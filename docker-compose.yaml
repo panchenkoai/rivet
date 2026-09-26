@@ -302,6 +302,44 @@ services:
       timeout: 5s
       retries: 20
 
+  # A read-scale Always On availability group (no cluster) whose readable SECONDARY rivet
+  # reads CDC from. dev/mssql-ag/setup.sh builds the group, the database and its capture.
+  mssql-ag-primary:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    profiles: ["replica"]
+    hostname: mssql-ag-primary
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "Rivet_Passw0rd!"
+      MSSQL_PID: Developer
+      MSSQL_AGENT_ENABLED: "true"
+      MSSQL_ENABLE_HADR: "1"
+    ports:
+      - "1440:1433"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"$$MSSQL_SA_PASSWORD\" -C -Q 'SELECT 1' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  mssql-ag-secondary:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    profiles: ["replica"]
+    hostname: mssql-ag-secondary
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "Rivet_Passw0rd!"
+      MSSQL_PID: Developer
+      MSSQL_AGENT_ENABLED: "true"
+      MSSQL_ENABLE_HADR: "1"
+    ports:
+      - "1441:1433"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"$$MSSQL_SA_PASSWORD\" -C -Q 'SELECT 1' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
   # ---- SQL Server for the CONCURRENCY GOVERNOR canaries ----------------------
   # A dedicated instance, not a convenience. The governor samples SQL Server's
   # `Log Flush Waits/sec` with the `_Total` instance — an INSTANCE-WIDE counter,
@@ -389,6 +427,34 @@ services:
       MYSQL_DATABASE: rivet
     ports:
       - "3309:3306"
+    volumes:
+      - ./dev/cdc/replica-grant.sql:/docker-entrypoint-initdb.d/grant.sql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-privet"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # A replica that applies but does NOT re-log (the MySQL default): its binlog holds none
+  # of the primary's changes, which rivet must refuse rather than read as "no changes".
+  mysql-replica-nolog:
+    image: mysql:8.0
+    profiles: ["replica"]
+    command:
+      - "--default-authentication-plugin=mysql_native_password"
+      - "--server-id=12"
+      - "--log-bin=binlog"
+      - "--binlog-format=ROW"
+      - "--log-replica-updates=OFF"
+      - "--gtid-mode=ON"
+      - "--enforce-gtid-consistency=ON"
+    environment:
+      MYSQL_ROOT_PASSWORD: rivet
+      MYSQL_USER: rivet
+      MYSQL_PASSWORD: rivet
+      MYSQL_DATABASE: rivet
+    ports:
+      - "3310:3306"
     volumes:
       - ./dev/cdc/replica-grant.sql:/docker-entrypoint-initdb.d/grant.sql
     healthcheck:
@@ -694,6 +760,35 @@ services:
       # a real mongo:4.4). `hello` is 5.0+, so gate on `isMaster().ismaster`
       # (cross-version 4.4→8.0). `mongo` is the 4.4 fallback (no mongosh there).
       test: ["CMD-SHELL", "mongosh --quiet --eval 'var st; try{st=rs.status()}catch(e){st={ok:0}}; if(!st.ok){try{rs.initiate({_id:\"rs0\",members:[{_id:0,host:\"127.0.0.1:27017\"}]})}catch(e){}}; db.isMaster().ismaster?quit(0):quit(1)' || mongo --quiet --eval 'var st; try{st=rs.status()}catch(e){st={ok:0}}; if(!st.ok){try{rs.initiate({_id:\"rs0\",members:[{_id:0,host:\"127.0.0.1:27017\"}]})}catch(e){}}; db.isMaster().ismaster?quit(0):quit(1)'"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  # A two-member replica set whose SECONDARY rivet reads (the "only a replica" topology).
+  # Separate from mongo-rs, whose single member is addressed as localhost and cannot take
+  # a second one. rs2-b has priority 0, so it is always the secondary.
+  mongo-rs2-a:
+    image: mongo:${MONGO_VERSION:-7}
+    profiles: ["replica"]
+    command: ["--replSet", "rs2", "--bind_ip_all"]
+    ports:
+      - "27022:27017"
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --quiet --eval 'var st; try{st=rs.status()}catch(e){st={ok:0}}; if(!st.ok){try{rs.initiate({_id:\"rs2\",members:[{_id:0,host:\"mongo-rs2-a:27017\",priority:1},{_id:1,host:\"mongo-rs2-b:27017\",priority:0}]})}catch(e){}}; db.isMaster().ismaster?quit(0):quit(1)'"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  mongo-rs2-b:
+    image: mongo:${MONGO_VERSION:-7}
+    profiles: ["replica"]
+    command: ["--replSet", "rs2", "--bind_ip_all"]
+    ports:
+      - "27023:27017"
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --quiet --eval 'db.isMaster().secondary?quit(0):quit(1)'"]
       interval: 5s
       timeout: 5s
       retries: 30

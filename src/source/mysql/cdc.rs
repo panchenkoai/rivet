@@ -612,6 +612,8 @@ impl MysqlChangeStream {
         let mut conn = connect_conn(url, tls)?;
         // Refuse a compressed binlog rather than read past it in silence.
         refuse_compressed_binlog(&mut conn)?;
+        // Refuse a replica that does not re-log what it applies: its binlog holds none of it.
+        refuse_replica_without_relog(&mut conn)?;
         // Read the connection's own database BEFORE the binlog stream consumes the
         // connection — it is the meaning of a bare configured name.
         // `Option<String>`, like the two sibling call sites (`mysql/mod.rs`,
@@ -1248,6 +1250,36 @@ impl MysqlChangeStream {
                 self.tx_bytes = 0;
                 self.spill = None;
             }
+            Some(EventData::QueryEvent(qe))
+                if drop_table_targets(&qe.query(), &qe.schema()).is_some_and(|ts| {
+                    ts.iter().any(|t| {
+                        undecodable_event_is_ours(
+                            t.as_ref().map(|(sc, tb)| (sc.as_str(), tb.as_str())),
+                            &self.configured_tables,
+                        )
+                    })
+                }) =>
+            {
+                let targets = drop_table_targets(&qe.query(), &qe.schema()).unwrap_or_default();
+                let ours = targets.iter().find(|t| {
+                    undecodable_event_is_ours(
+                        t.as_ref().map(|(sc, tb)| (sc.as_str(), tb.as_str())),
+                        &self.configured_tables,
+                    )
+                });
+                anyhow::bail!(drop_refusal_message(ours.and_then(|t| t.as_ref())));
+            }
+            Some(EventData::QueryEvent(qe))
+                if statement_dml_target(&qe.query(), &qe.schema()).is_some_and(|t| {
+                    undecodable_event_is_ours(
+                        t.as_ref().map(|(sc, tb)| (sc.as_str(), tb.as_str())),
+                        &self.configured_tables,
+                    )
+                }) =>
+            {
+                let target = statement_dml_target(&qe.query(), &qe.schema()).flatten();
+                anyhow::bail!(statement_dml_refusal_message(target.as_ref()));
+            }
             Some(EventData::QueryEvent(qe)) if is_commit_statement(&qe.query()) => {
                 if !self.close_transaction_at(log_pos) {
                     return Ok(false);
@@ -1412,6 +1444,36 @@ fn compressed_payload_refusal() -> anyhow::Error {
 /// `EventStreamReader::read_decompressed()`, and the inner events carry the
 /// OUTER payload's `end_log_pos`, so the commit-position semantics carry over
 /// unchanged — but until that lands, refusing is the only honest option.
+/// Ask the server whether it replicates and whether it re-logs what it applies.
+fn refuse_replica_without_relog(conn: &mut Conn) -> Result<()> {
+    let replicating = conn
+        .query_first::<mysql::Row, _>("SHOW REPLICA STATUS")
+        .or_else(|_| conn.query_first::<mysql::Row, _>("SHOW SLAVE STATUS"))
+        .ok()
+        .flatten()
+        .is_some();
+    let relog: Option<String> = conn
+        .query_first("SELECT @@global.log_replica_updates")
+        .or_else(|_| conn.query_first("SELECT @@global.log_slave_updates"))
+        .ok()
+        .flatten();
+    replica_relog_refusal(replicating, relog.as_deref())
+}
+
+/// A replica whose binlog omits replicated changes would capture nothing and report success.
+fn replica_relog_refusal(replicating: bool, relog: Option<&str>) -> Result<()> {
+    let relogs = matches!(relog, Some("1") | Some("ON") | Some("on") | None);
+    if !replicating || relogs {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "mysql cdc: this server is a replica with log_replica_updates = OFF, so the changes it \
+         applies from its source never reach its own binlog — reading it would capture NOTHING of \
+         them and report success. Set log_replica_updates = ON (log_slave_updates before 8.0.26; \
+         it needs a restart), or read the source instead."
+    )
+}
+
 fn refuse_compressed_binlog(conn: &mut Conn) -> Result<()> {
     // Pre-8.0.20 servers (and MariaDB) have no such variable: the query errors
     // or returns nothing, and both mean "not compressed". Never let the ABSENCE
@@ -1648,6 +1710,126 @@ pub(crate) fn truncate_target(sql: &str, event_db: &str) -> Option<(String, Stri
         Some(at) => Some((unq(&rest[..at]), unq(&rest[at + 1..]))),
         None => Some((event_db.to_string(), unq(rest))),
     }
+}
+
+/// The tables a `DROP TABLE` QUERY event removes (`None` for an unreadable name); `None` when the event is not one.
+pub(crate) fn drop_table_targets(
+    sql: &str,
+    event_db: &str,
+) -> Option<Vec<Option<(String, String)>>> {
+    let stripped = strip_sql_comments(sql);
+    let mut rest = stripped.trim().trim_end_matches(';').trim();
+    for w in ["drop", "table"] {
+        let head = rest.get(..w.len())?;
+        let after = &rest[w.len()..];
+        if !head.eq_ignore_ascii_case(w)
+            || !(after.is_empty() || after.starts_with(char::is_whitespace))
+        {
+            return None;
+        }
+        rest = after.trim_start();
+    }
+    if rest
+        .get(..9)
+        .is_some_and(|h| h.eq_ignore_ascii_case("if exists"))
+    {
+        rest = rest[9..].trim_start();
+    }
+    let (mut names, mut start, mut in_tick) = (Vec::new(), 0usize, false);
+    for (i, ch) in rest.char_indices() {
+        match ch {
+            '`' => in_tick = !in_tick,
+            ',' if !in_tick => {
+                names.push(&rest[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    names.push(&rest[start..]);
+    Some(
+        names
+            .into_iter()
+            .map(|n| {
+                let n = n.trim();
+                let n = ["restrict", "cascade"]
+                    .iter()
+                    .find_map(|k| {
+                        n.len()
+                            .checked_sub(k.len() + 1)
+                            .and_then(|at| n.get(at..))
+                            .filter(|tail| tail.trim_start().eq_ignore_ascii_case(k))
+                            .map(|tail| n[..n.len() - tail.len()].trim())
+                    })
+                    .unwrap_or(n);
+                truncate_target(&format!("TRUNCATE {n}"), event_db)
+            })
+            .collect(),
+    )
+}
+
+/// Refuse a DROP of a captured table: its rows leave the source without events, and a table re-created under the name is another table's history.
+pub(crate) fn drop_refusal_message(target: Option<&(String, String)>) -> String {
+    let what = match target {
+        Some((schema, table)) if !schema.is_empty() => format!("`{schema}.{table}`"),
+        Some((_, table)) => format!("`{table}`"),
+        None => "a table this reader could not identify".to_string(),
+    };
+    format!(
+        "mysql cdc: captured table {what} was DROPped, and this reader cannot represent that as a \
+         change. Skipping it would leave every row it held live in the destination, and a table \
+         re-created under the same name would continue that history as if it were one table. \
+         Recover in rivet's OWN order: re-anchor FIRST (delete the checkpoint so the next run pins \
+         a fresh one), THEN re-snapshot the table (`mode: full`)."
+    )
+}
+
+/// The table a statement-logged DML event writes: `None` when the event is not DML, `Some(None)` when it is but its target cannot be read.
+pub(crate) fn statement_dml_target(sql: &str, event_db: &str) -> Option<Option<(String, String)>> {
+    let stripped = strip_sql_comments(sql);
+    let mut words = stripped.split_whitespace();
+    let verb = words.next()?.to_ascii_lowercase();
+    let skip: &[&str] = match verb.as_str() {
+        "insert" | "replace" => &["low_priority", "delayed", "high_priority", "ignore", "into"],
+        "update" => &["low_priority", "ignore"],
+        "delete" => &["low_priority", "quick", "ignore", "from"],
+        "load" => return Some(None),
+        _ => return None,
+    };
+    let mut token = words.find(|w| !skip.contains(&w.to_ascii_lowercase().as_str()))?;
+    token = token.split('(').next().unwrap_or(token);
+    let multi = token.ends_with(',') || words.next().is_some_and(|w| w.starts_with(','));
+    let unbalanced = token.matches('`').count() % 2 == 1;
+    if token.is_empty() || multi || unbalanced {
+        return Some(None);
+    }
+    let unq = |s: &str| s.trim_matches('`').replace("``", "`");
+    let (db, table) = match token.split_once("`.`").or_else(|| {
+        (!token.starts_with('`'))
+            .then(|| token.split_once('.'))
+            .flatten()
+    }) {
+        Some((d, t)) => (unq(d), unq(t)),
+        None => (event_db.to_string(), unq(token)),
+    };
+    Some(Some((db, table)))
+}
+
+/// Refuse a change a writer logged as a SQL statement: this reader decodes only row events.
+pub(crate) fn statement_dml_refusal_message(target: Option<&(String, String)>) -> String {
+    let what = match target {
+        Some((schema, table)) if !schema.is_empty() => format!("`{schema}.{table}`"),
+        Some((_, table)) => format!("`{table}`"),
+        None => "a table this reader could not identify".to_string(),
+    };
+    format!(
+        "mysql cdc: a change to {what} was written to the binlog as a SQL STATEMENT (the writing \
+         session ran with binlog_format=STATEMENT or MIXED), and this reader decodes only row \
+         events. Skipping it would drop the change while the checkpoint moves past it. Set \
+         binlog_format=ROW for every writer — the global setting does not bind a session that \
+         changes its own — then recover in rivet's OWN order: re-anchor FIRST (delete the \
+         checkpoint so the next run pins a fresh one), THEN re-snapshot the table (`mode: full`)."
+    )
 }
 
 /// Refuse a TRUNCATE on a captured table. Same contract as the PostgreSQL arm —
@@ -2122,6 +2304,74 @@ mod tests {
             "say WHY no catalog check warned them, or the next reader adds one and it \
              does not fire either: {why}"
         );
+    }
+
+    #[test]
+    fn a_drop_table_names_every_table_it_removes() {
+        let t = |sql: &str| drop_table_targets(sql, "shop");
+        let at = |d: &str, n: &str| Some((d.to_string(), n.to_string()));
+        assert_eq!(
+            t("DROP TABLE `orders` /* generated by server */"),
+            Some(vec![at("shop", "orders")])
+        );
+        assert_eq!(
+            t("drop table if exists a, `b`.`c`, `odd, name`"),
+            Some(vec![at("shop", "a"), at("b", "c"), at("shop", "odd, name")])
+        );
+        assert_eq!(
+            t("DROP TABLE orders CASCADE"),
+            Some(vec![at("shop", "orders")])
+        );
+        assert_eq!(t("DROP DATABASE shop"), None);
+        assert_eq!(t("DROP TABLESPACE ts"), None);
+        assert_eq!(t("TRUNCATE orders"), None);
+    }
+
+    #[test]
+    fn only_a_replica_that_does_not_relog_is_refused() {
+        assert!(replica_relog_refusal(true, Some("0")).is_err());
+        assert!(replica_relog_refusal(true, Some("OFF")).is_err());
+        assert!(replica_relog_refusal(true, Some("1")).is_ok());
+        assert!(
+            replica_relog_refusal(false, Some("0")).is_ok(),
+            "a primary needs no re-logging"
+        );
+        assert!(
+            replica_relog_refusal(true, None).is_ok(),
+            "an unreadable setting must not block a source that may be fine"
+        );
+    }
+
+    #[test]
+    fn a_statement_logged_dml_names_the_table_it_writes() {
+        let t = |sql: &str| statement_dml_target(sql, "shop");
+        let at = |d: &str, n: &str| Some(Some((d.to_string(), n.to_string())));
+        assert_eq!(t("INSERT INTO orders VALUES (1)"), at("shop", "orders"));
+        assert_eq!(
+            t("insert ignore into rivet.orders(id) values (1)"),
+            at("rivet", "orders")
+        );
+        assert_eq!(
+            t("/* app */ REPLACE INTO `odd name` VALUES (1)"),
+            Some(None),
+            "a spaced name is not read by guess"
+        );
+        assert_eq!(t("UPDATE `a`.`b` SET v = 1"), at("a", "b"));
+        assert_eq!(t("DELETE FROM orders WHERE id = 1"), at("shop", "orders"));
+        assert_eq!(
+            t("UPDATE orders, items SET v = 1"),
+            Some(None),
+            "multi-table is unknown"
+        );
+        assert_eq!(t("LOAD DATA INFILE 'x' INTO TABLE orders"), Some(None));
+        assert_eq!(t("BEGIN"), None);
+        assert_eq!(t("COMMIT"), None);
+        assert_eq!(
+            t("CREATE TABLE orders (id INT)"),
+            None,
+            "DDL is not row data"
+        );
+        assert_eq!(t("TRUNCATE orders"), None, "TRUNCATE has its own refusal");
     }
 
     /// MySQL's TRUNCATE parser had ZERO offline coverage while the evidence matrix

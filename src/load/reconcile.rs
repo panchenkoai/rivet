@@ -163,7 +163,7 @@ fn runs_with_missing_parts(new: &[(String, RunManifest)], all_parquet: &[String]
 /// [`select_load_keys`] (which intersects them with what's present) and
 /// [`gc_orphans`] (which treats them as the keep-set), so the two can't drift on
 /// how a manifest maps to its files.
-fn resolve_parts<'a>(
+pub(crate) fn resolve_parts<'a>(
     manifest_key: &'a str,
     m: &'a RunManifest,
 ) -> impl Iterator<Item = String> + 'a {
@@ -2177,6 +2177,54 @@ mod tests {
     /// the marker sweep began re-reading it before deleting.
     fn planted(entry: &(String, RunManifest)) -> (&str, Vec<u8>) {
         (entry.0.as_str(), serde_json::to_vec(&entry.1).unwrap())
+    }
+
+    /// A run keyed at `key` whose parts are `parts`.
+    fn keyed_run(id: &str, key: &str, parts: &[&str]) -> (String, RunManifest) {
+        let mut m = manifest(id, 1, None);
+        m.parts = parts
+            .iter()
+            .map(|p| ManifestPart {
+                path: (*p).to_string(),
+                ..m.parts[0].clone()
+            })
+            .collect();
+        (key.to_string(), m)
+    }
+
+    #[test]
+    fn cleanup_deletes_only_the_files_of_runs_nobody_is_writing() {
+        let runs = [
+            keyed_run("r1", "base/manifest-r1.json", &["a.parquet"]),
+            keyed_run("r2", "base/manifest-r2.json", &["b.parquet"]),
+        ];
+        let writing: std::collections::HashSet<String> = ["r2".to_string()].into();
+        let keys = crate::load::staging::cleanup_keys(&runs, &writing, |_| Some("r1".into()));
+        assert_eq!(
+            keys,
+            vec![
+                "base/_SUCCESS".to_string(),
+                "base/a.parquet".to_string(),
+                "base/manifest-r1.json".to_string(),
+                "base/manifest.json".to_string(),
+            ],
+            "r1's manifest, part and the canonical pointer to it go; r2 is still writing"
+        );
+    }
+
+    #[test]
+    fn a_canonical_manifest_describing_another_run_stays() {
+        let runs = [keyed_run("r1", "base/manifest-r1.json", &["a.parquet"])];
+        let keys =
+            crate::load::staging::cleanup_keys(&runs, &Default::default(), |_| Some("r9".into()));
+        assert_eq!(
+            keys,
+            vec![
+                "base/a.parquet".to_string(),
+                "base/manifest-r1.json".to_string()
+            ],
+            "a canonical manifest written by another run is not this load's to delete"
+        );
     }
 
     fn manifest_bytes(run: &str, rows: i64, source: Option<i64>) -> Vec<u8> {

@@ -188,7 +188,7 @@ preflights:
   # go/no-go signal. Pooler safety is CI-scope, not a gate gap — the gate does the
   # shipping-artifact + independent-oracle checks CI can't. Not counted as a gap.
   - id: replica_read
-    what: "prod topology — rivet reads a read-REPLICA, not the master (the 'we were handed a product, no master access' case). Drives tests/live/live_cdc_replica.rs: the mysql-replica re-logs the primary's replicated changes into its OWN binlog (log_replica_updates) and rivet captures from that. Needs the `replica` compose profile (mysql-primary :3308 → mysql-replica :3309); SKIP when down."
+    what: "prod topology — rivet reads a read-REPLICA, not the master (the 'we were handed a product, no master access' case). Drives tests/live/live_cdc_replica.rs: the mysql-replica re-logs the primary's replicated changes into its OWN binlog (log_replica_updates) and rivet captures from that. Needs the `replica` compose profile (mysql-primary :3308 → mysql-replica :3309); SKIP when down. Four more rows, one per topology (REPLICA_CELLS in scenarios.py), each SKIPping alone when its services are down: mysql-replica-nolog :3310 (log_replica_updates = OFF, MySQL's default) must be refused at start, since its binlog holds none of the replicated changes (found 2026-09-26: 0.29.0 captured nothing and exited 0); a PostgreSQL 16 standby streams in continuous mode; a SQL Server read-scale availability group's readable secondary (dev/mssql-ag/setup.sh); a MongoDB secondary with readPreference=secondary. Each asserts the changes made on the primary through DuckDB over the declared parts."
     infra: [mysql-replica]
     status: test        # verify_replica_read — drives cdc_reads_changes_from_a_replica
   - id: pool_e2e
@@ -255,6 +255,10 @@ preflights:
     what: "`rivet load` into ClickHouse (ADR-0035) against the stand's server: a CDC stream from MySQL, PostgreSQL and SQL Server whose `FINAL` view equals the source row for row with the deleted key flagged (the version decodes each engine's position); a load killed after appending re-runs, the log holds every row twice and the view is unchanged; a full load swaps in the current source; an incremental export adopts the table behind a latest-cursor view; `rivet init --clickhouse-*` scaffolds the block and its flags require each other. Oracles: the source and ClickHouse read back directly — never rivet's report."
     backends: [postgres, gcs]
     status: test        # verify_clickhouse_load (dev/release_oracle/clickhouse_load.py) — runs tests/live/live_clickhouse_load.rs + live_init_extended.rs through the Rig against the gate binary; needs cargo and the local services (clickhouse :8123, fake-gcs :4443, postgres, the three CDC engines), SKIP naming any that is down — no cloud prerequisite
+  - id: cdc_schema_drift
+    what: "`on_schema_drift` on a CDC export (found 2026-09-26: the CDC runner never consulted it — a retyped column wrote three differently-typed parts into one prefix, exit 0). Per SQL engine: a column retyped between two runs is refused under `fail` before the stream acknowledges anything (MySQL/SQL Server checkpoint bytes and the PostgreSQL slot's confirmed_flush_lsn unchanged), and after switching to `warn` both deferred changes land with their values (30000000000 needs the widened BIGINT). Oracles: the checkpoint/slot read directly and the Parquet re-read — never rivet's report. MongoDB is n/a: its CDC schema is the fixed document blob."
+    backends: [sqlite]
+    status: test        # verify_cdc_schema_drift (dev/release_oracle/cdc_schema_drift.py) — runs tests/live/live_cdc_schema_drift.rs through the Rig against the gate binary; needs cargo and postgres-cdc :5434, mysql-cdc :3307, mssql-cdc :1434, SKIP naming any that is down
 
 # ── BACKEND-INFRASTRUCTURE dimensions the gate does NOT yet exercise (the audit gaps) ──
 # The gate connects DIRECT to every engine; it never routes through the connection-

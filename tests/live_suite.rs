@@ -59,6 +59,8 @@ mod chunking_stand;
 mod gremlin;
 #[path = "live/gremlin_cdc.rs"]
 mod gremlin_cdc;
+#[path = "live/live_audit_suspects.rs"]
+mod live_audit_suspects;
 #[path = "live/live_azure_multipart.rs"]
 mod live_azure_multipart;
 #[path = "live/live_batch_switch_golden.rs"]
@@ -89,6 +91,8 @@ mod live_cdc_oracle;
 mod live_cdc_property;
 #[path = "live/live_cdc_replica.rs"]
 mod live_cdc_replica;
+#[path = "live/live_cdc_schema_drift.rs"]
+mod live_cdc_schema_drift;
 #[path = "live/live_chaos.rs"]
 mod live_chaos;
 #[path = "live/live_chunked_dense.rs"]

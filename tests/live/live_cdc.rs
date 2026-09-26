@@ -5046,6 +5046,95 @@ fn roast_pg_cdc_bounded_on_a_standby_fails_loud() {
     );
 }
 
+#[test]
+#[ignore = "live: requires the cdc-standby profile — python3 -m dev.pytools.cdc_stand standby (pg-cdc-primary :5437 → pg-cdc-standby :5436)"]
+fn pg_cdc_streams_changes_from_a_standby_in_continuous_mode() {
+    let (primary_url, standby_url) = (
+        "postgresql://rivet:rivet@127.0.0.1:5437/rivet",
+        "postgresql://rivet:rivet@127.0.0.1:5436/rivet",
+    );
+    for port in ["5436", "5437"] {
+        if std::net::TcpStream::connect_timeout(
+            &format!("127.0.0.1:{port}").parse().unwrap(),
+            std::time::Duration::from_millis(500),
+        )
+        .is_err()
+        {
+            panic!("fixture: the cdc-standby pair is not up on :{port}");
+        }
+    }
+    let mut p = postgres::Client::connect(primary_url, postgres::NoTls).expect("connect primary");
+    let mut sb = postgres::Client::connect(standby_url, postgres::NoTls).expect("connect standby");
+    let tbl = unique_name("t_standby_stream");
+    let slot = unique_name("standby_stream_slot");
+    p.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"
+    ))
+    .unwrap();
+    let _tbl = PgTable::adopt_on(primary_url, tbl.clone());
+    let replicated = |sb: &mut postgres::Client, sql: &str, want: i64| {
+        for _ in 0..60 {
+            if sb.query_one(sql, &[]).ok().map(|r| r.get::<_, i64>(0)) == Some(want) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        panic!("fixture: the standby never reached {want} for `{sql}`");
+    };
+    replicated(
+        &mut sb,
+        &format!("SELECT COUNT(*) FROM pg_class WHERE relname = '{tbl}'"),
+        1,
+    );
+
+    // A logical slot on a standby waits for the primary to log a running-transactions
+    // snapshot; ask for one while the first run creates it.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let nudger = {
+        let stop = stop.clone();
+        let url = primary_url.to_string();
+        std::thread::spawn(move || {
+            let mut c = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = c.execute("SELECT pg_log_standby_snapshot()", &[]);
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            }
+        })
+    };
+    let rig = Rig::pg_cdc(&tbl, &slot)
+        .source_url(standby_url)
+        .continuous();
+    let first = rig.run();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    nudger.join().unwrap();
+    let drop_slot = |sb: &mut postgres::Client| {
+        let _ = sb.execute("SELECT pg_drop_replication_slot($1)", &[&slot]);
+    };
+    if !first.status.success() {
+        drop_slot(&mut sb);
+        panic!(
+            "a continuous run must stream from a PostgreSQL 16 standby:\n{}",
+            String::from_utf8_lossy(&first.stderr)
+        );
+    }
+
+    p.batch_execute(&format!("INSERT INTO {tbl} VALUES (1, 10), (2, 20)"))
+        .unwrap();
+    replicated(&mut sb, &format!("SELECT COUNT(*) FROM {tbl}"), 2);
+    let second = rig.run();
+    drop_slot(&mut sb);
+    assert!(
+        second.status.success(),
+        "the second standby run:\n{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_eq!(
+        duckdb_declared_dir_id_set(&rig.out_dir()),
+        [1, 2].into_iter().collect(),
+        "both changes made on the primary must be captured from the standby"
+    );
+}
+
 /// Finding #3: MySQL CDC enriches ENUM/SET labels from information_schema.COLUMNS.
 /// The old query pinned `TABLE_SCHEMA = DATABASE()` and dropped any `db.`
 /// qualifier, so a CROSS-DATABASE capture — a table in a database OTHER than the

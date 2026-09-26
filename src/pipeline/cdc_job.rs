@@ -629,6 +629,15 @@ pub(crate) fn dest_for_table(
 /// Returns what the drain made DURABLE paired with its outcome — never one
 /// without the other. See `sink::run_to_files`.
 #[allow(clippy::too_many_arguments)]
+/// The schema-baseline key of one captured table: the export alone, or `export/table` when one stream captures several.
+fn cdc_drift_key(export: &str, table: &str, multi: bool) -> String {
+    if multi {
+        format!("{export}/{table}")
+    } else {
+        export.to_string()
+    }
+}
+
 fn run_cdc_inner(
     config: &Config,
     export: &ExportConfig,
@@ -747,6 +756,10 @@ fn run_cdc_inner(
         );
     }
 
+    let schema_gate = |table: &str, cols: &[crate::types::TypeMapping]| {
+        let key = cdc_drift_key(&export.name, table, multi);
+        super::schema_drift::check_from_cdc_mappings(state, &key, cols, export.on_schema_drift)
+    };
     run_capture(
         CdcCapture {
             export_name: export.name.clone(),
@@ -805,6 +818,7 @@ fn run_cdc_inner(
             run_id: run_id.to_string(),
             started_at: now,
             state: Some(state),
+            schema_gate: Some(&schema_gate),
         },
         read_bytes,
     )
@@ -1542,6 +1556,20 @@ mod tests {
             cdc_rollover_memory_bytes(Some(32)),
             Some(32 * 1024 * 1024),
             "a configured value is megabytes, converted — not passed through raw"
+        );
+    }
+
+    #[test]
+    fn one_captured_table_keeps_the_export_key_several_get_their_own() {
+        assert_eq!(cdc_drift_key("orders", "orders", false), "orders");
+        assert_eq!(
+            cdc_drift_key("shop", "public.orders", true),
+            "shop/public.orders"
+        );
+        assert_ne!(
+            cdc_drift_key("shop", "a", true),
+            cdc_drift_key("shop", "b", true),
+            "two tables of one stream must not share a baseline"
         );
     }
 }
