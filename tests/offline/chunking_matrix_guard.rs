@@ -252,7 +252,9 @@ const MATRICES: &[(&str, usize)] = &[
     // Lowered 6 -> 1: partition_budget_footer_note proven per batch runner by a
     // footer readback (which found the chunked runners' bare take+finish); only the
     // cdc cell remains.
-    ("docs/runner-coverage-matrix.yaml", 1),
+    // Lowered 1 -> 0: the CDC drain cuts a flush at the partition budget under
+    // log_view and notes every part (live on MySQL, PostgreSQL, SQL Server).
+    ("docs/runner-coverage-matrix.yaml", 0),
     // Mode transitions (ADR-0033). 3 gaps: MT6, pre-v26 incremental cursors carry no identity.
     ("docs/mode-transition-matrix.yaml", 0),
     // Pool-split — `apply --pool --split` per (strategy × source engine). Split is a

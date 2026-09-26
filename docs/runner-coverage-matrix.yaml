@@ -135,7 +135,8 @@
 # B are applied inside the CDC path itself. The column is derived like the others (the
 # guard's CDC_DRAIN). Two of the three gaps it arrived with (open_forensics,
 # source_harm_and_diagnosis) were closed the same day by the shared HarmBracket and
-# an open-time server snapshot in run_cdc_export; partition_budget_footer_note remains.
+# an open-time server snapshot in run_cdc_export; the third (partition_budget_footer_note)
+# by cutting each change flush at the budget when the change log is partitioned (log_view).
 engines: [single, chunked, chunked_checkpoint, keyset, mongo_parallel, cdc]
 
 scenarios:
@@ -518,4 +519,7 @@ scenarios:
     chunked_checkpoint: { test: every_chunked_checkpoint_part_notes_its_partitions_sequential_and_parallel }
     keyset:         { test: every_keyset_page_notes_its_partitions_sequential_and_parallel }
     mongo_parallel: { na: "a Mongo export's Arrow schema is the fixed {_id, document, meta} shape, so there is no date column for `load.partition` to name — PartBudget::resolve finds none and the part is unbudgeted by construction" }
-    cdc:            { gap: "the drain writes parts through its own flush (src/source/cdc/sink.rs), with no PartBudget rotation and no rivet.partition_buckets note — both live only in pipeline/sink/mod.rs" }
+    # All four engines: mysql_/pg_/mssql_cdc_flush_past_the_partition_budget_is_cut_and_every_part_notes_its_partitions
+    # (tests/live/live_partition_footer.rs); MongoDB writes the fixed {_id, document} image, so it SAYS its parts
+    # cannot be budgeted (mongo_cdc_says_its_parts_cannot_be_budgeted_by_a_declared_partition).
+    cdc:            { test: mysql_cdc_flush_past_the_partition_budget_is_cut_and_every_part_notes_its_partitions }

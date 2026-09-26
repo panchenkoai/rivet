@@ -1654,6 +1654,8 @@ pub(crate) struct CaptureOutput<'a> {
     /// column the snapshot leg does, or the warehouse table ends up
     /// half-populated.
     pub row_hash: crate::config::RowHash,
+    /// The partition budget this table's change parts keep (changelog layout only).
+    pub partition: Option<crate::plan::rollover::PartitionRollover>,
 }
 
 /// Everything needed to capture a change stream to typed files, assembled once —
@@ -1775,12 +1777,18 @@ pub(crate) fn run_capture(
         {
             return (Vec::new(), Err(e));
         }
+        if let Some(w) =
+            sink::unbudgetable_partition_warning(&o.table, o.partition.as_ref(), &columns)
+        {
+            log::warn!("{w}");
+        }
         outputs.push(sink::TableOutput {
             table: o.table,
             columns,
             dest: o.dest,
             dest_uri: o.dest_uri,
             row_hash: o.row_hash,
+            partition: o.partition,
         });
     }
     let sink_cfg = sink::SinkConfig {

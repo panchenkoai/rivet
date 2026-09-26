@@ -55,6 +55,9 @@ pub(crate) struct TableOutput<'a> {
     /// stream because a DECLARED column set names one table's columns; a
     /// multi-table stream with one is refused at config-load.
     pub row_hash: crate::config::RowHash,
+    /// Keep each part within this many distinct partitions and note the count in its
+    /// footer; `None` when the change log is not partitioned.
+    pub partition: Option<crate::plan::rollover::PartitionRollover>,
 }
 
 /// Everything the sink needs that isn't the stream itself. `outputs` carries one
@@ -168,13 +171,13 @@ impl TableSink<'_> {
         );
     }
 
-    /// Encode + upload this table's buffered changes as one part; touches nothing but the destination.
+    /// Encode + upload this table's buffered changes as one part per partition-budget slice.
     fn encode_and_upload(
         &self,
         engine: super::CdcEngine,
         format: FormatType,
         run_token: &str,
-    ) -> Result<(PartRecord, Vec<(String, u64)>)> {
+    ) -> Result<FlushedParts> {
         let sch = self
             .schema
             .as_ref()
@@ -189,6 +192,7 @@ impl TableSink<'_> {
             self.seq,
             self.out.dest,
             &self.out.row_hash,
+            self.out.partition.as_ref(),
         )
     }
 
@@ -361,12 +365,16 @@ fn roll_all(
     let mut first_err = None;
     for (i, outcome) in pending.into_iter().zip(uploaded) {
         match outcome {
-            Ok((part, sums)) => sinks[i].record_part(
-                part,
-                sums,
-                run.format,
-                run.state.map(|st| (st, run.export_name, run.run_id)),
-            ),
+            Ok((parts, mut sums)) => {
+                for part in parts {
+                    sinks[i].record_part(
+                        part,
+                        std::mem::take(&mut sums),
+                        run.format,
+                        run.state.map(|st| (st, run.export_name, run.run_id)),
+                    );
+                }
+            }
             Err(e) => {
                 first_err.get_or_insert(e);
             }
@@ -900,7 +908,8 @@ fn flush(
     seq: usize,
     dest: &dyn Destination,
     row_hash: &crate::config::RowHash,
-) -> Result<(PartRecord, Vec<(String, u64)>)> {
+    partition: Option<&crate::plan::rollover::PartitionRollover>,
+) -> Result<FlushedParts> {
     let ops: ArrayRef = Arc::new(
         events
             .iter()
@@ -1081,20 +1090,90 @@ fn flush(
         RecordBatch::try_new(schema.clone(), arrays)?
     };
 
-    let tmp = NamedTempFile::new()?;
-    let fmt = crate::format::create_format(format, part_compression(format), None, None);
-    let writer: Box<dyn std::io::Write + Send> = Box::new(tmp.reopen()?);
-    let mut w = fmt.create_writer(schema, writer)?;
-    w.write_batch(&batch)?;
-    // No partition budget and no footer note here, by design: a change part lands in
-    // `<table>__changes`, which takes no partition (the buffer is read whole by one
-    // MERGE), so the per-job partition cap never applies to it.
-    w.finish()?;
-
-    let file_name = format!("cdc-{run_token}-{seq:06}.{}", format.label());
-    let part = write_part_file(dest, tmp.path(), events.len() as i64, file_name)?;
-    Ok((part, col_sums))
+    // A partitioned change log (the changelog layout) is loaded by jobs of at most
+    // `cap` partitions, and nothing splits a Parquet file at load time — so the part is
+    // cut here and each piece notes the partitions it holds, as the batch writer does.
+    let slices = match partition
+        .and_then(|r| crate::pipeline::batch_partition_buckets(&batch, r).map(|b| (r, b)))
+    {
+        Some((r, buckets)) => budget_slices(&buckets, r.cap)
+            .into_iter()
+            .map(|(rows, n)| {
+                let note =
+                    crate::plan::rollover::partition_buckets_note(&r.column, r.granularity, n);
+                (rows, Some(note))
+            })
+            .collect(),
+        None => vec![(0..batch.num_rows(), None)],
+    };
+    let mut parts = Vec::with_capacity(slices.len());
+    for (k, (rows, note)) in slices.into_iter().enumerate() {
+        let tmp = NamedTempFile::new()?;
+        let fmt = crate::format::create_format(format, part_compression(format), None, None);
+        let writer: Box<dyn std::io::Write + Send> = Box::new(tmp.reopen()?);
+        let mut w = fmt.create_writer(schema, writer)?;
+        w.write_batch(&batch.slice(rows.start, rows.len()))?;
+        if let Some(note) = &note {
+            w.note(crate::plan::rollover::PARTITION_BUCKETS_KEY, note);
+        }
+        w.finish()?;
+        let file_name = format!("cdc-{run_token}-{:06}.{}", seq + k, format.label());
+        parts.push(write_part_file(
+            dest,
+            tmp.path(),
+            rows.len() as i64,
+            file_name,
+        )?);
+    }
+    Ok((parts, col_sums))
 }
+
+/// The warning for a declared partition this table's parts cannot be budgeted by — the
+/// stream writes no date/timestamp column of that name; `None` when they can be.
+pub(crate) fn unbudgetable_partition_warning(
+    table: &str,
+    rollover: Option<&crate::plan::rollover::PartitionRollover>,
+    columns: &[TypeMapping],
+) -> Option<String> {
+    use arrow::datatypes::DataType;
+    let r = rollover?;
+    let dated = columns.iter().any(|c| {
+        c.column_name == r.column
+            && matches!(
+                c.arrow_type,
+                Some(DataType::Date32 | DataType::Date64 | DataType::Timestamp(..))
+            )
+    });
+    (!dated).then(|| {
+        format!(
+            "cdc table '{table}': the load partitions by `{}`, which this stream does not write \
+             as a date or timestamp column — its change parts cannot be kept within the \
+             {}-partition load budget, and a wide history will be refused at load time",
+            r.column, r.cap
+        )
+    })
+}
+
+/// Consecutive row ranges of `buckets`, each within `cap` distinct partitions, with the count it holds.
+fn budget_slices(buckets: &[i64], cap: usize) -> Vec<(std::ops::Range<usize>, usize)> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    while start < buckets.len() {
+        let fit = crate::plan::rollover::rows_that_fit(
+            &std::collections::HashSet::new(),
+            &buckets[start..],
+            cap,
+        );
+        let end = start + fit;
+        let held: std::collections::HashSet<i64> = buckets[start..end].iter().copied().collect();
+        out.push((start..end, held.len()));
+        start = end;
+    }
+    out
+}
+
+/// A flush's durable parts and the column checksums of the rows they hold.
+type FlushedParts = (Vec<PartRecord>, Vec<(String, u64)>);
 
 /// The name a CDC part is recorded under in `file_log`.
 ///
@@ -1210,6 +1289,66 @@ fn build_manifest(
                 .collect(),
         ),
         checksum_key_column: None,
+    }
+}
+
+#[cfg(test)]
+mod partition_budget_tests {
+    use super::{budget_slices, unbudgetable_partition_warning};
+
+    #[test]
+    fn a_partition_the_stream_cannot_budget_is_said_and_one_it_can_is_not() {
+        use crate::types::{RivetType, TypeFidelity, TypeMapping};
+        use arrow::datatypes::DataType;
+        let col = |name: &str, t: DataType| TypeMapping {
+            column_name: name.into(),
+            source_native_type: String::new(),
+            rivet_type: RivetType::Int64,
+            arrow_type: Some(t),
+            fidelity: TypeFidelity::Exact,
+            nullable: true,
+            warnings: vec![],
+        };
+        let r = crate::plan::rollover::PartitionRollover {
+            column: "created_at".into(),
+            granularity: crate::config::load::Granularity::Day,
+            cap: 4000,
+        };
+        let dated = [
+            col("id", DataType::Int64),
+            col("created_at", DataType::Date32),
+        ];
+        assert_eq!(unbudgetable_partition_warning("t", Some(&r), &dated), None);
+        assert_eq!(
+            unbudgetable_partition_warning("t", None, &[]),
+            None,
+            "nothing declared"
+        );
+        let mongo = [col("_id", DataType::Utf8), col("document", DataType::Utf8)];
+        let w = unbudgetable_partition_warning("orders", Some(&r), &mongo).expect("absent column");
+        assert!(
+            w.starts_with("cdc table 'orders': the load partitions by `created_at`, which this stream does not write as a date or timestamp column"),
+            "{w}"
+        );
+        let text = [col("created_at", DataType::Utf8)];
+        assert!(
+            unbudgetable_partition_warning("t", Some(&r), &text).is_some(),
+            "a text column of that name is not a date"
+        );
+    }
+
+    #[test]
+    fn a_flush_is_cut_where_the_next_row_would_open_a_partition_past_the_cap() {
+        // Buckets 1,1,2 | 3,3,4 under cap 2: the fourth row would be a THIRD partition.
+        assert_eq!(
+            budget_slices(&[1, 1, 2, 3, 3, 4], 2),
+            vec![(0..3, 2), (3..6, 2)]
+        );
+        // A partition already held is free, even after others: 1,2,1 fits in 2.
+        assert_eq!(budget_slices(&[1, 2, 1, 3], 2), vec![(0..3, 2), (3..4, 1)]);
+        assert_eq!(budget_slices(&[], 2), vec![]);
+        // cap 0 is "unbudgeted", never an endless loop of empty parts.
+        assert_eq!(budget_slices(&[1, 2, 3], 0), vec![(0..3, 3)]);
     }
 }
 
@@ -2138,6 +2277,76 @@ mod tests {
         }]
     }
 
+    #[test]
+    fn a_flush_past_the_partition_budget_ships_one_noted_part_per_slice() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = local_dest(&dir);
+        let cols = vec![TypeMapping {
+            column_name: "d".into(),
+            source_native_type: "date".into(),
+            rivet_type: crate::types::RivetType::Date,
+            arrow_type: Some(DataType::Date32),
+            fidelity: crate::types::TypeFidelity::Exact,
+            nullable: true,
+            warnings: vec![],
+        }];
+        let day = |n: u32| {
+            let mut e = insert(i64::from(n));
+            e.after = Some(vec![RivetValue::DateTime(
+                chrono::NaiveDate::from_ymd_opt(2026, 1, n)
+                    .unwrap()
+                    .and_hms_opt(0, 0, 0)
+                    .unwrap(),
+            )]);
+            e.committed = n == 5; // one transaction, one flush
+            e
+        };
+        let mut stream = FakeStream {
+            events: VecDeque::from((1..=5).map(day).collect::<Vec<_>>()),
+            acked: Vec::new(),
+        };
+        let mut sc = cfg(dest.as_ref(), &cols, FormatType::Parquet, 100);
+        sc.outputs[0].partition = Some(crate::plan::rollover::PartitionRollover {
+            column: "d".into(),
+            granularity: crate::config::load::Granularity::Day,
+            cap: 2,
+        });
+        let (_, r) = run_to_files(&mut stream, sc);
+        r.unwrap();
+
+        let mut notes = Vec::new();
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|e| e == "parquet") {
+                use parquet::file::reader::FileReader as _;
+                let reader = parquet::file::reader::SerializedFileReader::new(
+                    std::fs::File::open(&path).unwrap(),
+                )
+                .unwrap();
+                let meta = reader.metadata().file_metadata();
+                let note = meta
+                    .key_value_metadata()
+                    .and_then(|kv| {
+                        kv.iter()
+                            .find(|k| k.key == crate::plan::rollover::PARTITION_BUCKETS_KEY)
+                            .and_then(|k| k.value.clone())
+                    })
+                    .unwrap_or_default();
+                notes.push((meta.num_rows(), note));
+            }
+        }
+        notes.sort();
+        assert_eq!(
+            notes,
+            vec![
+                (1, "d|day|1".to_string()),
+                (2, "d|day|2".to_string()),
+                (2, "d|day|2".to_string())
+            ],
+            "five days under a budget of two: three parts, each named apart and noting what it holds"
+        );
+    }
+
     // Exercises the whole sink — encode + commit-seam upload + manifest + the
     // flush→checkpoint→ack sequence — against a real LocalDestination (temp dir)
     // and a fake stream, with no live database.
@@ -2241,6 +2450,7 @@ mod tests {
                             dest: dest_a.as_ref(),
                             dest_uri: String::new(),
                             row_hash: crate::config::RowHash::All(false),
+                            partition: None,
                         },
                         TableOutput {
                             table: "b".into(),
@@ -2248,6 +2458,7 @@ mod tests {
                             dest: dest_b.as_ref(),
                             dest_uri: String::new(),
                             row_hash: crate::config::RowHash::All(false),
+                            partition: None,
                         },
                     ],
                     ..base
@@ -2681,6 +2892,7 @@ mod tests {
                 dest,
                 dest_uri: String::new(),
                 row_hash: crate::config::RowHash::All(false),
+                partition: None,
             }],
             engine: crate::source::cdc::CdcEngine::Mysql,
             format,
@@ -2775,6 +2987,7 @@ mod tests {
                 dest,
                 dest_uri: String::new(),
                 row_hash: crate::config::RowHash::All(false),
+                partition: None,
             }
         }
         let base = cfg(&busy, &cols, FormatType::Parquet, 1);
@@ -2913,6 +3126,7 @@ mod tests {
                 dest,
                 dest_uri: String::new(),
                 row_hash: crate::config::RowHash::All(false),
+                partition: None,
             })
             .collect()
     }
@@ -3456,6 +3670,7 @@ mod tests {
                     dest: dest_a,
                     dest_uri: "a".into(),
                     row_hash: crate::config::RowHash::All(false),
+                    partition: None,
                 },
                 TableOutput {
                     table: "b".into(),
@@ -3463,6 +3678,7 @@ mod tests {
                     dest: dest_b,
                     dest_uri: "b".into(),
                     row_hash: crate::config::RowHash::All(false),
+                    partition: None,
                 },
             ],
             engine: crate::source::cdc::CdcEngine::Mysql,

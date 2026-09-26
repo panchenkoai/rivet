@@ -791,6 +791,7 @@ fn run_cdc_inner(
             dest_uri: u.clone(),
             overrides: crate::types::overrides_for_unit(&all_overrides, Some(t)),
             row_hash: export.meta_columns.row_hash.clone(),
+            partition: crate::plan::build::cdc_partition_rollover(config, export, t),
         })
         .collect();
     let now = chrono::Utc::now().to_rfc3339();

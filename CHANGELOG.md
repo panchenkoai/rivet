@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **CDC keeps each change part inside a load job's partition budget.** Under the `log_view`
+  layout the change log is partitioned, and BigQuery writes at most 4,000 partitions per load
+  job. The CDC drain wrote each flush as one part with no partition count in its footer, so a
+  flush of changes to rows scattered over more than 4,000 days could be refused at load. The
+  drain now cuts a flush at the budget and notes each part, like the batch writer (verified
+  on MySQL, PostgreSQL and SQL Server). MongoDB's change parts carry no date column, and the
+  run now says so instead of shipping them unbudgeted in silence.
 - **Chunked exports record their partition count in every part again.** The chunked,
   parallel-chunked and parallel-checkpoint runners closed each part without the
   `rivet.partition_buckets` footer note, so `rivet load` fell back to the part's min/max
