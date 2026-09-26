@@ -55,6 +55,8 @@ mod audit_target_typo;
 mod batch_memory_policy;
 #[path = "live/chunking_stand.rs"]
 mod chunking_stand;
+#[path = "live/gate_tls_failures.rs"]
+mod gate_tls_failures;
 #[path = "live/gremlin.rs"]
 mod gremlin;
 #[path = "live/gremlin_cdc.rs"]

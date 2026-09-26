@@ -142,6 +142,14 @@ pub fn classify_error(err: &anyhow::Error) -> RetryClass {
         return PERMANENT;
     }
 
+    // --- Typed marker: the connect failed in the TLS handshake (config, not network) ---
+    if err
+        .downcast_ref::<crate::source::TlsHandshakeFailed>()
+        .is_some()
+    {
+        return PERMANENT;
+    }
+
     // --- Postgres: check SQLSTATE via the `postgres::Error` downcasted type ---
     if let Some(pg) = err.downcast_ref::<postgres::Error>() {
         if let Some(db) = pg.as_db_error() {

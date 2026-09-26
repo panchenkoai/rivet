@@ -433,6 +433,42 @@ pub(crate) fn non_empty_keys(cols: Vec<String>) -> Option<Vec<String>> {
     (!cols.is_empty()).then_some(cols)
 }
 
+/// A connect that failed in the TLS handshake — a configuration fault no retry fixes (the classifier keys on the TYPE).
+#[derive(Debug)]
+pub struct TlsHandshakeFailed(String);
+
+impl std::fmt::Display for TlsHandshakeFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl TlsHandshakeFailed {
+    /// Put the TLS verdict (and its fix) in front of a driver error; `at` names the endpoint when known.
+    pub(crate) fn wrap(err: anyhow::Error, at: Option<&str>) -> anyhow::Error {
+        let with = at.map(|a| format!(" with {a}")).unwrap_or_default();
+        err.context(Self(format!(
+            "TLS handshake{with} failed — the server does not speak TLS or its certificate \
+             is not trusted: set `tls.ca_file` for a private CA, or `tls.mode: disable` if the \
+             server has no TLS (trusted networks only); retrying will not help"
+        )))
+    }
+}
+
+/// True when a rendered driver error names a failed TLS handshake or an untrusted certificate.
+pub(crate) fn is_tls_handshake_failure(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    [
+        "tls handshake",
+        "tlserror",
+        "does not support tls",
+        "invalid peer certificate",
+        "certificate verify failed",
+    ]
+    .iter()
+    .any(|p| t.contains(p))
+}
+
 /// Name the `url:` host and port when a connection failed before the server answered —
 /// an unresolvable name, a refused port, a timeout — since the driver's text alone
 /// does not say which part of the URL is wrong. Other errors pass through unchanged.
@@ -444,6 +480,9 @@ pub(crate) fn describe_connect_error(url: &str, err: anyhow::Error) -> anyhow::E
     } else {
         format!("{host}:{port}")
     };
+    if is_tls_handshake_failure(&text) {
+        return TlsHandshakeFailed::wrap(err, Some(&at));
+    }
     let hint = if [
         "failed to lookup address",
         "nodename nor servname",
@@ -592,6 +631,35 @@ mod connect_error_tests {
             );
             assert!(msg.contains("driver:"), "the driver's text stays: {msg}");
         }
+    }
+
+    const MONGO_TLS_EOF: &str = "Kind: Server selection timeout: No available servers. Topology: { Type: Unknown, Servers: [ { Address: 127.0.0.1:27017, Type: Unknown, Error: Kind: I/O error: tls handshake eof, labels: {\"SystemOverloadedError\", \"RetryableError\"}, source: None, server response: None } ] }, labels: {}, source: None, server response: None";
+    const MONGO_UNREACHABLE: &str = "Kind: Server selection timeout: No available servers. Topology: { Type: Unknown, Servers: [ { Address: 10.0.0.9:27017, Type: Unknown, Error: Kind: I/O error: connection timed out, labels: {}, source: None } ] }";
+
+    #[test]
+    fn a_mongo_tls_handshake_failure_is_permanent_and_says_tls_first() {
+        let e = describe_connect_error(
+            "mongodb://127.0.0.1:27017/rivet",
+            anyhow::anyhow!("{MONGO_TLS_EOF}"),
+        );
+        assert_eq!(
+            crate::pipeline::retry::classify_error(&e),
+            crate::pipeline::retry::RetryClass::Permanent
+        );
+        assert!(
+            format!("{e:#}").starts_with("TLS handshake with 127.0.0.1:27017 failed"),
+            "{e:#}"
+        );
+    }
+
+    #[test]
+    fn an_unreachable_mongo_host_stays_transient() {
+        let e = describe_connect_error(
+            "mongodb://10.0.0.9:27017/rivet",
+            anyhow::anyhow!("{MONGO_UNREACHABLE}"),
+        );
+        assert!(crate::pipeline::retry::classify_error(&e).is_transient());
+        assert!(format!("{e:#}").starts_with("no answer from 10.0.0.9:27017"));
     }
 
     #[test]

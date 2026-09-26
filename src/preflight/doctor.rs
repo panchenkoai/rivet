@@ -718,7 +718,7 @@ pub(crate) fn source_error_hint(
                 "TLS handshake failed. Oracle over TLS uses `tcps`: check the listener's TCPS port and that its certificate chains to a public CA in the bundle compiled into the driver (not the system trust store; a private `tls.ca_file` is not supported yet)."
             }
             SourceType::Mongo => {
-                "TLS handshake failed. For MongoDB, enable TLS in the connection string (`?tls=true`) and set `tls.ca_file: /path/to/ca-bundle.pem` for a private CA, or `tls.accept_invalid_certs: true` for a self-signed dev cert."
+                "TLS handshake failed. If the MongoDB server has no TLS, set `tls.mode: disable` (trusted networks only); for a private CA set `tls.ca_file: /path/to/ca-bundle.pem`, or `tls.accept_invalid_certs: true` for a self-signed dev cert."
             }
         });
     }
