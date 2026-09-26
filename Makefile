@@ -69,6 +69,14 @@ sweep-test-db:
 sweep-test-cloud:
 	$(PY) -m dev.pytools.sweep test-cruft --bigquery
 
+# Multi-hour soak on the CDC stand (NOT a release gate): sustained writes on all four engines,
+# batch + CDC runs on a schedule, graded by an independent journal. See dev/soak/README.md.
+# Smoke: `make soak SOAK_ARGS="--duration 10m"`. Output under dev/soak_runs/<timestamp>/.
+SOAK_ARGS ?=
+.PHONY: soak
+soak:
+	$(PY) -m dev.pytools.soak $(SOAK_ARGS)
+
 # Full live suite under nextest (per-test isolation), sweeping stale fixtures
 # FIRST so an interrupted prior run never pollutes the shared `rivet` DB.
 # Requires `docker compose up -d` (postgres + mysql + the validator containers).
