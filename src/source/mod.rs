@@ -3,6 +3,8 @@ pub(crate) mod cdc;
 pub mod mongo;
 pub mod mssql;
 pub mod mysql;
+#[cfg(feature = "oracle")]
+pub mod oracle;
 pub(crate) mod pg_numeric_wire;
 pub mod postgres;
 pub(crate) mod query;
@@ -45,6 +47,19 @@ impl StatementDurationTimeout {
         Self {
             message: format!(
                 "mssql: statement timeout after {seconds}s (tuning.statement_timeout_s) — \
+                 this query cannot finish within the budget; split it with `mode: chunked` \
+                 (per-chunk statements stay under the limit) or raise \
+                 `tuning.statement_timeout_s`"
+            ),
+        }
+    }
+
+    /// Oracle statement-duration timeout: the driver call timeout plus a check between rows.
+    #[cfg(feature = "oracle")]
+    pub fn oracle(seconds: u64) -> Self {
+        Self {
+            message: format!(
+                "oracle: statement timeout after {seconds}s (tuning.statement_timeout_s) — \
                  this query cannot finish within the budget; split it with `mode: chunked` \
                  (per-chunk statements stay under the limit) or raise \
                  `tuning.statement_timeout_s`"
@@ -205,7 +220,7 @@ pub struct ExportRequest<'a> {
     pub query: &'a str,
     /// The *unwrapped* base query to resolve catalog-dependent type hints from
     /// (PostgreSQL `NUMERIC` precision/scale, which the wire protocol omits — the
-    /// driver parses the `FROM` clause and asks `pg_catalog`). Chunked, dense and
+    /// driver parses the `FROM` clause and asks `pg_catalog`). Chunked and
     /// keyset runners wrap `query` in a `SELECT … FROM (<base>) …` subquery that
     /// hides the source table from the catalog parser, so they pass the original
     /// base query here. `None` ⇒ resolve from `query` (full/incremental, where it
@@ -266,7 +281,7 @@ impl<'a> ExportRequest<'a> {
     }
 
     /// A request whose `query` is a `SELECT … FROM (<base>) …` **wrapper** that
-    /// hides the source table (chunked / dense / time-window). `base` — the
+    /// hides the source table (chunked / time-window). `base` — the
     /// unwrapped query catalog hints resolve from — is a required argument, so a
     /// wrapping runner cannot silently fall back to the table-hiding wrapper and
     /// lose PG `NUMERIC` precision (the bug the catalog-hint fix / ADR-0020
@@ -398,12 +413,60 @@ pub trait Source: Send {
 
 /// Split a catalog's unit-separator-joined key list; an empty list is no key.
 pub(crate) fn split_key_list(joined: Option<String>) -> Option<Vec<String>> {
-    let cols: Vec<String> = joined?
-        .split('\u{1f}')
-        .filter(|c| !c.is_empty())
-        .map(str::to_string)
-        .collect();
+    non_empty_keys(
+        joined?
+            .split('\u{1f}')
+            .filter(|c| !c.is_empty())
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+/// The refusal for `source.type: oracle` in a build without the `oracle` feature.
+#[cfg_attr(feature = "oracle", allow(dead_code))]
+pub(crate) fn oracle_feature_missing() -> anyhow::Error {
+    anyhow::anyhow!("source.type: oracle — this rivet was built without the `oracle` feature")
+}
+
+/// A key column list, or `None` when the table has no key.
+pub(crate) fn non_empty_keys(cols: Vec<String>) -> Option<Vec<String>> {
     (!cols.is_empty()).then_some(cols)
+}
+
+/// A connect that failed in the TLS handshake — a configuration fault no retry fixes (the classifier keys on the TYPE).
+#[derive(Debug)]
+pub struct TlsHandshakeFailed(String);
+
+impl std::fmt::Display for TlsHandshakeFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl TlsHandshakeFailed {
+    /// Put the TLS verdict (and its fix) in front of a driver error; `at` names the endpoint when known.
+    pub(crate) fn wrap(err: anyhow::Error, at: Option<&str>) -> anyhow::Error {
+        let with = at.map(|a| format!(" with {a}")).unwrap_or_default();
+        err.context(Self(format!(
+            "TLS handshake{with} failed — the server does not speak TLS or its certificate \
+             is not trusted: set `tls.ca_file` for a private CA, or `tls.mode: disable` if the \
+             server has no TLS (trusted networks only); retrying will not help"
+        )))
+    }
+}
+
+/// True when a rendered driver error names a failed TLS handshake or an untrusted certificate.
+pub(crate) fn is_tls_handshake_failure(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    [
+        "tls handshake",
+        "tlserror",
+        "does not support tls",
+        "invalid peer certificate",
+        "certificate verify failed",
+    ]
+    .iter()
+    .any(|p| t.contains(p))
 }
 
 /// Name the `url:` host and port when a connection failed before the server answered —
@@ -417,6 +480,9 @@ pub(crate) fn describe_connect_error(url: &str, err: anyhow::Error) -> anyhow::E
     } else {
         format!("{host}:{port}")
     };
+    if is_tls_handshake_failure(&text) {
+        return TlsHandshakeFailed::wrap(err, Some(&at));
+    }
     let hint = if [
         "failed to lookup address",
         "nodename nor servname",
@@ -470,6 +536,13 @@ pub fn create_source(config: &SourceConfig) -> Result<Box<dyn Source>> {
             &url,
             config.tls.as_ref(),
         )?)),
+        #[cfg(feature = "oracle")]
+        SourceType::Oracle => Ok(Box::new(oracle::OracleSource::connect_with_tls(
+            &url,
+            config.tls.as_ref(),
+        )?)),
+        #[cfg(not(feature = "oracle"))]
+        SourceType::Oracle => Err(crate::source::oracle_feature_missing()),
         SourceType::Mongo => Ok(Box::new(mongo::MongoSource::connect(
             &url,
             config.tls.as_ref(),
@@ -558,6 +631,35 @@ mod connect_error_tests {
             );
             assert!(msg.contains("driver:"), "the driver's text stays: {msg}");
         }
+    }
+
+    const MONGO_TLS_EOF: &str = "Kind: Server selection timeout: No available servers. Topology: { Type: Unknown, Servers: [ { Address: 127.0.0.1:27017, Type: Unknown, Error: Kind: I/O error: tls handshake eof, labels: {\"SystemOverloadedError\", \"RetryableError\"}, source: None, server response: None } ] }, labels: {}, source: None, server response: None";
+    const MONGO_UNREACHABLE: &str = "Kind: Server selection timeout: No available servers. Topology: { Type: Unknown, Servers: [ { Address: 10.0.0.9:27017, Type: Unknown, Error: Kind: I/O error: connection timed out, labels: {}, source: None } ] }";
+
+    #[test]
+    fn a_mongo_tls_handshake_failure_is_permanent_and_says_tls_first() {
+        let e = describe_connect_error(
+            "mongodb://127.0.0.1:27017/rivet",
+            anyhow::anyhow!("{MONGO_TLS_EOF}"),
+        );
+        assert_eq!(
+            crate::pipeline::retry::classify_error(&e),
+            crate::pipeline::retry::RetryClass::Permanent
+        );
+        assert!(
+            format!("{e:#}").starts_with("TLS handshake with 127.0.0.1:27017 failed"),
+            "{e:#}"
+        );
+    }
+
+    #[test]
+    fn an_unreachable_mongo_host_stays_transient() {
+        let e = describe_connect_error(
+            "mongodb://10.0.0.9:27017/rivet",
+            anyhow::anyhow!("{MONGO_UNREACHABLE}"),
+        );
+        assert!(crate::pipeline::retry::classify_error(&e).is_transient());
+        assert!(format!("{e:#}").starts_with("no answer from 10.0.0.9:27017"));
     }
 
     #[test]
@@ -672,7 +774,7 @@ pub(crate) fn warn_if_tls_disabled(config: &SourceConfig) {
     WARNED.call_once(|| {
         log::warn!(
             "source: TLS is not enforced — credentials and result rows cross the network in plaintext. \
-             Add `source.tls.mode: verify-full` (with `ca_file:` if your CA is private) to enable transport security."
+             Add `source.tls.mode: verify-full` (with `ca_file:` if your CA is private — not yet supported for Oracle) to enable transport security."
         );
     });
 }
@@ -800,7 +902,7 @@ pub(crate) fn require_tls_or_loopback(url: &str, tls: Option<&TlsConfig>) -> Res
         let msg = "source: TLS required — refusing to connect to a remote (non-loopback) \
              host without TLS; credentials and every exported row would cross the network \
              in cleartext. Add `source.tls: { mode: verify-full }` (with `ca_file:` for a \
-             private CA) to enable transport security, or explicitly opt into remote \
+             private CA; not yet supported for Oracle) to enable transport security, or explicitly opt into remote \
              plaintext with `source.tls: { mode: disable }` if this network path is \
              already trusted.";
         log::error!("{msg}");

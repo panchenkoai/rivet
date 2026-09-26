@@ -142,6 +142,14 @@ pub fn classify_error(err: &anyhow::Error) -> RetryClass {
         return PERMANENT;
     }
 
+    // --- Typed marker: the connect failed in the TLS handshake (config, not network) ---
+    if err
+        .downcast_ref::<crate::source::TlsHandshakeFailed>()
+        .is_some()
+    {
+        return PERMANENT;
+    }
+
     // --- Postgres: check SQLSTATE via the `postgres::Error` downcasted type ---
     if let Some(pg) = err.downcast_ref::<postgres::Error>() {
         if let Some(db) = pg.as_db_error() {
@@ -171,6 +179,11 @@ pub fn classify_error(err: &anyhow::Error) -> RetryClass {
 
     // --- Fallback: string-based classification ---
     let msg = format!("{:#}", err).to_lowercase();
+
+    // Oracle: the source lifts `oracledb::Error` (Debug-only) into a string, so no downcast.
+    if is_oracle_lost_session(&msg) {
+        return TRANSIENT_RECONNECT;
+    }
 
     // Auth / credential errors are never transient — fix config, not retry
     if msg.contains("loading credential")
@@ -267,6 +280,7 @@ pub fn classify_error(err: &anyhow::Error) -> RetryClass {
         || msg.contains("connection slots are reserved")
         || msg.contains("the database system is starting up")
         || msg.contains("the database system is shutting down")
+        || is_oracle_capacity(&msg)
     {
         return transient(true, 15_000);
     }
@@ -356,6 +370,36 @@ fn classify_pg_sqlstate(code: &postgres::error::SqlState) -> RetryClass {
 
     // All other SQLSTATE codes → not transient by default
     PERMANENT
+}
+
+/// A lost or killed Oracle session: the thin driver's dead-connection wording or an ORA code
+/// for a killed session, a dropped channel, or an unreachable listener.
+/// Oracle refused a session for capacity: a per-user or server session/process cap,
+/// or a listener with no free handler. Clears when other sessions end.
+fn is_oracle_capacity(msg: &str) -> bool {
+    const CODES: &[&str] = &[
+        "ora-02391", // exceeded simultaneous SESSIONS_PER_USER limit
+        "ora-00018", // maximum number of sessions exceeded
+        "ora-00020", // maximum number of processes exceeded
+        "ora-12516", // TNS:listener could not find available handler
+        "ora-12519", // TNS:no appropriate service handler found
+        "ora-12520", // TNS:listener could not find available handler for requested type
+    ];
+    CODES.iter().any(|c| msg.contains(c))
+}
+
+fn is_oracle_lost_session(msg: &str) -> bool {
+    const CODES: &[&str] = &[
+        "ora-00028", // your session has been killed
+        "ora-03113", // end-of-file on communication channel
+        "ora-03114", // not connected to ORACLE
+        "ora-03135", // connection lost contact
+        "ora-12537", // TNS:connection closed
+        "ora-12170", // TNS:connect timeout occurred
+        "ora-12541", // TNS:no listener
+    ];
+    msg.contains("the database or network closed the connection")
+        || CODES.iter().any(|c| msg.contains(c))
 }
 
 /// Classify a MySQL error by numeric code.
@@ -467,6 +511,59 @@ mod tests {
                 matches!(c, RetryClass::Transient { .. }),
                 "{msg} must classify transient, got {c:?}"
             );
+        }
+    }
+
+    /// A lost or killed Oracle session reconnects and retries, in the form the source renders it.
+    #[test]
+    fn a_lost_oracle_session_is_transient_and_reconnects() {
+        for msg in [
+            "oracle: the database or network closed the connection",
+            "oracle: ORA-00028: your session has been killed",
+            "oracle: ORA-03113: end-of-file on communication channel",
+            "oracle: ORA-03114: not connected to ORACLE",
+            "oracle: ORA-03135: connection lost contact",
+            "oracle: ORA-12537: TNS:connection closed",
+            "oracle: ORA-12170: TNS:Connect timeout occurred",
+            "oracle: ORA-12541: TNS:no listener",
+        ] {
+            let c = classify_error(&anyhow::anyhow!("{msg}"));
+            assert_eq!(c, TRANSIENT_RECONNECT, "{msg}");
+        }
+    }
+
+    /// A session or process cap on Oracle clears as other sessions end: retry with the long delay.
+    #[test]
+    fn an_oracle_session_cap_is_transient_with_the_capacity_delay() {
+        for msg in [
+            "oracle: ORA-02391: exceeded simultaneous SESSIONS_PER_USER limit",
+            "oracle: ORA-00018: maximum number of sessions exceeded",
+            "oracle: ORA-00020: maximum number of processes (150) exceeded",
+            "oracle: ORA-12516: TNS:listener could not find available handler",
+            "oracle: ORA-12519: TNS:no appropriate service handler found",
+            "oracle: ORA-12520: TNS:listener could not find available handler",
+        ] {
+            assert_eq!(
+                classify_error(&anyhow::anyhow!("{msg}")),
+                transient(true, 15_000),
+                "{msg}"
+            );
+        }
+    }
+
+    /// Missing objects, bad credentials and syntax errors stay permanent on Oracle.
+    #[test]
+    fn a_permanent_oracle_error_is_not_retried() {
+        for msg in [
+            "oracle: ORA-00942: table or view \"RIVET\".\"NOPE\" does not exist",
+            "oracle: ORA-00904: \"NOPE\": invalid identifier",
+            "oracle: ORA-01017: invalid credential or not authorized; logon denied",
+            "oracle: ORA-00900: invalid SQL statement",
+            "oracle: ORA-00923: FROM keyword not found where expected",
+            "oracle: ORA-00933: SQL command not properly ended",
+        ] {
+            let c = classify_error(&anyhow::anyhow!("{msg}"));
+            assert_eq!(c, PERMANENT, "{msg}");
         }
     }
 

@@ -3217,7 +3217,7 @@ mod pool_harm_tests {
 }
 
 #[cfg(test)]
-mod run_tail_tests {
+pub(crate) mod run_tail_tests {
     use super::{
         RunModes, fold_failures, owns_throughput_self_check, pool_safe_heavy_split,
         reports_run_aggregate, self_check_throughput_as, snapshot_then_stamp, tail_plan,
@@ -3345,7 +3345,7 @@ mod run_tail_tests {
         fn flush(&self) {}
     }
 
-    fn install_warn_capture() {
+    pub(crate) fn install_warn_capture() {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
             let _ = log::set_logger(&WARN_CAPTURE);
@@ -3382,7 +3382,7 @@ mod run_tail_tests {
         )
     }
 
-    fn captured_warnings_mentioning(needle: &str) -> Vec<String> {
+    pub(crate) fn captured_warnings_mentioning(needle: &str) -> Vec<String> {
         WARN_LINES
             .lock()
             .unwrap_or_else(|e| e.into_inner())

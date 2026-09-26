@@ -454,7 +454,6 @@ fn apply_backfill_recipe(
     leg.chunk_size = recipe.chunk_size;
     leg.chunk_size_memory_mb = recipe.chunk_size_memory_mb;
     leg.chunk_count = recipe.chunk_count;
-    leg.chunk_dense = recipe.chunk_dense;
     leg.chunk_by_days = recipe.chunk_by_days;
     leg.chunk_checkpoint = recipe.chunk_checkpoint;
     leg.chunk_max_attempts = recipe.chunk_max_attempts;
@@ -780,6 +779,9 @@ fn run_cdc_inner(
                         // The same strings the sink will route by — see the field's doc.
                         configured_tables: wired.iter().map(|(t, _, _)| t.clone()).collect(),
                     },
+                    crate::config::SourceType::Oracle => {
+                        unreachable!("oracle cdc is refused at config validation")
+                    }
                     crate::config::SourceType::Mongo => CdcEngineOpts::Mongo {
                         canonical: config.source.mongo.as_ref().is_some_and(|m| {
                             matches!(m.json, crate::config::MongoJsonMode::Canonical)
@@ -1172,7 +1174,6 @@ mod tests {
         range.chunk_by_key = None;
         range.chunk_column = Some("ref_id".into());
         range.chunk_count = Some(7);
-        range.chunk_dense = true;
         range.chunk_by_days = Some(3);
         range.chunk_size_memory_mb = Some(64);
         range.chunk_max_attempts = Some(9);
@@ -1181,7 +1182,6 @@ mod tests {
         assert_eq!(range_leg.chunk_by_key, None);
         assert_eq!(range_leg.chunk_column.as_deref(), Some("ref_id"));
         assert_eq!(range_leg.chunk_count, Some(7));
-        assert!(range_leg.chunk_dense);
         assert_eq!(range_leg.chunk_by_days, Some(3));
         assert_eq!(range_leg.chunk_size_memory_mb, Some(64));
         assert_eq!(range_leg.chunk_max_attempts, Some(9));

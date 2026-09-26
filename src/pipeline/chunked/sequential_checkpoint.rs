@@ -50,13 +50,13 @@ fn export_one_chunk_range(
         &crate::pipeline::progress::ChunkProgressHandle,
         &std::sync::Arc<std::sync::atomic::AtomicI64>,
     )>,
+    debris: &mut Vec<super::super::commit::PartRecord>,
 ) -> Result<ChunkOutcome> {
     let chunk_query = build_chunk_query_sql(
         base_query,
         &cp.column,
         start,
         end,
-        cp.dense,
         cp.by_days.is_some(),
         plan.source.source_type,
     );
@@ -105,12 +105,17 @@ fn export_one_chunk_range(
     let dest = frame.dest;
     // Worker-safe half of commit (I1 + dest.write + fingerprint), draining
     // every part the sink produced (max_file_size rotation included).
-    let recs = super::super::commit::write_sink_parts(
+    let mut recs = Vec::new();
+    if let Err(e) = super::super::commit::write_sink_parts(
         dest.as_ref(),
         &mut sink,
         plan.validate.then_some(plan.format),
         |idx, count| super::super::commit::part_indexed_name(&base, idx, count),
-    )?;
+        &mut recs,
+    ) {
+        debris.append(&mut recs);
+        return Err(e);
+    }
     if plan.validate {
         summary.validated = Some(true);
     }
@@ -132,6 +137,7 @@ fn run_chunk_with_source_retries(
         &crate::pipeline::progress::ChunkProgressHandle,
         &std::sync::Arc<std::sync::atomic::AtomicI64>,
     )>,
+    debris: &mut Vec<super::super::commit::PartRecord>,
 ) -> Result<ChunkOutcome> {
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 0..=plan.tuning.max_retries {
@@ -198,6 +204,7 @@ fn run_chunk_with_source_retries(
             plan,
             summary,
             row_progress,
+            debris,
         ) {
             Ok(v) => return Ok(v),
             Err(e) => {
@@ -237,48 +244,17 @@ pub(crate) fn run_chunked_sequential_checkpoint(
     }
 
     let chunks = if plan.resume {
-        // A resume re-executes the STORED plan, and two things must still be true
-        // for that to be sound — neither of which was checked, because this arm
+        // A resume re-executes the STORED plan, and one thing must still be true
+        // for that to be sound — and it was not checked, because this arm
         // skipped the whole match below (round-11 bughunt).
         //
-        // 1. The SCHEMA must not have drifted. `on_schema_drift: fail` was inert
+        // The SCHEMA must not have drifted. `on_schema_drift: fail` was inert
         //    here: DEMONSTRATED — a `DROP COLUMN` between the crash and the resume
         //    produced exit 0, `rows: 300`, and three parts under ONE
         //    `schema_fingerprint` whose schemas disagree. The identical drop without
         //    `--resume` fails loudly. The gap between a crash and its resume is
         //    exactly where a schema change is most likely.
-        //
-        // 2. For `chunk_dense`, the ROW SET must not have changed. Dense windows are
-        //    ORDINALS (`ROW_NUMBER() OVER (ORDER BY col)`, 1..COUNT(*)) frozen at
-        //    plan time and re-evaluated at execution, so an insert shifts every row
-        //    under every stored ordinal. DEMONSTRATED on a 50-row table: crash after
-        //    chunk 0, insert 3 rows below the key range, resume → `status: success`,
-        //    `rows: 50`, and an independent read of the parts gives 50 rows / 47
-        //    DISTINCT — three ids written twice while six that exist in the source
-        //    were never exported. Silent because the ordinal partition stays gapless
-        //    and self-consistent and `rows` equals the manifest sum; only a per-key
-        //    comparison against the source sees it.
-        //
-        // Refusing rather than silently re-planning: the chunk table already records
-        // which ordinals were exported, and those records now describe rows nobody
-        // can identify. Re-deriving would produce a correct plan over an incorrect
-        // ledger.
         super::check_drift_only(src, plan, Some(state), summary)?;
-        if cp.dense {
-            anyhow::bail!(
-                "export '{}': cannot resume a `chunk_dense` plan. Dense chunks are \
-                 ORDINALS (`ROW_NUMBER() OVER (ORDER BY …)`, 1..COUNT(*)) frozen when \
-                 the plan was made and re-evaluated at execution, so ANY insert or \
-                 delete since then shifts which rows every stored window names — the \
-                 resume would re-export some and skip others while reporting success. \
-                 rivet cannot tell from the chunk ledger whether the row set moved, \
-                 because the ledger records ordinals, not keys. Re-run WITHOUT \
-                 `--resume` to re-plan from scratch, or switch to range chunking \
-                 (`chunk_dense: false`), whose windows are KEY ranges and survive a \
-                 change to the rows between them.",
-                plan.export_name
-            );
-        }
         vec![]
     } else {
         match chunk_source {
@@ -349,10 +325,13 @@ pub(crate) fn run_chunked_sequential_checkpoint(
             end_key: ek.clone(),
         });
 
+        // Parts a FAILED chunk left durable: counted and logged below, never lost.
+        let mut debris = Vec::new();
         // Test-only: make ONE chunk fail without killing the process, so the
         // "not every claimed chunk completed" guard below can be exercised. A
         // panic hook cannot reach it — the guard only runs when the loop
-        // finishes, which a crash never does.
+        // finishes, which a crash never does. (`sink_part_write:N` fails a chunk
+        // MID-write instead, after its earlier parts are durable.)
         let chunk_result = match crate::test_hook::maybe_error_at_index("chunk_export", chunk_index)
         {
             Err(msg) => Err(anyhow::anyhow!(msg)),
@@ -365,6 +344,7 @@ pub(crate) fn run_chunked_sequential_checkpoint(
                 plan,
                 summary,
                 Some((&pb_handle, &streamed_rows)),
+                &mut debris,
             ),
         };
         match chunk_result {
@@ -429,6 +409,16 @@ pub(crate) fn run_chunked_sequential_checkpoint(
                     error: msg.clone(),
                     attempt: 1,
                 });
+                for rec in &debris {
+                    super::super::commit::record_part(
+                        plan,
+                        summary,
+                        Some(state),
+                        rec,
+                        super::super::commit::PartKind::Chunk { chunk_index },
+                        super::super::commit::UnitId::Chunk(chunk_index),
+                    );
+                }
                 state.fail_chunk_task(&run_id, chunk_index, &msg, retryable)?;
             }
         }

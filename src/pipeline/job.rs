@@ -719,8 +719,9 @@ fn reconcile_source_count(plan: &ResolvedRunPlan, summary: &mut RunSummary) -> O
     }
 
     let count_sql = format!(
-        "SELECT COUNT(*) FROM ({}) AS _rivet_reconcile",
-        plan.base_query
+        "SELECT COUNT(*) FROM ({}) {}",
+        plan.base_query,
+        crate::sql::derived(plan.source.source_type, "_rivet_reconcile")
     );
     log::info!(
         "reconcile: running source count query for '{}'",
@@ -902,6 +903,11 @@ pub(super) struct RunOutcome<'a> {
 
 pub(super) fn keyset_anchor_survives(o: RunOutcome<'_>) -> bool {
     o.failed || o.manifest_gap.is_some()
+}
+
+/// Whether the incremental cursor may advance: only a successful run whose manifest landed.
+fn cursor_may_advance(status: &str, manifest_gap: &Option<String>) -> bool {
+    status == "success" && manifest_gap.is_none()
 }
 
 fn finalize_keyset_anchor(
@@ -1166,6 +1172,14 @@ fn execute_resolved_plan(
     state: &StateStore,
     tail: TailPolicy<'_>,
 ) -> (Result<()>, RunSummary) {
+    let (_run_lease, recovered) = match chunked::claim_checkpoint_run(state, plan) {
+        Ok(claim) => claim,
+        Err(e) => {
+            let summary = synthetic_failed_summary(&plan.export_name, &e);
+            return (Err(e), summary);
+        }
+    };
+    let plan = recovered.as_ref().unwrap_or(plan);
     let start = std::time::Instant::now();
     let rss_before = crate::resource::get_rss_mb();
     let rss_sampler = crate::resource::RssPeakSampler::start(rss_before, 100);
@@ -1416,13 +1430,15 @@ fn execute_resolved_plan(
     // "now that the manifest is durable" was a PREMISE, not a check: the cursor
     // advanced even when the manifest write had just failed, so the next run
     // started past data nothing described. Guarded now.
-    if manifest_gap.is_some() {
-        log::error!(
-            "{} '{}': incremental cursor NOT advanced — the manifest did not land, so the \
-             next run must re-export this window rather than skip past it",
-            tail.kind,
-            summary.export_name,
-        );
+    if !cursor_may_advance(&summary.status, &manifest_gap) {
+        if summary.cursor_high.is_some() {
+            log::error!(
+                "{} '{}': incremental cursor NOT advanced — the run did not succeed with a \
+                 manifest, so the next run must re-export this window rather than skip past it",
+                tail.kind,
+                summary.export_name,
+            );
+        }
     } else if let Err(e) = commit_incremental_cursor(state, plan, &summary) {
         log::error!(
             "{} '{}': cursor advance failed AFTER the manifest was written — the next run \
@@ -1905,6 +1921,19 @@ mod tests {
     /// manifest names — they are unreachable from both ends. Found by an
     /// adversarial pass over this branch; the manifest-gap handling that made the
     /// status "failed" did not widen the flag this decision reads.
+    #[test]
+    fn a_failed_run_holds_the_incremental_cursor_even_when_its_manifest_landed() {
+        let gap = Some("the manifest write FAILED".to_string());
+        assert!(cursor_may_advance("success", &None));
+        assert!(
+            !cursor_may_advance("failed", &None),
+            "a gate that fails AFTER the write (on_schema_drift: fail, quality) leaves only a \
+             Failed manifest — advancing past its rows loses them"
+        );
+        assert!(!cursor_may_advance("success", &gap));
+        assert!(!cursor_may_advance("failed", &gap));
+    }
+
     #[test]
     fn a_run_whose_manifest_did_not_land_keeps_its_keyset_resume_anchor() {
         let gap = Some("the manifest write FAILED".to_string());
@@ -2704,7 +2733,6 @@ mod tests {
                 chunk_size: 100,
                 chunk_count: None,
                 parallel: 1,
-                dense: false,
                 by_days: None,
                 checkpoint: false,
                 max_attempts: 3,
@@ -2969,7 +2997,6 @@ mod tests {
             chunk_size: 100_000,
             chunk_count: None,
             parallel: 4,
-            dense: false,
             by_days: None,
             checkpoint: false,
             max_attempts: 3,

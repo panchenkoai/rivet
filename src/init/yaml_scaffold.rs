@@ -586,7 +586,7 @@ fn table_shortcut_shape_ok(qualified: &str) -> bool {
 /// relation when a lowercase twin exists.
 fn recipe_readable(info: &TableInfo, source_type: &str) -> bool {
     let name = &info.table;
-    table_shortcut_shape_ok(name) && (source_type != "postgres" || is_simple_pg_ident(name))
+    table_shortcut_shape_ok(name) && unquoted_addresses_itself(name, source_type)
 }
 
 /// The read strategy a table's backfill RECIPE gets: paged when it can be, `full` otherwise.
@@ -673,9 +673,15 @@ pub(crate) fn table_form_ok(info: &TableInfo, source_type: &str) -> bool {
     // (round-9): diverging from the config gate produced DOA scaffolds twice.
     let qualified = qualified_table_of(info, source_type);
     let shape_ok = table_shortcut_shape_ok(&qualified);
+    shape_ok && unquoted_addresses_itself(&qualified, source_type)
+}
+
+/// Whether `name` written UNQUOTED resolves to the catalog name itself on `source_type` (PG folds lower, Oracle upper).
+fn unquoted_addresses_itself(name: &str, source_type: &str) -> bool {
     match source_type {
-        "postgres" => shape_ok && is_simple_pg_ident(&qualified),
-        _ => shape_ok,
+        "postgres" => is_simple_pg_ident(name),
+        "oracle" => name == name.to_uppercase(),
+        _ => true,
     }
 }
 
@@ -2407,6 +2413,24 @@ mod tests {
     /// all-`public` PostgreSQL schema; every other shape is one export per table. RED
     /// against each operator of that gate: a batch multi-table scaffold is never a
     /// stream, nor a non-`public` PostgreSQL schema, nor SQL Server, nor one table.
+    /// Oracle folds an unquoted name upper-case, so only an all-upper name may be an unquoted `table:`.
+    #[test]
+    fn an_oracle_mixed_case_name_is_never_an_unquoted_table() {
+        let mk = |schema: &str, table: &str| TableInfo {
+            density: None,
+            schema: schema.into(),
+            table: table.into(),
+            row_estimate: 100,
+            total_bytes: None,
+            columns: vec![col("ID", "bigint")],
+        };
+        assert!(table_form_ok(&mk("RIVET", "ORDERS"), "oracle"));
+        assert!(!table_form_ok(&mk("RIVET", "Orders_Mx"), "oracle"));
+        assert!(!table_form_ok(&mk("rivet", "ORDERS"), "oracle"));
+        assert!(table_form_ok(&mk("dbo", "Orders_Mx"), "mssql"));
+        assert!(!recipe_readable(&mk("RIVET", "Orders_Mx"), "oracle"));
+    }
+
     #[test]
     fn only_a_multi_table_cdc_scaffold_on_mysql_or_public_postgres_is_one_stream() {
         let mk = |schema: &str, table: &str| TableInfo {

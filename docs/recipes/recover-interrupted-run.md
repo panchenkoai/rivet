@@ -113,8 +113,14 @@ What `repair --execute` does and does not:
   `<nonce>` is a random 16-hex-digit suffix — the nonce, not the
   timestamp, is what guarantees a repair re-export never overwrites
   the original part.
-- Does **not** delete or overwrite prior files.  Downstream
-  deduplication or a versioned output prefix is the operator's job.
+- Does **not** delete or overwrite prior files, but the manifest
+  declares the replacement: the chunk's original part(s) are marked
+  `superseded`, so `rivet load`, `rivet validate`, and any reader of the
+  committed parts see each row once.  The superseded files stay on disk
+  until `load.gc_orphans: true` collects them.  If repair cannot map an
+  original part to its chunk without guessing, it warns and keeps both
+  declared for that chunk.  A warehouse that loaded the original part
+  before the repair keeps those rows unless it dedups by primary key.
 - Leaves `last_committed_*` untouched (RR4).  `last_verified_*`
   re-advances only on a subsequent clean reconcile (zero mismatches,
   zero unknowns).  See

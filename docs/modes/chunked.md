@@ -20,18 +20,17 @@ Four ways to slice the table. They differ in how chunk boundaries are computed; 
 | Strategy | YAML | How boundaries are computed | When to use | Mutually exclusive with |
 |---|---|---|---|---|
 | **Fixed size** (default) | `chunk_size: 100000` | `SELECT MIN, MAX` → `[min..min+N)`, `[min+N..min+2N)`, ... — `N` rows of range per chunk | Dense numeric PK, predictable size budget per chunk | `chunk_size_memory_mb` |
-| **Fixed count** | `chunk_count: 16` | Range divided into exactly `N` equal slices; per-chunk size derived dynamically | You want exactly *N* workers / files (e.g. = CPU cores) | `chunk_dense`, `chunk_by_days` |
-| **Dense** | `chunk_dense: true` | `ROW_NUMBER() OVER (ORDER BY chunk_column)` instead of range; guarantees equal **row count** per chunk regardless of gaps | Sparse IDs — UUIDs as `BIGINT`, deleted rows, hashed keys | `chunk_by_days` |
-| **Date-native** | `chunk_by_days: 365` | `chunk_column` must be `DATE` / `TIMESTAMP` / `TIMESTAMPTZ`; windows of N days with `>= AND <` (open-end) semantics | Time-series, event logs, historical backfills by period | `chunk_dense` |
+| **Fixed count** | `chunk_count: 16` | Range divided into exactly `N` equal slices; per-chunk size derived dynamically | You want exactly *N* workers / files (e.g. = CPU cores) | `chunk_by_days` |
+| **Date-native** | `chunk_by_days: 365` | `chunk_column` must be `DATE` / `TIMESTAMP` / `TIMESTAMPTZ`; windows of N days with `>= AND <` (open-end) semantics | Time-series, event logs, historical backfills by period | `chunk_count` |
 | **Memory-target** | `chunk_size_memory_mb: 256` | Auto-computes `chunk_size` from the engine's row-size estimate (PG `pg_class`/`reltuples`, MySQL `information_schema` avg row length; SQL Server has no estimate and falls back to 512 B/row); clamped to `[10_000, 5_000_000]` rows. Requires `table:` shortcut. Works on Postgres, MySQL, and SQL Server | You want to budget by megabytes, not rows; wide tables where row-width is hard to guess | explicit `chunk_size` |
-| **Keyset** (seek) | `chunk_by_key: uid` | Pages with `WHERE key > last ORDER BY key LIMIT chunk_size` on a unique index — **sequential by default; `parallel: N` fans it into N disjoint key ranges** — each page is one part file | **MySQL** tables with no single-integer PK (UUID / string / composite PK) — the only bounded shape without a server cursor. See [Keyset pagination](#keyset-seek-pagination--the-safe-shape-without-an-integer-pk) below | `chunk_column`, `chunk_dense`, `chunk_by_days`, `chunk_count` |
+| **Keyset** (seek) | `chunk_by_key: uid` | Pages with `WHERE key > last ORDER BY key LIMIT chunk_size` on a unique index — **sequential by default; `parallel: N` fans it into N disjoint key ranges** — each page is one part file | **MySQL** tables with no single-integer PK (UUID / string / composite PK) — the only bounded shape without a server cursor. See [Keyset pagination](#keyset-seek-pagination--the-safe-shape-without-an-integer-pk) below | `chunk_column`, `chunk_by_days`, `chunk_count` |
 
 **Orthogonal options that combine with any strategy:**
 
 | Field | Effect |
 |---|---|
 | `parallel: N` | Up to `N` chunks execute concurrently (separate DB connections). Default `1`. `rivet init` scaffolds a row-scaled value (≤500 K → 1, <5 M → 2, ≥5 M → 4) |
-| `chunk_checkpoint: true` | Per-chunk row in state DB → `rivet run --resume` skips completed chunks after a crash |
+| `chunk_checkpoint: true` | Per-chunk row in state DB → after a crash, the next run (plain or `--resume`) skips completed chunks |
 | `chunk_max_attempts: 3` | **Requires `chunk_checkpoint: true`.** Total attempt budget per chunk (first attempt + retries): `3` means each failed chunk is retried up to 2 times before the run bails. The budget is stored on the checkpoint run and enforced when a chunk task is claimed, so without `chunk_checkpoint` it has no effect — the non-checkpointed runners have no per-chunk retry and a failed chunk fails the run. Defaults to `tuning.max_retries + 1` |
 
 > **Picking `parallel`.** Extraction is I/O-bound, so the win comes from
@@ -44,7 +43,7 @@ Four ways to slice the table. They differ in how chunk boundaries are computed; 
 > heuristic is a good starting point; tune from there if memory or source
 > connection count is constrained.
 
-**Each integer-range chunk runs:** `SELECT * FROM (<base_query>) AS _rivet WHERE <chunk_column> BETWEEN <lo> AND <hi>` — inclusive bounds (hi = lo + chunk_size - 1) inlined as literals, not bind parameters. The subquery wrap applies to `query:` exports; a `table:` shortcut renders the unwrapped `SELECT * FROM <table> WHERE <chunk_column> BETWEEN <lo> AND <hi>`. The date variant (`chunk_by_days`) uses half-open `WHERE col >= '<start>' AND col < '<end>'`; dense uses `ROW_NUMBER()` (documented further down).
+**Each integer-range chunk runs:** `SELECT * FROM (<base_query>) AS _rivet WHERE <chunk_column> BETWEEN <lo> AND <hi>` — inclusive bounds (hi = lo + chunk_size - 1) inlined as literals, not bind parameters. The subquery wrap applies to `query:` exports; a `table:` shortcut renders the unwrapped `SELECT * FROM <table> WHERE <chunk_column> BETWEEN <lo> AND <hi>`. The date variant (`chunk_by_days`) uses half-open `WHERE col >= '<start>' AND col < '<end>'`.
 
 ## Minimal config
 
@@ -143,8 +142,8 @@ rivet state reset-chunks --config large_table.yaml --export orders_chunked
 
 Chunked mode is **not** "extract once, skip on the next clean run". Two
 plain `rivet run` invocations against the same table re-extract every
-chunk both times — `chunk_checkpoint: true` only matters for `--resume`
-after a crashed run. Each clean run produces a new file set with a
+chunk both times — `chunk_checkpoint: true` only matters after a crashed
+run, which the next run resumes. Each clean run produces a new file set with a
 fresh `run_id` and timestamp suffix.
 
 | Invocation | Behaviour |
@@ -205,42 +204,17 @@ The open-end `< end_date` bound is intentional: it correctly captures all `TIMES
 
 `chunk_by_days` can be combined with `parallel` for concurrent date windows, and supports `chunk_checkpoint` / `--resume` like numeric chunked mode.
 
-`chunk_dense: true` is incompatible with `chunk_by_days` and will be rejected at config validation.
-
 `rivet check` will report the strategy as `date-chunked(ordered_at, 365d)`.
 
 ## Sparse ID ranges
 
-If IDs have large gaps (e.g. UUIDs cast to BIGINT, or deleted rows), many chunks may be empty. Use `chunk_dense: true` to use `ROW_NUMBER()` ordering instead:
-
-```yaml
-exports:
-  - name: sparse_table
-    query: "SELECT id, payload FROM orders_sparse"
-    mode: chunked
-    chunk_column: id
-    chunk_size: 50000
-    chunk_dense: true               # uses ROW_NUMBER() instead of range splitting
-    format: parquet
-    destination:
-      type: local
-      path: ./output
-```
+If IDs have large gaps (e.g. UUIDs cast to BIGINT, or deleted rows), many chunks may be empty. On a unique key use keyset (`chunk_by_key`, below) — it pages by rows, so gaps cost nothing. Otherwise `chunk_count: N` caps the number of windows.
 
 `rivet check` will warn you about sparse ranges.
 
-> **Pick a `chunk_column` whose ordering is stable.** Dense mode pages by
-> `ROW_NUMBER() OVER (ORDER BY chunk_column)`, recomputed in an independent query
-> per chunk. If `chunk_column` has a large tied peer group (many equal values)
-> *and* the source is being written concurrently during the export, two chunks'
-> queries could order the tied band differently and a boundary row could land in
-> both or neither. Against a **static** table every engine we test (PG 16,
-> MySQL 8, SQL Server 2022) orders ties deterministically, so this does not occur
-> — but prefer a column with no large tied groups, or use **keyset** on a unique
-> key, when exporting a live-writing table. (The analog for incremental cursors
-> is in [semantics.md § Known non-guarantees](../semantics.md#known-non-guarantees).
-> Regression-guarded by `tests/live/live_chunked_dense.rs`, compiled into the
-> live suite via `tests/live_suite.rs`.)
+> **`chunk_dense` was removed.** It paged by `ROW_NUMBER() OVER (ORDER BY chunk_column)`,
+> recomputed per chunk, so concurrent inserts or deletes skipped or duplicated rows
+> even on a unique key. A config that still sets `chunk_dense: true` is refused at load.
 
 ## Keyset (seek) pagination — the safe shape without an integer PK
 
@@ -377,8 +351,8 @@ with `N`.
 
 ## Troubleshooting
 
-**Many empty chunks** -- Your ID column has gaps. Add `chunk_dense: true`.
+**Many empty chunks** -- Your ID column has gaps. Use `chunk_by_key` on a unique key, or `chunk_count: N`.
 
 **High memory usage with parallel > 1** -- Reduce `chunk_size` or add `tuning.profile: safe`.
 
-**Export fails midway through 1000 chunks** -- Enable `chunk_checkpoint: true` and re-run with `--resume`.
+**Export fails midway through 1000 chunks** -- Enable `chunk_checkpoint: true`; the next run resumes from the completed chunks, whether the last run crashed or failed.

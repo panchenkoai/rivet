@@ -114,14 +114,19 @@ const EXEMPT: &[(&str, &str)] = &[
 ];
 
 const MATRICES: &[(&str, usize)] = &[
-    ("docs/chunking-matrix.yaml", 0),
+    // Raised 0 -> 14 (2026-09-26): the Oracle column's honest gaps (batch-only phase 1).
+    // Lowered 14 -> 12 (2026-09-26): Oracle init keyset scaffold + chunk_by_days proven live.
+    // Lowered 12 -> 11 (2026-09-26): the `dense_chunk_dense` row went with `chunk_dense` (its Oracle gap too).
+    ("docs/chunking-matrix.yaml", 11),
     // Export-STRATEGY flag × engine, verified on GOLDEN fixtures + a distilled
     // GARBAGE profile (anonymized shape of a 200+-table field DB). Two layers:
     // the offline scaffold_strategy oracle (all shapes) + the live chunking_stand
     // (representative subset). Engine-specific garbage failure modes (unsigned
     // cursor = MySQL, regclass-throw = PG, STRING_AGG cap = MSSQL) are one test
     // + justified n/a. 0 gaps — every cell is a test or a justified n/a.
-    ("docs/cli-flag-matrix.yaml", 0),
+    // Raised 0 -> 10 (2026-09-26): the Oracle column's honest gaps (batch-only phase 1).
+    // Lowered 10 -> 8 (2026-09-26): Oracle wide-table introspection + time_window proven live.
+    ("docs/cli-flag-matrix.yaml", 8),
     // Destination-backend correctness (local/gcs/s3/azure × scenario): the dogfood
     // cloud findings (prefix normalization B, --validate-is-advisory A) + the
     // emulator round-trip + cross-backend parity.
@@ -131,20 +136,27 @@ const MATRICES: &[(&str, usize)] = &[
     // `azure_parquet_total_rows` the multipart test uses rather than a second
     // per-backend definition of delivered.
     ("docs/destination-matrix.yaml", 0),
-    ("docs/behaviour-matrix.yaml", 0),
-    ("docs/type-fidelity-matrix.yaml", 0),
+    // Raised 0 -> 2 (2026-09-26): the Oracle column's honest gaps (batch-only phase 1).
+    // Lowered 2 -> 1 (2026-09-26): Oracle time_window proven live.
+    ("docs/behaviour-matrix.yaml", 1),
+    // Raised 0 -> 1 (2026-09-26): the Oracle column's honest gaps (batch-only phase 1).
+    ("docs/type-fidelity-matrix.yaml", 1),
     // Cross config × db: 15 honest holes on the non-PG engines (cloud dests, codec
     // parity, csv, tuning profile) — visible + un-growable; fill by writing the test.
-    ("docs/cross-config-matrix.yaml", 0),
+    // Raised 0 -> 7 (2026-09-26): the Oracle column's honest gaps (batch-only phase 1).
+    // Lowered 7 -> 5 (2026-09-26): Oracle --reconcile + parallel: N proven live.
+    ("docs/cross-config-matrix.yaml", 5),
     // CDC — the most engine-divergent surface (12 scenarios × 4 engines). Complements
     // tests/cdc_conformance_gate.rs. The 5 holes it surfaced (schema-drift on PG +
     // MSSQL, until_current-terminates-under-load on the three SQL engines) are now
     // filled — every cell is a test or a justified n/a.
-    ("docs/cdc-matrix.yaml", 0),
+    // Raised 0 -> 21 (2026-09-26): the Oracle column's honest gaps (batch-only phase 1).
+    ("docs/cdc-matrix.yaml", 21),
     // Resilience / crash-recovery (BATCH + cross-cutting). Both Mongo holes closed:
     // batch-clobber filled with a live test; crash-after-source-read is na (that
     // hook is single.rs-only, and Mongo runs the keyset path).
-    ("docs/resilience-matrix.yaml", 0),
+    // Raised 0 -> 10 (2026-09-26): the Oracle column's honest gaps (batch-only phase 1).
+    ("docs/resilience-matrix.yaml", 10),
     // Warehouse-load — the Parquet→warehouse-autoload axis, keyed on the 4
     // ExportTarget variants (duckdb/bigquery/snowflake/clickhouse), not source
     // engines. Caught + fixed 3 resolver bugs (SF/DuckDB/CH decimal ceilings). 0
@@ -153,7 +165,8 @@ const MATRICES: &[(&str, usize)] = &[
     // Fail-loud / error-surface — the inverse of silent corruption: every
     // unrecoverable degradation fails LOUD, not silently. Cross-references the CDC
     // conformance gate + chunking/resilience/warehouse ledgers for the unified view.
-    ("docs/fail-loud-matrix.yaml", 0),
+    // Raised 0 -> 5 (2026-09-26): the Oracle column's honest gaps (batch-only phase 1).
+    ("docs/fail-loud-matrix.yaml", 5),
     // Load-mode write contracts — keyed on the 3 LoadMode variants (full /
     // incremental / cdc), not source engines. Codifies the 4 data bugs found in
     // the load layer (incremental+cleanup loss, full duplicate snapshots, full
@@ -166,13 +179,15 @@ const MATRICES: &[(&str, usize)] = &[
     // run nightly by fuzz.yml); the many `na:` cells prove structural immunity
     // (binary protocol decoded by the driver crate, panic-safe field access, or
     // write-only). 0 gaps: the surface Rivet parses is fully covered.
-    ("docs/fuzz-matrix.yaml", 0),
+    // Raised 0 -> 3 (2026-09-26): the Oracle column's honest gaps (batch-only phase 1).
+    ("docs/fuzz-matrix.yaml", 3),
     // URL & credential safety — the userinfo encode/decode/redact class that
     // regressed THREE times (round-1 MSSQL round-trip, round-3 redact_pg_url, and
     // the general log redactor), each invisible to point tests. `test:` cells are
     // round-trip + data-driven redaction sweeps; `na:` cells are driver-owned
     // parses or state-URL seams that don't exist per engine. 0 gaps.
-    ("docs/url-safety-matrix.yaml", 0),
+    // Raised 0 -> 3 (2026-09-26): the Oracle column's honest gaps (batch-only phase 1).
+    ("docs/url-safety-matrix.yaml", 3),
     // Durability ordering — the destination manifest is durable BEFORE the delivery
     // position advances, and the manifest/_SUCCESS pair stays consistent. This class
     // regressed twice (round-2 #11/#12) and escaped resilience/cdc because their
@@ -245,13 +260,15 @@ const MATRICES: &[(&str, usize)] = &[
     // Lower a cell the moment a per-runner readback exists.
     ("docs/runner-coverage-matrix.yaml", 5),
     // Mode transitions (ADR-0033). 3 gaps: MT6, pre-v26 incremental cursors carry no identity.
-    ("docs/mode-transition-matrix.yaml", 0),
+    // Raised 0 -> 14 (2026-09-26): the Oracle column's honest gaps (batch-only phase 1).
+    ("docs/mode-transition-matrix.yaml", 14),
     // Pool-split — `apply --pool --split` per (strategy × source engine). Split is a
     // scheduler layer above the runners (each unit runs through chunked/keyset), so its
     // per-engine behaviour (boundary probe, crash-recovery, finding-2 exact-partition
     // resume) is proven on every SQL engine via the Rig stand + a DuckDB manifest oracle;
     // Mongo is `na` (no inline SQL range literal → left whole). 0 gaps.
-    ("docs/pool-split-matrix.yaml", 0),
+    // Raised 0 -> 3 (2026-09-26): the Oracle column's honest gaps (batch-only phase 1).
+    ("docs/pool-split-matrix.yaml", 3),
     // CDC per-type value fidelity — the change-stream sibling of type-fidelity, the
     // axis where findings #2 (MSSQL MONEY>2^53), #3 (MySQL ENUM cross-db) and #4
     // (BIT(64) bit 63) lived: batch correct, CDC/edge sibling not. Workhorse cells
@@ -259,7 +276,8 @@ const MATRICES: &[(&str, usize)] = &[
     // CDC==batch); edge scenarios cite the range-specific tests. Row axis is
     // GENERATIVELY complete over RivetType (matrix_cdc_type_rows_cover_every_rivet_type).
     // 0 gaps: every (type × engine) cell is a test or a justified n/a.
-    ("docs/cdc-type-fidelity-matrix.yaml", 0),
+    // Raised 0 -> 11 (2026-09-26): the Oracle column's honest gaps (batch-only phase 1).
+    ("docs/cdc-type-fidelity-matrix.yaml", 11),
     // Load spec (ADR-0034) — `load.partition` form × granularity × warehouse target. The
     // BigQuery form cells are live (run + load + tables.get per cell); Snowflake cells are
     // SQL-text proofs (no live Snowflake from this stand); duckdb/clickhouse are `na`. 0 gaps.
@@ -807,8 +825,11 @@ fn matrix_columns_cover_every_source_and_target_enum_variant() {
     let dests = enum_variants_lowercased("src/config/destination.rs", "DestinationType");
     // Parse sanity: a drift here would silently UNDER-require, defeating the guard.
     assert!(
-        sources.len() == 4 && sources.contains("postgres") && sources.contains("mongo"),
-        "SourceType parse produced {sources:?} (expected the 4 source engines)"
+        sources.len() == 5
+            && sources.contains("postgres")
+            && sources.contains("mongo")
+            && sources.contains("oracle"),
+        "SourceType parse produced {sources:?} (expected the 5 source engines)"
     );
     assert!(
         targets.len() == 4 && targets.contains("duckdb") && targets.contains("clickhouse"),

@@ -346,13 +346,13 @@ By default `validate` resolves the destination prefix the same way `run` does (`
 | `--config` | `-c` | string | Path to YAML config file **(required)** |
 | `--export` | `-e` | string | Validate only a specific export by name |
 | `--format` | | `pretty`\|`json` | Output format: `pretty` (human summary) or `json` (machine-readable) |
-| `--depth` | | `light`\|`sample`\|`full` | Verification depth: `light` (manifest + `_SUCCESS`), `sample` (+ part reconcile + untracked surplus), `full` (+ value-checksum re-read of every part; **default**) |
+| `--depth` | | `light`\|`sample`\|`full` | Verification depth: `light` (manifest + `_SUCCESS`), `sample` (+ part reconcile + untracked surplus), `full` (+ value-checksum re-read of every part; **default**). CSV parts carry no value checksum: at `full` each CSV part's rows are re-counted against the manifest and a `RIVET_VERIFY_VALUE_CHECK_NOT_AVAILABLE` warning says no cell values were re-read |
 | `--output` | `-o` | PATH | Write the JSON report to this file (only with `--format json`) |
 | `--date` | | YYYY-MM-DD | Resolve `{date}` to this date instead of today (UTC) |
 | `--run-id` | | string | Substitute `{run_id}` in the destination prefix template (composes with `--date`). No run lookup is performed — if the template has no `{run_id}` placeholder this has no effect; use `--prefix` for an arbitrary path |
 | `--prefix` | | string | Point at an explicit destination prefix |
 
-Exits non-zero when the manifest references a part that is missing or whose size does not match. A legacy prefix (no manifest) falls back to the M6 reduced-guarantee path and is labelled `legacy_run: true`.
+Exits non-zero when the manifest references a part that is missing or whose size does not match, and when the manifest records its last run as anything but `success` (`RIVET_VERIFY_RUN_NOT_SUCCESSFUL`, exit 1: a failed, interrupted or still-running export is not a completed dataset). A legacy prefix (no manifest) falls back to the M6 reduced-guarantee path and is labelled `legacy_run: true`.
 
 ### Examples
 

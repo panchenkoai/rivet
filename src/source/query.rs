@@ -29,7 +29,7 @@
 
 use crate::config::{IncrementalCursorMode, SourceType};
 use crate::plan::IncrementalCursorPlan;
-use crate::sql::quote_ident;
+use crate::sql::{alias, derived, quote_ident};
 use crate::types::CursorState;
 
 /// Output of [`build_incremental_query`]: SQL text with an optional cursor bind.
@@ -90,10 +90,13 @@ pub(crate) fn build_incremental_query(
     let cursor_value = cursor.and_then(|c| c.last_cursor_value.as_deref());
     let primary = quote_ident(source_type, &plan.primary_column);
 
+    let rivet = alias(source_type, "_rivet");
+    let from_rivet = derived(source_type, "_rivet");
     let prefix = match plan.mode {
-        IncrementalCursorMode::SingleColumn => "",
-        IncrementalCursorMode::Coalesce => "_rivet.",
+        IncrementalCursorMode::SingleColumn => String::new(),
+        IncrementalCursorMode::Coalesce => format!("{rivet}."),
     };
+    let prefix = prefix.as_str();
     let cursor = cursor_expr(plan, prefix, source_type);
 
     let mut preds: Vec<String> = Vec::new();
@@ -122,7 +125,7 @@ pub(crate) fn build_incremental_query(
 
     let sql = match plan.mode {
         IncrementalCursorMode::SingleColumn => format!(
-            "SELECT * FROM ({base}) AS _rivet{where_clause} ORDER BY {primary}",
+            "SELECT * FROM ({base}) {from_rivet}{where_clause} ORDER BY {primary}",
             base = base_query,
         ),
         IncrementalCursorMode::Coalesce => {
@@ -132,8 +135,8 @@ pub(crate) fn build_incremental_query(
                 IncrementalCursorPlan::RIVET_COALESCE_CURSOR_COL,
             );
             format!(
-                "SELECT _rivet.*, {cursor} AS {synthetic} FROM ({base}) AS _rivet{where_clause} \
-                 ORDER BY {cursor}, _rivet.{primary}, _rivet.{fallback}",
+                "SELECT {rivet}.*, {cursor} AS {synthetic} FROM ({base}) {from_rivet}{where_clause} \
+                 ORDER BY {cursor}, {rivet}.{primary}, {rivet}.{fallback}",
                 base = base_query,
             )
         }
@@ -184,14 +187,16 @@ fn settle_predicates(
         (Some(_), IncrementalCursorMode::Coalesce) => false,
     };
     if !settle_is_cursor {
-        let young = cursor_expr(plan, "_rivet_young.", source_type);
+        let young_ref = format!("{}.", alias(source_type, "_rivet_young"));
+        let young = cursor_expr(plan, &young_ref, source_type);
         let mut young_where = vec![format!("{young} IS NOT NULL")];
         if let Some(v) = last {
             young_where.push(format!("{young} > {}", inline_literal(source_type, v)));
         }
-        young_where.push(format!("{} >= {threshold}", target("_rivet_young.")));
+        young_where.push(format!("{} >= {threshold}", target(&young_ref)));
         preds.push(format!(
-            "{cursor} < ALL (SELECT {young} FROM ({base_query}) AS _rivet_young WHERE {cond})",
+            "{cursor} < ALL (SELECT {young} FROM ({base_query}) {from_young} WHERE {cond})",
+            from_young = derived(source_type, "_rivet_young"),
             cursor = cursor_expr(plan, prefix, source_type),
             cond = young_where.join(" AND "),
         ));
@@ -205,6 +210,9 @@ fn settle_threshold(source_type: SourceType, after_secs: u64) -> String {
         SourceType::Mysql => format!("(NOW() - INTERVAL {after_secs} SECOND)"),
         SourceType::Postgres => format!("(now() - INTERVAL '{after_secs} seconds')"),
         SourceType::Mssql => format!("DATEADD(SECOND, -{after_secs}, SYSUTCDATETIME())"),
+        SourceType::Oracle => {
+            format!("(SYS_EXTRACT_UTC(SYSTIMESTAMP) - NUMTODSINTERVAL({after_secs}, 'SECOND'))")
+        }
         SourceType::Mongo => unreachable!(
             "settle_threshold: MongoDB incremental cursor is not a SQL path (guarded by full-mode-only validation)"
         ),
@@ -303,7 +311,8 @@ pub(crate) fn build_keyset_query_bounded(
             let (rhs, cursor_param) = cursor_rhs(source_type, val);
             BuiltQuery {
                 sql: format!(
-                    "SELECT * FROM ({base}) AS _rivet WHERE {k} > {rhs}{up} ORDER BY {k} {page}",
+                    "SELECT * FROM ({base}) {from_rivet} WHERE {k} > {rhs}{up} ORDER BY {k} {page}",
+                    from_rivet = derived(source_type, "_rivet"),
                     base = base_query,
                     k = key,
                     up = upper_pred(" AND "),
@@ -312,7 +321,8 @@ pub(crate) fn build_keyset_query_bounded(
             }
         }
         None => BuiltQuery::without_param(format!(
-            "SELECT * FROM ({base}) AS _rivet{where_up} ORDER BY {k} {page}",
+            "SELECT * FROM ({base}) {from_rivet}{where_up} ORDER BY {k} {page}",
+            from_rivet = derived(source_type, "_rivet"),
             base = base_query,
             k = key,
             where_up = upper_pred(" WHERE "),
@@ -348,7 +358,8 @@ pub(crate) fn wrap_key_range(
         preds.push(format!("{key} <= {}", inline_literal(source_type, hi)));
     }
     format!(
-        "SELECT * FROM ({base}) AS _rivet_split WHERE {preds}",
+        "SELECT * FROM ({base}) {from_split} WHERE {preds}",
+        from_split = derived(source_type, "_rivet_split"),
         base = base_query,
         preds = preds.join(" AND "),
     )
@@ -362,6 +373,7 @@ pub(crate) fn inline_literal(source_type: SourceType, value: &str) -> String {
         SourceType::Mysql => escape_mysql_literal(value),
         SourceType::Postgres => escape_pg_literal(value),
         SourceType::Mssql => escape_mssql_literal(value),
+        SourceType::Oracle => escape_oracle_literal(value),
         SourceType::Mongo => unreachable!(
             "inline_literal: MongoDB keyset paging is not a SQL path (guarded by full-mode-only validation)"
         ),
@@ -376,6 +388,7 @@ fn page_limit_clause(source_type: SourceType, limit: usize) -> String {
     match source_type {
         SourceType::Postgres | SourceType::Mysql => format!("LIMIT {limit}"),
         SourceType::Mssql => format!("OFFSET 0 ROWS FETCH NEXT {limit} ROWS ONLY"),
+        SourceType::Oracle => format!("FETCH FIRST {limit} ROWS ONLY"),
         SourceType::Mongo => unreachable!(
             "page_limit_clause: MongoDB keyset paging is not a SQL path (guarded by full-mode-only validation)"
         ),
@@ -399,10 +412,21 @@ fn cursor_rhs(source_type: SourceType, value: &str) -> (String, Option<String>) 
         // be int, datetime2, uniqueidentifier, …). No backslash escaping in
         // T-SQL; only `'` is doubled.
         SourceType::Mssql => (escape_mssql_literal(value), None),
+        // Oracle: a bind, converted to the column type through the session's pinned
+        // NLS masks (the cursor's text form is rivet's own ISO rendering).
+        SourceType::Oracle => (":1".to_string(), Some(value.to_string())),
         SourceType::Mongo => unreachable!(
             "cursor_rhs: MongoDB incremental cursor is not a SQL path (guarded by full-mode-only validation)"
         ),
     }
+}
+
+/// Quote `s` as an Oracle string literal: only `'` is escaped (doubled), and `N'…'`
+/// keeps non-ASCII key values intact.
+pub(crate) fn escape_oracle_literal(s: &str) -> String {
+    // A VARCHAR2 literal, not N'…': Oracle cannot convert NVARCHAR text through the
+    // pinned NLS_DATE_FORMAT's quoted parts (ORA-01830 on a DATE keyset bound).
+    format!("'{}'", s.replace('\'', "''"))
 }
 
 /// Quote `s` as a T-SQL `N'…'` unicode string literal. SQL Server escapes only
@@ -460,6 +484,15 @@ pub(crate) fn escape_pg_literal(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_oracle_literal_is_varchar2_with_doubled_quotes() {
+        assert_eq!(escape_oracle_literal("it's"), "'it''s'");
+        assert_eq!(
+            escape_oracle_literal("2024-01-01T00:00:00.000000"),
+            "'2024-01-01T00:00:00.000000'"
+        );
+    }
 
     fn cursor_with(val: Option<&str>) -> CursorState {
         CursorState {

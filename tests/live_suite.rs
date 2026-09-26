@@ -55,6 +55,8 @@ mod audit_target_typo;
 mod batch_memory_policy;
 #[path = "live/chunking_stand.rs"]
 mod chunking_stand;
+#[path = "live/gate_tls_failures.rs"]
+mod gate_tls_failures;
 #[path = "live/gremlin.rs"]
 mod gremlin;
 #[path = "live/gremlin_cdc.rs"]
@@ -91,8 +93,6 @@ mod live_cdc_property;
 mod live_cdc_replica;
 #[path = "live/live_chaos.rs"]
 mod live_chaos;
-#[path = "live/live_chunked_dense.rs"]
-mod live_chunked_dense;
 #[path = "live/live_chunked_recovery.rs"]
 mod live_chunked_recovery;
 #[path = "live/live_cli_flags.rs"]
@@ -153,6 +153,8 @@ mod live_mssql_chunked_recovery;
 mod live_mssql_crash_recovery;
 #[path = "live/live_mssql_harm_permission.rs"]
 mod live_mssql_harm_permission;
+#[path = "live/live_mssql_incremental_isolation.rs"]
+mod live_mssql_incremental_isolation;
 #[path = "live/live_mssql_reconcile_repair.rs"]
 mod live_mssql_reconcile_repair;
 #[path = "live/live_mssql_resume.rs"]
@@ -173,6 +175,9 @@ mod live_mysql_retry_and_faults;
 mod live_mysql_schema_drift;
 #[path = "live/live_oltp_load.rs"]
 mod live_oltp_load;
+#[cfg(feature = "oracle")]
+#[path = "live/live_oracle.rs"]
+mod live_oracle;
 #[path = "live/live_parallel_ux.rs"]
 mod live_parallel_ux;
 #[path = "live/live_parquet_roundtrip.rs"]

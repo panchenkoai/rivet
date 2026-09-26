@@ -416,6 +416,7 @@ impl Config {
     fn validate(&self) -> crate::error::Result<()> {
         self.validate_exports_list()?;
         self.validate_source_connection()?;
+        self.validate_non_sql_source_modes()?;
         for export in &self.exports {
             self.validate_export(export)?;
         }
@@ -423,7 +424,6 @@ impl Config {
         self.validate_csv_exports_are_not_loaded()?;
         self.validate_load_overrides()?;
         self.validate_layout_has_a_compacting_warehouse()?;
-        self.validate_non_sql_source_modes()?;
         Ok(())
     }
 
@@ -527,13 +527,9 @@ impl Config {
             if !matches!(e.mode, ExportMode::Full | ExportMode::Cdc) {
                 crate::config_bail!(
                     crate::error::codes::CONFIG_SOURCE_MODE_UNSUPPORTED,
-                    "export '{}': source type '{:?}' supports `mode: full` (batch) and \
-                     `mode: cdc` (change streams) (got `mode: {:?}`). MongoDB has no SQL, so \
-                     chunked / incremental / keyset / time-window are not available; every \
-                     document exports as `_id` + a `document` JSON column.",
+                    "export '{}': {}",
                     e.name,
-                    self.source.source_type,
-                    e.mode
+                    non_sql_mode_refusal(self.source.source_type, e.mode.as_str())
                 );
             }
             // An impossible combination must be a config error, not a silent
@@ -707,6 +703,14 @@ impl Config {
     /// destination auth, compression, and the mode/chunk matrix. Takes `&self`
     /// because effective tuning merges the source-level block.
     fn validate_export(&self, export: &ExportConfig) -> crate::error::Result<()> {
+        if export.chunk_dense {
+            anyhow::bail!(
+                "export '{}': `chunk_dense` was removed: it re-numbered rows per chunk and \
+                 skipped or duplicated rows under concurrent writes. Use `chunk_by_key: \
+                 <unique key>` (keyset), or `chunk_column:` range chunking on an integer key.",
+                export.name
+            );
+        }
         self.validate_export_names(export)?;
         self.validate_export_partition(export)?;
         self.validate_export_sizing(export)?;
@@ -787,7 +791,7 @@ impl Config {
         // only lived in the run-time expansion step, so `rivet check` gave a false
         // green and `rivet run` failed later — after a live DB probe, or (mode: cdc)
         // with a misleading "requires table:". Enforce them at config-load so check
-        // and run agree, mirroring the chunk_dense/chunk_by_days guards.
+        // and run agree, mirroring the chunk_by_days guards.
         // Round-6 hostile-input: two prefix shapes that are ALWAYS a mistake and
         // fail success-shaped (the export writes somewhere the load never
         // lists, "up to date" forever): a `..` traversal segment (on an
@@ -1273,14 +1277,6 @@ impl Config {
                         export.name
                     );
                 }
-                if export.chunk_count.is_some() && export.chunk_dense {
-                    anyhow::bail!(
-                        "export '{}': chunk_count and chunk_dense are mutually exclusive. \
-                         Use chunk_count for equal-sized chunks over a sparse key; \
-                         use chunk_dense only when the key has no gaps.",
-                        export.name
-                    );
-                }
                 if export.chunk_count.is_some() && export.chunk_by_days.is_some() {
                     anyhow::bail!(
                         "export '{}': chunk_count and chunk_by_days are mutually exclusive. \
@@ -1321,19 +1317,12 @@ impl Config {
             );
         }
 
-        if export.chunk_dense && export.mode != ExportMode::Chunked {
-            anyhow::bail!(
-                "export '{}': chunk_dense is only valid with mode: chunked",
-                export.name
-            );
-        }
-
         // Round-2 audit #14: the load-bearing chunk knobs are silently dropped
         // outside `mode: chunked` — `build_plan` routes Full/Incremental/
         // TimeWindow to a single-cursor snapshot that never consults them, so a
         // config that sets them but forgets `mode: chunked` degrades to the
         // unbounded whole-table snapshot chunking exists to prevent, with no
-        // error or warn. Gate them the same way chunk_dense/chunk_by_days are.
+        // error or warn. Gate them the same way chunk_by_days is.
         // (`parallel` is intentionally excluded — the Mongo full/keyset reader
         // legitimately fans workers with it, so it is not chunked-only.)
         if export.mode != ExportMode::Chunked {
@@ -1437,12 +1426,6 @@ impl Config {
             if export.mode != ExportMode::Chunked {
                 anyhow::bail!(
                     "export '{}': chunk_by_days requires mode: chunked",
-                    export.name
-                );
-            }
-            if export.chunk_dense {
-                anyhow::bail!(
-                    "export '{}': chunk_by_days cannot be combined with chunk_dense",
                     export.name
                 );
             }
@@ -1585,6 +1568,15 @@ fn is_filename_safe_name(name: &str) -> bool {
         && !name.contains('\0')
 }
 
+/// Why a non-SQL source refuses a mode other than `full` / `cdc` — shared by the loader and `rivet init`.
+pub(crate) fn non_sql_mode_refusal(source: SourceType, mode: &str) -> String {
+    format!(
+        "source type '{source:?}' supports `mode: full` (batch) and `mode: cdc` (change streams) \
+         (got `mode: {mode}`). MongoDB has no SQL, so chunked / incremental / keyset / \
+         time-window are not available; every document exports as `_id` + a `document` JSON \
+         column."
+    )
+}
 #[cfg(test)]
 mod tests;
 

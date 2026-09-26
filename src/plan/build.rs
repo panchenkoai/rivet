@@ -341,17 +341,11 @@ fn resolve_chunked_strategy(
     export: &ExportConfig,
     tuning: &SourceTuning,
 ) -> Result<ExtractionStrategy> {
-    // chunk_count / chunk_dense / chunk_by_days mutual-exclusion is shared
+    // chunk_count / chunk_by_days mutual-exclusion is shared
     // between the introspected and non-introspected paths.
     if let Some(count) = export.chunk_count {
         if count == 0 {
             anyhow::bail!("export '{}': chunk_count must be >= 1 (got 0)", export.name);
-        }
-        if export.chunk_dense {
-            anyhow::bail!(
-                "export '{}': chunk_count and chunk_dense are mutually exclusive",
-                export.name
-            );
         }
         if export.chunk_by_days.is_some() {
             anyhow::bail!(
@@ -361,13 +355,12 @@ fn resolve_chunked_strategy(
         }
     }
 
-    // Keyset (OPT-4) is its own shape — incompatible with the range / dense /
+    // Keyset (OPT-4) is its own shape — incompatible with the range /
     // date / count knobs. Validated up front so the conflict is reported
     // regardless of which downstream path runs.
     if export.chunk_by_key.is_some() {
         for (conflict, name) in [
             (export.chunk_column.is_some(), "chunk_column"),
-            (export.chunk_dense, "chunk_dense"),
             (export.chunk_by_days.is_some(), "chunk_by_days"),
             (export.chunk_count.is_some(), "chunk_count"),
         ] {
@@ -389,13 +382,12 @@ fn resolve_chunked_strategy(
     // Preserves the no-network plan-build invariant for hand-tuned configs.
     //
     // Exception (#103): when the column is integer-`BETWEEN`-sliced (the default
-    // range mode — NOT `chunk_dense`/ROW_NUMBER, NOT `chunk_by_days`/date
-    // half-open, both type-safe) AND a `table:` is present to probe, fall through
+    // range mode — NOT `chunk_by_days`/date half-open, which is type-safe) AND a `table:` is present to probe, fall through
     // to introspection so a NON-integer column is refused rather than silently
     // dropping every fractional row that falls between two window boundaries.
     // `query:`-only can't be probed (no relation), so it stays on the fast path
     // with a loud can't-verify warning.
-    let range_sliced = !export.chunk_dense && export.chunk_by_days.is_none();
+    let range_sliced = export.chunk_by_days.is_none();
     let can_probe_type = range_sliced && export.table.is_some();
     if export.chunk_column.is_some() && export.chunk_size_memory_mb.is_none() && !can_probe_type {
         if range_sliced && export.table.is_none() {
@@ -414,7 +406,6 @@ fn resolve_chunked_strategy(
             chunk_size: export.chunk_size,
             chunk_count: export.chunk_count,
             parallel: export.parallel,
-            dense: export.chunk_dense,
             by_days: export.chunk_by_days,
             checkpoint: export.chunk_checkpoint,
             max_attempts,
@@ -461,6 +452,16 @@ fn resolve_chunked_strategy(
                 tbl,
             )
         }
+        #[cfg(feature = "oracle")]
+        crate::config::SourceType::Oracle => {
+            crate::source::oracle::introspect_oracle_table_for_chunking(
+                &url,
+                config.source.tls.as_ref(),
+                tbl,
+            )
+        }
+        #[cfg(not(feature = "oracle"))]
+        crate::config::SourceType::Oracle => return Err(crate::source::oracle_feature_missing()),
         crate::config::SourceType::Mongo => anyhow::bail!(
             "chunked mode is not supported for MongoDB — use `mode: full` (the whole \
              collection is read as `_id` + `document` JSON)"
@@ -495,7 +496,6 @@ fn resolve_chunked_strategy(
                 chunk_size: export.chunk_size,
                 chunk_count: export.chunk_count,
                 parallel: export.parallel,
-                dense: export.chunk_dense,
                 by_days: export.chunk_by_days,
                 checkpoint: export.chunk_checkpoint,
                 max_attempts,
@@ -702,16 +702,16 @@ fn chunked_strategy_from_introspection(
     let column = if let Some(c) = export.chunk_column.clone() {
         // #103 (variant 1): an explicit chunk_column that is integer-`BETWEEN`-
         // sliced must be integer-family, or range chunking silently drops rows
-        // between windows. `chunk_dense` (ROW_NUMBER) and `chunk_by_days` (date
-        // half-open) are type-safe and took the fast path above (never reach here).
-        let range_sliced = !export.chunk_dense && export.chunk_by_days.is_none();
+        // between windows. `chunk_by_days` (date half-open) is type-safe and took the
+        // fast path above (never reaches here).
+        let range_sliced = export.chunk_by_days.is_none();
         if range_sliced && !introspection.is_integer_column(&c) {
             anyhow::bail!(
                 "export '{}': chunk_column '{}' on {} is not an integer-family column — range \
                  chunking derives integer min/max boundaries and slices with `BETWEEN`, so a \
                  numeric/decimal/float/text key silently drops every value between two window \
                  boundaries. Use `chunk_by_key: {}` (keyset — any orderable indexed key), an \
-                 integer column, `chunk_dense: true`, or `mode: full`.",
+                 integer column, or `mode: full`.",
                 export.name,
                 c,
                 tbl,
@@ -789,7 +789,6 @@ fn chunked_strategy_from_introspection(
         chunk_size,
         chunk_count: export.chunk_count,
         parallel: export.parallel,
-        dense: export.chunk_dense,
         by_days: export.chunk_by_days,
         checkpoint: export.chunk_checkpoint,
         max_attempts,
@@ -994,6 +993,34 @@ mod tests {
         assert!(!plan.validate);
         assert!(!plan.reconcile);
         assert!(!plan.resume);
+    }
+
+    #[test]
+    fn a_csv_plan_records_no_compression_because_the_csv_writer_applies_none() {
+        let mut csv = minimal_export();
+        csv.format = crate::config::FormatType::Csv;
+        let plan = build_plan(
+            &minimal_config(),
+            &csv,
+            Path::new("."),
+            false,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(plan.compression.label(), "none");
+        let parquet = build_plan(
+            &minimal_config(),
+            &minimal_export(),
+            Path::new("."),
+            false,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(parquet.compression.label(), "zstd");
     }
 
     /// #167 Slice C: a `--split` sub-export's plan restricts `base_query` to its
@@ -1241,7 +1268,7 @@ mod tests {
         // Sanity: an explicit chunk_column with `query:` (no `table:`) short-
         // circuits without opening a connection. (#103: `table:` + a range-sliced
         // column now DOES probe the type, so the no-network fast path is
-        // query-only / dense / by_days from here on.)
+        // query-only / by_days from here on.)
         let mut export = minimal_export();
         export.mode = ExportMode::Chunked;
         export.chunk_column = Some("explicit_pk".into());
@@ -1592,27 +1619,6 @@ mod tests {
     }
 
     #[test]
-    fn chunk_count_with_chunk_dense_is_rejected() {
-        let mut export = chunked_export();
-        export.chunk_count = Some(10);
-        export.chunk_dense = true;
-        let err = build_plan(
-            &minimal_config(),
-            &export,
-            Path::new("."),
-            false,
-            false,
-            false,
-            None,
-        )
-        .unwrap_err();
-        assert!(
-            err.to_string().contains("mutually exclusive"),
-            "expected 'mutually exclusive', got: {err}"
-        );
-    }
-
-    #[test]
     fn chunk_count_with_chunk_by_days_is_rejected() {
         let mut export = chunked_export();
         export.chunk_count = Some(10);
@@ -1649,30 +1655,6 @@ mod tests {
         .unwrap();
         match &plan.strategy {
             ExtractionStrategy::Chunked(cp) => assert_eq!(cp.chunk_count, Some(5)),
-            _ => panic!("expected Chunked"),
-        }
-    }
-
-    #[test]
-    fn chunk_count_none_is_accepted_with_dense() {
-        let mut export = chunked_export();
-        export.chunk_count = None;
-        export.chunk_dense = true;
-        let plan = build_plan(
-            &minimal_config(),
-            &export,
-            Path::new("."),
-            false,
-            false,
-            false,
-            None,
-        )
-        .unwrap();
-        match &plan.strategy {
-            ExtractionStrategy::Chunked(cp) => {
-                assert!(cp.dense);
-                assert!(cp.chunk_count.is_none());
-            }
             _ => panic!("expected Chunked"),
         }
     }

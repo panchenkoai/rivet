@@ -69,6 +69,12 @@ grid:
   mongo:
     gated: ["4.4", "5", "6", "7", "8"]   # 5/6/8 added; 4.4 is arm64-flaky on the colima devbox (documented, not a rivet bug)
     gaps:  []
+  oracle:
+    gated: ["23-free"]               # gvenzl/oracle-free:23-slim-faststart, the compose stand's image,
+                                     # brought up by the gate on :55023 and seeded from
+                                     # seeds/common/oracle.sql + dev/release-oracle/oracle_tz_probe.sql.
+                                     # BATCH ONLY: `mode: cdc` is refused for Oracle at config load.
+    gaps:  []
 
 # ── Per-(engine, version) DATA / BEHAVIOUR scenarios (run once per gridded version) ──
 # Cell is per-ENGINE (uniform across that engine's gridded versions); a version-specific
@@ -80,60 +86,77 @@ scenarios:
     mysql:    test
     mssql:    test
     mongo:    test
+    oracle:   test
   - id: blessed_path
     what: "COMPLEMENTS docs/scenario-artifact-matrix.yaml, which owns the artifact/meta-DB half more deeply (14 lifecycle scenarios, all engines, canonical seed, chunk_run/chunk_task/load_run snapshots). What is added here and provably absent there: an INDEPENDENT oracle (that driver has zero duckdb calls — it compares rivet's records to rivet's files), the COMMAND CHAIN in one traversal: init -> doctor -> check -> plan -> apply -> validate, one cell per stage, asserting every artifact (config, plan.json, parquet, manifest.json, _SUCCESS, export_metrics/file_log/run_status) with DuckDB as the independent oracle for rows and file count. Per-stage coverage existed everywhere; no test drove three of the five subcommands in one body, and both defects found 2026-08-04 (apply's empty config path, CDC's unexpanded {date}) lived in that handoff gap."
     postgres: test
     mysql:    test
     mssql:    test
     mongo:    test
+    oracle:   test
   - id: blessed_flow
     what: "The WHOLE journey as ONE declared cross-product, not per-defect additions: pipeline{batch,cdc} x lifecycle{clean,repeat,resume} x store{local,s3,gcs} x state{sqlite,postgres} x engine = 144 cells, 76 runnable, 68 `na` each carrying its reason in the ledger. Where blessed_path walks init->apply for one strategy, this adds what that chain cannot reach: the CDC pipeline (plan/apply REFUSE a cdc export, so those cells run `run`), the crash-then-resume lifecycle (a fault hook kills the first apply, and the probe FAILS the cell if the hook did not stop it — a resume whose first run succeeded is a clean re-run wearing a flag), the repeat lifecycle asserted on the MANIFEST COPIES rather than the parquet (the data surviving is what makes a sidecar clobber invisible), and `load` with load_run/loaded_source_run. Values are read ONLY by DuckDB, and only from parts a manifest DECLARES as committed — counting every parquet under the prefix reads a crashed run's orphans as delivered data. State is scoped per-run (watermark on export_metrics, which has no run_id; run ids from the manifests for file_log/run_status): the first draft counted `export_name='flow'` and read 37 rows of unrelated history on a cell that wrote one."
     postgres: test
     mysql:    test
     mssql:    test
     mongo:    test
+    oracle:   { gap: "not wired for Oracle: blessed_flow's cells (and its CDC half, which Oracle refuses) ride the CDC stand in dev/release_oracle/cdc.py, which has no Oracle engine; the batch chain is graded by blessed_path" }
   - id: not_inert
     what: "The chain's own oracles must be able to go RED. Breaks each artifact class and requires the matching stage to fail: every declared part removed (oracle must stop agreeing with the source), no manifest (must report undelivered, not count the parquet lying next to it), a run id that never ran (state must refuse). Carries a NEGATIVE control too — removing ONE redundant copy of a repeated export must NOT move the oracle; the first draft demanded a failure there and went red against a correct oracle."
     postgres: test
     mysql:    test
     mssql:    test
     mongo:    test
+    oracle:   { gap: "not wired for Oracle: sc_not_inert breaks blessed_flow's artifacts, and blessed_flow does not run on Oracle" }
   - id: verdicts
     what: "init -> the strategy per table matches the golden (keyset/full/range/name-trap), zero phantom heavy-chunk."
     postgres: test
     mysql:    test
     mssql:    test
     mongo:    test
+    oracle:   test
   - id: integrity_types
     what: "users 150K loss/dup 0 (source count+distinct == DuckDB read) + per-engine DuckDB type/CSV golden (parquet binary path + CSV all-varchar text path)."
     postgres: test
     mysql:    test
     mssql:    test
     mongo:    { na: "Mongo is a JSON-blob model (full-scan only) — no per-engine type matrix; the loss/dup arm still runs under integrity_types" }
+    oracle:   test
   - id: keyset_parallel
     what: "parallel:4 keyset fan-out: loss/dup 0 (DuckDB oracle) AND >=2 distinct pk_w{ridx} workers (no silent degrade to sequential)."
     postgres: test
     mysql:    test
     mssql:    test
-    mongo:    { na: "Mongo parallel:N is the separate _id-range mongo_parallel reader, not SQL keyset" }
+    mongo:    { na: "Mongo keyset is page_size (+ parallel -> mongo_parallel), graded by the mongo_keyset row" }
+    oracle:   test
+  - id: mongo_keyset
+    what: "Mongo keyset on ONE version (8): `source.mongo.page_size` sequential AND `parallel: 4` (run_mongo_parallel) must each equal the pymongo source count+distinct via DuckDB over the DECLARED parts, over >=2 range parts; an int+string `_id` collection must be REFUSED on both (exit != 0, zero parts, the ensure_uniform_id_type message) — `$gt` is BSON-type-bracketed, so an unguarded keyset exports one bracket and reports success. RED-proven against the guard disabled and a dropped parallel range."
+    postgres: { na: "SQL keyset is the keyset_parallel row" }
+    mysql:    { na: "SQL keyset is the keyset_parallel row" }
+    mssql:    { na: "SQL keyset is the keyset_parallel row" }
+    mongo:    test
+    oracle:   { na: "Mongo-only runner" }
   - id: load
     what: "manifested parts -> each object store {s3/minio, gcs/fake-gcs, azure/azurite}, independent readback count == summed manifest row_count + id-set round-trips."
     postgres: test
     mysql:    test
     mssql:    test
     mongo:    test
+    oracle:   test
   - id: gc_survival
     what: "concurrent-extract bucket-erasure guard: a Running manifest spares an in-flight part; none deletes the orphan; Success parts always kept."
     postgres: test
     mysql:    { na: "store-level property, source-agnostic — one engine's parts exercise it (runs on postgres)" }
     mssql:    { na: "store-level property (see postgres)" }
     mongo:    { na: "store-level property (see postgres)" }
+    oracle:   { na: "store-level property (see postgres)" }
   - id: load_pool
     what: "`rivet load --pool 16` at the pool's FULL declared width (MAX_POOL == DEFAULT_POOL == 16): 16 tables seeded alike, config GENERATED by `rivet init --include 'pool_t*' --gcs-bucket --bigquery-project --bigquery-dataset` (exports AND the load: block — not a line written by hand, so the cell also grades what init decides over 16 tables). TWO oracles, because completeness alone is vacuous here: (1) per table, BigQuery's COUNT(*) AND SUM(id) vs a re-query of the SOURCE — identical counts across 16 alike tables cannot see a fan-out that routed one table's rows under another's name, the sums can; (2) NON-VACUITY — BigQuery's own job history must show >=2 LOAD_DATA jobs for these tables OVERLAPPING in time, with touching-but-not-overlapping counted as 1, since a pool that degraded to sequential still loads every row and still passes (1). Sibling of keyset_parallel's '>=2 distinct worker parts'. An activation check fails the cell BEFORE measuring if init emitted fewer than 16 exports, so a narrowed pool can never be reported as the wide one."
     postgres: test
     mysql:    { na: "the load reads Parquet from GCS and talks to BigQuery — the SOURCE engine cannot change how the pool behaves; one engine exercises it (runs on postgres)" }
     mssql:    { na: "source-agnostic load path (see postgres)" }
     mongo:    { na: "source-agnostic load path (see postgres)" }
+    oracle:   { na: "source-agnostic load path (see postgres)" }
 
 # ── Source-agnostic PREFLIGHTS (run ONCE before the engine loop, not per engine/version) ──
 preflights:
@@ -160,8 +183,11 @@ preflights:
     what: "drift detection compares this run's `schema_fingerprint` to the previous run's — BOTH produced by the same function — so a fingerprint blind to some change is blind on both sides and reports `unchanged`. An exact independent digest is not available: the fingerprint hashes `<name>\\t<data_type>` where `data_type` is rivet's OWN rendering of the Arrow type, so a second implementation would reproduce that naming and be a copy, not a witness. What is checkable without rivet's cooperation is the PROPERTY — real DDL is the independent party. Four changes (add / rename / retype / drop a column) must each move the fingerprint, and a control case re-exports an untouched table and requires it to stay put; without that control a fingerprint that changed on every export would pass every other case while being useless. Postgres only: the property is the fingerprint's, not an engine's."
     status: test        # verify_schema_fingerprint_moves_with_the_schema (dev/release_oracle/schema_drift.py)
   - id: reconcile_and_validate_cover_both_sides
-    what: "reconcile and validate check DIFFERENT sides, and neither alone verifies 'what I can read equals what the source held'. Measured: delete source rows and reconcile exits 3 naming the partition and the diff while validate exits 0 (the destination is intact); delete a destination PART and reconcile exits 0 reporting `all partitions match` while validate exits 3. reconcile compares the SOURCE to the recorded per-partition counts; validate compares the DESTINATION to the manifest. The pair covers both, and nothing makes an operator run both — so this cell asserts the DISJUNCTION: each fault must be caught by at least one command, and the verdict names which. Framed that way an improvement (reconcile learning to read the destination) does not redden it, while a regression — a fault neither notices — does. Postgres only: the property is command-level, not engine-level."
-    status: test        # verify_reconcile_and_validate_cover_both_sides (dev/release_oracle/corruption.py)
+    what: "reconcile and validate check DIFFERENT sides: reconcile compares the SOURCE to the recorded per-partition counts, validate compares the DESTINATION to the manifest. Each is asserted on its OWN exact exit code for the fault it owns — the earlier disjunction ('caught by at least one') let a regression in one tool hide behind the other: a source DELETE after export must make reconcile exit 3 while validate stays 0; a deleted part must make validate exit 3 (reconcile's answer is recorded, not asserted — it reads no parts). Then the documented recovery: rows that land inside an exported range after the export make reconcile exit 3, `rivet repair --execute` re-exports the flagged chunks, and afterwards reconcile and validate must both exit 0 and DuckDB over the DECLARED parts (DISTINCT — repair is additive, RR5) must equal the source both ways. Postgres only: the property is command-level, not engine-level."
+    status: test        # verify_reconcile_and_validate_cover_both_sides (dev/release_oracle/corruption.py) — each tool on its OWN exit code (2026-09-26), plus the repair leg
+  - id: tls_downgrade_refused
+    what: "`tls: { mode: verify-full }` against the loopback stand must refuse, never export in plaintext (PG and Mongo serve plaintext; MySQL 8 and SQL Server present self-signed certs that verify-full must reject). Loopback is exempt from the TLS-required policy gate, so only each driver honouring `is_enforced()` stands between the enforced mode and plaintext — a separate connect path per leg: PG CDC run, MySQL batch run, MySQL `check` (the preflight pool), MySQL CDC run, MSSQL batch run, Mongo batch run. Per case: exit != 0, zero parts, and stderr TLS-shaped (tls/ssl/certificate/handshake). The existing sec_enforced_tls_is_not_overridden_by_url_sslmode_disable covers PG batch only. Each case SKIPs when its stand port is down. RED-proven against `is_enforced` bypassed on the MySQL source path."
+    status: test        # verify_tls_downgrade_refused (dev/release_oracle/tls_downgrade.py)
   - id: cdc_corruption_is_detected
     what: "the same negative proof for the CDC leg, which needs its own: the CDC sink keeps a SEPARATE per-column accumulator and writes its own manifests, so a green batch cell says nothing about it. The same annihilating XOR fold lived here, and the render marker was briefly left `None` on this path — which alone would have made every CDC prefix read as corrupt. Captures to a LOCAL destination rather than the object store the e2e cell uses, because the corruption must be a byte flip IN PLACE and a download/edit/re-upload round trip rewrites the object. Positive first (a clean capture verifies), then the flip. Opt-in on RIVET_CDC_<ENGINE>_URL like the e2e cell, and SKIPs loudly without it."
     status: test        # verify_cdc_corruption_is_detected (dev/release_oracle/corruption.py)
@@ -199,6 +225,14 @@ preflights:
     what: "the `--pool --split` range sub-export flow (#167): a dominating export is broken into N range sub-exports over its key span — separate scheduler units sharing ONE prefix + folding to ONE family. THREE independent DuckDB oracles (`pool_split_*` in tests/live/live_pool_toxiproxy.rs), each a NAMED gate cell: (1) realize — the split fires and the union reads back every row once, no seam gap/dup; (2) manifest coherence — validate does not flag a sibling unit's parts as untracked yet a true orphan still is; (3) per-unit crash resume — `--resume` re-runs ONLY the incomplete units (skip complete, resume crashed), no gap/no dup. SKIP when toxiproxy :8474 is down."
     backends: [postgres]
     status: test        # verify_pool_split — drives live_pool_toxiproxy::pool_split_* (realize / coherence / resume)
+  - id: failed_run_tail
+    what: "a run that fails by RETURNING an error (every other gate hook panics, and a panicked run never reaches the finalize code). On the stand PostgreSQL: single incremental (`RIVET_TEST_ERROR_AT=single_part_commit:1`), chunked plain parallel and chunk_checkpoint sequential + parallel (`chunk_export:1`), keyset parallel 4 + keyset_incremental (`keyset_parallel_worker_midrange:1`), an incremental run failed by `on_schema_drift: fail`; plus parallel-4 Mongo (`mongo_parallel_worker:1`). Per case: exit != 0 and no `_SUCCESS`; the run's manifest status is failed; `rivet validate` exits non-zero naming RIVET_VERIFY_RUN_NOT_SUCCESSFUL; the state DB read through DuckDB ATTACH holds the cursor at the newest SUCCESS manifest's cursor_high; `export_metrics.files_committed` == the parquet the failed run left on disk; then a clean re-run (`--resume` where the product prescribes it) after which DuckDB over the SUCCESS-declared parts == the source in count and distinct id. RED-proven against `cursor_may_advance` -> true and the RunNotSuccessful check removed."
+    backends: [postgres, mongo]
+    status: test        # verify_failed_run_tail (dev/release_oracle/failure.py) — SKIP when the stand PG :5432 / psql or Mongo :27017 is down
+  - id: transient_retry_exact
+    what: "a transient fault retries to an EXACT result, and stops when a retry would duplicate. (a) `RIVET_TEST_TRANSIENT_ONCE=chunk_write` and `=after_resume_adopt` (after a crash, with --resume): exit 0, export_metrics.retries >= 1, DuckDB over the declared parts == source count and distinct. (b) a toxiproxy `reset_peer` on the stand PG proxy (:15432), timed at the product's own pause point (`RIVET_TEST_PAUSE_AT=pg_after_snapshot_open`): before any part is durable the run retries and succeeds exactly once per row with no undeclared part left; after a part is durable it stops through the duplicate guard (`decide_export_retry`, 'cannot safely retry') with exit != 0 and files_committed == parquet on disk. Takes the live tests' toxiproxy flock. RED-proven against the duplicate guard disabled."
+    backends: [postgres]
+    status: test        # verify_transient_retry_exact (dev/release_oracle/failure.py) — SKIP when PG :5432 / psql or toxiproxy :8474/:15432 is down
   - id: release_regression
     what: "regression vs the PREVIOUS RELEASE (not a golden, not the gate itself). B-format: the new binary must READ what the prev release WROTE — prev exports a 100K keyset+zstd fixture, cur `validate` re-reads its manifest+parts (PASSED) + DuckDB row-count == source (a format bump that can't read old artifacts silently breaks every existing user on upgrade). B-perf: cur wall <= the DOWNLOADED prev-release binary's wall × tol (default 1.5×; a 3× slowdown / RSS blow-up ships green through every correctness check), benchmarked against the artifact users actually run, never a rebuilt parent. Env: RIVET_PREV_RELEASE_BIN + RIVET_REGRESSION_SOURCE_URL; SKIP-if-absent."
     backends: [postgres]
@@ -228,7 +262,7 @@ preflights:
     backends: [postgres, gcs]
     status: test        # verify_concurrent_writers_share_a_prefix (dev/release_oracle/concurrency.py)
   - id: cdc_e2e
-    what: "CDC end-to-end per engine (the change-data-capture surface the batch scenarios never exercise): anchor a typed table → INSERT/UPDATE/DELETE → capture (mode:cdc, until_current) to the object store → INDEPENDENT DuckDB readback == 5 events (never rivet) → rivet validate PASSED → state-DB metabase populated (run_status all-success) → at-least-once CRASH recovery (cdc_after_flush_before_ack holds the anchor; the re-run re-reads id=4) → large-transaction ATOMICITY (a >rollover 12-row PG tx survives a cdc_after_ack mid-flush crash whole, 12/12 — the committed-boundary invariant). PLUS SQLite-vs-Postgres state PARITY vs golden/cdc_state_snapshot.json (the reference snapshot). Each engine's anchor is its own mechanism (PG slot / MySQL binlog / MSSQL from-LSN / Mongo resume token). RED-proven by mutation vs the release binary: a drop-one-event sink mutant reddens the independent readback on all 4 engines (while rivet validate stays green); a committed:true-every-event PG mutant reddens the large-tx leg."
+    what: "CDC end-to-end per engine (the change-data-capture surface the batch scenarios never exercise): anchor a typed table → INSERT/UPDATE/DELETE → capture (mode:cdc, until_current) to the object store → INDEPENDENT DuckDB readback == 5 events (never rivet) → rivet validate PASSED → state-DB metabase populated (run_status all-success) → at-least-once CRASH recovery (cdc_after_flush_before_ack holds the anchor; the re-run re-reads id=4) → large-transaction ATOMICITY (a >rollover 12-row tx survives a cdc_after_ack mid-flush crash whole, 12/12 — the committed-boundary invariant). PLUS SQLite-vs-Postgres state PARITY vs golden/cdc_state_snapshot.json (the reference snapshot). Each engine's anchor is its own mechanism (PG slot / MySQL binlog / MSSQL from-LSN / Mongo resume token). RED-proven by mutation vs the release binary: a drop-one-event sink mutant reddens the independent readback on all 4 engines (while rivet validate stays green); a committed:true-every-event PG mutant reddens the large-tx leg. PLUS per-engine LIFECYCLE cells (each on its own uniquely named table): resume-exact (after a crash-recovery, an IDLE run's run-scoped manifest-<run_id>.json and DuckDB over its declared parts hold exactly 0 events, then one change → exactly 1 — the at-least-EVERYTHING class a membership check passes); large-tx-atomic on ALL FOUR engines (12-row tx at rollover 5, crash at the engine's anchor hook — cdc_after_ack PG, cdc_after_checkpoint_before_ack MySQL/MSSQL/Mongo — union of declared parts == the source's own rows; the committed flag is set per ADAPTER, so one engine proves nothing about another); PG pg-starvation (200-row uncaptured tx ahead of a 30-row backlog, rollover 5, one bounded run captures the whole backlog, DuckDB over declared parts == source) and pg-ddl-churn (pg_replication_slots.confirmed_flush_lsn advances across a zero-yield DDL-churn run, read from the SERVER). An engine whose CDC service is down (no logical WAL / binlog not ROW / Agent stopped / not a replica set) SKIPs every cell with that reason."
     backends: [sqlite, postgres]
     status: test        # verify_cdc_e2e (dev/release_oracle/cdc.py) — env-driven RIVET_CDC_<ENGINE>_URL, SKIP-if-absent
   - id: partner_shape

@@ -70,7 +70,6 @@ pub(crate) fn run_chunked_sequential(
             &cp.column,
             *start,
             *end,
-            cp.dense,
             is_date,
             plan.source.source_type,
         );
@@ -133,16 +132,19 @@ pub(crate) fn run_chunked_sequential(
             // write_sink_parts drains every part the sink produced — the
             // final temp file plus anything maybe_split rotated at
             // max_file_size — so rotation cannot drop data.
-            let recs = super::super::commit::write_sink_parts(
+            let mut recs = Vec::new();
+            let wrote = super::super::commit::write_sink_parts(
                 dest.as_ref(),
                 &mut sink,
                 plan.validate.then_some(plan.format),
                 |idx, count| super::super::commit::part_indexed_name(&base, idx, count),
-            )?;
-            if plan.validate {
+                &mut recs,
+            );
+            if plan.validate && wrote.is_ok() {
                 summary.validated = Some(true);
             }
-            // record_part journals the ChunkCompleted event with file_name=Some.
+            // record_part journals the ChunkCompleted event with file_name=Some. Every
+            // durable part is recorded, a failed write's earlier siblings included.
             for rec in &recs {
                 super::super::commit::record_part(
                     plan,
@@ -157,6 +159,7 @@ pub(crate) fn run_chunked_sequential(
                     super::super::commit::UnitId::Chunk(i as i64),
                 );
             }
+            wrote?;
         } else {
             // Empty chunk: no file, but still journal completion so the run
             // record covers every chunk index. record_part only handles the
@@ -226,6 +229,7 @@ pub(crate) fn run_chunked_parallel(
     // FanIn's `finished`, bumped on every exit — a success-only count would strand
     // it whenever a chunk fails.
     let completed = AtomicUsize::new(0);
+    let idle_sources = super::IdleSources::default();
     // Rows streamed across ALL chunks (completed + in-flight) — drives the
     // per-batch progress feed so the bar ticks during a chunk's read.
     let streamed_rows = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
@@ -283,6 +287,7 @@ pub(crate) fn run_chunked_parallel(
             let base_query = &plan.base_query;
             let col = &cp.column;
             let completed = &completed;
+            let idle_sources = &idle_sources;
             let fan_r = &fan;
             let shared_fingerprint = &shared_fingerprint;
             let semaphore = &semaphore;
@@ -313,7 +318,6 @@ pub(crate) fn run_chunked_parallel(
                         col,
                         start,
                         end,
-                        cp.dense,
                         is_date,
                         plan_for_worker.source.source_type,
                     );
@@ -324,7 +328,7 @@ pub(crate) fn run_chunked_parallel(
                     // credential rotation / pooler drop otherwise dead-ends in a raw
                     // driver error here. Matches single.rs:93.
                     let mut thread_src =
-                        source::create_source(&plan_for_worker.source).map_err(|e| {
+                        idle_sources.take(&plan_for_worker.source).map_err(|e| {
                             crate::pipeline::single::attach_connect_hint(e, &plan_for_worker.source)
                         })?;
                     let mut sink = ExportSink::new(&plan_for_worker)?.with_row_progress(
@@ -340,6 +344,7 @@ pub(crate) fn run_chunked_parallel(
                         ),
                         &mut sink,
                     )?;
+                    idle_sources.give(thread_src);
                     if let Some(w) = sink.writer.take() {
                         w.finish()?;
                     }
@@ -363,21 +368,23 @@ pub(crate) fn run_chunked_parallel(
                         // draining every part the sink produced (max_file_size
                         // rotation included). Touches no shared run state;
                         // record_part runs in the drain.
-                        let recs = super::super::commit::write_sink_parts(
+                        let mut recs = Vec::new();
+                        let wrote = super::super::commit::write_sink_parts(
                             &**shared_destination,
                             &mut sink,
                             plan_for_worker.validate.then_some(plan_for_worker.format),
                             |idx, count| super::super::commit::part_indexed_name(&base, idx, count),
-                        )?;
+                            &mut recs,
+                        );
                         let unit = super::super::commit::UnitId::Chunk(i as i64);
                         for rec in recs {
                             fan_r.part(unit, rec);
                         }
+                        wrote?;
                         // ADR-0029: the chunk is the commit unit its parts are recorded under.
                         fan_r.observe(sink.take_shape());
                         fan_r.contribute(unit, sink.take_checksums());
                     }
-
                     let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
                     // Advance the chunk count; show the streamed-rows total (≥
                     // agg_rows, monotonic) so the bar never jumps backward from
@@ -492,7 +499,6 @@ mod tests {
                 chunk_size: 100,
                 chunk_count: None,
                 parallel: 1,
-                dense: false,
                 by_days: None,
                 checkpoint: false,
                 max_attempts: 3,

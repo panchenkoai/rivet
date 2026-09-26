@@ -102,6 +102,7 @@ pub(super) fn collect(config: &Config, config_dir: &std::path::Path) -> Vec<Doct
         // Change streams: probe the replica-set requirement + declare the capture
         // fidelity tier (6.0+ pre/post-images vs current-state UpdateLookup).
         SourceType::Mongo => mongo_checks(&url, tls, &cdc, config_dir, &mut checks),
+        SourceType::Oracle => Err(anyhow::anyhow!("CDC is not supported for Oracle yet")),
     };
     if let Err(e) = result {
         checks.push(probe_failed(&e));

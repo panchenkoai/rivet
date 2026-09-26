@@ -260,7 +260,7 @@ pub enum Commands {
     /// Generate a config scaffold from a live database (connect + introspect)
     #[command(group = clap::ArgGroup::new("source_spec").required(true).multiple(false))]
     Init {
-        /// Database URL (postgresql://, mysql://, sqlserver://, or mongodb://). Visible in shell history / `ps`;
+        /// Database URL (postgresql://, mysql://, sqlserver://, mongodb://, or oracle://). Visible in shell history / `ps`;
         /// prefer `--source-env` or `--source-file` for anything other than local dev.
         #[arg(long, group = "source_spec")]
         source: Option<String>,
@@ -1050,7 +1050,8 @@ pub struct ValidateArgs {
     pub format: ValidateFormat,
     /// How deep to verify: "light" (manifest + _SUCCESS only, no prefix
     /// listing), "sample" (light + part reconcile + untracked surplus), or
-    /// "full" (sample + the value-checksum re-read of every part).
+    /// "full" (sample + the value-checksum re-read of every part; CSV parts
+    /// carry no value checksum, so for CSV only each part's row count is re-counted).
     ///
     /// `full` is the default and matches the pre-graded behaviour. Use
     /// `light` for a fast "is this a complete, marked run?" poll, or

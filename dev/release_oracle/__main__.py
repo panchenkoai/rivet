@@ -50,6 +50,7 @@ from . import (
     blessed_flow,
     cdc,
     concurrency,
+    failure,
     gifs,
     init_delta,
     partner_shape,
@@ -58,6 +59,7 @@ from . import (
     scenarios,
     shared_state,
     state_parity,
+    tls_downgrade,
     warehouse_layout,
 )
 
@@ -291,13 +293,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "its independent cells concurrently fills the idle cores; this bounds the "
              "total so the shared state DB / source containers are not stampeded.")
     ap.add_argument(
-        "--engine-parallel", type=int, default=4,
-        help="how many engines to run CONCURRENTLY in the engine loop (default 4 — every engine, so the longest never queues). Each engine "
+        "--engine-parallel", type=int, default=5,
+        help="how many engines to run CONCURRENTLY in the engine loop (default 5 — every engine, so the longest never queues). Each engine "
              "owns its own containers/ports, and the scenarios race on the SHARED state backend "
              "— which doubles as a real concurrent-writer test. The dominant serial cost is CDC "
              "capture-job waits (sleep-for-the-agent), which overlap under parallelism, so the "
              "engine-loop wall drops from sum(engines) toward max(engine). Set 1 for the old "
-             "serial behaviour, or lower if Docker memory is tight (MSSQL is the ~1.6 GiB hog).")
+             "serial behaviour, or lower if Docker memory is tight (MSSQL and Oracle are capped at 3 GiB each).")
     ap.add_argument("--no-clean", action="store_true",
                     help="skip the clean rebuild (iteration only — a release must be gated on a "
                          "tree built from nothing)")
@@ -389,6 +391,7 @@ def preflight(led: Ledger, *, bless_gifs: bool = False) -> None:
     # infrastructure first (skip loudly, never a vacuous pass).
     scenarios.verify_network_faults(led)
     scenarios.verify_tls_required(led)
+    tls_downgrade.verify_tls_downgrade_refused(led)
     scenarios.verify_auth(led)
     scenarios.verify_cdc_standby(led)
     scenarios.verify_live_only_coverage(led)
@@ -406,6 +409,9 @@ def preflight(led: Ledger, *, bless_gifs: bool = False) -> None:
     scenarios.verify_replica_read(led)
     scenarios.verify_pool_e2e(led)
     scenarios.verify_pool_split(led)
+    # Faults that RETURN an error (every hook above panics): the failed-run tail and exact retries.
+    failure.verify_failed_run_tail(led)
+    failure.verify_transient_retry_exact(led)
     cdc.verify_cdc_e2e(led)
     cdc.verify_cdc_differential(led)
     regression.verify_release_regression(led)
@@ -533,6 +539,12 @@ def bring_up(led: Ledger, engine: str, tag: str, image: str, port: int) -> str |
     elif engine == "mongo":
         args += ["--memory", "1g", "-p", f"{port}:27017"]
         cmd = ["--wiredTigerCacheSizeGB", "0.5"]
+    elif engine == "oracle":
+        # The compose `oracle` service's settings, grants script included (harm counters).
+        args += ["--memory", "3g", "-e", "ORACLE_PASSWORD=rivet", "-e", "APP_USER=rivet",
+                 "-e", "APP_USER_PASSWORD=rivet",
+                 "-v", f"{ROOT / 'dev' / 'oracle' / 'init'}:/container-entrypoint-initdb.d:ro",
+                 "-p", f"{port}:1521"]
     else:
         led.skipped(engine, tag, "all", "-", f"{engine}:{tag} unknown engine kind")
         return None
@@ -580,6 +592,9 @@ def bring_up(led: Ledger, engine: str, tag: str, image: str, port: int) -> str |
                    "-P", "Rivet_Passw0rd!", "-Q", "SELECT 1"]],
         "mongo": [["mongosh", "--quiet", "--eval", "db.runCommand({ping:1})"],
                   ["mongo", "--quiet", "--eval", "db.runCommand({ping:1})"]],
+        # The APP_USER exists only once the entrypoint has created it, after the DB opens.
+        "oracle": [["bash", "-c", "echo \"select 'rivet-ready' from dual;\" | sqlplus -s -L "
+                    "rivet/rivet@localhost/FREEPDB1 | grep -q rivet-ready"]],
     }[engine]
     if engine == "mssql":
         probes = [[x for a in p for x in (sqlcmd(name) if a == "__SQLCMD__" else (a,))]
@@ -607,17 +622,26 @@ def bring_up(led: Ledger, engine: str, tag: str, image: str, port: int) -> str |
     # that never came up, which surfaced as a seed error blaming the SQL rather
     # than the bring-up — the same "ignored boolean" shape this gate exists to
     # catch elsewhere.
-    if not wait_until(ready, tries=45, delay=2.0):
+    tries = 150 if engine == "oracle" else 45
+    if not wait_until(ready, tries=tries, delay=2.0):
         led.skipped(engine, tag, "all", "-",
                     f"{engine}:{tag} never became ready (no probe of "
                     f"{[p[0] for p in probes]} "
-                    f"never passed twice in ~90s)", "not ready")
+                    f"never passed twice in ~{tries * 2}s)", "not ready")
         return None
 
     if engine == "mssql":
         docker_exec(name, *sqlcmd(name), "-S", "localhost", "-U", "sa",
                     "-P", "Rivet_Passw0rd!", "-Q",
                     "IF DB_ID('rivet') IS NULL CREATE DATABASE rivet")
+
+    if engine == "oracle":
+        # processes=200 lets the listener's lagging handler count refuse a 16-cell connect burst (ORA-12516); measured 189/300 refused at 200, 0/300 at 1000.
+        docker_exec(name, "sqlplus", "-s", "/", "as", "sysdba", timeout=180,
+                    stdin="alter system set processes=1000 scope=spfile;\nshutdown immediate\nstartup\nexit\n")
+        if not wait_until(ready, tries=60, delay=2.0):
+            led.skipped(engine, tag, "all", "-", f"{engine}:{tag} not ready after the processes restart", "not ready")
+            return None
 
     return matrix_cfg("url", engine).replace("%PORT%", str(port))
 
@@ -634,12 +658,18 @@ def seed_engine(engine: str, tag: str, url: str) -> str:
     name = engine_container(engine, tag)
     seed = ROOT / matrix_cfg("seed", engine)
     body = seed.read_text() if engine != "mongo" else ""
+    if engine == "oracle":
+        # The gate's own TIMESTAMP WITH TIME ZONE fixture, in the gate's own container only.
+        body += "\n" + (ROOT / "dev" / "release-oracle" / "oracle_tz_probe.sql").read_text()
 
     if engine == "postgres":
         p = docker_exec(name, "psql", "-U", "rivet", "-d", "rivet", "-q",
                         "-v", "ON_ERROR_STOP=1", stdin=body, timeout=900)
     elif engine == "mysql":
         p = docker_exec(name, "mysql", "-urivet", "-privet", "rivet", stdin=body, timeout=900)
+    elif engine == "oracle":
+        p = docker_exec(name, "sqlplus", "-s", "-L", "rivet/rivet@localhost/FREEPDB1",
+                        stdin=body, timeout=900)
     elif engine == "mssql":
         docker("cp", str(seed), f"{name}:/tmp/s.sql")
         p = docker_exec(name, *sqlcmd(name), "-S", "localhost", "-U", "sa",

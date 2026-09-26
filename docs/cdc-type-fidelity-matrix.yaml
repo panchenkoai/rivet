@@ -29,7 +29,7 @@
 # as differential (weak) by default; the ratchet forbids the weak count from
 # growing and shrinks as cells are upgraded to independent.
 
-engines: [postgres, mysql, mssql, mongo]
+engines: [postgres, mysql, mssql, mongo, oracle]
 
 scenarios:
   - id: type_boolean
@@ -38,6 +38,7 @@ scenarios:
     mysql:   { test: mysql_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
     mssql:   { test: mssql_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
     mongo:    { na: "boolean rides the verbatim document blob, not a typed column" }
+    oracle:   { gap: "oracle CDC not implemented yet (phase 3) — `mode: cdc` is refused at config validation" }
 
   - id: type_integer_families
     what: "int16/32/64 + unsigned 64 (incl. BIGINT UNSIGNED > i64::MAX) survive CDC. MySQL cell is INDEPENDENT (DuckDB re-read vs the source literal), not a batch-differential"
@@ -45,6 +46,7 @@ scenarios:
     mysql:    { test: mysql_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
     mssql:    { test: mssql_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
     mongo:    { test: mongo_cdc_change_stream_renders_tricky_bson_verbatim_like_batch, oracle: independent }
+    oracle:   { gap: "oracle CDC not implemented yet (phase 3) — `mode: cdc` is refused at config validation" }
 
   - id: type_float
     what: "real/double through CDC — hostile floats (NaN/Inf) match batch or fail loud"
@@ -52,6 +54,7 @@ scenarios:
     mysql:   { test: mysql_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
     mssql:   { test: mssql_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
     mongo:    { na: "float rides the verbatim document blob, not a typed column" }
+    oracle:   { gap: "oracle CDC not implemented yet (phase 3) — `mode: cdc` is refused at config validation" }
 
   - id: type_decimal
     what: "decimal(p,s) precision + scale through CDC (MySQL cell INDEPENDENT: DuckDB re-read vs source literal); MSSQL MONEY past the f64-exact 2^53 range fails loud, not falsely-exact (finding #2)"
@@ -59,6 +62,7 @@ scenarios:
     mysql:    { test: mysql_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
     mssql:    { test: cdc_money_past_f64_exact_range_fails_loud_not_a_falsely_exact_decimal, oracle: fail_loud }
     mongo:    { test: mongo_cdc_change_stream_renders_tricky_bson_verbatim_like_batch, oracle: independent }
+    oracle:   { gap: "oracle CDC not implemented yet (phase 3) — `mode: cdc` is refused at config validation" }
 
   - id: type_date_time
     what: "date + time-of-day survive the change stream with the batch Arrow types"
@@ -66,6 +70,7 @@ scenarios:
     mysql:   { test: mysql_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
     mssql:    { test: mssql_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
     mongo:    { na: "BSON dates ride the verbatim document blob; the extJSON test pins the mechanism" }
+    oracle:   { gap: "oracle CDC not implemented yet (phase 3) — `mode: cdc` is refused at config validation" }
 
   - id: type_timestamp_tz
     what: "naive vs tz-aware timestamp — CDC preserves the UTC instant under a non-default session/DB timezone (the +9h render-time trap)"
@@ -73,6 +78,7 @@ scenarios:
     mysql:    { test: cdc_non_utc_server_timezone_matches_batch_and_utc_instant, oracle: independent }
     mssql:    { test: mssql_cdc_datetimeoffset_value_is_preserved, oracle: independent }
     mongo:    { na: "BSON dates ride the verbatim document blob" }
+    oracle:   { gap: "oracle CDC not implemented yet (phase 3) — `mode: cdc` is refused at config validation" }
 
   - id: type_text
     what: "varchar/char/text through CDC — value + encoding verbatim"
@@ -80,6 +86,7 @@ scenarios:
     mysql:   { test: mysql_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
     mssql:    { test: mssql_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
     mongo:    { test: mongo_cdc_change_stream_renders_tricky_bson_verbatim_like_batch, oracle: independent }
+    oracle:   { gap: "oracle CDC not implemented yet (phase 3) — `mode: cdc` is refused at config validation" }
 
   - id: type_binary
     what: "bytea/varbinary/binary through CDC as the same bytes"
@@ -87,6 +94,7 @@ scenarios:
     mysql:   { test: mysql_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
     mssql:    { test: mssql_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
     mongo:    { na: "binary rides the verbatim document blob (BSON Binary → extJSON)" }
+    oracle:   { gap: "oracle CDC not implemented yet (phase 3) — `mode: cdc` is refused at config validation" }
 
   - id: type_json
     what: "json/jsonb content fidelity through the change stream"
@@ -94,6 +102,7 @@ scenarios:
     mysql:   { test: mysql_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
     mssql:    { na: "SQL Server has no native JSON type; the CDC matrix fixture omits it by design" }
     mongo:    { test: mongo_cdc_change_stream_renders_tricky_bson_verbatim_like_batch, oracle: independent }
+    oracle:   { gap: "oracle CDC not implemented yet (phase 3) — `mode: cdc` is refused at config validation" }
 
   - id: type_uuid
     what: "uuid — PG uuid / MySQL CHAR(36) / MSSQL uniqueidentifier → canonical value through CDC"
@@ -101,6 +110,7 @@ scenarios:
     mysql:    { test: mysql_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
     mssql:   { test: mssql_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
     mongo:    { na: "a BSON uuid rides the verbatim document blob, not a typed column" }
+    oracle:   { na: "Oracle has no UUID type (SYS_GUID() is RAW(16) — type_binary)" }
 
   - id: type_enum
     what: "enum label (not the wire index) through CDC — incl. a CROSS-DATABASE MySQL capture enriched from the table's own schema (finding #3)"
@@ -108,6 +118,7 @@ scenarios:
     mysql:    { test: cdc_cross_database_enum_enriches_from_the_tables_own_schema, oracle: independent }
     mssql:    { na: "SQL Server has no ENUM type" }
     mongo:    { na: "no enum type; a string rides the document blob" }
+    oracle:   { na: "Oracle has no ENUM type" }
 
   - id: type_set
     what: "MySQL SET — the comma-joined labels (not the raw bitmask) through CDC"
@@ -115,6 +126,7 @@ scenarios:
     mysql:   { test: mysql_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
     mssql:    { na: "SQL Server has no SET type" }
     mongo:    { na: "no SET type" }
+    oracle:   { na: "Oracle has no SET type" }
 
   - id: type_bit
     what: "BIT(n) through CDC — BIT(1) boolean, BIT(n>1) integer; a BIT(64) with bit 63 set fails loud, never a silent NULL (finding #4)"
@@ -122,6 +134,7 @@ scenarios:
     mysql:    { test: build_column_narrows_int_and_fails_loud_on_overflow, oracle: fail_loud }
     mssql:   { test: mssql_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
     mongo:    { na: "no BIT type" }
+    oracle:   { na: "Oracle has no BIT type" }
 
   - id: type_money
     what: "MSSQL MONEY/SMALLMONEY — the exact scaled value through CDC (f64-delivered by tiberius), fails loud past the 2^53-exact range (finding #2)"
@@ -129,6 +142,7 @@ scenarios:
     mysql:    { na: "MySQL has no MONEY type" }
     mssql:    { test: mssql_money_values_survive_batch_and_cdc, oracle: independent }
     mongo:    { na: "no MONEY type" }
+    oracle:   { na: "Oracle has no MONEY type" }
 
   - id: type_interval
     what: "PostgreSQL interval — canonical ISO-8601 text through CDC, identical to batch"
@@ -136,6 +150,7 @@ scenarios:
     mysql:    { na: "MySQL has no INTERVAL column type" }
     mssql:    { na: "SQL Server has no INTERVAL type" }
     mongo:    { na: "no interval type" }
+    oracle:   { gap: "oracle CDC not implemented yet (phase 3) — `mode: cdc` is refused at config validation" }
 
   - id: type_list
     what: "PostgreSQL 1-D arrays (int[]/text[]/…) as a real Arrow List through CDC; a multi-dimensional array fails loud, never a flat NULL list (finding #6)"
@@ -143,3 +158,4 @@ scenarios:
     mysql:    { na: "MySQL has no array column type" }
     mssql:    { na: "SQL Server has no array column type" }
     mongo:    { na: "arrays ride the verbatim document blob (BSON array → extJSON)" }
+    oracle:   { gap: "oracle CDC not implemented yet (phase 3) — `mode: cdc` is refused at config validation" }

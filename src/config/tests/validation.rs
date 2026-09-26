@@ -34,7 +34,7 @@ exports:
 // ─── round-2 audit #14: chunk knobs are chunked-only ─────────────────────
 // A config that sets a chunk knob but omits `mode: chunked` silently degrades
 // to a single unbounded snapshot (the source-pressure footgun chunked mode
-// exists to prevent). Gate it at config-load, like chunk_dense/chunk_by_days.
+// exists to prevent). Gate it at config-load, like chunk_by_days.
 // RED before the validate_export guard: these all passed validation.
 
 #[test]
@@ -937,8 +937,10 @@ exports:
 #[test]
 fn mongo_non_full_or_cdc_mode_is_rejected() {
     for (mode, extra) in [
+        ("incremental", ""),
         ("incremental", "\n    cursor_column: updated_at"),
         ("chunked", ""),
+        ("time_window", ""),
     ] {
         let yaml = format!(
             r#"
@@ -953,7 +955,10 @@ exports:
         );
         let msg = format!("{:#}", Config::from_yaml(&yaml).unwrap_err());
         assert!(
-            msg.contains("MongoDB has no SQL") || msg.contains("supports `mode: full`"),
+            msg.contains(&format!(
+                "export 't': source type 'Mongo' supports `mode: full` (batch) and `mode: cdc` \
+                 (change streams) (got `mode: {mode}`). MongoDB has no SQL"
+            )),
             "mongo mode:{mode} must be rejected with the mode-unsupported message, got: {msg}"
         );
     }

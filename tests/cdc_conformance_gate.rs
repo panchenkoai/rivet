@@ -25,10 +25,16 @@ enum Expect {
 }
 use Expect::{NA, Test};
 
-/// (case, mysql, postgres, mssql, mongo). Test names live in
+/// Oracle has no CDC adapter yet: `mode: cdc` is refused at config validation
+/// (src/config/cdc.rs), so every case is NA until phase 3 lands one.
+/// `oracle_na_rests_on_the_cdc_refusal` turns RED when that refusal goes.
+const ORACLE_NO_CDC: Expect =
+    NA("oracle CDC not implemented yet (phase 3) — `mode: cdc` is refused at config validation");
+
+/// (case, mysql, postgres, mssql, mongo, oracle). Test names live in
 /// tests/live/live_cdc.rs (mysql + pg), tests/live/live_cdc_mssql.rs, and
 /// tests/live/live_cdc_mongo.rs.
-const CASES: &[(&str, Expect, Expect, Expect, Expect)] = &[
+const CASES: &[(&str, Expect, Expect, Expect, Expect, Expect)] = &[
     (
         "intra_transaction_seq",
         Test("fn cdc_intra_transaction_updates_get_distinct_seq"),
@@ -40,6 +46,7 @@ const CASES: &[(&str, Expect, Expect, Expect, Expect)] = &[
             0 and the total order is __pos alone — the SQL shared-__pos + __seq \
             tiebreak is unrepresentable (mongo_cdc_soak proves __pos-only dedup)",
         ),
+        ORACLE_NO_CDC,
     ),
     (
         "sum_reconciles_intra_txn",
@@ -47,6 +54,7 @@ const CASES: &[(&str, Expect, Expect, Expect, Expect)] = &[
         Test("fn pg_cdc_sum_reconciles_across_intra_txn_updates"),
         Test("fn mssql_cdc_sum_reconciles_across_intra_txn_updates"),
         Test("fn mongo_cdc_soak_dedup_matches_source"),
+        ORACLE_NO_CDC,
     ),
     (
         "resume_two_run",
@@ -54,6 +62,7 @@ const CASES: &[(&str, Expect, Expect, Expect, Expect)] = &[
         Test("fn pg_cdc_resume_captures_only_new_changes"),
         Test("fn mssql_cdc_resume_captures_only_new_changes"),
         Test("fn mongo_cdc_capture_resume"),
+        ORACLE_NO_CDC,
     ),
     (
         "idle_first_run",
@@ -61,6 +70,7 @@ const CASES: &[(&str, Expect, Expect, Expect, Expect)] = &[
         Test("fn pg_cdc_idle_first_run_then_change_is_captured"),
         Test("fn mssql_cdc_idle_first_run_then_change_is_captured"),
         Test("fn mongo_cdc_idle_first_run_then_change_is_captured"),
+        ORACLE_NO_CDC,
     ),
     (
         "crash_before_ack",
@@ -68,6 +78,7 @@ const CASES: &[(&str, Expect, Expect, Expect, Expect)] = &[
         Test("fn pg_cdc_crash_after_flush_before_ack"),
         Test("fn mssql_cdc_crash_before_checkpoint"),
         Test("fn mongo_cdc_crash_after_flush_before_ack"),
+        ORACLE_NO_CDC,
     ),
     (
         "full_type_matrix",
@@ -80,6 +91,7 @@ const CASES: &[(&str, Expect, Expect, Expect, Expect)] = &[
             type surface (large Int64 / Decimal128 verbatim); there is no per-op \
             typing that could diverge CDC from batch",
         ),
+        ORACLE_NO_CDC,
     ),
     (
         "update_delete_typed",
@@ -87,6 +99,7 @@ const CASES: &[(&str, Expect, Expect, Expect, Expect)] = &[
         Test("fn pg_cdc_update_and_delete_carry_full_types"),
         Test("fn mssql_cdc_update_and_delete_carry_full_types"),
         Test("fn mongo_cdc_update_and_delete_carry_document"),
+        ORACLE_NO_CDC,
     ),
     (
         "initial_snapshot",
@@ -94,6 +107,7 @@ const CASES: &[(&str, Expect, Expect, Expect, Expect)] = &[
         Test("fn pg_cdc_initial_snapshot_covers_preexisting_rows"),
         Test("fn mssql_cdc_initial_snapshot_covers_preexisting_rows"),
         Test("fn mongo_cdc_initial_snapshot_covers_preexisting_rows"),
+        ORACLE_NO_CDC,
     ),
     (
         "vanished_anchor_loud",
@@ -104,6 +118,7 @@ const CASES: &[(&str, Expect, Expect, Expect, Expect)] = &[
             ChangeStreamHistoryLost error DIRECTLY (rivet does not swallow it, no \
             silent re-anchor); forcing an oplog rollover in the gate is \
             impractical — the loud failure is the driver's"),
+        ORACLE_NO_CDC,
     ),
     (
         // #99: distinct from vanished_anchor_loud — the checkpoint FILE itself is
@@ -118,6 +133,7 @@ const CASES: &[(&str, Expect, Expect, Expect, Expect)] = &[
         Test("fn pg_cdc_corrupt_checkpoint_fails_loud_not_silently_absent"),
         Test("fn mssql_cdc_corrupt_checkpoint_fails_loud_not_silently_absent"),
         Test("fn roast_corrupt_checkpoint_fails_loudly_not_silent_reanchor"),
+        ORACLE_NO_CDC,
     ),
     (
         "mixed_transaction_boundary",
@@ -125,6 +141,7 @@ const CASES: &[(&str, Expect, Expect, Expect, Expect)] = &[
         Test("fn pg_cdc_mixed_transaction_ending_on_uncaptured_table"),
         Test("fn mssql_cdc_mixed_transaction_and_qualified_table"),
         Test("fn mongo_cdc_mixed_transaction_ending_on_uncaptured_table"),
+        ORACLE_NO_CDC,
     ),
     (
         "schema_qualified_table",
@@ -135,6 +152,7 @@ const CASES: &[(&str, Expect, Expect, Expect, Expect)] = &[
             "Mongo addresses a collection by name within the URL's database — no \
             schema.table qualifier to parse or route",
         ),
+        ORACLE_NO_CDC,
     ),
     (
         "non_utc_session",
@@ -149,6 +167,7 @@ const CASES: &[(&str, Expect, Expect, Expect, Expect)] = &[
             JSON — no session/server timezone shapes the document text (unlike \
             test_decoding's session-zone rendering)",
         ),
+        ORACLE_NO_CDC,
     ),
     (
         "empty_table_initial_converges",
@@ -159,6 +178,7 @@ const CASES: &[(&str, Expect, Expect, Expect, Expect)] = &[
         ),
         NA("same engine-agnostic path, pinned once on MySQL"),
         NA("same engine-agnostic cdc_job marker path, pinned once on MySQL"),
+        ORACLE_NO_CDC,
     ),
     (
         "multi_table_one_stream",
@@ -173,6 +193,7 @@ const CASES: &[(&str, Expect, Expect, Expect, Expect)] = &[
             `tables:` config routes the one stream to N collections; the \
             one-stream property is structural, not per-engine connection plumbing",
         ),
+        ORACLE_NO_CDC,
     ),
     (
         "gremlin_sigkill_mid_drain",
@@ -186,6 +207,7 @@ const CASES: &[(&str, Expect, Expect, Expect, Expect)] = &[
             "same shared sink/commit seam; Mongo is a client-anchor engine like \
             MySQL (crash_before_ack re-read is proven in mongo_cdc_crash)",
         ),
+        ORACLE_NO_CDC,
     ),
     (
         "gremlin_network_cut_mid_stream",
@@ -200,6 +222,7 @@ const CASES: &[(&str, Expect, Expect, Expect, Expect)] = &[
             then resumes from the persisted token — the drain/recover seam is \
             shared, pinned once on MySQL",
         ),
+        ORACLE_NO_CDC,
     ),
     (
         "gremlin_destination_outage_mid_drain",
@@ -210,6 +233,7 @@ const CASES: &[(&str, Expect, Expect, Expect, Expect)] = &[
         ),
         NA("same engine-agnostic destination seam"),
         NA("same engine-agnostic destination seam (shared commit path)"),
+        ORACLE_NO_CDC,
     ),
     (
         "gremlin_checkpoint_write_failure",
@@ -220,6 +244,7 @@ const CASES: &[(&str, Expect, Expect, Expect, Expect)] = &[
         ),
         NA("same shared Position::save path; pinned once on MySQL"),
         NA("same shared Position::save path (Mongo persists the token there too)"),
+        ORACLE_NO_CDC,
     ),
     (
         "concurrent_writers_mbt",
@@ -233,6 +258,7 @@ const CASES: &[(&str, Expect, Expect, Expect, Expect)] = &[
             "the shared merge; Mongo's convergence-to-source under mixed \
             transactional writes is proven in mongo_cdc_soak",
         ),
+        ORACLE_NO_CDC,
     ),
     (
         "fault_point_sweep",
@@ -243,6 +269,7 @@ const CASES: &[(&str, Expect, Expect, Expect, Expect)] = &[
         ),
         NA("same shared boundaries"),
         NA("same shared sink/run_capture boundaries"),
+        ORACLE_NO_CDC,
     ),
     (
         "cross_oracle_full_surface",
@@ -257,6 +284,7 @@ const CASES: &[(&str, Expect, Expect, Expect, Expect)] = &[
             "same anchoring; Mongo's blob passes the same readers via the batch \
             type-fidelity test, and CDC shares the document_to_json renderer",
         ),
+        ORACLE_NO_CDC,
     ),
     (
         "event_ordering_commit_order",
@@ -272,6 +300,7 @@ const CASES: &[(&str, Expect, Expect, Expect, Expect)] = &[
             "Mongo's __pos (resume token) IS commit order by construction — \
             mongo_cdc_soak's __pos-ordered dedup matching source proves it",
         ),
+        ORACLE_NO_CDC,
     ),
     (
         "golden_calculated_metrics",
@@ -286,6 +315,7 @@ const CASES: &[(&str, Expect, Expect, Expect, Expect)] = &[
             matrix + oracle contracts",
         ),
         NA("same one-arithmetic-anchor argument; Mongo values ride the blob"),
+        ORACLE_NO_CDC,
     ),
     (
         "gremlin_capture_job_stall",
@@ -293,6 +323,7 @@ const CASES: &[(&str, Expect, Expect, Expect, Expect)] = &[
         NA("PG has no external capture job — the slot decodes on read"),
         Test("fn gremlin_mssql_capture_job_stall_loses_nothing"),
         NA("Mongo has no external capture job — the oplog IS the capture, like MySQL"),
+        ORACLE_NO_CDC,
     ),
 ];
 
@@ -308,12 +339,13 @@ fn every_cdc_engine_covers_every_conformance_case() {
     let mongo = fs::read_to_string(root.join("tests/live/live_cdc_mongo.rs")).unwrap();
 
     let mut missing = Vec::new();
-    for (case, my, pg, ms, mo) in CASES {
+    for (case, my, pg, ms, mo, ora) in CASES {
         for (engine, expect, hay) in [
             ("mysql", my, &mysql_pg),
             ("postgres", pg, &mysql_pg),
             ("mssql", ms, &mssql),
             ("mongo", mo, &mongo),
+            ("oracle", ora, &String::new()),
         ] {
             match expect {
                 Test(needle) => {
@@ -1199,4 +1231,18 @@ fn conformance_columns_cover_every_source_engine() {
 }
 
 /// The engine names this gate grades, in the order the `CASES` tuples use them.
-const ENGINE_COLUMNS: [&str; 4] = ["mysql", "postgres", "mssql", "mongo"];
+const ENGINE_COLUMNS: [&str; 5] = ["mysql", "postgres", "mssql", "mongo", "oracle"];
+
+/// The Oracle column is NA only while the product refuses `mode: cdc` for Oracle.
+#[test]
+fn oracle_na_rests_on_the_cdc_refusal() {
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/config/cdc.rs"),
+    )
+    .unwrap();
+    assert!(
+        src.contains("`mode: cdc` is not supported for Oracle yet"),
+        "Oracle CDC is no longer refused at config validation — replace ORACLE_NO_CDC in \
+         CASES with a real Test(..) or a reasoned NA per case"
+    );
+}

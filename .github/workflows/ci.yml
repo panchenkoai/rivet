@@ -205,6 +205,8 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets -- -D warnings
+      - name: Clippy without the optional oracle driver
+        run: cargo clippy --all-targets --no-default-features --features jemalloc -- -D warnings
 
   # Mutation PR gate (docs/mutation-plan.md): mutate ONLY the lines this PR
   # changed and run the lib suite against each mutant. A missed mutant in your
@@ -1478,7 +1480,7 @@ jobs:
           # quiet-window lock. On the shared instance the two canaries failed in
           # OPPOSITE directions and both blamed the product for the schedule; they were
           # the dominant E2E flake through 2026-08-16/17.
-          docker compose --profile pool --profile cdc --profile replica --profile governor up -d postgres mysql mssql mssql-governor minio fake-gcs azurite toxiproxy pgbouncer proxysql postgres-cdc mysql-cdc mssql-cdc mysql-primary mysql-replica duckdb clickhouse
+          docker compose --profile pool --profile cdc --profile replica --profile governor up -d postgres mysql mssql mssql-governor minio fake-gcs azurite toxiproxy pgbouncer proxysql postgres-cdc mysql-cdc mssql-cdc mysql-primary mysql-replica duckdb clickhouse oracle
           # …then re-open it after ClickHouse chowns /work to uid 101 on boot,
           # which propagates to the host on Linux and EACCESes the test writer.
           sudo chmod -R 0777 tests/.live-tmp
@@ -1518,6 +1520,9 @@ jobs:
           # replication itself, so we only wait for both servers to accept logins.
           for i in $(seq 1 30); do docker compose exec -T mysql-primary mysqladmin ping -h localhost -uroot -privet 2>/dev/null && break || sleep 2; done
           for i in $(seq 1 30); do docker compose exec -T mysql-replica mysqladmin ping -h localhost -uroot -privet 2>/dev/null && break || sleep 2; done
+          # Oracle Free (gvenzl faststart) creates the app user on first start; its own
+          # healthcheck script reports ready only once the PDB accepts logins.
+          for i in $(seq 1 90); do docker compose exec -T oracle healthcheck.sh >/dev/null 2>&1 && break || sleep 2; done
 
       - name: Build rivet (debug)
         # Debug, not --release: the e2e suite exercises CORRECTNESS, not
@@ -1531,6 +1536,11 @@ jobs:
         run: |
           PGPASSWORD=rivet psql -h 127.0.0.1 -U rivet -d rivet -f dev/e2e/seed_pg.sql
           mysql -h 127.0.0.1 -u rivet -privet rivet < dev/e2e/seed_mysql.sql
+
+      - name: Seed Oracle database
+        # The live_oracle suite exports the seeded classic + garbage schema
+        # (every_seeded_oracle_table_exports_every_row and the ORDERS-based cells).
+        run: docker compose exec -T oracle sqlplus -s rivet/rivet@localhost/FREEPDB1 < seeds/common/oracle.sql > /dev/null
 
       - name: Seed MSSQL database
         # The SQL Server image has no init hook; create the `rivet` database via

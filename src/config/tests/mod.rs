@@ -367,40 +367,17 @@ exports:
 }
 
 #[test]
-fn chunk_dense_parses() {
-    let cfg = Config::from_yaml(
-        r#"
-source:
-  type: postgres
-  url: "postgresql://localhost/test"
-exports:
-  - name: orders
-    query: "SELECT id, payload FROM orders_sparse"
-    mode: chunked
-    chunk_column: id
-    chunk_dense: true
-    chunk_size: 10000
-    format: csv
-    destination:
-      type: local
-      path: ./out
-"#,
-    )
-    .unwrap();
-    assert!(cfg.exports[0].chunk_dense);
-}
-
-#[test]
-fn chunk_dense_rejected_without_chunked_mode() {
+fn chunk_dense_true_is_refused_with_the_removal_message() {
     let err = Config::from_yaml(
         r#"
 source:
   type: postgres
   url: "postgresql://localhost/test"
 exports:
-  - name: bad
-    query: "SELECT * FROM t"
-    mode: full
+  - name: orders
+    query: "SELECT id, payload FROM orders"
+    mode: chunked
+    chunk_column: id
     chunk_dense: true
     format: csv
     destination:
@@ -409,7 +386,12 @@ exports:
 "#,
     )
     .unwrap_err();
-    assert!(err.to_string().contains("chunk_dense"));
+    assert_eq!(
+        err.to_string(),
+        "export 'orders': `chunk_dense` was removed: it re-numbered rows per chunk and \
+         skipped or duplicated rows under concurrent writes. Use `chunk_by_key: \
+         <unique key>` (keyset), or `chunk_column:` range chunking on an integer key."
+    );
 }
 
 #[test]
@@ -446,30 +428,6 @@ exports:
   - name: bad
     query: "SELECT * FROM t"
     mode: full
-    chunk_by_days: 7
-    format: csv
-    destination:
-      type: local
-      path: ./out
-"#,
-    )
-    .unwrap_err();
-    assert!(err.to_string().contains("chunk_by_days"));
-}
-
-#[test]
-fn chunk_by_days_rejected_with_chunk_dense() {
-    let err = Config::from_yaml(
-        r#"
-source:
-  type: postgres
-  url: "postgresql://localhost/test"
-exports:
-  - name: bad
-    query: "SELECT * FROM t"
-    mode: chunked
-    chunk_column: created_at
-    chunk_dense: true
     chunk_by_days: 7
     format: csv
     destination:

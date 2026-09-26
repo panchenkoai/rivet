@@ -165,6 +165,7 @@ pub struct ExportConfig {
     #[serde(default)]
     pub settle: Option<SettleConfig>,
     pub chunk_column: Option<String>,
+    /// Removed. Kept only so a config that still sets `chunk_dense: true` is refused at load.
     #[serde(default)]
     pub chunk_dense: bool,
     #[serde(default = "default_chunk_size")]
@@ -189,7 +190,7 @@ pub struct ExportConfig {
     #[serde(default)]
     pub chunk_size_memory_mb: Option<u64>,
     /// Divide the column range into exactly this many equal chunks.
-    /// Mutually exclusive with `chunk_dense` and `chunk_by_days`.
+    /// Mutually exclusive with `chunk_by_days`.
     /// When set, `chunk_size` is computed dynamically from min/max.
     pub chunk_count: Option<usize>,
     pub chunk_by_days: Option<u32>,
@@ -453,6 +454,9 @@ impl ExportConfig {
     /// the `#[serde(default)]` (Zstd) — a literal `compression: zstd` alongside a
     /// profile is indistinguishable from an omitted field and stays silent.
     pub fn effective_compression(&self) -> (CompressionType, Option<u32>) {
+        if self.format == FormatType::Csv {
+            return (CompressionType::None, None);
+        }
         if let Some(profile) = self.compression_profile {
             let explicit_codec =
                 (self.compression != CompressionType::default()).then_some(self.compression);
@@ -486,7 +490,7 @@ impl ExportConfig {
             validate_table_shortcut_ident(&self.name, tbl)?;
             return Ok(format!("SELECT * FROM {tbl}"));
         }
-        match (&self.query, &self.query_file) {
+        let q = match (&self.query, &self.query_file) {
             (Some(q), None) => {
                 if params.is_some() {
                     resolve_vars(q, params)
@@ -544,7 +548,8 @@ impl ExportConfig {
                     self.name
                 )
             }
-        }
+        }?;
+        Ok(crate::sql::wrappable_query(&q))
     }
 }
 
@@ -801,6 +806,19 @@ pub enum ExportMode {
     /// INSERT/UPDATE/DELETE from the source's transaction log instead of querying
     /// the table. Reuses the export's `table` / `destination` / `format`.
     Cdc,
+}
+
+impl ExportMode {
+    /// The `mode:` spelling in a config.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Incremental => "incremental",
+            Self::Chunked => "chunked",
+            Self::TimeWindow => "time_window",
+            Self::Cdc => "cdc",
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Copy, PartialEq, Eq)]

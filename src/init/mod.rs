@@ -7,6 +7,8 @@ mod density;
 mod mongo;
 mod mssql;
 mod mysql;
+#[cfg(feature = "oracle")]
+mod oracle;
 mod postgres;
 mod yaml_scaffold;
 
@@ -270,33 +272,41 @@ impl TableInfo {
                     None => base,
                 }
             }
-            "incremental" => match self.chosen_cursor_column() {
-                Some(cursor) => format!(
-                    "auto: ~{} rows {}; chunk column missing, falling back to \
-                     incremental on '{cursor}'",
-                    fmt_row_estimate(self.row_estimate),
-                    if self.row_estimate > 100_000 {
-                        "≥ 100K threshold"
-                    } else {
-                        "below the 100K threshold"
-                    },
-                ),
-                // No timestamp candidate: do NOT name a phantom `updated_at` —
-                // the scaffold emits a REVIEW marker here, so the rationale must
-                // agree (roast 2026-08-09).
-                None => format!(
-                    "auto: ~{} rows ≥ 100K threshold; chunk column missing — set cursor_column \
-                     manually (no timestamp column detected)",
-                    fmt_row_estimate(self.row_estimate),
-                ),
-            },
+            "incremental" => {
+                let on = match self.chosen_cursor_column() {
+                    Some(cursor) => format!("incremental on '{cursor}'"),
+                    // No timestamp candidate: do NOT name a phantom `updated_at` —
+                    // the scaffold emits a REVIEW marker here, so the rationale must
+                    // agree (roast 2026-08-09).
+                    None => "incremental — set cursor_column manually (no timestamp column \
+                             detected)"
+                        .to_string(),
+                };
+                match self.overridden_from(mode) {
+                    Some(auto) => format!(
+                        "~{} rows {}; auto would pick `{auto}`, written as {on}",
+                        fmt_row_estimate(self.row_estimate),
+                        threshold_phrase(self.row_estimate),
+                    ),
+                    None => format!(
+                        "auto: ~{} rows ≥ 100K threshold; chunk column missing, falling back to {on}",
+                        fmt_row_estimate(self.row_estimate),
+                    ),
+                }
+            }
             "full" => {
                 // full is reached TWO ways: below the 100K threshold, OR above it
                 // with no usable chunk key / cursor column (e.g. a keyless table, or
                 // a Mongo collection whose `_id` isn't surfaced as a chunk key). The
                 // message must say WHICH — claiming "below 100K" on a 150K table is a
                 // false diagnostic that hides the real reason (no key to page by).
-                if self.row_estimate > 100_000 {
+                if let Some(auto) = self.overridden_from(mode) {
+                    format!(
+                        "~{} rows {}; auto would pick `{auto}`, written as a full scan",
+                        fmt_row_estimate(self.row_estimate),
+                        threshold_phrase(self.row_estimate),
+                    )
+                } else if self.row_estimate > 100_000 {
                     format!(
                         "auto: ~{} rows ≥ 100K but no chunk key or cursor column available — full scan",
                         fmt_row_estimate(self.row_estimate),
@@ -310,6 +320,12 @@ impl TableInfo {
             }
             _ => format!("mode={mode}"),
         }
+    }
+
+    /// `suggest_mode`'s pick when `mode` differs from it (a `--mode` override or a recipe), else `None`.
+    pub(crate) fn overridden_from(&self, mode: &str) -> Option<&'static str> {
+        let auto = self.suggest_mode();
+        (auto != mode).then_some(auto)
     }
 
     /// Default chunk_size scaled by the row estimate. Goal: keep the
@@ -366,6 +382,15 @@ impl TableInfo {
     /// Enumerate chunk candidates (integer-typed columns, PK preferred).
     pub(crate) fn chunk_candidates(&self) -> Vec<ChunkCandidate> {
         candidates::chunk_candidates(self)
+    }
+}
+
+/// Where `rows` sits against the 100K chunked threshold, as rationale text.
+fn threshold_phrase(rows: i64) -> &'static str {
+    if rows > 100_000 {
+        "≥ 100K threshold"
+    } else {
+        "below the 100K threshold"
     }
 }
 
@@ -492,7 +517,10 @@ fn is_keysettable_type(t: &str) -> bool {
     let t = t.to_lowercase();
     // uuid, string (char/varchar/text families), and float/real/double — but NOT
     // decimal/numeric/money (the planner's keyset cursor excludes those).
-    t.contains("uuid")
+    // `number`: an Oracle NUMBER without precision (init::oracle::catalog_type) —
+    // the cursor carries it as exact text and the server compares it numerically.
+    t == "number"
+        || t.contains("uuid")
         || t.contains("uniqueidentifier")
         || t.contains("char") // char, varchar, nvarchar, character varying, bpchar
         || t.contains("text")
@@ -513,11 +541,27 @@ pub(super) fn source_type(source_url: &str) -> Result<&'static str> {
         Ok("mssql")
     } else if source_url.starts_with("mongodb") {
         Ok("mongo")
+    } else if source_url.starts_with("oracle://") {
+        Ok("oracle")
     } else {
         anyhow::bail!(
-            "Unsupported source URL scheme. Expected postgresql://, mysql://, sqlserver://, or mongodb://, got: {}",
+            "Unsupported source URL scheme. Expected postgresql://, mysql://, sqlserver://, mongodb://, or oracle://, got: {}",
             source_url
         )
+    }
+}
+
+/// Refuse a forced `--mode` the source cannot run, in the config loader's own words.
+fn refuse_unsupported_forced_mode(source_url: &str, mode: Option<&str>) -> Result<()> {
+    match (source_type_of(source_url), mode) {
+        (Ok(st), Some(m)) if !st.is_sql() && !matches!(m, "full" | "cdc") => anyhow::bail!(
+            "init: --mode {m}: {}",
+            crate::config::non_sql_mode_refusal(st, m)
+        ),
+        (Ok(crate::config::SourceType::Oracle), Some("cdc")) => {
+            anyhow::bail!("init: {}", crate::config::ORACLE_CDC_UNSUPPORTED)
+        }
+        _ => Ok(()),
     }
 }
 
@@ -528,7 +572,9 @@ pub(super) fn source_type_of(source_url: &str) -> Result<crate::config::SourceTy
         "postgres" => SourceType::Postgres,
         "mysql" => SourceType::Mysql,
         "mssql" => SourceType::Mssql,
-        _ => SourceType::Mongo,
+        "oracle" => SourceType::Oracle,
+        "mongo" => SourceType::Mongo,
+        other => unreachable!("source_type returned an unknown engine {other}"),
     })
 }
 
@@ -565,6 +611,17 @@ impl TableFilter {
             return false;
         }
         self.include.is_empty() || self.include.iter().any(|g| glob_match(g, name))
+    }
+
+    /// [`matches`](Self::matches) ignoring case, for Oracle, where an unquoted name folds upper-case.
+    #[cfg_attr(not(feature = "oracle"), allow(dead_code))]
+    pub(super) fn matches_folded(&self, name: &str) -> bool {
+        let up = |v: &[String]| v.iter().map(|g| g.to_uppercase()).collect();
+        TableFilter {
+            include: up(&self.include),
+            exclude: up(&self.exclude),
+        }
+        .matches(&name.to_uppercase())
     }
 }
 
@@ -681,6 +738,9 @@ pub fn init(
     tls: Option<&crate::config::TlsConfig>,
 ) -> Result<()> {
     yaml_destination.validate()?;
+    if matches!(format, InitFormat::Yaml) {
+        refuse_unsupported_forced_mode(source_url, mode_override)?;
+    }
     let (text, yaml_decimal_review, snapshots) = match format {
         InitFormat::Yaml => init_yaml(
             tls,
@@ -987,6 +1047,16 @@ fn introspect_single_table(
             mark_mssql_catalog_exact(&mut info);
             info
         }
+        #[cfg(feature = "oracle")]
+        "oracle" => {
+            let mut conn = oracle::connect(source_url, tls)?;
+            let owner = oracle::resolve_schema(&mut conn, eff_schema.as_deref())?;
+            oracle::introspect(
+                &mut conn,
+                &owner,
+                &crate::sql::oracle_catalog_name(table_name),
+            )?
+        }
         "mongo" => {
             // #12 bughunt: --schema was silently ignored for Mongo (the cross-db
             // guard the SQL engines got was absent), so an operator scoping to a
@@ -1198,6 +1268,7 @@ fn init_discovery_json(
             "postgres" => format!("table \"{}\".\"{}\"", info.schema, info.table),
             "mysql" => format!("table `{}`", info.table),
             "mssql" => format!("table [{}].[{}]", info.schema, info.table),
+            "oracle" => format!("table \"{}\".\"{}\"", info.schema, info.table),
             "mongo" => format!("collection {}", info.table),
             _ => unreachable!(),
         };
@@ -1356,6 +1427,20 @@ fn introspect_all(
             }
             Ok(out)
         }
+        #[cfg(feature = "oracle")]
+        "oracle" => {
+            let mut conn = oracle::connect(source_url, tls)?;
+            let owner = oracle::resolve_schema(&mut conn, schema)?;
+            let mut names = oracle::list_tables(&mut conn, &owner)?;
+            names.retain(|n| filter.matches_folded(n));
+            let mut out = Vec::with_capacity(names.len());
+            for n in names {
+                if let Some(info) = scan_step(oracle::introspect(&mut conn, &owner, &n))? {
+                    out.push(info)
+                }
+            }
+            Ok(out)
+        }
         "mongo" => {
             reject_mongo_schema(schema)?;
             let conn = mongo::connect(source_url, tls)?;
@@ -1399,6 +1484,13 @@ fn schema_scope_label(source_url: &str, schema: Option<&str>, n: usize) -> Resul
                 .filter(|s| !s.is_empty())
                 .unwrap_or("dbo");
             format!("SQL Server schema \"{sch}\" ({n} {obj})")
+        }
+        "oracle" => {
+            let owner = schema
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("(current schema)");
+            format!("Oracle schema \"{owner}\" ({n} {obj})")
         }
         "mongo" => {
             // Database name from the URL path: mongodb://[user@]host[:port]/<db>[?opts]
@@ -2075,6 +2167,39 @@ mod tests {
             "150K must not say below 100K: {r}"
         );
         assert!(r.contains("no chunk key"), "must name the real reason: {r}");
+    }
+
+    #[test]
+    fn a_forced_mode_rationale_names_the_override_not_the_auto_reasons() {
+        let small_keyed = make_table(
+            900,
+            vec![
+                col("id", "bigint", true),
+                col("updated_at", "timestamp", false),
+            ],
+        );
+        assert_eq!(
+            small_keyed.mode_rationale("incremental"),
+            "~900 rows below the 100K threshold; auto would pick `full`, written as \
+             incremental on 'updated_at'"
+        );
+        let small_no_cursor = make_table(900, vec![col("label", "text", false)]);
+        assert_eq!(
+            small_no_cursor.mode_rationale("incremental"),
+            "~900 rows below the 100K threshold; auto would pick `full`, written as \
+             incremental — set cursor_column manually (no timestamp column detected)"
+        );
+        let big_keyed = make_table(500_000, vec![col("id", "bigint", true)]);
+        assert_eq!(
+            big_keyed.mode_rationale("full"),
+            "~500K rows ≥ 100K threshold; auto would pick `chunked`, written as a full scan"
+        );
+        let big_cursor_only = make_table(500_000, vec![col("updated_at", "timestamp", false)]);
+        assert_eq!(
+            big_cursor_only.mode_rationale("incremental"),
+            "auto: ~500K rows ≥ 100K threshold; chunk column missing, falling back to \
+             incremental on 'updated_at'"
+        );
     }
 
     #[test]
@@ -2892,8 +3017,21 @@ mod tests {
     }
 
     #[test]
+    fn oracle_schema_scope_label_names_the_owner_or_the_current_schema() {
+        let url = "oracle://u:p@h:1521/SVC";
+        assert_eq!(
+            schema_scope_label(url, Some("RIVET"), 2).unwrap(),
+            "Oracle schema \"RIVET\" (2 objects)"
+        );
+        assert_eq!(
+            schema_scope_label(url, Some(" "), 1).unwrap(),
+            "Oracle schema \"(current schema)\" (1 object)"
+        );
+    }
+
+    #[test]
     fn source_type_unsupported_scheme_names_sqlserver() {
-        let err = source_type("oracle://host/db").expect_err("oracle is unsupported");
+        let err = source_type("db2://host/db").expect_err("db2 is unsupported");
         let msg = format!("{err}");
         assert!(
             msg.contains("sqlserver://"),
@@ -2907,6 +3045,58 @@ mod tests {
         assert_eq!(mssql_table_schema("public"), "dbo");
         // An explicitly-qualified schema is honoured verbatim.
         assert_eq!(mssql_table_schema("sales"), "sales");
+    }
+
+    #[test]
+    fn init_refuses_oracle_cdc_with_the_loaders_exact_words() {
+        let ora = "oracle://rivet:rivet@h:1521/FREEPDB1";
+        assert_eq!(
+            refuse_unsupported_forced_mode(ora, Some("cdc"))
+                .unwrap_err()
+                .to_string(),
+            "init: `mode: cdc` is not supported for Oracle yet — use `mode: full`, `chunked` or \
+             `incremental`"
+        );
+        assert!(refuse_unsupported_forced_mode(ora, Some("chunked")).is_ok());
+        assert!(refuse_unsupported_forced_mode(ora, None).is_ok());
+        assert!(refuse_unsupported_forced_mode("postgresql://h/db", Some("cdc")).is_ok());
+    }
+
+    #[test]
+    fn an_oracle_include_glob_matches_whatever_case_it_is_typed_in() {
+        let f = TableFilter {
+            include: vec!["bh2_sk_i*".into()],
+            exclude: vec!["*_tmp".into()],
+        };
+        assert!(f.matches_folded("BH2_SK_IOT"));
+        assert!(f.matches_folded("bh2_sk_Iot"));
+        assert!(!f.matches_folded("BH2_SK_IOT_TMP"));
+        assert!(!f.matches_folded("BH2_SK_NUM"));
+        assert!(!f.matches("BH2_SK_IOT"), "the plain matcher stays exact");
+    }
+
+    #[test]
+    fn a_forced_mode_mongo_cannot_run_is_refused_in_the_loaders_words() {
+        for m in ["incremental", "chunked", "time_window"] {
+            let err = super::refuse_unsupported_forced_mode("mongodb://h/db", Some(m))
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                err,
+                format!(
+                    "init: --mode {m}: source type 'Mongo' supports `mode: full` (batch) and \
+                     `mode: cdc` (change streams) (got `mode: {m}`). MongoDB has no SQL, so \
+                     chunked / incremental / keyset / time-window are not available; every \
+                     document exports as `_id` + a `document` JSON column."
+                )
+            );
+        }
+        for m in [None, Some("full"), Some("cdc")] {
+            assert!(super::refuse_unsupported_forced_mode("mongodb://h/db", m).is_ok());
+        }
+        assert!(
+            super::refuse_unsupported_forced_mode("postgresql://h/db", Some("chunked")).is_ok()
+        );
     }
 
     #[test]

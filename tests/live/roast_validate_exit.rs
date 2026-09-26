@@ -118,3 +118,100 @@ fn roast_validate_exits_nonzero_when_manifest_unreadable() {
         String::from_utf8_lossy(&degraded.stderr),
     );
 }
+
+/// A CSV part that lost a row (same byte size, so size/presence still pass) fails `--depth full`.
+#[test]
+#[ignore = "live: postgres"]
+fn validate_full_depth_fails_a_csv_part_that_lost_a_row() {
+    require_alive(LiveService::Postgres);
+    let table = seed_pg_numeric_table(10);
+    let out_dir = tempfile::tempdir().unwrap();
+    let export_name = unique_name("csv_rowloss");
+    let rig = Rig::pg_batch(&export_name)
+        .query(&format!(
+            "SELECT id, name FROM {} ORDER BY id",
+            table.name()
+        ))
+        .with_format("csv")
+        .dest_path(out_dir.path().to_path_buf());
+    let run_out = rig.run_args(&["--export", &export_name]);
+    assert!(
+        run_out.status.success(),
+        "setup: rivet run failed; stderr:\n{}",
+        String::from_utf8_lossy(&run_out.stderr)
+    );
+
+    let healthy = rig.cli(&["validate", "--export", &export_name, "--depth", "full"]);
+    let healthy_out = String::from_utf8_lossy(&healthy.stdout);
+    assert!(
+        healthy.status.success(),
+        "intact CSV must validate:\n{healthy_out}"
+    );
+    assert!(
+        healthy_out.contains(
+            "warning:   [RIVET_VERIFY_VALUE_CHECK_NOT_AVAILABLE] cell values were not re-read: \
+             csv parts carry no value checksum (only parquet does); each part's row count was \
+             re-counted instead"
+        ),
+        "full depth must say the CSV value check did not run:\n{healthy_out}"
+    );
+
+    let part = std::fs::read_dir(out_dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|x| x == "csv"))
+        .expect("a csv part");
+    let body = std::fs::read_to_string(&part).unwrap();
+    let damaged = body.replacen("\n9,row_9", " 9,row_9", 1);
+    assert_ne!(
+        body, damaged,
+        "fixture: the last row must be present to merge"
+    );
+    assert_eq!(body.len(), damaged.len());
+    std::fs::write(&part, damaged).unwrap();
+
+    let degraded = rig.cli(&["validate", "--export", &export_name, "--depth", "full"]);
+    let out = String::from_utf8_lossy(&degraded.stdout);
+    assert!(
+        !degraded.status.success(),
+        "a CSV part missing a row must not pass:\n{out}"
+    );
+    assert!(
+        out.contains("[RIVET_VERIFY_PART_ROW_COUNT]")
+            && out.contains("declares 10 rows but holds 9 CSV records after the header"),
+        "{out}"
+    );
+}
+
+/// A prefix whose last run failed (manifest status `failed`) does not validate.
+#[test]
+#[ignore = "live: postgres"]
+fn validate_fails_a_prefix_whose_last_run_failed() {
+    require_alive(LiveService::Postgres);
+    let out_dir = tempfile::tempdir().unwrap();
+    let export_name = unique_name("failed_run");
+    let rig = Rig::pg_batch(&export_name)
+        .query("SELECT id FROM rivet_no_such_table_r3")
+        .dest_path(out_dir.path().to_path_buf());
+    let run_out = rig.run_args(&["--export", &export_name]);
+    assert!(!run_out.status.success(), "setup: the run must fail");
+    let manifest = std::fs::read_to_string(out_dir.path().join("manifest.json"))
+        .expect("setup: a failed run writes its manifest");
+    assert!(manifest.contains("\"status\": \"failed\""), "{manifest}");
+
+    let v = rig.cli(&["validate", "--export", &export_name]);
+    let out = String::from_utf8_lossy(&v.stdout);
+    assert_eq!(
+        v.status.code(),
+        Some(1),
+        "a failed run must not validate:\n{out}"
+    );
+    assert!(out.contains("status:    FAILED"), "{out}");
+    assert!(
+        out.contains(
+            "failure:   [RIVET_VERIFY_RUN_NOT_SUCCESSFUL] the manifest records its last run as \
+             failed, not success: this prefix does not hold a completed export. Re-run the export."
+        ),
+        "{out}"
+    );
+}

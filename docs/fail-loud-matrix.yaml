@@ -13,7 +13,7 @@
 # destination-outage + state-store-write-fail are in docs/resilience-matrix.yaml;
 # UInt64 overflow is a target-axis WARN (not a bail) in docs/warehouse-load-matrix.yaml.
 
-engines: [postgres, mysql, mssql, mongo]
+engines: [postgres, mysql, mssql, mongo, oracle]
 
 scenarios:
   - id: cdc_vanished_anchor_loud
@@ -22,6 +22,7 @@ scenarios:
     mysql:    { test: cdc_resume_from_missing_binlog_fails_loudly_not_silently }
     mssql:    { test: mssql_cdc_resume_past_retention_errors_not_a_silent_gap }
     mongo:    { na: "an oplog-rolled-past resume token surfaces the driver's ChangeStreamHistoryLost directly (rivet does not swallow it — src/source/mongo/cdc.rs); forcing an oplog rollover live is impractical (documented NA in cdc_conformance_gate.rs). The adjacent corrupt-checkpoint case IS tested: roast_corrupt_checkpoint_fails_loudly_not_silent_reanchor" }
+    oracle:   { gap: "oracle CDC not implemented yet (phase 3) — `mode: cdc` is refused at config validation" }
 
   - id: cdc_unroutable_configured_table_loud
     what: "a configured `table:` that NO change event can ever name (a PostgreSQL partitioned parent / view / matview; a MySQL VIEW, whose binlog Table_map names the BASE table; a SQL Server capture instance whose catalog identity differs) → loud AT OPEN, before any ack, never a 0-row `status: success` past an advanced cursor. Which LOUD is owed follows the error's permanence, and the split is load-bearing rather than a softening: a relation that EXISTS and can never emit under the configured name is a permanent error → BAIL (the three SQL engines; downgrading one to a warning is this shape's mutant). A name that is merely ABSENT and would become valid at the first write is pending, not wrong → loud WARNING naming what the catalog does hold (Mongo, where a collection is born on its first write; on the SQL engines the absent name is already loud through the schema probe, so no engine trades a bail for a warning)"
@@ -29,6 +30,7 @@ scenarios:
     mssql:    { test: mssql_cdc_capture_instance_name_must_not_decide_the_table }
     mysql:    { test: roast_mysql_cdc_refuses_a_view_whose_binlog_identity_is_the_base_table }
     mongo:    { test: mongo_cdc_warns_when_a_configured_collection_does_not_exist }
+    oracle:   { gap: "oracle CDC not implemented yet (phase 3) — `mode: cdc` is refused at config validation" }
 
   - id: cdc_truncate_loud_not_a_silent_divergence
     what: "a TRUNCATE on a captured table → loud bail naming the re-snapshot, never a silent drop that leaves the destination holding rows the source no longer has (no DELETE events carry them, so no later capture can reconcile it)"
@@ -36,6 +38,7 @@ scenarios:
     mysql:    { test: roast_mysql_cdc_refuses_a_truncate_instead_of_silently_diverging }
     mssql:    { na: "SQL Server REFUSES the truncate itself — `TRUNCATE TABLE` on a CDC-enabled table raises Msg 4711 (measured 2026-08-24 on rivet-mssql-cdc-1), so the divergence cannot be created and there is nothing for rivet to detect" }
     mongo:    { na: "MongoDB has no TRUNCATE; a drop/collection-level delete surfaces as an invalidate event on the change stream, a separate contract" }
+    oracle:   { gap: "oracle CDC not implemented yet (phase 3) — `mode: cdc` is refused at config validation" }
 
   - id: hostile_numeric_value_loud
     what: "a non-finite value (NaN/Inf) in a lossy fixed-point numeric → loud error, never a silent NULL / truncate-to-zero"
@@ -43,6 +46,7 @@ scenarios:
     mysql:    { na: "MySQL DECIMAL cannot hold NaN/Inf; float NaN is representable in Parquet (preserved, not degraded) — no lossy-numeric bail path" }
     mssql:    { test: non_finite_money_is_a_loud_error_not_a_silent_null }
     mongo:    { na: "BSON double NaN is representable in Parquet; the NaN-as-_id keyset refusal is a separate row (unusable_keyset_key_loud)" }
+    oracle:   { na: "Oracle NUMBER cannot hold NaN/Inf; BINARY_FLOAT/BINARY_DOUBLE NaN/Inf are representable in Parquet and exported as IEEE values (pinned by oracle_full_export_matches_the_databases_own_rendering_for_every_type)" }
 
   - id: sparse_range_plan_guard
     what: "a sparse range-chunk key that would blow up into thousands of near-empty windows → bail (PG/MSSQL, scan-free estimate proves ≥4×) or loud warn (MySQL, no trustworthy estimate)"
@@ -50,6 +54,7 @@ scenarios:
     mysql:    { test: stand_sparse_guard_mysql }
     mssql:    { test: stand_sparse_guard_mssql }
     mongo:    { na: "Mongo pages _id with a keyset seek — no BETWEEN key-span to divide; its guard family is the heterogeneous/NaN _id detector" }
+    oracle:   { gap: "no Oracle live sparse-range guard test" }
 
   - id: unusable_keyset_key_loud
     what: "keyset requested on a key that isn't single-column NOT NULL UNIQUE/PK (or a heterogeneous BSON _id on Mongo) → bail pointing at the fix; the full scan stays the working remediation"
@@ -57,6 +62,7 @@ scenarios:
     mysql:    { test: stand_keyset_non_usable_bail_mysql }
     mssql:    { na: "the refusal is engine-agnostic plan logic (src/plan/build.rs, is_usable_keyset_key); only the ACCEPT side is engine-specific (mssql_keyset_on_non_pk_unique_index) — pinned once on PG+MySQL" }
     mongo:    { test: mongo_keyset_on_heterogeneous_id_errors_loudly_full_scan_still_works }
+    oracle:   { gap: "the refusal is shared plan logic, but its input (Oracle's all_indexes/all_ind_columns keyset-key probe) is Oracle-specific and untested" }
 
   - id: strict_mode_unsafe_type_gates
     what: "--strict + an unsafe/unsupported source type (or a target-Fail type) → non-zero exit naming the column; without --strict, a printed un-gated note"
@@ -64,6 +70,7 @@ scenarios:
     mysql:    { na: "the --strict gate is engine-agnostic (src/preflight) — it gates on the type report, not the source engine; the PG unsafe-type fixture pins the gate" }
     mssql:    { na: "same engine-agnostic strict gate; pinned once on Postgres" }
     mongo:    { na: "same engine-agnostic strict gate; pinned once on Postgres" }
+    oracle:   { na: "same engine-agnostic strict gate; pinned once on Postgres" }
 
   - id: cross_shape_manifest_clobber_refused
     what: "a batch export and a CDC export sharing one destination prefix → refused (their manifests would clobber), never a silent overwrite"
@@ -71,6 +78,7 @@ scenarios:
     mysql:    { test: cdc_scaffold_gets_its_own_prefix_and_cross_shape_overwrite_is_refused }
     mssql:    { na: "guard_manifest_mode is engine-agnostic (src/manifest.rs), reached from every pipeline path — pinned by the PG offline unit + the MySQL live test" }
     mongo:    { na: "same engine-agnostic manifest-mode guard; pinned once" }
+    oracle:   { na: "guard_manifest_mode is engine-agnostic, and Oracle has no CDC export to cross with yet" }
 
   - id: remote_plaintext_tls_refused
     what: "a remote (non-loopback) plaintext connection with no tls: block → refused on policy (CWE-319), not attempted; loopback plaintext stays allowed"
@@ -78,6 +86,7 @@ scenarios:
     mysql:    { na: "require_tls_or_loopback is one shared gate reached from every engine's connect path (src/source/mod.rs) — pinned by the PG live test + offline units gate_refuses_remote_plaintext_only" }
     mssql:    { na: "same engine-agnostic TLS gate; pinned once on Postgres" }
     mongo:    { na: "same engine-agnostic TLS gate; pinned once on Postgres" }
+    oracle:   { na: "require_tls_or_loopback is the shared gate; oracle::connect calls it first — pinned once on Postgres" }
 
   - id: uint64_overflow_is_warn_not_bail
     what: "UInt64 > INT64_MAX is NOT a fail-loud condition by design — Parquet holds it losslessly (TypeFidelity::Exact); the divergence is warehouse autoload, a WARN + load-schema note, excluded from --strict's fatal gate"
@@ -85,6 +94,7 @@ scenarios:
     mysql:    { na: "see postgres — UInt64 rides losslessly as decimal(20,0); the note is advisory, not loud" }
     mssql:    { na: "SQL Server has no unsigned-64 type; NA by construction" }
     mongo:    { na: "target-axis condition; tracked in the warehouse-load matrix, not here" }
+    oracle:   { na: "Oracle has no unsigned-64 type; NA by construction" }
 
   # ── CLI-surface fail-loud (0.21.2 dogfood) ──────────────────────────────────
   # Engine-AGNOSTIC CLI contracts: the source engine never forks these code paths,
@@ -99,6 +109,7 @@ scenarios:
     mysql:    { na: "CLI inspect validation is engine-agnostic (src/pipeline/cli.rs::require_known_export, reached from every inspect handler regardless of source engine) — pinned once; the sibling commands are covered by show_journal_run_id_validates_export_and_cross_checks_ownership + reset_state_unknown_export_bails_with_hint" }
     mssql:    { na: "same engine-agnostic require_known_export gate" }
     mongo:    { na: "same engine-agnostic require_known_export gate" }
+    oracle:   { na: "same engine-agnostic require_known_export gate" }
 
   - id: cli_unresolved_placeholder_loud
     what: "an unresolved ${var} in the config (run / plan / check) → loud error that names --param AND the env var, never a silent empty-string substitution (dogfood MED: the message used to blame only the environment variable)"
@@ -106,6 +117,7 @@ scenarios:
     mysql:    { na: "config placeholder resolution is engine-agnostic (src/config/resolve.rs::resolve_vars), the same text for every source" }
     mssql:    { na: "same engine-agnostic resolver" }
     mongo:    { na: "same engine-agnostic resolver" }
+    oracle:   { na: "same engine-agnostic resolver" }
 
   - id: cli_malformed_param_loud
     what: "a malformed --param foo (no '=') → loud error, never silently dropped and then surfaced downstream as a misleading 'environment variable foo is not set' (dogfood LOW)"
@@ -113,6 +125,7 @@ scenarios:
     mysql:    { na: "CLI --param parsing is engine-agnostic (src/cli/params.rs::parse_params)" }
     mssql:    { na: "same engine-agnostic --param parser" }
     mongo:    { na: "same engine-agnostic --param parser" }
+    oracle:   { na: "same engine-agnostic --param parser" }
 
   - id: cdc_ndjson_binary_lossless
     what: "a genuinely-binary column (bytea / uuid / GUID bytes) in CDC NDJSON stdout → lossless PG-style hex (\\x…), never a silent from_utf8_lossy U+FFFD replacement that destroys the bytes (dogfood MED)"
@@ -120,3 +133,4 @@ scenarios:
     mysql:    { na: "the NDJSON Bytes renderer is engine-agnostic (src/source/cdc/value.rs::to_json), shared by every CDC adapter — pinned once" }
     mssql:    { na: "same shared to_json Bytes path" }
     mongo:    { na: "same shared to_json Bytes path" }
+    oracle:   { na: "same shared to_json Bytes path (engine-agnostic); Oracle has no CDC yet" }

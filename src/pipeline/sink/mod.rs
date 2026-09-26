@@ -15,7 +15,6 @@ use std::sync::Arc;
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 
-use super::chunked::RIVET_CHUNK_RN_COL;
 use crate::config::IncrementalCursorMode;
 use crate::enrich;
 use crate::error::Result;
@@ -71,7 +70,7 @@ pub(crate) struct ExportSink {
     pub(in crate::pipeline) quality: QualityTracker,
     pub(in crate::pipeline) max_file_size: Option<u64>,
     pub(in crate::pipeline) completed_parts: Vec<CompletedPart>,
-    /// When set, this column is removed from Arrow batches before enrichment and write (see `chunk_dense`).
+    /// When set, this column is removed from Arrow batches before enrichment and write (the coalesce cursor).
     pub(in crate::pipeline) strip_internal_column: Option<String>,
     /// Running per-column max byte length for string/binary columns (Epic 8).
     pub(in crate::pipeline) column_max_bytes: std::collections::HashMap<String, u64>,
@@ -510,7 +509,6 @@ impl ExportSink {
         let tmp = tempfile::NamedTempFile::new()?;
         let exported_at_us = chrono::Utc::now().timestamp_micros();
         let strip_internal_column = match &plan.strategy {
-            ExtractionStrategy::Chunked(cp) if cp.dense => Some(RIVET_CHUNK_RN_COL.to_string()),
             ExtractionStrategy::Incremental(p) if p.mode == IncrementalCursorMode::Coalesce => {
                 Some(IncrementalCursorPlan::RIVET_COALESCE_CURSOR_COL.to_string())
             }

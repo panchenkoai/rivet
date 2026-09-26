@@ -23,7 +23,7 @@ exports:
     # Rivet queries MIN/MAX then slices the KEY RANGE into windows of
     # chunk_size key values ((max-min)/chunk_size windows). Rows per chunk
     # equals chunk_size only when the key is dense; on a sparse/gappy key
-    # most windows hold far fewer rows (use chunk_dense: true or chunk_count: N).
+    # most windows hold far fewer rows (use chunk_by_key: <unique key> or chunk_count: N).
     chunk_column: id
     chunk_size: 100000              # key values per window (default: 100,000)
     parallel: 4                     # concurrent workers

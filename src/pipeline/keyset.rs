@@ -179,11 +179,13 @@ pub(crate) fn read_keyset_page_bounded(
     // Shared commit path (I1→I2→I7 + counters + journal + fault hooks).
     // write_sink_parts drains every part the sink produced — the final temp file
     // plus anything maybe_split rotated at max_file_size — so rotation can't drop.
-    let parts = super::commit::write_sink_parts(
+    let mut parts = Vec::new();
+    super::commit::write_sink_parts(
         dest,
         &mut sink,
         plan.validate.then_some(plan.format),
         |idx, count| super::commit::part_indexed_name(part_base, idx, count),
+        &mut parts,
     )?;
     Ok(Some(KeysetPage {
         parts,
@@ -218,7 +220,7 @@ fn nth_row_clause(st: crate::config::SourceType, off: i64) -> String {
     use crate::config::SourceType::*;
     match st {
         Postgres | Mysql => format!("LIMIT 1 OFFSET {off}"),
-        Mssql => format!("OFFSET {off} ROWS FETCH NEXT 1 ROWS ONLY"),
+        Mssql | Oracle => format!("OFFSET {off} ROWS FETCH NEXT 1 ROWS ONLY"),
         Mongo => unreachable!("parallel keyset sampling is a SQL path; Mongo uses $sample"),
     }
 }
@@ -263,7 +265,8 @@ pub(crate) fn sample_key_boundaries(
     };
     let total: i64 = src
         .query_scalar(&format!(
-            "SELECT COUNT(*) FROM ({base}) AS _rivet_pk_cnt {where_clause}"
+            "SELECT COUNT(*) FROM ({base}) {} {where_clause}",
+            crate::sql::derived(st, "_rivet_pk_cnt")
         ))?
         .as_deref()
         .and_then(|s| s.trim().parse::<i64>().ok())
@@ -275,8 +278,10 @@ pub(crate) fn sample_key_boundaries(
     for i in 1..parts {
         let off = percentile_offset(total, i, parts);
         let nth = nth_row_clause(st, off);
-        let sql =
-            format!("SELECT {k} FROM ({base}) AS _rivet_pk {where_clause} ORDER BY {k} {nth}");
+        let sql = format!(
+            "SELECT {k} FROM ({base}) {} {where_clause} ORDER BY {k} {nth}",
+            crate::sql::derived(st, "_rivet_pk")
+        );
         if let Some(v) = src.query_scalar(&sql)?
             && bounds.last().map(String::as_str) != Some(v.as_str())
         {
@@ -435,8 +440,9 @@ fn run_keyset_parallel(
         };
         let key_q = crate::sql::quote_ident(plan.source.source_type, &key);
         let cur_max = src.query_scalar(&format!(
-            "SELECT MAX({key_q}) FROM ({}) AS _rivet_pk_max",
-            plan.base_query
+            "SELECT MAX({key_q}) FROM ({}) {}",
+            plan.base_query,
+            crate::sql::derived(plan.source.source_type, "_rivet_pk_max")
         ))?;
         if nothing_past_anchor(anchor.as_deref(), cur_max.as_deref()) {
             log::info!(
@@ -655,12 +661,14 @@ fn run_keyset_parallel(
                     local_checks.push(page.checksums);
                     let last_page = is_last_page(page.rows, page_size);
                     if !last_page {
-                        cursor = Some(page.next_cursor.ok_or_else(|| {
+                        let next = page.next_cursor.ok_or_else(|| {
                             anyhow::anyhow!(
                                 "could not advance the '{key_r}' cursor at page {pages} \
                                  (NULL or unsupported type)"
                             )
-                        })?);
+                        })?;
+                        ensure_cursor_advanced(cursor.as_deref(), &next, key_r, pages)?;
+                        cursor = Some(next);
                     }
                     pages += 1;
                     if last_page {
@@ -829,6 +837,17 @@ fn nothing_past_anchor(anchor: Option<&str>, cur_max: Option<&str>) -> bool {
 /// Did the sampler collapse a requested parallel fan-out to a single range?
 fn fan_out_collapsed(parallel: usize, total_ranges: usize) -> bool {
     parallel > 1 && total_ranges == 1
+}
+
+/// Refuse a full page whose last key renders equal to the previous bound: the seek would re-read it for ever.
+fn ensure_cursor_advanced(prev: Option<&str>, next: &str, key: &str, page: usize) -> Result<()> {
+    anyhow::ensure!(
+        prev != Some(next),
+        "keyset page {page} ended on the same '{key}' value it started after ({next}): the key's \
+         rendering is coarser than its values (e.g. a TIMESTAMP(7..9) read at microseconds), so the \
+         seek cannot advance. Page on a unique key rivet reads exactly."
+    );
+    Ok(())
 }
 
 /// A short page means the key range is exhausted.
@@ -1127,7 +1146,10 @@ pub(crate) fn run_keyset(
         // unsupported type), we must NOT loop on the same bound — that would
         // re-read the same page forever.
         match page.next_cursor {
-            Some(v) => last = Some(v),
+            Some(v) => {
+                ensure_cursor_advanced(last.as_deref(), &v, &kp.key_column, pages - 1)?;
+                last = Some(v)
+            }
             None => {
                 // Failure forensics (v18): stamp the LAST key we did read — the
                 // boundary just before the unadvanceable row. With `cursor_high`
@@ -1199,6 +1221,21 @@ pub(crate) fn run_keyset(
 mod tests {
     use super::*;
     use crate::config::SourceType;
+
+    #[test]
+    fn a_page_that_ends_on_its_start_bound_is_refused() {
+        assert!(
+            ensure_cursor_advanced(
+                Some("2024-01-01T00:00:00.123456"),
+                "2024-01-01T00:00:00.123456",
+                "T9",
+                3
+            )
+            .is_err()
+        );
+        assert!(ensure_cursor_advanced(Some("7"), "14", "ID", 1).is_ok());
+        assert!(ensure_cursor_advanced(None, "7", "ID", 0).is_ok());
+    }
 
     // ── seek_tag: the sequential-checkpoint part-name identity ────────────────
     const FNV_ID_000300: &str = "c4c7be0f3cc9638a"; // FNV-1a of "id-000300", pinned

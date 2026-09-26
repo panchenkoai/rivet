@@ -100,6 +100,14 @@ fn staging_name(file_name: &str) -> String {
     )
 }
 
+/// An idempotent delete: a key that is already gone counts as removed.
+fn absent_is_removed(r: std::io::Result<()>) -> std::io::Result<()> {
+    match r {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
+}
+
 impl super::Destination for LocalDestination {
     fn write(&self, local_path: &Path, remote_key: &str) -> Result<super::WriteOutcome> {
         let target = self.safe_join(remote_key)?;
@@ -221,6 +229,12 @@ impl super::Destination for LocalDestination {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    fn remove(&self, key: &str) -> Result<()> {
+        Ok(absent_is_removed(std::fs::remove_file(
+            self.safe_join(key)?,
+        ))?)
     }
 
     fn r#move(&self, from: &str, to: &str) -> Result<()> {
@@ -626,6 +640,18 @@ mod tests {
         let m = dest.head("part-000001.parquet").unwrap().unwrap();
         assert_eq!(m.key, "part-000001.parquet");
         assert_eq!(m.size_bytes, 1234);
+    }
+
+    #[test]
+    fn remove_deletes_the_key_and_an_absent_key_is_ok() {
+        use std::io::{Error, ErrorKind};
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dest_at(dir.path());
+        std::fs::write(dir.path().join("_SUCCESS"), b"x").unwrap();
+        dest.remove("_SUCCESS").unwrap();
+        assert!(!dir.path().join("_SUCCESS").exists());
+        dest.remove("_SUCCESS").unwrap();
+        assert!(super::absent_is_removed(Err(Error::from(ErrorKind::PermissionDenied))).is_err());
     }
 
     #[test]

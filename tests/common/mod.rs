@@ -58,6 +58,8 @@ mod env;
 mod mongo;
 mod mssql;
 mod mysql;
+#[cfg(feature = "oracle")]
+mod oracle;
 mod parquet;
 mod pg;
 mod registry;
@@ -75,6 +77,8 @@ pub use env::*;
 pub use mongo::*;
 pub use mssql::*;
 pub use mysql::*;
+#[cfg(feature = "oracle")]
+pub use oracle::*;
 pub use parquet::*;
 pub use pg::*;
 pub use registry::*;

@@ -178,13 +178,10 @@ def build_wave_dag(
         # would false-mismatch a full-table COUNT(*), so reconcile only the rest.
         reconcile = "" if strat.startswith("incremental") else " --reconcile"
         if strat.startswith("chunked"):
-            # A chunked export checkpoints per chunk. If a previous attempt was
-            # killed mid-chunk (worker crash, retry, timeout), rivet refuses a fresh
-            # start with "chunk checkpoint still in progress" — that protection is
-            # why the checkpoint exists. Recover by STATE, not by try_number (which
-            # is wrong after a resume already finished): try a clean run; ONLY if
-            # rivet reports the in-progress checkpoint, `--resume` from the last good
-            # chunk (no reconcile — it would count only the resumed remainder). Any
+            # A chunked export checkpoints per chunk, and a plain run resumes a
+            # checkpoint whose process is gone (crashed or failed). rivet reports
+            # "chunk checkpoint ... in progress" only while a LIVE process holds it;
+            # the `--resume` below is then refused too and the task fails. Any
             # other failure propagates.
             run = (
                 f"out=$({base}{reconcile} 2>&1); rc=$?; echo \"$out\"; "

@@ -20,8 +20,24 @@ python3 -m dev.release_oracle --engines postgres,mysql
 |---|---|
 | **verdicts** | `init` picks the right strategy for **every seed AND garbage table** (both, per engine), checked against a committed golden (`golden/verdicts.json`): clean-PK seeds → **keyset**, `orders_sparse` → full, garbage `decimal_key` → full-bail, `ref_id_history` → range (non-unique), `unindexed_id` → **not** keyset (name-trap), `bigint_pk` → keyset; **zero** phantom heavy-chunk warnings. PG/MSSQL garbage lives in schema `ext` (a second init); MySQL in the same DB. Mongo → full. |
 | **integrity+types** | (1) users 150K loss/dup: source count+distinct == DuckDB read of the parts. (2) `<tmt>` = the PARQUET readback compared **value by value to the source table** in one DuckDB session (`value_diff.compare_rows_to_parquet` — decimal, uuid, timestamp, enum, arrays, float4; no golden) and `<tmt>__csv` = a per-engine DuckDB **golden** (`golden/duckdb_type_matrix.json`) of the CSV readback read ALL-VARCHAR (the text-writer path parquet never exercises — escape/quote/unicode/null; an array column CSV can't represent records a *refusal* sentinel, itself the guarantee of no silent lossy array→CSV). Both read by DuckDB, never rivet. |
+| **mongo_keyset** | one Mongo version: `source.mongo.page_size` keyset, sequential AND `parallel: 4` (`run_mongo_parallel`), each equals the pymongo source count+distinct via DuckDB over the DECLARED parts with >=2 range parts; an int+string `_id` collection is refused (exit != 0, zero parts) on both. `dev/release_oracle/mongo_keyset.py`. |
 | **load** | `rivet run` extracts to each store {s3/MinIO, gcs/fake-gcs, azure/Azurite}; the readback is **INDEPENDENT** — the store's own client + DuckDB (`httpfs` for MinIO, the fake-gcs JSON API, `az` for Azurite), never rivet's own `--validate` — so a rivet read bug can't rubber-stamp its own write. Row count must equal the source, then one DuckDB session attaches the source and compares **every value** of the declared parts (`value_diff.compare_to_parquet`; Mongo's `document` JSON is unpacked into the source's columns). A run-unique prefix isolates each run (run-unique part names never clobber, so a stable prefix would sum every past run). |
 | **gc_survival** | the concurrent-extract bucket-erasure guard (spare an in-flight part while a run is active, delete a true orphan). Runs in the BigQuery stage (needs a warehouse load target). |
+
+### Oracle (23-free, batch only)
+
+The gate starts its own `gvenzl/oracle-free:23-slim-faststart` on `:55023` (3 GiB cap, readiness
+waits up to ~5 min, a SKIP when it never answers) and seeds it from `seeds/common/oracle.sql` plus
+the gate-owned `oracle_tz_probe.sql` (TIMESTAMP WITH TIME ZONE by offset and by region name,
+which the canonical type matrix lacks). DuckDB has no Oracle scanner, so the SOURCE side is read by
+**python-oracledb** (thin, uv-pinned, imported lazily): exact `Decimal`s, LOBs read in full so an
+empty LOB is `''`/`b''` and not NULL, session zone UTC, and each `WITH TIME ZONE` column projected
+`AT TIME ZONE 'UTC'` (the thin driver drops the offset and refuses region names). Oracle runs
+verdicts, integrity+types (type matrix + tz probe, value by value), keyset_parallel, load (all
+three stores, the source registered into the DuckDB session through pyarrow), corruption_is_detected
+and blessed_path (with bq_cycle). CDC cells are `na` (`mode: cdc` is refused); `row_hash` SKIPs
+(Oracle stores `''` as NULL, so the probe's rows 3 and 4 are one row); blessed_flow and not_inert
+are recorded gaps (they ride the CDC stand in `cdc.py`, which has no Oracle).
 
 ## CDC end-to-end stage (all engines, independent oracle)
 
@@ -40,12 +56,26 @@ codifies the manual CDC dogfood as a preflight: for each engine whose
    holds the per-engine anchor (PG slot / MySQL binlog ckpt / MSSQL from-LSN /
    Mongo resume token), and the re-run **re-reads** the delta (`id=4`), never
    losing it;
-5. proves **large-transaction atomicity** (the committed-boundary invariant, PG):
-   a single transaction of 12 rows at `rollover: 5` must roll as ONE unit (the
-   adapter marks only its LAST event `committed`), so a `cdc_after_ack` crash
-   holds the anchor BEFORE the whole transaction and recovery re-reads it entire —
-   **all 12 rows survive**;
-6. **SQLite-vs-Postgres state PARITY**: a PG CDC run against both state backends
+5. proves **large-transaction atomicity on every engine** (`large-tx-atomic`): a
+   single transaction of 12 rows at `rollover: 5`, crashed at the hook right after
+   that engine's anchor moves (`cdc_after_ack` PG, `cdc_after_checkpoint_before_ack`
+   MySQL / SQL Server / Mongo); the union of declared parts after resume must equal
+   the **source's own 12 rows**. Per engine because `committed` is set by each
+   ADAPTER (PG `BEGIN`/`COMMIT`, MySQL XID, SQL Server rows sharing
+   `__$start_lsn`, Mongo per event by design — there the cell grades no-loss, not
+   no-split);
+6. proves **resume exactness** per engine (`resume-exact`): after a crash-recovery,
+   an IDLE run's own `manifest-<run_id>.json` and DuckDB over only its declared
+   parts hold **exactly 0** events, and one change then yields **exactly 1** —
+   scoped per run, never by prefix totals, so an engine that re-reads its whole
+   change table every run (at-least-*everything*) goes red;
+7. PG only: **starvation** (`pg-starvation` — a 200-row UNCAPTURED transaction
+   ahead of a 30-row captured backlog, `rollover: 5`; one bounded run must capture
+   the whole backlog, DuckDB over declared parts vs the source table) and **DDL
+   churn** (`pg-ddl-churn` — `pg_replication_slots.confirmed_flush_lsn` must advance
+   across a zero-yield run over 20 CREATE/DROP pairs; the SERVER is the oracle).
+   Both run in a throwaway database, since a slot decodes its whole database;
+8. **SQLite-vs-Postgres state PARITY**: a PG CDC run against both state backends
    must populate the **same** table set, matching `golden/cdc_state_snapshot.json`
    (the reference snapshot — a release that stops populating `run_status`, or
    drifts the state schema, fails here).
@@ -59,6 +89,16 @@ makes the large-transaction leg go **RED** (the tx splits at the shared commit-L
 the mid-flush crash advances the anchor past it, resume skips the tail — **5/12**
 rows survive, 7 lost). Both mutants revert cleanly; the gate is green only on
 correct code.
+
+The lifecycle cells were RED-proven the same way (2026-09-26, mutant debug builds):
+SQL Server `resume_from_checkpoint` ignoring its checkpoint → `resume-exact[mssql]`
+idle run delivered 2 (want 0), +1 run 3 (want 1); SQL Server `committed: true` on
+every event → `large-tx-atomic[mssql]` 5/12 (ids 6-12 lost); the sink re-drain loop
+disabled → `pg-starvation` 0/30 **with exit 0**; `release_empty_frontier` disabled →
+`pg-ddl-churn` slot frozen. Each cell uses its own uniquely named table / slot /
+capture instance / `server_id`, and an engine whose CDC service is down (no logical
+WAL, binlog not ROW, Agent stopped, not a replica set) SKIPs every cell with that
+reason.
 
 Env-driven and **SKIP** (never a silent pass) when a URL is absent:
 
@@ -139,6 +179,18 @@ have published**, when the failure is no longer re-runnable from the immutable t
 
 RED-proven: a stale `Cargo.lock` reddens the lock check; a multi-line inline table
 reddens **both** the offline guard AND `cargo chef prepare`. SKIP when `cargo` is absent.
+
+## Failures that RETURN, and exact retries (`failure.py`)
+
+Every other fault hook in the gate is a panic, and a panicked run never reaches the
+finalize code. `verify_failed_run_tail` fails PostgreSQL exports (single incremental,
+chunked parallel, chunk_checkpoint sequential/parallel, parallel keyset_incremental,
+`on_schema_drift: fail`) and a parallel Mongo export with `RIVET_TEST_ERROR_AT`, then
+checks exit, `_SUCCESS`, manifest status, `rivet validate` (RIVET_VERIFY_RUN_NOT_SUCCESSFUL),
+the state cursor via DuckDB ATTACH, `files_committed` vs disk, and a clean re-run
+against the source. `verify_transient_retry_exact` drives `RIVET_TEST_TRANSIENT_ONCE`
+and a toxiproxy `reset_peer` before/after the first durable part. Both SKIP when the
+stand PostgreSQL, Mongo or toxiproxy is down.
 
 ## Comparison against the previous release — three stages, and they BLOCK
 

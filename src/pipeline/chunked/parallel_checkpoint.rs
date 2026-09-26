@@ -44,11 +44,11 @@ pub(crate) fn run_chunked_parallel_checkpoint(
     let cp = chunked_plan(plan);
 
     let chunks = if plan.resume {
-        // A resume re-executes the STORED plan, and two things must still be true
-        // for that to be sound — neither of which was checked, because this arm
+        // A resume re-executes the STORED plan, and one thing must still be true
+        // for that to be sound — and it was not checked, because this arm
         // skipped the whole match below (round-11 bughunt).
         //
-        // 1. The SCHEMA must not have drifted. Through `check_drift_only_FRESH`,
+        // The SCHEMA must not have drifted. Through `check_drift_only_FRESH`,
         //    which opens its own short-lived connection — this runner has no
         //    `Source` in scope here, and that seam exists precisely for it. An
         //    earlier pass deferred this half claiming a `Source` would have to be
@@ -58,38 +58,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
         //    `schema_fingerprint` whose schemas disagree. The identical drop without
         //    `--resume` fails loudly. The gap between a crash and its resume is
         //    exactly where a schema change is most likely.
-        //
-        // 2. For `chunk_dense`, the ROW SET must not have changed. Dense windows are
-        //    ORDINALS (`ROW_NUMBER() OVER (ORDER BY col)`, 1..COUNT(*)) frozen at
-        //    plan time and re-evaluated at execution, so an insert shifts every row
-        //    under every stored ordinal. DEMONSTRATED on a 50-row table: crash after
-        //    chunk 0, insert 3 rows below the key range, resume → `status: success`,
-        //    `rows: 50`, and an independent read of the parts gives 50 rows / 47
-        //    DISTINCT — three ids written twice while six that exist in the source
-        //    were never exported. Silent because the ordinal partition stays gapless
-        //    and self-consistent and `rows` equals the manifest sum; only a per-key
-        //    comparison against the source sees it.
-        //
-        // Refusing rather than silently re-planning: the chunk table already records
-        // which ordinals were exported, and those records now describe rows nobody
-        // can identify. Re-deriving would produce a correct plan over an incorrect
-        // ledger.
         super::check_drift_only_fresh(plan, state, summary)?;
-        if cp.dense {
-            anyhow::bail!(
-                "export '{}': cannot resume a `chunk_dense` plan. Dense chunks are \
-                 ORDINALS (`ROW_NUMBER() OVER (ORDER BY …)`, 1..COUNT(*)) frozen when \
-                 the plan was made and re-evaluated at execution, so ANY insert or \
-                 delete since then shifts which rows every stored window names — the \
-                 resume would re-export some and skip others while reporting success. \
-                 rivet cannot tell from the chunk ledger whether the row set moved, \
-                 because the ledger records ordinals, not keys. Re-run WITHOUT \
-                 `--resume` to re-plan from scratch, or switch to range chunking \
-                 (`chunk_dense: false`), whose windows are KEY ranges and survive a \
-                 change to the rows between them.",
-                plan.export_name
-            );
-        }
         vec![]
     } else {
         match chunk_source {
@@ -151,6 +120,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
     // #4: reconnects across worker threads, folded into summary.reconnects after
     // the scope joins — the parallel analogue of the sequential runner's counter.
     let agg_reconnects = std::sync::atomic::AtomicU32::new(0);
+    let idle_sources = super::IdleSources::default();
     // Parts, shapes, checksums and failures, drained post-join in FanIn's fixed order.
     // The workers are spawned here, not through FanIn::spawn: this runner's crash
     // hooks (`maybe_panic_at_chunk`) must still take the process down.
@@ -206,6 +176,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
             let run_id_arc = std::sync::Arc::clone(&run_id_arc);
             let agg_retries = &agg_retries;
             let agg_reconnects = &agg_reconnects;
+            let idle_sources = &idle_sources;
             let fan_r = &fan;
             let shared_fingerprint = &shared_fingerprint;
             let plan_w = plan_for_workers.clone();
@@ -282,11 +253,12 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                         &cp_w.column,
                         start,
                         end,
-                        cp_w.dense,
                         cp_w.by_days.is_some(),
                         plan_w.source.source_type,
                     );
 
+                    // Parts a FAILED chunk left durable: counted and logged below, never lost.
+                    let mut debris: Vec<super::super::commit::PartRecord> = Vec::new();
                     let result = (|| -> Result<ChunkOutcome> {
                         let mut last_err: Option<anyhow::Error> = None;
                         for attempt in 0..=plan_w.tuning.max_retries {
@@ -296,8 +268,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                                 // (sequential path bumps `summary.retries`
                                 // directly; here we go through the atomic
                                 // and fold once after the scope joins).
-                                agg_retries
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                agg_retries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 let class = last_err.as_ref().map(classify_error);
                                 // #4: a reconnect-class retry re-opens the source
                                 // below — count it (folded into summary.reconnects).
@@ -305,8 +276,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                                     agg_reconnects
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 }
-                                let extra_delay =
-                                    class.map(|c| c.extra_delay_ms()).unwrap_or(0);
+                                let extra_delay = class.map(|c| c.extra_delay_ms()).unwrap_or(0);
                                 let backoff = crate::pipeline::retry::retry_backoff_ms(
                                     plan_w.tuning.retry_backoff_ms,
                                     attempt,
@@ -315,14 +285,22 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                                 std::thread::sleep(Duration::from_millis(backoff));
                             }
 
-                            let mut thread_src = match source::create_source(&plan_w.source) {
+                            // A retry reconnects; only the first attempt may reuse an idle connection.
+                            let opened = if attempt == 0 {
+                                idle_sources.take(&plan_w.source)
+                            } else {
+                                source::create_source(&plan_w.source)
+                            };
+                            let mut thread_src = match opened {
                                 Ok(s) => s,
                                 Err(e) => {
-                                    if crate::pipeline::retry::should_retry(crate::pipeline::retry::Attempt {
-                                        attempt,
-                                        max_retries: plan_w.tuning.max_retries,
-                                        error: &e,
-                                    }) {
+                                    if crate::pipeline::retry::should_retry(
+                                        crate::pipeline::retry::Attempt {
+                                            attempt,
+                                            max_retries: plan_w.tuning.max_retries,
+                                            error: &e,
+                                        },
+                                    ) {
                                         last_err = Some(e);
                                         continue;
                                     }
@@ -336,11 +314,10 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                                 }
                             };
 
-                            let mut sink = ExportSink::new(&plan_w)?
-                                .with_row_progress(
-                                    pb_w.clone(),
-                                    std::sync::Arc::clone(&streamed_rows),
-                                );
+                            let mut sink = ExportSink::new(&plan_w)?.with_row_progress(
+                                pb_w.clone(),
+                                std::sync::Arc::clone(&streamed_rows),
+                            );
 
                             let export_attempt = (|| -> Result<ChunkOutcome> {
                                 thread_src.export(
@@ -364,7 +341,12 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                                         .set(crate::state::schema_fingerprint(&columns));
                                 }
                                 if sink.total_rows == 0 {
-                                    return Ok((0, Vec::new(), Default::default(), Default::default()));
+                                    return Ok((
+                                        0,
+                                        Vec::new(),
+                                        Default::default(),
+                                        Default::default(),
+                                    ));
                                 }
                                 let fmt = format::create_format(
                                     plan_w.format,
@@ -382,14 +364,19 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                                 // produced (max_file_size rotation included).
                                 // The parent drains each PartRecord through
                                 // commit::record_part post-scope.
-                                let recs = super::super::commit::write_sink_parts(
+                                let mut recs = Vec::new();
+                                if let Err(e) = super::super::commit::write_sink_parts(
                                     &**shared_destination,
                                     &mut sink,
                                     plan_w.validate.then_some(plan_w.format),
                                     |idx, count| {
                                         super::super::commit::part_indexed_name(&base, idx, count)
                                     },
-                                )?;
+                                    &mut recs,
+                                ) {
+                                    debris.append(&mut recs);
+                                    return Err(e);
+                                }
                                 Ok((
                                     sink.total_rows,
                                     recs,
@@ -399,13 +386,18 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                             })();
 
                             match export_attempt {
-                                Ok(v) => return Ok(v),
+                                Ok(v) => {
+                                    idle_sources.give(thread_src);
+                                    return Ok(v);
+                                }
                                 Err(e) => {
-                                    if crate::pipeline::retry::should_retry(crate::pipeline::retry::Attempt {
-                                        attempt,
-                                        max_retries: plan_w.tuning.max_retries,
-                                        error: &e,
-                                    }) {
+                                    if crate::pipeline::retry::should_retry(
+                                        crate::pipeline::retry::Attempt {
+                                            attempt,
+                                            max_retries: plan_w.tuning.max_retries,
+                                            error: &e,
+                                        },
+                                    ) {
                                         last_err = Some(e);
                                         continue;
                                     }
@@ -422,12 +414,15 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                     // chunk-completion guards below can be exercised. A panic hook
                     // cannot reach them — they only run once the workers join,
                     // which a crashed process never does.
-                    let result = match crate::test_hook::maybe_error_at_index(
-                        "chunk_export",
-                        chunk_index,
+                    let result = match (
+                        result,
+                        crate::test_hook::maybe_error_at_index("chunk_export", chunk_index),
                     ) {
-                        Err(msg) => Err(anyhow::anyhow!(msg)),
-                        Ok(()) => result,
+                        (Ok((_, parts, ..)), Err(msg)) => {
+                            debris.extend(parts);
+                            Err(anyhow::anyhow!(msg))
+                        }
+                        (result, _) => result,
                     };
                     match result {
                         Ok((rows, parts, chunk_checksums, chunk_shape)) => {
@@ -456,40 +451,21 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                                 // `completed` with no file_log to rehydrate, so
                                 // it declared a manifest with zero parts over
                                 // parquet that was already on the destination.
-                                match StateStore::open_at_ref(&state_ref) {
-                                    Ok(store) => {
-                                        for rec in &parts {
-                                            if let Err(e) = store.record_durable_part(
-                                                crate::state::DurablePart {
-                                                    run_id: run_id_arc.as_str(),
-                                                    export_name: &plan_w.export_name,
-                                                    file_name: &rec.file_name,
-                                                    rows: rec.rows,
-                                                    bytes: rec.bytes as i64,
-                                                    format: fmt_label_w,
-                                                    compression: Some(comp_label_w),
-                                                    mode: mode_label_w,
-                                                    cursor_high: None, // chunked runner, not keyset pages
-                                                },
-                                            ) {
-                                                log::warn!(
-                                                    "export '{}': file_log write failed for parallel checkpoint chunk '{}' (file was produced): {:#}",
-                                                    plan_w.export_name,
-                                                    rec.file_name,
-                                                    e
-                                                );
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        log::warn!(
-                                            "export '{}': could not open state DB for file_log write of chunk {}: {:#}",
-                                            plan_w.export_name,
-                                            chunk_index,
-                                            e
-                                        );
-                                    }
-                                }
+                                record_durable_parts(
+                                    &state_ref,
+                                    crate::state::DurablePart {
+                                        run_id: run_id_arc.as_str(),
+                                        export_name: &plan_w.export_name,
+                                        file_name: "",
+                                        rows: 0,
+                                        bytes: 0,
+                                        format: fmt_label_w,
+                                        compression: Some(comp_label_w),
+                                        mode: mode_label_w,
+                                        cursor_high: None, // chunked runner, not keyset pages
+                                    },
+                                    &parts,
+                                );
                                 // chunk_task carries one file name; for a
                                 // rotation-split chunk store the first sibling.
                                 // The manifest records all siblings, so a
@@ -531,6 +507,27 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                         }
                         Err(e) => {
                             let msg = crate::redact::redact_error(&e);
+                            if !debris.is_empty() {
+                                record_durable_parts(
+                                    &state_ref,
+                                    crate::state::DurablePart {
+                                        run_id: run_id_arc.as_str(),
+                                        export_name: &plan_w.export_name,
+                                        file_name: "",
+                                        rows: 0,
+                                        bytes: 0,
+                                        format: fmt_label_w,
+                                        compression: Some(comp_label_w),
+                                        mode: mode_label_w,
+                                        cursor_high: None,
+                                    },
+                                    &debris,
+                                );
+                                let unit = super::super::commit::UnitId::Chunk(chunk_index);
+                                for rec in debris.drain(..) {
+                                    fan_r.part(unit, rec);
+                                }
+                            }
                             let _ = StateStore::open_at_ref(&state_ref).and_then(|st| {
                                 st.fail_chunk_task(
                                     run_id_arc.as_str(),
@@ -609,4 +606,42 @@ pub(crate) fn run_chunked_parallel_checkpoint(
         plan.export_name
     );
     Ok(())
+}
+
+/// Write one `file_log` row per durable part from a worker (the drain records with no state).
+///
+/// Reopens from the REF, never from `config_path`: `rivet apply` passes an empty one, and
+/// `StateStore::open("")` would write every row into a stray `./.rivet_state.db`.
+fn record_durable_parts(
+    state_ref: &crate::state::StateRef,
+    template: crate::state::DurablePart<'_>,
+    parts: &[super::super::commit::PartRecord],
+) {
+    let store = match StateStore::open_at_ref(state_ref) {
+        Ok(store) => store,
+        Err(e) => {
+            log::warn!(
+                "export '{}': could not open state DB for the file_log write of {} part(s): {:#}",
+                template.export_name,
+                parts.len(),
+                e
+            );
+            return;
+        }
+    };
+    for rec in parts {
+        if let Err(e) = store.record_durable_part(crate::state::DurablePart {
+            file_name: &rec.file_name,
+            rows: rec.rows,
+            bytes: rec.bytes as i64,
+            ..template
+        }) {
+            log::warn!(
+                "export '{}': file_log write failed for parallel checkpoint part '{}' (file was produced): {:#}",
+                template.export_name,
+                rec.file_name,
+                e
+            );
+        }
+    }
 }
