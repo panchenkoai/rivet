@@ -1517,11 +1517,31 @@ def verify_live_only_coverage(led: Ledger) -> None:
         return
     probe = run(["cargo", "llvm-cov", "--version"], timeout=60)
     if not probe.ok:
+        # The coverage adjudication needs the tool; the offline battery it runs does not,
+        # and must never leave the gate with the tool.
         _skipped(
             led, "infra", "live-only", "coverage", "-",
             "live-only-cov: cargo-llvm-cov not installed (cargo install cargo-llvm-cov)",
             "no llvm-cov",
         )
+        plain = run(
+            ["env", "-u", "RIVET_STATE_URL", "-u", "RIVET_TEST_STATE_URL",
+             "cargo", "nextest", "run", "--manifest-path", str(ROOT / "Cargo.toml")],
+            timeout=NO_TIMEOUT,
+        )
+        log = ROOT / "target" / "gate-failures" / f"offline_battery-{os.getpid()}.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text(plain.out)
+        if plain.ok:
+            _passed(led, "infra", "offline", "battery", "-",
+                    "offline battery (lib + offline suites) passes without coverage")
+        else:
+            _failed(
+                led, "infra", "offline", "battery", "-",
+                f"offline battery FAILED: {_first_match(plain.out, r'FAIL|panicked|error')} · "
+                f"full output: {log}",
+                _first_match(plain.out, r"FAILED|error"),
+            )
         return
     led.phase("Live-only coverage (mutants.toml exclusions vs measured offline coverage)")
     lcov = work_dir() / "offline.lcov"

@@ -266,6 +266,12 @@ preflights:
 # compose stack HAS all of it. Each row is a real hole, ratcheted; fill by adding a
 # preflight/scenario and flipping status -> test.
 infra:
+  - id: no_invariant_violations
+    status: test
+    note: "verify_no_invariant_violations fails the gate when ANY gated command (Proc, the concurrency
+      racers, the CDC differential) printed `run-integrity invariant violated` — the release binary only
+      warns on a facade bypass (ADR-0018), so without this scan the warning passed silently. Self-test
+      RED-proven against a no-scan mutant"
   - id: network_faults
     infra: toxiproxy
     status: test
