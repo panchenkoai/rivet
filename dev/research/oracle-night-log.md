@@ -122,3 +122,22 @@ mining works from the PDB service with 4 grants; resume across log switches prov
 a straddling transaction (restart_scn); a log missing mid-range is SILENT in LogMiner —
 a pre-mining contiguity check + V$LOGMNR_LOGS status is mandatory; ROLLBACK TO SAVEPOINT
 leaves a compensating ROLLBACK=1 row a naive framer would mis-handle.
+
+## Round 3 — security/redaction, crash-resume, multi-export, formats, hostile config — 20 confirmed
+
+Axis yield: security 3/3, resume 1/1, multi 2/2, formats 4/4, config 10/10. Commit e9842ae5 (+ generic agent, pending).
+
+| # | finding | fix | proof |
+|---|---|---|---|
+| R3-0/1/10/11/12 | **security, one root cause**: `parse_oracle_url` split userinfo on the LAST '@' of the whole URL; the redactor and TLS gate cut the authority at the first '/'. Raw '/' in a password → plaintext password in plan.json, part of it in connect errors + summary.json, and `u:k@localhost/q@remote` passed the TLS gate as loopback while the driver dialled the remote host in plaintext | one reading: authority ends at first '/', '?', '#'; raw delimiters refused; parse before the gate | unit (both repro URLs refused; encoded form parses) |
+| R3-3 | parallel keyset on a DATE key failed every bounded range (ORA-01830: N'…' vs the pinned NLS mask) | VARCHAR2 literal | live (RED) |
+| R3-6 | NUMBER(p, s>38) → Decimal256 crash | exact text | unit |
+| R3-13/14/15 | TLS hints: "system trust store"; handshake hint on the policy refusal; `ca_file` advice Oracle refuses; bare EOF on a plain listener | reworded / skipped / marked / hint | unit (exact text) |
+| R3-16/17/19 | IPv6 without port; structured `::1`; scheme case; templates redacted into `REDACTED@host` | bracket handling; templates not credential-shaped | unit |
+| R3-4/5/7/8/9/18 | generic (plan waves, validate over failed run, CSV value check, CSV empty binary vs NULL, CSV manifest compression, PG/MySQL `prefer` hint) | delegated to an agent | pending |
+
+Roast 3 caught three regressions my round-2 fixes introduced, all reproduced and fixed with tests:
+A1 meta-column collision guard was exact-case (a `_RIVET_ROW_HASH` source column took over the hash in DuckDB);
+A2 silencing the rerun warning over a FAILED manifest hid durable parts (200 rows / 100 distinct);
+A3 N5's "whole table only" also dropped the index probe and row estimate for init's own column-list scaffolds.
+Lesson: a fix narrowed to the reported case (wording → trigger; values → every probe) regresses the neighbour.
