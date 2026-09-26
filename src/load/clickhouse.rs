@@ -175,17 +175,27 @@ impl ClickhouseLoader {
     ) -> Result<Option<String>> {
         let name = format!("{table}__changes");
         let found = self.query(&format!(
-            "SELECT engine, sorting_key FROM system.tables WHERE {} FORMAT TSV",
+            "SELECT engine, sorting_key FROM system.tables WHERE {} FORMAT TSVRaw",
             self.system_filter(&name, "name")
         ))?;
         let Some((engine, sorting_key)) = found.split_once('\t') else {
             return Ok(None);
         };
         let cols = self.query(&format!(
-            "SELECT name, type FROM system.columns WHERE {} FORMAT TSV",
+            "SELECT name, type FROM system.columns WHERE {} FORMAT TSVRaw",
             self.system_filter(&name, "table")
         ))?;
         let existing: Vec<(&str, &str)> = cols.lines().filter_map(|l| l.split_once('\t')).collect();
+        let declared: Vec<String> = full
+            .iter()
+            .map(|s| column_type(s, shape.not_null.contains(&s.column_name)))
+            .collect();
+        let canonical = self.query(&canonical_types_sql(&declared))?;
+        let wanted: Vec<(&str, &str)> = full
+            .iter()
+            .map(|s| s.column_name.as_str())
+            .zip(canonical.split('\t'))
+            .collect();
         Ok(changelog_conflict(
             &TargetLoader::fqtn(self, &name),
             &TargetLoader::fqtn(self, table),
@@ -193,7 +203,7 @@ impl ClickhouseLoader {
             pk,
             (engine, sorting_key),
             &existing,
-            full,
+            &wanted,
         ))
     }
 
@@ -453,9 +463,13 @@ fn changelog_conflict(
     pk: &[String],
     (engine, sorting_key): (&str, &str),
     existing: &[(&str, &str)],
-    wanted: &[TargetColumnSpec],
+    wanted: &[(&str, &str)],
 ) -> Option<String> {
     let want_engine = shape.engine.split('(').next().unwrap_or(shape.engine);
+    let engine = ["Replicated", "Shared"]
+        .iter()
+        .find_map(|p| engine.strip_prefix(p))
+        .unwrap_or(engine);
     let restart = format!(
         "Nothing was written. Drop it and `{view}`, then re-snapshot the export (a CDC stream) \
          or `rivet state reset` it (an incremental one) so the next load starts the log over"
@@ -479,20 +493,28 @@ fn changelog_conflict(
             pk.join(", ")
         ));
     }
-    let squash = |t: &str| t.replace(' ', "");
-    wanted.iter().find_map(|s| {
-        let want = column_type(s, shape.not_null.contains(&s.column_name));
-        let (_, have) = existing.iter().find(|(n, _)| *n == s.column_name)?;
-        (squash(have) != squash(&want)).then(|| {
+    wanted.iter().find_map(|&(name, want)| {
+        let (_, have) = existing.iter().find(|(n, _)| *n == name)?;
+        (*have != want).then(|| {
             format!(
-                "column `{}` of `{changes}` is {have}, but the export now resolves it to {want}; \
+                "column `{name}` of `{changes}` is {have}, but the export now resolves it to {want}; \
                  inserting would convert every value silently. Widen it with `ALTER TABLE \
-                 {changes} MODIFY COLUMN `{}` {want}` (not possible for a key column). \
-                 Otherwise: {restart}",
-                s.column_name, s.column_name,
+                 {changes} MODIFY COLUMN `{name}` {want}` (not possible for a key column). \
+                 Otherwise: {restart}"
             )
         })
     })
+}
+
+/// One row, tab-separated: how ClickHouse itself spells each of `types`, so a declared
+/// `Decimal64(6)` compares equal to the catalog's `Decimal(18, 6)`.
+fn canonical_types_sql(types: &[String]) -> String {
+    let cols = types
+        .iter()
+        .map(|t| format!("toTypeName(defaultValueOfTypeName({}))", literal(t)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("SELECT {cols} FORMAT TSVRaw")
 }
 
 /// `CREATE … <fqtn> (<ddl>) ENGINE = <engine> ORDER BY <key>`, allowing a Nullable key column.
@@ -679,60 +701,90 @@ mod tests {
         let pk = ["id".to_string()];
         let cdc = changelog_shape(true, "t", &pk).unwrap();
         let inc = changelog_shape(false, "t", &pk).unwrap();
-        let specs = changelog_specs(&[spec("id", "Int64"), spec("v", "Decimal(10,2)")]);
-        let cols = [
-            ("id", "Int64"),
-            ("v", "Nullable(Decimal(10, 2))"),
-            ("__op", "Nullable(String)"),
-        ];
-        let inc_cols = [("id", "Nullable(Int64)"), ("v", "Nullable(Decimal(10, 2))")];
+        let tz = "Nullable(DateTime64(6, 'UTC'))";
+        let cdc_want = [("id", "Int64"), ("at", tz)];
+        let inc_want = [("id", "Nullable(Int64)"), ("at", tz)];
+        let cols = [("id", "Int64"), ("at", tz), ("__op", "Nullable(String)")];
+        let inc_cols = [("id", "Nullable(Int64)"), ("at", tz)];
         let conflict = |shape: &ChangelogShape<'_>,
                         key: &[String],
                         existing: (&str, &str),
-                        cols: &[(&str, &str)]| {
-            changelog_conflict("d.t__changes", "d.t", shape, key, existing, cols, &specs)
+                        cols: &[(&str, &str)],
+                        want: &[(&str, &str)]| {
+            changelog_conflict("d.t__changes", "d.t", shape, key, existing, cols, want)
         };
         assert_eq!(
-            conflict(&cdc, &pk, ("ReplacingMergeTree", "id"), &cols),
-            None,
-            "a matching log"
+            conflict(&cdc, &pk, ("ReplacingMergeTree", "id"), &cols, &cdc_want),
+            None
         );
         assert_eq!(
-            conflict(&inc, &pk, ("MergeTree", ""), &inc_cols),
+            conflict(&inc, &pk, ("MergeTree", ""), &inc_cols, &inc_want),
+            None
+        );
+        assert_eq!(
+            conflict(
+                &cdc,
+                &pk,
+                ("ReplicatedReplacingMergeTree", "id"),
+                &cols,
+                &cdc_want
+            ),
             None,
-            "a matching incremental log"
+            "a replicated or cloud engine is the same engine"
+        );
+        assert_eq!(
+            conflict(&inc, &pk, ("SharedMergeTree", ""), &inc_cols, &inc_want),
+            None
         );
 
-        let mode =
-            conflict(&inc, &pk, ("ReplacingMergeTree", "id"), &cols).expect("cdc -> incremental");
+        let mode = conflict(&inc, &pk, ("ReplacingMergeTree", "id"), &cols, &inc_want)
+            .expect("cdc -> incremental");
         assert!(
             mode.contains("is a ReplacingMergeTree") && mode.contains("Nothing was written"),
             "{mode}"
         );
         assert!(
-            conflict(&cdc, &pk, ("MergeTree", ""), &cols).is_some(),
+            conflict(&cdc, &pk, ("MergeTree", ""), &cols, &cdc_want).is_some(),
             "incremental -> cdc"
         );
 
         let wider = ["id".to_string(), "tenant".to_string()];
         let cdc2 = changelog_shape(true, "t", &wider).unwrap();
-        let key = conflict(&cdc2, &wider, ("ReplacingMergeTree", "id"), &cols).expect("pk changed");
+        let key = conflict(
+            &cdc2,
+            &wider,
+            ("ReplacingMergeTree", "id"),
+            &cols,
+            &cdc_want,
+        )
+        .expect("pk changed");
         assert!(
             key.contains("collapses versions by (id)") && key.contains("(id, tenant)"),
             "{key}"
         );
         assert_eq!(
-            conflict(&cdc2, &wider, ("ReplacingMergeTree", "id, `tenant`"), &cols),
+            conflict(
+                &cdc2,
+                &wider,
+                ("ReplacingMergeTree", "id, `tenant`"),
+                &cols,
+                &cdc_want
+            ),
             None,
             "the catalog's spelling of the same key"
         );
 
-        let narrow = [("id", "Int64"), ("v", "Nullable(Decimal(9, 2))")];
-        let ty =
-            conflict(&cdc, &pk, ("ReplacingMergeTree", "id"), &narrow).expect("a type changed");
+        let narrow = [("id", "Int64"), ("at", "Nullable(DateTime64(3, 'UTC'))")];
+        let ty = conflict(&cdc, &pk, ("ReplacingMergeTree", "id"), &narrow, &cdc_want)
+            .expect("a type changed");
         assert!(
-            ty.contains("column `v`") && ty.contains("MODIFY COLUMN"),
+            ty.contains("column `at`") && ty.contains("MODIFY COLUMN"),
             "{ty}"
+        );
+        assert_eq!(
+            canonical_types_sql(&["Decimal64(6)".into(), tz.into()]),
+            "SELECT toTypeName(defaultValueOfTypeName('Decimal64(6)')), \
+             toTypeName(defaultValueOfTypeName('Nullable(DateTime64(6, \\'UTC\\'))')) FORMAT TSVRaw"
         );
     }
 

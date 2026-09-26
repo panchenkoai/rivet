@@ -635,3 +635,39 @@ fn a_cdc_stream_staged_on_azure_is_pulled_by_clickhouse() {
         Some("rivet_stand_azurite"),
     );
 }
+
+/// A second load into a change log with a tz timestamp and a time column must pass the
+/// change-log check: the catalog spells those types its own way (quotes, Decimal(18, p)).
+#[test]
+#[ignore = "live: requires clickhouse + fake-gcs + postgres-cdc"]
+fn a_change_log_with_tz_and_time_columns_takes_a_second_load() {
+    require_alive(LiveService::ClickHouse);
+    require_alive(LiveService::FakeGcs);
+    ensure_gcs_bucket(BUCKET);
+    let tbl = unique_name("rivet_ch_tz");
+    let slot = unique_name("rivet_ch_tz_slot");
+    let _slot = Slot(slot.clone());
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, postgres::NoTls).expect("pg");
+    c.batch_execute(&format!(
+        "CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v BIGINT, at TIMESTAMPTZ, t TIME); \
+         INSERT INTO {tbl} VALUES (1, 1, '2026-01-01 10:00:00+00', '10:00:00.5')"
+    ))
+    .expect("seed");
+    let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
+    let db = Db::new("rivet_chtest");
+    let rig = into_clickhouse(Rig::pg_cdc(&tbl, &slot), &db);
+    rig.run_ok();
+    load(&rig);
+    c.batch_execute(&format!("UPDATE {tbl} SET v = 2 WHERE id = 1"))
+        .expect("change");
+    rig.run_ok();
+    load(&rig);
+    assert_eq!(
+        clickhouse_rows_tsv(&format!(
+            "SELECT id, v, toString(t) FROM {}.{tbl} ORDER BY id FORMAT TSV",
+            db.0
+        )),
+        "1\t2\t36000.5",
+        "the second load landed and the time kept its fraction"
+    );
+}
