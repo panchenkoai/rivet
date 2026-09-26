@@ -1091,7 +1091,7 @@ pub(crate) fn split_object_uri(uri: &str) -> Result<(&str, &str)> {
     // everything. (Trailing/only slashes collapse to empty too.)
     if key.trim_matches('/').is_empty() {
         anyhow::bail!(
-            "refusing a bucket-root staging prefix `{uri}`: a GCS load stages into and cleans up a \
+            "refusing a bucket-root staging prefix `{uri}`: a load stages into and cleans up a \
              DEDICATED prefix, so an empty prefix would list/delete the whole bucket. Set a \
              non-empty `destination.prefix`, and put any `{{partition}}` token AFTER a literal \
              segment (e.g. `exports/{{partition}}/`, not `{{partition}}/`)."

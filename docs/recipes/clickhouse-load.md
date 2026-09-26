@@ -11,7 +11,7 @@ database must already exist.
 export DATABASE_URL="postgresql://user:pass@host/db"
 export CLICKHOUSE_PASSWORD=...
 
-rivet init --source-env DATABASE_URL --mode cdc \
+rivet init --source-env DATABASE_URL --mode cdc --tls verify-full \
   --gcs-bucket my-bucket \
   --clickhouse-url http://clickhouse:8123 --clickhouse-database raw --clickhouse-user loader \
   -o rivet.yaml
@@ -65,8 +65,9 @@ named collection ClickHouse reads the part directly, and no data passes through
 the host running rivet:
 
 ```sql
--- once, as an administrator. GCS: HMAC keys from "Interoperability"; S3: the bucket's
--- endpoint and keys; Azure: a connection string (the container is the export's bucket).
+-- once, as an administrator. GCS: HMAC keys from "Interoperability"; S3: the service
+-- endpoint (e.g. https://s3.<region>.amazonaws.com/ — rivet appends the bucket) and keys;
+-- Azure: a connection string (the container is the export's bucket).
 CREATE NAMED COLLECTION gcs_raw AS
   url = 'https://storage.googleapis.com/',
   access_key_id = '...',

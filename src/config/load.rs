@@ -185,7 +185,7 @@ impl TryFrom<RawLoadSection> for LoadSection {
             .chain(optional.iter())
             .find(|(_, v, of)| v.is_some() && !of.contains(&r.target));
         if let Some((field, _, of)) = foreign {
-            let other = of[0].name();
+            let other = of.iter().map(|k| k.name()).collect::<Vec<_>>().join("`/`");
             return Err(format!(
                 "`load:` targets `{name}` but carries `{field}`, a `{other}` field — remove it \
                  (it would be silently ignored, masking a mis-configured load)"

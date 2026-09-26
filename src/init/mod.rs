@@ -770,7 +770,7 @@ pub fn init(
                         text.contains("      backfill: auto"),
                         text.contains("\nload:"),
                         text.contains("\n  layout: base_buffer"),
-                        text.contains("mode: cdc") || text.contains("mode: incremental")
+                        has_delta_export(&text)
                     )
                 );
             }
@@ -789,7 +789,7 @@ pub fn init(
                         text.contains("      backfill: auto"),
                         text.contains("\nload:"),
                         text.contains("\n  layout: base_buffer"),
-                        text.contains("mode: cdc") || text.contains("mode: incremental")
+                        has_delta_export(&text)
                     )
                 );
             }
@@ -797,6 +797,13 @@ pub fn init(
     }
 
     Ok(())
+}
+
+/// Whether a scaffold has an export in a delta mode, read from its `mode:` lines (a comment
+/// that mentions a mode is not one).
+fn has_delta_export(yaml: &str) -> bool {
+    yaml.lines()
+        .any(|l| matches!(l.trim(), "mode: cdc" | "mode: incremental"))
 }
 
 /// The friendly "do this next" ladder printed after a YAML scaffold. For an
@@ -1733,6 +1740,15 @@ mod tests {
     /// step only where the scaffold declares a base and a buffer. A `full` scaffold
     /// with a warehouse printed both lines while its own `load:` comment said every
     /// load OVERWRITES the table and compact would only say "skipped".
+    #[test]
+    fn a_delta_export_is_read_from_mode_lines_not_comments() {
+        assert!(super::has_delta_export("    mode: incremental\n"));
+        assert!(super::has_delta_export("    mode: cdc\n"));
+        assert!(!super::has_delta_export(
+            "    mode: full\n    # switch to `mode: incremental` on 'updated_at'\n"
+        ));
+    }
+
     #[test]
     fn next_steps_block_prescribes_compact_only_for_a_base_and_buffer_scaffold() {
         let block = |has_compact: bool| {

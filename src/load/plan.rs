@@ -729,7 +729,8 @@ fn build_plans_keyed(
         }
         let bucket = dest.bucket.as_deref().with_context(|| {
             format!(
-                "export `{}` has no destination `bucket` — a GCS destination is required",
+                "export `{}` has no destination `bucket` — set the bucket (or Azure container) \
+                 the load reads from",
                 export.name
             )
         })?;

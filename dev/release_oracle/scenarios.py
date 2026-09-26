@@ -1409,9 +1409,14 @@ def verify_network_faults(led: Ledger) -> None:
     _drive_live_tests(
         led, "infra", "network", "faults",
         "Network faults (toxiproxy: latency retry, dead proxy, CDC mid-stream cut)",
+        # Every engine sibling by its own whole name: the filter matches whole names since
+        # 2026-09-26, so the MySQL and Mongo variants the old suffix match pulled in are listed.
         [
             "export_survives_transient_latency_added_via_toxiproxy",
+            "mysql_export_survives_transient_latency_added_via_toxiproxy",
+            "mongo_export_survives_transient_latency_added_via_toxiproxy",
             "export_fails_cleanly_when_toxiproxy_is_disabled_before_run",
+            "mysql_export_fails_cleanly_when_toxiproxy_is_disabled_before_run",
             "gremlin_cdc_binlog_cut_mid_drain_fails_loud_then_recovers",
         ],
         "network_faults.log",
