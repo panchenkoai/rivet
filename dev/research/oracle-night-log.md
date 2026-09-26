@@ -75,3 +75,50 @@ Difficulties:
 - A cherry-pick conflict on the shared test file (both agents appended); resolved by taking HEAD + each agent's appended hunk.
 - `tests/.live-tmp` in the worktree was a real directory, so the DuckDB container read the main checkout's copy → 0 rows; symlinked.
 - The first RED of the timeout test MISSED: warm cache made the fixture query shorter than the ceiling. Fixture made 10x heavier.
+
+## Round 2 — new axes (lifecycle, CLI surfaces, hostile data, concurrency, message truth) — 26 confirmed
+
+Axis yield: lifecycle 1/1, cli 8/8, hostile-data 5/5, consistency 2/3, truth 10/10.
+Commits 0b22b8db, db7cc1d8 (mine), 4210e45f (pipeline agent), 92ac0ee1 + d7da0a7e (init agent), 25621dc3 (OraKind), 104107b5.
+
+| # | finding | fix | proof |
+|---|---|---|---|
+| R2-0 | **data loss, engine-agnostic**: a run failed by `on_schema_drift: fail` still advanced the incremental cursor | `cursor_may_advance(status, manifest_gap)` | PG live (RED) + unit |
+| R2-14 | **data loss, engine-agnostic**: `chunk_dense` under concurrent deletes skips rows even on a unique key | NOT fixed at the root: docs corrected, sparse hints recommend keyset first, run-start WARN | unit (exact text) |
+| R2-13 | a source column named `_rivet_row_hash` + meta columns → duplicate Parquet field | refused before writing | unit |
+| R2-1 | init on a mixed-case table read its UPPER-case twin (validate + reconcile passed) | Oracle names must equal their upper fold for `table:` | live twin-table (RED) |
+| R2-2/16 | time_window always failed (ORA-01861) | ANSI `TIMESTAMP '…'` | live DATE + TIMESTAMP (RED) |
+| R2-3 | INTEGER mapped to decimal(38,18) override | `number` | live |
+| R2-4/20 | never-analyzed table read as 0 rows → mode: full | capped count | live |
+| R2-5/19 | init --mode cdc wrote a refused scaffold | refused in init, loader's words | offline |
+| R2-6/7 | synonyms invisible; init CLI names exact-case | follow synonym; fold like Oracle | live |
+| R2-9/10 | LOB flag alias collision; 1000-col + LOB | unique alias; flags dropped past the cap with WARN | live (RED) |
+| R2-11/17 | key-column hint wrong for INVISIBLE / quoted lower-case | catalog lookup names the real spelling / INVISIBLE | live (RED) |
+| R2-12/21 | VARRAY/ANYDATA raw ORA-00932, check "Looks good" | refused by name; failed type report blocks, `--strict` fails | live (RED) |
+| R2-15 | ORA-02391 session caps permanent | capacity retry | unit |
+| R2-18 | ORA-01017 no hint; ORA-12514 "check the tunnel" | auth / new "unknown service" | unit |
+| R2-22 | docs listed four sources | docs/reference/oracle.md + compatibility/config/CLI | — |
+| R2-23 | ca_file refusal said "system trust store" | the driver trusts only its compiled-in public CA bundle (webpki-roots) — measured in the driver source | unit (exact text) |
+| R2-24/25 | bare-NUMBER example; rerun warning over a failed manifest | per-column; success-with-parts only | unit |
+
+Roast round 2 — acted on: N2 (LOB probe by fetched type: JSON/XML/VECTOR bypassed it, 829 MB vs 163 MB),
+N4 (preflight `WHERE 1=0` still executed aggregates), N5 (check probed the wrong relation:
+range 1..150000 for a query spanning 1000100001..), N10 (call timeout reset on every exit).
+Deferred (Worth): N1 shared memory-cap helper across engines (MySQL/MSSQL LOB widths inferred,
+not measured), N3 native-label strings, N6 init engine as &str, N7 NUMBER≤18 rule ×5,
+N8 typed Oracle error instead of substring matching, N9 Projection layout, N11 doctor note tri-state.
+
+Also this round:
+- The build WITHOUT the oracle feature did not compile (agent code); fixed + CI clippy step added.
+- Test-harness finds: the kill test killed an idle probe session once describe stopped
+  emitting `1 = 0`; fixed by waiting for rows_processed > 0. Oracle Free (2 CPUs) needs
+  a nextest test-group of 4 or the whole-schema export exceeds its ceiling.
+- Full Oracle live suite: 41/41 under full parallel load.
+- `rivet init` schema-wide: 35 s for 21 objects idle (ALL_* catalog views are slow) — not fixed.
+
+## Phase 3 (CDC) — research done, not implemented
+dev/research/oracle-cdc-probes.md (agent, on a separate ARCHIVELOG spike container):
+mining works from the PDB service with 4 grants; resume across log switches proven incl.
+a straddling transaction (restart_scn); a log missing mid-range is SILENT in LogMiner —
+a pre-mining contiguity check + V$LOGMNR_LOGS status is mandatory; ROLLBACK TO SAVEPOINT
+leaves a compensating ROLLBACK=1 row a naive framer would mis-handle.
