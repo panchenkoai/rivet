@@ -1480,7 +1480,7 @@ jobs:
           # quiet-window lock. On the shared instance the two canaries failed in
           # OPPOSITE directions and both blamed the product for the schedule; they were
           # the dominant E2E flake through 2026-08-16/17.
-          docker compose --profile pool --profile cdc --profile replica --profile governor up -d postgres mysql mssql mssql-governor minio fake-gcs azurite toxiproxy pgbouncer proxysql postgres-cdc mysql-cdc mssql-cdc mysql-primary mysql-replica duckdb clickhouse oracle
+          docker compose --profile pool --profile cdc --profile replica --profile governor up -d postgres mysql mssql mssql-governor minio fake-gcs azurite toxiproxy pgbouncer proxysql postgres-cdc mysql-cdc mssql-cdc mysql-primary mysql-replica mysql-replica-nolog duckdb clickhouse oracle
           # …then re-open it after ClickHouse chowns /work to uid 101 on boot,
           # which propagates to the host on Linux and EACCESes the test writer.
           sudo chmod -R 0777 tests/.live-tmp
@@ -1620,7 +1620,18 @@ jobs:
         # `Skipped`, which the strength floor treats as a failure (its own doc said
         # so all along), so the exclusion has to be written HERE where a reader can
         # see it rather than hidden in the harness.
-        run: cargo test -- --ignored --skip content_export --skip validates --skip edge_cases --skip via_duckdb --skip mongo --skip warehouse_cell
+        # Skip the topologies this runner cannot hold and the cells that need a real
+        # BigQuery (no credentials here): the SQL Server availability group (two
+        # SQL Server containers + dev/mssql-ag/setup.sh), the PostgreSQL 16 standby
+        # pair (dev/pytools/cdc_stand), and the audit's BigQuery cells. The release
+        # gate runs every one of them (REPLICA_CELLS, verify_audit_suspects).
+        run: >-
+          cargo test -- --ignored --skip content_export --skip validates --skip edge_cases
+          --skip via_duckdb --skip mongo --skip warehouse_cell
+          --skip readable_secondary --skip mssql_checkpoint_follows_a_failover
+          --skip mssql_checkpoint_from_another_database --skip from_a_standby
+          --skip loads_into_bigquery_or_refuses_by_column
+          --skip cleanup_source_never_deletes_parts --skip compact_after_a_source_alter
 
       - name: Stop services
         if: always()

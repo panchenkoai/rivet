@@ -248,9 +248,9 @@ def _flags_for(cell_ix: int, pipeline: str, lifecycle: str, store: str) -> dict[
             f["plan"] += ["--annotate-waves"]
         f["apply"] = []
         if lifecycle == "resume":
-            # `--resume` on a tree that never crashed resumes nothing — the flag
-            # is carried, the path is not. The executor crashes the first apply
-            # with a fault hook and this second one is the real resume.
+            # The chain applies a SEALED plan, where `--resume` is ignored with a
+            # warning (config-wave mode only) — so the second apply after the crash
+            # is a clean re-run, and the executor asserts that warning.
             f["apply"] = ["--resume"]
             f["apply:crash"] = ["after_file_write"]
         elif lifecycle == "repeat":
@@ -909,6 +909,13 @@ def _run_chain(led: Ledger, cell: Cell, url: str, state_url: str, work: Path,
         p = rivet("apply", str(plan), *cell.flags.get("apply", []),
                   env=env, timeout=scenarios.NO_TIMEOUT)
         applied = p.ok
+        wave_only = SEALED_PLAN_IGNORES & set(cell.flags.get("apply", []))
+        if applied and wave_only and SEALED_PLAN_WARNING not in p.out:
+            _stage(led, cell, tag, "apply", False,
+                   f"{', '.join(sorted(wave_only))} on a sealed plan must warn "
+                   f"'{SEALED_PLAN_WARNING}' — the flag was accepted silently")
+            _unreached(led, cell, tag, "apply")
+            return
         if cell.lifecycle == "repeat" and applied:
             # The scheduler's real shape: a second run into the SAME prefix. The
             # union of both runs must be readable — a part name that carries only
@@ -1404,6 +1411,20 @@ def sc_blessed_flow(led: Ledger, engine: str, tag: str, url: str,
         list(ex.map(run_one, tasks))
 
 
+#: `apply` flags the sealed-plan path ignores, and the warning it must print for them.
+SEALED_PLAN_IGNORES = {"--resume", "--parallel-export-processes"}
+SEALED_PLAN_WARNING = "ignored for a sealed plan artifact"
+
+#: A stage key whose executor runs a DIFFERENT subcommand than its name.
+STAGE_COMMAND = {"reconcile": "run"}
+
+
+def command_of(stage: str) -> str:
+    """The subcommand a stage key actually runs (`apply:second` → apply, `reconcile` → run)."""
+    base = stage.split(":", 1)[0]
+    return STAGE_COMMAND.get(base, base)
+
+
 def flag_coverage(cells: list[Cell]) -> dict[str, set[str]]:
     """Which flags the matrix actually exercises, per command.
 
@@ -1415,7 +1436,7 @@ def flag_coverage(cells: list[Cell]) -> dict[str, set[str]]:
         if c.na_reason():
             continue
         for cmd, fl in c.flags.items():
-            out.setdefault(cmd, set()).update(f for f in fl if f.startswith("--"))
+            out.setdefault(command_of(cmd), set()).update(f for f in fl if f.startswith("--"))
     return out
 
 
@@ -1464,6 +1485,10 @@ FLAG_EXCUSED = {
     "--source-file": "the file form of --source; same reader, and --source-env is the one ops use",
     "--s3-region": "carried with --s3-bucket on the s3 cells",
     "--gcs-credentials-file": "fake-gcs takes no credentials; the real path is the bigquery cycle's",
+    "--resume": "the chain applies a SEALED plan, where apply ignores `--resume` with a warning "
+                "(asserted on the resume cells); `rivet run --resume` after a crash is carried "
+                "INSIDE the gate by scenarios.verify_batch_resume (live_chunked_recovery + "
+                "live_resume, one row per case).",
     "--pool": "pool mode schedules a whole CONFIG's exports (multi-export, duration-ordered); "
               "the blessed cell chain applies a sealed SINGLE-export plan artifact, where --pool "
               "is a refusal by design. Carried INSIDE the gate by its own stage instead: "
@@ -1487,6 +1512,13 @@ FLAG_EXCUSED = {
                           "run → load → compact on the generated file (three engines, "
                           "incremental and CDC) — run 1 everything, run 2 the delta.",
     "--bigquery-dataset": "the other half of the `load:` scaffold — see --bigquery-project.",
+    "--clickhouse-url": "scaffolds a ClickHouse `load:` section, which the blessed chain never "
+                        "loads. Carried INSIDE the gate by clickhouse_load.verify_clickhouse_load: "
+                        "live_init_extended::init_clickhouse_flags_scaffold_the_load_block_and_"
+                        "require_each_other runs init with the flags on GCS and S3 and checks "
+                        "every refusal between them.",
+    "--clickhouse-database": "the other half of the ClickHouse `load:` scaffold — see --clickhouse-url.",
+    "--clickhouse-user": "the ClickHouse `load:` scaffold's user — see --clickhouse-url.",
 }
 
 
@@ -1536,9 +1568,8 @@ def verify_flag_surface(led: Ledger) -> None:
     led.phase("blessed flow · flag surface (derived from the CLI, not from a list)")
     cells = cross_product(["postgres"])
     cov = flag_coverage(cells)
-    carried = {f for fl in cov.values() for f in fl}
     # `-c`, `-o` and load's `--run-id` are carried by the executor rather than declared.
-    carried |= {"--config", "--output", "--run-id", "--prefix", "--date"}
+    executor_carried = {"--config", "--output", "--run-id", "--prefix", "--date"}
     # The chain, DERIVED from what the cells actually run — not a literal tuple.
     # It used to be eight names written out here while the CLI declares sixteen
     # subcommands, in a function whose docstring says "derived from the CLI, not
@@ -1554,7 +1585,7 @@ def verify_flag_surface(led: Ledger) -> None:
     # grade" FAILs on the 0.24.5 gate over commands that were graded fine
     # under their base names. The stage suffix is the gate's own notation;
     # strip it before asking the CLI.
-    chain = sorted({c.split(":", 1)[0] for c in cov})
+    chain = sorted(cov)
     assert chain, "no cell declares any flags — the flag surface would grade nothing"
 
     # And the OTHER half of the omission, now a visible row instead of silence:
@@ -1578,6 +1609,7 @@ def verify_flag_surface(led: Ledger) -> None:
             led.failed("-", "flow", "flow:flags", cmd,
                        f"flag surface · `rivet {cmd} --help` produced no flags — cannot grade")
             continue
+        carried = cov.get(cmd, set()) | executor_carried
         gap = sorted(f for f in real if f not in carried and f not in FLAG_EXCUSED)
         if gap:
             led.failed("-", "flow", "flow:flags", cmd,

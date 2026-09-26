@@ -806,10 +806,10 @@ fn oracle_class_census_is_pinned() {
 // 2026-09-18, the compact guard: +3 independent — a foreign base refused before
 // any write, a dropped base refused by name with the buffer kept, and a compact
 // killed before its merge; all three graded by `bq` and the load ledger.
-const PIN_INDEPENDENT: usize = 78;
+const PIN_INDEPENDENT: usize = 88;
 const PIN_SHARED_CODEC: usize = 73;
 const PIN_SELF_COUNTER: usize = 6;
-const PIN_PRESENCE: usize = 64;
+const PIN_PRESENCE: usize = 67;
 
 /// TIER 2 (harness audit, 2026-08-29): a test whose NAME makes a
 /// COMPLETENESS claim must carry a class-(a) INDEPENDENT oracle — not merely
@@ -1078,6 +1078,9 @@ fn every_live_cdc_test_asserts_an_outcome() {
                 // suite): the CDC parquet is loaded and queried by another engine.
                 || chunk.contains("duckdb_run_sql_json(")
                 || chunk.contains("clickhouse_run_sql_json(")
+                // `rivet load` into ClickHouse, read back from the server and
+                // compared to the source (tests/live/live_clickhouse_load.rs).
+                || chunk.contains("clickhouse_rows")
                 // Read-back helpers the newer suites use. This dictionary
                 // is INTENTIONALLY wide: the read-backs differ because the
                 // oracles differ (manifest vs parquet vs csv vs gcs listing

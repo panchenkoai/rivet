@@ -637,6 +637,10 @@ impl TargetLoader for BigQueryLoader {
         // It must run BEFORE the rename below, which would otherwise fail on the name
         // already existing. Its rows are counted into this run's report: they really
         // were merged now.
+        // A column the source gained reaches the base before any MERGE names it.
+        if let Some(alter) = build_alter_add_columns_sql(&base, specs) {
+            self.run_sql(&alter, "merge", table)?;
+        }
         let merging = format!("{table}__changes__merging");
         let merging_fqtn = self.fqtn(&merging);
         let mut recovered_rows = 0u64;

@@ -101,9 +101,7 @@ pub(crate) fn run_chunked_sequential(
             ),
             &mut sink,
         )?;
-        if let Some(w) = sink.writer.take() {
-            w.finish()?;
-        }
+        sink.finish_writer()?;
         // ADR-0012 M3: capture the dest schema fingerprint as soon as the
         // sink resolves a schema (first non-empty chunk).  Idempotent across
         // subsequent chunks since the schema is identical run-wide.
@@ -345,9 +343,7 @@ pub(crate) fn run_chunked_parallel(
                         &mut sink,
                     )?;
                     idle_sources.give(thread_src);
-                    if let Some(w) = sink.writer.take() {
-                        w.finish()?;
-                    }
+                    sink.finish_writer()?;
                     // ADR-0012 M3: capture the dest schema fingerprint once
                     // per run.  `OnceLock::set` is a no-op after the first
                     // successful set, so all later workers race-free.

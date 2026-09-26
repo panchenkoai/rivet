@@ -665,6 +665,10 @@ pub struct InitYamlDestination {
     /// warehouse half of the cycle too.
     pub bigquery_project: Option<String>,
     pub bigquery_dataset: Option<String>,
+    /// `--clickhouse-url` / `--clickhouse-database`: the same, for a ClickHouse load.
+    pub clickhouse_url: Option<String>,
+    pub clickhouse_database: Option<String>,
+    pub clickhouse_user: Option<String>,
 }
 
 impl InitYamlDestination {
@@ -807,7 +811,8 @@ pub fn init(
                         mode_override,
                         text.contains("      backfill: auto"),
                         text.contains("\nload:"),
-                        text.contains("\n  layout: base_buffer")
+                        text.contains("\n  layout: base_buffer"),
+                        has_delta_export(&text)
                     )
                 );
             }
@@ -825,7 +830,8 @@ pub fn init(
                         mode_override,
                         text.contains("      backfill: auto"),
                         text.contains("\nload:"),
-                        text.contains("\n  layout: base_buffer")
+                        text.contains("\n  layout: base_buffer"),
+                        has_delta_export(&text)
                     )
                 );
             }
@@ -833,6 +839,13 @@ pub fn init(
     }
 
     Ok(())
+}
+
+/// Whether a scaffold has an export in a delta mode, read from its `mode:` lines (a comment
+/// that mentions a mode is not one).
+fn has_delta_export(yaml: &str) -> bool {
+    yaml.lines()
+        .any(|l| matches!(l.trim(), "mode: cdc" | "mode: incremental"))
 }
 
 /// The friendly "do this next" ladder printed after a YAML scaffold. For an
@@ -849,6 +862,7 @@ fn next_steps_block(
     has_backfill: bool,
     has_load: bool,
     has_compact: bool,
+    has_delta: bool,
 ) -> String {
     let mut s = String::from("\nNext steps:\n");
     if matches!(provenance, SourceProvenance::Inline) {
@@ -893,6 +907,12 @@ fn next_steps_block(
             "\nThen the warehouse half of the cycle (review `load:` first — its values are guesses):\n  \
              rivet load    -c {path}                  # Parquet -> the base, or the buffer on later runs\n  \
              rivet compact -c {path}                  # merge the buffer into the base and drop it\n"
+        ));
+    } else if has_load && has_delta {
+        s.push_str(&format!(
+            "\nThen the warehouse half (review `load:` first — its values are guesses):\n  \
+             rivet load    -c {path}                  # a full export OVERWRITES its table; a cdc or \
+             incremental one appends to <table>__changes behind the <table> view\n"
         ));
     } else if has_load {
         s.push_str(&format!(
@@ -1760,6 +1780,7 @@ mod tests {
             true,
             false,
             false,
+            false,
         );
         assert!(s.contains("rivet doctor -c rivet.yaml"), "block:\n{s}");
         assert!(
@@ -1780,6 +1801,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         assert!(
             s.contains("CHANGES ONLY") && !s.contains("through its recipe"),
@@ -1793,6 +1815,15 @@ mod tests {
     /// with a warehouse printed both lines while its own `load:` comment said every
     /// load OVERWRITES the table and compact would only say "skipped".
     #[test]
+    fn a_delta_export_is_read_from_mode_lines_not_comments() {
+        assert!(super::has_delta_export("    mode: incremental\n"));
+        assert!(super::has_delta_export("    mode: cdc\n"));
+        assert!(!super::has_delta_export(
+            "    mode: full\n    # switch to `mode: incremental` on 'updated_at'\n"
+        ));
+    }
+
+    #[test]
     fn next_steps_block_prescribes_compact_only_for_a_base_and_buffer_scaffold() {
         let block = |has_compact: bool| {
             super::next_steps_block(
@@ -1802,6 +1833,7 @@ mod tests {
                 false,
                 true,
                 has_compact,
+                false,
             )
         };
         let compacting = block(true);
@@ -1817,6 +1849,35 @@ mod tests {
                 && !overwriting.contains("rivet compact"),
             "block:\n{overwriting}"
         );
+        // A warehouse that never compacts (ClickHouse) with delta exports: the load
+        // appends behind a view — "each load OVERWRITES" would be false for them.
+        let appending = super::next_steps_block(
+            "rivet.yaml",
+            &super::SourceProvenance::Env("X".into()),
+            Some("cdc"),
+            false,
+            true,
+            false,
+            true,
+        );
+        assert!(
+            appending.contains("appends to <table>__changes")
+                && !appending.contains("rivet compact"),
+            "block:\n{appending}"
+        );
+        let no_load = super::next_steps_block(
+            "rivet.yaml",
+            &super::SourceProvenance::Env("X".into()),
+            Some("cdc"),
+            false,
+            false,
+            false,
+            true,
+        );
+        assert!(
+            !no_load.contains("rivet load"),
+            "no load block, no load step:\n{no_load}"
+        );
     }
 
     #[test]
@@ -1825,6 +1886,7 @@ mod tests {
             "rivet.yaml",
             &super::SourceProvenance::Env("X".into()),
             None,
+            false,
             false,
             false,
             false,
@@ -2589,6 +2651,9 @@ mod tests {
             s3_region: None,
             bigquery_project: None,
             bigquery_dataset: None,
+            clickhouse_url: None,
+            clickhouse_database: None,
+            clickhouse_user: None,
         };
         let yaml = yaml_scaffold::generate_config(
             &info,
@@ -2616,6 +2681,9 @@ mod tests {
             s3_region: None,
             bigquery_project: None,
             bigquery_dataset: None,
+            clickhouse_url: None,
+            clickhouse_database: None,
+            clickhouse_user: None,
         };
         yaml_scaffold::generate_config(
             info,
@@ -2740,6 +2808,9 @@ mod tests {
             s3_region: None,
             bigquery_project: None,
             bigquery_dataset: None,
+            clickhouse_url: None,
+            clickhouse_database: None,
+            clickhouse_user: None,
         };
         let yaml = yaml_scaffold::generate_config(
             &info,
@@ -2769,6 +2840,9 @@ mod tests {
             s3_region: Some("eu-central-1".to_string()),
             bigquery_project: None,
             bigquery_dataset: None,
+            clickhouse_url: None,
+            clickhouse_database: None,
+            clickhouse_user: None,
         };
         let yaml = yaml_scaffold::generate_config(
             &info,
@@ -2803,6 +2877,9 @@ mod tests {
             s3_region: None,
             bigquery_project: None,
             bigquery_dataset: None,
+            clickhouse_url: None,
+            clickhouse_database: None,
+            clickhouse_user: None,
         };
         let yaml = yaml_scaffold::generate_config(
             &info,
@@ -2826,6 +2903,9 @@ mod tests {
             s3_region: None,
             bigquery_project: None,
             bigquery_dataset: None,
+            clickhouse_url: None,
+            clickhouse_database: None,
+            clickhouse_user: None,
         };
         let err = dest.validate().expect_err("conflict must be rejected");
         let msg = format!("{err}");

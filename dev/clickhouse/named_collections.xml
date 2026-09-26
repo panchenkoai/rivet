@@ -1,0 +1,13 @@
+<!-- Named collections for the ClickHouse load's server-side pull (ADR-0035): MinIO and Azurite on the stand. -->
+<clickhouse>
+  <named_collections>
+    <rivet_stand_minio>
+      <url>http://minio:9000/</url>
+      <access_key_id>minioadmin</access_key_id>
+      <secret_access_key>minioadmin</secret_access_key>
+    </rivet_stand_minio>
+    <rivet_stand_azurite>
+      <connection_string>DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;</connection_string>
+    </rivet_stand_azurite>
+  </named_collections>
+</clickhouse>

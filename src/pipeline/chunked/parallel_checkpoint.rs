@@ -329,9 +329,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                                     ),
                                     &mut sink,
                                 )?;
-                                if let Some(w) = sink.writer.take() {
-                                    w.finish()?;
-                                }
+                                sink.finish_writer()?;
                                 // ADR-0012 M3: fingerprint the schema as soon
                                 // as the sink resolves it.  Race-free across
                                 // workers thanks to OnceLock::set semantics.

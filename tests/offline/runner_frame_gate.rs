@@ -298,13 +298,40 @@ fn every_run_harm_bracket_close_is_preceded_by_its_window_stamp() {
 fn both_job_entry_points_bracket_the_source_harm_window() {
     assert_both_job_entry_points_do(
         &[
-            ("opens the harm bracket", "harm_snapshot(&plan.source)"),
-            ("records the delta", "record_harm("),
+            ("opens the harm bracket", "HarmBracket::open(&plan.source)"),
+            ("closes it and records the delta", "harm.close("),
             ("emits the DIAGNOSIS", "run_diagnosis("),
         ],
         "a job entry point skips the source-harm bracket, so runs through it record \
          no export_harm rows and never diagnose a spilling source",
     );
+}
+
+/// The CDC drain returns before the batch script, so it must bracket its own window.
+#[test]
+fn the_cdc_drain_brackets_the_source_harm_window_and_captures_open_forensics() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/pipeline/cdc_job.rs");
+    let text = std::fs::read_to_string(&path).expect("read src/pipeline/cdc_job.rs");
+    let start = text
+        .find("pub(super) fn run_cdc_export(")
+        .expect("run_cdc_export moved or was renamed");
+    let body = body_of(&text, start);
+    assert!(
+        !body.contains("#[cfg(test)]"),
+        "body_of swallowed the test module"
+    );
+    for needle in [
+        "HarmBracket::open(&config.source)",
+        "harm.close(",
+        "run_diagnosis(",
+        "server_context()",
+    ] {
+        assert!(
+            body.contains(needle),
+            "run_cdc_export lost `{needle}` — a CDC run would record no export_harm rows, no \
+             DIAGNOSIS or no server context"
+        );
+    }
 }
 
 /// Both job entry points must PERSIST the run journal they fill.
@@ -428,5 +455,43 @@ fn assert_both_job_entry_points_do(needles: &[(&str, &str)], harm: &str) {
         "{harm} (docs/runner-coverage-matrix.yaml). Re-apply it in that entry \
          point:\n{}",
         offenders.join("\n")
+    );
+}
+
+/// Every part closes through `ExportSink::finish_writer`, the one path that writes the footer note.
+#[test]
+fn no_runner_closes_a_part_behind_finish_writers_back() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/pipeline");
+    let mut offenders = Vec::new();
+    let mut stack = vec![root.clone()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read src/pipeline") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let rel = path
+                .strip_prefix(&root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            if !rel.ends_with(".rs") || rel == "sink/mod.rs" || rel == "sink/tests.rs" {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("read source");
+            let product = text.split("#[cfg(test)]").next().unwrap_or_default();
+            for (i, line) in product.lines().enumerate() {
+                let code = line.split("//").next().unwrap_or_default();
+                if code.contains("writer.take()") {
+                    offenders.push(format!("src/pipeline/{rel}:{}", i + 1));
+                }
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "a runner closes a part with a bare `writer.take()` — that part ships without the \
+         `rivet.partition_buckets` note the loader bounds it by. Call `sink.finish_writer()?`: {offenders:?}"
     );
 }

@@ -79,7 +79,7 @@ pub fn fetch_manifests_keyed(
     store: &GcsStore,
     gcs_prefix: &str,
 ) -> Result<Vec<(String, RunManifest)>> {
-    let (_, base) = crate::load::split_gs_uri(gcs_prefix)?;
+    let (_, base) = crate::load::split_object_uri(gcs_prefix)?;
     let keys = list_manifest_keys(store, base)?;
     // CWE-400: a manifest over the cap is refused, never read past the cap. One
     // stat + read per key, 16 keys in flight — a prefix keeps one copy per run it held.
@@ -126,7 +126,7 @@ pub fn select_load_uris(
     gcs_prefix: &str,
     new: &[(String, RunManifest)],
 ) -> Result<Vec<String>> {
-    let (bucket, base) = crate::load::split_gs_uri(gcs_prefix)?;
+    let (bucket, base) = crate::load::split_object_uri(gcs_prefix)?;
     let all_parquet: Vec<String> = store
         .list_files(base)?
         .into_iter()
@@ -143,7 +143,7 @@ pub fn select_load_uris(
     }
     Ok(select_load_keys(new, &all_parquet)
         .into_iter()
-        .map(|k| format!("gs://{bucket}/{k}"))
+        .map(|k| format!("{}://{bucket}/{k}", crate::load::scheme_of(gcs_prefix)))
         .collect())
 }
 
@@ -165,7 +165,7 @@ fn runs_with_missing_parts(new: &[(String, RunManifest)], all_parquet: &[String]
 /// [`select_load_keys`] (which intersects them with what's present) and
 /// [`gc_orphans`] (which treats them as the keep-set), so the two can't drift on
 /// how a manifest maps to its files.
-fn resolve_parts<'a>(
+pub(crate) fn resolve_parts<'a>(
     manifest_key: &'a str,
     m: &'a RunManifest,
 ) -> impl Iterator<Item = String> + 'a {
@@ -265,7 +265,7 @@ pub fn gc_orphans(
     // supersession-only sweep.
     dead_marker_run_ids: &std::collections::HashSet<String>,
 ) -> Result<(usize, u64)> {
-    let (_bucket, base) = crate::load::split_gs_uri(gcs_prefix)?;
+    let (_bucket, base) = crate::load::split_object_uri(gcs_prefix)?;
     // Success parts → keep. Failed/Interrupted parts → terminal ONLY once a
     // newer same-family Success supersedes their run (until then a checkpoint
     // resume may still adopt them); then deletable regardless of `active`. A
@@ -2182,6 +2182,54 @@ mod tests {
     /// the marker sweep began re-reading it before deleting.
     fn planted(entry: &(String, RunManifest)) -> (&str, Vec<u8>) {
         (entry.0.as_str(), serde_json::to_vec(&entry.1).unwrap())
+    }
+
+    /// A run keyed at `key` whose parts are `parts`.
+    fn keyed_run(id: &str, key: &str, parts: &[&str]) -> (String, RunManifest) {
+        let mut m = manifest(id, 1, None);
+        m.parts = parts
+            .iter()
+            .map(|p| ManifestPart {
+                path: (*p).to_string(),
+                ..m.parts[0].clone()
+            })
+            .collect();
+        (key.to_string(), m)
+    }
+
+    #[test]
+    fn cleanup_deletes_only_the_files_of_runs_nobody_is_writing() {
+        let runs = [
+            keyed_run("r1", "base/manifest-r1.json", &["a.parquet"]),
+            keyed_run("r2", "base/manifest-r2.json", &["b.parquet"]),
+        ];
+        let writing: std::collections::HashSet<String> = ["r2".to_string()].into();
+        let keys = crate::load::staging::cleanup_keys(&runs, &writing, |_| Some("r1".into()));
+        assert_eq!(
+            keys,
+            vec![
+                "base/_SUCCESS".to_string(),
+                "base/a.parquet".to_string(),
+                "base/manifest-r1.json".to_string(),
+                "base/manifest.json".to_string(),
+            ],
+            "r1's manifest, part and the canonical pointer to it go; r2 is still writing"
+        );
+    }
+
+    #[test]
+    fn a_canonical_manifest_describing_another_run_stays() {
+        let runs = [keyed_run("r1", "base/manifest-r1.json", &["a.parquet"])];
+        let keys =
+            crate::load::staging::cleanup_keys(&runs, &Default::default(), |_| Some("r9".into()));
+        assert_eq!(
+            keys,
+            vec![
+                "base/a.parquet".to_string(),
+                "base/manifest-r1.json".to_string()
+            ],
+            "a canonical manifest written by another run is not this load's to delete"
+        );
     }
 
     fn manifest_bytes(run: &str, rows: i64, source: Option<i64>) -> Vec<u8> {

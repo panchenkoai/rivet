@@ -27,17 +27,38 @@ pub(crate) fn partition_rollover_of(
     export: &ExportConfig,
 ) -> Option<crate::plan::rollover::PartitionRollover> {
     crate::load::plan::resolved_partition(config, export, export.snapshot_label.as_deref())
-        .and_then(|spec| match spec.form {
-            crate::config::load::PartitionForm::Column {
-                column,
-                granularity,
-            } => Some(crate::plan::rollover::PartitionRollover {
-                column,
-                granularity,
-                cap: crate::load::partition_budget::MAX_PARTITIONS_PER_JOB as usize,
-            }),
-            _ => None,
-        })
+        .and_then(rollover_of)
+}
+
+/// The budget a CDC table's change parts must keep: its column partition, when the change
+/// log is itself partitioned (the changelog layout; a base-and-buffer buffer takes none).
+pub(crate) fn cdc_partition_rollover(
+    config: &Config,
+    export: &ExportConfig,
+    table: &str,
+) -> Option<crate::plan::rollover::PartitionRollover> {
+    let layout = crate::load::plan::resolved_layout(config, export, Some(table));
+    (!layout.log_is_disposable())
+        .then(|| crate::load::plan::resolved_partition(config, export, Some(table)))
+        .flatten()
+        .and_then(rollover_of)
+}
+
+/// A COLUMN partition as the writer's budget; other partition forms are not countable.
+fn rollover_of(
+    spec: crate::load::plan::PartitionSpec,
+) -> Option<crate::plan::rollover::PartitionRollover> {
+    match spec.form {
+        crate::config::load::PartitionForm::Column {
+            column,
+            granularity,
+        } => Some(crate::plan::rollover::PartitionRollover {
+            column,
+            granularity,
+            cap: crate::load::partition_budget::MAX_PARTITIONS_PER_JOB as usize,
+        }),
+        _ => None,
+    }
 }
 
 pub fn build_plan(
@@ -893,6 +914,34 @@ mod tests {
             },
             ..crate::config::sample_export("test_export")
         }
+    }
+
+    /// A CDC table's change parts are budgeted only when its change log is itself
+    /// partitioned (`log_view`), per table, and only for a column partition.
+    #[test]
+    fn cdc_parts_are_budgeted_only_under_a_partitioned_change_log() {
+        let cfg = |layout: &str| {
+            Config::from_yaml(&format!(
+                "source:\n  type: mysql\n  url: \"mysql://localhost/test\"\nexports:\n\
+                 \x20 - name: cdc\n    tables: [orders, customers]\n    mode: cdc\n    format: parquet\n\
+                 \x20   cdc: {{ checkpoint: ./c.ckpt }}\n    destination: {{ type: gcs, bucket: b, prefix: cdc/ }}\n\
+                 \x20   load: {{ tables: {{ orders: {{ partition: {{ column: created_at, granularity: day }} }} }} }}\n\
+                 load:\n  target: bigquery\n  project: p\n  dataset: d\n  layout: {layout}\n"
+            ))
+            .unwrap_or_else(|e| panic!("fixture must load: {e:#}"))
+        };
+        let log = cfg("log_view");
+        let r = cdc_partition_rollover(&log, &log.exports[0], "orders").expect("log_view budgets");
+        assert_eq!((r.column.as_str(), r.cap), ("created_at", 4000));
+        assert!(
+            cdc_partition_rollover(&log, &log.exports[0], "customers").is_none(),
+            "a table with no partition is not budgeted"
+        );
+        let buf = cfg("base_buffer");
+        assert!(
+            cdc_partition_rollover(&buf, &buf.exports[0], "orders").is_none(),
+            "a base-and-buffer buffer takes no partition, so its parts are not cut"
+        );
     }
 
     /// A multiplex stream's per-table `load.tables.<name>.partition` must reach the

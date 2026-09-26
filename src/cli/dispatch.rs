@@ -144,6 +144,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             s3_region,
             bigquery_project,
             bigquery_dataset,
+            clickhouse_url,
+            clickhouse_database,
+            clickhouse_user,
             tls,
             tls_ca,
         } => dispatch_init(
@@ -163,6 +166,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             s3_region,
             bigquery_project,
             bigquery_dataset,
+            clickhouse_url,
+            clickhouse_database,
+            clickhouse_user,
             tls,
             tls_ca,
         ),
@@ -356,6 +362,7 @@ fn dispatch_cdc(a: CdcArgs) -> Result<()> {
                 // The ad-hoc CLI has no `columns:` surface; config-driven runs do.
                 overrides: crate::types::ColumnOverrides::new(),
                 // Likewise no `row_hash:` surface — a hash's covered column set is
+                partition: None,
                 // a contract the warehouse table carries, which needs a config file
                 // to declare.
                 row_hash: crate::config::RowHash::All(false),
@@ -377,6 +384,7 @@ fn dispatch_cdc(a: CdcArgs) -> Result<()> {
             // supported path, and the one the sweep and the load read — passes its
             // store, so every part reaches the database as it becomes durable.
             state: None,
+            schema_gate: None,
         },
         &__cdc_read_bytes,
     )
@@ -555,6 +563,9 @@ fn dispatch_init(
     s3_region: Option<String>,
     bigquery_project: Option<String>,
     bigquery_dataset: Option<String>,
+    clickhouse_url: Option<String>,
+    clickhouse_database: Option<String>,
+    clickhouse_user: String,
     tls: Option<crate::config::TlsMode>,
     tls_ca: Option<String>,
 ) -> Result<()> {
@@ -581,6 +592,9 @@ fn dispatch_init(
         s3_region,
         bigquery_project,
         bigquery_dataset,
+        clickhouse_url,
+        clickhouse_database,
+        clickhouse_user: Some(clickhouse_user),
     };
     let filter = init::TableFilter { include, exclude };
     let tls_config = resolve_init_tls(tls, tls_ca)?;
@@ -1063,6 +1077,9 @@ mod init_tls_tests {
             None,
             None,
             None,
+            None,
+            None,
+            "default".into(),
             None,
             None,
         )

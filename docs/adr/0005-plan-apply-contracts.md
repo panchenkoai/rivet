@@ -204,3 +204,10 @@ Regenerate with `rivet plan` or pass --force to skip this check.
 `plan/artifact.rs` tests: `round_trip_json`, `round_trip_chunked`, `staleness_fresh`, `staleness_expired_artifact`, `cursor_matches_none_snapshot`, `cursor_matches_incremental`.
 
 PA5 structural coverage is provided by `pipeline/chunked/math.rs` tests (`test_generate_chunks`, `test_generate_chunks_exact`, `test_generate_chunks_empty`).
+
+## Amendment 2026-09-26: PA1 holds for a plan artifact only
+
+`rivet apply <config.yaml>` is a second, artifact-free mode: it loads the config and runs
+every export live, wave by wave (or as a `--pool N` pool), so PA1–PA6 and PA10 do not apply
+to it. A JSON plan artifact still takes the sealed path — integrity, staleness and
+precomputed chunks — and `--pool` is refused for one.

@@ -79,7 +79,7 @@ pub(crate) fn plan_load_batches(
     let mut spanned: Vec<Part> = Vec::new();
     let mut blind: Vec<String> = Vec::new();
     for uri in uris {
-        let (_, key) = crate::load::split_gs_uri(uri)?;
+        let (_, key) = crate::load::split_object_uri(uri)?;
         let meta = read_footer(store, key)
             .with_context(|| format!("reading the Parquet footer of {uri}"))?;
         let rows = meta.file_metadata().num_rows();
@@ -407,14 +407,14 @@ pub(crate) fn budgeted_uris(
     }
     let keys: Vec<String> = uris
         .iter()
-        .filter_map(|u| load::split_gs_uri(u).ok().map(|(_, k)| k.to_string()))
+        .filter_map(|u| load::split_object_uri(u).ok().map(|(_, k)| k.to_string()))
         .collect();
     let want: std::collections::HashSet<String> =
         load::reconcile::select_load_keys(&baseline, &keys)
             .into_iter()
             .collect();
     uris.iter()
-        .filter(|u| load::split_gs_uri(u).is_ok_and(|(_, k)| want.contains(k)))
+        .filter(|u| load::split_object_uri(u).is_ok_and(|(_, k)| want.contains(k)))
         .cloned()
         .collect()
 }

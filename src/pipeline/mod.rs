@@ -18,6 +18,7 @@ mod cli;
 pub(crate) mod commit;
 mod finalize;
 pub(crate) use finalize::destination_uri_for_manifest;
+pub(crate) use sink::batch_partition_buckets;
 mod fan_in;
 pub(crate) mod frame;
 mod governor;

@@ -173,3 +173,15 @@ preflight that resolves its subject from a **subset** of strategy fields (an
 output). The cure rhymes: resolve through the one function that enumerates
 every strategy. Wherever a fan-out re-implements a decision its dispatcher
 could own, this class is waiting.
+
+## Amendment 2026-09-26: the seam covers the batch runners, not CDC
+
+`mode: cdc` returns from the dispatcher before `execute_resolved_plan`. Its drain writes its
+own manifests from the CDC sink and bypasses `finalize_export`, `finalize_manifest`, the
+post-run invariant check and `--validate` / `--reconcile`; the run warns that those flags and
+the batch-only knobs (`quality:`, `parquet:`, `compression*`, `max_file_size`,
+`shape_drift_warn_factor`) are ignored. It shares the schema-drift core
+(`check_from_cdc_mappings`), the run report, notifications, the metrics row, the journal and
+the run-status ledger. Its `initial: snapshot` legs run through the full batch tail. The
+runner-coverage matrix carries a `cdc` column so each per-export feature states its CDC
+answer.

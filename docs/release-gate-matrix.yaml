@@ -214,15 +214,24 @@ preflights:
   # go/no-go signal. Pooler safety is CI-scope, not a gate gap — the gate does the
   # shipping-artifact + independent-oracle checks CI can't. Not counted as a gap.
   - id: replica_read
-    what: "prod topology — rivet reads a read-REPLICA, not the master (the 'we were handed a product, no master access' case). Drives tests/live/live_cdc_replica.rs: the mysql-replica re-logs the primary's replicated changes into its OWN binlog (log_replica_updates) and rivet captures from that. Needs the `replica` compose profile (mysql-primary :3308 → mysql-replica :3309); SKIP when down."
+    what: "prod topology — rivet reads a read-REPLICA, not the master (the 'we were handed a product, no master access' case). Drives tests/live/live_cdc_replica.rs: the mysql-replica re-logs the primary's replicated changes into its OWN binlog (log_replica_updates) and rivet captures from that. Needs the `replica` compose profile (mysql-primary :3308 → mysql-replica :3309); SKIP when down. Four more rows, one per topology (REPLICA_CELLS in scenarios.py), each SKIPping alone when its services are down: mysql-replica-nolog :3310 (log_replica_updates = OFF, MySQL's default) must be refused at start, since its binlog holds none of the replicated changes (found 2026-09-26: 0.29.0 captured nothing and exited 0); a PostgreSQL 16 standby streams in continuous mode; a SQL Server read-scale availability group's readable secondary (dev/mssql-ag/setup.sh); a MongoDB secondary with readPreference=secondary. Each asserts the changes made on the primary through DuckDB over the declared parts. Three SQL Server checkpoint-identity rows ride the same table (found 2026-09-26: 0.29.0 resumed another server's checkpoint with exit 0 and 0 rows, the other database's change silently skipped): a checkpoint from another database is refused and left untouched; one that predates a RESTORE (new recovery_fork_guid) is refused; one written on the AG primary resumes on the secondary with only the new change (RED against a database_guid mutant, which differs per replica)."
     infra: [mysql-replica]
     status: test        # verify_replica_read — drives cdc_reads_changes_from_a_replica
+  - id: batch_resume
+    what: "`rivet run --resume` after a crash, per runner and engine — the gate's only real resume, because the blessed chain applies a sealed plan where `apply --resume` is ignored with a warning (asserted there). Runs tests/live/live_chunked_recovery.rs + live_resume.rs through the gate binary, one ledger row per case (29 on 2026-09-26). Added when per-command flag coverage showed `run --resume` carried by nothing: the pooled union had credited it to apply's ignored `--resume`."
+    status: test        # verify_batch_resume — live_chunked_recovery + live_resume, per case
+  - id: audit_suspects
+    what: "the 2026-09-26 contract audit's silent-loss cells, each proven RED on 0.29.0 and GREEN on the fix: cleanup_source never deletes parts an extract committed during the load; a keyset text key's second run takes the new keys (source collation, not byte order); MySQL refuses a statement-logged change and a DROP of a captured table; Mongo refuses a dropped collection; compact carries a source ADD COLUMN into the base; an MSSQL DATETIME cursor takes the next row once — each with an other-table twin RED against an over-refusal mutant. Oracles: BigQuery reads, DuckDB over declared parts, the checkpoint. The BigQuery cells need BIGQUERY_TEST_PROJECT + RIVET_TEST_GCS_BUCKET."
+    status: test        # verify_audit_suspects — tests/live/live_audit_suspects.rs, one row per case
+  - id: partition_footer
+    what: "every part each batch runner ships — the LAST one included — carries the `rivet.partition_buckets` footer note the loader bounds it by, and its count equals the distinct days DuckDB counts in that part itself (`parquet_kv_metadata` + `count(DISTINCT created_at::date)`, no shared code with the writer). The single runner's fixture crosses the 4,000-partition budget, so it rotates. Written 2026-09-26; its first run found the chunked runners closing parts with a bare `writer.take()` — every chunked part unnoted. The CDC drain (log_view layout) is proven the same way on MySQL, PostgreSQL and SQL Server — one transaction of 5,000 days cut into parts of at most 4,000 — and MongoDB, whose parts carry no date column, must say so. Needs the CDC stand (mysql-cdc, postgres-cdc, mssql-cdc, mongo-rs)."
+    status: test        # verify_partition_footer — tests/live/live_partition_footer.rs, one row per case
   - id: pool_e2e
     what: "the pool scheduler's e2e flow (#166): `apply --pool 2` on a multi-export config (one heavy + three parallel_safe) through a toxiproxy BANDWIDTH-CAPPED source — the shared-tunnel field pathology. Oracles: exact per-export rows (independent DuckDB readback), the predicted-vs-actual makespan contract on stdout (the model grades itself), and --resume defer-not-drop. Drives the `pool_apply_*` cases in tests/live/live_pool_toxiproxy.rs; SKIP when toxiproxy :8474 is down."
     backends: [postgres]
     status: test        # verify_pool_e2e — drives live_pool_toxiproxy::pool_apply_* (bandwidth / resume / two-heavy)
   - id: pool_split
-    what: "the `--pool --split` range sub-export flow (#167): a dominating export is broken into N range sub-exports over its key span — separate scheduler units sharing ONE prefix + folding to ONE family. THREE independent DuckDB oracles (`pool_split_*` in tests/live/live_pool_toxiproxy.rs), each a NAMED gate cell: (1) realize — the split fires and the union reads back every row once, no seam gap/dup; (2) manifest coherence — validate does not flag a sibling unit's parts as untracked yet a true orphan still is; (3) per-unit crash resume — `--resume` re-runs ONLY the incomplete units (skip complete, resume crashed), no gap/no dup. SKIP when toxiproxy :8474 is down."
+    what: "the `--pool --split` range sub-export flow (#167): a dominating export is broken into N range sub-exports over its key span — separate scheduler units sharing ONE prefix + folding to ONE family. FOUR independent oracles (`pool_split_*` in tests/live/live_pool_toxiproxy.rs), each a NAMED gate cell: (1) realize — the split fires and the union reads back every row once, no seam gap/dup; (2) manifest coherence — validate does not flag a sibling unit's parts as untracked yet a true orphan still is; (3) per-unit crash resume — `--resume` re-runs ONLY the incomplete units (skip complete, resume crashed), no gap/no dup; (4) a nullable chunk_column refuses before any unit writes (RED without the guard: 200000 of 200002 rows delivered, the NULL-keyed two dropped under a successful run). SKIP when toxiproxy :8474 is down."
     backends: [postgres]
     status: test        # verify_pool_split — drives live_pool_toxiproxy::pool_split_* (realize / coherence / resume)
   - id: failed_run_tail
@@ -281,6 +290,18 @@ preflights:
     what: "the guarantee path on configs the PRODUCT wrote: `rivet init --bigquery-project/--bigquery-dataset` scaffolds the `load:` section, and on that file run 1 takes everything and run 2 takes only the delta — batch on PostgreSQL / MySQL / SQL Server (`run → load → compact`: run 1 a BASE TABLE, run 2 a buffered delta that `compact` merges, the UPDATE landed, the buffer gone), an incremental export (every row, then the delta), a single-table CDC scaffold (run 1 captures NOTHING — the anchor — run 2 the changes), a multi-table `backfill: auto` scaffold (every baseline, then the changes). No hand-typed YAML anywhere: init's own decisions (the cursor, the layout, the load block) are what is graded — the SQL Server `datetime2` cursor miss was found this way. Oracles: the source, `bq`, the Parquet on disk — never rivet's report."
     backends: [sqlite, gcs]
     status: test        # verify_init_delta (dev/release_oracle/init_delta.py) — runs tests/live/live_init_delta.rs through the Rig against the gate binary; RIVET_CDC_STATE_URL + BQ_ORACLE_PROJECT + `bq` + cargo, SKIP-if-absent
+  - id: nextest_grading
+    what: "the harness's own grading of the Rig cells: nextest prints `FAIL + LEAK [` for a test that failed AND left a handle open, and a parser matching `(PASS|LEAK) [` found the `LEAK [` inside it and graded the failure green (found 2026-09-25: 2 of 6 failures in one cell). Checked first in every gate run against nextest's real line shapes — PASS, LEAK, FAIL + LEAK, FAIL, SLOW — so a regressed parser fails the gate before it grades anything."
+    backends: [sqlite]
+    status: test        # verify_nextest_grading (dev/release_oracle/core.py) — runs at the start of every gate; also `--self-test`
+  - id: clickhouse_load
+    what: "`rivet load` into ClickHouse (ADR-0035) against the stand's server: a CDC stream from MySQL, PostgreSQL and SQL Server whose `FINAL` view equals the source row for row with the deleted key flagged (the version decodes each engine's position); a load killed after appending re-runs, the log holds every row twice and the view is unchanged; a full load swaps in the current source; an incremental export adopts the table behind a latest-cursor view; `rivet init --clickhouse-*` scaffolds the block and its flags require each other. Oracles: the source and ClickHouse read back directly — never rivet's report."
+    backends: [postgres, gcs]
+    status: test        # verify_clickhouse_load (dev/release_oracle/clickhouse_load.py) — runs tests/live/live_clickhouse_load.rs + live_init_extended.rs through the Rig against the gate binary; needs cargo and the local services (clickhouse :8123, fake-gcs :4443, postgres, the three CDC engines), SKIP naming any that is down — no cloud prerequisite
+  - id: cdc_schema_drift
+    what: "`on_schema_drift` on a CDC export (found 2026-09-26: the CDC runner never consulted it — a retyped column wrote three differently-typed parts into one prefix, exit 0). Per SQL engine: a column retyped between two runs is refused under `fail` before the stream acknowledges anything (MySQL/SQL Server checkpoint bytes and the PostgreSQL slot's confirmed_flush_lsn unchanged), and after switching to `warn` both deferred changes land with their values (30000000000 needs the widened BIGINT). Oracles: the checkpoint/slot read directly and the Parquet re-read — never rivet's report. MongoDB is n/a: its CDC schema is the fixed document blob. The same cell also runs two shared-tail checks on MySQL (engine-agnostic code in `run_cdc_export`): a failed CDC run POSTs its `failure` notification to a loopback webhook, and a CDC export names the batch-only knobs its drain ignores."
+    backends: [sqlite]
+    status: test        # verify_cdc_schema_drift (dev/release_oracle/cdc_schema_drift.py) — runs tests/live/live_cdc_schema_drift.rs through the Rig against the gate binary; needs cargo and postgres-cdc :5434, mysql-cdc :3307, mssql-cdc :1434, SKIP naming any that is down
 
 # ── BACKEND-INFRASTRUCTURE dimensions the gate does NOT yet exercise (the audit gaps) ──
 # The gate connects DIRECT to every engine; it never routes through the connection-
@@ -288,6 +309,12 @@ preflights:
 # compose stack HAS all of it. Each row is a real hole, ratcheted; fill by adding a
 # preflight/scenario and flipping status -> test.
 infra:
+  - id: no_invariant_violations
+    status: test
+    note: "verify_no_invariant_violations fails the gate when ANY gated command (Proc, the concurrency
+      racers, the CDC differential) printed `run-integrity invariant violated` — the release binary only
+      warns on a facade bypass (ADR-0018), so without this scan the warning passed silently. Self-test
+      RED-proven against a no-scan mutant"
   - id: network_faults
     infra: toxiproxy
     status: test
@@ -332,5 +359,5 @@ infra:
   - id: warehouse_load
     status: partial
     note: "BigQuery live golden IS gated — driven by run_bigquery_golden (dev/release_oracle/bigquery.py),
-      which is this row's driver under a different name; Snowflake + ClickHouse are resolver/type-only (no live
-      load-and-readback) — ClickHouse is even a local compose service, cheap to add"
+      which is this row's driver under a different name; ClickHouse has its own row (clickhouse_load); Snowflake is
+      resolver/type-only (no live load-and-readback)"

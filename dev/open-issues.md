@@ -265,6 +265,22 @@ the same as a run that never built one. Now `(docker image built)`.
   is their subject. `live_cdc_multi_table_cycle.rs`'s module doc still describes the view
   layout.
 
+### Architecture review 2026-09-25 (ClickHouse, PR #308) — the rest, researched
+- **#3, position order written twice** (`SourceEngine::order_exprs` per warehouse and
+  `CLICKHOUSE_VERSION_EXPR`): kept apart — the ROW_NUMBER warehouses compare text, ClickHouse
+  needs an integer — but the silent half is closed: an unknown `__pos` shape now fails the
+  insert. Drift is caught by the live version-order test (PG LSN, binlog rollover, MSSQL
+  LSN, snapshot vs pre-anchor), not by a shared definition.
+- **#4, the live-only purity gate matches exclusions by bare function name**, so an
+  exclusion written for `<impl … for BigQueryLoader>::materialize` also covers every other
+  adapter's `materialize`. ClickHouse's HTTP methods now carry their own explicit entries,
+  so nothing is covered by accident today. The precise fix — match the impl path the entry
+  names — needs the gate's source reader to track `impl` blocks; do it when a second
+  adapter needs a method the first one excludes.
+- **#5, a load target is described in four places** (`RawLoadSection` fields,
+  `LoadTargetKind`, the field-ownership table in `TryFrom`, `LoadTarget`). The compiler
+  catches two of the four. Not worth a descriptor at three warehouses; revisit at the fourth.
+
 ## Unexplained / unverified
 
 ### U1. `init_delta[warehouse:mysql]` failed once, cause unknown
