@@ -25,12 +25,12 @@ The most-used options, grouped by section, with the *why* and examples.
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `type` | `postgres` \| `mysql` \| `mssql` \| `mongo` | **yes** | — | Database type. `mssql` = SQL Server (URL scheme `sqlserver://`); `mongo` = MongoDB (URL scheme `mongodb://`, see [mongodb.md](mongodb.md)). |
-| `url` | string | one of url/url_env/url_file or structured | — | Full connection URL (`postgresql://` / `mysql://` / `sqlserver://` / `mongodb://`) |
+| `type` | `postgres` \| `mysql` \| `mssql` \| `mongo` \| `oracle` | **yes** | — | Database type. `mssql` = SQL Server (URL scheme `sqlserver://`); `mongo` = MongoDB (URL scheme `mongodb://`, see [mongodb.md](mongodb.md)); `oracle` = Oracle Database (URL scheme `oracle://…/SERVICE`, see [oracle.md](oracle.md)). |
+| `url` | string | one of url/url_env/url_file or structured | — | Full connection URL (`postgresql://` / `mysql://` / `sqlserver://` / `mongodb://` / `oracle://`) |
 | `url_env` | string | | — | Env var name containing the URL |
 | `url_file` | string | | — | Path to file containing the URL |
 | `host` | string | for structured | — | Database hostname |
-| `port` | integer | no | `5432` (PG) / `3306` (MySQL) / `1433` (MSSQL) / `27017` (MongoDB) | Database port |
+| `port` | integer | no | `5432` (PG) / `3306` (MySQL) / `1433` (MSSQL) / `27017` (MongoDB) / `1521` (Oracle) | Database port |
 | `user` | string | for structured | — | Database user |
 | `password` | string | no | — | **Not recommended** — plaintext; see [Credentials & plan artifacts](#credentials--plan-artifacts) below |
 | `password_env` | string | no | — | Env var name containing the password (recommended) |

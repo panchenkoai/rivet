@@ -428,11 +428,17 @@ pub fn build_time_window_query(
             // ISO-8601 with a 'T' is DATEFORMAT/LANGUAGE-immune on MSSQL (mirrors
             // partition.rs's date-literal rule); PG/MySQL keep the space form,
             // which they parse ISO-unambiguously (bug hunt 2026-08-09).
+            // Oracle's ANSI `TIMESTAMP '…'` ignores the session's pinned NLS format.
             let lit = match source_type {
-                crate::config::SourceType::Mssql => truncated.format("%Y-%m-%dT%H:%M:%S"),
-                _ => truncated.format("%Y-%m-%d %H:%M:%S"),
+                crate::config::SourceType::Mssql => {
+                    format!("'{}'", truncated.format("%Y-%m-%dT%H:%M:%S"))
+                }
+                crate::config::SourceType::Oracle => {
+                    format!("TIMESTAMP '{}'", truncated.format("%Y-%m-%d %H:%M:%S"))
+                }
+                _ => format!("'{}'", truncated.format("%Y-%m-%d %H:%M:%S")),
             };
-            format!("{quoted_col} >= '{lit}'")
+            format!("{quoted_col} >= {lit}")
         }
         TimeColumnType::Unix => {
             format!("{} >= {}", quoted_col, truncated.and_utc().timestamp())
@@ -613,6 +619,19 @@ mod tests {
             !q.contains(" 00:00:00'"),
             "MSSQL literal must NOT use the DATEFORMAT-dependent space form: {q}"
         );
+    }
+
+    #[test]
+    fn build_time_window_query_oracle_uses_an_nls_immune_literal() {
+        let q = build_time_window_query(
+            "SELECT * FROM events",
+            "CREATED_AT",
+            TimeColumnType::Timestamp,
+            7,
+            SourceType::Oracle,
+        );
+        assert!(q.contains("\"CREATED_AT\" >= TIMESTAMP '"), "got: {q}");
+        assert!(q.ends_with(" 00:00:00'"), "got: {q}");
     }
 
     #[test]

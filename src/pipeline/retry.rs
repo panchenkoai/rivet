@@ -272,6 +272,7 @@ pub fn classify_error(err: &anyhow::Error) -> RetryClass {
         || msg.contains("connection slots are reserved")
         || msg.contains("the database system is starting up")
         || msg.contains("the database system is shutting down")
+        || is_oracle_capacity(&msg)
     {
         return transient(true, 15_000);
     }
@@ -365,6 +366,20 @@ fn classify_pg_sqlstate(code: &postgres::error::SqlState) -> RetryClass {
 
 /// A lost or killed Oracle session: the thin driver's dead-connection wording or an ORA code
 /// for a killed session, a dropped channel, or an unreachable listener.
+/// Oracle refused a session for capacity: a per-user or server session/process cap,
+/// or a listener with no free handler. Clears when other sessions end.
+fn is_oracle_capacity(msg: &str) -> bool {
+    const CODES: &[&str] = &[
+        "ora-02391", // exceeded simultaneous SESSIONS_PER_USER limit
+        "ora-00018", // maximum number of sessions exceeded
+        "ora-00020", // maximum number of processes exceeded
+        "ora-12516", // TNS:listener could not find available handler
+        "ora-12519", // TNS:no appropriate service handler found
+        "ora-12520", // TNS:listener could not find available handler for requested type
+    ];
+    CODES.iter().any(|c| msg.contains(c))
+}
+
 fn is_oracle_lost_session(msg: &str) -> bool {
     const CODES: &[&str] = &[
         "ora-00028", // your session has been killed
@@ -506,6 +521,25 @@ mod tests {
         ] {
             let c = classify_error(&anyhow::anyhow!("{msg}"));
             assert_eq!(c, TRANSIENT_RECONNECT, "{msg}");
+        }
+    }
+
+    /// A session or process cap on Oracle clears as other sessions end: retry with the long delay.
+    #[test]
+    fn an_oracle_session_cap_is_transient_with_the_capacity_delay() {
+        for msg in [
+            "oracle: ORA-02391: exceeded simultaneous SESSIONS_PER_USER limit",
+            "oracle: ORA-00018: maximum number of sessions exceeded",
+            "oracle: ORA-00020: maximum number of processes (150) exceeded",
+            "oracle: ORA-12516: TNS:listener could not find available handler",
+            "oracle: ORA-12519: TNS:no appropriate service handler found",
+            "oracle: ORA-12520: TNS:listener could not find available handler",
+        ] {
+            assert_eq!(
+                classify_error(&anyhow::anyhow!("{msg}")),
+                transient(true, 15_000),
+                "{msg}"
+            );
         }
     }
 

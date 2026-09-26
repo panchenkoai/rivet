@@ -39,6 +39,7 @@
 
 - [Compatibility & versions](reference/compatibility.md)
 - [MongoDB](reference/mongodb.md)
+- [Oracle Database (preview)](reference/oracle.md)
 - [Extraction prioritization](reference/prioritization.md)
 
 # Destinations

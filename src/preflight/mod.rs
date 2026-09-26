@@ -496,6 +496,7 @@ pub fn check(
         // but exit is gated only by --strict; without this note an operator or CI
         // reading the glyph alone would be misled into thinking rc != 0.
         let mut tally = TargetFailTally::default();
+        let mut reports_failed = 0usize;
         for export in &exports {
             let column_overrides =
                 crate::plan::parse_column_overrides_pub(&export.columns, &export.name)?;
@@ -563,6 +564,9 @@ pub fn check(
                 }
                 Err(e) => {
                     log::warn!("type report for '{}' failed: {:#}", export.name, e);
+                    // An export whose column types cannot be described is not "Looks good".
+                    clean = false;
+                    reports_failed += 1;
                     // The type report could not be collected, but the diagnostic
                     // was. Under --json the verdict must still reach the
                     // consumer, so emit a diagnostic-only object (no `columns`/
@@ -576,6 +580,11 @@ pub fn check(
             }
         }
 
+        if strict_fails_on_unbuilt_reports(strict, reports_failed) {
+            anyhow::bail!(
+                "strict mode: the type report failed for {reports_failed} export(s) (see the warnings above)"
+            );
+        }
         match tally.outcome(strict, json_output) {
             TypeReportOutcome::Fail => {
                 anyhow::bail!("strict mode: unsafe type mappings found (see report above)")
@@ -609,6 +618,11 @@ pub fn check(
     // `clean` = the type check surfaced no fatal mapping. The caller ANDs this
     // with the plan-compatibility gate before printing the success epilogue.
     Ok(clean)
+}
+
+/// `--strict` fails when any export's type report could not be built.
+fn strict_fails_on_unbuilt_reports(strict: bool, reports_failed: usize) -> bool {
+    strict && reports_failed > 0
 }
 
 /// One type report per export unit against `target`, typed from the load spec
@@ -771,6 +785,13 @@ fn print_diagnostic(diag: &ExportDiagnostic) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn strict_fails_on_unbuilt_reports_only_under_strict() {
+        assert!(super::strict_fails_on_unbuilt_reports(true, 1));
+        assert!(!super::strict_fails_on_unbuilt_reports(true, 0));
+        assert!(!super::strict_fails_on_unbuilt_reports(false, 3));
+    }
 
     /// The preflight must refuse exactly what the planner refuses — no more.
     ///

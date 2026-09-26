@@ -133,8 +133,10 @@ fn connect_string(parts: &OracleUrl, tls: Option<&TlsConfig>) -> Result<String> 
         && t.ca_file.is_some()
     {
         anyhow::bail!(
-            "oracle: `tls.ca_file` is not supported yet — the driver verifies against the \
-             system trust store; install the CA there, or use `tls.mode: require`"
+            "oracle: `tls.ca_file` is not supported yet — the Oracle driver verifies the server \
+             certificate only against the public CA bundle compiled into it (not the system \
+             trust store), so a certificate from a private CA cannot be verified; remove \
+             `tls.ca_file` if the server's certificate chains to a public CA"
         );
     }
     let scheme = if enforced { "tcps://" } else { "" };
@@ -175,6 +177,18 @@ fn probe_rows(projection: &Projection, target: usize) -> usize {
     } else {
         target
     }
+}
+
+/// Oracle's cap on a select list's columns.
+const MAX_SELECT_COLUMNS: usize = 1000;
+
+/// `base`, suffixed until no result column already has that name.
+fn unique_alias(base: &str, metas: &[Metadata]) -> String {
+    let mut alias = base.to_string();
+    while metas.iter().any(|m| m.name() == alias) {
+        alias.push('_');
+    }
+    alias
 }
 
 /// A result column name an outer query cannot reference: the ROWID pseudo-column
@@ -296,10 +310,22 @@ impl OracleSource {
             if k.needs_empty_flag() {
                 rewritten = true;
                 empty_flags[i] = Some(metas.len() + flags.len());
+                let alias = unique_alias(&format!("_rivet_empty_{i}"), &metas);
                 flags.push(format!(
-                    "CASE WHEN DBMS_LOB.GETLENGTH({quoted}) = 0 THEN 1 END \"_rivet_empty_{i}\""
+                    "CASE WHEN DBMS_LOB.GETLENGTH({quoted}) = 0 THEN 1 END \"{alias}\""
                 ));
             }
+        }
+        if metas.len() + flags.len() > MAX_SELECT_COLUMNS {
+            log::warn!(
+                "oracle: {} LOB column(s) read a zero-length value as NULL: the query already \
+                 has {} columns and Oracle allows {MAX_SELECT_COLUMNS}, so the empty-value flags \
+                 do not fit — select fewer columns in a `query:` to keep the distinction",
+                flags.len(),
+                metas.len()
+            );
+            flags.clear();
+            empty_flags.iter_mut().for_each(|f| *f = None);
         }
         let sql = if rewritten {
             if let Some(m) = metas.iter().find(|m| unreferenceable(m.name())) {
@@ -315,6 +341,22 @@ impl OracleSource {
         } else {
             query.to_string()
         };
+        let objects: Vec<&str> = metas
+            .iter()
+            .filter(|m| OraKind::of(m) == OraKind::Object)
+            .map(|m| m.name())
+            .collect();
+        if !objects.is_empty()
+            && let Err(e) = self.describe(&sql)
+        {
+            anyhow::ensure!(
+                !format!("{e:#}").contains("ORA-00932"),
+                "oracle: column(s) {objects:?} are object or collection types rivet cannot \
+                 export (only XMLTYPE is re-read, as text); select their attributes in a \
+                 `query:`, or leave them out"
+            );
+            return Err(e);
+        }
         Ok(Projection {
             sql,
             native,
@@ -633,7 +675,13 @@ mod tests {
             "tcps://h:1522/S"
         );
         tls.ca_file = Some("/ca.pem".into());
-        assert!(connect_string(&parts, Some(&tls)).is_err());
+        let err = connect_string(&parts, Some(&tls)).unwrap_err().to_string();
+        assert!(
+            err.contains(
+                "only against the public CA bundle compiled into it (not the system trust store)"
+            ),
+            "{err}"
+        );
         tls.mode = crate::config::TlsMode::Disable;
         assert_eq!(connect_string(&parts, Some(&tls)).unwrap(), "h:1522/S");
     }

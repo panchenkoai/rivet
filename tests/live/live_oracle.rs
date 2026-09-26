@@ -782,7 +782,7 @@ fn check_refuses_a_key_column_in_the_wrong_case() {
     );
     let err = String::from_utf8_lossy(&check.stderr);
     assert!(
-        err.contains("column 'id' is not in the export's result; Oracle names match exactly and a table created without quotes stores them upper-case — write 'ID'"),
+        err.contains("column 'id' is not in the export's result; Oracle names match exactly and this one is spelled 'ID'"),
         "stderr:\n{err}"
     );
 }
@@ -1270,4 +1270,215 @@ fn init_discover_names_the_oracle_table_scope() {
     let d: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(d["source_type"], "oracle");
     assert_eq!(d["scope"], format!("table \"RIVET\".\"{}\"", t.name()));
+}
+
+/// `time_window` on DATE and TIMESTAMP columns: the window literal parses under the pinned NLS masks.
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn time_window_on_date_and_timestamp_reads_only_the_window() {
+    require_alive(LiveService::Oracle);
+    let t = OracleTable::create(
+        "ora_tw",
+        "id NUMBER(10) PRIMARY KEY, d DATE, ts TIMESTAMP(6)",
+    );
+    ora_exec(&format!(
+        "INSERT INTO {} SELECT LEVEL, SYSDATE - CASE WHEN LEVEL <= 3 THEN 1 ELSE 100 END, \
+         SYSTIMESTAMP - NUMTODSINTERVAL(CASE WHEN LEVEL <= 3 THEN 1 ELSE 100 END, 'DAY') \
+         FROM dual CONNECT BY LEVEL <= 5",
+        t.name()
+    ));
+    for col in ["D", "TS"] {
+        let out = tempfile::tempdir().unwrap();
+        let run = Rig::oracle_batch(t.name())
+            .mode("time_window")
+            .export_line(&format!("time_column: {col}"))
+            .export_line("days_window: 7")
+            .dest_path(out.path().to_path_buf())
+            .run_args(&[]);
+        assert!(
+            run.status.success(),
+            "{col} stderr:\n{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert_eq!(
+            duckdb_total_parquet_rows(out.path()),
+            3,
+            "{col}: only the in-window rows"
+        );
+    }
+}
+
+/// `partition_by` on an Oracle DATE splits rows into day buckets. Not RED against a plain
+/// `'YYYY-MM-DD'` bound: Oracle's lenient conversion accepts it under the pinned mask too.
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn partition_by_a_date_column_buckets_every_row() {
+    require_alive(LiveService::Oracle);
+    let t = OracleTable::create("ora_part", "id NUMBER(10) PRIMARY KEY, d DATE");
+    ora_exec(&format!(
+        "INSERT INTO {} SELECT LEVEL, DATE '2024-01-01' + MOD(LEVEL, 3) FROM dual CONNECT BY LEVEL <= 9",
+        t.name()
+    ));
+    let out = tempfile::tempdir().unwrap();
+    let run = Rig::oracle_batch(t.name())
+        .export_line("partition_by: D")
+        .export_line("partition_granularity: day")
+        .dest_path(out.path().join("{partition}"))
+        .run_args(&[]);
+    assert!(
+        run.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    for day in ["2024-01-01", "2024-01-02", "2024-01-03"] {
+        assert_eq!(
+            duckdb_total_parquet_rows(&out.path().join(format!("D={day}"))),
+            3,
+            "{day}"
+        );
+    }
+}
+
+/// A user column named like rivet's LOB empty-flag alias does not collide with it under a cursor wrap.
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn a_column_named_like_the_lob_flag_does_not_collide() {
+    require_alive(LiveService::Oracle);
+    let t = OracleTable::create(
+        "ora_flag",
+        "id NUMBER(10) PRIMARY KEY, c CLOB, \"_rivet_empty_1\" VARCHAR2(10)",
+    );
+    for row in ["1, 'a', 'x'", "2, EMPTY_CLOB(), 'y'", "3, NULL, 'z'"] {
+        ora_exec(&format!("INSERT INTO {} VALUES ({row})", t.name()));
+    }
+    let out = tempfile::tempdir().unwrap();
+    let run = Rig::oracle_batch(t.name())
+        .mode("incremental")
+        .export_line("cursor_column: ID")
+        .dest_path(out.path().to_path_buf())
+        .run_args(&[]);
+    assert!(
+        run.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let c = parquet_cells(out.path(), "C");
+    assert_eq!(
+        (c[&2].as_deref(), c[&3].as_deref()),
+        (Some(""), None),
+        "empty vs NULL CLOB"
+    );
+    let user = parquet_cells(out.path(), "_rivet_empty_1");
+    assert_eq!(
+        user[&2].as_deref(),
+        Some("y"),
+        "the user's own column is intact"
+    );
+}
+
+/// A 1000-column table with a LOB pages by key: the empty-value flags give way to Oracle's column cap.
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn a_thousand_column_table_with_a_lob_pages_by_key() {
+    require_alive(LiveService::Oracle);
+    let cols: Vec<String> = (2..=999).map(|i| format!("c{i} VARCHAR2(5)")).collect();
+    let t = OracleTable::create(
+        "ora_w1000",
+        &format!("id NUMBER(10) PRIMARY KEY, {}, cl CLOB", cols.join(", ")),
+    );
+    ora_exec(&format!(
+        "INSERT INTO {} (id, c2, cl) VALUES (1, 'a', 'x')",
+        t.name()
+    ));
+    ora_exec(&format!(
+        "INSERT INTO {} (id, c2, cl) VALUES (2, 'b', 'y')",
+        t.name()
+    ));
+    let out = tempfile::tempdir().unwrap();
+    let run = Rig::oracle_batch(t.name())
+        .mode("chunked")
+        .export_line("chunk_by_key: ID")
+        .export_line("chunk_size: 1")
+        .dest_path(out.path().to_path_buf())
+        .run_args(&[]);
+    assert!(
+        run.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(duckdb_total_parquet_rows(out.path()), 2, "every row");
+    let err = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        err.contains("read a zero-length value as NULL"),
+        "the degradation is loud:\n{err}"
+    );
+}
+
+/// A collection-typed column is refused by name, and `check --type-report --strict` fails on it.
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn a_collection_column_is_refused_by_name_and_fails_strict_check() {
+    require_alive(LiveService::Oracle);
+    let ty = format!("{}_T", crate::common::unique_name("ora_va").to_uppercase());
+    ora_exec(&format!("CREATE TYPE {ty} AS VARRAY(5) OF NUMBER"));
+    let t = OracleTable::create("ora_va", &format!("id NUMBER(10) PRIMARY KEY, va {ty}"));
+    ora_exec(&format!("INSERT INTO {} VALUES (1, {ty}(1, 2))", t.name()));
+    let out = tempfile::tempdir().unwrap();
+    let rig = Rig::oracle_batch(t.name()).dest_path(out.path().to_path_buf());
+    let run = rig.run_args(&[]);
+    let check = rig.cli(&["check", "--type-report", "--strict"]);
+    drop(t);
+    ora_exec(&format!("DROP TYPE {ty}"));
+    assert!(!run.status.success(), "a VARRAY column must be refused");
+    let err = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        err.contains("column(s) [\"VA\"] are object or collection types"),
+        "stderr:\n{err}"
+    );
+    assert!(
+        !check.status.success(),
+        "strict check must fail when the type report cannot be built"
+    );
+}
+
+/// An INVISIBLE key column is named as such, not blamed on case.
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn check_names_an_invisible_key_column() {
+    require_alive(LiveService::Oracle);
+    let t = OracleTable::create(
+        "ora_inv",
+        "k NUMBER(10) INVISIBLE PRIMARY KEY, a VARCHAR2(5)",
+    );
+    let check = Rig::oracle_batch(t.name())
+        .mode("chunked")
+        .export_line("chunk_by_key: K")
+        .cli(&["check"]);
+    assert!(!check.status.success());
+    let err = String::from_utf8_lossy(&check.stderr);
+    assert!(
+        err.contains("column 'K' is INVISIBLE, and `table:` reads SELECT *, which leaves invisible columns out"),
+        "stderr:\n{err}"
+    );
+}
+
+/// A quoted lower-case column is suggested with its real spelling.
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn check_suggests_the_real_spelling_of_a_quoted_lowercase_column() {
+    require_alive(LiveService::Oracle);
+    let t = OracleTable::create(
+        "ora_lc",
+        "\"id\" NUMBER(10) PRIMARY KEY, \"updated_at\" TIMESTAMP(6)",
+    );
+    let check = Rig::oracle_batch(t.name())
+        .mode("incremental")
+        .export_line("cursor_column: UPDATED_AT")
+        .cli(&["check"]);
+    assert!(!check.status.success());
+    let err = String::from_utf8_lossy(&check.stderr);
+    assert!(
+        err.contains("column 'UPDATED_AT' is not in the export's result; Oracle names match exactly and this one is spelled 'updated_at'"),
+        "stderr:\n{err}"
+    );
 }

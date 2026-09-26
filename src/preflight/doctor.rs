@@ -564,6 +564,10 @@ pub(crate) fn categorize_source_error(err: &anyhow::Error) -> &'static str {
     {
         return "unknown database";
     }
+    // Oracle ORA-12514: the listener, before any login, does not know the URL's service.
+    if msg.contains("ora-12514") || msg.contains("not registered with the listener") {
+        return "unknown service";
+    }
     // ALL of 53300's renderings, measured against the stand's own PostgreSQL:
     // the max_connections cap says "sorry, too many clients already" or
     // "remaining connection slots are reserved" — NEITHER contains "too many
@@ -582,6 +586,9 @@ pub(crate) fn categorize_source_error(err: &anyhow::Error) -> &'static str {
         || msg.contains("access denied")
         // MSSQL bad credentials: `"Login failed for user 'sa'"`.
         || msg.contains("login failed")
+        // Oracle bad credentials: "ORA-01017: invalid credential or not authorized; logon denied".
+        || msg.contains("ora-01017")
+        || msg.contains("logon denied")
         // Postgres top-level Display when the real cause (auth) is nested and
         // `{:#}` still collapses to the bare wrapper — a server-side `DbError`
         // is never a connectivity failure (those say "connect"/"refused"). But
@@ -722,6 +729,12 @@ pub(crate) fn source_error_hint(
         // catch-all — each hint names the actual fix, where "verify the
         // user/password" sent the operator to credentials they never had a
         // problem with.
+        "unknown service" => Some(
+            "The listener does not know the service named in the URL path \
+             (oracle://user:pass@host:port/SERVICE) — the login was never attempted. \
+             List the registered services with `lsnrctl services` on the server; \
+             Oracle Free's pluggable database is FREEPDB1.",
+        ),
         "unknown database" => Some(
             "The database named in the URL does not exist on this server. Check \
              the path segment of the connection URL — credentials are fine (the \
@@ -956,6 +969,20 @@ exports:
             "no actionable hint produced for Postgres 'db error' (category {:?}); operator gets no next step",
             cat
         );
+    }
+
+    #[test]
+    fn oracle_bad_credentials_and_unknown_service_get_their_own_categories() {
+        let auth = anyhow::anyhow!(
+            "oracle: ORA-01017: invalid credential or not authorized; logon denied"
+        );
+        assert_eq!(categorize_source_error(&auth), "auth error");
+        let service = anyhow::anyhow!(
+            "oracle: ORA-12514: Cannot connect to database. Service FREE_NOPE is not registered \
+             with the listener at host 127.0.0.1 port 1521. (CONNECTION_ID=abc)"
+        );
+        assert_eq!(categorize_source_error(&service), "unknown service");
+        assert!(source_error_hint("unknown service", &service, &SourceType::Oracle).is_some());
     }
 
     // AUDIT-RED doctor-categorizer (#1): MSSQL wrong-login Display is

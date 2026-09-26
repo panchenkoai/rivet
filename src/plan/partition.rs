@@ -84,14 +84,23 @@ pub(crate) fn build_range_query(
     source_type: SourceType,
 ) -> String {
     let q = crate::sql::quote_ident(source_type, col);
-    let fmt = date_literal_format(source_type);
     format!(
-        "SELECT * FROM ({base}) {d} WHERE {q} >= '{lo}' AND {q} < '{hi}'",
+        "SELECT * FROM ({base}) {d} WHERE {q} >= {lo} AND {q} < {hi}",
         base = base_query,
         d = crate::sql::derived(source_type, "_rivet_part"),
-        lo = range.lo.format(fmt),
-        hi = range.hi.format(fmt),
+        lo = date_literal(source_type, range.lo),
+        hi = date_literal(source_type, range.hi),
     )
+}
+
+/// A date bound as a SQL literal this engine parses regardless of session settings;
+/// Oracle's ANSI `DATE '…'` ignores the pinned NLS_DATE_FORMAT.
+pub(crate) fn date_literal(source_type: SourceType, date: NaiveDate) -> String {
+    let text = date.format(date_literal_format(source_type));
+    match source_type {
+        SourceType::Oracle => format!("DATE '{text}'"),
+        _ => format!("'{text}'"),
+    }
 }
 
 /// The date-literal spelling that this engine parses unambiguously regardless of
@@ -361,7 +370,7 @@ mod tests {
 
 #[cfg(test)]
 mod date_literal_dialect_tests {
-    use super::{PartitionRange, build_range_query, date_literal_format};
+    use super::{PartitionRange, build_range_query, date_literal, date_literal_format};
     use crate::config::SourceType;
     use chrono::NaiveDate;
 
@@ -415,5 +424,9 @@ mod date_literal_dialect_tests {
         assert_eq!(date_literal_format(SourceType::Mssql), "%Y%m%d");
         assert_eq!(date_literal_format(SourceType::Postgres), "%Y-%m-%d");
         assert_eq!(date_literal_format(SourceType::Mysql), "%Y-%m-%d");
+        let d = NaiveDate::from_ymd_opt(2024, 2, 29).unwrap();
+        assert_eq!(date_literal(SourceType::Oracle, d), "DATE '2024-02-29'");
+        assert_eq!(date_literal(SourceType::Postgres, d), "'2024-02-29'");
+        assert_eq!(date_literal(SourceType::Mssql, d), "'20240229'");
     }
 }

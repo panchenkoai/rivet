@@ -49,15 +49,16 @@ fn diagnose_oracle(conn: &mut OracleSource, export: &ExportConfig) -> Result<Exp
     if let Some(fail) = schema_fail_oracle(conn, base_query) {
         return Err(fail);
     }
-    for col in key_columns(export) {
-        if let Some(fail) = key_column_fail_oracle(conn, base_query, col) {
-            return Err(fail);
-        }
-    }
+
     let base_table_owned = strip_select_star_from(base_query)
         .map(std::borrow::Cow::Borrowed)
         .or_else(|| table_from_simple_query(base_query));
     let base_table = base_table_owned.as_deref();
+    for col in key_columns(export) {
+        if let Some(fail) = key_column_fail_oracle(conn, base_query, base_table, col) {
+            return Err(fail);
+        }
+    }
 
     let auto_pk: Option<String> =
         auto_pk_probe_target(export, base_table).and_then(|t| single_int_pk_oracle(conn, t));
@@ -158,28 +159,54 @@ fn key_columns(export: &ExportConfig) -> Vec<&str> {
     .collect()
 }
 
-/// A strategy column the result does not have is a loud error naming Oracle's case rule.
+/// A strategy column the result does not have is a loud error that says why, from the catalog.
 fn key_column_fail_oracle(
     conn: &mut OracleSource,
     base_query: &str,
+    base_table: Option<&str>,
     col: &str,
 ) -> Option<anyhow::Error> {
     let quoted = crate::sql::quote_ident(SourceType::Oracle, col);
     let probe = format!("SELECT {quoted} FROM ({base_query}) \"_rivet_probe\" WHERE 1 = 0");
     let e = conn.query_scalar(&probe).err()?;
-    format!("{e:#}").contains("ORA-00904").then(|| {
-        PreflightSchemaError::new(unknown_key_column_detail(col), "ORA-00904".to_string())
-            .into_error()
-    })
+    if !format!("{e:#}").contains("ORA-00904") {
+        return None;
+    }
+    let catalog = base_table.and_then(|t| catalog_column(conn, t, col));
+    Some(
+        PreflightSchemaError::new(
+            unknown_key_column_detail(col, catalog.as_ref()),
+            "ORA-00904".to_string(),
+        )
+        .into_error(),
+    )
 }
 
-/// Why a strategy column was not found: Oracle matches names exactly, and unquoted DDL is upper-case.
-fn unknown_key_column_detail(col: &str) -> String {
-    format!(
-        "column '{col}' is not in the export's result; Oracle names match exactly and a table \
-         created without quotes stores them upper-case — write '{}'",
-        col.to_uppercase()
-    )
+/// The table's column spelled like `col` in any case: `(real name, invisible)`.
+fn catalog_column(conn: &mut OracleSource, table: &str, col: &str) -> Option<(String, bool)> {
+    let (owner, name) = crate::sql::oracle_catalog_preds(table);
+    let sql = format!(
+        "SELECT column_name, hidden_column FROM all_tab_cols WHERE owner = {owner} \
+         AND table_name = {name} AND UPPER(column_name) = UPPER('{}') AND user_generated = 'YES'",
+        col.replace('\'', "''")
+    );
+    let row = conn.query_rows(&sql).ok()?.into_iter().next()?;
+    Some((row.first()?.clone()?, row.get(1)?.as_deref() == Some("YES")))
+}
+
+/// Why a strategy column was not found, given what the catalog holds under that name.
+fn unknown_key_column_detail(col: &str, catalog: Option<&(String, bool)>) -> String {
+    match catalog {
+        Some((_, true)) => format!(
+            "column '{col}' is INVISIBLE, and `table:` reads SELECT *, which leaves invisible \
+             columns out — list the columns, including it, in a `query:`"
+        ),
+        Some((real, false)) if real != col => format!(
+            "column '{col}' is not in the export's result; Oracle names match exactly and this \
+             one is spelled '{real}'"
+        ),
+        _ => format!("column '{col}' is not in the export's result"),
+    }
 }
 
 /// The single integer `NUMBER(p<=18,0)` primary-key column of `table`, if any.
@@ -253,7 +280,18 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_key_column_names_the_upper_case_spelling() {
-        assert!(unknown_key_column_detail("id").ends_with("write 'ID'"));
+    fn an_unknown_key_column_says_why_from_the_catalog() {
+        let real = ("ID".to_string(), false);
+        assert!(unknown_key_column_detail("id", Some(&real)).ends_with("spelled 'ID'"));
+        let lower = ("updated_at".to_string(), false);
+        assert!(
+            unknown_key_column_detail("UPDATED_AT", Some(&lower)).ends_with("spelled 'updated_at'")
+        );
+        let hidden = ("K".to_string(), true);
+        assert!(unknown_key_column_detail("K", Some(&hidden)).contains("is INVISIBLE"));
+        assert_eq!(
+            unknown_key_column_detail("NOPE", None),
+            "column 'NOPE' is not in the export's result"
+        );
     }
 }

@@ -24,10 +24,15 @@ use crate::types::{
     ColumnOverrides, RivetType, SourceColumn, TimeUnit, TypeMapping, build_arrow_field,
 };
 
-/// Warning attached to a bare `NUMBER` (no declared precision) exported as exact text.
-pub(super) const BARE_NUMBER_WARNING: &str = "NUMBER without declared precision → exact decimal text (Utf8): its range (1E-130..1E126) \
-     fits no fixed-scale decimal. Declare the type to load it as a number, e.g. \
-     `columns: {ID: \"decimal(38,0)\"}`.";
+/// Warning attached to a bare `NUMBER` column `name` (no declared precision) exported as exact text.
+pub(super) fn bare_number_warning(name: &str) -> String {
+    format!(
+        "NUMBER without declared precision → exact decimal text (Utf8): its range \
+         (1E-130..1E126) fits no fixed-scale decimal. Declare the type to load it as a \
+         number: `columns: {{{name}: \"decimal(38,0)\"}}` for whole numbers, or a scale \
+         the values need, e.g. \"decimal(38,10)\""
+    )
+}
 
 /// Warning attached to a `TIMESTAMP(7..9)` column truncated to microseconds.
 pub(super) const TIMESTAMP_NS_WARNING: &str = "TIMESTAMP(7..9) / INTERVAL DAY TO SECOND(7..9) → microseconds: the sub-microsecond \
@@ -112,7 +117,7 @@ pub(super) fn oracle_type_mappings(
             if overrides.contains_key(m.name()) {
                 mapping
             } else if is_bare_number(m) {
-                mapping.with_warning(BARE_NUMBER_WARNING)
+                mapping.with_warning(bare_number_warning(m.name()))
             } else if sub_microsecond(native, m.scale()) {
                 TypeMapping {
                     fidelity: crate::types::TypeFidelity::Lossy,
@@ -409,6 +414,15 @@ mod tests {
         assert_eq!(interval_ym_iso(0, -3), "P-3M");
         assert_eq!(interval_ym_iso(2, 0), "P2Y");
         assert_eq!(interval_ym_iso(0, 0), "PT0S");
+    }
+
+    #[test]
+    fn the_bare_number_warning_names_its_own_column() {
+        let w = bare_number_warning("AMT");
+        assert!(
+            w.contains("`columns: {AMT: \"decimal(38,0)\"}` for whole numbers"),
+            "{w}"
+        );
     }
 
     #[test]
