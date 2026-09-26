@@ -212,6 +212,20 @@ fn audit_repair_keeps_validate_clean() {
 
 /// Seed `id BIGINT, v TEXT` over 1..=1000 minus 500..=549, export chunked, insert the gap, repair.
 fn seed_gap_run_insert_repair() -> (PgTable, Rig) {
+    let (table, rig) = seed_gap_run_insert();
+    let repair = rig.cli(&["repair", "--export", table.name(), "--execute"]);
+    assert!(
+        repair.status.success(),
+        "repair: {}",
+        String::from_utf8_lossy(&repair.stderr)
+    );
+    let (ok, after) = reconcile_json(&rig, table.name());
+    assert!(ok, "reconcile must converge after repair: {after:#}");
+    (table, rig)
+}
+
+/// Seed 1..=1000 minus 500..=549, export chunked (chunk_size 250), insert the gap; reconcile sees it.
+fn seed_gap_run_insert() -> (PgTable, Rig) {
     let name = unique_name("repair_formb");
     let mut c = pg_connect();
     c.batch_execute(&format!(
@@ -241,15 +255,34 @@ fn seed_gap_run_insert_repair() -> (PgTable, Rig) {
     .expect("insert gap");
     let (ok, _) = reconcile_json(&rig, table.name());
     assert!(!ok, "precondition: reconcile must see the inserted gap");
-    let repair = rig.cli(&["repair", "--export", table.name(), "--execute"]);
-    assert!(
-        repair.status.success(),
-        "repair: {}",
-        String::from_utf8_lossy(&repair.stderr)
-    );
-    let (ok, after) = reconcile_json(&rig, table.name());
-    assert!(ok, "reconcile must converge after repair: {after:#}");
     (table, rig)
+}
+
+/// The canonical manifest at `out` as JSON.
+fn manifest_json(out: &std::path::Path) -> serde_json::Value {
+    serde_json::from_str(&std::fs::read_to_string(out.join("manifest.json")).unwrap()).unwrap()
+}
+
+/// Paths of the manifest parts with `status`.
+fn parts_with_status(m: &serde_json::Value, status: &str) -> Vec<String> {
+    m["parts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p["status"] == status)
+        .map(|p| p["path"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// DuckDB `[count(*), count(DISTINCT id)]` over `names` under the oracle's view of `out`.
+fn duck_count_distinct(rig: &Rig, names: &[String]) -> serde_json::Value {
+    let container = rig.oracle_container_out();
+    let files: Vec<String> = names.iter().map(|n| format!("'{container}/{n}'")).collect();
+    duckdb_run_sql_json(&format!(
+        "SELECT count(*), count(DISTINCT id) FROM read_parquet([{}])",
+        files.join(", ")
+    ))["rows"][0]
+        .clone()
 }
 
 /// `validate --depth full` → (exit code, stdout+stderr).
@@ -275,9 +308,10 @@ fn repaired_prefix_passes_validate_full_value_checksum() {
         .iter()
         .map(|p| format!("'{container}/{}'", p.file_name().unwrap().to_string_lossy()))
         .collect();
-    assert!(
-        files.len() >= 5,
-        "4 chunk parts + the repair part: {files:?}"
+    assert_eq!(
+        files.len(),
+        4,
+        "4 chunks, each declared once (the repaired ones by their repair part): {files:?}"
     );
     let e = OracleEngine::Postgres;
     let (attach, from) = e.source_sql("rivet", table.name());
@@ -297,12 +331,110 @@ fn repaired_prefix_passes_validate_full_value_checksum() {
         "DuckDB: the declared parts must equal the source"
     );
 
+    let names: Vec<String> = declared_parquet_parts(&rig.out_dir())
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        duck_count_distinct(&rig, &names),
+        serde_json::json!(["1000", "1000"]),
+        "DuckDB over the DECLARED parts: every source row exactly once, no duplicate from a \
+         superseded original: {names:?}"
+    );
+    let m = manifest_json(&rig.out_dir());
+    let superseded = parts_with_status(&m, "superseded");
+    assert!(
+        !superseded.is_empty(),
+        "the repaired chunks' originals must be superseded: {m:#}"
+    );
+    for s in &superseded {
+        assert!(
+            rig.out_dir().join(s).is_file(),
+            "RR5: the superseded file '{s}' stays on disk"
+        );
+    }
+
     let (code, text) = validate_full(&rig, table.name());
     assert_eq!(
         code,
         Some(0),
         "validate --depth full must PASS on a correctly repaired prefix (the manifest's value \
          checksums must include the repair parts); output:\n{text}"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres duckdb"]
+fn the_load_resolver_reads_a_repaired_prefix_without_duplicates() {
+    require_alive(LiveService::Postgres);
+    let (_table, rig) = seed_gap_run_insert_repair();
+    let out = rig.out_dir();
+    let m: rivet::manifest::RunManifest =
+        serde_json::from_str(&std::fs::read_to_string(out.join("manifest.json")).unwrap()).unwrap();
+    let all: Vec<String> = files_with_extension(&out, "parquet")
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    let selected =
+        rivet::load::reconcile::select_load_keys(&[("manifest.json".to_string(), m)], &all);
+    assert!(
+        selected.len() < all.len(),
+        "fixture inert: the prefix holds no superseded file: {all:?}"
+    );
+    assert_eq!(
+        duck_count_distinct(&rig, &selected),
+        serde_json::json!(["1000", "1000"]),
+        "the parts `rivet load` would read hold every row exactly once: {selected:?}"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres duckdb"]
+fn repair_stays_additive_when_an_original_part_has_no_chunk_index() {
+    require_alive(LiveService::Postgres);
+    let (table, rig) = seed_gap_run_insert();
+    let out = rig.out_dir();
+
+    // Rename one original part to a name that carries no chunk index.
+    let mut m = manifest_json(&out);
+    let old = m["parts"][0]["path"].as_str().unwrap().to_string();
+    std::fs::rename(out.join(&old), out.join("legacy_part.parquet")).unwrap();
+    m["parts"][0]["path"] = serde_json::json!("legacy_part.parquet");
+    let bytes = serde_json::to_string_pretty(&m).unwrap().into_bytes();
+    for f in std::fs::read_dir(&out).unwrap().map(|e| e.unwrap().path()) {
+        let n = f.file_name().unwrap().to_string_lossy().into_owned();
+        if n.starts_with("manifest") && n.ends_with(".json") {
+            std::fs::write(&f, &bytes).unwrap();
+        }
+    }
+    std::fs::write(
+        out.join("_SUCCESS"),
+        rivet::manifest::success_marker_body(&bytes),
+    )
+    .unwrap();
+
+    let repair = rig.cli(&["repair", "--export", table.name(), "--execute"]);
+    let stderr = String::from_utf8_lossy(&repair.stderr);
+    assert!(repair.status.success(), "repair: {stderr}");
+    assert!(
+        stderr.contains("carries no chunk index") && stderr.contains("(additive)"),
+        "the fallback must say why it stayed additive: {stderr}"
+    );
+    let m = manifest_json(&out);
+    assert!(
+        parts_with_status(&m, "superseded").is_empty(),
+        "never guess: {m:#}"
+    );
+    let committed = parts_with_status(&m, "committed");
+    assert_eq!(
+        committed.len(),
+        6,
+        "4 originals + 2 repair parts stay declared: {m:#}"
+    );
+    assert_eq!(
+        duck_count_distinct(&rig, &committed)[1],
+        "1000",
+        "no row lost by the fallback"
     );
 }
 

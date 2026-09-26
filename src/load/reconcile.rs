@@ -25,7 +25,7 @@
 
 use crate::destination::gcs::GcsStore;
 use crate::manifest::census::{ManifestCensus, dedupe_by_run_id, ensure_single_generation};
-use crate::manifest::{MANIFEST_FILENAME, ManifestStatus, RunManifest};
+use crate::manifest::{MANIFEST_FILENAME, ManifestStatus, PartStatus, RunManifest};
 use crate::pipeline::validate_manifest::MANIFEST_MAX_BYTES;
 use anyhow::{Context, Result, bail};
 
@@ -152,13 +152,15 @@ fn runs_with_missing_parts(new: &[(String, RunManifest)], all_parquet: &[String]
     let present: std::collections::HashSet<&str> = all_parquet.iter().map(String::as_str).collect();
     new.iter()
         .filter(|(key, m)| {
-            !m.parts.is_empty() && !resolve_parts(key, m).any(|p| present.contains(p.as_str()))
+            m.committed_part_count() > 0
+                && !resolve_parts(key, m).any(|p| present.contains(p.as_str()))
         })
         .map(|(_, m)| m.run_id.clone())
         .collect()
 }
 
-/// The bucket-relative part keys a manifest declares, each resolved against the
+/// The bucket-relative COMMITTED part keys a manifest declares (a superseded repair original is
+/// neither loaded nor kept, so gc collects it once no run is active), each resolved against the
 /// manifest's own directory: `<dir(manifest_key)>/<part.path>`. Shared by
 /// [`select_load_keys`] (which intersects them with what's present) and
 /// [`gc_orphans`] (which treats them as the keep-set), so the two can't drift on
@@ -168,13 +170,16 @@ fn resolve_parts<'a>(
     m: &'a RunManifest,
 ) -> impl Iterator<Item = String> + 'a {
     let dir = manifest_key.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
-    m.parts.iter().map(move |p| {
-        if dir.is_empty() {
-            p.path.clone()
-        } else {
-            format!("{dir}/{}", p.path)
-        }
-    })
+    m.parts
+        .iter()
+        .filter(|p| p.status == PartStatus::Committed)
+        .map(move |p| {
+            if dir.is_empty() {
+                p.path.clone()
+            } else {
+                format!("{dir}/{}", p.path)
+            }
+        })
 }
 
 /// Pure selection: which bucket-relative parquet keys to load for the given
@@ -210,7 +215,7 @@ pub fn select_load_keys(new: &[(String, RunManifest)], all_parquet: &[String]) -
         // "appended 2 rows, expected 0 from the run manifests". Surfaced by the
         // scenario-artifact matrix on SQL Server, where the async capture Agent
         // makes an empty first cycle common; the mechanism is engine-independent.
-        if !resolved_any && !m.parts.is_empty() {
+        if !resolved_any && m.committed_part_count() > 0 {
             return all_parquet.to_vec();
         }
     }

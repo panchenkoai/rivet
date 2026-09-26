@@ -575,7 +575,8 @@ def verify_reconcile_and_validate_cover_both_sides(led: Ledger, engine: str, tag
                 src_q = "SELECT id, v FROM pg.public.recon_probe"
                 diff = o.scalar(
                     f"SELECT (SELECT count(*) FROM ({src_q} EXCEPT {q}))||' missing, '||"
-                    f"(SELECT count(*) FROM ({q} EXCEPT {src_q}))||' extra'"
+                    f"(SELECT count(*) FROM ({q} EXCEPT {src_q}))||' extra, '||"
+                    f"(SELECT count(*) - count(DISTINCT id) FROM read_parquet({lst}))||' duplicate'"
                 )
 
         fails = []
@@ -591,7 +592,7 @@ def verify_reconcile_and_validate_cover_both_sides(led: Ledger, engine: str, tag
             fails.append(f"repair --execute exit {rp.returncode}: {rp.stderr.strip()[-160:]}")
         if r4 != 0 or v4 != 0:
             fails.append(f"after repair: reconcile exit {r4}, validate exit {v4}, want 0/0")
-        if diff != "0 missing, 0 extra":
+        if diff != "0 missing, 0 extra, 0 duplicate":
             fails.append(f"after repair: DuckDB declared parts vs source: {diff}")
         if fails:
             _failed(

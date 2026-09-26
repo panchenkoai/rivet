@@ -511,63 +511,10 @@ pub fn validate_recorded_checksums(
     key_col_name: Option<&str>,
     fold: Fold,
 ) -> Result<Option<String>> {
-    use std::collections::BTreeMap;
-
-    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-
-    // Re-read every part, accumulate side C per column BY NAME — keyed to the same
-    // cursor column as the export when `key_col_name` is set, so the keyed hashes
-    // match. Name-keyed so a column reorder can't silently misalign the compare.
-    let mut actual: BTreeMap<String, u64> = BTreeMap::new();
-    for path in part_paths {
-        // File::open failing (EMFILE, a permissions blip) is OPERATIONAL — the
-        // verification could not run, so it must not be reported as corruption.
-        let file = std::fs::File::open(path)
-            .map_err(|e| anyhow::anyhow!("value checksum: open {}: {e}", path.display()))?;
-        // A part the manifest recorded as committed Parquet that will NOT decode
-        // is post-write CORRUPTION — verified-wrong (Ok(Some), exit 3), not an
-        // operational could-not-verify. Distinct from File::open above.
-        let reader = match ParquetRecordBatchReaderBuilder::try_new(file).and_then(|b| b.build()) {
-            Ok(r) => r,
-            Err(e) => {
-                return Ok(Some(format!(
-                    "value checksum: part {} is not readable as Parquet ({e}) — post-write corruption",
-                    path.display()
-                )));
-            }
-        };
-        for batch in reader {
-            let batch = match batch {
-                Ok(b) => b,
-                Err(e) => {
-                    return Ok(Some(format!(
-                        "value checksum: part {} failed to decode ({e}) — post-write corruption",
-                        path.display()
-                    )));
-                }
-            };
-            let key_col = key_col_name.and_then(|n| batch.schema().index_of(n).ok());
-            // Re-derive with the fold that WROTE these numbers, not today's.
-            // EVERY column is keyed when a key exists — including the key column
-            // itself, exactly as `arrow_batch_checksums_keyed` does on the write
-            // side. Excluding it (an exception I invented on the first cut) makes
-            // the key column's re-read disagree with what was recorded, which a
-            // 4-part keyset export reported as post-write corruption.
-            let key_arr = key_col.map(|k| batch.column(k).clone());
-            let sums: Vec<u64> = batch
-                .columns()
-                .iter()
-                .map(|c| column_xxh3_with(c.as_ref(), key_arr.as_deref(), fold))
-                .collect();
-            for (i, f) in batch.schema().fields().iter().enumerate() {
-                // Folded by the SAME rule that produced the recorded value —
-                // see `Fold`. Combining batches with a different operation than
-                // the writer used would report every multi-batch part as corrupt.
-                let e = actual.entry(f.name().clone()).or_insert(0);
-                *e = fold.combine(*e, sums[i]);
-            }
-        }
-    }
+    let actual = match reread_column_checksums(part_paths, key_col_name, fold)? {
+        Ok(actual) => actual,
+        Err(detail) => return Ok(Some(detail)),
+    };
 
     // Compare each recorded (data) column to the re-read value by name. Re-read
     // columns absent from `recorded` (enrichment / meta columns) are not compared.
@@ -599,6 +546,72 @@ pub fn validate_recorded_checksums(
         }
     }
     Ok(None)
+}
+
+/// Re-read Parquet parts and fold per-column checksums by name; `Ok(Err(detail))` when a part will not decode.
+pub(crate) fn reread_column_checksums(
+    part_paths: &[std::path::PathBuf],
+    key_col_name: Option<&str>,
+    fold: Fold,
+) -> Result<std::result::Result<std::collections::BTreeMap<String, u64>, String>> {
+    use std::collections::BTreeMap;
+
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    // Re-read every part, accumulate side C per column BY NAME — keyed to the same
+    // cursor column as the export when `key_col_name` is set, so the keyed hashes
+    // match. Name-keyed so a column reorder can't silently misalign the compare.
+    let mut actual: BTreeMap<String, u64> = BTreeMap::new();
+    for path in part_paths {
+        // File::open failing (EMFILE, a permissions blip) is OPERATIONAL — the
+        // verification could not run, so it must not be reported as corruption.
+        let file = std::fs::File::open(path)
+            .map_err(|e| anyhow::anyhow!("value checksum: open {}: {e}", path.display()))?;
+        // A part the manifest recorded as committed Parquet that will NOT decode
+        // is post-write CORRUPTION — verified-wrong (Ok(Some), exit 3), not an
+        // operational could-not-verify. Distinct from File::open above.
+        let reader = match ParquetRecordBatchReaderBuilder::try_new(file).and_then(|b| b.build()) {
+            Ok(r) => r,
+            Err(e) => {
+                return Ok(Err(format!(
+                    "value checksum: part {} is not readable as Parquet ({e}) — post-write corruption",
+                    path.display()
+                )));
+            }
+        };
+        for batch in reader {
+            let batch = match batch {
+                Ok(b) => b,
+                Err(e) => {
+                    return Ok(Err(format!(
+                        "value checksum: part {} failed to decode ({e}) — post-write corruption",
+                        path.display()
+                    )));
+                }
+            };
+            let key_col = key_col_name.and_then(|n| batch.schema().index_of(n).ok());
+            // Re-derive with the fold that WROTE these numbers, not today's.
+            // EVERY column is keyed when a key exists — including the key column
+            // itself, exactly as `arrow_batch_checksums_keyed` does on the write
+            // side. Excluding it (an exception I invented on the first cut) makes
+            // the key column's re-read disagree with what was recorded, which a
+            // 4-part keyset export reported as post-write corruption.
+            let key_arr = key_col.map(|k| batch.column(k).clone());
+            let sums: Vec<u64> = batch
+                .columns()
+                .iter()
+                .map(|c| column_xxh3_with(c.as_ref(), key_arr.as_deref(), fold))
+                .collect();
+            for (i, f) in batch.schema().fields().iter().enumerate() {
+                // Folded by the SAME rule that produced the recorded value —
+                // see `Fold`. Combining batches with a different operation than
+                // the writer used would report every multi-batch part as corrupt.
+                let e = actual.entry(f.name().clone()).or_insert(0);
+                *e = fold.combine(*e, sums[i]);
+            }
+        }
+    }
+    Ok(Ok(actual))
 }
 
 /// What a destination-side re-read found wrong, typed so the caller classifies it

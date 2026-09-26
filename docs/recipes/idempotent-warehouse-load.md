@@ -25,8 +25,11 @@ What Rivet does **not** provide:
 A downstream loader that ignores the manifest and processes "every file
 under this prefix" will eventually double-load — chunked retries write
 new files alongside originals (RR5), and `rivet repair --execute`
-explicitly does so.  Treat the manifest as the source of truth and
-deduplicate on the warehouse side.
+explicitly does so.  Treat the manifest as the source of truth: after a
+repair it lists the chunk's original part(s) as `superseded` and only the
+replacement as `committed`, so a reader of the committed parts sees each
+row once.  A warehouse that already loaded the original part before the
+repair still holds those rows; without a primary-key dedup it keeps them.
 
 ---
 
@@ -98,8 +101,8 @@ The manifest gives a downstream loader two things it cannot easily
 recover from raw object listing:
 
 1. The **exact set of parts** that were *committed* in this run (vs.
-   parts left over from earlier interrupted runs, repair retries, or
-   external writes).
+   parts left over from earlier interrupted runs, parts a repair
+   superseded (`status: superseded`), or external writes).
 2. A **content-addressable identity** per part (`content_fingerprint`)
    that survives object renames, lifecycle migrations, and CDN copies.
 
@@ -126,8 +129,9 @@ the pattern is the same across targets:
 1. Read `manifest.json` from the resolved destination prefix.
 2. Verify `_SUCCESS` matches.  If it does not, abort — the export is
    not complete.
-3. Load **only the parts listed in `manifest.json`**.  Do not glob the
-   prefix.
+3. Load **only the parts listed in `manifest.json` with `status:
+   committed`**.  Do not glob the prefix, and skip `superseded` /
+   `quarantined` entries.
 4. Record the manifest identity (`run_id` + `schema_fingerprint` +
    `_SUCCESS` body) in a downstream control table.
 5. Deduplicate by primary key (or natural key) when merging into the
