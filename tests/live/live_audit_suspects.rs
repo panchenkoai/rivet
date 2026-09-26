@@ -501,4 +501,13 @@ fn cleanup_source_never_deletes_parts_an_extract_committed_during_the_load() {
         "every row an extract committed during a load must reach the warehouse; a cleanup \
          that deleted its part after the stream acknowledged it loses the row for good"
     );
+    let left: Vec<String> = bq
+        .gcs_objects()
+        .into_iter()
+        .filter(|n| n.ends_with(".parquet"))
+        .collect();
+    assert!(
+        left.is_empty(),
+        "with nothing writing, cleanup_source must still remove every part it loaded: {left:?}"
+    );
 }

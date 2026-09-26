@@ -5,7 +5,6 @@ use crate::destination::gcs::GcsStore;
 use crate::error::Result;
 use crate::load;
 use crate::state::StateStore;
-use anyhow::Context as _;
 
 /// The runs the run-status ledger says are writing into `prefix`: `None` when stateless, `Some(Err)` when the query failed.
 pub(super) fn ledger_writers(
@@ -180,6 +179,77 @@ pub(super) fn cleanup_target_leased<'a>(
     plan: &'a load::plan::LoadPlan,
     store: &'a crate::destination::gcs::GcsStore,
     state: Option<&'a StateStore>,
+    runs: &[(String, crate::manifest::RunManifest)],
+    writing: Option<&std::collections::HashSet<String>>,
+) -> (
+    Option<(&'a crate::destination::gcs::GcsStore, Vec<String>)>,
+    Option<crate::state::LoadLease<'a>>,
+) {
+    let (target, lease) = prefix_target_leased(plan, store, state);
+    let Some((store, _)) = target else {
+        return (None, lease);
+    };
+    let Some(writing) = writing else {
+        eprintln!(
+            "  cleanup [{}]: SKIPPED — could not tell which runs are still writing into {}; \
+             nothing is deleted this cycle, and the next load with `cleanup_source` retries.",
+            plan.table, plan.gcs_prefix
+        );
+        return (None, lease);
+    };
+    let keys = cleanup_keys(runs, writing, |dir| canonical_run_id(store, dir));
+    (Some((store, keys)), lease)
+}
+
+/// The run a directory's canonical `manifest.json` describes, if it can be read.
+fn canonical_run_id(store: &GcsStore, dir: &str) -> Option<String> {
+    let bytes = store
+        .read(&join_key(dir, crate::manifest::MANIFEST_FILENAME))
+        .ok()?;
+    serde_json::from_slice::<crate::manifest::RunManifest>(&bytes)
+        .ok()
+        .map(|m| m.run_id)
+}
+
+/// `dir/name`, or `name` at the bucket root.
+fn join_key(dir: &str, name: &str) -> String {
+    if dir.is_empty() {
+        name.to_string()
+    } else {
+        format!("{dir}/{name}")
+    }
+}
+
+/// What `cleanup_source` deletes: the manifest and parts of every run read that nobody is still writing, plus a directory's canonical manifest and `_SUCCESS` when they describe one of those runs.
+pub(super) fn cleanup_keys(
+    runs: &[(String, crate::manifest::RunManifest)],
+    writing: &std::collections::HashSet<String>,
+    canonical_run: impl Fn(&str) -> Option<String>,
+) -> Vec<String> {
+    let done: Vec<&(String, crate::manifest::RunManifest)> = runs
+        .iter()
+        .filter(|(_, m)| !writing.contains(&m.run_id))
+        .collect();
+    let ids: std::collections::HashSet<&str> =
+        done.iter().map(|(_, m)| m.run_id.as_str()).collect();
+    let mut keys = std::collections::BTreeSet::new();
+    for (key, m) in done {
+        keys.insert(key.clone());
+        keys.extend(load::reconcile::resolve_parts(key, m));
+        let dir = key.rsplit_once('/').map_or("", |(d, _)| d);
+        if canonical_run(dir).is_some_and(|id| ids.contains(id.as_str())) {
+            keys.insert(join_key(dir, crate::manifest::MANIFEST_FILENAME));
+            keys.insert(join_key(dir, crate::manifest::SUCCESS_FILENAME));
+        }
+    }
+    keys.into_iter().collect()
+}
+
+/// [`cleanup_target`] under the prefix lease: the prefix to clean, or `None` when cleanup is off, refused, or the lease is held elsewhere.
+fn prefix_target_leased<'a>(
+    plan: &'a load::plan::LoadPlan,
+    store: &'a crate::destination::gcs::GcsStore,
+    state: Option<&'a StateStore>,
 ) -> (
     Option<(&'a crate::destination::gcs::GcsStore, &'a str)>,
     Option<crate::state::LoadLease<'a>>,
@@ -285,11 +355,11 @@ pub(super) fn maybe_gc_orphans(
 
 /// Clean up iff `cleanup` is `Some`, downgrading a failure to a warning — the
 /// data is loaded and gated, so a stuck delete must not fail the load. Cleanup
-/// runs the driver's own [`delete_under`] over an injected [`GcsStore`], so no
+/// deletes exactly the listed keys through an injected [`GcsStore`], so no
 /// adapter owns a delete path. Returns whether the source was actually cleaned.
-pub(super) fn maybe_cleanup(cleanup: Option<(&GcsStore, &str)>) -> bool {
+pub(super) fn maybe_cleanup(cleanup: Option<(&GcsStore, &[String])>) -> bool {
     match cleanup {
-        Some((store, prefix)) => match delete_under(store, prefix) {
+        Some((store, keys)) => match keys.iter().try_for_each(|k| store.remove(k)) {
             Ok(()) => true,
             Err(e) => {
                 eprintln!(
@@ -301,16 +371,4 @@ pub(super) fn maybe_cleanup(cleanup: Option<(&GcsStore, &str)>) -> bool {
         },
         None => false,
     }
-}
-
-/// Recursively delete a whole export-dedicated `gs://…/` prefix through an
-/// injected [`GcsStore`] — the driver's post-gate source cleanup, over the same
-/// native opendal GCS client the export destination uses (no `gcloud`). Taking
-/// the store as an argument (rather than each adapter building one from a
-/// config) is what lets an fs-backed store exercise this delete offline.
-pub(crate) fn delete_under(store: &GcsStore, gs_prefix: &str) -> Result<()> {
-    let (_, rel) = load::split_object_uri(gs_prefix)?;
-    store
-        .remove_all(rel)
-        .with_context(|| format!("source cleanup (recursive delete of {gs_prefix}) failed"))
 }

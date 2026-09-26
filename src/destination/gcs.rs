@@ -163,22 +163,6 @@ impl GcsStore {
         Ok(self.op.read_options(path, opts)?.to_vec())
     }
 
-    /// Recursively delete everything under the bucket-relative `path`.
-    ///
-    /// Normalise to a DIRECTORY boundary first (`dir_boundary`): opendal — and
-    /// GCS/S3 under it — match by STRING prefix, so `remove_all("exports/orders")`
-    /// would ALSO delete `exports/orders_archive/…`, `exports/orders2/…`, and any
-    /// other object whose key string-starts-with it. `list_files` always scoped
-    /// with a trailing slash; this delete path did NOT, so a post-load source
-    /// cleanup could destroy UNRELATED sibling exports. The fs backend reproduces
-    /// it too (opendal string-prefixes there as well) — the prior "spares
-    /// siblings" test only used a non-prefix sibling (`keep/`), so it never
-    /// activated the bug.
-    pub(crate) fn remove_all(&self, path: &str) -> Result<()> {
-        self.op.remove_all(&dir_boundary(path))?;
-        Ok(())
-    }
-
     /// Delete the single object at the bucket-relative `path`. Deleting a missing
     /// object is a no-op `Ok` — opendal's delete is idempotent.
     pub(crate) fn remove(&self, path: &str) -> Result<()> {
@@ -511,73 +495,6 @@ mod tests {
         write_at(dir.path(), "p/a.parquet", b"abcd"); // 4 bytes
         let store = GcsStore::open_fs(dir.path().to_str().unwrap()).unwrap();
         assert_eq!(store.stat_size("p/a.parquet").unwrap(), 4);
-    }
-
-    // RED before dir_boundary in remove_all: opendal matches by STRING prefix,
-    // so `remove_all("p")` (no trailing slash — exactly what the load cleanup
-    // passes for `prefix: "exports/orders"` or a mid-segment `{partition}`) also
-    // deletes `p_archive/…`, a SEPARATE sibling export. Data destruction, and
-    // reproduced on the fs backend (opendal string-prefixes there too). The
-    // prior test used `keep/` — not a string prefix — so it never activated it.
-    #[test]
-    fn remove_all_spares_a_string_prefix_sibling() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        write_at(root, "p/a.parquet", b"a");
-        write_at(root, "p_archive/b.parquet", b"b"); // key string-starts-with "p"
-        let store = GcsStore::open_fs(root.to_str().unwrap()).unwrap();
-
-        store.remove_all("p").unwrap();
-        assert!(
-            store.list_files("p").unwrap().is_empty(),
-            "the target subtree is drained"
-        );
-        assert_eq!(
-            store.list_files("p_archive").unwrap(),
-            vec!["p_archive/b.parquet".to_string()],
-            "a SEPARATE export sharing the string prefix must NOT be deleted"
-        );
-    }
-
-    #[test]
-    fn remove_all_recursively_empties_the_prefix_and_spares_siblings() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        write_at(root, "p/a.parquet", b"a");
-        write_at(root, "p/sub/b.parquet", b"b");
-        write_at(root, "keep/c.parquet", b"c");
-        let store = GcsStore::open_fs(root.to_str().unwrap()).unwrap();
-
-        // `delete_under` passes the bucket-relative prefix with no trailing
-        // slash — the recursive delete must still drain the whole subtree.
-        store.remove_all("p").unwrap();
-        assert!(
-            store.list_files("p").unwrap().is_empty(),
-            "the prefix subtree is fully drained"
-        );
-        assert_eq!(
-            store.list_files("keep").unwrap(),
-            vec!["keep/c.parquet".to_string()],
-            "objects outside the prefix are untouched"
-        );
-    }
-
-    #[test]
-    fn remove_all_on_a_missing_prefix_is_a_no_op_not_an_error() {
-        // `cleanup_source` runs after a load; a retried load (or a crash between
-        // cleanup and the next run) can call it on an ALREADY-empty prefix. That
-        // must be a no-op `Ok(())`, never an error that fails the whole load.
-        let dir = tempfile::tempdir().unwrap();
-        write_at(dir.path(), "keep/c.parquet", b"c"); // a sibling, untouched
-        let store = GcsStore::open_fs(dir.path().to_str().unwrap()).unwrap();
-        store
-            .remove_all("never/existed")
-            .expect("deleting a nonexistent prefix must be a no-op");
-        assert_eq!(
-            store.list_files("keep").unwrap(),
-            vec!["keep/c.parquet".to_string()],
-            "a no-op delete touches nothing"
-        );
     }
 
     #[test]
