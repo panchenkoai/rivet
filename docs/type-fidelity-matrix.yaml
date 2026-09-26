@@ -68,7 +68,7 @@ scenarios:
     mysql:    { na: "MySQL has no array type — the closest is JSON, covered by type_json. Nothing here can build an Arrow List." }
     mssql:    { na: "SQL Server has no array type either; the same JSON note applies." }
     mongo:    { na: "a Mongo document exports as exactly two columns (`_id` + one extended-JSON blob), so an in-document array never becomes an Arrow List column — the same fixed-shape reason the drift gate is `na` for this engine." }
-    oracle:   { gap: "Oracle VARRAY / nested-table columns map to RivetType::Unsupported — no Arrow List path and no test" }
+    oracle:   { gap: "Oracle VARRAY / nested-table columns map to RivetType::Unsupported — no Arrow List path; a_collection_column_is_refused_by_name_and_fails_strict_check pins only the loud refusal" }
 
   - id: type_boolean
     what: "boolean — incl NULL; MySQL BIT(1)/TINYINT(1) → Boolean, BIT(8) → Int"

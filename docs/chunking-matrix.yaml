@@ -53,7 +53,7 @@ scenarios:
     mysql:    { test: parallel_keyset_parity_mysql }
     mssql:    { test: parallel_keyset_parity_mssql }
     mongo:    { na: "Mongo `parallel: N` is the SEPARATE `_id`-range reader (mongo_parallel), not SQL keyset fan-out — see the mongo_parallel runner, out of this SQL-keyset scenario" }
-    oracle:   { gap: "nth_row_clause has an Oracle arm (OFFSET … FETCH NEXT 1 ROWS ONLY); no Oracle parallel-keyset live test" }
+    oracle:   { gap: "parallel_keyset_reads_every_row_once proves every row once through the Oracle nth-row boundary probe, but does not assert the run fanned out to ≥2 workers — a collapsed probe still passes it" }
 
   - id: keyset_parallel_incremental
     what: "chunk_by_key + parallel: N + keyset_incremental: a CLEAN re-run seeks past the persisted anchor + advances it, across N workers (run→unchanged=0→insert→only-new). Discriminator = total row count (1000→1000→1500, never a full re-read)."
@@ -69,7 +69,7 @@ scenarios:
     mysql:    { test: generate_config_chunked_single_pk_uses_keyset }
     mssql:    { test: generate_config_chunked_single_pk_uses_keyset }
     mongo:    { na: "Mongo init scaffolds a collection scan, not a SQL keyset key" }
-    oracle:   { gap: "rivet init's Oracle catalog reader is not covered by any Oracle keyset-scaffold test" }
+    oracle:   { test: an_init_generated_config_keysets_a_number_19_key_past_i64 }
 
   # ── range chunking (WHERE key BETWEEN a AND b) ────────────────────────────
   - id: range_auto_single_int_pk
@@ -78,7 +78,7 @@ scenarios:
     mysql:    { test: mysql_chunked_auto_resolves_chunk_column_from_pk }
     mssql:    { test: mssql_chunked_auto_resolves_chunk_column_from_pk }
     mongo:    { test: mongo_batch_parallel_integer_id_no_loss_or_dup }
-    oracle:   { gap: "introspect_oracle_table_for_chunking resolves a single-int PK; no Oracle range-chunk live test" }
+    oracle:   { gap: "introspect_oracle_table_for_chunking resolves a single-int PK, but every Oracle range-chunk live test passes an explicit chunk_column over a `query:` — the table-shortcut auto-resolution is unexercised" }
 
   - id: range_chunk_size_memory_mb
     what: "chunk_size_memory_mb derives the row-count chunk_size from a byte budget"
@@ -111,7 +111,7 @@ scenarios:
     mysql:    { test: dense_ties_mysql_sequential_no_loss_no_dup }
     mssql:    { test: dense_ties_mssql_sequential_no_loss_no_dup }
     mongo:    { na: "no ROW_NUMBER / dense concept in the Mongo reader" }
-    oracle:   { gap: "no Oracle chunk_dense (ROW_NUMBER windows) live test" }
+    oracle:   { gap: "chunk_dense_reads_every_row_once runs the ROW_NUMBER windows on Oracle, but over the unique ID — no ties or NULLs in the chunk column, so the tie-safety this row claims is unproven" }
 
   - id: chunk_count_n
     what: "chunk_count: N divides the key range into exactly N windows"
@@ -127,7 +127,7 @@ scenarios:
     mysql:    { test: stand_chunk_by_days_mysql }
     mssql:    { test: stand_chunk_by_days_mssql }   # found+fixed the MSSQL DATE-scalar bug
     mongo:    { na: "no date-window chunking on Mongo" }
-    oracle:   { gap: "no Oracle chunk_by_days live test (DATE is a timestamp on Oracle — the window literal is dialect-specific)" }
+    oracle:   { test: chunk_by_days_over_a_region_named_tstz_reads_every_row }
 
   - id: snapshot_full
     what: "mode: full — one bounded cursor, one file, re-read each run"

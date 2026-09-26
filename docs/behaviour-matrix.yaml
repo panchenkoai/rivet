@@ -46,7 +46,7 @@ scenarios:
     mysql:    { test: stand_time_window_mysql }
     mssql:    { test: stand_time_window_mssql }
     mongo:    { na: "no SQL date-window mode on Mongo" }
-    oracle:   { gap: "no Oracle time_window live test (date-literal rendering in the window predicate is Oracle-dialect)" }
+    oracle:   { test: time_window_on_date_and_timestamp_reads_only_the_window }
 
   # ── config features (engine-agnostic: one offline test covers all engines) ──
   - id: config_var_substitution

@@ -32,7 +32,7 @@ scenarios:
     mysql:    { test: scaffold_strategy_matches_every_distilled_field_shape }
     mssql:    { test: scaffold_strategy_matches_every_distilled_field_shape }
     mongo:    { test: scaffold_strategy_matches_every_distilled_field_shape }
-    oracle:   { gap: "scaffold_strategy_matches_every_distilled_field_shape feeds the distilled profile through no Oracle catalog reader (init's Oracle path is new and untested)" }
+    oracle:   { gap: "scaffold_strategy_matches_every_distilled_field_shape feeds the distilled profile through no Oracle catalog reader; the live init tests in live_oracle.rs cover single shapes (PK → keyset, un-analyzed 150K → chunked), not the whole profile" }
 
   - id: noninteger_chunk_column_bails
     what: "GARBAGE + GOLDEN: an explicit `chunk_column` that is NOT integer-family (a text/decimal key — the #103 silent fractional-row-drop shape) must LOUDLY bail, never range-chunk. Tested on every SQL engine's introspection."
@@ -80,7 +80,7 @@ scenarios:
     mysql:    { na: "MySQL introspection reads information_schema.COLUMNS rows directly — no STRING_AGG cap." }
     mssql:    { test: stand_wide_table_introspection_mssql }
     mongo:    { na: "Mongo has no column introspection for SQL chunking." }
-    oracle:   { gap: "introspect_oracle_table_for_chunking aggregates column names with LISTAGG, a VARCHAR2 capped at 4000 bytes under MAX_STRING_SIZE=STANDARD (ORA-01489) — the MSSQL #21 shape; no wide-table Oracle test" }
+    oracle:   { test: a_thousand_column_table_with_a_lob_pages_by_key }
 
   - id: chunk_by_days_date_windows
     what: "GOLDEN: `chunk_by_days` on a DATE column slices half-open date windows (type-safe, no fractional-row-drop) — the alternative rivet steers date-keyed fleet tables toward. Every SQL engine."
@@ -88,7 +88,7 @@ scenarios:
     mysql:    { test: stand_chunk_by_days_mysql }
     mssql:    { test: stand_chunk_by_days_mssql }
     mongo:    { na: "no date-window chunking on the Mongo reader." }
-    oracle:   { gap: "no Oracle chunk_by_days live test" }
+    oracle:   { gap: "chunk_by_days_over_a_region_named_tstz_reads_every_row chunks a TIMESTAMP WITH TIME ZONE column; the DATE-column window literal this row names is untested on Oracle" }
 
   - id: chunk_count_exact_parts
     what: "GOLDEN: `chunk_count: N` on a dense clean key emits EXACTLY N part files (the range is divided into N windows). Representative-engine coverage (MySQL + MSSQL); the PG range path shares the same generate_chunks seam, unit-tested in chunked/math.rs."
@@ -104,7 +104,7 @@ scenarios:
     mysql:    { test: stand_time_window_mysql }
     mssql:    { test: stand_time_window_mssql }
     mongo:    { na: "no SQL time_window on the Mongo reader (it pages _id)." }
-    oracle:   { gap: "no Oracle time_window live test" }
+    oracle:   { test: time_window_on_date_and_timestamp_reads_only_the_window }
 
   - id: keyset_key_type_extractable
     what: "GARBAGE (dogfood): `chunk_by_key` must refuse a key type the keyset CURSOR cannot read (`decimal`/`numeric`) at PLAN time — a loud bail naming the type, NOT a partial write then a mid-run 'could not read the key value' failure. The keyset_keys introspection excludes decimal/numeric on every SQL engine so the planner never offers an un-advanceable key."
@@ -112,7 +112,7 @@ scenarios:
     mysql:    { test: stand_keyset_decimal_key_bails_mysql }
     mssql:    { test: stand_keyset_decimal_key_bails_mssql }
     mongo:    { na: "Mongo keysets by `_id` (always extractable); no user chunk_by_key type to refuse." }
-    oracle:   { gap: "no Oracle test of chunk_by_key on a NUMBER(p,s>0) key (the plan-time refusal)" }
+    oracle:   { gap: "keyset_on_a_timestamp_9_key_fails_loudly_instead_of_looping pins the TIMESTAMP(9) arm of the same keyset_keys exclusion; no Oracle test of chunk_by_key on a NUMBER(p,s>0) key (the plan-time refusal)" }
 
   - id: mongo_parallel_needs_page_size
     what: "GARBAGE (dogfood): `parallel: N` on a Mongo `mode: full` export fans out the `_id`-range reader, which requires `source.mongo.page_size`. Without it the export is a single cursor and `parallel: N` is a NO-OP — rivet must WARN, not silently drop it (Mongo-only; the SQL engines fan out via chunk/keyset)."

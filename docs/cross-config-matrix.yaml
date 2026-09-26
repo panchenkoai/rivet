@@ -75,7 +75,7 @@ scenarios:
     mysql:    { test: mysql_reconcile_all_match_exits_zero_with_pretty_output }
     mssql:    { test: mssql_reconcile_all_match_exits_zero_with_pretty_output }
     mongo:    { test: mongo_run_reconcile_matches_source_count }
-    oracle:   { gap: "no Oracle --reconcile test" }
+    oracle:   { test: reconcile_counts_the_source_on_both_paths }
 
   - id: parallel_n
     what: "parallel: N — concurrent workers, no loss or dup"
@@ -83,7 +83,7 @@ scenarios:
     mysql:    { test: dense_ties_mysql_parallel_no_loss_no_dup }
     mssql:    { test: dense_ties_mssql_parallel_no_loss_no_dup }
     mongo:    { test: mongo_batch_parallel_integer_id_no_loss_or_dup }
-    oracle:   { gap: "no Oracle parallel: N live test" }
+    oracle:   { test: parallel_keyset_reads_every_row_once }
 
   - id: environment_tuning_profile
     what: "source.environment → tuning profile default (local → fast)"

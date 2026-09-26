@@ -179,6 +179,11 @@ fn probe_rows(has_lob: bool, target: usize) -> usize {
     }
 }
 
+/// A missing view or privilege (ORA-00942 / ORA-01031), as opposed to a failure that says nothing about grants.
+fn privilege_denied(msg: &str) -> bool {
+    msg.contains("ORA-00942") || msg.contains("ORA-01031")
+}
+
 /// Whether a statement has used its whole time budget.
 fn budget_spent(elapsed: std::time::Duration, budget: std::time::Duration) -> bool {
     elapsed >= budget
@@ -242,8 +247,16 @@ impl OracleSource {
     /// Can this user read V$SYSSTAT and V$SYSTEM_EVENT, the harm and governor probes' views?
     /// `None` when the connection itself fails.
     pub(crate) fn sample_harm_views(url: &str, tls: Option<&TlsConfig>) -> Option<bool> {
-        let mut src = Self::connect_with_tls(url, tls).ok()?;
-        Some(src.harm_counters().is_some() && src.sample_governor_pressure().is_some())
+        let src = Self::connect_with_tls(url, tls).ok()?;
+        let mut readable = true;
+        for view in ["v$sysstat", "v$system_event"] {
+            match src.parses(&format!("SELECT 1 FROM {view}")) {
+                Ok(()) => {}
+                Err(e) if privilege_denied(&format!("{e:#}")) => readable = false,
+                Err(_) => return None,
+            }
+        }
+        Some(readable)
     }
 
     /// Parse `sql` on the server without executing it; a missing table or column fails here.
@@ -656,6 +669,19 @@ mod tests {
             known_failure_hint("ORA-00942: table or view does not exist"),
             None
         );
+    }
+
+    #[test]
+    fn only_a_missing_view_or_privilege_reads_as_denied() {
+        assert!(privilege_denied(
+            "oracle: ORA-00942: table or view \"V$SYSSTAT\" does not exist"
+        ));
+        assert!(privilege_denied(
+            "oracle: ORA-01031: insufficient privileges"
+        ));
+        assert!(!privilege_denied(
+            "oracle: the database or network closed the connection"
+        ));
     }
 
     #[test]
