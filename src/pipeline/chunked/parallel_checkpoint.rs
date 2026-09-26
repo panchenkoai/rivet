@@ -120,6 +120,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
     // #4: reconnects across worker threads, folded into summary.reconnects after
     // the scope joins — the parallel analogue of the sequential runner's counter.
     let agg_reconnects = std::sync::atomic::AtomicU32::new(0);
+    let idle_sources = super::IdleSources::default();
     // Parts, shapes, checksums and failures, drained post-join in FanIn's fixed order.
     // The workers are spawned here, not through FanIn::spawn: this runner's crash
     // hooks (`maybe_panic_at_chunk`) must still take the process down.
@@ -175,6 +176,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
             let run_id_arc = std::sync::Arc::clone(&run_id_arc);
             let agg_retries = &agg_retries;
             let agg_reconnects = &agg_reconnects;
+            let idle_sources = &idle_sources;
             let fan_r = &fan;
             let shared_fingerprint = &shared_fingerprint;
             let plan_w = plan_for_workers.clone();
@@ -283,7 +285,13 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                                 std::thread::sleep(Duration::from_millis(backoff));
                             }
 
-                            let mut thread_src = match source::create_source(&plan_w.source) {
+                            // A retry reconnects; only the first attempt may reuse an idle connection.
+                            let opened = if attempt == 0 {
+                                idle_sources.take(&plan_w.source)
+                            } else {
+                                source::create_source(&plan_w.source)
+                            };
+                            let mut thread_src = match opened {
                                 Ok(s) => s,
                                 Err(e) => {
                                     if crate::pipeline::retry::should_retry(
@@ -378,7 +386,10 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                             })();
 
                             match export_attempt {
-                                Ok(v) => return Ok(v),
+                                Ok(v) => {
+                                    idle_sources.give(thread_src);
+                                    return Ok(v);
+                                }
                                 Err(e) => {
                                     if crate::pipeline::retry::should_retry(
                                         crate::pipeline::retry::Attempt {

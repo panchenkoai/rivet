@@ -240,6 +240,29 @@ pub(super) fn check_drift_only_fresh(
     check_drift_only(&mut *src, plan, Some(state), summary)
 }
 
+/// Idle source connections shared by one parallel chunked run: a chunk reuses one instead of reconnecting per chunk.
+#[derive(Default)]
+pub(super) struct IdleSources(std::sync::Mutex<Vec<Box<dyn crate::source::Source>>>);
+
+impl IdleSources {
+    /// An idle connection, or a fresh one when none is idle.
+    pub(super) fn take(
+        &self,
+        cfg: &crate::config::SourceConfig,
+    ) -> Result<Box<dyn crate::source::Source>> {
+        let idle = self.0.lock().unwrap_or_else(|p| p.into_inner()).pop();
+        match idle {
+            Some(src) => Ok(src),
+            None => crate::source::create_source(cfg),
+        }
+    }
+
+    /// Return a connection after a chunk that SUCCEEDED; a failed chunk's connection is dropped instead.
+    pub(super) fn give(&self, src: Box<dyn crate::source::Source>) {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).push(src);
+    }
+}
+
 /// Like [`prepare_chunk_plan`], but for the parallel runners that don't already
 /// hold a `Source`: open a short-lived connection, compute the plan, and drop
 /// the connection here — **before** the workers open theirs. The detect

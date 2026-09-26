@@ -229,6 +229,7 @@ pub(crate) fn run_chunked_parallel(
     // FanIn's `finished`, bumped on every exit — a success-only count would strand
     // it whenever a chunk fails.
     let completed = AtomicUsize::new(0);
+    let idle_sources = super::IdleSources::default();
     // Rows streamed across ALL chunks (completed + in-flight) — drives the
     // per-batch progress feed so the bar ticks during a chunk's read.
     let streamed_rows = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
@@ -286,6 +287,7 @@ pub(crate) fn run_chunked_parallel(
             let base_query = &plan.base_query;
             let col = &cp.column;
             let completed = &completed;
+            let idle_sources = &idle_sources;
             let fan_r = &fan;
             let shared_fingerprint = &shared_fingerprint;
             let semaphore = &semaphore;
@@ -326,7 +328,7 @@ pub(crate) fn run_chunked_parallel(
                     // credential rotation / pooler drop otherwise dead-ends in a raw
                     // driver error here. Matches single.rs:93.
                     let mut thread_src =
-                        source::create_source(&plan_for_worker.source).map_err(|e| {
+                        idle_sources.take(&plan_for_worker.source).map_err(|e| {
                             crate::pipeline::single::attach_connect_hint(e, &plan_for_worker.source)
                         })?;
                     let mut sink = ExportSink::new(&plan_for_worker)?.with_row_progress(
@@ -342,6 +344,7 @@ pub(crate) fn run_chunked_parallel(
                         ),
                         &mut sink,
                     )?;
+                    idle_sources.give(thread_src);
                     if let Some(w) = sink.writer.take() {
                         w.finish()?;
                     }
