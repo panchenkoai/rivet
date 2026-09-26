@@ -79,6 +79,8 @@ mod live_cdc_compact;
 mod live_cdc_full_cycle;
 #[path = "live/live_cdc_golden.rs"]
 mod live_cdc_golden;
+#[path = "live/live_cdc_harm.rs"]
+mod live_cdc_harm;
 #[path = "live/live_cdc_mbt.rs"]
 mod live_cdc_mbt;
 #[path = "live/live_cdc_mongo.rs"]
