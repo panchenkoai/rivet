@@ -671,3 +671,20 @@ fn a_change_log_with_tz_and_time_columns_takes_a_second_load() {
         "the second load landed and the time kept its fraction"
     );
 }
+
+/// A prefix ClickHouse's table functions cannot address as written (a space, non-ASCII)
+/// still loads under `named_collection`: rivet sends those parts itself.
+#[test]
+#[ignore = "live: requires clickhouse (named collections) + minio + mysql-cdc"]
+fn a_part_clickhouse_cannot_address_is_sent_by_rivet_instead() {
+    require_alive(LiveService::Minio);
+    ensure_minio_bucket(S3_BUCKET);
+    let odd = |rig: Rig| {
+        rig.dest_s3(
+            S3_BUCKET,
+            &format!("{} Order Détails", unique_name("chload")),
+            MINIO_ENDPOINT,
+        )
+    };
+    staged_cdc_cycle("rivet_ch_odd", odd, &MINIO_ENV, Some("rivet_stand_minio"));
+}

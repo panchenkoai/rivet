@@ -137,7 +137,11 @@ impl ClickhouseLoader {
     /// Insert one part into `target`; the rows it holds.
     fn insert_one(&self, target: &str, uri: &str) -> Result<u64> {
         let (bucket, key) = super::split_object_uri(uri)?;
-        let (query, body, rows) = match &self.named_collection {
+        let pull = self
+            .named_collection
+            .as_ref()
+            .filter(|_| pullable(bucket, key));
+        let (query, body, rows) = match pull {
             Some(nc) => {
                 let source = pull_source(nc, super::scheme_of(uri), bucket, key);
                 (
@@ -159,6 +163,7 @@ impl ClickhouseLoader {
             ("query", query.as_str()),
             ("input_format_null_as_default", "0"),
             ("async_insert", "0"),
+            ("use_structure_from_insertion_table_in_table_functions", "1"),
         ];
         self.post(&params, body)
             .with_context(|| format!("inserting {uri} into {target}"))?;
@@ -364,6 +369,15 @@ impl TargetLoader for ClickhouseLoader {
         ))
         .map(|_| ())
     }
+}
+
+/// Whether ClickHouse can read `bucket/key` through a table function as written: its
+/// functions decode `%` and expand `?`, `*` and `{…}` as globs, and reject spaces and
+/// non-ASCII, so any other key goes through rivet instead (measured: `a?b` read 5 objects).
+fn pullable(bucket: &str, key: &str) -> bool {
+    format!("{bucket}/{key}")
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '='))
 }
 
 /// The table function reading one part through `collection`: `gcs`/`s3` take the path under
@@ -1095,6 +1109,22 @@ mod tests {
             !err.is::<crate::load::Refused>(),
             "an incremental log adopts by RENAME, over HTTP: {err:#}"
         );
+    }
+
+    #[test]
+    fn only_a_plain_key_is_read_by_clickhouse_itself() {
+        assert!(pullable("b", "exports/t/snapshot/part-000=1_run.parquet"));
+        for key in [
+            "t/a?b.parquet",
+            "t/a*b.parquet",
+            "t/{a,b}.parquet",
+            "t/x%20y.parquet",
+            "Order Details/p.parquet",
+            "Détails/p.parquet",
+            "t/a#b.parquet",
+        ] {
+            assert!(!pullable("b", key), "{key}");
+        }
     }
 
     #[test]
