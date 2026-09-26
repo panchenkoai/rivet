@@ -118,11 +118,17 @@ pub fn enrich_schema(schema: &SchemaRef, meta: &MetaColumns) -> Result<SchemaRef
         fields.push(Arc::new(Field::new(COL_ROW_HASH, DataType::Int64, false)));
     }
     for added in &fields[schema.fields().len()..] {
-        if schema.field_with_name(added.name()).is_ok() {
+        // Warehouse readers match names case-insensitively, so a case variant collides too.
+        if let Some(src) = schema
+            .fields()
+            .iter()
+            .find(|f| f.name().eq_ignore_ascii_case(added.name()))
+        {
             anyhow::bail!(
-                "source column '{0}' collides with the '{0}' column rivet adds for \
-                 meta_columns — alias it in `query:` (e.g. `SELECT \"{0}\" AS src{0} ...`) \
+                "source column '{0}' collides with the '{1}' column rivet adds for \
+                 meta_columns — rename it in a `query:` (select it under another alias) \
                  or turn that meta column off",
+                src.name(),
                 added.name()
             );
         }
@@ -503,6 +509,7 @@ mod tests {
             "__pos",
             "__seq",
             crate::load::cdc::DELETE_FLAG_COLUMN,
+            "_RIVET_ROW_HASH",
         ] {
             let schema = Arc::new(Schema::new(vec![
                 Field::new("id", DataType::Int64, false),
@@ -511,7 +518,7 @@ mod tests {
             let err = enrich_schema(&schema, &all_on).unwrap_err().to_string();
             assert!(
                 err.contains(&format!("source column '{name}' collides"))
-                    && err.contains("alias it in `query:`"),
+                    && err.contains("rename it in a `query:`"),
                 "{name}: {err}"
             );
         }

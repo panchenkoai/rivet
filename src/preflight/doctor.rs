@@ -700,7 +700,8 @@ pub(crate) fn source_error_hint(
 
     // TLS misconfig leaks through every category — check first so a
     // generic "error" with a TLS root cause still gets the right hint.
-    if msg.contains("tls")
+    // The TLS-required policy refusal names its own fix; it is not a handshake failure.
+    if (msg.contains("tls") && !msg.contains("tls required"))
         || msg.contains("ssl")
         || msg.contains("certificate")
         || msg.contains("handshake")
@@ -716,7 +717,7 @@ pub(crate) fn source_error_hint(
                 "TLS handshake failed. SQL Server forces TLS on the login handshake; set `tls.ca_file: /path/to/ca-bundle.pem` to trust a private CA, or `tls.accept_invalid_certs: true` for a self-signed dev cert."
             }
             SourceType::Oracle => {
-                "TLS handshake failed. Oracle over TLS uses `tcps`: check the listener's TCPS port and that its certificate chains to the system trust store (a private `tls.ca_file` is not supported yet)."
+                "TLS handshake failed. Oracle over TLS uses `tcps`: check the listener's TCPS port and that its certificate chains to a public CA in the bundle compiled into the driver (not the system trust store; a private `tls.ca_file` is not supported yet)."
             }
             SourceType::Mongo => {
                 "TLS handshake failed. For MongoDB, enable TLS in the connection string (`?tls=true`) and set `tls.ca_file: /path/to/ca-bundle.pem` for a private CA, or `tls.accept_invalid_certs: true` for a self-signed dev cert."
@@ -731,7 +732,7 @@ pub(crate) fn source_error_hint(
         // problem with.
         "unknown service" => Some(
             "The listener does not know the service named in the URL path \
-             (oracle://user:pass@host:port/SERVICE) — the login was never attempted. \
+             (oracle://USER@HOST:PORT/SERVICE) — the login was never attempted. \
              List the registered services with `lsnrctl services` on the server; \
              Oracle Free's pluggable database is FREEPDB1.",
         ),
@@ -968,6 +969,25 @@ exports:
             hint.is_some(),
             "no actionable hint produced for Postgres 'db error' (category {:?}); operator gets no next step",
             cat
+        );
+    }
+
+    #[test]
+    fn the_oracle_tls_hint_names_the_compiled_in_bundle_and_skips_the_policy_refusal() {
+        let handshake = anyhow::anyhow!("oracle: TLS handshake failed: invalid peer certificate");
+        let hint = source_error_hint("error", &handshake, &SourceType::Oracle).unwrap();
+        assert!(
+            hint.contains(
+                "public CA in the bundle compiled into the driver (not the system trust store"
+            ),
+            "{hint}"
+        );
+        let policy = anyhow::anyhow!(
+            "source: TLS required — refusing to connect to a remote (non-loopback) host"
+        );
+        assert_ne!(
+            source_error_hint("error", &policy, &SourceType::Oracle),
+            Some(hint)
         );
     }
 

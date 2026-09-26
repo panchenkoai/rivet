@@ -45,7 +45,7 @@ slow-timeout = { period = "300s", terminate-after = 4 }
 oracle = { max-threads = 4 }
 
 [[profile.default.overrides]]
-filter = 'test(/^live_oracle::every_seeded_oracle_table_exports_every_row$/)'
+filter = 'test(/^live_oracle::every_seeded_oracle_table_exports_every_row$/) or test(/^live_oracle::wide_clob_rows_stay_within_the_memory_budget$/)'
 test-group = 'oracle'
 slow-timeout = { period = "300s", terminate-after = 2 }
 

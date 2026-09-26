@@ -1695,3 +1695,79 @@ fn init_folds_lower_case_cli_names_like_oracle_does() {
         25
     );
 }
+
+/// Parallel keyset over a DATE key: each range's upper bound converts through the pinned NLS mask.
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn parallel_keyset_over_a_date_key_reads_every_row_once() {
+    require_alive(LiveService::Oracle);
+    let t = OracleTable::create(
+        "ora_pkd",
+        "id NUMBER(10) PRIMARY KEY, kdate DATE UNIQUE NOT NULL",
+    );
+    ora_exec(&format!(
+        "INSERT INTO {} SELECT LEVEL, DATE '2020-01-01' + LEVEL * 37 / 86400 FROM dual CONNECT BY LEVEL <= 3000",
+        t.name()
+    ));
+    let out = tempfile::tempdir().unwrap();
+    let run = Rig::oracle_batch(t.name())
+        .mode("chunked")
+        .export_line("chunk_by_key: KDATE")
+        .export_line("chunk_size: 300")
+        .export_line("parallel: 3")
+        .dest_path(out.path().to_path_buf())
+        .run_args(&[]);
+    assert!(
+        run.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(duckdb_total_parquet_rows(out.path()), 3000, "every row");
+    assert_eq!(
+        duckdb_dir_scalar(out.path(), "count(DISTINCT \"ID\")", None),
+        3000,
+        "no row twice"
+    );
+}
+
+/// `rivet check` on init's own column-list scaffold still finds the cursor's index.
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn check_on_an_init_scaffold_finds_the_cursor_index() {
+    require_alive(LiveService::Oracle);
+    let dir = tempfile::tempdir().unwrap();
+    let env = [("ORACLE_URL", ORACLE_URL)];
+    let init = run_rivet_in_dir(
+        dir.path(),
+        &[
+            "init",
+            "--source-env",
+            "ORACLE_URL",
+            "--table",
+            "ORDERS",
+            "--mode",
+            "incremental",
+            "-o",
+            "rivet.yaml",
+        ],
+        &env,
+    );
+    assert!(
+        init.status.success(),
+        "init:\n{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let yaml = std::fs::read_to_string(dir.path().join("rivet.yaml")).unwrap();
+    assert!(
+        yaml.contains("query:"),
+        "init writes a column-list query:\n{yaml}"
+    );
+    let check = run_rivet_in_dir(dir.path(), &["check", "-c", "rivet.yaml", "--json"], &env);
+    assert!(
+        check.status.success(),
+        "check:\n{}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+    let d: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
+    assert_eq!(d["diagnostic"]["uses_index"], true, "{d}");
+}

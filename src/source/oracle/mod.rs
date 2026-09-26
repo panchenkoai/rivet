@@ -42,6 +42,12 @@ impl<T> Ora<T> for std::result::Result<T, oracledb::Error> {
 
 /// An actionable hint for failures whose cause rivet has measured.
 fn known_failure_hint(msg: &str) -> Option<&'static str> {
+    if msg.contains("unexpected end of file") {
+        return Some(
+            "the server closed the connection during setup; with `tls.mode` enforced (tcps), \
+             the port is most likely a plain TCP listener rather than a TCPS one",
+        );
+    }
     msg.contains("unknown TTC message type").then_some(
         "the Oracle thin driver (oracledb 26.0.0-beta.4) lost protocol sync. rivet avoids \
          both known triggers (prefetch_rows=1 for a LOB in a wide row; no statement cache, \
@@ -87,31 +93,35 @@ pub(crate) struct OracleUrl {
 
 /// Parse `oracle://user:pass@host[:port]/service`; userinfo is percent-decoded.
 pub(crate) fn parse_oracle_url(url: &str) -> Result<OracleUrl> {
-    let rest = url.strip_prefix("oracle://").ok_or_else(|| {
-        anyhow::anyhow!("oracle: URL must start with oracle:// (got a different scheme)")
-    })?;
-    let (userinfo, hostpart) = rest.rsplit_once('@').ok_or_else(|| {
-        anyhow::anyhow!(
-            "oracle: URL needs user:password@host — oracle://user:pass@host:1521/SERVICE"
-        )
-    })?;
+    const FORM: &str = "oracle://USER@HOST:PORT/SERVICE, with :PASSWORD after USER \
+                        (percent-encode @ : / ? # in the password)";
+    let url = url.trim();
+    let rest = url
+        .get(..9)
+        .filter(|scheme| scheme.eq_ignore_ascii_case("oracle://"))
+        .map(|_| &url[9..])
+        .ok_or_else(|| anyhow::anyhow!("oracle: URL must start with oracle:// — {FORM}"))?;
+    // The authority ends at the first '/', '?' or '#': the same reading as the
+    // credential redactor and the TLS gate, so all three see one host.
+    let (authority, path) = rest.split_at(rest.find(['/', '?', '#']).unwrap_or(rest.len()));
+    let (userinfo, hostport) = authority
+        .rsplit_once('@')
+        .ok_or_else(|| anyhow::anyhow!("oracle: URL needs a user before the host — {FORM}"))?;
     let (user, password) = userinfo.split_once(':').unwrap_or((userinfo, ""));
-    let (authority, service) = hostpart.split_once('/').ok_or_else(|| {
-        anyhow::anyhow!(
-            "oracle: URL needs a service name path — oracle://user:pass@host:1521/SERVICE"
-        )
-    })?;
-    let service = service.split(['?', '#']).next().unwrap_or_default();
-    anyhow::ensure!(!service.is_empty(), "oracle: URL has an empty service name");
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((h, p)) => (
-            h,
-            p.parse::<u16>()
-                .map_err(|_| anyhow::anyhow!("oracle: invalid port {p:?} in URL"))?,
-        ),
-        None => (authority, 1521),
-    };
-    anyhow::ensure!(!host.is_empty(), "oracle: URL has an empty host");
+    let service = path
+        .strip_prefix('/')
+        .map(|p| p.split(['?', '#']).next().unwrap_or_default())
+        .unwrap_or_default();
+    anyhow::ensure!(
+        !service.is_empty(),
+        "oracle: URL has no service name — {FORM}"
+    );
+    anyhow::ensure!(
+        !service.contains('/'),
+        "oracle: the service name {service:?} contains '/' — {FORM}"
+    );
+    let (host, port) = split_host_port(hostport)?;
+    anyhow::ensure!(!host.is_empty(), "oracle: URL has an empty host — {FORM}");
     let decode = |s: &str| {
         percent_encoding::percent_decode_str(s)
             .decode_utf8_lossy()
@@ -124,6 +134,24 @@ pub(crate) fn parse_oracle_url(url: &str) -> Result<OracleUrl> {
         port,
         service: service.to_string(),
     })
+}
+
+/// `host[:port]` or `[v6]:port`; the port defaults to 1521. A bracketed IPv6 host keeps its brackets.
+fn split_host_port(hostport: &str) -> Result<(&str, u16)> {
+    let (host, port) = match hostport.strip_prefix('[').and_then(|r| r.split_once(']')) {
+        Some((v6, tail)) => (&hostport[..v6.len() + 2], tail.strip_prefix(':')),
+        None => match hostport.rsplit_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (hostport, None),
+        },
+    };
+    let port = match port {
+        Some(p) => p
+            .parse::<u16>()
+            .map_err(|_| anyhow::anyhow!("oracle: invalid port {p:?} in URL"))?,
+        None => 1521,
+    };
+    Ok((host, port))
 }
 
 /// The driver connect string: plaintext for no/disabled TLS, `tcps://` otherwise.
@@ -148,8 +176,8 @@ fn connect_string(parts: &OracleUrl, tls: Option<&TlsConfig>) -> Result<String> 
 
 /// Open and pin a connection.
 pub(crate) fn connect(url: &str, tls: Option<&TlsConfig>) -> Result<Connection> {
-    crate::source::require_tls_or_loopback(url, tls)?;
     let parts = parse_oracle_url(url)?;
+    crate::source::require_tls_or_loopback(url, tls)?;
     // The driver builds its TLS config from the process default provider, and the
     // binary links two (ring via reqwest, aws-lc via the driver): pick one.
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -729,6 +757,48 @@ mod tests {
         ] {
             assert!(parse_oracle_url(bad).is_err(), "{bad} must be refused");
         }
+    }
+
+    #[test]
+    fn a_raw_delimiter_in_the_password_is_refused_not_read_two_ways() {
+        // A raw '/' made the redactor and the TLS gate read a different host than the driver.
+        for bad in [
+            "oracle://u:Qm4/Tz8@127.0.0.1:1521/FREEPDB1",
+            "oracle://u:k@localhost/q@192.168.0.165:1521/FREEPDB1",
+            "oracle://u:p?x@h/S",
+            "oracle://u:p@h/S/extra",
+        ] {
+            assert!(parse_oracle_url(bad).is_err(), "{bad} must be refused");
+        }
+        let ok = parse_oracle_url("oracle://u:Qm4%2FTz8@127.0.0.1:1521/FREEPDB1").unwrap();
+        assert_eq!(
+            (ok.password.as_str(), ok.host.as_str()),
+            ("Qm4/Tz8", "127.0.0.1")
+        );
+    }
+
+    #[test]
+    fn ipv6_hosts_and_scheme_case_parse() {
+        let u = parse_oracle_url("oracle://u:p@[::1]/S").unwrap();
+        assert_eq!((u.host.as_str(), u.port), ("[::1]", 1521));
+        let u = parse_oracle_url("oracle://u:p@[::1]:1522/S").unwrap();
+        assert_eq!((u.host.as_str(), u.port), ("[::1]", 1522));
+        assert!(parse_oracle_url(" ORACLE://u:p@h/S").is_ok());
+    }
+
+    #[test]
+    fn the_url_form_in_errors_survives_the_credential_redactor() {
+        let msg = parse_oracle_url("oracle://h:1521/S")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(crate::redact::redact_secrets(&msg), msg);
+        assert!(msg.contains("oracle://USER@HOST:PORT/SERVICE"), "{msg}");
+    }
+
+    #[test]
+    fn a_tls_setup_eof_names_the_plain_listener() {
+        let hint = known_failure_hint("oracle: stream operation failed: unexpected end of file");
+        assert!(hint.is_some_and(|h| h.contains("plain TCP listener rather than a TCPS one")));
     }
 
     #[test]

@@ -706,7 +706,7 @@ pub(crate) fn warn_if_tls_disabled(config: &SourceConfig) {
     WARNED.call_once(|| {
         log::warn!(
             "source: TLS is not enforced — credentials and result rows cross the network in plaintext. \
-             Add `source.tls.mode: verify-full` (with `ca_file:` if your CA is private) to enable transport security."
+             Add `source.tls.mode: verify-full` (with `ca_file:` if your CA is private — not yet supported for Oracle) to enable transport security."
         );
     });
 }
@@ -834,7 +834,7 @@ pub(crate) fn require_tls_or_loopback(url: &str, tls: Option<&TlsConfig>) -> Res
         let msg = "source: TLS required — refusing to connect to a remote (non-loopback) \
              host without TLS; credentials and every exported row would cross the network \
              in cleartext. Add `source.tls: { mode: verify-full }` (with `ca_file:` for a \
-             private CA) to enable transport security, or explicitly opt into remote \
+             private CA; not yet supported for Oracle) to enable transport security, or explicitly opt into remote \
              plaintext with `source.tls: { mode: disable }` if this network path is \
              already trusted.";
         log::error!("{msg}");

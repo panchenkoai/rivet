@@ -893,9 +893,9 @@ pub(crate) fn destination_has_success(dest: &crate::config::DestinationConfig) -
 
 /// Whether a prior `manifest.json` names a completed run with parts; unparseable counts as yes.
 fn manifest_describes_completed_parts(bytes: &[u8]) -> bool {
-    serde_json::from_slice::<crate::manifest::RunManifest>(bytes).map_or(true, |m| {
-        m.status == crate::manifest::ManifestStatus::Success && m.committed_part_count() > 0
-    })
+    // A failed run's parts are durable too, and a re-run beside them double-counts.
+    serde_json::from_slice::<crate::manifest::RunManifest>(bytes)
+        .map_or(true, |m| m.committed_part_count() > 0)
 }
 
 /// The operator-facing body of the rerun-accumulation warning.
@@ -907,7 +907,7 @@ fn manifest_describes_completed_parts(bytes: &[u8]) -> bool {
 /// markers would silently fail the audit, so the test below guards it.
 fn rerun_warning_message(uri: &str, marker: &str) -> String {
     format!(
-        "destination prefix '{uri}' already has a prior completed run ({marker} present) — \
+        "destination prefix '{uri}' already has parts from a prior run ({marker} present) — \
          re-running WITHOUT --resume appends fresh timestamp-named parts alongside the old ones \
          (nothing is overwritten) and rewrites manifest.json to describe only this run, so a glob \
          reader over the prefix will double-count / orphan the old parts. \
@@ -1536,9 +1536,10 @@ mod tests {
             !manifest_describes_completed_parts(&bytes_for("failed", false)),
             "a failed run with no parts left nothing a re-run could double-count"
         );
-        assert!(!manifest_describes_completed_parts(&bytes_for(
-            "failed", true
-        )));
+        assert!(
+            manifest_describes_completed_parts(&bytes_for("failed", true)),
+            "a failed run's durable parts double-count under a re-run too"
+        );
         assert!(!manifest_describes_completed_parts(&bytes_for(
             "success", false
         )));

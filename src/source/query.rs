@@ -424,7 +424,9 @@ fn cursor_rhs(source_type: SourceType, value: &str) -> (String, Option<String>) 
 /// Quote `s` as an Oracle string literal: only `'` is escaped (doubled), and `N'…'`
 /// keeps non-ASCII key values intact.
 pub(crate) fn escape_oracle_literal(s: &str) -> String {
-    format!("N'{}'", s.replace('\'', "''"))
+    // A VARCHAR2 literal, not N'…': Oracle cannot convert NVARCHAR text through the
+    // pinned NLS_DATE_FORMAT's quoted parts (ORA-01830 on a DATE keyset bound).
+    format!("'{}'", s.replace('\'', "''"))
 }
 
 /// Quote `s` as a T-SQL `N'…'` unicode string literal. SQL Server escapes only

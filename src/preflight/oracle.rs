@@ -54,8 +54,9 @@ fn diagnose_oracle(conn: &mut OracleSource, export: &ExportConfig) -> Result<Exp
         .map(std::borrow::Cow::Borrowed)
         .or_else(|| table_from_simple_query(base_query));
     let base_table = base_table_owned.as_deref();
-    // Values and row counts describe the relation only when the export reads it whole.
+    // Values describe the relation only when the export reads it whole; counts need only no row filter.
     let whole_table = strip_select_star_from(base_query);
+    let unfiltered_table = base_table.filter(|_| reads_every_row(base_query));
     for col in key_columns(export) {
         if let Some(fail) = key_column_fail_oracle(conn, base_query, base_table, col) {
             return Err(fail);
@@ -66,7 +67,7 @@ fn diagnose_oracle(conn: &mut OracleSource, export: &ExportConfig) -> Result<Exp
         auto_pk_probe_target(export, base_table).and_then(|t| single_int_pk_oracle(conn, t));
     let range_col = preflight_range_col_resolved(export, auto_pk.as_deref());
 
-    let row_estimate = whole_table.and_then(|t| {
+    let row_estimate = unfiltered_table.and_then(|t| {
         let (owner, table) = crate::sql::oracle_catalog_preds(t);
         scalar_i64(
             conn,
@@ -77,7 +78,7 @@ fn diagnose_oracle(conn: &mut OracleSource, export: &ExportConfig) -> Result<Exp
         )
         .map(|n| n.max(0))
     });
-    let avg_row_bytes = whole_table.and_then(|t| {
+    let avg_row_bytes = unfiltered_table.and_then(|t| {
         let (owner, table) = crate::sql::oracle_catalog_preds(t);
         scalar_i64(
             conn,
@@ -101,7 +102,7 @@ fn diagnose_oracle(conn: &mut OracleSource, export: &ExportConfig) -> Result<Exp
         (None, None)
     };
 
-    let catalog_index = index_probe_target(export, auto_pk.as_deref(), whole_table)
+    let catalog_index = index_probe_target(export, auto_pk.as_deref(), base_table)
         .and_then(|(table, col)| column_has_index_oracle(conn, table, col));
     let db_max_connections = conn
         .query_scalar("SELECT value FROM v$parameter WHERE name = 'processes'")
@@ -124,6 +125,33 @@ fn diagnose_oracle(conn: &mut OracleSource, export: &ExportConfig) -> Result<Exp
             db_max_connections,
         },
     ))
+}
+
+/// Whether a single-table query returns every row of its table (no filter, grouping, set or join).
+fn reads_every_row(query: &str) -> bool {
+    let q = format!(
+        " {} ",
+        query
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase()
+    );
+    ![
+        " where ",
+        " group by ",
+        " having ",
+        " union ",
+        " intersect ",
+        " minus ",
+        " join ",
+        " distinct ",
+        " fetch ",
+        " connect by ",
+        " sample",
+    ]
+    .iter()
+    .any(|kw| q.contains(kw))
 }
 
 /// Validate the query's relations by parsing it; a missing table/column
@@ -278,6 +306,18 @@ mod tests {
         let min = range_bound_sql("MIN", "\"ID\"", "ORDERS");
         assert_eq!(min, "SELECT TO_CHAR(MIN(\"ID\")) AS rivet_agg FROM ORDERS");
         assert!(!min.contains("MAX"));
+    }
+
+    #[test]
+    fn a_column_list_without_a_filter_reads_every_row() {
+        assert!(reads_every_row(
+            "SELECT \"ID\", \"NAME\"\nFROM \"RIVET\".\"ORDERS\""
+        ));
+        assert!(!reads_every_row(
+            "SELECT ID + 1 AS ID FROM ORDERS WHERE ID > 5"
+        ));
+        assert!(!reads_every_row("select distinct a from t"));
+        assert!(!reads_every_row("SELECT a FROM t FETCH FIRST 5 ROWS ONLY"));
     }
 
     #[test]

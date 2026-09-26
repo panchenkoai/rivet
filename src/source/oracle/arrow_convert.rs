@@ -91,6 +91,8 @@ fn number_type(precision: u8, scale: i8) -> RivetType {
             Some(w) => decimal(w, 0),
             None => RivetType::String,
         },
+        // Past 38 digits no Decimal128 holds it: exact text, like a bare NUMBER.
+        (_, s) if s > 38 => RivetType::String,
         (p, s) if s as u8 > p => decimal(s as u8, s),
         (p, s) => decimal(p, s),
     }
@@ -380,6 +382,7 @@ mod tests {
         );
         let dec = |precision, scale| RivetType::Decimal { precision, scale };
         assert_eq!(number_type(3, 5), dec(5, 5), "s > p widens to (s,s)");
+        assert_eq!(number_type(10, 60), RivetType::String, "s > 38: exact text");
         assert_eq!(
             number_type(5, -2),
             dec(7, 0),
