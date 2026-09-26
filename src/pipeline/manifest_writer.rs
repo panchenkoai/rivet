@@ -505,6 +505,12 @@ fn write_manifest_inner(
 
     let manifest_tmp = tempfile::NamedTempFile::new()?;
     std::fs::write(manifest_tmp.path(), &bytes)?;
+    if write_canonical && !matches!(manifest.status, ManifestStatus::Success) {
+        // A prior run's `_SUCCESS` goes BEFORE a non-success canonical lands, so no
+        // reader ever finds the marker beside it; a crash between the two leaves an
+        // incomplete-looking prefix, the safe direction.
+        dest.remove(SUCCESS_FILENAME)?;
+    }
     if write_canonical {
         // The canonical (last-writer-wins) pointer. Updated with `_SUCCESS` only at
         // a run's clean end so the pair never disagrees (round-3 regression fix).
@@ -952,6 +958,31 @@ mod tests {
             ids,
             vec![1, 2, 4, 5],
             "next part id must be max+1 (5) — len-based or max-1 numbering collides"
+        );
+    }
+
+    #[test]
+    fn a_non_success_canonical_retires_the_prior_success_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = local_dest(dir.path());
+        write_manifest(&dest, &build_manifest(ManifestStatus::Success)).unwrap();
+        assert!(dir.path().join(SUCCESS_FILENAME).exists(), "premise");
+        let mut failed = build_manifest(ManifestStatus::Failed);
+        failed.run_id = "run_failed".into();
+        write_manifest(&dest, &failed).unwrap();
+        assert!(!dir.path().join(SUCCESS_FILENAME).exists());
+        let canonical: RunManifest =
+            serde_json::from_slice(&std::fs::read(dir.path().join(MANIFEST_FILENAME)).unwrap())
+                .unwrap();
+        assert_eq!(canonical.status, ManifestStatus::Failed);
+        write_manifest_without_success_marker(&dest, &build_manifest(ManifestStatus::Running))
+            .unwrap();
+        write_manifest(&dest, &build_manifest(ManifestStatus::Success)).unwrap();
+        write_manifest_without_success_marker(&dest, &build_manifest(ManifestStatus::Running))
+            .unwrap();
+        assert!(
+            dir.path().join(SUCCESS_FILENAME).exists(),
+            "a run-unique marker write never touches the canonical pair"
         );
     }
 

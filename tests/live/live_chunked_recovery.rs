@@ -1835,3 +1835,77 @@ fn a_part_write_failing_mid_chunk_counts_the_earlier_parts_plain_parallel() {
 fn a_part_write_failing_mid_chunk_counts_the_earlier_parts_plain_sequential() {
     a_failed_chunks_durable_parts_are_counted(&[], "sink_part_write:1");
 }
+
+// ─── A failed run over a completed prefix retires its _SUCCESS ───────────────────
+
+/// Run once to success, then fail a second run into the SAME prefix; return the prefix's
+/// `_SUCCESS` presence and canonical `manifest.json` status after each run.
+fn success_marker_after_a_failed_rerun(s3: bool) -> [(bool, String); 2] {
+    require_alive(LiveService::Postgres);
+    let table = seed_pg_numeric_table(150);
+    let mut rig = Rig::pg_batch(table.name())
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 50")
+        .export_line("parallel: 2");
+    let prefix = unique_name("stale_success");
+    let bucket = "rivet-qa-stale-success";
+    if s3 {
+        require_alive(LiveService::Minio);
+        ensure_minio_bucket(bucket);
+        rig = rig.dest_s3(bucket, &prefix, MINIO_ENDPOINT);
+    }
+    let env = [
+        ("RIVET_TEST_MINIO_AK", MINIO_ACCESS_KEY),
+        ("RIVET_TEST_MINIO_SK", MINIO_SECRET_KEY),
+        ("AWS_EC2_METADATA_DISABLED", "true"),
+    ];
+    let observe = |rig: &Rig| {
+        let pulled = tempfile::tempdir().unwrap();
+        let dir = if s3 {
+            minio_pull_prefix(bucket, &prefix, pulled.path());
+            pulled.path().to_path_buf()
+        } else {
+            rig.out_dir()
+        };
+        let m: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("manifest.json")).unwrap())
+                .unwrap();
+        (
+            dir.join("_SUCCESS").exists(),
+            m["status"].as_str().unwrap_or_default().to_string(),
+        )
+    };
+    let ok = rig.run_args_env(&[], &env);
+    assert!(
+        ok.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
+    let first = observe(&rig);
+    let mut failing = env.to_vec();
+    failing.push(("RIVET_TEST_ERROR_AT", "chunk_export:1"));
+    let failed = rig.run_args_env(&[], &failing);
+    assert!(!failed.status.success(), "the second run must fail");
+    [first, observe(&rig)]
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_failed_rerun_retires_the_prior_success_marker_local() {
+    assert_eq!(
+        success_marker_after_a_failed_rerun(false),
+        [(true, "success".into()), (false, "failed".into())],
+        "a _SUCCESS beside a failed canonical manifest reads as complete to a sensor"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres + minio"]
+fn a_failed_rerun_retires_the_prior_success_marker_s3() {
+    assert_eq!(
+        success_marker_after_a_failed_rerun(true),
+        [(true, "success".into()), (false, "failed".into())],
+        "a _SUCCESS beside a failed canonical manifest reads as complete to a sensor"
+    );
+}
