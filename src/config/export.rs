@@ -453,6 +453,9 @@ impl ExportConfig {
     /// the `#[serde(default)]` (Zstd) — a literal `compression: zstd` alongside a
     /// profile is indistinguishable from an omitted field and stays silent.
     pub fn effective_compression(&self) -> (CompressionType, Option<u32>) {
+        if self.format == FormatType::Csv {
+            return (CompressionType::None, None);
+        }
         if let Some(profile) = self.compression_profile {
             let explicit_codec =
                 (self.compression != CompressionType::default()).then_some(self.compression);

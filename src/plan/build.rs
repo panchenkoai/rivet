@@ -1006,6 +1006,34 @@ mod tests {
         assert!(!plan.resume);
     }
 
+    #[test]
+    fn a_csv_plan_records_no_compression_because_the_csv_writer_applies_none() {
+        let mut csv = minimal_export();
+        csv.format = crate::config::FormatType::Csv;
+        let plan = build_plan(
+            &minimal_config(),
+            &csv,
+            Path::new("."),
+            false,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(plan.compression.label(), "none");
+        let parquet = build_plan(
+            &minimal_config(),
+            &minimal_export(),
+            Path::new("."),
+            false,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(parquet.compression.label(), "zstd");
+    }
+
     /// #167 Slice C: a `--split` sub-export's plan restricts `base_query` to its
     /// key window `(lo, hi]`, injection-safe, on the base every runner wraps. RED
     /// against a build_plan that ignores `export.split` (base_query stays the raw
