@@ -89,8 +89,10 @@ fn mysql_cdc_a_statement_logged_insert_is_captured_or_refused_never_dropped() {
         );
     } else {
         assert!(
-            said(&out).to_lowercase().contains("statement"),
-            "a refusal must name the statement-logged event:\n{}",
+            said(&out).contains(&format!(
+                "a change to `rivet.{tbl}` was written to the binlog as a SQL STATEMENT"
+            )),
+            "a refusal must name the table and the statement-logged event:\n{}",
             said(&out)
         );
     }
@@ -509,5 +511,36 @@ fn cleanup_source_never_deletes_parts_an_extract_committed_during_the_load() {
     assert!(
         left.is_empty(),
         "with nothing writing, cleanup_source must still remove every part it loaded: {left:?}"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql-cdc (binlog ROW)"]
+fn mysql_cdc_a_statement_logged_insert_into_another_table_does_not_stop_capture() {
+    let tbl = unique_name("aud_stmt_ours");
+    let other = unique_name("aud_stmt_other");
+    let mut c = mysql_cdc_conn(MYSQL_CDC_URL);
+    for t in [&tbl, &other] {
+        c.query_drop(format!("DROP TABLE IF EXISTS {t}")).unwrap();
+        c.query_drop(format!("CREATE TABLE {t} (id INT PRIMARY KEY, v INT)"))
+            .unwrap();
+    }
+    let _guards = (MysqlCdcTable(tbl.clone()), MysqlCdcTable(other.clone()));
+
+    let rig = Rig::mysql_cdc(&tbl);
+    rig.run_ok(); // anchor
+    let mut root = mysql_cdc_conn(MYSQL_CDC_ROOT_URL);
+    root.query_drop("SET SESSION binlog_format = 'STATEMENT'")
+        .unwrap();
+    root.query_drop(format!("INSERT INTO rivet.{other} VALUES (9, 90)"))
+        .unwrap();
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (1, 10)"))
+        .unwrap();
+
+    rig.run_ok();
+    assert_eq!(
+        duckdb_declared_dir_id_set(&rig.out_dir()),
+        [1].into_iter().collect(),
+        "a statement on a table nobody captures must not stop this export's capture"
     );
 }

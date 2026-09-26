@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **MySQL CDC refuses a change to a captured table that was logged as a SQL statement.** A
+  writer session on `binlog_format=STATEMENT` (or MIXED) put its DML in the binlog as text,
+  which the row reader skipped: the run exited 0 with the change missing. It now fails naming
+  the table and the fix; the same statement on a table nobody captures is still skipped.
 - **Parallel keyset incremental no longer skips text keys the source collation ranks higher.**
   Whether anything lay past the anchor was decided by a byte compare in rivet while the source
   orders by its collation: on an `en_US` database 500 new keys `C…` after an anchor `b…` read as
