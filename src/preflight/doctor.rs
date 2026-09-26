@@ -682,6 +682,9 @@ pub(super) fn categorize_dest_error(
     }
 }
 
+/// TLS hint for PostgreSQL and MySQL; every `tls.mode` it names must parse as a `TlsMode`.
+const SQL_TLS_HINT: &str = "TLS handshake failed. Set `tls.ca_file: /path/to/ca-bundle.pem` if your DB uses a private CA, or `tls.mode: require` to encrypt without verifying the certificate; if the server has no TLS at all, `tls.mode: disable` (trusted networks only).";
+
 /// Map a categorised source error (+ raw text) to an actionable hint.
 ///
 /// Returns `None` when nothing more useful than the underlying error
@@ -707,12 +710,7 @@ pub(crate) fn source_error_hint(
         || msg.contains("handshake")
     {
         return Some(match source_type {
-            SourceType::Postgres => {
-                "TLS handshake failed. Try `tls.mode: prefer` (downgrade gracefully) or set `tls.ca_file: /path/to/ca-bundle.pem` if your DB uses a private CA."
-            }
-            SourceType::Mysql => {
-                "TLS handshake failed. Try `tls.mode: prefer` or set `tls.ca_file: /path/to/ca-bundle.pem` to trust the DB's certificate authority."
-            }
+            SourceType::Postgres | SourceType::Mysql => SQL_TLS_HINT,
             SourceType::Mssql => {
                 "TLS handshake failed. SQL Server forces TLS on the login handshake; set `tls.ca_file: /path/to/ca-bundle.pem` to trust a private CA, or `tls.accept_invalid_certs: true` for a self-signed dev cert."
             }
@@ -835,6 +833,34 @@ pub(super) fn destination_error_hint(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_tls_mode_a_tls_hint_names_is_one_the_loader_accepts() {
+        let err = anyhow::anyhow!("TLS handshake failed: certificate verify failed");
+        for engine in [
+            SourceType::Postgres,
+            SourceType::Mysql,
+            SourceType::Mssql,
+            SourceType::Oracle,
+            SourceType::Mongo,
+        ] {
+            let hint = source_error_hint("error", &err, &engine).expect("a TLS hint");
+            for named in hint.split("`tls.mode: ").skip(1) {
+                let mode = named.split('`').next().unwrap();
+                serde_yaml_ng::from_str::<crate::config::TlsMode>(mode).unwrap_or_else(|e| {
+                    panic!(
+                        "{engine:?} hint names `tls.mode: {mode}`, which the loader refuses: {e}"
+                    )
+                });
+            }
+        }
+        assert_eq!(
+            source_error_hint("error", &err, &SourceType::Postgres),
+            Some(
+                "TLS handshake failed. Set `tls.ca_file: /path/to/ca-bundle.pem` if your DB uses a private CA, or `tls.mode: require` to encrypt without verifying the certificate; if the server has no TLS at all, `tls.mode: disable` (trusted networks only)."
+            )
+        );
+    }
 
     #[test]
     fn doctor_transient_failure_classifies_as_retryable_exit_2() {
