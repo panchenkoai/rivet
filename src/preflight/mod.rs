@@ -200,7 +200,7 @@ pub(crate) fn get_export_diagnostic(
         #[cfg(feature = "oracle")]
         SourceType::Oracle => oracle::diagnose_export_oracle(&url, tls, export),
         #[cfg(not(feature = "oracle"))]
-        SourceType::Oracle => return Err(crate::source::oracle_feature_missing()),
+        SourceType::Oracle => Err(crate::source::oracle_feature_missing()),
         SourceType::Mongo => {
             mongo::diagnose_export_mongo(&url, tls, export, config.source.mongo.as_ref())
         }

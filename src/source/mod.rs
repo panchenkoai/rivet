@@ -503,7 +503,7 @@ pub fn create_source(config: &SourceConfig) -> Result<Box<dyn Source>> {
             config.tls.as_ref(),
         )?)),
         #[cfg(not(feature = "oracle"))]
-        SourceType::Oracle => return Err(crate::source::oracle_feature_missing()),
+        SourceType::Oracle => Err(crate::source::oracle_feature_missing()),
         SourceType::Mongo => Ok(Box::new(mongo::MongoSource::connect(
             &url,
             config.tls.as_ref(),

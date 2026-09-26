@@ -600,6 +600,7 @@ impl TableFilter {
     }
 
     /// [`matches`](Self::matches) ignoring case, for Oracle, where an unquoted name folds upper-case.
+    #[cfg_attr(not(feature = "oracle"), allow(dead_code))]
     pub(super) fn matches_folded(&self, name: &str) -> bool {
         let up = |v: &[String]| v.iter().map(|g| g.to_uppercase()).collect();
         TableFilter {
