@@ -205,6 +205,8 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets -- -D warnings
+      - name: Clippy without the optional oracle driver
+        run: cargo clippy --all-targets --no-default-features --features jemalloc -- -D warnings
 
   # Mutation PR gate (docs/mutation-plan.md): mutate ONLY the lines this PR
   # changed and run the lib suite against each mutant. A missed mutant in your

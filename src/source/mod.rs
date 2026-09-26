@@ -54,7 +54,8 @@ impl StatementDurationTimeout {
         }
     }
 
-    /// Oracle client-side statement-duration timeout (no per-statement server limit).
+    /// Oracle statement-duration timeout: the driver call timeout plus a check between rows.
+    #[cfg(feature = "oracle")]
     pub fn oracle(seconds: u64) -> Self {
         Self {
             message: format!(
@@ -421,6 +422,12 @@ pub(crate) fn split_key_list(joined: Option<String>) -> Option<Vec<String>> {
     )
 }
 
+/// The refusal for `source.type: oracle` in a build without the `oracle` feature.
+#[cfg_attr(feature = "oracle", allow(dead_code))]
+pub(crate) fn oracle_feature_missing() -> anyhow::Error {
+    anyhow::anyhow!("source.type: oracle — this rivet was built without the `oracle` feature")
+}
+
 /// A key column list, or `None` when the table has no key.
 pub(crate) fn non_empty_keys(cols: Vec<String>) -> Option<Vec<String>> {
     (!cols.is_empty()).then_some(cols)
@@ -496,9 +503,7 @@ pub fn create_source(config: &SourceConfig) -> Result<Box<dyn Source>> {
             config.tls.as_ref(),
         )?)),
         #[cfg(not(feature = "oracle"))]
-        SourceType::Oracle => {
-            anyhow::bail!("source.type: oracle — this rivet was built without the `oracle` feature")
-        }
+        SourceType::Oracle => return Err(crate::source::oracle_feature_missing()),
         SourceType::Mongo => Ok(Box::new(mongo::MongoSource::connect(
             &url,
             config.tls.as_ref(),

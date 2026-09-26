@@ -200,9 +200,7 @@ pub(crate) fn get_export_diagnostic(
         #[cfg(feature = "oracle")]
         SourceType::Oracle => oracle::diagnose_export_oracle(&url, tls, export),
         #[cfg(not(feature = "oracle"))]
-        SourceType::Oracle => {
-            anyhow::bail!("source.type: oracle — this rivet was built without the `oracle` feature")
-        }
+        SourceType::Oracle => return Err(crate::source::oracle_feature_missing()),
         SourceType::Mongo => {
             mongo::diagnose_export_mongo(&url, tls, export, config.source.mongo.as_ref())
         }
@@ -412,9 +410,7 @@ pub fn check(
         #[cfg(feature = "oracle")]
         SourceType::Oracle => oracle::check_oracle(&url, tls, &exports)?,
         #[cfg(not(feature = "oracle"))]
-        SourceType::Oracle => {
-            anyhow::bail!("source.type: oracle — this rivet was built without the `oracle` feature")
-        }
+        SourceType::Oracle => return Err(crate::source::oracle_feature_missing()),
         SourceType::Mongo => mongo::check_mongo(&url, tls, &exports, config.source.mongo.as_ref())?,
     };
     // #149: measured beats declared — overlay the state store's actuals and

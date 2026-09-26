@@ -433,9 +433,7 @@ pub(crate) fn connect_source_of(
         #[cfg(feature = "oracle")]
         SourceType::Oracle => Box::new(source::oracle::OracleSource::connect_with_tls(url, tls)?),
         #[cfg(not(feature = "oracle"))]
-        SourceType::Oracle => {
-            anyhow::bail!("source.type: oracle — this rivet was built without the `oracle` feature")
-        }
+        SourceType::Oracle => return Err(crate::source::oracle_feature_missing()),
         SourceType::Mongo => Box::new(source::mongo::MongoSource::connect(url, tls, None)?),
     })
 }

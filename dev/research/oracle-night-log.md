@@ -53,3 +53,25 @@ Commit 9514f57f (phase 2a) and c01038d4 (phase 2b):
 Difficulty: the old type-matrix test rendered BC years through the same chrono
 convention as the product, so it agreed with the bug — a self-oracle; fixed the
 renderer and added a DuckDB-rendered check.
+
+Commits de29317b (2c), 5e9abab0 + e4a8e074 (two parallel agents, cherry-picked), ae33d94b (2d):
+| # | finding | fix | test (RED-proven) |
+|---|---|---|---|
+| 13, roast 2 | four `owner.table` parsers disagreed; lower-case `table:` recorded no PK | one `sql::oracle_catalog_preds` | a_lowercase_table_shortcut_records_its_primary_key |
+| roast 3, 17 | lower-case key column: check "Looks good", run ORA-00904 | preflight probes every strategy column, names Oracle's case rule | check_refuses_a_key_column_in_the_wrong_case |
+| roast 1 | query_scalar read raw → driver panic on region TSTZ (chunk_by_days) | every read goes through the projection seam | chunk_by_days_over_a_region_named_tstz_reads_every_row |
+| 14, 15 | unaliased ROWID / unreferenceable names | refused with the alias fix | an_unaliased_rowid_is_refused_with_the_alias_fix |
+| 11,12,21,25-28 | `) AS _rivet*` in shared builders: parallel keyset, reconcile, chunk_dense, range over `query:` all failed | every wrap via `sql::derived` (agent) | 4 live tests (agent, each RED) |
+| 16 | trailing `;` / `-- comment` | `sql::wrappable_query` for every engine (agent) | live + unit |
+| 30 | check "Looks good" after plan build failed | plan-build failure is a Rejected finding (agent) | offline unit |
+| 22 | killed session not retried | `is_oracle_lost_session` → reconnect (agent) | live kill test + 2 unit |
+| 23 | no doctor note without catalog privileges | exact doctor note (agent) | least-privilege live + control |
+| 18 | statement_timeout only between rows (274 s for a 2 s budget) | driver call timeout; server stops the query (0 ACTIVE sessions after) | a_statement_timeout_stops_a_long_query_on_the_server |
+| — (found fixing 18) | describe `WHERE 1 = 0` wrap EXECUTED aggregate queries in full before every export | parse-only describe | same test (RED against the old describe) |
+| 20 | LOB rows: 1.09 GB RSS with a 16 MB budget | 16-row probe/fetch for LOB projections, cap below 500 | wide_clob_rows_stay_within_the_memory_budget (164 MB) |
+| 19 | MIN+MAX in one statement = full index scan | two boundary seeks | unit |
+
+Difficulties:
+- A cherry-pick conflict on the shared test file (both agents appended); resolved by taking HEAD + each agent's appended hunk.
+- `tests/.live-tmp` in the worktree was a real directory, so the DuckDB container read the main checkout's copy → 0 rows; symlinked.
+- The first RED of the timeout test MISSED: warm cache made the fixture query shorter than the ceiling. Fixture made 10x heavier.

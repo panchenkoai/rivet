@@ -379,6 +379,12 @@ fn note_mssql_harm_permission(config: &Config) {
 
 /// Advisory (never a `[FAIL]`): an Oracle user that cannot read V$SYSSTAT / V$SYSTEM_EVENT
 /// gets no harm metrics and no governor pressure, silently.
+#[cfg(not(feature = "oracle"))]
+fn note_oracle_harm_permission(_config: &Config) {}
+
+/// Advisory (never a `[FAIL]`): an Oracle user that cannot read V$SYSSTAT / V$SYSTEM_EVENT
+/// gets no harm metrics and no governor pressure, silently.
+#[cfg(feature = "oracle")]
 fn note_oracle_harm_permission(config: &Config) {
     if config.source.source_type != SourceType::Oracle {
         return;
