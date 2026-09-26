@@ -34,11 +34,13 @@ from pathlib import Path
 
 try:
     from .core import Ledger, have, rivet, run
-    from .scenarios import NO_TIMEOUT, _failed, _passed, _skipped, Scope, work_dir
+    from .duck import Oracle
+    from .scenarios import NO_TIMEOUT, _declared_read, _failed, _passed, _skipped, Scope, work_dir
     from ..pytools.duckcli import ARGV as DUCKDB
 except ImportError:  # pragma: no cover - depends on how the driver is invoked
     from core import Ledger, have, rivet, run  # type: ignore
-    from scenarios import NO_TIMEOUT, _failed, _passed, _skipped, Scope, work_dir  # type: ignore
+    from duck import Oracle  # type: ignore
+    from scenarios import NO_TIMEOUT, _declared_read, _failed, _passed, _skipped, Scope, work_dir  # type: ignore
     DUCKDB = [__import__("sys").executable, str(__import__("pathlib").Path(__file__).resolve().parents[1] / "pytools" / "duckcli.py")]
 
 __all__ = ["verify_corruption_is_detected"]
@@ -471,12 +473,11 @@ def _cdc_corruption_locked(led: Ledger, engine: str, tag: str, url: str, cdc_mod
 #                                 validate  exit 3
 #
 # reconcile compares the SOURCE against the recorded per-partition counts;
-# validate compares the DESTINATION against the manifest. Neither alone verifies
-# "what I can read equals what the source held" — only the pair does, and nothing
-# makes an operator run both. So this cell asserts the DISJUNCTION: each fault
-# must be caught by at least one command, and it reports which. Framed that way an
-# improvement (reconcile learning to check the destination too) does not redden it,
-# while a regression — a fault neither notices — does.
+# validate compares the DESTINATION against the manifest. Each tool is asserted
+# on its OWN exit code for the fault it owns: the earlier disjunction ("caught by
+# at least one") let a regression in one tool hide behind the other. Then the
+# documented recovery for a reconcile-flagged range (`rivet repair --execute`) is
+# driven and graded by DuckDB over the declared parts against the source.
 
 
 def verify_reconcile_and_validate_cover_both_sides(led: Ledger, engine: str, tag: str, url: str) -> None:
@@ -519,7 +520,7 @@ def verify_reconcile_and_validate_cover_both_sides(led: Ledger, engine: str, tag
     if not psql(
         "DROP TABLE IF EXISTS recon_probe; "
         "CREATE TABLE recon_probe(id INT PRIMARY KEY, v TEXT); "
-        "INSERT INTO recon_probe SELECT g,'v'||g FROM generate_series(1,1000) g;"
+        "INSERT INTO recon_probe SELECT g,'v'||g FROM generate_series(1,1000) g WHERE g NOT BETWEEN 500 AND 549;"
     ):
         _skipped(led, engine, tag, "reconcile_and_validate_cover_both_sides", "-", "reconcile-coverage: psql absent", "no psql")
         return
@@ -544,36 +545,65 @@ def verify_reconcile_and_validate_cover_both_sides(led: Ledger, engine: str, tag
             )
             return
 
-        # Fault 1 — the SOURCE drifts under a completed export.
+        # Fault 1 — the SOURCE drifts under a completed export: reconcile's fault, not validate's.
         psql("DELETE FROM recon_probe WHERE id BETWEEN 100 AND 149;")
         r1, v1 = rec(), val()
         psql("INSERT INTO recon_probe SELECT g,'v'||g FROM generate_series(100,149) g;")
 
-        # Fault 2 — exported DATA disappears from the destination.
+        # Fault 2 — exported DATA disappears from the destination: validate's fault.
         parts = sorted(out.rglob("*.parquet"))
         if not parts:
             _failed(led, engine, tag, "reconcile_and_validate_cover_both_sides", "-", "reconcile-coverage: no part", "no part")
             return
+        saved = parts[0].read_bytes()
         parts[0].unlink()
         r2, v2 = rec(), val()
+        parts[0].write_bytes(saved)
 
-        missed = []
-        if r1 == 0 and v1 == 0:
-            missed.append("source drift went unnoticed by BOTH reconcile and validate")
-        if r2 == 0 and v2 == 0:
-            missed.append("a deleted destination part went unnoticed by BOTH reconcile and validate")
-        if missed:
+        # Recovery — rows that reached the source inside an exported range after the
+        # export (the hole seeded at 500..549) are what reconcile flags and repair re-exports.
+        psql("INSERT INTO recon_probe SELECT g,'v'||g FROM generate_series(500,549) g;")
+        r3 = rec()
+        rp = rivet("repair", "-c", str(cfg), "-e", name, "--execute", env=env, timeout=NO_TIMEOUT)
+        r4, v4 = rec(), val()
+        lst = _declared_read(out, ".parquet")
+        diff = "nothing declared"
+        if lst is not None:
+            with Oracle(postgres=url) as o:
+                q = f"SELECT DISTINCT id, v FROM read_parquet({lst})"
+                src_q = "SELECT id, v FROM pg.public.recon_probe"
+                diff = o.scalar(
+                    f"SELECT (SELECT count(*) FROM ({src_q} EXCEPT {q}))||' missing, '||"
+                    f"(SELECT count(*) FROM ({q} EXCEPT {src_q}))||' extra'"
+                )
+
+        fails = []
+        if r1 != EXIT_DATA_INTEGRITY:
+            fails.append(f"source drift: reconcile exit {r1}, want {EXIT_DATA_INTEGRITY}")
+        if v1 != 0:
+            fails.append(f"source drift: validate exit {v1}, want 0 (the destination is intact)")
+        if v2 != EXIT_DATA_INTEGRITY:
+            fails.append(f"deleted part: validate exit {v2}, want {EXIT_DATA_INTEGRITY}")
+        if r3 != EXIT_DATA_INTEGRITY:
+            fails.append(f"late rows: reconcile exit {r3}, want {EXIT_DATA_INTEGRITY} (nothing for repair to act on)")
+        if not rp.ok:
+            fails.append(f"repair --execute exit {rp.returncode}: {rp.stderr.strip()[-160:]}")
+        if r4 != 0 or v4 != 0:
+            fails.append(f"after repair: reconcile exit {r4}, validate exit {v4}, want 0/0")
+        if diff != "0 missing, 0 extra":
+            fails.append(f"after repair: DuckDB declared parts vs source: {diff}")
+        if fails:
             _failed(
                 led, engine, tag, "reconcile_and_validate_cover_both_sides", "-",
-                "reconcile-coverage: " + "; ".join(missed),
-                "uncovered",
+                "reconcile-coverage: " + "; ".join(fails),
+                "; ".join(fails)[:200],
             )
             return
         _passed(
             led, engine, tag, "reconcile_and_validate_cover_both_sides", "-",
-            f"reconcile-coverage: source drift caught by "
-            f"{'reconcile' if r1 else 'validate'} (exit {r1 or v1}); destination loss caught by "
-            f"{'validate' if v2 else 'reconcile'} (exit {v2 or r2}) — both sides covered by the pair",
+            f"reconcile-coverage: source drift -> reconcile 3 / validate 0; deleted part -> "
+            f"validate 3 (reconcile {r2}); late rows -> reconcile 3, repair --execute -> "
+            f"reconcile 0 / validate 0, declared parts == source ({diff})",
         )
     finally:
         psql("DROP TABLE IF EXISTS recon_probe;")

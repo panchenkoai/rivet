@@ -589,7 +589,7 @@ exclude_re = [
     # length 7 on the alphabet `",.ax` — 97 655 inputs, ZERO differing outputs. The
     # SIBLING mutant on the same line (`replace + with -`, the lookahead reading
     # backward) differs on 5 580 of them, shortest witness `"",`, and is graded by
-    # `a_truncate_is_recognised_and_refused_only_for_the_captured_tables` with a
+    # `a_truncate_is_recognised_across_a_relation_list_and_refused_only_for_ours` with a
     # name ending in an escaped quote (`"a"""`) — so this exclusion is scoped to the
     # guard alone and does not blanket the line.
     "replace match guard in_quotes .* in split_top_level_commas",

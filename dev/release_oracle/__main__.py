@@ -59,6 +59,7 @@ from . import (
     scenarios,
     shared_state,
     state_parity,
+    tls_downgrade,
     warehouse_layout,
 )
 
@@ -390,6 +391,7 @@ def preflight(led: Ledger, *, bless_gifs: bool = False) -> None:
     # infrastructure first (skip loudly, never a vacuous pass).
     scenarios.verify_network_faults(led)
     scenarios.verify_tls_required(led)
+    tls_downgrade.verify_tls_downgrade_refused(led)
     scenarios.verify_auth(led)
     scenarios.verify_cdc_standby(led)
     scenarios.verify_live_only_coverage(led)

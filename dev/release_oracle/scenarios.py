@@ -743,7 +743,7 @@ def _export_local(
     )
     shutil.rmtree(dest_dir, ignore_errors=True)
     if engine == "mongo":
-        mode = "full"  # Mongo has no keyset/chunked — full scan only
+        mode = "full"  # Mongo keyset is `source.mongo.page_size` (+ `parallel`), not chunk_by_key — see mongo_keyset.py
     key_block = "    mode: full"
     if mode == "chunked":
         key_block = "    mode: chunked\n    chunk_by_key: id\n    chunk_size: 50000"
@@ -976,7 +976,7 @@ def sc_keyset_parallel(led: Ledger, engine: str, tag: str, url: str) -> None:
     if engine == "mongo":
         _skipped(
             led, engine, tag, "keyset_parallel", "-",
-            "keyset_parallel[mongo]: separate _id-range path (mongo_parallel), not SQL keyset",
+            "keyset_parallel[mongo]: graded by the mongo_keyset cell (page_size + parallel -> mongo_parallel)",
             "mongo na",
         )
         return
@@ -1144,6 +1144,10 @@ def run_scenarios(led: Ledger, engine: str, tag: str, url: str) -> None:
         return
     with led.span(f"{engine}: keyset_parallel"):
         sc_keyset_parallel(led, engine, tag, url)
+    if engine == "mongo":
+        from . import mongo_keyset
+
+        mongo_keyset.sc_mongo_keyset(led, engine, tag, url)
     # The one integrity column a reader is asked to trust, checked by something
     # that is not rivet — see rowhash.py for why the in-tree auditor cannot.
     from . import corruption, rowhash
@@ -1685,6 +1689,14 @@ def verify_pool_split(led: Ledger) -> None:
     not bundled invisibly into the pool cell. Needs toxiproxy (:8474) + postgres
     (:5432); SKIP when down.
     """
+    if not have("cargo"):
+        _skipped(led, "pool", "split", "-", "-", "pool split: cargo absent", "no cargo")
+        return
+    for port, what in ((8474, "toxiproxy"), (5432, "source postgres")):
+        if not _tcp_open("127.0.0.1", port):
+            _skipped(led, "pool", "split", "-", "-",
+                     f"pool split: no {what} :{port} (docker compose up -d)", f"no {what}")
+            return
     _run_pool_module(
         led,
         test_filter="live_pool_toxiproxy::pool_split",

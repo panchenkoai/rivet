@@ -55,10 +55,10 @@ use xxhash_rust::xxh3::{Xxh3, xxh3_64};
 use crate::error::Result;
 
 /// Side B — order-independent per-column checksum over a built batch: `xxh3` of
-/// each cell's **value bytes**, XOR-combined. int/uint/float/decimal128/date/
-/// timestamp(µs) → little-endian value bytes; bool → a 0/1 byte; utf8/binary → the
-/// raw bytes. Uncovered types (Time64, FixedSizeBinary/UUID, List, ns-timestamps)
-/// contribute 0 on BOTH sides. Hashing every cell (vs the old value-sum) makes the
+/// each cell's **value bytes**, combined by a wrapping sum (`Fold::Sum`). Coverage is
+/// declared once in `check_rule`; an uncovered type (ns-timestamps, lists of an
+/// unmatched element type, anything unlisted) contributes 0 on BOTH sides. Hashing
+/// every cell (vs the old value-sum) makes the
 /// check sensitive to **content** corruption that preserves length or sum — a byte
 /// flip, or two compensating changes — which a sum/length silently misses.
 pub fn arrow_batch_checksums(batch: &RecordBatch) -> Vec<u64> {
