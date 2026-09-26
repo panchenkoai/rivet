@@ -362,6 +362,7 @@ fn dispatch_cdc(a: CdcArgs) -> Result<()> {
                 // The ad-hoc CLI has no `columns:` surface; config-driven runs do.
                 overrides: crate::types::ColumnOverrides::new(),
                 // Likewise no `row_hash:` surface — a hash's covered column set is
+                partition: None,
                 // a contract the warehouse table carries, which needs a config file
                 // to declare.
                 row_hash: crate::config::RowHash::All(false),
@@ -383,6 +384,7 @@ fn dispatch_cdc(a: CdcArgs) -> Result<()> {
             // supported path, and the one the sweep and the load read — passes its
             // store, so every part reaches the database as it becomes durable.
             state: None,
+            schema_gate: None,
         },
         &__cdc_read_bytes,
     )

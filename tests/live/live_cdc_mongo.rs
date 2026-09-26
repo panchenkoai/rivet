@@ -1200,3 +1200,46 @@ fn mongo_cdc_captures_a_dotted_collection_without_swallowing_its_sibling() {
     m.drop_collection(&dotted);
     m.drop_collection("orders");
 }
+
+#[test]
+#[ignore = "live: requires docker compose --profile replica up -d mongo-rs2-a mongo-rs2-b"]
+fn mongo_cdc_streams_changes_from_a_secondary() {
+    for port in [27022u16, 27023] {
+        assert!(
+            std::net::TcpStream::connect_timeout(
+                &format!("127.0.0.1:{port}").parse().unwrap(),
+                std::time::Duration::from_millis(500),
+            )
+            .is_ok(),
+            "fixture: the rs2 replica set is not up on :{port}"
+        );
+    }
+    require_alive(LiveService::DuckDb);
+    let db = unique_name("cdc_secondary");
+    let primary = MongoTest::connect(27022, &db);
+    let secondary = MongoTest::connect(27023, &db);
+    primary.drop_collection("t");
+    let url = format!("{}&readPreference=secondary", MongoTest::url(27023, &db));
+    let rig = Rig::mongo_cdc("t").source_url(&url).duckdb_oracle();
+    rig.run_ok(); // anchor, on the secondary
+
+    primary.upsert_set("t", 1, "v", "a");
+    primary.upsert_set("t", 2, "v", "b");
+    for _ in 0..60 {
+        if secondary.count("t") == 2 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    assert_eq!(
+        secondary.count("t"),
+        2,
+        "fixture: both documents reached the secondary"
+    );
+    rig.run_ok();
+    let ids = duckdb_declared_distinct_set(rig.oracle_dir(), "_id");
+    assert!(
+        ["1", "2"].iter().all(|i| ids.contains(*i)),
+        "both changes written on the primary must be captured from the secondary: got {ids:?}"
+    );
+}

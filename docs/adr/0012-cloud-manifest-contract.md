@@ -294,3 +294,21 @@ Sequencing note: M10 touches the manifest write path, the state store, and every
 engine's ack path. It is the largest of the four CDC amendments dated 2026-08-27
 (the others are in ADR-0023 and ADR-0025) and the one most likely to need its own
 ADR before code.
+
+## Amendment 2026-09-26: what M1, M2 and M8 do today
+
+**M1.** Recovery without a destination manifest rebuilds the committed parts from the state
+DB (completed chunk tasks, `file_log`) and uses the destination listing only to confirm they
+are present: a missing part's chunk is reset and re-exported in the same run (keyset refuses
+instead). Listed parts the state DB does not name are not adopted. When the listing fails,
+the parts are declared from the state DB with a warning.
+
+**M2.** Resume-time re-verification is not implemented for the chunked runners. They mark the
+chunk run completed before the dispatcher writes the manifest, so a crash between the
+manifest and `_SUCCESS` makes `--resume` plan afresh and re-export. `--pool --split` repairs a
+missing marker only when the completed units' windows tile. The writer-side order (manifest
+before `_SUCCESS`) holds.
+
+**M8.** The per-part decision matrix (`apply_m8_resume_decisions`) runs only in the two
+chunked-checkpoint runners, and only against a manifest carrying this run's `run_id`. Single,
+plain chunked, keyset and `mongo_parallel` have no per-part matrix.

@@ -74,6 +74,58 @@ fn cdc_ignored_meta_warning(export: &ExportConfig) -> Option<String> {
     })
 }
 
+/// The run-start warning naming batch-only knobs a CDC export set: the drain ignores them.
+fn cdc_ignored_knobs_warning(export: &ExportConfig) -> Option<String> {
+    let set = [
+        ("quality", export.quality.is_some()),
+        ("parquet", export.parquet.is_some()),
+        (
+            "compression",
+            export.compression != crate::config::CompressionType::default(),
+        ),
+        ("compression_level", export.compression_level.is_some()),
+        ("compression_profile", export.compression_profile.is_some()),
+        ("max_file_size", export.max_file_size.is_some()),
+        (
+            "shape_drift_warn_factor",
+            export.shape_drift_warn_factor.is_some(),
+        ),
+        ("skip_empty", export.skip_empty),
+    ];
+    let named: Vec<&str> = set.iter().filter(|(_, on)| *on).map(|(k, _)| *k).collect();
+    (!named.is_empty()).then(|| {
+        format!(
+            "export '{}': mode: cdc ignores {} on the change stream — the drain writes its own \
+             parts (fixed compression per format, rolled by `cdc.rollover`) and runs no quality checks. They apply only \
+             to an `initial: snapshot` / `backfill:` baseline. Remove them, or use a batch mode \
+             if the captured changes need them.",
+            export.name,
+            named.join(", ")
+        )
+    })
+}
+
+/// The run-start warning for `run --validate` / `--reconcile` on a CDC export: the drain skips both.
+pub(super) fn cdc_ignored_run_flags_warning(
+    export: &str,
+    validate: bool,
+    reconcile: bool,
+) -> Option<String> {
+    let named: Vec<&str> = [("--validate", validate), ("--reconcile", reconcile)]
+        .iter()
+        .filter(|(_, on)| *on)
+        .map(|(k, _)| *k)
+        .collect();
+    (!named.is_empty()).then(|| {
+        format!(
+            "export '{export}': {} checks only an `initial: snapshot` / `backfill:` baseline — \
+             the change stream is not validated or reconciled by `rivet run`. Run `rivet \
+             validate` over the destination to check the captured parts.",
+            named.join(" and ")
+        )
+    })
+}
+
 pub(super) fn run_cdc_export(
     config_path: &str,
     config: &Config,
@@ -82,7 +134,13 @@ pub(super) fn run_cdc_export(
 ) -> (Result<()>, RunSummary) {
     // No-silent-config-drop: warn (don't hard-fail — a shared default may set
     // meta_columns for a mixed batch+CDC config) that the request has no effect.
-    if let Some(msg) = cdc_ignored_meta_warning(export) {
+    for msg in [
+        cdc_ignored_meta_warning(export),
+        cdc_ignored_knobs_warning(export),
+    ]
+    .into_iter()
+    .flatten()
+    {
         log::warn!("{msg}");
     }
     let started = std::time::Instant::now();
@@ -152,6 +210,12 @@ pub(super) fn run_cdc_export(
     // memory is the rollover buffer + the spill, and the ledger recorded 0.
     let rss_before = crate::resource::get_rss_mb();
     let rss_sampler = crate::resource::RssPeakSampler::start(rss_before, 100);
+    // Open forensics + the source-harm bracket, as the batch tail takes them: a
+    // failed drain still records the server it ran against and what it cost it.
+    let server_context = crate::source::create_source(&config.source)
+        .ok()
+        .and_then(|mut s| s.server_context());
+    let harm = super::job::HarmBracket::open(&config.source);
     let result = run_cdc_inner(config, export, &run_id, state, &read_bytes, config_dir);
     let duration_ms = started.elapsed().as_millis() as i64;
     let peak_rss_mb = rss_sampler
@@ -190,6 +254,15 @@ pub(super) fn run_cdc_export(
         outcome.as_ref().err().map(crate::redact::redact_error),
     );
     summary.peak_rss_mb = peak_rss_mb;
+    summary.server_context_json = server_context;
+    let harm_deltas = harm.close(&config.source, state, &mut summary);
+    if let Some(line) = super::job::run_diagnosis(
+        &summary,
+        &harm_deltas,
+        super::run::multi_export_concurrent(),
+    ) {
+        log::warn!("{line}");
+    }
 
     // Transition the ledger to the CDC run's terminal status (mirrors the batch
     // path). A crash before here leaves the row `running`; the next CDC run
@@ -231,6 +304,7 @@ pub(super) fn run_cdc_export(
 
     record_metric(state, config, export, &summary);
     finalize_run_report(config_path, &summary, "cdc");
+    crate::notify::maybe_send(config.notifications.as_ref(), &summary);
     (outcome, summary)
 }
 
@@ -629,6 +703,15 @@ pub(crate) fn dest_for_table(
 /// Returns what the drain made DURABLE paired with its outcome — never one
 /// without the other. See `sink::run_to_files`.
 #[allow(clippy::too_many_arguments)]
+/// The schema-baseline key of one captured table: the export alone, or `export/table` when one stream captures several.
+fn cdc_drift_key(export: &str, table: &str, multi: bool) -> String {
+    if multi {
+        format!("{export}/{table}")
+    } else {
+        export.to_string()
+    }
+}
+
 fn run_cdc_inner(
     config: &Config,
     export: &ExportConfig,
@@ -708,6 +791,7 @@ fn run_cdc_inner(
             dest_uri: u.clone(),
             overrides: crate::types::overrides_for_unit(&all_overrides, Some(t)),
             row_hash: export.meta_columns.row_hash.clone(),
+            partition: crate::plan::build::cdc_partition_rollover(config, export, t),
         })
         .collect();
     let now = chrono::Utc::now().to_rfc3339();
@@ -747,6 +831,10 @@ fn run_cdc_inner(
         );
     }
 
+    let schema_gate = |table: &str, cols: &[crate::types::TypeMapping]| {
+        let key = cdc_drift_key(&export.name, table, multi);
+        super::schema_drift::check_from_cdc_mappings(state, &key, cols, export.on_schema_drift)
+    };
     run_capture(
         CdcCapture {
             export_name: export.name.clone(),
@@ -805,6 +893,7 @@ fn run_cdc_inner(
             run_id: run_id.to_string(),
             started_at: now,
             state: Some(state),
+            schema_gate: Some(&schema_gate),
         },
         read_bytes,
     )
@@ -890,6 +979,7 @@ fn cdc_metric_row(
             .as_deref()
             .and_then(classify_error_message)
             .map(str::to_string),
+        server_context_json: summary.server_context_json.clone(),
         ..Default::default()
     }
 }
@@ -1072,6 +1162,19 @@ mod tests {
     }
 
     #[test]
+    fn cdc_metric_row_carries_the_server_context() {
+        let export = crate::config::sample_export("t");
+        let mut summary =
+            super::cdc_summary("r1", &export, "failed", 0, 0, 0, 0, 50, Some("boom".into()));
+        summary.server_context_json = Some(r#"{"version":"8.0"}"#.into());
+        let row = super::cdc_metric_row(&summary, None, None);
+        assert_eq!(
+            row.server_context_json.as_deref(),
+            Some(r#"{"version":"8.0"}"#)
+        );
+    }
+
+    #[test]
     fn cdc_warns_when_meta_columns_are_requested_on_a_cdc_export() {
         let mut e = crate::config::sample_export("orders");
         // No meta columns → no warning.
@@ -1101,6 +1204,43 @@ mod tests {
             cdc_ignored_meta_warning(&e).is_none(),
             "row_hash is emitted on the CDC leg now, so claiming it is ignored would be a lie"
         );
+    }
+
+    #[test]
+    fn cdc_names_every_batch_only_knob_it_ignores_and_only_those() {
+        let mut e = crate::config::sample_export("orders");
+        e.compression = crate::config::CompressionType::default();
+        assert!(
+            cdc_ignored_knobs_warning(&e).is_none(),
+            "defaults must not warn"
+        );
+        e.quality = serde_yaml_ng::from_str("row_count_min: 1").ok();
+        e.compression = crate::config::CompressionType::Gzip;
+        e.max_file_size = Some("256MB".into());
+        let msg = cdc_ignored_knobs_warning(&e).expect("set knobs must warn");
+        assert!(
+            msg.contains("ignores quality, compression, max_file_size on the change stream"),
+            "names exactly the set knobs, in order: {msg}"
+        );
+        assert!(msg.contains("'orders'"), "names the export: {msg}");
+        e.skip_empty = true;
+        let msg = cdc_ignored_knobs_warning(&e).expect("set knobs must warn");
+        assert!(
+            msg.contains("max_file_size, skip_empty on the change stream"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn cdc_warns_that_run_validate_and_reconcile_skip_the_change_stream() {
+        assert!(cdc_ignored_run_flags_warning("orders", false, false).is_none());
+        let msg = cdc_ignored_run_flags_warning("orders", true, true).expect("must warn");
+        assert!(
+            msg.starts_with("export 'orders': --validate and --reconcile checks only"),
+            "names both flags: {msg}"
+        );
+        let msg = cdc_ignored_run_flags_warning("orders", false, true).expect("must warn");
+        assert!(msg.contains("'orders': --reconcile checks only"), "{msg}");
     }
 
     // The snapshot (batch) leg and the CDC stream are two legs of ONE dataset the
@@ -1542,6 +1682,20 @@ mod tests {
             cdc_rollover_memory_bytes(Some(32)),
             Some(32 * 1024 * 1024),
             "a configured value is megabytes, converted — not passed through raw"
+        );
+    }
+
+    #[test]
+    fn one_captured_table_keeps_the_export_key_several_get_their_own() {
+        assert_eq!(cdc_drift_key("orders", "orders", false), "orders");
+        assert_eq!(
+            cdc_drift_key("shop", "public.orders", true),
+            "shop/public.orders"
+        );
+        assert_ne!(
+            cdc_drift_key("shop", "a", true),
+            cdc_drift_key("shop", "b", true),
+            "two tables of one stream must not share a baseline"
         );
     }
 }

@@ -57,6 +57,7 @@ try:  # imported as part of the package
         Proc,
         container_for_port,
         docker_exec,
+        note_invariant_violations,
         port_of,
         rivet,
         rivet_bin,
@@ -72,6 +73,7 @@ except ImportError:  # run directly out of dev/release_oracle/
         Proc,
         container_for_port,
         docker_exec,
+        note_invariant_violations,
         port_of,
         rivet,
         rivet_bin,
@@ -1156,6 +1158,7 @@ def _differential_engine(led: "Ledger", eng: str, runner: Path) -> None:
                     capture_output=True, text=True, timeout=900,
                     env={**os.environ, "RIVET_BIN": str(rivet_bin())},
                 )
+                note_invariant_violations([str(runner), eng, scen], (r.stdout or "") + (r.stderr or ""))
             except subprocess.TimeoutExpired as t:
                 led.failed(eng, "cdc", f"differential:{scen}", "-",
                            f"differential[{eng}/{scen}]: harness HUNG past 900s — a "

@@ -2,6 +2,76 @@
 
 ## Unreleased
 
+- **CDC keeps each change part inside a load job's partition budget.** Under the `log_view`
+  layout the change log is partitioned, and BigQuery writes at most 4,000 partitions per load
+  job. The CDC drain wrote each flush as one part with no partition count in its footer, so a
+  flush of changes to rows scattered over more than 4,000 days could be refused at load. The
+  drain now cuts a flush at the budget and notes each part, like the batch writer (verified
+  on MySQL, PostgreSQL and SQL Server). MongoDB's change parts carry no date column, and the
+  run now says so instead of shipping them unbudgeted in silence.
+- **Chunked exports record their partition count in every part again.** The chunked,
+  parallel-chunked and parallel-checkpoint runners closed each part without the
+  `rivet.partition_buckets` footer note, so `rivet load` fell back to the part's min/max
+  date span — a wider bound than the part really holds, which can refuse a load that fits.
+  Every runner now closes parts the same way, and a live test reads every part's footer.
+- **SQL Server CDC refuses a checkpoint from another database or from before a restore.**
+  The checkpoint held only an LSN, which every database accepts: pointed at another server's
+  database, a run resumed there, exited 0 and captured nothing, skipping that database's
+  changes. The checkpoint now records the database's `family_guid` and `recovery_fork_guid`.
+  rivet refuses a different family (another database) or a changed fork (a `RESTORE`), and
+  still follows an availability-group failover, whose replicas share both.
+- **A CDC run sends its notifications and says which batch settings it ignores.** A failed CDC
+  run never reached `notifications:`, so an `on: [failure]` webhook stayed silent while the
+  stream was down. It now fires like a batch run's. `quality:`, `parquet:`, `compression*`,
+  `max_file_size`, `shape_drift_warn_factor` and `skip_empty` apply only to a CDC export's snapshot baseline,
+  and `run --validate` / `--reconcile` likewise check only the baseline; each run now warns,
+  naming the ones that were set. A CDC run now also records the source server it ran against
+  (even when it fails) and the source-harm counters of its window, with the same DIAGNOSIS line
+  a batch run prints.
+- **The release gate grades what it used to wave through.** A run that bypasses the
+  run-integrity facade only warns in a release build, and the gate now fails on that warning.
+  Without `cargo-llvm-cov` the offline battery still runs and is graded instead of skipping.
+- **Reading CDC from a replica is verified on every engine.** Live tests and release-gate rows
+  now cover a PostgreSQL 16 standby (continuous mode; the default bounded mode still refuses,
+  and its message no longer claims a standby cannot host a slot), a SQL Server read-scale
+  availability group's readable secondary, and a MongoDB secondary, beside MySQL's re-logging
+  replica. The CDC reference says, per engine, what the replica needs and what proves it.
+- **MySQL CDC refuses a replica that does not re-log what it applies.** With
+  `log_replica_updates = OFF` (MySQL's default) a replica's binlog holds none of the primary's
+  changes; reading it captured nothing and exited 0. rivet now refuses such a replica at start.
+  MySQL only: the other engines have no such setting to get wrong.
+- **SQL Server incremental exports work on a legacy `DATETIME` cursor.** The saved boundary was
+  rendered with six fractional digits, which `DATETIME` rejects, so every run after the first
+  failed with `Conversion failed`. A rivet-rendered timestamp cursor is now typed `DATETIME2(7)`,
+  and a `DATETIME` value is read to its nearest microsecond (its 1/300 s tick has no exact one) in
+  batch and CDC alike, so the boundary row is not re-exported.
+- **`rivet compact` carries a column the source gained into the base.** After an `ADD COLUMN`
+  at the source, the BigQuery MERGE named the new column while the base lacked it and failed
+  with a raw `Unrecognized name`, on this and every later compact. The base now gets
+  `ADD COLUMN IF NOT EXISTS` before any MERGE.
+- **CDC refuses a captured table or collection that was dropped.** MySQL skipped `DROP TABLE`
+  and MongoDB skipped `drop`/`rename`/`dropDatabase`, so the destination kept the removed rows
+  live and a table re-created under the same name continued the old history as one table. Both
+  now fail naming the object and the recovery order; the same DDL on something nobody captures
+  is still skipped.
+- **MySQL CDC refuses a change to a captured table that was logged as a SQL statement.** A
+  writer session on `binlog_format=STATEMENT` (or MIXED) put its DML in the binlog as text,
+  which the row reader skipped: the run exited 0 with the change missing. It now fails naming
+  the table and the fix; the same statement on a table nobody captures is still skipped.
+- **Parallel keyset incremental no longer skips text keys the source collation ranks higher.**
+  Whether anything lay past the anchor was decided by a byte compare in rivet while the source
+  orders by its collation: on an `en_US` database 500 new keys `C…` after an anchor `b…` read as
+  "nothing new" and the run exported 0 of them with status success. The source now answers the
+  question itself (`MAX(key) … WHERE key > anchor`).
+- **`cleanup_source` no longer deletes parts an extract committed during the load.** The load
+  checked for a running extract before appending, then deleted the whole prefix after it; an
+  extract that started and committed in between lost its parts after the source position had
+  moved past them (measured: 51 of 52 rows reached BigQuery). Cleanup now deletes exactly the
+  files of runs already loaded (or superseded, on a full load) that nobody is writing.
+- **`on_schema_drift` now applies to CDC exports.** A CDC run never consulted it: a column
+  retyped between runs wrote parts with different types into one prefix and exited 0 under
+  `fail`. Each captured table's schema is now checked before the stream reads a change, so a
+  refusal acknowledges nothing and switching to `warn` captures every deferred change.
 - **`rivet load` into ClickHouse** (ADR-0035; the loader started from
   @ssyusyukalov's #145). `load: { target: clickhouse, url, database, user,
   password_env }`, or `rivet init --clickhouse-url … --clickhouse-database …`. A

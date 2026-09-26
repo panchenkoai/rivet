@@ -48,11 +48,11 @@ from typing import Callable
 from pathlib import Path
 
 try:
-    from .core import Ledger, have, run
+    from .core import Ledger, have, run, note_invariant_violations
     from .scenarios import NO_TIMEOUT, _failed, _passed, _skipped, work_dir
     from ..pytools.duckcli import ARGV as DUCKDB
 except ImportError:  # pragma: no cover - depends on how the driver is invoked
-    from core import Ledger, have, run  # type: ignore
+    from core import Ledger, have, run, note_invariant_violations  # type: ignore
     from scenarios import NO_TIMEOUT, _failed, _passed, _skipped, work_dir  # type: ignore
     DUCKDB = [sys.executable, str(Path(__file__).resolve().parents[1] / "pytools" / "duckcli.py")]
 
@@ -166,6 +166,7 @@ def _run_writers(cfgs: list[Path], state_url: str | None) -> tuple[list[int], st
     exits, chatter = [], []
     for c, p in procs:
         out, _ = p.communicate()
+        note_invariant_violations([str(c)], out or "")
         exits.append(p.returncode)
         if p.returncode != 0:
             chatter.append(f"{c.name}: {(out or '').strip().splitlines()[-1] if out else '(silent)'}")

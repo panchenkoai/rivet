@@ -114,6 +114,38 @@ fn should_split(written: u64, max_file_size: Option<u64>, part_rows: usize) -> b
     max_file_size.is_some_and(|max| written >= max) && part_rows > 0
 }
 
+/// Each row's partition bucket in `batch` under `rollover`; `None` when the batch lacks
+/// the column or it is not a date/timestamp. Shared with the CDC drain.
+pub(crate) fn batch_partition_buckets(
+    batch: &RecordBatch,
+    rollover: &crate::plan::rollover::PartitionRollover,
+) -> Option<Vec<i64>> {
+    let idx = batch.schema().index_of(&rollover.column).ok()?;
+    let unit = partition_unit_of(batch.schema().field(idx).data_type())?;
+    column_buckets(batch.column(idx).as_ref(), unit, rollover.granularity)
+}
+
+/// The partition bucket of every value of `col`, NULL rows in the NULL bucket.
+fn column_buckets(
+    col: &dyn arrow::array::Array,
+    unit: PartitionUnit,
+    granularity: crate::config::load::Granularity,
+) -> Option<Vec<i64>> {
+    use crate::plan::rollover::{NULL_BUCKET, bucket_of, to_epoch_seconds};
+    let raw = partition_values(col)?;
+    Some(
+        (0..col.len())
+            .map(|row| {
+                if col.is_null(row) {
+                    NULL_BUCKET
+                } else {
+                    bucket_of(to_epoch_seconds(raw[row], unit), granularity)
+                }
+            })
+            .collect(),
+    )
+}
+
 /// The unit an Arrow date/timestamp type stores, or `None` for a type no warehouse
 /// partitions by — the signal `on_schema` turns into a warning rather than silence.
 fn partition_unit_of(data_type: &arrow::datatypes::DataType) -> Option<PartitionUnit> {
@@ -222,22 +254,10 @@ impl PartBudget {
     /// against. `None` when this export is not budgeted (no column partition, or the
     /// column is absent / not a date) — the caller then writes the batch unchanged.
     fn buckets_for(&self, batch: &RecordBatch) -> Option<(Vec<i64>, usize)> {
-        use crate::plan::rollover::{NULL_BUCKET, bucket_of, to_epoch_seconds};
         let (idx, unit) = self.col?;
-        let granularity = self.rollover.as_ref()?.granularity;
-        let cap = self.rollover.as_ref()?.cap;
-        let col = batch.column(idx);
-        let raw = partition_values(col.as_ref())?;
-        let buckets = (0..batch.num_rows())
-            .map(|row| {
-                if col.is_null(row) {
-                    NULL_BUCKET
-                } else {
-                    bucket_of(to_epoch_seconds(raw[row], unit), granularity)
-                }
-            })
-            .collect();
-        Some((buckets, cap))
+        let r = self.rollover.as_ref()?;
+        let buckets = column_buckets(batch.column(idx).as_ref(), unit, r.granularity)?;
+        Some((buckets, r.cap))
     }
 
     /// What the closing part records in its footer — the column, granularity and the

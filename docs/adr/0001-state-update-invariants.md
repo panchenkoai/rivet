@@ -163,3 +163,19 @@ labels it accordingly.  A failure at step 2 leaves
 ## Test Coverage
 
 Each invariant is covered by at least one automated test. `tests/invariants.rs` covers I1–I7 structural contracts. `tests/journal_invariants.rs` covers the `RunJournal` event-ordering contracts (plan snapshot recorded first, `RunCompleted` recorded last, chunk lifecycle ordering). `tests/recovery.rs` covers chunk checkpoint resume semantics (I5/I6). I8 (finalize order) is exercised by `tests/offline/trust_artifacts_integration.rs` §23 (ValidationOutcome wire contract): the run report's `validation.manifest` sub-object is populated only when the verification step ran between the manifest write and the report write — the order test passes by virtue of the verdict appearing in the JSON. All test suites are run as semantic release gates in CI before any binary is produced.
+
+## Amendment 2026-09-26: the cursor and the manifest moved to the dispatcher
+
+**I3.** The cursor now advances in the dispatcher (`pipeline::job::execute_resolved_plan` →
+`single::commit_incremental_cursor` → `RunStore`), only after `finalize_manifest` has
+written the destination manifest, and never when that write failed. A cursor-write failure
+after the manifest is logged and does not fail the run: the next run re-exports from the
+prior cursor (at-least-once).
+
+**I4.** `run_export_job` and `run_export_job_with_chunk_source` both funnel into
+`execute_resolved_plan`, which is now the one call site of the finalize steps.
+
+**I8.** Step 1 is no longer non-fatal. A manifest that cannot be written fails the run: the
+status becomes `failed`, the run-status ledger row is re-closed, the cursor is not advanced,
+and the exit is non-zero (it outranks a reconcile verdict). The later steps remain
+best-effort. The order is manifest → cursor → validate → metrics → report → notification.

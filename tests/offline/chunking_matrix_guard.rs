@@ -145,10 +145,10 @@ const MATRICES: &[(&str, usize)] = &[
     // batch-clobber filled with a live test; crash-after-source-read is na (that
     // hook is single.rs-only, and Mongo runs the keyset path).
     ("docs/resilience-matrix.yaml", 0),
-    // Warehouse-load — the Parquet→warehouse-autoload axis, keyed on the 4
-    // ExportTarget variants (duckdb/bigquery/snowflake/clickhouse), not source
-    // engines. Caught + fixed 3 resolver bugs (SF/DuckDB/CH decimal ceilings). 0
-    // gaps: every reachable degradation-prone (type × target) cell is tested.
+    // Warehouse-load — the resolver + Parquet→warehouse-AUTOLOAD axis, keyed on the 4
+    // ExportTarget variants, not source engines. Caught + fixed 3 resolver bugs
+    // (SF/DuckDB/CH decimal ceilings). 0 gaps on THAT axis; most cells are offline
+    // resolver tests, and `rivet load` (declared schema) is not graded here.
     ("docs/warehouse-load-matrix.yaml", 0),
     // Fail-loud / error-surface — the inverse of silent corruption: every
     // unrecoverable degradation fails LOUD, not silently. Cross-references the CDC
@@ -243,7 +243,18 @@ const MATRICES: &[(&str, usize)] = &[
     // the final part of every export unnoted, bughunt round 4). The sink unit test
     // proves the method; no test yet reads the footers of the parts each runner ships.
     // Lower a cell the moment a per-runner readback exists.
-    ("docs/runner-coverage-matrix.yaml", 5),
+    // Raised 5 -> 8 (2026-09-26): the new `cdc` column (the CDC drain is a commit
+    // loop the derivation now finds) brought three honest gaps — open_forensics,
+    // source_harm_and_diagnosis, partition_budget_footer_note — none of them wired
+    // on the drain.
+    // Lowered 8 -> 6 the same day: open_forensics + source_harm_and_diagnosis on
+    // cdc closed (HarmBracket shared with the batch tail; RED-proven live).
+    // Lowered 6 -> 1: partition_budget_footer_note proven per batch runner by a
+    // footer readback (which found the chunked runners' bare take+finish); only the
+    // cdc cell remains.
+    // Lowered 1 -> 0: the CDC drain cuts a flush at the partition budget under
+    // log_view and notes every part (live on MySQL, PostgreSQL, SQL Server).
+    ("docs/runner-coverage-matrix.yaml", 0),
     // Mode transitions (ADR-0033). 3 gaps: MT6, pre-v26 incremental cursors carry no identity.
     ("docs/mode-transition-matrix.yaml", 0),
     // Pool-split — `apply --pool --split` per (strategy × source engine). Split is a
@@ -1099,6 +1110,10 @@ const COMMIT_DRAIN: &str = "commit::record_part(";
 /// A runner that drains through the fan-in (`FanIn::finish` calls `record_part`)
 /// is a commit loop too — found by where it builds the fan-in.
 const FAN_IN_DRAIN: &str = "fan_in::FanIn::default()";
+/// The CDC drain's commit call: `mode: cdc` returns from job.rs before the batch
+/// tail and commits through its own per-table sinks under `src/source/cdc`.
+const CDC_DRAIN: &str = "].record_part(";
+const CDC_ROOT: &str = "src/source/cdc";
 
 /// Every COMMIT LOOP the product has → the runner-coverage COLUMN it collapses
 /// into. This table is the collapse the ledger's header describes, written where
@@ -1123,6 +1138,7 @@ const COMMIT_LOOP_COLUMN: &[(&str, &str)] = &[
     ("run_keyset", "keyset"),
     ("run_keyset_parallel", "keyset"),
     ("run_mongo_parallel", "mongo_parallel"),
+    ("roll_all", "cdc"),
 ];
 
 const RUNNER_MATRIX: &str = "docs/runner-coverage-matrix.yaml";
@@ -1160,7 +1176,12 @@ const TAIL_SEAM_CALLERS: &[(&str, &str)] = &[(
 ///   twice, and counting them would make the seam look re-applied.
 /// * the DECLARATION line: `fn finalize_export(` is not a call to itself.
 fn top_level_callers_of(needle: &str) -> BTreeMap<String, String> {
-    let root = repo_root().join("src/pipeline");
+    top_level_callers_in("src/pipeline", needle)
+}
+
+/// [`top_level_callers_of`] over any source directory.
+fn top_level_callers_in(dir: &str, needle: &str) -> BTreeMap<String, String> {
+    let root = repo_root().join(dir);
     let mut out = BTreeMap::new();
     let mut stack = vec![root];
     while let Some(dir) = stack.pop() {
@@ -1294,6 +1315,15 @@ fn runner_matrix_columns_are_derived_from_the_commit_loops() {
     );
     let mut loops = top_level_callers_of(COMMIT_DRAIN);
     loops.extend(top_level_callers_of(FAN_IN_DRAIN));
+    super::nonvacuity::require_needle(
+        &super::nonvacuity::subject_text("src/source/cdc/sink.rs"),
+        "src/source/cdc/sink.rs",
+        CDC_DRAIN,
+        1,
+        "If the CDC sink's commit call moved, re-point CDC_DRAIN — the cdc column is derived \
+         from it.",
+    );
+    loops.extend(top_level_callers_in(CDC_ROOT, CDC_DRAIN));
     super::nonvacuity::require_enumerated(
         loops.len(),
         6,

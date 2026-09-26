@@ -44,11 +44,12 @@ import tempfile
 import time
 from pathlib import Path
 
-from .core import Ledger, Status, engine_container, docker, have, remove_engine_containers, rivet, rivet_bin, run, sqlcmd, target_dir, verify_nextest_grading, HERE, ROOT
+from .core import Ledger, Status, engine_container, verify_no_invariant_violations, docker, have, remove_engine_containers, rivet, rivet_bin, run, sqlcmd, target_dir, verify_nextest_grading, HERE, ROOT
 from . import (
     bigquery,
     blessed_flow,
     cdc,
+    cdc_schema_drift,
     clickhouse_load,
     concurrency,
     gifs,
@@ -244,6 +245,35 @@ def _self_test() -> int:
     assert test_passed("t", {"m::t"}) and not test_passed("t", {"m::at", "m::t_x"}), "suffix match"
     assert nextest_filter(["t"]) == "test(/(^|::)t$/)"
     print("self-test ok: a test is matched by its whole name, never by a suffix of another")
+    # A run-integrity warning in ANY command's output fails the gate; a clean run passes.
+    from . import core as _core
+    saved = list(_core.INVARIANT_HITS)
+    _core.INVARIANT_HITS.clear()
+    _core.Proc(["rivet", "run"], 0, "", "[WARN] export 't': run-integrity invariant violated — x")
+    probe = Ledger(colour=False)
+    _core.verify_no_invariant_violations(probe)
+    assert [c.status for c in probe.cells] == [Status.FAIL], probe.cells
+    _core.INVARIANT_HITS.clear()
+    probe = Ledger(colour=False)
+    _core.verify_no_invariant_violations(probe)
+    assert [c.status for c in probe.cells] == [Status.PASS], probe.cells
+    _core.INVARIANT_HITS.extend(saved)
+    print("self-test ok: a run-integrity warning in any command's output fails the gate")
+    # Without cargo-llvm-cov the offline battery still runs and is graded on its own row.
+    from . import scenarios as _sc
+    real_run, real_have = _sc.run, _sc.have
+    try:
+        _sc.have = lambda _tool: True
+        for battery_rc, want in ((1, Status.FAIL), (0, Status.PASS)):
+            _sc.run = lambda argv, **_k: _core.Proc(
+                list(argv), 1 if "llvm-cov" in argv else battery_rc, "", "")
+            probe = Ledger(colour=False)
+            _sc.verify_live_only_coverage(probe)
+            rows = {c.scenario: c.status for c in probe.cells}
+            assert rows.get("battery") == want, probe.cells
+    finally:
+        _sc.run, _sc.have = real_run, real_have
+    print("self-test ok: without cargo-llvm-cov the offline battery is still graded")
     print("\nregression stage (child harness, stand, banner):")
     return regression._self_test()
 
@@ -423,6 +453,9 @@ def preflight(led: Ledger, *, bless_gifs: bool = False) -> None:
     scenarios.verify_replica_read(led)
     scenarios.verify_pool_e2e(led)
     scenarios.verify_pool_split(led)
+    scenarios.verify_batch_resume(led)
+    scenarios.verify_partition_footer(led)
+    scenarios.verify_audit_suspects(led)
     cdc.verify_cdc_e2e(led)
     cdc.verify_cdc_differential(led)
     regression.verify_release_regression(led)
@@ -472,6 +505,7 @@ def preflight(led: Ledger, *, bless_gifs: bool = False) -> None:
     ])
     # Sequential: its CDC cells share the cross-process engine locks init delta holds.
     clickhouse_load.verify_clickhouse_load(led)
+    cdc_schema_drift.verify_cdc_schema_drift(led)
     concurrency.verify_concurrent_writers_share_a_prefix(
         led,
         state_url=os.environ.get("RIVET_CDC_STATE_URL") or os.environ.get("RIVET_CONC_STATE_URL"),
@@ -935,6 +969,7 @@ def main(argv: list[str] | None = None) -> int:
                     sub, keep=ns.keep, parallel=ns.engine_parallel,
                     bring_up=bring_up, seed_engine=seed_engine)),
             ])
+        verify_no_invariant_violations(led)
         rc = led.report()
         # A run that graded nothing against the previous release has to say so
         # AFTER the verdict, where the reader's eye lands: `RELEASE-READY` is

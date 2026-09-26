@@ -1517,11 +1517,31 @@ def verify_live_only_coverage(led: Ledger) -> None:
         return
     probe = run(["cargo", "llvm-cov", "--version"], timeout=60)
     if not probe.ok:
+        # The coverage adjudication needs the tool; the offline battery it runs does not,
+        # and must never leave the gate with the tool.
         _skipped(
             led, "infra", "live-only", "coverage", "-",
             "live-only-cov: cargo-llvm-cov not installed (cargo install cargo-llvm-cov)",
             "no llvm-cov",
         )
+        plain = run(
+            ["env", "-u", "RIVET_STATE_URL", "-u", "RIVET_TEST_STATE_URL",
+             "cargo", "nextest", "run", "--manifest-path", str(ROOT / "Cargo.toml")],
+            timeout=NO_TIMEOUT,
+        )
+        log = ROOT / "target" / "gate-failures" / f"offline_battery-{os.getpid()}.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text(plain.out)
+        if plain.ok:
+            _passed(led, "infra", "offline", "battery", "-",
+                    "offline battery (lib + offline suites) passes without coverage")
+        else:
+            _failed(
+                led, "infra", "offline", "battery", "-",
+                f"offline battery FAILED: {_first_match(plain.out, r'FAIL|panicked|error')} · "
+                f"full output: {log}",
+                _first_match(plain.out, r"FAILED|error"),
+            )
         return
     led.phase("Live-only coverage (mutants.toml exclusions vs measured offline coverage)")
     lcov = work_dir() / "offline.lcov"
@@ -1642,6 +1662,57 @@ def verify_replica_read(led: Ledger) -> None:
             _first_match(p.out, r"FAILED|panic|assert|error"),
         )
 
+    # The other replica topologies, one row each: a missing service SKIPs its own row
+    # and names what to start; it never hides the rows after it.
+    for label, ports, test, hint in REPLICA_CELLS:
+        if not all(_tcp_open("127.0.0.1", port) for port in ports):
+            _skipped(led, "replica", label, "-", "-", f"replica {label}: not up — {hint}", "no replica")
+            continue
+        cell_log = work_dir() / f"replica_{label}.log"
+        p = run(
+            ["cargo", "nextest", "run", "--manifest-path", str(ROOT / "Cargo.toml"),
+             "--test", "live_suite", "--run-ignored", "all", "-E", f"test(/::{test}$/)"],
+            env=release_bin_env(),
+            timeout=NO_TIMEOUT,
+        )
+        cell_log.write_text(p.out)
+        if p.ok:
+            _passed(led, "replica", label, "-", "-", f"replica {label}: {test.replace('_', ' ')}")
+        else:
+            _failed(
+                led, "replica", label, "-", "-",
+                f"replica {label} FAILED (see {cell_log})",
+                _first_match(p.out, r"FAILED|panic|assert|error"),
+            )
+
+
+# Replica topologies beyond the MySQL re-logging replica: (row, ports, test, how to start).
+REPLICA_CELLS = (
+    ("mysql-no-relog", (3308, 3310),
+     "cdc_from_a_replica_that_does_not_relog_refuses_instead_of_capturing_nothing",
+     "docker compose --profile replica up -d mysql-primary mysql-replica-nolog"),
+    ("postgres-standby", (5436, 5437),
+     "pg_cdc_streams_changes_from_a_standby_in_continuous_mode",
+     "python3 -m dev.pytools.cdc_stand standby"),
+    ("mssql-secondary", (1440, 1441),
+     "mssql_cdc_reads_changes_from_a_readable_secondary",
+     "docker compose --profile replica up -d mssql-ag-primary mssql-ag-secondary && dev/mssql-ag/setup.sh"),
+    ("mongo-secondary", (27022, 27023),
+     "mongo_cdc_streams_changes_from_a_secondary",
+     "docker compose --profile replica up -d mongo-rs2-a mongo-rs2-b"),
+    # SQL Server's checkpoint carries the database identity: refused on another server's
+    # database or after a restore, followed across an availability-group failover.
+    ("mssql-foreign-checkpoint", (1434, 1440),
+     "mssql_checkpoint_from_another_database_is_refused",
+     "docker compose --profile cdc --profile replica up -d mssql-cdc mssql-ag-primary && dev/mssql-ag/setup.sh"),
+    ("mssql-restored-checkpoint", (1434,),
+     "mssql_checkpoint_on_a_database_restored_from_backup_is_refused",
+     "docker compose --profile cdc up -d mssql-cdc"),
+    ("mssql-failover-checkpoint", (1440, 1441),
+     "mssql_checkpoint_follows_a_failover_to_the_secondary",
+     "docker compose --profile replica up -d mssql-ag-primary mssql-ag-secondary && dev/mssql-ag/setup.sh"),
+)
+
 
 def verify_pool_e2e(led: Ledger) -> None:
     """The pool scheduler's e2e flow AS A GATE STAGE (#166 GA): drives the
@@ -1675,9 +1746,68 @@ def verify_pool_e2e(led: Ledger) -> None:
     )
 
 
+def verify_batch_resume(led: Ledger) -> None:
+    """`rivet run --resume` after a crash, per runner and engine: the live_chunked_recovery
+    and live_resume modules, each case a ledger row. The blessed chain applies a sealed
+    plan, where `--resume` is ignored, so this cell is the gate's only real resume."""
+    _run_live_modules(led, "resume", "batch resume",
+                      "`rivet run --resume` after a crash (live_chunked_recovery + live_resume)",
+                      ["live_chunked_recovery", "live_resume"])
+
+
+def verify_audit_suspects(led: Ledger) -> None:
+    """The contract audit's silent-loss cells (cleanup race, keyset collation, MySQL
+    STATEMENT/DROP, Mongo drop, compact ADD COLUMN, MSSQL DATETIME), one row per case;
+    the BigQuery cells need the operator's warehouse credentials."""
+    _run_live_modules(led, "audit", "audit suspects",
+                      "silent-loss cells from the 2026-09-26 contract audit (live_audit_suspects)",
+                      ["live_audit_suspects"])
+
+
+def verify_partition_footer(led: Ledger) -> None:
+    """Every part each batch runner ships — the last one included — carries the
+    `rivet.partition_buckets` note, and its count equals DuckDB's own distinct-day count."""
+    _run_live_modules(led, "partition", "partition footer",
+                      "every shipped part notes its partitions, per runner (live_partition_footer)",
+                      ["live_partition_footer"])
+
+
+def _run_live_modules(led: Ledger, scenario: str, label: str, phase: str,
+                      modules: list[str]) -> None:
+    """Run live_suite `modules` through the gate binary; one ledger row per test case."""
+    led.phase(f"{label} · {phase}")
+    if not have("cargo"):
+        _skipped(led, scenario, "batch", "-", "-", f"{label}: cargo absent", "no cargo")
+        return
+    log_path = work_dir() / f"{scenario}_{'_'.join(modules)}.log"
+    p = run(
+        ["cargo", "nextest", "run", "--manifest-path", str(ROOT / "Cargo.toml"),
+         "--test", "live_suite", "--run-ignored", "all", "--no-fail-fast",
+         "-E", " | ".join(f"test(/^{m}::/)" for m in modules)],
+        env=release_bin_env(),
+        timeout=NO_TIMEOUT,
+    )
+    log_path.write_text(p.out)
+    verdicts = {
+        name: verdict
+        for verdict, name in re.findall(
+            r"^\s+(PASS|LEAK|FAIL|TIMEOUT|SIGABRT|SIGSEGV) \[[^\]]*\] \(\d+/\d+\) \S+ (\S+)$",
+            p.out, re.M)
+    }
+    if not verdicts:
+        _failed(led, scenario, "batch", "-", "-",
+                f"{label}: no test ran (see {log_path})", _first_match(p.out, r"error|FAILED"))
+        return
+    for name, verdict in sorted(verdicts.items()):
+        if verdict in ("PASS", "LEAK"):
+            _passed(led, scenario, "batch", "-", "-", f"{label} · {name}")
+        else:
+            _failed(led, scenario, "batch", "-", "-", f"{label} FAILED · {name} (see {log_path})")
+
+
 def verify_pool_split(led: Ledger) -> None:
     """The `--pool --split` scenarios AS THEIR OWN GATE CELLS (#167): a dominating
-    export is broken into N range sub-exports over its key span. Three scenarios,
+    export is broken into N range sub-exports over its key span. Four scenarios,
     each an independent live oracle in tests/live/live_pool_toxiproxy.rs
     (`pool_split_*`):
 
@@ -1686,7 +1816,9 @@ def verify_pool_split(led: Ledger) -> None:
       * manifest coherence — validate does not flag a sibling unit's parts as
         untracked, yet a true foreign orphan still is;
       * per-unit resume — a crashed split re-runs ONLY the incomplete units on
-        `--resume` (skip complete, resume crashed), no gap/no dup.
+        `--resume` (skip complete, resume crashed), no gap/no dup;
+      * NULL-keyed rows — a split over a nullable chunk_column refuses before any
+        unit writes (without the refusal it delivered 200000 of 200002 rows).
 
     Separate from `verify_pool_e2e` so the split coverage is a NAMED matrix cell,
     not bundled invisibly into the pool cell. Needs toxiproxy (:8474) + postgres

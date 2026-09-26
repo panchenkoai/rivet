@@ -40,7 +40,7 @@ const PG_HARM_COUNTERS: &[&str] = &[
     "pg_tup_returned",
 ];
 
-const MYSQL_HARM_COUNTERS: &[&str] = &[
+pub(crate) const MYSQL_HARM_COUNTERS: &[&str] = &[
     "mysql_created_tmp_disk_tables",
     "mysql_handler_read_rnd_next",
     "mysql_innodb_buffer_pool_reads",
@@ -55,7 +55,7 @@ const MSSQL_HARM_COUNTERS: &[&str] = &["mssql_lock_wait_ms", "mssql_lock_waits"]
 /// (proves the probe read every column and the name mapping is complete — a
 /// dropped or typo'd counter surfaces as a set mismatch), and that every delta
 /// is floored at 0 (no counter persists a negative "harm").
-fn assert_harm_contract(db: &StateDb, run_id: &str, expected: &[&str]) {
+pub(crate) fn assert_harm_contract(db: &StateDb, run_id: &str, expected: &[&str]) {
     let rows = db.harm_rows(run_id);
     let mut got: Vec<&str> = rows.iter().map(|(m, _)| m.as_str()).collect();
     got.sort_unstable();

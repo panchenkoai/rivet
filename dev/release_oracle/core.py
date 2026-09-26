@@ -277,6 +277,30 @@ class Ledger:
 
 
 # ── process running ────────────────────────────────────────────────────────────
+# rivet's release binary only WARNS when a run skipped a per-export facade (debug
+# builds panic); every command the gate runs is scanned for it, and the gate fails on it.
+INVARIANT_MARKER = "run-integrity invariant violated"
+INVARIANT_HITS: list[tuple[str, str]] = []
+
+
+def note_invariant_violations(argv: Sequence[str], text: str) -> None:
+    """Record each run-integrity invariant warning in a command's output."""
+    for line in text.splitlines():
+        if INVARIANT_MARKER in line:
+            INVARIANT_HITS.append((" ".join(str(a) for a in argv)[:200], line.strip()[:400]))
+
+
+def verify_no_invariant_violations(led: "Ledger") -> None:
+    """Fail the gate for every run that reported an incomplete integrity record."""
+    led.phase("Run-integrity invariant — no gated run may skip a per-export facade")
+    if not INVARIANT_HITS:
+        led.passed("all", "-", "run-integrity", "-",
+                   "run-integrity: no gated run reported a skipped facade", "clean")
+        return
+    for cmd, line in INVARIANT_HITS:
+        led.failed("all", "-", "run-integrity", "-", f"run-integrity: `{cmd}` — {line}", "violated")
+
+
 @dataclass
 class Proc:
     """A finished process. `ok` is the EXIT STATUS, never a grep over the output.
@@ -290,6 +314,9 @@ class Proc:
     returncode: int
     stdout: str
     stderr: str
+
+    def __post_init__(self) -> None:
+        note_invariant_violations(self.argv, self.stdout + self.stderr)
 
     @property
     def ok(self) -> bool:

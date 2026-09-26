@@ -525,6 +525,11 @@ pub(crate) trait ChangeStream {
         None
     }
 
+    /// The checkpoint to persist for `position`; an engine adds what verifies a later resume.
+    fn checkpoint_of(&self, position: &Position) -> Position {
+        position.clone()
+    }
+
     /// Which engine this stream speaks — required, never defaulted.
     ///
     /// Routing semantics differ by engine (a document store has no schema to
@@ -571,7 +576,7 @@ pub(crate) fn run(
                 .any(|t| sink::table_matches(eng, t, &ev.schema, &ev.table));
         if filtered {
             if committed && let Some(p) = &checkpoint {
-                ev.position.save(p)?;
+                stream.checkpoint_of(&ev.position).save(p)?;
             }
             continue;
         }
@@ -603,7 +608,7 @@ pub(crate) fn run(
         // at-least-once break, the save ran before the println). Emit→checkpoint
         // means a crash there re-emits on resume (a duplicate, never a loss).
         if committed && let Some(p) = &checkpoint {
-            ev.position.save(p)?;
+            stream.checkpoint_of(&ev.position).save(p)?;
         }
         // A SOFT cap, landing on the commit boundary — the same semantics the file
         // sink already had (`max_events_stops_at_a_commit_boundary_never_inside_a_
@@ -1649,6 +1654,8 @@ pub(crate) struct CaptureOutput<'a> {
     /// column the snapshot leg does, or the warehouse table ends up
     /// half-populated.
     pub row_hash: crate::config::RowHash,
+    /// The partition budget this table's change parts keep (changelog layout only).
+    pub partition: Option<crate::plan::rollover::PartitionRollover>,
 }
 
 /// Everything needed to capture a change stream to typed files, assembled once —
@@ -1657,6 +1664,9 @@ pub(crate) struct CaptureOutput<'a> {
 /// is identical. Both entry points fill this in and call [`run_capture`].
 /// `outputs` carries one entry per captured table: several tables ride ONE stream
 /// (one slot / one binlog connection) and one checkpoint.
+/// Judges one captured table's resolved columns; an error ends the run before any change is read.
+pub(crate) type SchemaGate<'a> = dyn Fn(&str, &[crate::types::TypeMapping]) -> Result<()> + 'a;
+
 pub(crate) struct CdcCapture<'a> {
     /// `exports[].name` — recorded into each manifest's `export_family` so the
     /// load's shared-prefix guard groups the drain with its snapshot leg by what
@@ -1675,6 +1685,8 @@ pub(crate) struct CdcCapture<'a> {
     /// recorded in the DATABASE as it becomes durable; the `rivet cdc` CLI has
     /// no state store and passes `None`.
     pub state: Option<&'a crate::state::StateStore>,
+    /// Judges each table's resolved columns before any change is read; an error ends the run unacknowledged.
+    pub schema_gate: Option<&'a SchemaGate<'a>>,
 }
 
 /// Open the change stream (with the engine's permission/TLS gate), resolve each
@@ -1759,12 +1771,24 @@ pub(crate) fn run_capture(
             Ok(c) => c,
             Err(e) => return (Vec::new(), Err(e)),
         };
+        if let Err(e) = cap
+            .schema_gate
+            .map_or(Ok(()), |gate| gate(&o.table, &columns))
+        {
+            return (Vec::new(), Err(e));
+        }
+        if let Some(w) =
+            sink::unbudgetable_partition_warning(&o.table, o.partition.as_ref(), &columns)
+        {
+            log::warn!("{w}");
+        }
         outputs.push(sink::TableOutput {
             table: o.table,
             columns,
             dest: o.dest,
             dest_uri: o.dest_uri,
             row_hash: o.row_hash,
+            partition: o.partition,
         });
     }
     let sink_cfg = sink::SinkConfig {

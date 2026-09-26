@@ -1596,3 +1596,34 @@ fn pipelined_forwards_the_source_cursor_to_the_inner_sink() {
         "the token must reach the inner ExportSink through the decorator"
     );
 }
+
+#[test]
+fn batch_partition_buckets_counts_days_and_puts_nulls_in_their_own_bucket() {
+    use arrow::array::Date32Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    let schema = Arc::new(Schema::new(vec![Field::new("d", DataType::Date32, true)]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(Date32Array::from(vec![
+            Some(10),
+            Some(10),
+            None,
+            Some(11),
+        ]))],
+    )
+    .unwrap();
+    let r = crate::plan::rollover::PartitionRollover {
+        column: "d".into(),
+        granularity: crate::config::load::Granularity::Day,
+        cap: 4000,
+    };
+    let b = super::batch_partition_buckets(&batch, &r).expect("a date column buckets");
+    assert_eq!(b[0], b[1]);
+    assert_ne!(b[0], b[3]);
+    assert_eq!(b[2], crate::plan::rollover::NULL_BUCKET);
+    let other = crate::plan::rollover::PartitionRollover {
+        column: "missing".into(),
+        ..r
+    };
+    assert!(super::batch_partition_buckets(&batch, &other).is_none());
+}

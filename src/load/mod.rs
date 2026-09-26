@@ -675,7 +675,7 @@ pub fn run_load(
     specs: &[TargetColumnSpec],
     uris: &[String],
     expected_rows: Option<u64>,
-    cleanup: Option<(&GcsStore, &str)>,
+    cleanup: Option<(&GcsStore, &[String])>,
     ownership: Ownership,
 ) -> Result<LoadReport> {
     before_write(whole_table_preflight(
@@ -749,7 +749,7 @@ fn append_and_view(
     uris: &[String],
     pk: &[String],
     expected_delta: Option<u64>,
-    cleanup: Option<(&GcsStore, &str)>,
+    cleanup: Option<(&GcsStore, &[String])>,
     ownership: Ownership,
     rebuild_changelog: bool,
     label: &str,
@@ -946,7 +946,7 @@ pub fn run_load_cdc(
     pk: &[String],
     engine: cdc::SourceEngine,
     expected_delta: Option<u64>,
-    cleanup: Option<(&GcsStore, &str)>,
+    cleanup: Option<(&GcsStore, &[String])>,
     ownership: Ownership,
     rebuild_changelog: bool,
 ) -> Result<CdcLoadReport> {
@@ -983,7 +983,7 @@ pub fn run_load_buffer(
     uris: &[String],
     pk: &[String],
     expected_delta: Option<u64>,
-    cleanup: Option<(&GcsStore, &str)>,
+    cleanup: Option<(&GcsStore, &[String])>,
 ) -> Result<CdcLoadReport> {
     before_write(append_preflight(loader, table, specs, uris, pk, "CDC"))?;
     let rows_appended = loader.append_changelog(table, specs, uris, pk)?;
@@ -1023,7 +1023,7 @@ pub fn run_load_incremental(
     pk: &[String],
     cursor_column: &str,
     expected_delta: Option<u64>,
-    cleanup: Option<(&GcsStore, &str)>,
+    cleanup: Option<(&GcsStore, &[String])>,
     ownership: Ownership,
     rebuild_changelog: bool,
 ) -> Result<CdcLoadReport> {
@@ -1214,7 +1214,6 @@ fn build_bigquery_loader(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::load::staging::delete_under;
 
     #[test]
     fn only_a_name_that_is_plain_once_its_cyrillic_lookalikes_are_latin_folds() {
@@ -1951,9 +1950,9 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn delete_under_and_gc_orphans_refuse_the_bucket_root_and_spare_siblings() {
+    fn gc_orphans_refuses_the_bucket_root_and_spares_siblings() {
         // #8 e2e against the REAL opendal fs-backed store (the load layer's offline
-        // e2e seam — `delete_under`/`gc_orphans` run their real recursive delete
+        // e2e seam — `gc_orphans` runs its real delete
         // here). A bucket-ROOT prefix (the empty resolved key a no-`prefix` or
         // `{partition}`-leading GCS export + cleanup_source produces) must be
         // REFUSED, never wiped — a real `remove_all("")` destroys UNRELATED exports.
@@ -1965,11 +1964,7 @@ pub(crate) mod tests {
         }
         let store = GcsStore::open_fs(dir.path().to_str().unwrap()).unwrap();
 
-        // The destructive paths refuse the root — BEFORE touching the store.
-        assert!(
-            delete_under(&store, "gs://bucket/").is_err(),
-            "cleanup_source must REFUSE a bucket-root prefix, not remove_all(\"\")"
-        );
+        // The destructive path refuses the root — BEFORE touching the store.
         assert!(
             reconcile::gc_orphans(&store, "gs://bucket/", &[], false, &Default::default()).is_err(),
             "gc_orphans must REFUSE a bucket-root prefix, not list+delete the whole bucket"
@@ -1979,18 +1974,6 @@ pub(crate) mod tests {
         assert!(
             prefix_populated(&store, "innocent-neighbour"),
             "an unrelated neighbour export must survive the refused root cleanup"
-        );
-
-        // Contrast — the guard does NOT over-block: a REAL per-export prefix still
-        // drains its own subtree and spares the neighbour.
-        delete_under(&store, "gs://bucket/exportA").unwrap();
-        assert!(
-            !prefix_populated(&store, "exportA"),
-            "a real prefix cleanup still drains its own export"
-        );
-        assert!(
-            prefix_populated(&store, "innocent-neighbour"),
-            "a scoped cleanup spares the sibling"
         );
     }
 
@@ -2009,7 +1992,6 @@ pub(crate) mod tests {
     }
     /// The cleanup prefix the driver receives (a `gs://bucket/…` URI) and its
     /// bucket-relative form the fs store is keyed by.
-    const PREFIX: &str = "gs://b/p";
     const REL: &str = "p";
 
     /// Runs that declare rows but whose files are gone must never empty the table.
@@ -2103,7 +2085,7 @@ pub(crate) mod tests {
             &spec(TargetStatus::Ok),
             &uris(),
             Some(10),
-            Some((&store, PREFIX)),
+            Some((&store, &[format!("{REL}/x.parquet")][..])),
             Ownership::Own,
         )
         .unwrap_err()
@@ -2129,7 +2111,7 @@ pub(crate) mod tests {
             &spec(TargetStatus::Ok),
             &uris(),
             Some(10),
-            Some((&store, PREFIX)),
+            Some((&store, &[format!("{REL}/x.parquet")][..])),
             Ownership::Own,
         )
         .unwrap();
@@ -2197,7 +2179,7 @@ pub(crate) mod tests {
             &["id".into()],
             cdc::SourceEngine::MySql,
             Some(5),
-            Some((&store, PREFIX)),
+            Some((&store, &[format!("{REL}/x.parquet")][..])),
             Ownership::Own,
             false,
         )
@@ -2232,7 +2214,7 @@ pub(crate) mod tests {
             &uris(),
             &["id".into()],
             Some(5),
-            Some((&store, PREFIX)),
+            Some((&store, &[format!("{REL}/x.parquet")][..])),
         )
         .unwrap_err()
         .to_string();
@@ -2275,7 +2257,7 @@ pub(crate) mod tests {
             &["id".into()],
             cdc::SourceEngine::MySql,
             Some(5),
-            Some((&store, PREFIX)),
+            Some((&store, &[format!("{REL}/x.parquet")][..])),
             Ownership::Own,
             false,
         )
@@ -2287,18 +2269,6 @@ pub(crate) mod tests {
             "a passed CDC gate drains the source prefix after the view is built"
         );
         assert_eq!(r.changes_table, "db.t__changes");
-    }
-
-    #[test]
-    fn delete_under_drains_the_prefix_through_the_store() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = fs_store_with_prefix(&dir, REL);
-        assert!(prefix_populated(&store, REL), "seeded object is present");
-        delete_under(&store, PREFIX).unwrap();
-        assert!(
-            !prefix_populated(&store, REL),
-            "delete_under recursively removes the bucket-relative prefix behind the gs:// URI"
-        );
     }
 
     #[test]
