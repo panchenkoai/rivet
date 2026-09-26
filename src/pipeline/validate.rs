@@ -15,7 +15,7 @@ use crate::plan::FormatType;
 /// self-cancel, so toggling on every `"` tracks quoted state without parsing
 /// fields. CRLF terminators work because the `\n` is the trigger; a final
 /// record without a trailing newline is counted at EOF.
-fn count_csv_records(path: &Path) -> Result<usize> {
+pub(crate) fn count_csv_records(path: &Path) -> Result<usize> {
     let file = std::fs::File::open(path)?;
     let mut reader = std::io::BufReader::new(file);
     let mut records = 0usize;

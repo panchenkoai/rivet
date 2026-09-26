@@ -53,7 +53,7 @@ mod single;
 mod sink;
 pub(crate) mod split;
 mod summary;
-mod validate;
+pub(crate) mod validate;
 mod validate_cmd;
 pub(crate) mod validate_manifest;
 

@@ -492,7 +492,7 @@ By default `validate` resolves the destination prefix the same way `run` does �
 
   Possible values: `pretty`, `json`
 
-* `--depth <DEPTH>` — How deep to verify: "light" (manifest + _SUCCESS only, no prefix listing), "sample" (light + part reconcile + untracked surplus), or "full" (sample + the value-checksum re-read of every part).
+* `--depth <DEPTH>` — How deep to verify: "light" (manifest + _SUCCESS only, no prefix listing), "sample" (light + part reconcile + untracked surplus), or "full" (sample + the value-checksum re-read of every part; CSV parts carry no value checksum, so for CSV only each part's row count is re-counted).
 
    `full` is the default and matches the pre-graded behaviour. Use `light` for a fast "is this a complete, marked run?" poll, or `sample` for full structural verification without downloading parts.
 
@@ -504,7 +504,7 @@ By default `validate` resolves the destination prefix the same way `run` does �
   - `sample`:
     Light + part reconcile + untracked surplus (one `list_prefix`)
   - `full`:
-    Sample + the Form B value-checksum re-read (downloads parts)
+    Sample + the Form B value-checksum re-read (downloads parts; CSV: row counts only)
 
 * `-o`, `--output <OUTPUT>` — Write JSON report to this file (only with `--format json`)
 * `--date <YYYY-MM-DD>` — Resolve `{date}` to this ISO-8601 day (e.g. `2026-05-21`) instead of today.

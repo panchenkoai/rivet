@@ -624,7 +624,23 @@ fn part_row_count_mismatch(
 ) -> Result<Option<String>> {
     use parquet::file::reader::{FileReader, SerializedFileReader};
 
-    for (part, path) in manifest.parts.iter().zip(paths) {
+    let committed = manifest
+        .parts
+        .iter()
+        .filter(|p| p.status == crate::manifest::PartStatus::Committed);
+    for (part, path) in committed.zip(paths) {
+        if manifest.format == crate::config::FormatType::Csv.label() {
+            let records = crate::pipeline::validate::count_csv_records(path)
+                .map_err(|e| anyhow::anyhow!("part row count: read {}: {e}", part.path))?;
+            let actual = records.saturating_sub(1) as i64;
+            if actual != part.rows {
+                return Ok(Some(format!(
+                    "part '{}' declares {} rows but holds {actual} CSV records after the header",
+                    part.path, part.rows
+                )));
+            }
+            continue;
+        }
         let file = std::fs::File::open(path)
             .map_err(|e| anyhow::anyhow!("part row count: open {}: {e}", part.path))?;
         // Footer only — `num_rows` lives in the file metadata, so this does not
@@ -786,6 +802,9 @@ fn validate_one_manifest_checksums(
     let Some(recorded) = manifest.column_checksums.as_deref() else {
         return Ok(None);
     };
+    if manifest.format == crate::config::FormatType::Csv.label() {
+        return Ok(None);
+    }
 
     // `validate_recorded_checksums` now classifies for us: Ok(None) clean,
     // Ok(Some) verified-wrong (exit 3), Err operational (exit 1). Everything
@@ -820,6 +839,81 @@ mod tests {
             Field::new("b", DataType::Int64, true),
             Field::new("c", DataType::Int64, true),
         ]))
+    }
+
+    fn csv_manifest(parts: Vec<crate::manifest::ManifestPart>) -> crate::manifest::RunManifest {
+        use crate::manifest::*;
+        RunManifest {
+            split_window: None,
+            checksum_render: None,
+            row_hash: None,
+            mode: "batch".into(),
+            manifest_version: MANIFEST_VERSION,
+            run_id: "r".into(),
+            export_name: "e".into(),
+            export_family: String::new(),
+            started_at: String::new(),
+            finished_at: String::new(),
+            status: ManifestStatus::Success,
+            source: ManifestSource {
+                engine: "postgres".into(),
+                schema: None,
+                table: None,
+                extraction: None,
+            },
+            destination: ManifestDestination {
+                kind: "local".into(),
+                uri: String::new(),
+            },
+            format: "csv".into(),
+            compression: "none".into(),
+            schema_fingerprint: String::new(),
+            row_count: 0,
+            part_count: 0,
+            parts,
+            column_checksums: None,
+            checksum_key_column: None,
+        }
+    }
+
+    fn csv_part(
+        path: &str,
+        rows: i64,
+        status: crate::manifest::PartStatus,
+    ) -> crate::manifest::ManifestPart {
+        crate::manifest::ManifestPart {
+            part_id: 0,
+            path: path.into(),
+            rows,
+            size_bytes: 0,
+            content_fingerprint: String::new(),
+            content_md5: String::new(),
+            status,
+        }
+    }
+
+    #[test]
+    fn csv_part_rows_are_recounted_after_the_header_and_skip_quarantined_parts() {
+        use crate::manifest::PartStatus::{Committed, Quarantined};
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.csv");
+        std::fs::write(&file, "id,s\n1,\"x\ny\"\n2,z\n").unwrap();
+        let paths = vec![file];
+
+        let ok = csv_manifest(vec![
+            csv_part("q.csv", 7, Quarantined),
+            csv_part("a.csv", 2, Committed),
+        ]);
+        assert_eq!(part_row_count_mismatch(&ok, &paths).unwrap(), None);
+
+        let lost = csv_manifest(vec![
+            csv_part("q.csv", 7, Quarantined),
+            csv_part("a.csv", 3, Committed),
+        ]);
+        assert_eq!(
+            part_row_count_mismatch(&lost, &paths).unwrap().as_deref(),
+            Some("part 'a.csv' declares 3 rows but holds 2 CSV records after the header")
+        );
     }
 
     // ── mutation-tier2 gap closures ──────────────────────────────────────────
