@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **`rivet compact` carries a column the source gained into the base.** After an `ADD COLUMN`
+  at the source, the BigQuery MERGE named the new column while the base lacked it and failed
+  with a raw `Unrecognized name`, on this and every later compact. The base now gets
+  `ADD COLUMN IF NOT EXISTS` before any MERGE.
 - **CDC refuses a captured table or collection that was dropped.** MySQL skipped `DROP TABLE`
   and MongoDB skipped `drop`/`rename`/`dropDatabase`, so the destination kept the removed rows
   live and a table re-created under the same name continued the old history as one table. Both
