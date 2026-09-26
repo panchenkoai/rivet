@@ -281,6 +281,17 @@ mod tests {
     }
 
     #[test]
+    fn every_strategy_column_the_config_names_is_probed() {
+        let mut e = crate::config::sample_export("x");
+        assert!(key_columns(&e).is_empty());
+        e.chunk_column = Some("C".into());
+        e.chunk_by_key = Some("K".into());
+        e.cursor_column = Some("U".into());
+        e.cursor_fallback_column = Some("F".into());
+        assert_eq!(key_columns(&e), vec!["C", "K", "U", "F"]);
+    }
+
+    #[test]
     fn an_unknown_key_column_says_why_from_the_catalog() {
         let real = ("ID".to_string(), false);
         assert!(unknown_key_column_detail("id", Some(&real)).ends_with("spelled 'ID'"));

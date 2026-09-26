@@ -649,6 +649,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_protocol_desync_carries_the_driver_hint_and_nothing_else_does() {
+        let hint = known_failure_hint("internal error: unknown TTC message type 1 at packet 1");
+        assert!(hint.is_some_and(|h| h.contains("lost protocol sync")));
+        assert_eq!(
+            known_failure_hint("ORA-00942: table or view does not exist"),
+            None
+        );
+    }
+
+    #[test]
     fn a_lob_projection_probes_a_few_rows_first() {
         assert_eq!(probe_rows(true, 500), 16);
         assert_eq!(probe_rows(true, 8), 8);
