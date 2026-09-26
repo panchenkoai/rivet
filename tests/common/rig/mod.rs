@@ -281,6 +281,13 @@ impl Rig {
         self
     }
 
+    /// CDC in continuous mode: `until_current: false` in place of the constructor's `true`.
+    pub fn continuous(mut self) -> Self {
+        self.cdc_lines.retain(|l| l != "until_current: true");
+        self.cdc_lines.push("until_current: false".into());
+        self
+    }
+
     /// `source.mongo.*` options, e.g. `.mongo("page_size: 500, resume: true")`.
     pub fn mongo(mut self, opts: &str) -> Self {
         self.source_lines.push(format!("mongo: {{ {opts} }}"));

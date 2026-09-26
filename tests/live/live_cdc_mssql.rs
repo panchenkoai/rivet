@@ -2781,3 +2781,69 @@ fn mssql_cdc_a_marker_only_snapshot_survives_a_fresh_state_db() {
         "and their VALUES, not merely their count"
     );
 }
+
+#[test]
+#[ignore = "live: requires docker compose --profile replica up -d mssql-ag-primary mssql-ag-secondary, then dev/mssql-ag/setup.sh"]
+fn mssql_cdc_reads_changes_from_a_readable_secondary() {
+    const PRIMARY: u16 = 1440;
+    const SECONDARY: u16 = 1441;
+    for port in [PRIMARY, SECONDARY] {
+        assert!(
+            std::net::TcpStream::connect_timeout(
+                &format!("127.0.0.1:{port}").parse().unwrap(),
+                std::time::Duration::from_millis(500),
+            )
+            .is_ok(),
+            "fixture: the availability group is not up on :{port} (dev/mssql-ag/setup.sh)"
+        );
+    }
+    let wait = |sql: &str, want: i64| {
+        for _ in 0..120 {
+            if mssql_query_i64_on(SECONDARY, sql) == want {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        panic!("fixture: the secondary never reached {want} for `{sql}`");
+    };
+    let table = unique_name("cdc_ag");
+    let ci = format!("dbo_{table}");
+    mssql_exec_on(
+        PRIMARY,
+        &format!(
+            "CREATE TABLE dbo.{table}(id INT PRIMARY KEY, v INT);
+             EXEC sys.sp_cdc_enable_table @source_schema=N'dbo', @source_name=N'{table}',
+               @role_name=NULL, @capture_instance=N'{ci}';"
+        ),
+    );
+    wait(
+        &format!("SELECT COUNT(*) FROM cdc.change_tables WHERE capture_instance = N'{ci}'"),
+        1,
+    );
+
+    let rig = Rig::mssql_cdc(&table, &ci).source_url(&format!(
+        "sqlserver://sa:Rivet_Passw0rd!@127.0.0.1:{SECONDARY}/rivet"
+    ));
+    rig.run_ok(); // anchor, on the secondary
+
+    mssql_exec_on(
+        PRIMARY,
+        &format!("INSERT INTO dbo.{table} VALUES (1, 10), (2, 20)"),
+    );
+    wait(&format!("SELECT COUNT(*) FROM cdc.{ci}_CT"), 2);
+    rig.run_ok();
+    let delivered = duckdb_declared_dir_id_set(&rig.out_dir());
+    mssql_exec_on(
+        PRIMARY,
+        &format!(
+            "EXEC sys.sp_cdc_disable_table @source_schema=N'dbo', @source_name=N'{table}',
+               @capture_instance=N'{ci}';
+             DROP TABLE dbo.{table};"
+        ),
+    );
+    assert_eq!(
+        delivered,
+        [1, 2].into_iter().collect(),
+        "both changes captured on the primary must be read from the readable secondary"
+    );
+}

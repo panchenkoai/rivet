@@ -1642,36 +1642,45 @@ def verify_replica_read(led: Ledger) -> None:
             _first_match(p.out, r"FAILED|panic|assert|error"),
         )
 
-    # A replica that does not re-log (MySQL's default) holds none of the primary's
-    # changes in its binlog: rivet must refuse it, never report an empty success.
-    if not _tcp_open("127.0.0.1", 3310):
-        _skipped(
-            led, "replica", "no-relog", "-", "-",
-            "replica no-relog: no mysql-replica-nolog :3310 "
-            "(docker compose --profile replica up -d mysql-replica-nolog)",
-            "no replica",
+    # The other replica topologies, one row each: a missing service SKIPs its own row
+    # and names what to start; it never hides the rows after it.
+    for label, ports, test, hint in REPLICA_CELLS:
+        if not all(_tcp_open("127.0.0.1", port) for port in ports):
+            _skipped(led, "replica", label, "-", "-", f"replica {label}: not up — {hint}", "no replica")
+            continue
+        cell_log = work_dir() / f"replica_{label}.log"
+        p = run(
+            ["cargo", "nextest", "run", "--manifest-path", str(ROOT / "Cargo.toml"),
+             "--test", "live_suite", "--run-ignored", "all", "-E", f"test(/::{test}$/)"],
+            env=release_bin_env(),
+            timeout=NO_TIMEOUT,
         )
-        return
-    nolog_log = work_dir() / "replica_nolog.log"
-    p = run(
-        ["cargo", "nextest", "run", "--manifest-path", str(ROOT / "Cargo.toml"),
-         "--test", "live_suite", "--run-ignored", "all",
-         "-E", "test(/cdc_from_a_replica_that_does_not_relog_refuses_instead_of_capturing_nothing$/)"],
-        env=release_bin_env(),
-        timeout=NO_TIMEOUT,
-    )
-    nolog_log.write_text(p.out)
-    if p.ok:
-        _passed(
-            led, "replica", "no-relog", "-", "-",
-            "replica no-relog: rivet refuses a replica whose binlog omits replicated changes",
-        )
-    else:
-        _failed(
-            led, "replica", "no-relog", "-", "-",
-            f"replica no-relog FAILED — a non-re-logging replica was not refused (see {nolog_log})",
-            _first_match(p.out, r"FAILED|panic|assert|error"),
-        )
+        cell_log.write_text(p.out)
+        if p.ok:
+            _passed(led, "replica", label, "-", "-", f"replica {label}: {test.replace('_', ' ')}")
+        else:
+            _failed(
+                led, "replica", label, "-", "-",
+                f"replica {label} FAILED (see {cell_log})",
+                _first_match(p.out, r"FAILED|panic|assert|error"),
+            )
+
+
+# Replica topologies beyond the MySQL re-logging replica: (row, ports, test, how to start).
+REPLICA_CELLS = (
+    ("mysql-no-relog", (3308, 3310),
+     "cdc_from_a_replica_that_does_not_relog_refuses_instead_of_capturing_nothing",
+     "docker compose --profile replica up -d mysql-primary mysql-replica-nolog"),
+    ("postgres-standby", (5436, 5437),
+     "pg_cdc_streams_changes_from_a_standby_in_continuous_mode",
+     "python3 -m dev.pytools.cdc_stand standby"),
+    ("mssql-secondary", (1440, 1441),
+     "mssql_cdc_reads_changes_from_a_readable_secondary",
+     "docker compose --profile replica up -d mssql-ag-primary mssql-ag-secondary && dev/mssql-ag/setup.sh"),
+    ("mongo-secondary", (27022, 27023),
+     "mongo_cdc_streams_changes_from_a_secondary",
+     "docker compose --profile replica up -d mongo-rs2-a mongo-rs2-b"),
+)
 
 
 def verify_pool_e2e(led: Ledger) -> None:
