@@ -90,6 +90,7 @@ fn cdc_ignored_knobs_warning(export: &ExportConfig) -> Option<String> {
             "shape_drift_warn_factor",
             export.shape_drift_warn_factor.is_some(),
         ),
+        ("skip_empty", export.skip_empty),
     ];
     let named: Vec<&str> = set.iter().filter(|(_, on)| *on).map(|(k, _)| *k).collect();
     (!named.is_empty()).then(|| {
@@ -1192,6 +1193,12 @@ mod tests {
             "names exactly the set knobs, in order: {msg}"
         );
         assert!(msg.contains("'orders'"), "names the export: {msg}");
+        e.skip_empty = true;
+        let msg = cdc_ignored_knobs_warning(&e).expect("set knobs must warn");
+        assert!(
+            msg.contains("max_file_size, skip_empty on the change stream"),
+            "{msg}"
+        );
     }
 
     #[test]

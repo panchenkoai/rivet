@@ -1746,6 +1746,41 @@ def verify_pool_e2e(led: Ledger) -> None:
     )
 
 
+def verify_batch_resume(led: Ledger) -> None:
+    """`rivet run --resume` after a crash, per runner and engine: the live_chunked_recovery
+    and live_resume modules, each case a ledger row. The blessed chain applies a sealed
+    plan, where `--resume` is ignored, so this cell is the gate's only real resume."""
+    led.phase("batch resume · `rivet run --resume` after a crash (live_chunked_recovery + live_resume)")
+    if not have("cargo"):
+        _skipped(led, "resume", "batch", "-", "-", "batch resume: cargo absent", "no cargo")
+        return
+    log_path = work_dir() / "batch_resume.log"
+    p = run(
+        ["cargo", "nextest", "run", "--manifest-path", str(ROOT / "Cargo.toml"),
+         "--test", "live_suite", "--run-ignored", "all", "--no-fail-fast",
+         "-E", "test(/^live_chunked_recovery::/) | test(/^live_resume::/)"],
+        env=release_bin_env(),
+        timeout=NO_TIMEOUT,
+    )
+    log_path.write_text(p.out)
+    verdicts = {
+        name: verdict
+        for verdict, name in re.findall(
+            r"^\s+(PASS|LEAK|FAIL|TIMEOUT|SIGABRT|SIGSEGV) \[[^\]]*\] \(\d+/\d+\) \S+ (\S+)$",
+            p.out, re.M)
+    }
+    cases = sorted((v, n) for n, v in verdicts.items())
+    if not cases:
+        _failed(led, "resume", "batch", "-", "-",
+                f"batch resume: no test ran (see {log_path})", _first_match(p.out, r"error|FAILED"))
+        return
+    for verdict, name in cases:
+        if verdict in ("PASS", "LEAK"):
+            _passed(led, "resume", "batch", "-", "-", f"batch resume · {name}")
+        else:
+            _failed(led, "resume", "batch", "-", "-", f"batch resume FAILED · {name} (see {log_path})")
+
+
 def verify_pool_split(led: Ledger) -> None:
     """The `--pool --split` scenarios AS THEIR OWN GATE CELLS (#167): a dominating
     export is broken into N range sub-exports over its key span. Four scenarios,

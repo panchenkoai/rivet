@@ -11,7 +11,7 @@
 - **A CDC run sends its notifications and says which batch settings it ignores.** A failed CDC
   run never reached `notifications:`, so an `on: [failure]` webhook stayed silent while the
   stream was down. It now fires like a batch run's. `quality:`, `parquet:`, `compression*`,
-  `max_file_size` and `shape_drift_warn_factor` apply only to a CDC export's snapshot baseline,
+  `max_file_size`, `shape_drift_warn_factor` and `skip_empty` apply only to a CDC export's snapshot baseline,
   and `run --validate` / `--reconcile` likewise check only the baseline; each run now warns,
   naming the ones that were set.
 - **The release gate grades what it used to wave through.** A run that bypasses the

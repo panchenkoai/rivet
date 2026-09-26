@@ -1,4 +1,12 @@
 # Runner-coverage matrix — every PER-EXPORT feature must be applied on EVERY export
+#
+# CDC COLUMN, 2026-09-26. `mode: cdc` returns from job.rs before execute_resolved_plan and
+# commits through its own sink (src/source/cdc/sink.rs::roll_all), so the seam wording
+# below ("applied ONCE at finalize_export") does not hold for it: its drift gate and Form
+# B are applied inside the CDC path itself. The column is derived like the others (the
+# guard's CDC_DRAIN), and three honest gaps came with it (open_forensics,
+# source_harm_and_diagnosis, partition_budget_footer_note).
+#
 # runner, not just the single-batch path. The columns below collapse to FIVE runner
 # FAMILIES (four until the 2026-08-16 split recorded below), but the code actually has
 # ~EIGHT distinct commit loops: single;
@@ -128,7 +136,7 @@
 # each runner must EXPLICITLY re-apply (schema_drift gate, checksum harvest, part
 # stamp) is `gap` when unproven — that is exactly the class that bites.
 
-engines: [single, chunked, chunked_checkpoint, keyset, mongo_parallel]
+engines: [single, chunked, chunked_checkpoint, keyset, mongo_parallel, cdc]
 
 scenarios:
   - id: failed_chunk_fails_the_run
@@ -151,6 +159,7 @@ scenarios:
     chunked_checkpoint: { test: a_failed_chunk_must_fail_the_run_not_ship_a_short_export }
     keyset:         { test: parallel_keyset_worker_error_still_counts_the_durable_parts_postgres }
     mongo_parallel: { test: mongo_parallel_worker_error_still_counts_the_durable_parts }
+    cdc:            { test: a_failed_part_upload_still_records_the_siblings_durable_part }
 
   - id: adaptive_concurrency_governor
     what: "OPT-2 governor sheds parallel workers under source pressure (backs off to min_parallel, recovers as pressure eases). Runner-bypass class on the SAFETY knob: it was chunked-only, so a `parallel: N` keyset export on a straining replica adapted batches but never shed workers (#152). Now wired into keyset per-page (permit-per-page semaphore + the same Governor loop + min_parallel floor); the run journal records each ParallelismAdjusted.
@@ -217,6 +226,7 @@ scenarios:
     chunked_checkpoint: { test: checkpoint_governor_backs_off_under_concurrent_write_pressure, note: "the sequential half is na (no fan-out to govern); this cell grades the PARALLEL half. Was the last `gap:` in this file: the wiring was pinned offline (`the_parallel_checkpoint_runner_arms_spawns_and_drains_the_governor`, a call-site pin over source text) and the pool shed mechanism too (`a_shrunken_permit_ceiling_sheds_pool_workers_without_stranding_a_task`), but neither can catch a run whose SAMPLER never moves under real pressure — the end-to-end shed had only ever been seen in an ad-hoc run (2026-08-14), never committed. Filled to the recipe this cell carried: a checkpoint twin of the `chunked` cells live test (same writer + quiet window, plus `chunk_checkpoint: true`), asserting the RECORDED shed and the full row count. The oracle is the STORED `run_journal.journal_json`, not `rivet journal` — that command renders only files/retries/quality issues and never prints a ParallelismAdjusted, so the first draft read an empty result while stderr showed the shed. RED-proven twice: governor never arming (fails the arm assertion) and `drain_into` dropping its events (fails the RECORD assertion while stderr still says backed off)." }
     keyset:         { test: keyset_governor_backs_off_under_concurrent_write_pressure }
     mongo_parallel: { na: "mongo_parallel spawns one thread per _id range with NO shared permit ceiling — the governor's resize target does not exist there. The reader-level adaptive batch sizing (engine pressure counters) still applies; the concurrency governor is a permit-ceiling mechanism and mongo_parallel has no ceiling to shrink. A future ceiling would take a `test` cell here." }
+    cdc:            { na: "the drain is one change stream per export with no worker permit ceiling to shrink; per-table part uploads fan out once per roll through workers::run_each in roll_all (src/source/cdc/sink.rs), not a governed pool, and CDC reads no `tuning:`" }
 
   - id: schema_drift_gate
     what: "on_schema_drift enforcement — a drifted schema under `fail` aborts (exit 4). Round-8: keyset + mongo_parallel had SILENTLY dropped it (exit 0 on drift) — each runner re-applied the gate by hand then. Since ADR-0028 the gate runs ONCE at the finalize_export seam from the ledger's drift schema; runners only FEED the schema they resolved (chunked feeds none — its gate is pre-chunk via check_from_type_mappings, ADR-0021). The test cells grade the feed + seam end-to-end."
@@ -225,6 +235,7 @@ scenarios:
     chunked_checkpoint: { na: "shared CHUNKED preamble, not per-runner: every chunked variant takes the gate through chunked/mod.rs — `prepare_chunk_plan` / `prepare_chunk_plan_fresh` on the Detect path and `check_drift_only(_fresh)` on the Precomputed (apply/resume) path. Call sites, paired by shape rather than by line (a line number drifts on the next merge, a name does not): `run_chunked_sequential_checkpoint` calls the same `prepare_chunk_plan` / `check_drift_only` that `run_chunked_sequential` (chunked/exec.rs) calls, and `run_chunked_parallel_checkpoint` the same `prepare_chunk_plan_fresh` / `check_drift_only_fresh` that `run_chunked_parallel` calls — so the checkpoint runners cannot diverge from the cell to the left. Backstopped structurally as well — check_post_run_invariants rejects a state_backed success that committed parts with schema_changed = None (summary.rs), and finalize.rs panics on it under debug_assertions, the build every live test runs" }
     keyset:         { test: keyset_export_enforces_on_schema_drift_fail }
     mongo_parallel: { na: "the gate IS applied (check_from_sink_schema, mongo_parallel.rs), but a Mongo export's Arrow schema is a FIXED {_id, document, meta} shape — the document is one verbatim extended-JSON blob column, so adding/dropping a document field does NOT change the Arrow schema and cannot drift. The gate is wired defensively; there is no structural drift to trip it (a meta_columns config change is the only mover, covered by the meta cell)" }
+    cdc:            { test: mysql_cdc_retyped_column_refuses_under_fail_and_defers_not_drops }
 
   - id: quality_gates
     what: "the `quality:` block's tripwires. `row_count_min`/`max` is the COMPLETENESS gate (Severity::Fail -> exit 3) and must fire on every runner: it was Chunked-only once, so a truncated keyset/parallel extract — the paths auto-selected for LARGE tables, where completeness matters most — exited 0 with the tripwire silently disarmed (`run_chunked_quality_gate`, job.rs). `null_ratio_max` and `unique_columns` are single-batch checks by construction. Added as a row because the feature had none: the tests existed, scattered across three files, with nothing asking whether every runner was among them."
@@ -233,6 +244,7 @@ scenarios:
     chunked_checkpoint: { na: "not a per-runner re-application: the gate runs in `run_export_job` AFTER the runner returns, keyed on `plan.strategy` (Chunked | Keyset), so every chunked variant is inside the same arm as the cell to the left — there is no checkpoint-specific code path to bypass it" }
     keyset:         { test: keyset_quality_gate_failure_exits_data_integrity_3 }
     mongo_parallel: { na: "runs UNDER `ExtractionStrategy::Keyset` (single.rs: a Mongo keyset export with parallel > 1 fans _id-range workers), so it takes the Keyset arm of the same match — the cell to the left is the same code. A separate strategy variant would need its own `test` cell here." }
+    cdc:            { na: "not applied on the drain by design — the gate lives in execute_resolved_plan, which CDC returns before; the run warns when `quality:` is set (cdc_ignored_knobs_warning, pinned by cdc_names_every_batch_only_knob_it_ignores_and_only_those and the live a_cdc_export_names_the_batch_knobs_its_drain_ignores)" }
 
   - id: shape_drift_warn
     what: "detect_shape_drift — advisory warning when a string/binary column's max byte length grows past the factor. Applied once at the finalize_export seam from the ledger's max-merged shape bytes; every runner feeds its sinks' bytes (Observations via take_observations / take_shape). Each test widens ONE row in a MIDDLE chunk/page/range, so a runner that fed only its first or only its last sink stays RED."
@@ -241,6 +253,7 @@ scenarios:
     chunked_checkpoint: { test: shape_drift_warns_on_the_checkpoint_runner }
     keyset:         { test: shape_drift_warns_on_the_keyset_runner }
     mongo_parallel: { test: shape_drift_warns_on_the_mongo_parallel_runner }
+    cdc:            { na: "detect_shape_drift runs at the finalize_export seam, which CDC never reaches; the run warns when shape_drift_warn_factor is set (cdc_ignored_knobs_warning)" }
 
   - id: skip_empty_status
     what: "skip_empty: a run that delivered nothing (0 rows, 0 manifest parts) is recorded `skipped` with a skip_reason instead of `success`. Decided once by job.rs::ok_status after the runner returns, so no runner re-implements it; each test exports an EMPTY source and reads the status back from export_metrics."
@@ -249,6 +262,7 @@ scenarios:
     chunked_checkpoint: { test: skip_empty_skips_on_the_checkpoint_runner }
     keyset:         { test: skip_empty_skips_on_the_keyset_runner }
     mongo_parallel: { test: skip_empty_skips_on_the_mongo_parallel_runner }
+    cdc:            { na: "the drain does not read skip_empty (its status is success/failed, cdc_job.rs::run_cdc_export); the run warns when it is set (cdc_ignored_knobs_warning, cdc_names_every_batch_only_knob_it_ignores_and_only_those). The snapshot legs never inherit it (synth_snapshot_export)." }
 
   - id: value_checksum_form_b
     what: "Form B — the sink's per-column value checksums are harvested into summary.column_checksums so finalize_manifest RECORDS them and `rivet validate` can re-read the parts and verify the Arrow→Parquet encode. The sink COMPUTES them for every runner (track_checksum in on_batch); since ADR-0028 every runner FEEDS them into summary.ledger and the HARVEST happens once at the finalize_export seam — no runner calls harvest itself (round-9 had fixed the computed-then-discarded bug per runner; the seam removes the per-runner call entirely). ADR-0029 then made the feed KEYED and the coverage COMPUTED: a runner contributes under a UnitId (its commit unit — Run for single, Chunk for chunked/checkpoint/mongo_parallel, Page for keyset-sequential, Range for keyset-PARALLEL, whose parts publish per page but whose checksums publish per committed range), commit::record_part registers the same UnitId for every manifest part, and the seam compares the two sets — full cover records, any uncovered or hydrated part suppresses. So the cells below grade MORE than before: each asserts its runner RECORDS column_checksums in the destination manifest, and a runner that paired its part and its checksum under different UnitIds now suppresses and turns its cell RED. The structural backstop grew the matching half — check_post_run_invariants rejects a state_backed success carrying column_checksums_short_cover (a part this run recorded whose unit contributed nothing, which on a SUCCESS can only be a mis-pairing), so the fail-safe-but-silent direction is loud on every runner under debug_assertions, the build live tests use."
@@ -272,6 +286,7 @@ scenarios:
     chunked_checkpoint: { test: chunked_checkpoint_resume_suppresses_form_b_so_validate_does_not_false_fail }
     keyset:         { test: keyset_export_records_form_b_checksums_and_validate_passes }
     mongo_parallel: { test: mongo_parallel_export_records_form_b_checksum }
+    cdc:            { test: cdc_manifest_records_form_b_checksums_and_validate_verifies_them }
 
   - id: files_committed_on_abort
     what: "the retry duplicate guard's ONLY input. `decide_export_retry` bails with BailDuplicateGuard when summary.files_committed > 0 (pipeline/single.rs), and commit::record_part is the sole production site that raises it — so a runner that aborts BEFORE its record_part drain reports ZERO while its successful workers' parts are already durable, and a TRANSIENT failure retries the whole export over them. Found by the third hunt: keyset_parallel bailed above the drain since 0.23.0. Measured pre-fix — 4 parts on disk, `retry 1/2` + `retry 2/2`; with a range whose output SHRANK between attempts (mid-backoff DELETE) the earlier attempt's extra part survived unoverwritten: 751 rows / 750 distinct, id 501 duplicated. NOTE the reason the existing tests missed it, because it generalises: decide_export_retry's unit matrix FEEDS files_committed as a parameter (0/2/5) and is correct on every input, while the keyset worker-error live test DELETES the orphan parts before its clean re-run (a vacuous-oracle guard its own comment explains). Neither observes the VALUE one layer hands the other — this row exists to make that boundary a per-runner obligation."
@@ -285,6 +300,7 @@ scenarios:
     chunked_checkpoint: { na: "same ordering, verified per runner: sequential_checkpoint.rs records inside the per-chunk loop; parallel_checkpoint.rs drains every worker part through record_part and only THEN evaluates the worker-error bail and the not-completed-task bail (parallel_checkpoint.rs, `let errs = poison::into_recover(errors)` after the drain loop). Nothing aborts above a pending drain." }
     keyset:         { test: parallel_keyset_worker_error_still_counts_the_durable_parts_postgres }
     mongo_parallel: { test: mongo_parallel_worker_error_still_counts_the_durable_parts }
+    cdc:            { na: "no retry loop consumes it — run_cdc_export is never wrapped by decide_export_retry; the durable count still reaches the metrics row from the returned manifests (run_cdc_export), and the producer is pinned by a_failed_drain_still_reports_the_parts_it_made_durable (sink.rs)" }
 
   - id: guard_manifest_mode
     what: "cross-shape manifest guard — a batch export must REFUSE to overwrite a prior CDC manifest at the same prefix (and vice versa), or the two silently destroy each other's audit trail. HISTORY: round-11 found the TWO chunk-checkpoint runners bypassed the per-runner call (a chunked-checkpoint export clobbered a CDC prefix silently). Since 0.24.4 the guard is welded into RunnerFrame::open — the ONLY door to a batch destination (runner_frame_gate source-lint makes a bypass a diff-time failure) — so the feature moved from the per-runner class to the shared-seam class. The live cells below stay as belt-and-suspenders end-to-end proofs; the LOAD-BEARING guarantees are the frame's unit (open_refuses_a_cdc_prefix_before_any_part, RED-proven against a guard-less frame) and the lint (RED-proven against an injected bare create_destination)."
@@ -293,6 +309,7 @@ scenarios:
     chunked_checkpoint: { test: chunked_checkpoint_refuses_to_clobber_a_cdc_manifest }
     keyset:         { test: keyset_export_refuses_to_clobber_a_cdc_manifest }
     mongo_parallel: { test: mongo_parallel_export_refuses_to_clobber_a_cdc_manifest }
+    cdc:            { test: a_cdc_stream_into_a_batch_prefix_refuses_before_its_first_part }
 
   - id: meta_columns
     what: "__rivet_* meta columns (plan.meta_columns) injected into the output schema + batches."
@@ -301,6 +318,7 @@ scenarios:
     chunked_checkpoint: { na: "shared ExportSink seam — each chunk's sink injects, identical to the plain chunked cell" }
     keyset:         { na: "shared ExportSink seam — runner-agnostic (keyset's ExportRequest::unwrapped carries no meta; the sink injects downstream)" }
     mongo_parallel: { na: "shared ExportSink seam — runner-agnostic (each worker's sink injects)" }
+    cdc:            { na: "the drain writes through its own TableSink, not ExportSink; `exported_at` is deliberately not injected and warned at run start (cdc_ignored_meta_warning, pinned by cdc_warns_when_meta_columns_are_requested_on_a_cdc_export); row_hash is graded in the next row" }
 
   - id: row_hash_and_its_contract
     what: "`meta_columns.row_hash` — the `_rivet_row_hash` column AND the `RowHashContract` (covered set + render id) recorded in the run manifest, so a reader can check coverage instead of assuming it. Both halves are `na` by SEAM, and the seams differ: the COLUMN is injected by `ExportSink` (enrich_schema/enrich_batch, like meta_columns); the CONTRACT is derived from the PLAN snapshot (`RunSummary` ← `RowHashContract::of(&plan.meta_columns.row_hash)`), not harvested from the sink — which is what keeps it off the value-checksum `gap` path, where only `single` harvested `sink.column_checksums` into the summary. Recorded here explicitly because 'meta column ⇒ na' is only half the reason: a contract harvested per runner WOULD be a gap, and the next reader needs to see which mechanism it is."
@@ -309,6 +327,7 @@ scenarios:
     chunked_checkpoint: { na: "shared seams — ExportSink for the column, plan snapshot for the contract (identical to the plain chunked cell)" }
     keyset:         { na: "shared seams — ExportSink for the column, plan snapshot for the contract" }
     mongo_parallel: { na: "shared seams — each worker's sink injects the column; the contract comes from the same plan snapshot" }
+    cdc:            { test: cdc_drain_row_hash_matches_the_independent_implementation }
 
   - id: run_unique_part_naming
     what: "two runs into ONE destination prefix must not clobber — part filenames carry a run-unique token (millisecond %3f stamp or a random nonce), never a second-granularity stamp that collides."
@@ -317,6 +336,7 @@ scenarios:
     chunked_checkpoint: { na: "shared naming seam — every chunked variant derives its part base from the same `chunk_part_filename` (called once each by run_chunked_sequential and run_chunked_parallel in exec.rs, and by both checkpoint twins in sequential_checkpoint.rs / parallel_checkpoint.rs); there is no per-runner stamp to forget, so the pure-fn proof in the cell to the left covers this column too" }
     keyset:         { test: parallel_keyset_two_full_runs_into_same_prefix_no_clobber_postgres }
     mongo_parallel: { test: mongo_parallel_two_rapid_runs_into_same_prefix_do_not_clobber }
+    cdc:            { test: roast_second_run_into_same_prefix_must_not_clobber_prior_parts }
 
   - id: part_name_not_export_doubled
     what: "a part filename carries the export name EXACTLY ONCE. The keyset part-name format prepends `<export>_` AND used the run_id for run-uniqueness — but the production run_id is itself `<export>_<stamp>` (job.rs), so real runs wrote `<export>_<export>_<stamp>_pk_w…` (field-run, 0.24.5). The chunked/mongo/single siblings key their middle segment off a FRESH Utc stamp, not the run_id, so they never doubled; keyset was the odd one out. Fix: `run_scoped_tag` strips a redundant leading `<export>_` from the run tag."
@@ -325,6 +345,7 @@ scenarios:
     chunked_checkpoint: { na: "same `chunk_part_filename` seam as `chunked` — a fresh stamp, not the run_id" }
     keyset:         { test: keyset_part_names_do_not_double_the_export_name }
     mongo_parallel: { na: "keys off a fresh `%Y%m%d_%H%M%S_%3f` stamp (mongo_parallel.rs:63), not the run_id — no double" }
+    cdc:            { na: "the part name is `cdc-{run_token}-{seq:06}` (src/source/cdc/sink.rs), run_token derived from the run_id — nothing prepends the export name a second time" }
 
   - id: durable_manifest_before_advance
     what: "the destination manifest covering a run's parts is durable BEFORE the delivery position advances past them (the silent-loss ordering) — cross-references docs/durability-ordering-matrix.yaml."
@@ -333,6 +354,7 @@ scenarios:
     chunked_checkpoint: { test: chunked_crash_resume_writes_a_complete_destination_manifest }
     keyset:         { test: keyset_checkpoint_crash_resume_writes_a_complete_destination_manifest }
     mongo_parallel: { na: "no mid-run delivery position — mongo_parallel takes a quiescent full scan with no checkpoint/cursor advance; the manifest is written once at finalize and a crash re-runs the whole export (steady-state no-loss/no-dup covered by mongo_batch_parallel_integer_id_no_loss_or_dup)" }
+    cdc:            { test: roast_manifest_is_durable_before_the_slot_is_acked }
 
   - id: cursor_ownership_guard
     what: "a persisted cursor records its column/key on write (export_state.cursor_column, v26) and a run on another column refuses it instead of matching nothing"
@@ -341,6 +363,7 @@ scenarios:
     chunked_checkpoint: { na: "range chunking persists chunk_task state, never an export_state cursor" }
     keyset:         { test: keyset_incremental_key_change_mysql }
     mongo_parallel: { na: "quiescent full scan — no cursor read or written" }
+    cdc:            { na: "the drain persists a stream checkpoint (cdc.checkpoint / PG slot / SQL Server from-LSN), never an export_state cursor; its ownership analogue is the checkpoint identity refusal (a_mysql_checkpoint_from_another_server_is_refused, mssql_checkpoint_from_another_database_is_refused)" }
 
   - id: incremental_settle_window
     what: "exports[].settle bounds the incremental query below the source-clock threshold"
@@ -349,6 +372,7 @@ scenarios:
     chunked_checkpoint: { na: "settle is rejected outside mode: incremental, which runs only on the single runner" }
     keyset:         { na: "settle is rejected outside mode: incremental, which runs only on the single runner" }
     mongo_parallel: { na: "settle is rejected outside mode: incremental, which runs only on the single runner" }
+    cdc:            { na: "settle is refused outside mode: incremental at config load (validate_export_mode)" }
 
   - id: sparse_chunk_warn
     what: "run-start sparse-key cost warning (sparse_chunk_action) — a key span that divides into far more windows than the row count justifies is flagged at warn level before the windows execute."
@@ -357,6 +381,7 @@ scenarios:
     chunked_checkpoint: { na: "shared chunk-GENERATION seam — the warning is emitted inside detect_and_generate_chunks, reached by every chunked variant through prepare_chunk_plan / prepare_chunk_plan_fresh (run_chunked_sequential_checkpoint and run_chunked_parallel_checkpoint call the same two that run_chunked_sequential and run_chunked_parallel call in exec.rs), before any window executes. No per-runner emission to forget; the pure-fn proof to the left covers this column" }
     keyset:         { na: "index seek advances by `col > cursor` — no min/max range windows to explode, so the sparse-key cost class does not exist" }
     mongo_parallel: { na: "$sample-derived _id ranges, not (min..max)/chunk_size BETWEEN windows" }
+    cdc:            { na: "the drain reads the change log; there is no key span divided into windows, so the sparse-key cost class does not exist" }
 
   - id: resume_checkpoint
     what: "--resume / checkpoint continuation from the last durably-committed position."
@@ -365,6 +390,7 @@ scenarios:
     chunked_checkpoint: { test: chunked_crash_after_first_chunk_complete_resume_finishes_export }
     keyset:         { test: keyset_checkpoint_resume_second_run_captures_only_new_keys }
     mongo_parallel: { na: "no checkpoint/resume — run_mongo_parallel reads no checkpoint state; a crash re-runs the full quiescent scan" }
+    cdc:            { test: cdc_resume_captures_only_new_changes }
 
   - id: open_forensics
     what: "v18 failure forensics captured at run OPEN by capture_open_forensics — server_context_json (source version + limits, so a statement timeout / ERROR 3024 is explainable) + schema-at-open (columns/types via type_mappings LIMIT-0, so a run that fails BEFORE finalize still records its schema; export_schema was success-only, which left the field DB's 43 failures with none). Called once in run_export_job BEFORE the strategy branch, so all four runners share the seam; the runner-bypass risk was the SEPARATE apply entry point (run_export_job_with_chunk_source), now re-calling it explicitly."
@@ -373,6 +399,7 @@ scenarios:
     chunked_checkpoint: { na: "shared seam (run_export_job pre-dispatch — capture_open_forensics runs BEFORE the is_resumable() branch, so both chunked columns are the same call)" }
     keyset:         { test: keyset_export_persists_v18_forensics_columns }
     mongo_parallel: { na: "shared seam (run_export_job pre-dispatch); the one distinct entry point is APPLY (run_export_job_with_chunk_source), which re-calls capture_open_forensics — job.rs, guarding the runner-bypass class this ledger exists for" }
+    cdc:            { gap: "run_cdc_export never calls capture_open_forensics — its only run-path call is in execute_resolved_plan, which CDC returns before — so a failed drain records no server context or schema-at-open" }
 
   - id: bytes_read_metric
     what: "the v23 bytes_read metric (decoded Arrow bytes read from the source) must count EVERY runner's reads — a per-runner harvest would be the exact bypass class (a runner that forgets it reports 0). Wired shared-seam instead: the counter is an Arc on the PLAN (plan.bytes_read), every ExportSink::on_batch increments it (per-chunk sinks and plan-cloning workers share the Arc by construction), and run_export_job harvests it ONCE after the runner returns. No runner-specific code exists to forget (#175, 2026-08-09)."
@@ -381,6 +408,7 @@ scenarios:
     chunked_checkpoint: { na: "shared-seam (per-chunk / per-worker sinks share the same plan Arc; the harvest is the single post-run read in run_export_job, after the is_resumable() branch rejoins)" }
     keyset:         { na: "shared-seam (worker plan clones share the Arc)" }
     mongo_parallel: { na: "shared-seam (worker plan clones share the Arc)" }
+    cdc:            { test: read_bytes_counts_payload_not_resident }
 
   - id: source_harm_and_diagnosis
     what: >-
@@ -407,6 +435,7 @@ scenarios:
     chunked_checkpoint: { na: "shared seam (run_export_job brackets the dispatch — the bracket is taken around the whole strategy branch, so it covers both chunked columns identically)" }
     keyset:         { na: "shared seam (run_export_job brackets the dispatch)" }
     mongo_parallel: { na: "shared seam (run_export_job brackets the dispatch); the one distinct entry point is APPLY (run_export_job_with_chunk_source), which re-applies the SAME bracket (harm_snapshot + pg_temp_bytes_snapshot around the dispatch, run_diagnosis after status resolution — job.rs), guarded by both_job_entry_points_bracket_the_source_harm_window (tests/offline/runner_frame_gate.rs)" }
+    cdc:            { gap: "the harm_snapshot / pg_temp_bytes_snapshot bracket and run_diagnosis live in execute_resolved_plan, which the drain bypasses — a CDC run records no export_harm rows and no DIAGNOSIS; only its snapshot legs, which run the batch tail, do" }
 
   - id: throughput_self_check
     what: >
@@ -453,6 +482,7 @@ scenarios:
     chunked_checkpoint: { na: "tail-level — see the single cell; the runner is not a participant" }
     keyset:         { na: "tail-level — see the single cell; the runner is not a participant" }
     mongo_parallel: { na: "tail-level — see the single cell. Note the apply entry point (run_export_job_with_chunk_source) is the tail that was MISSING the seam until round 7, the same entry point the source_harm_and_diagnosis row above had to re-apply its bracket to — one entry point, two features it had to be taught separately" }
+    cdc:            { na: "tail-level: run_cdc_export returns its RunSummary through run_export_job into the same orchestrator aggregate as every runner, so the one seam covers it" }
 
   - id: memory_threshold_throttle
     what: "the `memory_threshold_mb` RSS throttle — pause/back off between chunks when the process RSS crosses the knob. DELIBERATELY chunked-family-only (three semantics: sequential pause-5s-once; plain-parallel block-until-below; checkpoint variants pause-once), and docs/reference/tuning.md documents exactly that scope. Round-4 (governor axis) found the doc claim guarded by NOTHING — the next runner edit could silently un-wire the throttle, or wire it into a runner the doc denies, and every suite stayed green. The cells below cite the wiring pin (tests/offline/memory_throttle_wiring.rs), which is a source-text guard failing BOTH directions: RED when a wired runner loses its check_memory call, RED-downward when a documented-absent runner gains one without this row/doc moving in the same commit. Honest strength: a pin proves wiring, not that the sleep fires — the threshold decision (resource::check_memory) has its own units."
@@ -461,6 +491,7 @@ scenarios:
     chunked_checkpoint: { test: the_memory_throttle_is_wired_into_every_chunked_variant }
     keyset:         { na: "documented absent (tuning.md): keyset pages are bounded by page_size and the governor sheds workers under source pressure; absence pinned downward by the_memory_throttle_stays_out_of_the_runners_the_doc_says_lack_it" }
     mongo_parallel: { na: "documented absent (tuning.md): worker batches are bounded by page_size; absence pinned downward by the_memory_throttle_stays_out_of_the_runners_the_doc_says_lack_it" }
+    cdc:            { na: "the drain never reads tuning.memory_threshold_mb; its memory ceiling is cdc.rollover_memory_mb (cdc_rollover_memory_bytes, cdc_job.rs)" }
 
   - id: load_spec_record
     what: "ADR-0034 D1: a successful run of an export in a config with a `load:` block records its resolved column types and source primary key in export_load_spec (state v27), so `rivet load` plans without the source. Recorded once in the run_export_job wrapper after the runner (or the CDC runner) returns Ok, so no runner can bypass it; the separate apply entry point (run_export_job_with_chunk_source) re-calls it."
@@ -469,6 +500,7 @@ scenarios:
     chunked_checkpoint: { na: "shared seam (run_export_job wrapper)" }
     keyset:         { na: "shared seam (run_export_job wrapper)" }
     mongo_parallel: { na: "shared seam (run_export_job wrapper); the Mongo capture itself is proven by run_records_the_load_spec_of_a_mongo_collection" }
+    cdc:            { test: the_recipe_column_types_reach_the_stream_and_the_recorded_spec }
 
   - id: cdc_backfill_leg
     what: "the CDC baseline leg under `cdc.backfill:` BORROWS its recipe's read (mode, key, workers, page size, resume, tuning, column types narrowed by the table label) and keeps its own identity and prefix — built once in `apply_backfill_recipe` and dispatched through the ordinary `run_export_job`, so WHICH runner runs is the recipe's mode, and no runner re-applies anything the leg could bypass. The cells name the recipe mode each is proven with."
@@ -477,6 +509,7 @@ scenarios:
     chunked_checkpoint: { test: a_crashed_chunked_baseline_finishes_on_the_next_plain_run }
     keyset:         { test: a_crashed_keyset_baseline_finishes_on_the_next_plain_run }
     mongo_parallel: { na: "the leg is the recipe dispatched as a batch export (shared seam); a Mongo recipe is proven live with a full-scan recipe (full_cdc_cycle_mongo), a parallel-Mongo recipe borrows the same fields (backfill_leg_borrows_the_recipe_read_and_keeps_its_own_identity)" }
+    cdc:            { test: the_recipe_column_types_reach_the_stream_and_the_recorded_spec }
 
   - id: partition_budget_footer_note
     what: "the writer keeps every part inside the load job's partition cap (`PartBudget`, 4,000 distinct buckets of the `load.partition` column) and records the count it measured in the Parquet footer (`rivet.partition_buckets`), which the loader takes as the bound instead of the footer's min/max span. The budget itself is shared-seam (one `ExportSink`, one `on_batch_inner`); the NOTE is not — it is written when the writer CLOSES, and every runner closes its LAST part itself (`ExportSink::finish_writer`, formerly a bare `writer.take()` + `finish()` that shipped the final part of every export, and every keyset page, unnoted — bughunt round 4). The sink unit test proves the method; a per-runner proof reads the footers of the parts each runner actually shipped, which no test does yet."
@@ -485,3 +518,4 @@ scenarios:
     chunked_checkpoint: { gap: "as chunked" }
     keyset:         { gap: "a keyset page is one part closed by the runner — the only path the note took before round 4 never ran here" }
     mongo_parallel: { gap: "as keyset" }
+    cdc:            { gap: "the drain writes parts through its own flush (src/source/cdc/sink.rs), with no PartBudget rotation and no rivet.partition_buckets note — both live only in pipeline/sink/mod.rs" }
