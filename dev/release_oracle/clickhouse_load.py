@@ -29,6 +29,9 @@ CELLS = {
     "a_cdc_stream_staged_on_s3_is_pulled_by_clickhouse": "s3:pull",
     "a_cdc_stream_staged_on_azure_loads_into_clickhouse": "azure:push",
     "a_cdc_stream_staged_on_azure_is_pulled_by_clickhouse": "azure:pull",
+    "a_change_log_with_tz_and_time_columns_takes_a_second_load": "reload-tz-time",
+    "a_part_clickhouse_cannot_address_is_sent_by_rivet_instead": "odd-key-pull",
+    "a_load_that_dies_after_adopting_the_table_resumes_into_the_log": "adopt-resume",
 }
 
 
