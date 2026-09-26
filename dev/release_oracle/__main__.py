@@ -50,6 +50,7 @@ from . import (
     blessed_flow,
     cdc,
     concurrency,
+    failure,
     gifs,
     init_delta,
     partner_shape,
@@ -406,6 +407,9 @@ def preflight(led: Ledger, *, bless_gifs: bool = False) -> None:
     scenarios.verify_replica_read(led)
     scenarios.verify_pool_e2e(led)
     scenarios.verify_pool_split(led)
+    # Faults that RETURN an error (every hook above panics): the failed-run tail and exact retries.
+    failure.verify_failed_run_tail(led)
+    failure.verify_transient_retry_exact(led)
     cdc.verify_cdc_e2e(led)
     cdc.verify_cdc_differential(led)
     regression.verify_release_regression(led)

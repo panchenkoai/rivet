@@ -140,6 +140,18 @@ have published**, when the failure is no longer re-runnable from the immutable t
 RED-proven: a stale `Cargo.lock` reddens the lock check; a multi-line inline table
 reddens **both** the offline guard AND `cargo chef prepare`. SKIP when `cargo` is absent.
 
+## Failures that RETURN, and exact retries (`failure.py`)
+
+Every other fault hook in the gate is a panic, and a panicked run never reaches the
+finalize code. `verify_failed_run_tail` fails PostgreSQL exports (single incremental,
+chunked parallel, chunk_checkpoint sequential/parallel, parallel keyset_incremental,
+`on_schema_drift: fail`) and a parallel Mongo export with `RIVET_TEST_ERROR_AT`, then
+checks exit, `_SUCCESS`, manifest status, `rivet validate` (RIVET_VERIFY_RUN_NOT_SUCCESSFUL),
+the state cursor via DuckDB ATTACH, `files_committed` vs disk, and a clean re-run
+against the source. `verify_transient_retry_exact` drives `RIVET_TEST_TRANSIENT_ONCE`
+and a toxiproxy `reset_peer` before/after the first durable part. Both SKIP when the
+stand PostgreSQL, Mongo or toxiproxy is down.
+
 ## Comparison against the previous release — three stages, and they BLOCK
 
 The gate compares to checked-in **goldens** and to **itself**, never to the version
