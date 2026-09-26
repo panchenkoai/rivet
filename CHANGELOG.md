@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **Reading CDC from a replica is verified on every engine.** Live tests and release-gate rows
+  now cover a PostgreSQL 16 standby (continuous mode; the default bounded mode still refuses,
+  and its message no longer claims a standby cannot host a slot), a SQL Server read-scale
+  availability group's readable secondary, and a MongoDB secondary, beside MySQL's re-logging
+  replica. The CDC reference says, per engine, what the replica needs and what proves it.
 - **MySQL CDC refuses a replica that does not re-log what it applies.** With
   `log_replica_updates = OFF` (MySQL's default) a replica's binlog holds none of the primary's
   changes; reading it captured nothing and exited 0. rivet now refuses such a replica at start.

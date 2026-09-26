@@ -690,9 +690,9 @@ impl PgChangeStream {
             if in_recovery {
                 anyhow::bail!(
                     "bounded (until_current) CDC cannot run on a PostgreSQL standby — it is in \
-                     recovery, where pg_current_wal_lsn() is unavailable and a logical slot cannot \
-                     be created. Stream continuously (until_current: false) or point the source at \
-                     the primary."
+                     recovery, where pg_current_wal_lsn() is unavailable. Stream continuously \
+                     (until_current: false; PostgreSQL 16+, where a standby can host a logical \
+                     slot) or point the source at the primary."
                 );
             }
         }

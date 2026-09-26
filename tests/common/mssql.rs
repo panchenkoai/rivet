@@ -175,6 +175,16 @@ pub fn mssql_exec(sql: &str) {
     exec_at(1433, sql)
 }
 
+/// Run T-SQL against the SQL Server on `port` (the availability-group pair lives on :1440/:1441).
+pub fn mssql_exec_on(port: u16, sql: &str) {
+    exec_at(port, sql)
+}
+
+/// Scalar `i64` from the SQL Server on `port`.
+pub fn mssql_query_i64_on(port: u16, sql: &str) -> i64 {
+    query_i64_at(port, sql)
+}
+
 /// Error-tolerant twin of [`mssql_exec`] for BACKGROUND LOAD threads against
 /// the shared `mssql` (`:1433`) — `true` when the statement really ran. See
 /// [`soft_exec_at`] for why a load loop must not use the panicking executor.

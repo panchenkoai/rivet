@@ -774,7 +774,7 @@ fn oracle_class_census_is_pinned() {
 // 2026-09-18, the compact guard: +3 independent — a foreign base refused before
 // any write, a dropped base refused by name with the buffer kept, and a compact
 // killed before its merge; all three graded by `bq` and the load ledger.
-const PIN_INDEPENDENT: usize = 82;
+const PIN_INDEPENDENT: usize = 85;
 const PIN_SHARED_CODEC: usize = 73;
 const PIN_SELF_COUNTER: usize = 6;
 const PIN_PRESENCE: usize = 64;
