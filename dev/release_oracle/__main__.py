@@ -469,8 +469,9 @@ def preflight(led: Ledger, *, bless_gifs: bool = False) -> None:
         ("warehouse layout", lambda sub: warehouse_layout.verify_warehouse_layout(sub)),
         ("init delta", lambda sub: init_delta.verify_init_delta(sub)),
         ("partner shape", lambda sub: partner_shape.verify_partner_shape(sub)),
-        ("clickhouse load", lambda sub: clickhouse_load.verify_clickhouse_load(sub)),
     ])
+    # Sequential: its CDC cells share the cross-process engine locks init delta holds.
+    clickhouse_load.verify_clickhouse_load(led)
     concurrency.verify_concurrent_writers_share_a_prefix(
         led,
         state_url=os.environ.get("RIVET_CDC_STATE_URL") or os.environ.get("RIVET_CONC_STATE_URL"),
