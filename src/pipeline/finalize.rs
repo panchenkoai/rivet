@@ -776,7 +776,10 @@ pub(super) fn warn_if_prefix_has_completed_run(plan: &ResolvedRunPlan) {
     let marker = match dest.head(SUCCESS_FILENAME) {
         Ok(Some(_)) => Some(SUCCESS_FILENAME),
         Ok(None) => match dest.head(MANIFEST_FILENAME) {
-            Ok(Some(_)) => Some(MANIFEST_FILENAME),
+            Ok(Some(_)) => dest
+                .read(MANIFEST_FILENAME)
+                .map_or(true, |b| manifest_describes_completed_parts(&b))
+                .then_some(MANIFEST_FILENAME),
             Ok(None) => None,
             Err(e) => {
                 log::debug!(
@@ -886,6 +889,13 @@ pub(crate) fn destination_has_success(dest: &crate::config::DestinationConfig) -
         return false;
     }
     matches!(d.head(SUCCESS_FILENAME), Ok(Some(_)))
+}
+
+/// Whether a prior `manifest.json` names a completed run with parts; unparseable counts as yes.
+fn manifest_describes_completed_parts(bytes: &[u8]) -> bool {
+    serde_json::from_slice::<crate::manifest::RunManifest>(bytes).map_or(true, |m| {
+        m.status == crate::manifest::ManifestStatus::Success && m.committed_part_count() > 0
+    })
 }
 
 /// The operator-facing body of the rerun-accumulation warning.
@@ -1503,6 +1513,36 @@ mod tests {
 
     fn read_manifest(dir: &std::path::Path) -> crate::manifest::RunManifest {
         serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn the_rerun_warning_counts_only_a_successful_manifest_with_parts_as_a_prior_run() {
+        let bytes_for = |status: &str, keep_parts: bool| {
+            let dir = tempfile::tempdir().unwrap();
+            let plan = fin_plan(dir.path());
+            let state = crate::state::StateStore::open_in_memory().unwrap();
+            let mut summary = fin_summary(&plan, status);
+            if !keep_parts {
+                summary.manifest_parts.clear();
+                summary.total_rows = 0;
+            }
+            finalize_manifest(&plan, "e", &state, &summary, "export");
+            std::fs::read(dir.path().join("manifest.json")).unwrap()
+        };
+        assert!(manifest_describes_completed_parts(&bytes_for(
+            "success", true
+        )));
+        assert!(
+            !manifest_describes_completed_parts(&bytes_for("failed", false)),
+            "a failed run with no parts left nothing a re-run could double-count"
+        );
+        assert!(!manifest_describes_completed_parts(&bytes_for(
+            "failed", true
+        )));
+        assert!(!manifest_describes_completed_parts(&bytes_for(
+            "success", false
+        )));
+        assert!(manifest_describes_completed_parts(b"not json"));
     }
 
     #[test]

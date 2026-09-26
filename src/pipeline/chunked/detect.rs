@@ -192,7 +192,7 @@ fn sparse_chunk_action(
                 return None; // roughly dense — the windows are earning their keep
             }
             let avg = (rows as usize) / chunk_count.max(1);
-            // Exact reduction: dense keyset paging tracks ROWS, so it collapses to
+            // Exact reduction: dense ordinal paging tracks ROWS, so it collapses to
             // rows/chunk_size windows — chunk_count/dense_windows fewer round-trips.
             let factor = chunk_count / dense_windows.max(1);
             Some(SparseAction::Bail(format!(
@@ -200,8 +200,10 @@ fn sparse_chunk_action(
                  ~{rows} rows (~{avg} rows/window vs chunk_size {cs}). `chunk_size` divides \
                  the KEY RANGE, not the row count, so most windows are near-empty and each is \
                  a separate source query: {chunk_count} round-trips, very slow over a \
-                 tunnel/VPN. Set one of: `chunk_dense: true` (dense keyset paging → \
-                 ~{dense_windows} windows, ~{factor}× fewer round-trips), `chunk_count: N`, \
+                 tunnel/VPN. Set one of: `chunk_by_key: <unique key>` (keyset paging — \
+                 windows track rows and stay correct under concurrent writes), \
+                 `chunk_dense: true` (~{dense_windows} windows, ~{factor}× fewer round-trips, \
+                 but only on a table nothing writes during the run), `chunk_count: N`, \
                  or `mode: full`."
             )))
         }
@@ -218,12 +220,24 @@ fn sparse_chunk_action(
                 "{chunk_count} chunk windows on a range key (no scan-free row estimate to \
                  confirm density). If the key is sparse (large / gappy ids), most windows are \
                  near-empty and this is {chunk_count} source round-trips — very slow over a \
-                 tunnel/VPN. If so: `chunk_dense: true` makes windows track ROWS not the id \
-                 span; or `chunk_count: {example_n}` → {example_n} windows (~{factor}× fewer \
-                 round-trips); or `mode: full`."
+                 tunnel/VPN. If so: `chunk_by_key: <unique key>` pages by keyset, tracking \
+                 ROWS not the id span; `chunk_dense: true` also tracks rows but only on a table \
+                 nothing writes during the run; or `chunk_count: {example_n}` → {example_n} \
+                 windows (~{factor}× fewer round-trips); or `mode: full`."
             )))
         }
     }
+}
+
+/// The run-start warning that `chunk_dense` ordinals shift under concurrent inserts/deletes.
+pub(crate) fn dense_concurrency_warning(export_name: &str, chunk_column: &str) -> String {
+    format!(
+        "export '{export_name}': chunk_dense numbers rows with ROW_NUMBER() OVER (ORDER BY \
+         `{chunk_column}`) again in EVERY chunk query, so a row inserted or deleted by another \
+         session during the run shifts later ordinals across window boundaries — rows are \
+         silently skipped or duplicated, even on a unique key. Use it only on a table nothing \
+         writes during the run; on a live table use `chunk_by_key: <unique key>` (keyset)."
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -291,6 +305,7 @@ pub(crate) fn detect_and_generate_chunks(
     }
 
     if chunk_dense {
+        log::warn!("{}", dense_concurrency_warning(export_name, chunk_column));
         let row_count = query_wrapped_row_count(src, base_query, source_type)?;
         log::info!(
             "export '{}': chunk_dense: ROW_NUMBER() OVER (ORDER BY `{}`) — {} row(s), chunk_size={}",
@@ -696,6 +711,31 @@ mod tests {
     }
 
     #[test]
+    fn a_dense_plan_logs_the_concurrency_warning_at_run_start() {
+        use crate::pipeline::run::run_tail_tests::{
+            captured_warnings_mentioning, install_warn_capture,
+        };
+        install_warn_capture();
+        let mut src = ScriptedSource::new([ok("250")]);
+        detect_and_generate_chunks(
+            &mut src,
+            "SELECT * FROM orders",
+            "id",
+            100,
+            None,
+            "dense_warn_probe",
+            true,
+            None,
+            SourceType::Postgres,
+        )
+        .unwrap();
+        assert_eq!(
+            captured_warnings_mentioning("export 'dense_warn_probe'"),
+            vec![dense_concurrency_warning("dense_warn_probe", "id")]
+        );
+    }
+
+    #[test]
     fn chunk_dense_zero_rows_returns_empty() {
         let mut src = ScriptedSource::new([ok("0")]);
         let chunks = detect(&mut src, 100, true, None).unwrap();
@@ -996,6 +1036,39 @@ mod tests {
             "should name the dense count: {msg}"
         );
         assert!(msg.contains("571"), "should quantify the reduction: {msg}");
+    }
+
+    #[test]
+    fn chunk_dense_warns_at_run_start_that_concurrent_writes_skip_or_duplicate_rows() {
+        assert_eq!(
+            dense_concurrency_warning("orders", "id"),
+            "export 'orders': chunk_dense numbers rows with ROW_NUMBER() OVER (ORDER BY `id`) \
+             again in EVERY chunk query, so a row inserted or deleted by another session during \
+             the run shifts later ordinals across window boundaries — rows are silently skipped \
+             or duplicated, even on a unique key. Use it only on a table nothing writes during \
+             the run; on a live table use `chunk_by_key: <unique key>` (keyset)."
+        );
+    }
+
+    #[test]
+    fn sparse_hints_recommend_keyset_before_dense() {
+        for msg in [
+            match sparse_chunk_action(3428, Some(520_789), 100_000).unwrap() {
+                SparseAction::Bail(m) | SparseAction::Warn(m) => m,
+            },
+            match sparse_chunk_action(3428, None, 100_000).unwrap() {
+                SparseAction::Bail(m) | SparseAction::Warn(m) => m,
+            },
+        ] {
+            let key = msg.find("`chunk_by_key: <unique key>`").expect(&msg);
+            let dense = msg.find("`chunk_dense: true`").expect(&msg);
+            assert!(key < dense, "keyset must come first: {msg}");
+            assert!(!msg.contains("dense keyset paging"), "{msg}");
+            assert!(
+                msg.contains("only on a table nothing writes during the run"),
+                "{msg}"
+            );
+        }
     }
 
     #[test]

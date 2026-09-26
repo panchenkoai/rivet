@@ -905,6 +905,11 @@ pub(super) fn keyset_anchor_survives(o: RunOutcome<'_>) -> bool {
     o.failed || o.manifest_gap.is_some()
 }
 
+/// Whether the incremental cursor may advance: only a successful run whose manifest landed.
+fn cursor_may_advance(status: &str, manifest_gap: &Option<String>) -> bool {
+    status == "success" && manifest_gap.is_none()
+}
+
 fn finalize_keyset_anchor(
     state: &StateStore,
     plan: &ResolvedRunPlan,
@@ -1417,13 +1422,15 @@ fn execute_resolved_plan(
     // "now that the manifest is durable" was a PREMISE, not a check: the cursor
     // advanced even when the manifest write had just failed, so the next run
     // started past data nothing described. Guarded now.
-    if manifest_gap.is_some() {
-        log::error!(
-            "{} '{}': incremental cursor NOT advanced — the manifest did not land, so the \
-             next run must re-export this window rather than skip past it",
-            tail.kind,
-            summary.export_name,
-        );
+    if !cursor_may_advance(&summary.status, &manifest_gap) {
+        if summary.cursor_high.is_some() {
+            log::error!(
+                "{} '{}': incremental cursor NOT advanced — the run did not succeed with a \
+                 manifest, so the next run must re-export this window rather than skip past it",
+                tail.kind,
+                summary.export_name,
+            );
+        }
     } else if let Err(e) = commit_incremental_cursor(state, plan, &summary) {
         log::error!(
             "{} '{}': cursor advance failed AFTER the manifest was written — the next run \
@@ -1906,6 +1913,19 @@ mod tests {
     /// manifest names — they are unreachable from both ends. Found by an
     /// adversarial pass over this branch; the manifest-gap handling that made the
     /// status "failed" did not widen the flag this decision reads.
+    #[test]
+    fn a_failed_run_holds_the_incremental_cursor_even_when_its_manifest_landed() {
+        let gap = Some("the manifest write FAILED".to_string());
+        assert!(cursor_may_advance("success", &None));
+        assert!(
+            !cursor_may_advance("failed", &None),
+            "a gate that fails AFTER the write (on_schema_drift: fail, quality) leaves only a \
+             Failed manifest — advancing past its rows loses them"
+        );
+        assert!(!cursor_may_advance("success", &gap));
+        assert!(!cursor_may_advance("failed", &gap));
+    }
+
     #[test]
     fn a_run_whose_manifest_did_not_land_keeps_its_keyset_resume_anchor() {
         let gap = Some("the manifest write FAILED".to_string());

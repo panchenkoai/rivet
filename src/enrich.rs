@@ -117,6 +117,16 @@ pub fn enrich_schema(schema: &SchemaRef, meta: &MetaColumns) -> Result<SchemaRef
     if meta.row_hash.enabled() {
         fields.push(Arc::new(Field::new(COL_ROW_HASH, DataType::Int64, false)));
     }
+    for added in &fields[schema.fields().len()..] {
+        if schema.field_with_name(added.name()).is_ok() {
+            anyhow::bail!(
+                "source column '{0}' collides with the '{0}' column rivet adds for \
+                 meta_columns — alias it in `query:` (e.g. `SELECT \"{0}\" AS src{0} ...`) \
+                 or turn that meta column off",
+                added.name()
+            );
+        }
+    }
     Ok(Arc::new(Schema::new(fields)))
 }
 
@@ -479,6 +489,36 @@ mod tests {
     /// `__is_deleted` column of constant `false`, so the base table's flag is
     /// populated by the load itself (BigQuery fills an absent column with NULL,
     /// not its DEFAULT — measured 2026-09-17).
+    #[test]
+    fn a_source_column_named_like_any_meta_column_is_refused_before_writing() {
+        let all_on = MetaColumns {
+            exported_at: true,
+            row_hash: RowHash::All(true),
+            cdc_snapshot_pos: Some("p".into()),
+            deleted_flag: true,
+        };
+        for name in [
+            COL_ROW_HASH,
+            COL_EXPORTED_AT,
+            "__pos",
+            "__seq",
+            crate::load::cdc::DELETE_FLAG_COLUMN,
+        ] {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new(name, DataType::Utf8, true),
+            ]));
+            let err = enrich_schema(&schema, &all_on).unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("source column '{name}' collides"))
+                    && err.contains("alias it in `query:`"),
+                "{name}: {err}"
+            );
+        }
+        let clean = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        assert_eq!(enrich_schema(&clean, &all_on).unwrap().fields().len(), 6);
+    }
+
     #[test]
     fn a_deleted_flag_leg_writes_a_constant_false_column() {
         use arrow::array::{Array as _, BooleanArray, Int64Array};

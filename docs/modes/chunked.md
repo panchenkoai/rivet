@@ -21,7 +21,7 @@ Four ways to slice the table. They differ in how chunk boundaries are computed; 
 |---|---|---|---|---|
 | **Fixed size** (default) | `chunk_size: 100000` | `SELECT MIN, MAX` → `[min..min+N)`, `[min+N..min+2N)`, ... — `N` rows of range per chunk | Dense numeric PK, predictable size budget per chunk | `chunk_size_memory_mb` |
 | **Fixed count** | `chunk_count: 16` | Range divided into exactly `N` equal slices; per-chunk size derived dynamically | You want exactly *N* workers / files (e.g. = CPU cores) | `chunk_dense`, `chunk_by_days` |
-| **Dense** | `chunk_dense: true` | `ROW_NUMBER() OVER (ORDER BY chunk_column)` instead of range; guarantees equal **row count** per chunk regardless of gaps | Sparse IDs — UUIDs as `BIGINT`, deleted rows, hashed keys | `chunk_by_days` |
+| **Dense** | `chunk_dense: true` | `ROW_NUMBER() OVER (ORDER BY chunk_column)` instead of range; guarantees equal **row count** per chunk regardless of gaps | Sparse IDs on a table nothing writes during the run (concurrent inserts/deletes skip or duplicate rows — use keyset on a live table) | `chunk_by_days` |
 | **Date-native** | `chunk_by_days: 365` | `chunk_column` must be `DATE` / `TIMESTAMP` / `TIMESTAMPTZ`; windows of N days with `>= AND <` (open-end) semantics | Time-series, event logs, historical backfills by period | `chunk_dense` |
 | **Memory-target** | `chunk_size_memory_mb: 256` | Auto-computes `chunk_size` from the engine's row-size estimate (PG `pg_class`/`reltuples`, MySQL `information_schema` avg row length; SQL Server has no estimate and falls back to 512 B/row); clamped to `[10_000, 5_000_000]` rows. Requires `table:` shortcut. Works on Postgres, MySQL, and SQL Server | You want to budget by megabytes, not rows; wide tables where row-width is hard to guess | explicit `chunk_size` |
 | **Keyset** (seek) | `chunk_by_key: uid` | Pages with `WHERE key > last ORDER BY key LIMIT chunk_size` on a unique index — **sequential by default; `parallel: N` fans it into N disjoint key ranges** — each page is one part file | **MySQL** tables with no single-integer PK (UUID / string / composite PK) — the only bounded shape without a server cursor. See [Keyset pagination](#keyset-seek-pagination--the-safe-shape-without-an-integer-pk) below | `chunk_column`, `chunk_dense`, `chunk_by_days`, `chunk_count` |
@@ -211,7 +211,7 @@ The open-end `< end_date` bound is intentional: it correctly captures all `TIMES
 
 ## Sparse ID ranges
 
-If IDs have large gaps (e.g. UUIDs cast to BIGINT, or deleted rows), many chunks may be empty. Use `chunk_dense: true` to use `ROW_NUMBER()` ordering instead:
+If IDs have large gaps (e.g. UUIDs cast to BIGINT, or deleted rows), many chunks may be empty. On a unique key prefer keyset (`chunk_by_key`, below); on a table nothing writes during the run, `chunk_dense: true` uses `ROW_NUMBER()` ordering instead:
 
 ```yaml
 exports:
@@ -229,18 +229,15 @@ exports:
 
 `rivet check` will warn you about sparse ranges.
 
-> **Pick a `chunk_column` whose ordering is stable.** Dense mode pages by
+> **Dense mode is for tables nothing writes during the run.** It pages by
 > `ROW_NUMBER() OVER (ORDER BY chunk_column)`, recomputed in an independent query
-> per chunk. If `chunk_column` has a large tied peer group (many equal values)
-> *and* the source is being written concurrently during the export, two chunks'
-> queries could order the tied band differently and a boundary row could land in
-> both or neither. Against a **static** table every engine we test (PG 16,
-> MySQL 8, SQL Server 2022) orders ties deterministically, so this does not occur
-> — but prefer a column with no large tied groups, or use **keyset** on a unique
-> key, when exporting a live-writing table. (The analog for incremental cursors
-> is in [semantics.md § Known non-guarantees](../semantics.md#known-non-guarantees).
-> Regression-guarded by `tests/live/live_chunked_dense.rs`, compiled into the
-> live suite via `tests/live_suite.rs`.)
+> per chunk. A row another session inserts or deletes mid-run shifts every later
+> ordinal, so rows cross window boundaries between chunk queries and are silently
+> skipped (a delete) or duplicated (an insert) — even on a unique key, not only on
+> a tied `chunk_column`. rivet warns at run start. On a live-writing table use
+> **keyset** (`chunk_by_key`) on a unique key instead. (See
+> [semantics.md § Known non-guarantees](../semantics.md#known-non-guarantees).
+> The static-table case is regression-guarded by `tests/live/live_chunked_dense.rs`.)
 
 ## Keyset (seek) pagination — the safe shape without an integer PK
 
@@ -377,7 +374,7 @@ with `N`.
 
 ## Troubleshooting
 
-**Many empty chunks** -- Your ID column has gaps. Add `chunk_dense: true`.
+**Many empty chunks** -- Your ID column has gaps. Use `chunk_by_key` on a unique key, or `chunk_dense: true` if nothing writes to the table during the run.
 
 **High memory usage with parallel > 1** -- Reduce `chunk_size` or add `tuning.profile: safe`.
 
