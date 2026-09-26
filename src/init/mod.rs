@@ -558,6 +558,9 @@ fn refuse_unsupported_forced_mode(source_url: &str, mode: Option<&str>) -> Resul
             "init: --mode {m}: {}",
             crate::config::non_sql_mode_refusal(st, m)
         ),
+        (Ok(crate::config::SourceType::Oracle), Some("cdc")) => {
+            anyhow::bail!("init: {}", crate::config::ORACLE_CDC_UNSUPPORTED)
+        }
         _ => Ok(()),
     }
 }
@@ -1068,12 +1071,6 @@ fn introspect_single_table(
     })
 }
 
-/// The config loader's refusal of `mode` on `source_type`, when it would refuse the scaffold init is about to write.
-fn mode_refusal(source_type: &str, mode: Option<&str>) -> Option<&'static str> {
-    (source_type == "oracle" && mode == Some("cdc"))
-        .then_some(crate::config::ORACLE_CDC_UNSUPPORTED)
-}
-
 /// MongoDB has no schema namespace (collections live directly in a database), so
 /// an explicit `--schema` cannot be honoured — it was silently ignored, exporting
 /// the URL's database instead of what the operator asked for (#12 bughunt). Refuse
@@ -1100,9 +1097,6 @@ fn init_yaml(
     filter: &TableFilter,
     mode_override: Option<&str>,
 ) -> Result<(String, bool, Vec<crate::state::StrategySnapshot>)> {
-    if let Some(why) = mode_refusal(source_type(source_url)?, mode_override) {
-        anyhow::bail!("init: {why}");
-    }
     if let Some(t) = table {
         let info = introspect_single_table(tls, source_url, t, schema)?;
         let hint = yaml_scaffold::table_has_unbounded_decimal_columns(&info);
@@ -3055,16 +3049,17 @@ mod tests {
 
     #[test]
     fn init_refuses_oracle_cdc_with_the_loaders_exact_words() {
+        let ora = "oracle://rivet:rivet@h:1521/FREEPDB1";
         assert_eq!(
-            mode_refusal("oracle", Some("cdc")),
-            Some(
-                "`mode: cdc` is not supported for Oracle yet — use `mode: full`, `chunked` or \
-                 `incremental`"
-            )
+            refuse_unsupported_forced_mode(ora, Some("cdc"))
+                .unwrap_err()
+                .to_string(),
+            "init: `mode: cdc` is not supported for Oracle yet — use `mode: full`, `chunked` or \
+             `incremental`"
         );
-        assert_eq!(mode_refusal("oracle", Some("chunked")), None);
-        assert_eq!(mode_refusal("oracle", None), None);
-        assert_eq!(mode_refusal("postgres", Some("cdc")), None);
+        assert!(refuse_unsupported_forced_mode(ora, Some("chunked")).is_ok());
+        assert!(refuse_unsupported_forced_mode(ora, None).is_ok());
+        assert!(refuse_unsupported_forced_mode("postgresql://h/db", Some("cdc")).is_ok());
     }
 
     #[test]

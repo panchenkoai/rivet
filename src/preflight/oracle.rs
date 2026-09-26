@@ -284,22 +284,30 @@ fn range_min_max_oracle(
 /// `Some(true)` when `column` leads some index on `table`, `Some(false)` when the
 /// probe ran and found none, `None` when it could not run.
 fn column_has_index_oracle(conn: &mut OracleSource, qualified: &str, column: &str) -> Option<bool> {
+    scalar_i64(conn, &index_probe_sql(qualified, column), "index").map(|n| n > 0)
+}
+
+/// Count of indexes led by `column` on `qualified`, both names folded as Oracle resolves them.
+fn index_probe_sql(qualified: &str, column: &str) -> String {
     let (owner, table) = crate::sql::oracle_catalog_preds(qualified);
-    let col = column.trim_matches('"').replace('\'', "''");
-    scalar_i64(
-        conn,
-        &format!(
-            "SELECT COUNT(*) FROM all_ind_columns WHERE table_owner = {owner} \
-             AND table_name = {table} AND column_position = 1 AND column_name = '{col}'"
-        ),
-        "index",
+    let col = crate::sql::oracle_catalog_name(column).replace('\'', "''");
+    format!(
+        "SELECT COUNT(*) FROM all_ind_columns WHERE table_owner = {owner} \
+         AND table_name = {table} AND column_position = 1 AND column_name = '{col}'"
     )
-    .map(|n| n > 0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_index_probe_folds_an_unquoted_column_like_oracle_does() {
+        assert!(
+            index_probe_sql("ext_order_keyed", "order_id").ends_with("column_name = 'ORDER_ID'")
+        );
+        assert!(index_probe_sql("t", "\"MiXed\"").ends_with("column_name = 'MiXed'"));
+    }
 
     #[test]
     fn each_range_bound_is_its_own_single_aggregate_statement() {

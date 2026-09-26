@@ -126,6 +126,7 @@ impl MongoSession {
         let (client, db) = rt
             .block_on(async {
                 let mut opts = ClientOptions::parse(url).await?;
+                default_server_selection_timeout(&mut opts);
                 // Honor the `tls:` block. Without this the driver used only the URL's
                 // `?tls=` — so `tls: { mode: verify-full }` on a URL that didn't opt
                 // in connected in PLAINTEXT, the exact posture the operator asked to
@@ -157,6 +158,12 @@ impl MongoSession {
     pub fn block_on<T>(&self, fut: impl std::future::Future<Output = T>) -> T {
         self.rt.block_on(fut)
     }
+}
+
+/// Cap server selection at 10 s unless the URL sets `serverSelectionTimeoutMS` (the driver's 30 s default made an unreachable or TLS-refusing server take ~90 s to fail).
+fn default_server_selection_timeout(opts: &mut ClientOptions) {
+    opts.server_selection_timeout
+        .get_or_insert(std::time::Duration::from_secs(10));
 }
 
 /// The refusal for a collection the database does not list; `None` when it exists or the listing was not allowed (a role without `listCollections`).
@@ -984,6 +991,26 @@ pub(crate) fn estimated_count(url: &str, tls: Option<&TlsConfig>, collection: &s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_selection_defaults_to_ten_seconds_but_the_url_wins() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let sel = |url: &str| {
+            let mut o = rt
+                .block_on(async { ClientOptions::parse(url).await })
+                .unwrap();
+            default_server_selection_timeout(&mut o);
+            o.server_selection_timeout
+        };
+        assert_eq!(
+            sel("mongodb://h/db"),
+            Some(std::time::Duration::from_secs(10))
+        );
+        assert_eq!(
+            sel("mongodb://h/db?serverSelectionTimeoutMS=45000"),
+            Some(std::time::Duration::from_secs(45))
+        );
+    }
 
     #[test]
     fn only_a_collection_the_database_does_not_list_is_refused() {
