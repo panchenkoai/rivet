@@ -242,7 +242,13 @@ fn write_csv_value(writer: &mut dyn Write, array: &dyn Array, idx: usize) -> Res
                 .as_any()
                 .downcast_ref::<BinaryArray>()
                 .expect("DataType/Array mismatch");
-            write_lower_hex(writer, arr.value(idx))?;
+            let val = arr.value(idx);
+            // Same rule as Utf8: a present empty value is `""`, bare nothing is NULL.
+            if val.is_empty() {
+                writer.write_all(b"\"\"")?;
+                return Ok(());
+            }
+            write_lower_hex(writer, val)?;
         }
         // FixedSizeBinary today only carries 16-byte UUIDs (see
         // `RivetType::Uuid` → `DataType::FixedSizeBinary(16)` in
@@ -643,9 +649,9 @@ mod tests {
     }
 
     #[test]
-    fn binary_empty_writes_empty() {
-        let arr = BinaryArray::from_vec(vec![&[][..]]);
-        assert_eq!(cell(arr, 0), "");
+    fn an_empty_binary_is_quoted_and_distinct_from_null() {
+        assert_eq!(cell(BinaryArray::from_vec(vec![&[][..]]), 0), "\"\"");
+        assert_eq!(null_cell(DataType::Binary), "");
     }
 
     // ── Date32 ───────────────────────────────────────────────────────────────
@@ -844,10 +850,10 @@ mod tests {
 
     #[test]
     fn binary_hex_matches_per_byte_format_for_all_byte_values() {
-        // Every byte 0..=255 plus the empty slice — the table+chunk encoder
-        // must equal the old per-byte `{:02x}`.
+        // Every byte 0..=255 — the table+chunk encoder must equal the old
+        // per-byte `{:02x}` (the empty value is `""`, pinned separately).
         let all: Vec<u8> = (0..=255u8).collect();
-        for case in [&all[..], &[][..], &[0x00, 0xff, 0x10, 0x0a]] {
+        for case in [&all[..], &[0x00, 0xff, 0x10, 0x0a]] {
             let expected: String = case.iter().map(|b| format!("{b:02x}")).collect();
             let got = cell(BinaryArray::from_vec(vec![case]), 0);
             assert_eq!(got, expected, "hex mismatch for {case:?}");
