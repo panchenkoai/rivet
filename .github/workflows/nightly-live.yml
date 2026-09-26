@@ -327,7 +327,7 @@ jobs:
   #
   # What is lost, plainly: nothing now sweeps code no PR is touching. That
   # capability never actually existed — no tier ever finished — so this removes a
-  # claim, not a check. `docs/mutants-baseline.txt` keeps its 1412 adjudicated
+  # claim, not a check. `docs/mutants-baseline.txt` keeps its adjudicated
   # verdicts as a record and no longer has an automated consumer.
 
   # Version-matrix scout lane (staff class #3): the CDC conformance subset
