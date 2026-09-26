@@ -79,8 +79,6 @@ mod live_cdc_golden;
 mod live_cdc_mbt;
 #[path = "live/live_cdc_mongo.rs"]
 mod live_cdc_mongo;
-#[path = "live/live_cdc_schema_drift.rs"]
-mod live_cdc_schema_drift;
 #[path = "live/live_cdc_mssql.rs"]
 mod live_cdc_mssql;
 #[path = "live/live_cdc_multi_table_cycle.rs"]
@@ -91,6 +89,8 @@ mod live_cdc_oracle;
 mod live_cdc_property;
 #[path = "live/live_cdc_replica.rs"]
 mod live_cdc_replica;
+#[path = "live/live_cdc_schema_drift.rs"]
+mod live_cdc_schema_drift;
 #[path = "live/live_chaos.rs"]
 mod live_chaos;
 #[path = "live/live_chunked_dense.rs"]

@@ -96,6 +96,24 @@ pub(super) fn check_from_type_mappings(
     )
 }
 
+/// Adapter — CDC: one captured table's probed columns, judged before any change is read.
+pub(super) fn check_from_cdc_mappings(
+    state: &StateStore,
+    key: &str,
+    mappings: &[crate::types::TypeMapping],
+    policy: SchemaDriftPolicy,
+) -> Result<()> {
+    let fields: Vec<arrow::datatypes::Field> = mappings
+        .iter()
+        .filter_map(crate::types::build_arrow_field)
+        .collect();
+    if fields.is_empty() {
+        return Ok(());
+    }
+    let columns = crate::state::arrow_schema_to_columns(&arrow::datatypes::Schema::new(fields));
+    check_and_persist(state, key, &columns, policy, &mut RunSummary::default())
+}
+
 /// Deep core (private): detect drift of `columns` against the stored baseline for
 /// `export_name` and act per `policy`.
 ///
