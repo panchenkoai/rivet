@@ -32,7 +32,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .core import Ledger, have, rivet, rivet_bin, run
-from .duck import Oracle
 from .scenarios import _manifest_declared_parts, _tcp_open, work_dir
 
 __all__ = ["verify_failed_run_tail", "verify_transient_retry_exact"]
@@ -47,6 +46,13 @@ VER = "stand"
 
 
 # ── small helpers ────────────────────────────────────────────────────────────
+def Oracle(**kw):  # noqa: N802
+    """The harness DuckDB session, imported lazily so `--self-test` runs on bare python3."""
+    from .duck import Oracle as _Oracle
+
+    return _Oracle(**kw)
+
+
 def _token() -> str:
     """A name fragment unique to this cell invocation (the stand is shared)."""
     return f"{os.getpid()}_{uuid.uuid4().hex[:6]}"
