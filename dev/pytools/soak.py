@@ -580,7 +580,8 @@ def setup_configs(rivet: Path, eng: Engine, work: Path, modes: set[str]) -> dict
             dirs["incremental"] = d
         for kind in ("keyset", "range"):
             d = work / eng.name / f"snapshot-{kind}"
-            cfg = gen_config(rivet, eng, d, "chunked")
+            # MongoDB is full-only: init refuses `--mode chunked` there, and the snapshot shapes are knobs on `full`.
+            cfg = gen_config(rivet, eng, d, "chunked" if eng.sql else "full")
             ex = cfg["exports"][0]
             if eng.sql:
                 if ex.get("chunk_by_key") != "id":
