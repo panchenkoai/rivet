@@ -22,13 +22,18 @@ pub(super) fn current_schema(conn: &mut OracleSource) -> Result<String> {
 
 /// `schema`, or the session's current schema for an unqualified / `public` placeholder.
 pub(super) fn resolve_schema(conn: &mut OracleSource, schema: Option<&str>) -> Result<String> {
-    match schema
-        .map(str::trim)
-        .filter(|s| !s.is_empty() && *s != "public")
-    {
-        Some(s) => Ok(crate::sql::oracle_catalog_name(s)),
+    match explicit_owner(schema) {
+        Some(owner) => Ok(owner),
         None => current_schema(conn),
     }
+}
+
+/// The owner a `--schema` names, folded like Oracle; `None` for none, blank or the `public` placeholder.
+fn explicit_owner(schema: Option<&str>) -> Option<String> {
+    schema
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "public")
+        .map(crate::sql::oracle_catalog_name)
 }
 
 fn lit(s: &str) -> String {
@@ -267,5 +272,19 @@ mod tests {
         assert!(ts.is_indexed && !ts.is_primary_key);
         assert_eq!(ts.data_type, "timestamp(6)");
         assert!(column_info(&row(["X", "NUMBER", "0", "0", "Y", "", ""])[..6]).is_none());
+    }
+
+    #[test]
+    fn an_explicit_schema_folds_and_placeholders_mean_the_current_one() {
+        assert_eq!(explicit_owner(Some(" rivet ")).as_deref(), Some("RIVET"));
+        assert_eq!(explicit_owner(Some("\"Mixed\"")).as_deref(), Some("Mixed"));
+        assert_eq!(explicit_owner(Some("public")), None);
+        assert_eq!(explicit_owner(Some("  ")), None);
+        assert_eq!(explicit_owner(None), None);
+    }
+
+    #[test]
+    fn a_catalog_literal_doubles_its_quotes() {
+        assert_eq!(lit("O'NEIL"), "O''NEIL");
     }
 }

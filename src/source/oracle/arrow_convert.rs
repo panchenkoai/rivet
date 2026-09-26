@@ -384,6 +384,11 @@ mod tests {
         assert_eq!(number_type(3, 5), dec(5, 5), "s > p widens to (s,s)");
         assert_eq!(number_type(10, 60), RivetType::String, "s > 38: exact text");
         assert_eq!(
+            number_type(10, 38),
+            dec(38, 38),
+            "s = 38 still fits Decimal128"
+        );
+        assert_eq!(
             number_type(5, -2),
             dec(7, 0),
             "negative scale widens to integers"

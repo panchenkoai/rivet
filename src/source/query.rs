@@ -485,6 +485,15 @@ pub(crate) fn escape_pg_literal(s: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn an_oracle_literal_is_varchar2_with_doubled_quotes() {
+        assert_eq!(escape_oracle_literal("it's"), "'it''s'");
+        assert_eq!(
+            escape_oracle_literal("2024-01-01T00:00:00.000000"),
+            "'2024-01-01T00:00:00.000000'"
+        );
+    }
+
     fn cursor_with(val: Option<&str>) -> CursorState {
         CursorState {
             export_name: "t".into(),
