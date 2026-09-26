@@ -508,6 +508,8 @@ struct LoadInputs {
     marker_active: std::collections::HashSet<String>,
     /// The selected run manifests, keyed by their bucket path.
     runs: Vec<(String, crate::manifest::RunManifest)>,
+    /// The Success runs under the prefix whose files `cleanup_source` may remove.
+    cleanable: Vec<(String, crate::manifest::RunManifest)>,
     /// Whether the target table, if it exists, is one rivet loaded (per the ledger).
     ownership: load::Ownership,
 }
@@ -663,6 +665,7 @@ fn prepare_load(
         .iter()
         .filter(|(_, m)| m.status == crate::manifest::ManifestStatus::Success)
         .count();
+    let listed = keyed.clone();
     let new = load::reconcile::select_runs(keyed, &loaded, plan.mode)?;
     if new.is_empty() {
         if manifests_seen > 0 && success_runs == 0 {
@@ -760,6 +763,7 @@ fn prepare_load(
     // loading. Same class as the ledger READ below, and the `Err(_) => true` at the
     // gc callsite shows the direction was a real choice: there it fails SAFE.
     let ownership = ownership_of(state, target_fqtn, "load");
+    let cleanable = cleanable_runs(listed, &loaded, &source_run_ids, plan.mode);
     Ok(Some(LoadInputs {
         integrity,
         uris,
@@ -768,6 +772,7 @@ fn prepare_load(
         active_at_fetch,
         marker_active,
         runs: new,
+        cleanable,
         ownership,
     }))
 }
@@ -839,6 +844,40 @@ fn consumable_run_ids(
         .filter(|id| !active.contains(*id))
         .cloned()
         .collect()
+}
+
+/// The Success runs whose files `cleanup_source` may remove: every one on a full load, which supersedes them, else those already loaded or being loaded now.
+fn cleanable_runs(
+    listed: Vec<(String, crate::manifest::RunManifest)>,
+    loaded: &std::collections::HashSet<String>,
+    loading: &[String],
+    mode: load::plan::LoadMode,
+) -> Vec<(String, crate::manifest::RunManifest)> {
+    listed
+        .into_iter()
+        .filter(|(_, m)| m.status == crate::manifest::ManifestStatus::Success)
+        .filter(|(_, m)| {
+            mode == load::plan::LoadMode::Full
+                || loaded.contains(&m.run_id)
+                || loading.contains(&m.run_id)
+        })
+        .collect()
+}
+
+/// The runs that may still be writing into the prefix, or `None` when a stateful load could not tell.
+fn still_writing(
+    active_at_fetch: &Option<std::collections::HashSet<String>>,
+    marker_active: &std::collections::HashSet<String>,
+    stateful: bool,
+) -> Option<std::collections::HashSet<String>> {
+    match (active_at_fetch, stateful) {
+        (None, true) => None,
+        (at_fetch, _) => {
+            let mut writing = at_fetch.clone().unwrap_or_default();
+            writing.extend(marker_active.iter().cloned());
+            Some(writing)
+        }
+    }
 }
 
 /// The operator note for source runs still writing into the prefix — `None` when
@@ -1155,7 +1194,18 @@ fn load_one_cdc_base(
             if let Some(uris) = buffer_uris(stream_uris) {
                 let manifests: Vec<_> = stream.iter().map(|(_, m)| m.clone()).collect();
                 let integrity = load::reconcile::reconcile(&manifests, allow_source_drift)?;
-                let (cleanup, _prefix_lease) = cleanup_target_leased(plan, store, state);
+                let (cleanup, _prefix_lease) = cleanup_target_leased(
+                    plan,
+                    store,
+                    state,
+                    &inputs.cleanable,
+                    still_writing(
+                        &inputs.active_at_fetch,
+                        &inputs.marker_active,
+                        state.is_some(),
+                    )
+                    .as_ref(),
+                );
                 let r = load::run_load_buffer(
                     loader,
                     &plan.table,
@@ -1163,7 +1213,7 @@ fn load_one_cdc_base(
                     &uris,
                     pk,
                     Some(integrity.file_rows),
-                    cleanup,
+                    cleanup.as_ref().map(|(s, k)| (*s, k.as_slice())),
                 )?;
                 landed.push(r.rows_appended);
                 report = Some(r);
@@ -1602,7 +1652,18 @@ fn load_one_cdc(
             }
             // The driver gates the appended delta against the manifests' summed
             // `row_count` and cleans up (only) after the gate passes.
-            let (cleanup, _prefix_lease) = cleanup_target_leased(plan, store, state);
+            let (cleanup, _prefix_lease) = cleanup_target_leased(
+                plan,
+                store,
+                state,
+                &inputs.cleanable,
+                still_writing(
+                    &inputs.active_at_fetch,
+                    &inputs.marker_active,
+                    state.is_some(),
+                )
+                .as_ref(),
+            );
             let report = load::run_load_cdc(
                 loader,
                 &plan.table,
@@ -1611,7 +1672,7 @@ fn load_one_cdc(
                 pk,
                 engine,
                 Some(inputs.integrity.file_rows),
-                cleanup,
+                cleanup.as_ref().map(|(s, k)| (*s, k.as_slice())),
                 inputs.ownership,
                 rebuild_changelog,
             )?;
@@ -1856,7 +1917,18 @@ fn load_one_incremental(
                 let (cleanup, _prefix_lease) = if has_deltas {
                     (None, None)
                 } else {
-                    cleanup_target_leased(plan, store, state)
+                    cleanup_target_leased(
+                        plan,
+                        store,
+                        state,
+                        &inputs.cleanable,
+                        still_writing(
+                            &inputs.active_at_fetch,
+                            &inputs.marker_active,
+                            state.is_some(),
+                        )
+                        .as_ref(),
+                    )
                 };
                 // The base carries the delete flag as DATA, like a CDC baseline:
                 // the buffer's tombstones flip it, and the column must exist from
@@ -1875,7 +1947,7 @@ fn load_one_incremental(
                     &base_specs,
                     &uris,
                     Some(integrity.file_rows),
-                    cleanup,
+                    cleanup.as_ref().map(|(s, k)| (*s, k.as_slice())),
                     inputs.ownership,
                 )?;
                 eprintln!("{}", full_done_line(&integrity, &r));
@@ -1892,7 +1964,18 @@ fn load_one_incremental(
                 } else {
                     inputs.ownership
                 };
-                let (cleanup, _prefix_lease) = cleanup_target_leased(plan, store, state);
+                let (cleanup, _prefix_lease) = cleanup_target_leased(
+                    plan,
+                    store,
+                    state,
+                    &inputs.cleanable,
+                    still_writing(
+                        &inputs.active_at_fetch,
+                        &inputs.marker_active,
+                        state.is_some(),
+                    )
+                    .as_ref(),
+                );
                 let r = if base_and_buffer {
                     load::run_load_buffer(
                         loader,
@@ -1901,7 +1984,7 @@ fn load_one_incremental(
                         &uris,
                         pk,
                         Some(integrity.file_rows),
-                        cleanup,
+                        cleanup.as_ref().map(|(s, k)| (*s, k.as_slice())),
                     )?
                 } else {
                     load::run_load_incremental(
@@ -1912,7 +1995,7 @@ fn load_one_incremental(
                         pk,
                         &cursor,
                         Some(integrity.file_rows),
-                        cleanup,
+                        cleanup.as_ref().map(|(s, k)| (*s, k.as_slice())),
                         ownership,
                         rebuild_changelog,
                     )?
@@ -1971,14 +2054,25 @@ fn load_one(
             );
         },
         |loader, store, inputs, _legs| {
-            let (cleanup, _prefix_lease) = cleanup_target_leased(plan, store, state);
+            let (cleanup, _prefix_lease) = cleanup_target_leased(
+                plan,
+                store,
+                state,
+                &inputs.cleanable,
+                still_writing(
+                    &inputs.active_at_fetch,
+                    &inputs.marker_active,
+                    state.is_some(),
+                )
+                .as_ref(),
+            );
             let report = load::run_load(
                 loader,
                 &plan.table,
                 &plan.specs,
                 &inputs.uris,
                 Some(inputs.integrity.file_rows),
-                cleanup,
+                cleanup.as_ref().map(|(s, k)| (*s, k.as_slice())),
                 inputs.ownership,
             )?;
             Ok((report.rows_loaded, report))
@@ -3540,8 +3634,9 @@ mod live_only_decisions {
         plan.load.cleanup_source = true;
 
         // Idle: the delete proceeds AND the lease is held while it does.
-        let (target, lease) = cleanup_target_leased(&plan, &store, Some(&state));
-        assert_eq!(target.map(|(_, p)| p), Some(prefix));
+        let (target, lease) =
+            cleanup_target_leased(&plan, &store, Some(&state), &[], Some(&Default::default()));
+        assert_eq!(target.map(|(_, k)| k), Some(Vec::new()));
         assert!(
             lease.is_some(),
             "the delete must HOLD the prefix, not merely check it"
@@ -3549,27 +3644,83 @@ mod live_only_decisions {
 
         // Held by someone else: no delete. The load itself already succeeded, so
         // leaving the staged Parquet is the safe half of the trade.
-        let (blocked, no_lease) = cleanup_target_leased(&plan, &store, Some(&state));
+        let (blocked, no_lease) =
+            cleanup_target_leased(&plan, &store, Some(&state), &[], Some(&Default::default()));
         assert!(
             blocked.is_none() && no_lease.is_none(),
             "a prefix another rivet holds must not be wiped: {:?}",
-            blocked.map(|(_, p)| p)
+            blocked.map(|(_, k)| k)
         );
 
         // Released with the holder, as every rivet lease is.
         drop(lease);
-        let (again, _) = cleanup_target_leased(&plan, &store, Some(&state));
+        let (again, _) =
+            cleanup_target_leased(&plan, &store, Some(&state), &[], Some(&Default::default()));
         assert_eq!(
-            again.map(|(_, p)| p),
-            Some(prefix),
+            again.map(|(_, k)| k),
+            Some(Vec::new()),
             "the lease is released with its holder — the next load cleans up normally"
         );
 
         // Stateless is unchanged: no lease to take, no second rivet to coordinate
         // with, and refusing would break the documented stateless path for nothing.
-        let (stateless, none) = cleanup_target_leased(&plan, &store, None);
-        assert_eq!(stateless.map(|(_, p)| p), Some(prefix));
+        let (stateless, none) =
+            cleanup_target_leased(&plan, &store, None, &[], Some(&Default::default()));
+        assert_eq!(stateless.map(|(_, k)| k), Some(Vec::new()));
         assert!(none.is_none());
+    }
+
+    #[test]
+    fn cleanup_may_remove_loaded_runs_and_superseded_full_runs_never_unloaded_ones() {
+        let listed = || {
+            vec![
+                (
+                    "p/manifest-old.json".to_string(),
+                    success_manifest("old", "a.parquet"),
+                ),
+                (
+                    "p/manifest-now.json".to_string(),
+                    success_manifest("now", "b.parquet"),
+                ),
+                (
+                    "p/manifest-late.json".to_string(),
+                    success_manifest("late", "c.parquet"),
+                ),
+            ]
+        };
+        let ids = |v: Vec<(String, crate::manifest::RunManifest)>| -> Vec<String> {
+            v.into_iter().map(|(_, m)| m.run_id).collect()
+        };
+        let loaded: std::collections::HashSet<String> = ["old".to_string()].into();
+        let loading = ["now".to_string()];
+        assert_eq!(
+            ids(cleanable_runs(listed(), &loaded, &loading, LoadMode::Cdc)),
+            vec!["old", "now"],
+            "a run written after this load's read is not its to delete"
+        );
+        assert_eq!(
+            ids(cleanable_runs(
+                listed(),
+                &Default::default(),
+                &loading,
+                LoadMode::Full
+            )),
+            vec!["old", "now", "late"],
+            "a full load supersedes every earlier run"
+        );
+    }
+
+    #[test]
+    fn a_stateful_load_that_cannot_tell_who_is_writing_deletes_nothing() {
+        let markers: std::collections::HashSet<String> = ["m".to_string()].into();
+        assert_eq!(still_writing(&None, &markers, true), None);
+        assert_eq!(still_writing(&None, &markers, false), Some(markers.clone()));
+        let at_fetch = Some(["a".to_string()].into());
+        assert_eq!(
+            still_writing(&at_fetch, &markers, true),
+            Some(["a".to_string(), "m".to_string()].into()),
+            "the ledger's writers and the bucket's markers both spare a run"
+        );
     }
 
     /// Orphan GC over a real store, both directions. Kills `replace
@@ -3757,6 +3908,7 @@ mod live_only_decisions {
             active_at_fetch: Some(Default::default()),
             marker_active: Default::default(),
             runs: Vec::new(),
+            cleanable: Vec::new(),
             ownership: load::Ownership::Own,
         };
 

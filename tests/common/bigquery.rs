@@ -297,6 +297,38 @@ impl BqLive {
     }
 
     /// The top-level `load:` line for a rig, with `extra` appended inside the mapping.
+    /// Every object name under this test's GCS prefix.
+    pub fn gcs_objects(&self) -> Vec<String> {
+        let list = format!(
+            "https://storage.googleapis.com/storage/v1/b/{}/o",
+            self.bucket
+        );
+        let mut names = Vec::new();
+        let mut page_token: Option<String> = None;
+        loop {
+            let mut url = format!(
+                "{list}?prefix={}/&fields=items(name),nextPageToken",
+                urlencode(&self.prefix)
+            );
+            if let Some(t) = &page_token {
+                url.push_str(&format!("&pageToken={}", urlencode(t)));
+            }
+            let (st, page) = call(reqwest::Method::GET, &url, None);
+            assert_eq!(st, 200, "list gs://{}/{}: {page}", self.bucket, self.prefix);
+            names.extend(
+                page["items"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|i| i["name"].as_str().map(str::to_string)),
+            );
+            match page["nextPageToken"].as_str() {
+                Some(t) => page_token = Some(t.to_string()),
+                None => return names,
+            }
+        }
+    }
+
     pub fn load_line(&self, extra: &str) -> String {
         format!(
             "load: {{ target: bigquery, project: {}, dataset: {}{extra} }}",

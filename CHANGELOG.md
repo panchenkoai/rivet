@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **`cleanup_source` no longer deletes parts an extract committed during the load.** The load
+  checked for a running extract before appending, then deleted the whole prefix after it; an
+  extract that started and committed in between lost its parts after the source position had
+  moved past them (measured: 51 of 52 rows reached BigQuery). Cleanup now deletes exactly the
+  files of runs already loaded (or superseded, on a full load) that nobody is writing.
 - **`on_schema_drift` now applies to CDC exports.** A CDC run never consulted it: a column
   retyped between runs wrote parts with different types into one prefix and exited 0 under
   `fail`. Each captured table's schema is now checked before the stream reads a change, so a
