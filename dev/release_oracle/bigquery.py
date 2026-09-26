@@ -539,8 +539,8 @@ def _bq_one_engine(
 
     url = up(led, engine, _TAG, image, port)
     if not url:
-        led.skipped("bigquery", engine, "golden", "-",
-                    f"BigQuery[{engine}]: bring-up failed", "bring-up")
+        led.failed("bigquery", engine, "golden", "-",
+                   f"BigQuery[{engine}]: bring-up failed", "bring-up")
         return None
     if seed(engine, _TAG, url):
         led.skipped("bigquery", engine, "golden", "-",

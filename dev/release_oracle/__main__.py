@@ -627,7 +627,8 @@ def bring_up(led: Ledger, engine: str, tag: str, image: str, port: int) -> str |
     # than the bring-up — the same "ignored boolean" shape this gate exists to
     # catch elsewhere.
     if not wait_until(ready, tries=45, delay=2.0):
-        led.skipped(engine, tag, "all", "-",
+        # FAIL, not SKIP: an engine the gate was asked to grade and did not is a hole.
+        led.failed(engine, tag, "all", "-",
                     f"{engine}:{tag} never became ready (no probe of "
                     f"{[p[0] for p in probes]} "
                     f"never passed twice in ~90s)", "not ready")
@@ -763,7 +764,7 @@ def _run_one_version(led: Ledger, ns: argparse.Namespace, engine: str, line: str
     with led.span(f"{engine}: bring-up"):
         url = bring_up(led, engine, tag, image, port)
     if not url:
-        led.add(engine, tag, "all", "-", Status.SKIP, "bring-up failed")
+        led.add(engine, tag, "all", "-", Status.FAIL, "bring-up failed")
         return
     # The seed is idempotent (DROP TABLE IF EXISTS …), so a transient
     # failure is retried: a fresh container under load can drop the seed
