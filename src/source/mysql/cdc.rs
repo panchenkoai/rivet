@@ -3013,6 +3013,32 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod identity_recovery_order {
+    use super::CheckpointIdentity;
+
+    #[test]
+    fn every_identity_refusal_names_the_anchor_before_the_snapshot() {
+        for v in [
+            CheckpointIdentity::ForeignServer {
+                checkpoint: "a".into(),
+                server: "b".into(),
+            },
+            CheckpointIdentity::GtidNotContained {
+                checkpoint: "a:1-5".into(),
+                server: "a:1-2".into(),
+            },
+        ] {
+            let why = v.refusal().expect("refuses");
+            assert!(
+                why.contains("delete the checkpoint so the next run pins a fresh one FIRST, THEN re-snapshot the table (`mode: full`)")
+                    || why.contains("Delete the checkpoint so the next run pins a fresh one FIRST, THEN re-snapshot the table (`mode: full`)"),
+                "{v:?}: {why}"
+            );
+        }
+    }
+}
+
 /// The outcome of [`MysqlChangeStream::checkpoint_identity_verdict`].
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum CheckpointIdentity {
@@ -3039,15 +3065,18 @@ impl CheckpointIdentity {
                  resuming would start at an arbitrary point in a DIFFERENT binlog, \
                  capturing whatever is there and skipping whatever was between — \
                  silently, in both directions. If the source genuinely moved \
-                 (a failover, a restore), re-snapshot (`mode: full`) and start CDC \
-                 from a fresh checkpoint; the old coordinates cannot be carried over."
+                 (a failover, a restore), delete the checkpoint so the next run pins a \
+                 fresh one FIRST, THEN re-snapshot the table (`mode: full`): snapshotting \
+                 first leaves the changes in between in neither. The old coordinates \
+                 cannot be carried over."
             )),
             Self::GtidNotContained { checkpoint, server } => Some(format!(
                 "mysql cdc: the checkpoint's GTID set `{checkpoint}` is not contained \
                  in the server's executed set `{server}` — the same server no longer \
                  has those transactions, which is what a `RESET MASTER` or a rebuild \
                  leaves behind. The coordinates address a binlog that no longer \
-                 exists. Re-snapshot (`mode: full`) and start from a fresh checkpoint."
+                 exists. Delete the checkpoint so the next run pins a fresh one FIRST, \
+                 THEN re-snapshot the table (`mode: full`)."
             )),
         }
     }

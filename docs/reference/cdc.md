@@ -461,8 +461,9 @@ can serve that log is an engine + replica-config question, not a rivet limitatio
 **MySQL caveat — the checkpoint is replica-local.** Rivet resumes by binlog
 `{file, pos}` (not GTID), and a replica's binlog coordinates are its *own*, not the
 primary's. A checkpoint taken against one replica does **not** transfer to another
-host: if you fail over (to a different replica, or to the primary), re-snapshot
-(`mode: full`) and restart CDC from a fresh checkpoint there.
+host, and rivet refuses one written by a different server (it records `server_uuid`).
+If you fail over (to a different replica, or to the primary), delete the checkpoint so
+CDC anchors on the new host **first**, then re-snapshot the table (`mode: full`).
 
 **SQL Server — the checkpoint follows a failover, and nothing else.** An availability
 group's replicas share one log, so a checkpoint written on the primary resumes on a
@@ -710,16 +711,16 @@ slot-invalidated error and you re-snapshot. **Monitor** `pg_replication_slots`
 If rivet is offline long enough that the saved binlog position is **purged**
 (`binlog_expire_logs_seconds` / `PURGE BINARY LOGS`), the resume read fails with
 MySQL **ERROR 1236** (the requested binlog file is gone). The position is
-unrecoverable — **re-snapshot** (`mode: full`) and restart CDC from a fresh
-checkpoint. Size binlog retention comfortably above your CDC cadence.
+unrecoverable — delete the checkpoint so CDC re-anchors **first**, then
+**re-snapshot** (`mode: full`). Size binlog retention comfortably above your CDC cadence.
 
 ### SQL Server — the checkpoint fell below retention
 
 If the saved LSN falls **below** `sys.fn_cdc_get_min_lsn()` (the cleanup job — ~3
 days by default — removed the changes after it), rivet **fails loudly** — *"the
 resume position is older than the change-table retention … re-snapshot"* — rather
-than resume from the new min and **silently skip the gap**. Re-snapshot and restart
-from a fresh checkpoint. Also watch for a **non-advancing `sys.fn_cdc_get_max_lsn()`**:
+than resume from the new min and **silently skip the gap**. Delete the checkpoint so
+CDC re-anchors **first**, then re-snapshot. Also watch for a **non-advancing `sys.fn_cdc_get_max_lsn()`**:
 that means the **Agent capture job stopped**, so the change tables are frozen — read
 "no rows" as "the job is down", not "no changes".
 
@@ -727,9 +728,11 @@ that means the **Agent capture job stopped**, so the change tables are frozen �
 
 Re-run to resume from the last checkpoint (the common case). If the run reports the
 position is unrecoverable (PostgreSQL slot invalidated, MySQL binlog purged, SQL
-Server retention exceeded), **re-snapshot the table with `mode: full` and restart
-CDC from a new checkpoint** — the only safe recovery once the source log no longer
-covers the gap.
+Server retention exceeded), **restart CDC from a new checkpoint first, then
+re-snapshot the table with `mode: full`** — the only safe recovery once the source log
+no longer covers the gap. The order matters: the new anchor must exist before the
+snapshot reads, so the stream overlaps the snapshot (duplicates, which the load
+deduplicates) instead of leaving the changes in between in neither.
 
 ## Limitations (current)
 
