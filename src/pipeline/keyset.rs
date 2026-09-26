@@ -794,7 +794,7 @@ fn run_keyset_parallel(
     // that iteration 2's cursor_high caveat deferred.
     if incremental && let Some(hi) = &anchor_ceiling {
         // Set the pending cursor range ONLY — do NOT advance the persisted
-        // cursor here. `run_export_job` calls `commit_incremental_cursor` AFTER
+        // cursor here. `execute_resolved_plan` calls `commit_incremental_cursor` AFTER
         // `finalize_manifest` and ONLY when there is no manifest gap, exactly as
         // single mode defers it (single.rs commit_incremental_cursor). Advancing
         // eagerly inside the runner (before the manifest is durable) meant a

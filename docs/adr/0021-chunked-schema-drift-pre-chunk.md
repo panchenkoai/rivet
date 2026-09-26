@@ -71,3 +71,10 @@ update).
   a future contributor does not chase a phantom.
 - Resume / `Precomputed` chunk sources skip the pre-check (drift was already
   evaluated on the original Detect run that planned the chunks).
+
+## Amendment 2026-09-26: resume and apply run the pre-chunk check too
+
+Superseded in part: resume and precomputed (`rivet apply`) chunk sources now run the pre-chunk
+drift check as well (`check_drift_only`, `check_drift_only_fresh`), because the drift this
+guards against happens between the plan or the crash and the resume or the apply. The only
+skip is a precomputed plan with no ranges.

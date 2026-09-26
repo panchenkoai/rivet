@@ -235,3 +235,11 @@ implementation logic, not from substitutability.
 - Session commits: `034fa64` (extract commit), `1db8eba`
   (chunked migration), `bb27336` (sequential_checkpoint migration),
   `e9b0796` (parallel_checkpoint M1 gap fix), `58c2c5d` (RunStore).
+
+## Amendment 2026-09-26: the invariant is RED in debug and at the release gate
+
+The coherence check runs in every build. A debug or test build panics. The release binary logs
+`run-integrity invariant violated` at WARN and still exits 0, so a user's run is never failed
+by it. The release oracle fails the gate on any occurrence of that line in any gated command's
+output (`dev/release_oracle/core.py`, `verify_no_invariant_violations`). The drift telltale is
+not enforced on `--resume` runs.

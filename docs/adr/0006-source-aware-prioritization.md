@@ -343,3 +343,11 @@ It will:
 - emit source-aware warnings
 
 It will not become a scheduler in v1.
+
+## Amendment 2026-09-26: rivet now executes orderings
+
+The recommendation layer in `plan` stays advisory, but `rivet apply <config.yaml>` now
+executes orderings: it runs `wave:` tiers with barriers, and `--pool N` is a bounded
+work-stealing scheduler that orders exports by predicted duration (longest first, from run
+history) and serializes exports that are not `parallel_safe`. Tiers are not honoured in pool
+mode. rivet is still not a daemon, a queue service or a cron.

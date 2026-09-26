@@ -97,3 +97,9 @@ JSON output for monitoring integrations is tracked as a follow-up; current consu
 - **ADR-0005** (plan/apply) — PA4 cursor-drift check still uses `export_state.last_cursor_value`, not the progression table.
 - **ADR-0006** (prioritization) — progression is a future input to Epic I (historical refinement), not used in v1 scoring.
 - **ADR-0007** (cursor policy) — the single `cursor` string stored in the committed boundary carries the same semantics as the execution cursor; for `coalesce` mode it is `COALESCE(primary, fallback)`.
+
+## Amendment 2026-09-26: progression is cleared by the existing reset commands
+
+`rivet state reset -e <export>` deletes the cursor and the `export_progression` row together,
+and `rivet state reset-chunks -e <export>` also deletes the progression row. No separate
+`reset-progression` command exists or is planned.
