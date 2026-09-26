@@ -1157,7 +1157,14 @@ fn cell_to_rivet(row: &Row, idx: usize, data: &ColumnData<'_>) -> RivetValue {
             .ok()
             .flatten()
             .map_or(RivetValue::Null, |dt| RivetValue::DateTime(dt.naive_utc())),
-        ColumnData::DateTime(_) | ColumnData::DateTime2(_) | ColumnData::SmallDateTime(_) => row
+        ColumnData::DateTime(_) => row
+            .try_get::<NaiveDateTime, _>(idx)
+            .ok()
+            .flatten()
+            .map_or(RivetValue::Null, |dt| {
+                RivetValue::DateTime(super::arrow_convert::nearest_micro(dt))
+            }),
+        ColumnData::DateTime2(_) | ColumnData::SmallDateTime(_) => row
             .try_get::<NaiveDateTime, _>(idx)
             .ok()
             .flatten()

@@ -398,11 +398,23 @@ fn cursor_rhs(source_type: SourceType, value: &str) -> (String, Option<String>) 
         // column type (same rationale as Postgres — the keyset/cursor column may
         // be int, datetime2, uniqueidentifier, …). No backslash escaping in
         // T-SQL; only `'` is doubled.
-        SourceType::Mssql => (escape_mssql_literal(value), None),
+        SourceType::Mssql => (mssql_cursor_literal(value), None),
         SourceType::Mongo => unreachable!(
             "cursor_rhs: MongoDB incremental cursor is not a SQL path (guarded by full-mode-only validation)"
         ),
     }
+}
+
+/// A T-SQL cursor literal: a timestamp rivet rendered is typed `DATETIME2(7)` (its fraction cut to seven digits), so a legacy `DATETIME` column accepts it.
+fn mssql_cursor_literal(value: &str) -> String {
+    if chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.f").is_err() {
+        return escape_mssql_literal(value);
+    }
+    let fitted = match value.split_once('.') {
+        Some((whole, frac)) if frac.len() > 7 => format!("{whole}.{}", &frac[..7]),
+        _ => value.to_string(),
+    };
+    format!("CAST({} AS DATETIME2(7))", escape_mssql_literal(&fitted))
 }
 
 /// Quote `s` as a T-SQL `N'…'` unicode string literal. SQL Server escapes only
@@ -859,6 +871,30 @@ mod tests {
             SourceType::Mysql,
         );
         assert_eq!(q.sql, next.sql);
+    }
+
+    #[test]
+    fn a_mssql_timestamp_cursor_is_typed_so_a_datetime_column_accepts_it() {
+        assert_eq!(
+            mssql_cursor_literal("2024-01-01T10:00:00.456667"),
+            "CAST(N'2024-01-01T10:00:00.456667' AS DATETIME2(7))"
+        );
+        assert_eq!(
+            mssql_cursor_literal("2024-01-01T10:00:00.123456789"),
+            "CAST(N'2024-01-01T10:00:00.1234567' AS DATETIME2(7))",
+            "a nanosecond fraction is cut to what DATETIME2 holds"
+        );
+        assert_eq!(
+            mssql_cursor_literal("250001"),
+            "N'250001'",
+            "a number stays a plain literal"
+        );
+        assert_eq!(
+            mssql_cursor_literal("2024-01-01"),
+            "N'2024-01-01'",
+            "a date stays a plain literal"
+        );
+        assert_eq!(mssql_cursor_literal("O'Brien"), "N'O''Brien'");
     }
 
     #[test]

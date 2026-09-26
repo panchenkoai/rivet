@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **SQL Server incremental exports work on a legacy `DATETIME` cursor.** The saved boundary was
+  rendered with six fractional digits, which `DATETIME` rejects, so every run after the first
+  failed with `Conversion failed`. A rivet-rendered timestamp cursor is now typed `DATETIME2(7)`,
+  and a `DATETIME` value is read to its nearest microsecond (its 1/300 s tick has no exact one) in
+  batch and CDC alike, so the boundary row is not re-exported.
 - **`rivet compact` carries a column the source gained into the base.** After an `ADD COLUMN`
   at the source, the BigQuery MERGE named the new column while the base lacked it and failed
   with a raw `Unrecognized name`, on this and every later compact. The base now gets
