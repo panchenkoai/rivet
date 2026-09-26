@@ -1193,6 +1193,14 @@ impl CdcEngine {
 /// adapter are built from.
 fn with_setup_hint(e: anyhow::Error, hint: &'static str) -> anyhow::Error {
     let rendered = format!("{e:#}");
+    if e.downcast_ref::<crate::source::TlsHandshakeFailed>()
+        .is_some()
+    {
+        return e;
+    }
+    if crate::source::is_tls_handshake_failure(&rendered) {
+        return crate::source::TlsHandshakeFailed::wrap(e, None);
+    }
     if [
         "mysql cdc:",
         "pg cdc:",
@@ -2287,6 +2295,20 @@ mod setup_hint {
             "an engine-agnostic sink refusal is rivet's verdict as much as an \
              engine-prefixed one"
         );
+    }
+
+    #[test]
+    fn a_tls_handshake_failure_does_not_get_the_setup_hint() {
+        let tls = anyhow::anyhow!("error performing TLS handshake: server does not support TLS");
+        let e = super::with_setup_hint(tls, super::PG_CDC_HINT);
+        assert_eq!(
+            format!("{e:#}"),
+            "TLS handshake failed — the server does not speak TLS or its certificate is not \
+             trusted: set `tls.ca_file` for a private CA, or `tls.mode: disable` if the server \
+             has no TLS (trusted networks only); retrying will not help: error performing TLS \
+             handshake: server does not support TLS"
+        );
+        assert!(!crate::pipeline::retry::classify_error(&e).is_transient());
     }
 }
 

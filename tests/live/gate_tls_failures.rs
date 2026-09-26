@@ -44,3 +44,47 @@ fn mongo_verify_full_against_a_plaintext_server_is_permanent_not_retried() {
         "a permanent failure must not ride out the retry budget: took {took:?}"
     );
 }
+
+/// The last `Error:` line rivet prints for a failed run.
+fn error_line(stderr: &str) -> String {
+    stderr
+        .lines()
+        .rev()
+        .find(|l| l.starts_with("Error: "))
+        .unwrap_or_else(|| panic!("no `Error:` line; stderr:\n{stderr}"))
+        .to_string()
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres-cdc"]
+fn pg_cdc_tls_failure_is_not_buried_behind_the_setup_hint() {
+    let rig = Rig::pg_cdc("public.tls_probe", &unique_name("tls_slot"))
+        .source_line("tls: { mode: verify-full }");
+    let (code, stderr, _) = run_timed(&rig);
+    assert_ne!(code, Some(0), "stderr:\n{stderr}");
+    assert_eq!(
+        error_line(&stderr),
+        format!(
+            "Error: {TLS_VERDICT}: error performing TLS handshake: server does not support TLS"
+        )
+    );
+}
+
+const TLS_VERDICT: &str = "TLS handshake failed — the server does not speak TLS or its \
+     certificate is not trusted: set `tls.ca_file` for a private CA, or `tls.mode: disable` if \
+     the server has no TLS (trusted networks only); retrying will not help";
+
+#[test]
+#[ignore = "live: requires docker compose up -d mysql-cdc"]
+fn mysql_cdc_tls_failure_is_not_buried_behind_the_setup_hint() {
+    let rig = Rig::mysql_cdc("tls_probe").source_line("tls: { mode: verify-full }");
+    let (code, stderr, _) = run_timed(&rig);
+    assert_ne!(code, Some(0), "stderr:\n{stderr}");
+    // The stand's MySQL speaks TLS with a self-signed certificate, so verify-full fails on
+    // the certificate; the TLS backend's own reason after `TlsError {` differs by platform.
+    let line = error_line(&stderr);
+    assert!(
+        line.starts_with(&format!("Error: {TLS_VERDICT}: TlsError {{ ")),
+        "{line}"
+    );
+}
