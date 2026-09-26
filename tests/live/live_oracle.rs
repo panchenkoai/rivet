@@ -985,15 +985,19 @@ fn a_query_with_a_trailing_semicolon_or_comment_still_exports() {
 
 /// The first `sid,serial#` of a `RIVET` session running (or last running) SQL that names `table`,
 /// the describe probe excluded.
-fn rivet_session_on(conn: &oracledb::Connection, table: &str) -> Option<String> {
+fn rivet_sessions_on(conn: &oracledb::Connection, table: &str) -> Vec<String> {
     let sql = format!(
         "SELECT TO_CHAR(s.sid) || ',' || TO_CHAR(s.serial#) FROM v$session s \
          JOIN v$sql q ON q.sql_id = NVL(s.sql_id, s.prev_sql_id) \
          WHERE s.username = 'RIVET' AND q.sql_text LIKE '%{table}%' \
-         AND q.sql_text NOT LIKE '%1 = 0%' AND q.sql_text NOT LIKE '%v$session%' AND ROWNUM = 1"
+         AND q.sql_text NOT LIKE '%v$session%' AND q.rows_processed > 0 ORDER BY 1"
     );
-    let mut cursor = conn.query(&sql, &[]).ok()?;
-    cursor.next()?.ok()?.get::<Option<String>>(0).ok()?
+    let Ok(cursor) = conn.query(&sql, &[]) else {
+        return vec![];
+    };
+    cursor
+        .filter_map(|r| r.ok()?.get::<Option<String>>(0).ok()?)
+        .collect()
 }
 
 /// A session killed on the server mid-export is retried on a fresh connection and
@@ -1017,6 +1021,8 @@ fn a_session_killed_mid_export_is_retried_and_delivers_every_row() {
         .mode("full")
         .export_line("tuning:")
         .export_line("  batch_size: 50")
+        // 800 batches x 20 ms keeps the export's session alive well past the 2 s detection.
+        .export_line("  throttle_ms: 20")
         .export_line("  max_retries: 3")
         .export_line("  retry_backoff_ms: 200")
         .dest_path(out.path().to_path_buf());
@@ -1025,23 +1031,24 @@ fn a_session_killed_mid_export_is_retried_and_delivers_every_row() {
     let killer = std::thread::spawn(move || {
         let sys = ora_system_conn();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-        // Short-lived probe connections also name the table: kill only a session seen for 2 s.
-        let mut seen: Option<(String, std::time::Instant)> = None;
+        // Once the export has fetched rows, kill every rivet session on the table that has
+        // lived 2 s: the export's, and any idle probe connection (rivet must survive both).
+        let mut seen: Option<(Vec<String>, std::time::Instant)> = None;
         while std::time::Instant::now() < deadline {
-            match (rivet_session_on(&sys, &table), &seen) {
-                (Some(sid), Some((prev, since))) if *prev == sid => {
+            let now = rivet_sessions_on(&sys, &table);
+            match &seen {
+                Some((prev, since)) if !now.is_empty() && *prev == now => {
                     if since.elapsed() >= std::time::Duration::from_secs(2) {
-                        let kill = format!("ALTER SYSTEM KILL SESSION '{sid}' IMMEDIATE");
-                        match sys.execute(&kill, &[]) {
-                            Ok(_) => return true,
-                            // Mid-call: the session dies when the call returns.
-                            Err(e) if format!("{e:?}").contains("ORA-00031") => return true,
-                            Err(_) => seen = None,
+                        for sid in &now {
+                            let kill = format!("ALTER SYSTEM KILL SESSION '{sid}' IMMEDIATE");
+                            // ORA-00031: mid-call, the session dies when the call returns.
+                            let _ = sys.execute(&kill, &[]);
                         }
+                        return true;
                     }
                 }
-                (Some(sid), _) => seen = Some((sid, std::time::Instant::now())),
-                (None, _) => seen = None,
+                _ if now.is_empty() => seen = None,
+                _ => seen = Some((now, std::time::Instant::now())),
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }

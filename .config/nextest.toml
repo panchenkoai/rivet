@@ -39,6 +39,20 @@ retries = 0
 filter = 'test(/same_named_configs_share_a_postgres_state_cdc_cycle$/) or test(/same_named_configs_share_a_postgres_state_batch_cycle$/) or test(/a_cdc_baseline_over_a_wide_history_lands_in_the_base_in_batches$/) or test(/a_wide_history_read_by_keyset_loads_daily_partitions_in_batches$/) or test(/base_and_buffer_cycle_run_load_compact_keeps_deletes_as_flags$/)'
 slow-timeout = { period = "300s", terminate-after = 4 }
 
+# Oracle Free caps the server at two CPUs, so the Oracle cells share it four at a time;
+# the whole-schema export reads ~2M rows and gets the long ceiling.
+[test-groups]
+oracle = { max-threads = 4 }
+
+[[profile.default.overrides]]
+filter = 'test(/^live_oracle::every_seeded_oracle_table_exports_every_row$/)'
+test-group = 'oracle'
+slow-timeout = { period = "300s", terminate-after = 2 }
+
+[[profile.default.overrides]]
+filter = 'test(/^live_oracle::/)'
+test-group = 'oracle'
+
 [profile.ci]
 # CI tolerates a single flaky retry and reports every failure (no early bail),
 # so one flake doesn't mask the rest of the matrix.
