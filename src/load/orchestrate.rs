@@ -69,6 +69,9 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
     } else {
         None
     };
+    if let Some(why) = engine.and_then(|e| unsupported_cdc_target(e, &plans)) {
+        anyhow::bail!("{why}");
+    }
     // Route each table by its declared `mode:`; `pk:` and `allow_source_drift:`
     // come from the `load:` block, so the CLI carries no per-mode flags.
     // Per-table FAULT ISOLATION, mirroring `rivet run` (pipeline/run.rs): collect
@@ -301,6 +304,42 @@ fn lease_busy_message(target_fqtn: &str) -> String {
 /// configs the parse engine exists for.
 pub(super) fn needs_source_engine(plans: &[load::plan::LoadPlan]) -> bool {
     plans.iter().any(|p| p.mode == load::plan::LoadMode::Cdc)
+}
+
+/// Why a CDC snapshot over an earlier full-load table is refused, with the ways out this warehouse takes.
+pub(super) fn snapshot_over_full_table_refusal(
+    fqtn: &str,
+    warehouse: load::cdc::Warehouse,
+) -> String {
+    let keep = match warehouse {
+        // A CDC change log there is a ReplacingMergeTree, which a table cannot become (ADR-0035 CH11).
+        load::cdc::Warehouse::ClickHouse => "",
+        _ => {
+            ", or run the stream without `initial: snapshot` to keep the table's rows as the baseline"
+        }
+    };
+    format!(
+        "`{fqtn}` is a table from an earlier full load, and this CDC load carries an initial \
+         snapshot of the same table — the snapshot is a new baseline, so keep one: drop the \
+         table (the snapshot replaces it){keep}"
+    )
+}
+
+/// Why a CDC load from `engine` cannot reach one of `plans`' targets, or `None`.
+pub(super) fn unsupported_cdc_target(
+    engine: load::cdc::SourceEngine,
+    plans: &[load::plan::LoadPlan],
+) -> Option<String> {
+    let clickhouse_cdc = plans.iter().any(|p| {
+        p.mode == load::plan::LoadMode::Cdc
+            && matches!(p.load.target, load::plan::LoadTarget::Clickhouse { .. })
+    });
+    (engine == load::cdc::SourceEngine::Mongo && clickhouse_cdc).then(|| {
+        "a MongoDB CDC stream cannot load into ClickHouse: its resume token has no integer \
+         order for the change log's version (ADR-0035 CH7) — load it into BigQuery or \
+         Snowflake, or export it in batch mode"
+            .to_string()
+    })
 }
 
 /// Fold every per-plan failure into ONE error, or `None` when nothing failed.
@@ -1455,10 +1494,7 @@ fn rebaseline_action(warehouse_has_changes: bool, ledger: LedgerSignal) -> Rebas
 fn rebaseline_refusal(target_fqtn: &str, warehouse: crate::load::cdc::Warehouse) -> String {
     // The remedy must PARSE where the operator pastes it (round-8): backticks
     // are BigQuery-only; Snowflake takes the bare fqtn.
-    let quoted = match warehouse {
-        crate::load::cdc::Warehouse::BigQuery => format!("`{target_fqtn}__changes`"),
-        crate::load::cdc::Warehouse::Snowflake => format!("{target_fqtn}__changes"),
-    };
+    let quoted = warehouse.quote_fqtn(&format!("{target_fqtn}__changes"));
     rebaseline_refusal_text(&quoted)
 }
 
@@ -1521,12 +1557,9 @@ fn load_one_cdc(
             let shape = rebaseline_shape(&inputs.uris, &plan.gcs_prefix);
             let kind = load::before_write(loader.object_kind(&plan.table))?;
             if snapshot_over_full_table(shape, kind) {
-                return Err(load::refused(format!(
-                    "`{}` is a table from an earlier full load, and this CDC load carries an \
-                     initial snapshot of the same table — the snapshot is a new baseline, so \
-                     keep one: drop the table (the snapshot replaces it), or run the stream \
-                     without `initial: snapshot` to keep the table's rows as the baseline",
-                    loader.fqtn(&plan.table)
+                return Err(load::refused(snapshot_over_full_table_refusal(
+                    &loader.fqtn(&plan.table),
+                    loader.warehouse(),
                 )));
             }
             if shape {
@@ -1665,9 +1698,15 @@ impl SplitRuns {
 /// Whether a whole-table run joins the change log rather than landing as `<table>`:
 /// whenever that name is already taken. An incremental load never overwrites an existing
 /// table — the table becomes the log's baseline and the run is appended to it — and it
-/// cannot replace a view at all. Only an absent name is landed as a new table.
-fn whole_table_run_joins_the_log(kind: load::ObjectKind) -> bool {
-    matches!(kind, load::ObjectKind::Table | load::ObjectKind::View)
+/// cannot replace a view at all. An absent name joins too when `<table>__changes` exists:
+/// a load that adopted the table died before building the view, and landing a new table
+/// beside that log would make every later delta refuse. Otherwise it lands as a new table.
+fn whole_table_run_joins_the_log(kind: load::ObjectKind, changes: load::ObjectKind) -> bool {
+    match kind {
+        load::ObjectKind::Table | load::ObjectKind::View => true,
+        load::ObjectKind::Absent => changes == load::ObjectKind::Table,
+        load::ObjectKind::Other => false,
+    }
 }
 
 /// Why a whole-table run is appended to the change log instead of landing as `<table>`.
@@ -1677,6 +1716,11 @@ fn whole_table_run_note(kind: load::ObjectKind, fqtn: &str, run_id: &str) -> Str
             "  note: `{fqtn}` is already the current-state view over its change log — run \
              {run_id} re-read the whole table, so it is appended to the log (at least once; the \
              view keeps the latest row per key) instead of replacing it"
+        ),
+        load::ObjectKind::Absent => format!(
+            "  note: `{fqtn}` is missing but its change log `{fqtn}__changes` exists — a load \
+             that turned the table into that log stopped before building the view — so run \
+             {run_id}'s whole pass is appended to the log and the view is built"
         ),
         _ => format!(
             "  note: `{fqtn}` already holds rows from an earlier load, and an incremental load \
@@ -1771,7 +1815,9 @@ fn load_one_incremental(
                 .filter(|_| load::plan::whole_table_pass_may_join_the_log(base_and_buffer));
             if let Some((_, first)) = joins_the_log {
                 let kind = load::before_write(loader.object_kind(&plan.table))?;
-                if whole_table_run_joins_the_log(kind) {
+                let changes =
+                    load::before_write(loader.object_kind(&format!("{}__changes", plan.table)))?;
+                if whole_table_run_joins_the_log(kind, changes) {
                     eprintln!(
                         "{}",
                         whole_table_run_note(kind, &loader.fqtn(&plan.table), &first.run_id)
@@ -3006,9 +3052,12 @@ mod live_only_decisions {
     #[test]
     fn a_whole_table_run_joins_the_log_whenever_the_target_already_exists() {
         use load::ObjectKind::*;
-        assert!(whole_table_run_joins_the_log(View));
-        assert!(whole_table_run_joins_the_log(Table));
-        assert!(!whole_table_run_joins_the_log(Absent));
+        assert!(whole_table_run_joins_the_log(View, Absent));
+        assert!(whole_table_run_joins_the_log(Table, Absent));
+        assert!(!whole_table_run_joins_the_log(Absent, Absent));
+        // An adoption interrupted before its view: the log exists, the name does not.
+        assert!(whole_table_run_joins_the_log(Absent, Table));
+        assert!(!whole_table_run_joins_the_log(Other, Table));
 
         let on_table = whole_table_run_note(Table, "p.d.orders", "f1");
         assert!(
@@ -3300,6 +3349,54 @@ mod live_only_decisions {
             plan_at(LoadMode::Full, "gs://b/base"),
             plan_at(LoadMode::Cdc, "gs://b/base"),
         ]));
+    }
+
+    /// ClickHouse cannot adopt the table under CDC, so its refusal offers only the drop.
+    #[test]
+    fn a_snapshot_over_a_full_table_offers_only_the_ways_out_the_warehouse_takes() {
+        use crate::load::cdc::Warehouse;
+        let bq = snapshot_over_full_table_refusal("p.d.t", Warehouse::BigQuery);
+        assert!(
+            bq.contains("drop the table") && bq.contains("without `initial: snapshot`"),
+            "{bq}"
+        );
+        let ch = snapshot_over_full_table_refusal("d.t", Warehouse::ClickHouse);
+        assert!(
+            ch.contains("drop the table") && !ch.contains("without `initial"),
+            "{ch}"
+        );
+    }
+
+    /// Only a MongoDB stream into ClickHouse is refused: another engine, another
+    /// warehouse, or a batch load of a Mongo export all proceed (ADR-0035 CH7).
+    #[test]
+    fn only_mongo_cdc_into_clickhouse_is_refused() {
+        use crate::load::cdc::SourceEngine;
+        let into = |mode, target| {
+            let mut p = plan_at(mode, "gs://b/base");
+            p.load.target = target;
+            p
+        };
+        let ch = || load::plan::LoadTarget::Clickhouse {
+            url: "u".into(),
+            database: "d".into(),
+            user: "x".into(),
+            password_env: "P".into(),
+            named_collection: None,
+        };
+        let why = unsupported_cdc_target(SourceEngine::Mongo, &[into(LoadMode::Cdc, ch())])
+            .expect("mongo CDC into ClickHouse refuses");
+        assert!(why.contains("ADR-0035 CH7"), "{why}");
+        let bq = plan_at(LoadMode::Cdc, "gs://b/base");
+        assert_eq!(unsupported_cdc_target(SourceEngine::Mongo, &[bq]), None);
+        assert_eq!(
+            unsupported_cdc_target(SourceEngine::Mongo, &[into(LoadMode::Full, ch())]),
+            None
+        );
+        assert_eq!(
+            unsupported_cdc_target(SourceEngine::Postgres, &[into(LoadMode::Cdc, ch())]),
+            None
+        );
     }
 
     /// The ledger's three answers, each decisive. A query ERROR must read as

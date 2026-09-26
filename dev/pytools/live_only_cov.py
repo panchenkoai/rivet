@@ -58,6 +58,11 @@ ADJUDICATED: dict[str, tuple[str, int]] = {
     # the standard this list is held to: an adjudication survives only until
     # someone runs the mutant it stands in for.
     "check": ("cli tests spawn the binary; measured 8% of body (preflight/mod.rs)", 25),
+    # `dispatch` (cli/dispatch.rs) — the CLI's routing: the offline integration suite
+    # spawns the binary through it (measured 41% of body), and its `-> Ok(())` stub
+    # fails 15 tests of tests/offline_suite.rs (measured 2026-09-26). Excluded only
+    # because the in-diff gate runs `-- --lib --bins`, which spawns no binary.
+    "dispatch": ("cli tests spawn the binary; stub fails 15 offline_suite tests", 50),
 }
 
 

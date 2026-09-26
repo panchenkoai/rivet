@@ -609,6 +609,30 @@ fn recipe_mode(info: &TableInfo) -> &'static str {
 /// `day` is right until the history passes ~4,000 days, which no catalog field
 /// here can tell us — so it is said in a comment rather than silently coarsened.
 fn load_block_lines(dest: &InitYamlDestination, compactable: bool) -> Vec<String> {
+    if let (Some(url), Some(database)) = (
+        dest.clickhouse_url.as_deref(),
+        dest.clickhouse_database.as_deref(),
+    ) {
+        return vec![
+            String::new(),
+            "# The warehouse half of the cycle: `rivet load` fills ClickHouse. A CDC table is"
+                .into(),
+            "# a change log the engine collapses by key, read through the `<table>` view.".into(),
+            "# Review every value below — they are guesses, not decisions.".into(),
+            "load:".into(),
+            "  target: clickhouse".into(),
+            format!("  url: {}", yaml_quote_if_needed(url)),
+            format!("  database: {}", yaml_quote_if_needed(database)),
+            format!(
+                "  user: {}",
+                yaml_quote_if_needed(dest.clickhouse_user.as_deref().unwrap_or("default"))
+            ),
+            "  password_env: CLICKHOUSE_PASSWORD".into(),
+            "  pk: auto  # the source primary key `rivet run` recorded".into(),
+            "  cluster_by: auto".into(),
+            "  cleanup_source: true".into(),
+        ];
+    }
     let (Some(project), Some(dataset)) = (
         dest.bigquery_project.as_deref(),
         dest.bigquery_dataset.as_deref(),
@@ -2854,6 +2878,9 @@ mod load_block_tests {
             s3_region: None,
             bigquery_project: None,
             bigquery_dataset: None,
+            clickhouse_url: None,
+            clickhouse_database: None,
+            clickhouse_user: None,
         };
         assert!(
             load_block_lines(&bare, true).is_empty(),
@@ -2891,6 +2918,34 @@ mod load_block_tests {
         assert!(
             overwriting.contains("--mode incremental"),
             "it names the way to the compaction cycle: {overwriting}"
+        );
+    }
+
+    /// A ClickHouse scaffold names its endpoint, database and user, and promises no
+    /// compaction and no partition: ClickHouse loads do neither (ADR-0035).
+    #[test]
+    fn a_clickhouse_load_block_carries_its_connection_and_no_layout() {
+        let dest = InitYamlDestination {
+            gcs_bucket: Some("b".into()),
+            clickhouse_url: Some("http://ch:8123".into()),
+            clickhouse_database: Some("raw".into()),
+            clickhouse_user: Some("loader".into()),
+            ..Default::default()
+        };
+        let block = load_block_lines(&dest, true).join("\n");
+        for want in [
+            "  target: clickhouse",
+            "  url: http://ch:8123",
+            "  database: raw",
+            "  user: loader",
+            "  password_env: CLICKHOUSE_PASSWORD",
+            "  pk: auto",
+        ] {
+            assert!(block.contains(want), "missing `{want}` in:\n{block}");
+        }
+        assert!(
+            !block.contains("layout:") && !block.contains("partition"),
+            "{block}"
         );
     }
 }

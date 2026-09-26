@@ -50,7 +50,8 @@ from tempfile import mkdtemp
 
 try:  # importable both as a package module and as a plain sibling file
     from .core import (HERE, ROOT, Ledger, Proc, Status, container_for_port, docker, docker_exec, have,
-                       port_of, release_bin_env, rivet, rivet_bin, run, sqlcmd)
+                       nextest_filter, nextest_outcomes, nextest_passed, port_of, release_bin_env,
+                       rivet, rivet_bin, run, sqlcmd, test_passed)
     from ..pytools.duckcli import ARGV as DUCKDB
 except ImportError:  # pragma: no cover - depends on how the driver is invoked
     from core import (  # type: ignore
@@ -63,12 +64,16 @@ except ImportError:  # pragma: no cover - depends on how the driver is invoked
         docker,
         docker_exec,
         have,
+        nextest_filter,
+        nextest_outcomes,
+        nextest_passed,
         port_of,
         release_bin_env,
         rivet,
         rivet_bin,
         run,
         sqlcmd,
+        test_passed,
     )
     DUCKDB = [sys.executable, str(Path(__file__).resolve().parents[1] / "pytools" / "duckcli.py")]
 
@@ -1343,7 +1348,7 @@ def _drive_live_tests(
     skip_log.write_text("")
     # `test(=X)` matches the FULL nextest name (`<module>::<fn>`), so the bare
     # fn name never matches; anchor the regex form at the end instead.
-    expr = " or ".join(f"test(/{t}$/)" for t in tests)
+    expr = nextest_filter(tests)
     res = run(
         ["cargo", "nextest", "run", "--manifest-path", str(ROOT / "Cargo.toml"),
          "--test", "live_suite", "--run-ignored", "all", "-E", expr],
@@ -1358,11 +1363,8 @@ def _drive_live_tests(
     # ("6 tests run: 6 passed (2 leaky)"). Matching only `PASS` read a green run
     # as "this named test never passed" and failed the row (gate #9, the gremlin
     # binlog-cut cell, green in gate #8 and green in its own log here).
-    passed = {
-        m.group(1)
-        for m in re.finditer(r"(?:PASS|LEAK) \[[^\]]*\] \([^)]*\) \S+ (\S+)", res.out)
-    }
-    missing = [t for t in tests if not any(p.endswith(t) or p == t for p in passed)]
+    passed = nextest_passed(res.out)
+    missing = [t for t in tests if not test_passed(t, passed)]
     skipped = [ln for ln in skip_log.read_text().splitlines() if ln.strip()]
     if missing:
         _failed(
@@ -1407,9 +1409,14 @@ def verify_network_faults(led: Ledger) -> None:
     _drive_live_tests(
         led, "infra", "network", "faults",
         "Network faults (toxiproxy: latency retry, dead proxy, CDC mid-stream cut)",
+        # Every engine sibling by its own whole name: the filter matches whole names since
+        # 2026-09-26, so the MySQL and Mongo variants the old suffix match pulled in are listed.
         [
             "export_survives_transient_latency_added_via_toxiproxy",
+            "mysql_export_survives_transient_latency_added_via_toxiproxy",
+            "mongo_export_survives_transient_latency_added_via_toxiproxy",
             "export_fails_cleanly_when_toxiproxy_is_disabled_before_run",
+            "mysql_export_fails_cleanly_when_toxiproxy_is_disabled_before_run",
             "gremlin_cdc_binlog_cut_mid_drain_fails_loud_then_recovers",
         ],
         "network_faults.log",
@@ -1724,13 +1731,13 @@ def _run_pool_module(
     # a PASS that left a handle open past the test's end; nextest counts it green.
     # nextest prints a FAIL line TWICE (inline, then again in its failure summary),
     # so dedupe by name or one failure would emit two rows.
-    seen: dict[str, str] = {}
-    for m in re.finditer(
-        r"(PASS|LEAK|FAIL) \[[^\]]*\] \([^)]*\) \S+ live_pool_toxiproxy::(\w+)", p.out
-    ):
-        seen.setdefault(m.group(2), m.group(1))
+    seen = {
+        name.removeprefix("live_pool_toxiproxy::"): status
+        for name, status in nextest_outcomes(p.out).items()
+        if name.startswith("live_pool_toxiproxy::")
+    }
     for name, res in sorted(seen.items()):
-        if res == "FAIL":
+        if res not in ("PASS", "LEAK"):
             led.failed("pool", scenario, name[:16], "-", f"pool {scenario}: {name} FAILED")
         else:
             led.add("pool", scenario, name[:16], "-", Status.PASS, name)

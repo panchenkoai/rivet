@@ -821,8 +821,8 @@ fn matrix_columns_cover_every_source_and_target_enum_variant() {
 
     let load_targets = enum_variants_lowercased("src/config/load.rs", "LoadTargetKind");
     assert!(
-        load_targets.len() == 2 && load_targets.contains("bigquery"),
-        "LoadTargetKind parse produced {load_targets:?} (expected the 2 load targets)"
+        load_targets.len() == 3 && load_targets.contains("clickhouse"),
+        "LoadTargetKind parse produced {load_targets:?} (expected the 3 load targets)"
     );
 
     for (path, _) in MATRICES {

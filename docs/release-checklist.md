@@ -56,6 +56,10 @@ checklist is what a maintainer fills out **before** pushing the tag.
       converges on retry (covered by `live_crash_recovery`,
       `live_chunked_recovery`).
 
+- [ ] The release gate's `harness · nextest-grading` cell is PASS — a parser that
+      reads `FAIL + LEAK` as green would turn failed Rig cells green, so a gate
+      with this cell red (or absent) is not a verdict at all.
+
 ## 3. Cloud smoke (manual)
 
 > Per-PR CI uses MinIO and fake-gcs containers.  Real-cloud verification

@@ -1,0 +1,8 @@
+<!-- Lets the stand's `rivet` user read through the named collections (ADR-0035). -->
+<clickhouse>
+  <users>
+    <rivet>
+      <named_collection_control>1</named_collection_control>
+    </rivet>
+  </users>
+</clickhouse>
