@@ -3059,7 +3059,7 @@ mod tests {
             exclude: vec!["*_tmp".into()],
         };
         assert!(f.matches_folded("BH2_SK_IOT"));
-        assert!(f.matches_folded("BH2_SK_Iot"));
+        assert!(f.matches_folded("bh2_sk_Iot"));
         assert!(!f.matches_folded("BH2_SK_IOT_TMP"));
         assert!(!f.matches_folded("BH2_SK_NUM"));
         assert!(!f.matches("BH2_SK_IOT"), "the plain matcher stays exact");
