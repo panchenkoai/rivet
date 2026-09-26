@@ -293,6 +293,23 @@ fn resolve_decimal(
 }
 
 /// Fetch the `ColumnData` of column `idx` from a row without consuming it.
+/// Microseconds of a naive timestamp: rounded for a legacy DATETIME, whose 1/300 s tick has no exact microsecond, truncated otherwise.
+fn naive_micros(dt: NaiveDateTime, legacy_datetime: bool) -> i64 {
+    let dt = if legacy_datetime {
+        nearest_micro(dt)
+    } else {
+        dt
+    };
+    dt.and_utc().timestamp_micros()
+}
+
+/// A legacy DATETIME value moved to its nearest microsecond — the one reading batch and CDC both give it.
+pub(crate) fn nearest_micro(dt: NaiveDateTime) -> NaiveDateTime {
+    let sub = i64::from(dt.nanosecond() % 1_000);
+    let shift = if sub >= 500 { 1_000 - sub } else { -sub };
+    dt + chrono::TimeDelta::nanoseconds(shift)
+}
+
 fn cell(row: &Row, idx: usize) -> Option<&ColumnData<'static>> {
     row.cells().nth(idx).map(|(_, d)| d)
 }
@@ -471,8 +488,9 @@ fn build_array(
                 // datetime/datetime2 are naive; datetimeoffset is tz-aware and is NOT
                 // a NaiveDateTime (reading it as one errors and fails the whole
                 // export). Fall back to its UTC instant via FixedOffset.
+                let legacy = matches!(cell(row, idx), Some(ColumnData::DateTime(_)));
                 let micros = match row.try_get::<NaiveDateTime, _>(idx) {
-                    Ok(v) => v.map(|dt| dt.and_utc().timestamp_micros()),
+                    Ok(v) => v.map(|dt| naive_micros(dt, legacy)),
                     Err(_) => match row.try_get::<chrono::DateTime<chrono::FixedOffset>, _>(idx) {
                         Ok(v) => v.map(|dt| dt.timestamp_micros()),
                         Err(e) => anyhow::bail!("mssql timestamp column {idx} row {r}: {e}"),
@@ -706,8 +724,9 @@ impl crate::source::value_checksum::CellSource for MssqlCellSource<'_> {
         Some((d - epoch).num_days() as i32 + UNIX_EPOCH_DAY)
     }
     fn ts_micros(&self, col: usize, row: usize) -> Option<i64> {
+        let legacy = matches!(cell(&self.rows[row], col), Some(ColumnData::DateTime(_)));
         match self.rows[row].try_get::<NaiveDateTime, _>(col) {
-            Ok(v) => v.map(|dt| dt.and_utc().timestamp_micros()),
+            Ok(v) => v.map(|dt| naive_micros(dt, legacy)),
             Err(_) => match self.rows[row].try_get::<chrono::DateTime<chrono::FixedOffset>, _>(col)
             {
                 Ok(v) => v.map(|dt| dt.timestamp_micros()),
@@ -870,6 +889,28 @@ mod tests {
 
     // Rust's `%` keeps the dividend's sign; the lossy check must catch negative
     // remainders too, and a lossless negative down-scale must stay exact.
+    #[test]
+    fn a_legacy_datetime_rounds_to_the_nearest_microsecond_and_datetime2_truncates() {
+        let at = |nanos| {
+            NaiveDate::from_ymd_opt(2024, 1, 1)
+                .unwrap()
+                .and_hms_nano_opt(10, 0, 0, nanos)
+                .unwrap()
+        };
+        let base = at(0).and_utc().timestamp_micros();
+        assert_eq!(
+            naive_micros(at(456_666_666), true) - base,
+            456_667,
+            "DATETIME .457 is .45666… s"
+        );
+        assert_eq!(
+            naive_micros(at(456_666_666), false) - base,
+            456_666,
+            "DATETIME2 never rounds up"
+        );
+        assert_eq!(naive_micros(at(123_333_333), true) - base, 123_333);
+    }
+
     #[test]
     fn rescale_i128_negative_values() {
         assert!(
