@@ -108,7 +108,6 @@ src/pipeline/chunked/exec.rs:392:40: replace > with == in run_chunked_parallel
 src/pipeline/chunked/exec.rs:392:40: replace > with >= in run_chunked_parallel
 src/pipeline/chunked/exec.rs:416:74: replace + with * in run_chunked_parallel
 src/pipeline/chunked/exec.rs:416:74: replace + with - in run_chunked_parallel
-src/pipeline/chunked/math.rs:134:17: replace match guard chunk_dense with false in chunk_plan_fingerprint
 src/pipeline/chunked/mod.rs:117:5: replace prepare_chunk_plan -> Result<Vec<(i64, i64)>> with Ok(vec![(-1, -1)])
 src/pipeline/chunked/mod.rs:117:5: replace prepare_chunk_plan -> Result<Vec<(i64, i64)>> with Ok(vec![(-1, 0)])
 src/pipeline/chunked/mod.rs:117:5: replace prepare_chunk_plan -> Result<Vec<(i64, i64)>> with Ok(vec![(-1, 1)])

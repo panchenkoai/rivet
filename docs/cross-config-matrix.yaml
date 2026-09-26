@@ -79,9 +79,9 @@ scenarios:
 
   - id: parallel_n
     what: "parallel: N — concurrent workers, no loss or dup"
-    postgres: { test: dense_ties_pg_parallel_no_loss_no_dup }
-    mysql:    { test: dense_ties_mysql_parallel_no_loss_no_dup }
-    mssql:    { test: dense_ties_mssql_parallel_no_loss_no_dup }
+    postgres: { test: task_9_2_chunked_parallelism_exports_all_rows_without_duplicates }
+    mysql:    { test: mysql_parallel_chunked_crash_after_chunk_complete_resume_finishes_with_no_duplicates }
+    mssql:    { test: mssql_parallel_chunked_crash_after_chunk_complete_resume_finishes_with_no_duplicates }
     mongo:    { test: mongo_batch_parallel_integer_id_no_loss_or_dup }
     oracle:   { test: parallel_keyset_reads_every_row_once }
 

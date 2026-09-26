@@ -383,7 +383,7 @@ Requires an **in_progress** chunk run for export `bench_content_p4` (same as aft
   ```yaml
    chunk_size: 10000    # e.g. change to 15000
   ```
-   (Any change to `query`, `chunk_column`, `chunk_size`, or `chunk_dense` invalidates the stored plan.)
+   (Any change to `query`, `chunk_column`, `chunk_size`, `chunk_count` or `chunk_by_days` invalidates the stored plan.)
 3. **Resume with the modified YAML** (must fail):
   ```bash
    rivet run --config dev/scenarios/chunked_postgres_bench.yaml --export bench_content_p4 --resume
@@ -432,7 +432,7 @@ Requires an **in_progress** chunk run for export `bench_content_p4` (same as aft
 | --- | --------------- | ------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------- | ------ | ---- |
 | U1  | Seed sparse ids | `cargo run --release --bin seed -- --target postgres --only-sparse-chunk-demo --sparse-chunk-rows 5000 --sparse-chunk-id-gap 100000` | `orders_sparse` has few rows vs wide `MIN/MAX(id)` band |        | [ ]  |
 | U2  | Preflight warns | `rivet check --config dev/workbench/sparse_chunk_demo.yaml --export orders_sparse_on_id`                                                       | Sparse / inefficient range warning (wording may vary)   |        | [ ]  |
-| U3  | Chunked export  | `rivet run --config dev/workbench/sparse_chunk_demo.yaml --export orders_sparse_builtin_dense`                                                 | Completes; output under `dev/output/sparse_chunk/`      |        | [ ]  |
+| U3  | Chunked export  | `rivet run --config dev/workbench/sparse_chunk_demo.yaml --export orders_sparse_keyset`                                                        | Completes; output under `dev/output/sparse_chunk/`      |        | [ ]  |
 
 
 ---

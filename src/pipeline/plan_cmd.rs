@@ -433,7 +433,6 @@ fn build_plan_artifact(
             &cp.column,
             cp.chunk_size,
             cp.chunk_count,
-            cp.dense,
             cp.by_days,
         ),
         _ => String::new(),
@@ -514,29 +513,15 @@ const CATALOG_OVERRIDE_MIN_SPAN: i64 = 10_000;
 ///   config and the pool then reads as "cheap, run it concurrently with another
 ///   heavy" (bughunt 2026-08-14). The `CATALOG_OVERRIDE_MIN_SPAN` floor cannot
 ///   rescue this: a day span is always far below it.
-/// * `span_is_exact` short-circuits the rest. Under `chunk_dense: true` the
-///   ranges are ORDINALS `1..row_count` built from a real `COUNT(*)` taken in
-///   this very plan ([`super::chunked::detect`]) — the span IS the row count,
-///   not a key range, so `rows > distinct keys` cannot happen and there is
-///   nothing for the catalog to correct. Letting `max()` win there publishes a
-///   STALE `reltuples` over a fresh exact count: a table that lost 90% of its
-///   rows without `ANALYZE` would be scheduled at its old size (bughunt
-///   2026-08-13). Same reason the measured-actual branch is skipped — a prior
-///   run's actual is older than this run's COUNT.
 fn chunked_row_estimate(
     key_span: Option<i64>,
     catalog: Option<i64>,
     measured: bool,
-    span_is_exact: bool,
     span_is_days: bool,
 ) -> Option<i64> {
     // A day span is not a row count — it is not a candidate at all.
     if span_is_days {
         return catalog;
-    }
-    // An exact count needs no second opinion, in either direction.
-    if span_is_exact && let Some(span) = key_span {
-        return Some(span);
     }
     if measured {
         return catalog.or(key_span);
@@ -564,9 +549,7 @@ fn chunked_row_estimate(
 /// connection-owning glue stays live.
 ///
 /// Inclusive because a chunk range is `[lo, hi]` on both ends — a single-ordinal
-/// table (`first.0 == last.1`) holds one row, not zero. Under `chunk_dense` this
-/// number reaches [`chunked_row_estimate`] as an EXACT row count that no catalog
-/// is allowed to correct, so an off-by-one here is published as fact.
+/// table (`first.0 == last.1`) holds one row, not zero.
 fn chunked_key_span(first_lo: i64, last_hi: i64) -> i64 {
     (last_hi - first_lo + 1).max(0)
 }
@@ -598,7 +581,6 @@ fn compute_plan_data(
                 cp.chunk_size,
                 cp.chunk_count,
                 &plan.export_name,
-                cp.dense,
                 cp.by_days,
                 plan.source.source_type,
             )?;
@@ -613,16 +595,8 @@ fn compute_plan_data(
                 .first()
                 .zip(chunk_ranges.last())
                 .map(|(first, last)| chunked_key_span(first.0, last.1));
-            // `chunked_estimate` is a span over WHATEVER ordinals the detector
-            // chose, so pass the ordinals' MEANING with it — the two facts are
-            // independent and both branches of the estimate need them:
-            //  * days: `by_days` is checked FIRST in `detect_and_generate_chunks`,
-            //    so a config with both set produces DAY ordinals. A day count is
-            //    never a row count, in either direction (bughunt 2026-08-14).
-            //  * exact: only the dense path's ordinals are `1..COUNT(*)`, i.e.
-            //    the span IS the row count and no catalog may correct it.
+            // `by_days` ordinals are DAYS, never a row count (bughunt 2026-08-14).
             let span_is_days = cp.by_days.is_some();
-            let span_is_exact = cp.dense;
             Ok(ComputedPlanData {
                 chunk_ranges,
                 chunk_count,
@@ -631,7 +605,6 @@ fn compute_plan_data(
                     chunked_estimate,
                     row_estimate,
                     row_is_measured,
-                    span_is_exact,
                     span_is_days,
                 ),
             })
@@ -1241,8 +1214,7 @@ mod tests {
     ///
     /// RED, each verified by applying that exact mutation (first failing
     /// assertion, verbatim):
-    ///   * `+`→`*`: `left: 29, right: 30` — an off-by-one row estimate, which
-    ///     under `chunk_dense` is published as an EXACT count.
+    ///   * `+`→`*`: `left: 29, right: 30` — an off-by-one row estimate.
     ///   * `+`→`-`: `left: 28, right: 30`
     ///   * `-`→`+`: `left: 32, right: 30`
     ///   * `-`→`/`: `left: 31, right: 30`
@@ -1976,81 +1948,32 @@ mod tests {
         use super::chunked_row_estimate;
         // catalog > span ⇒ rows > distinct keys ⇒ the span is only a floor.
         assert_eq!(
-            chunked_row_estimate(Some(333_000_000), Some(831_000_000), false, false, false),
+            chunked_row_estimate(Some(333_000_000), Some(831_000_000), false, false),
             Some(831_000_000),
         );
         // Sparse key (#149 shape): span dwarfs the catalog — span still wins,
         // exactly the pre-existing behavior (over-estimating is the safe
         // direction for scheduling; the catalog is not trusted to shrink it).
         assert_eq!(
-            chunked_row_estimate(Some(342_000_000), Some(520_000), false, false, false),
+            chunked_row_estimate(Some(342_000_000), Some(520_000), false, false),
             Some(342_000_000),
         );
         // A measured whole-table actual beats the span in either direction.
         assert_eq!(
-            chunked_row_estimate(Some(342_000_000), Some(520_000), true, false, false),
+            chunked_row_estimate(Some(342_000_000), Some(520_000), true, false),
             Some(520_000),
         );
         // F4 fresh-ANALYZE shape: tiny exact span, garbage catalog above it —
         // the span must survive (the catalog override is gated on a span big
         // enough to be worth chunking).
         assert_eq!(
-            chunked_row_estimate(Some(30), Some(1130), false, false, false),
+            chunked_row_estimate(Some(30), Some(1130), false, false),
             Some(30)
         );
         // Missing signals degrade to whichever side exists.
-        assert_eq!(
-            chunked_row_estimate(Some(42), None, false, false, false),
-            Some(42)
-        );
-        assert_eq!(
-            chunked_row_estimate(None, Some(42), false, false, false),
-            Some(42)
-        );
-        assert_eq!(chunked_row_estimate(None, None, false, false, false), None);
-    }
-
-    /// `chunk_dense: true` makes the span an EXACT `COUNT(*)` over ordinals
-    /// `1..row_count`, so no catalog figure — and no older measured actual —
-    /// may override it. Bughunt 2026-08-13: the `span.max(catalog)` rule was
-    /// written for a KEY span (where `catalog > span` proves a non-unique key);
-    /// applied to a dense span it republishes a stale `reltuples`, so a table
-    /// that lost 90% of its rows without `ANALYZE` schedules at its old size.
-    /// Both directions are asserted — a fold that only checked the larger side
-    /// would pass on `max()` alone.
-    #[test]
-    fn a_dense_span_is_an_exact_count_and_no_catalog_may_override_it() {
-        use super::chunked_row_estimate;
-        // Stale catalog ABOVE the fresh exact count (the 90%-deleted table):
-        // the count wins. RED against `span.max(cat)` reaching the dense path.
-        assert_eq!(
-            chunked_row_estimate(Some(120_000), Some(1_200_000), false, true, false),
-            Some(120_000),
-        );
-        // Catalog BELOW it (the ordinary lagging-stats direction): unchanged.
-        assert_eq!(
-            chunked_row_estimate(Some(1_200_000), Some(120_000), false, true, false),
-            Some(1_200_000),
-        );
-        // A prior run's MEASURED actual is older than this plan's COUNT(*),
-        // so the exact count outranks it too (RED against an early
-        // `if measured` return).
-        assert_eq!(
-            chunked_row_estimate(Some(120_000), Some(1_200_000), true, true, false),
-            Some(120_000),
-        );
-        // Small dense tables take the same path — the tiny-span carve-out for
-        // fresh-ANALYZE garbage is subsumed, not contradicted.
-        assert_eq!(
-            chunked_row_estimate(Some(30), Some(1130), false, true, false),
-            Some(30)
-        );
-        // An empty dense table yields no ranges → no span; the catalog is all
-        // that is left, exactly as on the non-dense path.
-        assert_eq!(
-            chunked_row_estimate(None, Some(1130), false, true, false),
-            Some(1130)
-        );
+        assert_eq!(chunked_row_estimate(Some(42), None, false, false), Some(42));
+        assert_eq!(chunked_row_estimate(None, Some(42), false, false), Some(42));
+        assert_eq!(chunked_row_estimate(None, None, false, false), None);
     }
 
     /// `chunk_by_days` ordinals are DAYS, so the span is not a row figure at
@@ -2064,43 +1987,33 @@ mod tests {
     /// table. That is `CostClass::Low` → `parallel_safe: true` written into the
     /// operator's config, and the pool then schedules the giant as a cheap
     /// concurrent export and drops it out of the heavy makespan floor. The
-    /// exactness guard at the call site was applied to the dense
-    /// short-circuit only; the `max()`/tiny-span rules underneath it needed the
-    /// OPPOSITE treatment, which is what `span_is_days` now carries.
+    /// `max()`/tiny-span rules need the OPPOSITE treatment for a day span, which
+    /// is what `span_is_days` carries.
     #[test]
     fn a_by_days_span_is_a_day_count_and_never_a_row_estimate() {
         use super::chunked_row_estimate;
         // The field shape: tiny day span, huge catalog. RED against today's
         // tiny-span-wins arm, which returned Some(1095).
         assert_eq!(
-            chunked_row_estimate(Some(1095), Some(831_000_000), false, false, true),
+            chunked_row_estimate(Some(1095), Some(831_000_000), false, true),
             Some(831_000_000),
         );
         // The other direction too — a day span ABOVE the catalog is still not
         // a row count, so `max()` must not reach it either (a fixture that
         // only tested the first direction would pass on `span.max(cat)`).
         assert_eq!(
-            chunked_row_estimate(Some(20_000), Some(4_000), false, false, true),
+            chunked_row_estimate(Some(20_000), Some(4_000), false, true),
             Some(4_000),
         );
         // A measured whole-table actual arrives in the same argument and wins
         // for the same reason.
         assert_eq!(
-            chunked_row_estimate(Some(1095), Some(520_000), true, false, true),
+            chunked_row_estimate(Some(1095), Some(520_000), true, true),
             Some(520_000),
         );
         // No catalog: NO estimate. `None` classifies Medium ("assume medium
         // cost until preflight succeeds"), which is the conservative answer;
         // the day count would classify Low.
-        assert_eq!(
-            chunked_row_estimate(Some(1095), None, false, false, true),
-            None
-        );
-        // `chunk_dense` + `chunk_by_days` together still produce DAY ordinals
-        // (by_days is checked first), so the exactness claim must not win here.
-        assert_eq!(
-            chunked_row_estimate(Some(1095), Some(831_000_000), false, true, true),
-            Some(831_000_000),
-        );
+        assert_eq!(chunked_row_estimate(Some(1095), None, false, true), None);
     }
 }

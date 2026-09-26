@@ -220,7 +220,7 @@ pub struct ExportRequest<'a> {
     pub query: &'a str,
     /// The *unwrapped* base query to resolve catalog-dependent type hints from
     /// (PostgreSQL `NUMERIC` precision/scale, which the wire protocol omits — the
-    /// driver parses the `FROM` clause and asks `pg_catalog`). Chunked, dense and
+    /// driver parses the `FROM` clause and asks `pg_catalog`). Chunked and
     /// keyset runners wrap `query` in a `SELECT … FROM (<base>) …` subquery that
     /// hides the source table from the catalog parser, so they pass the original
     /// base query here. `None` ⇒ resolve from `query` (full/incremental, where it
@@ -281,7 +281,7 @@ impl<'a> ExportRequest<'a> {
     }
 
     /// A request whose `query` is a `SELECT … FROM (<base>) …` **wrapper** that
-    /// hides the source table (chunked / dense / time-window). `base` — the
+    /// hides the source table (chunked / time-window). `base` — the
     /// unwrapped query catalog hints resolve from — is a required argument, so a
     /// wrapping runner cannot silently fall back to the table-hiding wrapper and
     /// lose PG `NUMERIC` precision (the bug the catalog-hint fix / ADR-0020

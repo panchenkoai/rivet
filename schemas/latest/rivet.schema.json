@@ -574,6 +574,7 @@
           ]
         },
         "chunk_dense": {
+          "description": "Removed. Kept only so a config that still sets `chunk_dense: true` is refused at load.",
           "type": "boolean",
           "default": false
         },
@@ -594,7 +595,7 @@
           "default": null
         },
         "chunk_count": {
-          "description": "Divide the column range into exactly this many equal chunks.\nMutually exclusive with `chunk_dense` and `chunk_by_days`.\nWhen set, `chunk_size` is computed dynamically from min/max.",
+          "description": "Divide the column range into exactly this many equal chunks.\nMutually exclusive with `chunk_by_days`.\nWhen set, `chunk_size` is computed dynamically from min/max.",
           "type": [
             "integer",
             "null"

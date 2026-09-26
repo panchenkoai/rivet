@@ -91,8 +91,6 @@ mod live_cdc_property;
 mod live_cdc_replica;
 #[path = "live/live_chaos.rs"]
 mod live_chaos;
-#[path = "live/live_chunked_dense.rs"]
-mod live_chunked_dense;
 #[path = "live/live_chunked_recovery.rs"]
 mod live_chunked_recovery;
 #[path = "live/live_cli_flags.rs"]

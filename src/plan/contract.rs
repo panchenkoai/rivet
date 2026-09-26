@@ -17,7 +17,6 @@ pub struct ChunkedPlan {
     /// When Some, `chunk_size` is recomputed at detect time from min/max.
     pub chunk_count: Option<usize>,
     pub parallel: usize,
-    pub dense: bool,
     pub by_days: Option<u32>,
     pub checkpoint: bool,
     /// Resolved from `chunk_max_attempts` or `tuning.max_retries + 1`.
@@ -542,7 +541,6 @@ mod tests {
             chunk_size: 10_000,
             chunk_count: None,
             parallel: 1,
-            dense: false,
             by_days: None,
             checkpoint: false,
             max_attempts: 3,
@@ -560,7 +558,6 @@ mod tests {
             chunk_size: 10_000,
             chunk_count: None,
             parallel: 1,
-            dense: false,
             by_days: None,
             checkpoint: true,
             max_attempts: 3,

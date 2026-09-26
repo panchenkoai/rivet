@@ -1629,30 +1629,6 @@ mod tests {
     }
 
     #[test]
-    fn sparse_range_skipped_when_chunk_dense() {
-        let mut e = make_export("t", ExportMode::Chunked, None);
-        e.chunk_column = Some("id".to_string());
-        e.chunk_dense = true;
-        e.chunk_size = 100_000;
-        let w = check_sparse_range(&e, Some(100_000), Some("1"), Some("10000000"));
-        assert!(
-            w.is_none(),
-            "chunk_dense uses ordinals, not physical id span"
-        );
-    }
-
-    #[test]
-    fn dense_surrogate_warning_when_chunk_dense_builtin() {
-        let mut e = make_export("t", ExportMode::Chunked, None);
-        e.chunk_column = Some("id".to_string());
-        e.chunk_dense = true;
-        e.query = Some("SELECT id FROM orders".to_string());
-        let w = check_dense_surrogate_cost(&e);
-        assert!(w.is_some(), "should warn about built-in ROW_NUMBER cost");
-        assert!(w.unwrap().contains("global sort"));
-    }
-
-    #[test]
     fn sparse_range_not_triggered_for_non_chunked() {
         let e = make_export("t", ExportMode::Full, None);
         let w = check_sparse_range(&e, Some(100), Some("1"), Some("1000000"));

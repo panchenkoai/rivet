@@ -105,14 +105,6 @@ scenarios:
     oracle:   { gap: "no Oracle range chunk crash/resume live test" }
 
   # ── other strategies ──────────────────────────────────────────────────────
-  - id: dense_chunk_dense
-    what: "chunk_dense: ROW_NUMBER windows on a non-unique chunk column (null-safe, tie-safe)"
-    postgres: { test: dense_ties_pg_sequential_no_loss_no_dup }
-    mysql:    { test: dense_ties_mysql_sequential_no_loss_no_dup }
-    mssql:    { test: dense_ties_mssql_sequential_no_loss_no_dup }
-    mongo:    { na: "no ROW_NUMBER / dense concept in the Mongo reader" }
-    oracle:   { gap: "chunk_dense_reads_every_row_once runs the ROW_NUMBER windows on Oracle, but over the unique ID — no ties or NULLs in the chunk column, so the tie-safety this row claims is unproven" }
-
   - id: chunk_count_n
     what: "chunk_count: N divides the key range into exactly N windows"
     postgres: { test: stand_chunk_count_postgres }

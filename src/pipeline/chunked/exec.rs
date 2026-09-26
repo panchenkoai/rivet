@@ -70,7 +70,6 @@ pub(crate) fn run_chunked_sequential(
             &cp.column,
             *start,
             *end,
-            cp.dense,
             is_date,
             plan.source.source_type,
         );
@@ -313,7 +312,6 @@ pub(crate) fn run_chunked_parallel(
                         col,
                         start,
                         end,
-                        cp.dense,
                         is_date,
                         plan_for_worker.source.source_type,
                     );
@@ -492,7 +490,6 @@ mod tests {
                 chunk_size: 100,
                 chunk_count: None,
                 parallel: 1,
-                dense: false,
                 by_days: None,
                 checkpoint: false,
                 max_attempts: 3,

@@ -364,10 +364,10 @@ Rivet exports the WKT text as a `Utf8` (string) column. Downstream tools (DuckDB
 | `chunk_by_key` | string | yes* | — | Single index-backed UNIQUE NOT NULL column for **keyset (seek)** pagination — the source-safe shape for tables with no single-integer PK (UUID / string / composite). Requires the `table:` shortcut; mutually exclusive with `chunk_column`. See [chunked modes](../modes/chunked.md) and [ADR-0020](../adr/0020-pg-uuid-pk-chunking-asymmetry.md). |
 | `chunk_size` | integer | no | `100000` | Rows per chunk (numeric mode), or page size for keyset. Ignored when `chunk_count` is set. |
 | `chunk_size_memory_mb` | integer | no | — | Target memory budget per chunk in MB; `chunk_size` is derived from a per-engine row-size estimate, clamped to `[10000, 5000000]` rows. Works on **PostgreSQL, MySQL and SQL Server** (PG: `pg_relation_size / reltuples`; MySQL: `information_schema` `AVG_ROW_LENGTH` with InnoDB overflow correction; SQL Server: no estimate, falls back to 512 B/row with a warning). Requires the `table:` shortcut, mutually exclusive with an explicit non-default `chunk_size:`. |
-| `chunk_count` | integer | no | — | Divide the column range into exactly this many equal chunks. `chunk_size` is computed dynamically from `min`/`max`. Must be ≥ 1. Mutually exclusive with `chunk_dense` and `chunk_by_days`. |
-| `chunk_by_days` | integer | no | — | Enable date chunking: window size in days. Mutually exclusive with `chunk_dense` and `chunk_count`. |
+| `chunk_count` | integer | no | — | Divide the column range into exactly this many equal chunks. `chunk_size` is computed dynamically from `min`/`max`. Must be ≥ 1. Mutually exclusive with `chunk_by_days`. |
+| `chunk_by_days` | integer | no | — | Enable date chunking: window size in days. Mutually exclusive with `chunk_count`. |
 | `parallel` | integer | no | `1` | Concurrent chunk workers |
-| `chunk_dense` | boolean | no | `false` | Use `ROW_NUMBER()` for sparse numeric IDs. Mutually exclusive with `chunk_by_days` and `chunk_count`. |
+| `chunk_dense` | boolean | no | `false` | **Removed.** `true` is refused at config load (it skipped or duplicated rows under concurrent writes); use `chunk_by_key` or `chunk_column`. |
 | `chunk_checkpoint` | boolean | no | `false` | Persist per-chunk progress for resume |
 | `chunk_max_attempts` | integer | no | — | Max retry attempts per chunk |
 

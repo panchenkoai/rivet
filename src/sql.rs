@@ -144,7 +144,7 @@ fn find_from_keyword(s: &str) -> Option<usize> {
 
 /// A non-empty list of bare column references: only ASCII alphanumerics, `_`,
 /// `.`, `,`, `*`, and whitespace — and not a leading `DISTINCT` (which would
-/// change the row count / set, breaking the dense-chunk count and the
+/// change the row count / set, breaking the wrapped row count and the
 /// whole-table equivalence the fast path relies on). Functions (`(`), quoted
 /// idents / string literals, and any other punctuation → `false`.
 fn is_plain_column_list(s: &str) -> bool {
@@ -449,7 +449,7 @@ mod tests {
         );
         assert!(strip_simple_projection_from("SELECT id FROM t GROUP BY id").is_none());
         assert!(strip_simple_projection_from("SELECT id FROM t;").is_none());
-        // DISTINCT changes the row count/set (would break the dense-chunk COUNT).
+        // DISTINCT changes the row count/set (would break the wrapped row COUNT).
         assert!(strip_simple_projection_from("SELECT DISTINCT id FROM t").is_none());
         // A function / expression in the projection — can't reason syntactically.
         assert!(strip_simple_projection_from("SELECT count(*) FROM t").is_none());

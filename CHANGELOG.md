@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **Breaking: `chunk_dense` is removed.** It paged by `ROW_NUMBER() OVER (ORDER BY
+  chunk_column)`, recomputed per chunk, so a concurrent insert or delete skipped or
+  duplicated rows even on a unique key. Nobody used it. A config that still sets
+  `chunk_dense: true` is refused at load with a pointer to `chunk_by_key` (keyset) or
+  `chunk_column` range chunking; `chunk_dense: false` is still accepted. A chunked
+  `plan.json` written by an older rivet fails `apply`'s integrity check; re-run
+  `rivet plan`.
 - **`destination.oneshot_budget_mb`** (by @ssyusyukalov, #143): the RAM cap on
   single-PUT uploads, until now fixed at 64 MB, is configurable. On GCS and Azure a
   part that fits uploads in one PUT and gets a store-computed `Content-MD5` that

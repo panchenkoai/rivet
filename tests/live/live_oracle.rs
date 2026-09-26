@@ -919,25 +919,6 @@ fn reconcile_counts_the_source_on_both_paths() {
     );
 }
 
-/// `chunk_dense` numbers rows through a quoted ordinal alias Oracle accepts.
-#[test]
-#[ignore = "live: requires docker compose oracle"]
-fn chunk_dense_reads_every_row_once() {
-    require_alive(LiveService::Oracle);
-    let t = seed_oracle_numeric_table(1_000);
-    let out = tempfile::tempdir().unwrap();
-    let run = Rig::oracle_batch(t.name())
-        .query(&format!("SELECT id, name FROM {}", t.name()))
-        .mode("chunked")
-        .export_line("chunk_column: ID")
-        .export_line("chunk_size: 300")
-        .export_line("chunk_dense: true")
-        .dest_path(out.path().to_path_buf())
-        .run_args(&[]);
-    assert_ok(&run, "chunk_dense");
-    assert_every_row_once(out.path(), t.name(), "chunk_dense");
-}
-
 /// Range chunking over a `query:` export wraps it as a derived table.
 #[test]
 #[ignore = "live: requires docker compose oracle"]

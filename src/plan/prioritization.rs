@@ -219,7 +219,6 @@ mod tests {
                     chunk_size: 1,
                     chunk_count: None,
                     parallel: 1,
-                    dense: false,
                     by_days: None,
                     checkpoint: false,
                     max_attempts: 1,

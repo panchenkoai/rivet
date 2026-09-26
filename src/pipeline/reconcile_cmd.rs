@@ -233,7 +233,6 @@ where
             &cp.column,
             start,
             end,
-            cp.dense,
             cp.by_days.is_some(),
             plan.source.source_type,
         );
@@ -363,7 +362,6 @@ mod tests {
                 chunk_size: 100,
                 chunk_count: None,
                 parallel: 1,
-                dense: false,
                 by_days: None,
                 checkpoint: true,
                 max_attempts: 3,

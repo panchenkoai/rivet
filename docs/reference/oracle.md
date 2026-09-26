@@ -96,4 +96,4 @@ Parquet); dates before 1582-10-15 are not converted from Oracle's Julian calenda
   would exceed Oracle's 1000-column select list, so zero-length LOBs read as NULL,
   with a warning.
 - Each chunk or page reads its own statement-level snapshot; there is no
-  cross-chunk consistency (`chunk_dense` is the most exposed — prefer `chunk_by_key`).
+  cross-chunk consistency.

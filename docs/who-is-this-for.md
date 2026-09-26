@@ -63,9 +63,8 @@ become any of those, and shoehorning will be painful.
 - **Sources with weak or missing primary keys / cursor columns.**
   Rivet has `incremental_cursor_mode: coalesce` for nullable
   primaries (see [composite cursor walkthrough](modes/incremental-coalesce.md))
-  and ROW_NUMBER-style dense surrogates for chunking — but these
-  surface tradeoffs in `rivet check` (sparse range warnings, global
-  sort cost).  Look at the warnings, do not ignore them.
+  and keyset (`chunk_by_key`) for chunking without an integer key — but
+  these surface tradeoffs in `rivet check` (sparse range warnings).  Look at the warnings, do not ignore them.
 
 - **Read replicas with replication lag.**  On PostgreSQL, a
   full-mode export runs inside a single snapshot transaction, so the

@@ -445,7 +445,6 @@ mod tests {
             chunk_size: 1000,
             chunk_count: None,
             parallel: 1,
-            dense: false,
             by_days: None,
             max_attempts: 3,
             checkpoint: false,

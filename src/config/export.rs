@@ -165,6 +165,7 @@ pub struct ExportConfig {
     #[serde(default)]
     pub settle: Option<SettleConfig>,
     pub chunk_column: Option<String>,
+    /// Removed. Kept only so a config that still sets `chunk_dense: true` is refused at load.
     #[serde(default)]
     pub chunk_dense: bool,
     #[serde(default = "default_chunk_size")]
@@ -189,7 +190,7 @@ pub struct ExportConfig {
     #[serde(default)]
     pub chunk_size_memory_mb: Option<u64>,
     /// Divide the column range into exactly this many equal chunks.
-    /// Mutually exclusive with `chunk_dense` and `chunk_by_days`.
+    /// Mutually exclusive with `chunk_by_days`.
     /// When set, `chunk_size` is computed dynamically from min/max.
     pub chunk_count: Option<usize>,
     pub chunk_by_days: Option<u32>,

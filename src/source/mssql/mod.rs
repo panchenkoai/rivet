@@ -10,7 +10,7 @@
 //! - cursor literal `N'…'` with `''` escaping (`query::cursor_rhs`)
 //! - introspection via `sys.*` catalog views
 //!
-//! Supported today: snapshot / incremental / chunked (range + dense) and keyset
+//! Supported today: snapshot / incremental / chunked (range) and keyset
 //! (seek) export, `check --type-report`, `doctor`, chunked-mode planning. The
 //! keyset page builder emits a dialect-correct
 //! `OFFSET 0 ROWS FETCH NEXT n ROWS ONLY` clause (T-SQL has no `LIMIT`).

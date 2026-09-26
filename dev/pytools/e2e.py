@@ -1079,13 +1079,13 @@ def phase_15_date_chunking(ctx: Ctx) -> None:
     else:
         t.bad("PG check: expected 'date-chunked' in strategy output")
 
-    # PG: inline config — verify chunk_by_days rejects chunk_dense combination.
+    # PG: inline config — verify the removed chunk_dense is refused at load.
     with inline_config(DATE_DENSE_YAML, "invalid_date_dense") as cfg_path:
         out = ctx.run("run", "--config", cfg_path).out
-    if re.search(r"chunk_dense|cannot combine|invalid", out, re.I):
-        t.ok("PG validation: chunk_by_days + chunk_dense rejected")
+    if re.search(r"`chunk_dense` was removed", out):
+        t.ok("PG validation: removed chunk_dense refused")
     else:
-        t.bad("PG validation: expected rejection of chunk_by_days + chunk_dense")
+        t.bad("PG validation: expected the chunk_dense removal refusal")
 
     if not ctx.mysql_ok:
         t.skip("MySQL date-chunked: run")

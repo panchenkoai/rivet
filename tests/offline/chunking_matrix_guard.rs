@@ -116,7 +116,8 @@ const EXEMPT: &[(&str, &str)] = &[
 const MATRICES: &[(&str, usize)] = &[
     // Raised 0 -> 14 (2026-09-26): the Oracle column's honest gaps (batch-only phase 1).
     // Lowered 14 -> 12 (2026-09-26): Oracle init keyset scaffold + chunk_by_days proven live.
-    ("docs/chunking-matrix.yaml", 12),
+    // Lowered 12 -> 11 (2026-09-26): the `dense_chunk_dense` row went with `chunk_dense` (its Oracle gap too).
+    ("docs/chunking-matrix.yaml", 11),
     // Export-STRATEGY flag × engine, verified on GOLDEN fixtures + a distilled
     // GARBAGE profile (anonymized shape of a 200+-table field DB). Two layers:
     // the offline scaffold_strategy oracle (all shapes) + the live chunking_stand

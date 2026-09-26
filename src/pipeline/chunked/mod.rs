@@ -41,9 +41,7 @@ pub(crate) use detect::detect_and_generate_chunks;
 pub(crate) use exec::run_chunked_parallel;
 pub(crate) use exec::run_chunked_sequential;
 pub use math::generate_chunks;
-pub(crate) use math::{
-    RIVET_CHUNK_RN_COL, build_chunk_query_sql, chunk_plan_fingerprint, strip_select_star_from,
-};
+pub(crate) use math::{build_chunk_query_sql, chunk_plan_fingerprint, strip_select_star_from};
 pub(crate) use parallel_checkpoint::run_chunked_parallel_checkpoint;
 pub(crate) use resume_m8::apply_m8_resume_decisions;
 pub(crate) use resume_m8::rehydrate_manifest_parts_probed;
@@ -187,7 +185,6 @@ pub(super) fn prepare_chunk_plan(
         cp.chunk_size,
         cp.chunk_count,
         &plan.export_name,
-        cp.dense,
         cp.by_days,
         plan.source.source_type,
     )?;
@@ -296,7 +293,6 @@ pub(super) fn ensure_chunk_checkpoint_plan(
         &cp.column,
         cp.chunk_size,
         cp.chunk_count,
-        cp.dense,
         cp.by_days,
     );
     let max_att = cp.max_attempts;
@@ -319,7 +315,7 @@ pub(super) fn ensure_chunk_checkpoint_plan(
             Some((rid, stored_hash)) => {
                 if stored_hash != plan_hash {
                     anyhow::bail!(
-                        "export '{}': chunk plan fingerprint mismatch (query, chunk_column, chunk_size, or chunk_dense changed); cannot resume — \
+                        "export '{}': chunk plan fingerprint mismatch (query, chunk_column, chunk_size, chunk_count or chunk_by_days changed); cannot resume — \
                          to abandon the interrupted run and start over: `rivet state reset-chunks -c {config_path} -e {}`",
                         plan.export_name,
                         plan.export_name
@@ -541,7 +537,6 @@ mod tests {
                 chunk_size: 100,
                 chunk_count: None,
                 parallel: 1,
-                dense: false,
                 by_days: None,
                 checkpoint: true,
                 max_attempts: 3,
@@ -703,7 +698,6 @@ mod tests {
             &cp.column,
             cp.chunk_size,
             cp.chunk_count,
-            cp.dense,
             cp.by_days,
         );
         state

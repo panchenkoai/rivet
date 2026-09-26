@@ -34,7 +34,7 @@ exports:
 // ─── round-2 audit #14: chunk knobs are chunked-only ─────────────────────
 // A config that sets a chunk knob but omits `mode: chunked` silently degrades
 // to a single unbounded snapshot (the source-pressure footgun chunked mode
-// exists to prevent). Gate it at config-load, like chunk_dense/chunk_by_days.
+// exists to prevent). Gate it at config-load, like chunk_by_days.
 // RED before the validate_export guard: these all passed validation.
 
 #[test]

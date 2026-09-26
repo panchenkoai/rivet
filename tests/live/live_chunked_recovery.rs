@@ -1127,8 +1127,8 @@ fn a_failed_chunk_must_fail_the_run_not_ship_a_short_export() {
 ///
 /// Here TWO guards stand between a partial export and a green `_SUCCESS`: the
 /// collected worker errors, and the chunk-completion count behind it. Disabling
-/// BOTH left 56 live tests green — chunked-recovery, chunked-dense, cli-flags and
-/// crash-soak — while a run missing a whole chunk reported success.
+/// BOTH left 56 live tests green — chunked-recovery, the since-removed chunked-dense,
+/// cli-flags and crash-soak — while a run missing a whole chunk reported success.
 ///
 /// So this injects an ERROR instead (`RIVET_TEST_ERROR_AT=chunk_export:1`): the
 /// chunk returns, the loop completes, and the guard is the only thing that can
@@ -1223,7 +1223,7 @@ fn a_failed_chunk_must_fail_the_parallel_run_not_ship_a_short_export() {
 ///     process death never reaches a guard that runs after the join.
 ///   * So do the tests that DO drive this very runner:
 ///     `live_governor::governor_activates_and_run_completes`,
-///     `live_chunked_dense::dense_ties_pg_parallel_no_loss_no_dup` and
+///     the since-removed `chunk_dense` parallel test, and
 ///     `live_schema_drift::chunked_range_export_enforces_on_schema_drift_fail`
 ///     are all `mode: chunked` + `parallel: N` with no checkpoint, and all pass
 ///     with the guard gone — they never make a chunk fail.
@@ -1516,4 +1516,50 @@ fn a_resume_after_a_failed_run_reports_the_rows_it_adopted() {
         Some(150),
         "the reported total counts the adopted parts, not only the re-run chunk"
     );
+}
+
+// Cross-shape manifest guard (graph-surfaced runner-bypass). The two
+// chunk-checkpoint runners were the ONLY batch runners not calling
+// guard_manifest_mode, so a chunked-checkpoint export into a prefix that
+// already held a CDC manifest would silently overwrite it — destroying the CDC
+// export's audit trail. Both runners must now refuse: parallel=1 exercises the
+// sequential checkpoint runner, parallel=4 the parallel one.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn chunked_checkpoint_refuses_to_clobber_a_cdc_manifest() {
+    require_alive(LiveService::Postgres);
+    let table = seed_pg_numeric_table(150);
+    for parallel in [1usize, 4] {
+        let out = tempfile::tempdir().unwrap();
+        // A prior CDC run's manifest already sits at the destination prefix.
+        std::fs::write(
+            out.path().join("manifest.json"),
+            br#"{"manifest_version":1,"run_id":"prior-cdc","mode":"cdc","parts":[]}"#,
+        )
+        .unwrap();
+        let export = unique_name("cdc_clobber_guard");
+        let rig = Rig::pg_batch(&export)
+            .query(&format!("SELECT id, name FROM {}", table.name()))
+            .mode("chunked")
+            .export_line("chunk_column: id")
+            .export_line("chunk_size: 50")
+            .export_line("chunk_checkpoint: true")
+            .export_line(&format!("parallel: {parallel}"))
+            .dest_path(out.path().to_path_buf());
+        let run = rig.run_args(&["--export", &export]);
+        assert!(
+            !run.status.success(),
+            "parallel={parallel}: a chunked-checkpoint batch export must REFUSE to \
+             overwrite a CDC manifest"
+        );
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(
+            combined.contains("already holds a 'cdc' manifest"),
+            "parallel={parallel}: must name the cross-shape collision; got:\n{combined}"
+        );
+    }
 }
