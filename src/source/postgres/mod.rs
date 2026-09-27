@@ -877,10 +877,31 @@ impl super::Source for PostgresSource {
             "pg_temp_files",
             "pg_deadlocks",
         ];
-        let mut out = Vec::with_capacity(names.len());
+        let mut out = Vec::with_capacity(names.len() + 3);
         for (i, name) in names.iter().enumerate() {
             if let Ok(v) = row.try_get::<_, i64>(i) {
                 out.push(((*name).to_string(), v));
+            }
+        }
+        // Logical decoding's own cost (PostgreSQL 14+): transactions and bytes spilled to
+        // disk past logical_decoding_work_mem, and bytes decoded — what a CDC drain costs
+        // the server. Summed over every slot; absent on older servers.
+        if let Ok(slots) = client.query_one(
+            "SELECT COALESCE(SUM(spill_txns), 0)::bigint, COALESCE(SUM(spill_bytes), 0)::bigint, \
+             COALESCE(SUM(total_bytes), 0)::bigint FROM pg_stat_replication_slots",
+            &[],
+        ) {
+            for (i, name) in [
+                "pg_slot_spill_txns",
+                "pg_slot_spill_bytes",
+                "pg_slot_decoded_bytes",
+            ]
+            .iter()
+            .enumerate()
+            {
+                if let Ok(v) = slots.try_get::<_, i64>(i) {
+                    out.push(((*name).to_string(), v));
+                }
             }
         }
         Some(out)

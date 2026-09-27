@@ -991,16 +991,42 @@ impl MssqlSource {
     /// the run.
     pub(crate) fn harm_counters(&mut self) -> Option<Vec<(String, i64)>> {
         let Self { rt, client, .. } = self;
-        let sql = "SELECT SUM(waiting_tasks_count), SUM(wait_time_ms) \
-                   FROM sys.dm_os_wait_stats WHERE wait_type LIKE 'LCK%'";
+        // Lock waits; logical reads of every completed query (dm_exec_query_stats, updated
+        // as each query finishes); the buffer pool's page lookups/reads and the work
+        // tables/files a sort or hash spills to tempdb — performance counters SQL Server
+        // refreshes about once a second, so a sub-second run records 0 for those.
+        let sql = "SELECT (SELECT SUM(waiting_tasks_count) FROM sys.dm_os_wait_stats \
+                           WHERE wait_type LIKE 'LCK%'), \
+                          (SELECT SUM(wait_time_ms) FROM sys.dm_os_wait_stats \
+                           WHERE wait_type LIKE 'LCK%'), \
+                          (SELECT SUM(total_logical_reads) FROM sys.dm_exec_query_stats), \
+                          SUM(CASE WHEN RTRIM(counter_name) = 'Page lookups/sec' \
+                               AND object_name LIKE '%Buffer Manager%' THEN cntr_value END), \
+                          SUM(CASE WHEN RTRIM(counter_name) = 'Page reads/sec' \
+                               AND object_name LIKE '%Buffer Manager%' THEN cntr_value END), \
+                          SUM(CASE WHEN RTRIM(counter_name) = 'Worktables Created/sec' \
+                               AND object_name LIKE '%Access Methods%' THEN cntr_value END), \
+                          SUM(CASE WHEN RTRIM(counter_name) = 'Workfiles Created/sec' \
+                               AND object_name LIKE '%Access Methods%' THEN cntr_value END) \
+                   FROM sys.dm_os_performance_counters";
         rt.block_on(async {
             let row = client.query(sql, &[]).await.ok()?.into_row().await.ok()??;
-            let waits = row.get::<i64, _>(0).unwrap_or(0);
-            let wait_ms = row.get::<i64, _>(1).unwrap_or(0);
-            Some(vec![
-                ("mssql_lock_waits".to_string(), waits),
-                ("mssql_lock_wait_ms".to_string(), wait_ms),
-            ])
+            let names = [
+                "mssql_lock_waits",
+                "mssql_lock_wait_ms",
+                "mssql_logical_reads",
+                "mssql_page_lookups",
+                "mssql_page_reads",
+                "mssql_worktables_created",
+                "mssql_workfiles_created",
+            ];
+            Some(
+                names
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, n)| row.get::<i64, _>(i).map(|v| ((*n).to_string(), v)))
+                    .collect(),
+            )
         })
     }
 

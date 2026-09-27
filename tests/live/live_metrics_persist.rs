@@ -35,6 +35,9 @@ const PG_HARM_COUNTERS: &[&str] = &[
     "pg_blks_hit",
     "pg_blks_read",
     "pg_deadlocks",
+    "pg_slot_decoded_bytes",
+    "pg_slot_spill_bytes",
+    "pg_slot_spill_txns",
     "pg_temp_files",
     "pg_tup_fetched",
     "pg_tup_returned",
@@ -49,7 +52,15 @@ pub(crate) const MYSQL_HARM_COUNTERS: &[&str] = &[
     "mysql_innodb_rows_read",
 ];
 
-const MSSQL_HARM_COUNTERS: &[&str] = &["mssql_lock_wait_ms", "mssql_lock_waits"];
+const MSSQL_HARM_COUNTERS: &[&str] = &[
+    "mssql_lock_wait_ms",
+    "mssql_lock_waits",
+    "mssql_logical_reads",
+    "mssql_page_lookups",
+    "mssql_page_reads",
+    "mssql_workfiles_created",
+    "mssql_worktables_created",
+];
 
 /// Assert the harm rows for a run are exactly the engine's full counter set
 /// (proves the probe read every column and the name mapping is complete — a

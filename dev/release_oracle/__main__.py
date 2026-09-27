@@ -276,6 +276,17 @@ def _self_test() -> int:
     finally:
         _sc.run, _sc.have = real_run, real_have
     print("self-test ok: without cargo-llvm-cov the offline battery is still graded")
+    # A graded harm counter past prev × tol + slack fails; noise within it passes; a counter
+    # only one binary records is not compared.
+    hv = regression.harm_verdict
+    assert hv("postgres", {"pg_tup_returned": 1000}, {"pg_tup_returned": 1400}, 1.25, 200) == (
+        [], ["pg_tup_returned"])
+    worse, _ = hv("postgres", {"pg_tup_returned": 1000}, {"pg_tup_returned": 1500}, 1.25, 200)
+    assert worse == ["pg_tup_returned 1500 > 1000×1.25+200"], worse
+    assert hv("mssql", {}, {"mssql_page_lookups": 9}, 1.25, 200) == ([], [])
+    assert hv("postgres", {"pg_blks_hit": 1}, {"pg_blks_hit": 999999}, 1.25, 200) == ([], []), \
+        "cache counters are recorded, not graded"
+    print("self-test ok: a source-harm counter past the previous release fails the gate")
     print("\nregression stage (child harness, stand, banner):")
     return regression._self_test()
 
@@ -462,9 +473,11 @@ def preflight(led: Ledger, *, bless_gifs: bool = False) -> None:
     scenarios.verify_batch_resume(led)
     scenarios.verify_partition_footer(led)
     scenarios.verify_audit_suspects(led)
+    scenarios.verify_cdc_harm(led)
     cdc.verify_cdc_e2e(led)
     cdc.verify_cdc_differential(led)
     regression.verify_release_regression(led)
+    regression.verify_harm_regression(led)
     # The two prev-release harnesses, next to the stage that shares their
     # baseline (`RIVET_PREV_RELEASE_BIN`) — and, like it, they FAIL rather than
     # SKIP when that baseline is absent (see `regression`'s module docstring):

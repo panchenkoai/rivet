@@ -1741,3 +1741,134 @@ def _self_test() -> int:
     print(f"\nregression self-test: {len(failures)} failed" if failures
           else "\nregression self-test ok")
     return 1 if failures else 0
+
+
+# ── stage: source HARM, cur vs the downloaded prev release ─────────────────────
+#: Counters whose delta for one export of a fixed table is a property of the SQL
+#: rivet sends (rows scanned, temp spills), not of the machine. Cache and lock
+#: counters depend on what else runs, so they are recorded but not graded.
+HARM_GRADED = {
+    "postgres": ("pg_tup_returned", "pg_tup_fetched", "pg_temp_files"),
+    "mysql": ("mysql_innodb_rows_read", "mysql_handler_read_rnd_next",
+              "mysql_created_tmp_disk_tables"),
+    "mssql": ("mssql_logical_reads", "mssql_worktables_created", "mssql_workfiles_created"),
+    "mongo": ("mongo_docs_scanned", "mongo_keys_scanned"),
+}
+
+
+def _last_run_harm(envdir: Path) -> dict[str, int]:
+    """The harm deltas of the newest run recorded in the state DB beside `envdir`'s config."""
+    import sqlite3
+    db = envdir / ".rivet_state.db"
+    if not db.exists():
+        return {}
+    con = sqlite3.connect(db)
+    try:
+        rows = con.execute(
+            "SELECT metric, delta FROM export_harm WHERE run_id = "
+            "(SELECT run_id FROM export_harm ORDER BY id DESC LIMIT 1)"
+        ).fetchall()
+    finally:
+        con.close()
+    return {m: int(d) for m, d in rows}
+
+
+def harm_verdict(engine: str, prev: dict[str, int], cur: dict[str, int],
+                 tol: float, slack: int) -> tuple[list[str], list[str]]:
+    """(regressions, comparable counters): a graded counter regresses when cur exceeds
+    prev × tol + slack. Only counters both binaries recorded can be compared."""
+    comparable = [m for m in HARM_GRADED.get(engine, ()) if m in prev and m in cur]
+    worse = [f"{m} {cur[m]} > {prev[m]}×{tol}+{slack}"
+             for m in comparable if cur[m] > prev[m] * tol + slack]
+    return worse, comparable
+
+
+#: Rows in the harm fixture: long enough that SQL Server's performance counters, which
+#: refresh about once a second, see the export.
+HARM_ROWS = 100_000
+
+
+def _harm_seed(engine: str, url: str, drop: bool = False) -> bool:
+    """Create (or drop) the `harm_probe` fixture — `HARM_ROWS` rows of (id, v) — on `engine`."""
+    from .cdc import _mongosh, _mysql, _psql, _sqlcmd
+    if engine == "postgres":
+        sql = "DROP TABLE IF EXISTS harm_probe;" + ("" if drop else (
+            "CREATE TABLE harm_probe (id int PRIMARY KEY, v int); "
+            f"INSERT INTO harm_probe SELECT g, g FROM generate_series(1, {HARM_ROWS}) g;"))
+        return _psql(url, sql=sql).ok
+    if engine == "mysql":
+        sql = "DROP TABLE IF EXISTS harm_probe;" + ("" if drop else (
+            "CREATE TABLE harm_probe (id INT PRIMARY KEY, v INT); "
+            "SET SESSION cte_max_recursion_depth = 1000000; "
+            "INSERT INTO harm_probe WITH RECURSIVE g(n) AS (SELECT 1 UNION ALL SELECT n + 1 "
+            f"FROM g WHERE n < {HARM_ROWS}) SELECT n, n FROM g;"))
+        return _mysql(url, sql).ok
+    if engine == "mssql":
+        sql = "DROP TABLE IF EXISTS dbo.harm_probe;" + ("" if drop else (
+            "CREATE TABLE dbo.harm_probe (id INT PRIMARY KEY, v INT); "
+            f"INSERT INTO dbo.harm_probe SELECT TOP ({HARM_ROWS}) n, n FROM (SELECT "
+            "ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS n FROM sys.all_objects a "
+            "CROSS JOIN sys.all_objects b) q;"))
+        return _sqlcmd(url, q=sql).ok
+    script = "db.harm_probe.drop();" + ("" if drop else (
+        f"db.harm_probe.insertMany(Array.from({{length: {HARM_ROWS}}}, "
+        "(_, i) => ({_id: i + 1, v: i + 1})));"))
+    return _mongosh(url, script).ok
+
+
+def verify_harm_regression(led: Ledger) -> None:
+    """What one export costs the SOURCE, cur vs the previous release, per engine: each
+    binary exports the same table three times from its own env, and the per-counter MIN
+    is compared — other activity on a shared server only ever adds to a global counter,
+    so the minimum is the closest reading of the export's own cost."""
+    scen = "harm_regression"
+    prev = _require_prev_binary(led, "all", "-", scen, "local", "harm regression")
+    if prev is None:
+        return
+    tol = _tolerance(os.environ.get("RIVET_HARM_TOL") or "1.25")
+    slack = int(os.environ.get("RIVET_HARM_SLACK") or "200")
+    led.phase("Source harm regression vs prev — rows scanned / temp spills per engine")
+    work = Path(tempfile.mkdtemp(prefix="rivet-oracle-harm-"))
+    for engine in ("postgres", "mysql", "mssql", "mongo"):
+        uvar = f"RIVET_ORACLE_{engine.upper()}_URL"
+        url = os.environ.get(uvar, "")
+        if not url:
+            led.skipped(engine, "-", scen, "local", f"harm[{engine}]: no {uvar}", "no url")
+            continue
+        if not _harm_seed(engine, url):
+            led.failed(engine, "-", scen, "local",
+                       f"harm[{engine}]: could not seed the harm_probe fixture", "seed")
+            continue
+        table = "harm_probe"
+        mins: dict[str, dict[str, int]] = {}
+        for label, binary in (("prev", prev), ("cur", rivet_bin())):
+            envdir = work / f"{engine}_{label}"
+            _scale_cfg(engine, url, table, envdir)
+            best: dict[str, int] = {}
+            for _ in range(3):
+                shutil.rmtree(envdir / "out", ignore_errors=True)
+                (envdir / "out").mkdir(parents=True, exist_ok=True)
+                run([str(binary), "run", "-c", str(envdir / "c.yaml")], timeout=None,
+                    env=_ISOLATED_STATE)
+                for m, d in _last_run_harm(envdir).items():
+                    best[m] = min(best.get(m, d), d)
+            mins[label] = best
+        _harm_seed(engine, url, drop=True)
+        worse, comparable = harm_verdict(engine, mins["prev"], mins["cur"], tol, slack)
+        shown = ", ".join(f"{m} {mins['cur'].get(m)}/{mins['prev'].get(m)}" for m in comparable)
+        if not mins["cur"]:
+            led.failed(engine, "-", scen, "local",
+                       f"harm[{engine}]: the current binary recorded no export_harm rows",
+                       "no harm")
+        elif worse:
+            led.failed(engine, "-", scen, "local",
+                       f"harm[{engine}] regression: {'; '.join(worse)}", ";".join(worse))
+        elif not comparable:
+            led.skipped(engine, "-", scen, "local",
+                        f"harm[{engine}]: the previous release records none of "
+                        f"{', '.join(HARM_GRADED[engine])} — baseline taken, compared from the "
+                        f"next release on (cur {mins['cur']})", "no prev counter")
+        else:
+            led.passed(engine, "-", scen, "local",
+                       f"harm[{engine}]: cur/prev min of 3 runs — {shown} (≤ ×{tol}+{slack})",
+                       shown)
