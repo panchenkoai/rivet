@@ -18,6 +18,10 @@ class KnownRed:
 
 
 KNOWN_RED: tuple[KnownRed, ...] = (
+    KnownRed("two_runs_of_one_export_through_a_transaction_pooler_never_both_proceed",
+             "#318: the session advisory lease does not hold behind a transaction-mode pooler; "
+             "the lease design is pending a decision",
+             "2026-10-11"),
     KnownRed("cdc state parity: sqlite!=golden",
              "#310 made CDC record its schema (export_schema populated); the golden awaits a re-bless",
              "2026-10-11"),

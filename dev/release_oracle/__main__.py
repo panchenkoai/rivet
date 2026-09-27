@@ -612,6 +612,10 @@ def bring_up(led: Ledger, engine: str, tag: str, image: str, port: int) -> str |
     # named ones, on a disk at 89%. The engines are seeded from scratch every
     # run, so there is nothing in them worth keeping past teardown.
     docker("rm", "-fv", name)
+    # Engines get their own network, not `bridge`: a killed run can leave a phantom endpoint
+    # for this name in `bridge` that no disconnect clears, and every later run then fails to
+    # start the container. They are reached through published ports, so nothing else changes.
+    docker("network", "create", "rivet-gate-engines")
 
     # Every engine ran with NO memory limit, and each then sized itself off the
     # WHOLE Docker VM rather than off what a 150k-row fixture needs. Measured on
@@ -645,7 +649,7 @@ def bring_up(led: Ledger, engine: str, tag: str, image: str, port: int) -> str |
     # Multiples, not tight fits: those samples are moments during the matrix, not
     # proven peaks, and a cap that OOM-kills a container mid-run surfaces as a
     # product failure rather than as a resource decision.
-    args: list[str] = ["run", "-d", "--name", name]
+    args: list[str] = ["run", "-d", "--name", name, "--network", "rivet-gate-engines"]
     cmd: list[str] = []
     if engine == "postgres":
         args += ["--memory", "512m",
@@ -671,8 +675,9 @@ def bring_up(led: Ledger, engine: str, tag: str, image: str, port: int) -> str |
         led.skipped(engine, tag, "all", "-", f"{engine}:{tag} unknown engine kind")
         return None
 
-    if not docker(*args, image, *cmd).ok:
-        led.skip(f"{engine}:{tag} could not start ({image})")
+    started = docker(*args, image, *cmd)
+    if not started.ok:
+        led.skip(f"{engine}:{tag} could not start ({image}): {started.stderr.strip()[-200:]}")
         return None
 
     # One engine may need SEVERAL probe spellings across the versions this gate
