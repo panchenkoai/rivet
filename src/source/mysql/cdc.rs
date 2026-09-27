@@ -2896,8 +2896,8 @@ mod tests {
             Some(&ckpt),
             DrainMode::BoundedAtOpen,
             None,
-            Vec::new(),
-            None, // no spill dir — these tests never cross the cap
+            vec!["cdc_idle_first".to_string()], // only its own table: a sibling test's DROP must not reach it
+            None,                               // no spill dir — these tests never cross the cap
         )
         .unwrap();
         assert!(
@@ -2924,8 +2924,8 @@ mod tests {
             Some(&ckpt),
             DrainMode::BoundedAtOpen,
             None,
-            Vec::new(),
-            None, // no spill dir — these tests never cross the cap
+            vec!["cdc_idle_first".to_string()], // only its own table: a sibling test's DROP must not reach it
+            None,                               // no spill dir — these tests never cross the cap
         )
         .unwrap();
         let got = s2
