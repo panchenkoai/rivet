@@ -62,6 +62,7 @@ from . import (
     shared_state,
     state_parity,
     tls_downgrade,
+    upgrade,
     warehouse_layout,
 )
 
@@ -478,6 +479,7 @@ def preflight(led: Ledger, *, bless_gifs: bool = False) -> None:
     cdc.verify_cdc_e2e(led)
     cdc.verify_cdc_differential(led)
     regression.verify_release_regression(led)
+    upgrade.verify_upgrade_continuity(led)
     regression.verify_harm_regression(led)
     # The two prev-release harnesses, next to the stage that shares their
     # baseline (`RIVET_PREV_RELEASE_BIN`) — and, like it, they FAIL rather than
