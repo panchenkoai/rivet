@@ -50,7 +50,7 @@ from tempfile import mkdtemp
 
 try:  # importable both as a package module and as a plain sibling file
     from .core import (HERE, RAN_LIVE_MODULES, RAN_LIVE_TESTS, ROOT, Ledger, Proc, Status, container_for_port, docker, docker_exec, have,
-                       nextest_filter, nextest_outcomes, nextest_passed, port_of, release_bin_env,
+                       nextest_filter, nextest_outcomes, nextest_passed, nextest_started, port_of, release_bin_env,
                        rivet, rivet_bin, run, sqlcmd, test_passed)
     from ..pytools.duckcli import ARGV as DUCKDB
 except ImportError:  # pragma: no cover - depends on how the driver is invoked
@@ -68,6 +68,7 @@ except ImportError:  # pragma: no cover - depends on how the driver is invoked
         have,
         nextest_filter,
         nextest_outcomes,
+        nextest_started,
         nextest_passed,
         port_of,
         release_bin_env,
@@ -1870,6 +1871,11 @@ def _run_live_modules(led: Ledger, scenario: str, label: str, phase: str,
     # nextest pads it (`(   5/1038)`), so all but the last few verdicts — failures included
     # — were silently dropped (39 of 1038 graded, measured 2026-09-27).
     verdicts = nextest_outcomes(p.out)
+    started = nextest_started(p.out)
+    if started is not None and len(verdicts) != started:
+        _failed(led, scenario, "batch", "-", "-",
+                f"{label}: graded {len(verdicts)} of the {started} tests nextest ran — the rest "
+                f"were not read (see {log_path})", "unread verdicts")
     if not verdicts:
         _failed(led, scenario, "batch", "-", "-",
                 f"{label}: no test ran (see {log_path})", _first_match(p.out, r"error|FAILED"))

@@ -508,6 +508,12 @@ def nextest_outcomes(out: str) -> dict[str, str]:
     return final
 
 
+def nextest_started(out: str) -> int | None:
+    """How many tests nextest said it would run (`Starting N tests`), or None if it never started."""
+    m = re.search(r"Starting (\d+) tests?\b", out)
+    return int(m.group(1)) if m else None
+
+
 def nextest_passed(out: str) -> set[str]:
     """The tests nextest reports green: `PASS`, or `LEAK` (passed, left a handle open)."""
     return {n for n, s in nextest_outcomes(out).items() if s in ("PASS", "LEAK")}
@@ -526,6 +532,8 @@ _NEXTEST_SAMPLE = (
 
 def nextest_grading_error() -> str | None:
     """Why the nextest parser would misgrade a real line shape, or None when it grades all correctly."""
+    if nextest_started("    Starting 1038 tests across 1 binary (11 tests skipped)") != 1038:
+        return "the `Starting N tests` count is not read"
     seen = set(nextest_outcomes(_NEXTEST_SAMPLE))
     every = {"m::slow_then_pass", "m::leaky_pass", "m::leaky_fail", "m::plain_fail", "m::padded_fail"}
     if seen != every:
