@@ -620,6 +620,30 @@ services:
       timeout: 3s
       retries: 10
 
+  # The STATE ledger behind a transaction-mode pooler — a common managed-Postgres setup. Session
+  # state (advisory locks, SET) does not survive between transactions here, so the gate can grade
+  # what rivet's run lease does behind one. Opt in: docker compose --profile pool up -d pgbouncer-state
+  pgbouncer-state:
+    image: edoburu/pgbouncer:latest
+    profiles: ["pool"]
+    environment:
+      DATABASE_URL: "postgres://rivet:rivet@postgres-state:5432/rivet_state_bouncer"
+      POOL_MODE: transaction
+      DEFAULT_POOL_SIZE: 1  # one server connection: every client shares it, deterministically
+      MAX_CLIENT_CONN: 50
+      AUTH_TYPE: plain
+      LISTEN_PORT: 6433
+    ports:
+      - "6433:6433"
+    depends_on:
+      postgres-state:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "(echo > /dev/tcp/127.0.0.1/6433) >/dev/null 2>&1 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   # ---- ProxySQL (MySQL pool safety + multiplexing detection tests) ---------
   # Single-backend ProxySQL configured to forward to `mysql:3306`.  The
   # docker-entry config sets up:
