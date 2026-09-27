@@ -343,6 +343,7 @@ pub(super) fn rows_to_batch(
     schema: &Arc<Schema>,
     max_value_bytes: Option<usize>,
     empty_flags: &[Option<usize>],
+    row_index: &[usize],
 ) -> Result<RecordBatch> {
     let columns = schema
         .fields()
@@ -350,7 +351,8 @@ pub(super) fn rows_to_batch(
         .enumerate()
         .map(|(i, f)| {
             let flag = empty_flags.get(i).copied().flatten();
-            build_column(rows, i, f.name(), f.data_type(), max_value_bytes, flag)
+            let at = row_index.get(i).copied().unwrap_or(i);
+            build_column(rows, at, f.name(), f.data_type(), max_value_bytes, flag)
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(RecordBatch::try_new(Arc::clone(schema), columns)?)
