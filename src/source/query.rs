@@ -372,7 +372,7 @@ pub(crate) fn inline_literal(source_type: SourceType, value: &str) -> String {
     match source_type {
         SourceType::Mysql => escape_mysql_literal(value),
         SourceType::Postgres => escape_pg_literal(value),
-        SourceType::Mssql => escape_mssql_literal(value),
+        SourceType::Mssql => mssql_cursor_literal(value),
         SourceType::Oracle => escape_oracle_literal(value),
         SourceType::Mongo => unreachable!(
             "inline_literal: MongoDB keyset paging is not a SQL path (guarded by full-mode-only validation)"
@@ -429,14 +429,15 @@ pub(crate) fn escape_oracle_literal(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
-/// A T-SQL cursor literal: a timestamp rivet rendered is typed `DATETIME2(7)` (its fraction cut to seven digits), so a legacy `DATETIME` column accepts it.
+/// A T-SQL literal: a timestamp (`T` or space form) is typed `DATETIME2(7)` in ISO `T` form, so it parses the same under any `DATEFORMAT`.
 fn mssql_cursor_literal(value: &str) -> String {
-    if chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.f").is_err() {
+    let iso = value.replacen(' ', "T", 1);
+    if chrono::NaiveDateTime::parse_from_str(&iso, "%Y-%m-%dT%H:%M:%S%.f").is_err() {
         return escape_mssql_literal(value);
     }
-    let fitted = match value.split_once('.') {
+    let fitted = match iso.split_once('.') {
         Some((whole, frac)) if frac.len() > 7 => format!("{whole}.{}", &frac[..7]),
-        _ => value.to_string(),
+        _ => iso.clone(),
     };
     format!("CAST({} AS DATETIME2(7))", escape_mssql_literal(&fitted))
 }
@@ -928,6 +929,11 @@ mod tests {
         );
         assert_eq!(mssql_cursor_literal("O'Brien"), "'O''Brien'");
         assert_eq!(mssql_cursor_literal("Zoë"), "N'Zoë'");
+        assert_eq!(
+            mssql_cursor_literal("2024-05-10 10:00:00"),
+            "CAST('2024-05-10T10:00:00' AS DATETIME2(7))",
+            "a space-form timestamp is sent in the DATEFORMAT-independent T form"
+        );
     }
 
     #[test]
