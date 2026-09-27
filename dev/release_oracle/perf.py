@@ -15,8 +15,9 @@ measured runs; the MINIMUM of each metric is compared (other activity only ever 
          source counters
 
 Paths: batch `full`, keyset (`chunked`), an incremental delta and a crash→resume per SQL
-engine; a CDC drain of a large change set (one big transaction plus many small) per CDC
-engine. Configs for batch come from the previous release's `rivet init`.
+engine; per CDC engine a drain of a large change set (one big transaction plus many small),
+the same drain with the transaction buffer capped so it spills, and a resume after a crash
+between flush and ack. Configs for batch come from the previous release's `rivet init`.
 """
 
 from __future__ import annotations
@@ -243,8 +244,12 @@ def _cdc_changes(engine: str, url: str, lo: int) -> None:
                        f"db.orc_cdc_probe.deleteMany({{_id: {{$gte: {lo}, $lte: {hi}}}, amount: {{$mod: [17, 0]}}}});"))
 
 
-def _cdc_side(binary: Path, engine: str, url: str) -> Sample | None:
-    """Anchor, then the minimum of REPS measured drains of CDC_CHANGES changes each (warm-up first)."""
+def _cdc_side(binary: Path, engine: str, url: str, path: str = "cdc") -> Sample | None:
+    """Anchor, then the minimum of REPS measured drains of CDC_CHANGES changes each (warm-up first).
+
+    `cdc-spill` caps the transaction buffer so the big transaction spills to disk;
+    `cdc-resume` crashes each drain after its flush and times the run that resumes it.
+    """
     from .cdc import _ENGINES, _workdir
 
     eng = _ENGINES[engine]
@@ -259,16 +264,22 @@ def _cdc_side(binary: Path, engine: str, url: str) -> Sample | None:
         "    destination:\n      type: local\n      path: ./output/\n"
     )
     env = {"RIVET_STATE_URL": ""}
+    if path == "cdc-spill":
+        env |= {"RIVET_CDC_MAX_TX_ROWS": str(CDC_CHANGES // 20), "RIVET_CDC_SPILL_DIR": "1"}
     try:
         run([str(binary), "run", "-c", "c.yaml"], env=env, cwd=work, timeout=None)
         samples = []
         for i in range(REPS + 1):
             _cdc_changes(engine, url, 1 + i * CDC_CHANGES)
+            if path == "cdc-resume":
+                run([str(binary), "run", "-c", "c.yaml"], cwd=work, timeout=None,
+                    env={**env, "RIVET_TEST_PANIC_AT": "cdc_after_flush_before_ack"})
             s = _timed(binary, work, env, "run", "-c", "c.yaml")
             if i:
                 samples.append(s)
-        # A fast drain that captured nothing is not a measurement: every insert must have landed.
-        got = _declared(work / "output", "SELECT count(*) FROM {parts}")
+        # A fast drain that captured nothing is not a measurement: every inserted id must have
+        # landed. DISTINCT ids, not events — updates and deletes would cover lost inserts.
+        got = _declared(work / "output", f"SELECT count(DISTINCT {eng.id_col}) FROM {{parts}}")
         if not got or got[0][0] < (REPS + 1) * CDC_CHANGES:
             return None
         return _best(samples)
@@ -282,7 +293,10 @@ def _cdc(led: Ledger, prev: Path) -> None:
         if not url:
             led.skipped(engine, "-", SCEN, "cdc", f"perf[{engine}/cdc]: no RIVET_CDC_{engine.upper()}_URL", "no url")
             continue
-        _grade(led, engine, "cdc", _cdc_side(prev, engine, url), _cdc_side(rivet_bin(), engine, url))
+        # MongoDB has no transaction buffer, so there is nothing for it to spill.
+        for path in ("cdc", "cdc-resume") if engine == "mongo" else ("cdc", "cdc-spill", "cdc-resume"):
+            _grade(led, engine, path, _cdc_side(prev, engine, url, path),
+                   _cdc_side(rivet_bin(), engine, url, path))
 
 
 def _aa(led: Ledger, prev: Path, root: Path) -> None:
