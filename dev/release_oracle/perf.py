@@ -74,12 +74,34 @@ def _cpu(text: str) -> float:
     return float(u.group(1)) + float(s.group(1)) if u and s else 0.0
 
 
-def _timed(binary: Path, cwd: Path, env: dict[str, str], *args: str) -> Sample:
-    """`binary args…` under `/usr/bin/time` in `cwd`: wall, CPU, peak RSS and the run's harm."""
+def _pg_counters(url: str) -> dict[str, int] | None:
+    """The source database's own harm counters, read by the harness — never rivet's report."""
+    import time
+
+    from .cdc import _psql
+
+    time.sleep(1.1)  # a backend's statistics reach pg_stat_database up to a second after it idles
+    p = _psql(url, sql="SELECT tup_returned, tup_fetched, temp_files FROM pg_stat_database "
+                       "WHERE datname = current_database();")
+    vals = [v for v in (p.stdout or "").replace("|", " ").split() if v.lstrip("-").isdigit()]
+    if not p.ok or len(vals) < 3:
+        return None
+    return dict(zip(("pg_tup_returned", "pg_tup_fetched", "pg_temp_files"), map(int, vals[-3:])))
+
+
+def _timed(binary: Path, cwd: Path, env: dict[str, str], *args: str, probe: str = "") -> Sample:
+    """`binary args…` under `/usr/bin/time` in `cwd`: wall, CPU, peak RSS and the run's harm.
+
+    With a PostgreSQL `probe` URL the harm is the source's own counter delta over the run;
+    rivet's self-report changed meaning between releases (#312), so it cannot be compared.
+    """
     flag = "-l" if _is_bsd_time() else "-v"
+    before = _pg_counters(probe) if probe else None
     p = run([str(_TIME_BIN), flag, str(binary), *args], timeout=None, env=env, cwd=cwd)
+    after = _pg_counters(probe) if probe else None
+    harm = ({k: after[k] - before[k] for k in after} if before and after else _last_run_harm(cwd))
     return Sample(p.returncode == 0, _parse_wall(p.stderr)[1], _cpu(p.stderr),
-                  _parse_rss(p.stderr), _last_run_harm(cwd))
+                  _parse_rss(p.stderr), harm)
 
 
 def _best(samples: list[Sample]) -> Sample | None:
@@ -160,7 +182,8 @@ def _batch_path(binary: Path, d: Path, url: str, engine: str, table: str, path: 
             if path == "resume":
                 run([str(binary), "run", "-c", "c.yaml"], cwd=d, timeout=None,
                     env={**env, "RIVET_TEST_PANIC_AT": "after_keyset_page:0"})
-        s = _timed(binary, d, env, "run", "-c", "c.yaml")
+        s = _timed(binary, d, env, "run", "-c", "c.yaml",
+                   probe=url if engine == "postgres" else "")
         if i:
             samples.append(s)
     # A fast run that read nothing is not a measurement: the last output holds every row.
@@ -336,7 +359,8 @@ def _cdc_side(binary: Path, engine: str, url: str, path: str = "cdc") -> Sample 
             if path == "cdc-resume":
                 run([str(binary), "run", "-c", "c.yaml"], cwd=work, timeout=None,
                     env={**env, "RIVET_TEST_PANIC_AT": "cdc_after_flush_before_ack"})
-            s = _timed(binary, work, env, "run", "-c", "c.yaml")
+            s = _timed(binary, work, env, "run", "-c", "c.yaml",
+                       probe=url if engine == "postgres" else "")
             if i:
                 samples.append(s)
         # A fast drain that captured nothing is not a measurement: every inserted id must have
@@ -347,6 +371,63 @@ def _cdc_side(binary: Path, engine: str, url: str, path: str = "cdc") -> Sample 
         return _best(samples)
     finally:
         eng.cleanup(url, work)
+
+
+CDC_TABLES = 20
+CDC_PER_TABLE = 1000
+
+
+def _cdc20_side(binary: Path, prev: Path, root: Path, url: str, tag: str) -> Sample | None:
+    """One multiplex stream over CDC_TABLES tables from the previous init: anchor + baseline, then
+    the minimum of REPS timed drains of CDC_PER_TABLE changes per table (warm-up first)."""
+    tables = [f"pc20_{os.getpid()}_{i}" for i in range(1, CDC_TABLES + 1)]
+    _sql("postgres", url, "".join(f"DROP TABLE IF EXISTS {t}; CREATE TABLE {t} (id BIGINT PRIMARY KEY, "
+                                  "v TEXT);" for t in tables))
+    d = root / f"cdc20_{tag}"
+    d.mkdir()
+    env = {"RIVET_PERF_URL": url, "RIVET_STATE_URL": ""}
+    try:
+        p = run([str(prev), "init", "--source-env", "RIVET_PERF_URL", "--include", f"pc20_{os.getpid()}_*",
+                 "--mode", "cdc", "-o", "c.yaml"], env=env, cwd=d)
+        if not p.ok:
+            return None
+        cdc_export = next((ln.split("name:", 1)[1].strip() for ln in (d / "c.yaml").read_text().splitlines()
+                           if ln.strip().startswith("- name:") and ln.strip().endswith("_cdc")), None)
+        if cdc_export is None:
+            return None
+        run([str(binary), "run", "-c", "c.yaml"], env=env, cwd=d, timeout=None)
+        samples = []
+        for i in range(REPS + 1):
+            lo = i * CDC_PER_TABLE + 1
+            _sql("postgres", url, "".join(
+                f"INSERT INTO {t} SELECT g, md5(g::text) FROM generate_series({lo}, {lo + CDC_PER_TABLE - 1}) g;"
+                for t in tables))
+            s = _timed(binary, d, env, "run", "-c", "c.yaml", "--export", cdc_export, probe=url)
+            if i:
+                samples.append(s)
+        # Every inserted id of every table must have landed: a fast drain that captured
+        # nothing is not a measurement.
+        want = (REPS + 1) * CDC_PER_TABLE
+        for t in tables:
+            got = _declared(d / "output" / "cdc" / t, "SELECT count(DISTINCT id) FROM {parts}")
+            if not got or got[0][0] < want:
+                return None
+        return _best(samples)
+    finally:
+        _sql("postgres", url, "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots "
+                              f"WHERE slot_name LIKE 'rivet_%' AND NOT active AND slot_name LIKE '%cdc%' "
+                              f"AND EXISTS (SELECT 1 FROM pg_class WHERE relname = '{tables[0]}');"
+                              + "".join(f"DROP TABLE IF EXISTS {t};" for t in tables))
+
+
+def _cdc20(led: Ledger, prev: Path, root: Path) -> None:
+    """A multiplex CDC stream over twenty PostgreSQL tables, as the previous init generates it."""
+    url = os.environ.get("RIVET_CDC_POSTGRES_URL", "")
+    if not url:
+        led.skipped("postgres", "-", SCEN, "cdc-20", "perf[postgres/cdc-20]: no RIVET_CDC_POSTGRES_URL", "no url")
+        return
+    _grade(led, "postgres", "cdc-20-tables", _cdc20_side(prev, prev, root, url, "prev"),
+           _cdc20_side(rivet_bin(), prev, root, url, "cur"))
 
 
 def _cdc(led: Ledger, prev: Path) -> None:
@@ -405,3 +486,4 @@ def verify_perf_regression(led: Ledger) -> None:
     _batch(led, prev, root)
     _off_happy_path(led, prev, root)
     _cdc(led, prev)
+    _cdc20(led, prev, root)
