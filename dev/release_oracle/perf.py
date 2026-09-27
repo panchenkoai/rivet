@@ -285,6 +285,39 @@ def _cdc(led: Ledger, prev: Path) -> None:
         _grade(led, engine, "cdc", _cdc_side(prev, engine, url), _cdc_side(rivet_bin(), engine, url))
 
 
+def _aa(led: Ledger, prev: Path, root: Path) -> None:
+    """A/A: the previous release against ITSELF must pass these tolerances, or this machine is
+    too noisy for them and a red here would blame the product for the bench."""
+    url = os.environ.get("RIVET_ORACLE_POSTGRES_URL", "")
+    cdc_url = os.environ.get("RIVET_CDC_POSTGRES_URL", "")
+    if not url or not cdc_url:
+        led.skipped("postgres", "-", SCEN, "a/a", "perf A/A: no postgres URLs", "no url")
+        return
+    table = f"perf_aa_{os.getpid()}"
+    if not _seed("postgres", url, table, ROWS, with_cursor=True):
+        led.failed("postgres", "-", SCEN, "a/a", "perf A/A: seed failed", "seed")
+        return
+    try:
+        d = _init_dir(prev, root, "aa_full", url, table, "full")
+        pairs = [("full", _batch_path(prev, d, url, "postgres", table, "full") if d else None,
+                  _batch_path(prev, d, url, "postgres", table, "full") if d else None),
+                 ("cdc", _cdc_side(prev, "postgres", cdc_url), _cdc_side(prev, "postgres", cdc_url))]
+    finally:
+        _sql("postgres", url, f"DROP TABLE IF EXISTS {table};")
+    for path, a, b in pairs:
+        if a is None or b is None:
+            led.failed("postgres", "-", SCEN, "a/a", f"perf A/A[{path}]: a run failed", "run failed")
+            continue
+        noise = perf_verdict("postgres", a, b) + perf_verdict("postgres", b, a)
+        if noise:
+            led.failed("postgres", "-", SCEN, "a/a", f"perf A/A[{path}]: the previous release differs "
+                       f"from ITSELF past the tolerances ({'; '.join(noise)}) — this machine is too "
+                       "noisy for them; a perf verdict here would measure the bench", "noisy")
+        else:
+            led.passed("postgres", "-", SCEN, "a/a", f"perf A/A[{path}]: the previous release matches "
+                       f"itself within the tolerances (wall {a.wall:.2f}/{b.wall:.2f}s)", "a/a")
+
+
 def verify_perf_regression(led: Ledger) -> None:
     """Wall, CPU, peak RSS and source harm per path, this binary against the previous release."""
     prev = _require_prev_binary(led, "all", "-", SCEN, "local", "perf regression")
@@ -292,5 +325,6 @@ def verify_perf_regression(led: Ledger) -> None:
         return
     led.phase("Perf regression vs prev — batch paths and CDC drains: wall, CPU, RSS, source harm")
     root = Path(tempfile.mkdtemp(prefix="rivet-oracle-perf-"))
+    _aa(led, prev, root)
     _batch(led, prev, root)
     _cdc(led, prev)
