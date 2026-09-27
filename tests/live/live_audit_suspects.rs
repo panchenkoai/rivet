@@ -648,3 +648,49 @@ fn keyset_over_an_mssql_datetime2_7_key_reads_every_row_once_or_refuses() {
         }
     }
 }
+
+/// Keyset over a `varchar` key under SQL Server's default SQL collation: the page is
+/// ordered by the column's non-Unicode sort, so the seek must compare in the same order —
+/// an `N'…'` literal compares by Unicode rules and skips keys (`'a-b' < 'ab'` in varchar,
+/// `N'a-b' > N'ab'` in nvarchar).
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn keyset_over_an_mssql_varchar_key_reads_every_key_under_the_default_sql_collation() {
+    let table = unique_name("ks_vc");
+    let keys: Vec<String> = (0..60)
+        .flat_map(|i| [format!("x-{i:02}"), format!("x{i:02}"), format!("x'{i:02}")])
+        .collect();
+    let values = keys
+        .iter()
+        .enumerate()
+        .map(|(i, k)| format!("('{}', {i})", k.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    mssql_exec(&format!(
+        "IF OBJECT_ID('dbo.{table}') IS NOT NULL DROP TABLE dbo.{table}; \
+         CREATE TABLE dbo.{table} (k VARCHAR(20) COLLATE SQL_Latin1_General_CP1_CI_AS NOT NULL \
+           PRIMARY KEY, id INT NOT NULL); \
+         INSERT INTO dbo.{table} VALUES {values}"
+    ));
+    let rig = Rig::mssql_batch(&table)
+        .duckdb_oracle()
+        .mode("chunked")
+        .export_line("chunk_by_key: k")
+        .export_line("chunk_size: 7");
+    let out = rig.run_args(&[]);
+    let ok = out.status.success();
+    let ids = if ok {
+        duckdb_distinct_i64_set(rig.oracle_dir(), "id")
+    } else {
+        Default::default()
+    };
+    let rows = if ok {
+        duckdb_parquet_rows(rig.oracle_dir())
+    } else {
+        0
+    };
+    mssql_exec(&format!("DROP TABLE dbo.{table}"));
+    assert!(ok, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(ids.len(), keys.len(), "every key exported");
+    assert_eq!(rows, keys.len() as i64, "each exactly once");
+}

@@ -441,12 +441,11 @@ fn mssql_cursor_literal(value: &str) -> String {
     format!("CAST({} AS DATETIME2(7))", escape_mssql_literal(&fitted))
 }
 
-/// Quote `s` as a T-SQL `N'…'` unicode string literal. SQL Server escapes only
-/// the single quote (by doubling); backslash is a literal character (unlike
-/// Postgres `E'…'`). The `N` prefix keeps non-ASCII cursor values intact.
+/// Quote `s` as a T-SQL literal: plain `'…'` when ASCII (compares in a varchar key's own sort order), `N'…'` otherwise.
 pub(crate) fn escape_mssql_literal(s: &str) -> String {
+    // ponytail: a NON-ASCII value on a varchar key under a SQL_* collation still seeks by the Unicode order; exact fix needs the key's type in the plan.
     let mut out = String::with_capacity(s.len() + 4);
-    out.push_str("N'");
+    out.push_str(if s.is_ascii() { "'" } else { "N'" });
     for c in s.chars() {
         if c == '\'' {
             out.push('\'');
@@ -793,7 +792,7 @@ mod tests {
         );
         assert!(!first.sql.contains("LIMIT"), "{}", first.sql);
 
-        // Subsequent page: cursor as an N'…' literal (server implicit-casts),
+        // Subsequent page: cursor as a quoted literal (server implicit-casts),
         // FETCH after the ORDER BY.
         let next = build_keyset_query(
             "SELECT * FROM t",
@@ -802,7 +801,7 @@ mod tests {
             500,
             SourceType::Mssql,
         );
-        assert!(next.sql.contains("WHERE [id] > N'"), "{}", next.sql);
+        assert!(next.sql.contains("WHERE [id] > '"), "{}", next.sql);
         assert!(
             next.sql.contains("OFFSET 0 ROWS FETCH NEXT 500 ROWS ONLY"),
             "{}",
@@ -910,24 +909,25 @@ mod tests {
     fn a_mssql_timestamp_cursor_is_typed_so_a_datetime_column_accepts_it() {
         assert_eq!(
             mssql_cursor_literal("2024-01-01T10:00:00.456667"),
-            "CAST(N'2024-01-01T10:00:00.456667' AS DATETIME2(7))"
+            "CAST('2024-01-01T10:00:00.456667' AS DATETIME2(7))"
         );
         assert_eq!(
             mssql_cursor_literal("2024-01-01T10:00:00.123456789"),
-            "CAST(N'2024-01-01T10:00:00.1234567' AS DATETIME2(7))",
+            "CAST('2024-01-01T10:00:00.1234567' AS DATETIME2(7))",
             "a nanosecond fraction is cut to what DATETIME2 holds"
         );
         assert_eq!(
             mssql_cursor_literal("250001"),
-            "N'250001'",
+            "'250001'",
             "a number stays a plain literal"
         );
         assert_eq!(
             mssql_cursor_literal("2024-01-01"),
-            "N'2024-01-01'",
+            "'2024-01-01'",
             "a date stays a plain literal"
         );
-        assert_eq!(mssql_cursor_literal("O'Brien"), "N'O''Brien'");
+        assert_eq!(mssql_cursor_literal("O'Brien"), "'O''Brien'");
+        assert_eq!(mssql_cursor_literal("Zoë"), "N'Zoë'");
     }
 
     #[test]
@@ -997,7 +997,7 @@ mod tests {
             Some(&cursor_with(Some(evil))),
             SourceType::Mssql,
         );
-        assert!(ms.sql.contains("> N'1'' OR ''1''=''1'"), "{}", ms.sql);
+        assert!(ms.sql.contains("> '1'' OR ''1''=''1'"), "{}", ms.sql);
     }
 
     #[test]
