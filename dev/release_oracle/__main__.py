@@ -320,8 +320,25 @@ def _self_test() -> int:
     probe = Ledger(colour=False)
     probe.failed("-", "-", "s", "-", f"boom {k.match}")
     assert probe.cells[-1].status is Status.KNOWN and not probe.red
+    from .scenarios import _failed
+    via = Ledger(colour=False)
+    _failed(via, "-", "-", "s", "-", f"boom {k.match}", "detail")
+    assert via.cells[-1].status is Status.KNOWN, "a scenario failure must meet the known-red registry"
     probe.close_known_red()
     assert probe.red, "an entry that matched nothing in a full run must fail"
+    other = kr.KNOWN_RED[-1]
+    shown = Ledger(colour=False)
+    shown.passed("-", "-", "s", "-", f"ok {other.match}")
+    shown.close_known_red()
+    said = [c.detail for c in shown.cells if c.scenario == "known_red"]
+    assert any(other.match in d and "PASSED" in d for d in said), said
+    assert any(k.match in d and "no cell" in d for d in said), said
+    from .core import SKIP_ALLOWED
+    from .live_modules import exclusive_tests
+    live_src = "\n".join(f.read_text() for f in (ROOT / "tests" / "live").glob("*.rs"))
+    for key in SKIP_ALLOWED:
+        assert f"fn {key.split('::')[-1]}(" in live_src, f"SKIP_ALLOWED names no live test: {key}"
+    assert exclusive_tests(), "no live+exclusive test found — the exclusive pass would grade nothing"
     print("self-test ok: live modules are derived; perf tolerances grade regressions, not noise")
     print("\nregression stage (child harness, stand, banner):")
     return regression._self_test()

@@ -16,7 +16,7 @@ import re
 from .core import RAN_LIVE_MODULES, RAN_LIVE_TESTS, ROOT, Ledger, have, run
 from .scenarios import _run_live_modules
 
-__all__ = ["verify_live_modules", "live_suite_modules", "EXCLUDED"]
+__all__ = ["verify_live_modules", "live_suite_modules", "exclusive_tests", "EXCLUDED"]
 
 #: Modules the derived run skips, each for a reason (a stale entry fails the offline guard).
 EXCLUDED = {
@@ -28,6 +28,15 @@ def live_suite_modules() -> list[str]:
     """Every module tests/live_suite.rs declares."""
     text = (ROOT / "tests" / "live_suite.rs").read_text()
     return re.findall(r"^mod ([a-z0-9_]+);", text, re.M)
+
+
+def exclusive_tests() -> list[str]:
+    """Bare names of live tests marked `live+exclusive`: each needs the stand to itself."""
+    names = []
+    for f in sorted((ROOT / "tests" / "live").glob("*.rs")):
+        names += re.findall(r'#\[ignore = "live\+exclusive[^\n]*\n(?:\s*#\[[^\n]*\n)*\s*(?:pub )?fn ([a-z0-9_]+)',
+                            f.read_text())
+    return names
 
 
 def derived_filter(modules: list[str], ran_modules: set[str], ran_tests: set[str]) -> tuple[list[str], str]:
@@ -43,6 +52,7 @@ def derived_filter(modules: list[str], ran_modules: set[str], ran_tests: set[str
 def verify_live_modules(led: Ledger) -> None:
     """Run every live_suite module and test no dedicated cell ran; one ledger row per test."""
     left, expr = derived_filter(live_suite_modules(), set(RAN_LIVE_MODULES), set(RAN_LIVE_TESTS))
+    excl = [n for n in exclusive_tests() if n not in RAN_LIVE_TESTS]
     # The environment the Rig cells get: a warehouse project and bucket for the cloud tests,
     # a Postgres state URL for the ones that share one — and NO ambient RIVET_STATE_URL, which
     # would move every SQLite-reading test onto Postgres (the batch_resume lesson).
@@ -53,4 +63,12 @@ def verify_live_modules(led: Ledger) -> None:
            "RIVET_TEST_GCS_BUCKET": os.environ.get("BQ_ORACLE_BUCKET", "rivet_data_test")}
     _run_live_modules(led, "live", "live modules",
                       f"every other live_suite module ({len(left)}), derived from tests/live_suite.rs",
-                      left, env=env, expr=expr)
+                      left, env=env,
+                      expr=f"({expr}) - test(/::({'|'.join(excl)})$/)" if excl else expr)
+    if excl:
+        # They restart a shared engine or hold a slot their neighbours flag: one at a time,
+        # with nothing else running, which is the only way they grade anything.
+        _run_live_modules(led, "live_modules", "live modules (exclusive)",
+                          f"tests that need the stand to themselves ({len(excl)}), one at a time",
+                          left, env={**env, "RIVET_TEST_EXCLUSIVE": "1"}, threads=1,
+                          expr=" | ".join(f"test(/::{n}$/)" for n in excl))

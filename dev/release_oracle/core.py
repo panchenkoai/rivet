@@ -84,6 +84,7 @@ class Ledger:
     def __init__(self, *, colour: bool | None = None) -> None:
         self.cells: list[Cell] = []
         self.known_seen: set[str] = set()
+        self.known_passed: set[str] = set()
         if colour is None:
             colour = sys.stdout.isatty() or os.environ.get("FORCE_COLOR") == "1"
         self._colour = colour
@@ -170,6 +171,7 @@ class Ledger:
             parent._emit(line)
         parent.cells.extend(self.cells)
         parent.known_seen |= self.known_seen
+        parent.known_passed |= self.known_passed
         # Spans DO travel (unlike _phase_times): each is a per-engine wall-clock
         # the parent reports ranked, not summed, so overlap across engines is not
         # double-counted. This is the only window into the parallel matrix.
@@ -189,6 +191,10 @@ class Ledger:
 
     def passed(self, engine: str, version: str, scenario: str, store: str, msg: str, detail: str = "") -> None:
         """Print the ✓ AND record the row — one call, so the two cannot diverge."""
+        from . import known_red
+        entry, _ = known_red.match(msg)
+        if entry is not None:
+            self.known_passed.add(entry.match)
         self.ok(msg)
         self.add(engine, version, scenario, store, Status.PASS, detail or msg)
 
@@ -212,7 +218,10 @@ class Ledger:
         for k in known_red.KNOWN_RED:
             if k.match not in self.known_seen:
                 # Straight to FAIL: the message quotes the entry, so `failed` would match it.
-                msg = (f"known-red entry `{k.match}` matched no failure this run — it is fixed; "
+                why = ("its cell PASSED this run — it is fixed"
+                       if k.match in self.known_passed else
+                       "no cell this run exercised it, so it excuses nothing")
+                msg = (f"known-red entry `{k.match}` matched no failure: {why}; "
                        "remove it from dev/release_oracle/known_red.py")
                 self.bad(msg)
                 self.add("-", "-", "known_red", "-", Status.FAIL, msg)
@@ -472,7 +481,14 @@ RAN_LIVE_MODULES: set[str] = set()
 
 #: Live tests allowed to SELF-SKIP in a gate run (`module::fn` → why). Any other self-skip
 #: fails its cell: libtest counts a skip green, so an unlisted one is a row that graded nothing.
-SKIP_ALLOWED: dict[str, str] = {}
+SKIP_ALLOWED: dict[str, str] = {
+    "live_cdc::regenerate_the_pgoutput_fixture_from_the_rig_scenarios":
+        "a fixture GENERATOR (RIVET_REGENERATE_FIXTURES=1), not a check",
+    "live_cdc_mbt::cdc_destination_disk_full_is_loud_and_lossless":
+        "needs a mounted tiny filesystem (RIVET_TINYFS_DIR) the stand does not provision",
+    "live_keyset_parallel::parallel_keyset_incremental_survives_no_backslash_escapes_mysql":
+        "sets @@global.sql_mode, which needs SUPER; the stand's test user has none",
+}
 
 
 def self_skipped(skip_log: Path) -> dict[str, str]:

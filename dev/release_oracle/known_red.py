@@ -24,15 +24,6 @@ KNOWN_RED: tuple[KnownRed, ...] = (
     KnownRed("verdicts DIVERGED",
              "#309 changed init's strategy for key-less tables (range -> full); the golden awaits a re-bless",
              "2026-10-11"),
-    KnownRed("a_ledger_cut_mid_load_fails_loudly_and_the_next_run_finishes_the_job",
-             "a load killed between the warehouse write and the ledger row wedges the table (loud, safe); fix pending",
-             "2026-10-11"),
-    KnownRed("soak_spill_mssql",
-             "the MSSQL spill soak runs past nextest's 240 s ceiling; needs its own slow-timeout",
-             "2026-10-11"),
-    KnownRed("pg_temp_bytes_snapshot",
-             "a live-only exclusion the offline battery now covers; the exclusion needs removing",
-             "2026-10-11"),
 )
 
 

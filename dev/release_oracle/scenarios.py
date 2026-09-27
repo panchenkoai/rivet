@@ -200,8 +200,7 @@ def _passed(led: Ledger, eng: str, ver: str, scenario: str, store: str, msg: str
 
 
 def _failed(led: Ledger, eng: str, ver: str, scenario: str, store: str, msg: str, detail: str = "") -> None:
-    led.bad(msg)
-    led.add(eng, ver, scenario, store, Status.FAIL, detail)
+    led.failed(eng, ver, scenario, store, msg, detail)
 
 
 def _skipped(led: Ledger, eng: str, ver: str, scenario: str, store: str, msg: str, detail: str = "") -> None:
@@ -1853,7 +1852,7 @@ def verify_partition_footer(led: Ledger) -> None:
 
 def _run_live_modules(led: Ledger, scenario: str, label: str, phase: str,
                       modules: list[str], env: dict[str, str] | None = None,
-                      expr: str | None = None) -> None:
+                      expr: str | None = None, threads: int | None = None) -> None:
     """Run live_suite `modules` (or the nextest filter `expr`) through the gate binary; one ledger row per test case."""
     led.phase(f"{label} · {phase}")
     if not have("cargo"):
@@ -1866,6 +1865,7 @@ def _run_live_modules(led: Ledger, scenario: str, label: str, phase: str,
     p = run(
         ["cargo", "nextest", "run", "--manifest-path", str(ROOT / "Cargo.toml"),
          "--test", "live_suite", "--run-ignored", "all", "--no-fail-fast",
+         *(["--test-threads", str(threads)] if threads else []),
          "-E", expr or " | ".join(f"test(/^{m}::/)" for m in modules)],
         env={**release_bin_env(), **(env or {}), "RIVET_SKIP_LOG": str(skip_log)},
         timeout=NO_TIMEOUT,
