@@ -544,6 +544,13 @@ def isolate_state_db(url: str, tag: str) -> str | None:
     return urllib.parse.urlunsplit((u.scheme, u.netloc, f"/{db}", u.query, u.fragment))
 
 
+def state_db_name() -> str:
+    """The gate's Postgres state database (the per-run one when isolated)."""
+    import urllib.parse
+    url = os.environ.get("RIVET_GATE_STATE_URL", "")
+    return urllib.parse.urlsplit(url).path.lstrip("/") or "rivet_state"
+
+
 def container_for_port(port: int) -> str | None:
     """The running container publishing `port` — how the CDC layer finds the
     engine behind a URL. Returns None rather than an empty string, so a caller

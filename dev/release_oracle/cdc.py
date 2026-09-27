@@ -51,6 +51,7 @@ from typing import Callable
 try:  # imported as part of the package
     from . import scenarios
     from .core import (
+        state_db_name,
         HERE,
         ROOT,
         Ledger,
@@ -67,6 +68,7 @@ try:  # imported as part of the package
 except ImportError:  # run directly out of dev/release_oracle/
     import scenarios  # type: ignore[no-redef]
     from core import (  # type: ignore[no-redef]
+        state_db_name,
         HERE,
         ROOT,
         Ledger,
@@ -572,7 +574,7 @@ def _runs_seen(export: str = "orc_cdc_probe") -> frozenset[str] | None:
     return frozenset(
         ln.strip()
         for ln in docker_exec(
-            c, "psql", "-U", "rivet", "-d", "rivet_state", "-tAc",
+            c, "psql", "-U", "rivet", "-d", state_db_name(), "-tAc",
             f"SELECT run_id FROM run_status WHERE export_name = '{export}'",
         ).stdout.splitlines()
         if ln.strip()
@@ -613,7 +615,7 @@ def _state_populated(
         rows = [
             ln.split("|", 1)
             for ln in docker_exec(
-                c, "psql", "-U", "rivet", "-d", "rivet_state", "-tAc",
+                c, "psql", "-U", "rivet", "-d", state_db_name(), "-tAc",
                 f"SELECT run_id||'|'||status FROM run_status WHERE export_name = '{export}'",
             ).stdout.splitlines()
             if "|" in ln

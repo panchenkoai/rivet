@@ -1831,7 +1831,7 @@ def verify_cdc_harm(led: Ledger) -> None:
     server's own table-level counters (live_cdc_harm)."""
     _run_live_modules(led, "cdc_harm", "cdc harm",
                       "a CDC drain costs the source a fraction of one scan (live_cdc_harm)",
-                      ["live_cdc_harm"])
+                      ["live_cdc_harm"], env={"RIVET_STATE_URL": ""})
 
 
 def verify_session_state(led: Ledger) -> None:

@@ -48,11 +48,11 @@ from typing import Callable
 from pathlib import Path
 
 try:
-    from .core import Ledger, have, run, note_invariant_violations
+    from .core import Ledger, have, run, note_invariant_violations, state_db_name
     from .scenarios import NO_TIMEOUT, _failed, _passed, _skipped, work_dir
     from ..pytools.duckcli import ARGV as DUCKDB
 except ImportError:  # pragma: no cover - depends on how the driver is invoked
-    from core import Ledger, have, run, note_invariant_violations  # type: ignore
+    from core import Ledger, have, run, note_invariant_violations, state_db_name  # type: ignore
     from scenarios import NO_TIMEOUT, _failed, _passed, _skipped, work_dir  # type: ignore
     DUCKDB = [sys.executable, str(Path(__file__).resolve().parents[1] / "pytools" / "duckcli.py")]
 
@@ -85,7 +85,7 @@ def _psql_state(container: str, sql: str) -> str | None:
     `None` forces the caller to say "could not verify", which is a different
     verdict from "verified clean"."""
     p = run(
-        ["docker", "exec", container, "psql", "-U", "rivet", "-d", "rivet_state", "-tAc", sql]
+        ["docker", "exec", container, "psql", "-U", "rivet", "-d", state_db_name(), "-tAc", sql]
     )
     return p.stdout.strip() if p.ok else None
 

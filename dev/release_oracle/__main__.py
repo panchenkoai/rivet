@@ -463,7 +463,7 @@ def clean_tree_and_build(led: Ledger, *, fast: bool = False) -> bool:
         led.failed(
             "-", "-", "clean_tree", "-",
             f"clean tree: the release build FAILED on a clean tree — nothing below can mean "
-            f"anything: {(build.err or build.out)[-300:]}",
+            f"anything: {(build.stderr or build.stdout)[-300:]}",
         )
         return False
     how = ("target/package removed (fast: cargo fingerprints trusted, binary=HEAD)"
@@ -960,10 +960,29 @@ def engine_loop(led: Ledger, ns: argparse.Namespace) -> None:
         subs[engine].flush_into(led)
 
 
+def _hold_gate_lock():
+    """An exclusive lock on this tree's target dir for the whole run, or None if held."""
+    import fcntl
+
+    target_dir().mkdir(parents=True, exist_ok=True)
+    fh = open(target_dir() / ".gate.lock", "w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fh.close()
+        return None
+    return fh
+
+
 def main(argv: list[str] | None = None) -> int:
     if (argv if argv is not None else sys.argv[1:]) == ["--self-test"]:
         return _self_test()
     ns = parse_args(argv)
+    lock = _hold_gate_lock()
+    if lock is None:
+        print(f"another gate run holds {target_dir() / '.gate.lock'} — two runs in one tree clean "
+              "and rebuild each other's binary; wait for it or stop it", file=sys.stderr)
+        return 2
     from .core import set_cell_parallel
     set_cell_parallel(ns.cell_parallel)
 

@@ -30,4 +30,6 @@ def verify_cdc_schema_drift(led: Ledger) -> None:
         msg=lambda n: f"cdc-schema-drift[{CELLS[n]}] · {n.replace('_', ' ')}",
         cloud=False,
         services=(("postgres-cdc", 5434), ("mysql-cdc", 3307), ("mssql-cdc", 1434)),
+        # The source-harm test reads the SQLite `.rivet_state.db` beside its config.
+        extra_env={"RIVET_STATE_URL": ""},
     )

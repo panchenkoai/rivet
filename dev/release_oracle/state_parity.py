@@ -40,11 +40,11 @@ from pathlib import Path
 
 try:
     from . import state_parity_duckdb
-    from .core import Ledger, rivet, run
+    from .core import Ledger, rivet, run, state_db_name
     from .scenarios import NO_TIMEOUT, _failed, _passed, _skipped, work_dir
 except ImportError:  # pragma: no cover - depends on how the driver is invoked
     import state_parity_duckdb  # type: ignore
-    from core import Ledger, rivet, run  # type: ignore
+    from core import Ledger, rivet, run, state_db_name  # type: ignore
     from scenarios import NO_TIMEOUT, _failed, _passed, _skipped, work_dir  # type: ignore
 
 __all__ = ["verify_state_backend_parity"]
@@ -84,7 +84,7 @@ UNSCOPED = {"chunk_task", "loaded_source_run"}
 
 def _psql(container: str, sql: str) -> str:
     return run(
-        ["docker", "exec", container, "psql", "-U", "rivet", "-d", "rivet_state", "-tAc", sql]
+        ["docker", "exec", container, "psql", "-U", "rivet", "-d", state_db_name(), "-tAc", sql]
     ).stdout.strip()
 
 

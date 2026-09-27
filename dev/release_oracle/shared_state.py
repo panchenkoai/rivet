@@ -47,13 +47,14 @@ def _listening(port: int) -> bool:
 
 def run_rig_tests(led: Ledger, scenario: str, tests: tuple[str, ...],
                   cell: Callable[[str], str], msg: Callable[[str], str], *,
-                  cloud: bool = True, services: tuple[tuple[str, int], ...] = ()) -> None:
+                  cloud: bool = True, services: tuple[tuple[str, int], ...] = (),
+                  extra_env: dict[str, str] | None = None) -> None:
     """Run live Rig tests against the gate binary; grade each by cargo's own verdict line.
 
     `cloud` cells need the BigQuery project, `gcloud` and a Postgres state URL; `services`
     are local ports the tests need. A missing one is a SKIP naming it, never a FAIL.
     """
-    env = {"RIVET_BIN_OVERRIDE": str(rivet_bin())}
+    env = {"RIVET_BIN_OVERRIDE": str(rivet_bin()), **(extra_env or {})}
     checks = [("cargo", have("cargo"))]
     if cloud:
         state = os.environ.get("RIVET_CDC_STATE_URL") or os.environ.get("RIVET_CONC_STATE_URL") or ""

@@ -506,7 +506,8 @@ def prev_binary() -> Path | None:
     raw = os.environ.get("RIVET_PREV_RELEASE_BIN", "")
     if not raw:
         return None
-    p = Path(raw)
+    # Absolute: cells run the baseline from their own temp directories.
+    p = (ROOT / raw).resolve() if not Path(raw).is_absolute() else Path(raw)
     return p if p.is_file() and os.access(p, os.X_OK) else None
 
 
