@@ -847,3 +847,44 @@ fn parallel_keyset_incremental_on_an_mssql_datetime_key_exports_the_newest_row()
         );
     }
 }
+
+/// `rivet check` under a `db_datareader` login still reports the MSSQL row estimate: it
+/// reads the `sys.partitions` catalog, not a DMV that needs VIEW DATABASE STATE.
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn mssql_check_reports_a_row_estimate_for_a_read_only_login() {
+    let table = unique_name("ro_est");
+    let login = unique_name("rivet_ro");
+    let pw = "Rivet_Passw0rd!";
+    let drop_login = |login: &str| {
+        mssql_exec(&format!(
+            "IF EXISTS (SELECT 1 FROM sys.database_principals WHERE name = '{login}') DROP USER {login}; \
+             IF EXISTS (SELECT 1 FROM sys.server_principals WHERE name = '{login}') DROP LOGIN {login};"
+        ))
+    };
+    drop_login(&login);
+    mssql_exec(&format!(
+        "IF OBJECT_ID('dbo.{table}') IS NOT NULL DROP TABLE dbo.{table}; \
+         CREATE TABLE dbo.{table} (id INT NOT NULL PRIMARY KEY, v INT NOT NULL); \
+         INSERT INTO dbo.{table} SELECT TOP 1500 ROW_NUMBER() OVER (ORDER BY (SELECT 1)), 1 \
+           FROM sys.all_objects a CROSS JOIN sys.all_objects b; \
+         CREATE LOGIN {login} WITH PASSWORD = '{pw}', CHECK_POLICY = OFF; \
+         CREATE USER {login} FOR LOGIN {login}; ALTER ROLE db_datareader ADD MEMBER {login};"
+    ));
+    let rig = Rig::mssql_batch(&table)
+        .source_url(&format!("sqlserver://{login}:{pw}@127.0.0.1:1433/rivet"))
+        .mode("chunked")
+        .export_line("chunk_column: id");
+    let out = rig.cli(&["check"]);
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    mssql_exec(&format!("DROP TABLE dbo.{table}"));
+    drop_login(&login);
+    assert!(
+        said.contains("Row estimate: ~1K  (catalog estimate)"),
+        "{said}"
+    );
+}

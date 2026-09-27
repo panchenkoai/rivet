@@ -125,6 +125,9 @@ const BASELINE: &[(&str, usize, usize, usize, usize)] = &[
         0,
     ),
     ("src/source/oracle/mod.rs::export_within_budget", 2, 0, 2, 2),
+    // Matched by NAME from the PostgresSource::query_scalar exclusion (the gate keys on
+    // name + return type); Mongo's own query_scalar is not excluded. Entered at its count.
+    ("src/source/mongo/mod.rs::query_scalar", 0, 0, 1, 0),
     (
         "src/pipeline/mongo_parallel.rs::run_mongo_parallel",
         0,

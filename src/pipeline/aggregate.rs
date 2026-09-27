@@ -423,17 +423,21 @@ pub(super) fn print(agg: &RunAggregate) {
             eprintln!("    - {}: {}", e.export_name, truncate(cause, 200));
         }
         if !chunked_recovery.is_empty() {
-            write_chunked_recovery(
-                &mut std::io::stderr(),
-                &chunked_recovery,
-                agg.config_path.as_deref(),
-            );
+            print_chunked_recovery(&chunked_recovery, agg.config_path.as_deref());
         }
     }
 }
 
-/// Write one consolidated recovery block for the failed chunked exports to `w`.
+/// Print one consolidated recovery block for the failed chunked exports.
+fn print_chunked_recovery(exports: &[&str], config_path: Option<&str>) {
+    write_chunked_recovery(&mut std::io::stderr(), exports, config_path);
+}
+
+/// Write one consolidated recovery block for the failed chunked exports to `w`; nothing when there are none.
 fn write_chunked_recovery(w: &mut dyn std::io::Write, exports: &[&str], config_path: Option<&str>) {
+    if exports.is_empty() {
+        return;
+    }
     let _ = std::io::Write::write_all(w, chunked_recovery_text(exports, config_path).as_bytes());
 }
 
@@ -644,6 +648,9 @@ mod tests {
             text,
             "the block is what gets written"
         );
+        let mut none = Vec::new();
+        write_chunked_recovery(&mut none, &[], Some("r.yaml"));
+        assert!(none.is_empty(), "no failed chunked export, no block");
     }
 
     /// A child that CRASHED must be reported as failed with its own cause — not
