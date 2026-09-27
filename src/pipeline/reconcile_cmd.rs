@@ -114,7 +114,7 @@ fn enforce_reconcile_exit(summary: &ReconcileSummary) -> Result<()> {
 }
 
 /// Run a reconcile pass against the latest chunk run and return the report.
-/// Exposed so `rivet repair --auto` can build a repair plan from a fresh reconcile
+/// Exposed so `rivet repair` can build a repair plan from a fresh reconcile
 /// without duplicating the logic.
 pub(crate) fn reconcile_chunked_fresh(
     plan: &ResolvedRunPlan,

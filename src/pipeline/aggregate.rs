@@ -428,32 +428,26 @@ pub(super) fn print(agg: &RunAggregate) {
     }
 }
 
-/// Render one consolidated recovery block instead of repeating the same
-/// `rivet run --resume` / `rivet state reset-chunks` commands per failed
-/// export.  `config_path` is taken from the aggregate so the printed
-/// commands are copy-paste runnable.
+/// Print one consolidated recovery block for the failed chunked exports.
 fn print_chunked_recovery(exports: &[&str], config_path: Option<&str>) {
+    eprint!("{}", chunked_recovery_text(exports, config_path));
+}
+
+/// The recovery block: a plain run resumes each interrupted checkpoint; a reset abandons it (then run WITHOUT --resume).
+fn chunked_recovery_text(exports: &[&str], config_path: Option<&str>) -> String {
     let cfg = match config_path {
-        Some(p) if !p.is_empty() => format!("--config {}", p),
+        Some(p) if !p.is_empty() => format!("--config {p}"),
         _ => "--config <CONFIG>".to_string(),
     };
-    let names_spaced = exports.join(" ");
-    eprintln!();
-    eprintln!("  recovery ({} chunked export(s)):", exports.len());
-    eprintln!("    resume in-progress checkpoint runs:");
-    eprintln!("      rivet run {} --resume", cfg);
-    eprintln!(
-        "    or reset stuck checkpoints for every export in this config (chunk_run.status = in_progress), then resume:"
-    );
-    eprintln!(
-        "      rivet state reset-chunks {} --stuck-checkpoints && rivet run {} --resume",
-        cfg, cfg
-    );
-    eprintln!("    or reset only the exports listed above, then resume:");
-    eprintln!(
-        "      for e in {}; do rivet state reset-chunks {} --export \"$e\"; done && rivet run {} --resume",
-        names_spaced, cfg, cfg
-    );
+    format!(
+        "\n  recovery ({n} chunked export(s)):\n    \
+         resume the interrupted runs (a plain run continues each from its checkpoint):\n      \
+         rivet run {cfg}\n    \
+         or abandon them and start over (their parts stay under the prefix, unmanifested):\n      \
+         for e in {names}; do rivet state reset-chunks {cfg} --export \"$e\"; done && rivet run {cfg}\n",
+        n = exports.len(),
+        names = exports.join(" "),
+    )
 }
 
 fn format_duration(ms: i64) -> String {
@@ -623,6 +617,19 @@ pub(super) fn collect_child_entries(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn chunked_recovery_never_chains_a_reset_into_a_resume() {
+        let text = chunked_recovery_text(&["a", "b"], Some("r.yaml"));
+        assert!(
+            text.contains("      rivet run --config r.yaml\n"),
+            "a plain run resumes:\n{text}"
+        );
+        assert!(
+            text.contains("--export \"$e\"; done && rivet run --config r.yaml\n"),
+            "a reset is followed by a run without --resume:\n{text}"
+        );
+        assert!(!text.contains("--resume"), "{text}");
+    }
 
     /// A child that CRASHED must be reported as failed with its own cause — not
     /// as its half-finished in-flight aggregate.

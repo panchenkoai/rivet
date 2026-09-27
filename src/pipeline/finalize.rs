@@ -811,11 +811,6 @@ pub(super) fn warn_if_prefix_has_completed_run(plan: &ResolvedRunPlan) {
     }
 }
 
-/// Whether this destination already holds a completed export (`_SUCCESS`).
-/// `rivet apply --resume` uses it to skip exports a prior run finished, so a
-/// re-run after a partial failure does not redo work already done. Reuses the
-/// same probe as [`warn_if_prefix_has_completed_run`]; a streaming destination
-/// (stdout) or a probe error counts as "not complete" (re-run it).
 /// Repair the prefix `_SUCCESS` a `--split --resume` found MISSING with every
 /// unit already complete — the crash-in-[last unit's Success → pool marker]
 /// window. That resume path returns "nothing to run" ABOVE the pool's marker
@@ -880,6 +875,11 @@ pub(crate) fn needs_run(export: &crate::config::ExportConfig, resume: bool, who:
     true
 }
 
+/// Whether this destination already holds a completed export (`_SUCCESS`).
+/// `rivet apply --resume` uses it to skip exports a prior run finished, so a
+/// re-run after a partial failure does not redo work already done. Reuses the
+/// same probe as [`warn_if_prefix_has_completed_run`]; a streaming destination
+/// (stdout) or a probe error counts as "not complete" (re-run it).
 pub(crate) fn destination_has_success(dest: &crate::config::DestinationConfig) -> bool {
     use crate::manifest::SUCCESS_FILENAME;
     let Ok(d) = crate::destination::create_destination(dest) else {
@@ -906,12 +906,17 @@ fn manifest_describes_completed_parts(bytes: &[u8]) -> bool {
 /// `_SUCCESS` / `would overwrite`, or `orphan`.  Weakening the text below those
 /// markers would silently fail the audit, so the test below guards it.
 fn rerun_warning_message(uri: &str, marker: &str) -> String {
+    // A completed run (`_SUCCESS`) has nothing to continue, and --resume refuses it.
+    let way_out = if marker == crate::manifest::SUCCESS_FILENAME {
+        "The prior run completed: clear the prefix (or use a new one) before re-running."
+    } else {
+        "Use --resume to continue the prior run, or clear the prefix first."
+    };
     format!(
         "destination prefix '{uri}' already has parts from a prior run ({marker} present) — \
          re-running WITHOUT --resume appends fresh timestamp-named parts alongside the old ones \
          (nothing is overwritten) and rewrites manifest.json to describe only this run, so a glob \
-         reader over the prefix will double-count / orphan the old parts. \
-         Use --resume to continue the prior run, or clear the prefix first."
+         reader over the prefix will double-count / orphan the old parts. {way_out}"
     )
 }
 
@@ -1885,8 +1890,9 @@ mod tests {
             "must name the prefix: {msg}"
         );
         assert!(
-            msg.contains("--resume"),
-            "must point at the safe recovery: {msg}"
+            msg.contains("The prior run completed: clear the prefix (or use a new one)")
+                && !msg.contains("Use --resume"),
+            "a completed prefix points at clearing it, never at --resume (which refuses it): {msg}"
         );
     }
 
@@ -1896,6 +1902,10 @@ mod tests {
         // the `_SUCCESS` substring is gone — the message must still trip the
         // matcher via `already has` / `prior completed run` / `orphan`.
         let msg = rerun_warning_message("file:///tmp/out", "manifest.json");
+        assert!(
+            msg.contains("Use --resume to continue the prior run"),
+            "an uncompleted prior run can be resumed: {msg}"
+        );
         assert!(
             audit_matcher_accepts(&msg),
             "manifest-only rerun warning must still trip the live audit matcher; message was: {msg}"
