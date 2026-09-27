@@ -56,6 +56,7 @@ from . import (
     gifs,
     init_delta,
     partner_shape,
+    perf,
     regression,
     release_path,
     scenarios,
@@ -480,6 +481,7 @@ def preflight(led: Ledger, *, bless_gifs: bool = False) -> None:
     cdc.verify_cdc_differential(led)
     regression.verify_release_regression(led)
     upgrade.verify_upgrade_continuity(led)
+    perf.verify_perf_regression(led)
     regression.verify_harm_regression(led)
     # The two prev-release harnesses, next to the stage that shares their
     # baseline (`RIVET_PREV_RELEASE_BIN`) — and, like it, they FAIL rather than
