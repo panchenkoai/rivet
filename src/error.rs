@@ -499,6 +499,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_codes_table_renders_one_row_per_kind_with_its_exit() {
+        let md = codes_markdown();
+        for row in [
+            "| `RIVET_CONFIG_NO_EXPORTS` | usage | 1 | declare at least one export under `exports:` |",
+            "| `RIVET_SOURCE_STATEMENT_TIMEOUT` | environment | 2 if transient, else 1 | raise `tuning.statement_timeout_s`, or narrow the chunk |",
+            "| `RIVET_STATE_SCHEMA_NEWER` | refusal | 5 | upgrade rivet, or point this binary at a state DB it created |",
+            "| `RIVET_LOAD_COUNT_MISMATCH` | integrity | 3 | compare the warehouse table with the run's manifest before re-running; the source is kept |",
+            "| `RIVET_INTERNAL_SPILL` | internal | 6 | the CDC spill log is inconsistent — a bug or a damaged spill directory; report it and re-run |",
+        ] {
+            assert!(md.contains(row), "missing row: {row}\n{md}");
+        }
+    }
+
+    #[test]
+    fn the_committed_errors_reference_matches_the_registry() {
+        let committed = include_str!("../docs/reference/errors.md");
+        assert_eq!(
+            committed.trim_end(),
+            codes_markdown().trim_end(),
+            "docs/reference/errors.md is stale: regenerate it with `rivet schema errors`"
+        );
+    }
+
+    #[test]
     fn schema_drift_marker_classifies_to_4() {
         let err: anyhow::Error = SchemaDriftError::new("schema changed").into();
         assert_eq!(classify_exit(&err), 4);
