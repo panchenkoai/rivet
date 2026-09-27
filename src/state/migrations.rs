@@ -482,6 +482,25 @@ const MIGRATIONS: &[(i64, &str)] = &[
         DROP TABLE cdc_snapshot_v28;
         ALTER TABLE keyset_range ADD COLUMN key_column TEXT;",
     ),
+    // v30: the cursor is keyed by its DESTINATION as well — two configs sharing a state
+    // DB and an export name read each other's cursor and exported nothing. A legacy row
+    // keeps prefix '' until the first run of that export writes it (claimed).
+    (
+        30,
+        "ALTER TABLE export_state RENAME TO export_state_v29;
+        CREATE TABLE export_state (
+            export_name TEXT NOT NULL,
+            prefix TEXT NOT NULL DEFAULT '',
+            last_cursor_value TEXT,
+            last_run_at TEXT,
+            resume_run_id TEXT,
+            cursor_column TEXT,
+            PRIMARY KEY (export_name, prefix)
+        );
+        INSERT INTO export_state (export_name, prefix, last_cursor_value, last_run_at, resume_run_id, cursor_column)
+            SELECT export_name, '', last_cursor_value, last_run_at, resume_run_id, cursor_column FROM export_state_v29;
+        DROP TABLE export_state_v29;",
+    ),
 ];
 
 /// PostgreSQL-compatible DDL.  Column types differ from SQLite (BIGSERIAL,
@@ -901,6 +920,13 @@ const PG_MIGRATIONS: &[(i64, &str)] = &[
          ALTER TABLE cdc_snapshot ADD PRIMARY KEY (export_name, table_name, prefix);
          ALTER TABLE keyset_range ADD COLUMN IF NOT EXISTS key_column TEXT;",
     ),
+    // v30: see the SQLite ladder.
+    (
+        30,
+        "ALTER TABLE export_state ADD COLUMN IF NOT EXISTS prefix TEXT NOT NULL DEFAULT '';
+         ALTER TABLE export_state DROP CONSTRAINT IF EXISTS export_state_pkey;
+         ALTER TABLE export_state ADD PRIMARY KEY (export_name, prefix);",
+    ),
 ];
 
 // ─── SQLite migration ─────────────────────────────────────────────────────────
@@ -1209,7 +1235,8 @@ mod tests {
         // SQLite cannot ALTER a primary key, so a key change REBUILDS the table
         // (CREATE + copy) where Postgres alters in place: the one sanctioned
         // asymmetry, listed by version and table.
-        const REBUILT_ON_SQLITE_ONLY: &[(i64, &str)] = &[(29, "cdc_snapshot")];
+        const REBUILT_ON_SQLITE_ONLY: &[(i64, &str)] =
+            &[(29, "cdc_snapshot"), (30, "export_state")];
         for &(v, sql) in MIGRATIONS {
             if let Some(pg_tables) = pg.get(&v) {
                 let mut sqlite_tables = table_names(sql);
@@ -1291,6 +1318,48 @@ mod tests {
     /// v29 rebuilds `cdc_snapshot` with the prefix in its key: a row written
     /// before it keeps prefix '' (done for every prefix), and two prefixes for one
     /// `(export, table)` are two rows. `keyset_range` gains `key_column`.
+    #[test]
+    fn v30_keeps_every_cursor_under_the_empty_prefix_and_keys_by_destination() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_schema_version_table(&conn);
+        for &(ver, sql) in MIGRATIONS {
+            if ver <= 29 {
+                conn.execute_batch(&format!(
+                    "BEGIN;\n{sql}\nINSERT INTO schema_version (version) VALUES ({ver});\nCOMMIT;"
+                ))
+                .unwrap();
+            }
+        }
+        conn.execute(
+            "INSERT INTO export_state (export_name, last_cursor_value, resume_run_id, cursor_column) \
+             VALUES ('orders', '2026-01-01', 'r1', 'updated_at')",
+            [],
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        let row: (String, String, String, String) = conn
+            .query_row(
+                "SELECT prefix, last_cursor_value, resume_run_id, cursor_column FROM export_state",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (
+                "".into(),
+                "2026-01-01".into(),
+                "r1".into(),
+                "updated_at".into()
+            )
+        );
+        conn.execute(
+            "INSERT INTO export_state (export_name, prefix, last_cursor_value) VALUES ('orders', 'b/out', 'x')",
+            [],
+        )
+        .expect("the same name under another destination is its own row");
+    }
+
     #[test]
     fn v29_keeps_legacy_snapshot_rows_and_keys_baselines_by_prefix() {
         let conn = Connection::open_in_memory().unwrap();

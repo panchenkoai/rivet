@@ -62,7 +62,11 @@ fn existing_db_missing_required_tables_is_healed_by_migration() {
         .expect("migrations must heal a DB that lacks the required tables");
     store.update_legacy("heal_test", "v1").unwrap();
     assert_eq!(
-        store.get("heal_test").unwrap().last_cursor_value.as_deref(),
+        store
+            .get("heal_test", "")
+            .unwrap()
+            .last_cursor_value
+            .as_deref(),
         Some("v1")
     );
 }
@@ -88,7 +92,7 @@ fn corrupted_cursor_row_is_handled_without_panic() {
     }
 
     let store = StateStore::open_at_path(tmp.path()).unwrap();
-    if let Ok(state) = store.get("orders") {
+    if let Ok(state) = store.get("orders", "") {
         assert!(
             state.last_cursor_value.is_none(),
             "NULL cursor in DB must surface as None, not a bogus value"
@@ -129,7 +133,11 @@ fn fresh_db_opens_and_is_functional_end_to_end() {
         })
         .unwrap();
     assert_eq!(
-        store.get("orders").unwrap().last_cursor_value.as_deref(),
+        store
+            .get("orders", "")
+            .unwrap()
+            .last_cursor_value
+            .as_deref(),
         Some("2024-01-01T00:00:00Z")
     );
     assert_eq!(store.get_files(Some("orders"), 10).unwrap().len(), 1);
@@ -147,7 +155,7 @@ fn reopening_an_existing_db_is_idempotent() {
     {
         let s = StateStore::open_at_path(tmp.path()).unwrap();
         assert_eq!(
-            s.get("orders").unwrap().last_cursor_value.as_deref(),
+            s.get("orders", "").unwrap().last_cursor_value.as_deref(),
             Some("v1"),
             "reopening must preserve data"
         );
@@ -156,7 +164,7 @@ fn reopening_an_existing_db_is_idempotent() {
     {
         let s = StateStore::open_at_path(tmp.path()).unwrap();
         assert_eq!(
-            s.get("orders").unwrap().last_cursor_value.as_deref(),
+            s.get("orders", "").unwrap().last_cursor_value.as_deref(),
             Some("v2")
         );
     }
@@ -193,7 +201,11 @@ fn legacy_preversioned_db_is_migrated_and_preserves_existing_rows() {
 
     let store = StateStore::open_at_path(tmp.path()).unwrap();
     assert_eq!(
-        store.get("legacy").unwrap().last_cursor_value.as_deref(),
+        store
+            .get("legacy", "")
+            .unwrap()
+            .last_cursor_value
+            .as_deref(),
         Some("v-from-old-binary"),
         "legacy cursor rows must survive migration"
     );
@@ -223,7 +235,7 @@ fn db_with_only_schema_version_table_upgrades_cleanly() {
     let store = StateStore::open_at_path(tmp.path()).unwrap();
     store.update_legacy("x", "y").unwrap();
     assert_eq!(
-        store.get("x").unwrap().last_cursor_value.as_deref(),
+        store.get("x", "").unwrap().last_cursor_value.as_deref(),
         Some("y")
     );
 }

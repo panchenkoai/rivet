@@ -264,7 +264,7 @@ pub(crate) fn run_export(
             .strategy
             .cursor_identity()
             .expect("a strategy that needs cursor state has a cursor identity");
-        Some(state.get_owned(&plan.export_name, &identity)?)
+        Some(state.get_owned(&plan.export_name, &plan.source.state_key(), &identity)?)
     } else {
         None
     };
@@ -474,7 +474,7 @@ pub(super) fn run_single_export(
         // overwrites the stored cursor with the new high; the RANGE (low..high)
         // ships to the manifest for warehouse-side continuity.
         let prior_low = st
-            .get(&plan.export_name)
+            .get(&plan.export_name, &plan.source.state_key())
             .ok()
             .and_then(|e| e.last_cursor_value.clone());
         summary.cursor_column = plan

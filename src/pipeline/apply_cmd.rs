@@ -174,7 +174,12 @@ pub fn run_apply_command(
     // with a WARN log, matching the documented contract and the analogous
     // staleness path above.
     if artifact.computed.cursor_snapshot.is_some() {
-        let current = state.get(&artifact.export_name)?.last_cursor_value;
+        let current = state
+            .get(
+                &artifact.export_name,
+                &artifact.resolved_plan.source.state_key(),
+            )?
+            .last_cursor_value;
         if !artifact.cursor_matches(current.as_deref()) {
             if !force {
                 anyhow::bail!(

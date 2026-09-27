@@ -398,6 +398,14 @@ impl SourceConfig {
         }
     }
 
+    /// The state key of what reads from here (cursor, crash anchor): engine, host, port and
+    /// database — no credentials or parameters — so a changed destination keeps its cursor.
+    pub fn state_key(&self) -> String {
+        self.resolve_url()
+            .map(|u| source_state_key(self.source_type, &u))
+            .unwrap_or_default()
+    }
+
     pub fn resolve_url(&self) -> crate::error::Result<String> {
         if self.has_url_fields() && self.has_structured_fields() {
             anyhow::bail!(
@@ -550,8 +558,41 @@ fn find_userinfo(raw: &str) -> Option<(usize, usize)> {
     Some((scheme + at, scheme))
 }
 
+/// `engine://host:port/database` of `url`, credentials, query and fragment dropped.
+pub(crate) fn source_state_key(source_type: SourceType, url: &str) -> String {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let rest = rest.split(['?', '#']).next().unwrap_or(rest);
+    let at_host = rest.rsplit_once('@').map_or(rest, |(_, h)| h);
+    format!("{source_type:?}://{}", at_host.trim_end_matches('/')).to_lowercase()
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_source_state_key_names_the_server_and_database_without_credentials() {
+        use super::{SourceType, source_state_key};
+        let k = source_state_key(
+            SourceType::Postgres,
+            "postgresql://u:secret@Db.host:5432/app?sslmode=require",
+        );
+        assert_eq!(k, "postgres://db.host:5432/app");
+        assert_eq!(
+            k,
+            source_state_key(
+                SourceType::Postgres,
+                "postgres://other:pw@db.host:5432/app/"
+            )
+        );
+        assert_ne!(
+            k,
+            source_state_key(SourceType::Mysql, "mysql://u:secret@db.host:5432/app")
+        );
+        assert_ne!(
+            k,
+            source_state_key(SourceType::Postgres, "postgresql://u@db.host:5432/other")
+        );
+    }
+
     use super::*;
 
     // ── TlsMode::is_enforced ────────────────────────────────────────────────
@@ -587,6 +628,13 @@ mod tests {
             tls: None,
             mongo: None,
         }
+    }
+
+    #[test]
+    fn a_source_state_key_is_derived_from_its_resolved_url() {
+        let mut src = make_source(SourceType::Postgres);
+        src.url = Some("postgresql://u:pw@db.host:5432/app".into());
+        assert_eq!(src.state_key(), "postgres://db.host:5432/app");
     }
 
     #[test]

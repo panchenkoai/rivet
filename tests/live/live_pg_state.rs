@@ -78,15 +78,15 @@ fn pg_cursor_round_trip() {
     let Some(s) = pg_store() else { return };
 
     s.update_legacy("pg_orders", "2024-06-01").unwrap();
-    let got = s.get("pg_orders").unwrap();
+    let got = s.get("pg_orders", "").unwrap();
     assert_eq!(got.last_cursor_value.as_deref(), Some("2024-06-01"));
 
     s.update_legacy("pg_orders", "2024-07-01").unwrap();
-    let got2 = s.get("pg_orders").unwrap();
+    let got2 = s.get("pg_orders", "").unwrap();
     assert_eq!(got2.last_cursor_value.as_deref(), Some("2024-07-01"));
 
     s.reset("pg_orders").unwrap();
-    let empty = s.get("pg_orders").unwrap();
+    let empty = s.get("pg_orders", "").unwrap();
     assert!(empty.last_cursor_value.is_none());
 }
 

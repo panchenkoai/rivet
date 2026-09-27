@@ -84,9 +84,35 @@ impl DestinationType {
     }
 }
 
+impl DestinationConfig {
+    /// The state key of a CDC table's snapshot baseline: its destination.
+    pub fn state_key(&self) -> String {
+        format!(
+            "{}/{}",
+            self.bucket.as_deref().unwrap_or(""),
+            self.path
+                .as_deref()
+                .or(self.prefix.as_deref())
+                .unwrap_or("")
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_destination_state_key_is_its_bucket_and_path_or_prefix() {
+        let mut d = DestinationConfig {
+            bucket: Some("b".into()),
+            prefix: Some("p/".into()),
+            ..Default::default()
+        };
+        assert_eq!(d.state_key(), "b/p/");
+        d.path = Some("out/".into());
+        assert_eq!(d.state_key(), "b/out/");
+    }
 
     #[test]
     fn destination_type_labels_stable() {

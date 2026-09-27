@@ -173,7 +173,7 @@ fn i6_finalize_gate_requires_all_tasks_complete() {
 fn i3_cursor_absent_until_explicitly_updated() {
     let state = StateStore::open_in_memory().unwrap();
 
-    let before = state.get("my_export").unwrap();
+    let before = state.get("my_export", "").unwrap();
     assert!(
         before.last_cursor_value.is_none(),
         "cursor must be absent before any run"
@@ -183,7 +183,7 @@ fn i3_cursor_absent_until_explicitly_updated() {
         .update_legacy("my_export", "2024-06-01T00:00:00Z")
         .unwrap();
 
-    let after = state.get("my_export").unwrap();
+    let after = state.get("my_export", "").unwrap();
     assert_eq!(
         after.last_cursor_value.as_deref(),
         Some("2024-06-01T00:00:00Z"),
@@ -199,7 +199,7 @@ fn i3_cursor_update_is_last_write_wins() {
     state.update_legacy("exp", "2024-01-01T00:00:00Z").unwrap();
     state.update_legacy("exp", "2024-06-15T00:00:00Z").unwrap();
 
-    let val = state.get("exp").unwrap().last_cursor_value.unwrap();
+    let val = state.get("exp", "").unwrap().last_cursor_value.unwrap();
     assert_eq!(
         val, "2024-06-15T00:00:00Z",
         "cursor must hold the last committed value"
@@ -221,7 +221,7 @@ fn i3_state_store_does_not_enforce_cursor_monotonicity() {
     // Deliberately write an older value — the store accepts it without error.
     state.update_legacy("exp", "2024-01-01T00:00:00Z").unwrap();
 
-    let val = state.get("exp").unwrap().last_cursor_value.unwrap();
+    let val = state.get("exp", "").unwrap().last_cursor_value.unwrap();
     assert_eq!(
         val, "2024-01-01T00:00:00Z",
         "StateStore accepts any update; monotonicity is the pipeline's responsibility (ADR-0001 I3)"

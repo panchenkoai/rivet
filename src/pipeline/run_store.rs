@@ -113,8 +113,12 @@ impl<'a> RunStore<'a> {
                     self.plan.export_name
                 )
             })?;
-            self.state
-                .update_with_column(&self.plan.export_name, cursor_val, &column)?;
+            self.state.update_with_column(
+                &self.plan.export_name,
+                &self.plan.source.state_key(),
+                cursor_val,
+                &column,
+            )?;
 
             // Test fault-point: cursor advanced, but the outer-pipeline
             // record_metric has NOT been recorded. QA backlog Task 1.1.
@@ -270,7 +274,7 @@ mod tests {
             .commit()
             .unwrap();
 
-        let cursor = state.get("orders").unwrap();
+        let cursor = state.get("orders", &plan.source.state_key()).unwrap();
         assert_eq!(
             cursor.last_cursor_value.as_deref(),
             Some("2026-05-30T12:00:00Z"),
@@ -294,7 +298,13 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("no cursor identity"), "{err}");
-        assert_eq!(state.get("orders").unwrap().last_cursor_value, None);
+        assert_eq!(
+            state
+                .get("orders", &plan.source.state_key())
+                .unwrap()
+                .last_cursor_value,
+            None
+        );
     }
 
     #[test]
@@ -372,7 +382,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            state.get("orders").unwrap().last_cursor_value.as_deref(),
+            state
+                .get("orders", &plan.source.state_key())
+                .unwrap()
+                .last_cursor_value
+                .as_deref(),
             Some("99")
         );
         let prog = state.get_progression("orders").unwrap();

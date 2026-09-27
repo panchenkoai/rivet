@@ -971,7 +971,7 @@ fn finalize_keyset_anchor(
     failed: bool,
 ) {
     if !failed && matches!(plan.strategy, ExtractionStrategy::Keyset(_)) {
-        let _ = state.clear_resume_run_id(export_name);
+        let _ = state.clear_resume_run_id(export_name, &plan.source.state_key());
         // Parallel keyset persists its per-range recovery rows under the same
         // anchor; clear them too (a no-op for sequential keyset, which writes none).
         let _ = state.clear_keyset_ranges(export_name);
@@ -1561,7 +1561,7 @@ fn record_snapshot_done(
         && let Err(e) = state.mark_snapshot_done(
             export_name,
             table,
-            &super::cdc_job::snapshot_key(&synth.destination),
+            &synth.destination.state_key(),
             &summary.journal.run_id,
         )
     {
@@ -1864,7 +1864,7 @@ mod snapshot_leg_tests {
         let leg =
             crate::pipeline::cdc_job::synth_snapshot_export_for_test(&export, "orders", "orders");
         let state = StateStore::open_in_memory().unwrap();
-        let key = crate::pipeline::cdc_job::snapshot_key(&leg.destination);
+        let key = leg.destination.state_key();
         assert!(
             !state.snapshot_done("cdc", "orders", &key).unwrap(),
             "fixture starts undone"
