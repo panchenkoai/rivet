@@ -520,8 +520,10 @@ jobs:
             say cache miss
             rm -rf .mutants-cache
           fi
-          # Four runners, each a cold build plus a quarter of the mutants.
-          SHARD_N=$(( N < 4 ? N : 4 ))
+          # Up to eight runners, at least ~10 mutants each: every shard pays a build and a
+          # baseline (~6 min), so a small diff on eight runners buys nothing.
+          SHARD_N=$(( (N + 9) / 10 ))
+          SHARD_N=$(( SHARD_N > 8 ? 8 : SHARD_N ))
           say shard_n "$SHARD_N"
           say shards "$(python3 -c "import json,sys; print(json.dumps(list(range(int(sys.argv[1])))))" "$SHARD_N")"
       - name: Hand the plan to the shards
