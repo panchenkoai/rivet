@@ -1826,6 +1826,15 @@ def verify_cdc_harm(led: Ledger) -> None:
                       ["live_cdc_harm"])
 
 
+def verify_session_state(led: Ledger) -> None:
+    """The same exports under a NON-default session (a Tokyo/German-DMY Postgres role, a
+    British SQL Server login) — the stand is UTC/ISO everywhere, so only this grades text
+    renderings re-injected as literals; one row per case."""
+    _run_live_modules(led, "session", "session state",
+                      "exports under a non-default session zone/datestyle/language (live_session_state)",
+                      ["live_session_state"])
+
+
 def verify_partition_footer(led: Ledger) -> None:
     """Every part each batch runner ships — the last one included — carries the
     `rivet.partition_buckets` note, and its count equals DuckDB's own distinct-day count."""

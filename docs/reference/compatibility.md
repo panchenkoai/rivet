@@ -242,6 +242,17 @@ source:
 See [config.md](config.md#tls) for the full TLS block. This works against
 every supported PostgreSQL version (12+).
 
+### PostgreSQL — rivet's sessions run in UTC
+
+Every PostgreSQL connection rivet opens sets `TimeZone = 'UTC'`, `DateStyle = 'ISO, MDY'`,
+`IntervalStyle = 'postgres'` and `bytea_output = 'hex'`, whatever the server, database or role
+defaults are. Stored values are unaffected: a `timestamptz` is an instant, and a `timestamp`
+has no zone. What changes is calendar arithmetic inside your own `query:`. For example,
+`current_date` and `ts::date` on a `timestamptz` column count days in UTC. For the server's
+local day, say so explicitly: `(ts AT TIME ZONE 'Europe/Kyiv')::date`. Behind a
+transaction-mode pooler (pgBouncer, Odyssey), a session `SET` would leak to other clients.
+There rivet sets the zone only inside the export's own transaction.
+
 ## What "passes" means per target
 
 Each target in `dev/pytools/legacy_stand.py` runs 83 assertions against its assigned

@@ -474,6 +474,7 @@ def preflight(led: Ledger, *, bless_gifs: bool = False) -> None:
     scenarios.verify_partition_footer(led)
     scenarios.verify_audit_suspects(led)
     scenarios.verify_cdc_harm(led)
+    scenarios.verify_session_state(led)
     cdc.verify_cdc_e2e(led)
     cdc.verify_cdc_differential(led)
     regression.verify_release_regression(led)
