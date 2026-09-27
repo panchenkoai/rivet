@@ -35,12 +35,15 @@ fn descriptor_cursor_column(descriptor: &str) -> Option<String> {
 }
 
 impl StateStore {
-    pub fn get(&self, export_name: &str) -> Result<CursorState> {
+    /// The cursor of `export_name` writing to `scope` (its destination), or the legacy
+    /// pre-v30 row no scoped run has claimed yet.
+    pub fn get(&self, export_name: &str, scope: &str) -> Result<CursorState> {
         Ok(self
             .query_opt(
                 "SELECT last_cursor_value, last_run_at, cursor_column FROM export_state \
-                 WHERE export_name = ?1",
-                &[export_name.into()],
+                 WHERE export_name = ?1 AND (prefix = ?2 OR prefix = '') \
+                 ORDER BY prefix DESC LIMIT 1",
+                &[export_name.into(), scope.into()],
                 |r| CursorState {
                     export_name: export_name.to_string(),
                     last_cursor_value: r.opt_text(0),
@@ -56,9 +59,23 @@ impl StateStore {
             }))
     }
 
+    /// Move the legacy (unscoped) row to `scope` if this scope has none yet: the first
+    /// scoped writer continues it, and no other config sharing the name can read it after.
+    fn claim_legacy_row(&self, export_name: &str, scope: &str) -> Result<()> {
+        if scope.is_empty() {
+            return Ok(());
+        }
+        self.execute(
+            "UPDATE export_state SET prefix = ?2 WHERE export_name = ?1 AND prefix = '' \
+             AND NOT EXISTS (SELECT 1 FROM export_state WHERE export_name = ?1 AND prefix = ?2)",
+            &[export_name.into(), scope.into()],
+        )?;
+        Ok(())
+    }
+
     /// Read the cursor for a run progressing on `expected`, refusing one written for another column.
-    pub fn get_owned(&self, export_name: &str, expected: &str) -> Result<CursorState> {
-        let state = self.get(export_name)?;
+    pub fn get_owned(&self, export_name: &str, scope: &str, expected: &str) -> Result<CursorState> {
+        let state = self.get(export_name, scope)?;
         let Some(value) = state.last_cursor_value.as_deref() else {
             return Ok(state);
         };
@@ -102,14 +119,16 @@ impl StateStore {
     pub fn update_with_column(
         &self,
         export_name: &str,
+        scope: &str,
         cursor_value: &str,
         cursor_column: &str,
     ) -> Result<()> {
+        self.claim_legacy_row(export_name, scope)?;
         let now = chrono::Utc::now().to_rfc3339();
-        let sql =
-            "INSERT INTO export_state (export_name, last_cursor_value, last_run_at, cursor_column)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(export_name) DO UPDATE SET
+        let sql = "INSERT INTO export_state \
+             (export_name, prefix, last_cursor_value, last_run_at, cursor_column)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(export_name, prefix) DO UPDATE SET
                 last_cursor_value = excluded.last_cursor_value,
                 last_run_at = excluded.last_run_at,
                 cursor_column = excluded.cursor_column";
@@ -117,6 +136,7 @@ impl StateStore {
             sql,
             &[
                 export_name.into(),
+                scope.into(),
                 cursor_value.into(),
                 now.into(),
                 cursor_column.into(),
@@ -132,7 +152,7 @@ impl StateStore {
         let now = chrono::Utc::now().to_rfc3339();
         let sql = "INSERT INTO export_state (export_name, last_cursor_value, last_run_at)
              VALUES (?1, ?2, ?3)
-             ON CONFLICT(export_name) DO UPDATE SET
+             ON CONFLICT(export_name, prefix) DO UPDATE SET
                 last_cursor_value = excluded.last_cursor_value,
                 last_run_at = excluded.last_run_at";
         self.execute(sql, &[export_name.into(), cursor_value.into(), now.into()])?;
@@ -143,30 +163,58 @@ impl StateStore {
     /// in-progress keyset run_id beside the resume cursor, so a crash+resume reuses
     /// it and reconstructs every committed page's manifest part from file_log. Set on
     /// the first checkpointed run, read on resume, cleared when the run finalizes.
-    pub fn set_resume_run_id(&self, export_name: &str, run_id: &str) -> Result<()> {
+    pub fn set_resume_run_id(&self, export_name: &str, scope: &str, run_id: &str) -> Result<()> {
+        self.claim_legacy_row(export_name, scope)?;
         let now = chrono::Utc::now().to_rfc3339();
-        let sql = "INSERT INTO export_state (export_name, resume_run_id, last_run_at)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(export_name) DO UPDATE SET resume_run_id = excluded.resume_run_id";
-        self.execute(sql, &[export_name.into(), run_id.into(), now.into()])?;
+        let sql = "INSERT INTO export_state (export_name, prefix, resume_run_id, last_run_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(export_name, prefix) DO UPDATE SET resume_run_id = excluded.resume_run_id";
+        self.execute(
+            sql,
+            &[export_name.into(), scope.into(), run_id.into(), now.into()],
+        )?;
         Ok(())
     }
 
     /// The persisted in-progress keyset run_id, or None when no run is in progress.
-    pub fn get_resume_run_id(&self, export_name: &str) -> Result<Option<String>> {
-        let sql = "SELECT resume_run_id FROM export_state WHERE export_name = ?1";
+    pub fn get_resume_run_id(&self, export_name: &str, scope: &str) -> Result<Option<String>> {
+        let sql = "SELECT resume_run_id FROM export_state \
+                   WHERE export_name = ?1 AND (prefix = ?2 OR prefix = '') \
+                   ORDER BY prefix DESC LIMIT 1";
         Ok(self
-            .query_opt(sql, &[export_name.into()], |r| r.opt_text(0))?
+            .query_opt(sql, &[export_name.into(), scope.into()], |r| r.opt_text(0))?
             .flatten())
     }
 
     /// Clear the in-progress run_id once a keyset run has finalized its manifest.
-    pub fn clear_resume_run_id(&self, export_name: &str) -> Result<()> {
+    pub fn clear_resume_run_id(&self, export_name: &str, scope: &str) -> Result<()> {
+        self.claim_legacy_row(export_name, scope)?;
+        self.execute(
+            "UPDATE export_state SET resume_run_id = NULL WHERE export_name = ?1 AND prefix = ?2",
+            &[export_name.into(), scope.into()],
+        )?;
+        Ok(())
+    }
+
+    /// Clear every in-progress run_id this export name holds, in any scope (a split re-cut its windows).
+    pub fn clear_resume_run_id_every_scope(&self, export_name: &str) -> Result<()> {
         self.execute(
             "UPDATE export_state SET resume_run_id = NULL WHERE export_name = ?1",
             &[export_name.into()],
         )?;
         Ok(())
+    }
+
+    /// Whether this export name holds an in-progress run_id in any scope.
+    pub fn has_resume_run_id_in_any_scope(&self, export_name: &str) -> Result<bool> {
+        Ok(self
+            .query_opt(
+                "SELECT COUNT(*) FROM export_state WHERE export_name = ?1 AND resume_run_id IS NOT NULL",
+                &[export_name.into()],
+                |r| r.i64(0),
+            )?
+            .unwrap_or(0)
+            > 0)
     }
 
     /// Null ONLY the persisted keyset high-water mark (`last_cursor_value`),
@@ -181,10 +229,11 @@ impl StateStore {
     /// it here ties crash-recovery to THIS run's committed progress only.
     /// Incremental keyset deliberately does NOT clear it — continuing from the
     /// prior high-water mark is the whole point of `keyset_incremental`.
-    pub fn clear_cursor_value(&self, export_name: &str) -> Result<()> {
+    pub fn clear_cursor_value(&self, export_name: &str, scope: &str) -> Result<()> {
+        self.claim_legacy_row(export_name, scope)?;
         self.execute(
-            "UPDATE export_state SET last_cursor_value = NULL WHERE export_name = ?1",
-            &[export_name.into()],
+            "UPDATE export_state SET last_cursor_value = NULL WHERE export_name = ?1 AND prefix = ?2",
+            &[export_name.into(), scope.into()],
         )?;
         Ok(())
     }
@@ -228,9 +277,68 @@ mod tests {
     }
 
     #[test]
+    fn two_configs_with_one_export_name_keep_separate_cursors() {
+        let s = store();
+        s.update_with_column("orders", "pg/out", "2026-09-01", "updated_at")
+            .unwrap();
+        assert_eq!(
+            s.get("orders", "my/out").unwrap().last_cursor_value,
+            None,
+            "another destination starts from nothing"
+        );
+        s.update_with_column("orders", "my/out", "2026-01-01", "updated_at")
+            .unwrap();
+        assert_eq!(
+            s.get("orders", "pg/out")
+                .unwrap()
+                .last_cursor_value
+                .as_deref(),
+            Some("2026-09-01")
+        );
+        assert_eq!(
+            s.get("orders", "my/out")
+                .unwrap()
+                .last_cursor_value
+                .as_deref(),
+            Some("2026-01-01")
+        );
+        s.set_resume_run_id("orders", "pg/out", "r1").unwrap();
+        assert_eq!(s.get_resume_run_id("orders", "my/out").unwrap(), None);
+    }
+
+    #[test]
+    fn a_legacy_cursor_is_continued_by_the_first_scope_that_writes_and_by_no_other() {
+        let s = store();
+        s.update_legacy("orders", "100").unwrap();
+        assert_eq!(
+            s.get("orders", "a/out")
+                .unwrap()
+                .last_cursor_value
+                .as_deref(),
+            Some("100"),
+            "read before any claim"
+        );
+        s.update_with_column("orders", "a/out", "200", "id")
+            .unwrap();
+        assert_eq!(
+            s.get("orders", "a/out")
+                .unwrap()
+                .last_cursor_value
+                .as_deref(),
+            Some("200")
+        );
+        assert_eq!(
+            s.get("orders", "b/out").unwrap().last_cursor_value,
+            None,
+            "claimed: no other scope inherits it"
+        );
+        assert_eq!(s.list_all().unwrap().len(), 1, "moved, not copied");
+    }
+
+    #[test]
     fn get_unknown_returns_empty_state() {
         let s = store();
-        let state = s.get("nonexistent").unwrap();
+        let state = s.get("nonexistent", "").unwrap();
         assert!(state.last_cursor_value.is_none());
     }
 
@@ -239,7 +347,7 @@ mod tests {
         let s = store();
         s.update_legacy("orders", "2024-06-01").unwrap();
         assert_eq!(
-            s.get("orders").unwrap().last_cursor_value.as_deref(),
+            s.get("orders", "").unwrap().last_cursor_value.as_deref(),
             Some("2024-06-01")
         );
     }
@@ -250,7 +358,7 @@ mod tests {
         s.update_legacy("orders", "100").unwrap();
         s.update_legacy("orders", "200").unwrap();
         assert_eq!(
-            s.get("orders").unwrap().last_cursor_value.as_deref(),
+            s.get("orders", "").unwrap().last_cursor_value.as_deref(),
             Some("200")
         );
     }
@@ -260,7 +368,7 @@ mod tests {
         let s = store();
         s.update_legacy("orders", "100").unwrap();
         s.reset("orders").unwrap();
-        assert!(s.get("orders").unwrap().last_cursor_value.is_none());
+        assert!(s.get("orders", "").unwrap().last_cursor_value.is_none());
     }
 
     #[test]
@@ -271,14 +379,14 @@ mod tests {
         // resume_run_id it is about to set (crash-recovery needs that).
         let s = store();
         s.update_legacy("orders", "9000000").unwrap();
-        s.set_resume_run_id("orders", "run_2").unwrap();
-        s.clear_cursor_value("orders").unwrap();
+        s.set_resume_run_id("orders", "", "run_2").unwrap();
+        s.clear_cursor_value("orders", "").unwrap();
         assert!(
-            s.get("orders").unwrap().last_cursor_value.is_none(),
+            s.get("orders", "").unwrap().last_cursor_value.is_none(),
             "cursor must be nulled"
         );
         assert_eq!(
-            s.get_resume_run_id("orders").unwrap().as_deref(),
+            s.get_resume_run_id("orders", "").unwrap().as_deref(),
             Some("run_2"),
             "resume_run_id must survive"
         );
@@ -316,7 +424,7 @@ mod tests {
         s.update_legacy("orders", "2024-06-01T00:00:00Z").unwrap();
         s.update_legacy("orders", "2024-06-01T00:00:00Z").unwrap();
         assert_eq!(
-            s.get("orders").unwrap().last_cursor_value.as_deref(),
+            s.get("orders", "").unwrap().last_cursor_value.as_deref(),
             Some("2024-06-01T00:00:00Z")
         );
     }
@@ -330,7 +438,7 @@ mod tests {
         let ts = "2024-06-01T12:34:56.123456789+02:00";
         s.update_legacy("events", ts).unwrap();
         assert_eq!(
-            s.get("events").unwrap().last_cursor_value.as_deref(),
+            s.get("events", "").unwrap().last_cursor_value.as_deref(),
             Some(ts)
         );
     }
@@ -350,7 +458,7 @@ mod tests {
         for v in values {
             s.update_legacy("t", v).unwrap();
             assert_eq!(
-                s.get("t").unwrap().last_cursor_value.as_deref(),
+                s.get("t", "").unwrap().last_cursor_value.as_deref(),
                 Some(v),
                 "cursor value {v:?} must round-trip exactly"
             );
@@ -364,7 +472,7 @@ mod tests {
         let s = store();
         s.update_legacy("orders", "2024-06-01").unwrap();
         s.reset("orders").unwrap();
-        let after = s.get("orders").unwrap();
+        let after = s.get("orders", "").unwrap();
         assert!(after.last_cursor_value.is_none());
         assert!(
             after.last_run_at.is_none(),
@@ -427,8 +535,8 @@ mod tests {
     #[test]
     fn get_owned_accepts_the_identity_that_wrote_the_cursor() {
         let s = store();
-        s.update_with_column("orders", "100", "id").unwrap();
-        let c = s.get_owned("orders", "id").unwrap();
+        s.update_with_column("orders", "", "100", "id").unwrap();
+        let c = s.get_owned("orders", "", "id").unwrap();
         assert_eq!(c.last_cursor_value.as_deref(), Some("100"));
         assert_eq!(c.cursor_column.as_deref(), Some("id"));
     }
@@ -436,11 +544,12 @@ mod tests {
     #[test]
     fn get_owned_refuses_a_cursor_written_for_another_column() {
         let s = store();
-        s.update_with_column("orders", "3711169", "idvisit")
+        s.update_with_column("orders", "", "3711169", "idvisit")
             .unwrap();
         let msg = format!(
             "{:#}",
-            s.get_owned("orders", "visit_last_action_time").unwrap_err()
+            s.get_owned("orders", "", "visit_last_action_time")
+                .unwrap_err()
         );
         assert!(
             msg.contains("idvisit")
@@ -453,10 +562,10 @@ mod tests {
     #[test]
     fn update_keeps_the_recorded_column() {
         let s = store();
-        s.update_with_column("orders", "1", "id").unwrap();
+        s.update_with_column("orders", "", "1", "id").unwrap();
         s.update_legacy("orders", "2").unwrap();
         assert_eq!(
-            s.get("orders").unwrap().cursor_column.as_deref(),
+            s.get("orders", "").unwrap().cursor_column.as_deref(),
             Some("id")
         );
     }
@@ -464,8 +573,8 @@ mod tests {
     #[test]
     fn get_owned_without_a_cursor_value_never_refuses() {
         let s = store();
-        s.set_resume_run_id("orders", "r1").unwrap();
-        assert!(s.get_owned("orders", "anything").is_ok());
+        s.set_resume_run_id("orders", "", "r1").unwrap();
+        assert!(s.get_owned("orders", "", "anything").is_ok());
     }
 
     #[test]
@@ -473,8 +582,8 @@ mod tests {
         let s = store();
         s.update_legacy("orders", "3711169").unwrap();
         metric(&s, "keyset", Some("idvisit"), "3711169");
-        assert!(s.get_owned("orders", "idvisit").is_ok());
-        assert!(s.get_owned("orders", "visit_last_action_time").is_err());
+        assert!(s.get_owned("orders", "", "idvisit").is_ok());
+        assert!(s.get_owned("orders", "", "visit_last_action_time").is_err());
     }
 
     /// A 0.25.0 incremental run left no `cursor_column`, but its `export_metrics` row
@@ -494,9 +603,9 @@ mod tests {
             "3711169",
             Some(r#"{"strategy":"incremental","key":"idvisit","db_type":"int(10) unsigned"}"#),
         );
-        assert!(s.get_owned("orders", "idvisit").is_ok());
+        assert!(s.get_owned("orders", "", "idvisit").is_ok());
         let err = s
-            .get_owned("orders", "visit_last_action_time")
+            .get_owned("orders", "", "visit_last_action_time")
             .unwrap_err()
             .to_string();
         assert!(err.contains("written for `idvisit`"), "{err}");
@@ -504,11 +613,11 @@ mod tests {
         // The descriptor names the primary column; a coalesce identity led by it is the
         // same cursor continuing, not a switch.
         assert!(
-            s.get_owned("orders", "coalesce(idvisit,updated_at)")
+            s.get_owned("orders", "", "coalesce(idvisit,updated_at)")
                 .is_ok()
         );
         assert!(
-            s.get_owned("orders", "coalesce(updated_at,idvisit)")
+            s.get_owned("orders", "", "coalesce(updated_at,idvisit)")
                 .is_err()
         );
         // Another value than the one the run wrote: not that run's cursor.
@@ -521,7 +630,7 @@ mod tests {
             "499",
             Some(r#"{"strategy":"incremental","key":"id"}"#),
         );
-        assert!(t.get_owned("orders", "other").is_ok());
+        assert!(t.get_owned("orders", "", "other").is_ok());
     }
 
     #[test]
@@ -547,11 +656,11 @@ mod tests {
         let s = store();
         s.update_legacy("orders", "2026-09-11 10:00:00").unwrap();
         metric(&s, "keyset", Some("idvisit"), "3711169");
-        assert!(s.get_owned("orders", "updated_at").is_ok());
+        assert!(s.get_owned("orders", "", "updated_at").is_ok());
 
         let t = store();
         t.update_legacy("orders", "500").unwrap();
         metric(&t, "incremental", None, "500");
-        assert!(t.get_owned("orders", "anything").is_ok());
+        assert!(t.get_owned("orders", "", "anything").is_ok());
     }
 }

@@ -336,7 +336,7 @@ pub(crate) fn claim_checkpoint_run<'s>(
     let Some(lease) = state.try_load_lease(&format!("chunk-run:{export}"))? else {
         let rid = match state.find_in_progress_chunk_run(export)? {
             Some((rid, _)) => Some(rid),
-            None => state.get_resume_run_id(export)?,
+            None => state.get_resume_run_id(export, &plan.destination.state_key())?,
         };
         anyhow::bail!(live_chunk_run_refusal(export, rid.as_deref()));
     };
