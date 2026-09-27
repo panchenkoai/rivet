@@ -684,7 +684,7 @@ pub(crate) fn realize(
             let fresh = probe_and_synthesize(config, &base, config_dir, n)?;
             // Fresh windows: a unit's in-progress keyset checkpoint belongs to the OLD window.
             for unit in fresh.iter().flatten() {
-                state.clear_resume_run_id(&unit.name)?;
+                state.clear_resume_run_id_every_scope(&unit.name)?;
             }
             fresh
         }

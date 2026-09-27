@@ -408,6 +408,7 @@ fn run_keyset_parallel(
     use std::sync::Mutex;
 
     let kp = keyset_plan(plan);
+    let scope = plan.destination.state_key();
     let key = kp.key_column.clone();
     let page_size = kp.chunk_size;
     let checkpoint = kp.checkpoint;
@@ -419,12 +420,12 @@ fn run_keyset_parallel(
     // gap. A fresh run samples the ranges, persists them, and sets the anchor.
     let resume_run_id: Option<String> = if checkpoint {
         state
-            .and_then(|s| s.get_resume_run_id(&plan.export_name).ok())
+            .and_then(|s| s.get_resume_run_id(&plan.export_name, &scope).ok())
             .flatten()
     } else {
         None
     };
-    let resume_run_id = resume_anchor(state, &plan.export_name, resume_run_id, true, &key)?;
+    let resume_run_id = resume_anchor(state, &plan.export_name, &scope, resume_run_id, true, &key)?;
 
     // Incremental (iteration 3): a FRESH run seeks past the persisted anchor
     // (`floor`) up to the source max AT OPEN (`ceil`) — bounding the last range at
@@ -435,7 +436,10 @@ fn run_keyset_parallel(
     let (floor, ceil): (Option<String>, Option<String>) = if incremental && resume_run_id.is_none()
     {
         let anchor = match state {
-            Some(s) => s.get_owned(&plan.export_name, &key)?.last_cursor_value,
+            Some(s) => {
+                s.get_owned(&plan.export_name, &scope, &key)?
+                    .last_cursor_value
+            }
             None => None,
         };
         let st = plan.source.source_type;
@@ -490,7 +494,7 @@ fn run_keyset_parallel(
                 &key,
                 &lo_hi_pairs(&fresh),
             )?;
-            st.set_resume_run_id(&plan.export_name, &summary.run_id)?;
+            st.set_resume_run_id(&plan.export_name, &scope, &summary.run_id)?;
             fresh
         }
         _ => sample_parallel_ranges(src, plan, &key, parallel, floor_r, ceil_r)?,
@@ -838,6 +842,7 @@ fn anchor_is_own(parallel_runner: bool, anchor_has_ranges: bool) -> bool {
 fn resume_anchor(
     state: Option<&StateStore>,
     export_name: &str,
+    scope: &str,
     rid: Option<String>,
     parallel_runner: bool,
     key: &str,
@@ -860,7 +865,7 @@ fn resume_anchor(
         "export '{export_name}': interrupted run {rid} {why} — starting a fresh pass; its parts \
          stay unmanifested and are not read"
     );
-    st.clear_resume_run_id(export_name)?;
+    st.clear_resume_run_id(export_name, scope)?;
     Ok(None)
 }
 
@@ -898,6 +903,7 @@ pub(crate) fn run_keyset(
     state: Option<&StateStore>,
 ) -> Result<()> {
     let kp = keyset_plan(plan);
+    let scope = plan.destination.state_key();
     // The key drives both the WHERE/ORDER BY (built in the driver) and the
     // sink's per-page max-key extraction (via `cursor_extract_column`).
     let key_plan = IncrementalCursorPlan {
@@ -942,7 +948,8 @@ pub(crate) fn run_keyset(
             Some(st) => resume_anchor(
                 Some(st),
                 &plan.export_name,
-                st.get_resume_run_id(&plan.export_name)?,
+                &scope,
+                st.get_resume_run_id(&plan.export_name, &scope)?,
                 false,
                 &kp.key_column,
             )?,
@@ -960,7 +967,7 @@ pub(crate) fn run_keyset(
         if seeks_from_persisted_cursor(kp.checkpoint, recovering_crash, kp.incremental) {
             match state {
                 Some(s) => {
-                    s.get_owned(&plan.export_name, &kp.key_column)?
+                    s.get_owned(&plan.export_name, &scope, &kp.key_column)?
                         .last_cursor_value
                 }
                 None => None,
@@ -1019,9 +1026,9 @@ pub(crate) fn run_keyset(
                 // the cursor to this run makes a pre-first-commit crash re-read from
                 // the start. Incremental deliberately keeps it (that IS the point).
                 if !kp.incremental {
-                    st.clear_cursor_value(&plan.export_name)?;
+                    st.clear_cursor_value(&plan.export_name, &scope)?;
                 }
-                st.set_resume_run_id(&plan.export_name, &summary.run_id)?;
+                st.set_resume_run_id(&plan.export_name, &scope, &summary.run_id)?;
             }
         }
     }
@@ -1138,7 +1145,12 @@ pub(crate) fn run_keyset(
         if kp.checkpoint
             && let (Some(st), Some(v)) = (state, page.next_cursor.as_ref())
         {
-            st.update_with_column(&plan.export_name, v, &kp.key_column)?;
+            st.update_with_column(
+                &plan.export_name,
+                &plan.destination.state_key(),
+                v,
+                &kp.key_column,
+            )?;
         }
         // Fault point: page durably committed (parts + file_log + cursor advanced),
         // NO destination manifest yet — a crash here must be resume-recoverable
@@ -1214,7 +1226,7 @@ pub(crate) fn run_keyset(
     if releases_anchor_at_data_complete(kp.checkpoint, kp.incremental)
         && let Some(st) = state
     {
-        st.clear_resume_run_id(&plan.export_name)?;
+        st.clear_resume_run_id(&plan.export_name, &plan.destination.state_key())?;
     }
 
     // Fault point: data is fully committed (and, for a non-incremental run, the
@@ -1245,54 +1257,54 @@ mod tests {
         let st = StateStore::open_in_memory().unwrap();
         let ranges = [(None, Some("5".to_string())), (Some("5".to_string()), None)];
         let anchored = |rid: &str, ranged_on: Option<&str>| {
-            st.set_resume_run_id("e", rid).unwrap();
+            st.set_resume_run_id("e", "p", rid).unwrap();
             if let Some(key) = ranged_on {
                 st.persist_keyset_ranges("e", rid, key, &ranges).unwrap();
             }
         };
         anchored("par", Some("id"));
         assert_eq!(
-            resume_anchor(Some(&st), "e", Some("par".into()), true, "id").unwrap(),
+            resume_anchor(Some(&st), "e", "p", Some("par".into()), true, "id").unwrap(),
             Some("par".into())
         );
         assert_eq!(
-            st.get_resume_run_id("e").unwrap(),
+            st.get_resume_run_id("e", "p").unwrap(),
             Some("par".into()),
             "kept"
         );
         assert_eq!(
-            resume_anchor(Some(&st), "e", Some("par".into()), false, "id").unwrap(),
+            resume_anchor(Some(&st), "e", "p", Some("par".into()), false, "id").unwrap(),
             None
         );
         assert_eq!(
-            st.get_resume_run_id("e").unwrap(),
+            st.get_resume_run_id("e", "p").unwrap(),
             None,
             "a sequential run clears a parallel anchor"
         );
 
         anchored("seq", None);
         assert_eq!(
-            resume_anchor(Some(&st), "e", Some("seq".into()), false, "id").unwrap(),
+            resume_anchor(Some(&st), "e", "p", Some("seq".into()), false, "id").unwrap(),
             Some("seq".into())
         );
         assert_eq!(
-            resume_anchor(Some(&st), "e", Some("seq".into()), true, "id").unwrap(),
+            resume_anchor(Some(&st), "e", "p", Some("seq".into()), true, "id").unwrap(),
             None
         );
         assert_eq!(
-            st.get_resume_run_id("e").unwrap(),
+            st.get_resume_run_id("e", "p").unwrap(),
             None,
             "a parallel run clears a sequential anchor"
         );
 
         anchored("other", Some("ts"));
         assert_eq!(
-            resume_anchor(Some(&st), "e", Some("other".into()), true, "id").unwrap(),
+            resume_anchor(Some(&st), "e", "p", Some("other".into()), true, "id").unwrap(),
             None,
             "ranges on another key do not make a parallel anchor on this one"
         );
         assert_eq!(
-            resume_anchor(None, "e", Some("x".into()), true, "id").unwrap(),
+            resume_anchor(None, "e", "p", Some("x".into()), true, "id").unwrap(),
             Some("x".into())
         );
     }

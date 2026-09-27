@@ -92,7 +92,7 @@ fn f1_pre_write_failure_leaves_cursor_at_prior_value() {
 
     // Export fails — state.update() is never called again.
 
-    let cursor = state.get("orders").unwrap();
+    let cursor = state.get("orders", "").unwrap();
     assert_eq!(
         cursor.last_cursor_value.as_deref(),
         Some("2024-01-31T00:00:00Z"),
@@ -126,7 +126,7 @@ fn f2_crash_window_manifest_written_cursor_absent() {
     );
     assert_eq!(files[0].file_name, "orders_20240601.parquet");
 
-    let cursor = state.get("orders").unwrap();
+    let cursor = state.get("orders", "").unwrap();
     assert!(
         cursor.last_cursor_value.is_none(),
         "cursor must be absent — crash prevented the advance after record_file"
@@ -146,7 +146,7 @@ fn f2_crash_window_is_detectable_via_state_inspection() {
     // state.update() not called — crash window
 
     let files = state.get_files(Some("events"), 10).unwrap();
-    let cursor = state.get("events").unwrap();
+    let cursor = state.get("events", "").unwrap();
 
     let manifest_has_file = !files.is_empty();
     let cursor_absent = cursor.last_cursor_value.is_none();
@@ -158,7 +158,7 @@ fn f2_crash_window_is_detectable_via_state_inspection() {
 
     // A recovery procedure can reset cursor state to force a clean re-run.
     state.reset("events").unwrap();
-    let after = state.get("events").unwrap();
+    let after = state.get("events", "").unwrap();
     assert!(
         after.last_cursor_value.is_none(),
         "reset is idempotent when cursor is already absent"
@@ -194,7 +194,7 @@ fn f3_write_cycle_complete_without_metric_is_recoverable() {
         "file must be recorded in the manifest despite the missing metric"
     );
 
-    let cursor = state.get("users").unwrap();
+    let cursor = state.get("users", "").unwrap();
     assert_eq!(
         cursor.last_cursor_value.as_deref(),
         Some("2024-06-01T00:00:00Z"),

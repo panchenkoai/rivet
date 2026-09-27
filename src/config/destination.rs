@@ -84,6 +84,21 @@ impl DestinationType {
     }
 }
 
+impl DestinationConfig {
+    /// The state key of what writes here (cursor, crash anchor, baseline): two configs
+    /// sharing a state DB and an export name keep separate state when they write apart.
+    pub fn state_key(&self) -> String {
+        format!(
+            "{}/{}",
+            self.bucket.as_deref().unwrap_or(""),
+            self.path
+                .as_deref()
+                .or(self.prefix.as_deref())
+                .unwrap_or("")
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

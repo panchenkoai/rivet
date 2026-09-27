@@ -623,3 +623,46 @@ fn same_named_configs_share_a_postgres_state_batch_cycle() {
     let legs = fleet(&bq, batch_shape);
     batch_cycle(legs, &state);
 }
+
+/// Two INCREMENTAL configs with one export name on one Postgres state, each writing to its
+/// own prefix: each keeps its own cursor. Before v30 the cursor was keyed by name alone, so
+/// the MySQL config continued from the PostgreSQL config's cursor and exported 0 of 100.
+#[test]
+#[ignore = "live: requires postgres + mysql + a Postgres state URL"]
+fn same_named_incremental_configs_on_a_postgres_state_keep_their_own_cursor() {
+    use mysql::prelude::Queryable as _;
+    let Some(state) = state_url() else {
+        return;
+    };
+    let name = unique_name("sn_inc");
+    let mut pg = pg_connect();
+    pg.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {name}; CREATE TABLE {name} (id BIGINT PRIMARY KEY, updated_at TIMESTAMPTZ NOT NULL);
+         INSERT INTO {name} SELECT g, TIMESTAMPTZ '2026-09-01' + g * INTERVAL '1 second' FROM generate_series(1, 100) g;"
+    ))
+    .unwrap();
+    let _pg_t = PgTable::adopt(name.clone());
+    let mut my = mysql_connect();
+    my.query_drop(format!(
+        "DROP TABLE IF EXISTS {name}; CREATE TABLE {name} (id BIGINT PRIMARY KEY, updated_at DATETIME(6) NOT NULL)"
+    ))
+    .unwrap();
+    my.query_drop(format!(
+        "INSERT INTO {name} WITH RECURSIVE g(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM g WHERE n < 100) \
+         SELECT n, TIMESTAMP('2026-01-01') + INTERVAL n SECOND FROM g"
+    ))
+    .unwrap();
+    let env = [("RIVET_STATE_URL", state.as_str())];
+    let rig = |r: Rig| {
+        r.mode("incremental")
+            .export_line("cursor_column: updated_at")
+    };
+    let pg_rig = rig(Rig::pg_batch(&name));
+    let my_rig = rig(Rig::mysql_batch(&name));
+    let rows = |r: &Rig| dir_manifest_copy_id_set(&r.out_dir()).len();
+    assert!(pg_rig.run_with_envs(&env).status.success());
+    assert!(my_rig.run_with_envs(&env).status.success());
+    let got = (rows(&pg_rig), rows(&my_rig));
+    let _ = my.query_drop(format!("DROP TABLE IF EXISTS {name}"));
+    assert_eq!(got, (100, 100), "each config exports its own 100 rows");
+}

@@ -659,11 +659,7 @@ fn snapshot_plan(done_flags: &[bool], ckpt_resume: bool) -> (Vec<usize>, bool) {
 /// The state key of a table's baseline: its snapshot destination, so two configs
 /// sharing a state DB and an export name keep separate baselines.
 pub(crate) fn snapshot_key(d: &crate::config::DestinationConfig) -> String {
-    format!(
-        "{}/{}",
-        d.bucket.as_deref().unwrap_or(""),
-        d.path.as_deref().or(d.prefix.as_deref()).unwrap_or("")
-    )
+    d.state_key()
 }
 
 pub(crate) fn dest_for_table(

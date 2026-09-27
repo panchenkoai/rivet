@@ -47,7 +47,7 @@ impl StateStore {
         if self.find_in_progress_chunk_run(export_name)?.is_some() {
             return Ok(true);
         }
-        Ok(self.get_resume_run_id(export_name)?.is_some())
+        self.has_resume_run_id_in_any_scope(export_name)
     }
 
     /// Latest `in_progress` chunk run for this export, if any.
