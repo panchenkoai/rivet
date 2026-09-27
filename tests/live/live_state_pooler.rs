@@ -43,17 +43,20 @@ fn two_runs_of_one_export_through_a_transaction_pooler_never_both_proceed() {
     };
     let (a, b) = (run(0), run(300));
     let (a, b) = (a.join().unwrap(), b.join().unwrap());
+    let said = |o: &std::process::Output| String::from_utf8_lossy(&o.stderr).to_string();
+    let refused = |o: &std::process::Output| {
+        !o.status.success() && said(o).contains("still in progress in another live rivet process")
+    };
+    // Exactly one proceeds and the other is refused BY THE LEASE — a run failing for any
+    // other reason (a state DB it cannot open, a missing table) must not count as the lease
+    // holding.
     assert!(
-        !(a.status.success() && b.status.success()),
-        "both concurrent runs proceeded through the pooler — the run lease did not hold:\nA: {}\nB: {}",
-        String::from_utf8_lossy(&a.stderr)
-            .lines()
-            .last()
-            .unwrap_or(""),
-        String::from_utf8_lossy(&b.stderr)
-            .lines()
-            .last()
-            .unwrap_or("")
+        (a.status.success() && refused(&b)) || (b.status.success() && refused(&a)),
+        "one run must proceed and the other be refused by the run lease:\nA ({}): {}\nB ({}): {}",
+        a.status,
+        said(&a).lines().last().unwrap_or(""),
+        b.status,
+        said(&b).lines().last().unwrap_or("")
     );
 }
 
