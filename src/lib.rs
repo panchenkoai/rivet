@@ -89,7 +89,11 @@ pub mod google_auth {
     pub use crate::destination::gcs_auth::{AdcUserTokenLoader, try_authorized_user_loader};
 }
 
+// Its clap help text indents shell examples, which rustdoc would compile as doctests.
+#[cfg(not(doctest))]
+pub mod cli;
 pub mod enrich;
+pub(crate) mod init;
 pub(crate) mod notify;
 pub(crate) mod plan;
 // Credential redaction invariant (ADR-0014, v0.7.2 P0.3).  `pub` so the
