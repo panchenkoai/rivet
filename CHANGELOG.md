@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **A Postgres state behind pgBouncer (transaction mode) keeps one run of an export at a
+  time (state v31).** The run lease of a checkpointed export and the per-table lease of
+  `rivet load` were session advisory locks. Behind a transaction-mode pooler two rivets
+  could be handed the same server connection and both take the lock: two runs of one
+  export ran together (measured: both exit 0). The lease is now a `state_lease` row taken in
+  one statement, renewed by a heartbeat and expired by the state server's clock. A holder
+  that died on the same host is taken over at once; one that died on another host blocks
+  the next run until its lease expires (`RIVET_STATE_LEASE_TTL_S`, default 30 s). A SQLite
+  state is unchanged. The previous release cannot open a v31 state DB.
 - **Two configs sharing a Postgres state DB no longer read each other's incremental cursor
   (state v30).** The cursor and the keyset crash anchor were keyed by the export name alone.
   Two configs with the same export name on one state DB — one template rolled out per
