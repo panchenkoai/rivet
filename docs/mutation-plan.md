@@ -36,7 +36,7 @@ Narrow live filters for Tier 3 (mutate X → run only its guards):
 
    Since 2026-08-21 the in-diff mutants are **prioritised before they are
    budgeted** (`.github/scripts/mutants_classify.py`, wired into the
-   `mutants-in-diff` job). `cargo llvm-cov --lib --bins` measures which
+   `mutants-plan` job). `cargo llvm-cov --lib --bins` measures which
    functions the offline suite actually EXECUTES, and each mutant lands in one
    of two classes:
 
@@ -54,7 +54,14 @@ Narrow live filters for Tier 3 (mutate X → run only its guards):
    report, an unmentioned file, an unparseable name) stays in the graded class,
    and whenever the budget stretches to it the reported class is RUN as an
    audit: if the offline suite catches one of them, the classification was
-   wrong and `Mutants (coverage verdict)` fails.
+   wrong and `Mutants (coverage verdict)` fails. A file some source reads as
+   text (`include_str!`) always stays graded: a test that greps it kills a
+   stub without executing it, which coverage cannot see.
+
+   The graded set runs in up to four `Mutants (shard N)` jobs (`--shard k/N`,
+   dependencies reused through `--copy-target`); `Mutants (changed lines)`
+   grades their outcomes as one run, and the P2 audit rides in that same run
+   rather than paying a second build.
 2. **Nightly (devbox self-hosted runner).** Full `--lib` runs over Tier 0-2 in
    rotation (~500-1000 mutants/night). Result diffed against the committed
    baseline (`docs/mutants-baseline.txt`): any missed mutant NOT in the

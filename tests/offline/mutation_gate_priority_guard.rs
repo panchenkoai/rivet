@@ -272,7 +272,11 @@ fn only_a_function_measured_at_zero_leaves_the_graded_class() {
 /// step from `gate-scripts`.
 #[test]
 fn the_mutation_gate_actually_invokes_the_prioritiser() {
-    let mutate = job_shell("mutants-in-diff", 40);
+    let mutate = format!(
+        "{}\n{}",
+        job_shell("mutants-plan", 40),
+        job_shell("mutants-in-diff", 40)
+    );
     for (needle, why) in [
         (
             "mutants_classify.py reach",
@@ -292,6 +296,11 @@ fn the_mutation_gate_actually_invokes_the_prioritiser() {
             "--extents fn-extents.tsv",
             "the classification's only MEASURED input; without it the partition \
              is the no-coverage fallback and nothing is ever prioritised",
+        ),
+        (
+            "--src src",
+            "the rule that a file a test reads as TEXT (`include_str!`) stays graded; without \
+             it a stub those tests kill unexecuted reads as `oracle-lied` (PR #314, run.rs)",
         ),
         (
             "verify p1.txt p1-check.txt",
@@ -369,7 +378,8 @@ fn every_state_the_prioritiser_can_publish_is_handled_by_the_workflow() {
 
     // Both jobs: the run job SETS these, the verdict job READS them.
     let shell = format!(
-        "{}\n{}",
+        "{}\n{}\n{}",
+        job_shell("mutants-plan", 40),
         job_shell("mutants-in-diff", 40),
         job_shell("mutants-verdict", 20)
     );

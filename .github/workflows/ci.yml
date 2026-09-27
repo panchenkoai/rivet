@@ -222,89 +222,34 @@ jobs:
   # "nothing offline runs this at all" is a triage question for
   # .cargo/mutants.toml. See the reach step below for the measurement and the
   # partition comment for what the split may and may not excuse.
-  mutants-in-diff:
-    name: Mutants (changed lines)
+  mutants-plan:
+    name: Mutants (plan)
     runs-on: ubuntu-latest
     if: contains(fromJSON('["pull_request", "merge_group"]'), github.event_name)
-    # First live run: 52 mutants took 42m on the 2-core runner (cold baseline
-    # build 270s + ~80s/mutant) — 45m was one flaky rebuild away from a
-    # spurious timeout on a large PR. Raised 90 -> 120 when the offline-REACH
-    # measurement was added below: it takes an instrumented build plus one
-    # `--lib --bins` run (capped at 25m of its own), and the grading capacity
-    # $MUTANTS_DIFF_BUDGET describes has to survive that. It usually PAYS for
-    # itself — every live-only mutant it deprioritises is ~90s not spent — but
-    # a diff that is fully offline-reachable pays the measurement for nothing,
-    # so the ceiling absorbs it rather than the budget.
-    # The ceiling must COVER the budget: 120 mutants x ~80s = 160 min, plus the
-    # cold build and the reach measurement (~30 min). At 120 min a diff of ~110
-    # in-budget mutants was cancelled half-graded (PR #314, 2026-09-27) and the
-    # blocking verdict read "no verdict" — a budget the timeout cannot pay for.
-    timeout-minutes: 190
-    # Advisory, not blocking: a foundational-module PR (e.g. the ~3k-line
-    # `src/load` layer = ~400 in-diff mutants) can't finish inside the per-diff
-    # budget — killing mutants doesn't help, the run is just too large. The
-    # signal is still emitted for review; mutation coverage for such modules is
-    # ratcheted in the nightly baseline (docs/mutants-baseline.txt), not gated
-    # per-diff. Keep it a gate for normal-sized diffs.
-    #
-    # `continue-on-error` makes this job's CONCLUSION success whatever happens
-    # in it, so neither a required-check setting nor a `needs:` can observe what
-    # it did. What it did is therefore PUBLISHED as job outputs and asserted by
-    # the blocking `Mutants (coverage verdict)` job below — the coverage-ledger
-    # process rule: the claim "these files are graded" has to be read off
-    # the call site, not asserted about it.
+    # The reach measurement is capped at 25m of its own; the rest is listing.
+    timeout-minutes: 45
+    # Like the run it plans, this job cannot fail a PR: what it decided is
+    # published and `Mutants (changed lines)` re-publishes it for the verdict.
     continue-on-error: true
     outputs:
-      # `a || b` in a GitHub expression yields b when a is empty, so a step that
-      # never ran falls through to the always()-run reporter below.
-      state: ${{ steps.mutate.outputs.state || steps.report.outputs.state }}
-      result: ${{ steps.mutate.outputs.result || steps.report.outputs.result }}
-      untiered: ${{ steps.mutate.outputs.untiered }}
-      sub: ${{ steps.mutate.outputs.sub }}
-      count: ${{ steps.mutate.outputs.count }}
-      outcome: ${{ steps.report.outputs.outcome }}
-      # The PRIORITISATION's evidence, published for the same reason as the
-      # rest: this job cannot fail, so what it decided has to be readable from
-      # outside. `reach` is whether the offline-coverage measurement produced a
-      # usable answer (measured / unmeasured / unverified); `p1` is how many
-      # in-diff mutants sit in code the offline suite EXECUTES (graded, and
-      # blocking); `p2` how many sit in functions measured at zero executions
-      # (reported); `p2_audit` what happened when the report-only class was
-      # itself graded — `oracle-lied` means the offline suite CAUGHT one of
-      # them, i.e. the classification was wrong and the report-only class is
-      # not safe.
-      reach: ${{ steps.mutate.outputs.reach }}
-      p1: ${{ steps.mutate.outputs.p1 }}
-      p2: ${{ steps.mutate.outputs.p2 }}
-      p2_audit: ${{ steps.mutate.outputs.p2_audit }}
-      # The run's tally, for the non-blocking `harness-metrics` job only. These
-      # are the ONLY outputs here nothing asserts on: a thermometer, published
-      # beside the evidence rather than instead of it.
-      caught: ${{ steps.mutate.outputs.caught }}
-      missed: ${{ steps.mutate.outputs.missed }}
-      timeout: ${{ steps.mutate.outputs.timeout }}
-      unviable: ${{ steps.mutate.outputs.unviable }}
+      code: ${{ steps.scope.outputs.code }}
+      scope: ${{ steps.scope.outcome }}
+      state: ${{ steps.plan.outputs.state }}
+      result: ${{ steps.plan.outputs.result }}
+      count: ${{ steps.plan.outputs.count }}
+      reach: ${{ steps.plan.outputs.reach }}
+      p1: ${{ steps.plan.outputs.p1 }}
+      p2: ${{ steps.plan.outputs.p2 }}
+      # `whole` grades P1 and the P2 audit in ONE run; `p1` excludes P2.
+      graded: ${{ steps.plan.outputs.graded }}
+      cache: ${{ steps.plan.outputs.cache }}
+      shards: ${{ steps.plan.outputs.shards }}
+      shard_n: ${{ steps.plan.outputs.shard_n }}
+      outcome: ${{ steps.plan.outcome }}
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      # Skip the mutation WORK on docs-only PRs — there is no source to mutate, and
-      # a 42-min run for a README edit is pure waste. The job itself still runs and
-      # reports green (so it never blocks a docs merge, and were it ever promoted to
-      # a required check a skipped step would not leave it pending).
-      #
-      # This step FAILS OPEN nowhere. The previous version swallowed a failed
-      # fetch with `|| true`; if `origin/<base>` was then unresolvable,
-      # `git diff` wrote nothing, `grep -qv` exited 1, `code=false`, and EVERY
-      # step of the job was skipped under a green "Docs-only PR" notice — a
-      # broken base ref silently disabled the whole gate. An unresolvable base
-      # is now an error, because "I could not read the diff" and "there is
-      # nothing to grade" must not arrive looking alike.
-      #
-      # `mutants-gate-sanity` carries a byte-identical copy: GitHub Actions has
-      # no YAML anchors, and the two jobs must decide scope the same way. They
-      # are cross-checked at runtime — `Mutants (coverage verdict)` fails if the
-      # two jobs' pictures of this diff disagree.
       - name: Any non-docs changes?
         id: scope
         run: |
@@ -341,7 +286,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         if: steps.scope.outputs.code == 'true'
         with:
-          key: mutants
+          key: mutants-reach
       # Outcomes already measured for THIS EXACT code. The key is the whole
       # world the answer depends on — a mutant is killed by the SUITE, not by
       # its own file, so there is no honest per-file key (see the script's
@@ -353,10 +298,13 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: .mutants-cache
-          key: mutants-outcomes-v1-${{ hashFiles('src/**/*.rs', 'tests/**/*.rs', 'Cargo.lock', '.cargo/mutants.toml') }}
-      - name: Install cargo-mutants
+          key: mutants-outcomes-v2-${{ hashFiles('src/**/*.rs', 'tests/**/*.rs', 'Cargo.lock', '.cargo/mutants.toml') }}
+      # Prebuilt binaries: `cargo install` compiled cargo-mutants from source
+      # on every cold cache (68s on PR #314).
+      - uses: taiki-e/install-action@v2.87.8
         if: steps.scope.outputs.code == 'true'
-        run: cargo install cargo-mutants --locked
+        with:
+          tool: cargo-mutants,cargo-llvm-cov
       # WHAT CAN THE OFFLINE SUITE EVEN REACH? Measured once, so the run below
       # can spend its budget on mutants it is able to kill.
       #
@@ -394,15 +342,12 @@ jobs:
         run: |
           set -euo pipefail
           rustup component add llvm-tools-preview
-          cargo install cargo-llvm-cov --locked
           cargo llvm-cov --lib --bins --json --output-path cov.json
           python3 .github/scripts/mutants_classify.py reach cov.json fn-extents.tsv
-      - name: Mutate the PR diff
-        id: mutate
+      - name: Plan the graded set
+        id: plan
         if: steps.scope.outputs.code == 'true'
         env:
-          # Mutants never need debuginfo — halves build dirs, speeds links.
-          CARGO_PROFILE_DEV_DEBUG: "0"
           # merge_group carries no `base_ref`; it carries the base SHA the queue
           # built this group on. A three-dot diff against either is the same
           # set — merge-base(base, HEAD)..HEAD — so one expression serves both
@@ -417,16 +362,6 @@ jobs:
           # `Mutants (coverage verdict)` job asserts both against its own
           # independent measurement.
           say() { echo "$1=$2" >> "$GITHUB_OUTPUT"; }
-          # cargo-mutants exit codes: 0 = every mutant caught, 2 = FOUND_PROBLEMS
-          # (a missed/timed-out mutant — the gate's own finding), anything else =
-          # the tool or the invocation broke, which is NOT a verdict.
-          verdict() {
-            case "$1" in
-              0) say result clean ;;
-              2) say result missed ;;
-              *) say result tool-error ;;
-            esac
-          }
           # `cargo mutants --list | grep -c .` reads a TOOL FAILURE as the
           # safest-looking number there is: `grep -c .` on empty stdin prints 0
           # and exits 1, and the `|| true` that hid grep's status hid
@@ -500,7 +435,7 @@ jobs:
           if [ -s fn-extents.tsv ]; then
             REACH=measured
             python3 "$CLASSIFY" partition diff-list.txt --extents fn-extents.tsv \
-              --p1 p1.txt --p2 p2.txt --drop-p1 drop-p1.txt --drop-p2 drop-p2.txt
+              --p1 p1.txt --p2 p2.txt --drop-p1 drop-p1.txt --drop-p2 drop-p2.txt --src src
           else
             REACH=unmeasured
             python3 "$CLASSIFY" partition diff-list.txt \
@@ -527,7 +462,12 @@ jobs:
               echo "::warning::the generated P2 exclusions did not remove exactly the report-only class (errors above), so they are DISCARDED and every in-diff mutant is graded."
             fi
           fi
-          [ "$REACH" = "measured" ] || P2=0
+          if [ "$REACH" != "measured" ]; then
+            # Nothing is deprioritised: the graded class is the whole diff.
+            P2=0
+            cp diff-list.txt p1.txt
+            : > p2.txt
+          fi
           P1=$((COUNT - P2))
           say reach "$REACH"
           say p1 "$P1"
@@ -554,101 +494,245 @@ jobs:
             # about. Only when even THAT does not fit is the diff ungraded.
             say state over-budget-ungraded
             say result n/a
-            echo "::notice::this diff yields $COUNT mutants, $P1 of them in code the offline suite executes — past the $MUTANTS_DIFF_BUDGET this job's budget can grade (~90s each in CI, dominated by the rebuild). It is NOT graded — there is no nightly rotation to defer to, and grading a slice would look like coverage without being it. Split the PR into changes that fit, or accept that mutation testing has nothing to say about this one."
+            echo "::notice::this diff yields $COUNT mutants, $P1 of them in code the offline suite executes — past the $MUTANTS_DIFF_BUDGET this job's budget can grade. It is NOT graded — there is no nightly rotation to defer to, and grading a slice would look like coverage without being it. Split the PR into changes that fit, or accept that mutation testing has nothing to say about this one."
             exit 0
           fi
-          # "Did this gate grade anything at all?" is NOT asked here: this job is
-          # `continue-on-error: true`, so an `exit 1` in it is an annotation, not
-          # a failure — the very property that let the vacuous gate survive eight
-          # runs. It lives in the BLOCKING `mutants-gate-sanity` /
-          # `mutants-verdict` jobs below, which read the outputs recorded above.
-          #
-          # Exit code 2 = missed mutants (the gate's failure); 0 = all caught
-          # or nothing to mutate in this diff.
+          say state in-budget
+          # ONE run grades P1 and audits P2 whenever both fit the budget: the
+          # separate audit run paid a second cold build and baseline (6.5 min
+          # on PR #314) to grade seven mutants. Past the budget only P1 runs,
+          # through the verified P2 exclusions, and the audit is skipped.
+          if [ "$P2" -gt 0 ] && [ $((P1 + P2)) -le "$MUTANTS_DIFF_BUDGET" ]; then
+            say graded whole
+            cp diff-list.txt graded.txt
+          else
+            say graded p1
+            cp p1.txt graded.txt
+          fi
+          N=$(grep -c . graded.txt || true)
+          # ALL-OR-NOTHING replay: either every graded mutant is known for this
+          # exact tree, or the run happens in full (see mutants_cache.py).
+          if [ "$N" -gt 0 ] && [ -f .mutants-cache/outcomes.json ] \
+             && python3 .github/scripts/mutants_cache.py replay .mutants-cache/outcomes.json graded.txt >/dev/null; then
+            say cache hit
+            echo "::notice::every mutant this diff grades was already measured against identical src/, tests/, Cargo.lock and .cargo/mutants.toml — replaying rather than re-running. A RE-run saved, not a grading skipped."
+          else
+            say cache miss
+            rm -rf .mutants-cache
+          fi
+          # Four runners, each a cold build plus a quarter of the mutants.
+          SHARD_N=$(( N < 4 ? N : 4 ))
+          say shard_n "$SHARD_N"
+          say shards "$(python3 -c "import json,sys; print(json.dumps(list(range(int(sys.argv[1])))))" "$SHARD_N")"
+      - name: Hand the plan to the shards
+        if: steps.plan.outputs.state == 'in-budget'
+        uses: actions/upload-artifact@v7
+        with:
+          name: mutants-plan
+          include-hidden-files: true
+          path: |
+            pr.diff
+            diff-list.txt
+            graded.txt
+            p1.txt
+            p2.txt
+            drop-p2.txt
+            .mutants-cache/
+          retention-days: 3
+
+  # The graded set, cut in `shard_n` slices by cargo-mutants' own `--shard`.
+  # A shard never decides anything: it records its outcomes and its exit code,
+  # and `Mutants (changed lines)` grades them together.
+  mutants-shard:
+    name: Mutants (shard ${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    needs: mutants-plan
+    if: needs.mutants-plan.outputs.state == 'in-budget' && needs.mutants-plan.outputs.cache == 'miss' && needs.mutants-plan.outputs.shard_n != '0'
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.mutants-plan.outputs.shards) }}
+    env:
+      # Mutants never need debuginfo — halves build dirs, speeds links.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: mutants
+      - uses: taiki-e/install-action@v2.87.8
+        with:
+          tool: cargo-mutants
+      - uses: actions/download-artifact@v8
+        with:
+          name: mutants-plan
+      # cargo-mutants builds in a COPY of the tree; `--copy-target` hands that
+      # copy these cached dependencies, so the baseline compiles only rivet
+      # (the cold 294s baseline build on PR #314 was mostly dependencies).
+      - name: Build the dependencies the mutants reuse
+        run: cargo test --lib --bins --no-run
+      - name: Mutate shard ${{ matrix.shard }}
+        env:
+          GRADED: ${{ needs.mutants-plan.outputs.graded }}
+          SHARD_N: ${{ needs.mutants-plan.outputs.shard_n }}
+        run: |
+          set -euo pipefail
+          DROP_P2=()
+          if [ "$GRADED" = "p1" ]; then
+            while IFS= read -r pat; do DROP_P2+=(--exclude-re "$pat"); done < drop-p2.txt
+          fi
           # --lib AND --bins: half this crate lives in the BINARY target
           # (src/init, src/cli, declared in main.rs), so a lib-only mutation
           # run reports the bin crate's unit tests as nonexistent — PR #154's
           # first run scored 35/47 MISSED while direct unit tests for most of
-          # those mutants sat green in `cargo test --bin rivet`. Scope honesty:
-          # measure against every offline test target, then triage what's left.
-          say state in-budget
+          # those mutants sat green in `cargo test --bin rivet`.
           rc=0
-          # ALL-OR-NOTHING replay. Reusing SOME outcomes would change `count` /
-          # `p1` / `p2`, which `Mutants (coverage verdict)` audits against its
-          # OWN independent measurement — the two halves of the gate disagreeing
-          # about how much was graded is precisely the failure this plumbing
-          # exists to prevent. Either every graded mutant is known, or the run
-          # happens in full. A timeout is never replayed: it records that a
-          # measurement did not finish, which is not a verdict.
-          CACHED_RC=""
-          if [ -f .mutants-cache/outcomes.json ]; then
-            CACHED_RC=$(python3 .github/scripts/mutants_cache.py replay \
-                          .mutants-cache/outcomes.json p1.txt) || CACHED_RC=""
-          fi
-          if [ -n "$CACHED_RC" ]; then
-            rc="$CACHED_RC"
-            say cache hit
-            echo "::notice::every mutant this diff grades was already measured against identical src/, tests/, Cargo.lock and .cargo/mutants.toml — replaying rc=$rc rather than re-running. A RE-run saved, not a grading skipped."
-          else
-            say cache miss
-            cargo mutants --in-diff pr.diff ${DROP_P2[@]+"${DROP_P2[@]}"} -j 2 -- --lib --bins || rc=$?
-            mkdir -p .mutants-cache
-            python3 .github/scripts/mutants_cache.py record .mutants-cache/outcomes.json \
-              mutants.out/caught.txt mutants.out/missed.txt mutants.out/timeout.txt >/dev/null || true
-          fi
-          verdict "$rc"
-          # The run's own tally, published for the harness-metrics THERMOMETER
-          # (see the `harness-metrics` job). Nothing gates on these; they exist
-          # so a human can read a trend instead of re-deriving it from forty
-          # log lines. Absent files stay ABSENT — an unset output is `null` in
-          # the artifact, never 0, because "the run never happened" and "nothing
-          # was missed" must not look alike on a chart.
-          for class in caught missed timeout unviable; do
-            f="mutants.out/$class.txt"
-            if [ -f "$f" ]; then
-              say "$class" "$(grep -c . "$f" || true)"
+          cargo mutants --in-diff pr.diff ${DROP_P2[@]+"${DROP_P2[@]}"} \
+            --shard "${{ matrix.shard }}/$SHARD_N" --copy-target=true -j 2 -- --lib --bins || rc=$?
+          mkdir -p mutants.out
+          echo "$rc" > mutants.out/rc
+          echo "shard ${{ matrix.shard }}/$SHARD_N: cargo-mutants exit $rc"
+      - name: Record this shard's outcomes
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: mutants-shard-${{ matrix.shard }}
+          path: |
+            mutants.out/rc
+            mutants.out/*.txt
+          if-no-files-found: ignore
+          retention-days: 3
+
+  # THE REQUIRED CHECK. It grades the shards' outcomes as one run and publishes
+  # what the per-diff run used to publish, so the verdict, the sanity audit and
+  # harness-metrics read one job whatever the fan-out below it.
+  #
+  # `continue-on-error` makes this job's CONCLUSION success whatever happens
+  # in it, so neither a required-check setting nor a `needs:` can observe what
+  # it did. What it did is therefore PUBLISHED as job outputs and asserted by
+  # the blocking `Mutants (coverage verdict)` job below — the coverage-ledger
+  # process rule: the claim "these files are graded" has to be read off
+  # the call site, not asserted about it. It still blocks on a miss:
+  # `continue-on-error` does not launder the conclusion (measured on PR #233).
+  mutants-in-diff:
+    name: Mutants (changed lines)
+    runs-on: ubuntu-latest
+    needs: [mutants-plan, mutants-shard]
+    if: always() && contains(fromJSON('["pull_request", "merge_group"]'), github.event_name)
+    timeout-minutes: 15
+    continue-on-error: true
+    outputs:
+      # `a || b` in a GitHub expression yields b when a is empty, so a step that
+      # never ran falls through to the always()-run reporter below.
+      state: ${{ steps.grade.outputs.state || steps.report.outputs.state }}
+      result: ${{ steps.grade.outputs.result || steps.report.outputs.result }}
+      count: ${{ needs.mutants-plan.outputs.count }}
+      outcome: ${{ steps.report.outputs.outcome }}
+      # The PRIORITISATION's evidence, published for the same reason as the
+      # rest: this job cannot fail, so what it decided has to be readable from
+      # outside. `reach` is whether the offline-coverage measurement produced a
+      # usable answer (measured / unmeasured / unverified); `p1` is how many
+      # in-diff mutants sit in code the offline suite EXECUTES (graded, and
+      # blocking); `p2` how many sit in functions measured at zero executions
+      # (reported); `p2_audit` what happened when the report-only class was
+      # itself graded — `oracle-lied` means the offline suite CAUGHT one of
+      # them, i.e. the classification was wrong and the report-only class is
+      # not safe.
+      reach: ${{ needs.mutants-plan.outputs.reach }}
+      p1: ${{ needs.mutants-plan.outputs.p1 }}
+      p2: ${{ needs.mutants-plan.outputs.p2 }}
+      p2_audit: ${{ steps.grade.outputs.p2_audit }}
+      # The run's tally over the graded class, for the non-blocking
+      # `harness-metrics` job only: a thermometer, nothing asserts on it.
+      caught: ${{ steps.grade.outputs.caught }}
+      missed: ${{ steps.grade.outputs.missed }}
+      timeout: ${{ steps.grade.outputs.timeout }}
+      unviable: ${{ steps.grade.outputs.unviable }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        if: needs.mutants-plan.outputs.state == 'in-budget'
+        with:
+          name: mutants-plan
+      - uses: actions/download-artifact@v8
+        if: needs.mutants-plan.outputs.state == 'in-budget' && needs.mutants-plan.outputs.cache == 'miss'
+        with:
+          pattern: mutants-shard-*
+          path: shards
+      - name: Grade the shards as one run
+        id: grade
+        if: needs.mutants-plan.outputs.state == 'in-budget'
+        env:
+          CACHE: ${{ needs.mutants-plan.outputs.cache }}
+          GRADED: ${{ needs.mutants-plan.outputs.graded }}
+          SHARD_N: ${{ needs.mutants-plan.outputs.shard_n }}
+          P2: ${{ needs.mutants-plan.outputs.p2 }}
+        run: |
+          set -euo pipefail
+          say() { echo "$1=$2" >> "$GITHUB_OUTPUT"; }
+          say state in-budget
+          CACHE_PY=.github/scripts/mutants_cache.py
+          OUT=.mutants-cache/outcomes.json
+          if [ "$CACHE" = "miss" ]; then
+            # Every shard must have REPORTED. A shard that died is a slice of
+            # the diff nobody graded, and that must not read as a clean one.
+            got=0
+            for d in shards/mutants-shard-*; do
+              [ -f "$d/rc" ] || continue
+              got=$((got + 1))
+              rc=$(cat "$d/rc")
+              # cargo-mutants: 0 clean, 2 missed, 3 timeout — verdicts, graded
+              # below from the outcome lists. Anything else broke the tool.
+              case "$rc" in
+                0|2|3) ;;
+                *) say result tool-error
+                   echo "::error::shard $d: cargo-mutants exited $rc — the tool or the tree broke, which is not a verdict."
+                   exit 1 ;;
+              esac
+            done
+            if [ "$got" -ne "$SHARD_N" ]; then
+              say result tool-error
+              echo "::error::only $got of $SHARD_N mutation shards reported — the rest of the diff was graded by nothing."
+              exit 1
             fi
+            mkdir -p .mutants-cache
+            python3 "$CACHE_PY" record "$OUT" shards/mutants-shard-* >/dev/null
+          fi
+          # The verdict is P1's alone; P2 mutants in a `whole` run are the audit.
+          rc=0
+          if [ -s p1.txt ]; then
+            if ! rc=$(python3 "$CACHE_PY" replay "$OUT" p1.txt); then
+              say result tool-error
+              echo "::error::a graded mutant has no outcome or TIMED OUT — this run has no verdict on it:"
+              python3 "$CACHE_PY" labelled "$OUT" timeout | grep -Fxf p1.txt || true
+              exit 1
+            fi
+          fi
+          case "$rc" in
+            0) say result clean ;;
+            2) say result missed ;;
+          esac
+          # The run's own tally over the GRADED class, for the thermometer.
+          for class in caught missed timeout unviable; do
+            say "$class" "$( (python3 "$CACHE_PY" labelled "$OUT" "$class" | grep -Fxf p1.txt || true) | grep -c . || true)"
           done
-          # THE REPORT-ONLY CLASS IS ITSELF AUDITED, whenever the budget stretches
-          # to it. "These mutants cannot be killed offline" is a claim, and the
-          # one thing that can falsify it is running them: if the offline suite
-          # CATCHES one, the coverage-based classification was wrong and the
-          # report-only class is unsound — `Mutants (coverage verdict)` fails on
-          # `oracle-lied`. This is what keeps the split from becoming the excuse
-          # ("it wasn't covered, so it doesn't count") that a report-only class
-          # otherwise grows into: whenever the whole diff would have fitted the
-          # budget anyway, the gate spends exactly what it used to spend and
-          # checks its own oracle with it. Past the budget the audit is skipped
-          # and SAID to be skipped — that is the trade the prioritisation buys,
-          # and it is named rather than implied.
-          #
-          # The kills are graded AGAINST p2.txt, not against "whatever survived
-          # the P1 exclusions". Those are not the same set, and on 2026-08-22
-          # (PR #265) the difference failed a clean PR: the audit caught four
-          # mutants, all of them P1, none of them in the P2 list the same run
-          # had just printed — and the old `[ -s caught.txt ]` test read that as
-          # `oracle-lied`. Measured cause, cargo-mutants 27.1.0 `src/visit.rs`:
-          # every genre goes through `collect_mutant`, which gates on
-          # `options.allows_mutant()`, EXCEPT `Genre::StructField` (`delete
-          # field X from struct Y expression`) which is pushed straight onto
-          # `self.mutants`. `--exclude-re` cannot remove one — probed on that
-          # branch, `--exclude-re .` over `src/load/plan.rs` left exactly the 4
-          # StructField mutants of 56. So the audit corpus always contains any
-          # unexcludable P1 mutant, and a kill on one is not evidence about a
-          # class it was never in. Scoping the oracle is the fix; it takes
-          # nothing away, since a genuinely-P2 kill still fails the gate.
-          #
-          # The mirror-image leak — an unexcludable mutant that IS in P2, which
-          # the MAIN run therefore cannot deprioritise — is already fail-closed
-          # one step up: `verify` sees it survive the P2 exclusions, discards
-          # them, and the whole diff is graded.
-          if [ "$P2" -gt 0 ]; then
-            if [ $((P1 + P2)) -le "$MUTANTS_DIFF_BUDGET" ]; then
-              DROP_P1=()
-              while IFS= read -r pat; do DROP_P1+=(--exclude-re "$pat"); done < drop-p1.txt
-              cargo mutants --in-diff pr.diff ${DROP_P1[@]+"${DROP_P1[@]}"} -j 2 \
-                -o p2-audit -- --lib --bins || true
-              if python3 "$CLASSIFY" audit p2.txt p2-audit/mutants.out/caught.txt; then
+          if [ "$rc" = "2" ]; then
+            echo "::error::missed mutants in code the offline suite executes:"
+            python3 "$CACHE_PY" labelled "$OUT" missed | grep -Fxf p1.txt || true
+          fi
+          # THE REPORT-ONLY CLASS IS ITSELF AUDITED whenever the budget
+          # stretches to it: if the offline suite CATCHES one, the coverage
+          # classification was wrong and `Mutants (coverage verdict)` fails on
+          # `oracle-lied`. The kills are graded AGAINST p2.txt — see `audit`
+          # in mutants_classify.py for the StructField leak that scoping fixes.
+          if [ "${P2:-0}" -gt 0 ]; then
+            if [ "$GRADED" = "whole" ]; then
+              python3 "$CACHE_PY" labelled "$OUT" caught > caught-all.txt
+              if python3 .github/scripts/mutants_classify.py audit p2.txt caught-all.txt; then
                 say p2_audit oracle-holds
               else
                 say p2_audit oracle-lied
@@ -658,33 +742,43 @@ jobs:
             fi
           fi
           exit "$rc"
-      # The job's own conclusion is unreadable (continue-on-error), so the last
-      # thing it does is write down what happened — including the cases where
-      # the step above never ran at all. Without this, "the run was skipped
-      # because the scope step broke" and "there was nothing to grade" arrive at
-      # the blocking job as the same empty value.
       - name: Save mutation outcomes
         # `always()`: a run that ends in MISSED mutants still measured them, and
         # that measurement is exactly what a re-run of the same commit should
         # not have to pay for again.
-        if: always() && steps.scope.outputs.code == 'true' && hashFiles('.mutants-cache/outcomes.json') != ''
+        if: always() && needs.mutants-plan.outputs.cache == 'miss' && hashFiles('.mutants-cache/outcomes.json') != ''
         uses: actions/cache/save@v6
         with:
           path: .mutants-cache
-          key: mutants-outcomes-v1-${{ hashFiles('src/**/*.rs', 'tests/**/*.rs', 'Cargo.lock', '.cargo/mutants.toml') }}
+          key: mutants-outcomes-v2-${{ hashFiles('src/**/*.rs', 'tests/**/*.rs', 'Cargo.lock', '.cargo/mutants.toml') }}
+      # The job's own conclusion is unreadable (continue-on-error), so the last
+      # thing it does is write down what happened — including the cases where
+      # grading never ran. Without this, "the plan broke" and "there was
+      # nothing to grade" arrive at the blocking job as the same empty value.
       - name: Publish this run's verdict
         id: report
         if: always()
+        env:
+          GRADE_STATE: ${{ steps.grade.outputs.state }}
+          PLAN_SCOPE: ${{ needs.mutants-plan.outputs.scope }}
+          PLAN_CODE: ${{ needs.mutants-plan.outputs.code }}
+          PLAN_STATE: ${{ needs.mutants-plan.outputs.state }}
+          PLAN_RESULT: ${{ needs.mutants-plan.outputs.result }}
         run: |
           set -euo pipefail
-          if [ "${{ steps.scope.outcome }}" != "success" ]; then
-            echo "state=scope-error" >> "$GITHUB_OUTPUT"
-            echo "result=tool-error" >> "$GITHUB_OUTPUT"
-          elif [ "${{ steps.scope.outputs.code }}" != "true" ]; then
-            echo "state=docs-only" >> "$GITHUB_OUTPUT"
-            echo "result=n/a" >> "$GITHUB_OUTPUT"
+          if [ -z "$GRADE_STATE" ]; then
+            if [ "$PLAN_SCOPE" != "success" ]; then
+              echo "state=scope-error" >> "$GITHUB_OUTPUT"
+              echo "result=tool-error" >> "$GITHUB_OUTPUT"
+            elif [ "$PLAN_CODE" != "true" ]; then
+              echo "state=docs-only" >> "$GITHUB_OUTPUT"
+              echo "result=n/a" >> "$GITHUB_OUTPUT"
+            elif [ -n "$PLAN_STATE" ]; then
+              echo "state=$PLAN_STATE" >> "$GITHUB_OUTPUT"
+              echo "result=$PLAN_RESULT" >> "$GITHUB_OUTPUT"
+            fi
           fi
-          echo "outcome=${{ steps.mutate.outcome }}" >> "$GITHUB_OUTPUT"
+          echo "outcome=${{ steps.grade.outcome }}" >> "$GITHUB_OUTPUT"
 
   # Is the mutation gate GRADING ANYTHING? Split out of `mutants-in-diff` on
   # purpose: that job is `continue-on-error: true` (a foundational-module PR
@@ -721,7 +815,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      # Byte-identical to `mutants-in-diff`'s scope step, and for the same
+      # Byte-identical to `mutants-plan`'s scope step, and for the same
       # reason: a swallowed fetch failure used to make an unresolvable base read
       # as "docs-only", skipping every step of this BLOCKING job under a green
       # notice. Fail-open on the scope question disables the gate silently.
@@ -764,9 +858,10 @@ jobs:
         if: steps.scope.outputs.code == 'true'
         with:
           key: mutants
-      - name: Install cargo-mutants
+      - uses: taiki-e/install-action@v2.87.8
         if: steps.scope.outputs.code == 'true'
-        run: cargo install cargo-mutants --locked
+        with:
+          tool: cargo-mutants
       # Every exclusion must triage a REAL mutant, and only the one it names.
       # `tests/offline/mutation_gate_config.rs` grades the patterns' SHAPE; it
       # cannot see the corpus, so it cannot see a DEAD entry (round-4's
@@ -974,8 +1069,6 @@ jobs:
           STATE: ${{ needs.mutants-in-diff.outputs.state }}
           RESULT: ${{ needs.mutants-in-diff.outputs.result }}
           OUTCOME: ${{ needs.mutants-in-diff.outputs.outcome }}
-          UNTIERED: ${{ needs.mutants-in-diff.outputs.untiered }}
-          SUB: ${{ needs.mutants-in-diff.outputs.sub }}
           COUNT: ${{ needs.mutants-in-diff.outputs.count }}
           REACH: ${{ needs.mutants-in-diff.outputs.reach }}
           P1: ${{ needs.mutants-in-diff.outputs.p1 }}
