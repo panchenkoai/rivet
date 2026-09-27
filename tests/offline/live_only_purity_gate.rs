@@ -100,12 +100,9 @@ const BASELINE: &[(&str, usize, usize, usize, usize)] = &[
     // Visible to this gate since 2026-09-23: the parser read only a bare leading
     // identifier, so every qualified whole-function exclusion was skipped and
     // these bodies were never counted. Entered at their counts that day.
-    ("src/bin/seed/mssql.rs::fill", 0, 0, 0, 1),
     ("src/load/bigquery/mod.rs::append_changelog", 0, 0, 1, 0),
     ("src/load/bigquery/mod.rs::compact", 0, 0, 0, 1),
     ("src/load/bigquery/mod.rs::rebuild_changelog", 0, 0, 0, 1),
-    ("src/source/cdc/sink.rs::flush", 0, 0, 0, 1),
-    ("src/source/mssql/cdc.rs::fill", 1, 0, 1, 3),
     ("src/source/mysql/cdc.rs::fill", 0, 1, 4, 0),
     ("src/source/postgres/cdc.rs::fill", 1, 2, 4, 2),
     // ── the export RUNNERS ───────────────────────────────────────────────
@@ -125,9 +122,8 @@ const BASELINE: &[(&str, usize, usize, usize, usize)] = &[
         0,
     ),
     ("src/source/oracle/mod.rs::export_within_budget", 2, 0, 2, 2),
-    // Matched by NAME from the PostgresSource::query_scalar exclusion (the gate keys on
-    // name + return type); Mongo's own query_scalar is not excluded. Entered at its count.
-    ("src/source/mongo/mod.rs::query_scalar", 0, 0, 1, 0),
+    // The Postgres release of a state lease (heartbeat stop + row delete): glue.
+    ("src/state/load_lease.rs::drop", 0, 0, 0, 0),
     (
         "src/pipeline/mongo_parallel.rs::run_mongo_parallel",
         0,
@@ -248,7 +244,7 @@ const BASELINE: &[(&str, usize, usize, usize, usize)] = &[
 /// (`replace == with != in check$`, `delete ! in run_pool`) are equivalence or
 /// per-operator triage, not a body claim, and are skipped — they are, in fact,
 /// the symptom this gate exists to make unnecessary.
-fn live_only_functions() -> Vec<(String, Option<String>)> {
+fn live_only_functions() -> Vec<(String, Option<String>, Option<String>)> {
     let mut out = Vec::new();
     for pat in super::mutation_gate_config::exclude_patterns() {
         let Some(rest) = pat.strip_prefix("replace ") else {
@@ -256,6 +252,7 @@ fn live_only_functions() -> Vec<(String, Option<String>)> {
         };
         let (path, tail) = split_path(rest);
         let name: String = path.rsplit("::").next().unwrap_or(path).to_string();
+        let owner = self_type(path);
         if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             continue;
         }
@@ -289,7 +286,7 @@ fn live_only_functions() -> Vec<(String, Option<String>)> {
         } else {
             continue; // not a whole-function stub entry
         };
-        out.push((name, ret));
+        out.push((name, ret, owner));
     }
     out.sort();
     out.dedup();
@@ -308,6 +305,71 @@ fn split_path(rest: &str) -> (&str, &str) {
         }
     }
     (rest, "")
+}
+
+/// The type a qualified path names (`<impl Tr for T<'_>>::f` → `T`, `T<'_>::f` → `T`), or None.
+fn self_type(path: &str) -> Option<String> {
+    let (head, _) = path.rsplit_once("::")?;
+    let head = head
+        .strip_prefix('<')
+        .and_then(|h| h.strip_suffix('>'))
+        .unwrap_or(head);
+    let ty = head.rsplit(" for ").next().unwrap_or(head);
+    let ty: String = ty
+        .trim_start_matches("impl ")
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    (!ty.is_empty()).then_some(ty)
+}
+
+/// Byte ranges of every `impl … { }` block whose self type is `ty`, and of `trait ty { }`
+/// (cargo-mutants names a trait's default method `Trait::f`).
+fn impl_ranges(code: &str, ty: &str) -> Vec<(usize, usize)> {
+    let b: Vec<char> = code.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i + 5 < b.len() {
+        let word = i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == '_');
+        if word && b[i..].starts_with(&['t', 'r', 'a', 'i', 't', ' ']) {
+            let named: String = b[i + 6..]
+                .iter()
+                .take_while(|c| c.is_ascii_alphanumeric() || **c == '_')
+                .collect();
+            if named == ty
+                && let Some(open) = (i..b.len()).find(|&k| b[k] == '{')
+                && let Some(end) = match_brace(&b, open)
+            {
+                out.push((open, end));
+            }
+        }
+        if word && b[i..].starts_with(&['i', 'm', 'p', 'l']) && matches!(b[i + 4], ' ' | '<') {
+            let Some(open) = (i..b.len()).find(|&k| b[k] == '{' || b[k] == ';') else {
+                break;
+            };
+            if b[open] == '{' {
+                let header: String = b[i + 4..open].iter().collect();
+                let self_ty = header.rsplit(" for ").next().unwrap_or(&header);
+                let self_ty = self_ty.trim().trim_start_matches(['<', '>']);
+                let named: String = self_ty
+                    .split_whitespace()
+                    .last()
+                    .unwrap_or("")
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                if named == ty
+                    && let Some(end) = match_brace(&b, open)
+                {
+                    out.push((open, end));
+                }
+            }
+            i = open + 1;
+            continue;
+        }
+        i += 1;
+    }
+    out
 }
 
 // ── reading Rust source without being fooled by it ───────────────────────
@@ -461,7 +523,7 @@ fn raw_string_start(b: &[char], i: usize) -> Option<(usize, usize)> {
 /// The body is the brace-matched text INCLUDING its braces; the return type is
 /// the text between a depth-0 `->` and the opening brace, empty when the
 /// function returns unit.
-fn fn_sites(code: &str, name: &str) -> Vec<(String, String)> {
+fn fn_sites(code: &str, name: &str) -> Vec<(usize, String, String)> {
     let b: Vec<char> = code.chars().collect();
     let needle: Vec<char> = format!("fn {name}").chars().collect();
     let mut out = Vec::new();
@@ -493,7 +555,7 @@ fn fn_sites(code: &str, name: &str) -> Vec<(String, String)> {
                                 .map(|r| b[r..k].iter().collect::<String>().trim().to_string())
                                 .unwrap_or_default();
                             if let Some(end) = body_end {
-                                out.push((ret, b[k..=end].iter().collect::<String>()));
+                                out.push((i, ret, b[k..=end].iter().collect::<String>()));
                             }
                             break;
                         }
@@ -687,10 +749,18 @@ fn graded_sites() -> BTreeMap<String, Decisions> {
         .collect();
 
     let mut sites: BTreeMap<String, Decisions> = BTreeMap::new();
-    for (name, ret) in live_only_functions() {
+    for (name, ret, owner) in live_only_functions() {
         let mut hits = 0usize;
         for (rel, code) in &blanked {
-            for (actual_ret, body) in fn_sites(code, &name) {
+            // A qualified exclusion (`<impl Drop for LoadLease>::drop`) names ONE impl's
+            // function; matching the bare name graded every `fn drop` in the tree.
+            let scope = owner.as_deref().map(|t| impl_ranges(code, t));
+            for (at, actual_ret, body) in fn_sites(code, &name) {
+                if let Some(ranges) = &scope
+                    && !ranges.iter().any(|&(lo, hi)| lo < at && at < hi)
+                {
+                    continue;
+                }
                 // Same-named siblings are real (`check` also names a struct
                 // helper in preflight/cdc_health.rs, `density_probe` exists per
                 // engine). The exclusion regex carries the return type when it
@@ -921,7 +991,7 @@ fn the_decision_scanner_counts_operators_not_syntax() {
 #[test]
 fn only_whole_function_exclusions_are_read_as_live_only_claims() {
     let real = live_only_functions();
-    let names: Vec<&str> = real.iter().map(|(n, _)| n.as_str()).collect();
+    let names: Vec<&str> = real.iter().map(|(n, _, _)| n.as_str()).collect();
     for expect in [
         "run_pool",
         "check",
@@ -954,8 +1024,8 @@ fn only_whole_function_exclusions_are_read_as_live_only_claims() {
     // `check` mean every `fn check` in the tree.
     let check_ret = real
         .iter()
-        .find(|(n, _)| n == "check")
-        .and_then(|(_, r)| r.clone());
+        .find(|(n, _, _)| n == "check")
+        .and_then(|(_, r, _)| r.clone());
     assert_eq!(
         check_ret.as_deref(),
         Some("Result<bool>"),
