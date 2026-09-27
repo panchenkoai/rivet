@@ -426,14 +426,22 @@ pub(crate) fn escape_oracle_literal(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
-/// A T-SQL literal: a timestamp (`T` or space form) is typed `DATETIME2(7)` in ISO `T` form, so it parses the same under any `DATEFORMAT`.
+/// A T-SQL literal: a timestamp (`T` or space form) is typed `DATETIME2(7)` in ISO `T` form (fraction rounded to 100 ns), so it parses the same under any `DATEFORMAT`.
 fn mssql_cursor_literal(value: &str) -> String {
+    use chrono::DurationRound;
     let iso = value.replacen(' ', "T", 1);
-    if chrono::NaiveDateTime::parse_from_str(&iso, "%Y-%m-%dT%H:%M:%S%.f").is_err() {
+    let Ok(dt) = chrono::NaiveDateTime::parse_from_str(&iso, "%Y-%m-%dT%H:%M:%S%.f") else {
         return escape_mssql_literal(value);
-    }
+    };
+    // Rounded, not cut: a legacy DATETIME (n/300 s) converts to DATETIME2 rounded, so a cut bound sits below its own row.
     let fitted = match iso.split_once('.') {
-        Some((whole, frac)) if frac.len() > 7 => format!("{whole}.{}", &frac[..7]),
+        Some((_, frac)) if frac.len() > 7 => dt
+            .duration_round(chrono::TimeDelta::nanoseconds(100))
+            .map_or(iso.clone(), |r| {
+                let mut s = r.format("%Y-%m-%dT%H:%M:%S%.9f").to_string();
+                s.truncate(s.len() - 2);
+                s
+            }),
         _ => iso.clone(),
     };
     format!("CAST({} AS DATETIME2(7))", escape_mssql_literal(&fitted))
@@ -911,8 +919,8 @@ mod tests {
         );
         assert_eq!(
             mssql_cursor_literal("2024-01-01T10:00:00.123456789"),
-            "CAST('2024-01-01T10:00:00.1234567' AS DATETIME2(7))",
-            "a nanosecond fraction is cut to what DATETIME2 holds"
+            "CAST('2024-01-01T10:00:00.1234568' AS DATETIME2(7))",
+            "a nanosecond fraction is rounded to the 100 ns DATETIME2 holds"
         );
         assert_eq!(
             mssql_cursor_literal("250001"),

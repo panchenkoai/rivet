@@ -1213,7 +1213,8 @@ fn scalar_to_string(row: &tiberius::Row) -> Option<String> {
         // which `scalar::parse_date_flexible` (chunk_by_days / date-keyset min/max)
         // cannot read — so date-window chunking on an MSSQL DATE key failed the run.
         // Decode via tiberius' chrono `FromSql` (`try_get`, the same path
-        // arrow_convert uses) and render ISO: `YYYY-MM-DD` / `YYYY-MM-DD HH:MM:SS`.
+        // arrow_convert uses) and render ISO: `YYYY-MM-DD` / `YYYY-MM-DD HH:MM:SS[.f]` (the
+        // fraction kept, or a sampled keyset ceiling excludes the newest row).
         ColumnData::Date(_) => row
             .try_get::<chrono::NaiveDate, _>(0)
             .ok()
@@ -1223,7 +1224,7 @@ fn scalar_to_string(row: &tiberius::Row) -> Option<String> {
             .try_get::<chrono::NaiveDateTime, _>(0)
             .ok()
             .flatten()
-            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string()),
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S%.f").to_string()),
         other => Some(format!("{other:?}")),
     }
 }

@@ -808,3 +808,42 @@ fn parallel_keyset_incremental_on_a_timestamptz_key_reads_each_row_once_in_a_tok
         "both runs together: every row, once"
     );
 }
+
+/// Parallel keyset incremental over an MSSQL datetime key whose newest row has a sub-second
+/// part: the open-time ceiling must include it, so run 1 exports every row.
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn parallel_keyset_incremental_on_an_mssql_datetime_key_exports_the_newest_row() {
+    for (ty, base) in [
+        ("DATETIME2(7)", "2024-01-01 00:00:00.5"),
+        ("DATETIME", "2024-01-01 00:00:00.997"),
+    ] {
+        let table = unique_name("ks_dtinc");
+        let values = (1..=200)
+            .map(|i| format!("(DATEADD(MINUTE, {i}, CAST('{base}' AS {ty})), {i})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        mssql_exec(&format!(
+            "IF OBJECT_ID('dbo.{table}') IS NOT NULL DROP TABLE dbo.{table}; \
+             CREATE TABLE dbo.{table} (ts {ty} NOT NULL PRIMARY KEY, id INT NOT NULL); \
+             INSERT INTO dbo.{table} VALUES {values}"
+        ));
+        let rig = Rig::mssql_batch(&table)
+            .duckdb_oracle()
+            .mode("chunked")
+            .export_line("chunk_by_key: ts")
+            .export_line("parallel: 3")
+            .export_line("chunk_checkpoint: true")
+            .export_line("keyset_incremental: true")
+            .export_line("chunk_size: 40");
+        let out = rig.run_with_envs_bounded(&[], std::time::Duration::from_secs(120));
+        let rows = duckdb_parquet_rows(rig.oracle_dir());
+        mssql_exec(&format!("DROP TABLE dbo.{table}"));
+        let out = out.expect("run finishes");
+        assert!(out.status.success(), "{ty}: {}", said(&out));
+        assert_eq!(
+            rows, 200,
+            "{ty}: the newest row is inside the open-time ceiling"
+        );
+    }
+}
