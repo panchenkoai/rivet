@@ -151,13 +151,16 @@ def _cursor_leg(led: Ledger, prev: Path, root: Path, engine: str, url: str, stat
             led.failed(engine, "-", SCEN, store, f"upgrade[{engine}/config]: previous init failed: "
                        f"{e.init.stderr.strip()[-200:]}", "init")
             return
+        # The upgrade order: the previous release ran first, THEN this binary arrives (its
+        # `check` may migrate the state, which the previous one could no longer open).
+        ps = _strategy(e.rivet(prev, "check", "-c", "c.yaml"))
+        r1 = e.rivet(prev, "run", "-c", "c.yaml")
         if state_url == "":
-            ps, cs = _strategy(e.rivet(prev, "check", "-c", "c.yaml")), _strategy(e.rivet(rivet_bin(), "check", "-c", "c.yaml"))
+            cs = _strategy(e.rivet(rivet_bin(), "check", "-c", "c.yaml"))
             if cs and cs == ps:
                 led.passed(engine, "-", SCEN, "config", f"upgrade[{engine}/config]: this binary checks the previous init's config the same way ({cs[0]})")
             else:
                 led.failed(engine, "-", SCEN, "config", f"upgrade[{engine}/config]: strategy prev {ps} vs this {cs}", "strategy")
-        r1 = e.rivet(prev, "run", "-c", "c.yaml")
         ok_mut = r1.ok and _mutate(engine, url, table)
         r2 = e.rivet(rivet_bin(), "run", "-c", "c.yaml")
         got = _declared(e.dir / "output",
