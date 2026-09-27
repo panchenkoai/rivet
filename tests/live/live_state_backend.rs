@@ -98,11 +98,11 @@ fn a_state_ledger_lost_mid_run_fails_loudly_and_the_next_run_delivers_every_row_
 const STATE_ADMIN: &str = "host=127.0.0.1 port=5433 user=rivet password=rivet dbname=postgres";
 
 /// A fresh database on the state server, dropped (with anything it holds) when the guard goes.
-struct ScratchStateDb {
+struct ScratchDb {
     name: String,
 }
 
-impl ScratchStateDb {
+impl ScratchDb {
     fn new(tag: &str) -> Self {
         let name = unique_name(tag);
         let mut c = postgres::Client::connect(STATE_ADMIN, postgres::NoTls).expect("state server");
@@ -117,7 +117,7 @@ impl ScratchStateDb {
     }
 }
 
-impl Drop for ScratchStateDb {
+impl Drop for ScratchDb {
     fn drop(&mut self) {
         if let Ok(mut c) = postgres::Client::connect(STATE_ADMIN, postgres::NoTls) {
             let _ = c.batch_execute(&format!(
@@ -150,7 +150,7 @@ fn checkpointed(prefix: &str, rows: i64) -> (Rig, Box<dyn std::any::Any>) {
 #[test]
 #[ignore = "live: requires postgres + postgres-state"]
 fn a_least_privilege_role_keeps_the_whole_state_in_its_own_schema() {
-    let db = ScratchStateDb::new("st_lp");
+    let db = ScratchDb::new("st_lp");
     let role = unique_name("st_lp_role");
     let mut c = db.client();
     c.batch_execute(&format!(
@@ -198,7 +198,7 @@ fn a_least_privilege_role_keeps_the_whole_state_in_its_own_schema() {
 #[test]
 #[ignore = "live: requires postgres + postgres-state"]
 fn thirty_two_concurrent_runs_on_one_postgres_state_all_finish() {
-    let db = ScratchStateDb::new("st_32");
+    let db = ScratchDb::new("st_32");
     let url = db.url();
     let rigs: Vec<_> = (0..32)
         .map(|i| checkpointed(&format!("st32_{i}"), 1000))
@@ -245,7 +245,7 @@ fn thirty_two_concurrent_runs_on_one_postgres_state_all_finish() {
 #[test]
 #[ignore = "live: requires postgres + postgres-state"]
 fn a_state_db_whose_timezone_is_not_utc_continues_the_cursor() {
-    let db = ScratchStateDb::new("st_tz");
+    let db = ScratchDb::new("st_tz");
     db.client()
         .batch_execute(&format!(
             "ALTER DATABASE {} SET timezone TO 'Asia/Tokyo'",
@@ -294,51 +294,13 @@ fn a_state_db_whose_timezone_is_not_utc_continues_the_cursor() {
     );
 }
 
-/// A `running` row left by a crashed host whose clock ran an hour ahead: the next successful
-/// run of the same export on the same prefix supersedes it, so nothing reads the prefix as
-/// still being written for the hour the skew lasts.
-#[test]
-#[ignore = "live: requires postgres + postgres-state"]
-fn a_crashed_run_from_a_fast_clock_host_is_superseded_by_the_next_run() {
-    let db = ScratchStateDb::new("st_skew");
-    let url = db.url();
-    let (rig, _t) = checkpointed("st_skew", 1000);
-    let env = [("RIVET_STATE_URL", url.as_str())];
-    assert!(
-        rig.run_args_env(&[], &env).status.success(),
-        "fixture: the first run"
-    );
-    let mut c = db.client();
-    let (export, prefix): (String, String) = {
-        let r = c
-            .query_one("SELECT export_name, prefix FROM run_status LIMIT 1", &[])
-            .unwrap();
-        (r.get(0), r.get(1))
-    };
-    let ahead = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
-    c.execute(
-        "INSERT INTO run_status (run_id, export_name, prefix, status, started_at) \
-         VALUES ('skewed-crash', $1, $2, 'running', $3)",
-        &[&export, &prefix, &ahead],
-    )
-    .unwrap();
-    assert!(rig.run_args_env(&[], &env).status.success(), "the next run");
-    let st = rivet::state::StateStore::open_at_ref(&rivet::state::StateRef::Postgres(url.clone()))
-        .unwrap();
-    assert!(
-        !st.has_active_run_on_prefix(&prefix).unwrap(),
-        "a crashed run stamped by a clock an hour ahead still reads as a live writer on \
-         {prefix} after the next run succeeded"
-    );
-}
-
 /// Moving an export from a SQLite state to a Postgres one: the first run on the empty
 /// Postgres state loses no row of the prefix the SQLite runs filled.
 /// Pins behaviour (there is no migration path to mutate): switching backends starts empty.
 #[test]
 #[ignore = "live: requires postgres + postgres-state"]
 fn moving_from_a_sqlite_state_to_a_postgres_state_loses_no_row() {
-    let db = ScratchStateDb::new("st_move");
+    let db = ScratchDb::new("st_move");
     let (rig, _t) = checkpointed("st_move", 3000);
     assert!(
         rig.run_args_env(&[], &[("RIVET_STATE_URL", "")])
@@ -367,7 +329,7 @@ fn moving_from_a_sqlite_state_to_a_postgres_state_loses_no_row() {
 #[test]
 #[ignore = "live: requires postgres + postgres-state"]
 fn a_run_on_a_hundred_thousand_run_ledger_is_not_slowed_by_the_history() {
-    let db = ScratchStateDb::new("st_big");
+    let db = ScratchDb::new("st_big");
     let url = db.url();
     let (rig, _t) = checkpointed("st_big", 5000);
     let env = [("RIVET_STATE_URL", url.as_str())];

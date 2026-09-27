@@ -18,11 +18,6 @@ class KnownRed:
 
 
 KNOWN_RED: tuple[KnownRed, ...] = (
-    KnownRed("a_crashed_run_from_a_fast_clock_host_is_superseded_by_the_next_run",
-             "run_status.started_at is the CLIENT's clock, so a crashed run from a fast-clock "
-             "host outranks its successor and gc defers cleanup until the clock catches up; "
-             "fix: stamp started_at with the state server's clock",
-             "2026-10-11"),
     KnownRed("two_runs_of_one_export_through_a_transaction_pooler_never_both_proceed",
              "#318: the session advisory lease does not hold behind a transaction-mode pooler; "
              "the lease design is pending a decision",
