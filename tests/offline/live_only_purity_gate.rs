@@ -115,6 +115,19 @@ const BASELINE: &[(&str, usize, usize, usize, usize)] = &[
     // per-runner decision that no offline test grades.
     ("src/pipeline/keyset.rs::run_keyset", 3, 0, 1, 1),
     ("src/pipeline/keyset.rs::run_keyset_parallel", 4, 0, 2, 2),
+    // Excluded 2026-09-27 at their existing decisions (catalog-row parsing, the
+    // statement-timeout arm), not grown by the exclusion; shrink as they are extracted.
+    (
+        "src/source/mssql/mod.rs::introspect_mssql_table_for_chunking",
+        1,
+        0,
+        2,
+        0,
+    ),
+    ("src/source/oracle/mod.rs::export_within_budget", 2, 0, 2, 2),
+    // Matched by NAME from the PostgresSource::query_scalar exclusion (the gate keys on
+    // name + return type); Mongo's own query_scalar is not excluded. Entered at its count.
+    ("src/source/mongo/mod.rs::query_scalar", 0, 0, 1, 0),
     (
         "src/pipeline/mongo_parallel.rs::run_mongo_parallel",
         0,

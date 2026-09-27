@@ -96,6 +96,26 @@ impl StateStore {
         )
     }
 
+    /// Whether ranges are persisted for `run_id` (on `key_column`, or on any key when `None`) — the mark of a parallel keyset run.
+    pub fn has_keyset_ranges(
+        &self,
+        export_name: &str,
+        run_id: &str,
+        key_column: Option<&str>,
+    ) -> Result<bool> {
+        let rows = match key_column {
+            Some(key) => self.load_keyset_ranges(export_name, run_id, key)?.len(),
+            None => self
+                .query(
+                    "SELECT 1 FROM keyset_range WHERE export_name = ?1 AND run_id = ?2 LIMIT 1",
+                    &[export_name.into(), run_id.into()],
+                    |r| r.i64(0),
+                )?
+                .len(),
+        };
+        Ok(rows > 0)
+    }
+
     /// Clear an export's persisted ranges. Called post-finalize (via
     /// `finalize_keyset_anchor`) once the complete manifest is written — a no-op
     /// for any export that never ran parallel keyset.

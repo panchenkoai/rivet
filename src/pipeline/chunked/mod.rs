@@ -440,9 +440,8 @@ pub(super) fn ensure_chunk_checkpoint_plan(
             }
             None => {
                 anyhow::bail!(
-                    "export '{}': --resume but no in-progress chunk checkpoint; \
-                     run without --resume first or `rivet state reset-chunks --config <cfg> --export {}`",
-                    plan.export_name,
+                    "export '{}': --resume but no in-progress chunk checkpoint — nothing to \
+                     continue; run without --resume (a crashed run is resumed by a plain run)",
                     plan.export_name
                 );
             }
@@ -760,8 +759,8 @@ mod tests {
             "got: {msg}"
         );
         assert!(
-            msg.contains("reset-chunks"),
-            "error must point to recovery command"
+            msg.contains("run without --resume") && !msg.contains("reset-chunks"),
+            "a reset cannot create a checkpoint to resume: {msg}"
         );
     }
 

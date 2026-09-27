@@ -804,13 +804,14 @@ impl super::Source for PostgresSource {
         }
         // TIMESTAMP / DATE / TIMESTAMPTZ — required for MIN/MAX on time columns (e.g. chunk_by_days)
         if let Ok(Some(v)) = row.try_get::<_, Option<chrono::NaiveDateTime>>(0) {
-            return Ok(Some(v.format("%Y-%m-%d %H:%M:%S").to_string()));
+            return Ok(Some(v.format("%Y-%m-%d %H:%M:%S%.f").to_string()));
         }
         if let Ok(Some(v)) = row.try_get::<_, Option<chrono::NaiveDate>>(0) {
             return Ok(Some(v.format("%Y-%m-%d").to_string()));
         }
+        // Full fraction and an explicit `+00`: a bound re-injected as a literal names the same instant in any session zone.
         if let Ok(Some(v)) = row.try_get::<_, Option<chrono::DateTime<chrono::Utc>>>(0) {
-            return Ok(Some(v.format("%Y-%m-%d %H:%M:%S").to_string()));
+            return Ok(Some(v.format("%Y-%m-%d %H:%M:%S%.f+00").to_string()));
         }
         // UUID — the canonical PG keyset key (`id UUID PRIMARY KEY`). Without this
         // arm the String arm rejects the uuid OID → Ok(None), so parallel keyset

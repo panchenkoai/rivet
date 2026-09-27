@@ -372,7 +372,7 @@ pub(crate) fn inline_literal(source_type: SourceType, value: &str) -> String {
     match source_type {
         SourceType::Mysql => escape_mysql_literal(value),
         SourceType::Postgres => escape_pg_literal(value),
-        SourceType::Mssql => escape_mssql_literal(value),
+        SourceType::Mssql => mssql_cursor_literal(value),
         SourceType::Oracle => escape_oracle_literal(value),
         SourceType::Mongo => unreachable!(
             "inline_literal: MongoDB keyset paging is not a SQL path (guarded by full-mode-only validation)"
@@ -421,32 +421,34 @@ fn cursor_rhs(source_type: SourceType, value: &str) -> (String, Option<String>) 
     }
 }
 
-/// Quote `s` as an Oracle string literal: only `'` is escaped (doubled), and `N'…'`
-/// keeps non-ASCII key values intact.
+/// Quote `s` as an Oracle VARCHAR2 literal (`'` doubled); not `N'…'`, which fails a DATE bound through the pinned NLS_DATE_FORMAT (ORA-01830).
 pub(crate) fn escape_oracle_literal(s: &str) -> String {
-    // A VARCHAR2 literal, not N'…': Oracle cannot convert NVARCHAR text through the
-    // pinned NLS_DATE_FORMAT's quoted parts (ORA-01830 on a DATE keyset bound).
     format!("'{}'", s.replace('\'', "''"))
 }
 
-/// A T-SQL cursor literal: a timestamp rivet rendered is typed `DATETIME2(7)` (its fraction cut to seven digits), so a legacy `DATETIME` column accepts it.
+/// A T-SQL literal: a timestamp (`T` or space form) is typed `DATETIME2(7)` in ISO `T` form (fraction rounded to 100 ns), so it parses the same under any `DATEFORMAT`.
 fn mssql_cursor_literal(value: &str) -> String {
-    if chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.f").is_err() {
+    use chrono::DurationRound;
+    let iso = value.replacen(' ', "T", 1);
+    let Ok(dt) = chrono::NaiveDateTime::parse_from_str(&iso, "%Y-%m-%dT%H:%M:%S%.f") else {
         return escape_mssql_literal(value);
-    }
-    let fitted = match value.split_once('.') {
-        Some((whole, frac)) if frac.len() > 7 => format!("{whole}.{}", &frac[..7]),
-        _ => value.to_string(),
     };
+    // Rounded, not cut: a legacy DATETIME (n/300 s) converts to DATETIME2 rounded, so a cut bound sits below its own row.
+    let fitted = dt
+        .duration_round(chrono::TimeDelta::nanoseconds(100))
+        .map_or(iso, |r| {
+            let mut s = r.format("%Y-%m-%dT%H:%M:%S%.9f").to_string();
+            s.truncate(s.len() - 2);
+            s
+        });
     format!("CAST({} AS DATETIME2(7))", escape_mssql_literal(&fitted))
 }
 
-/// Quote `s` as a T-SQL `N'…'` unicode string literal. SQL Server escapes only
-/// the single quote (by doubling); backslash is a literal character (unlike
-/// Postgres `E'…'`). The `N` prefix keeps non-ASCII cursor values intact.
+/// Quote `s` as a T-SQL literal: plain `'…'` when ASCII (compares in a varchar key's own sort order), `N'…'` otherwise.
 pub(crate) fn escape_mssql_literal(s: &str) -> String {
+    // ponytail: a NON-ASCII value on a varchar key under a SQL_* collation still seeks by the Unicode order; exact fix needs the key's type in the plan.
     let mut out = String::with_capacity(s.len() + 4);
-    out.push_str("N'");
+    out.push_str(if s.is_ascii() { "'" } else { "N'" });
     for c in s.chars() {
         if c == '\'' {
             out.push('\'');
@@ -793,7 +795,7 @@ mod tests {
         );
         assert!(!first.sql.contains("LIMIT"), "{}", first.sql);
 
-        // Subsequent page: cursor as an N'…' literal (server implicit-casts),
+        // Subsequent page: cursor as a quoted literal (server implicit-casts),
         // FETCH after the ORDER BY.
         let next = build_keyset_query(
             "SELECT * FROM t",
@@ -802,7 +804,7 @@ mod tests {
             500,
             SourceType::Mssql,
         );
-        assert!(next.sql.contains("WHERE [id] > N'"), "{}", next.sql);
+        assert!(next.sql.contains("WHERE [id] > '"), "{}", next.sql);
         assert!(
             next.sql.contains("OFFSET 0 ROWS FETCH NEXT 500 ROWS ONLY"),
             "{}",
@@ -910,24 +912,30 @@ mod tests {
     fn a_mssql_timestamp_cursor_is_typed_so_a_datetime_column_accepts_it() {
         assert_eq!(
             mssql_cursor_literal("2024-01-01T10:00:00.456667"),
-            "CAST(N'2024-01-01T10:00:00.456667' AS DATETIME2(7))"
+            "CAST('2024-01-01T10:00:00.4566670' AS DATETIME2(7))"
         );
         assert_eq!(
             mssql_cursor_literal("2024-01-01T10:00:00.123456789"),
-            "CAST(N'2024-01-01T10:00:00.1234567' AS DATETIME2(7))",
-            "a nanosecond fraction is cut to what DATETIME2 holds"
+            "CAST('2024-01-01T10:00:00.1234568' AS DATETIME2(7))",
+            "a nanosecond fraction is rounded to the 100 ns DATETIME2 holds"
         );
         assert_eq!(
             mssql_cursor_literal("250001"),
-            "N'250001'",
+            "'250001'",
             "a number stays a plain literal"
         );
         assert_eq!(
             mssql_cursor_literal("2024-01-01"),
-            "N'2024-01-01'",
+            "'2024-01-01'",
             "a date stays a plain literal"
         );
-        assert_eq!(mssql_cursor_literal("O'Brien"), "N'O''Brien'");
+        assert_eq!(mssql_cursor_literal("O'Brien"), "'O''Brien'");
+        assert_eq!(mssql_cursor_literal("Zoë"), "N'Zoë'");
+        assert_eq!(
+            mssql_cursor_literal("2024-05-10 10:00:00"),
+            "CAST('2024-05-10T10:00:00.0000000' AS DATETIME2(7))",
+            "a space-form timestamp is sent in the DATEFORMAT-independent T form"
+        );
     }
 
     #[test]
@@ -997,7 +1005,7 @@ mod tests {
             Some(&cursor_with(Some(evil))),
             SourceType::Mssql,
         );
-        assert!(ms.sql.contains("> N'1'' OR ''1''=''1'"), "{}", ms.sql);
+        assert!(ms.sql.contains("> '1'' OR ''1''=''1'"), "{}", ms.sql);
     }
 
     #[test]

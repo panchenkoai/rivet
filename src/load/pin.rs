@@ -18,7 +18,8 @@ use anyhow::Context as _;
 ///
 /// Glue: one extra manifest listing per table, then `retype_plan`. Every path
 /// that cannot pin — no state, no store, no manifest, a run older than the
-/// per-run table — keeps the plan as typed and says so; it never fails the load.
+/// per-run table — keeps the plan as typed and says so; it fails the load only on the
+/// strict fit check a deferred plan still owes (`check_spec_fit`), or a refused plan.
 pub(super) fn pin_plan_to_its_run(
     plan: &load::plan::LoadPlan,
     state: Option<&StateStore>,

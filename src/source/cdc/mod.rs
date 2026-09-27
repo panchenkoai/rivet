@@ -1402,7 +1402,10 @@ pub(crate) fn create_change_stream(
             configured_tables,
         } => {
             let ci = capture_instance.as_deref().ok_or_else(|| {
-                anyhow::anyhow!("sqlserver cdc requires --capture-instance (e.g. dbo_orders)")
+                anyhow::anyhow!(
+                    "sqlserver cdc requires a capture instance: set `cdc.capture_instance:` on the \
+                     export (or `--capture-instance` with `rivet cdc`), e.g. dbo_orders"
+                )
             })?;
             // Resume from the checkpoint's position if one was persisted (SQL Server
             // has no server-side cursor — the from-LSN is what makes it at-least-once
@@ -1857,8 +1860,9 @@ pub(crate) fn resolve_checkpoint(raw: &str, config_dir: &std::path::Path) -> Pat
         log::warn!(
             "cdc: using the existing checkpoint at `{}` (relative to the working \
              directory). rivet now resolves a relative `cdc.checkpoint:` against the \
-             config's directory, so this run would otherwise have re-anchored at the \
-             current log position and skipped everything since. Move it to `{}` — or \
+             config's directory, so this run would otherwise have started without it \
+             (MySQL/MongoDB re-anchor at the current position and skip everything since; \
+             SQL Server re-reads the retained change table). Move it to `{}` — or \
              make the path absolute — so the location no longer depends on where \
              rivet is invoked from.",
             p.display(),
@@ -2531,6 +2535,29 @@ mod tests {
         assert!(
             !msg.contains("REPLICATION SLAVE") && !msg.contains("binlog_format"),
             "a checkpoint-file error must NOT carry the binlog-grants hint: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_missing_mssql_capture_instance_names_the_config_key() {
+        let cfg = CdcConfig {
+            config_dir: std::path::PathBuf::from("."),
+            url: "sqlserver://sa:x@127.0.0.1:1/rivet".into(),
+            checkpoint: None,
+            drain: DrainMode::BoundedAtOpen,
+            tls: None,
+            engine: CdcEngineOpts::Mssql {
+                capture_instance: None,
+                configured_tables: Vec::new(),
+            },
+        };
+        let err = match create_change_stream(&cfg, PeekBound::Unbounded) {
+            Ok(_) => panic!("no capture instance must error"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            err.contains("set `cdc.capture_instance:` on the export"),
+            "{err}"
         );
     }
 

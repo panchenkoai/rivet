@@ -803,7 +803,7 @@ mod tests {
         let _ = detect_with_base(&mut src, "SELECT * FROM warranty", None).unwrap();
         assert!(
             src.seen_sql.iter().any(|s| s.contains("reltuples")
-                || s.contains("dm_db_partition_stats")
+                || s.contains("sys.partitions")
                 || s.contains("TABLE_ROWS")),
             "expected a scan-free row estimate; saw: {:?}",
             src.seen_sql

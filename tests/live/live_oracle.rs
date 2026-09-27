@@ -1781,3 +1781,77 @@ fn the_type_report_marks_a_timestamp_9_column_lossy() {
     assert_eq!(fidelity("T9"), "lossy");
     assert_eq!(fidelity("T6"), "exact");
 }
+
+/// A coalesce-mode incremental cursor advances on Oracle: run 2 over an unchanged table
+/// delivers nothing, and a row added after run 1 lands exactly once.
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn a_coalesce_cursor_advances_and_never_re_exports() {
+    require_alive(LiveService::Oracle);
+    let t = OracleTable::create(
+        "ora_coal",
+        "id NUMBER(10) PRIMARY KEY, upd TIMESTAMP(6), ins TIMESTAMP(6) NOT NULL",
+    );
+    ora_exec(&format!(
+        "INSERT INTO {} SELECT LEVEL, CASE WHEN MOD(LEVEL, 2) = 0 THEN TIMESTAMP '2024-02-01 00:00:00' \
+         + NUMTODSINTERVAL(LEVEL, 'SECOND') END, TIMESTAMP '2024-01-01 00:00:00' \
+         + NUMTODSINTERVAL(LEVEL, 'SECOND') FROM dual CONNECT BY LEVEL <= 20",
+        t.name()
+    ));
+    let out = tempfile::tempdir().unwrap();
+    let rig = Rig::oracle_batch(t.name())
+        .mode("incremental")
+        .export_line("cursor_column: UPD")
+        .export_line("cursor_fallback_column: INS")
+        .export_line("incremental_cursor_mode: coalesce")
+        .dest_path(out.path().to_path_buf());
+    rig.run_ok();
+    rig.run_ok();
+    ora_exec(&format!(
+        "INSERT INTO {} VALUES (21, TIMESTAMP '2025-01-01 00:00:00', TIMESTAMP '2025-01-01 00:00:00')",
+        t.name()
+    ));
+    rig.run_ok();
+    let mut all: Vec<i64> = Vec::new();
+    for e in std::fs::read_dir(out.path()).unwrap().flatten() {
+        if e.path().extension().is_some_and(|x| x == "parquet") {
+            all.extend(parquet_cells_file(&e.path()));
+        }
+    }
+    all.sort_unstable();
+    assert_eq!(
+        all,
+        (1..=21).collect::<Vec<_>>(),
+        "each row exactly once across three runs — run 2 over an unchanged table must add nothing"
+    );
+}
+
+/// An incremental cursor on a TIMESTAMP(9) column is refused up front: rivet stores the
+/// cursor to the microsecond, so the boundary row would be exported again on every run.
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn an_incremental_cursor_on_a_nanosecond_timestamp_is_refused_before_it_re_exports() {
+    require_alive(LiveService::Oracle);
+    let t = OracleTable::create(
+        "ora_ts9",
+        "id NUMBER(10) PRIMARY KEY, ts TIMESTAMP(9) NOT NULL",
+    );
+    ora_exec(&format!(
+        "INSERT INTO {} SELECT LEVEL, TIMESTAMP '2024-01-01 00:00:00.123456789' \
+         + NUMTODSINTERVAL(LEVEL, 'SECOND') FROM dual CONNECT BY LEVEL <= 10",
+        t.name()
+    ));
+    let rig = Rig::oracle_batch(t.name())
+        .mode("incremental")
+        .export_line("cursor_column: TS");
+    let said = rig.run_expect_fail();
+    assert!(
+        said.contains("oracle: incremental cursor column TS is TIMESTAMP(9)"),
+        "the refusal names the column and its precision:\n{said}"
+    );
+    let files = files_with_extension(&rig.out_dir(), "parquet");
+    assert!(
+        files.is_empty(),
+        "the refusal comes before any part: {files:?}"
+    );
+}

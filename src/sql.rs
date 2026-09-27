@@ -286,11 +286,11 @@ pub(crate) fn row_estimate_sql(source_type: SourceType, table_ident: &str) -> Op
         // the chunk boundaries come from min/max regardless. (An exact count would
         // need a full `COUNT(*)` scan — the very source-harm this function avoids.)
         SourceType::Mysql => None,
-        // `sys.dm_db_partition_stats` is a maintained running row count (effectively
-        // exact), not a sampled estimate — the same fast probe the SQL Server
+        // `sys.partitions.rows` is a maintained running row count (effectively
+        // exact), not a sampled estimate, readable without VIEW DATABASE STATE — the same probe the SQL Server
         // preflight uses, over the heap/clustered index (index_id 0/1).
         SourceType::Mssql => Some(format!(
-            "SELECT SUM(p.row_count) FROM sys.dm_db_partition_stats p \
+            "SELECT SUM(p.rows) FROM sys.partitions p \
              WHERE p.object_id = OBJECT_ID('{table_ident}') AND p.index_id IN (0,1)"
         )),
         // No scan-free row estimate for MongoDB in this SQL helper — the
@@ -529,7 +529,7 @@ mod tests {
         let ms =
             row_estimate_sql(SourceType::Mssql, "dbo.warranty").expect("MSSQL has an estimate");
         assert!(
-            ms.contains("dm_db_partition_stats") && ms.contains("OBJECT_ID('dbo.warranty')"),
+            ms.contains("sys.partitions") && ms.contains("OBJECT_ID('dbo.warranty')"),
             "{ms}"
         );
         assert!(!ms.contains("COUNT"), "estimate must not scan: {ms}");

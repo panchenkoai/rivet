@@ -490,11 +490,28 @@ impl OracleSource {
             }
             None => stmt.query(&[]).ora().map_err(timed_out)?,
         };
-        let metas = cursor.columns()[..projection.native.len()].to_vec();
+        let (row_index, metas) = result_columns(
+            cursor.columns(),
+            projection.native.len(),
+            &projection.empty_flags,
+        );
+        let mut native = projection.native.clone();
+        native.extend(metas[projection.native.len()..].iter().map(native_type));
+        let cursor_cols: Vec<(&str, bool, &str)> = metas
+            .iter()
+            .zip(&native)
+            .map(|(m, n)| {
+                let sub = arrow_convert::sub_microsecond(&kind::native_label(m), m.scale());
+                (m.name(), sub, n.as_str())
+            })
+            .collect();
+        if let Some(why) = sub_micro_cursor_refusal(request.incremental, &cursor_cols) {
+            anyhow::bail!("{why}");
+        }
         let empty_flags = projection.empty_flags.clone();
         let schema: SchemaRef = Arc::new(arrow_convert::oracle_schema(
             &metas,
-            &projection.native,
+            &native,
             request.column_overrides,
         )?);
         ctl.raise_configured_ceiling(request.tuning.effective_batch_size(Some(&schema)));
@@ -504,7 +521,13 @@ impl OracleSource {
         let mut emitted = false;
         let mut cap_applied = false;
         let mut emit = |buf: &mut Vec<Row>, ctl: &mut AdaptiveBatchController| -> Result<()> {
-            let batch = arrow_convert::rows_to_batch(buf, &schema, max_value_bytes, &empty_flags)?;
+            let batch = arrow_convert::rows_to_batch(
+                buf,
+                &schema,
+                max_value_bytes,
+                &empty_flags,
+                &row_index,
+            )?;
             let n = buf.len();
             buf.clear();
             sink.on_batch(&batch)?;
@@ -546,6 +569,48 @@ impl OracleSource {
         }
         Ok(())
     }
+}
+
+/// The refusal for an incremental cursor on a TIMESTAMP finer than the microsecond rivet
+/// stores: the saved cursor falls below its own row, which every run then re-exports.
+fn sub_micro_cursor_refusal(
+    cursor: Option<&crate::plan::IncrementalCursorPlan>,
+    cols: &[(&str, bool, &str)],
+) -> Option<String> {
+    let c = cursor?;
+    [
+        Some(c.primary_column.as_str()),
+        c.fallback_column.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|want| {
+        cols.iter()
+            .find(|(name, sub, _)| *sub && name.eq_ignore_ascii_case(want))
+            .map(|(name, _, native)| {
+                format!(
+                    "oracle: incremental cursor column {name} is {} — rivet keeps timestamps \
+                         to the microsecond, so the saved cursor falls below its own row and every \
+                         run would export that row again. Read it as CAST({name} AS TIMESTAMP(6)) \
+                         in a `query:`, or use a cursor column with at most 6 fractional digits.",
+                    native.to_uppercase()
+                )
+            })
+    })
+}
+
+/// The result columns the schema carries, and where each sits in a row: the query's own
+/// columns, then whatever an outer wrapper added after the LOB empty-value flags (the
+/// coalesce cursor), skipping the flags themselves.
+fn result_columns<M: Clone>(
+    all: &[M],
+    native: usize,
+    empty_flags: &[Option<usize>],
+) -> (Vec<usize>, Vec<M>) {
+    let tail = native + empty_flags.iter().flatten().count();
+    let row_index: Vec<usize> = (0..native).chain(tail..all.len()).collect();
+    let metas = row_index.iter().map(|&i| all[i].clone()).collect();
+    (row_index, metas)
 }
 
 impl Source for OracleSource {
@@ -687,6 +752,50 @@ pub(crate) fn introspect_oracle_table_for_chunking(
 
 #[cfg(test)]
 mod tests {
+
+    /// Only a cursor (primary or coalesce fallback) finer than the microsecond is refused.
+    #[test]
+    fn a_cursor_finer_than_a_microsecond_is_refused_and_nothing_else() {
+        use crate::config::IncrementalCursorMode;
+        let plan = |fallback: Option<&str>| crate::plan::IncrementalCursorPlan {
+            primary_column: "upd".into(),
+            fallback_column: fallback.map(str::to_string),
+            mode: IncrementalCursorMode::Coalesce,
+            settle: None,
+        };
+        let cols = [
+            ("UPD", false, "timestamp(6)"),
+            ("INS", true, "timestamp(9)"),
+        ];
+        assert_eq!(
+            super::sub_micro_cursor_refusal(Some(&plan(None)), &cols),
+            None
+        );
+        let why =
+            super::sub_micro_cursor_refusal(Some(&plan(Some("ins"))), &cols).expect("refused");
+        assert!(
+            why.starts_with("oracle: incremental cursor column INS is TIMESTAMP(9)"),
+            "{why}"
+        );
+        assert_eq!(
+            super::sub_micro_cursor_refusal(None, &cols),
+            None,
+            "not incremental"
+        );
+    }
+
+    /// The schema skips the LOB empty-value flags and keeps a wrapper's trailing cursor column.
+    #[test]
+    fn result_columns_keep_the_coalesce_cursor_and_skip_the_lob_flags() {
+        let all = ["A", "B", "C", "FLAG_B", "_rivet_coalesced_cursor"];
+        let (idx, metas) = super::result_columns(&all, 3, &[None, Some(3), None]);
+        assert_eq!(idx, vec![0, 1, 2, 4]);
+        assert_eq!(metas, vec!["A", "B", "C", "_rivet_coalesced_cursor"]);
+        let (idx, metas) = super::result_columns(&["A", "FLAG_A"], 1, &[Some(1)]);
+        assert_eq!((idx, metas), (vec![0], vec!["A"]));
+        let (idx, _) = super::result_columns(&["A", "B"], 2, &[None, None]);
+        assert_eq!(idx, vec![0, 1]);
+    }
     use super::*;
 
     #[test]

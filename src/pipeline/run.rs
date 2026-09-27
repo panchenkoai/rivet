@@ -491,15 +491,12 @@ pub fn run(
     summary_output: Option<&Path>,
     json_output: bool,
 ) -> Result<()> {
-    // F-NEW-B (0.7.5 audit): `--force` is scoped to whichever gate it
-    // overrides (today: the `_SUCCESS`-already-present refusal on
-    // resume).  When the operator passes `--force` without `--resume`,
-    // the flag is a no-op — surface that explicitly so a typo or
-    // copy-paste mistake does not pass silently.
+    // `--force` without `--resume` only silences the rerun-accumulation warning; say so.
     if force && !resume {
         log::warn!(
-            "--force without --resume is a no-op today (force only overrides the resume safety \
-             gate against a destination prefix whose _SUCCESS is already present)"
+            "--force without --resume only silences the rerun-accumulation warning (a prefix that \
+             already holds a prior run); it overrides nothing else — with --resume it overrides the \
+             gate against a prefix whose _SUCCESS is already present"
         );
     }
     let config = Config::load_with_params(config_path, params)?;

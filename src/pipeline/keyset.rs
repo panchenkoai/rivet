@@ -424,6 +424,7 @@ fn run_keyset_parallel(
     } else {
         None
     };
+    let resume_run_id = resume_anchor(state, &plan.export_name, resume_run_id, true, &key)?;
 
     // Incremental (iteration 3): a FRESH run seeks past the persisted anchor
     // (`floor`) up to the source max AT OPEN (`ceil`) — bounding the last range at
@@ -472,20 +473,10 @@ fn run_keyset_parallel(
         (Some(rid), Some(st)) => {
             summary.run_id = rid.clone();
             summary.resumed = true;
-            let rows = st.load_keyset_ranges(&plan.export_name, rid, &key)?;
-            if rows.is_empty() {
-                // Anchor set but no persisted ranges (a crash between set_resume_
-                // run_id and persist_keyset_ranges — nothing committed), or ranges
-                // sampled on ANOTHER key column (the recipe changed): re-sample +
-                // persist under this run_id and start over. No skip.
-                let fresh = sample_parallel_ranges(src, plan, &key, parallel, floor_r, ceil_r)?;
-                st.persist_keyset_ranges(&plan.export_name, rid, &key, &lo_hi_pairs(&fresh))?;
-                fresh
-            } else {
-                rows.into_iter()
-                    .map(|r| (r.range_index as usize, r.lo, r.hi, r.done))
-                    .collect()
-            }
+            st.load_keyset_ranges(&plan.export_name, rid, &key)?
+                .into_iter()
+                .map(|r| (r.range_index as usize, r.lo, r.hi, r.done))
+                .collect()
         }
         (None, Some(st)) if checkpoint => {
             // Fresh checkpoint run: sample, persist the boundaries (all done=0),
@@ -838,6 +829,41 @@ fn is_last_page(rows: usize, page_size: usize) -> bool {
     rows < page_size
 }
 
+/// Whether a crash anchor was written by this runner shape: only a parallel run persists ranges for it.
+fn anchor_is_own(parallel_runner: bool, anchor_has_ranges: bool) -> bool {
+    parallel_runner == anchor_has_ranges
+}
+
+/// The crash anchor to resume, or `None` (anchor cleared) when another runner shape wrote it.
+fn resume_anchor(
+    state: Option<&StateStore>,
+    export_name: &str,
+    rid: Option<String>,
+    parallel_runner: bool,
+    key: &str,
+) -> Result<Option<String>> {
+    let (Some(rid), Some(st)) = (rid.clone(), state) else {
+        return Ok(rid);
+    };
+    // A parallel run's ranges must be on THIS key; any ranges at all mark a parallel anchor.
+    let on_key = parallel_runner.then_some(key);
+    let anchor_has_ranges = st.has_keyset_ranges(export_name, &rid, on_key)?;
+    if anchor_is_own(parallel_runner, anchor_has_ranges) {
+        return Ok(Some(rid));
+    }
+    let why = if parallel_runner {
+        "left no parallel ranges on this key (a sequential run, or one keyed differently)"
+    } else {
+        "was a parallel keyset run, which a sequential one cannot continue"
+    };
+    log::warn!(
+        "export '{export_name}': interrupted run {rid} {why} — starting a fresh pass; its parts \
+         stay unmanifested and are not read"
+    );
+    st.clear_resume_run_id(export_name)?;
+    Ok(None)
+}
+
 /// Does a sequential keyset run seek from the persisted cursor (crash recovery,
 /// or `keyset_incremental`) rather than from the start of the key space?
 fn seeks_from_persisted_cursor(
@@ -913,7 +939,13 @@ pub(crate) fn run_keyset(
     // checkpoint no longer implies incremental-by-key).
     let resume_run_id: Option<String> = if kp.checkpoint {
         match state {
-            Some(st) => st.get_resume_run_id(&plan.export_name)?,
+            Some(st) => resume_anchor(
+                Some(st),
+                &plan.export_name,
+                st.get_resume_run_id(&plan.export_name)?,
+                false,
+                &kp.key_column,
+            )?,
             None => None,
         }
     } else {
@@ -1208,6 +1240,80 @@ pub(crate) fn run_keyset(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn resume_anchor_keeps_its_own_shape_and_clears_the_other() {
+        let st = StateStore::open_in_memory().unwrap();
+        let ranges = [(None, Some("5".to_string())), (Some("5".to_string()), None)];
+        let anchored = |rid: &str, ranged_on: Option<&str>| {
+            st.set_resume_run_id("e", rid).unwrap();
+            if let Some(key) = ranged_on {
+                st.persist_keyset_ranges("e", rid, key, &ranges).unwrap();
+            }
+        };
+        anchored("par", Some("id"));
+        assert_eq!(
+            resume_anchor(Some(&st), "e", Some("par".into()), true, "id").unwrap(),
+            Some("par".into())
+        );
+        assert_eq!(
+            st.get_resume_run_id("e").unwrap(),
+            Some("par".into()),
+            "kept"
+        );
+        assert_eq!(
+            resume_anchor(Some(&st), "e", Some("par".into()), false, "id").unwrap(),
+            None
+        );
+        assert_eq!(
+            st.get_resume_run_id("e").unwrap(),
+            None,
+            "a sequential run clears a parallel anchor"
+        );
+
+        anchored("seq", None);
+        assert_eq!(
+            resume_anchor(Some(&st), "e", Some("seq".into()), false, "id").unwrap(),
+            Some("seq".into())
+        );
+        assert_eq!(
+            resume_anchor(Some(&st), "e", Some("seq".into()), true, "id").unwrap(),
+            None
+        );
+        assert_eq!(
+            st.get_resume_run_id("e").unwrap(),
+            None,
+            "a parallel run clears a sequential anchor"
+        );
+
+        anchored("other", Some("ts"));
+        assert_eq!(
+            resume_anchor(Some(&st), "e", Some("other".into()), true, "id").unwrap(),
+            None,
+            "ranges on another key do not make a parallel anchor on this one"
+        );
+        assert_eq!(
+            resume_anchor(None, "e", Some("x".into()), true, "id").unwrap(),
+            Some("x".into())
+        );
+    }
+
+    #[test]
+    fn an_anchor_belongs_to_the_runner_shape_that_wrote_it() {
+        assert!(anchor_is_own(true, true), "parallel resumes its own ranges");
+        assert!(
+            anchor_is_own(false, false),
+            "sequential resumes its own pages"
+        );
+        assert!(
+            !anchor_is_own(true, false),
+            "parallel never adopts a sequential anchor"
+        );
+        assert!(
+            !anchor_is_own(false, true),
+            "sequential never continues a parallel anchor"
+        );
+    }
+
     use super::*;
     use crate::config::SourceType;
 

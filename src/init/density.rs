@@ -23,7 +23,7 @@ pub(crate) enum EstimateMethod {
     /// strategy boundary is near; a catalog error changes nothing).
     CatalogTriaged,
     /// The engine's catalog figure is near-exact by construction
-    /// (MSSQL `dm_db_partition_stats`).
+    /// (MSSQL `sys.partitions`).
     CatalogExact,
     /// The stratified index probe ran; the snapshot's rows are sampled.
     Probed,

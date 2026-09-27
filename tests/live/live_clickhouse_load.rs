@@ -760,3 +760,119 @@ fn a_load_that_dies_after_adopting_the_table_resumes_into_the_log() {
         pg_rows(&mut c, &tbl)
     );
 }
+
+/// A timestamp without a zone keeps its wall-clock value in ClickHouse whatever the
+/// reading SESSION's time zone (RED against a column declared in a zone). The server's own
+/// zone is not flipped here: the stand's ClickHouse is shared and runs UTC.
+#[test]
+#[ignore = "live: requires clickhouse + fake-gcs + postgres"]
+fn a_naive_timestamp_reads_back_the_same_wall_clock_in_any_session_zone() {
+    require_alive(LiveService::ClickHouse);
+    require_alive(LiveService::FakeGcs);
+    ensure_gcs_bucket(BUCKET);
+    let mut c = pg_connect();
+    let tbl = unique_name("rivet_ch_naive");
+    c.batch_execute(&format!(
+        "CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, ts TIMESTAMP); \
+         INSERT INTO {tbl} VALUES (1, TIMESTAMP '2024-01-01 00:00:00'), (2, TIMESTAMP '2024-06-30 23:30:15.5')"
+    ))
+    .expect("seed");
+    let _t = PgTable::adopt(tbl.clone());
+    let db = Db::new("rivet_chtest");
+    let rig = batch_into_clickhouse(Rig::pg_batch(&tbl).mode("full"), &db);
+    rig.run_ok();
+    load(&rig);
+    let table = format!("{}.{tbl}", db.0);
+    for zone in ["UTC", "Asia/Tokyo", "America/Los_Angeles"] {
+        let got = clickhouse_rows_tsv(&format!(
+            "SELECT toString(ts), toString(toDate(ts)) FROM {table} ORDER BY id \
+             SETTINGS session_timezone = '{zone}' FORMAT TSV"
+        ));
+        assert_eq!(
+            got.trim(),
+            "2024-01-01 00:00:00.000000\t2024-01-01\n2024-06-30 23:30:15.500000\t2024-06-30",
+            "a zone-less value must read back as written in session zone {zone}"
+        );
+    }
+}
+
+/// A column added between the first full pass and the first delta: the adoption refuses,
+/// and the remedy its message names must keep the baseline rows in the view.
+#[test]
+#[ignore = "live: requires clickhouse + fake-gcs + postgres"]
+fn a_column_added_before_the_first_delta_is_refused_and_its_remedy_keeps_the_baseline() {
+    require_alive(LiveService::ClickHouse);
+    require_alive(LiveService::FakeGcs);
+    ensure_gcs_bucket(BUCKET);
+    let (tbl, _t, mut c) = pg_batch_seeded("rivet_ch_addcol", 5);
+    let db = Db::new("rivet_chtest");
+    let rig = batch_into_clickhouse(
+        Rig::pg_batch(&tbl)
+            .mode("incremental")
+            .export_line("cursor_column: updated_at"),
+        &db,
+    );
+    let table = format!("{}.{tbl}", db.0);
+    rig.run_ok();
+    load(&rig);
+    c.batch_execute(&format!(
+        "ALTER TABLE {tbl} ADD COLUMN c INT; \
+         UPDATE {tbl} SET v = 99, c = 7, updated_at = TIMESTAMP '2026-02-01' WHERE id = 1"
+    ))
+    .expect("changes");
+    rig.run_ok();
+    let refused = rig.load_args_env(&[], &[(PASSWORD_ENV, CLICKHOUSE_PASSWORD)]);
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&refused.stdout),
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(!refused.status.success(), "the adoption refuses:\n{said}");
+    assert!(
+        said.contains("add the export's new column(s) to the table (ALTER TABLE … ADD COLUMN")
+            && said.contains("Do not rename the table aside"),
+        "the refusal names the lossless remedy and warns off the rename:\n{said}"
+    );
+    ch(&format!("ALTER TABLE {table} ADD COLUMN c Nullable(Int32)"));
+    load(&rig);
+    assert_eq!(
+        clickhouse_rows(&format!("SELECT id, v FROM {table} ORDER BY id FORMAT TSV")),
+        pg_rows(&mut c, &tbl),
+        "the baseline rows survive the remedy"
+    );
+}
+
+/// An incremental first pass followed by an idle run: the load lands the table and
+/// exits 0 — an empty delta is "up to date", not a failure.
+#[test]
+#[ignore = "live: requires clickhouse + fake-gcs + postgres"]
+fn an_idle_incremental_run_after_the_first_pass_loads_cleanly() {
+    require_alive(LiveService::ClickHouse);
+    require_alive(LiveService::FakeGcs);
+    ensure_gcs_bucket(BUCKET);
+    let (tbl, _t, mut c) = pg_batch_seeded("rivet_ch_idle", 5);
+    let db = Db::new("rivet_chtest");
+    let rig = batch_into_clickhouse(
+        Rig::pg_batch(&tbl)
+            .mode("incremental")
+            .export_line("cursor_column: updated_at"),
+        &db,
+    );
+    let loaded = || {
+        clickhouse_rows(&format!(
+            "SELECT id, v FROM {}.{tbl} ORDER BY id FORMAT TSV",
+            db.0
+        ))
+    };
+    rig.run_ok();
+    rig.run_ok();
+    load(&rig);
+    assert_eq!(loaded(), pg_rows(&mut c, &tbl));
+    c.batch_execute(&format!(
+        "UPDATE {tbl} SET v = 99, updated_at = TIMESTAMP '2026-02-01' WHERE id = 1"
+    ))
+    .expect("change");
+    rig.run_ok();
+    load(&rig);
+    assert_eq!(loaded(), pg_rows(&mut c, &tbl), "a later delta still lands");
+}

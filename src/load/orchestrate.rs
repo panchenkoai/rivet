@@ -1895,7 +1895,16 @@ fn load_one_incremental(
             let mut rows = 0u64;
             let mut report = None;
             let landed_table = split.first_pass.is_some();
-            let has_deltas = split.has_deltas();
+            // Idle deltas (runs with no parts) leave nothing to append; the closing record covers them.
+            let delta_uris = match split.has_deltas() {
+                true => buffer_uris(load::reconcile::select_load_uris(
+                    store,
+                    &plan.gcs_prefix,
+                    &split.deltas,
+                )?),
+                false => None,
+            };
+            let has_deltas = delta_uris.is_some();
             if let Some(first) = split.first_pass {
                 // The runs this leg consumes: the whole-table run and those it supersedes.
                 let mut landed_ids = split.superseded.clone();
@@ -1954,9 +1963,7 @@ fn load_one_incremental(
                 legs.landed(&landed_ids, r.rows_loaded);
                 report = Some(IncrementalReport::Table(r));
             }
-            if has_deltas {
-                let uris =
-                    load::reconcile::select_load_uris(store, &plan.gcs_prefix, &split.deltas)?;
+            if let Some(uris) = delta_uris {
                 let manifests: Vec<_> = split.deltas.iter().map(|(_, m)| m.clone()).collect();
                 let integrity = load::reconcile::reconcile(&manifests, allow_source_drift)?;
                 let ownership = if landed_table {

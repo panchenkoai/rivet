@@ -1224,3 +1224,93 @@ fn manifest_schema_fingerprint(dir: &std::path::Path) -> String {
         .unwrap_or_else(|| panic!("manifest.json has no schema_fingerprint: {text}"))
         .to_string()
 }
+
+/// Seeded PG table of `n` ids for the runner-shape resume tests.
+fn pg_shape_table(prefix: &str, n: usize) -> String {
+    let table = unique_name(prefix);
+    pg_connect()
+        .batch_execute(&format!(
+            "DROP TABLE IF EXISTS {table};
+             CREATE TABLE {table} (id BIGINT PRIMARY KEY, payload INT NOT NULL);
+             INSERT INTO {table} SELECT g, g FROM generate_series(1, {n}) g;"
+        ))
+        .unwrap();
+    table
+}
+
+/// Every row once in the manifest and in the parts it declares (orphans of the failed run excluded).
+fn assert_every_row_once(rig: &Rig, n: usize) {
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(rig.out_dir().join("manifest.json")).unwrap())
+            .expect("destination manifest.json");
+    let declared = |sql: &str| duckdb_declared_dir_scalar(&rig.out_dir(), sql);
+    assert_eq!(
+        (
+            manifest["row_count"].as_i64(),
+            declared("count(*)"),
+            declared("count(DISTINCT id)"),
+            declared("min(id)"),
+            declared("max(id)"),
+        ),
+        (Some(n as i64), n as i64, n as i64, 1, n as i64),
+        "manifest rows, declared rows, distinct ids, id range"
+    );
+}
+
+/// A parallel keyset run that fails part-way, resumed after `parallel:` was lowered to 1:
+/// the sequential runner must not continue a checkpoint the parallel runner wrote.
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn a_parallel_keyset_failure_resumed_sequentially_exports_every_row_once() {
+    require_alive(LiveService::Postgres);
+    let table = pg_shape_table("pk_shape_ps", 2000);
+    let rig = crash_rig(Rig::pg_batch(&format!("public.{table}")));
+    rig.run_ok();
+    let _ = std::fs::remove_dir_all(rig.out_dir());
+    let failed = rig.run_with_env("RIVET_TEST_ERROR_AT", "keyset_parallel_worker:3");
+    assert!(!failed.status.success(), "the worker error fails run 2");
+    let rig = rig.restage(
+        "chunked",
+        &[
+            "chunk_by_key: id",
+            "parallel: 1",
+            "chunk_checkpoint: true",
+            "chunk_size: 200",
+        ],
+    );
+    rig.run_ok();
+    assert_every_row_once(&rig, 2000);
+    let _ = pg_connect().execute(&format!("DROP TABLE IF EXISTS {table}"), &[]);
+}
+
+/// A sequential keyset run that crashes part-way, resumed after `parallel:` was raised:
+/// the parallel runner must not adopt the sequential run's pages beside its own full pass.
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn a_sequential_keyset_crash_resumed_in_parallel_exports_every_row_once() {
+    require_alive(LiveService::Postgres);
+    let table = pg_shape_table("pk_shape_sp", 2000);
+    let rig = Rig::pg_batch(&format!("public.{table}")).restage(
+        "chunked",
+        &[
+            "chunk_by_key: id",
+            "parallel: 1",
+            "chunk_checkpoint: true",
+            "chunk_size: 200",
+        ],
+    );
+    let crashed = rig.run_with_env("RIVET_TEST_PANIC_AT", "after_keyset_page:2");
+    assert!(!crashed.status.success(), "the injected panic fails run 1");
+    let rig = rig.restage(
+        "chunked",
+        &[
+            "chunk_by_key: id",
+            "parallel: 4",
+            "chunk_checkpoint: true",
+            "chunk_size: 200",
+        ],
+    );
+    rig.run_ok();
+    assert_every_row_once(&rig, 2000);
+    let _ = pg_connect().execute(&format!("DROP TABLE IF EXISTS {table}"), &[]);
+}

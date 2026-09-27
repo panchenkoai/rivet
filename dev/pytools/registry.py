@@ -19,8 +19,31 @@ def load() -> dict:
 
 
 def source(name: str) -> dict:
-    """`{container, url}` of one stand source (`postgres`, `mongo_rs`, …)."""
-    return load()["sources"][name]
+    """`{container, url}` of one stand source; the running container publishing the URL's
+    port stands in when compose has recreated the declared one under another index."""
+    x = dict(load()["sources"][name])
+    x["container"] = _running_container(x["container"], x["url"])
+    return x
+
+
+def _running_container(declared: str, url: str) -> str:
+    """`declared` if it runs, else the running container that publishes `url`'s port."""
+    import subprocess
+    from urllib.parse import urlparse
+
+    def ps(*filters: str) -> list[str]:
+        try:
+            out = subprocess.run(["docker", "ps", "--format", "{{.Names}}", *filters],
+                                 capture_output=True, text=True, timeout=20).stdout
+        except (OSError, subprocess.SubprocessError):
+            return []
+        return [n for n in out.split() if n]
+
+    if declared in ps("--filter", f"name=^{declared}$"):
+        return declared
+    port = urlparse(url).port
+    found = ps("--filter", f"publish={port}") if port else []
+    return found[0] if len(found) == 1 else declared
 
 
 def bq_tmp(name: str) -> str:

@@ -600,3 +600,291 @@ fn mongo_cdc_dropping_another_collection_does_not_stop_capture() {
         "a drop of a collection nobody captures must not stop this export's capture"
     );
 }
+
+/// Keyset over a DATETIME2(7) primary key (100 ns ticks, finer than the microsecond the
+/// seek cursor keeps) either reads every row once or refuses — it must not loop or
+/// re-read a page.
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn keyset_over_an_mssql_datetime2_7_key_reads_every_row_once_or_refuses() {
+    let table = unique_name("dt2_key");
+    mssql_exec(&format!(
+        "IF OBJECT_ID('dbo.{table}') IS NOT NULL DROP TABLE dbo.{table}; \
+         CREATE TABLE dbo.{table} (ts DATETIME2(7) NOT NULL PRIMARY KEY, id INT NOT NULL); \
+         INSERT INTO dbo.{table} VALUES ('2024-01-01 00:00:01.1234567', 1), \
+           ('2024-01-01 00:00:01.1234568', 2), ('2024-01-01 00:00:02.1234567', 3), \
+           ('2024-01-01 00:00:03.1234567', 4)"
+    ));
+    let rig = Rig::mssql_batch(&table)
+        .duckdb_oracle()
+        .mode("chunked")
+        .export_line("chunk_by_key: ts")
+        .export_line("chunk_size: 1");
+    let out = rig
+        .run_with_envs_bounded(&[], std::time::Duration::from_secs(60))
+        .expect("a keyset run over four rows must finish, not loop");
+    let said = String::from_utf8_lossy(&out.stderr).to_string();
+    let refused = !out.status.success();
+    let got = if refused {
+        None
+    } else {
+        Some(duckdb_distinct_i64_set(rig.oracle_dir(), "id"))
+    };
+    let rows = if refused {
+        0
+    } else {
+        duckdb_parquet_rows(rig.oracle_dir())
+    };
+    mssql_exec(&format!("DROP TABLE dbo.{table}"));
+    match got {
+        None => assert!(
+            said.contains("ended on the same 'ts' value it started after")
+                && said.contains("the seek cannot advance"),
+            "the refusal says why the seek cannot advance:\n{said}"
+        ),
+        Some(ids) => {
+            assert_eq!(ids, (1..=4).collect(), "every row");
+            assert_eq!(rows, 4, "exactly once");
+        }
+    }
+}
+
+/// Keyset over a `varchar` key under SQL Server's default SQL collation: the page is
+/// ordered by the column's non-Unicode sort, so the seek must compare in the same order —
+/// an `N'…'` literal compares by Unicode rules and skips keys (`'a-b' < 'ab'` in varchar,
+/// `N'a-b' > N'ab'` in nvarchar).
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn keyset_over_an_mssql_varchar_key_reads_every_key_under_the_default_sql_collation() {
+    let table = unique_name("ks_vc");
+    let keys: Vec<String> = (0..60)
+        .flat_map(|i| [format!("x-{i:02}"), format!("x{i:02}"), format!("x'{i:02}")])
+        .collect();
+    let values = keys
+        .iter()
+        .enumerate()
+        .map(|(i, k)| format!("('{}', {i})", k.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    mssql_exec(&format!(
+        "IF OBJECT_ID('dbo.{table}') IS NOT NULL DROP TABLE dbo.{table}; \
+         CREATE TABLE dbo.{table} (k VARCHAR(20) COLLATE SQL_Latin1_General_CP1_CI_AS NOT NULL \
+           PRIMARY KEY, id INT NOT NULL); \
+         INSERT INTO dbo.{table} VALUES {values}"
+    ));
+    let rig = Rig::mssql_batch(&table)
+        .duckdb_oracle()
+        .mode("chunked")
+        .export_line("chunk_by_key: k")
+        .export_line("chunk_size: 7");
+    let out = rig.run_args(&[]);
+    let ok = out.status.success();
+    let ids = if ok {
+        duckdb_distinct_i64_set(rig.oracle_dir(), "id")
+    } else {
+        Default::default()
+    };
+    let rows = if ok {
+        duckdb_parquet_rows(rig.oracle_dir())
+    } else {
+        0
+    };
+    mssql_exec(&format!("DROP TABLE dbo.{table}"));
+    assert!(ok, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(ids.len(), keys.len(), "every key exported");
+    assert_eq!(rows, keys.len() as i64, "each exactly once");
+}
+
+/// Parallel keyset over a legacy `DATETIME` key for a login whose language reads dates
+/// day-first: every seek and range-bound literal must parse the same instant under any `DATEFORMAT`.
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn keyset_over_an_mssql_datetime_key_reads_every_row_for_a_day_first_login() {
+    let table = unique_name("ks_dmy");
+    let login = unique_name("rivet_dmy");
+    let pw = "Rivet_Passw0rd!";
+    let drop_login = |login: &str| {
+        mssql_exec(&format!(
+            "IF EXISTS (SELECT 1 FROM sys.database_principals WHERE name = '{login}') DROP USER {login}; \
+             IF EXISTS (SELECT 1 FROM sys.server_principals WHERE name = '{login}') DROP LOGIN {login};"
+        ))
+    };
+    drop_login(&login);
+    let values = (1..=12)
+        .flat_map(|m| {
+            if m <= 6 {
+                [(m, 10), (m, 11)]
+            } else {
+                [(m, 3), (m, 7)]
+            }
+        })
+        .enumerate()
+        .map(|(i, (m, d))| format!("('2024-{m:02}-{d:02} 10:00:00', {i})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    mssql_exec(&format!(
+        "IF OBJECT_ID('dbo.{table}') IS NOT NULL DROP TABLE dbo.{table}; \
+         CREATE TABLE dbo.{table} (ts DATETIME NOT NULL PRIMARY KEY, id INT NOT NULL); \
+         INSERT INTO dbo.{table} VALUES {values}; \
+         CREATE LOGIN {login} WITH PASSWORD = '{pw}', CHECK_POLICY = OFF, DEFAULT_LANGUAGE = British; \
+         CREATE USER {login} FOR LOGIN {login}; ALTER ROLE db_datareader ADD MEMBER {login};"
+    ));
+    let rig = Rig::mssql_batch(&table)
+        .source_url(&format!("sqlserver://{login}:{pw}@127.0.0.1:1433/rivet"))
+        .duckdb_oracle()
+        .mode("chunked")
+        .export_line("chunk_by_key: ts")
+        .export_line("chunk_size: 5")
+        .export_line("parallel: 3");
+    let out = rig
+        .run_with_envs_bounded(&[], std::time::Duration::from_secs(60))
+        .expect("a keyset run over 24 rows must finish");
+    let said = String::from_utf8_lossy(&out.stderr).to_string();
+    let got = out
+        .status
+        .success()
+        .then(|| duckdb_distinct_i64_set(rig.oracle_dir(), "id"));
+    let rows = got
+        .as_ref()
+        .map_or(0, |_| duckdb_parquet_rows(rig.oracle_dir()));
+    mssql_exec(&format!("DROP TABLE dbo.{table}"));
+    drop_login(&login);
+    assert_eq!(got, Some((0..24).collect()), "every row:\n{said}");
+    assert_eq!(rows, 24, "exactly once");
+}
+
+/// Parallel keyset incremental over a `timestamptz` key for a role whose session zone is
+/// not UTC: the sampled bounds and the anchor must name the same instants in every session.
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn parallel_keyset_incremental_on_a_timestamptz_key_reads_each_row_once_in_a_tokyo_session() {
+    require_alive(LiveService::Postgres);
+    let table = unique_name("aud_tzkey");
+    let role = unique_name("rivet_tokyo");
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "DROP ROLE IF EXISTS {role};
+         CREATE ROLE {role} LOGIN PASSWORD 'rivet';
+         ALTER ROLE {role} SET timezone = 'Asia/Tokyo';
+         DROP TABLE IF EXISTS {table};
+         CREATE TABLE {table} (ts TIMESTAMPTZ PRIMARY KEY, id INT NOT NULL);
+         INSERT INTO {table} SELECT TIMESTAMPTZ '2024-01-01 00:00:00.5+00' + g * INTERVAL '1 minute', g
+           FROM generate_series(1, 1000) g;
+         GRANT SELECT ON {table} TO {role};"
+    ))
+    .unwrap();
+    let _tbl = PgTable::adopt(table.clone());
+    let rig = Rig::pg_batch(&format!("public.{table}"))
+        .source_url(&format!("postgresql://{role}:rivet@127.0.0.1:5432/rivet"))
+        .mode("chunked")
+        .export_line("chunk_by_key: ts")
+        .export_line("parallel: 4")
+        .export_line("chunk_checkpoint: true")
+        .export_line("keyset_incremental: true")
+        .export_line("chunk_size: 100");
+    let first = rig.run_with_envs_bounded(&[], std::time::Duration::from_secs(120));
+    let first_rows = duckdb_declared_dir_scalar(&rig.out_dir(), "count(*)");
+    c.batch_execute(&format!(
+        "INSERT INTO {table} SELECT TIMESTAMPTZ '2024-01-01 00:00:00.5+00' + g * INTERVAL '1 minute', g
+           FROM generate_series(1001, 1500) g"
+    ))
+    .unwrap();
+    let second = rig.run_with_envs_bounded(&[], std::time::Duration::from_secs(120));
+    let rows = duckdb_declared_dir_scalar(&rig.out_dir(), "count(*)");
+    let ids = duckdb_declared_dir_scalar(&rig.out_dir(), "count(DISTINCT id)");
+    let _ = c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {table}; DROP ROLE IF EXISTS {role};"
+    ));
+    let (first, second) = (
+        first.expect("run 1 finishes"),
+        second.expect("run 2 finishes"),
+    );
+    assert!(first.status.success(), "run 1:\n{}", said(&first));
+    assert_eq!(first_rows, 1000, "run 1 exports every row once");
+    assert!(second.status.success(), "run 2:\n{}", said(&second));
+    assert_eq!(
+        (rows, ids),
+        (1500, 1500),
+        "both runs together: every row, once"
+    );
+}
+
+/// Parallel keyset incremental over an MSSQL datetime key whose newest row has a sub-second
+/// part: the open-time ceiling must include it, so run 1 exports every row.
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn parallel_keyset_incremental_on_an_mssql_datetime_key_exports_the_newest_row() {
+    for (ty, base) in [
+        ("DATETIME2(7)", "2024-01-01 00:00:00.5"),
+        ("DATETIME", "2024-01-01 00:00:00.997"),
+    ] {
+        let table = unique_name("ks_dtinc");
+        let values = (1..=200)
+            .map(|i| format!("(DATEADD(MINUTE, {i}, CAST('{base}' AS {ty})), {i})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        mssql_exec(&format!(
+            "IF OBJECT_ID('dbo.{table}') IS NOT NULL DROP TABLE dbo.{table}; \
+             CREATE TABLE dbo.{table} (ts {ty} NOT NULL PRIMARY KEY, id INT NOT NULL); \
+             INSERT INTO dbo.{table} VALUES {values}"
+        ));
+        let rig = Rig::mssql_batch(&table)
+            .duckdb_oracle()
+            .mode("chunked")
+            .export_line("chunk_by_key: ts")
+            .export_line("parallel: 3")
+            .export_line("chunk_checkpoint: true")
+            .export_line("keyset_incremental: true")
+            .export_line("chunk_size: 40");
+        let out = rig.run_with_envs_bounded(&[], std::time::Duration::from_secs(120));
+        let rows = duckdb_parquet_rows(rig.oracle_dir());
+        mssql_exec(&format!("DROP TABLE dbo.{table}"));
+        let out = out.expect("run finishes");
+        assert!(out.status.success(), "{ty}: {}", said(&out));
+        assert_eq!(
+            rows, 200,
+            "{ty}: the newest row is inside the open-time ceiling"
+        );
+    }
+}
+
+/// `rivet check` under a `db_datareader` login still reports the MSSQL row estimate: it
+/// reads the `sys.partitions` catalog, not a DMV that needs VIEW DATABASE STATE.
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn mssql_check_reports_a_row_estimate_for_a_read_only_login() {
+    let table = unique_name("ro_est");
+    let login = unique_name("rivet_ro");
+    let pw = "Rivet_Passw0rd!";
+    let drop_login = |login: &str| {
+        mssql_exec(&format!(
+            "IF EXISTS (SELECT 1 FROM sys.database_principals WHERE name = '{login}') DROP USER {login}; \
+             IF EXISTS (SELECT 1 FROM sys.server_principals WHERE name = '{login}') DROP LOGIN {login};"
+        ))
+    };
+    drop_login(&login);
+    mssql_exec(&format!(
+        "IF OBJECT_ID('dbo.{table}') IS NOT NULL DROP TABLE dbo.{table}; \
+         CREATE TABLE dbo.{table} (id INT NOT NULL PRIMARY KEY, v INT NOT NULL); \
+         INSERT INTO dbo.{table} SELECT TOP 1500 ROW_NUMBER() OVER (ORDER BY (SELECT 1)), 1 \
+           FROM sys.all_objects a CROSS JOIN sys.all_objects b; \
+         CREATE LOGIN {login} WITH PASSWORD = '{pw}', CHECK_POLICY = OFF; \
+         CREATE USER {login} FOR LOGIN {login}; ALTER ROLE db_datareader ADD MEMBER {login};"
+    ));
+    let rig = Rig::mssql_batch(&table)
+        .source_url(&format!("sqlserver://{login}:{pw}@127.0.0.1:1433/rivet"))
+        .mode("chunked")
+        .export_line("chunk_column: id");
+    let out = rig.cli(&["check"]);
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    mssql_exec(&format!("DROP TABLE dbo.{table}"));
+    drop_login(&login);
+    assert!(
+        said.contains("Row estimate: ~1K  (catalog estimate)"),
+        "{said}"
+    );
+}

@@ -224,6 +224,29 @@ exclude_re = [
     # 2026-08-20, then reverted). The whole live_keyset suite guards the bodies.
     "replace run_keyset ->",
     "replace run_keyset_parallel ->",
+    # introspect_mssql_table_for_chunking (source/mssql/mod.rs) reads sys.* over a
+    # real SQL Server connection; OracleSource::export_within_budget drives a real
+    # Oracle cursor. Unkillable under --lib. Proven live-killed by hand 2026-09-27
+    # (stub applied, test run, reverted): Ok(Default::default()) empties keyset_keys,
+    # so keyset_over_an_mssql_varchar_key_reads_every_key_under_the_default_sql_collation
+    # refuses the key; Ok(()) exports nothing, 31 of 44 live_oracle tests RED.
+    "replace introspect_mssql_table_for_chunking ->",
+    "replace OracleSource::export_within_budget ->",
+    # Also live-only, each proven live-killed by hand 2026-09-27:
+    # - PostgresSource::query_scalar needs a Postgres; Ok(None) makes a parallel
+    #   keyset incremental run find nothing past its anchor (both
+    #   parallel_keyset_incremental_* in live_audit_suspects RED).
+    # - row_estimate_mssql needs SQL Server; None is exactly the DMV-permission
+    #   failure mssql_check_reports_a_row_estimate_for_a_read_only_login guards (RED
+    #   against the old dm_db_partition_stats query too).
+    # - the resume arm of run_keyset_parallel's range match: disabled, a crashed
+    #   parallel run re-samples instead of reloading (parallel_keyset_crash_recovery_postgres RED).
+    # - print_chunked_recovery writes stderr only; its block is graded through
+    #   write_chunked_recovery / chunked_recovery_text (the print_pool_estimate precedent).
+    "replace <impl super::Source for PostgresSource>::query_scalar ->",
+    "replace row_estimate_mssql ->",
+    "delete match arm \\(Some\\(rid\\), Some\\(st\\)\\) in run_keyset_parallel",
+    "replace print_chunked_recovery with \\(\\)",
     # run_with_reconnect / run_mongo_parallel (ADR-0028 seam cut-over, PR: the
     # finalize-export-seam branch) are live-only export runners: the first wraps
     # run_single_export's retry loop over a real source connection, the second

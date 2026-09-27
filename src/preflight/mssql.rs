@@ -10,7 +10,7 @@
 //! over that seam.
 //!
 //! What is probed (all through `query_scalar`, the same seam `init` uses):
-//! - **row estimate** — `SUM(row_count)` from `sys.dm_db_partition_stats`
+//! - **row estimate** — `SUM(rows)` from the `sys.partitions` catalog
 //!   (heap/clustered index, `index_id IN (0,1)`), the exact SQL `rivet init`
 //!   and `introspect_mssql_table_for_chunking` already run; `None` when the base
 //!   query is not a simple single-table read (joins, subqueries, inline SQL).
@@ -105,7 +105,7 @@ fn diagnose_mssql(conn: &mut MssqlSource, export: &ExportConfig) -> Result<Expor
     // auto-resolved PK above — the run's real read column.
     let range_col = preflight_range_col_resolved(export, auto_pk.as_deref());
 
-    // Row estimate from `sys.dm_db_partition_stats` — the same fast,
+    // Row estimate from the `sys.partitions` catalog — the same fast,
     // no-`COUNT(*)` probe `rivet init` and `introspect_mssql_table_for_chunking`
     // run. `None` (printer omits the line) when the base relation is unknown or
     // the stats row is absent.
@@ -114,7 +114,7 @@ fn diagnose_mssql(conn: &mut MssqlSource, export: &ExportConfig) -> Result<Expor
         None => None,
     };
 
-    // Average bytes/row from the same `dm_db_partition_stats` DMV — feeds the
+    // Average bytes/row from the `dm_db_partition_stats` DMV — feeds the
     // oversized-chunk warning. `None` when the base relation is unknown.
     let avg_row_bytes = base_table.and_then(|table| avg_row_bytes_mssql(conn, table));
 
@@ -166,7 +166,7 @@ fn diagnose_mssql(conn: &mut MssqlSource, export: &ExportConfig) -> Result<Expor
     ))
 }
 
-/// Row estimate from `sys.dm_db_partition_stats` for `[schema.]table`. Mirrors
+/// Row estimate from the `sys.partitions` catalog for `[schema.]table`. Mirrors
 /// the SQL `rivet init` (`src/init/mssql.rs`) and
 /// `introspect_mssql_table_for_chunking` already run — rows in the heap /
 /// clustered index (`index_id IN (0,1)`), no `COUNT(*)` scan. `None` when the
@@ -216,7 +216,7 @@ fn mssql_error_code(msg: &str) -> Option<u16> {
 fn row_estimate_mssql(conn: &mut MssqlSource, qualified_table: &str) -> Option<i64> {
     let (schema, table) = split_qualified(qualified_table);
     let sql = format!(
-        "SELECT SUM(p.row_count) FROM sys.dm_db_partition_stats p \
+        "SELECT SUM(p.rows) FROM sys.partitions p \
          JOIN sys.objects o ON o.object_id = p.object_id \
          JOIN sys.schemas s ON s.schema_id = o.schema_id \
          WHERE s.name = N'{}' AND o.name = N'{}' AND p.index_id IN (0,1)",

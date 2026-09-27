@@ -928,8 +928,10 @@ fn adoptable(
         bail!(
             "cannot turn `{}` (a table from an earlier full load) into the change-log \
              baseline: it has {total} column(s), {matched} of the export's {} — the view over \
-             it would not match the export. Align the export with the table, or rename the \
-             table aside and re-run.",
+             it would not match the export. Align the two and re-run: add the export's new \
+             column(s) to the table (ALTER TABLE … ADD COLUMN; its rows read NULL there) or \
+             restore the ones the export dropped. Do not rename the table aside: its run is \
+             already recorded as loaded, so the view would drop every row it holds.",
             loader.fqtn(table),
             names.len()
         );
