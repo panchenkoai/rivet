@@ -727,7 +727,7 @@ fn keyset_over_an_mssql_datetime_key_reads_every_row_for_a_day_first_login() {
          CREATE TABLE dbo.{table} (ts DATETIME NOT NULL PRIMARY KEY, id INT NOT NULL); \
          INSERT INTO dbo.{table} VALUES {values}; \
          CREATE LOGIN {login} WITH PASSWORD = '{pw}', CHECK_POLICY = OFF, DEFAULT_LANGUAGE = British; \
-         CREATE USER {login} FOR LOGIN {login}; ALTER ROLE db_datareader ADD MEMBER {login}; GRANT VIEW DATABASE PERFORMANCE STATE TO {login};"
+         CREATE USER {login} FOR LOGIN {login}; ALTER ROLE db_datareader ADD MEMBER {login};"
     ));
     let rig = Rig::mssql_batch(&table)
         .source_url(&format!("sqlserver://{login}:{pw}@127.0.0.1:1433/rivet"))

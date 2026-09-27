@@ -1039,7 +1039,7 @@ pub(crate) struct ProbeFacts {
     /// non-integer / absent — exactly when the planner would not use one either.
     pub auto_pk: Option<String>,
     /// Scan-free row estimate (PG EXPLAIN `rows=`, MySQL EXPLAIN `rows`, MSSQL
-    /// `dm_db_partition_stats`). `None` = unknown, which the checks read as
+    /// `sys.partitions`). `None` = unknown, which the checks read as
     /// "unknown", never as zero.
     pub row_estimate: Option<i64>,
     /// Average bytes per row, where the engine has a figure worth trusting.

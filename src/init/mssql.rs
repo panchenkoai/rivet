@@ -68,11 +68,11 @@ pub(super) fn introspect(conn: &mut MssqlSource, schema: &str, table: &str) -> R
     let schema_lit = schema.replace('\'', "''");
     let table_lit = table.replace('\'', "''");
 
-    // Row estimate from `sys.dm_db_partition_stats` (rows in the heap/clustered
+    // Row estimate from the `sys.partitions` catalog (rows in the heap/clustered
     // index, index_id 0/1) — fast, no `COUNT(*)`. `0` for a view or when stats
     // are unavailable; never fails the scaffold.
     let count_sql = format!(
-        "SELECT SUM(p.row_count) FROM sys.dm_db_partition_stats p \
+        "SELECT SUM(p.rows) FROM sys.partitions p \
          JOIN sys.objects o ON o.object_id = p.object_id \
          JOIN sys.schemas s ON s.schema_id = o.schema_id \
          WHERE s.name = N'{schema_lit}' AND o.name = N'{table_lit}' AND p.index_id IN (0,1)",

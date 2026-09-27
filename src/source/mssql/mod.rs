@@ -1241,10 +1241,10 @@ pub(crate) fn introspect_mssql_table_for_chunking(
     };
     let mut src = MssqlSource::connect_with_tls(url, tls)?;
 
-    // Row estimate from `sys.dm_db_partition_stats` (rows in the heap/clustered
-    // index, index_id 0/1).
+    // Row estimate from the `sys.partitions` catalog (heap/clustered index, index_id 0/1):
+    // a read-only login sees it, unlike the `dm_db_partition_stats` DMV.
     let count_sql = format!(
-        "SELECT SUM(p.row_count) FROM sys.dm_db_partition_stats p \
+        "SELECT SUM(p.rows) FROM sys.partitions p \
          JOIN sys.objects o ON o.object_id = p.object_id \
          JOIN sys.schemas s ON s.schema_id = o.schema_id \
          WHERE s.name = N'{}' AND o.name = N'{}' AND p.index_id IN (0,1)",

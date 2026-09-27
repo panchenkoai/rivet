@@ -1141,10 +1141,10 @@ fn init_yaml(
 ///
 /// Every field here is something `init` already read from the catalog to make
 /// the choice; before this they were discarded the moment the YAML was written.
-/// MSSQL's `dm_db_partition_stats` row counts are near-exact by construction —
+/// MSSQL's `sys.partitions` row counts are near-exact by construction —
 /// no probe needed; the snapshot still SAYS where the number came from (#148).
 fn mark_mssql_catalog_exact(info: &mut TableInfo) {
-    // #148 (roast 2026-08-09): dm_db_partition_stats yields 0 for a VIEW or when
+    // #148 (roast 2026-08-09): sys.partitions yields 0 for a VIEW or when
     // stats are unavailable — a documented UNKNOWN, not an exact count. Stamping
     // `catalog-exact` on a 0 turns "unknown" into an audited "exactly 0 rows".
     // Only a positive figure is genuinely catalog-exact; 0 is unverified.
@@ -2060,7 +2060,7 @@ mod tests {
         assert_eq!(
             base.density.as_ref().unwrap().method,
             EstimateMethod::CatalogExact,
-            "a positive dm_db_partition_stats count IS catalog-exact"
+            "a positive sys.partitions count IS catalog-exact"
         );
         let mut view = make_table(0, vec![]);
         mark_mssql_catalog_exact(&mut view);
