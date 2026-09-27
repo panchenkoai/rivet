@@ -841,3 +841,38 @@ fn a_column_added_before_the_first_delta_is_refused_and_its_remedy_keeps_the_bas
         "the baseline rows survive the remedy"
     );
 }
+
+/// An incremental first pass followed by an idle run: the load lands the table and
+/// exits 0 — an empty delta is "up to date", not a failure.
+#[test]
+#[ignore = "live: requires clickhouse + fake-gcs + postgres"]
+fn an_idle_incremental_run_after_the_first_pass_loads_cleanly() {
+    require_alive(LiveService::ClickHouse);
+    require_alive(LiveService::FakeGcs);
+    ensure_gcs_bucket(BUCKET);
+    let (tbl, _t, mut c) = pg_batch_seeded("rivet_ch_idle", 5);
+    let db = Db::new("rivet_chtest");
+    let rig = batch_into_clickhouse(
+        Rig::pg_batch(&tbl)
+            .mode("incremental")
+            .export_line("cursor_column: updated_at"),
+        &db,
+    );
+    let loaded = || {
+        clickhouse_rows(&format!(
+            "SELECT id, v FROM {}.{tbl} ORDER BY id FORMAT TSV",
+            db.0
+        ))
+    };
+    rig.run_ok();
+    rig.run_ok();
+    load(&rig);
+    assert_eq!(loaded(), pg_rows(&mut c, &tbl));
+    c.batch_execute(&format!(
+        "UPDATE {tbl} SET v = 99, updated_at = TIMESTAMP '2026-02-01' WHERE id = 1"
+    ))
+    .expect("change");
+    rig.run_ok();
+    load(&rig);
+    assert_eq!(loaded(), pg_rows(&mut c, &tbl), "a later delta still lands");
+}
