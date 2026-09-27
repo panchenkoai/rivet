@@ -752,3 +752,59 @@ fn keyset_over_an_mssql_datetime_key_reads_every_row_for_a_day_first_login() {
     assert_eq!(got, Some((0..24).collect()), "every row:\n{said}");
     assert_eq!(rows, 24, "exactly once");
 }
+
+/// Parallel keyset incremental over a `timestamptz` key for a role whose session zone is
+/// not UTC: the sampled bounds and the anchor must name the same instants in every session.
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn parallel_keyset_incremental_on_a_timestamptz_key_reads_each_row_once_in_a_tokyo_session() {
+    require_alive(LiveService::Postgres);
+    let table = unique_name("aud_tzkey");
+    let role = unique_name("rivet_tokyo");
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "DROP ROLE IF EXISTS {role};
+         CREATE ROLE {role} LOGIN PASSWORD 'rivet';
+         ALTER ROLE {role} SET timezone = 'Asia/Tokyo';
+         DROP TABLE IF EXISTS {table};
+         CREATE TABLE {table} (ts TIMESTAMPTZ PRIMARY KEY, id INT NOT NULL);
+         INSERT INTO {table} SELECT TIMESTAMPTZ '2024-01-01 00:00:00.5+00' + g * INTERVAL '1 minute', g
+           FROM generate_series(1, 1000) g;
+         GRANT SELECT ON {table} TO {role};"
+    ))
+    .unwrap();
+    let _tbl = PgTable::adopt(table.clone());
+    let rig = Rig::pg_batch(&format!("public.{table}"))
+        .source_url(&format!("postgresql://{role}:rivet@127.0.0.1:5432/rivet"))
+        .mode("chunked")
+        .export_line("chunk_by_key: ts")
+        .export_line("parallel: 4")
+        .export_line("chunk_checkpoint: true")
+        .export_line("keyset_incremental: true")
+        .export_line("chunk_size: 100");
+    let first = rig.run_with_envs_bounded(&[], std::time::Duration::from_secs(120));
+    let first_rows = duckdb_declared_dir_scalar(&rig.out_dir(), "count(*)");
+    c.batch_execute(&format!(
+        "INSERT INTO {table} SELECT TIMESTAMPTZ '2024-01-01 00:00:00.5+00' + g * INTERVAL '1 minute', g
+           FROM generate_series(1001, 1500) g"
+    ))
+    .unwrap();
+    let second = rig.run_with_envs_bounded(&[], std::time::Duration::from_secs(120));
+    let rows = duckdb_declared_dir_scalar(&rig.out_dir(), "count(*)");
+    let ids = duckdb_declared_dir_scalar(&rig.out_dir(), "count(DISTINCT id)");
+    let _ = c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {table}; DROP ROLE IF EXISTS {role};"
+    ));
+    let (first, second) = (
+        first.expect("run 1 finishes"),
+        second.expect("run 2 finishes"),
+    );
+    assert!(first.status.success(), "run 1:\n{}", said(&first));
+    assert_eq!(first_rows, 1000, "run 1 exports every row once");
+    assert!(second.status.success(), "run 2:\n{}", said(&second));
+    assert_eq!(
+        (rows, ids),
+        (1500, 1500),
+        "both runs together: every row, once"
+    );
+}
