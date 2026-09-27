@@ -336,6 +336,17 @@ mod tests {
     }
 
     #[test]
+    fn a_resume_run_id_in_any_scope_is_seen_until_every_scope_is_cleared() {
+        let s = store();
+        assert!(!s.has_resume_run_id_in_any_scope("orders").unwrap());
+        s.set_resume_run_id("orders", "pg/out", "r1").unwrap();
+        assert!(s.has_resume_run_id_in_any_scope("orders").unwrap());
+        assert!(!s.has_resume_run_id_in_any_scope("other").unwrap());
+        s.clear_resume_run_id_every_scope("orders").unwrap();
+        assert!(!s.has_resume_run_id_in_any_scope("orders").unwrap());
+    }
+
+    #[test]
     fn get_unknown_returns_empty_state() {
         let s = store();
         let state = s.get("nonexistent", "").unwrap();

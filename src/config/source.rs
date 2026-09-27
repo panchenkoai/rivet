@@ -631,6 +631,13 @@ mod tests {
     }
 
     #[test]
+    fn a_source_state_key_is_derived_from_its_resolved_url() {
+        let mut src = make_source(SourceType::Postgres);
+        src.url = Some("postgresql://u:pw@db.host:5432/app".into());
+        assert_eq!(src.state_key(), "postgres://db.host:5432/app");
+    }
+
+    #[test]
     fn redact_plaintext_password() {
         let mut src = make_source(SourceType::Postgres);
         src.password = Some("s3cr3t".into());
