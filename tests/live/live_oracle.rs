@@ -1825,3 +1825,33 @@ fn a_coalesce_cursor_advances_and_never_re_exports() {
         "each row exactly once across three runs — run 2 over an unchanged table must add nothing"
     );
 }
+
+/// An incremental cursor on a TIMESTAMP(9) column is refused up front: rivet stores the
+/// cursor to the microsecond, so the boundary row would be exported again on every run.
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn an_incremental_cursor_on_a_nanosecond_timestamp_is_refused_before_it_re_exports() {
+    require_alive(LiveService::Oracle);
+    let t = OracleTable::create(
+        "ora_ts9",
+        "id NUMBER(10) PRIMARY KEY, ts TIMESTAMP(9) NOT NULL",
+    );
+    ora_exec(&format!(
+        "INSERT INTO {} SELECT LEVEL, TIMESTAMP '2024-01-01 00:00:00.123456789' \
+         + NUMTODSINTERVAL(LEVEL, 'SECOND') FROM dual CONNECT BY LEVEL <= 10",
+        t.name()
+    ));
+    let rig = Rig::oracle_batch(t.name())
+        .mode("incremental")
+        .export_line("cursor_column: TS");
+    let said = rig.run_expect_fail();
+    assert!(
+        said.contains("oracle: incremental cursor column TS is TIMESTAMP(9)"),
+        "the refusal names the column and its precision:\n{said}"
+    );
+    let files = files_with_extension(&rig.out_dir(), "parquet");
+    assert!(
+        files.is_empty(),
+        "the refusal comes before any part: {files:?}"
+    );
+}

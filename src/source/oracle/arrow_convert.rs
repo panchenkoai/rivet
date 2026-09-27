@@ -133,7 +133,7 @@ pub(super) fn oracle_type_mappings(
 }
 
 /// True for a TIMESTAMP / INTERVAL DAY TO SECOND whose fraction is finer than the µs rivet keeps.
-fn sub_microsecond(native: &str, scale: i8) -> bool {
+pub(super) fn sub_microsecond(native: &str, scale: i8) -> bool {
     (native.starts_with("timestamp") || native.starts_with("interval_ds")) && scale > 6
 }
 

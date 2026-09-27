@@ -497,6 +497,17 @@ impl OracleSource {
         );
         let mut native = projection.native.clone();
         native.extend(metas[projection.native.len()..].iter().map(native_type));
+        let cursor_cols: Vec<(&str, bool, &str)> = metas
+            .iter()
+            .zip(&native)
+            .map(|(m, n)| {
+                let sub = arrow_convert::sub_microsecond(&kind::native_label(m), m.scale());
+                (m.name(), sub, n.as_str())
+            })
+            .collect();
+        if let Some(why) = sub_micro_cursor_refusal(request.incremental, &cursor_cols) {
+            anyhow::bail!("{why}");
+        }
         let empty_flags = projection.empty_flags.clone();
         let schema: SchemaRef = Arc::new(arrow_convert::oracle_schema(
             &metas,
@@ -558,6 +569,34 @@ impl OracleSource {
         }
         Ok(())
     }
+}
+
+/// The refusal for an incremental cursor on a TIMESTAMP finer than the microsecond rivet
+/// stores: the saved cursor falls below its own row, which every run then re-exports.
+fn sub_micro_cursor_refusal(
+    cursor: Option<&crate::plan::IncrementalCursorPlan>,
+    cols: &[(&str, bool, &str)],
+) -> Option<String> {
+    let c = cursor?;
+    [
+        Some(c.primary_column.as_str()),
+        c.fallback_column.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|want| {
+        cols.iter()
+            .find(|(name, sub, _)| *sub && name.eq_ignore_ascii_case(want))
+            .map(|(name, _, native)| {
+                format!(
+                    "oracle: incremental cursor column {name} is {} — rivet keeps timestamps \
+                         to the microsecond, so the saved cursor falls below its own row and every \
+                         run would export that row again. Read it as CAST({name} AS TIMESTAMP(6)) \
+                         in a `query:`, or use a cursor column with at most 6 fractional digits.",
+                    native.to_uppercase()
+                )
+            })
+    })
 }
 
 /// The result columns the schema carries, and where each sits in a row: the query's own
@@ -713,6 +752,37 @@ pub(crate) fn introspect_oracle_table_for_chunking(
 
 #[cfg(test)]
 mod tests {
+
+    /// Only a cursor (primary or coalesce fallback) finer than the microsecond is refused.
+    #[test]
+    fn a_cursor_finer_than_a_microsecond_is_refused_and_nothing_else() {
+        use crate::config::IncrementalCursorMode;
+        let plan = |fallback: Option<&str>| crate::plan::IncrementalCursorPlan {
+            primary_column: "upd".into(),
+            fallback_column: fallback.map(str::to_string),
+            mode: IncrementalCursorMode::Coalesce,
+            settle: None,
+        };
+        let cols = [
+            ("UPD", false, "timestamp(6)"),
+            ("INS", true, "timestamp(9)"),
+        ];
+        assert_eq!(
+            super::sub_micro_cursor_refusal(Some(&plan(None)), &cols),
+            None
+        );
+        let why =
+            super::sub_micro_cursor_refusal(Some(&plan(Some("ins"))), &cols).expect("refused");
+        assert!(
+            why.starts_with("oracle: incremental cursor column INS is TIMESTAMP(9)"),
+            "{why}"
+        );
+        assert_eq!(
+            super::sub_micro_cursor_refusal(None, &cols),
+            None,
+            "not incremental"
+        );
+    }
 
     /// The schema skips the LOB empty-value flags and keeps a wrapper's trailing cursor column.
     #[test]
