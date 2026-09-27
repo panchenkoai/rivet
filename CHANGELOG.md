@@ -18,8 +18,9 @@
   refusal, integrity, internal) and one line saying what to do. The code appears in
   `--json-errors` as `code` and as a `[CODE]` prefix. The full list is
   `docs/reference/errors.md`, generated from the registry (`rivet schema errors`). The first
-  codes are a newer state DB, a foreign cursor, a load count mismatch, a table the change log
-  cannot adopt, and the internal spill and value-converter failures. The rest move over a
+  codes are a newer state DB, a foreign cursor, an Oracle cursor finer than a microsecond, a
+  load count mismatch, a table the change log cannot adopt, and the internal spill and
+  value-converter failures. The rest move over a
   batch at a time; an offline ratchet keeps the uncoded ones from growing. A scheduler that
   treated every non-zero exit as "fix the config" should now treat 5 as "a human decides"
   and 6 as "report it".

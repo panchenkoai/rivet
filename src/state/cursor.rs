@@ -558,7 +558,9 @@ mod tests {
         let s = store();
         s.update_with_column("orders", "", "3711169", "idvisit")
             .unwrap();
-        let e = s.get_owned("orders", "", "visit_last_action_time").unwrap_err();
+        let e = s
+            .get_owned("orders", "", "visit_last_action_time")
+            .unwrap_err();
         assert_eq!(
             crate::error::classify_exit(&e),
             5,
