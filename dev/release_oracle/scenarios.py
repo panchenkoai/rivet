@@ -195,8 +195,7 @@ class Scope:
 # empty, because several bash rows carry no detail and the final table must stay
 # byte-identical between the two implementations.
 def _passed(led: Ledger, eng: str, ver: str, scenario: str, store: str, msg: str, detail: str = "") -> None:
-    led.ok(msg)
-    led.add(eng, ver, scenario, store, Status.PASS, detail)
+    led.passed(eng, ver, scenario, store, msg, detail)
 
 
 def _failed(led: Ledger, eng: str, ver: str, scenario: str, store: str, msg: str, detail: str = "") -> None:
@@ -1339,7 +1338,7 @@ def verify_state_migrations(led: Ledger) -> None:
         # form matches its 3 tests, while the `$`-anchored form matches NONE —
         # which would leave this leg green over zero tests (measured, not argued).
         ["cargo", "nextest", "run", "--manifest-path", str(ROOT / "Cargo.toml"),
-         "--test", "live_suite", "--run-ignored", "all",
+         "--test", "live_suite", "--run-ignored", "all", "--no-fail-fast",
          "-E", "test(state_parity_) or test(/pg_keyset_range_round_trips_and_commits$/)"],
         env={**release_bin_env(), "RIVET_TEST_STATE_URL": state_url},
         timeout=NO_TIMEOUT,
@@ -1405,7 +1404,7 @@ def _drive_live_tests(
     RAN_LIVE_TESTS.update(tests)
     res = run(
         ["cargo", "nextest", "run", "--manifest-path", str(ROOT / "Cargo.toml"),
-         "--test", "live_suite", "--run-ignored", "all", "-E", expr],
+         "--test", "live_suite", "--run-ignored", "all", "--no-fail-fast", "-E", expr],
         env={**release_bin_env(), "RIVET_SKIP_LOG": str(skip_log)},
         timeout=3600,
     )
@@ -1698,7 +1697,7 @@ def verify_replica_read(led: Ledger) -> None:
         # consolidated suite loses that isolation under the default libtest
         # harness, where `--test-threads=1` was the mitigation.
         ["cargo", "nextest", "run", "--manifest-path", str(ROOT / "Cargo.toml"),
-         "--test", "live_suite", "--run-ignored", "all",
+         "--test", "live_suite", "--run-ignored", "all", "--no-fail-fast",
          "-E", "test(/cdc_reads_changes_from_a_replica$/)"],
         env=release_bin_env(),
         timeout=NO_TIMEOUT,
@@ -1725,7 +1724,7 @@ def verify_replica_read(led: Ledger) -> None:
         cell_log = work_dir() / f"replica_{label}.log"
         p = run(
             ["cargo", "nextest", "run", "--manifest-path", str(ROOT / "Cargo.toml"),
-             "--test", "live_suite", "--run-ignored", "all", "-E", f"test(/::{test}$/)"],
+             "--test", "live_suite", "--run-ignored", "all", "--no-fail-fast", "-E", f"test(/::{test}$/)"],
             env=release_bin_env(),
             timeout=NO_TIMEOUT,
         )
@@ -1956,7 +1955,7 @@ def _run_pool_module(
         # the SUBSTRING form: `test_filter` is a `<module>::<prefix>`, which the
         # `$`-anchored form would match NONE of (measured on `state_parity_`).
         ["cargo", "nextest", "run", "--manifest-path", str(ROOT / "Cargo.toml"),
-         "--test", "live_suite", "--run-ignored", "all", "-E", f"test({test_filter})"],
+         "--test", "live_suite", "--run-ignored", "all", "--no-fail-fast", "-E", f"test({test_filter})"],
         env=release_bin_env(),
         timeout=NO_TIMEOUT,
     )

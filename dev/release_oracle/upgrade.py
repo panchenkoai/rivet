@@ -33,7 +33,7 @@ import sqlite3
 import tempfile
 from pathlib import Path
 
-from .core import Ledger, Proc, rivet_bin, run
+from .core import Ledger, Proc, isolate_state_db, rivet_bin, run
 from .regression import _require_prev_binary
 
 __all__ = ["verify_upgrade_continuity"]
@@ -260,5 +260,13 @@ def verify_upgrade_continuity(led: Ledger) -> None:
             led.skipped(engine, "-", SCEN, "local", f"upgrade[{engine}]: no {uvar}", "no url")
             continue
         for state_url in states:
-            _cursor_leg(led, prev, root, engine, url, state_url)
-            _crash_leg(led, prev, root, engine, url, state_url)
+            for leg in (_cursor_leg, _crash_leg):
+                # Each Postgres-state leg gets a DB the PREVIOUS release creates: the gate's own
+                # DB is already migrated by this binary, which the previous one rightly refuses.
+                fresh = isolate_state_db(state_url, f"{os.getpid()}_{engine}_{leg.__name__}") \
+                    if state_url else ""
+                if state_url and not fresh:
+                    led.failed(engine, "-", SCEN, "pg-state", f"upgrade[{engine}]: could not create "
+                               "a fresh Postgres state DB for the previous release", "no state db")
+                    continue
+                leg(led, prev, root, engine, url, fresh)

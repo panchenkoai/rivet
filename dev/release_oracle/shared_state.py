@@ -84,7 +84,9 @@ def run_rig_tests(led: Ledger, scenario: str, tests: tuple[str, ...],
     skip_log = Path(tempfile.mkdtemp(prefix="rivet-skips-")) / "skips"
     env["RIVET_SKIP_LOG"] = str(skip_log)
     p = run(["cargo", "nextest", "run", "--manifest-path", str(ROOT / "Cargo.toml"),
-             "--test", "live_suite", "--run-ignored", "all", "-E", expr],
+             # --no-fail-fast: one failure must not cancel the rest, which then read as
+             # "no PASS line" rows — two real failures showed up as seven (2026-09-27).
+             "--test", "live_suite", "--run-ignored", "all", "--no-fail-fast", "-E", expr],
             cwd=ROOT, env=env, timeout=None)
     skipped = {k.rsplit("::", 1)[-1]: v for k, v in self_skipped(skip_log).items()}
     out = (p.stdout or "") + (p.stderr or "")

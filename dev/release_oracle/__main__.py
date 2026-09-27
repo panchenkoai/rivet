@@ -321,6 +321,10 @@ def _self_test() -> int:
     probe.failed("-", "-", "s", "-", f"boom {k.match}")
     assert probe.cells[-1].status is Status.KNOWN and not probe.red
     from .scenarios import _failed
+    from .scenarios import _passed
+    seen = Ledger(colour=False)
+    _passed(seen, "-", "-", "s", "-", f"ok {k.match}")
+    assert k.match in seen.known_passed, "a scenario PASS must reach the known-red registry"
     via = Ledger(colour=False)
     _failed(via, "-", "-", "s", "-", f"boom {k.match}", "detail")
     assert via.cells[-1].status is Status.KNOWN, "a scenario failure must meet the known-red registry"
