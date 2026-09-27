@@ -760,3 +760,38 @@ fn a_load_that_dies_after_adopting_the_table_resumes_into_the_log() {
         pg_rows(&mut c, &tbl)
     );
 }
+
+/// A timestamp without a zone keeps its wall-clock value in ClickHouse whatever the
+/// reading SESSION's time zone (RED against a column declared in a zone). The server's own
+/// zone is not flipped here: the stand's ClickHouse is shared and runs UTC.
+#[test]
+#[ignore = "live: requires clickhouse + fake-gcs + postgres"]
+fn a_naive_timestamp_reads_back_the_same_wall_clock_in_any_session_zone() {
+    require_alive(LiveService::ClickHouse);
+    require_alive(LiveService::FakeGcs);
+    ensure_gcs_bucket(BUCKET);
+    let mut c = pg_connect();
+    let tbl = unique_name("rivet_ch_naive");
+    c.batch_execute(&format!(
+        "CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, ts TIMESTAMP); \
+         INSERT INTO {tbl} VALUES (1, TIMESTAMP '2024-01-01 00:00:00'), (2, TIMESTAMP '2024-06-30 23:30:15.5')"
+    ))
+    .expect("seed");
+    let _t = PgTable::adopt(tbl.clone());
+    let db = Db::new("rivet_chtest");
+    let rig = batch_into_clickhouse(Rig::pg_batch(&tbl).mode("full"), &db);
+    rig.run_ok();
+    load(&rig);
+    let table = format!("{}.{tbl}", db.0);
+    for zone in ["UTC", "Asia/Tokyo", "America/Los_Angeles"] {
+        let got = clickhouse_rows_tsv(&format!(
+            "SELECT toString(ts), toString(toDate(ts)) FROM {table} ORDER BY id \
+             SETTINGS session_timezone = '{zone}' FORMAT TSV"
+        ));
+        assert_eq!(
+            got.trim(),
+            "2024-01-01 00:00:00.000000\t2024-01-01\n2024-06-30 23:30:15.500000\t2024-06-30",
+            "a zone-less value must read back as written in session zone {zone}"
+        );
+    }
+}
