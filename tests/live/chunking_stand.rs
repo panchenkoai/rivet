@@ -250,6 +250,19 @@ fn run_pool_split_resume_with(
     key_line: &str,
     crash: (&str, &str),
 ) {
+    run_pool_split_rerun_with(eng, table, original_ids, grow, key_line, crash, true);
+}
+
+/// As [`run_pool_split_resume_with`], with run 2 passing `--resume` only when `resume` is set.
+fn run_pool_split_rerun_with(
+    eng: Eng,
+    table: &str,
+    original_ids: &std::collections::BTreeSet<i64>,
+    grow: Option<(i64, i64)>,
+    key_line: &str,
+    crash: (&str, &str),
+    resume: bool,
+) {
     let n = original_ids.len() as i64;
     let chunk = (n / 4).max(1); // 2 units of n/2 → 2 chunks/pages each → the hook fires
     let sibling_q = format!("SELECT id FROM {} WHERE id <= 100", eng.qualified(table));
@@ -366,17 +379,11 @@ fn run_pool_split_resume_with(
     }
 
     // Run 2: split + resume — must reconstruct the ORIGINAL partition.
-    let resumed = run_rivet_env(
-        &[
-            "apply",
-            cfg.to_str().unwrap(),
-            "--pool",
-            "2",
-            "--split",
-            "--resume",
-        ],
-        &[],
-    );
+    let mut args = vec!["apply", cfg.to_str().unwrap(), "--pool", "2", "--split"];
+    if resume {
+        args.push("--resume");
+    }
+    let resumed = run_rivet_env(&args, &[]);
     assert!(
         resumed.status.success(),
         "resume run must succeed:\n{}",
@@ -395,6 +402,17 @@ fn run_pool_split_resume_with(
         missing.len(),
         &missing[..missing.len().min(8)]
     );
+    if !resume {
+        let grown = grow.map_or(0, |(lo, hi)| hi - lo + 1);
+        assert_eq!(
+            (
+                declared.len() as i64,
+                dir_manifest_copy_total_rows(&rig.out_dir())
+            ),
+            (n + grown, n + grown),
+            "a fresh re-run declares every current id exactly once"
+        );
+    }
 }
 
 /// Drops the stand's temp table on scope exit, per engine.
@@ -2535,6 +2553,24 @@ fn stand_pool_split_keyset_recovers_a_crash_postgres() {
         Some((300_001, 450_000)),
         "chunk_by_key: id",
         ("RIVET_TEST_PANIC_AT", "after_keyset_page:1"),
+    );
+}
+
+/// A crashed keyset split re-run WITHOUT `--resume` re-samples its windows; a unit must not
+/// continue its old checkpoint inside a moved window.
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn stand_pool_split_keyset_rerun_without_resume_after_a_crash_postgres() {
+    Eng::Pg.require();
+    let (table, _g) = seed_dense_wide_for_split(Eng::Pg, 300_000);
+    run_pool_split_rerun_with(
+        Eng::Pg,
+        &table,
+        &dense_ids(300_000),
+        Some((300_001, 450_000)),
+        "chunk_by_key: id",
+        ("RIVET_TEST_PANIC_AT", "after_keyset_page:1"),
+        false,
     );
 }
 

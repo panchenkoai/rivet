@@ -680,7 +680,14 @@ pub(crate) fn realize(
             );
             Some(u)
         }
-        None => probe_and_synthesize(config, &base, config_dir, n)?,
+        None => {
+            let fresh = probe_and_synthesize(config, &base, config_dir, n)?;
+            // Fresh windows: a unit's in-progress keyset checkpoint belongs to the OLD window.
+            for unit in fresh.iter().flatten() {
+                state.clear_resume_run_id(&unit.name)?;
+            }
+            fresh
+        }
     };
     let Some(units) = units_opt else {
         log::warn!(
