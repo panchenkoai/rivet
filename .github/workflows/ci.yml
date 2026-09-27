@@ -1254,6 +1254,10 @@ jobs:
         run: |
           python3 dev/pytools/self_oracle_lint.py --self-test
           python3 dev/pytools/self_oracle_lint.py
+      - name: Fault catalog and nightly comparison self-tests
+        run: |
+          python3 dev/pytools/fault_catalog.py --self-test
+          python3 dev/pytools/nightly.py --self-test
       # The PRIORITISER's classification, graded over a coverage export copied
       # from a real `cargo llvm-cov --lib --bins --json` run: an executed
       # function, an untaken branch inside one, a function measured at zero, a
