@@ -50,7 +50,7 @@ Usage:
         unrecognised report must not arrive as "nothing is covered", which
         would move the whole diff into P2.
 
-  mutants_classify.py partition <mutant-list> [--extents <tsv>]
+  mutants_classify.py partition <mutant-list> [--extents <tsv> [--src <dir>]]
                       --p1 <f> --p2 <f> --drop-p1 <f> --drop-p2 <f>
         <mutant-list> is `cargo mutants --in-diff pr.diff --list`. Writes the
         two classes, plus the `--exclude-re` regexes that remove each class
@@ -78,6 +78,7 @@ Usage:
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -219,6 +220,15 @@ def partition(
         else:
             p1.append(name)
     return p1, p2
+
+
+def source_read_files(src: Path) -> set[str]:
+    """`.rs` files under `src` that some source file reads as TEXT (`include_str!`)."""
+    read: set[str] = set()
+    for f in sorted(src.rglob("*.rs")):
+        for m in re.finditer(r'include_str!\(\s*"([^"]+\.rs)"\s*\)', f.read_text(errors="ignore")):
+            read.add(os.path.normpath(f.parent / m.group(1)))
+    return read
 
 
 def exclusion_regexes(mutants: list[str]) -> list[str]:
@@ -521,8 +531,20 @@ def self_test() -> int:
         else:
             raise AssertionError(f"shape accepted that should not be: {broken}")
 
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        (Path(d) / "src" / "pipeline").mkdir(parents=True)
+        (Path(d) / "src" / "pipeline" / "pool.rs").write_text(
+            'const T: &str = include_str!("run.rs");\nconst J: &str = include_str!("fixtures/x.json");\n'
+        )
+        (Path(d) / "src" / "pipeline" / "run.rs").write_text("fn run() {}\n")
+        got = source_read_files(Path(d) / "src")
+        want = {os.path.normpath(Path(d) / "src" / "pipeline" / "run.rs")}
+        assert got == want, got
+
     print(
-        "self-test ok: executed / zero-coverage / unmeasured-file / uncovered-line / "
+        "self-test ok: include_str!-read files, executed / zero-coverage / unmeasured-file / uncovered-line / "
         "unparseable classification, the no-coverage fallback, exact exclusions, "
         "both verify directions, six rejected report shapes, and the P2 audit scoped "
         "to the P2 class over PR #265's leaked StructField kills"
@@ -581,6 +603,13 @@ def main(argv: list[str]) -> int:
         extents = None
         if extents_path:
             extents = load_extents(Path(extents_path).read_text().splitlines())
+            src = _arg(argv, "--src")
+            if src:
+                # A test that reads a file's text kills a stub without executing
+                # it, so coverage zero is no evidence there: its mutants stay P1.
+                for f in sorted(source_read_files(Path(src))):
+                    if extents.pop(f, None) is not None:
+                        print(f"  graded (its source is read as text by a test): {f}")
         p1, p2 = partition(mutants, extents)
         _write(_arg(argv, "--p1"), p1)
         _write(_arg(argv, "--p2"), p2)

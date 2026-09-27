@@ -74,18 +74,28 @@ def replay(cache_path: str, wanted_path: str) -> int:
     return 0
 
 
-def record(cache_path: str, caught_path: str, missed_path: str, timeout_path: str) -> int:
+def record(cache_path: str, out_dirs: list[str]) -> int:
+    """Merge every `mutants.out` directory's outcome lists into the cache."""
     doc = _load(cache_path)
     outcomes = doc.get("outcomes", {})
     if not isinstance(outcomes, dict):
         outcomes = {}
-    for path, label in ((caught_path, "caught"), (missed_path, "missed"), (timeout_path, "timeout")):
-        for m in _lines(path):
-            outcomes[m] = label
+    for d in out_dirs:
+        for label in ("caught", "missed", "timeout", "unviable"):
+            for m in _lines(f"{d}/{label}.txt"):
+                outcomes[m] = label
     doc["outcomes"] = outcomes
     with open(cache_path, "w", encoding="utf-8") as fh:
         json.dump(doc, fh, indent=1, sort_keys=True)
     print(len(outcomes))
+    return 0
+
+
+def labelled(cache_path: str, label: str) -> int:
+    """Print the cached mutants carrying `label`, one per line."""
+    for m, o in sorted(_load(cache_path).get("outcomes", {}).items()):
+        if o == label:
+            print(m)
     return 0
 
 
@@ -102,19 +112,19 @@ def self_test() -> int:
     with tempfile.TemporaryDirectory() as d:
         cache = os.path.join(d, "c.json")
         w = os.path.join(d, "want.txt")
-        caught = os.path.join(d, "caught.txt")
-        missed = os.path.join(d, "missed.txt")
-        tmo = os.path.join(d, "timeout.txt")
-
-        open(caught, "w").write("src/a.rs:1:1: replace f -> ()\n")
-        open(missed, "w").write("src/b.rs:2:2: replace g -> ()\n")
-        open(tmo, "w").write("src/c.rs:3:3: replace h -> ()\n")
+        s0, s1 = os.path.join(d, "s0"), os.path.join(d, "s1")
+        os.mkdir(s0)
+        os.mkdir(s1)
+        open(os.path.join(s0, "caught.txt"), "w").write("src/a.rs:1:1: replace f -> ()\n")
+        open(os.path.join(s1, "missed.txt"), "w").write("src/b.rs:2:2: replace g -> ()\n")
+        open(os.path.join(s1, "timeout.txt"), "w").write("src/c.rs:3:3: replace h -> ()\n")
+        open(os.path.join(s0, "unviable.txt"), "w").write("src/u.rs:4:4: replace u -> ()\n")
         import contextlib as _c
         import io as _io
 
         with _c.redirect_stdout(_io.StringIO()):   # `record` prints its tally
-            record(cache, caught, missed, tmo)
-        check("recorded", len(_load(cache)["outcomes"]), 3)
+            record(cache, [s0, s1])
+        check("recorded across shards", len(_load(cache)["outcomes"]), 4)
 
         # a mutant nobody measured must NOT be answered from cache
         open(w, "w").write("src/z.rs:9:9: replace q -> ()\n")
@@ -144,6 +154,14 @@ def self_test() -> int:
         open(w, "w").write("src/c.rs:3:3: replace h -> ()\n")
         check("timeout refuses", replay(cache, w), 1)
 
+        open(w, "w").write("src/a.rs:1:1: replace f -> ()\nsrc/u.rs:4:4: replace u -> ()\n")
+        check("an unviable mutant is known, not a refusal", replayed(w), (0, "0"))
+
+        buf = _io.StringIO()
+        with _c.redirect_stdout(buf):
+            labelled(cache, "caught")
+        check("labelled caught", buf.getvalue().strip(), "src/a.rs:1:1: replace f -> ()")
+
         # an empty wanted set is not a hit
         open(w, "w").write("")
         check("empty set refuses", replay(cache, w), 1)
@@ -167,7 +185,9 @@ def main() -> int:
     if len(sys.argv) >= 2 and sys.argv[1] == "replay":
         return replay(sys.argv[2], sys.argv[3])
     if len(sys.argv) >= 2 and sys.argv[1] == "record":
-        return record(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5])
+        return record(sys.argv[2], sys.argv[3:])
+    if len(sys.argv) == 4 and sys.argv[1] == "labelled":
+        return labelled(sys.argv[2], sys.argv[3])
     print(__doc__, file=sys.stderr)
     return 2
 
