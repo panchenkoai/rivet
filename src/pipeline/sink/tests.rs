@@ -1628,3 +1628,95 @@ fn batch_partition_buckets_counts_days_and_puts_nulls_in_their_own_bucket() {
     };
     assert!(super::batch_partition_buckets(&batch, &other).is_none());
 }
+
+#[test]
+fn a_byte_cap_sizes_row_groups_so_it_can_rotate_between_them() {
+    use super::{cap_piece_rows, piece_ranges, row_group_rows_for_cap};
+    assert_eq!(piece_ranges(10, 4), vec![(0, 4), (4, 4), (8, 2)]);
+    assert_eq!(piece_ranges(8, 4), vec![(0, 4), (4, 4)]);
+    assert_eq!(piece_ranges(3, 10), vec![(0, 3)]);
+    assert_eq!(
+        piece_ranges(0, 4),
+        vec![(0, 0)],
+        "an empty batch still reaches the writer"
+    );
+    assert_eq!(
+        piece_ranges(2, 0),
+        vec![(0, 1), (1, 1)],
+        "a zero step never loops"
+    );
+    // No cap: the configured group stands.
+    assert_eq!(
+        row_group_rows_for_cap(Some(1_000_000), None, 100),
+        Some(1_000_000)
+    );
+    assert_eq!(row_group_rows_for_cap(None, None, 100), None);
+    // A 400 KB cap over 100-byte rows: a quarter-cap group is 1,024 rows.
+    assert_eq!(
+        row_group_rows_for_cap(Some(1_000_000), Some(400 * 1024), 100),
+        Some(1024)
+    );
+    assert_eq!(
+        row_group_rows_for_cap(None, Some(400 * 1024), 100),
+        Some(1024)
+    );
+    // A smaller configured group is kept; a row wider than the quarter-cap still gets one row.
+    assert_eq!(
+        row_group_rows_for_cap(Some(10), Some(400 * 1024), 100),
+        Some(10)
+    );
+    assert_eq!(row_group_rows_for_cap(None, Some(8), 1_000), Some(1));
+    // Pieces follow the group only under a cap.
+    assert_eq!(cap_piece_rows(Some(1), Some(300), 10_000), 300);
+    assert_eq!(cap_piece_rows(None, Some(300), 10_000), 10_000);
+    assert_eq!(cap_piece_rows(Some(1), None, 10_000), 10_000);
+}
+
+#[test]
+fn row_group_rows_outside_fixed_rows_is_said_to_be_ignored() {
+    use crate::config::{ParquetConfig, RowGroupStrategy};
+    let pc = |s: Option<RowGroupStrategy>, rows: Option<usize>| ParquetConfig {
+        row_group_strategy: s,
+        row_group_rows: rows,
+        target_row_group_mb: None,
+        max_row_group_mb: None,
+    };
+    let w = super::ignored_row_group_rows_warning(&pc(None, Some(500))).expect("auto ignores it");
+    assert!(
+        w.starts_with(
+            "parquet.row_group_rows is ignored under row_group_strategy: auto (the default)"
+        ),
+        "{w}"
+    );
+    assert!(
+        super::ignored_row_group_rows_warning(&pc(Some(RowGroupStrategy::FixedMemory), Some(5)))
+            .is_some_and(|w| w.contains("row_group_strategy: fixed_memory —"))
+    );
+    assert!(
+        super::ignored_row_group_rows_warning(&pc(Some(RowGroupStrategy::FixedRows), Some(5)))
+            .is_none()
+    );
+    assert!(super::ignored_row_group_rows_warning(&pc(None, None)).is_none());
+}
+
+/// Only a Parquet sink under a byte cap gets row groups small enough to rotate; CSV has none.
+#[test]
+fn a_byte_capped_parquet_sink_sizes_its_row_groups_and_a_csv_sink_does_not() {
+    use arrow::datatypes::{DataType, Field};
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let capped = |format_type| {
+        let mut sink = ExportSink {
+            format_type,
+            max_file_size: Some(1024),
+            ..minimal_sink()
+        };
+        crate::source::BatchSink::on_schema(&mut sink, schema.clone()).unwrap();
+        sink.parquet_row_group_rows
+    };
+    assert!(
+        capped(crate::config::FormatType::Parquet).is_some_and(|r| r < 1024),
+        "parquet: {:?}",
+        capped(crate::config::FormatType::Parquet)
+    );
+    assert_eq!(capped(crate::config::FormatType::Csv), None);
+}

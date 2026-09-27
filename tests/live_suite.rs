@@ -141,6 +141,8 @@ mod live_load_partition_batches;
 mod live_load_spec;
 #[path = "live/live_load_spec_pin.rs"]
 mod live_load_spec_pin;
+#[path = "live/live_max_file_size.rs"]
+mod live_max_file_size;
 #[path = "live/live_metrics_persist.rs"]
 mod live_metrics_persist;
 #[path = "live/live_mode_transition.rs"]

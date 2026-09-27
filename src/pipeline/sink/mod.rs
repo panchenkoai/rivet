@@ -145,6 +145,66 @@ fn column_buckets(
     )
 }
 
+/// The row-group size under which `max_file_size` can rotate a part: a quarter of the
+/// cap per group, so a part overshoots it by at most one (compressed) group.
+fn row_group_rows_for_cap(
+    rows: Option<usize>,
+    max_file_size: Option<u64>,
+    row_bytes: usize,
+) -> Option<usize> {
+    let Some(max) = max_file_size else {
+        return rows;
+    };
+    let fit = (usize::try_from(max / 4).unwrap_or(usize::MAX) / row_bytes.max(1)).max(1);
+    Some(rows.map_or(fit, |r| r.min(fit)))
+}
+
+/// Rows per piece a batch is written in: one row group when a byte cap is set, else the whole batch.
+fn cap_piece_rows(
+    max_file_size: Option<u64>,
+    group_rows: Option<usize>,
+    batch_rows: usize,
+) -> usize {
+    match (max_file_size, group_rows) {
+        (Some(_), Some(g)) => g.max(1),
+        _ => batch_rows.max(1),
+    }
+}
+
+/// The `(offset, len)` pieces of an `n`-row batch cut every `step` rows; an empty batch is one empty piece.
+fn piece_ranges(n: usize, step: usize) -> Vec<(usize, usize)> {
+    let step = step.max(1);
+    let mut out: Vec<(usize, usize)> = (0..n).step_by(step).map(|o| (o, step.min(n - o))).collect();
+    if out.is_empty() {
+        out.push((0, 0));
+    }
+    out
+}
+
+/// The warning for `row_group_rows` set under a strategy that does not read it.
+fn ignored_row_group_rows_warning(pc: &crate::config::ParquetConfig) -> Option<String> {
+    let strategy = pc.row_group_strategy.unwrap_or_default();
+    (pc.row_group_rows.is_some() && strategy != crate::config::RowGroupStrategy::FixedRows).then(
+        || {
+            format!(
+                "parquet.row_group_rows is ignored under row_group_strategy: {}{} — row groups \
+                 are sized from target_row_group_mb. Set `row_group_strategy: fixed_rows` to \
+                 use a fixed row count.",
+                match strategy {
+                    crate::config::RowGroupStrategy::Auto => "auto",
+                    crate::config::RowGroupStrategy::FixedMemory => "fixed_memory",
+                    crate::config::RowGroupStrategy::FixedRows => "fixed_rows",
+                },
+                if pc.row_group_strategy.is_none() {
+                    " (the default)"
+                } else {
+                    ""
+                }
+            )
+        },
+    )
+}
+
 /// The unit an Arrow date/timestamp type stores, or `None` for a type no warehouse
 /// partitions by — the signal `on_schema` turns into a warning rather than silence.
 fn partition_unit_of(data_type: &arrow::datatypes::DataType) -> Option<PartitionUnit> {
@@ -830,6 +890,18 @@ impl ExportSink {
     /// overflows the stack on a batch that is merely wide — measured, as an abort rather
     /// than a test failure, which is a far worse way to learn it.
     fn on_batch_inner(&mut self, dest_batch: &RecordBatch) -> Result<()> {
+        let n = dest_batch.num_rows();
+        // One row group at a time when a byte cap is set: parquet flushes only when a
+        // group closes, so the cap can rotate only between groups (#307).
+        let step = cap_piece_rows(self.max_file_size, self.parquet_row_group_rows, n);
+        for (offset, len) in piece_ranges(n, step) {
+            self.on_piece(&dest_batch.slice(offset, len))?;
+        }
+        Ok(())
+    }
+
+    /// Write one piece of a batch within the part's partition budget.
+    fn on_piece(&mut self, dest_batch: &RecordBatch) -> Result<()> {
         let Some((buckets, cap)) = self.partition.buckets_for(dest_batch) else {
             return self.write_batch_part(dest_batch);
         };
@@ -996,28 +1068,23 @@ impl BatchSink for ExportSink {
                 );
             }
         }
-        // Warn loud (#6/#29, the process rules "never a silent no-op"): `max_file_size`
-        // is enforced by `maybe_split` comparing the writer's FLUSHED bytes
-        // against the cap. parquet-rs only flushes on row-group close, so with
-        // the library-default (~1M-row) row group an export below one group
-        // flushes ~nothing and the cap silently never fires. Tell the operator
-        // their declared cap won't engage unless they constrain the row group
-        // (or switch to CSV). Once per process so chunked runs don't spam.
-        if self.format_type == FormatType::Parquet
-            && self.max_file_size.is_some()
-            && self.parquet_row_group_rows.is_none()
-        {
-            static WARN_ONCE: std::sync::Once = std::sync::Once::new();
-            WARN_ONCE.call_once(|| {
-                log::warn!(
-                    "max_file_size is set but will NOT be enforced for this parquet export: \
-                     parquet only flushes bytes when a row group closes, and no \
-                     `parquet.row_group_rows` is configured (library default ~1M rows), so a \
-                     file below one row group never reaches the cap. Set a small \
-                     `parquet.row_group_rows` to make max_file_size effective, or use \
-                     `format: csv`."
-                );
-            });
+        // `maybe_split` compares the writer's FLUSHED bytes with `max_file_size`, and
+        // parquet flushes only when a row group closes — so the group must be small
+        // enough for the cap to be reached between closes (#307).
+        if self.format_type == FormatType::Parquet {
+            self.parquet_row_group_rows = row_group_rows_for_cap(
+                self.parquet_row_group_rows,
+                self.max_file_size,
+                crate::tuning::estimate_row_bytes(&dest_schema),
+            );
+            if let Some(w) = self
+                .parquet_config
+                .as_ref()
+                .and_then(ignored_row_group_rows_warning)
+            {
+                static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+                WARN_ONCE.call_once(|| log::warn!("{w}"));
+            }
         }
         let fmt = format::create_format(
             self.format_type,

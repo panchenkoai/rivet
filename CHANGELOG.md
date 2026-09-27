@@ -8,6 +8,15 @@
   past the previous release. Harm now also records PostgreSQL logical-decoding spill and decoded
   bytes and SQL Server logical reads and tempdb work tables. A live test proves on every engine
   that a CDC drain reads the change log and not the table.
+- **`max_file_size` holds on parquet exports again (#307).** Parquet writes bytes only when
+  a row group closes, and a `rivet init` config sizes row groups automatically (~128 MB), so a
+  256 KB cap produced one 1.1 MB part with no warning. Row groups are now capped at a quarter
+  of `max_file_size` and a batch is written a group at a time, so parts rotate within about a
+  quarter of the cap. `parquet.row_group_rows` under the default `auto` strategy is now said to
+  be ignored, naming `fixed_rows`. Enforcing the cap made a keyset page rotate into several
+  parts, which exposed a resume that duplicated the finished parts of a page interrupted
+  mid-rotation when the cap changed between the crash and the resume; such a page is now
+  re-read whole.
 - **Breaking: `chunk_dense` is removed.** It paged by `ROW_NUMBER() OVER (ORDER BY
   chunk_column)`, recomputed per chunk, so a concurrent insert or delete skipped or
   duplicated rows even on a unique key. Nobody used it. A config that still sets

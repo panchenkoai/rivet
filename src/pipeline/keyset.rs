@@ -957,6 +957,12 @@ pub(crate) fn run_keyset(
         match &resume_run_id {
             Some(rid) => {
                 summary.run_id = rid.clone();
+                // A page that rotated into several parts and crashed before its LAST part is
+                // not committed (only the last part carries the page's cursor_high), so the
+                // resume re-reads it whole; its earlier parts must not be rehydrated too, or a
+                // re-read that rotates differently (a changed max_file_size) duplicates them.
+                let forgotten = st.forget_unfinished_page_parts(rid)?;
+                log::debug!("keyset resume: {forgotten} part(s) of an unfinished page re-read");
                 rehydrate_keyset_pages_probed(st, rid, plan, summary)?;
                 // v25 cursor-atomic reconcile: the export_state cursor can LAG the committed parts
                 // — a crash in the after_manifest_update window advanced file_log (with the page's

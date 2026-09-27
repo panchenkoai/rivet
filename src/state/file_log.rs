@@ -203,6 +203,16 @@ impl StateStore {
         )?;
         Ok(rows.into_iter().next())
     }
+
+    /// Forget the parts a keyset page logged before it finished — every row after the last
+    /// one carrying a `cursor_high` — so a resume re-reads that page whole; returns how many.
+    pub fn forget_unfinished_page_parts(&self, run_id: &str) -> Result<usize> {
+        self.execute(
+            "DELETE FROM file_log WHERE run_id = ?1 AND id > COALESCE( \
+             (SELECT MAX(id) FROM file_log WHERE run_id = ?1 AND cursor_high IS NOT NULL), 0)",
+            &[run_id.into()],
+        )
+    }
 }
 
 /// The `FileRecord` projection, written once for both backends.
@@ -288,6 +298,45 @@ mod tests {
     }
 
     use super::*;
+
+    /// A page that rotated into parts and crashed before its last one is not committed:
+    /// its earlier parts are forgotten, every finished page is kept.
+    #[test]
+    fn a_resume_forgets_only_the_parts_of_an_unfinished_page() {
+        let s = StateStore::open_in_memory().expect("in-memory state");
+        let part = |run: &'static str, name: &'static str, high: Option<&'static str>| {
+            s.record_durable_part(DurablePart {
+                run_id: run,
+                export_name: "orders",
+                file_name: name,
+                rows: 1,
+                bytes: 1,
+                format: "parquet",
+                compression: None,
+                mode: "chunked",
+                cursor_high: high,
+            })
+            .expect("record");
+        };
+        // Page 0: two parts, finished. Page 1: two parts written, crashed before its last.
+        part("r1", "p0a", None);
+        part("r1", "p0b", Some("k300"));
+        part("r1", "p1a", None);
+        part("r1", "p1b", None);
+        part("r2", "other", None); // another run is untouched
+        assert_eq!(s.forget_unfinished_page_parts("r1").expect("forget"), 2);
+        let kept: Vec<String> = s
+            .list_files_for_run("r1")
+            .unwrap()
+            .into_iter()
+            .map(|f| f.file_name)
+            .collect();
+        assert_eq!(kept, vec!["p0a", "p0b"]);
+        assert_eq!(s.list_files_for_run("r2").unwrap().len(), 1);
+        // A first page that never finished leaves nothing committed.
+        part("r3", "q0a", None);
+        assert_eq!(s.forget_unfinished_page_parts("r3").expect("forget"), 1);
+    }
 
     fn store() -> StateStore {
         StateStore::open_in_memory().expect("in-memory store")

@@ -304,6 +304,8 @@ pub struct ExportConfig {
     /// Accepts `B`/`KB`/`MB`/`GB` (case-insensitive) or a bare byte count;
     /// a fractional value is allowed (`1.5GB`). Units are binary (IEC-style):
     /// `KB` = 1024 bytes, `MB` = 1024 KB, `GB` = 1024 MB. Example: `256MB`.
+    /// Parquet row groups are capped at a quarter of it, so a part stays within
+    /// about one row group of the size whatever `parquet.row_group_strategy` says.
     pub max_file_size: Option<String>,
     /// Persist per-chunk / per-page progress so a **crashed** run resumes from the
     /// last durably committed point instead of re-reading from the start. This is
