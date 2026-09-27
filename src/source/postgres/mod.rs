@@ -76,7 +76,7 @@ impl PostgresSource {
     pub fn connect(url: &str) -> Result<Self> {
         let mut client = Client::connect(url, NoTls)
             .map_err(|e| crate::source::describe_connect_error(url, e.into()))?;
-        let transaction_pooler = detect_pg_transaction_pooler(&mut client);
+        let transaction_pooler = pin_session_formats(&mut client)?;
         if transaction_pooler {
             log::warn!(
                 "transaction-mode connection pooler detected (pgBouncer/Odyssey) — \
@@ -103,7 +103,7 @@ impl PostgresSource {
                 let mut client = pg_config_ssl_forced(url)?
                     .connect(make_tls)
                     .map_err(|e| crate::source::describe_connect_error(url, e.into()))?;
-                let transaction_pooler = detect_pg_transaction_pooler(&mut client);
+                let transaction_pooler = pin_session_formats(&mut client)?;
                 if transaction_pooler {
                     log::warn!(
                         "transaction-mode connection pooler detected (pgBouncer/Odyssey) — \
@@ -521,7 +521,27 @@ fn strip_url_query_key(url: &str, key: &str) -> String {
     }
 }
 
+/// Pin the session's text formats (UTC, ISO dates, postgres intervals, hex bytea) on a fresh
+/// connection unless a transaction pooler would leak them to other clients; returns whether one was detected.
+fn pin_session_formats(client: &mut Client) -> Result<bool> {
+    let transaction_pooler = detect_pg_transaction_pooler(client);
+    if !transaction_pooler {
+        client.batch_execute(
+            "SET TimeZone = 'UTC'; SET DateStyle = 'ISO, MDY'; \
+             SET IntervalStyle = 'postgres'; SET bytea_output = 'hex'",
+        )?;
+    }
+    Ok(transaction_pooler)
+}
+
 pub(crate) fn connect_client(url: &str, tls: Option<&TlsConfig>) -> Result<Client> {
+    let mut client = connect_client_raw(url, tls)?;
+    pin_session_formats(&mut client)?;
+    Ok(client)
+}
+
+/// Dial `url` honoring the TLS policy, with the server's own session defaults.
+fn connect_client_raw(url: &str, tls: Option<&TlsConfig>) -> Result<Client> {
     // Refuse remote plaintext (no `tls:` block) before any dial (CWE-319).
     crate::source::require_tls_or_loopback(url, tls)?;
     match tls {

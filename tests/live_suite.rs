@@ -274,3 +274,6 @@ mod live_single_abort;
 
 #[path = "live/soak_spill.rs"]
 mod soak_spill;
+
+#[path = "live/live_session_state.rs"]
+mod live_session_state;

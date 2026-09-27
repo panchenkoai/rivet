@@ -96,12 +96,21 @@ def fresh_mysql_source(net: str) -> None:
 
 MSSQL_HOST_IN_NET = os.environ.get("CDC_ORACLE_MSSQL_HOST", "mssql-cdc")
 MSSQL_URL = os.environ.get("MSSQL_CDC_URL", "sqlserver://sa:Rivet_Passw0rd!@127.0.0.1:1434/rivet")
-MSSQL_EXEC = ["docker", "exec", os.environ.get("CDC_ORACLE_MSSQL_CONTAINER", "rivet-mssql-cdc-1"),
+def _container(env_var: str, port: int, fallback: str) -> str:
+    """The container to `docker exec`: the env override, else the one publishing `port` (compose may recreate it as `-2`)."""
+    if os.environ.get(env_var):
+        return os.environ[env_var]
+    names = subprocess.run(["docker", "ps", "--filter", f"publish={port}", "--format", "{{.Names}}"],
+                           capture_output=True, text=True).stdout.split()
+    return names[0] if names else fallback
+
+
+MSSQL_EXEC = ["docker", "exec", _container("CDC_ORACLE_MSSQL_CONTAINER", 1434, "rivet-mssql-cdc-1"),
               "/opt/mssql-tools18/bin/sqlcmd", "-S", "localhost", "-U", "sa",
               "-P", "Rivet_Passw0rd!", "-C", "-d", "rivet", "-h", "-1", "-W", "-b", "-Q"]
 MONGO_HOST_IN_NET = os.environ.get("CDC_ORACLE_MONGO_HOST", "mongo80-cdc")
 MONGO_URL = os.environ.get("MONGO_CDC_URL", "mongodb://127.0.0.1:27208/rivet?replicaSet=rs0&directConnection=true")
-MONGO_EXEC = ["docker", "exec", os.environ.get("CDC_ORACLE_MONGO_CONTAINER", "stand-mongo80-cdc-1"),
+MONGO_EXEC = ["docker", "exec", _container("CDC_ORACLE_MONGO_CONTAINER", 27208, "stand-mongo80-cdc-1"),
               "mongosh", "--quiet", "rivet", "--eval"]
 
 

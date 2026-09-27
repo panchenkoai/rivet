@@ -1799,9 +1799,11 @@ def verify_batch_resume(led: Ledger) -> None:
     """`rivet run --resume` after a crash, per runner and engine: the live_chunked_recovery
     and live_resume modules, each case a ledger row. The blessed chain applies a sealed
     plan, where `--resume` is ignored, so this cell is the gate's only real resume."""
+    # These modules read the SQLite `.rivet_state.db` beside each config, so they run on
+    # SQLite even when the gate grades the Postgres backend (release-oracle-full does).
     _run_live_modules(led, "resume", "batch resume",
                       "`rivet run --resume` after a crash (live_chunked_recovery + live_resume)",
-                      ["live_chunked_recovery", "live_resume"])
+                      ["live_chunked_recovery", "live_resume"], env={"RIVET_STATE_URL": ""})
 
 
 def verify_audit_suspects(led: Ledger) -> None:
@@ -1824,6 +1826,15 @@ def verify_cdc_harm(led: Ledger) -> None:
     _run_live_modules(led, "cdc_harm", "cdc harm",
                       "a CDC drain costs the source a fraction of one scan (live_cdc_harm)",
                       ["live_cdc_harm"])
+
+
+def verify_session_state(led: Ledger) -> None:
+    """The same exports under a NON-default session (a Tokyo/German-DMY Postgres role, a
+    British SQL Server login) — the stand is UTC/ISO everywhere, so only this grades text
+    renderings re-injected as literals; one row per case."""
+    _run_live_modules(led, "session", "session state",
+                      "exports under a non-default session zone/datestyle/language (live_session_state)",
+                      ["live_session_state"])
 
 
 def verify_partition_footer(led: Ledger) -> None:
