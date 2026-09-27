@@ -18,6 +18,9 @@ Per SQL engine, on the downloaded previous binary and this one:
              part is written (this binary is next release's "previous").
   fresh      the old config over the used prefix with an EMPTY state: no row is lost;
              the rows written again are reported (a re-baseline, measured not judged).
+  cdc        per CDC engine: the previous release anchors a stream and captures a batch;
+             this binary continues its checkpoint and captures exactly the next batch —
+             nothing skipped, nothing of the first batch re-read.
 
 `cursor` and `crash` run on the SQLite state and, when the gate grades Postgres state, on
 it too. Oracles: DuckDB over the parts the manifests declare, the source's own counts.
@@ -245,6 +248,59 @@ def _crash_leg(led: Ledger, prev: Path, root: Path, engine: str, url: str, state
         _sql(engine, url, f"DROP TABLE IF EXISTS {table};")
 
 
+CDC_ENGINES = ("postgres", "mysql", "mssql", "mongo")
+
+
+def _cdc_leg(led: Ledger, prev: Path, engine: str, url: str) -> None:
+    """The previous release anchors a CDC stream and captures a batch; this binary continues its checkpoint."""
+    import duckdb
+
+    from .cdc import _ENGINES, _workdir
+    from .perf import CDC_CHANGES, _cdc_changes
+
+    eng = _ENGINES[engine]
+    work = _workdir()
+    block = eng.setup(url, work)
+    if block is None:
+        led.failed(engine, "-", SCEN, "local", f"upgrade[{engine}/cdc]: the CDC source setup failed", "setup")
+        return
+    tls = "\n  tls: { accept_invalid_certs: true }" if engine == "mssql" else ""
+    (work / "c.yaml").write_text(
+        f"source:\n  type: {engine}\n  url: \"{url}\"{tls}\nexports:\n  - name: orc_cdc_probe\n"
+        f"    table: orc_cdc_probe\n    mode: cdc\n    format: parquet\n    {block}\n"
+        "    destination:\n      type: local\n      path: ./output/\n"
+    )
+    env = {"RIVET_STATE_URL": ""}
+    out = work / "output"
+    try:
+        anchored = run([str(prev), "run", "-c", "c.yaml"], env=env, cwd=work, timeout=None)
+        _cdc_changes(engine, url, 1)
+        first = run([str(prev), "run", "-c", "c.yaml"], env=env, cwd=work, timeout=None)
+        before = _declared_names(out)
+        _cdc_changes(engine, url, 1 + CDC_CHANGES)
+        cont = run([str(rivet_bin()), "run", "-c", "c.yaml"], env=env, cwd=work, timeout=None)
+        mine = sorted(str(p) for p in out.rglob("*.parquet") if p.name in _declared_names(out) - before)
+        idc = f"CAST({eng.id_col} AS BIGINT)"  # MongoDB's `_id` lands as text
+        every = _declared(out, f"SELECT count(DISTINCT {idc}) FROM {{parts}}")
+        span = (duckdb.connect().execute(
+            f"SELECT min({idc}), count(DISTINCT {idc}) FROM read_parquet({mine})").fetchone()
+            if mine else (None, 0))
+        ok = (anchored.ok and first.ok and cont.ok
+              and every and every[0][0] == 2 * CDC_CHANGES
+              and span[0] is not None and span[0] > CDC_CHANGES and span[1] == CDC_CHANGES)
+        shown = (f"distinct ids {every[0][0] if every else 0}/{2 * CDC_CHANGES}; this binary's parts "
+                 f"hold ids from {span[0]} ({span[1]} distinct, want {CDC_CHANGES} from {CDC_CHANGES + 1})")
+        if ok:
+            led.passed(engine, "-", SCEN, "local", f"upgrade[{engine}/cdc]: this binary continued the "
+                       f"previous release's checkpoint — {shown}", "cdc")
+        else:
+            led.failed(engine, "-", SCEN, "local", f"upgrade[{engine}/cdc]: prev anchor ok={anchored.ok} "
+                       f"prev capture ok={first.ok} this ok={cont.ok}; {shown}: "
+                       f"{(cont.stderr or first.stderr or anchored.stderr).strip()[-200:]}", "cdc")
+    finally:
+        eng.cleanup(url, work)
+
+
 def verify_upgrade_continuity(led: Ledger) -> None:
     """The previous release's config, state and crash checkpoint, carried on by this binary."""
     prev = _require_prev_binary(led, "all", "-", SCEN, "local", "upgrade continuity")
@@ -270,3 +326,10 @@ def verify_upgrade_continuity(led: Ledger) -> None:
                                "a fresh Postgres state DB for the previous release", "no state db")
                     continue
                 leg(led, prev, root, engine, url, fresh)
+    for engine in CDC_ENGINES:
+        cvar = f"RIVET_CDC_{engine.upper()}_URL"
+        curl = os.environ.get(cvar, "")
+        if not curl:
+            led.skipped(engine, "-", SCEN, "local", f"upgrade[{engine}/cdc]: no {cvar}", "no url")
+            continue
+        _cdc_leg(led, prev, engine, curl)
