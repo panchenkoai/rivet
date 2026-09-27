@@ -171,6 +171,16 @@ fn cap_piece_rows(
     }
 }
 
+/// The `(offset, len)` pieces of an `n`-row batch cut every `step` rows; an empty batch is one empty piece.
+fn piece_ranges(n: usize, step: usize) -> Vec<(usize, usize)> {
+    let step = step.max(1);
+    let mut out: Vec<(usize, usize)> = (0..n).step_by(step).map(|o| (o, step.min(n - o))).collect();
+    if out.is_empty() {
+        out.push((0, 0));
+    }
+    out
+}
+
 /// The warning for `row_group_rows` set under a strategy that does not read it.
 fn ignored_row_group_rows_warning(pc: &crate::config::ParquetConfig) -> Option<String> {
     let strategy = pc.row_group_strategy.unwrap_or_default();
@@ -881,17 +891,11 @@ impl ExportSink {
     /// than a test failure, which is a far worse way to learn it.
     fn on_batch_inner(&mut self, dest_batch: &RecordBatch) -> Result<()> {
         let n = dest_batch.num_rows();
-        if n == 0 {
-            return self.on_piece(dest_batch);
-        }
         // One row group at a time when a byte cap is set: parquet flushes only when a
         // group closes, so the cap can rotate only between groups (#307).
         let step = cap_piece_rows(self.max_file_size, self.parquet_row_group_rows, n);
-        let mut offset = 0;
-        while offset < n {
-            let len = step.min(n - offset);
+        for (offset, len) in piece_ranges(n, step) {
             self.on_piece(&dest_batch.slice(offset, len))?;
-            offset += len;
         }
         Ok(())
     }

@@ -1631,7 +1631,20 @@ fn batch_partition_buckets_counts_days_and_puts_nulls_in_their_own_bucket() {
 
 #[test]
 fn a_byte_cap_sizes_row_groups_so_it_can_rotate_between_them() {
-    use super::{cap_piece_rows, row_group_rows_for_cap};
+    use super::{cap_piece_rows, piece_ranges, row_group_rows_for_cap};
+    assert_eq!(piece_ranges(10, 4), vec![(0, 4), (4, 4), (8, 2)]);
+    assert_eq!(piece_ranges(8, 4), vec![(0, 4), (4, 4)]);
+    assert_eq!(piece_ranges(3, 10), vec![(0, 3)]);
+    assert_eq!(
+        piece_ranges(0, 4),
+        vec![(0, 0)],
+        "an empty batch still reaches the writer"
+    );
+    assert_eq!(
+        piece_ranges(2, 0),
+        vec![(0, 1), (1, 1)],
+        "a zero step never loops"
+    );
     // No cap: the configured group stands.
     assert_eq!(
         row_group_rows_for_cap(Some(1_000_000), None, 100),
@@ -1684,4 +1697,26 @@ fn row_group_rows_outside_fixed_rows_is_said_to_be_ignored() {
             .is_none()
     );
     assert!(super::ignored_row_group_rows_warning(&pc(None, None)).is_none());
+}
+
+/// Only a Parquet sink under a byte cap gets row groups small enough to rotate; CSV has none.
+#[test]
+fn a_byte_capped_parquet_sink_sizes_its_row_groups_and_a_csv_sink_does_not() {
+    use arrow::datatypes::{DataType, Field};
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let capped = |format_type| {
+        let mut sink = ExportSink {
+            format_type,
+            max_file_size: Some(1024),
+            ..minimal_sink()
+        };
+        crate::source::BatchSink::on_schema(&mut sink, schema.clone()).unwrap();
+        sink.parquet_row_group_rows
+    };
+    assert!(
+        capped(crate::config::FormatType::Parquet).is_some_and(|r| r < 1024),
+        "parquet: {:?}",
+        capped(crate::config::FormatType::Parquet)
+    );
+    assert_eq!(capped(crate::config::FormatType::Csv), None);
 }
