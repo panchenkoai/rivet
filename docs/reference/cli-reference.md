@@ -32,6 +32,7 @@ This document contains the help content for the `rivet` command-line program.
 * [`rivet schema`↴](#rivet-schema)
 * [`rivet schema config`↴](#rivet-schema-config)
 * [`rivet schema cli`↴](#rivet-schema-cli)
+* [`rivet schema errors`↴](#rivet-schema-errors)
 * [`rivet journal`↴](#rivet-journal)
 
 ## `rivet`
@@ -574,6 +575,7 @@ Today: `rivet schema config` prints the JSON Schema for the `rivet.yaml` config 
 
 * `config` — Print the JSON Schema describing `rivet.yaml` to stdout
 * `cli` — Print a Markdown CLI reference (every command + flag) to stdout, generated from the clap definitions — the same source as `--help`, so it cannot drift from the actual commands
+* `errors` — Print the Markdown error-code reference (every `RIVET_*` code, its kind, exit code and operator action) to stdout, generated from the code registry
 
 
 
@@ -596,6 +598,16 @@ Print a Markdown CLI reference (every command + flag) to stdout, generated from 
 rivet schema cli > docs/reference/cli-reference.md
 
 **Usage:** `rivet schema cli`
+
+
+
+## `rivet schema errors`
+
+Print the Markdown error-code reference (every `RIVET_*` code, its kind, exit code and operator action) to stdout, generated from the code registry.
+
+rivet schema errors > docs/reference/errors.md
+
+**Usage:** `rivet schema errors`
 
 
 

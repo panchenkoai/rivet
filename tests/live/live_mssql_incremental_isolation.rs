@@ -131,7 +131,7 @@ fn mssql_lock_timeout_fails_a_blocked_read_fast() {
         .source_line("tuning:")
         .source_line("  lock_timeout_s: 1");
     let tx = format!(
-        "BEGIN TRAN; UPDATE {table} SET v = 2 WHERE id = 1;\nWAITFOR DELAY '00:00:06';\nCOMMIT;"
+        "BEGIN TRAN; UPDATE {table} SET v = 2 WHERE id = 1;\nWAITFOR DELAY '00:00:20';\nCOMMIT;"
     );
     let writer = std::thread::spawn(move || mssql_exec(&tx));
     let t0 = std::time::Instant::now();

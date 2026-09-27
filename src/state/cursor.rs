@@ -86,7 +86,8 @@ impl StateStore {
         if let Some(owner) = owner
             && !identity_matches(&owner, expected, legacy)
         {
-            anyhow::bail!(
+            crate::rivet_bail!(
+                crate::error::codes::STATE_CURSOR_OWNER_MISMATCH,
                 "export '{export_name}': the stored cursor `{value}` was written for `{owner}`, \
                  but this export now progresses on `{expected}` — comparing `{expected}` against \
                  it selects the wrong rows (on MySQL silently none, on every run).\n  \
@@ -557,11 +558,19 @@ mod tests {
         let s = store();
         s.update_with_column("orders", "", "3711169", "idvisit")
             .unwrap();
-        let msg = format!(
-            "{:#}",
-            s.get_owned("orders", "", "visit_last_action_time")
-                .unwrap_err()
+        let e = s
+            .get_owned("orders", "", "visit_last_action_time")
+            .unwrap_err();
+        assert_eq!(
+            crate::error::classify_exit(&e),
+            5,
+            "a protective refusal exits 5"
         );
+        assert_eq!(
+            crate::error::error_code(&e),
+            Some("RIVET_STATE_CURSOR_OWNER_MISMATCH")
+        );
+        let msg = format!("{e:#}");
         assert!(
             msg.contains("idvisit")
                 && msg.contains("visit_last_action_time")

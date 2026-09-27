@@ -16,6 +16,8 @@
 /// | `2`  | [`Retryable`](ExitClass::Retryable): transient (connection reset, lock-wait timeout, capacity) | safe to retry the *same* command |
 /// | `3`  | [`DataIntegrity`](ExitClass::DataIntegrity): quality gate / reconcile mismatch / `validate` verification failure / duplicate-guard / manifest inconsistency | **STOP** — data may be wrong, do **not** blindly retry |
 /// | `4`  | [`SchemaDrift`](ExitClass::SchemaDrift): `on_schema_drift: fail` tripped | the source shape changed — needs human review |
+/// | `5`  | [`Refusal`](ExitClass::Refusal): a protective stop (a foreign cursor, a newer state DB, a table rivet does not own) | a human decides; do **not** retry unchanged |
+/// | `6`  | [`Internal`](ExitClass::Internal): an invariant did not hold | a bug — report it |
 ///
 /// ## Overlap with clap's usage exit (also `2`)
 ///
@@ -43,6 +45,11 @@ pub enum ExitClass {
     /// `4` — schema-drift failure (`on_schema_drift: fail` tripped). The source
     /// shape changed; a human must review before re-running.
     SchemaDrift = 4,
+    /// `5` — a protective REFUSAL: rivet stopped on purpose so as not to lose, duplicate
+    /// or overwrite data. Retrying unchanged refuses again; a human decides.
+    Refusal = 5,
+    /// `6` — INTERNAL: an invariant rivet relies on did not hold. A bug — report it.
+    Internal = 6,
 }
 
 impl ExitClass {
@@ -122,6 +129,43 @@ impl std::fmt::Display for PreclassifiedExit {
 
 impl std::error::Error for PreclassifiedExit {}
 
+/// What KIND of failure a coded error is — the dimension an operator (and the release gate)
+/// branches on: fix the input, fix the environment, decide, stop and investigate, report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorKind {
+    /// Invalid config or command line: the same input fails the same way.
+    Usage,
+    /// The world outside rivet: network, credentials, permissions, a missing object.
+    Environment,
+    /// rivet stopped on purpose so as not to lose, duplicate or overwrite data.
+    Refusal,
+    /// A verification found the data wrong.
+    Integrity,
+    /// An invariant did not hold: a bug.
+    Internal,
+}
+
+impl ErrorKind {
+    /// The lowercase name the docs and JSON use.
+    pub fn name(self) -> &'static str {
+        match self {
+            ErrorKind::Usage => "usage",
+            ErrorKind::Environment => "environment",
+            ErrorKind::Refusal => "refusal",
+            ErrorKind::Integrity => "integrity",
+            ErrorKind::Internal => "internal",
+        }
+    }
+}
+
+/// One registered error code: its stable id, kind, and the one thing an operator does about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Code {
+    pub id: &'static str,
+    pub kind: ErrorKind,
+    pub action: &'static str,
+}
+
 /// Typed marker carrying a **stable error code** (`RIVET_CONFIG_*` /
 /// `RIVET_SOURCE_*`), for config / source failures that an operator's tooling
 /// greps by code rather than by wording.
@@ -139,22 +183,27 @@ impl std::error::Error for PreclassifiedExit {}
 /// would be reintroduced — until then it is dead weight.
 #[derive(Debug)]
 pub struct CodedError {
-    code: &'static str,
+    code: Code,
     message: String,
 }
 
 impl CodedError {
-    /// Wrap a human-facing message with a stable `RIVET_*` code.
-    pub fn new(code: &'static str, message: impl Into<String>) -> Self {
+    /// Wrap a human-facing message with a registered `RIVET_*` code.
+    pub fn new(code: Code, message: impl Into<String>) -> Self {
         Self {
             code,
             message: message.into(),
         }
     }
 
-    /// The stable `RIVET_*` code.
+    /// The stable `RIVET_*` code id.
     pub fn code(&self) -> &'static str {
-        self.code
+        self.code.id
+    }
+
+    /// The kind the code is registered as.
+    pub fn kind(&self) -> ErrorKind {
+        self.code.kind
     }
 }
 
@@ -180,7 +229,7 @@ pub fn error_code(err: &anyhow::Error) -> Option<&'static str> {
         .downcast_ref::<crate::source::StatementDurationTimeout>()
         .is_some()
     {
-        return Some(codes::SOURCE_STATEMENT_TIMEOUT);
+        return Some(codes::SOURCE_STATEMENT_TIMEOUT.id);
     }
     None
 }
@@ -214,8 +263,6 @@ pub fn classify_exit(err: &anyhow::Error) -> i32 {
     if let Some(p) = err.downcast_ref::<PreclassifiedExit>() {
         return p.0;
     }
-    // A `CodedError` (config validation) is always exit class `Generic`, which is
-    // this function's default below — so it needs no arm of its own here.
     if err.downcast_ref::<SchemaDriftError>().is_some() {
         return ExitClass::SchemaDrift.code();
     }
@@ -225,6 +272,17 @@ pub fn classify_exit(err: &anyhow::Error) -> i32 {
             .is_some()
     {
         return ExitClass::DataIntegrity.code();
+    }
+    // A registered code decides by its kind; an environment failure still goes through the
+    // transient check below (a dropped connection retries, a denied permission does not).
+    if let Some(c) = err.downcast_ref::<CodedError>() {
+        match c.kind() {
+            ErrorKind::Refusal => return ExitClass::Refusal.code(),
+            ErrorKind::Internal => return ExitClass::Internal.code(),
+            ErrorKind::Integrity => return ExitClass::DataIntegrity.code(),
+            ErrorKind::Usage => return ExitClass::Generic.code(),
+            ErrorKind::Environment => {}
+        }
     }
     if crate::pipeline::retry::classify_error(err).is_transient() {
         return ExitClass::Retryable.code();
@@ -238,47 +296,155 @@ pub fn classify_exit(err: &anyhow::Error) -> i32 {
 /// `RIVET_CONFIG_` or `RIVET_SOURCE_` prefix; the `codes_*` guard tests assert
 /// distinctness + the prefix, mirroring the verify-layer `RIVET_VERIFY_*` guard.
 pub mod codes {
-    // Config validation — always exit class Generic (`1`): fix the file, no retry.
-    pub const CONFIG_NO_EXPORTS: &str = "RIVET_CONFIG_NO_EXPORTS";
-    pub const CONFIG_CHUNK_COUNT_INVALID: &str = "RIVET_CONFIG_CHUNK_COUNT_INVALID";
-    pub const CONFIG_CHUNK_BY_DAYS_INVALID: &str = "RIVET_CONFIG_CHUNK_BY_DAYS_INVALID";
-    pub const CONFIG_DUPLICATE_EXPORT: &str = "RIVET_CONFIG_DUPLICATE_EXPORT";
+    use super::{Code, ErrorKind};
+
+    const fn usage(id: &'static str, action: &'static str) -> Code {
+        Code {
+            id,
+            kind: ErrorKind::Usage,
+            action,
+        }
+    }
+    const fn environment(id: &'static str, action: &'static str) -> Code {
+        Code {
+            id,
+            kind: ErrorKind::Environment,
+            action,
+        }
+    }
+
+    pub const CONFIG_NO_EXPORTS: Code = usage(
+        "RIVET_CONFIG_NO_EXPORTS",
+        "declare at least one export under `exports:`",
+    );
+    pub const CONFIG_CHUNK_COUNT_INVALID: Code = usage(
+        "RIVET_CONFIG_CHUNK_COUNT_INVALID",
+        "set `chunk_count` to 1 or more",
+    );
+    pub const CONFIG_CHUNK_BY_DAYS_INVALID: Code = usage(
+        "RIVET_CONFIG_CHUNK_BY_DAYS_INVALID",
+        "set `chunk_by_days` to 1 or more",
+    );
+    pub const CONFIG_DUPLICATE_EXPORT: Code = usage(
+        "RIVET_CONFIG_DUPLICATE_EXPORT",
+        "give every export a unique `name`",
+    );
     /// Two `mode: cdc` exports resolved to the same per-engine stream resource
     /// (PostgreSQL slot / MySQL server_id / checkpoint path) — including the
     /// defaults colliding, which is what a naive multi-table CDC config hits.
-    pub const CONFIG_CDC_RESOURCE_CONFLICT: &str = "RIVET_CONFIG_CDC_RESOURCE_CONFLICT";
-    pub const CONFIG_CDC_ROLLOVER_INVALID: &str = "RIVET_CONFIG_CDC_ROLLOVER_INVALID";
-    pub const CONFIG_CSV_LOAD_UNSUPPORTED: &str = "RIVET_CONFIG_CSV_LOAD_UNSUPPORTED";
+    pub const CONFIG_CDC_RESOURCE_CONFLICT: Code = usage(
+        "RIVET_CONFIG_CDC_RESOURCE_CONFLICT",
+        "give each CDC export its own slot / server_id / checkpoint path",
+    );
+    pub const CONFIG_CDC_ROLLOVER_INVALID: Code = usage(
+        "RIVET_CONFIG_CDC_ROLLOVER_INVALID",
+        "set `cdc.rollover` to 1 or more, or omit it",
+    );
+    pub const CONFIG_CSV_LOAD_UNSUPPORTED: Code = usage(
+        "RIVET_CONFIG_CSV_LOAD_UNSUPPORTED",
+        "use `format: parquet` for an export with a `load:` section",
+    );
     /// An export mode is not supported by the configured source type — today
-    /// this is a non-SQL source (MongoDB) with any `mode:` other than `full`
-    /// (chunked / incremental / keyset / time-window / cdc all need SQL).
-    pub const CONFIG_SOURCE_MODE_UNSUPPORTED: &str = "RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED";
+    /// this is a non-SQL source (MongoDB) with any `mode:` other than `full`.
+    pub const CONFIG_SOURCE_MODE_UNSUPPORTED: Code = usage(
+        "RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED",
+        "use a mode this source supports (MongoDB: `full`)",
+    );
+    /// A statement that ran past the configured duration cap, carried by the existing
+    /// `source::StatementDurationTimeout` marker (recognised in [`super::error_code`]).
+    pub const SOURCE_STATEMENT_TIMEOUT: Code = environment(
+        "RIVET_SOURCE_STATEMENT_TIMEOUT",
+        "raise `tuning.statement_timeout_s`, or narrow the chunk",
+    );
 
-    // Source — a statement that ran past the configured duration cap. Carried by
-    // the existing `source::StatementDurationTimeout` marker (recognised in
-    // [`super::error_code`]), so the long-query failure an operator's
-    // `statement_timeout` tooling watches for has a stable code without
-    // re-tagging its construction site. (Connect / auth codes are a deliberate
-    // follow-up: tagging them at `create_source` must preserve the retry path's
-    // transient classification — wrapping the driver error there can blind
-    // `classify_error` and regress retries, so it needs its own careful change.)
-    pub const SOURCE_STATEMENT_TIMEOUT: &str = "RIVET_SOURCE_STATEMENT_TIMEOUT";
+    const fn refusal(id: &'static str, action: &'static str) -> Code {
+        Code {
+            id,
+            kind: ErrorKind::Refusal,
+            action,
+        }
+    }
+    const fn integrity(id: &'static str, action: &'static str) -> Code {
+        Code {
+            id,
+            kind: ErrorKind::Integrity,
+            action,
+        }
+    }
+    const fn internal(id: &'static str, action: &'static str) -> Code {
+        Code {
+            id,
+            kind: ErrorKind::Internal,
+            action,
+        }
+    }
 
-    /// Every code, for the stability/uniqueness guard test.
-    #[cfg(test)]
-    pub(crate) const ALL: &[&str] = &[
+    pub const STATE_SCHEMA_NEWER: Code = refusal(
+        "RIVET_STATE_SCHEMA_NEWER",
+        "upgrade rivet, or point this binary at a state DB it created",
+    );
+    pub const STATE_CURSOR_OWNER_MISMATCH: Code = refusal(
+        "RIVET_STATE_CURSOR_OWNER_MISMATCH",
+        "`rivet state reset --export <name>` to start the new cursor with a full pass, or restore the previous cursor column",
+    );
+    pub const SOURCE_CURSOR_FINER_THAN_MICROSECOND: Code = refusal(
+        "RIVET_SOURCE_CURSOR_FINER_THAN_MICROSECOND",
+        "cursor on a column at microsecond precision or coarser, or cast the cursor to TIMESTAMP(6) in a curated query",
+    );
+    pub const LOAD_COUNT_MISMATCH: Code = integrity(
+        "RIVET_LOAD_COUNT_MISMATCH",
+        "compare the warehouse table with the run's manifest before re-running; the source is kept",
+    );
+    pub const LOAD_ADOPTION_COLUMN_MISMATCH: Code = refusal(
+        "RIVET_LOAD_ADOPTION_COLUMN_MISMATCH",
+        "add the export's new columns to the table (`ALTER TABLE … ADD COLUMN`) and re-run; do not rename it aside",
+    );
+    pub const INTERNAL_VALUE_CONVERTER: Code = internal(
+        "RIVET_INTERNAL_VALUE_CONVERTER",
+        "a value changed between the source and the written part — a bug; report it with the column's type",
+    );
+    pub const INTERNAL_SPILL: Code = internal(
+        "RIVET_INTERNAL_SPILL",
+        "the CDC spill log is inconsistent — a bug or a damaged spill directory; report it and re-run",
+    );
+    pub const INTERNAL_TYPE_BUILDER: Code = internal(
+        "RIVET_INTERNAL_TYPE_BUILDER",
+        "a column builder got a type it cannot build — a bug; report it with the column's type",
+    );
+
+    /// Every registered code: the docs page and the guard tests read this one list.
+    pub const ALL: &[Code] = &[
         CONFIG_NO_EXPORTS,
         CONFIG_CHUNK_COUNT_INVALID,
         CONFIG_CHUNK_BY_DAYS_INVALID,
         CONFIG_DUPLICATE_EXPORT,
         CONFIG_CDC_RESOURCE_CONFLICT,
+        CONFIG_CDC_ROLLOVER_INVALID,
+        CONFIG_CSV_LOAD_UNSUPPORTED,
+        CONFIG_SOURCE_MODE_UNSUPPORTED,
         SOURCE_STATEMENT_TIMEOUT,
+        SOURCE_CURSOR_FINER_THAN_MICROSECOND,
+        STATE_SCHEMA_NEWER,
+        STATE_CURSOR_OWNER_MISMATCH,
+        LOAD_COUNT_MISMATCH,
+        LOAD_ADOPTION_COLUMN_MISMATCH,
+        INTERNAL_VALUE_CONVERTER,
+        INTERNAL_SPILL,
+        INTERNAL_TYPE_BUILDER,
     ];
 }
 
-/// `return Err`-style bail with a stable `RIVET_CONFIG_*` code (exit class
-/// Generic). Drop-in for `anyhow::bail!` at a config-validation site — the
-/// message text is unchanged; only a typed code rides alongside it.
+/// `return Err` with a registered code: drop-in for `anyhow::bail!`, the message unchanged,
+/// the code (and so the exit class, via its kind) riding alongside it.
+#[macro_export]
+macro_rules! rivet_bail {
+    ($code:expr, $($arg:tt)*) => {
+        return ::core::result::Result::Err(::anyhow::Error::new(
+            $crate::error::CodedError::new($code, format!($($arg)*))))
+    };
+}
+
+/// A config-validation [`rivet_bail!`] (kept for the existing call sites).
 #[macro_export]
 macro_rules! config_bail {
     ($code:expr, $($arg:tt)*) => {
@@ -287,11 +453,74 @@ macro_rules! config_bail {
     };
 }
 
+/// The exit code a code of `kind` produces (an environment failure: 2 when transient, else 1).
+fn kind_exit(kind: ErrorKind) -> &'static str {
+    match kind {
+        ErrorKind::Usage => "1",
+        ErrorKind::Environment => "2 if transient, else 1",
+        ErrorKind::Refusal => "5",
+        ErrorKind::Integrity => "3",
+        ErrorKind::Internal => "6",
+    }
+}
+
+/// The Markdown error-code reference, generated from [`codes::ALL`].
+pub fn codes_markdown() -> String {
+    let mut out = String::from(
+        "# Error codes\n\n<!-- Generated by `rivet schema errors` from the code registry in \
+         src/error.rs. Do not edit. -->\n\nEvery failure rivet names carries a stable \
+         `RIVET_<FAMILY>_<NAME>` code: in `--json-errors` output as `code`, and as a `[CODE]` \
+         prefix on the text error line. The KIND decides the exit code.\n\n\
+         | exit | meaning |\n|---|---|\n\
+         | 1 | usage — fix the config or the command; retrying fails the same way |\n\
+         | 2 | a transient failure — retry the same command |\n\
+         | 3 | integrity — the data may be wrong; stop and investigate |\n\
+         | 4 | schema drift — the source shape changed; review before re-running |\n\
+         | 5 | refusal — rivet stopped on purpose to protect data; a human decides |\n\
+         | 6 | internal — an invariant did not hold; a bug, please report it |\n\n\
+         | code | kind | exit | what to do |\n|---|---|---|---|\n",
+    );
+    for c in codes::ALL {
+        out.push_str(&format!(
+            "| `{}` | {} | {} | {} |\n",
+            c.id,
+            c.kind.name(),
+            kind_exit(c.kind),
+            c.action.replace('|', "\\|")
+        ));
+    }
+    out
+}
+
 pub type Result<T> = anyhow::Result<T>;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_codes_table_renders_one_row_per_kind_with_its_exit() {
+        let md = codes_markdown();
+        for row in [
+            "| `RIVET_CONFIG_NO_EXPORTS` | usage | 1 | declare at least one export under `exports:` |",
+            "| `RIVET_SOURCE_STATEMENT_TIMEOUT` | environment | 2 if transient, else 1 | raise `tuning.statement_timeout_s`, or narrow the chunk |",
+            "| `RIVET_STATE_SCHEMA_NEWER` | refusal | 5 | upgrade rivet, or point this binary at a state DB it created |",
+            "| `RIVET_LOAD_COUNT_MISMATCH` | integrity | 3 | compare the warehouse table with the run's manifest before re-running; the source is kept |",
+            "| `RIVET_INTERNAL_SPILL` | internal | 6 | the CDC spill log is inconsistent — a bug or a damaged spill directory; report it and re-run |",
+        ] {
+            assert!(md.contains(row), "missing row: {row}\n{md}");
+        }
+    }
+
+    #[test]
+    fn the_committed_errors_reference_matches_the_registry() {
+        let committed = include_str!("../docs/reference/errors.md");
+        assert_eq!(
+            committed.trim_end(),
+            codes_markdown().trim_end(),
+            "docs/reference/errors.md is stale: regenerate it with `rivet schema errors`"
+        );
+    }
 
     #[test]
     fn schema_drift_marker_classifies_to_4() {
@@ -383,17 +612,67 @@ mod tests {
         assert_eq!(format!("{}", SchemaDriftError::new(msg)), msg);
     }
 
+    /// The families a code may name (`RIVET_<FAMILY>_<NAME>`).
+    const FAMILIES: &[&str] = &[
+        "CONFIG", "CLI", "SOURCE", "CDC", "SPILL", "TYPE", "STATE", "DEST", "PLAN", "LOAD",
+        "VALIDATE", "INIT", "INTERNAL",
+    ];
+
     #[test]
-    fn coded_error_codes_are_distinct_and_prefixed() {
-        use std::collections::HashSet;
-        let mut seen = HashSet::new();
-        for &c in codes::ALL {
-            assert!(seen.insert(c), "duplicate code: {c}");
+    fn every_registered_code_is_distinct_named_by_family_and_actionable() {
+        let mut seen = std::collections::HashSet::new();
+        for c in codes::ALL {
+            assert!(seen.insert(c.id), "duplicate code: {}", c.id);
+            let family =
+                c.id.strip_prefix("RIVET_")
+                    .and_then(|r| r.split('_').next());
             assert!(
-                c.starts_with("RIVET_CONFIG_") || c.starts_with("RIVET_SOURCE_"),
-                "code {c} must share the RIVET_CONFIG_ / RIVET_SOURCE_ prefix",
+                family.is_some_and(|f| FAMILIES.contains(&f)),
+                "{} is not RIVET_<FAMILY>_<NAME> with a known family",
+                c.id
             );
+            assert!(!c.action.trim().is_empty(), "{} names no action", c.id);
         }
+    }
+
+    #[test]
+    fn every_code_constant_is_in_the_registry() {
+        // Derived from the source, not a second list: a constant left out of ALL has no docs
+        // row and no guard (three of nine were, before the registry).
+        let src = include_str!("error.rs");
+        let consts = src.matches("pub const ").count() - src.matches("pub const ALL").count();
+        let module = &src[src.find("pub mod codes").unwrap()..];
+        let declared = module
+            .lines()
+            .filter(|l| l.trim_start().starts_with("pub const ") && l.contains(": Code"))
+            .count();
+        assert_eq!(
+            declared,
+            codes::ALL.len(),
+            "a `Code` constant is missing from codes::ALL"
+        );
+        assert!(consts >= declared);
+    }
+
+    #[test]
+    fn a_code_s_kind_decides_its_exit_class() {
+        let with = |kind| {
+            let c = Code {
+                id: "RIVET_STATE_TEST",
+                kind,
+                action: "x",
+            };
+            classify_exit(&anyhow::Error::new(CodedError::new(c, "permission denied")))
+        };
+        assert_eq!(with(ErrorKind::Refusal), 5);
+        assert_eq!(with(ErrorKind::Internal), 6);
+        assert_eq!(with(ErrorKind::Integrity), 3);
+        assert_eq!(with(ErrorKind::Usage), 1);
+        assert_eq!(
+            with(ErrorKind::Environment),
+            1,
+            "a non-transient environment failure"
+        );
     }
 
     #[test]
@@ -407,7 +686,7 @@ mod tests {
             "exports: at least one export must be defined",
         ))
         .context("while loading config");
-        assert_eq!(error_code(&e), Some(codes::CONFIG_NO_EXPORTS));
+        assert_eq!(error_code(&e), Some(codes::CONFIG_NO_EXPORTS.id));
         assert_eq!(classify_exit(&e), ExitClass::Generic.code());
         assert!(format!("{e:#}").contains("at least one export must be defined"));
     }

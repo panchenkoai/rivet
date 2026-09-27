@@ -1046,7 +1046,8 @@ fn flush(
         let arrow_sum = crate::source::value_checksum::array_checksum(arr.as_ref());
         col_sums.push((m.column_name.clone(), arrow_sum));
         if source_sum != arrow_sum {
-            anyhow::bail!(
+            crate::rivet_bail!(
+                crate::error::codes::INTERNAL_VALUE_CONVERTER,
                 "cdc value checksum mismatch in column '{}': source={source_sum} \
                  arrow={arrow_sum} — the value converter changed a value between \
                  decode and Arrow build",

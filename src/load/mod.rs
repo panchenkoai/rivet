@@ -692,7 +692,8 @@ pub fn run_load(
     if let Some(expected) = expected_rows
         && rows_loaded != expected
     {
-        bail!(
+        crate::rivet_bail!(
+            crate::error::codes::LOAD_COUNT_MISMATCH,
             "count validation failed for `{}`: loaded {rows_loaded} rows, expected {expected} — \
              NOT cleaning up source; investigate before re-running",
             loader.fqtn(table)
@@ -925,7 +926,8 @@ fn adoptable(
         .collect();
     let (total, matched) = loader.column_overlap(table, &names)?;
     if total != matched || matched != names.len() as u64 {
-        bail!(
+        crate::rivet_bail!(
+            crate::error::codes::LOAD_ADOPTION_COLUMN_MISMATCH,
             "cannot turn `{}` (a table from an earlier full load) into the change-log \
              baseline: it has {total} column(s), {matched} of the export's {} — the view over \
              it would not match the export. Align the two and re-run: add the export's new \

@@ -506,7 +506,10 @@ impl OracleSource {
             })
             .collect();
         if let Some(why) = sub_micro_cursor_refusal(request.incremental, &cursor_cols) {
-            anyhow::bail!("{why}");
+            crate::rivet_bail!(
+                crate::error::codes::SOURCE_CURSOR_FINER_THAN_MICROSECOND,
+                "{why}"
+            );
         }
         let empty_flags = projection.empty_flags.clone();
         let schema: SchemaRef = Arc::new(arrow_convert::oracle_schema(
