@@ -795,3 +795,49 @@ fn a_naive_timestamp_reads_back_the_same_wall_clock_in_any_session_zone() {
         );
     }
 }
+
+/// A column added between the first full pass and the first delta: the adoption refuses,
+/// and the remedy its message names must keep the baseline rows in the view.
+#[test]
+#[ignore = "live: requires clickhouse + fake-gcs + postgres"]
+fn a_column_added_before_the_first_delta_is_refused_and_its_remedy_keeps_the_baseline() {
+    require_alive(LiveService::ClickHouse);
+    require_alive(LiveService::FakeGcs);
+    ensure_gcs_bucket(BUCKET);
+    let (tbl, _t, mut c) = pg_batch_seeded("rivet_ch_addcol", 5);
+    let db = Db::new("rivet_chtest");
+    let rig = batch_into_clickhouse(
+        Rig::pg_batch(&tbl)
+            .mode("incremental")
+            .export_line("cursor_column: updated_at"),
+        &db,
+    );
+    let table = format!("{}.{tbl}", db.0);
+    rig.run_ok();
+    load(&rig);
+    c.batch_execute(&format!(
+        "ALTER TABLE {tbl} ADD COLUMN c INT; \
+         UPDATE {tbl} SET v = 99, c = 7, updated_at = TIMESTAMP '2026-02-01' WHERE id = 1"
+    ))
+    .expect("changes");
+    rig.run_ok();
+    let refused = rig.load_args_env(&[], &[(PASSWORD_ENV, CLICKHOUSE_PASSWORD)]);
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&refused.stdout),
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(!refused.status.success(), "the adoption refuses:\n{said}");
+    assert!(
+        said.contains("add the export's new column(s) to the table (ALTER TABLE … ADD COLUMN")
+            && said.contains("Do not rename the table aside"),
+        "the refusal names the lossless remedy and warns off the rename:\n{said}"
+    );
+    ch(&format!("ALTER TABLE {table} ADD COLUMN c Nullable(Int32)"));
+    load(&rig);
+    assert_eq!(
+        clickhouse_rows(&format!("SELECT id, v FROM {table} ORDER BY id FORMAT TSV")),
+        pg_rows(&mut c, &tbl),
+        "the baseline rows survive the remedy"
+    );
+}
