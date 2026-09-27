@@ -715,6 +715,11 @@ exclude_re = [
     # the binary through it: stubbing it to `Ok(())` fails 15 tests of
     # tests/offline_suite.rs (measured 2026-09-26).
     "replace dispatch -> Result<\\(\\)> with Ok\\(\\(\\)\\)",
+    # The binary's entry — `main` (src/main.rs) and the `cli::run_binary` it calls — is the
+    # same case: born MISSED under `--lib --bins`, which spawns no binary. Stubbing either to
+    # `()` fails 26 tests of tests/offline_suite.rs (measured 2026-09-27).
+    "^src/main\\.rs:\\d+:\\d+: replace main with \\(\\)$",
+    "replace run_binary with \\(\\)",
     # The ClickHouse loader's HTTP methods (load/clickhouse.rs): each is one statement
     # or one part sent over the HTTP interface, so no offline test can run them and
     # their body stubs are born MISSED. What each DECIDES is next door and graded:

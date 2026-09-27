@@ -1,6 +1,6 @@
 //! CLI surface for the `rivet` binary.
 //!
-//! `main.rs` only calls [`run`].
+//! `main.rs` only calls [`run_binary`].
 //! Internally the module is split into four single-purpose siblings so the
 //! 900-line monolith stays out of `main.rs`:
 //!
@@ -23,7 +23,7 @@ pub use args::parse_cli;
 pub use dispatch::dispatch;
 
 /// The `rivet` binary's entry point: parse, dispatch, report a failure, exit with its class.
-pub fn run() {
+pub fn run_binary() {
     crate::redact::install_logger();
     #[cfg(feature = "oracle")]
     let _ = rustls::crypto::ring::default_provider().install_default();

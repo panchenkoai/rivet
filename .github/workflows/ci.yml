@@ -681,9 +681,13 @@ jobs:
           if [ "$CACHE" = "miss" ]; then
             # Every shard must have REPORTED. A shard that died is a slice of
             # the diff nobody graded, and that must not read as a clean one.
+            # A single shard's artifact lands directly in shards/ (no per-artifact
+            # subdirectory), so find the rc files wherever they are.
             got=0
-            for d in shards/mutants-shard-*; do
-              [ -f "$d/rc" ] || continue
+            dirs=()
+            for rcf in $(find shards -name rc -type f); do
+              d=$(dirname "$rcf")
+              dirs+=("$d")
               got=$((got + 1))
               rc=$(cat "$d/rc")
               # cargo-mutants: 0 clean, 2 missed, 3 timeout — verdicts, graded
@@ -701,7 +705,7 @@ jobs:
               exit 1
             fi
             mkdir -p .mutants-cache
-            python3 "$CACHE_PY" record "$OUT" shards/mutants-shard-* >/dev/null
+            python3 "$CACHE_PY" record "$OUT" "${dirs[@]}" >/dev/null
           fi
           # The verdict is P1's alone; P2 mutants in a `whole` run are the audit.
           rc=0

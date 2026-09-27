@@ -63,6 +63,9 @@ ADJUDICATED: dict[str, tuple[str, int]] = {
     # fails 15 tests of tests/offline_suite.rs (measured 2026-09-26). Excluded only
     # because the in-diff gate runs `-- --lib --bins`, which spawns no binary.
     "dispatch": ("cli tests spawn the binary; stub fails 15 offline_suite tests", 50),
+    # The binary's entry (`main` → `cli::run_binary`): the same measurement, 26 tests.
+    "main": ("cli tests spawn the binary; stub fails 26 offline_suite tests", 100),
+    "run_binary": ("cli tests spawn the binary; stub fails 26 offline_suite tests", 100),
 }
 
 
