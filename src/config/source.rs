@@ -630,6 +630,23 @@ mod tests {
         }
     }
 
+    /// Whatever credentials and query options a URL carries, the state key never holds them
+    /// and does not change with them.
+    #[test]
+    fn a_source_state_key_never_carries_credentials_or_options() {
+        use proptest::prelude::*;
+        proptest!(|(user in "[a-z][a-z0-9]{0,8}", pw in "[A-Za-z0-9!%]{1,12}",
+                    opt in "[a-z]{1,6}=[a-z0-9]{1,6}")| {
+            let bare = source_state_key(SourceType::Postgres, "postgresql://db.h:5432/app");
+            let full = source_state_key(
+                SourceType::Postgres,
+                &format!("postgresql://{user}:{pw}@db.h:5432/app?{opt}"),
+            );
+            prop_assert_eq!(&full, &bare);
+            prop_assert!(!full.contains(&pw) || bare.contains(&pw));
+        });
+    }
+
     #[test]
     fn a_source_state_key_is_derived_from_its_resolved_url() {
         let mut src = make_source(SourceType::Postgres);

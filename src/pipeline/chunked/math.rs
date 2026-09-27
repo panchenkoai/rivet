@@ -476,6 +476,26 @@ mod tests {
         assert_eq!(total, max - min + 1, "sum of chunks equals total range");
     }
 
+    /// Any span anywhere in i64 — the edges where the arithmetic saturates included — is
+    /// tiled with no gap, no overlap and no window past the size.
+    #[test]
+    fn generate_chunks_tiles_any_span_of_i64() {
+        use proptest::prelude::*;
+        // Weighted to the edges: a uniform i64 almost never lands where saturation matters.
+        let edge = 1_000_000_000_000_000i64;
+        let min = prop_oneof![
+            any::<i64>(),
+            (i64::MAX - edge)..=i64::MAX,
+            i64::MIN..=(i64::MIN + edge),
+        ];
+        proptest!(|(min in min, size in 1i64..=1_000_000_000_000, windows in 0i64..=200)| {
+            let max = min.saturating_add(size.saturating_mul(windows)).saturating_sub(1);
+            prop_assume!(max >= min);
+            let chunks = generate_chunks(min, max, size);
+            assert_chunk_invariants(min, max, size, &chunks);
+        });
+    }
+
     #[test]
     fn generate_chunks_invariants_over_grid() {
         let mins: [i64; 6] = [-50, -1, 0, 1, 100, 1_000_000];
