@@ -408,7 +408,7 @@ fn run_keyset_parallel(
     use std::sync::Mutex;
 
     let kp = keyset_plan(plan);
-    let scope = plan.destination.state_key();
+    let scope = plan.source.state_key();
     let key = kp.key_column.clone();
     let page_size = kp.chunk_size;
     let checkpoint = kp.checkpoint;
@@ -903,7 +903,7 @@ pub(crate) fn run_keyset(
     state: Option<&StateStore>,
 ) -> Result<()> {
     let kp = keyset_plan(plan);
-    let scope = plan.destination.state_key();
+    let scope = plan.source.state_key();
     // The key drives both the WHERE/ORDER BY (built in the driver) and the
     // sink's per-page max-key extraction (via `cursor_extract_column`).
     let key_plan = IncrementalCursorPlan {
@@ -1147,7 +1147,7 @@ pub(crate) fn run_keyset(
         {
             st.update_with_column(
                 &plan.export_name,
-                &plan.destination.state_key(),
+                &plan.source.state_key(),
                 v,
                 &kp.key_column,
             )?;
@@ -1226,7 +1226,7 @@ pub(crate) fn run_keyset(
     if releases_anchor_at_data_complete(kp.checkpoint, kp.incremental)
         && let Some(st) = state
     {
-        st.clear_resume_run_id(&plan.export_name, &plan.destination.state_key())?;
+        st.clear_resume_run_id(&plan.export_name, &plan.source.state_key())?;
     }
 
     // Fault point: data is fully committed (and, for a non-incremental run, the

@@ -177,7 +177,7 @@ pub fn run_apply_command(
         let current = state
             .get(
                 &artifact.export_name,
-                &artifact.resolved_plan.destination.state_key(),
+                &artifact.resolved_plan.source.state_key(),
             )?
             .last_cursor_value;
         if !artifact.cursor_matches(current.as_deref()) {

@@ -6,10 +6,11 @@
   (state v30).** The cursor and the keyset crash anchor were keyed by the export name alone.
   Two configs with the same export name on one state DB — one template rolled out per
   database — shared one row. The second config continued from the first one's cursor and
-  exported nothing, exit 0 (measured: 0 of 100 rows). Both are now keyed by the destination
-  too, the way baselines have been since v29. A cursor written before v30 is continued by the
-  first run of that export and by no other config. The previous release cannot open a v30
-  state DB; it says so and writes nothing.
+  exported nothing, exit 0 (measured: 0 of 100 rows). Both are now keyed by the SOURCE too
+  (engine, host, port and database — never credentials), so a destination that changes
+  between runs, a `{date}` path for one, keeps its cursor. A cursor written before v30 is
+  continued by the first run of that export and by no other config. The previous release
+  cannot open a v30 state DB; it says so and writes nothing.
 - **The release gate now grades what rivet costs the source database.** It compared wall time
   and memory with the previous release, never the load on the source. A new stage exports the
   same table with both binaries on every engine and fails if rows scanned or temp spills grow

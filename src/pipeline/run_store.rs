@@ -115,7 +115,7 @@ impl<'a> RunStore<'a> {
             })?;
             self.state.update_with_column(
                 &self.plan.export_name,
-                &self.plan.destination.state_key(),
+                &self.plan.source.state_key(),
                 cursor_val,
                 &column,
             )?;
@@ -274,7 +274,7 @@ mod tests {
             .commit()
             .unwrap();
 
-        let cursor = state.get("orders", &plan.destination.state_key()).unwrap();
+        let cursor = state.get("orders", &plan.source.state_key()).unwrap();
         assert_eq!(
             cursor.last_cursor_value.as_deref(),
             Some("2026-05-30T12:00:00Z"),
@@ -300,7 +300,7 @@ mod tests {
         assert!(err.contains("no cursor identity"), "{err}");
         assert_eq!(
             state
-                .get("orders", &plan.destination.state_key())
+                .get("orders", &plan.source.state_key())
                 .unwrap()
                 .last_cursor_value,
             None
@@ -383,7 +383,7 @@ mod tests {
 
         assert_eq!(
             state
-                .get("orders", &plan.destination.state_key())
+                .get("orders", &plan.source.state_key())
                 .unwrap()
                 .last_cursor_value
                 .as_deref(),
