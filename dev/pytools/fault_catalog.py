@@ -32,7 +32,7 @@ def load(path: Path) -> list[dict]:
 def detectors_command(suite: str, names: list[str]) -> list[str]:
     """The cargo invocation that runs exactly `names` in `suite`."""
     if suite == "lib":
-        return [CARGO, "nextest", "run", "--lib", "--no-fail-fast",
+        return [CARGO, "nextest", "run", "--lib", "--run-ignored", "all", "--no-fail-fast",
                 "-E", " | ".join(f"test(/::{n}$/)" for n in names)]
     return [CARGO, "nextest", "run", "--test", suite, "--run-ignored", "all", "--no-fail-fast",
             "-E", " | ".join(f"test(/::{n}$/)" for n in names)]
