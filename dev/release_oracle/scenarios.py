@@ -1799,9 +1799,11 @@ def verify_batch_resume(led: Ledger) -> None:
     """`rivet run --resume` after a crash, per runner and engine: the live_chunked_recovery
     and live_resume modules, each case a ledger row. The blessed chain applies a sealed
     plan, where `--resume` is ignored, so this cell is the gate's only real resume."""
+    # These modules read the SQLite `.rivet_state.db` beside each config, so they run on
+    # SQLite even when the gate grades the Postgres backend (release-oracle-full does).
     _run_live_modules(led, "resume", "batch resume",
                       "`rivet run --resume` after a crash (live_chunked_recovery + live_resume)",
-                      ["live_chunked_recovery", "live_resume"])
+                      ["live_chunked_recovery", "live_resume"], env={"RIVET_STATE_URL": ""})
 
 
 def verify_audit_suspects(led: Ledger) -> None:
