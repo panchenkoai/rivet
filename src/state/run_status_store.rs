@@ -55,22 +55,37 @@ impl StateStore {
         prefix: &str,
         started_at: &str,
     ) -> Result<()> {
+        // On a shared Postgres state the SERVER stamps the start: supersession ranks runs by
+        // it, and writers on hosts with skewed clocks would otherwise rank by their own clocks.
+        let (stamp, params) = match &self.state_ref {
+            super::StateRef::Postgres(_) => (
+                "to_char(clock_timestamp() AT TIME ZONE 'UTC', \
+                 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"+00:00\"')",
+                vec![run_id.into(), export_name.into(), prefix.into()],
+            ),
+            super::StateRef::Sqlite(_) => (
+                "?4",
+                vec![
+                    run_id.into(),
+                    export_name.into(),
+                    prefix.into(),
+                    started_at.into(),
+                ],
+            ),
+        };
         self.execute(
-            "INSERT INTO run_status
-               (run_id, export_name, prefix, status, started_at, finished_at)
-             VALUES (?1, ?2, ?3, 'running', ?4, NULL)
-             ON CONFLICT(run_id) DO UPDATE SET
-                 export_name = excluded.export_name,
-                 prefix      = excluded.prefix,
-                 status      = 'running',
-                 started_at  = excluded.started_at,
-                 finished_at = NULL",
-            &[
-                run_id.into(),
-                export_name.into(),
-                prefix.into(),
-                started_at.into(),
-            ],
+            &format!(
+                "INSERT INTO run_status
+                   (run_id, export_name, prefix, status, started_at, finished_at)
+                 VALUES (?1, ?2, ?3, 'running', {stamp}, NULL)
+                 ON CONFLICT(run_id) DO UPDATE SET
+                     export_name = excluded.export_name,
+                     prefix      = excluded.prefix,
+                     status      = 'running',
+                     started_at  = excluded.started_at,
+                     finished_at = NULL"
+            ),
+            &params,
         )?;
         Ok(())
     }

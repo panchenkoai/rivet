@@ -376,3 +376,39 @@ pub fn ledger_load_statuses(cfg: &std::path::Path, target_table: &str) -> Vec<St
         None => StateDb::next_to_config(cfg).load_statuses(target_table),
     }
 }
+
+const STATE_ADMIN: &str = "host=127.0.0.1 port=5433 user=rivet password=rivet dbname=postgres";
+
+/// A fresh database on the state server, dropped (with anything it holds) when the guard goes.
+pub struct ScratchStateDb {
+    pub name: String,
+}
+
+impl ScratchStateDb {
+    /// Create `<tag>_<unique>` on the state server.
+    pub fn new(tag: &str) -> Self {
+        let name = crate::common::unique_name(tag);
+        let mut c = postgres::Client::connect(STATE_ADMIN, postgres::NoTls).expect("state server");
+        c.batch_execute(&format!("CREATE DATABASE {name}")).unwrap();
+        Self { name }
+    }
+    /// A `RIVET_STATE_URL` for it.
+    pub fn url(&self) -> String {
+        format!("postgresql://rivet:rivet@127.0.0.1:5433/{}", self.name)
+    }
+    /// A direct client on it.
+    pub fn client(&self) -> postgres::Client {
+        postgres::Client::connect(&self.url(), postgres::NoTls).expect("scratch state DB")
+    }
+}
+
+impl Drop for ScratchStateDb {
+    fn drop(&mut self) {
+        if let Ok(mut c) = postgres::Client::connect(STATE_ADMIN, postgres::NoTls) {
+            let _ = c.batch_execute(&format!(
+                "DROP DATABASE IF EXISTS {} WITH (FORCE)",
+                self.name
+            ));
+        }
+    }
+}

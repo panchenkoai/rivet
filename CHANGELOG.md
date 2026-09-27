@@ -20,6 +20,12 @@
   table needs `ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS`; a table without it, or with a type
   the preview does not capture (LOBs among them), is refused by name. `rivet load` of an
   Oracle stream is not supported yet.
+- **On a shared Postgres state, the state server stamps when a run started.** Runs were
+  ranked by the writer's own clock, so a run that crashed on a host whose clock ran ahead
+  outranked the run that replaced it, and `rivet load --gc-orphans` kept treating the prefix
+  as still being written until that clock caught up (cleanup deferred, nothing lost). The
+  start is now `clock_timestamp()` on the state server; a SQLite state keeps the local
+  clock, which is the only one it has.
 - **Two configs sharing a Postgres state DB no longer read each other's incremental cursor
   (state v30).** The cursor and the keyset crash anchor were keyed by the export name alone.
   Two configs with the same export name on one state DB — one template rolled out per
