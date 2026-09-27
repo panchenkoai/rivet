@@ -303,6 +303,19 @@ def _self_test() -> int:
     assert perf_verdict("postgres", base, Sample(True, 1.05, 0.05, 50 * 1024 * 1024, {})) == []
     assert perf_verdict("postgres", base, Sample(True, 2.0, 0.02, 50 * 1024 * 1024, {}))
     assert perf_verdict("postgres", base, Sample(True, 1.0, 0.02, 200 * 1024 * 1024, {}))
+    # Known reds: an in-date entry downgrades its failure, an expired one does not, and an
+    # entry nothing matched in a full run is reported as fixed.
+    import datetime as _dt
+    from . import known_red as kr
+    k = kr.KNOWN_RED[0]
+    assert kr.match(f"x {k.match} y", _dt.date(2026, 1, 1)) == (k, True)
+    assert kr.match(f"x {k.match} y", _dt.date(2099, 1, 1)) == (k, False)
+    assert kr.match("an unrelated failure", _dt.date(2026, 1, 1)) == (None, False)
+    probe = Ledger(colour=False)
+    probe.failed("-", "-", "s", "-", f"boom {k.match}")
+    assert probe.cells[-1].status is Status.KNOWN and not probe.red
+    probe.close_known_red()
+    assert probe.red, "an entry that matched nothing in a full run must fail"
     print("self-test ok: live modules are derived; perf tolerances grade regressions, not noise")
     print("\nregression stage (child harness, stand, banner):")
     return regression._self_test()
@@ -1035,6 +1048,9 @@ def main(argv: list[str] | None = None) -> int:
         # Last: it runs every live_suite test no cell above already ran.
         live_modules.verify_live_modules(led)
         verify_no_invariant_violations(led)
+        # Only a FULL run can say a known red no longer fires.
+        if not (ns.engines or ns.versions or ns.no_cloud or ns.latest_only):
+            led.close_known_red()
         rc = led.report()
         # A run that graded nothing against the previous release has to say so
         # AFTER the verdict, where the reader's eye lands: `RELEASE-READY` is

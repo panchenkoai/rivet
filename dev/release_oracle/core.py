@@ -58,6 +58,7 @@ class Status(str, Enum):
     PASS = "PASS"
     FAIL = "FAIL"
     SKIP = "SKIP"
+    KNOWN = "KNOWN"  # a failure recorded in known_red.py with a reason, in date
 
 
 @dataclass(frozen=True)
@@ -82,6 +83,7 @@ class Ledger:
 
     def __init__(self, *, colour: bool | None = None) -> None:
         self.cells: list[Cell] = []
+        self.known_seen: set[str] = set()
         if colour is None:
             colour = sys.stdout.isatty() or os.environ.get("FORCE_COLOR") == "1"
         self._colour = colour
@@ -167,6 +169,7 @@ class Ledger:
         for line in self._buf or []:
             parent._emit(line)
         parent.cells.extend(self.cells)
+        parent.known_seen |= self.known_seen
         # Spans DO travel (unlike _phase_times): each is a per-engine wall-clock
         # the parent reports ranked, not summed, so overlap across engines is not
         # double-counted. This is the only window into the parallel matrix.
@@ -190,8 +193,29 @@ class Ledger:
         self.add(engine, version, scenario, store, Status.PASS, detail or msg)
 
     def failed(self, engine: str, version: str, scenario: str, store: str, msg: str, detail: str = "") -> None:
+        from . import known_red
+        entry, in_date = known_red.match(msg)
+        if entry is not None:
+            self.known_seen.add(entry.match)
+        if entry is not None and in_date:
+            self.skip(f"KNOWN RED (until {entry.expires}: {entry.reason}) — {msg}")
+            self.add(engine, version, scenario, store, Status.KNOWN, detail or msg)
+            return
+        if entry is not None:
+            msg = f"{msg} — its known-red entry EXPIRED {entry.expires}: fix it or renew the entry"
         self.bad(msg)
         self.add(engine, version, scenario, store, Status.FAIL, detail or msg)
+
+    def close_known_red(self) -> None:
+        """After a FULL run: a known-red entry no failure matched is fixed — it must be removed."""
+        from . import known_red
+        for k in known_red.KNOWN_RED:
+            if k.match not in self.known_seen:
+                # Straight to FAIL: the message quotes the entry, so `failed` would match it.
+                msg = (f"known-red entry `{k.match}` matched no failure this run — it is fixed; "
+                       "remove it from dev/release_oracle/known_red.py")
+                self.bad(msg)
+                self.add("-", "-", "known_red", "-", Status.FAIL, msg)
 
     def skipped(self, engine: str, version: str, scenario: str, store: str, msg: str, detail: str = "") -> None:
         self.skip(msg)
@@ -269,6 +293,9 @@ class Ledger:
                     print(f"  {sum(ds) / 60.0:6.1f} min  {key:28} n={len(ds):<4} "
                           f"mean={sum(ds) / len(ds):5.1f}s  max={max(ds):5.1f}s")
                 print()
+        known = [c for c in self.cells if c.status is Status.KNOWN]
+        if known:
+            print(self._c("1;33", f"  {len(known)} KNOWN RED cell(s), each recorded in known_red.py with a reason and an expiry."))
         if self.red:
             print(self._c("1;31", "  NOT RELEASABLE — one or more cells failed (see ✗ above)."))
             return 1
