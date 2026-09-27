@@ -48,6 +48,7 @@ SCEN = "perf_regression"
 ROWS = 200_000
 DELTA = 20_000
 CDC_CHANGES = 20_000
+BIG_ROWS = 2_000_000
 REPS = 3
 MIB = 1024 * 1024
 
@@ -142,7 +143,8 @@ def _fresh(d: Path) -> None:
         f.unlink()
 
 
-def _batch_path(binary: Path, d: Path, url: str, engine: str, table: str, path: str) -> Sample | None:
+def _batch_path(binary: Path, d: Path, url: str, engine: str, table: str, path: str,
+                rows: int = ROWS, idc: str = "id") -> Sample | None:
     """Warm up, then the minimum of REPS measured runs of one batch path."""
     env = {"RIVET_PERF_URL": url, "RIVET_STATE_URL": ""}
     samples: list[Sample] = []
@@ -162,8 +164,8 @@ def _batch_path(binary: Path, d: Path, url: str, engine: str, table: str, path: 
         if i:
             samples.append(s)
     # A fast run that read nothing is not a measurement: the last output holds every row.
-    got = _declared(d / "output", "SELECT count(DISTINCT id) FROM {parts}")
-    want = ROWS + (REPS + 1) * DELTA if path == "incremental" else ROWS
+    got = _declared(d / "output", f"SELECT count(DISTINCT {idc}) FROM {{parts}}")
+    want = rows + (REPS + 1) * DELTA if path == "incremental" else rows
     if not got or got[0][0] != want:
         return None
     return _best(samples)
@@ -210,6 +212,66 @@ def _batch(led: Ledger, prev: Path, root: Path) -> None:
                 _grade(led, engine, path, p, c)
             finally:
                 _sql(engine, url, f"DROP TABLE IF EXISTS {table};")
+
+
+def _pair(led: Ledger, prev: Path, root: Path, engine: str, url: str, table: str, mode: str,
+          label: str, rows: int = ROWS, idc: str = "id", init_url: str | None = None) -> None:
+    """Grade one path: the previous release's init config, run by both binaries."""
+    d_prev = _init_dir(prev, root, f"{engine}_{label}_prev".replace("@", "_"), init_url or url, table, mode)
+    if d_prev is None:
+        led.failed(engine, "-", SCEN, label, f"perf[{engine}/{label}]: previous init failed", "init")
+        return
+    d_cur = root / f"{engine}_{label}_cur".replace("@", "_")
+    d_cur.mkdir()
+    shutil.copy(d_prev / "c.yaml", d_cur / "c.yaml")
+    path = "keyset" if mode == "chunked" else "full"
+    _grade(led, engine, label, _batch_path(prev, d_prev, url, engine, table, path, rows, idc),
+           _batch_path(rivet_bin(), d_cur, url, engine, table, path, rows, idc))
+
+
+def _off_happy_path(led: Ledger, prev: Path, root: Path) -> None:
+    """A 50 ms link, a table ten times larger, and a document store — the paths a lab never sees."""
+    from .failure import PG_TOXI_URL, TOXI_PROXY, _toxi, _toxi_lock
+
+    url = os.environ.get("RIVET_ORACLE_POSTGRES_URL", "")
+    if url:
+        table = f"perf_pg_lat_{os.getpid()}"
+        if _seed("postgres", url, table, ROWS, with_cursor=False):
+            try:
+                with _toxi_lock():
+                    _toxi("POST", "/proxies", {"name": TOXI_PROXY, "listen": "0.0.0.0:15432",
+                                               "upstream": "postgres:5432", "enabled": True})
+                    code = _toxi("POST", f"/proxies/{TOXI_PROXY}/toxics",
+                                 {"name": "perf_latency", "type": "latency", "stream": "downstream",
+                                  "attributes": {"latency": 50}})
+                    try:
+                        if code != 200:
+                            led.failed("postgres", "-", SCEN, "latency", f"perf[postgres/@50ms]: "
+                                       f"toxiproxy refused the latency toxic (HTTP {code})", "toxi")
+                        else:
+                            for mode, label in (("full", "full@50ms"), ("chunked", "keyset@50ms")):
+                                _pair(led, prev, root, "postgres", PG_TOXI_URL, table, mode, label)
+                    finally:
+                        _toxi("DELETE", f"/proxies/{TOXI_PROXY}/toxics/perf_latency")
+            finally:
+                _sql("postgres", url, f"DROP TABLE IF EXISTS {table};")
+        big = f"perf_pg_big_{os.getpid()}"
+        if _seed("postgres", url, big, BIG_ROWS, with_cursor=False):
+            try:
+                _pair(led, prev, root, "postgres", url, big, "chunked", "keyset-2M", rows=BIG_ROWS)
+            finally:
+                _sql("postgres", url, f"DROP TABLE IF EXISTS {big};")
+    murl = os.environ.get("RIVET_ORACLE_MONGO_URL", "")
+    if murl:
+        from .cdc import _mongosh
+
+        coll = f"perf_mg_{os.getpid()}"
+        _mongosh(murl, f"db.{coll}.drop(); db.{coll}.insertMany(Array.from({{length: {ROWS}}}, "
+                       f"(_, i) => ({{_id: i + 1, v: i, meta: {{k: i}}}})));")
+        try:
+            _pair(led, prev, root, "mongo", murl, coll, "full", "full", idc="CAST(_id AS BIGINT)")
+        finally:
+            _mongosh(murl, f"db.{coll}.drop();")
 
 
 def _cdc_changes(engine: str, url: str, lo: int) -> None:
@@ -341,4 +403,5 @@ def verify_perf_regression(led: Ledger) -> None:
     root = Path(tempfile.mkdtemp(prefix="rivet-oracle-perf-"))
     _aa(led, prev, root)
     _batch(led, prev, root)
+    _off_happy_path(led, prev, root)
     _cdc(led, prev)
