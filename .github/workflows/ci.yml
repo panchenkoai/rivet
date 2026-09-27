@@ -235,7 +235,11 @@ jobs:
     # itself — every live-only mutant it deprioritises is ~90s not spent — but
     # a diff that is fully offline-reachable pays the measurement for nothing,
     # so the ceiling absorbs it rather than the budget.
-    timeout-minutes: 120
+    # The ceiling must COVER the budget: 120 mutants x ~80s = 160 min, plus the
+    # cold build and the reach measurement (~30 min). At 120 min a diff of ~110
+    # in-budget mutants was cancelled half-graded (PR #314, 2026-09-27) and the
+    # blocking verdict read "no verdict" — a budget the timeout cannot pay for.
+    timeout-minutes: 190
     # Advisory, not blocking: a foundational-module PR (e.g. the ~3k-line
     # `src/load` layer = ~400 in-diff mutants) can't finish inside the per-diff
     # budget — killing mutants doesn't help, the run is just too large. The
