@@ -424,13 +424,7 @@ fn run_keyset_parallel(
     } else {
         None
     };
-    let resume_run_id = match (resume_run_id, state) {
-        (Some(rid), Some(st)) => {
-            let ranged = st.has_keyset_ranges(&plan.export_name, &rid, Some(&key))?;
-            own_anchor_or_fresh(st, &plan.export_name, rid, true, ranged)?
-        }
-        (rid, _) => rid,
-    };
+    let resume_run_id = resume_anchor(state, &plan.export_name, resume_run_id, true, &key)?;
 
     // Incremental (iteration 3): a FRESH run seeks past the persisted anchor
     // (`floor`) up to the source max AT OPEN (`ceil`) — bounding the last range at
@@ -840,14 +834,20 @@ fn anchor_is_own(parallel_runner: bool, anchor_has_ranges: bool) -> bool {
     parallel_runner == anchor_has_ranges
 }
 
-/// The anchor to resume, or `None` (anchor cleared) when another runner shape wrote it.
-fn own_anchor_or_fresh(
-    st: &StateStore,
+/// The crash anchor to resume, or `None` (anchor cleared) when another runner shape wrote it.
+fn resume_anchor(
+    state: Option<&StateStore>,
     export_name: &str,
-    rid: String,
+    rid: Option<String>,
     parallel_runner: bool,
-    anchor_has_ranges: bool,
+    key: &str,
 ) -> Result<Option<String>> {
+    let (Some(rid), Some(st)) = (rid.clone(), state) else {
+        return Ok(rid);
+    };
+    // A parallel run's ranges must be on THIS key; any ranges at all mark a parallel anchor.
+    let on_key = parallel_runner.then_some(key);
+    let anchor_has_ranges = st.has_keyset_ranges(export_name, &rid, on_key)?;
     if anchor_is_own(parallel_runner, anchor_has_ranges) {
         return Ok(Some(rid));
     }
@@ -939,13 +939,13 @@ pub(crate) fn run_keyset(
     // checkpoint no longer implies incremental-by-key).
     let resume_run_id: Option<String> = if kp.checkpoint {
         match state {
-            Some(st) => match st.get_resume_run_id(&plan.export_name)? {
-                Some(rid) => {
-                    let ranged = st.has_keyset_ranges(&plan.export_name, &rid, None)?;
-                    own_anchor_or_fresh(st, &plan.export_name, rid, false, ranged)?
-                }
-                None => None,
-            },
+            Some(st) => resume_anchor(
+                Some(st),
+                &plan.export_name,
+                st.get_resume_run_id(&plan.export_name)?,
+                false,
+                &kp.key_column,
+            )?,
             None => None,
         }
     } else {
@@ -1234,6 +1234,63 @@ pub(crate) fn run_keyset(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn resume_anchor_keeps_its_own_shape_and_clears_the_other() {
+        let st = StateStore::open_in_memory().unwrap();
+        let ranges = [(None, Some("5".to_string())), (Some("5".to_string()), None)];
+        let anchored = |rid: &str, ranged_on: Option<&str>| {
+            st.set_resume_run_id("e", rid).unwrap();
+            if let Some(key) = ranged_on {
+                st.persist_keyset_ranges("e", rid, key, &ranges).unwrap();
+            }
+        };
+        anchored("par", Some("id"));
+        assert_eq!(
+            resume_anchor(Some(&st), "e", Some("par".into()), true, "id").unwrap(),
+            Some("par".into())
+        );
+        assert_eq!(
+            st.get_resume_run_id("e").unwrap(),
+            Some("par".into()),
+            "kept"
+        );
+        assert_eq!(
+            resume_anchor(Some(&st), "e", Some("par".into()), false, "id").unwrap(),
+            None
+        );
+        assert_eq!(
+            st.get_resume_run_id("e").unwrap(),
+            None,
+            "a sequential run clears a parallel anchor"
+        );
+
+        anchored("seq", None);
+        assert_eq!(
+            resume_anchor(Some(&st), "e", Some("seq".into()), false, "id").unwrap(),
+            Some("seq".into())
+        );
+        assert_eq!(
+            resume_anchor(Some(&st), "e", Some("seq".into()), true, "id").unwrap(),
+            None
+        );
+        assert_eq!(
+            st.get_resume_run_id("e").unwrap(),
+            None,
+            "a parallel run clears a sequential anchor"
+        );
+
+        anchored("other", Some("ts"));
+        assert_eq!(
+            resume_anchor(Some(&st), "e", Some("other".into()), true, "id").unwrap(),
+            None,
+            "ranges on another key do not make a parallel anchor on this one"
+        );
+        assert_eq!(
+            resume_anchor(None, "e", Some("x".into()), true, "id").unwrap(),
+            Some("x".into())
+        );
+    }
+
     #[test]
     fn an_anchor_belongs_to_the_runner_shape_that_wrote_it() {
         assert!(anchor_is_own(true, true), "parallel resumes its own ranges");

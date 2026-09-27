@@ -423,14 +423,18 @@ pub(super) fn print(agg: &RunAggregate) {
             eprintln!("    - {}: {}", e.export_name, truncate(cause, 200));
         }
         if !chunked_recovery.is_empty() {
-            print_chunked_recovery(&chunked_recovery, agg.config_path.as_deref());
+            write_chunked_recovery(
+                &mut std::io::stderr(),
+                &chunked_recovery,
+                agg.config_path.as_deref(),
+            );
         }
     }
 }
 
-/// Print one consolidated recovery block for the failed chunked exports.
-fn print_chunked_recovery(exports: &[&str], config_path: Option<&str>) {
-    eprint!("{}", chunked_recovery_text(exports, config_path));
+/// Write one consolidated recovery block for the failed chunked exports to `w`.
+fn write_chunked_recovery(w: &mut dyn std::io::Write, exports: &[&str], config_path: Option<&str>) {
+    let _ = std::io::Write::write_all(w, chunked_recovery_text(exports, config_path).as_bytes());
 }
 
 /// The recovery block: a plain run resumes each interrupted checkpoint; a reset abandons it (then run WITHOUT --resume).
@@ -629,6 +633,17 @@ mod tests {
             "a reset is followed by a run without --resume:\n{text}"
         );
         assert!(!text.contains("--resume"), "{text}");
+        assert!(
+            chunked_recovery_text(&["a"], Some("")).contains("rivet run --config <CONFIG>\n"),
+            "an empty config path prints the placeholder"
+        );
+        let mut written = Vec::new();
+        write_chunked_recovery(&mut written, &["a", "b"], Some("r.yaml"));
+        assert_eq!(
+            String::from_utf8(written).unwrap(),
+            text,
+            "the block is what gets written"
+        );
     }
 
     /// A child that CRASHED must be reported as failed with its own cause — not

@@ -434,16 +434,13 @@ fn mssql_cursor_literal(value: &str) -> String {
         return escape_mssql_literal(value);
     };
     // Rounded, not cut: a legacy DATETIME (n/300 s) converts to DATETIME2 rounded, so a cut bound sits below its own row.
-    let fitted = match iso.split_once('.') {
-        Some((_, frac)) if frac.len() > 7 => dt
-            .duration_round(chrono::TimeDelta::nanoseconds(100))
-            .map_or(iso.clone(), |r| {
-                let mut s = r.format("%Y-%m-%dT%H:%M:%S%.9f").to_string();
-                s.truncate(s.len() - 2);
-                s
-            }),
-        _ => iso.clone(),
-    };
+    let fitted = dt
+        .duration_round(chrono::TimeDelta::nanoseconds(100))
+        .map_or(iso, |r| {
+            let mut s = r.format("%Y-%m-%dT%H:%M:%S%.9f").to_string();
+            s.truncate(s.len() - 2);
+            s
+        });
     format!("CAST({} AS DATETIME2(7))", escape_mssql_literal(&fitted))
 }
 
@@ -915,7 +912,7 @@ mod tests {
     fn a_mssql_timestamp_cursor_is_typed_so_a_datetime_column_accepts_it() {
         assert_eq!(
             mssql_cursor_literal("2024-01-01T10:00:00.456667"),
-            "CAST('2024-01-01T10:00:00.456667' AS DATETIME2(7))"
+            "CAST('2024-01-01T10:00:00.4566670' AS DATETIME2(7))"
         );
         assert_eq!(
             mssql_cursor_literal("2024-01-01T10:00:00.123456789"),
@@ -936,7 +933,7 @@ mod tests {
         assert_eq!(mssql_cursor_literal("Zoë"), "N'Zoë'");
         assert_eq!(
             mssql_cursor_literal("2024-05-10 10:00:00"),
-            "CAST('2024-05-10T10:00:00' AS DATETIME2(7))",
+            "CAST('2024-05-10T10:00:00.0000000' AS DATETIME2(7))",
             "a space-form timestamp is sent in the DATEFORMAT-independent T form"
         );
     }

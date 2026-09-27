@@ -224,6 +224,14 @@ exclude_re = [
     # 2026-08-20, then reverted). The whole live_keyset suite guards the bodies.
     "replace run_keyset ->",
     "replace run_keyset_parallel ->",
+    # introspect_mssql_table_for_chunking (source/mssql/mod.rs) reads sys.* over a
+    # real SQL Server connection; OracleSource::export_within_budget drives a real
+    # Oracle cursor. Unkillable under --lib. Proven live-killed by hand 2026-09-27
+    # (stub applied, test run, reverted): Ok(Default::default()) empties keyset_keys,
+    # so keyset_over_an_mssql_varchar_key_reads_every_key_under_the_default_sql_collation
+    # refuses the key; Ok(()) exports nothing, 31 of 44 live_oracle tests RED.
+    "replace introspect_mssql_table_for_chunking ->",
+    "replace OracleSource::export_within_budget ->",
     # run_with_reconnect / run_mongo_parallel (ADR-0028 seam cut-over, PR: the
     # finalize-export-seam branch) are live-only export runners: the first wraps
     # run_single_export's retry loop over a real source connection, the second
