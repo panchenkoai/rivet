@@ -310,16 +310,29 @@ INVARIANT_MARKER = "run-integrity invariant violated"
 INVARIANT_HITS: list[tuple[str, str]] = []
 
 
+#: rivet's INTERNAL errors (a broken invariant — a bug) carry a `RIVET_INTERNAL_*` code, in the
+#: `[CODE]` text prefix and the JSON `code` field alike. One in ANY gated command fails the gate,
+#: even where the test expected the command to fail.
+INTERNAL_MARKER = "RIVET_INTERNAL_"
+INTERNAL_HITS: list[tuple[str, str]] = []
+
+
 def note_invariant_violations(argv: Sequence[str], text: str) -> None:
-    """Record each run-integrity invariant warning in a command's output."""
+    """Record each run-integrity invariant warning and each INTERNAL error in a command's output."""
     for line in text.splitlines():
+        cmd = " ".join(str(a) for a in argv)[:200]
         if INVARIANT_MARKER in line:
-            INVARIANT_HITS.append((" ".join(str(a) for a in argv)[:200], line.strip()[:400]))
+            INVARIANT_HITS.append((cmd, line.strip()[:400]))
+        if INTERNAL_MARKER in line and ("Error" in line or '"code"' in line):
+            INTERNAL_HITS.append((cmd, line.strip()[:400]))
 
 
 def verify_no_invariant_violations(led: "Ledger") -> None:
     """Fail the gate for every run that reported an incomplete integrity record."""
     led.phase("Run-integrity invariant — no gated run may skip a per-export facade")
+    for cmd, line in INTERNAL_HITS:
+        led.failed("all", "-", "internal-error", "-",
+                   f"internal error (a rivet bug) in `{cmd}` — {line}", "internal")
     if not INVARIANT_HITS:
         led.passed("all", "-", "run-integrity", "-",
                    "run-integrity: no gated run reported a skipped facade", "clean")

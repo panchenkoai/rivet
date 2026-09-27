@@ -303,6 +303,12 @@ def _self_test() -> int:
     assert perf_verdict("postgres", base, Sample(True, 1.05, 0.05, 50 * 1024 * 1024, {})) == []
     assert perf_verdict("postgres", base, Sample(True, 2.0, 0.02, 50 * 1024 * 1024, {}))
     assert perf_verdict("postgres", base, Sample(True, 1.0, 0.02, 200 * 1024 * 1024, {}))
+    # An INTERNAL error anywhere in a gated command's output is a gate failure.
+    from . import core as _core
+    _core.note_invariant_violations(["rivet", "run"], "Error: [RIVET_INTERNAL_SPILL] cdc spill: sealed twice")
+    _core.note_invariant_violations(["rivet", "run"], 'a row mentions RIVET_INTERNAL_ in its data')
+    assert len(_core.INTERNAL_HITS) == 1, _core.INTERNAL_HITS
+    _core.INTERNAL_HITS.clear()
     # Known reds: an in-date entry downgrades its failure, an expired one does not, and an
     # entry nothing matched in a full run is reported as fixed.
     import datetime as _dt
