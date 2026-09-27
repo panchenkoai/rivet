@@ -971,7 +971,7 @@ fn finalize_keyset_anchor(
     failed: bool,
 ) {
     if !failed && matches!(plan.strategy, ExtractionStrategy::Keyset(_)) {
-        let _ = state.clear_resume_run_id(export_name, &plan.destination.state_key());
+        let _ = state.clear_resume_run_id(export_name, &plan.source.state_key());
         // Parallel keyset persists its per-range recovery rows under the same
         // anchor; clear them too (a no-op for sequential keyset, which writes none).
         let _ = state.clear_keyset_ranges(export_name);

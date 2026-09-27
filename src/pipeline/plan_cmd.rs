@@ -612,7 +612,7 @@ fn compute_plan_data(
 
         ExtractionStrategy::Incremental(_) => {
             let cursor_snapshot = state
-                .get(&plan.export_name, &plan.destination.state_key())?
+                .get(&plan.export_name, &plan.source.state_key())?
                 .last_cursor_value;
             Ok(ComputedPlanData {
                 chunk_ranges: vec![],
