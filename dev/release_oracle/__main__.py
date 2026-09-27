@@ -55,6 +55,7 @@ from . import (
     failure,
     gifs,
     init_delta,
+    live_modules,
     partner_shape,
     perf,
     regression,
@@ -289,6 +290,20 @@ def _self_test() -> int:
     assert hv("postgres", {"pg_blks_hit": 1}, {"pg_blks_hit": 999999}, 1.25, 200) == ([], []), \
         "cache counters are recorded, not graded"
     print("self-test ok: a source-harm counter past the previous release fails the gate")
+    # The derived live-module run: an exclusion names a module that exists, and the filter
+    # drops what a dedicated cell already ran.
+    mods = live_modules.live_suite_modules()
+    stale = [m for m in live_modules.EXCLUDED if m not in mods]
+    assert not stale, f"live_modules.EXCLUDED names modules live_suite no longer has: {stale}"
+    left, expr = live_modules.derived_filter(["a", "b", "common"], {"b"}, {"t_1"})
+    assert left == ["a"] and expr == "(test(/^a::/)) - test(/::(t_1)$/)", (left, expr)
+    # perf: a regression past the tolerance fails, noise under the absolute slack does not.
+    from .perf import Sample, perf_verdict
+    base = Sample(True, 1.0, 0.02, 50 * 1024 * 1024, {})
+    assert perf_verdict("postgres", base, Sample(True, 1.05, 0.05, 50 * 1024 * 1024, {})) == []
+    assert perf_verdict("postgres", base, Sample(True, 2.0, 0.02, 50 * 1024 * 1024, {}))
+    assert perf_verdict("postgres", base, Sample(True, 1.0, 0.02, 200 * 1024 * 1024, {}))
+    print("self-test ok: live modules are derived; perf tolerances grade regressions, not noise")
     print("\nregression stage (child harness, stand, banner):")
     return regression._self_test()
 
@@ -1017,6 +1032,8 @@ def main(argv: list[str] | None = None) -> int:
                     sub, keep=ns.keep, parallel=ns.engine_parallel,
                     bring_up=bring_up, seed_engine=seed_engine)),
             ])
+        # Last: it runs every live_suite test no cell above already ran.
+        live_modules.verify_live_modules(led)
         verify_no_invariant_violations(led)
         rc = led.report()
         # A run that graded nothing against the previous release has to say so

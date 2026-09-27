@@ -425,6 +425,12 @@ def target_dir() -> Path:
     return ROOT / os.environ.get("CARGO_TARGET_DIR", "target")
 
 
+#: live_suite tests (bare fn names) and modules a dedicated cell has already run this gate;
+#: the derived `live_modules` cell runs everything else.
+RAN_LIVE_TESTS: set[str] = set()
+RAN_LIVE_MODULES: set[str] = set()
+
+
 def rivet_bin() -> Path:
     """$RIVET_BIN, else the release binary cargo builds under `target_dir()`."""
     return Path(os.environ.get("RIVET_BIN", target_dir() / "release" / "rivet"))
@@ -514,11 +520,16 @@ _NEXTEST_SAMPLE = (
     "        LEAK [   0.400s] (2/4) rivet-cli::live_suite m::leaky_pass\n"
     " FAIL + LEAK [   0.476s] (3/4) rivet-cli::live_suite m::leaky_fail\n"
     "        FAIL [   0.200s] (4/4) rivet-cli::live_suite m::plain_fail\n"
+    "        FAIL [   0.200s] (   5/1038) rivet-cli::live_suite m::padded_fail\n"
 )
 
 
 def nextest_grading_error() -> str | None:
     """Why the nextest parser would misgrade a real line shape, or None when it grades all correctly."""
+    seen = set(nextest_outcomes(_NEXTEST_SAMPLE))
+    every = {"m::slow_then_pass", "m::leaky_pass", "m::leaky_fail", "m::plain_fail", "m::padded_fail"}
+    if seen != every:
+        return f"read {sorted(seen)}, dropped {sorted(every - seen)} (a dropped FAIL line is a silent pass)"
     passed = nextest_passed(_NEXTEST_SAMPLE)
     want = {"m::slow_then_pass", "m::leaky_pass"}
     if passed != want:

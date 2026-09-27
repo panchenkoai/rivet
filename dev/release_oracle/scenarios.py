@@ -49,13 +49,15 @@ from pathlib import Path
 from tempfile import mkdtemp
 
 try:  # importable both as a package module and as a plain sibling file
-    from .core import (HERE, ROOT, Ledger, Proc, Status, container_for_port, docker, docker_exec, have,
+    from .core import (HERE, RAN_LIVE_MODULES, RAN_LIVE_TESTS, ROOT, Ledger, Proc, Status, container_for_port, docker, docker_exec, have,
                        nextest_filter, nextest_outcomes, nextest_passed, port_of, release_bin_env,
                        rivet, rivet_bin, run, sqlcmd, test_passed)
     from ..pytools.duckcli import ARGV as DUCKDB
 except ImportError:  # pragma: no cover - depends on how the driver is invoked
     from core import (  # type: ignore
         HERE,
+        RAN_LIVE_MODULES,
+        RAN_LIVE_TESTS,
         ROOT,
         Ledger,
         Proc,
@@ -1398,6 +1400,7 @@ def _drive_live_tests(
     # `test(=X)` matches the FULL nextest name (`<module>::<fn>`), so the bare
     # fn name never matches; anchor the regex form at the end instead.
     expr = nextest_filter(tests)
+    RAN_LIVE_TESTS.update(tests)
     res = run(
         ["cargo", "nextest", "run", "--manifest-path", str(ROOT / "Cargo.toml"),
          "--test", "live_suite", "--run-ignored", "all", "-E", expr],
@@ -1846,27 +1849,27 @@ def verify_partition_footer(led: Ledger) -> None:
 
 
 def _run_live_modules(led: Ledger, scenario: str, label: str, phase: str,
-                      modules: list[str], env: dict[str, str] | None = None) -> None:
-    """Run live_suite `modules` through the gate binary; one ledger row per test case."""
+                      modules: list[str], env: dict[str, str] | None = None,
+                      expr: str | None = None) -> None:
+    """Run live_suite `modules` (or the nextest filter `expr`) through the gate binary; one ledger row per test case."""
     led.phase(f"{label} · {phase}")
     if not have("cargo"):
         _skipped(led, scenario, "batch", "-", "-", f"{label}: cargo absent", "no cargo")
         return
-    log_path = work_dir() / f"{scenario}_{'_'.join(modules)}.log"
+    RAN_LIVE_MODULES.update(modules)
+    log_path = work_dir() / f"{scenario}_{'_'.join(modules)[:120]}.log"
     p = run(
         ["cargo", "nextest", "run", "--manifest-path", str(ROOT / "Cargo.toml"),
          "--test", "live_suite", "--run-ignored", "all", "--no-fail-fast",
-         "-E", " | ".join(f"test(/^{m}::/)" for m in modules)],
+         "-E", expr or " | ".join(f"test(/^{m}::/)" for m in modules)],
         env={**release_bin_env(), **(env or {})},
         timeout=NO_TIMEOUT,
     )
     log_path.write_text(p.out)
-    verdicts = {
-        name: verdict
-        for verdict, name in re.findall(
-            r"^\s+(PASS|LEAK|FAIL|TIMEOUT|SIGABRT|SIGSEGV) \[[^\]]*\] \(\d+/\d+\) \S+ (\S+)$",
-            p.out, re.M)
-    }
+    # The shared, self-tested parser: a local regex here required an UNPADDED `(n/m)` and
+    # nextest pads it (`(   5/1038)`), so all but the last few verdicts — failures included
+    # — were silently dropped (39 of 1038 graded, measured 2026-09-27).
+    verdicts = nextest_outcomes(p.out)
     if not verdicts:
         _failed(led, scenario, "batch", "-", "-",
                 f"{label}: no test ran (see {log_path})", _first_match(p.out, r"error|FAILED"))

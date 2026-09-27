@@ -26,7 +26,7 @@ import socket
 import re
 from collections.abc import Callable
 
-from .core import Ledger, ROOT, have, nextest_filter, nextest_passed, rivet_bin, run, test_passed
+from .core import RAN_LIVE_TESTS, Ledger, ROOT, have, nextest_filter, nextest_passed, rivet_bin, run, test_passed
 
 TESTS = (
     "same_named_configs_share_a_postgres_state_cdc_cycle",
@@ -77,6 +77,7 @@ def run_rig_tests(led: Ledger, scenario: str, tests: tuple[str, ...],
     # `test(=X)` matches the FULL `<module>::<fn>` name, so the bare fn name never
     # matches — anchor the regex form at the end instead (same as _drive_live_tests).
     expr = nextest_filter(tests)
+    RAN_LIVE_TESTS.update(tests)
     p = run(["cargo", "nextest", "run", "--manifest-path", str(ROOT / "Cargo.toml"),
              "--test", "live_suite", "--run-ignored", "all", "-E", expr],
             cwd=ROOT, env=env, timeout=None)
