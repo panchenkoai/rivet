@@ -237,6 +237,18 @@ mod tests {
             !holder_is_dead_here("garbage", &host),
             "an unparseable holder"
         );
+        // A negative pid names a process GROUP to kill(2); it must never read as a dead holder.
+        assert!(
+            !holder_is_dead_here(&format!("{host}:-99999:1"), &host),
+            "a negative pid"
+        );
+    }
+
+    /// The host part of a holder id is the OS hostname, read independently of `host_name`.
+    #[test]
+    fn the_holder_host_is_the_os_hostname() {
+        let os = std::process::Command::new("hostname").output().unwrap();
+        assert_eq!(host_name(), String::from_utf8_lossy(&os.stdout).trim());
     }
 
     /// Two loads of one table: the second is refused while the first holds the

@@ -126,3 +126,24 @@ fn a_run_killed_on_this_host_does_not_block_the_next_one() {
         "the recovered run delivers every row"
     );
 }
+
+/// A dropped lease is free at once — even to the SAME live process, which a session advisory
+/// lock would have let in twice while held (it is re-entrant) and a TTL would have kept out.
+#[test]
+#[ignore = "live: requires postgres-state"]
+fn a_lease_is_refused_while_held_and_free_the_moment_it_is_dropped() {
+    let url = "postgresql://rivet:rivet@127.0.0.1:5433/rivet_state_bouncer";
+    let st = rivet::state::StateStore::open_at_ref(&rivet::state::StateRef::Postgres(url.into()))
+        .expect("the scratch state DB");
+    let key = unique_name("lease_release");
+    let held = st.try_load_lease(&key).unwrap().expect("the first take");
+    assert!(
+        st.try_load_lease(&key).unwrap().is_none(),
+        "held: a second take, even by this process, is refused"
+    );
+    drop(held);
+    assert!(
+        st.try_load_lease(&key).unwrap().is_some(),
+        "dropped: free at once, not after the TTL"
+    );
+}

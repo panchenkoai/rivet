@@ -764,6 +764,15 @@ exclude_re = [
     # `two_compacts_at_once_admit_one_and_apply_each_change_once` proves it across
     # two.
     "replace \\| with \\^ in StateStore::try_load_lease",
+    # `pid > 0` in `holder_is_dead_here` → `>=`: EQUIVALENT. The two differ only at pid 0,
+    # and kill(0, 0) signals the caller's own process group, which always exists — so
+    # both read "alive". The guard that matters, a negative pid (a process GROUP to
+    # kill(2)), is graded by `a_dead_holder_on_this_host_is_recognised_and_nothing_else_is`.
+    "replace > with >= in holder_is_dead_here",
+    # `<impl Drop for LoadLease>::drop` deletes a Postgres lease row; offline runs hold only
+    # SQLite leases, whose flock the file handle's own drop releases. Live oracle:
+    # `a_lease_is_refused_while_held_and_free_the_moment_it_is_dropped` (live_state_pooler).
+    "replace <impl Drop for LoadLease<'_>>::drop with \\(\\)",
     # `run_cdc_export` (pipeline/cdc_job.rs) is the CDC run's live-only script:
     # a run-status row in the state DB, the anchor + backfill + drain against a
     # real source, manifests in a real destination, the summary card. Every
