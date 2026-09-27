@@ -64,7 +64,8 @@ fn main() {
         let msg = crate::pipeline::parent_ui::sanitize_terminal(&redact::redact_error(&e));
         // Machine-actionable exit-code taxonomy (see `error::ExitClass`): a
         // scheduler branches on the code (2=retryable, 3=data-integrity,
-        // 4=schema-drift, 1=generic) instead of grepping `msg`.
+        // 4=schema-drift, 5=refusal, 6=internal, 1=generic) instead of grepping `msg`;
+        // every code and its meaning: docs/reference/errors.md.
         let exit_class = crate::error::classify_exit(&e);
         // A config/source failure tagged with a stable `RIVET_*` code surfaces it
         // for greppable tooling: a `code` field in JSON, a `[CODE]` text prefix.

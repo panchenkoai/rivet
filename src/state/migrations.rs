@@ -1059,7 +1059,8 @@ fn migrate_locked(conn: &Connection) -> Result<()> {
 
     let final_version = get_current_version(conn);
     if final_version > SCHEMA_VERSION {
-        anyhow::bail!(
+        crate::rivet_bail!(
+            crate::error::codes::STATE_SCHEMA_NEWER,
             "state: this state DB is at schema v{final_version}, newer than this rivet knows \
              (v{SCHEMA_VERSION}) — a newer rivet migrated it. Upgrade rivet, or point this one \
              at a state DB it created; a downgrade never rewrites the schema"
@@ -1144,7 +1145,8 @@ fn migrate_pg_locked(client: &mut postgres::Client) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("state(pg): read final schema version: {:#}", e))?
         .get(0);
     if final_version > SCHEMA_VERSION {
-        anyhow::bail!(
+        crate::rivet_bail!(
+            crate::error::codes::STATE_SCHEMA_NEWER,
             "state(pg): this state DB is at schema v{final_version}, newer than this rivet knows \
              (v{SCHEMA_VERSION}) — a newer rivet migrated it. Upgrade rivet, or point this one at \
              a state DB it created; a downgrade never rewrites the schema"
@@ -1302,7 +1304,17 @@ mod tests {
                     [SCHEMA_VERSION + 1],
                 )
                 .unwrap();
-                let err = format!("{:#}", migrate(c).unwrap_err());
+                let e = migrate(c).unwrap_err();
+                assert_eq!(
+                    crate::error::classify_exit(&e),
+                    5,
+                    "a protective refusal exits 5"
+                );
+                assert_eq!(
+                    crate::error::error_code(&e),
+                    Some("RIVET_STATE_SCHEMA_NEWER")
+                );
+                let err = format!("{e:#}");
                 assert!(err.contains("newer than this rivet knows"), "{err}");
                 assert!(!err.contains("migration incomplete"), "{err}");
                 assert_eq!(

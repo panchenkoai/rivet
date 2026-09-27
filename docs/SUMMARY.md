@@ -90,6 +90,7 @@
 
 - [CLI](reference/cli.md)
   - [Full CLI reference](reference/cli-reference.md)
+  - [Error codes and exit codes](reference/errors.md)
 - [Config](reference/config.md)
   - [Full config reference](reference/config-reference.md)
 - [rivet init](reference/init.md)

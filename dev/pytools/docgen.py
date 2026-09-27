@@ -78,6 +78,8 @@ def generators(rivet: str) -> tuple[Generated, ...]:
         ),
         # CLI reference — from the clap `Cli` derive, the same source as `--help`.
         Generated(out="docs/reference/cli-reference.md", argv=(rivet, "schema", "cli")),
+        # Error codes — from the code registry (`codes::ALL` in src/error.rs).
+        Generated(out="docs/reference/errors.md", argv=(rivet, "schema", "errors")),
     )
 
 

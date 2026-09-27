@@ -941,7 +941,10 @@ fn build_pg_list_array(
     let inner_dt = if let DataType::List(field_ref) = target_type {
         field_ref.data_type()
     } else {
-        anyhow::bail!("build_pg_list_array called with non-List target type");
+        crate::rivet_bail!(
+            crate::error::codes::INTERNAL_TYPE_BUILDER,
+            "build_pg_list_array called with non-List target type"
+        );
     };
 
     // PG arrays can legally contain NULL elements (`ARRAY[1, NULL, 3]`); the

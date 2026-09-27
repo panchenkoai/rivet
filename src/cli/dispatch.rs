@@ -234,6 +234,10 @@ fn dispatch_schema(what: SchemaKind) -> Result<()> {
             print!("{}", clap_markdown::help_markdown::<Cli>());
             Ok(())
         }
+        SchemaKind::Errors => {
+            print!("{}", crate::error::codes_markdown());
+            Ok(())
+        }
     }
 }
 

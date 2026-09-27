@@ -538,6 +538,11 @@ pub enum SchemaKind {
     ///
     ///     rivet schema cli > docs/reference/cli-reference.md
     Cli,
+    /// Print the Markdown error-code reference (every `RIVET_*` code, its kind, exit
+    /// code and operator action) to stdout, generated from the code registry.
+    ///
+    ///     rivet schema errors > docs/reference/errors.md
+    Errors,
 }
 
 #[derive(Subcommand)]

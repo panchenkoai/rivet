@@ -338,7 +338,10 @@ impl SpillFile {
     /// released at its commit and the file has no reason to outlive that.
     pub(crate) fn into_reader(mut self) -> Result<SpillReader> {
         let Some(w) = self.writer.take() else {
-            anyhow::bail!("cdc spill: sealed twice");
+            crate::rivet_bail!(
+                crate::error::codes::INTERNAL_SPILL,
+                "cdc spill: sealed twice"
+            );
         };
         let mut file = w.into_inner().map_err(|e| {
             anyhow::anyhow!("cdc spill: flushing the log before reading it back: {e}")
@@ -1389,7 +1392,10 @@ fn get_value_at(c: &mut Cur<'_>, depth: u32) -> Result<RivetValue> {
         // disagree, and guessing NULL would turn that into a column of nulls that
         // every count and sum check passes — the exact silent-loss shape a
         // "degrade to null" cell path produces.
-        other => anyhow::bail!("cdc spill: unknown value tag {other}"),
+        other => crate::rivet_bail!(
+            crate::error::codes::INTERNAL_SPILL,
+            "cdc spill: unknown value tag {other}"
+        ),
     })
 }
 
@@ -1472,7 +1478,10 @@ pub(crate) fn decode_event(rec: &[u8]) -> Result<ChangeEvent> {
         0 => ChangeOp::Insert,
         1 => ChangeOp::Update,
         2 => ChangeOp::Delete,
-        other => anyhow::bail!("cdc spill: unknown op tag {other}"),
+        other => crate::rivet_bail!(
+            crate::error::codes::INTERNAL_SPILL,
+            "cdc spill: unknown op tag {other}"
+        ),
     };
     let schema = c.string()?;
     let table = c.string()?;
