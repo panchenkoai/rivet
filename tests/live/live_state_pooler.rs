@@ -135,8 +135,15 @@ fn a_run_killed_on_this_host_does_not_block_the_next_one() {
 #[test]
 #[ignore = "live: requires postgres-state"]
 fn a_lease_is_refused_while_held_and_free_the_moment_it_is_dropped() {
-    let url = "postgresql://rivet:rivet@127.0.0.1:5433/rivet_state_bouncer";
-    let st = rivet::state::StateStore::open_at_ref(&rivet::state::StateRef::Postgres(url.into()))
+    // Its own database on the state server, so the test needs nothing a stand was given by hand.
+    let admin = "host=127.0.0.1 port=5433 user=rivet password=rivet dbname=postgres";
+    let db = unique_name("lease_drop");
+    postgres::Client::connect(admin, postgres::NoTls)
+        .expect("the state server")
+        .batch_execute(&format!("CREATE DATABASE {db}"))
+        .unwrap();
+    let url = format!("postgresql://rivet:rivet@127.0.0.1:5433/{db}");
+    let st = rivet::state::StateStore::open_at_ref(&rivet::state::StateRef::Postgres(url))
         .expect("the scratch state DB");
     let key = unique_name("lease_release");
     let held = st.try_load_lease(&key).unwrap().expect("the first take");
@@ -145,8 +152,9 @@ fn a_lease_is_refused_while_held_and_free_the_moment_it_is_dropped() {
         "held: a second take, even by this process, is refused"
     );
     drop(held);
-    assert!(
-        st.try_load_lease(&key).unwrap().is_some(),
-        "dropped: free at once, not after the TTL"
-    );
+    let free = st.try_load_lease(&key).unwrap().is_some();
+    drop(st);
+    let _ = postgres::Client::connect(admin, postgres::NoTls)
+        .map(|mut c| c.batch_execute(&format!("DROP DATABASE IF EXISTS {db} WITH (FORCE)")));
+    assert!(free, "dropped: free at once, not after the TTL");
 }
