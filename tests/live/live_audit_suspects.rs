@@ -600,3 +600,51 @@ fn mongo_cdc_dropping_another_collection_does_not_stop_capture() {
         "a drop of a collection nobody captures must not stop this export's capture"
     );
 }
+
+/// Keyset over a DATETIME2(7) primary key (100 ns ticks, finer than the microsecond the
+/// seek cursor keeps) either reads every row once or refuses — it must not loop or
+/// re-read a page.
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn keyset_over_an_mssql_datetime2_7_key_reads_every_row_once_or_refuses() {
+    let table = unique_name("dt2_key");
+    mssql_exec(&format!(
+        "IF OBJECT_ID('dbo.{table}') IS NOT NULL DROP TABLE dbo.{table}; \
+         CREATE TABLE dbo.{table} (ts DATETIME2(7) NOT NULL PRIMARY KEY, id INT NOT NULL); \
+         INSERT INTO dbo.{table} VALUES ('2024-01-01 00:00:01.1234567', 1), \
+           ('2024-01-01 00:00:01.1234568', 2), ('2024-01-01 00:00:02.1234567', 3), \
+           ('2024-01-01 00:00:03.1234567', 4)"
+    ));
+    let rig = Rig::mssql_batch(&table)
+        .duckdb_oracle()
+        .mode("chunked")
+        .export_line("chunk_by_key: ts")
+        .export_line("chunk_size: 1");
+    let out = rig
+        .run_with_envs_bounded(&[], std::time::Duration::from_secs(60))
+        .expect("a keyset run over four rows must finish, not loop");
+    let said = String::from_utf8_lossy(&out.stderr).to_string();
+    let refused = !out.status.success();
+    let got = if refused {
+        None
+    } else {
+        Some(duckdb_distinct_i64_set(rig.oracle_dir(), "id"))
+    };
+    let rows = if refused {
+        0
+    } else {
+        duckdb_parquet_rows(rig.oracle_dir())
+    };
+    mssql_exec(&format!("DROP TABLE dbo.{table}"));
+    match got {
+        None => assert!(
+            said.contains("ended on the same 'ts' value it started after")
+                && said.contains("the seek cannot advance"),
+            "the refusal says why the seek cannot advance:\n{said}"
+        ),
+        Some(ids) => {
+            assert_eq!(ids, (1..=4).collect(), "every row");
+            assert_eq!(rows, 4, "exactly once");
+        }
+    }
+}
