@@ -430,6 +430,23 @@ def target_dir() -> Path:
 RAN_LIVE_TESTS: set[str] = set()
 RAN_LIVE_MODULES: set[str] = set()
 
+#: Live tests allowed to SELF-SKIP in a gate run (`module::fn` → why). Any other self-skip
+#: fails its cell: libtest counts a skip green, so an unlisted one is a row that graded nothing.
+SKIP_ALLOWED: dict[str, str] = {}
+
+
+def self_skipped(skip_log: Path) -> dict[str, str]:
+    """The tests that wrote `RIVET-SKIP <module::fn> — <why>` to `skip_log`."""
+    if not skip_log.exists():
+        return {}
+    # Split on the marker, not on lines: records written by parallel tests can interleave.
+    out: dict[str, str] = {}
+    for rec in skip_log.read_text().split("RIVET-SKIP ")[1:]:
+        m = re.match(r"(\S+) — (.*)", rec.strip(), re.S)
+        if m:
+            out[m.group(1)] = m.group(2).strip()
+    return out
+
 
 def rivet_bin() -> Path:
     """$RIVET_BIN, else the release binary cargo builds under `target_dir()`."""
@@ -530,8 +547,21 @@ _NEXTEST_SAMPLE = (
 )
 
 
+def self_skip_error() -> str | None:
+    """Why a self-skip marker would not be read, or None when it is."""
+    import tempfile
+    d = Path(tempfile.mkdtemp())
+    # Two records interleaved the way parallel tests wrote them (line, line, newline, newline).
+    (d / "s").write_text("RIVET-SKIP live_x::needs_bq — BIGQUERY_TEST_PROJECT unsetRIVET-SKIP live_x::b — no state\n\n")
+    got = self_skipped(d / "s")
+    want = {"live_x::needs_bq": "BIGQUERY_TEST_PROJECT unset", "live_x::b": "no state"}
+    return None if got == want else f"read {got}"
+
+
 def nextest_grading_error() -> str | None:
     """Why the nextest parser would misgrade a real line shape, or None when it grades all correctly."""
+    if self_skip_error():
+        return f"self-skips are not read: {self_skip_error()}"
     if nextest_started("    Starting 1038 tests across 1 binary (11 tests skipped)") != 1038:
         return "the `Starting N tests` count is not read"
     seen = set(nextest_outcomes(_NEXTEST_SAMPLE))

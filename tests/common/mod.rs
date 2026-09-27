@@ -142,7 +142,8 @@ pub fn skip_live(why: &str) {
         .append(true)
         .open(&path)
     {
-        let _ = writeln!(f, "{line}");
+        // One write per record: `writeln!` issues two, and parallel tests interleaved them.
+        let _ = f.write_all(format!("{line}\n").as_bytes());
     }
 }
 

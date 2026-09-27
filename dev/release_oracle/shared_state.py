@@ -24,9 +24,11 @@ from __future__ import annotations
 import os
 import socket
 import re
+import tempfile
+from pathlib import Path
 from collections.abc import Callable
 
-from .core import RAN_LIVE_TESTS, Ledger, ROOT, have, nextest_filter, nextest_passed, rivet_bin, run, test_passed
+from .core import RAN_LIVE_TESTS, SKIP_ALLOWED, Ledger, self_skipped, ROOT, have, nextest_filter, nextest_passed, rivet_bin, run, test_passed
 
 TESTS = (
     "same_named_configs_share_a_postgres_state_cdc_cycle",
@@ -78,15 +80,24 @@ def run_rig_tests(led: Ledger, scenario: str, tests: tuple[str, ...],
     # matches — anchor the regex form at the end instead (same as _drive_live_tests).
     expr = nextest_filter(tests)
     RAN_LIVE_TESTS.update(tests)
+    skip_log = Path(tempfile.mkdtemp(prefix="rivet-skips-")) / "skips"
+    env["RIVET_SKIP_LOG"] = str(skip_log)
     p = run(["cargo", "nextest", "run", "--manifest-path", str(ROOT / "Cargo.toml"),
              "--test", "live_suite", "--run-ignored", "all", "-E", expr],
             cwd=ROOT, env=env, timeout=None)
+    skipped = {k.rsplit("::", 1)[-1]: v for k, v in self_skipped(skip_log).items()}
     out = (p.stdout or "") + (p.stderr or "")
     # LEAK is a test that PASSED but left a handle or child open past its end;
     # nextest's own summary counts it green ("6 passed (2 leaky)").
     passed = nextest_passed(out)
     for name in tests:
-        if test_passed(name, passed):
+        if test_passed(name, passed) and name in skipped and not any(
+                k.endswith("::" + name) for k in SKIP_ALLOWED):
+            led.failed("all", scenario, cell(name), "postgres",
+                       f"{msg(name)} — SELF-SKIPPED ({skipped[name]}), counted green by libtest; "
+                       "allow it in core.SKIP_ALLOWED with a reason, or bring its infrastructure up",
+                       "vacuous skip")
+        elif test_passed(name, passed):
             led.passed("all", scenario, cell(name), "postgres", msg(name), "ok")
         else:
             # From the test's captured-output block (`--- STDOUT/STDERR: … <name> ---`):

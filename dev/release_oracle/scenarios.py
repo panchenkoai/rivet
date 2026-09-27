@@ -49,7 +49,7 @@ from pathlib import Path
 from tempfile import mkdtemp
 
 try:  # importable both as a package module and as a plain sibling file
-    from .core import (HERE, RAN_LIVE_MODULES, RAN_LIVE_TESTS, ROOT, Ledger, Proc, Status, container_for_port, docker, docker_exec, have,
+    from .core import (HERE, RAN_LIVE_MODULES, RAN_LIVE_TESTS, ROOT, SKIP_ALLOWED, self_skipped, Ledger, Proc, Status, container_for_port, docker, docker_exec, have,
                        nextest_filter, nextest_outcomes, nextest_passed, nextest_started, port_of, release_bin_env,
                        rivet, rivet_bin, run, sqlcmd, test_passed)
     from ..pytools.duckcli import ARGV as DUCKDB
@@ -58,6 +58,8 @@ except ImportError:  # pragma: no cover - depends on how the driver is invoked
         HERE,
         RAN_LIVE_MODULES,
         RAN_LIVE_TESTS,
+        SKIP_ALLOWED,
+        self_skipped,
         ROOT,
         Ledger,
         Proc,
@@ -1418,7 +1420,7 @@ def _drive_live_tests(
     # binlog-cut cell, green in gate #8 and green in its own log here).
     passed = nextest_passed(res.out)
     missing = [t for t in tests if not test_passed(t, passed)]
-    skipped = [ln for ln in skip_log.read_text().splitlines() if ln.strip()]
+    skipped = [f"{k} — {v}" for k, v in self_skipped(skip_log).items() if k not in SKIP_ALLOWED]
     if missing:
         _failed(
             led, area, a, b, "-",
@@ -1859,11 +1861,13 @@ def _run_live_modules(led: Ledger, scenario: str, label: str, phase: str,
         return
     RAN_LIVE_MODULES.update(modules)
     log_path = work_dir() / f"{scenario}_{'_'.join(modules)[:120]}.log"
+    skip_log = Path(str(log_path) + ".skips")
+    skip_log.write_text("")
     p = run(
         ["cargo", "nextest", "run", "--manifest-path", str(ROOT / "Cargo.toml"),
          "--test", "live_suite", "--run-ignored", "all", "--no-fail-fast",
          "-E", expr or " | ".join(f"test(/^{m}::/)" for m in modules)],
-        env={**release_bin_env(), **(env or {})},
+        env={**release_bin_env(), **(env or {}), "RIVET_SKIP_LOG": str(skip_log)},
         timeout=NO_TIMEOUT,
     )
     log_path.write_text(p.out)
@@ -1880,8 +1884,17 @@ def _run_live_modules(led: Ledger, scenario: str, label: str, phase: str,
         _failed(led, scenario, "batch", "-", "-",
                 f"{label}: no test ran (see {log_path})", _first_match(p.out, r"error|FAILED"))
         return
+    skipped = self_skipped(skip_log)
     for name, verdict in sorted(verdicts.items()):
-        if verdict in ("PASS", "LEAK"):
+        if verdict in ("PASS", "LEAK") and name in skipped:
+            why = SKIP_ALLOWED.get(name)
+            if why:
+                _skipped(led, scenario, "batch", "-", "-", f"{label} · {name} SKIPPED — {why}", "allowed skip")
+            else:
+                _failed(led, scenario, "batch", "-", "-", f"{label} · {name} SELF-SKIPPED "
+                        f"({skipped[name]}) — counted green by libtest; allow it in "
+                        "core.SKIP_ALLOWED with a reason, or bring its infrastructure up", "vacuous skip")
+        elif verdict in ("PASS", "LEAK"):
             _passed(led, scenario, "batch", "-", "-", f"{label} · {name}")
         else:
             _failed(led, scenario, "batch", "-", "-", f"{label} FAILED · {name} (see {log_path})")
