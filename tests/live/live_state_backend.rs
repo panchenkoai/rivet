@@ -53,7 +53,8 @@ fn a_state_ledger_lost_mid_run_fails_loudly_and_the_next_run_delivers_every_row_
         .export_line("chunk_by_key: id")
         .export_line("chunk_checkpoint: true")
         .export_line("chunk_size: 500");
-    let env = [("RIVET_STATE_URL", POSTGRES_STATE_TOXI_URL)];
+    let toxi_url = postgres_state_toxi_url();
+    let env = [("RIVET_STATE_URL", toxi_url.as_str())];
     // Slow every ledger round-trip so the run is still paging when the first part lands.
     toxi_add_latency("postgres_state", 40);
     let out_dir = rig.out_dir();

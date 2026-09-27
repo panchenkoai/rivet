@@ -524,6 +524,26 @@ def remove_engine_containers() -> None:
         docker("rm", "-fv", cid)
 
 
+def isolate_state_db(url: str, tag: str) -> str | None:
+    """Create a fresh database beside `url`'s and return a URL to it (dropped at exit), or None.
+
+    One gate run gets its own state DB: a build that bumps the state schema must not migrate
+    the shared stand DB every other branch and session on this machine still opens."""
+    import atexit
+    import urllib.parse
+    u = urllib.parse.urlsplit(url)
+    c = container_for_port(u.port or 5432)
+    if c is None or not u.username:
+        return None
+    db = f"rivet_state_gate_{tag}"
+    psql = ["psql", "-U", urllib.parse.unquote(u.username), "-d", "postgres", "-v", "ON_ERROR_STOP=1", "-c"]
+    if not docker_exec(c, *psql, f"DROP DATABASE IF EXISTS {db}").ok or \
+            not docker_exec(c, *psql, f"CREATE DATABASE {db}").ok:
+        return None
+    atexit.register(lambda: docker_exec(c, *psql, f"DROP DATABASE IF EXISTS {db} WITH (FORCE)"))
+    return urllib.parse.urlunsplit((u.scheme, u.netloc, f"/{db}", u.query, u.fragment))
+
+
 def container_for_port(port: int) -> str | None:
     """The running container publishing `port` — how the CDC layer finds the
     engine behind a URL. Returns None rather than an empty string, so a caller

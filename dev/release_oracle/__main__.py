@@ -1007,6 +1007,24 @@ def main(argv: list[str] | None = None) -> int:
         # worked on Postgres at all). Grading both is two passes, deliberately,
         # rather than a subset of cells quietly touching the other backend.
         state_url = ns.state_url or os.environ.get("RIVET_GATE_STATE_URL", "")
+        # One state DB per gate run (RIVET_GATE_SHARED_STATE=1 keeps the shared one): a build
+        # that bumps the state schema must not migrate the stand DB other branches still open.
+        if state_url and os.environ.get("RIVET_GATE_SHARED_STATE") != "1":
+            from .core import isolate_state_db
+            own = isolate_state_db(state_url, f"{os.getpid()}")
+            if own is None:
+                led.failed("-", "-", "state-isolation", "-",
+                           f"could not create a per-run state DB beside {state_url.split('@')[-1]}")
+            else:
+                state_url = own
+                for var in ("RIVET_GATE_STATE_URL", "RIVET_CDC_STATE_URL",
+                            "RIVET_CONC_STATE_URL", "RIVET_TEST_STATE_URL"):
+                    os.environ[var] = own
+                import urllib.parse as _up
+                t = _up.urlsplit(own)
+                os.environ["RIVET_TEST_STATE_TOXI_URL"] = _up.urlunsplit(
+                    (t.scheme, f"{t.username}:{t.password}@127.0.0.1:15433", t.path, "", ""))
+                print(f"  per-run state DB: {t.path.lstrip('/')} (dropped at exit)")
         if state_url:
             os.environ["RIVET_STATE_URL"] = state_url
             backend = f"POSTGRES ({state_url.split('@')[-1]})"

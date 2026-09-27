@@ -93,7 +93,8 @@ fn a_pooled_load_through_a_throttled_ledger_loses_no_table() {
     let _cleanup = bq.cleanup(&tables);
 
     // Extract at full speed: the toxic belongs to the load leg only.
-    let env = [("RIVET_STATE_URL", POSTGRES_STATE_TOXI_URL)];
+    let toxi_url = postgres_state_toxi_url();
+    let env = [("RIVET_STATE_URL", toxi_url.as_str())];
     let out = rig.run_args_env(&[], &env);
     assert!(
         out.status.success(),
@@ -201,7 +202,8 @@ fn a_ledger_cut_mid_load_fails_loudly_and_the_next_run_finishes_the_job() {
     tables.extend(secondaries.iter().map(|s| s.as_str()));
     let _cleanup = bq.cleanup(&tables);
 
-    let env = [("RIVET_STATE_URL", POSTGRES_STATE_TOXI_URL)];
+    let toxi_url = postgres_state_toxi_url();
+    let env = [("RIVET_STATE_URL", toxi_url.as_str())];
     let out = rig.run_args_env(&[], &env);
     assert!(
         out.status.success(),

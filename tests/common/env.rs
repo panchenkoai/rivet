@@ -45,6 +45,13 @@ pub const POSTGRES_TOXI_URL: &str = "postgresql://rivet:rivet@127.0.0.1:15432/ri
 /// load can be throttled or dropped on.
 pub const POSTGRES_STATE_TOXI_URL: &str = "postgresql://rivet:rivet@127.0.0.1:15433/rivet_state";
 
+/// [`POSTGRES_STATE_TOXI_URL`], or `RIVET_TEST_STATE_TOXI_URL` when the release gate points
+/// the ledger at its own per-run database.
+pub fn postgres_state_toxi_url() -> String {
+    std::env::var("RIVET_TEST_STATE_TOXI_URL")
+        .unwrap_or_else(|_| POSTGRES_STATE_TOXI_URL.to_string())
+}
+
 /// pgBouncer in transaction mode with pool_size=1, port :6432.
 /// Opt in: docker compose --profile pool up -d pgbouncer
 pub const PGBOUNCER_URL: &str = "postgresql://rivet:rivet@127.0.0.1:6432/rivet";
