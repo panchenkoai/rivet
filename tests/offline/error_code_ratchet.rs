@@ -4,7 +4,7 @@
 //! migration that forgets to lower the ceiling, so the win stays banked.
 
 /// Uncoded `bail!(` sites under `src/` on 2026-09-27, when the registry landed.
-const CEILING: usize = 436;
+const CEILING: usize = 435;
 
 /// Occurrences of a bare `bail!(` (not `rivet_bail!` / `config_bail!`) in `text`.
 fn bare_bails(text: &str) -> usize {

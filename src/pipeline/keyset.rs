@@ -682,20 +682,19 @@ fn run_keyset_parallel(
                         }
                     }
                     local_checks.push(page.checksums);
-                    let last_page = is_last_page(page.rows, page_size);
-                    if !last_page {
-                        let next = page.next_cursor.ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "could not advance the '{key_r}' cursor at page {pages} \
-                                 (NULL or unsupported type)"
-                            )
-                        })?;
-                        ensure_cursor_advanced(cursor.as_deref(), &next, key_r, pages)?;
-                        cursor = Some(next);
-                    }
+                    let next = next_seek(
+                        cursor.as_deref(),
+                        page.rows,
+                        page_size,
+                        page.next_cursor,
+                        key_r,
+                        pages,
+                        &format!("export '{}'", plan_r.export_name),
+                    )?;
                     pages += 1;
-                    if last_page {
-                        break;
+                    match next {
+                        Some(n) => cursor = Some(n),
+                        None => break,
                     }
                 }
                 // Atomic checkpoint: the range's parts → file_log AND `done=1` in one
@@ -832,20 +831,34 @@ fn fan_out_collapsed(parallel: usize, total_ranges: usize) -> bool {
     parallel > 1 && total_ranges == 1
 }
 
-/// Refuse a full page whose last key renders equal to the previous bound: the seek would re-read it for ever.
-fn ensure_cursor_advanced(prev: Option<&str>, next: &str, key: &str, page: usize) -> Result<()> {
+/// The seek bound after a page: `None` on a short (last) page, else its max key — refusing a missing or non-advancing one.
+pub(crate) fn next_seek(
+    prev: Option<&str>,
+    rows: usize,
+    page_size: usize,
+    next: Option<String>,
+    key: &str,
+    page: usize,
+    who: &str,
+) -> Result<Option<String>> {
+    if rows < page_size {
+        return Ok(None);
+    }
+    let Some(next) = next else {
+        anyhow::bail!(
+            "{who}: keyset could not read the '{key}' value from the last row of page {page} \
+             (NULL or unsupported type) — cannot advance safely (last readable key: {}). \
+             The key must be NOT NULL and one of: integer, float, string, timestamp, date, uuid.",
+            prev.unwrap_or("<none>"),
+        );
+    };
     anyhow::ensure!(
-        prev != Some(next),
+        prev != Some(next.as_str()),
         "keyset page {page} ended on the same '{key}' value it started after ({next}): the key's \
          rendering is coarser than its values (e.g. a TIMESTAMP(7..9) read at microseconds), so the \
          seek cannot advance. Page on a unique key rivet reads exactly."
     );
-    Ok(())
-}
-
-/// A short page means the key range is exhausted.
-fn is_last_page(rows: usize, page_size: usize) -> bool {
-    rows < page_size
+    Ok(Some(next))
 }
 
 /// Whether a crash anchor was written by this runner shape: only a parallel run persists ranges for it.
@@ -1201,42 +1214,31 @@ pub(crate) fn run_keyset(
         );
         pages += 1;
 
-        // A short page means the index range is exhausted — stop without an
-        // extra empty round-trip.
-        if is_last_page(page.rows, kp.chunk_size) {
-            // Forensics (v18): the final page's max key is the run's true high-water.
-            // Record it BEFORE breaking — the loop stops without advancing `last`, so
-            // a short tail page (e.g. the 3 u64 ids above i64::MAX) is captured yet
-            // would otherwise be invisible in cursor_max. `.or(last)` covers an EMPTY
-            // final page, whose max is the previous full page's key.
-            summary.cursor_high = page.next_cursor.clone().or_else(|| last.clone());
-            break;
-        }
-        // Advance to the page's max key; if it could not be read (NULL or an
-        // unsupported type), we must NOT loop on the same bound — that would
-        // re-read the same page forever.
-        match page.next_cursor {
-            Some(v) => {
-                ensure_cursor_advanced(last.as_deref(), &v, &kp.key_column, pages - 1)?;
-                last = Some(v)
+        // Forensics (v18): a short final page's max key (or, if empty, the previous
+        // page's) is the run's true high-water; an unreadable key stamps the LAST key
+        // read, bracketing the value that broke advancing.
+        let high = page.next_cursor.clone().or_else(|| last.clone());
+        let unreadable = page.next_cursor.is_none().then(|| last.clone());
+        let next = next_seek(
+            last.as_deref(),
+            page.rows,
+            kp.chunk_size,
+            page.next_cursor,
+            &kp.key_column,
+            pages - 1,
+            &format!("export '{}'", plan.export_name),
+        )
+        .inspect_err(|_| {
+            if let Some(l) = unreadable {
+                summary.offending_value = l.clone();
+                summary.cursor_high = l;
             }
+        })?;
+        match next {
+            Some(v) => last = Some(v),
             None => {
-                // Failure forensics (v18): stamp the LAST key we did read — the
-                // boundary just before the unadvanceable row. With `cursor_high`
-                // (the table's max key) this brackets the value that broke
-                // advancing (e.g. a u64 in the zone above i64::MAX), so a failed
-                // `export_metrics` row explains itself without the source.
-                summary.offending_value = last.clone();
-                summary.cursor_high = last.clone();
-                anyhow::bail!(
-                    "export '{}': keyset could not read the '{}' value from the last row of page {} \
-                     (NULL or unsupported type) — cannot advance safely (last readable key: {}). \
-                     The key must be NOT NULL and one of: integer, float, string, timestamp, date, uuid.",
-                    plan.export_name,
-                    kp.key_column,
-                    pages - 1,
-                    last.as_deref().unwrap_or("<none>"),
-                );
+                summary.cursor_high = high;
+                break;
             }
         }
     }
@@ -1366,19 +1368,41 @@ mod tests {
     use super::*;
     use crate::config::SourceType;
 
+    /// `next_seek` over a full page with the given bounds.
+    fn seek(prev: Option<&str>, next: Option<&str>) -> Result<Option<String>> {
+        next_seek(prev, 3, 3, next.map(str::to_string), "ID", 1, "export 'x'")
+    }
+
     #[test]
     fn a_page_that_ends_on_its_start_bound_is_refused() {
-        assert!(
-            ensure_cursor_advanced(
-                Some("2024-01-01T00:00:00.123456"),
-                "2024-01-01T00:00:00.123456",
-                "T9",
-                3
-            )
-            .is_err()
+        let ts = "2024-01-01T00:00:00.123456";
+        assert!(next_seek(Some(ts), 3, 3, Some(ts.into()), "T9", 3, "export 'x'").is_err());
+        assert_eq!(seek(Some("7"), Some("14")).unwrap().as_deref(), Some("14"));
+        assert_eq!(seek(None, Some("7")).unwrap().as_deref(), Some("7"));
+    }
+
+    #[test]
+    fn a_short_page_is_the_last_even_without_a_key() {
+        assert_eq!(
+            next_seek(Some("7"), 2, 3, None, "ID", 1, "export 'x'").unwrap(),
+            None
         );
-        assert!(ensure_cursor_advanced(Some("7"), "14", "ID", 1).is_ok());
-        assert!(ensure_cursor_advanced(None, "7", "ID", 0).is_ok());
+        assert_eq!(
+            next_seek(Some("7"), 2, 3, Some("7".into()), "ID", 1, "x").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn an_unreadable_key_error_is_classified_and_names_the_last_readable_key() {
+        let msg = seek(Some("7"), None).unwrap_err().to_string();
+        assert_eq!(
+            crate::pipeline::job::classify_error_message(&msg),
+            Some("keyset_unreadable_key"),
+            "{msg}"
+        );
+        assert!(msg.contains("last readable key: 7"), "{msg}");
+        assert!(msg.starts_with("export 'x': "), "{msg}");
     }
 
     // ── seek_tag: the sequential-checkpoint part-name identity ────────────────
@@ -1490,12 +1514,6 @@ mod tests {
         assert!(fan_out_collapsed(4, 1));
         assert!(!fan_out_collapsed(1, 1), "sequential was asked for");
         assert!(!fan_out_collapsed(4, 2));
-    }
-
-    #[test]
-    fn a_short_page_is_the_last() {
-        assert!(is_last_page(2, 3));
-        assert!(!is_last_page(3, 3), "a full page may have a successor");
     }
 
     #[test]

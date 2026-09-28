@@ -184,22 +184,17 @@ fn range_worker_pages(
         fan.contribute(unit, p.checksums);
         page += 1;
 
-        if p.rows < kp.chunk_size {
-            break;
-        }
-        match p.next_cursor {
+        match super::keyset::next_seek(
+            last.as_deref(),
+            p.rows,
+            kp.chunk_size,
+            p.next_cursor,
+            &kp.key_column,
+            page - 1,
+            &format!("export '{}': parallel worker {worker}", plan.export_name),
+        )? {
             Some(v) => last = Some(v),
-            None => anyhow::bail!(
-                // last-good key carried in the message: a worker has no &mut summary
-                // (its failure is collected by the FanIn), so the forensic value
-                // rides error_message — which error_class reads as keyset_unreadable_key.
-                "export '{}': parallel worker {} could not read the '{}' value to advance keyset \
-                 (NULL or unsupported type) — last readable key: {}.",
-                plan.export_name,
-                worker,
-                kp.key_column,
-                last.as_deref().unwrap_or("<none>"),
-            ),
+            None => break,
         }
     }
     Ok(())
