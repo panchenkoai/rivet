@@ -70,6 +70,23 @@ pub fn build_plan(
     resume: bool,
     params: Option<&HashMap<String, String>>,
 ) -> Result<ResolvedRunPlan> {
+    build_plan_on(
+        None, config, export, config_dir, validate, reconcile, resume, params,
+    )
+}
+
+/// [`build_plan`], with the chunk planner's catalog probe asked on `probe` when the caller holds one.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_plan_on(
+    probe: Option<&mut dyn crate::source::Source>,
+    config: &Config,
+    export: &ExportConfig,
+    config_dir: &Path,
+    validate: bool,
+    reconcile: bool,
+    resume: bool,
+    params: Option<&HashMap<String, String>>,
+) -> Result<ResolvedRunPlan> {
     // CDC has no batch plan — bail BEFORE resolve_query. A `tables:`-style CDC
     // export carries no `query`, so resolve_query would fail first and hide this
     // friendly message behind a confusing "no query" error (bughunt MED: the
@@ -157,7 +174,7 @@ pub fn build_plan(
                 settle,
             })
         }
-        ExportMode::Chunked => resolve_chunked_strategy(config, export, &tuning)?,
+        ExportMode::Chunked => resolve_chunked_strategy(probe, config, export, &tuning)?,
         ExportMode::TimeWindow => {
             let column = export.time_column.clone().ok_or_else(|| {
                 anyhow::anyhow!(
@@ -358,6 +375,7 @@ pub(crate) fn chunked_without_table_error(export: &ExportConfig) -> Option<Strin
 }
 
 fn resolve_chunked_strategy(
+    probe: Option<&mut dyn crate::source::Source>,
     config: &Config,
     export: &ExportConfig,
     tuning: &SourceTuning,
@@ -451,22 +469,23 @@ fn resolve_chunked_strategy(
             export.name
         )
     })?;
-    let introspection_result = match config.source.source_type {
-        crate::config::SourceType::Postgres => {
+    let introspection_result = match (probe, config.source.source_type) {
+        (Some(src), t) if t != crate::config::SourceType::Mongo => src.introspect_for_chunking(tbl),
+        (_, crate::config::SourceType::Postgres) => {
             crate::source::postgres::introspect_pg_table_for_chunking(
                 &url,
                 config.source.tls.as_ref(),
                 tbl,
             )
         }
-        crate::config::SourceType::Mysql => {
+        (_, crate::config::SourceType::Mysql) => {
             crate::source::mysql::introspect_mysql_table_for_chunking(
                 &url,
                 config.source.tls.as_ref(),
                 tbl,
             )
         }
-        crate::config::SourceType::Mssql => {
+        (_, crate::config::SourceType::Mssql) => {
             crate::source::mssql::introspect_mssql_table_for_chunking(
                 &url,
                 config.source.tls.as_ref(),
@@ -474,7 +493,7 @@ fn resolve_chunked_strategy(
             )
         }
         #[cfg(feature = "oracle")]
-        crate::config::SourceType::Oracle => {
+        (_, crate::config::SourceType::Oracle) => {
             crate::source::oracle::introspect_oracle_table_for_chunking(
                 &url,
                 config.source.tls.as_ref(),
@@ -482,8 +501,10 @@ fn resolve_chunked_strategy(
             )
         }
         #[cfg(not(feature = "oracle"))]
-        crate::config::SourceType::Oracle => return Err(crate::source::oracle_feature_missing()),
-        crate::config::SourceType::Mongo => anyhow::bail!(
+        (_, crate::config::SourceType::Oracle) => {
+            return Err(crate::source::oracle_feature_missing());
+        }
+        (_, crate::config::SourceType::Mongo) => anyhow::bail!(
             "chunked mode is not supported for MongoDB — use `mode: full` (the whole \
              collection is read as `_id` + `document` JSON)"
         ),
@@ -1020,6 +1041,74 @@ mod tests {
         let bare = base();
         let m = chunked_without_table_error(&bare).expect("no column, no table, no plan");
         assert!(m.contains("chunk_column"), "{m}");
+    }
+
+    /// A held connection whose catalog says `id` is the only keyset key.
+    struct CatalogProbe;
+
+    impl crate::source::Source for CatalogProbe {
+        fn introspect_for_chunking(
+            &mut self,
+            _qualified_table: &str,
+        ) -> Result<crate::source::TableIntrospection> {
+            Ok(crate::source::TableIntrospection {
+                keyset_keys: vec!["id".into()],
+                row_estimate: 10,
+                ..Default::default()
+            })
+        }
+        fn query_scalar(&mut self, _sql: &str) -> Result<Option<String>> {
+            unimplemented!("the planner only probes the catalog")
+        }
+        fn export(
+            &mut self,
+            _request: &crate::source::ExportRequest<'_>,
+            _sink: &mut dyn crate::source::BatchSink,
+        ) -> Result<()> {
+            unimplemented!("the planner reads no rows")
+        }
+        fn type_mappings(
+            &mut self,
+            _query: &str,
+            _column_overrides: &crate::types::ColumnOverrides,
+        ) -> Result<Vec<crate::types::TypeMapping>> {
+            unimplemented!("the planner reads no types")
+        }
+    }
+
+    #[test]
+    fn the_chunk_planner_asks_a_held_connection_except_on_mongo() {
+        let mut export = minimal_export();
+        export.mode = ExportMode::Chunked;
+        export.query = None;
+        export.table = Some("t".into());
+        export.chunk_by_key = Some("id".into());
+        let mut cfg = minimal_config();
+        cfg.source.url = Some("postgresql://u@127.0.0.1:1/db".into());
+        let plan = |cfg: &Config| {
+            build_plan_on(
+                Some(&mut CatalogProbe),
+                cfg,
+                &export,
+                Path::new("."),
+                false,
+                false,
+                false,
+                None,
+            )
+        };
+        let keyset = plan(&cfg).expect("the held connection answers; nothing dials 127.0.0.1:1");
+        assert!(
+            matches!(keyset.strategy, ExtractionStrategy::Keyset(_)),
+            "{:?}",
+            keyset.strategy
+        );
+        cfg.source.source_type = SourceType::Mongo;
+        let err = plan(&cfg).expect_err("Mongo cannot be chunk-planned, whatever is held");
+        assert!(
+            format!("{err:#}").contains("chunked mode is not supported for MongoDB"),
+            "{err:#}"
+        );
     }
 
     #[test]

@@ -184,11 +184,12 @@ pub(crate) fn run_chunked_sequential(
     Ok(())
 }
 
-pub(crate) fn run_chunked_parallel(
+pub(in crate::pipeline) fn run_chunked_parallel(
     state: &StateStore,
     plan: &ResolvedRunPlan,
     summary: &mut RunSummary,
     chunk_source: super::ChunkSource,
+    meta: &mut crate::pipeline::job::MetaConn<'_>,
 ) -> Result<()> {
     // Subject to the per-runner facade contract (ADR-0018) — this runner is
     // dispatched directly from job.rs, bypassing run_export, so it sets the flag
@@ -197,16 +198,18 @@ pub(crate) fn run_chunked_parallel(
     let cp = super::chunked_plan(plan);
 
     let chunks = match chunk_source {
-        // Detect: a short-lived connection computes ranges + runs the pre-chunk
-        // drift check (ADR-0021), then closes before the workers open theirs.
-        super::ChunkSource::Detect => super::prepare_chunk_plan_fresh(plan, state, summary)?,
+        // Detect: the run's metadata connection computes ranges + runs the
+        // pre-chunk drift check (ADR-0021).
+        super::ChunkSource::Detect => {
+            super::prepare_chunk_plan(meta.require()?, plan, Some(state), summary)?
+        }
         super::ChunkSource::Precomputed(ranges) => {
             // Ranges come from the artifact; the DRIFT GATE still runs.
             summary.chunks_precomputed = true;
             // No ranges ⇒ no rows will be read, so there is nothing for the gate
             // to protect and no reason to open a connection to say so.
             if !ranges.is_empty() {
-                super::check_drift_only_fresh(plan, state, summary)?;
+                super::check_drift_only(meta.require()?, plan, Some(state), summary)?;
             }
             ranges
         }
@@ -669,6 +672,7 @@ mod tests {
             &plan,
             &mut summary,
             ChunkSource::Precomputed(vec![]),
+            &mut crate::pipeline::job::MetaConn::empty(&plan.source),
         )
         .unwrap();
         assert_eq!(summary.total_rows, 0);

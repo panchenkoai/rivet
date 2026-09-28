@@ -224,13 +224,13 @@ exclude_re = [
     # 2026-08-20, then reverted). The whole live_keyset suite guards the bodies.
     "replace run_keyset ->",
     "replace run_keyset_parallel ->",
-    # introspect_mssql_table_for_chunking (source/mssql/mod.rs) reads sys.* over a
+    # introspect_mssql_on (source/mssql/mod.rs) reads sys.* over a
     # real SQL Server connection; OracleSource::export_within_budget drives a real
     # Oracle cursor. Unkillable under --lib. Proven live-killed by hand 2026-09-27
     # (stub applied, test run, reverted): Ok(Default::default()) empties keyset_keys,
     # so keyset_over_an_mssql_varchar_key_reads_every_key_under_the_default_sql_collation
     # refuses the key; Ok(()) exports nothing, 31 of 44 live_oracle tests RED.
-    "replace introspect_mssql_table_for_chunking ->",
+    "replace introspect_mssql_on ->",
     "replace OracleSource::export_within_budget ->",
     # Also live-only, each proven live-killed by hand 2026-09-27:
     # - PostgresSource::query_scalar needs a Postgres; Ok(None) makes a parallel

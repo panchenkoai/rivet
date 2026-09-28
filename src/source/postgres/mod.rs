@@ -315,11 +315,18 @@ pub(crate) fn introspect_pg_table_for_chunking(
     tls: Option<&TlsConfig>,
     qualified_table: &str,
 ) -> Result<crate::source::TableIntrospection> {
+    introspect_pg_on(&mut connect_client(url, tls)?, qualified_table)
+}
+
+/// [`introspect_pg_table_for_chunking`] on a connection the caller already holds.
+fn introspect_pg_on(
+    client: &mut Client,
+    qualified_table: &str,
+) -> Result<crate::source::TableIntrospection> {
     let (schema, table) = match qualified_table.split_once('.') {
         Some((s, t)) => (s.to_string(), t.to_string()),
         None => ("public".to_string(), qualified_table.to_string()),
     };
-    let mut client = connect_client(url, tls)?;
 
     // ── reltuples + heap size, in one shot ──────────────────────────────
     let (row_estimate, rel_size_bytes) = match client.query_opt(
@@ -728,6 +735,13 @@ fn pg_run_export(
 }
 
 impl super::Source for PostgresSource {
+    fn introspect_for_chunking(
+        &mut self,
+        qualified_table: &str,
+    ) -> Result<crate::source::TableIntrospection> {
+        introspect_pg_on(&mut self.client, qualified_table)
+    }
+
     fn export(
         &mut self,
         request: &super::ExportRequest<'_>,

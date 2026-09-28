@@ -618,6 +618,13 @@ fn result_columns<M: Clone>(
 }
 
 impl Source for OracleSource {
+    fn introspect_for_chunking(
+        &mut self,
+        qualified_table: &str,
+    ) -> Result<crate::source::TableIntrospection> {
+        introspect_oracle_on(self, qualified_table)
+    }
+
     fn export(&mut self, request: &ExportRequest<'_>, sink: &mut dyn BatchSink) -> Result<()> {
         let result = self.export_within_budget(request, sink);
         // The call timeout is per connection: clear it on every exit, not only on success.
@@ -698,8 +705,18 @@ pub(crate) fn introspect_oracle_table_for_chunking(
     tls: Option<&TlsConfig>,
     qualified_table: &str,
 ) -> Result<crate::source::TableIntrospection> {
+    introspect_oracle_on(
+        &mut OracleSource::connect_with_tls(url, tls)?,
+        qualified_table,
+    )
+}
+
+/// [`introspect_oracle_table_for_chunking`] on a connection the caller already holds.
+fn introspect_oracle_on(
+    src: &mut OracleSource,
+    qualified_table: &str,
+) -> Result<crate::source::TableIntrospection> {
     let (owner, table) = crate::sql::oracle_catalog_preds(qualified_table);
-    let mut src = OracleSource::connect_with_tls(url, tls)?;
     let row_estimate = src
         .query_scalar(&format!(
             "SELECT NVL(num_rows, 0) FROM all_tables WHERE owner = {owner} AND table_name = {table}"
