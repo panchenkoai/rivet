@@ -557,6 +557,18 @@ mod tests {
         );
         let err = super::partition_budget_ok(&store, &plan, &uris).unwrap_err();
         assert!(format!("{err:#}").contains("export `orders`"), "{err:#}");
+
+        plan.load.target = crate::load::plan::LoadTarget::Clickhouse {
+            url: "http://ch:8123".into(),
+            database: "d".into(),
+            user: "u".into(),
+            password_env: "P".into(),
+            named_collection: None,
+        };
+        assert!(
+            super::partition_budget_ok(&store, &plan, &uris).is_ok(),
+            "only BigQuery caps the partitions one job writes"
+        );
     }
 
     fn write_noted(
