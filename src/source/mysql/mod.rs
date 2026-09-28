@@ -812,6 +812,25 @@ impl super::Source for MysqlSource {
         )
     }
 
+    fn native_column_types(&mut self, table: &str) -> Result<Vec<(String, String)>> {
+        // A qualified `db.table` carries its OWN schema, which may differ from the
+        // connection's DATABASE() (a cross-database capture), and a db-less URL has no
+        // DATABASE() at all — so the qualifier wins and only a bare name asks.
+        let mut conn = self.pool.get_conn()?;
+        let default_db: Option<String> = if table.contains('.') {
+            None
+        } else {
+            conn.query_first("SELECT DATABASE()")?
+        };
+        let (schema, bare) =
+            crate::source::cdc::enrich_schema_and_table(table, default_db.as_deref());
+        Ok(conn.exec(
+            "SELECT COLUMN_NAME, COLUMN_TYPE FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+            (&schema, &bare),
+        )?)
+    }
+
     fn server_context(&mut self) -> Option<String> {
         // Best-effort per var (a proxy or older server may omit one).
         // `@@max_execution_time` (ms) is the query-level limit that surfaces as

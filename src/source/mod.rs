@@ -336,6 +336,9 @@ impl<'a> ExportRequest<'a> {
     }
 }
 
+/// The harm-counter key PostgreSQL reports `pg_stat_database.temp_bytes` under.
+pub(crate) const PG_TEMP_BYTES_KEY: &str = "pg_temp_bytes";
+
 pub trait Source: Send {
     /// Execute `request.query` and stream batches into `sink`.
     fn export(&mut self, request: &ExportRequest<'_>, sink: &mut dyn BatchSink) -> Result<()>;
@@ -408,6 +411,12 @@ pub trait Source: Send {
     /// or the engine cannot tell.
     fn primary_key(&mut self, _table: &str) -> Result<Option<Vec<String>>> {
         Ok(None)
+    }
+
+    /// `(column, full native type)` for `table` where the wire metadata lacks widths and
+    /// labels (MySQL `COLUMN_TYPE`: `bit(8)`, `enum('a','b')`); empty where there is nothing to add.
+    fn native_column_types(&mut self, _table: &str) -> Result<Vec<(String, String)>> {
+        Ok(Vec::new())
     }
 }
 

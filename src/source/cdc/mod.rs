@@ -498,6 +498,21 @@ impl ChangeEvent {
 pub(crate) trait ChangeStream {
     fn next_change(&mut self) -> Option<Result<ChangeEvent>>;
 
+    /// The row-image verdict asked on the stream's own connection; `None` asks on another.
+    fn row_image_here(&mut self, _tables: &[String]) -> Option<RowImage> {
+        None
+    }
+
+    /// The retention warnings asked on the stream's own connection; `None` asks on another.
+    fn retention_warnings_here(&mut self) -> Option<Vec<String>> {
+        None
+    }
+
+    /// The positional-mapping warning asked on the stream's own connection; `None` asks on another.
+    fn positional_mapping_here(&mut self) -> Option<Option<String>> {
+        None
+    }
+
     /// Acknowledge that every change up to and including `position` is **durably
     /// persisted** at the destination. Engines that consume-on-read (PostgreSQL:
     /// reading a logical slot advances it) defer the actual consume to here — so a
@@ -1019,43 +1034,10 @@ impl CdcEngine {
         let CdcEngineOpts::Postgres { slot, .. } = opts else {
             return Vec::new();
         };
-        let slot = slot.clone();
         let Ok(mut client) = crate::source::postgres::connect_client(url, tls) else {
             return Vec::new();
         };
-        let mut out = Vec::new();
-        if let Ok(Some(row)) = client.query_opt(
-            "SELECT active, COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn), 0)::bigint \
-             FROM pg_replication_slots WHERE slot_name = $1",
-            &[&slot],
-        ) && let Some(w) = crate::preflight::cdc_health::pg_retained_wal_warning(
-            &slot,
-            row.get(1),
-            row.get(0),
-        ) {
-            out.push(w);
-        }
-        // ONE export's slot is all this seam knows: `CdcCapture` carries a single
-        // `cdc_cfg`, so a sibling export's slot — drained by the same `rivet run` a
-        // moment later — is indistinguishable from an abandoned one here. Hence
-        // `may_be_owned_elsewhere = true`: report the WAL, never the verdict, and
-        // never the drop command. `doctor` sees the whole config and does both.
-        let ours = vec![slot];
-        if let Ok(rows) = client.query(
-            "SELECT slot_name, COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn), 0)::bigint, \
-                    slot_type \
-             FROM pg_replication_slots WHERE NOT active AND slot_name <> ALL($1)",
-            &[&ours],
-        ) {
-            let foreign: Vec<(String, i64, String)> = rows
-                .iter()
-                .map(|r| (r.get(0), r.get(1), r.get(2)))
-                .collect();
-            if let Some(w) = crate::preflight::cdc_health::pg_foreign_slots_warning(&foreign, true) {
-                out.push(w);
-            }
-        }
-        out
+        pg_retention_warnings_on(&mut client, slot)
     }
 
     pub(crate) fn from_url(url: &str) -> Result<Self> {
@@ -1189,6 +1171,42 @@ impl CdcEngine {
             }
         }
     }
+}
+
+/// The retained-WAL warnings for `slot` and for inactive slots nobody here owns, on `client`.
+pub(crate) fn pg_retention_warnings_on(client: &mut postgres::Client, slot: &str) -> Vec<String> {
+    let slot = slot.to_string();
+    let mut out = Vec::new();
+    if let Ok(Some(row)) = client.query_opt(
+        "SELECT active, COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn), 0)::bigint \
+         FROM pg_replication_slots WHERE slot_name = $1",
+        &[&slot],
+    ) && let Some(w) =
+        crate::preflight::cdc_health::pg_retained_wal_warning(&slot, row.get(1), row.get(0))
+    {
+        out.push(w);
+    }
+    // ONE export's slot is all this seam knows: `CdcCapture` carries a single
+    // `cdc_cfg`, so a sibling export's slot — drained by the same `rivet run` a
+    // moment later — is indistinguishable from an abandoned one here. Hence
+    // `may_be_owned_elsewhere = true`: report the WAL, never the verdict, and
+    // never the drop command. `doctor` sees the whole config and does both.
+    let ours = vec![slot];
+    if let Ok(rows) = client.query(
+        "SELECT slot_name, COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn), 0)::bigint, \
+                slot_type \
+         FROM pg_replication_slots WHERE NOT active AND slot_name <> ALL($1)",
+        &[&ours],
+    ) {
+        let foreign: Vec<(String, i64, String)> = rows
+            .iter()
+            .map(|r| (r.get(0), r.get(1), r.get(2)))
+            .collect();
+        if let Some(w) = crate::preflight::cdc_health::pg_foreign_slots_warning(&foreign, true) {
+            out.push(w);
+        }
+    }
+    out
 }
 
 /// Add an engine's setup hint ONLY to errors rivet did not raise itself.
@@ -1358,14 +1376,9 @@ pub(crate) fn create_change_stream(
             if let Some(p) = cfg.checkpoint.as_deref() {
                 Position::load(std::path::Path::new(p))?;
             }
-            // Same hoist, same reason: a configured name the binlog can never carry
-            // (a VIEW, whose Table_map names the BASE table) is a CONFIG problem, and
-            // raising it inside open would prefix it with the binlog-grants hint.
-            crate::source::mysql::cdc::MysqlChangeStream::precheck_configured_tables(
-                url,
-                tls,
-                configured_tables,
-            )?;
+            // The routing check runs inside `open`, on the connection that then dumps:
+            // its refusals carry rivet's `mysql cdc:` prefix, which `with_setup_hint`
+            // passes through without the binlog-grants hint.
             Ok(Box::new(
                 crate::source::mysql::cdc::MysqlChangeStream::open_or_resume(
                     url,
@@ -1394,15 +1407,10 @@ pub(crate) fn create_change_stream(
                 Some(p) => Position::load(p)?.is_some(),
                 None => false,
             };
-            // Hoisted out of the PG_CDC_HINT wrap below: a configured name the
-            // stream can never route is a CONFIG problem, and raising it inside
-            // open prefixes it with a wal_level/REPLICATION hint that sends the
-            // operator to fix permissions they never had a problem with.
-            crate::source::postgres::cdc::PgChangeStream::precheck_configured_tables(
-                url,
-                tls,
-                configured_tables,
-            )?;
+            // The routing check runs inside `open`, on the stream's own connection: its
+            // refusals are rivet's own `pg cdc:` / `cdc:` verdicts, which
+            // `with_setup_hint` passes through without the wal_level hint, so a
+            // separate precheck connection bought nothing but a second session.
             Ok(Box::new(
                 crate::source::postgres::cdc::PgChangeStream::open(
                     url,
@@ -1521,17 +1529,19 @@ pub(crate) fn create_change_stream(
 /// connection (plus, for MySQL, one enrichment connection) serves every table
 /// of a multi-table export — the per-table constructor cost was 2 connections
 /// per table per run.
-pub(crate) struct CdcSchemaResolver {
-    src: Box<dyn crate::source::Source>,
-    /// MySQL-only: one connection for the `information_schema.COLUMN_TYPE`
-    /// enrichment (wire metadata has no widths/labels for BIT/BINARY/ENUM/SET).
-    enrich: Option<mysql::PooledConn>,
+pub(crate) struct CdcSchemaResolver<'s> {
+    src: ResolverSource<'s>,
 }
 
-impl CdcSchemaResolver {
+/// The resolver's connection: its own, or the run's metadata connection lent for the run.
+enum ResolverSource<'s> {
+    Own(Box<dyn crate::source::Source>),
+    Lent(&'s mut (dyn crate::source::Source + 'static)),
+}
+
+impl CdcSchemaResolver<'static> {
     pub(crate) fn connect(url: &str, tls: Option<&crate::config::TlsConfig>) -> Result<Self> {
-        let engine = CdcEngine::from_url(url)?;
-        let src: Box<dyn crate::source::Source> = match engine {
+        let src: Box<dyn crate::source::Source> = match CdcEngine::from_url(url)? {
             CdcEngine::Mysql => Box::new(crate::source::mysql::MysqlSource::connect_with_tls(
                 url, tls,
             )?),
@@ -1553,11 +1563,25 @@ impl CdcSchemaResolver {
             #[cfg(not(feature = "oracle"))]
             CdcEngine::Oracle => return Err(crate::source::oracle_feature_missing()),
         };
-        let enrich = match engine {
-            CdcEngine::Mysql => Some(crate::source::mysql::connect_pool(url, tls)?.get_conn()?),
-            _ => None,
-        };
-        Ok(Self { src, enrich })
+        Ok(Self {
+            src: ResolverSource::Own(src),
+        })
+    }
+}
+
+impl<'s> CdcSchemaResolver<'s> {
+    /// Resolve on a connection the run already holds.
+    pub(crate) fn lent(src: &'s mut (dyn crate::source::Source + 'static)) -> Self {
+        Self {
+            src: ResolverSource::Lent(src),
+        }
+    }
+
+    fn source(&mut self) -> &mut dyn crate::source::Source {
+        match &mut self.src {
+            ResolverSource::Own(s) => s.as_mut(),
+            ResolverSource::Lent(s) => &mut **s,
+        }
     }
 
     /// One table's mappings. `overrides` are the export's `columns:`
@@ -1570,7 +1594,7 @@ impl CdcSchemaResolver {
     ) -> Result<Vec<crate::types::TypeMapping>> {
         validate_table_ident(table)?;
         let mut mappings = self
-            .src
+            .source()
             .type_mappings(&format!("SELECT * FROM {table}"), overrides)?;
         // A source column in the CDC meta namespace collides with the columns the
         // sink prepends, and the collision is silent in the direction that matters.
@@ -1607,36 +1631,14 @@ impl CdcSchemaResolver {
                 m.column_name
             );
         }
-        // MySQL: enrich `source_native_type` with the full
-        // `information_schema.COLUMN_TYPE` ("bit(8)", "binary(4)",
-        // "enum('a','b','c')") — the binlog cell fixes need widths + labels the
-        // wire metadata lacks. CDC-only; batch's contract-pinned native names
-        // stay untouched.
-        if let Some(conn) = self.enrich.as_mut() {
-            use mysql::prelude::Queryable;
-            // A qualified `db.table` carries its OWN schema, which may differ from
-            // the connection's DATABASE() (a cross-database capture), and a db-less
-            // URL has no DATABASE() at all. The old query dropped the qualifier and
-            // pinned `TABLE_SCHEMA = DATABASE()`, so both cases enriched NOTHING —
-            // ENUM/SET columns then kept their raw wire index / bitmask instead of
-            // the `enum('a',…)` / `set('x',…)` labels the binlog cell fixes need,
-            // silently corrupting every such column. Split like the batch path
-            // (mysql::mod) and query the EXPLICIT schema.
-            let default_db: Option<String> = if table.contains('.') {
-                None
-            } else {
-                conn.query_first("SELECT DATABASE()")?
-            };
-            let (schema, bare) = enrich_schema_and_table(table, default_db.as_deref());
-            let full: Vec<(String, String)> = conn.exec(
-                "SELECT COLUMN_NAME, COLUMN_TYPE FROM information_schema.COLUMNS \
-                 WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
-                (&schema, &bare),
-            )?;
-            for m in &mut mappings {
-                if let Some(ct) = native_type_for(&full, &m.column_name) {
-                    m.source_native_type = ct.to_string();
-                }
+        // Enrich `source_native_type` with the engine's full column type where the wire
+        // metadata lacks it (MySQL `COLUMN_TYPE`: "bit(8)", "binary(4)", "enum('a','b')")
+        // — the binlog cell fixes need widths and labels. CDC-only; batch's
+        // contract-pinned native names stay untouched.
+        let full = self.source().native_column_types(table)?;
+        for m in &mut mappings {
+            if let Some(ct) = native_type_for(&full, &m.column_name) {
+                m.source_native_type = ct.to_string();
             }
         }
         Ok(mappings)
@@ -1652,7 +1654,7 @@ impl CdcSchemaResolver {
 /// and batch resolve the same schema for the same table. `default_db` is only
 /// consulted for an unqualified name (the caller passes `None` for a qualified
 /// one to skip the extra `SELECT DATABASE()` round-trip).
-fn enrich_schema_and_table(table: &str, default_db: Option<&str>) -> (String, String) {
+pub(crate) fn enrich_schema_and_table(table: &str, default_db: Option<&str>) -> (String, String) {
     match table.split_once('.') {
         Some((s, t)) => (s.to_string(), t.to_string()),
         None => (
@@ -1742,6 +1744,8 @@ pub(crate) struct CdcCapture<'a> {
     pub state: Option<&'a crate::state::StateStore>,
     /// Judges each table's resolved columns before any change is read; an error ends the run unacknowledged.
     pub schema_gate: Option<&'a SchemaGate<'a>>,
+    /// The run's metadata connection, lent for schema resolution; `None` opens one here.
+    pub meta: Option<&'a mut (dyn crate::source::Source + 'static)>,
 }
 
 /// Open the change stream (with the engine's permission/TLS gate), resolve each
@@ -1782,7 +1786,10 @@ pub(crate) fn run_capture(
     // rather than inside each stream's `open`: scoped to what is actually being
     // captured, the answer is one line an operator can act on instead of a census
     // of the database (a first cut counted every table and said "704").
-    match engine.row_image(&url, tls.as_ref(), &cap_tables, &cap.cdc_cfg.engine) {
+    let image = stream
+        .row_image_here(&cap_tables)
+        .unwrap_or_else(|| engine.row_image(&url, tls.as_ref(), &cap_tables, &cap.cdc_cfg.engine));
+    match image {
         RowImage::Whole => {}
         RowImage::KeyOnlyDeletes { why } => log::warn!(
             "{} cdc: {why}. Counts still reconcile, but a per-row hash over deletes will differ \
@@ -1804,15 +1811,24 @@ pub(crate) fn run_capture(
     // capture is about to map by position must learn it from the run rather than
     // from a swapped column months later. `info` would be functionally silent at
     // the default log level — the same rule the sparse-chunk warning follows.
-    if let Some(why) = engine.positional_mapping_warning(&url, tls.as_ref()) {
+    let positional = stream
+        .positional_mapping_here()
+        .unwrap_or_else(|| engine.positional_mapping_warning(&url, tls.as_ref()));
+    if let Some(why) = positional {
         log::warn!("{} cdc: {why}.", engine.label());
     }
-    for why in engine.retention_warnings(&url, tls.as_ref(), &cap.cdc_cfg.engine) {
+    let retention = stream
+        .retention_warnings_here()
+        .unwrap_or_else(|| engine.retention_warnings(&url, tls.as_ref(), &cap.cdc_cfg.engine));
+    for why in retention {
         log::warn!("{} cdc: {why}.", engine.label());
     }
-    let mut resolver = match CdcSchemaResolver::connect(&url, tls.as_ref()) {
-        Ok(r) => r,
-        Err(e) => return (Vec::new(), Err(e)),
+    let mut resolver = match cap.meta {
+        Some(src) => CdcSchemaResolver::lent(src),
+        None => match CdcSchemaResolver::connect(&url, tls.as_ref()) {
+            Ok(r) => r,
+            Err(e) => return (Vec::new(), Err(e)),
+        },
     };
     for o in cap.outputs {
         // Probe the relation the STREAM resolved, not the string the config spelled

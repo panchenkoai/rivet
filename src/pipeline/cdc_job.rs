@@ -212,11 +212,21 @@ pub(super) fn run_cdc_export(
     let rss_sampler = crate::resource::RssPeakSampler::start(rss_before, 100);
     // Open forensics + the source-harm bracket, as the batch tail takes them: a
     // failed drain still records the server it ran against and what it cost it.
-    let server_context = crate::source::create_source(&config.source)
-        .ok()
-        .and_then(|mut s| s.server_context());
-    let harm = super::job::HarmBracket::open(&config.source);
-    let result = run_cdc_inner(config, export, &run_id, state, &read_bytes, config_dir);
+    // ONE metadata connection for the whole run: forensics, both harm snapshots and the
+    // schema resolver share it (it idles through the drain). Measured before this: 10-13
+    // new source connections per bounded run, each paying the server's session setup.
+    let mut meta = crate::source::create_source(&config.source).ok();
+    let server_context = meta.as_mut().and_then(|s| s.server_context());
+    let harm = super::job::HarmBracket::open_on(meta.as_deref_mut());
+    let result = run_cdc_inner(
+        config,
+        export,
+        &run_id,
+        state,
+        &read_bytes,
+        config_dir,
+        meta.as_deref_mut(),
+    );
     let duration_ms = started.elapsed().as_millis() as i64;
     let peak_rss_mb = rss_sampler
         .stop()
@@ -255,7 +265,7 @@ pub(super) fn run_cdc_export(
     );
     summary.peak_rss_mb = peak_rss_mb;
     summary.server_context_json = server_context;
-    let harm_deltas = harm.close(&config.source, state, &mut summary);
+    let harm_deltas = harm.close_on(meta.as_deref_mut(), state, &mut summary);
     if let Some(line) = super::job::run_diagnosis(
         &summary,
         &harm_deltas,
@@ -708,6 +718,7 @@ fn run_cdc_inner(
     state: &StateStore,
     read_bytes: &std::sync::Arc<std::sync::atomic::AtomicU64>,
     config_dir: &std::path::Path,
+    meta: Option<&mut (dyn crate::source::Source + 'static)>,
 ) -> (Vec<crate::manifest::RunManifest>, Result<()>) {
     let url = match config.source.resolve_url() {
         Ok(u) => u,
@@ -886,6 +897,7 @@ fn run_cdc_inner(
             started_at: now,
             state: Some(state),
             schema_gate: Some(&schema_gate),
+            meta,
         },
         read_bytes,
     )

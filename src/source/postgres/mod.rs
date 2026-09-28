@@ -4,7 +4,7 @@
 //!
 //! - `mod.rs` (this file) — `PostgresSource` struct + connect/TLS path, the
 //!   transaction-pooler detector, `PgTxnGuard`, sampling helpers
-//!   (`sample_temp_bytes`, `pg_sample_checkpoints_req`, `pg_fetch_work_mem_bytes`),
+//!   (`pg_sample_checkpoints_req`, `pg_fetch_work_mem_bytes`),
 //!   `introspect_pg_table_for_chunking`, the cursor + FETCH export loop
 //!   (`pg_run_export`), the `Source` trait impl, and the catalog-hint
 //!   resolver that bridges parsed FROM clauses to `pg_catalog`.
@@ -163,28 +163,6 @@ impl Drop for PgTxnGuard<'_> {
             log::warn!("PgTxnGuard: ROLLBACK during drop failed: {e:#}");
         }
     }
-}
-
-/// Snapshot `pg_stat_database.temp_bytes` for the current database.
-///
-/// Used by the pipeline job to compute per-run cursor / sort spill: we capture
-/// the cluster-wide counter immediately before and after each export and
-/// surface the delta on the run summary card. Failures (connect, query) return
-/// `None` — the metric is informational, not a correctness signal.
-///
-/// Note this is a cluster-level counter: concurrent activity from other
-/// connections during the run inflates the delta. For a single-tenant test
-/// box (the common pilot setup) it is accurate; for shared hosts it is a
-/// noisy upper bound, useful as a "your workload was loud" signal.
-pub(crate) fn sample_temp_bytes(url: &str, tls: Option<&TlsConfig>) -> Option<i64> {
-    let mut client = connect_client(url, tls).ok()?;
-    client
-        .query_one(
-            "SELECT temp_bytes::bigint FROM pg_stat_database WHERE datname = current_database()",
-            &[],
-        )
-        .ok()
-        .and_then(|r| r.try_get::<_, i64>(0).ok())
 }
 
 /// Probe `SHOW work_mem` and return the value in bytes.
@@ -880,12 +858,13 @@ impl super::Source for PostgresSource {
         let client = &mut self.client;
         // `tup_returned` (rows the engine had to scan) is the read-amplification
         // signal; `blks_read`/`blks_hit` the I/O vs cache split; `temp_files` the
-        // spill count; `deadlocks` contention. temp_bytes is intentionally omitted —
-        // it's already on the run summary (export_metrics.pg_temp_bytes_delta).
+        // spill count; `deadlocks` contention. temp_bytes rides the same row so the
+        // run's temp-spill delta needs no connection of its own; the harm bracket
+        // lifts it out into export_metrics.pg_temp_bytes_delta.
         let row = client
             .query_one(
                 "SELECT blks_read::bigint, blks_hit::bigint, tup_returned::bigint, \
-             tup_fetched::bigint, temp_files::bigint, deadlocks::bigint \
+             tup_fetched::bigint, temp_files::bigint, deadlocks::bigint, temp_bytes::bigint \
              FROM pg_stat_database WHERE datname = current_database()",
                 &[],
             )
@@ -897,6 +876,7 @@ impl super::Source for PostgresSource {
             "pg_tup_fetched",
             "pg_temp_files",
             "pg_deadlocks",
+            crate::source::PG_TEMP_BYTES_KEY,
         ];
         let mut out = Vec::with_capacity(names.len() + 3);
         for (i, name) in names.iter().enumerate() {
