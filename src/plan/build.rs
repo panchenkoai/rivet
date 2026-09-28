@@ -1104,6 +1104,7 @@ mod tests {
             keyset.strategy
         );
         cfg.source.source_type = SourceType::Mongo;
+        cfg.source.url = Some("mongodb://127.0.0.1:1/db".into());
         let err = plan(&cfg).expect_err("Mongo cannot be chunk-planned, whatever is held");
         assert!(
             format!("{err:#}").contains("chunked mode is not supported for MongoDB"),
