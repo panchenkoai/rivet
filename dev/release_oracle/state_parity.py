@@ -82,10 +82,10 @@ BOOKKEEPING = {"schema_version", "rivet_schema_version"}
 UNSCOPED = {"chunk_task", "loaded_source_run"}
 
 
-def _psql(container: str, sql: str) -> str:
-    return run(
-        ["docker", "exec", container, "psql", "-U", "rivet", "-d", state_db_name(), "-tAc", sql]
-    ).stdout.strip()
+def _psql(container: str, sql: str) -> str | None:
+    """One Postgres state query's output, or None when it did not run — never "" for a failure."""
+    p = run(["docker", "exec", container, "psql", "-U", "rivet", "-d", state_db_name(), "-tAc", sql])
+    return p.stdout.strip() if p.ok else None
 
 
 def _seed(src_container: str) -> bool:
@@ -142,36 +142,35 @@ def _sqlite_profile(db: Path, export: str) -> dict[str, object]:
 
 def _pg_profile(container: str, export: str) -> dict[str, object]:
     out: dict[str, object] = {}
-    tables = [
-        t
-        for t in _psql(
-            container, "SELECT tablename FROM pg_tables WHERE schemaname='public'"
-        ).splitlines()
-        if t.strip()
-    ]
+    listed = _psql(container, "SELECT tablename FROM pg_tables WHERE schemaname='public'")
+    if listed is None:
+        raise RuntimeError("state-parity: the Postgres state's table list could not be read")
+    tables = [t for t in listed.splitlines() if t.strip()]
     for t in tables:
         cols = _psql(
             container,
             f"SELECT string_agg(column_name, ',') FROM information_schema.columns "
             f"WHERE table_name = '{t}'",
-        )
+        ) or ""
         where = f" WHERE export_name = '{export}'" if "export_name" in cols.split(",") else ""
-        out[f"count:{t}"] = int(_psql(container, f"SELECT count(*) FROM {t}{where}") or 0)
+        # An unread count is "unreadable", as on the SQLite side — never 0, which reads as agreement.
+        n = _psql(container, f"SELECT count(*) FROM {t}{where}")
+        out[f"count:{t}"] = int(n) if n is not None and n.isdigit() else "unreadable"
     for t, columns in WORK_COLUMNS.items():
         if t not in tables:
             continue
         expr = "||'|'||".join(f"coalesce({c}::text,'-')" for c in columns)
-        rows = _psql(
+        rows = (_psql(
             container,
             f"SELECT {expr} FROM {t} WHERE export_name = '{export}' ORDER BY {columns[0]}",
-        ).splitlines()
+        ) or "unreadable").splitlines()
         out[f"work:{t}"] = [tuple(r.split("|")) for r in rows if r.strip()]
     if "file_log" in tables:
         raw = _psql(
             container,
             f"SELECT count(*)||'|'||coalesce(sum(row_count),0) FROM file_log "
             f"WHERE export_name = '{export}'",
-        )
+        ) or ""
         out["file_log:rows"] = tuple(raw.split("|")) if "|" in raw else ("?", "?")
     return out
 
@@ -250,7 +249,11 @@ def verify_state_backend_parity(
         return
 
     a = _sqlite_profile(db, export)
-    b = _pg_profile(state_container, export)
+    try:
+        b = _pg_profile(state_container, export)
+    except RuntimeError as e:
+        _failed(led, "-", "-", "state_backend_parity", "-", str(e), "unreadable")
+        return
     notes: list[str] = []
 
     # A table with no `export_name` column cannot be scoped, and the Postgres
