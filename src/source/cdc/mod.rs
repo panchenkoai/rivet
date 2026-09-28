@@ -46,10 +46,10 @@ pub(crate) fn check_tx_buffer_caps(engine: &str, rows: usize, bytes: usize) -> R
     // huge transaction that may not exist. Unifying the three engines' backstops
     // into one home (511ead5) collapsed this distinction and made the SQL Server
     // message untrue; a claim in a product message is a testable claim.
-    let subject = if engine == "mssql" {
-        "one poll batch (one or more transactions)"
-    } else {
-        "a single transaction"
+    let subject = match engine {
+        "mssql" => "one poll batch (one or more transactions)",
+        "oracle" => "one commit SCN (one or more transactions)",
+        _ => "a single transaction",
     };
     let row_cap = max_tx_rows();
     if rows > row_cap {
@@ -979,8 +979,9 @@ impl CdcEngine {
     /// single entry point for anchor creation (idempotent: a present anchor is
     /// never moved). The per-engine anchor models (see the process rules):
     /// PG pins server-side at slot creation; MySQL has NO server-side anchor —
-    /// the checkpoint is pinned at first open; MSSQL floors at
-    /// `fn_cdc_get_min_lsn` without one (over-reads, never skips).
+    /// the checkpoint is pinned at first open, and so are Mongo's resume token
+    /// and Oracle's SCN; MSSQL floors at `fn_cdc_get_min_lsn` without one
+    /// (over-reads, never skips).
     /// `resume_expected` = prior-run evidence exists — a missing server-side
     /// anchor then fails LOUDLY instead of silently re-anchoring at "current".
     pub(crate) fn ensure_anchor(
@@ -1169,6 +1170,8 @@ pub(crate) const PG_CDC_HINT: &str = "if this is a permissions/setup error: Post
 pub(crate) const MSSQL_CDC_HINT: &str = "if this is a permissions/setup error: SQL Server CDC must be enabled on the table (sys.sp_cdc_enable_table) with SQL Server Agent running, and the reader needs SELECT on the cdc schema — see the 'SQL Server — CDC change tables' section of docs/reference/cdc.md";
 pub(crate) const ORACLE_CDC_HINT: &str = "if this is a permissions/setup error: Oracle CDC mines redo with LogMiner from CDB$ROOT — the URL names the pluggable database's service, the user is a COMMON user (C##…) granted CREATE SESSION, SET CONTAINER, LOGMINING, EXECUTE_CATALOG_ROLE and SELECT on V_$DATABASE, V_$ARCHIVED_LOG, V_$LOG, V_$LOGFILE, V_$LOGMNR_CONTENTS, V_$LOGMNR_LOGS, V_$TRANSACTION with CONTAINER=ALL, plus SELECT on the captured tables — see the 'Oracle — LogMiner' section of docs/reference/cdc.md";
 pub(crate) const MONGO_CDC_HINT: &str = "if this is a setup error: MongoDB change streams require a replica set (a single-node replica set is fine) — a standalone mongod cannot watch(); the reader needs a role that can run changeStream (readAnyDatabase / read on the db) — see the 'MongoDB — change streams' section of docs/reference/cdc.md";
+/// Why Oracle refuses `until_current: false` / `--stream`: LogMiner here only drains to the open-time SCN.
+pub(crate) const ORACLE_CONTINUOUS_REFUSAL: &str = "Oracle CDC is always a bounded drain to the SCN current at open, so `until_current: false` (`rivet cdc --stream`) would still exit on catch-up — omit it (or set `until_current: true`) and run on a schedule";
 
 /// Where an oversized transaction spills — `None` unless the operator named a
 /// directory in `RIVET_CDC_SPILL_DIR`.
@@ -1366,6 +1369,12 @@ pub(crate) fn create_change_stream(
         }
         #[cfg(feature = "oracle")]
         CdcEngineOpts::Oracle { configured_tables } => {
+            if !cfg.drain.is_bounded() {
+                crate::rivet_bail!(
+                    crate::error::codes::CONFIG_CDC_CONTINUOUS_UNSUPPORTED,
+                    "{ORACLE_CONTINUOUS_REFUSAL}"
+                );
+            }
             // A corrupt checkpoint is its own error, not a setup problem: load it outside the hint.
             if let Some(p) = cfg.checkpoint.as_deref() {
                 Position::load(p)?;
@@ -2541,7 +2550,7 @@ mod tests {
     use super::*;
 
     // Ultrareview bug_001: the loud-fail-on-missing-anchor promise held only
-    // for PostgreSQL. On MySQL/MSSQL a deleted checkpoint with prior-run
+    // for PostgreSQL. On MySQL/MSSQL (and later Mongo/Oracle) a deleted checkpoint with prior-run
     // evidence behind it silently re-pinned at "current" (and on MSSQL that
     // pin actively destroys the min-LSN over-read floor). The bail must fire
     // BEFORE any connection — so this needs no live database.
@@ -2549,7 +2558,12 @@ mod tests {
     fn ensure_anchor_missing_checkpoint_with_evidence_fails_loudly() {
         let d = tempfile::tempdir().unwrap();
         let missing = d.path().join("nonexistent.ckpt");
-        for engine in [CdcEngine::Mysql, CdcEngine::Mssql] {
+        for engine in [
+            CdcEngine::Mysql,
+            CdcEngine::Mssql,
+            CdcEngine::Mongo,
+            CdcEngine::Oracle,
+        ] {
             let err = engine
                 .ensure_anchor(
                     "mysql://u:p@127.0.0.1:1/db",

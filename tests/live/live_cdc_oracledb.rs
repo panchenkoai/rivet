@@ -606,7 +606,7 @@ fn oracle_cdc_cli_resolves_the_source_from_env_and_file_alike() {
 fn oracle_cdc_cli_writes_csv_parts_and_stops_at_the_cap_on_a_commit() {
     // `--format csv` is read back by DuckDB's own CSV parser; `--max-events 2` over three
     // single-row commits must deliver two now and the third on the next run, never lose it;
-    // `--rollover 1` must cut one part per commit; `--stream` must still end the bounded drain.
+    // `--rollover 1` must cut one part per commit; `--stream` is refused, not silently bounded.
     let _serial = cross_process_serial("oracle_cdc");
     let t = cdc_table("ora_cclicsv", "id NUMBER(18) PRIMARY KEY, v NUMBER(18)");
     let table = format!("RIVET.{}", t.name());
@@ -632,9 +632,17 @@ fn oracle_cdc_cli_writes_csv_parts_and_stops_at_the_cap_on_a_commit() {
     for id in 1..=3 {
         ora_exec(&format!("INSERT INTO {} VALUES ({id}, {id})", t.name()));
     }
+    let a = args(&["--stream"]);
+    let refs: Vec<&str> = a.iter().map(String::as_str).collect();
+    let refused = run_rivet(&refs);
+    let err = String::from_utf8_lossy(&refused.stderr);
     assert!(
-        run(&["--max-events", "2", "--rollover", "1", "--stream"]).is_some(),
-        "a capped --stream run did not terminate"
+        !refused.status.success() && err.contains("Oracle CDC is always a bounded drain"),
+        "--stream on Oracle must refuse, not run a bounded drain it did not ask for: {err}"
+    );
+    assert!(
+        run(&["--max-events", "2", "--rollover", "1"]).is_some(),
+        "a capped run did not terminate"
     );
     let ids = |_: ()| -> Vec<i64> {
         let v = duckdb_run_sql_json(&format!(
@@ -680,5 +688,37 @@ fn oracle_cdc_refuses_a_table_it_cannot_resolve_before_the_first_ack() {
     assert!(
         !ckpt.exists(),
         "no anchor is written for a config that cannot run"
+    );
+}
+
+#[test]
+#[ignore = "live: requires the oracle service with LogMiner prerequisites"]
+fn oracle_cdc_byte_cap_counts_the_first_row_and_defers_not_drops() {
+    // RED against a group whose first row is left out of the byte count (the old
+    // Oracle-only copy of the cap): a one-row transaction then never reached the check.
+    let _serial = cross_process_serial("oracle_cdc");
+    let d = tempfile::tempdir().unwrap();
+    let t = cdc_table("ora_ccap", "id NUMBER(18) PRIMARY KEY, v NUMBER(18)");
+    let ckpt = d.path().join("cdc.ckpt");
+    rig(&t, &ckpt, &d.path().join("anchor")).run_ok();
+    ora_exec(&format!("INSERT INTO {} VALUES (1, 10)", t.name()));
+
+    let refused =
+        rig(&t, &ckpt, &d.path().join("refused")).run_with_envs(&[("RIVET_CDC_MAX_TX_BYTES", "1")]);
+    let err = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        !refused.status.success()
+            && err.contains(
+                "oracle cdc: one commit SCN (one or more transactions) needs more than 1 bytes"
+            ),
+        "a one-row transaction past the byte cap must refuse, naming what it buffered: {err}"
+    );
+
+    let out = d.path().join("out");
+    rig(&t, &ckpt, &out).run_ok();
+    assert_eq!(
+        cdc_id_ops(&out),
+        ops(&[(1, "insert")]),
+        "the refused transaction is re-read on the next run, never skipped"
     );
 }

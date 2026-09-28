@@ -151,7 +151,7 @@ const MATRICES: &[(&str, usize)] = &[
     // MSSQL, until_current-terminates-under-load on the three SQL engines) are now
     // filled — every cell is a test or a justified n/a.
     // Raised 0 -> 21 (2026-09-26): the Oracle column's honest gaps (batch-only phase 1).
-    ("docs/cdc-matrix.yaml", 21),
+    ("docs/cdc-matrix.yaml", 20),
     // Resilience / crash-recovery (BATCH + cross-cutting). Both Mongo holes closed:
     // batch-clobber filled with a live test; crash-after-source-read is na (that
     // hook is single.rs-only, and Mongo runs the keyset path).

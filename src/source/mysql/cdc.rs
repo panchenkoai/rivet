@@ -732,15 +732,21 @@ impl MysqlChangeStream {
     ) -> Result<()> {
         let mut conn = connect_conn(url, tls)?;
         let (file, pos) = Self::current_coordinates(&mut conn)?;
-        // `?`, never `unwrap_or_default`: swallowing the error wrote a checkpoint
-        // with an EMPTY uuid — an unverifiable anchor that silently disables the
-        // whole foreign-server refusal this identity exists for, on any transient
-        // blip of the second query (the first, `current_coordinates`, had just
-        // succeeded on the same connection path — measured on a loaded E2E runner,
-        // where the inertness guard in the live test caught the empty uuid). An
-        // anchor rivet cannot later verify must not be created quietly; failing
-        // here is retryable and loud.
-        let (uuid, gtid) = Self::server_identity(&mut conn).map_err(|e| {
+        Self::write_anchor(ckpt, &file, pos, &Self::server_identity(&mut conn))
+    }
+
+    /// Persist `file:pos` with the server's identity, refusing to write an anchor it cannot verify later.
+    fn write_anchor(
+        ckpt: &Path,
+        file: &str,
+        pos: u64,
+        identity: &Result<(String, String)>,
+    ) -> Result<()> {
+        // `?`, never `unwrap_or_default`: a transient blip of the identity query
+        // wrote a checkpoint with an EMPTY uuid, silently disabling the
+        // foreign-server refusal (measured on a loaded CI runner). Refusing is
+        // retryable and loud; a half-anchor is forever.
+        let (uuid, gtid) = identity.as_ref().map_err(|e| {
             anyhow::anyhow!(
                 "mysql cdc: could not record the server's identity for the new \
                  checkpoint ({e:#}) — refusing to write an UNVERIFIABLE anchor: a \
@@ -862,25 +868,7 @@ impl MysqlChangeStream {
                  trusting the result.",
                 path.display()
             );
-            // `?`, never `unwrap_or_default` — the SECOND site of the same
-            // swallowing `pin_checkpoint_at_current` had, and the one the config
-            // path actually takes: a transient blip of the identity query wrote a
-            // checkpoint with an EMPTY uuid, an unverifiable anchor that silently
-            // disables the foreign-server refusal (measured on a loaded CI
-            // runner, where the live test's inertness guard caught the empty
-            // uuid). Refusing is retryable and loud; a half-anchor is forever.
-            let (uuid, gtid) = identity.as_ref().map_err(|e| {
-                anyhow::anyhow!(
-                    "mysql cdc: could not record the server's identity for the new \
-                     checkpoint ({e:#}) — refusing to write an UNVERIFIABLE anchor: \
-                     a checkpoint without a server_uuid cannot be checked against a \
-                     foreign server on resume"
-                )
-            })?;
-            Position(serde_json::json!({
-                "file": file, "pos": pos, "server_uuid": uuid, "gtid_executed": gtid
-            }))
-            .save(path)?;
+            Self::write_anchor(path, &file, pos, &identity)?;
         }
         Self::open_on(
             conn,

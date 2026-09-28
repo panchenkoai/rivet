@@ -880,7 +880,7 @@
           ]
         },
         "until_current": {
-          "description": "Catch up to the source's current end and exit (a bounded run), instead of\nstreaming indefinitely — ideal for a scheduler. For MySQL this is a\nnon-blocking binlog dump; PostgreSQL / SQL Server already drain-and-exit.\n**Defaults to `true`** (bounded): the OSS model is scheduler-driven, and\nomitting this must NOT silently start a never-terminating stream. Setting\n`false` opts into the continuous model, which is engine-specific: a true\ndaemon on MySQL (blocking binlog dump) and MongoDB (the change stream\nblocks awaiting events; ends only if the stream is invalidated/closed);\nPostgreSQL / SQL Server still exit on catch-up — one unbounded pass, run\nit under a supervisor.",
+          "description": "Catch up to the source's current end and exit (a bounded run), instead of\nstreaming indefinitely — ideal for a scheduler. For MySQL this is a\nnon-blocking binlog dump; PostgreSQL / SQL Server already drain-and-exit.\n**Defaults to `true`** (bounded): the OSS model is scheduler-driven, and\nomitting this must NOT silently start a never-terminating stream. Setting\n`false` opts into the continuous model, which is engine-specific: a true\ndaemon on MySQL (blocking binlog dump) and MongoDB (the change stream\nblocks awaiting events; ends only if the stream is invalidated/closed);\nPostgreSQL / SQL Server still exit on catch-up — one unbounded pass, run\nit under a supervisor. Oracle refuses `false`: LogMiner is always a\nbounded drain to the SCN current at open.",
           "type": "boolean",
           "default": true
         },

@@ -340,6 +340,11 @@ pub mod codes {
         "RIVET_CONFIG_CDC_ROLLOVER_INVALID",
         "set `cdc.rollover` to 1 or more, or omit it",
     );
+    /// `until_current: false` / `--stream` on an engine that only drains to an open-time bound (Oracle).
+    pub const CONFIG_CDC_CONTINUOUS_UNSUPPORTED: Code = usage(
+        "RIVET_CONFIG_CDC_CONTINUOUS_UNSUPPORTED",
+        "omit `cdc.until_current` (or `--stream`) and run the bounded drain on a schedule",
+    );
     pub const CONFIG_CSV_LOAD_UNSUPPORTED: Code = usage(
         "RIVET_CONFIG_CSV_LOAD_UNSUPPORTED",
         "use `format: parquet` for an export with a `load:` section",
@@ -444,6 +449,7 @@ pub mod codes {
         CONFIG_DUPLICATE_EXPORT,
         CONFIG_CDC_RESOURCE_CONFLICT,
         CONFIG_CDC_ROLLOVER_INVALID,
+        CONFIG_CDC_CONTINUOUS_UNSUPPORTED,
         CONFIG_CSV_LOAD_UNSUPPORTED,
         CONFIG_SOURCE_MODE_UNSUPPORTED,
         SOURCE_STATEMENT_TIMEOUT,
