@@ -1,8 +1,8 @@
 //! Single-threaded chunk-checkpoint runner.
 //!
 //! `run_chunked_sequential_checkpoint` claims chunk tasks from the state DB
-//! one at a time, runs each through `export_one_chunk_range` (with its own
-//! retry wrapper `run_chunk_with_source_retries`), and records progress in
+//! one at a time, runs each through `export_one_chunk_range` (under the shared
+//! retry policy `super::attempt::run_with_retries`), and records progress in
 //! the manifest + chunk_task tables. This is the path used when `parallel: 1`
 //! or when `chunk_checkpoint: true` is set on a non-parallel export.
 //!
@@ -13,12 +13,7 @@
 
 use std::time::Duration;
 
-use super::super::{
-    RunSummary,
-    progress::ChunkProgress,
-    retry::{RetryClass, classify_error},
-    sink::ExportSink,
-};
+use super::super::{RunSummary, progress::ChunkProgress, sink::ExportSink};
 use super::{ChunkSource, chunked_plan, config_hint, ensure_chunk_checkpoint_plan};
 use crate::error::Result;
 use crate::journal::RunEvent;
@@ -123,105 +118,6 @@ fn export_one_chunk_range(
     Ok((rows, recs, sink.take_checksums(), sink.take_shape()))
 }
 
-#[allow(clippy::too_many_arguments)] // mirrors export_one_chunk_range's arity for retry wrapping
-fn run_chunk_with_source_retries(
-    base_query: &str,
-    cp: &ChunkedPlan,
-    start: i64,
-    end: i64,
-    chunk_index: i64,
-    plan: &ResolvedRunPlan,
-    summary: &mut RunSummary,
-    row_progress: Option<(
-        &crate::pipeline::progress::ChunkProgressHandle,
-        &std::sync::Arc<std::sync::atomic::AtomicI64>,
-    )>,
-    debris: &mut Vec<super::super::commit::PartRecord>,
-) -> Result<ChunkOutcome> {
-    let mut last_err: Option<anyhow::Error> = None;
-    for attempt in 0..=plan.tuning.max_retries {
-        if attempt > 0 {
-            // Bump the per-run retry counter on every retry attempt so the
-            // console summary card and `rivet metrics` show how often the
-            // export had to re-try (it would otherwise stay at 0, masking
-            // a flaky link that worked only because backoff covered for it).
-            summary.retries = summary.retries.saturating_add(1);
-            let class = last_err
-                .as_ref()
-                .map(classify_error)
-                .unwrap_or(RetryClass::Permanent);
-            // #4: a retry whose error class needs a fresh connection re-opens the
-            // source below (create_source per attempt) — a real reconnect. Count it
-            // so the flaky-link DIAGNOSIS fires on the chunked runner too, not only
-            // single mode's run_with_reconnect.
-            if class.needs_reconnect() {
-                summary.reconnects = summary.reconnects.saturating_add(1);
-            }
-            let backoff = crate::pipeline::retry::retry_backoff_ms(
-                plan.tuning.retry_backoff_ms,
-                attempt,
-                class.extra_delay_ms(),
-            );
-            log::warn!(
-                "export '{}': chunk {} retry {}/{} in {}ms",
-                plan.export_name,
-                chunk_index,
-                attempt,
-                plan.tuning.max_retries,
-                backoff
-            );
-            std::thread::sleep(Duration::from_millis(backoff));
-        }
-
-        let mut src = match source::create_source(&plan.source) {
-            Ok(s) => s,
-            Err(e) => {
-                if super::super::retry::should_retry(super::super::retry::Attempt {
-                    attempt,
-                    max_retries: plan.tuning.max_retries,
-                    error: &e,
-                }) {
-                    last_err = Some(e);
-                    continue;
-                }
-                // Round-2 audit #3/#4: doctor/auth-TLS connect hint on the final
-                // (non-transient) worker connect failure, matching single.rs:93.
-                return Err(crate::pipeline::single::attach_connect_hint(
-                    e,
-                    &plan.source,
-                ));
-            }
-        };
-
-        match export_one_chunk_range(
-            &mut *src,
-            base_query,
-            cp,
-            start,
-            end,
-            chunk_index,
-            plan,
-            summary,
-            row_progress,
-            debris,
-        ) {
-            Ok(v) => return Ok(v),
-            Err(e) => {
-                if super::super::retry::should_retry(super::super::retry::Attempt {
-                    attempt,
-                    max_retries: plan.tuning.max_retries,
-                    error: &e,
-                }) {
-                    last_err = Some(e);
-                    continue;
-                }
-                return Err(e);
-            }
-        }
-    }
-    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("chunk export failed after retries")))
-}
-
 pub(crate) fn run_chunked_sequential_checkpoint(
     src: &mut dyn Source,
     state: &StateStore,
@@ -294,6 +190,9 @@ pub(crate) fn run_chunked_sequential_checkpoint(
         std::thread::sleep(Duration::from_secs(5));
     }
 
+    // One connection carried across chunks; a retry reconnects.
+    let idle = super::IdleSources::default();
+    let tally = super::attempt::RetryTally::default();
     while let Some((chunk_index, sk, ek)) = state.claim_next_chunk_task(&run_id)? {
         if !resource::check_memory(plan.tuning.memory_threshold_mb) {
             log::warn!(
@@ -334,17 +233,31 @@ pub(crate) fn run_chunked_sequential_checkpoint(
         let chunk_result = match crate::test_hook::maybe_error_at_index("chunk_export", chunk_index)
         {
             Err(msg) => Err(anyhow::anyhow!(msg)),
-            Ok(()) => run_chunk_with_source_retries(
-                &plan.base_query,
-                cp,
-                start,
-                end,
-                chunk_index,
-                plan,
-                summary,
-                Some((&pb_handle, &streamed_rows)),
-                &mut debris,
-            ),
+            Ok(()) => {
+                let r = super::attempt::run_with_retries(
+                    plan,
+                    chunk_index,
+                    &tally,
+                    |a| super::attempt::open_for_attempt(&idle, &plan.source, a),
+                    |src| {
+                        export_one_chunk_range(
+                            &mut **src,
+                            &plan.base_query,
+                            cp,
+                            start,
+                            end,
+                            chunk_index,
+                            plan,
+                            summary,
+                            Some((&pb_handle, &streamed_rows)),
+                            &mut debris,
+                        )
+                    },
+                    |src| idle.give(src),
+                );
+                tally.fold_into(summary);
+                r
+            }
         };
         match chunk_result {
             Ok((rows, parts, chunk_checksums, chunk_shape)) => {

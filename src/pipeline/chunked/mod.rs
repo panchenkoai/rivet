@@ -19,6 +19,7 @@
 //! and concentrates the helpers they share in one place rather than
 //! duplicating them.
 
+mod attempt;
 mod detect;
 mod exec;
 pub(crate) mod math;
