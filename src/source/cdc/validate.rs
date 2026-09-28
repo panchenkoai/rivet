@@ -45,6 +45,8 @@ enum PosKey {
     /// A binlog name with no numeric suffix keeps its filename via `BinlogRaw`
     /// so two such never compare equal by accident.
     Binlog(u64, u64),
+    /// Oracle commit SCN, compared as a number (a string compare puts "999" after "1000").
+    Scn(u64),
     /// A binlog file whose name has no parseable ordinal — ordered by name,
     /// then pos. Never mixed with `Binlog` in a real run (one server, one
     /// basename), but kept distinct so the fallback is not silently equal.
@@ -73,6 +75,9 @@ fn parse_pos(s: &str) -> Option<PosKey> {
     // the resume-token keystring, order-preserving under lexical compare (oplog
     // order). Key on it — a `Utf8` string key, like a generic LSN. Without this
     // arm `rivet validate --depth full` failed on every healthy mongo CDC output.
+    if let Some(scn) = v.get("commit_scn").and_then(|x| x.as_str()) {
+        return scn.parse().ok().map(PosKey::Scn);
+    }
     if let Some(data) = v.get("_data").and_then(|x| x.as_str()) {
         return Some(PosKey::Lsn(data.to_string()));
     }

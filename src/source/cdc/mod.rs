@@ -671,6 +671,8 @@ pub(crate) enum CdcEngineOpts {
     /// Render the `document` blob as canonical (type-tagged) extended JSON — the
     /// `source.mongo.json: canonical` mode, so a CDC stream and a full export
     /// produce identical text. Config-driven only; the CLI defaults to relaxed.
+    /// Oracle LogMiner (ADR-0037): the configured tables are what the mining query selects.
+    Oracle { configured_tables: Vec<String> },
     Mongo {
         canonical: bool,
         /// The export's configured `table:` names. Every other engine's variant
@@ -836,6 +838,7 @@ pub(crate) enum CdcEngine {
     Postgres,
     Mssql,
     Mongo,
+    Oracle,
 }
 
 /// What image of a row this source can actually supply per change event.
@@ -903,7 +906,7 @@ impl CdcEngine {
     pub(crate) fn maps_by_position(self) -> bool {
         match self {
             Self::Mysql => true,
-            Self::Postgres | Self::Mssql | Self::Mongo => false,
+            Self::Postgres | Self::Mssql | Self::Mongo | Self::Oracle => false,
         }
     }
 
@@ -920,7 +923,7 @@ impl CdcEngine {
     pub(crate) fn pins_log_for_reader(self) -> bool {
         match self {
             Self::Postgres => true,
-            Self::Mysql | Self::Mssql | Self::Mongo => false,
+            Self::Mysql | Self::Mssql | Self::Mongo | Self::Oracle => false,
         }
     }
 }
@@ -958,6 +961,10 @@ impl CdcEngine {
             // The reader requests `FullDocumentType::UpdateLookup`, so the
             // post-image is the whole document whatever the server is set to.
             Self::Mongo => RowImage::Whole,
+            #[cfg(feature = "oracle")]
+            Self::Oracle => crate::source::oracle::cdc::row_image(url, tls, tables),
+            #[cfg(not(feature = "oracle"))]
+            Self::Oracle => RowImage::Whole,
         }
     }
 
@@ -1060,9 +1067,14 @@ impl CdcEngine {
             Ok(Self::Mssql)
         } else if url.starts_with("mongodb://") || url.starts_with("mongodb+srv://") {
             Ok(Self::Mongo)
+        } else if url
+            .get(..9)
+            .is_some_and(|s| s.eq_ignore_ascii_case("oracle://"))
+        {
+            Ok(Self::Oracle)
         } else {
             anyhow::bail!(
-                "rivet cdc: unsupported source url — expected mysql:// / postgresql:// / sqlserver:// / mongodb://"
+                "rivet cdc: unsupported source url — expected mysql:// / postgresql:// / sqlserver:// / mongodb:// / oracle://"
             )
         }
     }
@@ -1074,6 +1086,7 @@ impl CdcEngine {
             Self::Postgres => "postgres",
             Self::Mssql => "mssql",
             Self::Mongo => "mongo",
+            Self::Oracle => "oracle",
         }
     }
 
@@ -1120,7 +1133,7 @@ impl CdcEngine {
                 )?);
                 Ok(())
             }
-            Self::Mysql | Self::Mssql | Self::Mongo => {
+            Self::Mysql | Self::Mssql | Self::Mongo | Self::Oracle => {
                 let ckpt = checkpoint.ok_or_else(|| {
                     anyhow::anyhow!(
                         "{} cdc: an anchor needs cdc.checkpoint (no server-side anchor exists)",
@@ -1165,6 +1178,12 @@ impl CdcEngine {
                     Self::Mssql => {
                         crate::source::mssql::cdc::pin_checkpoint_at_max_lsn(url, ckpt, tls)
                     }
+                    #[cfg(feature = "oracle")]
+                    Self::Oracle => {
+                        crate::source::oracle::cdc::pin_checkpoint_at_current(url, tls, ckpt)
+                    }
+                    #[cfg(not(feature = "oracle"))]
+                    Self::Oracle => Err(crate::source::oracle_feature_missing()),
                     _ => crate::source::mongo::cdc::pin_checkpoint_at_current(url, tls, ckpt),
                 }
             }
@@ -1227,6 +1246,7 @@ fn with_setup_hint(e: anyhow::Error, hint: &'static str) -> anyhow::Error {
 pub(crate) const MYSQL_CDC_HINT: &str = "if this is a permissions/setup error: MySQL CDC needs binlog_format=ROW plus a REPLICATION SLAVE + REPLICATION CLIENT grant (and SELECT on the table) — see the 'MySQL — the binlog grants' section of docs/reference/cdc.md";
 pub(crate) const PG_CDC_HINT: &str = "if this is a permissions/setup error: PostgreSQL CDC needs wal_level=logical and a role with the REPLICATION attribute — see the 'PostgreSQL — the logical slot' section of docs/reference/cdc.md";
 pub(crate) const MSSQL_CDC_HINT: &str = "if this is a permissions/setup error: SQL Server CDC must be enabled on the table (sys.sp_cdc_enable_table) with SQL Server Agent running, and the reader needs SELECT on the cdc schema — see the 'SQL Server — CDC change tables' section of docs/reference/cdc.md";
+pub(crate) const ORACLE_CDC_HINT: &str = "if this is a permissions/setup error: Oracle CDC mines redo with LogMiner from CDB$ROOT — the URL names the pluggable database's service, the user is a COMMON user (C##…) granted CREATE SESSION, SET CONTAINER, LOGMINING, EXECUTE_CATALOG_ROLE and SELECT on V_$DATABASE, V_$ARCHIVED_LOG, V_$LOG, V_$LOGFILE, V_$LOGMNR_CONTENTS, V_$LOGMNR_LOGS, V_$TRANSACTION with CONTAINER=ALL, plus SELECT on the captured tables — see the 'Oracle — LogMiner' section of docs/reference/cdc.md";
 pub(crate) const MONGO_CDC_HINT: &str = "if this is a setup error: MongoDB change streams require a replica set (a single-node replica set is fine) — a standalone mongod cannot watch(); the reader needs a role that can run changeStream (readAnyDatabase / read on the db) — see the 'MongoDB — change streams' section of docs/reference/cdc.md";
 
 /// Where an oversized transaction spills — `None` unless the operator named a
@@ -1433,6 +1453,24 @@ pub(crate) fn create_change_stream(
                 .map_err(|e| with_setup_hint(e, MSSQL_CDC_HINT))?,
             ))
         }
+        #[cfg(feature = "oracle")]
+        CdcEngineOpts::Oracle { configured_tables } => {
+            // A corrupt checkpoint is its own error, not a setup problem: load it outside the hint.
+            if let Some(p) = cfg.checkpoint.as_deref() {
+                Position::load(p)?;
+            }
+            Ok(Box::new(
+                crate::source::oracle::cdc::OracleChangeStream::open(
+                    url,
+                    tls,
+                    cfg.checkpoint.as_deref(),
+                    configured_tables,
+                )
+                .map_err(|e| with_setup_hint(e, ORACLE_CDC_HINT))?,
+            ))
+        }
+        #[cfg(not(feature = "oracle"))]
+        CdcEngineOpts::Oracle { .. } => Err(crate::source::oracle_feature_missing()),
         CdcEngineOpts::Mongo {
             canonical,
             configured_tables,
@@ -1508,6 +1546,12 @@ impl CdcSchemaResolver {
             CdcEngine::Mongo => {
                 Box::new(crate::source::mongo::MongoSource::connect(url, tls, None)?)
             }
+            #[cfg(feature = "oracle")]
+            CdcEngine::Oracle => Box::new(crate::source::oracle::OracleSource::connect_with_tls(
+                url, tls,
+            )?),
+            #[cfg(not(feature = "oracle"))]
+            CdcEngine::Oracle => return Err(crate::source::oracle_feature_missing()),
         };
         let enrich = match engine {
             CdcEngine::Mysql => Some(crate::source::mysql::connect_pool(url, tls)?.get_conn()?),

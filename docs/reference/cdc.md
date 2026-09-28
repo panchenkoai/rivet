@@ -290,6 +290,7 @@ Rivet normalises four different source mechanisms behind one `ChangeStream`:
 | **PostgreSQL** | logical replication slot (`test_decoding`) | poll the slot via `pg_logical_slot_peek_changes()` |
 | **SQL Server** | `cdc.*` change tables the capture Agent extracts | poll the change function by LSN window |
 | **MongoDB** | whole-database change stream (`db.watch()` over the oplog) | tailable stream; the resume token checkpoints the position (JSON-blob image — see [mongodb.md](mongodb.md)) |
+| **Oracle** (preview) | LogMiner over the redo logs, mined from `CDB$ROOT` | poll: each run mines `[checkpoint, SCN at open]` with `COMMITTED_DATA_ONLY` ([ADR-0037](../adr/0037-oracle-cdc-logminer.md)) |
 
 MySQL and PostgreSQL expose the log to the client; SQL Server does not — there a
 server-side Agent extracts the log into change tables that rivet polls.
@@ -441,6 +442,43 @@ Notes:
 - **Retention:** the cleanup job keeps ~3 days by default. If rivet is offline
   longer than retention, the saved LSN falls below `sys.fn_cdc_get_min_lsn()` and
   the read errors — fall back to a full re-snapshot.
+
+### Oracle — LogMiner (preview)
+
+Oracle CDC reads the redo logs through LogMiner, which ships with every edition
+(Free included) and needs no GoldenGate licence. rivet never sets
+`ENABLE_GOLDENGATE_REPLICATION` (that one does need the licence).
+
+```sql
+-- ONCE, as SYSDBA in CDB$ROOT:
+SHUTDOWN IMMEDIATE; STARTUP MOUNT; ALTER DATABASE ARCHIVELOG; ALTER DATABASE OPEN;
+ALTER DATABASE ADD SUPPLEMENTAL LOG DATA;              -- minimal logging
+CREATE USER c##rivetcdc IDENTIFIED BY … CONTAINER = ALL;
+GRANT CREATE SESSION, SET CONTAINER, LOGMINING TO c##rivetcdc CONTAINER = ALL;
+GRANT EXECUTE_CATALOG_ROLE TO c##rivetcdc CONTAINER = ALL;
+GRANT SELECT ON v_$database TO c##rivetcdc CONTAINER = ALL;   -- and the same for
+--   v_$archived_log, v_$log, v_$logfile, v_$logmnr_contents, v_$logmnr_logs, v_$transaction
+
+-- PER CAPTURED TABLE (its owner or a DBA), in the pluggable database:
+ALTER TABLE app.orders ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;
+GRANT SELECT ON app.orders TO c##rivetcdc;
+```
+
+Notes:
+
+- **The URL names the pluggable database** (`oracle://c%23%23rivetcdc:…@host:1521/ORCLPDB1`
+  — `#` percent-encoded). rivet switches the session to `CDB$ROOT` to mine and
+  keeps only that PDB's changes. A non-CDB works without the switch.
+- **ALL COLUMNS logging, not PRIMARY KEY.** With key logging an UPDATE's redo
+  carries only the changed columns, so the change cannot represent the row; rivet
+  refuses such a table and prints the statement above.
+- **Tables the preview refuses by name:** a column of type LOB, LONG, XMLTYPE, JSON,
+  INTERVAL, BOOLEAN, VECTOR, ROWID or an object type; a name over 30 bytes; and,
+  before 23ai, an identity column (LogMiner ignores those tables entirely).
+- **Retention is the DBA's**, as with the binlog: nothing pins archived logs for
+  rivet. If the checkpoint needs a log that was deleted, the run fails with a
+  data-loss error (see *Failure modes*).
+- **Loading** an Oracle stream with `rivet load` is not supported in the preview.
 
 ---
 
@@ -723,6 +761,17 @@ than resume from the new min and **silently skip the gap**. Delete the checkpoin
 CDC re-anchors **first**, then re-snapshot. Also watch for a **non-advancing `sys.fn_cdc_get_max_lsn()`**:
 that means the **Agent capture job stopped**, so the change tables are frozen — read
 "no rows" as "the job is down", not "no changes".
+
+### Oracle — the archived logs were deleted
+
+If the checkpoint needs redo older than the oldest archived log still listed (RMAN
+`DELETE INPUT`, a retention policy), or a log sequence is missing in between, the run
+fails with *"… LOST to this stream"* instead of mining from whatever remains. Delete
+the checkpoint so the next run anchors **first**, then re-snapshot the table.
+
+A checkpoint written against another database (a different `DBID`, a `RESETLOGS`
+since, or another pluggable database) is refused the same way: an SCN means nothing
+outside the database that issued it.
 
 ### Recovery, in one line
 

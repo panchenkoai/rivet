@@ -391,6 +391,26 @@ pub mod codes {
         "RIVET_SOURCE_CURSOR_FINER_THAN_MICROSECOND",
         "cursor on a column at microsecond precision or coarser, or cast the cursor to TIMESTAMP(6) in a curated query",
     );
+    pub const SOURCE_CDC_FOREIGN_CHECKPOINT: Code = refusal(
+        "RIVET_SOURCE_CDC_FOREIGN_CHECKPOINT",
+        "delete the checkpoint so the next run anchors afresh FIRST, then re-snapshot the tables",
+    );
+    pub const SOURCE_CDC_CHECKPOINT_INVALID: Code = refusal(
+        "RIVET_SOURCE_CDC_CHECKPOINT_INVALID",
+        "restore the checkpoint file, or delete it to accept a fresh anchor (then re-snapshot)",
+    );
+    pub const SOURCE_CDC_LOG_GAP: Code = refusal(
+        "RIVET_SOURCE_CDC_LOG_GAP",
+        "restore the missing log, or delete the checkpoint so the stream anchors FIRST, then re-snapshot",
+    );
+    pub const SOURCE_CDC_UNDECODABLE: Code = refusal(
+        "RIVET_SOURCE_CDC_UNDECODABLE",
+        "re-snapshot the table: delete the checkpoint first so the stream anchors, then snapshot",
+    );
+    pub const SOURCE_CDC_PREREQUISITE: Code = environment(
+        "RIVET_SOURCE_CDC_PREREQUISITE",
+        "apply the setup statement the message names, then re-run (docs/reference/cdc.md)",
+    );
     pub const LOAD_COUNT_MISMATCH: Code = integrity(
         "RIVET_LOAD_COUNT_MISMATCH",
         "compare the warehouse table with the run's manifest before re-running; the source is kept",
@@ -424,6 +444,11 @@ pub mod codes {
         CONFIG_SOURCE_MODE_UNSUPPORTED,
         SOURCE_STATEMENT_TIMEOUT,
         SOURCE_CURSOR_FINER_THAN_MICROSECOND,
+        SOURCE_CDC_FOREIGN_CHECKPOINT,
+        SOURCE_CDC_CHECKPOINT_INVALID,
+        SOURCE_CDC_LOG_GAP,
+        SOURCE_CDC_UNDECODABLE,
+        SOURCE_CDC_PREREQUISITE,
         STATE_SCHEMA_NEWER,
         STATE_CURSOR_OWNER_MISMATCH,
         LOAD_COUNT_MISMATCH,
