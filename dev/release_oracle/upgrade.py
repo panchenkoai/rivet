@@ -18,6 +18,13 @@ Per SQL engine, on the downloaded previous binary and this one:
              part is written (this binary is next release's "previous").
   fresh      the old config over the used prefix with an EMPTY state: no row is lost;
              the rows written again are reported (a re-baseline, measured not judged).
+  load       the previous release runs and `rivet load`s an incremental export into
+             BigQuery; after a delta this binary runs and loads the same config: the base
+             keeps the first load, the buffer holds exactly the delta, the union every
+             source id. The previous state carries the cursor and the primary key the load
+             needs (RED: dropping it fails the load). The loaded-run skip set is NOT graded:
+             init's `cleanup_source: true` deletes the first parts, so erasing it changes
+             nothing here (measured).
   cdc        per CDC engine: the previous release anchors a stream and captures a batch;
              this binary continues its checkpoint and captures exactly the next batch —
              nothing skipped, nothing of the first batch re-read.
@@ -31,6 +38,7 @@ from __future__ import annotations
 import glob
 import json
 import os
+import re
 import shutil
 import sqlite3
 import tempfile
@@ -301,6 +309,65 @@ def _cdc_leg(led: Ledger, prev: Path, engine: str, url: str) -> None:
         eng.cleanup(url, work)
 
 
+def _load_leg(led: Ledger, prev: Path, root: Path, url: str) -> None:
+    """The previous release's BigQuery base+buffer and state, continued by this binary's run and load."""
+    from . import gcp
+    from .bigquery import _bq_json
+
+    proj, bucket = os.environ.get("BQ_ORACLE_PROJECT", ""), os.environ.get("BQ_ORACLE_BUCKET", "")
+    if not proj or not bucket:
+        led.skipped("postgres", "-", SCEN, "load", "upgrade[postgres/load]: no BQ_ORACLE_PROJECT / "
+                    "BQ_ORACLE_BUCKET", "no bigquery")
+        return
+    table = f"upg_load_{os.getpid()}"
+    dset = f"rivet_tmp_upg_{os.getpid()}"
+    if not _seed("postgres", url, table, ROWS, with_cursor=True):
+        led.failed("postgres", "-", SCEN, "load", "upgrade[postgres/load]: seed failed", "seed")
+        return
+    d = root / "load"
+    d.mkdir()
+    env = {"RIVET_UPG_URL": url, "RIVET_STATE_URL": ""}
+    try:
+        gcp.bq_ensure_dataset(proj, dset)
+        init = run([str(prev), "init", "--source-env", "RIVET_UPG_URL", "--table", table, "--mode",
+                    "incremental", "--gcs-bucket", bucket, "--bigquery-project", proj,
+                    "--bigquery-dataset", dset, "-o", "c.yaml"], env=env, cwd=d)
+        steps = [(prev, "run"), (prev, "load"), (None, "delta"), (rivet_bin(), "run"), (rivet_bin(), "load")]
+        for binary, step in steps:
+            if binary is None:
+                ok = _mutate("postgres", url, table)
+            else:
+                p = run([str(binary), step, "-c", "c.yaml"], env=env, cwd=d, timeout=None)
+                ok = p.ok
+            if not init.ok or not ok:
+                why = init.stderr if not init.ok else ("" if binary is None else p.stderr)
+                led.failed("postgres", "-", SCEN, "load", f"upgrade[postgres/load]: {step} by "
+                           f"{'prev' if binary == prev else 'this'} failed: {why.strip()[-200:]}", step)
+                return
+        src = _sql("postgres", url, f"SELECT 'rows=' || count(*) FROM {table};")
+        m = re.search(r"rows=(\d+)", src.stdout or "") if src.ok else None
+        want = int(m.group(1)) if m else None
+        # Base + buffer: the first load fills the base, every later one appends to
+        # `__changes`. A continued ledger leaves exactly the delta (300 new + 50 changed)
+        # in the buffer; a lost one reloads the first run's parts there too.
+        t = f"`{proj}.{dset}.{table}`"
+        c = f"`{proj}.{dset}.{table}__changes`"
+        got = _bq_json(proj, f"SELECT (SELECT count(*) FROM {t}) b, (SELECT count(*) FROM {c}) ch, "
+                             f"(SELECT count(DISTINCT id) FROM (SELECT id FROM {t} UNION ALL SELECT id FROM {c})) u")
+        b, ch, u = (int(got[0]["b"]), int(got[0]["ch"]), int(got[0]["u"])) if got else (None, None, None)
+        if want is not None and (b, ch, u) == (ROWS, 350, want):
+            led.passed("postgres", "-", SCEN, "load", f"upgrade[postgres/load]: this binary's load continued "
+                       f"the previous release's ledger — base {b}, buffer {ch} (the delta only), {u} ids")
+        else:
+            led.failed("postgres", "-", SCEN, "load", f"upgrade[postgres/load]: (base, buffer, ids) = "
+                       f"{(b, ch, u)}, want ({ROWS}, 350, {want})", "ledger")
+    finally:
+        _sql("postgres", url, f"DROP TABLE IF EXISTS {table};")
+        if not os.environ.get("RIVET_UPG_KEEP"):
+            gcp.bq_delete_dataset(proj, dset)
+        gcp.gcs_delete_prefix(bucket, f"exports/{table}/")
+
+
 def verify_upgrade_continuity(led: Ledger) -> None:
     """The previous release's config, state and crash checkpoint, carried on by this binary."""
     prev = _require_prev_binary(led, "all", "-", SCEN, "local", "upgrade continuity")
@@ -326,6 +393,8 @@ def verify_upgrade_continuity(led: Ledger) -> None:
                                "a fresh Postgres state DB for the previous release", "no state db")
                     continue
                 leg(led, prev, root, engine, url, fresh)
+    if os.environ.get("RIVET_ORACLE_POSTGRES_URL"):
+        _load_leg(led, prev, root, os.environ["RIVET_ORACLE_POSTGRES_URL"])
     for engine in CDC_ENGINES:
         cvar = f"RIVET_CDC_{engine.upper()}_URL"
         curl = os.environ.get(cvar, "")
