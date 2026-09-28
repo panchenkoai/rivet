@@ -893,6 +893,18 @@ mod tests {
     }
 
     #[test]
+    fn decide_retry_a_quality_stop_named_like_a_timeout_bails_original() {
+        let err: anyhow::Error = DataIntegrityError::new(crate::quality::failure_message(
+            "session_timeouts",
+            None,
+            &["column 'timeout_ms': 3 duplicate values"],
+        ))
+        .into();
+        let d = decide_export_retry(0, 3, 0, "session_timeouts", &err);
+        assert!(matches!(d, ExportRetry::BailOriginal), "got: {d:?}");
+    }
+
+    #[test]
     fn decide_retry_transient_after_budget_exhausted_bails_original() {
         // attempt == max_retries → no more attempts allowed.
         let d = decide_export_retry(3, 3, 0, "orders", &transient_err());

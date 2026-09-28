@@ -289,31 +289,36 @@ pub fn classify_exit(err: &anyhow::Error) -> i32 {
     if let Some(p) = err.downcast_ref::<PreclassifiedExit>() {
         return p.0;
     }
+    if let Some(c) = stop_class(err) {
+        return c.code();
+    }
+    if crate::pipeline::retry::classify_error(err).is_transient() {
+        return ExitClass::Retryable.code();
+    }
+    ExitClass::Generic.code()
+}
+
+/// The class a typed stop marker in the chain fixes regardless of wording; `None` leaves it to the transient check.
+pub(crate) fn stop_class(err: &anyhow::Error) -> Option<ExitClass> {
     if err.downcast_ref::<SchemaDriftError>().is_some() {
-        return ExitClass::SchemaDrift.code();
+        return Some(ExitClass::SchemaDrift);
     }
     if err.downcast_ref::<DataIntegrityError>().is_some()
         || err
             .downcast_ref::<crate::manifest::ManifestInconsistency>()
             .is_some()
     {
-        return ExitClass::DataIntegrity.code();
+        return Some(ExitClass::DataIntegrity);
     }
-    // A registered code decides by its kind; an environment failure still goes through the
-    // transient check below (a dropped connection retries, a denied permission does not).
-    if let Some(c) = err.downcast_ref::<CodedError>() {
-        match c.kind() {
-            ErrorKind::Refusal => return ExitClass::Refusal.code(),
-            ErrorKind::Internal => return ExitClass::Internal.code(),
-            ErrorKind::Integrity => return ExitClass::DataIntegrity.code(),
-            ErrorKind::Usage => return ExitClass::Generic.code(),
-            ErrorKind::Environment => {}
-        }
+    // An environment failure still goes through the transient check (a dropped
+    // connection retries, a denied permission does not).
+    match err.downcast_ref::<CodedError>()?.kind() {
+        ErrorKind::Refusal => Some(ExitClass::Refusal),
+        ErrorKind::Internal => Some(ExitClass::Internal),
+        ErrorKind::Integrity => Some(ExitClass::DataIntegrity),
+        ErrorKind::Usage => Some(ExitClass::Generic),
+        ErrorKind::Environment => None,
     }
-    if crate::pipeline::retry::classify_error(err).is_transient() {
-        return ExitClass::Retryable.code();
-    }
-    ExitClass::Generic.code()
 }
 
 /// Stable, greppable error codes carried by [`CodedError`]. A scheduler / CI step
