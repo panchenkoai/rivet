@@ -393,6 +393,7 @@ fn dispatch_cdc(a: CdcArgs) -> Result<()> {
             // store, so every part reaches the database as it becomes durable.
             state: None,
             schema_gate: None,
+            meta: None,
         },
         &__cdc_read_bytes,
     )

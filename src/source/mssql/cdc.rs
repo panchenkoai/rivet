@@ -57,12 +57,23 @@ pub(crate) fn row_image(
 ) -> crate::source::cdc::RowImage {
     use crate::source::cdc::RowImage;
 
-    if tables.is_empty() {
+    let Some(sql) = row_image_sql(tables, capture_instance) else {
         return RowImage::Whole;
-    }
+    };
     let Ok(mut src) = crate::source::mssql::MssqlSource::connect_with_tls(url, tls) else {
         return RowImage::Whole;
     };
+    let Ok(rows) = src.query_single_column(&sql) else {
+        return RowImage::Whole;
+    };
+    row_image_verdict(&rows)
+}
+
+/// The row-image catalog query for `tables` under the instance rivet reads; `None` for no tables.
+fn row_image_sql(tables: &[String], capture_instance: Option<&str>) -> Option<String> {
+    if tables.is_empty() {
+        return None;
+    }
     let bare: Vec<String> = tables
         .iter()
         .map(|t| t.rsplit('.').next().unwrap_or(t).to_string())
@@ -125,10 +136,7 @@ pub(crate) fn row_image(
              GROUP BY t.name, t.object_id, ct.capture_instance"
         ),
     };
-    let Ok(rows) = src.query_single_column(&sql) else {
-        return RowImage::Whole;
-    };
-    row_image_verdict(&rows)
+    Some(sql)
 }
 
 /// Pure verdict half of [`row_image`] (#161, the compression_refusal split):
@@ -1142,6 +1150,24 @@ impl MssqlChangeStream {
 }
 
 impl ChangeStream for MssqlChangeStream {
+    fn row_image_here(&mut self, tables: &[String]) -> Option<crate::source::cdc::RowImage> {
+        use crate::source::cdc::RowImage;
+        let Some(sql) = row_image_sql(tables, Some(&self.capture_instance)) else {
+            return Some(RowImage::Whole);
+        };
+        let Self { rt, client, .. } = self;
+        let rows = rt.block_on(async { client.simple_query(sql).await?.into_first_result().await });
+        // Best-effort, like the separate-connection path: an unreadable catalog is `Whole`.
+        let Ok(rows) = rows else {
+            return Some(RowImage::Whole);
+        };
+        let named: Vec<String> = rows
+            .iter()
+            .filter_map(|r| r.get::<&str, _>(0).map(str::to_string))
+            .collect();
+        Some(row_image_verdict(&named))
+    }
+
     fn engine(&self) -> crate::source::cdc::CdcEngine {
         crate::source::cdc::CdcEngine::Mssql
     }

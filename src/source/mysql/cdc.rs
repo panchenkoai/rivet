@@ -103,6 +103,10 @@ pub(crate) struct MysqlChangeStream {
     /// position this stream persists — the anchor wrote it and the commit save
     /// dropped it, so one captured transaction disarmed the foreign-server refusal.
     identity: (String, String),
+    /// `binlog_row_image`'s verdict, read at open on the connection that dumps.
+    row_image: crate::source::cdc::RowImage,
+    /// `binlog_row_metadata`'s warning, read at open on the connection that dumps.
+    positional: Option<String>,
 }
 
 impl MysqlChangeStream {
@@ -357,8 +361,13 @@ impl MysqlChangeStream {
     /// "nothing to say" — this exists to catch a CONFIGURATION, not to police
     /// access, the same contract as [`Self::row_image`].
     pub(crate) fn row_metadata(url: &str, tls: Option<&TlsConfig>) -> Option<String> {
-        use mysql::prelude::Queryable;
         let mut conn = connect_conn(url, tls).ok()?;
+        Self::row_metadata_on(&mut conn)
+    }
+
+    /// [`Self::row_metadata`] asked on a connection the caller holds.
+    fn row_metadata_on(conn: &mut mysql::Conn) -> Option<String> {
+        use mysql::prelude::Queryable;
         let m: Option<String> = conn
             .query_first("SELECT @@global.binlog_row_metadata")
             .unwrap_or(None);
@@ -366,43 +375,19 @@ impl MysqlChangeStream {
     }
 
     pub(crate) fn row_image(url: &str, tls: Option<&TlsConfig>) -> super::super::cdc::RowImage {
-        use super::super::cdc::RowImage;
-        use mysql::prelude::Queryable;
+        match connect_conn(url, tls) {
+            Ok(mut conn) => Self::row_image_on(&mut conn),
+            Err(_) => super::super::cdc::RowImage::Whole,
+        }
+    }
 
-        let Ok(mut conn) = connect_conn(url, tls) else {
-            return RowImage::Whole;
-        };
+    /// [`Self::row_image`] asked on a connection the caller holds.
+    fn row_image_on(conn: &mut mysql::Conn) -> super::super::cdc::RowImage {
+        use mysql::prelude::Queryable;
         let image: Option<String> = conn
             .query_first("SELECT @@global.binlog_row_image")
             .unwrap_or(None);
         Self::row_image_verdict(image.as_deref())
-    }
-
-    /// [`Self::check_configured_tables_are_routable`] on its own connection, for the
-    /// caller to run BEFORE `open_or_resume`.
-    ///
-    /// The hoist matters: `create_change_stream` wraps that call in
-    /// `MYSQL_CDC_HINT` (binlog grants / binlog_format), so a routing refusal raised
-    /// inside `open` reaches the operator prefixed with "if this is a
-    /// permissions/setup error" — for a config problem that has nothing to do with
-    /// permissions. Same reason the checkpoint is validated before the call, and the
-    /// same defect that hoist was added for.
-    ///
-    /// A connect failure here is swallowed deliberately: `open_or_resume` is about to
-    /// dial the same server and its error — WITH the grants hint — is the right one
-    /// for that case.
-    pub(crate) fn precheck_configured_tables(
-        url: &str,
-        tls: Option<&TlsConfig>,
-        configured: &[String],
-    ) -> Result<()> {
-        if configured.is_empty() {
-            return Ok(());
-        }
-        let Ok(mut conn) = connect_conn(url, tls) else {
-            return Ok(());
-        };
-        Self::check_configured_tables_are_routable(&mut conn, configured)
     }
 
     /// Live half: ask `information_schema` what each configured name IS, before
@@ -599,17 +584,45 @@ impl MysqlChangeStream {
         tls: Option<&TlsConfig>,
         configured_tables: Vec<String>,
     ) -> Result<Self> {
+        let mut conn = connect_conn(url, tls)?;
+        let identity = Self::server_identity(&mut conn)?;
+        Self::open_on(
+            conn,
+            server_id,
+            file,
+            pos,
+            mode,
+            identity,
+            configured_tables,
+        )
+    }
+
+    /// Open the stream on `conn`: every question asked before the dump rides the
+    /// connection that then dumps, so a bounded run costs the server ONE session.
+    fn open_on(
+        mut conn: mysql::Conn,
+        server_id: u32,
+        file: String,
+        pos: u64,
+        mode: DrainMode,
+        identity: (String, String),
+        configured_tables: Vec<String>,
+    ) -> Result<Self> {
         // Snapshot the ceiling BEFORE the dump starts: every commit already in
         // the log is ≤ it, and anything racing in after is the next run's work.
         let bound = if mode.is_bounded() {
-            Some(Self::current_coordinates(url, tls)?)
+            Some(Self::current_coordinates(&mut conn)?)
         } else {
             None
         };
-        // Every position this stream writes must be verifiable on resume, so the
-        // identity is read here, once, before the dump consumes the connection.
-        let identity = Self::server_identity(url, tls)?;
-        let mut conn = connect_conn(url, tls)?;
+        // A configured name the binlog can never carry is refused here; its message
+        // carries rivet's `mysql cdc:` prefix, so the caller's grants hint is never
+        // prepended to it.
+        if !configured_tables.is_empty() {
+            Self::check_configured_tables_are_routable(&mut conn, &configured_tables)?;
+        }
+        let row_image = Self::row_image_on(&mut conn);
+        let positional = Self::row_metadata_on(&mut conn);
         // Refuse a compressed binlog rather than read past it in silence.
         refuse_compressed_binlog(&mut conn)?;
         // Refuse a replica that does not re-log what it applies: its binlog holds none of it.
@@ -663,6 +676,8 @@ impl MysqlChangeStream {
             // name, and the wire-side comparison's fixed reference.
             own_db,
             identity,
+            row_image,
+            positional,
         })
     }
 
@@ -675,14 +690,13 @@ impl MysqlChangeStream {
     /// `server_uuid` is present on every MySQL and stable across restarts;
     /// `gtid_executed` is empty unless `gtid_mode` is ON (which is OFF by default —
     /// measured, and the reason the uuid is the floor and GTID only ever an extra).
-    fn server_identity(url: &str, tls: Option<&TlsConfig>) -> Result<(String, String)> {
+    fn server_identity(c: &mut mysql::Conn) -> Result<(String, String)> {
         use mysql::prelude::Queryable;
         // Fault hook: the identity query's transient failure is the state the
         // no-swallowing contract exists for, and a healthy stand can never
         // produce it — without this, the mutant restoring `unwrap_or_default`
         // is equivalent on every test environment.
         crate::test_hook::maybe_fail_at("mysql_identity_query")?;
-        let mut c = connect_conn(url, tls)?;
         let uuid: String = c
             .query_first("SELECT @@server_uuid")?
             .ok_or_else(|| anyhow::anyhow!("mysql: server reported no @@server_uuid"))?;
@@ -693,24 +707,17 @@ impl MysqlChangeStream {
     /// Ask the SERVER whether the checkpoint's GTID set is still contained in what
     /// it has executed. `GTID_SUBSET` is the server's own comparison — reimplementing
     /// set containment over GTID ranges here would be a second definition to drift.
-    fn gtid_is_contained(
-        url: &str,
-        tls: Option<&TlsConfig>,
-        subset: &str,
-        superset: &str,
-    ) -> Option<bool> {
+    fn gtid_is_contained(c: &mut mysql::Conn, subset: &str, superset: &str) -> Option<bool> {
         use mysql::prelude::Queryable;
         if subset.is_empty() {
             return None;
         }
-        let mut c = connect_conn(url, tls).ok()?;
         c.exec_first("SELECT GTID_SUBSET(?, ?)", (subset, superset))
             .ok()
             .flatten()
     }
 
-    fn current_coordinates(url: &str, tls: Option<&TlsConfig>) -> Result<(String, u64)> {
-        let mut c = connect_conn(url, tls)?;
+    fn current_coordinates(c: &mut mysql::Conn) -> Result<(String, u64)> {
         let row: mysql::Row = match c.query_first("SHOW BINARY LOG STATUS") {
             Ok(Some(row)) => row,
             // The 8.2+ statement EXISTS and returned nothing ⇒ binlog is
@@ -736,7 +743,8 @@ impl MysqlChangeStream {
         ckpt: &Path,
         tls: Option<&TlsConfig>,
     ) -> Result<()> {
-        let (file, pos) = Self::current_coordinates(url, tls)?;
+        let mut conn = connect_conn(url, tls)?;
+        let (file, pos) = Self::current_coordinates(&mut conn)?;
         // `?`, never `unwrap_or_default`: swallowing the error wrote a checkpoint
         // with an EMPTY uuid — an unverifiable anchor that silently disables the
         // whole foreign-server refusal this identity exists for, on any transient
@@ -745,7 +753,7 @@ impl MysqlChangeStream {
         // where the inertness guard in the live test caught the empty uuid). An
         // anchor rivet cannot later verify must not be created quietly; failing
         // here is retryable and loud.
-        let (uuid, gtid) = Self::server_identity(url, tls).map_err(|e| {
+        let (uuid, gtid) = Self::server_identity(&mut conn).map_err(|e| {
             anyhow::anyhow!(
                 "mysql cdc: could not record the server's identity for the new \
                  checkpoint ({e:#}) — refusing to write an UNVERIFIABLE anchor: a \
@@ -770,7 +778,7 @@ impl MysqlChangeStream {
         tls: Option<&TlsConfig>,
         tables: &[&str],
     ) -> Result<Self> {
-        let (file, pos) = Self::current_coordinates(url, tls)?;
+        let (file, pos) = Self::current_coordinates(&mut connect_conn(url, tls)?)?;
         // Each test captures only its OWN table: tests run concurrently, and a stream
         // over every table would take a sibling test's DROP as a captured table's.
         let tables = tables.iter().map(|t| t.to_string()).collect();
@@ -800,6 +808,8 @@ impl MysqlChangeStream {
             s.spill_dir = spill_dir.clone();
             s
         };
+        // ONE connection for every question asked before the dump; it then dumps.
+        let mut conn = connect_conn(url, tls)?;
         if let Some(path) = ckpt
             && let Some(pos) = Position::load(path)?
             && let Some((file, p)) =
@@ -812,10 +822,10 @@ impl MysqlChangeStream {
             // and skipping whatever was between, silently in both directions.
             let ckpt_uuid = pos.0.get("server_uuid").and_then(Json::as_str);
             let ckpt_gtid = pos.0.get("gtid_executed").and_then(Json::as_str);
-            let (server_uuid, server_gtid) = Self::server_identity(url, tls)?;
+            let (server_uuid, server_gtid) = Self::server_identity(&mut conn)?;
             let contained = ckpt_gtid
                 .filter(|g| !g.is_empty())
-                .and_then(|g| Self::gtid_is_contained(url, tls, g, &server_gtid));
+                .and_then(|g| Self::gtid_is_contained(&mut conn, g, &server_gtid));
             let verdict = Self::checkpoint_identity_verdict(
                 ckpt_uuid,
                 ckpt_gtid,
@@ -829,7 +839,9 @@ impl MysqlChangeStream {
             if let Some(warn) = verdict.warning() {
                 log::warn!("{warn}");
             }
-            return Self::open(url, server_id, file, p, mode, tls, configured_tables).map(with_dir);
+            let identity = (server_uuid, server_gtid);
+            return Self::open_on(conn, server_id, file, p, mode, identity, configured_tables)
+                .map(with_dir);
         }
         // First run (no checkpoint yet): anchor at the current position and persist
         // it IMMEDIATELY. PostgreSQL pins its anchor server-side at open (slot
@@ -837,7 +849,8 @@ impl MysqlChangeStream {
         // at a part commit — so an idle bounded run (zero changes drained) would
         // otherwise leave no checkpoint, the next run would re-anchor to a newer
         // "current" position, and every change in between would be silently skipped.
-        let (file, pos) = Self::current_coordinates(url, tls)?;
+        let (file, pos) = Self::current_coordinates(&mut conn)?;
+        let identity = Self::server_identity(&mut conn);
         if let Some(path) = ckpt {
             // LOUD, and at `warn` — this branch is reached both on a genuine first
             // run and when a previously-written checkpoint is simply NOT THERE, and
@@ -869,7 +882,7 @@ impl MysqlChangeStream {
             // disables the foreign-server refusal (measured on a loaded CI
             // runner, where the live test's inertness guard caught the empty
             // uuid). Refusing is retryable and loud; a half-anchor is forever.
-            let (uuid, gtid) = Self::server_identity(url, tls).map_err(|e| {
+            let (uuid, gtid) = identity.as_ref().map_err(|e| {
                 anyhow::anyhow!(
                     "mysql cdc: could not record the server's identity for the new \
                      checkpoint ({e:#}) — refusing to write an UNVERIFIABLE anchor: \
@@ -882,7 +895,16 @@ impl MysqlChangeStream {
             }))
             .save(path)?;
         }
-        Self::open(url, server_id, file, pos, mode, tls, configured_tables).map(with_dir)
+        Self::open_on(
+            conn,
+            server_id,
+            file,
+            pos,
+            mode,
+            identity?,
+            configured_tables,
+        )
+        .map(with_dir)
     }
 
     /// Open the spill once the buffered transaction passes the in-memory cap.
@@ -2108,6 +2130,14 @@ impl Iterator for MysqlChangeStream {
 }
 
 impl ChangeStream for MysqlChangeStream {
+    fn row_image_here(&mut self, _tables: &[String]) -> Option<crate::source::cdc::RowImage> {
+        Some(self.row_image.clone())
+    }
+
+    fn positional_mapping_here(&mut self) -> Option<Option<String>> {
+        Some(self.positional.clone())
+    }
+
     fn engine(&self) -> crate::source::cdc::CdcEngine {
         crate::source::cdc::CdcEngine::Mysql
     }

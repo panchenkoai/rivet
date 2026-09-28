@@ -361,50 +361,64 @@ fn run_chunked_quality_gate(
     Ok(())
 }
 
-/// Snapshot `pg_stat_database.temp_bytes` for the run's source DB.
-///
-/// `None` for non-Postgres sources (no equivalent counter), or when the
-/// snapshot probe fails (URL unresolvable, connection refused, view filtered).
-/// Failures are silent — this is an observability metric, not a correctness
-/// signal, so a failed probe must never block the actual export.
-fn pg_temp_bytes_snapshot(source: &crate::config::SourceConfig) -> Option<i64> {
-    samples_pg_temp_bytes(source.source_type)
-        .then(|| {
-            let url = source.resolve_url().ok()?;
-            crate::source::postgres::sample_temp_bytes(&url, source.tls.as_ref())
-        })
-        .flatten()
+/// The PostgreSQL temp-spill counter carried in a harm snapshot; `None` for other engines.
+fn temp_bytes_of(harm: Option<&[(String, i64)]>) -> Option<i64> {
+    harm?
+        .iter()
+        .find(|(k, _)| k == crate::source::PG_TEMP_BYTES_KEY)
+        .map(|(_, v)| *v)
 }
 
-/// Only PostgreSQL has the cluster temp-spill counter the bracket samples.
-fn samples_pg_temp_bytes(source_type: crate::config::SourceType) -> bool {
-    matches!(source_type, crate::config::SourceType::Postgres)
+/// The harm deltas worth recording: all but the temp-spill, which has its own summary field.
+fn recorded_harm(deltas: Vec<(String, i64)>) -> Vec<(String, i64)> {
+    deltas
+        .into_iter()
+        .filter(|(k, _)| k != crate::source::PG_TEMP_BYTES_KEY)
+        .collect()
 }
 
 /// Source-harm counters taken before a run window; `close` turns them into the run's deltas.
 pub(super) struct HarmBracket {
-    temp_bytes: Option<i64>,
     harm: Option<Vec<(String, i64)>>,
 }
 
 impl HarmBracket {
-    /// Snapshot the source's temp-spill and harm counters before the run.
+    /// Snapshot the source's harm counters (temp-spill included) on a fresh connection.
     pub(super) fn open(source: &crate::config::SourceConfig) -> Self {
+        Self::open_on(crate::source::create_source(source).ok().as_deref_mut())
+    }
+
+    /// Snapshot on a connection the caller already holds, so the bracket opens none.
+    pub(super) fn open_on(src: Option<&mut (dyn crate::source::Source + '_)>) -> Self {
         Self {
-            temp_bytes: pg_temp_bytes_snapshot(source),
-            harm: harm_snapshot(source),
+            harm: src.and_then(|s| s.harm_counters()),
         }
     }
 
-    /// Close on the same window: set the temp delta (warning on a spill), persist and return the harm deltas.
+    /// Close on a fresh connection: see [`Self::close_on`].
     pub(super) fn close(
         self,
         source: &crate::config::SourceConfig,
         state: &StateStore,
         summary: &mut RunSummary,
     ) -> Vec<(String, i64)> {
-        if let (Some(before), Some(after)) = (self.temp_bytes, pg_temp_bytes_snapshot(source)) {
-            let delta = pg_temp_bytes_delta(before, after);
+        let mut src = crate::source::create_source(source).ok();
+        self.close_on(src.as_deref_mut(), state, summary)
+    }
+
+    /// Close on the same window: set the temp delta (warning on a spill), persist and return the harm deltas.
+    pub(super) fn close_on(
+        self,
+        src: Option<&mut (dyn crate::source::Source + '_)>,
+        state: &StateStore,
+        summary: &mut RunSummary,
+    ) -> Vec<(String, i64)> {
+        let after = src.and_then(|s| s.harm_counters());
+        if let (Some(before), Some(now)) = (
+            temp_bytes_of(self.harm.as_deref()),
+            temp_bytes_of(after.as_deref()),
+        ) {
+            let delta = pg_temp_bytes_delta(before, now);
             summary.pg_temp_bytes_delta = Some(delta);
             if let Some(line) = pg_temp_bytes_warning(
                 &summary.export_name,
@@ -414,10 +428,10 @@ impl HarmBracket {
                 log::warn!("{line}");
             }
         }
-        let (Some(before), Some(after)) = (self.harm, harm_snapshot(source)) else {
+        let (Some(before), Some(after)) = (self.harm, after) else {
             return Vec::new();
         };
-        let deltas = harm_deltas(&before, &after);
+        let deltas = recorded_harm(harm_deltas(&before, &after));
         if let Err(e) = state.record_harm(&summary.run_id, &summary.export_name, &deltas) {
             log::debug!(
                 "'{}': harm metrics write failed (informational): {:#}",
@@ -2592,12 +2606,21 @@ mod tests {
     /// quotient 2 — three distinct values, all positive, so `.max(0)` cannot mask
     /// the disagreement.
     #[test]
-    fn only_postgres_samples_the_temp_spill_counter() {
-        use crate::config::SourceType;
-        assert!(super::samples_pg_temp_bytes(SourceType::Postgres));
-        for other in [SourceType::Mysql, SourceType::Mssql, SourceType::Mongo] {
-            assert!(!super::samples_pg_temp_bytes(other), "{other:?}");
-        }
+    fn the_temp_spill_rides_the_harm_snapshot_and_is_not_recorded_twice() {
+        let key = crate::source::PG_TEMP_BYTES_KEY;
+        let snap = vec![("pg_temp_files".to_string(), 3), (key.to_string(), 7)];
+        assert_eq!(super::temp_bytes_of(Some(&snap)), Some(7));
+        assert_eq!(
+            super::temp_bytes_of(Some(&snap[..1])),
+            None,
+            "another engine"
+        );
+        assert_eq!(super::temp_bytes_of(None), None);
+        assert_eq!(
+            super::recorded_harm(snap),
+            vec![("pg_temp_files".to_string(), 3)],
+            "the spill already has its own summary field"
+        );
     }
 
     #[test]

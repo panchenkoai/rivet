@@ -372,6 +372,18 @@ impl PgChangeStream {
         }) else {
             return RowImage::Whole;
         };
+        Self::row_image_on(&mut client, tables)
+    }
+
+    /// The row-image verdict for `tables`, asked on `client`; best-effort (`Whole` when unreadable).
+    pub(crate) fn row_image_on(
+        client: &mut Client,
+        tables: &[String],
+    ) -> crate::source::cdc::RowImage {
+        use crate::source::cdc::RowImage;
+        if tables.is_empty() {
+            return RowImage::Whole;
+        }
         // The config may name a table bare or schema-qualified; `relname` is bare.
         let bare: Vec<String> = tables
             .iter()
@@ -410,45 +422,6 @@ impl PgChangeStream {
         }
     }
 
-    /// [`Self::check_configured_tables_are_routable`] on its own connection, for the
-    /// caller to run BEFORE the stream is opened.
-    ///
-    /// `create_change_stream` wraps the open call in `PG_CDC_HINT` (wal_level and
-    /// the REPLICATION attribute), so a routing refusal raised inside `open` reaches
-    /// the operator prefixed with "if this is a permissions/setup error" — for a
-    /// CONFIG problem with nothing to do with permissions. MEASURED on this branch,
-    /// and the same defect the MySQL side was just fixed for, which is why both now
-    /// run their check outside the wrap.
-    ///
-    /// A connect failure is swallowed on purpose: `open` is about to dial the same
-    /// server, and its error — WITH the hint — is the right one for that case.
-    pub(crate) fn precheck_configured_tables(
-        conn_str: &str,
-        tls: Option<&TlsConfig>,
-        configured: &[String],
-    ) -> Result<()> {
-        if configured.is_empty() {
-            return Ok(());
-        }
-        if require_tls_or_loopback(conn_str, tls).is_err() {
-            return Ok(()); // open() bails on the same posture, with the right message
-        }
-        let Ok(mut client) = (match tls {
-            Some(cfg) if cfg.mode.is_enforced() => crate::source::tls::build_native_tls(cfg)
-                .and_then(|c| {
-                    super::pg_config_ssl_forced(conn_str)?
-                        .connect(postgres_native_tls::MakeTlsConnector::new(c))
-                        .map_err(Into::into)
-                }),
-            _ => Client::connect(conn_str, NoTls).map_err(Into::into),
-        }) else {
-            return Ok(());
-        };
-        // The PRECHECK says the note: it runs once per run, where `open`'s call
-        // can repeat under the sink's re-drain loop.
-        Self::check_configured_tables_are_routable(&mut client, configured, true)
-    }
-
     /// Live half of the routing guard: ask the CATALOG what each configured
     /// table actually is, and refuse a capture that could only ever drop
     /// everything. Decisions live in [`classify_routing`]; this is glue.
@@ -465,13 +438,9 @@ impl PgChangeStream {
     pub(crate) fn check_configured_tables_are_routable(
         client: &mut Client,
         configured: &[String],
-        // Whether to LOG the inert-twin note. This function is called twice by
-        // design — a precheck on its own connection, then again inside `open` — and
-        // the duplicate is justified as "one round-trip on a config that is about to
-        // fail anyway". That reasoning holds for a REFUSAL and not for a note on a
-        // config that SUCCEEDS: the note then printed twice per run, forever, on
-        // every scheduler cycle. A reporting view named after a table is not a
-        // condition that resolves.
+        // Whether to LOG the inert-twin note — once per run, from `open`. A reporting
+        // view named after a table is not a condition that resolves, so a note said
+        // more than once per run would repeat on every scheduler cycle, forever.
         say_note: bool,
     ) -> Result<()> {
         use anyhow::Context as _;
@@ -672,13 +641,10 @@ impl PgChangeStream {
             "SET datestyle = 'ISO, MDY'; SET bytea_output = 'hex'; \
              SET intervalstyle = 'postgres'; SET extra_float_digits = 3;",
         )?;
-        // Also here, not only in the caller's precheck. The precheck exists so the
-        // refusal reaches the operator WITHOUT the wal_level/REPLICATION hint
-        // wrapped around it; this one keeps the guarantee for any path that opens a
-        // stream directly. The duplicate catalog read costs one round-trip on a
-        // config that is about to fail anyway.
-        // The refusal still runs here; the NOTE was already said by the precheck.
-        Self::check_configured_tables_are_routable(&mut client, configured_tables, false)?;
+        // The one routing check of a run, on the stream's own connection (the stream is
+        // opened once per run). Its refusals carry rivet's `pg cdc:` prefix, so the
+        // caller's setup hint is never prepended to them.
+        Self::check_configured_tables_are_routable(&mut client, configured_tables, true)?;
 
         // A bounded run cannot work on a STANDBY: it pins its ceiling with
         // pg_current_wal_lsn() (unavailable during recovery) and a fresh run
@@ -1295,6 +1261,17 @@ fn decode_wire_row(rec: &[u8]) -> Result<(String, String)> {
 }
 
 impl ChangeStream for PgChangeStream {
+    fn row_image_here(&mut self, tables: &[String]) -> Option<crate::source::cdc::RowImage> {
+        Some(Self::row_image_on(&mut self.client, tables))
+    }
+
+    fn retention_warnings_here(&mut self) -> Option<Vec<String>> {
+        Some(crate::source::cdc::pg_retention_warnings_on(
+            &mut self.client,
+            &self.slot,
+        ))
+    }
+
     fn engine(&self) -> crate::source::cdc::CdcEngine {
         crate::source::cdc::CdcEngine::Postgres
     }

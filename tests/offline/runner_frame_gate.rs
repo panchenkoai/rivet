@@ -321,8 +321,8 @@ fn the_cdc_drain_brackets_the_source_harm_window_and_captures_open_forensics() {
         "body_of swallowed the test module"
     );
     for needle in [
-        "HarmBracket::open(&config.source)",
-        "harm.close(",
+        "HarmBracket::open_on(meta.as_deref_mut())",
+        "harm.close_on(",
         "run_diagnosis(",
         "server_context()",
     ] {

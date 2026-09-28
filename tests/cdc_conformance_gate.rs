@@ -820,7 +820,9 @@ fn oracle_class_census_is_pinned() {
 // (corrupt, retention gap, foreign DBID, no ALL COLUMNS logging, a LOB, an unknown
 // table), the NDJSON source-resolution CLI cell, and the shared intra-transaction check.
 const PIN_INDEPENDENT: usize = 97;
-const PIN_SHARED_CODEC: usize = 81;
+// 2026-09-28, source connection ceilings: +3 shared codec — the run's captured row is the
+// fixture check; the oracle is the server's own connection counter.
+const PIN_SHARED_CODEC: usize = 84;
 const PIN_SELF_COUNTER: usize = 6;
 const PIN_PRESENCE: usize = 75;
 
