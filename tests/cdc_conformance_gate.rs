@@ -822,7 +822,7 @@ fn oracle_class_census_is_pinned() {
 const PIN_INDEPENDENT: usize = 97;
 // 2026-09-28, source connection ceilings: +3 shared codec — the run's captured row is the
 // fixture check; the oracle is the server's own connection counter.
-const PIN_SHARED_CODEC: usize = 84;
+const PIN_SHARED_CODEC: usize = 85;
 const PIN_SELF_COUNTER: usize = 6;
 const PIN_PRESENCE: usize = 75;
 
