@@ -141,7 +141,8 @@ fn checkpointed(prefix: &str, rows: i64) -> (Rig, Box<dyn std::any::Any>) {
         .mode("chunked")
         .export_line("chunk_by_key: id")
         .export_line("chunk_checkpoint: true")
-        .export_line("chunk_size: 500");
+        .export_line("chunk_size: 500")
+        .duckdb_oracle();
     (rig, guard)
 }
 
@@ -315,10 +316,12 @@ fn moving_from_a_sqlite_state_to_a_postgres_state_loses_no_row() {
         "{}",
         String::from_utf8_lossy(&moved.stderr)
     );
-    assert_eq!(
-        dir_manifest_copy_id_set(&rig.out_dir()).len(),
+    duckdb_declared_assert_rows_and_distinct(
+        rig.oracle_dir(),
+        "id",
+        6000,
         3000,
-        "every row still declared after the move"
+        "the run on the new state re-delivers all 3000 rows beside the first run's",
     );
 }
 
