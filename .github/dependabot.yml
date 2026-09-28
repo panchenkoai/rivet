@@ -36,6 +36,13 @@ updates:
         update-types:
           - version-update:semver-minor
           - version-update:semver-patch
+      # jsonwebtoken tracks reqsign's major (see Cargo.toml): reqsign 0.16 pulls
+      # jsonwebtoken 9, so a lone bump resolves two majors side by side, and >= 10
+      # panics at runtime without an explicit crypto backend (#338). Move it
+      # together with reqsign, by hand, once reqsign is on >= 10.
+      - dependency-name: "jsonwebtoken"
+        update-types:
+          - version-update:semver-major
     # One combined PR for the (major-only) churn, so the whole upgrade is
     # reviewed and CI'd together rather than as N racing branches.
     groups:
