@@ -899,7 +899,17 @@ fn active_run_note(active_runs: usize, prefix: &str) -> Option<String> {
 impl LoadCtx<'_> {
     /// Best-effort ledger write — a state-DB failure warns but never fails a load.
     fn record(&self, source_run_ids: &[String], rows_loaded: i64, status: &str) {
-        let Some(s) = self.state else { return };
+        if let Err(e) = self.try_record(source_run_ids, rows_loaded, status) {
+            eprintln!(
+                "  warning: load ledger write failed (load itself proceeded): {}",
+                crate::redact::redact_secrets(&format!("{e:#}"))
+            );
+        }
+    }
+
+    /// One ledger row; the error is the caller's to judge.
+    fn try_record(&self, source_run_ids: &[String], rows_loaded: i64, status: &str) -> Result<()> {
+        let Some(s) = self.state else { return Ok(()) };
         // A run still ACTIVE on this prefix can still GROW its manifest: the CDC
         // sink rewrites a `Success` superset at every commit-boundary roll under
         // ONE run_id, and `list_manifest_keys` deliberately prefers that
@@ -936,7 +946,7 @@ impl LoadCtx<'_> {
                 a.extend(self.marker_active.iter().cloned());
                 a
             }
-            None => return,
+            None => return Ok(()),
             Some(Err(e)) => {
                 log::warn!(
                     "load: cannot tell which runs are still writing into {} ({e:#}) — not \
@@ -983,21 +993,17 @@ impl LoadCtx<'_> {
             status: status.to_string(),
             finished_at: chrono::Utc::now().to_rfc3339(),
         };
-        if let Err(e) = s.store_load(&rec) {
-            eprintln!(
-                "  warning: load ledger write failed (load itself proceeded): {}",
-                crate::redact::redact_secrets(&format!("{e:#}"))
-            );
-        }
+        s.store_load(&rec)
     }
     /// Nothing new to load — the ledger already covers every run.
     fn record_skip(&self) {
         self.record(&[], 0, "success");
     }
 
-    /// About to touch the warehouse. Survives only a process that DIED here.
-    fn record_writing(&self) {
-        self.record(&[], 0, "writing");
+    /// About to touch the warehouse. Survives only a process that DIED here; unwritable, the load must not write.
+    fn record_writing(&self) -> Result<()> {
+        self.try_record(&[], 0, "writing")
+            .context("load: the ledger cannot record that this load is about to write, so it does not write — a table written without that record reads as foreign to the next load")
     }
     /// The load errored after consuming `run_ids`.
     #[cfg(test)]
@@ -1102,7 +1108,7 @@ fn execute_load<R>(
             // It is replaced, never accumulated: the closing row shares this
             // `load_id`, so the ledger still holds exactly one audit row per load and
             // a `writing` row can only survive a process that died.
-            ctx.record_writing();
+            load::before_write(ctx.record_writing())?;
             run(&**loader, store, &inputs, &mut legs)
         }) {
         Ok(v) => v,
@@ -2691,6 +2697,18 @@ mod live_only_decisions {
     /// survives — same `load_id` — so the ledger still holds exactly one audit row
     /// per load, and a `writing` row can only be seen after a process died.
     #[test]
+    fn an_unrecordable_writing_marker_stops_the_load_before_the_write() {
+        let state = StateStore::open_in_memory().unwrap();
+        let ctx = ctx_for(&state, "load-cut", "p.d.orders");
+        state.exec_for_test("DROP TABLE load_run");
+        assert!(
+            ctx.record_writing().is_err(),
+            "a marker the ledger could not take must stop the load: a table written without \
+             it reads as foreign to the next load, which refuses it for ever"
+        );
+    }
+
+    #[test]
     fn a_crash_between_the_write_and_the_ledger_row_does_not_disown_the_table() {
         let state = StateStore::open_in_memory().unwrap();
         let target = "p.d.orders";
@@ -2702,7 +2720,7 @@ mod live_only_decisions {
         );
 
         // …the process dies here, right after the warehouse write.
-        ctx.record_writing();
+        ctx.record_writing().unwrap();
         assert!(
             state.has_load_attempt(target).unwrap(),
             "a load that reached the warehouse must leave the table rivet's own, or the \

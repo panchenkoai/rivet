@@ -364,6 +364,14 @@ impl StateStore {
         })
     }
 
+    /// Run raw SQL on an in-memory store, to put it in a state no product path reaches.
+    #[cfg(test)]
+    pub(crate) fn exec_for_test(&self, sql: &str) {
+        if let StateConn::Sqlite(c) = &self.conn {
+            c.execute_batch(sql).unwrap();
+        }
+    }
+
     /// Open a SQLite store at an explicit file path (tests that need
     /// cross-connection access via `claim_next_chunk_task_at_path`).
     #[allow(dead_code)]

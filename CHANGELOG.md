@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **A load whose state ledger dies before it can mark a table as being written no longer writes it.**
+  The `writing` marker that keeps a table rivet's own across a crash was written best-effort: when
+  the ledger connection dropped first, the load wrote the table anyway and reported `LOAD OK`, and
+  the next load refused that table as foreign for ever. The marker is now required — without it the
+  load fails before the warehouse write, and the next load finishes the job.
 - **A Postgres state behind pgBouncer (transaction mode) keeps one run of an export at a
   time (state v31).** The run lease of a checkpointed export and the per-table lease of
   `rivet load` were session advisory locks. Behind a transaction-mode pooler two rivets

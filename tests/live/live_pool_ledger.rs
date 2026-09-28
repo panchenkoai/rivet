@@ -217,20 +217,41 @@ fn a_ledger_cut_mid_load_fails_loudly_and_the_next_run_finishes_the_job() {
     // `RefCell`s and so is not `Sync`, and the killer needs nothing but the
     // proxy name.
     let pool = TABLES.to_string();
-    // From MEASUREMENT, not guesswork: BigQuery's own job history puts the
-    // six-table load leg at 2991 ms end to end, statements issued over a 1259 ms
-    // spread, each averaging 1291 ms. A 5 s kill landed after the whole leg had
-    // finished (the run passed cleanly — that draft proved only that loads are
-    // fast); 1200 ms and 2600 ms BOTH landed before the first statement — the
-    // latency toxic was stretching the ledger-read phase past them, so it is gone
-    // from this test. 1800 ms on a healthy ledger aims between the two, where a
-    // statement has succeeded and its ledger row has not been written yet.
-    let killer = std::thread::spawn(|| {
-        std::thread::sleep(std::time::Duration::from_millis(1800));
-        toxi_disable("postgres_state");
+    // The cut is EVENT-driven: the killer watches the ledger directly (:5433, past the
+    // proxy) and cuts the proxy the moment this load's first `writing` marker lands —
+    // one load is then between its marker and its closing row, and the others are
+    // still ahead of their markers. A fixed sleep (1800 ms) landed after the whole leg
+    // had finished in gate run 9 and before any statement in others, so it graded the
+    // timer, not rivet.
+    let watch = format!("%{t}%");
+    let killer = std::thread::spawn(move || {
+        let mut c = postgres::Client::connect(
+            "postgresql://rivet:rivet@127.0.0.1:5433/rivet_state",
+            postgres::NoTls,
+        )
+        .expect("the ledger, directly");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while std::time::Instant::now() < deadline {
+            let n: i64 = c
+                .query_one(
+                    "SELECT count(*) FROM load_run WHERE status = 'writing' AND target_table LIKE $1",
+                    &[&watch],
+                )
+                .map(|r| r.get(0))
+                .unwrap_or(0);
+            if n > 0 {
+                toxi_disable("postgres_state");
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        false
     });
     let crashed = rig.load_args_env(&["--pool", &pool], &env);
-    killer.join().expect("the killer thread");
+    assert!(
+        killer.join().expect("the killer thread"),
+        "fixture inert: no `writing` marker appeared, so the ledger was never cut mid-load"
+    );
     assert!(
         !crashed.status.success(),
         "a load whose ledger died mid-run must FAIL, not report a tidy success:\n{}",
