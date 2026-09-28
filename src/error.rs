@@ -412,6 +412,11 @@ pub mod codes {
         "RIVET_SOURCE_CDC_UNDECODABLE",
         "re-snapshot the table: delete the checkpoint first so the stream anchors, then snapshot",
     );
+    /// A captured cell holding a value the CDC decoder has no faithful reading for.
+    pub const SOURCE_CDC_CELL_UNSUPPORTED: Code = refusal(
+        "RIVET_SOURCE_CDC_CELL_UNSUPPORTED",
+        "leave the column out of the capture (SQL Server: @captured_column_list), then re-snapshot",
+    );
     pub const SOURCE_CDC_PREREQUISITE: Code = environment(
         "RIVET_SOURCE_CDC_PREREQUISITE",
         "apply the setup statement the message names, then re-run (docs/reference/cdc.md)",
@@ -458,6 +463,7 @@ pub mod codes {
         SOURCE_CDC_CHECKPOINT_INVALID,
         SOURCE_CDC_LOG_GAP,
         SOURCE_CDC_UNDECODABLE,
+        SOURCE_CDC_CELL_UNSUPPORTED,
         SOURCE_CDC_PREREQUISITE,
         STATE_SCHEMA_NEWER,
         STATE_CURSOR_OWNER_MISMATCH,

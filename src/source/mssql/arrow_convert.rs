@@ -26,7 +26,7 @@ use chrono::{NaiveDate, NaiveDateTime, Timelike};
 use tiberius::{Column, ColumnData, ColumnType, Row};
 
 /// Whether a cell is SQL NULL, whatever its wire type.
-fn is_null_cell(c: &ColumnData<'_>) -> bool {
+pub(super) fn is_null_cell(c: &ColumnData<'_>) -> bool {
     matches!(
         c,
         ColumnData::U8(None)

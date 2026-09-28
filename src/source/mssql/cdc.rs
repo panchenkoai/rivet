@@ -970,7 +970,7 @@ impl MssqlChangeStream {
                     n if n.starts_with("__$") => {} // skip other metadata
                     n => {
                         names.push(n.to_string());
-                        values.push(cell_to_rivet(r, idx, data));
+                        values.push(cell_to_rivet(r, idx, data)?);
                     }
                 }
             }
@@ -1274,48 +1274,59 @@ fn naive_time_to_micros(t: NaiveTime) -> i64 {
     t.num_seconds_from_midnight() as i64 * 1_000_000 + t.nanosecond() as i64 / 1000
 }
 
-fn cell_to_rivet(row: &Row, idx: usize, data: &ColumnData<'_>) -> RivetValue {
+fn cell_to_rivet(row: &Row, idx: usize, data: &ColumnData<'_>) -> Result<RivetValue> {
     if let Some(v) = cell_from_data(data) {
-        return v;
+        return Ok(v);
     }
-    match data {
+    let unreadable = |e: tiberius::error::Error| {
+        anyhow::Error::new(crate::error::CodedError::new(
+            crate::error::codes::SOURCE_CDC_CELL_UNSUPPORTED,
+            format!("mssql cdc: column {idx}: cannot read {data:?}: {e}"),
+        ))
+    };
+    Ok(match data {
         // datetimeoffset is tz-aware — `try_get::<NaiveDateTime>` is the *wrong* type
         // and returns None (silent data loss). Read it as FixedOffset and carry its UTC
         // instant; the resolved column is a tz-aware Timestamp, so the sink writes it
         // identically to the batch export (parity) with the zone preserved.
         ColumnData::DateTimeOffset(_) => row
             .try_get::<chrono::DateTime<chrono::FixedOffset>, _>(idx)
-            .ok()
-            .flatten()
+            .map_err(unreadable)?
             .map_or(RivetValue::Null, |dt| RivetValue::DateTime(dt.naive_utc())),
         ColumnData::DateTime(_) => row
             .try_get::<NaiveDateTime, _>(idx)
-            .ok()
-            .flatten()
+            .map_err(unreadable)?
             .map_or(RivetValue::Null, |dt| {
                 RivetValue::DateTime(super::arrow_convert::nearest_micro(dt))
             }),
         ColumnData::DateTime2(_) | ColumnData::SmallDateTime(_) => row
             .try_get::<NaiveDateTime, _>(idx)
-            .ok()
-            .flatten()
+            .map_err(unreadable)?
             .map_or(RivetValue::Null, RivetValue::DateTime),
         ColumnData::Date(_) => row
             .try_get::<NaiveDate, _>(idx)
-            .ok()
-            .flatten()
+            .map_err(unreadable)?
             .and_then(|d| d.and_hms_opt(0, 0, 0))
             .map_or(RivetValue::Null, RivetValue::DateTime),
         ColumnData::Time(_) => row
             .try_get::<NaiveTime, _>(idx)
-            .ok()
-            .flatten()
+            .map_err(unreadable)?
             .map_or(RivetValue::Null, |t| {
                 RivetValue::TimeMicros(naive_time_to_micros(t))
             }),
-        // every None (NULL) variant + anything unhandled
-        _ => RivetValue::Null,
+        other => cell_fallthrough(other)?,
+    })
+}
+
+/// NULL for a true SQL NULL; a refusal for a valued cell no arm above decodes, never a silent NULL.
+fn cell_fallthrough(data: &ColumnData<'_>) -> Result<RivetValue> {
+    if super::arrow_convert::is_null_cell(data) {
+        return Ok(RivetValue::Null);
     }
+    crate::rivet_bail!(
+        crate::error::codes::SOURCE_CDC_CELL_UNSUPPORTED,
+        "mssql cdc: no decoder for a captured {data:?} value — refusing rather than writing NULL"
+    )
 }
 
 /// Render a tiberius `Numeric` (unscaled `value` + `scale`) to exact decimal text.
@@ -1572,6 +1583,26 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_valued_cell_without_a_decoder_is_refused_not_nulled() {
+        use std::borrow::Cow;
+        let xml = ColumnData::Xml(Some(Cow::Owned(tiberius::xml::XmlData::new("<a/>"))));
+        let err = cell_fallthrough(&xml).expect_err("a valued xml cell must not become NULL");
+        assert_eq!(crate::error::classify_exit(&err), 5, "{err:#}");
+        for null in [
+            ColumnData::Xml(None),
+            ColumnData::Date(None),
+            ColumnData::DateTimeOffset(None),
+            ColumnData::String(None),
+        ] {
+            assert_eq!(
+                cell_fallthrough(&null).unwrap(),
+                RivetValue::Null,
+                "{null:?}"
+            );
+        }
+    }
 
     /// Every data-only `ColumnData` arm, with an INDEPENDENT expectation.
     ///
