@@ -8,8 +8,15 @@
 //! are what the run needs: one metadata connection plus the change stream, on every engine.
 //!
 //! `live+exclusive`: the counters are server-wide, so a concurrent test's sessions would count.
+//! Each stand's healthcheck also opens a session every 5-10 s; it only ever ADDS, so each
+//! test takes the minimum over three runs.
 
 use crate::common::*;
+
+/// The fewest connections any of three runs opened: `opened` measures one run.
+fn fewest(mut opened: impl FnMut() -> i64) -> i64 {
+    (0..3).map(|_| opened()).min().unwrap()
+}
 
 /// New sessions the server has seen, read on a connection the probe already holds.
 fn pg_sessions(c: &mut postgres::Client) -> i64 {
@@ -38,7 +45,12 @@ fn a_postgres_cdc_run_opens_at_most_two_source_connections() {
         .unwrap();
     let before = pg_sessions(&mut c);
     let out = rig.run_and_read();
-    let opened = pg_sessions(&mut c) - before;
+    let first = pg_sessions(&mut c) - before;
+    let opened = first.min(fewest(|| {
+        let before = pg_sessions(&mut c);
+        rig.run_ok();
+        pg_sessions(&mut c) - before
+    }));
     c.execute("SELECT pg_drop_replication_slot($1)", &[&slot])
         .ok();
     assert_eq!(
@@ -74,7 +86,12 @@ fn a_mysql_cdc_run_opens_at_most_two_source_connections() {
         .unwrap();
     let before = connections(&mut c);
     let out = rig.run_and_read();
-    let opened = connections(&mut c) - before;
+    let first = connections(&mut c) - before;
+    let opened = first.min(fewest(|| {
+        let before = connections(&mut c);
+        rig.run_ok();
+        connections(&mut c) - before
+    }));
     assert_eq!(
         out.iter().map(|b| b.num_rows()).sum::<usize>(),
         1,
@@ -118,7 +135,12 @@ fn a_sql_server_cdc_run_opens_at_most_two_source_connections() {
     };
     let before = logins();
     let out = rig.run_and_read();
-    let opened = logins() - before - probe;
+    let first = logins() - before - probe;
+    let opened = first.min(fewest(|| {
+        let before = logins();
+        rig.run_ok();
+        logins() - before - probe
+    }));
     assert_eq!(
         out.iter().map(|b| b.num_rows()).sum::<usize>(),
         1,
