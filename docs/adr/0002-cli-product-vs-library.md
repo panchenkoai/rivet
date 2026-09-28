@@ -53,6 +53,7 @@ harness needs it", not "public API".
 | `tuning` | `pub` | Governor / adaptive tuning tests link it (ADR-0019) |
 | `types` | `pub` | Type-roundtrip tests assert `RivetType` / fidelity mappings (ADR-0014) |
 | `mcp` | `pub` | Rivet's read-only DB-introspection MCP server (`run_stdio`) — public so the `rivet-mcp` binary in `src/bin/rivet-mcp.rs` can link it |
+| `cli` | `pub` | The `rivet` binary's entry point (`run_binary`) — public so `src/main.rs` can link it, like `mcp` |
 | `redact` | `pub` | Cross-cutting credential-redaction helper, asserted in tests |
 | `destination_for_tests` | `pub` | Thin test-only shim over the `pub(crate)` `destination` module |
 | `destination` | `pub(crate)` | Internal write backends — exercised via `destination_for_tests` |
@@ -70,6 +71,7 @@ harness needs it", not "public API".
 - **No stability guarantee**: Consumers who depend on internal modules (any non-`pub` module above, or sub-items of `pub` modules not explicitly documented) accept breakage at any patch release.
 - **Docs reflect intent**: `cargo doc` will not generate docs for `pub(crate)` modules, reducing confusion about the intended API surface.
 - **Binary compilation path**: `src/main.rs` declares all modules privately via `mod` — it never uses the library crate. The two targets are independent compilation units that happen to share source files.
+  - *Amended 2026-09-27*: `src/main.rs` now calls `rivet::cli::run_binary()` and declares no modules. Two compilation units compiled every module twice and ran each unit test twice (3,196 lib + 3,379 bin tests from the same sources). Every CI job and every mutation build paid that twice. The CLI-first decision above is unchanged: `cli` is `pub` only so the binary links it, as `mcp` is for `rivet-mcp`.
 - **Future library path**: If Rivet ever offers a stable embedding API, a separate `rivet-engine` crate should be extracted with its own semver-tracked surface, rather than promoting internal types to `pub`.
   - *Amended by [ADR-0026](0026-first-party-extension-seam.md)*: a minimal **first-party** extension seam (the `types`/`types::target` resolution items) is now stability-tracked in-crate for the private `rivet-pro` companion. The full `rivet-engine` extraction is deferred until a *non-first-party* external consumer appears.
 

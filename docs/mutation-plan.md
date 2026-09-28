@@ -58,7 +58,7 @@ Narrow live filters for Tier 3 (mutate X → run only its guards):
    text (`include_str!`) always stays graded: a test that greps it kills a
    stub without executing it, which coverage cannot see.
 
-   The graded set runs in up to four `Mutants (shard N)` jobs (`--shard k/N`,
+   The graded set runs in up to eight `Mutants (shard N)` jobs (about ten mutants each) (`--shard k/N`,
    dependencies reused through `--copy-target`); `Mutants (changed lines)`
    grades their outcomes as one run, and the P2 audit rides in that same run
    rather than paying a second build.
