@@ -21,6 +21,7 @@ Every failure rivet names carries a stable `RIVET_<FAMILY>_<NAME>` code: in `--j
 | `RIVET_CONFIG_DUPLICATE_EXPORT` | usage | 1 | give every export a unique `name` |
 | `RIVET_CONFIG_CDC_RESOURCE_CONFLICT` | usage | 1 | give each CDC export its own slot / server_id / checkpoint path |
 | `RIVET_CONFIG_CDC_ROLLOVER_INVALID` | usage | 1 | set `cdc.rollover` to 1 or more, or omit it |
+| `RIVET_CONFIG_CDC_CONTINUOUS_UNSUPPORTED` | usage | 1 | omit `cdc.until_current` (or `--stream`) and run the bounded drain on a schedule |
 | `RIVET_CONFIG_CSV_LOAD_UNSUPPORTED` | usage | 1 | use `format: parquet` for an export with a `load:` section |
 | `RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED` | usage | 1 | use a mode this source supports (MongoDB: `full`) |
 | `RIVET_SOURCE_STATEMENT_TIMEOUT` | environment | 2 if transient, else 1 | raise `tuning.statement_timeout_s`, or narrow the chunk |

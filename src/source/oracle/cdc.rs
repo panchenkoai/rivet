@@ -12,9 +12,7 @@ use super::{Ora, connect};
 use crate::config::TlsConfig;
 use crate::error::Result;
 use crate::source::cdc::value::RivetValue;
-use crate::source::cdc::{
-    CdcEngine, ChangeEvent, ChangeOp, ChangeStream, Position, TxnFramer, max_tx_bytes, max_tx_rows,
-};
+use crate::source::cdc::{CdcEngine, ChangeEvent, ChangeOp, ChangeStream, Position, TxnFramer};
 
 /// LogMiner returns names over 30 bytes as `UNSUPPORTED`.
 const MAX_MINED_NAME: usize = 30;
@@ -923,24 +921,20 @@ impl OracleChangeStream {
             },
         };
         let commit = first.commit;
+        let mut bytes = first.event.estimated_bytes();
         let mut group = vec![first];
-        let mut bytes = 0usize;
-        while let Some(m) = self.next_mined()? {
-            if joins_commit_group(commit, m.commit) {
-                bytes += m.event.estimated_bytes();
-                group.push(m);
-                anyhow::ensure!(
-                    within_tx_caps(group.len(), bytes, max_tx_rows(), max_tx_bytes()),
-                    "oracle cdc: the transactions committed at SCN {commit} passed the \
-                     per-transaction cap ({} rows / {} bytes). rivet never splits a transaction \
-                     across parts; raise RIVET_CDC_MAX_TX_ROWS / RIVET_CDC_MAX_TX_BYTES if one \
-                     this large is expected.",
-                    max_tx_rows(),
-                    max_tx_bytes()
-                );
-            } else {
-                self.carry = Some(m);
-                break;
+        loop {
+            crate::source::cdc::check_tx_buffer_caps("oracle", group.len(), bytes)?;
+            match self.next_mined()? {
+                Some(m) if joins_commit_group(commit, m.commit) => {
+                    bytes += m.event.estimated_bytes();
+                    group.push(m);
+                }
+                Some(m) => {
+                    self.carry = Some(m);
+                    break;
+                }
+                None => break,
             }
         }
         let order = commit_group_order(
@@ -1030,11 +1024,6 @@ fn start_mining(
 /// Whether a row committed at `next` belongs to the group being read for commit SCN `commit`.
 pub(crate) fn joins_commit_group(commit: u64, next: u64) -> bool {
     next == commit
-}
-
-/// Whether a buffered commit group of `rows` / `bytes` is still inside the transaction caps.
-pub(crate) fn within_tx_caps(rows: usize, bytes: usize, max_rows: usize, max_bytes: usize) -> bool {
-    rows <= max_rows && bytes <= max_bytes
 }
 
 /// The order of one commit SCN's rows `(xid, sequence)`: each transaction stays contiguous in
@@ -1398,12 +1387,9 @@ mod tests {
     }
 
     #[test]
-    fn a_commit_group_takes_only_its_own_scn_and_stops_at_either_cap() {
+    fn a_commit_group_takes_only_its_own_scn() {
         assert!(joins_commit_group(7, 7));
         assert!(!joins_commit_group(7, 8));
-        assert!(within_tx_caps(5, 50, 5, 50));
-        assert!(!within_tx_caps(6, 50, 5, 50));
-        assert!(!within_tx_caps(5, 51, 5, 50));
     }
 
     #[test]

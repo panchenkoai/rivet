@@ -455,7 +455,7 @@ pub(super) fn initial_snapshot_pending(
     let recipes = crate::config::resolve_backfill(export, &config.exports)
         .map_err(|why| anyhow::anyhow!(why))?;
 
-    // The anchor — one entry point; the engine's AnchorModel decides the
+    // The anchor — one entry point; `ensure_anchor` picks the engine's
     // mechanism (idempotent: a present anchor is never moved). After the refusal
     // above, so a refused config leaves no slot or checkpoint behind.
     CdcEngine::from_url(&url)?.ensure_anchor(
@@ -476,7 +476,7 @@ pub(super) fn initial_snapshot_pending(
     // recreates the file only at first ack, AFTER the snapshots run) — so a
     // PG re-baseline is never stamped and stays behind the refusal+truncate
     // guard. The stamp covers checkpointed non-recovery snapshots (a table
-    // added mid-stream) and the MySQL/MSSQL/Mongo recovery flows, whose
+    // added mid-stream) and the MySQL/MSSQL/Mongo/Oracle recovery flows, whose
     // ensure_anchor persists the pin before the snapshots.
     let anchor_pos = ckpt_path
         .as_deref()

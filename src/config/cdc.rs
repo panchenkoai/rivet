@@ -99,7 +99,8 @@ pub struct CdcExportConfig {
     /// daemon on MySQL (blocking binlog dump) and MongoDB (the change stream
     /// blocks awaiting events; ends only if the stream is invalidated/closed);
     /// PostgreSQL / SQL Server still exit on catch-up — one unbounded pass, run
-    /// it under a supervisor.
+    /// it under a supervisor. Oracle refuses `false`: LogMiner is always a
+    /// bounded drain to the SCN current at open.
     #[serde(default = "default_true")]
     pub until_current: bool,
     /// Stop at the first COMMIT BOUNDARY once N change events have been
@@ -891,7 +892,7 @@ impl Config {
         }
 
         // `initial:` needs a durable anchor BEFORE anything reads. PostgreSQL
-        // pins server-side (the slot); MySQL / SQL Server have no server-side
+        // pins server-side (the slot); MySQL / SQL Server / Mongo / Oracle have no server-side
         // anchor, so the checkpoint file IS the anchor there. Stated against the
         // MODE rather than only `snapshot` by name, so a future `initial:` mode
         // inherits the requirement instead of silently deferring the failure to
@@ -900,6 +901,17 @@ impl Config {
         // One predicate for both baselines (`initial:` and `backfill:`).
         if let Some(why) = baseline_checkpoint_refusal(export, self.source.source_type) {
             anyhow::bail!(why);
+        }
+
+        if self.source.source_type == SourceType::Oracle
+            && export.cdc.as_ref().is_some_and(|c| c.runs_until_stopped())
+        {
+            crate::config_bail!(
+                crate::error::codes::CONFIG_CDC_CONTINUOUS_UNSUPPORTED,
+                "export '{}': {}",
+                export.name,
+                crate::source::cdc::ORACLE_CONTINUOUS_REFUSAL
+            );
         }
 
         // `cdc.backfill` is the other way to get a baseline, and it is the same
@@ -989,7 +1001,7 @@ impl Config {
         // hole was total: `cdc.initial` absent skips the `initial.is_some()` rule
         // above, and the run-time backstop that would catch it —
         // `CdcEngine::ensure_anchor`, which demands a checkpoint for
-        // Mysql|Mssql|Mongo — is unreachable, because its only production caller
+        // Mysql|Mssql|Mongo|Oracle — is unreachable, because its only production caller
         // sits inside `initial_snapshot_pending`, which returns early when
         // `cdc.initial.is_none()`. Measured on a live stand: two runs with three
         // changes between them captured ZERO events, both exiting 0. `rivet
@@ -1032,6 +1044,35 @@ impl Config {
 mod tests {
     use super::*;
     use crate::config::export::sample_export;
+
+    /// A one-export `mode: cdc` config on `source_type` with the given `until_current`.
+    fn cdc_yaml(source: &str, url: &str, until_current: bool) -> String {
+        format!(
+            "source: {{ type: {source}, url: \"{url}\" }}\nexports:\n  - name: t\n    table: T\n    \
+             mode: cdc\n    format: parquet\n    \
+             cdc: {{ until_current: {until_current}, checkpoint: \"./t.ckpt\" }}\n    \
+             destination: {{ type: local, path: /tmp/x }}\n"
+        )
+    }
+
+    #[test]
+    fn only_oracle_refuses_the_continuous_model_at_load() {
+        let ora = "oracle://u:p@localhost:1521/FREEPDB1";
+        let err = crate::config::Config::from_yaml(&cdc_yaml("oracle", ora, false))
+            .expect_err("Oracle `until_current: false` must refuse");
+        assert!(
+            format!("{err:#}").contains("Oracle CDC is always a bounded drain"),
+            "{err:#}"
+        );
+        crate::config::Config::from_yaml(&cdc_yaml("oracle", ora, true))
+            .expect("the bounded default loads");
+        crate::config::Config::from_yaml(&cdc_yaml(
+            "postgres",
+            "postgresql://u:p@localhost/db",
+            false,
+        ))
+        .expect("PostgreSQL may opt into the continuous model");
+    }
 
     // ── cdc.backfill: the pairing ────────────────────────────────────────────
 
