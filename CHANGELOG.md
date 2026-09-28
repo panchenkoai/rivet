@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **MySQL CDC writes a zero `TIMESTAMP` (`0000-00-00 00:00:00`) as NULL, not `1970-01-01`.** The
+  binlog carries a zero TIMESTAMP as epoch 0, and the CDC decoder turned it into the epoch instant,
+  while the batch path (and so every snapshot) wrote NULL: the same source value landed two ways in
+  one table, and a row that CDC touched after its snapshot silently changed from NULL to 1970. No
+  real TIMESTAMP can be 0 — MySQL's range starts at `1970-01-01 00:00:01` UTC — so 0 is the zero
+  date and is now NULL on both paths. Found on a pilot comparing rivet with a cursor pipeline.
+  Rows already loaded keep the epoch until they change again or the table is re-snapshotted.
+
 - **A load whose state ledger dies before it can mark a table as being written no longer writes it.**
   The `writing` marker that keeps a table rivet's own across a crash was written best-effort: when
   the ledger connection dropped first, the load wrote the table anyway and reported `LOAD OK`, and

@@ -1362,7 +1362,8 @@ fn cdc_hostile_zero_date_and_nul_string_match_batch() {
     let mut c = conn();
     c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
     c.query_drop(format!(
-        "CREATE TABLE {tbl} (id INT PRIMARY KEY, dt DATETIME, s VARCHAR(20))"
+        "CREATE TABLE {tbl} (id INT PRIMARY KEY, dt DATETIME, s VARCHAR(20), \
+         ts TIMESTAMP NULL, ts6 TIMESTAMP(6) NULL)"
     ))
     .unwrap();
     let _guard = Table(tbl.clone());
@@ -1375,8 +1376,9 @@ fn cdc_hostile_zero_date_and_nul_string_match_batch() {
     run_rivet_ok(&cdc_config(&d, &tbl, &ckpt, &out)); // pin
     c.query_drop("SET SESSION sql_mode=''").unwrap();
     c.query_drop(format!(
-        "INSERT INTO {tbl} VALUES (1, '0000-00-00 00:00:00', CONCAT('a', CHAR(0), 'b')), \
-         (2, '2024-03-15 12:00:00', 'plain')"
+        "INSERT INTO {tbl} VALUES (1, '0000-00-00 00:00:00', CONCAT('a', CHAR(0), 'b'), \
+         '0000-00-00 00:00:00', '0000-00-00 00:00:00.000000'), \
+         (2, '2024-03-15 12:00:00', 'plain', '2024-03-15 12:00:00', '2024-03-15 12:00:00.500000')"
     ))
     .unwrap();
     run_rivet_ok(&cdc_config(&d, &tbl, &ckpt, &out));
@@ -1394,6 +1396,14 @@ fn cdc_hostile_zero_date_and_nul_string_match_batch() {
         .unwrap();
     assert!(dt.is_null(0), "zero-date degrades to NULL (documented)");
     assert!(!dt.is_null(1), "a real datetime stays");
+    for col in ["ts", "ts6"] {
+        let arr = b.column(b.schema().index_of(col).unwrap());
+        assert!(
+            arr.is_null(0),
+            "{col}: a zero TIMESTAMP is NULL, not 1970-01-01"
+        );
+        assert!(!arr.is_null(1), "{col}: a real TIMESTAMP stays");
+    }
     // The NUL byte survives inside the string.
     let s = parquet_one_string(&out, "s");
     assert_eq!(s.as_bytes(), b"a\0b", "embedded NUL survives byte-for-byte");
