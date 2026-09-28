@@ -18,6 +18,10 @@ measured runs; the MINIMUM of each metric is compared (other activity only ever 
 a loopback proxy the harness owns (a server counter also counts the stand's healthchecks):
 at most CONN_CEILING[engine], and never more than the previous release.
 
+`parallel-exports-8`: the previous release's init over eight tables, run with
+`--parallel-exports` — the concurrency a generated config offers (init never writes
+`parallel:` for a keyset table, so the per-export parallel runners are unreachable from it).
+
 Paths: batch `full`, keyset (`chunked`), an incremental delta and a crash→resume per SQL
 engine; per CDC engine a drain of a large change set (one big transaction plus many small),
 the same drain with the transaction buffer capped so it spills, and a resume after a crash
@@ -259,6 +263,41 @@ def _pair(led: Ledger, prev: Path, root: Path, engine: str, url: str, table: str
            _batch_path(rivet_bin(), d_cur, url, engine, table, path, rows, idc))
 
 
+MULTI_TABLES = 8
+MULTI_ROWS = 50_000
+
+
+def _multi_side(binary: Path, prev: Path, root: Path, url: str, tag: str) -> Sample | None:
+    """The previous init over MULTI_TABLES tables, run by `binary` with `--parallel-exports`:
+    the minimum of REPS timed runs after a warm-up. None when any table came back short."""
+    pre = f"pmulti_{os.getpid()}_{tag}_"
+    tables = [f"{pre}{i}" for i in range(1, MULTI_TABLES + 1)]
+    _sql("postgres", url, "".join(
+        f"DROP TABLE IF EXISTS {t}; CREATE TABLE {t} (id BIGINT PRIMARY KEY, v TEXT); "
+        f"INSERT INTO {t} SELECT g, md5(g::text) FROM generate_series(1, {MULTI_ROWS}) g;" for t in tables))
+    d = root / f"multi_{tag}"
+    d.mkdir()
+    env = {"RIVET_PERF_URL": url, "RIVET_STATE_URL": ""}
+    try:
+        p = run([str(prev), "init", "--source-env", "RIVET_PERF_URL", "--include", f"{pre}*",
+                 "--mode", "full", "-o", "c.yaml"], env=env, cwd=d)
+        if not p.ok:
+            return None
+        samples = []
+        for i in range(REPS + 1):
+            _fresh(d)
+            s = _timed(binary, d, env, "run", "-c", "c.yaml", "--parallel-exports", probe=url)
+            if i:
+                samples.append(s)
+        for t in tables:
+            got = _declared(d / "output" / t, "SELECT count(DISTINCT id) FROM {parts}")
+            if not got or got[0][0] != MULTI_ROWS:
+                return None
+        return _best(samples)
+    finally:
+        _sql("postgres", url, "".join(f"DROP TABLE IF EXISTS {t};" for t in tables))
+
+
 def _off_happy_path(led: Ledger, prev: Path, root: Path) -> None:
     """A 50 ms link, a table ten times larger, and a document store — the paths a lab never sees."""
     from .failure import PG_TOXI_URL, TOXI_PROXY, _toxi, _toxi_lock
@@ -285,6 +324,9 @@ def _off_happy_path(led: Ledger, prev: Path, root: Path) -> None:
                         _toxi("DELETE", f"/proxies/{TOXI_PROXY}/toxics/perf_latency")
             finally:
                 _sql("postgres", url, f"DROP TABLE IF EXISTS {table};")
+        # The parallelism an operator gets from a generated config: many exports at once.
+        _grade(led, "postgres", "parallel-exports-8", _multi_side(prev, prev, root, url, "prev"),
+               _multi_side(rivet_bin(), prev, root, url, "cur"))
         big = f"perf_pg_big_{os.getpid()}"
         if _seed("postgres", url, big, BIG_ROWS, with_cursor=False):
             try:
