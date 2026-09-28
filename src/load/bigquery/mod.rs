@@ -598,7 +598,8 @@ impl TargetLoader for BigQueryLoader {
         order: crate::load::cdc::CompactOrder,
     ) -> Result<crate::load::CompactReport> {
         use crate::load::cdc::{
-            CompactProbe, compact_probe_sql, compact_script_sql, plan_compact_merges,
+            CompactArm, CompactProbe, compact_arm, compact_probe_sql, compact_script_sql,
+            plan_compact_merges,
         };
         let base = self.fqtn(table);
         let changes = format!("{table}__changes");
@@ -615,18 +616,7 @@ impl TargetLoader for BigQueryLoader {
         // unpartitioned one compacts in ONE scripted job: the buffer's distinct days
         // become a script variable and every MERGE prunes to exactly those partitions.
         let key = self.partition.as_ref().map(|p| &p.key);
-        let day_column = match key {
-            None => Some(None),
-            // A load date (`_rivet_exported_at`, the load time) is a different value
-            // on every run: the base holds every key under an older one, so there is
-            // nothing to prune by — one unbounded MERGE.
-            Some(k) if k.is_load_date() => Some(None),
-            Some(PartitionKey::Time {
-                column,
-                granularity: Granularity::Day,
-            }) => Some(column.as_deref()),
-            Some(_) => None,
-        };
+        let arm = compact_arm(key);
 
         // RECOVERY, before anything else. The scripted arm renames the live buffer to
         // this deterministic name as its first act (see `CompactRename`), so a table
@@ -661,7 +651,7 @@ impl TargetLoader for BigQueryLoader {
                 // The leftover can only have come from the scripted arm. If the config
                 // has since moved to a range key, fall back to the unbounded MERGE —
                 // correct, merely less pruned, and never a reason to strand the rows.
-                day_column.unwrap_or(None),
+                arm.recovery_day_column(),
             );
             let row = api.run_query_first_row(&script, &self.labels("merge", table))?;
             let (rows, jobs) = compact_summary(&row)?;
@@ -679,10 +669,11 @@ impl TargetLoader for BigQueryLoader {
             // reason — it is what the caller prints.
             return Ok(crate::load::CompactReport {
                 base,
-                changes_rows: recovered_rows,
-                merge_jobs: recovered_jobs,
-                had_buffer: recovered_jobs > 0,
-            });
+                changes_rows: 0,
+                merge_jobs: 0,
+                had_buffer: false,
+            }
+            .with_recovered(recovered_rows, recovered_jobs));
         };
         // An EMPTY buffer (the metadata row count is exact after a load job) needs
         // no probe and no MERGE — every statement that touches a table is billed a
@@ -691,18 +682,17 @@ impl TargetLoader for BigQueryLoader {
             self.run_sql(&format!("DROP TABLE `{changes_fqtn}`;"), "merge", table)?;
             return Ok(crate::load::CompactReport {
                 base,
-                // Same as the no-buffer arm: a recovered leftover was really merged by
-                // this run and must not be reported as zero.
-                changes_rows: recovered_rows,
-                merge_jobs: recovered_jobs,
+                changes_rows: 0,
+                merge_jobs: 0,
                 had_buffer: true,
-            });
+            }
+            .with_recovered(recovered_rows, recovered_jobs));
         }
         // A crash BEFORE any MERGE: the buffer must survive whole, so the next
         // compact applies every change exactly once (the sibling of
         // `compact_after_merge`, where the script already dropped it).
         crate::test_hook::maybe_panic_at("compact_before_merge");
-        if let Some(day_column) = day_column {
+        if let CompactArm::Scripted { day_column } = arm {
             // The rename is the script's first act, so the live name is free the moment
             // the job starts and every later statement — MERGE and DROP alike — works
             // on `merging_fqtn`. A job abandoned by a dying client therefore drops a
@@ -727,10 +717,11 @@ impl TargetLoader for BigQueryLoader {
             crate::test_hook::maybe_panic_at("compact_after_merge");
             return Ok(crate::load::CompactReport {
                 base,
-                changes_rows: changes_rows + recovered_rows,
-                merge_jobs: merge_jobs + recovered_jobs,
+                changes_rows,
+                merge_jobs,
                 had_buffer: true,
-            });
+            }
+            .with_recovered(recovered_rows, recovered_jobs));
         }
         // Other keys (hour/month/year, integer ranges): the range probe, then one
         // MERGE per window of constant bounds, then the DROP — separate jobs.
@@ -768,7 +759,8 @@ impl TargetLoader for BigQueryLoader {
             changes_rows,
             merge_jobs: merges.len(),
             had_buffer: true,
-        })
+        }
+        .with_recovered(recovered_rows, recovered_jobs))
     }
 
     fn create_view(&self, table: &str, view_sql: &str) -> Result<()> {

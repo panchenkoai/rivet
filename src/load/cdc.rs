@@ -1389,10 +1389,97 @@ pub fn compact_script_sql(
     )
 }
 
+/// Which compaction a base's partition key gets: one scripted job, or windowed MERGEs then a DROP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactArm<'a> {
+    /// One scripted job; `day_column` is the DATE-pruned column, `None` for an unbounded MERGE.
+    Scripted { day_column: Option<&'a str> },
+    /// Hour/month/year or integer-range keys: probe, one MERGE per window, then DROP.
+    Windowed,
+}
+
+impl<'a> CompactArm<'a> {
+    /// The day column a recovered leftover's script prunes by; unbounded off the scripted arm.
+    pub fn recovery_day_column(self) -> Option<&'a str> {
+        match self {
+            CompactArm::Scripted { day_column } => day_column,
+            CompactArm::Windowed => None,
+        }
+    }
+}
+
+/// Picks the compaction arm for a base partitioned on `key` (unpartitioned or a load date prunes nothing).
+pub fn compact_arm(key: Option<&crate::load::plan::PartitionKey>) -> CompactArm<'_> {
+    use crate::load::plan::{Granularity, PartitionKey};
+    match key {
+        None => CompactArm::Scripted { day_column: None },
+        Some(k) if k.is_load_date() => CompactArm::Scripted { day_column: None },
+        Some(PartitionKey::Time {
+            column,
+            granularity: Granularity::Day,
+        }) => CompactArm::Scripted {
+            day_column: column.as_deref(),
+        },
+        Some(_) => CompactArm::Windowed,
+    }
+}
+
 #[cfg(test)]
 mod compact_tests {
     use super::*;
     use crate::load::plan::{Granularity, PartitionKey};
+
+    #[test]
+    fn compact_arm_scripts_day_and_unprunable_keys_and_windows_the_rest() {
+        let time = |c: Option<&str>, g| PartitionKey::Time {
+            column: c.map(str::to_string),
+            granularity: g,
+        };
+        let scripted = |d| CompactArm::Scripted { day_column: d };
+        assert_eq!(compact_arm(None), scripted(None));
+        assert_eq!(
+            compact_arm(Some(&time(None, Granularity::Hour))),
+            scripted(None),
+            "load time"
+        );
+        assert_eq!(
+            compact_arm(Some(&time(
+                Some(crate::enrich::COL_EXPORTED_AT),
+                Granularity::Month
+            ))),
+            scripted(None),
+            "extraction stamp"
+        );
+        assert_eq!(
+            compact_arm(Some(&time(Some("ts"), Granularity::Day))),
+            scripted(Some("ts"))
+        );
+        for g in [Granularity::Hour, Granularity::Month, Granularity::Year] {
+            assert_eq!(
+                compact_arm(Some(&time(Some("ts"), g))),
+                CompactArm::Windowed
+            );
+        }
+        let range = PartitionKey::Range {
+            column: "b".into(),
+            start: 0,
+            end: 100,
+            interval: 10,
+        };
+        assert_eq!(compact_arm(Some(&range)), CompactArm::Windowed);
+    }
+
+    #[test]
+    fn a_recovered_leftover_merges_unbounded_off_the_scripted_arm() {
+        assert_eq!(CompactArm::Windowed.recovery_day_column(), None);
+        assert_eq!(
+            CompactArm::Scripted {
+                day_column: Some("ts")
+            }
+            .recovery_day_column(),
+            Some("ts")
+        );
+    }
 
     /// The script renames the LIVE buffer away first, and never drops it by name.
     ///
