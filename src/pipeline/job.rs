@@ -123,22 +123,20 @@ fn capture_open_forensics(
     state: &StateStore,
     summary: &mut RunSummary,
     want_key: bool,
+    meta: &mut MetaConn<'_>,
 ) {
-    let mut src = match crate::source::create_source(&plan.source) {
-        Ok(s) => s,
-        Err(e) => {
-            log::debug!(
-                "open-forensics: source connect failed for '{}': {e}",
-                plan.export_name
-            );
-            return;
-        }
+    let Some(src) = meta.get() else {
+        log::debug!(
+            "open-forensics: no source connection for '{}'",
+            plan.export_name
+        );
+        return;
     };
     summary.server_context_json = src.server_context();
     // The same resolution the type report and the load spec use, so what this run
     // records for `rivet load` is what it resolved, not a second reading.
     match crate::preflight::type_report::probe_mappings(
-        src.as_mut(),
+        src,
         &plan.base_query,
         &plan.column_overrides,
     ) {
@@ -378,16 +376,46 @@ fn recorded_harm(deltas: Vec<(String, i64)>) -> Vec<(String, i64)> {
 }
 
 /// Source-harm counters taken before a run window; `close` turns them into the run's deltas.
+/// A batch run's one metadata connection: opened at the start, reopened once if it died idle.
+pub(super) struct MetaConn<'a> {
+    cfg: &'a crate::config::SourceConfig,
+    src: Option<Box<dyn crate::source::Source>>,
+}
+
+impl<'a> MetaConn<'a> {
+    /// Connect once for the run; a failed connect leaves it empty rather than failing the run.
+    pub(super) fn open(cfg: &'a crate::config::SourceConfig) -> Self {
+        Self {
+            cfg,
+            src: crate::source::create_source(cfg).ok(),
+        }
+    }
+
+    /// The held connection, if the run has one.
+    pub(super) fn get(&mut self) -> Option<&mut (dyn crate::source::Source + 'static)> {
+        self.src.as_deref_mut()
+    }
+
+    /// Replace the connection with a fresh one (a server or a network may drop an idle one).
+    pub(super) fn reopen(
+        &mut self,
+    ) -> crate::error::Result<&mut (dyn crate::source::Source + 'static)> {
+        self.src = None;
+        let fresh = crate::source::create_source(self.cfg)?;
+        Ok(self.src.insert(fresh).as_mut())
+    }
+}
+
+/// Whether to reopen the run's connection to close the harm bracket: it opened, and the held connection no longer answers.
+fn reopen_to_close_the_bracket(opened: bool, answered: bool) -> bool {
+    opened && !answered
+}
+
 pub(super) struct HarmBracket {
     harm: Option<Vec<(String, i64)>>,
 }
 
 impl HarmBracket {
-    /// Snapshot the source's harm counters (temp-spill included) on a fresh connection.
-    pub(super) fn open(source: &crate::config::SourceConfig) -> Self {
-        Self::open_on(crate::source::create_source(source).ok().as_deref_mut())
-    }
-
     /// Snapshot on a connection the caller already holds, so the bracket opens none.
     pub(super) fn open_on(src: Option<&mut (dyn crate::source::Source + '_)>) -> Self {
         Self {
@@ -395,15 +423,18 @@ impl HarmBracket {
         }
     }
 
-    /// Close on a fresh connection: see [`Self::close_on`].
-    pub(super) fn close(
+    /// Close on the run's metadata connection, reopening it once if it died while the run held it idle.
+    pub(super) fn close_on_meta(
         self,
-        source: &crate::config::SourceConfig,
+        meta: &mut MetaConn<'_>,
         state: &StateStore,
         summary: &mut RunSummary,
     ) -> Vec<(String, i64)> {
-        let mut src = crate::source::create_source(source).ok();
-        self.close_on(src.as_deref_mut(), state, summary)
+        let mut after = meta.get().and_then(|s| s.harm_counters());
+        if reopen_to_close_the_bracket(self.harm.is_some(), after.is_some()) {
+            after = meta.reopen().ok().and_then(|s| s.harm_counters());
+        }
+        self.close_with(after, state, summary)
     }
 
     /// Close on the same window: set the temp delta (warning on a spill), persist and return the harm deltas.
@@ -414,6 +445,16 @@ impl HarmBracket {
         summary: &mut RunSummary,
     ) -> Vec<(String, i64)> {
         let after = src.and_then(|s| s.harm_counters());
+        self.close_with(after, state, summary)
+    }
+
+    /// The close itself, given the counters read at the end of the window.
+    fn close_with(
+        self,
+        after: Option<Vec<(String, i64)>>,
+        state: &StateStore,
+        summary: &mut RunSummary,
+    ) -> Vec<(String, i64)> {
         if let (Some(before), Some(now)) = (
             temp_bytes_of(self.harm.as_deref()),
             temp_bytes_of(after.as_deref()),
@@ -771,7 +812,11 @@ fn reconcile_run_gate(
 /// from a legitimate SUBSET-strategy skip (`None`, exit 0). Before this a
 /// could-not-verify left `reconciled = None`, indistinguishable from the skip, so
 /// `run --reconcile` exited 0 as if verified-OK (#10 bughunt).
-fn reconcile_source_count(plan: &ResolvedRunPlan, summary: &mut RunSummary) -> Option<String> {
+fn reconcile_source_count(
+    plan: &ResolvedRunPlan,
+    summary: &mut RunSummary,
+    meta: &mut MetaConn<'_>,
+) -> Option<String> {
     // Skip the full-source COUNT(*) for any SUBSET/DELTA strategy — its exported
     // count legitimately differs from the table total, and the #102 exit gate
     // must not turn that STRUCTURAL mismatch into a false exit-3 (which would
@@ -796,17 +841,21 @@ fn reconcile_source_count(plan: &ResolvedRunPlan, summary: &mut RunSummary) -> O
         plan.export_name
     );
 
-    let mut src = match crate::source::create_source(&plan.source) {
-        Ok(s) => s,
-        Err(e) => {
-            log::warn!("reconcile: could not connect to source: {:#}", e);
-            return Some(format!(
-                "could not connect to the source to reconcile: {e:#}"
-            ));
-        }
+    // The run's metadata connection, reopened once if it went away while the run held it idle.
+    let counted = match meta.get().map(|s| s.query_scalar(&count_sql)) {
+        Some(Ok(v)) => Ok(v),
+        _ => match meta.reopen() {
+            Ok(s) => s.query_scalar(&count_sql),
+            Err(e) => {
+                log::warn!("reconcile: could not connect to source: {e:#}");
+                return Some(format!(
+                    "could not connect to the source to reconcile: {e:#}"
+                ));
+            }
+        },
     };
 
-    match src.query_scalar(&count_sql) {
+    match counted {
         Ok(Some(val)) => {
             let Ok(count) = val.parse::<i64>() else {
                 // A non-integer COUNT is COULD-NOT-VERIFY (we cannot compare), NOT
@@ -1270,11 +1319,15 @@ fn execute_resolved_plan(
     let ledger_run_id = summary.run_id.clone();
     // Failure forensics at open: source schema + server limits, so a run that fails
     // before finalize still explains itself (export_schema is otherwise success-only).
-    capture_open_forensics(plan, state, &mut summary, tail.record_load_spec);
+    // ONE metadata connection for the run's own probes — forensics, both harm
+    // snapshots, the reconcile count — instead of one each (measured: 4 connections
+    // for a full export, 1 of them reading data).
+    let mut meta = MetaConn::open(&plan.source);
+    capture_open_forensics(plan, state, &mut summary, tail.record_load_spec, &mut meta);
 
     // PG temp-spill + the broader source-harm counters, bracketed around the run
     // window; the deltas land in export_harm. Best-effort — see `harm_snapshot`.
-    let harm = HarmBracket::open(&plan.source);
+    let harm = HarmBracket::open_on(meta.get());
 
     // Record plan diagnostics the caller already logged at validate time.
     for (rule, message) in &tail.plan_warnings {
@@ -1333,7 +1386,7 @@ fn execute_resolved_plan(
 
     // Close the harm bracket on the SAME window the run occupied, before the
     // status resolution below — the deltas are what the DIAGNOSIS reads.
-    let harm_delta_vec = harm.close(&plan.source, state, &mut summary);
+    let harm_delta_vec = harm.close_on_meta(&mut meta, state, &mut summary);
     let tuning_class = plan.tuning.profile_name().to_string();
     let result = run_chunked_quality_gate(result, plan, &mut summary);
     let failed = result.is_err();
@@ -1379,7 +1432,7 @@ fn execute_resolved_plan(
 
     let mut reconcile_gate: crate::error::Result<()> = Ok(());
     if should_reconcile(tail.allow_reconcile, plan.reconcile, failed) {
-        let could_not_verify = reconcile_source_count(plan, &mut summary);
+        let could_not_verify = reconcile_source_count(plan, &mut summary, &mut meta);
         if let (Some(source_count), Some(matched)) = (summary.source_count, summary.reconciled) {
             summary.journal.record(RunEvent::ReconciliationResult {
                 source_count,
@@ -2605,6 +2658,23 @@ mod tests {
     /// difference: over `3 MB → 7 MB` the difference is 4 MB, the sum 10 MB, the
     /// quotient 2 — three distinct values, all positive, so `.max(0)` cannot mask
     /// the disagreement.
+    #[test]
+    fn the_bracket_reopens_only_when_it_opened_and_the_held_connection_went_quiet() {
+        assert!(
+            reopen_to_close_the_bracket(true, false),
+            "opened, then the connection died"
+        );
+        assert!(
+            !reopen_to_close_the_bracket(true, true),
+            "the held connection still answers"
+        );
+        assert!(
+            !reopen_to_close_the_bracket(false, false),
+            "nothing to close: never opened"
+        );
+        assert!(!reopen_to_close_the_bracket(false, true));
+    }
+
     #[test]
     fn the_temp_spill_rides_the_harm_snapshot_and_is_not_recorded_twice() {
         let key = crate::source::PG_TEMP_BYTES_KEY;
