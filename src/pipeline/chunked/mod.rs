@@ -227,6 +227,11 @@ pub(super) fn check_drift_only(
     super::schema_drift::check_from_type_mappings(src, st, plan, summary)
 }
 
+/// Whether precomputed ranges read rows, so the drift gate must run: no ranges, no read, no connection.
+pub(super) fn precomputed_ranges_need_the_drift_gate(ranges: &[(i64, i64)]) -> bool {
+    !ranges.is_empty()
+}
+
 /// Idle source connections shared by one parallel chunked run: a chunk reuses one instead of reconnecting per chunk.
 #[derive(Default)]
 pub(super) struct IdleSources(std::sync::Mutex<Vec<Box<dyn crate::source::Source>>>);
@@ -503,6 +508,12 @@ mod tests {
     //! no mocks, no docker. They are *intentionally* the only unit cover
     //! for this file's recovery logic; everything that touches a live
     //! `Source` is exercised by `tests/live_*.rs` instead.
+
+    #[test]
+    fn only_precomputed_ranges_that_read_rows_need_the_drift_gate() {
+        assert!(!super::precomputed_ranges_need_the_drift_gate(&[]));
+        assert!(super::precomputed_ranges_need_the_drift_gate(&[(1, 10)]));
+    }
 
     #[test]
     fn a_dead_owners_plan_resumes_unless_resume_was_asked_or_nothing_crashed() {

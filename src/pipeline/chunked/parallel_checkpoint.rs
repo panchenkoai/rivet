@@ -70,7 +70,7 @@ pub(in crate::pipeline) fn run_chunked_parallel_checkpoint(
                 summary.chunks_precomputed = true;
                 // No ranges ⇒ no rows will be read, so there is nothing for the
                 // gate to protect and no reason to open a connection to say so.
-                if !ranges.is_empty() {
+                if super::precomputed_ranges_need_the_drift_gate(&ranges) {
                     super::check_drift_only(meta.require()?, plan, Some(state), summary)?;
                 }
                 ranges

@@ -222,12 +222,22 @@ def partition(
     return p1, p2
 
 
+_MANIFEST_PATH = re.compile(
+    r'env!\(\s*"CARGO_MANIFEST_DIR"\s*\)\s*\)?\s*(?:\.join\(\s*"|,\s*"/)(src/[^"]*)"'
+)
+
+
 def source_read_files(src: Path) -> set[str]:
-    """`.rs` files under `src` that some source file reads as TEXT (`include_str!`)."""
+    """`.rs` files under `src` a source file reads as TEXT: `include_str!`, or a `CARGO_MANIFEST_DIR` path (a dir reads all)."""
     read: set[str] = set()
     for f in sorted(src.rglob("*.rs")):
-        for m in re.finditer(r'include_str!\(\s*"([^"]+\.rs)"\s*\)', f.read_text(errors="ignore")):
+        text = f.read_text(errors="ignore")
+        for m in re.finditer(r'include_str!\(\s*"([^"]+\.rs)"\s*\)', text):
             read.add(os.path.normpath(f.parent / m.group(1)))
+        for m in _MANIFEST_PATH.finditer(text):
+            target = src.parent / m.group(1)
+            files = sorted(target.rglob("*.rs")) if target.is_dir() else [target]
+            read.update(os.path.normpath(t) for t in files if t.suffix == ".rs" and t.exists())
     return read
 
 
@@ -542,9 +552,19 @@ def self_test() -> int:
         got = source_read_files(Path(d) / "src")
         want = {os.path.normpath(Path(d) / "src" / "pipeline" / "run.rs")}
         assert got == want, got
+        (Path(d) / "src" / "load").mkdir()
+        (Path(d) / "src" / "load" / "a.rs").write_text("fn a() {}\n")
+        (Path(d) / "src" / "load" / "b.rs").write_text("fn b() {}\n")
+        (Path(d) / "src" / "pipeline" / "grep.rs").write_text(
+            'let r = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/load");\n'
+            'let f = concat!(env!("CARGO_MANIFEST_DIR"), "/src/pipeline/run.rs");\n'
+        )
+        got = source_read_files(Path(d) / "src")
+        want |= {os.path.normpath(Path(d) / "src" / "load" / n) for n in ("a.rs", "b.rs")}
+        assert got == want, got
 
     print(
-        "self-test ok: include_str!-read files, executed / zero-coverage / unmeasured-file / uncovered-line / "
+        "self-test ok: include_str!- and CARGO_MANIFEST_DIR-read files, executed / zero-coverage / unmeasured-file / uncovered-line / "
         "unparseable classification, the no-coverage fallback, exact exclusions, "
         "both verify directions, six rejected report shapes, and the P2 audit scoped "
         "to the P2 class over PR #265's leaked StructField kills"
