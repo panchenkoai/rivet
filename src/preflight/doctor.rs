@@ -938,9 +938,13 @@ exports:
         let config_path = config_dir.path().join("rivet.yaml");
         std::fs::write(&config_path, yaml).unwrap();
 
-        // Returns Err (source auth fails on the unset env var); the
-        // destination probes are the observable under test.
-        let _ = doctor(config_path.to_str().unwrap(), false);
+        // Source auth fails on the unset env var, and doctor must say so — then still probe both paths.
+        let err = doctor(config_path.to_str().unwrap(), false)
+            .expect_err("an unresolvable source must fail doctor, not pass it");
+        assert!(
+            format!("{err:#}").contains("one or more preflight checks failed"),
+            "{err:#}"
+        );
 
         let probe = crate::manifest::DOCTOR_PROBE_FILENAME;
 
