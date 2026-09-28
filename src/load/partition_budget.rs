@@ -243,6 +243,30 @@ fn column_span(meta: &ParquetMetaData, column: &str) -> Option<(Span, bool)> {
     span.map(|s| (s, nulls))
 }
 
+/// The first timestamp column whose footer statistics reach outside `[lo_secs, hi_secs]`
+/// (Unix seconds), with the offending value rendered; `None` when all are inside or unknown.
+pub(crate) fn timestamp_outside(
+    meta: &ParquetMetaData,
+    lo_secs: i64,
+    hi_secs: i64,
+) -> Option<(String, String)> {
+    let schema = meta.file_metadata().schema_descr();
+    schema.columns().iter().find_map(|c| {
+        if !matches!(c.logical_type_ref(), Some(LogicalType::Timestamp(_))) {
+            return None;
+        }
+        let (span, _) = column_span(meta, c.name())?;
+        let end = if to_seconds(span.lo, span.unit) < lo_secs {
+            span.lo
+        } else if to_seconds(span.hi, span.unit) > hi_secs {
+            span.hi
+        } else {
+            return None;
+        };
+        Some((c.name().to_string(), render(end, span.unit)))
+    })
+}
+
 /// The unit a partitionable column's statistics are in, by its Parquet type.
 fn stored_unit(logical: Option<&LogicalType>, physical: PhysicalType) -> Option<Unit> {
     match (logical, physical) {
@@ -473,6 +497,39 @@ mod tests {
 
     fn write(dir: &std::path::Path, name: &str, field: Field, column: ArrayRef, stats: bool) {
         write_noted(dir, name, field, column, stats, None);
+    }
+
+    #[test]
+    fn a_timestamp_past_either_end_of_a_range_is_named_with_its_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lo, hi) = (at(1900, 1, 1, 0), at(2299, 12, 31, 23));
+        for (name, secs, stats) in [
+            ("inside.parquet", vec![lo, hi], true),
+            ("late.parquet", vec![lo, at(9999, 12, 31, 0)], true),
+            ("early.parquet", vec![at(1850, 1, 1, 0), hi], true),
+            ("unknown.parquet", vec![at(9999, 12, 31, 0)], false),
+        ] {
+            let (field, column) = ts_column(&secs);
+            write(dir.path(), name, field, column, stats);
+        }
+        let store = GcsStore::open_fs(dir.path().to_str().unwrap()).unwrap();
+        let check =
+            |name: &str| timestamp_outside(&read_footer(&store, name).unwrap(), lo, hi + HOUR - 1);
+        assert_eq!(check("inside.parquet"), None);
+        assert_eq!(
+            timestamp_outside(&read_footer(&store, "inside.parquet").unwrap(), lo, hi),
+            None,
+            "a value exactly at either end is inside"
+        );
+        assert_eq!(
+            check("late.parquet"),
+            Some(("ts".to_string(), "9999-12-31 00:00".to_string()))
+        );
+        assert_eq!(
+            check("early.parquet"),
+            Some(("ts".to_string(), "1850-01-01 00:00".to_string()))
+        );
+        assert_eq!(check("unknown.parquet"), None, "no statistics, no verdict");
     }
 
     #[test]

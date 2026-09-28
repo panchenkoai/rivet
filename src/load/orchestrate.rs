@@ -325,6 +325,11 @@ pub(super) fn snapshot_over_full_table_refusal(
     )
 }
 
+/// Why a MongoDB CDC stream cannot load into ClickHouse — said by config validation and by the load.
+pub(crate) const MONGO_CDC_INTO_CLICKHOUSE: &str = "a MongoDB CDC stream cannot load into ClickHouse: its resume token has no integer \
+     order for the change log's version (ADR-0035 CH7) — load it into BigQuery or \
+     Snowflake, or export it in batch mode";
+
 /// Why a CDC load from `engine` cannot reach one of `plans`' targets, or `None`.
 pub(super) fn unsupported_cdc_target(
     engine: load::cdc::SourceEngine,
@@ -334,12 +339,8 @@ pub(super) fn unsupported_cdc_target(
         p.mode == load::plan::LoadMode::Cdc
             && matches!(p.load.target, load::plan::LoadTarget::Clickhouse { .. })
     });
-    (engine == load::cdc::SourceEngine::Mongo && clickhouse_cdc).then(|| {
-        "a MongoDB CDC stream cannot load into ClickHouse: its resume token has no integer \
-         order for the change log's version (ADR-0035 CH7) — load it into BigQuery or \
-         Snowflake, or export it in batch mode"
-            .to_string()
-    })
+    (engine == load::cdc::SourceEngine::Mongo && clickhouse_cdc)
+        .then(|| MONGO_CDC_INTO_CLICKHOUSE.to_string())
 }
 
 /// Fold every per-plan failure into ONE error, or `None` when nothing failed.

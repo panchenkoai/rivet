@@ -411,6 +411,10 @@ pub mod codes {
         "RIVET_SOURCE_CDC_PREREQUISITE",
         "apply the setup statement the message names, then re-run (docs/reference/cdc.md)",
     );
+    pub const LOAD_VALUE_OUT_OF_TARGET_RANGE: Code = refusal(
+        "RIVET_LOAD_VALUE_OUT_OF_TARGET_RANGE",
+        "the warehouse type cannot hold this value; declare a wider type (e.g. String) for the column, or fix the source value",
+    );
     pub const LOAD_COUNT_MISMATCH: Code = integrity(
         "RIVET_LOAD_COUNT_MISMATCH",
         "compare the warehouse table with the run's manifest before re-running; the source is kept",
@@ -451,6 +455,7 @@ pub mod codes {
         SOURCE_CDC_PREREQUISITE,
         STATE_SCHEMA_NEWER,
         STATE_CURSOR_OWNER_MISMATCH,
+        LOAD_VALUE_OUT_OF_TARGET_RANGE,
         LOAD_COUNT_MISMATCH,
         LOAD_ADOPTION_COLUMN_MISMATCH,
         INTERNAL_VALUE_CONVERTER,
