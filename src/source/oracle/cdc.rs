@@ -13,8 +13,7 @@ use crate::config::TlsConfig;
 use crate::error::Result;
 use crate::source::cdc::value::RivetValue;
 use crate::source::cdc::{
-    CdcEngine, ChangeEvent, ChangeOp, ChangeStream, Position, RowImage, TxnFramer, max_tx_bytes,
-    max_tx_rows,
+    CdcEngine, ChangeEvent, ChangeOp, ChangeStream, Position, TxnFramer, max_tx_bytes, max_tx_rows,
 };
 
 /// LogMiner returns names over 30 bytes as `UNSUPPORTED`.
@@ -548,17 +547,6 @@ fn logging_check(conn: &Connection, tables: &[Captured]) -> Result<Option<String
         }
     }
     Ok(None)
-}
-
-/// What the capture can supply for `tables`, for the run-start row-image gate.
-pub(crate) fn row_image(url: &str, tls: Option<&TlsConfig>, tables: &[String]) -> RowImage {
-    let Ok(conn) = connect(url, tls) else {
-        return RowImage::Whole;
-    };
-    match resolve_tables(&conn, tables).and_then(|t| logging_check(&conn, &t)) {
-        Ok(Some(why)) => RowImage::Partial { why },
-        _ => RowImage::Whole,
-    }
 }
 
 /// Switch to the root and read the database identity; refuse a source that cannot be mined.

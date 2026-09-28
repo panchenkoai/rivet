@@ -23,7 +23,6 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value as Json;
 
-use crate::config::TlsConfig;
 use crate::error::Result;
 use value::RivetValue;
 
@@ -498,18 +497,18 @@ impl ChangeEvent {
 pub(crate) trait ChangeStream {
     fn next_change(&mut self) -> Option<Result<ChangeEvent>>;
 
-    /// The row-image verdict asked on the stream's own connection; `None` asks on another.
-    fn row_image_here(&mut self, _tables: &[String]) -> Option<RowImage> {
-        None
+    /// What the capture can supply for `tables`, asked on this stream's own connection; best-effort, `Whole` when unreadable (Mongo's UpdateLookup is always whole).
+    fn row_image(&mut self, _tables: &[String]) -> RowImage {
+        RowImage::Whole
     }
 
-    /// The retention warnings asked on the stream's own connection; `None` asks on another.
-    fn retention_warnings_here(&mut self) -> Option<Vec<String>> {
-        None
+    /// Log this source retains on the reader's behalf, worth saying before the run; only a PostgreSQL slot pins log.
+    fn retention_warnings(&mut self) -> Vec<String> {
+        Vec::new()
     }
 
-    /// The positional-mapping warning asked on the stream's own connection; `None` asks on another.
-    fn positional_mapping_here(&mut self) -> Option<Option<String>> {
+    /// The cost of mapping change images by position; only MySQL below `binlog_row_metadata=FULL` does.
+    fn positional_mapping_warning(&mut self) -> Option<String> {
         None
     }
 
@@ -944,102 +943,6 @@ impl CdcEngine {
 }
 
 impl CdcEngine {
-    /// Ask the source what it can supply for the tables about to be captured.
-    ///
-    /// Best-effort by construction: a catalog the reader cannot query answers
-    /// `Whole`. Refusing on a permission error would lock out sources that are
-    /// fine, and this check exists to catch a CONFIGURATION, not to police access.
-    pub(crate) fn row_image(
-        &self,
-        url: &str,
-        tls: Option<&TlsConfig>,
-        tables: &[String],
-        opts: &CdcEngineOpts,
-    ) -> RowImage {
-        match self {
-            Self::Mysql => crate::source::mysql::cdc::MysqlChangeStream::row_image(url, tls),
-            Self::Postgres => {
-                crate::source::postgres::cdc::PgChangeStream::row_image(url, tls, tables)
-            }
-            Self::Mssql => {
-                // The gate must grade the instance the poll will READ; anything
-                // else either sums across instances (masking a partial one) or
-                // matches a same-named table in another schema.
-                let ci = match opts {
-                    CdcEngineOpts::Mssql {
-                        capture_instance, ..
-                    } => capture_instance.as_deref(),
-                    _ => None,
-                };
-                crate::source::mssql::cdc::row_image(url, tls, tables, ci)
-            }
-            // The reader requests `FullDocumentType::UpdateLookup`, so the
-            // post-image is the whole document whatever the server is set to.
-            Self::Mongo => RowImage::Whole,
-            #[cfg(feature = "oracle")]
-            Self::Oracle => crate::source::oracle::cdc::row_image(url, tls, tables),
-            #[cfg(not(feature = "oracle"))]
-            Self::Oracle => RowImage::Whole,
-        }
-    }
-
-    /// Does this engine's CURRENT configuration map change images by position
-    /// rather than by name, and what does that cost?
-    ///
-    /// MySQL is the only engine that can answer yes: its binlog carries column
-    /// names only at `binlog_row_metadata=FULL`, and the default is MINIMAL. The
-    /// other three name their columns unconditionally — PostgreSQL's
-    /// `test_decoding` prints `name[type]:value`, SQL Server's change table IS a
-    /// table, Mongo's events are documents — so there is no positional mapping to
-    /// warn about, and a `None` here is structural rather than unimplemented.
-    pub(crate) fn positional_mapping_warning(
-        &self,
-        url: &str,
-        tls: Option<&TlsConfig>,
-    ) -> Option<String> {
-        if !self.maps_by_position() {
-            return None;
-        }
-        crate::source::mysql::cdc::MysqlChangeStream::row_metadata(url, tls)
-    }
-
-    /// WAL this source is holding that an operator should know about before the run
-    /// starts, not after the disk fills.
-    ///
-    /// PostgreSQL only, and structurally so: a replication slot is the one CDC
-    /// anchor that makes the SERVER retain log on the reader's behalf. MySQL's
-    /// binlog and SQL Server's change tables expire on their own schedule whatever
-    /// rivet does (which is why they can lose data to retention and PG cannot), and
-    /// Mongo's oplog is a capped collection. There is nothing to pin, so nothing to
-    /// warn about — a `None` here is a fact about those engines, not a TODO.
-    ///
-    /// Two questions, and the second is the dangerous one. This export's OWN slot
-    /// being far behind is worth saying (the drain will be long and WAL grows
-    /// meanwhile) but the run does fix it. A slot NOBODY owns is pinned until a
-    /// human acts — measured live at 9 abandoned slots holding 1.5 GiB each.
-    ///
-    /// Best-effort like `row_image`: a catalog the reader cannot query answers with
-    /// nothing. This exists to surface a CONFIGURATION hazard, not to police access,
-    /// and a run that refuses because it could not read `pg_replication_slots` would
-    /// trade a warning for an outage.
-    pub(crate) fn retention_warnings(
-        &self,
-        url: &str,
-        tls: Option<&TlsConfig>,
-        opts: &CdcEngineOpts,
-    ) -> Vec<String> {
-        if !self.pins_log_for_reader() {
-            return Vec::new();
-        }
-        let CdcEngineOpts::Postgres { slot, .. } = opts else {
-            return Vec::new();
-        };
-        let Ok(mut client) = crate::source::postgres::connect_client(url, tls) else {
-            return Vec::new();
-        };
-        pg_retention_warnings_on(&mut client, slot)
-    }
-
     pub(crate) fn from_url(url: &str) -> Result<Self> {
         if url.starts_with("mysql://") {
             Ok(Self::Mysql)
@@ -1786,9 +1689,7 @@ pub(crate) fn run_capture(
     // rather than inside each stream's `open`: scoped to what is actually being
     // captured, the answer is one line an operator can act on instead of a census
     // of the database (a first cut counted every table and said "704").
-    let image = stream
-        .row_image_here(&cap_tables)
-        .unwrap_or_else(|| engine.row_image(&url, tls.as_ref(), &cap_tables, &cap.cdc_cfg.engine));
+    let image = stream.row_image(&cap_tables);
     match image {
         RowImage::Whole => {}
         RowImage::KeyOnlyDeletes { why } => log::warn!(
@@ -1811,15 +1712,11 @@ pub(crate) fn run_capture(
     // capture is about to map by position must learn it from the run rather than
     // from a swapped column months later. `info` would be functionally silent at
     // the default log level — the same rule the sparse-chunk warning follows.
-    let positional = stream
-        .positional_mapping_here()
-        .unwrap_or_else(|| engine.positional_mapping_warning(&url, tls.as_ref()));
+    let positional = stream.positional_mapping_warning();
     if let Some(why) = positional {
         log::warn!("{} cdc: {why}.", engine.label());
     }
-    let retention = stream
-        .retention_warnings_here()
-        .unwrap_or_else(|| engine.retention_warnings(&url, tls.as_ref(), &cap.cdc_cfg.engine));
+    let retention = stream.retention_warnings();
     for why in retention {
         log::warn!("{} cdc: {why}.", engine.label());
     }

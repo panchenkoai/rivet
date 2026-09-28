@@ -49,27 +49,6 @@ use crate::source::require_tls_or_loopback;
 ///
 /// Best-effort: a reader without rights on the `cdc` schema answers `Whole` rather
 /// than blocking a capture that is otherwise fine.
-pub(crate) fn row_image(
-    url: &str,
-    tls: Option<&TlsConfig>,
-    tables: &[String],
-    capture_instance: Option<&str>,
-) -> crate::source::cdc::RowImage {
-    use crate::source::cdc::RowImage;
-
-    let Some(sql) = row_image_sql(tables, capture_instance) else {
-        return RowImage::Whole;
-    };
-    let Ok(mut src) = crate::source::mssql::MssqlSource::connect_with_tls(url, tls) else {
-        return RowImage::Whole;
-    };
-    let Ok(rows) = src.query_single_column(&sql) else {
-        return RowImage::Whole;
-    };
-    row_image_verdict(&rows)
-}
-
-/// The row-image catalog query for `tables` under the instance rivet reads; `None` for no tables.
 fn row_image_sql(tables: &[String], capture_instance: Option<&str>) -> Option<String> {
     if tables.is_empty() {
         return None;
@@ -1150,22 +1129,22 @@ impl MssqlChangeStream {
 }
 
 impl ChangeStream for MssqlChangeStream {
-    fn row_image_here(&mut self, tables: &[String]) -> Option<crate::source::cdc::RowImage> {
+    fn row_image(&mut self, tables: &[String]) -> crate::source::cdc::RowImage {
         use crate::source::cdc::RowImage;
         let Some(sql) = row_image_sql(tables, Some(&self.capture_instance)) else {
-            return Some(RowImage::Whole);
+            return RowImage::Whole;
         };
         let Self { rt, client, .. } = self;
         let rows = rt.block_on(async { client.simple_query(sql).await?.into_first_result().await });
-        // Best-effort, like the separate-connection path: an unreadable catalog is `Whole`.
+        // Best-effort: an unreadable catalog is `Whole`.
         let Ok(rows) = rows else {
-            return Some(RowImage::Whole);
+            return RowImage::Whole;
         };
         let named: Vec<String> = rows
             .iter()
             .filter_map(|r| r.get::<&str, _>(0).map(str::to_string))
             .collect();
-        Some(row_image_verdict(&named))
+        row_image_verdict(&named)
     }
 
     fn engine(&self) -> crate::source::cdc::CdcEngine {
