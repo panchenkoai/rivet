@@ -540,9 +540,6 @@ fn refuse_unsupported_forced_mode(source_url: &str, mode: Option<&str>) -> Resul
             "init: --mode {m}: {}",
             crate::config::non_sql_mode_refusal(st, m)
         ),
-        (Ok(crate::config::SourceType::Oracle), Some("cdc")) => {
-            anyhow::bail!("init: {}", crate::config::ORACLE_CDC_UNSUPPORTED)
-        }
         _ => Ok(()),
     }
 }
@@ -3117,18 +3114,11 @@ mod tests {
     }
 
     #[test]
-    fn init_refuses_oracle_cdc_with_the_loaders_exact_words() {
+    fn init_accepts_oracle_cdc_and_still_refuses_what_the_loader_refuses() {
         let ora = "oracle://rivet:rivet@h:1521/FREEPDB1";
-        assert_eq!(
-            refuse_unsupported_forced_mode(ora, Some("cdc"))
-                .unwrap_err()
-                .to_string(),
-            "init: `mode: cdc` is not supported for Oracle yet — use `mode: full`, `chunked` or \
-             `incremental`"
-        );
+        assert!(refuse_unsupported_forced_mode(ora, Some("cdc")).is_ok());
         assert!(refuse_unsupported_forced_mode(ora, Some("chunked")).is_ok());
-        assert!(refuse_unsupported_forced_mode(ora, None).is_ok());
-        assert!(refuse_unsupported_forced_mode("postgresql://h/db", Some("cdc")).is_ok());
+        assert!(refuse_unsupported_forced_mode("mongodb://h/db", Some("chunked")).is_err());
     }
 
     #[test]

@@ -1050,6 +1050,9 @@ omitting differ per engine — see cdc.md)",
             "      capture_instance: {}_{}  # sp_cdc_enable_table instance; needs CDC enabled + SQL Server Agent",
             info.schema, info.table
         )),
+        "oracle" => lines.push(format!(
+            "      # LogMiner (preview): the table needs ALTER TABLE {qualified_table} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS; the user is a common C## user"
+        )),
         _ => {}
     }
     lines.extend(destination_scaffold(info, source_type, dest, "cdc"));
@@ -1131,6 +1134,10 @@ fn cdc_multiplex_export_lines(
         "postgres" => lines.push(format!(
             "      slot: rivet_{}  # ONE logical slot for the whole stream; source needs wal_level=logical + a REPLICATION role",
             cdc_ident(&name).to_lowercase()
+        )),
+        // Like MySQL, the anchor is client-side: the checkpoint is the resume position.
+        "oracle" => lines.push(format!(
+            "      checkpoint: ./cdc/{name}.ckpt  # one resume position for the whole stream; every table needs ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS"
         )),
         _ => {}
     }

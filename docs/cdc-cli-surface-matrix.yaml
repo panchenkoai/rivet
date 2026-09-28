@@ -21,7 +21,7 @@
 # `mode: cdc` in a config is a DIFFERENT surface and is covered by cdc-matrix;
 # this ledger is only about the subcommand.
 
-engines: [postgres, mysql, mssql, mongo]
+engines: [postgres, mysql, mssql, mongo, oracle]
 
 flags:
   - id: "--source"
@@ -29,18 +29,21 @@ flags:
     mysql:    { test: "cdc_full_surface_cross_oracle_matches_literals and siblings" }
     mssql:    { test: "mssql_cdc_cli_path_case_only_table_mismatch_must_not_silently_drop_events" }
     mongo:    { test: "mongo_cdc_cli_writes_a_faithful_csv_of_the_document_column" }
+    oracle:   { test: "oracle_cdc_cli_resolves_the_source_from_env_and_file_alike" }
 
   - id: "--source-env"
     postgres: { gap: "resolution is engine-agnostic but only proven on mysql" }
     mysql:    { test: "mysql_cdc_cli_resolves_the_source_from_env_and_file_alike" }
     mssql:    { gap: "same" }
     mongo:    { gap: "same" }
+    oracle:   { test: "oracle_cdc_cli_resolves_the_source_from_env_and_file_alike — the change captured through --source-env is the same id the inline form captured" }
 
   - id: "--source-file"
     postgres: { gap: "resolution is engine-agnostic but only proven on mysql" }
     mysql:    { test: "mysql_cdc_cli_resolves_the_source_from_env_and_file_alike" }
     mssql:    { gap: "same" }
     mongo:    { gap: "same" }
+    oracle:   { test: "oracle_cdc_cli_resolves_the_source_from_env_and_file_alike" }
 
   - id: "--table"
     postgres: { test: "roast_pg_cdc_ndjson_until_current_terminates_and_emits_backlog drives it" }
@@ -52,6 +55,7 @@ flags:
                 NOTE the flag cannot be dropped on this path at all: the subcommand refuses
                 --output without exactly one --table (MEASURED), so the mutant that grades
                 this cell is a WRONG selection, not an absent flag" }
+    oracle:   { test: "oracle_cdc_cli_resolves_the_source_from_env_and_file_alike and oracle_cdc_cli_writes_csv_parts_and_stops_at_the_cap_on_a_commit" }
 
   - id: "--slot"
     postgres: { test: "roast_pg_cdc_ndjson_until_current_terminates_and_emits_backlog passes it" }
@@ -61,6 +65,7 @@ flags:
                 the flag is rejected for any other source" }
     mongo:    { na: "PostgreSQL-only: MongoDB anchors on a driver resume token, and the flag is
                 rejected for any other source" }
+    oracle:   { na: "PostgreSQL-only: Oracle anchors on the SCN pair in its checkpoint file, and the Oracle arm of the CLI dispatch never reads the flag" }
 
   - id: "--capture-instance"
     postgres: { na: "SQL Server-only: it names a `cdc.<instance>_CT` change table, which no
@@ -70,6 +75,7 @@ flags:
     mssql:    { test: "mssql_cdc_cli_path_case_only_table_mismatch_must_not_silently_drop_events" }
     mongo:    { na: "SQL Server-only: a change stream has no capture instance, and the flag is
                 rejected for any other source" }
+    oracle:   { na: "SQL Server-only: LogMiner reads the redo logs directly, there is no change table to name, and the Oracle arm of the CLI dispatch never reads the flag" }
 
   - id: "--server-id"
     postgres: { na: "MySQL-only: it is the replica identity a binlog dump registers under, and
@@ -77,6 +83,7 @@ flags:
     mysql:    { test: "mysql_cdc_cli_stream_with_a_cap_terminates_and_accepts_a_server_id" }
     mssql:    { na: "MySQL-only: no binlog, no dump registration — rejected for other sources" }
     mongo:    { na: "MySQL-only: no binlog, no dump registration — rejected for other sources" }
+    oracle:   { na: "MySQL-only: LogMiner registers no replica, and the Oracle arm of the CLI dispatch never reads the flag" }
 
   - id: "--checkpoint"
     postgres: { gap: "PG's anchor is the SLOT and the checkpoint file is only a boolean, so the
@@ -87,12 +94,14 @@ flags:
     mongo:    { test: "mongo_cdc_cli_writes_a_faithful_csv_of_the_document_column — RED-proven: with
                 --checkpoint dropped, run 2 re-anchors at the source's current position,
                 captures zero, and the sink writes no file" }
+    oracle:   { test: "oracle_cdc_cli_writes_csv_parts_and_stops_at_the_cap_on_a_commit — the capped-off commit arrives only because the second run resumes from the checkpoint the first wrote" }
 
   - id: "--output"
     postgres: { gap: "only proven on mysql and mssql" }
     mysql:    { test: "mysql_cdc_cli_csv_output_is_wired_and_readable" }
     mssql:    { test: "mssql_cdc_cli_path_case_only_table_mismatch_must_not_silently_drop_events" }
     mongo:    { test: "mongo_cdc_cli_writes_a_faithful_csv_of_the_document_column" }
+    oracle:   { test: "oracle_cdc_cli_writes_csv_parts_and_stops_at_the_cap_on_a_commit" }
 
   - id: "--format"
     postgres: { gap: "the writer is shared, but CSV vs parquet is re-selected per invocation" }
@@ -103,21 +112,25 @@ flags:
                 nothing to open. The document column is JSON, so this is the CSV writer's
                 hostile input; the oracle is DuckDB read_csv_auto + hard-coded expected
                 values, never the csv crate rivet writes with" }
+    oracle:   { test: "oracle_cdc_cli_writes_csv_parts_and_stops_at_the_cap_on_a_commit — read back by DuckDB read_csv_auto, never the csv crate rivet writes with" }
 
   - id: "--max-events"
     postgres: { gap: "the cap is applied in shared driver code but only proven on mysql" }
     mysql:    { test: "roast_mysql_cdc_cli_max_events_below_a_transaction_still_advances_the_checkpoint" }
     mssql:    { gap: "same" }
     mongo:    { gap: "same" }
+    oracle:   { test: "oracle_cdc_cli_writes_csv_parts_and_stops_at_the_cap_on_a_commit — two of three single-row commits, then the third on the next run" }
 
   - id: "--rollover"
     postgres: { gap: "only proven on mysql" }
     mysql:    { test: "roast_mysql_cdc_cli_rollover_keeps_transactions_whole_and_two_runs_do_not_clobber" }
     mssql:    { gap: "same" }
     mongo:    { gap: "same" }
+    oracle:   { test: "oracle_cdc_cli_writes_csv_parts_and_stops_at_the_cap_on_a_commit — rollover 1 cuts at least two parts" }
 
   - id: "--stream"
     postgres: { gap: "only proven on mysql" }
     mysql:    { test: "mysql_cdc_cli_stream_with_a_cap_terminates_and_accepts_a_server_id" }
     mssql:    { gap: "same" }
     mongo:    { gap: "same" }
+    oracle:   { test: "oracle_cdc_cli_writes_csv_parts_and_stops_at_the_cap_on_a_commit — a capped --stream run terminates (the Oracle drain is always bounded at the SCN current at open)" }

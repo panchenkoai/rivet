@@ -102,7 +102,10 @@ pub(super) fn collect(config: &Config, config_dir: &std::path::Path) -> Vec<Doct
         // Change streams: probe the replica-set requirement + declare the capture
         // fidelity tier (6.0+ pre/post-images vs current-state UpdateLookup).
         SourceType::Mongo => mongo_checks(&url, tls, &cdc, config_dir, &mut checks),
-        SourceType::Oracle => Err(anyhow::anyhow!("CDC is not supported for Oracle yet")),
+        #[cfg(feature = "oracle")]
+        SourceType::Oracle => oracle_checks(&url, tls, &cdc, config_dir, &mut checks),
+        #[cfg(not(feature = "oracle"))]
+        SourceType::Oracle => Err(crate::source::oracle_feature_missing()),
     };
     if let Err(e) = result {
         checks.push(probe_failed(&e));
@@ -809,6 +812,53 @@ fn mssql_checks(
 /// `watch()`) and the DECLARED capture-fidelity tier — so an operator learns
 /// before the run that a sub-6.0 server gives current-state post-images and
 /// key-only deletes, never discovering it as a silent null in the output.
+/// Oracle LogMiner: each export's checkpoint, then the table, logging and redo prerequisites.
+#[cfg(feature = "oracle")]
+fn oracle_checks(
+    url: &str,
+    tls: Option<&crate::config::TlsConfig>,
+    exports: &[&ExportConfig],
+    config_dir: &std::path::Path,
+    checks: &mut Vec<DoctorCheck>,
+) -> Result<()> {
+    for e in exports {
+        let Some(raw) = e.cdc.as_ref().and_then(|c| c.checkpoint.as_deref()) else {
+            continue;
+        };
+        let path = crate::source::cdc::resolve_checkpoint(raw, config_dir);
+        let name = format!("CDC checkpoint (export '{}')", e.name);
+        let problem = match crate::source::cdc::Position::load(&path) {
+            Ok(None) => None,
+            Ok(Some(pos)) => {
+                crate::source::oracle::cdc::checkpoint_problem(&pos, &path.display().to_string())
+            }
+            Err(why) => Some(why.to_string()),
+        };
+        let ok = problem.is_none();
+        checks.push(check(
+            name,
+            ok,
+            problem.or(Some("readable (or not written yet)".into())),
+            (!ok).then(|| "restore the file, or delete it to accept a fresh anchor".into()),
+        ));
+    }
+    let tables: Vec<String> = exports
+        .iter()
+        .flat_map(|e| e.table.iter().chain(e.tables.iter().flatten()).cloned())
+        .collect();
+    for (name, verdict) in crate::source::oracle::cdc::prerequisites(url, tls, &tables)? {
+        let ok = verdict.is_ok();
+        let detail = verdict.unwrap_or_else(|problem| problem);
+        checks.push(check(
+            name.into(),
+            ok,
+            Some(detail),
+            (!ok).then(|| "see the 'Oracle — LogMiner' section of docs/reference/cdc.md".into()),
+        ));
+    }
+    Ok(())
+}
+
 fn mongo_checks(
     url: &str,
     tls: Option<&crate::config::TlsConfig>,

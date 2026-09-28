@@ -91,6 +91,8 @@ mod live_cdc_mssql;
 mod live_cdc_multi_table_cycle;
 #[path = "live/live_cdc_oracle.rs"]
 mod live_cdc_oracle;
+#[path = "live/live_cdc_oracledb.rs"]
+mod live_cdc_oracledb;
 #[path = "live/live_cdc_property.rs"]
 mod live_cdc_property;
 #[path = "live/live_cdc_replica.rs"]

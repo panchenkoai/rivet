@@ -7,10 +7,6 @@ use super::{
     Config, DestinationType, ExportConfig, ExportMode, SourceType, overlapping_table_pair,
 };
 
-/// Why a `mode: cdc` export on Oracle is refused — shared by the config loader and `rivet init`.
-pub const ORACLE_CDC_UNSUPPORTED: &str =
-    "`mode: cdc` is not supported for Oracle yet — use `mode: full`, `chunked` or `incremental`";
-
 /// `until_current` defaults to `true` — the OSS model is the BOUNDED, scheduler-
 /// driven drain ("read to the log end and exit"). `until_current: false` is an
 /// explicit opt-in to the continuous model; making it the default would silently
@@ -750,9 +746,6 @@ impl Config {
         &self,
         export: &ExportConfig,
     ) -> crate::error::Result<()> {
-        if self.source.source_type == SourceType::Oracle {
-            anyhow::bail!("export '{}': {ORACLE_CDC_UNSUPPORTED}", export.name);
-        }
         match (&export.table, &export.tables) {
             (None, None) => anyhow::bail!(
                 "export '{}': cdc mode requires `table:` (or `tables:` for a \
@@ -1004,7 +997,7 @@ impl Config {
         if export.mode == ExportMode::Cdc
             && matches!(
                 self.source.source_type,
-                SourceType::Mongo | SourceType::Mysql
+                SourceType::Mongo | SourceType::Mysql | SourceType::Oracle
             )
             && export
                 .cdc

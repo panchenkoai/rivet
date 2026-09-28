@@ -36,7 +36,7 @@
 # is deliberate: the audit found the conformance gate's four engine columns were tied
 # to nothing, so a fifth CDC engine would have arrived with no row asking about it.
 
-engines: [postgres, mysql, mssql, mongo]
+engines: [postgres, mysql, mssql, mongo, oracle]
 
 shapes:
 
@@ -60,6 +60,7 @@ shapes:
         it. That seam also had to set the CONTAINER-visible path, not only the host one —
         the DuckDB oracle reads from inside a container and a resume destination it cannot
         see reads zero, which looks like data loss and is a harness bug." }
+    oracle: { sound: "oracle_cdc_crash_after_flush_before_ack (live_cdc_oracledb.rs) resumes into its own out2/. RED-proven 2026-09-28 with this shape's mutant (checkpoint + ack moved above the flush in roll_all): the resume captured [] where [(2, insert)] was owed." }
 
   - id: configured_identity_is_cross_checked_before_the_first_ack
     what: >
@@ -108,6 +109,7 @@ shapes:
         would break the legitimate start-the-stream-then-write setup. The SQL
         engines bail because their unroutable relation EXISTS and can never emit
         under the configured name — a permanent error, not a pending one."
+    oracle: { sound: "oracle_cdc_refuses_a_table_it_cannot_resolve_before_the_first_ack (live_cdc_oracledb.rs) — a real table beside a misspelled one. RED-proven 2026-09-28 by making resolve_tables skip an unresolvable name: the run still failed, but on the schema probe's ORA-00942 instead of the adapter's named refusal, so the test's message assertion went RED. Two guards stand here; the test pins the specific one." }
 
   - id: readback_is_manifest_scoped
     what: >
@@ -150,6 +152,8 @@ shapes:
         call sites are now duckdb_declared_distinct_set / duckdb_declared_rows, which
         read the manifest-declared parts; 43 Mongo live tests green across the
         4.4 / 5.0 / 8.0 stands afterwards."
+    oracle: { sound: "roast_oracle_cdc_large_transaction_is_atomic_across_a_mid_flush_crash (live_cdc_oracledb.rs) reads both legs through cdc_id_ops, which resolves declared parts only. RED-proven 2026-09-28 by publishing all but the last part in the pre-ack manifest." }
+
   - id: fold_fixture_crosses_its_threshold
     what: >
       Anything that FOLDS or accumulates across parts must be graded over >= 2 parts.
@@ -193,6 +197,8 @@ shapes:
         is the shared-seam/gap distinction the runner-coverage matrix draws — a feature applied
         by construction is `na`, a feature each engine must re-apply is a `gap`. The threshold
         rule itself is engine-agnostic for the same reason. Graded on mysql; see that cell.
+    oracle: { na: "na — the manifest fold lives in the SHARED sink (`build_manifest` over `s.parts`, src/source/cdc/sink.rs), not in the Oracle adapter: no engine can reach a different fold, so it is proven once on the fixture that drives it rather than once per engine" }
+
   - id: runs_the_engine_default_configuration
     what: >
       The stand must exercise the configuration an untuned production server has. A stand
@@ -228,6 +234,8 @@ shapes:
         earlier 'seed'), and self-skips out loud below server 6.0 where there is no pre-image
         to carry. RED against `ChangeOp::Delete => cse.full_document`; the pre-existing delete
         test stays GREEN against that same mutant, which is what made this a gap.
+    oracle: { na: "the positional (nameless) arm is unreachable on Oracle: every event carries image_names from ALL_TAB_COLS, so the sink maps by name. The engine default (no ALL COLUMNS supplemental logging) is not captured at all — the open refuses it, oracle_cdc_table_without_all_column_logging_is_refused (live_cdc_oracledb.rs)" }
+
   - id: unknown_input_fails_loud_not_silent
     what: >
       Every "unknown -> default" boundary must warn or bail, never degrade silently. The
@@ -281,6 +289,7 @@ shapes:
         roast_until_current_terminates_under_sustained_writes_and_keeps_backlog, which
         HANGS at its 30s ceiling when the bound is disabled — the exact state a silent
         None used to reach by accident."
+    oracle: { sound: "two boundaries in src/source/oracle/cdc.rs, both RED-proven 2026-09-28 by unit tests there: a checkpoint that parses but lacks an SCN is refused (a_checkpoint_round_trips_its_scns_and_identity_and_a_hollow_one_is_refused went RED when it was accepted as 0), and a column absent from the image its op carries is refused rather than written NULL (a_column_missing_from_the_image_its_op_carries_is_refused_not_nulled went RED when image_sides returned no side)" }
 
   - id: fault_hook_has_a_crash_test
     what: >
@@ -321,6 +330,8 @@ shapes:
         preconditions: an empty resume leg fails outright, RED-proven by deleting the resume
         run. Oracle is the UNION of both legs — crashing AFTER the checkpoint means the
         resume legitimately starts past what leg 1 covered.
+    oracle: { sound: "roast_oracle_cdc_large_transaction_is_atomic_across_a_mid_flush_crash crashes at cdc_after_ack and oracle_cdc_crash_after_flush_before_ack at cdc_after_flush_before_ack (live_cdc_oracledb.rs); with the hook made a no-op both went RED (2026-09-28)" }
+
   - id: the_test_asserts_its_own_fault_fired
     what: >
       A fault-injection test must assert the injected fault ACTUALLY fired. Otherwise a
@@ -394,6 +405,8 @@ shapes:
         every_toxiproxy_fault_injector_asserts_its_own_injection_landed
         (tests/offline/skip_is_not_a_pass_guard.rs). RED-proven by
         disabling the kill window (parts >= 99999) and by stripping one injector's assert.
+    oracle: { sound: "both Oracle crash tests assert the injected crash failed the run before reading anything (live_cdc_oracledb.rs); with maybe_panic_at made a no-op they go RED on exactly that assertion (measured 2026-09-28)" }
+
   - id: skip_is_not_a_pass
     what: >
       A test that SKIPS when its precondition is absent reports success. Where a CI job
@@ -460,6 +473,8 @@ shapes:
         found by RED-proving the guard rather than reading it, and the rewrite immediately
         surfaced four more sites including this engine's own standby test. RED-proven by
         reverting a site to its own words.
+    oracle: { sound: "the Oracle tests have no skip path: every one connects through the Rig's ORACLE_CDC_URL and fails when the stand cannot be reached. RED-proven 2026-09-28 by pointing that URL at port 1: oracle_cdc_resume_captures_only_new_changes (live_cdc_oracledb.rs) FAILED, it did not pass or skip" }
+
   - id: delete_semantics_are_end_to_end
     what: >
       Tombstones and the 'live current state is WHERE NOT __is_deleted' contract must be
@@ -479,6 +494,7 @@ shapes:
         delete (measured {_id:9,v:'doomed'}, not the earlier 'seed'). RED against
         `ChangeOp::Delete => cse.full_document` — and the disagreement is the finding: the
         pre-existing delete test stays GREEN against that same mutant." 
+    oracle: { na: "`rivet load` refuses an Oracle CDC stream in the preview (src/load/plan.rs::source_engine), so no __is_deleted is ever computed for it; the capture half — a DELETE carries its whole before-image — is oracle_cdc_update_and_delete_carry_full_types (live_cdc_oracledb.rs)" }
 
   - id: every_reading_of_one_config_agrees
     what: >
@@ -534,6 +550,7 @@ shapes:
         ({dotted, sibling} vs {dotted}), and with finalize's engine-blind split
         restored the snapshot leg's manifest records {schema: <db>, table: orders} —
         a different, existing collection. The database is not a schema."
+    oracle: { sound: "oracle_cdc_schema_qualified_table_config_captures_events (live_cdc_oracledb.rs) configures a LOWER-case `rivet.<table>`; the adapter, the schema probe and the snapshot leg all resolve it through Oracle's own fold (sql::oracle_catalog_preds / the server). RED-proven 2026-09-28 by making the adapter compare the raw string: the run refused the table as not found" }
 
   - id: spill_crash_mid_tail_atomicity
     what: "with RIVET_CDC_SPILL_DIR set, a transaction past the memory cap keeps its head in memory and its tail on disk — and a CRASH while that tail is being handed out must lose nothing on resume. The framing decides this: only the tail's true last row (per transaction) may carry `committed`, or the sink rolls + checkpoints past a commit whose remaining rows die with the crashed process's spill file"
@@ -546,3 +563,4 @@ shapes:
       sound: "roast_mssql_cdc_a_crash_mid_spilled_tail_loses_no_group_on_resume (live_cdc_mssql.rs) — the ONE engine where the window exists: its tail holds SEVERAL `__$start_lsn` groups, each group's last row a real commit, so the sink can roll + checkpoint + ack between spilled groups and crash before the rest. PER_TX=7 over rollover 5, because at 5 every roll lands on a group boundary and the early-close mutant 'commits' only where the checkpoint is accidentally legal (measured: two mutants green at PER_TX=5). RED: 19 of 21 rows, the checkpoint past a commit whose last two rows died with the process."
     mongo:
       na: "no transaction buffer exists to spill: every change-stream event is its own commit (`single_event_commit`), the sink may roll after any event, and the soak stand asserts the no-spill property as its CONTROL (`assert_cycle_spilled`, soak_spill.rs) — if Mongo ever grows a buffer, that assertion says the control stopped being one."
+    oracle: { na: "the Oracle adapter has no spill: a commit SCN group is buffered whole under RIVET_CDC_MAX_TX_ROWS / _BYTES and refused past them (within_tx_caps), and spill.rs is not wired to it, so no spilled tail can be split by a crash" }

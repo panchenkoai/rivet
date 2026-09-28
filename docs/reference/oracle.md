@@ -1,8 +1,9 @@
 # Oracle Database (source)
 
-> **Status: Preview — batch only.** Live-tested against Oracle AI Database 26ai Free
+> **Status: Preview.** Live-tested against Oracle AI Database 26ai Free
 > (release 23.26.3, `gvenzl/oracle-free:23-slim-faststart`, the stand's `oracle` compose service).
-> `mode: cdc` is refused at config load. The driver is Oracle's pure-Rust thin
+> `mode: cdc` reads the redo logs through LogMiner (preview; see the Oracle section of
+> [cdc.md](cdc.md) for the prerequisites). The driver is Oracle's pure-Rust thin
 > driver `oracledb 26.0.0-beta.4`; no Oracle client install is needed.
 
 ## Connecting
@@ -91,7 +92,9 @@ Parquet); dates before 1582-10-15 are not converted from Oracle's Julian calenda
 
 ## Known limits
 
-- No CDC yet (LogMiner is the planned mechanism).
+- CDC (LogMiner) is a preview: it captures NUMBER, FLOAT, BINARY_FLOAT/DOUBLE, DATE,
+  TIMESTAMP (every zone form), VARCHAR2/NVARCHAR2/CHAR/NCHAR and RAW columns, refuses
+  a table with any other type by name, and cannot be loaded with `rivet load` yet.
 - A table of exactly 1000 columns that has LOBs: the server-side empty-value flags
   would exceed Oracle's 1000-column select list, so zero-length LOBs read as NULL,
   with a warning.

@@ -11,6 +11,15 @@
   that died on the same host is taken over at once; one that died on another host blocks
   the next run until its lease expires (`RIVET_STATE_LEASE_TTL_S`, default 30 s). A SQLite
   state is unchanged. The previous release cannot open a v31 state DB.
+- **Oracle CDC (preview), through LogMiner.** `mode: cdc` on an Oracle source now mines the
+  redo logs from `CDB$ROOT` for the configured tables of one pluggable database
+  (ADR-0037), with no GoldenGate licence. A run drains to the SCN current at its start and
+  resumes from a checkpoint of two SCNs, so a transaction open across two runs arrives whole.
+  The checkpoint records the database, its incarnation and the PDB, and a run refuses one
+  from elsewhere. A checkpoint that needs a deleted archive is refused as a loss. Each captured
+  table needs `ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS`; a table without it, or with a type
+  the preview does not capture (LOBs among them), is refused by name. `rivet load` of an
+  Oracle stream is not supported yet.
 - **Two configs sharing a Postgres state DB no longer read each other's incremental cursor
   (state v30).** The cursor and the keyset crash anchor were keyed by the export name alone.
   Two configs with the same export name on one state DB — one template rolled out per

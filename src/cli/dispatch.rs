@@ -313,6 +313,10 @@ fn dispatch_cdc(a: CdcArgs) -> Result<()> {
                 canonical: false,
                 configured_tables: a.table.clone(),
             },
+            // LogMiner selects only the named tables, so `--table` is required in practice.
+            CdcEngine::Oracle => CdcEngineOpts::Oracle {
+                configured_tables: a.table.clone(),
+            },
         },
     };
     let Some(dir) = a.output else {

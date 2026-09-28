@@ -7,6 +7,7 @@
 //! reach it (`TIMESTAMP WITH TIME ZONE` holding a region name panics the driver).
 
 mod arrow_convert;
+pub(crate) mod cdc;
 mod kind;
 
 use kind::OraKind;

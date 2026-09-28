@@ -211,6 +211,16 @@ impl Rig {
         Self::new("oracle", super::env::ORACLE_URL, table)
     }
 
+    /// Oracle CDC (LogMiner) as the common capture user, over `RIVET.<table>` (the export is named `table`).
+    pub fn oracle_cdc(table: &str) -> Self {
+        let mut r = Self::new("oracle", super::env::ORACLE_CDC_URL, table);
+        r.tables = vec![format!("RIVET.{table}")];
+        r.mode = "cdc".to_string();
+        r.cdc_lines.push("until_current: true".into());
+        r.cdc_lines.push("__CKPT__".into()); // resolved at render time
+        r
+    }
+
     /// Mongo batch (standalone :27017). The db varies per test — chain
     /// `.source_url(&MongoTest::url(PORT, &db))`.
     pub fn mongo_batch(table: &str) -> Self {

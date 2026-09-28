@@ -33,7 +33,7 @@ use super::files_with_extension;
 /// Copying rather than moving: the caller still owns its directory and may
 /// assert on it afterwards. Test outputs here are kilobytes, and one DuckDB
 /// round trip is ~38 ms, so the copy is not the cost that matters.
-fn stage_for_duckdb(dir: &Path) -> String {
+pub fn stage_for_duckdb(dir: &Path) -> String {
     // ONE stable directory per THREAD, contents cleared — never a fresh
     // directory per call.
     //
@@ -463,15 +463,22 @@ fn reader(path: &Path) -> parquet::arrow::arrow_reader::ParquetRecordBatchReader
 
 /// The `i64` values of column `col` across every `.parquet` under `dir`, in row
 /// order (e.g. `__seq`, or a `BIGINT` data column).
+/// `name`, or its upper-case spelling — Oracle reports unquoted names upper-case.
+fn column_ci<'a>(
+    b: &'a arrow::record_batch::RecordBatch,
+    name: &str,
+) -> Option<&'a arrow::array::ArrayRef> {
+    b.column_by_name(name)
+        .or_else(|| b.column_by_name(&name.to_uppercase()))
+}
+
 pub fn dir_parquet_i64(dir: &Path, col: &str) -> Vec<i64> {
     use arrow::array::{Array, AsArray};
     let mut out = Vec::new();
     for path in files_with_extension(dir, "parquet") {
         for batch in reader(&path) {
             let batch = batch.unwrap();
-            let c = batch
-                .column_by_name(col)
-                .unwrap_or_else(|| panic!("column {col} present"));
+            let c = column_ci(&batch, col).unwrap_or_else(|| panic!("column {col} present"));
             let a = c
                 .as_primitive_opt::<arrow::datatypes::Int64Type>()
                 .unwrap_or_else(|| panic!("{col} decodes as Int64"));
@@ -679,6 +686,7 @@ pub enum CdcEngine {
     MySql,
     Postgres,
     SqlServer,
+    Oracle,
 }
 
 /// The parts the manifest(s) under `dir` DECLARE as committed — what a consumer
@@ -787,9 +795,7 @@ pub fn read_cdc_changes(dir: &Path) -> Vec<CdcChange> {
             // Int32 OR Int64 → i64: an `INT` source column lands as Int32 in
             // the CDC parquet; the original Int64-only downcast panicked on it.
             let col_i64 = |name: &str| -> Vec<i64> {
-                let col = b
-                    .column_by_name(name)
-                    .unwrap_or_else(|| panic!("{name} column present"));
+                let col = column_ci(&b, name).unwrap_or_else(|| panic!("{name} column present"));
                 match col.data_type() {
                     arrow::datatypes::DataType::Int64 => col
                         .as_primitive::<arrow::datatypes::Int64Type>()
@@ -867,6 +873,10 @@ fn pos_u128(engine: CdcEngine, pos: &str) -> u128 {
             let lsn = j["lsn"].as_str().expect("__pos.lsn");
             u128::from_str_radix(lsn, 16).expect("lsn hex")
         }
+        CdcEngine::Oracle => j["commit_scn"]
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .expect("__pos.commit_scn"),
     }
 }
 
