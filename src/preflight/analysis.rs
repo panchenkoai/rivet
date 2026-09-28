@@ -169,6 +169,46 @@ pub(crate) fn preflight_base_table<'a>(
         .or_else(|| super::postgres::table_from_simple_query(base_query))
 }
 
+/// Whether a single-table query returns every row of its table (no filter, grouping, set, join or row cap).
+pub(crate) fn reads_every_row(query: &str) -> bool {
+    let q = format!(
+        " {} ",
+        query
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase()
+    );
+    ![
+        " where ",
+        " group by ",
+        " having ",
+        " union ",
+        " intersect ",
+        " except ",
+        " minus ",
+        " join ",
+        " distinct ",
+        " top ",
+        " top(",
+        " offset ",
+        " fetch ",
+        " connect by ",
+        " sample",
+        " tablesample",
+    ]
+    .iter()
+    .any(|kw| q.contains(kw))
+}
+
+/// `base_table` when the query reads all of it, so catalog stats and bare-table MIN/MAX describe the export.
+pub(crate) fn whole_table_relation<'a>(
+    base_table: Option<&'a str>,
+    base_query: &str,
+) -> Option<&'a str> {
+    base_table.filter(|_| reads_every_row(base_query))
+}
+
 /// The table an engine runs its single-int-PK probe against — `Some` ONLY when
 /// the planner would actually auto-resolve this export's chunk column
 /// ([`should_auto_resolve_chunk_pk`]) and the base relation is known. The gate
@@ -1141,6 +1181,39 @@ pub(crate) fn assemble_diagnostic(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_a_whole_table_read_may_borrow_the_tables_stats() {
+        use crate::preflight::table_from_simple_query;
+        let whole = |q: &str| {
+            let t = table_from_simple_query(q).map(|c| c.into_owned());
+            whole_table_relation(t.as_deref(), q).map(str::to_string)
+        };
+        for q in [
+            "SELECT * FROM dbo.orders",
+            "SELECT id, amount FROM dbo.orders",
+            "SELECT [id], [amount]\nFROM [dbo].[orders]",
+            "SELECT \"ID\", \"NAME\"\nFROM \"RIVET\".\"ORDERS\"",
+        ] {
+            assert!(whole(q).is_some(), "reads every row: {q}");
+        }
+        for q in [
+            "SELECT id, amount FROM dbo.orders WHERE tenant_id = 7",
+            "SELECT TOP 100 * FROM dbo.orders",
+            "SELECT TOP(100) id FROM dbo.orders",
+            "SELECT DISTINCT id FROM dbo.orders",
+            "SELECT id FROM dbo.orders ORDER BY id OFFSET 10 ROWS",
+            "SELECT a FROM t FETCH FIRST 5 ROWS ONLY",
+            "SELECT id FROM dbo.orders TABLESAMPLE (10 PERCENT)",
+            "SELECT id, count(*) FROM dbo.orders GROUP BY id",
+        ] {
+            assert!(
+                table_from_simple_query(q).is_some(),
+                "probe relation still resolves: {q}"
+            );
+            assert_eq!(whole(q), None, "a subset must not borrow table stats: {q}");
+        }
+    }
+
     /// Round-10: the runtime sparse warning names `chunk_count: N` as its
     /// escape — check must stop alarming on the config that took it. RED
     /// against removing the chunk_count arm from the exemption chain.

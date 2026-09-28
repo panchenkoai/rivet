@@ -56,7 +56,7 @@ fn diagnose_oracle(conn: &mut OracleSource, export: &ExportConfig) -> Result<Exp
     let base_table = base_table_owned.as_deref();
     // Values describe the relation only when the export reads it whole; counts need only no row filter.
     let whole_table = strip_select_star_from(base_query);
-    let unfiltered_table = base_table.filter(|_| reads_every_row(base_query));
+    let unfiltered_table = whole_table_relation(base_table, base_query);
     for col in key_columns(export) {
         if let Some(fail) = key_column_fail_oracle(conn, base_query, base_table, col) {
             return Err(fail);
@@ -125,33 +125,6 @@ fn diagnose_oracle(conn: &mut OracleSource, export: &ExportConfig) -> Result<Exp
             db_max_connections,
         },
     ))
-}
-
-/// Whether a single-table query returns every row of its table (no filter, grouping, set or join).
-fn reads_every_row(query: &str) -> bool {
-    let q = format!(
-        " {} ",
-        query
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .to_lowercase()
-    );
-    ![
-        " where ",
-        " group by ",
-        " having ",
-        " union ",
-        " intersect ",
-        " minus ",
-        " join ",
-        " distinct ",
-        " fetch ",
-        " connect by ",
-        " sample",
-    ]
-    .iter()
-    .any(|kw| q.contains(kw))
 }
 
 /// Validate the query's relations by parsing it; a missing table/column
@@ -314,18 +287,6 @@ mod tests {
         let min = range_bound_sql("MIN", "\"ID\"", "ORDERS");
         assert_eq!(min, "SELECT TO_CHAR(MIN(\"ID\")) AS rivet_agg FROM ORDERS");
         assert!(!min.contains("MAX"));
-    }
-
-    #[test]
-    fn a_column_list_without_a_filter_reads_every_row() {
-        assert!(reads_every_row(
-            "SELECT \"ID\", \"NAME\"\nFROM \"RIVET\".\"ORDERS\""
-        ));
-        assert!(!reads_every_row(
-            "SELECT ID + 1 AS ID FROM ORDERS WHERE ID > 5"
-        ));
-        assert!(!reads_every_row("select distinct a from t"));
-        assert!(!reads_every_row("SELECT a FROM t FETCH FIRST 5 ROWS ONLY"));
     }
 
     #[test]

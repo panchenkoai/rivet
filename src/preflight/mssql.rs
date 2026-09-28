@@ -13,7 +13,7 @@
 //! - **row estimate** — `SUM(rows)` from the `sys.partitions` catalog
 //!   (heap/clustered index, `index_id IN (0,1)`), the exact SQL `rivet init`
 //!   and `introspect_mssql_on` already run; `None` when the base
-//!   query is not a simple single-table read (joins, subqueries, inline SQL).
+//!   query does not read every row of one table (a filter, TOP, join, subquery).
 //! - **cursor / range min-max** — `MIN`/`MAX` of the cursor/chunk column for
 //!   incremental/chunked modes, surfaced as the `Cursor range` line.
 //! - **`uses_index`** — an honest catalog probe: is the range/cursor column the
@@ -94,6 +94,8 @@ fn diagnose_mssql(conn: &mut MssqlSource, export: &ExportConfig) -> Result<Expor
         .map(std::borrow::Cow::Borrowed)
         .or_else(|| table_from_simple_query(base_query));
     let base_table = base_table_owned.as_deref();
+    // Catalog counts and bare-table MIN/MAX describe the export only when it reads every row.
+    let unfiltered_table = whole_table_relation(base_table, base_query);
 
     // build_plan auto-resolves an UNSET chunked chunk_column to the single-integer PK, and
     // `auto_pk_probe_target` is that gate — so range_col / the strategy label / the index
@@ -107,27 +109,24 @@ fn diagnose_mssql(conn: &mut MssqlSource, export: &ExportConfig) -> Result<Expor
 
     // Row estimate from the `sys.partitions` catalog — the same fast,
     // no-`COUNT(*)` probe `rivet init` and `introspect_mssql_on`
-    // run. `None` (printer omits the line) when the base relation is unknown or
-    // the stats row is absent.
-    let row_estimate = match base_table {
-        Some(table) => row_estimate_mssql(conn, table),
-        None => None,
-    };
+    // run. `None` (printer omits the line) when the query does not read the whole
+    // table or the stats row is absent.
+    let row_estimate = unfiltered_table.and_then(|table| row_estimate_mssql(conn, table));
 
     // Average bytes/row from the `dm_db_partition_stats` DMV — feeds the
-    // oversized-chunk warning. `None` when the base relation is unknown.
-    let avg_row_bytes = base_table.and_then(|table| avg_row_bytes_mssql(conn, table));
+    // oversized-chunk warning. `None` unless the query reads the whole table.
+    let avg_row_bytes = unfiltered_table.and_then(|table| avg_row_bytes_mssql(conn, table));
 
     // Cursor / chunk range. Incremental mode orders on the (possibly COALESCE'd)
     // key expression; chunked/cursor modes take MIN/MAX of the range column.
     let (range_min, range_max) = if export.mode == ExportMode::Incremental {
         match incremental_key_expr(export, SourceType::Mssql) {
-            Some(expr) => range_min_max_mssql(conn, base_query, base_table, &expr),
+            Some(expr) => range_min_max_mssql(conn, base_query, unfiltered_table, &expr),
             None => (None, None),
         }
     } else if let Some(col) = range_col {
         let expr = crate::sql::quote_ident(SourceType::Mssql, col);
-        range_min_max_mssql(conn, base_query, base_table, &expr)
+        range_min_max_mssql(conn, base_query, unfiltered_table, &expr)
     } else {
         (None, None)
     };
@@ -260,7 +259,7 @@ fn avg_row_bytes_mssql(conn: &mut MssqlSource, qualified_table: &str) -> Option<
 
 /// `MIN`/`MAX` of `expr` over the export's base relation, as display strings.
 ///
-/// When the base query is a simple `SELECT … FROM <table>` we run
+/// When the base query reads every row of `<table>` we run
 /// `MIN/MAX … FROM <table>` directly (no subquery wrap); otherwise we wrap the
 /// user's query as a derived table so the bounds still come from exactly the
 /// rows the export reads. `CONVERT(varchar(64), …)` renders any orderable type
