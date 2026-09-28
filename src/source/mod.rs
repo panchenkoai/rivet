@@ -519,7 +519,17 @@ pub(crate) fn describe_connect_error(url: &str, err: anyhow::Error) -> anyhow::E
     } else {
         return err;
     };
-    anyhow::anyhow!("{hint} (driver: {err:#})")
+    anyhow::Error::msg(UnreachableTarget(format!("{hint} (driver: {err:#})")))
+}
+
+/// A connect that never reached the server, named by host:port — rivet's own verdict, so no setup hint goes in front.
+#[derive(Debug)]
+pub(crate) struct UnreachableTarget(String);
+
+impl std::fmt::Display for UnreachableTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
 /// The `(host, port)` of a connection URL; the port is empty when the URL has none.

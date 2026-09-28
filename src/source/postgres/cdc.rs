@@ -22,7 +22,7 @@
 
 use std::collections::VecDeque;
 
-use postgres::{Client, NoTls};
+use postgres::Client;
 use serde_json::json;
 
 use crate::config::TlsConfig;
@@ -30,7 +30,6 @@ use crate::error::Result;
 use crate::source::cdc::spill::{SpillFile, SpooledTx};
 use crate::source::cdc::value::RivetValue;
 use crate::source::cdc::{ChangeEvent, ChangeOp, ChangeStream, DrainMode, Position};
-use crate::source::require_tls_or_loopback;
 
 /// Polls a logical slot and yields canonical changes.
 pub(crate) struct PgChangeStream {
@@ -572,23 +571,8 @@ impl PgChangeStream {
         configured_tables: &[String],
         spill_dir: Option<&std::path::Path>,
     ) -> Result<Self> {
-        // Same gate the batch path uses: refuse remote plaintext (CWE-319), and
-        // use a verifying TLS connector when a TlsConfig is enforced.
-        require_tls_or_loopback(conn_str, tls)?;
-        let mut client = match tls {
-            Some(cfg) if cfg.mode.is_enforced() => {
-                let connector = crate::source::tls::build_native_tls(cfg)?;
-                // Force ssl_mode(Require) like the batch path — otherwise
-                // tokio-postgres picks TLS from the URL's sslmode and a
-                // `?sslmode=disable` (or a `prefer` downgrade) ships the CDC
-                // stream in cleartext, ignoring the connector we just built
-                // (roast 2026-08-09: the batch leg was fixed, the CDC leg was
-                // not — the exact posture verify-full is asked to forbid).
-                super::pg_config_ssl_forced(conn_str)?
-                    .connect(postgres_native_tls::MakeTlsConnector::new(connector))?
-            }
-            _ => Client::connect(conn_str, NoTls)?,
-        };
+        // The batch dial: the plaintext gate, the forced-ssl connector, and a host:port-naming error.
+        let mut client = super::connect_client_raw(conn_str, tls)?;
         // test_decoding renders values as TEXT in the polling SESSION's format, so
         // pin the formats this reader's parser assumes — otherwise a non-default
         // database `datestyle` (e.g. 'German, DMY') nulls every timestamp and a
@@ -2299,6 +2283,7 @@ mod tests {
     }
 
     use super::*;
+    use postgres::NoTls;
 
     /// The TRUNCATE recogniser and its addressing, graded offline.
     ///

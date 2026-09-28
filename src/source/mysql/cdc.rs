@@ -21,7 +21,7 @@ use std::path::Path;
 use mysql::binlog::events::{EventData, RowsEventData, TableMapEvent};
 use mysql::binlog::value::BinlogValue;
 use mysql::prelude::Queryable;
-use mysql::{BinlogDumpFlags, BinlogRequest, BinlogStream, Conn, Opts, OptsBuilder};
+use mysql::{BinlogDumpFlags, BinlogRequest, BinlogStream, Conn};
 use serde_json::{Value as Json, json};
 
 use crate::config::TlsConfig;
@@ -29,7 +29,6 @@ use crate::error::Result;
 use crate::source::cdc::checkpoint_identity::IdentityVerdict;
 use crate::source::cdc::value::RivetValue;
 use crate::source::cdc::{ChangeEvent, ChangeOp, ChangeStream, DrainMode, Position};
-use crate::source::require_tls_or_loopback;
 
 /// A blocking iterator of canonical [`ChangeEvent`]s over a MySQL binlog stream.
 ///
@@ -1517,18 +1516,9 @@ fn binlog_compression_is_on(raw: Option<&str>) -> bool {
     )
 }
 
-/// Connect a MySQL `Conn`, applying the same TLS gate the batch path uses —
-/// refuse remote plaintext (CWE-319), and map an enforced `TlsConfig` to the
-/// driver's SSL options (`super::build_mysql_ssl_opts`).
+/// Dial through the batch path's [`super::dial_conn`], then refuse a proxy that cannot carry the binlog.
 fn connect_conn(url: &str, tls: Option<&TlsConfig>) -> Result<Conn> {
-    require_tls_or_loopback(url, tls)?;
-    let mut conn = match tls {
-        Some(cfg) if cfg.mode.is_enforced() => Conn::new(
-            OptsBuilder::from_opts(Opts::from_url(url)?)
-                .ssl_opts(Some(super::build_mysql_ssl_opts(cfg))),
-        )?,
-        _ => Conn::new(Opts::from_url(url)?)?,
-    };
+    let mut conn = super::dial_conn(url, tls)?;
     // CDC streams the binlog (COM_BINLOG_DUMP) — a replication protocol that
     // ProxySQL / MaxScale / transaction-mode multiplexers do not carry. Detect the
     // proxy here and fail with the fix, not a cryptic dump-protocol error or a hang.
@@ -2688,6 +2678,7 @@ mod tests {
     }
 
     use super::*;
+    use mysql::Opts;
 
     /// The compression guard's decision, offline. Anything unrecognized — an
     /// absent variable (pre-8.0.20, MariaDB), an empty reply, a shape we did

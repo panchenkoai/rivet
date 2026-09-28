@@ -74,8 +74,12 @@ impl PostgresSource {
     /// Connect with no transport security (legacy path). Prefer [`Self::connect_with_tls`]
     /// for production workloads so credentials and result sets are not visible on the wire.
     pub fn connect(url: &str) -> Result<Self> {
-        let mut client = Client::connect(url, NoTls)
-            .map_err(|e| crate::source::describe_connect_error(url, e.into()))?;
+        Self::connect_with_tls(url, None)
+    }
+
+    /// Connect honoring the user's [`TlsConfig`] through the shared dial, warning on a transaction pooler.
+    pub fn connect_with_tls(url: &str, tls: Option<&TlsConfig>) -> Result<Self> {
+        let mut client = connect_client_raw(url, tls)?;
         let transaction_pooler = pin_session_formats(&mut client)?;
         if transaction_pooler {
             log::warn!(
@@ -88,36 +92,6 @@ impl PostgresSource {
             client,
             transaction_pooler,
         })
-    }
-
-    /// Connect honoring the user's [`TlsConfig`]. When `tls.mode` is
-    /// [`TlsMode::Disable`] this falls back to [`Self::connect`].
-    pub fn connect_with_tls(url: &str, tls: Option<&TlsConfig>) -> Result<Self> {
-        // Refuse remote plaintext (no `tls:` block) before any dial (CWE-319).
-        crate::source::require_tls_or_loopback(url, tls)?;
-        match tls {
-            Some(cfg) if cfg.mode.is_enforced() => {
-                let connector = build_native_tls(cfg)?;
-                let make_tls = postgres_native_tls::MakeTlsConnector::new(connector);
-                // Forced ssl_mode overrides the URL's sslmode; see connect_client.
-                let mut client = pg_config_ssl_forced(url)?
-                    .connect(make_tls)
-                    .map_err(|e| crate::source::describe_connect_error(url, e.into()))?;
-                let transaction_pooler = pin_session_formats(&mut client)?;
-                if transaction_pooler {
-                    log::warn!(
-                        "transaction-mode connection pooler detected (pgBouncer/Odyssey) — \
-                         SET LOCAL tuning is transaction-scoped; \
-                         LISTEN/NOTIFY and advisory locks are unavailable"
-                    );
-                }
-                Ok(Self {
-                    client,
-                    transaction_pooler,
-                })
-            }
-            _ => Self::connect(url),
-        }
     }
 }
 
@@ -526,7 +500,7 @@ pub(crate) fn connect_client(url: &str, tls: Option<&TlsConfig>) -> Result<Clien
 }
 
 /// Dial `url` honoring the TLS policy, with the server's own session defaults.
-fn connect_client_raw(url: &str, tls: Option<&TlsConfig>) -> Result<Client> {
+pub(crate) fn connect_client_raw(url: &str, tls: Option<&TlsConfig>) -> Result<Client> {
     // Refuse remote plaintext (no `tls:` block) before any dial (CWE-319).
     crate::source::require_tls_or_loopback(url, tls)?;
     match tls {

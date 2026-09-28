@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use arrow::datatypes::Schema;
 use mysql::prelude::*;
-use mysql::{Opts, OptsBuilder, Pool, PoolConstraints, PoolOpts, SslOpts};
+use mysql::{Conn, Opts, OptsBuilder, Pool, PoolConstraints, PoolOpts, SslOpts};
 
 use crate::config::{SourceType, TlsConfig, TlsMode};
 use crate::error::Result;
@@ -160,18 +160,32 @@ impl MysqlSource {
 pub(crate) fn connect_pool(url: &str, tls: Option<&TlsConfig>) -> Result<Pool> {
     // Refuse remote plaintext (no `tls:` block) before any dial (CWE-319).
     crate::source::require_tls_or_loopback(url, tls)?;
-    let builder = OptsBuilder::from_opts(Opts::from_url(url)?).pool_opts(lean_pool_opts());
-    let opts = match tls {
-        Some(cfg) if cfg.mode.is_enforced() => {
-            Opts::from(builder.ssl_opts(Some(build_mysql_ssl_opts(cfg))))
-        }
-        _ => Opts::from(builder),
-    };
+    let opts = with_tls(
+        OptsBuilder::from_opts(Opts::from_url(url)?).pool_opts(lean_pool_opts()),
+        tls,
+    );
     let pool = Pool::new(opts).map_err(|e| crate::source::describe_connect_error(url, e.into()))?;
     // Dial now, so a wrong host or port fails here with its name and not at the first query.
     pool.get_conn()
         .map_err(|e| crate::source::describe_connect_error(url, e.into()))?;
     Ok(pool)
+}
+
+/// Dial one MySQL `Conn` under the same TLS gate and host:port-naming error as [`connect_pool`].
+pub(crate) fn dial_conn(url: &str, tls: Option<&TlsConfig>) -> Result<Conn> {
+    crate::source::require_tls_or_loopback(url, tls)?;
+    let opts = with_tls(OptsBuilder::from_opts(Opts::from_url(url)?), tls);
+    Conn::new(opts).map_err(|e| crate::source::describe_connect_error(url, e.into()))
+}
+
+/// Apply an enforced [`TlsConfig`] to the driver's SSL options; anything else stays plaintext.
+fn with_tls(builder: OptsBuilder, tls: Option<&TlsConfig>) -> Opts {
+    match tls {
+        Some(cfg) if cfg.mode.is_enforced() => {
+            Opts::from(builder.ssl_opts(Some(build_mysql_ssl_opts(cfg))))
+        }
+        _ => Opts::from(builder),
+    }
 }
 
 /// Threshold above which `AVG_ROW_LENGTH` is treated as inflated by InnoDB BLOB

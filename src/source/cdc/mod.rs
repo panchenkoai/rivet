@@ -1142,6 +1142,8 @@ fn with_setup_hint(e: anyhow::Error, hint: &'static str) -> anyhow::Error {
     let rendered = format!("{e:#}");
     if e.downcast_ref::<crate::source::TlsHandshakeFailed>()
         .is_some()
+        || e.downcast_ref::<crate::source::UnreachableTarget>()
+            .is_some()
     {
         return e;
     }
@@ -2293,6 +2295,66 @@ mod setup_hint {
              handshake: server does not support TLS"
         );
         assert!(!crate::pipeline::retry::classify_error(&e).is_transient());
+    }
+
+    /// Asserts a CDC open against a refused loopback port leads with the port, not the setup hint.
+    fn assert_names_refused_port(open: anyhow::Result<()>, hint: &'static str) {
+        let e = open.expect_err("nothing listens on 127.0.0.1:1");
+        let shown = format!("{:#}", super::with_setup_hint(e, hint));
+        assert!(
+            shown.starts_with("nothing is listening on 127.0.0.1:1"),
+            "a refused port must be named first, not buried behind a setup hint. Got: {shown}"
+        );
+    }
+
+    #[test]
+    fn pg_cdc_open_names_the_refused_port() {
+        let open = crate::source::postgres::cdc::PgChangeStream::open(
+            "postgresql://u:p@127.0.0.1:1/db",
+            "s",
+            false,
+            None,
+            super::PeekBound::Unbounded,
+            super::DrainMode::Continuous,
+            &[],
+            None,
+        );
+        assert_names_refused_port(open.map(drop), super::PG_CDC_HINT);
+    }
+
+    #[test]
+    fn mysql_cdc_open_names_the_refused_port() {
+        let open = crate::source::mysql::cdc::MysqlChangeStream::open_or_resume(
+            "mysql://u:p@127.0.0.1:1/db",
+            1,
+            None,
+            super::DrainMode::Continuous,
+            None,
+            vec![],
+            None,
+        );
+        assert_names_refused_port(open.map(drop), super::MYSQL_CDC_HINT);
+    }
+
+    #[test]
+    fn mssql_cdc_open_names_the_refused_port() {
+        let open = crate::source::mssql::cdc::MssqlChangeStream::from_url(
+            "sqlserver://u:p@127.0.0.1:1/db",
+            "dbo_t",
+            crate::source::mssql::cdc::resume_from_checkpoint(None, "").unwrap(),
+            None,
+            super::PeekBound::Unbounded,
+            super::DrainMode::Continuous,
+            &[],
+            None,
+        );
+        assert_names_refused_port(open.map(drop), super::MSSQL_CDC_HINT);
+    }
+
+    #[test]
+    fn tiberius_config_dials_the_host_and_port_it_was_given() {
+        let c = crate::source::mssql::tiberius_config("db.example", 14330, "d", "u", "p", None);
+        assert_eq!(c.get_addr(), "db.example:14330");
     }
 }
 

@@ -335,7 +335,7 @@ exclude_re = [
     # The DECISION whether an MSSQL TLS posture trusts an unverified cert lives
     # in `mssql_trusts_cert_without_verify`, unit-tested in both directions and
     # RED-proven (Require/VerifyFull/accept_invalid combos). The match GUARD at
-    # its call site (`connect_with_tls`) takes a live `tiberius::Config` and only
+    # its call site (`tiberius_config`) builds a `tiberius::Config` whose trust knobs are private and only
     # matters against a real TLS handshake — there is no offline caller, so the
     # `guard -> true`/`-> false` mutant is unkillable HERE by construction. It is
     # live-guarded by the blessed-path `init --tls` + MSSQL connect scenarios.
@@ -413,7 +413,7 @@ exclude_re = [
     # (.github/scripts/mutants_exclusions.py), which fails when an exclusion
     # matches no real mutant.
     "replace < with <= in Governor::decision_cause",
-    "replace match guard mssql_trusts_cert_without_verify\\(cfg\\) with (true|false) in MssqlSource::connect_with_tls",
+    "replace match guard mssql_trusts_cert_without_verify\\(cfg\\) with (true|false) in tiberius_config",
     # ── the `rivet load` ORCHESTRATOR (src/load/orchestrate.rs) ──────────────
     # `run_loads` → `load_one*` → `execute_load` → `prepare_load` is the whole
     # warehouse-load script, live-only end to end: it opens a real state DB,

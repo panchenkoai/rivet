@@ -26,9 +26,9 @@ use std::collections::VecDeque;
 
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use serde_json::json;
-use tiberius::{AuthMethod, Client, ColumnData, Config, EncryptionLevel, Row};
+use tiberius::{Client, ColumnData, Row};
 use tokio::net::TcpStream;
-use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
+use tokio_util::compat::Compat;
 
 use crate::config::TlsConfig;
 use crate::error::Result;
@@ -1359,28 +1359,15 @@ async fn connect(
     cfg: &MssqlCdcConfig,
     tls: Option<&TlsConfig>,
 ) -> Result<Client<Compat<TcpStream>>> {
-    let mut config = Config::new();
-    config.host(&cfg.host);
-    config.port(cfg.port);
-    config.database(&cfg.database);
-    config.authentication(AuthMethod::sql_server(&cfg.user, &cfg.password));
-    config.encryption(EncryptionLevel::Required);
-    // Gate trust_cert exactly as the batch MssqlSource does: verify the chain by
-    // default (no trust_cert); trust the named CA when given; accept-any only for
-    // an explicit disable / accept-invalid, or for loopback (None — the
-    // require_tls_or_loopback gate already ensured a remote host carries a tls block).
-    match tls {
-        Some(c) if crate::source::mssql::mssql_trusts_cert_without_verify(c) => config.trust_cert(),
-        Some(c) => {
-            if let Some(ca) = &c.ca_file {
-                config.trust_cert_ca(ca);
-            }
-        }
-        None => config.trust_cert(),
-    }
-    let tcp = TcpStream::connect(config.get_addr()).await?;
-    tcp.set_nodelay(true)?;
-    Ok(Client::connect(config, tcp.compat_write()).await?)
+    let config = crate::source::mssql::tiberius_config(
+        &cfg.host,
+        cfg.port,
+        &cfg.database,
+        &cfg.user,
+        &cfg.password,
+        tls,
+    );
+    crate::source::mssql::dial(config, &format!("mssql://{}:{}", cfg.host, cfg.port)).await
 }
 
 /// Persist the database's CURRENT max LSN to `ckpt` — the anchor for

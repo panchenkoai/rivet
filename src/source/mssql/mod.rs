@@ -158,6 +158,83 @@ fn pct_decode(s: &str) -> String {
         .into_owned()
 }
 
+/// The tiberius `Config` for a login, with the shared TLS policy mapped onto its cert-trust knobs.
+pub(crate) fn tiberius_config(
+    host: &str,
+    port: u16,
+    database: &str,
+    user: &str,
+    password: &str,
+    tls: Option<&TlsConfig>,
+) -> Config {
+    let mut config = Config::new();
+    config.host(host);
+    config.port(port);
+    config.database(database);
+    config.authentication(AuthMethod::sql_server(user, password));
+
+    // SQL Server forces TLS on the login handshake regardless; map the
+    // shared TlsConfig onto tiberius' cert-trust knobs. A private CA goes
+    // through `trust_cert_ca`; otherwise dev self-signed certs need
+    // `trust_cert` (accept-invalid). Default keeps full verification.
+    config.encryption(EncryptionLevel::Required);
+    match tls {
+        // `mode: disable` is the operator's explicit opt-in to an
+        // unauthenticated (trust-any-cert) connection — the SQL Server
+        // analogue of PG/MySQL remote plaintext. It is the documented way
+        // to keep trust-cert against a remote host the plaintext gate would
+        // otherwise have refused.
+        Some(cfg) if mssql_trusts_cert_without_verify(cfg) => config.trust_cert(),
+        Some(cfg) => {
+            // Strict cert validation is ON here (mode verify-ca/verify-full,
+            // no accept_invalid_certs). The TLS backend is OpenSSL
+            // (vendored-openssl via tiberius — see Cargo.toml), NOT
+            // rustls-webpki, so there is no CA name-constraint advisory to
+            // warn about: OpenSSL validates the chain against the trusted CA
+            // (and, for verify-full, the hostname) and rejects a certificate
+            // that does not chain to it (verified against a private-CA-
+            // configured SQL Server: the correct CA connects; a wrong CA is
+            // refused with OpenSSL `certificate verify failed`).
+            if let Some(ca) = cfg.ca_file.as_deref() {
+                config.trust_cert_ca(ca);
+            }
+        }
+        None => {
+            // Reached only for a LOOPBACK host (the require_tls_or_loopback gate refuses a
+            // remote host with no `tls:` block). On loopback, tiberius
+            // trusts the server certificate without verifying issuer or
+            // hostname: the handshake is encrypted but unauthenticated. That
+            // is safe here because the bytes never leave the box, and it
+            // keeps dev / self-signed docker setups working without opt-in.
+            // Warn once, naming the config key that turns on strict
+            // validation.
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                log::warn!(
+                    "mssql: connecting with TLS certificate validation disabled \
+                     (no `source.tls:` block) — the connection is encrypted but the \
+                     server certificate is not verified (MITM not detected). Add \
+                     `source.tls: {{ mode: verify-full, ca_file: <ca.pem> }}` to enable \
+                     strict validation (or `mode: verify-ca` to skip only hostname checks)."
+                );
+            });
+            config.trust_cert();
+        }
+    }
+    config
+}
+
+/// Open TCP to `config`'s address and log in; a refused or unresolvable address names `at`.
+pub(crate) async fn dial(config: Config, at: &str) -> Result<MssqlClient> {
+    let tcp = TcpStream::connect(config.get_addr()).await.map_err(|e| {
+        crate::source::describe_connect_error(at, anyhow::anyhow!("mssql: TCP connect failed: {e}"))
+    })?;
+    tcp.set_nodelay(true).ok();
+    Client::connect(config, tcp.compat_write())
+        .await
+        .map_err(|e| anyhow::anyhow!("mssql: login failed: {e}"))
+}
+
 /// Does this TLS posture mean "encrypt, but do NOT verify the certificate"?
 ///
 /// `Disable`, `Require`, and `accept_invalid_certs` all do — SQL Server always
@@ -230,78 +307,21 @@ impl MssqlSource {
         // explicitly via `tls: { mode: ... }`.
         crate::source::require_tls_or_loopback(url, tls)?;
         let parts = parse_mssql_url(url)?;
-        let mut config = Config::new();
-        config.host(&parts.host);
-        config.port(parts.port);
-        config.database(&parts.database);
-        config.authentication(AuthMethod::sql_server(&parts.user, &parts.password));
-
-        // SQL Server forces TLS on the login handshake regardless; map the
-        // shared TlsConfig onto tiberius' cert-trust knobs. A private CA goes
-        // through `trust_cert_ca`; otherwise dev self-signed certs need
-        // `trust_cert` (accept-invalid). Default keeps full verification.
-        config.encryption(EncryptionLevel::Required);
-        match tls {
-            // `mode: disable` is the operator's explicit opt-in to an
-            // unauthenticated (trust-any-cert) connection — the SQL Server
-            // analogue of PG/MySQL remote plaintext. It is the documented way
-            // to keep trust-cert against a remote host the gate above would
-            // otherwise have refused.
-            Some(cfg) if mssql_trusts_cert_without_verify(cfg) => config.trust_cert(),
-            Some(cfg) => {
-                // Strict cert validation is ON here (mode verify-ca/verify-full,
-                // no accept_invalid_certs). The TLS backend is OpenSSL
-                // (vendored-openssl via tiberius — see Cargo.toml), NOT
-                // rustls-webpki, so there is no CA name-constraint advisory to
-                // warn about: OpenSSL validates the chain against the trusted CA
-                // (and, for verify-full, the hostname) and rejects a certificate
-                // that does not chain to it (verified against a private-CA-
-                // configured SQL Server: the correct CA connects; a wrong CA is
-                // refused with OpenSSL `certificate verify failed`).
-                if let Some(ca) = cfg.ca_file.as_deref() {
-                    config.trust_cert_ca(ca);
-                }
-            }
-            None => {
-                // Reached only for a LOOPBACK host (the gate above refuses a
-                // remote host with no `tls:` block). On loopback, tiberius
-                // trusts the server certificate without verifying issuer or
-                // hostname: the handshake is encrypted but unauthenticated. That
-                // is safe here because the bytes never leave the box, and it
-                // keeps dev / self-signed docker setups working without opt-in.
-                // Warn once, naming the config key that turns on strict
-                // validation.
-                static WARNED: std::sync::Once = std::sync::Once::new();
-                WARNED.call_once(|| {
-                    log::warn!(
-                        "mssql: connecting with TLS certificate validation disabled \
-                         (no `source.tls:` block) — the connection is encrypted but the \
-                         server certificate is not verified (MITM not detected). Add \
-                         `source.tls: {{ mode: verify-full, ca_file: <ca.pem> }}` to enable \
-                         strict validation (or `mode: verify-ca` to skip only hostname checks)."
-                    );
-                });
-                config.trust_cert();
-            }
-        }
+        let config = tiberius_config(
+            &parts.host,
+            parts.port,
+            &parts.database,
+            &parts.user,
+            &parts.password,
+            tls,
+        );
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|e| anyhow::anyhow!("mssql: tokio runtime build failed: {e}"))?;
 
-        let client = rt.block_on(async {
-            let tcp = TcpStream::connect(config.get_addr()).await.map_err(|e| {
-                crate::source::describe_connect_error(
-                    url,
-                    anyhow::anyhow!("mssql: TCP connect failed: {e}"),
-                )
-            })?;
-            tcp.set_nodelay(true).ok();
-            Client::connect(config, tcp.compat_write())
-                .await
-                .map_err(|e| anyhow::anyhow!("mssql: login failed: {e}"))
-        })?;
+        let client = rt.block_on(dial(config, url))?;
 
         let mut src = Self {
             rt,
