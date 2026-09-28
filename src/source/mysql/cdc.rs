@@ -26,6 +26,7 @@ use serde_json::{Value as Json, json};
 
 use crate::config::TlsConfig;
 use crate::error::Result;
+use crate::source::cdc::checkpoint_identity::IdentityVerdict;
 use crate::source::cdc::value::RivetValue;
 use crate::source::cdc::{ChangeEvent, ChangeOp, ChangeStream, DrainMode, Position};
 use crate::source::require_tls_or_loopback;
@@ -282,16 +283,22 @@ impl MysqlChangeStream {
             .get("file")
             .and_then(Json::as_str)
             .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "checkpoint '{path}' parses as JSON but carries no 'file' — refusing to \
-                     treat it as absent, which would re-anchor at the CURRENT binlog \
-                     position and silently skip every change since it was written. Restore \
-                     the file, or delete it to accept a fresh anchor."
+                crate::error::CodedError::new(
+                    crate::error::codes::SOURCE_CDC_CHECKPOINT_INVALID,
+                    format!(
+                        "checkpoint '{path}' parses as JSON but carries no 'file' — refusing to \
+                         treat it as absent, which would re-anchor at the CURRENT binlog \
+                         position and silently skip every change since it was written. Restore \
+                         the file, or delete it to accept a fresh anchor."
+                    ),
                 )
             })?
             .to_string();
         let p = pos.0.get("pos").and_then(Json::as_u64).ok_or_else(|| {
-            anyhow::anyhow!("checkpoint '{path}' parses as JSON but carries no 'pos'")
+            crate::error::CodedError::new(
+                crate::error::codes::SOURCE_CDC_CHECKPOINT_INVALID,
+                format!("checkpoint '{path}' parses as JSON but carries no 'pos'"),
+            )
         })?;
         Ok(Some((file, p)))
     }
@@ -826,12 +833,7 @@ impl MysqlChangeStream {
                 Some(server_gtid.as_str()),
                 contained,
             );
-            if let Some(why) = verdict.refusal() {
-                anyhow::bail!("{why}");
-            }
-            if let Some(warn) = verdict.warning() {
-                log::warn!("{warn}");
-            }
+            verdict.verdict().enforce()?;
             let identity = (server_uuid, server_gtid);
             return Self::open_on(conn, server_id, file, p, mode, identity, configured_tables)
                 .map(with_dir);
@@ -2193,8 +2195,9 @@ mod tests {
             "the refusal must name BOTH servers and the reason — an operator whose \
              failover just happened needs to know which is which: {msg}"
         );
+        let err = v.verdict().enforce().expect_err("enforced, it refuses");
         assert!(
-            msg.contains("mode: full"),
+            err.to_string().contains("mode: full"),
             "and name the recovery, which is a re-snapshot: the old coordinates \
              cannot be carried to a new server at all"
         );
@@ -3035,7 +3038,7 @@ mod tests {
 
 #[cfg(test)]
 mod identity_recovery_order {
-    use super::CheckpointIdentity;
+    use super::{CheckpointIdentity, IdentityVerdict};
 
     #[test]
     fn every_identity_refusal_names_the_anchor_before_the_snapshot() {
@@ -3049,11 +3052,39 @@ mod identity_recovery_order {
                 server: "a:1-2".into(),
             },
         ] {
-            let why = v.refusal().expect("refuses");
+            let err = v.verdict().enforce().expect_err("refuses");
+            assert_eq!(crate::error::classify_exit(&err), 5, "{v:?}: {err}");
+            assert_eq!(
+                crate::error::error_code(&err),
+                Some("RIVET_SOURCE_CDC_FOREIGN_CHECKPOINT")
+            );
+            let why = err.to_string();
             assert!(
-                why.contains("delete the checkpoint so the next run pins a fresh one FIRST, THEN re-snapshot the table (`mode: full`)")
-                    || why.contains("Delete the checkpoint so the next run pins a fresh one FIRST, THEN re-snapshot the table (`mode: full`)"),
+                why.ends_with(crate::source::cdc::checkpoint_identity::RECOVER),
                 "{v:?}: {why}"
+            );
+        }
+        assert_eq!(CheckpointIdentity::Ok.verdict(), IdentityVerdict::Ok);
+        assert!(matches!(
+            CheckpointIdentity::Unverifiable.verdict(),
+            IdentityVerdict::Unverifiable(w) if w.contains("per-server")
+        ));
+    }
+
+    #[test]
+    fn a_checkpoint_without_file_or_pos_is_refused_as_invalid_with_exit_5() {
+        use crate::source::cdc::Position;
+        for hollow in [
+            serde_json::json!({"pos": 4}),
+            serde_json::json!({"file": "binlog.000001"}),
+        ] {
+            let err =
+                super::MysqlChangeStream::resume_from_checkpoint(Some(&Position(hollow)), "/x")
+                    .unwrap_err();
+            assert_eq!(crate::error::classify_exit(&err), 5, "{err}");
+            assert_eq!(
+                crate::error::error_code(&err),
+                Some("RIVET_SOURCE_CDC_CHECKPOINT_INVALID")
             );
         }
     }
@@ -3085,19 +3116,24 @@ impl CheckpointIdentity {
                  resuming would start at an arbitrary point in a DIFFERENT binlog, \
                  capturing whatever is there and skipping whatever was between — \
                  silently, in both directions. If the source genuinely moved \
-                 (a failover, a restore), delete the checkpoint so the next run pins a \
-                 fresh one FIRST, THEN re-snapshot the table (`mode: full`): snapshotting \
-                 first leaves the changes in between in neither. The old coordinates \
-                 cannot be carried over."
+                 (a failover, a restore), the old coordinates cannot be carried over."
             )),
             Self::GtidNotContained { checkpoint, server } => Some(format!(
                 "mysql cdc: the checkpoint's GTID set `{checkpoint}` is not contained \
                  in the server's executed set `{server}` — the same server no longer \
                  has those transactions, which is what a `RESET MASTER` or a rebuild \
                  leaves behind. The coordinates address a binlog that no longer \
-                 exists. Delete the checkpoint so the next run pins a fresh one FIRST, \
-                 THEN re-snapshot the table (`mode: full`)."
+                 exists."
             )),
+        }
+    }
+
+    /// The shared verdict this outcome enforces.
+    pub(crate) fn verdict(&self) -> IdentityVerdict {
+        match (self.refusal(), self.warning()) {
+            (Some(why), _) => IdentityVerdict::Foreign(why),
+            (None, Some(warn)) => IdentityVerdict::Unverifiable(warn.into()),
+            (None, None) => IdentityVerdict::Ok,
         }
     }
 

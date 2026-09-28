@@ -32,6 +32,7 @@ use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
 use crate::config::TlsConfig;
 use crate::error::Result;
+use crate::source::cdc::checkpoint_identity::IdentityVerdict;
 use crate::source::cdc::value::RivetValue;
 use crate::source::cdc::{ChangeEvent, ChangeOp, ChangeStream, DrainMode, Position};
 use crate::source::require_tls_or_loopback;
@@ -239,6 +240,14 @@ fn advance_cursor(from_lsn: &mut Option<String>, from_is_pin: &mut bool, to: Str
     *from_is_pin = false;
 }
 
+/// The user error number `fill_sql` THROWs when the resume position fell below retention.
+const RETENTION_GAP_ERROR: u32 = 51000;
+
+/// Whether a server error number is `fill_sql`'s retention-gap THROW.
+fn is_retention_gap(server_code: Option<u32>) -> bool {
+    server_code == Some(RETENTION_GAP_ERROR)
+}
+
 fn fill_sql(p: Poll<'_>) -> String {
     let Poll {
         ci,
@@ -274,7 +283,7 @@ fn fill_sql(p: Poll<'_>) -> String {
          DECLARE @max binary(10) = {max_expr}; \
          {floor} \
          IF @from IS NOT NULL AND @min IS NOT NULL AND @from < @min \
-            THROW 51000, 'rivet cdc: the resume position is older than the SQL Server \
+            THROW {RETENTION_GAP_ERROR}, 'rivet cdc: the resume position is older than the SQL Server \
 CDC change-table retention (the cleanup job removed it). Resuming would silently skip changes \
 — restart CDC from a fresh checkpoint FIRST, then re-snapshot the table (mode: full): snapshotting first leaves the changes in between in neither.', 1; \
          DECLARE @to binary(10) = NULL; \
@@ -326,48 +335,35 @@ impl DbIdentity {
     }
 }
 
-/// What a resume may do given the checkpoint's recorded identity and the server's.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum IdentityVerdict {
-    Ok,
-    /// Resume proceeds, but nothing could be verified; the text says why.
-    Warn(String),
-    /// Resume is refused; the text says why and how to recover.
-    Refuse(String),
-}
-
 /// Judge a resume: another database's LSNs, or a log rewound by a restore, are refused.
 pub(crate) fn identity_verdict(
     checkpoint: Option<&DbIdentity>,
     server: Option<&DbIdentity>,
 ) -> IdentityVerdict {
-    const RECOVER: &str = "Delete the checkpoint to start CDC from a fresh anchor FIRST, then \
-         re-snapshot the table (mode: full): snapshotting first leaves the changes in between \
-         in neither.";
     match (checkpoint, server) {
-        (None, _) => IdentityVerdict::Warn(
+        (None, _) => IdentityVerdict::Unverifiable(
             "mssql cdc: this checkpoint carries no database identity (it predates rivet \
              recording one), so rivet cannot confirm it belongs to this database. LSNs are \
              positions in ONE database's log; if the source moved, resuming skips changes."
                 .into(),
         ),
-        (Some(_), None) => IdentityVerdict::Warn(
+        (Some(_), None) => IdentityVerdict::Unverifiable(
             "mssql cdc: this login cannot read sys.database_recovery_status for the \
              database, so rivet cannot confirm the checkpoint belongs to it."
                 .into(),
         ),
-        (Some(c), Some(s)) if c.family != s.family => IdentityVerdict::Refuse(format!(
+        (Some(c), Some(s)) if c.family != s.family => IdentityVerdict::Foreign(format!(
             "mssql cdc: this checkpoint was written against a different database (family \
              {}, the connection's is {}). LSNs are positions in one database's log: \
              resuming here would start at an arbitrary point in another log and skip \
-             whatever lies below it, silently. {RECOVER}",
+             whatever lies below it, silently.",
             c.family, s.family
         )),
-        (Some(c), Some(s)) if c.fork != s.fork => IdentityVerdict::Refuse(format!(
+        (Some(c), Some(s)) if c.fork != s.fork => IdentityVerdict::Foreign(format!(
             "mssql cdc: this database was restored from a backup since the checkpoint was \
              written (recovery fork {} is now {}). The log was rewound: changes the \
              checkpoint already covers may no longer exist in the source, and the \
-             destination still holds them. {RECOVER}",
+             destination still holds them.",
             c.fork, s.fork
         )),
         _ => IdentityVerdict::Ok,
@@ -447,11 +443,14 @@ pub(crate) fn resume_from_checkpoint(
         .get("lsn")
         .and_then(|v| v.as_str())
         .ok_or_else(|| {
-            anyhow::anyhow!(
-                "checkpoint '{path}' parses as JSON but carries no 'lsn' — refusing to treat \
-                 it as absent, which would re-read and re-deliver the ENTIRE retained change \
-                 table from fn_cdc_get_min_lsn under a successful exit. Restore the file, or \
-                 delete it to accept a fresh anchor."
+            crate::error::CodedError::new(
+                crate::error::codes::SOURCE_CDC_CHECKPOINT_INVALID,
+                format!(
+                    "checkpoint '{path}' parses as JSON but carries no 'lsn' — refusing to treat \
+                     it as absent, which would re-read and re-deliver the ENTIRE retained change \
+                     table from fn_cdc_get_min_lsn under a successful exit. Restore the file, or \
+                     delete it to accept a fresh anchor."
+                ),
             )
         })?
         .to_string();
@@ -714,11 +713,7 @@ impl MssqlChangeStream {
         let mut client = rt.block_on(connect(cfg, tls))?;
         let identity = rt.block_on(db_identity(&mut client))?;
         if cfg.from_lsn.is_some() {
-            match identity_verdict(cfg.checkpoint_identity.as_ref(), identity.as_ref()) {
-                IdentityVerdict::Refuse(why) => anyhow::bail!("{why}"),
-                IdentityVerdict::Warn(why) => log::warn!("{why}"),
-                IdentityVerdict::Ok => {}
-            }
+            identity_verdict(cfg.checkpoint_identity.as_ref(), identity.as_ref()).enforce()?;
         }
 
         // Resolve the REAL schema/table from cdc.change_tables metadata. The
@@ -927,7 +922,17 @@ impl MssqlChangeStream {
         let rows = {
             let Self { rt, client, .. } = self;
             rt.block_on(async { client.simple_query(sql).await?.into_first_result().await })
-                .map_err(|e| anyhow::Error::new(e).context(crate::source::cdc::MSSQL_CDC_HINT))?
+                .map_err(|e| {
+                    if is_retention_gap(e.code()) {
+                        crate::error::CodedError::new(
+                            crate::error::codes::SOURCE_CDC_LOG_GAP,
+                            e.to_string(),
+                        )
+                        .into()
+                    } else {
+                        anyhow::Error::new(e).context(crate::source::cdc::MSSQL_CDC_HINT)
+                    }
+                })?
         };
         // Rows are ordered ascending by start LSN, so the last one's `__$start_lsn`
         // is `@to` — the cursor advances there regardless of each row's op.
@@ -1572,8 +1577,13 @@ mod tests {
                     "{missing} carries no readable position — treating it as absent re-reads \
                      the ENTIRE retained change table under a green exit (measured: ids \
                      [1,2,3,4] delivered where [4] was owed)"
-                ))
-                .to_string();
+                ));
+            assert_eq!(crate::error::classify_exit(&err), 5, "{err}");
+            assert_eq!(
+                crate::error::error_code(&err),
+                Some("RIVET_SOURCE_CDC_CHECKPOINT_INVALID")
+            );
+            let err = err.to_string();
             assert!(
                 err.contains("lsn") && err.contains("/tmp/c.ckpt"),
                 "the refusal must name the key AND the file, or an operator cannot act on \
@@ -1756,6 +1766,13 @@ mod tests {
     // open-time ceiling — it must never re-read `fn_cdc_get_max_lsn()` (the
     // moving target that keeps a hot table's drain from ever terminating), and
     // the daemon poll must keep doing exactly that.
+    #[test]
+    fn only_the_retention_throw_number_is_a_log_gap() {
+        assert!(is_retention_gap(Some(51000)));
+        assert!(!is_retention_gap(Some(208)));
+        assert!(!is_retention_gap(None));
+    }
+
     #[test]
     fn fill_sql_bounded_pins_max_and_daemon_chases_it() {
         let bounded = fill_sql(Poll {
@@ -2068,30 +2085,44 @@ mod identity_tests {
             identity_verdict(Some(&here), Some(&here)),
             IdentityVerdict::Ok
         );
-        let IdentityVerdict::Refuse(why) = identity_verdict(Some(&here), Some(&id("F2", "K1")))
+        let IdentityVerdict::Foreign(why) = identity_verdict(Some(&here), Some(&id("F2", "K1")))
         else {
             panic!("another family must refuse");
         };
         assert!(why.starts_with("mssql cdc: this checkpoint was written against a different database (family F1, the connection's is F2)"), "{why}");
-        let IdentityVerdict::Refuse(why) = identity_verdict(Some(&here), Some(&id("F1", "K2")))
+        let IdentityVerdict::Foreign(why) = identity_verdict(Some(&here), Some(&id("F1", "K2")))
         else {
             panic!("another fork must refuse");
         };
         assert!(why.starts_with("mssql cdc: this database was restored from a backup since the checkpoint was written (recovery fork K1 is now K2)"), "{why}");
-        assert!(
-            why.contains(
-                "Delete the checkpoint to start CDC from a fresh anchor FIRST, then re-snapshot"
-            ),
-            "the recovery order must be anchor first: {why}"
-        );
         assert!(matches!(
             identity_verdict(None, Some(&here)),
-            IdentityVerdict::Warn(w) if w.contains("carries no database identity")
+            IdentityVerdict::Unverifiable(w) if w.contains("carries no database identity")
         ));
         assert!(matches!(
             identity_verdict(Some(&here), None),
-            IdentityVerdict::Warn(w) if w.contains("cannot read sys.database_recovery_status")
+            IdentityVerdict::Unverifiable(w) if w.contains("cannot read sys.database_recovery_status")
         ));
+    }
+
+    #[test]
+    fn a_foreign_or_rewound_checkpoint_refuses_with_exit_5_and_the_anchor_first_order() {
+        let here = id("F1", "K1");
+        for server in [id("F2", "K1"), id("F1", "K2")] {
+            let err = identity_verdict(Some(&here), Some(&server))
+                .enforce()
+                .unwrap_err();
+            assert_eq!(crate::error::classify_exit(&err), 5, "{err}");
+            assert_eq!(
+                crate::error::error_code(&err),
+                Some("RIVET_SOURCE_CDC_FOREIGN_CHECKPOINT")
+            );
+            assert!(
+                err.to_string()
+                    .ends_with(crate::source::cdc::checkpoint_identity::RECOVER),
+                "{err}"
+            );
+        }
     }
 
     #[test]

@@ -13,6 +13,7 @@
 
 #![allow(dead_code)]
 
+pub(crate) mod checkpoint_identity;
 pub(crate) mod identity;
 pub(crate) mod sink;
 pub(crate) mod spill;
