@@ -109,10 +109,11 @@ GROUP BY 1;
   (e.g. MySQL `SET time_zone = '+00:00'`) when the exact day boundary matters.
 - **Not compatible with `mode: time_window`** (time_window already filters by a
   rolling window). Use `partition_by` with `full`, `chunked`, or `incremental`.
-- **Not compatible with `chunk_by_key` (keyset).** Keyset pagination needs the
-  `table:` shortcut so the planner can confirm the key is index-backed;
-  partitioning rewrites the export into a `query:` subquery, so the two can't
-  compose — Rivet rejects the combination up front.
+- **Not compatible with `chunk_by_key` (keyset).** Each partition reads its
+  bucket as a subquery around the table, and keyset seek pagination over that
+  shape is not supported — Rivet rejects the combination up front. A
+  `table:` export keeps its table per partition, so a range `chunk_column` is
+  type-checked and an unset one auto-resolves to the primary key as usual.
 - **`--parallel-export-processes` is disabled** while partitioning is active
   (child processes re-load the config and can't see the synthesised partitions);
   the run executes in-process.

@@ -888,9 +888,9 @@ impl Config {
             }
             if export.chunk_by_key.is_some() {
                 anyhow::bail!(
-                    "export '{}': partition_by is not compatible with chunk_by_key — keyset needs \
-                     the `table:` shortcut to verify the index, but partitioning rewrites the query \
-                     into a subquery. Use a range `chunk_column`, a smaller `partition_granularity`, \
+                    "export '{}': partition_by is not compatible with chunk_by_key — keyset seek \
+                     pagination over a partition bucket (a subquery around the table) is not \
+                     supported. Use a range `chunk_column`, a smaller `partition_granularity`, \
                      or `mode: full`.",
                     export.name
                 );

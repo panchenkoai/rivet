@@ -106,7 +106,7 @@ pub(crate) fn build_plan_on(
         // so the bound is runner-agnostic by construction — full/chunked/keyset
         // all page over the already-bounded set, the exact runner-bypass trap a
         // per-runner filter would reintroduce.
-        match &export.split {
+        let q = match &export.split {
             Some(s) => crate::source::query::wrap_key_range(
                 &q,
                 &s.key_column,
@@ -114,6 +114,12 @@ pub(crate) fn build_plan_on(
                 s.hi.as_deref(),
                 config.source.source_type,
             ),
+            None => q,
+        };
+        // A `partition_by` child's bucket, applied at the same seam as the split
+        // window — the child keeps `table:`, so introspection and identity survive.
+        match &export.partition_window {
+            Some(w) => crate::plan::partition::apply_bucket(&q, w, config.source.source_type),
             None => q,
         }
     };

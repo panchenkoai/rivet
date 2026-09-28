@@ -59,6 +59,15 @@ pub enum SchemaDriftPolicy {
 /// so N adjacent windows partition the key gap-free with no overlap (the same
 /// convention `keyset::partition_ranges` uses): `lo = None` is the run's floor
 /// (first window), `hi = None` is the ceil (last window).
+/// One `partition_by` child's bucket over the parent's base query, applied by the planner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartitionSynth {
+    /// The `partition_by` column.
+    pub column: String,
+    /// Half-open `[lo, hi)` day bounds; `None` is the NULL bucket.
+    pub range: Option<(chrono::NaiveDate, chrono::NaiveDate)>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SplitSynth {
     /// The parent export's FAMILY — every sub-export folds to it so the load view
@@ -125,6 +134,10 @@ pub struct ExportConfig {
     /// must not appear in the schema or the config reference.
     #[serde(skip)]
     pub split: Option<SplitSynth>,
+    /// Set ONLY on a `partition_by` child `run` synthesizes: the bucket the
+    /// planner wraps around the base query, so `table:` survives. Never user-writable.
+    #[serde(skip)]
+    pub partition_window: Option<PartitionSynth>,
     #[serde(default)]
     pub query: Option<String>,
     pub query_file: Option<String>,
@@ -858,6 +871,7 @@ pub(crate) fn sample_export(name: &str) -> ExportConfig {
         snapshot_parent: None,
         snapshot_label: None,
         split: None,
+        partition_window: None,
         name: name.into(),
         target: None,
         load: None,
