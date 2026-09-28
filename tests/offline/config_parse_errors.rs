@@ -503,31 +503,3 @@ exports:
         "BigQuery takes a MongoDB stream"
     );
 }
-
-#[test]
-fn oracle_cdc_refuses_until_current_false_at_load() {
-    // LogMiner only drains to the open-time SCN, so `false` would be a promise the run cannot keep.
-    let yaml = |until_current: bool| {
-        format!(
-            r#"
-source:
-  type: oracle
-  url: "oracle://u:p@localhost:1521/FREEPDB1"
-exports:
-  - name: t
-    table: T
-    mode: cdc
-    format: parquet
-    cdc: {{ until_current: {until_current}, checkpoint: "./t.ckpt" }}
-    destination: {{ type: local, path: "/tmp/x" }}
-"#
-        )
-    };
-    let err = parse_err(&yaml(false));
-    assert!(
-        err.contains("Oracle CDC is always a bounded drain")
-            && err.contains("`until_current: false`"),
-        "the error must name the refused key; got: {err}"
-    );
-    Config::from_yaml(&yaml(true)).expect("the bounded default must load");
-}

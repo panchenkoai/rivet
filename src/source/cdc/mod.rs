@@ -2504,6 +2504,39 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "oracle")]
+    #[test]
+    fn the_oracle_stream_refuses_only_the_continuous_drain() {
+        let d = tempfile::tempdir().unwrap();
+        let ckpt = d.path().join("ck.json");
+        std::fs::write(&ckpt, b"{not valid json").unwrap();
+        let open = |drain| {
+            let cfg = CdcConfig {
+                config_dir: std::path::PathBuf::from("."),
+                url: "oracle://u:p@127.0.0.1:1/FREEPDB1".into(),
+                checkpoint: Some(ckpt.clone()),
+                drain,
+                tls: None,
+                engine: CdcEngineOpts::Oracle {
+                    configured_tables: Vec::new(),
+                },
+            };
+            match create_change_stream(&cfg, PeekBound::Unbounded) {
+                Ok(_) => panic!("a corrupt checkpoint never opens a stream"),
+                Err(e) => format!("{e:#}"),
+            }
+        };
+        assert!(
+            open(DrainMode::Continuous).contains("Oracle CDC is always a bounded drain"),
+            "the continuous drain is refused before anything is read"
+        );
+        let bounded = open(DrainMode::BoundedAtOpen);
+        assert!(
+            bounded.contains("corrupt or truncated"),
+            "the bounded drain goes on to read the checkpoint: {bounded}"
+        );
+    }
+
     #[test]
     fn a_missing_mssql_capture_instance_names_the_config_key() {
         let cfg = CdcConfig {

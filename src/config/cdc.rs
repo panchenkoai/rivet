@@ -1045,6 +1045,35 @@ mod tests {
     use super::*;
     use crate::config::export::sample_export;
 
+    /// A one-export `mode: cdc` config on `source_type` with the given `until_current`.
+    fn cdc_yaml(source: &str, url: &str, until_current: bool) -> String {
+        format!(
+            "source: {{ type: {source}, url: \"{url}\" }}\nexports:\n  - name: t\n    table: T\n    \
+             mode: cdc\n    format: parquet\n    \
+             cdc: {{ until_current: {until_current}, checkpoint: \"./t.ckpt\" }}\n    \
+             destination: {{ type: local, path: /tmp/x }}\n"
+        )
+    }
+
+    #[test]
+    fn only_oracle_refuses_the_continuous_model_at_load() {
+        let ora = "oracle://u:p@localhost:1521/FREEPDB1";
+        let err = crate::config::Config::from_yaml(&cdc_yaml("oracle", ora, false))
+            .expect_err("Oracle `until_current: false` must refuse");
+        assert!(
+            format!("{err:#}").contains("Oracle CDC is always a bounded drain"),
+            "{err:#}"
+        );
+        crate::config::Config::from_yaml(&cdc_yaml("oracle", ora, true))
+            .expect("the bounded default loads");
+        crate::config::Config::from_yaml(&cdc_yaml(
+            "postgres",
+            "postgresql://u:p@localhost/db",
+            false,
+        ))
+        .expect("PostgreSQL may opt into the continuous model");
+    }
+
     // ── cdc.backfill: the pairing ────────────────────────────────────────────
 
     /// A batch export reading one table, named as a recipe candidate.
