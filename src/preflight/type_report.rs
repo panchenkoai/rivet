@@ -415,27 +415,12 @@ pub(crate) fn connect_source(
     url: &str,
     tls: Option<&crate::config::TlsConfig>,
 ) -> Result<Box<dyn source::Source>> {
-    connect_source_of(config.source.source_type, url, tls)
-}
-
-/// [`connect_source`] by the one thing it actually needs.
-pub(crate) fn connect_source_of(
-    source_type: SourceType,
-    url: &str,
-    tls: Option<&crate::config::TlsConfig>,
-) -> Result<Box<dyn source::Source>> {
-    Ok(match source_type {
-        SourceType::Postgres => Box::new(source::postgres::PostgresSource::connect_with_tls(
-            url, tls,
-        )?),
-        SourceType::Mysql => Box::new(source::mysql::MysqlSource::connect_with_tls(url, tls)?),
-        SourceType::Mssql => Box::new(source::mssql::MssqlSource::connect_with_tls(url, tls)?),
-        #[cfg(feature = "oracle")]
-        SourceType::Oracle => Box::new(source::oracle::OracleSource::connect_with_tls(url, tls)?),
-        #[cfg(not(feature = "oracle"))]
-        SourceType::Oracle => return Err(crate::source::oracle_feature_missing()),
-        SourceType::Mongo => Box::new(source::mongo::MongoSource::connect(url, tls, None)?),
-    })
+    source::connect(
+        config.source.source_type,
+        url,
+        tls,
+        config.source.mongo.as_ref(),
+    )
 }
 
 /// What a successful run records for the load about one unit: its resolved

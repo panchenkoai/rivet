@@ -598,7 +598,7 @@ fn run_keyset_parallel(
             let unit = super::commit::UnitId::Range(ridx as i64);
             fan.spawn(scope, format!("range {ridx}"), move || {
                 let mut wsrc = source::create_source(&plan_r.source)
-                    .map_err(|e| anyhow::anyhow!("connect: {e:#}"))?;
+                    .map_err(|e| super::single::attach_connect_hint(e, &plan_r.source))?;
                 let mut cursor = lo;
                 let mut pages = 0usize;
                 let mut rmax: Option<String> = None;

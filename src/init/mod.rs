@@ -1563,7 +1563,7 @@ fn record_primary_keys(
             return;
         }
     };
-    let mut src = match crate::preflight::type_report::connect_source_of(kind, source_url, tls) {
+    let mut src = match crate::source::connect(kind, source_url, tls, None) {
         Ok(s) => s,
         Err(e) => {
             log::warn!("init: source primary keys not recorded (source unreachable): {e:#}");
@@ -1643,7 +1643,7 @@ mod tests {
              from the URL (`source_type_of`), as everywhere else in init."
         );
         assert!(
-            body.contains("connect_source_of"),
+            body.contains("source::connect("),
             "it should take the source by TYPE, not by a config it had to load"
         );
         assert!(
