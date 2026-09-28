@@ -96,7 +96,7 @@ impl<'a> PgFromSql<'a> for PgUuidBytes {
 /// goes through `client.query` (extended protocol, binary results), and the
 /// version-byte check mirrors the `postgres` crate's own `Json<T>` reader,
 /// so failure behavior is unchanged.
-struct PgJsonRawText<'a>(&'a str);
+pub(super) struct PgJsonRawText<'a>(pub(super) &'a str);
 
 impl<'a> PgFromSql<'a> for PgJsonRawText<'a> {
     fn accepts(ty: &Type) -> bool {
@@ -325,10 +325,10 @@ pub(super) fn pg_columns_to_schema(
 ///   bytes 0–7  (i64 big-endian): microseconds within day
 ///   bytes 8–11 (i32 big-endian): days
 ///   bytes 12–15 (i32 big-endian): months
-struct PgInterval {
-    microseconds: i64,
-    days: i32,
-    months: i32,
+pub(super) struct PgInterval {
+    pub(super) microseconds: i64,
+    pub(super) days: i32,
+    pub(super) months: i32,
 }
 
 impl<'a> postgres_types::FromSql<'a> for PgInterval {

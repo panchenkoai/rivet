@@ -376,14 +376,32 @@ pub(crate) fn value_from_binary(
         // that turned an entire column NULL when the text rendering was 36 chars.
         2950 => V::Bytes(de::<uuid::Uuid>(&ty, raw, "uuid")?.as_bytes().to_vec()),
         17 => V::Bytes(de::<Vec<u8>>(&ty, raw, "bytea")?),
-        // json/jsonb/numeric/text all travel as bytes rivet already renders; jsonb's
-        // binary form carries a 1-byte version prefix that `FromSql` strips.
+        // json/jsonb go through the batch reader's raw-text adapter: the stored
+        // bytes verbatim (jsonb's version byte stripped), never a serde re-encode.
         114 | 3802 => V::Bytes(
-            serde_json::to_vec(&de::<serde_json::Value>(&ty, raw, "json")?)
-                .map_err(|e| anyhow::anyhow!("pgoutput: re-encoding json: {e}"))?,
+            de::<super::arrow_convert::PgJsonRawText>(&ty, raw, "json")?
+                .0
+                .as_bytes()
+                .to_vec(),
         ),
-        25 | 1042 | 1043 => V::Bytes(de::<String>(&ty, raw, "text")?.into_bytes()),
+        19 | 25 | 1042 | 1043 => V::Bytes(de::<String>(&ty, raw, "text")?.into_bytes()),
+        26 => V::Int(de::<u32>(&ty, raw, "oid")? as i64),
+        // numeric: the batch reader's decoder, so both emit the same normalized text.
         1700 => V::Bytes(numeric_text(raw)?.into_bytes()),
+        1083 => {
+            use chrono::Timelike as _;
+            let t = de::<chrono::NaiveTime>(&ty, raw, "time")?;
+            V::TimeMicros(
+                t.num_seconds_from_midnight() as i64 * 1_000_000 + t.nanosecond() as i64 / 1_000,
+            )
+        }
+        1186 => {
+            let iv = de::<super::arrow_convert::PgInterval>(&ty, raw, "interval")?;
+            V::Bytes(
+                super::arrow_convert::pg_interval_to_iso8601(iv.months, iv.days, iv.microseconds)
+                    .into_bytes(),
+            )
+        }
         // One-dimensional arrays of the element types the batch list builder makes.
         1005 => array_of(de::<Vec<Option<i16>>>(&ty, raw, "int2[]")?, |v| {
             V::Int(v as i64)
@@ -397,14 +415,15 @@ pub(crate) fn value_from_binary(
             V::Float(v as f64)
         }),
         1022 => array_of(de::<Vec<Option<f64>>>(&ty, raw, "float8[]")?, V::Float),
-        1009 => array_of(de::<Vec<Option<String>>>(&ty, raw, "text[]")?, |v| {
+        1009 | 1014 | 1015 => array_of(de::<Vec<Option<String>>>(&ty, raw, "text[]")?, |v| {
             V::Bytes(v.into_bytes())
         }),
         _ => anyhow::bail!(
             "pgoutput: column type `{}` (oid {oid}) has no binary decoder. Refusing \
              rather than passing the raw bytes through as text — an unmapped type \
              that ships as hex is a column every count and sum agrees with and no \
-             consumer can read.",
+             consumer can read. Enums and domains have no fixed OID and are not \
+             decoded here yet.",
             ty.name()
         ),
     })
@@ -418,57 +437,15 @@ fn array_of<T>(
     V::Array(items.into_iter().map(|o| o.map_or(V::Null, &f)).collect())
 }
 
-/// PostgreSQL `numeric` in its binary form -> exact decimal text.
-///
-/// `postgres-types` has no `FromSql` for it, so this is the one type the format
-/// does not hand over ready-made. The layout is base-10000 digit groups:
-/// ndigits, weight, sign, dscale, then the groups.
+/// PostgreSQL binary `numeric` -> the batch reader's decimal text (NaN/±Infinity by name).
 fn numeric_text(raw: &[u8]) -> Result<String> {
-    if raw.len() < 8 {
-        anyhow::bail!("pgoutput: numeric header truncated ({} bytes)", raw.len());
-    }
-    let g = |i: usize| i16::from_be_bytes([raw[i], raw[i + 1]]);
-    let (ndigits, weight, sign, dscale) = (g(0) as usize, g(2) as i32, g(4) as u16, g(6) as usize);
-    match sign {
-        0xC000 => return Ok("NaN".into()),
-        0xD000 => return Ok("Infinity".into()),
-        0xF000 => return Ok("-Infinity".into()),
-        _ => {}
-    }
-    if raw.len() < 8 + ndigits * 2 {
-        anyhow::bail!("pgoutput: numeric digits truncated");
-    }
-    let digits: Vec<i16> = (0..ndigits).map(|i| g(8 + i * 2)).collect();
-    let mut int_part = String::new();
-    for d in 0..=weight.max(0) {
-        let v = digits.get(d as usize).copied().unwrap_or(0);
-        if d == 0 {
-            int_part.push_str(&v.to_string());
-        } else {
-            int_part.push_str(&format!("{v:04}"));
-        }
-    }
-    if int_part.is_empty() {
-        int_part.push('0');
-    }
-    let mut frac = String::new();
-    let mut d = weight + 1;
-    while frac.len() < dscale {
-        let v = if d < 0 {
-            0
-        } else {
-            digits.get(d as usize).copied().unwrap_or(0)
-        };
-        frac.push_str(&format!("{v:04}"));
-        d += 1;
-    }
-    frac.truncate(dscale);
-    let neg = if sign == 0x4000 { "-" } else { "" };
-    Ok(if dscale == 0 {
-        format!("{neg}{int_part}")
-    } else {
-        format!("{neg}{int_part}.{frac}")
-    })
+    use crate::source::pg_numeric_wire::{
+        numeric_wire_normalized_plain, numeric_wire_special_text,
+    };
+    numeric_wire_special_text(raw)
+        .map(str::to_string)
+        .or_else(|| numeric_wire_normalized_plain(raw))
+        .ok_or_else(|| anyhow::anyhow!("pgoutput: malformed numeric payload ({} bytes)", raw.len()))
 }
 
 /// The prefix rivet stamps on its own logical messages, so a barrier emitted by
@@ -1133,7 +1110,11 @@ mod tests {
             &V::Bytes(b"-12345.6789".to_vec()),
             "numeric is exact decimal text, sign and scale preserved"
         );
-        assert_eq!(by("j"), &V::Bytes(br#"{"k":[1,2]}"#.to_vec()));
+        assert_eq!(
+            by("j"),
+            &V::Bytes(br#"{"k": [1, 2]}"#.to_vec()),
+            "jsonb is the server's own text, as the batch reader emits it"
+        );
         // `2026-03-01 12:00:00+05` is `07:00:00Z` — an INSTANT, with no session
         // rendering in between. The +9h corruption class cannot arise here.
         assert_eq!(
@@ -1166,6 +1147,75 @@ mod tests {
         assert!(
             format!("{err:#}").contains("no binary decoder"),
             "an unmapped type must name itself and refuse: {err:#}"
+        );
+    }
+
+    /// Hand-built wire bytes against hand-written literals, per arm the fixture lacks.
+    #[test]
+    fn binary_arms_decode_hand_built_wire_bytes_to_literal_values() {
+        use crate::source::cdc::value::RivetValue as V;
+        let bytes = |oid: u32, raw: &[u8]| match value_from_binary(oid, raw).unwrap() {
+            V::Bytes(b) => String::from_utf8(b).unwrap(),
+            other => panic!("oid {oid}: expected Bytes, got {other:?}"),
+        };
+
+        assert_eq!(
+            bytes(1700, &[0, 1, 0xFF, 0xFF, 0, 0, 0, 1, 0x13, 0x88]),
+            "0.5"
+        );
+        assert_eq!(
+            bytes(1700, &[0, 1, 0xFF, 0xFE, 0, 0, 0, 5, 0x13, 0x88]),
+            "0.00005"
+        );
+        assert_eq!(bytes(1700, &[0, 0, 0, 0, 0xC0, 0, 0, 0]), "NaN");
+        assert_eq!(
+            bytes(1700, &[0, 2, 0, 0, 0, 0, 0, 2, 0, 1, 0x13, 0x88]),
+            "1.5",
+            "numeric is the batch reader's normalized text: 1.50 renders as 1.5"
+        );
+        assert!(
+            value_from_binary(1700, &[0, 1]).is_err(),
+            "truncated numeric"
+        );
+
+        let doc = br#"{"b":1,  "a":0.12345678901234567890}"#;
+        assert_eq!(bytes(114, doc).as_bytes(), doc, "json is byte-identical");
+        let mut jb = vec![1u8];
+        jb.extend_from_slice(doc);
+        assert_eq!(
+            bytes(3802, &jb).as_bytes(),
+            doc,
+            "jsonb version byte stripped"
+        );
+        jb[0] = 2;
+        assert!(
+            value_from_binary(3802, &jb).is_err(),
+            "jsonb version 2 refused"
+        );
+
+        let mut iv = vec![0u8; 8];
+        iv.extend_from_slice(&3i32.to_be_bytes());
+        iv.extend_from_slice(&14i32.to_be_bytes());
+        assert_eq!(bytes(1186, &iv), "P1Y2M3D");
+
+        assert_eq!(
+            value_from_binary(1083, &43_200_500_000i64.to_be_bytes()).unwrap(),
+            V::TimeMicros(43_200_500_000)
+        );
+        assert_eq!(
+            value_from_binary(26, &12345u32.to_be_bytes()).unwrap(),
+            V::Int(12345)
+        );
+        assert_eq!(bytes(19, b"pg_class"), "pg_class");
+
+        let mut arr = Vec::new();
+        for w in [1u32, 0, 1043, 1, 1, 2] {
+            arr.extend_from_slice(&w.to_be_bytes());
+        }
+        arr.extend_from_slice(b"xy");
+        assert_eq!(
+            value_from_binary(1015, &arr).unwrap(),
+            V::Array(vec![V::Bytes(b"xy".to_vec())])
         );
     }
 
