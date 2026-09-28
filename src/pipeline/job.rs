@@ -1925,6 +1925,36 @@ pub(crate) fn run_export_job_with_chunk_source(
 mod snapshot_leg_tests {
     use super::*;
 
+    /// A run whose source cannot be reached ends FAILED — the post-plan script never reports success it did not earn.
+    #[test]
+    fn an_unreachable_source_fails_the_run_and_its_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut plan = crate::pipeline::commit::tests::test_plan();
+        plan.destination.path = Some(dir.path().to_string_lossy().into_owned());
+        let state = StateStore::open_in_memory().unwrap();
+        let config = dir.path().join("rivet.yaml").to_string_lossy().into_owned();
+        let (result, summary) = execute_resolved_plan(
+            &plan,
+            &state,
+            TailPolicy {
+                kind: "export",
+                family: "orders",
+                config_path: &config,
+                runner_config_path: &config,
+                chunk_source: chunked::ChunkSource::Detect,
+                apply_context: None,
+                allow_reconcile: false,
+                notifications: None,
+                record_load_spec: false,
+                plan_warnings: Vec::new(),
+            },
+            MetaConn::open(&plan.source),
+        );
+        assert!(result.is_err(), "nothing listens on 127.0.0.1:9999");
+        assert_eq!(summary.status, "failed");
+        assert_eq!(summary.export_name, "orders");
+    }
+
     fn cdc_export() -> crate::config::ExportConfig {
         let cfg = crate::config::Config::from_yaml(
             "source:\n  type: mysql\n  url: \"mysql://localhost/test\"\n\
