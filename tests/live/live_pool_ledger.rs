@@ -64,6 +64,8 @@ fn a_pooled_load_through_a_throttled_ledger_loses_no_table() {
     let _lock = toxiproxy_guard();
     ensure_toxi_proxy("postgres_state", 15433, "postgres-state:5432");
     toxi_reset_toxics("postgres_state");
+    // A neighbour that panics between its toxi_disable and toxi_enable leaves the proxy off.
+    toxi_enable("postgres_state");
     require_alive(LiveService::PostgresStateToxi);
 
     let pg = SqlEngine::Pg;
