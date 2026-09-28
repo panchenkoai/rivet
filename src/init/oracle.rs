@@ -175,11 +175,43 @@ fn columns_of(conn: &mut OracleSource, schema: &str, table: &str) -> Result<Vec<
          WHERE c.owner = '{owner}' AND c.table_name = '{name}' \
          ORDER BY c.column_id"
     );
-    Ok(conn
+    let mut cols: Vec<ColumnInfo> = conn
         .query_rows(&columns_sql)?
         .iter()
         .filter_map(|r| column_info(r))
-        .collect())
+        .collect();
+    if !cols.iter().any(|c| c.is_primary_key) {
+        let uniques = conn.query_rows(&format!(
+            "SELECT k.constraint_name, MIN(cc.column_name), COUNT(*) FROM all_constraints k \
+             JOIN all_cons_columns cc ON cc.owner = k.owner AND cc.constraint_name = k.constraint_name \
+             WHERE k.constraint_type = 'U' AND k.owner = '{owner}' AND k.table_name = '{name}' \
+             GROUP BY k.constraint_name ORDER BY k.constraint_name"
+        ))?;
+        let single: Vec<String> = uniques
+            .iter()
+            .filter_map(|r| match r.as_slice() {
+                [_, Some(col), Some(n)] if n == "1" => Some(col.clone()),
+                _ => None,
+            })
+            .collect();
+        promote_unique_key(&mut cols, &single);
+    }
+    Ok(cols)
+}
+
+/// With no primary key, the first single-column UNIQUE key on a NOT NULL column becomes the key (MySQL reports that one as `PRI`).
+fn promote_unique_key(cols: &mut [ColumnInfo], single_column_uniques: &[String]) {
+    if cols.iter().any(|c| c.is_primary_key) {
+        return;
+    }
+    if let Some(c) = single_column_uniques
+        .iter()
+        .find_map(|u| cols.iter().position(|c| &c.name == u && !c.is_nullable))
+        .map(|i| &mut cols[i])
+    {
+        c.is_primary_key = true;
+        c.is_indexed = true;
+    }
 }
 
 /// One catalog row `(name, type, is_pk, is_indexed, nullable, precision, scale)`.
@@ -221,6 +253,47 @@ fn catalog_type(data_type: &str, precision: Option<u32>, scale: Option<i32>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn col(name: &str, nullable: bool, pk: bool) -> ColumnInfo {
+        ColumnInfo {
+            name: name.into(),
+            data_type: "number".into(),
+            is_primary_key: pk,
+            is_indexed: pk,
+            is_nullable: nullable,
+            numeric_precision: Some(19),
+            numeric_scale: Some(0),
+        }
+    }
+
+    #[test]
+    fn a_not_null_single_column_unique_key_stands_in_for_a_missing_primary_key() {
+        let mut cols = vec![col("A", true, false), col("ORDER_ID", false, false)];
+        promote_unique_key(&mut cols, &["A".into(), "ORDER_ID".into()]);
+        assert!(
+            !cols[0].is_primary_key,
+            "a nullable unique column cannot key a seek"
+        );
+        assert!(cols[1].is_primary_key && cols[1].is_indexed);
+
+        let mut with_pk = vec![col("ID", false, true), col("ORDER_ID", false, false)];
+        promote_unique_key(&mut with_pk, &["ORDER_ID".into()]);
+        assert!(
+            !with_pk[1].is_primary_key,
+            "a real primary key is never replaced"
+        );
+
+        let mut other_first = vec![col("NOTE", false, false), col("ORDER_ID", false, false)];
+        promote_unique_key(&mut other_first, &["ORDER_ID".into()]);
+        assert!(
+            !other_first[0].is_primary_key && other_first[1].is_primary_key,
+            "only the column the UNIQUE key names is promoted"
+        );
+
+        let mut none = vec![col("ORDER_ID", false, false)];
+        promote_unique_key(&mut none, &[]);
+        assert!(!none[0].is_primary_key, "no unique key, no stand-in");
+    }
 
     #[test]
     fn oracle_types_map_onto_the_classifier_vocabulary() {
