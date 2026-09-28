@@ -362,16 +362,15 @@ pub(in crate::pipeline) fn run_chunked_parallel_checkpoint(
                                 // produced (max_file_size rotation included).
                                 // The parent drains each PartRecord through
                                 // commit::record_part post-scope.
-                                let mut recs = Vec::new();
-                                if let Err(e) = super::super::commit::write_sink_parts(
+                                let (mut recs, wrote) = super::super::commit::write_sink_parts(
                                     &**shared_destination,
                                     &mut sink,
                                     plan_w.validate.then_some(plan_w.format),
                                     |idx, count| {
                                         super::super::commit::part_indexed_name(&base, idx, count)
                                     },
-                                    &mut recs,
-                                ) {
+                                );
+                                if let Err(e) = wrote {
                                     debris.append(&mut recs);
                                     return Err(e);
                                 }

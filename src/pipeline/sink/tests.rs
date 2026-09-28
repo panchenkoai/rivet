@@ -1720,3 +1720,51 @@ fn a_byte_capped_parquet_sink_sizes_its_row_groups_and_a_csv_sink_does_not() {
     );
     assert_eq!(capped(crate::config::FormatType::Csv), None);
 }
+
+// ── sealing and draining parts ───────────────────────────────────────────
+
+/// A sink holding two rotated parts and an open tail of one row each.
+fn sink_with_three_parts() -> ExportSink {
+    let (mut sink, schema) = sink_with_partition_budget(1);
+    sink.on_schema(schema.clone()).unwrap();
+    sink.on_batch_inner(&day_batch(&schema, vec![Some(0), Some(1), Some(2)]))
+        .unwrap();
+    sink
+}
+
+/// Sealing hands over every rotated part plus the open tail, and leaves the sink empty.
+#[test]
+fn seal_parts_hands_over_every_part_and_the_tail_once() {
+    let mut sink = sink_with_three_parts();
+    let parts = sink.seal_parts().unwrap();
+    assert_eq!(
+        parts.iter().map(|p| p.rows).collect::<Vec<_>>(),
+        vec![1, 1, 1],
+        "two rotated parts and the sealed tail"
+    );
+    assert_eq!(sink.part_rows, 0, "the tail is no longer open");
+    assert!(
+        sink.seal_parts().unwrap().is_empty(),
+        "a second seal hands over nothing"
+    );
+}
+
+/// A failed part write still hands back every part that reached the destination first.
+#[test]
+fn write_sink_parts_returns_the_durable_parts_beside_a_later_failure() {
+    let mut sink = sink_with_three_parts();
+    let dest = crate::pipeline::commit::tests::NthWriteFails::after(1);
+    let (parts, wrote) =
+        crate::pipeline::commit::write_sink_parts(&dest, &mut sink, None, |i, n| {
+            crate::pipeline::commit::part_indexed_name("t.csv", i, n)
+        });
+    assert!(wrote.is_err(), "the second part's refusal is the outcome");
+    assert_eq!(
+        parts
+            .iter()
+            .map(|p| p.file_name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["t_p0.csv"],
+        "exactly the part that landed before the failure"
+    );
+}

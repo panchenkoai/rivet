@@ -97,14 +97,13 @@ fn keyset_plan(plan: &ResolvedRunPlan) -> &KeysetPlan {
     }
 }
 
-/// One keyset page produced by [`read_keyset_page`]: the parts written to the
-/// destination, the row count, the dest schema (for the run fingerprint), and
-/// the typed high-water cursor to advance from. The two runners
-/// ([`run_keyset`] sequential, `mongo_parallel::range_worker` parallel) share
+/// One keyset page produced by [`read_keyset_page`]: the row count, the dest
+/// schema (for the run fingerprint), and the typed high-water cursor to advance
+/// from. The page's durable parts travel BESIDE it (see [`PageRead`]), so a page
+/// that failed part-way still hands over the parts it wrote. The runners share
 /// the page READ; they differ only in WHEN the parts commit, which stays each
 /// caller's business.
 pub(crate) struct KeysetPage {
-    pub(crate) parts: Vec<super::commit::PartRecord>,
     pub(crate) rows: usize,
     /// What this page's sink SAW: dest schema (run fingerprint) + column max bytes.
     pub(crate) observed: super::commit::Observations,
@@ -116,9 +115,12 @@ pub(crate) struct KeysetPage {
     pub(crate) checksums: super::commit::UnitChecksums,
 }
 
+/// The parts a page read made durable, and the page (`None` when empty) or the error that stopped it.
+pub(crate) type PageRead = (Vec<super::commit::PartRecord>, Result<Option<KeysetPage>>);
+
 /// Read ONE seek page: `find`-and-seek from `cursor` (or the range floor), write
 /// its parts to `dest` named by `part_base`, and report the page + the typed
-/// high-water cursor. Returns `None` when the page is empty (range exhausted).
+/// high-water cursor. The page is `None` when empty (range exhausted).
 ///
 /// Paging control stays with the caller via the returned `rows`/`next_cursor`:
 /// a page shorter than `page_size` is the last one; a full page whose
@@ -132,7 +134,7 @@ pub(crate) fn read_keyset_page(
     cursor: Option<&str>,
     dest: &dyn destination::Destination,
     part_base: &str,
-) -> Result<Option<KeysetPage>> {
+) -> PageRead {
     read_keyset_page_bounded(
         src, plan, key_plan, page_size, cursor, None, dest, part_base,
     )
@@ -151,7 +153,46 @@ pub(crate) fn read_keyset_page_bounded(
     upper: Option<&str>,
     dest: &dyn destination::Destination,
     part_base: &str,
-) -> Result<Option<KeysetPage>> {
+) -> PageRead {
+    let mut sink = match fill_keyset_page(src, plan, key_plan, page_size, cursor, upper) {
+        Ok(Some(sink)) => sink,
+        Ok(None) => return (Vec::new(), Ok(None)),
+        Err(e) => return (Vec::new(), Err(e)),
+    };
+    let rows = sink.total_rows;
+    let observed = sink.take_observations();
+    // Shared commit path (I1→I2→I7 + counters + journal + fault hooks).
+    // write_sink_parts drains every part the sink produced — the final temp file
+    // plus anything maybe_split rotated at max_file_size — so rotation can't drop.
+    let (parts, wrote) = super::commit::write_sink_parts(
+        dest,
+        &mut sink,
+        plan.validate.then_some(plan.format),
+        |idx, count| super::commit::part_indexed_name(part_base, idx, count),
+    );
+    let page = wrote.map(|()| {
+        Some(KeysetPage {
+            rows,
+            observed,
+            // The source's own lossless token (Mongo BSON `_id`) when it reported
+            // one, else the column-extracted string (every SQL engine).
+            next_cursor: sink.effective_cursor(),
+            first_cursor: sink.first_cursor_value.clone(),
+            checksums: sink.take_checksums(),
+        })
+    });
+    (parts, page)
+}
+
+/// Run one seek page's query into a fresh sink; `None` when the page is empty.
+fn fill_keyset_page(
+    src: &mut dyn Source,
+    plan: &ResolvedRunPlan,
+    key_plan: &IncrementalCursorPlan,
+    page_size: usize,
+    cursor: Option<&str>,
+    upper: Option<&str>,
+) -> Result<Option<ExportSink>> {
     let cursor_state = cursor.map(|v| CursorState {
         export_name: plan.export_name.clone(),
         last_cursor_value: Some(v.to_string()),
@@ -171,32 +212,10 @@ pub(crate) fn read_keyset_page_bounded(
         &mut sink,
     )?;
     sink.finish_writer()?;
-    let rows = sink.total_rows;
-    if rows == 0 {
+    if sink.total_rows == 0 {
         return Ok(None); // range exhausted, or an exact-multiple last page
     }
-    let observed = sink.take_observations();
-    // Shared commit path (I1→I2→I7 + counters + journal + fault hooks).
-    // write_sink_parts drains every part the sink produced — the final temp file
-    // plus anything maybe_split rotated at max_file_size — so rotation can't drop.
-    let mut parts = Vec::new();
-    super::commit::write_sink_parts(
-        dest,
-        &mut sink,
-        plan.validate.then_some(plan.format),
-        |idx, count| super::commit::part_indexed_name(part_base, idx, count),
-        &mut parts,
-    )?;
-    Ok(Some(KeysetPage {
-        parts,
-        rows,
-        observed,
-        // The source's own lossless token (Mongo BSON `_id`) when it reported
-        // one, else the column-extracted string (every SQL engine).
-        next_cursor: sink.effective_cursor(),
-        first_cursor: sink.first_cursor_value.clone(),
-        checksums: sink.take_checksums(),
-    }))
+    Ok(Some(sink))
 }
 
 /// The 0-indexed ROW offset of the i-th of `parts` percentile boundaries over `total`
@@ -627,7 +646,7 @@ fn run_keyset_parallel(
                         "{}_{}_pk_w{}_{}.{}",
                         plan_r.export_name, tag_r, ridx, pages, ext_r
                     );
-                    let page = read_keyset_page_bounded(
+                    let (parts, page) = read_keyset_page_bounded(
                         &mut *wsrc,
                         plan_r,
                         key_plan_r,
@@ -636,18 +655,24 @@ fn run_keyset_parallel(
                         hi.as_deref(),
                         &**dest,
                         &base,
-                    )
-                    .map_err(|e| anyhow::anyhow!("page {pages}: {e:#}"))?;
-                    let Some(page) = page else { break };
-                    fan_r.observe(page.observed);
-                    rmax = page.next_cursor.clone().or(rmax);
-                    for p in &page.parts {
+                    );
+                    // The parquet is durable the moment `read_keyset_page_bounded`
+                    // returns — publish its parts now, before the range commits and
+                    // before a failed page's error propagates, so a range that later
+                    // fails still counts them (#200-1). Cursor and checksums stay
+                    // commit-gated below.
+                    for p in parts {
                         range_parts.push(crate::state::KeysetRangePart {
                             file_name: p.file_name.clone(),
                             rows: p.rows,
                             bytes: p.bytes as i64,
                         });
+                        fan_r.part(unit, p);
                     }
+                    let page = page.map_err(|e| anyhow::anyhow!("page {pages}: {e:#}"))?;
+                    let Some(page) = page else { break };
+                    fan_r.observe(page.observed);
+                    rmax = page.next_cursor.clone().or(rmax);
                     if ridx == 0 {
                         // Range 0 is the LOWEST range: its first key is the
                         // run's observed floor (#151).
@@ -655,13 +680,6 @@ fn run_keyset_parallel(
                         if first.is_none() {
                             *first = page.first_cursor.clone();
                         }
-                    }
-                    // The parquet is durable the moment `read_keyset_page_bounded`
-                    // returns — publish its parts now, before the range commits, so
-                    // a range that later fails still counts them (#200-1). Cursor
-                    // and checksums stay commit-gated below.
-                    for p in page.parts {
-                        fan_r.part(unit, p);
                     }
                     local_checks.push(page.checksums);
                     let last_page = is_last_page(page.rows, page_size);
@@ -1066,7 +1084,7 @@ pub(crate) fn run_keyset(
             seek_tag(last.as_deref()),
             ext
         );
-        let Some(mut page) = read_keyset_page(
+        let (parts, page) = read_keyset_page(
             src,
             plan,
             &key_plan,
@@ -1074,8 +1092,30 @@ pub(crate) fn run_keyset(
             last.as_deref(),
             dest.as_ref(),
             &base,
-        )?
-        else {
+        );
+        let page = match page {
+            Ok(page) => page,
+            Err(e) => {
+                // A page that failed part-way: its earlier parts are durable, so they
+                // are recorded (no cursor_high — the page never completed) before the
+                // error leaves, or `files_committed` under-counts for the retry guard.
+                for rec in &parts {
+                    super::commit::record_part(
+                        plan,
+                        summary,
+                        state,
+                        rec,
+                        super::commit::PartKind::Page {
+                            page_index: pages as i64,
+                            cursor_high: None,
+                        },
+                        super::commit::UnitId::Page(pages as i64),
+                    );
+                }
+                return Err(e);
+            }
+        };
+        let Some(mut page) = page else {
             // No further rows (the seek past the last full page came back empty):
             // the last advanced key is the run's high-water. This is the OTHER exit
             // from the short-page break below — a table whose size is an exact
@@ -1110,8 +1150,8 @@ pub(crate) fn run_keyset(
         // reconcile (above) means a committed page is never re-read, so a dedup normally fires only
         // in the mid-page-crash fallback (below); `record_part` counts each part's rows once, so a
         // deduped re-read of a rehydrated part adds nothing.
-        let n_parts = page.parts.len();
-        for (pi, rec) in page.parts.iter().enumerate() {
+        let n_parts = parts.len();
+        for (pi, rec) in parts.iter().enumerate() {
             // v25: stamp the page's high-water key ONLY on the LAST part's file_log row — the
             // point at which the WHOLE page is committed. On resume, `last` reconciles to the max
             // committed `cursor_high`, so a page that fully committed is skipped (never re-read →
@@ -1545,5 +1585,75 @@ mod tests {
             }
             prop_assert_eq!(ranges[ranges.len() - 1].2.as_deref(), ceil.as_deref());
         });
+    }
+
+    /// A source whose page is three rows over three distinct days of `d`.
+    struct ThreeDays;
+    impl Source for ThreeDays {
+        fn export(
+            &mut self,
+            _request: &source::ExportRequest<'_>,
+            sink: &mut dyn source::BatchSink,
+        ) -> Result<()> {
+            use arrow::datatypes::{DataType, Field, Schema};
+            let schema =
+                std::sync::Arc::new(Schema::new(vec![Field::new("d", DataType::Date32, true)]));
+            sink.on_schema(schema.clone())?;
+            let days = arrow::array::Date32Array::from(vec![0, 1, 2]);
+            sink.on_batch(&arrow::record_batch::RecordBatch::try_new(
+                schema,
+                vec![std::sync::Arc::new(days)],
+            )?)
+        }
+        fn query_scalar(&mut self, _sql: &str) -> Result<Option<String>> {
+            Ok(None)
+        }
+        fn type_mappings(
+            &mut self,
+            _query: &str,
+            _overrides: &crate::types::ColumnOverrides,
+        ) -> Result<Vec<crate::types::TypeMapping>> {
+            Ok(vec![])
+        }
+    }
+
+    /// A page the sink rotated hands back the part that landed before a later part failed.
+    #[test]
+    fn a_page_that_fails_part_way_still_hands_back_its_durable_part() {
+        let mut plan = crate::pipeline::commit::tests::test_plan();
+        plan.partition_rollover = Some(crate::plan::rollover::PartitionRollover {
+            column: "d".into(),
+            granularity: crate::config::load::Granularity::Day,
+            cap: 1,
+        });
+        let key = IncrementalCursorPlan {
+            primary_column: "d".into(),
+            fallback_column: None,
+            mode: IncrementalCursorMode::SingleColumn,
+            settle: None,
+        };
+        let dest = crate::pipeline::commit::tests::NthWriteFails::after(1);
+        let (parts, page) = read_keyset_page_bounded(
+            &mut ThreeDays,
+            &plan,
+            &key,
+            10,
+            None,
+            None,
+            &dest,
+            "k.parquet",
+        );
+        assert!(
+            page.is_err(),
+            "the refused second part is the page's outcome"
+        );
+        assert_eq!(
+            parts
+                .iter()
+                .map(|p| p.file_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["k_p0.parquet"],
+            "the durable first part must survive the failure"
+        );
     }
 }

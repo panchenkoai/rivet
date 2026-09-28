@@ -10,7 +10,7 @@ use std::time::Duration;
 use super::RunSummary;
 use super::chunked::{run_chunked_sequential, run_chunked_sequential_checkpoint};
 use super::retry::{RetryClass, classify_error};
-use super::sink::{CompletedPart, ExportSink};
+use super::sink::ExportSink;
 use super::validate::validate_output;
 use crate::error::{DataIntegrityError, Result};
 use crate::journal::RunEvent;
@@ -391,25 +391,20 @@ pub(super) fn run_single_export(
         return Ok(());
     }
 
-    if sink.part_rows > 0 {
-        sink.completed_parts.push(CompletedPart {
-            tmp: std::mem::replace(&mut sink.tmp, tempfile::NamedTempFile::new()?),
-            rows: sink.part_rows,
-        });
-    }
+    let parts = sink.seal_parts()?;
 
     let frame = super::frame::RunnerFrame::open(plan)?;
     let (dest, ext) = (frame.dest, frame.ext);
     let ext = ext.as_str();
 
-    let has_parts = sink.completed_parts.len() > 1;
+    let has_parts = parts.len() > 1;
     // Millisecond precision (matches keyset.rs / mongo_parallel.rs / cdc sink):
     // two runs into the same prefix within the same SECOND must not produce
     // identical part names, or the later run silently clobbers the earlier's file
     // (LocalDestination idempotent_overwrite) — a real incremental-delta loss.
     let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f");
 
-    for (part_idx, part) in sink.completed_parts.iter().enumerate() {
+    for (part_idx, part) in parts.iter().enumerate() {
         // Test-only: a RETURNED error mid-commit-loop (not a crash — a panic
         // never reaches the retry decider at all). Proves the boundary the
         // runner-coverage matrix argues "by construction": an error at part N

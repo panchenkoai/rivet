@@ -167,7 +167,7 @@ fn range_worker_pages(
         // Deferred commit: the worker collects its parts (the main thread drains
         // them through `record_part`), unlike the sequential runner which commits
         // each page as it arrives — the one axis the two callers differ on.
-        let Some(p) = super::keyset::read_keyset_page(
+        let (parts, p) = super::keyset::read_keyset_page(
             &mut src,
             plan,
             key_plan,
@@ -175,14 +175,15 @@ fn range_worker_pages(
             last.as_deref(),
             &**dest,
             &base,
-        )?
-        else {
+        );
+        // Published before a failed page's error leaves, so its durable parts still count.
+        for part in parts {
+            fan.part(unit, part);
+        }
+        let Some(p) = p? else {
             break;
         };
         fan.observe(p.observed);
-        for part in p.parts {
-            fan.part(unit, part);
-        }
         fan.contribute(unit, p.checksums);
         page += 1;
 

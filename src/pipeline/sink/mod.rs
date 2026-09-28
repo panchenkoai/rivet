@@ -36,13 +36,13 @@ pub(crate) struct ExportSink {
     pub(in crate::pipeline) format_type: FormatType,
     pub(in crate::pipeline) compression: CompressionType,
     pub(in crate::pipeline) compression_level: Option<u32>,
-    pub(in crate::pipeline) tmp: tempfile::NamedTempFile,
+    tmp: tempfile::NamedTempFile,
     pub(in crate::pipeline) total_rows: usize,
     /// The RUN-wide bytes-read counter, shared from `plan.bytes_read` (every
     /// sink this run creates — per chunk, per worker — increments the same
     /// `Arc`, so accumulation is runner-agnostic by construction; see #175).
     pub(in crate::pipeline) bytes_read: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    pub(in crate::pipeline) part_rows: usize,
+    part_rows: usize,
     /// Cursor column name (with internal columns), set from plan at construction.
     /// When `Some`, `on_batch` extracts the last cursor value inline so we never
     /// hold a full batch in memory just for post-run cursor commit.
@@ -69,7 +69,7 @@ pub(crate) struct ExportSink {
     /// The declared quality rules and everything accumulated against them.
     pub(in crate::pipeline) quality: QualityTracker,
     pub(in crate::pipeline) max_file_size: Option<u64>,
-    pub(in crate::pipeline) completed_parts: Vec<CompletedPart>,
+    completed_parts: Vec<CompletedPart>,
     /// When set, this column is removed from Arrow batches before enrichment and write (the coalesce cursor).
     pub(in crate::pipeline) strip_internal_column: Option<String>,
     /// Running per-column max byte length for string/binary columns (Epic 8).
@@ -694,6 +694,19 @@ impl ExportSink {
             w.finish()?;
         }
         Ok(())
+    }
+
+    /// Close the writer, seal the partial tail as the last part, and hand over every part.
+    pub(in crate::pipeline) fn seal_parts(&mut self) -> Result<Vec<CompletedPart>> {
+        self.finish_writer()?;
+        if self.part_rows > 0 {
+            self.completed_parts.push(CompletedPart {
+                tmp: std::mem::replace(&mut self.tmp, tempfile::NamedTempFile::new()?),
+                rows: self.part_rows,
+            });
+            self.part_rows = 0;
+        }
+        Ok(std::mem::take(&mut self.completed_parts))
     }
 
     pub(in crate::pipeline) fn split_now(&mut self) -> Result<()> {

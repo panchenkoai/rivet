@@ -105,14 +105,13 @@ fn export_one_chunk_range(
     let dest = frame.dest;
     // Worker-safe half of commit (I1 + dest.write + fingerprint), draining
     // every part the sink produced (max_file_size rotation included).
-    let mut recs = Vec::new();
-    if let Err(e) = super::super::commit::write_sink_parts(
+    let (mut recs, wrote) = super::super::commit::write_sink_parts(
         dest.as_ref(),
         &mut sink,
         plan.validate.then_some(plan.format),
         |idx, count| super::super::commit::part_indexed_name(&base, idx, count),
-        &mut recs,
-    ) {
+    );
+    if let Err(e) = wrote {
         debris.append(&mut recs);
         return Err(e);
     }
