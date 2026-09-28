@@ -132,25 +132,6 @@ jobs:
           done
           [ "$FAIL" = "0" ]
 
-  # docs-as-code gate: docs/reference/{config,cli}-reference.md are GENERATED from
-  # the binary (schemars Config + clap Cli), so the reference cannot drift from the
-  # code. If a struct field / flag / enum changes, the committed reference must be
-  # regenerated. Mirrors the schema_drift test's role for rivet.schema.json — the
-  # whole point is to retire manual doc-vs-code verification (the 0.18 docs pass).
-  docs-generated:
-    name: Generated docs are in sync (docs-as-code)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.94"
-      - uses: Swatinem/rust-cache@v2
-      - name: Reference docs are regenerated from code (clap + schema)
-        run: |
-          cargo build --bin rivet
-          python3 -m dev.pytools.docgen --check
-
   boundary:
     name: OSS must not depend on rivet-pro (one-way seam, ADR-0026)
     runs-on: ubuntu-latest
@@ -1334,39 +1315,27 @@ jobs:
           haskell: true
           swap-storage: false
       - run: cargo test --all-targets
-
-  test-invariants:
-    name: Invariant tests (semantic gate)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.94"
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --test invariants --test journal_invariants
-
-  test-recovery:
-    name: Recovery tests (semantic gate)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.94"
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --test recovery
-
-  test-compatibility:
-    name: Compatibility matrix tests (semantic gate)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.94"
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --lib -- plan::validate::tests
+      # The semantic gates below were five jobs that each recompiled the crate to
+      # re-run tests `--all-targets` had just run. They are steps now: the binaries
+      # are built, so each is seconds, and each still fails under its own name.
+      - name: Invariant tests (semantic gate)
+        run: cargo test --test invariants --test journal_invariants
+      - name: Recovery tests (semantic gate)
+        run: cargo test --test recovery
+      - name: Compatibility matrix tests (semantic gate)
+        run: cargo test --lib -- plan::validate::tests
+      - name: Type mapping contracts (semantic gate)
+        run: cargo test --test type_roundtrip contract_
+      - name: Stability tests — format & row-group goldens (semantic gate)
+        run: cargo test --test format_golden
+      - name: Stability tests — sink unit tests (semantic gate)
+        run: cargo test --lib -- pipeline::sink::tests
+      # docs-as-code: docs/reference/{config,cli}-reference.md are GENERATED from the
+      # binary (schemars Config + clap Cli); the committed reference must be current.
+      - name: Generated docs are in sync (docs-as-code)
+        run: |
+          cargo build --bin rivet
+          python3 -m dev.pytools.docgen --check
 
   # release-compat REMOVED from PR CI (2026-08-04).
   #
@@ -1385,33 +1354,6 @@ jobs:
   #
   # nightly-live.yml::release-compat-artifacts is untouched — it covers the
   # `artifacts` axis, which needs a live postgres.
-
-  test-types:
-    name: Type mapping contracts (semantic gate)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.94"
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --test type_roundtrip contract_
-
-  test-stability:
-    name: Stability tests — Phase 1 (semantic gate)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.94"
-      - uses: Swatinem/rust-cache@v2
-      - name: Format & row-group golden tests
-        run: cargo test --test format_golden
-      - name: Sink unit tests (quality cap, auto_shrink)
-        run: cargo test --lib -- pipeline::sink::tests
-      - name: Plan validate unit tests
-        run: cargo test --lib -- plan::validate::tests
 
   test-type-golden:
     name: Type-golden tests (semantic gate)
@@ -1435,6 +1377,38 @@ jobs:
 
       - name: Run type-golden tests
         run: cargo test --test live_type_golden -- --ignored
+
+      # The PR regression matrices (dev/matrices/, shell-level CLI / config / path
+      # guards) need the same two databases and a debug `rivet`; they ran as their
+      # own job, which compiled the crate a second time for them.
+      - name: Build rivet (debug)
+        run: cargo build --bin rivet
+
+      - name: Create matrix navigation links
+        env:
+          RIVET_BIN: ${{ github.workspace }}/target/debug/rivet
+        run: python3 -m dev.pytools.matrix_common setup-links
+
+      - name: PR regression matrices (cli + cfg + path)
+        env:
+          RIVET_BIN: ${{ github.workspace }}/target/debug/rivet
+        # `shell: bash` + pipefail: Actions' default `bash -e` has no pipefail, so
+        # `matrices … | tee run.log` would exit with tee's status and never fail.
+        shell: bash
+        run: |
+          set -o pipefail
+          python3 -m dev.pytools.matrices --tier=pr --skip-compose | tee dev/matrices/run.log
+
+      - name: Upload matrix logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: matrices-pr-logs
+          path: |
+            dev/cli_matrix/logs/
+            dev/cfg_matrix/logs/
+            dev/path_matrix/logs/
+          retention-days: 14
 
       - name: Stop services
         if: always()
@@ -1734,66 +1708,6 @@ jobs:
           --skip mssql_checkpoint_from_another_database --skip from_a_standby
           --skip loads_into_bigquery_or_refuses_by_column
           --skip cleanup_source_never_deletes_parts --skip compact_after_a_source_alter
-
-      - name: Stop services
-        if: always()
-        run: docker compose down
-
-  cli-matrix:
-    name: PR regression matrices (cli + cfg + path)
-    runs-on: ubuntu-latest
-    # Shell-based regression guards under dev/matrices/. Catches UX and
-    # config-surface regressions that unit tests miss. See dev/matrices/README.md.
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.94"
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Start databases
-        run: docker compose up -d postgres mysql
-
-      - name: Wait for databases
-        run: |
-          echo "Waiting for Postgres..."
-          for i in $(seq 1 30); do docker compose exec -T postgres pg_isready -U rivet && break || sleep 2; done
-          echo "Waiting for MySQL..."
-          for i in $(seq 1 30); do docker compose exec -T mysql mysqladmin ping -h localhost -uroot -privet 2>/dev/null && break || sleep 2; done
-
-      - name: Build rivet (debug)
-        # Debug, not --release: the matrices probe CLI / config / path SURFACE
-        # behavior, not throughput, so the fat-LTO release build buys nothing.
-        # The staging step honours $RIVET_BIN, so point it at the debug binary.
-        run: cargo build --bin rivet
-
-      - name: Create matrix navigation links
-        env:
-          RIVET_BIN: ${{ github.workspace }}/target/debug/rivet
-        run: python3 -m dev.pytools.matrix_common setup-links
-
-      - name: Run PR matrix tier
-        env:
-          RIVET_BIN: ${{ github.workspace }}/target/debug/rivet
-        # `shell: bash` + pipefail, because Actions' default is `bash -e` WITHOUT
-        # pipefail: `matrices … | tee run.log` exited with tee's status, so this
-        # gate could not fail no matter what the matrices reported. Inherited from
-        # the bash line this replaced — same shape, same silence.
-        shell: bash
-        run: |
-          set -o pipefail
-          python3 -m dev.pytools.matrices --tier=pr --skip-compose | tee dev/matrices/run.log
-
-      - name: Upload artifacts on failure
-        if: failure()
-        uses: actions/upload-artifact@v7
-        with:
-          name: matrices-pr-logs
-          path: |
-            dev/cli_matrix/logs/
-            dev/cfg_matrix/logs/
-            dev/path_matrix/logs/
-          retention-days: 14
 
       - name: Stop services
         if: always()
