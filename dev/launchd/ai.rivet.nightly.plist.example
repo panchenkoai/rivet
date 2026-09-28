@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- The nightly gate + prev-vs-cur soak (dev/pytools/nightly.py) at 02:00. Copy to
+     ~/Library/LaunchAgents/, fix the paths, then: launchctl load ~/Library/LaunchAgents/ai.rivet.nightly.plist -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>ai.rivet.nightly</string>
+  <key>WorkingDirectory</key><string>/Users/YOU/rivet</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/uv</string><string>run</string><string>python</string>
+    <string>dev/pytools/nightly.py</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict><key>COMPOSE_PROJECT_NAME</key><string>rivet</string></dict>
+  <key>StartCalendarInterval</key><dict><key>Hour</key><integer>2</integer><key>Minute</key><integer>0</integer></dict>
+  <key>StandardOutPath</key><string>/tmp/rivet-nightly.log</string>
+  <key>StandardErrorPath</key><string>/tmp/rivet-nightly.log</string>
+</dict>
+</plist>

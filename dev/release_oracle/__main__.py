@@ -55,13 +55,16 @@ from . import (
     failure,
     gifs,
     init_delta,
+    live_modules,
     partner_shape,
+    perf,
     regression,
     release_path,
     scenarios,
     shared_state,
     state_parity,
     tls_downgrade,
+    upgrade,
     warehouse_layout,
 )
 
@@ -287,6 +290,78 @@ def _self_test() -> int:
     assert hv("postgres", {"pg_blks_hit": 1}, {"pg_blks_hit": 999999}, 1.25, 200) == ([], []), \
         "cache counters are recorded, not graded"
     print("self-test ok: a source-harm counter past the previous release fails the gate")
+    # The derived live-module run: an exclusion names a module that exists, and the filter
+    # drops what a dedicated cell already ran.
+    mods = live_modules.live_suite_modules()
+    stale = [m for m in live_modules.EXCLUDED if m not in mods]
+    assert not stale, f"live_modules.EXCLUDED names modules live_suite no longer has: {stale}"
+    left, expr = live_modules.derived_filter(["a", "b", "common"], {"b"}, {"t_1"})
+    assert left == ["a"] and expr == "(test(/^a::/)) - test(/::(t_1)$/)", (left, expr)
+    # perf: a regression past the tolerance fails, noise under the absolute slack does not.
+    from .perf import Sample, perf_verdict
+    base = Sample(True, 1.0, 0.02, 50 * 1024 * 1024, {})
+    assert perf_verdict("postgres", base, Sample(True, 1.05, 0.05, 50 * 1024 * 1024, {})) == []
+    assert perf_verdict("postgres", base, Sample(True, 2.0, 0.02, 50 * 1024 * 1024, {}))
+    assert perf_verdict("postgres", base, Sample(True, 1.0, 0.02, 200 * 1024 * 1024, {}))
+    # cdc-conns: the ceiling holds even when the previous release was worse, and one
+    # connection more than the previous release is a regression under the ceiling too.
+    from .perf import conns_verdict
+    assert conns_verdict("postgres", 5, 2) == [] and conns_verdict("postgres", 2, 3)
+    assert conns_verdict("mongo", 3, 4) and conns_verdict("mongo", 6, 6) == []
+    # A path graded without its wall still fails on CPU, and passes a slower wall alone.
+    from .perf import _grade
+    slow_wall = Ledger(colour=False)
+    _grade(slow_wall, "mongo", "p", base, Sample(True, 9.0, 0.02, 50 * 1024 * 1024, {}), wall=False)
+    assert not slow_wall.red, "wall=False must not grade the wall"
+    hot_cpu = Ledger(colour=False)
+    _grade(hot_cpu, "mongo", "p", base, Sample(True, 1.0, 5.0, 50 * 1024 * 1024, {}), wall=False)
+    assert hot_cpu.red, "wall=False must still grade CPU"
+    # An INTERNAL error anywhere in a gated command's output is a gate failure.
+    from . import core as _core
+    _core.note_invariant_violations(["rivet", "run"], "Error: [RIVET_INTERNAL_SPILL] cdc spill: sealed twice")
+    _core.note_invariant_violations(["rivet", "run"], 'a row mentions RIVET_INTERNAL_ in its data')
+    assert len(_core.INTERNAL_HITS) == 1, _core.INTERNAL_HITS
+    _core.INTERNAL_HITS.clear()
+    # Known reds: an in-date entry downgrades its failure, an expired one does not, and an
+    # entry nothing matched in a full run is reported as fixed.
+    import datetime as _dt
+    from . import known_red as kr
+    # A synthetic registry, so the check does not depend on how many real reds are open.
+    real_reds = kr.KNOWN_RED
+    kr.KNOWN_RED = (kr.KnownRed("probe-red-a", "self-test", "2099-01-01"),
+                    kr.KnownRed("probe-red-b", "self-test", "2099-01-01"))
+    k = kr.KNOWN_RED[0]
+    assert kr.match(f"x {k.match} y", _dt.date(2026, 1, 1)) == (k, True)
+    assert kr.match(f"x {k.match} y", _dt.date(2099, 1, 2)) == (k, False)
+    assert kr.match("an unrelated failure", _dt.date(2026, 1, 1)) == (None, False)
+    probe = Ledger(colour=False)
+    probe.failed("-", "-", "s", "-", f"boom {k.match}")
+    assert probe.cells[-1].status is Status.KNOWN and not probe.red
+    from .scenarios import _failed
+    from .scenarios import _passed
+    seen = Ledger(colour=False)
+    _passed(seen, "-", "-", "s", "-", f"ok {k.match}")
+    assert k.match in seen.known_passed, "a scenario PASS must reach the known-red registry"
+    via = Ledger(colour=False)
+    _failed(via, "-", "-", "s", "-", f"boom {k.match}", "detail")
+    assert via.cells[-1].status is Status.KNOWN, "a scenario failure must meet the known-red registry"
+    probe.close_known_red()
+    assert probe.red, "an entry that matched nothing in a full run must fail"
+    other = kr.KNOWN_RED[-1]
+    shown = Ledger(colour=False)
+    shown.passed("-", "-", "s", "-", f"ok {other.match}")
+    shown.close_known_red()
+    said = [c.detail for c in shown.cells if c.scenario == "known_red"]
+    assert any(other.match in d and "PASSED" in d for d in said), said
+    assert any(k.match in d and "no cell" in d for d in said), said
+    kr.KNOWN_RED = real_reds
+    from .core import SKIP_ALLOWED
+    from .live_modules import exclusive_tests
+    live_src = "\n".join(f.read_text() for f in (ROOT / "tests" / "live").glob("*.rs"))
+    for key in SKIP_ALLOWED:
+        assert f"fn {key.split('::')[-1]}(" in live_src, f"SKIP_ALLOWED names no live test: {key}"
+    assert exclusive_tests(), "no live+exclusive test found — the exclusive pass would grade nothing"
+    print("self-test ok: live modules are derived; perf tolerances grade regressions, not noise")
     print("\nregression stage (child harness, stand, banner):")
     return regression._self_test()
 
@@ -427,7 +502,7 @@ def clean_tree_and_build(led: Ledger, *, fast: bool = False) -> bool:
         led.failed(
             "-", "-", "clean_tree", "-",
             f"clean tree: the release build FAILED on a clean tree — nothing below can mean "
-            f"anything: {(build.err or build.out)[-300:]}",
+            f"anything: {(build.stderr or build.stdout)[-300:]}",
         )
         return False
     how = ("target/package removed (fast: cargo fingerprints trusted, binary=HEAD)"
@@ -478,6 +553,8 @@ def preflight(led: Ledger, *, bless_gifs: bool = False) -> None:
     cdc.verify_cdc_e2e(led)
     cdc.verify_cdc_differential(led)
     regression.verify_release_regression(led)
+    upgrade.verify_upgrade_continuity(led)
+    perf.verify_perf_regression(led)
     regression.verify_harm_regression(led)
     # The two prev-release harnesses, next to the stage that shares their
     # baseline (`RIVET_PREV_RELEASE_BIN`) — and, like it, they FAIL rather than
@@ -557,6 +634,10 @@ def bring_up(led: Ledger, engine: str, tag: str, image: str, port: int) -> str |
     # named ones, on a disk at 89%. The engines are seeded from scratch every
     # run, so there is nothing in them worth keeping past teardown.
     docker("rm", "-fv", name)
+    # Engines get their own network, not `bridge`: a killed run can leave a phantom endpoint
+    # for this name in `bridge` that no disconnect clears, and every later run then fails to
+    # start the container. They are reached through published ports, so nothing else changes.
+    docker("network", "create", "rivet-gate-engines")
 
     # Every engine ran with NO memory limit, and each then sized itself off the
     # WHOLE Docker VM rather than off what a 150k-row fixture needs. Measured on
@@ -590,7 +671,7 @@ def bring_up(led: Ledger, engine: str, tag: str, image: str, port: int) -> str |
     # Multiples, not tight fits: those samples are moments during the matrix, not
     # proven peaks, and a cap that OOM-kills a container mid-run surfaces as a
     # product failure rather than as a resource decision.
-    args: list[str] = ["run", "-d", "--name", name]
+    args: list[str] = ["run", "-d", "--name", name, "--network", "rivet-gate-engines"]
     cmd: list[str] = []
     if engine == "postgres":
         args += ["--memory", "512m",
@@ -616,8 +697,9 @@ def bring_up(led: Ledger, engine: str, tag: str, image: str, port: int) -> str |
         led.skipped(engine, tag, "all", "-", f"{engine}:{tag} unknown engine kind")
         return None
 
-    if not docker(*args, image, *cmd).ok:
-        led.skip(f"{engine}:{tag} could not start ({image})")
+    started = docker(*args, image, *cmd)
+    if not started.ok:
+        led.skip(f"{engine}:{tag} could not start ({image}): {started.stderr.strip()[-200:]}")
         return None
 
     # One engine may need SEVERAL probe spellings across the versions this gate
@@ -922,10 +1004,29 @@ def engine_loop(led: Ledger, ns: argparse.Namespace) -> None:
         subs[engine].flush_into(led)
 
 
+def _hold_gate_lock():
+    """An exclusive lock on this tree's target dir for the whole run, or None if held."""
+    import fcntl
+
+    target_dir().mkdir(parents=True, exist_ok=True)
+    fh = open(target_dir() / ".gate.lock", "w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fh.close()
+        return None
+    return fh
+
+
 def main(argv: list[str] | None = None) -> int:
     if (argv if argv is not None else sys.argv[1:]) == ["--self-test"]:
         return _self_test()
     ns = parse_args(argv)
+    lock = _hold_gate_lock()
+    if lock is None:
+        print(f"another gate run holds {target_dir() / '.gate.lock'} — two runs in one tree clean "
+              "and rebuild each other's binary; wait for it or stop it", file=sys.stderr)
+        return 2
     from .core import set_cell_parallel
     set_cell_parallel(ns.cell_parallel)
 
@@ -969,6 +1070,24 @@ def main(argv: list[str] | None = None) -> int:
         # worked on Postgres at all). Grading both is two passes, deliberately,
         # rather than a subset of cells quietly touching the other backend.
         state_url = ns.state_url or os.environ.get("RIVET_GATE_STATE_URL", "")
+        # One state DB per gate run (RIVET_GATE_SHARED_STATE=1 keeps the shared one): a build
+        # that bumps the state schema must not migrate the stand DB other branches still open.
+        if state_url and os.environ.get("RIVET_GATE_SHARED_STATE") != "1":
+            from .core import isolate_state_db
+            own = isolate_state_db(state_url, f"{os.getpid()}")
+            if own is None:
+                led.failed("-", "-", "state-isolation", "-",
+                           f"could not create a per-run state DB beside {state_url.split('@')[-1]}")
+            else:
+                state_url = own
+                for var in ("RIVET_GATE_STATE_URL", "RIVET_CDC_STATE_URL",
+                            "RIVET_CONC_STATE_URL", "RIVET_TEST_STATE_URL"):
+                    os.environ[var] = own
+                import urllib.parse as _up
+                t = _up.urlsplit(own)
+                os.environ["RIVET_TEST_STATE_TOXI_URL"] = _up.urlunsplit(
+                    (t.scheme, f"{t.username}:{t.password}@127.0.0.1:15433", t.path, "", ""))
+                print(f"  per-run state DB: {t.path.lstrip('/')} (dropped at exit)")
         if state_url:
             os.environ["RIVET_STATE_URL"] = state_url
             backend = f"POSTGRES ({state_url.split('@')[-1]})"
@@ -1013,7 +1132,12 @@ def main(argv: list[str] | None = None) -> int:
                     sub, keep=ns.keep, parallel=ns.engine_parallel,
                     bring_up=bring_up, seed_engine=seed_engine)),
             ])
+        # Last: it runs every live_suite test no cell above already ran.
+        live_modules.verify_live_modules(led)
         verify_no_invariant_violations(led)
+        # Only a FULL run can say a known red no longer fires.
+        if not (ns.engines or ns.versions or ns.no_cloud or ns.latest_only):
+            led.close_known_red()
         rc = led.report()
         # A run that graded nothing against the previous release has to say so
         # AFTER the verdict, where the reader's eye lands: `RELEASE-READY` is

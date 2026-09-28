@@ -282,6 +282,8 @@ mod soak_spill;
 
 #[path = "live/live_session_state.rs"]
 mod live_session_state;
+#[path = "live/live_state_backend.rs"]
+mod live_state_backend;
 #[path = "live/live_state_clock.rs"]
 mod live_state_clock;
 #[path = "live/live_state_pooler.rs"]

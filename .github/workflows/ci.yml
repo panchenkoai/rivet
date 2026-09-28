@@ -1250,6 +1250,14 @@ jobs:
       # that contains a missed mutant.
       - name: Mutation outcome cache self-test
         run: python3 .github/scripts/mutants_cache.py --self-test
+      - name: No live test grades rivet by rivet's own report alone (shrink-only)
+        run: |
+          python3 dev/pytools/self_oracle_lint.py --self-test
+          python3 dev/pytools/self_oracle_lint.py
+      - name: Fault catalog and nightly comparison self-tests
+        run: |
+          python3 dev/pytools/fault_catalog.py --self-test
+          python3 dev/pytools/nightly.py --self-test
       # The PRIORITISER's classification, graded over a coverage export copied
       # from a real `cargo llvm-cov --lib --bins --json` run: an executed
       # function, an untaken branch inside one, a function measured at zero, a

@@ -1,0 +1,310 @@
+# Canonical product faults for the fault x detection matrix: each entry re-introduces one silent-loss class.
+# Runner: dev/pytools/fault_catalog.py (applies `old` -> `new` from a working-tree snapshot, runs the detectors).
+# Every `old` must match EXACTLY ONCE in its `file`, byte-for-byte, or the runner reports the entry unviable.
+
+# PG-local on purpose: the shared TxnFramer is graded by lib tests for every engine.
+- id: pg-cdc-committed-every-event
+  class: "PG CDC marks every event of a transaction `committed` -> sink acks mid-transaction, a crash loses the tail"
+  file: src/source/postgres/cdc.rs
+  old: |2-
+                            for ev in group {
+                                self.pending.push_back(ev);
+  new: |2-
+                            for mut ev in group {
+                                ev.committed = true;
+                                self.pending.push_back(ev);
+  detectors:
+    - test: roast_pg_cdc_large_transaction_is_atomic_across_a_mid_flush_crash
+      suite: live_suite
+      needs: postgres-cdc
+
+- id: mssql-cdc-ignores-checkpoint-lsn
+  class: "SQL Server CDC open() drops the checkpoint LSN -> every run re-reads the whole retained change table"
+  file: src/source/mssql/cdc.rs
+  old: |2-
+                from_lsn: cfg.from_lsn.clone(),
+  new: |2-
+                from_lsn: None,
+  detectors:
+    - test: mssql_cdc_resume_captures_only_new_changes
+      suite: live_suite
+      needs: mssql-cdc
+
+# Only the stream-level lib test sees this: on the config path ensure_anchor pins first, so the binary test
+# cdc_idle_first_run_then_change_is_captured_not_skipped stays green (belt-and-suspenders). The lib test is
+# #[ignore] (live) - fault_catalog.py's lib command has no --run-ignored, so it reports not-run until that is added.
+- id: mysql-cdc-idle-first-run-no-pin
+  class: "MySQL CDC first run does not persist its anchor -> an idle run leaves none and the next run skips the gap"
+  file: src/source/mysql/cdc.rs
+  old: |2-
+            if let Some(path) = ckpt {
+  new: |2-
+            if let Some(path) = ckpt.filter(|_| false) {
+  detectors:
+    - test: first_run_with_zero_changes_pins_the_checkpoint_at_open
+      suite: lib
+      needs: mysql-cdc
+
+- id: mysql-cdc-ignores-checkpoint
+  class: "MySQL CDC ignores Position::load -> re-anchors at the current binlog position, skipping everything since"
+  file: src/source/mysql/cdc.rs
+  old: |2-
+                && let Some(pos) = Position::load(path)?
+  new: |2-
+                && let Some(pos) = Position::load(path)?.filter(|_| false)
+  detectors:
+    - test: cdc_resume_captures_only_new_changes
+      suite: live_suite
+      needs: mysql-cdc
+
+- id: pg-cdc-until-current-unbounded
+  class: "PG bounded drain ignores its open-time bound -> until_current chases the log under sustained writes"
+  file: src/source/postgres/cdc.rs
+  old: |2-
+        if bound.is_some_and(|b| commit_lsn > b) {
+  new: |2-
+        if false && bound.is_some_and(|b| commit_lsn > b) {
+  detectors:
+    - test: tx_disposition_bound_frontier_matrix
+      suite: lib
+      needs: none
+    - test: pg_cdc_until_current_terminates_under_sustained_writes
+      suite: live_suite
+      needs: postgres-cdc
+
+- id: batch-part-name-second-granularity
+  class: "Batch part names lose sub-second precision -> two runs in one second clobber each other's parts"
+  file: src/pipeline/single.rs
+  old: |2-
+        let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f");
+  new: |2-
+        let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+  detectors:
+    - test: roast_rapid_incremental_runs_into_same_prefix_must_not_clobber_prior_parts
+      suite: live_suite
+      needs: postgres
+
+- id: manifest-copy-not-run-unique
+  class: "Per-run manifest copy written to the canonical name -> consecutive runs clobber the sidecar"
+  file: src/pipeline/manifest_writer.rs
+  old: |2-
+            &run_unique_manifest_name(&manifest.run_id),
+  new: |2-
+            MANIFEST_FILENAME,
+  detectors:
+    - test: two_runs_into_one_prefix_leave_two_run_unique_manifests
+      suite: lib
+      needs: none
+    - test: write_manifest_leaves_a_run_unique_copy_beside_the_canonical
+      suite: lib
+      needs: none
+
+- id: chunk-checkpoint-completion-guard-off
+  class: "Sequential chunk-checkpoint completion guard disabled -> a failed chunk ships a short export as success"
+  file: src/pipeline/chunked/sequential_checkpoint.rs
+  old: |2-
+        if pending > 0 {
+  new: |2-
+        if false && pending > 0 {
+  detectors:
+    - test: a_failed_chunk_must_fail_the_run_not_ship_a_short_export
+      suite: live_suite
+      needs: postgres
+
+# The supplier moved into the shared FanIn; this mutant reintroduces the pre-#200 order for every parallel runner.
+- id: fan-in-bails-before-recording-parts
+  class: "Worker-error bail before the record_part drain -> durable parts uncounted, retry decider sees files_committed=0"
+  file: src/pipeline/fan_in.rs
+  old: |2-
+            summary.ledger.observe(inner(self.observed));
+            for (i, (unit, rec)) in inner(self.parts).into_iter().enumerate() {
+  new: |2-
+            summary.ledger.observe(inner(self.observed));
+            let early = locked(&self.errors).clone();
+            if !early.is_empty() {
+                return Err(on_err(&early[..]));
+            }
+            for (i, (unit, rec)) in inner(self.parts).into_iter().enumerate() {
+  detectors:
+    - test: a_unit_that_fails_after_a_durable_part_still_records_it_then_bails
+      suite: lib
+      needs: none
+    - test: parallel_keyset_worker_error_still_counts_the_durable_parts_postgres
+      suite: live_suite
+      needs: postgres
+
+- id: gc-orphans-ignores-active-run
+  class: "gc_orphans ignores the active-run signal -> deletes a live extract's unmanifested in-flight parts"
+  file: src/load/reconcile.rs
+  old: |2-
+            if active && !terminal.contains(&key) {
+  new: |2-
+            if false && active && !terminal.contains(&key) {
+  detectors:
+    - test: gc_orphans_spares_an_unmanifested_part_while_a_run_is_active
+      suite: lib
+      needs: none
+
+# Merely dropping the length is NOT caught: the 0x01 presence tag still frames an alphabet with no 0x01.
+# The mutant restores the v1 shape (tag + length removed, \x1f appended) the RED-proven test names.
+- id: row-hash-separator-framing
+  class: "Row hash loses its length framing (v1 bare \\x1f separator) -> a value forges a field boundary, two rows share a hash"
+  file: src/enrich.rs
+  old: |2-
+        let _ = write!(buf, "{}", fmt.value(row));
+        let len = (buf.len() - len_at - 4) as u32;
+        buf[len_at..len_at + 4].copy_from_slice(&len.to_le_bytes());
+  new: |2-
+        let _ = write!(buf, "{}\x1f", fmt.value(row));
+        buf.drain(len_at - 1..len_at + 4);
+  detectors:
+    - test: a_value_containing_the_old_separator_cannot_forge_a_field_boundary
+      suite: lib
+      needs: none
+    - test: row_hash_is_injective_over_hostile_two_column_rows
+      suite: lib
+      needs: none
+
+- id: mongo-heterogeneous-id-guard-off
+  class: "Mongo keyset heterogeneous-_id guard disabled -> $gt seek pages one BSON bracket, silently drops the rest"
+  file: src/source/mongo/mod.rs
+  old: |2-
+                if id_types_collide(lo_id, hi_id) {
+  new: |2-
+                if false && id_types_collide(lo_id, hi_id) {
+  detectors:
+    - test: mongo_keyset_on_heterogeneous_id_errors_loudly_full_scan_still_works
+      suite: live_suite
+      needs: mongo
+    - test: roast_resume_must_not_bypass_heterogeneous_id_guard
+      suite: live_suite
+      needs: mongo
+
+- id: cursor-scope-ignored
+  class: "Incremental cursor read ignores its v30 scope -> same-named configs read each other's cursor and skip rows"
+  file: src/state/cursor.rs
+  old: |2-
+                    "SELECT last_cursor_value, last_run_at, cursor_column FROM export_state \
+                     WHERE export_name = ?1 AND (prefix = ?2 OR prefix = '') \
+  new: |2-
+                    "SELECT last_cursor_value, last_run_at, cursor_column FROM export_state \
+                     WHERE export_name = ?1 AND (prefix = ?2 OR prefix = '' OR prefix <> ?2) \
+  detectors:
+    - test: two_configs_with_one_export_name_keep_separate_cursors
+      suite: lib
+      needs: none
+    - test: same_named_incremental_configs_on_a_postgres_state_keep_their_own_cursor
+      suite: live_suite
+      needs: postgres, mysql, postgres-state
+
+# Not documented RED against this exact mutant; the incremental cursor is still covered by SET LOCAL (see pg-incremental-cursor-tz).
+- id: pg-session-formats-unpinned
+  class: "PG batch connection no longer pins TimeZone/DateStyle/IntervalStyle/bytea_output -> text renderings follow the session"
+  file: src/source/postgres/mod.rs
+  old: |2-
+        if !transaction_pooler {
+  new: |2-
+        if false && !transaction_pooler {
+  detectors:
+    - test: pg_check_reports_a_timestamptz_cursor_range_in_iso_utc_for_any_session
+      suite: live_suite
+      needs: postgres
+    - test: pg_date_window_chunks_read_each_row_once_in_an_odd_session
+      suite: live_suite
+      needs: postgres
+
+# The `state_lease.expires_at < now()` condition no longer exists: the lease is an flock / pg advisory lock
+# (clock-free). This mutates the SQLite flock arm; the Postgres arm is graded live in live_pg_state.rs.
+- id: state-load-lease-not-exclusive
+  class: "Load lease always granted -> two loads of one warehouse table run concurrently"
+  file: src/state/load_lease.rs
+  old: |2-
+                    if rc == 0 {
+  new: |2-
+                    if rc == 0 || !key.is_empty() {
+  detectors:
+    - test: a_second_load_of_the_same_table_waits_for_the_first_to_release
+      suite: lib
+      needs: none
+
+# DEFAULT, not deletion: deleting the line is masked by pin_session_formats' session-level SET TimeZone.
+# DEFAULT resets to the role/db/startup-options zone, un-pinning both layers for the read txn.
+- id: pg-incremental-cursor-tz
+  class: "PG incremental cursor boundary parsed in the session zone -> non-UTC session skips/duplicates the offset window"
+  file: src/source/postgres/mod.rs
+  old: |2-
+            .batch_execute("SET LOCAL TimeZone = 'UTC'")?;
+  new: |2-
+            .batch_execute("SET LOCAL TimeZone = DEFAULT")?;
+  detectors:
+    - test: pg_incremental_cursor_survives_a_non_utc_session_timezone
+      suite: live_suite
+      needs: postgres
+    - test: pg_incremental_on_a_timestamptz_cursor_reads_each_row_once_across_runs_in_an_odd_session
+      suite: live_suite
+      needs: postgres
+
+- id: sparse-chunk-warning-info
+  class: "Sparse chunk-key warning downgraded to info -> invisible at the default log level (MySQL, no estimate)"
+  file: src/pipeline/chunked/detect.rs
+  old: |2-
+                Some(SparseAction::Warn(msg)) => log::warn!("export '{export_name}': {msg}"),
+  new: |2-
+                Some(SparseAction::Warn(msg)) => log::info!("export '{export_name}': {msg}"),
+  detectors:
+    - test: stand_sparse_guard_mysql
+      suite: live_suite
+      needs: mysql
+
+- id: keyset-drift-gate-bypass
+  class: "Sequential keyset runner stops feeding the ledger -> on_schema_drift: fail not enforced (runner bypass)"
+  file: src/pipeline/keyset.rs
+  old: |2-
+            summary.ledger.observe(std::mem::take(&mut page.observed));
+  new: |2-
+            let _ = std::mem::take(&mut page.observed);
+  detectors:
+    - test: keyset_export_enforces_on_schema_drift_fail
+      suite: live_suite
+      needs: postgres
+    - test: shape_drift_warns_on_the_keyset_runner
+      suite: live_suite
+      needs: postgres
+
+# Parallel keyset has no Form-B live test (tests/live/live_keyset_parallel.rs asserts none), so the
+# large-table runner graded here is mongo_parallel.
+- id: mongo-parallel-form-b-harvest-missing
+  class: "Parallel Mongo runner drops its per-unit checksums -> no Form B in the manifest, validate's re-read is a no-op"
+  file: src/pipeline/mongo_parallel.rs
+  old: |2-
+            fan.contribute(unit, p.checksums);
+  new: |2-
+            drop(p.checksums);
+  detectors:
+    - test: mongo_parallel_export_records_form_b_checksum
+      suite: live_suite
+      needs: mongo
+
+- id: pg-cdc-truncate-refusal-off
+  class: "PG CDC TRUNCATE of a captured table passes silently -> destination keeps rows the source no longer has"
+  file: src/source/postgres/cdc.rs
+  old: |2-
+                    .find(|(sc, tb)| truncate_is_ours(sc, tb, &self.configured_tables))
+  new: |2-
+                    .find(|(sc, tb)| false && truncate_is_ours(sc, tb, &self.configured_tables))
+  detectors:
+    - test: roast_pg_cdc_refuses_a_truncate_instead_of_silently_diverging
+      suite: live_suite
+      needs: postgres-cdc
+
+- id: mysql-cdc-truncate-refusal-off
+  class: "MySQL CDC TRUNCATE of a captured table passes silently -> destination keeps rows the source no longer has"
+  file: src/source/mysql/cdc.rs
+  old: |2-
+                        undecodable_event_is_ours(Some((&sc, &tb)), &self.configured_tables)
+  new: |2-
+                        false && undecodable_event_is_ours(Some((&sc, &tb)), &self.configured_tables)
+  detectors:
+    - test: roast_mysql_cdc_refuses_a_truncate_instead_of_silently_diverging
+      suite: live_suite
+      needs: mysql-cdc

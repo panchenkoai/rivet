@@ -58,3 +58,10 @@ test-group = 'oracle'
 # so one flake doesn't mask the rest of the matrix.
 retries = 1
 fail-fast = false
+
+# The MSSQL spill soak runs in ~15 s alone but queues behind every other SQL Server CDC test
+# in a full live_suite run, where it passed 240 s (2026-09-27 gate, live_modules). The same
+# long ceiling as the other contended cycles above.
+[[profile.default.overrides]]
+filter = 'test(/^soak_spill::/)'
+slow-timeout = { period = "300s", terminate-after = 4 }

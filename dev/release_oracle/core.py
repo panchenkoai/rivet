@@ -58,6 +58,7 @@ class Status(str, Enum):
     PASS = "PASS"
     FAIL = "FAIL"
     SKIP = "SKIP"
+    KNOWN = "KNOWN"  # a failure recorded in known_red.py with a reason, in date
 
 
 @dataclass(frozen=True)
@@ -82,6 +83,8 @@ class Ledger:
 
     def __init__(self, *, colour: bool | None = None) -> None:
         self.cells: list[Cell] = []
+        self.known_seen: set[str] = set()
+        self.known_passed: set[str] = set()
         if colour is None:
             colour = sys.stdout.isatty() or os.environ.get("FORCE_COLOR") == "1"
         self._colour = colour
@@ -167,6 +170,8 @@ class Ledger:
         for line in self._buf or []:
             parent._emit(line)
         parent.cells.extend(self.cells)
+        parent.known_seen |= self.known_seen
+        parent.known_passed |= self.known_passed
         # Spans DO travel (unlike _phase_times): each is a per-engine wall-clock
         # the parent reports ranked, not summed, so overlap across engines is not
         # double-counted. This is the only window into the parallel matrix.
@@ -186,12 +191,40 @@ class Ledger:
 
     def passed(self, engine: str, version: str, scenario: str, store: str, msg: str, detail: str = "") -> None:
         """Print the ✓ AND record the row — one call, so the two cannot diverge."""
+        from . import known_red
+        entry, _ = known_red.match(msg)
+        if entry is not None:
+            self.known_passed.add(entry.match)
         self.ok(msg)
         self.add(engine, version, scenario, store, Status.PASS, detail or msg)
 
     def failed(self, engine: str, version: str, scenario: str, store: str, msg: str, detail: str = "") -> None:
+        from . import known_red
+        entry, in_date = known_red.match(msg)
+        if entry is not None:
+            self.known_seen.add(entry.match)
+        if entry is not None and in_date:
+            self.skip(f"KNOWN RED (until {entry.expires}: {entry.reason}) — {msg}")
+            self.add(engine, version, scenario, store, Status.KNOWN, detail or msg)
+            return
+        if entry is not None:
+            msg = f"{msg} — its known-red entry EXPIRED {entry.expires}: fix it or renew the entry"
         self.bad(msg)
         self.add(engine, version, scenario, store, Status.FAIL, detail or msg)
+
+    def close_known_red(self) -> None:
+        """After a FULL run: a known-red entry no failure matched is fixed — it must be removed."""
+        from . import known_red
+        for k in known_red.KNOWN_RED:
+            if k.match not in self.known_seen:
+                # Straight to FAIL: the message quotes the entry, so `failed` would match it.
+                why = ("its cell PASSED this run — it is fixed"
+                       if k.match in self.known_passed else
+                       "no cell this run exercised it, so it excuses nothing")
+                msg = (f"known-red entry `{k.match}` matched no failure: {why}; "
+                       "remove it from dev/release_oracle/known_red.py")
+                self.bad(msg)
+                self.add("-", "-", "known_red", "-", Status.FAIL, msg)
 
     def skipped(self, engine: str, version: str, scenario: str, store: str, msg: str, detail: str = "") -> None:
         self.skip(msg)
@@ -269,6 +302,9 @@ class Ledger:
                     print(f"  {sum(ds) / 60.0:6.1f} min  {key:28} n={len(ds):<4} "
                           f"mean={sum(ds) / len(ds):5.1f}s  max={max(ds):5.1f}s")
                 print()
+        known = [c for c in self.cells if c.status is Status.KNOWN]
+        if known:
+            print(self._c("1;33", f"  {len(known)} KNOWN RED cell(s), each recorded in known_red.py with a reason and an expiry."))
         if self.red:
             print(self._c("1;31", "  NOT RELEASABLE — one or more cells failed (see ✗ above)."))
             return 1
@@ -283,16 +319,29 @@ INVARIANT_MARKER = "run-integrity invariant violated"
 INVARIANT_HITS: list[tuple[str, str]] = []
 
 
+#: rivet's INTERNAL errors (a broken invariant — a bug) carry a `RIVET_INTERNAL_*` code, in the
+#: `[CODE]` text prefix and the JSON `code` field alike. One in ANY gated command fails the gate,
+#: even where the test expected the command to fail.
+INTERNAL_MARKER = "RIVET_INTERNAL_"
+INTERNAL_HITS: list[tuple[str, str]] = []
+
+
 def note_invariant_violations(argv: Sequence[str], text: str) -> None:
-    """Record each run-integrity invariant warning in a command's output."""
+    """Record each run-integrity invariant warning and each INTERNAL error in a command's output."""
     for line in text.splitlines():
+        cmd = " ".join(str(a) for a in argv)[:200]
         if INVARIANT_MARKER in line:
-            INVARIANT_HITS.append((" ".join(str(a) for a in argv)[:200], line.strip()[:400]))
+            INVARIANT_HITS.append((cmd, line.strip()[:400]))
+        if INTERNAL_MARKER in line and ("Error" in line or '"code"' in line):
+            INTERNAL_HITS.append((cmd, line.strip()[:400]))
 
 
 def verify_no_invariant_violations(led: "Ledger") -> None:
     """Fail the gate for every run that reported an incomplete integrity record."""
     led.phase("Run-integrity invariant — no gated run may skip a per-export facade")
+    for cmd, line in INTERNAL_HITS:
+        led.failed("all", "-", "internal-error", "-",
+                   f"internal error (a rivet bug) in `{cmd}` — {line}", "internal")
     if not INVARIANT_HITS:
         led.passed("all", "-", "run-integrity", "-",
                    "run-integrity: no gated run reported a skipped facade", "clean")
@@ -425,6 +474,36 @@ def target_dir() -> Path:
     return ROOT / os.environ.get("CARGO_TARGET_DIR", "target")
 
 
+#: live_suite tests (bare fn names) and modules a dedicated cell has already run this gate;
+#: the derived `live_modules` cell runs everything else.
+RAN_LIVE_TESTS: set[str] = set()
+RAN_LIVE_MODULES: set[str] = set()
+
+#: Live tests allowed to SELF-SKIP in a gate run (`module::fn` → why). Any other self-skip
+#: fails its cell: libtest counts a skip green, so an unlisted one is a row that graded nothing.
+SKIP_ALLOWED: dict[str, str] = {
+    "live_cdc::regenerate_the_pgoutput_fixture_from_the_rig_scenarios":
+        "a fixture GENERATOR (RIVET_REGENERATE_FIXTURES=1), not a check",
+    "live_cdc_mbt::cdc_destination_disk_full_is_loud_and_lossless":
+        "needs a mounted tiny filesystem (RIVET_TINYFS_DIR) the stand does not provision",
+    "live_keyset_parallel::parallel_keyset_incremental_survives_no_backslash_escapes_mysql":
+        "sets @@global.sql_mode, which needs SUPER; the stand's test user has none",
+}
+
+
+def self_skipped(skip_log: Path) -> dict[str, str]:
+    """The tests that wrote `RIVET-SKIP <module::fn> — <why>` to `skip_log`."""
+    if not skip_log.exists():
+        return {}
+    # Split on the marker, not on lines: records written by parallel tests can interleave.
+    out: dict[str, str] = {}
+    for rec in skip_log.read_text().split("RIVET-SKIP ")[1:]:
+        m = re.match(r"(\S+) — (.*)", rec.strip(), re.S)
+        if m:
+            out[m.group(1)] = m.group(2).strip()
+    return out
+
+
 def rivet_bin() -> Path:
     """$RIVET_BIN, else the release binary cargo builds under `target_dir()`."""
     return Path(os.environ.get("RIVET_BIN", target_dir() / "release" / "rivet"))
@@ -459,6 +538,33 @@ def remove_engine_containers() -> None:
     ps = docker("ps", "-aq", "--filter", f"name={ENGINE_PREFIX}")
     for cid in ps.stdout.split():
         docker("rm", "-fv", cid)
+
+
+def isolate_state_db(url: str, tag: str) -> str | None:
+    """Create a fresh database beside `url`'s and return a URL to it (dropped at exit), or None.
+
+    One gate run gets its own state DB: a build that bumps the state schema must not migrate
+    the shared stand DB every other branch and session on this machine still opens."""
+    import atexit
+    import urllib.parse
+    u = urllib.parse.urlsplit(url)
+    c = container_for_port(u.port or 5432)
+    if c is None or not u.username:
+        return None
+    db = f"rivet_state_gate_{tag}"
+    psql = ["psql", "-U", urllib.parse.unquote(u.username), "-d", "postgres", "-v", "ON_ERROR_STOP=1", "-c"]
+    if not docker_exec(c, *psql, f"DROP DATABASE IF EXISTS {db}").ok or \
+            not docker_exec(c, *psql, f"CREATE DATABASE {db}").ok:
+        return None
+    atexit.register(lambda: docker_exec(c, *psql, f"DROP DATABASE IF EXISTS {db} WITH (FORCE)"))
+    return urllib.parse.urlunsplit((u.scheme, u.netloc, f"/{db}", u.query, u.fragment))
+
+
+def state_db_name() -> str:
+    """The gate's Postgres state database (the per-run one when isolated)."""
+    import urllib.parse
+    url = os.environ.get("RIVET_GATE_STATE_URL", "")
+    return urllib.parse.urlsplit(url).path.lstrip("/") or "rivet_state"
 
 
 def container_for_port(port: int) -> str | None:
@@ -502,6 +608,12 @@ def nextest_outcomes(out: str) -> dict[str, str]:
     return final
 
 
+def nextest_started(out: str) -> int | None:
+    """How many tests nextest said it would run (`Starting N tests`), or None if it never started."""
+    m = re.search(r"Starting (\d+) tests?\b", out)
+    return int(m.group(1)) if m else None
+
+
 def nextest_passed(out: str) -> set[str]:
     """The tests nextest reports green: `PASS`, or `LEAK` (passed, left a handle open)."""
     return {n for n, s in nextest_outcomes(out).items() if s in ("PASS", "LEAK")}
@@ -514,11 +626,31 @@ _NEXTEST_SAMPLE = (
     "        LEAK [   0.400s] (2/4) rivet-cli::live_suite m::leaky_pass\n"
     " FAIL + LEAK [   0.476s] (3/4) rivet-cli::live_suite m::leaky_fail\n"
     "        FAIL [   0.200s] (4/4) rivet-cli::live_suite m::plain_fail\n"
+    "        FAIL [   0.200s] (   5/1038) rivet-cli::live_suite m::padded_fail\n"
 )
+
+
+def self_skip_error() -> str | None:
+    """Why a self-skip marker would not be read, or None when it is."""
+    import tempfile
+    d = Path(tempfile.mkdtemp())
+    # Two records interleaved the way parallel tests wrote them (line, line, newline, newline).
+    (d / "s").write_text("RIVET-SKIP live_x::needs_bq — BIGQUERY_TEST_PROJECT unsetRIVET-SKIP live_x::b — no state\n\n")
+    got = self_skipped(d / "s")
+    want = {"live_x::needs_bq": "BIGQUERY_TEST_PROJECT unset", "live_x::b": "no state"}
+    return None if got == want else f"read {got}"
 
 
 def nextest_grading_error() -> str | None:
     """Why the nextest parser would misgrade a real line shape, or None when it grades all correctly."""
+    if self_skip_error():
+        return f"self-skips are not read: {self_skip_error()}"
+    if nextest_started("    Starting 1038 tests across 1 binary (11 tests skipped)") != 1038:
+        return "the `Starting N tests` count is not read"
+    seen = set(nextest_outcomes(_NEXTEST_SAMPLE))
+    every = {"m::slow_then_pass", "m::leaky_pass", "m::leaky_fail", "m::plain_fail", "m::padded_fail"}
+    if seen != every:
+        return f"read {sorted(seen)}, dropped {sorted(every - seen)} (a dropped FAIL line is a silent pass)"
     passed = nextest_passed(_NEXTEST_SAMPLE)
     want = {"m::slow_then_pass", "m::leaky_pass"}
     if passed != want:

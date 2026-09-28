@@ -49,13 +49,17 @@ from pathlib import Path
 from tempfile import mkdtemp
 
 try:  # importable both as a package module and as a plain sibling file
-    from .core import (HERE, ROOT, Ledger, Proc, Status, container_for_port, docker, docker_exec, have,
-                       nextest_filter, nextest_outcomes, nextest_passed, port_of, release_bin_env,
+    from .core import (HERE, RAN_LIVE_MODULES, RAN_LIVE_TESTS, ROOT, SKIP_ALLOWED, self_skipped, Ledger, Proc, Status, container_for_port, docker, docker_exec, have,
+                       nextest_filter, nextest_outcomes, nextest_passed, nextest_started, port_of, release_bin_env,
                        rivet, rivet_bin, run, sqlcmd, test_passed)
     from ..pytools.duckcli import ARGV as DUCKDB
 except ImportError:  # pragma: no cover - depends on how the driver is invoked
     from core import (  # type: ignore
         HERE,
+        RAN_LIVE_MODULES,
+        RAN_LIVE_TESTS,
+        SKIP_ALLOWED,
+        self_skipped,
         ROOT,
         Ledger,
         Proc,
@@ -66,6 +70,7 @@ except ImportError:  # pragma: no cover - depends on how the driver is invoked
         have,
         nextest_filter,
         nextest_outcomes,
+        nextest_started,
         nextest_passed,
         port_of,
         release_bin_env,
@@ -190,13 +195,11 @@ class Scope:
 # empty, because several bash rows carry no detail and the final table must stay
 # byte-identical between the two implementations.
 def _passed(led: Ledger, eng: str, ver: str, scenario: str, store: str, msg: str, detail: str = "") -> None:
-    led.ok(msg)
-    led.add(eng, ver, scenario, store, Status.PASS, detail)
+    led.passed(eng, ver, scenario, store, msg, detail)
 
 
 def _failed(led: Ledger, eng: str, ver: str, scenario: str, store: str, msg: str, detail: str = "") -> None:
-    led.bad(msg)
-    led.add(eng, ver, scenario, store, Status.FAIL, detail)
+    led.failed(eng, ver, scenario, store, msg, detail)
 
 
 def _skipped(led: Ledger, eng: str, ver: str, scenario: str, store: str, msg: str, detail: str = "") -> None:
@@ -1335,7 +1338,7 @@ def verify_state_migrations(led: Ledger) -> None:
         # form matches its 3 tests, while the `$`-anchored form matches NONE —
         # which would leave this leg green over zero tests (measured, not argued).
         ["cargo", "nextest", "run", "--manifest-path", str(ROOT / "Cargo.toml"),
-         "--test", "live_suite", "--run-ignored", "all",
+         "--test", "live_suite", "--run-ignored", "all", "--no-fail-fast",
          "-E", "test(state_parity_) or test(/pg_keyset_range_round_trips_and_commits$/)"],
         env={**release_bin_env(), "RIVET_TEST_STATE_URL": state_url},
         timeout=NO_TIMEOUT,
@@ -1398,9 +1401,10 @@ def _drive_live_tests(
     # `test(=X)` matches the FULL nextest name (`<module>::<fn>`), so the bare
     # fn name never matches; anchor the regex form at the end instead.
     expr = nextest_filter(tests)
+    RAN_LIVE_TESTS.update(tests)
     res = run(
         ["cargo", "nextest", "run", "--manifest-path", str(ROOT / "Cargo.toml"),
-         "--test", "live_suite", "--run-ignored", "all", "-E", expr],
+         "--test", "live_suite", "--run-ignored", "all", "--no-fail-fast", "-E", expr],
         env={**release_bin_env(), "RIVET_SKIP_LOG": str(skip_log)},
         timeout=3600,
     )
@@ -1414,7 +1418,7 @@ def _drive_live_tests(
     # binlog-cut cell, green in gate #8 and green in its own log here).
     passed = nextest_passed(res.out)
     missing = [t for t in tests if not test_passed(t, passed)]
-    skipped = [ln for ln in skip_log.read_text().splitlines() if ln.strip()]
+    skipped = [f"{k} — {v}" for k, v in self_skipped(skip_log).items() if k not in SKIP_ALLOWED]
     if missing:
         _failed(
             led, area, a, b, "-",
@@ -1693,7 +1697,7 @@ def verify_replica_read(led: Ledger) -> None:
         # consolidated suite loses that isolation under the default libtest
         # harness, where `--test-threads=1` was the mitigation.
         ["cargo", "nextest", "run", "--manifest-path", str(ROOT / "Cargo.toml"),
-         "--test", "live_suite", "--run-ignored", "all",
+         "--test", "live_suite", "--run-ignored", "all", "--no-fail-fast",
          "-E", "test(/cdc_reads_changes_from_a_replica$/)"],
         env=release_bin_env(),
         timeout=NO_TIMEOUT,
@@ -1720,7 +1724,7 @@ def verify_replica_read(led: Ledger) -> None:
         cell_log = work_dir() / f"replica_{label}.log"
         p = run(
             ["cargo", "nextest", "run", "--manifest-path", str(ROOT / "Cargo.toml"),
-             "--test", "live_suite", "--run-ignored", "all", "-E", f"test(/::{test}$/)"],
+             "--test", "live_suite", "--run-ignored", "all", "--no-fail-fast", "-E", f"test(/::{test}$/)"],
             env=release_bin_env(),
             timeout=NO_TIMEOUT,
         )
@@ -1825,7 +1829,7 @@ def verify_cdc_harm(led: Ledger) -> None:
     server's own table-level counters (live_cdc_harm)."""
     _run_live_modules(led, "cdc_harm", "cdc harm",
                       "a CDC drain costs the source a fraction of one scan (live_cdc_harm)",
-                      ["live_cdc_harm"])
+                      ["live_cdc_harm"], env={"RIVET_STATE_URL": ""})
 
 
 def verify_session_state(led: Ledger) -> None:
@@ -1846,33 +1850,50 @@ def verify_partition_footer(led: Ledger) -> None:
 
 
 def _run_live_modules(led: Ledger, scenario: str, label: str, phase: str,
-                      modules: list[str], env: dict[str, str] | None = None) -> None:
-    """Run live_suite `modules` through the gate binary; one ledger row per test case."""
+                      modules: list[str], env: dict[str, str] | None = None,
+                      expr: str | None = None, threads: int | None = None) -> None:
+    """Run live_suite `modules` (or the nextest filter `expr`) through the gate binary; one ledger row per test case."""
     led.phase(f"{label} · {phase}")
     if not have("cargo"):
         _skipped(led, scenario, "batch", "-", "-", f"{label}: cargo absent", "no cargo")
         return
-    log_path = work_dir() / f"{scenario}_{'_'.join(modules)}.log"
+    RAN_LIVE_MODULES.update(modules)
+    log_path = work_dir() / f"{scenario}_{'_'.join(modules)[:120]}.log"
+    skip_log = Path(str(log_path) + ".skips")
+    skip_log.write_text("")
     p = run(
         ["cargo", "nextest", "run", "--manifest-path", str(ROOT / "Cargo.toml"),
          "--test", "live_suite", "--run-ignored", "all", "--no-fail-fast",
-         "-E", " | ".join(f"test(/^{m}::/)" for m in modules)],
-        env={**release_bin_env(), **(env or {})},
+         *(["--test-threads", str(threads)] if threads else []),
+         "-E", expr or " | ".join(f"test(/^{m}::/)" for m in modules)],
+        env={**release_bin_env(), **(env or {}), "RIVET_SKIP_LOG": str(skip_log)},
         timeout=NO_TIMEOUT,
     )
     log_path.write_text(p.out)
-    verdicts = {
-        name: verdict
-        for verdict, name in re.findall(
-            r"^\s+(PASS|LEAK|FAIL|TIMEOUT|SIGABRT|SIGSEGV) \[[^\]]*\] \(\d+/\d+\) \S+ (\S+)$",
-            p.out, re.M)
-    }
+    # The shared, self-tested parser: a local regex here required an UNPADDED `(n/m)` and
+    # nextest pads it (`(   5/1038)`), so all but the last few verdicts — failures included
+    # — were silently dropped (39 of 1038 graded, measured 2026-09-27).
+    verdicts = nextest_outcomes(p.out)
+    started = nextest_started(p.out)
+    if started is not None and len(verdicts) != started:
+        _failed(led, scenario, "batch", "-", "-",
+                f"{label}: graded {len(verdicts)} of the {started} tests nextest ran — the rest "
+                f"were not read (see {log_path})", "unread verdicts")
     if not verdicts:
         _failed(led, scenario, "batch", "-", "-",
                 f"{label}: no test ran (see {log_path})", _first_match(p.out, r"error|FAILED"))
         return
+    skipped = self_skipped(skip_log)
     for name, verdict in sorted(verdicts.items()):
-        if verdict in ("PASS", "LEAK"):
+        if verdict in ("PASS", "LEAK") and name in skipped:
+            why = SKIP_ALLOWED.get(name)
+            if why:
+                _skipped(led, scenario, "batch", "-", "-", f"{label} · {name} SKIPPED — {why}", "allowed skip")
+            else:
+                _failed(led, scenario, "batch", "-", "-", f"{label} · {name} SELF-SKIPPED "
+                        f"({skipped[name]}) — counted green by libtest; allow it in "
+                        "core.SKIP_ALLOWED with a reason, or bring its infrastructure up", "vacuous skip")
+        elif verdict in ("PASS", "LEAK"):
             _passed(led, scenario, "batch", "-", "-", f"{label} · {name}")
         else:
             _failed(led, scenario, "batch", "-", "-", f"{label} FAILED · {name} (see {log_path})")
@@ -1934,7 +1955,7 @@ def _run_pool_module(
         # the SUBSTRING form: `test_filter` is a `<module>::<prefix>`, which the
         # `$`-anchored form would match NONE of (measured on `state_parity_`).
         ["cargo", "nextest", "run", "--manifest-path", str(ROOT / "Cargo.toml"),
-         "--test", "live_suite", "--run-ignored", "all", "-E", f"test({test_filter})"],
+         "--test", "live_suite", "--run-ignored", "all", "--no-fail-fast", "-E", f"test({test_filter})"],
         env=release_bin_env(),
         timeout=NO_TIMEOUT,
     )

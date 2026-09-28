@@ -506,7 +506,8 @@ def prev_binary() -> Path | None:
     raw = os.environ.get("RIVET_PREV_RELEASE_BIN", "")
     if not raw:
         return None
-    p = Path(raw)
+    # Absolute: cells run the baseline from their own temp directories.
+    p = (ROOT / raw).resolve() if not Path(raw).is_absolute() else Path(raw)
     return p if p.is_file() and os.access(p, os.X_OK) else None
 
 
@@ -1816,6 +1817,13 @@ def _harm_seed(engine: str, url: str, drop: bool = False) -> bool:
     return _mongosh(url, script).ok
 
 
+def _pg_counters(url: str) -> dict[str, int] | None:
+    """The source database's own harm counters (see `perf._pg_counters`)."""
+    from .perf import _pg_counters as probe
+
+    return probe(url)
+
+
 def verify_harm_regression(led: Ledger) -> None:
     """What one export costs the SOURCE, cur vs the previous release, per engine: each
     binary exports the same table three times from its own env, and the per-counter MIN
@@ -1848,9 +1856,18 @@ def verify_harm_regression(led: Ledger) -> None:
             for _ in range(3):
                 shutil.rmtree(envdir / "out", ignore_errors=True)
                 (envdir / "out").mkdir(parents=True, exist_ok=True)
+                before = _pg_counters(url) if engine == "postgres" else None
                 run([str(binary), "run", "-c", str(envdir / "c.yaml")], timeout=None,
                     env=_ISOLATED_STATE)
-                for m, d in _last_run_harm(envdir).items():
+                after = _pg_counters(url) if engine == "postgres" else None
+                reported = _last_run_harm(envdir)
+                # PostgreSQL: the source's own counters, read here — rivet's report changed
+                # meaning between releases (#312) and cannot be compared across them.
+                measured = ({k: after[k] - before[k] for k in after}
+                            if before and after else reported)
+                if not reported:
+                    measured = {}
+                for m, d in measured.items():
                     best[m] = min(best.get(m, d), d)
             mins[label] = best
         _harm_seed(engine, url, drop=True)

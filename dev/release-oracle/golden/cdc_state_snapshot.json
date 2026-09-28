@@ -1,6 +1,6 @@
 {
   "export_metrics": "populated",
-  "export_schema": "empty",
+  "export_schema": "populated",
   "export_state": "empty",
   "file_log": "populated",
   "run_aggregate": "empty",
