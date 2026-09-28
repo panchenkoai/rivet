@@ -7,7 +7,8 @@
 //! what the risk profile is (resumable? memory bound?).
 //!
 //! It is a **pure** function over data already available in the lib layer — the
-//! preflight [`ExportDiagnostic`] plus the [`ExportConfig`] — and the shared
+//! planner's resolved [`ExtractionStrategy`], the preflight [`ExportDiagnostic`]
+//! plus the [`ExportConfig`] — and the shared
 //! memory model in [`crate::tuning::memory`]. It deliberately does **not** touch
 //! `crate::init` (bin-only) even though `init::TableInfo::mode_rationale` covers
 //! the same ground for `rivet init`: the plan layer is library code and cannot
@@ -16,7 +17,8 @@
 //! All numbers are data-driven: a missing `row_estimate` or `avg_row_bytes`
 //! degrades to an explicit "unavailable" note rather than a fabricated figure.
 
-use crate::config::ExportConfig;
+use crate::config::{ExportConfig, ExportMode};
+use crate::plan::ExtractionStrategy;
 use crate::preflight::{ExportDiagnostic, SMALL_TABLE_ROW_THRESHOLD};
 use crate::tuning::memory::{DEFAULT_MEM_BUDGET_MB, estimate_peak_rss_mb};
 
@@ -24,45 +26,38 @@ use crate::tuning::memory::{DEFAULT_MEM_BUDGET_MB, estimate_peak_rss_mb};
 /// strategy — mode, chunk geometry, parallelism — was chosen, plus its risk
 /// profile (resumable? memory bound?).
 ///
-/// Reads only from the preflight [`ExportDiagnostic`] and the [`ExportConfig`]
-/// (both lib-accessible) and the shared [`crate::tuning::memory`] model, so it
-/// compiles in the library and never fabricates a number it does not have.
-/// The BASE token of a diagnostic `mode` string. `diagnose_mode_str` decorates
-/// every non-`full` mode — `"chunked (column: id, size: 1000000)"`,
-/// `"keyset (key: k, size: n)"`, `"incremental (cursor: c)"` — while the
-/// matches in this file compared the exact bare token, so no arm ever fired on
-/// a real diagnostic: every chunked/keyset/incremental export read the `_`
-/// fallback's narrative, including "resumable: no" on a checkpointed chunked
-/// plan. Match on the first word instead of trusting two files to agree on a
-/// format nobody pinned.
-fn mode_token(mode: &str) -> &str {
-    mode.split([' ', '(']).next().unwrap_or(mode)
-}
-
-pub fn explain_strategy(diag: &ExportDiagnostic, export: &ExportConfig) -> String {
+/// The mode, column and sizes come from the planner's resolved `strategy` —
+/// never re-derived from config — so the narrative names what will actually run
+/// (an auto-resolved PK, a memory-derived chunk_size, a small-table downgrade).
+/// Row and index facts come from the preflight [`ExportDiagnostic`].
+pub fn explain_strategy(
+    diag: &ExportDiagnostic,
+    strategy: &ExtractionStrategy,
+    export: &ExportConfig,
+) -> String {
     let mut sentences: Vec<String> = Vec::new();
 
-    sentences.push(explain_mode(diag, export));
-    if let Some(geometry) = explain_geometry(diag, export) {
+    sentences.push(explain_mode(diag, strategy, export));
+    if let Some(geometry) = explain_geometry(diag, strategy) {
         sentences.push(geometry);
     }
-    sentences.push(explain_parallelism(diag, export));
-    sentences.push(explain_risk(diag, export));
+    sentences.push(explain_parallelism(diag, strategy));
+    sentences.push(explain_risk(diag, strategy));
 
     sentences.join(" ")
 }
 
 /// Why this mode — grounds the choice in the row estimate vs. the chunked
 /// threshold and the presence (or absence) of an indexed chunk/cursor column.
-fn explain_mode(diag: &ExportDiagnostic, export: &ExportConfig) -> String {
+fn explain_mode(
+    diag: &ExportDiagnostic,
+    strategy: &ExtractionStrategy,
+    export: &ExportConfig,
+) -> String {
     let rows = fmt_rows(diag.row_estimate);
-    match mode_token(&diag.mode) {
-        "chunked" => {
-            let col = export
-                .chunk_column
-                .as_deref()
-                .or(diag.cursor_column.as_deref())
-                .unwrap_or("key");
+    match strategy {
+        ExtractionStrategy::Chunked(cp) => {
+            let col = &cp.column;
             let index_note = if diag.uses_index {
                 format!("chunk column `{col}` is indexed")
             } else {
@@ -76,12 +71,8 @@ fn explain_mode(diag: &ExportDiagnostic, export: &ExportConfig) -> String {
                 _ => format!("Mode chunked: configured explicitly ({rows}); {index_note}."),
             }
         }
-        "incremental" => {
-            let col = diag
-                .cursor_column
-                .as_deref()
-                .or(export.cursor_column.as_deref())
-                .unwrap_or("cursor");
+        ExtractionStrategy::Incremental(ip) => {
+            let col = ip.cursor_identity();
             let index_note = if diag.uses_index {
                 "the cursor is indexed, so the watermark predicate is an index range scan"
             } else {
@@ -91,47 +82,46 @@ fn explain_mode(diag: &ExportDiagnostic, export: &ExportConfig) -> String {
                 "Mode incremental on `{col}`: resumes from the last stored watermark and pulls only newer rows ({index_note})."
             )
         }
-        "full" => match diag.row_estimate {
+        ExtractionStrategy::Snapshot if export.mode == ExportMode::Chunked => format!(
+            "Mode full: `mode: chunked` was downgraded to a single pass because the table ({rows}) fits in one chunk."
+        ),
+        ExtractionStrategy::Snapshot => match diag.row_estimate {
             Some(r) if r < SMALL_TABLE_ROW_THRESHOLD => format!(
                 "Mode full: {rows} rows, below the {threshold} chunked threshold, so a single-pass copy is cheapest.",
                 threshold = fmt_rows(Some(SMALL_TABLE_ROW_THRESHOLD)),
             ),
             _ => format!("Mode full: a single-pass copy of the whole result set ({rows})."),
         },
-        "timewindow" => {
-            let col = export.time_column.as_deref().unwrap_or("time column");
-            let days = export
-                .days_window
-                .map(|d| format!("{d}-day"))
-                .unwrap_or_else(|| "rolling".to_string());
-            format!("Mode time_window: re-reads a {days} window of `{col}` each run ({rows}).")
-        }
-        "keyset" => {
-            let col = export.chunk_by_key.as_deref().unwrap_or("key");
-            format!(
-                "Mode keyset: seek-paginates by the indexed key `{col}` ({rows}), bounding peak memory and query hold-time without a single-integer PK."
-            )
-        }
-        other => format!("Mode {other}: {rows}."),
+        ExtractionStrategy::TimeWindow {
+            column,
+            days_window,
+            ..
+        } => format!(
+            "Mode time_window: re-reads a {days_window}-day window of `{column}` each run ({rows})."
+        ),
+        ExtractionStrategy::Keyset(kp) => format!(
+            "Mode keyset: seek-paginates by the indexed key `{col}` ({rows}), bounding peak memory and query hold-time.",
+            col = kp.key_column,
+        ),
     }
 }
 
 /// Why this chunk_size / file geometry — only meaningful for chunked exports;
 /// relates the row estimate to the chunk size and the resulting part count.
-fn explain_geometry(diag: &ExportDiagnostic, export: &ExportConfig) -> Option<String> {
-    if mode_token(&diag.mode) != "chunked" {
+fn explain_geometry(diag: &ExportDiagnostic, strategy: &ExtractionStrategy) -> Option<String> {
+    let ExtractionStrategy::Chunked(cp) = strategy else {
         return None;
-    }
+    };
 
     // An explicit `chunk_count` fixes the number of windows directly; the size is
     // derived from min/max at detect time, so don't claim a row-derived count.
-    if let Some(count) = export.chunk_count {
+    if let Some(count) = cp.chunk_count {
         return Some(format!(
             "Geometry: {count} equal key-range windows (chunk_count={count}); chunk_size is derived from the observed min/max."
         ));
     }
 
-    let size = export.chunk_size;
+    let size = cp.chunk_size;
     match diag.row_estimate {
         Some(r) if size > 0 => {
             let parts = (r as usize).div_ceil(size).max(1);
@@ -151,10 +141,8 @@ fn explain_geometry(diag: &ExportDiagnostic, export: &ExportConfig) -> Option<St
 /// Why this parallelism — ties the configured worker count to the shared RSS
 /// budget via `tuning::memory::estimate_peak_rss_mb`, and surfaces the preflight
 /// recommendation when it diverges from what is configured.
-fn explain_parallelism(diag: &ExportDiagnostic, export: &ExportConfig) -> String {
-    // The worker count that will actually run is the configured `parallel`
-    // (chunked only); other modes are single-threaded at query time.
-    let parallel = parallel_workers(diag, export);
+fn explain_parallelism(diag: &ExportDiagnostic, strategy: &ExtractionStrategy) -> String {
+    let parallel = parallel_workers(strategy);
 
     let (rec_level, rec_reason) = diag.recommended_parallel;
 
@@ -182,25 +170,29 @@ fn explain_parallelism(diag: &ExportDiagnostic, export: &ExportConfig) -> String
 }
 
 /// Risk profile — resumability and the memory bound.
-fn explain_risk(diag: &ExportDiagnostic, export: &ExportConfig) -> String {
-    let resumable = match mode_token(&diag.mode) {
-        // Incremental resumes by its stored watermark every run.
-        "incremental" => "resumable: yes — re-runs continue from the stored watermark".to_string(),
-        // Chunked resumes only when the checkpoint is on. Without it a failed run
-        // re-reads the whole table from the first window.
-        "chunked" => "resumable: per-chunk when checkpointing is on; otherwise a failed/re-run \
-             re-reads the whole table"
-            .to_string(),
-        // Keyset pages forward by key but does not persist progress across runs.
-        "keyset" => {
-            "resumable: pages forward by key within a run, but a re-run restarts from the first page"
-                .to_string()
+fn explain_risk(diag: &ExportDiagnostic, strategy: &ExtractionStrategy) -> String {
+    let resumable = match strategy {
+        ExtractionStrategy::Incremental(_) => {
+            "resumable: yes — re-runs continue from the stored watermark"
         }
-        // Full and time_window restart from scratch.
-        _ => "resumable: no — a failed run restarts from the beginning".to_string(),
+        ExtractionStrategy::Chunked(cp) if cp.checkpoint => {
+            "resumable: per-chunk — the chunk checkpoint resumes a failed run"
+        }
+        ExtractionStrategy::Chunked(_) => {
+            "resumable: no chunk checkpoint — a failed run re-reads the whole table"
+        }
+        ExtractionStrategy::Keyset(kp) if kp.checkpoint => {
+            "resumable: yes — a crashed run resumes from its last committed key"
+        }
+        ExtractionStrategy::Keyset(_) => {
+            "resumable: pages forward by key within a run, but a re-run restarts from the first page"
+        }
+        ExtractionStrategy::Snapshot | ExtractionStrategy::TimeWindow { .. } => {
+            "resumable: no — a failed run restarts from the beginning"
+        }
     };
 
-    let parallel = parallel_workers(diag, export);
+    let parallel = parallel_workers(strategy);
     let mem = match diag.avg_row_bytes {
         Some(width) => format!(
             "memory: bounded to ~{} MB peak",
@@ -212,13 +204,12 @@ fn explain_risk(diag: &ExportDiagnostic, export: &ExportConfig) -> String {
     format!("Risk — {resumable}; {mem}.")
 }
 
-/// Worker count that will actually run: the configured `parallel` for chunked
-/// exports (the only mode that spawns a worker pool), 1 for everything else.
-fn parallel_workers(diag: &ExportDiagnostic, export: &ExportConfig) -> usize {
-    if mode_token(&diag.mode) == "chunked" {
-        export.parallel.max(1)
-    } else {
-        1
+/// Worker count the plan will run: its chunked or keyset `parallel`, else 1.
+fn parallel_workers(strategy: &ExtractionStrategy) -> usize {
+    match strategy {
+        ExtractionStrategy::Chunked(cp) => cp.parallel.max(1),
+        ExtractionStrategy::Keyset(kp) => kp.parallel.max(1),
+        _ => 1,
     }
 }
 
@@ -251,50 +242,89 @@ mod tests {
         crate::config::sample_export(name)
     }
 
-    /// The producer/consumer contract this file silently broke: `diagnose_mode_str`
-    /// returns DECORATED strings — `"chunked (column: id, size: 1000000)"` — while
-    /// every match in this file compared the exact bare token, so no arm ever
-    /// fired on a real diagnostic: a chunked export read the `_` fallback's
-    /// narrative ("resumable: no"), including on a checkpointed plan. Bare only
-    /// for `full`, which is why the mismatch survived: the only mode anyone eyed
-    /// in tests was the one that happened to compare equal.
-    ///
-    /// The test therefore goes through the REAL producer rather than hand-typing
-    /// the mode string — hand-typing is exactly how the bug stayed invisible.
-    #[test]
-    fn explain_understands_what_diagnose_mode_str_actually_produces() {
+    fn chunked(column: &str, chunk_size: usize, parallel: usize) -> ExtractionStrategy {
+        ExtractionStrategy::Chunked(crate::plan::ChunkedPlan {
+            column: column.into(),
+            chunk_size,
+            chunk_count: None,
+            parallel,
+            by_days: None,
+            checkpoint: false,
+            max_attempts: 1,
+        })
+    }
+
+    fn keyset(key: &str) -> ExtractionStrategy {
+        ExtractionStrategy::Keyset(crate::plan::KeysetPlan {
+            key_column: key.into(),
+            chunk_size: 1000,
+            checkpoint: false,
+            incremental: false,
+            parallel: 0,
+        })
+    }
+
+    fn chunked_config_without_column() -> ExportConfig {
         let mut export = base_export("t");
-        export.mode = crate::config::ExportMode::Chunked;
-        export.chunk_column = Some("id".into());
+        export.mode = ExportMode::Chunked;
+        export.chunk_column = None;
+        export.chunk_size = 250_000;
+        export
+    }
 
-        let mut diag = base_diag("placeholder");
-        diag.mode = crate::preflight::diagnose_mode_str(&export);
-        assert!(
-            diag.mode.starts_with("chunked"),
-            "producer sanity: got {:?}",
-            diag.mode
-        );
+    #[test]
+    fn the_rationale_names_the_planned_column_and_size_not_the_yaml() {
+        let export = chunked_config_without_column();
+        let mut diag = base_diag("chunked (column: ?, size: 250000)");
+        diag.row_estimate = Some(370_000);
+        let s = explain_strategy(&diag, &chunked("id", 37_000, 1), &export);
+        assert!(s.contains("`id`"), "names the auto-resolved PK: {s}");
+        assert!(s.contains("~37K"), "cites the planned chunk_size: {s}");
+        assert!(s.contains("~10 part"), "370K / 37K = 10 parts: {s}");
+        assert!(!s.contains("`?`") && !s.contains("`key`"), "{s}");
+        assert!(!s.contains("~250K"), "never the YAML chunk_size: {s}");
+    }
 
-        // The chunked narrative names the chunk column; the `_` fallback cannot.
-        let mode_text = explain_mode(&diag, &export);
-        assert!(
-            mode_text.contains("chunk column"),
-            "a chunked diagnostic must take the chunked arm, got: {mode_text}"
-        );
-        // The risk line must give chunked's resumability, not the fallback's
-        // "resumable: no".
-        let risk = explain_risk(&diag, &export);
-        assert!(
-            risk.contains("per-chunk"),
-            "a chunked plan's risk line must describe per-chunk resume, got: {risk}"
-        );
-        // And the worker count must honour `parallel` for chunked.
-        export.parallel = 4;
-        assert_eq!(
-            parallel_workers(&diag, &export),
-            4,
-            "a chunked diagnostic must report the configured worker pool"
-        );
+    #[test]
+    fn a_small_table_downgrade_is_explained_as_a_single_pass() {
+        let export = chunked_config_without_column();
+        let mut diag = base_diag("chunked (column: ?, size: 250000)");
+        diag.row_estimate = Some(500);
+        let s = explain_strategy(&diag, &ExtractionStrategy::Snapshot, &export);
+        assert!(!s.contains("Mode chunked"), "{s}");
+        assert!(s.contains("downgraded"), "names the downgrade: {s}");
+        assert!(!s.contains("part file"), "no chunk geometry: {s}");
+    }
+
+    #[test]
+    fn a_planned_keyset_is_explained_as_keyset_on_its_key() {
+        let export = chunked_config_without_column();
+        let diag = base_diag("chunked (column: ?, size: 250000)");
+        let s = explain_strategy(&diag, &keyset("uk"), &export);
+        assert!(s.contains("Mode keyset"), "{s}");
+        assert!(s.contains("`uk`"), "names the key: {s}");
+        assert!(!s.contains("Mode chunked"), "{s}");
+    }
+
+    #[test]
+    fn the_risk_line_follows_the_planned_checkpoint() {
+        let diag = base_diag("chunked");
+        let mut on = chunked("id", 1000, 1);
+        if let ExtractionStrategy::Chunked(cp) = &mut on {
+            cp.checkpoint = true;
+        }
+        assert!(explain_risk(&diag, &on).contains("per-chunk"));
+        let off = explain_risk(&diag, &chunked("id", 1000, 1));
+        assert!(off.contains("re-reads the whole table"), "{off}");
+    }
+
+    fn incremental(column: &str) -> ExtractionStrategy {
+        ExtractionStrategy::Incremental(crate::plan::IncrementalCursorPlan {
+            primary_column: column.into(),
+            fallback_column: None,
+            mode: crate::config::IncrementalCursorMode::SingleColumn,
+            settle: None,
+        })
     }
 
     fn base_diag(mode: &str) -> ExportDiagnostic {
@@ -335,7 +365,7 @@ mod tests {
         export.chunk_size = 250_000;
         export.parallel = 4;
 
-        let s = explain_strategy(&diag, &export);
+        let s = explain_strategy(&diag, &chunked("id", 250_000, 4), &export);
         assert!(s.contains("chunked"), "mentions mode: {s}");
         assert!(s.contains("`id`"), "names the chunk column: {s}");
         assert!(s.contains("indexed"), "calls out the index: {s}");
@@ -364,7 +394,7 @@ mod tests {
         export.mode = ExportMode::Incremental;
         export.cursor_column = Some("updated_at".into());
 
-        let s = explain_strategy(&diag, &export);
+        let s = explain_strategy(&diag, &incremental("updated_at"), &export);
         assert!(s.contains("incremental"), "mentions mode: {s}");
         assert!(s.contains("`updated_at`"), "names the cursor: {s}");
         assert!(s.contains("watermark"), "explains the resume driver: {s}");
@@ -386,7 +416,7 @@ mod tests {
         export.mode = ExportMode::Full;
         export.format = FormatType::Csv;
 
-        let s = explain_strategy(&diag, &export);
+        let s = explain_strategy(&diag, &ExtractionStrategy::Snapshot, &export);
         assert!(s.contains("full"), "mentions mode: {s}");
         assert!(s.contains("below"), "explains it's below threshold: {s}");
         assert!(s.contains("~40K"), "uses the row estimate: {s}");
@@ -410,7 +440,7 @@ mod tests {
         export.chunk_size = 100_000;
         export.parallel = 2;
 
-        let s = explain_strategy(&diag, &export);
+        let s = explain_strategy(&diag, &chunked("pk", 100_000, 2), &export);
         assert!(s.contains("chunked"), "mentions mode: {s}");
         assert!(
             s.contains("row estimate unavailable"),
@@ -444,7 +474,7 @@ mod tests {
         export.chunk_size = 1_000_000;
         export.parallel = 8;
 
-        let s = explain_strategy(&diag, &export);
+        let s = explain_strategy(&diag, &chunked("id", 1_000_000, 8), &export);
         assert!(
             s.contains("preflight recommends 4"),
             "surfaces the divergent recommendation: {s}"
@@ -466,7 +496,7 @@ mod tests {
         export.chunk_size = 1_000_000;
         export.parallel = 64;
 
-        let s = explain_strategy(&diag, &export);
+        let s = explain_strategy(&diag, &chunked("id", 1_000_000, 64), &export);
         let peak = estimate_peak_rss_mb(64, 8_000);
         assert!(peak > DEFAULT_MEM_BUDGET_MB, "sanity: scenario over budget");
         assert!(s.contains("EXCEEDS"), "flags the over-budget peak: {s}");
