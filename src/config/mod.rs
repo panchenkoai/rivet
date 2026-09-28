@@ -431,18 +431,17 @@ impl Config {
     /// A MongoDB CDC export under a ClickHouse `load:` is refused when the config is read,
     /// before a run extracts a stream the load would then refuse.
     fn validate_mongo_cdc_has_a_loadable_target(&self) -> crate::error::Result<()> {
-        let into_clickhouse = matches!(
-            self.load.as_ref().map(|l| &l.target),
-            Some(crate::config::load::LoadTarget::Clickhouse { .. })
-        );
+        let refusal = self
+            .load
+            .as_ref()
+            .and_then(|l| l.target.cdc_refusal(self.source.source_type));
         let cdc = self.exports.iter().find(|e| e.mode == ExportMode::Cdc);
-        if let (true, SourceType::Mongo, Some(e)) = (into_clickhouse, self.source.source_type, cdc)
-        {
+        if let (Some(why), Some(e)) = (refusal, cdc) {
             crate::config_bail!(
                 crate::error::codes::CONFIG_SOURCE_MODE_UNSUPPORTED,
                 "export '{}': {}",
                 e.name,
-                crate::load::orchestrate::MONGO_CDC_INTO_CLICKHOUSE
+                why
             );
         }
         Ok(())
@@ -455,7 +454,7 @@ impl Config {
         let Some(load) = &self.load else {
             return Ok(());
         };
-        if crate::load::plan::warehouse_compacts(load) {
+        if load.target.compacts() {
             return Ok(());
         }
         let base = |l: Option<LayoutChoice>| l == Some(LayoutChoice::BaseBuffer);

@@ -450,8 +450,8 @@ pub(crate) fn partition_budget_ok(
     plan: &load::plan::LoadPlan,
     uris: &[String],
 ) -> Result<()> {
-    match (&plan.load.target, &plan.partition) {
-        (load::plan::LoadTarget::Bigquery { .. }, Some(partition)) => {
+    match &plan.partition {
+        Some(partition) if plan.load.target.budgets_partitions() => {
             load::partition_budget::check_partition_budget(store, uris, partition)
                 .with_context(|| format!("export `{}`", plan.export_name))
         }
@@ -557,6 +557,18 @@ mod tests {
         );
         let err = super::partition_budget_ok(&store, &plan, &uris).unwrap_err();
         assert!(format!("{err:#}").contains("export `orders`"), "{err:#}");
+
+        plan.load.target = crate::load::plan::LoadTarget::Clickhouse {
+            url: "http://ch:8123".into(),
+            database: "d".into(),
+            user: "u".into(),
+            password_env: "P".into(),
+            named_collection: None,
+        };
+        assert!(
+            super::partition_budget_ok(&store, &plan, &uris).is_ok(),
+            "only BigQuery caps the partitions one job writes"
+        );
     }
 
     fn write_noted(
