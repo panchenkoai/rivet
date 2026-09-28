@@ -33,7 +33,7 @@ pub use checkpoint::{ChunkTaskInfo, StrategySnapshot};
 pub use file_log::{DurablePart, FilePart, FileRecord};
 #[allow(unused_imports)]
 pub use keyset_range::{KeysetRangePart, KeysetRangeRow};
-pub use load_journal_store::LoadRecord;
+pub use load_journal_store::{LoadRecord, LoadStatus};
 #[allow(unused_imports)]
 pub use load_spec_store::{LoadSpec, LoadSpecColumn};
 #[allow(unused_imports)]

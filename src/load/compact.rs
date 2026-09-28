@@ -2,10 +2,10 @@
 
 use crate::error::Result;
 use crate::load;
+use crate::load::ledger::{ledger_load_id, ledger_status, ownership_of};
 use crate::load::orchestrate::{
-    failures_of, hand_off_state, ledger_load_id, ledger_status, needs_source_engine,
-    no_outcome_error, open_state, ownership_of, reconnect, require_pk, resolve_run_id,
-    take_table_lease,
+    failures_of, hand_off_state, needs_source_engine, no_outcome_error, open_state, reconnect,
+    require_pk, resolve_run_id, take_table_lease,
 };
 use crate::load::pin::pin_plan_to_its_run;
 use crate::load::{ObjectKind, Ownership};
@@ -323,7 +323,7 @@ pub fn run_compacts(args: CompactArgs) -> Result<()> {
                         source_ident: String::new(),
                         rows_loaded: report.as_ref().map_or(0, |r| r.changes_rows as i64),
                         status: match &report {
-                            Ok(_) => "success".to_string(),
+                            Ok(_) => crate::state::LoadStatus::Success.as_str().to_string(),
                             // A refusal is a stop before the write, exactly as on the
                             // load path — never a `failed` row that makes the target
                             // look like rivet's own on the next attempt.

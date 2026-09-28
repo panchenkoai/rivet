@@ -14,9 +14,13 @@
 
 use crate::error::Result;
 use crate::load;
+#[cfg(test)]
+use crate::load::ledger::ledger_status;
+use crate::load::ledger::{closing_status, ledger_load_id, ownership_of};
 use crate::load::partition_budget::{budgeted_uris, partition_budget_ok, partition_label};
 use crate::load::pin::{late_runs_refusal, pin_plan_to_its_run};
 use crate::load::staging::{cleanup_target_leased, ledger_writers, maybe_gc_orphans};
+use crate::state::LoadStatus;
 use crate::state::{LoadRecord, StateRef, StateStore};
 use anyhow::Context as _;
 
@@ -449,24 +453,6 @@ pub(super) fn take_table_lease<'a>(
     }
 }
 
-/// Whether the ledger says rivet loaded `fqtn`; `Unreadable` (warned) when the probe fails.
-pub(super) fn ownership_of(state: Option<&StateStore>, fqtn: &str, op: &str) -> load::Ownership {
-    match state {
-        Some(s) => match s.has_load_attempt(fqtn) {
-            Ok(true) => load::Ownership::Own,
-            Ok(false) => load::Ownership::Foreign,
-            Err(e) => {
-                log::warn!(
-                    "{op}: the ownership probe for {fqtn} failed ({e:#}) — refusing rather \
-                     than treating it as a stateless {op}"
-                );
-                load::Ownership::Unreadable
-            }
-        },
-        None => load::Ownership::Unknown,
-    }
-}
-
 /// The resolved dedup key for an append mode (`cdc` / `incremental`); bails with a
 /// config-fix hint when neither the config nor the recorded source key gives one.
 pub(super) fn require_pk<'a>(plan: &'a load::plan::LoadPlan, mode: &str) -> Result<&'a [String]> {
@@ -706,9 +692,15 @@ fn prepare_load(
         && let Some((_, m)) = new.first()
     {
         let mine = crate::manifest::identity_source(m);
-        if let Ok(prior) = s.loaded_source_idents(target_fqtn)
-            && let Some(other) = conflicting_source_ident(&mine, &prior)
-        {
+        // Fail SAFE: an unreadable ledger cannot vouch that no other source loaded this table.
+        let prior = s.loaded_source_idents(target_fqtn).map_err(|e| {
+            e.context(format!(
+                "load: the ledger could not say which source last loaded `{target_fqtn}`, so this \
+                 load cannot rule out replacing another source's rows — nothing was written; fix \
+                 the state backend and re-run"
+            ))
+        })?;
+        if let Some(other) = conflicting_source_ident(&mine, &prior) {
             anyhow::bail!(
                 "target table `{target_fqtn}` was last loaded from `{other}` and this load \
                  carries `{mine}` — loading would REPLACE the other source's rows, and both \
@@ -997,22 +989,22 @@ impl LoadCtx<'_> {
     }
     /// Nothing new to load — the ledger already covers every run.
     fn record_skip(&self) {
-        self.record(&[], 0, "success");
+        self.record(&[], 0, LoadStatus::Success.as_str());
     }
 
     /// About to touch the warehouse. Survives only a process that DIED here; unwritable, the load must not write.
     fn record_writing(&self) -> Result<()> {
-        self.try_record(&[], 0, "writing")
+        self.try_record(&[], 0, LoadStatus::Writing.as_str())
             .context("load: the ledger cannot record that this load is about to write, so it does not write — a table written without that record reads as foreign to the next load")
     }
     /// The load errored after consuming `run_ids`.
     #[cfg(test)]
     fn record_failed(&self, run_ids: &[String]) {
-        self.record(run_ids, 0, "failed");
+        self.record(run_ids, 0, LoadStatus::Failed.as_str());
     }
     /// The load appended/loaded `rows` from `run_ids`.
     fn record_success(&self, run_ids: &[String], rows: i64) {
-        self.record(run_ids, rows, "success");
+        self.record(run_ids, rows, LoadStatus::Success.as_str());
     }
 }
 
@@ -1270,58 +1262,6 @@ fn buffer_uris(uris: Vec<String>) -> Option<Vec<String>> {
 /// `t` writes `export_name = t`, exactly what a leg's family/name pair looks like.
 pub(crate) fn is_baseline_leg(m: &crate::manifest::RunManifest) -> bool {
     m.mode != "cdc"
-}
-
-/// The status a load's CLOSING ledger row carries after the load failed.
-///
-/// `refused` means "stopped before ANY warehouse write" — that is precisely why
-/// `has_load_attempt` does not count it. Once a LEG has LANDED the claim is false for
-/// this load: the warehouse WAS written, and the target is rivet's own.
-///
-/// It matters because the closing row reuses the leg's `load_id` — one audit row per
-/// load, deliberately — so it REPLACES whatever the leg wrote. A `refused` replacing a
-/// leg's `success` makes `has_load_attempt` return false and rivet DISOWNS the base it
-/// had just created; the next load refuses it as foreign. The success path already
-/// guards its closing row (`closing_record_applies`); the error path had no guard at
-/// all, which is the asymmetry this closes.
-///
-/// `loaded_source_run` is unaffected either way — it is written only on `success` and
-/// never deleted, so the skip set survives the replacement. The damage was always to
-/// the audit row and, through it, to ownership.
-fn closing_status(e: &anyhow::Error, consumed: &[String]) -> &'static str {
-    if consumed.is_empty() {
-        ledger_status(e)
-    } else {
-        "failed"
-    }
-}
-
-/// The `load_run` PRIMARY KEY for one table's row in one invocation.
-///
-/// The OP belongs in it because `rivet load` and `rivet compact` are two different
-/// RECORDS of the same table, and both derive their key from the same operator-supplied
-/// run id. Without it they computed the identical string, `load_run` upserts
-/// `ON CONFLICT (load_id) DO UPDATE`, and the compact's row — `mode=compact`,
-/// `source_run_ids=[]`, `rows_loaded=0` — REPLACED the load's. A scheduler that stamps
-/// one `RIVET_RUN_ID` per cycle and then runs load followed by compact is the ordinary
-/// shape that does it, and the release gate had already met this: `blessed_flow.py`
-/// works around it by minting a unique `--run-id` per cell, and says why in a comment.
-/// A harness workaround for a product behaviour is a bug report, not a fix.
-///
-/// The `{run_id}:` PREFIX is load-bearing and must stay first — the gate's ledger check
-/// scopes with `LIKE '<run-id>%'`.
-pub(super) fn ledger_load_id(run_id: &str, op: &str, table: &str) -> String {
-    format!("{run_id}:{op}:{table}")
-}
-
-/// How the ledger records a load that did not complete: `refused` when it stopped before
-/// any warehouse write (the target is not rivet's own for having been refused), `failed`
-/// otherwise.
-pub(super) fn ledger_status(e: &anyhow::Error) -> &'static str {
-    match e.downcast_ref::<load::Refused>() {
-        Some(_) => "refused",
-        None => "failed",
-    }
 }
 
 /// The ledger rows of one load, written per LEG: a run closure that lands some of
@@ -2990,6 +2930,31 @@ mod live_only_decisions {
         assert!(
             note.contains("2 newer run(s)") && note.contains("r3, r2"),
             "{note}"
+        );
+    }
+
+    /// An unreadable ledger cannot vouch that no other source loaded the table: refuse, never skip the check.
+    #[test]
+    fn an_unreadable_source_identity_ledger_refuses_the_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = fs_store(&dir);
+        let prefix = "gs://b/base";
+        write_at(&dir, "base/part-1.parquet", b"x");
+        let good = success_manifest("run-1", "part-1.parquet");
+        write_at(
+            &dir,
+            "base/manifest-run-1.json",
+            &serde_json::to_vec(&good).unwrap(),
+        );
+        let state = StateStore::open_in_memory().unwrap();
+        state.exec_for_test("DROP TABLE loaded_source_run");
+        let plan = plan_at(LoadMode::Full, prefix);
+        let err = prepare_load(&store, &plan, Some(&state), "p.d.orders", false)
+            .err()
+            .expect("an unreadable ledger must refuse, not skip the cross-source check");
+        assert!(
+            format!("{err:#}").contains("could not say which source last loaded"),
+            "{err:#}"
         );
     }
 
