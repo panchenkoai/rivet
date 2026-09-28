@@ -1,5 +1,5 @@
-//! The semantic gates are STEPS of the `Tests` job (and the PR matrices a step of the
-//! type-golden job), not jobs of their own. A step is easy to drop or to point at the
+//! The semantic gates are STEPS of the `Tests` job, and the service-backed suites steps of
+//! the E2E job (one compile, one set of containers), not jobs of their own. A step is easy to drop or to point at the
 //! wrong filter in an edit that reads as tidying; this pins each one by its command.
 
 use std::path::Path;
@@ -42,7 +42,22 @@ const GATES: &[(&str, &str, &str)] = &[
         "python3 -m dev.pytools.docgen --check",
     ),
     (
-        "test-type-golden",
+        "e2e",
+        "Type-golden tests (semantic gate)",
+        "cargo test --test live_type_golden -- --ignored",
+    ),
+    (
+        "e2e",
+        "Type round-trip validators — DuckDB · ClickHouse · pyarrow (semantic gate)",
+        "cargo test --test type_roundtrip -- --include-ignored --skip bigquery",
+    ),
+    (
+        "e2e",
+        "Differential correctness at scale (DuckDB vs source)",
+        "cargo test --test live_differential -- --ignored",
+    ),
+    (
+        "e2e",
         "PR regression matrices (cli + cfg + path)",
         "python3 -m dev.pytools.matrices --tier=pr --skip-compose | tee dev/matrices/run.log",
     ),
@@ -74,7 +89,7 @@ fn every_semantic_gate_is_a_step_with_its_command() {
             run.lines().any(|l| l.trim() == *cmd),
             "`{name}` in job `{job}` no longer runs `{cmd}` — got `{run}`"
         );
-        if *job == "test" {
+        {
             assert_eq!(
                 step["if"].as_str(),
                 Some("${{ !cancelled() }}"),

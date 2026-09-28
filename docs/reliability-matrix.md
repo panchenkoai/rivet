@@ -14,7 +14,7 @@ The matrix is derived from the workflows in [.github/workflows/](https://github.
 | **Nightly** | full live suite incl. content_load against ~60k-row fixture; pgBouncer profile; MongoDB version matrix (4.4 → 8.0, batch + CDC) | 03:30 UTC cron + manual dispatch | up to 60 min |
 | **Manual** | 1M-row stress, full legacy DB matrix (PG 12–15, MySQL 5.7), wide-table memory benchmarks | operator-invoked from `dev/` scripts | varies |
 
-PR CI defines branch protection — the named gates (`fmt`, `clippy`, `test` — whose invariant / recovery / compatibility / type-contract / stability / generated-docs steps each fail under their own name — `test-type-golden`, `e2e`) block merges on regression.
+PR CI defines branch protection — the named gates (`fmt`, `clippy`, `test` — whose invariant / recovery / compatibility / type-contract / stability / generated-docs steps each fail under their own name — and `e2e`, whose type-golden / type-validator / differential / PR-matrix steps do the same on one set of containers) block merges on regression.
 
 ---
 
@@ -151,7 +151,7 @@ runs the right set per gate.
 | [`legacy`](https://github.com/panchenkoai/rivet/tree/main/dev/legacy) | Compatibility | Full e2e (83 assertions) per DB version | **Manual** | operator-invoked |
 
 Branch-protection guarantees: the **PR** row must stay green to merge — the
-runs as a step of the `test-type-golden` job in [.github/workflows/ci.yml](https://github.com/panchenkoai/rivet/blob/main/.github/workflows/ci.yml).
+runs as a step of the `e2e` job in [.github/workflows/ci.yml](https://github.com/panchenkoai/rivet/blob/main/.github/workflows/ci.yml).
 **Nightly** matrices run from [.github/workflows/nightly-live.yml](https://github.com/panchenkoai/rivet/blob/main/.github/workflows/nightly-live.yml);
 a red nightly emails the on-call. **Release** matrices run as part of the
 release checklist; the artifact is the matrix log in

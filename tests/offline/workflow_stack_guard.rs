@@ -27,6 +27,10 @@ fn compose_services(path: &str) -> BTreeSet<String> {
         }
         let mut words = line[idx + "up -d".len()..].split_whitespace().peekable();
         while let Some(w) = words.next() {
+            // A redirect or control operator ends the service list (`… oracle > log &`).
+            if w.starts_with('>') || w.starts_with(['&', '|', ')', ';']) {
+                break;
+            }
             if w == "--wait" {
                 continue;
             }
