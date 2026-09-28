@@ -14,7 +14,7 @@
 
 use crate::error::Result;
 
-use super::{StateRef, StateStore, open_connection, pg_sql};
+use super::{StateConn, StateStore, pg_sql};
 
 /// One persisted range of a parallel keyset run.
 #[derive(Debug, Clone)]
@@ -129,14 +129,14 @@ impl StateStore {
 
     /// Atomically COMMIT a completed range from a worker thread: record every part
     /// to `file_log` AND flip the range's `done=1`, in ONE transaction, over a
-    /// fresh connection (the live `StateStore` is not `Sync`, so workers reconnect
-    /// per the ADR-0011 `*_at_ref` pattern). The transaction is the checkpoint
+    /// worker-held store (the live `StateStore` is not `Sync`, so each worker opens
+    /// its own via `open_at_ref`). The transaction is the checkpoint
     /// boundary — a crash before it commits leaves the range `done=0` with no
     /// `file_log` rows (re-read on resume), after it leaves both durable (skipped +
     /// rehydrated on resume). Only the range's OWN row is touched, so concurrent
     /// workers never contend.
-    pub fn commit_keyset_range_at_ref(
-        state_ref: &StateRef,
+    pub fn commit_keyset_range(
+        &self,
         run_id: &str,
         export_name: &str,
         range_index: i64,
@@ -153,10 +153,9 @@ impl StateStore {
         // belonging to ANOTHER run's recovery set left behind by a crash (H1).
         let done_sql = "UPDATE keyset_range SET done = 1, updated_at = ?1 \
              WHERE export_name = ?2 AND range_index = ?3 AND run_id = ?4";
-        match state_ref {
-            StateRef::Sqlite(db_path) => {
-                let mut conn = open_connection(db_path)?;
-                let tx = conn.transaction()?;
+        match &self.conn {
+            StateConn::Sqlite(conn) => {
+                let tx = conn.unchecked_transaction()?;
                 for p in parts {
                     tx.execute(
                         file_sql,
@@ -178,8 +177,8 @@ impl StateStore {
                 )?;
                 tx.commit()?;
             }
-            StateRef::Postgres(url) => {
-                let mut client = super::connect_pg(url)?;
+            StateConn::Postgres(client) => {
+                let mut client = client.borrow_mut();
                 let mut tx = client.transaction()?;
                 for p in parts {
                     tx.execute(
@@ -276,9 +275,7 @@ mod tests {
     }
 
     #[test]
-    fn commit_range_marks_only_its_own_row_done_and_records_parts() {
-        // `_at_ref` reconnects (workers are not `Sync`), so an in-memory store won't
-        // do: `open_connection(":memory:")` is a DISTINCT empty DB. Use a file store.
+    fn commit_range_via_a_worker_held_store_marks_only_its_own_row_done_and_records_parts() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = dir.path().join("rivet.yaml");
         std::fs::write(&cfg, "# test").unwrap();
@@ -290,20 +287,21 @@ mod tests {
         s.persist_keyset_ranges("exp", "run-1", "id", &ranges)
             .unwrap();
 
-        StateStore::commit_keyset_range_at_ref(
-            s.state_ref(),
-            "run-1",
-            "exp",
-            1,
-            &[KeysetRangePart {
-                file_name: "exp_run-1_pk_w1_0.parquet".to_string(),
-                rows: 42,
-                bytes: 100,
-            }],
-            "parquet",
-            Some("zstd"),
-        )
-        .unwrap();
+        let worker = StateStore::open_at_ref(s.state_ref()).unwrap();
+        worker
+            .commit_keyset_range(
+                "run-1",
+                "exp",
+                1,
+                &[KeysetRangePart {
+                    file_name: "exp_run-1_pk_w1_0.parquet".to_string(),
+                    rows: 42,
+                    bytes: 100,
+                }],
+                "parquet",
+                Some("zstd"),
+            )
+            .unwrap();
 
         let loaded = s.load_keyset_ranges("exp", "run-1", "id").unwrap();
         assert!(!loaded[0].done, "range 0 untouched");

@@ -117,21 +117,22 @@ fn pg_keyset_range_round_trips_and_commits() {
     assert_eq!(loaded.len(), 2);
     assert!(loaded.iter().all(|r| !r.done), "fresh ranges are not done");
 
-    // Commit range 1 (a worker's atomic done-flip + file_log) over the PG StateRef.
-    StateStore::commit_keyset_range_at_ref(
-        s.state_ref(),
-        "run-1",
-        export,
-        1,
-        &[KeysetRangePart {
-            file_name: "pk_w1_0.parquet".to_string(),
-            rows: 7,
-            bytes: 70,
-        }],
-        "parquet",
-        None,
-    )
-    .unwrap();
+    // Commit range 1 (a worker's atomic done-flip + file_log) on a worker-held PG store.
+    let worker = StateStore::open_at_ref(s.state_ref()).unwrap();
+    worker
+        .commit_keyset_range(
+            "run-1",
+            export,
+            1,
+            &[KeysetRangePart {
+                file_name: "pk_w1_0.parquet".to_string(),
+                rows: 7,
+                bytes: 70,
+            }],
+            "parquet",
+            None,
+        )
+        .unwrap();
     let after = s.load_keyset_ranges(export, "run-1", "id").unwrap();
     assert!(!after[0].done, "range 0 untouched");
     assert!(after[1].done, "range 1 committed → done");
@@ -241,8 +242,9 @@ fn pg_chunk_checkpoint_claim_complete() {
     s.insert_chunk_tasks(&run_id, &[(0, 100), (101, 200), (201, 300)])
         .unwrap();
 
-    let state_ref = s.state_ref().clone();
-    let t0 = StateStore::claim_next_chunk_task_at_ref(&state_ref, &run_id)
+    let worker = StateStore::open_at_ref(s.state_ref()).unwrap();
+    let t0 = worker
+        .claim_next_chunk_task(&run_id)
         .unwrap()
         .expect("claim chunk 0");
     assert_eq!(t0.0, 0);
@@ -250,14 +252,16 @@ fn pg_chunk_checkpoint_claim_complete() {
     s.complete_chunk_task(&run_id, 0, 100, Some("part0.parquet"))
         .unwrap();
 
-    let t1 = StateStore::claim_next_chunk_task_at_ref(&state_ref, &run_id)
+    let t1 = worker
+        .claim_next_chunk_task(&run_id)
         .unwrap()
         .expect("claim chunk 1");
     assert_eq!(t1.0, 1);
     s.complete_chunk_task(&run_id, 1, 100, Some("part1.parquet"))
         .unwrap();
 
-    let t2 = StateStore::claim_next_chunk_task_at_ref(&state_ref, &run_id)
+    let t2 = worker
+        .claim_next_chunk_task(&run_id)
         .unwrap()
         .expect("claim chunk 2");
     assert_eq!(t2.0, 2);

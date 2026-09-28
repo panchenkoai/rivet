@@ -62,6 +62,13 @@ impl FanIn {
         locked(&self.errors).push(format!("{label}: {msg}"));
     }
 
+    /// Record `result`'s error as a unit failure instead of dropping it.
+    pub(crate) fn fail_on_err<T>(&self, label: &str, result: anyhow::Result<T>) {
+        if let Err(e) = result {
+            self.fail(label, format!("{e:#}"));
+        }
+    }
+
     /// Run `body` on a scoped thread: counted as finished on every exit, an `Err` or a panic recorded as a failure.
     pub(crate) fn spawn<'s, 'e>(
         &'s self,
@@ -162,6 +169,17 @@ mod tests {
             (summary.files_committed, summary.total_rows),
             (1, 100),
             "the durable part is counted"
+        );
+    }
+
+    #[test]
+    fn a_failed_state_write_fails_the_run_and_a_successful_one_does_not() {
+        let fan = FanIn::default();
+        fan.fail_on_err("chunk 2 state", Ok(()));
+        fan.fail_on_err::<()>("chunk 3 state", Err(anyhow::anyhow!("database is locked")));
+        assert_eq!(
+            inner(fan.errors),
+            vec!["chunk 3 state: database is locked".to_string()]
         );
     }
 

@@ -194,16 +194,22 @@ pub(in crate::pipeline) fn run_chunked_parallel_checkpoint(
                 // `finished >= total`, so a missed bump hangs `thread::scope` forever.
                 let _finish = crate::pipeline::governor::WorkerFinished::new(fan_r.finished());
                 let shared_destination = shared_destination;
+                // One state store per worker, held for its lifetime: every claim and
+                // chunk-state write below runs on it, not on a fresh connection each.
+                let st = match StateStore::open_at_ref(&state_ref) {
+                    Ok(st) => st,
+                    Err(e) => {
+                        fan_r.fail("state open", format!("{e:#}"));
+                        return;
+                    }
+                };
                 loop {
                     // One permit per claimed task, taken BEFORE the claim: a shed then
                     // parks this worker without leaving a chunk_task pinned `running`
                     // while it waits. The guard releases at the end of THIS iteration on
                     // every path (`break`, `continue`, panic).
                     let _permit = crate::pipeline::governor::TaskPermit::acquire(semaphore);
-                    let claimed = match StateStore::claim_next_chunk_task_at_ref(
-                        &state_ref,
-                        run_id_arc.as_str(),
-                    ) {
+                    let claimed = match st.claim_next_chunk_task(run_id_arc.as_str()) {
                         Ok(c) => c,
                         Err(e) => {
                             fan_r.fail("claim error", format!("{e:#}"));
@@ -222,28 +228,30 @@ pub(in crate::pipeline) fn run_chunked_parallel_checkpoint(
                     let start: i64 = match sk.parse() {
                         Ok(v) => v,
                         Err(_) => {
-                            let _ = StateStore::open_at_ref(&state_ref).and_then(|st| {
+                            fan_r.fail_on_err(
+                                &format!("chunk {chunk_index} state"),
                                 st.fail_chunk_task(
                                     run_id_arc.as_str(),
                                     chunk_index,
                                     "invalid start_key",
                                     false, // a malformed key parses the same way every time
-                                )
-                            });
+                                ),
+                            );
                             continue;
                         }
                     };
                     let end: i64 = match ek.parse() {
                         Ok(v) => v,
                         Err(_) => {
-                            let _ = StateStore::open_at_ref(&state_ref).and_then(|st| {
+                            fan_r.fail_on_err(
+                                &format!("chunk {chunk_index} state"),
                                 st.fail_chunk_task(
                                     run_id_arc.as_str(),
                                     chunk_index,
                                     "invalid end_key",
                                     false, // a malformed key parses the same way every time
-                                )
-                            });
+                                ),
+                            );
                             continue;
                         }
                     };
@@ -435,21 +443,12 @@ pub(in crate::pipeline) fn run_chunked_parallel_checkpoint(
                             let fname_for_state: Option<String> = if parts.is_empty() {
                                 None
                             } else {
-                                // Reopen from the REF, not from `config_path`.
-                                // `rivet apply` dispatches this runner with an
-                                // empty config_path (job.rs — it is a
-                                // display-only hint there), and
-                                // `StateStore::open("")` resolves to
-                                // `./.rivet_state.db` in the process CWD. Every
-                                // durable-part row and the running aggregate
-                                // landed in a stray database while the real
-                                // state DB got none — invisible on a clean run,
-                                // and on recovery the resume found the chunks
-                                // `completed` with no file_log to rehydrate, so
-                                // it declared a manifest with zero parts over
-                                // parquet that was already on the destination.
+                                // The worker's store was opened from the REF, not
+                                // from `config_path`: `rivet apply` passes an empty
+                                // one, and `StateStore::open("")` would land every
+                                // durable-part row in a stray `./.rivet_state.db`.
                                 record_durable_parts(
-                                    &state_ref,
+                                    &st,
                                     crate::state::DurablePart {
                                         run_id: run_id_arc.as_str(),
                                         export_name: &plan_w.export_name,
@@ -488,14 +487,15 @@ pub(in crate::pipeline) fn run_chunked_parallel_checkpoint(
                             // crashing the process and leaving any in-flight workers'
                             // chunk_task rows as 'running' for the resume path to reset.
                             crate::test_hook::maybe_panic_at_chunk("after_chunk_file", chunk_index);
-                            let _ = StateStore::open_at_ref(&state_ref).and_then(|st| {
+                            fan_r.fail_on_err(
+                                &format!("chunk {chunk_index} state"),
                                 st.complete_chunk_task(
                                     run_id_arc.as_str(),
                                     chunk_index,
                                     rows as i64,
                                     fname_for_state.as_deref(),
-                                )
-                            });
+                                ),
+                            );
                             crate::test_hook::maybe_panic_at_chunk(
                                 "after_chunk_complete",
                                 chunk_index,
@@ -506,7 +506,7 @@ pub(in crate::pipeline) fn run_chunked_parallel_checkpoint(
                             let msg = crate::redact::redact_error(&e);
                             if !debris.is_empty() {
                                 record_durable_parts(
-                                    &state_ref,
+                                    &st,
                                     crate::state::DurablePart {
                                         run_id: run_id_arc.as_str(),
                                         export_name: &plan_w.export_name,
@@ -525,14 +525,15 @@ pub(in crate::pipeline) fn run_chunked_parallel_checkpoint(
                                     fan_r.part(unit, rec);
                                 }
                             }
-                            let _ = StateStore::open_at_ref(&state_ref).and_then(|st| {
+                            fan_r.fail_on_err(
+                                &format!("chunk {chunk_index} state"),
                                 st.fail_chunk_task(
                                     run_id_arc.as_str(),
                                     chunk_index,
                                     &msg,
                                     crate::pipeline::retry::is_transient(&e),
-                                )
-                            });
+                                ),
+                            );
                             fan_r.fail(&format!("chunk {chunk_index}"), msg);
                         }
                     }
@@ -602,27 +603,12 @@ pub(in crate::pipeline) fn run_chunked_parallel_checkpoint(
     Ok(())
 }
 
-/// Write one `file_log` row per durable part from a worker (the drain records with no state).
-///
-/// Reopens from the REF, never from `config_path`: `rivet apply` passes an empty one, and
-/// `StateStore::open("")` would write every row into a stray `./.rivet_state.db`.
+/// Write one `file_log` row per durable part on the worker's store (the drain records with no state).
 fn record_durable_parts(
-    state_ref: &crate::state::StateRef,
+    store: &StateStore,
     template: crate::state::DurablePart<'_>,
     parts: &[super::super::commit::PartRecord],
 ) {
-    let store = match StateStore::open_at_ref(state_ref) {
-        Ok(store) => store,
-        Err(e) => {
-            log::warn!(
-                "export '{}': could not open state DB for the file_log write of {} part(s): {:#}",
-                template.export_name,
-                parts.len(),
-                e
-            );
-            return;
-        }
-    };
     for rec in parts {
         if let Err(e) = store.record_durable_part(crate::state::DurablePart {
             file_name: &rec.file_name,

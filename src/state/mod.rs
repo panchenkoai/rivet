@@ -344,7 +344,7 @@ impl StateStore {
     }
 
     /// Open a SQLite store at an explicit file path (tests that need
-    /// cross-connection access via `claim_next_chunk_task_at_path`).
+    /// a file-backed store another connection can reopen).
     #[allow(dead_code)]
     pub fn open_at_path(db_path: &std::path::Path) -> Result<Self> {
         let conn = open_connection(db_path)?;

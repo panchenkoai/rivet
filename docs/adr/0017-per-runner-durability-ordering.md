@@ -63,7 +63,7 @@ in the worker (so a crash-resume can rehydrate) and drains
 `manifest_parts` + counters + journal post-scope (`record_part(state=None)`).
 It differs on **granularity and atomicity**: the worker-sync write is
 **per-RANGE, not per-chunk** — a range's parts + its `keyset_range.done=1`
-flip go in ONE transaction (`commit_keyset_range_at_ref`), the atomic
+flip go in ONE transaction (`commit_keyset_range`), the atomic
 checkpoint boundary (see `dev/parallel_keyset/design_iter2.md`). Because an
 incomplete range writes NO file_log rows, the resume rehydrate pulls only
 `done` ranges with no filtering. This sidesteps ADR-0017's per-chunk

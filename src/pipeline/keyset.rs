@@ -701,8 +701,9 @@ fn run_keyset_parallel(
                 // transaction (checkpoint runs only). A crash before this leaves the
                 // range `done=0` with no file_log rows — re-read on resume.
                 if let Some(sref) = sref_r {
-                    crate::state::StateStore::commit_keyset_range_at_ref(
-                        sref,
+                    let st = crate::state::StateStore::open_at_ref(sref)
+                        .map_err(|e| anyhow::anyhow!("checkpoint commit: {e:#}"))?;
+                    st.commit_keyset_range(
                         rid_r,
                         &plan_r.export_name,
                         ridx as i64,
@@ -711,24 +712,20 @@ fn run_keyset_parallel(
                         Some(cmp_r),
                     )
                     .map_err(|e| anyhow::anyhow!("checkpoint commit: {e:#}"))?;
-                }
-                // Project the in-flight `running` aggregate from file_log (#173):
-                // best-effort observability, never gates the checkpoint above.
-                if let Some(sref) = sref_r
-                    && let Err(e) = crate::state::StateStore::open_at_ref(sref).and_then(|st| {
-                        st.project_running_aggregate(
-                            rid_r,
-                            &plan_r.export_name,
-                            plan_r.strategy.mode_label(),
-                            plan_r.format.label(),
-                        )
-                    })
-                {
-                    log::warn!(
-                        "export '{}': running-aggregate projection failed for range {ridx} \
-                         (checkpoint is durable; metrics row will catch up at finalize): {e:#}",
-                        plan_r.export_name
-                    );
+                    // Project the in-flight `running` aggregate from file_log (#173):
+                    // best-effort observability, never gates the checkpoint above.
+                    if let Err(e) = st.project_running_aggregate(
+                        rid_r,
+                        &plan_r.export_name,
+                        plan_r.strategy.mode_label(),
+                        plan_r.format.label(),
+                    ) {
+                        log::warn!(
+                            "export '{}': running-aggregate projection failed for range {ridx} \
+                             (checkpoint is durable; metrics row will catch up at finalize): {e:#}",
+                            plan_r.export_name
+                        );
+                    }
                 }
                 // Crash simulation: this range is now durably `done` in the state DB,
                 // but the run has NOT finalized — a resume must skip it (rehydrate its

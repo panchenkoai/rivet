@@ -13,7 +13,7 @@
 //! right backend so a caller writes its SQL + params + ONE extraction closure.
 //!
 //! Methods whose two arms have genuinely DIVERGENT SQL (not just placeholder
-//! style) — e.g. `claim_next_chunk_task_at_ref`'s `FOR UPDATE SKIP LOCKED`, the
+//! style) — e.g. `claim_next_chunk_task`'s `FOR UPDATE SKIP LOCKED`, the
 //! batch-vs-loop inserts — keep their explicit two-arm match; this seam is for the
 //! ~40-50 sites that differ only in dialect ceremony.
 
