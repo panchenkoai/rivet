@@ -547,9 +547,6 @@ pub(in crate::pipeline) fn run_chunked_parallel_checkpoint(
     summary.reconnects = summary
         .reconnects
         .saturating_add(agg_reconnects.load(Ordering::Relaxed));
-    if plan.validate {
-        summary.validated = Some(true);
-    }
     if let Some(fp) = shared_fingerprint.into_inner() {
         summary.schema_fingerprint = Some(fp);
     }

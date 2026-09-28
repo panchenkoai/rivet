@@ -398,9 +398,6 @@ pub(in crate::pipeline) fn run_chunked_parallel(
         }
     });
 
-    if plan.validate {
-        summary.validated = Some(true);
-    }
     // Drain the worker-shared fingerprint into summary.  Stays None for
     // empty runs (no worker saw a schema) — finalize_manifest then falls
     // through to the state lookup / placeholder path for those.

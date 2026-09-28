@@ -778,9 +778,6 @@ fn run_keyset_parallel(
 
     // Merge into the summary through the shared seams (identical to the sequential
     // runner's per-page path, folded run-wide).
-    if plan.validate {
-        summary.validated = Some(true);
-    }
     // cursor_high = the highest populated range's max (forensics v18); see range_max.
     summary.cursor_high =
         highest_range_max(range_max.into_inner().unwrap_or_else(|e| e.into_inner()));

@@ -111,9 +111,6 @@ pub(crate) fn run_mongo_parallel(
             )
         },
     );
-    if plan.validate {
-        summary.validated = Some(true);
-    }
     drained?;
 
     log::info!(
