@@ -501,6 +501,16 @@ const MIGRATIONS: &[(i64, &str)] = &[
             SELECT export_name, '', last_cursor_value, last_run_at, resume_run_id, cursor_column FROM export_state_v29;
         DROP TABLE export_state_v29;",
     ),
+    // v31: a lease held by a row (Postgres state). A session advisory lock does not hold
+    // behind a transaction-mode pooler; SQLite keeps its flock and never writes here.
+    (
+        31,
+        "CREATE TABLE IF NOT EXISTS state_lease (
+            lease_key TEXT PRIMARY KEY,
+            holder TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+        );",
+    ),
 ];
 
 /// PostgreSQL-compatible DDL.  Column types differ from SQLite (BIGSERIAL,
@@ -926,6 +936,15 @@ const PG_MIGRATIONS: &[(i64, &str)] = &[
         "ALTER TABLE export_state ADD COLUMN IF NOT EXISTS prefix TEXT NOT NULL DEFAULT '';
          ALTER TABLE export_state DROP CONSTRAINT IF EXISTS export_state_pkey;
          ALTER TABLE export_state ADD PRIMARY KEY (export_name, prefix);",
+    ),
+    // v31: see the SQLite ladder.
+    (
+        31,
+        "CREATE TABLE IF NOT EXISTS state_lease (
+            lease_key TEXT PRIMARY KEY,
+            holder TEXT NOT NULL,
+            expires_at TIMESTAMPTZ NOT NULL
+        );",
     ),
 ];
 
