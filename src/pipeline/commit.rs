@@ -930,7 +930,7 @@ pub(crate) mod tests {
             key: &str,
         ) -> Result<crate::destination::WriteOutcome> {
             if self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= self.ok {
-                anyhow::bail!("injected: write of '{key}' refused");
+                return Err(anyhow::anyhow!("injected: write of '{key}' refused"));
             }
             Ok(crate::destination::WriteOutcome { content_md5: None })
         }

@@ -3282,7 +3282,7 @@ mod tests {
             if key.ends_with(".parquet")
                 && self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= self.ok
             {
-                anyhow::bail!("injected: part upload of '{key}' refused");
+                return Err(anyhow::anyhow!("injected: part upload of '{key}' refused"));
             }
             self.inner.write(local, key)
         }
