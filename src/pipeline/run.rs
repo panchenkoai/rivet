@@ -1113,9 +1113,8 @@ fn fold_failures(mut failures: Vec<anyhow::Error>, context: &str) -> crate::erro
     // Carry a representative typed failure as the returned error so
     // `error::classify_exit` downcasts the marker (DataIntegrityError=3,
     // SchemaDriftError=4, transient=2) through anyhow's context chain. Pick
-    // the most "stop-worthy" class — data-integrity (possibly-wrong data)
-    // outranks schema-drift, which outranks retryable, which outranks
-    // generic — so a mixed batch exits on the scariest reason.
+    // the most "stop-worthy" class (`ExitClass::stop_rank`) so a mixed batch
+    // exits on the scariest reason.
     let primary_idx = representative_failure_idx(&failures).unwrap();
     let primary = failures.remove(primary_idx);
     if failures.is_empty() {
@@ -4454,19 +4453,15 @@ mod wave_grouping_tests {
     }
 }
 
-/// Index of the most "stop-worthy" failure in a batch: data-integrity (exit 3)
-/// outranks schema-drift (4), which outranks retryable (2), which outranks
-/// generic (1). The chosen error's typed marker then rides up so `classify_exit`
+/// Index of the most "stop-worthy" failure in a batch, ranked by
+/// [`crate::error::ExitClass::stop_rank`]. The chosen error's typed marker then rides up so `classify_exit`
 /// exits the process on the scariest reason rather than whichever export happened
 /// to fail first. Returns `None` for an empty slice.
 pub(crate) fn representative_failure_idx(failures: &[anyhow::Error]) -> Option<usize> {
-    let rank = |e: &anyhow::Error| match crate::error::classify_exit(e) {
-        c if c == crate::error::ExitClass::DataIntegrity.code() => 3,
-        c if c == crate::error::ExitClass::SchemaDrift.code() => 2,
-        c if c == crate::error::ExitClass::Retryable.code() => 1,
-        _ => 0,
-    };
-    (0..failures.len()).max_by_key(|&i| rank(&failures[i]))
+    (0..failures.len()).max_by_key(|&i| {
+        crate::error::ExitClass::from_code(crate::error::classify_exit(&failures[i]))
+            .map_or(0, crate::error::ExitClass::stop_rank)
+    })
 }
 
 #[cfg(test)]
@@ -4506,5 +4501,23 @@ mod representative_failure_tests {
         ];
         let idx = representative_failure_idx(&failures).unwrap();
         assert_eq!(classify_exit(&failures[idx]), ExitClass::SchemaDrift.code());
+    }
+
+    #[test]
+    fn a_refusal_outranks_a_retryable_and_a_generic_failure() {
+        let refused = || -> anyhow::Error {
+            crate::error::CodedError::new(
+                crate::error::codes::STATE_CURSOR_OWNER_MISMATCH,
+                "cursor owned elsewhere",
+            )
+            .into()
+        };
+        let failures = vec![refused(), anyhow::anyhow!("connection reset by peer")];
+        assert_eq!(classify_exit(&failures[1]), ExitClass::Retryable.code());
+        let idx = representative_failure_idx(&failures).unwrap();
+        assert_eq!(classify_exit(&failures[idx]), ExitClass::Refusal.code());
+        let failures = vec![refused(), anyhow::anyhow!("generic")];
+        let idx = representative_failure_idx(&failures).unwrap();
+        assert_eq!(classify_exit(&failures[idx]), ExitClass::Refusal.code());
     }
 }

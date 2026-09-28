@@ -57,6 +57,32 @@ impl ExitClass {
     pub fn code(self) -> i32 {
         self as i32
     }
+
+    /// How stop-worthy this class is when choosing one exit among many failures: integrity > internal > refusal > drift > retryable > generic.
+    pub fn stop_rank(self) -> u8 {
+        match self {
+            ExitClass::Generic => 0,
+            ExitClass::Retryable => 1,
+            ExitClass::SchemaDrift => 2,
+            ExitClass::Refusal => 3,
+            ExitClass::Internal => 4,
+            ExitClass::DataIntegrity => 5,
+        }
+    }
+
+    /// The class a process exit code names, `None` for a signal or unknown code.
+    pub fn from_code(code: i32) -> Option<Self> {
+        [
+            ExitClass::Generic,
+            ExitClass::Retryable,
+            ExitClass::DataIntegrity,
+            ExitClass::SchemaDrift,
+            ExitClass::Refusal,
+            ExitClass::Internal,
+        ]
+        .into_iter()
+        .find(|c| c.code() == code)
+    }
 }
 
 /// Typed marker for a **data-integrity** failure (exit `3`).
@@ -539,6 +565,39 @@ pub type Result<T> = anyhow::Result<T>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_exit_class_round_trips_through_its_code_and_ranks_distinctly() {
+        let all = [
+            ExitClass::Generic,
+            ExitClass::Retryable,
+            ExitClass::DataIntegrity,
+            ExitClass::SchemaDrift,
+            ExitClass::Refusal,
+            ExitClass::Internal,
+        ];
+        for c in all {
+            assert_eq!(ExitClass::from_code(c.code()), Some(c));
+        }
+        assert_eq!(ExitClass::from_code(0), None);
+        assert_eq!(ExitClass::from_code(143), None);
+        let ascending = [
+            ExitClass::Generic,
+            ExitClass::Retryable,
+            ExitClass::SchemaDrift,
+            ExitClass::Refusal,
+            ExitClass::Internal,
+            ExitClass::DataIntegrity,
+        ];
+        for w in ascending.windows(2) {
+            assert!(
+                w[0].stop_rank() < w[1].stop_rank(),
+                "{:?} !< {:?}",
+                w[0],
+                w[1]
+            );
+        }
+    }
 
     #[test]
     fn the_codes_table_renders_one_row_per_kind_with_its_exit() {

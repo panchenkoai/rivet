@@ -506,18 +506,13 @@ fn aggregate_child_result(failures: &[String], child_exit_codes: &[i32]) -> anyh
     }
 }
 
-/// The most "stop-worthy" exit code among failed children: data-integrity (3)
-/// outranks schema-drift (4), which outranks retryable (2), which outranks
-/// generic / anything else (1) — matching the representative-failure ranking the
-/// in-process multi-export path uses. `None` when no child reported a code.
+/// The most "stop-worthy" exit code among failed children, ranked by
+/// [`crate::error::ExitClass::stop_rank`] (signal / unknown codes rank lowest).
+/// `None` when no child reported a code.
 fn worst_exit_code(codes: &[i32]) -> Option<i32> {
-    let rank = |c: i32| match c {
-        3 => 3, // data-integrity — STOP, possibly-wrong data
-        4 => 2, // schema-drift — needs human review
-        2 => 1, // retryable — safe to retry
-        _ => 0, // generic / signal
-    };
-    codes.iter().copied().max_by_key(|&c| rank(c))
+    codes.iter().copied().max_by_key(|&c| {
+        crate::error::ExitClass::from_code(c).map_or(0, crate::error::ExitClass::stop_rank)
+    })
 }
 
 /// Best-effort reaping of subprocess-export children when the parent receives a
@@ -692,6 +687,14 @@ mod exit_propagation_tests {
         assert_eq!(worst_exit_code(&[1, 2]), Some(2));
         assert_eq!(worst_exit_code(&[1, 1]), Some(1));
         assert_eq!(worst_exit_code(&[]), None);
+    }
+
+    #[test]
+    fn a_refused_or_internal_child_outranks_a_retryable_one() {
+        assert_eq!(worst_exit_code(&[5, 2]), Some(5));
+        assert_eq!(worst_exit_code(&[1, 5]), Some(5));
+        assert_eq!(worst_exit_code(&[6, 2]), Some(6));
+        assert_eq!(worst_exit_code(&[3, 6, 5]), Some(3));
     }
 
     #[test]
