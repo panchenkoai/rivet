@@ -339,43 +339,6 @@ impl PgChangeStream {
     ///
     /// Best-effort: a catalog permission error must not fail a capture that is
     /// otherwise fine.
-    pub(crate) fn row_image(
-        conn_str: &str,
-        tls: Option<&TlsConfig>,
-        tables: &[String],
-    ) -> crate::source::cdc::RowImage {
-        use crate::source::cdc::RowImage;
-
-        if tables.is_empty() {
-            return RowImage::Whole;
-        }
-        // Same CWE-319 gate open() applies (:188): refuse a REMOTE plaintext
-        // probe. This best-effort catalog read carries the same credentials, so
-        // an ungated remote-plaintext connection here would leak them exactly
-        // where open() forbids it (#161). On refusal, fall back to Whole rather
-        // than dialing plaintext — open() will bail the run on the same config.
-        if require_tls_or_loopback(conn_str, tls).is_err() {
-            return RowImage::Whole;
-        }
-        let Ok(mut client) = (match tls {
-            Some(cfg) if cfg.mode.is_enforced() => crate::source::tls::build_native_tls(cfg)
-                .and_then(|c| {
-                    // Force ssl_mode(Require) so the connector is honored — the
-                    // same enforcement the batch path and open() use; without it
-                    // this catalog probe carries credentials in cleartext under
-                    // an enforced verify-full posture (roast 2026-08-09).
-                    super::pg_config_ssl_forced(conn_str)?
-                        .connect(postgres_native_tls::MakeTlsConnector::new(c))
-                        .map_err(Into::into)
-                }),
-            _ => Client::connect(conn_str, NoTls).map_err(Into::into),
-        }) else {
-            return RowImage::Whole;
-        };
-        Self::row_image_on(&mut client, tables)
-    }
-
-    /// The row-image verdict for `tables`, asked on `client`; best-effort (`Whole` when unreadable).
     pub(crate) fn row_image_on(
         client: &mut Client,
         tables: &[String],
@@ -1261,15 +1224,12 @@ fn decode_wire_row(rec: &[u8]) -> Result<(String, String)> {
 }
 
 impl ChangeStream for PgChangeStream {
-    fn row_image_here(&mut self, tables: &[String]) -> Option<crate::source::cdc::RowImage> {
-        Some(Self::row_image_on(&mut self.client, tables))
+    fn row_image(&mut self, tables: &[String]) -> crate::source::cdc::RowImage {
+        Self::row_image_on(&mut self.client, tables)
     }
 
-    fn retention_warnings_here(&mut self) -> Option<Vec<String>> {
-        Some(crate::source::cdc::pg_retention_warnings_on(
-            &mut self.client,
-            &self.slot,
-        ))
+    fn retention_warnings(&mut self) -> Vec<String> {
+        crate::source::cdc::pg_retention_warnings_on(&mut self.client, &self.slot)
     }
 
     fn engine(&self) -> crate::source::cdc::CdcEngine {

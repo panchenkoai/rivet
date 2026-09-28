@@ -360,12 +360,6 @@ impl MysqlChangeStream {
     /// connection that is about to dump. A connect/permission failure answers
     /// "nothing to say" — this exists to catch a CONFIGURATION, not to police
     /// access, the same contract as [`Self::row_image`].
-    pub(crate) fn row_metadata(url: &str, tls: Option<&TlsConfig>) -> Option<String> {
-        let mut conn = connect_conn(url, tls).ok()?;
-        Self::row_metadata_on(&mut conn)
-    }
-
-    /// [`Self::row_metadata`] asked on a connection the caller holds.
     fn row_metadata_on(conn: &mut mysql::Conn) -> Option<String> {
         use mysql::prelude::Queryable;
         let m: Option<String> = conn
@@ -374,14 +368,7 @@ impl MysqlChangeStream {
         Self::row_metadata_warning(m.as_deref())
     }
 
-    pub(crate) fn row_image(url: &str, tls: Option<&TlsConfig>) -> super::super::cdc::RowImage {
-        match connect_conn(url, tls) {
-            Ok(mut conn) => Self::row_image_on(&mut conn),
-            Err(_) => super::super::cdc::RowImage::Whole,
-        }
-    }
-
-    /// [`Self::row_image`] asked on a connection the caller holds.
+    /// The binlog row-image verdict, asked on a connection the caller holds.
     fn row_image_on(conn: &mut mysql::Conn) -> super::super::cdc::RowImage {
         use mysql::prelude::Queryable;
         let image: Option<String> = conn
@@ -2130,12 +2117,12 @@ impl Iterator for MysqlChangeStream {
 }
 
 impl ChangeStream for MysqlChangeStream {
-    fn row_image_here(&mut self, _tables: &[String]) -> Option<crate::source::cdc::RowImage> {
-        Some(self.row_image.clone())
+    fn row_image(&mut self, _tables: &[String]) -> crate::source::cdc::RowImage {
+        self.row_image.clone()
     }
 
-    fn positional_mapping_here(&mut self) -> Option<Option<String>> {
-        Some(self.positional.clone())
+    fn positional_mapping_warning(&mut self) -> Option<String> {
+        self.positional.clone()
     }
 
     fn engine(&self) -> crate::source::cdc::CdcEngine {
