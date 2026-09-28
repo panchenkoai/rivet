@@ -573,7 +573,7 @@ exclude_re = [
     # all it claims; `live_only_purity_gate` holds each body at a shrink-only
     # ceiling so a decision cannot quietly move back in.
     "replace run_capture -> \\(Vec<crate::manifest::RunManifest>, Result<\\(\\)>\\)",
-    "replace CdcSchemaResolver::resolve -> Result<Vec<crate::types::TypeMapping>>",
+    "replace CdcSchemaResolver<'s>::resolve -> Result<Vec<crate::types::TypeMapping>>",
     "replace CdcEngine::ensure_anchor -> Result<\\(\\)>",
     "delete match arm .* in CdcEngine::ensure_anchor",
     "replace PgChangeStream::fill -> Result",
