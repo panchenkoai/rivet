@@ -169,7 +169,7 @@ mod run_summary_redaction {
         let leaky =
             format!("connection refused at postgresql://rivet:{SECRET_MARKER}@db.prod:5432/orders");
         let s = make_summary_with_error(leaky);
-        let out = write_run_report(cfg.to_str().unwrap(), &s).unwrap();
+        let out = write_run_report(cfg.to_str().unwrap(), &s, "export").unwrap();
 
         let json = std::fs::read_to_string(out.join("summary.json")).unwrap();
         let md = std::fs::read_to_string(out.join("summary.md")).unwrap();

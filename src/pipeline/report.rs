@@ -123,21 +123,14 @@ pub struct PlanWarningEntry {
 
 impl RunReport {
     /// Project a [`RunSummary`] into the public report schema.
-    pub fn from_summary(summary: &RunSummary, config_path: &str) -> Self {
+    pub fn from_summary(summary: &RunSummary, config_path: &str, kind: &str) -> Self {
         let (started_at, finished_at) = journal_time_bounds(summary);
         let (source_engine, destination_kind) = plan_origin(summary);
         let schema_changes = collect_schema_changes(summary);
         let plan_warnings = collect_plan_warnings(summary);
 
-        let resumable = summary.status == "failed" && summary.files_committed > 0;
-        let resume_command = if resumable {
-            Some(format!(
-                "rivet run --config {} --resume",
-                shell_quote(config_path)
-            ))
-        } else {
-            None
-        };
+        let resume_command = resume_command(summary, config_path, kind);
+        let resumable = failed_with_durable_parts(summary);
 
         Self {
             run_id: summary.run_id.clone(),
@@ -189,17 +182,39 @@ impl RunReport {
 /// Returns the directory path on success.  Failures (permission denied, disk
 /// full, etc.) are returned as `Err` — callers should log-and-continue rather
 /// than propagate (see invariant I7).
-pub fn write_run_report(config_path: &str, summary: &RunSummary) -> Result<PathBuf> {
+pub fn write_run_report(config_path: &str, summary: &RunSummary, kind: &str) -> Result<PathBuf> {
     let dir = report_dir(config_path, &summary.run_id);
     std::fs::create_dir_all(&dir)?;
 
-    let report = RunReport::from_summary(summary, config_path);
+    let report = RunReport::from_summary(summary, config_path, kind);
 
     let json = serde_json::to_string_pretty(&report)?;
     std::fs::write(dir.join("summary.json"), json)?;
     std::fs::write(dir.join("summary.md"), render_markdown(&report))?;
 
     Ok(dir)
+}
+
+/// A failed run that already committed parts: its data is on the prefix, so there is something to resume.
+fn failed_with_durable_parts(summary: &RunSummary) -> bool {
+    summary.status == "failed" && summary.files_committed > 0
+}
+
+/// The command that resumes a failed run with durable parts from this entry point (`export`/`apply`/`cdc`), if any.
+pub(crate) fn resume_command(
+    summary: &RunSummary,
+    config_path: &str,
+    kind: &str,
+) -> Option<String> {
+    if !failed_with_durable_parts(summary) {
+        return None;
+    }
+    let cfg = shell_quote(config_path);
+    match kind {
+        "export" => Some(format!("rivet run --config {cfg} --resume")),
+        "cdc" => Some(format!("rivet run --config {cfg}")),
+        _ => None,
+    }
 }
 
 fn journal_time_bounds(summary: &RunSummary) -> (Option<String>, Option<String>) {
@@ -433,17 +448,15 @@ pub fn render_markdown(r: &RunReport) -> String {
 
     if r.resumable {
         out.push_str("## Resume\n\n");
-        out.push_str(
-            "The run failed after committing one or more files. \
-             Resume picks up from the last committed checkpoint:\n\n",
-        );
-        out.push_str("```sh\n");
-        if let Some(cmd) = &r.resume_command {
-            out.push_str(cmd);
-        } else {
-            out.push_str("rivet run --resume");
+        out.push_str("The run failed after committing one or more files. ");
+        match &r.resume_command {
+            Some(cmd) => out.push_str(&format!(
+                "Resume picks up from the last committed checkpoint:\n\n```sh\n{cmd}\n```\n"
+            )),
+            None => out.push_str(
+                "This entry point has no resume command: re-run it once the error is fixed.\n",
+            ),
         }
-        out.push_str("\n```\n");
     } else if r.status == "failed" {
         out.push_str("## Resume\n\n");
         out.push_str(
@@ -559,7 +572,7 @@ mod tests {
     #[test]
     fn from_summary_success_path_has_no_resume_hint() {
         let s = fresh_summary("success", 0);
-        let r = RunReport::from_summary(&s, "rivet.yaml");
+        let r = RunReport::from_summary(&s, "rivet.yaml", "export");
         assert_eq!(r.status, "success");
         assert!(!r.resumable);
         assert!(r.resume_command.is_none());
@@ -569,7 +582,7 @@ mod tests {
     #[test]
     fn from_summary_failed_with_commits_is_resumable() {
         let s = fresh_summary("failed", 2);
-        let r = RunReport::from_summary(&s, "rivet.yaml");
+        let r = RunReport::from_summary(&s, "rivet.yaml", "export");
         assert_eq!(r.status, "failed");
         assert!(r.resumable);
         let cmd = r.resume_command.as_deref().unwrap();
@@ -580,9 +593,60 @@ mod tests {
     #[test]
     fn from_summary_failed_without_commits_is_not_resumable() {
         let s = fresh_summary("failed", 0);
-        let r = RunReport::from_summary(&s, "rivet.yaml");
+        let r = RunReport::from_summary(&s, "rivet.yaml", "export");
         assert!(!r.resumable);
         assert!(r.resume_command.is_none());
+    }
+
+    /// Resume advice per entry point, at all four status/parts corners.
+    #[test]
+    fn the_resume_command_depends_on_the_entry_point_and_durable_parts() {
+        let case = |status: &str, files: usize, kind: &str| {
+            let s = RunSummary {
+                status: status.into(),
+                files_committed: files,
+                ..Default::default()
+            };
+            resume_command(&s, "x.yaml", kind)
+        };
+        for kind in ["export", "apply", "cdc"] {
+            assert_eq!(case("failed", 0, kind), None, "{kind}: nothing durable");
+            assert_eq!(
+                case("success", 2, kind),
+                None,
+                "{kind}: a success is not resumed"
+            );
+            assert_eq!(case("success", 0, kind), None, "{kind}");
+        }
+        assert_eq!(
+            case("failed", 2, "export").as_deref(),
+            Some("rivet run --config x.yaml --resume")
+        );
+        assert_eq!(
+            case("failed", 2, "apply"),
+            None,
+            "--resume is ignored for a plan artifact"
+        );
+        assert_eq!(
+            case("failed", 2, "cdc").as_deref(),
+            Some("rivet run --config x.yaml"),
+            "cdc resumes from its checkpoint"
+        );
+        assert_eq!(case("failed", 2, "other"), None, "never the batch default");
+    }
+
+    #[test]
+    fn a_failed_apply_never_advises_running_the_plan_artifact_as_a_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = dir.path().join("plan.json");
+        let s = fresh_summary("failed", 2);
+        let r = RunReport::from_summary(&s, plan.to_str().unwrap(), "apply");
+        assert!(r.resume_command.is_none());
+        assert!(r.resumable, "the parts are still durable");
+        let out = write_run_report(plan.to_str().unwrap(), &s, "apply").unwrap();
+        let md = std::fs::read_to_string(out.join("summary.md")).unwrap();
+        assert!(!md.contains("plan.json --resume"), "{md}");
+        assert!(!md.contains("--config"), "{md}");
     }
 
     #[test]
@@ -592,7 +656,7 @@ mod tests {
         std::fs::write(&cfg, "exports: []").unwrap();
 
         let s = fresh_summary("success", 0);
-        let out = write_run_report(cfg.to_str().unwrap(), &s).unwrap();
+        let out = write_run_report(cfg.to_str().unwrap(), &s, "export").unwrap();
 
         assert!(out.join("summary.json").exists());
         assert!(out.join("summary.md").exists());
@@ -608,7 +672,7 @@ mod tests {
         let cfg = dir.path().join("rivet.yaml");
         std::fs::write(&cfg, "exports: []").unwrap();
         let s = fresh_summary("failed", 1);
-        let out = write_run_report(cfg.to_str().unwrap(), &s).unwrap();
+        let out = write_run_report(cfg.to_str().unwrap(), &s, "export").unwrap();
         let json = std::fs::read_to_string(out.join("summary.json")).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["run_id"], "test_run_001");
@@ -640,7 +704,7 @@ mod tests {
     #[test]
     fn markdown_marks_running_status_as_interrupted() {
         let s = fresh_summary("running", 0);
-        let r = RunReport::from_summary(&s, "rivet.yaml");
+        let r = RunReport::from_summary(&s, "rivet.yaml", "export");
         let md = render_markdown(&r);
         assert!(md.contains("INTERRUPTED"));
     }
