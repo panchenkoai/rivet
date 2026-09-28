@@ -311,11 +311,12 @@ def _load_side(binary: Path, prev: Path, root: Path, url: str, tag: str) -> dict
     from . import gcp
     from .bigquery import _bq_json
     from .upgrade import ROWS as LOAD_ROWS, _mutate
+    from ..pytools.registry import bq_tmp
 
     proj, bucket = os.environ.get("BQ_ORACLE_PROJECT", ""), os.environ.get("BQ_ORACLE_BUCKET", "")
     got: dict[str, list[Sample]] = {"load": [], "load-delta": [], "compact": []}
     for i in range(REPS):
-        table, dset = f"perf_ld_{os.getpid()}_{tag}_{i}", f"rivet_tmp_perf_{os.getpid()}_{tag}_{i}"
+        table, dset = f"perf_ld_{os.getpid()}_{tag}_{i}", bq_tmp(f"perf_{os.getpid()}_{tag}_{i}")
         d = root / f"load_{tag}_{i}"
         d.mkdir()
         env = {"RIVET_PERF_URL": url, "RIVET_STATE_URL": ""}

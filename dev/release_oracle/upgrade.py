@@ -313,6 +313,7 @@ def _load_leg(led: Ledger, prev: Path, root: Path, url: str) -> None:
     """The previous release's BigQuery base+buffer and state, continued by this binary's run and load."""
     from . import gcp
     from .bigquery import _bq_json
+    from ..pytools.registry import bq_tmp
 
     proj, bucket = os.environ.get("BQ_ORACLE_PROJECT", ""), os.environ.get("BQ_ORACLE_BUCKET", "")
     if not proj or not bucket:
@@ -320,7 +321,7 @@ def _load_leg(led: Ledger, prev: Path, root: Path, url: str) -> None:
                     "BQ_ORACLE_BUCKET", "no bigquery")
         return
     table = f"upg_load_{os.getpid()}"
-    dset = f"rivet_tmp_upg_{os.getpid()}"
+    dset = bq_tmp(f"upg_{os.getpid()}")
     if not _seed("postgres", url, table, ROWS, with_cursor=True):
         led.failed("postgres", "-", SCEN, "load", "upgrade[postgres/load]: seed failed", "seed")
         return
