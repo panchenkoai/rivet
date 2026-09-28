@@ -1318,21 +1318,30 @@ jobs:
       # The semantic gates below were five jobs that each recompiled the crate to
       # re-run tests `--all-targets` had just run. They are steps now: the binaries
       # are built, so each is seconds, and each still fails under its own name.
+      # `!cancelled()` runs every one of them even after an earlier one fails, so a
+      # red run names every broken gate, not just the first.
       - name: Invariant tests (semantic gate)
+        if: ${{ !cancelled() }}
         run: cargo test --test invariants --test journal_invariants
       - name: Recovery tests (semantic gate)
+        if: ${{ !cancelled() }}
         run: cargo test --test recovery
       - name: Compatibility matrix tests (semantic gate)
+        if: ${{ !cancelled() }}
         run: cargo test --lib -- plan::validate::tests
       - name: Type mapping contracts (semantic gate)
+        if: ${{ !cancelled() }}
         run: cargo test --test type_roundtrip contract_
       - name: Stability tests — format & row-group goldens (semantic gate)
+        if: ${{ !cancelled() }}
         run: cargo test --test format_golden
       - name: Stability tests — sink unit tests (semantic gate)
+        if: ${{ !cancelled() }}
         run: cargo test --lib -- pipeline::sink::tests
       # docs-as-code: docs/reference/{config,cli}-reference.md are GENERATED from the
       # binary (schemars Config + clap Cli); the committed reference must be current.
       - name: Generated docs are in sync (docs-as-code)
+        if: ${{ !cancelled() }}
         run: |
           cargo build --bin rivet
           python3 -m dev.pytools.docgen --check

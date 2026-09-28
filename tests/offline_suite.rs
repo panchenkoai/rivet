@@ -24,6 +24,8 @@ mod audit_validate_warning_label;
 mod cargo_manifest_chef;
 #[path = "offline/cdc_axis_matrix_guard.rs"]
 mod cdc_axis_matrix_guard;
+#[path = "offline/ci_gate_steps_guard.rs"]
+mod ci_gate_steps_guard;
 #[path = "offline/connect_error_hints.rs"]
 mod connect_error_hints;
 #[path = "offline/memory_throttle_wiring.rs"]
