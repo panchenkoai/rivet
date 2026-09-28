@@ -66,11 +66,6 @@ ADJUDICATED: dict[str, tuple[str, int]] = {
     # The binary's entry (`main` → `cli::run_binary`): the same measurement, 26 tests.
     "main": ("cli tests spawn the binary; stub fails 26 offline_suite tests", 100),
     "run_binary": ("cli tests spawn the binary; stub fails 26 offline_suite tests", 100),
-    # `pg_temp_bytes_snapshot` (pipeline/job.rs) — every offline run passes through it,
-    # but on a non-Postgres source, where it returns None without a probe; the value it
-    # exists for is a live Postgres counter, graded by live_metrics_persist.rs
-    # (`pg_temp_bytes_delta.is_some()` for a Postgres source).
-    "pg_temp_bytes_snapshot": ("offline runs take only the non-Postgres None arm; live-oracled", 100),
 }
 
 
