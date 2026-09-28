@@ -424,6 +424,27 @@ impl Config {
         self.validate_csv_exports_are_not_loaded()?;
         self.validate_load_overrides()?;
         self.validate_layout_has_a_compacting_warehouse()?;
+        self.validate_mongo_cdc_has_a_loadable_target()?;
+        Ok(())
+    }
+
+    /// A MongoDB CDC export under a ClickHouse `load:` is refused when the config is read,
+    /// before a run extracts a stream the load would then refuse.
+    fn validate_mongo_cdc_has_a_loadable_target(&self) -> crate::error::Result<()> {
+        let into_clickhouse = matches!(
+            self.load.as_ref().map(|l| &l.target),
+            Some(crate::config::load::LoadTarget::Clickhouse { .. })
+        );
+        let cdc = self.exports.iter().find(|e| e.mode == ExportMode::Cdc);
+        if let (true, SourceType::Mongo, Some(e)) = (into_clickhouse, self.source.source_type, cdc)
+        {
+            crate::config_bail!(
+                crate::error::codes::CONFIG_SOURCE_MODE_UNSUPPORTED,
+                "export '{}': {}",
+                e.name,
+                crate::load::orchestrate::MONGO_CDC_INTO_CLICKHOUSE
+            );
+        }
         Ok(())
     }
 

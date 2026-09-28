@@ -469,3 +469,37 @@ exports:
         "two bare names of different tables are not a collision either"
     );
 }
+
+/// A MongoDB CDC export under a ClickHouse `load:` is refused when the config is read, not after
+/// a run has extracted a stream the load then refuses (ADR-0035 CH7); BigQuery still takes it.
+#[test]
+fn mongo_cdc_under_a_clickhouse_load_is_refused_at_config_load() {
+    let yaml = |target: &str| {
+        format!(
+            r#"
+source:
+  type: mongo
+  url: "mongodb://localhost:27018/db"
+load: {target}
+exports:
+  - name: orders
+    table: orders
+    mode: cdc
+    cdc: {{ checkpoint: "./cdc/orders.ckpt" }}
+    format: parquet
+    destination: {{ type: gcs, bucket: b, prefix: "p/" }}
+"#
+        )
+    };
+    let err = parse_err(&yaml(
+        "{ target: clickhouse, url: \"http://localhost:8123\", database: d, user: u, password_env: CH_PW }",
+    ));
+    assert!(
+        err.contains("export 'orders': a MongoDB CDC stream cannot load into ClickHouse"),
+        "{err}"
+    );
+    assert!(
+        Config::from_yaml(&yaml("{ target: bigquery, project: p, dataset: d }")).is_ok(),
+        "BigQuery takes a MongoDB stream"
+    );
+}

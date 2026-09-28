@@ -796,6 +796,50 @@ fn a_naive_timestamp_reads_back_the_same_wall_clock_in_any_session_zone() {
     }
 }
 
+/// A timestamp past ClickHouse DateTime64's 2299-12-31 is refused before any row is inserted,
+/// never stored as the clamped end of the range (measured on 24.8: 9999-12-31 read back as
+/// 2299-12-31 23:00 with no error, whatever `date_time_overflow_behavior` said).
+#[test]
+#[ignore = "live: requires clickhouse + fake-gcs + postgres"]
+fn a_timestamp_clickhouse_cannot_hold_is_refused_not_clamped() {
+    require_alive(LiveService::ClickHouse);
+    require_alive(LiveService::FakeGcs);
+    ensure_gcs_bucket(BUCKET);
+    let mut c = pg_connect();
+    let tbl = unique_name("rivet_ch_far");
+    c.batch_execute(&format!(
+        "CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, ts TIMESTAMP); \
+         INSERT INTO {tbl} VALUES (1, TIMESTAMP '2024-01-01 00:00:00'), \
+                                  (2, TIMESTAMP '9999-12-31 00:00:00')"
+    ))
+    .expect("seed");
+    let _t = PgTable::adopt(tbl.clone());
+    let db = Db::new("rivet_chtest");
+    let rig = batch_into_clickhouse(Rig::pg_batch(&tbl).mode("full"), &db);
+    rig.run_ok();
+    let out = rig.load_args_env(&[], &[(PASSWORD_ENV, CLICKHOUSE_PASSWORD)]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "the load must refuse:\n{err}");
+    assert!(
+        err.contains("column `ts` holds 9999-12-31 00:00, outside ClickHouse DateTime64's range"),
+        "{err}"
+    );
+    let stored = ch(&format!(
+        "SELECT count() FROM system.tables WHERE database = '{}' AND name = '{tbl}' FORMAT TSV",
+        db.0
+    ));
+    let rows = if stored.trim() == "1" {
+        ch(&format!("SELECT count() FROM {}.{tbl} FORMAT TSV", db.0))
+    } else {
+        "0".to_string()
+    };
+    assert_eq!(
+        rows.trim(),
+        "0",
+        "nothing was inserted, the clamped row least of all"
+    );
+}
+
 /// A column added between the first full pass and the first delta: the adoption refuses,
 /// and the remedy its message names must keep the baseline rows in the view.
 #[test]

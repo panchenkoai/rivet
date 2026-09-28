@@ -26,6 +26,18 @@
   as still being written until that clock caught up (cleanup deferred, nothing lost). The
   start is now `clock_timestamp()` on the state server; a SQLite state keeps the local
   clock, which is the only one it has.
+- **A timestamp ClickHouse cannot hold is refused, not clamped.** ClickHouse `DateTime64` holds
+  1900-01-01 to 2299-12-31, and reading Parquet it clamps anything past that to the nearest end
+  with no error (measured on 24.8: 9999-12-31 stored as 2299-12-31 23:00; the
+  `date_time_overflow_behavior` setting does not reach the Parquet reader). `rivet load` now reads
+  each part's footer statistics and refuses a part holding such a value before inserting anything
+  (`RIVET_LOAD_VALUE_OUT_OF_TARGET_RANGE`). A load pulled through a named collection is not
+  inspected yet; the type report says so.
+- **A MongoDB CDC export under a ClickHouse `load:` is refused when the config is read.** It was
+  refused only by `rivet load`, after `rivet run` had extracted the whole stream.
+- **The type report no longer claims a bare `Decimal` for a negative-scale decimal on ClickHouse**
+  (ClickHouse reads a bare `Decimal` as `Decimal(10, 0)`): it is declared `Decimal(p+|s|, 0)`,
+  which holds the whole numbers exactly, and refused past precision 76.
 - **Two configs sharing a Postgres state DB no longer read each other's incremental cursor
   (state v30).** The cursor and the keyset crash anchor were keyed by the export name alone.
   Two configs with the same export name on one state DB — one template rolled out per

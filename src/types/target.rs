@@ -741,12 +741,23 @@ mod clickhouse {
             RivetType::Float64 => Resolved::ok("Float64"),
             RivetType::Decimal { precision, scale } => {
                 if *scale < 0 {
-                    Resolved::warn(
-                        "Decimal",
-                        format!(
-                            "ClickHouse Decimal has no negative scale; decimal({precision},{scale}) needs a declared schema"
-                        ),
-                    )
+                    // A bare `Decimal` is ClickHouse's Decimal(10, 0) — not this type. The
+                    // values are whole numbers, so widening the precision holds them exactly.
+                    let width = u16::from(*precision) + u16::from(scale.unsigned_abs());
+                    if width > 76 {
+                        Resolved::fail(format!(
+                            "decimal({precision},{scale}) needs Decimal({width}, 0) to hold its \
+                             whole numbers, past ClickHouse's precision 76"
+                        ))
+                    } else {
+                        Resolved::warn(
+                            format!("Decimal({width}, 0)"),
+                            format!(
+                                "ClickHouse Decimal has no negative scale; decimal({precision},{scale}) \
+                                 is declared Decimal({width}, 0), which holds its whole numbers exactly"
+                            ),
+                        )
+                    }
                 } else if *precision > 76 {
                     // ClickHouse Decimal caps at precision 76 (Decimal256) — the same
                     // silent-Ok class as Snowflake past 38: never claim a type the
@@ -793,8 +804,9 @@ mod clickhouse {
                 };
                 Resolved::warn(
                     ty,
-                    "DateTime64 holds 1900-01-01 to 2299-12-31; a value outside loads clamped to \
-                     the nearest end",
+                    "DateTime64 holds 1900-01-01 to 2299-12-31; rivet load refuses a part holding a \
+                     value outside it, but a load pulled through a named collection (or any other \
+                     reader) gets the nearest end, silently",
                 )
             }
             RivetType::String | RivetType::Text | RivetType::Enum => Resolved::ok("String"),
@@ -1483,6 +1495,16 @@ mod tests {
         assert_eq!(duck(&neg).status, TargetStatus::Warn);
         assert_eq!(sf(&neg).status, TargetStatus::Warn);
         assert_eq!(ch(&neg).status, TargetStatus::Warn);
+        assert_eq!(
+            ch(&neg).target_type,
+            "Decimal(12, 0)",
+            "never the bare `Decimal`, which ClickHouse reads as Decimal(10, 0)"
+        );
+        let wide = RivetType::Decimal {
+            precision: 70,
+            scale: -10,
+        };
+        assert_eq!(ch(&wide).status, TargetStatus::Fail);
     }
 
     // ── L5 recovery SQL (the post-load transform for BigQuery autoload) ───────

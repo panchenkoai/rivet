@@ -155,7 +155,9 @@ impl ClickhouseLoader {
                     .store()?
                     .read(key)
                     .with_context(|| format!("reading {uri} for the ClickHouse load"))?;
-                let rows = parquet_rows(&bytes).with_context(|| format!("reading {uri}"))?;
+                let meta = parquet_footer(&bytes).with_context(|| format!("reading {uri}"))?;
+                refuse_unholdable_timestamps(&meta, uri)?;
+                let rows = footer_rows(&meta)?;
                 (format!("INSERT INTO {target} FORMAT Parquet"), bytes, rows)
             }
         };
@@ -619,8 +621,33 @@ fn object_kind_of(engine: &str) -> ObjectKind {
     }
 }
 
-/// The row count a Parquet file's footer declares.
-fn parquet_rows(file: &[u8]) -> Result<u64> {
+/// ClickHouse `DateTime64`'s range in Unix seconds: 1900-01-01 00:00:00 to 2299-12-31 23:59:59.
+const DATETIME64_MIN_SECS: i64 = -2_208_988_800;
+const DATETIME64_MAX_SECS: i64 = 10_413_791_999;
+
+/// Refuse a part holding a timestamp ClickHouse would silently clamp (measured on 24.8:
+/// 9999-12-31 reads back as 2299-12-31 23:00, and `date_time_overflow_behavior` does not
+/// reach the Parquet reader).
+fn refuse_unholdable_timestamps(
+    meta: &parquet::file::metadata::ParquetMetaData,
+    uri: &str,
+) -> Result<()> {
+    if let Some((column, value)) =
+        super::partition_budget::timestamp_outside(meta, DATETIME64_MIN_SECS, DATETIME64_MAX_SECS)
+    {
+        crate::rivet_bail!(
+            crate::error::codes::LOAD_VALUE_OUT_OF_TARGET_RANGE,
+            "{uri}: column `{column}` holds {value}, outside ClickHouse DateTime64's range \
+             (1900-01-01 to 2299-12-31). ClickHouse would store the nearest end instead, \
+             silently; nothing was inserted. Declare the column as String in the export's \
+             `columns:` to keep the value, or correct it at the source."
+        );
+    }
+    Ok(())
+}
+
+/// A Parquet file's footer metadata.
+fn parquet_footer(file: &[u8]) -> Result<parquet::file::metadata::ParquetMetaData> {
     use parquet::file::metadata::{FooterTail, ParquetMetaDataReader};
     const TAIL: usize = 8;
     let tail: [u8; TAIL] = file
@@ -632,7 +659,13 @@ fn parquet_rows(file: &[u8]) -> Result<u64> {
         .len()
         .checked_sub(TAIL + len)
         .context("the Parquet footer is longer than the file")?;
-    let meta = ParquetMetaDataReader::decode_metadata(&file[start..file.len() - TAIL])?;
+    Ok(ParquetMetaDataReader::decode_metadata(
+        &file[start..file.len() - TAIL],
+    )?)
+}
+
+/// The row count a Parquet footer declares.
+fn footer_rows(meta: &parquet::file::metadata::ParquetMetaData) -> Result<u64> {
     u64::try_from(meta.file_metadata().num_rows()).context("a negative Parquet row count")
 }
 
@@ -859,9 +892,9 @@ mod tests {
         w.write(&batch).unwrap();
         w.write(&batch).unwrap();
         w.close().unwrap();
-        assert_eq!(parquet_rows(&buf).unwrap(), 6);
+        assert_eq!(footer_rows(&parquet_footer(&buf).unwrap()).unwrap(), 6);
         assert!(
-            parquet_rows(&buf[..4]).is_err(),
+            parquet_footer(&buf[..4]).is_err(),
             "a truncated file is refused"
         );
     }
