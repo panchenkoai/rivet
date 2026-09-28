@@ -227,29 +227,26 @@ fn sec_mcp_pg_honors_sslmode() {
     );
 }
 
-// SEC-RED V10: a MySQL MCP URL that requests TLS (`ssl-mode=REQUIRED`) must NOT
-// be built without `ssl_opts`. The secure server must configure TLS from the
-// URL rather than always connecting in plaintext.
-//
-// Same gating rationale as V18: docker MySQL is plaintext, so this documents
-// intent. The fix routes mcp through `crate::source::mysql::connect_pool`
-// (already TLS-aware via `build_mysql_ssl_opts`).
+// SEC-RED V10: a MySQL MCP URL that requests TLS (`sslmode=require`) must reach
+// the TLS-aware seam (`crate::source::mysql::connect_pool` with `ssl_opts`), not
+// die in the driver's URL parser — the mysql crate refuses any parameter it does
+// not know, so the MCP must strip `sslmode` after reading it (`source::url_tls`).
+// The oracle is the ABSENCE of the parse error: any other outcome (a TLS
+// handshake failure on a plaintext server, or a TLS connect) is the product.
 #[test]
-#[ignore = "live: mysql with TLS listener — docker mysql is plaintext; fix routes mcp through source::mysql::connect_pool"]
+#[ignore = "live: mysql TLS posture depends on the stand's listener; asserts the URL parses"]
 fn sec_mcp_mysql_pool_sets_ssl_opts() {
     require_alive(LiveService::Mysql);
-    // The mysql driver spells enforced TLS as the `ssl-mode=REQUIRED` URL param.
-    let url = "mysql://rivet:rivet@127.0.0.1:3306/rivet?ssl-mode=REQUIRED";
+    let url = "mysql://rivet:rivet@127.0.0.1:3306/rivet?sslmode=require";
     let mut proc = McpProc::start(&["--mysql-url", url]);
     let resp = call_tool(&mut proc, "mysql_processlist");
     proc.close();
 
     let payload = full_payload(&resp);
-    let is_error =
-        resp["result"]["isError"].as_bool().unwrap_or(false) || payload.contains("error:");
+    assert!(!payload.is_empty(), "the tool must answer; got: {resp}");
     assert!(
-        is_error,
-        "mysql MCP tool with ssl-mode=REQUIRED against a non-TLS server must \
-         refuse, not silently connect without ssl_opts; got: {payload}"
+        !payload.contains("Unknown URL parameter"),
+        "the MCP must strip `sslmode` before the mysql driver parses the URL, or every \
+         TLS spelling fails as a parse error; got: {payload}"
     );
 }

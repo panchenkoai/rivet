@@ -451,33 +451,12 @@ fn pg_config_ssl_forced(url: &str) -> Result<postgres::Config> {
     // error (bug hunt 2026-08-08: init derived verify-full from such a URL and
     // then failed to parse it, erroring every time). Dropping it makes any
     // sslmode the operator wrote parseable; the connector decides verification.
-    let cleaned = strip_url_query_key(url, "sslmode");
+    let cleaned = crate::source::strip_url_query_key(url, "sslmode");
     let mut config = postgres::Config::from_str(&cleaned).map_err(|e| {
         anyhow::anyhow!("postgres: cannot parse source URL for TLS enforcement: {e}")
     })?;
     config.ssl_mode(postgres::config::SslMode::Require);
     Ok(config)
-}
-
-/// Remove a single query parameter (case-insensitive key) from a URL, leaving
-/// the rest of the query intact. Used to drop `sslmode` before handing the URL
-/// to a parser that would reject some of its values.
-fn strip_url_query_key(url: &str, key: &str) -> String {
-    let Some((base, query)) = url.split_once('?') else {
-        return url.to_string();
-    };
-    let kept: Vec<&str> = query
-        .split('&')
-        .filter(|pair| {
-            let k = pair.split('=').next().unwrap_or(pair);
-            !k.eq_ignore_ascii_case(key)
-        })
-        .collect();
-    if kept.is_empty() {
-        base.to_string()
-    } else {
-        format!("{base}?{}", kept.join("&"))
-    }
 }
 
 /// Pin the session's text formats (UTC, ISO dates, postgres intervals, hex bytea) on a fresh

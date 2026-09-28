@@ -10,8 +10,6 @@
 use serde_json::{Value, json};
 use std::io::{BufRead, Write};
 
-use crate::config::{TlsConfig, TlsMode};
-
 // ─── Public entry point ────────────────────────────────────────────────────
 
 /// Run the MCP server loop on stdin/stdout until EOF.
@@ -211,9 +209,7 @@ fn require_pg(url: Option<&str>) -> anyhow::Result<&str> {
 }
 
 fn require_mysql(url: Option<&str>) -> anyhow::Result<&str> {
-    url.ok_or_else(|| {
-        anyhow::anyhow!("no MySQL URL configured — pass --mysql-url or set DATABASE_URL")
-    })
+    url.ok_or_else(|| anyhow::anyhow!("no MySQL URL configured — pass --mysql-url"))
 }
 
 fn text(result: anyhow::Result<String>) -> anyhow::Result<Value> {
@@ -227,43 +223,12 @@ fn text(result: anyhow::Result<String>) -> anyhow::Result<Value> {
 
 // ─── Postgres tools ────────────────────────────────────────────────────────
 
-/// Derive a [`TlsConfig`] from a connection URL's `sslmode` query parameter so
-/// the MCP diagnostics tools honor transport security (CWE-319). The MCP server
-/// runs before/without any YAML `tls:` block (it takes raw URLs on the command
-/// line), so the URL's `sslmode` is the only policy signal — the same source
-/// `rivet init` and the state backend use.
-///
-/// `require` / `verify-ca` / `verify-full` map to the enforced mode; everything
-/// else (missing, `disable`, `prefer`, `allow`, unrecognized) returns `None`
-/// (plaintext), which keeps loopback/local-dev URLs working. Last occurrence
-/// wins, matching libpq. Returning `None` for a remote plaintext URL is what
-/// lets the shared connect seams refuse it via `require_tls_or_loopback`.
-fn tls_config_from_url(url: &str) -> Option<TlsConfig> {
-    let (_, query) = url.split_once('?')?;
-    let mut mode = None;
-    for pair in query.split('&') {
-        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-        if key != "sslmode" {
-            continue;
-        }
-        mode = match value {
-            "require" => Some(TlsMode::Require),
-            "verify-ca" => Some(TlsMode::VerifyCa),
-            "verify-full" => Some(TlsMode::VerifyFull),
-            _ => None,
-        };
-    }
-    mode.map(|mode| TlsConfig {
-        mode,
-        ..TlsConfig::default()
-    })
-}
-
 fn pg_connect(url: &str) -> anyhow::Result<postgres::Client> {
     // Route through the shared TLS-aware seam (same path as doctor/check/init)
     // so `sslmode=require|verify-ca|verify-full` is honored and remote plaintext
     // is refused before any dial.
-    let tls = tls_config_from_url(url);
+    // The MCP takes raw URLs with no `tls:` block, so the URL's `sslmode` is the only policy signal.
+    let tls = crate::source::url_tls(url).1;
     crate::source::postgres::connect_client(url, tls.as_ref())
 }
 
@@ -448,8 +413,9 @@ fn mysql_pool(url: &str) -> anyhow::Result<mysql::Pool> {
     // `ssl_opts` (previously the MCP pool built Opts with no TLS — CWE-319) and
     // remote plaintext is refused before any dial. The seam pins lean pool opts
     // (no eager pre-connection) for these short-lived diagnostics calls.
-    let tls = tls_config_from_url(url);
-    crate::source::mysql::connect_pool(url, tls.as_ref())
+    // The driver refuses unknown URL parameters, so `sslmode` is read here and stripped before it parses.
+    let (url, tls) = crate::source::url_tls(url);
+    crate::source::mysql::connect_pool(&url, tls.as_ref())
 }
 
 fn mysql_rows_to_table(rows: &[Vec<String>], headers: &[String]) -> String {
@@ -729,62 +695,15 @@ mod tests {
         assert!(!sql.contains('?'), "fallback takes no bind params: {sql}");
     }
 
-    // ── V10/V18: sslmode → TlsConfig derivation ──────────────────────────────
-
+    /// The MCP MySQL pool must strip `sslmode` before the driver parses the URL, so the dial is what fails.
     #[test]
-    fn tls_config_from_url_enforces_when_sslmode_requested() {
-        for (url, want) in [
-            (
-                "postgresql://u:p@db.prod:5432/d?sslmode=require",
-                TlsMode::Require,
-            ),
-            (
-                "postgresql://u:p@db.prod/d?sslmode=verify-ca",
-                TlsMode::VerifyCa,
-            ),
-            (
-                "mysql://u:p@db.prod:3306/d?sslmode=verify-full",
-                TlsMode::VerifyFull,
-            ),
-        ] {
-            let cfg = tls_config_from_url(url)
-                .unwrap_or_else(|| panic!("expected enforced TLS for {url}"));
-            assert_eq!(cfg.mode, want, "url {url}");
-            assert!(cfg.mode.is_enforced(), "url {url} must enforce TLS");
-        }
-    }
-
-    #[test]
-    fn tls_config_from_url_none_for_plaintext_or_missing() {
-        // Missing, disable, prefer/allow, unrecognized, or empty → None (plaintext),
-        // which on a remote host is what makes the shared seam refuse the dial.
-        for url in [
-            "postgresql://u:p@localhost/d",
-            "mysql://u:p@127.0.0.1:3306/d",
-            "postgresql://u:p@db/d?sslmode=disable",
-            "postgresql://u:p@db/d?sslmode=prefer",
-            "postgresql://u:p@db/d?sslmode=allow",
-            "postgresql://u:p@db/d?sslmode=REQUIRE",
-            "postgresql://u:p@db/d?sslmode=garbage",
-            "postgresql://u:p@db/d?sslmode",
-            "postgresql://u:p@db/d?sslmode=",
-        ] {
-            assert!(tls_config_from_url(url).is_none(), "url {url} must be None");
-        }
-    }
-
-    #[test]
-    fn tls_config_from_url_exact_key_and_last_occurrence_wins() {
-        // `xsslmode` is a different parameter; the exact `sslmode` key matters.
-        assert!(tls_config_from_url("postgresql://u:p@db/d?xsslmode=require").is_none());
-        // Last occurrence wins (matches libpq), even mid-query.
-        let cfg = tls_config_from_url(
-            "postgresql://u:p@db/d?connect_timeout=10&sslmode=require&application_name=x",
-        )
-        .expect("enforced");
-        assert_eq!(cfg.mode, TlsMode::Require);
+    fn mcp_mysql_url_with_sslmode_reaches_the_dial() {
+        let err = mysql_pool("mysql://u:p@127.0.0.1:1/d?sslmode=require")
+            .expect_err("nothing listens on 127.0.0.1:1");
+        let shown = format!("{err:#}");
         assert!(
-            tls_config_from_url("postgresql://u:p@db/d?sslmode=require&sslmode=disable").is_none()
+            shown.starts_with("nothing is listening on 127.0.0.1:1"),
+            "the URL must parse and the connect must be what fails; got: {shown}"
         );
     }
 

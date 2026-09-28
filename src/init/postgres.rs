@@ -1,6 +1,6 @@
 use postgres::Client;
 
-use crate::config::{TlsConfig, TlsMode};
+use crate::config::TlsConfig;
 use crate::error::Result;
 
 use super::{ColumnInfo, TableInfo};
@@ -19,51 +19,11 @@ pub(super) fn connect(url: &str, tls: Option<&TlsConfig>) -> Result<Client> {
     let tls = match tls {
         Some(t) => Some(t),
         None => {
-            from_url = tls_from_url(url);
+            from_url = crate::source::url_tls(url).1;
             from_url.as_ref()
         }
     };
     crate::source::postgres::connect_client(url, tls)
-}
-
-/// The URL's `sslmode`, as the [`TlsConfig`] the connection actually uses.
-///
-/// Split from `connect` (which needs a live server) so the CONSTRUCTION is
-/// unit-testable: the mutation gate showed `mode` could be dropped from this
-/// struct and nothing offline noticed — the URL's posture would silently fall
-/// back to the default.
-fn tls_from_url(url: &str) -> Option<TlsConfig> {
-    tls_mode_from_url(url).map(|mode| TlsConfig {
-        mode,
-        ..TlsConfig::default()
-    })
-}
-
-/// Map the URL's `sslmode` query parameter to the [`TlsMode`] the shared TLS
-/// connector understands.
-///
-/// `require` / `verify-ca` / `verify-full` map to the corresponding enforced
-/// mode. Everything else — parameter missing, `disable`, `prefer`, `allow`,
-/// or an unrecognized value — returns `None` (plaintext), keeping plain dev
-/// setups working. [`TlsMode`] has no `prefer` variant, so no try-TLS-then-
-/// fallback is attempted; values libpq would reject are left for the driver's
-/// own URL parsing to diagnose. Last occurrence wins, matching libpq.
-fn tls_mode_from_url(url: &str) -> Option<TlsMode> {
-    let (_, query) = url.split_once('?')?;
-    let mut mode = None;
-    for pair in query.split('&') {
-        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-        if key != "sslmode" {
-            continue;
-        }
-        mode = match value {
-            "require" => Some(TlsMode::Require),
-            "verify-ca" => Some(TlsMode::VerifyCa),
-            "verify-full" => Some(TlsMode::VerifyFull),
-            _ => None,
-        };
-    }
-    mode
 }
 
 /// Tables and views in a PostgreSQL schema (`information_schema`).
@@ -291,104 +251,4 @@ pub(super) fn density_probe(client: &mut Client, info: &mut super::TableInfo) {
         k: offsets.len(),
         w: PROBE_W,
     });
-}
-
-#[cfg(test)]
-mod tests {
-    /// The struct the URL's sslmode becomes must CARRY the mode — dropping the
-    /// field compiles (struct-update syntax fills the default) and silently
-    /// downgrades the posture. Named by the mutation gate on #154.
-    #[test]
-    fn url_sslmode_lands_in_the_config_it_builds() {
-        use crate::config::TlsMode;
-        // `require`, deliberately NOT `verify-full`: VerifyFull is TlsMode's
-        // `#[default]`, so a fixture equal to the default cannot see the
-        // delete-field mutant (struct-update fills the default back in) — the
-        // below-activation-threshold fixture lesson, caught on the first try.
-        let t = super::tls_from_url("postgresql://u:p@h/db?sslmode=require").expect("require maps");
-        assert_eq!(t.mode, TlsMode::Require);
-        assert!(!t.accept_invalid_certs && t.ca_file.is_none());
-        assert!(super::tls_from_url("postgresql://u:p@h/db").is_none());
-    }
-
-    use super::tls_mode_from_url;
-    use crate::config::TlsMode;
-
-    #[test]
-    fn sslmode_enforced_values_map_to_tls_modes() {
-        assert_eq!(
-            tls_mode_from_url("postgresql://u:p@host:5432/db?sslmode=require"),
-            Some(TlsMode::Require)
-        );
-        assert_eq!(
-            tls_mode_from_url("postgresql://u:p@host/db?sslmode=verify-ca"),
-            Some(TlsMode::VerifyCa)
-        );
-        assert_eq!(
-            tls_mode_from_url("postgresql://u:p@host/db?sslmode=verify-full"),
-            Some(TlsMode::VerifyFull)
-        );
-    }
-
-    #[test]
-    fn sslmode_plaintext_values_stay_plaintext() {
-        // Missing, disable, and libpq's plaintext-leaning modes (prefer/allow)
-        // all keep the current NoTls behavior — TlsMode has no `prefer`.
-        assert_eq!(tls_mode_from_url("postgresql://u:p@host/db"), None);
-        assert_eq!(
-            tls_mode_from_url("postgresql://u:p@host/db?sslmode=disable"),
-            None
-        );
-        assert_eq!(
-            tls_mode_from_url("postgresql://u:p@host/db?sslmode=prefer"),
-            None
-        );
-        assert_eq!(
-            tls_mode_from_url("postgresql://u:p@host/db?sslmode=allow"),
-            None
-        );
-    }
-
-    #[test]
-    fn sslmode_unrecognized_values_stay_plaintext() {
-        // libpq values are lowercase and exact; the driver rejects anything
-        // else at connect time, so derivation must not guess.
-        assert_eq!(
-            tls_mode_from_url("postgresql://u:p@host/db?sslmode=REQUIRE"),
-            None
-        );
-        assert_eq!(
-            tls_mode_from_url("postgresql://u:p@host/db?sslmode=garbage"),
-            None
-        );
-        assert_eq!(tls_mode_from_url("postgresql://u:p@host/db?sslmode"), None);
-        assert_eq!(tls_mode_from_url("postgresql://u:p@host/db?sslmode="), None);
-    }
-
-    #[test]
-    fn sslmode_found_among_other_params_and_exact_key_only() {
-        assert_eq!(
-            tls_mode_from_url(
-                "postgresql://u:p@host/db?connect_timeout=10&sslmode=require&application_name=x"
-            ),
-            Some(TlsMode::Require)
-        );
-        // Key must match exactly — `xsslmode` is a different parameter.
-        assert_eq!(
-            tls_mode_from_url("postgresql://u:p@host/db?xsslmode=require"),
-            None
-        );
-    }
-
-    #[test]
-    fn sslmode_last_occurrence_wins() {
-        assert_eq!(
-            tls_mode_from_url("postgresql://u:p@host/db?sslmode=disable&sslmode=require"),
-            Some(TlsMode::Require)
-        );
-        assert_eq!(
-            tls_mode_from_url("postgresql://u:p@host/db?sslmode=require&sslmode=disable"),
-            None
-        );
-    }
 }
