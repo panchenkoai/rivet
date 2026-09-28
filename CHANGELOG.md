@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **A count mismatch on an incremental or CDC load exits 3 (integrity), like a full load.** The
+  append and base+buffer gates raised an uncoded error, so the exit class fell to the transient-
+  error text match: exit 1 in general, and exit **2 (retry)** when the table name contained a
+  network word such as `dns` — a scheduler retried a data-integrity failure. Every load-integrity
+  gate now carries `RIVET_LOAD_COUNT_MISMATCH`, and an incremental base+buffer load no longer
+  labels its failure "CDC".
 - **MySQL CDC writes a zero `TIMESTAMP` (`0000-00-00 00:00:00`) as NULL, not `1970-01-01`.** The
   binlog carries a zero TIMESTAMP as epoch 0, and the CDC decoder turned it into the epoch instant,
   while the batch path (and so every snapshot) wrote NULL: the same source value landed two ways in
