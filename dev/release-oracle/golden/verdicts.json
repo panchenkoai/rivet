@@ -211,11 +211,11 @@
       "verdict": "DEGRADED"
     },
     "EXT_ORDER_KEYED": {
-      "strategy": "range",
-      "verdict": "DEGRADED"
+      "strategy": "keyset",
+      "verdict": "ACCEPTABLE"
     },
     "EXT_REF_ID_HISTORY": {
-      "strategy": "range",
+      "strategy": "incremental",
       "verdict": "DEGRADED"
     },
     "EXT_SPARSE_KEY": {

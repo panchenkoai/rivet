@@ -226,12 +226,11 @@ fn a_ledger_cut_mid_load_fails_loudly_and_the_next_run_finishes_the_job() {
     // had finished in gate run 9 and before any statement in others, so it graded the
     // timer, not rivet.
     let watch = format!("%{t}%");
+    // The SAME ledger rivet writes (the gate gives each run its own state DB), past the proxy.
+    let direct = postgres_state_toxi_url().replace(":15433/", ":5433/");
     let killer = std::thread::spawn(move || {
-        let mut c = postgres::Client::connect(
-            "postgresql://rivet:rivet@127.0.0.1:5433/rivet_state",
-            postgres::NoTls,
-        )
-        .expect("the ledger, directly");
+        let mut c =
+            postgres::Client::connect(&direct, postgres::NoTls).expect("the ledger, directly");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
         while std::time::Instant::now() < deadline {
             let n: i64 = c

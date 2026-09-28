@@ -18,11 +18,6 @@ class KnownRed:
 
 
 KNOWN_RED: tuple[KnownRed, ...] = (
-    KnownRed("verdicts DIVERGED: EXT_ORDER_KEYED",
-             "Oracle init no longer picks keyset for EXT_ORDER_KEYED (UNIQUE NOT NULL NUMBER(19); "
-             "MySQL keysets it) and picks incremental for EXT_REF_ID_HISTORY — suspected Oracle init "
-             "defect, under the Oracle preview; the golden is NOT re-blessed for these two",
-             "2026-10-11"),
 )
 
 
