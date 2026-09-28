@@ -386,6 +386,11 @@ pub mod codes {
         "RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED",
         "use a mode this source supports (MongoDB: `full`)",
     );
+    /// A raw `url:` whose scheme names a different engine than `source.type`.
+    pub const CONFIG_SOURCE_URL_SCHEME_MISMATCH: Code = usage(
+        "RIVET_CONFIG_SOURCE_URL_SCHEME_MISMATCH",
+        "make `source.type` and the URL scheme name the same engine",
+    );
     /// A statement that ran past the configured duration cap, carried by the existing
     /// `source::StatementDurationTimeout` marker (recognised in [`super::error_code`]).
     pub const SOURCE_STATEMENT_TIMEOUT: Code = environment(
@@ -488,6 +493,7 @@ pub mod codes {
         CONFIG_CDC_CONTINUOUS_UNSUPPORTED,
         CONFIG_CSV_LOAD_UNSUPPORTED,
         CONFIG_SOURCE_MODE_UNSUPPORTED,
+        CONFIG_SOURCE_URL_SCHEME_MISMATCH,
         SOURCE_STATEMENT_TIMEOUT,
         SOURCE_CURSOR_FINER_THAN_MICROSECOND,
         SOURCE_CDC_FOREIGN_CHECKPOINT,

@@ -373,13 +373,7 @@ pub(super) fn finalize_manifest(
         })
         .unwrap_or_else(|| crate::manifest::SCHEMA_FINGERPRINT_UNAVAILABLE.to_string());
 
-    let source_engine = match plan.source.source_type {
-        crate::config::SourceType::Postgres => "postgres",
-        crate::config::SourceType::Mysql => "mysql",
-        crate::config::SourceType::Mssql => "mssql",
-        crate::config::SourceType::Oracle => "oracle",
-        crate::config::SourceType::Mongo => "mongo",
-    };
+    let source_engine = plan.source.source_type.label();
 
     // The DECLARED table first — a name is a label, the config is the catalog.
     //
@@ -971,7 +965,7 @@ pub(super) fn write_running_manifest(
     run_id: &str,
     started_at: &str,
 ) {
-    use crate::config::{DestinationType, SourceType};
+    use crate::config::DestinationType;
     use crate::manifest::{
         MANIFEST_VERSION, ManifestDestination, ManifestSource, ManifestStatus, RunManifest,
     };
@@ -985,13 +979,7 @@ pub(super) fn write_running_manifest(
         // co-located case, so skip the marker.
         DestinationType::Local | DestinationType::Stdout => return,
     };
-    let engine = match plan.source.source_type {
-        SourceType::Postgres => "postgres",
-        SourceType::Mysql => "mysql",
-        SourceType::Mssql => "mssql",
-        SourceType::Oracle => "oracle",
-        SourceType::Mongo => "mongo",
-    };
+    let engine = plan.source.source_type.label();
     let manifest = RunManifest {
         row_hash: None,
         split_window: None, // the running marker is overwritten by the terminal manifest

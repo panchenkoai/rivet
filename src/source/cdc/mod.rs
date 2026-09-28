@@ -698,6 +698,19 @@ pub(crate) enum CdcEngineOpts {
     },
 }
 
+impl CdcEngineOpts {
+    /// The engine these opts configure — the identity `source.type` chose, never re-read from the URL.
+    pub(crate) fn engine(&self) -> CdcEngine {
+        match self {
+            Self::Mysql { .. } => CdcEngine::Mysql,
+            Self::Postgres { .. } => CdcEngine::Postgres,
+            Self::Mssql { .. } => CdcEngine::Mssql,
+            Self::Oracle { .. } => CdcEngine::Oracle,
+            Self::Mongo { .. } => CdcEngine::Mongo,
+        }
+    }
+}
+
 /// How a capture run ends — ONE name for the concept that used to cross the
 /// adapter seam as three differently-aliased bools (`bound_at_open`,
 /// `non_block`, `until_current`), and the canonical home of the bounded run's
@@ -843,10 +856,10 @@ impl PeekBound {
     }
 }
 
-/// The CDC engine, resolved ONCE from the source URL's scheme. Every
-/// downstream dispatch matches on this enum — never on the URL string — so
-/// adding engine #4 is one variant plus compiler-led match arms, and a
-/// mistyped scheme fails in exactly one place.
+/// The CDC engine, resolved ONCE — from `source.type` on a config run, from the
+/// URL scheme only for `rivet cdc`. Every downstream dispatch matches on this
+/// enum — never on the URL string — so adding an engine is one variant plus
+/// compiler-led match arms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CdcEngine {
     Mysql,
@@ -854,6 +867,19 @@ pub(crate) enum CdcEngine {
     Mssql,
     Mongo,
     Oracle,
+}
+
+impl From<crate::config::SourceType> for CdcEngine {
+    fn from(t: crate::config::SourceType) -> Self {
+        use crate::config::SourceType;
+        match t {
+            SourceType::Mysql => Self::Mysql,
+            SourceType::Postgres => Self::Postgres,
+            SourceType::Mssql => Self::Mssql,
+            SourceType::Mongo => Self::Mongo,
+            SourceType::Oracle => Self::Oracle,
+        }
+    }
 }
 
 /// What image of a row this source can actually supply per change event.
@@ -944,36 +970,31 @@ impl CdcEngine {
 }
 
 impl CdcEngine {
+    /// The engine a URL's scheme names — for `rivet cdc`, which has a URL and no `source.type`.
     pub(crate) fn from_url(url: &str) -> Result<Self> {
-        if url.starts_with("mysql://") {
-            Ok(Self::Mysql)
-        } else if url.starts_with("postgres://") || url.starts_with("postgresql://") {
-            Ok(Self::Postgres)
-        } else if url.starts_with("sqlserver://") || url.starts_with("mssql://") {
-            Ok(Self::Mssql)
-        } else if url.starts_with("mongodb://") || url.starts_with("mongodb+srv://") {
-            Ok(Self::Mongo)
-        } else if url
-            .get(..9)
-            .is_some_and(|s| s.eq_ignore_ascii_case("oracle://"))
-        {
-            Ok(Self::Oracle)
-        } else {
+        let Some(t) = crate::config::SourceType::from_url_scheme(url) else {
             anyhow::bail!(
                 "rivet cdc: unsupported source url — expected mysql:// / postgresql:// / sqlserver:// / mongodb:// / oracle://"
             )
+        };
+        Ok(t.into())
+    }
+
+    /// The `source.type` this engine reads.
+    pub(crate) fn source_type(self) -> crate::config::SourceType {
+        use crate::config::SourceType;
+        match self {
+            Self::Mysql => SourceType::Mysql,
+            Self::Postgres => SourceType::Postgres,
+            Self::Mssql => SourceType::Mssql,
+            Self::Mongo => SourceType::Mongo,
+            Self::Oracle => SourceType::Oracle,
         }
     }
 
     /// Stable lowercase label for metrics / run records / hints.
     pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::Mysql => "mysql",
-            Self::Postgres => "postgres",
-            Self::Mssql => "mssql",
-            Self::Mongo => "mongo",
-            Self::Oracle => "oracle",
-        }
+        self.source_type().label()
     }
 
     /// Ensure the resume anchor EXISTS — `initial: snapshot` step ① and the
@@ -1456,17 +1477,16 @@ enum ResolverSource<'s> {
 
 impl CdcSchemaResolver<'static> {
     pub(crate) fn connect(url: &str, tls: Option<&crate::config::TlsConfig>) -> Result<Self> {
-        use crate::config::SourceType;
-        let source_type = match CdcEngine::from_url(url)? {
-            CdcEngine::Mysql => SourceType::Mysql,
-            CdcEngine::Postgres => SourceType::Postgres,
-            CdcEngine::Mssql => SourceType::Mssql,
-            // The JSON-blob model has a fixed 2-column schema (`_id`, `document`),
-            // resolved by `MongoSource::type_mappings` — same as the batch path.
-            CdcEngine::Mongo => SourceType::Mongo,
-            CdcEngine::Oracle => SourceType::Oracle,
-        };
-        let src = crate::source::connect(source_type, url, tls, None)?;
+        Self::connect_as(CdcEngine::from_url(url)?, url, tls)
+    }
+
+    /// Open the resolver's own connection to `engine` (Mongo resolves its fixed `_id` + `document` schema, like batch).
+    pub(crate) fn connect_as(
+        engine: CdcEngine,
+        url: &str,
+        tls: Option<&crate::config::TlsConfig>,
+    ) -> Result<Self> {
+        let src = crate::source::connect(engine.source_type(), url, tls, None)?;
         Ok(Self {
             src: ResolverSource::Own(src),
         })
@@ -1676,10 +1696,7 @@ pub(crate) fn run_capture(
     };
     // Fault point: stream (and any server-side anchor) opened, nothing read.
     crate::test_hook::maybe_panic_at("cdc_after_open");
-    let engine = match CdcEngine::from_url(&url) {
-        Ok(e) => e,
-        Err(e) => return (Vec::new(), Err(e)),
-    };
+    let engine = cap.cdc_cfg.engine.engine();
     let cap_tables: Vec<String> = cap.outputs.iter().map(|o| o.table.clone()).collect();
     let mut outputs = Vec::with_capacity(cap.outputs.len());
     // ONE resolver session serves every table (was: 2 fresh connections per
@@ -1723,7 +1740,7 @@ pub(crate) fn run_capture(
     }
     let mut resolver = match cap.meta {
         Some(src) => CdcSchemaResolver::lent(src),
-        None => match CdcSchemaResolver::connect(&url, tls.as_ref()) {
+        None => match CdcSchemaResolver::connect_as(engine, &url, tls.as_ref()) {
             Ok(r) => r,
             Err(e) => return (Vec::new(), Err(e)),
         },
@@ -2355,6 +2372,65 @@ mod setup_hint {
     fn tiberius_config_dials_the_host_and_port_it_was_given() {
         let c = crate::source::mssql::tiberius_config("db.example", 14330, "d", "u", "p", None);
         assert_eq!(c.get_addr(), "db.example:14330");
+    }
+}
+
+#[cfg(test)]
+mod engine_identity {
+    use super::{CdcEngine, CdcEngineOpts};
+    use crate::config::SourceType;
+
+    #[test]
+    fn the_opts_variant_source_type_and_url_scheme_name_one_engine() {
+        let t = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for (opts, st, url) in [
+            (
+                CdcEngineOpts::Mysql {
+                    server_id: 1,
+                    configured_tables: t(&["a"]),
+                },
+                SourceType::Mysql,
+                "mysql://h/d",
+            ),
+            (
+                CdcEngineOpts::Postgres {
+                    slot: "s".into(),
+                    configured_tables: t(&["a"]),
+                },
+                SourceType::Postgres,
+                "postgresql://h/d",
+            ),
+            (
+                CdcEngineOpts::Mssql {
+                    capture_instance: None,
+                    configured_tables: t(&["a"]),
+                },
+                SourceType::Mssql,
+                "sqlserver://h/d",
+            ),
+            (
+                CdcEngineOpts::Oracle {
+                    configured_tables: t(&["a"]),
+                },
+                SourceType::Oracle,
+                "ORACLE://h/d",
+            ),
+            (
+                CdcEngineOpts::Mongo {
+                    canonical: false,
+                    configured_tables: t(&["a"]),
+                },
+                SourceType::Mongo,
+                "mongodb+srv://h/d",
+            ),
+        ] {
+            let engine = opts.engine();
+            assert_eq!(engine, CdcEngine::from(st), "{url}");
+            assert_eq!(engine.source_type(), st, "{url}");
+            assert_eq!(CdcEngine::from_url(url).unwrap(), engine, "{url}");
+            assert_eq!(engine.label(), st.label(), "{url}");
+        }
+        assert!(CdcEngine::from_url("redis://h").is_err());
     }
 }
 
