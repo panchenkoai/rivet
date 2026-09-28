@@ -21,6 +21,9 @@ at most CONN_CEILING[engine], and never more than the previous release.
 `cdc-snapshot`: a first CDC run with `initial: snapshot` over a pre-populated table, each
 repetition on a fresh stream; complete when it holds the source's own row count.
 
+`load` / `load-delta` / `compact`: BigQuery, the previous init's incremental config, both
+binaries; the compacted base must hold every source id.
+
 `parallel-exports-8`: the previous release's init over eight tables, run with
 `--parallel-exports` — the concurrency a generated config offers (init never writes
 `parallel:` for a keyset table, so the per-export parallel runners are unreachable from it).
@@ -299,6 +302,77 @@ def _multi_side(binary: Path, prev: Path, root: Path, url: str, tag: str) -> Sam
         return _best(samples)
     finally:
         _sql("postgres", url, "".join(f"DROP TABLE IF EXISTS {t};" for t in tables))
+
+
+def _load_side(binary: Path, prev: Path, root: Path, url: str, tag: str) -> dict[str, Sample] | None:
+    """`rivet load` (first and delta) and `rivet compact` by `binary` on the previous release's
+    init config into BigQuery: per step, the minimum over REPS fresh datasets. None on any
+    failure or when the compacted base does not hold every source id."""
+    from . import gcp
+    from .bigquery import _bq_json
+    from .upgrade import ROWS as LOAD_ROWS, _mutate
+
+    proj, bucket = os.environ.get("BQ_ORACLE_PROJECT", ""), os.environ.get("BQ_ORACLE_BUCKET", "")
+    got: dict[str, list[Sample]] = {"load": [], "load-delta": [], "compact": []}
+    for i in range(REPS):
+        table, dset = f"perf_ld_{os.getpid()}_{tag}_{i}", f"rivet_tmp_perf_{os.getpid()}_{tag}_{i}"
+        d = root / f"load_{tag}_{i}"
+        d.mkdir()
+        env = {"RIVET_PERF_URL": url, "RIVET_STATE_URL": ""}
+        try:
+            if not _seed("postgres", url, table, LOAD_ROWS, with_cursor=True):
+                return None
+            gcp.bq_ensure_dataset(proj, dset)
+            if not run([str(prev), "init", "--source-env", "RIVET_PERF_URL", "--table", table, "--mode",
+                        "incremental", "--gcs-bucket", bucket, "--bigquery-project", proj,
+                        "--bigquery-dataset", dset, "-o", "c.yaml"], env=env, cwd=d).ok:
+                return None
+            for step, cmd in (("run", "run"), ("load", "load"), ("delta", None), ("run", "run"),
+                              ("load-delta", "load"), ("compact", "compact")):
+                if cmd is None:
+                    if not _mutate("postgres", url, table):
+                        return None
+                    continue
+                s = _timed(binary, d, env, cmd, "-c", "c.yaml")
+                if not s.ok:
+                    return None
+                if step in got:
+                    got[step].append(s)
+            want = LOAD_ROWS + 300
+            n = _bq_json(proj, f"SELECT count(DISTINCT id) n FROM `{proj}.{dset}.{table}`")
+            if not n or int(n[0]["n"]) != want:
+                return None
+        finally:
+            _sql("postgres", url, f"DROP TABLE IF EXISTS {table};")
+            gcp.bq_delete_dataset(proj, dset)
+            gcp.gcs_delete_prefix(bucket, f"exports/{table}/")
+    return {k: _best(v) for k, v in got.items()}
+
+
+def _load(led: Ledger, prev: Path, root: Path) -> None:
+    """BigQuery load and compact, this binary against the previous release. Wall carries the
+    warehouse's own queueing, so it gets RIVET_PERF_BQ_WALL_TOL (2.0) + 5 s; CPU and RSS are
+    rivet's and use the common tolerances. (ClickHouse joins once a previous release has it.)"""
+    url = os.environ.get("RIVET_ORACLE_POSTGRES_URL", "")
+    if not url or not os.environ.get("BQ_ORACLE_PROJECT") or not os.environ.get("BQ_ORACLE_BUCKET"):
+        led.skipped("bigquery", "-", SCEN, "load", "perf[bigquery/load]: no postgres URL or "
+                    "BQ_ORACLE_PROJECT / BQ_ORACLE_BUCKET", "no bigquery")
+        return
+    p, c = _load_side(prev, prev, root, url, "prev"), _load_side(rivet_bin(), prev, root, url, "cur")
+    wt = _tolerance(os.environ.get("RIVET_PERF_BQ_WALL_TOL") or "2.0")
+    for step in ("load", "load-delta", "compact"):
+        ps, cs = (p or {}).get(step), (c or {}).get(step)
+        if ps is None or cs is None:
+            _grade(led, "bigquery", step, ps, cs)
+            continue
+        worse = [w for w in perf_verdict("bigquery", ps, cs) if not w.startswith("wall")]
+        if cs.wall > ps.wall * wt + 5:
+            worse.append(f"wall {cs.wall:.2f}s > {ps.wall:.2f}s×{wt}+5")
+        shown = f"wall {cs.wall:.2f}/{ps.wall:.2f}s cpu {cs.cpu:.2f}/{ps.cpu:.2f}s rss {cs.rss // MIB}/{ps.rss // MIB}MB"
+        if worse:
+            led.failed("bigquery", "-", SCEN, step, f"perf[bigquery/{step}]: {'; '.join(worse)}", shown)
+        else:
+            led.passed("bigquery", "-", SCEN, step, f"perf[bigquery/{step}]: this/prev {shown}", shown)
 
 
 def _off_happy_path(led: Ledger, prev: Path, root: Path) -> None:
@@ -714,4 +788,5 @@ def verify_perf_regression(led: Ledger) -> None:
     _off_happy_path(led, prev, root)
     _cdc(led, prev)
     _conns(led, prev)
+    _load(led, prev, root)
     _cdc20(led, prev, root)
