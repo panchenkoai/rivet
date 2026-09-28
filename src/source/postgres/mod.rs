@@ -5,7 +5,7 @@
 //! - `mod.rs` (this file) — `PostgresSource` struct + connect/TLS path, the
 //!   transaction-pooler detector, `PgTxnGuard`, sampling helpers
 //!   (`pg_sample_checkpoints_req`, `pg_fetch_work_mem_bytes`),
-//!   `introspect_pg_table_for_chunking`, the cursor + FETCH export loop
+//!   `introspect_pg_on` (chunk-planner catalog probe), the cursor + FETCH export loop
 //!   (`pg_run_export`), the `Source` trait impl, and the catalog-hint
 //!   resolver that bridges parsed FROM clauses to `pg_catalog`.
 //! - [`arrow_convert`] — the entire row → Arrow `RecordBatch` pipeline: type
@@ -284,15 +284,6 @@ fn pg_sample_checkpoints_req(client: &mut Client) -> Option<i64> {
 /// or bare `<table>` (resolved under `public`). It is split internally with
 /// the same strict rules as the `table:` YAML shortcut — anything more
 /// elaborate must use the explicit-column path.
-pub(crate) fn introspect_pg_table_for_chunking(
-    url: &str,
-    tls: Option<&TlsConfig>,
-    qualified_table: &str,
-) -> Result<crate::source::TableIntrospection> {
-    introspect_pg_on(&mut connect_client(url, tls)?, qualified_table)
-}
-
-/// [`introspect_pg_table_for_chunking`] on a connection the caller already holds.
 fn introspect_pg_on(
     client: &mut Client,
     qualified_table: &str,

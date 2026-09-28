@@ -12,7 +12,7 @@
 //! What is probed (all through `query_scalar`, the same seam `init` uses):
 //! - **row estimate** — `SUM(rows)` from the `sys.partitions` catalog
 //!   (heap/clustered index, `index_id IN (0,1)`), the exact SQL `rivet init`
-//!   and `introspect_mssql_table_for_chunking` already run; `None` when the base
+//!   and `introspect_mssql_on` already run; `None` when the base
 //!   query is not a simple single-table read (joins, subqueries, inline SQL).
 //! - **cursor / range min-max** — `MIN`/`MAX` of the cursor/chunk column for
 //!   incremental/chunked modes, surfaced as the `Cursor range` line.
@@ -106,7 +106,7 @@ fn diagnose_mssql(conn: &mut MssqlSource, export: &ExportConfig) -> Result<Expor
     let range_col = preflight_range_col_resolved(export, auto_pk.as_deref());
 
     // Row estimate from the `sys.partitions` catalog — the same fast,
-    // no-`COUNT(*)` probe `rivet init` and `introspect_mssql_table_for_chunking`
+    // no-`COUNT(*)` probe `rivet init` and `introspect_mssql_on`
     // run. `None` (printer omits the line) when the base relation is unknown or
     // the stats row is absent.
     let row_estimate = match base_table {
@@ -168,7 +168,7 @@ fn diagnose_mssql(conn: &mut MssqlSource, export: &ExportConfig) -> Result<Expor
 
 /// Row estimate from the `sys.partitions` catalog for `[schema.]table`. Mirrors
 /// the SQL `rivet init` (`src/init/mssql.rs`) and
-/// `introspect_mssql_table_for_chunking` already run — rows in the heap /
+/// `introspect_mssql_on` already run — rows in the heap /
 /// clustered index (`index_id IN (0,1)`), no `COUNT(*)` scan. `None` when the
 /// stats row is absent (view, no stats) or the probe fails; preflight is
 /// non-fatal, so a failure is logged at debug, never aborted.
@@ -307,7 +307,7 @@ fn range_min_max_mssql(
 /// inspect a query plan, so the signal is a catalog fact, not a heuristic.
 /// The single-integer PK `build_plan` auto-resolves an UNSET chunked `chunk_column` to — so the
 /// diagnostic ranges/probes on the SAME column, not a `?` placeholder (post-0.24.3 review MED).
-/// EXACT two-step mirror of `source::mssql::introspect_mssql_table_for_chunking`'s single_int_pk
+/// EXACT two-step mirror of `source::mssql::introspect_mssql_on`'s single_int_pk
 /// (the PK col via is_primary_key + GROUP BY HAVING COUNT(*)=1, then an int-family type check) —
 /// replicated verbatim so the diagnostic resolves the SAME column the planner will (any
 /// divergence here would REINTRODUCE the false UNSAFE this fixes). `None` on composite / non-int /
@@ -370,7 +370,7 @@ fn column_has_index_mssql(
 
 /// Split a `[schema.]table` name into `(schema, table)`, defaulting the schema
 /// to `dbo` when unqualified (SQL Server's default schema — matches `init` and
-/// `introspect_mssql_table_for_chunking`).
+/// `introspect_mssql_on`).
 fn split_qualified(qualified_table: &str) -> (&str, &str) {
     match qualified_table.split_once('.') {
         Some((s, t)) => (s, t),

@@ -314,8 +314,7 @@ fn full_strategy(config: &Config, export: &ExportConfig) -> ExtractionStrategy {
 ///
 /// 1. **chunk_column** — explicit `chunk_column:` wins; otherwise the `table:`
 ///    shortcut on a Postgres source triggers auto-detection of a single
-///    integer-family PK via
-///    [`crate::source::postgres::introspect_pg_table_for_chunking`].
+///    integer-family PK via [`crate::source::Source::introspect_for_chunking`].
 /// 2. **chunk_size** — explicit `chunk_size:` wins; if `chunk_size_memory_mb:`
 ///    is set, derive the row count from `<budget_mb> / avg_row_bytes`,
 ///    clamped to `[10_000, 5_000_000]`. Falls back to the YAML-default
@@ -440,15 +439,12 @@ fn resolve_chunked_strategy(
                 export.chunk_column.as_deref().unwrap_or("")
             );
         }
-        return Ok(ExtractionStrategy::Chunked(ChunkedPlan {
-            column: export.chunk_column.clone().unwrap(),
-            chunk_size: export.chunk_size,
-            chunk_count: export.chunk_count,
-            parallel: export.parallel,
-            by_days: export.chunk_by_days,
-            checkpoint: export.chunk_checkpoint,
+        return Ok(chunked_plan(
+            export,
+            export.chunk_column.clone().unwrap(),
+            export.chunk_size,
             max_attempts,
-        }));
+        ));
     }
 
     // Anything beyond the fast path requires the `table:` shortcut so we have
@@ -463,51 +459,27 @@ fn resolve_chunked_strategy(
         );
     };
 
+    if config.source.source_type == crate::config::SourceType::Mongo {
+        anyhow::bail!(
+            "chunked mode is not supported for MongoDB — use `mode: full` (the whole \
+             collection is read as `_id` + `document` JSON)"
+        );
+    }
     let url = config.source.resolve_url().map_err(|e| {
         anyhow::anyhow!(
             "export '{}': chunked mode needs the source URL for the introspection probe: {e}",
             export.name
         )
     })?;
-    let introspection_result = match (probe, config.source.source_type) {
-        (Some(src), t) if t != crate::config::SourceType::Mongo => src.introspect_for_chunking(tbl),
-        (_, crate::config::SourceType::Postgres) => {
-            crate::source::postgres::introspect_pg_table_for_chunking(
-                &url,
-                config.source.tls.as_ref(),
-                tbl,
-            )
-        }
-        (_, crate::config::SourceType::Mysql) => {
-            crate::source::mysql::introspect_mysql_table_for_chunking(
-                &url,
-                config.source.tls.as_ref(),
-                tbl,
-            )
-        }
-        (_, crate::config::SourceType::Mssql) => {
-            crate::source::mssql::introspect_mssql_table_for_chunking(
-                &url,
-                config.source.tls.as_ref(),
-                tbl,
-            )
-        }
-        #[cfg(feature = "oracle")]
-        (_, crate::config::SourceType::Oracle) => {
-            crate::source::oracle::introspect_oracle_table_for_chunking(
-                &url,
-                config.source.tls.as_ref(),
-                tbl,
-            )
-        }
-        #[cfg(not(feature = "oracle"))]
-        (_, crate::config::SourceType::Oracle) => {
-            return Err(crate::source::oracle_feature_missing());
-        }
-        (_, crate::config::SourceType::Mongo) => anyhow::bail!(
-            "chunked mode is not supported for MongoDB — use `mode: full` (the whole \
-             collection is read as `_id` + `document` JSON)"
-        ),
+    let introspection_result = match probe {
+        Some(src) => src.introspect_for_chunking(tbl),
+        None => crate::source::connect(
+            config.source.source_type,
+            &url,
+            config.source.tls.as_ref(),
+            config.source.mongo.as_ref(),
+        )
+        .and_then(|mut src| src.introspect_for_chunking(tbl)),
     };
     let introspection = match introspection_result {
         Ok(i) => i,
@@ -533,15 +505,12 @@ fn resolve_chunked_strategy(
                 export.name,
                 export.chunk_column.as_deref().unwrap_or("")
             );
-            return Ok(ExtractionStrategy::Chunked(ChunkedPlan {
-                column: export.chunk_column.clone().unwrap(),
-                chunk_size: export.chunk_size,
-                chunk_count: export.chunk_count,
-                parallel: export.parallel,
-                by_days: export.chunk_by_days,
-                checkpoint: export.chunk_checkpoint,
+            return Ok(chunked_plan(
+                export,
+                export.chunk_column.clone().unwrap(),
+                export.chunk_size,
                 max_attempts,
-            }));
+            ));
         }
         Err(e) => {
             return Err(anyhow::anyhow!(
@@ -732,9 +701,8 @@ fn chunked_strategy_from_introspection(
             incremental,
             // `parallel: N` fans N ROW-percentile-range keyset workers (feat/
             // parallel-keyset). The runner samples the boundaries at run open and
-            // seeks each disjoint `(lo, hi]` range concurrently; iteration 1 has no
-            // crash-recovery (a crashed parallel run re-reads from scratch), which
-            // is why `keyset_recovery` forces checkpoint/incremental off above.
+            // seeks each disjoint `(lo, hi]` range concurrently; recovery flags come
+            // from `keyset_recovery`, the same as sequential.
             parallel: export.parallel,
         }));
     }
@@ -826,7 +794,17 @@ fn chunked_strategy_from_introspection(
         }
     };
 
-    Ok(ExtractionStrategy::Chunked(ChunkedPlan {
+    Ok(chunked_plan(export, column, chunk_size, max_attempts))
+}
+
+/// A range-chunked strategy on `column` carrying the export's own chunk knobs.
+fn chunked_plan(
+    export: &ExportConfig,
+    column: String,
+    chunk_size: usize,
+    max_attempts: u32,
+) -> ExtractionStrategy {
+    ExtractionStrategy::Chunked(ChunkedPlan {
         column,
         chunk_size,
         chunk_count: export.chunk_count,
@@ -834,7 +812,7 @@ fn chunked_strategy_from_introspection(
         by_days: export.chunk_by_days,
         checkpoint: export.chunk_checkpoint,
         max_attempts,
-    }))
+    })
 }
 
 /// Public re-export for callers outside `plan` (e.g. `preflight::type_report`).
@@ -1108,6 +1086,38 @@ mod tests {
         let err = plan(&cfg).expect_err("Mongo cannot be chunk-planned, whatever is held");
         assert!(
             format!("{err:#}").contains("chunked mode is not supported for MongoDB"),
+            "{err:#}"
+        );
+    }
+
+    /// An unreachable `table:` export with no held connection, planned without a probe.
+    fn plan_unreachable(configure: impl Fn(&mut ExportConfig)) -> Result<ResolvedRunPlan> {
+        let mut export = minimal_export();
+        export.mode = ExportMode::Chunked;
+        export.query = None;
+        export.table = Some("t".into());
+        configure(&mut export);
+        let mut cfg = minimal_config();
+        cfg.source.url = Some("postgresql://u@127.0.0.1:1/db".into());
+        build_plan(&cfg, &export, Path::new("."), false, false, false, None)
+    }
+
+    #[test]
+    fn a_failed_connect_on_an_explicit_chunk_column_still_plans_that_column() {
+        let plan = plan_unreachable(|e| e.chunk_column = Some("id".into()))
+            .expect("an explicit column survives a probe that cannot even connect");
+        match plan.strategy {
+            ExtractionStrategy::Chunked(cp) => assert_eq!(cp.column, "id"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_failed_connect_stays_fatal_when_the_plan_needs_the_probe() {
+        let err = plan_unreachable(|e| e.chunk_by_key = Some("id".into()))
+            .expect_err("keyset needs the catalog; a dead connection cannot answer");
+        assert!(
+            format!("{err:#}").contains("introspection probe failed"),
             "{err:#}"
         );
     }

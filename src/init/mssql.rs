@@ -7,7 +7,7 @@
 //! [`MssqlSource`] the export path already owns exposes only
 //! [`query_scalar`](crate::source::Source::query_scalar) publicly (one scalar
 //! cell). So, exactly like
-//! [`crate::source::mssql::introspect_mssql_table_for_chunking`], every
+//! the MSSQL `Source::introspect_for_chunking`, every
 //! multi-row / multi-column read is folded server-side into a single delimited
 //! scalar with `STRING_AGG`: `CHAR(31)` (unit separator) between fields and
 //! `CHAR(30)` (record separator) between rows. Both bytes are illegal in a SQL

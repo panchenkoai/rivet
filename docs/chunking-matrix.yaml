@@ -78,7 +78,7 @@ scenarios:
     mysql:    { test: mysql_chunked_auto_resolves_chunk_column_from_pk }
     mssql:    { test: mssql_chunked_auto_resolves_chunk_column_from_pk }
     mongo:    { test: mongo_batch_parallel_integer_id_no_loss_or_dup }
-    oracle:   { gap: "introspect_oracle_table_for_chunking resolves a single-int PK, but every Oracle range-chunk live test passes an explicit chunk_column over a `query:` — the table-shortcut auto-resolution is unexercised" }
+    oracle:   { gap: "the Oracle introspect_for_chunking resolves a single-int PK, but every Oracle range-chunk live test passes an explicit chunk_column over a `query:` — the table-shortcut auto-resolution is unexercised" }
 
   - id: range_chunk_size_memory_mb
     what: "chunk_size_memory_mb derives the row-count chunk_size from a byte budget"

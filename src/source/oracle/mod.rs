@@ -700,18 +700,6 @@ impl Source for OracleSource {
 }
 
 /// Catalog facts the planner needs to chunk or keyset-page `qualified_table`.
-pub(crate) fn introspect_oracle_table_for_chunking(
-    url: &str,
-    tls: Option<&TlsConfig>,
-    qualified_table: &str,
-) -> Result<crate::source::TableIntrospection> {
-    introspect_oracle_on(
-        &mut OracleSource::connect_with_tls(url, tls)?,
-        qualified_table,
-    )
-}
-
-/// [`introspect_oracle_table_for_chunking`] on a connection the caller already holds.
 fn introspect_oracle_on(
     src: &mut OracleSource,
     qualified_table: &str,

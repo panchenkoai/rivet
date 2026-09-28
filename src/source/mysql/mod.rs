@@ -4,7 +4,7 @@
 //!
 //! - `mod.rs` (this file) — `MysqlSource` struct + connect/TLS path, the
 //!   extraction-pressure sampler, the `lean_pool_opts` / `connect_pool` /
-//!   `build_mysql_ssl_opts` helpers, `introspect_mysql_table_for_chunking`
+//!   `build_mysql_ssl_opts` helpers, `introspect_mysql_on`
 //!   together with the InnoDB `AVG_ROW_LENGTH` correction, the cursor-bound
 //!   `exec_iter` export loop (`mysql_run_export`), and the `Source` trait impl.
 //! - [`arrow_convert`] — the entire row → Arrow `RecordBatch` pipeline:
@@ -214,7 +214,7 @@ fn correct_innodb_avg_row_length(raw_bytes: i64) -> i64 {
 
 /// Probe `information_schema` for stats chunked-mode planning needs.
 ///
-/// MySQL analogue of [`crate::source::postgres::introspect_pg_table_for_chunking`]:
+/// MySQL analogue of the Postgres chunk-planner probe:
 /// returns the same source-neutral [`crate::source::TableIntrospection`] so
 /// `plan/build.rs` can dispatch on `source_type` and reuse the same downstream
 /// logic for chunk-column / chunk_size derivation.
@@ -230,15 +230,6 @@ fn correct_innodb_avg_row_length(raw_bytes: i64) -> i64 {
 /// `qualified_table` is `<schema>.<table>` or bare `<table>` (resolved under the
 /// current database for the connection). Same strict ident rules as the YAML
 /// `table:` shortcut so the SQL stays trivially safe.
-pub(crate) fn introspect_mysql_table_for_chunking(
-    url: &str,
-    tls: Option<&TlsConfig>,
-    qualified_table: &str,
-) -> Result<crate::source::TableIntrospection> {
-    introspect_mysql_on(&mut connect_pool(url, tls)?.get_conn()?, qualified_table)
-}
-
-/// [`introspect_mysql_table_for_chunking`] on a connection the caller already holds.
 fn introspect_mysql_on(
     conn: &mut mysql::PooledConn,
     qualified_table: &str,

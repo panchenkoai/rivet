@@ -1238,19 +1238,6 @@ fn scalar_to_string(row: &tiberius::Row) -> Option<String> {
 }
 
 /// Probe `sys.*` for the stats chunked-mode planning needs (ADR-0015 seam).
-/// Mirrors `introspect_pg_table_for_chunking` / `introspect_mysql_table_for_chunking`.
-pub(crate) fn introspect_mssql_table_for_chunking(
-    url: &str,
-    tls: Option<&TlsConfig>,
-    qualified_table: &str,
-) -> Result<TableIntrospection> {
-    introspect_mssql_on(
-        &mut MssqlSource::connect_with_tls(url, tls)?,
-        qualified_table,
-    )
-}
-
-/// [`introspect_mssql_table_for_chunking`] on a connection the caller already holds.
 fn introspect_mssql_on(src: &mut MssqlSource, qualified_table: &str) -> Result<TableIntrospection> {
     let (schema, table) = match qualified_table.split_once('.') {
         Some((s, t)) => (s.to_string(), t.to_string()),

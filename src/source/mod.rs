@@ -96,8 +96,7 @@ impl std::error::Error for StatementDurationTimeout {}
 /// Summary of a source table relevant to chunked-mode planning. Source-neutral
 /// shape so plan-build can ask either Postgres or MySQL for the same answer.
 ///
-/// Populated by `crate::source::postgres::introspect_pg_table_for_chunking` and
-/// `crate::source::mysql::introspect_mysql_table_for_chunking`. Both helpers
+/// Populated by each engine's [`Source::introspect_for_chunking`]. The helpers
 /// rely on catalog stats (`pg_class` / `information_schema.TABLES`) so the
 /// numbers are only as fresh as the last `ANALYZE` / autoanalyse.
 ///
