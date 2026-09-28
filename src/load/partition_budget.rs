@@ -450,8 +450,8 @@ pub(crate) fn partition_budget_ok(
     plan: &load::plan::LoadPlan,
     uris: &[String],
 ) -> Result<()> {
-    match (&plan.load.target, &plan.partition) {
-        (load::plan::LoadTarget::Bigquery { .. }, Some(partition)) => {
+    match &plan.partition {
+        Some(partition) if plan.load.target.budgets_partitions() => {
             load::partition_budget::check_partition_budget(store, uris, partition)
                 .with_context(|| format!("export `{}`", plan.export_name))
         }

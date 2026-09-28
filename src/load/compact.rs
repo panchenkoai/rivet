@@ -232,11 +232,9 @@ pub fn run_compacts(args: CompactArgs) -> Result<()> {
         load::pool::effective_pool(args.pool, plans.len()),
         || reconnect(state_ref.as_ref(), "compact"),
         |state, _idx, plan| {
-            if let Some(why) = compact_skip_reason(
-                &plan.mode,
-                &plan.layout,
-                load::plan::warehouse_compacts(&plan.load),
-            ) {
+            if let Some(why) =
+                compact_skip_reason(&plan.mode, &plan.layout, plan.load.target.compacts())
+            {
                 eprintln!("  compact [{}]: skipped — {why}", plan.table);
                 return Ok(());
             }

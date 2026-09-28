@@ -329,20 +329,6 @@ impl Clustering {
 /// silent-no-load class the expansion above closes for the static tokens, left
 /// open for the day-specific one). `{run_id}` (and any token still unresolved
 /// after expansion) fails loud the same way.
-/// Whether a load into `target` can read an export staged on `dest`.
-fn load_reads(target: &LoadTarget, dest: crate::config::DestinationType) -> bool {
-    use crate::config::DestinationType;
-    match target {
-        LoadTarget::Clickhouse { .. } => {
-            matches!(
-                dest,
-                DestinationType::Gcs | DestinationType::S3 | DestinationType::Azure
-            )
-        }
-        _ => dest == DestinationType::Gcs,
-    }
-}
-
 fn resolve_load_prefix(
     dest: &crate::config::DestinationConfig,
     export_name: &str,
@@ -558,14 +544,8 @@ pub fn resolved_layout(
 ) -> CdcLayout {
     let eff = effective_load(config, export, table);
     let choice = eff.as_ref().and_then(|eff| eff.layout);
-    let compacts = eff.as_ref().is_some_and(warehouse_compacts);
+    let compacts = eff.as_ref().is_some_and(|l| l.target.compacts());
     cdc_layout(export, load_mode_of(export.mode), choice, compacts)
-}
-
-/// Whether the warehouse can merge a buffer into a base: `rivet compact` is
-/// BigQuery-only, so only there does a base-and-buffer table ever complete a cycle.
-pub(crate) fn warehouse_compacts(section: &LoadSection) -> bool {
-    matches!(section.target, LoadTarget::Bigquery { .. })
 }
 
 fn cdc_layout(
@@ -716,7 +696,7 @@ fn build_plans_keyed(
         // "up to date", exit 0; cleanup/gc would target that foreign prefix.
         // Both warehouse loaders are GCS-only (Snowflake rewrites gs://→gcs://),
         // so refuse anything else loudly at plan time.
-        if !load_reads(&load.target, dest.destination_type) {
+        if !load.target.reads_from(dest.destination_type) {
             anyhow::bail!(
                 "export `{}` has `load:` but its destination is `type: {}` — a {} load \
                  reads GCS only (Snowflake via storage integration, BigQuery via LOAD DATA; \
@@ -878,7 +858,7 @@ fn build_plans_keyed(
             specs,
             gcs_prefix,
             destination: export.destination.clone(),
-            layout: cdc_layout(export, mode, eff_load.layout, warehouse_compacts(&eff_load)),
+            layout: cdc_layout(export, mode, eff_load.layout, eff_load.target.compacts()),
             // A CDC stream can express a delete, a query cannot — so the flag is a
             // column a batch base does not pay for unless its operator asks.
             deleted_flag: eff_load
@@ -955,7 +935,7 @@ fn fold_lookalike_columns(
     if renames.is_empty() {
         return Ok((renames, Vec::new()));
     }
-    if !matches!(load.target, LoadTarget::Bigquery { .. }) {
+    if !load.target.renames_lookalikes() {
         bail!(
             "export `{export}`: column(s) {} have Cyrillic look-alike letters; only a BigQuery \
              load renames them — rename them in the source",
@@ -1674,16 +1654,16 @@ mod tests {
             let plans = build_plans(&cfg, &load, reports).expect("ClickHouse reads this store");
             assert_eq!(plans[0].gcs_prefix, format!("{scheme}://b1/exports/alpha/"));
         }
-        assert!(!load_reads(
-            &LoadTarget::Snowflake {
+        assert!(
+            !LoadTarget::Snowflake {
                 connection: "c".into(),
                 warehouse: "w".into(),
                 database: "d".into(),
                 schema: "s".into(),
                 storage_integration: "i".into(),
-            },
-            crate::config::DestinationType::Azure
-        ));
+            }
+            .reads_from(crate::config::DestinationType::Azure)
+        );
     }
 
     #[test]

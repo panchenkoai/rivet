@@ -307,7 +307,51 @@ impl LoadTarget {
             LoadTarget::Clickhouse { .. } => "clickhouse",
         }
     }
+
+    /// Whether `rivet compact` can merge a buffer into a base on this warehouse.
+    pub(crate) fn compacts(&self) -> bool {
+        matches!(self, LoadTarget::Bigquery { .. })
+    }
+
+    /// Whether a load into this warehouse can read an export staged on `dest`.
+    pub(crate) fn reads_from(&self, dest: crate::config::DestinationType) -> bool {
+        use crate::config::DestinationType;
+        match self {
+            LoadTarget::Clickhouse { .. } => matches!(
+                dest,
+                DestinationType::Gcs | DestinationType::S3 | DestinationType::Azure
+            ),
+            LoadTarget::Bigquery { .. } | LoadTarget::Snowflake { .. } => {
+                dest == DestinationType::Gcs
+            }
+        }
+    }
+
+    /// Whether a load renames a column spelled with look-alike letters (only BigQuery's does).
+    pub(crate) fn renames_lookalikes(&self) -> bool {
+        matches!(self, LoadTarget::Bigquery { .. })
+    }
+
+    /// Whether one load job may write only a bounded number of partitions (BigQuery: 4,000).
+    pub(crate) fn budgets_partitions(&self) -> bool {
+        matches!(self, LoadTarget::Bigquery { .. })
+    }
+
+    /// Why a CDC stream from `source` cannot load into this warehouse, or `None`.
+    pub(crate) fn cdc_refusal(&self, source: crate::config::SourceType) -> Option<&'static str> {
+        match (self, source) {
+            (LoadTarget::Clickhouse { .. }, crate::config::SourceType::Mongo) => {
+                Some(MONGO_CDC_INTO_CLICKHOUSE)
+            }
+            _ => None,
+        }
+    }
 }
+
+/// Why a MongoDB CDC stream cannot load into ClickHouse — said by config validation and by the load.
+pub(crate) const MONGO_CDC_INTO_CLICKHOUSE: &str = "a MongoDB CDC stream cannot load into ClickHouse: its resume token has no integer \
+     order for the change log's version (ADR-0035 CH7) — load it into BigQuery or \
+     Snowflake, or export it in batch mode";
 
 /// Per-export overrides of the top-level [`LoadSection`]: every field optional, `None`
 /// inherits. The warehouse is shared, so `target` is not among them.
@@ -896,6 +940,64 @@ mod tests {
 
 #[cfg(test)]
 mod partition_form_tests {
+
+    /// Each warehouse capability, per target, against values written here — not derived from the methods.
+    #[test]
+    fn warehouse_capabilities_are_what_each_target_can_do() {
+        use crate::config::{DestinationType, SourceType};
+        let bq = LoadTarget::Bigquery {
+            project: "p".into(),
+            dataset: "d".into(),
+        };
+        let sf = LoadTarget::Snowflake {
+            connection: "c".into(),
+            warehouse: "w".into(),
+            database: "d".into(),
+            schema: "s".into(),
+            storage_integration: "i".into(),
+        };
+        let ch = LoadTarget::Clickhouse {
+            url: "u".into(),
+            database: "d".into(),
+            user: "u".into(),
+            password_env: "P".into(),
+            named_collection: None,
+        };
+        assert_eq!(
+            [bq.compacts(), sf.compacts(), ch.compacts()],
+            [true, false, false]
+        );
+        assert_eq!(
+            [
+                bq.renames_lookalikes(),
+                sf.renames_lookalikes(),
+                ch.renames_lookalikes()
+            ],
+            [true, false, false]
+        );
+        assert_eq!(
+            [
+                bq.budgets_partitions(),
+                sf.budgets_partitions(),
+                ch.budgets_partitions()
+            ],
+            [true, false, false]
+        );
+        for t in [&bq, &sf] {
+            assert!(t.reads_from(DestinationType::Gcs));
+            assert!(!t.reads_from(DestinationType::S3) && !t.reads_from(DestinationType::Azure));
+        }
+        assert!(ch.reads_from(DestinationType::Gcs) && ch.reads_from(DestinationType::S3));
+        assert!(ch.reads_from(DestinationType::Azure) && !ch.reads_from(DestinationType::Local));
+        assert_eq!(
+            ch.cdc_refusal(SourceType::Mongo),
+            Some(MONGO_CDC_INTO_CLICKHOUSE)
+        );
+        assert_eq!(ch.cdc_refusal(SourceType::Mysql), None);
+        assert_eq!(bq.cdc_refusal(SourceType::Mongo), None);
+        assert_eq!(sf.cdc_refusal(SourceType::Mongo), None);
+    }
+
     use super::*;
 
     /// The column each `partition:` form keys on. Both the compaction plan and

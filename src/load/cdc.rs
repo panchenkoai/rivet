@@ -46,6 +46,19 @@ pub enum SourceEngine {
     Mongo,
 }
 
+impl SourceEngine {
+    /// The source type this change log came from.
+    pub fn source_type(self) -> crate::config::SourceType {
+        use crate::config::SourceType;
+        match self {
+            Self::MySql => SourceType::Mysql,
+            Self::Postgres => SourceType::Postgres,
+            Self::SqlServer => SourceType::Mssql,
+            Self::Mongo => SourceType::Mongo,
+        }
+    }
+}
+
 /// The warehouse the view is defined in — selects the JSON-parse dialect and
 /// the `SELECT * EXCEPT/EXCLUDE` keyword.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
