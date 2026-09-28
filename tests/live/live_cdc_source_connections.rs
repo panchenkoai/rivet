@@ -13,6 +13,17 @@
 
 use crate::common::*;
 
+/// True (and a skip is recorded) unless the stand is ours alone for this test.
+fn not_exclusive() -> bool {
+    let shared = std::env::var("RIVET_TEST_EXCLUSIVE").is_err();
+    if shared {
+        skip_live(
+            "counts server-wide connections — run with RIVET_TEST_EXCLUSIVE=1 and --test-threads=1",
+        );
+    }
+    shared
+}
+
 /// The fewest connections any of three runs opened: `opened` measures one run.
 fn fewest(mut opened: impl FnMut() -> i64) -> i64 {
     (0..3).map(|_| opened()).min().unwrap()
@@ -31,6 +42,9 @@ fn pg_sessions(c: &mut postgres::Client) -> i64 {
 #[test]
 #[ignore = "live+exclusive: requires postgres-cdc; counts server-wide sessions"]
 fn a_postgres_cdc_run_opens_at_most_two_source_connections() {
+    if not_exclusive() {
+        return;
+    }
     let mut c = postgres::Client::connect(POSTGRES_CDC_URL, postgres::NoTls).unwrap();
     let tbl = unique_name("rivet_cdc_conns");
     let slot = unique_name("rivet_conns_slot");
@@ -67,6 +81,9 @@ fn a_postgres_cdc_run_opens_at_most_two_source_connections() {
 #[test]
 #[ignore = "live+exclusive: requires mysql-cdc; counts server-wide connections"]
 fn a_mysql_cdc_run_opens_at_most_two_source_connections() {
+    if not_exclusive() {
+        return;
+    }
     use mysql::prelude::Queryable;
     let mut c = mysql::Conn::new(mysql::Opts::from_url(MYSQL_CDC_URL).unwrap()).unwrap();
     let connections = |c: &mut mysql::Conn| -> i64 {
@@ -106,6 +123,9 @@ fn a_mysql_cdc_run_opens_at_most_two_source_connections() {
 #[test]
 #[ignore = "live+exclusive: requires mssql-cdc with SQL Server Agent; counts server-wide logins"]
 fn a_sql_server_cdc_run_opens_at_most_two_source_connections() {
+    if not_exclusive() {
+        return;
+    }
     let _serial = cross_process_serial("mssql_cdc");
     let logins = || {
         mssql_cdc_query_i64(
