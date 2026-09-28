@@ -177,23 +177,31 @@ impl TableSink<'_> {
         engine: super::CdcEngine,
         format: FormatType,
         run_token: &str,
-    ) -> Result<FlushedParts> {
+    ) -> FlushedParts {
         let sch = self
             .schema
             .as_ref()
             .expect("prepare_schema runs before every flush");
-        flush(
+        match flush(
             &self.buf,
             sch,
             &self.out.columns,
             engine,
-            format,
-            run_token,
-            self.seq,
-            self.out.dest,
             &self.out.row_hash,
             self.out.partition.as_ref(),
-        )
+        ) {
+            Ok((batch, slices)) => upload_slices(
+                &batch,
+                slices,
+                sch,
+                &self.out.columns,
+                format,
+                run_token,
+                self.seq,
+                self.out.dest,
+            ),
+            Err(e) => (Vec::new(), Err(e)),
+        }
     }
 
     /// Account for a part that is durable at the destination: checksums, ledger, part list, buffer.
@@ -358,26 +366,26 @@ fn roll_all(
     let uploaded = {
         let view: Vec<&TableSink<'_>> = pending.iter().map(|&i| &sinks[i]).collect();
         let (engine, format, run_token) = (run.engine, run.format, run.run_token);
-        crate::workers::run_each(&view, |s| s.encode_and_upload(engine, format, run_token))
+        crate::workers::run_each(
+            &view,
+            |s| Ok(s.encode_and_upload(engine, format, run_token)),
+        )
     };
     // Every part that reached the store is recorded, even when a sibling's upload
     // failed: it is durable either way, and the error still stops the ack below.
     let mut first_err = None;
-    for (i, outcome) in pending.into_iter().zip(uploaded) {
-        match outcome {
-            Ok((parts, mut sums)) => {
-                for part in parts {
-                    sinks[i].record_part(
-                        part,
-                        std::mem::take(&mut sums),
-                        run.format,
-                        run.state.map(|st| (st, run.export_name, run.run_id)),
-                    );
-                }
-            }
-            Err(e) => {
-                first_err.get_or_insert(e);
-            }
+    for (i, flushed) in pending.into_iter().zip(uploaded) {
+        let (parts, outcome) = flushed.unwrap_or_else(|panicked| (Vec::new(), Err(panicked)));
+        for (part, sums) in parts {
+            sinks[i].record_part(
+                part,
+                sums,
+                run.format,
+                run.state.map(|st| (st, run.export_name, run.run_id)),
+            );
+        }
+        if let Err(e) = outcome {
+            first_err.get_or_insert(e);
         }
     }
     if let Some(e) = first_err {
@@ -903,13 +911,9 @@ fn flush(
     schema: &SchemaRef,
     columns: &[TypeMapping],
     engine: super::CdcEngine,
-    format: FormatType,
-    run_token: &str,
-    seq: usize,
-    dest: &dyn Destination,
     row_hash: &crate::config::RowHash,
     partition: Option<&crate::plan::rollover::PartitionRollover>,
-) -> Result<FlushedParts> {
+) -> Result<EncodedBatch> {
     let ops: ArrayRef = Arc::new(
         events
             .iter()
@@ -1006,7 +1010,6 @@ fn flush(
     }
 
     let mut arrays: Vec<ArrayRef> = vec![ops, poss, seqs];
-    let mut col_sums: Vec<(String, u64)> = Vec::with_capacity(columns.len());
     for (i, m) in columns.iter().enumerate() {
         // Engine/native-type cell normalisation (e.g. MySQL binlog quirks: BIT
         // bytes, ENUM indexes, epoch-text TIMESTAMPs, NUL-trimmed BINARY) —
@@ -1044,7 +1047,6 @@ fn flush(
         // Arrow — fail loud BEFORE the part is written, naming the column.
         let source_sum = value::cells_checksum(&render, &cells);
         let arrow_sum = crate::source::value_checksum::array_checksum(arr.as_ref());
-        col_sums.push((m.column_name.clone(), arrow_sum));
         if source_sum != arrow_sum {
             crate::rivet_bail!(
                 crate::error::codes::INTERNAL_VALUE_CONVERTER,
@@ -1067,9 +1069,6 @@ fn flush(
     // columns; the resulting hash covers NULL content by that engine's own
     // model, and the audit never reads it, because a tombstoned row is filtered
     // out (`NOT __is_deleted`).
-    //
-    // `col_sums` deliberately excludes the hash: it records SOURCE column
-    // checksums, and the batch leg likewise omits its own added columns.
     let batch = if row_hash.enabled() {
         let data: Vec<String> = columns.iter().map(|m| m.column_name.clone()).collect();
         let covered = crate::enrich::row_hash_columns_of(&data, row_hash)?;
@@ -1107,26 +1106,56 @@ fn flush(
             .collect(),
         None => vec![(0..batch.num_rows(), None)],
     };
+    Ok((batch, slices))
+}
+
+/// Write + upload each slice as one part, stopping at the first failure; the parts already durable come back with it.
+#[allow(clippy::too_many_arguments)]
+fn upload_slices(
+    batch: &RecordBatch,
+    slices: Vec<Slice>,
+    schema: &SchemaRef,
+    columns: &[TypeMapping],
+    format: FormatType,
+    run_token: &str,
+    seq: usize,
+    dest: &dyn Destination,
+) -> FlushedParts {
     let mut parts = Vec::with_capacity(slices.len());
     for (k, (rows, note)) in slices.into_iter().enumerate() {
-        let tmp = NamedTempFile::new()?;
-        let fmt = crate::format::create_format(format, part_compression(format), None, None);
-        let writer: Box<dyn std::io::Write + Send> = Box::new(tmp.reopen()?);
-        let mut w = fmt.create_writer(schema, writer)?;
-        w.write_batch(&batch.slice(rows.start, rows.len()))?;
-        if let Some(note) = &note {
-            w.note(crate::plan::rollover::PARTITION_BUCKETS_KEY, note);
+        let one = || -> Result<(PartRecord, Vec<(String, u64)>)> {
+            let data = batch.slice(rows.start, rows.len());
+            let tmp = NamedTempFile::new()?;
+            let fmt = crate::format::create_format(format, part_compression(format), None, None);
+            let writer: Box<dyn std::io::Write + Send> = Box::new(tmp.reopen()?);
+            let mut w = fmt.create_writer(schema, writer)?;
+            w.write_batch(&data)?;
+            if let Some(note) = &note {
+                w.note(crate::plan::rollover::PARTITION_BUCKETS_KEY, note);
+            }
+            w.finish()?;
+            let file_name = format!("cdc-{run_token}-{:06}.{}", seq + k, format.label());
+            let part = write_part_file(dest, tmp.path(), rows.len() as i64, file_name)?;
+            Ok((part, slice_column_sums(&data, columns)))
+        };
+        match one() {
+            Ok(p) => parts.push(p),
+            Err(e) => return (parts, Err(e)),
         }
-        w.finish()?;
-        let file_name = format!("cdc-{run_token}-{:06}.{}", seq + k, format.label());
-        parts.push(write_part_file(
-            dest,
-            tmp.path(),
-            rows.len() as i64,
-            file_name,
-        )?);
     }
-    Ok((parts, col_sums))
+    (parts, Ok(()))
+}
+
+/// The source-column checksums of the rows one part holds (the meta columns and row hash excluded).
+fn slice_column_sums(part: &RecordBatch, columns: &[TypeMapping]) -> Vec<(String, u64)> {
+    columns
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let sum = crate::source::value_checksum::array_checksum(part.column(3 + i).as_ref());
+            (m.column_name.clone(), sum)
+        })
+        .collect()
 }
 
 /// The warning for a declared partition this table's parts cannot be budgeted by — the
@@ -1173,8 +1202,14 @@ fn budget_slices(buckets: &[i64], cap: usize) -> Vec<(std::ops::Range<usize>, us
     out
 }
 
-/// A flush's durable parts and the column checksums of the rows they hold.
-type FlushedParts = (Vec<PartRecord>, Vec<(String, u64)>);
+/// One part's row range and its partition note.
+type Slice = (std::ops::Range<usize>, Option<String>);
+
+/// A flush's encoded batch and the slices it is cut into.
+type EncodedBatch = (RecordBatch, Vec<Slice>);
+
+/// The parts a flush made durable, each with its own column checksums, and whether it finished.
+type FlushedParts = (Vec<(PartRecord, Vec<(String, u64)>)>, Result<()>);
 
 /// The name a CDC part is recorded under in `file_log`.
 ///
@@ -3229,6 +3264,169 @@ mod tests {
         assert!(
             logged.iter().any(|f| f.file_name.starts_with("b/")),
             "b's durable part never reached the ledger: {logged:?}"
+        );
+    }
+
+    /// Fails every data-part upload after the first `ok` of them.
+    struct NthPartFailingDest {
+        inner: Box<dyn crate::destination::Destination>,
+        ok: usize,
+        seen: std::sync::atomic::AtomicUsize,
+    }
+    impl crate::destination::Destination for NthPartFailingDest {
+        fn write(
+            &self,
+            local: &std::path::Path,
+            key: &str,
+        ) -> Result<crate::destination::WriteOutcome> {
+            if key.ends_with(".parquet")
+                && self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= self.ok
+            {
+                anyhow::bail!("injected: part upload of '{key}' refused");
+            }
+            self.inner.write(local, key)
+        }
+        fn capabilities(&self) -> crate::destination::DestinationCapabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// One date column, one transaction spanning `days` days.
+    fn one_commit_over_days(days: u32) -> (Vec<TypeMapping>, FakeStream) {
+        let cols = vec![TypeMapping {
+            column_name: "d".into(),
+            source_native_type: "date".into(),
+            rivet_type: crate::types::RivetType::Date,
+            arrow_type: Some(DataType::Date32),
+            fidelity: crate::types::TypeFidelity::Exact,
+            nullable: true,
+            warnings: vec![],
+        }];
+        let day = |n: u32| {
+            let mut e = insert(i64::from(n));
+            e.after = Some(vec![RivetValue::DateTime(
+                chrono::NaiveDate::from_ymd_opt(2026, 1, n)
+                    .unwrap()
+                    .and_hms_opt(0, 0, 0)
+                    .unwrap(),
+            )]);
+            e.committed = n == days;
+            e
+        };
+        let stream = FakeStream {
+            events: VecDeque::from((1..=days).map(day).collect::<Vec<_>>()),
+            acked: Vec::new(),
+        };
+        (cols, stream)
+    }
+
+    /// The `d` column checksum of every parquet part under `dir`, re-read from disk.
+    fn on_disk_d_checksums(dir: &std::path::Path) -> Vec<u64> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|e| e == "parquet") {
+                let reader =
+                    parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+                        std::fs::File::open(&path).unwrap(),
+                    )
+                    .unwrap()
+                    .build()
+                    .unwrap();
+                let mut sum = 0u64;
+                for b in reader {
+                    let b = b.unwrap();
+                    let d = b.column(b.schema().index_of("d").unwrap());
+                    sum =
+                        sum.wrapping_add(crate::source::value_checksum::array_checksum(d.as_ref()));
+                }
+                out.push(sum);
+            }
+        }
+        out
+    }
+
+    /// The manifest's recorded checksum for column `d`.
+    fn manifest_d_checksum(m: &RunManifest) -> u64 {
+        m.column_checksums
+            .as_ref()
+            .and_then(|c| c.iter().find(|c| c.name == "d"))
+            .map(|c| c.checksum.parse().unwrap())
+            .expect("manifest records a checksum for d")
+    }
+
+    /// Budget the sink's one output at one day per part.
+    fn one_day_per_part(sc: &mut SinkConfig<'_>) {
+        sc.outputs[0].partition = Some(crate::plan::rollover::PartitionRollover {
+            column: "d".into(),
+            granularity: crate::config::load::Granularity::Day,
+            cap: 1,
+        });
+    }
+
+    /// A table whose flush is cut into slices records the slice that landed before a
+    /// later slice's upload failed — in its manifest, its checksums and the ledger.
+    #[test]
+    fn a_failed_slice_upload_still_records_the_tables_earlier_durable_slice() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = NthPartFailingDest {
+            inner: local_dest(&dir),
+            ok: 1,
+            seen: Default::default(),
+        };
+        let (cols, mut stream) = one_commit_over_days(2);
+        let state = crate::state::StateStore::open_in_memory().expect("in-memory state");
+        let mut sc = SinkConfig {
+            state: Some(&state),
+            ..cfg(&dest, &cols, FormatType::Parquet, 100)
+        };
+        one_day_per_part(&mut sc);
+        let (m, r) = run_to_files(&mut stream, sc);
+        assert!(r.is_err(), "the failed slice is the roll's outcome");
+        assert!(
+            stream.acked.is_empty(),
+            "nothing is acked past a lost slice"
+        );
+        let disk = on_disk_d_checksums(dir.path());
+        assert_eq!(
+            disk.len(),
+            1,
+            "fixture is inert — one slice must have landed"
+        );
+        assert_eq!(
+            m[0].parts.len(),
+            1,
+            "the durable slice is missing from the manifest"
+        );
+        assert_eq!(m[0].parts[0].rows, 1);
+        assert_eq!(
+            manifest_d_checksum(&m[0]),
+            disk[0],
+            "the checksum must cover the durable slice alone, not the whole batch"
+        );
+        let logged = state.list_files_for_run("r").expect("read file_log");
+        assert_eq!(
+            logged.len(),
+            1,
+            "the durable slice never reached the ledger: {logged:?}"
+        );
+    }
+
+    /// Per-slice checksums add up to the checksum of every part that landed.
+    #[test]
+    fn every_slice_of_a_flush_contributes_its_own_checksum() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = local_dest(&dir);
+        let (cols, mut stream) = one_commit_over_days(3);
+        let mut sc = cfg(dest.as_ref(), &cols, FormatType::Parquet, 100);
+        one_day_per_part(&mut sc);
+        let (m, r) = run_to_files(&mut stream, sc);
+        r.unwrap();
+        let disk = on_disk_d_checksums(dir.path());
+        assert_eq!(disk.len(), 3, "fixture is inert — three days, three parts");
+        assert_eq!(
+            manifest_d_checksum(&m[0]),
+            disk.iter().fold(0u64, |a, s| a.wrapping_add(*s))
         );
     }
 
