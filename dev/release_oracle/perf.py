@@ -151,13 +151,14 @@ def perf_verdict(engine: str, prev: Sample, cur: Sample) -> list[str]:
     return worse
 
 
-def _grade(led: Ledger, engine: str, path: str, prev: Sample | None, cur: Sample | None) -> None:
-    """Record one path's verdict."""
+def _grade(led: Ledger, engine: str, path: str, prev: Sample | None, cur: Sample | None,
+           wall: bool = True) -> None:
+    """Record one path's verdict; `wall=False` grades CPU, RSS and harm but only shows the wall."""
     if prev is None or cur is None:
         led.failed(engine, "-", SCEN, path, f"perf[{engine}/{path}]: a run failed "
                    f"(prev ok={prev is not None}, this ok={cur is not None})", "run failed")
         return
-    worse = perf_verdict(engine, prev, cur)
+    worse = [w for w in perf_verdict(engine, prev, cur) if wall or not w.startswith("wall")]
     shown = (f"wall {cur.wall:.2f}/{prev.wall:.2f}s cpu {cur.cpu:.2f}/{prev.cpu:.2f}s "
              f"rss {cur.rss // MIB}/{prev.rss // MIB}MB")
     if worse:
@@ -740,8 +741,11 @@ def _cdc(led: Ledger, prev: Path) -> None:
         for path in ("cdc", "cdc-resume") if engine == "mongo" else ("cdc", "cdc-spill", "cdc-resume"):
             _grade(led, engine, path, _cdc_side(prev, engine, url, path),
                    _cdc_side(rivet_bin(), engine, url, path))
+        # MongoDB's first run waits on the server in ~8 s steps (measured on BOTH
+        # binaries: 2.2 / 10.7 / 18.3 s wall at 0.06 s CPU), so its wall grades the wait,
+        # not rivet; CPU and RSS still grade it.
         _grade(led, engine, "cdc-snapshot", _snapshot_side(prev, engine, url),
-               _snapshot_side(rivet_bin(), engine, url))
+               _snapshot_side(rivet_bin(), engine, url), wall=engine != "mongo")
 
 
 def _aa(led: Ledger, prev: Path, root: Path) -> None:

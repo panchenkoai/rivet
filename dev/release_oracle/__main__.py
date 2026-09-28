@@ -308,6 +308,14 @@ def _self_test() -> int:
     from .perf import conns_verdict
     assert conns_verdict("postgres", 5, 2) == [] and conns_verdict("postgres", 2, 3)
     assert conns_verdict("mongo", 3, 4) and conns_verdict("mongo", 6, 6) == []
+    # A path graded without its wall still fails on CPU, and passes a slower wall alone.
+    from .perf import _grade
+    slow_wall = Ledger(colour=False)
+    _grade(slow_wall, "mongo", "p", base, Sample(True, 9.0, 0.02, 50 * 1024 * 1024, {}), wall=False)
+    assert not slow_wall.red, "wall=False must not grade the wall"
+    hot_cpu = Ledger(colour=False)
+    _grade(hot_cpu, "mongo", "p", base, Sample(True, 1.0, 5.0, 50 * 1024 * 1024, {}), wall=False)
+    assert hot_cpu.red, "wall=False must still grade CPU"
     # An INTERNAL error anywhere in a gated command's output is a gate failure.
     from . import core as _core
     _core.note_invariant_violations(["rivet", "run"], "Error: [RIVET_INTERNAL_SPILL] cdc spill: sealed twice")
