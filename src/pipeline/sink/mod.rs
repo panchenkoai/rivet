@@ -24,6 +24,7 @@ use crate::plan::{
     CompressionType, ExtractionStrategy, FormatType, IncrementalCursorPlan, MetaColumns,
     ResolvedRunPlan,
 };
+use crate::quality::QualityTracker;
 use crate::source::BatchSink;
 
 pub(crate) struct CompletedPart {
@@ -347,174 +348,6 @@ impl PartBudget {
     }
 }
 
-/// The export's declared quality rules and what has been measured against them.
-///
-/// Seven of `ExportSink`'s fields were this one concern, and nothing in the write path
-/// reads them: the tracker needs the batch, the resolved dest schema, and the run's row
-/// count, and it answers with issues. Keeping it whole means the sink's interface no
-/// longer carries the accumulators, and the rules are testable without a writer.
-#[derive(Default)]
-pub(in crate::pipeline) struct QualityTracker {
-    pub(in crate::pipeline) columns: Option<crate::config::QualityConfig>,
-    pub(in crate::pipeline) null_counts: std::collections::HashMap<String, usize>,
-    pub(in crate::pipeline) unique_sets:
-        std::collections::HashMap<String, std::collections::HashSet<u64>>,
-    /// Per-column count of non-NULL values seen by uniqueness tracking. NULLs are never
-    /// duplicates (SQL UNIQUE semantics) and are skipped from hashing, so duplicates must
-    /// be computed against this count, not the run's `total_rows`.
-    pub(in crate::pipeline) unique_non_null_counts: std::collections::HashMap<String, usize>,
-    /// Columns whose unique-entry tracking stopped because `unique_max_entries` was reached.
-    pub(in crate::pipeline) unique_capped: std::collections::HashSet<String>,
-    /// Column index caches, built once when the dest schema resolves.
-    pub(in crate::pipeline) null_indices: Vec<(usize, String)>,
-    pub(in crate::pipeline) unique_indices: Vec<(usize, String)>,
-}
-
-impl QualityTracker {
-    pub(in crate::pipeline) fn new(columns: Option<crate::config::QualityConfig>) -> Self {
-        Self {
-            columns,
-            ..Default::default()
-        }
-    }
-
-    /// Bind the declared rules to the resolved dest schema, caching each rule's column
-    /// index.
-    ///
-    /// Fails loud (#33, "never a silent no-op"): a rule naming a column the export does not
-    /// produce would otherwise be dropped by the filters below and report `quality: pass`
-    /// over a gate that never ran. Validated the moment the schema resolves, before any
-    /// batch.
-    pub(in crate::pipeline) fn resolve_columns(&mut self, dest_schema: &Schema) -> Result<()> {
-        let Some(qc) = &self.columns else {
-            return Ok(());
-        };
-        let available: Vec<String> = dest_schema
-            .fields()
-            .iter()
-            .map(|f| f.name().clone())
-            .collect();
-        crate::quality::validate_quality_columns(qc, &available)?;
-        self.null_indices = dest_schema
-            .fields()
-            .iter()
-            .enumerate()
-            .filter(|(_, f)| qc.null_ratio_max.contains_key(f.name().as_str()))
-            .map(|(i, f)| (i, f.name().clone()))
-            .collect();
-        self.unique_indices = dest_schema
-            .fields()
-            .iter()
-            .enumerate()
-            .filter(|(_, f)| qc.unique_columns.contains(f.name()))
-            .map(|(i, f)| (i, f.name().clone()))
-            .collect();
-        Ok(())
-    }
-
-    /// Accumulate one batch against the declared rules.
-    pub(in crate::pipeline) fn track(&mut self, batch: &RecordBatch) {
-        if self.columns.is_none() {
-            return;
-        }
-        for (i, name) in &self.null_indices {
-            *self.null_counts.entry(name.clone()).or_default() += batch.column(*i).null_count();
-        }
-        if self.unique_indices.is_empty() {
-            return;
-        }
-        let cap = self.columns.as_ref().and_then(|q| q.unique_max_entries);
-        use std::io::Write as _;
-        use xxhash_rust::xxh3::xxh3_64;
-        let fmt_options = arrow::util::display::FormatOptions::default();
-        let mut scratch = Vec::with_capacity(64);
-        for (i, name) in &self.unique_indices {
-            if self.unique_capped.contains(name) {
-                continue;
-            }
-            let col = batch.column(*i);
-            let non_null_count = self.unique_non_null_counts.entry(name.clone()).or_default();
-            let set = self.unique_sets.entry(name.clone()).or_default();
-            if let Ok(formatter) =
-                arrow::util::display::ArrayFormatter::try_new(col.as_ref(), &fmt_options)
-            {
-                for row in 0..col.len() {
-                    // NULLs are never duplicates (SQL UNIQUE semantics): skip before the
-                    // cap check so trailing NULLs can't trip the cap.
-                    if col.is_null(row) {
-                        continue;
-                    }
-                    if let Some(limit) = cap
-                        && set.len() >= limit
-                    {
-                        self.unique_capped.insert(name.clone());
-                        break;
-                    }
-                    scratch.clear();
-                    let _ = write!(scratch, "{}", formatter.value(row));
-                    set.insert(xxh3_64(&scratch));
-                    *non_null_count += 1;
-                }
-            }
-        }
-    }
-
-    /// The verdict, given the run's row count — the one number the rules need that the
-    /// tracker does not own.
-    pub(in crate::pipeline) fn issues(
-        &self,
-        total_rows: usize,
-    ) -> Vec<crate::quality::QualityIssue> {
-        let Some(qc) = &self.columns else {
-            return Vec::new();
-        };
-        let mut issues = Vec::new();
-        issues.extend(crate::quality::check_row_count(total_rows, qc));
-        if total_rows == 0 {
-            return issues;
-        }
-        for (col, max_ratio) in &qc.null_ratio_max {
-            let nulls = self.null_counts.get(col).copied().unwrap_or(0);
-            let ratio = nulls as f64 / total_rows as f64;
-            if ratio > *max_ratio {
-                issues.push(crate::quality::QualityIssue {
-                    severity: crate::quality::Severity::Fail,
-                    message: format!(
-                        "column '{}': null ratio {:.4} exceeds threshold {:.4}",
-                        col, ratio, max_ratio
-                    ),
-                });
-            }
-        }
-        for col in &qc.unique_columns {
-            if self.unique_capped.contains(col) {
-                let cap = qc.unique_max_entries.unwrap_or(0);
-                issues.push(crate::quality::QualityIssue {
-                    severity: crate::quality::Severity::Warn,
-                    message: format!(
-                        "column '{}': uniqueness check capped at {} entries; result may be \
-                         incomplete (set unique_max_entries higher to cover all rows)",
-                        col, cap
-                    ),
-                });
-            } else if let Some(set) = self.unique_sets.get(col) {
-                let non_null = self.unique_non_null_counts.get(col).copied().unwrap_or(0);
-                let dupes = non_null.saturating_sub(set.len());
-                if dupes > 0 {
-                    issues.push(crate::quality::QualityIssue {
-                        severity: crate::quality::Severity::Fail,
-                        message: format!(
-                            "column '{}': {} duplicate values out of {} rows",
-                            col, dupes, total_rows
-                        ),
-                    });
-                }
-            }
-        }
-        issues
-    }
-}
-
 /// Per-batch progress feed for chunked exports: ticks the export's shared
 /// progress bar with the running row count *during* a chunk's read, so a wide
 /// first chunk (e.g. 250k rows / 90 MB) doesn't sit at "0 rows" for seconds and
@@ -744,8 +577,8 @@ impl ExportSink {
         Ok(())
     }
 
-    pub fn track_quality(&mut self, batch: &RecordBatch) {
-        self.quality.track(batch);
+    pub fn track_quality(&mut self, batch: &RecordBatch) -> Result<()> {
+        self.quality.track(batch)
     }
 
     /// Hard per-value guard (OPT-1): abort with `RIVET_VALUE_TOO_LARGE` when a
@@ -962,7 +795,7 @@ impl ExportSink {
             }
         }
         self.part_rows += dest_batch.num_rows();
-        self.track_quality(dest_batch);
+        self.track_quality(dest_batch)?;
         self.track_shape(dest_batch);
         self.track_checksum(dest_batch);
 

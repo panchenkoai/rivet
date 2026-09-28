@@ -1,243 +1,16 @@
-// Functions in this module are called from pipeline::sink, pipeline::mod, and integration tests
-// via the library crate. The binary re-declares this module but does not call all functions
-// directly, producing dead_code warnings only for the bin target.
-#![allow(dead_code)]
+//! The export's quality gate: the declared rules, the streaming tracker the sink
+//! feeds every batch, and the operator-facing failure contract.
 
 use std::collections::{HashMap, HashSet};
 
-use arrow::array::{
-    Array, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal128Array, Float32Array,
-    Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray,
-    LargeStringArray, StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
-};
-use arrow::datatypes::DataType;
+use arrow::array::Array;
+use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::config::QualityConfig;
+use crate::enrich::{CanonColumn, CanonUse};
 use crate::error::Result;
-
-/// Hash a single array value using typed dispatch to avoid string formatting.
-///
-/// The return distinguishes the two reasons there may be no hash, because
-/// conflating them made a uniqueness check pass over rows it never examined:
-///
-///   `Ok(None)`  the cell is NULL — skip it, which is correct for uniqueness.
-///   `Err(_)`    the cell is PRESENT but its type could not be rendered. The
-///               caller must NOT treat this as "nothing to compare".
-///
-/// Both used to be `None`. Arrow's `ArrayFormatter` refuses a timestamp whose
-/// timezone is a NAME (`Some("UTC")` — the only form rivet emits) without the
-/// `chrono-tz` feature, so `unique: true` on any temporal column silently
-/// examined ZERO rows and reported no duplicates. The feature is now on
-/// (`Cargo.toml`), which removes that trigger — but the conflation was the
-/// defect, and it would return with the next unrenderable type.
-fn hash_value(array: &dyn Array, row: usize) -> Result<Option<u64>> {
-    if array.is_null(row) {
-        return Ok(None);
-    }
-    let h = match array.data_type() {
-        DataType::Boolean => {
-            let v = array
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| {
-                    anyhow::anyhow!("quality: column is not a BooleanArray despite its DataType")
-                })?
-                .value(row);
-            xxh3_64(&[v as u8])
-        }
-        DataType::Int8 => xxh3_64(
-            &array
-                .as_any()
-                .downcast_ref::<Int8Array>()
-                .ok_or_else(|| {
-                    anyhow::anyhow!("quality: column is not a Int8Array despite its DataType")
-                })?
-                .value(row)
-                .to_le_bytes(),
-        ),
-        DataType::Int16 => xxh3_64(
-            &array
-                .as_any()
-                .downcast_ref::<Int16Array>()
-                .ok_or_else(|| {
-                    anyhow::anyhow!("quality: column is not a Int16Array despite its DataType")
-                })?
-                .value(row)
-                .to_le_bytes(),
-        ),
-        DataType::Int32 => xxh3_64(
-            &array
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .ok_or_else(|| {
-                    anyhow::anyhow!("quality: column is not a Int32Array despite its DataType")
-                })?
-                .value(row)
-                .to_le_bytes(),
-        ),
-        DataType::Int64 => xxh3_64(
-            &array
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| {
-                    anyhow::anyhow!("quality: column is not a Int64Array despite its DataType")
-                })?
-                .value(row)
-                .to_le_bytes(),
-        ),
-        DataType::UInt8 => xxh3_64(
-            &array
-                .as_any()
-                .downcast_ref::<UInt8Array>()
-                .ok_or_else(|| {
-                    anyhow::anyhow!("quality: column is not a UInt8Array despite its DataType")
-                })?
-                .value(row)
-                .to_le_bytes(),
-        ),
-        DataType::UInt16 => xxh3_64(
-            &array
-                .as_any()
-                .downcast_ref::<UInt16Array>()
-                .ok_or_else(|| {
-                    anyhow::anyhow!("quality: column is not a UInt16Array despite its DataType")
-                })?
-                .value(row)
-                .to_le_bytes(),
-        ),
-        DataType::UInt32 => xxh3_64(
-            &array
-                .as_any()
-                .downcast_ref::<UInt32Array>()
-                .ok_or_else(|| {
-                    anyhow::anyhow!("quality: column is not a UInt32Array despite its DataType")
-                })?
-                .value(row)
-                .to_le_bytes(),
-        ),
-        DataType::UInt64 => xxh3_64(
-            &array
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .ok_or_else(|| {
-                    anyhow::anyhow!("quality: column is not a UInt64Array despite its DataType")
-                })?
-                .value(row)
-                .to_le_bytes(),
-        ),
-        DataType::Float32 => {
-            let bits = array
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .ok_or_else(|| {
-                    anyhow::anyhow!("quality: column is not a Float32Array despite its DataType")
-                })?
-                .value(row)
-                .to_bits();
-            xxh3_64(&bits.to_le_bytes())
-        }
-        DataType::Float64 => {
-            let bits = array
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .ok_or_else(|| {
-                    anyhow::anyhow!("quality: column is not a Float64Array despite its DataType")
-                })?
-                .value(row)
-                .to_bits();
-            xxh3_64(&bits.to_le_bytes())
-        }
-        DataType::Decimal128(_, _) => xxh3_64(
-            &array
-                .as_any()
-                .downcast_ref::<Decimal128Array>()
-                .ok_or_else(|| {
-                    anyhow::anyhow!("quality: column is not a Decimal128Array despite its DataType")
-                })?
-                .value(row)
-                .to_le_bytes(),
-        ),
-        DataType::Date32 => xxh3_64(
-            &array
-                .as_any()
-                .downcast_ref::<Date32Array>()
-                .ok_or_else(|| {
-                    anyhow::anyhow!("quality: column is not a Date32Array despite its DataType")
-                })?
-                .value(row)
-                .to_le_bytes(),
-        ),
-        DataType::Date64 => xxh3_64(
-            &array
-                .as_any()
-                .downcast_ref::<Date64Array>()
-                .ok_or_else(|| {
-                    anyhow::anyhow!("quality: column is not a Date64Array despite its DataType")
-                })?
-                .value(row)
-                .to_le_bytes(),
-        ),
-        DataType::Utf8 => xxh3_64(
-            array
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| {
-                    anyhow::anyhow!("quality: column is not a StringArray despite its DataType")
-                })?
-                .value(row)
-                .as_bytes(),
-        ),
-        DataType::LargeUtf8 => xxh3_64(
-            array
-                .as_any()
-                .downcast_ref::<LargeStringArray>()
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "quality: column is not a LargeStringArray despite its DataType"
-                    )
-                })?
-                .value(row)
-                .as_bytes(),
-        ),
-        DataType::Binary => xxh3_64(
-            array
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .ok_or_else(|| {
-                    anyhow::anyhow!("quality: column is not a BinaryArray despite its DataType")
-                })?
-                .value(row),
-        ),
-        DataType::LargeBinary => xxh3_64(
-            array
-                .as_any()
-                .downcast_ref::<LargeBinaryArray>()
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "quality: column is not a LargeBinaryArray despite its DataType"
-                    )
-                })?
-                .value(row),
-        ),
-        _ => {
-            // Fallback for exotic types (Timestamp variants, Duration, etc.)
-            let options = arrow::util::display::FormatOptions::default();
-            let fmt =
-                arrow::util::display::ArrayFormatter::try_new(array, &options).map_err(|e| {
-                    anyhow::anyhow!(
-                        "quality: a PRESENT value of type {} cannot be rendered ({e}), so it \
-                         cannot take part in a uniqueness check. Skipping it silently would \
-                         report 'no duplicates' over rows never examined.",
-                        array.data_type()
-                    )
-                })?;
-            xxh3_64(fmt.value(row).to_string().as_bytes())
-        }
-    };
-    Ok(Some(h))
-}
 
 #[derive(Debug, Clone)]
 pub struct QualityIssue {
@@ -312,20 +85,6 @@ pub fn validate_quality_columns(config: &QualityConfig, available: &[String]) ->
     );
 }
 
-/// Union of column names across `batches` (the schema the export produced).
-/// Used to validate quality-rule column references against reality.
-fn available_columns(batches: &[RecordBatch]) -> Vec<String> {
-    let mut seen: Vec<String> = Vec::new();
-    for batch in batches {
-        for field in batch.schema().fields() {
-            if !seen.iter().any(|c| c == field.name()) {
-                seen.push(field.name().clone());
-            }
-        }
-    }
-    seen
-}
-
 pub fn check_row_count(actual: usize, config: &QualityConfig) -> Vec<QualityIssue> {
     let mut issues = Vec::new();
     if let Some(min) = config.row_count_min
@@ -347,202 +106,160 @@ pub fn check_row_count(actual: usize, config: &QualityConfig) -> Vec<QualityIssu
     issues
 }
 
-pub fn check_null_ratios(
-    batches: &[RecordBatch],
-    thresholds: &HashMap<String, f64>,
-) -> Vec<QualityIssue> {
-    if thresholds.is_empty() {
-        return Vec::new();
-    }
-
-    // #33: a threshold naming a column the export does not produce can never
-    // evaluate — `unwrap_or(0)` would treat it as 0 nulls and silently "pass".
-    // Surface it as a Fail (naming the available columns) instead, regardless of
-    // row count, so the gate cannot vanish.
-    let available = available_columns(batches);
-    let mut issues = Vec::new();
-    for col_name in thresholds.keys() {
-        if !available.iter().any(|c| c == col_name) {
-            issues.push(QualityIssue {
-                severity: Severity::Fail,
-                message: format!(
-                    "column '{}': null-ratio check references a column not produced by the \
-                     export (available: {}); fix the column name or add it to the query",
-                    col_name,
-                    if available.is_empty() {
-                        "<none>".to_string()
-                    } else {
-                        available.join(", ")
-                    },
-                ),
-            });
-        }
-    }
-
-    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-    if total_rows == 0 {
-        return issues;
-    }
-
-    let mut null_counts: HashMap<String, usize> = HashMap::new();
-    for batch in batches {
-        let schema = batch.schema();
-        for (i, field) in schema.fields().iter().enumerate() {
-            if thresholds.contains_key(field.name().as_str()) {
-                let col = batch.column(i);
-                *null_counts.entry(field.name().clone()).or_default() += col.null_count();
-            }
-        }
-    }
-
-    for (col_name, max_ratio) in thresholds {
-        // Missing columns already produced a Fail above; skip the ratio math so
-        // they don't also yield a spurious "ratio 0.0000 exceeds" line.
-        if !available.iter().any(|c| c == col_name) {
-            continue;
-        }
-        let nulls = null_counts.get(col_name.as_str()).copied().unwrap_or(0);
-        let ratio = nulls as f64 / total_rows as f64;
-        if ratio > *max_ratio {
-            issues.push(QualityIssue {
-                severity: Severity::Fail,
-                message: format!(
-                    "column '{}': null ratio {:.4} exceeds threshold {:.4}",
-                    col_name, ratio, max_ratio
-                ),
-            });
-        }
-    }
-    issues
+/// The export's declared quality rules and what has been measured against them.
+///
+/// Seven of `ExportSink`'s fields were this one concern, and nothing in the write path
+/// reads them: the tracker needs the batch, the resolved dest schema, and the run's row
+/// count, and it answers with issues. Keeping it whole means the sink's interface no
+/// longer carries the accumulators, and the rules are testable without a writer.
+#[derive(Default)]
+pub(crate) struct QualityTracker {
+    pub(crate) columns: Option<QualityConfig>,
+    pub(crate) null_counts: HashMap<String, usize>,
+    pub(crate) unique_sets: HashMap<String, HashSet<u64>>,
+    /// Per-column count of non-NULL values seen by uniqueness tracking. NULLs are never
+    /// duplicates (SQL UNIQUE semantics) and are skipped from hashing, so duplicates must
+    /// be computed against this count, not the run's `total_rows`.
+    pub(crate) unique_non_null_counts: HashMap<String, usize>,
+    /// Columns whose unique-entry tracking stopped because `unique_max_entries` was reached.
+    pub(crate) unique_capped: HashSet<String>,
+    /// Column index caches, built once when the dest schema resolves.
+    pub(crate) null_indices: Vec<(usize, String)>,
+    pub(crate) unique_indices: Vec<(usize, String)>,
 }
 
-pub fn check_uniqueness(
-    batches: &[RecordBatch],
-    columns: &[String],
-    max_entries: Option<usize>,
-) -> Vec<QualityIssue> {
-    if columns.is_empty() {
-        return Vec::new();
-    }
-
-    // #33: a uniqueness column the export does not produce can never evaluate —
-    // `index_of(col)` returns `Err`, the inner loop is skipped, 0 duplicates are
-    // counted and the gate silently "passes". Surface it as a Fail (naming the
-    // available columns) instead, regardless of row count, so the gate cannot
-    // vanish (the process rules: never a silent no-op).
-    let available = available_columns(batches);
-    let mut issues = Vec::new();
-    for col_name in columns {
-        if !available.iter().any(|c| c == col_name) {
-            issues.push(QualityIssue {
-                severity: Severity::Fail,
-                message: format!(
-                    "column '{}': uniqueness check references a column not produced by the \
-                     export (available: {}); fix the column name or add it to the query",
-                    col_name,
-                    if available.is_empty() {
-                        "<none>".to_string()
-                    } else {
-                        available.join(", ")
-                    },
-                ),
-            });
+impl QualityTracker {
+    pub(crate) fn new(columns: Option<QualityConfig>) -> Self {
+        Self {
+            columns,
+            ..Default::default()
         }
     }
 
-    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-    if total_rows == 0 {
-        return issues;
+    /// Bind the declared rules to the resolved dest schema, caching each rule's column
+    /// index.
+    ///
+    /// Fails loud (#33, "never a silent no-op"): a rule naming a column the export does not
+    /// produce would otherwise be dropped by the filters below and report `quality: pass`
+    /// over a gate that never ran. Validated the moment the schema resolves, before any
+    /// batch.
+    pub(crate) fn resolve_columns(&mut self, dest_schema: &Schema) -> Result<()> {
+        let Some(qc) = &self.columns else {
+            return Ok(());
+        };
+        let available: Vec<String> = dest_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        validate_quality_columns(qc, &available)?;
+        self.null_indices = dest_schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| qc.null_ratio_max.contains_key(f.name().as_str()))
+            .map(|(i, f)| (i, f.name().clone()))
+            .collect();
+        self.unique_indices = dest_schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| qc.unique_columns.contains(f.name()))
+            .map(|(i, f)| (i, f.name().clone()))
+            .collect();
+        Ok(())
     }
 
-    for col_name in columns {
-        if !available.iter().any(|c| c == col_name) {
-            continue; // already reported as a Fail above
+    /// Accumulate one batch against the declared rules; a present cell that cannot be canonicalized fails the run.
+    pub(crate) fn track(&mut self, batch: &RecordBatch) -> Result<()> {
+        if self.columns.is_none() {
+            return Ok(());
         }
-        let mut seen: HashSet<u64> = HashSet::new();
-        let mut duplicates = 0usize;
-        let mut capped = false;
-        let mut unhashable: Option<String> = None;
+        for (i, name) in &self.null_indices {
+            *self.null_counts.entry(name.clone()).or_default() += batch.column(*i).null_count();
+        }
+        let cap = self.columns.as_ref().and_then(|q| q.unique_max_entries);
+        let mut scratch = Vec::with_capacity(64);
+        for (i, name) in &self.unique_indices {
+            if self.unique_capped.contains(name) {
+                continue;
+            }
+            let col = batch.column(*i);
+            let canon = CanonColumn::new(col.as_ref(), name, CanonUse::Unique)?;
+            let non_null_count = self.unique_non_null_counts.entry(name.clone()).or_default();
+            let set = self.unique_sets.entry(name.clone()).or_default();
+            for row in 0..col.len() {
+                // NULLs are never duplicates (SQL UNIQUE semantics): skip before the
+                // cap check so trailing NULLs can't trip the cap.
+                if col.is_null(row) {
+                    continue;
+                }
+                if let Some(limit) = cap
+                    && set.len() >= limit
+                {
+                    self.unique_capped.insert(name.clone());
+                    break;
+                }
+                scratch.clear();
+                canon.write(&mut scratch, row)?;
+                set.insert(xxh3_64(&scratch));
+                *non_null_count += 1;
+            }
+        }
+        Ok(())
+    }
 
-        'batches: for batch in batches {
-            if let Ok(idx) = batch.schema().index_of(col_name) {
-                let col = batch.column(idx);
-                for row in 0..col.len() {
-                    if max_entries.is_some_and(|limit| seen.len() >= limit) {
-                        capped = true;
-                        break 'batches;
-                    }
-                    // An UNRENDERABLE cell is not an absent one. Both used to be
-                    // `None` and both were skipped, which is how `unique: true`
-                    // on a named-timezone timestamp examined ZERO rows and
-                    // reported no duplicates.
-                    match hash_value(col.as_ref(), row) {
-                        Ok(Some(h)) => {
-                            if !seen.insert(h) {
-                                duplicates += 1;
-                            }
-                        }
-                        Ok(None) => {} // NULL — correctly excluded from uniqueness
-                        Err(e) => {
-                            unhashable = Some(format!("{e:#}"));
-                            break 'batches;
-                        }
-                    }
+    /// The verdict, given the run's row count — the one number the rules need that the
+    /// tracker does not own.
+    pub(crate) fn issues(&self, total_rows: usize) -> Vec<QualityIssue> {
+        let Some(qc) = &self.columns else {
+            return Vec::new();
+        };
+        let mut issues = Vec::new();
+        issues.extend(check_row_count(total_rows, qc));
+        if total_rows == 0 {
+            return issues;
+        }
+        for (col, max_ratio) in &qc.null_ratio_max {
+            let nulls = self.null_counts.get(col).copied().unwrap_or(0);
+            let ratio = nulls as f64 / total_rows as f64;
+            if ratio > *max_ratio {
+                issues.push(QualityIssue {
+                    severity: Severity::Fail,
+                    message: format!(
+                        "column '{}': null ratio {:.4} exceeds threshold {:.4}",
+                        col, ratio, max_ratio
+                    ),
+                });
+            }
+        }
+        for col in &qc.unique_columns {
+            if self.unique_capped.contains(col) {
+                let cap = qc.unique_max_entries.unwrap_or(0);
+                issues.push(QualityIssue {
+                    severity: Severity::Warn,
+                    message: format!(
+                        "column '{}': uniqueness check capped at {} entries; result may be \
+                         incomplete (set unique_max_entries higher to cover all rows)",
+                        col, cap
+                    ),
+                });
+            } else if let Some(set) = self.unique_sets.get(col) {
+                let non_null = self.unique_non_null_counts.get(col).copied().unwrap_or(0);
+                let dupes = non_null.saturating_sub(set.len());
+                if dupes > 0 {
+                    issues.push(QualityIssue {
+                        severity: Severity::Fail,
+                        message: format!(
+                            "column '{}': {} duplicate values out of {} rows",
+                            col, dupes, total_rows
+                        ),
+                    });
                 }
             }
         }
-
-        // Reported BEFORE the duplicate verdict: a check that could not read its
-        // column has no verdict to give, and "0 duplicates" over zero examined
-        // rows is exactly the shape of a gate that passes on nothing.
-        if let Some(why) = unhashable {
-            issues.push(QualityIssue {
-                severity: Severity::Fail,
-                message: format!("column '{col_name}': uniqueness check DID NOT RUN — {why}"),
-            });
-            continue;
-        }
-
-        if capped {
-            issues.push(QualityIssue {
-                severity: Severity::Warn,
-                message: format!(
-                    "column '{}': uniqueness check capped at {} entries; result may be incomplete",
-                    col_name,
-                    max_entries.unwrap_or(0)
-                ),
-            });
-        }
-
-        if duplicates > 0 {
-            issues.push(QualityIssue {
-                severity: Severity::Fail,
-                message: format!(
-                    "column '{}': {} duplicate values out of {} rows",
-                    col_name, duplicates, total_rows
-                ),
-            });
-        }
+        issues
     }
-
-    issues
-}
-
-/// Run all configured quality checks. Returns issues found.
-pub fn run_checks(
-    config: &QualityConfig,
-    batches: &[RecordBatch],
-    total_rows: usize,
-) -> Vec<QualityIssue> {
-    let mut all = Vec::new();
-    all.extend(check_row_count(total_rows, config));
-    all.extend(check_null_ratios(batches, &config.null_ratio_max));
-    all.extend(check_uniqueness(
-        batches,
-        &config.unique_columns,
-        config.unique_max_entries,
-    ));
-    all
 }
 
 #[cfg(test)]
@@ -625,161 +342,6 @@ mod tests {
     }
 
     #[test]
-    fn null_ratio_passes() {
-        let batch = make_batch(
-            &[Some(1), Some(2), Some(3)],
-            &[Some("a"), Some("b"), Some("c")],
-        );
-        let mut thresholds = HashMap::new();
-        thresholds.insert("name".into(), 0.5);
-        assert!(check_null_ratios(&[batch], &thresholds).is_empty());
-    }
-
-    #[test]
-    fn null_ratio_fails() {
-        let batch = make_batch(&[Some(1), Some(2), Some(3)], &[None, None, Some("c")]);
-        let mut thresholds = HashMap::new();
-        thresholds.insert("name".into(), 0.5);
-        let issues = check_null_ratios(&[batch], &thresholds);
-        assert_eq!(issues.len(), 1);
-        assert!(issues[0].message.contains("null ratio"));
-    }
-
-    #[test]
-    fn uniqueness_passes() {
-        let batch = make_batch(
-            &[Some(1), Some(2), Some(3)],
-            &[Some("a"), Some("b"), Some("c")],
-        );
-        let issues = check_uniqueness(&[batch], &["id".into()], None);
-        assert!(issues.is_empty());
-    }
-
-    #[test]
-    fn uniqueness_fails() {
-        let batch = make_batch(
-            &[Some(1), Some(2), Some(1)],
-            &[Some("a"), Some("b"), Some("c")],
-        );
-        let issues = check_uniqueness(&[batch], &["id".into()], None);
-        assert_eq!(issues.len(), 1);
-        assert!(issues[0].message.contains("duplicate"));
-    }
-
-    // ─── regression: multi-batch aggregation ─────────────────
-
-    #[test]
-    fn null_ratio_multi_batch_aggregates() {
-        let b1 = make_batch(&[Some(1), Some(2)], &[None, Some("b")]);
-        let b2 = make_batch(&[Some(3), Some(4)], &[None, None]);
-        let mut thresholds = HashMap::new();
-        thresholds.insert("name".into(), 0.5);
-        let issues = check_null_ratios(&[b1, b2], &thresholds);
-        assert_eq!(issues.len(), 1, "3/4 nulls > 0.5 threshold");
-    }
-
-    #[test]
-    fn null_ratio_multi_batch_passes_when_sparse() {
-        let b1 = make_batch(&[Some(1), Some(2)], &[Some("a"), Some("b")]);
-        let b2 = make_batch(&[Some(3)], &[None]);
-        let mut thresholds = HashMap::new();
-        thresholds.insert("name".into(), 0.5);
-        let issues = check_null_ratios(&[b1, b2], &thresholds);
-        assert!(issues.is_empty(), "1/3 nulls < 0.5 threshold");
-    }
-
-    #[test]
-    fn uniqueness_multi_batch_detects_cross_batch_dupes() {
-        let b1 = make_batch(&[Some(1), Some(2)], &[Some("a"), Some("b")]);
-        let b2 = make_batch(&[Some(2), Some(3)], &[Some("c"), Some("d")]);
-        let issues = check_uniqueness(&[b1, b2], &["id".into()], None);
-        assert_eq!(issues.len(), 1, "id=2 duplicated across batches");
-    }
-
-    #[test]
-    fn uniqueness_empty_batches() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, true),
-            Field::new("name", DataType::Utf8, true),
-        ]));
-        let empty = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(Int64Array::from(Vec::<Option<i64>>::new())),
-                Arc::new(StringArray::from(Vec::<Option<&str>>::new())),
-            ],
-        )
-        .unwrap();
-        let issues = check_uniqueness(&[empty], &["id".into()], None);
-        assert!(issues.is_empty(), "empty batch → no duplicates");
-    }
-
-    #[test]
-    fn null_ratio_empty_batches() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, true),
-            Field::new("name", DataType::Utf8, true),
-        ]));
-        let empty = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(Int64Array::from(Vec::<Option<i64>>::new())),
-                Arc::new(StringArray::from(Vec::<Option<&str>>::new())),
-            ],
-        )
-        .unwrap();
-        let mut thresholds = HashMap::new();
-        thresholds.insert("name".into(), 0.0);
-        let issues = check_null_ratios(&[empty], &thresholds);
-        assert!(issues.is_empty(), "0 rows → skip");
-    }
-
-    // ─── regression: run_checks integration ──────────────────
-
-    #[test]
-    fn run_checks_combines_all_results() {
-        let batch = make_batch(&[Some(1), Some(1), Some(1)], &[None, None, Some("c")]);
-        let cfg = QualityConfig {
-            row_count_min: Some(100),
-            row_count_max: None,
-            null_ratio_max: {
-                let mut m = HashMap::new();
-                m.insert("name".into(), 0.1);
-                m
-            },
-            unique_columns: vec!["id".into()],
-            unique_max_entries: None,
-        };
-        let issues = run_checks(&cfg, &[batch], 3);
-        assert!(
-            issues.len() >= 3,
-            "row_count + null_ratio + uniqueness, got: {}",
-            issues.len()
-        );
-    }
-
-    #[test]
-    fn run_checks_no_issues_when_clean() {
-        let batch = make_batch(
-            &[Some(1), Some(2), Some(3)],
-            &[Some("a"), Some("b"), Some("c")],
-        );
-        let cfg = QualityConfig {
-            row_count_min: Some(1),
-            row_count_max: Some(10),
-            null_ratio_max: {
-                let mut m = HashMap::new();
-                m.insert("name".into(), 0.5);
-                m
-            },
-            unique_columns: vec!["id".into()],
-            unique_max_entries: None,
-        };
-        let issues = run_checks(&cfg, &[batch], 3);
-        assert!(issues.is_empty(), "all clean: {:?}", issues);
-    }
-
-    #[test]
     fn row_count_exact_boundary() {
         let cfg = QualityConfig {
             row_count_min: Some(5),
@@ -793,71 +355,101 @@ mod tests {
         assert!(!check_row_count(6, &cfg).is_empty(), "one above max");
     }
 
+    fn unique_tracker(col: &str, schema: &Schema) -> QualityTracker {
+        let mut t = QualityTracker::new(Some(QualityConfig {
+            row_count_min: None,
+            row_count_max: None,
+            null_ratio_max: HashMap::new(),
+            unique_columns: vec![col.into()],
+            unique_max_entries: None,
+        }));
+        t.resolve_columns(schema).unwrap();
+        t
+    }
+
+    fn list_batch(rows: Vec<Option<Vec<Option<&str>>>>) -> RecordBatch {
+        use arrow::array::{ListBuilder, StringBuilder};
+        let mut b = ListBuilder::new(StringBuilder::new());
+        for row in rows {
+            match row {
+                Some(items) => {
+                    for item in items {
+                        b.values().append_option(item);
+                    }
+                    b.append(true);
+                }
+                None => b.append(false),
+            }
+        }
+        let arr = b.finish();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "tags",
+            arr.data_type().clone(),
+            true,
+        )]));
+        RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap()
+    }
+
+    fn fails(issues: &[QualityIssue]) -> Vec<&str> {
+        issues
+            .iter()
+            .filter(|i| i.severity == Severity::Fail)
+            .map(|i| i.message.as_str())
+            .collect()
+    }
+
     #[test]
-    fn uniqueness_cap_emits_warn_and_stops() {
-        // 5 unique values but cap=3 → should warn; no duplicate issue since we stopped early
-        let batch = make_batch(
-            &[Some(1), Some(2), Some(3), Some(4), Some(5)],
-            &[Some("a"), Some("b"), Some("c"), Some("d"), Some("e")],
-        );
-        let issues = check_uniqueness(&[batch], &["id".into()], Some(3));
-        assert!(
-            issues
-                .iter()
-                .any(|i| i.severity == Severity::Warn && i.message.contains("capped")),
-            "expected cap warning, got: {:?}",
-            issues
+    fn unique_list_cells_whose_display_text_agrees_are_not_duplicates() {
+        let batch = list_batch(vec![
+            Some(vec![Some("a, b")]),
+            Some(vec![Some("a"), Some("b")]),
+        ]);
+        let mut t = unique_tracker("tags", &batch.schema());
+        t.track(&batch).unwrap();
+        assert_eq!(fails(&t.issues(2)), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn unique_null_element_empty_string_and_empty_list_are_three_values() {
+        let batch = list_batch(vec![Some(vec![None]), Some(vec![Some("")]), Some(vec![])]);
+        let mut t = unique_tracker("tags", &batch.schema());
+        t.track(&batch).unwrap();
+        assert_eq!(fails(&t.issues(3)), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn unique_identical_lists_are_one_duplicate() {
+        let batch = list_batch(vec![
+            Some(vec![Some("x"), Some("y")]),
+            Some(vec![Some("x"), Some("y")]),
+            None,
+        ]);
+        let mut t = unique_tracker("tags", &batch.schema());
+        t.track(&batch).unwrap();
+        assert_eq!(
+            fails(&t.issues(3)),
+            vec!["column 'tags': 1 duplicate values out of 3 rows"]
         );
     }
 
     #[test]
-    fn uniqueness_cap_none_means_no_limit() {
-        let batch = make_batch(
-            &[Some(1), Some(2), Some(3)],
-            &[Some("a"), Some("b"), Some("c")],
+    fn unique_detects_a_duplicate_across_batches() {
+        let b1 = make_batch(&[Some(1), Some(2)], &[Some("a"), Some("b")]);
+        let b2 = make_batch(&[Some(2), None], &[Some("c"), Some("d")]);
+        let mut t = unique_tracker("id", &b1.schema());
+        t.track(&b1).unwrap();
+        t.track(&b2).unwrap();
+        assert_eq!(
+            fails(&t.issues(4)),
+            vec!["column 'id': 1 duplicate values out of 4 rows"]
         );
-        let issues = check_uniqueness(&[batch], &["id".into()], None);
-        assert!(issues.is_empty(), "no cap → no issues on unique data");
     }
 
+    /// Pins the refusal policy: an unparseable zone is the one type Arrow's formatter
+    /// refuses that a batch can carry, since `chrono-tz` renders every zone rivet emits.
     #[test]
-    fn null_ratio_exact_threshold_passes() {
-        let batch = make_batch(&[Some(1), Some(2)], &[None, Some("b")]);
-        let mut thresholds = HashMap::new();
-        thresholds.insert("name".into(), 0.5);
-        let issues = check_null_ratios(&[batch], &thresholds);
-        assert!(issues.is_empty(), "0.5 == 0.5, not >, so should pass");
-    }
-
-    // ─── #33 regression: a quality rule on a ghost column must be LOUD ────────
-    // (the process rules: "never a silent no-op"). The old code skipped a missing
-    // uniqueness column (index_of → Err → 0 dups → pass) and treated a missing
-    // null-ratio column as 0 nulls (unwrap_or(0) → pass); both vanished.
-
-    /// A PRESENT cell that cannot be hashed must FAIL the check, not shrink it.
-    ///
-    /// `hash_value` returned `None` for two unrelated reasons — "this cell is
-    /// NULL" and "I cannot render this type" — and the caller skipped both. So
-    /// `unique: true` on a column Arrow refuses examined ZERO rows and reported
-    /// no duplicates: a gate passing over data it never read.
-    ///
-    /// The trigger was real. Arrow's `ArrayFormatter` rejects a timestamp whose
-    /// timezone is a NAME unless the `chrono-tz` feature is on — the refusal
-    /// that cost 63 of 65 exports on a production MySQL config, 2026-08-05.
-    ///
-    /// SCOPE, stated because it changes what this proves: with `chrono-tz` on,
-    /// `Some("UTC")` — the only zone rivet emits — renders, so rivet's own
-    /// output can no longer reach the Err arm. An UNPARSEABLE zone still can,
-    /// and that is what this uses. The test therefore pins the CONTRACT ("a
-    /// present-but-unhashable value fails the check") rather than a live
-    /// production path. It is RED-proven against the conflation: restore the
-    /// silent skip and it fails.
-    #[test]
-    fn uniqueness_refuses_when_a_present_value_cannot_be_hashed() {
+    fn unique_on_a_column_that_cannot_be_rendered_refuses_instead_of_passing() {
         use arrow::array::{ArrayRef, TimestampMicrosecondArray};
-
-        // Two IDENTICAL values: were they hashable, the check would find a
-        // duplicate. Either outcome is acceptable; a clean pass is not.
         let arr: ArrayRef = Arc::new(
             TimestampMicrosecondArray::from(vec![1_700_000_000_000_000i64; 2])
                 .with_timezone("Mars/Olympus".to_string()),
@@ -867,78 +459,20 @@ mod tests {
             arr.data_type().clone(),
             false,
         )]));
-        let batch = RecordBatch::try_new(schema, vec![arr]).unwrap();
-
-        let issues = check_uniqueness(&[batch], &["seen_at".into()], None);
+        let batch = RecordBatch::try_new(schema.clone(), vec![arr]).unwrap();
+        let mut t = unique_tracker("seen_at", &schema);
+        let err = t
+            .track(&batch)
+            .expect_err("an unrenderable column must refuse");
+        let msg = format!("{err:#}");
         assert!(
-            !issues.is_empty(),
-            "an unhashable PRESENT value produced a clean pass — the rows were skipped, \
-             which is the defect: the check reports 'no duplicates' over nothing"
-        );
-        assert_eq!(issues[0].severity, Severity::Fail);
-        assert!(
-            issues[0].message.contains("DID NOT RUN"),
-            "the message must say the check did not run, not that the data is clean: {}",
-            issues[0].message
+            msg.starts_with("quality.unique_columns: column 'seen_at'")
+                && msg.ends_with("Remove it from `quality.unique_columns`."),
+            "{msg}"
         );
     }
 
-    #[test]
-    fn uniqueness_missing_column_is_loud_fail() {
-        let batch = make_batch(
-            &[Some(1), Some(2), Some(3)],
-            &[Some("a"), Some("b"), Some("c")],
-        );
-        let issues = check_uniqueness(&[batch], &["ghost".into()], None);
-        assert_eq!(issues.len(), 1, "missing column must produce one Fail");
-        assert_eq!(issues[0].severity, Severity::Fail);
-        assert!(issues[0].message.contains("ghost"), "names the column");
-        assert!(
-            issues[0].message.contains("not produced"),
-            "explains why: {}",
-            issues[0].message
-        );
-        // Available columns are surfaced so the operator can spot the typo.
-        assert!(
-            issues[0].message.contains("id") && issues[0].message.contains("name"),
-            "lists available columns: {}",
-            issues[0].message
-        );
-    }
-
-    #[test]
-    fn uniqueness_missing_column_fails_even_on_empty_batches() {
-        // A ghost column is a config error regardless of row count — it must
-        // not slip through the `total_rows == 0` early return.
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, true),
-            Field::new("name", DataType::Utf8, true),
-        ]));
-        let empty = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(Int64Array::from(Vec::<Option<i64>>::new())),
-                Arc::new(StringArray::from(Vec::<Option<&str>>::new())),
-            ],
-        )
-        .unwrap();
-        let issues = check_uniqueness(&[empty], &["ghost".into()], None);
-        assert_eq!(issues.len(), 1);
-        assert_eq!(issues[0].severity, Severity::Fail);
-        assert!(issues[0].message.contains("ghost"));
-    }
-
-    #[test]
-    fn null_ratio_missing_column_is_loud_fail() {
-        let batch = make_batch(&[Some(1), Some(2)], &[Some("a"), Some("b")]);
-        let mut thresholds = HashMap::new();
-        thresholds.insert("ghost".into(), 0.5);
-        let issues = check_null_ratios(&[batch], &thresholds);
-        assert_eq!(issues.len(), 1, "missing column must produce one Fail");
-        assert_eq!(issues[0].severity, Severity::Fail);
-        assert!(issues[0].message.contains("ghost"));
-        assert!(issues[0].message.contains("not produced"));
-    }
+    // ─── #33 regression: a quality rule on a ghost column must be LOUD ────────
 
     #[test]
     fn validate_quality_columns_ok_when_all_present() {

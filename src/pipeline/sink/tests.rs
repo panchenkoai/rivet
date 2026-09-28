@@ -146,7 +146,7 @@ fn track_quality_counts_nulls() {
 
     let mut sink = minimal_sink_with_quality(vec!["name".into()], vec![]);
     sink.on_schema(schema).unwrap();
-    sink.track_quality(&batch);
+    sink.track_quality(&batch).unwrap();
     assert_eq!(sink.quality.null_counts.get("name"), Some(&2));
 }
 
@@ -162,7 +162,7 @@ fn track_quality_counts_uniques() {
 
     let mut sink = minimal_sink_with_quality(vec![], vec!["id".into()]);
     sink.on_schema(schema).unwrap();
-    sink.track_quality(&batch);
+    sink.track_quality(&batch).unwrap();
     assert_eq!(sink.quality.unique_sets.get("id").unwrap().len(), 3);
 }
 
@@ -314,7 +314,7 @@ fn unique_cap_stops_inserting_at_limit() {
     .unwrap();
     let mut sink = sink_with_unique_cap(vec!["id".into()], 3);
     sink.quality.unique_indices = vec![(0, "id".into())];
-    sink.track_quality(&batch);
+    sink.track_quality(&batch).unwrap();
     let set_len = sink
         .quality
         .unique_sets
@@ -359,7 +359,7 @@ fn unique_no_cap_grows_unbounded() {
     .unwrap();
     let mut sink = minimal_sink_with_quality(vec![], vec!["id".into()]);
     sink.on_schema(schema).unwrap();
-    sink.track_quality(&batch);
+    sink.track_quality(&batch).unwrap();
     assert_eq!(
         sink.quality.unique_sets.get("id").unwrap().len(),
         10,
@@ -387,14 +387,14 @@ fn unique_cap_column_skipped_in_subsequent_batches() {
     .unwrap();
     let mut sink = sink_with_unique_cap(vec!["id".into()], 2);
     sink.quality.unique_indices = vec![(0, "id".into())];
-    sink.track_quality(&batch1); // cap hit here
+    sink.track_quality(&batch1).unwrap(); // cap hit here
     let len_after_first = sink
         .quality
         .unique_sets
         .get("id")
         .map(|s| s.len())
         .unwrap_or(0);
-    sink.track_quality(&batch2); // must be a no-op
+    sink.track_quality(&batch2).unwrap(); // must be a no-op
     let len_after_second = sink
         .quality
         .unique_sets
@@ -1080,7 +1080,7 @@ fn gremlin_unique_cap_exact_boundary_no_false_capped_flag() {
     .unwrap();
     let mut sink = sink_with_unique_cap(vec!["id".into()], 5);
     sink.quality.unique_indices = vec![(0, "id".into())];
-    sink.track_quality(&exact_batch);
+    sink.track_quality(&exact_batch).unwrap();
 
     assert!(
         !sink.quality.unique_capped.contains("id"),
@@ -1095,7 +1095,7 @@ fn gremlin_unique_cap_exact_boundary_no_false_capped_flag() {
     // Now add one more distinct value → cap flag must fire
     let overflow_batch =
         RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![6]))]).unwrap();
-    sink.track_quality(&overflow_batch);
+    sink.track_quality(&overflow_batch).unwrap();
 
     assert!(
         sink.quality.unique_capped.contains("id"),
@@ -1382,7 +1382,7 @@ fn unique_cap_with_nulls_emits_warn_only_no_false_duplicate_fail() {
 
     let mut sink = sink_with_unique_cap(vec!["id".into()], 2);
     sink.quality.unique_indices = vec![(0, "id".into())];
-    sink.track_quality(&batch);
+    sink.track_quality(&batch).unwrap();
     sink.total_rows = 5;
 
     assert!(
@@ -1426,7 +1426,7 @@ fn unique_cap_exact_boundary_trailing_nulls_do_not_trip_cap() {
 
     let mut sink = sink_with_unique_cap(vec!["id".into()], 3);
     sink.quality.unique_indices = vec![(0, "id".into())];
-    sink.track_quality(&batch);
+    sink.track_quality(&batch).unwrap();
     sink.total_rows = 5;
 
     assert!(

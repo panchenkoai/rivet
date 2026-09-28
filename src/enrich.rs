@@ -303,21 +303,100 @@ fn write_leaf(
     buf[len_at..len_at + 4].copy_from_slice(&len.to_le_bytes());
 }
 
+/// Which gate is canonicalizing a cell; it decides the refusal's label and remedy.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum CanonUse {
+    RowHash,
+    Unique,
+}
+
+impl CanonUse {
+    /// The config knob a refusal names first.
+    fn label(self) -> &'static str {
+        match self {
+            CanonUse::RowHash => "row_hash",
+            CanonUse::Unique => "quality.unique_columns",
+        }
+    }
+
+    /// How the operator gets past a refusal for this gate.
+    fn remedy(self) -> &'static str {
+        match self {
+            CanonUse::RowHash => {
+                "Declare the covered set without it — `meta_columns.row_hash: [col, ...]` — \
+                 or leave `row_hash` off for this export."
+            }
+            CanonUse::Unique => "Remove it from `quality.unique_columns`.",
+        }
+    }
+}
+
+/// The column a refusal names and the gate that asked.
+#[derive(Clone, Copy)]
+struct Who<'a> {
+    column: &'a str,
+    by: CanonUse,
+}
+
+static CANON_OPTIONS: arrow::util::display::FormatOptions<'static> =
+    arrow::util::display::FormatOptions::new();
+
+/// One column's injective cell encoder, with a scalar column's formatter built once.
+pub(crate) struct CanonColumn<'a> {
+    array: &'a dyn arrow::array::Array,
+    who: Who<'a>,
+    top: Top<'a>,
+}
+
+/// A scalar column renders through its hoisted formatter; a container recurses.
+enum Top<'a> {
+    Scalar(arrow::util::display::ArrayFormatter<'a>),
+    Container,
+}
+
+impl<'a> CanonColumn<'a> {
+    /// Bind one column, refusing up front a scalar type Arrow cannot render.
+    pub(crate) fn new(
+        array: &'a dyn arrow::array::Array,
+        column: &'a str,
+        by: CanonUse,
+    ) -> Result<Self> {
+        let who = Who { column, by };
+        let top = if is_container(array.data_type()) {
+            Top::Container
+        } else {
+            Top::Scalar(leaf_formatter(array, who, &CANON_OPTIONS)?)
+        };
+        Ok(Self { array, who, top })
+    }
+
+    /// Append one cell's canonical bytes to `buf`.
+    pub(crate) fn write(&self, buf: &mut Vec<u8>, row: usize) -> Result<()> {
+        match &self.top {
+            Top::Scalar(fmt) => {
+                write_leaf(buf, self.array, fmt, row);
+                Ok(())
+            }
+            Top::Container => write_canon(buf, self.array, row, self.who, &CANON_OPTIONS),
+        }
+    }
+}
+
 /// Append the canonical form of one cell, recursing into containers.
 ///
-/// `name` is carried only for the error message, so a refusal names the column
+/// `who` is carried only for the error message, so a refusal names the column
 /// the operator wrote rather than an anonymous child field.
 fn write_canon(
     buf: &mut Vec<u8>,
     array: &dyn arrow::array::Array,
     row: usize,
-    name: &str,
+    who: Who<'_>,
     options: &arrow::util::display::FormatOptions,
 ) -> Result<()> {
     use arrow::array::{FixedSizeListArray, LargeListArray, ListArray, MapArray, StructArray};
 
     if !is_container(array.data_type()) {
-        let fmt = leaf_formatter(array, name, options)?;
+        let fmt = leaf_formatter(array, who, options)?;
         write_leaf(buf, array, &fmt, row);
         return Ok(());
     }
@@ -331,31 +410,31 @@ fn write_canon(
     buf.push(TAG_PRESENT);
     match array.data_type() {
         DataType::List(_) => {
-            let a = downcast::<ListArray>(array, name)?;
-            write_elements(buf, a.value(row).as_ref(), name, options)
+            let a = downcast::<ListArray>(array, who)?;
+            write_elements(buf, a.value(row).as_ref(), who, options)
         }
         DataType::LargeList(_) => {
-            let a = downcast::<LargeListArray>(array, name)?;
-            write_elements(buf, a.value(row).as_ref(), name, options)
+            let a = downcast::<LargeListArray>(array, who)?;
+            write_elements(buf, a.value(row).as_ref(), who, options)
         }
         DataType::FixedSizeList(_, _) => {
-            let a = downcast::<FixedSizeListArray>(array, name)?;
-            write_elements(buf, a.value(row).as_ref(), name, options)
+            let a = downcast::<FixedSizeListArray>(array, who)?;
+            write_elements(buf, a.value(row).as_ref(), who, options)
         }
         DataType::Map(_, _) => {
             // One entry is a {key, value} struct; the entry COUNT is length-
             // prefixed like a list's, so `{}` and `{k: NULL}` cannot collide.
-            let a = downcast::<MapArray>(array, name)?;
+            let a = downcast::<MapArray>(array, who)?;
             let entries = a.value(row);
-            write_elements(buf, &entries, name, options)
+            write_elements(buf, &entries, who, options)
         }
         DataType::Struct(_) => {
             // No count needed — the arity is fixed by the schema — but every
             // field is written, so a NULL field is still one tag rather than
             // nothing at all.
-            let a = downcast::<StructArray>(array, name)?;
+            let a = downcast::<StructArray>(array, who)?;
             for child in a.columns() {
-                write_canon(buf, child.as_ref(), row, name, options)?;
+                write_canon(buf, child.as_ref(), row, who, options)?;
             }
             Ok(())
         }
@@ -364,10 +443,11 @@ fn write_canon(
         // rather than guess a canonical form for a shape we cannot generate and
         // cannot test against real data, refuse — loudly, naming the escape.
         other => anyhow::bail!(
-            "row_hash: column '{name}' has type {other}, for which rivet has no canonical \
-             form, so hashing it could attest that different rows are equal. Declare the \
-             covered set without it — `meta_columns.row_hash: [col, ...]` — or leave \
-             `row_hash` off for this export."
+            "{}: column '{}' has type {other}, for which rivet has no canonical form, so \
+             comparing it could attest that different values are equal. {}",
+            who.by.label(),
+            who.column,
+            who.by.remedy()
         ),
     }
 }
@@ -382,19 +462,19 @@ fn write_canon(
 fn write_elements(
     buf: &mut Vec<u8>,
     elements: &dyn arrow::array::Array,
-    name: &str,
+    who: Who<'_>,
     options: &arrow::util::display::FormatOptions,
 ) -> Result<()> {
     buf.extend_from_slice(&(elements.len() as u32).to_le_bytes());
     if is_container(elements.data_type()) {
         for i in 0..elements.len() {
-            write_canon(buf, elements, i, name, options)?;
+            write_canon(buf, elements, i, who, options)?;
         }
         return Ok(());
     }
     // One formatter for the whole slice rather than one per element — the
     // hoisting the top level does, at every depth.
-    let fmt = leaf_formatter(elements, name, options)?;
+    let fmt = leaf_formatter(elements, who, options)?;
     for i in 0..elements.len() {
         write_leaf(buf, elements, &fmt, i);
     }
@@ -403,24 +483,28 @@ fn write_elements(
 
 fn leaf_formatter<'a>(
     array: &'a dyn arrow::array::Array,
-    name: &str,
+    who: Who<'_>,
     options: &'a arrow::util::display::FormatOptions,
 ) -> Result<arrow::util::display::ArrayFormatter<'a>> {
     arrow::util::display::ArrayFormatter::try_new(array, options).map_err(|e| {
         anyhow::anyhow!(
-            "row_hash: column '{name}' has type {} which Arrow cannot render, so it cannot \
-             be hashed ({e}). Declare the covered set without it — `meta_columns.row_hash: \
-             [col, ...]`.",
-            array.data_type()
+            "{}: column '{}' has type {} which Arrow cannot render, so it cannot be hashed \
+             ({e}). {}",
+            who.by.label(),
+            who.column,
+            array.data_type(),
+            who.by.remedy()
         )
     })
 }
 
-fn downcast<'a, T: 'static>(array: &'a dyn arrow::array::Array, name: &str) -> Result<&'a T> {
+fn downcast<'a, T: 'static>(array: &'a dyn arrow::array::Array, who: Who<'_>) -> Result<&'a T> {
     array.as_any().downcast_ref::<T>().ok_or_else(|| {
         anyhow::anyhow!(
-            "row_hash: column '{name}' declares {} but its array is a different kind — \
-             refusing rather than hashing a value read as the wrong shape",
+            "{}: column '{}' declares {} but its array is a different kind — refusing \
+             rather than hashing a value read as the wrong shape",
+            who.by.label(),
+            who.column,
             array.data_type()
         )
     })
@@ -443,42 +527,22 @@ fn downcast<'a, T: 'static>(array: &'a dyn arrow::array::Array, name: &str) -> R
 fn hash_column(batch: &RecordBatch, n: usize, cols: &[usize]) -> Result<Int64Array> {
     use xxhash_rust::xxh3::xxh3_128;
 
-    /// A covered column's fast path. `Container` is NOT "skip" — it routes to
-    /// `write_canon`; the enum exists so the scalar hoist stays a hoist without
-    /// an `Option` whose `None` could be mistaken for "omit this column".
-    enum Top<'a> {
-        Scalar(arrow::util::display::ArrayFormatter<'a>),
-        Container,
-    }
-
-    let options = arrow::util::display::FormatOptions::default();
     let names: Vec<String> = cols
         .iter()
         .map(|&i| batch.schema().field(i).name().to_string())
         .collect();
-    let tops: Vec<Top> = cols
+    let canons: Vec<CanonColumn> = cols
         .iter()
         .zip(&names)
-        .map(|(&i, name)| {
-            let array = batch.column(i);
-            if is_container(array.data_type()) {
-                Ok(Top::Container)
-            } else {
-                leaf_formatter(array.as_ref(), name, &options).map(Top::Scalar)
-            }
-        })
+        .map(|(&i, name)| CanonColumn::new(batch.column(i).as_ref(), name, CanonUse::RowHash))
         .collect::<Result<Vec<_>>>()?;
 
     let mut buf = Vec::with_capacity(256);
     let mut hashes = Vec::with_capacity(n);
     for row in 0..n {
         buf.clear();
-        for ((&col_idx, top), name) in cols.iter().zip(&tops).zip(&names) {
-            let array = batch.column(col_idx);
-            match top {
-                Top::Scalar(fmt) => write_leaf(&mut buf, array.as_ref(), fmt, row),
-                Top::Container => write_canon(&mut buf, array.as_ref(), row, name, &options)?,
-            }
+        for canon in &canons {
+            canon.write(&mut buf, row)?;
         }
         let h = xxh3_128(&buf);
         hashes.push(h as i64);
@@ -1308,6 +1372,33 @@ mod tests {
         assert_eq!(
             ROW_HASH_RENDER_ID, "xxh3-128-i64-arrow-display-us-v2",
             "the render id must change whenever the rendering above does"
+        );
+    }
+
+    /// A row_hash refusal names its own knob and remedy, not the uniqueness gate's.
+    #[test]
+    fn a_row_hash_refusal_names_row_hash_and_its_covered_set_remedy() {
+        use arrow::array::TimestampMicrosecondArray;
+        let arr: ArrayRef = Arc::new(
+            TimestampMicrosecondArray::from(vec![1i64]).with_timezone("Mars/Olympus".to_string()),
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "seen_at",
+            arr.data_type().clone(),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![arr]).unwrap();
+        let msg = format!(
+            "{:#}",
+            row_hash_array(&batch, &["seen_at".into()]).unwrap_err()
+        );
+        assert!(
+            msg.starts_with("row_hash: column 'seen_at'")
+                && msg.ends_with(
+                    "Declare the covered set without it — `meta_columns.row_hash: [col, ...]` \
+                     — or leave `row_hash` off for this export."
+                ),
+            "{msg}"
         );
     }
 }

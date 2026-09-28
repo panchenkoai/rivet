@@ -1634,7 +1634,7 @@ fn run_csv(eng: Eng) {
 ///
 ///   `enrich::row_hash_array`      the `_rivet_row_hash` meta column
 ///   `ExportSink::track_checksum`  the per-column value checksum `validate` re-reads
-///   `quality::check_uniqueness`   the `unique_columns` gate
+///   `quality::QualityTracker::track`  the `unique_columns` gate (via `enrich::CanonColumn`)
 ///
 /// Every defect this guard exists for had the same shape: a type the product
 /// PRODUCES met a consumer nobody had run it through, and the consumer degraded
