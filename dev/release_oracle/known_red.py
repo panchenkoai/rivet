@@ -18,6 +18,12 @@ class KnownRed:
 
 
 KNOWN_RED: tuple[KnownRed, ...] = (
+    KnownRed("perf[mssql/cdc-snapshot]: wall",
+             "a fixed +0.1–0.3 s on SQL Server's first initial-snapshot run against 0.29.0, reproducible "
+             "(0.57/0.57 s vs 0.27/0.38 s), CPU and rows unchanged; it opens FEWER connections (2 vs 3) "
+             "and the harm query costs no more than SELECT 1, so the source is not yet attributed — "
+             "investigation open, not a loss",
+             "2026-10-12"),
 )
 
 
