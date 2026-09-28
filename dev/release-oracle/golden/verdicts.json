@@ -31,7 +31,7 @@
       "verdict": "ACCEPTABLE"
     },
     "heap_no_key": {
-      "strategy": "range",
+      "strategy": "full",
       "verdict": "DEGRADED"
     },
     "int_pk_dual_ts": {
@@ -39,7 +39,7 @@
       "verdict": "ACCEPTABLE"
     },
     "no_pk_no_ts": {
-      "strategy": "range",
+      "strategy": "full",
       "verdict": "DEGRADED"
     },
     "order_keyed": {
@@ -83,7 +83,7 @@
       "verdict": "ACCEPTABLE"
     },
     "unindexed_id": {
-      "strategy": "range",
+      "strategy": "full",
       "verdict": "DEGRADED"
     },
     "users": {
@@ -117,7 +117,7 @@
       "verdict": "DEGRADED"
     },
     "ext_heap_no_key": {
-      "strategy": "range",
+      "strategy": "full",
       "verdict": "DEGRADED"
     },
     "ext_int_pk_dual_ts": {
@@ -125,7 +125,7 @@
       "verdict": "ACCEPTABLE"
     },
     "ext_no_pk_no_ts": {
-      "strategy": "range",
+      "strategy": "full",
       "verdict": "DEGRADED"
     },
     "ext_order_keyed": {
@@ -141,7 +141,7 @@
       "verdict": "ACCEPTABLE"
     },
     "ext_unindexed_id": {
-      "strategy": "range",
+      "strategy": "full",
       "verdict": "DEGRADED"
     },
     "orders": {
@@ -199,7 +199,7 @@
       "verdict": "ACCEPTABLE"
     },
     "EXT_HEAP_NO_KEY": {
-      "strategy": "range",
+      "strategy": "full",
       "verdict": "DEGRADED"
     },
     "EXT_INT_PK_DUAL_TS": {
@@ -207,7 +207,7 @@
       "verdict": "ACCEPTABLE"
     },
     "EXT_NO_PK_NO_TS": {
-      "strategy": "range",
+      "strategy": "full",
       "verdict": "DEGRADED"
     },
     "EXT_ORDER_KEYED": {
@@ -223,7 +223,7 @@
       "verdict": "ACCEPTABLE"
     },
     "EXT_UNINDEXED_ID": {
-      "strategy": "range",
+      "strategy": "full",
       "verdict": "DEGRADED"
     },
     "ORDERS": {
@@ -285,7 +285,7 @@
       "verdict": "ACCEPTABLE"
     },
     "heap_no_key": {
-      "strategy": "range",
+      "strategy": "full",
       "verdict": "DEGRADED"
     },
     "int_pk_dual_ts": {
@@ -293,7 +293,7 @@
       "verdict": "ACCEPTABLE"
     },
     "no_pk_no_ts": {
-      "strategy": "range",
+      "strategy": "full",
       "verdict": "DEGRADED"
     },
     "order_keyed": {
@@ -337,7 +337,7 @@
       "verdict": "ACCEPTABLE"
     },
     "unindexed_id": {
-      "strategy": "range",
+      "strategy": "full",
       "verdict": "DEGRADED"
     },
     "users": {

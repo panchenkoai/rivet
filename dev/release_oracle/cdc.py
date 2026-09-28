@@ -1186,9 +1186,9 @@ def _cdc_state_parity(led: Ledger) -> None:
     if want is None:
         reasons.append("no-golden(bless first)")
     if snap_sqlite != want:
-        reasons.append("sqlite!=golden")
+        reasons.append(f"sqlite!=golden{_snapshot_diff(want or {}, snap_sqlite)}")
     if surl and snap_pg != want:
-        reasons.append("postgres!=golden")
+        reasons.append(f"postgres!=golden{_snapshot_diff(want or {}, snap_pg)}")
     if not reasons:
         led.passed(
             "postgres",
@@ -1201,6 +1201,12 @@ def _cdc_state_parity(led: Ledger) -> None:
     else:
         fails = "".join(f"{r} " for r in reasons)
         led.failed("postgres", "cdc", "state-parity", "-", f"cdc state parity: {fails}", fails)
+
+
+def _snapshot_diff(want: dict, got: dict) -> str:
+    """The keys where a state snapshot differs from the golden, as `[key: golden->live, ...]`."""
+    keys = sorted(k for k in set(want) | set(got) if want.get(k) != got.get(k))
+    return "[" + ", ".join(f"{k}: {want.get(k)}->{got.get(k)}" for k in keys) + "]"
 
 
 def open_state_db(sdb: Path) -> sqlite3.Connection:
