@@ -65,14 +65,20 @@ fn pg_cdc_tls_failure_is_not_buried_behind_the_setup_hint() {
     assert_eq!(
         error_line(&stderr),
         format!(
-            "Error: {TLS_VERDICT}: error performing TLS handshake: server does not support TLS"
+            "Error: {}: error performing TLS handshake: server does not support TLS",
+            tls_verdict("127.0.0.1:5434")
         )
     );
 }
 
-const TLS_VERDICT: &str = "TLS handshake failed — the server does not speak TLS or its \
-     certificate is not trusted: set `tls.ca_file` for a private CA, or `tls.mode: disable` if \
-     the server has no TLS (trusted networks only); retrying will not help";
+/// The TLS refusal naming the address dialled — batch and CDC share one dial, so both name it.
+fn tls_verdict(at: &str) -> String {
+    format!(
+        "TLS handshake with {at} failed — the server does not speak TLS or its certificate is \
+         not trusted: set `tls.ca_file` for a private CA, or `tls.mode: disable` if the server \
+         has no TLS (trusted networks only); retrying will not help"
+    )
+}
 
 #[test]
 #[ignore = "live: requires docker compose up -d mysql-cdc"]
@@ -84,7 +90,10 @@ fn mysql_cdc_tls_failure_is_not_buried_behind_the_setup_hint() {
     // the certificate; the TLS backend's own reason after `TlsError {` differs by platform.
     let line = error_line(&stderr);
     assert!(
-        line.starts_with(&format!("Error: {TLS_VERDICT}: TlsError {{ ")),
+        line.starts_with(&format!(
+            "Error: {}: TlsError {{ ",
+            tls_verdict("127.0.0.1:3307")
+        )),
         "{line}"
     );
 }
