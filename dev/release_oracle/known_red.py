@@ -18,10 +18,6 @@ class KnownRed:
 
 
 KNOWN_RED: tuple[KnownRed, ...] = (
-    KnownRed("a_ledger_cut_mid_load_fails_loudly_and_the_next_run_finishes_the_job",
-             "a load killed between the warehouse write and the ledger row wedges the table (loud, "
-             "safe); fix pending — it passed once on 2026-09-27 and failed again the next run",
-             "2026-10-11"),
     KnownRed("verdicts DIVERGED: EXT_ORDER_KEYED",
              "Oracle init no longer picks keyset for EXT_ORDER_KEYED (UNIQUE NOT NULL NUMBER(19); "
              "MySQL keysets it) and picks incremental for EXT_REF_ID_HISTORY — suspected Oracle init "
