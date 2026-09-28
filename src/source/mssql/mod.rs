@@ -649,6 +649,10 @@ fn mssql_starts_clause_boundary(rest: &str) -> bool {
 }
 
 impl Source for MssqlSource {
+    fn introspect_for_chunking(&mut self, qualified_table: &str) -> Result<TableIntrospection> {
+        introspect_mssql_on(self, qualified_table)
+    }
+
     fn export(&mut self, request: &ExportRequest<'_>, sink: &mut dyn BatchSink) -> Result<()> {
         // Keyset (seek) pages build a dialect-correct
         // `OFFSET 0 ROWS FETCH NEXT n ROWS ONLY` clause (T-SQL has no `LIMIT`).
@@ -1220,11 +1224,18 @@ pub(crate) fn introspect_mssql_table_for_chunking(
     tls: Option<&TlsConfig>,
     qualified_table: &str,
 ) -> Result<TableIntrospection> {
+    introspect_mssql_on(
+        &mut MssqlSource::connect_with_tls(url, tls)?,
+        qualified_table,
+    )
+}
+
+/// [`introspect_mssql_table_for_chunking`] on a connection the caller already holds.
+fn introspect_mssql_on(src: &mut MssqlSource, qualified_table: &str) -> Result<TableIntrospection> {
     let (schema, table) = match qualified_table.split_once('.') {
         Some((s, t)) => (s.to_string(), t.to_string()),
         None => ("dbo".to_string(), qualified_table.to_string()),
     };
-    let mut src = MssqlSource::connect_with_tls(url, tls)?;
 
     // Row estimate from the `sys.partitions` catalog (heap/clustered index, index_id 0/1):
     // a read-only login sees it, unlike the `dm_db_partition_stats` DMV.

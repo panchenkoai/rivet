@@ -31,12 +31,13 @@ use super::math::build_chunk_query_sql;
 
 use super::ChunkOutcome;
 
-pub(crate) fn run_chunked_parallel_checkpoint(
+pub(in crate::pipeline) fn run_chunked_parallel_checkpoint(
     config_path: &str,
     state: &StateStore,
     plan: &ResolvedRunPlan,
     summary: &mut RunSummary,
     chunk_source: ChunkSource,
+    meta: &mut crate::pipeline::job::MetaConn<'_>,
 ) -> Result<()> {
     // Subject to the per-runner facade contract (ADR-0018) — dispatched directly
     // from job.rs (bypassing run_export), so it sets the flag itself.
@@ -48,30 +49,29 @@ pub(crate) fn run_chunked_parallel_checkpoint(
         // for that to be sound — and it was not checked, because this arm
         // skipped the whole match below (round-11 bughunt).
         //
-        // The SCHEMA must not have drifted. Through `check_drift_only_FRESH`,
-        //    which opens its own short-lived connection — this runner has no
-        //    `Source` in scope here, and that seam exists precisely for it. An
-        //    earlier pass deferred this half claiming a `Source` would have to be
-        //    threaded in; the helper was already there, one line away. `on_schema_drift: fail` was inert
+        // The SCHEMA must not have drifted, checked on the run's metadata
+        //    connection. `on_schema_drift: fail` was inert
         //    here: DEMONSTRATED — a `DROP COLUMN` between the crash and the resume
         //    produced exit 0, `rows: 300`, and three parts under ONE
         //    `schema_fingerprint` whose schemas disagree. The identical drop without
         //    `--resume` fails loudly. The gap between a crash and its resume is
         //    exactly where a schema change is most likely.
-        super::check_drift_only_fresh(plan, state, summary)?;
+        super::check_drift_only(meta.require()?, plan, Some(state), summary)?;
         vec![]
     } else {
         match chunk_source {
-            // Detect: a short-lived connection computes ranges + runs the
-            // pre-chunk drift check (ADR-0021), then closes before workers spawn.
-            ChunkSource::Detect => super::prepare_chunk_plan_fresh(plan, state, summary)?,
+            // Detect: the run's metadata connection computes ranges + runs the
+            // pre-chunk drift check (ADR-0021).
+            ChunkSource::Detect => {
+                super::prepare_chunk_plan(meta.require()?, plan, Some(state), summary)?
+            }
             ChunkSource::Precomputed(ranges) => {
                 // Ranges come from the artifact; the DRIFT GATE still runs.
                 summary.chunks_precomputed = true;
                 // No ranges ⇒ no rows will be read, so there is nothing for the
                 // gate to protect and no reason to open a connection to say so.
-                if !ranges.is_empty() {
-                    super::check_drift_only_fresh(plan, state, summary)?;
+                if super::precomputed_ranges_need_the_drift_gate(&ranges) {
+                    super::check_drift_only(meta.require()?, plan, Some(state), summary)?;
                 }
                 ranges
             }

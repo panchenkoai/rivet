@@ -2,9 +2,7 @@ use std::path::Path;
 
 use crate::config::{Config, ExportConfig};
 use crate::error::{DataIntegrityError, Result};
-use crate::plan::{
-    DiagnosticLevel, ExtractionStrategy, ResolvedRunPlan, build_plan, validate_plan,
-};
+use crate::plan::{DiagnosticLevel, ExtractionStrategy, ResolvedRunPlan, validate_plan};
 use crate::state::StateStore;
 
 use super::RunOptions;
@@ -375,7 +373,6 @@ fn recorded_harm(deltas: Vec<(String, i64)>) -> Vec<(String, i64)> {
         .collect()
 }
 
-/// Source-harm counters taken before a run window; `close` turns them into the run's deltas.
 /// A batch run's one metadata connection: opened at the start, reopened once if it died idle.
 pub(super) struct MetaConn<'a> {
     cfg: &'a crate::config::SourceConfig,
@@ -389,6 +386,24 @@ impl<'a> MetaConn<'a> {
             cfg,
             src: crate::source::create_source(cfg).ok(),
         }
+    }
+
+    /// No connection yet; the first `require` opens one.
+    #[cfg(test)]
+    pub(super) fn empty(cfg: &'a crate::config::SourceConfig) -> Self {
+        Self { cfg, src: None }
+    }
+
+    /// The held connection, or a fresh one (with the connect hint) when the run's open failed.
+    pub(super) fn require(
+        &mut self,
+    ) -> crate::error::Result<&mut (dyn crate::source::Source + 'static)> {
+        let src = match self.src.take() {
+            Some(src) => src,
+            None => crate::source::create_source(self.cfg)
+                .map_err(|e| crate::pipeline::single::attach_connect_hint(e, self.cfg))?,
+        };
+        Ok(self.src.insert(src).as_mut())
     }
 
     /// The held connection, if the run has one.
@@ -411,6 +426,7 @@ fn reopen_to_close_the_bracket(opened: bool, answered: bool) -> bool {
     opened && !answered
 }
 
+/// Source-harm counters taken before a run window; `close` turns them into the run's deltas.
 pub(super) struct HarmBracket {
     harm: Option<Vec<(String, i64)>>,
 }
@@ -1288,6 +1304,7 @@ fn execute_resolved_plan(
     plan: &ResolvedRunPlan,
     state: &StateStore,
     tail: TailPolicy<'_>,
+    mut meta: MetaConn<'_>,
 ) -> (Result<()>, RunSummary) {
     let (_run_lease, recovered) = match chunked::claim_checkpoint_run(state, plan) {
         Ok(claim) => claim,
@@ -1319,10 +1336,9 @@ fn execute_resolved_plan(
     let ledger_run_id = summary.run_id.clone();
     // Failure forensics at open: source schema + server limits, so a run that fails
     // before finalize still explains itself (export_schema is otherwise success-only).
-    // ONE metadata connection for the run's own probes — forensics, both harm
-    // snapshots, the reconcile count — instead of one each (measured: 4 connections
-    // for a full export, 1 of them reading data).
-    let mut meta = MetaConn::open(&plan.source);
+    // ONE metadata connection (`meta`, from the caller) for the run's own probes —
+    // the chunk planner's catalog probe, forensics, both harm snapshots, the
+    // reconcile count — instead of one each.
     capture_open_forensics(plan, state, &mut summary, tail.record_load_spec, &mut meta);
 
     // PG temp-spill + the broader source-harm counters, bracketed around the run
@@ -1347,9 +1363,16 @@ fn execute_resolved_plan(
                     plan,
                     &mut summary,
                     tail.chunk_source,
+                    &mut meta,
                 )
             } else {
-                chunked::run_chunked_parallel(state, plan, &mut summary, tail.chunk_source)
+                chunked::run_chunked_parallel(
+                    state,
+                    plan,
+                    &mut summary,
+                    tail.chunk_source,
+                    &mut meta,
+                )
             }
         }
         Ok(()) => run_with_reconnect(
@@ -1731,7 +1754,9 @@ fn run_export_job_inner(
     } else {
         export
     };
-    let plan = match build_plan(
+    let mut meta = MetaConn::open(&config.source);
+    let plan = match crate::plan::build::build_plan_on(
+        meta.get().map(|s| s as &mut dyn crate::source::Source),
         config,
         export,
         config_dir,
@@ -1811,6 +1836,7 @@ fn run_export_job_inner(
             record_load_spec: true,
             plan_warnings,
         },
+        meta,
     )
 }
 
@@ -1891,12 +1917,43 @@ pub(crate) fn run_export_job_with_chunk_source(
             record_load_spec,
             plan_warnings: Vec::new(),
         },
+        MetaConn::open(&plan.source),
     )
 }
 
 #[cfg(test)]
 mod snapshot_leg_tests {
     use super::*;
+
+    /// A run whose source cannot be reached ends FAILED — the post-plan script never reports success it did not earn.
+    #[test]
+    fn an_unreachable_source_fails_the_run_and_its_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut plan = crate::pipeline::commit::tests::test_plan();
+        plan.destination.path = Some(dir.path().to_string_lossy().into_owned());
+        let state = StateStore::open_in_memory().unwrap();
+        let config = dir.path().join("rivet.yaml").to_string_lossy().into_owned();
+        let (result, summary) = execute_resolved_plan(
+            &plan,
+            &state,
+            TailPolicy {
+                kind: "export",
+                family: "orders",
+                config_path: &config,
+                runner_config_path: &config,
+                chunk_source: chunked::ChunkSource::Detect,
+                apply_context: None,
+                allow_reconcile: false,
+                notifications: None,
+                record_load_spec: false,
+                plan_warnings: Vec::new(),
+            },
+            MetaConn::open(&plan.source),
+        );
+        assert!(result.is_err(), "nothing listens on 127.0.0.1:9999");
+        assert_eq!(summary.status, "failed");
+        assert_eq!(summary.export_name, "orders");
+    }
 
     fn cdc_export() -> crate::config::ExportConfig {
         let cfg = crate::config::Config::from_yaml(

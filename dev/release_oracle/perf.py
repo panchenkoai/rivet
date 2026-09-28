@@ -602,8 +602,8 @@ def _conns(led: Ledger, prev: Path) -> None:
             led.passed(engine, "-", SCEN, "cdc-conns", f"perf[{engine}/cdc-conns]: {shown}", shown)
 
 
-# A batch run needs one metadata connection plus the data read; chunked adds its chunk-plan probe.
-BATCH_CONN_CEILING = {"full": 2, "chunked": 3}
+# A batch run needs one metadata connection plus the data read; the chunk planner probes on the first.
+BATCH_CONN_CEILING = {"full": 2, "chunked": 2}
 
 
 def _batch_conns_side(binary: Path, prev: Path, root: Path, engine: str, url: str, mode: str,

@@ -172,11 +172,19 @@ fn a_sql_server_cdc_run_opens_at_most_two_source_connections() {
     );
 }
 
+/// The keyset export `rivet init --mode chunked` writes: its planner probe must reuse the metadata connection.
+const KEYSET: &[&str] = &["chunk_by_key: id", "chunk_checkpoint: true"];
+
 /// Connections one steady-state BATCH run opens, per engine: the fewest of three runs.
-fn batch_run_opens(engine: SqlEngine) -> i64 {
+/// `lines` restages the export as `chunked` with those lines (e.g. keyset); empty keeps `full`.
+fn batch_run_opens(engine: SqlEngine, lines: &[&str]) -> i64 {
     let (t, _guard) = engine.create("rivet_batch_conns", "id INT PRIMARY KEY, v INT");
     engine.exec(&format!("INSERT INTO {t} VALUES (1, 10), (2, 20)"));
-    let rig = engine.rig(&t);
+    let rig = if lines.is_empty() {
+        engine.rig(&t)
+    } else {
+        engine.rig(&t).restage("chunked", lines)
+    };
     rig.run_ok();
     match engine {
         SqlEngine::Pg => {
@@ -232,11 +240,13 @@ fn a_postgres_batch_run_opens_at_most_two_source_connections() {
     if not_exclusive() {
         return;
     }
-    let opened = batch_run_opens(SqlEngine::Pg);
-    assert!(
-        opened <= 2,
-        "a batch run opened {opened} PostgreSQL sessions; it needs two (metadata + data)"
-    );
+    for lines in [&[][..], KEYSET] {
+        let opened = batch_run_opens(SqlEngine::Pg, lines);
+        assert!(
+            opened <= 2,
+            "a batch run {lines:?} opened {opened} PostgreSQL sessions; it needs two (metadata + data)"
+        );
+    }
 }
 
 #[test]
@@ -245,11 +255,13 @@ fn a_mysql_batch_run_opens_at_most_two_source_connections() {
     if not_exclusive() {
         return;
     }
-    let opened = batch_run_opens(SqlEngine::Mysql);
-    assert!(
-        opened <= 2,
-        "a batch run opened {opened} MySQL connections; it needs two (metadata + data)"
-    );
+    for lines in [&[][..], KEYSET] {
+        let opened = batch_run_opens(SqlEngine::Mysql, lines);
+        assert!(
+            opened <= 2,
+            "a batch run {lines:?} opened {opened} MySQL connections; it needs two (metadata + data)"
+        );
+    }
 }
 
 #[test]
@@ -258,9 +270,11 @@ fn a_sql_server_batch_run_opens_at_most_two_source_connections() {
     if not_exclusive() {
         return;
     }
-    let opened = batch_run_opens(SqlEngine::Mssql);
-    assert!(
-        opened <= 2,
-        "a batch run opened {opened} SQL Server logins; it needs two (metadata + data)"
-    );
+    for lines in [&[][..], KEYSET] {
+        let opened = batch_run_opens(SqlEngine::Mssql, lines);
+        assert!(
+            opened <= 2,
+            "a batch run {lines:?} opened {opened} SQL Server logins; it needs two (metadata + data)"
+        );
+    }
 }

@@ -38,11 +38,11 @@ type ChunkOutcome = (
 // ─── Re-exports for callers in pipeline:: ────────────────────────────────────
 
 pub(crate) use detect::detect_and_generate_chunks;
-pub(crate) use exec::run_chunked_parallel;
+pub(in crate::pipeline) use exec::run_chunked_parallel;
 pub(crate) use exec::run_chunked_sequential;
 pub use math::generate_chunks;
 pub(crate) use math::{build_chunk_query_sql, chunk_plan_fingerprint, strip_select_star_from};
-pub(crate) use parallel_checkpoint::run_chunked_parallel_checkpoint;
+pub(in crate::pipeline) use parallel_checkpoint::run_chunked_parallel_checkpoint;
 pub(crate) use resume_m8::apply_m8_resume_decisions;
 pub(crate) use resume_m8::rehydrate_manifest_parts_probed;
 // `M8Stats` is intentionally not re-exported yet — Phase C-γ keeps it
@@ -227,17 +227,9 @@ pub(super) fn check_drift_only(
     super::schema_drift::check_from_type_mappings(src, st, plan, summary)
 }
 
-/// [`check_drift_only`] for the parallel runners, which hold no `Source`: open a
-/// short-lived connection just for the type probe and drop it before the workers
-/// spawn — the same shape as [`prepare_chunk_plan_fresh`].
-pub(super) fn check_drift_only_fresh(
-    plan: &ResolvedRunPlan,
-    state: &StateStore,
-    summary: &mut RunSummary,
-) -> Result<()> {
-    let mut src = crate::source::create_source(&plan.source)
-        .map_err(|e| crate::pipeline::single::attach_connect_hint(e, &plan.source))?;
-    check_drift_only(&mut *src, plan, Some(state), summary)
+/// Whether precomputed ranges read rows, so the drift gate must run: no ranges, no read, no connection.
+pub(super) fn precomputed_ranges_need_the_drift_gate(ranges: &[(i64, i64)]) -> bool {
+    !ranges.is_empty()
 }
 
 /// Idle source connections shared by one parallel chunked run: a chunk reuses one instead of reconnecting per chunk.
@@ -261,26 +253,6 @@ impl IdleSources {
     pub(super) fn give(&self, src: Box<dyn crate::source::Source>) {
         self.0.lock().unwrap_or_else(|p| p.into_inner()).push(src);
     }
-}
-
-/// Like [`prepare_chunk_plan`], but for the parallel runners that don't already
-/// hold a `Source`: open a short-lived connection, compute the plan, and drop
-/// the connection here — **before** the workers open theirs. The detect
-/// connection must not outlive this call; folding the create → plan → drop dance
-/// into one helper keeps that `drop` structural rather than a hand-placed
-/// statement the two parallel Detect arms must each remember.
-pub(super) fn prepare_chunk_plan_fresh(
-    plan: &ResolvedRunPlan,
-    state: &StateStore,
-    summary: &mut RunSummary,
-) -> Result<Vec<(i64, i64)>> {
-    // The chunked run's FIRST connect. Attach the same actionable hint (doctor
-    // pointer + auth/TLS category) the single-export path gives, so a bad-creds /
-    // unreachable / TLS failure here is not a raw driver error (audit finding).
-    let mut src = crate::source::create_source(&plan.source)
-        .map_err(|e| crate::pipeline::single::attach_connect_hint(e, &plan.source))?;
-    prepare_chunk_plan(&mut *src, plan, Some(state), summary)
-    // `src` drops here, closing the detect connection before workers open theirs.
 }
 
 /// Extract the `ChunkedPlan` from a `ResolvedRunPlan`. Panics if the strategy
@@ -536,6 +508,12 @@ mod tests {
     //! no mocks, no docker. They are *intentionally* the only unit cover
     //! for this file's recovery logic; everything that touches a live
     //! `Source` is exercised by `tests/live_*.rs` instead.
+
+    #[test]
+    fn only_precomputed_ranges_that_read_rows_need_the_drift_gate() {
+        assert!(!super::precomputed_ranges_need_the_drift_gate(&[]));
+        assert!(super::precomputed_ranges_need_the_drift_gate(&[(1, 10)]));
+    }
 
     #[test]
     fn a_dead_owners_plan_resumes_unless_resume_was_asked_or_nothing_crashed() {

@@ -123,7 +123,7 @@ impl std::error::Error for StatementDurationTimeout {}
 /// dispatch is an `enum`-driven `match`. See ADR-0015 for the full
 /// rationale and the architecture-review walks that led here.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct TableIntrospection {
+pub struct TableIntrospection {
     /// Name of the single integer-family PK column, if present and safe to
     /// range-chunk. `None` when the table has no PK, has a composite PK, or
     /// the PK type is not an integer family (text, uuid, decimal, …).
@@ -344,6 +344,14 @@ pub trait Source: Send {
     fn export(&mut self, request: &ExportRequest<'_>, sink: &mut dyn BatchSink) -> Result<()>;
 
     fn query_scalar(&mut self, sql: &str) -> Result<Option<String>>;
+
+    /// The chunk planner's catalog probe of `qualified_table`, on this connection.
+    fn introspect_for_chunking(&mut self, _qualified_table: &str) -> Result<TableIntrospection> {
+        crate::rivet_bail!(
+            crate::error::codes::CONFIG_SOURCE_MODE_UNSUPPORTED,
+            "chunked mode is not supported for this source"
+        )
+    }
 
     /// Return `TypeMapping` for every column in `query` without fetching rows.
     ///

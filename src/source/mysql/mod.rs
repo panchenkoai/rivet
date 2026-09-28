@@ -221,8 +221,14 @@ pub(crate) fn introspect_mysql_table_for_chunking(
     tls: Option<&TlsConfig>,
     qualified_table: &str,
 ) -> Result<crate::source::TableIntrospection> {
-    let pool = connect_pool(url, tls)?;
-    let mut conn = pool.get_conn()?;
+    introspect_mysql_on(&mut connect_pool(url, tls)?.get_conn()?, qualified_table)
+}
+
+/// [`introspect_mysql_table_for_chunking`] on a connection the caller already holds.
+fn introspect_mysql_on(
+    conn: &mut mysql::PooledConn,
+    qualified_table: &str,
+) -> Result<crate::source::TableIntrospection> {
     let default_db: Option<String> = conn.query_first("SELECT DATABASE()")?;
     let default_db = default_db.unwrap_or_default();
 
@@ -645,6 +651,13 @@ fn mysql_run_export(
 }
 
 impl super::Source for MysqlSource {
+    fn introspect_for_chunking(
+        &mut self,
+        qualified_table: &str,
+    ) -> Result<crate::source::TableIntrospection> {
+        introspect_mysql_on(&mut self.pool.get_conn()?, qualified_table)
+    }
+
     fn export(
         &mut self,
         request: &super::ExportRequest<'_>,
