@@ -929,6 +929,9 @@ impl MysqlCellFix {
                     } else {
                         format!("{frac:0<6}").get(..6)?.parse().ok()?
                     };
+                    if (secs, micros) == (0, 0) {
+                        return None;
+                    }
                     chrono::DateTime::from_timestamp(secs, micros * 1_000).map(|dt| dt.naive_utc())
                 })
                 .map_or(V::Null, V::DateTime),
@@ -1428,6 +1431,19 @@ mod tests {
                     .unwrap()
                     .naive_utc()
             )
+        );
+
+        // TIMESTAMP zero-date: the binlog carries '0000-00-00 00:00:00' as epoch 0, which no real
+        // TIMESTAMP can hold (the range starts at 1970-01-01 00:00:01 UTC) — NULL, as the batch path.
+        assert_eq!(fix("timestamp").apply(&V::Bytes(b"0".to_vec())), V::Null);
+        assert_eq!(
+            fix("timestamp(6)").apply(&V::Bytes(b"0.000000".to_vec())),
+            V::Null
+        );
+        assert_eq!(
+            fix("timestamp").apply(&V::Bytes(b"1".to_vec())),
+            V::DateTime(chrono::DateTime::from_timestamp(1, 0).unwrap().naive_utc()),
+            "the first real TIMESTAMP second stays a value"
         );
 
         // BIT(1): one raw byte → Bool; BIT(8): big-endian bytes → UInt.
