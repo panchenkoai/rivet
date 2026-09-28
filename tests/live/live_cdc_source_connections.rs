@@ -1,4 +1,4 @@
-//! What a bounded CDC run costs the source in CONNECTIONS, read from the server's own
+//! What a run — a bounded CDC run, and a batch run — costs the source in CONNECTIONS, read from the server's own
 //! cumulative counter around one steady-state run (checkpoint present, one change).
 //!
 //! Every connection is a server session to set up — on PostgreSQL a backend that warms its
@@ -169,5 +169,98 @@ fn a_sql_server_cdc_run_opens_at_most_two_source_connections() {
     assert!(
         opened <= 2,
         "a bounded CDC run opened {opened} SQL Server logins; it needs metadata + change table"
+    );
+}
+
+/// Connections one steady-state BATCH run opens, per engine: the fewest of three runs.
+fn batch_run_opens(engine: SqlEngine) -> i64 {
+    let (t, _guard) = engine.create("rivet_batch_conns", "id INT PRIMARY KEY, v INT");
+    engine.exec(&format!("INSERT INTO {t} VALUES (1, 10), (2, 20)"));
+    let rig = engine.rig(&t);
+    rig.run_ok();
+    match engine {
+        SqlEngine::Pg => {
+            let mut c = postgres::Client::connect(POSTGRES_URL, postgres::NoTls).unwrap();
+            fewest(|| {
+                let before = pg_sessions(&mut c);
+                rig.run_ok();
+                std::thread::sleep(std::time::Duration::from_millis(1100));
+                pg_sessions(&mut c) - before
+            })
+        }
+        SqlEngine::Mysql => {
+            use mysql::prelude::Queryable;
+            let mut c = mysql::Conn::new(mysql::Opts::from_url(MYSQL_URL).unwrap()).unwrap();
+            let mut connections = move || -> i64 {
+                let row: (String, String) = c
+                    .query_first("SHOW GLOBAL STATUS LIKE 'Connections'")
+                    .unwrap()
+                    .unwrap();
+                row.1.parse().unwrap()
+            };
+            fewest(|| {
+                let before = connections();
+                rig.run_ok();
+                connections() - before
+            })
+        }
+        SqlEngine::Mssql => {
+            let logins = || {
+                mssql_query_bigints(
+                    "SELECT CAST(cntr_value AS BIGINT) FROM sys.dm_os_performance_counters \
+                     WHERE counter_name = 'Logins/sec'",
+                    1,
+                )[0]
+            };
+            // Each probe logs in once itself: measure that, then subtract it.
+            let probe = {
+                let a = logins();
+                logins() - a
+            };
+            fewest(|| {
+                let before = logins();
+                rig.run_ok();
+                logins() - before - probe
+            })
+        }
+    }
+}
+
+#[test]
+#[ignore = "live+exclusive: requires postgres; counts server-wide sessions"]
+fn a_postgres_batch_run_opens_at_most_two_source_connections() {
+    if not_exclusive() {
+        return;
+    }
+    let opened = batch_run_opens(SqlEngine::Pg);
+    assert!(
+        opened <= 2,
+        "a batch run opened {opened} PostgreSQL sessions; it needs two (metadata + data)"
+    );
+}
+
+#[test]
+#[ignore = "live+exclusive: requires mysql; counts server-wide connections"]
+fn a_mysql_batch_run_opens_at_most_two_source_connections() {
+    if not_exclusive() {
+        return;
+    }
+    let opened = batch_run_opens(SqlEngine::Mysql);
+    assert!(
+        opened <= 2,
+        "a batch run opened {opened} MySQL connections; it needs two (metadata + data)"
+    );
+}
+
+#[test]
+#[ignore = "live+exclusive: requires mssql; counts server-wide logins"]
+fn a_sql_server_batch_run_opens_at_most_two_source_connections() {
+    if not_exclusive() {
+        return;
+    }
+    let opened = batch_run_opens(SqlEngine::Mssql);
+    assert!(
+        opened <= 2,
+        "a batch run opened {opened} SQL Server logins; it needs two (metadata + data)"
     );
 }

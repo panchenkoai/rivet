@@ -14,6 +14,10 @@ measured runs; the MINIMUM of each metric is compared (other activity only ever 
   harm   the engine's graded      ≤ prev × RIVET_HARM_TOL (1.25) + RIVET_HARM_SLACK (200)
          source counters
 
+`batch-conns-full` / `batch-conns-chunked` do the same for one batch run on the previous
+release's init config (ceiling 2 / 3: one metadata connection, the data read, chunked's plan
+probe).
+
 `cdc-conns` counts the connections one steady-state CDC run opens on the source, through
 a loopback proxy the harness owns (a server counter also counts the stand's healthchecks):
 at most CONN_CEILING[engine], and never more than the previous release.
@@ -598,6 +602,66 @@ def _conns(led: Ledger, prev: Path) -> None:
             led.passed(engine, "-", SCEN, "cdc-conns", f"perf[{engine}/cdc-conns]: {shown}", shown)
 
 
+# A batch run needs one metadata connection plus the data read; chunked adds its chunk-plan probe.
+BATCH_CONN_CEILING = {"full": 2, "chunked": 3}
+
+
+def _batch_conns_side(binary: Path, prev: Path, root: Path, engine: str, url: str, mode: str,
+                      tag: str) -> int | None:
+    """Connections ONE batch run of `binary` opens on the previous release's init config, counted
+    through a proxy after a warm-up run. None when a run failed."""
+    import urllib.parse
+
+    table = f"perf_bc_{engine[:2]}_{mode[:2]}_{os.getpid()}_{tag}"
+    if not _seed(engine, url, table, ROWS, with_cursor=True):
+        return None
+    u = urllib.parse.urlsplit(url)
+    proxy = _CountingProxy((u.hostname or "127.0.0.1", u.port or 0))
+    host = u.netloc.rsplit("@", 1)
+    via = urllib.parse.urlunsplit(u._replace(netloc=(host[0] + "@" if len(host) == 2 else "")
+                                             + f"127.0.0.1:{proxy.port}"))
+    try:
+        d = _init_dir(prev, root, f"bconns_{engine}_{mode}_{tag}", via, table, mode)
+        if d is None:
+            return None
+        env = {"RIVET_PERF_URL": via, "RIVET_STATE_URL": ""}
+        if run([str(binary), "run", "-c", "c.yaml"], env=env, cwd=d, timeout=None).returncode:
+            return None
+        _fresh(d)
+        before = proxy.accepted
+        if run([str(binary), "run", "-c", "c.yaml"], env=env, cwd=d, timeout=None).returncode:
+            return None
+        return proxy.accepted - before
+    finally:
+        proxy.close()
+        _sql(engine, url, f"DROP TABLE IF EXISTS {table};")
+
+
+def _batch_conns(led: Ledger, prev: Path, root: Path) -> None:
+    """Source connections per batch run, per engine and mode: ceiling, and never above prev."""
+    for engine in ("postgres", "mysql", "mssql"):
+        url = os.environ.get(f"RIVET_ORACLE_{engine.upper()}_URL", "")
+        if not url:
+            led.skipped(engine, "-", SCEN, "batch-conns", f"perf[{engine}/batch-conns]: no "
+                        f"RIVET_ORACLE_{engine.upper()}_URL", "no url")
+            continue
+        for mode, ceiling in BATCH_CONN_CEILING.items():
+            label = f"batch-conns-{mode}"
+            p = _batch_conns_side(prev, prev, root, engine, url, mode, "prev")
+            c = _batch_conns_side(rivet_bin(), prev, root, engine, url, mode, "cur")
+            if p is None or c is None:
+                led.failed(engine, "-", SCEN, label, f"perf[{engine}/{label}]: a run failed "
+                           f"(prev={p}, this={c})", "run failed")
+                continue
+            worse = [w for w in (f"{c} connections > ceiling {ceiling}" if c > ceiling else "",
+                                 f"{c} connections > {p} for the previous release" if c > p else "") if w]
+            shown = f"connections this/prev {c}/{p}, ceiling {ceiling}"
+            if worse:
+                led.failed(engine, "-", SCEN, label, f"perf[{engine}/{label}]: {'; '.join(worse)}", shown)
+            else:
+                led.passed(engine, "-", SCEN, label, f"perf[{engine}/{label}]: {shown}", shown)
+
+
 def _cdc_side(binary: Path, engine: str, url: str, path: str = "cdc") -> Sample | None:
     """Anchor, then the minimum of REPS measured drains of CDC_CHANGES changes each (warm-up first).
 
@@ -751,5 +815,6 @@ def verify_perf_regression(led: Ledger) -> None:
     _off_happy_path(led, prev, root)
     _cdc(led, prev)
     _conns(led, prev)
+    _batch_conns(led, prev, root)
     _load(led, prev, root)
     _cdc20(led, prev, root)

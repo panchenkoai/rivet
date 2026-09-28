@@ -788,7 +788,7 @@ exclude_re = [
     # peak-RSS bracket (graded live: the backfill cycle test reads
     # `export_metrics.peak_rss_mb` back).
     "replace run_cdc_export -> \\(Result<\\(\\)>, RunSummary\\)",
-    # `HarmBracket::close` / `close_on` (pipeline/job.rs) read a
+    # `HarmBracket::close_on_meta` / `close_on` (pipeline/job.rs) read a
     # LIVE source's counters before and after a run window, so no offline test can
     # reach them; the pure halves (harm_deltas, pg_temp_bytes_delta,
     # pg_temp_bytes_warning, run_diagnosis) are unit-graded next door. Live oracle:
@@ -796,7 +796,7 @@ exclude_re = [
     # mysql_cdc_run_persists_source_harm_and_server_context_even_when_it_fails
     # ("got []", RED-proven 2026-09-26) and the three *_run_persists_source_harm_rows
     # batch tests, which read export_harm back.
-    "replace HarmBracket::close -> Vec<\\(String, i64\\)>",
+    "replace HarmBracket::close_on_meta -> Vec<\\(String, i64\\)>",
     "replace HarmBracket::close_on -> Vec<\\(String, i64\\)>",
     # `same_leaf_typed_pair` (config/cdc.rs) walks `pairs.iter().skip(i + 1)`
     # inside `enumerate()`; `skip(i * 1)` = `skip(i)` adds the (i, i) pair to

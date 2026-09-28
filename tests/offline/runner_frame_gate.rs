@@ -298,8 +298,8 @@ fn every_run_harm_bracket_close_is_preceded_by_its_window_stamp() {
 fn both_job_entry_points_bracket_the_source_harm_window() {
     assert_both_job_entry_points_do(
         &[
-            ("opens the harm bracket", "HarmBracket::open(&plan.source)"),
-            ("closes it and records the delta", "harm.close("),
+            ("opens the harm bracket", "HarmBracket::open_on(meta.get())"),
+            ("closes it and records the delta", "harm.close_on_meta("),
             ("emits the DIAGNOSIS", "run_diagnosis("),
         ],
         "a job entry point skips the source-harm bracket, so runs through it record \
