@@ -14,7 +14,7 @@ The matrix is derived from the workflows in [.github/workflows/](https://github.
 | **Nightly** | full live suite incl. content_load against ~60k-row fixture; pgBouncer profile; MongoDB version matrix (4.4 → 8.0, batch + CDC) | 03:30 UTC cron + manual dispatch | up to 60 min |
 | **Manual** | 1M-row stress, full legacy DB matrix (PG 12–15, MySQL 5.7), wide-table memory benchmarks | operator-invoked from `dev/` scripts | varies |
 
-PR CI defines branch protection — the named gates (`fmt`, `clippy`, `test`, `test-invariants`, `test-recovery`, `test-compatibility`, `test-stability`) block merges on regression.
+PR CI defines branch protection — the named gates (`fmt`, `clippy`, `test` — whose invariant / recovery / compatibility / type-contract / stability / generated-docs steps each fail under their own name — and `e2e`, whose type-golden / type-validator / differential / PR-matrix steps do the same on one set of containers) block merges on regression.
 
 ---
 
@@ -112,7 +112,7 @@ Per-backend commit contracts: [ADR-0004](adr/0004-destination-write-contracts.md
 | Per-type golden round-trip (PG + MySQL) | ✅ gate | ✅ | — | `live_type_golden` — runs in dedicated `test-type-golden` job with live DBs |
 | Per-type round-trip via oracle (SQL Server) | ✅ gate | ✅ | — | `type_roundtrip::{duckdb,clickhouse}_validates_mssql_type_matrix_parquet` — `test-type-validators` job (DuckDB + ClickHouse readers) |
 | Parquet round-trip | ✅ | ✅ | — | `live_parquet_roundtrip`, `format_golden`, `format_fuzz` |
-| Format writer (CSV + Parquet, row-group golden) | ✅ gate | ✅ | — | `format_golden`, `test-stability` job |
+| Format writer (CSV + Parquet, row-group golden) | ✅ gate | ✅ | — | `format_golden`, the `Tests` job's stability step |
 | Type policy + ExportTarget compat (BigQuery) | ✅ | ✅ | — | covered in `live_cli_flags --type-report` |
 
 ---
@@ -151,7 +151,7 @@ runs the right set per gate.
 | [`legacy`](https://github.com/panchenkoai/rivet/tree/main/dev/legacy) | Compatibility | Full e2e (83 assertions) per DB version | **Manual** | operator-invoked |
 
 Branch-protection guarantees: the **PR** row must stay green to merge — the
-job is named `cli-matrix` in [.github/workflows/ci.yml](https://github.com/panchenkoai/rivet/blob/main/.github/workflows/ci.yml).
+runs as a step of the `e2e` job in [.github/workflows/ci.yml](https://github.com/panchenkoai/rivet/blob/main/.github/workflows/ci.yml).
 **Nightly** matrices run from [.github/workflows/nightly-live.yml](https://github.com/panchenkoai/rivet/blob/main/.github/workflows/nightly-live.yml);
 a red nightly emails the on-call. **Release** matrices run as part of the
 release checklist; the artifact is the matrix log in
@@ -167,7 +167,7 @@ release checklist; the artifact is the matrix log in
 | `rivet doctor` preflight | ✅ | ✅ | — | covered in `live_cli_flags` |
 | Run-summary JSON contract | ✅ | ✅ | — | `run_summary_contract` |
 | MCP server contract | ✅ | — | — | `mcp_contract` |
-| Quality gates (row-count, null-ratio, uniqueness) | ✅ | ✅ | — | `quality_live`, `test-stability` |
+| Quality gates (row-count, null-ratio, uniqueness) | ✅ | ✅ | — | `quality_live`, the `Tests` job's stability step |
 | Resource sampler (RSS) | ✅ | ✅ | — | `resource_smoke` |
 | Batch memory policy (`auto_shrink` / `warn` / `fail`) | ✅ | ✅ | — | `batch_memory_policy` |
 

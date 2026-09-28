@@ -132,25 +132,6 @@ jobs:
           done
           [ "$FAIL" = "0" ]
 
-  # docs-as-code gate: docs/reference/{config,cli}-reference.md are GENERATED from
-  # the binary (schemars Config + clap Cli), so the reference cannot drift from the
-  # code. If a struct field / flag / enum changes, the committed reference must be
-  # regenerated. Mirrors the schema_drift test's role for rivet.schema.json — the
-  # whole point is to retire manual doc-vs-code verification (the 0.18 docs pass).
-  docs-generated:
-    name: Generated docs are in sync (docs-as-code)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.94"
-      - uses: Swatinem/rust-cache@v2
-      - name: Reference docs are regenerated from code (clap + schema)
-        run: |
-          cargo build --bin rivet
-          python3 -m dev.pytools.docgen --check
-
   boundary:
     name: OSS must not depend on rivet-pro (one-way seam, ADR-0026)
     runs-on: ubuntu-latest
@@ -1334,39 +1315,36 @@ jobs:
           haskell: true
           swap-storage: false
       - run: cargo test --all-targets
-
-  test-invariants:
-    name: Invariant tests (semantic gate)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.94"
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --test invariants --test journal_invariants
-
-  test-recovery:
-    name: Recovery tests (semantic gate)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.94"
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --test recovery
-
-  test-compatibility:
-    name: Compatibility matrix tests (semantic gate)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.94"
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --lib -- plan::validate::tests
+      # The semantic gates below were five jobs that each recompiled the crate to
+      # re-run tests `--all-targets` had just run. They are steps now: the binaries
+      # are built, so each is seconds, and each still fails under its own name.
+      # `!cancelled()` runs every one of them even after an earlier one fails, so a
+      # red run names every broken gate, not just the first.
+      - name: Invariant tests (semantic gate)
+        if: ${{ !cancelled() }}
+        run: cargo test --test invariants --test journal_invariants
+      - name: Recovery tests (semantic gate)
+        if: ${{ !cancelled() }}
+        run: cargo test --test recovery
+      - name: Compatibility matrix tests (semantic gate)
+        if: ${{ !cancelled() }}
+        run: cargo test --lib -- plan::validate::tests
+      - name: Type mapping contracts (semantic gate)
+        if: ${{ !cancelled() }}
+        run: cargo test --test type_roundtrip contract_
+      - name: Stability tests — format & row-group goldens (semantic gate)
+        if: ${{ !cancelled() }}
+        run: cargo test --test format_golden
+      - name: Stability tests — sink unit tests (semantic gate)
+        if: ${{ !cancelled() }}
+        run: cargo test --lib -- pipeline::sink::tests
+      # docs-as-code: docs/reference/{config,cli}-reference.md are GENERATED from the
+      # binary (schemars Config + clap Cli); the committed reference must be current.
+      - name: Generated docs are in sync (docs-as-code)
+        if: ${{ !cancelled() }}
+        run: |
+          cargo build --bin rivet
+          python3 -m dev.pytools.docgen --check
 
   # release-compat REMOVED from PR CI (2026-08-04).
   #
@@ -1385,128 +1363,6 @@ jobs:
   #
   # nightly-live.yml::release-compat-artifacts is untouched — it covers the
   # `artifacts` axis, which needs a live postgres.
-
-  test-types:
-    name: Type mapping contracts (semantic gate)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.94"
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --test type_roundtrip contract_
-
-  test-stability:
-    name: Stability tests — Phase 1 (semantic gate)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.94"
-      - uses: Swatinem/rust-cache@v2
-      - name: Format & row-group golden tests
-        run: cargo test --test format_golden
-      - name: Sink unit tests (quality cap, auto_shrink)
-        run: cargo test --lib -- pipeline::sink::tests
-      - name: Plan validate unit tests
-        run: cargo test --lib -- plan::validate::tests
-
-  test-type-golden:
-    name: Type-golden tests (semantic gate)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.94"
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Start databases
-        run: docker compose up -d postgres mysql
-
-      - name: Wait for databases
-        run: |
-          echo "Waiting for Postgres..."
-          for i in $(seq 1 30); do docker compose exec -T postgres pg_isready -U rivet && break || sleep 2; done
-          echo "Waiting for MySQL..."
-          for i in $(seq 1 30); do docker compose exec -T mysql mysqladmin ping -h localhost -uroot -privet 2>/dev/null && break || sleep 2; done
-
-      - name: Run type-golden tests
-        run: cargo test --test live_type_golden -- --ignored
-
-      - name: Stop services
-        if: always()
-        run: docker compose down
-
-  test-type-validators:
-    name: Type round-trip validators — DuckDB · ClickHouse · pyarrow (semantic gate)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.94"
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Pre-create shared bind-mount dir (runner-owned)
-        # The duckdb/clickhouse services mount ./tests/.live-tmp:/work. On Linux
-        # the docker daemon creates a missing bind-mount source as root:root,
-        # which then blocks the test process (runner user) from creating
-        # per-test workdirs under it (`create_dir_all` → EACCES). Pre-creating
-        # it makes the mount source runner-owned; the root containers only read
-        # the Parquet the test writes there.
-        run: mkdir -p tests/.live-tmp
-
-      - name: Start source + oracle containers
-        # postgres/mysql/mssql are the sources; duckdb + clickhouse are
-        # independent Parquet *readers* (ADR-0014 oracles) that read back what
-        # rivet wrote and assert field-by-field type fidelity. The duckdb image
-        # pip-installs duckdb/pytz/pyarrow on boot, so `--wait` blocks on its
-        # healthcheck (start_period 30s) before tests run. The reader containers
-        # share the ./tests/.live-tmp:/work bind mount they glob over.
-        run: docker compose up -d --wait postgres mysql duckdb clickhouse mssql
-
-      - name: Seed MSSQL database
-        # The SQL Server image has no /docker-entrypoint-initdb.d hook, so create
-        # the `rivet` database via dev/mssql/init.sql once the container is
-        # healthy (`--wait` blocked on its SELECT-1 healthcheck). The
-        # type-roundtrip validators create their per-test matrix tables inside it.
-        run: |
-          docker compose cp dev/mssql/init.sql mssql:/tmp/init.sql
-          docker compose exec -T mssql /opt/mssql-tools18/bin/sqlcmd \
-            -S localhost -U sa -P 'Rivet_Passw0rd!' -C -i /tmp/init.sql
-
-      - name: Reopen shared mount after ClickHouse chowns it
-        # ClickHouse chowns its user_files_path (/work = ./tests/.live-tmp) to
-        # the clickhouse uid (101) on startup. On Linux that propagates to the
-        # host and re-locks the dir the runner just created, so `create_dir_all`
-        # still fails with EACCES. Re-open it after the stack is up; the test
-        # writes per-run workdirs (world-readable), the reader containers read
-        # them back.
-        run: sudo chmod -R 0777 tests/.live-tmp
-
-      - name: Run type round-trip validators
-        # Force the `#[ignore]`d live validators to run. `--skip bigquery`
-        # drops the two cloud-warehouse tests — they need a real GCP project +
-        # `bq` CLI that CI has no credentials for (covered by the manual
-        # `make test-types-bigquery` target instead).
-        run: cargo test --test type_roundtrip -- --include-ignored --skip bigquery
-
-      - name: Differential correctness at scale (DuckDB vs source)
-        # tests/live_differential.rs — an INDEPENDENT reader (DuckDB) fingerprints
-        # the exported Parquet and must agree with the source field-for-field
-        # (count, integer sums, distinct id/text). Two cases: a clean chunked
-        # export, and a crash + resume (raw count proves the at-least-once
-        # surplus; `SELECT DISTINCT *` collapses to the exactly-once set == source).
-        # Lives here, not the e2e job: needs the `duckdb` reader + the
-        # ./tests/.live-tmp:/work shared mount this job already provisions.
-        run: cargo test --test live_differential -- --ignored
-
-      - name: Stop services
-        if: always()
-        run: docker compose down
 
   build-release:
     name: Release build
@@ -1549,21 +1405,11 @@ jobs:
       - name: Disk snapshot — pre-build
         run: df -h /
 
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.94"
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Independent row-hash oracle deps
-        # `xxhash` is what makes the row-hash check INDEPENDENT: it rebuilds the
-        # canonical image from the spec in src/enrich.rs and hashes it with a
-        # different library, so rivet is never compared against itself. Without
-        # the package the test REFUSES rather than falling back — which is the
-        # contract, and which turned this job red until the package was
-        # installed here (measured: 699 passed, 1 failed, three runs running).
-        run: python3 -m pip install --break-system-packages xxhash
-
-      - name: Start services
+      - name: Start services (in the background, while the build runs)
+        # `up -d` pulls ~20 images and starts them; that used to happen, and then be
+        # waited on, BEFORE the build. It runs in the background now and overlaps the
+        # compile; "Services are up" below joins it and fails the job on its exit code.
+        #
         # Include `toxiproxy` so the retry / chaos / crash-recovery live-test
         # binaries have the proxy admin API available on :8474.
         # `--profile pool` brings up pgBouncer (transaction mode, pool_size=1)
@@ -1582,8 +1428,36 @@ jobs:
           # quiet-window lock. On the shared instance the two canaries failed in
           # OPPOSITE directions and both blamed the product for the schedule; they were
           # the dominant E2E flake through 2026-08-16/17.
-          docker compose --profile pool --profile cdc --profile replica --profile governor up -d postgres mysql mssql mssql-governor minio fake-gcs azurite toxiproxy pgbouncer proxysql postgres-cdc mysql-cdc mssql-cdc mysql-primary mysql-replica mysql-replica-nolog duckdb clickhouse oracle
-          # …then re-open it after ClickHouse chowns /work to uid 101 on boot,
+          ( docker compose --profile pool --profile cdc --profile replica --profile governor up -d postgres mysql mssql mssql-governor minio fake-gcs azurite toxiproxy pgbouncer proxysql postgres-cdc mysql-cdc mssql-cdc mysql-primary mysql-replica mysql-replica-nolog duckdb clickhouse oracle > "$RUNNER_TEMP/compose.log" 2>&1; echo $? > "$RUNNER_TEMP/compose.rc" ) &
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Independent row-hash oracle deps
+        # `xxhash` is what makes the row-hash check INDEPENDENT: it rebuilds the
+        # canonical image from the spec in src/enrich.rs and hashes it with a
+        # different library, so rivet is never compared against itself. Without
+        # the package the test REFUSES rather than falling back — which is the
+        # contract, and which turned this job red until the package was
+        # installed here (measured: 699 passed, 1 failed, three runs running).
+        run: python3 -m pip install --break-system-packages xxhash
+
+      - name: Build rivet and every test binary (debug)
+        # ONE compile for every suite below, overlapping the service start-up.
+        # Debug, not --release: these suites grade CORRECTNESS on small fixtures, so
+        # the fat-LTO release build buys nothing here; `build-release` keeps it.
+        run: |
+          cargo build
+          cargo test --no-run
+
+      - name: Services are up
+        run: |
+          while [ ! -f "$RUNNER_TEMP/compose.rc" ]; do sleep 2; done
+          cat "$RUNNER_TEMP/compose.log"
+          [ "$(cat "$RUNNER_TEMP/compose.rc")" = 0 ]
+          # Re-open the shared mount after ClickHouse chowns /work to uid 101 on boot,
           # which propagates to the host on Linux and EACCESes the test writer.
           sudo chmod -R 0777 tests/.live-tmp
 
@@ -1626,13 +1500,6 @@ jobs:
           # healthcheck script reports ready only once the PDB accepts logins.
           for i in $(seq 1 90); do docker compose exec -T oracle healthcheck.sh >/dev/null 2>&1 && break || sleep 2; done
 
-      - name: Build rivet (debug)
-        # Debug, not --release: the e2e suite exercises CORRECTNESS, not
-        # throughput, on small seeded fixtures, so the fat-LTO release build
-        # (codegen-units=1 → ~22 min link) buys nothing here. Debug builds in
-        # ~2-3 min. The shipping artifact is still validated by the dedicated
-        # `build-release` job, which keeps the full release profile.
-        run: cargo build
 
       - name: Seed databases
         run: |
@@ -1669,7 +1536,54 @@ jobs:
             -S localhost -U sa -P 'Rivet_Passw0rd!' -C \
             -Q "IF DB_ID('rivet') IS NULL CREATE DATABASE rivet;"
 
+      # The suites below were jobs of their own, each compiling the crate again on a
+      # runner that started a subset of these same services.
+      - name: Type-golden tests (semantic gate)
+        if: ${{ !cancelled() }}
+        run: cargo test --test live_type_golden -- --ignored
+
+      - name: Type round-trip validators — DuckDB · ClickHouse · pyarrow (semantic gate)
+        # `--skip bigquery`: the cloud-warehouse cells need GCP credentials CI has
+        # not got (the manual `make test-types-bigquery` target covers them).
+        if: ${{ !cancelled() }}
+        run: cargo test --test type_roundtrip -- --include-ignored --skip bigquery
+
+      - name: Differential correctness at scale (DuckDB vs source)
+        # tests/live_differential.rs — an INDEPENDENT reader (DuckDB) must agree with
+        # the source field for field, on a clean chunked export and a crash + resume.
+        if: ${{ !cancelled() }}
+        run: cargo test --test live_differential -- --ignored
+
+      - name: Create matrix navigation links
+        if: ${{ !cancelled() }}
+        env:
+          RIVET_BIN: ${{ github.workspace }}/target/debug/rivet
+        run: python3 -m dev.pytools.matrix_common setup-links
+
+      - name: PR regression matrices (cli + cfg + path)
+        if: ${{ !cancelled() }}
+        env:
+          RIVET_BIN: ${{ github.workspace }}/target/debug/rivet
+        # `shell: bash` + pipefail: Actions' default `bash -e` has no pipefail, so
+        # `matrices … | tee run.log` would exit with tee's status and never fail.
+        shell: bash
+        run: |
+          set -o pipefail
+          python3 -m dev.pytools.matrices --tier=pr --skip-compose | tee dev/matrices/run.log
+
+      - name: Upload matrix logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: matrices-pr-logs
+          path: |
+            dev/cli_matrix/logs/
+            dev/cfg_matrix/logs/
+            dev/path_matrix/logs/
+          retention-days: 14
+
       - name: Run E2E test suite
+        if: ${{ !cancelled() }}
         env:
           MINIO_ACCESS_KEY: minioadmin
           MINIO_SECRET_KEY: minioadmin
@@ -1683,6 +1597,7 @@ jobs:
         run: df -h /
 
       - name: Run live cargo integration tests
+        if: ${{ !cancelled() }}
         # Activates every `tests/live_*.rs` binary that is `#[ignore]`d by
         # default (Phase A–G of the QA backlog).  Cross-process synchronisation
         # on the shared Toxiproxy admin API is enforced by an flock-based
@@ -1734,66 +1649,6 @@ jobs:
           --skip mssql_checkpoint_from_another_database --skip from_a_standby
           --skip loads_into_bigquery_or_refuses_by_column
           --skip cleanup_source_never_deletes_parts --skip compact_after_a_source_alter
-
-      - name: Stop services
-        if: always()
-        run: docker compose down
-
-  cli-matrix:
-    name: PR regression matrices (cli + cfg + path)
-    runs-on: ubuntu-latest
-    # Shell-based regression guards under dev/matrices/. Catches UX and
-    # config-surface regressions that unit tests miss. See dev/matrices/README.md.
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.94"
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Start databases
-        run: docker compose up -d postgres mysql
-
-      - name: Wait for databases
-        run: |
-          echo "Waiting for Postgres..."
-          for i in $(seq 1 30); do docker compose exec -T postgres pg_isready -U rivet && break || sleep 2; done
-          echo "Waiting for MySQL..."
-          for i in $(seq 1 30); do docker compose exec -T mysql mysqladmin ping -h localhost -uroot -privet 2>/dev/null && break || sleep 2; done
-
-      - name: Build rivet (debug)
-        # Debug, not --release: the matrices probe CLI / config / path SURFACE
-        # behavior, not throughput, so the fat-LTO release build buys nothing.
-        # The staging step honours $RIVET_BIN, so point it at the debug binary.
-        run: cargo build --bin rivet
-
-      - name: Create matrix navigation links
-        env:
-          RIVET_BIN: ${{ github.workspace }}/target/debug/rivet
-        run: python3 -m dev.pytools.matrix_common setup-links
-
-      - name: Run PR matrix tier
-        env:
-          RIVET_BIN: ${{ github.workspace }}/target/debug/rivet
-        # `shell: bash` + pipefail, because Actions' default is `bash -e` WITHOUT
-        # pipefail: `matrices … | tee run.log` exited with tee's status, so this
-        # gate could not fail no matter what the matrices reported. Inherited from
-        # the bash line this replaced — same shape, same silence.
-        shell: bash
-        run: |
-          set -o pipefail
-          python3 -m dev.pytools.matrices --tier=pr --skip-compose | tee dev/matrices/run.log
-
-      - name: Upload artifacts on failure
-        if: failure()
-        uses: actions/upload-artifact@v7
-        with:
-          name: matrices-pr-logs
-          path: |
-            dev/cli_matrix/logs/
-            dev/cfg_matrix/logs/
-            dev/path_matrix/logs/
-          retention-days: 14
 
       - name: Stop services
         if: always()
