@@ -529,35 +529,34 @@ fn url_host_port(url: &str) -> (String, String) {
 }
 
 pub fn create_source(config: &SourceConfig) -> Result<Box<dyn Source>> {
-    use crate::config::SourceType;
     let url = config.resolve_url()?;
     warn_if_tls_disabled(config);
-    match config.source_type {
-        SourceType::Postgres => Ok(Box::new(postgres::PostgresSource::connect_with_tls(
-            &url,
-            config.tls.as_ref(),
-        )?)),
-        SourceType::Mysql => Ok(Box::new(mysql::MysqlSource::connect_with_tls(
-            &url,
-            config.tls.as_ref(),
-        )?)),
-        SourceType::Mssql => Ok(Box::new(mssql::MssqlSource::connect_with_tls(
-            &url,
-            config.tls.as_ref(),
-        )?)),
+    connect(
+        config.source_type,
+        &url,
+        config.tls.as_ref(),
+        config.mongo.as_ref(),
+    )
+}
+
+/// Connect to a `source_type` source at a resolved `url` — the one engine switch every connection goes through.
+pub fn connect(
+    source_type: crate::config::SourceType,
+    url: &str,
+    tls: Option<&crate::config::TlsConfig>,
+    mongo: Option<&crate::config::MongoConfig>,
+) -> Result<Box<dyn Source>> {
+    use crate::config::SourceType;
+    Ok(match source_type {
+        SourceType::Postgres => Box::new(postgres::PostgresSource::connect_with_tls(url, tls)?),
+        SourceType::Mysql => Box::new(mysql::MysqlSource::connect_with_tls(url, tls)?),
+        SourceType::Mssql => Box::new(mssql::MssqlSource::connect_with_tls(url, tls)?),
         #[cfg(feature = "oracle")]
-        SourceType::Oracle => Ok(Box::new(oracle::OracleSource::connect_with_tls(
-            &url,
-            config.tls.as_ref(),
-        )?)),
+        SourceType::Oracle => Box::new(oracle::OracleSource::connect_with_tls(url, tls)?),
         #[cfg(not(feature = "oracle"))]
-        SourceType::Oracle => Err(crate::source::oracle_feature_missing()),
-        SourceType::Mongo => Ok(Box::new(mongo::MongoSource::connect(
-            &url,
-            config.tls.as_ref(),
-            config.mongo.as_ref(),
-        )?)),
-    }
+        SourceType::Oracle => return Err(crate::source::oracle_feature_missing()),
+        SourceType::Mongo => Box::new(mongo::MongoSource::connect(url, tls, mongo)?),
+    })
 }
 
 /// Pre-allocation per-value size guard, shared by every engine's

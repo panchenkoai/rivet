@@ -1444,28 +1444,17 @@ enum ResolverSource<'s> {
 
 impl CdcSchemaResolver<'static> {
     pub(crate) fn connect(url: &str, tls: Option<&crate::config::TlsConfig>) -> Result<Self> {
-        let src: Box<dyn crate::source::Source> = match CdcEngine::from_url(url)? {
-            CdcEngine::Mysql => Box::new(crate::source::mysql::MysqlSource::connect_with_tls(
-                url, tls,
-            )?),
-            CdcEngine::Postgres => Box::new(
-                crate::source::postgres::PostgresSource::connect_with_tls(url, tls)?,
-            ),
-            CdcEngine::Mssql => Box::new(crate::source::mssql::MssqlSource::connect_with_tls(
-                url, tls,
-            )?),
+        use crate::config::SourceType;
+        let source_type = match CdcEngine::from_url(url)? {
+            CdcEngine::Mysql => SourceType::Mysql,
+            CdcEngine::Postgres => SourceType::Postgres,
+            CdcEngine::Mssql => SourceType::Mssql,
             // The JSON-blob model has a fixed 2-column schema (`_id`, `document`),
             // resolved by `MongoSource::type_mappings` — same as the batch path.
-            CdcEngine::Mongo => {
-                Box::new(crate::source::mongo::MongoSource::connect(url, tls, None)?)
-            }
-            #[cfg(feature = "oracle")]
-            CdcEngine::Oracle => Box::new(crate::source::oracle::OracleSource::connect_with_tls(
-                url, tls,
-            )?),
-            #[cfg(not(feature = "oracle"))]
-            CdcEngine::Oracle => return Err(crate::source::oracle_feature_missing()),
+            CdcEngine::Mongo => SourceType::Mongo,
+            CdcEngine::Oracle => SourceType::Oracle,
         };
+        let src = crate::source::connect(source_type, url, tls, None)?;
         Ok(Self {
             src: ResolverSource::Own(src),
         })
