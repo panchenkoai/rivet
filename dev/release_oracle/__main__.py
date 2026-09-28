@@ -318,9 +318,13 @@ def _self_test() -> int:
     # entry nothing matched in a full run is reported as fixed.
     import datetime as _dt
     from . import known_red as kr
+    # A synthetic registry, so the check does not depend on how many real reds are open.
+    real_reds = kr.KNOWN_RED
+    kr.KNOWN_RED = (kr.KnownRed("probe-red-a", "self-test", "2099-01-01"),
+                    kr.KnownRed("probe-red-b", "self-test", "2099-01-01"))
     k = kr.KNOWN_RED[0]
     assert kr.match(f"x {k.match} y", _dt.date(2026, 1, 1)) == (k, True)
-    assert kr.match(f"x {k.match} y", _dt.date(2099, 1, 1)) == (k, False)
+    assert kr.match(f"x {k.match} y", _dt.date(2099, 1, 2)) == (k, False)
     assert kr.match("an unrelated failure", _dt.date(2026, 1, 1)) == (None, False)
     probe = Ledger(colour=False)
     probe.failed("-", "-", "s", "-", f"boom {k.match}")
@@ -342,6 +346,7 @@ def _self_test() -> int:
     said = [c.detail for c in shown.cells if c.scenario == "known_red"]
     assert any(other.match in d and "PASSED" in d for d in said), said
     assert any(k.match in d and "no cell" in d for d in said), said
+    kr.KNOWN_RED = real_reds
     from .core import SKIP_ALLOWED
     from .live_modules import exclusive_tests
     live_src = "\n".join(f.read_text() for f in (ROOT / "tests" / "live").glob("*.rs"))
