@@ -45,6 +45,7 @@ import tempfile
 from pathlib import Path
 
 from .core import Ledger, Proc, isolate_state_db, rivet_bin, run
+from .engines import sql as _sql
 from .regression import _require_prev_binary
 
 __all__ = ["verify_upgrade_continuity"]
@@ -53,17 +54,6 @@ SCEN = "upgrade_continuity"
 ROWS = 5000
 CRASH_ROWS = 250_000
 ENGINES = ("postgres", "mysql", "mssql")
-
-
-def _sql(engine: str, url: str, sql: str) -> Proc:
-    """Run `sql` on the stand engine behind `url`."""
-    from .cdc import _mysql, _psql, _sqlcmd
-
-    if engine == "postgres":
-        return _psql(url, sql=sql)
-    if engine == "mysql":
-        return _mysql(url, sql)
-    return _sqlcmd(url, q=sql)
 
 
 def _seed(engine: str, url: str, table: str, rows: int, with_cursor: bool) -> bool:
@@ -106,24 +96,23 @@ def _mutate(engine: str, url: str, table: str) -> bool:
 
 
 def _declared(out: Path, select: str) -> list[tuple]:
-    """`select` over the parts every run-unique manifest under `out` declares (`{parts}` is the relation)."""
+    """`select` over the parts the manifests under `out` declare (`{parts}` is the relation):
+    success manifests, committed parts only — the loader's rule, one definition."""
     import duckdb
 
-    parts: list[str] = []
-    for m in glob.glob(str(out / "**" / "manifest-*.json"), recursive=True):
-        doc = json.loads(Path(m).read_text())
-        parts += [str(Path(m).parent / Path(p["path"]).name) for p in doc.get("parts", [])]
+    from .scenarios import _manifest_declared_parts
+
+    parts = _manifest_declared_parts(out)
     if not parts:
         return []
     return duckdb.connect().execute(select.format(parts=f"read_parquet({parts})")).fetchall()
 
 
 def _declared_names(out: Path) -> set[str]:
-    """The part file names every run-unique manifest under `out` declares."""
-    names: set[str] = set()
-    for m in glob.glob(str(out / "**" / "manifest-*.json"), recursive=True):
-        names |= {Path(p["path"]).name for p in json.loads(Path(m).read_text()).get("parts", [])}
-    return names
+    """The part file names the manifests under `out` declare, by the same rule as `_declared`."""
+    from .scenarios import _manifest_declared_parts
+
+    return {Path(p).name for p in _manifest_declared_parts(out)}
 
 
 def _strategy(p: Proc) -> list[str]:
@@ -263,24 +252,16 @@ def _cdc_leg(led: Ledger, prev: Path, engine: str, url: str) -> None:
     """The previous release anchors a CDC stream and captures a batch; this binary continues its checkpoint."""
     import duckdb
 
-    from .cdc import _ENGINES, _workdir
+    from .cdc import cdc_probe
     from .perf import CDC_CHANGES, _cdc_changes
 
-    eng = _ENGINES[engine]
-    work = _workdir()
-    block = eng.setup(url, work)
-    if block is None:
-        led.failed(engine, "-", SCEN, "local", f"upgrade[{engine}/cdc]: the CDC source setup failed", "setup")
-        return
-    tls = "\n  tls: { accept_invalid_certs: true }" if engine == "mssql" else ""
-    (work / "c.yaml").write_text(
-        f"source:\n  type: {engine}\n  url: \"{url}\"{tls}\nexports:\n  - name: orc_cdc_probe\n"
-        f"    table: orc_cdc_probe\n    mode: cdc\n    format: parquet\n    {block}\n"
-        "    destination:\n      type: local\n      path: ./output/\n"
-    )
-    env = {"RIVET_STATE_URL": ""}
-    out = work / "output"
-    try:
+    with cdc_probe(engine, url) as probe:
+        if probe is None:
+            led.failed(engine, "-", SCEN, "local", f"upgrade[{engine}/cdc]: the CDC source setup failed", "setup")
+            return
+        eng, work, _ = probe
+        env = {"RIVET_STATE_URL": ""}
+        out = work / "output"
         anchored = run([str(prev), "run", "-c", "c.yaml"], env=env, cwd=work, timeout=None)
         _cdc_changes(engine, url, 1)
         first = run([str(prev), "run", "-c", "c.yaml"], env=env, cwd=work, timeout=None)
@@ -305,8 +286,6 @@ def _cdc_leg(led: Ledger, prev: Path, engine: str, url: str) -> None:
             led.failed(engine, "-", SCEN, "local", f"upgrade[{engine}/cdc]: prev anchor ok={anchored.ok} "
                        f"prev capture ok={first.ok} this ok={cont.ok}; {shown}: "
                        f"{(cont.stderr or first.stderr or anchored.stderr).strip()[-200:]}", "cdc")
-    finally:
-        eng.cleanup(url, work)
 
 
 def _load_leg(led: Ledger, prev: Path, root: Path, url: str) -> None:

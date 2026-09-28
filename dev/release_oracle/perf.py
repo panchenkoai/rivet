@@ -54,7 +54,8 @@ from .regression import (
     _require_prev_binary,
     _tolerance,
 )
-from .upgrade import _declared, _seed, _sql
+from .engines import rows, sql as _sql
+from .upgrade import _declared, _seed
 
 __all__ = ["verify_perf_regression"]
 
@@ -520,44 +521,21 @@ def conns_verdict(engine: str, prev: int, cur: int) -> list[str]:
     return worse
 
 
-def _source_rows(engine: str, url: str) -> int | None:
-    """orc_cdc_probe's row count, read from the source by the harness."""
-    from .cdc import _mongosh, _mysql, _psql, _sqlcmd
-
-    if engine == "postgres":
-        p = _psql(url, "-Atc", "SELECT count(*) FROM orc_cdc_probe")
-    elif engine == "mysql":
-        p = _mysql(url, "SELECT COUNT(*) FROM orc_cdc_probe;")
-    elif engine == "mssql":
-        p = _sqlcmd(url, q="SET NOCOUNT ON; SELECT COUNT(*) FROM dbo.orc_cdc_probe")
-    else:
-        p = _mongosh(url, "db.orc_cdc_probe.countDocuments({})")
-    nums = re.findall(r"\d+", p.stdout or "") if p.ok else []
-    return int(nums[-1]) if nums else None
-
-
 def _snapshot_side(binary: Path, engine: str, url: str) -> Sample | None:
     """A first run with `initial: snapshot` over CDC_CHANGES pre-existing changes: the
     minimum of REPS timed runs, each on a fresh stream, after a warm-up. None when a run
     failed or the snapshot came back short of the source's own count."""
-    from .cdc import _ENGINES, _workdir
+    from .cdc import cdc_probe
 
-    eng = _ENGINES[engine]
     samples = []
     for i in range(REPS + 1):
-        work = _workdir()
-        block = eng.setup(url, work)
-        if block is None or "until_current: true" not in block:
-            return None
-        try:
+        with cdc_probe(engine, url, edit_block=lambda b: b.replace(
+                "until_current: true", "until_current: true, initial: snapshot")) as probe:
+            if probe is None or "initial: snapshot" not in probe[2]:
+                return None
+            eng, work, _ = probe
             _cdc_changes(engine, url, 1)
-            want = _source_rows(engine, url)
-            tls = "\n  tls: { accept_invalid_certs: true }" if engine == "mssql" else ""
-            blk = block.replace("until_current: true", "until_current: true, initial: snapshot")
-            (work / "c.yaml").write_text(
-                f"source:\n  type: {engine}\n  url: \"{url}\"{tls}\nexports:\n  - name: orc_cdc_probe\n"
-                f"    table: orc_cdc_probe\n    mode: cdc\n    format: parquet\n    {blk}\n"
-                "    destination:\n      type: local\n      path: ./output/\n")
+            want = rows(engine, url, "orc_cdc_probe")
             s = _timed(binary, work, {"RIVET_STATE_URL": ""}, "run", "-c", "c.yaml",
                        probe=url if engine == "postgres" else "")
             got = _declared(work / "output", f"SELECT count(DISTINCT {eng.id_col}) FROM {{parts}}")
@@ -565,8 +543,6 @@ def _snapshot_side(binary: Path, engine: str, url: str) -> Sample | None:
                 return None
             if i:
                 samples.append(s)
-        finally:
-            eng.cleanup(url, work)
     return _best(samples)
 
 
@@ -575,38 +551,30 @@ def _conns_side(binary: Path, engine: str, url: str) -> int | None:
     counted run through a proxy. None when a run failed or captured nothing."""
     import urllib.parse
 
-    from .cdc import _ENGINES, _workdir
+    from .cdc import cdc_probe
 
-    eng = _ENGINES[engine]
-    work = _workdir()
-    block = eng.setup(url, work)
-    if block is None:
-        return None
     u = urllib.parse.urlsplit(url)
     proxy = _CountingProxy((u.hostname or "127.0.0.1", u.port or 0))
     host = u.netloc.rsplit("@", 1)
     via = urllib.parse.urlunsplit(u._replace(netloc=(host[0] + "@" if len(host) == 2 else "")
                                              + f"127.0.0.1:{proxy.port}"))
-    tls = "\n  tls: { accept_invalid_certs: true }" if engine == "mssql" else ""
-    (work / "c.yaml").write_text(
-        f"source:\n  type: {engine}\n  url: \"{via}\"{tls}\nexports:\n  - name: orc_cdc_probe\n"
-        f"    table: orc_cdc_probe\n    mode: cdc\n    format: parquet\n    {block}\n"
-        "    destination:\n      type: local\n      path: ./output/\n"
-    )
     env = {"RIVET_STATE_URL": ""}
     try:
-        if run([str(binary), "run", "-c", "c.yaml"], env=env, cwd=work, timeout=None).returncode:
-            return None
-        _cdc_changes(engine, url, 1)
-        before = proxy.accepted
-        if run([str(binary), "run", "-c", "c.yaml"], env=env, cwd=work, timeout=None).returncode:
-            return None
-        opened = proxy.accepted - before
-        got = _declared(work / "output", f"SELECT count(DISTINCT {eng.id_col}) FROM {{parts}}")
-        return opened if got and got[0][0] >= CDC_CHANGES else None
+        with cdc_probe(engine, url, config_url=via) as probe:
+            if probe is None:
+                return None
+            eng, work, _ = probe
+            if run([str(binary), "run", "-c", "c.yaml"], env=env, cwd=work, timeout=None).returncode:
+                return None
+            _cdc_changes(engine, url, 1)
+            before = proxy.accepted
+            if run([str(binary), "run", "-c", "c.yaml"], env=env, cwd=work, timeout=None).returncode:
+                return None
+            opened = proxy.accepted - before
+            got = _declared(work / "output", f"SELECT count(DISTINCT {eng.id_col}) FROM {{parts}}")
+            return opened if got and got[0][0] >= CDC_CHANGES else None
     finally:
         proxy.close()
-        eng.cleanup(url, work)
 
 
 def _conns(led: Ledger, prev: Path) -> None:
@@ -636,23 +604,15 @@ def _cdc_side(binary: Path, engine: str, url: str, path: str = "cdc") -> Sample 
     `cdc-spill` caps the transaction buffer so the big transaction spills to disk;
     `cdc-resume` crashes each drain after its flush and times the run that resumes it.
     """
-    from .cdc import _ENGINES, _workdir
+    from .cdc import cdc_probe
 
-    eng = _ENGINES[engine]
-    work = _workdir()
-    block = eng.setup(url, work)
-    if block is None:
-        return None
-    tls = "\n  tls: { accept_invalid_certs: true }" if engine == "mssql" else ""
-    (work / "c.yaml").write_text(
-        f"source:\n  type: {engine}\n  url: \"{url}\"{tls}\nexports:\n  - name: orc_cdc_probe\n"
-        f"    table: orc_cdc_probe\n    mode: cdc\n    format: parquet\n    {block}\n"
-        "    destination:\n      type: local\n      path: ./output/\n"
-    )
     env = {"RIVET_STATE_URL": ""}
     if path == "cdc-spill":
         env |= {"RIVET_CDC_MAX_TX_ROWS": str(CDC_CHANGES // 20), "RIVET_CDC_SPILL_DIR": "1"}
-    try:
+    with cdc_probe(engine, url) as probe:
+        if probe is None:
+            return None
+        eng, work, _ = probe
         run([str(binary), "run", "-c", "c.yaml"], env=env, cwd=work, timeout=None)
         samples = []
         for i in range(REPS + 1):
@@ -670,8 +630,6 @@ def _cdc_side(binary: Path, engine: str, url: str, path: str = "cdc") -> Sample 
         if not got or got[0][0] < (REPS + 1) * CDC_CHANGES:
             return None
         return _best(samples)
-    finally:
-        eng.cleanup(url, work)
 
 
 CDC_TABLES = 20

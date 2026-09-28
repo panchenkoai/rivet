@@ -316,6 +316,19 @@ def _self_test() -> int:
     hot_cpu = Ledger(colour=False)
     _grade(hot_cpu, "mongo", "p", base, Sample(True, 1.0, 5.0, 50 * 1024 * 1024, {}), wall=False)
     assert hot_cpu.red, "wall=False must still grade CPU"
+    # "Declared" is one rule: a failed run's manifest delivers nothing, an uncommitted part neither.
+    import json as _json
+    import tempfile as _tf
+    from .upgrade import _declared_names
+    with _tf.TemporaryDirectory() as d:
+        root = Path(d)
+        for name in ("ok.parquet", "failed.parquet", "pending.parquet"):
+            (root / name).write_bytes(b"x")
+        (root / "manifest-ok.json").write_text(_json.dumps({"status": "success", "parts": [
+            {"path": "ok.parquet", "status": "committed"}, {"path": "pending.parquet", "status": "pending"}]}))
+        (root / "manifest-bad.json").write_text(_json.dumps({"status": "failed", "parts": [
+            {"path": "failed.parquet", "status": "committed"}]}))
+        assert _declared_names(root) == {"ok.parquet"}, _declared_names(root)
     # An INTERNAL error anywhere in a gated command's output is a gate failure.
     from . import core as _core
     _core.note_invariant_violations(["rivet", "run"], "Error: [RIVET_INTERNAL_SPILL] cdc spill: sealed twice")

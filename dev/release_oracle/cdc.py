@@ -33,6 +33,7 @@ the two implementations apart.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -528,6 +529,33 @@ class _Capture:
     yaml: Path
     bucket: str
     prefix: str
+
+
+@contextlib.contextmanager
+def cdc_probe(engine: str, url: str, *, config_url: str | None = None,
+              edit_block: Callable[[str], str] | None = None):
+    """A fresh `orc_cdc_probe` stream with a local-destination config at <work>/c.yaml.
+
+    Yields (engine, work, block), or None when the source setup failed; the stream is
+    cleaned up either way. `config_url` is what rivet dials (a proxy); setup and cleanup
+    always use `url`."""
+    eng = _ENGINES[engine]
+    work = _workdir()
+    block = eng.setup(url, work)
+    try:
+        if block is None:
+            yield None
+            return
+        if edit_block is not None:
+            block = edit_block(block)
+        tls = "\n  tls: { accept_invalid_certs: true }" if engine == "mssql" else ""
+        (work / "c.yaml").write_text(
+            f"source:\n  type: {engine}\n  url: \"{config_url or url}\"{tls}\nexports:\n"
+            f"  - name: orc_cdc_probe\n    table: orc_cdc_probe\n    mode: cdc\n    format: parquet\n"
+            f"    {block}\n    destination:\n      type: local\n      path: ./output/\n")
+        yield eng, work, block
+    finally:
+        eng.cleanup(url, work)
 
 
 def _cdc_write_cfg(
