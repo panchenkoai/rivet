@@ -283,6 +283,13 @@ mod tests {
             "a real primary key is never replaced"
         );
 
+        let mut other_first = vec![col("NOTE", false, false), col("ORDER_ID", false, false)];
+        promote_unique_key(&mut other_first, &["ORDER_ID".into()]);
+        assert!(
+            !other_first[0].is_primary_key && other_first[1].is_primary_key,
+            "only the column the UNIQUE key names is promoted"
+        );
+
         let mut none = vec![col("ORDER_ID", false, false)];
         promote_unique_key(&mut none, &[]);
         assert!(!none[0].is_primary_key, "no unique key, no stand-in");
