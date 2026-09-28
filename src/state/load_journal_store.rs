@@ -28,6 +28,27 @@ pub struct LoadRecord {
     pub source_ident: String,
 }
 
+/// The status of one `load_run` row — the one vocabulary the writers and the ownership rule share.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadStatus {
+    Success,
+    Failed,
+    Refused,
+    Writing,
+}
+
+impl LoadStatus {
+    /// The text stored in `load_run.status`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Failed => "failed",
+            Self::Refused => "refused",
+            Self::Writing => "writing",
+        }
+    }
+}
+
 impl StateStore {
     /// Log one load into `load_run` and — only for a **successful** load — mark
     /// each consumed extraction run in `loaded_source_run` (the skip set). A
@@ -41,7 +62,7 @@ impl StateStore {
         // A run is "loaded" only when its load succeeded; a failed load must
         // leave its runs retryable, never mark them loaded (else their data is
         // skipped on every subsequent load).
-        let mark_loaded = rec.status == "success";
+        let mark_loaded = rec.status == LoadStatus::Success.as_str();
         match &self.conn {
             StateConn::Sqlite(c) => {
                 // One transaction: the audit row + the skip-set rows commit
@@ -170,14 +191,15 @@ impl StateStore {
     /// is replaced by the closing row on every path that survives, so it can only be
     /// seen after a crash.
     pub fn has_load_attempt(&self, target_table: &str) -> Result<bool> {
+        let sql = format!(
+            "SELECT COUNT(*) FROM load_run WHERE target_table = ?1 \
+             AND (status IN ('{}', '{}') OR (status = '{}' AND source_run_ids <> '[]'))",
+            LoadStatus::Failed.as_str(),
+            LoadStatus::Writing.as_str(),
+            LoadStatus::Success.as_str(),
+        );
         Ok(self
-            .query_opt(
-                "SELECT COUNT(*) FROM load_run WHERE target_table = ?1 \
-                 AND (status IN ('failed', 'writing') \
-                      OR (status = 'success' AND source_run_ids <> '[]'))",
-                &[target_table.into()],
-                |r| r.i64(0),
-            )?
+            .query_opt(&sql, &[target_table.into()], |r| r.i64(0))?
             .unwrap_or(0)
             > 0)
     }

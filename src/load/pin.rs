@@ -106,9 +106,17 @@ pub(super) fn pin_plan_to_its_run(
         eprintln!("{note}");
     }
     let pinned_names: Vec<&str> = spec.columns.iter().map(|c| c.name.as_str()).collect();
-    let loaded = s
-        .loaded_source_run_ids(&load::build_loader(plan, op).fqtn(&plan.table))
-        .unwrap_or_default();
+    // Without the ledger's answer the respelling check below cannot run: unpin, like every
+    // other unreadable input here, rather than pin with the check silently off.
+    let loaded = match s.loaded_source_run_ids(&load::build_loader(plan, op).fqtn(&plan.table)) {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            return unpinned(&format!(
+                "the ledger could not list the runs already loaded ({e:#}), so the \
+                 column-respelling check cannot run"
+            ));
+        }
+    };
     let mut respelled: Vec<(String, String, String)> = Vec::new();
     for older in runs_loaded_with_the_pin(op, plan.mode, &newest_first, &run_id, &loaded) {
         if let Ok(Some(o)) =

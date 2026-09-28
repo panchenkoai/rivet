@@ -19,6 +19,7 @@ mod bq_rest;
 pub mod cdc;
 mod clickhouse;
 pub mod compact;
+pub(crate) mod ledger;
 pub mod orchestrate;
 pub(crate) mod partition_budget;
 mod pin;
