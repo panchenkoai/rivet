@@ -1617,6 +1617,30 @@ mod audit_csv_compression {
         )
     }
 
+    /// A MongoDB `mode: cdc` export under a ClickHouse `load:` is refused; a batch one is not.
+    #[test]
+    fn a_mongo_cdc_export_under_a_clickhouse_load_is_refused_and_batch_is_not() {
+        let cfg = |mode: &str, extra: &str| {
+            format!(
+                "source:\n  type: mongo\n  url: \"mongodb://localhost:27018/db\"\n\
+                 load: {{ target: clickhouse, url: \"http://localhost:8123\", database: d, \
+                 user: u, password_env: CH_PW }}\n\
+                 exports:\n  - name: orders\n    table: orders\n    mode: {mode}\n{extra}\
+                 \x20   format: parquet\n    destination: {{ type: gcs, bucket: b, prefix: \"p/\" }}\n"
+            )
+        };
+        let err =
+            Config::from_yaml(&cfg("cdc", "    cdc: { checkpoint: ./c.ckpt }\n")).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("a MongoDB CDC stream cannot load into ClickHouse"),
+            "{err:#}"
+        );
+        assert!(
+            Config::from_yaml(&cfg("full", "")).is_ok(),
+            "a batch export loads"
+        );
+    }
+
     #[test]
     fn audit_csv_compression_is_rejected() {
         // csv + gzip → rejected, with an actionable message.

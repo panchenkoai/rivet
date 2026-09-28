@@ -880,6 +880,39 @@ mod tests {
     }
 
     #[test]
+    fn a_part_is_refused_only_past_either_end_of_datetime64() {
+        use std::sync::Arc;
+        let part = |secs: i64| {
+            let col = arrow::array::TimestampMicrosecondArray::from(vec![secs * 1_000_000])
+                .with_timezone("UTC");
+            let batch = arrow::record_batch::RecordBatch::try_from_iter([(
+                "ts",
+                Arc::new(col) as arrow::array::ArrayRef,
+            )])
+            .unwrap();
+            let mut buf = Vec::new();
+            let mut w =
+                parquet::arrow::ArrowWriter::try_new(&mut buf, batch.schema(), None).unwrap();
+            w.write(&batch).unwrap();
+            w.close().unwrap();
+            parquet_footer(&buf).unwrap()
+        };
+        for ok in [DATETIME64_MIN_SECS, 0, DATETIME64_MAX_SECS] {
+            assert!(
+                refuse_unholdable_timestamps(&part(ok), "gs://b/p").is_ok(),
+                "{ok}"
+            );
+        }
+        for bad in [DATETIME64_MIN_SECS - 1, DATETIME64_MAX_SECS + 1] {
+            let err = refuse_unholdable_timestamps(&part(bad), "gs://b/p").unwrap_err();
+            assert!(
+                format!("{err:#}").contains("outside ClickHouse DateTime64's range"),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
     fn the_row_count_is_the_parquet_footers() {
         use std::sync::Arc;
         let batch = arrow::record_batch::RecordBatch::try_from_iter([(

@@ -1505,6 +1505,24 @@ mod tests {
             scale: -10,
         };
         assert_eq!(ch(&wide).status, TargetStatus::Fail);
+        let edge = RivetType::Decimal {
+            precision: 70,
+            scale: -6,
+        };
+        assert_eq!(
+            ch(&edge).target_type,
+            "Decimal(76, 0)",
+            "width 76 still fits"
+        );
+        let zero = RivetType::Decimal {
+            precision: 10,
+            scale: 0,
+        };
+        assert_eq!(
+            (ch(&zero).status, ch(&zero).target_type.as_str()),
+            (TargetStatus::Ok, "Decimal(10, 0)"),
+            "scale 0 is an ordinary decimal"
+        );
     }
 
     // ── L5 recovery SQL (the post-load transform for BigQuery autoload) ───────

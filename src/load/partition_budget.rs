@@ -517,6 +517,11 @@ mod tests {
             |name: &str| timestamp_outside(&read_footer(&store, name).unwrap(), lo, hi + HOUR - 1);
         assert_eq!(check("inside.parquet"), None);
         assert_eq!(
+            timestamp_outside(&read_footer(&store, "inside.parquet").unwrap(), lo, hi),
+            None,
+            "a value exactly at either end is inside"
+        );
+        assert_eq!(
             check("late.parquet"),
             Some(("ts".to_string(), "9999-12-31 00:00".to_string()))
         );
