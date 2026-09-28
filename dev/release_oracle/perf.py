@@ -18,6 +18,9 @@ measured runs; the MINIMUM of each metric is compared (other activity only ever 
 a loopback proxy the harness owns (a server counter also counts the stand's healthchecks):
 at most CONN_CEILING[engine], and never more than the previous release.
 
+`cdc-snapshot`: a first CDC run with `initial: snapshot` over a pre-populated table, each
+repetition on a fresh stream; complete when it holds the source's own row count.
+
 `parallel-exports-8`: the previous release's init over eight tables, run with
 `--parallel-exports` — the concurrency a generated config offers (init never writes
 `parallel:` for a keyset table, so the per-export parallel runners are unreachable from it).
@@ -441,6 +444,56 @@ def conns_verdict(engine: str, prev: int, cur: int) -> list[str]:
     return worse
 
 
+def _source_rows(engine: str, url: str) -> int | None:
+    """orc_cdc_probe's row count, read from the source by the harness."""
+    from .cdc import _mongosh, _mysql, _psql, _sqlcmd
+
+    if engine == "postgres":
+        p = _psql(url, "-Atc", "SELECT count(*) FROM orc_cdc_probe")
+    elif engine == "mysql":
+        p = _mysql(url, "SELECT COUNT(*) FROM orc_cdc_probe;")
+    elif engine == "mssql":
+        p = _sqlcmd(url, q="SET NOCOUNT ON; SELECT COUNT(*) FROM dbo.orc_cdc_probe")
+    else:
+        p = _mongosh(url, "db.orc_cdc_probe.countDocuments({})")
+    nums = re.findall(r"\d+", p.stdout or "") if p.ok else []
+    return int(nums[-1]) if nums else None
+
+
+def _snapshot_side(binary: Path, engine: str, url: str) -> Sample | None:
+    """A first run with `initial: snapshot` over CDC_CHANGES pre-existing changes: the
+    minimum of REPS timed runs, each on a fresh stream, after a warm-up. None when a run
+    failed or the snapshot came back short of the source's own count."""
+    from .cdc import _ENGINES, _workdir
+
+    eng = _ENGINES[engine]
+    samples = []
+    for i in range(REPS + 1):
+        work = _workdir()
+        block = eng.setup(url, work)
+        if block is None or "until_current: true" not in block:
+            return None
+        try:
+            _cdc_changes(engine, url, 1)
+            want = _source_rows(engine, url)
+            tls = "\n  tls: { accept_invalid_certs: true }" if engine == "mssql" else ""
+            blk = block.replace("until_current: true", "until_current: true, initial: snapshot")
+            (work / "c.yaml").write_text(
+                f"source:\n  type: {engine}\n  url: \"{url}\"{tls}\nexports:\n  - name: orc_cdc_probe\n"
+                f"    table: orc_cdc_probe\n    mode: cdc\n    format: parquet\n    {blk}\n"
+                "    destination:\n      type: local\n      path: ./output/\n")
+            s = _timed(binary, work, {"RIVET_STATE_URL": ""}, "run", "-c", "c.yaml",
+                       probe=url if engine == "postgres" else "")
+            got = _declared(work / "output", f"SELECT count(DISTINCT {eng.id_col}) FROM {{parts}}")
+            if not s.ok or not want or not got or got[0][0] != want:
+                return None
+            if i:
+                samples.append(s)
+        finally:
+            eng.cleanup(url, work)
+    return _best(samples)
+
+
 def _conns_side(binary: Path, engine: str, url: str) -> int | None:
     """Connections ONE steady-state CDC run of `binary` opens: anchor, one change set, then the
     counted run through a proxy. None when a run failed or captured nothing."""
@@ -612,6 +665,8 @@ def _cdc(led: Ledger, prev: Path) -> None:
         for path in ("cdc", "cdc-resume") if engine == "mongo" else ("cdc", "cdc-spill", "cdc-resume"):
             _grade(led, engine, path, _cdc_side(prev, engine, url, path),
                    _cdc_side(rivet_bin(), engine, url, path))
+        _grade(led, engine, "cdc-snapshot", _snapshot_side(prev, engine, url),
+               _snapshot_side(rivet_bin(), engine, url))
 
 
 def _aa(led: Ledger, prev: Path, root: Path) -> None:
