@@ -14,6 +14,10 @@ measured runs; the MINIMUM of each metric is compared (other activity only ever 
   harm   the engine's graded      ≤ prev × RIVET_HARM_TOL (1.25) + RIVET_HARM_SLACK (200)
          source counters
 
+`cdc-conns` counts the connections one steady-state CDC run opens on the source, through
+a loopback proxy the harness owns (a server counter also counts the stand's healthchecks):
+at most CONN_CEILING[engine], and never more than the previous release.
+
 Paths: batch `full`, keyset (`chunked`), an incremental delta and a crash→resume per SQL
 engine; per CDC engine a drain of a large change set (one big transaction plus many small),
 the same drain with the transaction buffer capped so it spills, and a resume after a crash
@@ -51,6 +55,9 @@ CDC_CHANGES = 20_000
 BIG_ROWS = 2_000_000
 REPS = 3
 MIB = 1024 * 1024
+# What a bounded CDC run needs: one metadata connection plus the change stream. A MongoDB
+# driver client adds its own monitoring connections (3 per client, measured).
+CONN_CEILING = {"postgres": 2, "mysql": 2, "mssql": 2, "mongo": 6}
 
 
 @dataclass(frozen=True)
@@ -329,6 +336,129 @@ def _cdc_changes(engine: str, url: str, lo: int) -> None:
                        f"db.orc_cdc_probe.deleteMany({{_id: {{$gte: {lo}, $lte: {hi}}}, amount: {{$mod: [17, 0]}}}});"))
 
 
+class _CountingProxy:
+    """A loopback TCP forwarder to `target` that counts the connections it accepts."""
+
+    def __init__(self, target: tuple[str, int]) -> None:
+        import socket
+        import threading
+
+        self.accepted = 0
+        self._target = target
+        self._srv = socket.create_server(("127.0.0.1", 0))
+        self.port = self._srv.getsockname()[1]
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self) -> None:
+        """Accept, count, and pipe both directions until the listener closes."""
+        import socket
+        import threading
+
+        while True:
+            try:
+                down, _ = self._srv.accept()
+            except OSError:
+                return
+            self.accepted += 1
+            try:
+                up = socket.create_connection(self._target)
+            except OSError:
+                down.close()
+                continue
+            for a, b in ((down, up), (up, down)):
+                threading.Thread(target=self._pipe, args=(a, b), daemon=True).start()
+
+    @staticmethod
+    def _pipe(a, b) -> None:
+        """Copy `a` to `b`; when either side ends, end both."""
+        import socket
+
+        try:
+            while data := a.recv(65536):
+                b.sendall(data)
+        except OSError:
+            pass
+        for sock in (a, b):
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    def close(self) -> None:
+        """Stop accepting."""
+        self._srv.close()
+
+
+def conns_verdict(engine: str, prev: int, cur: int) -> list[str]:
+    """How `cur` connections per run broke the ceiling or the previous release (empty = none)."""
+    worse = []
+    if cur > CONN_CEILING[engine]:
+        worse.append(f"{cur} connections > ceiling {CONN_CEILING[engine]}")
+    if cur > prev:
+        worse.append(f"{cur} connections > {prev} for the previous release")
+    return worse
+
+
+def _conns_side(binary: Path, engine: str, url: str) -> int | None:
+    """Connections ONE steady-state CDC run of `binary` opens: anchor, one change set, then the
+    counted run through a proxy. None when a run failed or captured nothing."""
+    import urllib.parse
+
+    from .cdc import _ENGINES, _workdir
+
+    eng = _ENGINES[engine]
+    work = _workdir()
+    block = eng.setup(url, work)
+    if block is None:
+        return None
+    u = urllib.parse.urlsplit(url)
+    proxy = _CountingProxy((u.hostname or "127.0.0.1", u.port or 0))
+    host = u.netloc.rsplit("@", 1)
+    via = urllib.parse.urlunsplit(u._replace(netloc=(host[0] + "@" if len(host) == 2 else "")
+                                             + f"127.0.0.1:{proxy.port}"))
+    tls = "\n  tls: { accept_invalid_certs: true }" if engine == "mssql" else ""
+    (work / "c.yaml").write_text(
+        f"source:\n  type: {engine}\n  url: \"{via}\"{tls}\nexports:\n  - name: orc_cdc_probe\n"
+        f"    table: orc_cdc_probe\n    mode: cdc\n    format: parquet\n    {block}\n"
+        "    destination:\n      type: local\n      path: ./output/\n"
+    )
+    env = {"RIVET_STATE_URL": ""}
+    try:
+        if run([str(binary), "run", "-c", "c.yaml"], env=env, cwd=work, timeout=None).returncode:
+            return None
+        _cdc_changes(engine, url, 1)
+        before = proxy.accepted
+        if run([str(binary), "run", "-c", "c.yaml"], env=env, cwd=work, timeout=None).returncode:
+            return None
+        opened = proxy.accepted - before
+        got = _declared(work / "output", f"SELECT count(DISTINCT {eng.id_col}) FROM {{parts}}")
+        return opened if got and got[0][0] >= CDC_CHANGES else None
+    finally:
+        proxy.close()
+        eng.cleanup(url, work)
+
+
+def _conns(led: Ledger, prev: Path) -> None:
+    """Source connections per steady-state CDC run, per engine: ceiling, and never above prev."""
+    for engine in ("postgres", "mysql", "mssql", "mongo"):
+        url = os.environ.get(f"RIVET_CDC_{engine.upper()}_URL", "")
+        if not url:
+            led.skipped(engine, "-", SCEN, "cdc-conns", f"perf[{engine}/cdc-conns]: no "
+                        f"RIVET_CDC_{engine.upper()}_URL", "no url")
+            continue
+        p, c = _conns_side(prev, engine, url), _conns_side(rivet_bin(), engine, url)
+        if p is None or c is None:
+            led.failed(engine, "-", SCEN, "cdc-conns", f"perf[{engine}/cdc-conns]: a run failed or "
+                       f"captured nothing (prev={p}, this={c})", "run failed")
+            continue
+        worse = conns_verdict(engine, p, c)
+        shown = f"connections this/prev {c}/{p}, ceiling {CONN_CEILING[engine]}"
+        if worse:
+            led.failed(engine, "-", SCEN, "cdc-conns", f"perf[{engine}/cdc-conns]: {'; '.join(worse)}", shown)
+        else:
+            led.passed(engine, "-", SCEN, "cdc-conns", f"perf[{engine}/cdc-conns]: {shown}", shown)
+
+
 def _cdc_side(binary: Path, engine: str, url: str, path: str = "cdc") -> Sample | None:
     """Anchor, then the minimum of REPS measured drains of CDC_CHANGES changes each (warm-up first).
 
@@ -486,4 +616,5 @@ def verify_perf_regression(led: Ledger) -> None:
     _batch(led, prev, root)
     _off_happy_path(led, prev, root)
     _cdc(led, prev)
+    _conns(led, prev)
     _cdc20(led, prev, root)

@@ -303,6 +303,11 @@ def _self_test() -> int:
     assert perf_verdict("postgres", base, Sample(True, 1.05, 0.05, 50 * 1024 * 1024, {})) == []
     assert perf_verdict("postgres", base, Sample(True, 2.0, 0.02, 50 * 1024 * 1024, {}))
     assert perf_verdict("postgres", base, Sample(True, 1.0, 0.02, 200 * 1024 * 1024, {}))
+    # cdc-conns: the ceiling holds even when the previous release was worse, and one
+    # connection more than the previous release is a regression under the ceiling too.
+    from .perf import conns_verdict
+    assert conns_verdict("postgres", 5, 2) == [] and conns_verdict("postgres", 2, 3)
+    assert conns_verdict("mongo", 3, 4) and conns_verdict("mongo", 6, 6) == []
     # An INTERNAL error anywhere in a gated command's output is a gate failure.
     from . import core as _core
     _core.note_invariant_violations(["rivet", "run"], "Error: [RIVET_INTERNAL_SPILL] cdc spill: sealed twice")
