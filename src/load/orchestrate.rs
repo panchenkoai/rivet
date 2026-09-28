@@ -1221,6 +1221,7 @@ fn load_one_cdc_base(
                     pk,
                     Some(integrity.file_rows),
                     cleanup.as_ref().map(|(s, k)| (*s, k.as_slice())),
+                    "CDC",
                 )?;
                 landed.push(r.rows_appended);
                 report = Some(r);
@@ -1999,6 +2000,7 @@ fn load_one_incremental(
                         pk,
                         Some(integrity.file_rows),
                         cleanup.as_ref().map(|(s, k)| (*s, k.as_slice())),
+                        "incremental",
                     )?
                 } else {
                     load::run_load_incremental(

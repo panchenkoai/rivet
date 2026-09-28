@@ -774,7 +774,8 @@ fn append_and_view(
     if let Some(expected) = expected_delta
         && rows_appended != expected
     {
-        bail!(
+        crate::rivet_bail!(
+            crate::error::codes::LOAD_COUNT_MISMATCH,
             "{label} count validation failed for `{}__changes`: appended {rows_appended} rows, \
              expected {expected} from the run manifests — investigate before trusting the view",
             table
@@ -988,14 +989,16 @@ pub fn run_load_buffer(
     pk: &[String],
     expected_delta: Option<u64>,
     cleanup: Option<(&GcsStore, &[String])>,
+    label: &str,
 ) -> Result<CdcLoadReport> {
-    before_write(append_preflight(loader, table, specs, uris, pk, "CDC"))?;
+    before_write(append_preflight(loader, table, specs, uris, pk, label))?;
     let rows_appended = loader.append_changelog(table, specs, uris, pk)?;
     if let Some(expected) = expected_delta
         && rows_appended != expected
     {
-        bail!(
-            "CDC count validation failed for `{}__changes`: appended {rows_appended} rows, \
+        crate::rivet_bail!(
+            crate::error::codes::LOAD_COUNT_MISMATCH,
+            "{label} count validation failed for `{}__changes`: appended {rows_appended} rows, \
              expected {expected} from the run manifests — investigate before compacting",
             table
         );
@@ -2187,8 +2190,12 @@ pub(crate) mod tests {
             Ownership::Own,
             false,
         )
-        .unwrap_err()
-        .to_string();
+        .unwrap_err();
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some("RIVET_LOAD_COUNT_MISMATCH")
+        );
+        let err = err.to_string();
         assert!(err.contains("CDC count validation failed"), "{err}");
         assert!(
             f.views.borrow().is_empty(),
@@ -2198,6 +2205,33 @@ pub(crate) mod tests {
             prefix_populated(&store, REL),
             "cleanup must not run on a failed gate"
         );
+    }
+
+    /// A count mismatch is an integrity failure on every load path, whatever the table is called.
+    #[test]
+    fn a_buffer_count_mismatch_exits_as_integrity_even_on_a_table_named_like_a_network_error() {
+        let f = FakeLoader {
+            rows: 3,
+            ..Default::default()
+        };
+        let err = run_load_buffer(
+            &f,
+            "dns_log",
+            &spec(TargetStatus::Ok),
+            &uris(),
+            &["id".into()],
+            Some(5),
+            None,
+            "incremental",
+        )
+        .unwrap_err();
+        assert_eq!(
+            crate::error::classify_exit(&err),
+            3,
+            "an uncoded mismatch read `dns` in the table name as a network error and exited 2 \
+             (retry): {err:#}"
+        );
+        assert!(format!("{err:#}").contains("incremental count validation failed"));
     }
 
     /// The buffer append has the same count gate as the changelog append: a short
@@ -2219,9 +2253,14 @@ pub(crate) mod tests {
             &["id".into()],
             Some(5),
             Some((&store, &[format!("{REL}/x.parquet")][..])),
+            "CDC",
         )
-        .unwrap_err()
-        .to_string();
+        .unwrap_err();
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some("RIVET_LOAD_COUNT_MISMATCH")
+        );
+        let err = err.to_string();
         assert!(err.contains("CDC count validation failed"), "{err}");
         assert!(
             prefix_populated(&store, REL),
@@ -2236,6 +2275,7 @@ pub(crate) mod tests {
             &["id".into()],
             Some(3),
             None,
+            "CDC",
         )
         .expect("an exact delta passes the gate");
         assert_eq!(ok.rows_appended, 3);
