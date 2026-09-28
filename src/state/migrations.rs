@@ -967,7 +967,18 @@ fn get_current_version(conn: &Connection) -> i64 {
     .unwrap_or(0)
 }
 
+/// Whether a version read WITHOUT the migration lock already equals this build's schema.
+fn already_current(unlocked_version: i64) -> bool {
+    unlocked_version == SCHEMA_VERSION
+}
+
 pub(super) fn migrate(conn: &Connection) -> Result<()> {
+    // Fast path: a database already at this build's version has nothing to
+    // migrate, so no write lock. Versions only grow, and the ladder's version row
+    // commits with the ladder, so a committed SCHEMA_VERSION is a finished one.
+    if already_current(get_current_version(conn)) {
+        return Ok(());
+    }
     // ONE writer migrates at a time. `BEGIN IMMEDIATE` takes the database's write
     // lock before anything is read, so the version this process sees cannot be
     // stale by the time it acts on it; the others block on `busy_timeout` and
@@ -1103,10 +1114,24 @@ fn migrate_locked(conn: &Connection) -> Result<()> {
 const PG_MIGRATION_LOCK: i64 = 0x7269_7665_745f_6d69_u64 as i64; // "rivet_mi"
 
 pub(super) fn migrate_pg(client: &mut postgres::Client) -> Result<()> {
-    // ONE writer migrates at a time, across PROCESSES and HOSTS. A session
-    // advisory lock is the right instrument: it is held for the connection, so a
-    // process that dies mid-migration releases it, and it needs no table of its
-    // own (which would itself have to be created race-free).
+    // Fast path, as on SQLite: an already-current schema takes no lock. A missing
+    // version table (fresh schema) reads as 0 and falls through.
+    let unlocked = client
+        .query_one(
+            "SELECT COALESCE(MAX(version), 0) FROM rivet_schema_version",
+            &[],
+        )
+        .map(|r| r.get::<_, i64>(0))
+        .unwrap_or(0);
+    if already_current(unlocked) {
+        return Ok(());
+    }
+    // ONE writer migrates at a time, across PROCESSES and HOSTS, under a
+    // TRANSACTION-scoped advisory lock: COMMIT/ROLLBACK releases it on the same
+    // backend, so it holds behind a transaction-mode pooler (a session lock/unlock
+    // pair can land on two backends and leak the lock), and a process that dies
+    // mid-migration releases it by aborting. The whole ladder runs in that one
+    // transaction; PostgreSQL DDL is transactional.
     //
     // `CREATE TABLE IF NOT EXISTS` is NOT race-free in PostgreSQL — concurrent
     // creators collide in the catalog — and even past it each migration ran in
@@ -1115,15 +1140,19 @@ pub(super) fn migrate_pg(client: &mut postgres::Client) -> Result<()> {
     // EMPTY schema: THREE of the four died with `state(pg): create version table:
     // db error`, at the very first statement. One survived. That is the first day
     // of a shared deployment.
-    client
-        .batch_execute(&format!("SELECT pg_advisory_lock({PG_MIGRATION_LOCK});"))
-        .map_err(|e| anyhow::anyhow!("state(pg): take migration lock: {:#}", e))?;
-    let out = migrate_pg_locked(client);
-    let _ = client.batch_execute(&format!("SELECT pg_advisory_unlock({PG_MIGRATION_LOCK});"));
-    out
+    let mut tx = client
+        .transaction()
+        .map_err(|e| anyhow::anyhow!("state(pg): begin migration: {:#}", e))?;
+    tx.batch_execute(&format!(
+        "SELECT pg_advisory_xact_lock({PG_MIGRATION_LOCK});"
+    ))
+    .map_err(|e| anyhow::anyhow!("state(pg): take migration lock: {:#}", e))?;
+    migrate_pg_locked(&mut tx)?;
+    tx.commit()
+        .map_err(|e| anyhow::anyhow!("state(pg): commit migration: {:#}", e))
 }
 
-fn migrate_pg_locked(client: &mut postgres::Client) -> Result<()> {
+fn migrate_pg_locked(client: &mut postgres::Transaction<'_>) -> Result<()> {
     client
         .batch_execute("CREATE TABLE IF NOT EXISTS rivet_schema_version (version BIGINT NOT NULL);")
         .map_err(|e| anyhow::anyhow!("state(pg): create version table: {:#}", e))?;
@@ -1140,7 +1169,7 @@ fn migrate_pg_locked(client: &mut postgres::Client) -> Result<()> {
         if ver > current {
             log::debug!("state(pg): applying migration v{}", ver);
             let batch = format!(
-                "BEGIN; {} INSERT INTO rivet_schema_version (version) VALUES ({}); COMMIT;",
+                "{} INSERT INTO rivet_schema_version (version) VALUES ({});",
                 sql, ver
             );
             client
@@ -1150,10 +1179,12 @@ fn migrate_pg_locked(client: &mut postgres::Client) -> Result<()> {
     }
 
     // Remove superseded version rows so MAX() stays unambiguous (mirrors SQLite behaviour).
-    let _ = client.batch_execute(
-        "DELETE FROM rivet_schema_version \
-         WHERE version < (SELECT MAX(version) FROM rivet_schema_version);",
-    );
+    client
+        .batch_execute(
+            "DELETE FROM rivet_schema_version \
+             WHERE version < (SELECT MAX(version) FROM rivet_schema_version);",
+        )
+        .map_err(|e| anyhow::anyhow!("state(pg): prune schema versions: {:#}", e))?;
 
     // Verify the DB actually reached the expected version.
     let final_version: i64 = client
@@ -1443,6 +1474,31 @@ mod tests {
             }
             StateConn::Postgres(_) => unreachable!(),
         }
+    }
+
+    /// Only a version equal to this build's schema skips the migration lock.
+    #[test]
+    fn already_current_is_true_only_at_this_builds_schema_version() {
+        assert!(already_current(SCHEMA_VERSION));
+        assert!(!already_current(0));
+        assert!(!already_current(SCHEMA_VERSION - 1));
+        assert!(!already_current(SCHEMA_VERSION + 1));
+    }
+
+    /// Opening an already-current database takes no write lock, so it succeeds while another writer holds one.
+    #[test]
+    fn migrating_a_current_database_does_not_wait_for_the_write_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("state.db");
+        migrate(&open_connection(&db).unwrap()).unwrap();
+        let holder = open_connection(&db).unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        let opener = open_connection(&db).unwrap();
+        opener
+            .busy_timeout(std::time::Duration::from_millis(200))
+            .unwrap();
+        migrate(&opener).expect("an already-current open must not need the write lock");
+        holder.execute_batch("ROLLBACK;").unwrap();
     }
 
     /// Several writers migrating ONE database at once all succeed.

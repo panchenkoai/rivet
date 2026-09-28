@@ -461,7 +461,7 @@ impl Drop for ScratchDb {
 /// The SQLite sibling (`several_writers_migrating_one_database_at_once_all_succeed`,
 /// `src/state/migrations.rs`) can live inline because its race fits in a tempdir. This one
 /// needs the stand, which is exactly why it was missing while the guard it grades —
-/// `pg_advisory_lock(PG_MIGRATION_LOCK)` in `migrate_pg` — carried a MEASUREMENT in
+/// `pg_advisory_xact_lock(PG_MIGRATION_LOCK)` in `migrate_pg` — carried a MEASUREMENT in
 /// its own comment and no test: four concurrent exports against an empty schema,
 /// three of the four dead at the very first statement with `state(pg): create
 /// version table`. `rivet load --pool 16` leans on it sixteen times harder.
