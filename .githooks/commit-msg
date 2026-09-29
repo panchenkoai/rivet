@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# The repository is English-only: a commit message with Cyrillic is refused (see .githooks/no-cyrillic).
+set -euo pipefail
+exec "$(dirname "$0")/no-cyrillic" --message "$1"
