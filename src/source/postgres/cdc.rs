@@ -130,6 +130,21 @@ pub(crate) fn slot_created_warning(slot: &str) -> String {
     )
 }
 
+/// The refusal for a missing slot under prior-run evidence, shared by the run and `rivet doctor`.
+pub(crate) fn pg_slot_missing_refusal(slot: &str) -> String {
+    format!(
+        "pg cdc: slot '{slot}' is missing but prior-run evidence exists (a checkpoint and/or a \
+         completed snapshot) — the slot was dropped or invalidated, and the changes since then \
+         are no longer in the log. To re-snapshot: delete the checkpoint file if one is \
+         configured, clear the export's `cdc_snapshot` row in the state DB AND delete the \
+         destination's snapshot/_SUCCESS marker (the two done-signals are OR-ed, so leaving \
+         either in place repeats this refusal). If a warehouse load consumes this stream, ALSO \
+         truncate its `<table>__changes` table before the next load. Then re-run: rivet creates \
+         the new slot BEFORE it re-snapshots, so nothing falls between the two (see \
+         cdc-failure-modes.md)."
+    )
+}
+
 /// What one CONFIGURED table can contribute to a `test_decoding` stream —
 /// the pure half of [`PgChangeStream::check_configured_tables_are_routable`].
 ///
@@ -617,14 +632,7 @@ impl PgChangeStream {
             .get(0);
         if !exists {
             if resume_expected {
-                anyhow::bail!(
-                    "pg cdc: slot '{slot}' is missing but a resume checkpoint exists — the slot \
-                     was dropped or invalidated, and the changes since then are no longer in the \
-                     log. Recover in rivet's OWN order: delete the checkpoint file so the \
-                     next run pins a fresh slot at the current WAL position, THEN re-snapshot \
-                     the table (mode: full). Snapshotting first leaves everything changed \
-                     between the snapshot and the new slot in neither."
-                );
+                anyhow::bail!("{}", pg_slot_missing_refusal(slot));
             }
             // Creating the slot anchors capture at the CURRENT WAL position:
             // everything already written is unreachable from here. That is correct

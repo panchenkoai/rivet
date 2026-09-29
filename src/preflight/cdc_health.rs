@@ -271,15 +271,7 @@ fn pg_slot_verdict(
         None if resume_ckpt => check(
             name,
             false,
-            Some(
-                "slot is missing but a resume checkpoint exists — the slot was dropped or \
-                 invalidated, and the changes since then are no longer in the log. Recover in \
-                 rivet's OWN order: delete the checkpoint file so the next run pins a fresh slot \
-                 at the current WAL position, THEN re-snapshot the table (mode: full). \
-                 Snapshotting first leaves everything changed between the snapshot and the new \
-                 slot in neither."
-                    .into(),
-            ),
+            Some(crate::source::postgres::cdc::pg_slot_missing_refusal(slot)),
             None,
         ),
         None => check(
@@ -1009,14 +1001,31 @@ mod tests {
             "a dropped slot under an existing checkpoint is not a first run: {c:?}"
         );
         let detail = c.detail.expect("the verdict must say why");
-        assert!(
-            detail.contains("resume checkpoint exists"),
-            "it must name the state, not just fail: {detail}"
+        assert_eq!(
+            detail,
+            crate::source::postgres::cdc::pg_slot_missing_refusal("rivet_orders"),
+            "preflight and run must tell the operator the same thing"
         );
         assert!(
-            detail.contains("delete the checkpoint file") && detail.contains("THEN re-snapshot"),
-            "…and the run's OWN recovery order, or preflight and run tell the operator two \
-             different things: {detail}"
+            detail.contains("prior-run evidence exists"),
+            "it must name the state, not just fail: {detail}"
+        );
+        for step in [
+            "delete the checkpoint file if one is configured",
+            "clear the export's `cdc_snapshot` row in the state DB",
+            "delete the destination's snapshot/_SUCCESS marker",
+            "truncate its `<table>__changes` table",
+            "rivet creates the new slot BEFORE it re-snapshots",
+        ] {
+            assert!(
+                detail.contains(step),
+                "the recovery must name `{step}` — deleting the checkpoint alone leaves \
+                 the OR-ed done-signals set and repeats this refusal forever: {detail}"
+            );
+        }
+        assert!(
+            !detail.contains("mode: full"),
+            "`mode: full` clears neither done-signal: {detail}"
         );
     }
 
