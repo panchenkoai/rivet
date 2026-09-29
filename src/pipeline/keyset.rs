@@ -1228,7 +1228,6 @@ pub(crate) fn run_keyset(
             pages,
             page.rows
         );
-        pages += 1;
 
         // Forensics (v18): a short final page's max key (or, if empty, the previous
         // page's) is the run's true high-water; an unreadable key stamps the LAST key
@@ -1241,7 +1240,7 @@ pub(crate) fn run_keyset(
             kp.chunk_size,
             page.next_cursor,
             &kp.key_column,
-            pages - 1,
+            pages,
             &format!("export '{}'", plan.export_name),
         )
         .inspect_err(|_| {
@@ -1250,6 +1249,7 @@ pub(crate) fn run_keyset(
                 summary.cursor_high = l;
             }
         })?;
+        pages += 1;
         match next {
             Some(v) => last = Some(v),
             None => {
