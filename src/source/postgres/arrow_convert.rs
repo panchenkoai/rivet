@@ -538,10 +538,14 @@ impl crate::source::value_checksum::CellSource for PgCellSource<'_> {
         self.rows[row].get::<_, Option<f64>>(col)
     }
     fn decimal128(&self, col: usize, row: usize, scale: i8) -> Option<i128> {
-        let wire = self.rows[row]
-            .try_get::<_, Option<PgNumericWire<'_>>>(col)
-            .ok()
-            .flatten()?;
+        let Ok(wire) = self.rows[row].try_get::<_, Option<PgNumericWire<'_>>>(col) else {
+            let PgDecimalFallback(t) = self.rows[row]
+                .try_get::<_, Option<PgDecimalFallback>>(col)
+                .ok()
+                .flatten()?;
+            return crate::types::decimal::decimal_str_to_scaled_i128(&t, scale);
+        };
+        let wire = wire?;
         let bd = crate::source::pg_numeric_wire::wire_to_big_decimal(wire.0)?;
         let scaled = bd.with_scale_round(scale as i64, bigdecimal::RoundingMode::Down);
         bigdecimal::num_traits::ToPrimitive::to_i128(&scaled.into_bigint_and_exponent().0)
@@ -1090,14 +1094,42 @@ fn pg_numeric_optional_plain(row: &Row, col_idx: usize) -> Result<Option<String>
             )),
         },
         Ok(None) => Ok(None),
-        Err(_) => {
-            // Fallback for unconventional cast-to-text callers.
-            if let Ok(Some(s)) = row.try_get::<_, Option<String>>(col_idx) {
-                let t = s.trim();
-                return Ok((!t.is_empty()).then(|| t.to_string()));
+        Err(_) => match row.try_get::<_, Option<PgDecimalFallback>>(col_idx) {
+            Ok(v) => Ok(v.and_then(|PgDecimalFallback(t)| (!t.is_empty()).then_some(t))),
+            Err(_) => {
+                let c = &row.columns()[col_idx];
+                crate::rivet_bail!(
+                    crate::error::codes::SOURCE_OVERRIDE_WIRE_MISMATCH,
+                    "postgres: column `{}` is declared decimal by a `columns:` override but \
+                     PostgreSQL sends it as {} — rivet does not convert it, and writing it as \
+                     NULL would lose every value. Remove the override, or CAST the column to \
+                     numeric in the export's `query:`.",
+                    c.name(),
+                    c.type_()
+                )
             }
-            Ok(None)
-        }
+        },
+    }
+}
+
+/// A non-`numeric` cell read under a `decimal` override: an integer or text, as plain text.
+struct PgDecimalFallback(String);
+
+impl<'a> PgFromSql<'a> for PgDecimalFallback {
+    fn accepts(ty: &Type) -> bool {
+        matches!(*ty, Type::INT2 | Type::INT4 | Type::INT8) || <&str as PgFromSql>::accepts(ty)
+    }
+
+    fn from_sql(
+        ty: &Type,
+        raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        Ok(Self(match *ty {
+            Type::INT2 => i16::from_sql(ty, raw)?.to_string(),
+            Type::INT4 => i32::from_sql(ty, raw)?.to_string(),
+            Type::INT8 => i64::from_sql(ty, raw)?.to_string(),
+            _ => <&str as PgFromSql>::from_sql(ty, raw)?.trim().to_string(),
+        }))
     }
 }
 
@@ -1198,6 +1230,46 @@ mod interval_render_tests {
         // which "P2Y" expresses correctly. (The "T0S" fallback fires only when
         // NOTHING was written, i.e. the string is still bare "P".)
         assert_eq!(pg_interval_to_iso8601(24, 0, 0), "P2Y");
+    }
+}
+
+#[cfg(test)]
+mod decimal_override_tests {
+    use super::PgDecimalFallback;
+    use postgres::types::{FromSql, Type};
+
+    /// A `decimal` override on a PG integer column reads the integer exactly.
+    ///
+    /// Before, only text fell back, so an INT2/INT4/INT8 cell under a decimal
+    /// override matched nothing and became NULL — the whole column, exit 0, both
+    /// checksum sides agreeing. Wire bytes are hand-built big-endian integers.
+    #[test]
+    fn an_integer_column_under_a_decimal_override_reads_its_value() {
+        for ty in [
+            Type::INT2,
+            Type::INT4,
+            Type::INT8,
+            Type::TEXT,
+            Type::VARCHAR,
+        ] {
+            assert!(PgDecimalFallback::accepts(&ty), "{ty}");
+        }
+        let v = |ty: &Type, raw: &[u8]| PgDecimalFallback::from_sql(ty, raw).unwrap().0;
+        assert_eq!(v(&Type::INT2, &(-7i16).to_be_bytes()), "-7");
+        assert_eq!(v(&Type::INT4, &123_456i32.to_be_bytes()), "123456");
+        assert_eq!(
+            v(&Type::INT8, &i64::MAX.to_be_bytes()),
+            "9223372036854775807"
+        );
+        assert_eq!(v(&Type::TEXT, b" 12.50 "), "12.50");
+    }
+
+    /// A wire type rivet does not convert (float, bool) is refused, never nulled.
+    #[test]
+    fn a_float_column_under_a_decimal_override_is_not_accepted() {
+        for ty in [Type::FLOAT4, Type::FLOAT8, Type::BOOL, Type::DATE] {
+            assert!(!PgDecimalFallback::accepts(&ty), "{ty}");
+        }
     }
 }
 
