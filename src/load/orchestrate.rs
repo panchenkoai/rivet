@@ -1148,6 +1148,13 @@ fn load_one_cdc_base(
             // Rows this cycle landed, per leg then the buffer; summed for the ledger.
             let mut landed: Vec<u64> = Vec::new();
             let mut report: Option<load::CdcLoadReport> = None;
+            let (baseline, superseded) = load::reconcile::latest_baseline_generation(baseline)?;
+            for id in &superseded {
+                eprintln!(
+                    "  note: baseline run {id} is superseded by a newer baseline — recorded as \
+                     loaded, its files are not read"
+                );
+            }
             if let [_, ..] = baseline.as_slice() {
                 let uris = load::reconcile::select_load_uris(store, &plan.gcs_prefix, &baseline)?;
                 let manifests: Vec<_> = baseline.iter().map(|(_, m)| m.clone()).collect();
@@ -1176,7 +1183,11 @@ fn load_one_cdc_base(
                     r.rows_loaded,
                     baseline.len()
                 );
-                let ids: Vec<String> = baseline.iter().map(|(_, m)| m.run_id.clone()).collect();
+                let ids: Vec<String> = baseline
+                    .iter()
+                    .map(|(_, m)| m.run_id.clone())
+                    .chain(superseded)
+                    .collect();
                 legs.landed(&ids, r.rows_loaded);
                 landed.push(r.rows_loaded);
             }
