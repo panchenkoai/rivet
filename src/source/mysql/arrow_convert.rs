@@ -487,17 +487,7 @@ impl crate::source::value_checksum::CellSource for MysqlCellSource<'_> {
         }
     }
     fn time64_micros(&self, col: usize, row: usize) -> Option<i64> {
-        match self.rows[row].as_ref(col) {
-            Some(Value::Time(neg, days, h, m, s, us)) => {
-                let total =
-                    (*days as i64 * 86_400 + *h as i64 * 3_600 + *m as i64 * 60 + *s as i64)
-                        * 1_000_000
-                        + *us as i64;
-                Some(if *neg { -total } else { total })
-            }
-            Some(Value::Bytes(bv)) => bytes_to_str(bv).and_then(parse_time_str_to_micros),
-            _ => None,
-        }
+        mysql_time_of_day(self.rows[row].as_ref(col)).ok().flatten()
     }
     fn fixed_binary(&self, col: usize, row: usize) -> Option<Cow<'_, [u8]>> {
         // Mirrors the FixedSizeBinary(16) build arm: 16 raw bytes verbatim, or
@@ -577,6 +567,53 @@ fn int64_from_bytes(bv: &[u8], is_bit: bool) -> Result<Option<i64>> {
 
 /// Parse MySQL text-protocol TIME string ("HH:MM:SS", "-HHH:MM:SS", "HH:MM:SS.uuuuuu")
 /// into microseconds since midnight. Negative values are allowed.
+/// MySQL TIME as microseconds since midnight; a duration outside one day or unreadable text is refused, never wrapped or nulled.
+fn mysql_time_of_day(v: Option<&Value>) -> Result<Option<i64>> {
+    let us = match v {
+        None | Some(Value::NULL) => return Ok(None),
+        Some(Value::Time(neg, days, h, m, s, us)) => {
+            let total = (*days as i64 * 86_400 + *h as i64 * 3_600 + *m as i64 * 60 + *s as i64)
+                * 1_000_000
+                + *us as i64;
+            if *neg { -total } else { total }
+        }
+        Some(Value::Bytes(bv)) => match bytes_to_str(bv).and_then(parse_time_str_to_micros) {
+            Some(us) => us,
+            None => crate::rivet_bail!(
+                crate::error::codes::SOURCE_VALUE_UNREPRESENTABLE,
+                "mysql: a TIME value {:?} could not be read; rivet refuses rather than writing NULL",
+                String::from_utf8_lossy(bv)
+            ),
+        },
+        Some(other) => crate::rivet_bail!(
+            crate::error::codes::SOURCE_VALUE_UNREPRESENTABLE,
+            "mysql: a TIME column delivered {other:?}; rivet refuses rather than writing NULL"
+        ),
+    };
+    if !(0..86_400_000_000).contains(&us) {
+        crate::rivet_bail!(
+            crate::error::codes::SOURCE_VALUE_UNREPRESENTABLE,
+            "mysql: TIME {} is outside 00:00..24:00, which a Parquet TIME cannot hold (MySQL TIME is a \
+             duration up to 838:59:59). Cast it in a query, e.g. TIME_TO_SEC(col) or CAST(col AS CHAR)",
+            fmt_micros_as_time(us)
+        );
+    }
+    Ok(Some(us))
+}
+
+/// `[-]H:MM:SS.ffffff` for a message.
+fn fmt_micros_as_time(us: i64) -> String {
+    let (sign, a) = if us < 0 { ("-", -us) } else { ("", us) };
+    let s = a / 1_000_000;
+    format!(
+        "{sign}{}:{:02}:{:02}.{:06}",
+        s / 3600,
+        s / 60 % 60,
+        s % 60,
+        a % 1_000_000
+    )
+}
+
 fn parse_time_str_to_micros(s: &str) -> Option<i64> {
     let (neg, rest) = if let Some(r) = s.strip_prefix('-') {
         (true, r)
@@ -822,27 +859,7 @@ fn build_array(
         DataType::Time64(TimeUnit::Microsecond) => {
             let mut b = Time64MicrosecondBuilder::with_capacity(rows.len());
             for row in rows {
-                match row.as_ref(col_idx) {
-                    // MySQL wire protocol delivers TIME as Value::Time(neg, days, h, m, s, us)
-                    Some(Value::Time(neg, days, h, m, s, us)) => {
-                        let total_us = (*days as i64 * 86_400
-                            + *h as i64 * 3_600
-                            + *m as i64 * 60
-                            + *s as i64)
-                            * 1_000_000
-                            + *us as i64;
-                        b.append_value(if *neg { -total_us } else { total_us });
-                    }
-                    Some(Value::Bytes(bv)) => {
-                        // text-protocol fallback: "HH:MM:SS" or "HHH:MM:SS.uuuuuu"
-                        if let Some(us) = bytes_to_str(bv).and_then(parse_time_str_to_micros) {
-                            b.append_value(us);
-                        } else {
-                            b.append_null();
-                        }
-                    }
-                    _ => b.append_null(),
-                }
+                b.append_option(mysql_time_of_day(row.as_ref(col_idx))?);
             }
             Ok(Arc::new(b.finish()))
         }
@@ -2152,19 +2169,30 @@ mod roast_mysql_bit_decode_tests {
             .expect("Time64");
         assert_eq!(t.value(0), 49_530_123_456, "micros since midnight");
 
-        // A negative TIME, and one carrying whole DAYS — MySQL's TIME is a signed
-        // interval, not a clock reading, so both are representable and both were
-        // unexercised.
-        let a = one_array(
-            v_time(true, 2, 1, 0, 0, 0),
-            &DataType::Time64(TimeUnit::Microsecond),
-            "time64/negative_days",
-        );
-        let t = a
-            .as_any()
-            .downcast_ref::<Time64MicrosecondArray>()
-            .expect("Time64");
-        assert_eq!(t.value(0), -(2 * 86_400 + 3_600) * 1_000_000);
+        // A negative TIME, and one carrying whole DAYS: MySQL's TIME is a signed
+        // duration, and a Parquet TIME holds only [00:00, 24:00), so both are refused.
+        for (neg, days, h, label) in [
+            (true, 2, 1, "negative"),
+            (false, 34, 22, "838h"),
+            (false, 1, 0, "24h"),
+        ] {
+            let (def, bytes) = v_time(neg, days, h, 0, 0, 1);
+            let rows = fetch_binary_rows(vec![def], vec![vec![Some(bytes)]]);
+            let err = build_array(
+                &DataType::Time64(TimeUnit::Microsecond),
+                0,
+                &rows,
+                false,
+                "c",
+                None,
+            )
+            .expect_err(label);
+            assert_eq!(
+                crate::error::error_code(&err),
+                Some("RIVET_SOURCE_VALUE_UNREPRESENTABLE"),
+                "{label}: {err:#}"
+            );
+        }
 
         // The Bytes fallback of the time arm.
         let a = one_array(

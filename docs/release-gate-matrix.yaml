@@ -122,6 +122,13 @@ scenarios:
     mssql:    test
     mongo:    { na: "Mongo is a JSON-blob model (full-scan only) — no per-engine type matrix; the loss/dup arm still runs under integrity_types" }
     oracle:   test
+  - id: sentinels
+    what: "Boundary values must round-trip EXACTLY or fail loudly, never succeed changed. Per engine, tables created at run time in the gate's own container hold NULL rows, epoch and epoch-1us, the type's min/max, leap days, empty vs 'NULL' text, nil uuids, extreme decimals and floats; one-value tables hold what may be unrepresentable (PG infinity/BC/24:00/NaN, MySQL zero dates and YEAR 0000, SQL Server 100ns datetime2/xml/sql_variant, Oracle BC dates and TIMESTAMP(9)). Each goes through the full and keyset paths and is compared to the SOURCE row by DuckDB. Success with a changed value is the defect (a zero date that became 1970-01-01, a NULL that became epoch)."
+    postgres: test
+    mysql:    test
+    mssql:    test
+    mongo:    { na: "Mongo is a JSON-blob model (_id + extended-JSON document), so there is no per-column value mapping to degrade; its values are graded under integrity_types and mongo_keyset" }
+    oracle:   test
   - id: keyset_parallel
     what: "parallel:4 keyset fan-out: loss/dup 0 (DuckDB oracle) AND >=2 distinct pk_w{ridx} workers (no silent degrade to sequential)."
     postgres: test
