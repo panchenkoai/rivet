@@ -619,6 +619,12 @@ pub(crate) fn run_to_files(
                 break;
             }
         }
+        if !hit_max
+            && !unacked_commit
+            && let (Some(ck), Some(frontier)) = (run.checkpoint, stream.drained_frontier())
+        {
+            stream.checkpoint_of(&frontier).save(ck)?;
+        }
         Ok(())
     })();
 
@@ -1476,6 +1482,56 @@ mod tests {
             self.acked.push(position.clone());
             Ok(())
         }
+    }
+
+    /// A `FakeStream` that also reports a drained frontier.
+    struct FrontierStream(FakeStream, Position);
+
+    impl ChangeStream for FrontierStream {
+        fn engine(&self) -> super::super::CdcEngine {
+            super::super::CdcEngine::Mssql
+        }
+        fn next_change(&mut self) -> Option<Result<ChangeEvent>> {
+            self.0.next_change()
+        }
+        fn ack(&mut self, position: &Position) -> Result<()> {
+            self.0.ack(position)
+        }
+        fn drained_frontier(&self) -> Option<Position> {
+            Some(self.1.clone())
+        }
+    }
+
+    #[test]
+    fn an_idle_drain_checkpoints_the_drained_frontier_but_a_max_events_stop_does_not() {
+        let (dir, ck_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (dest, cols) = (local_dest(&dir), int_col());
+        let ck = ck_dir.path().join("ck.json");
+        let frontier = Position(serde_json::json!({ "lsn": "FF" }));
+        let run = |events: Vec<ChangeEvent>, max_events: Option<usize>| {
+            let mut s = FrontierStream(
+                FakeStream {
+                    events: VecDeque::from(events),
+                    acked: Vec::new(),
+                },
+                frontier.clone(),
+            );
+            let mut c = cfg(dest.as_ref(), &cols, FormatType::Parquet, 100);
+            c.checkpoint = Some(ck.clone());
+            c.max_events = max_events;
+            run_to_files(&mut s, c).1.unwrap();
+            Position::load(&ck).unwrap().expect("a checkpoint").0
+        };
+        assert_eq!(
+            run(Vec::new(), None),
+            frontier.0,
+            "an idle bounded drain must move the checkpoint to the drained frontier"
+        );
+        assert_eq!(
+            run(vec![insert(1), insert(2)], Some(1)),
+            insert(1).position.0,
+            "a max_events stop has not drained the window, so the frontier must not be saved"
+        );
     }
 
     // Ultrareview bug_002: MySQL marks only the LAST event of a transaction

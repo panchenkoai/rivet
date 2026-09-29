@@ -540,6 +540,11 @@ pub(crate) trait ChangeStream {
         None
     }
 
+    /// After a clean drain, a position past everything read that nothing captured can precede.
+    fn drained_frontier(&self) -> Option<Position> {
+        None
+    }
+
     /// The checkpoint to persist for `position`; an engine adds what verifies a later resume.
     fn checkpoint_of(&self, position: &Position) -> Position {
         position.clone()

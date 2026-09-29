@@ -796,7 +796,7 @@ impl MssqlChangeStream {
                         .and_then(|r| r.get::<&str, _>(0).map(|s| s.to_string())),
                 )
             })?;
-            let max = max.map(|s| s.trim_start_matches("0x").to_string());
+            let max = max.map(|s| s.trim_start_matches("0x").to_ascii_lowercase());
             // The value is inlined into `0x{hex}` in every poll — hold it to the
             // same charset gate as the resume LSN, even though the server made it.
             if let Some(hex) = &max
@@ -1168,6 +1168,16 @@ impl ChangeStream for MssqlChangeStream {
         with_identity(position, self.identity.as_ref())
     }
 
+    fn drained_frontier(&self) -> Option<crate::source::cdc::Position> {
+        drained_frontier(
+            self.exhausted,
+            self.from_is_pin,
+            self.bound.as_deref(),
+            self.from_lsn.as_deref(),
+        )
+        .map(|lsn| Position(json!({ "lsn": lsn })))
+    }
+
     fn next_change(&mut self) -> Option<Result<ChangeEvent>> {
         // Refill a bounded batch whenever the buffer drains, advancing the cursor
         // each time, until a poll returns nothing (window drained to the max LSN).
@@ -1190,6 +1200,17 @@ impl ChangeStream for MssqlChangeStream {
         }
         None
     }
+}
+
+/// The open-time bound a drained bounded run may checkpoint at, when it is past a resumed cursor.
+fn drained_frontier(
+    exhausted: bool,
+    from_is_pin: bool,
+    bound: Option<&str>,
+    from: Option<&str>,
+) -> Option<String> {
+    let (b, f) = (bound?.to_ascii_lowercase(), from?.to_ascii_lowercase());
+    (exhausted && !from_is_pin && b.len() == f.len() && b > f).then_some(b)
 }
 
 /// Does the in-memory head's group continue onto the spilled tail?
@@ -1426,6 +1447,42 @@ fn probe_max_lsn(probe: &crate::source::mssql::MssqlCdcProbe) -> Option<String> 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_a_drained_resumed_cursor_below_the_bound_yields_a_frontier() {
+        use super::drained_frontier as f;
+        assert_eq!(
+            f(true, false, Some("00FF"), Some("0010")),
+            Some("00ff".into())
+        );
+        assert_eq!(
+            f(false, false, Some("00ff"), Some("0010")),
+            None,
+            "not drained"
+        );
+        assert_eq!(
+            f(true, true, Some("00ff"), Some("0010")),
+            None,
+            "a pin keeps its floor"
+        );
+        assert_eq!(f(true, false, None, Some("0010")), None, "daemon: no bound");
+        assert_eq!(f(true, false, Some("00ff"), None), None, "no cursor");
+        assert_eq!(
+            f(true, false, Some("00ff"), Some("00ff")),
+            None,
+            "already there"
+        );
+        assert_eq!(
+            f(true, false, Some("0010"), Some("00ff")),
+            None,
+            "never backwards"
+        );
+        assert_eq!(
+            f(true, false, Some("0fff"), Some("ff")),
+            None,
+            "unequal widths"
+        );
+    }
+
     #[test]
     fn the_pinned_anchor_uses_the_event_lsn_case_so_warehouse_views_rank_it_right() {
         let probe = crate::source::mssql::MssqlCdcProbe {

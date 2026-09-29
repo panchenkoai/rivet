@@ -819,7 +819,7 @@ fn oracle_class_census_is_pinned() {
 // declared parts), +8 presence — six refusals whose oracle is the refusal text itself
 // (corrupt, retention gap, foreign DBID, no ALL COLUMNS logging, a LOB, an unknown
 // table), the NDJSON source-resolution CLI cell, and the shared intra-transaction check.
-const PIN_INDEPENDENT: usize = 97;
+const PIN_INDEPENDENT: usize = 98;
 // 2026-09-28, source connection ceilings: +3 shared codec — the run's captured row is the
 // fixture check; the oracle is the server's own connection counter.
 const PIN_SHARED_CODEC: usize = 85;
