@@ -310,6 +310,15 @@ pub(super) fn needs_source_engine(plans: &[load::plan::LoadPlan]) -> bool {
     plans.iter().any(|p| p.mode == load::plan::LoadMode::Cdc)
 }
 
+/// Why a load from `mine` into a table last loaded from `other` is refused.
+pub(super) fn source_conflict_refusal(target_fqtn: &str, other: &str, mine: &str) -> String {
+    format!(
+        "target table `{target_fqtn}` was last loaded from `{other}` and this load carries \
+         `{mine}` — loading would REPLACE the other source's rows, and both commands would \
+         report success. Give this source its own target table."
+    )
+}
+
 /// Why a CDC snapshot over an earlier full-load table is refused, with the ways out this warehouse takes.
 pub(super) fn snapshot_over_full_table_refusal(
     fqtn: &str,
@@ -695,13 +704,7 @@ fn prepare_load(
             ))
         })?;
         if let Some(other) = conflicting_source_ident(&mine, &prior) {
-            anyhow::bail!(
-                "target table `{target_fqtn}` was last loaded from `{other}` and this load \
-                 carries `{mine}` — loading would REPLACE the other source's rows, and both \
-                 commands would report success. Name a different `dataset:`/table for this \
-                 source, or load them into one table deliberately by giving them one export \
-                 name and one prefix."
-            );
+            anyhow::bail!("{}", source_conflict_refusal(target_fqtn, other, &mine));
         }
     }
     let manifests: Vec<_> = new.iter().map(|(_, m)| m.clone()).collect();
@@ -3877,6 +3880,21 @@ mod live_only_decisions {
             "an artifact written before the ledger recorded an identity reads as UNKNOWN and \
              must never block — an upgrade may not start refusing yesterday's loads"
         );
+    }
+
+    /// One prefix under one export name is refused by `ensure_single_source`, and
+    /// `dataset:` is a BigQuery-only key, so the refusal offers neither.
+    #[test]
+    fn the_cross_source_refusal_offers_only_a_remedy_the_product_accepts() {
+        let msg = source_conflict_refusal("d.orders", "postgres:public.orders", "mysql:app.orders");
+        assert!(
+            msg.ends_with(
+                "both commands would report success. Give this source its own target table."
+            ),
+            "{msg}"
+        );
+        assert!(!msg.contains("one export name and one prefix"), "{msg}");
+        assert!(!msg.contains("`dataset:`"), "{msg}");
     }
 
     /// A run still WRITING into the prefix stays retryable: its id is not
