@@ -39,7 +39,15 @@ pub(super) fn generate_config(
     let unbounded = table_has_unbounded_decimal_columns(info);
     let mut lines = config_header_lines(st, &header, unbounded, provenance, tls);
     lines.push("exports:".to_string());
-    lines.extend(export_block_lines(info, st, dest, mode_override, false, 0));
+    lines.extend(export_block_lines(
+        info,
+        st,
+        dest,
+        mode_override,
+        false,
+        0,
+        None,
+    ));
     let compactable = matches!(
         mode_override.unwrap_or_else(|| info.suggest_mode()),
         "incremental" | "cdc"
@@ -114,6 +122,7 @@ pub(super) fn generate_schema_config(
                 Some(recipe_mode(info)),
                 true,
                 0,
+                None,
             ));
         }
         let readable: Vec<TableInfo> = readable.into_iter().cloned().collect();
@@ -129,6 +138,8 @@ pub(super) fn generate_schema_config(
     };
     lines.push(dest_note.to_string());
     lines.push("exports:".to_string());
+    let names: Vec<&str> = infos.iter().map(|i| i.table.as_str()).collect();
+    let idents = unique_cdc_idents(&names);
     for (ordinal, info) in infos.iter().enumerate() {
         lines.extend(export_block_lines(
             info,
@@ -137,6 +148,7 @@ pub(super) fn generate_schema_config(
             mode_override,
             false,
             ordinal,
+            Some(&idents[ordinal]),
         ));
     }
     let compactable = infos.iter().any(|i| {
@@ -721,6 +733,7 @@ fn export_block_lines(
     mode_override: Option<&str>,
     recipe: bool,
     ordinal: usize,
+    ident: Option<&str>,
 ) -> Vec<String> {
     let mode = mode_override.unwrap_or_else(|| info.suggest_mode());
     let columns: Vec<&str> = info.columns.iter().map(|c| c.name.as_str()).collect();
@@ -739,7 +752,8 @@ fn export_block_lines(
     // CDC reads the transaction log, not a query — a wholly different block
     // (no cursor/chunk/meta_columns; engine-specific stream knobs instead).
     if mode == "cdc" {
-        return cdc_export_lines(info, source_type, dest, &qualified_table, ordinal);
+        let ident = ident.map_or_else(|| cdc_ident(&info.table), str::to_string);
+        return cdc_export_lines(info, source_type, dest, &qualified_table, ordinal, &ident);
     }
 
     // For `mode: full` on a plain table, emit the `table:` shortcut: it produces
@@ -1012,6 +1026,7 @@ fn cdc_export_lines(
     dest: &InitYamlDestination,
     qualified_table: &str,
     ordinal: usize,
+    ident: &str,
 ) -> Vec<String> {
     let mut lines = vec![
         format!("  - name: {}", yaml_quote_if_needed(&info.table)),
@@ -1028,9 +1043,9 @@ fn cdc_export_lines(
             // checkpoint re-reads the ENTIRE retained change table every run.
             "      checkpoint: ./cdc/{}.ckpt  # resume position; keep it (semantics of \
 omitting differ per engine — see cdc.md)",
-            cdc_ident(&info.table)
+            ident
         ),
-        "      until_current: true  # drain to the current log end and exit (good for a scheduler); omit to stream"
+        "      until_current: true  # drain to the current log end and exit (good for a scheduler)"
             .to_string(),
     ];
     match source_type {
@@ -1044,7 +1059,7 @@ omitting differ per engine — see cdc.md)",
         // `rivet_Orders` is refused by the server the moment the stream opens.
         "postgres" => lines.push(format!(
             "      slot: rivet_{}  # logical slot (auto-created); source needs wal_level=logical + a REPLICATION role",
-            cdc_ident(&info.table).to_lowercase()
+            ident.to_lowercase()
         )),
         "mssql" => lines.push(format!(
             "      capture_instance: {}_{}  # sp_cdc_enable_table instance; needs CDC enabled + SQL Server Agent",
@@ -1245,6 +1260,25 @@ fn cdc_multiplex_column_lines(infos: &[TableInfo]) -> Vec<String> {
         lines.extend(body);
     }
     lines
+}
+
+/// Per-table CDC identifiers, suffixed with a hash of the raw name only where two sanitise to one (case-insensitively).
+fn unique_cdc_idents(names: &[&str]) -> Vec<String> {
+    let base: Vec<String> = names.iter().map(|n| cdc_ident(n)).collect();
+    base.iter()
+        .zip(names)
+        .map(|(b, raw)| {
+            let key = b.to_lowercase();
+            if base.iter().filter(|o| o.to_lowercase() == key).count() > 1 {
+                format!(
+                    "{b}_{:08x}",
+                    xxhash_rust::xxh3::xxh3_64(raw.as_bytes()) as u32
+                )
+            } else {
+                b.clone()
+            }
+        })
+        .collect()
 }
 
 /// Sanitise a table name into a plain identifier for a checkpoint filename /
@@ -1563,7 +1597,8 @@ mod tests {
             let mut info = make_table(vec![col("id", "bigint"), col("updated_at", "timestamp")]);
             info.schema = schema.into();
             info.table = "rivet_type_matrix".into();
-            let block = export_block_lines(&info, engine, &dest, Some(mode), false, 0).join("\n");
+            let block =
+                export_block_lines(&info, engine, &dest, Some(mode), false, 0, None).join("\n");
             let query: String = block
                 .lines()
                 .skip_while(|l| !l.trim_start().starts_with("query:"))
@@ -1586,6 +1621,65 @@ mod tests {
             });
             assert_eq!(got.as_deref(), Some(want), "{engine}: {query}");
         }
+    }
+
+    /// Per-table CDC scaffolds whose names sanitise to one identifier still load: slots and checkpoints stay distinct.
+    #[test]
+    fn per_table_cdc_scaffold_gives_colliding_names_distinct_slots_and_checkpoints() {
+        let names = [
+            "заказы",
+            "товары",
+            "Orders",
+            "orders",
+            "order-items",
+            "order_items",
+            "plain",
+        ];
+        for (url, key) in [
+            ("postgresql://u:p@localhost/db", "slot: "),
+            ("sqlserver://u:p@localhost/db", "checkpoint: "),
+        ] {
+            let infos: Vec<TableInfo> = names
+                .iter()
+                .map(|n| TableInfo {
+                    schema: "sales".into(),
+                    table: (*n).into(),
+                    ..make_table(vec![col("id", "bigint")])
+                })
+                .collect();
+            let yaml = generate_schema_config(
+                &infos,
+                url,
+                &crate::init::SourceProvenance::Inline,
+                "db",
+                &InitYamlDestination::default(),
+                Some("cdc"),
+                None,
+            )
+            .unwrap();
+            crate::config::Config::from_yaml(&yaml)
+                .unwrap_or_else(|e| panic!("{url}: generated config refused: {e:#}\n{yaml}"));
+            let values = |k: &str| -> Vec<String> {
+                yaml.lines()
+                    .filter_map(|l| l.trim_start().strip_prefix(k))
+                    .map(|v| v.split_whitespace().next().unwrap().to_lowercase())
+                    .collect()
+            };
+            for k in ["checkpoint: ", key] {
+                let v = values(k);
+                let distinct: std::collections::HashSet<_> = v.iter().collect();
+                assert_eq!(v.len(), names.len(), "{k}\n{yaml}");
+                assert_eq!(distinct.len(), v.len(), "{k} collides: {v:?}");
+            }
+            assert!(yaml.contains("checkpoint: ./cdc/plain.ckpt "), "{yaml}");
+            let flat: Vec<&str> = yaml.split_whitespace().filter(|w| *w != "#").collect();
+            assert!(!flat.join(" ").contains("omit to stream"), "{yaml}");
+        }
+        let cdc: crate::config::CdcExportConfig = serde_yaml_ng::from_str("{}").unwrap();
+        assert!(
+            cdc.until_current,
+            "omitting until_current keeps the bounded drain"
+        );
     }
 
     fn make_table(cols: Vec<ColumnInfo>) -> TableInfo {
