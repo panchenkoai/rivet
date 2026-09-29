@@ -892,8 +892,9 @@ impl Config {
                     "export '{}': partition_by is not compatible with a `load:` block — a \
                      partitioned export writes one manifest per partition sub-prefix, but the \
                      warehouse loader would load only a single partition (and `cleanup_source` \
-                     would then wipe the rest). Load a non-partitioned export, or drop `load:` \
-                     and run `rivet load` per partition.",
+                     would then wipe the rest). To load it, remove `partition_by:` from this \
+                     export; to keep the partitioned layout, remove the `load:` block — the \
+                     export then stays Parquet-only, since `rivet load` has no per-partition mode.",
                     export.name,
                 );
             }
@@ -2158,6 +2159,14 @@ load: { target: bigquery, project: p, dataset: d }
             err.to_string()
                 .contains("partition_by is not compatible with a `load:` block"),
             "a top-level `load:` + partition_by must be rejected: {err}"
+        );
+        assert!(
+            err.to_string().ends_with(
+                "To load it, remove `partition_by:` from this export; to keep the partitioned \
+                 layout, remove the `load:` block — the export then stays Parquet-only, since \
+                 `rivet load` has no per-partition mode."
+            ),
+            "the remedy must name only what works: {err}"
         );
 
         // Without the top-level load, the same partitioned export is accepted —
