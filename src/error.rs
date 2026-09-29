@@ -391,6 +391,11 @@ pub mod codes {
         "RIVET_CONFIG_SOURCE_URL_SCHEME_MISMATCH",
         "make `source.type` and the URL scheme name the same engine",
     );
+    /// A MySQL keyset key under a `uuid` column override: the seek binds hex text, not the stored order.
+    pub const CONFIG_KEYSET_KEY_UUID_OVERRIDE: Code = usage(
+        "RIVET_CONFIG_KEYSET_KEY_UUID_OVERRIDE",
+        "key the keyset on another unique column, or use `mode: full` for this table",
+    );
     /// A statement that ran past the configured duration cap, carried by the existing
     /// `source::StatementDurationTimeout` marker (recognised in [`super::error_code`]).
     pub const SOURCE_STATEMENT_TIMEOUT: Code = environment(
@@ -494,6 +499,7 @@ pub mod codes {
         CONFIG_CSV_LOAD_UNSUPPORTED,
         CONFIG_SOURCE_MODE_UNSUPPORTED,
         CONFIG_SOURCE_URL_SCHEME_MISMATCH,
+        CONFIG_KEYSET_KEY_UUID_OVERRIDE,
         SOURCE_STATEMENT_TIMEOUT,
         SOURCE_CURSOR_FINER_THAN_MICROSECOND,
         SOURCE_CDC_FOREIGN_CHECKPOINT,

@@ -25,6 +25,7 @@ Every failure rivet names carries a stable `RIVET_<FAMILY>_<NAME>` code: in `--j
 | `RIVET_CONFIG_CSV_LOAD_UNSUPPORTED` | usage | 1 | use `format: parquet` for an export with a `load:` section |
 | `RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED` | usage | 1 | use a mode this source supports (MongoDB: `full`) |
 | `RIVET_CONFIG_SOURCE_URL_SCHEME_MISMATCH` | usage | 1 | make `source.type` and the URL scheme name the same engine |
+| `RIVET_CONFIG_KEYSET_KEY_UUID_OVERRIDE` | usage | 1 | key the keyset on another unique column, or use `mode: full` for this table |
 | `RIVET_SOURCE_STATEMENT_TIMEOUT` | environment | 2 if transient, else 1 | raise `tuning.statement_timeout_s`, or narrow the chunk |
 | `RIVET_SOURCE_CURSOR_FINER_THAN_MICROSECOND` | refusal | 5 | cursor on a column at microsecond precision or coarser, or cast the cursor to TIMESTAMP(6) in a curated query |
 | `RIVET_SOURCE_CDC_FOREIGN_CHECKPOINT` | refusal | 5 | delete the checkpoint so the next run anchors afresh FIRST, then re-snapshot the tables |

@@ -592,6 +592,33 @@ fn keyset_recovery(export: &ExportConfig) -> (bool, bool) {
     )
 }
 
+/// Refuse a MySQL keyset key under a `uuid` override: the seek binds hex text, which is not the key's stored order.
+fn refuse_mysql_uuid_keyset_key(
+    source_type: crate::config::SourceType,
+    export: &ExportConfig,
+    key: &str,
+) -> Result<()> {
+    let uuid_override = export.columns.iter().any(|(c, t)| {
+        c.eq_ignore_ascii_case(key)
+            && matches!(
+                crate::types::parse_type_str(t),
+                Ok(crate::types::RivetType::Uuid)
+            )
+    });
+    if source_type == crate::config::SourceType::Mysql && uuid_override {
+        crate::config_bail!(
+            crate::error::codes::CONFIG_KEYSET_KEY_UUID_OVERRIDE,
+            "export '{}': keyset key '{}' carries a `uuid` override in `columns:` — on MySQL the \
+             seek would bind the rendered hex text against the stored bytes (or a case-sensitive \
+             collation) and skip or repeat rows. Key the keyset on another unique column, or use \
+             `mode: full` for this table.",
+            export.name,
+            key
+        );
+    }
+    Ok(())
+}
+
 fn chunked_strategy_from_introspection(
     source_type: crate::config::SourceType,
     export: &ExportConfig,
@@ -699,6 +726,7 @@ fn chunked_strategy_from_introspection(
             key,
             chunk_size
         );
+        refuse_mysql_uuid_keyset_key(source_type, export, key)?;
         let (checkpoint, incremental) = keyset_recovery(export);
         return Ok(ExtractionStrategy::Keyset(KeysetPlan {
             key_column: key.to_string(),
@@ -779,6 +807,7 @@ fn chunked_strategy_from_introspection(
                         tbl,
                         key
                     );
+                    refuse_mysql_uuid_keyset_key(source_type, export, key)?;
                     let (checkpoint, incremental) = keyset_recovery(export);
                     return Ok(ExtractionStrategy::Keyset(KeysetPlan {
                         key_column: key.to_string(),
@@ -1598,6 +1627,35 @@ mod tests {
         e.mode = ExportMode::Chunked;
         e.chunk_column = Some("id".into());
         e
+    }
+
+    #[test]
+    fn a_mysql_keyset_key_with_a_uuid_override_is_refused() {
+        use crate::config::SourceType;
+        let i = intro(None, &["id"], 1_000_000, Some(100), &[]);
+        let mut e = chunked_export();
+        e.chunk_column = None;
+        e.chunk_by_key = Some("id".into());
+        e.columns.insert("ID".into(), "uuid".into());
+        let err =
+            chunked_strategy_from_introspection(SourceType::Mysql, &e, "t", 3, &i).unwrap_err();
+        assert!(
+            crate::error::error_code(&err) == Some("RIVET_CONFIG_KEYSET_KEY_UUID_OVERRIDE"),
+            "{err}"
+        );
+        e.chunk_by_key = None;
+        assert!(
+            chunked_strategy_from_introspection(SourceType::Mysql, &e, "t", 3, &i).is_err(),
+            "the auto-selected keyset key is refused too"
+        );
+        e.chunk_by_key = Some("id".into());
+        assert!(
+            matches!(
+                chunked_strategy_from_introspection(SourceType::Postgres, &e, "t", 3, &i),
+                Ok(ExtractionStrategy::Keyset(_))
+            ),
+            "PostgreSQL casts the literal to uuid, so its keyset stays"
+        );
     }
 
     // ── mutation-W5 gap closure ──────────────────────────────────────────────
