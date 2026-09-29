@@ -349,6 +349,7 @@ pub(crate) fn run_chunked_sequential_checkpoint(
         );
     }
 
+    super::prune_superseded_attempts(summary, &state.list_chunk_tasks_for_run(&run_id)?);
     pb.finish(summary.total_rows);
     state.finalize_chunk_run_completed(&run_id)?;
     // ADR-0008 PG2 committed boundary via the shared finalize seam — the

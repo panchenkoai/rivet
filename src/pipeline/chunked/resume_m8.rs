@@ -177,6 +177,31 @@ fn is_surviving_attempt(
     }
 }
 
+/// Drop from a completing run's manifest the parts of chunk attempts a later attempt superseded, with their counters.
+pub(crate) fn prune_superseded_attempts(
+    summary: &mut RunSummary,
+    tasks: &[crate::state::ChunkTaskInfo],
+) -> usize {
+    let surviving = surviving_attempts(tasks);
+    let (kept, pruned): (Vec<_>, Vec<_>) = std::mem::take(&mut summary.manifest_parts)
+        .into_iter()
+        .partition(|p| is_surviving_attempt(&p.path, &surviving));
+    summary.manifest_parts = kept;
+    for p in &pruned {
+        log::warn!(
+            "export '{}': part '{}' is debris of a chunk attempt a later attempt completed — \
+             left out of the manifest",
+            summary.export_name,
+            p.path
+        );
+        summary.total_rows -= p.rows;
+        summary.bytes_written = summary.bytes_written.saturating_sub(p.size_bytes);
+        summary.files_produced = summary.files_produced.saturating_sub(1);
+        summary.files_committed = summary.files_committed.saturating_sub(1);
+    }
+    pruned.len()
+}
+
 /// Completed, undeclared chunks whose surviving attempt's `file_log` rows are absent or short of the chunk's rows.
 fn under_logged_chunks(
     tasks: &[crate::state::ChunkTaskInfo],
@@ -1995,6 +2020,54 @@ mod tests {
                 (Some(2), short.to_string())
             ]
         );
+    }
+
+    /// A chunk that failed after writing parts, was re-claimed and completed in the SAME
+    /// run leaves its failed attempt's parts in `manifest_parts`: the completing run must
+    /// declare only the attempt that completed each chunk (rotation siblings and non-chunk
+    /// parts kept), with the counters taken down to match — never the rows twice.
+    #[test]
+    fn a_completing_run_declares_only_the_attempt_that_completed_each_chunk() {
+        let won = "orders_chunk0_00000000000000bb_p0.parquet";
+        let won_sibling = "orders_chunk0_00000000000000bb_p1.parquet";
+        let debris = "orders_chunk0_00000000000000aa_p0.parquet";
+        let mut summary =
+            crate::pipeline::summary::RunSummary::stub_for_testing("r", String::from("orders"));
+        for (path, rows) in [
+            (debris, 7),
+            (won, 7),
+            (won_sibling, 3),
+            ("other.parquet", 1),
+        ] {
+            summary.manifest_parts.push(m8_part(path, rows, 100));
+            summary.total_rows += rows;
+            summary.bytes_written += 100;
+            summary.files_produced += 1;
+            summary.files_committed += 1;
+        }
+        let tasks = [ChunkTaskInfo {
+            chunk_index: 0,
+            start_key: String::new(),
+            end_key: String::new(),
+            status: "completed".into(),
+            attempts: 2,
+            last_error: None,
+            rows_written: Some(10),
+            file_name: Some(won.into()),
+        }];
+
+        assert_eq!(prune_superseded_attempts(&mut summary, &tasks), 1);
+
+        let declared: Vec<&str> = summary
+            .manifest_parts
+            .iter()
+            .map(|p| p.path.as_str())
+            .collect();
+        assert_eq!(declared, [won, won_sibling, "other.parquet"]);
+        assert_eq!(summary.total_rows, 11);
+        assert_eq!(summary.bytes_written, 300);
+        assert_eq!(summary.files_produced, 3);
+        assert_eq!(summary.files_committed, 3);
     }
 
     #[test]
