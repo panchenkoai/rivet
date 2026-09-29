@@ -472,6 +472,16 @@ pub mod codes {
         "RIVET_SOURCE_CDC_PREREQUISITE",
         "apply the setup statement the message names, then re-run (docs/reference/cdc.md)",
     );
+    /// A source value the column's Arrow type has no faithful reading for (PG `infinity`, `24:00:00`).
+    pub const SOURCE_VALUE_UNREPRESENTABLE: Code = refusal(
+        "RIVET_SOURCE_VALUE_UNREPRESENTABLE",
+        "map the value to a representable one in the export's `query:`, or exclude the column",
+    );
+    /// A `columns:` override declares a type the source's wire value cannot be read as.
+    pub const SOURCE_OVERRIDE_WIRE_MISMATCH: Code = usage(
+        "RIVET_SOURCE_OVERRIDE_WIRE_MISMATCH",
+        "remove or correct the column's `columns:` override, or CAST the column to that type in the export's `query:`",
+    );
     pub const LOAD_VALUE_OUT_OF_TARGET_RANGE: Code = refusal(
         "RIVET_LOAD_VALUE_OUT_OF_TARGET_RANGE",
         "the warehouse type cannot hold this value; declare a wider type (e.g. String) for the column, or fix the source value",
@@ -519,6 +529,8 @@ pub mod codes {
         SOURCE_CDC_UNDECODABLE,
         SOURCE_CDC_CELL_UNSUPPORTED,
         SOURCE_CDC_PREREQUISITE,
+        SOURCE_VALUE_UNREPRESENTABLE,
+        SOURCE_OVERRIDE_WIRE_MISMATCH,
         STATE_SCHEMA_NEWER,
         STATE_CURSOR_OWNER_MISMATCH,
         STATE_KEYSET_SEQUENTIAL_ANCHOR_UNFINISHED,

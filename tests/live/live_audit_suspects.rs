@@ -888,3 +888,45 @@ fn mssql_check_reports_a_row_estimate_for_a_read_only_login() {
         "{said}"
     );
 }
+
+/// A PostgreSQL value rivet cannot hold faithfully fails the run with the coded
+/// refusal naming the column — never a panic (exit 101), never a silent value.
+fn pg_value_refused(label: &str, select: &str, column: &str) {
+    let rig = Rig::pg_batch(&unique_name(label)).query(select);
+    let out = rig.run();
+    let said = said(&out);
+    assert_ne!(
+        out.status.code(),
+        Some(101),
+        "panicked instead of refusing: {said}"
+    );
+    assert!(
+        !out.status.success(),
+        "a value rivet cannot hold exported: {said}"
+    );
+    assert!(
+        said.contains(&format!("column `{column}` holds a")) && said.contains("cannot represent"),
+        "{said}"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn pg_batch_time_24_00_is_refused_not_written_as_midnight() {
+    pg_value_refused("aud_t24", "SELECT 1 AS id, '24:00:00'::time AS t", "t");
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn pg_batch_plain_timestamp_infinity_is_refused_not_a_panic() {
+    pg_value_refused(
+        "aud_tsinf",
+        "SELECT 1 AS id, 'infinity'::timestamp AS v",
+        "v",
+    );
+    pg_value_refused(
+        "aud_tsninf",
+        "SELECT 1 AS id, '-infinity'::timestamp AS v",
+        "v",
+    );
+}
