@@ -383,12 +383,12 @@ Rivet exports the WKT text as a `Utf8` (string) column. Downstream tools (DuckDB
 
 ## `exports[]` — value-based partitioning
 
-Orthogonal to `mode`: splits rows into Hive-style `col=value/` destination
-sub-folders by a date column. See [partitioning.md](../partitioning.md).
+Splits a `full`, `chunked` or `incremental` export's rows into Hive-style
+`col=value/` destination sub-folders by a date column. See [partitioning.md](../partitioning.md).
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `partition_by` | string | no | — | Date/timestamp column to bucket rows by. Requires a `{partition}` token in `destination.path`/`prefix`. NULLs → `col=__HIVE_DEFAULT_PARTITION__/`. Not compatible with `mode: time_window`. |
+| `partition_by` | string | no | — | Date/timestamp column to bucket rows by. Requires a `{partition}` token in `destination.path`/`prefix`. NULLs → `col=__HIVE_DEFAULT_PARTITION__/`. Not compatible with `mode: time_window`, `mode: cdc`, `chunk_by_key`, a `load:` block (per-export or top-level), or a MongoDB source. |
 | `partition_granularity` | `day` \| `month` \| `year` | no | `day` | Bucket width. |
 
 ---
