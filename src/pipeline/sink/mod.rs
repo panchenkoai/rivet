@@ -48,6 +48,8 @@ pub(crate) struct ExportSink {
     /// When `Some`, `on_batch` extracts the last cursor value inline so we never
     /// hold a full batch in memory just for post-run cursor commit.
     pub(in crate::pipeline) cursor_column: Option<String>,
+    /// The `columns:` override keys, checked against the result's spelling at `on_schema`.
+    override_columns: Vec<String>,
     /// Columns the settle window compares; must be date/timestamp.
     pub(in crate::pipeline) settle_columns: Vec<String>,
     /// Last extracted cursor value — set by `on_batch`, consumed by `run_single_export`.
@@ -437,6 +439,7 @@ impl ExportSink {
             bytes_read: std::sync::Arc::clone(&plan.bytes_read),
             part_rows: 0,
             cursor_column: plan.strategy.cursor_extract_column().map(str::to_string),
+            override_columns: plan.column_overrides.keys().cloned().collect(),
             settle_columns: plan
                 .strategy
                 .incremental_plan()
@@ -875,6 +878,23 @@ impl ExportSink {
     }
 }
 
+/// The first override key absent from `schema` as spelled but present ignoring case: `(key, real name)`.
+fn override_case_miss<'a>(
+    keys: &'a [String],
+    schema: &'a arrow::datatypes::Schema,
+) -> Option<(&'a str, &'a str)> {
+    keys.iter().find_map(|k| {
+        if schema.index_of(k).is_ok() {
+            return None;
+        }
+        schema
+            .fields()
+            .iter()
+            .find(|f| f.name().eq_ignore_ascii_case(k))
+            .map(|f| (k.as_str(), f.name().as_str()))
+    })
+}
+
 impl BatchSink for ExportSink {
     fn on_schema(&mut self, schema: SchemaRef) -> Result<()> {
         // Strip the synthetic column only when it's actually present in the schema —
@@ -899,6 +919,14 @@ impl BatchSink for ExportSink {
                  `cursor_column: {}`.",
                 f.name(),
                 f.name()
+            );
+        }
+        if let Some((key, real)) = override_case_miss(&self.override_columns, &schema) {
+            crate::rivet_bail!(
+                crate::error::codes::CONFIG_COLUMN_OVERRIDE_CASE,
+                "`columns: {{ {key}: ... }}` names no result-set column; the result names it \
+                 `{real}`, and override keys match exactly, so the override would be silently \
+                 ignored. Spell the key `{real}`."
             );
         }
         for name in &self.settle_columns {

@@ -24,7 +24,7 @@ use crate::error::Result;
 /// row data) can be distilled into a checked-in catalog fixture and replayed
 /// offline against the strategy-decision logic (`catalog_replay`) — the messy DB
 /// becomes a regression oracle with zero customer-data exposure.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ColumnInfo {
     pub name: String,
     pub data_type: String,
@@ -42,6 +42,12 @@ pub(crate) struct ColumnInfo {
     /// so pre-existing catalog-replay fixtures still parse.
     #[serde(default)]
     pub is_indexed: bool,
+    /// Set by an engine whose planner refuses this column as a keyset key although its type name reads as one.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub not_keyset: bool,
+    /// Set by an engine whose run refuses this column as an incremental cursor although its type name reads as one.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub not_cursor: bool,
 }
 
 /// Table metadata used to generate the config scaffold and discovery artifact.
@@ -154,6 +160,7 @@ impl TableInfo {
             .iter()
             .filter(|c| {
                 is_timestamp_type(&c.data_type)
+                    && !c.not_cursor
                     && !is_tombstone_stamp(&c.name)
                     && !is_coarse_stamp_type(&c.data_type)
             })
@@ -174,12 +181,8 @@ impl TableInfo {
     /// PK, no PK, or a decimal-typed PK.
     pub(crate) fn keysettable_pk_column(&self) -> Option<&str> {
         let pk = self.single_pk_column()?;
-        let ty = self
-            .columns
-            .iter()
-            .find(|c| c.name == pk)
-            .map(|c| c.data_type.as_str())?;
-        is_keysettable_type(ty).then_some(pk)
+        let col = self.columns.iter().find(|c| c.name == pk)?;
+        (is_keysettable_type(&col.data_type) && !col.not_keyset).then_some(pk)
     }
 
     /// Whether the table has any key `chunked` can page by: an integer column or a keysettable PK.
@@ -1942,6 +1945,7 @@ mod tests {
             numeric_precision: None,
             numeric_scale: None,
             is_indexed: false,
+            ..Default::default()
         }
     }
 
@@ -1959,6 +1963,7 @@ mod tests {
             numeric_precision: None,
             numeric_scale: None,
             is_indexed: idx,
+            ..Default::default()
         };
         // integer PK → indexed → returned.
         let t = make_table(1, vec![c("id", "bigint", true, true)]);
@@ -2067,6 +2072,7 @@ mod tests {
             numeric_precision: None,
             numeric_scale: None,
             is_indexed: false,
+            ..Default::default()
         };
         let info = make_table(
             500_000,
@@ -2346,6 +2352,7 @@ mod tests {
                     numeric_precision: Some(20),
                     numeric_scale: Some(0),
                     is_indexed: false,
+                    ..Default::default()
                 },
                 col("name", "text", false),
             ],
@@ -3316,6 +3323,7 @@ mod tests {
                     numeric_precision: None,
                     numeric_scale: None,
                     is_indexed: false,
+                    ..Default::default()
                 },
             ],
         );

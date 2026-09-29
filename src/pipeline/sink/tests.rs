@@ -498,6 +498,7 @@ fn minimal_sink() -> ExportSink {
         total_rows: 0,
         part_rows: 0,
         cursor_column: None,
+        override_columns: Vec::new(),
         settle_columns: Vec::new(),
         last_cursor_value: None,
         first_cursor_value: None,
@@ -1820,4 +1821,40 @@ fn a_cursor_column_that_matches_only_ignoring_case_is_refused() {
     absent
         .on_schema(Arc::new(Schema::empty()))
         .expect("a zero-row empty schema still opens");
+}
+
+/// A `columns:` key that matches a result column only ignoring case is refused, not silently dropped.
+#[test]
+fn a_column_override_key_spelled_in_another_case_is_refused_at_schema() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("ID", DataType::Int64, false),
+        Field::new("CREATED_AT", DataType::Utf8, true),
+    ]));
+    let mut plan = crate::pipeline::commit::tests::test_plan();
+    plan.column_overrides
+        .insert("created_at".into(), crate::types::RivetType::String);
+    let err = ExportSink::new(&plan)
+        .unwrap()
+        .on_schema(Arc::clone(&schema))
+        .expect_err("a case-only match must be refused");
+    assert_eq!(
+        crate::error::error_code(&err),
+        Some("RIVET_CONFIG_COLUMN_OVERRIDE_CASE"),
+        "{err:#}"
+    );
+    assert!(
+        format!("{err:#}").contains("Spell the key `CREATED_AT`"),
+        "{err:#}"
+    );
+
+    let mut exact = crate::pipeline::commit::tests::test_plan();
+    for key in ["CREATED_AT", "not_there"] {
+        exact
+            .column_overrides
+            .insert(key.into(), crate::types::RivetType::String);
+    }
+    ExportSink::new(&exact)
+        .unwrap()
+        .on_schema(schema)
+        .expect("an exact key, or one naming no column in any case, passes");
 }

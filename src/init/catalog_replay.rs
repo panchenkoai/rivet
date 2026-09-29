@@ -149,6 +149,7 @@ mod tests {
             numeric_precision: None,
             numeric_scale: None,
             is_indexed: false,
+            ..Default::default()
         }
     }
 

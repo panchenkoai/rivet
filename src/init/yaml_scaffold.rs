@@ -1737,6 +1737,7 @@ mod tests {
             numeric_precision: None,
             numeric_scale: None,
             is_indexed: false,
+            ..Default::default()
         }
     }
 
@@ -1874,6 +1875,7 @@ mod tests {
             numeric_precision: None,
             numeric_scale: None,
             is_indexed: false,
+            ..Default::default()
         };
         let info = TableInfo {
             density: None,
@@ -1929,6 +1931,7 @@ mod tests {
             numeric_precision: None,
             numeric_scale: None,
             is_indexed: false,
+            ..Default::default()
         };
         let info = TableInfo {
             density: None,

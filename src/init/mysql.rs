@@ -112,6 +112,7 @@ pub(super) fn introspect(conn: &mut mysql::PooledConn, table: &str) -> Result<Ta
                     data_type,
                     numeric_precision,
                     numeric_scale,
+                    ..Default::default()
                 }
             },
         )

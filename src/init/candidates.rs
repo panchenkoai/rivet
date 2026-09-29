@@ -19,7 +19,7 @@ pub(super) fn cursor_candidates(info: &TableInfo) -> Vec<CursorCandidate> {
         let mut reasons: Vec<CursorCandidateReason> = Vec::new();
         let mut score: i32 = 0;
 
-        if super::is_tombstone_stamp(&col.name) {
+        if super::is_tombstone_stamp(&col.name) || col.not_cursor {
             continue;
         }
         if is_timestamp_type(&col.data_type) {
@@ -82,6 +82,7 @@ pub(super) fn suggest_cursor_fallback(info: &TableInfo) -> Option<String> {
         .iter()
         .find(|c| {
             !c.is_nullable
+                && !c.not_cursor
                 && is_timestamp_type(&c.data_type)
                 && !super::is_coarse_stamp_type(&c.data_type)
                 && c.name != primary.column
@@ -126,6 +127,7 @@ mod tests {
             numeric_precision: None,
             numeric_scale: None,
             is_indexed: false,
+            ..Default::default()
         }
     }
 

@@ -73,7 +73,9 @@ grid:
     gated: ["23-free"]               # gvenzl/oracle-free:23-slim-faststart, the compose stand's image,
                                      # brought up by the gate on :55023 and seeded from
                                      # seeds/common/oracle.sql + dev/release-oracle/oracle_tz_probe.sql.
-                                     # BATCH ONLY: `mode: cdc` is refused for Oracle at config load.
+                                     # The gate grades Oracle BATCH only. Oracle CDC ships (#324) as a
+                                     # bounded drain to files, tested in tests/live/live_cdc_oracledb.rs;
+                                     # continuous CDC and a `load:` over it are refused at config load.
     gaps:  []
 
 # ── Per-(engine, version) DATA / BEHAVIOUR scenarios (run once per gridded version) ──
@@ -100,7 +102,7 @@ scenarios:
     mysql:    test
     mssql:    test
     mongo:    test
-    oracle:   { gap: "not wired for Oracle: blessed_flow's cells (and its CDC half, which Oracle refuses) ride the CDC stand in dev/release_oracle/cdc.py, which has no Oracle engine; the batch chain is graded by blessed_path" }
+    oracle:   { gap: "not wired for Oracle: blessed_flow's cells ride the CDC stand in dev/release_oracle/cdc.py, whose _ENGINES has no Oracle entry (Oracle CDC itself ships as a bounded drain to files, #324, but its `load` leg is refused at config load); the batch chain is graded by blessed_path" }
   - id: not_inert
     what: "The chain's own oracles must be able to go RED. Breaks each artifact class and requires the matching stage to fail: every declared part removed (oracle must stop agreeing with the source), no manifest (must report undelivered, not count the parquet lying next to it), a run id that never ran (state must refuse). Carries a NEGATIVE control too — removing ONE redundant copy of a repeated export must NOT move the oracle; the first draft demanded a failure there and went red against a correct oracle."
     postgres: test

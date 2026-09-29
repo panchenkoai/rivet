@@ -131,6 +131,7 @@ pub(super) fn introspect(client: &mut Client, schema: &str, table: &str) -> Resu
                 is_nullable: is_nullable_str.eq_ignore_ascii_case("YES"),
                 numeric_precision: numeric_precision.map(|v| v as u32),
                 numeric_scale: numeric_scale.map(|v| v as u32),
+                ..Default::default()
             }
         })
         .collect();

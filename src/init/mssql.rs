@@ -161,6 +161,7 @@ fn parse_columns_agg(agg: &str) -> Vec<ColumnInfo> {
                 is_nullable: f[3].eq_ignore_ascii_case("YES"),
                 numeric_precision: f[4].parse::<u32>().ok(),
                 numeric_scale: f[5].parse::<u32>().ok(),
+                ..Default::default()
             })
         })
         .collect()

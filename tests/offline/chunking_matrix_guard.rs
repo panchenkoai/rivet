@@ -151,7 +151,8 @@ const MATRICES: &[(&str, usize)] = &[
     // MSSQL, until_current-terminates-under-load on the three SQL engines) are now
     // filled — every cell is a test or a justified n/a.
     // Raised 0 -> 21 (2026-09-26): the Oracle column's honest gaps (batch-only phase 1).
-    ("docs/cdc-matrix.yaml", 20),
+    // Lowered 20 -> 5 (2026-09-29): Oracle CDC shipped (#324); its live tests fill the cells.
+    ("docs/cdc-matrix.yaml", 5),
     // Resilience / crash-recovery (BATCH + cross-cutting). Both Mongo holes closed:
     // batch-clobber filled with a live test; crash-after-source-read is na (that
     // hook is single.rs-only, and Mongo runs the keyset path).
@@ -166,7 +167,8 @@ const MATRICES: &[(&str, usize)] = &[
     // unrecoverable degradation fails LOUD, not silently. Cross-references the CDC
     // conformance gate + chunking/resilience/warehouse ledgers for the unified view.
     // Raised 0 -> 5 (2026-09-26): the Oracle column's honest gaps (batch-only phase 1).
-    ("docs/fail-loud-matrix.yaml", 5),
+    // Lowered 5 -> 4 (2026-09-29): Oracle CDC vanished-anchor proven live.
+    ("docs/fail-loud-matrix.yaml", 4),
     // Load-mode write contracts — keyed on the 3 LoadMode variants (full /
     // incremental / cdc), not source engines. Codifies the 4 data bugs found in
     // the load layer (incremental+cleanup loss, full duplicate snapshots, full
@@ -180,7 +182,8 @@ const MATRICES: &[(&str, usize)] = &[
     // (binary protocol decoded by the driver crate, panic-safe field access, or
     // write-only). 0 gaps: the surface Rivet parses is fully covered.
     // Raised 0 -> 3 (2026-09-26): the Oracle column's honest gaps (batch-only phase 1).
-    ("docs/fuzz-matrix.yaml", 3),
+    // Lowered 3 -> 1 (2026-09-29): Oracle checkpoint + spill cells are structurally `na`.
+    ("docs/fuzz-matrix.yaml", 1),
     // URL & credential safety — the userinfo encode/decode/redact class that
     // regressed THREE times (round-1 MSSQL round-trip, round-3 redact_pg_url, and
     // the general log redactor), each invisible to point tests. `test:` cells are

@@ -189,7 +189,7 @@ scenarios:
   - id: cdc_until_current_twice
     what: "two bounded CDC cycles into one prefix. Both runs' parts must survive — the sink names parts run-uniquely so cycle 2 cannot clobber cycle 1."
     engines: [postgres, mysql, mssql, mongo]
-    note: "oracle has no CDC yet (phase 3) — `mode: cdc` is refused at config validation."
+    note: "oracle is not run here: dev/pytools/scenario_artifacts.py has no Oracle golden-seed mapping yet (tracked). Oracle CDC itself ships as a bounded drain to files (#324), covered live by tests/live/live_cdc_oracledb.rs."
     expect:
       run_status_running: []
       checkpoint_file: 1
@@ -198,7 +198,7 @@ scenarios:
 
   - id: cdc_initial_snapshot
     what: "`initial: snapshot` — the synthesized leg plus the drain, sharing a prefix by design. The leg's family must be its PARENT export, or the load refuses rivet's own output."
-    note: "mongo's `initial: snapshot` leg exists but seeds through a different path (collection copy, no SQL leg); wiring it here is tracked. oracle has no CDC yet (phase 3) — `mode: cdc` is refused at config validation."
+    note: "mongo's `initial: snapshot` leg exists but seeds through a different path (collection copy, no SQL leg); wiring it here is tracked. oracle is not run here: dev/pytools/scenario_artifacts.py has no Oracle golden-seed mapping yet (tracked). Oracle CDC itself ships as a bounded drain to files (#324), covered live by tests/live/live_cdc_oracledb.rs."
     engines: [postgres, mysql, mssql]
     expect:
       run_status_running: []
@@ -216,7 +216,7 @@ scenarios:
 
   - id: load_cdc_append_twice
     what: "two CDC load cycles. Each terminal source run is recorded consumed exactly once — the second load must not re-append the first cycle."
-    note: "warehouse-bound. Every CDC-capable SQL engine: the skip set is keyed on run ids, but the MANIFESTS it selects over are written per engine, and a CDC manifest grows under one id — the shape this scenario exists for. Mongo's CDC driver is not wired yet. oracle has no CDC yet (phase 3) — `mode: cdc` is refused at config validation."
+    note: "warehouse-bound. Every CDC-capable SQL engine: the skip set is keyed on run ids, but the MANIFESTS it selects over are written per engine, and a CDC manifest grows under one id — the shape this scenario exists for. Mongo's CDC driver is not wired yet. oracle is excluded by config: an Oracle `mode: cdc` export under a `load:` block is refused when the config is read (the preview drains to files only)."
     engines: [postgres, mysql, mssql]
     expect:
       run_status_running: []
