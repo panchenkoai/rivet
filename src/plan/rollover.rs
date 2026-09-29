@@ -45,11 +45,8 @@ pub fn partition_buckets_note(column: &str, granularity: Granularity, buckets: u
 
 /// The note read back as `(column, granularity, buckets)`; `None` for anything else.
 pub fn parse_partition_buckets_note(note: &str) -> Option<(&str, &str, i64)> {
-    let mut parts = note.split('|');
-    let (column, granularity, buckets) = (parts.next()?, parts.next()?, parts.next()?);
-    if parts.next().is_some() {
-        return None;
-    }
+    let mut parts = note.rsplitn(3, '|');
+    let (buckets, granularity, column) = (parts.next()?, parts.next()?, parts.next()?);
     Some((column, granularity, buckets.parse().ok()?))
 }
 
@@ -127,6 +124,14 @@ pub fn rows_that_fit(held: &HashSet<i64>, buckets: &[i64], cap: usize) -> usize 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_partition_column_containing_a_pipe_round_trips_through_the_footer_note() {
+        let note = partition_buckets_note("event|date", Granularity::Day, 7);
+        assert_eq!(parse_partition_buckets_note(&note), Some(("event|date", "day", 7)));
+        assert_eq!(parse_partition_buckets_note("d|day|x"), None);
+        assert_eq!(parse_partition_buckets_note("day|7"), None);
+    }
 
     fn at(y: i32, m: u32, d: u32, h: u32) -> i64 {
         chrono::NaiveDate::from_ymd_opt(y, m, d)
