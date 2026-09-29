@@ -34,6 +34,14 @@ CELLS = {
     "a_load_that_dies_after_adopting_the_table_resumes_into_the_log": "adopt-resume",
 }
 
+# The loader's own live tests: `#[ignore]` lib tests in src/load/clickhouse.rs, which
+# .cargo/mutants.toml cites as the kill for mutants the lib-only mutation gate cannot see.
+LIB_CELLS = {
+    "the_change_log_keeps_the_latest_source_position_whatever_the_insert_order": "lib:version-order",
+    "an_unknown_position_shape_fails_the_insert": "lib:unknown-pos",
+    "a_pulled_part_lands_by_column_name_and_a_null_key_refuses": "lib:pull-by-name",
+}
+
 
 def verify_clickhouse_load(led: Ledger) -> None:
     led.phase("ClickHouse load — CDC per engine, crash re-run, full, incremental, init")
@@ -45,4 +53,12 @@ def verify_clickhouse_load(led: Ledger) -> None:
         services=(("clickhouse", 8123), ("fake-gcs", 4443), ("minio", 9000), ("azurite", 10000),
                   ("postgres", 5432), ("postgres-cdc", 5434), ("mysql-cdc", 3307),
                   ("mssql-cdc", 1434)),
+    )
+    run_rig_tests(
+        led, "clickhouse", tuple(LIB_CELLS),
+        cell=LIB_CELLS.__getitem__,
+        msg=lambda n: f"clickhouse[{LIB_CELLS[n]}] · {n.replace('_', ' ')}",
+        cloud=False,
+        services=(("clickhouse", 8123), ("minio", 9000)),
+        target=("--lib",),
     )

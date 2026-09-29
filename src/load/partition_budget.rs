@@ -87,13 +87,13 @@ pub(crate) fn plan_load_batches(
         // span cannot give for a scattered part (4,000 distinct days across 5,600).
         let rows = footer_buckets(&meta, &partition.key).map_or(rows, |b| rows.min(b));
         match column_span(&meta, column) {
-            Some((span, has_nulls)) => spanned.push(Part {
+            ColumnStats::Span(span, has_nulls) => spanned.push(Part {
                 uri: uri.clone(),
                 span,
                 rows,
                 has_nulls,
             }),
-            None => blind.push(uri.clone()),
+            ColumnStats::NoValues | ColumnStats::Unknown => blind.push(uri.clone()),
         }
     }
     let mut batches = pack_batches(&partition.key, spanned)?;
@@ -209,13 +209,27 @@ fn read_footer(store: &GcsStore, key: &str) -> Result<ParquetMetaData> {
     Ok(ParquetMetaDataReader::decode_metadata(&bytes)?)
 }
 
-/// `column`'s min and max over every row group of one file, or `None` when the column
-/// is absent, of a type no partition takes, or has no statistics somewhere.
-fn column_span(meta: &ParquetMetaData, column: &str) -> Option<(Span, bool)> {
+/// What one file's footer says about a column's non-NULL values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColumnStats {
+    /// Their `[lo, hi]`, and whether any row is known to be NULL.
+    Span(Span, bool),
+    /// Every row group is known to hold only NULLs (or no rows).
+    NoValues,
+    /// Absent, of a type no partition takes, or a row group the footer does not bound.
+    Unknown,
+}
+
+/// `column`'s span over every row group of one file; an all-NULL row group adds no values.
+fn column_span(meta: &ParquetMetaData, column: &str) -> ColumnStats {
     let schema = meta.file_metadata().schema_descr();
-    let idx = schema.columns().iter().position(|c| c.name() == column)?;
+    let Some(idx) = schema.columns().iter().position(|c| c.name() == column) else {
+        return ColumnStats::Unknown;
+    };
     let descr = schema.column(idx);
-    let unit = stored_unit(descr.logical_type_ref(), descr.physical_type())?;
+    let Some(unit) = stored_unit(descr.logical_type_ref(), descr.physical_type()) else {
+        return ColumnStats::Unknown;
+    };
     let mut span: Option<Span> = None;
     // NULL rows occupy a partition of their own, and `min`/`max` exclude them by
     // definition — so the span alone can never see it. Only a KNOWN non-zero count
@@ -227,12 +241,25 @@ fn column_span(meta: &ParquetMetaData, column: &str) -> Option<(Span, bool)> {
     // load they cannot make; being cautious the other way costs at most a job.
     let mut nulls = false;
     for rg in meta.row_groups() {
-        let stats = rg.column(idx).statistics()?;
-        nulls |= stats.null_count_opt().is_some_and(|n| n > 0);
-        let (lo, hi) = match stats {
-            Statistics::Int32(s) => (i64::from(*s.min_opt()?), i64::from(*s.max_opt()?)),
-            Statistics::Int64(s) => (*s.min_opt()?, *s.max_opt()?),
-            _ => return None,
+        let Some(stats) = rg.column(idx).statistics() else {
+            return ColumnStats::Unknown;
+        };
+        let null_count = stats.null_count_opt();
+        nulls |= null_count.is_some_and(|n| n > 0);
+        let bounds = match stats {
+            Statistics::Int32(s) => s
+                .min_opt()
+                .zip(s.max_opt())
+                .map(|(lo, hi)| (i64::from(*lo), i64::from(*hi))),
+            Statistics::Int64(s) => s.min_opt().zip(s.max_opt()).map(|(lo, hi)| (*lo, *hi)),
+            _ => return ColumnStats::Unknown,
+        };
+        let Some((lo, hi)) = bounds else {
+            // No min/max means "no values" only when the null count says every row is NULL.
+            if null_count.is_some_and(|n| i64::try_from(n) == Ok(rg.num_rows())) {
+                continue;
+            }
+            return ColumnStats::Unknown;
         };
         let file = Span { lo, hi, unit };
         span = Some(match span {
@@ -240,22 +267,26 @@ fn column_span(meta: &ParquetMetaData, column: &str) -> Option<(Span, bool)> {
             Some(s) => merge(s, file),
         });
     }
-    span.map(|s| (s, nulls))
+    span.map_or(ColumnStats::NoValues, |s| ColumnStats::Span(s, nulls))
 }
 
-/// The first timestamp column whose footer statistics reach outside `[lo_secs, hi_secs]`
-/// (Unix seconds), with the offending value rendered; `None` when all are inside or unknown.
+/// The first timestamp column the footer does not show inside `[lo_secs, hi_secs]` (Unix
+/// seconds): with the offending value rendered, or `None` when the footer cannot bound it.
 pub(crate) fn timestamp_outside(
     meta: &ParquetMetaData,
     lo_secs: i64,
     hi_secs: i64,
-) -> Option<(String, String)> {
+) -> Option<(String, Option<String>)> {
     let schema = meta.file_metadata().schema_descr();
     schema.columns().iter().find_map(|c| {
         if !matches!(c.logical_type_ref(), Some(LogicalType::Timestamp(_))) {
             return None;
         }
-        let (span, _) = column_span(meta, c.name())?;
+        let span = match column_span(meta, c.name()) {
+            ColumnStats::Span(span, _) => span,
+            ColumnStats::NoValues => return None,
+            ColumnStats::Unknown => return Some((c.name().to_string(), None)),
+        };
         let end = if to_seconds(span.lo, span.unit) < lo_secs {
             span.lo
         } else if to_seconds(span.hi, span.unit) > hi_secs {
@@ -263,7 +294,7 @@ pub(crate) fn timestamp_outside(
         } else {
             return None;
         };
-        Some((c.name().to_string(), render(end, span.unit)))
+        Some((c.name().to_string(), Some(render(end, span.unit))))
     })
 }
 
@@ -523,13 +554,82 @@ mod tests {
         );
         assert_eq!(
             check("late.parquet"),
-            Some(("ts".to_string(), "9999-12-31 00:00".to_string()))
+            Some(("ts".to_string(), Some("9999-12-31 00:00".to_string())))
         );
         assert_eq!(
             check("early.parquet"),
-            Some(("ts".to_string(), "1850-01-01 00:00".to_string()))
+            Some(("ts".to_string(), Some("1850-01-01 00:00".to_string())))
         );
-        assert_eq!(check("unknown.parquet"), None, "no statistics, no verdict");
+        assert_eq!(
+            check("unknown.parquet"),
+            Some(("ts".to_string(), None)),
+            "no statistics is named, never passed"
+        );
+    }
+
+    /// Footer metadata of one `ts` column written as one row group per entry of `groups`.
+    fn row_groups_meta(groups: &[Vec<Option<i64>>]) -> ParquetMetaData {
+        let field = Field::new(
+            "ts",
+            DataType::Timestamp(ArrowUnit::Microsecond, Some("UTC".into())),
+            true,
+        );
+        let schema = Arc::new(Schema::new(vec![field]));
+        let mut buf = Vec::new();
+        let mut w = ArrowWriter::try_new(&mut buf, schema.clone(), None).unwrap();
+        for g in groups {
+            let values: Vec<Option<i64>> = g.iter().map(|s| s.map(micros)).collect();
+            let col: ArrayRef =
+                Arc::new(TimestampMicrosecondArray::from(values).with_timezone("UTC"));
+            w.write(&RecordBatch::try_new(schema.clone(), vec![col]).unwrap())
+                .unwrap();
+            w.flush().unwrap();
+        }
+        w.close().unwrap();
+        let meta = ParquetMetaDataReader::new()
+            .parse_and_finish(&bytes::Bytes::from(buf))
+            .unwrap();
+        assert_eq!(meta.num_row_groups(), groups.len());
+        meta
+    }
+
+    /// An all-NULL row group has no min/max; it must not hide an out-of-range value in
+    /// another row group of the same part.
+    #[test]
+    fn an_all_null_row_group_does_not_hide_an_out_of_range_timestamp() {
+        let (lo, hi) = (at(1900, 1, 1, 0), at(2299, 12, 31, 23));
+        let late = Some(at(9999, 12, 31, 0));
+        for groups in [
+            vec![vec![None, None], vec![late]],
+            vec![vec![late], vec![None]],
+        ] {
+            assert_eq!(
+                timestamp_outside(&row_groups_meta(&groups), lo, hi),
+                Some(("ts".to_string(), Some("9999-12-31 00:00".to_string()))),
+                "{groups:?}"
+            );
+        }
+    }
+
+    /// The budget spans the bounded row groups and counts an all-NULL one as the NULL
+    /// partition; a file of only NULLs has no span and rides as blind, as before.
+    #[test]
+    fn an_all_null_row_group_is_the_null_partition_not_an_unknown_file() {
+        let (a, b) = (at(2020, 1, 1, 0), at(2020, 1, 3, 0));
+        let meta = row_groups_meta(&[vec![None], vec![Some(a), Some(b)]]);
+        let ColumnStats::Span(span, nulls) = column_span(&meta, "ts") else {
+            panic!("{:?}", column_span(&meta, "ts"));
+        };
+        assert_eq!((span.lo, span.hi, nulls), (micros(a), micros(b), true));
+        assert_eq!(
+            budgeted(&time("ts", Granularity::Day).key, span, 10, nulls),
+            4,
+            "three days plus the NULL partition"
+        );
+        assert_eq!(
+            column_span(&row_groups_meta(&[vec![None], vec![None, None]]), "ts"),
+            ColumnStats::NoValues
+        );
     }
 
     #[test]

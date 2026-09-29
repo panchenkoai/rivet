@@ -820,14 +820,14 @@ mod clickhouse {
             // ClickHouse String holds arbitrary bytes, so bytea/blob round-trips
             // losslessly — no BINARY_AS_TEXT caveat like Snowflake.
             RivetType::Binary => Resolved::ok("String"),
-            // ClickHouse's native JSON type is a declared column (still settling
-            // across versions); Parquet JSON autoloads as String holding the valid
-            // JSON text. Recover by declaring a JSON column at load — there is no
-            // safe SELECT-time cast, so the recovery is upstream (a note).
+            // Parquet JSON autoloads as String holding the valid JSON text, and `rivet
+            // load` declares String: a JSON column refuses the Parquet insert (measured).
             RivetType::Json => Resolved::diverge(
                 "JSON",
                 "String",
-                "JSON autoloads as String (valid JSON text); declare a JSON column at load for the native type",
+                "JSON lands as String holding the valid JSON text (rivet load declares String; \
+                 a ClickHouse JSON column refuses the Parquet insert); read it with the \
+                 JSONExtract* functions",
                 None,
             ),
             // The 16-byte UUID field autoloads as FixedString(16) (verified live).
@@ -852,10 +852,19 @@ mod clickhouse {
                         inner_r.target_type
                     ))
                 } else {
-                    Resolved::warn(
+                    let null_note = "a ClickHouse Array cannot be NULL: a NULL list loads as [], \
+                                     the same value as an empty list";
+                    let note = match &inner_r.note {
+                        Some(n) if inner_r.autoload_type != inner_r.target_type => {
+                            format!("{null_note}; each element: {n}")
+                        }
+                        _ => null_note.to_string(),
+                    };
+                    Resolved::diverge(
                         format!("Array(Nullable({}))", inner_r.target_type),
-                        "a ClickHouse Array cannot be NULL: a NULL list loads as [], the same \
-                         value as an empty list",
+                        format!("Array(Nullable({}))", inner_r.autoload_type),
+                        note,
+                        None,
                     )
                 }
             }
@@ -1424,6 +1433,27 @@ mod tests {
                 .unwrap_or("")
                 .contains("a NULL list loads as []")
         );
+        let uuids = ch(&RivetType::List {
+            inner: Box::new(RivetType::Uuid),
+        });
+        assert_eq!(
+            (uuids.target_type.as_str(), uuids.autoload_type.as_str()),
+            ("Array(Nullable(UUID))", "Array(Nullable(FixedString(16)))"),
+            "an array's autoload is its element's"
+        );
+        assert!(
+            uuids
+                .note
+                .as_deref()
+                .unwrap_or("")
+                .contains("UUID autoloads as FixedString(16)"),
+            "{:?}",
+            uuids.note
+        );
+        let json = ch(&RivetType::List {
+            inner: Box::new(RivetType::Json),
+        });
+        assert_eq!(json.autoload_type, "Array(Nullable(String))");
     }
 
     #[test]

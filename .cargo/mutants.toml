@@ -724,13 +724,14 @@ exclude_re = [
     # their body stubs are born MISSED. What each DECIDES is next door and graded:
     # the DDL and version (`changelog_shape`, `changelog_conflict`, `columns_ddl`,
     # `create_table_sql`, `pull_source`, `CLICKHOUSE_VERSION_EXPR`), the count
-    # (`parquet_rows`), the catalog decode (`object_kind_of`), the view text
+    # (`footer_rows`), the catalog decode (`object_kind_of`), the view text
     # (`clickhouse_final_view`). Live, each stub is caught: tests/live/live_clickhouse_load.rs
     # (a stubbed insert_uris/materialize/append_changelog fails the count gate or the
     # source comparison; a stubbed changes_has_prior_changes/object_kind/column_overlap/
     # row_count/adopt_as_changelog breaks the incremental adoption and re-key cells) and
-    # the `clickhouse_load` gate row; `the_change_log_keeps_the_latest_source_position…`
-    # and `a_pulled_part_lands…` (lib, live) cover create_current_view and the pull.
+    # the `clickhouse_load` gate row, which also runs the three lib live tests
+    # `the_change_log_keeps_the_latest_source_position…`, `an_unknown_position_shape…`
+    # and `a_pulled_part_lands…`, which cover create_current_view and the pull.
     "replace ClickhouseLoader::post -> Result<String>",
     "replace ClickhouseLoader::insert_one -> Result<u64>",
     "replace ClickhouseLoader::query -> Result<String>",
