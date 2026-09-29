@@ -30,6 +30,8 @@ pub struct ClickhouseLoader {
     cdc: bool,
     /// Read parts server-side through this named collection instead of sending them.
     named_collection: Option<String>,
+    /// `PARTITION BY` of every table the load creates (ADR-0035 CH8).
+    partition_by: Option<String>,
 }
 
 impl ClickhouseLoader {
@@ -51,6 +53,7 @@ impl ClickhouseLoader {
             cluster_by: Vec::new(),
             cdc: false,
             named_collection: None,
+            partition_by: None,
         }
     }
 
@@ -63,6 +66,12 @@ impl ClickhouseLoader {
     /// Set the full-load table's `ORDER BY` columns.
     pub(crate) fn cluster_by(mut self, cols: Vec<String>) -> Self {
         self.cluster_by = cols;
+        self
+    }
+
+    /// Partition every table the load creates by `expr`.
+    pub(crate) fn partition_by(mut self, expr: Option<String>) -> Self {
+        self.partition_by = expr;
         self
     }
 
@@ -187,10 +196,13 @@ impl ClickhouseLoader {
     ) -> Result<Option<String>> {
         let name = format!("{table}__changes");
         let found = self.query(&format!(
-            "SELECT engine, sorting_key FROM system.tables WHERE {} FORMAT TSVRaw",
+            "SELECT engine, sorting_key, partition_key FROM system.tables WHERE {} FORMAT TSVRaw",
             self.system_filter(&name, "name")
         ))?;
-        let Some((engine, sorting_key)) = found.split_once('\t') else {
+        let mut found = found.trim_end_matches('\n').splitn(3, '\t');
+        let (Some(engine), Some(sorting_key), partition_key) =
+            (found.next(), found.next(), found.next().unwrap_or(""))
+        else {
             return Ok(None);
         };
         let cols = self.query(&format!(
@@ -213,7 +225,7 @@ impl ClickhouseLoader {
             &TargetLoader::fqtn(self, table),
             shape,
             pk,
-            (engine, sorting_key),
+            (engine, sorting_key, partition_key),
             &existing,
             &wanted,
         ))
@@ -248,6 +260,7 @@ impl TargetLoader for ClickhouseLoader {
             &swap,
             &columns_ddl(specs, &[]),
             "MergeTree",
+            self.partition_by.as_deref(),
             &order_by(&self.cluster_by),
         ))?;
         let rows = self.insert_uris(&swap, uris)?;
@@ -266,7 +279,7 @@ impl TargetLoader for ClickhouseLoader {
     ) -> Result<u64> {
         let full = changelog_specs(specs);
         let changes = self.quoted(&format!("{table}__changes"));
-        let shape = changelog_shape(self.cdc, table, pk)?;
+        let shape = changelog_shape(self.cdc, table, pk, self.partition_by.as_deref())?;
         if let Some(why) = self.existing_changelog_conflict(table, &shape, pk, &full)? {
             return Err(super::refused(why));
         }
@@ -276,6 +289,7 @@ impl TargetLoader for ClickhouseLoader {
             &changes,
             &ddl,
             shape.engine,
+            shape.partition,
             &shape.order_by,
         ))?;
         if let Some(alter) = alter_add_columns_sql(&changes, &full, shape.not_null) {
@@ -446,16 +460,23 @@ fn changelog_specs(specs: &[TargetColumnSpec]) -> Vec<TargetColumnSpec> {
 /// The engine, key and version column of a change log (ADR-0035 CH2, CH10).
 struct ChangelogShape<'a> {
     engine: &'static str,
+    partition: Option<&'a str>,
     order_by: String,
     not_null: &'a [String],
     version_column: String,
 }
 
 /// A CDC log collapses versions by the PK; an incremental log is a plain `MergeTree`.
-fn changelog_shape<'a>(cdc: bool, table: &str, pk: &'a [String]) -> Result<ChangelogShape<'a>> {
+fn changelog_shape<'a>(
+    cdc: bool,
+    table: &str,
+    pk: &'a [String],
+    partition: Option<&'a str>,
+) -> Result<ChangelogShape<'a>> {
     if !cdc {
         return Ok(ChangelogShape {
             engine: "MergeTree",
+            partition,
             order_by: order_by(&[]),
             not_null: &[],
             version_column: String::new(),
@@ -469,6 +490,7 @@ fn changelog_shape<'a>(cdc: bool, table: &str, pk: &'a [String]) -> Result<Chang
     }
     Ok(ChangelogShape {
         engine: "ReplacingMergeTree(__ver)",
+        partition,
         order_by: order_by(pk),
         not_null: pk,
         version_column: format!(
@@ -478,15 +500,15 @@ fn changelog_shape<'a>(cdc: bool, table: &str, pk: &'a [String]) -> Result<Chang
     })
 }
 
-/// Why an existing change log (`engine`, `sorting_key`, column types) cannot take a load
-/// shaped `shape` over `wanted`, or `None`: another engine (the export changed mode), another
-/// key (a changed `load.pk`) or another column type would each corrupt it silently.
+/// Why an existing change log (`engine`, `sorting_key`, `partition_key`, column types) cannot
+/// take a load shaped `shape` over `wanted`, or `None`: another engine (the export changed
+/// mode), another key (a changed `load.pk`), another declared partition or another column type.
 fn changelog_conflict(
     changes: &str,
     view: &str,
     shape: &ChangelogShape<'_>,
     pk: &[String],
-    (engine, sorting_key): (&str, &str),
+    (engine, sorting_key, partition_key): (&str, &str, &str),
     existing: &[(&str, &str)],
     wanted: &[(&str, &str)],
 ) -> Option<String> {
@@ -518,6 +540,20 @@ fn changelog_conflict(
             pk.join(", ")
         ));
     }
+    let bare = |e: &str| e.replace(['`', ' '], "");
+    if let Some(declared) = shape.partition
+        && bare(declared) != bare(partition_key)
+    {
+        let existing = if partition_key.is_empty() {
+            "nothing"
+        } else {
+            partition_key
+        };
+        return Some(format!(
+            "`{changes}` is partitioned by {existing}, but the load declares {declared}; \
+             ClickHouse cannot re-partition a table in place. Set `partition:` back, or: {restart}"
+        ));
+    }
     wanted.iter().find_map(|&(name, want)| {
         let (_, have) = existing.iter().find(|(n, _)| *n == name)?;
         (*have != want).then(|| {
@@ -542,10 +578,79 @@ fn canonical_types_sql(types: &[String]) -> String {
     format!("SELECT {cols} FORMAT TSVRaw")
 }
 
-/// `CREATE … <fqtn> (<ddl>) ENGINE = <engine> ORDER BY <key>`, allowing a Nullable key column.
-fn create_table_sql(verb: &str, fqtn: &str, ddl: &str, engine: &str, key: &str) -> String {
+/// The `PARTITION BY` expression for a `partition:` column at a granularity (ADR-0035 CH8).
+pub(crate) fn partition_expr(
+    export: &str,
+    spec: &crate::load::plan::PartitionSpec,
+    column_type: &dyn Fn(&str) -> Result<String>,
+) -> Result<(crate::load::plan::PartitionKey, String)> {
+    use crate::load::plan::{Granularity, PartitionForm, PartitionKey};
+    if spec.expiration_days.is_some() || spec.require_filter {
+        crate::rivet_bail!(
+            crate::error::codes::CONFIG_LOAD_PARTITION_UNSUPPORTED,
+            "export `{export}`: a ClickHouse load sets no partition expiry or partition filter — \
+             drop `expiration_days` / `require_filter` from `partition` (a TTL is the table \
+             owner's decision)"
+        );
+    }
+    let (column, granularity) = match &spec.form {
+        PartitionForm::Column {
+            column,
+            granularity,
+        } => (column, *granularity),
+        PartitionForm::Range { .. } => crate::rivet_bail!(
+            crate::error::codes::CONFIG_LOAD_PARTITION_UNSUPPORTED,
+            "export `{export}`: `range` is BigQuery's integer-range partitioning; a ClickHouse \
+             load partitions by a date or time `column` + `granularity`"
+        ),
+        PartitionForm::Ingestion(_) => crate::rivet_bail!(
+            crate::error::codes::CONFIG_LOAD_PARTITION_UNSUPPORTED,
+            "export `{export}`: ClickHouse has no load-time partitions — partition by \
+             `column: _rivet_exported_at` (the export stamp) instead"
+        ),
+    };
+    let t = column_type(column)?;
+    if !t.starts_with("DATE") {
+        crate::rivet_bail!(
+            crate::error::codes::CONFIG_LOAD_PARTITION_UNSUPPORTED,
+            "export `{export}`: cannot partition on `{column}` ({t}); a ClickHouse load partitions \
+             a Date32 or DateTime64 column by time"
+        );
+    }
+    let c = Warehouse::ClickHouse.quote_ident(column);
+    let expr = match granularity {
+        Granularity::Hour if !t.starts_with("DATETIME") => crate::rivet_bail!(
+            crate::error::codes::CONFIG_LOAD_PARTITION_UNSUPPORTED,
+            "export `{export}`: `{column}` is a {t}, which has no hours — partition it by day, \
+             month or year"
+        ),
+        Granularity::Hour => format!("intDiv(toYYYYMMDDhhmmss({c}), 10000)"),
+        Granularity::Day => format!("toYYYYMMDD({c})"),
+        Granularity::Month => format!("toYYYYMM({c})"),
+        Granularity::Year => format!("toYear({c})"),
+    };
+    Ok((
+        PartitionKey::Time {
+            column: Some(column.clone()),
+            granularity,
+        },
+        expr,
+    ))
+}
+
+/// `CREATE … <fqtn> (<ddl>) ENGINE = <engine> [PARTITION BY …] ORDER BY <key>`, allowing a Nullable key.
+fn create_table_sql(
+    verb: &str,
+    fqtn: &str,
+    ddl: &str,
+    engine: &str,
+    partition: Option<&str>,
+    key: &str,
+) -> String {
+    let partition = partition.map_or(String::new(), |p| format!(" PARTITION BY {p}"));
     format!(
-        "{verb} {fqtn} (\n{ddl}\n) ENGINE = {engine} ORDER BY {key} SETTINGS allow_nullable_key = 1"
+        "{verb} {fqtn} (\n{ddl}\n) ENGINE = {engine}{partition} ORDER BY {key} SETTINGS \
+         allow_nullable_key = 1"
     )
 }
 
@@ -765,18 +870,18 @@ mod tests {
     #[test]
     fn a_cdc_log_collapses_by_key_and_an_incremental_log_does_not() {
         let pk = ["id".to_string()];
-        let cdc = changelog_shape(true, "t", &pk).unwrap();
+        let cdc = changelog_shape(true, "t", &pk, None).unwrap();
         assert_eq!(cdc.engine, "ReplacingMergeTree(__ver)");
         assert_eq!(cdc.order_by, "(`id`)");
         assert_eq!(cdc.not_null, &pk);
         assert!(cdc.version_column.contains("`__ver` UInt256 MATERIALIZED"));
-        let inc = changelog_shape(false, "t", &pk).unwrap();
+        let inc = changelog_shape(false, "t", &pk, None).unwrap();
         assert_eq!(
             (inc.engine, inc.order_by.as_str()),
             ("MergeTree", "tuple()")
         );
         assert!(inc.not_null.is_empty() && inc.version_column.is_empty());
-        let err = changelog_shape(true, "t", &[])
+        let err = changelog_shape(true, "t", &[], None)
             .err()
             .expect("no key refuses");
         assert!(err.to_string().contains("needs a primary key"), "{err}");
@@ -796,8 +901,8 @@ mod tests {
     #[test]
     fn an_existing_change_log_that_this_load_would_corrupt_is_refused() {
         let pk = ["id".to_string()];
-        let cdc = changelog_shape(true, "t", &pk).unwrap();
-        let inc = changelog_shape(false, "t", &pk).unwrap();
+        let cdc = changelog_shape(true, "t", &pk, None).unwrap();
+        let inc = changelog_shape(false, "t", &pk, None).unwrap();
         let tz = "Nullable(DateTime64(6, 'UTC'))";
         let cdc_want = [("id", "Int64"), ("at", tz)];
         let inc_want = [("id", "Nullable(Int64)"), ("at", tz)];
@@ -808,7 +913,16 @@ mod tests {
                         existing: (&str, &str),
                         cols: &[(&str, &str)],
                         want: &[(&str, &str)]| {
-            changelog_conflict("d.t__changes", "d.t", shape, key, existing, cols, want)
+            let (engine, sorting) = existing;
+            changelog_conflict(
+                "d.t__changes",
+                "d.t",
+                shape,
+                key,
+                (engine, sorting, ""),
+                cols,
+                want,
+            )
         };
         assert_eq!(
             conflict(&cdc, &pk, ("ReplacingMergeTree", "id"), &cols, &cdc_want),
@@ -846,7 +960,7 @@ mod tests {
         );
 
         let wider = ["id".to_string(), "tenant".to_string()];
-        let cdc2 = changelog_shape(true, "t", &wider).unwrap();
+        let cdc2 = changelog_shape(true, "t", &wider, None).unwrap();
         let key = conflict(
             &cdc2,
             &wider,
@@ -883,6 +997,38 @@ mod tests {
             "SELECT toTypeName(defaultValueOfTypeName('Decimal64(6)')), \
              toTypeName(defaultValueOfTypeName('Nullable(DateTime64(6, \\'UTC\\'))')) FORMAT TSVRaw"
         );
+    }
+
+    /// A declared partition must match the log's (as the catalog spells it); an undeclared
+    /// one leaves the log's partition alone.
+    #[test]
+    fn a_change_log_partitioned_otherwise_than_declared_is_refused() {
+        let pk = ["id".to_string()];
+        let cols = [("id", "Int64")];
+        let declared = "toYYYYMM(`created_at`)";
+        let conflict = |partition: Option<&str>, existing: &str| {
+            let shape = changelog_shape(true, "t", &pk, partition).unwrap();
+            changelog_conflict(
+                "d.t__changes",
+                "d.t",
+                &shape,
+                &pk,
+                ("ReplacingMergeTree", "id", existing),
+                &cols,
+                &cols,
+            )
+        };
+        assert_eq!(conflict(Some(declared), "toYYYYMM(created_at)"), None);
+        assert_eq!(conflict(None, "toYear(created_at)"), None);
+        assert_eq!(conflict(None, ""), None);
+        let moved = conflict(Some(declared), "toYear(created_at)").expect("granularity changed");
+        assert!(
+            moved.contains("partitioned by toYear(created_at), but the load declares toYYYYMM")
+                && moved.contains("Nothing was written"),
+            "{moved}"
+        );
+        let added = conflict(Some(declared), "").expect("partition added to a flat log");
+        assert!(added.contains("is partitioned by nothing"), "{added}");
     }
 
     #[test]
@@ -1258,10 +1404,23 @@ mod tests {
                 "`d`.`t`",
                 "  `id` Int64",
                 "ReplacingMergeTree(__ver)",
+                None,
                 "(`id`)"
             ),
             "CREATE TABLE IF NOT EXISTS `d`.`t` (\n  `id` Int64\n) ENGINE = ReplacingMergeTree(__ver) \
              ORDER BY (`id`) SETTINGS allow_nullable_key = 1"
+        );
+        assert_eq!(
+            create_table_sql(
+                "CREATE TABLE",
+                "`d`.`t`",
+                "  `id` Int64",
+                "MergeTree",
+                Some("toYYYYMM(`ts`)"),
+                "tuple()"
+            ),
+            "CREATE TABLE `d`.`t` (\n  `id` Int64\n) ENGINE = MergeTree PARTITION BY toYYYYMM(`ts`) \
+             ORDER BY tuple() SETTINGS allow_nullable_key = 1"
         );
         let loader = ClickhouseLoader::new("http://ch:8123/", "raw", "u", "P", Default::default());
         assert_eq!(TargetLoader::fqtn(&loader, "orders"), "raw.orders");

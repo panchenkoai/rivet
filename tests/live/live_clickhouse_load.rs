@@ -920,3 +920,252 @@ fn an_idle_incremental_run_after_the_first_pass_loads_cleanly() {
     load(&rig);
     assert_eq!(loaded(), pg_rows(&mut c, &tbl), "a later delta still lands");
 }
+
+/// The `load:` line into `db` keyed on `id`, with `extra` spliced into the block.
+fn load_line(db: &Db, extra: &str) -> String {
+    format!(
+        "load: {{ target: clickhouse, url: \"{CLICKHOUSE_HTTP_URL}\", database: {}, \
+         user: {CLICKHOUSE_USER}, password_env: {PASSWORD_ENV}, pk: [id]{extra} }}",
+        db.0
+    )
+}
+
+/// `system.tables.partition_key` of `db.name`, as ClickHouse spells it.
+fn partition_key(db: &Db, name: &str) -> String {
+    ch(&format!(
+        "SELECT partition_key FROM system.tables WHERE database = '{}' AND name = '{name}' \
+         FORMAT TSVRaw",
+        db.0
+    ))
+}
+
+/// A partitioned whole-table load: the table carries the declared key, each row sits in the
+/// month PostgreSQL itself names for it (a 1950 row included), and the data equals the source.
+#[test]
+#[ignore = "live: requires clickhouse + fake-gcs + postgres"]
+fn a_full_load_into_clickhouse_is_partitioned_by_month_as_declared() {
+    require_alive(LiveService::ClickHouse);
+    require_alive(LiveService::FakeGcs);
+    ensure_gcs_bucket(BUCKET);
+    let mut c = pg_connect();
+    let tbl = unique_name("rivet_ch_part_full");
+    c.batch_execute(&format!(
+        "CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v BIGINT, created_at TIMESTAMP); \
+         INSERT INTO {tbl} VALUES (1, 1, '1950-06-15 13:45:00'), (2, 2, '2026-01-05 00:00:00'), \
+           (3, 3, '2026-01-31 23:59:59'), (4, 4, '2026-03-01 00:00:00'), (5, 5, NULL)"
+    ))
+    .expect("seed");
+    let _t = PgTable::adopt(tbl.clone());
+    let db = Db::new("rivet_chtest");
+    let rig = Rig::pg_batch(&tbl)
+        .mode("full")
+        .dest_gcs(BUCKET, &unique_name("chload"), FAKE_GCS_ENDPOINT)
+        .top_line(&load_line(
+            &db,
+            ", partition: { column: created_at, granularity: month }",
+        ));
+    rig.run_ok();
+    load(&rig);
+
+    let table = format!("{}.{tbl}", db.0);
+    assert_eq!(partition_key(&db, &tbl), "toYYYYMM(created_at)");
+    let months: Vec<String> = c
+        .query(
+            &format!(
+                "SELECT DISTINCT to_char(created_at, 'YYYYMM') FROM {tbl} \
+                 WHERE created_at IS NOT NULL ORDER BY 1"
+            ),
+            &[],
+        )
+        .expect("source months")
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_eq!(
+        ch(&format!(
+            "SELECT DISTINCT _partition_id FROM {table} WHERE created_at IS NOT NULL \
+             ORDER BY 1 FORMAT TSV"
+        )),
+        months.join("\n"),
+        "each row sits in the month the source names, 1950 included"
+    );
+    assert_eq!(
+        clickhouse_rows(&format!("SELECT id, v FROM {table} ORDER BY id FORMAT TSV")),
+        pg_rows(&mut c, &tbl)
+    );
+}
+
+/// A CDC log partitioned by a column that moves: the key whose `event_at` changes month
+/// keeps one version per partition in storage, and the view still returns exactly the
+/// source's latest row per key — also under a session that turns the cross-partition
+/// `FINAL` off, since the view pins it.
+#[test]
+#[ignore = "live: requires clickhouse + fake-gcs + mysql-cdc"]
+fn a_cdc_log_partitioned_by_a_moving_column_serves_one_latest_row_per_key() {
+    require_alive(LiveService::ClickHouse);
+    require_alive(LiveService::FakeGcs);
+    ensure_gcs_bucket(BUCKET);
+    let mut c = conn();
+    let tbl = unique_name("rivet_ch_part_cdc");
+    c.query_drop(format!(
+        "DROP TABLE IF EXISTS {tbl}; \
+         CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT, event_at DATETIME NOT NULL); \
+         INSERT INTO {tbl} VALUES (1, 1, '2026-01-10 00:00:00'), (2, 2, '2026-01-11 00:00:00'), \
+           (3, 3, '2026-02-01 00:00:00'), (4, 4, '1950-01-01 00:00:00'), \
+           (5, 5, '2026-02-02 00:00:00')"
+    ))
+    .expect("seed");
+    let _guard = Table(tbl.clone());
+    let db = Db::new("rivet_chtest");
+    let rig = Rig::mysql_cdc(&tbl)
+        .cdc("initial: snapshot")
+        .dest_gcs(BUCKET, &unique_name("chload"), FAKE_GCS_ENDPOINT)
+        .top_line(&load_line(
+            &db,
+            ", partition: { column: event_at, granularity: month }",
+        ));
+    let view = format!("{}.{tbl}", db.0);
+    rig.run_ok();
+    load(&rig);
+    clickhouse_rows_match_source(&view, source_rows(&tbl), "");
+
+    c.query_drop(format!(
+        "UPDATE {tbl} SET v = 99, event_at = '2026-03-10 00:00:00' WHERE id = 1; \
+         UPDATE {tbl} SET v = 30 WHERE id = 3; \
+         UPDATE {tbl} SET v = 31, event_at = '2026-04-01 00:00:00' WHERE id = 3; \
+         DELETE FROM {tbl} WHERE id = 2"
+    ))
+    .expect("changes");
+    rig.run_ok();
+    let out = rig.load_args_env(&[], &[(PASSWORD_ENV, CLICKHOUSE_PASSWORD)]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "load: {err}");
+    assert!(
+        err.contains("partitioned by `event_at`, which is not a creation stamp"),
+        "the load warns that the column can move:\n{err}"
+    );
+
+    assert_eq!(
+        partition_key(&db, &format!("{tbl}__changes")),
+        "toYYYYMM(event_at)"
+    );
+    ch(&format!("OPTIMIZE TABLE {view}__changes FINAL"));
+    assert_eq!(
+        ch(&format!(
+            "SELECT groupArray(_partition_id) FROM (SELECT _partition_id FROM {view}__changes \
+             WHERE id = 1 ORDER BY 1) FORMAT TSV"
+        )),
+        "['202601','202603']",
+        "merges never cross partitions: the moved key keeps a version in each"
+    );
+    clickhouse_rows_match_source(&view, source_rows(&tbl), "2");
+    assert_eq!(
+        clickhouse_rows(&format!(
+            "SELECT id, v FROM {view} WHERE NOT __is_deleted ORDER BY id \
+             SETTINGS do_not_merge_across_partitions_select_final = 1 FORMAT TSV"
+        )),
+        source_rows(&tbl),
+        "the view pins the cross-partition FINAL against the session"
+    );
+}
+
+/// A change log created with one partition refuses a load declaring another, naming both,
+/// and the view keeps serving what it served.
+#[test]
+#[ignore = "live: requires clickhouse + fake-gcs + mysql-cdc"]
+fn a_changed_partition_is_refused_before_it_touches_the_change_log() {
+    require_alive(LiveService::ClickHouse);
+    require_alive(LiveService::FakeGcs);
+    ensure_gcs_bucket(BUCKET);
+    let mut c = conn();
+    let tbl = unique_name("rivet_ch_part_moved");
+    c.query_drop(format!(
+        "DROP TABLE IF EXISTS {tbl}; \
+         CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT, created_at DATETIME NOT NULL); \
+         INSERT INTO {tbl} VALUES (1, 1, '2026-01-10 00:00:00'), (2, 2, '2026-02-10 00:00:00')"
+    ))
+    .expect("seed");
+    let _guard = Table(tbl.clone());
+    let db = Db::new("rivet_chtest");
+    let by = |granularity: &str| {
+        Rig::mysql_cdc(&tbl)
+            .cdc("initial: snapshot")
+            .dest_gcs(BUCKET, &unique_name("chload"), FAKE_GCS_ENDPOINT)
+            .top_line(&load_line(
+                &db,
+                &format!(", partition: {{ column: created_at, granularity: {granularity} }}"),
+            ))
+    };
+    let first = by("month");
+    first.run_ok();
+    load(&first);
+    let view = format!("{}.{tbl}", db.0);
+    let before = source_rows(&tbl);
+    clickhouse_rows_match_source(&view, before.clone(), "");
+
+    let second = by("year");
+    second.run_ok();
+    let out = second.load_args_env(&[], &[(PASSWORD_ENV, CLICKHOUSE_PASSWORD)]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success()
+            && err.contains(
+                "is partitioned by toYYYYMM(created_at), but the load declares toYear(`created_at`)"
+            ),
+        "a re-partitioned load must refuse, naming both keys:\n{err}"
+    );
+    assert_eq!(
+        ch(&format!("SELECT count() FROM {view}__changes")),
+        "2",
+        "nothing was written"
+    );
+    clickhouse_rows_match_source(&view, before, "");
+}
+
+/// A partitioned incremental export: the first pass lands a partitioned table, the first
+/// delta adopts it as the log (same key, so no refusal), and the view serves the source.
+#[test]
+#[ignore = "live: requires clickhouse + fake-gcs + postgres"]
+fn a_partitioned_incremental_export_into_clickhouse_serves_the_latest_rows() {
+    require_alive(LiveService::ClickHouse);
+    require_alive(LiveService::FakeGcs);
+    ensure_gcs_bucket(BUCKET);
+    let (tbl, _t, mut c) = pg_batch_seeded("rivet_ch_part_inc", 5);
+    let db = Db::new("rivet_chtest");
+    let rig = Rig::pg_batch(&tbl)
+        .mode("incremental")
+        .export_line("cursor_column: updated_at")
+        .dest_gcs(BUCKET, &unique_name("chload"), FAKE_GCS_ENDPOINT)
+        .top_line(&load_line(
+            &db,
+            ", partition: { column: updated_at, granularity: month }",
+        ));
+    let view = format!("{}.{tbl}", db.0);
+
+    rig.run_ok();
+    load(&rig);
+    assert_eq!(partition_key(&db, &tbl), "toYYYYMM(updated_at)");
+    c.batch_execute(&format!(
+        "UPDATE {tbl} SET v = 99, updated_at = TIMESTAMP '2026-02-01' WHERE id = 1; \
+         INSERT INTO {tbl} VALUES (6, 6, TIMESTAMP '2026-03-01')"
+    ))
+    .expect("changes");
+    rig.run_ok();
+    load(&rig);
+
+    assert_eq!(
+        partition_key(&db, &format!("{tbl}__changes")),
+        "toYYYYMM(updated_at)",
+        "the log keeps the partition of the table it grew from"
+    );
+    assert_eq!(
+        ch(&format!(
+            "SELECT DISTINCT _partition_id FROM {view}__changes ORDER BY 1 FORMAT TSV"
+        )),
+        "202601\n202602\n202603"
+    );
+    assert_eq!(
+        clickhouse_rows(&format!("SELECT id, v FROM {view} ORDER BY id FORMAT TSV")),
+        pg_rows(&mut c, &tbl)
+    );
+}

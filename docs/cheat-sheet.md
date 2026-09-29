@@ -356,10 +356,10 @@ load:
   partition:                    # none (default) | exactly one of column / range / ingestion
     column: {{CURSOR}}
     granularity: day            # hour | day | month | year
-    # range: { column: n, start: 0, end: 1000000, interval: 1000 }
-    # ingestion: day
-    expiration_days: 90
-    require_filter: false
+    # range: { column: n, start: 0, end: 1000000, interval: 1000 }   # not on Snowflake or ClickHouse
+    # ingestion: day                                                 # not on Snowflake or ClickHouse
+    expiration_days: 90         # BigQuery only
+    require_filter: false       # BigQuery only
   cleanup_source: true          # delete staged Parquet after the count gate passes
   gc_orphans: false             # also delete unmanifested crash leftovers
   allow_source_drift: false     # load even if the manifest's source count ≠ extracted

@@ -4,8 +4,8 @@ The cell runs the Rig tests that pin the ClickHouse load against a live server o
 the stand: a CDC stream from each of MySQL, PostgreSQL and SQL Server whose view
 must equal the source row for row with the deleted key flagged; a load killed
 after appending that re-runs without duplicating the view; a full load replacing
-the table; an incremental export adopting it behind a view; and `rivet init`'s
-ClickHouse flags. Oracles are the tests': the source and ClickHouse read back
+the table; an incremental export adopting it behind a view; partitioned full, CDC and
+incremental loads (ADR-0035 CH8); and `rivet init`'s ClickHouse flags. Oracles are the tests': the source and ClickHouse read back
 directly — never rivet's report.
 """
 
@@ -32,6 +32,10 @@ CELLS = {
     "a_change_log_with_tz_and_time_columns_takes_a_second_load": "reload-tz-time",
     "a_part_clickhouse_cannot_address_is_sent_by_rivet_instead": "odd-key-pull",
     "a_load_that_dies_after_adopting_the_table_resumes_into_the_log": "adopt-resume",
+    "a_full_load_into_clickhouse_is_partitioned_by_month_as_declared": "partition:full",
+    "a_cdc_log_partitioned_by_a_moving_column_serves_one_latest_row_per_key": "partition:cdc",
+    "a_changed_partition_is_refused_before_it_touches_the_change_log": "partition:changed",
+    "a_partitioned_incremental_export_into_clickhouse_serves_the_latest_rows": "partition:incremental",
 }
 
 # The loader's own live tests: `#[ignore]` lib tests in src/load/clickhouse.rs, which

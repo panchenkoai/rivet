@@ -67,6 +67,7 @@ code does not count.
   - M5;
   - M6 (`clickhouse_load` gate cells for CDC per engine, full, incremental, a crash re-run, and the loader's three live lib tests);
   - M7 (the loader's HTTP methods are excluded in `.cargo/mutants.toml`, each exclusion naming the live test that kills it, all of which the gate runs);
+  - `partition:` by column and granularity in every mode, the change log's view pinned to a cross-partition `FINAL` (CH8; live cells for full, CDC with a moving partition value, incremental, and a changed partition refused);
   - M8 (the reference page, [recipes/clickhouse-load.md](recipes/clickhouse-load.md), with its known limits).
 - **Open for GA:**
   - the range guard does not cover a load pulled through a named collection;
@@ -75,6 +76,5 @@ code does not count.
   - a private CA for `https://` URLs;
   - a real-GCS run of the named-collection pull;
   - Mongo CDC (refused, CH7);
-  - `partition:` (refused, CH8);
   - M8's driven run;
   - M9.
