@@ -619,6 +619,22 @@ pub(crate) struct Realized {
     pub(crate) seeds: HashMap<String, PredictedFrom>,
 }
 
+/// Drop the in-progress checkpoints (keyset anchor + chunk run) of every unit that runs over a new window.
+fn forget_stale_unit_checkpoints(
+    state: &StateStore,
+    units: &[ExportConfig],
+    fresh_windows: bool,
+) -> Result<()> {
+    for unit in units
+        .iter()
+        .filter(|u| fresh_windows || !u.chunk_checkpoint)
+    {
+        state.clear_resume_run_id_every_scope(&unit.name)?;
+        state.reset_chunk_checkpoint(&unit.name)?;
+    }
+    Ok(())
+}
+
 /// Replace the dominating `giant` in `effective` with its range units; `None` when it is not splittable.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn realize(
@@ -678,13 +694,13 @@ pub(crate) fn realize(
                 u.len(),
                 state,
             );
+            forget_stale_unit_checkpoints(state, &u, false)?;
             Some(u)
         }
         None => {
             let fresh = probe_and_synthesize(config, &base, config_dir, n)?;
-            // Fresh windows: a unit's in-progress keyset checkpoint belongs to the OLD window.
-            for unit in fresh.iter().flatten() {
-                state.clear_resume_run_id_every_scope(&unit.name)?;
+            if let Some(units) = &fresh {
+                forget_stale_unit_checkpoints(state, units, true)?;
             }
             fresh
         }
@@ -907,6 +923,47 @@ mod tests {
         state.create_chunk_run("r0", &unit.name, "h", 3).unwrap();
         assert!(unit_resume(&unit, true, &state), "a crashed unit resumes");
         assert!(!unit_resume(&unit, false, &state));
+    }
+
+    /// A unit forced fresh (or re-sampled) must not leave its crashed chunk run
+    /// in_progress: the next split run would auto-resume it against a moved window and
+    /// bail on the fingerprint. A unit that keeps its checkpoint keeps its run.
+    #[test]
+    fn a_unit_run_over_a_new_window_forgets_its_crashed_chunk_run() {
+        let state = StateStore::open_in_memory().unwrap();
+        let mut giant = sample_export("orders");
+        giant.mode = ExportMode::Chunked;
+        giant.chunk_by_key = Some("id".into());
+        let mut units = synthesize(&giant, "id", &["10".into()]);
+        units[1].chunk_checkpoint = false;
+        state
+            .create_chunk_run("r0", &units[0].name, "h", 3)
+            .unwrap();
+        state
+            .create_chunk_run("r1", &units[1].name, "h", 3)
+            .unwrap();
+
+        forget_stale_unit_checkpoints(&state, &units, false).unwrap();
+        assert!(
+            state
+                .find_in_progress_chunk_run(&units[0].name)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            state
+                .find_in_progress_chunk_run(&units[1].name)
+                .unwrap()
+                .is_none()
+        );
+
+        forget_stale_unit_checkpoints(&state, &units, true).unwrap();
+        assert!(
+            state
+                .find_in_progress_chunk_run(&units[0].name)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
