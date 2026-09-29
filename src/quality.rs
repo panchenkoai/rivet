@@ -274,6 +274,27 @@ pub(crate) fn has_multi_part_unsupported_checks(qc: &QualityConfig) -> bool {
 mod tests {
     use super::*;
     use arrow::array::{Int64Array, StringArray};
+
+    #[test]
+    fn only_null_or_unique_checks_are_unsupported_on_multi_part_runners() {
+        let base = || QualityConfig {
+            row_count_min: Some(1),
+            row_count_max: None,
+            null_ratio_max: Default::default(),
+            unique_columns: Vec::new(),
+            unique_max_entries: None,
+        };
+        assert!(
+            !has_multi_part_unsupported_checks(&base()),
+            "row_count is run-wide"
+        );
+        let mut nulls = base();
+        nulls.null_ratio_max.insert("a".into(), 0.1);
+        assert!(has_multi_part_unsupported_checks(&nulls));
+        let mut unique = base();
+        unique.unique_columns.push("id".into());
+        assert!(has_multi_part_unsupported_checks(&unique));
+    }
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
 

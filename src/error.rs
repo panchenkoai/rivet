@@ -603,6 +603,11 @@ pub type Result<T> = anyhow::Result<T>;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_preclassified_exit_reads_as_its_class() {
+        assert_eq!(super::PreclassifiedExit(5).to_string(), "exit class 5");
+    }
+
     /// The cli.md exit-code table lists exactly 0 plus every code an [`ExitClass`] maps to.
     #[test]
     fn the_cli_exit_code_table_lists_every_exit_class() {
