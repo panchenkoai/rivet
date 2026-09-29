@@ -600,8 +600,7 @@ impl PgChangeStream {
             // parses a lossy value while the batch binary path stays exact — a
             // silent CDC-vs-batch float divergence (bug hunt 2026-08-09, same
             // session-state-rendering class as datestyle/bytea/intervalstyle).
-            "SET datestyle = 'ISO, MDY'; SET bytea_output = 'hex'; \
-             SET intervalstyle = 'postgres'; SET extra_float_digits = 3;",
+            READER_SESSION_PIN,
         )?;
         // The one routing check of a run, on the stream's own connection (the stream is
         // opened once per run). Its refusals carry rivet's `pg cdc:` prefix, so the
@@ -2113,6 +2112,11 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
+/// Session formats the text reader parses, pinned on its own connection (TimeZone too:
+/// an LMT-era timestamptz in a named zone renders a seconds offset nothing parses).
+const READER_SESSION_PIN: &str = "SET datestyle = 'ISO, MDY'; SET bytea_output = 'hex'; \
+     SET intervalstyle = 'postgres'; SET extra_float_digits = 3; SET TimeZone = 'UTC';";
+
 /// Parse a PostgreSQL timestamp rendering (`YYYY-MM-DD HH:MM:SS[.ffffff][±TZ]`).
 /// For `timestamptz` the trailing offset is DATA, not decoration: test_decoding
 /// renders the instant in the polling session's zone, so at any non-UTC
@@ -2853,6 +2857,14 @@ mod tests {
     // even stripped, so the parse failed and the value silently became NULL.
     // Every prior test ran the session at UTC, where the offset is always +00
     // and the bug is invisible.
+    #[test]
+    fn the_reader_session_pins_timezone_to_utc() {
+        assert!(
+            READER_SESSION_PIN.contains("SET TimeZone = 'UTC';"),
+            "{READER_SESSION_PIN}"
+        );
+    }
+
     #[test]
     fn timestamptz_offset_is_data_not_decoration() {
         use chrono::NaiveDate;
