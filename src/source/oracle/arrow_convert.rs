@@ -9,8 +9,9 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, BinaryBuilder, BooleanBuilder, Decimal128Builder, Float32Builder, Float64Builder,
-    Int32Builder, Int64Builder, StringBuilder, TimestampMicrosecondBuilder,
+    ArrayRef, BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder,
+    FixedSizeBinaryBuilder, Float32Builder, Float64Builder, Int16Builder, Int32Builder,
+    Int64Builder, StringBuilder, TimestampMicrosecondBuilder, TimestampNanosecondBuilder,
 };
 use arrow::datatypes::{DataType, Schema, TimeUnit as ArrowTimeUnit};
 use arrow::record_batch::RecordBatch;
@@ -45,7 +46,20 @@ pub(super) fn oracle_type_to_rivet(
     native: &str,
     overrides: &ColumnOverrides,
 ) -> RivetType {
-    crate::types::resolve_or(overrides, meta.name(), || match OraKind::of(meta) {
+    crate::types::resolve_or(overrides, meta.name(), || {
+        autodetect(
+            OraKind::of(meta),
+            native,
+            meta.precision(),
+            meta.scale(),
+            &native_label(meta),
+        )
+    })
+}
+
+/// The Rivet type of a re-projected column of `kind`, declared as `native`; `label` names it when unmapped.
+fn autodetect(kind: OraKind, native: &str, precision: u8, scale: i8, label: &str) -> RivetType {
+    match kind {
         _ if native.starts_with("timestamp_tz") || native.starts_with("timestamp_ltz") => {
             RivetType::Timestamp {
                 unit: TimeUnit::Microsecond,
@@ -54,8 +68,7 @@ pub(super) fn oracle_type_to_rivet(
         }
         _ if native.starts_with("interval") => RivetType::Interval,
         _ if native == "json" => RivetType::Json,
-        _ if native == "vector" || native == "object" || native == "xmltype" => RivetType::String,
-        OraKind::Number => number_type(meta.precision(), meta.scale()),
+        OraKind::Number => number_type(precision, scale),
         OraKind::BinaryFloat => RivetType::Float32,
         OraKind::BinaryDouble => RivetType::Float64,
         OraKind::Boolean => RivetType::Bool,
@@ -65,17 +78,14 @@ pub(super) fn oracle_type_to_rivet(
         },
         OraKind::Text | OraKind::Clob => RivetType::String,
         OraKind::Raw | OraKind::Blob => RivetType::Binary,
-        _ => {
-            let label = native_label(meta);
-            RivetType::Unsupported {
-                native_type: label.clone(),
-                reason: format!(
-                    "Oracle column type {label} has no Rivet mapping; select a convertible \
-                     expression of it in a `query:`, or drop it"
-                ),
-            }
-        }
-    })
+        _ => RivetType::Unsupported {
+            native_type: label.to_string(),
+            reason: format!(
+                "Oracle column type {label} has no Rivet mapping; select a convertible \
+                 expression of it in a `query:`, or drop it"
+            ),
+        },
+    }
 }
 
 /// NUMBER(p,s): small integers, then `Decimal`; bare `NUMBER`/`FLOAT` as exact text.
@@ -97,9 +107,9 @@ fn number_type(precision: u8, scale: i8) -> RivetType {
     }
 }
 
-/// True when `meta` is a bare `NUMBER`/`FLOAT` (exported as exact text).
-fn is_bare_number(meta: &Metadata) -> bool {
-    OraKind::of(meta) == OraKind::Number && (meta.precision() == 0 || meta.scale() == -127)
+/// True for a bare `NUMBER`/`FLOAT` (exported as exact text).
+fn is_bare_number(kind: OraKind, precision: u8, scale: i8) -> bool {
+    kind == OraKind::Number && (precision == 0 || scale == -127)
 }
 
 /// `TypeMapping` for every column, with the Oracle-specific warnings attached.
@@ -117,7 +127,7 @@ pub(super) fn oracle_type_mappings(
             let mapping = TypeMapping::from_source(&source, rivet);
             if overrides.contains_key(m.name()) {
                 mapping
-            } else if is_bare_number(m) {
+            } else if is_bare_number(OraKind::of(m), m.precision(), m.scale()) {
                 mapping.with_warning(bare_number_warning(m.name()))
             } else if sub_microsecond(native, m.scale()) {
                 TypeMapping {
@@ -171,17 +181,28 @@ pub(super) fn oracle_schema(
 fn interval_iso(row: &Row, idx: usize, kind: OraKind) -> Result<Option<String>> {
     Ok(match kind {
         OraKind::IntervalDs => row.get::<Option<OracleIntervalDS>>(idx).ora()?.map(|v| {
-            let us = i64::from(v.hours()) * 3_600_000_000
-                + i64::from(v.minutes()) * 60_000_000
-                + i64::from(v.seconds()) * 1_000_000
-                + i64::from(v.nanoseconds()) / 1_000;
-            crate::source::postgres::pg_interval_to_iso8601(0, v.days(), us)
+            interval_ds_iso(
+                v.days(),
+                v.hours(),
+                v.minutes(),
+                v.seconds(),
+                v.nanoseconds(),
+            )
         }),
         _ => row
             .get::<Option<OracleIntervalYM>>(idx)
             .ora()?
             .map(|v| interval_ym_iso(v.years(), i32::from(v.months()))),
     })
+}
+
+/// ISO 8601 for a DAY TO SECOND interval's fields, truncated to microseconds.
+fn interval_ds_iso(days: i32, hours: i8, minutes: i8, seconds: i8, nanos: i32) -> String {
+    let us = i64::from(hours) * 3_600_000_000
+        + i64::from(minutes) * 60_000_000
+        + i64::from(seconds) * 1_000_000
+        + i64::from(nanos) / 1_000;
+    crate::source::postgres::pg_interval_to_iso8601(0, days, us)
 }
 
 /// ISO 8601 for a YEAR TO MONTH interval, straight from its fields (YEAR(9) overflows i32 months).
@@ -203,8 +224,8 @@ pub(super) fn chrono_year(oracle: i32) -> i32 {
     }
 }
 
-/// Microseconds since the Unix epoch for an Oracle timestamp's fields, read as UTC.
-pub(super) fn timestamp_micros(t: &OracleTimestamp) -> Result<i64> {
+/// An Oracle timestamp's fields as a proleptic-Gregorian date-time, read as UTC.
+fn timestamp_datetime(t: &OracleTimestamp) -> Result<chrono::NaiveDateTime> {
     let year = chrono_year(t.year() as i32);
     let date = chrono::NaiveDate::from_ymd_opt(year, t.month() as u32, t.day() as u32)
         .ok_or_else(|| anyhow::anyhow!("oracle: invalid date {t}"))?;
@@ -215,7 +236,65 @@ pub(super) fn timestamp_micros(t: &OracleTimestamp) -> Result<i64> {
         t.nanoseconds(),
     )
     .ok_or_else(|| anyhow::anyhow!("oracle: invalid time {t}"))?;
-    Ok(date.and_time(time).and_utc().timestamp_micros())
+    Ok(date.and_time(time))
+}
+
+/// Microseconds since the Unix epoch for an Oracle timestamp's fields, read as UTC.
+pub(super) fn timestamp_micros(t: &OracleTimestamp) -> Result<i64> {
+    Ok(timestamp_datetime(t)?.and_utc().timestamp_micros())
+}
+
+/// Nanoseconds since the Unix epoch, or an error naming `name` outside Arrow's 1677..2262 range.
+fn timestamp_nanos(t: &OracleTimestamp, name: &str) -> Result<i64> {
+    timestamp_datetime(t)?
+        .and_utc()
+        .timestamp_nanos_opt()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "oracle: column {name} = {t} is outside the nanosecond timestamp range \
+                 (1677-09-21..2262-04-11); declare it `timestamp` (microseconds) instead"
+            )
+        })
+}
+
+/// Days since the Unix epoch, or an error naming `name` when the value has a time of day.
+fn date_days(t: &OracleTimestamp, name: &str) -> Result<i32> {
+    let dt = timestamp_datetime(t)?;
+    anyhow::ensure!(
+        dt.time() == chrono::NaiveTime::MIN,
+        "oracle: column {name} = {t} has a time of day, which a `date` override would drop; \
+         declare it `timestamp`, or select TRUNC({name}) in a `query:`"
+    );
+    i32::try_from(dt.and_utc().timestamp() / 86_400).map_err(Into::into)
+}
+
+/// Oracle's own `SYYYY-MM-DD"T"HH24:MI:SS.FF` text of a timestamp: 6 fractional digits, 9 when finer.
+fn timestamp_text(t: &OracleTimestamp) -> String {
+    let y = t.year() as i32;
+    let year = if y < 0 {
+        format!("-{:04}", -y)
+    } else {
+        format!("{y:04}")
+    };
+    let ns = t.nanoseconds();
+    let frac = if ns.is_multiple_of(1_000) {
+        format!("{:06}", ns / 1_000)
+    } else {
+        format!("{ns:09}")
+    };
+    format!(
+        "{year}-{:02}-{:02}T{:02}:{:02}:{:02}.{frac}",
+        t.month(),
+        t.day(),
+        t.hour(),
+        t.minute(),
+        t.second()
+    )
+}
+
+/// Upper-case hex, as Oracle's `RAWTOHEX` renders bytes.
+fn upper_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02X}")).collect()
 }
 
 /// True when `row`'s zero-length flag column (see `super::Projection`) is set.
@@ -240,7 +319,18 @@ fn build_column(
             .ora()
             .map(|v| v.map(|n| n.to_string()))
     };
+    let kind = rows
+        .first()
+        .and_then(|r| r.columns().get(idx))
+        .map_or(OraKind::Other, OraKind::of);
     Ok(match dt {
+        DataType::Int16 => {
+            let mut b = Int16Builder::with_capacity(rows.len());
+            for r in rows {
+                b.append_option(number(r)?.map(|s| s.parse::<i16>()).transpose()?);
+            }
+            Arc::new(b.finish())
+        }
         DataType::Int32 => {
             let mut b = Int32Builder::with_capacity(rows.len());
             for r in rows {
@@ -280,7 +370,10 @@ fn build_column(
         DataType::Float64 => {
             let mut b = Float64Builder::with_capacity(rows.len());
             for r in rows {
-                b.append_option(r.get::<Option<f64>>(idx).ora()?);
+                b.append_option(match kind {
+                    OraKind::BinaryFloat => r.get::<Option<f32>>(idx).ora()?.map(f64::from),
+                    _ => r.get::<Option<f64>>(idx).ora()?,
+                });
             }
             Arc::new(b.finish())
         }
@@ -301,6 +394,42 @@ fn build_column(
             }
             Arc::new(b.finish().with_timezone_opt(tz.clone()))
         }
+        DataType::Timestamp(ArrowTimeUnit::Nanosecond, tz) => {
+            let mut b = TimestampNanosecondBuilder::with_capacity(rows.len());
+            for r in rows {
+                match r.get::<Option<OracleTimestamp>>(idx).ora()? {
+                    Some(t) => b.append_value(timestamp_nanos(&t, name)?),
+                    None => b.append_null(),
+                }
+            }
+            Arc::new(b.finish().with_timezone_opt(tz.clone()))
+        }
+        DataType::Date32 => {
+            let mut b = Date32Builder::with_capacity(rows.len());
+            for r in rows {
+                match r.get::<Option<OracleTimestamp>>(idx).ora()? {
+                    Some(t) => b.append_value(date_days(&t, name)?),
+                    None => b.append_null(),
+                }
+            }
+            Arc::new(b.finish())
+        }
+        DataType::FixedSizeBinary(width) => {
+            let mut b = FixedSizeBinaryBuilder::with_capacity(rows.len(), *width);
+            for r in rows {
+                match r.get::<Option<Vec<u8>>>(idx).ora()? {
+                    Some(v) => b.append_value(&v).map_err(|_| {
+                        anyhow::anyhow!(
+                            "oracle: column {name} holds a {}-byte value; a `uuid` override needs \
+                             exactly {width} bytes (RAW({width}))",
+                            v.len()
+                        )
+                    })?,
+                    None => b.append_null(),
+                }
+            }
+            Arc::new(b.finish())
+        }
         DataType::Binary => {
             let mut b = BinaryBuilder::with_capacity(rows.len(), 0);
             for r in rows {
@@ -317,14 +446,22 @@ fn build_column(
         }
         DataType::Utf8 => {
             let mut b = StringBuilder::with_capacity(rows.len(), 0);
-            let kind = rows
-                .first()
-                .and_then(|r| r.columns().get(idx))
-                .map_or(OraKind::Other, OraKind::of);
             for r in rows {
                 let v = match kind {
                     OraKind::Number => number(r)?,
                     OraKind::IntervalDs | OraKind::IntervalYm => interval_iso(r, idx, kind)?,
+                    OraKind::Date | OraKind::Timestamp => r
+                        .get::<Option<OracleTimestamp>>(idx)
+                        .ora()?
+                        .map(|t| timestamp_text(&t)),
+                    OraKind::BinaryFloat => r.get::<Option<f32>>(idx).ora()?.map(|v| v.to_string()),
+                    OraKind::BinaryDouble => {
+                        r.get::<Option<f64>>(idx).ora()?.map(|v| v.to_string())
+                    }
+                    OraKind::Boolean => r.get::<Option<bool>>(idx).ora()?.map(|v| v.to_string()),
+                    OraKind::Raw | OraKind::Blob => {
+                        r.get::<Option<Vec<u8>>>(idx).ora()?.map(|v| upper_hex(&v))
+                    }
                     _ => r.get::<Option<String>>(idx).ora()?,
                 };
                 match v {
@@ -437,6 +574,121 @@ mod tests {
             w.contains("`columns: {AMT: \"decimal(38,0)\"}` for whole numbers"),
             "{w}"
         );
+    }
+
+    #[test]
+    fn timestamp_text_is_oracles_signed_iso_rendering() {
+        let t = OracleTimestamp::new_timestamp(2024, 2, 29, 13, 14, 15, 123_456_000);
+        assert_eq!(timestamp_text(&t), "2024-02-29T13:14:15.123456");
+        let ns = OracleTimestamp::new_timestamp(2024, 2, 29, 13, 14, 15, 1);
+        assert_eq!(timestamp_text(&ns), "2024-02-29T13:14:15.000000001");
+        let bc = OracleTimestamp::new_date(-1, 6, 15);
+        assert_eq!(timestamp_text(&bc), "-0001-06-15T00:00:00.000000");
+        let one = OracleTimestamp::new_date(1, 1, 1);
+        assert_eq!(timestamp_text(&one), "0001-01-01T00:00:00.000000");
+    }
+
+    #[test]
+    fn a_date_is_whole_days_and_a_time_of_day_is_refused_by_name() {
+        assert_eq!(
+            date_days(&OracleTimestamp::new_date(1970, 1, 2), "D").unwrap(),
+            1
+        );
+        assert_eq!(
+            date_days(&OracleTimestamp::new_date(1969, 12, 31), "D").unwrap(),
+            -1
+        );
+        let noon = OracleTimestamp::new_timestamp(1970, 1, 2, 12, 0, 0, 0);
+        let err = date_days(&noon, "DT").unwrap_err().to_string();
+        assert!(
+            err.contains("column DT = ") && err.contains("time of day"),
+            "{err}"
+        );
+        let ns = OracleTimestamp::new_timestamp(1970, 1, 2, 0, 0, 0, 1);
+        assert!(
+            date_days(&ns, "DT").is_err(),
+            "a nanosecond is a time of day"
+        );
+    }
+
+    #[test]
+    fn nanosecond_timestamps_keep_every_digit_and_refuse_past_arrows_range() {
+        let t = OracleTimestamp::new_timestamp(1970, 1, 1, 0, 0, 1, 123_456_789);
+        assert_eq!(timestamp_nanos(&t, "T").unwrap(), 1_123_456_789);
+        let far = OracleTimestamp::new_date(9999, 12, 31);
+        let err = timestamp_nanos(&far, "T").unwrap_err().to_string();
+        assert!(err.contains("column T = "), "{err}");
+    }
+
+    #[test]
+    fn every_kind_autodetects_to_its_rivet_type() {
+        let ts = |tz: Option<&str>| RivetType::Timestamp {
+            unit: TimeUnit::Microsecond,
+            timezone: tz.map(Into::into),
+        };
+        let a = |k, native| autodetect(k, native, 10, 2, "lbl");
+        assert_eq!(a(OraKind::Timestamp, "timestamp_tz(6)"), ts(Some("UTC")));
+        assert_eq!(a(OraKind::Timestamp, "timestamp_ltz(6)"), ts(Some("UTC")));
+        assert_eq!(a(OraKind::Timestamp, "timestamp(6)"), ts(None));
+        assert_eq!(a(OraKind::Date, "date"), ts(None));
+        assert_eq!(a(OraKind::Text, "interval_ds"), RivetType::Interval);
+        assert_eq!(a(OraKind::Clob, "json"), RivetType::Json);
+        // VECTOR, XMLTYPE and object types arrive re-projected to CLOB.
+        for n in ["vector", "object", "xmltype"] {
+            assert_eq!(a(OraKind::Clob, n), RivetType::String, "{n}");
+        }
+        assert_eq!(
+            a(OraKind::Number, "number(10,2)"),
+            RivetType::Decimal {
+                precision: 10,
+                scale: 2
+            }
+        );
+        assert_eq!(a(OraKind::BinaryFloat, "binary_float"), RivetType::Float32);
+        assert_eq!(
+            a(OraKind::BinaryDouble, "binary_double"),
+            RivetType::Float64
+        );
+        assert_eq!(a(OraKind::Boolean, "boolean"), RivetType::Bool);
+        assert_eq!(a(OraKind::Text, "varchar"), RivetType::String);
+        assert_eq!(a(OraKind::Clob, "clob"), RivetType::String);
+        assert_eq!(a(OraKind::Raw, "raw"), RivetType::Binary);
+        assert_eq!(a(OraKind::Blob, "blob"), RivetType::Binary);
+        match a(OraKind::Other, "bfile") {
+            RivetType::Unsupported {
+                native_type,
+                reason,
+            } => {
+                assert_eq!(native_type, "lbl");
+                assert!(reason.contains("Oracle column type lbl has no Rivet mapping"));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn only_an_undeclared_number_is_bare() {
+        assert!(is_bare_number(OraKind::Number, 0, 0));
+        assert!(is_bare_number(OraKind::Number, 126, -127));
+        assert!(!is_bare_number(OraKind::Number, 10, 0));
+        assert!(!is_bare_number(OraKind::Number, 1, -1));
+        assert!(!is_bare_number(OraKind::BinaryDouble, 0, 0));
+        assert!(!is_bare_number(OraKind::Text, 0, -127));
+    }
+
+    #[test]
+    fn a_day_to_second_interval_renders_every_field() {
+        assert_eq!(interval_ds_iso(1, 2, 3, 4, 5_000), "P1DT2H3M4.000005S");
+        assert_eq!(interval_ds_iso(0, 0, 0, 0, 999), "PT0S", "sub-µs truncated");
+        assert_eq!(interval_ds_iso(0, 0, 0, 1, 0), "PT1S");
+        assert_eq!(interval_ds_iso(0, 0, 1, 0, 0), "PT1M");
+        assert_eq!(interval_ds_iso(0, 1, 0, 0, 0), "PT1H");
+    }
+
+    #[test]
+    fn bytes_render_as_upper_hex() {
+        assert_eq!(upper_hex(&[0x00, 0xab, 0xff]), "00ABFF");
+        assert_eq!(upper_hex(&[]), "");
     }
 
     #[test]

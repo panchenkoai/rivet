@@ -66,7 +66,20 @@ fn render(a: &dyn Array, i: usize) -> Option<String> {
             .iter()
             .map(|b| format!("{b:02X}"))
             .collect(),
-        DataType::Decimal128(..) | DataType::Int32 | DataType::Int64 => {
+        DataType::FixedSizeBinary(_) => a
+            .as_fixed_size_binary()
+            .value(i)
+            .iter()
+            .map(|b| format!("{b:02X}"))
+            .collect(),
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+            let ns = a
+                .as_primitive::<arrow::datatypes::TimestampNanosecondType>()
+                .value(i);
+            let dt = chrono::DateTime::from_timestamp_nanos(ns);
+            canon_ts(&dt.format("%Y-%m-%dT%H:%M:%S%.9f").to_string())
+        }
+        DataType::Decimal128(..) | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
             canon_num(&arrow::util::display::array_value_to_string(a, i).unwrap())
         }
         _ => arrow::util::display::array_value_to_string(a, i).unwrap(),
@@ -1916,4 +1929,543 @@ fn an_incremental_cursor_on_a_nanosecond_timestamp_is_refused_before_it_re_expor
         files.is_empty(),
         "the refusal comes before any part: {files:?}"
     );
+}
+
+/// The `columns:` override types beyond the autodetected ones, one column each.
+const OVERRIDE_DECODERS: &str = "columns: {N_SMALL: int16, D: date, TS9: timestamp_ns, \
+    TS6: timestamp_tz, DT: text, T9TXT: text, BD: text, BF: float64, B: text, RW: uuid, R8: text, \
+    N_F4: float4, TZ9: timestamp_tz_ns}";
+
+/// A table whose every column is read through one of [`OVERRIDE_DECODERS`].
+fn override_decoder_table() -> OracleTable {
+    let t = OracleTable::create(
+        "ora_ovr",
+        "id NUMBER(10) PRIMARY KEY, n_small NUMBER(4), d DATE, ts9 TIMESTAMP(9), \
+         ts6 TIMESTAMP(6), dt DATE, t9txt TIMESTAMP(9), bd BINARY_DOUBLE, bf BINARY_FLOAT, \
+         b BOOLEAN, rw RAW(16), r8 RAW(8), n_f4 NUMBER(6,2), tz9 TIMESTAMP(9)",
+    );
+    for row in [
+        "1, 1234, DATE '2024-02-29', TIMESTAMP '2024-02-29 13:14:15.123456789', \
+         TIMESTAMP '2024-02-29 13:14:15.123456', TO_DATE('2024-02-29 13:14:15','YYYY-MM-DD HH24:MI:SS'), \
+         TIMESTAMP '2024-02-29 13:14:15.000000001', 2.25, 0.1, TRUE, \
+         HEXTORAW('00112233445566778899AABBCCDDEEFF'), HEXTORAW('DEADBEEF00'), 12.5, \
+         TIMESTAMP '2024-02-29 13:14:15.987654321'",
+        "2, -9999, DATE '0001-01-01', TIMESTAMP '1677-09-21 00:12:43.145224192', \
+         TIMESTAMP '9999-12-31 23:59:59.999999', TO_DATE('-0001-06-15 23:59:59','SYYYY-MM-DD HH24:MI:SS'), \
+         TIMESTAMP '2024-01-01 00:00:00.5', -1.5E300D, -3.5, FALSE, \
+         HEXTORAW('FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF'), HEXTORAW('01'), -0.1, \
+         TIMESTAMP '2262-04-11 23:47:16.854775807'",
+        "3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL",
+    ] {
+        ora_exec(&format!("INSERT INTO {} VALUES ({row})", t.name()));
+    }
+    t
+}
+
+/// Every override decoder round-trips against Oracle's own rendering of the same cell.
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn every_override_decoder_round_trips_against_oracles_rendering() {
+    require_alive(LiveService::Oracle);
+    let t = override_decoder_table();
+    let n = t.name();
+    let out = tempfile::tempdir().unwrap();
+    let run = Rig::oracle_batch(n)
+        .export_line(OVERRIDE_DECODERS)
+        .dest_path(out.path().to_path_buf())
+        .run_args(&[]);
+    assert_ok(&run, "override decoders");
+
+    type Canon = fn(&str) -> String;
+    let trim = |m: BTreeMap<i64, Option<String>>, f: Canon| {
+        m.into_iter()
+            .map(|(k, v)| (k, v.map(|s| f(s.trim()))))
+            .collect::<BTreeMap<_, _>>()
+    };
+    let ident: Canon = |s| s.to_string();
+    let (ts, num): (Canon, Canon) = (canon_ts, canon_num);
+    let cases: [(&str, String, Canon); 10] = [
+        ("N_SMALL", "TO_CHAR(n_small)".into(), num),
+        ("D", "TO_CHAR(d, 'YYYY-MM-DD')".into(), ident),
+        (
+            "TS9",
+            "TO_CHAR(ts9, 'YYYY-MM-DD\"T\"HH24:MI:SS.FF9')".into(),
+            ts,
+        ),
+        ("TS6", ts_fmt("ts6"), ts),
+        (
+            "DT",
+            "NVL2(dt, TO_CHAR(dt, 'SYYYY-MM-DD\"T\"HH24:MI:SS') || '.000000', NULL)".into(),
+            ident,
+        ),
+        (
+            "T9TXT",
+            "TO_CHAR(t9txt, 'SYYYY-MM-DD\"T\"HH24:MI:SS.FF9')".into(),
+            ts,
+        ),
+        (
+            "B",
+            "CASE WHEN b THEN 'true' WHEN NOT b THEN 'false' END".into(),
+            ident,
+        ),
+        ("RW", "RAWTOHEX(rw)".into(), ident),
+        ("R8", "RAWTOHEX(r8)".into(), ident),
+        (
+            "TZ9",
+            "TO_CHAR(tz9, 'YYYY-MM-DD\"T\"HH24:MI:SS.FF9')".into(),
+            ts,
+        ),
+    ];
+    for (col, expr, f) in cases {
+        let want = trim(oracle_cells(n, &expr), f);
+        let got = trim(parquet_cells(out.path(), col), f);
+        assert_eq!(got, want, "{col}: rivet vs Oracle's own rendering");
+    }
+
+    // Floats compare as numbers: Oracle renders 2.25 as 2.25E+000.
+    let bits = |m: BTreeMap<i64, Option<String>>, widen: bool| {
+        m.into_iter()
+            .map(|(k, v)| {
+                let v = v.map(|s| {
+                    let s = s.trim();
+                    if widen {
+                        f64::from(s.parse::<f32>().unwrap()).to_bits()
+                    } else {
+                        s.parse::<f64>().unwrap().to_bits()
+                    }
+                });
+                (k, v)
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
+    assert_eq!(
+        bits(parquet_cells(out.path(), "BD"), false),
+        bits(oracle_cells(n, "TO_CHAR(bd)"), false),
+        "BD as text"
+    );
+    assert_eq!(
+        bits(parquet_cells(out.path(), "N_F4"), true),
+        bits(oracle_cells(n, "TO_CHAR(n_f4)"), true),
+        "N_F4 as float4"
+    );
+    assert_eq!(
+        bits(parquet_cells(out.path(), "BF"), false),
+        bits(oracle_cells(n, "TO_CHAR(bf)"), true),
+        "BF widened to float64"
+    );
+    assert_eq!(
+        parquet_cells(out.path(), "DT")[&2].as_deref(),
+        Some("-0001-06-15T23:59:59.000000"),
+        "a BC date keeps Oracle's signed year as text"
+    );
+}
+
+/// A `date` override on a DATE holding a time of day fails naming the column, instead of dropping the time.
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn a_date_override_refuses_a_value_with_a_time_of_day() {
+    require_alive(LiveService::Oracle);
+    let t = OracleTable::create("ora_ovd", "id NUMBER(10) PRIMARY KEY, dt DATE");
+    ora_exec(&format!(
+        "INSERT INTO {} VALUES (1, TO_DATE('2024-02-29 13:14:15','YYYY-MM-DD HH24:MI:SS'))",
+        t.name()
+    ));
+    let rig = Rig::oracle_batch(t.name()).export_line("columns: {DT: date}");
+    let said = rig.run_expect_fail();
+    assert!(
+        said.contains("column DT = ") && said.contains("has a time of day"),
+        "the refusal names the column:\n{said}"
+    );
+    assert!(
+        files_with_extension(&rig.out_dir(), "parquet").is_empty(),
+        "no part carries the truncated value"
+    );
+}
+
+/// `rivet check` refuses a `columns:` key spelled in another case than its result column, as the run does.
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn check_refuses_a_column_override_key_in_the_wrong_case() {
+    require_alive(LiveService::Oracle);
+    let t = seed_oracle_numeric_table(5);
+    let wrong = Rig::oracle_batch(t.name()).export_line("columns: {amount: \"decimal(12,2)\"}");
+    let check = wrong.cli(&["check"]);
+    assert!(!check.status.success(), "a case-only key must fail check");
+    let err = String::from_utf8_lossy(&check.stderr);
+    assert!(
+        err.contains("RIVET_CONFIG_COLUMN_OVERRIDE_CASE") && err.contains("Spell the key `AMOUNT`"),
+        "stderr:\n{err}"
+    );
+    let right = Rig::oracle_batch(t.name()).export_line("columns: {AMOUNT: \"decimal(12,2)\"}");
+    let check = right.cli(&["check"]);
+    assert!(
+        check.status.success(),
+        "the exact key passes; stderr:\n{}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+}
+
+/// UTF-8 bytes of `s` in upper hex: the literal the test inserted, rendered independently.
+fn utf8_hex(s: &str) -> String {
+    s.bytes().map(|b| format!("{b:02X}")).collect()
+}
+
+/// `s` as an Oracle `UNISTR` literal, so no client or database character set converts it on the way in.
+fn unistr(s: &str) -> String {
+    let body: String = s
+        .encode_utf16()
+        .map(|u| match u {
+            0x20..=0x7e if u != u16::from(b'\\') && u != u16::from(b'\'') => {
+                char::from(u as u8).to_string()
+            }
+            _ => format!("\\{u:04X}"),
+        })
+        .collect();
+    format!("UNISTR('{body}')")
+}
+
+/// A WE8ISO8859P1 database: Latin-1 VARCHAR2/CHAR/CLOB and non-Latin NVARCHAR2/NCHAR/NCLOB
+/// arrive byte-exact, checked against the inserted literal and Oracle's own UTF-8 rendering.
+#[test]
+#[ignore = "live: requires the stand's LATIN1PDB (dev/oracle/init/03-latin1-pdb.sh)"]
+fn a_non_unicode_database_round_trips_character_types_byte_exact() {
+    let url = oracle_latin1_url();
+    let cs = std::panic::catch_unwind(|| {
+        ora_text_rows_on(
+            &url,
+            "SELECT value FROM nls_database_parameters WHERE parameter = 'NLS_CHARACTERSET'",
+        )
+    })
+    .unwrap_or_else(|_| {
+        panic!(
+            "no LATIN1PDB at {url}: create it once with \
+             `docker exec -i -e RIVET_STAND_LATIN1_PDB=1 rivet-oracle-1 bash < dev/oracle/init/03-latin1-pdb.sh`"
+        )
+    });
+    assert_eq!(cs[0][0].as_deref(), Some("WE8ISO8859P1"), "fixture charset");
+
+    let latin = "caf\u{e9} na\u{ef}ve \u{dc}ber \u{df} \u{f1} \u{ff} \u{a9}";
+    let wide = "\u{41f}\u{440}\u{438}\u{432}\u{435}\u{442} \u{65e5}\u{672c}\u{8a9e} \u{1f980}";
+    let t = OracleTable::create_on(
+        &url,
+        "ora_l1",
+        "id NUMBER(10) PRIMARY KEY, vc VARCHAR2(60), ch CHAR(40), cl CLOB, \
+         nvc NVARCHAR2(40), nch NCHAR(20), ncl NCLOB",
+    );
+    let (l, w) = (unistr(latin), unistr(wide));
+    ora_exec_on(
+        &url,
+        &format!(
+            "INSERT INTO {} VALUES (1, {l}, {l}, TO_CLOB({l}), {w}, {w}, TO_NCLOB({w}))",
+            t.name()
+        ),
+    );
+    ora_exec_on(
+        &url,
+        &format!(
+            "INSERT INTO {} VALUES (2, NULL, NULL, NULL, NULL, NULL, NULL)",
+            t.name()
+        ),
+    );
+    let out = tempfile::tempdir().unwrap();
+    let run = Rig::oracle_batch(t.name())
+        .source_url(&url)
+        .dest_path(out.path().to_path_buf())
+        .run_args(&[]);
+    assert_ok(&run, "latin1 database");
+
+    for (col, literal, expr) in [
+        ("VC", latin, "vc"),
+        ("CH", latin, "ch"),
+        ("CL", latin, "TO_CHAR(cl)"),
+        ("NVC", wide, "nvc"),
+        ("NCH", wide, "nch"),
+        ("NCL", wide, "TO_NCHAR(ncl)"),
+    ] {
+        let oracle = ora_text_rows_on(
+            &url,
+            &format!(
+                "SELECT RAWTOHEX(UTL_I18N.STRING_TO_RAW({expr}, 'AL32UTF8')) FROM {} ORDER BY id",
+                t.name()
+            ),
+        );
+        let got = parquet_cells(out.path(), col);
+        let cell = got[&1].as_deref().expect("row 1 is not NULL");
+        assert_eq!(
+            utf8_hex(cell.trim_end_matches(' ')),
+            utf8_hex(literal),
+            "{col}: rivet vs the inserted literal (CHAR padding aside)"
+        );
+        assert_eq!(
+            Some(utf8_hex(cell)),
+            oracle[0][0],
+            "{col}: rivet vs Oracle's UTF-8 rendering, byte for byte"
+        );
+        assert_eq!(got[&2], None, "{col}: NULL stays NULL");
+    }
+}
+
+// ── M3: every batch runner hook, faulted on Oracle, loses nothing ─────────────
+// The oracle is the database: `TO_CHAR(amount)` per id, compared with every row the
+// Success manifests declare after the recovery run (never rivet's own counters).
+
+/// Export lines that split a ~1 KB-row stream into several 64 KB parts, so part-index hooks fire.
+const MULTI_PART: [&str; 6] = [
+    "compression: none",
+    "max_file_size: 64KB",
+    "parquet:",
+    "  row_group_strategy: fixed_rows",
+    "  row_group_rows: 100",
+    "tuning: {batch_size: 100}",
+];
+
+/// `rows` rows of `ID, AMOUNT, PAYLOAD (~1 KB), UPD`, ids 1..=rows.
+fn crash_table(rows: i64) -> OracleTable {
+    let t = OracleTable::create(
+        "ora_crash",
+        "id NUMBER(10) PRIMARY KEY, amount NUMBER(12,2), payload VARCHAR2(1100), \
+         upd TIMESTAMP(6) NOT NULL",
+    );
+    ora_exec(&format!(
+        "INSERT INTO {} SELECT LEVEL, LEVEL * 1.25, RPAD('p' || LEVEL, 1000, 'x'), \
+         TIMESTAMP '2024-01-01 00:00:00' + NUMTODSINTERVAL(LEVEL, 'SECOND') \
+         FROM dual CONNECT BY LEVEL <= {rows}",
+        t.name()
+    ));
+    t
+}
+
+/// Every copy of every row the Success manifests declare, `ID -> [AMOUNT, …]`.
+fn declared_amounts(rig: &Rig) -> BTreeMap<i64, Vec<String>> {
+    let mut out: BTreeMap<i64, Vec<String>> = BTreeMap::new();
+    for b in rig.read_declared_parts() {
+        let ids = b.column_by_name("ID").expect("ID");
+        let amounts = b.column_by_name("AMOUNT").expect("AMOUNT");
+        for i in 0..b.num_rows() {
+            let id = render(ids.as_ref(), i).unwrap().parse().unwrap();
+            out.entry(id)
+                .or_default()
+                .push(render(amounts.as_ref(), i).unwrap());
+        }
+    }
+    out
+}
+
+/// The declared rows hold every source row, nothing else, each copy equal to Oracle's own `TO_CHAR(amount)`.
+fn assert_no_loss(rig: &Rig, table: &str, ctx: &str) {
+    let want: BTreeMap<i64, String> =
+        ora_text_rows(&format!("SELECT TO_CHAR(id), TO_CHAR(amount) FROM {table}"))
+            .into_iter()
+            .map(|r| {
+                (
+                    r[0].as_deref().unwrap().parse().unwrap(),
+                    canon_num(r[1].as_deref().unwrap()),
+                )
+            })
+            .collect();
+    let got = declared_amounts(rig);
+    let missing: Vec<_> = want
+        .keys()
+        .filter(|k| !got.contains_key(k))
+        .take(5)
+        .collect();
+    assert!(missing.is_empty(), "{ctx}: rows lost, e.g. {missing:?}");
+    let extra: Vec<_> = got
+        .keys()
+        .filter(|k| !want.contains_key(k))
+        .take(5)
+        .collect();
+    assert!(extra.is_empty(), "{ctx}: rows the source lacks: {extra:?}");
+    for (id, copies) in &got {
+        assert!(
+            copies.iter().all(|a| *a == want[id]),
+            "{ctx}: id {id} is {copies:?}, the source says {}",
+            want[id]
+        );
+    }
+}
+
+/// One fault: the faulted run fails at the hook, then the recovery run succeeds.
+fn fault_then_recover(rig: &Rig, fault: (&str, &str), recover: &[&str], ctx: &str) {
+    let crash = rig.run_args_env(&[], &[fault]);
+    let err = String::from_utf8_lossy(&crash.stderr);
+    assert!(!crash.status.success(), "{ctx}: the faulted run must fail");
+    assert!(
+        err.contains("rivet test-hook: injected"),
+        "{ctx}: the run failed, but not at the hook:\n{err}"
+    );
+    assert_ok(&rig.run_args(recover), &format!("{ctx}: recovery"));
+}
+
+/// A rig over `table` with the multi-part lines and `lines`.
+fn crash_rig(table: &str, mode: &str, lines: &[&str]) -> Rig {
+    let mut rig = Rig::oracle_batch(table).mode(mode);
+    for l in MULTI_PART.iter().chain(lines) {
+        rig = rig.export_line(l);
+    }
+    rig
+}
+
+const PANIC: &str = "RIVET_TEST_PANIC_AT";
+const ERROR: &str = "RIVET_TEST_ERROR_AT";
+
+/// Single-export runner (`mode: full`): every hook it has.
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn every_single_runner_hook_loses_nothing_on_oracle() {
+    require_alive(LiveService::Oracle);
+    let t = crash_table(1_200);
+    for fault in [
+        (PANIC, "after_source_read"),
+        (PANIC, "after_file_write"),
+        (PANIC, "after_manifest_update"),
+        (ERROR, "single_part_commit:1"),
+    ] {
+        let rig = crash_rig(t.name(), "full", &[]);
+        let ctx = format!("single {fault:?}");
+        fault_then_recover(&rig, fault, &[], &ctx);
+        assert_no_loss(&rig, t.name(), &ctx);
+    }
+}
+
+/// Incremental runner: a fault, rows added after it, and a clean next run that captures them.
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn every_incremental_runner_hook_loses_nothing_on_oracle() {
+    require_alive(LiveService::Oracle);
+    for fault in [
+        (PANIC, "after_source_read"),
+        (PANIC, "after_file_write"),
+        (PANIC, "after_manifest_update"),
+        (PANIC, "after_cursor_commit"),
+        (ERROR, "single_part_commit:1"),
+    ] {
+        let ctx = format!("incremental {fault:?}");
+        let t = crash_table(600);
+        let rig = crash_rig(t.name(), "incremental", &["cursor_column: UPD"]);
+        let crash = rig.run_args_env(&[], &[fault]);
+        assert!(!crash.status.success(), "{ctx}: the faulted run must fail");
+        assert!(
+            String::from_utf8_lossy(&crash.stderr).contains("rivet test-hook: injected"),
+            "{ctx}: the run failed, but not at the hook"
+        );
+        ora_exec(&format!(
+            "INSERT INTO {} SELECT 600 + LEVEL, LEVEL * 2.5, 'late', \
+             TIMESTAMP '2025-01-01 00:00:00' + NUMTODSINTERVAL(LEVEL, 'SECOND') \
+             FROM dual CONNECT BY LEVEL <= 50",
+            t.name()
+        ));
+        assert_ok(&rig.run_args(&[]), &format!("{ctx}: recovery"));
+        assert_no_loss(&rig, t.name(), &ctx);
+    }
+}
+
+/// Range-chunked runner, sequential and parallel, with and without the chunk checkpoint.
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn every_chunked_range_runner_hook_loses_nothing_on_oracle() {
+    require_alive(LiveService::Oracle);
+    let t = crash_table(1_500);
+    let range = ["chunk_column: ID", "chunk_size: 500"];
+    for (runner, extra, resume) in [
+        (
+            "checkpoint",
+            &["chunk_checkpoint: true"][..],
+            &["--resume"][..],
+        ),
+        (
+            "parallel checkpoint",
+            &["chunk_checkpoint: true", "parallel: 2"][..],
+            &["--resume"][..],
+        ),
+        ("plain", &[][..], &[][..]),
+        ("plain parallel", &["parallel: 2"][..], &[][..]),
+    ] {
+        // The plain sequential runner has no per-chunk error point; the other three do.
+        let mut faults = vec![(ERROR, "sink_part_write:1")];
+        if runner != "plain" {
+            faults.push((ERROR, "chunk_export:1"));
+        }
+        if runner.contains("checkpoint") {
+            faults.extend([
+                (PANIC, "after_chunk_file:1"),
+                (PANIC, "after_chunk_complete:1"),
+            ]);
+        }
+        for fault in faults {
+            let lines: Vec<&str> = range.iter().chain(extra).copied().collect();
+            let rig = crash_rig(t.name(), "chunked", &lines);
+            let ctx = format!("chunked {runner} {fault:?}");
+            fault_then_recover(&rig, fault, resume, &ctx);
+            assert_no_loss(&rig, t.name(), &ctx);
+        }
+    }
+    // A transient write failure is retried inside the same run.
+    let rig = crash_rig(t.name(), "chunked", &range);
+    assert_ok(
+        &rig.run_args_env(&[], &[("RIVET_TEST_TRANSIENT_ONCE", "chunk_write")]),
+        "chunked transient chunk_write",
+    );
+    assert_no_loss(&rig, t.name(), "chunked transient chunk_write");
+}
+
+/// Keyset runner, sequential, with and without the chunk checkpoint.
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn every_keyset_runner_hook_loses_nothing_on_oracle() {
+    require_alive(LiveService::Oracle);
+    let t = crash_table(1_500);
+    for (extra, resume) in [
+        (&[][..], &[][..]),
+        (&["chunk_checkpoint: true"][..], &["--resume"][..]),
+    ] {
+        for fault in [
+            (PANIC, "keyset_after_open_before_first_page"),
+            (PANIC, "after_keyset_page:2"),
+            (PANIC, "keyset_after_data_complete"),
+            (ERROR, "sink_part_write:1"),
+        ] {
+            let lines: Vec<&str> = ["chunk_by_key: ID", "chunk_size: 300"]
+                .iter()
+                .chain(extra)
+                .copied()
+                .collect();
+            let rig = crash_rig(t.name(), "chunked", &lines);
+            let ctx = format!("keyset {extra:?} {fault:?}");
+            fault_then_recover(&rig, fault, resume, &ctx);
+            assert_no_loss(&rig, t.name(), &ctx);
+        }
+    }
+}
+
+/// Parallel keyset runner: a worker error at a range's start and mid-range, and a hard exit after a range commits.
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn every_parallel_keyset_runner_hook_loses_nothing_on_oracle() {
+    require_alive(LiveService::Oracle);
+    let t = crash_table(1_500);
+    let base = ["chunk_by_key: ID", "chunk_size: 200", "parallel: 3"];
+    for fault in [
+        (ERROR, "keyset_parallel_worker:1"),
+        (ERROR, "keyset_parallel_worker_midrange:1"),
+    ] {
+        let rig = crash_rig(t.name(), "chunked", &base);
+        let ctx = format!("parallel keyset {fault:?}");
+        fault_then_recover(&rig, fault, &[], &ctx);
+        assert_no_loss(&rig, t.name(), &ctx);
+    }
+    let lines: Vec<&str> = base
+        .iter()
+        .copied()
+        .chain(["chunk_checkpoint: true"])
+        .collect();
+    let rig = crash_rig(t.name(), "chunked", &lines);
+    let ctx = "parallel keyset checkpoint hard exit";
+    fault_then_recover(
+        &rig,
+        (PANIC, "keyset_parallel_range_committed:0"),
+        &["--resume"],
+        ctx,
+    );
+    assert_no_loss(&rig, t.name(), ctx);
 }

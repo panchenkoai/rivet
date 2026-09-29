@@ -222,9 +222,9 @@ fn budget_spent(elapsed: std::time::Duration, budget: std::time::Duration) -> bo
 const MAX_SELECT_COLUMNS: usize = 1000;
 
 /// `base`, suffixed until no result column already has that name.
-fn unique_alias(base: &str, metas: &[Metadata]) -> String {
+fn unique_alias(base: &str, names: &[&str]) -> String {
     let mut alias = base.to_string();
-    while metas.iter().any(|m| m.name() == alias) {
+    while names.contains(&alias.as_str()) {
         alias.push('_');
     }
     alias
@@ -238,13 +238,20 @@ fn unreferenceable(name: &str) -> bool {
 
 /// The native type label a mapping reports: the DECLARED type, before re-projection.
 fn native_type(meta: &Metadata) -> String {
-    let base = kind::native_label(meta);
-    match OraKind::of(meta) {
-        OraKind::Number if meta.precision() > 0 && meta.scale() != -127 => {
-            format!("number({},{})", meta.precision(), meta.scale())
-        }
+    declared_type(
+        OraKind::of(meta),
+        kind::native_label(meta),
+        meta.precision(),
+        meta.scale(),
+    )
+}
+
+/// A column's declared type label from its kind, driver label, precision and scale.
+fn declared_type(kind: OraKind, base: String, precision: u8, scale: i8) -> String {
+    match kind {
+        OraKind::Number if precision > 0 && scale != -127 => format!("number({precision},{scale})"),
         OraKind::Timestamp | OraKind::TimestampTz | OraKind::TimestampLtz => {
-            format!("{base}({})", meta.scale())
+            format!("{base}({scale})")
         }
         _ => base,
     }
@@ -347,6 +354,7 @@ impl OracleSource {
     fn projected(&self, query: &str) -> Result<Projection> {
         let metas = self.describe(query)?;
         let native: Vec<String> = metas.iter().map(native_type).collect();
+        let names: Vec<&str> = metas.iter().map(|m| m.name()).collect();
         let mut rewritten = false;
         let mut cols = Vec::with_capacity(metas.len());
         let mut flags = Vec::new();
@@ -364,7 +372,7 @@ impl OracleSource {
             if k.needs_empty_flag() {
                 rewritten = true;
                 empty_flags[i] = Some(metas.len() + flags.len());
-                let alias = unique_alias(&format!("_rivet_empty_{i}"), &metas);
+                let alias = unique_alias(&format!("_rivet_empty_{i}"), &names);
                 flags.push(format!(
                     "CASE WHEN DBMS_LOB.GETLENGTH({quoted}) = 0 THEN 1 END \"{alias}\""
                 ));
@@ -899,6 +907,34 @@ mod tests {
         assert!(!privilege_denied(
             "oracle: the database or network closed the connection"
         ));
+    }
+
+    #[test]
+    fn the_statement_budget_is_spent_at_its_end_not_before() {
+        let s = std::time::Duration::from_secs;
+        assert!(!budget_spent(s(1), s(2)));
+        assert!(budget_spent(s(2), s(2)));
+        assert!(budget_spent(s(3), s(2)));
+    }
+
+    #[test]
+    fn an_alias_is_suffixed_past_every_taken_name() {
+        assert_eq!(unique_alias("_f", &["A", "B"]), "_f");
+        assert_eq!(unique_alias("_f", &["_f", "_f_", "X"]), "_f__");
+    }
+
+    #[test]
+    fn the_declared_type_keeps_precision_scale_and_fraction_digits() {
+        let d = |k, p, s| declared_type(k, "base".into(), p, s);
+        assert_eq!(d(OraKind::Number, 10, 2), "number(10,2)");
+        assert_eq!(d(OraKind::Number, 10, -2), "number(10,-2)");
+        assert_eq!(d(OraKind::Number, 0, 0), "base", "bare NUMBER");
+        assert_eq!(d(OraKind::Number, 126, -127), "base", "FLOAT");
+        assert_eq!(d(OraKind::Number, 1, 0), "number(1,0)");
+        assert_eq!(d(OraKind::Timestamp, 0, 9), "base(9)");
+        assert_eq!(d(OraKind::TimestampTz, 0, 6), "base(6)");
+        assert_eq!(d(OraKind::TimestampLtz, 0, 3), "base(3)");
+        assert_eq!(d(OraKind::Text, 40, 0), "base");
     }
 
     #[test]

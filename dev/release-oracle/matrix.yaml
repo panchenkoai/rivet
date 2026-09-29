@@ -68,9 +68,17 @@ engines:
       - { tag: "7",   image: "mongo:7",   port: 55007 }
       - { tag: "8",   image: "mongo:8",   port: 55008 }
   oracle:
-    # Batch only: `mode: cdc` is refused for Oracle at config load, so no CDC cell
-    # runs. The source oracle is python-oracledb (thin), since DuckDB has no Oracle
-    # scanner. The image starts in ~1-3 min; bring-up waits up to ~5 min.
+    # Batch cells only: the gate's CDC stage (dev/release_oracle/cdc.py `_ENGINES`) has
+    # no Oracle arm yet. Oracle CDC (LogMiner, preview) runs as a bounded drain; only
+    # continuous CDC (`until_current: false`) is refused at config load. It is graded by
+    # its live module (live_cdc_oracledb). The source oracle is
+    # python-oracledb (thin), since DuckDB has no Oracle scanner. The image starts in
+    # ~1-3 min; bring-up waits up to ~5 min.
+    # Other versions, measured 2026-09-29 on the arm64 (Apple silicon, OrbStack) stand:
+    # gvenzl/oracle-xe:21-slim-faststart is amd64-only, and under OrbStack's Rosetta it
+    # stops at startup with ORA-00442 (XE single-instance check, sxecheck4). Running it
+    # needs full-system x86 emulation or an amd64 host. 19c has no gvenzl image; Oracle's
+    # registry image needs an account sign-in and license acceptance (not attempted).
     driver: oracle
     url: "oracle://rivet:rivet@127.0.0.1:%PORT%/FREEPDB1"
     seed: seeds/common/oracle.sql

@@ -165,13 +165,15 @@ services:
   # (the official container-registry image builds its database on first boot).
   # APP_USER creates `rivet/rivet` in the FREEPDB1 PDB; the init script grants
   # the catalog role rivet's row estimates and harm counters read. Seeded by
-  # `make seed-oracle` (seeds/common/oracle.sql).
+  # `make seed-oracle` (seeds/common/oracle.sql). RIVET_STAND_LATIN1_PDB adds a
+  # WE8ISO8859P1 PDB (LATIN1PDB) for the non-Unicode character-set tests.
   oracle:
     image: gvenzl/oracle-free:23-slim-faststart
     environment:
       ORACLE_PASSWORD: rivet
       APP_USER: rivet
       APP_USER_PASSWORD: rivet
+      RIVET_STAND_LATIN1_PDB: "1"
     ports:
       - "1521:1521"
     volumes:

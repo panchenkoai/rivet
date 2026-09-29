@@ -878,21 +878,26 @@ impl ExportSink {
     }
 }
 
-/// The first override key absent from `schema` as spelled but present ignoring case: `(key, real name)`.
-fn override_case_miss<'a>(
-    keys: &'a [String],
-    schema: &'a arrow::datatypes::Schema,
-) -> Option<(&'a str, &'a str)> {
-    keys.iter().find_map(|k| {
-        if schema.index_of(k).is_ok() {
+/// Refuse a `columns:` key that names no result column as spelled but one ignoring case; `check` and `run` share it.
+pub(crate) fn refuse_override_case_miss(keys: &[String], names: &[&str]) -> Result<()> {
+    let miss = keys.iter().find_map(|k| {
+        if names.contains(&k.as_str()) {
             return None;
         }
-        schema
-            .fields()
+        names
             .iter()
-            .find(|f| f.name().eq_ignore_ascii_case(k))
-            .map(|f| (k.as_str(), f.name().as_str()))
-    })
+            .find(|n| n.eq_ignore_ascii_case(k))
+            .map(|n| (k.as_str(), *n))
+    });
+    if let Some((key, real)) = miss {
+        crate::rivet_bail!(
+            crate::error::codes::CONFIG_COLUMN_OVERRIDE_CASE,
+            "`columns: {{ {key}: ... }}` names no result-set column; the result names it \
+             `{real}`, and override keys match exactly, so the override would be silently \
+             ignored. Spell the key `{real}`."
+        );
+    }
+    Ok(())
 }
 
 impl BatchSink for ExportSink {
@@ -921,14 +926,8 @@ impl BatchSink for ExportSink {
                 f.name()
             );
         }
-        if let Some((key, real)) = override_case_miss(&self.override_columns, &schema) {
-            crate::rivet_bail!(
-                crate::error::codes::CONFIG_COLUMN_OVERRIDE_CASE,
-                "`columns: {{ {key}: ... }}` names no result-set column; the result names it \
-                 `{real}`, and override keys match exactly, so the override would be silently \
-                 ignored. Spell the key `{real}`."
-            );
-        }
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        refuse_override_case_miss(&self.override_columns, &names)?;
         for name in &self.settle_columns {
             if let Ok(field) = schema.field_with_name(name)
                 && !matches!(

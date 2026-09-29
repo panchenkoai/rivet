@@ -365,6 +365,8 @@ fn every_completeness_named_batch_test_carries_an_independent_oracle() {
         "duckdb_store_census(",
         "query_one(",
         "pg_connect()",
+        // Oracle's own rendering of the source rows (tests/common/oracle.rs).
+        "ora_text_rows",
     ];
     let mut weak = Vec::new();
     for f in batch_files() {

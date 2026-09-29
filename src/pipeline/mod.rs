@@ -77,6 +77,7 @@ pub use validate_cmd::{ValidateOutputFormat, ValidateTarget, run_validate_comman
 // same enum that gates the checks in `verify_at_destination`.  Defined in the
 // pipeline layer; re-exported here so `cli::args` can parse it on the flag
 // without the CLI→pipeline layering inversion of defining it in `cli`.
+pub(crate) use sink::refuse_override_case_miss;
 pub use validate_manifest::ValidateDepth;
 
 // `RunSummary` is consumed by `notify::*` (via the Coordinator path) plus
