@@ -32,8 +32,13 @@ use crate::source::cdc::value::RivetValue;
 use crate::source::cdc::{ChangeEvent, ChangeOp, ChangeStream, DrainMode, Position};
 
 /// Polls a logical slot and yields canonical changes.
+/// Domain type label -> its base type label, as `test_decoding` names both.
+pub(crate) type Domains = std::collections::HashMap<String, String>;
+
 pub(crate) struct PgChangeStream {
     client: Client,
+    /// The database's domains, so a domain-typed cell decodes as its base type.
+    domains: Domains,
     slot: String,
     pending: VecDeque<ChangeEvent>,
     /// Directory for an oversized transaction's spill, or `None` when the run has
@@ -606,6 +611,7 @@ impl PgChangeStream {
         // opened once per run). Its refusals carry rivet's `pg cdc:` prefix, so the
         // caller's setup hint is never prepended to them.
         Self::check_configured_tables_are_routable(&mut client, configured_tables, true)?;
+        let domains = load_domains(&mut client)?;
 
         // A bounded run cannot work on a STANDBY: it pins its ceiling with
         // pg_current_wal_lsn() (unavailable during recovery) and a fresh run
@@ -706,6 +712,7 @@ impl PgChangeStream {
             .flatten();
         Ok(Self {
             client,
+            domains,
             slot: slot.to_string(),
             pending: VecDeque::new(),
             spill_dir: spill_dir.map(std::path::Path::to_path_buf),
@@ -924,7 +931,7 @@ impl PgChangeStream {
                 self.pending_truncate_refusal = Some(why);
                 self.exhausted = true;
                 break;
-            } else if let Some(ev) = parse_test_decoding(&lsn, &data)? {
+            } else if let Some(ev) = parse_test_decoding(&lsn, &data, &self.domains)? {
                 if let Some(sp) = spill.as_mut() {
                     // Past the cap: keep the RAW wire row and throw the event away.
                     //
@@ -1001,7 +1008,7 @@ impl PgChangeStream {
         };
         let out = sp.next_event(|rec| {
             let (lsn, data) = decode_wire_row(rec)?;
-            parse_test_decoding(&lsn, &data)?.ok_or_else(|| {
+            parse_test_decoding(&lsn, &data, &self.domains)?.ok_or_else(|| {
                 anyhow::anyhow!(
                     "pg cdc spill: a spilled row decodes to no change, though only \
                      rows that decoded were spilled. The tail and the decoder \
@@ -1494,7 +1501,11 @@ pub(crate) fn truncate_is_ours(schema: &str, table: &str, configured: &[String])
 /// `BEGIN`/`COMMIT` transaction markers and anything unrecognised. The line shape
 /// is `table <schema>.<table>: <OP>: <columns…>`; pre-images / typed before-after
 /// are deferred.
-pub(crate) fn parse_test_decoding(lsn: &str, data: &str) -> Result<Option<ChangeEvent>> {
+pub(crate) fn parse_test_decoding(
+    lsn: &str,
+    data: &str,
+    domains: &Domains,
+) -> Result<Option<ChangeEvent>> {
     let Some((qual, tail)) = data.strip_prefix("table ").and_then(|s| s.split_once(": ")) else {
         return Ok(None);
     };
@@ -1528,8 +1539,8 @@ pub(crate) fn parse_test_decoding(lsn: &str, data: &str) -> Result<Option<Change
         },
         None => (None, body),
     };
-    let mut named = parse_columns(new_part);
-    let old_named = old_key_part.map(parse_columns);
+    let mut named = parse_columns(new_part, domains);
+    let old_named = old_key_part.map(|p| parse_columns(p, domains));
 
     // An UPDATE that leaves an externally-stored TOAST column untouched renders
     // that column as `col[type]:unchanged-toast-datum` in the NEW tuple — the
@@ -1656,7 +1667,28 @@ struct ParsedColumn {
 // not converge on a PK move) in place of corruption, which is the trade an operator
 // can reason about. The split returns when the key is a type.
 
-fn parse_columns(s: &str) -> Vec<ParsedColumn> {
+/// Every domain's label mapped to its base type's label, on the reader's own session.
+fn load_domains(client: &mut Client) -> Result<Domains> {
+    Ok(client
+        .query(
+            "SELECT format_type(oid, NULL), format_type(typbasetype, NULL) \
+             FROM pg_type WHERE typtype = 'd'",
+            &[],
+        )?
+        .iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect())
+}
+
+/// The built-in type a (possibly nested) domain label decodes as; any other label as is.
+fn domain_base<'a>(domains: &'a Domains, mut typ: &'a str) -> &'a str {
+    while let Some(base) = domains.get(typ) {
+        typ = base;
+    }
+    typ
+}
+
+fn parse_columns(s: &str, domains: &Domains) -> Vec<ParsedColumn> {
     let mut out = Vec::new();
     let mut rest = s.trim_start();
     while !rest.is_empty() {
@@ -1687,7 +1719,7 @@ fn parse_columns(s: &str) -> Vec<ParsedColumn> {
         // collide — the TYPE is the disambiguator here, where for TOAST it was the
         // quoting. Getting that backwards made the first cut of this guard silently
         // inert; the run still reported `status: success, rows: 2`.
-        let mapped = map_pg_value(typ, &val, quoted);
+        let mapped = map_pg_value(domain_base(domains, typ), &val, quoted);
         let unrepresentable = mapped.is_none() && !toast_unchanged;
         out.push(ParsedColumn {
             name,
@@ -2250,7 +2282,10 @@ mod tests {
             assert_eq!(map_pg_value(typ, val, false), None, "{typ} {val}");
         }
         assert_eq!(map_pg_value("date", "null", false), Some(RivetValue::Null));
-        let cols = parse_columns("d[date]:'0044-03-15 BC' n[integer]:unchanged-toast-datum");
+        let cols = parse_columns(
+            "d[date]:'0044-03-15 BC' n[integer]:unchanged-toast-datum",
+            &Domains::new(),
+        );
         assert!(cols[0].unrepresentable && cols[0].value == RivetValue::Null);
         assert!(
             !cols[1].unrepresentable,
@@ -2714,7 +2749,7 @@ mod tests {
 
         #[test]
         fn parse_test_decoding_never_panics(s in ".{0,200}") {
-            let _ = parse_test_decoding("0/ABC", &s);
+            let _ = parse_test_decoding("0/ABC", &s, &Domains::new());
         }
 
         #[test]
@@ -2806,7 +2841,9 @@ mod tests {
     fn pk_changing_update_splits_old_key_from_new_tuple() {
         let line = "table public.t: UPDATE: old-key: id[integer]:1 \
                     new-tuple: id[integer]:2 v[text]:'a'";
-        let ev = parse_test_decoding("0/ABC", line).unwrap().unwrap();
+        let ev = parse_test_decoding("0/ABC", line, &Domains::new())
+            .unwrap()
+            .unwrap();
         assert_eq!(
             ev.after,
             Some(vec![RivetValue::Int(2), RivetValue::Bytes(b"a".to_vec())]),
@@ -2818,9 +2855,13 @@ mod tests {
             "the old key rides before"
         );
         // A normal (non-PK) update stays a plain after-image.
-        let ev = parse_test_decoding("0/ABC", "table public.t: UPDATE: id[integer]:1 v[text]:'b'")
-            .unwrap()
-            .unwrap();
+        let ev = parse_test_decoding(
+            "0/ABC",
+            "table public.t: UPDATE: id[integer]:1 v[text]:'b'",
+            &Domains::new(),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(
             ev.after,
             Some(vec![RivetValue::Int(1), RivetValue::Bytes(b"b".to_vec())])
@@ -2837,7 +2878,9 @@ mod tests {
         // The old key's text value contains the section-separator substring.
         let line = "table public.t: UPDATE: old-key: k[text]:'a new-tuple: b' \
                     new-tuple: k[text]:'c' v[integer]:9";
-        let ev = parse_test_decoding("0/ABC", line).unwrap().unwrap();
+        let ev = parse_test_decoding("0/ABC", line, &Domains::new())
+            .unwrap()
+            .unwrap();
         assert_eq!(
             ev.before,
             Some(vec![RivetValue::Bytes(b"a new-tuple: b".to_vec())]),
@@ -2857,6 +2900,38 @@ mod tests {
     // even stripped, so the parse failed and the value silently became NULL.
     // Every prior test ran the session at UTC, where the offset is always +00
     // and the bug is invisible.
+    #[test]
+    fn a_domain_typed_cell_decodes_as_its_base_type() {
+        use crate::source::cdc::value::build_column;
+        use arrow::array::{Array, BooleanArray, Date32Array, Int32Array};
+        use arrow::datatypes::DataType;
+        let domains: Domains = [
+            ("posint", "integer"),
+            ("flag", "boolean"),
+            ("day", "date"),
+            ("workday", "day"),
+        ]
+        .map(|(d, b)| (d.to_string(), b.to_string()))
+        .into();
+        let line = "table public.t: INSERT: id[integer]:1 qty[posint]:'5' ok[flag]:'t' \
+                    d[workday]:'2024-02-29'";
+        let ev = parse_test_decoding("0/1", line, &domains).unwrap().unwrap();
+        let after = ev.after.unwrap();
+        let qty = build_column(&DataType::Int32, &[Some(&after[1])]).unwrap();
+        let qty = qty.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert!(
+            qty.is_valid(0),
+            "a domain over integer must not build a NULL"
+        );
+        assert_eq!(qty.value(0), 5);
+        let ok = build_column(&DataType::Boolean, &[Some(&after[2])]).unwrap();
+        assert!(ok.as_any().downcast_ref::<BooleanArray>().unwrap().value(0));
+        let d = build_column(&DataType::Date32, &[Some(&after[3])]).unwrap();
+        let d = d.as_any().downcast_ref::<Date32Array>().unwrap();
+        assert!(d.is_valid(0), "a nested date domain must not build a NULL");
+        assert_eq!(d.value(0), 19_782, "2024-02-29 is day 19782 of the epoch");
+    }
+
     #[test]
     fn the_reader_session_pins_timezone_to_utc() {
         assert!(
@@ -2904,7 +2979,9 @@ mod tests {
                     iv2[interval]:'-1 years' \
                     iv3[interval]:'00:00:00' \
                     iv4[interval]:'3 days 04:05:06.789'";
-        let ev = parse_test_decoding("0/ABC", line).unwrap().unwrap();
+        let ev = parse_test_decoding("0/ABC", line, &Domains::new())
+            .unwrap()
+            .unwrap();
         let after = ev.after.unwrap();
         assert_eq!(
             after[0],
@@ -2929,7 +3006,9 @@ mod tests {
         let line = "table public.t: INSERT: \
                     u[uuid]:'0b0e0af9-27ec-4c33-b428-a01b27fdd576' \
                     b[bytea]:'\\x48656c6c6f'";
-        let ev = parse_test_decoding("0/ABC", line).unwrap().unwrap();
+        let ev = parse_test_decoding("0/ABC", line, &Domains::new())
+            .unwrap()
+            .unwrap();
         let after = ev.after.unwrap();
         let RivetValue::Bytes(u) = &after[0] else {
             panic!("uuid must be Bytes, got {:?}", after[0]);
@@ -2960,7 +3039,9 @@ mod tests {
                     tags[text[]]:'{alpha,\"with,comma\",\"he said \\\"hi\\\"\",NULL}' \
                     nums[integer[]]:'{1,NULL,3}' \
                     empty[text[]]:'{}'";
-        let ev = parse_test_decoding("0/ABC", line).unwrap().unwrap();
+        let ev = parse_test_decoding("0/ABC", line, &Domains::new())
+            .unwrap()
+            .unwrap();
         let after = ev.after.unwrap();
         assert_eq!(
             after[0],
@@ -3011,7 +3092,9 @@ mod tests {
         // The full test_decoding row keeps the raw literal (Bytes), never a
         // flat Array of NULLs, so the sink can fail loud on it.
         let line = "table public.t: INSERT: grid[integer[]]:'{{1,2},{3,4}}'";
-        let ev = parse_test_decoding("0/ABC", line).unwrap().unwrap();
+        let ev = parse_test_decoding("0/ABC", line, &Domains::new())
+            .unwrap()
+            .unwrap();
         assert_eq!(
             ev.after.unwrap()[0],
             RivetValue::Bytes(b"{{1,2},{3,4}}".to_vec()),
@@ -3024,7 +3107,9 @@ mod tests {
         let line = "table public.t: INSERT: id[integer]:1 name[text]:'alice o''brien' \
                     amount[numeric]:150.05 ts[timestamp without time zone]:'2026-06-23 11:58:01' \
                     flag[boolean]:t maybe[integer]:null";
-        let ev = parse_test_decoding("0/ABC", line).unwrap().unwrap();
+        let ev = parse_test_decoding("0/ABC", line, &Domains::new())
+            .unwrap()
+            .unwrap();
         assert_eq!(ev.op, ChangeOp::Insert);
         assert_eq!(ev.table, "t");
         let after = ev.after.unwrap();
@@ -3048,7 +3133,9 @@ mod tests {
         let line = "table public.t: UPDATE: \
                     old-key: id[integer]:1 small[text]:'a' big[text]:'REAL-VALUE' \
                     new-tuple: id[integer]:1 small[text]:'b' big[text]:unchanged-toast-datum";
-        let ev = parse_test_decoding("0/ABC", line).unwrap().unwrap();
+        let ev = parse_test_decoding("0/ABC", line, &Domains::new())
+            .unwrap()
+            .unwrap();
         let after = ev.after.unwrap();
         // The after-image's `big` must be the recovered pre-image value, NOT the
         // literal marker text.
@@ -3076,7 +3163,7 @@ mod tests {
         let line = "table public.t: UPDATE: \
                     old-key: id[integer]:1 big[text]:unchanged-toast-datum \
                     new-tuple: id[integer]:1 big[text]:unchanged-toast-datum";
-        let ev = parse_test_decoding("0/ABC", line)
+        let ev = parse_test_decoding("0/ABC", line, &Domains::new())
             .expect("the refusal is deferred, never an immediate bail")
             .expect("the event is still produced for commit-boundary tracking");
         let msg = ev.poison.expect(
@@ -3113,7 +3200,7 @@ mod tests {
     fn unchanged_toast_without_pre_image_is_deferred_to_poison_not_an_immediate_bail() {
         let line = "table public.t: UPDATE: \
                     id[integer]:1 small[text]:'b' big[text]:unchanged-toast-datum";
-        let ev = parse_test_decoding("0/ABC", line)
+        let ev = parse_test_decoding("0/ABC", line, &Domains::new())
             .expect("must NOT bail — the refusal is deferred to the sink")
             .expect("the event is still produced (for commit-boundary tracking)");
         let msg = ev
@@ -3133,7 +3220,9 @@ mod tests {
     fn recoverable_toast_update_leaves_poison_none() {
         let line = "table public.t: UPDATE: old-key: id[integer]:1 big[text]:'real' \
                     new-tuple: id[integer]:1 small[text]:'b' big[text]:unchanged-toast-datum";
-        let ev = parse_test_decoding("0/ABC", line).unwrap().unwrap();
+        let ev = parse_test_decoding("0/ABC", line, &Domains::new())
+            .unwrap()
+            .unwrap();
         assert!(
             ev.poison.is_none(),
             "a full pre-image recovers the value → no poison: {:?}",
@@ -3168,7 +3257,7 @@ mod tests {
         assert_eq!(parse_pg_interval("2 years 3 mons 4 days"), Some((27, 4, 0)));
         // And the top-level fuzz entry point must not panic on the hostile time.
         let line = "table public.t: INSERT: id[integer]:1 t[time]:12:9999999999999999:00";
-        let _ = parse_test_decoding("0/ABC", line); // must not panic
+        let _ = parse_test_decoding("0/ABC", line, &Domains::new()); // must not panic
     }
 
     // A genuine text value that happens to equal the marker is QUOTED on the
@@ -3177,7 +3266,9 @@ mod tests {
     #[test]
     fn quoted_marker_text_is_real_data_not_the_sentinel() {
         let line = "table public.t: INSERT: id[integer]:1 note[text]:'unchanged-toast-datum'";
-        let ev = parse_test_decoding("0/ABC", line).unwrap().unwrap();
+        let ev = parse_test_decoding("0/ABC", line, &Domains::new())
+            .unwrap()
+            .unwrap();
         let after = ev.after.unwrap();
         assert_eq!(
             after[1],
@@ -3250,9 +3341,13 @@ mod tests {
     #[test]
     fn quoted_identifiers_are_unquoted_so_routing_can_match_them() {
         // A reserved word — quote_ident quotes it.
-        let ev = parse_test_decoding("0/1", "table app.\"order\": INSERT: id[integer]:1")
-            .expect("parses")
-            .expect("an event");
+        let ev = parse_test_decoding(
+            "0/1",
+            "table app.\"order\": INSERT: id[integer]:1",
+            &Domains::new(),
+        )
+        .expect("parses")
+        .expect("an event");
         assert_eq!(ev.schema, "app", "schema must be usable as a plain name");
         assert_eq!(
             ev.table, "order",
@@ -3262,9 +3357,13 @@ mod tests {
 
         // Mixed case — the ORM default (`public.\"User\"`), the same trap without a
         // reserved word in sight.
-        let ev = parse_test_decoding("0/2", "table public.\"User\": INSERT: id[integer]:7")
-            .expect("parses")
-            .expect("an event");
+        let ev = parse_test_decoding(
+            "0/2",
+            "table public.\"User\": INSERT: id[integer]:7",
+            &Domains::new(),
+        )
+        .expect("parses")
+        .expect("an event");
         assert_eq!((ev.schema.as_str(), ev.table.as_str()), ("public", "User"));
     }
 
@@ -3272,9 +3371,13 @@ mod tests {
     /// there and produced two identifiers that never existed.
     #[test]
     fn a_dot_inside_a_quoted_identifier_is_not_a_qualifier_split() {
-        let ev = parse_test_decoding("0/3", "table \"my.schema\".t: INSERT: id[integer]:1")
-            .expect("parses")
-            .expect("an event");
+        let ev = parse_test_decoding(
+            "0/3",
+            "table \"my.schema\".t: INSERT: id[integer]:1",
+            &Domains::new(),
+        )
+        .expect("parses")
+        .expect("an event");
         assert_eq!((ev.schema.as_str(), ev.table.as_str()), ("my.schema", "t"));
     }
 
@@ -3293,9 +3396,13 @@ mod tests {
     /// while counts and sums reconcile.
     #[test]
     fn a_quoted_column_name_is_unquoted_so_a_key_only_delete_maps_by_name() {
-        let ev = parse_test_decoding("0/4", "table app.t: DELETE: \"userId\"[integer]:7")
-            .expect("parses")
-            .expect("an event");
+        let ev = parse_test_decoding(
+            "0/4",
+            "table app.t: DELETE: \"userId\"[integer]:7",
+            &Domains::new(),
+        )
+        .expect("parses")
+        .expect("an event");
         assert_eq!(
             ev.image_names.as_deref(),
             Some(&["userId".to_string()][..]),
@@ -3326,9 +3433,13 @@ mod tests {
             ("\"order\"", "", "order"),
         ];
         for (input, schema, table) in cases {
-            let ev = parse_test_decoding("0/9", &format!("table {input}: INSERT: id[integer]:1"))
-                .expect("parses")
-                .expect("an event");
+            let ev = parse_test_decoding(
+                "0/9",
+                &format!("table {input}: INSERT: id[integer]:1"),
+                &Domains::new(),
+            )
+            .expect("parses")
+            .expect("an event");
             assert_eq!(
                 (ev.schema.as_str(), ev.table.as_str()),
                 (*schema, *table),
@@ -3401,10 +3512,13 @@ mod spill_tests {
         const N: usize = 5;
         let commit = Position(json!({ "lsn": "0/DEAD" }));
         let row = |i: usize| {
-            let mut ev =
-                parse_test_decoding("0/1", &format!("table public.t: INSERT: id[integer]:{i}"))
-                    .expect("parse")
-                    .expect("an event");
+            let mut ev = parse_test_decoding(
+                "0/1",
+                &format!("table public.t: INSERT: id[integer]:{i}"),
+                &Domains::new(),
+            )
+            .expect("parse")
+            .expect("an event");
             // Poison the flag so the stamp has to CLEAR it, not merely leave it.
             ev.committed = true;
             ev

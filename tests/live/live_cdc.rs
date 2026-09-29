@@ -1124,6 +1124,89 @@ fn pg_cdc_non_iso_datestyle_and_escape_bytea_match_batch() {
     assert_cdc_matches_batch(&out, &batch_out);
 }
 
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn pg_cdc_lmt_timestamptz_under_a_named_zone_matches_batch() {
+    // A named zone renders a pre-1893 Berlin instant with a SECONDS offset (+00:53:28)
+    // the text parser cannot read; the reader pins TimeZone = 'UTC' so it renders +00.
+    let d = tempfile::tempdir().unwrap();
+    let cdc_db = CdcDb::new("cdc_lmt");
+    let tbl = unique_name("cdc_lmt_pg");
+    let slot = unique_name("rivet_lmt_slot");
+    let mut c = cdc_db.connect();
+    c.batch_execute(&format!(
+        "ALTER DATABASE {db} SET timezone TO 'Europe/Berlin'",
+        db = cdc_db.name()
+    ))
+    .expect("set db timezone");
+    c.batch_execute(&format!(
+        "CREATE TABLE {tbl} (id INT PRIMARY KEY, ts TIMESTAMPTZ)"
+    ))
+    .unwrap();
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    c.batch_execute(&format!(
+        "INSERT INTO {tbl} VALUES (1, '1850-01-01 00:00:00+00'), (2, '2024-03-05 12:00:00+00')"
+    ))
+    .unwrap();
+
+    let out = d.path().join("out");
+    let batch_out = d.path().join("batch");
+    std::fs::create_dir_all(&out).unwrap();
+    std::fs::create_dir_all(&batch_out).unwrap();
+    let rig = Rig::pg_cdc(&tbl, &slot)
+        .source_url(cdc_db.url())
+        .dest_path(out.clone());
+    run_rivet_ok(&rig.config_path());
+    let batch_rig = pg_full_rig(&tbl, cdc_db.url(), &batch_out);
+    run_rivet_ok(&batch_rig.config_path());
+    assert_cdc_matches_batch(&out, &batch_out);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn pg_cdc_domain_columns_decode_as_their_base_type_and_match_batch() {
+    // test_decoding labels a domain cell with the DOMAIN's name; the reader resolves it
+    // to the base type, or an integer/date/boolean domain builds NULL for every row.
+    let d = tempfile::tempdir().unwrap();
+    let cdc_db = CdcDb::new("cdc_domain");
+    let tbl = unique_name("cdc_domain_pg");
+    let slot = unique_name("rivet_domain_slot");
+    let mut c = cdc_db.connect();
+    c.batch_execute(&format!(
+        "CREATE DOMAIN posint AS integer CHECK (VALUE > 0); \
+         CREATE DOMAIN day_d AS date; \
+         CREATE DOMAIN workday AS day_d; \
+         CREATE DOMAIN flag AS boolean; \
+         CREATE TABLE {tbl} (id INT PRIMARY KEY, qty posint, d workday, ok flag)"
+    ))
+    .unwrap();
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    c.batch_execute(&format!(
+        "INSERT INTO {tbl} VALUES (1, 5, '2024-02-29', true), (2, 7, '1999-12-31', false)"
+    ))
+    .unwrap();
+
+    let out = d.path().join("out");
+    let batch_out = d.path().join("batch");
+    std::fs::create_dir_all(&out).unwrap();
+    std::fs::create_dir_all(&batch_out).unwrap();
+    let rig = Rig::pg_cdc(&tbl, &slot)
+        .source_url(cdc_db.url())
+        .dest_path(out.clone());
+    run_rivet_ok(&rig.config_path());
+    let batch_rig = pg_full_rig(&tbl, cdc_db.url(), &batch_out);
+    run_rivet_ok(&batch_rig.config_path());
+    assert_cdc_matches_batch(&out, &batch_out);
+}
+
 // UPDATE and DELETE through the typed surface — the matrix tests pin INSERT
 // after-images only; this pins that an UPDATE's after-image carries every
 // column type identically to a batch export of the post-update state, and a
