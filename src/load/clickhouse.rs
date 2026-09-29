@@ -137,8 +137,7 @@ impl ClickhouseLoader {
             )
         })?;
         let client = self.client()?;
-        let mut attempt = 1;
-        loop {
+        for attempt in 1..=MAX_ATTEMPTS {
             let (failure, err) = match self.send_once(client, &pass, params, body.clone()) {
                 Ok(text) => return Ok(text),
                 Err(e) => e,
@@ -148,13 +147,13 @@ impl ClickhouseLoader {
                 std::thread::sleep(Duration::from_millis(
                     crate::pipeline::retry::retry_backoff_ms(RETRY_BASE_MS, attempt, 0),
                 ));
-                attempt += 1;
                 continue;
             }
             return Err(err.context(format!(
                 "ClickHouse statement failed on attempt {attempt} of {MAX_ATTEMPTS}"
             )));
         }
+        unreachable!("retry_after refuses attempt {MAX_ATTEMPTS}, so the last attempt returns")
     }
 
     /// One HTTP attempt: the response text, or how it failed and why.
