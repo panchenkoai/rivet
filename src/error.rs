@@ -441,7 +441,7 @@ pub mod codes {
     );
     pub const STATE_CURSOR_OWNER_MISMATCH: Code = refusal(
         "RIVET_STATE_CURSOR_OWNER_MISMATCH",
-        "`rivet state reset --export <name>` to start the new cursor with a full pass, or restore the previous cursor column",
+        "`rivet state reset -c <config> --export <name>` to start the new cursor with a full pass, or restore the previous cursor column",
     );
     pub const SOURCE_CURSOR_FINER_THAN_MICROSECOND: Code = refusal(
         "RIVET_SOURCE_CURSOR_FINER_THAN_MICROSECOND",

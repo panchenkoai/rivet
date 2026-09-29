@@ -137,7 +137,7 @@ The usual path is a full load first, then `mode: incremental` on the same export
 |---|---|---|
 | `full`, `time_window`, range `chunked` | any | full pass — no cursor was stored |
 | keyset (`chunk_by_key`), any variant | the same key | continues after the last exported key |
-| keyset or `incremental` | a different column, or a changed `incremental_cursor_mode` | refused until `rivet state reset --export <name>` |
+| keyset or `incremental` | a different column, or a changed `incremental_cursor_mode` | refused until `rivet state reset -c <config> --export <name>` |
 | `incremental` | the same column with `settle` added | continues |
 
 `rivet load` follows what each run holds. A run that re-read the whole table — a full load, or an incremental export's first run — lands as a plain `<table>`. The first delta renames that table to `<table>__changes`, adds `__op` / `__pos` / `__seq` (NULL on the rows it already held) and makes `<table>` a view over it; the log keeps the table's partitioning and clustering, and nothing is copied or dropped. A whole-table load onto a table rivet did not load, one whose partitioning or clustering differs from the config, or a view left by an earlier incremental load fails naming the difference and changes nothing — drop or rename the table, or align the config. The rename refuses the same way when the table's columns differ from the export's or a `<table>__changes` already exists beside it.

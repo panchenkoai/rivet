@@ -91,7 +91,7 @@ impl StateStore {
                 "export '{export_name}': the stored cursor `{value}` was written for `{owner}`, \
                  but this export now progresses on `{expected}` — comparing `{expected}` against \
                  it selects the wrong rows (on MySQL silently none, on every run).\n  \
-                 Hint: `rivet state reset --export {export_name}` starts `{expected}` over with a \
+                 Hint: `rivet state reset -c <config> --export {export_name}` starts `{expected}` over with a \
                  full pass; or restore the previous cursor (`{owner}`)."
             );
         }
@@ -574,8 +574,13 @@ mod tests {
         assert!(
             msg.contains("idvisit")
                 && msg.contains("visit_last_action_time")
-                && msg.contains("state reset"),
+                && msg.contains("`rivet state reset -c <config> --export orders`"),
             "{msg}"
+        );
+        assert!(
+            crate::error::codes::STATE_CURSOR_OWNER_MISMATCH
+                .action
+                .starts_with("`rivet state reset -c <config> --export <name>`"),
         );
     }
 

@@ -60,7 +60,7 @@ For the full internal acceptance test plan with detailed suites and smoke-test s
 ## Error recovery
 
 - [ ] Interrupted export can be safely re-run without data loss
-- [ ] `rivet state reset --export <name>` correctly resets cursor for a re-export
+- [ ] `rivet state reset -c <config> --export <name>` correctly resets cursor for a re-export
 
 ## Progression, reconcile, and repair (chunked exports with `chunk_checkpoint: true`)
 
