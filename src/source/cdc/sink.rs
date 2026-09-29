@@ -772,7 +772,7 @@ fn refine_decimal_scales(columns: &mut [TypeMapping], events: &[ChangeEvent]) {
 ///
 /// * `n == col` → `!=` picks the first column that is NOT the one asked for,
 ///   so every cell comes back holding a neighbour's value;
-/// * the `vals.len() == ncols` guard → `true` restores the pre-round-13 read
+/// * the `vals.len() == schema.len()` guard → `true` restores the pre-round-13 read
 ///   (a short image indexed by position, reading past its end), → `false`
 ///   degrades a mid-window RENAME to NULL, which is the silent-loss shape the
 ///   guard was added against.
@@ -784,7 +784,7 @@ pub(crate) fn image_cell<'e>(
     e: &'e ChangeEvent,
     i: usize,
     col: &str,
-    ncols: usize,
+    schema: &[&str],
     memo: Option<(&std::sync::Arc<[String]>, Option<usize>)>,
 ) -> Option<&'e RivetValue> {
     let vals = if e.op.values_live_in_before() {
@@ -799,12 +799,17 @@ pub(crate) fn image_cell<'e>(
             .unwrap_or_else(|| names.iter().position(|n| n == col))
         {
             Some(j) => vals.get(j),
-            // Name absent: a mid-window RENAME leaves the value under
-            // its OLD name — when the arity still matches, position is
-            // trustworthy and the value must not silently degrade to
-            // NULL. Arity mismatch (mid-window ADD/DROP) ⇒ the column
-            // genuinely has no value in this image ⇒ NULL.
-            None if vals.len() == ncols => vals.get(i),
+            // Name absent: a mid-window RENAME leaves the value under its OLD
+            // name at the same position. Position is trusted only when the arity
+            // matches AND the name there is not itself a schema column — else an
+            // equal-arity DROP+ADD would hand this column a neighbour's value.
+            None if vals.len() == schema.len()
+                && names
+                    .get(i)
+                    .is_some_and(|old| !schema.contains(&old.as_str())) =>
+            {
+                vals.get(i)
+            }
             None => None,
         },
         None => vals.get(i),
@@ -1010,6 +1015,7 @@ fn flush(
     }
 
     let mut arrays: Vec<ArrayRef> = vec![ops, poss, seqs];
+    let schema_names: Vec<&str> = columns.iter().map(|m| m.column_name.as_str()).collect();
     for (i, m) in columns.iter().enumerate() {
         // Engine/native-type cell normalisation (e.g. MySQL binlog quirks: BIT
         // bytes, ENUM indexes, epoch-text TIMESTAMPs, NUL-trimmed BINARY) —
@@ -1029,7 +1035,7 @@ fn flush(
             events
                 .iter()
                 .map(|e| {
-                    image_cell(e, i, &m.column_name, columns.len(), memo).map(|v| fix.apply(v))
+                    image_cell(e, i, &m.column_name, &schema_names, memo).map(|v| fix.apply(v))
                 })
                 .collect()
         });
@@ -1037,7 +1043,7 @@ fn flush(
             Some(o) => o.iter().map(|c| c.as_ref()).collect(),
             None => events
                 .iter()
-                .map(|e| image_cell(e, i, &m.column_name, columns.len(), memo))
+                .map(|e| image_cell(e, i, &m.column_name, &schema_names, memo))
                 .collect(),
         };
         let arr = value::build_column(&render, &cells)?;
@@ -1921,12 +1927,15 @@ mod tests {
             Some(names.clone()),
         );
         assert_eq!(
-            image_cell(&e, 0, "b", 2, None),
+            image_cell(&e, 0, "b", &["a", "b"], None),
             Some(&RivetValue::Int(20)),
             "a named image resolves by NAME; matching the first column that is NOT \
              the one asked for hands every cell its neighbour's value"
         );
-        assert_eq!(image_cell(&e, 1, "a", 2, None), Some(&RivetValue::Int(10)));
+        assert_eq!(
+            image_cell(&e, 1, "a", &["a", "b"], None),
+            Some(&RivetValue::Int(10))
+        );
 
         // The MEMO is a pointer-identity shortcut and must agree with the search —
         // and it comes from `image_name_memo`, not hand-built here, so this grades
@@ -1953,28 +1962,54 @@ mod tests {
             "no event carries names ⇒ no memo; the positional engines index by \
              position and have nothing to memoise"
         );
-        assert_eq!(image_cell(&e, 0, "b", 2, memo), Some(&RivetValue::Int(20)));
+        assert_eq!(
+            image_cell(&e, 0, "b", &["a", "b"], memo),
+            Some(&RivetValue::Int(20))
+        );
         // A memo for a DIFFERENT names-Arc must be ignored, not trusted.
         let other: Arc<[String]> = Arc::from(vec!["b".to_string(), "a".to_string()]);
         assert_eq!(
-            image_cell(&e, 9, "b", 2, Some((&other, Some(0)))),
+            image_cell(&e, 9, "b", &["a", "b"], Some((&other, Some(0)))),
             Some(&RivetValue::Int(20)),
             "the memo is keyed by Arc identity; a stale one must fall back to the \
              search rather than index another table's layout"
         );
 
         // NAME ABSENT, ARITY MATCHES — a mid-window RENAME. The value is there,
-        // under its old name, and position is trustworthy. `== ncols` → `false`
+        // under its old name, and position is trustworthy. `== schema.len()` → `false`
         // degrades it to NULL: the silent-loss shape this arm exists to refuse.
         assert_eq!(
-            image_cell(&e, 1, "renamed", 2, None),
+            image_cell(&e, 1, "renamed", &["a", "renamed"], None),
             Some(&RivetValue::Int(20)),
             "a renamed column keeps its value at the same position while the arity \
              agrees — returning None here is a column that silently becomes NULL"
         );
 
+        // NAME ABSENT, ARITY MATCHES, but the name at that position is STILL a
+        // schema column — an equal-arity DROP a + ADD c. Position 2 holds `b`'s
+        // value, and handing it to `c` is a silent wrong-column write.
+        let abc = ev(
+            vec![RivetValue::Int(1), RivetValue::Int(10), RivetValue::Int(20)],
+            Some(Arc::from(vec![
+                "id".to_string(),
+                "a".to_string(),
+                "b".to_string(),
+            ])),
+        );
+        assert_eq!(
+            image_cell(&abc, 2, "c", &["id", "b", "c"], None),
+            None,
+            "after DROP a + ADD c the image's position 2 is `b`, a live column — \
+             reading it by position writes b's value into c"
+        );
+        assert_eq!(
+            image_cell(&abc, 1, "b", &["id", "b", "c"], None),
+            Some(&RivetValue::Int(20)),
+            "`b` itself still resolves by name"
+        );
+
         // NAME ABSENT, ARITY DIFFERS — a mid-window ADD/DROP, or a partial image.
-        // The column genuinely has no value here. `== ncols` → `true` restores the
+        // The column genuinely has no value here. `== schema.len()` → `true` restores the
         // pre-round-13 read: index past the end of a short image.
         //
         // The index must land INSIDE the short image, or the two branches agree by
@@ -1991,13 +2026,16 @@ mod tests {
             Some(three.clone()),
         );
         assert_eq!(
-            image_cell(&short, 0, "absent", 3, None),
+            image_cell(&short, 0, "absent", &["absent", "b", "c"], None),
             None,
             "a short image has no value for a column it does not name; reading it by \
              position returns the FIRST column's value under another column's name"
         );
         // …and past the end too, so the arm is exercised on both sides.
-        assert_eq!(image_cell(&short, 2, "absent", 3, None), None);
+        assert_eq!(
+            image_cell(&short, 2, "absent", &["a", "b", "absent"], None),
+            None
+        );
 
         // A DELETE reads the BEFORE image, an INSERT/UPDATE the AFTER.
         let del = ChangeEvent {
@@ -2007,16 +2045,22 @@ mod tests {
             image_names: Some(names.clone()),
             ..insert(0)
         };
-        assert_eq!(image_cell(&del, 0, "b", 2, None), Some(&RivetValue::Int(8)));
-        assert_eq!(image_cell(&del, 0, "a", 2, None), Some(&RivetValue::Int(7)));
+        assert_eq!(
+            image_cell(&del, 0, "b", &["a", "b"], None),
+            Some(&RivetValue::Int(8))
+        );
+        assert_eq!(
+            image_cell(&del, 0, "a", &["a", "b"], None),
+            Some(&RivetValue::Int(7))
+        );
 
         // NO NAMES: purely positional, the pre-names engines' shape.
         let anon = ev(vec![RivetValue::Int(10), RivetValue::Int(20)], None);
         assert_eq!(
-            image_cell(&anon, 1, "b", 2, None),
+            image_cell(&anon, 1, "b", &["a", "b"], None),
             Some(&RivetValue::Int(20))
         );
-        assert_eq!(image_cell(&anon, 5, "b", 2, None), None);
+        assert_eq!(image_cell(&anon, 5, "b", &["a", "b"], None), None);
     }
 
     /// The drain loop's two decisions, every combination — four mutants that
