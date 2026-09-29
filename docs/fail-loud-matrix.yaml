@@ -38,7 +38,7 @@ scenarios:
     mysql:    { test: roast_mysql_cdc_refuses_a_truncate_instead_of_silently_diverging }
     mssql:    { na: "SQL Server REFUSES the truncate itself — `TRUNCATE TABLE` on a CDC-enabled table raises Msg 4711 (measured 2026-08-24 on rivet-mssql-cdc-1), so the divergence cannot be created and there is nothing for rivet to detect" }
     mongo:    { na: "MongoDB has no TRUNCATE; a drop/collection-level delete surfaces as an invalidate event on the change stream, a separate contract" }
-    oracle:   { gap: "not handled: the LogMiner contents query selects only INSERT/UPDATE/DELETE/UNSUPPORTED rows, so a TRUNCATE (DDL in redo) is neither captured nor refused by that query; no live test measures it" }
+    oracle:   { gap: "not handled: the LogMiner contents query selects only INSERT/UPDATE/DELETE/UNSUPPORTED rows, so a TRUNCATE (DDL in redo) is neither captured nor refused. Measured live 2026-09-29: insert 1,2 -> run -> TRUNCATE + insert 3 -> run exits 0 and captures only (3, insert); rows 1,2 stay live downstream. A silent divergence to fix" }
 
   - id: hostile_numeric_value_loud
     what: "a non-finite value (NaN/Inf) in a lossy fixed-point numeric → loud error, never a silent NULL / truncate-to-zero"
