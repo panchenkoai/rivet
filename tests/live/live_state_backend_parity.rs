@@ -108,7 +108,7 @@ fn assert_single_run_parity(build: impl Fn() -> Rig, pg_url: &str, expected: usi
 const N: usize = 3000;
 
 /// Parallel keyset + chunk_checkpoint: the run persists the ranges at open
-/// (persist_keyset_ranges) and commits each completed range (commit_keyset_range_at_ref)
+/// (persist_keyset_ranges) and commits each completed range (commit_keyset_range)
 /// to the state backend — the two write sites the int4 DDL broke on Postgres. Parity
 /// here proves both write paths work identically on SQLite and Postgres state.
 fn parallel_checkpoint(rig: Rig) -> Rig {

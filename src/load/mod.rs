@@ -55,6 +55,16 @@ pub struct CompactReport {
     pub had_buffer: bool,
 }
 
+impl CompactReport {
+    /// Adds a recovered leftover's merged rows and jobs; a recovery that ran counts as a buffer.
+    pub fn with_recovered(mut self, rows: u64, jobs: usize) -> Self {
+        self.changes_rows += rows;
+        self.merge_jobs += jobs;
+        self.had_buffer |= jobs > 0;
+        self
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CdcLoadReport {
     pub rows_appended: u64,
@@ -1222,6 +1232,30 @@ fn build_bigquery_loader(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    fn report(rows: u64, jobs: usize, had: bool) -> CompactReport {
+        CompactReport {
+            base: "b".into(),
+            changes_rows: rows,
+            merge_jobs: jobs,
+            had_buffer: had,
+        }
+    }
+
+    #[test]
+    fn recovered_work_is_reported_on_every_arm() {
+        let r = report(5, 2, true).with_recovered(3, 1);
+        assert_eq!((r.changes_rows, r.merge_jobs, r.had_buffer), (8, 3, true));
+        let r = report(5, 2, true).with_recovered(0, 0);
+        assert_eq!((r.changes_rows, r.merge_jobs, r.had_buffer), (5, 2, true));
+        let r = report(0, 0, false).with_recovered(0, 0);
+        assert!(!r.had_buffer, "no recovery, no buffer");
+    }
+
+    #[test]
+    fn a_recovered_leftover_alone_marks_had_buffer() {
+        assert!(report(0, 0, false).with_recovered(3, 1).had_buffer);
+    }
 
     #[test]
     fn only_a_name_that_is_plain_once_its_cyrillic_lookalikes_are_latin_folds() {

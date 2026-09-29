@@ -1,10 +1,4 @@
 mod analysis;
-// Re-exported for the explain-layer test that pins the producer/consumer
-// contract on the diagnostic `mode` string: `plan/explain.rs` must parse what
-// THIS function actually emits, and hand-typing the string in that test is how
-// the two drifted unnoticed in the first place.
-#[cfg(test)]
-pub(crate) use analysis::diagnose_mode_str;
 pub(crate) use analysis::overlay_measured_rows;
 #[allow(unused_imports)] // the binary's `init` tests
 pub(crate) use postgres::table_from_simple_query;

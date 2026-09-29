@@ -242,7 +242,8 @@ fn success_run_produces_both_summary_files() {
     let cfg = touch_config(dir.path());
     let s = summary("r1", "orders", "success", Vec::new(), None);
 
-    let report_path = write_run_report(cfg.to_str().unwrap(), &s).expect("report write succeeds");
+    let report_path =
+        write_run_report(cfg.to_str().unwrap(), &s, "export").expect("report write succeeds");
     assert!(report_path.join("summary.md").exists());
     assert!(report_path.join("summary.json").exists());
 
@@ -271,7 +272,7 @@ fn report_dir_is_created_on_demand() {
     let cfg = touch_config(dir.path());
     assert!(!dir.path().join(".rivet").exists());
     let s = summary("r2", "users", "success", Vec::new(), None);
-    write_run_report(cfg.to_str().unwrap(), &s).unwrap();
+    write_run_report(cfg.to_str().unwrap(), &s, "export").unwrap();
     assert!(dir.path().join(".rivet").join("runs").join("r2").exists());
 }
 
@@ -290,7 +291,7 @@ fn failed_run_with_committed_files_carries_resume_command() {
         Some("connection reset".into()),
     );
 
-    let out = write_run_report(cfg.to_str().unwrap(), &s).unwrap();
+    let out = write_run_report(cfg.to_str().unwrap(), &s, "export").unwrap();
     let report: RunReport =
         serde_json::from_str(&std::fs::read_to_string(out.join("summary.json")).unwrap()).unwrap();
     assert!(report.resumable);
@@ -314,7 +315,7 @@ fn failed_run_without_committed_files_has_no_resume_command() {
         Vec::new(),
         Some("plan validation rejected".into()),
     );
-    let out = write_run_report(cfg.to_str().unwrap(), &s).unwrap();
+    let out = write_run_report(cfg.to_str().unwrap(), &s, "export").unwrap();
     let report: RunReport =
         serde_json::from_str(&std::fs::read_to_string(out.join("summary.json")).unwrap()).unwrap();
     assert!(!report.resumable);
@@ -334,7 +335,7 @@ fn interrupted_run_renders_as_interrupted_status() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = touch_config(dir.path());
     let s = summary("r5", "orders", "running", Vec::new(), None);
-    let out = write_run_report(cfg.to_str().unwrap(), &s).unwrap();
+    let out = write_run_report(cfg.to_str().unwrap(), &s, "export").unwrap();
     let md = std::fs::read_to_string(out.join("summary.md")).unwrap();
     assert!(md.contains("INTERRUPTED"));
 }
@@ -764,7 +765,7 @@ fn run_id_matches_across_summary_json_and_manifest_json() {
     );
     let m = build_manifest("orders_20260521T120000", ManifestStatus::Success, parts);
 
-    let report_path = write_run_report(cfg.to_str().unwrap(), &s).unwrap();
+    let report_path = write_run_report(cfg.to_str().unwrap(), &s, "export").unwrap();
     write_manifest(dest_proxy.as_writer(), &m).unwrap();
 
     let report: RunReport =
@@ -793,7 +794,7 @@ fn write_run_report_returns_err_when_target_parent_is_unwritable() {
     // must fail.
     let cfg = blocker.join("inner.yaml");
     let s = summary("r50", "orders", "success", Vec::new(), None);
-    let res = write_run_report(cfg.to_str().unwrap(), &s);
+    let res = write_run_report(cfg.to_str().unwrap(), &s, "export");
     assert!(
         res.is_err(),
         "writer must propagate the I/O error to caller"
@@ -1091,7 +1092,7 @@ fn success_summary_paired_with_success_manifest_has_no_disagreement() {
     );
     let m = build_manifest("orders_pair_ok", ManifestStatus::Success, parts);
 
-    let report_path = write_run_report(cfg.to_str().unwrap(), &s).unwrap();
+    let report_path = write_run_report(cfg.to_str().unwrap(), &s, "export").unwrap();
     write_manifest(dest_proxy.as_writer(), &m).unwrap();
 
     let report: RunReport =
@@ -1127,7 +1128,7 @@ fn failed_summary_paired_with_failed_manifest_emits_no_success_marker() {
     );
     let m = build_manifest("orders_pair_fail", ManifestStatus::Failed, parts);
 
-    let report_path = write_run_report(cfg.to_str().unwrap(), &s).unwrap();
+    let report_path = write_run_report(cfg.to_str().unwrap(), &s, "export").unwrap();
     write_manifest(dest_proxy.as_writer(), &m).unwrap();
 
     let report: RunReport =
@@ -1195,7 +1196,7 @@ fn resume_command_quotes_config_path_with_spaces() {
         parts,
         Some("connection reset".into()),
     );
-    let out = write_run_report(cfg.to_str().unwrap(), &s).unwrap();
+    let out = write_run_report(cfg.to_str().unwrap(), &s, "export").unwrap();
     let report: RunReport =
         serde_json::from_str(&std::fs::read_to_string(out.join("summary.json")).unwrap()).unwrap();
 
@@ -1227,7 +1228,7 @@ fn resume_command_handles_apostrophe_in_config_path() {
 
     let parts = vec![part(1, 100, 4096, "xxh3:1111111111111111")];
     let s = summary("orders_apos", "orders", "failed", parts, Some("err".into()));
-    let out = write_run_report(cfg.to_str().unwrap(), &s).unwrap();
+    let out = write_run_report(cfg.to_str().unwrap(), &s, "export").unwrap();
     let report: RunReport =
         serde_json::from_str(&std::fs::read_to_string(out.join("summary.json")).unwrap()).unwrap();
 
@@ -1441,7 +1442,7 @@ fn run_report_json_contains_all_top_level_contract_keys() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = touch_config(dir.path());
     let s = summary("orders_keyset", "orders", "success", Vec::new(), None);
-    let out = write_run_report(cfg.to_str().unwrap(), &s).unwrap();
+    let out = write_run_report(cfg.to_str().unwrap(), &s, "export").unwrap();
 
     let json: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(out.join("summary.json")).unwrap()).unwrap();
@@ -1495,7 +1496,7 @@ fn run_report_validation_outcome_is_nested_object_when_set() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = touch_config(dir.path());
     let s = summary("orders_val", "orders", "success", Vec::new(), None);
-    let out = write_run_report(cfg.to_str().unwrap(), &s).unwrap();
+    let out = write_run_report(cfg.to_str().unwrap(), &s, "export").unwrap();
     let json: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(out.join("summary.json")).unwrap()).unwrap();
     assert!(json["validation"].is_object());
@@ -1520,7 +1521,7 @@ fn rewriting_run_report_overwrites_existing_summary_files() {
         vec![part(1, 50, 1024, "xxh3:1111111111111111")],
         Some("first attempt timed out".into()),
     );
-    let out1 = write_run_report(cfg.to_str().unwrap(), &s1).unwrap();
+    let out1 = write_run_report(cfg.to_str().unwrap(), &s1, "export").unwrap();
     let json1 = std::fs::read_to_string(out1.join("summary.json")).unwrap();
     assert!(json1.contains("first attempt timed out"));
     assert!(json1.contains("\"resumable\": true"));
@@ -1535,7 +1536,7 @@ fn rewriting_run_report_overwrites_existing_summary_files() {
         ],
         None,
     );
-    let out2 = write_run_report(cfg.to_str().unwrap(), &s2).unwrap();
+    let out2 = write_run_report(cfg.to_str().unwrap(), &s2, "export").unwrap();
     assert_eq!(out1, out2, "same run_id ⇒ same report dir");
     let json2 = std::fs::read_to_string(out2.join("summary.json")).unwrap();
     assert!(
@@ -1567,7 +1568,7 @@ fn run_id_with_path_traversal_chars_is_rendered_as_literal_dir() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = touch_config(dir.path());
     let s = summary("nested/run_id", "orders", "success", Vec::new(), None);
-    let out = write_run_report(cfg.to_str().unwrap(), &s).unwrap();
+    let out = write_run_report(cfg.to_str().unwrap(), &s, "export").unwrap();
     // The "/" splits into a sub-directory; that's the literal interpretation
     // (we treat `run_id` as a path component the caller takes responsibility
     // for sanitising).
@@ -1999,7 +2000,7 @@ fn validation_outcome_in_summary_json_carries_manifest_subobject_when_set() {
         depth_level: ValidateDepth::Full.label().to_string(),
     });
 
-    let out = write_run_report(cfg.to_str().unwrap(), &s).unwrap();
+    let out = write_run_report(cfg.to_str().unwrap(), &s, "export").unwrap();
     let raw = std::fs::read_to_string(out.join("summary.json")).unwrap();
     let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
     assert!(json["validation"].is_object());
@@ -2035,7 +2036,7 @@ fn validation_outcome_omits_manifest_subobject_when_unset() {
     // Note: summary fixture leaves manifest_verification = None and
     // validated = Some(true) (file-row check ran).
 
-    let out = write_run_report(cfg.to_str().unwrap(), &s).unwrap();
+    let out = write_run_report(cfg.to_str().unwrap(), &s, "export").unwrap();
     let raw = std::fs::read_to_string(out.join("summary.json")).unwrap();
     let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
     assert!(json["validation"].is_object());

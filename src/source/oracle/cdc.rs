@@ -11,6 +11,7 @@ use oracledb::{Connection, Cursor, Row};
 use super::{Ora, connect};
 use crate::config::TlsConfig;
 use crate::error::Result;
+use crate::source::cdc::checkpoint_identity::IdentityVerdict;
 use crate::source::cdc::value::RivetValue;
 use crate::source::cdc::{CdcEngine, ChangeEvent, ChangeOp, ChangeStream, Position, TxnFramer};
 
@@ -177,55 +178,42 @@ impl OraIdentity {
     }
 }
 
-/// Refuse a checkpoint written against another database, incarnation or PDB; `Ok(Some)` is a warning.
+/// Judge a resume: a checkpoint from another database, incarnation or PDB is foreign.
 pub(crate) fn identity_verdict(
     checkpoint: Option<&OraIdentity>,
     server: &OraIdentity,
-) -> Result<Option<String>> {
-    const RECOVER: &str = "Delete the checkpoint so the next run anchors afresh FIRST, then \
-         re-snapshot the tables: snapshotting first leaves the changes in between in neither.";
+) -> IdentityVerdict {
     let Some(c) = checkpoint else {
-        return Ok(Some(
+        return IdentityVerdict::Unverifiable(
             "oracle cdc: this checkpoint records no database identity, so rivet cannot confirm \
              it belongs to this database"
                 .into(),
-        ));
+        );
     };
     if c.dbid != server.dbid {
-        crate::rivet_bail!(
-            crate::error::codes::SOURCE_CDC_FOREIGN_CHECKPOINT,
+        return IdentityVerdict::Foreign(format!(
             "oracle cdc: this checkpoint was written against another database (DBID {} / {}, \
              this one is {} / {}). An SCN means nothing outside the database that issued it: \
-             resuming would start at an arbitrary point and skip changes silently. {RECOVER}",
-            c.dbid,
-            c.db_unique_name,
-            server.dbid,
-            server.db_unique_name
-        );
+             resuming would start at an arbitrary point and skip changes silently.",
+            c.dbid, c.db_unique_name, server.dbid, server.db_unique_name
+        ));
     }
     if c.resetlogs != server.resetlogs {
-        crate::rivet_bail!(
-            crate::error::codes::SOURCE_CDC_FOREIGN_CHECKPOINT,
+        return IdentityVerdict::Foreign(format!(
             "oracle cdc: the database was opened RESETLOGS since this checkpoint was written \
              (incarnation SCN {} is now {}). Its redo history was rewound, so changes the \
-             checkpoint covers may no longer exist while the destination still holds them. \
-             {RECOVER}",
-            c.resetlogs,
-            server.resetlogs
-        );
+             checkpoint covers may no longer exist while the destination still holds them.",
+            c.resetlogs, server.resetlogs
+        ));
     }
     if c.con_dbid != server.con_dbid {
-        crate::rivet_bail!(
-            crate::error::codes::SOURCE_CDC_FOREIGN_CHECKPOINT,
+        return IdentityVerdict::Foreign(format!(
             "oracle cdc: this checkpoint belongs to another pluggable database ({} DBID {}, \
-             the connection's is {} DBID {}). {RECOVER}",
-            c.con_name,
-            c.con_dbid,
-            server.con_name,
-            server.con_dbid
-        );
+             the connection's is {} DBID {}).",
+            c.con_name, c.con_dbid, server.con_name, server.con_dbid
+        ));
     }
-    Ok(None)
+    IdentityVerdict::Ok
 }
 
 /// A resume position: mine from `low_water`, deliver only commits after `commit_scn`.
@@ -785,11 +773,7 @@ impl OracleChangeStream {
         let from = match Position::load(checkpoint)? {
             Some(pos) => {
                 let path = checkpoint.display().to_string();
-                if let Some(w) =
-                    identity_verdict(OraIdentity::from_position(&pos).as_ref(), &identity)?
-                {
-                    log::warn!("{w}");
-                }
+                identity_verdict(OraIdentity::from_position(&pos).as_ref(), &identity).enforce()?;
                 Scns::from_position(&pos, &path)?
             }
             None => {
@@ -1275,18 +1259,22 @@ mod tests {
     #[test]
     fn a_checkpoint_from_another_database_incarnation_or_pdb_is_refused() {
         let server = id("1", "10", "7");
-        assert!(
-            identity_verdict(Some(&id("1", "10", "7")), &server)
-                .unwrap()
-                .is_none()
+        assert_eq!(
+            identity_verdict(Some(&id("1", "10", "7")), &server),
+            IdentityVerdict::Ok
         );
         for other in [id("2", "10", "7"), id("1", "11", "7"), id("1", "10", "8")] {
             let e = identity_verdict(Some(&other), &server)
-                .unwrap_err()
-                .to_string();
+                .enforce()
+                .unwrap_err();
+            assert_eq!(crate::error::classify_exit(&e), 5, "{e}");
+            let e = e.to_string();
             assert!(e.contains("anchors afresh FIRST, then re-snapshot"), "{e}");
         }
-        assert!(identity_verdict(None, &server).unwrap().is_some());
+        assert!(matches!(
+            identity_verdict(None, &server),
+            IdentityVerdict::Unverifiable(_)
+        ));
     }
 
     #[test]

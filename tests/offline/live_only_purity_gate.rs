@@ -111,7 +111,7 @@ const BASELINE: &[(&str, usize, usize, usize, usize)] = &[
     // worth spending: the runner-bypass class in the process rules is precisely a
     // per-runner decision that no offline test grades.
     ("src/pipeline/keyset.rs::run_keyset", 3, 0, 1, 1),
-    ("src/pipeline/keyset.rs::run_keyset_parallel", 4, 0, 2, 2),
+    ("src/pipeline/keyset.rs::run_keyset_parallel", 3, 0, 1, 2),
     // Excluded 2026-09-27 at their existing decisions (catalog-row parsing, the
     // statement-timeout arm), not grown by the exclusion; shrink as they are extracted.
     ("src/source/mssql/mod.rs::introspect_mssql_on", 1, 0, 2, 0),
@@ -1001,13 +1001,9 @@ fn only_whole_function_exclusions_are_read_as_live_only_claims() {
         );
     }
     // Operator/equivalence entries name a function too — and must NOT be read
-    // as a body claim, or the gate would demand purity of `hash_value` and
-    // `overlay_measured_rows`, which are unit-tested and mutation-graded.
-    for not_a_body in [
-        "overlay_measured_rows",
-        "hash_value",
-        "compute_part_checksums",
-    ] {
+    // as a body claim, or the gate would demand purity of `overlay_measured_rows`
+    // and `compute_part_checksums`, which are unit-tested and mutation-graded.
+    for not_a_body in ["overlay_measured_rows", "compute_part_checksums"] {
         assert!(
             !names.contains(&not_a_body),
             "`{not_a_body}` is an OPERATOR triage, not a whole-function live-only claim, \

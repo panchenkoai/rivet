@@ -566,7 +566,7 @@ fn bench_mysql_int_bytes(c: &mut Criterion) {
 }
 
 // ── quality uniqueness: string formatter (before) vs typed hash (after) ──────
-// Mirrors check_uniqueness() in src/quality.rs.
+// Historical: the live gate (`quality::QualityTracker::track`) now hashes `enrich::CanonColumn` bytes.
 // Before: HashSet<String> built via ArrayFormatter → one String alloc per row.
 // After:  HashSet<u64>   built via xxh3_64 on raw typed bytes — zero allocs.
 

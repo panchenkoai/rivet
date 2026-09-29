@@ -4,10 +4,11 @@
 //! export selection, [`expand_partitioned_exports`] rewrites the borrowed
 //! `&ExportConfig` list into an **owned** list where every export with
 //! `partition_by` set has been replaced by one concrete child export per
-//! bucket — each with the bucket predicate wrapped into its query and the
-//! `{partition}` token resolved to a Hive `col=value` segment in its
-//! destination. Everything downstream (`run`'s loop, parallelism, manifest,
-//! `validate`) then sees ordinary exports and needs no partition awareness —
+//! bucket — each carrying its bucket as `partition_window` (the planner wraps
+//! it around the base query, so `table:` survives) and the `{partition}` token
+//! resolved to a Hive `col=value` segment in its destination. Everything
+//! downstream (`run`'s loop, parallelism, manifest, `validate`) then sees
+//! ordinary exports and needs no partition awareness —
 //! which is why each partition gets its own manifest + `_SUCCESS` for free.
 //!
 //! The bucketing math and SQL builders are pure (`crate::plan::partition`);
@@ -17,7 +18,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::config::{ExportConfig, ExportMode, SourceConfig};
+use crate::config::{ExportConfig, SourceConfig};
 use crate::destination::placeholder;
 use crate::error::Result;
 use crate::plan::partition::{self, HIVE_NULL_PARTITION};
@@ -60,8 +61,6 @@ fn expand_one(
     params: Option<&HashMap<String, String>>,
     out: &mut Vec<ExportConfig>,
 ) -> Result<()> {
-    validate_partitionable(export, col)?;
-
     let base_query = export.resolve_query(config_dir, params)?;
     let st = source.source_type;
 
@@ -77,7 +76,7 @@ fn expand_one(
         .unwrap_or(0)
         > 0;
 
-    let children = build_partition_children(export, col, &base_query, st, bounds, has_nulls);
+    let children = build_partition_children(export, col, bounds, has_nulls);
     if children.is_empty() {
         log::warn!(
             "export '{}': partition_by '{}' found no rows (no value span, no NULLs) — nothing to export",
@@ -131,21 +130,18 @@ fn fetch_value_span(
 fn build_partition_children(
     parent: &ExportConfig,
     col: &str,
-    base_query: &str,
-    st: crate::config::SourceType,
     bounds: Option<(chrono::NaiveDate, chrono::NaiveDate)>,
     has_nulls: bool,
 ) -> Vec<ExportConfig> {
     let mut children = Vec::new();
     if let Some((min_day, max_day)) = bounds {
         for range in partition::generate_ranges(min_day, max_day, parent.partition_granularity) {
-            let query = partition::build_range_query(base_query, col, &range, st);
             children.push(make_child(
                 parent,
                 col,
                 &range.label_value,
                 &range.label_value,
-                query,
+                Some(range.bounds()),
             ));
         }
     }
@@ -153,8 +149,7 @@ fn build_partition_children(
     // would be lost without this. `__HIVE_DEFAULT_PARTITION__` keeps them
     // queryable by Hive/Spark/duckdb partition discovery.
     if has_nulls {
-        let query = partition::build_null_query(base_query, col, st);
-        children.push(make_child(parent, col, HIVE_NULL_PARTITION, "null", query));
+        children.push(make_child(parent, col, HIVE_NULL_PARTITION, "null", None));
     }
     children
 }
@@ -165,68 +160,25 @@ fn build_partition_children(
 ///   `__HIVE_DEFAULT_PARTITION__`); the segment is `col=path_value`.
 /// - `name_value` is a filename-safe suffix for the child export name (used in
 ///   state keys and output filenames).
+/// - `range` is the bucket's `[lo, hi)` day bounds; `None` is the NULL bucket.
 fn make_child(
     parent: &ExportConfig,
     col: &str,
     path_value: &str,
     name_value: &str,
-    query: String,
+    range: Option<(chrono::NaiveDate, chrono::NaiveDate)>,
 ) -> ExportConfig {
     let mut child = parent.clone();
-    // Stop any recursion and detach from the base query forms.
     child.partition_by = None;
     child.name = format!("{}__{}", parent.name, name_value);
-    child.query = Some(query);
-    child.query_file = None;
-    child.table = None;
+    child.partition_window = Some(crate::config::PartitionSynth {
+        column: col.to_string(),
+        range,
+    });
     let segment = format!("{col}={path_value}");
     child.destination =
         placeholder::expand_destination_partition(parent.destination.clone(), &segment);
     child
-}
-
-/// Up-front rules that make partitioning safe; checked before any source I/O.
-fn validate_partitionable(export: &ExportConfig, col: &str) -> Result<()> {
-    if col.trim().is_empty() {
-        anyhow::bail!("export '{}': partition_by must name a column", export.name);
-    }
-    if export.mode == ExportMode::TimeWindow {
-        anyhow::bail!(
-            "export '{}': partition_by is not compatible with mode: time_window \
-             (time_window already filters by a rolling window; partition a full/chunked/incremental export instead)",
-            export.name
-        );
-    }
-    if export.chunk_by_key.is_some() {
-        // Keyset needs the `table:` shortcut so the planner can verify the key
-        // is index-backed; partitioning rewrites the export into a `query:`
-        // subquery (the date predicate), which keyset refuses. Fail fast with a
-        // clear message instead of a per-partition keyset error.
-        anyhow::bail!(
-            "export '{}': partition_by is not compatible with chunk_by_key — keyset requires the \
-             `table:` shortcut to verify the index, but partitioning rewrites the query. Use a range \
-             `chunk_column` (dense/correlated key), a smaller `partition_granularity`, or `mode: full`.",
-            export.name
-        );
-    }
-    let has_token = export
-        .destination
-        .path
-        .as_deref()
-        .is_some_and(|s| s.contains("{partition}"))
-        || export
-            .destination
-            .prefix
-            .as_deref()
-            .is_some_and(|s| s.contains("{partition}"));
-    if !has_token {
-        anyhow::bail!(
-            "export '{}': partition_by requires a '{{partition}}' token in destination.path or \
-             destination.prefix (otherwise every partition would overwrite the same prefix)",
-            export.name
-        );
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -264,38 +216,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_partition_token() {
-        let e = part_export(false);
-        let err = validate_partitionable(&e, "created_at").unwrap_err();
-        assert!(err.to_string().contains("{partition}"), "got: {err}");
-    }
-
-    #[test]
-    fn accepts_partition_token_in_path() {
-        let e = part_export(true);
-        assert!(validate_partitionable(&e, "created_at").is_ok());
-    }
-
-    #[test]
-    fn rejects_time_window_mode() {
-        let mut e = part_export(true);
-        e.mode = ExportMode::TimeWindow;
-        let err = validate_partitionable(&e, "created_at").unwrap_err();
-        assert!(err.to_string().contains("time_window"), "got: {err}");
-    }
-
-    #[test]
-    fn rejects_chunk_by_key() {
-        // Keyset needs `table:` introspection; partitioning rewrites into a
-        // `query:` subquery, so the two cannot compose — fail fast.
-        let mut e = part_export(true);
-        e.mode = ExportMode::Chunked;
-        e.chunk_by_key = Some("id".into());
-        let err = validate_partitionable(&e, "created_at").unwrap_err();
-        assert!(err.to_string().contains("chunk_by_key"), "got: {err}");
-    }
-
-    #[test]
     fn make_child_resolves_segment_and_detaches() {
         let parent = part_export(true);
         let child = make_child(
@@ -303,11 +223,15 @@ mod tests {
             "created_at",
             "2023-01-03",
             "2023-01-03",
-            "SELECT * FROM (SELECT * FROM events) AS _rivet_part WHERE x".into(),
+            Some((day("2023-01-03"), day("2023-01-04"))),
         );
         assert_eq!(child.name, "events__2023-01-03");
         assert!(child.partition_by.is_none());
-        assert!(child.table.is_none());
+        assert_eq!(child.query, parent.query, "the base query form is kept");
+        assert_eq!(
+            child.partition_window.as_ref().and_then(|w| w.range),
+            Some((day("2023-01-03"), day("2023-01-04")))
+        );
         assert_eq!(
             child.destination.path.as_deref(),
             Some("./out/events/created_at=2023-01-03")
@@ -315,15 +239,63 @@ mod tests {
     }
 
     #[test]
+    fn a_table_partition_child_plans_its_bucket_over_the_table() {
+        let cfg = crate::config::Config::from_yaml(
+            r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: events
+    table: events
+    mode: full
+    partition_by: created_at
+    format: parquet
+    columns:
+      "events.amount": "decimal(38,2)"
+    destination:
+      type: local
+      path: "./out/events/{partition}"
+"#,
+        )
+        .expect("config");
+        let parent = &cfg.exports[0];
+        let children = build_partition_children(
+            parent,
+            "created_at",
+            Some((day("2023-01-03"), day("2023-01-03"))),
+            true,
+        );
+        let plan = |c: &ExportConfig| {
+            crate::plan::build_plan(&cfg, c, Path::new("."), false, false, false, None)
+                .expect("plan")
+        };
+        let day_plan = plan(&children[0]);
+        assert_eq!(
+            day_plan.base_query,
+            "SELECT * FROM (SELECT * FROM events) AS _rivet_part \
+             WHERE \"created_at\" >= '2023-01-03' AND \"created_at\" < '2023-01-04'"
+        );
+        assert_eq!(day_plan.source_table.as_deref(), Some("events"));
+        assert!(
+            day_plan.column_overrides.contains_key("amount"),
+            "a qualified override narrows to the child's table: {:?}",
+            day_plan.column_overrides
+        );
+        let null_plan = plan(&children[1]);
+        assert!(
+            null_plan
+                .base_query
+                .ends_with("WHERE \"created_at\" IS NULL"),
+            "{}",
+            null_plan.base_query
+        );
+    }
+
+    #[test]
     fn make_child_null_bucket_uses_hive_default() {
         let parent = part_export(true);
-        let child = make_child(
-            &parent,
-            "created_at",
-            HIVE_NULL_PARTITION,
-            "null",
-            "Q".into(),
-        );
+        let child = make_child(&parent, "created_at", HIVE_NULL_PARTITION, "null", None);
         assert_eq!(child.name, "events__null");
         assert_eq!(
             child.destination.path.as_deref(),
@@ -355,8 +327,6 @@ mod tests {
         let children = build_partition_children(
             &parent,
             "created_at",
-            "SELECT * FROM events",
-            crate::config::SourceType::Postgres,
             Some((day("2023-01-01"), day("2023-01-03"))),
             true,
         );
@@ -382,8 +352,6 @@ mod tests {
         let children = build_partition_children(
             &parent,
             "created_at",
-            "SELECT * FROM events",
-            crate::config::SourceType::Postgres,
             Some((day("2023-01-01"), day("2023-01-02"))),
             false,
         );
@@ -396,28 +364,14 @@ mod tests {
     #[test]
     fn children_only_null_bucket_when_no_value_span() {
         let parent = part_export(true);
-        let children = build_partition_children(
-            &parent,
-            "created_at",
-            "SELECT * FROM events",
-            crate::config::SourceType::Postgres,
-            None,
-            true,
-        );
+        let children = build_partition_children(&parent, "created_at", None, true);
         assert_eq!(child_names(&children), ["events__null"]);
     }
 
     #[test]
     fn children_empty_when_no_rows_at_all() {
         let parent = part_export(true);
-        let children = build_partition_children(
-            &parent,
-            "created_at",
-            "SELECT * FROM events",
-            crate::config::SourceType::Postgres,
-            None,
-            false,
-        );
+        let children = build_partition_children(&parent, "created_at", None, false);
         assert!(children.is_empty());
     }
 }

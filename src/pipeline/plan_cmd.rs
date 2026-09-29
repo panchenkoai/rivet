@@ -383,10 +383,10 @@ fn build_plan_artifact(
                 }
             }
             // Explain *why* this strategy was chosen (mode + chunk geometry +
-            // parallelism) and its risk profile. Built from the same
-            // `ExportDiagnostic` + config the numbers above came from, so the
-            // narrative can never contradict them.
-            let strategy_rationale = crate::plan::explain_strategy(&diag, export);
+            // parallelism) and its risk profile. The mode, column and sizes come
+            // from `plan.strategy` — the same value the artifact's mode label is
+            // taken from — so the narrative cannot contradict the plan.
+            let strategy_rationale = crate::plan::explain_strategy(&diag, &plan.strategy, export);
             let plan_diagnostics = PlanDiagnostics {
                 verdict: diag.verdict.to_string(),
                 warnings,

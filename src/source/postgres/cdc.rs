@@ -22,7 +22,7 @@
 
 use std::collections::VecDeque;
 
-use postgres::{Client, NoTls};
+use postgres::Client;
 use serde_json::json;
 
 use crate::config::TlsConfig;
@@ -30,7 +30,6 @@ use crate::error::Result;
 use crate::source::cdc::spill::{SpillFile, SpooledTx};
 use crate::source::cdc::value::RivetValue;
 use crate::source::cdc::{ChangeEvent, ChangeOp, ChangeStream, DrainMode, Position};
-use crate::source::require_tls_or_loopback;
 
 /// Polls a logical slot and yields canonical changes.
 pub(crate) struct PgChangeStream {
@@ -572,23 +571,8 @@ impl PgChangeStream {
         configured_tables: &[String],
         spill_dir: Option<&std::path::Path>,
     ) -> Result<Self> {
-        // Same gate the batch path uses: refuse remote plaintext (CWE-319), and
-        // use a verifying TLS connector when a TlsConfig is enforced.
-        require_tls_or_loopback(conn_str, tls)?;
-        let mut client = match tls {
-            Some(cfg) if cfg.mode.is_enforced() => {
-                let connector = crate::source::tls::build_native_tls(cfg)?;
-                // Force ssl_mode(Require) like the batch path — otherwise
-                // tokio-postgres picks TLS from the URL's sslmode and a
-                // `?sslmode=disable` (or a `prefer` downgrade) ships the CDC
-                // stream in cleartext, ignoring the connector we just built
-                // (roast 2026-08-09: the batch leg was fixed, the CDC leg was
-                // not — the exact posture verify-full is asked to forbid).
-                super::pg_config_ssl_forced(conn_str)?
-                    .connect(postgres_native_tls::MakeTlsConnector::new(connector))?
-            }
-            _ => Client::connect(conn_str, NoTls)?,
-        };
+        // The batch dial: the plaintext gate, the forced-ssl connector, and a host:port-naming error.
+        let mut client = super::connect_client_raw(conn_str, tls)?;
         // test_decoding renders values as TEXT in the polling SESSION's format, so
         // pin the formats this reader's parser assumes — otherwise a non-default
         // database `datestyle` (e.g. 'German, DMY') nulls every timestamp and a
@@ -1562,12 +1546,12 @@ pub(crate) fn parse_test_decoding(lsn: &str, data: &str) -> Result<Option<Change
         .collect();
     let infinity_poison = (!infinite.is_empty()).then(|| {
         format!(
-            "pg cdc: {schema}.{table}: column(s) [{}] hold PostgreSQL's `infinity` / \
-             `-infinity` sentinel, which has no instant Arrow can represent. rivet \
+            "pg cdc: {schema}.{table}: column(s) [{}] hold a value rivet cannot decode \
+             faithfully (e.g. `infinity`, a BC date, a time of 24:00:00). rivet \
              refuses rather than writing NULL, because a NULL here is \
              indistinguishable from a genuinely absent value and every count and \
-             checksum would agree about the loss. Map the sentinels to real bounds in \
-             the source, or exclude the column from capture.",
+             checksum would agree about the loss. Map such values to representable \
+             ones in the source, or exclude the column from capture.",
             infinite.join(", ")
         )
     });
@@ -1635,20 +1619,6 @@ struct ParsedColumn {
     unrepresentable: bool,
 }
 
-/// Is this `test_decoding` cell PostgreSQL's `infinity` sentinel on a temporal type?
-///
-/// A named predicate because six mutants lived inside it while it was an inline
-/// expression — every operator in `(timestamp || date) && (infinity || -infinity)`
-/// could be flipped without a test noticing. The live test that guards the class
-/// carries ONE row shape, and one shape cannot distinguish four boolean arms.
-///
-/// The TYPE is the disambiguator, not the quoting: `test_decoding` renders this
-/// sentinel WITH quotes (`expires[timestamp with time zone]:'infinity'`, measured),
-/// and no genuine text value can sit on a timestamp or date column.
-fn is_unrepresentable_temporal(typ: &str, val: &str) -> bool {
-    (typ.starts_with("timestamp") || typ == "date") && (val == "infinity" || val == "-infinity")
-}
-
 // REVERTED: `split_key_changing_update` lived here and shipped CORRUPTION, so it is
 // gone rather than patched. Kept as a note because the next attempt must not start
 // from the same place.
@@ -1710,10 +1680,11 @@ fn parse_columns(s: &str) -> Vec<ParsedColumn> {
         // collide — the TYPE is the disambiguator here, where for TOAST it was the
         // quoting. Getting that backwards made the first cut of this guard silently
         // inert; the run still reported `status: success, rows: 2`.
-        let unrepresentable = is_unrepresentable_temporal(typ, &val);
+        let mapped = map_pg_value(typ, &val, quoted);
+        let unrepresentable = mapped.is_none() && !toast_unchanged;
         out.push(ParsedColumn {
             name,
-            value: map_pg_value(typ, &val, quoted),
+            value: mapped.unwrap_or(RivetValue::Null),
             toast_unchanged,
             unrepresentable,
         });
@@ -1873,36 +1844,32 @@ fn utf8_len(lead: u8) -> usize {
     }
 }
 
-/// Map a `test_decoding` `(type, value)` to a typed [`RivetValue`]. The column
-/// type is explicit in the stream, so timestamp-vs-timestamptz is never guessed
-/// (no naive-vs-instant hazard). Decimals carry exact text → `Decimal128`.
-fn map_pg_value(typ: &str, val: &str, quoted: bool) -> RivetValue {
+/// Map a `test_decoding` `(type, value)` to a typed [`RivetValue`]; `None` is a non-NULL value with no faithful reading.
+fn map_pg_value(typ: &str, val: &str, quoted: bool) -> Option<RivetValue> {
     if !quoted && val == "null" {
-        return RivetValue::Null;
+        return Some(RivetValue::Null);
     }
     // One-dimensional arrays: `text[]` / `integer[]` / … render as the PG
     // array literal (`{a,"with,comma",NULL}`); parse to element values so the
     // sink builds a real List column (batch parity), never the literal text.
     if let Some(inner) = typ.strip_suffix("[]") {
-        return parse_pg_array_literal(inner, val).map_or_else(
+        return Some(parse_pg_array_literal(inner, val).map_or_else(
             || RivetValue::Bytes(val.as_bytes().to_vec()),
             RivetValue::Array,
-        );
+        ));
     }
     let t = typ;
     if t == "integer" || t == "bigint" || t == "smallint" || t == "oid" {
-        return val.parse::<i64>().map_or(RivetValue::Null, RivetValue::Int);
+        return val.parse::<i64>().ok().map(RivetValue::Int);
     }
     if t.starts_with("numeric") || t.starts_with("decimal") {
-        return RivetValue::Bytes(val.as_bytes().to_vec());
+        return Some(RivetValue::Bytes(val.as_bytes().to_vec()));
     }
     if t == "boolean" {
-        return RivetValue::Bool(val == "t" || val == "true");
+        return Some(RivetValue::Bool(val == "t" || val == "true"));
     }
     if t == "double precision" || t == "real" {
-        return val
-            .parse::<f64>()
-            .map_or(RivetValue::Null, RivetValue::Float);
+        return val.parse::<f64>().ok().map(RivetValue::Float);
     }
     if t.starts_with("timestamp") {
         return parse_pg_timestamp(val);
@@ -1910,28 +1877,30 @@ fn map_pg_value(typ: &str, val: &str, quoted: bool) -> RivetValue {
     if t == "time" || t == "time without time zone" {
         // "HH:MM:SS[.ffffff]" → microseconds since midnight (the Time64 column
         // the batch export uses; the text rendering would silently null there).
-        return parse_pg_time_micros(val).map_or(RivetValue::Null, RivetValue::TimeMicros);
+        return parse_pg_time_micros(val).map(RivetValue::TimeMicros);
     }
     if t == "interval" {
         // Canonicalise the text rendering ("1 year 2 mons 3 days") to the SAME
         // ISO 8601 string the batch export emits ("P1Y2M3D") — one canon, so
         // CDC and batch outputs of the same value are byte-identical.
-        return parse_pg_interval(val)
-            .map(|(months, days, us)| {
-                RivetValue::Bytes(
-                    crate::source::postgres::arrow_convert::pg_interval_to_iso8601(
-                        months, days, us,
+        return Some(
+            parse_pg_interval(val)
+                .map(|(months, days, us)| {
+                    RivetValue::Bytes(
+                        crate::source::postgres::arrow_convert::pg_interval_to_iso8601(
+                            months, days, us,
+                        )
+                        .into_bytes(),
                     )
-                    .into_bytes(),
-                )
-            })
-            .unwrap_or_else(|| RivetValue::Bytes(val.as_bytes().to_vec()));
+                })
+                .unwrap_or_else(|| RivetValue::Bytes(val.as_bytes().to_vec())),
+        );
     }
     if t == "date" {
         return chrono::NaiveDate::parse_from_str(val, "%Y-%m-%d")
             .ok()
             .and_then(|d| d.and_hms_opt(0, 0, 0))
-            .map_or(RivetValue::Null, RivetValue::DateTime);
+            .map(RivetValue::DateTime);
     }
     if t == "uuid" {
         // test_decoding renders the uuid as 36-char hyphenated text; the sink's
@@ -1939,7 +1908,7 @@ fn map_pg_value(typ: &str, val: &str, quoted: bool) -> RivetValue {
         // 16 bytes — the text rendering would silently degrade to NULL there.
         return decode_hex(&val.replace('-', ""))
             .filter(|b| b.len() == 16)
-            .map_or(RivetValue::Null, RivetValue::Bytes);
+            .map(RivetValue::Bytes);
     }
     if t == "bytea" {
         // Rendered as `\x…` hex; a Binary column must carry the raw bytes, not
@@ -1947,12 +1916,12 @@ fn map_pg_value(typ: &str, val: &str, quoted: bool) -> RivetValue {
         if let Some(hex) = val.strip_prefix("\\x")
             && let Some(b) = decode_hex(hex)
         {
-            return RivetValue::Bytes(b);
+            return Some(RivetValue::Bytes(b));
         }
-        return RivetValue::Bytes(val.as_bytes().to_vec());
+        return Some(RivetValue::Bytes(val.as_bytes().to_vec()));
     }
     // text / varchar / char / json / … → string bytes.
-    RivetValue::Bytes(val.as_bytes().to_vec())
+    Some(RivetValue::Bytes(val.as_bytes().to_vec()))
 }
 
 /// Parse a PG array literal (`{alpha,"with,comma","he said \"hi\"",NULL}`)
@@ -1990,7 +1959,7 @@ fn parse_pg_array_literal(inner_type: &str, val: &str) -> Option<Vec<RivetValue>
                 }
             }
             i += 1; // closing quote
-            out.push(map_pg_value(inner_type, &elem, true));
+            out.push(map_pg_value(inner_type, &elem, true)?);
             if b.get(i) == Some(&b',') {
                 i += 1;
             } else {
@@ -2012,7 +1981,7 @@ fn parse_pg_array_literal(inner_type: &str, val: &str) -> Option<Vec<RivetValue>
             out.push(if tok == "NULL" {
                 RivetValue::Null
             } else {
-                map_pg_value(inner_type, tok, false)
+                map_pg_value(inner_type, tok, false)?
             });
             if end == body.len() {
                 break;
@@ -2143,21 +2112,21 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
 /// instant. (The old code stripped '+…' and treated the wall-clock as UTC —
 /// +9h corruption at a Tokyo session — and failed outright on negative
 /// offsets, silently nulling every value at a western session.)
-fn parse_pg_timestamp(val: &str) -> RivetValue {
+fn parse_pg_timestamp(val: &str) -> Option<RivetValue> {
     let v = val.trim_end();
     // tz-aware renderings first: %#z accepts +09 / +09:30 / +0930.
     for fmt in ["%Y-%m-%d %H:%M:%S%.f%#z", "%Y-%m-%d %H:%M:%S%#z"] {
         if let Ok(dt) = chrono::DateTime::parse_from_str(v, fmt) {
-            return RivetValue::DateTime(dt.naive_utc());
+            return Some(RivetValue::DateTime(dt.naive_utc()));
         }
     }
     let naive = v.trim_end_matches('Z');
     for fmt in ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%d %H:%M:%S"] {
         if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(naive, fmt) {
-            return RivetValue::DateTime(dt);
+            return Some(RivetValue::DateTime(dt));
         }
     }
-    RivetValue::Null
+    None
 }
 
 #[cfg(test)]
@@ -2258,8 +2227,28 @@ mod tests {
     /// TIMEOUTs rather than survivors: a mutated cursor stops advancing and the test
     /// hangs, which is detection, just not by assertion.)
     #[test]
+    fn a_value_the_decoder_cannot_read_is_unrepresentable_never_null() {
+        for (typ, val) in [
+            ("date", "0044-03-15 BC"),
+            ("timestamp without time zone", "0044-03-15 00:00:00 BC"),
+            ("timestamp with time zone", "1800-01-01 00:00:00+09:18:59"),
+            ("time without time zone", "24:00:00"),
+            ("integer", "12x"),
+        ] {
+            assert_eq!(map_pg_value(typ, val, false), None, "{typ} {val}");
+        }
+        assert_eq!(map_pg_value("date", "null", false), Some(RivetValue::Null));
+        let cols = parse_columns("d[date]:'0044-03-15 BC' n[integer]:unchanged-toast-datum");
+        assert!(cols[0].unrepresentable && cols[0].value == RivetValue::Null);
+        assert!(
+            !cols[1].unrepresentable,
+            "an unchanged-TOAST marker is recovered elsewhere, not refused as unreadable"
+        );
+    }
+
+    #[test]
     fn the_infinity_predicate_and_the_escaped_quote_path_are_graded() {
-        use super::is_unrepresentable_temporal as inf;
+        let inf = |typ: &str, val: &str| super::map_pg_value(typ, val, true).is_none();
 
         // Both temporal types, both spellings — the four TRUE corners.
         assert!(inf("timestamp with time zone", "infinity"));
@@ -2267,15 +2256,11 @@ mod tests {
         assert!(inf("date", "infinity"));
         assert!(inf("date", "-infinity"));
 
-        // A temporal type with an ordinary value: `&&` becoming `||` would call
-        // every timestamp unrepresentable and refuse every capture.
+        // A temporal type with an ordinary value decodes.
         assert!(!inf("timestamp with time zone", "2026-01-02 03:04:05+00"));
         // The sentinel spelling on a NON-temporal type: a text column may legally
         // hold the word, and refusing it would be a false loss report.
         assert!(!inf("text", "infinity"));
-        assert!(!inf("integer", "-infinity"));
-        // `date` must not be matched by prefix — `datemark` is a different type, and
-        // `==` becoming `!=` on that arm inverts exactly this.
         assert!(!inf("datemark", "infinity"));
 
         // The scanners' escaped-quote path. A doubled quote inside a literal is ONE
@@ -2298,6 +2283,7 @@ mod tests {
     }
 
     use super::*;
+    use postgres::NoTls;
 
     /// The TRUNCATE recogniser and its addressing, graded offline.
     ///
@@ -2705,11 +2691,8 @@ mod tests {
         // The two arms that feed it arbitrary wire text.
         let _ = map_pg_value("uuid", "€€€€€€€€€€€€€€€€€€", false); // even byte len
         let _ = map_pg_value("bytea", "\\x€€", false);
-        // A malformed uuid degrades to Null, not a crash (existing contract).
-        assert!(matches!(
-            map_pg_value("uuid", "not-hex", false),
-            RivetValue::Null
-        ));
+        // A malformed uuid is unreadable (the run refuses it), not a crash and not a NULL.
+        assert_eq!(map_pg_value("uuid", "not-hex", false), None);
     }
 
     proptest::proptest! {
@@ -2755,7 +2738,7 @@ mod tests {
             let _ = parse_pg_timestamp(&junk);
             // Correct on every well-formed offset rendering:
             let rendered = format!("2024-06-15 {h:02}:{mi:02}:{sec:02}{off_h:+03}");
-            if let RivetValue::DateTime(dt) = parse_pg_timestamp(&rendered) {
+            if let Some(RivetValue::DateTime(dt)) = parse_pg_timestamp(&rendered) {
                 let wall = chrono::NaiveDate::from_ymd_opt(2024, 6, 15)
                     .unwrap()
                     .and_hms_opt(h, mi, sec)
@@ -2881,7 +2864,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 parse_pg_timestamp(rendered),
-                RivetValue::DateTime(expected),
+                Some(RivetValue::DateTime(expected)),
                 "offset must convert to the UTC instant for {rendered:?}"
             );
         }

@@ -498,6 +498,18 @@ impl SourceConfig {
             }
         }
 
+        if let Some(named) = SourceType::from_url_scheme(&resolved)
+            && named != self.source_type
+        {
+            crate::config_bail!(
+                crate::error::codes::CONFIG_SOURCE_URL_SCHEME_MISMATCH,
+                "source.type: {} but the url scheme names {} — the two must agree, or the run \
+                 would anchor and read one engine while typing the stream as another",
+                self.source_type.label(),
+                named.label()
+            );
+        }
+
         Ok(resolved)
     }
 }
@@ -532,7 +544,31 @@ impl SourceType {
 
     /// The engine as `export_metrics.source_type` records it (`postgres`, `mysql`, `mssql`, `mongo`).
     pub fn ledger_label(self) -> String {
-        format!("{self:?}").to_lowercase()
+        self.label().to_string()
+    }
+
+    /// Stable lowercase engine label for metrics, run records and hints.
+    pub fn label(self) -> &'static str {
+        match self {
+            SourceType::Postgres => "postgres",
+            SourceType::Mysql => "mysql",
+            SourceType::Mssql => "mssql",
+            SourceType::Oracle => "oracle",
+            SourceType::Mongo => "mongo",
+        }
+    }
+
+    /// The engine a URL's scheme names (case-insensitive), or `None` for a scheme rivet does not read.
+    pub fn from_url_scheme(url: &str) -> Option<SourceType> {
+        let (scheme, _) = url.split_once("://")?;
+        match scheme.to_ascii_lowercase().as_str() {
+            "postgres" | "postgresql" => Some(SourceType::Postgres),
+            "mysql" => Some(SourceType::Mysql),
+            "sqlserver" | "mssql" => Some(SourceType::Mssql),
+            "mongodb" | "mongodb+srv" => Some(SourceType::Mongo),
+            "oracle" => Some(SourceType::Oracle),
+            _ => None,
+        }
     }
 }
 
@@ -740,6 +776,71 @@ mod tests {
         src.database = Some("orders".into());
         let url = src.resolve_url().unwrap();
         assert_eq!(url, "mysql://bob@my.internal:3306/orders");
+    }
+
+    #[test]
+    fn from_url_scheme_is_the_one_scheme_parser() {
+        for (url, want) in [
+            ("postgresql://h/db", Some(SourceType::Postgres)),
+            ("postgres://h/db", Some(SourceType::Postgres)),
+            ("POSTGRESQL://h/db", Some(SourceType::Postgres)),
+            ("mysql://h/db", Some(SourceType::Mysql)),
+            ("sqlserver://h/db", Some(SourceType::Mssql)),
+            ("mssql://h/db", Some(SourceType::Mssql)),
+            ("mongodb://h/db", Some(SourceType::Mongo)),
+            ("mongodb+srv://h/db", Some(SourceType::Mongo)),
+            ("oracle://h/db", Some(SourceType::Oracle)),
+            ("ORACLE://h/db", Some(SourceType::Oracle)),
+            ("postgresXYZ://h/db", None),
+            ("postgres:h/db", None),
+            ("redis://h", None),
+        ] {
+            assert_eq!(SourceType::from_url_scheme(url), want, "{url}");
+        }
+    }
+
+    #[test]
+    fn label_is_the_ledger_spelling_of_every_engine() {
+        for (t, want) in [
+            (SourceType::Postgres, "postgres"),
+            (SourceType::Mysql, "mysql"),
+            (SourceType::Mssql, "mssql"),
+            (SourceType::Oracle, "oracle"),
+            (SourceType::Mongo, "mongo"),
+        ] {
+            assert_eq!(t.label(), want);
+            assert_eq!(t.ledger_label(), want);
+        }
+    }
+
+    #[test]
+    fn resolve_url_refuses_a_scheme_that_names_another_engine() {
+        let mut src = make_source(SourceType::Mysql);
+        src.url = Some("postgresql://carol@pg.example.com:5432/db".into());
+        let err = src
+            .resolve_url()
+            .expect_err("type mysql, scheme postgresql");
+        assert_eq!(
+            err.to_string(),
+            "source.type: mysql but the url scheme names postgres — the two must agree, or the \
+             run would anchor and read one engine while typing the stream as another"
+        );
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some("RIVET_CONFIG_SOURCE_URL_SCHEME_MISMATCH")
+        );
+    }
+
+    #[test]
+    fn resolve_url_admits_a_matching_or_unknown_scheme() {
+        let mut src = make_source(SourceType::Mssql);
+        src.url = Some("mssql://sa@db:1433/d".into());
+        assert!(src.resolve_url().is_ok());
+        src.url = Some("jdbc:sqlserver://db:1433".into());
+        assert!(
+            src.resolve_url().is_ok(),
+            "an unknown scheme is the driver's to judge"
+        );
     }
 
     #[test]

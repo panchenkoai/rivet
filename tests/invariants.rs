@@ -6,7 +6,7 @@
 use rivet::state::{FilePart, StateStore};
 
 /// File-backed store for tests that use `claim_next_chunk_task`.
-/// `claim_next_chunk_task` opens a *new* connection to the DB path;
+/// Workers reopen the DB path via `open_at_ref`;
 /// an in-memory store would create a separate empty DB each time.
 fn file_store() -> (StateStore, tempfile::NamedTempFile) {
     let f = tempfile::NamedTempFile::new().unwrap();

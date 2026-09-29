@@ -515,22 +515,7 @@ fn is_keysettable_type(t: &str) -> bool {
 }
 
 pub(super) fn source_type(source_url: &str) -> Result<&'static str> {
-    if source_url.starts_with("postgres") || source_url.starts_with("postgresql") {
-        Ok("postgres")
-    } else if source_url.starts_with("mysql") {
-        Ok("mysql")
-    } else if source_url.starts_with("sqlserver") || source_url.starts_with("mssql") {
-        Ok("mssql")
-    } else if source_url.starts_with("mongodb") {
-        Ok("mongo")
-    } else if source_url.starts_with("oracle://") {
-        Ok("oracle")
-    } else {
-        anyhow::bail!(
-            "Unsupported source URL scheme. Expected postgresql://, mysql://, sqlserver://, mongodb://, or oracle://, got: {}",
-            source_url
-        )
-    }
+    source_type_of(source_url).map(crate::config::SourceType::label)
 }
 
 /// Refuse a forced `--mode` the source cannot run, in the config loader's own words.
@@ -544,17 +529,15 @@ fn refuse_unsupported_forced_mode(source_url: &str, mode: Option<&str>) -> Resul
     }
 }
 
-/// [`source_type`] as the enum the rest of the tree speaks.
+/// The engine the source URL's scheme names ([`crate::config::SourceType::from_url_scheme`]).
 pub(super) fn source_type_of(source_url: &str) -> Result<crate::config::SourceType> {
-    use crate::config::SourceType;
-    Ok(match source_type(source_url)? {
-        "postgres" => SourceType::Postgres,
-        "mysql" => SourceType::Mysql,
-        "mssql" => SourceType::Mssql,
-        "oracle" => SourceType::Oracle,
-        "mongo" => SourceType::Mongo,
-        other => unreachable!("source_type returned an unknown engine {other}"),
-    })
+    let Some(t) = crate::config::SourceType::from_url_scheme(source_url) else {
+        anyhow::bail!(
+            "Unsupported source URL scheme. Expected postgresql://, mysql://, sqlserver://, mongodb://, or oracle://, got: {}",
+            source_url
+        )
+    };
+    Ok(t)
 }
 
 /// Default SQL Server schema when the user passes a bare table name.

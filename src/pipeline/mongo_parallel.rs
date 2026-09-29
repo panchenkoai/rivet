@@ -111,9 +111,6 @@ pub(crate) fn run_mongo_parallel(
             )
         },
     );
-    if plan.validate {
-        summary.validated = Some(true);
-    }
     drained?;
 
     log::info!(
@@ -167,7 +164,7 @@ fn range_worker_pages(
         // Deferred commit: the worker collects its parts (the main thread drains
         // them through `record_part`), unlike the sequential runner which commits
         // each page as it arrives — the one axis the two callers differ on.
-        let Some(p) = super::keyset::read_keyset_page(
+        let (parts, p) = super::keyset::read_keyset_page(
             &mut src,
             plan,
             key_plan,
@@ -175,33 +172,29 @@ fn range_worker_pages(
             last.as_deref(),
             &**dest,
             &base,
-        )?
-        else {
+        );
+        // Published before a failed page's error leaves, so its durable parts still count.
+        for part in parts {
+            fan.part(unit, part);
+        }
+        let Some(p) = p? else {
             break;
         };
         fan.observe(p.observed);
-        for part in p.parts {
-            fan.part(unit, part);
-        }
         fan.contribute(unit, p.checksums);
         page += 1;
 
-        if p.rows < kp.chunk_size {
-            break;
-        }
-        match p.next_cursor {
+        match super::keyset::next_seek(
+            last.as_deref(),
+            p.rows,
+            kp.chunk_size,
+            p.next_cursor,
+            &kp.key_column,
+            page - 1,
+            &format!("export '{}': parallel worker {worker}", plan.export_name),
+        )? {
             Some(v) => last = Some(v),
-            None => anyhow::bail!(
-                // last-good key carried in the message: a worker has no &mut summary
-                // (its failure is collected by the FanIn), so the forensic value
-                // rides error_message — which error_class reads as keyset_unreadable_key.
-                "export '{}': parallel worker {} could not read the '{}' value to advance keyset \
-                 (NULL or unsupported type) — last readable key: {}.",
-                plan.export_name,
-                worker,
-                kp.key_column,
-                last.as_deref().unwrap_or("<none>"),
-            ),
+            None => break,
         }
     }
     Ok(())

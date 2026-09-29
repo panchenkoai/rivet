@@ -130,13 +130,11 @@ pub(crate) fn run_chunked_sequential(
             // write_sink_parts drains every part the sink produced — the
             // final temp file plus anything maybe_split rotated at
             // max_file_size — so rotation cannot drop data.
-            let mut recs = Vec::new();
-            let wrote = super::super::commit::write_sink_parts(
+            let (recs, wrote) = super::super::commit::write_sink_parts(
                 dest.as_ref(),
                 &mut sink,
                 plan.validate.then_some(plan.format),
                 |idx, count| super::super::commit::part_indexed_name(&base, idx, count),
-                &mut recs,
             );
             if plan.validate && wrote.is_ok() {
                 summary.validated = Some(true);
@@ -367,13 +365,11 @@ pub(in crate::pipeline) fn run_chunked_parallel(
                         // draining every part the sink produced (max_file_size
                         // rotation included). Touches no shared run state;
                         // record_part runs in the drain.
-                        let mut recs = Vec::new();
-                        let wrote = super::super::commit::write_sink_parts(
+                        let (recs, wrote) = super::super::commit::write_sink_parts(
                             &**shared_destination,
                             &mut sink,
                             plan_for_worker.validate.then_some(plan_for_worker.format),
                             |idx, count| super::super::commit::part_indexed_name(&base, idx, count),
-                            &mut recs,
                         );
                         let unit = super::super::commit::UnitId::Chunk(i as i64);
                         for rec in recs {
@@ -402,9 +398,6 @@ pub(in crate::pipeline) fn run_chunked_parallel(
         }
     });
 
-    if plan.validate {
-        summary.validated = Some(true);
-    }
     // Drain the worker-shared fingerprint into summary.  Stays None for
     // empty runs (no worker saw a schema) — finalize_manifest then falls
     // through to the state lookup / placeholder path for those.

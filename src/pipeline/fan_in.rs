@@ -62,6 +62,13 @@ impl FanIn {
         locked(&self.errors).push(format!("{label}: {msg}"));
     }
 
+    /// Record `result`'s error as a unit failure instead of dropping it.
+    pub(crate) fn fail_on_err<T>(&self, label: &str, result: anyhow::Result<T>) {
+        if let Err(e) = result {
+            self.fail(label, format!("{e:#}"));
+        }
+    }
+
     /// Run `body` on a scoped thread: counted as finished on every exit, an `Err` or a panic recorded as a failure.
     pub(crate) fn spawn<'s, 'e>(
         &'s self,
@@ -84,7 +91,8 @@ impl FanIn {
 
     /// Drain on the parent, in this order: governor log, observations, every durable part
     /// (`record_part`, `file_log` per ADR-0017), every committed unit's checksums, then the
-    /// bail if any unit failed — so nothing a worker made durable is lost to an error.
+    /// bail if any unit failed — so nothing a worker made durable is lost to an error — and
+    /// only on a clean drain the `validate` verdict.
     pub(crate) fn finish(
         self,
         plan: &ResolvedRunPlan,
@@ -106,6 +114,9 @@ impl FanIn {
         }
         let errors = inner(self.errors);
         if errors.is_empty() {
+            if plan.validate {
+                summary.validated = Some(true);
+            }
             Ok(())
         } else {
             Err(on_err(&errors))
@@ -158,6 +169,17 @@ mod tests {
             (summary.files_committed, summary.total_rows),
             (1, 100),
             "the durable part is counted"
+        );
+    }
+
+    #[test]
+    fn a_failed_state_write_fails_the_run_and_a_successful_one_does_not() {
+        let fan = FanIn::default();
+        fan.fail_on_err("chunk 2 state", Ok(()));
+        fan.fail_on_err::<()>("chunk 3 state", Err(anyhow::anyhow!("database is locked")));
+        assert_eq!(
+            inner(fan.errors),
+            vec!["chunk 3 state: database is locked".to_string()]
         );
     }
 
@@ -222,5 +244,40 @@ mod tests {
         assert_eq!(summary.manifest_parts.len(), 2);
         let covered = &summary.ledger.integrity.covered_units;
         assert!(covered.contains(&UnitId::Chunk(0)) && covered.contains(&UnitId::Chunk(1)));
+    }
+
+    /// A run whose unit failed never reaches the `validate` verdict, even with every part written.
+    #[test]
+    fn a_failed_unit_leaves_the_validate_verdict_unreached() {
+        let mut plan = test_plan();
+        plan.validate = true;
+        let mut summary = test_summary(&plan);
+        let fan = FanIn::default();
+        fan.part(UnitId::Chunk(0), synthetic_parts(1).remove(0));
+        fan.fail("chunk 1", "part validation failed");
+        assert!(
+            fan.finish(&plan, &mut summary, None, None, chunk_kind, bail)
+                .is_err()
+        );
+        assert_eq!(summary.validated, None);
+    }
+
+    /// A clean drain under `validate` records the pass; without `validate` it records nothing.
+    #[test]
+    fn a_clean_drain_records_the_validate_verdict_only_when_asked() {
+        for validate in [true, false] {
+            let mut plan = test_plan();
+            plan.validate = validate;
+            let mut summary = test_summary(&plan);
+            let fan = FanIn::default();
+            fan.part(UnitId::Chunk(0), synthetic_parts(1).remove(0));
+            fan.finish(&plan, &mut summary, None, None, chunk_kind, bail)
+                .unwrap();
+            assert_eq!(
+                summary.validated,
+                validate.then_some(true),
+                "validate={validate}"
+            );
+        }
     }
 }

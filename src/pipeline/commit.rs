@@ -491,40 +491,41 @@ pub(crate) fn write_part_file(
 /// Validation (when `validate` is `Some`) runs per part against that
 /// part's own row count — the only count the part actually contains.
 ///
-/// Each part is pushed onto `written` as soon as it is durable, so a failure on a
-/// later part still leaves the caller every part that reached the destination.
+/// Returns every part that reached the destination BESIDE the outcome, so a
+/// failure on a later part cannot drop the earlier durable ones on the way out.
 pub(crate) fn write_sink_parts(
     dest: &dyn Destination,
     sink: &mut crate::pipeline::sink::ExportSink,
     validate: Option<crate::config::FormatType>,
     name_for: impl Fn(usize, usize) -> String,
-    written: &mut Vec<PartRecord>,
-) -> Result<()> {
-    sink.finish_writer()?;
-    if sink.part_rows > 0 {
-        sink.completed_parts
-            .push(crate::pipeline::sink::CompletedPart {
-                tmp: std::mem::replace(&mut sink.tmp, tempfile::NamedTempFile::new()?),
-                rows: sink.part_rows,
-            });
-        sink.part_rows = 0;
-    }
-    let count = sink.completed_parts.len();
-    for (idx, part) in sink.completed_parts.drain(..).enumerate() {
-        // Test-only: fail part `idx` after its earlier siblings are durable.
-        crate::test_hook::maybe_error_at_index("sink_part_write", idx as i64)
-            .map_err(|msg| anyhow::anyhow!(msg))?;
-        if let Some(fmt) = validate {
-            crate::pipeline::validate::validate_output(part.tmp.path(), fmt, part.rows)?;
+) -> (Vec<PartRecord>, Result<()>) {
+    let parts = match sink.seal_parts() {
+        Ok(p) => p,
+        Err(e) => return (Vec::new(), Err(e)),
+    };
+    let count = parts.len();
+    let mut written = Vec::with_capacity(count);
+    for (idx, part) in parts.into_iter().enumerate() {
+        let one = || -> Result<PartRecord> {
+            // Test-only: fail part `idx` after its earlier siblings are durable.
+            crate::test_hook::maybe_error_at_index("sink_part_write", idx as i64)
+                .map_err(|msg| anyhow::anyhow!(msg))?;
+            if let Some(fmt) = validate {
+                crate::pipeline::validate::validate_output(part.tmp.path(), fmt, part.rows)?;
+            }
+            write_part_file(
+                dest,
+                part.tmp.path(),
+                part.rows as i64,
+                name_for(idx, count),
+            )
+        };
+        match one() {
+            Ok(rec) => written.push(rec),
+            Err(e) => return (written, Err(e)),
         }
-        written.push(write_part_file(
-            dest,
-            part.tmp.path(),
-            part.rows as i64,
-            name_for(idx, count),
-        )?);
     }
-    Ok(())
+    (written, Ok(()))
 }
 
 /// Sibling naming for rotated parts: a single-part chunk keeps its legacy
@@ -906,6 +907,41 @@ pub(crate) mod tests {
         );
         let written = dst_dir.path().join("out").join("part.parquet");
         assert_eq!(std::fs::read(&written).unwrap(), payload);
+    }
+
+    /// A destination that accepts the first `ok` writes and refuses the rest.
+    pub(crate) struct NthWriteFails {
+        ok: usize,
+        seen: std::sync::atomic::AtomicUsize,
+    }
+    impl NthWriteFails {
+        /// Accept `ok` writes, then refuse every one after.
+        pub(crate) fn after(ok: usize) -> Self {
+            Self {
+                ok,
+                seen: Default::default(),
+            }
+        }
+    }
+    impl crate::destination::Destination for NthWriteFails {
+        fn write(
+            &self,
+            _p: &std::path::Path,
+            key: &str,
+        ) -> Result<crate::destination::WriteOutcome> {
+            if self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= self.ok {
+                return Err(anyhow::anyhow!("injected: write of '{key}' refused"));
+            }
+            Ok(crate::destination::WriteOutcome { content_md5: None })
+        }
+        fn capabilities(&self) -> crate::destination::DestinationCapabilities {
+            crate::destination::DestinationCapabilities {
+                commit_protocol: crate::destination::WriteCommitProtocol::FinalizeOnClose,
+                idempotent_overwrite: true,
+                retry_safe: true,
+                partial_write_risk: false,
+            }
+        }
     }
 
     // ── write_part_file: store-reported checksum transit check ─────────────────

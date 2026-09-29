@@ -4,7 +4,7 @@
 //!
 //! - `mod.rs` (this file) — `MysqlSource` struct + connect/TLS path, the
 //!   extraction-pressure sampler, the `lean_pool_opts` / `connect_pool` /
-//!   `build_mysql_ssl_opts` helpers, `introspect_mysql_table_for_chunking`
+//!   `build_mysql_ssl_opts` helpers, `introspect_mysql_on`
 //!   together with the InnoDB `AVG_ROW_LENGTH` correction, the cursor-bound
 //!   `exec_iter` export loop (`mysql_run_export`), and the `Source` trait impl.
 //! - [`arrow_convert`] — the entire row → Arrow `RecordBatch` pipeline:
@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use arrow::datatypes::Schema;
 use mysql::prelude::*;
-use mysql::{Opts, OptsBuilder, Pool, PoolConstraints, PoolOpts, SslOpts};
+use mysql::{Conn, Opts, OptsBuilder, Pool, PoolConstraints, PoolOpts, SslOpts};
 
 use crate::config::{SourceType, TlsConfig, TlsMode};
 use crate::error::Result;
@@ -160,18 +160,32 @@ impl MysqlSource {
 pub(crate) fn connect_pool(url: &str, tls: Option<&TlsConfig>) -> Result<Pool> {
     // Refuse remote plaintext (no `tls:` block) before any dial (CWE-319).
     crate::source::require_tls_or_loopback(url, tls)?;
-    let builder = OptsBuilder::from_opts(Opts::from_url(url)?).pool_opts(lean_pool_opts());
-    let opts = match tls {
-        Some(cfg) if cfg.mode.is_enforced() => {
-            Opts::from(builder.ssl_opts(Some(build_mysql_ssl_opts(cfg))))
-        }
-        _ => Opts::from(builder),
-    };
+    let opts = with_tls(
+        OptsBuilder::from_opts(Opts::from_url(url)?).pool_opts(lean_pool_opts()),
+        tls,
+    );
     let pool = Pool::new(opts).map_err(|e| crate::source::describe_connect_error(url, e.into()))?;
     // Dial now, so a wrong host or port fails here with its name and not at the first query.
     pool.get_conn()
         .map_err(|e| crate::source::describe_connect_error(url, e.into()))?;
     Ok(pool)
+}
+
+/// Dial one MySQL `Conn` under the same TLS gate and host:port-naming error as [`connect_pool`].
+pub(crate) fn dial_conn(url: &str, tls: Option<&TlsConfig>) -> Result<Conn> {
+    crate::source::require_tls_or_loopback(url, tls)?;
+    let opts = with_tls(OptsBuilder::from_opts(Opts::from_url(url)?), tls);
+    Conn::new(opts).map_err(|e| crate::source::describe_connect_error(url, e.into()))
+}
+
+/// Apply an enforced [`TlsConfig`] to the driver's SSL options; anything else stays plaintext.
+fn with_tls(builder: OptsBuilder, tls: Option<&TlsConfig>) -> Opts {
+    match tls {
+        Some(cfg) if cfg.mode.is_enforced() => {
+            Opts::from(builder.ssl_opts(Some(build_mysql_ssl_opts(cfg))))
+        }
+        _ => Opts::from(builder),
+    }
 }
 
 /// Threshold above which `AVG_ROW_LENGTH` is treated as inflated by InnoDB BLOB
@@ -200,7 +214,7 @@ fn correct_innodb_avg_row_length(raw_bytes: i64) -> i64 {
 
 /// Probe `information_schema` for stats chunked-mode planning needs.
 ///
-/// MySQL analogue of [`crate::source::postgres::introspect_pg_table_for_chunking`]:
+/// MySQL analogue of the Postgres chunk-planner probe:
 /// returns the same source-neutral [`crate::source::TableIntrospection`] so
 /// `plan/build.rs` can dispatch on `source_type` and reuse the same downstream
 /// logic for chunk-column / chunk_size derivation.
@@ -216,15 +230,6 @@ fn correct_innodb_avg_row_length(raw_bytes: i64) -> i64 {
 /// `qualified_table` is `<schema>.<table>` or bare `<table>` (resolved under the
 /// current database for the connection). Same strict ident rules as the YAML
 /// `table:` shortcut so the SQL stays trivially safe.
-pub(crate) fn introspect_mysql_table_for_chunking(
-    url: &str,
-    tls: Option<&TlsConfig>,
-    qualified_table: &str,
-) -> Result<crate::source::TableIntrospection> {
-    introspect_mysql_on(&mut connect_pool(url, tls)?.get_conn()?, qualified_table)
-}
-
-/// [`introspect_mysql_table_for_chunking`] on a connection the caller already holds.
 fn introspect_mysql_on(
     conn: &mut mysql::PooledConn,
     qualified_table: &str,

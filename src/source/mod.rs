@@ -96,8 +96,7 @@ impl std::error::Error for StatementDurationTimeout {}
 /// Summary of a source table relevant to chunked-mode planning. Source-neutral
 /// shape so plan-build can ask either Postgres or MySQL for the same answer.
 ///
-/// Populated by `crate::source::postgres::introspect_pg_table_for_chunking` and
-/// `crate::source::mysql::introspect_mysql_table_for_chunking`. Both helpers
+/// Populated by each engine's [`Source::introspect_for_chunking`]. The helpers
 /// rely on catalog stats (`pg_class` / `information_schema.TABLES`) so the
 /// numbers are only as fresh as the last `ANALYZE` / autoanalyse.
 ///
@@ -519,7 +518,17 @@ pub(crate) fn describe_connect_error(url: &str, err: anyhow::Error) -> anyhow::E
     } else {
         return err;
     };
-    anyhow::anyhow!("{hint} (driver: {err:#})")
+    anyhow::Error::msg(UnreachableTarget(format!("{hint} (driver: {err:#})")))
+}
+
+/// A connect that never reached the server, named by host:port — rivet's own verdict, so no setup hint goes in front.
+#[derive(Debug)]
+pub(crate) struct UnreachableTarget(String);
+
+impl std::fmt::Display for UnreachableTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
 /// The `(host, port)` of a connection URL; the port is empty when the URL has none.
@@ -929,6 +938,148 @@ pub(crate) fn require_tls_or_loopback(url: &str, tls: Option<&TlsConfig>) -> Res
         return Err(anyhow::Error::new(TlsRequiredError).context(msg));
     }
     Ok(())
+}
+
+/// The URL without its `sslmode`, and the [`TlsConfig`] that `sslmode` asks for:
+/// `require` / `verify-ca` / `verify-full` enforce, anything else is `None`; last occurrence wins, like libpq.
+pub(crate) fn url_tls(url: &str) -> (String, Option<TlsConfig>) {
+    let query = url.split_once('?').map_or("", |(_, q)| q);
+    let mut mode = None;
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if key != "sslmode" {
+            continue;
+        }
+        mode = match value {
+            "require" => Some(crate::config::TlsMode::Require),
+            "verify-ca" => Some(crate::config::TlsMode::VerifyCa),
+            "verify-full" => Some(crate::config::TlsMode::VerifyFull),
+            _ => None,
+        };
+    }
+    let tls = mode.map(|mode| TlsConfig {
+        mode,
+        ..TlsConfig::default()
+    });
+    (strip_url_query_key(url, "sslmode"), tls)
+}
+
+/// Remove a query parameter (case-insensitive key) from a URL, keeping the rest of the query.
+pub(crate) fn strip_url_query_key(url: &str, key: &str) -> String {
+    let Some((base, query)) = url.split_once('?') else {
+        return url.to_string();
+    };
+    let kept: Vec<&str> = query
+        .split('&')
+        .filter(|pair| {
+            let k = pair.split('=').next().unwrap_or(pair);
+            !k.eq_ignore_ascii_case(key)
+        })
+        .collect();
+    if kept.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}?{}", kept.join("&"))
+    }
+}
+
+#[cfg(test)]
+mod url_tls_tests {
+    use super::url_tls;
+    use crate::config::TlsMode;
+
+    fn mode(url: &str) -> Option<TlsMode> {
+        url_tls(url).1.map(|t| t.mode)
+    }
+
+    #[test]
+    fn sslmode_enforced_values_map_to_tls_modes() {
+        assert_eq!(
+            mode("postgresql://u:p@h:5432/d?sslmode=require"),
+            Some(TlsMode::Require)
+        );
+        assert_eq!(
+            mode("postgresql://u:p@h/d?sslmode=verify-ca"),
+            Some(TlsMode::VerifyCa)
+        );
+        assert_eq!(
+            mode("mysql://u:p@h/d?sslmode=verify-full"),
+            Some(TlsMode::VerifyFull)
+        );
+    }
+
+    /// `require`, not the `#[default]` VerifyFull, so dropping `mode` from the struct is visible.
+    #[test]
+    fn url_sslmode_lands_in_the_config_it_builds() {
+        let t = url_tls("postgresql://u:p@h/db?sslmode=require")
+            .1
+            .expect("require maps");
+        assert_eq!(t.mode, TlsMode::Require);
+        assert!(!t.accept_invalid_certs && t.ca_file.is_none());
+    }
+
+    #[test]
+    fn sslmode_plaintext_missing_and_unrecognized_values_stay_plaintext() {
+        for url in [
+            "postgresql://u:p@localhost/d",
+            "postgresql://u:p@db/d?sslmode=disable",
+            "postgresql://u:p@db/d?sslmode=prefer",
+            "postgresql://u:p@db/d?sslmode=allow",
+            "postgresql://u:p@db/d?sslmode=REQUIRE",
+            "postgresql://u:p@db/d?sslmode=garbage",
+            "postgresql://u:p@db/d?sslmode",
+            "postgresql://u:p@db/d?sslmode=",
+        ] {
+            assert_eq!(mode(url), None, "url: {url}");
+        }
+    }
+
+    #[test]
+    fn sslmode_exact_key_among_other_params_and_last_occurrence_wins() {
+        assert_eq!(mode("postgresql://u:p@db/d?xsslmode=require"), None);
+        assert_eq!(
+            mode("postgresql://u:p@db/d?connect_timeout=10&sslmode=require&application_name=x"),
+            Some(TlsMode::Require)
+        );
+        assert_eq!(
+            mode("postgresql://u:p@db/d?sslmode=disable&sslmode=require"),
+            Some(TlsMode::Require)
+        );
+        assert_eq!(
+            mode("postgresql://u:p@db/d?sslmode=require&sslmode=disable"),
+            None
+        );
+    }
+
+    #[test]
+    fn url_tls_strips_sslmode_and_keeps_other_params() {
+        assert_eq!(
+            url_tls("mysql://u:p@db:3306/d?stmt_cache_size=5&sslmode=require&prefer_socket=false")
+                .0,
+            "mysql://u:p@db:3306/d?stmt_cache_size=5&prefer_socket=false"
+        );
+        assert_eq!(
+            url_tls("mysql://u:p@db/d?sslmode=require").0,
+            "mysql://u:p@db/d"
+        );
+        assert_eq!(url_tls("mysql://u:p@db/d").0, "mysql://u:p@db/d");
+    }
+
+    /// The MySQL driver refuses any URL parameter it does not know, so `sslmode` must be gone before it parses.
+    #[test]
+    fn mysql_url_with_sslmode_parses_after_url_tls() {
+        let raw = "mysql://u:p@db.prod:3306/d?sslmode=verify-full&stmt_cache_size=5";
+        assert!(
+            mysql::Opts::from_url(raw).is_err(),
+            "the driver must reject the raw URL"
+        );
+        let (clean, tls) = url_tls(raw);
+        assert!(
+            mysql::Opts::from_url(&clean).is_ok(),
+            "cleaned URL must parse: {clean}"
+        );
+        assert_eq!(tls.map(|t| t.mode), Some(TlsMode::VerifyFull));
+    }
 }
 
 #[cfg(test)]

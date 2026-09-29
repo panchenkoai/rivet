@@ -242,7 +242,7 @@ exclude_re = [
 ///
 /// RED-proven twice: with the unescaped `||` form restored (the empty-branch
 /// bug), and with `"replace == with != in check"` un-anchored (the prefix bug —
-/// it matches `check_null_ratios` and `check_memory` below).
+/// it matches `check_memory` below).
 #[test]
 fn exclude_patterns_are_not_over_broad() {
     // Names shaped exactly like cargo-mutants output, from modules no entry in
@@ -251,8 +251,6 @@ fn exclude_patterns_are_not_over_broad() {
     const UNRELATED: &[&str] = &[
         // Operator mutants whose function name merely SHARES A PREFIX with an
         // excluded one: `in check` must not mean `in check_*`.
-        "src/quality.rs:365:40: replace == with != in check_null_ratios",
-        "src/quality.rs:436:40: replace == with != in check_uniqueness",
         "src/resource.rs:103:21: replace == with != in check_memory",
         "src/cli/dispatch.rs:35:45: replace == with != in check_export_selection",
         "src/preflight/analysis.rs:410:13: replace == with != in check_sparse_range",

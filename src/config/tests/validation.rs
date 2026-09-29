@@ -201,6 +201,48 @@ exports:
 }
 
 #[test]
+fn partition_by_refuses_time_window_and_chunk_by_key_at_load() {
+    let yaml = |extra: &str| {
+        format!(
+            r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: t
+    table: events
+    partition_by: created_at
+    format: parquet
+{extra}
+    destination:
+      type: local
+      path: ./out
+      prefix: "p/{{partition}}/"
+"#
+        )
+    };
+    let tw = format!(
+        "{:#}",
+        Config::from_yaml(&yaml(
+            "    mode: time_window\n    time_column: created_at\n    days_window: 3"
+        ))
+        .unwrap_err()
+    );
+    assert!(
+        tw.contains("partition_by is not compatible with `mode:"),
+        "{tw}"
+    );
+    let key = format!(
+        "{:#}",
+        Config::from_yaml(&yaml("    mode: chunked\n    chunk_by_key: id")).unwrap_err()
+    );
+    assert!(
+        key.contains("partition_by is not compatible with chunk_by_key"),
+        "{key}"
+    );
+}
+
+#[test]
 fn partition_by_without_token_rejected_at_check_time() {
     // #16: the {partition}-token rule was enforced only in the run pipeline —
     // `rivet check` gave a false green. Now caught at config-load.

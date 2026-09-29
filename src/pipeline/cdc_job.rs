@@ -366,7 +366,8 @@ pub(super) fn initial_snapshot_pending(
     // holding neither that id nor those columns, `status: success`). The LABEL stays
     // the configured string — both legs share one prefix and the snapshot marker is
     // keyed by it — while the READ follows the catalog.
-    let catalog_read: Option<String> = match (CdcEngine::from_url(&url)?, &cdc.capture_instance) {
+    let engine = CdcEngine::from(config.source.source_type);
+    let catalog_read: Option<String> = match (engine, &cdc.capture_instance) {
         (CdcEngine::Mssql, Some(ci)) => {
             let Some((schema, table)) =
                 crate::source::mssql::cdc::source_object_of_capture_instance(&url, ci, tls)?
@@ -458,13 +459,7 @@ pub(super) fn initial_snapshot_pending(
     // The anchor — one entry point; `ensure_anchor` picks the engine's
     // mechanism (idempotent: a present anchor is never moved). After the refusal
     // above, so a refused config leaves no slot or checkpoint behind.
-    CdcEngine::from_url(&url)?.ensure_anchor(
-        &url,
-        &slot,
-        ckpt_path.as_deref(),
-        tls,
-        resume_expected,
-    )?;
+    engine.ensure_anchor(&url, &slot, ckpt_path.as_deref(), tls, resume_expected)?;
 
     // The anchor STRING for the snapshot stamp (round-10 STRUCT): rendered by
     // the same `Position.0.to_string()` the drain writes into `__pos`, read
@@ -989,12 +984,7 @@ fn cdc_metric_row(
 }
 
 fn record_metric(state: &StateStore, config: &Config, export: &ExportConfig, summary: &RunSummary) {
-    let source_type = config
-        .source
-        .resolve_url()
-        .ok()
-        .and_then(|u| CdcEngine::from_url(&u).ok().map(CdcEngine::label))
-        .map(|s| s.to_string());
+    let source_type = Some(config.source.source_type.ledger_label());
     let dest_type = Some(export.destination.destination_type.label().to_string());
     let row = cdc_metric_row(summary, source_type, dest_type);
     if let Err(e) = state.record_metric_full(&row) {

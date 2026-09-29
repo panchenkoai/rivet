@@ -163,27 +163,11 @@ pub(super) fn finalize_export_records(summary: &mut RunSummary) {
 /// Failures to write are non-fatal: the run keeps its existing exit code,
 /// the reason is logged, and the resume hint is still shown so the operator
 /// can recover even if disk-full prevents the report itself from landing.
-/// Does this run have something to resume?
-///
-/// A FAILED run that already committed parts: the data is on the prefix, so the
-/// next step is `--resume` and not a fresh run. On a success there is nothing to
-/// resume, and on a failure that committed nothing a resume would find nothing.
-///
-/// Extracted because it could not be tested where it was. Four mutations of the
-/// condition survived the suite — flipping `==` to `!=`, `>` to `<`/`==`/`>=` —
-/// so the advisory could have stopped firing, or started firing on every
-/// successful run, and nothing would have gone red. It matters more since a
-/// manifest that fails to land now FAILS the run with its parts durable: that is
-/// exactly the state this line addresses.
-pub(super) fn should_offer_resume(summary: &RunSummary) -> bool {
-    summary.status == "failed" && summary.files_committed > 0
-}
-
 pub(super) fn finalize_run_report(config_path: &str, summary: &RunSummary, kind: &str) {
     use std::io::Write;
 
     let dir = crate::pipeline::report::report_dir(config_path, &summary.run_id);
-    let written = match crate::pipeline::report::write_run_report(config_path, summary) {
+    let written = match crate::pipeline::report::write_run_report(config_path, summary, kind) {
         Ok(_) => true,
         Err(e) => {
             log::warn!(
@@ -211,12 +195,8 @@ pub(super) fn finalize_run_report(config_path: &str, summary: &RunSummary, kind:
     if written && !crate::pipeline::multi_export_mode() {
         let _ = writeln!(h, "report:    {}", dir.join("summary.md").display());
     }
-    if should_offer_resume(summary) {
-        let _ = writeln!(
-            h,
-            "resume:    rivet run --config {} --resume",
-            crate::pipeline::report::shell_quote(config_path)
-        );
+    if let Some(cmd) = crate::pipeline::report::resume_command(summary, config_path, kind) {
+        let _ = writeln!(h, "resume:    {cmd}");
     }
     let _ = h.flush();
 }
@@ -373,13 +353,7 @@ pub(super) fn finalize_manifest(
         })
         .unwrap_or_else(|| crate::manifest::SCHEMA_FINGERPRINT_UNAVAILABLE.to_string());
 
-    let source_engine = match plan.source.source_type {
-        crate::config::SourceType::Postgres => "postgres",
-        crate::config::SourceType::Mysql => "mysql",
-        crate::config::SourceType::Mssql => "mssql",
-        crate::config::SourceType::Oracle => "oracle",
-        crate::config::SourceType::Mongo => "mongo",
-    };
+    let source_engine = plan.source.source_type.label();
 
     // The DECLARED table first — a name is a label, the config is the catalog.
     //
@@ -971,7 +945,7 @@ pub(super) fn write_running_manifest(
     run_id: &str,
     started_at: &str,
 ) {
-    use crate::config::{DestinationType, SourceType};
+    use crate::config::DestinationType;
     use crate::manifest::{
         MANIFEST_VERSION, ManifestDestination, ManifestSource, ManifestStatus, RunManifest,
     };
@@ -985,13 +959,7 @@ pub(super) fn write_running_manifest(
         // co-located case, so skip the marker.
         DestinationType::Local | DestinationType::Stdout => return,
     };
-    let engine = match plan.source.source_type {
-        SourceType::Postgres => "postgres",
-        SourceType::Mysql => "mysql",
-        SourceType::Mssql => "mssql",
-        SourceType::Oracle => "oracle",
-        SourceType::Mongo => "mongo",
-    };
+    let engine = plan.source.source_type.label();
     let manifest = RunManifest {
         row_hash: None,
         split_window: None, // the running marker is overwritten by the terminal manifest
@@ -1181,37 +1149,6 @@ mod tests {
             !should_downgrade_validated(&v(false, true), Some(false)),
             "already failed; the downgrade is not a second opinion"
         );
-    }
-
-    /// The resume advisory fires exactly when there is something to resume.
-    ///
-    /// RED-proven against the four mutants that survived the suite on its
-    /// condition: `==`→`!=` (silent on failures, loud on successes), `>`→`<` /
-    /// `==` / `>=` (silent with parts, loud with none). Each row below kills at
-    /// least one of them, which is why the table has all four corners rather
-    /// than the one case a reader would think to write.
-    #[test]
-    fn the_resume_hint_fires_only_when_a_failed_run_left_durable_parts() {
-        let case = |status: &str, files: usize| {
-            let s = crate::pipeline::summary::RunSummary {
-                status: status.into(),
-                files_committed: files,
-                ..Default::default()
-            };
-            should_offer_resume(&s)
-        };
-        assert!(
-            case("failed", 3),
-            "a failed run WITH committed parts is the one case worth a resume line — the data \
-             is on the prefix and a fresh run would not pick it up"
-        );
-        assert!(
-            !case("failed", 0),
-            "a failure that committed nothing has nothing to resume; the line would send the \
-             operator after data that is not there"
-        );
-        assert!(!case("success", 3), "a successful run is not resumed");
-        assert!(!case("success", 0), "nor an empty successful one");
     }
 
     use super::*;

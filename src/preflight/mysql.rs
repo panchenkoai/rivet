@@ -230,7 +230,7 @@ fn mysql_row_get_string(row: &mysql::Row, col: &str) -> Option<String> {
 /// The single-integer PK `build_plan` auto-resolves an UNSET chunked `chunk_column` to — so
 /// the diagnostic ranges/probes on the SAME column the run will, not a `?` placeholder
 /// (post-0.24.3 review MED). FAITHFUL mirror of the `single_int_pk` probe in
-/// `source::mysql::introspect_mysql_table_for_chunking` — keep the int-type set in sync
+/// `source::mysql::introspect_mysql_on` — keep the int-type set in sync
 /// (tinyint/smallint/mediumint/int/bigint). `None` on composite / non-int / absent PK or a
 /// probe error (the planner then does NOT auto-resolve either).
 fn single_int_pk_mysql(conn: &mut mysql::PooledConn, qualified_table: &str) -> Option<String> {

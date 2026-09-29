@@ -321,7 +321,7 @@ rivet plan  -c rivet.yaml --annotate-waves  # write wave:/parallel_safe: into th
 rivet apply rivet.yaml
 ```
 
-A failing export does not stop its wave-mates: failures are collected and the run exits non-zero with the most stop-worthy error (data-integrity > schema-drift > retryable).
+A failing export does not stop its wave-mates: failures are collected and the run exits non-zero with the most stop-worthy error (data-integrity > internal > refusal > schema-drift > retryable > generic).
 
 **Resuming after a partial failure.** Re-run with `rivet apply <config>.yaml --resume`: exports a prior run already completed (their destination carries a `_SUCCESS` marker) are **skipped**, and an incomplete chunked export continues from its checkpoint — so recovering a run that failed mid-way does not redo the tables that already succeeded. Without `--resume`, a re-run re-exports everything.
 

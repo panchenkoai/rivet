@@ -5,7 +5,7 @@
 //! - `mod.rs` (this file) — `PostgresSource` struct + connect/TLS path, the
 //!   transaction-pooler detector, `PgTxnGuard`, sampling helpers
 //!   (`pg_sample_checkpoints_req`, `pg_fetch_work_mem_bytes`),
-//!   `introspect_pg_table_for_chunking`, the cursor + FETCH export loop
+//!   `introspect_pg_on` (chunk-planner catalog probe), the cursor + FETCH export loop
 //!   (`pg_run_export`), the `Source` trait impl, and the catalog-hint
 //!   resolver that bridges parsed FROM clauses to `pg_catalog`.
 //! - [`arrow_convert`] — the entire row → Arrow `RecordBatch` pipeline: type
@@ -74,8 +74,12 @@ impl PostgresSource {
     /// Connect with no transport security (legacy path). Prefer [`Self::connect_with_tls`]
     /// for production workloads so credentials and result sets are not visible on the wire.
     pub fn connect(url: &str) -> Result<Self> {
-        let mut client = Client::connect(url, NoTls)
-            .map_err(|e| crate::source::describe_connect_error(url, e.into()))?;
+        Self::connect_with_tls(url, None)
+    }
+
+    /// Connect honoring the user's [`TlsConfig`] through the shared dial, warning on a transaction pooler.
+    pub fn connect_with_tls(url: &str, tls: Option<&TlsConfig>) -> Result<Self> {
+        let mut client = connect_client_raw(url, tls)?;
         let transaction_pooler = pin_session_formats(&mut client)?;
         if transaction_pooler {
             log::warn!(
@@ -88,36 +92,6 @@ impl PostgresSource {
             client,
             transaction_pooler,
         })
-    }
-
-    /// Connect honoring the user's [`TlsConfig`]. When `tls.mode` is
-    /// [`TlsMode::Disable`] this falls back to [`Self::connect`].
-    pub fn connect_with_tls(url: &str, tls: Option<&TlsConfig>) -> Result<Self> {
-        // Refuse remote plaintext (no `tls:` block) before any dial (CWE-319).
-        crate::source::require_tls_or_loopback(url, tls)?;
-        match tls {
-            Some(cfg) if cfg.mode.is_enforced() => {
-                let connector = build_native_tls(cfg)?;
-                let make_tls = postgres_native_tls::MakeTlsConnector::new(connector);
-                // Forced ssl_mode overrides the URL's sslmode; see connect_client.
-                let mut client = pg_config_ssl_forced(url)?
-                    .connect(make_tls)
-                    .map_err(|e| crate::source::describe_connect_error(url, e.into()))?;
-                let transaction_pooler = pin_session_formats(&mut client)?;
-                if transaction_pooler {
-                    log::warn!(
-                        "transaction-mode connection pooler detected (pgBouncer/Odyssey) — \
-                         SET LOCAL tuning is transaction-scoped; \
-                         LISTEN/NOTIFY and advisory locks are unavailable"
-                    );
-                }
-                Ok(Self {
-                    client,
-                    transaction_pooler,
-                })
-            }
-            _ => Self::connect(url),
-        }
     }
 }
 
@@ -310,15 +284,6 @@ fn pg_sample_checkpoints_req(client: &mut Client) -> Option<i64> {
 /// or bare `<table>` (resolved under `public`). It is split internally with
 /// the same strict rules as the `table:` YAML shortcut — anything more
 /// elaborate must use the explicit-column path.
-pub(crate) fn introspect_pg_table_for_chunking(
-    url: &str,
-    tls: Option<&TlsConfig>,
-    qualified_table: &str,
-) -> Result<crate::source::TableIntrospection> {
-    introspect_pg_on(&mut connect_client(url, tls)?, qualified_table)
-}
-
-/// [`introspect_pg_table_for_chunking`] on a connection the caller already holds.
 fn introspect_pg_on(
     client: &mut Client,
     qualified_table: &str,
@@ -477,33 +442,12 @@ fn pg_config_ssl_forced(url: &str) -> Result<postgres::Config> {
     // error (bug hunt 2026-08-08: init derived verify-full from such a URL and
     // then failed to parse it, erroring every time). Dropping it makes any
     // sslmode the operator wrote parseable; the connector decides verification.
-    let cleaned = strip_url_query_key(url, "sslmode");
+    let cleaned = crate::source::strip_url_query_key(url, "sslmode");
     let mut config = postgres::Config::from_str(&cleaned).map_err(|e| {
         anyhow::anyhow!("postgres: cannot parse source URL for TLS enforcement: {e}")
     })?;
     config.ssl_mode(postgres::config::SslMode::Require);
     Ok(config)
-}
-
-/// Remove a single query parameter (case-insensitive key) from a URL, leaving
-/// the rest of the query intact. Used to drop `sslmode` before handing the URL
-/// to a parser that would reject some of its values.
-fn strip_url_query_key(url: &str, key: &str) -> String {
-    let Some((base, query)) = url.split_once('?') else {
-        return url.to_string();
-    };
-    let kept: Vec<&str> = query
-        .split('&')
-        .filter(|pair| {
-            let k = pair.split('=').next().unwrap_or(pair);
-            !k.eq_ignore_ascii_case(key)
-        })
-        .collect();
-    if kept.is_empty() {
-        base.to_string()
-    } else {
-        format!("{base}?{}", kept.join("&"))
-    }
 }
 
 /// Pin the session's text formats (UTC, ISO dates, postgres intervals, hex bytea) on a fresh
@@ -526,7 +470,7 @@ pub(crate) fn connect_client(url: &str, tls: Option<&TlsConfig>) -> Result<Clien
 }
 
 /// Dial `url` honoring the TLS policy, with the server's own session defaults.
-fn connect_client_raw(url: &str, tls: Option<&TlsConfig>) -> Result<Client> {
+pub(crate) fn connect_client_raw(url: &str, tls: Option<&TlsConfig>) -> Result<Client> {
     // Refuse remote plaintext (no `tls:` block) before any dial (CWE-319).
     crate::source::require_tls_or_loopback(url, tls)?;
     match tls {

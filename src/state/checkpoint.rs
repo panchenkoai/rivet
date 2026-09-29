@@ -2,7 +2,7 @@ use rusqlite::TransactionBehavior;
 
 use crate::error::Result;
 
-use super::{StateConn, StateRef, StateStore, open_connection};
+use super::{StateConn, StateStore};
 
 /// One row from `chunk_task` for display / debugging.
 #[derive(Debug, Clone)]
@@ -175,11 +175,6 @@ impl StateStore {
         )
     }
 
-    /// Atomically claim the next pending or retryable failed chunk.
-    pub fn claim_next_chunk_task(&self, run_id: &str) -> Result<Option<(i64, String, String)>> {
-        Self::claim_next_chunk_task_at_ref(&self.state_ref, run_id)
-    }
-
     fn claim_next_chunk_in_sqlite_tx(
         tx: &rusqlite::Transaction<'_>,
         now: &str,
@@ -210,29 +205,24 @@ impl StateStore {
         Ok(out)
     }
 
-    /// Claim next chunk using a fresh connection identified by `state_ref`.
-    /// Used by parallel workers that cannot share a single connection.
+    /// Atomically claim the next pending or retryable failed chunk on this store's connection.
     ///
-    /// Divergent-by-design (row.rs exemption): fresh per-worker connections via
-    /// `StateRef` and genuinely different SQL per backend (Postgres `FOR UPDATE
-    /// SKIP LOCKED` vs SQLite rowid + IMMEDIATE tx) — do not re-migrate this
-    /// onto the ceremony seam.
-    pub fn claim_next_chunk_task_at_ref(
-        state_ref: &StateRef,
-        run_id: &str,
-    ) -> Result<Option<(i64, String, String)>> {
-        match state_ref {
-            StateRef::Sqlite(db_path) => {
-                let mut conn = open_connection(db_path)?;
-                let now = chrono::Utc::now().to_rfc3339();
-                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    /// Divergent-by-design (row.rs exemption): genuinely different SQL per backend
+    /// (Postgres `FOR UPDATE SKIP LOCKED` vs SQLite rowid + IMMEDIATE tx) — do not
+    /// re-migrate this onto the ceremony seam. Parallel workers each hold their own
+    /// store (`open_at_ref` once per worker), so claims still run on distinct connections.
+    pub fn claim_next_chunk_task(&self, run_id: &str) -> Result<Option<(i64, String, String)>> {
+        let now = chrono::Utc::now().to_rfc3339();
+        match &self.conn {
+            StateConn::Sqlite(conn) => {
+                let tx =
+                    rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
                 let res = Self::claim_next_chunk_in_sqlite_tx(&tx, &now, run_id)?;
                 tx.commit()?;
                 Ok(res)
             }
-            StateRef::Postgres(url) => {
-                let mut client = super::connect_pg(url)?;
-                let now = chrono::Utc::now().to_rfc3339();
+            StateConn::Postgres(client) => {
+                let mut client = client.borrow_mut();
                 // FOR UPDATE SKIP LOCKED ensures concurrent workers each get a distinct task.
                 let rows = client
                     .query(
@@ -474,6 +464,36 @@ mod tests {
         // `orders` is allowed again.
         s.finalize_chunk_run_completed("run_1").unwrap();
         assert!(s.create_chunk_run("run_4", "orders", "h", 1).is_ok());
+    }
+
+    /// A claim runs on the store's own connection: an in-memory store claims its own chunks.
+    #[test]
+    fn claim_runs_on_the_stores_own_connection() {
+        let s = StateStore::open_in_memory().unwrap();
+        s.create_chunk_run("run_m", "orders", "h", 1).unwrap();
+        s.insert_chunk_tasks("run_m", &[(1, 5)]).unwrap();
+        assert_eq!(s.claim_next_chunk_task("run_m").unwrap().unwrap().0, 0);
+        assert!(s.claim_next_chunk_task("run_m").unwrap().is_none());
+    }
+
+    /// Two worker-held stores on one database interleave claims without handing out a chunk twice.
+    #[test]
+    fn claim_next_chunk_task_on_two_held_stores_claims_distinct_chunks() {
+        let (_dir, s) = store_on_disk();
+        s.create_chunk_run("run_w", "orders", "h", 1).unwrap();
+        s.insert_chunk_tasks("run_w", &[(1, 5), (6, 10), (11, 15)])
+            .unwrap();
+        let a = StateStore::open_at_ref(s.state_ref()).unwrap();
+        let b = StateStore::open_at_ref(s.state_ref()).unwrap();
+        let mut got = vec![
+            a.claim_next_chunk_task("run_w").unwrap().unwrap().0,
+            b.claim_next_chunk_task("run_w").unwrap().unwrap().0,
+            a.claim_next_chunk_task("run_w").unwrap().unwrap().0,
+        ];
+        got.sort();
+        assert_eq!(got, vec![0, 1, 2]);
+        assert!(b.claim_next_chunk_task("run_w").unwrap().is_none());
+        assert!(a.claim_next_chunk_task("run_w").unwrap().is_none());
     }
 
     /// A chunk that failed for a DETERMINISTIC reason must not be re-claimed.

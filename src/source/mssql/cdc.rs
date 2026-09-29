@@ -26,12 +26,13 @@ use std::collections::VecDeque;
 
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use serde_json::json;
-use tiberius::{AuthMethod, Client, ColumnData, Config, EncryptionLevel, Row};
+use tiberius::{Client, ColumnData, Row};
 use tokio::net::TcpStream;
-use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
+use tokio_util::compat::Compat;
 
 use crate::config::TlsConfig;
 use crate::error::Result;
+use crate::source::cdc::checkpoint_identity::IdentityVerdict;
 use crate::source::cdc::value::RivetValue;
 use crate::source::cdc::{ChangeEvent, ChangeOp, ChangeStream, DrainMode, Position};
 use crate::source::require_tls_or_loopback;
@@ -239,6 +240,14 @@ fn advance_cursor(from_lsn: &mut Option<String>, from_is_pin: &mut bool, to: Str
     *from_is_pin = false;
 }
 
+/// The user error number `fill_sql` THROWs when the resume position fell below retention.
+const RETENTION_GAP_ERROR: u32 = 51000;
+
+/// Whether a server error number is `fill_sql`'s retention-gap THROW.
+fn is_retention_gap(server_code: Option<u32>) -> bool {
+    server_code == Some(RETENTION_GAP_ERROR)
+}
+
 fn fill_sql(p: Poll<'_>) -> String {
     let Poll {
         ci,
@@ -274,7 +283,7 @@ fn fill_sql(p: Poll<'_>) -> String {
          DECLARE @max binary(10) = {max_expr}; \
          {floor} \
          IF @from IS NOT NULL AND @min IS NOT NULL AND @from < @min \
-            THROW 51000, 'rivet cdc: the resume position is older than the SQL Server \
+            THROW {RETENTION_GAP_ERROR}, 'rivet cdc: the resume position is older than the SQL Server \
 CDC change-table retention (the cleanup job removed it). Resuming would silently skip changes \
 — restart CDC from a fresh checkpoint FIRST, then re-snapshot the table (mode: full): snapshotting first leaves the changes in between in neither.', 1; \
          DECLARE @to binary(10) = NULL; \
@@ -326,48 +335,35 @@ impl DbIdentity {
     }
 }
 
-/// What a resume may do given the checkpoint's recorded identity and the server's.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum IdentityVerdict {
-    Ok,
-    /// Resume proceeds, but nothing could be verified; the text says why.
-    Warn(String),
-    /// Resume is refused; the text says why and how to recover.
-    Refuse(String),
-}
-
 /// Judge a resume: another database's LSNs, or a log rewound by a restore, are refused.
 pub(crate) fn identity_verdict(
     checkpoint: Option<&DbIdentity>,
     server: Option<&DbIdentity>,
 ) -> IdentityVerdict {
-    const RECOVER: &str = "Delete the checkpoint to start CDC from a fresh anchor FIRST, then \
-         re-snapshot the table (mode: full): snapshotting first leaves the changes in between \
-         in neither.";
     match (checkpoint, server) {
-        (None, _) => IdentityVerdict::Warn(
+        (None, _) => IdentityVerdict::Unverifiable(
             "mssql cdc: this checkpoint carries no database identity (it predates rivet \
              recording one), so rivet cannot confirm it belongs to this database. LSNs are \
              positions in ONE database's log; if the source moved, resuming skips changes."
                 .into(),
         ),
-        (Some(_), None) => IdentityVerdict::Warn(
+        (Some(_), None) => IdentityVerdict::Unverifiable(
             "mssql cdc: this login cannot read sys.database_recovery_status for the \
              database, so rivet cannot confirm the checkpoint belongs to it."
                 .into(),
         ),
-        (Some(c), Some(s)) if c.family != s.family => IdentityVerdict::Refuse(format!(
+        (Some(c), Some(s)) if c.family != s.family => IdentityVerdict::Foreign(format!(
             "mssql cdc: this checkpoint was written against a different database (family \
              {}, the connection's is {}). LSNs are positions in one database's log: \
              resuming here would start at an arbitrary point in another log and skip \
-             whatever lies below it, silently. {RECOVER}",
+             whatever lies below it, silently.",
             c.family, s.family
         )),
-        (Some(c), Some(s)) if c.fork != s.fork => IdentityVerdict::Refuse(format!(
+        (Some(c), Some(s)) if c.fork != s.fork => IdentityVerdict::Foreign(format!(
             "mssql cdc: this database was restored from a backup since the checkpoint was \
              written (recovery fork {} is now {}). The log was rewound: changes the \
              checkpoint already covers may no longer exist in the source, and the \
-             destination still holds them. {RECOVER}",
+             destination still holds them.",
             c.fork, s.fork
         )),
         _ => IdentityVerdict::Ok,
@@ -447,11 +443,14 @@ pub(crate) fn resume_from_checkpoint(
         .get("lsn")
         .and_then(|v| v.as_str())
         .ok_or_else(|| {
-            anyhow::anyhow!(
-                "checkpoint '{path}' parses as JSON but carries no 'lsn' — refusing to treat \
-                 it as absent, which would re-read and re-deliver the ENTIRE retained change \
-                 table from fn_cdc_get_min_lsn under a successful exit. Restore the file, or \
-                 delete it to accept a fresh anchor."
+            crate::error::CodedError::new(
+                crate::error::codes::SOURCE_CDC_CHECKPOINT_INVALID,
+                format!(
+                    "checkpoint '{path}' parses as JSON but carries no 'lsn' — refusing to treat \
+                     it as absent, which would re-read and re-deliver the ENTIRE retained change \
+                     table from fn_cdc_get_min_lsn under a successful exit. Restore the file, or \
+                     delete it to accept a fresh anchor."
+                ),
             )
         })?
         .to_string();
@@ -714,11 +713,7 @@ impl MssqlChangeStream {
         let mut client = rt.block_on(connect(cfg, tls))?;
         let identity = rt.block_on(db_identity(&mut client))?;
         if cfg.from_lsn.is_some() {
-            match identity_verdict(cfg.checkpoint_identity.as_ref(), identity.as_ref()) {
-                IdentityVerdict::Refuse(why) => anyhow::bail!("{why}"),
-                IdentityVerdict::Warn(why) => log::warn!("{why}"),
-                IdentityVerdict::Ok => {}
-            }
+            identity_verdict(cfg.checkpoint_identity.as_ref(), identity.as_ref()).enforce()?;
         }
 
         // Resolve the REAL schema/table from cdc.change_tables metadata. The
@@ -927,7 +922,17 @@ impl MssqlChangeStream {
         let rows = {
             let Self { rt, client, .. } = self;
             rt.block_on(async { client.simple_query(sql).await?.into_first_result().await })
-                .map_err(|e| anyhow::Error::new(e).context(crate::source::cdc::MSSQL_CDC_HINT))?
+                .map_err(|e| {
+                    if is_retention_gap(e.code()) {
+                        crate::error::CodedError::new(
+                            crate::error::codes::SOURCE_CDC_LOG_GAP,
+                            e.to_string(),
+                        )
+                        .into()
+                    } else {
+                        anyhow::Error::new(e).context(crate::source::cdc::MSSQL_CDC_HINT)
+                    }
+                })?
         };
         // Rows are ordered ascending by start LSN, so the last one's `__$start_lsn`
         // is `@to` — the cursor advances there regardless of each row's op.
@@ -970,7 +975,7 @@ impl MssqlChangeStream {
                     n if n.starts_with("__$") => {} // skip other metadata
                     n => {
                         names.push(n.to_string());
-                        values.push(cell_to_rivet(r, idx, data));
+                        values.push(cell_to_rivet(r, idx, data)?);
                     }
                 }
             }
@@ -1274,48 +1279,59 @@ fn naive_time_to_micros(t: NaiveTime) -> i64 {
     t.num_seconds_from_midnight() as i64 * 1_000_000 + t.nanosecond() as i64 / 1000
 }
 
-fn cell_to_rivet(row: &Row, idx: usize, data: &ColumnData<'_>) -> RivetValue {
+fn cell_to_rivet(row: &Row, idx: usize, data: &ColumnData<'_>) -> Result<RivetValue> {
     if let Some(v) = cell_from_data(data) {
-        return v;
+        return Ok(v);
     }
-    match data {
+    let unreadable = |e: tiberius::error::Error| {
+        anyhow::Error::new(crate::error::CodedError::new(
+            crate::error::codes::SOURCE_CDC_CELL_UNSUPPORTED,
+            format!("mssql cdc: column {idx}: cannot read {data:?}: {e}"),
+        ))
+    };
+    Ok(match data {
         // datetimeoffset is tz-aware — `try_get::<NaiveDateTime>` is the *wrong* type
         // and returns None (silent data loss). Read it as FixedOffset and carry its UTC
         // instant; the resolved column is a tz-aware Timestamp, so the sink writes it
         // identically to the batch export (parity) with the zone preserved.
         ColumnData::DateTimeOffset(_) => row
             .try_get::<chrono::DateTime<chrono::FixedOffset>, _>(idx)
-            .ok()
-            .flatten()
+            .map_err(unreadable)?
             .map_or(RivetValue::Null, |dt| RivetValue::DateTime(dt.naive_utc())),
         ColumnData::DateTime(_) => row
             .try_get::<NaiveDateTime, _>(idx)
-            .ok()
-            .flatten()
+            .map_err(unreadable)?
             .map_or(RivetValue::Null, |dt| {
                 RivetValue::DateTime(super::arrow_convert::nearest_micro(dt))
             }),
         ColumnData::DateTime2(_) | ColumnData::SmallDateTime(_) => row
             .try_get::<NaiveDateTime, _>(idx)
-            .ok()
-            .flatten()
+            .map_err(unreadable)?
             .map_or(RivetValue::Null, RivetValue::DateTime),
         ColumnData::Date(_) => row
             .try_get::<NaiveDate, _>(idx)
-            .ok()
-            .flatten()
+            .map_err(unreadable)?
             .and_then(|d| d.and_hms_opt(0, 0, 0))
             .map_or(RivetValue::Null, RivetValue::DateTime),
         ColumnData::Time(_) => row
             .try_get::<NaiveTime, _>(idx)
-            .ok()
-            .flatten()
+            .map_err(unreadable)?
             .map_or(RivetValue::Null, |t| {
                 RivetValue::TimeMicros(naive_time_to_micros(t))
             }),
-        // every None (NULL) variant + anything unhandled
-        _ => RivetValue::Null,
+        other => cell_fallthrough(other)?,
+    })
+}
+
+/// NULL for a true SQL NULL; a refusal for a valued cell no arm above decodes, never a silent NULL.
+fn cell_fallthrough(data: &ColumnData<'_>) -> Result<RivetValue> {
+    if super::arrow_convert::is_null_cell(data) {
+        return Ok(RivetValue::Null);
     }
+    crate::rivet_bail!(
+        crate::error::codes::SOURCE_CDC_CELL_UNSUPPORTED,
+        "mssql cdc: no decoder for a captured {data:?} value — refusing rather than writing NULL"
+    )
 }
 
 /// Render a tiberius `Numeric` (unscaled `value` + `scale`) to exact decimal text.
@@ -1343,28 +1359,15 @@ async fn connect(
     cfg: &MssqlCdcConfig,
     tls: Option<&TlsConfig>,
 ) -> Result<Client<Compat<TcpStream>>> {
-    let mut config = Config::new();
-    config.host(&cfg.host);
-    config.port(cfg.port);
-    config.database(&cfg.database);
-    config.authentication(AuthMethod::sql_server(&cfg.user, &cfg.password));
-    config.encryption(EncryptionLevel::Required);
-    // Gate trust_cert exactly as the batch MssqlSource does: verify the chain by
-    // default (no trust_cert); trust the named CA when given; accept-any only for
-    // an explicit disable / accept-invalid, or for loopback (None — the
-    // require_tls_or_loopback gate already ensured a remote host carries a tls block).
-    match tls {
-        Some(c) if crate::source::mssql::mssql_trusts_cert_without_verify(c) => config.trust_cert(),
-        Some(c) => {
-            if let Some(ca) = &c.ca_file {
-                config.trust_cert_ca(ca);
-            }
-        }
-        None => config.trust_cert(),
-    }
-    let tcp = TcpStream::connect(config.get_addr()).await?;
-    tcp.set_nodelay(true)?;
-    Ok(Client::connect(config, tcp.compat_write()).await?)
+    let config = crate::source::mssql::tiberius_config(
+        &cfg.host,
+        cfg.port,
+        &cfg.database,
+        &cfg.user,
+        &cfg.password,
+        tls,
+    );
+    crate::source::mssql::dial(config, &format!("mssql://{}:{}", cfg.host, cfg.port)).await
 }
 
 /// Persist the database's CURRENT max LSN to `ckpt` — the anchor for
@@ -1561,8 +1564,13 @@ mod tests {
                     "{missing} carries no readable position — treating it as absent re-reads \
                      the ENTIRE retained change table under a green exit (measured: ids \
                      [1,2,3,4] delivered where [4] was owed)"
-                ))
-                .to_string();
+                ));
+            assert_eq!(crate::error::classify_exit(&err), 5, "{err}");
+            assert_eq!(
+                crate::error::error_code(&err),
+                Some("RIVET_SOURCE_CDC_CHECKPOINT_INVALID")
+            );
+            let err = err.to_string();
             assert!(
                 err.contains("lsn") && err.contains("/tmp/c.ckpt"),
                 "the refusal must name the key AND the file, or an operator cannot act on \
@@ -1572,6 +1580,26 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_valued_cell_without_a_decoder_is_refused_not_nulled() {
+        use std::borrow::Cow;
+        let xml = ColumnData::Xml(Some(Cow::Owned(tiberius::xml::XmlData::new("<a/>"))));
+        let err = cell_fallthrough(&xml).expect_err("a valued xml cell must not become NULL");
+        assert_eq!(crate::error::classify_exit(&err), 5, "{err:#}");
+        for null in [
+            ColumnData::Xml(None),
+            ColumnData::Date(None),
+            ColumnData::DateTimeOffset(None),
+            ColumnData::String(None),
+        ] {
+            assert_eq!(
+                cell_fallthrough(&null).unwrap(),
+                RivetValue::Null,
+                "{null:?}"
+            );
+        }
+    }
 
     /// Every data-only `ColumnData` arm, with an INDEPENDENT expectation.
     ///
@@ -1725,6 +1753,13 @@ mod tests {
     // open-time ceiling — it must never re-read `fn_cdc_get_max_lsn()` (the
     // moving target that keeps a hot table's drain from ever terminating), and
     // the daemon poll must keep doing exactly that.
+    #[test]
+    fn only_the_retention_throw_number_is_a_log_gap() {
+        assert!(is_retention_gap(Some(51000)));
+        assert!(!is_retention_gap(Some(208)));
+        assert!(!is_retention_gap(None));
+    }
+
     #[test]
     fn fill_sql_bounded_pins_max_and_daemon_chases_it() {
         let bounded = fill_sql(Poll {
@@ -2037,30 +2072,44 @@ mod identity_tests {
             identity_verdict(Some(&here), Some(&here)),
             IdentityVerdict::Ok
         );
-        let IdentityVerdict::Refuse(why) = identity_verdict(Some(&here), Some(&id("F2", "K1")))
+        let IdentityVerdict::Foreign(why) = identity_verdict(Some(&here), Some(&id("F2", "K1")))
         else {
             panic!("another family must refuse");
         };
         assert!(why.starts_with("mssql cdc: this checkpoint was written against a different database (family F1, the connection's is F2)"), "{why}");
-        let IdentityVerdict::Refuse(why) = identity_verdict(Some(&here), Some(&id("F1", "K2")))
+        let IdentityVerdict::Foreign(why) = identity_verdict(Some(&here), Some(&id("F1", "K2")))
         else {
             panic!("another fork must refuse");
         };
         assert!(why.starts_with("mssql cdc: this database was restored from a backup since the checkpoint was written (recovery fork K1 is now K2)"), "{why}");
-        assert!(
-            why.contains(
-                "Delete the checkpoint to start CDC from a fresh anchor FIRST, then re-snapshot"
-            ),
-            "the recovery order must be anchor first: {why}"
-        );
         assert!(matches!(
             identity_verdict(None, Some(&here)),
-            IdentityVerdict::Warn(w) if w.contains("carries no database identity")
+            IdentityVerdict::Unverifiable(w) if w.contains("carries no database identity")
         ));
         assert!(matches!(
             identity_verdict(Some(&here), None),
-            IdentityVerdict::Warn(w) if w.contains("cannot read sys.database_recovery_status")
+            IdentityVerdict::Unverifiable(w) if w.contains("cannot read sys.database_recovery_status")
         ));
+    }
+
+    #[test]
+    fn a_foreign_or_rewound_checkpoint_refuses_with_exit_5_and_the_anchor_first_order() {
+        let here = id("F1", "K1");
+        for server in [id("F2", "K1"), id("F1", "K2")] {
+            let err = identity_verdict(Some(&here), Some(&server))
+                .enforce()
+                .unwrap_err();
+            assert_eq!(crate::error::classify_exit(&err), 5, "{err}");
+            assert_eq!(
+                crate::error::error_code(&err),
+                Some("RIVET_SOURCE_CDC_FOREIGN_CHECKPOINT")
+            );
+            assert!(
+                err.to_string()
+                    .ends_with(crate::source::cdc::checkpoint_identity::RECOVER),
+                "{err}"
+            );
+        }
     }
 
     #[test]

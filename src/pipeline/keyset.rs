@@ -97,14 +97,13 @@ fn keyset_plan(plan: &ResolvedRunPlan) -> &KeysetPlan {
     }
 }
 
-/// One keyset page produced by [`read_keyset_page`]: the parts written to the
-/// destination, the row count, the dest schema (for the run fingerprint), and
-/// the typed high-water cursor to advance from. The two runners
-/// ([`run_keyset`] sequential, `mongo_parallel::range_worker` parallel) share
+/// One keyset page produced by [`read_keyset_page`]: the row count, the dest
+/// schema (for the run fingerprint), and the typed high-water cursor to advance
+/// from. The page's durable parts travel BESIDE it (see [`PageRead`]), so a page
+/// that failed part-way still hands over the parts it wrote. The runners share
 /// the page READ; they differ only in WHEN the parts commit, which stays each
 /// caller's business.
 pub(crate) struct KeysetPage {
-    pub(crate) parts: Vec<super::commit::PartRecord>,
     pub(crate) rows: usize,
     /// What this page's sink SAW: dest schema (run fingerprint) + column max bytes.
     pub(crate) observed: super::commit::Observations,
@@ -116,9 +115,12 @@ pub(crate) struct KeysetPage {
     pub(crate) checksums: super::commit::UnitChecksums,
 }
 
+/// The parts a page read made durable, and the page (`None` when empty) or the error that stopped it.
+pub(crate) type PageRead = (Vec<super::commit::PartRecord>, Result<Option<KeysetPage>>);
+
 /// Read ONE seek page: `find`-and-seek from `cursor` (or the range floor), write
 /// its parts to `dest` named by `part_base`, and report the page + the typed
-/// high-water cursor. Returns `None` when the page is empty (range exhausted).
+/// high-water cursor. The page is `None` when empty (range exhausted).
 ///
 /// Paging control stays with the caller via the returned `rows`/`next_cursor`:
 /// a page shorter than `page_size` is the last one; a full page whose
@@ -132,7 +134,7 @@ pub(crate) fn read_keyset_page(
     cursor: Option<&str>,
     dest: &dyn destination::Destination,
     part_base: &str,
-) -> Result<Option<KeysetPage>> {
+) -> PageRead {
     read_keyset_page_bounded(
         src, plan, key_plan, page_size, cursor, None, dest, part_base,
     )
@@ -151,7 +153,46 @@ pub(crate) fn read_keyset_page_bounded(
     upper: Option<&str>,
     dest: &dyn destination::Destination,
     part_base: &str,
-) -> Result<Option<KeysetPage>> {
+) -> PageRead {
+    let mut sink = match fill_keyset_page(src, plan, key_plan, page_size, cursor, upper) {
+        Ok(Some(sink)) => sink,
+        Ok(None) => return (Vec::new(), Ok(None)),
+        Err(e) => return (Vec::new(), Err(e)),
+    };
+    let rows = sink.total_rows;
+    let observed = sink.take_observations();
+    // Shared commit path (I1→I2→I7 + counters + journal + fault hooks).
+    // write_sink_parts drains every part the sink produced — the final temp file
+    // plus anything maybe_split rotated at max_file_size — so rotation can't drop.
+    let (parts, wrote) = super::commit::write_sink_parts(
+        dest,
+        &mut sink,
+        plan.validate.then_some(plan.format),
+        |idx, count| super::commit::part_indexed_name(part_base, idx, count),
+    );
+    let page = wrote.map(|()| {
+        Some(KeysetPage {
+            rows,
+            observed,
+            // The source's own lossless token (Mongo BSON `_id`) when it reported
+            // one, else the column-extracted string (every SQL engine).
+            next_cursor: sink.effective_cursor(),
+            first_cursor: sink.first_cursor_value.clone(),
+            checksums: sink.take_checksums(),
+        })
+    });
+    (parts, page)
+}
+
+/// Run one seek page's query into a fresh sink; `None` when the page is empty.
+fn fill_keyset_page(
+    src: &mut dyn Source,
+    plan: &ResolvedRunPlan,
+    key_plan: &IncrementalCursorPlan,
+    page_size: usize,
+    cursor: Option<&str>,
+    upper: Option<&str>,
+) -> Result<Option<ExportSink>> {
     let cursor_state = cursor.map(|v| CursorState {
         export_name: plan.export_name.clone(),
         last_cursor_value: Some(v.to_string()),
@@ -171,32 +212,10 @@ pub(crate) fn read_keyset_page_bounded(
         &mut sink,
     )?;
     sink.finish_writer()?;
-    let rows = sink.total_rows;
-    if rows == 0 {
+    if sink.total_rows == 0 {
         return Ok(None); // range exhausted, or an exact-multiple last page
     }
-    let observed = sink.take_observations();
-    // Shared commit path (I1→I2→I7 + counters + journal + fault hooks).
-    // write_sink_parts drains every part the sink produced — the final temp file
-    // plus anything maybe_split rotated at max_file_size — so rotation can't drop.
-    let mut parts = Vec::new();
-    super::commit::write_sink_parts(
-        dest,
-        &mut sink,
-        plan.validate.then_some(plan.format),
-        |idx, count| super::commit::part_indexed_name(part_base, idx, count),
-        &mut parts,
-    )?;
-    Ok(Some(KeysetPage {
-        parts,
-        rows,
-        observed,
-        // The source's own lossless token (Mongo BSON `_id`) when it reported
-        // one, else the column-extracted string (every SQL engine).
-        next_cursor: sink.effective_cursor(),
-        first_cursor: sink.first_cursor_value.clone(),
-        checksums: sink.take_checksums(),
-    }))
+    Ok(Some(sink))
 }
 
 /// The 0-indexed ROW offset of the i-th of `parts` percentile boundaries over `total`
@@ -627,7 +646,7 @@ fn run_keyset_parallel(
                         "{}_{}_pk_w{}_{}.{}",
                         plan_r.export_name, tag_r, ridx, pages, ext_r
                     );
-                    let page = read_keyset_page_bounded(
+                    let (parts, page) = read_keyset_page_bounded(
                         &mut *wsrc,
                         plan_r,
                         key_plan_r,
@@ -636,18 +655,24 @@ fn run_keyset_parallel(
                         hi.as_deref(),
                         &**dest,
                         &base,
-                    )
-                    .map_err(|e| anyhow::anyhow!("page {pages}: {e:#}"))?;
-                    let Some(page) = page else { break };
-                    fan_r.observe(page.observed);
-                    rmax = page.next_cursor.clone().or(rmax);
-                    for p in &page.parts {
+                    );
+                    // The parquet is durable the moment `read_keyset_page_bounded`
+                    // returns — publish its parts now, before the range commits and
+                    // before a failed page's error propagates, so a range that later
+                    // fails still counts them (#200-1). Cursor and checksums stay
+                    // commit-gated below.
+                    for p in parts {
                         range_parts.push(crate::state::KeysetRangePart {
                             file_name: p.file_name.clone(),
                             rows: p.rows,
                             bytes: p.bytes as i64,
                         });
+                        fan_r.part(unit, p);
                     }
+                    let page = page.map_err(|e| anyhow::anyhow!("page {pages}: {e:#}"))?;
+                    let Some(page) = page else { break };
+                    fan_r.observe(page.observed);
+                    rmax = page.next_cursor.clone().or(rmax);
                     if ridx == 0 {
                         // Range 0 is the LOWEST range: its first key is the
                         // run's observed floor (#151).
@@ -656,36 +681,29 @@ fn run_keyset_parallel(
                             *first = page.first_cursor.clone();
                         }
                     }
-                    // The parquet is durable the moment `read_keyset_page_bounded`
-                    // returns — publish its parts now, before the range commits, so
-                    // a range that later fails still counts them (#200-1). Cursor
-                    // and checksums stay commit-gated below.
-                    for p in page.parts {
-                        fan_r.part(unit, p);
-                    }
                     local_checks.push(page.checksums);
-                    let last_page = is_last_page(page.rows, page_size);
-                    if !last_page {
-                        let next = page.next_cursor.ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "could not advance the '{key_r}' cursor at page {pages} \
-                                 (NULL or unsupported type)"
-                            )
-                        })?;
-                        ensure_cursor_advanced(cursor.as_deref(), &next, key_r, pages)?;
-                        cursor = Some(next);
-                    }
+                    let next = next_seek(
+                        cursor.as_deref(),
+                        page.rows,
+                        page_size,
+                        page.next_cursor,
+                        key_r,
+                        pages,
+                        &format!("export '{}'", plan_r.export_name),
+                    )?;
                     pages += 1;
-                    if last_page {
-                        break;
+                    match next {
+                        Some(n) => cursor = Some(n),
+                        None => break,
                     }
                 }
                 // Atomic checkpoint: the range's parts → file_log AND `done=1` in one
                 // transaction (checkpoint runs only). A crash before this leaves the
                 // range `done=0` with no file_log rows — re-read on resume.
                 if let Some(sref) = sref_r {
-                    crate::state::StateStore::commit_keyset_range_at_ref(
-                        sref,
+                    let st = crate::state::StateStore::open_at_ref(sref)
+                        .map_err(|e| anyhow::anyhow!("checkpoint commit: {e:#}"))?;
+                    st.commit_keyset_range(
                         rid_r,
                         &plan_r.export_name,
                         ridx as i64,
@@ -694,24 +712,20 @@ fn run_keyset_parallel(
                         Some(cmp_r),
                     )
                     .map_err(|e| anyhow::anyhow!("checkpoint commit: {e:#}"))?;
-                }
-                // Project the in-flight `running` aggregate from file_log (#173):
-                // best-effort observability, never gates the checkpoint above.
-                if let Some(sref) = sref_r
-                    && let Err(e) = crate::state::StateStore::open_at_ref(sref).and_then(|st| {
-                        st.project_running_aggregate(
-                            rid_r,
-                            &plan_r.export_name,
-                            plan_r.strategy.mode_label(),
-                            plan_r.format.label(),
-                        )
-                    })
-                {
-                    log::warn!(
-                        "export '{}': running-aggregate projection failed for range {ridx} \
-                         (checkpoint is durable; metrics row will catch up at finalize): {e:#}",
-                        plan_r.export_name
-                    );
+                    // Project the in-flight `running` aggregate from file_log (#173):
+                    // best-effort observability, never gates the checkpoint above.
+                    if let Err(e) = st.project_running_aggregate(
+                        rid_r,
+                        &plan_r.export_name,
+                        plan_r.strategy.mode_label(),
+                        plan_r.format.label(),
+                    ) {
+                        log::warn!(
+                            "export '{}': running-aggregate projection failed for range {ridx} \
+                             (checkpoint is durable; metrics row will catch up at finalize): {e:#}",
+                            plan_r.export_name
+                        );
+                    }
                 }
                 // Crash simulation: this range is now durably `done` in the state DB,
                 // but the run has NOT finalized — a resume must skip it (rehydrate its
@@ -760,9 +774,6 @@ fn run_keyset_parallel(
 
     // Merge into the summary through the shared seams (identical to the sequential
     // runner's per-page path, folded run-wide).
-    if plan.validate {
-        summary.validated = Some(true);
-    }
     // cursor_high = the highest populated range's max (forensics v18); see range_max.
     summary.cursor_high =
         highest_range_max(range_max.into_inner().unwrap_or_else(|e| e.into_inner()));
@@ -817,20 +828,34 @@ fn fan_out_collapsed(parallel: usize, total_ranges: usize) -> bool {
     parallel > 1 && total_ranges == 1
 }
 
-/// Refuse a full page whose last key renders equal to the previous bound: the seek would re-read it for ever.
-fn ensure_cursor_advanced(prev: Option<&str>, next: &str, key: &str, page: usize) -> Result<()> {
+/// The seek bound after a page: `None` on a short (last) page, else its max key — refusing a missing or non-advancing one.
+pub(crate) fn next_seek(
+    prev: Option<&str>,
+    rows: usize,
+    page_size: usize,
+    next: Option<String>,
+    key: &str,
+    page: usize,
+    who: &str,
+) -> Result<Option<String>> {
+    if rows < page_size {
+        return Ok(None);
+    }
+    let Some(next) = next else {
+        anyhow::bail!(
+            "{who}: keyset could not read the '{key}' value from the last row of page {page} \
+             (NULL or unsupported type) — cannot advance safely (last readable key: {}). \
+             The key must be NOT NULL and one of: integer, float, string, timestamp, date, uuid.",
+            prev.unwrap_or("<none>"),
+        );
+    };
     anyhow::ensure!(
-        prev != Some(next),
+        prev != Some(next.as_str()),
         "keyset page {page} ended on the same '{key}' value it started after ({next}): the key's \
          rendering is coarser than its values (e.g. a TIMESTAMP(7..9) read at microseconds), so the \
          seek cannot advance. Page on a unique key rivet reads exactly."
     );
-    Ok(())
-}
-
-/// A short page means the key range is exhausted.
-fn is_last_page(rows: usize, page_size: usize) -> bool {
-    rows < page_size
+    Ok(Some(next))
 }
 
 /// Whether a crash anchor was written by this runner shape: only a parallel run persists ranges for it.
@@ -1066,7 +1091,7 @@ pub(crate) fn run_keyset(
             seek_tag(last.as_deref()),
             ext
         );
-        let Some(mut page) = read_keyset_page(
+        let (parts, page) = read_keyset_page(
             src,
             plan,
             &key_plan,
@@ -1074,8 +1099,30 @@ pub(crate) fn run_keyset(
             last.as_deref(),
             dest.as_ref(),
             &base,
-        )?
-        else {
+        );
+        let page = match page {
+            Ok(page) => page,
+            Err(e) => {
+                // A page that failed part-way: its earlier parts are durable, so they
+                // are recorded (no cursor_high — the page never completed) before the
+                // error leaves, or `files_committed` under-counts for the retry guard.
+                for rec in &parts {
+                    super::commit::record_part(
+                        plan,
+                        summary,
+                        state,
+                        rec,
+                        super::commit::PartKind::Page {
+                            page_index: pages as i64,
+                            cursor_high: None,
+                        },
+                        super::commit::UnitId::Page(pages as i64),
+                    );
+                }
+                return Err(e);
+            }
+        };
+        let Some(mut page) = page else {
             // No further rows (the seek past the last full page came back empty):
             // the last advanced key is the run's high-water. This is the OTHER exit
             // from the short-page break below — a table whose size is an exact
@@ -1110,8 +1157,8 @@ pub(crate) fn run_keyset(
         // reconcile (above) means a committed page is never re-read, so a dedup normally fires only
         // in the mid-page-crash fallback (below); `record_part` counts each part's rows once, so a
         // deduped re-read of a rehydrated part adds nothing.
-        let n_parts = page.parts.len();
-        for (pi, rec) in page.parts.iter().enumerate() {
+        let n_parts = parts.len();
+        for (pi, rec) in parts.iter().enumerate() {
             // v25: stamp the page's high-water key ONLY on the LAST part's file_log row — the
             // point at which the WHOLE page is committed. On resume, `last` reconciles to the max
             // committed `cursor_high`, so a page that fully committed is skipped (never re-read →
@@ -1164,42 +1211,31 @@ pub(crate) fn run_keyset(
         );
         pages += 1;
 
-        // A short page means the index range is exhausted — stop without an
-        // extra empty round-trip.
-        if is_last_page(page.rows, kp.chunk_size) {
-            // Forensics (v18): the final page's max key is the run's true high-water.
-            // Record it BEFORE breaking — the loop stops without advancing `last`, so
-            // a short tail page (e.g. the 3 u64 ids above i64::MAX) is captured yet
-            // would otherwise be invisible in cursor_max. `.or(last)` covers an EMPTY
-            // final page, whose max is the previous full page's key.
-            summary.cursor_high = page.next_cursor.clone().or_else(|| last.clone());
-            break;
-        }
-        // Advance to the page's max key; if it could not be read (NULL or an
-        // unsupported type), we must NOT loop on the same bound — that would
-        // re-read the same page forever.
-        match page.next_cursor {
-            Some(v) => {
-                ensure_cursor_advanced(last.as_deref(), &v, &kp.key_column, pages - 1)?;
-                last = Some(v)
+        // Forensics (v18): a short final page's max key (or, if empty, the previous
+        // page's) is the run's true high-water; an unreadable key stamps the LAST key
+        // read, bracketing the value that broke advancing.
+        let high = page.next_cursor.clone().or_else(|| last.clone());
+        let unreadable = page.next_cursor.is_none().then(|| last.clone());
+        let next = next_seek(
+            last.as_deref(),
+            page.rows,
+            kp.chunk_size,
+            page.next_cursor,
+            &kp.key_column,
+            pages - 1,
+            &format!("export '{}'", plan.export_name),
+        )
+        .inspect_err(|_| {
+            if let Some(l) = unreadable {
+                summary.offending_value = l.clone();
+                summary.cursor_high = l;
             }
+        })?;
+        match next {
+            Some(v) => last = Some(v),
             None => {
-                // Failure forensics (v18): stamp the LAST key we did read — the
-                // boundary just before the unadvanceable row. With `cursor_high`
-                // (the table's max key) this brackets the value that broke
-                // advancing (e.g. a u64 in the zone above i64::MAX), so a failed
-                // `export_metrics` row explains itself without the source.
-                summary.offending_value = last.clone();
-                summary.cursor_high = last.clone();
-                anyhow::bail!(
-                    "export '{}': keyset could not read the '{}' value from the last row of page {} \
-                     (NULL or unsupported type) — cannot advance safely (last readable key: {}). \
-                     The key must be NOT NULL and one of: integer, float, string, timestamp, date, uuid.",
-                    plan.export_name,
-                    kp.key_column,
-                    pages - 1,
-                    last.as_deref().unwrap_or("<none>"),
-                );
+                summary.cursor_high = high;
+                break;
             }
         }
     }
@@ -1329,19 +1365,41 @@ mod tests {
     use super::*;
     use crate::config::SourceType;
 
+    /// `next_seek` over a full page with the given bounds.
+    fn seek(prev: Option<&str>, next: Option<&str>) -> Result<Option<String>> {
+        next_seek(prev, 3, 3, next.map(str::to_string), "ID", 1, "export 'x'")
+    }
+
     #[test]
     fn a_page_that_ends_on_its_start_bound_is_refused() {
-        assert!(
-            ensure_cursor_advanced(
-                Some("2024-01-01T00:00:00.123456"),
-                "2024-01-01T00:00:00.123456",
-                "T9",
-                3
-            )
-            .is_err()
+        let ts = "2024-01-01T00:00:00.123456";
+        assert!(next_seek(Some(ts), 3, 3, Some(ts.into()), "T9", 3, "export 'x'").is_err());
+        assert_eq!(seek(Some("7"), Some("14")).unwrap().as_deref(), Some("14"));
+        assert_eq!(seek(None, Some("7")).unwrap().as_deref(), Some("7"));
+    }
+
+    #[test]
+    fn a_short_page_is_the_last_even_without_a_key() {
+        assert_eq!(
+            next_seek(Some("7"), 2, 3, None, "ID", 1, "export 'x'").unwrap(),
+            None
         );
-        assert!(ensure_cursor_advanced(Some("7"), "14", "ID", 1).is_ok());
-        assert!(ensure_cursor_advanced(None, "7", "ID", 0).is_ok());
+        assert_eq!(
+            next_seek(Some("7"), 2, 3, Some("7".into()), "ID", 1, "x").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn an_unreadable_key_error_is_classified_and_names_the_last_readable_key() {
+        let msg = seek(Some("7"), None).unwrap_err().to_string();
+        assert_eq!(
+            crate::pipeline::job::classify_error_message(&msg),
+            Some("keyset_unreadable_key"),
+            "{msg}"
+        );
+        assert!(msg.contains("last readable key: 7"), "{msg}");
+        assert!(msg.starts_with("export 'x': "), "{msg}");
     }
 
     // ── seek_tag: the sequential-checkpoint part-name identity ────────────────
@@ -1456,12 +1514,6 @@ mod tests {
     }
 
     #[test]
-    fn a_short_page_is_the_last() {
-        assert!(is_last_page(2, 3));
-        assert!(!is_last_page(3, 3), "a full page may have a successor");
-    }
-
-    #[test]
     fn keyset_seeks_from_the_cursor_only_for_recovery_or_incremental() {
         assert!(
             seeks_from_persisted_cursor(true, true, false),
@@ -1545,5 +1597,75 @@ mod tests {
             }
             prop_assert_eq!(ranges[ranges.len() - 1].2.as_deref(), ceil.as_deref());
         });
+    }
+
+    /// A source whose page is three rows over three distinct days of `d`.
+    struct ThreeDays;
+    impl Source for ThreeDays {
+        fn export(
+            &mut self,
+            _request: &source::ExportRequest<'_>,
+            sink: &mut dyn source::BatchSink,
+        ) -> Result<()> {
+            use arrow::datatypes::{DataType, Field, Schema};
+            let schema =
+                std::sync::Arc::new(Schema::new(vec![Field::new("d", DataType::Date32, true)]));
+            sink.on_schema(schema.clone())?;
+            let days = arrow::array::Date32Array::from(vec![0, 1, 2]);
+            sink.on_batch(&arrow::record_batch::RecordBatch::try_new(
+                schema,
+                vec![std::sync::Arc::new(days)],
+            )?)
+        }
+        fn query_scalar(&mut self, _sql: &str) -> Result<Option<String>> {
+            Ok(None)
+        }
+        fn type_mappings(
+            &mut self,
+            _query: &str,
+            _overrides: &crate::types::ColumnOverrides,
+        ) -> Result<Vec<crate::types::TypeMapping>> {
+            Ok(vec![])
+        }
+    }
+
+    /// A page the sink rotated hands back the part that landed before a later part failed.
+    #[test]
+    fn a_page_that_fails_part_way_still_hands_back_its_durable_part() {
+        let mut plan = crate::pipeline::commit::tests::test_plan();
+        plan.partition_rollover = Some(crate::plan::rollover::PartitionRollover {
+            column: "d".into(),
+            granularity: crate::config::load::Granularity::Day,
+            cap: 1,
+        });
+        let key = IncrementalCursorPlan {
+            primary_column: "d".into(),
+            fallback_column: None,
+            mode: IncrementalCursorMode::SingleColumn,
+            settle: None,
+        };
+        let dest = crate::pipeline::commit::tests::NthWriteFails::after(1);
+        let (parts, page) = read_keyset_page_bounded(
+            &mut ThreeDays,
+            &plan,
+            &key,
+            10,
+            None,
+            None,
+            &dest,
+            "k.parquet",
+        );
+        assert!(
+            page.is_err(),
+            "the refused second part is the page's outcome"
+        );
+        assert_eq!(
+            parts
+                .iter()
+                .map(|p| p.file_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["k_p0.parquet"],
+            "the durable first part must survive the failure"
+        );
     }
 }

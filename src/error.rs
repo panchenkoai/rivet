@@ -57,6 +57,32 @@ impl ExitClass {
     pub fn code(self) -> i32 {
         self as i32
     }
+
+    /// How stop-worthy this class is when choosing one exit among many failures: integrity > internal > refusal > drift > retryable > generic.
+    pub fn stop_rank(self) -> u8 {
+        match self {
+            ExitClass::Generic => 0,
+            ExitClass::Retryable => 1,
+            ExitClass::SchemaDrift => 2,
+            ExitClass::Refusal => 3,
+            ExitClass::Internal => 4,
+            ExitClass::DataIntegrity => 5,
+        }
+    }
+
+    /// The class a process exit code names, `None` for a signal or unknown code.
+    pub fn from_code(code: i32) -> Option<Self> {
+        [
+            ExitClass::Generic,
+            ExitClass::Retryable,
+            ExitClass::DataIntegrity,
+            ExitClass::SchemaDrift,
+            ExitClass::Refusal,
+            ExitClass::Internal,
+        ]
+        .into_iter()
+        .find(|c| c.code() == code)
+    }
 }
 
 /// Typed marker for a **data-integrity** failure (exit `3`).
@@ -263,31 +289,36 @@ pub fn classify_exit(err: &anyhow::Error) -> i32 {
     if let Some(p) = err.downcast_ref::<PreclassifiedExit>() {
         return p.0;
     }
+    if let Some(c) = stop_class(err) {
+        return c.code();
+    }
+    if crate::pipeline::retry::classify_error(err).is_transient() {
+        return ExitClass::Retryable.code();
+    }
+    ExitClass::Generic.code()
+}
+
+/// The class a typed stop marker in the chain fixes regardless of wording; `None` leaves it to the transient check.
+pub(crate) fn stop_class(err: &anyhow::Error) -> Option<ExitClass> {
     if err.downcast_ref::<SchemaDriftError>().is_some() {
-        return ExitClass::SchemaDrift.code();
+        return Some(ExitClass::SchemaDrift);
     }
     if err.downcast_ref::<DataIntegrityError>().is_some()
         || err
             .downcast_ref::<crate::manifest::ManifestInconsistency>()
             .is_some()
     {
-        return ExitClass::DataIntegrity.code();
+        return Some(ExitClass::DataIntegrity);
     }
-    // A registered code decides by its kind; an environment failure still goes through the
-    // transient check below (a dropped connection retries, a denied permission does not).
-    if let Some(c) = err.downcast_ref::<CodedError>() {
-        match c.kind() {
-            ErrorKind::Refusal => return ExitClass::Refusal.code(),
-            ErrorKind::Internal => return ExitClass::Internal.code(),
-            ErrorKind::Integrity => return ExitClass::DataIntegrity.code(),
-            ErrorKind::Usage => return ExitClass::Generic.code(),
-            ErrorKind::Environment => {}
-        }
+    // An environment failure still goes through the transient check (a dropped
+    // connection retries, a denied permission does not).
+    match err.downcast_ref::<CodedError>()?.kind() {
+        ErrorKind::Refusal => Some(ExitClass::Refusal),
+        ErrorKind::Internal => Some(ExitClass::Internal),
+        ErrorKind::Integrity => Some(ExitClass::DataIntegrity),
+        ErrorKind::Usage => Some(ExitClass::Generic),
+        ErrorKind::Environment => None,
     }
-    if crate::pipeline::retry::classify_error(err).is_transient() {
-        return ExitClass::Retryable.code();
-    }
-    ExitClass::Generic.code()
 }
 
 /// Stable, greppable error codes carried by [`CodedError`]. A scheduler / CI step
@@ -355,6 +386,11 @@ pub mod codes {
         "RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED",
         "use a mode this source supports (MongoDB: `full`)",
     );
+    /// A raw `url:` whose scheme names a different engine than `source.type`.
+    pub const CONFIG_SOURCE_URL_SCHEME_MISMATCH: Code = usage(
+        "RIVET_CONFIG_SOURCE_URL_SCHEME_MISMATCH",
+        "make `source.type` and the URL scheme name the same engine",
+    );
     /// A statement that ran past the configured duration cap, carried by the existing
     /// `source::StatementDurationTimeout` marker (recognised in [`super::error_code`]).
     pub const SOURCE_STATEMENT_TIMEOUT: Code = environment(
@@ -412,6 +448,11 @@ pub mod codes {
         "RIVET_SOURCE_CDC_UNDECODABLE",
         "re-snapshot the table: delete the checkpoint first so the stream anchors, then snapshot",
     );
+    /// A captured cell holding a value the CDC decoder has no faithful reading for.
+    pub const SOURCE_CDC_CELL_UNSUPPORTED: Code = refusal(
+        "RIVET_SOURCE_CDC_CELL_UNSUPPORTED",
+        "leave the column out of the capture (SQL Server: @captured_column_list), then re-snapshot",
+    );
     pub const SOURCE_CDC_PREREQUISITE: Code = environment(
         "RIVET_SOURCE_CDC_PREREQUISITE",
         "apply the setup statement the message names, then re-run (docs/reference/cdc.md)",
@@ -452,12 +493,14 @@ pub mod codes {
         CONFIG_CDC_CONTINUOUS_UNSUPPORTED,
         CONFIG_CSV_LOAD_UNSUPPORTED,
         CONFIG_SOURCE_MODE_UNSUPPORTED,
+        CONFIG_SOURCE_URL_SCHEME_MISMATCH,
         SOURCE_STATEMENT_TIMEOUT,
         SOURCE_CURSOR_FINER_THAN_MICROSECOND,
         SOURCE_CDC_FOREIGN_CHECKPOINT,
         SOURCE_CDC_CHECKPOINT_INVALID,
         SOURCE_CDC_LOG_GAP,
         SOURCE_CDC_UNDECODABLE,
+        SOURCE_CDC_CELL_UNSUPPORTED,
         SOURCE_CDC_PREREQUISITE,
         STATE_SCHEMA_NEWER,
         STATE_CURSOR_OWNER_MISMATCH,
@@ -533,6 +576,39 @@ pub type Result<T> = anyhow::Result<T>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_exit_class_round_trips_through_its_code_and_ranks_distinctly() {
+        let all = [
+            ExitClass::Generic,
+            ExitClass::Retryable,
+            ExitClass::DataIntegrity,
+            ExitClass::SchemaDrift,
+            ExitClass::Refusal,
+            ExitClass::Internal,
+        ];
+        for c in all {
+            assert_eq!(ExitClass::from_code(c.code()), Some(c));
+        }
+        assert_eq!(ExitClass::from_code(0), None);
+        assert_eq!(ExitClass::from_code(143), None);
+        let ascending = [
+            ExitClass::Generic,
+            ExitClass::Retryable,
+            ExitClass::SchemaDrift,
+            ExitClass::Refusal,
+            ExitClass::Internal,
+            ExitClass::DataIntegrity,
+        ];
+        for w in ascending.windows(2) {
+            assert!(
+                w[0].stop_rank() < w[1].stop_rank(),
+                "{:?} !< {:?}",
+                w[0],
+                w[1]
+            );
+        }
+    }
 
     #[test]
     fn the_codes_table_renders_one_row_per_kind_with_its_exit() {

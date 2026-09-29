@@ -33,6 +33,13 @@ pub(crate) struct PartitionRange {
     pub(crate) hi: NaiveDate,
 }
 
+impl PartitionRange {
+    /// The half-open `[lo, hi)` bounds.
+    pub(crate) fn bounds(&self) -> (NaiveDate, NaiveDate) {
+        (self.lo, self.hi)
+    }
+}
+
 /// Generate the ordered, gap-free list of partition buckets covering
 /// `[min_day, max_day]` at `granularity`.
 ///
@@ -80,7 +87,7 @@ pub(crate) fn generate_ranges(
 pub(crate) fn build_range_query(
     base_query: &str,
     col: &str,
-    range: &PartitionRange,
+    (lo, hi): (NaiveDate, NaiveDate),
     source_type: SourceType,
 ) -> String {
     let q = crate::sql::quote_ident(source_type, col);
@@ -88,9 +95,21 @@ pub(crate) fn build_range_query(
         "SELECT * FROM ({base}) {d} WHERE {q} >= {lo} AND {q} < {hi}",
         base = base_query,
         d = crate::sql::derived(source_type, "_rivet_part"),
-        lo = date_literal(source_type, range.lo),
-        hi = date_literal(source_type, range.hi),
+        lo = date_literal(source_type, lo),
+        hi = date_literal(source_type, hi),
     )
+}
+
+/// Restrict `base_query` to one partition child's bucket (range or NULL).
+pub(crate) fn apply_bucket(
+    base_query: &str,
+    window: &crate::config::PartitionSynth,
+    source_type: SourceType,
+) -> String {
+    match window.range {
+        Some(bounds) => build_range_query(base_query, &window.column, bounds, source_type),
+        None => build_null_query(base_query, &window.column, source_type),
+    }
 }
 
 /// A date bound as a SQL literal this engine parses regardless of session settings;
@@ -327,7 +346,7 @@ mod tests {
         let q = build_range_query(
             "SELECT * FROM events",
             "created_at",
-            &one_day("2023-01-03"),
+            one_day("2023-01-03").bounds(),
             SourceType::Postgres,
         );
         assert_eq!(
@@ -342,7 +361,7 @@ mod tests {
         let q = build_range_query(
             "SELECT * FROM events",
             "created_at",
-            &one_day("2023-01-03"),
+            one_day("2023-01-03").bounds(),
             SourceType::Mysql,
         );
         assert!(q.contains("WHERE `created_at` >= '2023-01-03' AND `created_at` < '2023-01-04'"));
@@ -398,7 +417,12 @@ mod date_literal_dialect_tests {
             label_value: "2024-03".to_string(),
         };
 
-        let mssql = build_range_query("SELECT * FROM t", "created_at", &range, SourceType::Mssql);
+        let mssql = build_range_query(
+            "SELECT * FROM t",
+            "created_at",
+            range.bounds(),
+            SourceType::Mssql,
+        );
         assert!(
             mssql.contains("'20240305'") && mssql.contains("'20240401'"),
             "SQL Server bounds must be DATEFORMAT-immune: {mssql}"
@@ -409,7 +433,7 @@ mod date_literal_dialect_tests {
         );
 
         for engine in [SourceType::Postgres, SourceType::Mysql] {
-            let q = build_range_query("SELECT * FROM t", "created_at", &range, engine);
+            let q = build_range_query("SELECT * FROM t", "created_at", range.bounds(), engine);
             assert!(
                 q.contains("'2024-03-05'") && q.contains("'2024-04-01'"),
                 "{engine:?} parses ISO-with-dashes unambiguously and must keep it: {q}"

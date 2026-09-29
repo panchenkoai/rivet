@@ -125,6 +125,10 @@ pub fn should_retry(a: Attempt<'_>) -> bool {
 }
 
 pub fn classify_error(err: &anyhow::Error) -> RetryClass {
+    // A typed stop (drift, integrity, a non-environment code) is permanent, whatever its text says.
+    if crate::error::stop_class(err).is_some() {
+        return PERMANENT;
+    }
     // --- Typed marker: rivet-raised statement-duration timeout (deterministic) ---
     // Downcast the TYPE so permanence does not depend on the Display wording.
     if err
@@ -914,5 +918,47 @@ mod tests {
                 msg
             );
         }
+    }
+
+    #[test]
+    fn a_typed_integrity_stop_is_never_retried_even_if_its_text_says_timeout() {
+        let err: anyhow::Error =
+            crate::error::DataIntegrityError::new(crate::quality::failure_message(
+                "session_timeouts",
+                None,
+                &["column 'timeout_ms': 3 duplicate values"],
+            ))
+            .into();
+        assert!(!classify_error(&err).is_transient());
+        assert!(!should_retry(Attempt {
+            attempt: 0,
+            max_retries: 3,
+            error: &err,
+        }));
+    }
+
+    #[test]
+    fn a_typed_drift_stop_is_never_retried_even_if_its_text_says_dns() {
+        let err: anyhow::Error = crate::error::SchemaDriftError::new(
+            "schema drift detected for export 'dns_records': column added",
+        )
+        .into();
+        assert!(!classify_error(&err).is_transient());
+    }
+
+    #[test]
+    fn a_coded_refusal_is_permanent_but_a_coded_environment_error_still_reads_its_text() {
+        let refused: anyhow::Error = crate::error::CodedError::new(
+            crate::error::codes::STATE_CURSOR_OWNER_MISMATCH,
+            "connection reset while the cursor is owned elsewhere",
+        )
+        .into();
+        assert!(!classify_error(&refused).is_transient());
+        let env: anyhow::Error = crate::error::CodedError::new(
+            crate::error::codes::SOURCE_STATEMENT_TIMEOUT,
+            "connection reset by peer",
+        )
+        .into();
+        assert!(classify_error(&env).is_transient());
     }
 }
