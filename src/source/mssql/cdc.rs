@@ -166,8 +166,8 @@ pub(crate) fn row_image_verdict(rows: &[String]) -> crate::source::cdc::RowImage
 ///   * `@start <= @from < @min` — the position was inside the instance's lifetime
 ///     and the cleanup job removed it. That IS loss, and the THROW is right.
 ///
-/// Without the first case the anchor wedged a brand-new export permanently, and
-/// KNOWN GAP, measured and deliberately left in place — see the decision below.
+/// Without the first case the anchor wedged a brand-new export permanently. But
+/// the server's LSNs alone cannot draw that line:
 ///
 /// The floor `IF @from < @start SET @from = @min` rescues a brand-new export
 /// whose anchor had been pinned at the DATABASE-wide
@@ -183,24 +183,13 @@ pub(crate) fn row_image_verdict(rows: &[String]) -> crate::source::cdc::RowImage
 /// skipping every change in between. That is the thing its own message promises
 /// not to do.
 ///
-/// Half of it is fixed at the cause: `pin_checkpoint_at_instance_start` now
-/// anchors at the INSTANCE's watermark (its `start_lsn` while the capture job has
-/// not published a `min_lsn` yet) instead of the database max, so a FRESH export
-/// no longer lands below its own instance and no longer needs rescuing.
-///
-/// The floor stays because a checkpoint written by an EARLIER rivet was pinned at
-/// the database max and can still sit below `@min` — and from LSNs alone the two
-/// causes are indistinguishable once `start_lsn` moves: "the instance is newer
-/// than this position" (floor is right, THROW would wedge the export) and "the
-/// cleanup job purged past this position" (THROW is right, floor silently skips).
-///
-/// The discriminator does not exist on the server; it exists in rivet. A
-/// checkpoint is either a PIN (written by `ensure_anchor` before anything was
-/// captured) or a RESUME position (written after a flush). Recording which — an
-/// optional field, so old files still load — lets the poll floor a pin and throw
-/// on a resume. What legacy checkpoints without the field should default to is a
-/// real decision with a cost either way (a false alarm that wedges an export, or
-/// a silent skip), which is why this is documented rather than guessed.
+/// Fresh anchors are still pinned at the database max (`pin_checkpoint_at_max_lsn`),
+/// so the floor is needed for EVERY pin, fresh or legacy — and only for pins. From
+/// LSNs alone "the instance is newer than this position" (floor is right) and "the
+/// cleanup job purged past it" (THROW is right) are indistinguishable once
+/// `start_lsn` moves; rivet tells them apart by the checkpoint's `pinned` flag
+/// (`from_is_pin`, cleared by `advance_cursor` on the first real read). A resume
+/// position, or a legacy checkpoint without the field, takes the THROW.
 /// What one poll needs to know. A parameter object rather than five positional
 /// arguments, because four of them are `&str`/`Option`/`bool` in a row and the
 /// call site said nothing: `fill_sql(ci, expr, 500, None, false)` gives a reader
