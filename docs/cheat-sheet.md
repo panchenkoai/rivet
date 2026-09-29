@@ -37,7 +37,8 @@ to the matching setup. Skip any step you have already done.
   `aws_profile:`. Export temporary credentials instead (the `sso` option above).
 - Temporary AWS keys expire, usually after about an hour. Re-run the
   `export-credentials` line before the next run.
-- `rivet load` reads **GCS only**: both BigQuery and Snowflake need `destination: type: gcs`.
+- BigQuery and Snowflake loads read **GCS only** (`destination: type: gcs`). A ClickHouse
+  load reads GCS, S3 or Azure.
 - `rivet doctor -c rivet.yaml` confirms the credentials can write to the prefix.
   On cloud storage it leaves a `.rivet_doctor_probe` object behind.
 
@@ -59,6 +60,8 @@ More auth paths (MinIO, Azurite, SAS details): [cloud-auth.md](cloud-auth.md) ·
 - **Snowflake:** database, schema and storage integration must already exist.
   rivet creates the file format, stage, tables and views itself, which is why the
   role needs the `CREATE` grants above.
+- **ClickHouse** (preview): the database must already exist. rivet creates the tables
+  and views over HTTP. Known limits: [recipes/clickhouse-load.md](recipes/clickhouse-load.md).
 
 ---
 
@@ -197,17 +200,21 @@ that drives everything** — the exports, the top-level `load:` block, and the
 base-and-buffer layout `rivet compact` needs. Nothing is hand-added afterwards.
 
 ```bash
-rivet init --source-env DATABASE_URL --table {{TABLE}} --mode incremental --tls {{TLS}} \
-  --gcs-bucket {{BUCKET}} --bigquery-project {{BQ_PROJECT}} --bigquery-dataset {{BQ_DATASET}} -o rivet.yaml
-rivet init --source-env DATABASE_URL --mode cdc --tls {{TLS}} \
-  --gcs-bucket {{BUCKET}} --bigquery-project {{BQ_PROJECT}} --bigquery-dataset {{BQ_DATASET}} -o rivet.yaml
+rivet init --source-env DATABASE_URL --table {{TABLE}} --mode incremental --tls {{TLS}}{{INIT_LOAD}} -o rivet.yaml
+rivet init --source-env DATABASE_URL --mode cdc --tls {{TLS}}{{INIT_LOAD}} -o rivet.yaml
                                                # whole DB: one `tables:` stream with backfill: auto
 
 rivet doctor  -c rivet.yaml    # source + destination auth
 rivet run     -c rivet.yaml    # Parquet → gs://{{BUCKET}}/exports/{{TABLE}}/
 rivet load    -c rivet.yaml    # → the base on the first pass, the buffer on later ones
-rivet compact -c rivet.yaml    # MERGE the buffer into the base, drop the buffer
+rivet compact -c rivet.yaml    # BigQuery: MERGE the buffer into the base, drop the buffer
 ```
+
+- **ClickHouse:** the cycle is `run` + `load` only. The change log is a
+  `ReplacingMergeTree`, the view reads it with `FINAL`, and `rivet compact` does nothing.
+  The generated block carries no `layout:` and no `partition:`.
+- **Snowflake:** `rivet init` has no Snowflake flags. Scaffold with `--gcs-bucket` and
+  add the `load:` block from §3.
 
 Every value in the generated `load:` block is a guess from the catalog — review it
 before the first load. It carries `target: bigquery`, `pk: auto`, `cluster_by: auto`,
@@ -217,8 +224,9 @@ on every update); and, for a mode that carries deltas (`incremental`, `cdc`),
 `layout: base_buffer` so `compact` has a base to merge into. Field-by-field reference:
 §3 below.
 
-> `--gcs-bucket` is required with the BigQuery flags: `rivet load` reads GCS only, so a
+> `--gcs-bucket` is required with the BigQuery flags: a BigQuery load reads GCS only, so a
 > `load:` block over a local or S3 destination is a config its own next step refuses.
+> The ClickHouse flags take `--gcs-bucket` or `--s3-bucket`.
 > On a whole-database CDC scaffold the partition guesses land on the stream's
 > `load.tables.<table>` blocks — the place the load reads them — not on the per-table
 > recipes, which the load never reads.
@@ -349,7 +357,7 @@ Recovery:
 
 ---
 
-## 3. Load (BigQuery / Snowflake)
+## 3. Load (BigQuery / Snowflake / ClickHouse)
 
 Put a top-level `load:` block in the **same** config. The load reads column types
 from the state DB and never connects to the source. An Oracle `mode: cdc` export
@@ -360,8 +368,8 @@ cannot feed a `load:` block yet (refused at config load). An Oracle batch export
 load:
   {{LOAD_TARGET}}
   pk: auto                      # auto (recorded source PK) | none | [col, ...]   — incremental/cdc dedup key
-  cluster_by: auto              # auto | none | [col, ...]  (≤4 on BigQuery)
-  partition:                    # none (default) | exactly one of column / range / ingestion
+  cluster_by: auto              # auto | none | [col, ...]  (≤4 on BigQuery; a full-load table's ORDER BY on ClickHouse)
+  partition:                    # none (default) | exactly one of column / range / ingestion. Not on ClickHouse
     column: {{CURSOR}}
     granularity: day            # hour | day | month | year
     # range: { column: n, start: 0, end: 1000000, interval: 1000 }
@@ -385,7 +393,9 @@ exports:
 
 Required target fields: BigQuery takes `project` and `dataset`. Snowflake takes
 `connection` (a `snow` CLI connection), `warehouse`, `database`, `schema` and
-`storage_integration`.
+`storage_integration`. ClickHouse takes `url`, `database`, `user` and `password_env`,
+plus an optional `named_collection` (ClickHouse then reads the bucket itself). ClickHouse
+refuses `partition:`, `layout: base_buffer` and a MongoDB CDC stream.
 
 ```bash
 rivet run  -c rivet.yaml              # extract → bucket

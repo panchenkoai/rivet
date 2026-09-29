@@ -45,7 +45,7 @@
       ['ckpt', 'Checkpoint dir', '/var/lib/rivet'],
     ]],
     ['Load', [
-      ['load', 'Target', ['bigquery', 'snowflake']],
+      ['load', 'Target', ['bigquery', 'snowflake', 'clickhouse']],
       ['dataset', 'Dataset', 'analytics', { load: ['bigquery'] }],
       ['sf_conn', 'snow connection', 'my_conn', { load: ['snowflake'] }],
       ['sf_wh', 'Warehouse', 'COMPUTE_WH', { load: ['snowflake'] }],
@@ -53,6 +53,9 @@
       ['sf_schema', 'Schema', 'PUBLIC', { load: ['snowflake'] }],
       ['sf_int', 'Integration', 'MY_GCS_INT', { load: ['snowflake'] }],
       ['sf_role', 'Role', 'RIVET_ROLE', { load: ['snowflake'] }],
+      ['ch_url', 'ClickHouse URL', 'http://clickhouse:8123', { load: ['clickhouse'] }],
+      ['ch_db', 'Database', 'raw', { load: ['clickhouse'] }],
+      ['ch_user', 'User', 'loader', { load: ['clickhouse'] }],
     ]],
   ];
 
@@ -172,7 +175,15 @@
 
   function loadSetup(t) {
     const { bucket, p, member } = t;
-    const warn = g('dest') === 'gcs' ? [] : ['# ⚠ rivet load reads GCS only: set Destination type to gcs', ''];
+    if (g('load') === 'clickhouse') {
+      return [
+        ...(g('dest') === 'local' ? ['# ⚠ a ClickHouse load reads GCS, S3 or Azure: set Destination type to one of them', ''] : []),
+        '# The ClickHouse database and the load user are created by the SQL below (as an admin)',
+        "printf 'ClickHouse password: '; read -rs CLICKHOUSE_PASSWORD; echo; export CLICKHOUSE_PASSWORD",
+        `curl -sS -u "${g('ch_user')}:$CLICKHOUSE_PASSWORD" '${g('ch_url')}/?query=SELECT%20version()'   # reachable + auth ok`,
+      ].join('\n');
+    }
+    const warn = g('dest') === 'gcs' ? [] : ['# ⚠ BigQuery and Snowflake loads read GCS only: set Destination type to gcs', ''];
     const conn = g('sf_conn');
     const lines = g('load') === 'bigquery'
       ? [
@@ -200,6 +211,17 @@
   }
 
   function loadSql(t) {
+    if (g('load') === 'clickhouse') {
+      const db = g('ch_db'), u = g('ch_user');
+      return [
+        '-- Once, as a ClickHouse admin. rivet does not create the database',
+        `CREATE DATABASE IF NOT EXISTS ${db};`,
+        `CREATE USER IF NOT EXISTS ${u} IDENTIFIED BY '<password>';`,
+        'GRANT SELECT, INSERT, ALTER ADD COLUMN, CREATE TABLE, DROP TABLE,',
+        `      CREATE VIEW, DROP VIEW ON ${db}.* TO ${u};`,
+        `-- optional pull through a named collection: GRANT NAMED COLLECTION ON <name> TO ${u};`,
+      ].join('\n');
+    }
     if (g('load') === 'bigquery') return '-- BigQuery needs no SQL setup: the dataset and grants are in the bash block above.';
     const si = g('sf_int'), db = g('sf_db'), sc = `${g('sf_db')}.${g('sf_schema')}`, role = g('sf_role');
     return [
@@ -222,7 +244,7 @@
 
   function tokens() {
     const e = g('engine'), t = g('table'), n = name(g), bucket = g('bucket'), user = g('user');
-    const db = g('db'), schema = g('schema'), bq = g('load') === 'bigquery', p = g('project');
+    const db = g('db'), schema = g('schema'), bq = g('load') === 'bigquery', ch = g('load') === 'clickhouse', p = g('project');
     const sa = `rivet@${p}.iam.gserviceaccount.com`;
     const member = g('gcp_auth') === 'adc' ? 'user:$(gcloud config get-value account)' : `serviceAccount:${sa}`;
     const s3auth = ({
@@ -276,12 +298,20 @@
           `ALTER TABLE ${t.includes('.') ? t : `${schema}.${t}`} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;\n` +
           `GRANT SELECT ON ${t.includes('.') ? t : `${schema}.${t}`} TO ${user};`,
       })[e] || `-- MongoDB: connect to a replica set; ${user} needs the read role on ${db}`,
-      LOAD_TARGET: (bq
-        ? ['target: bigquery', `project: ${p}`, `dataset: ${g('dataset')}`]
-        : ['target: snowflake', `connection: ${g('sf_conn')}`, `warehouse: ${g('sf_wh')}`, `database: ${g('sf_db')}`,
-          `schema: ${g('sf_schema')}`, `storage_integration: ${g('sf_int')}`]).join('\n  '),
-      WAREHOUSE_TABLE: bq ? `${p}.${g('dataset')}.${n}` : `${g('sf_db')}.${g('sf_schema')}.${n}`,
-      WAREHOUSE_SQL: bq ? `\`${p}.${g('dataset')}.${n}\`` : `${g('sf_db')}.${g('sf_schema')}.${n}`,
+      LOAD_TARGET: (ch
+        ? ['target: clickhouse', `url: ${g('ch_url')}`, `database: ${g('ch_db')}`, `user: ${g('ch_user')}`,
+          'password_env: CLICKHOUSE_PASSWORD']
+        : bq
+          ? ['target: bigquery', `project: ${p}`, `dataset: ${g('dataset')}`]
+          : ['target: snowflake', `connection: ${g('sf_conn')}`, `warehouse: ${g('sf_wh')}`, `database: ${g('sf_db')}`,
+            `schema: ${g('sf_schema')}`, `storage_integration: ${g('sf_int')}`]).join('\n  '),
+      WAREHOUSE_TABLE: ch ? `${g('ch_db')}.${n}` : bq ? `${p}.${g('dataset')}.${n}` : `${g('sf_db')}.${g('sf_schema')}.${n}`,
+      WAREHOUSE_SQL: ch ? `${g('ch_db')}.${n}` : bq ? `\`${p}.${g('dataset')}.${n}\`` : `${g('sf_db')}.${g('sf_schema')}.${n}`,
+      INIT_LOAD: ch
+        ? `${({ gcs: ` --gcs-bucket ${bucket}`, s3: ` --s3-bucket ${bucket} --s3-region ${g('region')}` })[g('dest')] || ' --gcs-bucket <bucket>'}` +
+          ` \\\n  --clickhouse-url ${g('ch_url')} --clickhouse-database ${g('ch_db')} --clickhouse-user ${g('ch_user')}`
+        : ` --gcs-bucket ${bucket}` + (bq ? ` --bigquery-project ${p} --bigquery-dataset ${g('dataset')}` : ''),
+      BUCKET: bucket,
     };
   }
 
