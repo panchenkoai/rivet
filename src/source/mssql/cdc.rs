@@ -1431,12 +1431,32 @@ fn probe_max_lsn(probe: &crate::source::mssql::MssqlCdcProbe) -> Option<String> 
     probe.max_lsn_hex.as_deref().map(|s| {
         s.trim_start_matches("0x")
             .trim_start_matches("0X")
-            .to_string()
+            .to_ascii_lowercase()
     })
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_pinned_anchor_uses_the_event_lsn_case_so_warehouse_views_rank_it_right() {
+        let probe = crate::source::mssql::MssqlCdcProbe {
+            cdc_enabled: true,
+            max_lsn_hex: Some("0x0000002D000000D80194".into()),
+            instance_min_lsn: None,
+            agent_running: None,
+        };
+        let anchor = super::probe_max_lsn(&probe).unwrap();
+        assert_eq!(
+            anchor,
+            super::hex(&[0, 0, 0, 0x2d, 0, 0, 0, 0xd8, 0x01, 0x94])
+        );
+        let older_event = super::hex(&[0, 0, 0, 0x2a, 0, 0, 0x01, 0xa8, 0, 0x04]);
+        assert!(
+            anchor > older_event,
+            "BigQuery/Snowflake order __pos.lsn as a string: {anchor} vs {older_event}"
+        );
+    }
+
     /// The three outcomes of a `cdc.change_tables` lookup, kept apart.
     ///
     /// The middle one is why this is a unit test: an orphaned capture instance (row
