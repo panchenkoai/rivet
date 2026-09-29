@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 300" width="1000" height="300" role="img" aria-label="PostgreSQL, MySQL, SQL Server and MongoDB flow through rivet, batch or CDC with no Kafka or connectors, to S3, GCS, Azure Blob or local disk, then into BigQuery (load and compact) or Snowflake (load)">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 300" width="1000" height="300" role="img" aria-label="PostgreSQL, MySQL, SQL Server, MongoDB and Oracle (preview) flow through rivet, batch or CDC with no Kafka or connectors, to S3, GCS, Azure Blob or local disk, then into BigQuery (load and compact), Snowflake (load) or ClickHouse (run and load, preview)">
   <defs>
     <linearGradient id="steel" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0" stop-color="#cfe2ff"/>
@@ -44,20 +44,23 @@
   <text class="cap" x="892" y="26" text-anchor="middle">WAREHOUSE</text>
 
   <!-- sources -->
-  <rect class="pill" x="30" y="50" width="170" height="38" rx="19"/>
-  <text class="label" x="115" y="74" text-anchor="middle">PostgreSQL</text>
-  <rect class="pill" x="30" y="106" width="170" height="38" rx="19"/>
-  <text class="label" x="115" y="130" text-anchor="middle">MySQL</text>
-  <rect class="pill" x="30" y="162" width="170" height="38" rx="19"/>
-  <text class="label" x="115" y="186" text-anchor="middle">SQL Server</text>
-  <rect class="pill" x="30" y="218" width="170" height="38" rx="19"/>
-  <text class="label" x="115" y="242" text-anchor="middle">MongoDB</text>
+  <rect class="pill" x="30" y="44" width="170" height="34" rx="17"/>
+  <text class="label" x="115" y="66" text-anchor="middle">PostgreSQL</text>
+  <rect class="pill" x="30" y="90" width="170" height="34" rx="17"/>
+  <text class="label" x="115" y="112" text-anchor="middle">MySQL</text>
+  <rect class="pill" x="30" y="136" width="170" height="34" rx="17"/>
+  <text class="label" x="115" y="158" text-anchor="middle">SQL Server</text>
+  <rect class="pill" x="30" y="182" width="170" height="34" rx="17"/>
+  <text class="label" x="115" y="204" text-anchor="middle">MongoDB</text>
+  <rect class="pill" x="30" y="228" width="170" height="34" rx="17"/>
+  <text class="label" x="115" y="250" text-anchor="middle">Oracle <tspan class="muted">preview</tspan></text>
 
   <!-- sources converge on rivet -->
-  <path class="edge" d="M200,69 C265,69 270,153 328,153"/>
-  <path class="edge" d="M200,125 C265,125 270,153 328,153"/>
-  <path class="edge" d="M200,181 C265,181 270,153 328,153"/>
-  <path class="edge" d="M200,237 C265,237 270,153 328,153"/>
+  <path class="edge" d="M200,61 C265,61 270,153 328,153"/>
+  <path class="edge" d="M200,107 C265,107 270,153 328,153"/>
+  <path class="edge" d="M200,153 C265,153 270,153 328,153"/>
+  <path class="edge" d="M200,199 C265,199 270,153 328,153"/>
+  <path class="edge" d="M200,245 C265,245 270,153 328,153"/>
 
   <!-- rivet -->
   <rect class="node" x="330" y="98" width="140" height="110" rx="24"/>
@@ -90,11 +93,14 @@
   <path class="edge" d="M730,153 L806,153" marker-end="url(#arrow)"/>
 
   <!-- warehouse -->
-  <rect class="card" x="810" y="92" width="165" height="122" rx="16"/>
-  <circle class="dot" cx="836" cy="121" r="3.5"/>
-  <text class="label" x="850" y="126">BigQuery</text>
-  <text class="muted" x="850" y="144">load + compact</text>
-  <circle class="dot" cx="836" cy="173" r="3.5"/>
-  <text class="label" x="850" y="178">Snowflake</text>
-  <text class="muted" x="850" y="196">load</text>
+  <rect class="card" x="810" y="62" width="165" height="182" rx="16"/>
+  <circle class="dot" cx="836" cy="91" r="3.5"/>
+  <text class="label" x="850" y="96">BigQuery</text>
+  <text class="muted" x="850" y="114">load + compact</text>
+  <circle class="dot" cx="836" cy="146" r="3.5"/>
+  <text class="label" x="850" y="151">Snowflake</text>
+  <text class="muted" x="850" y="169">load</text>
+  <circle class="dot" cx="836" cy="201" r="3.5"/>
+  <text class="label" x="850" y="206">ClickHouse</text>
+  <text class="muted" x="850" y="224">load · preview</text>
 </svg>
