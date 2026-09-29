@@ -859,7 +859,11 @@ RUST_LOG=info rivet run -c my_export.yaml
 | Code | Meaning |
 |------|---------|
 | 0 | All exports succeeded |
-| 1 | Generic failure — config parsing/validation, usage, or an unclassified export error. Fix the input; retrying won't help |
+| 1 | Usage / config error — config parsing/validation, a bad command, or an export error no other class claims. Fix the input; retrying won't help |
 | 2 | Retryable transient failure (connection loss, timeout, throttling) — safe to retry. Clap argument-parse errors also exit 2 (distinguishable by the usage text and absence of an `Error:` line) |
 | 3 | Data-integrity failure (quality gate / reconcile / validate / duplicate-guard) — stop and investigate |
 | 4 | Schema drift (`on_schema_drift: fail` tripped) |
+| 5 | Protective refusal — rivet stopped on purpose so as not to lose, duplicate or overwrite data (a foreign checkpoint, a newer state DB, a cursor-owner mismatch, ...). Retrying unchanged refuses again; a human decides |
+| 6 | Internal — an invariant rivet relies on did not hold; a bug, please report it |
+
+Every coded error and the exit its kind maps to: [errors.md](errors.md).
