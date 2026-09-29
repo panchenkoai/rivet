@@ -601,8 +601,8 @@ fn find_userinfo(raw: &str) -> Option<(usize, usize)> {
 /// `engine://host:port/database` of `url`, credentials, query and fragment dropped.
 pub(crate) fn source_state_key(source_type: SourceType, url: &str) -> String {
     let rest = url.split_once("://").map_or(url, |(_, r)| r);
-    let rest = rest.split(['?', '#']).next().unwrap_or(rest);
-    let at_host = rest.rsplit_once('@').map_or(rest, |(_, h)| h);
+    let rest = find_userinfo(url).map_or(rest, |(at, _)| &url[at + 1..]);
+    let at_host = rest.split(['?', '#']).next().unwrap_or(rest);
     format!("{source_type:?}://{}", at_host.trim_end_matches('/')).to_lowercase()
 }
 
@@ -631,6 +631,15 @@ mod tests {
             k,
             source_state_key(SourceType::Postgres, "postgresql://u@db.host:5432/other")
         );
+    }
+
+    #[test]
+    fn a_raw_query_delimiter_in_the_password_does_not_merge_two_servers_into_one_scope() {
+        use super::{SourceType, source_state_key};
+        let a = source_state_key(SourceType::Postgres, "postgresql://app:k?9@h1:5432/a");
+        let b = source_state_key(SourceType::Postgres, "postgresql://app:k#9@h2:5432/b");
+        assert_eq!(a, "postgres://h1:5432/a");
+        assert_eq!(b, "postgres://h2:5432/b");
     }
 
     use super::*;
