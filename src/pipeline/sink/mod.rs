@@ -1048,6 +1048,11 @@ impl BatchSink for ExportSink {
 }
 
 impl ExportSink {
+    /// Whether the export streamed no rows into this sink.
+    pub(in crate::pipeline) fn is_empty(&self) -> bool {
+        self.total_rows == 0
+    }
+
     /// The keyset high-water mark to advance/checkpoint from: the source's own
     /// lossless token when it reported one (MongoDB BSON `_id`), else the string
     /// extracted from the output column (every SQL engine).

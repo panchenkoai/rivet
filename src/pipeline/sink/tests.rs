@@ -125,6 +125,8 @@ fn i1_writer_finish_produces_complete_file_before_destination_write() {
 
     // Total rows must reflect the written batch.
     assert_eq!(sink.total_rows, 3, "total_rows must count written rows");
+    assert!(!sink.is_empty(), "a sink that streamed rows is not empty");
+    assert!(minimal_sink().is_empty(), "a fresh sink is empty");
 }
 
 // ─── quality tracking ────────────────────────────────────────
