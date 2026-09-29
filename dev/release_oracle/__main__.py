@@ -375,6 +375,10 @@ def _self_test() -> int:
         assert f"fn {key.split('::')[-1]}(" in live_src, f"SKIP_ALLOWED names no live test: {key}"
     assert exclusive_tests(), "no live+exclusive test found — the exclusive pass would grade nothing"
     print("self-test ok: live modules are derived; perf tolerances grade regressions, not noise")
+    from . import sentinels
+
+    sentinels._self_test()
+    print("self-test ok: sentinel verdicts (exact, or a loud non-panic refusal on a risky value)")
     print("\nregression stage (child harness, stand, banner):")
     return regression._self_test()
 
