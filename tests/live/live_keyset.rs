@@ -2525,3 +2525,68 @@ fn keyset_resume_refuses_when_a_committed_page_was_deleted_between_attempts() {
          and a bare count cannot tell them apart"
     );
 }
+
+/// H24: on SQL Server the leading column of a COMPOSITE unique index (other key column nullable, or
+/// decimal) is not a keyset key — seek paging on it skips rows sharing a boundary value. RED against
+/// the per-column WHERE filters that let the index's surviving column count as "single-column".
+#[test]
+#[ignore = "live: requires docker compose up -d mssql"]
+fn mssql_composite_unique_leading_column_is_refused_as_keyset_key() {
+    require_alive(LiveService::Mssql);
+    for (label, ddl) in [
+        (
+            "nullable",
+            "tenant_id INT NOT NULL, ext_ref VARCHAR(40) NULL, CONSTRAINT uq_{t} UNIQUE (tenant_id, ext_ref)",
+        ),
+        (
+            "numeric",
+            "tenant_id INT NOT NULL, ext_ref NUMERIC(10,2) NOT NULL, CONSTRAINT uq_{t} UNIQUE (tenant_id, ext_ref)",
+        ),
+    ] {
+        let table = unique_name("ms_cmp_uq");
+        mssql_exec(&format!(
+            "CREATE TABLE dbo.{table} ({})",
+            ddl.replace("{t}", &table)
+        ));
+        mssql_exec(&format!(
+            "INSERT INTO dbo.{table} (tenant_id, ext_ref) \
+             SELECT value / 50, value FROM GENERATE_SERIES(CAST(1 AS INT), CAST(500 AS INT))"
+        ));
+        let err = Rig::mssql_batch(&format!("dbo.{table}"))
+            .mode("chunked")
+            .export_line("chunk_by_key: tenant_id")
+            .export_line("chunk_size: 10")
+            .run_expect_fail();
+        mssql_drop_table(&format!("dbo.{table}"));
+        assert!(
+            err.contains("chunk_by_key 'tenant_id' is not a usable keyset key"),
+            "{label}: a composite unique index's leading column must be refused, got: {err}"
+        );
+    }
+}
+
+/// H25: a COMPOSITE integer primary key on SQL Server is not a single-integer PK — chunked mode
+/// with no `chunk_column` must refuse, as on PostgreSQL and MySQL, rather than auto-pick one part.
+#[test]
+#[ignore = "live: requires docker compose up -d mssql"]
+fn mssql_composite_int_pk_is_not_auto_resolved_as_chunk_column() {
+    require_alive(LiveService::Mssql);
+    let table = unique_name("ms_cmp_pk");
+    mssql_exec(&format!(
+        "CREATE TABLE dbo.{table} (order_id INT NOT NULL, line_no SMALLINT NOT NULL, \
+         PRIMARY KEY (order_id, line_no))"
+    ));
+    mssql_exec(&format!(
+        "INSERT INTO dbo.{table} (order_id, line_no) \
+         SELECT value / 5, value % 5 FROM GENERATE_SERIES(CAST(1 AS INT), CAST(500 AS INT))"
+    ));
+    let err = Rig::mssql_batch(&format!("dbo.{table}"))
+        .mode("chunked")
+        .export_line("chunk_size: 10")
+        .run_expect_fail();
+    mssql_drop_table(&format!("dbo.{table}"));
+    assert!(
+        err.contains("chunked mode found no safe shape"),
+        "a composite PK must not auto-resolve a chunk_column, got: {err}"
+    );
+}

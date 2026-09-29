@@ -304,40 +304,12 @@ fn range_min_max_mssql(
 /// index (`ic.key_ordinal = 1`). This is the SQL Server analogue of the
 /// PG/MySQL leading-key probe; it asks `sys.index_columns` directly rather than
 /// inspect a query plan, so the signal is a catalog fact, not a heuristic.
-/// The single-integer PK `build_plan` auto-resolves an UNSET chunked `chunk_column` to — so the
-/// diagnostic ranges/probes on the SAME column, not a `?` placeholder (post-0.24.3 review MED).
-/// EXACT two-step mirror of `source::mssql::introspect_mssql_on`'s single_int_pk
-/// (the PK col via is_primary_key + GROUP BY HAVING COUNT(*)=1, then an int-family type check) —
-/// replicated verbatim so the diagnostic resolves the SAME column the planner will (any
-/// divergence here would REINTRODUCE the false UNSAFE this fixes). `None` on composite / non-int /
-/// absent PK or a probe error.
+/// The single-integer PK `build_plan` auto-resolves an UNSET chunked `chunk_column` to, via the planner's own SQL.
 fn single_int_pk_mssql(conn: &mut MssqlSource, qualified_table: &str) -> Option<String> {
     let (schema, table) = split_qualified(qualified_table);
-    let pk_sql = format!(
-        "SELECT TOP 1 c.name, t.name FROM sys.indexes i \
-         JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id \
-         JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id \
-         JOIN sys.types t ON t.user_type_id = c.user_type_id \
-         JOIN sys.objects o ON o.object_id = i.object_id \
-         JOIN sys.schemas s ON s.schema_id = o.schema_id \
-         WHERE i.is_primary_key = 1 AND s.name = N'{}' AND o.name = N'{}' \
-         GROUP BY c.name, t.name HAVING COUNT(*) = 1",
-        schema.replace('\'', "''"),
-        table.replace('\'', "''")
-    );
-    let pk_col = conn.query_scalar(&pk_sql).ok().flatten()?;
-    let type_sql = format!(
-        "SELECT t.name FROM sys.columns c \
-         JOIN sys.types t ON t.user_type_id = c.user_type_id \
-         JOIN sys.objects o ON o.object_id = c.object_id \
-         JOIN sys.schemas s ON s.schema_id = o.schema_id \
-         WHERE s.name = N'{}' AND o.name = N'{}' AND c.name = N'{}'",
-        schema.replace('\'', "''"),
-        table.replace('\'', "''"),
-        pk_col.replace('\'', "''")
-    );
-    let ty = conn.query_scalar(&type_sql).ok().flatten()?;
-    matches!(ty.as_str(), "tinyint" | "smallint" | "int" | "bigint").then_some(pk_col)
+    conn.query_scalar(&crate::source::mssql::single_int_pk_sql(schema, table))
+        .ok()
+        .flatten()
 }
 
 fn column_has_index_mssql(
