@@ -2,6 +2,238 @@
 
 ## Unreleased
 
+## 0.30.0 — 2026-09-29
+
+- **Breaking: a source URL whose scheme names another engine is refused.** `source.type` is the
+  engine rivet anchors and types the stream as, and the URL's scheme was never compared with it:
+  `type: mysql` with a `postgresql://` URL got as far as the driver. Config load now refuses the
+  pair with `RIVET_CONFIG_SOURCE_URL_SCHEME_MISMATCH` (exit 1). A scheme rivet does not know
+  (`jdbc:…`) is still left to the driver.
+- **Breaking: a `cursor_column` or `columns:` key that matches a result column only when case is
+  ignored is refused.** MySQL and SQL Server (case-insensitive collations) run
+  `cursor_column: updatedat` against a column the result set names `updatedAt`. rivet matched the
+  name exactly, found nothing, recorded no cursor, and every run re-exported the whole table
+  with exit 0. A `columns:` override spelled that way was skipped just as silently. Both are now
+  refused when the schema arrives, naming the exact spelling (`RIVET_CONFIG_CURSOR_COLUMN_CASE`,
+  `RIVET_CONFIG_COLUMN_OVERRIDE_CASE`, exit 1). This applies on every engine. A `columns:` key that
+  names no column in any case still passes, because multi-table override maps rely on that.
+- **Breaking: a MySQL keyset key under a `uuid` column override is refused.** The override reads
+  `BINARY(16)` as a 16-byte UUID, but the page cursor was rendered as hyphenated hex text, which
+  MySQL compares against the raw bytes. Pages skipped and repeated rows while the run reported
+  success. An explicit or auto-selected keyset key with that override now fails at plan time with
+  `RIVET_CONFIG_KEYSET_KEY_UUID_OVERRIDE` (exit 1). PostgreSQL casts the literal to `uuid` and is
+  unaffected.
+- **Breaking: a `columns:` override whose type the column's value cannot be read as is refused,
+  not written as NULL.** On PostgreSQL and SQL Server, a `decimal(p,s)` override on an integer
+  column produced a column that was entirely NULL, and on SQL Server a `uuid` override on
+  `nvarchar(36)` did the same. The exit was 0 and both value checksums agreed on the NULL. Integers
+  under a `decimal` override are now scaled exactly, and SQL Server `uuid` text is parsed. Any
+  other mismatch fails naming the column (`RIVET_SOURCE_OVERRIDE_WIRE_MISMATCH`, exit 1). On
+  MySQL, a `uuid` override now refuses a value it cannot parse instead of nulling it.
+- **Breaking: a PostgreSQL URL with a remote `host=` or `hostaddr=` query parameter needs TLS.** The
+  plaintext gate looked only at the URL's authority, while the driver also dials the query's
+  `hostaddr=` (in preference to the authority) and `host=`. So
+  `postgresql://u:p@localhost/db?hostaddr=203.0.113.5` passed as loopback and sent credentials and
+  rows to the remote address in cleartext. Every `host=`/`hostaddr=` value must now be loopback
+  or a unix-socket path, or the connection needs a `tls:` block.
+- **Breaking: MySQL `TIME` outside 00:00–24:00 is refused, not written as garbage.** A table
+  holding durations that exported with exit 0 before now fails every run. A MySQL `TIME` is a
+  duration of up to ±838:59:59, and a Parquet `TIME` holds one day. `838:59:59` read back as
+  `'1$:59:59'`, a negative value made the file unreadable, and unparseable text became NULL, all
+  with exit 0. Such a value now fails with `RIVET_SOURCE_VALUE_UNREPRESENTABLE` (exit 5), naming a
+  cast that keeps it (`TIME_TO_SEC(col)`, `CAST(col AS CHAR)`).
+
+- **Oracle Database as a batch source (preview).** `source.type: oracle` with an
+  `oracle://user:password@host:1521/SERVICE` URL runs `full`, `incremental`, range- and
+  keyset-`chunked` (also `parallel > 1`), `time_window` and `partition_by` exports. It uses
+  Oracle's pure-Rust thin driver, so no Oracle client install is needed. `rivet init` scaffolds
+  from the schema's catalog and never picks a key or cursor that the planner or the run would
+  refuse. rivet pins its session to UTC with ISO NLS formats and `NLS_SORT = NLS_COMP = BINARY`.
+  A `TIMESTAMP(7..9)` column is read at microseconds and refused as an incremental cursor
+  (`RIVET_SOURCE_CURSOR_FINER_THAN_MICROSECOND`). Known limits (`docs/reference/oracle.md`): the
+  driver is a pinned beta behind the default-on `oracle` cargo feature; TLS verifies only against
+  the public CA bundle built into the driver (no `tls.ca_file`, no wallet); only 23ai/26ai Free
+  are tested.
+
+- **SQL Server keyset and range exports no longer skip or repeat rows under a non-default
+  collation or date format.** A keyset page bound was sent as `N'…'`, which a `varchar` key under
+  a SQL collation compares by different rules than its own `ORDER BY`: 67 of 180 keys lost. A
+  timestamp range bound in `YYYY-MM-DD HH:MM:SS` form is read day-first under a British login
+  (`DATEFORMAT dmy`), and a window exported 39 rows for 24. An ASCII bound is now a plain `'…'`
+  literal and timestamps are sent in the `T` form, which does not depend on `DATEFORMAT`.
+- **Timestamp bounds keep their fraction and offset on PostgreSQL and SQL Server.** The probe that
+  reads a range or keyset bound dropped the fraction on both engines, and the `+00` offset of a
+  PostgreSQL `timestamptz`. Under a session in another zone the bound then named a different
+  instant (measured on PostgreSQL in Asia/Tokyo: 999 of 1000 rows, then 1914 rows for 1499 ids).
+  A SQL Server `DATETIME` bound was cut instead of rounded to its 1/300 s tick, and the newest row
+  stayed behind (199 of 200).
+- **Every PostgreSQL connection rivet opens runs in UTC with ISO formats.** Only the export
+  transaction was pinned (`SET LOCAL TimeZone = 'UTC'`). The sampler, the bound probes, `check`
+  and `init` ran in the role's zone and `DateStyle`, so one run used two zones (the cause of the
+  Tokyo loss above). Each connection now sets `TimeZone`, `DateStyle`, `IntervalStyle` and
+  `bytea_output` at connect, except behind a transaction-mode pooler, where a session `SET` would
+  leak to other clients. Stored values do not move. Calendar arithmetic in your own `query:`
+  (`current_date`, `ts::date` on a `timestamptz`) now counts UTC days everywhere, as it already
+  did inside the export.
+- **A keyset crash anchor is resumed only by the runner shape that wrote it.** After a crash,
+  changing `parallel:` made the other runner continue the anchor: 1501 of 2000 rows
+  (sequential → parallel), or 2600 for 2000 (parallel → sequential). A plain keyset run now
+  warns and starts a fresh pass. A `keyset_incremental` run switched to `parallel:` after a
+  sequential crash is refused instead, because the sequential cursor had already moved past
+  pages no manifest names (`RIVET_STATE_KEYSET_SEQUENTIAL_ANCHOR_UNFINISHED`, exit 5). Re-run
+  once with `parallel: 1`.
+- **`--split` units no longer reuse a stale checkpoint.** A fresh `--split` re-run re-sampled its
+  windows but kept each unit's keyset anchor and crashed chunk run, so units resumed against moved
+  windows: 525000 rows over 450000 ids, or a plan-fingerprint refusal on every run. A unit that
+  runs over a new window now drops both. `rivet state reset-chunks` (and `--stuck-checkpoints`)
+  now also accept the `<export>#<n>` and `<parent>__<value>` names that the chunk refusals print
+  for split units and `partition_by` children.
+- **A chunked resume re-exports a chunk whose part it cannot find.** Resuming into a prefix that
+  held a foreign or stale manifest declared every recorded part without looking, so a part deleted
+  between attempts was named in a `Success` manifest. A chunk whose part record was never written
+  was skipped as completed and left out. Every resume now checks the destination and re-exports
+  what it cannot account for.
+- **A chunk that fails and is retried within one run is counted once.** Its failed attempt's
+  parts stayed in the `Success` manifest beside the retry's, so the chunk's leading rows appeared
+  twice and `total_rows` counted them twice. Those parts are now pruned before the manifest is
+  written. In the parallel checkpoint runner, a chunk that failed and then completed on retry
+  still failed the run; now the chunk ledger alone decides. When chunks remain unfinished, the
+  error names each one's last error.
+- **A MySQL `FLOAT` keyset key or cursor no longer re-reads its boundary row.** The saved value
+  was the shortest `f32` text (`0.1`), which MySQL compares as a `DOUBLE` below the row's own
+  `0.10000000149011612`, so every page boundary and every incremental run re-read the last row.
+  The exact widened value is saved now.
+- **A `?` or `#` in a URL password no longer merges different servers into one cursor scope.** The
+  state key cut the URL's query before removing the credentials, so
+  `postgresql://app:k?9@h1/a` and `…@h2/b` both keyed as `postgres://app:k`. The two shared one
+  incremental cursor and crash anchor, and a prefix of the password was stored in the state DB.
+  Keys of well-formed URLs are unchanged, so no existing cursor moves. The same password shapes,
+  and a `?password=` query parameter, are now redacted from `plan.json` too.
+- **PostgreSQL CDC decodes `DOMAIN` columns instead of writing NULL.** `test_decoding` labels a
+  domain cell with the domain's name, so every integer, date or boolean domain column was NULL in
+  the change log. The reader now resolves each domain to its base type at open (nested domains
+  included).
+- **PostgreSQL CDC refuses a value it cannot decode instead of writing NULL.** A BC date, a
+  `time '24:00:00'` or an unparseable value in `test_decoding` output became NULL with exit 0.
+  It is now refused, like `infinity` already was. The reader also pins `TimeZone = 'UTC'`. Under a
+  named server zone, an instant before that zone adopted a whole-minute offset rendered with a
+  seconds offset (`+00:53:28`). That was refused on every later run as bad source data.
+- **SQL Server CDC refuses a captured value it has no decoder for.** An `xml` or `sql_variant`
+  cell (and any other type without a decoder) was written as NULL with exit 0. It now fails with
+  `RIVET_SOURCE_CDC_CELL_UNSUPPORTED` (exit 5). To go on, leave the column out of the capture
+  instance.
+- **A DROP and ADD COLUMN of the same arity no longer fills the new column with a neighbour's
+  value.** On PostgreSQL and SQL Server CDC, a missing column was read by position whenever the
+  change image had as many columns as the schema. After `DROP a` + `ADD c`, older images put
+  `b`'s value into `c`. They now leave `c` NULL. The CDC reference no longer claims that a column
+  added while a run is open is captured: that run's values for it are dropped and acknowledged,
+  so re-snapshot the table to recover them.
+- **MySQL CDC writes `YEAR 0000` as 0, not 1900**, as the batch path does. The binlog decoder
+  adds 1900 to the stored byte, and 1900 is never a legal `YEAR`.
+- **SQL Server CDC advances a quiet table's checkpoint.** A table with no changes kept its
+  checkpoint at its last captured LSN. Once the cleanup job moved the retention floor past that
+  LSN, the next run failed with a log-gap refusal and asked for a re-snapshot, although nothing
+  had been lost. After a clean drain, the checkpoint now moves to the bound read at the start of
+  the run.
+- **The SQL Server CDC anchor is written in lowercase hex, like every change event's LSN.** The
+  BigQuery and Snowflake dedup views order `__pos.lsn` as a case-sensitive string, so after a
+  re-baseline an older event could outrank the new anchor and the view served the stale row.
+  Anchors already written to a warehouse stay uppercase.
+- **MySQL CDC fails the resume when it cannot run its `GTID_SUBSET` check.** A failed query read
+  as "contained" with no warning, which switched off the one identity check that catches a
+  `RESET MASTER` on the same server. The query error now fails the resume. A checkpoint with a
+  GTID set that gets no containment answer resumes with a warning.
+- **PostgreSQL `time '24:00:00'` and a `timestamp` `infinity` are refused in batch exports.**
+  `24:00:00` wrapped to `00:00:00` with exit 0, and both checksum sides agreed. A
+  `'infinity'::timestamp` (without time zone) panicked the process (exit 101, no summary). Both
+  now fail with `RIVET_SOURCE_VALUE_UNREPRESENTABLE` (exit 5), naming the column.
+- **A SQL Server `sql_variant` column is refused instead of crashing the export.** The driver
+  cannot parse the type and panicked (exit 101; a release build aborts) on every export or type
+  probe that touched it. rivet now asks the server for the result's column types first and
+  refuses with `RIVET_SOURCE_VALUE_UNREPRESENTABLE`, naming a cast. If that probe is unavailable,
+  the export runs as before.
+- **A `rivet load` of CDC base+buffer writes only the newest unloaded baseline.** If two
+  baseline generations were waiting (a snapshot re-run after a crash, or a re-baseline before any
+  load), both were written into the base: every key twice, with a count gate that grew to match.
+  The older generation is now recorded as superseded and not read.
+- **`rivet load` no longer disowns its own table after a skip or refusal under the same run id.**
+  An up-to-date skip or a pre-write refusal overwrote the ledger row that proved the table was
+  rivet's, and the next load refused it as foreign ("drop or rename it"). A load whose source
+  identity cannot be read from the ledger now refuses before writing. It used to skip the check
+  that stops one source from replacing another's rows.
+- **A load pinned to an older run's columns no longer refuses the newer runs it listed.** The pin
+  loads spec-less newer runs with the older run's columns, but it recorded the older run's finish
+  time, so those same runs were refused as late on every retry.
+- **A partition column whose name contains `|` keeps its partition budget.** The footer note split
+  on every `|`, so `rivet load` could not parse it and fell back to the row count. It could then
+  refuse a part the writer had kept within budget. Notes written before the fix still parse.
+- **An incremental load after an idle run no longer fails.** A run that exported nothing after
+  the first pass made the next `rivet load` fail with `no Parquet URIs to append`.
+- **Duplicates found before `unique_max_entries` is reached fail the run.** Once a unique column
+  hit its cap, only the capped warning was emitted: ids `[1,1,2,3,4]` at cap 3 exited 0 with one
+  duplicate already proven. It now fails as "at least N duplicate values".
+- **`rivet validate --depth full` no longer reports corruption on healthy exports with NULL
+  keys.** On re-read, Parquet can leave stale values in leading NULL slots, and the keyed
+  checksum hashed them. MySQL and SQL Server incremental exports whose nullable cursor sorts NULLs
+  first failed validation. Existing manifests stay valid.
+
+- **A run opens far fewer source connections.** Each probe (forensics, both harm snapshots,
+  reconcile, the chunk planner and, on CDC, the schema resolver and row-image checks) opened its
+  own connection. It now shares one metadata connection per run. When that connection has dropped
+  during a long run, it is reopened once. Measured per run through a counting proxy against
+  0.29.0: PostgreSQL full 6 → 2, chunked 7 → 3, keyset 7 → 2; MySQL and SQL Server full 4 → 2,
+  chunked 5 → 3, keyset 5 → 2. For a bounded CDC run, measured with the server's own counters:
+  PostgreSQL 10 → 2, MySQL 12 → 2, SQL Server 6 → 2. Each new PostgreSQL backend warms its
+  catalog cache, so fewer connections also means fewer catalog reads on the source.
+
+- **SQL Server chunked and keyset exports work for a `db_datareader` login.** The row estimate
+  read `sys.dm_db_partition_stats`, which needs `VIEW DATABASE STATE`, so every chunked or keyset
+  export by such a login failed. It now reads `sys.partitions`.
+- **A multi-export run exits with the most serious failure's class.** Ranking is now integrity >
+  internal > refusal > schema drift > retryable > usage. A refusal (5) or internal error (6) used
+  to lose to a retryable failure, so a scheduler retried a protective stop. A combined failure
+  took its exit class from the text of every other export's error: a permanent failure beside
+  one mentioning "timeout" exited 2. A child that panicked (exit 101) was passed through as 101;
+  it now counts as internal (6). A typed stop (integrity, drift, refusal) is never retried because
+  its message contains a transient-sounding word.
+- **MongoDB `partition_by` is refused when the config is read.** `rivet check` passed it, and
+  `rivet run` panicked while expanding partitions, taking every other export in the invocation
+  with it. Now `RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED`.
+- **`rivet check` grades a BigQuery `decimal` with more than 38 integer digits as Fail.**
+  `BIGNUMERIC` holds at most 38 integer digits, so `decimal(50,0)`, MySQL `DECIMAL(65,0)` and
+  PostgreSQL `numeric(76,0)` were reported OK, and the load then failed at BigQuery after the
+  extract had run.
+- **Discovery reads the keys and indexes that really exist.** On SQL Server, a UNIQUE index over
+  `(tenant_id NOT NULL, ext_ref NULL)` was taken for a single-column key on `tenant_id`, so
+  keyset paging skipped rows at page boundaries with status success. A composite primary key
+  gave an arbitrary one of its columns as the range `chunk_column`. `rivet init` on PostgreSQL
+  counted a column as indexed when it sat in any position of any index. Only a column that leads
+  a valid, complete btree counts now. Preflight no longer applies whole-table statistics to a
+  partition-extended, `APPLY`, flashback or dblink read.
+- **`rivet init` gives CDC tables whose names collide distinct slots and checkpoints.** Names that
+  reduce to the same identifier (`order-items` and `order_items`, `Orders` and `orders`,
+  non-Latin names) got one checkpoint and one slot, and init's own config was refused with
+  `RIVET_CONFIG_CDC_RESOURCE_CONFLICT`. Only colliding names get a hash suffix, so names that
+  already worked keep their checkpoint and slot.
+- **Recovery advice that failed when followed has been corrected.** The chunked recovery block no
+  longer chains `reset-chunks && run --resume`, which always failed. The rerun warning no longer
+  sends a completed (`_SUCCESS`) prefix to `--resume`, which refuses it. The resume command in the
+  run report names the failed export and appears only for a checkpointed strategy. The
+  cursor-owner hint carries the required `-c <config>`. The PostgreSQL slot-missing refusal lists
+  every done-signal to clear, not only the checkpoint. The invalid-checkpoint refusals say to
+  re-anchor first, then re-snapshot. The `partition_by` + `load:` refusal names only remedies
+  that work, and the load-adoption refusal says `ALTER TABLE … ADD COLUMN` instead of renaming
+  the table aside, which dropped its rows from the view. `--force` without `--resume` is described
+  truthfully.
+- **The plaintext-state warning checks the host.** It stayed silent for a remote PostgreSQL state
+  whose password or database name contained `localhost`.
+- **`rivet doctor` and `rivet check --type-report` honour the `mongo:` block**, and the MCP
+  server's MySQL tools accept a URL with `sslmode=` again.
+- **Documentation: the exit-code table in `docs/reference/cli.md` lists 5 (refusal) and 6
+  (internal).** The README's CDC quickstart says which sources get a first-run baseline, and the
+  CDC reference describes the per-transaction caps and opt-in spilling. The `partition_by`
+  reference lists every combination that config load refuses.
+
 - **`rivet compact` reads the base only for keys whose day moved, not for every key.** To find a
   key's OLD partition the day probe semi-joined the whole base on every compaction — a full read of
   its key and partition columns, 44% of one pilot's BigQuery bill (18.9 GiB per run on its largest
@@ -50,8 +282,11 @@
   The checkpoint records the database, its incarnation and the PDB, and a run refuses one
   from elsewhere. A checkpoint that needs a deleted archive is refused as a loss. Each captured
   table needs `ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS`; a table without it, or with a type
-  the preview does not capture (LOBs among them), is refused by name. `rivet load` of an
-  Oracle stream is not supported yet.
+  the preview does not capture (LOBs among them), is refused by name. A `TRUNCATE` of a captured table or partition is refused once the
+  changes before it are delivered (`RIVET_SOURCE_CDC_TRUNCATED`, exit 5), and every re-run
+  stops there until you re-anchor and re-snapshot. Continuous capture (`until_current: false`,
+  `rivet cdc --stream`) is refused (`RIVET_CONFIG_CDC_CONTINUOUS_UNSUPPORTED`), and an Oracle
+  CDC export under a `load:` block is refused when the config is read.
 - **On a shared Postgres state, the state server stamps when a run started.** Runs were
   ranked by the writer's own clock, so a run that crashed on a host whose clock ran ahead
   outranked the run that replaced it, and `rivet load --gc-orphans` kept treating the prefix
@@ -63,7 +298,8 @@
   with no error (measured on 24.8: 9999-12-31 stored as 2299-12-31 23:00; the
   `date_time_overflow_behavior` setting does not reach the Parquet reader). `rivet load` now reads
   each part's footer statistics and refuses a part holding such a value before inserting anything
-  (`RIVET_LOAD_VALUE_OUT_OF_TARGET_RANGE`). A load pulled through a named collection is not
+  (`RIVET_LOAD_VALUE_OUT_OF_TARGET_RANGE`), or a timestamp column the footer cannot bound (no
+  min/max statistics); an all-NULL row group no longer hides a value past the range in another. A load pulled through a named collection is not
   inspected yet; the type report says so.
 - **A MongoDB CDC export under a ClickHouse `load:` is refused when the config is read.** It was
   refused only by `rivet load`, after `rivet run` had extracted the whole stream.
@@ -184,7 +420,7 @@
   retyped between runs wrote parts with different types into one prefix and exited 0 under
   `fail`. Each captured table's schema is now checked before the stream reads a change, so a
   refusal acknowledges nothing and switching to `warn` captures every deferred change.
-- **`rivet load` into ClickHouse** (ADR-0035; the loader started from
+- **`rivet load` into ClickHouse (preview)** (ADR-0035; the loader started from
   @ssyusyukalov's #145). `load: { target: clickhouse, url, database, user,
   password_env }`, or `rivet init --clickhouse-url … --clickhouse-database …`. A
   CDC table lands in `<table>__changes`, a `ReplacingMergeTree` keyed on the primary
