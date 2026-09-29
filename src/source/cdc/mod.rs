@@ -2265,6 +2265,23 @@ mod mod_decisions {
 
 #[cfg(test)]
 mod setup_hint_doc_pointers {
+    /// cdc.md names the transaction caps and the opt-in spill the adapters actually read.
+    #[test]
+    fn cdc_reference_names_the_tx_caps_and_the_opt_in_spill() {
+        let doc = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/reference/cdc.md"),
+        )
+        .unwrap();
+        for var in [
+            "RIVET_CDC_MAX_TX_ROWS",
+            "RIVET_CDC_MAX_TX_BYTES",
+            "RIVET_CDC_SPILL_DIR",
+        ] {
+            assert!(doc.contains(var), "cdc.md must name {var}");
+        }
+        assert!(!doc.contains("Spilling oversized transactions to disk is roadmap"));
+    }
+
     /// Every setup hint names a docs section that exists as a heading in the file it names.
     #[test]
     fn every_setup_hint_points_at_a_heading_that_exists() {
