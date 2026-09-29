@@ -855,10 +855,8 @@ mod clickhouse {
                     let null_note = "a ClickHouse Array cannot be NULL: a NULL list loads as [], \
                                      the same value as an empty list";
                     let note = match &inner_r.note {
-                        Some(n) if inner_r.autoload_type != inner_r.target_type => {
-                            format!("{null_note}; each element: {n}")
-                        }
-                        _ => null_note.to_string(),
+                        Some(n) => format!("{null_note}; each element: {n}"),
+                        None => null_note.to_string(),
                     };
                     Resolved::diverge(
                         format!("Array(Nullable({}))", inner_r.target_type),
@@ -1454,6 +1452,21 @@ mod tests {
             inner: Box::new(RivetType::Json),
         });
         assert_eq!(json.autoload_type, "Array(Nullable(String))");
+        let stamps = ch(&RivetType::List {
+            inner: Box::new(RivetType::Timestamp {
+                unit: super::super::TimeUnit::Microsecond,
+                timezone: None,
+            }),
+        });
+        assert!(
+            stamps
+                .note
+                .as_deref()
+                .unwrap_or("")
+                .contains("1900-01-01 to 2299-12-31"),
+            "an element's range warning reaches the array: {:?}",
+            stamps.note
+        );
     }
 
     #[test]
