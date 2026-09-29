@@ -302,6 +302,12 @@ class Ledger:
                     print(f"  {sum(ds) / 60.0:6.1f} min  {key:28} n={len(ds):<4} "
                           f"mean={sum(ds) / len(ds):5.1f}s  max={max(ds):5.1f}s")
                 print()
+        record_timings(
+            TIMINGS_HISTORY, timed, self._spans,
+            "NOT RELEASABLE" if self.red else "RELEASE-READY",
+            sum(c.status is Status.PASS for c in self.cells),
+            sum(c.status is Status.FAIL for c in self.cells),
+        )
         known = [c for c in self.cells if c.status is Status.KNOWN]
         if known:
             print(self._c("1;33", f"  {len(known)} KNOWN RED cell(s), each recorded in known_red.py with a reason and an expiry."))
@@ -310,6 +316,47 @@ class Ledger:
             return 1
         print(self._c("1;32", "  RELEASE-READY — every non-skipped cell is green."))
         return 0
+
+
+#: One JSON line per full gate run (gitignored): where the wall-clock went, so a slow run is compared, not guessed.
+TIMINGS_HISTORY = ROOT / "dev" / "release-oracle" / "timings.jsonl"
+
+
+def record_timings(path: Path, phases: list[tuple[str, float]], spans: list[tuple[str, float]],
+                   verdict: str, passed: int, failed: int) -> dict:
+    """Append this run's phase and span timings to `path` and print the phase deltas against the previous run."""
+    import datetime as _dt
+    import json as _json
+
+    head = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--short", "HEAD"],
+                          capture_output=True, text=True).stdout.strip()
+    rec = {
+        "at": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
+        "commit": head,
+        "verdict": verdict,
+        "passed": passed,
+        "failed": failed,
+        "total_min": round(sum(d for _, d in phases) / 60.0, 1),
+        "phases_min": {n: round(d / 60.0, 2) for n, d in phases},
+        "top_spans_min": {n: round(d / 60.0, 2) for n, d in sorted(spans, key=lambda p: p[1], reverse=True)[:40]},
+    }
+    prev = None
+    if path.exists():
+        lines = [x for x in path.read_text().splitlines() if x.strip()]
+        prev = _json.loads(lines[-1]) if lines else None
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as f:
+        f.write(_json.dumps(rec) + "\n")
+    if prev:
+        print(f"  vs previous run ({prev.get('commit')} {prev.get('at')}): total "
+              f"{prev.get('total_min')} -> {rec['total_min']} min")
+        before = prev.get("phases_min", {})
+        deltas = sorted(((rec["phases_min"].get(n, 0.0) - before.get(n, 0.0), n)
+                         for n in set(before) | set(rec["phases_min"])), reverse=True)
+        for d, n in [x for x in deltas if abs(x[0]) >= 0.5][:10]:
+            print(f"    {d:+6.1f} min  {n}")
+    print(f"  timings appended to {path}")
+    return rec
 
 
 # ── process running ────────────────────────────────────────────────────────────
