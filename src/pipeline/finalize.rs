@@ -1059,6 +1059,91 @@ pub(crate) fn destination_uri_for_manifest(cfg: &DestinationConfig) -> String {
 #[cfg(test)]
 mod tests {
 
+    /// A cloud run PUTs its `running` marker at start; checked against a stub S3 endpoint.
+    #[test]
+    fn a_cloud_run_writes_its_running_marker_to_the_prefix() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a stub port");
+        let addr = listener.local_addr().expect("the stub's address");
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let log = std::sync::Arc::clone(&seen);
+        std::thread::spawn(move || {
+            while let Ok((mut stream, _)) = listener.accept() {
+                let mut req = Vec::new();
+                let mut buf = [0u8; 8192];
+                let head_end = loop {
+                    let Ok(n) = stream.read(&mut buf) else {
+                        break None;
+                    };
+                    if n == 0 {
+                        break None;
+                    }
+                    req.extend_from_slice(&buf[..n]);
+                    if let Some(i) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break Some(i + 4);
+                    }
+                };
+                let Some(head_end) = head_end else { continue };
+                let head = String::from_utf8_lossy(&req[..head_end]).to_string();
+                let len: usize = head
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse().ok())?
+                    })
+                    .unwrap_or(0);
+                while req.len() < head_end + len {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let line = head.lines().next().unwrap_or_default().to_string();
+                let status = if line.starts_with("PUT ") {
+                    "200 OK\r\nETag: \"e\""
+                } else {
+                    "404 Not Found"
+                };
+                log.lock().unwrap().push(line);
+                let _ = stream.write_all(
+                    format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .as_bytes(),
+                );
+            }
+        });
+
+        let mut plan = crate::pipeline::commit::tests::test_plan();
+        plan.destination = crate::config::DestinationConfig {
+            destination_type: crate::config::DestinationType::S3,
+            bucket: Some("b".into()),
+            prefix: Some("p/".into()),
+            region: Some("us-east-1".into()),
+            endpoint: Some(format!("http://{addr}")),
+            access_key_env: Some("PATH".into()),
+            secret_key_env: Some("PATH".into()),
+            ..Default::default()
+        };
+        super::write_running_manifest(&plan, "orders", "run_mark_1", "2026-09-29T00:00:00Z");
+        let seen = seen.lock().unwrap().clone();
+        assert!(
+            seen.iter()
+                .any(|l| l.starts_with("PUT /b/p/manifest-run_mark_1.json")),
+            "no running marker was written: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn the_run_report_lands_beside_the_config() {
+        let d = tempfile::tempdir().unwrap();
+        let cfg = d.path().join("rivet.yaml");
+        let summary = crate::pipeline::RunSummary::stub_for_testing("run_fin_1", "orders");
+        super::finalize_run_report(cfg.to_str().unwrap(), &summary, "export");
+        let dir = d.path().join(".rivet/runs/run_fin_1");
+        assert!(dir.join("summary.json").is_file());
+        assert!(dir.join("summary.md").is_file());
+    }
+
     /// The rerun guard must apply to every destination that can actually hold a
     /// previous run's parts — and the protocols come from the REAL destinations,
     /// not a hand-built capability struct, because the bug this guards is a

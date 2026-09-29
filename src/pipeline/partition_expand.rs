@@ -215,6 +215,16 @@ mod tests {
         .expect("parse base ExportConfig")
     }
 
+    /// A partitioned export whose span cannot be probed fails the run, never vanishes from it.
+    #[test]
+    fn an_unreachable_source_fails_the_expansion_instead_of_dropping_the_export() {
+        let parent = part_export(true);
+        let source = crate::pipeline::commit::tests::test_plan().source;
+        let dir = tempfile::tempdir().unwrap();
+        let r = expand_partitioned_exports(&[&parent], &source, dir.path(), None);
+        assert!(r.is_err(), "nothing listens on 127.0.0.1:9999: {r:?}");
+    }
+
     #[test]
     fn make_child_resolves_segment_and_detaches() {
         let parent = part_export(true);
