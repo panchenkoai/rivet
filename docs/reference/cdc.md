@@ -478,7 +478,8 @@ Notes:
 - **Retention is the DBA's**, as with the binlog: nothing pins archived logs for
   rivet. If the checkpoint needs a log that was deleted, the run fails with a
   data-loss error (see *Failure modes*).
-- **Loading** an Oracle stream with `rivet load` is not supported in the preview.
+- **Loading** an Oracle stream with `rivet load` is not supported in the preview: a
+  `mode: cdc` Oracle export under a `load:` block is refused when the config is read.
 
 ---
 

@@ -494,7 +494,7 @@ shapes:
         delete (measured {_id:9,v:'doomed'}, not the earlier 'seed'). RED against
         `ChangeOp::Delete => cse.full_document` — and the disagreement is the finding: the
         pre-existing delete test stays GREEN against that same mutant." 
-    oracle: { na: "`rivet load` refuses an Oracle CDC stream in the preview (src/load/plan.rs::source_engine), so no __is_deleted is ever computed for it; the capture half — a DELETE carries its whole before-image — is oracle_cdc_update_and_delete_carry_full_types (live_cdc_oracledb.rs)" }
+    oracle: { na: "`rivet load` refuses an Oracle CDC stream in the preview (src/config/load.rs::cdc_refusal at config validation, and src/load/plan.rs::source_engine), so no __is_deleted is ever computed for it; the capture half — a DELETE carries its whole before-image — is oracle_cdc_update_and_delete_carry_full_types (live_cdc_oracledb.rs)" }
 
   - id: every_reading_of_one_config_agrees
     what: >

@@ -343,10 +343,15 @@ impl LoadTarget {
             (LoadTarget::Clickhouse { .. }, crate::config::SourceType::Mongo) => {
                 Some(MONGO_CDC_INTO_CLICKHOUSE)
             }
+            (_, crate::config::SourceType::Oracle) => Some(ORACLE_CDC_NOT_LOADABLE),
             _ => None,
         }
     }
 }
+
+/// Why an Oracle CDC stream cannot load into any warehouse — said by config validation and by the load.
+pub(crate) const ORACLE_CDC_NOT_LOADABLE: &str = "loading an Oracle CDC stream is not supported yet: the Oracle CDC preview \
+     captures to files only (ADR-0037); load its parts with your own tooling";
 
 /// Why a MongoDB CDC stream cannot load into ClickHouse — said by config validation and by the load.
 pub(crate) const MONGO_CDC_INTO_CLICKHOUSE: &str = "a MongoDB CDC stream cannot load into ClickHouse: its resume token has no integer \
@@ -996,6 +1001,12 @@ mod partition_form_tests {
         assert_eq!(ch.cdc_refusal(SourceType::Mysql), None);
         assert_eq!(bq.cdc_refusal(SourceType::Mongo), None);
         assert_eq!(sf.cdc_refusal(SourceType::Mongo), None);
+        for t in [&bq, &sf, &ch] {
+            assert_eq!(
+                t.cdc_refusal(SourceType::Oracle),
+                Some(ORACLE_CDC_NOT_LOADABLE)
+            );
+        }
     }
 
     use super::*;

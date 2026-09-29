@@ -424,13 +424,14 @@ impl Config {
         self.validate_csv_exports_are_not_loaded()?;
         self.validate_load_overrides()?;
         self.validate_layout_has_a_compacting_warehouse()?;
-        self.validate_mongo_cdc_has_a_loadable_target()?;
+        self.validate_cdc_has_a_loadable_target()?;
         Ok(())
     }
 
-    /// A MongoDB CDC export under a ClickHouse `load:` is refused when the config is read,
-    /// before a run extracts a stream the load would then refuse.
-    fn validate_mongo_cdc_has_a_loadable_target(&self) -> crate::error::Result<()> {
+    /// A CDC export whose stream the `load:` target cannot take (MongoDB into ClickHouse, Oracle
+    /// anywhere) is refused when the config is read, before a run extracts a stream the load would
+    /// then refuse.
+    fn validate_cdc_has_a_loadable_target(&self) -> crate::error::Result<()> {
         let refusal = self
             .load
             .as_ref()
@@ -1632,6 +1633,29 @@ mod audit_csv_compression {
             Config::from_yaml(&cfg("cdc", "    cdc: { checkpoint: ./c.ckpt }\n")).unwrap_err();
         assert!(
             format!("{err:#}").contains("a MongoDB CDC stream cannot load into ClickHouse"),
+            "{err:#}"
+        );
+        assert!(
+            Config::from_yaml(&cfg("full", "")).is_ok(),
+            "a batch export loads"
+        );
+    }
+
+    /// An Oracle `mode: cdc` export under any `load:` is refused when the config is read.
+    #[test]
+    fn an_oracle_cdc_export_under_a_load_is_refused_and_batch_is_not() {
+        let cfg = |mode: &str, extra: &str| {
+            format!(
+                "source:\n  type: oracle\n  url: \"oracle://u:p@localhost:1521/FREEPDB1\"\n\
+                 load: {{ target: bigquery, project: p, dataset: d }}\n\
+                 exports:\n  - name: orders\n    table: orders\n    mode: {mode}\n{extra}\
+                 \x20   format: parquet\n    destination: {{ type: gcs, bucket: b, prefix: \"p/\" }}\n"
+            )
+        };
+        let err =
+            Config::from_yaml(&cfg("cdc", "    cdc: { checkpoint: ./c.ckpt }\n")).unwrap_err();
+        assert!(
+            format!("{err:#}").contains(crate::config::load::ORACLE_CDC_NOT_LOADABLE),
             "{err:#}"
         );
         assert!(

@@ -1412,12 +1412,7 @@ pub fn source_engine(config_path: &str) -> Result<crate::load::cdc::SourceEngine
         SourceType::Mysql => Ok(SourceEngine::MySql),
         SourceType::Mssql => Ok(SourceEngine::SqlServer),
         SourceType::Mongo => Ok(SourceEngine::Mongo),
-        SourceType::Oracle => {
-            anyhow::bail!(
-                "loading an Oracle CDC stream is not supported yet: the Oracle CDC preview \
-                 captures to files only (ADR-0037); load its parts with your own tooling"
-            )
-        }
+        SourceType::Oracle => anyhow::bail!("{}", crate::config::load::ORACLE_CDC_NOT_LOADABLE),
     }
 }
 
