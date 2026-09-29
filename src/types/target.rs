@@ -364,6 +364,8 @@ mod bigquery {
     /// BigQuery BIGNUMERIC precision/scale limits.
     const BIGNUMERIC_MAX_P: u8 = 76;
     const BIGNUMERIC_MAX_S: i8 = 38;
+    /// BIGNUMERIC's range is about ±5.79e38, so it holds at most 38 integer digits.
+    const BIGNUMERIC_MAX_INT_DIGITS: i16 = 38;
 
     pub(super) fn resolve(input: &TargetInput<'_>) -> TargetColumnSpec {
         native(input.rivet_type).into_spec(input)
@@ -452,11 +454,16 @@ mod bigquery {
         }
         let native = if p <= NUMERIC_MAX_P && s <= NUMERIC_MAX_S {
             "NUMERIC"
-        } else if p <= BIGNUMERIC_MAX_P && s <= BIGNUMERIC_MAX_S {
+        } else if p <= BIGNUMERIC_MAX_P
+            && s <= BIGNUMERIC_MAX_S
+            && i16::from(p) - i16::from(s) <= BIGNUMERIC_MAX_INT_DIGITS
+        {
             "BIGNUMERIC"
         } else {
             return Resolved::fail(format!(
-                "decimal({p},{s}) exceeds BigQuery BIGNUMERIC limits (max 76,38)"
+                "decimal({p},{s}) exceeds BigQuery BIGNUMERIC limits (max 76,38, and at most \
+                 38 integer digits; this has {})",
+                i16::from(p) - i16::from(s)
             ));
         };
         Resolved::ok(native)
@@ -1255,6 +1262,21 @@ mod tests {
             .status,
             TargetStatus::Fail
         );
+        // BIGNUMERIC holds 38 integer digits: p - s past that is Fail, whatever p is.
+        for (p, s, want) in [
+            (38, 0, TargetStatus::Ok),
+            (39, 1, TargetStatus::Ok),
+            (39, 0, TargetStatus::Fail),
+            (50, 0, TargetStatus::Fail),
+            (65, 0, TargetStatus::Fail),
+            (76, 0, TargetStatus::Fail),
+        ] {
+            let r = bq(&RivetType::Decimal {
+                precision: p,
+                scale: s,
+            });
+            assert_eq!(r.status, want, "decimal({p},{s}): {:?}", r.note);
+        }
         // Between NUMERIC and BIGNUMERIC escalates rather than overflowing NUMERIC.
         assert_eq!(
             bq(&RivetType::Decimal {
