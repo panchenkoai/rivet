@@ -710,6 +710,16 @@ mod tests {
     }
 
     #[test]
+    fn markdown_explains_a_restart_only_for_a_failed_run_with_nothing_committed() {
+        let md = |status: &str| {
+            let s = fresh_summary(status, 0);
+            render_markdown(&RunReport::from_summary(&s, "rivet.yaml", "export"))
+        };
+        assert!(md("failed").contains("No files were committed before the failure"));
+        assert!(!md("success").contains("## Resume"));
+    }
+
+    #[test]
     fn journals_to_json_empty_is_valid_array() {
         let json = journals_to_json(&[]).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();

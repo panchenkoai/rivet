@@ -286,7 +286,7 @@ pub(in crate::pipeline) fn run_chunked_parallel_checkpoint(
                                 let _ = shared_fingerprint
                                     .set(crate::state::schema_fingerprint(&columns));
                             }
-                            if sink.total_rows == 0 {
+                            if sink.is_empty() {
                                 return Ok((0, Vec::new(), Default::default(), Default::default()));
                             }
                             let fmt = format::create_format(
@@ -529,5 +529,47 @@ fn record_durable_parts(
                 e
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::super::commit::PartRecord;
+
+    #[test]
+    fn every_durable_part_gets_its_own_file_log_row() {
+        let d = tempfile::tempdir().unwrap();
+        let cfg = d.path().join("rivet.yaml");
+        let store = crate::state::StateStore::open(cfg.to_str().unwrap()).unwrap();
+        let part = |name: &str, rows: i64| PartRecord {
+            file_name: name.into(),
+            rows,
+            bytes: 10,
+            fingerprint: String::new(),
+            md5: String::new(),
+        };
+        super::record_durable_parts(
+            &store,
+            crate::state::DurablePart {
+                run_id: "r1",
+                export_name: "orders",
+                file_name: "",
+                rows: 0,
+                bytes: 0,
+                format: "parquet",
+                compression: None,
+                mode: "chunked",
+                cursor_high: None,
+            },
+            &[part("a.parquet", 3), part("b.parquet", 4)],
+        );
+        let mut got: Vec<(String, i64)> = store
+            .list_files_for_run("r1")
+            .unwrap()
+            .into_iter()
+            .map(|f| (f.file_name, f.row_count))
+            .collect();
+        got.sort();
+        assert_eq!(got, vec![("a.parquet".into(), 3), ("b.parquet".into(), 4)]);
     }
 }

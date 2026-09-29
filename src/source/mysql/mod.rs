@@ -889,6 +889,24 @@ impl super::Source for MysqlSource {
 mod tests {
     use super::{bit_bytes_to_u64, correct_innodb_avg_row_length};
 
+    #[test]
+    fn only_an_enforced_tls_mode_turns_on_the_driver_ssl_options() {
+        use crate::config::{TlsConfig, TlsMode};
+        let ssl = |mode: Option<TlsMode>| {
+            let cfg = mode.map(|mode| TlsConfig {
+                mode,
+                ca_file: None,
+                accept_invalid_certs: false,
+                accept_invalid_hostnames: false,
+            });
+            let builder = mysql::OptsBuilder::from_opts(mysql::Opts::from_url("mysql://h/db").unwrap());
+            super::with_tls(builder, cfg.as_ref()).get_ssl_opts().is_some()
+        };
+        assert!(ssl(Some(TlsMode::Require)));
+        assert!(!ssl(Some(TlsMode::Disable)));
+        assert!(!ssl(None));
+    }
+
     // Proxy classifier tests live in `proxy.rs` alongside the classifier.
 
     // ── bit_bytes_to_u64 (lives in arrow_convert.rs, exported pub(super)) ──

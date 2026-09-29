@@ -88,7 +88,7 @@ fn export_one_chunk_range(
         super::super::manifest_writer::record_run_schema_fingerprint(summary, s);
     }
 
-    if sink.total_rows == 0 {
+    if sink.is_empty() {
         return Ok((0, Vec::new(), Default::default(), Default::default()));
     }
 

@@ -1097,6 +1097,27 @@ mod tests {
     /// wrong: a classifiable failure must classify, and a success must not
     /// invent a class.
     #[test]
+    fn a_cdc_run_is_recorded_in_the_metrics_ledger() {
+        let d = tempfile::tempdir().unwrap();
+        let cfg_path = d.path().join("rivet.yaml");
+        let store = crate::state::StateStore::open(cfg_path.to_str().unwrap()).unwrap();
+        let config = crate::config::Config::from_yaml(
+            "source:\n  type: postgres\n  url: \"postgresql://localhost/t\"\n\
+             exports:\n  - name: a\n    table: t\n    format: parquet\n\
+             \x20   destination:\n      type: local\n      path: ./out\n",
+        )
+        .unwrap();
+        let export = crate::config::sample_export("cdc_t");
+        let summary =
+            super::cdc_summary("r_m1", &export, "success", 7, 1, 100, 10, 50, None);
+        super::record_metric(&store, &config, &export, &summary);
+        let got = store.get_metrics(Some("cdc_t"), 10).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].run_id.as_deref(), Some("r_m1"));
+        assert_eq!(got[0].total_rows, 7);
+    }
+
+    #[test]
     fn cdc_metric_row_classifies_a_failure_the_way_the_batch_path_does() {
         let export = crate::config::sample_export("t");
         // The literal is one `classify_error_message` actually maps (its own

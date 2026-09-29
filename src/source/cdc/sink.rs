@@ -1333,6 +1333,37 @@ mod partition_budget_tests {
     use super::{budget_slices, unbudgetable_partition_warning};
 
     #[test]
+    fn each_part_checksum_is_read_from_its_own_source_column_past_the_meta_columns() {
+        use crate::source::value_checksum::array_checksum;
+        use crate::types::{RivetType, TypeFidelity, TypeMapping};
+        use arrow::array::{ArrayRef, Int64Array};
+        use arrow::datatypes::DataType;
+        let col = |name: &str| TypeMapping {
+            column_name: name.into(),
+            source_native_type: String::new(),
+            rivet_type: RivetType::Int64,
+            arrow_type: Some(DataType::Int64),
+            fidelity: TypeFidelity::Exact,
+            nullable: true,
+            warnings: vec![],
+        };
+        let arrays: Vec<ArrayRef> = (0..5i64)
+            .map(|k| std::sync::Arc::new(Int64Array::from(vec![k * 10 + 1, k * 10 + 2])) as ArrayRef)
+            .collect();
+        let batch = arrow::record_batch::RecordBatch::try_from_iter(
+            ["m0", "m1", "m2", "a", "b"].into_iter().zip(arrays.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            super::slice_column_sums(&batch, &[col("a"), col("b")]),
+            vec![
+                ("a".to_string(), array_checksum(arrays[3].as_ref())),
+                ("b".to_string(), array_checksum(arrays[4].as_ref())),
+            ]
+        );
+    }
+
+    #[test]
     fn a_partition_the_stream_cannot_budget_is_said_and_one_it_can_is_not() {
         use crate::types::{RivetType, TypeFidelity, TypeMapping};
         use arrow::datatypes::DataType;

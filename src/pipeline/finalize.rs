@@ -1059,6 +1059,17 @@ pub(crate) fn destination_uri_for_manifest(cfg: &DestinationConfig) -> String {
 #[cfg(test)]
 mod tests {
 
+    #[test]
+    fn the_run_report_lands_beside_the_config() {
+        let d = tempfile::tempdir().unwrap();
+        let cfg = d.path().join("rivet.yaml");
+        let summary = crate::pipeline::RunSummary::stub_for_testing("run_fin_1", "orders");
+        super::finalize_run_report(cfg.to_str().unwrap(), &summary, "export");
+        let dir = d.path().join(".rivet/runs/run_fin_1");
+        assert!(dir.join("summary.json").is_file());
+        assert!(dir.join("summary.md").is_file());
+    }
+
     /// The rerun guard must apply to every destination that can actually hold a
     /// previous run's parts — and the protocols come from the REAL destinations,
     /// not a hand-built capability struct, because the bug this guards is a

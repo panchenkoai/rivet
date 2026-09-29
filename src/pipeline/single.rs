@@ -283,6 +283,15 @@ pub(crate) fn run_export(
     )
 }
 
+/// A part's file name: a `_part<N>` suffix whenever the run seals more than one part.
+fn part_file_name(export: &str, ts: &str, part_idx: usize, part_count: usize, ext: &str) -> String {
+    if part_count > 1 {
+        format!("{export}_{ts}_part{part_idx}.{ext}")
+    } else {
+        format!("{export}_{ts}.{ext}")
+    }
+}
+
 pub(super) fn run_single_export(
     src: &mut dyn Source,
     query: &str,
@@ -386,7 +395,7 @@ pub(super) fn run_single_export(
         summary.quality_passed = Some(true);
     }
 
-    if sink.total_rows == 0 {
+    if sink.is_empty() {
         log::info!("export '{}': no data to export", plan.export_name);
         return Ok(());
     }
@@ -397,12 +406,11 @@ pub(super) fn run_single_export(
     let (dest, ext) = (frame.dest, frame.ext);
     let ext = ext.as_str();
 
-    let has_parts = parts.len() > 1;
     // Millisecond precision (matches keyset.rs / mongo_parallel.rs / cdc sink):
     // two runs into the same prefix within the same SECOND must not produce
     // identical part names, or the later run silently clobbers the earlier's file
     // (LocalDestination idempotent_overwrite) — a real incremental-delta loss.
-    let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f");
+    let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
 
     for (part_idx, part) in parts.iter().enumerate() {
         // Test-only: a RETURNED error mid-commit-loop (not a crash — a panic
@@ -423,11 +431,7 @@ pub(super) fn run_single_export(
                 .record(RunEvent::ValidationResult { passed: true });
         }
 
-        let file_name = if has_parts {
-            format!("{}_{}_part{}.{}", plan.export_name, ts, part_idx, ext)
-        } else {
-            format!("{}_{}.{}", plan.export_name, ts, ext)
-        };
+        let file_name = part_file_name(&plan.export_name, &ts, part_idx, parts.len(), ext);
 
         // ADR-0001 I1→I2→I7 + the I2/I3 fault windows + the manifest/journal/
         // counters all live in `commit::{write_part_file,record_part}` now (one
@@ -557,6 +561,13 @@ fn is_port_closed(e: &anyhow::Error) -> bool {
 mod tests {
     use super::*;
     use arrow::array::Int64Array;
+
+    #[test]
+    fn only_a_multi_part_run_suffixes_its_part_names() {
+        assert_eq!(part_file_name("t", "ts", 0, 1, "parquet"), "t_ts.parquet");
+        assert_eq!(part_file_name("t", "ts", 0, 2, "parquet"), "t_ts_part0.parquet");
+        assert_eq!(part_file_name("t", "ts", 1, 2, "parquet"), "t_ts_part1.parquet");
+    }
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use std::sync::Arc;

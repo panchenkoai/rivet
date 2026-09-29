@@ -212,7 +212,7 @@ fn fill_keyset_page(
         &mut sink,
     )?;
     sink.finish_writer()?;
-    if sink.total_rows == 0 {
+    if sink.is_empty() {
         return Ok(None); // range exhausted, or an exact-multiple last page
     }
     Ok(Some(sink))

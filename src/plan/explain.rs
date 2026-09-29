@@ -318,6 +318,19 @@ mod tests {
         assert!(off.contains("re-reads the whole table"), "{off}");
     }
 
+    #[test]
+    fn a_keyset_plan_reports_its_own_checkpoint_and_worker_count() {
+        let diag = base_diag("keyset");
+        let mut on = keyset("id");
+        if let ExtractionStrategy::Keyset(kp) = &mut on {
+            kp.checkpoint = true;
+            kp.parallel = 4;
+        }
+        assert!(explain_risk(&diag, &on).contains("resumes from its last committed key"));
+        assert!(explain_risk(&diag, &keyset("id")).contains("a re-run restarts from the first page"));
+        assert_eq!(parallel_workers(&on), 4);
+    }
+
     fn incremental(column: &str) -> ExtractionStrategy {
         ExtractionStrategy::Incremental(crate::plan::IncrementalCursorPlan {
             primary_column: column.into(),
