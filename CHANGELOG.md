@@ -36,6 +36,12 @@
   `postgresql://u:p@localhost/db?hostaddr=203.0.113.5` passed as loopback and sent credentials and
   rows to the remote address in cleartext. Every `host=`/`hostaddr=` value must now be loopback
   or a unix-socket path, or the connection needs a `tls:` block.
+- **Breaking: MySQL `TIME` outside 00:00–24:00 is refused, not written as garbage.** A table
+  holding durations that exported with exit 0 before now fails every run. A MySQL `TIME` is a
+  duration of up to ±838:59:59, and a Parquet `TIME` holds one day. `838:59:59` read back as
+  `'1$:59:59'`, a negative value made the file unreadable, and unparseable text became NULL, all
+  with exit 0. Such a value now fails with `RIVET_SOURCE_VALUE_UNREPRESENTABLE` (exit 5), naming a
+  cast that keeps it (`TIME_TO_SEC(col)`, `CAST(col AS CHAR)`).
 
 - **Oracle Database as a batch source (preview).** `source.type: oracle` with an
   `oracle://user:password@host:1521/SERVICE` URL runs `full`, `incremental`, range- and
@@ -137,11 +143,6 @@
   as "contained" with no warning, which switched off the one identity check that catches a
   `RESET MASTER` on the same server. The query error now fails the resume. A checkpoint with a
   GTID set that gets no containment answer resumes with a warning.
-- **MySQL `TIME` outside 00:00–24:00 is refused, not written as garbage.** A MySQL `TIME` is a
-  duration of up to ±838:59:59, and a Parquet `TIME` holds one day. `838:59:59` read back as
-  `'1$:59:59'`, a negative value made the file unreadable, and unparseable text became NULL, all
-  with exit 0. Such a value now fails with `RIVET_SOURCE_VALUE_UNREPRESENTABLE` (exit 5), naming a
-  cast that keeps it (`TIME_TO_SEC(col)`, `CAST(col AS CHAR)`).
 - **PostgreSQL `time '24:00:00'` and a `timestamp` `infinity` are refused in batch exports.**
   `24:00:00` wrapped to `00:00:00` with exit 0, and both checksum sides agreed. A
   `'infinity'::timestamp` (without time zone) panicked the process (exit 101, no summary). Both
