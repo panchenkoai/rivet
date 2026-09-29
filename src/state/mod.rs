@@ -292,9 +292,7 @@ impl StateStore {
     }
 
     fn open_postgres(url: &str) -> Result<Self> {
-        let is_local =
-            url.contains("localhost") || url.contains("127.0.0.1") || url.contains("::1");
-        if !is_local && crate::source::url_tls(url).1.is_none() {
+        if is_plaintext_remote(url) {
             log::warn!(
                 "state(pg): connecting to a remote host without TLS; \
                  add sslmode=require (or verify-ca / verify-full) to RIVET_STATE_URL \
@@ -356,7 +354,32 @@ impl StateStore {
     }
 }
 
+/// A state URL that reaches a non-loopback host without an `sslmode` asking for TLS.
+fn is_plaintext_remote(url: &str) -> bool {
+    !crate::source::host_is_loopback(url) && crate::source::url_tls(url).1.is_none()
+}
+
 // ─── Migration tests ──────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod plaintext_remote_warning {
+    use super::is_plaintext_remote;
+
+    #[test]
+    fn only_a_remote_host_without_tls_is_plaintext_remote() {
+        assert!(is_plaintext_remote("postgres://u:p@db.example.com/s"));
+        assert!(!is_plaintext_remote(
+            "postgres://u:p@db.example.com/s?sslmode=require"
+        ));
+        assert!(!is_plaintext_remote("postgres://u:p@localhost/s"));
+        assert!(!is_plaintext_remote("postgres://u:p@127.0.0.1:5432/s"));
+        assert!(!is_plaintext_remote("postgres://u:p@[::1]:5432/s"));
+        assert!(
+            is_plaintext_remote("postgres://u:localhost@db.example.com/s"),
+            "a password that spells a loopback name is not a loopback host"
+        );
+    }
+}
 
 #[cfg(test)]
 mod empty_state_path_guard {
