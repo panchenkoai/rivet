@@ -286,8 +286,8 @@ fn lease_skip_message(table: &str, prefix: &str, lease_error: Option<&str>) -> S
     match lease_error {
         None => format!(
             "  cleanup [{table}]: SKIPPED — another rivet holds {prefix} right now; the load \
-             proceeds; the staged Parquet will be left in place, and the next load with \
-             `cleanup_source` removes it."
+             proceeds; the staged Parquet will be left in place, and the next load's cleanup \
+             removes it."
         ),
         Some(e) => format!(
             "  cleanup [{table}]: SKIPPED — could not take the prefix lease on {prefix} ({e}). \
