@@ -285,3 +285,89 @@ fn successful_run_writes_summary_artifacts_under_dot_rivet() {
         );
     }
 }
+
+/// Seed `(id int8, <cols>)` on the primary and return its drop guard.
+fn seed_pg_override_table(cols: &str, values: &str) -> PgTable {
+    let name = unique_name("pg_ovr");
+    pg_connect()
+        .batch_execute(&format!(
+            "CREATE TABLE {name} (id int8 PRIMARY KEY, {cols}); INSERT INTO {name} VALUES {values};"
+        ))
+        .expect("seed override table");
+    PgTable::adopt(name)
+}
+
+/// Run an export under one `columns:` override and return (exit code, combined output).
+fn run_pg_override(table: &PgTable, override_line: &str) -> (Option<i32>, String) {
+    let out = Rig::pg_batch(table.name())
+        .export_line("columns:")
+        .export_line(override_line)
+        .run();
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (out.status.code(), said)
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn an_int2_and_int4_column_widened_by_an_int8_override_round_trip_exactly() {
+    require_alive(LiveService::Postgres);
+    let table = seed_pg_override_table(
+        "a int2 NOT NULL, b int4 NOT NULL",
+        "(1, -32768, -2147483648), (2, 32767, 2147483647), (3, -1, 0)",
+    );
+    let rig = Rig::pg_batch(table.name())
+        .export_line("columns:")
+        .export_line("  a: int8")
+        .export_line("  b: int8");
+    rig.run_ok();
+    let out = rig.out_dir();
+    let mut src = pg_connect();
+    for col in ["a", "b"] {
+        assert_eq!(
+            parquet_column_type(&out, col),
+            arrow::datatypes::DataType::Int64
+        );
+        let mut want: Vec<i64> = src
+            .query(&format!("SELECT {col}::int8 FROM {}", table.name()), &[])
+            .unwrap()
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+        let mut got = duckdb_dir_parquet_i64(&out, col);
+        want.sort();
+        got.sort();
+        assert_eq!(got, want, "column {col} must round-trip the source values");
+    }
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn an_int2_override_on_an_int8_value_that_does_not_fit_is_refused_by_name() {
+    require_alive(LiveService::Postgres);
+    let table = seed_pg_override_table("v int8", "(1, 7), (2, 40000)");
+    let (code, said) = run_pg_override(&table, "  v: int2");
+    assert_ne!(code, Some(101), "rivet panicked:\n{said}");
+    assert_ne!(code, Some(0), "an overflowing narrowing must fail:\n{said}");
+    assert!(
+        said.contains("holds 40000, which does not fit the int2"),
+        "the refusal must name the value and the declared width:\n{said}"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_bool_override_on_an_integer_column_is_refused_by_name() {
+    require_alive(LiveService::Postgres);
+    let table = seed_pg_override_table("v int4", "(1, 1)");
+    let (code, said) = run_pg_override(&table, "  v: bool");
+    assert_ne!(code, Some(101), "rivet panicked:\n{said}");
+    assert_ne!(code, Some(0), "a bool override on int must fail:\n{said}");
+    assert!(
+        said.contains("is declared bool by a `columns:` override but PostgreSQL sends it as int4"),
+        "the refusal must name the override and the wire type:\n{said}"
+    );
+}

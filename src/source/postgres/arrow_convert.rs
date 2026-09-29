@@ -108,6 +108,82 @@ impl<'a> PgFromSql<'a> for PgTimeMicros {
     }
 }
 
+/// Any PostgreSQL integer cell (`int2`/`int4`/`int8`/`oid`) decoded at its wire width, widened to i64.
+struct PgInt(i64);
+
+impl<'a> PgFromSql<'a> for PgInt {
+    fn accepts(ty: &Type) -> bool {
+        matches!(*ty, Type::INT2 | Type::INT4 | Type::INT8 | Type::OID)
+    }
+
+    fn from_sql(
+        ty: &Type,
+        raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        Ok(Self(match *ty {
+            Type::INT2 => i16::from_be_bytes(raw.try_into()?).into(),
+            Type::INT4 => i32::from_be_bytes(raw.try_into()?).into(),
+            Type::OID => u32::from_be_bytes(raw.try_into()?).into(),
+            _ => i64::from_be_bytes(raw.try_into()?),
+        }))
+    }
+}
+
+/// A `columns:` override the wire value cannot be read as, named instead of panicking in `Row::get`.
+fn pg_override_mismatch(
+    row: &Row,
+    col_idx: usize,
+    declared: &str,
+    cause: impl std::fmt::Display,
+) -> anyhow::Error {
+    let c = &row.columns()[col_idx];
+    anyhow::Error::new(crate::error::CodedError::new(
+        crate::error::codes::SOURCE_OVERRIDE_WIRE_MISMATCH,
+        format!(
+            "postgres: column `{}` is declared {declared} by a `columns:` override but \
+             PostgreSQL sends it as {} ({cause}) — rivet does not convert it. Remove the \
+             override, or CAST the column to that type in the export's `query:`.",
+            c.name(),
+            c.type_()
+        ),
+    ))
+}
+
+/// Read one cell as `T`, turning a wire/override mismatch into a named error.
+fn pg_cell<'a, T: PgFromSql<'a>>(
+    row: &'a Row,
+    col_idx: usize,
+    declared: &str,
+) -> Result<Option<T>> {
+    row.try_get::<_, Option<T>>(col_idx)
+        .map_err(|e| pg_override_mismatch(row, col_idx, declared, e))
+}
+
+/// Side A re-reads a cell `build_array` already decoded; an error there surfaces as a checksum mismatch.
+fn side_a<T>(cell: Result<Option<T>>) -> Option<T> {
+    cell.ok().flatten()
+}
+
+/// An integer cell narrowed to the declared width, refusing a value that does not fit.
+fn pg_int_cell<T: TryFrom<i64>>(row: &Row, col_idx: usize, declared: &str) -> Result<Option<T>> {
+    match pg_cell::<PgInt>(row, col_idx, declared)? {
+        None => Ok(None),
+        Some(PgInt(v)) => T::try_from(v).map(Some).map_err(|_| {
+            let c = &row.columns()[col_idx];
+            anyhow::Error::new(crate::error::CodedError::new(
+                crate::error::codes::SOURCE_VALUE_UNREPRESENTABLE,
+                format!(
+                    "postgres: column `{}` ({}) holds {v}, which does not fit the {declared} \
+                     declared by its `columns:` override — rivet refuses rather than wrapping \
+                     or writing NULL. Declare a wider integer type, or remove the override.",
+                    c.name(),
+                    c.type_()
+                ),
+            ))
+        }),
+    }
+}
+
 /// PostgreSQL `json` / `jsonb` cells borrowed as their raw source text.
 ///
 /// The wire payload already IS the JSON text: `json_send` transmits the
@@ -514,17 +590,13 @@ impl crate::source::value_checksum::CellSource for PgCellSource<'_> {
         self.rows.len()
     }
     fn int16(&self, col: usize, row: usize) -> Option<i16> {
-        self.rows[row].get::<_, Option<i16>>(col)
+        side_a(pg_int_cell(&self.rows[row], col, "int2"))
     }
     fn int32(&self, col: usize, row: usize) -> Option<i32> {
-        self.rows[row].get::<_, Option<i32>>(col)
+        side_a(pg_int_cell(&self.rows[row], col, "int4"))
     }
     fn int64(&self, col: usize, row: usize) -> Option<i64> {
-        if self.columns[col].1 == Type::OID {
-            self.rows[row].get::<_, Option<u32>>(col).map(|v| v as i64)
-        } else {
-            self.rows[row].get::<_, Option<i64>>(col)
-        }
+        side_a(pg_int_cell(&self.rows[row], col, "int8"))
     }
     fn uint64(&self, _col: usize, _row: usize) -> Option<u64> {
         // Postgres never maps to UInt64 (OID widens to i64), so source_checksums
@@ -532,10 +604,10 @@ impl crate::source::value_checksum::CellSource for PgCellSource<'_> {
         None
     }
     fn float32(&self, col: usize, row: usize) -> Option<f32> {
-        self.rows[row].get::<_, Option<f32>>(col)
+        side_a(pg_cell(&self.rows[row], col, "float4"))
     }
     fn float64(&self, col: usize, row: usize) -> Option<f64> {
-        self.rows[row].get::<_, Option<f64>>(col)
+        side_a(pg_cell(&self.rows[row], col, "float8"))
     }
     fn decimal128(&self, col: usize, row: usize, scale: i8) -> Option<i128> {
         let Ok(wire) = self.rows[row].try_get::<_, Option<PgNumericWire<'_>>>(col) else {
@@ -574,12 +646,10 @@ impl crate::source::value_checksum::CellSource for PgCellSource<'_> {
         }
     }
     fn boolean(&self, col: usize, row: usize) -> Option<bool> {
-        self.rows[row].get::<_, Option<bool>>(col)
+        side_a(pg_cell(&self.rows[row], col, "bool"))
     }
     fn binary(&self, col: usize, row: usize) -> Option<Cow<'_, [u8]>> {
-        self.rows[row]
-            .get::<_, Option<Vec<u8>>>(col)
-            .map(Cow::Owned)
+        side_a(pg_cell::<Vec<u8>>(&self.rows[row], col, "bytes")).map(Cow::Owned)
     }
     fn utf8(&self, col: usize, row: usize) -> Option<Cow<'_, [u8]>> {
         let r = &self.rows[row];
@@ -704,49 +774,43 @@ fn build_array(
         DataType::Boolean => {
             let mut b = BooleanBuilder::with_capacity(rows.len());
             for row in rows {
-                b.append_option(row.get(col_idx));
+                b.append_option(pg_cell::<bool>(row, col_idx, "bool")?);
             }
             Ok(Arc::new(b.finish()))
         }
         DataType::Int16 => {
             let mut b = Int16Builder::with_capacity(rows.len());
             for row in rows {
-                b.append_option(row.get(col_idx));
+                b.append_option(pg_int_cell::<i16>(row, col_idx, "int2")?);
             }
             Ok(Arc::new(b.finish()))
         }
         DataType::Int32 => {
             let mut b = Int32Builder::with_capacity(rows.len());
             for row in rows {
-                b.append_option(row.get(col_idx));
+                b.append_option(pg_int_cell::<i32>(row, col_idx, "int4")?);
             }
             Ok(Arc::new(b.finish()))
         }
         DataType::Int64 => {
-            // INT8 reads i64; OID reads u32 widened to i64.
+            // Any integer wire width (and OID) widens losslessly to i64.
             let mut b = Int64Builder::with_capacity(rows.len());
-            if *pg_type == Type::OID {
-                for row in rows {
-                    b.append_option(row.get::<_, Option<u32>>(col_idx).map(|v| v as i64));
-                }
-            } else {
-                for row in rows {
-                    b.append_option(row.get(col_idx));
-                }
+            for row in rows {
+                b.append_option(pg_int_cell::<i64>(row, col_idx, "int8")?);
             }
             Ok(Arc::new(b.finish()))
         }
         DataType::Float32 => {
             let mut b = Float32Builder::with_capacity(rows.len());
             for row in rows {
-                b.append_option(row.get(col_idx));
+                b.append_option(pg_cell::<f32>(row, col_idx, "float4")?);
             }
             Ok(Arc::new(b.finish()))
         }
         DataType::Float64 => {
             let mut b = Float64Builder::with_capacity(rows.len());
             for row in rows {
-                b.append_option(row.get(col_idx));
+                b.append_option(pg_cell::<f64>(row, col_idx, "float8")?);
             }
             Ok(Arc::new(b.finish()))
         }
@@ -756,7 +820,7 @@ fn build_array(
         DataType::Binary => {
             let mut b = BinaryBuilder::with_capacity(rows.len(), rows.len() * 64);
             for row in rows {
-                match row.get::<_, Option<Vec<u8>>>(col_idx) {
+                match pg_cell::<Vec<u8>>(row, col_idx, "bytes")? {
                     Some(v) => {
                         // Pre-allocation ceiling: the driver copy (`Vec<u8>`) is
                         // unavoidable, but bail before it is appended so the
@@ -925,7 +989,7 @@ fn build_pg_text_array(
         // INTERVAL → ISO 8601 (Arrow Interval(MonthDayNano) is not Parquet-writable).
         Type::INTERVAL => {
             for row in rows {
-                match row.try_get::<_, Option<PgInterval>>(col_idx).ok().flatten() {
+                match pg_cell::<PgInterval>(row, col_idx, "string")? {
                     Some(iv) => {
                         b.append_value(pg_interval_to_iso8601(iv.months, iv.days, iv.microseconds))
                     }
@@ -1275,7 +1339,7 @@ mod decimal_override_tests {
 
 #[cfg(test)]
 mod temporal_refusal_tests {
-    use super::{MICROS_PER_DAY, PgTimeMicros};
+    use super::{MICROS_PER_DAY, PgInt, PgTimeMicros};
     use postgres::types::{FromSql, Type};
 
     /// PostgreSQL's legal `time '24:00:00'` is refused, not wrapped to midnight.
@@ -1321,6 +1385,43 @@ mod temporal_refusal_tests {
                 "a temporal read goes through Row::get, which panics on `infinity`: {needle}"
             );
         }
+    }
+
+    /// Every integer wire width decodes at its own width and widens exactly to i64.
+    #[test]
+    fn an_integer_cell_is_decoded_at_its_wire_width_and_widened() {
+        let dec = |ty: &Type, raw: &[u8]| PgInt::from_sql(ty, raw).unwrap().0;
+        assert_eq!(dec(&Type::INT2, &(-12_345i16).to_be_bytes()), -12_345);
+        assert_eq!(
+            dec(&Type::INT4, &(-2_000_000_001i32).to_be_bytes()),
+            -2_000_000_001
+        );
+        assert_eq!(
+            dec(&Type::INT8, &(-9_000_000_000_123i64).to_be_bytes()),
+            -9_000_000_000_123
+        );
+        assert_eq!(
+            dec(&Type::OID, &4_000_000_000u32.to_be_bytes()),
+            4_000_000_000
+        );
+        assert!(PgInt::from_sql(&Type::INT8, &7i32.to_be_bytes()).is_err());
+        assert!(!<PgInt as FromSql>::accepts(&Type::BOOL));
+    }
+
+    /// No scalar cell is read with the panicking `Row::get` outside the text-typed arms.
+    #[test]
+    fn no_scalar_column_is_read_with_panicking_get() {
+        let src = include_str!("arrow_convert.rs");
+        let product = &src[..src.find("#[cfg(test)]").unwrap()];
+        let panicking: Vec<&str> = product
+            .lines()
+            .filter(|l| l.contains("row.get(col_idx)") || l.contains(".get::<"))
+            .filter(|l| !l.contains("Option<&str>"))
+            .collect();
+        assert!(
+            panicking.is_empty(),
+            "Row::get panics on an override: {panicking:?}"
+        );
     }
 }
 
