@@ -506,13 +506,14 @@ fn aggregate_child_result(failures: &[String], child_exit_codes: &[i32]) -> anyh
     }
 }
 
-/// The most "stop-worthy" exit code among failed children, ranked by
-/// [`crate::error::ExitClass::stop_rank`] (signal / unknown codes rank lowest).
-/// `None` when no child reported a code.
+/// The most stop-worthy class among failed children's codes; a code outside the taxonomy (a panic's 101) counts as Internal.
 fn worst_exit_code(codes: &[i32]) -> Option<i32> {
-    codes.iter().copied().max_by_key(|&c| {
-        crate::error::ExitClass::from_code(c).map_or(0, crate::error::ExitClass::stop_rank)
-    })
+    use crate::error::ExitClass;
+    codes
+        .iter()
+        .map(|&c| ExitClass::from_code(c).unwrap_or(ExitClass::Internal))
+        .max_by_key(|k| k.stop_rank())
+        .map(ExitClass::code)
 }
 
 /// Best-effort reaping of subprocess-export children when the parent receives a
@@ -695,6 +696,13 @@ mod exit_propagation_tests {
         assert_eq!(worst_exit_code(&[1, 5]), Some(5));
         assert_eq!(worst_exit_code(&[6, 2]), Some(6));
         assert_eq!(worst_exit_code(&[3, 6, 5]), Some(3));
+    }
+
+    #[test]
+    fn a_panicked_child_exit_101_is_reported_as_internal_not_passed_through() {
+        assert_eq!(worst_exit_code(&[1, 101]), Some(6));
+        assert_eq!(worst_exit_code(&[2, 101]), Some(6));
+        assert_eq!(worst_exit_code(&[3, 101]), Some(3));
     }
 
     #[test]
