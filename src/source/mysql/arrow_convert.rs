@@ -790,10 +790,25 @@ fn build_array(
                         a.copy_from_slice(bv);
                         Some(a)
                     }
-                    Some(Value::Bytes(bv)) => bytes_to_str(bv)
-                        .and_then(|s| uuid::Uuid::parse_str(s.trim()).ok())
-                        .map(|u| *u.as_bytes()),
-                    _ => None,
+                    Some(Value::Bytes(bv)) => {
+                        match bytes_to_str(bv).and_then(|s| uuid::Uuid::parse_str(s.trim()).ok()) {
+                            Some(u) => Some(*u.as_bytes()),
+                            None => crate::rivet_bail!(
+                                crate::error::codes::SOURCE_OVERRIDE_WIRE_MISMATCH,
+                                "column `{column}` is declared uuid by a `columns:` override but \
+                                 holds {:?}, which is not a uuid — rivet refuses rather than \
+                                 writing NULL. Fix the value, or remove the override.",
+                                String::from_utf8_lossy(bv)
+                            ),
+                        }
+                    }
+                    None | Some(Value::NULL) => None,
+                    Some(other) => crate::rivet_bail!(
+                        crate::error::codes::SOURCE_OVERRIDE_WIRE_MISMATCH,
+                        "column `{column}` is declared uuid by a `columns:` override but MySQL \
+                         sends {other:?} — rivet does not convert it, and writing it as NULL \
+                         would lose every value. Remove the override."
+                    ),
                 };
                 match bytes {
                     Some(a) => b
@@ -1769,6 +1784,35 @@ mod roast_mysql_bit_decode_tests {
         assert_eq!(rows.len(), 1, "{label}: one row");
         build_array(dt, 0, &rows, false, "c", None)
             .unwrap_or_else(|e| panic!("{label}: build_array errored: {e}"))
+    }
+
+    /// A `uuid` override refuses text that is not a uuid and a non-text value; NULL stays NULL.
+    ///
+    /// Before, both fell to `None` and were appended as NULL — a malformed or
+    /// braced id, or an integer column under the override, lost its value with
+    /// exit 0 while both checksum sides agreed.
+    #[test]
+    fn a_uuid_override_refuses_a_value_it_cannot_parse_instead_of_nulling_it() {
+        let fsb = DataType::FixedSizeBinary(16);
+        for (label, (def, bytes)) in [("text", v_bytes(b"not-a-uuid")), ("int", v_int(7))] {
+            let rows = fetch_binary_rows(vec![def], vec![vec![Some(bytes)]]);
+            let err = build_array(&fsb, 0, &rows, false, "u", None).unwrap_err();
+            let coded = err
+                .downcast_ref::<crate::error::CodedError>()
+                .expect("coded");
+            assert_eq!(
+                coded.code(),
+                "RIVET_SOURCE_OVERRIDE_WIRE_MISMATCH",
+                "{label}"
+            );
+            assert!(
+                err.to_string().contains("column `u` is declared uuid"),
+                "{label}: {err}"
+            );
+        }
+        let rows = fetch_binary_rows(vec![v_bytes(b"").0], vec![vec![None]]);
+        let a = build_array(&fsb, 0, &rows, false, "u", None).unwrap();
+        assert_eq!((a.len(), a.null_count()), (1, 1));
     }
 
     /// Every `CellSource` accessor, over the BINARY protocol.
