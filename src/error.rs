@@ -434,6 +434,11 @@ pub mod codes {
         "RIVET_STATE_SCHEMA_NEWER",
         "upgrade rivet, or point this binary at a state DB it created",
     );
+    /// A parallel incremental keyset run met an unfinished sequential run's anchor, whose cursor ran past its unmanifested pages.
+    pub const STATE_KEYSET_SEQUENTIAL_ANCHOR_UNFINISHED: Code = refusal(
+        "RIVET_STATE_KEYSET_SEQUENTIAL_ANCHOR_UNFINISHED",
+        "re-run once with `parallel: 1` to finish the interrupted run, then raise `parallel:`",
+    );
     pub const STATE_CURSOR_OWNER_MISMATCH: Code = refusal(
         "RIVET_STATE_CURSOR_OWNER_MISMATCH",
         "`rivet state reset --export <name>` to start the new cursor with a full pass, or restore the previous cursor column",
@@ -516,6 +521,7 @@ pub mod codes {
         SOURCE_CDC_PREREQUISITE,
         STATE_SCHEMA_NEWER,
         STATE_CURSOR_OWNER_MISMATCH,
+        STATE_KEYSET_SEQUENTIAL_ANCHOR_UNFINISHED,
         LOAD_VALUE_OUT_OF_TARGET_RANGE,
         LOAD_COUNT_MISMATCH,
         LOAD_ADOPTION_COLUMN_MISMATCH,

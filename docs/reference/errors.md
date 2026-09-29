@@ -37,6 +37,7 @@ Every failure rivet names carries a stable `RIVET_<FAMILY>_<NAME>` code: in `--j
 | `RIVET_SOURCE_CDC_PREREQUISITE` | environment | 2 if transient, else 1 | apply the setup statement the message names, then re-run (docs/reference/cdc.md) |
 | `RIVET_STATE_SCHEMA_NEWER` | refusal | 5 | upgrade rivet, or point this binary at a state DB it created |
 | `RIVET_STATE_CURSOR_OWNER_MISMATCH` | refusal | 5 | `rivet state reset --export <name>` to start the new cursor with a full pass, or restore the previous cursor column |
+| `RIVET_STATE_KEYSET_SEQUENTIAL_ANCHOR_UNFINISHED` | refusal | 5 | re-run once with `parallel: 1` to finish the interrupted run, then raise `parallel:` |
 | `RIVET_LOAD_VALUE_OUT_OF_TARGET_RANGE` | refusal | 5 | the warehouse type cannot hold this value; declare a wider type (e.g. String) for the column, or fix the source value |
 | `RIVET_LOAD_COUNT_MISMATCH` | integrity | 3 | compare the warehouse table with the run's manifest before re-running; the source is kept |
 | `RIVET_LOAD_ADOPTION_COLUMN_MISMATCH` | refusal | 5 | add the export's new columns to the table (`ALTER TABLE … ADD COLUMN`) and re-run; do not rename it aside |
