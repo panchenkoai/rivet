@@ -266,6 +266,7 @@ impl MysqlChangeStream {
                 checkpoint: g.to_string(),
                 server: server_gtid_executed.unwrap_or_default().to_string(),
             },
+            (Some(g), None) if !g.is_empty() => CheckpointIdentity::GtidUnanswered,
             _ => CheckpointIdentity::Ok,
         }
     }
@@ -705,14 +706,17 @@ impl MysqlChangeStream {
     /// Ask the SERVER whether the checkpoint's GTID set is still contained in what
     /// it has executed. `GTID_SUBSET` is the server's own comparison — reimplementing
     /// set containment over GTID ranges here would be a second definition to drift.
-    fn gtid_is_contained(c: &mut mysql::Conn, subset: &str, superset: &str) -> Option<bool> {
+    fn gtid_is_contained(
+        c: &mut mysql::Conn,
+        subset: &str,
+        superset: &str,
+    ) -> Result<Option<bool>> {
         use mysql::prelude::Queryable;
         if subset.is_empty() {
-            return None;
+            return Ok(None);
         }
-        c.exec_first("SELECT GTID_SUBSET(?, ?)", (subset, superset))
-            .ok()
-            .flatten()
+        crate::test_hook::maybe_fail_at("mysql_gtid_subset_query")?;
+        Ok(c.exec_first("SELECT GTID_SUBSET(?, ?)", (subset, superset))?)
     }
 
     fn current_coordinates(c: &mut mysql::Conn) -> Result<(String, u64)> {
@@ -829,7 +833,9 @@ impl MysqlChangeStream {
             let (server_uuid, server_gtid) = Self::server_identity(&mut conn)?;
             let contained = ckpt_gtid
                 .filter(|g| !g.is_empty())
-                .and_then(|g| Self::gtid_is_contained(&mut conn, g, &server_gtid));
+                .map(|g| Self::gtid_is_contained(&mut conn, g, &server_gtid))
+                .transpose()?
+                .flatten();
             let verdict = Self::checkpoint_identity_verdict(
                 ckpt_uuid,
                 ckpt_gtid,
@@ -2254,11 +2260,15 @@ mod tests {
              refusing on it would break every non-GTID deployment, which is the \
              DEFAULT one"
         );
-        // The server cannot answer (gtid_mode off NOW): the uuid still governs.
+        // No containment answer for a non-empty set: resume on the uuid, but SAY so.
         assert_eq!(
             MysqlChangeStream::checkpoint_identity_verdict(Some(a), Some(g), a, None, None),
-            C::Ok
+            C::GtidUnanswered
         );
+        assert!(matches!(
+            C::GtidUnanswered.verdict(),
+            IdentityVerdict::Unverifiable(w) if w.contains("GTID_SUBSET")
+        ));
     }
 
     /// The rule is DETERMINISTIC — a bare name means the connection's own database,
@@ -3106,13 +3116,15 @@ pub(crate) enum CheckpointIdentity {
     /// Same server, but the transactions the checkpoint names are gone —
     /// `RESET MASTER`, or a rebuild that kept the uuid.
     GtidNotContained { checkpoint: String, server: String },
+    /// Same server, but the server gave no containment answer for a non-empty GTID set.
+    GtidUnanswered,
 }
 
 impl CheckpointIdentity {
     /// The refusal text, or `None` when the resume may proceed.
     pub(crate) fn refusal(&self) -> Option<String> {
         match self {
-            Self::Ok | Self::Unverifiable => None,
+            Self::Ok | Self::Unverifiable | Self::GtidUnanswered => None,
             Self::ForeignServer { checkpoint, server } => Some(format!(
                 "mysql cdc: this checkpoint was written by server `{checkpoint}` and \
                  the connection is to `{server}`. Binlog coordinates are per-server: \
@@ -3142,12 +3154,20 @@ impl CheckpointIdentity {
 
     /// What to WARN about when the resume proceeds but could not be verified.
     pub(crate) fn warning(&self) -> Option<&'static str> {
-        matches!(self, Self::Unverifiable).then_some(
-            "mysql cdc: this checkpoint carries no server identity, so rivet cannot \
-             confirm it belongs to the server it is resuming against. It was written \
-             before rivet recorded one. Binlog coordinates are per-server — if this \
-             config has ever been pointed at a different host, delete the checkpoint \
-             and re-snapshot rather than trusting the resume.",
-        )
+        match self {
+            Self::Unverifiable => Some(
+                "mysql cdc: this checkpoint carries no server identity, so rivet cannot \
+                 confirm it belongs to the server it is resuming against. It was written \
+                 before rivet recorded one. Binlog coordinates are per-server — if this \
+                 config has ever been pointed at a different host, delete the checkpoint \
+                 and re-snapshot rather than trusting the resume.",
+            ),
+            Self::GtidUnanswered => Some(
+                "mysql cdc: the server gave no answer to GTID_SUBSET for this checkpoint's \
+                 GTID set, so a RESET MASTER since it was written cannot be ruled out; \
+                 resuming on the server uuid alone.",
+            ),
+            _ => None,
+        }
     }
 }
