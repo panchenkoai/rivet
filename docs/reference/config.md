@@ -410,7 +410,7 @@ sub-folders by a date column. See [partitioning.md](../partitioning.md).
 | `row_count_max` | integer | Fail if more rows exported |
 | `null_ratio_max` | map (column → float) | Fail if null ratio exceeds threshold |
 | `unique_columns` | list of strings | Fail if values are not unique |
-| `unique_max_entries` | integer | Cap on distinct values tracked per column during uniqueness checks. When reached, a `Warn` is emitted and checking stops for that column. Prevents unbounded memory growth on high-cardinality columns (UUIDs, email addresses, event IDs). |
+| `unique_max_entries` | integer | Cap on distinct values tracked per column during uniqueness checks. When reached, a `Warn` is emitted and checking stops for that column; duplicates already found before the cap still fail the run. Prevents unbounded memory growth on high-cardinality columns (UUIDs, email addresses, event IDs). |
 
 Uniqueness tracking uses typed xxHash3-64 internally — numeric and binary columns are hashed directly from raw bytes without string formatting. `unique_max_entries` is the primary knob to control memory on very large tables.
 
@@ -429,7 +429,7 @@ quality:
 
 **Without `unique_max_entries`** — tracking is unbounded. Safe for tables with hundreds of thousands of rows; may use significant RAM on tables with tens or hundreds of millions of distinct values.
 
-**With `unique_max_entries`** — tracking stops at the limit. The export succeeds but the run summary shows a warning. Use when you want a best-effort uniqueness check without memory risk.
+**With `unique_max_entries`** — tracking stops at the limit and the run summary shows a warning. Duplicates found before the limit still fail the run; ones past it go unseen. Use when you want a best-effort uniqueness check without memory risk.
 
 ---
 
