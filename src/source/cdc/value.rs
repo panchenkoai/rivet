@@ -944,6 +944,7 @@ impl MysqlCellFix {
             (MysqlCellFix::YearText, V::Bytes(b)) => std::str::from_utf8(b)
                 .ok()
                 .and_then(|s| s.parse::<i64>().ok())
+                .map(|y| if y == 1900 { 0 } else { y })
                 .map_or(V::Null, V::Int),
             (MysqlCellFix::MediumIntSign, V::Int(i)) if *i >= (1 << 23) => V::Int(*i - (1 << 24)),
             (MysqlCellFix::MediumIntSign, V::UInt(u)) => {
@@ -1445,6 +1446,12 @@ mod tests {
             V::DateTime(chrono::DateTime::from_timestamp(1, 0).unwrap().naive_utc()),
             "the first real TIMESTAMP second stays a value"
         );
+
+        // YEAR: the binlog decoder adds 1900 to the stored byte, so YEAR 0000 arrives as "1900"
+        // (never a legal YEAR) and must read back as 0, as the batch path does.
+        assert_eq!(fix("year").apply(&V::Bytes(b"1900".to_vec())), V::Int(0));
+        assert_eq!(fix("year").apply(&V::Bytes(b"1901".to_vec())), V::Int(1901));
+        assert_eq!(fix("year").apply(&V::Bytes(b"2024".to_vec())), V::Int(2024));
 
         // BIT(1): one raw byte → Bool; BIT(8): big-endian bytes → UInt.
         assert_eq!(fix("bit(1)").apply(&V::Bytes(vec![1])), V::Bool(true));
