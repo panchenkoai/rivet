@@ -90,7 +90,7 @@ Minimal config:
 
 ```yaml
 source:
-  type: {{SOURCE_TYPE}}           # postgres | mysql | mssql | mongo
+  type: {{SOURCE_TYPE}}           # postgres | mysql | mssql | mongo | oracle
   url_env: DATABASE_URL           # or url_file: / host+user+password_env+database
   tls: { mode: {{TLS}} }          # disable | require | verify-ca | verify-full (+ ca_file:)
 exports:
@@ -114,6 +114,10 @@ destination: { type: azure, bucket: my-container, account_name: acct, account_ke
 > `.rivet_state.db` (cursors, checkpoints, run history) is created next to the
 > config. Add it to `.gitignore`.
 
+> **Oracle** (preview): the URL path is the **service name** (`oracle://user:pass@host:1521/ORCLPDB1`),
+> not a SID. Unquoted names are upper-case (`table: orders` reads `ORDERS`). Types, modes
+> and limits: [reference/oracle.md](reference/oracle.md).
+
 ### 1.2 CDC
 
 Scaffold:
@@ -133,6 +137,7 @@ Source prerequisites:
 | **MySQL** | `log_bin=ON`, `binlog_format=ROW`, `binlog_row_image=FULL`, `binlog_row_metadata=FULL` (recommended), binlog retention ≫ the run interval |
 | **SQL Server** | SQL Server Agent running; Enterprise / Standard / Developer (not Express/Web) |
 | **MongoDB** | Replica set required (`?directConnection=true` for a port-mapped single node) |
+| **Oracle** (preview) | `ARCHIVELOG` mode, minimal supplemental logging, and `ALL COLUMNS` supplemental logging on each captured table (key-only logging is refused). The URL path is the pluggable database's service name; rivet mines from `CDB$ROOT`. Archived-log retention is the DBA's: nothing pins logs for rivet |
 
 Grants for the selected engine:
 
@@ -175,7 +180,7 @@ exports:
     format: parquet
     cdc:
       initial: snapshot            # first run: anchor → full snapshot → drain stream
-      checkpoint: {{CKPT_DIR}}/{{NAME}}.ckpt   # required for a baseline (initial:/backfill:) on every engine but PostgreSQL; MySQL/MongoDB need it for any mode: cdc
+      checkpoint: {{CKPT_DIR}}/{{NAME}}.ckpt   # required for a baseline (initial:/backfill:) on every engine but PostgreSQL; MySQL/MongoDB/Oracle need it for any mode: cdc
       until_current: true          # default: drain to the log end as of open, then exit
       {{CDC_PARAM}}
       # rollover: 100000           # rows per part (≈ drain memory)
@@ -308,7 +313,8 @@ rivet metrics -c cdc.yaml                        # CDC runs appear with mode=cdc
 
 Schedule `rivet run` on an interval. Each run resumes from the checkpoint or slot.
 `cdc.until_current: false` streams continuously, but only MySQL and MongoDB stay
-up that way. PostgreSQL and SQL Server still exit on catch-up.
+up that way. PostgreSQL and SQL Server still exit on catch-up, and Oracle refuses it
+at config load (bounded drain only).
 
 Ad-hoc CLI (loopback hosts only, since it has no TLS):
 
@@ -325,7 +331,7 @@ Output shape: one row per change.
 | column | meaning |
 |---|---|
 | `__op` | `insert` / `update` / `delete` |
-| `__pos` | JSON commit position (`{"file","pos"}` MySQL, `{"lsn"}` PG/MSSQL). Shared by a whole transaction |
+| `__pos` | JSON commit position (`{"file","pos"}` MySQL, `{"lsn"}` PG/MSSQL, `{"low_water","commit_scn"}` Oracle). Shared by a whole transaction |
 | `__seq` | ordinal within the transaction. `(__pos, __seq)` is a total order |
 | source columns | after-image for insert/update, key for delete |
 
@@ -346,7 +352,9 @@ Recovery:
 ## 3. Load (BigQuery / Snowflake)
 
 Put a top-level `load:` block in the **same** config. The load reads column types
-from the state DB and never connects to the source.
+from the state DB and never connects to the source. An Oracle `mode: cdc` export
+cannot feed a `load:` block yet (refused at config load). An Oracle batch export under
+`load:` is accepted, but no live test loads one into a warehouse yet.
 
 ```yaml
 load:

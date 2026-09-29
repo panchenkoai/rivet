@@ -7,21 +7,21 @@
   const root = document.getElementById('rivet-builder');
   if (!root) return;
 
-  const PORT = { postgres: '5432', mysql: '3306', mssql: '1433', mongo: '27017' };
-  const SCHEME = { postgres: 'postgresql', mysql: 'mysql', mssql: 'sqlserver', mongo: 'mongodb' };
+  const PORT = { postgres: '5432', mysql: '3306', mssql: '1433', mongo: '27017', oracle: '1521' };
+  const SCHEME = { postgres: 'postgresql', mysql: 'mysql', mssql: 'sqlserver', mongo: 'mongodb', oracle: 'oracle' };
   const name = (g) => g('table').split('.').pop().replace(/\W/g, '_');
 
   // [field, label, options[] | placeholder | (g) => placeholder, show-when (every key must match)]
   const SPEC = [
     ['Source', [
-      ['engine', 'Engine', ['postgres', 'mysql', 'mssql', 'mongo']],
+      ['engine', 'Engine', ['postgres', 'mysql', 'mssql', 'mongo', 'oracle']],
       ['host', 'Host', 'db.internal'],
       ['port', 'Port', (g) => PORT[g('engine')]],
-      ['db', 'Database', 'shop'],
+      ['db', 'Database', (g) => (g('engine') === 'oracle' ? 'ORCLPDB1' : 'shop')],
       ['user', 'User', 'rivet'],
       ['tls', 'TLS', ['verify-full', 'verify-ca', 'require', 'disable']],
-      ['schema', 'Schema', (g) => ({ postgres: 'public', mssql: 'dbo' })[g('engine')] || g('db'),
-        { engine: ['postgres', 'mysql', 'mssql'] }],
+      ['schema', 'Schema', (g) => ({ postgres: 'public', mssql: 'dbo', oracle: g('user').toUpperCase() })[g('engine')] || g('db'),
+        { engine: ['postgres', 'mysql', 'mssql', 'oracle'] }],
       ['table', 'Table', 'orders'],
       ['pk', 'Primary key', 'id'],
       ['cursor', 'Cursor column', 'updated_at'],
@@ -241,7 +241,7 @@
     return {
       SOURCE_TYPE: e, TABLE: t, NAME: n, SCHEMA: schema, TLS: g('tls'), PK: g('pk'), CURSOR: g('cursor'),
       SLOT: g('slot'), CKPT_DIR: g('ckpt'), LOAD_KIND: g('load'),
-      URL: `${SCHEME[e]}://${user}:\${DB_PASS}@${g('host')}:${g('port')}/${db}`,
+      URL: `${SCHEME[e]}://${encodeURIComponent(user)}:\${DB_PASS}@${g('host')}:${g('port')}/${db}`,
       DSN: `host=${g('host')} port=${g('port')} ${dsnDb}=${db} user=${user} password=$DB_PASS`,
       VERIFY_TYPE: ['postgres', 'mysql'].includes(e) ? e : 'unsupported',
       DEST: dest('exports'),
@@ -251,7 +251,8 @@
       LOAD_SQL: loadSql(ctx),
       INIT_DEST: ({ gcs: ` --gcs-bucket ${bucket}`, s3: ` --s3-bucket ${bucket} --s3-region ${g('region')}` })[g('dest')] || '',
       CDC_PARAM: ({ postgres: `slot: ${g('slot')}`, mysql: `server_id: ${g('server_id')}`,
-        mssql: `capture_instance: ${g('capture')}` })[e] || '# MongoDB: no engine-specific stream params',
+        mssql: `capture_instance: ${g('capture')}`, oracle: '# Oracle: no engine-specific stream params (LogMiner)' })[e]
+        || '# MongoDB: no engine-specific stream params',
       CDC_FLAG: ({ postgres: ` --slot ${g('slot')}`, mysql: ` --server-id ${g('server_id')}`,
         mssql: ` --capture-instance ${g('capture')}` })[e] || '',
       CDC_GRANTS: ({
@@ -263,6 +264,17 @@
           `EXEC sys.sp_cdc_enable_table @source_schema = N'${schema}', @source_name = N'${n}',\n` +
           `     @role_name = NULL, @capture_instance = N'${g('capture')}', @supports_net_changes = 0;\n` +
           `-- runtime reader (least privilege)\nCREATE USER ${user} FOR LOGIN ${user};\nGRANT SELECT ON SCHEMA::cdc TO ${user};`,
+        oracle: `-- ONCE, as SYSDBA in CDB$ROOT (ARCHIVELOG mode is required)\n` +
+          `ALTER DATABASE ADD SUPPLEMENTAL LOG DATA;\n` +
+          `-- the CDC user is a COMMON user: its name starts with c## (percent-encode # as %23 in the URL)\n` +
+          `CREATE USER ${user} IDENTIFIED BY "<password>" CONTAINER = ALL;\n` +
+          `GRANT CREATE SESSION, SET CONTAINER, LOGMINING TO ${user} CONTAINER = ALL;\n` +
+          `GRANT EXECUTE_CATALOG_ROLE TO ${user} CONTAINER = ALL;\n` +
+          ['database', 'archived_log', 'log', 'logfile', 'logmnr_contents', 'logmnr_logs', 'transaction']
+            .map((v) => `GRANT SELECT ON v_$${v} TO ${user} CONTAINER = ALL;`).join('\n') + '\n' +
+          `-- per captured table, in the pluggable database ${db}\n` +
+          `ALTER TABLE ${t.includes('.') ? t : `${schema}.${t}`} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;\n` +
+          `GRANT SELECT ON ${t.includes('.') ? t : `${schema}.${t}`} TO ${user};`,
       })[e] || `-- MongoDB: connect to a replica set; ${user} needs the read role on ${db}`,
       LOAD_TARGET: (bq
         ? ['target: bigquery', `project: ${p}`, `dataset: ${g('dataset')}`]
