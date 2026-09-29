@@ -1623,6 +1623,41 @@ mod tests {
         }
     }
 
+    /// A per-table CDC scaffold captures changes only, and the README's quickstart says which sources get one.
+    #[test]
+    fn per_table_cdc_scaffold_has_no_baseline_and_the_readme_scopes_the_one_stream_promise() {
+        let infos: Vec<TableInfo> = ["a", "b"]
+            .iter()
+            .map(|n| TableInfo {
+                schema: "dbo".into(),
+                table: (*n).into(),
+                ..make_table(vec![col("id", "bigint")])
+            })
+            .collect();
+        let yaml = generate_schema_config(
+            &infos,
+            "sqlserver://u:p@localhost/db",
+            &crate::init::SourceProvenance::Inline,
+            "db",
+            &InitYamlDestination::default(),
+            Some("cdc"),
+            None,
+        )
+        .unwrap();
+        assert!(
+            !yaml.contains("initial:") && !yaml.contains("backfill:"),
+            "{yaml}"
+        );
+        let readme = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"),
+        )
+        .unwrap();
+        assert!(readme.contains(
+            "SQL Server, MongoDB, a non-`public` PostgreSQL schema or a single table get one \
+             capture-only export per table: add `cdc.initial: snapshot`"
+        ));
+    }
+
     /// Per-table CDC scaffolds whose names sanitise to one identifier still load: slots and checkpoints stay distinct.
     #[test]
     fn per_table_cdc_scaffold_gives_colliding_names_distinct_slots_and_checkpoints() {
