@@ -338,6 +338,82 @@ fn touched_values_sql(
     )
 }
 
+/// Script-variable budget for keys: BigQuery refuses a variable over 1,048,576 bytes
+/// (measured: 60,000 INT64 keys fit, 80,000 do not; 10,000 45-char strings fit, 20,000 do not).
+const KEY_ARRAY_BYTES: u64 = 700_000;
+
+/// The script-variable element type for a key column's warehouse type; `None` for a type
+/// an `IN UNNEST` key filter does not cover (floats, bytes, containers).
+fn key_array_type(target_type: &str) -> Option<&'static str> {
+    let head: String = target_type
+        .trim()
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_uppercase();
+    match head.as_str() {
+        "INT64" | "INTEGER" | "INT" | "BIGINT" => Some("INT64"),
+        "STRING" => Some("STRING"),
+        "NUMERIC" | "DECIMAL" => Some("NUMERIC"),
+        "BIGNUMERIC" | "BIGDECIMAL" => Some("BIGNUMERIC"),
+        "DATE" => Some("DATE"),
+        "DATETIME" => Some("DATETIME"),
+        "TIMESTAMP" => Some("TIMESTAMP"),
+        _ => None,
+    }
+}
+
+/// Script statements that set `days` to the partition days a compaction touches, reading the
+/// base only for the updated/deleted keys whose row the buffer's own days do not contain
+/// (a key whose partition value changed, or a delete that carries no partition value).
+fn touched_days_script(
+    changes_fqtn: &str,
+    base_fqtn: &str,
+    pk: &[&str],
+    column: &str,
+    column_type: &str,
+    key0: Option<(&str, &str)>,
+) -> String {
+    let own = date_of(&format!("`{column}`"), column_type);
+    let base_day = date_of(&format!("__rivet_t.`{column}`"), column_type);
+    let join = key_join(pk);
+    let unmatched = format!(
+        "FROM `{changes_fqtn}` AS __rivet_s WHERE IFNULL(__rivet_s.__op, '') != 'insert' AND NOT EXISTS \
+         (SELECT 1 FROM `{base_fqtn}` AS __rivet_t WHERE {join} AND \
+         ({base_day} IN UNNEST(days) OR __rivet_t.`{column}` IS NULL))"
+    );
+    let add_days = |filter: &str| {
+        format!(
+            "SET days = ARRAY(SELECT DISTINCT d FROM UNNEST(ARRAY_CONCAT(days, (SELECT \
+             IFNULL(ARRAY_AGG(DISTINCT {base_day} IGNORE NULLS), []) FROM `{base_fqtn}` AS __rivet_t \
+             WHERE {filter}))) AS d);"
+        )
+    };
+    let scan_all = add_days(&format!(
+        "EXISTS (SELECT 1 FROM `{changes_fqtn}` AS __rivet_s WHERE {join} AND IFNULL(__rivet_s.__op, '') != 'insert')"
+    ));
+    let lookup = match key0 {
+        Some((k, _)) => format!(
+            "SET moved_bytes = (SELECT IFNULL(SUM(BYTE_LENGTH(CAST(__rivet_s.`{k}` AS STRING)) + 16), 0) {unmatched});\n\
+             IF moved_bytes > 0 THEN\n\
+             \x20 IF moved_bytes <= {KEY_ARRAY_BYTES} THEN\n\
+             \x20   SET moved = (SELECT IFNULL(ARRAY_AGG(DISTINCT __rivet_s.`{k}` IGNORE NULLS), []) {unmatched});\n\
+             \x20   {}\n\
+             \x20 ELSE\n\
+             \x20   {scan_all}\n\
+             \x20 END IF;\n\
+             END IF;",
+            add_days(&format!(
+                "__rivet_t.`{k}` IN UNNEST(moved) AND EXISTS (SELECT 1 FROM `{changes_fqtn}` AS __rivet_s WHERE {join})"
+            ))
+        ),
+        None => format!("IF EXISTS (SELECT 1 {unmatched}) THEN\n\x20 {scan_all}\nEND IF;"),
+    };
+    format!(
+        "SET days = (SELECT IFNULL(ARRAY_AGG(DISTINCT {own} IGNORE NULLS), []) FROM `{changes_fqtn}`);\n{lookup}"
+    )
+}
+
 /// The partition column as a `DATE`. A TIMESTAMP is pinned to UTC: an unqualified
 /// `DATE(timestamp)` follows the project's `default_time_zone`, while the bounds it
 /// feeds are rendered `+00` and the table's partitions ARE UTC days — under any other
@@ -1364,7 +1440,17 @@ pub fn compact_script_sql(
         all: "days".to_string(),
     });
     let null_keys = merge(&MergeFilter::NullKeys(col.to_string()));
-    let touched = touched_values_sql(changes_fqtn, base_fqtn, &pk_refs, col, Some(ty));
+    let key0 = pk_refs.first().and_then(|k| {
+        specs
+            .iter()
+            .find(|s| s.column_name == *k)
+            .and_then(|s| key_array_type(&s.target_type))
+            .map(|t| (*k, t))
+    });
+    let key_decls = key0.map_or_else(String::new, |(_, t)| {
+        format!("DECLARE moved_bytes INT64 DEFAULT 0;\nDECLARE moved ARRAY<{t}> DEFAULT [];\n")
+    });
+    let touched = touched_days_script(changes_fqtn, base_fqtn, &pk_refs, col, ty, key0);
     format!(
         "DECLARE n INT64 DEFAULT 0;\n\
          DECLARE null_keys INT64 DEFAULT 0;\n\
@@ -1372,9 +1458,10 @@ pub fn compact_script_sql(
          DECLARE chunk ARRAY<DATE>;\n\
          DECLARE i INT64 DEFAULT 0;\n\
          DECLARE jobs INT64 DEFAULT 0;\n\
+         {key_decls}\
          {rename}\
          SET (n, null_keys) = (SELECT AS STRUCT COUNT(*), COUNTIF(`{col}` IS NULL) FROM `{changes_fqtn}`);\n\
-         SET days = (SELECT IFNULL(ARRAY_AGG(DISTINCT v IGNORE NULLS), []) FROM ({touched}));\n\
+         {touched}\n\
          WHILE i < ARRAY_LENGTH(days) DO\n\
          \x20 SET chunk = ARRAY(SELECT d FROM UNNEST(days) AS d WITH OFFSET AS o WHERE o >= i AND o < i + {cap});\n\
          {by_days}\n\
@@ -1428,6 +1515,41 @@ pub fn compact_arm(key: Option<&crate::load::plan::PartitionKey>) -> CompactArm<
 mod compact_tests {
     use super::*;
     use crate::load::plan::{Granularity, PartitionKey};
+
+    #[test]
+    fn a_key_type_gets_an_array_element_type_only_when_in_unnest_covers_it() {
+        for (t, want) in [
+            ("INT64", Some("INT64")),
+            ("STRING", Some("STRING")),
+            ("NUMERIC(20, 0)", Some("NUMERIC")),
+            ("BIGNUMERIC(50,10)", Some("BIGNUMERIC")),
+            ("timestamp", Some("TIMESTAMP")),
+            ("DATE", Some("DATE")),
+            ("DATETIME", Some("DATETIME")),
+            ("FLOAT64", None),
+            ("BYTES", None),
+            ("ARRAY<INT64>", None),
+        ] {
+            assert_eq!(key_array_type(t), want, "{t}");
+        }
+        let s = compact_script_sql(
+            "p.d.t",
+            "p.d.t__changes",
+            None,
+            &[
+                meta_spec("id", "BYTES"),
+                meta_spec("v", "INT64"),
+                meta_spec("created_at", "DATETIME"),
+            ],
+            &["id".to_string()],
+            SourceEngine::MySql,
+            Some("created_at"),
+        );
+        assert!(
+            !s.contains("moved") && s.contains("IF EXISTS (SELECT 1 FROM `p.d.t__changes` AS __rivet_s WHERE IFNULL(__rivet_s.__op, '') != 'insert'"),
+            "a key an array cannot hold still looks moved keys up, by the semi-join: {s}"
+        );
+    }
 
     #[test]
     fn compact_arm_scripts_day_and_unprunable_keys_and_windows_the_rest() {
@@ -1586,18 +1708,31 @@ mod compact_tests {
         );
         assert!(
             s.contains(
-                "SET days = (SELECT IFNULL(ARRAY_AGG(DISTINCT v IGNORE NULLS), []) FROM (\
-                 SELECT DATE(`created_at`) AS v FROM `p.d.t__changes` UNION ALL \
-                 SELECT DATE(__rivet_t.`created_at`) FROM `p.d.t` AS __rivet_t WHERE EXISTS \
-                 (SELECT 1 FROM `p.d.t__changes` AS __rivet_s WHERE __rivet_t.`id` = __rivet_s.`id`)));"
+                "SET days = (SELECT IFNULL(ARRAY_AGG(DISTINCT DATE(`created_at`) IGNORE NULLS), []) FROM `p.d.t__changes`);"
             ),
-            "the days are the buffer's AND the base's for the buffer's keys: {s}"
+            "the days start as the buffer's own: {s}"
         );
-        assert_eq!(
-            s.matches("FROM `p.d.t__changes`").count(),
-            5,
-            "the buffer is read by the count, the day probe (twice), and the two MERGEs, \
-             nowhere else: {s}"
+        let unmatched = "FROM `p.d.t__changes` AS __rivet_s WHERE IFNULL(__rivet_s.__op, '') != 'insert' AND NOT EXISTS \
+                         (SELECT 1 FROM `p.d.t` AS __rivet_t WHERE __rivet_t.`id` = __rivet_s.`id` AND \
+                         (DATE(__rivet_t.`created_at`) IN UNNEST(days) OR __rivet_t.`created_at` IS NULL))";
+        assert!(
+            s.contains(&format!(
+                "SET moved_bytes = (SELECT IFNULL(SUM(BYTE_LENGTH(CAST(__rivet_s.`id` AS STRING)) + 16), 0) {unmatched});"
+            )),
+            "only an updated/deleted key whose base row lies outside the buffer's days is looked up, \
+             and the check reads the base pruned to those days: {s}"
+        );
+        assert!(
+            s.contains("DECLARE moved ARRAY<INT64> DEFAULT [];")
+                && s.contains("IF moved_bytes <= 700000 THEN")
+                && s.contains("WHERE __rivet_t.`id` IN UNNEST(moved) AND EXISTS"),
+            "a small moved set is found through the key's clustering, never a base scan: {s}"
+        );
+        assert!(
+            s.contains(
+                "WHERE EXISTS (SELECT 1 FROM `p.d.t__changes` AS __rivet_s WHERE __rivet_t.`id` = __rivet_s.`id` AND IFNULL(__rivet_s.__op, '') != 'insert')"
+            ),
+            "a moved set too large for a variable falls back to the semi-join: {s}"
         );
         assert!(s.contains("WHILE i < ARRAY_LENGTH(days) DO"), "{s}");
         assert!(s.contains("WHERE o >= i AND o < i + 4000"), "{s}");
@@ -1666,7 +1801,8 @@ mod compact_tests {
             Some("created_at"),
         );
         assert!(
-            utc.contains("SELECT DATE(`created_at`, 'UTC') AS v FROM `p.d.t__changes` UNION ALL SELECT DATE(__rivet_t.`created_at`, 'UTC') FROM `p.d.t` AS __rivet_t")
+            utc.contains("SET days = (SELECT IFNULL(ARRAY_AGG(DISTINCT DATE(`created_at`, 'UTC') IGNORE NULLS), []) FROM `p.d.t__changes`);")
+                && utc.contains("(DATE(__rivet_t.`created_at`, 'UTC') IN UNNEST(days) OR __rivet_t.`created_at` IS NULL))")
                 && utc.contains(") WHERE __rn = 1 AND DATE(`created_at`, 'UTC') IN UNNEST(chunk)")
                 && utc.contains("ON __rivet_t.`id` = __rivet_s.`id` AND (DATE(__rivet_t.`created_at`, 'UTC') IN UNNEST(days) OR __rivet_t.`created_at` IS NULL)"),
             "{utc}"

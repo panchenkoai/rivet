@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **`rivet compact` reads the base only for keys whose day moved, not for every key.** To find a
+  key's OLD partition the day probe semi-joined the whole base on every compaction — a full read of
+  its key and partition columns, 44% of one pilot's BigQuery bill (18.9 GiB per run on its largest
+  table). The days now come from the buffer first; the base is read only for updated, deleted or
+  NULL-op (incremental) keys whose row those days do not contain, through the key column
+  (`IN UNNEST`) or, past a script variable's size, the old semi-join. Inserted keys are not looked
+  up. Measured on a 50M-row base: 763 MiB → 46 MiB with no moved key, 102 MiB with one; the day
+  set is identical.
+
 - **A count mismatch on an incremental or CDC load exits 3 (integrity), like a full load.** The
   append and base+buffer gates raised an uncoded error, so the exit class fell to the transient-
   error text match: exit 1 in general, and exit **2 (retry)** when the table name contained a
