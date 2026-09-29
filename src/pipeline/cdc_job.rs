@@ -244,7 +244,8 @@ pub(super) fn run_cdc_export(
     // advanced past them. Nothing was lost — but an operator reading that
     // concludes nothing was captured, and re-runs expecting to recapture
     // changes the log no longer has. Any tool summing metric rows under-counted
-    // by the same amount.
+    // by the same amount. Known over-count: parts of the failing roll are in
+    // these manifests though never acked, so the next run re-captures their rows.
     let (manifests, outcome) = result;
     let bytes_read = read_bytes.load(std::sync::atomic::Ordering::Relaxed);
     let bytes: u64 = manifests

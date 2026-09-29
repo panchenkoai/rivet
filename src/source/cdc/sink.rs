@@ -631,10 +631,11 @@ pub(crate) fn run_to_files(
     crate::test_hook::maybe_panic_at("cdc_before_manifest");
 
     // Built from `sinks` on BOTH paths. On the clean path this also writes the
-    // terminal manifest + `_SUCCESS`; on the error path the parts are already
-    // covered by the per-roll run-unique manifest `roll_all` wrote before each
-    // ack, so the manifest is built for the CALLER's accounting and no
-    // `_SUCCESS` is claimed — the run did not succeed.
+    // terminal manifest + `_SUCCESS`; on the error path no `_SUCCESS` is claimed
+    // and the manifest is built for the CALLER's accounting only. It lists every
+    // part that reached the store, INCLUDING the failing roll's (and a
+    // mid-transaction roll's) parts, which no durable manifest declares and whose
+    // rows the next run re-captures because they were never acked.
     let manifests: Vec<RunManifest> = sinks.iter().map(|s| s.manifest(&run)).collect();
     // write_manifest leaves the canonical `manifest.json` (latest-run pointer)
     // AND an immutable run-unique copy, so a prefix accumulating several
