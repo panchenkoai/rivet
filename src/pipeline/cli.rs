@@ -381,15 +381,23 @@ pub fn show_metrics(
     Ok(())
 }
 
-/// Whether `name` is a declared export — or a CDC baseline leg
-/// (`<stream>__snapshot_<table>`, rivet's own name) whose PARENT stream is: its
-/// interrupted chunk run is the one a changed recipe leaves un-resumable.
+/// Whether `name` is a declared export, or a name rivet synthesizes from one: a CDC leg, a `--split` unit (`<giant>#<n>`), a `partition_by` child (`<parent>__<value>`).
 fn export_is_declared(config: &Config, name: &str) -> bool {
-    let parent = crate::manifest::snapshot_family(name);
-    config
-        .exports
-        .iter()
-        .any(|e| e.name == name || e.name == parent)
+    let leg_parent = crate::manifest::snapshot_family(name);
+    let unit_giant = name
+        .rsplit_once('#')
+        .filter(|(_, n)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        .map(|(giant, _)| giant);
+    config.exports.iter().any(|e| {
+        e.name == name
+            || e.name == leg_parent
+            || unit_giant == Some(e.name.as_str())
+            || (e.partition_by.is_some()
+                && name
+                    .strip_prefix(e.name.as_str())
+                    .and_then(|rest| rest.strip_prefix("__"))
+                    .is_some_and(|value| !value.is_empty()))
+    })
 }
 
 pub fn reset_chunk_checkpoint(config_path: &str, export_name: &str) -> Result<()> {
@@ -431,8 +439,6 @@ pub fn reset_chunk_checkpoint(config_path: &str, export_name: &str) -> Result<()
 /// Names present only in state (removed from config) are skipped with a printed note.
 pub fn reset_chunk_checkpoints_stuck(config_path: &str) -> Result<()> {
     let cfg = Config::load(config_path)?;
-    let allowed: std::collections::HashSet<&str> =
-        cfg.exports.iter().map(|e| e.name.as_str()).collect();
     let state = StateStore::open(config_path)?;
     let stuck = state.list_export_names_with_in_progress_chunk_runs()?;
     if stuck.is_empty() {
@@ -447,7 +453,7 @@ pub fn reset_chunk_checkpoints_stuck(config_path: &str) -> Result<()> {
     let mut skipped_not_in_config = Vec::new();
     let mut targets = Vec::new();
     for name in stuck {
-        if allowed.contains(name.as_str()) {
+        if export_is_declared(&cfg, &name) {
             targets.push(name);
         } else {
             skipped_not_in_config.push(name);
@@ -1512,5 +1518,49 @@ exports:
         assert!(export_is_declared(&cfg, "orders"));
         assert!(export_is_declared(&cfg, "orders__snapshot_orders"));
         assert!(!export_is_declared(&cfg, "ordrs"));
+    }
+
+    /// The chunk-checkpoint refusals print `reset-chunks -e <plan.export_name>`; for a
+    /// `--split` unit and a `partition_by` child that name is synthesized, and the command
+    /// (and `--stuck-checkpoints`) must accept it or the printed remediation is a dead end.
+    #[test]
+    fn reset_chunks_accepts_split_unit_and_partition_child_names() {
+        let (dir, config_path) = setup_dir();
+        std::fs::write(
+            &config_path,
+            "source:\n  type: postgres\n  url: postgresql://localhost/db\nexports:\n\
+             \x20 - name: orders\n    table: orders\n    mode: full\n    format: parquet\n\
+             \x20   destination: { type: local, path: ./out }\n\
+             \x20 - name: events\n    table: events\n    mode: full\n    partition_by: created_at\n\
+             \x20   format: parquet\n    destination: { type: local, path: './out/{partition}' }\n",
+        )
+        .unwrap();
+        let state = open_state(&dir);
+        state.create_chunk_run("r1", "orders#3", "h", 3).unwrap();
+        state
+            .create_chunk_run("r2", "events__2023-01-01", "h", 3)
+            .unwrap();
+        drop(state);
+
+        reset_chunk_checkpoint(&config_path, "orders#3").unwrap();
+        reset_chunk_checkpoints_stuck(&config_path).unwrap();
+
+        let state = StateStore::open(&config_path).unwrap();
+        assert!(
+            state
+                .find_in_progress_chunk_run("orders#3")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            state
+                .find_in_progress_chunk_run("events__2023-01-01")
+                .unwrap()
+                .is_none()
+        );
+        let cfg = Config::load(&config_path).unwrap();
+        assert!(!export_is_declared(&cfg, "orders#x"));
+        assert!(!export_is_declared(&cfg, "orders__2023-01-01"));
+        assert!(!export_is_declared(&cfg, "events__"));
     }
 }
