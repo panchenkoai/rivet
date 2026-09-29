@@ -603,7 +603,11 @@ fn mysql_time_of_day(v: Option<&Value>) -> Result<Option<i64>> {
 
 /// `[-]H:MM:SS.ffffff` for a message.
 fn fmt_micros_as_time(us: i64) -> String {
-    let (sign, a) = if us < 0 { ("-", -us) } else { ("", us) };
+    let (sign, a) = if us.is_negative() {
+        ("-", -us)
+    } else {
+        ("", us)
+    };
     let s = a / 1_000_000;
     format!(
         "{sign}{}:{:02}:{:02}.{:06}",
@@ -2192,6 +2196,12 @@ mod roast_mysql_bit_decode_tests {
                 Some("RIVET_SOURCE_VALUE_UNREPRESENTABLE"),
                 "{label}: {err:#}"
             );
+            let shown = match label {
+                "negative" => "TIME -49:00:00.000001 ",
+                "838h" => "TIME 838:00:00.000001 ",
+                _ => "TIME 24:00:00.000001 ",
+            };
+            assert!(format!("{err:#}").contains(shown), "{label}: {err:#}");
         }
 
         // The Bytes fallback of the time arm.
