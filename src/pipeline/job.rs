@@ -325,7 +325,7 @@ fn run_chunked_quality_gate(
 
     let total = summary.total_rows as usize;
     let row_issues = crate::quality::check_row_count(total, qc);
-    let has_unsupported = !qc.null_ratio_max.is_empty() || !qc.unique_columns.is_empty();
+    let has_unsupported = crate::quality::has_multi_part_unsupported_checks(qc);
 
     if has_unsupported {
         log::warn!(

@@ -108,23 +108,24 @@ fn check_incremental_reconcile(diags: &mut Vec<Diagnostic>, plan: &ResolvedRunPl
     }
 }
 
-/// `quality + chunked/keyset` — quality checks run per part file; row-count and
-/// uniqueness checks operate on each chunk (or keyset page) independently, not on
-/// the full dataset.
+/// `quality + chunked/keyset` — only the run-wide row_count bounds are checked; null/unique checks never run.
 fn check_quality_chunked(diags: &mut Vec<Diagnostic>, plan: &ResolvedRunPlan) {
-    if plan.quality.is_some()
-        && matches!(
-            &plan.strategy,
-            ExtractionStrategy::Chunked(_) | ExtractionStrategy::Keyset(_)
-        )
-    {
+    let Some(qc) = &plan.quality else { return };
+    if matches!(
+        &plan.strategy,
+        ExtractionStrategy::Chunked(_) | ExtractionStrategy::Keyset(_)
+    ) {
+        let unevaluated = if crate::quality::has_multi_part_unsupported_checks(qc) {
+            "; null_ratio_max and unique_columns are NOT evaluated"
+        } else {
+            ""
+        };
         diags.push(Diagnostic {
             level: DiagnosticLevel::Warning,
             rule: "quality-chunked-partial",
             message: format!(
-                "export '{}': quality checks run per part file; row_count and \
-                 unique_columns checks apply to each chunk independently, not the \
-                 full dataset — results may be misleading",
+                "export '{}': on chunked/keyset runs only row_count_min/row_count_max are \
+                 checked, against the run-wide total{unevaluated}",
                 plan.export_name
             ),
         });
@@ -413,6 +414,32 @@ mod tests {
             "expected quality-chunked-partial warning, got: {:?}",
             rules(&diags)
         );
+    }
+
+    #[test]
+    fn quality_chunked_partial_says_row_count_is_run_wide_and_unique_is_not_evaluated() {
+        for strategy in [chunked_plan_strategy(false), keyset_plan_strategy()] {
+            let mut p = base_plan();
+            p.strategy = strategy;
+            p.quality = Some(QualityConfig {
+                row_count_min: Some(10),
+                row_count_max: None,
+                null_ratio_max: Default::default(),
+                unique_columns: vec!["id".into()],
+                unique_max_entries: None,
+            });
+            let diags = validate_plan(&p);
+            let d = diags
+                .iter()
+                .find(|d| d.rule == "quality-chunked-partial")
+                .expect("warning");
+            assert_eq!(
+                d.message,
+                "export 'test': on chunked/keyset runs only row_count_min/row_count_max \
+                 are checked, against the run-wide total; null_ratio_max and unique_columns \
+                 are NOT evaluated"
+            );
+        }
     }
 
     #[test]

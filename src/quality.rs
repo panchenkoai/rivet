@@ -265,6 +265,11 @@ impl QualityTracker {
     }
 }
 
+/// True when the config asks for null/unique checks, which the multi-part runners (chunked/keyset) never evaluate.
+pub(crate) fn has_multi_part_unsupported_checks(qc: &QualityConfig) -> bool {
+    !qc.null_ratio_max.is_empty() || !qc.unique_columns.is_empty()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
