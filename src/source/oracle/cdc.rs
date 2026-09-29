@@ -132,15 +132,29 @@ pub(crate) fn canonical_number(text: &str) -> Option<String> {
     })
 }
 
-/// `YYYY-MM-DDTHH:MI:SS[.fraction]`, the fraction any length (empty included), kept to microseconds.
+/// The mining session's datetime formats: `SYYYY` so `MINE_VALUE` keeps a BC year's sign.
+const SIGNED_YEAR_PIN: &[&str] = &[
+    "ALTER SESSION SET NLS_DATE_FORMAT = 'SYYYY-MM-DD\"T\"HH24:MI:SS\".000000\"'",
+    "ALTER SESSION SET NLS_TIMESTAMP_FORMAT = 'SYYYY-MM-DD\"T\"HH24:MI:SS.FF'",
+    "ALTER SESSION SET NLS_TIMESTAMP_TZ_FORMAT = 'SYYYY-MM-DD\"T\"HH24:MI:SS.FF TZH:TZM'",
+];
+
+/// `SYYYY-MM-DDTHH:MI:SS[.fraction]` (a `-` year is BC), the fraction any length, kept to microseconds.
 pub(crate) fn parse_datetime(text: &str) -> Option<NaiveDateTime> {
+    use chrono::Datelike as _;
     let t = text.trim();
+    let (bc, t) = t.strip_prefix('-').map_or((false, t), |r| (true, r));
     let (base, frac) = t.split_once('.').unwrap_or((t, ""));
     let dt = NaiveDateTime::parse_from_str(base, "%Y-%m-%dT%H:%M:%S").ok()?;
     if !frac.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     let micros: u32 = format!("{:0<6}", &frac[..frac.len().min(6)]).parse().ok()?;
+    let dt = if bc {
+        dt.with_year(super::arrow_convert::chrono_year(-dt.year()))?
+    } else {
+        dt
+    };
     dt.checked_add_signed(chrono::Duration::microseconds(micros.into()))
 }
 
@@ -759,6 +773,9 @@ impl OracleChangeStream {
             "oracle cdc: name the tables to capture (`table:` / `tables:`, or `--table`)"
         );
         let conn = connect(url, tls)?;
+        for sql in SIGNED_YEAR_PIN {
+            conn.execute(sql, &[]).ora()?;
+        }
         let (_, con_name, con_dbid) = container(&conn)?;
         let captured = resolve_tables(&conn, tables)?;
         if let Some(why) = logging_check(&conn, &captured)? {
@@ -1186,6 +1203,28 @@ mod tests {
             Some(dt("2026-09-28 01:02:03.5"))
         );
         assert_eq!(parse_datetime("28-SEP-26 01.02.03"), None);
+        // SYYYY: an AD year renders with a leading blank, a BC one with `-` (Oracle -N = chrono 1-N).
+        assert_eq!(
+            parse_datetime(" 2026-09-28T00:00:00.000000"),
+            Some(dt("2026-09-28 00:00:00"))
+        );
+        assert_eq!(
+            parse_datetime("-0044-03-15T00:00:00.000000"),
+            Some(dt("-0043-03-15 00:00:00"))
+        );
+        // 1 BC is chrono year 0; DuckDB's make_date(0, 6, 15) is the independent value.
+        assert_eq!(
+            decode(ColKind::TimestampTz, "-0001-06-15T00:00:00.000000 +00:00").unwrap(),
+            RivetValue::DateTime(
+                chrono::DateTime::from_timestamp_micros(-62_152_876_800_000_000)
+                    .unwrap()
+                    .naive_utc()
+            )
+        );
+        assert!(
+            SIGNED_YEAR_PIN.iter().all(|s| s.contains("= 'SYYYY-")),
+            "{SIGNED_YEAR_PIN:?}"
+        );
         assert_eq!(
             decode(ColKind::TimestampTz, "2026-09-28T01:02:03.500000 +09:00").unwrap(),
             RivetValue::DateTime(dt("2026-09-27 16:02:03.5"))
