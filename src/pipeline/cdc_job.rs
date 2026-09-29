@@ -1080,6 +1080,26 @@ mod tests {
     /// #196: cdc_summary must carry bytes_read into the RunSummary (the CDC read
     /// leg). RED against deleting the field (defaults to 0).
     #[test]
+    fn a_cdc_run_is_recorded_in_the_metrics_ledger() {
+        let d = tempfile::tempdir().unwrap();
+        let cfg_path = d.path().join("rivet.yaml");
+        let store = crate::state::StateStore::open(cfg_path.to_str().unwrap()).unwrap();
+        let config = crate::config::Config::from_yaml(
+            "source:\n  type: postgres\n  url: \"postgresql://localhost/t\"\n\
+             exports:\n  - name: a\n    table: t\n    format: parquet\n\
+             \x20   destination:\n      type: local\n      path: ./out\n",
+        )
+        .unwrap();
+        let export = crate::config::sample_export("cdc_t");
+        let summary = super::cdc_summary("r_m1", &export, "success", 7, 1, 100, 10, 50, None);
+        super::record_metric(&store, &config, &export, &summary);
+        let got = store.get_metrics(Some("cdc_t"), 10).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].run_id.as_deref(), Some("r_m1"));
+        assert_eq!(got[0].total_rows, 7);
+    }
+
+    #[test]
     fn cdc_summary_carries_bytes_read() {
         let export = crate::config::sample_export("t");
         let s = super::cdc_summary("r1", &export, "success", 100, 2, 5_000, 12_345, 50, None);

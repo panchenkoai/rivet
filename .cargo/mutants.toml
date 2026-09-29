@@ -223,6 +223,18 @@ exclude_re = [
     # keyset_varchar_pk_roundtrips_full_keyset_across_pages (both RED-verified
     # 2026-08-20, then reverted). The whole live_keyset suite guards the bodies.
     "replace run_keyset ->",
+    # The page counters of the two sequential page loops name each page's part and its
+    # keyset_page row. Live-killed by hand 2026-09-29 (mutant applied, suite run,
+    # reverted): `pages *= 1` in run_keyset fails 5 crash/resume tests
+    # (stand_pool_split_keyset_recovers_a_crash_{postgres,mysql,mssql},
+    # a_sequential_keyset_crash_resumed_in_parallel_exports_every_row_once, ...);
+    # `page *= 1` in range_worker_pages fails mongo_parallel_export_records_form_b_checksum
+    # and shape_drift_warns_on_the_mongo_parallel_runner; `-=` underflows a zero usize.
+    # range_worker_pages -> Ok(()) needs a MongoDB and fails 4 live tests
+    # (mongo_parallel_worker_error_still_counts_the_durable_parts, ...).
+    "replace \\+= with [-*]= in run_keyset$",
+    "replace \\+= with [-*]= in range_worker_pages$",
+    "replace range_worker_pages ->",
     "replace run_keyset_parallel ->",
     # introspect_mssql_on (source/mssql/mod.rs) reads sys.* over a
     # real SQL Server connection; OracleSource::export_within_budget drives a real

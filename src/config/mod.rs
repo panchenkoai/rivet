@@ -892,8 +892,9 @@ impl Config {
                     "export '{}': partition_by is not compatible with a `load:` block — a \
                      partitioned export writes one manifest per partition sub-prefix, but the \
                      warehouse loader would load only a single partition (and `cleanup_source` \
-                     would then wipe the rest). Load a non-partitioned export, or drop `load:` \
-                     and run `rivet load` per partition.",
+                     would then wipe the rest). To load it, remove `partition_by:` from this \
+                     export; to keep the partitioned layout, remove the `load:` block — the \
+                     export then stays Parquet-only, since `rivet load` has no per-partition mode.",
                     export.name,
                 );
             }
@@ -2137,6 +2138,52 @@ mod audit_unquoted_template_brace {
     const HINT_FRAGMENT: &str =
         "a YAML value containing { } (such as {partition} or {date}) must be quoted";
 
+    /// Every combination the partition_by doc names as incompatible is refused at load, and the doc names each refusal.
+    #[test]
+    fn partition_by_doc_names_every_combination_config_load_refuses() {
+        let schema = serde_json::to_value(schemars::schema_for!(crate::config::ExportConfig))
+            .unwrap()["properties"]["partition_by"]["description"]
+            .as_str()
+            .unwrap()
+            .replace('\n', " ");
+        let base = |extra: &str, top: &str| {
+            format!(
+                "source: {{ type: postgres, url: \"postgresql://u:p@h/d\" }}\n\
+                 exports:\n  - name: t1\n    table: t1\n    format: parquet\n    \
+                 partition_by: created_at\n    destination: {{ type: local, path: \"./out/{{partition}}/\" }}\n\
+                 {extra}{top}"
+            )
+        };
+        let cases = [
+            (
+                "`mode: time_window`",
+                base(
+                    "    mode: time_window\n    time_column: created_at\n    days_window: 1\n",
+                    "",
+                ),
+            ),
+            ("`mode: cdc`", base("    mode: cdc\n", "")),
+            ("`chunk_by_key`", base("    chunk_by_key: id\n", "")),
+            (
+                "a `load:` block (per-export or top-level)",
+                base("", "load: { target: bigquery, project: p, dataset: d }\n"),
+            ),
+        ];
+        assert!(
+            Config::from_yaml(&base("", "")).is_ok(),
+            "the plain form must load"
+        );
+        for (token, yaml) in cases {
+            assert!(schema.contains(token), "partition_by doc must name {token}");
+            let err = format!("{:#}", Config::from_yaml(&yaml).unwrap_err());
+            assert!(err.contains("partition_by"), "{token}: {err}");
+        }
+        assert!(
+            schema.contains("or a MongoDB source"),
+            "partition_by doc must name the MongoDB refusal"
+        );
+    }
+
     #[test]
     fn top_level_load_with_partition_by_is_rejected() {
         // #101: partition_by is incompatible with a `load:` block — the loader
@@ -2158,6 +2205,14 @@ load: { target: bigquery, project: p, dataset: d }
             err.to_string()
                 .contains("partition_by is not compatible with a `load:` block"),
             "a top-level `load:` + partition_by must be rejected: {err}"
+        );
+        assert!(
+            err.to_string().ends_with(
+                "To load it, remove `partition_by:` from this export; to keep the partitioned \
+                 layout, remove the `load:` block — the export then stays Parquet-only, since \
+                 `rivet load` has no per-partition mode."
+            ),
+            "the remedy must name only what works: {err}"
         );
 
         // Without the top-level load, the same partitioned export is accepted —

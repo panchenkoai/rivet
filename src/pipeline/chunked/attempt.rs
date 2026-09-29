@@ -214,6 +214,25 @@ mod tests {
     }
 
     #[test]
+    fn a_permanent_open_failure_is_not_retried() {
+        let tally = RetryTally::default();
+        let opens = Cell::new(0u32);
+        let r: Result<u32> = run_with_retries(
+            &plan(3),
+            0,
+            &tally,
+            |_| {
+                opens.set(opens.get() + 1);
+                Err(anyhow::anyhow!("syntax error at or near SELECT"))
+            },
+            |s: &mut u32| Ok(*s),
+            |_| {},
+        );
+        assert!(r.is_err());
+        assert_eq!(opens.get(), 1, "a permanent open error spends no retries");
+    }
+
+    #[test]
     fn only_the_first_attempt_reuses_an_idle_connection() {
         assert!(reuses_idle_connection(0));
         assert!(!reuses_idle_connection(1));

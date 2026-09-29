@@ -234,7 +234,8 @@ impl QualityTracker {
             }
         }
         for col in &qc.unique_columns {
-            if self.unique_capped.contains(col) {
+            let capped = self.unique_capped.contains(col);
+            if capped {
                 let cap = qc.unique_max_entries.unwrap_or(0);
                 issues.push(QualityIssue {
                     severity: Severity::Warn,
@@ -244,15 +245,17 @@ impl QualityTracker {
                         col, cap
                     ),
                 });
-            } else if let Some(set) = self.unique_sets.get(col) {
+            }
+            if let Some(set) = self.unique_sets.get(col) {
                 let non_null = self.unique_non_null_counts.get(col).copied().unwrap_or(0);
                 let dupes = non_null.saturating_sub(set.len());
                 if dupes > 0 {
+                    let at_least = if capped { "at least " } else { "" };
                     issues.push(QualityIssue {
                         severity: Severity::Fail,
                         message: format!(
-                            "column '{}': {} duplicate values out of {} rows",
-                            col, dupes, total_rows
+                            "column '{}': {}{} duplicate values out of {} rows",
+                            col, at_least, dupes, total_rows
                         ),
                     });
                 }
@@ -262,10 +265,36 @@ impl QualityTracker {
     }
 }
 
+/// True when the config asks for null/unique checks, which the multi-part runners (chunked/keyset) never evaluate.
+pub(crate) fn has_multi_part_unsupported_checks(qc: &QualityConfig) -> bool {
+    !qc.null_ratio_max.is_empty() || !qc.unique_columns.is_empty()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use arrow::array::{Int64Array, StringArray};
+
+    #[test]
+    fn only_null_or_unique_checks_are_unsupported_on_multi_part_runners() {
+        let base = || QualityConfig {
+            row_count_min: Some(1),
+            row_count_max: None,
+            null_ratio_max: Default::default(),
+            unique_columns: Vec::new(),
+            unique_max_entries: None,
+        };
+        assert!(
+            !has_multi_part_unsupported_checks(&base()),
+            "row_count is run-wide"
+        );
+        let mut nulls = base();
+        nulls.null_ratio_max.insert("a".into(), 0.1);
+        assert!(has_multi_part_unsupported_checks(&nulls));
+        let mut unique = base();
+        unique.unique_columns.push("id".into());
+        assert!(has_multi_part_unsupported_checks(&unique));
+    }
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
 

@@ -125,6 +125,8 @@ fn i1_writer_finish_produces_complete_file_before_destination_write() {
 
     // Total rows must reflect the written batch.
     assert_eq!(sink.total_rows, 3, "total_rows must count written rows");
+    assert!(!sink.is_empty(), "a sink that streamed rows is not empty");
+    assert!(minimal_sink().is_empty(), "a fresh sink is empty");
 }
 
 // ─── quality tracking ────────────────────────────────────────
@@ -344,6 +346,30 @@ fn unique_cap_emits_warn_issue_not_fail() {
         issues[0].message.contains("capped"),
         "message must say 'capped'; got: {}",
         issues[0].message
+    );
+}
+
+#[test]
+fn duplicates_found_before_the_unique_cap_still_fail_the_run() {
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(Int64Array::from(vec![1, 1, 2, 3, 4]))],
+    )
+    .unwrap();
+    let mut sink = sink_with_unique_cap(vec!["id".into()], 3);
+    sink.quality.unique_indices = vec![(0, "id".into())];
+    sink.track_quality(&batch).unwrap();
+    sink.total_rows = 5;
+    let issues = sink.run_quality_checks();
+    let sev = |s| issues.iter().filter(|i| i.severity == s).count();
+    assert_eq!(sev(crate::quality::Severity::Warn), 1, "{issues:?}");
+    assert_eq!(sev(crate::quality::Severity::Fail), 1, "{issues:?}");
+    assert!(
+        issues
+            .iter()
+            .any(|i| i.message == "column 'id': at least 1 duplicate values out of 5 rows"),
+        "{issues:?}"
     );
 }
 

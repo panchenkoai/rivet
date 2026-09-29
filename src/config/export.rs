@@ -262,10 +262,13 @@ pub struct ExportConfig {
     /// To split by a categorical column, write one export per value with a
     /// `WHERE` filter instead.
     ///
-    /// Orthogonal to `mode`: each partition runs the export's own mode, so
-    /// `mode: chunked` chunks *within* a day. Rows whose partition column is
-    /// NULL land in `col=__HIVE_DEFAULT_PARTITION__/` (Hive default partition)
-    /// so no row is silently dropped. Not compatible with `mode: time_window`.
+    /// Applies to `full`, `chunked` and `incremental` exports on a SQL source:
+    /// each partition runs the export's own mode, so `mode: chunked` chunks
+    /// *within* a day. Rows whose partition column is NULL land in
+    /// `col=__HIVE_DEFAULT_PARTITION__/` (Hive default partition) so no row is
+    /// silently dropped. Not compatible with `mode: time_window`, `mode: cdc`,
+    /// `chunk_by_key`, a `load:` block (per-export or top-level), or a MongoDB
+    /// source — each is refused when the config loads.
     ///
     /// ```yaml
     /// exports:

@@ -149,7 +149,7 @@ pub struct PreclassifiedExit(pub i32);
 
 impl std::fmt::Display for PreclassifiedExit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "child exited with status {}", self.0)
+        write!(f, "exit class {}", self.0)
     }
 }
 
@@ -202,11 +202,8 @@ pub struct Code {
 /// for the `[CODE]` prefix `main` adds. [`error_code`] reads `code` for the JSON
 /// `code` field + the text prefix.
 ///
-/// A `CodedError` is always exit class `Generic` (config / usage — fix it, don't
-/// retry), which is already [`classify_exit`]'s default, so it carries no class
-/// and needs no downcast arm there. The first coded error that needs a
-/// non-`Generic` class (e.g. a retryable source failure) is where a class field
-/// would be reintroduced — until then it is dead weight.
+/// Its exit class comes from the code's [`ErrorKind`] (see `stop_class`); an
+/// `Environment` kind is left to the transient check.
 #[derive(Debug)]
 pub struct CodedError {
     code: Code,
@@ -263,9 +260,10 @@ pub fn error_code(err: &anyhow::Error) -> Option<&'static str> {
 /// Map an error to its process exit code per the [`ExitClass`] taxonomy.
 ///
 /// Precedence (first match wins):
-/// 1. [`SchemaDriftError`] downcast → `4`.
-/// 2. [`DataIntegrityError`] **or** [`crate::manifest::ManifestInconsistency`]
-///    downcast → `3`.
+/// 1. [`PreclassifiedExit`] → its code verbatim.
+/// 2. `stop_class`: [`SchemaDriftError`] → `4`; [`DataIntegrityError`] /
+///    [`crate::manifest::ManifestInconsistency`] → `3`; a [`CodedError`] by kind
+///    (refusal `5`, internal `6`, integrity `3`, usage `1`).
 /// 3. otherwise, if [`crate::pipeline::retry::classify_error`] says the error is
 ///    transient → `2`.
 /// 4. otherwise → `1` (generic).
@@ -441,7 +439,7 @@ pub mod codes {
     );
     pub const STATE_CURSOR_OWNER_MISMATCH: Code = refusal(
         "RIVET_STATE_CURSOR_OWNER_MISMATCH",
-        "`rivet state reset --export <name>` to start the new cursor with a full pass, or restore the previous cursor column",
+        "`rivet state reset -c <config> --export <name>` to start the new cursor with a full pass, or restore the previous cursor column",
     );
     pub const SOURCE_CURSOR_FINER_THAN_MICROSECOND: Code = refusal(
         "RIVET_SOURCE_CURSOR_FINER_THAN_MICROSECOND",
@@ -605,6 +603,31 @@ pub type Result<T> = anyhow::Result<T>;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_preclassified_exit_reads_as_its_class() {
+        assert_eq!(super::PreclassifiedExit(5).to_string(), "exit class 5");
+    }
+
+    /// The cli.md exit-code table lists exactly 0 plus every code an [`ExitClass`] maps to.
+    #[test]
+    fn the_cli_exit_code_table_lists_every_exit_class() {
+        let doc = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/reference/cli.md"),
+        )
+        .unwrap();
+        let table = doc.split_once("## Exit codes").unwrap().1;
+        let documented: std::collections::BTreeSet<i32> = table
+            .lines()
+            .skip_while(|l| !l.starts_with('|'))
+            .take_while(|l| l.starts_with('|'))
+            .filter_map(|l| l.trim_matches('|').split('|').next()?.trim().parse().ok())
+            .collect();
+        let expected: std::collections::BTreeSet<i32> = (0..=255)
+            .filter(|&c| c == 0 || super::ExitClass::from_code(c).is_some())
+            .collect();
+        assert_eq!(documented, expected);
+    }
+
     use super::*;
 
     #[test]

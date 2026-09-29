@@ -1235,6 +1235,16 @@ mod tests {
             value_from_binary(1015, &arr).unwrap(),
             V::Array(vec![V::Bytes(b"xy".to_vec())])
         );
+
+        let mut f8 = Vec::new();
+        for w in [1u32, 0, 701, 1, 1, 8] {
+            f8.extend_from_slice(&w.to_be_bytes());
+        }
+        f8.extend_from_slice(&2.5f64.to_be_bytes());
+        assert_eq!(
+            value_from_binary(1022, &f8).unwrap(),
+            V::Array(vec![V::Float(2.5)])
+        );
     }
 
     /// The transaction framing, from the same real capture.

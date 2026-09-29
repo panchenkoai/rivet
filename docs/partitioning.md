@@ -109,6 +109,9 @@ GROUP BY 1;
   (e.g. MySQL `SET time_zone = '+00:00'`) when the exact day boundary matters.
 - **Not compatible with `mode: time_window`** (time_window already filters by a
   rolling window). Use `partition_by` with `full`, `chunked`, or `incremental`.
+- **Not compatible with `mode: cdc`** (CDC reads the log, not a query), **a
+  `load:` block** (per-export or top-level: the loader would load a single
+  partition's manifest), **or a MongoDB source** (the bucket probes are SQL).
 - **Not compatible with `chunk_by_key` (keyset).** Each partition reads its
   bucket as a subquery around the table, and keyset seek pagination over that
   shape is not supported — Rivet rejects the combination up front. A

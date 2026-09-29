@@ -320,7 +320,7 @@ mod tests {
         // ── ENGINE DIFFERENCE: a WIDE (≥1024 B/row) range-chunk table. MySQL holds
         //    parallel at 1 (a single sequential scan beats chunked on wide MySQL
         //    rows); PostgreSQL and SQL Server still row-scale to 4. This is the
-        //    "по всем движкам" case — the range-chunk parallel is NOT engine-agnostic.
+        //    "across every engine" case — the range-chunk parallel is NOT engine-agnostic.
         let big_wide = tbl(
             10_000_000,
             wide(10_000_000),

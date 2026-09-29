@@ -682,13 +682,18 @@ behaviour depends on whether rivet is **running**:
   which **releases** WAL and relieves the pressure) or drop the slot. If PostgreSQL
   is too degraded to answer, rivet's query fails → the run fails → re-read next run.
 
-**Memory is O(largest transaction).** The MySQL adapter buffers a whole
+**Memory is O(largest transaction).** The adapters buffer a whole
 transaction until its COMMIT (parts never split a transaction — the resume
-invariant). Measured: ~1.4 KB of RSS per buffered row (~14× a 100-byte
-payload): a 100k-row transaction drains at ~170 MB RSS, 300k at ~440 MB —
-linear, so a 10M-row bulk backfill in ONE transaction will not fit. Run bulk
-backfills in batched transactions, or through `mode: full`/`initial: snapshot`
-(the batch path streams). Spilling oversized transactions to disk is roadmap.
+invariant; SQL Server buffers per poll batch). Measured on MySQL: ~1.4 KB of RSS
+per buffered row (~14× a 100-byte payload): a 100k-row transaction drains at
+~170 MB RSS, 300k at ~440 MB — linear. A transaction past the hard caps (5M
+buffered rows or 2 GiB estimated bytes by default; `RIVET_CDC_MAX_TX_ROWS` /
+`RIVET_CDC_MAX_TX_BYTES` override them) fails the run LOUDLY before it can OOM.
+Opt-in `RIVET_CDC_SPILL_DIR` spills the adapter's copy past the cap to disk
+(PostgreSQL, MySQL, SQL Server; Oracle always refuses at the cap), but the sink
+still holds the whole transaction, so it saves only ~11% of peak RSS — see
+[CDC failure modes](cdc-failure-modes.md). Run bulk backfills in batched
+transactions, or through `mode: full`/`initial: snapshot` (the batch path streams).
 
 **DDL inside a capture window: safe where the engine names its columns, a
 LOUD ERROR where it does not.** PostgreSQL (wire text) and SQL Server (change

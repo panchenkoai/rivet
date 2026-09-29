@@ -1901,9 +1901,6 @@ fn map_pg_value(typ: &str, val: &str, quoted: bool) -> Option<RivetValue> {
     if t == "integer" || t == "bigint" || t == "smallint" || t == "oid" {
         return val.parse::<i64>().ok().map(RivetValue::Int);
     }
-    if t.starts_with("numeric") || t.starts_with("decimal") {
-        return Some(RivetValue::Bytes(val.as_bytes().to_vec()));
-    }
     if t == "boolean" {
         return Some(RivetValue::Bool(val == "t" || val == "true"));
     }
@@ -1959,7 +1956,7 @@ fn map_pg_value(typ: &str, val: &str, quoted: bool) -> Option<RivetValue> {
         }
         return Some(RivetValue::Bytes(val.as_bytes().to_vec()));
     }
-    // text / varchar / char / json / … → string bytes.
+    // text / varchar / char / json / numeric / … → string bytes.
     Some(RivetValue::Bytes(val.as_bytes().to_vec()))
 }
 
@@ -2309,6 +2306,41 @@ mod tests {
         // hold the word, and refusing it would be a false loss report.
         assert!(!inf("text", "infinity"));
         assert!(!inf("datemark", "infinity"));
+
+        // Every integer spelling reads as an Int, and the other scalar arms decode.
+        for typ in ["integer", "bigint", "smallint", "oid"] {
+            assert_eq!(
+                map_pg_value(typ, "42", false),
+                Some(RivetValue::Int(42)),
+                "{typ}"
+            );
+        }
+        assert_eq!(
+            map_pg_value("boolean", "t", false),
+            Some(RivetValue::Bool(true))
+        );
+        assert_eq!(
+            map_pg_value("boolean", "true", false),
+            Some(RivetValue::Bool(true))
+        );
+        assert_eq!(
+            map_pg_value("boolean", "f", false),
+            Some(RivetValue::Bool(false))
+        );
+        for typ in ["double precision", "real"] {
+            assert_eq!(
+                map_pg_value(typ, "1.5", false),
+                Some(RivetValue::Float(1.5)),
+                "{typ}"
+            );
+        }
+        for typ in ["numeric(10,2)", "decimal"] {
+            assert_eq!(
+                map_pg_value(typ, "1.50", false),
+                Some(RivetValue::Bytes(b"1.50".to_vec())),
+                "{typ}"
+            );
+        }
 
         // The scanners' escaped-quote path. A doubled quote inside a literal is ONE
         // escaped character, not the end of the literal — so a TRUNCATE marker that

@@ -365,3 +365,74 @@ pub(crate) fn run_chunked_sequential_checkpoint(
     );
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    /// A source that streams three `id` rows whatever the query.
+    struct ThreeRows;
+
+    impl Source for ThreeRows {
+        fn export(
+            &mut self,
+            _request: &source::ExportRequest<'_>,
+            sink: &mut dyn source::BatchSink,
+        ) -> Result<()> {
+            let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+            sink.on_schema(Arc::clone(&schema))?;
+            let ids = Int64Array::from(vec![1, 2, 3]);
+            sink.on_batch(&arrow::record_batch::RecordBatch::try_new(
+                schema,
+                vec![Arc::new(ids)],
+            )?)
+        }
+        fn query_scalar(&mut self, _sql: &str) -> Result<Option<String>> {
+            Ok(None)
+        }
+        fn type_mappings(
+            &mut self,
+            _query: &str,
+            _overrides: &crate::types::ColumnOverrides,
+        ) -> Result<Vec<crate::types::TypeMapping>> {
+            Ok(vec![])
+        }
+    }
+
+    #[test]
+    fn a_chunk_with_rows_reports_them_and_commits_its_part() {
+        let out = tempfile::tempdir().unwrap();
+        let mut plan = crate::pipeline::commit::tests::test_plan();
+        plan.destination.path = Some(out.path().to_string_lossy().into_owned());
+        let cp = ChunkedPlan {
+            column: "id".into(),
+            chunk_size: 10,
+            chunk_count: None,
+            parallel: 1,
+            by_days: None,
+            checkpoint: true,
+            max_attempts: 1,
+        };
+        let mut summary = RunSummary::stub_for_testing("r1", "orders");
+        let mut debris = Vec::new();
+        let (rows, parts, _, _) = export_one_chunk_range(
+            &mut ThreeRows,
+            "SELECT id FROM t",
+            &cp,
+            1,
+            10,
+            0,
+            &plan,
+            &mut summary,
+            None,
+            &mut debris,
+        )
+        .unwrap();
+        assert_eq!(rows, 3);
+        assert_eq!(parts.len(), 1);
+        assert!(out.path().join(&parts[0].file_name).is_file());
+    }
+}

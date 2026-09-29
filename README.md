@@ -51,9 +51,11 @@ rivet run  -c rivet.yaml                             # typed Parquet in ./output
 **Change data capture** — every INSERT / UPDATE / DELETE from the MySQL binlog, a PostgreSQL logical slot, SQL Server change tables or a MongoDB change stream:
 
 ```bash
-rivet init --source-env DATABASE_URL --mode cdc -o cdc.yaml   # one stream over every table
+rivet init --source-env DATABASE_URL --mode cdc -o cdc.yaml   # MySQL / PostgreSQL `public`, 2+ tables: one stream over every table
 rivet run  -c cdc.yaml                                        # first run: baseline snapshot; every run: drain to the log's current end, then exit
 ```
+
+The one stream with a first-run baseline is what init scaffolds for MySQL and PostgreSQL `public` with two or more tables. SQL Server, MongoDB, a non-`public` PostgreSQL schema or a single table get one capture-only export per table: add `cdc.initial: snapshot` (or a batch export plus `cdc.backfill: auto`) before the first run, or the warehouse gets only the changes made after it — init prints the same warning.
 
 **All the way into the warehouse** — generate the config with a bucket and a dataset, then one cycle per schedule tick:
 
@@ -63,7 +65,7 @@ rivet init --source-env DATABASE_URL --mode cdc \
   --gcs-bucket my-bucket --bigquery-project my-project --bigquery-dataset raw -o cdc.yaml
 
 rivet run     -c cdc.yaml    # capture changes → Parquet in GCS
-rivet load    -c cdc.yaml    # the first run's snapshot → base tables; later runs → <table>__changes
+rivet load    -c cdc.yaml    # the first run's baseline → base tables; later runs → <table>__changes
 rivet compact -c cdc.yaml    # MERGE each buffer into its base table, drop the buffer
 ```
 

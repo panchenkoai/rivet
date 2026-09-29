@@ -182,17 +182,17 @@ fn range_worker_pages(
         };
         fan.observe(p.observed);
         fan.contribute(unit, p.checksums);
-        page += 1;
-
-        match super::keyset::next_seek(
+        let next = super::keyset::next_seek(
             last.as_deref(),
             p.rows,
             kp.chunk_size,
             p.next_cursor,
             &kp.key_column,
-            page - 1,
+            page,
             &format!("export '{}': parallel worker {worker}", plan.export_name),
-        )? {
+        )?;
+        page += 1;
+        match next {
             Some(v) => last = Some(v),
             None => break,
         }

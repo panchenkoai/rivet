@@ -127,6 +127,18 @@ fn summary(
     parts: Vec<ManifestPart>,
     error: Option<String>,
 ) -> RunSummary {
+    summary_with(run_id, export_name, status, parts, error, false)
+}
+
+/// `summary` with the plan snapshot's `resumable` (chunk-checkpoint) flag set.
+fn summary_with(
+    run_id: &str,
+    export_name: &str,
+    status: &str,
+    parts: Vec<ManifestPart>,
+    error: Option<String>,
+    resumable: bool,
+) -> RunSummary {
     let mut s = RunSummary::stub_for_testing(run_id, export_name)
         .with_plan_snapshot(PlanSnapshot {
             row_hash: None,
@@ -142,7 +154,7 @@ fn summary(
             reconcile: false,
             resume: false,
             chunk_key: None,
-            resumable: false,
+            resumable,
         })
         .with_manifest_parts(parts);
     s.duration_ms = 100;
@@ -283,12 +295,13 @@ fn failed_run_with_committed_files_carries_resume_command() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = touch_config(dir.path());
     let parts = vec![part(1, 100, 4096, "xxh3:0000000000000001")];
-    let s = summary(
+    let s = summary_with(
         "r3",
         "orders",
         "failed",
         parts,
         Some("connection reset".into()),
+        true,
     );
 
     let out = write_run_report(cfg.to_str().unwrap(), &s, "export").unwrap();
@@ -297,7 +310,7 @@ fn failed_run_with_committed_files_carries_resume_command() {
     assert!(report.resumable);
     let cmd = report.resume_command.as_deref().expect("must be set");
     assert!(cmd.starts_with("rivet run --config "));
-    assert!(cmd.ends_with(" --resume"));
+    assert!(cmd.ends_with(" --export orders --resume"));
     assert!(cmd.contains(cfg.to_str().unwrap()));
 
     let md = std::fs::read_to_string(out.join("summary.md")).unwrap();
@@ -1189,12 +1202,13 @@ fn resume_command_quotes_config_path_with_spaces() {
     std::fs::write(&cfg, "exports: []").unwrap();
 
     let parts = vec![part(1, 100, 4096, "xxh3:1111111111111111")];
-    let s = summary(
+    let s = summary_with(
         "orders_quoting",
         "orders",
         "failed",
         parts,
         Some("connection reset".into()),
+        true,
     );
     let out = write_run_report(cfg.to_str().unwrap(), &s, "export").unwrap();
     let report: RunReport =
@@ -1227,7 +1241,14 @@ fn resume_command_handles_apostrophe_in_config_path() {
     std::fs::write(&cfg, "exports: []").unwrap();
 
     let parts = vec![part(1, 100, 4096, "xxh3:1111111111111111")];
-    let s = summary("orders_apos", "orders", "failed", parts, Some("err".into()));
+    let s = summary_with(
+        "orders_apos",
+        "orders",
+        "failed",
+        parts,
+        Some("err".into()),
+        true,
+    );
     let out = write_run_report(cfg.to_str().unwrap(), &s, "export").unwrap();
     let report: RunReport =
         serde_json::from_str(&std::fs::read_to_string(out.join("summary.json")).unwrap()).unwrap();

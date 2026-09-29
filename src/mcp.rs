@@ -620,6 +620,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_configured_url_is_passed_through_and_a_missing_one_names_the_flag() {
+        assert_eq!(require_mysql(Some("mysql://h/db")).unwrap(), "mysql://h/db");
+        assert_eq!(
+            require_mysql(None).unwrap_err().to_string(),
+            "no MySQL URL configured — pass --mysql-url"
+        );
+        assert_eq!(
+            require_pg(Some("postgres://h/db")).unwrap(),
+            "postgres://h/db"
+        );
+    }
+
+    #[test]
     fn ascii_table_widens_columns_to_longest_cell() {
         let headers = ["pid", "state"];
         let rows = vec![

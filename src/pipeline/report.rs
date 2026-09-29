@@ -210,8 +210,12 @@ pub(crate) fn resume_command(
         return None;
     }
     let cfg = shell_quote(config_path);
+    let resumable = summary.journal.plan_snapshot().is_some_and(|p| p.resumable);
     match kind {
-        "export" => Some(format!("rivet run --config {cfg} --resume")),
+        "export" if resumable => Some(format!(
+            "rivet run --config {cfg} --export {} --resume",
+            shell_quote(&summary.export_name)
+        )),
         "cdc" => Some(format!("rivet run --config {cfg}")),
         _ => None,
     }
@@ -454,7 +458,7 @@ pub fn render_markdown(r: &RunReport) -> String {
                 "Resume picks up from the last committed checkpoint:\n\n```sh\n{cmd}\n```\n"
             )),
             None => out.push_str(
-                "This entry point has no resume command: re-run it once the error is fixed.\n",
+                "No checkpoint resume applies to this run: re-run it once the error is fixed.\n",
             ),
         }
     } else if r.status == "failed" {
@@ -525,12 +529,16 @@ mod tests {
     use crate::journal::PlanSnapshot;
 
     fn fresh_summary(status: &str, files_committed: usize) -> RunSummary {
+        fresh_summary_with(status, files_committed, true)
+    }
+
+    fn fresh_summary_with(status: &str, files_committed: usize, resumable: bool) -> RunSummary {
         let mut s = RunSummary::stub_for_testing("test_run_001", "orders").with_plan_snapshot(
             PlanSnapshot {
                 row_hash: None,
                 export_name: "orders".into(),
                 base_query: "SELECT * FROM orders".into(),
-                strategy: "snapshot".into(),
+                strategy: if resumable { "chunked" } else { "snapshot" }.into(),
                 format: "parquet".into(),
                 compression: "zstd".into(),
                 destination_type: "local".into(),
@@ -540,7 +548,7 @@ mod tests {
                 reconcile: false,
                 resume: false,
                 chunk_key: None,
-                resumable: false,
+                resumable,
             },
         );
         s.total_rows = 12_345;
@@ -602,11 +610,8 @@ mod tests {
     #[test]
     fn the_resume_command_depends_on_the_entry_point_and_durable_parts() {
         let case = |status: &str, files: usize, kind: &str| {
-            let s = RunSummary {
-                status: status.into(),
-                files_committed: files,
-                ..Default::default()
-            };
+            let mut s = fresh_summary_with(status, files, true);
+            s.export_name = "b".into();
             resume_command(&s, "x.yaml", kind)
         };
         for kind in ["export", "apply", "cdc"] {
@@ -620,7 +625,7 @@ mod tests {
         }
         assert_eq!(
             case("failed", 2, "export").as_deref(),
-            Some("rivet run --config x.yaml --resume")
+            Some("rivet run --config x.yaml --export b --resume")
         );
         assert_eq!(
             case("failed", 2, "apply"),
@@ -633,6 +638,15 @@ mod tests {
             "cdc resumes from its checkpoint"
         );
         assert_eq!(case("failed", 2, "other"), None, "never the batch default");
+    }
+
+    #[test]
+    fn a_failed_non_checkpoint_export_is_never_told_to_resume() {
+        let s = fresh_summary_with("failed", 2, false);
+        assert_eq!(resume_command(&s, "x.yaml", "export"), None);
+        let md = render_markdown(&RunReport::from_summary(&s, "x.yaml", "export"));
+        assert!(!md.contains("last committed checkpoint"), "{md}");
+        assert!(!md.contains("--resume"), "{md}");
     }
 
     #[test]
@@ -707,6 +721,16 @@ mod tests {
         let r = RunReport::from_summary(&s, "rivet.yaml", "export");
         let md = render_markdown(&r);
         assert!(md.contains("INTERRUPTED"));
+    }
+
+    #[test]
+    fn markdown_explains_a_restart_only_for_a_failed_run_with_nothing_committed() {
+        let md = |status: &str| {
+            let s = fresh_summary(status, 0);
+            render_markdown(&RunReport::from_summary(&s, "rivet.yaml", "export"))
+        };
+        assert!(md("failed").contains("No files were committed before the failure"));
+        assert!(!md("success").contains("## Resume"));
     }
 
     #[test]
