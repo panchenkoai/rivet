@@ -241,8 +241,8 @@ impl Scns {
                 crate::error::codes::SOURCE_CDC_CHECKPOINT_INVALID,
                 "oracle cdc: checkpoint '{path}' parses but carries no valid `low_water` / \
                  `commit_scn` pair — refusing to treat it as absent, which would re-anchor at \
-                 the current SCN and skip everything since. Restore the file, or delete it to \
-                 accept a fresh anchor."
+                 the current SCN and skip everything since. Restore the file, or: {}",
+                crate::source::cdc::checkpoint_identity::RECOVER
             ),
         }
     }
@@ -1287,7 +1287,14 @@ mod tests {
         assert_eq!(Scns::from_position(&pos, "ck").unwrap(), s);
         assert_eq!(OraIdentity::from_position(&pos), Some(id("1", "10", "7")));
         let hollow = Position(serde_json::json!({"commit_scn": "9"}));
-        assert!(Scns::from_position(&hollow, "ck").is_err());
+        let err = Scns::from_position(&hollow, "ck").unwrap_err().to_string();
+        assert!(
+            err.ends_with(&format!(
+                "Restore the file, or: {}",
+                crate::source::cdc::checkpoint_identity::RECOVER
+            )),
+            "the remedy must be anchor FIRST, then re-snapshot: {err}"
+        );
         let inverted = Position(serde_json::json!({"low_water": "10", "commit_scn": "9"}));
         assert!(Scns::from_position(&inverted, "ck").is_err());
     }

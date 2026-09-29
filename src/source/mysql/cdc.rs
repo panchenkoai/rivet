@@ -288,7 +288,8 @@ impl MysqlChangeStream {
                         "checkpoint '{path}' parses as JSON but carries no 'file' — refusing to \
                          treat it as absent, which would re-anchor at the CURRENT binlog \
                          position and silently skip every change since it was written. Restore \
-                         the file, or delete it to accept a fresh anchor."
+                         the file, or: {}",
+                        crate::source::cdc::checkpoint_identity::RECOVER
                     ),
                 )
             })?
@@ -296,7 +297,11 @@ impl MysqlChangeStream {
         let p = pos.0.get("pos").and_then(Json::as_u64).ok_or_else(|| {
             crate::error::CodedError::new(
                 crate::error::codes::SOURCE_CDC_CHECKPOINT_INVALID,
-                format!("checkpoint '{path}' parses as JSON but carries no 'pos'"),
+                format!(
+                    "checkpoint '{path}' parses as JSON but carries no 'pos'. Restore the file, \
+                     or: {}",
+                    crate::source::cdc::checkpoint_identity::RECOVER
+                ),
             )
         })?;
         Ok(Some((file, p)))
@@ -3076,6 +3081,13 @@ mod identity_recovery_order {
             assert_eq!(
                 crate::error::error_code(&err),
                 Some("RIVET_SOURCE_CDC_CHECKPOINT_INVALID")
+            );
+            assert!(
+                err.to_string().ends_with(&format!(
+                    "Restore the file, or: {}",
+                    crate::source::cdc::checkpoint_identity::RECOVER
+                )),
+                "the remedy must be anchor FIRST, then re-snapshot: {err}"
             );
         }
     }

@@ -30,7 +30,7 @@ Every failure rivet names carries a stable `RIVET_<FAMILY>_<NAME>` code: in `--j
 | `RIVET_SOURCE_STATEMENT_TIMEOUT` | environment | 2 if transient, else 1 | raise `tuning.statement_timeout_s`, or narrow the chunk |
 | `RIVET_SOURCE_CURSOR_FINER_THAN_MICROSECOND` | refusal | 5 | cursor on a column at microsecond precision or coarser, or cast the cursor to TIMESTAMP(6) in a curated query |
 | `RIVET_SOURCE_CDC_FOREIGN_CHECKPOINT` | refusal | 5 | delete the checkpoint so the next run anchors afresh FIRST, then re-snapshot the tables |
-| `RIVET_SOURCE_CDC_CHECKPOINT_INVALID` | refusal | 5 | restore the checkpoint file, or delete it to accept a fresh anchor (then re-snapshot) |
+| `RIVET_SOURCE_CDC_CHECKPOINT_INVALID` | refusal | 5 | restore the checkpoint file, or delete it so the stream anchors FIRST, then re-snapshot |
 | `RIVET_SOURCE_CDC_LOG_GAP` | refusal | 5 | restore the missing log, or delete the checkpoint so the stream anchors FIRST, then re-snapshot |
 | `RIVET_SOURCE_CDC_UNDECODABLE` | refusal | 5 | re-snapshot the table: delete the checkpoint first so the stream anchors, then snapshot |
 | `RIVET_SOURCE_CDC_CELL_UNSUPPORTED` | refusal | 5 | leave the column out of the capture (SQL Server: @captured_column_list), then re-snapshot |

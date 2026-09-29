@@ -453,7 +453,7 @@ pub mod codes {
     );
     pub const SOURCE_CDC_CHECKPOINT_INVALID: Code = refusal(
         "RIVET_SOURCE_CDC_CHECKPOINT_INVALID",
-        "restore the checkpoint file, or delete it to accept a fresh anchor (then re-snapshot)",
+        "restore the checkpoint file, or delete it so the stream anchors FIRST, then re-snapshot",
     );
     pub const SOURCE_CDC_LOG_GAP: Code = refusal(
         "RIVET_SOURCE_CDC_LOG_GAP",

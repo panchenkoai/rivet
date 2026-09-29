@@ -448,8 +448,8 @@ pub(crate) fn resume_from_checkpoint(
                 format!(
                     "checkpoint '{path}' parses as JSON but carries no 'lsn' — refusing to treat \
                      it as absent, which would re-read and re-deliver the ENTIRE retained change \
-                     table from fn_cdc_get_min_lsn under a successful exit. Restore the file, or \
-                     delete it to accept a fresh anchor."
+                     table from fn_cdc_get_min_lsn under a successful exit. Restore the file, or: {}",
+                    crate::source::cdc::checkpoint_identity::RECOVER
                 ),
             )
         })?
@@ -1575,6 +1575,13 @@ mod tests {
                 err.contains("lsn") && err.contains("/tmp/c.ckpt"),
                 "the refusal must name the key AND the file, or an operator cannot act on \
                  it: {err}"
+            );
+            assert!(
+                err.ends_with(&format!(
+                    "Restore the file, or: {}",
+                    crate::source::cdc::checkpoint_identity::RECOVER
+                )),
+                "the remedy must be anchor FIRST, then re-snapshot: {err}"
             );
         }
     }

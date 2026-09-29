@@ -56,6 +56,14 @@ fn check(name: String, ok: bool, detail: Option<String>, hint: Option<String>) -
     }
 }
 
+/// The hint for a checkpoint the run refuses: restore it, or recover in the order that loses nothing.
+fn restore_or_recover() -> String {
+    format!(
+        "restore the file, or: {}",
+        crate::source::cdc::checkpoint_identity::RECOVER
+    )
+}
+
 fn probe_failed(e: &anyhow::Error) -> DoctorCheck {
     check(
         "CDC health probe".into(),
@@ -588,11 +596,7 @@ fn mysql_checks(
                                     format!("CDC checkpoint (export '{}')", e.name),
                                     false,
                                     Some(why.to_string()),
-                                    Some(
-                                        "restore the file, or delete it to accept a fresh \
-                                     anchor at the current binlog position"
-                                            .into(),
-                                    ),
+                                    Some(restore_or_recover()),
                                 ));
                                 continue;
                             }
@@ -786,11 +790,7 @@ fn mssql_checks(
                 format!("CDC checkpoint (export '{}')", e.name),
                 false,
                 Some(why),
-                Some(
-                    "restore the file, or delete it to accept a fresh anchor from the \
-                     retained minimum"
-                        .into(),
-                ),
+                Some(restore_or_recover()),
             ));
         }
         checks.extend(mssql_verdicts(&e.name, ci, &mssql_health, ckpt_state));
@@ -831,7 +831,7 @@ fn oracle_checks(
             name,
             ok,
             problem.or(Some("readable (or not written yet)".into())),
-            (!ok).then(|| "restore the file, or delete it to accept a fresh anchor".into()),
+            (!ok).then(restore_or_recover),
         ));
     }
     let tables: Vec<String> = exports
@@ -901,7 +901,7 @@ fn mongo_checks(
                 name,
                 false,
                 Some(why.to_string()),
-                Some("restore the file, or delete it to accept a fresh anchor".into()),
+                Some(restore_or_recover()),
             )),
         }
     }
