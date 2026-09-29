@@ -16,6 +16,30 @@ use crate::types::target::TargetColumnSpec;
 /// HTTP timeout for one ClickHouse call (20 min); one part's INSERT is seconds on a LAN.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(1200);
 
+/// Attempts per statement, the first included; retries back off 250 ms, 500 ms, 1 s, 2 s.
+const MAX_ATTEMPTS: u32 = 5;
+const RETRY_BASE_MS: u64 = 250;
+
+/// Whether a statement may be sent again after a failure that leaves its outcome unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Repeat {
+    /// A second run changes nothing: a read, `IF NOT EXISTS`/`OR REPLACE` DDL, an insert into a log that collapses copies.
+    Safe,
+    /// A second run changes the result (EXCHANGE, RENAME, a plain `MergeTree` insert): resend only what never connected.
+    Undelivered,
+}
+
+/// How one HTTP attempt failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Failure {
+    /// No connection was made, so the server never saw the statement.
+    Connect,
+    /// The connection broke or timed out after the statement was sent.
+    Transport,
+    /// The server answered with this status and `X-ClickHouse-Exception-Code`.
+    Status(u16, Option<u32>),
+}
+
 /// Loads staged Parquet into ClickHouse over its HTTP interface.
 pub struct ClickhouseLoader {
     url: String,
@@ -30,6 +54,9 @@ pub struct ClickhouseLoader {
     cdc: bool,
     /// Read parts server-side through this named collection instead of sending them.
     named_collection: Option<String>,
+    /// A PEM file of extra root certificates for an `https://` URL.
+    ca_file: Option<String>,
+    client: OnceLock<reqwest::blocking::Client>,
 }
 
 impl ClickhouseLoader {
@@ -51,7 +78,15 @@ impl ClickhouseLoader {
             cluster_by: Vec::new(),
             cdc: false,
             named_collection: None,
+            ca_file: None,
+            client: OnceLock::new(),
         }
+    }
+
+    /// Trust the root certificates in `ca_file` beside the built-in ones.
+    pub(crate) fn ca_file(mut self, ca_file: Option<String>) -> Self {
+        self.ca_file = ca_file;
+        self
     }
 
     /// Have ClickHouse read each part itself through `collection` (ADR-0035 CH6).
@@ -84,43 +119,108 @@ impl ClickhouseLoader {
         Ok(self.store.get_or_init(|| s))
     }
 
-    /// POST `body` with `params`, waiting for the statement to finish; returns the response text.
-    fn post(&self, params: &[(&str, &str)], body: Vec<u8>) -> Result<String> {
+    fn client(&self) -> Result<&reqwest::blocking::Client> {
+        if let Some(c) = self.client.get() {
+            return Ok(c);
+        }
+        let c = http_client(self.ca_file.as_deref())?;
+        Ok(self.client.get_or_init(|| c))
+    }
+
+    /// POST `body` with `params`, waiting for the statement to finish and retrying what
+    /// `repeat` allows; returns the response text.
+    fn post(&self, params: &[(&str, &str)], body: bytes::Bytes, repeat: Repeat) -> Result<String> {
         let pass = std::env::var(&self.password_env).with_context(|| {
             format!(
                 "ClickHouse load: `password_env` names `{}`, which is not set",
                 self.password_env
             )
         })?;
-        let resp = reqwest::blocking::Client::builder()
-            .timeout(HTTP_TIMEOUT)
-            .build()
-            .context("building the ClickHouse HTTP client")?
+        let client = self.client()?;
+        let mut attempt = 1;
+        loop {
+            let (failure, err) = match self.send_once(client, &pass, params, body.clone()) {
+                Ok(text) => return Ok(text),
+                Err(e) => e,
+            };
+            if retry_after(failure, repeat, attempt) {
+                log::warn!("ClickHouse attempt {attempt} failed, retrying: {err:#}");
+                std::thread::sleep(Duration::from_millis(
+                    crate::pipeline::retry::retry_backoff_ms(RETRY_BASE_MS, attempt, 0),
+                ));
+                attempt += 1;
+                continue;
+            }
+            return Err(err.context(format!(
+                "ClickHouse statement failed on attempt {attempt} of {MAX_ATTEMPTS}"
+            )));
+        }
+    }
+
+    /// One HTTP attempt: the response text, or how it failed and why.
+    fn send_once(
+        &self,
+        client: &reqwest::blocking::Client,
+        pass: &str,
+        params: &[(&str, &str)],
+        body: bytes::Bytes,
+    ) -> std::result::Result<String, (Failure, anyhow::Error)> {
+        let resp = client
             .post(&self.url)
             .basic_auth(&self.user, Some(pass))
             .query(&[("wait_end_of_query", "1")])
             .query(params)
             .body(body)
             .send()
-            .with_context(|| {
-                format!(
-                    "ClickHouse HTTP request to {} failed",
-                    crate::redact::redact_secrets(&self.url)
+            .map_err(|e| {
+                let failure = if e.is_connect() {
+                    Failure::Connect
+                } else {
+                    Failure::Transport
+                };
+                let url = crate::redact::redact_secrets(&self.url);
+                let err = anyhow::Error::new(e);
+                (
+                    failure,
+                    err.context(format!("ClickHouse HTTP request to {url} failed")),
                 )
             })?;
         let status = resp.status();
-        let text = resp
-            .text()
-            .context("reading the ClickHouse HTTP response")?;
+        let code = resp
+            .headers()
+            .get("X-ClickHouse-Exception-Code")
+            .and_then(|v| v.to_str().ok()?.parse().ok());
+        let text = resp.text().map_err(|e| {
+            (
+                Failure::Transport,
+                anyhow::Error::new(e).context("reading the ClickHouse HTTP response"),
+            )
+        })?;
         match status.is_success() {
             true => Ok(text.trim().to_string()),
-            false => bail!("ClickHouse (HTTP {status}): {}", trim_ch_error(&text)),
+            false => Err((
+                Failure::Status(status.as_u16(), code),
+                anyhow::anyhow!("ClickHouse (HTTP {status}): {}", trim_ch_error(&text)),
+            )),
         }
     }
 
-    /// Run one SQL statement and return its output.
+    /// Run one idempotent SQL statement and return its output.
     fn query(&self, sql: &str) -> Result<String> {
-        self.post(&[], sql.as_bytes().to_vec())
+        self.post(
+            &[],
+            bytes::Bytes::copy_from_slice(sql.as_bytes()),
+            Repeat::Safe,
+        )
+    }
+
+    /// Run one SQL statement that must not run twice unless it never reached the server.
+    fn query_once(&self, sql: &str) -> Result<String> {
+        self.post(
+            &[],
+            bytes::Bytes::copy_from_slice(sql.as_bytes()),
+            Repeat::Undelivered,
+        )
     }
 
     /// A single `u64` from a `SELECT` returning one number.
@@ -135,44 +235,54 @@ impl ClickhouseLoader {
     /// The count comes from each part, not from `X-ClickHouse-Summary`: that counts rows
     /// materialized views write too and reads 0 under `async_insert`, while a statement that
     /// returns 200 under `wait_end_of_query` inserted all of its rows (ADR-0035 CH6).
-    fn insert_uris(&self, target: &str, uris: &[String]) -> Result<u64> {
-        uris.iter().map(|uri| self.insert_one(target, uri)).sum()
+    fn insert_uris(&self, target: &str, uris: &[String], repeat: Repeat) -> Result<u64> {
+        uris.iter()
+            .enumerate()
+            .map(|(i, uri)| {
+                let rows = self.insert_one(target, uri, repeat)?;
+                crate::test_hook::maybe_panic_at_chunk("clickhouse_after_part", i as i64);
+                Ok(rows)
+            })
+            .sum()
     }
 
-    /// Insert one part into `target`; the rows it holds.
-    fn insert_one(&self, target: &str, uri: &str) -> Result<u64> {
+    /// Insert one part into `target`; the rows it holds. Pushed or pulled, the part's footer
+    /// is read first, so a timestamp ClickHouse would clamp refuses before any row lands.
+    fn insert_one(&self, target: &str, uri: &str, repeat: Repeat) -> Result<u64> {
         let (bucket, key) = super::split_object_uri(uri)?;
         let pull = self
             .named_collection
             .as_ref()
             .filter(|_| pullable(bucket, key));
-        let (query, body, rows) = match pull {
-            Some(nc) => {
-                let source = pull_source(nc, super::scheme_of(uri), bucket, key);
-                (
-                    format!("INSERT INTO {target} SELECT * FROM {source}"),
-                    Vec::new(),
-                    self.number(&format!("SELECT count() FROM {source}"))?,
-                )
-            }
+        let (query, body, meta) = match pull {
+            Some(nc) => (
+                format!(
+                    "INSERT INTO {target} SELECT * FROM {}",
+                    pull_source(nc, super::scheme_of(uri), bucket, key)
+                ),
+                bytes::Bytes::new(),
+                super::partition_budget::read_footer(self.store()?, key)
+                    .with_context(|| format!("reading the footer of {uri}"))?,
+            ),
             None => {
                 let bytes = self
                     .store()?
                     .read(key)
                     .with_context(|| format!("reading {uri} for the ClickHouse load"))?;
                 let meta = parquet_footer(&bytes).with_context(|| format!("reading {uri}"))?;
-                refuse_unholdable_timestamps(&meta, uri)?;
-                let rows = footer_rows(&meta)?;
-                (format!("INSERT INTO {target} FORMAT Parquet"), bytes, rows)
+                let insert = format!("INSERT INTO {target} FORMAT Parquet");
+                (insert, bytes::Bytes::from(bytes), meta)
             }
         };
+        refuse_unholdable_timestamps(&meta, uri)?;
+        let rows = footer_rows(&meta)?;
         let params = [
             ("query", query.as_str()),
             ("input_format_null_as_default", "0"),
             ("async_insert", "0"),
             ("use_structure_from_insertion_table_in_table_functions", "1"),
         ];
-        self.post(&params, body)
+        self.post(&params, body, repeat)
             .with_context(|| format!("inserting {uri} into {target}"))?;
         Ok(rows)
     }
@@ -250,9 +360,14 @@ impl TargetLoader for ClickhouseLoader {
             "MergeTree",
             &order_by(&self.cluster_by),
         ))?;
-        let rows = self.insert_uris(&swap, uris)?;
-        for sql in swap_in(self.object_kind(table)?, &swap, &target) {
-            self.query(&sql)?;
+        crate::test_hook::maybe_panic_at("clickhouse_full_after_swap_created");
+        let rows = self.insert_uris(&swap, uris, Repeat::Undelivered)?;
+        crate::test_hook::maybe_panic_at("clickhouse_full_before_swap_in");
+        for (sql, repeat, hook) in swap_in(self.object_kind(table)?, &swap, &target) {
+            self.post(&[], bytes::Bytes::from(sql), repeat)?;
+            if let Some(point) = hook {
+                crate::test_hook::maybe_panic_at(point);
+            }
         }
         Ok(rows)
     }
@@ -282,7 +397,7 @@ impl TargetLoader for ClickhouseLoader {
             self.query(&alter)
                 .with_context(|| format!("adding new columns to `{table}__changes`"))?;
         }
-        self.insert_uris(&changes, uris)
+        self.insert_uris(&changes, uris, changelog_repeat(self.cdc))
     }
 
     fn warehouse(&self) -> Warehouse {
@@ -372,7 +487,7 @@ impl TargetLoader for ClickhouseLoader {
             )));
         }
         let to = self.quoted(&format!("{table}__changes"));
-        self.query(&format!("RENAME TABLE {from} TO {to}"))?;
+        self.query_once(&format!("RENAME TABLE {from} TO {to}"))?;
         self.query(&format!(
             "ALTER TABLE {to} ADD COLUMN IF NOT EXISTS `__op` Nullable(String) FIRST, \
              ADD COLUMN IF NOT EXISTS `__pos` Nullable(String) AFTER `__op`, \
@@ -408,16 +523,77 @@ fn pull_source(collection: &str, scheme: &str, bucket: &str, key: &str) -> Strin
     }
 }
 
-/// The statements that put a filled `swap` table in `target`'s place: a rename when there
-/// is nothing there yet, else an exchange and a drop of what was there.
-fn swap_in(existing: ObjectKind, swap: &str, target: &str) -> Vec<String> {
+/// The statements that put a filled `swap` table in `target`'s place, each with whether it
+/// may be resent and the fault point after it: a rename when there is nothing there yet,
+/// else an exchange (resent, it would swap the old table back) and a drop of what was there.
+fn swap_in(
+    existing: ObjectKind,
+    swap: &str,
+    target: &str,
+) -> Vec<(String, Repeat, Option<&'static str>)> {
     match existing {
-        ObjectKind::Absent => vec![format!("RENAME TABLE {swap} TO {target}")],
+        ObjectKind::Absent => vec![(
+            format!("RENAME TABLE {swap} TO {target}"),
+            Repeat::Undelivered,
+            None,
+        )],
         _ => vec![
-            format!("EXCHANGE TABLES {swap} AND {target}"),
-            format!("DROP TABLE {swap}"),
+            (
+                format!("EXCHANGE TABLES {swap} AND {target}"),
+                Repeat::Undelivered,
+                Some("clickhouse_full_after_exchange"),
+            ),
+            (format!("DROP TABLE IF EXISTS {swap}"), Repeat::Safe, None),
         ],
     }
+}
+
+/// A CDC log collapses a resent part's copies by key and version; a plain `MergeTree`
+/// incremental log would keep both, so its inserts are resent only when undelivered.
+fn changelog_repeat(cdc: bool) -> Repeat {
+    if cdc {
+        Repeat::Safe
+    } else {
+        Repeat::Undelivered
+    }
+}
+
+/// Whether attempt `attempt` failing with `failure` earns another for a `repeat` statement:
+/// a connection never made is always resent; a lost answer or an overloaded server only
+/// when a second run is harmless; any other answer is the server's decision.
+fn retry_after(failure: Failure, repeat: Repeat, attempt: u32) -> bool {
+    let transient = match failure {
+        Failure::Connect => true,
+        Failure::Transport => repeat == Repeat::Safe,
+        Failure::Status(status, code) => {
+            repeat == Repeat::Safe
+                && (matches!(status, 429 | 502 | 503 | 504) || matches!(code, Some(202 | 252)))
+        }
+    };
+    transient && attempt < MAX_ATTEMPTS
+}
+
+/// The HTTP client, trusting `ca_file`'s certificates beside the built-in roots; no pooled
+/// connection is reused, so a server-closed keep-alive cannot fail a statement.
+fn http_client(ca_file: Option<&str>) -> Result<reqwest::blocking::Client> {
+    let mut builder = reqwest::blocking::Client::builder()
+        .timeout(HTTP_TIMEOUT)
+        .pool_max_idle_per_host(0);
+    if let Some(path) = ca_file {
+        let pem = std::fs::read(path)
+            .with_context(|| format!("ClickHouse load: cannot read `load.ca_file` {path}"))?;
+        let certs = reqwest::Certificate::from_pem_bundle(&pem)
+            .with_context(|| format!("ClickHouse load: `load.ca_file` {path} is not PEM"))?;
+        if certs.is_empty() {
+            bail!("ClickHouse load: `load.ca_file` {path} holds no PEM certificate");
+        }
+        for cert in certs {
+            builder = builder.add_root_certificate(cert);
+        }
+    }
+    builder
+        .build()
+        .context("building the ClickHouse HTTP client")
 }
 
 /// Two tab-separated counts, as a `SELECT a, b … FORMAT TSV` returns them.
@@ -1164,14 +1340,23 @@ mod tests {
     #[test]
     #[ignore = "live: requires docker compose clickhouse (with dev/clickhouse/named_collections.xml) + minio"]
     fn a_pulled_part_lands_by_column_name_and_a_null_key_refuses() {
-        unsafe { std::env::set_var("RIVET_CH_PULL_TEST_PASSWORD", "rivet") };
+        unsafe {
+            std::env::set_var("RIVET_CH_PULL_TEST_PASSWORD", "rivet");
+            std::env::set_var("RIVET_CH_PULL_TEST_MINIO_KEY", "minioadmin");
+        }
         let db = format!("rivet_chpull_{}", std::process::id());
+        let store: crate::config::DestinationConfig = serde_yaml_ng::from_str(
+            "{ type: s3, bucket: rivet-qa-ch-pull, region: us-east-1, \
+             endpoint: \"http://127.0.0.1:9000\", access_key_env: RIVET_CH_PULL_TEST_MINIO_KEY, \
+             secret_key_env: RIVET_CH_PULL_TEST_MINIO_KEY }",
+        )
+        .expect("an S3 destination");
         let loader = ClickhouseLoader::new(
             "http://127.0.0.1:8123",
             &db,
             "rivet",
             "RIVET_CH_PULL_TEST_PASSWORD",
-            crate::config::DestinationConfig::default(),
+            store,
         )
         .cdc(true)
         .named_collection(Some("rivet_stand_minio".into()));
@@ -1238,11 +1423,18 @@ mod tests {
     fn a_first_full_load_renames_and_a_later_one_exchanges_then_drops() {
         assert_eq!(
             swap_in(ObjectKind::Absent, "s", "t"),
-            ["RENAME TABLE s TO t"]
+            [("RENAME TABLE s TO t".to_string(), Repeat::Undelivered, None)]
         );
         assert_eq!(
             swap_in(ObjectKind::Table, "s", "t"),
-            ["EXCHANGE TABLES s AND t", "DROP TABLE s"]
+            [
+                (
+                    "EXCHANGE TABLES s AND t".to_string(),
+                    Repeat::Undelivered,
+                    Some("clickhouse_full_after_exchange")
+                ),
+                ("DROP TABLE IF EXISTS s".to_string(), Repeat::Safe, None)
+            ]
         );
         assert_eq!(parse_pair("7\t3\n"), Some((7, 3)));
         assert_eq!(parse_pair("7"), None);
@@ -1288,6 +1480,7 @@ mod tests {
             user: "u".into(),
             password_env: "RIVET_CH_WIRE_TEST_PASSWORD".into(),
             named_collection: None,
+            ca_file: None,
         };
         let cdc = crate::load::build_loader(&plan, "run");
         let err = cdc
@@ -1342,6 +1535,90 @@ mod tests {
             pull_source("nc", "az", "c", "p/a.parquet"),
             "azureBlobStorage(nc, container = 'c', blob_path = 'p/a.parquet', format = 'Parquet')"
         );
+    }
+
+    /// A lost answer is resent only where a second run is harmless; a connection never made
+    /// always is; a server's own refusal never is; and the budget ends every loop.
+    #[test]
+    fn only_a_harmless_repeat_is_resent_and_never_past_the_budget() {
+        use Failure::*;
+        use Repeat::*;
+        for repeat in [Safe, Undelivered] {
+            assert!(retry_after(Connect, repeat, 1), "{repeat:?}");
+            assert!(retry_after(Connect, repeat, MAX_ATTEMPTS - 1), "{repeat:?}");
+            assert!(!retry_after(Connect, repeat, MAX_ATTEMPTS), "{repeat:?}");
+            assert!(
+                !retry_after(Status(500, Some(349)), repeat, 1),
+                "a NULL key"
+            );
+            assert!(
+                !retry_after(Status(400, Some(62)), repeat, 1),
+                "a syntax error"
+            );
+            assert!(!retry_after(Status(403, None), repeat, 1), "auth");
+        }
+        assert!(retry_after(Transport, Safe, 1));
+        assert!(!retry_after(Transport, Undelivered, 1));
+        for status in [429, 502, 503, 504] {
+            assert!(retry_after(Status(status, None), Safe, 1), "{status}");
+            assert!(
+                !retry_after(Status(status, None), Undelivered, 1),
+                "{status}"
+            );
+        }
+        for code in [202, 252] {
+            assert!(retry_after(Status(500, Some(code)), Safe, 1), "{code}");
+            assert!(
+                !retry_after(Status(500, Some(code)), Undelivered, 1),
+                "{code}"
+            );
+        }
+        assert!(!retry_after(Transport, Safe, MAX_ATTEMPTS));
+        assert_eq!(MAX_ATTEMPTS, 5);
+        assert_eq!(changelog_repeat(true), Safe, "a CDC log collapses copies");
+        assert_eq!(
+            changelog_repeat(false),
+            Undelivered,
+            "an incremental log keeps them"
+        );
+    }
+
+    /// `load.ca_file` is read when the client is built: a missing or non-PEM file refuses
+    /// naming the path, a CA certificate is accepted.
+    #[test]
+    fn a_ca_file_must_exist_and_hold_a_certificate() {
+        const CA: &str = "-----BEGIN CERTIFICATE-----
+MIIBhzCCAS2gAwIBAgIUWztYYpCs1NyMKmvB7Bax29YmgMowCgYIKoZIzj0EAwIw
+GDEWMBQGA1UEAwwNcml2ZXQtdGVzdC1jYTAgFw0yNjA5MjkyMDAyNDJaGA8yMTI2
+MDkwNTIwMDI0MlowGDEWMBQGA1UEAwwNcml2ZXQtdGVzdC1jYTBZMBMGByqGSM49
+AgEGCCqGSM49AwEHA0IABDnl0o+5mROtcCyvAOytFappXSft92U7GqO9OZ1F3yD+
+WIdop7cCa/fMfPgTmZFsU4MUAD+7kclPWub8WFCPikGjUzBRMB0GA1UdDgQWBBSO
+1pHNF9NUPaPAMrTPsin0x+VbCDAfBgNVHSMEGDAWgBSO1pHNF9NUPaPAMrTPsin0
+x+VbCDAPBgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMCA0gAMEUCIHphUR1wZCCD
+XuvoDdmSxlWD2Luc2HNVLlb0+FfdTP66AiEA/kHRfo1HOlxB43y04rUf4ViuH1Fd
+J10BsZgn5wxFlM4=
+-----END CERTIFICATE-----
+";
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, body: &str| {
+            let p = dir.path().join(name);
+            std::fs::write(&p, body).unwrap();
+            p.display().to_string()
+        };
+        let missing = dir.path().join("absent.pem").display().to_string();
+        let err = format!("{:#}", http_client(Some(&missing)).unwrap_err());
+        assert!(
+            err.contains("cannot read `load.ca_file`") && err.contains(&missing),
+            "{err}"
+        );
+        let junk = write("junk.pem", "not a certificate\n");
+        let err = format!("{:#}", http_client(Some(&junk)).unwrap_err());
+        assert!(
+            err.contains("holds no PEM certificate") && err.contains(&junk),
+            "{err}"
+        );
+        assert!(http_client(Some(&write("ca.pem", CA))).is_ok());
+        assert!(http_client(None).is_ok());
     }
 
     #[test]

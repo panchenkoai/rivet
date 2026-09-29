@@ -1192,6 +1192,7 @@ pub fn build_loader(plan: &plan::LoadPlan, run_id: &str) -> Box<dyn TargetLoader
             user,
             password_env,
             named_collection,
+            ca_file,
         } => Box::new(
             clickhouse::ClickhouseLoader::new(
                 url,
@@ -1201,6 +1202,7 @@ pub fn build_loader(plan: &plan::LoadPlan, run_id: &str) -> Box<dyn TargetLoader
                 plan.destination.clone(),
             )
             .named_collection(named_collection.clone())
+            .ca_file(ca_file.clone())
             .cluster_by(plan.clustering.columns().to_vec())
             .cdc(plan.mode == plan::LoadMode::Cdc),
         ),

@@ -27,6 +27,10 @@
 //! | `compact_before_merge` | `load/bigquery/mod.rs` (buffer read, nothing merged yet — the buffer must survive) | `RIVET_TEST_PANIC_AT=compact_before_merge` |
 //! | `load_after_adopt` | `load/mod.rs` (a full-load table renamed into the change log, nothing appended, no view yet) | `RIVET_TEST_PANIC_AT=load_after_adopt` |
 //! | `load_after_append` | `load/mod.rs` (changes appended and the view built, the load not yet recorded — the next load re-appends) | `RIVET_TEST_PANIC_AT=load_after_append` |
+//! | `clickhouse_full_after_swap_created` | `load/clickhouse.rs` (a full load's empty swap table created, nothing inserted) | `RIVET_TEST_PANIC_AT=clickhouse_full_after_swap_created` |
+//! | `clickhouse_after_part:{N}` | `load/clickhouse.rs` (part N inserted into the swap table or change log, the rest not) | `RIVET_TEST_PANIC_AT=clickhouse_after_part:0` |
+//! | `clickhouse_full_before_swap_in` | `load/clickhouse.rs` (every part in the swap table, the old table still served) | `RIVET_TEST_PANIC_AT=clickhouse_full_before_swap_in` |
+//! | `clickhouse_full_after_exchange` | `load/clickhouse.rs` (the swap exchanged in, the old table not yet dropped) | `RIVET_TEST_PANIC_AT=clickhouse_full_after_exchange` |
 //! | `compact_after_merge` | `load/bigquery/mod.rs` (MERGEs + DROP already committed) | `RIVET_TEST_PANIC_AT=compact_after_merge` |
 //!
 //! # Test usage
