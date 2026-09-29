@@ -196,6 +196,16 @@ pub(crate) fn reads_every_row(query: &str) -> bool {
         " connect by ",
         " sample",
         " tablesample",
+        " partition (",
+        " partition(",
+        " subpartition",
+        " apply ",
+        " pivot ",
+        " pivot(",
+        " unpivot",
+        " as of ",
+        " for system_time",
+        "@",
     ]
     .iter()
     .any(|kw| q.contains(kw))
@@ -1205,6 +1215,13 @@ mod tests {
             "SELECT a FROM t FETCH FIRST 5 ROWS ONLY",
             "SELECT id FROM dbo.orders TABLESAMPLE (10 PERCENT)",
             "SELECT id, count(*) FROM dbo.orders GROUP BY id",
+            "SELECT * FROM sales PARTITION (p2024)",
+            "SELECT * FROM sales SUBPARTITION (sp1)",
+            "SELECT o.* FROM dbo.orders o CROSS APPLY dbo.f(o.id) x",
+            "SELECT o.* FROM dbo.orders o OUTER APPLY dbo.f(o.id) x",
+            "SELECT * FROM sales AS OF TIMESTAMP SYSTIMESTAMP",
+            "SELECT * FROM dbo.orders FOR SYSTEM_TIME ALL",
+            "SELECT * FROM sales@remote_db",
         ] {
             assert!(
                 table_from_simple_query(q).is_some(),
