@@ -1525,6 +1525,7 @@ mod compact_tests {
             ("BIGNUMERIC(50,10)", Some("BIGNUMERIC")),
             ("timestamp", Some("TIMESTAMP")),
             ("DATE", Some("DATE")),
+            ("DATETIME", Some("DATETIME")),
             ("FLOAT64", None),
             ("BYTES", None),
             ("ARRAY<INT64>", None),
