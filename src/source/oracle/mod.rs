@@ -810,6 +810,8 @@ mod tests {
         }
         for (t, p, s) in [
             ("NUMBER", Some(12), Some(2)),
+            ("NUMBER", None, Some(2)),
+            ("NUMBER", Some(12), None),
             ("BINARY_FLOAT", None, None),
             ("BINARY_DOUBLE", None, None),
             ("FLOAT", Some(126), None),
