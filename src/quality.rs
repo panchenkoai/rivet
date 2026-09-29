@@ -234,7 +234,8 @@ impl QualityTracker {
             }
         }
         for col in &qc.unique_columns {
-            if self.unique_capped.contains(col) {
+            let capped = self.unique_capped.contains(col);
+            if capped {
                 let cap = qc.unique_max_entries.unwrap_or(0);
                 issues.push(QualityIssue {
                     severity: Severity::Warn,
@@ -244,15 +245,17 @@ impl QualityTracker {
                         col, cap
                     ),
                 });
-            } else if let Some(set) = self.unique_sets.get(col) {
+            }
+            if let Some(set) = self.unique_sets.get(col) {
                 let non_null = self.unique_non_null_counts.get(col).copied().unwrap_or(0);
                 let dupes = non_null.saturating_sub(set.len());
                 if dupes > 0 {
+                    let at_least = if capped { "at least " } else { "" };
                     issues.push(QualityIssue {
                         severity: Severity::Fail,
                         message: format!(
-                            "column '{}': {} duplicate values out of {} rows",
-                            col, dupes, total_rows
+                            "column '{}': {}{} duplicate values out of {} rows",
+                            col, at_least, dupes, total_rows
                         ),
                     });
                 }
