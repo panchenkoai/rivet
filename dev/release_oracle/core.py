@@ -337,7 +337,7 @@ def record_timings(path: Path, phases: list[tuple[str, float]], spans: list[tupl
         "passed": passed,
         "failed": failed,
         "total_min": round(sum(d for _, d in phases) / 60.0, 1),
-        "phases_min": {n: round(d / 60.0, 2) for n, d in phases},
+        "phases_min": {n.split(" — ")[0]: round(d / 60.0, 2) for n, d in phases},
         "top_spans_min": {n: round(d / 60.0, 2) for n, d in sorted(spans, key=lambda p: p[1], reverse=True)[:40]},
     }
     prev = None

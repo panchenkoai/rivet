@@ -251,14 +251,14 @@ def sc_sentinels(led: Ledger, engine: str, tag: str, url: str) -> None:
     if tables is None:
         _skipped(led, engine, tag, SCEN, "-", f"sentinels: no sentinel set for {engine}", "no set")
         return
-    out = Scope(engine, tag).dir("sentinels")
+    scope = Scope(engine, tag)
     for t in tables:
         err = create(engine, url, t)
         if err:
             _failed(led, engine, tag, SCEN, t.name, f"sentinels[{t.name}]: could not seed: {err}", "seed")
             continue
         for mode, label in (("full", "full"), ("chunked", "keyset")):
-            dest = out / t.name / label
+            dest = scope.dir("sentinels", t.name) / label
             p = _export_local(engine, url, t.name, dest, mode)
             diffs: list[str] | None = None
             oracle_error = ""
