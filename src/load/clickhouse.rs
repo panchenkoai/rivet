@@ -102,7 +102,6 @@ impl ClickhouseLoader {
             .query(params)
             .body(body)
             .send()
-            .map_err(reqwest::Error::without_url)
             .with_context(|| {
                 format!(
                     "ClickHouse HTTP request to {} failed",
