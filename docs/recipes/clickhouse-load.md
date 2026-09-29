@@ -41,6 +41,25 @@ load:
   cleanup_source: true
 ```
 
+## One cycle is `run` + `load` — no compact step
+
+```bash
+rivet run  -c rivet.yaml
+rivet load -c rivet.yaml
+```
+
+Put those two lines on the schedule. There is no third step: a CDC table's change
+log is a `ReplacingMergeTree(__ver)`, and ClickHouse itself collapses the versions
+of a key in its background merges. The view `<table>` reads the log with `FINAL`, so
+it returns one row per key — the latest version — whether or not those merges have
+run yet. A change delivered twice (at-least-once after an interrupted run, or a
+re-run load) carries the same key and version, so it collapses the same way.
+
+`rivet compact` on a ClickHouse config does nothing: it passes a change-log table
+by with "this warehouse keeps a change log behind a view and never compacts; nothing
+to merge" (and a full-load table with "a full load overwrites its table"). A deleted key stays in the log as its last version with `__is_deleted`
+set, so live state is `WHERE NOT __is_deleted`.
+
 ## What lands
 
 | Export mode | In ClickHouse |

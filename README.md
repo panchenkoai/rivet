@@ -16,14 +16,14 @@
 <h3 align="center">Production database → your warehouse, without hurting either.</h3>
 
 <p align="center">
-One ~30 MB Rust binary. <b>PostgreSQL · MySQL · SQL Server · MongoDB</b> → Parquet/CSV on <b>S3 · GCS · Azure · local</b> → <b>BigQuery · Snowflake</b>.<br>
+One ~30 MB Rust binary. <b>PostgreSQL · MySQL · SQL Server · MongoDB · Oracle</b> (preview) → Parquet/CSV on <b>S3 · GCS · Azure · local</b> → <b>BigQuery · Snowflake · ClickHouse</b> (preview).<br>
 Batch snapshots or log-based change data capture. Resumable, verifiable, source-safe.
 </p>
 
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/rivet-flow-dark.svg">
-    <img src="docs/assets/rivet-flow.svg" alt="PostgreSQL, MySQL, SQL Server and MongoDB → rivet → S3, GCS, Azure Blob or local disk → BigQuery or Snowflake" width="900">
+    <img src="docs/assets/rivet-flow.svg" alt="PostgreSQL, MySQL, SQL Server, MongoDB and Oracle → rivet → S3, GCS, Azure Blob or local disk → BigQuery, Snowflake or ClickHouse" width="900">
   </picture>
 </p>
 
@@ -31,7 +31,7 @@ Batch snapshots or log-based change data capture. Resumable, verifiable, source-
 
 - **Source-safe by construction.** Short keyset/chunked reads, a server-side cursor on PostgreSQL, CDC that reads the log instead of querying tables. rivet detects pgBouncer / Odyssey / ProxySQL / MaxScale and the Azure SQL gateway, and warns at run start when a sparse key would split one export into thousands of near-empty queries.
 - **Change data capture on four engines, at-least-once.** Checkpoints sit on transaction boundaries, a large transaction survives a mid-flush crash whole, and PostgreSQL's slot advances only after the parts are durable. Each release is diffed against Debezium on the same change window.
-- **A warehouse that follows the source.** On BigQuery, `rivet load` writes base tables with a `__is_deleted` flag and appends later changes to `<table>__changes`; `rivet compact` merges them in with one `MERGE` per table and drops the buffer — no full reloads. On Snowflake, `rivet load` keeps a change log and a current-state view.
+- **A warehouse that follows the source.** On BigQuery, `rivet load` writes base tables with a `__is_deleted` flag and appends later changes to `<table>__changes`; `rivet compact` merges them in with one `MERGE` per table and drops the buffer — no full reloads. On Snowflake, `rivet load` keeps a change log and a current-state view. On ClickHouse (preview) the change log is a `ReplacingMergeTree` behind a view, so a cycle is just `rivet run` + `rivet load` — there is no compact step.
 - **Proof, not just a green exit code.** Every part is in a manifest with its row count and MD5. `rivet validate` re-reads what landed, `rivet reconcile` recounts the source chunk by chunk, `rivet repair` re-exports only the chunks it flagged, and the run journal records what committed.
 - **Resumable everywhere.** A killed chunked, keyset or CDC run resumes from its last durable unit. Parts are named per run, so a re-run never overwrites the previous one.
 - **One binary, no platform.** State lives in SQLite next to the config, or in Postgres (`RIVET_STATE_URL`) for containers and shared runners. Run it from cron, Airflow, a Kubernetes `CronJob`, or `docker run`. [`rivet-mcp`](docs/reference/mcp.md) lets an AI agent check source health before an extract.
@@ -48,7 +48,7 @@ rivet init --source-env DATABASE_URL -o rivet.yaml   # discovers tables, keys, c
 rivet run  -c rivet.yaml                             # typed Parquet in ./output/
 ```
 
-**Change data capture** — every INSERT / UPDATE / DELETE from the MySQL binlog, a PostgreSQL logical slot, SQL Server change tables or a MongoDB change stream:
+**Change data capture** — every INSERT / UPDATE / DELETE from the MySQL binlog, a PostgreSQL logical slot, SQL Server change tables, a MongoDB change stream or Oracle LogMiner (preview; bounded runs to files):
 
 ```bash
 rivet init --source-env DATABASE_URL --mode cdc -o cdc.yaml   # MySQL / PostgreSQL `public`, 2+ tables: one stream over every table
@@ -73,7 +73,7 @@ Put those three lines in cron or [Airflow](docs/recipes/airflow/) and the wareho
 
 ## Is it for you?
 
-**Yes**, if you move tables from an operational PostgreSQL / MySQL / SQL Server / MongoDB into files or a warehouse, the source is production, and "it ran" is not enough — you want a record of what landed.
+**Yes**, if you move tables from an operational PostgreSQL / MySQL / SQL Server / MongoDB / Oracle into files or a warehouse, the source is production, and "it ran" is not enough — you want a record of what landed.
 
 **Look elsewhere** for SaaS sources (Airbyte, Fivetran), an always-on sub-second replication sink (Debezium, Estuary), warehouses rivet does not load (dlt, Sling), or in-warehouse modelling (dbt). rivet runs as a command you schedule, not a hosted service.
 
@@ -115,8 +115,8 @@ Running the test suites: [CONTRIBUTING.md § Running tests](CONTRIBUTING.md#runn
 |---|---|
 | Start here | [getting started](docs/getting-started.md) · [concepts](docs/concepts.md) · [who is this for](docs/who-is-this-for.md) · [all docs](docs/README.md) |
 | Run it in production | [pilot guide](docs/pilot/README.md) · [production checklist](docs/pilot/production-checklist.md) · [best practices](docs/best-practices/) · [recipes](docs/recipes/) |
-| CDC and the warehouse | [CDC reference](docs/reference/cdc.md) · [full cycle](docs/cdc-full-cycle.md) · [BigQuery load](docs/cdc-bigquery-load.md) |
-| Reference | [config](docs/reference/config.md) · [CLI](docs/reference/cli.md) · [tuning](docs/reference/tuning.md) · [init](docs/reference/init.md) · [destinations](docs/destinations/) |
+| CDC and the warehouse | [CDC reference](docs/reference/cdc.md) · [full cycle](docs/cdc-full-cycle.md) · [BigQuery load](docs/cdc-bigquery-load.md) · [ClickHouse load](docs/recipes/clickhouse-load.md) (preview) |
+| Reference | [config](docs/reference/config.md) · [CLI](docs/reference/cli.md) · [tuning](docs/reference/tuning.md) · [init](docs/reference/init.md) · [destinations](docs/destinations/) · [Oracle source](docs/reference/oracle.md) (preview) |
 | Trust | [semantics](docs/semantics.md) · [reliability matrix](docs/reliability-matrix.md) · [security](SECURITY.md) · [cloud permissions](docs/cloud-permissions.md) · [benchmarks](docs/bench/) |
 | Internals | [architecture](docs/architecture.md) · [ADRs](docs/adr/) · [contributing](CONTRIBUTING.md) |
 
