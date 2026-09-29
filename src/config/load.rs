@@ -922,6 +922,33 @@ mod tests {
         assert_eq!(HOURLY_LIFETIME_DAYS, 416);
     }
 
+    /// Every `target:` the schema accepts is named where the recipe lists `rivet load`'s targets.
+    #[test]
+    fn the_idempotent_load_recipe_names_every_load_target() {
+        let recipe = include_str!("../../docs/recipes/idempotent-warehouse-load.md").to_lowercase();
+        let schema = serde_json::to_value(schemars::schema_for!(LoadTargetKind)).unwrap();
+        let targets: Vec<String> = schema["enum"]
+            .as_array()
+            .expect("LoadTargetKind is a plain string enum")
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(targets.len() >= 3, "{schema}");
+        let line = |prefix: &str| {
+            recipe
+                .lines()
+                .find(|l| l.starts_with(prefix))
+                .unwrap_or_else(|| panic!("no line starting {prefix}"))
+                .to_string()
+        };
+        let heading = line("## the built-in path: `rivet load`");
+        let limit = line("- **load targets");
+        for t in &targets {
+            assert!(heading.contains(t.as_str()), "{t} missing from: {heading}");
+            assert!(limit.contains(t.as_str()), "{t} missing from: {limit}");
+        }
+    }
+
     #[test]
     fn the_json_schema_documents_the_block_as_written() {
         let schema = schemars::schema_for!(LoadSection);

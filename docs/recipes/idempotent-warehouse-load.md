@@ -33,9 +33,9 @@ repair still holds those rows; without a primary-key dedup it keeps them.
 
 ---
 
-## The built-in path: `rivet load` (BigQuery + Snowflake)
+## The built-in path: `rivet load` (BigQuery, Snowflake, ClickHouse)
 
-For BigQuery and Snowflake you do not build any of this — `rivet load` is
+For BigQuery, Snowflake and ClickHouse you do not build any of this — `rivet load` is
 idempotent by construction:
 
 - **Count gate before cleanup.** The load refuses to finish — and refuses to
@@ -51,11 +51,13 @@ idempotent by construction:
 - **`mode: incremental` / `mode: cdc` append + dedup.** For mutable sources the
   load appends to `<table>__changes` and exposes a current-state view
   (latest-per-PK, deletes flagged) — the built-in equivalent of the manual
-  `MERGE` below, no staging table or upsert SQL to write.
+  `MERGE` below, no staging table or upsert SQL to write. On ClickHouse the log
+  is a `ReplacingMergeTree` read through a `FINAL` view
+  ([ClickHouse load](clickhouse-load.md)).
 
 ```yaml
 load:
-  target: bigquery        # or: snowflake (+ connection/warehouse/database/schema/storage_integration)
+  target: bigquery        # or: snowflake / clickhouse (+ that target's connection keys)
   project: my-proj
   dataset: analytics
   pk: [id]                # incremental/cdc dedup key; default: the source primary key
@@ -259,8 +261,8 @@ silent data corruption that is invisible until a downstream join breaks.
 
 ## What Rivet does *not* do downstream
 
-- **Load targets BigQuery + Snowflake only.**  `rivet load` covers those two
-  (see [the built-in path](#the-built-in-path-rivet-load-bigquery--snowflake)
+- **Load targets BigQuery, Snowflake and ClickHouse only.**  `rivet load` covers those three
+  (see [the built-in path](#the-built-in-path-rivet-load-bigquery-snowflake-clickhouse)
   above); for Redshift / Trino / Databricks / dbt the operator wires up the load
   with the manual pattern here.
 - **No transactional coordination.**  Rivet does not coordinate with a
