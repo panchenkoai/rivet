@@ -548,6 +548,11 @@ fn oracle_cdc_truncate_refusal_delivers_the_rows_before_it_once() {
         ops(&[(1, "insert"), (2, "insert")]),
         "the rows before the truncate land once, and none after it"
     );
+    assert_eq!(
+        duckdb_dir_scalar(&out1, "count(*) * 100 + sum(\"ID\")", None),
+        203,
+        "DuckDB reads exactly ids 1 and 2 in run 1's parts"
+    );
 }
 
 #[test]

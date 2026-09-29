@@ -819,10 +819,12 @@ fn oracle_class_census_is_pinned() {
 // declared parts), +8 presence — six refusals whose oracle is the refusal text itself
 // (corrupt, retention gap, foreign DBID, no ALL COLUMNS logging, a LOB, an unknown
 // table), the NDJSON source-resolution CLI cell, and the shared intra-transaction check.
-const PIN_INDEPENDENT: usize = 98;
+// 2026-09-29: +1 independent — the Oracle TRUNCATE deferral cell reads run 1 through DuckDB.
+const PIN_INDEPENDENT: usize = 99;
 // 2026-09-28, source connection ceilings: +3 shared codec — the run's captured row is the
 // fixture check; the oracle is the server's own connection counter.
-const PIN_SHARED_CODEC: usize = 85;
+// 2026-09-29: +2 shared codec — the Oracle TRUNCATE refusal on re-run and the uncaptured-truncate cell.
+const PIN_SHARED_CODEC: usize = 87;
 const PIN_SELF_COUNTER: usize = 6;
 // 2026-09-28: +1 presence — the SQL Server undecodable-cell refusal, whose oracle is the refusal.
 // 2026-09-29: +2 presence — the PG CDC LMT-timezone and DOMAIN parity cells compare CDC to batch output.
