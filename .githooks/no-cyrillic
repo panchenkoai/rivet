@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# The repository is English-only: refuse Cyrillic in staged added lines, or in a commit message.
+#
+#   no-cyrillic --staged        pre-commit: every line the commit ADDS (existing lines are not graded)
+#   no-cyrillic --message FILE  commit-msg: the message, comment lines excluded
+#
+# A line that must carry Cyrillic as TEST DATA (a table name, an enum label) opts out
+# with the marker `allow-cyrillic` on the same line.
+set -euo pipefail
+export LC_ALL=en_US.UTF-8
+CYR='[А-Яа-яЁё]'  # allow-cyrillic
+
+case "${1:-}" in
+--staged)
+    hits=""
+    while IFS= read -r f; do
+        lines=$(git diff --cached -U0 --no-color --no-ext-diff -- "$f" \
+            | grep -E '^\+' | grep -vE '^\+\+\+ ' | grep "$CYR" | grep -v 'allow-cyrillic' || true)
+        [ -n "$lines" ] && hits+="$f:"$'\n'"$(printf '%s\n' "$lines" | head -5 | sed 's/^+/    /')"$'\n'
+    done < <(git diff --cached --name-only --diff-filter=ACMR | grep -vE '\.(gif|png|jpg|jpeg|parquet|ico|pdf)$' || true)
+    if [ -n "$hits" ]; then
+        echo "pre-commit: REFUSING — Cyrillic in added lines (the repository is English-only):" >&2
+        printf '%s' "$hits" >&2
+        echo "           Translate it. Cyrillic TEST DATA stays with 'allow-cyrillic' on its line." >&2
+        exit 1
+    fi
+    ;;
+--message)
+    if grep -v '^#' "${2:?message file}" | grep -q "$CYR"; then
+        echo "commit-msg: REFUSING — the commit message contains Cyrillic (the repository is English-only):" >&2
+        grep -v '^#' "$2" | grep -n "$CYR" | head -5 | sed 's/^/    /' >&2
+        exit 1
+    fi
+    ;;
+*)
+    echo "usage: no-cyrillic --staged | --message FILE" >&2
+    exit 2
+    ;;
+esac
