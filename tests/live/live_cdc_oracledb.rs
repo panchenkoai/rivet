@@ -465,6 +465,114 @@ fn oracle_cdc_mixed_transaction_ending_on_uncaptured_table() {
     );
 }
 
+/// Run `rig` expecting the TRUNCATE refusal; a pass shows what it captured instead.
+fn expect_truncate_refusal(rig: &Rig, out: &Path, table: &str, ctx: &str) {
+    let r = rig.run_args(&[]);
+    let err = String::from_utf8_lossy(&r.stderr);
+    assert!(
+        !r.status.success(),
+        "{ctx}: the run must refuse the TRUNCATE, but exited 0 having captured {:?}",
+        cdc_id_ops(out)
+    );
+    assert!(
+        err.contains(&format!("oracle cdc: `RIVET.{table}` was TRUNCATEd"))
+            && err.contains("re-anchor FIRST")
+            && err.contains("RIVET_SOURCE_CDC_TRUNCATED"),
+        "{ctx}: stderr:\n{err}"
+    );
+}
+
+#[test]
+#[ignore = "live: requires the oracle service with LogMiner prerequisites"]
+fn oracle_cdc_refuses_a_truncate_of_a_captured_table_on_every_rerun() {
+    let _serial = cross_process_serial("oracle_cdc");
+    let d = tempfile::tempdir().unwrap();
+    let t = cdc_table("ora_ctr", "id NUMBER(18) PRIMARY KEY, v NUMBER(18)");
+    let ckpt = d.path().join("cdc.ckpt");
+    rig(&t, &ckpt, &d.path().join("anchor")).run_ok();
+    ora_exec(&format!("INSERT INTO {} VALUES (1, 10)", t.name()));
+    ora_exec(&format!("INSERT INTO {} VALUES (2, 20)", t.name()));
+    let out1 = d.path().join("out1");
+    rig(&t, &ckpt, &out1).run_ok();
+    assert_eq!(cdc_id_ops(&out1), ops(&[(1, "insert"), (2, "insert")]));
+    ora_exec(&format!("TRUNCATE TABLE {}", t.name()));
+    ora_exec(&format!("INSERT INTO {} VALUES (3, 30)", t.name()));
+    let out2 = d.path().join("out2");
+    expect_truncate_refusal(&rig(&t, &ckpt, &out2), &out2, t.name(), "run 2");
+    let out3 = d.path().join("out3");
+    expect_truncate_refusal(&rig(&t, &ckpt, &out3), &out3, t.name(), "run 3");
+    assert!(
+        cdc_id_ops(&out2).is_empty() && cdc_id_ops(&out3).is_empty(),
+        "nothing past the truncate is delivered"
+    );
+}
+
+#[test]
+#[ignore = "live: requires the oracle service with LogMiner prerequisites"]
+fn oracle_cdc_truncate_refusal_delivers_the_rows_before_it_once() {
+    let _serial = cross_process_serial("oracle_cdc");
+    let d = tempfile::tempdir().unwrap();
+    let t = cdc_table(
+        "ora_ctp",
+        "id NUMBER(18) PRIMARY KEY, v NUMBER(18), d DATE NOT NULL",
+    );
+    ora_exec(&format!(
+        "ALTER TABLE {} MODIFY PARTITION BY RANGE (d) (PARTITION p1 VALUES LESS THAN \
+         (DATE '2025-01-01'), PARTITION p2 VALUES LESS THAN (MAXVALUE))",
+        t.name()
+    ));
+    let ckpt = d.path().join("cdc.ckpt");
+    rig(&t, &ckpt, &d.path().join("anchor")).run_ok();
+    for (id, day) in [(1, "2024-01-01"), (2, "2026-01-01")] {
+        ora_exec(&format!(
+            "INSERT INTO {} VALUES ({id}, {id}0, DATE '{day}')",
+            t.name()
+        ));
+    }
+    ora_exec(&format!(
+        "ALTER TABLE {} TRUNCATE PARTITION p1 UPDATE INDEXES",
+        t.name()
+    ));
+    ora_exec(&format!(
+        "INSERT INTO {} VALUES (3, 30, DATE '2024-02-01')",
+        t.name()
+    ));
+    let out1 = d.path().join("out1");
+    expect_truncate_refusal(&rig(&t, &ckpt, &out1), &out1, t.name(), "run 1");
+    let out2 = d.path().join("out2");
+    expect_truncate_refusal(&rig(&t, &ckpt, &out2), &out2, t.name(), "run 2");
+    let mut all = cdc_id_ops(&out1);
+    all.extend(cdc_id_ops(&out2));
+    assert_eq!(
+        all,
+        ops(&[(1, "insert"), (2, "insert")]),
+        "the rows before the truncate land once, and none after it"
+    );
+    assert_eq!(
+        duckdb_dir_scalar(&out1, "count(*) * 100 + sum(\"ID\")", None),
+        203,
+        "DuckDB reads exactly ids 1 and 2 in run 1's parts"
+    );
+}
+
+#[test]
+#[ignore = "live: requires the oracle service with LogMiner prerequisites"]
+fn oracle_cdc_a_truncate_of_an_uncaptured_table_does_not_refuse() {
+    let _serial = cross_process_serial("oracle_cdc");
+    let d = tempfile::tempdir().unwrap();
+    let orders = cdc_table("ora_ctuo", "id NUMBER(18) PRIMARY KEY, v NUMBER(18)");
+    let other = cdc_table("ora_ctuu", "id NUMBER(18) PRIMARY KEY, v NUMBER(18)");
+    let ckpt = d.path().join("cdc.ckpt");
+    rig(&orders, &ckpt, &d.path().join("anchor")).run_ok();
+    ora_exec(&format!("INSERT INTO {} VALUES (1, 10)", orders.name()));
+    ora_exec(&format!("INSERT INTO {} VALUES (1, 99)", other.name()));
+    ora_exec(&format!("TRUNCATE TABLE {}", other.name()));
+    ora_exec(&format!("INSERT INTO {} VALUES (2, 20)", orders.name()));
+    let out = d.path().join("out");
+    rig(&orders, &ckpt, &out).run_ok();
+    assert_eq!(cdc_id_ops(&out), ops(&[(1, "insert"), (2, "insert")]));
+}
+
 #[test]
 #[ignore = "live: requires the oracle service with LogMiner prerequisites"]
 fn oracle_cdc_schema_qualified_table_config_captures_events() {

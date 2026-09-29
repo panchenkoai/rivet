@@ -60,8 +60,16 @@ trigger that makes the session linguistic).
 | `time_window`, `partition_by` | ANSI `TIMESTAMP '…'` / `DATE '…'` bounds |
 
 `TIMESTAMP(7..9)` is not a keyset key (rivet reads it at microseconds, so a page
-could not advance); as an incremental cursor it re-exports the rows sharing the
-last microsecond on each run (duplicates, never loss).
+could not advance), and it is refused as an incremental cursor
+(`RIVET_SOURCE_CURSOR_FINER_THAN_MICROSECOND`): the saved cursor would fall below
+its own row and every run would export that row again. Read it as
+`CAST(col AS TIMESTAMP(6))` in a `query:`, or pick a cursor with at most 6
+fractional digits. `rivet init` never scaffolds one as a cursor or a keyset key,
+nor a `BINARY_FLOAT`/`BINARY_DOUBLE` or zoned `TIMESTAMP` keyset key.
+
+`columns:` override keys match the result's column names exactly; a key that
+matches one only when case is ignored (`created_at` for `CREATED_AT`) is refused
+(`RIVET_CONFIG_COLUMN_OVERRIDE_CASE`) rather than silently skipped.
 
 `tuning.statement_timeout_s` is enforced on the server: the driver's call timeout
 stops the query at the budget.
@@ -92,9 +100,23 @@ Parquet); dates before 1582-10-15 are not converted from Oracle's Julian calenda
 
 ## Known limits
 
-- CDC (LogMiner) is a preview: it captures NUMBER, FLOAT, BINARY_FLOAT/DOUBLE, DATE,
-  TIMESTAMP (every zone form), VARCHAR2/NVARCHAR2/CHAR/NCHAR and RAW columns, refuses
-  a table with any other type by name, and cannot be loaded with `rivet load` yet.
+- The driver is a **beta**: `oracledb =26.0.0-beta.4`, pinned exactly, behind the
+  `oracle` cargo feature, which is **on by default**.
+- TLS verifies the server against the public CA bundle compiled into the driver
+  (`webpki-roots`) only: no system trust store, no `tls.ca_file` (refused), no
+  Oracle wallet.
+- `TIMESTAMP(7..9)` values are truncated to microseconds (reported Lossy, with a
+  warning); such a column is refused as an incremental cursor.
+- CDC (LogMiner) is a preview and runs only as a bounded drain to files, to the SCN
+  current at open; continuous CDC (`until_current: false`, `rivet cdc --stream`) is refused at config load
+  (`RIVET_CONFIG_CDC_CONTINUOUS_UNSUPPORTED`), and an Oracle CDC export cannot feed a
+  `load:` block. A `TRUNCATE` (table, partition or subpartition) of a captured table
+  is refused after the changes before it are delivered and checkpointed, and every
+  re-run stops there until you re-anchor and re-snapshot. It captures NUMBER, FLOAT, BINARY_FLOAT/DOUBLE, DATE, TIMESTAMP
+  (every zone form), VARCHAR2/NVARCHAR2/CHAR/NCHAR and RAW columns and refuses a table
+  with any other type by name.
+- Graded only against Oracle AI Database 23ai/26ai Free. 19c and 21c are untested.
+- `NVARCHAR2`/`NCHAR` on a database whose character set is not Unicode is untested.
 - A table of exactly 1000 columns that has LOBs: the server-side empty-value flags
   would exceed Oracle's 1000-column select list, so zero-length LOBs read as NULL,
   with a warning.

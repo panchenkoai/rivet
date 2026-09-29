@@ -1,6 +1,6 @@
 # ADR-0037: Oracle CDC through LogMiner
 
-- **Status:** Proposed (preview)
+- **Status:** Accepted (preview) — the bounded drain to files shipped in #324; continuous CDC and `load:` over an Oracle stream are not implemented and are refused at config load
 - **Date:** 2026-09-28
 - **Context:** rivet reads Oracle in batch (preview, #309) but has no change capture from it. Every other CDC engine rivet supports reads a log the database keeps for its own purposes: the WAL (PostgreSQL), the binlog (MySQL), the change tables (SQL Server), the oplog (MongoDB). Oracle's equivalent that ships with every edition, Free included, and needs no separate licence is LogMiner over the redo logs. This ADR fixes how a bounded, checkpointed rivet run reads it, before the adapter is written.
 

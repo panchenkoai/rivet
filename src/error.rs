@@ -399,6 +399,11 @@ pub mod codes {
         "RIVET_CONFIG_CURSOR_COLUMN_CASE",
         "spell `cursor_column` exactly as the result set names the column",
     );
+    /// A `columns:` override key matches a result-set column only when case is ignored, so it would not apply.
+    pub const CONFIG_COLUMN_OVERRIDE_CASE: Code = usage(
+        "RIVET_CONFIG_COLUMN_OVERRIDE_CASE",
+        "spell the `columns:` key exactly as the result set names the column",
+    );
     /// A statement that ran past the configured duration cap, carried by the existing
     /// `source::StatementDurationTimeout` marker (recognised in [`super::error_code`]).
     pub const SOURCE_STATEMENT_TIMEOUT: Code = environment(
@@ -456,6 +461,11 @@ pub mod codes {
     pub const SOURCE_CDC_LOG_GAP: Code = refusal(
         "RIVET_SOURCE_CDC_LOG_GAP",
         "restore the missing log, or delete the checkpoint so the stream anchors FIRST, then re-snapshot",
+    );
+    /// A captured table was TRUNCATEd: its removed rows have no change events to retract them downstream.
+    pub const SOURCE_CDC_TRUNCATED: Code = refusal(
+        "RIVET_SOURCE_CDC_TRUNCATED",
+        "delete the checkpoint so the stream anchors FIRST, then re-snapshot the table",
     );
     pub const SOURCE_CDC_UNDECODABLE: Code = refusal(
         "RIVET_SOURCE_CDC_UNDECODABLE",
@@ -519,11 +529,13 @@ pub mod codes {
         CONFIG_SOURCE_URL_SCHEME_MISMATCH,
         CONFIG_KEYSET_KEY_UUID_OVERRIDE,
         CONFIG_CURSOR_COLUMN_CASE,
+        CONFIG_COLUMN_OVERRIDE_CASE,
         SOURCE_STATEMENT_TIMEOUT,
         SOURCE_CURSOR_FINER_THAN_MICROSECOND,
         SOURCE_CDC_FOREIGN_CHECKPOINT,
         SOURCE_CDC_CHECKPOINT_INVALID,
         SOURCE_CDC_LOG_GAP,
+        SOURCE_CDC_TRUNCATED,
         SOURCE_CDC_UNDECODABLE,
         SOURCE_CDC_CELL_UNSUPPORTED,
         SOURCE_CDC_PREREQUISITE,

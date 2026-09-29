@@ -40,7 +40,7 @@ time_window modes). See [mongodb.md](mongodb.md).
 | MongoDB    |      6.0 | Supported |
 | MongoDB    |      7.0 | Supported (primary target) |
 | MongoDB    |      8.0 | Supported |
-| Oracle     | 26ai Free (23.26) | **Preview** — batch only; see [oracle.md](oracle.md) |
+| Oracle     | 26ai Free (23.26) | **Preview** — batch, plus bounded CDC to files (no continuous CDC; a CDC export cannot feed `load:`); see [oracle.md](oracle.md) |
 
 "Primary target" means the version that runs the e2e suite by default in the
 local `docker-compose.yaml` top-level `postgres` / `mysql` / `mssql` / `mongo` services.

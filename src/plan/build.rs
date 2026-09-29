@@ -619,6 +619,17 @@ fn refuse_mysql_uuid_keyset_key(
     Ok(())
 }
 
+/// The key types the engine's keyset cursor reads, as the refusal lists them.
+fn keyset_key_types(source_type: crate::config::SourceType) -> &'static str {
+    match source_type {
+        crate::config::SourceType::Oracle => {
+            "on Oracle: integer NUMBER / VARCHAR2 / NVARCHAR2 / CHAR / NCHAR / DATE / TIMESTAMP(0..6) \
+             without time zone — not BINARY_FLOAT/BINARY_DOUBLE, a zoned TIMESTAMP or TIMESTAMP(7..9)"
+        }
+        _ => "integer / float / string / timestamp / date / uuid",
+    }
+}
+
 fn chunked_strategy_from_introspection(
     source_type: crate::config::SourceType,
     export: &ExportConfig,
@@ -709,7 +720,7 @@ fn chunked_strategy_from_introspection(
             anyhow::bail!(
                 "export '{}': chunk_by_key '{}' is not a usable keyset key on {} — it must be a \
                  single-column, NOT NULL, UNIQUE or PRIMARY key WHOSE TYPE the keyset cursor can \
-                 read (integer / float / string / timestamp / date / uuid). A `decimal`/`numeric` \
+                 read ({}). A `decimal`/`numeric` \
                  key is excluded: the cursor cannot advance past it (it would fail mid-run after a \
                  partial write). Without a usable key, `ORDER BY {} LIMIT n` would also full-scan + \
                  filesort. Add a unique index of a supported type, pick another key, use a range \
@@ -717,6 +728,7 @@ fn chunked_strategy_from_introspection(
                 export.name,
                 key,
                 tbl,
+                keyset_key_types(source_type),
                 key
             );
         }
@@ -1503,6 +1515,28 @@ mod tests {
                 Ok(ExtractionStrategy::Chunked(_))
             ),
             "an integer chunk_column must still resolve"
+        );
+    }
+
+    #[test]
+    fn an_oracle_keyset_refusal_lists_only_the_types_oracle_can_key() {
+        use crate::config::SourceType;
+        let i = intro(None, &["id"], 1_000_000, Some(100), &[]);
+        let mut e = chunked_export();
+        e.chunk_by_key = Some("ts".into());
+        let ora = chunked_strategy_from_introspection(SourceType::Oracle, &e, "T", 3, &i)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            ora.contains("on Oracle: integer NUMBER") && !ora.contains("float / string"),
+            "{ora}"
+        );
+        let pg = chunked_strategy_from_introspection(SourceType::Postgres, &e, "t", 3, &i)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            pg.contains("integer / float / string / timestamp / date / uuid"),
+            "{pg}"
         );
     }
 

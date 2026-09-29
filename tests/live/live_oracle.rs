@@ -578,6 +578,68 @@ fn an_init_generated_config_keysets_a_number_19_key_past_i64() {
     );
 }
 
+/// `rivet init` on a large table keyed only by a column Oracle cannot seek or cursor scaffolds a config that runs.
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn an_init_generated_config_runs_on_a_key_the_oracle_planner_cannot_seek() {
+    require_alive(LiveService::Oracle);
+    for (tag, ty, value) in [
+        ("bd", "BINARY_DOUBLE", "LEVEL + 0.5"),
+        (
+            "tz",
+            "TIMESTAMP(6) WITH LOCAL TIME ZONE",
+            "TIMESTAMP '2024-01-01 00:00:00 +02:00' + NUMTODSINTERVAL(LEVEL, 'SECOND')",
+        ),
+        (
+            "t9",
+            "TIMESTAMP(9)",
+            "TIMESTAMP '2024-01-01 00:00:00.000000001' + NUMTODSINTERVAL(LEVEL, 'SECOND')",
+        ),
+    ] {
+        let t = OracleTable::create(
+            &format!("ora_ik_{tag}"),
+            &format!("k {ty} NOT NULL UNIQUE, v VARCHAR2(20)"),
+        );
+        ora_exec(&format!(
+            "INSERT INTO {} SELECT {value}, 'v' || LEVEL FROM dual CONNECT BY LEVEL <= 150001",
+            t.name()
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let env = [("ORACLE_URL", ORACLE_URL)];
+        let init = run_rivet_in_dir(
+            dir.path(),
+            &[
+                "init",
+                "--source-env",
+                "ORACLE_URL",
+                "--table",
+                t.name(),
+                "-o",
+                "rivet.yaml",
+            ],
+            &env,
+        );
+        assert!(
+            init.status.success(),
+            "{ty} init:\n{}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+        let yaml = std::fs::read_to_string(dir.path().join("rivet.yaml")).unwrap();
+        assert!(
+            !yaml.contains("chunk_by_key: K"),
+            "{ty} is no keyset key:\n{yaml}"
+        );
+        let run = run_rivet_in_dir(dir.path(), &["run", "-c", "rivet.yaml"], &env);
+        assert!(
+            run.status.success(),
+            "{ty} run of the generated config:\n{yaml}\n{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let out = dir.path().join("output").join(t.name());
+        assert_eq!(duckdb_total_parquet_rows(&out), 150_001, "{ty}: every row");
+    }
+}
+
 /// Keyset over the wide seeded ORDERS re-executes one page statement many times; every row lands once.
 #[test]
 #[ignore = "live: requires docker compose oracle"]

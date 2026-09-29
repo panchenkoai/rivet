@@ -22,7 +22,7 @@ scenarios:
     mysql:    { test: cdc_resume_from_missing_binlog_fails_loudly_not_silently }
     mssql:    { test: mssql_cdc_resume_past_retention_errors_not_a_silent_gap }
     mongo:    { na: "an oplog-rolled-past resume token surfaces the driver's ChangeStreamHistoryLost directly (rivet does not swallow it — src/source/mongo/cdc.rs); forcing an oplog rollover live is impractical (documented NA in cdc_conformance_gate.rs). The adjacent corrupt-checkpoint case IS tested: roast_corrupt_checkpoint_fails_loudly_not_silent_reanchor" }
-    oracle:   { gap: "oracle CDC not implemented yet (phase 3) — `mode: cdc` is refused at config validation" }
+    oracle:   { test: oracle_cdc_resume_past_log_retention_fails_loudly }
 
   - id: cdc_unroutable_configured_table_loud
     what: "a configured `table:` that NO change event can ever name (a PostgreSQL partitioned parent / view / matview; a MySQL VIEW, whose binlog Table_map names the BASE table; a SQL Server capture instance whose catalog identity differs) → loud AT OPEN, before any ack, never a 0-row `status: success` past an advanced cursor. Which LOUD is owed follows the error's permanence, and the split is load-bearing rather than a softening: a relation that EXISTS and can never emit under the configured name is a permanent error → BAIL (the three SQL engines; downgrading one to a warning is this shape's mutant). A name that is merely ABSENT and would become valid at the first write is pending, not wrong → loud WARNING naming what the catalog does hold (Mongo, where a collection is born on its first write; on the SQL engines the absent name is already loud through the schema probe, so no engine trades a bail for a warning)"
@@ -30,7 +30,7 @@ scenarios:
     mssql:    { test: mssql_cdc_capture_instance_name_must_not_decide_the_table }
     mysql:    { test: roast_mysql_cdc_refuses_a_view_whose_binlog_identity_is_the_base_table }
     mongo:    { test: mongo_cdc_warns_when_a_configured_collection_does_not_exist }
-    oracle:   { gap: "oracle CDC not implemented yet (phase 3) — `mode: cdc` is refused at config validation" }
+    oracle:   { gap: "no Oracle cell for a relation that EXISTS but can never emit (a VIEW): an absent name bails before the anchor (oracle_cdc_refuses_a_table_it_cannot_resolve_before_the_first_ack), but a view passes the ALL_TAB_COLS probe and is untested live" }
 
   - id: cdc_truncate_loud_not_a_silent_divergence
     what: "a TRUNCATE on a captured table → loud bail naming the re-snapshot, never a silent drop that leaves the destination holding rows the source no longer has (no DELETE events carry them, so no later capture can reconcile it)"
@@ -38,7 +38,7 @@ scenarios:
     mysql:    { test: roast_mysql_cdc_refuses_a_truncate_instead_of_silently_diverging }
     mssql:    { na: "SQL Server REFUSES the truncate itself — `TRUNCATE TABLE` on a CDC-enabled table raises Msg 4711 (measured 2026-08-24 on rivet-mssql-cdc-1), so the divergence cannot be created and there is nothing for rivet to detect" }
     mongo:    { na: "MongoDB has no TRUNCATE; a drop/collection-level delete surfaces as an invalidate event on the change stream, a separate contract" }
-    oracle:   { gap: "oracle CDC not implemented yet (phase 3) — `mode: cdc` is refused at config validation" }
+    oracle:   { test: oracle_cdc_refuses_a_truncate_of_a_captured_table_on_every_rerun }
 
   - id: hostile_numeric_value_loud
     what: "a non-finite value (NaN/Inf) in a lossy fixed-point numeric → loud error, never a silent NULL / truncate-to-zero"
@@ -78,7 +78,7 @@ scenarios:
     mysql:    { test: cdc_scaffold_gets_its_own_prefix_and_cross_shape_overwrite_is_refused }
     mssql:    { na: "guard_manifest_mode is engine-agnostic (src/manifest.rs), reached from every pipeline path — pinned by the PG offline unit + the MySQL live test" }
     mongo:    { na: "same engine-agnostic manifest-mode guard; pinned once" }
-    oracle:   { na: "guard_manifest_mode is engine-agnostic, and Oracle has no CDC export to cross with yet" }
+    oracle:   { na: "guard_manifest_mode is engine-agnostic (src/manifest.rs), reached from every pipeline path including the Oracle CDC drain — pinned once" }
 
   - id: remote_plaintext_tls_refused
     what: "a remote (non-loopback) plaintext connection with no tls: block → refused on policy (CWE-319), not attempted; loopback plaintext stays allowed"
@@ -133,4 +133,4 @@ scenarios:
     mysql:    { na: "the NDJSON Bytes renderer is engine-agnostic (src/source/cdc/value.rs::to_json), shared by every CDC adapter — pinned once" }
     mssql:    { na: "same shared to_json Bytes path" }
     mongo:    { na: "same shared to_json Bytes path" }
-    oracle:   { na: "same shared to_json Bytes path (engine-agnostic); Oracle has no CDC yet" }
+    oracle:   { na: "same shared to_json Bytes path (engine-agnostic) — pinned once" }

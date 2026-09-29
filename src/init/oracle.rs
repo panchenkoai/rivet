@@ -223,9 +223,12 @@ fn column_info(f: &[Option<String>]) -> Option<ColumnInfo> {
     let precision = precision.as_deref().and_then(|p| p.parse::<u32>().ok());
     let scale = scale.as_deref().and_then(|s| s.parse::<i32>().ok());
     let is_pk = pk.as_deref() == Some("1");
+    let raw = text(data_type);
     Some(ColumnInfo {
         name: name.clone()?,
-        data_type: catalog_type(&text(data_type), precision, scale),
+        data_type: catalog_type(&raw, precision, scale),
+        not_keyset: !crate::source::oracle::is_keyset_key_type(&raw, precision, scale),
+        not_cursor: crate::source::oracle::is_sub_microsecond_type(&raw, scale),
         is_primary_key: is_pk,
         is_indexed: is_pk || ix.as_deref() == Some("1"),
         is_nullable: nullable.as_deref() == Some("Y"),
@@ -263,6 +266,7 @@ mod tests {
             is_nullable: nullable,
             numeric_precision: Some(19),
             numeric_scale: Some(0),
+            ..Default::default()
         }
     }
 
@@ -345,6 +349,84 @@ mod tests {
         assert!(ts.is_indexed && !ts.is_primary_key);
         assert_eq!(ts.data_type, "timestamp(6)");
         assert!(column_info(&row(["X", "NUMBER", "0", "0", "Y", "", ""])[..6]).is_none());
+    }
+
+    #[test]
+    fn init_keys_and_cursors_only_columns_the_oracle_planner_and_run_accept() {
+        let row = |v: [&str; 7]| -> Vec<Option<String>> {
+            v.iter()
+                .map(|c| (!c.is_empty()).then(|| c.to_string()))
+                .collect()
+        };
+        let table = |pk: [&str; 7], stamp: [&str; 7]| TableInfo {
+            schema: "RIVET".into(),
+            table: "T".into(),
+            row_estimate: 500_000,
+            total_bytes: None,
+            columns: vec![
+                column_info(&row(pk)).unwrap(),
+                column_info(&row(stamp)).unwrap(),
+            ],
+            density: None,
+        };
+        let ts6 = ["UPDATED_AT", "TIMESTAMP(6)", "0", "1", "N", "", "6"];
+        for refused in [
+            ["K", "BINARY_DOUBLE", "1", "1", "N", "", ""],
+            ["K", "BINARY_FLOAT", "1", "1", "N", "", ""],
+            ["K", "TIMESTAMP(6) WITH TIME ZONE", "1", "1", "N", "", "6"],
+            [
+                "K",
+                "TIMESTAMP(6) WITH LOCAL TIME ZONE",
+                "1",
+                "1",
+                "N",
+                "",
+                "6",
+            ],
+            ["K", "TIMESTAMP(9)", "1", "1", "N", "", "9"],
+        ] {
+            let info = table(refused, ts6);
+            assert_eq!(info.keysettable_pk_column(), None, "{}", refused[1]);
+            assert_eq!(info.suggest_mode(), "incremental", "{}", refused[1]);
+        }
+        for keyed in [
+            ["K", "VARCHAR2", "1", "1", "N", "", ""],
+            ["K", "TIMESTAMP(6)", "1", "1", "N", "", "6"],
+        ] {
+            assert_eq!(
+                table(keyed, ts6).keysettable_pk_column(),
+                Some("K"),
+                "{}",
+                keyed[1]
+            );
+        }
+        let ts9 = ["UPDATED_AT", "TIMESTAMP(9)", "0", "1", "N", "", "9"];
+        let info = table(["ID", "VARCHAR2", "1", "1", "N", "", ""], ts9);
+        assert_eq!(
+            info.chosen_cursor_column(),
+            None,
+            "a TIMESTAMP(9) cursor is refused at run"
+        );
+        assert_eq!(info.best_cursor_column(), None);
+        let nullable_ts6 = ["UPDATED_AT", "TIMESTAMP(6)", "0", "1", "Y", "", "6"];
+        let created9 = ["CREATED_AT", "TIMESTAMP(9)", "0", "0", "N", "", "9"];
+        let info = table(nullable_ts6, created9);
+        assert_eq!(
+            super::super::candidates::suggest_cursor_fallback(&info),
+            None,
+            "a TIMESTAMP(9) coalesce fallback is refused at run too"
+        );
+        let tstz = [
+            "UPDATED_AT",
+            "TIMESTAMP(6) WITH TIME ZONE",
+            "0",
+            "1",
+            "N",
+            "",
+            "6",
+        ];
+        let info = table(["ID", "VARCHAR2", "1", "1", "N", "", ""], tstz);
+        assert_eq!(info.chosen_cursor_column().as_deref(), Some("UPDATED_AT"));
     }
 
     #[test]

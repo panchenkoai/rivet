@@ -48,7 +48,7 @@ Commit 9514f57f (phase 2a) and c01038d4 (phase 2b):
 | 6 | TS(9)/INTERVAL DS(9) "exact" | Lossy + warning | unit |
 | 7,8 | NLS_SORT/NLS_COMP not pinned → keyset/cursor skip rows | pinned BINARY | a_linguistic_session_default_does_not_lose_keyset_rows (logon trigger) |
 | 9 | TS(9) keyset loops forever | TS(7..9) not a keyset key + generic no-progress guard | keyset_on_a_timestamp_9_key_fails_loudly_instead_of_looping (both guards off → RED) |
-| 10 | incremental TS(9) re-exports the max-µs rows each run | NOT fixed: duplicates, never loss (at-least-once); the column reports Lossy | — |
+| 10 | incremental TS(9) re-exports the max-µs rows each run | Superseded: a TS(7..9) cursor is now refused (`RIVET_SOURCE_CURSOR_FINER_THAN_MICROSECOND`), and `rivet init` never picks one | a_cursor_finer_than_a_microsecond_is_refused_and_nothing_else |
 
 Difficulty: the old type-matrix test rendered BC years through the same chrono
 convention as the product, so it agreed with the bug — a self-oracle; fixed the
@@ -90,7 +90,7 @@ Commits 0b22b8db, db7cc1d8 (mine), 4210e45f (pipeline agent), 92ac0ee1 + d7da0a7
 | R2-2/16 | time_window always failed (ORA-01861) | ANSI `TIMESTAMP '…'` | live DATE + TIMESTAMP (RED) |
 | R2-3 | INTEGER mapped to decimal(38,18) override | `number` | live |
 | R2-4/20 | never-analyzed table read as 0 rows → mode: full | capped count | live |
-| R2-5/19 | init --mode cdc wrote a refused scaffold | refused in init, loader's words | offline |
+| R2-5/19 | init --mode cdc wrote a refused scaffold | refused in init, loader's words (superseded by #324: init now emits an Oracle CDC scaffold and refuses only what the loader refuses — init_accepts_oracle_cdc_and_still_refuses_what_the_loader_refuses) | offline |
 | R2-6/7 | synonyms invisible; init CLI names exact-case | follow synonym; fold like Oracle | live |
 | R2-9/10 | LOB flag alias collision; 1000-col + LOB | unique alias; flags dropped past the cap with WARN | live (RED) |
 | R2-11/17 | key-column hint wrong for INVISIBLE / quoted lower-case | catalog lookup names the real spelling / INVISIBLE | live (RED) |
@@ -116,7 +116,11 @@ Also this round:
 - Full Oracle live suite: 41/41 under full parallel load.
 - `rivet init` schema-wide: 35 s for 21 objects idle (ALL_* catalog views are slow) — not fixed.
 
-## Phase 3 (CDC) — research done, not implemented
+## Phase 3 (CDC) — research done, not implemented (as of this log)
+Superseded: Oracle CDC shipped in #324 (ADR-0037) as a bounded `until_current` drain to
+files, tested live in tests/live/live_cdc_oracledb.rs. Still refused at config load:
+continuous CDC, and an Oracle CDC export under a `load:` block.
+
 dev/research/oracle-cdc-probes.md (agent, on a separate ARCHIVELOG spike container):
 mining works from the PDB service with 4 grants; resume across log switches proven incl.
 a straddling transaction (restart_scn); a log missing mid-range is SILENT in LogMiner —

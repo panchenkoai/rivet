@@ -84,7 +84,7 @@ cargo test -- --ignored
 | `live_crash_recovery.rs` | Four fault points (`after_source_read`, `after_file_write`, `after_manifest_update`, `after_cursor_commit`) × expected post-crash state × recovery run | Task 1.1 |
 | `live_mongo*.rs` | MongoDB batch (JSON-blob `_id` + `document`): distinct-`_id` set vs source, verbatim document round-trip, crash recovery, retry/faults, permission-harm | – |
 | `live_mssql_*.rs` | SQL Server batch: chunked (range + keyset), resume, crash recovery, reconcile/repair — twins of the Postgres/MySQL suites | – |
-| `live_cdc*.rs` | CDC capture/resume for all four engines (`live_cdc.rs`, `live_cdc_mongo.rs`, `live_cdc_mssql.rs`, plus golden/oracle/property/MBT) — at-least-once, no gap/dup | – |
+| `live_cdc*.rs` | CDC capture/resume for all five engines (`live_cdc.rs`, `live_cdc_mongo.rs`, `live_cdc_mssql.rs`, `live_cdc_oracledb.rs`, plus golden/oracle/property/MBT) — at-least-once, no gap/dup | – |
 
 ### Trust milestone: type golden round-trip
 

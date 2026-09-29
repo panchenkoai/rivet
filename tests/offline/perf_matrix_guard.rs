@@ -20,7 +20,8 @@ const ENGINES: [&str; 5] = ["postgres", "mysql", "mssql", "mongo", "oracle"];
 // exact equality, so ANY measured->gap downgrade (a lost baseline) fails immediately,
 // not after N accumulate (matching the sibling guards' zero-slack convention).
 // Raised 0 -> 7 (2026-09-26): the Oracle column's honest gaps — no Oracle baseline measured yet.
-const GAP_RATCHET: usize = 7;
+// Lowered 7 -> 6 (2026-09-29): Oracle keep-up-under-heavy-WAL is `na` (reader-independent retention).
+const GAP_RATCHET: usize = 6;
 
 fn load() -> Value {
     let s = fs::read_to_string(PERF_MATRIX).unwrap_or_else(|e| panic!("read {PERF_MATRIX}: {e}"));
