@@ -462,6 +462,11 @@ pub mod codes {
         "RIVET_SOURCE_CDC_LOG_GAP",
         "restore the missing log, or delete the checkpoint so the stream anchors FIRST, then re-snapshot",
     );
+    /// A captured table was TRUNCATEd: its removed rows have no change events to retract them downstream.
+    pub const SOURCE_CDC_TRUNCATED: Code = refusal(
+        "RIVET_SOURCE_CDC_TRUNCATED",
+        "delete the checkpoint so the stream anchors FIRST, then re-snapshot the table",
+    );
     pub const SOURCE_CDC_UNDECODABLE: Code = refusal(
         "RIVET_SOURCE_CDC_UNDECODABLE",
         "re-snapshot the table: delete the checkpoint first so the stream anchors, then snapshot",
@@ -530,6 +535,7 @@ pub mod codes {
         SOURCE_CDC_FOREIGN_CHECKPOINT,
         SOURCE_CDC_CHECKPOINT_INVALID,
         SOURCE_CDC_LOG_GAP,
+        SOURCE_CDC_TRUNCATED,
         SOURCE_CDC_UNDECODABLE,
         SOURCE_CDC_CELL_UNSUPPORTED,
         SOURCE_CDC_PREREQUISITE,

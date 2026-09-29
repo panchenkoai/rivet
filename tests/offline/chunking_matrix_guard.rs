@@ -168,7 +168,8 @@ const MATRICES: &[(&str, usize)] = &[
     // conformance gate + chunking/resilience/warehouse ledgers for the unified view.
     // Raised 0 -> 5 (2026-09-26): the Oracle column's honest gaps (batch-only phase 1).
     // Lowered 5 -> 4 (2026-09-29): Oracle CDC vanished-anchor proven live.
-    ("docs/fail-loud-matrix.yaml", 4),
+    // Lowered 4 -> 3 (2026-09-29): Oracle CDC refuses a captured-table TRUNCATE.
+    ("docs/fail-loud-matrix.yaml", 3),
     // Load-mode write contracts — keyed on the 3 LoadMode variants (full /
     // incremental / cdc), not source engines. Codifies the 4 data bugs found in
     // the load layer (incremental+cleanup loss, full duplicate snapshots, full

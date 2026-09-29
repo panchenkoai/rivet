@@ -676,6 +676,7 @@ fn contents_sql(tables: &[Captured], con_name: &str, after_commit: u64) -> Strin
         "TABLE_NAME".into(),
         "TO_CHAR(STATUS)".into(),
         "INFO".into(),
+        "CASE WHEN OPERATION = 'DDL' THEN SQL_REDO END".into(),
     ];
     for j in 0..slots {
         select.push(per_slot(j, &|s| {
@@ -700,7 +701,7 @@ fn contents_sql(tables: &[Captured], con_name: &str, after_commit: u64) -> Strin
     format!(
         "SELECT {} FROM V$LOGMNR_CONTENTS WHERE OPERATION = 'MISSING_SCN' OR ({container}\
          COMMIT_SCN > {after_commit} AND OPERATION IN ('INSERT', 'UPDATE', 'DELETE', \
-         'UNSUPPORTED') AND ({}))",
+         'UNSUPPORTED', 'DDL') AND ({}))",
         select.join(", "),
         captured.join(" OR ")
     )
@@ -725,10 +726,22 @@ pub(crate) struct OracleChangeStream {
     /// The open-time frontier the checkpoint moves to once the drain is fully acknowledged.
     frontier: Scns,
     checkpoint: PathBuf,
-    carry: Option<Mined>,
+    carry: Option<Mine>,
     queue: VecDeque<ChangeEvent>,
     exhausted: bool,
     outstanding: Option<Position>,
+    /// A captured table's TRUNCATE, raised on the pass after the changes before it are acked.
+    pending_truncate: Option<String>,
+    /// An event was handed out since the last ack, so a TRUNCATE must wait for it to be flushed.
+    yielded_since_ack: bool,
+}
+
+/// One mined row that matters to the stream.
+#[allow(clippy::large_enum_variant)] // one per row in flight, never collected
+enum Mine {
+    Change(Mined),
+    /// The refusal for a TRUNCATE of a captured table.
+    Truncate(String),
 }
 
 /// Which image a column value comes from.
@@ -816,16 +829,32 @@ impl OracleChangeStream {
             carry: None,
             queue: VecDeque::new(),
             outstanding: None,
+            pending_truncate: None,
+            yielded_since_ack: false,
         })
     }
 
-    /// The next mined change, or `None` at the end of the window.
-    fn next_mined(&mut self) -> Result<Option<Mined>> {
-        let Some(row) = self.cursor.as_mut().and_then(Iterator::next) else {
-            return Ok(None);
-        };
-        let row = row.ora()?;
-        self.mined(&row).map(Some)
+    /// The next mined change or captured-table TRUNCATE, or `None` at the end of the window.
+    fn next_mined(&mut self) -> Result<Option<Mine>> {
+        loop {
+            let Some(row) = self.cursor.as_mut().and_then(Iterator::next) else {
+                return Ok(None);
+            };
+            let row = row.ora()?;
+            let text = |i: usize| row.get::<Option<String>>(i).ora();
+            if text(3)?.as_deref() == Some("DDL") {
+                let stmt = text(8)?.unwrap_or_default();
+                if ddl_truncates(&stmt) {
+                    let (owner, table) =
+                        (text(4)?.unwrap_or_default(), text(5)?.unwrap_or_default());
+                    return Ok(Some(Mine::Truncate(truncate_refusal_message(
+                        &owner, &table, &stmt,
+                    ))));
+                }
+                continue;
+            }
+            return self.mined(&row).map(|m| Some(Mine::Change(m)));
+        }
     }
 
     fn mined(&self, row: &Row) -> Result<Mined> {
@@ -868,7 +897,7 @@ impl OracleChangeStream {
         let mut before = Vec::with_capacity(t.columns.len());
         let mut after = Vec::with_capacity(t.columns.len());
         for (j, (name, kind)) in t.columns.iter().enumerate() {
-            let present: u8 = text(8 + 3 * j)?.and_then(|s| s.parse().ok()).unwrap_or(0);
+            let present: u8 = text(9 + 3 * j)?.and_then(|s| s.parse().ok()).unwrap_or(0);
             let (b, a) = image_sides(op, present).ok_or_else(|| {
                 anyhow::anyhow!(
                     "oracle cdc: a {op:?} of `{owner}.{table}` carries no value for {name} — its \
@@ -878,7 +907,7 @@ impl OracleChangeStream {
                 )
             })?;
             let value = |side: Side| -> Result<RivetValue> {
-                let raw = text(if side == Side::Redo { 9 } else { 10 } + 3 * j)?;
+                let raw = text(if side == Side::Redo { 10 } else { 11 } + 3 * j)?;
                 match raw {
                     None => Ok(RivetValue::Null),
                     Some(s) => decode(*kind, &s)
@@ -921,13 +950,21 @@ impl OracleChangeStream {
                 None => return Ok(false),
             },
         };
+        let first = match first {
+            Mine::Change(m) => m,
+            Mine::Truncate(why) if !self.yielded_since_ack => return Err(truncate_error(why)),
+            Mine::Truncate(why) => {
+                self.pending_truncate = Some(why);
+                return Ok(false);
+            }
+        };
         let commit = first.commit;
         let mut bytes = first.event.estimated_bytes();
         let mut group = vec![first];
         loop {
             crate::source::cdc::check_tx_buffer_caps("oracle", group.len(), bytes)?;
             match self.next_mined()? {
-                Some(m) if joins_commit_group(commit, m.commit) => {
+                Some(Mine::Change(m)) if joins_commit_group(commit, m.commit) => {
                     bytes += m.event.estimated_bytes();
                     group.push(m);
                 }
@@ -959,12 +996,14 @@ impl OracleChangeStream {
     }
 
     fn save_frontier(&mut self) -> Result<()> {
-        if frontier_is_due(
-            self.exhausted,
-            self.outstanding.is_some(),
-            self.frontier,
-            self.from,
-        ) {
+        if self.pending_truncate.is_none()
+            && frontier_is_due(
+                self.exhausted,
+                self.outstanding.is_some(),
+                self.frontier,
+                self.from,
+            )
+        {
             with_identity(&self.frontier.position(), &self.identity).save(&self.checkpoint)?;
             self.from = self.frontier;
         }
@@ -1022,6 +1061,60 @@ fn start_mining(
     .ora()
 }
 
+/// Whether a mined DDL statement removes rows without redo per row: `TRUNCATE …` or `ALTER … TRUNCATE [SUB]PARTITION`.
+pub(crate) fn ddl_truncates(sql: &str) -> bool {
+    let mut s = sql.trim_start();
+    loop {
+        if let Some(rest) = s.strip_prefix("/*") {
+            s = rest.split_once("*/").map_or("", |(_, t)| t).trim_start();
+        } else if let Some(rest) = s.strip_prefix("--") {
+            s = rest.split_once('\n').map_or("", |(_, t)| t).trim_start();
+        } else {
+            break;
+        }
+    }
+    let upper = s.to_ascii_uppercase();
+    let words: Vec<&str> = upper
+        .split(|c: char| c.is_whitespace() || c == ';')
+        .filter(|w| !w.is_empty())
+        .collect();
+    match words.first() {
+        Some(&"TRUNCATE") => true,
+        Some(&"ALTER") => words.windows(2).any(|w| {
+            w[0] == "TRUNCATE"
+                && matches!(
+                    w[1],
+                    "PARTITION" | "PARTITIONS" | "SUBPARTITION" | "SUBPARTITIONS"
+                )
+        }),
+        _ => false,
+    }
+}
+
+/// The coded error a captured-table TRUNCATE raises.
+fn truncate_error(why: String) -> anyhow::Error {
+    anyhow::Error::new(crate::error::CodedError::new(
+        crate::error::codes::SOURCE_CDC_TRUNCATED,
+        why,
+    ))
+}
+
+/// Refuse a TRUNCATE of a captured table, naming why re-running cannot fix it and the recovery order.
+pub(crate) fn truncate_refusal_message(owner: &str, table: &str, stmt: &str) -> String {
+    format!(
+        "oracle cdc: `{owner}.{table}` was TRUNCATEd (`{}`), and this reader cannot represent \
+         that as a change. Skipping it would leave every row the truncate removed sitting in the \
+         destination with no DELETE to retract it — the source empty, the destination not, \
+         permanently, because those rows left the source without events and no later capture \
+         can reconcile them. Every re-run stops here again: the checkpoint sits at the last \
+         commit before the truncate. Recover in rivet's OWN order: re-anchor FIRST (delete the \
+         checkpoint so the next run pins a fresh one), THEN re-snapshot the table \
+         (`mode: full`). Snapshotting first leaves everything changed between the snapshot and \
+         the new anchor in neither — a silent gap as wide as the snapshot takes.",
+        stmt.trim().trim_end_matches(';')
+    )
+}
+
 /// Whether a row committed at `next` belongs to the group being read for commit SCN `commit`.
 pub(crate) fn joins_commit_group(commit: u64, next: u64) -> bool {
     next == commit
@@ -1053,6 +1146,11 @@ impl Drop for OracleChangeStream {
 
 impl ChangeStream for OracleChangeStream {
     fn next_change(&mut self) -> Option<Result<ChangeEvent>> {
+        if self.queue.is_empty()
+            && let Some(why) = &self.pending_truncate
+        {
+            return Some(Err(truncate_error(why.clone())));
+        }
         if self.queue.is_empty() && !self.exhausted {
             match self.fill() {
                 Ok(true) => {}
@@ -1065,6 +1163,7 @@ impl ChangeStream for OracleChangeStream {
                 if ev.committed {
                     self.outstanding = Some(ev.position.clone());
                 }
+                self.yielded_since_ack = true;
                 Some(Ok(ev))
             }
             None => self.save_frontier().err().map(Err),
@@ -1074,6 +1173,7 @@ impl ChangeStream for OracleChangeStream {
     fn ack(&mut self, position: &Position) -> Result<()> {
         if self.outstanding.as_ref() == Some(position) {
             self.outstanding = None;
+            self.yielded_since_ack = false;
         }
         self.save_frontier()
     }
@@ -1144,6 +1244,41 @@ pub(crate) fn pin_checkpoint_at_current(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Mined DDL text that removes rows is a truncate; every other DDL is not.
+    #[test]
+    fn only_table_and_partition_truncates_count_as_truncates() {
+        for sql in [
+            "TRUNCATE TABLE ptrunc;",
+            "truncate table   \"RIVET\".\"PTRUNC2\" drop storage;",
+            "  /* nightly */ -- reset\n TRUNCATE TABLE t REUSE STORAGE",
+            "ALTER TABLE ptrunc2 TRUNCATE PARTITION p1;",
+            "alter table t truncate subpartition sp1 update indexes",
+            "ALTER TABLE t TRUNCATE PARTITIONS p1, p2",
+        ] {
+            assert!(ddl_truncates(sql), "{sql}");
+        }
+        for sql in [
+            "",
+            "CREATE TABLE truncate_log (id NUMBER)",
+            "ALTER TABLE ptrunc ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;",
+            "ALTER TABLE t ADD (truncate NUMBER)",
+            "ALTER TABLE t DROP PARTITION p1",
+            "COMMENT ON TABLE t IS 'TRUNCATE PARTITION nightly'",
+            "CREATE UNIQUE INDEX \"RIVET\".\"SYS_C1\" on \"RIVET\".\"T\"(\"ID\")",
+        ] {
+            assert!(!ddl_truncates(sql), "{sql}");
+        }
+        let why = truncate_refusal_message("RIVET", "T", " TRUNCATE TABLE t; ");
+        assert!(
+            why.starts_with("oracle cdc: `RIVET.T` was TRUNCATEd (`TRUNCATE TABLE t`)"),
+            "{why}"
+        );
+        assert_eq!(
+            crate::error::error_code(&truncate_error(why)),
+            Some("RIVET_SOURCE_CDC_TRUNCATED")
+        );
+    }
 
     #[test]
     fn numbers_read_back_in_the_batch_exports_plain_form() {
