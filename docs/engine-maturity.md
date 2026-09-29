@@ -31,7 +31,6 @@ code does not count.
   - M7.
 - **Open for GA:**
   - `rivet init` scaffolds keys the planner refuses, on BINARY_FLOAT/DOUBLE/FLOAT/TSTZ;
-  - `EXT_ORDER_KEYED` is not keysetted despite its UNIQUE NOT NULL key (a known red in the gate);
   - column overrides with no decoder pass `check` and then fail at run;
   - override keys are case-sensitive;
   - NVARCHAR2 on a non-Unicode character set is unmeasured;
