@@ -21,6 +21,7 @@ async fn try_connect_at(port: u16) -> Result<Client<Compat<TcpStream>>, String> 
     config.port(port);
     config.database("rivet");
     config.authentication(AuthMethod::sql_server("sa", "Rivet_Passw0rd!"));
+    config.command_timeout(None);
     config.encryption(EncryptionLevel::Required);
     config.trust_cert();
     let tcp = TcpStream::connect(config.get_addr())
@@ -550,4 +551,36 @@ pub fn wait_for_capture(ci: &str, want: i64) {
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
     panic!("capture job did not populate cdc.{ci}_CT to {want} rows in 60s");
+}
+
+/// Every output line of `sql` run by the server's own `sqlcmd` inside `container` (no tiberius).
+pub fn sqlcmd_lines(container: &str, sql: &str) -> Vec<String> {
+    let out = std::process::Command::new("docker")
+        .args([
+            "exec",
+            container,
+            "/opt/mssql-tools18/bin/sqlcmd",
+            "-C",
+            "-S",
+            "localhost",
+            "-U",
+            "sa",
+            "-P",
+            "Rivet_Passw0rd!",
+            "-d",
+            "rivet",
+            "-f",
+            "65001",
+            "-h",
+            "-1",
+            "-W",
+            "-b",
+            "-Q",
+            &format!("SET NOCOUNT ON; {sql}"),
+        ])
+        .output()
+        .expect("spawn docker exec sqlcmd");
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success(), "sqlcmd failed: {text}");
+    text.lines().map(|l| l.trim_end().to_string()).collect()
 }

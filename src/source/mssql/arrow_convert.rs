@@ -50,6 +50,106 @@ pub(super) fn is_null_cell(c: &ColumnData<'_>) -> bool {
     )
 }
 
+/// A column whose values have no lossless Arrow type and ride as text: `sql_variant` and CLR UDTs.
+pub(crate) fn renders_as_text(ct: ColumnType) -> bool {
+    matches!(ct, ColumnType::SSVariant | ColumnType::Udt)
+}
+
+/// A cell rendered as text (ISO temporals, exact decimals, lowercase hex bytes); `None` for SQL NULL.
+pub(crate) fn cell_text(c: &ColumnData<'_>) -> Option<String> {
+    // Days from 0001-01-01 to 1900-01-01, the legacy datetime epoch.
+    const DAYS_TO_1900: i64 = 693_595;
+    const NANOS_PER_DAY: i128 = 86_400_000_000_000;
+    let frac = |nanos: u64, digits: u8| {
+        if digits == 0 {
+            return String::new();
+        }
+        format!(".{}", &format!("{nanos:09}")[..usize::from(digits.min(9))])
+    };
+    let date = |days_from_ce: i64| {
+        NaiveDate::from_num_days_from_ce_opt(i32::try_from(days_from_ce + 1).ok()?)
+            .map(|d| d.format("%Y-%m-%d").to_string())
+    };
+    let clock = |nanos_of_day: u64, digits: u8| {
+        let s = nanos_of_day / 1_000_000_000;
+        format!(
+            "{:02}:{:02}:{:02}{}",
+            s / 3600,
+            s / 60 % 60,
+            s % 60,
+            frac(nanos_of_day % 1_000_000_000, digits)
+        )
+    };
+    let nanos = |t: tiberius::time::Time| t.increments() * 10u64.pow(9 - u32::from(t.scale()));
+    Some(match c {
+        ColumnData::String(Some(s)) => s.to_string(),
+        ColumnData::Bit(Some(b)) => u8::from(*b).to_string(),
+        ColumnData::U8(Some(v)) => v.to_string(),
+        ColumnData::I16(Some(v)) => v.to_string(),
+        ColumnData::I32(Some(v)) => v.to_string(),
+        ColumnData::I64(Some(v)) => v.to_string(),
+        ColumnData::F32(Some(v)) => v.to_string(),
+        ColumnData::F64(Some(v)) => v.to_string(),
+        ColumnData::Numeric(Some(n)) => numeric_to_decimal_string(n.value(), n.scale()),
+        ColumnData::Guid(Some(g)) => g.to_string().to_uppercase(),
+        ColumnData::Binary(Some(b)) => b.iter().map(|x| format!("{x:02x}")).collect(),
+        ColumnData::Xml(Some(x)) => x.to_string(),
+        ColumnData::Date(Some(d)) => date(i64::from(d.days()))?,
+        ColumnData::Time(Some(t)) => clock(nanos(*t), t.scale()),
+        ColumnData::DateTime2(Some(dt)) => format!(
+            "{} {}",
+            date(i64::from(dt.date().days()))?,
+            clock(nanos(dt.time()), dt.time().scale())
+        ),
+        ColumnData::DateTimeOffset(Some(dto)) => {
+            let dt = dto.datetime2();
+            let off = i64::from(dto.offset());
+            let local = i128::from(dt.date().days()) * NANOS_PER_DAY
+                + i128::from(nanos(dt.time()))
+                + i128::from(off) * 60_000_000_000;
+            format!(
+                "{} {} {}{:02}:{:02}",
+                date(i64::try_from(local.div_euclid(NANOS_PER_DAY)).ok()?)?,
+                clock(local.rem_euclid(NANOS_PER_DAY) as u64, dt.time().scale()),
+                if off < 0 { '-' } else { '+' },
+                off.abs() / 60,
+                off.abs() % 60
+            )
+        }
+        ColumnData::DateTime(Some(dt)) => format!(
+            "{} {}",
+            date(DAYS_TO_1900 + i64::from(dt.days()))?,
+            clock(
+                (u64::from(dt.seconds_fragments()) * 10 + 1) / 3 * 1_000_000,
+                3
+            )
+        ),
+        ColumnData::SmallDateTime(Some(dt)) => format!(
+            "{} {}",
+            date(DAYS_TO_1900 + i64::from(dt.days()))?,
+            clock(u64::from(dt.seconds_fragments()) * 60_000_000_000, 0)
+        ),
+        _ => return None,
+    })
+}
+
+/// Render a tiberius `Numeric` (unscaled `value` + `scale`) to exact decimal text.
+pub(crate) fn numeric_to_decimal_string(value: i128, scale: u8) -> String {
+    let scale = scale as usize;
+    if scale == 0 {
+        return value.to_string();
+    }
+    let neg = value < 0;
+    let digits = value.unsigned_abs().to_string();
+    let digits = if digits.len() <= scale {
+        format!("{}{}", "0".repeat(scale + 1 - digits.len()), digits)
+    } else {
+        digits
+    };
+    let (int_part, frac) = digits.split_at(digits.len() - scale);
+    format!("{}{}.{}", if neg { "-" } else { "" }, int_part, frac)
+}
+
 /// The wire type of a cell, for an error message.
 fn cell_type_name(c: &ColumnData<'_>) -> String {
     format!("{c:?}")
@@ -105,6 +205,7 @@ pub(super) fn mssql_type_to_rivet(col: &Column, overrides: &ColumnOverrides) -> 
         | ColumnType::Text
         | ColumnType::NText => RivetType::String,
         ColumnType::BigVarBin | ColumnType::BigBinary | ColumnType::Image => RivetType::Binary,
+        ColumnType::SSVariant | ColumnType::Udt => RivetType::String,
         ColumnType::Daten => RivetType::Date,
         ColumnType::Timen => RivetType::Time {
             unit: RivetTimeUnit::Microsecond,
@@ -397,6 +498,28 @@ fn build_array(
         DataType::Int64 => simple!(Int64Builder, Some(ColumnData::I64(Some(v))) => *v),
         DataType::Float32 => simple!(Float32Builder, Some(ColumnData::F32(Some(v))) => *v),
         DataType::Float64 => simple!(Float64Builder, Some(ColumnData::F64(Some(v))) => *v),
+        DataType::Utf8
+            if rows
+                .first()
+                .is_some_and(|r| renders_as_text(r.columns()[idx].column_type())) =>
+        {
+            let mut b = StringBuilder::new();
+            for row in rows {
+                let c = cell(row, idx);
+                match c.and_then(cell_text) {
+                    Some(s) => {
+                        value_within_ceiling(column, s.len(), max_value_bytes)?;
+                        b.append_value(s);
+                    }
+                    None if c.is_none_or(is_null_cell) => b.append_null(),
+                    None => crate::rivet_bail!(
+                        crate::error::codes::SOURCE_VALUE_UNREPRESENTABLE,
+                        "mssql: column `{column}` holds a {c:?} value with no text rendering"
+                    ),
+                }
+            }
+            Arc::new(b.finish())
+        }
         DataType::Utf8 => {
             let mut b = StringBuilder::new();
             for row in rows {
@@ -795,7 +918,13 @@ impl crate::source::value_checksum::CellSource for MssqlCellSource<'_> {
         }
     }
     fn utf8(&self, col: usize, row: usize) -> Option<Cow<'_, [u8]>> {
-        match cell(&self.rows[row], col) {
+        let r = &self.rows[row];
+        if renders_as_text(r.columns()[col].column_type()) {
+            return cell(r, col)
+                .and_then(cell_text)
+                .map(|s| Cow::Owned(s.into_bytes()));
+        }
+        match cell(r, col) {
             Some(ColumnData::String(Some(v))) => Some(Cow::Borrowed(v.as_bytes())),
             _ => None,
         }
@@ -836,6 +965,75 @@ impl crate::source::value_checksum::CellSource for MssqlCellSource<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every base type a `sql_variant` or UDT can carry renders as SQL Server's own ISO text.
+    #[test]
+    fn a_variant_cell_renders_each_base_type_as_text() {
+        use tiberius::numeric::Numeric;
+        use tiberius::time::{Date, DateTime, DateTime2, DateTimeOffset, SmallDateTime, Time};
+        let dt2 = |days, inc, scale| DateTime2::new(Date::new(days), Time::new(inc, scale));
+        let cases: Vec<(ColumnData<'static>, &str)> = vec![
+            (ColumnData::I32(Some(-7)), "-7"),
+            (ColumnData::U8(Some(255)), "255"),
+            (ColumnData::I64(Some(i64::MIN)), "-9223372036854775808"),
+            (ColumnData::Bit(Some(true)), "1"),
+            (ColumnData::F64(Some(0.1)), "0.1"),
+            (ColumnData::String(Some("héllo".into())), "héllo"),
+            (
+                ColumnData::Numeric(Some(Numeric::new_with_scale(1250, 2))),
+                "12.50",
+            ),
+            (
+                ColumnData::Numeric(Some(Numeric::new_with_scale(-5, 3))),
+                "-0.005",
+            ),
+            (
+                ColumnData::Binary(Some(vec![0xDE, 0xAD, 0x0F].into())),
+                "dead0f",
+            ),
+            (
+                ColumnData::Guid(Some(tiberius::Uuid::from_bytes([0xab; 16]))),
+                "ABABABAB-ABAB-ABAB-ABAB-ABABABABABAB",
+            ),
+            (ColumnData::Date(Some(Date::new(0))), "0001-01-01"),
+            (ColumnData::Date(Some(Date::new(3_652_058))), "9999-12-31"),
+            (ColumnData::Time(Some(Time::new(86_399, 0))), "23:59:59"),
+            (ColumnData::Time(Some(Time::new(1_500, 3))), "00:00:01.500"),
+            (
+                ColumnData::DateTime2(Some(dt2(693_595, 452_961_234_567, 7))),
+                "1900-01-01 12:34:56.1234567",
+            ),
+            (
+                ColumnData::DateTimeOffset(Some(DateTimeOffset::new(dt2(693_595, 0, 0), 330))),
+                "1900-01-01 05:30:00 +05:30",
+            ),
+            (
+                ColumnData::DateTimeOffset(Some(DateTimeOffset::new(dt2(693_595, 0, 0), -60))),
+                "1899-12-31 23:00:00 -01:00",
+            ),
+            (
+                ColumnData::DateTime(Some(DateTime::new(0, 1))),
+                "1900-01-01 00:00:00.003",
+            ),
+            (
+                ColumnData::DateTime(Some(DateTime::new(0, 2))),
+                "1900-01-01 00:00:00.007",
+            ),
+            (
+                ColumnData::DateTime(Some(DateTime::new(-1, 25_919_999))),
+                "1899-12-31 23:59:59.997",
+            ),
+            (
+                ColumnData::SmallDateTime(Some(SmallDateTime::new(1, 61))),
+                "1900-01-02 01:01:00",
+            ),
+        ];
+        for (cell, want) in cases {
+            assert_eq!(cell_text(&cell).as_deref(), Some(want), "{cell:?}");
+        }
+        assert_eq!(cell_text(&ColumnData::String(None)), None);
+        assert_eq!(cell_text(&ColumnData::I32(None)), None);
+    }
 
     /// A `decimal` override on an integer column scales the integer exactly.
     ///

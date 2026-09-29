@@ -278,6 +278,8 @@ defects in the PG / MySQL drivers; all have been fixed in v0.7.8:
 | `nvarchar` / `varchar` / `nchar` / `char` / `text` / `ntext` | `string` | `Utf8` | escaped UTF-8 | | live matrix |
 | `varbinary` / `binary` / `image` | `binary` | `Binary` | hex in CSV | | live matrix |
 | `uniqueidentifier` | `uuid` | `FixedSizeBinary(16)` + Parquet `LogicalType::Uuid` | canonical UUID text | native UUID downstream | live matrix |
+| `sql_variant` | `string` | `Utf8` | the value as text | the base value rendered as text: integers and exact decimals as digits, temporals as ISO (`CONVERT(…, 121)`), uuid upper-case, bytes lowercase hex, floats as the shortest round-trip form | live (batch + CDC) |
+| `hierarchyid` / `geometry` / `geography` (CLR UDTs) | `string` | `Utf8` | lowercase hex | the serialized UDT bytes as lowercase hex, equal to `CAST(col AS varbinary(max))` | live (batch + CDC) |
 | nullable / all-null | — | preserved | empty cells | | live matrix |
 
 Unmapped SQL Server types resolve to `Unsupported` and fail loudly at schema

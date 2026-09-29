@@ -30,6 +30,7 @@ use tiberius::{Client, ColumnData, Row};
 use tokio::net::TcpStream;
 use tokio_util::compat::Compat;
 
+use super::arrow_convert::{cell_text, numeric_to_decimal_string, renders_as_text};
 use crate::config::TlsConfig;
 use crate::error::Result;
 use crate::source::cdc::checkpoint_identity::IdentityVerdict;
@@ -964,7 +965,14 @@ impl MssqlChangeStream {
                     n if n.starts_with("__$") => {} // skip other metadata
                     n => {
                         names.push(n.to_string());
-                        values.push(cell_to_rivet(r, idx, data)?);
+                        values.push(if renders_as_text(col.column_type()) {
+                            match cell_text(data) {
+                                Some(t) => RivetValue::Bytes(t.into_bytes()),
+                                None => cell_fallthrough(data)?,
+                            }
+                        } else {
+                            cell_to_rivet(r, idx, data)?
+                        });
                     }
                 }
             }
@@ -1342,23 +1350,6 @@ fn cell_fallthrough(data: &ColumnData<'_>) -> Result<RivetValue> {
         crate::error::codes::SOURCE_CDC_CELL_UNSUPPORTED,
         "mssql cdc: no decoder for a captured {data:?} value — refusing rather than writing NULL"
     )
-}
-
-/// Render a tiberius `Numeric` (unscaled `value` + `scale`) to exact decimal text.
-fn numeric_to_decimal_string(value: i128, scale: u8) -> String {
-    let scale = scale as usize;
-    if scale == 0 {
-        return value.to_string();
-    }
-    let neg = value < 0;
-    let digits = value.unsigned_abs().to_string();
-    let digits = if digits.len() <= scale {
-        format!("{}{}", "0".repeat(scale + 1 - digits.len()), digits)
-    } else {
-        digits
-    };
-    let (int_part, frac) = digits.split_at(digits.len() - scale);
-    format!("{}{}.{}", if neg { "-" } else { "" }, int_part, frac)
 }
 
 fn hex(b: &[u8]) -> String {
