@@ -396,6 +396,11 @@ pub mod codes {
         "RIVET_CONFIG_KEYSET_KEY_UUID_OVERRIDE",
         "key the keyset on another unique column, or use `mode: full` for this table",
     );
+    /// `cursor_column` matches a result-set column only when case is ignored, so the cursor never advances.
+    pub const CONFIG_CURSOR_COLUMN_CASE: Code = usage(
+        "RIVET_CONFIG_CURSOR_COLUMN_CASE",
+        "spell `cursor_column` exactly as the result set names the column",
+    );
     /// A statement that ran past the configured duration cap, carried by the existing
     /// `source::StatementDurationTimeout` marker (recognised in [`super::error_code`]).
     pub const SOURCE_STATEMENT_TIMEOUT: Code = environment(
@@ -500,6 +505,7 @@ pub mod codes {
         CONFIG_SOURCE_MODE_UNSUPPORTED,
         CONFIG_SOURCE_URL_SCHEME_MISMATCH,
         CONFIG_KEYSET_KEY_UUID_OVERRIDE,
+        CONFIG_CURSOR_COLUMN_CASE,
         SOURCE_STATEMENT_TIMEOUT,
         SOURCE_CURSOR_FINER_THAN_MICROSECOND,
         SOURCE_CDC_FOREIGN_CHECKPOINT,
