@@ -53,7 +53,7 @@ Short terminal walkthroughs in [gifs/](gifs/):
 | **incremental** | Only export rows newer than the last cursor | [modes/incremental.md](modes/incremental.md) · [composite cursor](modes/incremental-coalesce.md) |
 | **chunked** | Split large tables into parallel ranges by ID, **or by date** (`chunk_by_days: 365` → one chunk per ~year, `>= AND <` semantics); checkpoint + `--resume` for crashed runs | [modes/chunked.md](modes/chunked.md) |
 | **time_window** | Export a rolling N-day window | [modes/time-window.md](modes/time-window.md) |
-| **cdc** | Stream INSERT/UPDATE/DELETE from the transaction log (MySQL binlog / PostgreSQL logical slot / SQL Server change tables / MongoDB change streams) as typed Parquet/CSV — source-safe, at-least-once | [reference/cdc.md](reference/cdc.md) |
+| **cdc** | Stream INSERT/UPDATE/DELETE from the transaction log (MySQL binlog / PostgreSQL logical slot / SQL Server change tables / MongoDB change streams / Oracle LogMiner, preview) as typed Parquet/CSV — source-safe, at-least-once | [reference/cdc.md](reference/cdc.md) |
 
 ## Destinations
 
@@ -146,6 +146,8 @@ Action-first cookbooks for the most common production scenarios.
 |--------|----------------|
 | [recipes/recover-interrupted-run.md](recipes/recover-interrupted-run.md) | Resume after kill / crash, drive `validate` / `reconcile` / `repair`, unstick a stalled state DB |
 | [recipes/idempotent-warehouse-load.md](recipes/idempotent-warehouse-load.md) | Build an idempotent BigQuery / Snowflake loader on top of `manifest.json` + `_SUCCESS` |
+| [recipes/clickhouse-load.md](recipes/clickhouse-load.md) | **ClickHouse load (preview)** — `rivet run` + `rivet load` per cycle, no compact step; what lands, known limits |
+| [reference/oracle.md](reference/oracle.md) | **Oracle source (preview)** — batch modes, bounded LogMiner CDC to files, types, known limits |
 | [recipes/airflow/](recipes/airflow/) | Run Rivet on Airflow — a wave-aware DAG generated from `rivet plan` (heavy tables isolated, light ones parallelised, a barrier between waves), with per-table retries and a row-count reconcile gate |
 
 ## Architecture Decision Records

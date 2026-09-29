@@ -148,6 +148,11 @@ Check:
 - A second `rivet load` with no new run appends nothing (the load ledger); a
   second `rivet compact` finds no buffer and says so.
 
+- On **ClickHouse** (preview) there is no compaction either: the change log is a
+  `ReplacingMergeTree` that collapses versions per key by itself, and the view reads
+  it with `FINAL`. The cycle is `rivet run` + `rivet load`; see
+  [the ClickHouse recipe](recipes/clickhouse-load.md).
+
 A load never merges: the baseline `OVERWRITE`s the base, changes `LOAD DATA INTO`
 the buffer (or the changelog); only `rivet compact` rewrites base rows.
 

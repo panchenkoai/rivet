@@ -60,15 +60,21 @@ code does not count.
 ### ClickHouse load target — Preview (#308, ADR-0035)
 
 - **Met:**
-  - M1 (the load matrix);
-  - M2 (a timestamp past DateTime64's range is refused before insert, CH12);
+  - M1 (the common types: the load matrix and the uuid/json/time/array cell, read back from ClickHouse);
+  - M2 (a pushed part holding a timestamp past DateTime64's range, or one whose footer cannot bound it, is refused before insert, CH12; the rest are divergences in the type report);
+  - M3 (the main paths: a load killed after appending re-runs without changing the view; a load killed after adopting the table resumes into the log);
   - M4 (a naive timestamp read in three session zones);
   - M5;
-  - M6 (`clickhouse_load` gate cells for CDC per engine, full, incremental, a crash re-run);
-  - M7.
+  - M6 (`clickhouse_load` gate cells for CDC per engine, full, incremental, a crash re-run, and the loader's three live lib tests);
+  - M7 (the loader's HTTP methods are excluded in `.cargo/mutants.toml`, each exclusion naming the live test that kills it, all of which the gate runs);
+  - M8 (the reference page, [recipes/clickhouse-load.md](recipes/clickhouse-load.md), with its known limits).
 - **Open for GA:**
   - the range guard does not cover a load pulled through a named collection;
   - version order across a binlog renumbering (failover, `RESET MASTER`);
+  - no retry on a failed HTTP request;
+  - a private CA for `https://` URLs;
+  - a real-GCS run of the named-collection pull;
   - Mongo CDC (refused, CH7);
   - `partition:` (refused, CH8);
+  - M8's driven run;
   - M9.

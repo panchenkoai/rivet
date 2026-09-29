@@ -48,8 +48,9 @@ def _listening(port: int) -> bool:
 def run_rig_tests(led: Ledger, scenario: str, tests: tuple[str, ...],
                   cell: Callable[[str], str], msg: Callable[[str], str], *,
                   cloud: bool = True, services: tuple[tuple[str, int], ...] = (),
-                  extra_env: dict[str, str] | None = None) -> None:
-    """Run live Rig tests against the gate binary; grade each by cargo's own verdict line.
+                  extra_env: dict[str, str] | None = None,
+                  target: tuple[str, ...] = ("--test", "live_suite")) -> None:
+    """Run live tests (the Rig suite, or a cargo `target` such as `--lib`); grade each by cargo's own verdict line.
 
     `cloud` cells need the BigQuery project, `gcloud` and a Postgres state URL; `services`
     are local ports the tests need. A missing one is a SKIP naming it, never a FAIL.
@@ -80,13 +81,14 @@ def run_rig_tests(led: Ledger, scenario: str, tests: tuple[str, ...],
     # `test(=X)` matches the FULL `<module>::<fn>` name, so the bare fn name never
     # matches — anchor the regex form at the end instead (same as _drive_live_tests).
     expr = nextest_filter(tests)
-    RAN_LIVE_TESTS.update(tests)
+    if target == ("--test", "live_suite"):
+        RAN_LIVE_TESTS.update(tests)
     skip_log = Path(tempfile.mkdtemp(prefix="rivet-skips-")) / "skips"
     env["RIVET_SKIP_LOG"] = str(skip_log)
     p = run(["cargo", "nextest", "run", "--manifest-path", str(ROOT / "Cargo.toml"),
              # --no-fail-fast: one failure must not cancel the rest, which then read as
              # "no PASS line" rows — two real failures showed up as seven (2026-09-27).
-             "--test", "live_suite", "--run-ignored", "all", "--no-fail-fast", "-E", expr],
+             *target, "--run-ignored", "all", "--no-fail-fast", "-E", expr],
             cwd=ROOT, env=env, timeout=None)
     skipped = {k.rsplit("::", 1)[-1]: v for k, v in self_skipped(skip_log).items()}
     out = (p.stdout or "") + (p.stderr or "")

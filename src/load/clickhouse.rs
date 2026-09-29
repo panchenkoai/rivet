@@ -102,7 +102,12 @@ impl ClickhouseLoader {
             .query(params)
             .body(body)
             .send()
-            .with_context(|| format!("ClickHouse HTTP request to {} failed", self.url))?;
+            .with_context(|| {
+                format!(
+                    "ClickHouse HTTP request to {} failed",
+                    crate::redact::redact_secrets(&self.url)
+                )
+            })?;
         let status = resp.status();
         let text = resp
             .text()
@@ -563,15 +568,26 @@ fn columns_ddl(specs: &[TargetColumnSpec], not_null: &[String]) -> String {
 /// JSON and UUID are declared as what their Parquet converts into (`String`, the 16 raw
 /// bytes); a `JSON` or `UUID` column refuses the insert (measured).
 fn column_type(spec: &TargetColumnSpec, not_null: bool) -> String {
-    let t = match spec.target_type.as_str() {
-        "JSON" => "String",
-        "UUID" => "FixedString(16)",
-        other => other,
-    };
+    let t = landed_type(&spec.target_type);
     if not_null || t.starts_with("Array(") || t.starts_with("LowCardinality(") {
-        t.to_string()
+        t
     } else {
         format!("Nullable({t})")
+    }
+}
+
+/// A resolved type with JSON and UUID, also as Array elements, replaced by what they land as.
+fn landed_type(t: &str) -> String {
+    match t {
+        "JSON" => "String".to_string(),
+        "UUID" => "FixedString(16)".to_string(),
+        _ => match t
+            .strip_prefix("Array(Nullable(")
+            .and_then(|r| r.strip_suffix("))"))
+        {
+            Some(inner) => format!("Array(Nullable({}))", landed_type(inner)),
+            None => t.to_string(),
+        },
     }
 }
 
@@ -636,18 +652,28 @@ fn refuse_unholdable_timestamps(
     meta: &parquet::file::metadata::ParquetMetaData,
     uri: &str,
 ) -> Result<()> {
-    if let Some((column, value)) =
+    let Some((column, value)) =
         super::partition_budget::timestamp_outside(meta, DATETIME64_MIN_SECS, DATETIME64_MAX_SECS)
-    {
-        crate::rivet_bail!(
+    else {
+        return Ok(());
+    };
+    match value {
+        None => crate::rivet_bail!(
+            crate::error::codes::LOAD_VALUE_OUT_OF_TARGET_RANGE,
+            "{uri}: column `{column}` has no min/max statistics in the Parquet footer, so rivet \
+             cannot check it against ClickHouse DateTime64's range (1900-01-01 to 2299-12-31), \
+             which ClickHouse enforces by storing the nearest end silently; nothing was inserted. \
+             Re-export the part with statistics enabled (rivet's writer keeps them), or declare \
+             the column as String in the export's `columns:`."
+        ),
+        Some(value) => crate::rivet_bail!(
             crate::error::codes::LOAD_VALUE_OUT_OF_TARGET_RANGE,
             "{uri}: column `{column}` holds {value}, outside ClickHouse DateTime64's range \
              (1900-01-01 to 2299-12-31). ClickHouse would store the nearest end instead, \
              silently; nothing was inserted. Declare the column as String in the export's \
              `columns:` to keep the value, or correct it at the source."
-        );
+        ),
     }
-    Ok(())
 }
 
 /// A Parquet file's footer metadata.
@@ -713,6 +739,26 @@ mod tests {
         assert_eq!(
             ddl,
             "  `id` Int64,\n  `tags` Array(Nullable(String)),\n  `at` Nullable(DateTime64(6, 'UTC'))"
+        );
+    }
+
+    /// ClickHouse refuses a JSON or UUID column fed from Parquet, and `Array(Nullable(JSON))`
+    /// cannot even be created (measured on 24.8); their arrays land by element like the scalars.
+    #[test]
+    fn json_and_uuid_land_as_their_parquet_types_also_inside_an_array() {
+        let ddl = columns_ddl(
+            &[
+                spec("u", "UUID"),
+                spec("j", "JSON"),
+                spec("us", "Array(Nullable(UUID))"),
+                spec("js", "Array(Nullable(JSON))"),
+            ],
+            &[],
+        );
+        assert_eq!(
+            ddl,
+            "  `u` Nullable(FixedString(16)),\n  `j` Nullable(String),\n  \
+             `us` Array(Nullable(FixedString(16))),\n  `js` Array(Nullable(String))"
         );
     }
 
@@ -914,6 +960,84 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    /// A part whose timestamp the footer cannot bound is refused: an all-NULL row group
+    /// beside 9999-12-31, and a part written without statistics.
+    #[test]
+    fn a_part_the_footer_cannot_clear_is_refused() {
+        use parquet::file::properties::{EnabledStatistics, WriterProperties};
+        use std::sync::Arc;
+        let part = |groups: &[Vec<Option<i64>>], stats: EnabledStatistics| {
+            let props = WriterProperties::builder()
+                .set_statistics_enabled(stats)
+                .build();
+            let batches: Vec<_> = groups
+                .iter()
+                .map(|g| {
+                    let secs: Vec<Option<i64>> =
+                        g.iter().map(|s| s.map(|s| s * 1_000_000)).collect();
+                    let col =
+                        arrow::array::TimestampMicrosecondArray::from(secs).with_timezone("UTC");
+                    arrow::record_batch::RecordBatch::try_from_iter([(
+                        "ts",
+                        Arc::new(col) as arrow::array::ArrayRef,
+                    )])
+                    .unwrap()
+                })
+                .collect();
+            let mut buf = Vec::new();
+            let mut w =
+                parquet::arrow::ArrowWriter::try_new(&mut buf, batches[0].schema(), Some(props))
+                    .unwrap();
+            for batch in &batches {
+                w.write(batch).unwrap();
+                w.flush().unwrap();
+            }
+            w.close().unwrap();
+            parquet_footer(&buf).unwrap()
+        };
+        let late = Some(DATETIME64_MAX_SECS + 1);
+        let hidden = part(&[vec![None], vec![late]], EnabledStatistics::Chunk);
+        let err = format!(
+            "{:#}",
+            refuse_unholdable_timestamps(&hidden, "gs://b/p").unwrap_err()
+        );
+        assert!(
+            err.contains("outside ClickHouse DateTime64's range"),
+            "{err}"
+        );
+        let blind = part(&[vec![Some(0)]], EnabledStatistics::None);
+        let err = format!(
+            "{:#}",
+            refuse_unholdable_timestamps(&blind, "gs://b/p").unwrap_err()
+        );
+        assert!(err.contains("has no min/max statistics"), "{err}");
+        assert!(
+            refuse_unholdable_timestamps(
+                &part(&[vec![None], vec![Some(0)]], EnabledStatistics::Chunk),
+                "gs://b/p"
+            )
+            .is_ok(),
+            "an all-NULL row group beside an in-range one loads"
+        );
+    }
+
+    #[test]
+    fn a_failed_request_does_not_print_the_urls_password() {
+        unsafe { std::env::set_var("RIVET_CH_REDACT_TEST_PASSWORD", "x") };
+        let loader = ClickhouseLoader::new(
+            "http://u:hunter2@127.0.0.1:1",
+            "d",
+            "u",
+            "RIVET_CH_REDACT_TEST_PASSWORD",
+            crate::config::DestinationConfig::default(),
+        );
+        let err = format!("{:#}", loader.query("SELECT 1").unwrap_err());
+        assert!(
+            !err.contains("hunter2") && err.contains("127.0.0.1:1"),
+            "{err}"
+        );
     }
 
     #[test]
