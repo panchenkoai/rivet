@@ -1125,11 +1125,14 @@ fn fold_failures(mut failures: Vec<anyhow::Error>, context: &str) -> crate::erro
         .map(|e| format!("{e:#}"))
         .collect::<Vec<_>>()
         .join("; ");
-    Err(primary.context(format!(
-        "{} export(s) failed{}; representative error follows (also: {others})",
-        failures.len() + 1,
-        context,
-    )))
+    let class = crate::error::classify_exit(&primary);
+    Err(primary
+        .context(crate::error::PreclassifiedExit(class))
+        .context(format!(
+            "{} export(s) failed{}; representative error follows (also: {others})",
+            failures.len() + 1,
+            context,
+        )))
 }
 
 /// The waves/pool run tail, written once: ONE aggregate, then the shared
@@ -3316,6 +3319,24 @@ pub(crate) mod run_tail_tests {
             msg.contains("plain boom"),
             "the non-representative failures must still be listed; got: {msg}"
         );
+    }
+
+    #[test]
+    fn fold_failures_exits_on_the_primary_class_never_on_another_exports_text() {
+        use crate::error::{CodedError, classify_exit, codes};
+        let permanent = vec![
+            anyhow::Error::new(CodedError::new(
+                codes::CONFIG_NO_EXPORTS,
+                "export 'session_timeouts' has a dns_records column",
+            )),
+            anyhow::anyhow!("unsupported column type"),
+        ];
+        assert_eq!(classify_exit(&fold_failures(permanent, "").unwrap_err()), 1);
+        let retryable = vec![
+            anyhow::anyhow!("connection reset by peer"),
+            anyhow::anyhow!("permission denied on table x"),
+        ];
+        assert_eq!(classify_exit(&fold_failures(retryable, "").unwrap_err()), 2);
     }
 
     /// Captures WARN records, because the run-over-run self-check has no other
