@@ -1170,6 +1170,10 @@ def run_scenarios(led: Ledger, engine: str, tag: str, url: str) -> None:
             return
     sc_verdicts(led, engine, tag, url)
     sc_integrity_types(led, engine, tag, url)
+    from .sentinels import sc_sentinels
+
+    with led.span(f"{engine}: sentinels"):
+        sc_sentinels(led, engine, tag, url)
     # When blessing the local goldens (verdicts + duckdb-type) the store loads add
     # nothing — skip them.
     if _bless("BLESS_VERDICTS") or _bless("BLESS_DUCKDB"):
