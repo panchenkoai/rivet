@@ -976,6 +976,26 @@ exports:
 // Mongo `na`s rest entirely on it). A mutant relaxing `matches!(mode, Full|Cdc)`
 // would let `mode: incremental` reach a panic; a mutant dropping the parallel+
 // resume guard would silently re-read the whole collection every run.
+/// `partition_by` on a Mongo `mode: full` export reached `quote_ident`'s `unreachable!` at run time.
+#[test]
+fn mongo_partition_by_is_rejected_at_load() {
+    let yaml = r#"
+source: { type: mongo, url: "mongodb://localhost:27017/testdb" }
+exports:
+  - name: e
+    table: events
+    mode: full
+    partition_by: created_at
+    format: parquet
+    destination: { type: local, path: "./out/{partition}" }
+"#;
+    let msg = format!("{:#}", Config::from_yaml(yaml).unwrap_err());
+    assert!(
+        msg.contains("export 'e': partition_by is not supported on a Mongo source"),
+        "{msg}"
+    );
+}
+
 #[test]
 fn mongo_non_full_or_cdc_mode_is_rejected() {
     for (mode, extra) in [

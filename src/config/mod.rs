@@ -553,6 +553,16 @@ impl Config {
                     non_sql_mode_refusal(self.source.source_type, e.mode.as_str())
                 );
             }
+            if e.partition_by.is_some() {
+                crate::config_bail!(
+                    crate::error::codes::CONFIG_SOURCE_MODE_UNSUPPORTED,
+                    "export '{}': partition_by is not supported on a {:?} source — it builds SQL \
+                     min/max/NULL probes over the partition column. Drop `partition_by:` and \
+                     export the collection whole.",
+                    e.name,
+                    self.source.source_type
+                );
+            }
             // An impossible combination must be a config error, not a silent
             // behavior downgrade: the parallel `_id`-range path keeps NO keyset
             // checkpoint, so `resume: true` was silently ignored — the whole
