@@ -375,6 +375,20 @@ def _self_test() -> int:
         assert f"fn {key.split('::')[-1]}(" in live_src, f"SKIP_ALLOWED names no live test: {key}"
     assert exclusive_tests(), "no live+exclusive test found — the exclusive pass would grade nothing"
     print("self-test ok: live modules are derived; perf tolerances grade regressions, not noise")
+    import json as _json
+    import tempfile as _tf
+
+    from .core import record_timings
+
+    with _tf.TemporaryDirectory() as d:
+        hist = Path(d) / "t.jsonl"
+        record_timings(hist, [("A", 60.0), ("B", 120.0)], [("s", 30.0)], "RELEASE-READY", 3, 0)
+        second = record_timings(hist, [("A", 180.0), ("B", 120.0)], [], "NOT RELEASABLE", 2, 1)
+        lines = hist.read_text().splitlines()
+        assert len(lines) == 2, lines
+        assert _json.loads(lines[0])["total_min"] == 3.0 and second["total_min"] == 5.0, lines
+        assert second["phases_min"] == {"A": 3.0, "B": 2.0} and second["failed"] == 1, second
+    print("self-test ok: gate timings append one history line per run")
     from . import sentinels
 
     sentinels._self_test()
@@ -632,6 +646,31 @@ def preflight(led: Ledger, *, bless_gifs: bool = False) -> None:
     )
 
 
+def _usable_port(port: int) -> int:
+    """The pinned host port when it is bindable, else a free ephemeral one (a leaked OrbStack forward holds it)."""
+    import socket
+
+    for want in (port, 0):
+        with socket.socket() as s:
+            try:
+                s.bind(("0.0.0.0", want))
+                return s.getsockname()[1]
+            except OSError:
+                continue
+    return port
+
+
+def _host_port_open(port: int) -> bool:
+    """True when the published port accepts a TCP connect from the host, the path the seed and rivet use."""
+    import socket
+
+    try:
+        socket.create_connection(("127.0.0.1", port), timeout=2).close()
+        return True
+    except OSError:
+        return False
+
+
 def bring_up(led: Ledger, engine: str, tag: str, image: str, port: int) -> str | None:
     """Start one engine×version and wait for it to answer. Returns its URL, or
     None when it could not start (the caller records a SKIP).
@@ -642,6 +681,7 @@ def bring_up(led: Ledger, engine: str, tag: str, image: str, port: int) -> str |
     named the BigQuery stage's container after whichever engine the main loop had
     visited last."""
     name = engine_container(engine, tag)
+    port = _usable_port(port)
     # `-v`, not a bare `-f`. Every engine image here declares a VOLUME for its
     # data directory, and `docker run` with no `-v` of our own answers that by
     # creating an ANONYMOUS volume. `docker rm -f` deletes the container and
@@ -776,6 +816,8 @@ def bring_up(led: Ledger, engine: str, tag: str, image: str, port: int) -> str |
     # `connection to server on socket "…/.s.PGSQL.5432" failed: No such file or
     # directory`. Observed exactly that on postgres:14 in a full gate run.
     def ready() -> bool:
+        if not _host_port_open(port):
+            return False
         for probe in probes:
             if not docker_exec(name, *probe, timeout=20).ok:
                 continue  # this spelling is absent on this version — try the next

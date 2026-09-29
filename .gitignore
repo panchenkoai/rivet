@@ -151,3 +151,4 @@ __pycache__/
 # Claude instructions live in ~/.claude (private), never in the public tree.
 CLAUDE.md
 CLAUDE.local.md
+/dev/release-oracle/timings.jsonl
