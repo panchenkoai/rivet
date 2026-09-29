@@ -819,13 +819,14 @@ fn oracle_class_census_is_pinned() {
 // declared parts), +8 presence — six refusals whose oracle is the refusal text itself
 // (corrupt, retention gap, foreign DBID, no ALL COLUMNS logging, a LOB, an unknown
 // table), the NDJSON source-resolution CLI cell, and the shared intra-transaction check.
-const PIN_INDEPENDENT: usize = 97;
+const PIN_INDEPENDENT: usize = 98;
 // 2026-09-28, source connection ceilings: +3 shared codec — the run's captured row is the
 // fixture check; the oracle is the server's own connection counter.
 const PIN_SHARED_CODEC: usize = 85;
 const PIN_SELF_COUNTER: usize = 6;
 // 2026-09-28: +1 presence — the SQL Server undecodable-cell refusal, whose oracle is the refusal.
-const PIN_PRESENCE: usize = 76;
+// 2026-09-29: +2 presence — the PG CDC LMT-timezone and DOMAIN parity cells compare CDC to batch output.
+const PIN_PRESENCE: usize = 78;
 
 /// TIER 2 (harness audit, 2026-08-29): a test whose NAME makes a
 /// COMPLETENESS claim must carry a class-(a) INDEPENDENT oracle — not merely

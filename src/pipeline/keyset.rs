@@ -444,7 +444,15 @@ fn run_keyset_parallel(
     } else {
         None
     };
-    let resume_run_id = resume_anchor(state, &plan.export_name, &scope, resume_run_id, true, &key)?;
+    let resume_run_id = resume_anchor(
+        state,
+        &plan.export_name,
+        &scope,
+        resume_run_id,
+        true,
+        &key,
+        kp.incremental,
+    )?;
 
     // Incremental (iteration 3): a FRESH run seeks past the persisted anchor
     // (`floor`) up to the source max AT OPEN (`ceil`) — bounding the last range at
@@ -871,6 +879,7 @@ fn resume_anchor(
     rid: Option<String>,
     parallel_runner: bool,
     key: &str,
+    incremental: bool,
 ) -> Result<Option<String>> {
     let (Some(rid), Some(st)) = (rid.clone(), state) else {
         return Ok(rid);
@@ -880,6 +889,15 @@ fn resume_anchor(
     let anchor_has_ranges = st.has_keyset_ranges(export_name, &rid, on_key)?;
     if anchor_is_own(parallel_runner, anchor_has_ranges) {
         return Ok(Some(rid));
+    }
+    if parallel_runner && incremental && !st.has_keyset_ranges(export_name, &rid, None)? {
+        crate::rivet_bail!(
+            crate::error::codes::STATE_KEYSET_SEQUENTIAL_ANCHOR_UNFINISHED,
+            "export '{export_name}': interrupted run {rid} was a sequential `keyset_incremental` \
+             run whose cursor already moved past pages no manifest names — a parallel run would \
+             seek past them and lose them. Re-run once with `parallel: 1` to finish run {rid}, \
+             then raise `parallel:`."
+        );
     }
     let why = if parallel_runner {
         "left no parallel ranges on this key (a sequential run, or one keyed differently)"
@@ -977,6 +995,7 @@ pub(crate) fn run_keyset(
                 st.get_resume_run_id(&plan.export_name, &scope)?,
                 false,
                 &kp.key_column,
+                kp.incremental,
             )?,
             None => None,
         }
@@ -1289,6 +1308,24 @@ pub(crate) fn run_keyset(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn a_parallel_incremental_run_refuses_a_sequential_anchor_whose_cursor_ran_ahead() {
+        let st = StateStore::open_in_memory().unwrap();
+        st.set_resume_run_id("e", "p", "seq").unwrap();
+        let err =
+            resume_anchor(Some(&st), "e", "p", Some("seq".into()), true, "id", true).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Re-run once with `parallel: 1` to finish run seq"),
+            "{err}"
+        );
+        assert_eq!(
+            st.get_resume_run_id("e", "p").unwrap(),
+            Some("seq".into()),
+            "the anchor keeps the crashed run's pages reachable"
+        );
+    }
+
+    #[test]
     fn resume_anchor_keeps_its_own_shape_and_clears_the_other() {
         let st = StateStore::open_in_memory().unwrap();
         let ranges = [(None, Some("5".to_string())), (Some("5".to_string()), None)];
@@ -1300,7 +1337,7 @@ mod tests {
         };
         anchored("par", Some("id"));
         assert_eq!(
-            resume_anchor(Some(&st), "e", "p", Some("par".into()), true, "id").unwrap(),
+            resume_anchor(Some(&st), "e", "p", Some("par".into()), true, "id", false).unwrap(),
             Some("par".into())
         );
         assert_eq!(
@@ -1309,7 +1346,7 @@ mod tests {
             "kept"
         );
         assert_eq!(
-            resume_anchor(Some(&st), "e", "p", Some("par".into()), false, "id").unwrap(),
+            resume_anchor(Some(&st), "e", "p", Some("par".into()), false, "id", false).unwrap(),
             None
         );
         assert_eq!(
@@ -1320,11 +1357,11 @@ mod tests {
 
         anchored("seq", None);
         assert_eq!(
-            resume_anchor(Some(&st), "e", "p", Some("seq".into()), false, "id").unwrap(),
+            resume_anchor(Some(&st), "e", "p", Some("seq".into()), false, "id", false).unwrap(),
             Some("seq".into())
         );
         assert_eq!(
-            resume_anchor(Some(&st), "e", "p", Some("seq".into()), true, "id").unwrap(),
+            resume_anchor(Some(&st), "e", "p", Some("seq".into()), true, "id", false).unwrap(),
             None
         );
         assert_eq!(
@@ -1335,12 +1372,12 @@ mod tests {
 
         anchored("other", Some("ts"));
         assert_eq!(
-            resume_anchor(Some(&st), "e", "p", Some("other".into()), true, "id").unwrap(),
+            resume_anchor(Some(&st), "e", "p", Some("other".into()), true, "id", false).unwrap(),
             None,
             "ranges on another key do not make a parallel anchor on this one"
         );
         assert_eq!(
-            resume_anchor(None, "e", "p", Some("x".into()), true, "id").unwrap(),
+            resume_anchor(None, "e", "p", Some("x".into()), true, "id", false).unwrap(),
             Some("x".into())
         );
     }

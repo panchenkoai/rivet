@@ -478,7 +478,8 @@ Notes:
 - **Retention is the DBA's**, as with the binlog: nothing pins archived logs for
   rivet. If the checkpoint needs a log that was deleted, the run fails with a
   data-loss error (see *Failure modes*).
-- **Loading** an Oracle stream with `rivet load` is not supported in the preview.
+- **Loading** an Oracle stream with `rivet load` is not supported in the preview: a
+  `mode: cdc` Oracle export under a `load:` block is refused when the config is read.
 
 ---
 
@@ -691,8 +692,13 @@ backfills in batched transactions, or through `mode: full`/`initial: snapshot`
 
 **DDL inside a capture window: safe where the engine names its columns, a
 LOUD ERROR where it does not.** PostgreSQL (wire text) and SQL Server (change
-tables) always name every image column, so rivet maps values by NAME and a
-mid-window `DROP`/`ADD COLUMN` captures correctly. MySQL's binlog carries
+tables) always name every image column, so rivet maps values by NAME: a
+`DROP COLUMN` or `RENAME` landing between runs captures correctly, and an
+equal-arity `DROP a` + `ADD c` leaves `c` NULL for the older images rather than
+filling it with a neighbour's value (unless the dropped column sat at `c`'s
+position, which looks exactly like a rename and is read as one). A column ADDED while a run is open is not in
+that run's schema, so its values for that run's window are dropped — re-snapshot
+the table after an `ADD COLUMN` if those values matter. MySQL's binlog carries
 names only when the server runs with **`binlog_row_metadata=FULL`** (8.0.1+ —
 strongly recommended; the compose test stack sets it):
 
@@ -803,7 +809,9 @@ engines. What remains:
   pass — run it under a supervisor that restarts it). The bounded run remains
   the intended model.
 - **Schema drift:** the sink schema is frozen at the first flush — a column added
-  mid-run is not picked up until the next run re-resolves the table.
+  mid-run is not picked up until the next run re-resolves the table, and its values
+  captured in the meantime are dropped (the events are still acked) — re-snapshot
+  the table to recover them.
 - **No lag metric:** the run records rows / files / bytes / duration / status, but
   not replication lag ("how far behind the source is") — the next observability step.
 - **Pre-image completeness** depends on the source config: full UPDATE/DELETE

@@ -265,21 +265,34 @@ fn prefix_target_leased<'a>(
         Ok(Some(lease)) => (target, Some(lease)),
         Ok(None) => {
             eprintln!(
-                "  cleanup [{}]: SKIPPED — another rivet holds {} right now. The load itself \
-                 succeeded; only the staged Parquet is left in place, and the next load with \
-                 `cleanup_source` removes it.",
-                plan.table, plan.gcs_prefix
+                "{}",
+                lease_skip_message(&plan.table, &plan.gcs_prefix, None)
             );
             (None, None)
         }
         Err(e) => {
+            let why = format!("{e:#}");
             eprintln!(
-                "  cleanup [{}]: SKIPPED — could not take the prefix lease on {} ({e:#}). \
-                 Not deleting what cannot be confirmed idle; the load itself succeeded.",
-                plan.table, plan.gcs_prefix
+                "{}",
+                lease_skip_message(&plan.table, &plan.gcs_prefix, Some(&why))
             );
             (None, None)
         }
+    }
+}
+
+/// The line printed when cleanup is skipped for want of the prefix lease — before the load runs.
+fn lease_skip_message(table: &str, prefix: &str, lease_error: Option<&str>) -> String {
+    match lease_error {
+        None => format!(
+            "  cleanup [{table}]: SKIPPED — another rivet holds {prefix} right now; the load \
+             proceeds; the staged Parquet will be left in place, and the next load's cleanup \
+             removes it."
+        ),
+        Some(e) => format!(
+            "  cleanup [{table}]: SKIPPED — could not take the prefix lease on {prefix} ({e}). \
+             Not deleting what cannot be confirmed idle; the load proceeds."
+        ),
     }
 }
 
@@ -370,5 +383,19 @@ pub(super) fn maybe_cleanup(cleanup: Option<(&GcsStore, &[String])>) -> bool {
             }
         },
         None => false,
+    }
+}
+
+#[cfg(test)]
+mod lease_skip_message_tests {
+    use super::lease_skip_message;
+
+    #[test]
+    fn a_lease_skip_printed_before_the_load_does_not_claim_the_load_succeeded() {
+        for err in [None, Some("state db down")] {
+            let msg = lease_skip_message("orders", "gs://b/p/", err);
+            assert!(!msg.contains("succeeded"), "{msg}");
+            assert!(msg.contains("the load proceeds"), "{msg}");
+        }
     }
 }

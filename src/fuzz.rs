@@ -27,7 +27,8 @@ pub fn config_from_yaml(data: &[u8]) {
 pub fn pg_test_decoding(data: &[u8]) {
     if let Ok(s) = std::str::from_utf8(data) {
         // A fixed valid LSN — all the parsing under test lives in `data`.
-        let _ = crate::source::postgres::cdc::parse_test_decoding("0/16B2D48", s);
+        let _ =
+            crate::source::postgres::cdc::parse_test_decoding("0/16B2D48", s, &Default::default());
     }
 }
 

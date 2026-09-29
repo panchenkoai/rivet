@@ -540,6 +540,11 @@ pub(crate) trait ChangeStream {
         None
     }
 
+    /// After a clean drain, a position past everything read that nothing captured can precede.
+    fn drained_frontier(&self) -> Option<Position> {
+        None
+    }
+
     /// The checkpoint to persist for `position`; an engine adds what verifies a later resume.
     fn checkpoint_of(&self, position: &Position) -> Position {
         position.clone()
@@ -1304,7 +1309,11 @@ pub(crate) fn create_change_stream(
             // error as a permissions/setup problem). open_or_resume re-reads it;
             // the double read of a tiny file is cheap.
             if let Some(p) = cfg.checkpoint.as_deref() {
-                Position::load(std::path::Path::new(p))?;
+                let pos = Position::load(std::path::Path::new(p))?;
+                crate::source::mysql::cdc::MysqlChangeStream::resume_from_checkpoint(
+                    pos.as_ref(),
+                    &p.display().to_string(),
+                )?;
             }
             // The routing check runs inside `open`, on the connection that then dumps:
             // its refusals carry rivet's `mysql cdc:` prefix, which `with_setup_hint`
@@ -2630,6 +2639,39 @@ mod tests {
             !msg.contains("REPLICATION SLAVE") && !msg.contains("binlog_format"),
             "a checkpoint-file error must NOT carry the binlog-grants hint: {msg}"
         );
+    }
+
+    #[test]
+    fn mysql_hollow_checkpoint_refusal_is_not_masked_by_the_grants_hint() {
+        let d = tempfile::tempdir().unwrap();
+        let ckpt = d.path().join("ck.json");
+        for hollow in [&b"{\"pos\":4}"[..], &b"{\"file\":\"binlog.000001\"}"[..]] {
+            std::fs::write(&ckpt, hollow).unwrap();
+            let cfg = CdcConfig {
+                config_dir: std::path::PathBuf::from("."),
+                url: "mysql://rivet:rivet@127.0.0.1:1/rivet".into(),
+                checkpoint: Some(ckpt.clone()),
+                drain: DrainMode::BoundedAtOpen,
+                tls: None,
+                engine: CdcEngineOpts::Mysql {
+                    server_id: 4321,
+                    configured_tables: Vec::new(),
+                },
+            };
+            let Err(err) = create_change_stream(&cfg, PeekBound::Unbounded) else {
+                panic!("a hollow checkpoint must be refused, not open a stream");
+            };
+            let msg = format!("{err:#}");
+            assert!(
+                msg.starts_with("checkpoint '") && !msg.contains("permissions/setup"),
+                "the checkpoint refusal must come first, with no grants hint: {msg}"
+            );
+            assert_eq!(crate::error::classify_exit(&err), 5, "{msg}");
+            assert_eq!(
+                crate::error::error_code(&err),
+                Some("RIVET_SOURCE_CDC_CHECKPOINT_INVALID")
+            );
+        }
     }
 
     #[cfg(feature = "oracle")]

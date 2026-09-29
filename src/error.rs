@@ -391,6 +391,16 @@ pub mod codes {
         "RIVET_CONFIG_SOURCE_URL_SCHEME_MISMATCH",
         "make `source.type` and the URL scheme name the same engine",
     );
+    /// A MySQL keyset key under a `uuid` column override: the seek binds hex text, not the stored order.
+    pub const CONFIG_KEYSET_KEY_UUID_OVERRIDE: Code = usage(
+        "RIVET_CONFIG_KEYSET_KEY_UUID_OVERRIDE",
+        "key the keyset on another unique column, or use `mode: full` for this table",
+    );
+    /// `cursor_column` matches a result-set column only when case is ignored, so the cursor never advances.
+    pub const CONFIG_CURSOR_COLUMN_CASE: Code = usage(
+        "RIVET_CONFIG_CURSOR_COLUMN_CASE",
+        "spell `cursor_column` exactly as the result set names the column",
+    );
     /// A statement that ran past the configured duration cap, carried by the existing
     /// `source::StatementDurationTimeout` marker (recognised in [`super::error_code`]).
     pub const SOURCE_STATEMENT_TIMEOUT: Code = environment(
@@ -424,6 +434,11 @@ pub mod codes {
         "RIVET_STATE_SCHEMA_NEWER",
         "upgrade rivet, or point this binary at a state DB it created",
     );
+    /// A parallel incremental keyset run met an unfinished sequential run's anchor, whose cursor ran past its unmanifested pages.
+    pub const STATE_KEYSET_SEQUENTIAL_ANCHOR_UNFINISHED: Code = refusal(
+        "RIVET_STATE_KEYSET_SEQUENTIAL_ANCHOR_UNFINISHED",
+        "re-run once with `parallel: 1` to finish the interrupted run, then raise `parallel:`",
+    );
     pub const STATE_CURSOR_OWNER_MISMATCH: Code = refusal(
         "RIVET_STATE_CURSOR_OWNER_MISMATCH",
         "`rivet state reset --export <name>` to start the new cursor with a full pass, or restore the previous cursor column",
@@ -438,7 +453,7 @@ pub mod codes {
     );
     pub const SOURCE_CDC_CHECKPOINT_INVALID: Code = refusal(
         "RIVET_SOURCE_CDC_CHECKPOINT_INVALID",
-        "restore the checkpoint file, or delete it to accept a fresh anchor (then re-snapshot)",
+        "restore the checkpoint file, or delete it so the stream anchors FIRST, then re-snapshot",
     );
     pub const SOURCE_CDC_LOG_GAP: Code = refusal(
         "RIVET_SOURCE_CDC_LOG_GAP",
@@ -456,6 +471,16 @@ pub mod codes {
     pub const SOURCE_CDC_PREREQUISITE: Code = environment(
         "RIVET_SOURCE_CDC_PREREQUISITE",
         "apply the setup statement the message names, then re-run (docs/reference/cdc.md)",
+    );
+    /// A source value the column's Arrow type has no faithful reading for (PG `infinity`, `24:00:00`).
+    pub const SOURCE_VALUE_UNREPRESENTABLE: Code = refusal(
+        "RIVET_SOURCE_VALUE_UNREPRESENTABLE",
+        "map the value to a representable one in the export's `query:`, or exclude the column",
+    );
+    /// A `columns:` override declares a type the source's wire value cannot be read as.
+    pub const SOURCE_OVERRIDE_WIRE_MISMATCH: Code = usage(
+        "RIVET_SOURCE_OVERRIDE_WIRE_MISMATCH",
+        "remove or correct the column's `columns:` override, or CAST the column to that type in the export's `query:`",
     );
     pub const LOAD_VALUE_OUT_OF_TARGET_RANGE: Code = refusal(
         "RIVET_LOAD_VALUE_OUT_OF_TARGET_RANGE",
@@ -494,6 +519,8 @@ pub mod codes {
         CONFIG_CSV_LOAD_UNSUPPORTED,
         CONFIG_SOURCE_MODE_UNSUPPORTED,
         CONFIG_SOURCE_URL_SCHEME_MISMATCH,
+        CONFIG_KEYSET_KEY_UUID_OVERRIDE,
+        CONFIG_CURSOR_COLUMN_CASE,
         SOURCE_STATEMENT_TIMEOUT,
         SOURCE_CURSOR_FINER_THAN_MICROSECOND,
         SOURCE_CDC_FOREIGN_CHECKPOINT,
@@ -502,8 +529,11 @@ pub mod codes {
         SOURCE_CDC_UNDECODABLE,
         SOURCE_CDC_CELL_UNSUPPORTED,
         SOURCE_CDC_PREREQUISITE,
+        SOURCE_VALUE_UNREPRESENTABLE,
+        SOURCE_OVERRIDE_WIRE_MISMATCH,
         STATE_SCHEMA_NEWER,
         STATE_CURSOR_OWNER_MISMATCH,
+        STATE_KEYSET_SEQUENTIAL_ANCHOR_UNFINISHED,
         LOAD_VALUE_OUT_OF_TARGET_RANGE,
         LOAD_COUNT_MISMATCH,
         LOAD_ADOPTION_COLUMN_MISMATCH,

@@ -1081,6 +1081,91 @@ fn mssql_cdc_resume_past_retention_errors_not_a_silent_gap() {
     );
 }
 
+/// A quiet table's checkpoint must move to the drained open-time bound, so the
+/// cleanup job passing its last captured change is not refused as a retention gap.
+#[test]
+#[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
+fn mssql_cdc_quiet_table_checkpoint_advances_so_cleanup_is_not_a_false_gap() {
+    let _serial = cross_process_serial("mssql_cdc");
+    let d = tempfile::tempdir().unwrap();
+    let table = unique_name("rivet_cdc_quiet");
+    let other = unique_name("rivet_cdc_busy");
+    let (ci, other_ci) = (format!("dbo_{table}"), format!("dbo_{other}"));
+    for t in [&table, &other] {
+        mssql_cdc_drop_table(&format!("dbo.{t}"));
+        mssql_cdc_exec(&format!("CREATE TABLE dbo.{t}(id INT PRIMARY KEY, v INT)"));
+    }
+    enable_cdc(&table, &ci);
+    enable_cdc(&other, &other_ci);
+    let _guards = [
+        MssqlCdcTable {
+            table: table.clone(),
+            ci: ci.clone(),
+        },
+        MssqlCdcTable {
+            table: other.clone(),
+            ci: other_ci.clone(),
+        },
+    ];
+    let ckpt = d.path().join("cdc.ckpt");
+    let lsn = || -> String {
+        let j: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&ckpt).unwrap()).unwrap();
+        j["lsn"].as_str().unwrap().to_ascii_lowercase()
+    };
+    let run = |n: &str| {
+        let out = d.path().join(n);
+        std::fs::create_dir_all(&out).unwrap();
+        mssql_cdc_rig(&table, &ci, &ckpt, &out).run_ok();
+        out
+    };
+
+    mssql_cdc_exec(&format!("INSERT INTO dbo.{table} VALUES (1,10)"));
+    wait_for_capture(&ci, 1);
+    assert_eq!(
+        manifest_rows(&run("out1")),
+        1,
+        "run 1 captures the one change"
+    );
+    let captured_at = lsn();
+
+    // The database's log moves on while this table stays quiet.
+    mssql_cdc_exec(&format!("INSERT INTO dbo.{other} VALUES (1,10)"));
+    wait_for_capture(&other_ci, 1);
+    assert_eq!(
+        manifest_rows(&run("out2")),
+        0,
+        "run 2 is idle for this table"
+    );
+    let frontier = lsn();
+    assert!(
+        frontier > captured_at,
+        "an idle drain must move the checkpoint past {captured_at}, got {frontier}"
+    );
+
+    // Retention passes the last captured change, up to the drained frontier.
+    mssql_cdc_exec(&format!(
+        "EXEC sys.sp_cdc_cleanup_change_table @capture_instance = N'{ci}', \
+         @low_water_mark = 0x{frontier}, @threshold = 5000;"
+    ));
+    assert_eq!(
+        manifest_rows(&run("out3")),
+        0,
+        "no change was lost, so the run must not be refused as a retention gap"
+    );
+
+    // And the stream still delivers what comes next.
+    mssql_cdc_exec(&format!("INSERT INTO dbo.{table} VALUES (2,20)"));
+    wait_for_capture(&ci, 1);
+    let out4 = run("out4");
+    assert_eq!(duckdb_dir_scalar(&out4, "count(*)", None), 1);
+    assert_eq!(
+        duckdb_dir_scalar(&out4, "count(*)", Some("id = 2 AND __op = 'insert'")),
+        1,
+        "run 4 must deliver exactly the new insert"
+    );
+}
+
 #[test]
 #[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
 fn mssql_cdc_corrupt_checkpoint_fails_loud_not_silently_absent() {

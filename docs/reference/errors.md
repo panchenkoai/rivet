@@ -25,16 +25,21 @@ Every failure rivet names carries a stable `RIVET_<FAMILY>_<NAME>` code: in `--j
 | `RIVET_CONFIG_CSV_LOAD_UNSUPPORTED` | usage | 1 | use `format: parquet` for an export with a `load:` section |
 | `RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED` | usage | 1 | use a mode this source supports (MongoDB: `full`) |
 | `RIVET_CONFIG_SOURCE_URL_SCHEME_MISMATCH` | usage | 1 | make `source.type` and the URL scheme name the same engine |
+| `RIVET_CONFIG_KEYSET_KEY_UUID_OVERRIDE` | usage | 1 | key the keyset on another unique column, or use `mode: full` for this table |
+| `RIVET_CONFIG_CURSOR_COLUMN_CASE` | usage | 1 | spell `cursor_column` exactly as the result set names the column |
 | `RIVET_SOURCE_STATEMENT_TIMEOUT` | environment | 2 if transient, else 1 | raise `tuning.statement_timeout_s`, or narrow the chunk |
 | `RIVET_SOURCE_CURSOR_FINER_THAN_MICROSECOND` | refusal | 5 | cursor on a column at microsecond precision or coarser, or cast the cursor to TIMESTAMP(6) in a curated query |
 | `RIVET_SOURCE_CDC_FOREIGN_CHECKPOINT` | refusal | 5 | delete the checkpoint so the next run anchors afresh FIRST, then re-snapshot the tables |
-| `RIVET_SOURCE_CDC_CHECKPOINT_INVALID` | refusal | 5 | restore the checkpoint file, or delete it to accept a fresh anchor (then re-snapshot) |
+| `RIVET_SOURCE_CDC_CHECKPOINT_INVALID` | refusal | 5 | restore the checkpoint file, or delete it so the stream anchors FIRST, then re-snapshot |
 | `RIVET_SOURCE_CDC_LOG_GAP` | refusal | 5 | restore the missing log, or delete the checkpoint so the stream anchors FIRST, then re-snapshot |
 | `RIVET_SOURCE_CDC_UNDECODABLE` | refusal | 5 | re-snapshot the table: delete the checkpoint first so the stream anchors, then snapshot |
 | `RIVET_SOURCE_CDC_CELL_UNSUPPORTED` | refusal | 5 | leave the column out of the capture (SQL Server: @captured_column_list), then re-snapshot |
 | `RIVET_SOURCE_CDC_PREREQUISITE` | environment | 2 if transient, else 1 | apply the setup statement the message names, then re-run (docs/reference/cdc.md) |
+| `RIVET_SOURCE_VALUE_UNREPRESENTABLE` | refusal | 5 | map the value to a representable one in the export's `query:`, or exclude the column |
+| `RIVET_SOURCE_OVERRIDE_WIRE_MISMATCH` | usage | 1 | remove or correct the column's `columns:` override, or CAST the column to that type in the export's `query:` |
 | `RIVET_STATE_SCHEMA_NEWER` | refusal | 5 | upgrade rivet, or point this binary at a state DB it created |
 | `RIVET_STATE_CURSOR_OWNER_MISMATCH` | refusal | 5 | `rivet state reset --export <name>` to start the new cursor with a full pass, or restore the previous cursor column |
+| `RIVET_STATE_KEYSET_SEQUENTIAL_ANCHOR_UNFINISHED` | refusal | 5 | re-run once with `parallel: 1` to finish the interrupted run, then raise `parallel:` |
 | `RIVET_LOAD_VALUE_OUT_OF_TARGET_RANGE` | refusal | 5 | the warehouse type cannot hold this value; declare a wider type (e.g. String) for the column, or fix the source value |
 | `RIVET_LOAD_COUNT_MISMATCH` | integrity | 3 | compare the warehouse table with the run's manifest before re-running; the source is kept |
 | `RIVET_LOAD_ADOPTION_COLUMN_MISMATCH` | refusal | 5 | add the export's new columns to the table (`ALTER TABLE … ADD COLUMN`) and re-run; do not rename it aside |

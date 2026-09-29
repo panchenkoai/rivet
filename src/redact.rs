@@ -164,7 +164,7 @@ pub fn redact_secrets(s: &str) -> String {
 /// every log aggregator on a delivery failure. Path secrets have no
 /// recognizable shape (handled at the notify site via `without_url`); query
 /// keys DO, so they are scrubbed here for every error path.
-fn redact_query_secrets(s: &str) -> String {
+pub(crate) fn redact_query_secrets(s: &str) -> String {
     // SUFFIX-FAMILY matching (round-10, rebuilt from the start-anchored key
     // list): real secret params are compounds ENDING in the secret word —
     // access_token, sas_token, client_secret, X-Amz-Signature — so `token=`

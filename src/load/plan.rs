@@ -250,8 +250,8 @@ pub struct LoadPlan {
     pub pk: Vec<String>,
     /// The clustering of the table the load writes.
     pub clustering: Clustering,
-    /// The run this plan was typed from — `(run_id, finished_at)` — once the load
-    /// pinned it; a run that finishes after it is refused for this cycle.
+    /// The run this plan was typed from and the newest `finished_at` the pin listed —
+    /// `(run_id, finished_at)`; a run that finishes after it is refused for this cycle.
     pub pinned_run: Option<(String, String)>,
     /// Where a CDC table's baseline lives (see [`CdcLayout`]); `LogAndView` for
     /// every non-CDC mode.
@@ -1412,12 +1412,7 @@ pub fn source_engine(config_path: &str) -> Result<crate::load::cdc::SourceEngine
         SourceType::Mysql => Ok(SourceEngine::MySql),
         SourceType::Mssql => Ok(SourceEngine::SqlServer),
         SourceType::Mongo => Ok(SourceEngine::Mongo),
-        SourceType::Oracle => {
-            anyhow::bail!(
-                "loading an Oracle CDC stream is not supported yet: the Oracle CDC preview \
-                 captures to files only (ADR-0037); load its parts with your own tooling"
-            )
-        }
+        SourceType::Oracle => anyhow::bail!("{}", crate::config::load::ORACLE_CDC_NOT_LOADABLE),
     }
 }
 

@@ -310,6 +310,15 @@ pub(super) fn needs_source_engine(plans: &[load::plan::LoadPlan]) -> bool {
     plans.iter().any(|p| p.mode == load::plan::LoadMode::Cdc)
 }
 
+/// Why a load from `mine` into a table last loaded from `other` is refused.
+pub(super) fn source_conflict_refusal(target_fqtn: &str, other: &str, mine: &str) -> String {
+    format!(
+        "target table `{target_fqtn}` was last loaded from `{other}` and this load carries \
+         `{mine}` — loading would REPLACE the other source's rows, and both commands would \
+         report success. Give this source its own target table."
+    )
+}
+
 /// Why a CDC snapshot over an earlier full-load table is refused, with the ways out this warehouse takes.
 pub(super) fn snapshot_over_full_table_refusal(
     fqtn: &str,
@@ -695,13 +704,7 @@ fn prepare_load(
             ))
         })?;
         if let Some(other) = conflicting_source_ident(&mine, &prior) {
-            anyhow::bail!(
-                "target table `{target_fqtn}` was last loaded from `{other}` and this load \
-                 carries `{mine}` — loading would REPLACE the other source's rows, and both \
-                 commands would report success. Name a different `dataset:`/table for this \
-                 source, or load them into one table deliberately by giving them one export \
-                 name and one prefix."
-            );
+            anyhow::bail!("{}", source_conflict_refusal(target_fqtn, other, &mine));
         }
     }
     let manifests: Vec<_> = new.iter().map(|(_, m)| m.clone()).collect();
@@ -1145,6 +1148,13 @@ fn load_one_cdc_base(
             // Rows this cycle landed, per leg then the buffer; summed for the ledger.
             let mut landed: Vec<u64> = Vec::new();
             let mut report: Option<load::CdcLoadReport> = None;
+            let (baseline, superseded) = load::reconcile::latest_baseline_generation(baseline)?;
+            for id in &superseded {
+                eprintln!(
+                    "  note: baseline run {id} is superseded by a newer baseline — recorded as \
+                     loaded, its files are not read"
+                );
+            }
             if let [_, ..] = baseline.as_slice() {
                 let uris = load::reconcile::select_load_uris(store, &plan.gcs_prefix, &baseline)?;
                 let manifests: Vec<_> = baseline.iter().map(|(_, m)| m.clone()).collect();
@@ -1173,7 +1183,11 @@ fn load_one_cdc_base(
                     r.rows_loaded,
                     baseline.len()
                 );
-                let ids: Vec<String> = baseline.iter().map(|(_, m)| m.run_id.clone()).collect();
+                let ids: Vec<String> = baseline
+                    .iter()
+                    .map(|(_, m)| m.run_id.clone())
+                    .chain(superseded)
+                    .collect();
                 legs.landed(&ids, r.rows_loaded);
                 landed.push(r.rows_loaded);
             }
@@ -2303,6 +2317,24 @@ mod load_ledger_tests {
         );
     }
 
+    #[test]
+    fn a_same_load_id_skip_or_refusal_does_not_disown_the_table() {
+        for status in ["skip", "refused"] {
+            let s = StateStore::open_in_memory().unwrap();
+            ctx(&s, "L1").record_success(&["r1".into()], 5);
+            assert!(s.has_load_attempt(TARGET).unwrap());
+            if status == "skip" {
+                ctx(&s, "L1").record_skip();
+            } else {
+                ctx(&s, "L1").record(&[], 0, "refused");
+            }
+            assert!(
+                s.has_load_attempt(TARGET).unwrap(),
+                "a same-id {status} re-run must not disown the table"
+            );
+        }
+    }
+
     /// The load ENVELOPE, driven offline for the first time.
     ///
     /// `execute_load` used to build its own warehouse adapter, so nothing below the CLI
@@ -3217,6 +3249,31 @@ mod live_only_decisions {
         assert_eq!(late_runs_refusal("orders", &runs(vec![older]), None), None);
     }
 
+    #[test]
+    fn a_newer_run_the_pin_skipped_for_want_of_a_spec_is_not_refused_as_late() {
+        let mut r1 = success_manifest("r1", "p1.parquet");
+        r1.finished_at = "2026-08-21T00:00:30Z".into();
+        let r2 = success_manifest("r2", "p2.parquet"); // 00:01:00Z, recorded no spec
+        let mut r3 = success_manifest("r3", "p3.parquet");
+        r3.finished_at = "2026-08-21T00:01:00.250Z".into();
+        let newest_first = vec![
+            (r2.finished_at.clone(), "r2".to_string()),
+            (r1.finished_at.clone(), "r1".to_string()),
+        ];
+        let pin = crate::load::pin::listing_pin(&newest_first, "r1");
+        let keyed = |ms: Vec<crate::manifest::RunManifest>| {
+            ms.into_iter()
+                .map(|m| (m.run_id.clone(), m))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            late_runs_refusal("orders", &keyed(vec![r1, r2.clone()]), Some(&pin)),
+            None,
+            "r2 was listed by the pin and loads under r1's columns"
+        );
+        assert!(late_runs_refusal("orders", &keyed(vec![r2, r3]), Some(&pin)).is_some());
+    }
+
     /// The partition budget measures the files that land in the PARTITIONED
     /// target. Under base+buffer the stream's file goes into the buffer, which
     /// takes no partition — measuring it refused a load nothing would have
@@ -3834,6 +3891,21 @@ mod live_only_decisions {
             "an artifact written before the ledger recorded an identity reads as UNKNOWN and \
              must never block — an upgrade may not start refusing yesterday's loads"
         );
+    }
+
+    /// One prefix under one export name is refused by `ensure_single_source`, and
+    /// `dataset:` is a BigQuery-only key, so the refusal offers neither.
+    #[test]
+    fn the_cross_source_refusal_offers_only_a_remedy_the_product_accepts() {
+        let msg = source_conflict_refusal("d.orders", "postgres:public.orders", "mysql:app.orders");
+        assert!(
+            msg.ends_with(
+                "both commands would report success. Give this source its own target table."
+            ),
+            "{msg}"
+        );
+        assert!(!msg.contains("one export name and one prefix"), "{msg}");
+        assert!(!msg.contains("`dataset:`"), "{msg}");
     }
 
     /// A run still WRITING into the prefix stays retryable: its id is not

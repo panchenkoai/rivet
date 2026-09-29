@@ -189,11 +189,13 @@ impl StateStore {
     /// before its closing row left NO row, the table rivet had just created read as
     /// FOREIGN, and the refusal told the operator to drop their own data. The marker
     /// is replaced by the closing row on every path that survives, so it can only be
-    /// seen after a crash.
+    /// seen after a crash. A `loaded_source_run` row also counts: it is written only
+    /// on success and never deleted, so a same-`load_id` skip/refused row cannot erase it.
     pub fn has_load_attempt(&self, target_table: &str) -> Result<bool> {
         let sql = format!(
-            "SELECT COUNT(*) FROM load_run WHERE target_table = ?1 \
-             AND (status IN ('{}', '{}') OR (status = '{}' AND source_run_ids <> '[]'))",
+            "SELECT COUNT(*) FROM (SELECT 1 AS x FROM load_run WHERE target_table = ?1 \
+             AND (status IN ('{}', '{}') OR (status = '{}' AND source_run_ids <> '[]')) \
+             UNION ALL SELECT 1 AS x FROM loaded_source_run WHERE target_table = ?1) owned",
             LoadStatus::Failed.as_str(),
             LoadStatus::Writing.as_str(),
             LoadStatus::Success.as_str(),

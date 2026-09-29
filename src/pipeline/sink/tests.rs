@@ -1768,3 +1768,30 @@ fn write_sink_parts_returns_the_durable_parts_beside_a_later_failure() {
         "exactly the part that landed before the failure"
     );
 }
+
+#[test]
+fn a_cursor_column_that_matches_only_ignoring_case_is_refused() {
+    use crate::source::BatchSink;
+    let mut sink = ExportSink {
+        cursor_column: Some("updatedat".into()),
+        ..minimal_sink()
+    };
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "updatedAt",
+        DataType::Int64,
+        false,
+    )]));
+    let err = sink.on_schema(schema).unwrap_err();
+    assert!(
+        err.to_string().contains("Set `cursor_column: updatedAt`"),
+        "{err}"
+    );
+
+    let mut absent = ExportSink {
+        cursor_column: Some("updatedat".into()),
+        ..minimal_sink()
+    };
+    absent
+        .on_schema(Arc::new(Schema::empty()))
+        .expect("a zero-row empty schema still opens");
+}

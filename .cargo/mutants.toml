@@ -664,7 +664,7 @@ exclude_re = [
     # their body stubs are born MISSED for the documented reason above. Their
     # decisions are named predicates next door, each unit-tested: `is_baseline_leg`
     # (RED against the name-based classifier that overwrote the base with a delta),
-    # `buffer_uris`, `base_done_line`; `run_compacts` (load/compact.rs) decides through the loader's
+    # `buffer_uris`, `base_done_line`, `latest_baseline_generation` (load/reconcile.rs); `run_compacts` (load/compact.rs) decides through the loader's
     # `compact_*_sql` builders (unit-tested) and `lease_busy_message`. Live:
     # tests/live/live_cdc_compact.rs (both cells) and the `warehouse_layout` gate cell.
     "replace load_one_cdc_base ->",

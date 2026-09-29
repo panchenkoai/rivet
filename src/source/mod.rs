@@ -839,7 +839,29 @@ pub(crate) fn host_is_loopback(url: &str) -> bool {
     // PostgreSQL) is loopback ONLY if EVERY host is: reading just the first host
     // let `127.0.0.1:5432,evil.com:5432` dial evil.com in plaintext under the
     // gate (bug-hunt find). Empty authority ⇒ not loopback (fail closed).
-    !host_port.is_empty() && host_port.split(',').all(one_host_is_loopback)
+    !host_port.is_empty()
+        && host_port.split(',').all(one_host_is_loopback)
+        && query_hosts(url).all(query_host_is_local)
+}
+
+/// The libpq `host=` / `hostaddr=` query values a driver dials besides the authority.
+fn query_hosts(url: &str) -> impl Iterator<Item = &str> {
+    let query = url.split_once('?').map_or("", |(_, q)| q);
+    let query = query.split('#').next().unwrap_or(query);
+    query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .filter(|(k, _)| matches!(*k, "host" | "hostaddr"))
+        .flat_map(|(_, v)| v.split(','))
+}
+
+/// A query host that stays on the box: a unix-socket path, or a loopback name/address.
+fn query_host_is_local(v: &str) -> bool {
+    v.starts_with('/')
+        || v.get(..3).is_some_and(|p| p.eq_ignore_ascii_case("%2f"))
+        || v.parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+        || one_host_is_loopback(v)
 }
 
 /// Loopback test for a single `host[:port]` (or bracketed `[ipv6][:port]`).
@@ -1183,6 +1205,25 @@ mod tls_gate_tests {
         assert!(require_tls_or_loopback(remote, Some(&disable)).is_ok());
         // Enforced TLS to a remote host → allowed (the connect path uses TLS).
         assert!(require_tls_or_loopback(remote, Some(&verify)).is_ok());
+    }
+
+    #[test]
+    fn a_query_host_or_hostaddr_cannot_route_a_loopback_url_off_the_box() {
+        for u in [
+            "postgresql://u:p@localhost:5432/db?hostaddr=203.0.113.5",
+            "postgresql://u:p@127.0.0.1/db?host=db.example.com",
+            "postgresql://u:p@localhost/db?sslmode=disable&host=localhost,db.example.com",
+        ] {
+            assert!(require_tls_or_loopback(u, None).is_err(), "{u}");
+        }
+        for u in [
+            "postgresql://u:p@localhost/db?hostaddr=127.0.0.1",
+            "postgresql://u:p@localhost/db?hostaddr=::1",
+            "postgresql://u:p@localhost/db?host=/var/run/postgresql",
+            "postgresql://u:p@localhost/db?host=%2Fvar%2Frun%2Fpostgresql",
+        ] {
+            assert!(require_tls_or_loopback(u, None).is_ok(), "{u}");
+        }
     }
 
     #[test]

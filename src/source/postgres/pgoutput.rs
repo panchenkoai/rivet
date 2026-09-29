@@ -388,13 +388,7 @@ pub(crate) fn value_from_binary(
         26 => V::Int(de::<u32>(&ty, raw, "oid")? as i64),
         // numeric: the batch reader's decoder, so both emit the same normalized text.
         1700 => V::Bytes(numeric_text(raw)?.into_bytes()),
-        1083 => {
-            use chrono::Timelike as _;
-            let t = de::<chrono::NaiveTime>(&ty, raw, "time")?;
-            V::TimeMicros(
-                t.num_seconds_from_midnight() as i64 * 1_000_000 + t.nanosecond() as i64 / 1_000,
-            )
-        }
+        1083 => V::TimeMicros(time_micros(de::<i64>(&Type::INT8, raw, "time")?)?),
         1186 => {
             let iv = de::<super::arrow_convert::PgInterval>(&ty, raw, "interval")?;
             V::Bytes(
@@ -427,6 +421,19 @@ pub(crate) fn value_from_binary(
             ty.name()
         ),
     })
+}
+
+/// Raw `time` microseconds, refusing 24:00:00 (a day-length value no time-of-day can hold).
+fn time_micros(us: i64) -> Result<i64> {
+    if !(0..86_400_000_000).contains(&us) {
+        crate::rivet_bail!(
+            crate::error::codes::SOURCE_CDC_CELL_UNSUPPORTED,
+            "pgoutput: a `time` of {us} microseconds is outside 00:00:00..24:00:00 \
+             (24:00:00 has no time-of-day reading); map it to a representable value \
+             in the source"
+        );
+    }
+    Ok(us)
 }
 
 fn array_of<T>(
@@ -1201,6 +1208,17 @@ mod tests {
         assert_eq!(
             value_from_binary(1083, &43_200_500_000i64.to_be_bytes()).unwrap(),
             V::TimeMicros(43_200_500_000)
+        );
+        assert_eq!(
+            value_from_binary(1083, &86_399_999_999i64.to_be_bytes()).unwrap(),
+            V::TimeMicros(86_399_999_999)
+        );
+        let err = value_from_binary(1083, &86_400_000_000i64.to_be_bytes())
+            .expect_err("24:00:00 must be refused, never wrapped to midnight");
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some("RIVET_SOURCE_CDC_CELL_UNSUPPORTED"),
+            "{err:#}"
         );
         assert_eq!(
             value_from_binary(26, &12345u32.to_be_bytes()).unwrap(),

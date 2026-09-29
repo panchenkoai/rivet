@@ -885,6 +885,22 @@ impl BatchSink for ExportSink {
             }
             _ => schema.clone(),
         };
+        if let Some(c) = &self.cursor_column
+            && schema.index_of(c).is_err()
+            && let Some(f) = schema
+                .fields()
+                .iter()
+                .find(|f| f.name().eq_ignore_ascii_case(c))
+        {
+            crate::rivet_bail!(
+                crate::error::codes::CONFIG_CURSOR_COLUMN_CASE,
+                "`cursor_column: {c}` is not in the result set, which names the column `{}` — the \
+                 cursor could never advance and every run would re-read the whole table. Set \
+                 `cursor_column: {}`.",
+                f.name(),
+                f.name()
+            );
+        }
         for name in &self.settle_columns {
             if let Ok(field) = schema.field_with_name(name)
                 && !matches!(

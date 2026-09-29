@@ -82,6 +82,32 @@ impl<'a> PgFromSql<'a> for PgUuidBytes {
     }
 }
 
+/// PostgreSQL `time` as raw microseconds since midnight, refusing `24:00:00`.
+///
+/// The driver's `NaiveTime` decode adds the wire micros to midnight with chrono's
+/// wrapping `Add`, so PostgreSQL's legal `24:00:00` came back as `00:00:00`.
+struct PgTimeMicros(i64);
+
+/// Microseconds in one day: Arrow/Parquet TIME holds `[0, MICROS_PER_DAY)`.
+const MICROS_PER_DAY: i64 = 86_400_000_000;
+
+impl<'a> PgFromSql<'a> for PgTimeMicros {
+    fn accepts(ty: &Type) -> bool {
+        ty == &Type::TIME
+    }
+
+    fn from_sql(
+        _ty: &Type,
+        raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        let us = i64::from_be_bytes(raw.try_into()?);
+        if !(0..MICROS_PER_DAY).contains(&us) {
+            return Err(format!("time of {us} microseconds is outside 00:00..24:00").into());
+        }
+        Ok(Self(us))
+    }
+}
+
 /// PostgreSQL `json` / `jsonb` cells borrowed as their raw source text.
 ///
 /// The wire payload already IS the JSON text: `json_send` transmits the
@@ -119,8 +145,9 @@ impl<'a> PgFromSql<'a> for PgJsonRawText<'a> {
     }
 }
 
-/// A PostgreSQL date/timestamp the Arrow type cannot hold — `infinity` and
-/// `-infinity`, PostgreSQL's standard "never expires" / "since forever" sentinels.
+/// A PostgreSQL date/time/timestamp the Arrow type cannot hold — `infinity` and
+/// `-infinity`, PostgreSQL's standard "never expires" / "since forever" sentinels,
+/// or a `time` of `24:00:00`.
 ///
 /// `Row::get` PANICS rather than returning `Err` when the driver cannot deserialize
 /// a column, and `chrono` has no representation for the sentinel — so a table with
@@ -131,17 +158,22 @@ impl<'a> PgFromSql<'a> for PgJsonRawText<'a> {
 /// every count and checksum fold would then agree about losing.
 ///
 /// So: `try_get`, and a loud error that names the column and what to do.
-fn unrepresentable_temporal(col: &str, kind: &str) -> anyhow::Error {
-    anyhow::anyhow!(
-        "postgres: column `{col}` holds a {kind} value Arrow cannot represent — \
+fn unrepresentable_temporal(col: &str, kind: &str, cause: impl std::fmt::Display) -> anyhow::Error {
+    let msg = format!(
+        "postgres: column `{col}` holds a {kind} value Arrow cannot represent ({cause}) — \
          almost certainly PostgreSQL's `infinity` or `-infinity` sentinel, which has \
-         no instant to map to. rivet refuses rather than writing NULL, because a NULL \
+         no instant to map to, or a time of `24:00:00`, which Arrow's TIME range \
+         [00:00, 24:00) excludes. rivet refuses rather than writing NULL, because a NULL \
          here is indistinguishable from a genuinely absent value and every count and \
          checksum would agree about the loss. Project the column through a `query:` \
          that maps the sentinels to a real bound (e.g. \
          `CASE WHEN {col} = 'infinity' THEN '9999-12-31' ELSE {col} END`), or exclude \
          the column."
-    )
+    );
+    anyhow::Error::new(crate::error::CodedError::new(
+        crate::error::codes::SOURCE_VALUE_UNREPRESENTABLE,
+        msg,
+    ))
 }
 
 fn pg_numeric_optional_utf8_string(row: &Row, col_idx: usize) -> Result<Option<String>> {
@@ -506,27 +538,38 @@ impl crate::source::value_checksum::CellSource for PgCellSource<'_> {
         self.rows[row].get::<_, Option<f64>>(col)
     }
     fn decimal128(&self, col: usize, row: usize, scale: i8) -> Option<i128> {
-        let wire = self.rows[row]
-            .try_get::<_, Option<PgNumericWire<'_>>>(col)
-            .ok()
-            .flatten()?;
+        let Ok(wire) = self.rows[row].try_get::<_, Option<PgNumericWire<'_>>>(col) else {
+            let PgDecimalFallback(t) = self.rows[row]
+                .try_get::<_, Option<PgDecimalFallback>>(col)
+                .ok()
+                .flatten()?;
+            return crate::types::decimal::decimal_str_to_scaled_i128(&t, scale);
+        };
+        let wire = wire?;
         let bd = crate::source::pg_numeric_wire::wire_to_big_decimal(wire.0)?;
         let scaled = bd.with_scale_round(scale as i64, bigdecimal::RoundingMode::Down);
         bigdecimal::num_traits::ToPrimitive::to_i128(&scaled.into_bigint_and_exponent().0)
     }
     fn date32(&self, col: usize, row: usize) -> Option<i32> {
-        let d = self.rows[row].get::<_, Option<chrono::NaiveDate>>(col)?;
+        let d = self.rows[row]
+            .try_get::<_, Option<chrono::NaiveDate>>(col)
+            .ok()
+            .flatten()?;
         let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch valid");
         Some((d - epoch).num_days() as i32)
     }
     fn ts_micros(&self, col: usize, row: usize) -> Option<i64> {
         if self.columns[col].1 == Type::TIMESTAMPTZ {
             self.rows[row]
-                .get::<_, Option<chrono::DateTime<chrono::Utc>>>(col)
+                .try_get::<_, Option<chrono::DateTime<chrono::Utc>>>(col)
+                .ok()
+                .flatten()
                 .map(|ts| ts.timestamp_micros())
         } else {
             self.rows[row]
-                .get::<_, Option<chrono::NaiveDateTime>>(col)
+                .try_get::<_, Option<chrono::NaiveDateTime>>(col)
+                .ok()
+                .flatten()
                 .map(|ts| ts.and_utc().timestamp_micros())
         }
     }
@@ -580,9 +623,7 @@ impl crate::source::value_checksum::CellSource for PgCellSource<'_> {
             .try_get::<_, Option<chrono::NaiveTime>>(col)
             .ok()
             .flatten()
-            .map(|t| {
-                t.num_seconds_from_midnight() as i64 * 1_000_000 + t.nanosecond() as i64 / 1_000
-            })
+            .map(naive_time_to_micros)
     }
     fn fixed_binary(&self, col: usize, row: usize) -> Option<Cow<'_, [u8]>> {
         match self.rows[row].try_get::<_, Option<PgUuidBytes>>(col) {
@@ -733,7 +774,7 @@ fn build_array(
             for row in rows {
                 match row
                     .try_get::<_, Option<chrono::NaiveDate>>(col_idx)
-                    .map_err(|_| unrepresentable_temporal(column, "DATE"))?
+                    .map_err(|e| unrepresentable_temporal(column, "DATE", e))?
                 {
                     Some(d) => {
                         let epoch =
@@ -748,8 +789,11 @@ fn build_array(
         DataType::Time64(_) => {
             let mut b = Time64MicrosecondBuilder::with_capacity(rows.len());
             for row in rows {
-                match row.get::<_, Option<chrono::NaiveTime>>(col_idx) {
-                    Some(t) => b.append_value(naive_time_to_micros(t)),
+                match row
+                    .try_get::<_, Option<PgTimeMicros>>(col_idx)
+                    .map_err(|e| unrepresentable_temporal(column, "TIME", e))?
+                {
+                    Some(PgTimeMicros(us)) => b.append_value(us),
                     None => b.append_null(),
                 }
             }
@@ -764,7 +808,7 @@ fn build_array(
                 for row in rows {
                     match row
                         .try_get::<_, Option<chrono::DateTime<chrono::Utc>>>(col_idx)
-                        .map_err(|_| unrepresentable_temporal(column, "TIMESTAMPTZ"))?
+                        .map_err(|e| unrepresentable_temporal(column, "TIMESTAMPTZ", e))?
                     {
                         Some(ts) => b.append_value(ts.timestamp_micros()),
                         None => b.append_null(),
@@ -772,7 +816,10 @@ fn build_array(
                 }
             } else {
                 for row in rows {
-                    match row.get::<_, Option<chrono::NaiveDateTime>>(col_idx) {
+                    match row
+                        .try_get::<_, Option<chrono::NaiveDateTime>>(col_idx)
+                        .map_err(|e| unrepresentable_temporal(column, "TIMESTAMP", e))?
+                    {
                         Some(ts) => b.append_value(ts.and_utc().timestamp_micros()),
                         None => b.append_null(),
                     }
@@ -1047,14 +1094,42 @@ fn pg_numeric_optional_plain(row: &Row, col_idx: usize) -> Result<Option<String>
             )),
         },
         Ok(None) => Ok(None),
-        Err(_) => {
-            // Fallback for unconventional cast-to-text callers.
-            if let Ok(Some(s)) = row.try_get::<_, Option<String>>(col_idx) {
-                let t = s.trim();
-                return Ok((!t.is_empty()).then(|| t.to_string()));
+        Err(_) => match row.try_get::<_, Option<PgDecimalFallback>>(col_idx) {
+            Ok(v) => Ok(v.and_then(|PgDecimalFallback(t)| (!t.is_empty()).then_some(t))),
+            Err(_) => {
+                let c = &row.columns()[col_idx];
+                crate::rivet_bail!(
+                    crate::error::codes::SOURCE_OVERRIDE_WIRE_MISMATCH,
+                    "postgres: column `{}` is declared decimal by a `columns:` override but \
+                     PostgreSQL sends it as {} — rivet does not convert it, and writing it as \
+                     NULL would lose every value. Remove the override, or CAST the column to \
+                     numeric in the export's `query:`.",
+                    c.name(),
+                    c.type_()
+                )
             }
-            Ok(None)
-        }
+        },
+    }
+}
+
+/// A non-`numeric` cell read under a `decimal` override: an integer or text, as plain text.
+struct PgDecimalFallback(String);
+
+impl<'a> PgFromSql<'a> for PgDecimalFallback {
+    fn accepts(ty: &Type) -> bool {
+        matches!(*ty, Type::INT2 | Type::INT4 | Type::INT8) || <&str as PgFromSql>::accepts(ty)
+    }
+
+    fn from_sql(
+        ty: &Type,
+        raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        Ok(Self(match *ty {
+            Type::INT2 => i16::from_sql(ty, raw)?.to_string(),
+            Type::INT4 => i32::from_sql(ty, raw)?.to_string(),
+            Type::INT8 => i64::from_sql(ty, raw)?.to_string(),
+            _ => <&str as PgFromSql>::from_sql(ty, raw)?.trim().to_string(),
+        }))
     }
 }
 
@@ -1155,6 +1230,97 @@ mod interval_render_tests {
         // which "P2Y" expresses correctly. (The "T0S" fallback fires only when
         // NOTHING was written, i.e. the string is still bare "P".)
         assert_eq!(pg_interval_to_iso8601(24, 0, 0), "P2Y");
+    }
+}
+
+#[cfg(test)]
+mod decimal_override_tests {
+    use super::PgDecimalFallback;
+    use postgres::types::{FromSql, Type};
+
+    /// A `decimal` override on a PG integer column reads the integer exactly.
+    ///
+    /// Before, only text fell back, so an INT2/INT4/INT8 cell under a decimal
+    /// override matched nothing and became NULL — the whole column, exit 0, both
+    /// checksum sides agreeing. Wire bytes are hand-built big-endian integers.
+    #[test]
+    fn an_integer_column_under_a_decimal_override_reads_its_value() {
+        for ty in [
+            Type::INT2,
+            Type::INT4,
+            Type::INT8,
+            Type::TEXT,
+            Type::VARCHAR,
+        ] {
+            assert!(PgDecimalFallback::accepts(&ty), "{ty}");
+        }
+        let v = |ty: &Type, raw: &[u8]| PgDecimalFallback::from_sql(ty, raw).unwrap().0;
+        assert_eq!(v(&Type::INT2, &(-7i16).to_be_bytes()), "-7");
+        assert_eq!(v(&Type::INT4, &123_456i32.to_be_bytes()), "123456");
+        assert_eq!(
+            v(&Type::INT8, &i64::MAX.to_be_bytes()),
+            "9223372036854775807"
+        );
+        assert_eq!(v(&Type::TEXT, b" 12.50 "), "12.50");
+    }
+
+    /// A wire type rivet does not convert (float, bool) is refused, never nulled.
+    #[test]
+    fn a_float_column_under_a_decimal_override_is_not_accepted() {
+        for ty in [Type::FLOAT4, Type::FLOAT8, Type::BOOL, Type::DATE] {
+            assert!(!PgDecimalFallback::accepts(&ty), "{ty}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod temporal_refusal_tests {
+    use super::{MICROS_PER_DAY, PgTimeMicros};
+    use postgres::types::{FromSql, Type};
+
+    /// PostgreSQL's legal `time '24:00:00'` is refused, not wrapped to midnight.
+    ///
+    /// The wire value is hand-built from the protocol (i64 big-endian micros since
+    /// midnight), independent of any rivet encoder. The driver's own `NaiveTime`
+    /// decode is pinned beside it: it returns 00:00:00 for the same bytes, which is
+    /// the silent 24h error the batch path used to write.
+    #[test]
+    fn a_time_of_24_00_is_refused_not_wrapped_to_midnight() {
+        let raw = 86_400_000_000i64.to_be_bytes();
+        let wrapped = <chrono::NaiveTime as FromSql>::from_sql(&Type::TIME, &raw).unwrap();
+        assert_eq!(
+            wrapped,
+            chrono::NaiveTime::MIN,
+            "driver wraps 24:00 to midnight"
+        );
+        assert!(PgTimeMicros::from_sql(&Type::TIME, &raw).is_err());
+        assert!(PgTimeMicros::from_sql(&Type::TIME, &(-1i64).to_be_bytes()).is_err());
+        let last = MICROS_PER_DAY - 1;
+        let got = PgTimeMicros::from_sql(&Type::TIME, &last.to_be_bytes()).unwrap();
+        assert_eq!(got.0, 86_399_999_999);
+        let got = PgTimeMicros::from_sql(&Type::TIME, &3_723_456_789i64.to_be_bytes()).unwrap();
+        assert_eq!(got.0, 3_723_456_789);
+    }
+
+    /// No temporal column is read with the PANICKING `Row::get`.
+    ///
+    /// `get` turns a decode error (`infinity` on a plain `timestamp`, which chrono
+    /// cannot hold) into a process panic, exit 101, with no summary or ledger
+    /// finalize; `try_get` lets the export refuse with a coded error. A `Row` cannot
+    /// be built offline, so this reads the product source itself.
+    #[test]
+    fn no_temporal_column_is_read_with_panicking_get() {
+        let src = include_str!("arrow_convert.rs");
+        let product = &src[..src.find("#[cfg(test)]").unwrap()];
+        for needle in [
+            [".get::<_, Option<", "chrono::"].concat(),
+            [".get::<_, Option<", "PgTimeMicros"].concat(),
+        ] {
+            assert!(
+                !product.contains(&needle),
+                "a temporal read goes through Row::get, which panics on `infinity`: {needle}"
+            );
+        }
     }
 }
 

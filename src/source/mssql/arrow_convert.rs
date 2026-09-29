@@ -424,12 +424,12 @@ fn build_array(
         DataType::Binary => {
             let mut b = BinaryBuilder::new();
             for row in rows {
-                match cell(row, idx) {
-                    Some(ColumnData::Binary(Some(bytes))) => {
+                match binary_cell(cell(row, idx), column)? {
+                    Some(bytes) => {
                         value_within_ceiling(column, bytes.len(), max_value_bytes)?;
-                        b.append_value(bytes.as_ref());
+                        b.append_value(bytes);
                     }
-                    _ => b.append_null(),
+                    None => b.append_null(),
                 }
             }
             Arc::new(b.finish())
@@ -437,9 +437,9 @@ fn build_array(
         DataType::FixedSizeBinary(16) => {
             let mut b = FixedSizeBinaryBuilder::with_capacity(rows.len(), 16);
             for row in rows {
-                match cell(row, idx) {
-                    Some(ColumnData::Guid(Some(g))) => b.append_value(g.as_bytes())?,
-                    _ => b.append_null(),
+                match uuid_cell(cell(row, idx), column)? {
+                    Some(bytes) => b.append_value(bytes)?,
+                    None => b.append_null(),
                 }
             }
             Arc::new(b.finish())
@@ -448,22 +448,11 @@ fn build_array(
             let scale = (*s).max(0) as u8;
             let mut b = Decimal128Builder::with_capacity(rows.len()).with_data_type(target.clone());
             for (r, row) in rows.iter().enumerate() {
-                match cell(row, idx) {
-                    Some(ColumnData::Numeric(Some(n))) => b.append_value(
-                        rescale_i128(n.value(), n.scale(), scale)
-                            .with_context(|| format!("mssql decimal column {idx} row {r}"))?,
-                    ),
-                    // MONEY / SMALLMONEY: tiberius delivers the fixed-point
-                    // 1/10000 value as F64, so the value was silently NULLed
-                    // here. Render at the column's declared scale and parse the
-                    // digits exactly — a non-finite OR beyond-2^53 value fails
-                    // LOUDLY (round-2 #18), so every MONEY rivet stores is exactly
-                    // representable and the `Exact` fidelity label stays honest.
-                    Some(ColumnData::F64(Some(v))) => b.append_value(
-                        f64_to_scaled_i128(*v, scale)
-                            .with_context(|| format!("mssql money column {idx} row {r}"))?,
-                    ),
-                    _ => b.append_null(),
+                match decimal_cell(cell(row, idx), scale, column)
+                    .with_context(|| format!("mssql decimal column {idx} row {r}"))?
+                {
+                    Some(v) => b.append_value(v),
+                    None => b.append_null(),
                 }
             }
             Arc::new(b.finish())
@@ -550,6 +539,66 @@ fn build_array(
         other => anyhow::bail!("mssql: no array builder for Arrow type {other:?} (column {idx})"),
     };
     Ok(arr)
+}
+
+/// A valued cell whose wire type a `columns:` override declared as something rivet does not convert.
+fn override_mismatch(column: &str, declared: &str, other: &ColumnData<'_>) -> anyhow::Error {
+    anyhow::Error::new(crate::error::CodedError::new(
+        crate::error::codes::SOURCE_OVERRIDE_WIRE_MISMATCH,
+        format!(
+            "column `{column}` is declared {declared} by a `columns:` override but SQL Server \
+             sends it as {} — rivet does not convert it, and writing it as NULL would lose \
+             every value. Remove the override, or CAST the column to that type in the \
+             export's `query:`.",
+            cell_type_name(other)
+        ),
+    ))
+}
+
+/// A `Decimal128(_, scale)` cell: numeric rescaled, MONEY exact, an integer scaled; any other value refused.
+fn decimal_cell(c: Option<&ColumnData<'_>>, scale: u8, column: &str) -> Result<Option<i128>> {
+    let int = |v: i128| rescale_i128(v, 0, scale).map(Some);
+    match c {
+        Some(ColumnData::Numeric(Some(n))) => rescale_i128(n.value(), n.scale(), scale).map(Some),
+        // MONEY / SMALLMONEY: tiberius delivers the fixed-point 1/10000 value as
+        // F64; a non-finite OR beyond-2^53 value fails loudly (round-2 #18).
+        Some(ColumnData::F64(Some(v))) => f64_to_scaled_i128(*v, scale).map(Some),
+        Some(ColumnData::U8(Some(v))) => int(i128::from(*v)),
+        Some(ColumnData::I16(Some(v))) => int(i128::from(*v)),
+        Some(ColumnData::I32(Some(v))) => int(i128::from(*v)),
+        Some(ColumnData::I64(Some(v))) => int(i128::from(*v)),
+        Some(other) if !is_null_cell(other) => Err(override_mismatch(column, "decimal", other)),
+        _ => Ok(None),
+    }
+}
+
+/// A `uuid` cell: a GUID, or uuid text from a char/nvarchar column; any other value refused.
+fn uuid_cell(c: Option<&ColumnData<'_>>, column: &str) -> Result<Option<[u8; 16]>> {
+    match c {
+        Some(ColumnData::Guid(Some(g))) => Ok(Some(*g.as_bytes())),
+        Some(ColumnData::String(Some(s))) => match uuid::Uuid::parse_str(s.trim()) {
+            Ok(u) => Ok(Some(*u.as_bytes())),
+            Err(e) => Err(anyhow::Error::new(crate::error::CodedError::new(
+                crate::error::codes::SOURCE_OVERRIDE_WIRE_MISMATCH,
+                format!(
+                    "column `{column}` is declared uuid by a `columns:` override but holds \
+                     {s:?}, which is not a uuid ({e}) — rivet refuses rather than writing NULL. \
+                     Fix the value, or remove the override."
+                ),
+            ))),
+        },
+        Some(other) if !is_null_cell(other) => Err(override_mismatch(column, "uuid", other)),
+        _ => Ok(None),
+    }
+}
+
+/// A `bytes` cell: binary as-is; any other value refused.
+fn binary_cell<'a>(c: Option<&'a ColumnData<'_>>, column: &str) -> Result<Option<&'a [u8]>> {
+    match c {
+        Some(ColumnData::Binary(Some(bytes))) => Ok(Some(bytes.as_ref())),
+        Some(other) if !is_null_cell(other) => Err(override_mismatch(column, "bytes", other)),
+        _ => Ok(None),
+    }
 }
 
 /// An f64-delivered fixed-point value (MONEY/SMALLMONEY) as the unscaled i128
@@ -704,6 +753,7 @@ impl crate::source::value_checksum::CellSource for MssqlCellSource<'_> {
     fn decimal128(&self, col: usize, row: usize, scale: i8) -> Option<i128> {
         use bigdecimal::{BigDecimal, RoundingMode, num_bigint::BigInt, num_traits::ToPrimitive};
         let target_scale = scale.max(0) as i64;
+        let int = |v: i128| v.checked_mul(10i128.pow(target_scale as u32));
         match cell(&self.rows[row], col) {
             Some(ColumnData::Numeric(Some(n))) => {
                 BigDecimal::new(BigInt::from(n.value()), n.scale() as i64)
@@ -715,6 +765,10 @@ impl crate::source::value_checksum::CellSource for MssqlCellSource<'_> {
             // MONEY / SMALLMONEY arrive as F64 — fold the SAME scaled value the
             // Arrow build writes, or the checksum flags a false mismatch.
             Some(ColumnData::F64(Some(v))) => f64_to_scaled_i128(*v, scale.max(0) as u8).ok(),
+            Some(ColumnData::U8(Some(v))) => int(i128::from(*v)),
+            Some(ColumnData::I16(Some(v))) => int(i128::from(*v)),
+            Some(ColumnData::I32(Some(v))) => int(i128::from(*v)),
+            Some(ColumnData::I64(Some(v))) => int(i128::from(*v)),
             _ => None,
         }
     }
@@ -758,6 +812,9 @@ impl crate::source::value_checksum::CellSource for MssqlCellSource<'_> {
     fn fixed_binary(&self, col: usize, row: usize) -> Option<Cow<'_, [u8]>> {
         match cell(&self.rows[row], col) {
             Some(ColumnData::Guid(Some(g))) => Some(Cow::Owned(g.as_bytes().to_vec())),
+            Some(ColumnData::String(Some(s))) => uuid::Uuid::parse_str(s.trim())
+                .ok()
+                .map(|u| Cow::Owned(u.as_bytes().to_vec())),
             _ => None,
         }
     }
@@ -779,6 +836,71 @@ impl crate::source::value_checksum::CellSource for MssqlCellSource<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `decimal` override on an integer column scales the integer exactly.
+    ///
+    /// Before, the Decimal128 arm matched only Numeric and MONEY's F64, so a
+    /// bigint/int under `columns: {id: "decimal(38,0)"}` fell to `append_null`:
+    /// the whole column NULL, exit 0, both checksum sides agreeing.
+    #[test]
+    fn an_integer_column_under_a_decimal_override_is_scaled_not_nulled() {
+        let d = |c: ColumnData<'static>, s: u8| decimal_cell(Some(&c), s, "v").unwrap();
+        assert_eq!(d(ColumnData::I64(Some(1)), 0), Some(1));
+        assert_eq!(d(ColumnData::I32(Some(7)), 2), Some(700));
+        assert_eq!(d(ColumnData::I16(Some(-3)), 1), Some(-30));
+        assert_eq!(d(ColumnData::U8(Some(255)), 0), Some(255));
+        assert_eq!(d(ColumnData::I64(None), 2), None);
+        assert_eq!(decimal_cell(None, 2, "v").unwrap(), None);
+    }
+
+    /// A valued cell the decimal, uuid or bytes arm cannot convert is refused with the coded error.
+    #[test]
+    fn a_valued_cell_of_an_unconvertible_type_is_refused_not_nulled() {
+        let bit = ColumnData::Bit(Some(true));
+        for err in [
+            decimal_cell(Some(&bit), 0, "v").unwrap_err(),
+            uuid_cell(Some(&bit), "v").map(|_| ()).unwrap_err(),
+            binary_cell(Some(&ColumnData::I32(Some(1))), "v")
+                .map(|_| ())
+                .unwrap_err(),
+        ] {
+            let coded = err
+                .downcast_ref::<crate::error::CodedError>()
+                .expect("coded");
+            assert_eq!(coded.code(), "RIVET_SOURCE_OVERRIDE_WIRE_MISMATCH");
+            assert!(err.to_string().contains("column `v` is declared"), "{err}");
+        }
+        assert!(
+            uuid_cell(Some(&ColumnData::String(None)), "v")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            binary_cell(Some(&ColumnData::Binary(None)), "v")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// A `uuid` override on an nvarchar(36) column parses the text; a non-uuid is refused.
+    #[test]
+    fn a_uuid_override_on_text_parses_it_and_refuses_garbage() {
+        let text = ColumnData::String(Some("6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b".into()));
+        assert_eq!(
+            uuid_cell(Some(&text), "u").unwrap(),
+            Some([
+                0x6f, 0x1c, 0x2a, 0x3b, 0x4d, 0x5e, 0x4f, 0x60, 0x8a, 0x7b, 0x9c, 0x0d, 0x1e, 0x2f,
+                0x3a, 0x4b
+            ])
+        );
+        let bad = ColumnData::String(Some("not-a-uuid".into()));
+        let err = uuid_cell(Some(&bad), "u").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("\"not-a-uuid\", which is not a uuid"),
+            "{err}"
+        );
+    }
 
     #[test]
     fn only_a_null_cell_is_null_whatever_its_wire_type() {

@@ -166,8 +166,8 @@ pub(crate) fn row_image_verdict(rows: &[String]) -> crate::source::cdc::RowImage
 ///   * `@start <= @from < @min` — the position was inside the instance's lifetime
 ///     and the cleanup job removed it. That IS loss, and the THROW is right.
 ///
-/// Without the first case the anchor wedged a brand-new export permanently, and
-/// KNOWN GAP, measured and deliberately left in place — see the decision below.
+/// Without the first case the anchor wedged a brand-new export permanently. But
+/// the server's LSNs alone cannot draw that line:
 ///
 /// The floor `IF @from < @start SET @from = @min` rescues a brand-new export
 /// whose anchor had been pinned at the DATABASE-wide
@@ -183,24 +183,13 @@ pub(crate) fn row_image_verdict(rows: &[String]) -> crate::source::cdc::RowImage
 /// skipping every change in between. That is the thing its own message promises
 /// not to do.
 ///
-/// Half of it is fixed at the cause: `pin_checkpoint_at_instance_start` now
-/// anchors at the INSTANCE's watermark (its `start_lsn` while the capture job has
-/// not published a `min_lsn` yet) instead of the database max, so a FRESH export
-/// no longer lands below its own instance and no longer needs rescuing.
-///
-/// The floor stays because a checkpoint written by an EARLIER rivet was pinned at
-/// the database max and can still sit below `@min` — and from LSNs alone the two
-/// causes are indistinguishable once `start_lsn` moves: "the instance is newer
-/// than this position" (floor is right, THROW would wedge the export) and "the
-/// cleanup job purged past this position" (THROW is right, floor silently skips).
-///
-/// The discriminator does not exist on the server; it exists in rivet. A
-/// checkpoint is either a PIN (written by `ensure_anchor` before anything was
-/// captured) or a RESUME position (written after a flush). Recording which — an
-/// optional field, so old files still load — lets the poll floor a pin and throw
-/// on a resume. What legacy checkpoints without the field should default to is a
-/// real decision with a cost either way (a false alarm that wedges an export, or
-/// a silent skip), which is why this is documented rather than guessed.
+/// Fresh anchors are still pinned at the database max (`pin_checkpoint_at_max_lsn`),
+/// so the floor is needed for EVERY pin, fresh or legacy — and only for pins. From
+/// LSNs alone "the instance is newer than this position" (floor is right) and "the
+/// cleanup job purged past it" (THROW is right) are indistinguishable once
+/// `start_lsn` moves; rivet tells them apart by the checkpoint's `pinned` flag
+/// (`from_is_pin`, cleared by `advance_cursor` on the first real read). A resume
+/// position, or a legacy checkpoint without the field, takes the THROW.
 /// What one poll needs to know. A parameter object rather than five positional
 /// arguments, because four of them are `&str`/`Option`/`bool` in a row and the
 /// call site said nothing: `fill_sql(ci, expr, 500, None, false)` gives a reader
@@ -448,8 +437,8 @@ pub(crate) fn resume_from_checkpoint(
                 format!(
                     "checkpoint '{path}' parses as JSON but carries no 'lsn' — refusing to treat \
                      it as absent, which would re-read and re-deliver the ENTIRE retained change \
-                     table from fn_cdc_get_min_lsn under a successful exit. Restore the file, or \
-                     delete it to accept a fresh anchor."
+                     table from fn_cdc_get_min_lsn under a successful exit. Restore the file, or: {}",
+                    crate::source::cdc::checkpoint_identity::RECOVER
                 ),
             )
         })?
@@ -807,7 +796,7 @@ impl MssqlChangeStream {
                         .and_then(|r| r.get::<&str, _>(0).map(|s| s.to_string())),
                 )
             })?;
-            let max = max.map(|s| s.trim_start_matches("0x").to_string());
+            let max = max.map(|s| s.trim_start_matches("0x").to_ascii_lowercase());
             // The value is inlined into `0x{hex}` in every poll — hold it to the
             // same charset gate as the resume LSN, even though the server made it.
             if let Some(hex) = &max
@@ -1179,6 +1168,16 @@ impl ChangeStream for MssqlChangeStream {
         with_identity(position, self.identity.as_ref())
     }
 
+    fn drained_frontier(&self) -> Option<crate::source::cdc::Position> {
+        drained_frontier(
+            self.exhausted,
+            self.from_is_pin,
+            self.bound.as_deref(),
+            self.from_lsn.as_deref(),
+        )
+        .map(|lsn| Position(json!({ "lsn": lsn })))
+    }
+
     fn next_change(&mut self) -> Option<Result<ChangeEvent>> {
         // Refill a bounded batch whenever the buffer drains, advancing the cursor
         // each time, until a poll returns nothing (window drained to the max LSN).
@@ -1201,6 +1200,17 @@ impl ChangeStream for MssqlChangeStream {
         }
         None
     }
+}
+
+/// The open-time bound a drained bounded run may checkpoint at, when it is past a resumed cursor.
+fn drained_frontier(
+    exhausted: bool,
+    from_is_pin: bool,
+    bound: Option<&str>,
+    from: Option<&str>,
+) -> Option<String> {
+    let (b, f) = (bound?.to_ascii_lowercase(), from?.to_ascii_lowercase());
+    (exhausted && !from_is_pin && b.len() == f.len() && b > f).then_some(b)
 }
 
 /// Does the in-memory head's group continue onto the spilled tail?
@@ -1431,12 +1441,68 @@ fn probe_max_lsn(probe: &crate::source::mssql::MssqlCdcProbe) -> Option<String> 
     probe.max_lsn_hex.as_deref().map(|s| {
         s.trim_start_matches("0x")
             .trim_start_matches("0X")
-            .to_string()
+            .to_ascii_lowercase()
     })
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_a_drained_resumed_cursor_below_the_bound_yields_a_frontier() {
+        use super::drained_frontier as f;
+        assert_eq!(
+            f(true, false, Some("00FF"), Some("0010")),
+            Some("00ff".into())
+        );
+        assert_eq!(
+            f(false, false, Some("00ff"), Some("0010")),
+            None,
+            "not drained"
+        );
+        assert_eq!(
+            f(true, true, Some("00ff"), Some("0010")),
+            None,
+            "a pin keeps its floor"
+        );
+        assert_eq!(f(true, false, None, Some("0010")), None, "daemon: no bound");
+        assert_eq!(f(true, false, Some("00ff"), None), None, "no cursor");
+        assert_eq!(
+            f(true, false, Some("00ff"), Some("00ff")),
+            None,
+            "already there"
+        );
+        assert_eq!(
+            f(true, false, Some("0010"), Some("00ff")),
+            None,
+            "never backwards"
+        );
+        assert_eq!(
+            f(true, false, Some("0fff"), Some("ff")),
+            None,
+            "unequal widths"
+        );
+    }
+
+    #[test]
+    fn the_pinned_anchor_uses_the_event_lsn_case_so_warehouse_views_rank_it_right() {
+        let probe = crate::source::mssql::MssqlCdcProbe {
+            cdc_enabled: true,
+            max_lsn_hex: Some("0x0000002D000000D80194".into()),
+            instance_min_lsn: None,
+            agent_running: None,
+        };
+        let anchor = super::probe_max_lsn(&probe).unwrap();
+        assert_eq!(
+            anchor,
+            super::hex(&[0, 0, 0, 0x2d, 0, 0, 0, 0xd8, 0x01, 0x94])
+        );
+        let older_event = super::hex(&[0, 0, 0, 0x2a, 0, 0, 0x01, 0xa8, 0, 0x04]);
+        assert!(
+            anchor > older_event,
+            "BigQuery/Snowflake order __pos.lsn as a string: {anchor} vs {older_event}"
+        );
+    }
+
     /// The three outcomes of a `cdc.change_tables` lookup, kept apart.
     ///
     /// The middle one is why this is a unit test: an orphaned capture instance (row
@@ -1575,6 +1641,13 @@ mod tests {
                 err.contains("lsn") && err.contains("/tmp/c.ckpt"),
                 "the refusal must name the key AND the file, or an operator cannot act on \
                  it: {err}"
+            );
+            assert!(
+                err.ends_with(&format!(
+                    "Restore the file, or: {}",
+                    crate::source::cdc::checkpoint_identity::RECOVER
+                )),
+                "the remedy must be anchor FIRST, then re-snapshot: {err}"
             );
         }
     }

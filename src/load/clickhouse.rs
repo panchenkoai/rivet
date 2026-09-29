@@ -357,7 +357,11 @@ impl TargetLoader for ClickhouseLoader {
             return Err(super::refused(format!(
                 "`{}` is a table from an earlier whole-table load; a ClickHouse CDC change log is \
                  a ReplacingMergeTree, which a table cannot become in place (ADR-0035 CH11). \
-                 Drop or rename `{}` and re-run — nothing was changed",
+                 Drop or rename `{}` and re-run — nothing was changed. The change log holds only \
+                 changes from the stream's anchor on: to keep serving the table's existing rows, \
+                 also set `cdc.initial: snapshot` (or a `cdc.backfill:`) and `rivet run` again \
+                 before the load — the stream is already anchored, so the snapshot overlaps it \
+                 and no change falls between them",
                 TargetLoader::fqtn(self, table),
                 TargetLoader::fqtn(self, table)
             )));
@@ -1166,6 +1170,13 @@ mod tests {
             .adopt_as_changelog("t")
             .expect_err("a CDC log cannot adopt a table");
         assert!(err.is::<crate::load::Refused>(), "{err:#}");
+        assert!(
+            format!("{err:#}").contains(
+                "also set `cdc.initial: snapshot` (or a `cdc.backfill:`) and `rivet run` again \
+                 before the load — the stream is already anchored"
+            ),
+            "{err:#}"
+        );
         plan.mode = crate::load::plan::LoadMode::Incremental;
         let inc = crate::load::build_loader(&plan, "run");
         let err = inc

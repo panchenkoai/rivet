@@ -275,19 +275,35 @@ pub(crate) fn column_xxh3_with(arr: &dyn Array, key: Option<&dyn Array>, fold: F
             // Keyed: stream `key ‖ value` so the swap-resistant hash needs no
             // concat alloc; same hash value as one-shot over the concatenation.
             Some(k) => {
-                let d = with_cell_bytes(k, r, |kb| {
+                let keyed = |kb: &[u8]| {
                     with_cell_bytes(arr, r, |vb| {
                         let mut h = Xxh3::new();
                         h.update(kb);
                         h.update(vb);
                         h.digest()
                     })
-                });
+                };
+                let d = match null_key_width(k, r) {
+                    Some(w) => keyed(&vec![0u8; w]),
+                    None => with_cell_bytes(k, r, keyed),
+                };
                 acc = fold.combine(acc, d);
             }
         }
     }
     acc
+}
+
+/// Byte width of a NULL fixed-width key cell, hashed as zeros (the writer's `append_null` slot), since a Parquet re-read leaves stale values there.
+fn null_key_width(k: &dyn Array, r: usize) -> Option<usize> {
+    if !k.is_null(r) {
+        return None;
+    }
+    match k.data_type() {
+        DataType::Boolean => Some(1),
+        DataType::FixedSizeBinary(n) => usize::try_from(*n).ok(),
+        dt => dt.primitive_width(),
+    }
 }
 
 /// Whether this Arrow type participates in the value checksum (both sides hash
@@ -1662,6 +1678,48 @@ mod tests {
                 checksum: v.to_string(),
             })
             .collect()
+    }
+
+    #[test]
+    fn keyed_form_b_validates_leading_null_keys_after_a_parquet_reread() {
+        use arrow::array::TimestampMicrosecondArray;
+        let s: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new(
+                "key",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                true,
+            ),
+            Field::new("id", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            s,
+            vec![
+                Arc::new(TimestampMicrosecondArray::from(vec![
+                    None,
+                    None,
+                    Some(5),
+                    Some(9),
+                ])),
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
+            ],
+        )
+        .unwrap();
+        let recorded: Vec<crate::manifest::ColumnChecksum> = arrow_batch_checksums_keyed(&batch, 0)
+            .iter()
+            .zip(batch.schema().fields())
+            .map(|(v, f)| crate::manifest::ColumnChecksum {
+                name: f.name().clone(),
+                checksum: v.to_string(),
+            })
+            .collect();
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("part.parquet");
+        write_parquet(&batch, &p);
+        let verdict = validate_recorded_checksums(&recorded, &[p], Some("key"), Fold::Sum).unwrap();
+        assert_eq!(
+            verdict, None,
+            "healthy data with NULL keys first must validate clean"
+        );
     }
 
     #[test]

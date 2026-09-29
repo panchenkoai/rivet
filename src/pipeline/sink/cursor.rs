@@ -116,8 +116,8 @@ fn extract_cursor_value_at(
         DataType::Float32 => Some(
             array
                 .as_any()
-                .downcast_ref::<Float32Array>()?
-                .value(last_row)
+                .downcast_ref::<Float32Array>()
+                .map(|a| f64::from(a.value(last_row)))?
                 .to_string(),
         ),
         DataType::Float64 => Some(
@@ -265,6 +265,21 @@ mod tests {
         assert_eq!(
             extract_last_cursor_value(&batch, "id", &schema),
             Some("12345678901234567890123".into())
+        );
+    }
+
+    #[test]
+    fn cursor_float32_renders_the_exact_widened_value() {
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Float32, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Float32Array::from(vec![0.05f32, 0.1f32]))],
+        )
+        .unwrap();
+        assert_eq!(
+            extract_last_cursor_value(&batch, "k", &schema),
+            Some("0.10000000149011612".into()),
+            "MySQL compares FLOAT with a string as DOUBLE; the bound must equal the widened row"
         );
     }
 

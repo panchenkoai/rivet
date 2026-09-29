@@ -1125,10 +1125,12 @@ fn a_failed_chunk_must_fail_the_run_not_ship_a_short_export() {
 /// its own test for the reason this repo keeps re-learning: a guard wired into
 /// one runner says nothing about the others.
 ///
-/// Here TWO guards stand between a partial export and a green `_SUCCESS`: the
-/// collected worker errors, and the chunk-completion count behind it. Disabling
-/// BOTH left 56 live tests green — chunked-recovery, the since-removed chunked-dense,
-/// cli-flags and crash-soak — while a run missing a whole chunk reported success.
+/// For a failed CHUNK the chunk-completion count is the only guard: a chunk
+/// error is no longer a collected worker error (a re-claimed chunk that later
+/// completes must let the run succeed), so the ledger alone decides. When it was
+/// backed by the worker-error bail, disabling BOTH left 56 live tests green —
+/// chunked-recovery, the since-removed chunked-dense, cli-flags and crash-soak —
+/// while a run missing a whole chunk reported success.
 ///
 /// So this injects an ERROR instead (`RIVET_TEST_ERROR_AT=chunk_export:1`): the
 /// chunk returns, the loop completes, and the guard is the only thing that can
@@ -1183,8 +1185,8 @@ fn a_failed_chunk_must_fail_the_parallel_run_not_ship_a_short_export() {
     assert!(
         !run.status.success(),
         "a run that recorded only {committed} chunk part(s) of a 3-chunk export reported \
-         SUCCESS — the worker-error and chunk-completion guards are the only things that \
-         notice a failed chunk, and neither did; stderr:\n{stderr}"
+         SUCCESS — the chunk-completion guard is the only thing that notices a failed \
+         chunk, and it did not; stderr:\n{stderr}"
     );
     assert!(
         !out.path().join("_SUCCESS").exists(),

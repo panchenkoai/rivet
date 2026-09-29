@@ -888,3 +888,98 @@ fn mssql_check_reports_a_row_estimate_for_a_read_only_login() {
         "{said}"
     );
 }
+
+/// Asserts integer columns under `decimal` overrides land with their values (1 and 7.00), not NULL.
+fn assert_int_decimals_delivered(rig: &Rig) {
+    let said = rig.run_ok_capture();
+    let dir = rig.out_dir();
+    assert_eq!(duckdb_declared_dir_scalar(&dir, "count(v)"), 1, "{said}");
+    assert_eq!(
+        duckdb_declared_dir_scalar(&dir, "CAST(sum(v) AS BIGINT)"),
+        1
+    );
+    assert_eq!(
+        duckdb_declared_dir_scalar(&dir, "CAST(sum(w) * 100 AS BIGINT)"),
+        700
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres + duckdb"]
+fn pg_batch_decimal_override_on_an_integer_column_keeps_its_values() {
+    let rig = Rig::pg_batch(&unique_name("aud_pgdec"))
+        .query("SELECT 1::int8 AS v, 7::int4 AS w")
+        .export_line("columns:")
+        .export_line("  v: \"decimal(20,0)\"")
+        .export_line("  w: \"decimal(10,2)\"");
+    assert_int_decimals_delivered(&rig);
+    let said = Rig::pg_batch(&unique_name("aud_pgdecf"))
+        .query("SELECT 1 AS id, 1.5::float8 AS f")
+        .export_line("columns:")
+        .export_line("  f: \"decimal(10,2)\"")
+        .run_expect_fail();
+    assert!(said.contains("column `f` is declared decimal"), "{said}");
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql + duckdb"]
+fn mssql_batch_decimal_and_uuid_overrides_on_other_wire_types_keep_their_values() {
+    let rig = Rig::mssql_batch(&unique_name("aud_msdec"))
+        .query("SELECT CAST(1 AS bigint) AS v, CAST(7 AS int) AS w")
+        .export_line("columns:")
+        .export_line("  v: \"decimal(38,0)\"")
+        .export_line("  w: \"decimal(10,2)\"");
+    assert_int_decimals_delivered(&rig);
+    let rig = Rig::mssql_batch(&unique_name("aud_msuuid"))
+        .query("SELECT 1 AS id, CAST('6F1C2A3B-4D5E-4F60-8A7B-9C0D1E2F3A4B' AS nvarchar(36)) AS u")
+        .export_line("columns:")
+        .export_line("  u: uuid");
+    let said = rig.run_ok_capture();
+    assert_eq!(
+        duckdb_declared_dir_scalar(&rig.out_dir(), "count(u)"),
+        1,
+        "a uuid override on nvarchar(36) must keep the value: {said}"
+    );
+}
+
+/// A PostgreSQL value rivet cannot hold faithfully fails the run with the coded
+/// refusal naming the column — never a panic (exit 101), never a silent value.
+fn pg_value_refused(label: &str, select: &str, column: &str) {
+    let rig = Rig::pg_batch(&unique_name(label)).query(select);
+    let out = rig.run();
+    let said = said(&out);
+    assert_ne!(
+        out.status.code(),
+        Some(101),
+        "panicked instead of refusing: {said}"
+    );
+    assert!(
+        !out.status.success(),
+        "a value rivet cannot hold exported: {said}"
+    );
+    assert!(
+        said.contains(&format!("column `{column}` holds a")) && said.contains("cannot represent"),
+        "{said}"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn pg_batch_time_24_00_is_refused_not_written_as_midnight() {
+    pg_value_refused("aud_t24", "SELECT 1 AS id, '24:00:00'::time AS t", "t");
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn pg_batch_plain_timestamp_infinity_is_refused_not_a_panic() {
+    pg_value_refused(
+        "aud_tsinf",
+        "SELECT 1 AS id, 'infinity'::timestamp AS v",
+        "v",
+    );
+    pg_value_refused(
+        "aud_tsninf",
+        "SELECT 1 AS id, '-infinity'::timestamp AS v",
+        "v",
+    );
+}

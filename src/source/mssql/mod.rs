@@ -1237,6 +1237,47 @@ fn scalar_to_string(row: &tiberius::Row) -> Option<String> {
     }
 }
 
+/// SQL for the CHAR(31)-joined single-column, NOT NULL, non-decimal UNIQUE keys of `schema.table`, PK first.
+pub(crate) fn keyset_keys_sql(schema: &str, table: &str) -> String {
+    format!(
+        "SELECT STRING_AGG(CONVERT(nvarchar(max), col), CHAR(31)) WITHIN GROUP (ORDER BY is_pk DESC, col) FROM ( \
+           SELECT col, MAX(is_pk) AS is_pk FROM ( \
+             SELECT MIN(c.name) AS col, MAX(CONVERT(int, i.is_primary_key)) AS is_pk \
+             FROM sys.indexes i \
+             JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.key_ordinal > 0 \
+             JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id \
+             JOIN sys.types kt ON kt.user_type_id = c.user_type_id \
+             JOIN sys.objects o ON o.object_id = i.object_id \
+             JOIN sys.schemas s ON s.schema_id = o.schema_id \
+             WHERE i.is_unique = 1 AND i.has_filter = 0 AND i.is_disabled = 0 \
+               AND s.name = N'{}' AND o.name = N'{}' \
+             GROUP BY i.object_id, i.index_id \
+             HAVING COUNT(*) = 1 AND MAX(CONVERT(int, c.is_nullable)) = 0 \
+               AND MAX(CASE WHEN kt.name IN ('decimal', 'numeric') THEN 1 ELSE 0 END) = 0 \
+           ) per_index GROUP BY col \
+         ) deduped",
+        schema.replace('\'', "''"),
+        table.replace('\'', "''")
+    )
+}
+
+/// SQL for the column of `schema.table`'s primary key when that key is exactly one integer-family column.
+pub(crate) fn single_int_pk_sql(schema: &str, table: &str) -> String {
+    format!(
+        "SELECT MIN(c.name) FROM sys.indexes i \
+         JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.key_ordinal > 0 \
+         JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id \
+         JOIN sys.types t ON t.user_type_id = c.user_type_id \
+         JOIN sys.objects o ON o.object_id = i.object_id \
+         JOIN sys.schemas s ON s.schema_id = o.schema_id \
+         WHERE i.is_primary_key = 1 AND s.name = N'{}' AND o.name = N'{}' \
+         GROUP BY i.object_id, i.index_id \
+         HAVING COUNT(*) = 1 AND MIN(t.name) IN ('tinyint', 'smallint', 'int', 'bigint')",
+        schema.replace('\'', "''"),
+        table.replace('\'', "''")
+    )
+}
+
 /// Probe `sys.*` for the stats chunked-mode planning needs (ADR-0015 seam).
 fn introspect_mssql_on(src: &mut MssqlSource, qualified_table: &str) -> Result<TableIntrospection> {
     let (schema, table) = match qualified_table.split_once('.') {
@@ -1259,48 +1300,7 @@ fn introspect_mssql_on(src: &mut MssqlSource, qualified_table: &str) -> Result<T
         .and_then(|s| s.parse::<i64>().ok())
         .unwrap_or(0);
 
-    // Single-column integer PK → range chunking. `sys.indexes (is_primary_key)`
-    // + one `index_columns` row + an integer base type.
-    let pk_sql = format!(
-        "SELECT TOP 1 c.name, t.name FROM sys.indexes i \
-         JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id \
-         JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id \
-         JOIN sys.types t ON t.user_type_id = c.user_type_id \
-         JOIN sys.objects o ON o.object_id = i.object_id \
-         JOIN sys.schemas s ON s.schema_id = o.schema_id \
-         WHERE i.is_primary_key = 1 AND s.name = N'{}' AND o.name = N'{}' \
-         GROUP BY c.name, t.name HAVING COUNT(*) = 1",
-        schema.replace('\'', "''"),
-        table.replace('\'', "''")
-    );
-    // Keyset keys (OPT-4) — parity with `postgres/mod.rs:314-340`: every
-    // single-column, NOT NULL, UNIQUE index (the PK *plus* any unique
-    // constraint/index), PK-first and de-duplicated, not just the PK. SQL
-    // Server: `sys.indexes.is_unique = 1`, exactly one key column
-    // (`ic.key_ordinal > 0` + `HAVING COUNT(*) = 1`), and the column is NOT NULL
-    // — so `ORDER BY key LIMIT n` is an index range scan and `WHERE key > last`
-    // never skips dup keys. Aggregated with a `CHAR(31)` (unit-separator)
-    // delimiter because the introspection seam only exposes `query_scalar`; that
-    // byte cannot appear in a real identifier, so the split is unambiguous.
-    let keyset_sql = format!(
-        "SELECT STRING_AGG(CONVERT(nvarchar(max), col), CHAR(31)) WITHIN GROUP (ORDER BY is_pk DESC, col) FROM ( \
-           SELECT col, MAX(is_pk) AS is_pk FROM ( \
-             SELECT MIN(c.name) AS col, MAX(CONVERT(int, i.is_primary_key)) AS is_pk \
-             FROM sys.indexes i \
-             JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.key_ordinal > 0 \
-             JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id \
-             JOIN sys.types kt ON kt.user_type_id = c.user_type_id \
-             JOIN sys.objects o ON o.object_id = i.object_id \
-             JOIN sys.schemas s ON s.schema_id = o.schema_id \
-             WHERE i.is_unique = 1 AND i.has_filter = 0 AND i.is_disabled = 0 \
-               AND c.is_nullable = 0 AND s.name = N'{}' AND o.name = N'{}' \
-               AND kt.name NOT IN ('decimal', 'numeric') \
-             GROUP BY i.object_id, i.index_id HAVING COUNT(*) = 1 \
-           ) per_index GROUP BY col \
-         ) deduped",
-        schema.replace('\'', "''"),
-        table.replace('\'', "''")
-    );
+    let keyset_sql = keyset_keys_sql(&schema, &table);
     let keyset_keys: Vec<String> = src
         .query_scalar(&keyset_sql)?
         .map(|s| {
@@ -1311,28 +1311,8 @@ fn introspect_mssql_on(src: &mut MssqlSource, qualified_table: &str) -> Result<T
         })
         .unwrap_or_default();
 
-    // Single-column integer PK → range chunking. Its own probe (the keyset list
-    // above doesn't carry the type, and range-chunk eligibility needs it).
-    let mut single_int_pk = None;
-    if let Some(pk_col) = src.query_scalar(&pk_sql)? {
-        // The scalar query returns only the column name; re-probe the type to
-        // decide range-chunk eligibility.
-        let type_sql = format!(
-            "SELECT t.name FROM sys.columns c \
-             JOIN sys.types t ON t.user_type_id = c.user_type_id \
-             JOIN sys.objects o ON o.object_id = c.object_id \
-             JOIN sys.schemas s ON s.schema_id = o.schema_id \
-             WHERE s.name = N'{}' AND o.name = N'{}' AND c.name = N'{}'",
-            schema.replace('\'', "''"),
-            table.replace('\'', "''"),
-            pk_col.replace('\'', "''")
-        );
-        if let Some(ty) = src.query_scalar(&type_sql)?
-            && matches!(ty.as_str(), "tinyint" | "smallint" | "int" | "bigint")
-        {
-            single_int_pk = Some(pk_col);
-        }
-    }
+    // Single-column integer PK → range chunking.
+    let single_int_pk = src.query_scalar(&single_int_pk_sql(&schema, &table))?;
 
     // Integer-family columns — the safety set for an explicit `chunk_column`.
     // Same CHAR(31)-delimited STRING_AGG pattern as the keyset probe above.
@@ -1624,5 +1604,50 @@ mod tests {
         assert_eq!(catalog_decimal_to_params(0, 0), None);
         assert_eq!(catalog_decimal_to_params(39, 0), None);
         assert_eq!(catalog_decimal_to_params(10, 11), None);
+    }
+}
+
+#[cfg(test)]
+mod key_probe_sql_tests {
+    use super::{keyset_keys_sql, single_int_pk_sql};
+
+    /// The text between the per-index WHERE and its GROUP BY — the rows a HAVING COUNT(*) sees.
+    fn where_clause(sql: &str) -> &str {
+        let w = sql.find("WHERE i.").expect("WHERE");
+        let g = sql[w..].find("GROUP BY i.object_id").expect("GROUP BY") + w;
+        &sql[w..g]
+    }
+
+    /// H24: a composite UNIQUE(a NOT NULL, b NULL) must not surface `a` as a keyset key, so the
+    /// per-column filters live in HAVING where COUNT(*) still counts every key column.
+    #[test]
+    fn keyset_probe_counts_every_key_column_of_the_index() {
+        let sql = keyset_keys_sql("dbo", "orders");
+        let w = where_clause(&sql);
+        assert!(!w.contains("is_nullable"), "nullable filter in WHERE: {w}");
+        assert!(!w.contains("kt.name"), "type filter in WHERE: {w}");
+        assert!(
+            sql.contains(
+                "HAVING COUNT(*) = 1 AND MAX(CONVERT(int, c.is_nullable)) = 0 \
+                 AND MAX(CASE WHEN kt.name IN ('decimal', 'numeric') THEN 1 ELSE 0 END) = 0"
+            ),
+            "{sql}"
+        );
+    }
+
+    /// H25: a composite PK is one index with COUNT(*) = 2 — grouping per column made each part a
+    /// "single-column" PK and TOP 1 picked one arbitrarily.
+    #[test]
+    fn single_int_pk_probe_groups_per_index_not_per_column() {
+        let sql = single_int_pk_sql("dbo", "orders");
+        assert!(
+            sql.contains(
+                "GROUP BY i.object_id, i.index_id \
+                 HAVING COUNT(*) = 1 AND MIN(t.name) IN ('tinyint', 'smallint', 'int', 'bigint')"
+            ),
+            "{sql}"
+        );
+        assert!(!sql.contains("GROUP BY c.name"), "{sql}");
+        assert!(!sql.contains("TOP 1"), "{sql}");
     }
 }

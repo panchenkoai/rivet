@@ -194,13 +194,18 @@ fn interval_ym_iso(years: i32, months: i32) -> String {
     }
 }
 
+/// Oracle's signed year as chrono's proleptic one: Oracle has no year 0, so -1 (1 BC) is chrono 0.
+pub(super) fn chrono_year(oracle: i32) -> i32 {
+    if oracle.is_negative() {
+        oracle + 1
+    } else {
+        oracle
+    }
+}
+
 /// Microseconds since the Unix epoch for an Oracle timestamp's fields, read as UTC.
 pub(super) fn timestamp_micros(t: &OracleTimestamp) -> Result<i64> {
-    // Oracle has no year 0 (-1 is 1 BC); chrono's proleptic year 0 is 1 BC.
-    let year = match t.year() as i32 {
-        y if y.is_negative() => y + 1,
-        y => y,
-    };
+    let year = chrono_year(t.year() as i32);
     let date = chrono::NaiveDate::from_ymd_opt(year, t.month() as u32, t.day() as u32)
         .ok_or_else(|| anyhow::anyhow!("oracle: invalid date {t}"))?;
     let time = chrono::NaiveTime::from_hms_nano_opt(

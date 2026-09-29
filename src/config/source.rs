@@ -274,6 +274,7 @@ impl SourceConfig {
     /// Redaction rules:
     /// - `password` → always `None` (plaintext password never leaves the process).
     /// - `url` containing `user[:password]@` → userinfo segment replaced with `"REDACTED"`.
+    /// - `url` query secrets (`password=`, `*_token=`, …) → value replaced with `***`.
     /// - `url_env`, `url_file`, `password_env` — kept (env var **names** and file paths
     ///   are references, not secrets; `apply` needs them to re-resolve credentials).
     /// - `host`, `port`, `user`, `database` — kept (structured connection metadata).
@@ -298,6 +299,13 @@ impl SourceConfig {
             s.push_str(&raw[userinfo_end..]); // "@host:port/db…"
             out.url = Some(s);
             redacted = true;
+        }
+        if let Some(ref raw) = out.url {
+            let scrubbed = crate::redact::redact_query_secrets(raw);
+            if scrubbed != *raw {
+                out.url = Some(scrubbed);
+                redacted = true;
+            }
         }
 
         (out, redacted)
@@ -582,23 +590,19 @@ impl SourceType {
 fn find_userinfo(raw: &str) -> Option<(usize, usize)> {
     let scheme = raw.find("://")? + 3;
     let rest = &raw[scheme..];
-    // The userinfo `@` lives in the AUTHORITY, before the first `/ ? #` (a later
-    // `@` belongs to the path/query — e.g. `?filter=a@b` — and must NOT be treated
-    // as userinfo, or a credential-free URL is falsely redacted). Within the
-    // authority, take the LAST `@` (a password may contain `@`). This is correct
-    // for a well-formed URL; a RAW `/` in the password would make the URL
-    // ambiguous — which is why `build_url_from_fields` percent-encodes the userinfo
-    // (a `/` becomes `%2F`), so a Rivet-constructed URL never hits that case.
+    // The LAST `@` ends the userinfo when it sits in the authority or a `:` precedes
+    // it: a raw `${VAR}` password may hold `/ ? # @`. Only a `:`-free `@` past the
+    // authority (`host/db?filter=a@b`) is left in the path/query.
+    let at = rest.rfind('@')?;
     let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let at = rest[..authority_end].rfind('@')?;
-    Some((scheme + at, scheme))
+    (at < authority_end || rest[..at].contains(':')).then_some((scheme + at, scheme))
 }
 
 /// `engine://host:port/database` of `url`, credentials, query and fragment dropped.
 pub(crate) fn source_state_key(source_type: SourceType, url: &str) -> String {
     let rest = url.split_once("://").map_or(url, |(_, r)| r);
-    let rest = rest.split(['?', '#']).next().unwrap_or(rest);
-    let at_host = rest.rsplit_once('@').map_or(rest, |(_, h)| h);
+    let rest = find_userinfo(url).map_or(rest, |(at, _)| &url[at + 1..]);
+    let at_host = rest.split(['?', '#']).next().unwrap_or(rest);
     format!("{source_type:?}://{}", at_host.trim_end_matches('/')).to_lowercase()
 }
 
@@ -627,6 +631,15 @@ mod tests {
             k,
             source_state_key(SourceType::Postgres, "postgresql://u@db.host:5432/other")
         );
+    }
+
+    #[test]
+    fn a_raw_query_delimiter_in_the_password_does_not_merge_two_servers_into_one_scope() {
+        use super::{SourceType, source_state_key};
+        let a = source_state_key(SourceType::Postgres, "postgresql://app:k?9@h1:5432/a");
+        let b = source_state_key(SourceType::Postgres, "postgresql://app:k#9@h2:5432/b");
+        assert_eq!(a, "postgres://h1:5432/a");
+        assert_eq!(b, "postgres://h2:5432/b");
     }
 
     use super::*;
@@ -881,6 +894,27 @@ mod tests {
         let url = "postgresql://user:pass@host/db";
         let result = find_userinfo(url);
         assert!(result.is_some(), "should detect user:pass@");
+    }
+
+    #[test]
+    fn a_raw_delimiter_or_query_password_never_reaches_the_plan_artifact() {
+        for (url, secret) in [
+            ("postgresql://app:a/b@db.example.com:5432/prod", "a/b"),
+            ("postgresql://app:a?b@db.example.com:5432/prod", "a?b"),
+            ("postgresql://app:a#b@db.example.com:5432/prod", "a#b"),
+            (
+                "postgresql://db.example.com/prod?user=app&password=s3cret",
+                "s3cret",
+            ),
+        ] {
+            let mut src = make_source(SourceType::Postgres);
+            src.url = Some(url.into());
+            let (redacted, flag) = src.redact_for_artifact();
+            let out = redacted.url.unwrap();
+            assert!(flag, "{url} must be flagged");
+            assert!(!out.contains(secret), "{secret} leaked: {out}");
+            assert!(out.contains("db.example.com"), "host kept: {out}");
+        }
     }
 
     #[test]

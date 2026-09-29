@@ -45,6 +45,7 @@ pub use math::generate_chunks;
 pub(crate) use math::{build_chunk_query_sql, chunk_plan_fingerprint, strip_select_star_from};
 pub(in crate::pipeline) use parallel_checkpoint::run_chunked_parallel_checkpoint;
 pub(crate) use resume_m8::apply_m8_resume_decisions;
+use resume_m8::prune_superseded_attempts;
 pub(crate) use resume_m8::rehydrate_manifest_parts_probed;
 // `M8Stats` is intentionally not re-exported yet — Phase C-γ keeps it
 // internal until Phase C-δ surfaces it via summary.json.  Listed here

@@ -409,6 +409,34 @@ pub fn latest_full(keyed: Vec<(String, RunManifest)>) -> Vec<(String, RunManifes
     take_in_order(keyed, &picked)
 }
 
+/// [`latest_full`], refused unless the selection is ONE coherent split generation — the
+/// other half of the census's split classification, so the grouping and the coherence
+/// check read the SAME unit identity.
+fn latest_single_generation(
+    keyed: Vec<(String, RunManifest)>,
+) -> Result<Vec<(String, RunManifest)>> {
+    let sel = latest_full(keyed);
+    ensure_single_generation(&ManifestCensus::new(&sel).runs().iter().collect::<Vec<_>>())?;
+    Ok(sel)
+}
+
+/// Manifests keyed by their bucket key.
+pub type Keyed = Vec<(String, RunManifest)>;
+
+/// The baseline legs a base+buffer load writes (the newest generation, as a Full load
+/// picks it) and the run ids of the older legs that generation supersedes.
+pub fn latest_baseline_generation(
+    baseline: Vec<(String, RunManifest)>,
+) -> Result<(Keyed, Vec<String>)> {
+    let all: Vec<String> = baseline.iter().map(|(_, m)| m.run_id.clone()).collect();
+    let sel = latest_single_generation(baseline)?;
+    let superseded = all
+        .into_iter()
+        .filter(|id| sel.iter().all(|(_, m)| &m.run_id != id))
+        .collect();
+    Ok((sel, superseded))
+}
+
 /// Move the entries at `picked` out of `keyed`, in `picked`'s order — the census
 /// selects by INDEX into the caller's slice, so materialising it costs no clone.
 fn take_in_order(
@@ -460,14 +488,7 @@ pub fn select_runs(
         .filter(|(_, m)| m.status == ManifestStatus::Success)
         .collect();
     match mode {
-        crate::load::plan::LoadMode::Full => {
-            let sel = latest_full(keyed);
-            // ...and that selection must be ONE coherent split generation — the
-            // other half of the census's split classification, so the grouping
-            // above and the coherence check here read the SAME unit identity.
-            ensure_single_generation(&ManifestCensus::new(&sel).runs().iter().collect::<Vec<_>>())?;
-            Ok(sel)
-        }
+        crate::load::plan::LoadMode::Full => latest_single_generation(keyed),
         _ => Ok(keyed
             .into_iter()
             .filter(|(_, m)| !loaded.contains(&m.run_id))
@@ -1833,6 +1854,32 @@ mod tests {
         let sel = latest_full(keyed);
         assert_eq!(sel.len(), 1, "exactly one snapshot, never all");
         assert_eq!(sel[0].1.run_id, "r3", "the newest by finished_at");
+    }
+
+    /// Two unloaded baseline generations must not both overwrite the base (every key
+    /// twice); one generation made of split units still loads whole.
+    #[test]
+    fn a_base_load_writes_only_the_newest_baseline_generation() {
+        let (sel, superseded) = latest_baseline_generation(vec![
+            keyed_at("b1", "2026-01-01T00:00:00Z"),
+            keyed_at("b2", "2026-01-02T00:00:00Z"),
+        ])
+        .unwrap();
+        let picked: Vec<&str> = sel.iter().map(|(_, m)| m.run_id.as_str()).collect();
+        assert_eq!(picked, ["b2"]);
+        assert_eq!(superseded, ["b1"]);
+
+        let unit = |name: &str, run: &str| {
+            let mut m = manifest(run, 100, None);
+            m.export_name = name.into();
+            m.export_family = "orders".into();
+            (format!("orders/manifest-{run}.json"), m)
+        };
+        let (sel, superseded) =
+            latest_baseline_generation(vec![unit("orders#0", "u0"), unit("orders#1", "u1")])
+                .unwrap();
+        assert_eq!(sel.len(), 2, "every split unit of one generation loads");
+        assert!(superseded.is_empty());
     }
 
     #[test]

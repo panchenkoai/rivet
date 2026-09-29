@@ -445,7 +445,7 @@ pub(in crate::pipeline) fn run_chunked_parallel_checkpoint(
                                     crate::pipeline::retry::is_transient(&e),
                                 ),
                             );
-                            fan_r.fail(&format!("chunk {chunk_index}"), msg);
+                            log::error!("chunk {chunk_index} failed: {msg}");
                         }
                     }
                 }
@@ -485,18 +485,20 @@ pub(in crate::pipeline) fn run_chunked_parallel_checkpoint(
     drained?;
 
     let pending = state.count_chunk_tasks_not_completed(&run_id)?;
+    let tasks = state.list_chunk_tasks_for_run(&run_id)?;
     if pending > 0 {
         anyhow::bail!(
-            "export '{}': {} chunk task(s) not completed; `rivet run {} --export {} --resume` or inspect `rivet state chunks {} --export {}`",
-            plan.export_name,
-            pending,
-            config_hint(config_path),
-            plan.export_name,
-            config_hint(config_path),
-            plan.export_name
+            "{}",
+            incomplete_run_error(
+                &plan.export_name,
+                pending,
+                &tasks,
+                &config_hint(config_path)
+            )
         );
     }
 
+    super::prune_superseded_attempts(summary, &tasks);
     state.finalize_chunk_run_completed(&run_id)?;
     // ADR-0008 PG2 committed boundary via the shared finalize seam.
     super::super::run_store::RunStore::finalize(state, plan, summary)
@@ -507,6 +509,38 @@ pub(in crate::pipeline) fn run_chunked_parallel_checkpoint(
         plan.export_name
     );
     Ok(())
+}
+
+/// The refusal for a run that ended with chunks not completed, naming each failed chunk's last error.
+fn incomplete_run_error(
+    export: &str,
+    pending: i64,
+    tasks: &[crate::state::ChunkTaskInfo],
+    config_hint: &str,
+) -> String {
+    let remedy = format!(
+        "{pending} chunk task(s) not completed; `rivet run {config_hint} --export {export} --resume` \
+         or inspect `rivet state chunks {config_hint} --export {export}`"
+    );
+    let failed: Vec<String> = tasks
+        .iter()
+        .filter(|t| t.status == "failed")
+        .map(|t| {
+            format!(
+                "chunk {}: {}",
+                t.chunk_index,
+                t.last_error.as_deref().unwrap_or("(no error recorded)")
+            )
+        })
+        .collect();
+    if failed.is_empty() {
+        format!("export '{export}': {remedy}")
+    } else {
+        format!(
+            "export '{export}': parallel checkpoint worker errors:\n{}\n{remedy}",
+            failed.join("\n")
+        )
+    }
 }
 
 /// Write one `file_log` row per durable part on the worker's store (the drain records with no state).
@@ -529,5 +563,59 @@ fn record_durable_parts(
                 e
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::incomplete_run_error;
+    use crate::state::ChunkTaskInfo;
+
+    fn task(idx: i64, status: &str, err: Option<&str>) -> ChunkTaskInfo {
+        ChunkTaskInfo {
+            chunk_index: idx,
+            start_key: String::new(),
+            end_key: String::new(),
+            status: status.into(),
+            attempts: 4,
+            last_error: err.map(Into::into),
+            rows_written: None,
+            file_name: None,
+        }
+    }
+
+    /// A chunk error no longer fails the run by itself (the ledger decides, so a
+    /// re-claimed chunk that completes lets the run succeed); the not-completed refusal
+    /// must therefore carry each failed chunk's cause in the worker-errors shape the
+    /// summary and the error classifier read.
+    #[test]
+    fn the_incomplete_run_refusal_names_each_failed_chunks_cause() {
+        let tasks = [
+            task(0, "completed", None),
+            task(
+                3,
+                "failed",
+                Some("ERROR 3024 (HY000): maximum statement execution time exceeded"),
+            ),
+            task(5, "failed", None),
+        ];
+        assert_eq!(
+            incomplete_run_error("orders", 2, &tasks, "--config rivet.yaml"),
+            "export 'orders': parallel checkpoint worker errors:\n\
+             chunk 3: ERROR 3024 (HY000): maximum statement execution time exceeded\n\
+             chunk 5: (no error recorded)\n\
+             2 chunk task(s) not completed; `rivet run --config rivet.yaml --export orders --resume` \
+             or inspect `rivet state chunks --config rivet.yaml --export orders`"
+        );
+        assert_eq!(
+            incomplete_run_error(
+                "orders",
+                1,
+                &[task(0, "pending", None)],
+                "--config rivet.yaml"
+            ),
+            "export 'orders': 1 chunk task(s) not completed; `rivet run --config rivet.yaml \
+             --export orders --resume` or inspect `rivet state chunks --config rivet.yaml --export orders`"
+        );
     }
 }

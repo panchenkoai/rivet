@@ -37,6 +37,19 @@ pub(super) fn list_tables(client: &mut Client, schema: &str) -> Result<Vec<Strin
     Ok(rows.into_iter().map(|r| r.get::<_, String>(0)).collect())
 }
 
+/// Columns leading a valid, non-partial btree index — the only ones a range window can seek on.
+const LEADING_BTREE_KEY_SQL: &str = "SELECT a.attname
+     FROM pg_index i
+     JOIN pg_class ic ON ic.oid = i.indexrelid
+     JOIN pg_am am ON am.oid = ic.relam
+     JOIN pg_attribute a ON a.attrelid = i.indrelid
+         AND a.attnum = i.indkey[0]
+     WHERE i.indrelid = to_regclass(quote_ident($1) || '.' || quote_ident($2))
+       AND i.indrelid IS NOT NULL
+       AND am.amname = 'btree'
+       AND i.indisvalid AND i.indisready
+       AND i.indpred IS NULL";
+
 pub(super) fn introspect(client: &mut Client, schema: &str, table: &str) -> Result<TableInfo> {
     // Row estimate from pg_class (fast, no COUNT(*))
     let row_estimate: i64 = client
@@ -80,18 +93,7 @@ pub(super) fn introspect(client: &mut Client, schema: &str, table: &str) -> Resu
     let pk_cols: std::collections::HashSet<String> =
         pk_rows.iter().map(|r| r.get::<_, String>(0)).collect();
 
-    // Any indexed column (PK, unique, or secondary) — same shape as pk_rows
-    // minus `indisprimary`. Feeds ColumnInfo.is_indexed so the density probe
-    // (#199) samples only an indexed key, never an unindexed fallback.
-    let indexed_rows = client.query(
-        "SELECT a.attname
-         FROM pg_index i
-         JOIN pg_attribute a ON a.attrelid = i.indrelid
-             AND a.attnum = ANY(i.indkey)
-         WHERE i.indrelid = to_regclass(quote_ident($1) || '.' || quote_ident($2))
-           AND i.indrelid IS NOT NULL",
-        &[&schema, &table],
-    )?;
+    let indexed_rows = client.query(LEADING_BTREE_KEY_SQL, &[&schema, &table])?;
     let indexed_cols: std::collections::HashSet<String> =
         indexed_rows.iter().map(|r| r.get::<_, String>(0)).collect();
 
@@ -251,4 +253,21 @@ pub(super) fn density_probe(client: &mut Client, info: &mut super::TableInfo) {
         k: offsets.len(),
         w: PROBE_W,
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LEADING_BTREE_KEY_SQL;
+
+    /// H26: a non-leading, INCLUDE, hash/gin/brin, partial or invalid index position does not make a
+    /// column range-seekable, so init must not call it indexed (preflight's leading-btree rule).
+    #[test]
+    fn indexed_means_leading_key_of_a_valid_full_btree() {
+        let sql = LEADING_BTREE_KEY_SQL;
+        assert!(sql.contains("a.attnum = i.indkey[0]"), "{sql}");
+        assert!(!sql.contains("ANY(i.indkey)"), "{sql}");
+        assert!(sql.contains("am.amname = 'btree'"), "{sql}");
+        assert!(sql.contains("i.indisvalid AND i.indisready"), "{sql}");
+        assert!(sql.contains("i.indpred IS NULL"), "{sql}");
+    }
 }
