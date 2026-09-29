@@ -19,6 +19,7 @@
 //!   is exhaustively unit-tested in isolation (no live MySQL needed).
 
 mod arrow_convert;
+pub(crate) use arrow_convert::time_of_day_in_range;
 pub(crate) mod cdc;
 mod proxy;
 

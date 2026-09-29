@@ -9472,3 +9472,57 @@ fn cdc_drain_row_hash_matches_the_independent_implementation() {
         "positive control: the checker must have graded all four rows"
     );
 }
+
+/// A MySQL TIME outside one day fails the CDC run with the batch export's own refusal, and the checkpoint stays put.
+#[test]
+#[ignore = "live: requires docker compose mysql-cdc (binlog ROW + REPLICATION grant)"]
+fn mysql_cdc_time_outside_one_day_is_refused_like_batch_and_never_checkpointed() {
+    let tbl = unique_name("cdc_time_range");
+    let mut c = conn();
+    c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
+    c.query_drop(format!(
+        "CREATE TABLE {tbl} (id INT PRIMARY KEY, t TIME(6))"
+    ))
+    .unwrap();
+    let _t = Table(tbl.clone());
+
+    let rig = Rig::mysql_cdc(&tbl);
+    let ckpt = rig.checkpoint();
+    write_checkpoint(&mut c, &ckpt);
+    let anchored = std::fs::read(&ckpt).unwrap();
+    c.query_drop(format!(
+        "INSERT INTO {tbl} VALUES (1, '838:59:59'), (2, '-01:00:00')"
+    ))
+    .unwrap();
+
+    // The oracle for the wording is the batch export of the same rows.
+    let batch = Rig::mysql_batch(&tbl)
+        .source_url(MYSQL_CDC_URL)
+        .run_expect_fail();
+    let refusal = batch
+        .find("is outside 00:00..24:00")
+        .and_then(|i| {
+            batch[i..]
+                .find("CAST(col AS CHAR)")
+                .map(|j| &batch[i..i + j])
+        })
+        .unwrap_or_else(|| panic!("the batch export must refuse the fixture: {batch}"));
+    assert!(
+        batch.contains("RIVET_SOURCE_VALUE_UNREPRESENTABLE"),
+        "{batch}"
+    );
+
+    let err = rig.run_expect_fail();
+    assert!(
+        err.contains("RIVET_SOURCE_VALUE_UNREPRESENTABLE")
+            && err.contains("column 't'")
+            && err.contains("mysql: TIME 838:59:59.000000 ")
+            && err.contains(refusal),
+        "CDC must refuse with the batch's code and message, naming the column: {err}\nbatch: {batch}"
+    );
+    assert_eq!(
+        std::fs::read(&ckpt).unwrap(),
+        anchored,
+        "a refused flush must not advance the checkpoint past the rows"
+    );
+}
