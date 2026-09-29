@@ -2303,6 +2303,24 @@ mod load_ledger_tests {
         );
     }
 
+    #[test]
+    fn a_same_load_id_skip_or_refusal_does_not_disown_the_table() {
+        for status in ["skip", "refused"] {
+            let s = StateStore::open_in_memory().unwrap();
+            ctx(&s, "L1").record_success(&["r1".into()], 5);
+            assert!(s.has_load_attempt(TARGET).unwrap());
+            if status == "skip" {
+                ctx(&s, "L1").record_skip();
+            } else {
+                ctx(&s, "L1").record(&[], 0, "refused");
+            }
+            assert!(
+                s.has_load_attempt(TARGET).unwrap(),
+                "a same-id {status} re-run must not disown the table"
+            );
+        }
+    }
+
     /// The load ENVELOPE, driven offline for the first time.
     ///
     /// `execute_load` used to build its own warehouse adapter, so nothing below the CLI
