@@ -3235,6 +3235,31 @@ mod live_only_decisions {
         assert_eq!(late_runs_refusal("orders", &runs(vec![older]), None), None);
     }
 
+    #[test]
+    fn a_newer_run_the_pin_skipped_for_want_of_a_spec_is_not_refused_as_late() {
+        let mut r1 = success_manifest("r1", "p1.parquet");
+        r1.finished_at = "2026-08-21T00:00:30Z".into();
+        let r2 = success_manifest("r2", "p2.parquet"); // 00:01:00Z, recorded no spec
+        let mut r3 = success_manifest("r3", "p3.parquet");
+        r3.finished_at = "2026-08-21T00:01:00.250Z".into();
+        let newest_first = vec![
+            (r2.finished_at.clone(), "r2".to_string()),
+            (r1.finished_at.clone(), "r1".to_string()),
+        ];
+        let pin = crate::load::pin::listing_pin(&newest_first, "r1");
+        let keyed = |ms: Vec<crate::manifest::RunManifest>| {
+            ms.into_iter()
+                .map(|m| (m.run_id.clone(), m))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            late_runs_refusal("orders", &keyed(vec![r1, r2.clone()]), Some(&pin)),
+            None,
+            "r2 was listed by the pin and loads under r1's columns"
+        );
+        assert!(late_runs_refusal("orders", &keyed(vec![r2, r3]), Some(&pin)).is_some());
+    }
+
     /// The partition budget measures the files that land in the PARTITIONED
     /// target. Under base+buffer the stream's file goes into the buffer, which
     /// takes no partition — measuring it refused a load nothing would have

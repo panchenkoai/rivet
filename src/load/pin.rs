@@ -70,18 +70,18 @@ pub(super) fn pin_plan_to_its_run(
             b.1.cmp(&a.1)
         }
     });
-    let mut pinned: Option<(String, String, crate::state::LoadSpec)> = None;
+    let mut pinned: Option<(String, crate::state::LoadSpec)> = None;
     // Newer Success runs that recorded no spec (a crash after the manifest and
     // before the spec write; a drain that acked parts then failed) are typed from
     // the older pinned run — said so, since a column added between them is
     // exactly what the pin exists to type.
     let mut skipped: Vec<&str> = Vec::new();
-    for (finished_at, run_id) in &newest_first {
+    for (_, run_id) in &newest_first {
         // With the init-recorded key when the run recorded none (a `query:` export
         // has no key to read) — never with a key another run wrote by name.
         match s.load_spec_of_run_with_init_key(&plan.export_name, plan.unit.as_deref(), run_id) {
             Ok(Some(spec)) => {
-                pinned = Some((run_id.clone(), finished_at.clone(), spec));
+                pinned = Some((run_id.clone(), spec));
                 break;
             }
             Ok(None) => {
@@ -93,7 +93,7 @@ pub(super) fn pin_plan_to_its_run(
             }
         }
     }
-    let Some((run_id, finished_at, spec)) = pinned else {
+    let Some((run_id, spec)) = pinned else {
         return unpinned(&format!(
             "none of its {} loadable run(s) recorded a per-run spec (runs older than this \
              release, baseline legs only, a run that crashed after its manifest and before \
@@ -145,11 +145,20 @@ pub(super) fn pin_plan_to_its_run(
         )
     })?;
     retyped.refused()?;
-    retyped.pinned_run = Some((run_id, finished_at));
+    retyped.pinned_run = Some(listing_pin(&newest_first, &run_id));
     Ok(retyped)
 }
 
-/// Runs in this listing that finished AFTER the run the plan was typed from: a
+/// The pin `late_runs_refusal` checks: the pinned run id, bounded by the newest run the listing held.
+pub(super) fn listing_pin(newest_first: &[(String, String)], run_id: &str) -> (String, String) {
+    let newest = newest_first
+        .first()
+        .map(|(at, _)| at.clone())
+        .unwrap_or_default();
+    (run_id.to_string(), newest)
+}
+
+/// Runs in this listing that finished AFTER the newest run the pin listed: a
 /// run landing between the pin's listing and the load's would be loaded with an
 /// older spec's columns. Refused for this cycle; the next load pins it.
 pub(super) fn late_runs_refusal(

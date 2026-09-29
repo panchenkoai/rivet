@@ -250,8 +250,8 @@ pub struct LoadPlan {
     pub pk: Vec<String>,
     /// The clustering of the table the load writes.
     pub clustering: Clustering,
-    /// The run this plan was typed from — `(run_id, finished_at)` — once the load
-    /// pinned it; a run that finishes after it is refused for this cycle.
+    /// The run this plan was typed from and the newest `finished_at` the pin listed —
+    /// `(run_id, finished_at)`; a run that finishes after it is refused for this cycle.
     pub pinned_run: Option<(String, String)>,
     /// Where a CDC table's baseline lives (see [`CdcLayout`]); `LogAndView` for
     /// every non-CDC mode.
