@@ -8,8 +8,8 @@
 use super::*;
 use std::collections::BTreeSet;
 
-/// Manifest file names per graded directory (the out dir, then its `snapshot/` leg), taken before an invocation.
-pub(crate) type ManifestSnapshot = [(PathBuf, BTreeSet<String>); 2];
+/// Success manifest names in the destination and its `snapshot/` leg, taken before an invocation.
+pub(crate) type ManifestSnapshot = [BTreeSet<String>; 2];
 
 impl Rig {
     /// Opt this rig out of the default oracle; the reason is required and counted by an offline ceiling.
@@ -24,12 +24,38 @@ impl Rig {
 
     /// Snapshot the Success manifest names before a `run`, so the oracle can tell which ones this run wrote.
     pub(crate) fn oracle_before(&self) -> ManifestSnapshot {
-        let out = self.out_dir();
-        let snap = out.join("snapshot");
+        if self.oracle_off.is_some() || self.oracle_unreachable().is_some() {
+            return Default::default();
+        }
+        // A bucket the test has not created yet holds no manifest.
+        let Ok(out) =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.oracle_local_out()))
+        else {
+            return Default::default();
+        };
         [
-            (out.clone(), success_manifests(&out)),
-            (snap.clone(), success_manifests(&snap)),
+            success_manifests(&out),
+            success_manifests(&out.join("snapshot")),
         ]
+    }
+
+    /// The destination as a local directory: the out dir itself, or a MinIO prefix pulled whole (the same oracle then reads both).
+    fn oracle_local_out(&self) -> PathBuf {
+        match &self.cloud_dest {
+            Some(CloudDest::S3 { bucket, prefix, .. }) => {
+                let into = self
+                    .dir
+                    .path()
+                    .join(super::super::unique_name("oracle_pull"));
+                super::super::storage::minio_pull_prefix(
+                    bucket,
+                    &format!("{prefix}/{}/", self.name),
+                    &into,
+                );
+                into
+            }
+            _ => self.out_dir(),
+        }
     }
 
     /// Grade a successful `run` with the default oracle; panics with every disagreement it reports.
@@ -46,7 +72,9 @@ impl Rig {
             return oracle_log("SKIP", &self.name, &why);
         }
         let cdc = self.mode == "cdc";
-        let [(out, seen), (snap, seen_snap)] = before;
+        let [seen, seen_snap] = before;
+        let out = &self.oracle_local_out();
+        let snap = &out.join("snapshot");
         let (now, now_snap) = (success_manifests(out), success_manifests(snap));
         if now.is_subset(seen) && now_snap.is_subset(seen_snap) {
             return oracle_log("SKIP", &self.name, "the run wrote no new Success manifest");
@@ -144,8 +172,28 @@ impl Rig {
         if self.dest_stdout {
             return Some("stdout destination: nothing durable to read".into());
         }
-        if self.cloud_dest.is_some() {
-            return Some("cloud destination: not wired into the default oracle yet".into());
+        match &self.cloud_dest {
+            None => {}
+            Some(CloudDest::S3 { .. }) if self.mode == "cdc" => {
+                return Some(
+                    "CDC on MinIO: the pull flattens the prefix, and a CDC destination nests \
+                     sub-prefixes whose `_SUCCESS`/manifest names collide"
+                        .into(),
+                );
+            }
+            Some(CloudDest::S3 { .. }) => {}
+            Some(CloudDest::GcsLive { .. }) => {
+                return Some(
+                    "real GCS destination: not pulled by the default oracle (needs \
+                     RIVET_TEST_GCS_BUCKET and ambient gcloud credentials)"
+                        .into(),
+                );
+            }
+            Some(_) => {
+                return Some(
+                    "fake-gcs / azurite destination: no whole-prefix pull exists yet".into(),
+                );
+            }
         }
         if self.tables.len() > 1 {
             return Some("multi-table capture: one sub-prefix per table, not graded yet".into());
