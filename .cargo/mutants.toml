@@ -816,5 +816,7 @@ exclude_re = [
     # decode and `side_a`, are unit-tested in postgres/arrow_convert.rs.
     "replace pg_cell -> Result<Option<T>> with Ok\\(None\\)",
     "replace pg_int_cell -> Result<Option<T>> with Ok\\(None\\)",
-    "replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::int(16|32|64) -> Option<i(16|32|64)>",
+    "replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::int16 -> Option<i16>",
+    "replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::int32 -> Option<i32>",
+    "replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::int64 -> Option<i64>",
 ]
