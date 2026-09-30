@@ -814,4 +814,12 @@ exclude_re = [
     # the guard is what makes the branch equivalent, and it stays because `pairs`
     # is built one entry per captured table (2026-09-20).
     "replace \\+ with \\* in same_leaf_typed_pair",
+    # `override_case_fail_oracle` (preflight/oracle.rs) is glue: it reads the result schema
+    # from a live Oracle and hands it to the shared, unit-tested `refuse_override_case_miss`.
+    # Stubbed Ok, `check_refuses_a_column_override_key_in_the_wrong_case` goes red
+    # (RED-checked 2026-09-30).
+    "replace override_case_fail_oracle -> Result<\\(\\)> with Ok\\(\\(\\)\\)",
+    # Equivalent: `y < 0` and `y <= 0` differ only at year 0, which Oracle has no value for
+    # (its calendar goes from -1 to 1; ORA-01841), so no OracleTimestamp tells them apart.
+    "replace < with <= in timestamp_text",
 ]

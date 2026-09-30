@@ -1648,8 +1648,10 @@ jobs:
         # Skip the topologies this runner cannot hold and the cells that need a real
         # BigQuery (no credentials here): the SQL Server availability group (two
         # SQL Server containers + dev/mssql-ag/setup.sh), the PostgreSQL 16 standby
-        # pair (dev/pytools/cdc_stand), and the audit's BigQuery cells. The release
-        # gate runs every one of them (REPLICA_CELLS, verify_audit_suspects).
+        # pair (dev/pytools/cdc_stand), the second Oracle holding the WE8ISO8859P1
+        # LATIN1PDB (`oracle-latin1`), and the audit's BigQuery cells. The release
+        # gate runs every one of them (REPLICA_CELLS, verify_audit_suspects, the
+        # derived live-module cell).
         run: >-
           cargo test -- --ignored --skip content_export --skip validates --skip edge_cases
           --skip via_duckdb --skip mongo --skip warehouse_cell
@@ -1657,6 +1659,7 @@ jobs:
           --skip mssql_checkpoint_from_another_database --skip from_a_standby
           --skip loads_into_bigquery_or_refuses_by_column
           --skip cleanup_source_never_deletes_parts --skip compact_after_a_source_alter
+          --skip a_non_unicode_database_round_trips
 
       - name: Stop services
         if: always()
