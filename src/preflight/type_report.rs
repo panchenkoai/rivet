@@ -923,6 +923,7 @@ mod tests {
             fidelity: TypeFidelity::Exact,
             nullable: true,
             warnings: vec![],
+            delivery: crate::types::Delivery::Native,
         }
     }
 

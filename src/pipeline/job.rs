@@ -2855,6 +2855,7 @@ mod tests {
             fidelity: TypeFidelity::Exact,
             nullable: true,
             warnings: Vec::new(),
+            delivery: crate::types::Delivery::Native,
         };
         let mappings = [
             mapping("id", "bigint", RivetType::Int64),

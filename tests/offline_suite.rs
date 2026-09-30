@@ -130,6 +130,8 @@ mod state_compat;
 mod time_window;
 #[path = "offline/trust_artifacts_integration.rs"]
 mod trust_artifacts_integration;
+#[path = "offline/type_capability_matrix_guard.rs"]
+mod type_capability_matrix_guard;
 #[path = "offline/validate_historical.rs"]
 mod validate_historical;
 #[path = "offline/validate_regression.rs"]

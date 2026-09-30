@@ -1,0 +1,127 @@
+# Type capability ledger (ADR-0038 CP9).
+#
+# forms:   one entry per `TextForm` variant (src/types/delivery.rs), keyed by its label.
+#          renderer: the pure fn in src/types/delivery.rs, or `engine-produced`.
+#          recover:  the expression each warehouse runs on the text column `x` to get a
+#                    native column back; `text` means the column stays text there.
+# engines: every `SourceType` × mode (batch, cdc); rows (native type -> delivery) are
+#          filled per engine as it migrates to the column plan.
+#
+# Guarded by tests/offline/type_capability_matrix_guard.rs.
+
+forms:
+  decimal_plain:
+    renderer: decimal_plain
+    recover:
+      bigquery: CAST(x AS BIGNUMERIC)   # rounds past 38 fractional digits
+      snowflake: text                   # NUMBER stops at 38 digits
+      clickhouse: toDecimal256(x, S)    # no overflow check on arithmetic
+      duckdb: text                      # DECIMAL stops at 38 digits
+  iso8601_duration:
+    renderer: iso8601_duration
+    recover:
+      bigquery: CAST(x AS INTERVAL)
+      snowflake: text
+      clickhouse: text
+      duckdb: text
+  iso_timestamp_nanos:
+    renderer: iso_timestamp_nanos
+    recover:
+      bigquery: text                    # more than 6 fraction digits is an error
+      snowflake: CAST(x AS TIMESTAMP_NTZ(9))   # TIMESTAMP_TZ(9) when zoned
+      clickhouse: parseDateTime64BestEffort(x, 9)   # holds 1677..2262 only
+      duckdb: CAST(x AS TIMESTAMP_NS)
+  time_of_day_offset:
+    renderer: time_of_day_offset
+    recover:
+      bigquery: text
+      snowflake: text
+      clickhouse: text
+      duckdb: text                      # TIMETZ drops the offset
+  time_beyond_day:
+    renderer: time_beyond_day
+    recover:
+      bigquery: text
+      snowflake: text
+      clickhouse: text
+      duckdb: text
+  uuid36:
+    renderer: uuid36
+    recover:
+      bigquery: text                    # STRING is BigQuery's UUID
+      snowflake: TO_UUID(x)
+      clickhouse: toUUID(x)
+      duckdb: CAST(x AS UUID)
+  json:
+    renderer: engine-produced
+    recover:
+      bigquery: PARSE_JSON(x)
+      snowflake: PARSE_JSON(x)
+      clickhouse: CAST(x AS JSON)
+      duckdb: CAST(x AS JSON)
+  hex_wkb:
+    renderer: engine-produced
+    recover:
+      bigquery: ST_GEOGFROMWKB(x)
+      snowflake: TO_GEOMETRY(x)
+      clickhouse: readWKB*(unhex(x))    # one reader per geometry kind
+      duckdb: ST_GeomFromHEXWKB(x)
+  hex_bytes:
+    renderer: hex_bytes
+    recover:
+      bigquery: FROM_HEX(x)
+      snowflake: TO_BINARY(x, 'HEX')
+      clickhouse: unhex(x)
+      duckdb: unhex(x)
+  bit_string:
+    renderer: bit_string
+    recover:
+      bigquery: text
+      snowflake: text
+      clickhouse: text
+      duckdb: CAST(x AS BITSTRING)
+  inet_text:
+    renderer: engine-produced
+    recover:
+      bigquery: NET.IP_FROM_STRING(x)   # addresses only, no CIDR
+      snowflake: PARSE_IP(x, 'INET')
+      clickhouse: toIPv6(x)             # addresses only, no CIDR
+      duckdb: CAST(x AS INET)
+  range_text:
+    renderer: engine-produced
+    recover:
+      bigquery: text                    # RANGE holds date/time bounds only
+      snowflake: text
+      clickhouse: text
+      duckdb: text
+  xml_text:
+    renderer: engine-produced
+    recover:
+      bigquery: text
+      snowflake: PARSE_XML(x, TRUE)
+      clickhouse: text
+      duckdb: text
+  server_text:
+    renderer: engine-produced
+    recover:
+      bigquery: text
+      snowflake: text
+      clickhouse: text
+      duckdb: text
+
+engines:
+  postgres:
+    batch: {}
+    cdc: {}
+  mysql:
+    batch: {}
+    cdc: {}
+  mssql:
+    batch: {}
+    cdc: {}
+  oracle:
+    batch: {}
+    cdc: {}
+  mongo:
+    batch: {}
+    cdc: {}
