@@ -132,7 +132,8 @@ load:
 
 By default rivet reads each part from GCS and sends it to ClickHouse. With a
 named collection ClickHouse reads the part directly, and no data passes through
-the host running rivet:
+the host running rivet (rivet still reads each part's footer from the store, to
+check its timestamps and count its rows):
 
 ```sql
 -- once, as an administrator. GCS: HMAC keys from "Interoperability"; S3: the service
@@ -155,20 +156,26 @@ load:
 
 ## Known limits
 
-- **Timestamp range.** `DateTime64` holds 1900-01-01 to 2299-12-31. When rivet sends a
-  part, it reads the part's footer first and refuses it, inserting nothing, if a timestamp
-  column holds a value outside that range or has no min/max statistics
-  (`RIVET_LOAD_VALUE_OUT_OF_TARGET_RANGE`). A part ClickHouse pulls through a named
-  collection is not inspected: an out-of-range timestamp is stored as the nearest end
-  of the range, silently. A `Date32` outside the same range fails the insert: ClickHouse
-  refuses it itself (measured on a part rivet sends).
+- **Timestamp range.** `DateTime64` holds 1900-01-01 to 2299-12-31, and ClickHouse
+  stores a value outside it as the nearest end, silently. So rivet reads each part's
+  footer first, whether it sends the part or ClickHouse pulls it through a named
+  collection, and refuses the part, inserting nothing, if a timestamp column holds a
+  value outside that range or has no min/max statistics
+  (`RIVET_LOAD_VALUE_OUT_OF_TARGET_RANGE`). A `Date32` outside the same range fails the
+  insert: ClickHouse refuses it itself (measured on a part rivet sends).
 - **Types that land as something else.** `uuid` lands as `FixedString(16)` (the 16 raw
   bytes; the type report carries the `toUUID` expression to recover it), `json`/`jsonb`
   as `String` holding the JSON text, `time` as `Decimal64` seconds since midnight, and a
   NULL array as `[]` (a ClickHouse `Array` cannot be NULL). `rivet check --type-report --target clickhouse` lists each one.
-- **No retries.** Every statement is one HTTP request with a fixed 1200-second timeout;
-  a failed request fails the load. A CDC load re-run inserts the same versions, which
-  the engine collapses; a full load re-run swaps in a fresh table.
+- **Retries.** Every statement is one HTTP request with a 1200-second timeout, tried up
+  to 5 times. A request that never connected is always tried again. A lost answer, a
+  429/502/503/504, or "too many simultaneous queries"/"too many parts" is tried again
+  only where a second run changes nothing: catalog reads, the `IF NOT EXISTS` /
+  `OR REPLACE` DDL, and inserts into a CDC change log (the engine collapses the copy).
+  An insert into a full load's swap table or an incremental log, and the `EXCHANGE` /
+  `RENAME` that swap a table in, are not: the load fails and the next `rivet load`
+  starts that table over (a full load keeps serving the old table until its swap).
+  ADR-0035 CH13 lists every statement.
 - **MySQL binlog renumbering.** The version orders MySQL changes by binlog file number,
   then offset. After `RESET MASTER`, or a failover to a server whose binlog files are
   numbered lower, new changes carry lower versions and lose to older versions of the
@@ -185,8 +192,11 @@ load:
   `system.columns`) need nothing more. A pulled load also needs
   `GRANT NAMED COLLECTION ON <name>`.
 - **TLS.** An `https://` URL uses rustls with the Mozilla root certificates built into
-  rivet. A server certificate signed by a private CA is not accepted, and there is no
-  option to add one.
+  rivet. For a server certificate signed by a private CA, set `ca_file:` in the `load:`
+  block to a PEM file of its root certificate(s) (an absolute path; a relative one is
+  read from the directory rivet runs in); a file that is missing or holds no PEM
+  certificate fails the load before any statement. Not yet tested against a live
+  `https://` server: the stand's ClickHouse serves only HTTP.
 
 ## Not supported
 

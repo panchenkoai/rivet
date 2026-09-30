@@ -88,6 +88,10 @@ struct RawLoadSection {
     /// keys; ClickHouse then reads the Parquet itself instead of rivet sending it.
     #[serde(default)]
     named_collection: Option<String>,
+    /// ClickHouse: a PEM file of root certificates to trust for an `https://` URL signed
+    /// by a private CA, beside the built-in public roots.
+    #[serde(default)]
+    ca_file: Option<String>,
     /// After a successful load, delete the staged Parquet under the export prefix.
     #[serde(default)]
     cleanup_source: bool,
@@ -175,11 +179,14 @@ impl TryFrom<RawLoadSection> for LoadSection {
                 &[LoadTargetKind::Clickhouse],
             ),
         ];
-        let optional: [(&str, &Option<String>, &[LoadTargetKind]); 1] = [(
-            "named_collection",
-            &r.named_collection,
-            &[LoadTargetKind::Clickhouse],
-        )];
+        let optional: [(&str, &Option<String>, &[LoadTargetKind]); 2] = [
+            (
+                "named_collection",
+                &r.named_collection,
+                &[LoadTargetKind::Clickhouse],
+            ),
+            ("ca_file", &r.ca_file, &[LoadTargetKind::Clickhouse]),
+        ];
         let foreign = fields
             .iter()
             .chain(optional.iter())
@@ -225,6 +232,7 @@ impl TryFrom<RawLoadSection> for LoadSection {
                     user: take(&r.user),
                     password_env: take(&r.password_env),
                     named_collection: r.named_collection.clone(),
+                    ca_file: r.ca_file.clone(),
                 }
             }
         };
@@ -295,6 +303,7 @@ pub enum LoadTarget {
         user: String,
         password_env: String,
         named_collection: Option<String>,
+        ca_file: Option<String>,
     },
 }
 
@@ -994,6 +1003,7 @@ mod partition_form_tests {
             user: "u".into(),
             password_env: "P".into(),
             named_collection: None,
+            ca_file: None,
         };
         assert_eq!(
             [bq.compacts(), sf.compacts(), ch.compacts()],

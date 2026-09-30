@@ -1744,6 +1744,14 @@
           ],
           "default": null
         },
+        "ca_file": {
+          "description": "ClickHouse: a PEM file of root certificates to trust for an `https://` URL signed\nby a private CA, beside the built-in public roots.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
         "cleanup_source": {
           "description": "After a successful load, delete the staged Parquet under the export prefix.",
           "type": "boolean",

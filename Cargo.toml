@@ -160,6 +160,7 @@ reqsign = "0.16"
 # release binary. `rustls-tls` is selected explicitly so it matches the TLS
 # backend opendal already links.
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+bytes = "1"
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 indicatif = "0.18"
 console = "0.16"
@@ -182,7 +183,6 @@ regex = "1"
 # feature additions never reach the release binary (resolver v2).
 rsa = { version = "0.9", features = ["pem"] }
 sha2 = { version = "0.10", features = ["oid"] }
-bytes = "1"
 csv = "1"
 serde_json = "1"
 serde_yaml_ng = "0.10"

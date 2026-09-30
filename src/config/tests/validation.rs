@@ -1748,6 +1748,7 @@ fn a_clickhouse_load_names_its_own_fields_and_refuses_foreign_ones() {
             user: "u".into(),
             password_env: "CH_PW".into(),
             named_collection: None,
+            ca_file: None,
         }
     );
     let pulled = Config::from_yaml(&cfg(&format!("{own}  named_collection: gcs_raw\n")))
@@ -1765,6 +1766,12 @@ fn a_clickhouse_load_names_its_own_fields_and_refuses_foreign_ones() {
     assert!(sf.contains("carries `schema`, a `snowflake` field"), "{sf}");
     let bad_nc = err(&format!("{own}  named_collection: \"x; DROP\"\n"));
     assert!(bad_nc.contains("is not a plain identifier"), "{bad_nc}");
+    let ca = Config::from_yaml(&cfg(&format!("{own}  ca_file: /etc/rivet/ca.pem\n")))
+        .expect("a private CA is optional");
+    assert!(matches!(
+        ca.load.expect("load").target,
+        load::LoadTarget::Clickhouse { ca_file: Some(ref f), .. } if f == "/etc/rivet/ca.pem"
+    ));
     let layout = err(&format!("{own}  layout: base_buffer\n"));
     assert!(layout.contains("BigQuery-only"), "{layout}");
 }

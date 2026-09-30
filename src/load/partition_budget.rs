@@ -190,7 +190,7 @@ fn footer_buckets(meta: &ParquetMetaData, key: &PartitionKey) -> Option<i64> {
 
 /// The footer of the Parquet object at the bucket-relative `key`: its last 8 bytes name
 /// the metadata length, and the metadata sits right before them.
-fn read_footer(store: &GcsStore, key: &str) -> Result<ParquetMetaData> {
+pub(crate) fn read_footer(store: &GcsStore, key: &str) -> Result<ParquetMetaData> {
     let size = store.stat_size(key)?;
     let tail_len = FOOTER_SIZE as u64;
     if size < tail_len {
@@ -664,6 +664,7 @@ mod tests {
             user: "u".into(),
             password_env: "P".into(),
             named_collection: None,
+            ca_file: None,
         };
         assert!(
             super::partition_budget_ok(&store, &plan, &uris).is_ok(),

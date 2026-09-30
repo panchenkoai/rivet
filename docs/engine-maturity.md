@@ -61,19 +61,17 @@ code does not count.
 
 - **Met:**
   - M1 (the common types: the load matrix and the uuid/json/time/array cell, read back from ClickHouse);
-  - M2 (a pushed part holding a timestamp past DateTime64's range, or one whose footer cannot bound it, is refused before insert, CH12; the rest are divergences in the type report);
-  - M3 (the main paths: a load killed after appending re-runs without changing the view; a load killed after adopting the table resumes into the log);
+  - M2 (a part holding a timestamp past DateTime64's range, or one whose footer cannot bound it, is refused before insert whether rivet sends it or ClickHouse pulls it, CH12; the rest are divergences in the type report);
+  - M3 (a load killed after appending re-runs without changing the view; a load killed after adopting the table resumes into the log; a full load killed at each of its four fault points in `src/test_hook.rs` re-runs to the source; a lost INSERT answer is resent only where a copy collapses, CH13);
   - M4 (a naive timestamp read in three session zones);
   - M5;
-  - M6 (`clickhouse_load` gate cells for CDC per engine, full, incremental, a crash re-run, and the loader's three live lib tests);
+  - M6 (`clickhouse_load` gate cells for CDC per engine, full, incremental, the crash re-runs, the range refusal pushed and pulled, the retries, and the loader's three live lib tests);
   - M7 (the loader's HTTP methods are excluded in `.cargo/mutants.toml`, each exclusion naming the live test that kills it, all of which the gate runs);
   - `partition:` by column and granularity in every mode, the change log's view pinned to a cross-partition `FINAL` (CH8; live cells for full, CDC with a moving partition value, incremental, and a changed partition refused);
   - M8 (the reference page, [recipes/clickhouse-load.md](recipes/clickhouse-load.md), with its known limits).
 - **Open for GA:**
-  - the range guard does not cover a load pulled through a named collection;
   - version order across a binlog renumbering (failover, `RESET MASTER`);
-  - no retry on a failed HTTP request;
-  - a private CA for `https://` URLs;
+  - `load.ca_file` (a private CA) is unit-tested only: no live `https://` run, the stand's ClickHouse serves HTTP;
   - a real-GCS run of the named-collection pull;
   - Mongo CDC (refused, CH7);
   - M8's driven run;
