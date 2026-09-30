@@ -94,6 +94,9 @@ fn a_cdc_capture_delivers_sql_variant_and_udt_columns_as_the_source_renders_them
     assert_eq!(delivered(&sc.rig.out_dir()), want);
 }
 
+/// A read held behind a schema lock for over 30 s completes. It does not go red when
+/// `command_timeout(None)` is removed: tiberius 0.13's 30 s default did not fire while the
+/// server held the lock (measured 2026-09-30), so this guards the outcome, not that setting.
 #[test]
 #[ignore = "live: requires docker compose mssql"]
 fn a_read_blocked_longer_than_thirty_seconds_still_completes() {
@@ -109,18 +112,22 @@ fn a_read_blocked_longer_than_thirty_seconds_still_completes() {
         .source_line("  lock_timeout_s: 0")
         .source_line("  statement_timeout_s: 0")
         .source_line("  max_retries: 0");
+    // A schema-modification lock blocks every reader, snapshot isolation included.
     let tx = format!(
-        "BEGIN TRAN; UPDATE {table} SET v = 2 WHERE id = 1;\nWAITFOR DELAY '00:00:36';\nCOMMIT;"
+        "BEGIN TRAN; ALTER TABLE {table} ADD blocker INT NULL;\nWAITFOR DELAY '00:00:40';\nROLLBACK;"
     );
+    // Resolved before the lock: OBJECT_ID itself waits on the schema lock it would look for.
+    let oid = mssql_query_i64(&format!("SELECT OBJECT_ID('{table}')"));
     let writer = std::thread::spawn(move || mssql_exec(&tx));
     let t0 = std::time::Instant::now();
     while mssql_query_i64(&format!(
-        "SELECT COUNT(*) FROM {table} WITH (NOLOCK) WHERE v = 2"
+        "SELECT COUNT(*) FROM sys.dm_tran_locks WHERE request_mode = 'Sch-M' \
+         AND resource_associated_entity_id = {oid}"
     )) == 0
     {
         assert!(
-            t0.elapsed().as_secs() < 3,
-            "fixture: the writer never took the row lock"
+            t0.elapsed().as_secs() < 5,
+            "fixture: the writer never took the schema lock"
         );
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
@@ -132,5 +139,5 @@ fn a_read_blocked_longer_than_thirty_seconds_still_completes() {
         took.as_secs() >= 31,
         "the read was not blocked past tiberius' 30 s default ({took:?}), so this proves nothing:\n{said}"
     );
-    assert_eq!(duckdb_dir_parquet_i64(&rig.out_dir(), "v"), vec![2]);
+    assert_eq!(duckdb_dir_parquet_i64(&rig.out_dir(), "v"), vec![1]);
 }
