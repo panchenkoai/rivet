@@ -1366,7 +1366,7 @@ fn pg_cdc_update_and_delete_carry_full_types() {
 
 // Hostile values, PostgreSQL: ±Infinity/NaN FLOAT8 are representable and must
 // ride CDC ArrayData-equal to batch; 'NaN'::NUMERIC is NOT representable in a
-// Parquet decimal — the batch export fails LOUDLY on it
+// Parquet decimal(18,2) — the batch export fails LOUDLY on it
 // ("unsupported NaN/infinity payload"), and CDC must fail the same way, never
 // silently NULL the cell.
 #[test]
@@ -1428,8 +1428,11 @@ fn pg_cdc_hostile_floats_match_batch_and_nan_numeric_fails_loudly() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("unsupported decimal payload"),
-        "the failure must name the payload: {stderr}"
+        stderr.contains("RIVET_SOURCE_CDC_CELL_UNSUPPORTED")
+            && stderr.contains("column 'n' is Decimal128(18, 2)")
+            && stderr.contains("\"NaN\"")
+            && stderr.contains("NaN/Infinity"),
+        "the failure must name the column, the payload and why: {stderr}"
     );
 }
 

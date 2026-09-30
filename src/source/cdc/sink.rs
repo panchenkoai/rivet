@@ -1055,10 +1055,11 @@ fn flush(
                     .map(|(row, e)| {
                         image_cell(e, i, &m.column_name, &schema_names, memo)
                             .map(|v| {
-                                fix.apply(v).map_err(|reason| value::CellRefusal {
+                                fix.apply(v).map_err(|r| value::CellRefusal {
                                     row,
                                     value: v.clone(),
-                                    reason,
+                                    reason: r.reason,
+                                    code: r.code,
                                 })
                             })
                             .transpose()

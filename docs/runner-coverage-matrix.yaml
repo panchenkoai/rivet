@@ -531,4 +531,4 @@ scenarios:
     chunked_checkpoint: { na: "shared seam (execute_resolved_plan, before the dispatch)" }
     keyset:         { na: "shared seam (execute_resolved_plan, before the dispatch)" }
     mongo_parallel: { na: "shared seam (execute_resolved_plan, before the dispatch); a Mongo export's schema is the fixed {_id, document, meta} shape, so it has no lossy column to refuse" }
-    cdc:            { test: pg_cdc_bare_numeric_warns_by_default_and_strict_refuses_before_any_part_or_checkpoint }
+    cdc:            { test: oracle_cdc_timestamp9_warns_by_default_and_strict_refuses_before_any_part_or_checkpoint }

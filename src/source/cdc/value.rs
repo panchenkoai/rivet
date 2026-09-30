@@ -229,6 +229,32 @@ pub(crate) struct CellRefusal {
     pub row: usize,
     pub value: RivetValue,
     pub reason: String,
+    /// The engine's own code when the engine worded the refusal (its reason then carries the remedy).
+    pub code: Option<crate::error::Code>,
+}
+
+/// Why an engine cell fix cannot read a wire value, optionally with the engine's own code.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct FixRefusal {
+    pub reason: String,
+    pub code: Option<crate::error::Code>,
+}
+
+impl From<&str> for FixRefusal {
+    /// A refusal worded by the fix, coded by the sink.
+    fn from(reason: &str) -> Self {
+        Self {
+            reason: reason.into(),
+            code: None,
+        }
+    }
+}
+
+impl From<String> for FixRefusal {
+    /// A refusal worded by the fix, coded by the sink.
+    fn from(reason: String) -> Self {
+        Self { reason, code: None }
+    }
 }
 
 /// Why a cell is refused when its variant has no reading as the column type at all.
@@ -241,6 +267,7 @@ impl CellRefusal {
             row,
             value: value.clone(),
             reason: reason.into(),
+            code: None,
         }
     }
 
@@ -249,7 +276,9 @@ impl CellRefusal {
         let full = render_str(&self.value);
         let shown: String = full.chars().take(64).collect();
         let more = if shown.len() < full.len() { "…" } else { "" };
-        let (code, remedy) = if overridden {
+        let (code, remedy) = if let Some(code) = self.code {
+            (code, String::new())
+        } else if overridden {
             (
                 crate::error::codes::SOURCE_OVERRIDE_WIRE_MISMATCH,
                 format!(
@@ -269,7 +298,9 @@ impl CellRefusal {
                 "cdc: column '{column}' is {dt} but the captured value {shown:?}{more} (row {}) \
                  {}; rivet refuses rather than writing NULL. {remedy}",
                 self.row, self.reason
-            ),
+            )
+            .trim_end()
+            .to_string(),
         ))
     }
 }
@@ -740,6 +771,8 @@ pub(crate) enum MysqlCellFix {
     /// BINARY(n): the driver right-trims trailing NULs — pad back to width n
     /// (the batch export carries the full padded value).
     BinaryPad(usize),
+    /// TIME is a duration up to 838:59:59; one outside a day is refused with the batch's MySQL wording.
+    TimeOfDay,
 }
 
 /// The fix (if any) for a column, from the engine + native type.
@@ -768,6 +801,9 @@ pub(crate) fn mysql_cell_fix(
     // Signed only — `mediumint unsigned` needs no sign extension.
     if (n == "mediumint" || n.starts_with("mediumint(")) && !n.contains("unsigned") {
         return Some(MysqlCellFix::MediumIntSign);
+    }
+    if n == "time" || n.starts_with("time(") {
+        return Some(MysqlCellFix::TimeOfDay);
     }
     if n.starts_with("enum(") {
         return Some(MysqlCellFix::EnumLabels(parse_enum_labels(native)));
@@ -822,7 +858,7 @@ fn parse_enum_labels(native: &str) -> Vec<String> {
 
 impl MysqlCellFix {
     /// The value the typed column needs for wire value `v`, or why the wire value has no reading.
-    pub(crate) fn apply(&self, v: &RivetValue) -> Result<RivetValue, String> {
+    pub(crate) fn apply(&self, v: &RivetValue) -> Result<RivetValue, FixRefusal> {
         use RivetValue as V;
         Ok(match (self, v) {
             (_, V::Null) => V::Null,
@@ -866,6 +902,12 @@ impl MysqlCellFix {
             }
             (MysqlCellFix::SetLabels(labels), V::Int(i)) => set_labels(labels, *i as u64),
             (MysqlCellFix::SetLabels(labels), V::UInt(u)) => set_labels(labels, *u),
+            (MysqlCellFix::TimeOfDay, V::TimeMicros(us)) if !crate::types::is_time_of_day(*us) => {
+                return Err(FixRefusal {
+                    reason: crate::source::mysql::time_outside_day_refusal(*us),
+                    code: Some(crate::error::codes::SOURCE_VALUE_UNREPRESENTABLE),
+                });
+            }
             (MysqlCellFix::BinaryPad(w), V::Bytes(b)) if b.len() < *w => {
                 let mut p = b.clone();
                 p.resize(*w, 0);
@@ -1871,8 +1913,30 @@ mod tests {
         assert!(fix("year").apply(&V::Bytes(b"MMXXIV".to_vec())).is_err());
         let e = fix("enum('a','b')");
         let err = e.apply(&V::Int(3)).unwrap_err();
-        assert!(err.contains("past the column's 2 ENUM labels"), "{err}");
+        assert!(
+            err.reason.contains("past the column's 2 ENUM labels"),
+            "{err:?}"
+        );
         assert!(e.apply(&V::UInt(u64::MAX)).is_err());
+        let t = fix("time(6)");
+        let err = t
+            .apply(&V::TimeMicros((838 * 3600 + 59 * 60 + 59) * 1_000_000))
+            .unwrap_err();
+        assert_eq!(
+            err.code.map(|c| c.id),
+            Some("RIVET_SOURCE_VALUE_UNREPRESENTABLE")
+        );
+        assert!(
+            err.reason
+                .starts_with("mysql: TIME 838:59:59.000000 is outside 00:00..24:00")
+                && err.reason.contains("CAST(col AS CHAR)"),
+            "{err:?}"
+        );
+        assert_eq!(
+            t.apply(&V::TimeMicros(1)).unwrap(),
+            V::TimeMicros(1),
+            "a time of day passes through"
+        );
         assert_eq!(e.apply(&V::UInt(1)).unwrap(), V::Bytes(b"a".to_vec()));
     }
 

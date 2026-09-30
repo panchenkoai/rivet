@@ -19,6 +19,7 @@
 //!   is exhaustively unit-tested in isolation (no live MySQL needed).
 
 mod arrow_convert;
+pub(crate) use arrow_convert::time_outside_day_refusal;
 pub(crate) mod cdc;
 mod proxy;
 

@@ -602,12 +602,20 @@ fn time_of_day_in_range(us: i64) -> Result<i64> {
     if !crate::types::is_time_of_day(us) {
         crate::rivet_bail!(
             crate::error::codes::SOURCE_VALUE_UNREPRESENTABLE,
-            "mysql: TIME {} is outside 00:00..24:00, which a Parquet TIME cannot hold (MySQL TIME is a \
-             duration up to 838:59:59). Cast it in a query, e.g. TIME_TO_SEC(col) or CAST(col AS CHAR)",
-            fmt_micros_as_time(us)
+            "{}",
+            time_outside_day_refusal(us)
         );
     }
     Ok(us)
+}
+
+/// The MySQL wording (batch and CDC) for a TIME outside one day, with the MySQL remedy.
+pub(crate) fn time_outside_day_refusal(us: i64) -> String {
+    format!(
+        "mysql: TIME {} is outside 00:00..24:00, which a Parquet TIME cannot hold (MySQL TIME is a \
+         duration up to 838:59:59). Cast it in a query, e.g. TIME_TO_SEC(col) or CAST(col AS CHAR)",
+        fmt_micros_as_time(us)
+    )
 }
 
 /// `[-]H:MM:SS.ffffff` for a message.
