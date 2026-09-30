@@ -1777,6 +1777,35 @@ mod tests {
         );
         assert!(msg.contains(&format!("\"{}\"…", "9".repeat(64))), "{msg}");
         assert!(!msg.contains(&"9".repeat(65)), "{msg}");
+        let short = format!(
+            "{:#}",
+            build_column(
+                "c",
+                &DataType::Int64,
+                &[Some(&RivetValue::Bytes(b"1.5".to_vec()))]
+            )
+            .unwrap_err()
+        );
+        assert!(
+            short.contains("\"1.5\" cannot"),
+            "no ellipsis on a short value: {short}"
+        );
+    }
+
+    /// An unsigned cell in a Boolean column is true exactly when it is non-zero.
+    #[test]
+    fn an_unsigned_cell_in_a_boolean_column_is_true_when_non_zero() {
+        let arr = build_column(
+            "b",
+            &DataType::Boolean,
+            &[Some(&RivetValue::UInt(1)), Some(&RivetValue::UInt(0))],
+        )
+        .unwrap();
+        let b = arr
+            .as_any()
+            .downcast_ref::<arrow::array::BooleanArray>()
+            .unwrap();
+        assert!(b.value(0) && !b.value(1));
     }
 
     /// A MySQL TIME outside one day is refused exactly like the batch export; in-range times build.
