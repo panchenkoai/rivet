@@ -29,6 +29,7 @@
 
 mod cursor;
 pub mod decimal;
+mod delivery;
 mod fidelity;
 mod mapping;
 mod override_type;
@@ -38,6 +39,11 @@ mod source_column;
 pub mod target;
 
 pub use cursor::CursorState;
+#[allow(unused_imports)]
+pub use delivery::{
+    Delivery, TextForm, bit_string, decimal_plain, hex_bytes, iso_timestamp_nanos,
+    iso8601_duration, time_beyond_day, time_of_day_offset, uuid36,
+};
 pub use fidelity::TypeFidelity;
 // Public surface for contract/integration tests; not referenced from the binary.
 #[allow(unused_imports)]

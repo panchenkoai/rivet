@@ -25,7 +25,7 @@ use arrow_schema::extension::{Json as ArrowJson, Uuid as ArrowUuid};
 use serde::Serialize;
 use std::sync::Arc;
 
-use super::{RivetType, SourceColumn, TimeUnit, TypeFidelity};
+use super::{Delivery, RivetType, SourceColumn, TextForm, TimeUnit, TypeFidelity};
 
 /// Arrow field-metadata key carrying the native database type name.
 /// Read by the type-report CLI (Chunk 5) and by future BigQuery / Snowflake
@@ -40,6 +40,8 @@ pub const META_LOGICAL_TYPE: &str = "rivet.logical_type";
 /// CI / strict-mode tooling can sniff this to assert that no field in a
 /// produced Parquet schema is `lossy` or `unsupported`.
 pub const META_FIDELITY: &str = "rivet.fidelity";
+/// Arrow field-metadata key carrying the [`TextForm`] label of a `Text` delivery (ADR-0038 CP2).
+pub const META_TEXT_FORM: &str = "rivet.text_form";
 
 /// One row of the Type Mapping Pipeline (roadmap §6 `TypeMapping`).
 ///
@@ -72,6 +74,9 @@ pub struct TypeMapping {
     /// Diagnostic strings emitted by the mapper or the policy. Surfaced by
     /// the type-report and the strict-mode failure message.
     pub warnings: Vec<String>,
+    /// Native, or the canonical text form the column is delivered in (ADR-0038 CP2).
+    #[serde(skip_serializing_if = "Delivery::is_native")]
+    pub delivery: Delivery,
 }
 
 impl TypeMapping {
@@ -92,7 +97,17 @@ impl TypeMapping {
             fidelity,
             nullable: source.nullable,
             warnings: Vec::new(),
+            delivery: Delivery::Native,
         }
+    }
+
+    /// Deliver this column as canonical text: `Utf8`, `LogicalString`, `rivet.text_form` metadata.
+    #[allow(dead_code)]
+    pub fn with_text(mut self, form: TextForm) -> Self {
+        self.delivery = Delivery::Text(form);
+        self.arrow_type = Some(DataType::Utf8);
+        self.fidelity = TypeFidelity::LogicalString;
+        self
     }
 
     /// Append a warning visible to the type-report and to logs.
@@ -269,6 +284,9 @@ pub fn build_arrow_field(mapping: &TypeMapping) -> Option<Field> {
     if let Some(logical) = logical_type_label(&mapping.rivet_type) {
         metadata.insert(META_LOGICAL_TYPE.into(), logical.into());
     }
+    if let Delivery::Text(form) = mapping.delivery {
+        metadata.insert(META_TEXT_FORM.into(), form.label().into());
+    }
     let mut field = Field::new(&mapping.column_name, dt, mapping.nullable).with_metadata(metadata);
 
     // Attach the Arrow canonical extension type so that parquet-rs emits the
@@ -288,7 +306,7 @@ pub fn build_arrow_field(mapping: &TypeMapping) -> Option<Field> {
                 .try_with_extension_type(ArrowJson::default())
                 .expect("Json extension only valid on Utf8/LargeUtf8 — invariant in mapping");
         }
-        RivetType::Uuid => {
+        RivetType::Uuid if mapping.delivery == Delivery::Native => {
             field
                 .try_with_extension_type(ArrowUuid)
                 .expect("Uuid extension only valid on FixedSizeBinary(16) — invariant in mapping");
@@ -551,5 +569,57 @@ mod tests {
         let mapping = TypeMapping::from_source(&col("x", "int4"), RivetType::Int32)
             .with_warning("autodetect uncertainty");
         assert_eq!(mapping.warnings, vec!["autodetect uncertainty".to_string()]);
+    }
+
+    #[test]
+    fn from_source_is_native_with_no_text_form_metadata() {
+        let m = TypeMapping::from_source(&col("id", "int8"), RivetType::Int64);
+        assert_eq!(m.delivery, Delivery::Native);
+        let field = build_arrow_field(&m).expect("field");
+        assert!(!field.metadata().contains_key("rivet.text_form"));
+        assert!(!serde_json::to_string(&m).unwrap().contains("delivery"));
+    }
+
+    #[test]
+    fn with_text_delivers_utf8_logical_string_and_labels_the_field() {
+        let m = TypeMapping::from_source(&col("u", "uuid"), RivetType::Uuid)
+            .with_text(TextForm::Uuid36);
+        assert_eq!(m.delivery, Delivery::Text(TextForm::Uuid36));
+        assert_eq!(m.arrow_type, Some(DataType::Utf8));
+        assert_eq!(m.fidelity, TypeFidelity::LogicalString);
+        let field = build_arrow_field(&m).expect("a text uuid must still build a field");
+        assert_eq!(field.data_type(), &DataType::Utf8);
+        let md = field.metadata();
+        assert_eq!(
+            md.get("rivet.text_form").map(String::as_str),
+            Some("uuid36")
+        );
+        assert_eq!(
+            md.get("rivet.fidelity").map(String::as_str),
+            Some("logical_string")
+        );
+        assert!(!md.contains_key("ARROW:extension:name"));
+        assert!(
+            serde_json::to_string(&m)
+                .unwrap()
+                .contains(r#""delivery":{"text":"uuid36"}"#)
+        );
+
+        let unsupported = TypeMapping::from_source(
+            &col("n", "numeric"),
+            RivetType::Unsupported {
+                native_type: "numeric".into(),
+                reason: "no precision".into(),
+            },
+        )
+        .with_text(TextForm::DecimalPlain);
+        let md = build_arrow_field(&unsupported)
+            .expect("field")
+            .metadata()
+            .clone();
+        assert_eq!(
+            md.get(META_TEXT_FORM).map(String::as_str),
+            Some("decimal_plain")
+        );
     }
 }

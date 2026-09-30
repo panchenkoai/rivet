@@ -111,6 +111,11 @@ const EXEMPT: &[(&str, &str)] = &[
         "docs/scenario-artifact-matrix.yaml",
         "tests/offline/scenario_artifact_matrix_guard.rs",
     ),
+    // Keyed on TextForm, ExportTarget and SourceType x mode, not on scenario cells.
+    (
+        "docs/type-capability-matrix.yaml",
+        "tests/offline/type_capability_matrix_guard.rs",
+    ),
 ];
 
 const MATRICES: &[(&str, usize)] = &[
@@ -765,7 +770,7 @@ fn matrix_gaps_do_not_exceed_ratchet() {
 /// tracked so a struct variant's OWN field lines (depth 2) aren't mistaken for
 /// variants, and its `{…}` doesn't end the scan early. Adding a variant grows the
 /// derived set automatically — no hand-kept list.
-fn enum_variants(rel: &str, enum_name: &str) -> HashSet<String> {
+pub(crate) fn enum_variants(rel: &str, enum_name: &str) -> HashSet<String> {
     let text = std::fs::read_to_string(repo_root().join(rel))
         .unwrap_or_else(|e| panic!("read {rel}: {e}"));
     let needle = format!("enum {enum_name} {{");
