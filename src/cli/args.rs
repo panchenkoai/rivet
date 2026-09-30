@@ -294,7 +294,7 @@ pub enum Commands {
         /// Mutually exclusive with the YAML-only `--gcs-bucket` / `--s3-bucket` flags.
         #[arg(
             long,
-            conflicts_with_all = ["gcs_bucket", "gcs_credentials_file", "s3_bucket", "s3_region"]
+            conflicts_with_all = ["gcs_bucket", "gcs_credentials_file", "s3_bucket", "s3_region", "azure_container", "azure_account"]
         )]
         discover: bool,
         /// Override the suggested extraction mode for every scaffolded export.
@@ -331,6 +331,23 @@ pub enum Commands {
         /// Optional AWS region for S3 scaffolds (when using `--s3-bucket`).
         #[arg(long = "s3-region", value_name = "REGION", requires = "s3_bucket")]
         s3_region: Option<String>,
+        /// Scaffold `destination: type: azure` with this container (each export gets `prefix: exports/<table>/`);
+        /// the account key is read from `RIVET_AZURE_KEY`. Needs `--azure-account`.
+        /// Incompatible with `--gcs-bucket`, `--s3-bucket` and `--discover`.
+        #[arg(
+            long = "azure-container",
+            value_name = "NAME",
+            requires = "azure_account",
+            group = "staging_bucket"
+        )]
+        azure_container: Option<String>,
+        /// The storage account of `--azure-container` (the `<account>` in `<account>.blob.core.windows.net`).
+        #[arg(
+            long = "azure-account",
+            value_name = "NAME",
+            requires = "azure_container"
+        )]
+        azure_account: Option<String>,
         /// Scaffold a `load:` block for this BigQuery project. With
         /// `--bigquery-dataset` the generated config carries the warehouse target,
         /// a per-table partition guess and the base+buffer layout, so `rivet load`
@@ -354,7 +371,7 @@ pub enum Commands {
         bigquery_dataset: Option<String>,
         /// Scaffold a `load:` block for this ClickHouse HTTP endpoint, e.g.
         /// `http://localhost:8123`. Needs `--clickhouse-database` and a bucket the
-        /// export stages in (`--gcs-bucket` or `--s3-bucket`).
+        /// export stages in (`--gcs-bucket`, `--s3-bucket` or `--azure-container`).
         #[arg(
             long = "clickhouse-url",
             value_name = "URL",

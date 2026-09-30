@@ -130,6 +130,7 @@ If the column is declared as plain `NUMERIC` (no precision / scale in the DDL), 
 | `--schema` | no | **PostgreSQL:** schema to scan (default `public`). **SQL Server:** schema (default `dbo`). **MySQL:** database name when the URL omits one (a `--schema` naming a *different* database than the URL's is refused — put the database in the URL instead) |
 | `-o` / `--output` | no | Write output to file; default is stdout |
 | `--discover` | no | Emit a **JSON discovery artifact** (Epic B) instead of a YAML scaffold — see below |
+| `--gcs-bucket` / `--s3-bucket` / `--azure-container` | no, at most one | Scaffold a cloud `destination:` instead of `./output`; each export gets `prefix: exports/<table>/`. `--s3-region` goes with S3, `--gcs-credentials-file` with GCS. `--azure-container` needs `--azure-account` (the storage account) and writes `account_key_env: RIVET_AZURE_KEY` — export the account key under that name before `rivet doctor` |
 | `--mode` | no | Override the suggested mode for every scaffolded export. **`--mode cdc`** scaffolds a change-data-capture config (`mode: cdc` + an engine-specific `cdc:` block) instead of a batch query — see [cdc.md](cdc.md). Other values (`full` / `incremental` / `chunked` / `time_window`) just override the auto-suggested mode |
 
 ### Avoiding credentials on the command line

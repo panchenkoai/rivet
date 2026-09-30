@@ -131,7 +131,7 @@ pub(super) fn generate_schema_config(
         return Ok(wrap_comments(&(lines.join("\n") + "\n")));
     }
 
-    let dest_note = if dest.gcs_bucket.is_some() || dest.s3_bucket.is_some() {
+    let dest_note = if dest.has_bucket() {
         "# One export per table/view — per-table prefix `exports/<name>/` under the given bucket; review modes before running."
     } else {
         "# One export per table/view — review modes and destinations before running."
@@ -1194,35 +1194,51 @@ fn cdc_multiplex_load_lines(infos: &[TableInfo], dest: &InitYamlDestination) -> 
     lines
 }
 
+/// The `destination:` block for the bucket init was given, writing under `prefix`; `None` for a local scaffold.
+fn bucket_destination_lines(dest: &InitYamlDestination, prefix: &str) -> Option<Vec<String>> {
+    let (kind, bucket, extra) = if let Some(bucket) = &dest.gcs_bucket {
+        let creds = dest.gcs_credentials_file.as_ref();
+        (
+            "gcs",
+            bucket,
+            creds.map(|p| format!("      credentials_file: {}", yaml_quote_if_needed(p))),
+        )
+    } else if let Some(bucket) = &dest.s3_bucket {
+        let region = dest.s3_region.as_ref();
+        (
+            "s3",
+            bucket,
+            region.map(|r| format!("      region: {}", yaml_quote_if_needed(r))),
+        )
+    } else if let Some(container) = &dest.azure_container {
+        let account = dest.azure_account.as_deref().unwrap_or_default();
+        (
+            "azure",
+            container,
+            Some(format!(
+                "      account_name: {}\n      account_key_env: RIVET_AZURE_KEY",
+                yaml_quote_if_needed(account)
+            )),
+        )
+    } else {
+        return None;
+    };
+    let mut lines = vec![
+        "    destination:".to_string(),
+        format!("      type: {kind}"),
+        format!("      bucket: {}", yaml_quote_if_needed(bucket)),
+        format!("      prefix: {prefix}"),
+    ];
+    lines.extend(extra);
+    Some(lines)
+}
+
 /// Destination for the multiplex: a BASE prefix (no per-table segment) — the
 /// stream itself appends `<table>/`, so `cdc/` becomes `cdc/orders/`,
 /// `cdc/users/`, … each with its own `manifest.json` + `_SUCCESS`.
 fn cdc_multiplex_destination(dest: &InitYamlDestination) -> Vec<String> {
-    if let Some(bucket) = &dest.gcs_bucket {
-        let mut v = vec![
-            "    destination:".to_string(),
-            "      type: gcs".to_string(),
-            format!("      bucket: {}", yaml_quote_if_needed(bucket)),
-            "      prefix: cdc/".to_string(),
-        ];
-        if let Some(p) = &dest.gcs_credentials_file {
-            v.push(format!(
-                "      credentials_file: {}",
-                yaml_quote_if_needed(p)
-            ));
-        }
-        v
-    } else if let Some(bucket) = &dest.s3_bucket {
-        let mut v = vec![
-            "    destination:".to_string(),
-            "      type: s3".to_string(),
-            format!("      bucket: {}", yaml_quote_if_needed(bucket)),
-            "      prefix: cdc/".to_string(),
-        ];
-        if let Some(r) = &dest.s3_region {
-            v.push(format!("      region: {}", yaml_quote_if_needed(r)));
-        }
-        v
+    if let Some(lines) = bucket_destination_lines(dest, "cdc/") {
+        lines
     } else {
         vec![
             "    destination:".to_string(),
@@ -1302,33 +1318,8 @@ fn destination_scaffold(
     mode: &str,
 ) -> Vec<String> {
     let prefix = yaml_quote_if_needed(&table_export_prefix(info, source_type, mode));
-    if let Some(bucket) = &dest.gcs_bucket {
-        let bucket = yaml_quote_if_needed(bucket);
-        let mut v = vec![
-            "    destination:".to_string(),
-            "      type: gcs".to_string(),
-            format!("      bucket: {bucket}"),
-            format!("      prefix: {prefix}"),
-        ];
-        if let Some(p) = &dest.gcs_credentials_file {
-            v.push(format!(
-                "      credentials_file: {}",
-                yaml_quote_if_needed(p)
-            ));
-        }
-        v
-    } else if let Some(bucket) = &dest.s3_bucket {
-        let bucket = yaml_quote_if_needed(bucket);
-        let mut v = vec![
-            "    destination:".to_string(),
-            "      type: s3".to_string(),
-            format!("      bucket: {bucket}"),
-            format!("      prefix: {prefix}"),
-        ];
-        if let Some(r) = &dest.s3_region {
-            v.push(format!("      region: {}", yaml_quote_if_needed(r)));
-        }
-        v
+    if let Some(lines) = bucket_destination_lines(dest, &prefix) {
+        lines
     } else {
         // Per-export subdirectory (symmetric with the bucket prefixes above) so
         // a schema-wide init's exports don't all share ./output — that collides
@@ -3067,6 +3058,8 @@ mod load_block_tests {
             clickhouse_url: None,
             clickhouse_database: None,
             clickhouse_user: None,
+            azure_container: None,
+            azure_account: None,
         };
         assert!(
             load_block_lines(&bare, true).is_empty(),

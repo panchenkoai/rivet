@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **`rivet init` scaffolds an Azure Blob destination.** `--azure-container <name> --azure-account
+  <account>` writes `destination: type: azure` with `account_key_env: RIVET_AZURE_KEY`, as
+  `--gcs-bucket` and `--s3-bucket` do for their stores, and works as the staging bucket of
+  `--clickhouse-url`. An Azure config no longer has to be written by hand.
 - **Breaking: MySQL CDC refuses `binlog_row_metadata = MINIMAL`.** It used to warn and map binlog
   values by position, so a column reorder or `ALTER` delivered them under the wrong names (source
   `(1, b='BBB', a='AAA')` arrived as `b='AAA', a='BBB'`). A server that is not at FULL, or that

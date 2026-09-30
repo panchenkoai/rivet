@@ -643,6 +643,9 @@ pub struct InitYamlDestination {
     pub gcs_credentials_file: Option<String>,
     pub s3_bucket: Option<String>,
     pub s3_region: Option<String>,
+    /// `--azure-container` / `--azure-account`: an Azure Blob destination keyed by `RIVET_AZURE_KEY`.
+    pub azure_container: Option<String>,
+    pub azure_account: Option<String>,
     /// `--bigquery-project` / `--bigquery-dataset`: when both are given the
     /// scaffold carries a `load:` block, so the generated config drives the
     /// warehouse half of the cycle too.
@@ -673,10 +676,16 @@ impl InitYamlDestination {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.gcs_bucket.is_some() && self.s3_bucket.is_some() {
-            anyhow::bail!("use at most one of --gcs-bucket and --s3-bucket");
+        let named = [&self.gcs_bucket, &self.s3_bucket, &self.azure_container];
+        if named.iter().filter(|b| b.is_some()).count() > 1 {
+            anyhow::bail!("use at most one of --gcs-bucket, --s3-bucket and --azure-container");
         }
         Ok(())
+    }
+
+    /// Whether the scaffold writes to a cloud bucket rather than `./output`.
+    pub(crate) fn has_bucket(&self) -> bool {
+        self.gcs_bucket.is_some() || self.s3_bucket.is_some() || self.azure_container.is_some()
     }
 }
 
@@ -2658,6 +2667,8 @@ mod tests {
             clickhouse_url: None,
             clickhouse_database: None,
             clickhouse_user: None,
+            azure_container: None,
+            azure_account: None,
         };
         let yaml = yaml_scaffold::generate_config(
             &info,
@@ -2688,6 +2699,8 @@ mod tests {
             clickhouse_url: None,
             clickhouse_database: None,
             clickhouse_user: None,
+            azure_container: None,
+            azure_account: None,
         };
         yaml_scaffold::generate_config(
             info,
@@ -2815,6 +2828,8 @@ mod tests {
             clickhouse_url: None,
             clickhouse_database: None,
             clickhouse_user: None,
+            azure_container: None,
+            azure_account: None,
         };
         let yaml = yaml_scaffold::generate_config(
             &info,
@@ -2847,6 +2862,8 @@ mod tests {
             clickhouse_url: None,
             clickhouse_database: None,
             clickhouse_user: None,
+            azure_container: None,
+            azure_account: None,
         };
         let yaml = yaml_scaffold::generate_config(
             &info,
@@ -2884,6 +2901,8 @@ mod tests {
             clickhouse_url: None,
             clickhouse_database: None,
             clickhouse_user: None,
+            azure_container: None,
+            azure_account: None,
         };
         let yaml = yaml_scaffold::generate_config(
             &info,
@@ -2910,6 +2929,8 @@ mod tests {
             clickhouse_url: None,
             clickhouse_database: None,
             clickhouse_user: None,
+            azure_container: None,
+            azure_account: None,
         };
         let err = dest.validate().expect_err("conflict must be rejected");
         let msg = format!("{err}");

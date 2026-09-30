@@ -273,6 +273,82 @@ fn init_cloud_destination_flags_scaffold_and_exclude_each_other() {
         "the scaffold must declare a gcs destination with the given bucket; got:\n{yaml}"
     );
 
+    // Azure: the container AND the account it lives in, keyed by an env var — and the
+    // scaffold must be a config rivet itself accepts: `check` reads it back and resolves
+    // the key from the very env var the scaffold names.
+    let azure = init(&[
+        "--azure-container",
+        "qa-scaffold-container",
+        "--azure-account",
+        "qascaffoldacct",
+    ]);
+    assert!(
+        azure.status.success(),
+        "init --azure-container must exit 0; stderr:\n{}",
+        String::from_utf8_lossy(&azure.stderr)
+    );
+    let yaml = String::from_utf8_lossy(&azure.stdout).to_string();
+    for line in [
+        "type: azure",
+        "bucket: qa-scaffold-container",
+        "account_name: qascaffoldacct",
+        "account_key_env: RIVET_AZURE_KEY",
+    ] {
+        assert!(
+            yaml.contains(line),
+            "the scaffold lacks `{line}`; got:\n{yaml}"
+        );
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("rivet.yaml");
+    std::fs::write(&cfg, &yaml).unwrap();
+    let check = run_rivet_env(
+        &["check", "-c", cfg.to_str().unwrap()],
+        &[("DATABASE_URL", POSTGRES_URL), ("RIVET_AZURE_KEY", "Zm9v")],
+    );
+    assert!(
+        check.status.success(),
+        "rivet must accept the azure scaffold it generated; stderr:\n{}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+    assert!(
+        !init(&["--azure-container", "c"]).status.success(),
+        "--azure-container without --azure-account must be REFUSED — the destination \
+         cannot resolve an endpoint without the account"
+    );
+    assert!(
+        !init(&[
+            "--azure-container",
+            "c",
+            "--azure-account",
+            "a",
+            "--s3-bucket",
+            "b"
+        ])
+        .status
+        .success(),
+        "naming an Azure container AND an S3 bucket must be REFUSED (clap's group and \
+         InitYamlDestination::validate both refuse; RED only with both off)"
+    );
+    let staged = init(&[
+        "--azure-container",
+        "c",
+        "--azure-account",
+        "a",
+        "--clickhouse-url",
+        "http://localhost:8123",
+        "--clickhouse-database",
+        "raw",
+    ]);
+    let yaml = String::from_utf8_lossy(&staged.stdout);
+    assert!(
+        staged.status.success()
+            && yaml.contains("type: azure")
+            && yaml.contains("target: clickhouse"),
+        "an Azure container must count as the staging bucket of --clickhouse-url; stderr:\n{}",
+        String::from_utf8_lossy(&staged.stderr)
+    );
+
     // The constraints. Both are `assert!(!success)` on purpose: the failure mode
     // they guard is a SILENT resolution, not an error message.
     let both = init(&["--s3-bucket", "a", "--gcs-bucket", "b"]);

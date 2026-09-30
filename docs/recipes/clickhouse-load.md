@@ -6,7 +6,7 @@
 
 `rivet load` writes an export's Parquet into ClickHouse over the HTTP interface
 ([ADR-0035](../adr/0035-clickhouse-load-target.md)). The export may land in GCS, S3
-or Azure (`rivet init` takes `--gcs-bucket` or `--s3-bucket`); the ClickHouse
+or Azure (`rivet init` takes `--gcs-bucket`, `--s3-bucket` or `--azure-container`); the ClickHouse
 database must already exist.
 
 ## Generate the config

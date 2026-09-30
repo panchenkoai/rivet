@@ -387,9 +387,11 @@ Generate a config scaffold from a live database (connect + introspect)
 * `--gcs-credentials-file <PATH>` — Optional path for `credentials_file:` on GCS scaffolds. Omit entirely to use ADC (`gcloud auth application-default login`) or `GOOGLE_APPLICATION_CREDENTIALS` — no key in YAML
 * `--s3-bucket <NAME>` — Scaffold `destination: type: s3` with this bucket (each export gets `prefix: exports/<table>/`). Incompatible with `--gcs-bucket` and `--discover`
 * `--s3-region <REGION>` — Optional AWS region for S3 scaffolds (when using `--s3-bucket`)
+* `--azure-container <NAME>` — Scaffold `destination: type: azure` with this container (each export gets `prefix: exports/<table>/`); the account key is read from `RIVET_AZURE_KEY`. Needs `--azure-account`. Incompatible with `--gcs-bucket`, `--s3-bucket` and `--discover`
+* `--azure-account <NAME>` — The storage account of `--azure-container` (the `<account>` in `<account>.blob.core.windows.net`)
 * `--bigquery-project <PROJECT>` — Scaffold a `load:` block for this BigQuery project. With `--bigquery-dataset` the generated config carries the warehouse target, a per-table partition guess and the base+buffer layout, so `rivet load` and `rivet compact` work from it after a review. Needs `--gcs-bucket`: the load reads GCS only, so a local or S3 scaffold with a `load:` block is a config `rivet load` refuses
 * `--bigquery-dataset <DATASET>` — The dataset the load creates its tables in (with `--bigquery-project`)
-* `--clickhouse-url <URL>` — Scaffold a `load:` block for this ClickHouse HTTP endpoint, e.g. `http://localhost:8123`. Needs `--clickhouse-database` and a bucket the export stages in (`--gcs-bucket` or `--s3-bucket`)
+* `--clickhouse-url <URL>` — Scaffold a `load:` block for this ClickHouse HTTP endpoint, e.g. `http://localhost:8123`. Needs `--clickhouse-database` and a bucket the export stages in (`--gcs-bucket`, `--s3-bucket` or `--azure-container`)
 * `--clickhouse-database <DATABASE>` — The ClickHouse database the load creates its tables in (with `--clickhouse-url`)
 * `--clickhouse-user <USER>` — The ClickHouse user the load authenticates as (with `--clickhouse-url`)
 
