@@ -36,6 +36,14 @@ pub struct Cli {
     pub json_errors: bool,
 }
 
+/// Whether clap's missing-argument error lists `--config` as missing; its usage line names `--config` on every command and does not count.
+fn names_config_as_missing(rendered: &str) -> bool {
+    rendered
+        .split("Usage:")
+        .next()
+        .is_some_and(|missing| missing.contains("--config"))
+}
+
 /// Parse argv into [`Cli`]. When a config-taking subcommand (the documented
 /// `doctor` Step 1, `check`, `run`, …) is invoked with NO `-c/--config`, append
 /// a `rivet init` recovery hint after clap's own usage error. Every other clap
@@ -49,7 +57,7 @@ pub fn parse_cli() -> Cli {
         Ok(cli) => cli,
         Err(e) => {
             let missing_config = e.kind() == clap::error::ErrorKind::MissingRequiredArgument
-                && e.to_string().contains("--config");
+                && names_config_as_missing(&e.to_string());
             if missing_config {
                 let _ = e.print();
                 eprintln!(
@@ -184,7 +192,7 @@ pub enum Commands {
         #[arg(long)]
         stream: bool,
     },
-    /// Load an export's Parquet into a warehouse (BigQuery / Snowflake)
+    /// Load an export's Parquet into a warehouse (BigQuery / Snowflake / ClickHouse)
     ///
     /// The native column schema, target table, partition, and source URIs are
     /// all derived from the config's top-level `load:` block — nothing is
@@ -681,6 +689,31 @@ pub enum ValidateFormat {
 
 #[cfg(test)]
 mod tests {
+    /// clap's rendered error for `argv`.
+    fn parse_error(argv: &[&str]) -> String {
+        use clap::Parser;
+        super::Cli::try_parse_from(argv)
+            .err()
+            .expect("argv must not parse")
+            .to_string()
+    }
+
+    #[test]
+    fn the_init_hint_follows_only_an_error_that_lists_config_as_missing() {
+        assert!(super::names_config_as_missing(&parse_error(&[
+            "rivet", "run"
+        ])));
+        assert!(super::names_config_as_missing(&parse_error(&[
+            "rivet", "journal"
+        ])));
+        let only_export = parse_error(&["rivet", "journal", "-c", "rivet.yaml"]);
+        assert!(
+            only_export.contains("--config"),
+            "the usage line names it: {only_export}"
+        );
+        assert!(!super::names_config_as_missing(&only_export));
+    }
+
     use super::*;
     use clap::Parser;
 
