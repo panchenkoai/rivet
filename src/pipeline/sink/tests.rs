@@ -522,6 +522,7 @@ fn minimal_sink() -> ExportSink {
         column_checksums: std::collections::BTreeMap::new(),
         checksum_key_col: None,
         row_progress: None,
+        row_feed: (String::new(), 0, std::time::Instant::now()),
         partition: PartBudget::default(),
     }
 }

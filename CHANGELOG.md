@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **A piped run reports progress.** With stderr not a terminal (cron, Airflow, CI) `rivet run`
+  printed nothing until an export finished: a 3M-row keyset export was silent for 60 s. It now
+  prints one line per running export every 30 s, e.g.
+  `▸ big  keyset  streaming  1.8M rows  58.9K r/s  30.1s  ETA —`. Set
+  `RIVET_PROGRESS_INTERVAL_SECS` to change the interval; `0` turns the lines off. Full, incremental
+  and keyset exports now show a running row count on the interactive card as well. `mode: cdc`
+  prints no progress line.
 - **Breaking: MySQL CDC refuses `binlog_row_metadata = MINIMAL`.** It used to warn and map binlog
   values by position, so a column reorder or `ALTER` delivered them under the wrong names (source
   `(1, b='BBB', a='AAA')` arrived as `b='AAA', a='BBB'`). A server that is not at FULL, or that

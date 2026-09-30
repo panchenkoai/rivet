@@ -836,6 +836,7 @@ export RIVET_STATE_URL="postgresql://rivet:secret@db.internal/rivet_state?sslmod
 | Variable | Description |
 |----------|-------------|
 | `RUST_LOG` | Log level: `error`, `warn`, `info`, `debug`, `trace` |
+| `RIVET_PROGRESS_INTERVAL_SECS` | Seconds between progress lines when stderr is not a terminal (cron, Airflow, CI): one `▸ <export> … rows` line per running export. Default `30`; `0` turns them off |
 | `DATABASE_URL` | Commonly used with `url_env: DATABASE_URL` in source config |
 | `RIVET_STATE_URL` | PostgreSQL URL for the state backend. When set (and starts with `postgres`), activates the PG backend instead of the default SQLite file. Example: `postgresql://rivet:rivet@localhost:5433/rivet_state` |
 

@@ -105,6 +105,8 @@ pub(crate) struct ExportSink {
     /// Per-batch row-progress feed (chunked exports). `None` for paths that
     /// don't drive a progress bar.
     pub(in crate::pipeline) row_progress: Option<RowProgress>,
+    /// Rows not yet fed to the unified UI, and when the last feed went out (sinks with no `row_progress`).
+    row_feed: (String, i64, std::time::Instant),
     /// The warehouse partition budget the CURRENT part is kept inside, and what it has
     /// spent — see [`PartBudget`].
     pub(in crate::pipeline) partition: PartBudget,
@@ -468,6 +470,7 @@ impl ExportSink {
             column_checksums: std::collections::BTreeMap::new(),
             checksum_key_col: None,
             row_progress: None,
+            row_feed: (plan.export_name.clone(), 0, std::time::Instant::now()),
             partition: PartBudget::new(plan.partition_rollover.clone()),
         })
     }
@@ -795,6 +798,16 @@ impl ExportSink {
             if rp.last_tick.elapsed() >= std::time::Duration::from_millis(120) {
                 rp.handle.set_rows(total);
                 rp.last_tick = std::time::Instant::now();
+            }
+        } else {
+            let (export_name, unfed, last_feed) = &mut self.row_feed;
+            *unfed += dest_batch.num_rows() as i64;
+            if last_feed.elapsed() >= std::time::Duration::from_millis(120) {
+                crate::pipeline::ipc::emit_event(&crate::pipeline::ipc::ChildEvent::Rows {
+                    export_name: export_name.clone(),
+                    rows: std::mem::take(unfed),
+                });
+                *last_feed = std::time::Instant::now();
             }
         }
         self.part_rows += dest_batch.num_rows();

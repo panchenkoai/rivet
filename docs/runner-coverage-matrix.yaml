@@ -256,6 +256,15 @@ scenarios:
     mongo_parallel: { test: shape_drift_warns_on_the_mongo_parallel_runner }
     cdc:            { na: "detect_shape_drift runs at the finalize_export seam, which CDC never reaches; the run warns when shape_drift_warn_factor is set (cdc_ignored_knobs_warning)" }
 
+  - id: unattended_progress_line
+    what: "a piped run (cron, Airflow, CI) prints one `▸` line per running export every RIVET_PROGRESS_INTERVAL_SECS (default 30, 0 = off) carrying the rows streamed so far. The line is printed by the linear renderer (parent_ui::run_ui_linear), which every batch run mode routes through; the ROW COUNT is the per-runner part: chunk workers feed it through RowProgress, every other sink through the ExportSink::write_batch_part row feed (ChildEvent::Rows). Each test slows a 3000-row export past three 1 s intervals and reads the line off stderr."
+    single:         { test: an_unattended_run_prints_progress_on_the_single_runner_and_interval_zero_turns_it_off }
+    chunked:        { test: an_unattended_run_prints_progress_on_the_chunked_runner }
+    chunked_checkpoint: { test: an_unattended_run_prints_progress_on_the_checkpoint_runner }
+    keyset:         { test: an_unattended_run_prints_progress_on_the_keyset_runner }
+    mongo_parallel: { na: "shared ExportSink seam — each worker's sink feeds row deltas from write_batch_part exactly as the single and keyset sinks do, and the card sums them (running_lines_list_only_unfinished_exports_with_their_summed_row_feed); not run live against MongoDB" }
+    cdc:            { na: "the drain writes through its own TableSink and emits no card events, so a CDC run prints no progress line; it is a bounded drain to the open-time boundary, not covered by this feature" }
+
   - id: skip_empty_status
     what: "skip_empty: a run that delivered nothing (0 rows, 0 manifest parts) is recorded `skipped` with a skip_reason instead of `success`. Decided once by job.rs::ok_status after the runner returns, so no runner re-implements it; each test exports an EMPTY source and reads the status back from export_metrics."
     single:         { test: skip_empty_skips_on_the_single_runner }

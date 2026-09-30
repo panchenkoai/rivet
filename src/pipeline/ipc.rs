@@ -99,6 +99,8 @@ pub enum ChildEvent {
         chunks_done: u64,
         rows: i64,
     },
+    /// Rows written since this sink's last feed — the running count for runners with no chunk bar.
+    Rows { export_name: String, rows: i64 },
     /// Terminal verdict reached.  Carries final metrics that the parent
     /// renders in place of the progress bar.
     Finished {
@@ -130,6 +132,7 @@ impl ChildEvent {
             ChildEvent::Started { export_name, .. }
             | ChildEvent::ProgressInit { export_name, .. }
             | ChildEvent::Progress { export_name, .. }
+            | ChildEvent::Rows { export_name, .. }
             | ChildEvent::Finished { export_name, .. } => export_name,
         }
     }

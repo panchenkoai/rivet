@@ -227,10 +227,26 @@ fn run_ui_interactive(rx: Receiver<UiMessage>, width: usize, name_floor: usize) 
 fn run_ui_linear(rx: Receiver<UiMessage>, width: usize, name_floor: usize) {
     let mut renderer = Renderer::new(width, name_floor);
     let mut printed: HashSet<String> = HashSet::new();
+    let every = heartbeat_interval(
+        std::env::var("RIVET_PROGRESS_INTERVAL_SECS")
+            .ok()
+            .as_deref(),
+    );
+    let mut last_beat = Instant::now();
 
-    while let Ok(msg) = rx.recv() {
-        renderer.process_message(msg);
-        flush_finished_cards(&renderer, &mut printed, width);
+    loop {
+        match rx.recv_timeout(IDLE_REDRAW_INTERVAL) {
+            Ok(msg) => {
+                renderer.process_message(msg);
+                flush_finished_cards(&renderer, &mut printed, width);
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+        if every.is_some_and(|every| last_beat.elapsed() >= every) {
+            write_stderr(&running_lines(&renderer, width));
+            last_beat = Instant::now();
+        }
     }
 
     // Channel closed: synthesize failures for anything still pending and
@@ -249,6 +265,37 @@ fn run_ui_linear(rx: Receiver<UiMessage>, width: usize, name_floor: usize) {
         }
     }
     flush_finished_cards(&renderer, &mut printed, width);
+}
+
+/// Time between progress lines on unattended stderr: `RIVET_PROGRESS_INTERVAL_SECS`, 30 s when unset or unparseable, off at `0`.
+fn heartbeat_interval(raw: Option<&str>) -> Option<Duration> {
+    let secs = raw.and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(30);
+    (secs > 0).then(|| Duration::from_secs(secs))
+}
+
+/// One line per export still running, in start order — the unattended heartbeat.
+fn running_lines(renderer: &Renderer, width: usize) -> String {
+    let (name_col, mode_col) = column_widths(&renderer.cards, renderer.name_floor);
+    let mut out = String::new();
+    for card in renderer.order.iter().filter_map(|n| renderer.cards.get(n)) {
+        if !card.finished {
+            for line in card.live_lines(width, name_col, mode_col) {
+                out.push_str(&line);
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
+/// Write `out` to stderr in one locked write; nothing for an empty string.
+fn write_stderr(out: &str) {
+    if out.is_empty() {
+        return;
+    }
+    let mut handle = std::io::stderr().lock();
+    let _ = handle.write_all(out.as_bytes());
+    let _ = handle.flush();
 }
 
 /// Append every card that has reached its terminal state but hasn't been
@@ -272,12 +319,7 @@ fn flush_finished_cards(renderer: &Renderer, printed: &mut HashSet<String>, widt
         }
         printed.insert(name.clone());
     }
-    if out.is_empty() {
-        return;
-    }
-    let mut handle = std::io::stderr().lock();
-    let _ = handle.write_all(out.as_bytes());
-    let _ = handle.flush();
+    write_stderr(&out);
 }
 
 /// Pick stable column widths for the name and mode columns by combining the
@@ -407,6 +449,11 @@ impl Renderer {
                 if let Some(card) = self.cards.get_mut(&export_name) {
                     card.chunks_done = chunks_done;
                     card.rows = rows;
+                }
+            }
+            ChildEvent::Rows { export_name, rows } => {
+                if let Some(card) = self.cards.get_mut(&export_name) {
+                    card.rows += rows;
                 }
             }
             ChildEvent::Finished {
@@ -603,6 +650,8 @@ impl CardState {
         let elapsed_ms = self.started_at.elapsed().as_millis() as i64;
         let chunks_label = if self.total_chunks > 0 {
             format!("{}/{} chunks", self.chunks_done, self.total_chunks)
+        } else if self.rows > 0 {
+            "streaming".to_string()
         } else {
             "preparing…".to_string()
         };
@@ -1003,6 +1052,53 @@ mod tests {
         assert!(line.contains("4/10 chunks"));
         assert!(line.contains("40K rows"));
         assert!(line.contains("ETA "));
+    }
+
+    #[test]
+    fn heartbeat_interval_defaults_to_thirty_seconds_and_zero_turns_it_off() {
+        assert_eq!(heartbeat_interval(None), Some(Duration::from_secs(30)));
+        assert_eq!(heartbeat_interval(Some("5")), Some(Duration::from_secs(5)));
+        assert_eq!(
+            heartbeat_interval(Some("soon")),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(heartbeat_interval(Some("0")), None);
+    }
+
+    #[test]
+    fn running_lines_list_only_unfinished_exports_with_their_summed_row_feed() {
+        let mut r = Renderer::new(100, 0);
+        for name in ["orders", "users"] {
+            r.handle_event(ChildEvent::Started {
+                export_name: name.into(),
+                run_id: "r".into(),
+                mode: "keyset".into(),
+                tuning_profile: "balanced".into(),
+                batch_size: 100,
+            });
+        }
+        for rows in [40_000, 10_000] {
+            r.handle_event(ChildEvent::Rows {
+                export_name: "orders".into(),
+                rows,
+            });
+        }
+        r.cards
+            .get_mut("users")
+            .unwrap()
+            .finalize("success", 7, 1, 1, 1, 1, None);
+
+        let out = running_lines(&r, 100);
+        assert_eq!(
+            out.lines().count(),
+            1,
+            "one line per running export:\n{out}"
+        );
+        assert!(out.starts_with("▸ orders"), "{out}");
+        assert!(
+            out.contains("streaming") && out.contains("50K rows"),
+            "{out}"
+        );
     }
 
     #[test]
