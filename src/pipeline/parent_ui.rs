@@ -685,10 +685,14 @@ fn log_frame(last_drawn_lines: usize, line: &str) -> String {
 }
 
 fn pick_width() -> usize {
-    // `console::Term::stderr().size()` returns `(rows, cols)` if attached to a
-    // tty, otherwise falls back to `(24, 80)` — that fallback is fine.
-    let (_, cols) = console::Term::stderr().size();
-    (cols as usize).clamp(60, 100)
+    let term = console::Term::stderr();
+    // `size()` returns `(rows, cols)` on a tty and falls back to `(24, 80)` otherwise.
+    card_width(term.features().is_attended(), term.size().1 as usize)
+}
+
+/// Line budget of a card: the terminal's columns within `[60, 100]`, or 200 when nothing is attached — a log has no columns to wrap at.
+fn card_width(attended: bool, cols: usize) -> usize {
+    if attended { cols.clamp(60, 100) } else { 200 }
 }
 
 fn fmt_rows(rows: i64) -> String {
@@ -937,9 +941,11 @@ mod tests {
     }
 
     #[test]
-    fn pick_width_in_bounds() {
-        let w = pick_width();
-        assert!((60..=100).contains(&w));
+    fn card_width_follows_the_terminal_and_is_wide_when_nothing_is_attached() {
+        assert_eq!(card_width(true, 20), 60);
+        assert_eq!(card_width(true, 90), 90);
+        assert_eq!(card_width(true, 300), 100);
+        assert_eq!(card_width(false, 80), 200);
     }
 
     #[test]

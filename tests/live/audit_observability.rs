@@ -121,3 +121,28 @@ fn audit_journal_shows_file_names() {
          got:\n{stdout}"
     );
 }
+
+/// A piped run's one-line card must not be cut at a terminal width it does not have:
+/// the peak-RSS figure at the end of the line reaches the log.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_piped_runs_card_line_keeps_its_peak_rss() {
+    require_alive(LiveService::Postgres);
+    let tbl = unique_name("rivet_obs_card_width");
+    pg_connect()
+        .batch_execute(&format!(
+            "CREATE TABLE {tbl} (id BIGINT PRIMARY KEY); \
+             INSERT INTO {tbl} SELECT g FROM generate_series(1, 10) g"
+        ))
+        .expect("seed");
+    let _t = PgTable::adopt(tbl.clone());
+    let said = Rig::pg_batch(&tbl).mode("full").run_ok_capture();
+    let card = said
+        .lines()
+        .find(|l| l.starts_with("✓ "))
+        .unwrap_or_else(|| panic!("no card line:\n{said}"));
+    assert!(
+        card.contains("RSS") && card.trim_end().ends_with("MB"),
+        "the card line was cut: {card:?}"
+    );
+}
