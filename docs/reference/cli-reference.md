@@ -96,6 +96,7 @@ Run export jobs defined in config
 * `--summary-output <PATH>` — Write the run aggregate summary as JSON to this file (in addition to .rivet_state.db)
 * `--json` — Print the run aggregate summary as JSON to stdout at the end of the run
 * `-p`, `--param <KEY=VALUE>` — Query parameter: key=value (repeatable, substitutes ${key} in queries)
+* `--strict` — Refuse the run before any data is read if a column's type mapping is lossy or unsupported (default: warn and continue), the verdict `check --type-report --strict` gives
 
 
 

@@ -48,6 +48,15 @@ impl TypePolicy {
         }
     }
 
+    /// `strict()` under `--strict`, else `warn_only()`: the one default `check` and `run` share.
+    pub fn from_strict(strict: bool) -> Self {
+        if strict {
+            Self::strict()
+        } else {
+            Self::warn_only()
+        }
+    }
+
     /// Permissive mode: warn only, never fail. Useful for `--type-report`
     /// when the user just wants to see the table without aborting.
     pub fn warn_only() -> Self {
@@ -103,24 +112,47 @@ impl TypePolicy {
         }
         out
     }
+}
 
-    /// Return `Err` when any `fatal` violation exists, otherwise `Ok(())`.
-    #[allow(dead_code)]
-    pub fn check_fail(&self, violations: &[PolicyViolation]) -> crate::error::Result<()> {
-        let fatal: Vec<&str> = violations
-            .iter()
-            .filter(|v| v.fatal)
-            .map(|v| v.message.as_str())
-            .collect();
-        if !fatal.is_empty() {
-            anyhow::bail!(
-                "strict mode: {} unsafe type mapping(s):\n{}",
-                fatal.len(),
-                fatal.join("\n")
-            );
-        }
-        Ok(())
+/// The column plan: `mappings` under `policy`, each non-fatal violation logged, every fatal one in one coded error.
+pub fn plan_columns(
+    mappings: Vec<TypeMapping>,
+    policy: &TypePolicy,
+    subject: &str,
+) -> crate::error::Result<Vec<TypeMapping>> {
+    let violations = policy.validate(&mappings);
+    for w in warnings(&violations, subject) {
+        log::warn!("{w}");
     }
+    refuse_fatal(&violations, subject)?;
+    Ok(mappings)
+}
+
+/// The warning line for each non-fatal violation, prefixed with `subject`.
+pub fn warnings(violations: &[PolicyViolation], subject: &str) -> Vec<String> {
+    violations
+        .iter()
+        .filter(|v| !v.fatal)
+        .map(|v| format!("{subject}: {}", v.message))
+        .collect()
+}
+
+/// `Err` naming every fatal violation (`RIVET_TYPE_UNSAFE_MAPPING`), `Ok` when none is fatal.
+pub fn refuse_fatal(violations: &[PolicyViolation], subject: &str) -> crate::error::Result<()> {
+    let fatal: Vec<&str> = violations
+        .iter()
+        .filter(|v| v.fatal)
+        .map(|v| v.message.as_str())
+        .collect();
+    if !fatal.is_empty() {
+        crate::rivet_bail!(
+            crate::error::codes::TYPE_UNSAFE_MAPPING,
+            "{subject}: strict mode: {} unsafe type mapping(s):\n{}",
+            fatal.len(),
+            fatal.join("\n")
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -155,7 +187,7 @@ mod tests {
         assert_eq!(violations.len(), 1);
         assert!(violations[0].fatal);
         assert_eq!(violations[0].column_name, "location");
-        assert!(policy.check_fail(&violations).is_err());
+        assert!(refuse_fatal(&violations, "export 'e'").is_err());
     }
 
     #[test]
@@ -165,7 +197,7 @@ mod tests {
         let violations = policy.validate(&mappings);
         assert_eq!(violations.len(), 1);
         assert!(!violations[0].fatal);
-        assert!(policy.check_fail(&violations).is_ok());
+        assert!(refuse_fatal(&violations, "export 'e'").is_ok());
     }
 
     #[test]
@@ -189,5 +221,84 @@ mod tests {
             ),
         ];
         assert!(policy.validate(&mappings).is_empty());
+    }
+
+    fn lossy_mapping(name: &str) -> TypeMapping {
+        let mut m = exact_mapping(name, "timestamp(9)");
+        m.fidelity = TypeFidelity::Lossy;
+        m
+    }
+
+    #[test]
+    fn plan_columns_under_warn_only_keeps_every_column() {
+        let mappings = vec![
+            exact_mapping("id", "int8"),
+            unsupported_mapping("amount", "numeric"),
+            lossy_mapping("ts"),
+        ];
+        let planned = plan_columns(mappings, &TypePolicy::from_strict(false), "export 'e'")
+            .expect("warn_only never refuses");
+        let names: Vec<&str> = planned.iter().map(|m| m.column_name.as_str()).collect();
+        assert_eq!(names, ["id", "amount", "ts"]);
+    }
+
+    #[test]
+    fn plan_columns_under_strict_refuses_naming_every_fatal_column_with_one_code() {
+        let mappings = vec![
+            exact_mapping("id", "int8"),
+            unsupported_mapping("amount", "numeric"),
+            lossy_mapping("ts"),
+        ];
+        let err = plan_columns(mappings, &TypePolicy::from_strict(true), "export 'e'")
+            .expect_err("strict refuses lossy and unsupported");
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some("RIVET_TYPE_UNSAFE_MAPPING")
+        );
+        assert_eq!(
+            crate::error::classify_exit(&err),
+            1,
+            "check --strict exits 1"
+        );
+        let msg = format!("{err:#}");
+        assert!(
+            msg.starts_with("export 'e': strict mode: 2 unsafe type mapping(s):"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("column 'amount' (source type 'numeric'): fidelity=unsupported"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("column 'ts' (source type 'timestamp(9)'): fidelity=lossy"),
+            "{msg}"
+        );
+        assert!(!msg.contains("column 'id'"), "{msg}");
+    }
+
+    #[test]
+    fn plan_columns_under_strict_passes_a_plan_with_no_unsafe_column() {
+        let mappings = vec![exact_mapping("id", "int8")];
+        assert_eq!(
+            plan_columns(mappings, &TypePolicy::strict(), "export 'e'")
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// Only the non-fatal violations become warning lines, each prefixed with the subject.
+    #[test]
+    fn warnings_are_the_non_fatal_violations_prefixed_with_the_subject() {
+        let v = |c: &str, fatal: bool| PolicyViolation {
+            column_name: c.into(),
+            fidelity: TypeFidelity::Lossy,
+            message: format!("m-{c}"),
+            fatal,
+        };
+        assert_eq!(
+            warnings(&[v("a", false), v("b", true), v("c", false)], "export 'e'"),
+            vec!["export 'e': m-a".to_string(), "export 'e': m-c".to_string()]
+        );
     }
 }

@@ -154,6 +154,13 @@ ADR is superseded:
 If a use case appears that these rule out, the right move is to reopen this
 ADR and amend it, not to slip a new flag in under the radar.
 
+## Type-policy switch (amendment 2026-09-30)
+
+`rivet run --strict` is not a trust flag. It is the switch `rivet check --strict` already has:
+the run evaluates `TypePolicy` over its column plan before reading data (ADR-0038 CP6), warns on
+lossy and unsupported columns by default, and refuses them under `--strict`. It adds no trust
+noun and verifies nothing after the run.
+
 ## Subcommand carveouts (amendment 2026-05-21)
 
 The contract above pins the **flag surface** of `rivet run`.  It does not

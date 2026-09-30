@@ -1679,6 +1679,8 @@ pub(crate) struct CdcCapture<'a> {
     pub schema_gate: Option<&'a SchemaGate<'a>>,
     /// The run's metadata connection, lent for schema resolution; `None` opens one here.
     pub meta: Option<&'a mut (dyn crate::source::Source + 'static)>,
+    /// The type policy each table's resolved columns pass before any change is read.
+    pub policy: crate::types::policy::TypePolicy,
 }
 
 /// Open the change stream (with the engine's permission/TLS gate), resolve each
@@ -1762,7 +1764,11 @@ pub(crate) fn run_capture(
             Some((schema, table)) => format!("{schema}.{table}"),
             None => o.table.clone(),
         };
-        let columns = match resolver.resolve(&probe, &o.overrides) {
+        let subject = format!("export '{}' table '{}'", cap.export_name, o.table);
+        let columns = match resolver
+            .resolve(&probe, &o.overrides)
+            .and_then(|c| crate::types::plan_columns(c, &cap.policy, &subject))
+        {
             Ok(c) => c,
             Err(e) => return (Vec::new(), Err(e)),
         };

@@ -41,6 +41,8 @@ pub struct RunOptions<'a> {
     pub params: Option<&'a std::collections::HashMap<String, String>>,
     /// A CDC export's pending baseline snapshots run concurrently (up to the pool ceiling) — `--parallel-exports`.
     pub parallel_snapshots: bool,
+    /// `--strict`: a lossy or unsupported column refuses the run instead of warning.
+    pub strict: bool,
 }
 
 /// True when the current process is running more than one export in this
@@ -490,6 +492,7 @@ pub fn run(
     parallel_export_processes_cli: bool,
     summary_output: Option<&Path>,
     json_output: bool,
+    strict: bool,
 ) -> Result<()> {
     // `--force` without `--resume` only silences the rerun-accumulation warning; say so.
     if force && !resume {
@@ -565,6 +568,7 @@ pub fn run(
         force,
         params,
         parallel_snapshots,
+        strict,
     };
 
     // Seeds the card-table name column so it aligns from the first redraw
@@ -624,6 +628,7 @@ pub fn run(
                 resume,
                 force,
                 params,
+                strict,
                 name_floor,
             );
         // Stamp the window BEFORE closing the bracket: the close opens a source
@@ -881,6 +886,7 @@ pub(crate) fn run_waves(
         force,
         params: None,
         parallel_snapshots: false,
+        strict: false,
     };
 
     // Group exports by wave (ascending; an export with no `wave:` runs last).
@@ -1026,6 +1032,7 @@ pub(crate) fn run_waves(
                     resume,
                     force,
                     None,
+                    false,
                     wave_name_floor,
                 );
                 child_failures.extend(cf);
@@ -1715,6 +1722,7 @@ pub(crate) fn run_pool(
         force,
         params: None,
         parallel_snapshots: false,
+        strict: false,
     };
     // Pre-migrate the state DB once before worker threads race on DDL, and use
     // this handle for the duration reads below.

@@ -49,6 +49,7 @@ pub use fidelity::TypeFidelity;
 #[allow(unused_imports)]
 pub use mapping::{TypeMapping, build_arrow_field, derive_fidelity, rivet_type_to_arrow};
 pub use override_type::parse_type_str;
+pub use policy::plan_columns;
 pub use rivet_type::{RivetType, TimeUnit};
 pub use source_column::SourceColumn;
 // ColumnOverride is the planned public API for column type overrides (Chunk 6).

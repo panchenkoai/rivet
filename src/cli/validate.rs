@@ -63,6 +63,7 @@ mod tests {
             summary_output: None,
             json: false,
             params: vec![],
+            strict: false,
         })
     }
 

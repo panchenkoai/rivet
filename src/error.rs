@@ -409,6 +409,11 @@ pub mod codes {
         "RIVET_CONFIG_COLUMN_OVERRIDE_CASE",
         "spell the `columns:` key exactly as the result set names the column",
     );
+    /// A column whose mapping is lossy or unsupported, refused under `--strict`.
+    pub const TYPE_UNSAFE_MAPPING: Code = usage(
+        "RIVET_TYPE_UNSAFE_MAPPING",
+        "add a `columns:` override the engine delivers exactly, CAST or drop the column in the export's `query:`, or run without `--strict` to accept it with a warning",
+    );
     /// A statement that ran past the configured duration cap, carried by the existing
     /// `source::StatementDurationTimeout` marker (recognised in [`super::error_code`]).
     pub const SOURCE_STATEMENT_TIMEOUT: Code = environment(
@@ -536,6 +541,7 @@ pub mod codes {
         CONFIG_KEYSET_KEY_UUID_OVERRIDE,
         CONFIG_CURSOR_COLUMN_CASE,
         CONFIG_COLUMN_OVERRIDE_CASE,
+        TYPE_UNSAFE_MAPPING,
         SOURCE_STATEMENT_TIMEOUT,
         SOURCE_CURSOR_FINER_THAN_MICROSECOND,
         SOURCE_CDC_FOREIGN_CHECKPOINT,

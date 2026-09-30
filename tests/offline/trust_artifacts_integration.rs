@@ -2139,6 +2139,8 @@ fn rivet_run_subcommand_has_exactly_the_adr_0013_flag_set() {
         "summary-output",
         "json",
         "param",
+        // type policy, not a trust flag: `check --strict`'s switch (ADR-0038 CP6, ADR-0013 amendment 2026-09-30):
+        "strict",
         // global (clap-derived):
         "json-errors",
         "help",
