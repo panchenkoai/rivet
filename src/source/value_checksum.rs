@@ -1,12 +1,13 @@
 //! Always-on value checksum — a cheap, order-independent per-column `xxh3`,
 //! cross-checked at two stages.
 //!
-//! **Form A (in-process).** An independent source-side pass (per engine — e.g.
-//! Postgres' `pg_rows_checksums`) computes a per-column checksum from the raw
-//! driver values; [`arrow_batch_checksums`] ("side B") computes the same over the
-//! *built* Arrow [`RecordBatch`]; [`verify`] compares them on the spot. A mismatch
-//! means the value converter (`build_array`) changed a value between read and Arrow
-//! build — caught in process, no re-read. Always-on (~+7% CPU, ~0% wall on the
+//! **Form A (in-process).** A source-side pass (per engine — e.g. Postgres'
+//! `PgCellSource`) computes a per-column checksum from the raw driver values;
+//! [`arrow_batch_checksums`] ("side B") computes the same over the *built* Arrow
+//! [`RecordBatch`]; [`verify`] compares them on the spot. A mismatch means the
+//! builder/append step changed a value between read and Arrow build — caught in
+//! process, no re-read. It does NOT catch a decode fault: Postgres' side A shares
+//! the builder's cell decoders, so a wrong decode is wrong identically on both sides. Always-on (~+7% CPU, ~0% wall on the
 //! I/O-bound export path).
 //!
 //! **Form B (validate-time).** The sink records the per-column checksum in the
@@ -379,7 +380,7 @@ fn with_cell_bytes<R>(arr: &dyn Array, r: usize, f: impl FnOnce(&[u8]) -> R) -> 
     }
 }
 
-/// A per-engine, INDEPENDENT source of typed cell values — a second decode of the
+/// A per-engine source of typed cell values — a second read of the
 /// same rows, the side-A twin of side B's Arrow read. Each accessor returns the
 /// cell's canonical value (the generic [`source_checksums`] byte-encodes it
 /// identically to [`with_cell_bytes`]) or `None` for a NULL / absent cell; the
@@ -413,7 +414,7 @@ pub trait CellSource {
     fn list(&self, col: usize, row: usize, elem: &DataType) -> Option<Vec<ListElem>>;
 }
 
-/// Side A — the per-column checksum computed **independently** from a [`CellSource`]
+/// Side A — the per-column checksum computed from a [`CellSource`]
 /// (the raw driver values), the single dispatch behind every engine's source pass.
 /// Dispatches on the target Arrow type, byte-encodes each non-null cell **identically
 /// to [`feed_cell`]** (so a correct build keeps A==B and the matrix guard fires on

@@ -834,4 +834,19 @@ exclude_re = [
     # Equivalent: `y < 0` and `y <= 0` differ only at year 0, which Oracle has no value for
     # (its calendar goes from -1 to 1; ORA-01841), so no OracleTimestamp tells them apart.
     "replace < with <= in timestamp_text",
+    # Side A's `PgCellSource::utf8` reads a live `tokio_postgres::Row`. Its stubs and the TEXT
+    # and INTERVAL arm deletions fail the value checksum in
+    # `pg_cdc_full_type_matrix_matches_batch` (a batch export of every PG type); the UUID arm
+    # (reached only under a `string` override) fails
+    # `a_uuid_column_overridden_to_string_lands_as_postgres_own_text` (RED-checked 2026-09-30).
+    "replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::utf8 -> Option<Cow<'_, \\[u8\\]>>",
+    "delete match arm .* in <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::utf8",
+    # PgCellSource::utf8's enum guard: `false` fails the checksum in
+    # `pg_cdc_full_type_matrix_matches_batch` (RED-checked); `true` is equivalent — no Utf8-typed
+    # PostgreSQL column reaches the fallthrough (every Utf8 wire type has its own arm), and one
+    # that did would read the same text through AnyAsString.
+    "replace match guard matches!\\(t.kind\\(\\), Kind::Enum\\(_\\)\\) with (true|false) in <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::utf8",
+    # The text builder's TEXT arm reads a live Row; deleting it fails
+    # `full_export_preserves_string_and_null_distinction` (RED-checked 2026-09-30).
+    "delete match arm Type::TEXT \\| Type::VARCHAR \\| Type::BPCHAR \\| Type::NAME in build_pg_text_array",
 ]

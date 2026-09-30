@@ -371,3 +371,73 @@ fn a_bool_override_on_an_integer_column_is_refused_by_name() {
         "the refusal must name the override and the wire type:\n{said}"
     );
 }
+
+const SQLASCII_URL: &str = "postgresql://rivet:rivet@127.0.0.1:5432/rivet_sqlascii";
+
+/// Invalid UTF-8 from a SQL_ASCII database (query-side client_encoding switch) is refused by name, not a panic.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_text_value_that_is_not_utf8_is_refused_by_name_not_a_panic() {
+    require_alive(LiveService::Postgres);
+    // A concurrent creator loses with duplicate_database; the connect below is the real check.
+    let _ = pg_connect().batch_execute(
+        "CREATE DATABASE rivet_sqlascii ENCODING 'SQL_ASCII' LC_COLLATE 'C' LC_CTYPE 'C' \
+         TEMPLATE template0",
+    );
+    let t = unique_name("pg_sqlascii");
+    postgres::Client::connect(SQLASCII_URL, postgres::NoTls)
+        .expect("connect to rivet_sqlascii")
+        .batch_execute(&format!(
+            r"CREATE TABLE {t} (id int8 PRIMARY KEY, note text);
+              INSERT INTO {t} VALUES (1, 'ok'), (2, E'caf\351');"
+        ))
+        .expect("seed SQL_ASCII table");
+    let table = PgTable::adopt_on(SQLASCII_URL, t);
+    let t = table.name();
+    let out = Rig::pg_batch(t)
+        .source_url(SQLASCII_URL)
+        .query(&format!(
+            "SELECT * FROM {t} WHERE set_config('client_encoding', 'SQL_ASCII', false) IS NOT NULL"
+        ))
+        .run();
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_ne!(out.status.code(), Some(101), "rivet panicked:\n{said}");
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "invalid UTF-8 must fail the export:\n{said}"
+    );
+    assert!(
+        said.contains("column `note` (text) holds a value that is not valid UTF-8"),
+        "the refusal must name the column and the cause:\n{said}"
+    );
+}
+
+/// A uuid column read as text through a `string` override lands as PostgreSQL's own `u::text`.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_uuid_column_overridden_to_string_lands_as_postgres_own_text() {
+    require_alive(LiveService::Postgres);
+    let table = seed_pg_override_table(
+        "u uuid NOT NULL",
+        "(1, '123e4567-e89b-12d3-a456-426614174000'), (2, 'ffffffff-0000-0000-0000-000000000001')",
+    );
+    let rig = Rig::pg_batch(table.name())
+        .export_line("columns:")
+        .export_line("  u: string");
+    rig.run_ok();
+    let want: std::collections::BTreeSet<String> = pg_connect()
+        .query(&format!("SELECT u::text FROM {}", table.name()), &[])
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_eq!(
+        duckdb_dir_parquet_distinct_strings(&rig.out_dir(), "u"),
+        want
+    );
+}
