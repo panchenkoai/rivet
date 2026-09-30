@@ -108,11 +108,11 @@ pub fn mongo_toxi_url(db: &str) -> String {
 /// set needs `directConnection=true` (port-mapped single node).
 /// Oracle Database 23ai Free, app user `rivet` in the FREEPDB1 service.
 pub const ORACLE_URL: &str = "oracle://rivet:rivet@127.0.0.1:1521/FREEPDB1";
-/// The `rivet` user in LATIN1PDB, the stand's WE8ISO8859P1 database (`dev/oracle/init/03-latin1-pdb.sh`);
+/// The `rivet` user in LATIN1PDB, the stand's WE8ISO8859P1 database in the `oracle-latin1` service;
 /// `RIVET_TEST_ORACLE_LATIN1_URL` points it elsewhere.
 pub fn oracle_latin1_url() -> String {
     std::env::var("RIVET_TEST_ORACLE_LATIN1_URL")
-        .unwrap_or_else(|_| "oracle://rivet:rivet@127.0.0.1:1521/LATIN1PDB".to_string())
+        .unwrap_or_else(|_| "oracle://rivet:rivet@127.0.0.1:1531/LATIN1PDB".to_string())
 }
 /// The common LogMiner user (`dev/oracle/init/02-logminer.sh`), connected to the PDB it captures.
 pub const ORACLE_CDC_URL: &str = "oracle://c%23%23rivetcdc:rivet@127.0.0.1:1521/FREEPDB1";

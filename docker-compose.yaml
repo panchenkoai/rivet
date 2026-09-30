@@ -165,17 +165,33 @@ services:
   # (the official container-registry image builds its database on first boot).
   # APP_USER creates `rivet/rivet` in the FREEPDB1 PDB; the init script grants
   # the catalog role rivet's row estimates and harm counters read. Seeded by
-  # `make seed-oracle` (seeds/common/oracle.sql). RIVET_STAND_LATIN1_PDB adds a
-  # WE8ISO8859P1 PDB (LATIN1PDB) for the non-Unicode character-set tests.
+  # `make seed-oracle` (seeds/common/oracle.sql).
   oracle:
     image: gvenzl/oracle-free:23-slim-faststart
     environment:
       ORACLE_PASSWORD: rivet
       APP_USER: rivet
       APP_USER_PASSWORD: rivet
-      RIVET_STAND_LATIN1_PDB: "1"
     ports:
       - "1521:1521"
+    volumes:
+      - ./dev/oracle/init:/container-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "healthcheck.sh"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  # A second Oracle Free whose LATIN1PDB has the WE8ISO8859P1 character set, for the
+  # non-Unicode character-type tests. Its own container: a PDB of another character set in
+  # the CDC stand's CDB makes LogMiner refuse every mining session (ORA-01305).
+  oracle-latin1:
+    image: gvenzl/oracle-free:23-slim-faststart
+    environment:
+      ORACLE_PASSWORD: rivet
+      RIVET_STAND_LATIN1_PDB: "1"
+    ports:
+      - "1531:1521"
     volumes:
       - ./dev/oracle/init:/container-entrypoint-initdb.d:ro
     healthcheck:

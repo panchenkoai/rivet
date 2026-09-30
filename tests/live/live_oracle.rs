@@ -2127,7 +2127,7 @@ fn unistr(s: &str) -> String {
 /// A WE8ISO8859P1 database: Latin-1 VARCHAR2/CHAR/CLOB and non-Latin NVARCHAR2/NCHAR/NCLOB
 /// arrive byte-exact, checked against the inserted literal and Oracle's own UTF-8 rendering.
 #[test]
-#[ignore = "live: requires the stand's LATIN1PDB (dev/oracle/init/03-latin1-pdb.sh)"]
+#[ignore = "live: requires the oracle-latin1 service"]
 fn a_non_unicode_database_round_trips_character_types_byte_exact() {
     let url = oracle_latin1_url();
     let cs = std::panic::catch_unwind(|| {
@@ -2138,8 +2138,8 @@ fn a_non_unicode_database_round_trips_character_types_byte_exact() {
     })
     .unwrap_or_else(|_| {
         panic!(
-            "no LATIN1PDB at {url}: create it once with \
-             `docker exec -i -e RIVET_STAND_LATIN1_PDB=1 rivet-oracle-1 bash < dev/oracle/init/03-latin1-pdb.sh`"
+            "no LATIN1PDB at {url}: start the stand's `oracle-latin1` service \
+             (`docker compose up -d oracle-latin1`)"
         )
     });
     assert_eq!(cs[0][0].as_deref(), Some("WE8ISO8859P1"), "fixture charset");

@@ -3,9 +3,9 @@
 # for the non-Unicode character-set tests. Oracle Free ships one AL32UTF8 database; a CDB whose
 # root is AL32UTF8 may hold PDBs of other character sets, and a fresh clone of the seed holds no
 # user data, so INTERNAL_USE relabels it safely. Stand-only: never do this to a database with data.
-# Only where RIVET_STAND_LATIN1_PDB=1 (the compose stand), so the release gate's engine containers,
-# which mount this directory too, skip it. Idempotent; on a stand created before it existed:
-#   docker exec -i -e RIVET_STAND_LATIN1_PDB=1 rivet-oracle-1 bash < dev/oracle/init/03-latin1-pdb.sh
+# Only where RIVET_STAND_LATIN1_PDB=1: the compose `oracle-latin1` service, never the CDC
+# stand's `oracle` — LogMiner refuses to mine a CDB holding a PDB of another character set
+# (ORA-01305). The release gate's engine containers mount this directory too and skip it.
 set -euo pipefail
 if [ "${RIVET_STAND_LATIN1_PDB:-}" != "1" ]; then
   echo "RIVET_STAND_LATIN1_PDB is not 1: no LATIN1PDB"
