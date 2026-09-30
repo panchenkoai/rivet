@@ -343,3 +343,84 @@ fn audit_a_healthy_noop_keyset_run_does_not_invalidate_the_prefix() {
         String::from_utf8_lossy(&v.stderr)
     );
 }
+
+/// An incremental run past a stored cursor appends its delta beside the earlier parts BY
+/// DESIGN: the rerun warning ("a glob reader will double-count … clear the prefix") is
+/// false there, and its remedy would delete rows no later run re-exports. The warning
+/// must stay for the run that really re-reads the table: the one after `state reset`.
+///
+/// The oracle for "nothing is double-counted" is the prefix itself against the source:
+/// every Parquet row under it, counted by a plain reader.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn an_incremental_delta_run_does_not_warn_of_accumulation_and_a_reset_rerun_still_does() {
+    delta_run_warns_only_after_a_reset("incremental", &["cursor_column: updated_at"]);
+}
+
+/// The same on the keyset runner, whose `keyset_incremental` continues past a stored key.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_keyset_incremental_delta_run_does_not_warn_of_accumulation_and_a_reset_rerun_still_does() {
+    delta_run_warns_only_after_a_reset(
+        "chunked",
+        &[
+            "chunk_by_key: id",
+            "chunk_size: 100",
+            "chunk_checkpoint: true",
+            "keyset_incremental: true",
+        ],
+    );
+}
+
+fn delta_run_warns_only_after_a_reset(mode: &str, lines: &[&str]) {
+    require_alive(LiveService::Postgres);
+    let tbl = unique_name("rivet_rerun_delta");
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, updated_at TIMESTAMP NOT NULL); \
+         INSERT INTO {tbl} SELECT g, TIMESTAMP '2026-01-01' FROM generate_series(1, 10) g"
+    ))
+    .expect("seed");
+    let _t = PgTable::adopt(tbl.clone());
+    let out = tempfile::tempdir().unwrap();
+    let mut rig = Rig::pg_batch(&tbl)
+        .export_named("delta")
+        .mode(mode)
+        .dest_path(out.path().to_path_buf());
+    for line in lines {
+        rig = rig.export_line(line);
+    }
+    let warned = |said: &str| said.contains("already has parts from a prior run");
+
+    assert!(
+        !warned(&rig.run_ok_capture()),
+        "an empty prefix has nothing to warn about"
+    );
+    c.batch_execute(&format!(
+        "INSERT INTO {tbl} SELECT g, TIMESTAMP '2026-02-01' FROM generate_series(11, 15) g"
+    ))
+    .expect("delta");
+    let delta = rig.run_ok_capture();
+    assert_eq!(
+        total_parquet_rows(out.path()),
+        15,
+        "fixture: the delta run must leave the prefix holding each source row once"
+    );
+    assert!(
+        !warned(&delta),
+        "a delta past the stored cursor is not an accumulation:\n{delta}"
+    );
+
+    let reset = rig.cli(&["state", "reset", "--export", "delta"]);
+    assert!(reset.status.success(), "state reset failed");
+    let reread = rig.run_ok_capture();
+    assert_eq!(
+        total_parquet_rows(out.path()),
+        30,
+        "fixture: with the cursor gone the run re-reads the table beside the old parts"
+    );
+    assert!(
+        warned(&reread),
+        "a whole-table re-read beside prior parts must still warn:\n{reread}"
+    );
+}

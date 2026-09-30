@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **An incremental run no longer warns that it double-counts.** Every `mode: incremental` or
+  `keyset_incremental` run after the first warned that the prefix "already has parts from a prior
+  run", that a reader would double-count, and to clear the prefix. A delta past the stored cursor
+  is appended there by design, and clearing the prefix deletes rows no later run exports again.
+  The warning now stays for a run that re-reads the table beside old parts: a full, chunked or
+  time-window re-run, and an incremental run with no stored cursor (the first one, or one after
+  `rivet state reset`).
 - **Breaking: MySQL CDC refuses `binlog_row_metadata = MINIMAL`.** It used to warn and map binlog
   values by position, so a column reorder or `ALTER` delivered them under the wrong names (source
   `(1, b='BBB', a='AAA')` arrived as `b='AAA', a='BBB'`). A server that is not at FULL, or that

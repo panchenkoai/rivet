@@ -1246,8 +1246,13 @@ fn resume_success_gate_applies(resume: bool, force: bool) -> bool {
 
 /// Sibling of [`resume_success_gate_applies`] — the fresh-run rerun-accumulation
 /// warning (audit findings #5/#19/#30).
-fn rerun_warning_applies(resume: bool, force: bool) -> bool {
-    !resume && !force
+fn rerun_warning_applies(resume: bool, force: bool, appends_delta: bool) -> bool {
+    !resume && !force && !appends_delta
+}
+
+/// Whether this run appends only a delta beside the prior parts: a delta strategy with stored progress to continue from.
+fn appends_delta(strategy: &ExtractionStrategy, stored_progress: bool) -> bool {
+    strategy.continues_from_stored_progress() && stored_progress
 }
 
 /// May a successful run promote its status to `success`?
@@ -1829,7 +1834,15 @@ fn run_export_job_inner(
     // parts.  Refusing or auto-deleting would destroy operator data, so this
     // is a loud, non-fatal WARN instead (the `--resume` path above keeps its
     // refuse-without-`--force` gate).  `--force` is the explicit opt-out.
-    if rerun_warning_applies(opts.resume, opts.force) {
+    // An incremental run past a stored cursor appends its delta here by design.
+    let stored_progress = state
+        .get(&plan.export_name, &plan.source.state_key())
+        .is_ok_and(|c| c.last_cursor_value.is_some());
+    if rerun_warning_applies(
+        opts.resume,
+        opts.force,
+        appends_delta(&plan.strategy, stored_progress),
+    ) {
         warn_if_prefix_has_completed_run(&plan);
     }
 
@@ -2401,11 +2414,13 @@ mod tests {
         // --resume, no --force: refuse a complete prefix; do NOT warn (the
         // resume path owns this case).
         assert!(resume_success_gate_applies(true, false));
-        assert!(!rerun_warning_applies(true, false));
+        assert!(!rerun_warning_applies(true, false, false));
         // fresh run, no --force: warn about accumulation; the refuse-gate is
         // not this path's.
         assert!(!resume_success_gate_applies(false, false));
-        assert!(rerun_warning_applies(false, false));
+        assert!(rerun_warning_applies(false, false, false));
+        // a delta appended past stored progress is the design, not an accumulation.
+        assert!(!rerun_warning_applies(false, false, true));
         // --force is the audited override: BOTH gates go quiet, resumed or not.
         for resume in [true, false] {
             assert!(
@@ -2413,7 +2428,7 @@ mod tests {
                 "--force must disable the resume refusal (resume={resume})"
             );
             assert!(
-                !rerun_warning_applies(resume, true),
+                !rerun_warning_applies(resume, true, false),
                 "--force must disable the rerun warning (resume={resume})"
             );
         }

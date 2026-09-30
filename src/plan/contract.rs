@@ -330,6 +330,15 @@ impl ExtractionStrategy {
         }
     }
 
+    /// Whether a clean re-run continues from stored progress and appends only a delta: an incremental cursor or `keyset_incremental`.
+    pub fn continues_from_stored_progress(&self) -> bool {
+        match self {
+            ExtractionStrategy::Incremental(_) => true,
+            ExtractionStrategy::Keyset(kp) => kp.incremental,
+            _ => false,
+        }
+    }
+
     /// Resolved incremental cursor plan when strategy is incremental.
     pub fn incremental_plan(&self) -> Option<&IncrementalCursorPlan> {
         match self {
@@ -485,6 +494,17 @@ mod tests {
         assert!(
             keyset(true).reconcile_subset_skip().is_some(),
             "keyset_incremental pulls only new keys — reconcile must skip"
+        );
+        assert!(keyset(true).continues_from_stored_progress());
+        assert!(!keyset(false).continues_from_stored_progress());
+        assert!(
+            !ExtractionStrategy::TimeWindow {
+                column: "d".into(),
+                column_type: TimeColumnType::Timestamp,
+                days_window: 7,
+            }
+            .continues_from_stored_progress(),
+            "a time window re-reads its window: a re-run beside old parts duplicates them"
         );
         assert!(
             keyset(false).reconcile_subset_skip().is_none(),
