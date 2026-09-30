@@ -4,8 +4,22 @@
 #          renderer: the pure fn in src/types/delivery.rs, or `engine-produced`.
 #          recover:  the expression each warehouse runs on the text column `x` to get a
 #                    native column back; `text` means the column stays text there.
-# engines: every `SourceType` × mode (batch, cdc); rows (native type -> delivery) are
-#          filled per engine as it migrates to the column plan.
+# engines: every `SourceType` × mode (batch, cdc), one row per native type:
+#          native_type  the column type as written in CREATE TABLE
+#          sample       SQL literals; sample i of every row lands in table row i
+#          delivery     the Arrow type (`DataType` display), a canonical extension name
+#                       (`arrow.uuid`), a TextForm label from `forms:` above, or `refused`
+#                       (the run fails naming the column)
+#          override     optional `columns:` override applied in both modes
+#          render       optional {source, parquet, canon}: the value as text on the source
+#                       and in DuckDB (`{c}` is the column; `parquet: arrow` for a type
+#                       DuckDB misreads, CP11), then canonicalised (number, timestamp,
+#                       float32, float64) on both sides
+#          diverges     on the cdc row only: why its delivery differs from batch (ADR ref)
+#          setup:       engine-level DDL run before the table (types the rows name).
+#          A row in one mode has its twin, with the same sample, in the other.
+#          tests/live/live_cdc_type_parity.rs builds one table per engine from these rows
+#          and proves both modes deliver each row as declared, alike and equal to the source.
 #
 # Guarded by tests/offline/type_capability_matrix_guard.rs.
 
@@ -111,30 +125,226 @@ forms:
 
 engines:
   postgres:
-    batch: {}
+    setup:
+      - "DO $$ BEGIN CREATE TYPE rivet_status AS ENUM ('active','inactive','pending'); EXCEPTION WHEN duplicate_object THEN NULL; END $$"
+      - "DO $$ BEGIN CREATE TYPE rivet_status_typed AS ENUM ('active','shipped','off'); EXCEPTION WHEN duplicate_object THEN NULL; END $$"
+    batch:
+      - {native_type: "TEXT", sample: ["'üñíçødé ''q'''", "'hello'"], delivery: "Utf8"}
+      - {native_type: "NUMERIC(18,2)", sample: ["999999999999.99"], delivery: "Decimal128(18, 2)"}
+      - {native_type: "NUMERIC(18,4)", sample: ["12345.6789"], delivery: "Decimal128(18, 4)"}
+      - {native_type: "TIMESTAMP", sample: ["'2035-08-07 09:08:07.987654'"], delivery: "Timestamp(µs)"}
+      - {native_type: "TIMESTAMPTZ", sample: ["'2019-02-03 08:07:06.554433+05'"], delivery: "Timestamp(µs, \"UTC\")"}
+      - {native_type: "BYTEA", sample: ["'\\x00ff01'::bytea", "'\\xDEADBEEF'"], delivery: "Binary", render: {source: "encode({c}, 'hex')", parquet: "lower(hex({c}))"}}
+      - {native_type: "UUID", sample: ["'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380011'", "'12345678-1234-1234-1234-123456789012'"], delivery: "arrow.uuid"}
+      - {native_type: "JSONB", sample: ["'{\"n\":1}'::jsonb", "'{\"k\": \"v\", \"n\": 42}'"], delivery: "arrow.json"}
+      - {native_type: "BOOLEAN", sample: ["TRUE", "true"], delivery: "Boolean"}
+      - {native_type: "SMALLINT", sample: ["32767"], delivery: "Int16"}
+      - {native_type: "BIGINT", sample: ["9000000000000"], delivery: "Int64"}
+      - {native_type: "DOUBLE PRECISION", sample: ["2.5", "1.5"], delivery: "Float64"}
+      - {native_type: "DATE", sample: ["'2024-03-15'"], delivery: "Date32"}
+      - {native_type: "TIME", sample: ["'14:30:00.123456'"], delivery: "Time64(µs)"}
+      - {native_type: "INTERVAL", sample: ["INTERVAL '1 year 2 mons 3 days'"], delivery: "Utf8"}
+      - {native_type: "rivet_status", sample: ["'active'"], delivery: "Utf8"}
+      - {native_type: "rivet_status_typed", sample: ["'off'"], delivery: "Utf8"}
+      - {native_type: "JSON", sample: ["'{\"k\": [1, 2]}'::json"], delivery: "arrow.json"}
+      - {native_type: "CHAR(8)", sample: ["'pad'"], delivery: "Utf8", render: {source: "CASE WHEN {c} IS NOT NULL THEN format('%s', {c}) END"}}
+      - {native_type: "VARCHAR(50)", sample: ["'plain varchar'"], delivery: "Utf8"}
+      - {native_type: "REAL", sample: ["3.14"], delivery: "Float32"}
+      - {native_type: "TEXT[]", sample: ["ARRAY['with,comma', 'he said \"hi\"', NULL]", "ARRAY[]::text[]"], delivery: "List(Utf8)", render: {source: "array_to_json({c})::text", parquet: "CAST(to_json({c}) AS VARCHAR)"}}
+      - {native_type: "INTEGER[]", sample: ["ARRAY[1, NULL, 3]", "'{}'"], delivery: "List(Int32)", render: {source: "array_to_json({c})::text", parquet: "CAST(to_json({c}) AS VARCHAR)"}}
+      - {native_type: "DOUBLE PRECISION[]", sample: ["ARRAY[2.5, -0.5]"], delivery: "List(Float64)", render: {source: "array_to_json({c})::text", parquet: "CAST(to_json({c}) AS VARCHAR)"}}
+      - {native_type: "NUMERIC(60,10)", sample: ["123456789012345678901234567890.0123456789"], delivery: "Decimal256(60, 10)", render: {parquet: "arrow"}}
+      - {native_type: "NUMERIC", sample: ["1.50", "-0.000001234", "123456789012345678901234567890.123456789012", "'NaN'"], delivery: "refused"}
+      - {native_type: "MONEY", sample: ["'12.34'"], delivery: "refused"}
+      - {native_type: "INET", sample: ["'192.168.0.1'"], delivery: "refused", render: {source: "CASE WHEN {c} IS NOT NULL THEN format('%s', {c}) END"}}
+      - {native_type: "CIDR", sample: ["'10.0.0.0/8'"], delivery: "refused"}
+      - {native_type: "DATE[]", sample: ["ARRAY['2024-01-01'::date]"], delivery: "refused"}
+      - {native_type: "TIMESTAMP[]", sample: ["ARRAY['2024-01-01 10:00:00'::timestamp]"], delivery: "refused"}
+      - {native_type: "TIMESTAMPTZ[]", sample: ["ARRAY['2024-01-01 10:00:00+00'::timestamptz]"], delivery: "refused"}
+      - {native_type: "TIME[]", sample: ["ARRAY['10:00:00'::time]"], delivery: "refused"}
+      - {native_type: "UUID[]", sample: ["ARRAY['12345678-1234-1234-1234-123456789012'::uuid]"], delivery: "refused"}
+      - {native_type: "BYTEA[]", sample: ["ARRAY['\\xDEADBEEF'::bytea]"], delivery: "refused"}
+      - {native_type: "NUMERIC[]", sample: ["ARRAY[1.5]::numeric[]"], delivery: "refused"}
     cdc:
-      # test_decoding's own text, verbatim; any type the CDC builder has no
-      # native arm for (ADR-0038 CP4) is delivered the same way.
-      numeric: server_text              # no declared precision
-      money: server_text
-      inet: server_text
-      cidr: server_text
-      date[]: server_text               # arrays of these keep the server's literal
-      timestamp[]: server_text
-      timestamptz[]: server_text
-      time[]: server_text
-      uuid[]: server_text
-      bytea[]: server_text
-      numeric[]: server_text
+      - {native_type: "TEXT", sample: ["'üñíçødé ''q'''", "'hello'"], delivery: "Utf8"}
+      - {native_type: "NUMERIC(18,2)", sample: ["999999999999.99"], delivery: "Decimal128(18, 2)"}
+      - {native_type: "NUMERIC(18,4)", sample: ["12345.6789"], delivery: "Decimal128(18, 4)"}
+      - {native_type: "TIMESTAMP", sample: ["'2035-08-07 09:08:07.987654'"], delivery: "Timestamp(µs)"}
+      - {native_type: "TIMESTAMPTZ", sample: ["'2019-02-03 08:07:06.554433+05'"], delivery: "Timestamp(µs, \"UTC\")"}
+      - {native_type: "BYTEA", sample: ["'\\x00ff01'::bytea", "'\\xDEADBEEF'"], delivery: "Binary", render: {source: "encode({c}, 'hex')", parquet: "lower(hex({c}))"}}
+      - {native_type: "UUID", sample: ["'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380011'", "'12345678-1234-1234-1234-123456789012'"], delivery: "arrow.uuid"}
+      - {native_type: "JSONB", sample: ["'{\"n\":1}'::jsonb", "'{\"k\": \"v\", \"n\": 42}'"], delivery: "arrow.json"}
+      - {native_type: "BOOLEAN", sample: ["TRUE", "true"], delivery: "Boolean"}
+      - {native_type: "SMALLINT", sample: ["32767"], delivery: "Int16"}
+      - {native_type: "BIGINT", sample: ["9000000000000"], delivery: "Int64"}
+      - {native_type: "DOUBLE PRECISION", sample: ["2.5", "1.5"], delivery: "Float64"}
+      - {native_type: "DATE", sample: ["'2024-03-15'"], delivery: "Date32"}
+      - {native_type: "TIME", sample: ["'14:30:00.123456'"], delivery: "Time64(µs)"}
+      - {native_type: "INTERVAL", sample: ["INTERVAL '1 year 2 mons 3 days'"], delivery: "Utf8"}
+      - {native_type: "rivet_status", sample: ["'active'"], delivery: "Utf8"}
+      - {native_type: "rivet_status_typed", sample: ["'off'"], delivery: "Utf8"}
+      - {native_type: "JSON", sample: ["'{\"k\": [1, 2]}'::json"], delivery: "arrow.json"}
+      - {native_type: "CHAR(8)", sample: ["'pad'"], delivery: "Utf8", render: {source: "CASE WHEN {c} IS NOT NULL THEN format('%s', {c}) END"}}
+      - {native_type: "VARCHAR(50)", sample: ["'plain varchar'"], delivery: "Utf8"}
+      - {native_type: "REAL", sample: ["3.14"], delivery: "Float32"}
+      - {native_type: "TEXT[]", sample: ["ARRAY['with,comma', 'he said \"hi\"', NULL]", "ARRAY[]::text[]"], delivery: "List(Utf8)", render: {source: "array_to_json({c})::text", parquet: "CAST(to_json({c}) AS VARCHAR)"}}
+      - {native_type: "INTEGER[]", sample: ["ARRAY[1, NULL, 3]", "'{}'"], delivery: "List(Int32)", render: {source: "array_to_json({c})::text", parquet: "CAST(to_json({c}) AS VARCHAR)"}}
+      - {native_type: "DOUBLE PRECISION[]", sample: ["ARRAY[2.5, -0.5]"], delivery: "List(Float64)", render: {source: "array_to_json({c})::text", parquet: "CAST(to_json({c}) AS VARCHAR)"}}
+      - {native_type: "NUMERIC(60,10)", sample: ["123456789012345678901234567890.0123456789"], delivery: "Decimal256(60, 10)", render: {parquet: "arrow"}}
+      - {native_type: "NUMERIC", sample: ["1.50", "-0.000001234", "123456789012345678901234567890.123456789012", "'NaN'"], delivery: "server_text", diverges: "batch has no decoder yet and refuses the column by name; CDC keeps test_decoding's own text (ADR-0038 CP4, CP12)"}
+      - {native_type: "MONEY", sample: ["'12.34'"], delivery: "server_text", diverges: "batch has no decoder yet and refuses the column by name; CDC keeps test_decoding's own text (ADR-0038 CP4, CP12)"}
+      - {native_type: "INET", sample: ["'192.168.0.1'"], delivery: "server_text", render: {source: "CASE WHEN {c} IS NOT NULL THEN format('%s', {c}) END"}, diverges: "batch has no decoder yet and refuses the column by name; CDC keeps test_decoding's own text (ADR-0038 CP4, CP12)"}
+      - {native_type: "CIDR", sample: ["'10.0.0.0/8'"], delivery: "server_text", diverges: "batch has no decoder yet and refuses the column by name; CDC keeps test_decoding's own text (ADR-0038 CP4, CP12)"}
+      - {native_type: "DATE[]", sample: ["ARRAY['2024-01-01'::date]"], delivery: "server_text", diverges: "batch has no decoder yet and refuses the column by name; CDC keeps test_decoding's own text (ADR-0038 CP4, CP12)"}
+      - {native_type: "TIMESTAMP[]", sample: ["ARRAY['2024-01-01 10:00:00'::timestamp]"], delivery: "server_text", diverges: "batch has no decoder yet and refuses the column by name; CDC keeps test_decoding's own text (ADR-0038 CP4, CP12)"}
+      - {native_type: "TIMESTAMPTZ[]", sample: ["ARRAY['2024-01-01 10:00:00+00'::timestamptz]"], delivery: "server_text", diverges: "batch has no decoder yet and refuses the column by name; CDC keeps test_decoding's own text (ADR-0038 CP4, CP12)"}
+      - {native_type: "TIME[]", sample: ["ARRAY['10:00:00'::time]"], delivery: "server_text", diverges: "batch has no decoder yet and refuses the column by name; CDC keeps test_decoding's own text (ADR-0038 CP4, CP12)"}
+      - {native_type: "UUID[]", sample: ["ARRAY['12345678-1234-1234-1234-123456789012'::uuid]"], delivery: "server_text", diverges: "batch has no decoder yet and refuses the column by name; CDC keeps test_decoding's own text (ADR-0038 CP4, CP12)"}
+      - {native_type: "BYTEA[]", sample: ["ARRAY['\\xDEADBEEF'::bytea]"], delivery: "server_text", diverges: "batch has no decoder yet and refuses the column by name; CDC keeps test_decoding's own text (ADR-0038 CP4, CP12)"}
+      - {native_type: "NUMERIC[]", sample: ["ARRAY[1.5]::numeric[]"], delivery: "server_text", diverges: "batch has no decoder yet and refuses the column by name; CDC keeps test_decoding's own text (ADR-0038 CP4, CP12)"}
   mysql:
-    batch: {}
-    cdc: {}
+    batch:
+      - {native_type: "VARCHAR(200)", sample: ["'üñíçødé'"], delivery: "Utf8"}
+      - {native_type: "VARCHAR(20)", sample: ["'hello'"], delivery: "Utf8"}
+      - {native_type: "DECIMAL(18,2)", sample: ["999999999999.99"], delivery: "Decimal128(18, 2)"}
+      - {native_type: "DECIMAL(18,4)", sample: ["12345.6789"], delivery: "Decimal128(18, 4)"}
+      - {native_type: "DATETIME(6)", sample: ["'2035-08-07 09:08:07.987654'"], delivery: "Timestamp(µs)"}
+      - {native_type: "TIMESTAMP(6) NULL", sample: ["'2035-08-07 09:08:07.987654'"], delivery: "Timestamp(µs, \"UTC\")", render: {source: "CONCAT(CAST({c} AS CHAR), '+00')"}}
+      - {native_type: "BINARY(4)", sample: ["UNHEX('00000000')"], delivery: "Binary", render: {source: "LOWER(HEX({c}))", parquet: "lower(hex({c}))"}}
+      - {native_type: "JSON", sample: ["JSON_OBJECT('tier','gold','n',1)", "'{\"k\": \"v\", \"n\": 42}'"], delivery: "arrow.json"}
+      - {native_type: "BOOLEAN", sample: ["TRUE", "1"], delivery: "Boolean", render: {source: "CASE {c} WHEN 1 THEN 'true' WHEN 0 THEN 'false' END"}}
+      - {native_type: "BIT(1)", sample: ["b'1'"], delivery: "Boolean", render: {source: "CASE {c} + 0 WHEN 1 THEN 'true' WHEN 0 THEN 'false' END"}}
+      - {native_type: "BIT(8)", sample: ["b'10101010'"], delivery: "Int64", render: {source: "CAST({c} + 0 AS CHAR)"}}
+      - {native_type: "TINYINT", sample: ["127"], delivery: "Int16"}
+      - {native_type: "DATE", sample: ["'2024-03-15'"], delivery: "Date32"}
+      - {native_type: "TIME(6)", sample: ["'14:30:00.123456'"], delivery: "Time64(µs)"}
+      - {native_type: "YEAR", sample: ["2024"], delivery: "Int16"}
+      - {native_type: "ENUM('a','b','c')", sample: ["'b'"], delivery: "Utf8"}
+      - {native_type: "ENUM('active','shipped','off')", sample: ["'off'"], delivery: "Utf8"}
+      - {native_type: "VARBINARY(4)", sample: ["0xDEADBEEF"], delivery: "Binary", render: {source: "LOWER(HEX({c}))", parquet: "lower(hex({c}))"}}
+      - {native_type: "BLOB", sample: ["0x0102"], delivery: "Binary", render: {source: "LOWER(HEX({c}))", parquet: "lower(hex({c}))"}}
+      - {native_type: "SMALLINT", sample: ["-32768"], delivery: "Int16"}
+      - {native_type: "MEDIUMINT", sample: ["-8388608"], delivery: "Int32"}
+      - {native_type: "INT", sample: ["-2147483648"], delivery: "Int32"}
+      - {native_type: "INT UNSIGNED", sample: ["4294967295"], delivery: "Int64"}
+      - {native_type: "BIGINT UNSIGNED", sample: ["18446744073709551615", "18000000000000000000"], delivery: "UInt64"}
+      - {native_type: "FLOAT", sample: ["1.5"], delivery: "Float32"}
+      - {native_type: "DOUBLE", sample: ["-2.25", "1.5"], delivery: "Float64"}
+      - {native_type: "CHAR(8)", sample: ["'pad'"], delivery: "Utf8"}
+      - {native_type: "CHAR(36)", sample: ["'12345678-1234-1234-1234-123456789012'"], delivery: "Utf8"}
+      - {native_type: "TEXT", sample: ["'long text'"], delivery: "Utf8"}
+      - {native_type: "SET('x','y','z')", sample: ["'x,z'"], delivery: "Utf8"}
+      - {native_type: "SET('a','b','c')", sample: ["'a,b'"], delivery: "Utf8"}
+    cdc:
+      - {native_type: "VARCHAR(200)", sample: ["'üñíçødé'"], delivery: "Utf8"}
+      - {native_type: "VARCHAR(20)", sample: ["'hello'"], delivery: "Utf8"}
+      - {native_type: "DECIMAL(18,2)", sample: ["999999999999.99"], delivery: "Decimal128(18, 2)"}
+      - {native_type: "DECIMAL(18,4)", sample: ["12345.6789"], delivery: "Decimal128(18, 4)"}
+      - {native_type: "DATETIME(6)", sample: ["'2035-08-07 09:08:07.987654'"], delivery: "Timestamp(µs)"}
+      - {native_type: "TIMESTAMP(6) NULL", sample: ["'2035-08-07 09:08:07.987654'"], delivery: "Timestamp(µs, \"UTC\")", render: {source: "CONCAT(CAST({c} AS CHAR), '+00')"}}
+      - {native_type: "BINARY(4)", sample: ["UNHEX('00000000')"], delivery: "Binary", render: {source: "LOWER(HEX({c}))", parquet: "lower(hex({c}))"}}
+      - {native_type: "JSON", sample: ["JSON_OBJECT('tier','gold','n',1)", "'{\"k\": \"v\", \"n\": 42}'"], delivery: "arrow.json"}
+      - {native_type: "BOOLEAN", sample: ["TRUE", "1"], delivery: "Boolean", render: {source: "CASE {c} WHEN 1 THEN 'true' WHEN 0 THEN 'false' END"}}
+      - {native_type: "BIT(1)", sample: ["b'1'"], delivery: "Boolean", render: {source: "CASE {c} + 0 WHEN 1 THEN 'true' WHEN 0 THEN 'false' END"}}
+      - {native_type: "BIT(8)", sample: ["b'10101010'"], delivery: "Int64", render: {source: "CAST({c} + 0 AS CHAR)"}}
+      - {native_type: "TINYINT", sample: ["127"], delivery: "Int16"}
+      - {native_type: "DATE", sample: ["'2024-03-15'"], delivery: "Date32"}
+      - {native_type: "TIME(6)", sample: ["'14:30:00.123456'"], delivery: "Time64(µs)"}
+      - {native_type: "YEAR", sample: ["2024"], delivery: "Int16"}
+      - {native_type: "ENUM('a','b','c')", sample: ["'b'"], delivery: "Utf8"}
+      - {native_type: "ENUM('active','shipped','off')", sample: ["'off'"], delivery: "Utf8"}
+      - {native_type: "VARBINARY(4)", sample: ["0xDEADBEEF"], delivery: "Binary", render: {source: "LOWER(HEX({c}))", parquet: "lower(hex({c}))"}}
+      - {native_type: "BLOB", sample: ["0x0102"], delivery: "Binary", render: {source: "LOWER(HEX({c}))", parquet: "lower(hex({c}))"}}
+      - {native_type: "SMALLINT", sample: ["-32768"], delivery: "Int16"}
+      - {native_type: "MEDIUMINT", sample: ["-8388608"], delivery: "Int32"}
+      - {native_type: "INT", sample: ["-2147483648"], delivery: "Int32"}
+      - {native_type: "INT UNSIGNED", sample: ["4294967295"], delivery: "Int64"}
+      - {native_type: "BIGINT UNSIGNED", sample: ["18446744073709551615", "18000000000000000000"], delivery: "UInt64"}
+      - {native_type: "FLOAT", sample: ["1.5"], delivery: "Float32"}
+      - {native_type: "DOUBLE", sample: ["-2.25", "1.5"], delivery: "Float64"}
+      - {native_type: "CHAR(8)", sample: ["'pad'"], delivery: "Utf8"}
+      - {native_type: "CHAR(36)", sample: ["'12345678-1234-1234-1234-123456789012'"], delivery: "Utf8"}
+      - {native_type: "TEXT", sample: ["'long text'"], delivery: "Utf8"}
+      - {native_type: "SET('x','y','z')", sample: ["'x,z'"], delivery: "Utf8"}
+      - {native_type: "SET('a','b','c')", sample: ["'a,b'"], delivery: "Utf8"}
   mssql:
-    batch: {}
-    cdc: {}
+    batch:
+      - {native_type: "BIGINT", sample: ["9000000000000"], delivery: "Int64"}
+      - {native_type: "DECIMAL(18,4)", sample: ["12345.6789"], delivery: "Decimal128(18, 4)"}
+      - {native_type: "BIT", sample: ["1"], delivery: "Boolean", render: {source: "CASE {c} WHEN 1 THEN 'true' WHEN 0 THEN 'false' END"}}
+      - {native_type: "VARCHAR(50)", sample: ["'hello'"], delivery: "Utf8"}
+      - {native_type: "NVARCHAR(50)", sample: ["N'cafe-unicode'"], delivery: "Utf8"}
+      - {native_type: "DATETIME2", sample: ["'2026-06-23 10:00:00.1234567'"], delivery: "Timestamp(µs)", render: {source: "CONVERT(varchar(26), {c}, 121)"}}
+      - {native_type: "DATETIMEOFFSET", sample: ["'2026-06-23 10:00:00 +05:30'"], delivery: "Timestamp(µs, \"UTC\")", render: {source: "CONVERT(varchar(26), SWITCHOFFSET({c}, '+00:00'), 121)", parquet: "strftime({c}, '%Y-%m-%d %H:%M:%S.%f')"}}
+      - {native_type: "DATE", sample: ["'2026-06-23'"], delivery: "Date32"}
+      - {native_type: "TIME", sample: ["'13:45:30.123456'"], delivery: "Time64(µs)", render: {source: "CONVERT(varchar(15), {c}, 114)"}}
+      - {native_type: "UNIQUEIDENTIFIER", sample: ["'12345678-1234-1234-1234-123456789012'"], delivery: "arrow.uuid"}
+      - {native_type: "VARBINARY(16)", sample: ["0xDEADBEEF"], delivery: "Binary", render: {source: "LOWER(CONVERT(varchar(max), {c}, 2))", parquet: "lower(hex({c}))"}}
+      - {native_type: "CHAR(8)", sample: ["'pad'"], delivery: "Utf8"}
+      - {native_type: "NCHAR(8)", sample: ["N'ñpad'"], delivery: "Utf8"}
+      - {native_type: "DATETIME", sample: ["'2026-01-15T13:45:30.127'"], delivery: "Timestamp(µs)", render: {source: "CONVERT(varchar(26), CAST({c} AS DATETIME2(6)), 121)"}}
+      - {native_type: "SMALLDATETIME", sample: ["'2026-01-15T13:45:00'"], delivery: "Timestamp(µs)", render: {source: "CONVERT(varchar(19), {c}, 120)"}}
+      - {native_type: "BINARY(8)", sample: ["0xAB"], delivery: "Binary", render: {source: "LOWER(CONVERT(varchar(max), {c}, 2))", parquet: "lower(hex({c}))"}}
+      - {native_type: "NUMERIC(10,3)", sample: ["12.345"], delivery: "Decimal128(10, 3)"}
+      - {native_type: "MONEY", sample: ["123.4567"], delivery: "Decimal128(19, 4)", render: {source: "CONVERT(varchar(30), {c}, 2)"}}
+      - {native_type: "SMALLMONEY", sample: ["-0.01"], delivery: "Decimal128(19, 4)", render: {source: "CONVERT(varchar(30), {c}, 2)"}}
+      - {native_type: "VARBINARY(4)", sample: ["0xDEADBEEF"], delivery: "Binary", render: {source: "LOWER(CONVERT(varchar(max), {c}, 2))", parquet: "lower(hex({c}))"}}
+      - {native_type: "FLOAT", sample: ["1.5"], delivery: "Float64"}
+    cdc:
+      - {native_type: "BIGINT", sample: ["9000000000000"], delivery: "Int64"}
+      - {native_type: "DECIMAL(18,4)", sample: ["12345.6789"], delivery: "Decimal128(18, 4)"}
+      - {native_type: "BIT", sample: ["1"], delivery: "Boolean", render: {source: "CASE {c} WHEN 1 THEN 'true' WHEN 0 THEN 'false' END"}}
+      - {native_type: "VARCHAR(50)", sample: ["'hello'"], delivery: "Utf8"}
+      - {native_type: "NVARCHAR(50)", sample: ["N'cafe-unicode'"], delivery: "Utf8"}
+      - {native_type: "DATETIME2", sample: ["'2026-06-23 10:00:00.1234567'"], delivery: "Timestamp(µs)", render: {source: "CONVERT(varchar(26), {c}, 121)"}}
+      - {native_type: "DATETIMEOFFSET", sample: ["'2026-06-23 10:00:00 +05:30'"], delivery: "Timestamp(µs, \"UTC\")", render: {source: "CONVERT(varchar(26), SWITCHOFFSET({c}, '+00:00'), 121)", parquet: "strftime({c}, '%Y-%m-%d %H:%M:%S.%f')"}}
+      - {native_type: "DATE", sample: ["'2026-06-23'"], delivery: "Date32"}
+      - {native_type: "TIME", sample: ["'13:45:30.123456'"], delivery: "Time64(µs)", render: {source: "CONVERT(varchar(15), {c}, 114)"}}
+      - {native_type: "UNIQUEIDENTIFIER", sample: ["'12345678-1234-1234-1234-123456789012'"], delivery: "arrow.uuid"}
+      - {native_type: "VARBINARY(16)", sample: ["0xDEADBEEF"], delivery: "Binary", render: {source: "LOWER(CONVERT(varchar(max), {c}, 2))", parquet: "lower(hex({c}))"}}
+      - {native_type: "CHAR(8)", sample: ["'pad'"], delivery: "Utf8"}
+      - {native_type: "NCHAR(8)", sample: ["N'ñpad'"], delivery: "Utf8"}
+      - {native_type: "DATETIME", sample: ["'2026-01-15T13:45:30.127'"], delivery: "Timestamp(µs)", render: {source: "CONVERT(varchar(26), CAST({c} AS DATETIME2(6)), 121)"}}
+      - {native_type: "SMALLDATETIME", sample: ["'2026-01-15T13:45:00'"], delivery: "Timestamp(µs)", render: {source: "CONVERT(varchar(19), {c}, 120)"}}
+      - {native_type: "BINARY(8)", sample: ["0xAB"], delivery: "Binary", render: {source: "LOWER(CONVERT(varchar(max), {c}, 2))", parquet: "lower(hex({c}))"}}
+      - {native_type: "NUMERIC(10,3)", sample: ["12.345"], delivery: "Decimal128(10, 3)"}
+      - {native_type: "MONEY", sample: ["123.4567"], delivery: "Decimal128(19, 4)", render: {source: "CONVERT(varchar(30), {c}, 2)"}}
+      - {native_type: "SMALLMONEY", sample: ["-0.01"], delivery: "Decimal128(19, 4)", render: {source: "CONVERT(varchar(30), {c}, 2)"}}
+      - {native_type: "VARBINARY(4)", sample: ["0xDEADBEEF"], delivery: "Binary", render: {source: "LOWER(CONVERT(varchar(max), {c}, 2))", parquet: "lower(hex({c}))"}}
+      - {native_type: "FLOAT", sample: ["1.5"], delivery: "Float64"}
   oracle:
-    batch: {}
-    cdc: {}
+    batch:
+      - {native_type: "NUMBER", sample: ["123.45", "12345678901234567890.123456789", "1E125", "-0.000000000000000000000000000000000000001"], delivery: "Utf8", render: {source: "TO_CHAR({c}, 'TM9')", canon: "number"}}
+      - {native_type: "NUMBER(38,10)", sample: ["1.5", "1234567890123456789012345678.0123456789", "0.5"], delivery: "Decimal128(38, 10)", render: {source: "TO_CHAR({c}, 'TM9')", canon: "number"}}
+      - {native_type: "NUMBER(9)", sample: ["42", "-999999999", "0"], delivery: "Int32", render: {source: "TO_CHAR({c}, 'TM9')", canon: "number"}}
+      - {native_type: "NUMBER(18)", sample: ["9007199254740993", "-999999999999999999", "0"], delivery: "Int64", render: {source: "TO_CHAR({c}, 'TM9')", canon: "number"}}
+      - {native_type: "BINARY_FLOAT", sample: ["1.5", "BINARY_FLOAT_NAN", "-0.1"], delivery: "Float32", render: {canon: "float32"}}
+      - {native_type: "BINARY_DOUBLE", sample: ["2.25", "BINARY_DOUBLE_INFINITY", "0.1"], delivery: "Float64", render: {canon: "float64"}}
+      - {native_type: "DATE", sample: ["TO_DATE('2024-02-29 13:14:15','YYYY-MM-DD HH24:MI:SS')", "TO_DATE('0001-01-01','YYYY-MM-DD')"], delivery: "Timestamp(µs)", render: {source: "TO_CHAR(CAST({c} AS TIMESTAMP), 'SYYYY-MM-DD\"T\"HH24:MI:SS.FF6')", parquet: "strftime({c}, '%Y-%m-%dT%H:%M:%S.%f')", canon: "timestamp"}}
+      - {native_type: "TIMESTAMP(6)", sample: ["TO_TIMESTAMP('2024-02-29 13:14:15.123456','YYYY-MM-DD HH24:MI:SS.FF')", "TO_TIMESTAMP('9999-12-31 23:59:59.999999','YYYY-MM-DD HH24:MI:SS.FF')"], delivery: "Timestamp(µs)", render: {source: "TO_CHAR({c}, 'SYYYY-MM-DD\"T\"HH24:MI:SS.FF6')", parquet: "strftime({c}, '%Y-%m-%dT%H:%M:%S.%f')", canon: "timestamp"}}
+      - {native_type: "TIMESTAMP(9)", sample: ["TO_TIMESTAMP('2024-02-29 13:14:15.123456789','YYYY-MM-DD HH24:MI:SS.FF')"], delivery: "Timestamp(µs)", render: {source: "TO_CHAR({c}, 'SYYYY-MM-DD\"T\"HH24:MI:SS.FF6')", parquet: "strftime({c}, '%Y-%m-%dT%H:%M:%S.%f')", canon: "timestamp"}}
+      - {native_type: "TIMESTAMP(6) WITH TIME ZONE", sample: ["TO_TIMESTAMP_TZ('2024-02-29 10:00:00.5 +02:00','YYYY-MM-DD HH24:MI:SS.FF TZH:TZM')", "TO_TIMESTAMP_TZ('2024-07-01 10:00:00 Europe/Berlin','YYYY-MM-DD HH24:MI:SS TZR')"], delivery: "Timestamp(µs, \"UTC\")", render: {source: "TO_CHAR(SYS_EXTRACT_UTC({c}), 'SYYYY-MM-DD\"T\"HH24:MI:SS.FF6')", parquet: "strftime({c}, '%Y-%m-%dT%H:%M:%S.%f')", canon: "timestamp"}}
+      - {native_type: "TIMESTAMP(6) WITH LOCAL TIME ZONE", sample: ["TO_TIMESTAMP_TZ('2024-02-29 10:00:00 -03:00','YYYY-MM-DD HH24:MI:SS TZH:TZM')"], delivery: "Timestamp(µs, \"UTC\")", render: {source: "TO_CHAR(SYS_EXTRACT_UTC({c}), 'SYYYY-MM-DD\"T\"HH24:MI:SS.FF6')", parquet: "strftime({c}, '%Y-%m-%dT%H:%M:%S.%f')", canon: "timestamp"}}
+      - {native_type: "VARCHAR2(100 CHAR)", sample: ["'it''s, \"q\"'", "'   '", "''"], delivery: "Utf8", render: {source: "{c}"}}
+      - {native_type: "NVARCHAR2(50)", sample: ["N'unicode ✓'", "N'日本語'"], delivery: "Utf8"}
+      - {native_type: "CHAR(5 CHAR)", sample: ["'ab'", "'x'"], delivery: "Utf8", render: {source: "{c}"}}
+      - {native_type: "RAW(16)", sample: ["HEXTORAW('00FF10')", "HEXTORAW('01')"], delivery: "Binary", render: {source: "RAWTOHEX({c})", parquet: "upper(hex({c}))"}}
+    cdc:
+      - {native_type: "NUMBER", sample: ["123.45", "12345678901234567890.123456789", "1E125", "-0.000000000000000000000000000000000000001"], delivery: "Utf8", render: {source: "TO_CHAR({c}, 'TM9')", canon: "number"}}
+      - {native_type: "NUMBER(38,10)", sample: ["1.5", "1234567890123456789012345678.0123456789", "0.5"], delivery: "Decimal128(38, 10)", render: {source: "TO_CHAR({c}, 'TM9')", canon: "number"}}
+      - {native_type: "NUMBER(9)", sample: ["42", "-999999999", "0"], delivery: "Int32", render: {source: "TO_CHAR({c}, 'TM9')", canon: "number"}}
+      - {native_type: "NUMBER(18)", sample: ["9007199254740993", "-999999999999999999", "0"], delivery: "Int64", render: {source: "TO_CHAR({c}, 'TM9')", canon: "number"}}
+      - {native_type: "BINARY_FLOAT", sample: ["1.5", "BINARY_FLOAT_NAN", "-0.1"], delivery: "Float32", render: {canon: "float32"}}
+      - {native_type: "BINARY_DOUBLE", sample: ["2.25", "BINARY_DOUBLE_INFINITY", "0.1"], delivery: "Float64", render: {canon: "float64"}}
+      - {native_type: "DATE", sample: ["TO_DATE('2024-02-29 13:14:15','YYYY-MM-DD HH24:MI:SS')", "TO_DATE('0001-01-01','YYYY-MM-DD')"], delivery: "Timestamp(µs)", render: {source: "TO_CHAR(CAST({c} AS TIMESTAMP), 'SYYYY-MM-DD\"T\"HH24:MI:SS.FF6')", parquet: "strftime({c}, '%Y-%m-%dT%H:%M:%S.%f')", canon: "timestamp"}}
+      - {native_type: "TIMESTAMP(6)", sample: ["TO_TIMESTAMP('2024-02-29 13:14:15.123456','YYYY-MM-DD HH24:MI:SS.FF')", "TO_TIMESTAMP('9999-12-31 23:59:59.999999','YYYY-MM-DD HH24:MI:SS.FF')"], delivery: "Timestamp(µs)", render: {source: "TO_CHAR({c}, 'SYYYY-MM-DD\"T\"HH24:MI:SS.FF6')", parquet: "strftime({c}, '%Y-%m-%dT%H:%M:%S.%f')", canon: "timestamp"}}
+      - {native_type: "TIMESTAMP(9)", sample: ["TO_TIMESTAMP('2024-02-29 13:14:15.123456789','YYYY-MM-DD HH24:MI:SS.FF')"], delivery: "Timestamp(µs)", render: {source: "TO_CHAR({c}, 'SYYYY-MM-DD\"T\"HH24:MI:SS.FF6')", parquet: "strftime({c}, '%Y-%m-%dT%H:%M:%S.%f')", canon: "timestamp"}}
+      - {native_type: "TIMESTAMP(6) WITH TIME ZONE", sample: ["TO_TIMESTAMP_TZ('2024-02-29 10:00:00.5 +02:00','YYYY-MM-DD HH24:MI:SS.FF TZH:TZM')", "TO_TIMESTAMP_TZ('2024-07-01 10:00:00 Europe/Berlin','YYYY-MM-DD HH24:MI:SS TZR')"], delivery: "Timestamp(µs, \"UTC\")", render: {source: "TO_CHAR(SYS_EXTRACT_UTC({c}), 'SYYYY-MM-DD\"T\"HH24:MI:SS.FF6')", parquet: "strftime({c}, '%Y-%m-%dT%H:%M:%S.%f')", canon: "timestamp"}}
+      - {native_type: "TIMESTAMP(6) WITH LOCAL TIME ZONE", sample: ["TO_TIMESTAMP_TZ('2024-02-29 10:00:00 -03:00','YYYY-MM-DD HH24:MI:SS TZH:TZM')"], delivery: "Timestamp(µs, \"UTC\")", render: {source: "TO_CHAR(SYS_EXTRACT_UTC({c}), 'SYYYY-MM-DD\"T\"HH24:MI:SS.FF6')", parquet: "strftime({c}, '%Y-%m-%dT%H:%M:%S.%f')", canon: "timestamp"}}
+      - {native_type: "VARCHAR2(100 CHAR)", sample: ["'it''s, \"q\"'", "'   '", "''"], delivery: "Utf8", render: {source: "{c}"}}
+      - {native_type: "NVARCHAR2(50)", sample: ["N'unicode ✓'", "N'日本語'"], delivery: "Utf8"}
+      - {native_type: "CHAR(5 CHAR)", sample: ["'ab'", "'x'"], delivery: "Utf8", render: {source: "{c}"}}
+      - {native_type: "RAW(16)", sample: ["HEXTORAW('00FF10')", "HEXTORAW('01')"], delivery: "Binary", render: {source: "RAWTOHEX({c})", parquet: "upper(hex({c}))"}}
   mongo:
-    batch: {}
-    cdc: {}
+    batch: []
+    cdc: []

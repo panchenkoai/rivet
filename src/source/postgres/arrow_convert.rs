@@ -1150,11 +1150,18 @@ fn build_pg_list_array(
         // build_array `_ =>` arm, so the operator learns the array element type isn't
         // decoded yet (cast the column to text[] upstream, or omit it) instead of
         // shipping an all-null column.
-        other => anyhow::bail!(
-            "PG array column has element type {other:?} which the list builder cannot decode \
-             (temporal/uuid/bytea array elements are not yet supported) — it would export as \
-             100% NULL. Cast the column to text[] in the source query, or exclude it."
-        ),
+        other => {
+            let col = rows
+                .first()
+                .and_then(|r| r.columns().get(col_idx))
+                .map_or("?", |c| c.name());
+            anyhow::bail!(
+                "column '{col}': PG array column has element type {other:?} which the list \
+                 builder cannot decode (temporal/uuid/bytea array elements are not yet \
+                 supported) — it would export as 100% NULL. Cast the column to text[] in the \
+                 source query, or exclude it."
+            )
+        }
     }
 }
 

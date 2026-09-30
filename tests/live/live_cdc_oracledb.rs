@@ -11,7 +11,7 @@ use std::path::Path;
 use crate::common::*;
 
 /// A `RIVET` table the capture user can read, logged with ALL columns (a whole row per change).
-fn cdc_table(prefix: &str, columns: &str) -> OracleTable {
+pub(crate) fn cdc_table(prefix: &str, columns: &str) -> OracleTable {
     let t = OracleTable::create(prefix, columns);
     ora_exec(&format!(
         "ALTER TABLE {} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS",

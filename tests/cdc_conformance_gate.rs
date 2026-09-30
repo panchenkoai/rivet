@@ -821,7 +821,9 @@ fn oracle_class_census_is_pinned() {
 // table), the NDJSON source-resolution CLI cell, and the shared intra-transaction check.
 // 2026-09-29: +1 independent — the Oracle TRUNCATE deferral cell reads run 1 through DuckDB.
 // 2026-09-30: +1 independent — the PG upgrade-baseline drift cell reads the capture through DuckDB.
-const PIN_INDEPENDENT: usize = 100;
+// 2026-09-30: +4 independent — the ledger-generated batch-equals-CDC cells (one per SQL engine,
+// live_cdc_type_parity.rs), graded by DuckDB and the source's own rendering.
+const PIN_INDEPENDENT: usize = 104;
 // 2026-09-28, source connection ceilings: +3 shared codec — the run's captured row is the
 // fixture check; the oracle is the server's own connection counter.
 // 2026-09-29: +2 shared codec — the Oracle TRUNCATE refusal on re-run and the uncaptured-truncate cell.

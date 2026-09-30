@@ -93,11 +93,185 @@ fn every_source_engine_has_a_batch_and_a_cdc_section() {
         "{LEDGER} engines: must list exactly the SourceType variants"
     );
     for engine in &engines {
-        let modes = keys(&doc["engines"], engine);
+        let mut modes = keys(&doc["engines"], engine);
+        modes.remove("setup");
         assert_eq!(
             modes,
             MODES.iter().map(|m| m.to_string()).collect(),
-            "engines.{engine} must have exactly the modes {MODES:?}"
+            "engines.{engine} must have exactly the modes {MODES:?} (plus an optional setup:)"
         );
     }
+}
+
+/// One mode's rows of one engine, keyed by native type.
+fn rows<'a>(doc: &'a Value, engine: &str, mode: &str) -> Vec<(String, &'a Value)> {
+    doc["engines"][engine][mode]
+        .as_sequence()
+        .unwrap_or_else(|| panic!("engines.{engine}.{mode} must be a list of rows"))
+        .iter()
+        .map(|r| {
+            let native = r["native_type"]
+                .as_str()
+                .unwrap_or_else(|| panic!("engines.{engine}.{mode}: a row has no native_type"));
+            (native.to_string(), r)
+        })
+        .collect()
+}
+
+/// Every error in the engine rows of `doc`: samples, twins across modes, divergences, delivery spellings.
+fn row_violations(doc: &Value) -> Vec<String> {
+    use arrow_schema::extension::{ExtensionType, Json, Uuid};
+    let forms = keys(doc, "forms");
+    let extensions = [<Uuid as ExtensionType>::NAME, <Json as ExtensionType>::NAME];
+    let valid_delivery = |d: &str| {
+        d == "refused"
+            || forms.contains(d)
+            || extensions.contains(&d)
+            || d.parse::<arrow_schema::DataType>()
+                .is_ok_and(|t| t.to_string() == d)
+    };
+    let mut bad = Vec::new();
+    for engine in keys(doc, "engines") {
+        let (batch, cdc) = (rows(doc, &engine, "batch"), rows(doc, &engine, "cdc"));
+        for (mode, list) in [("batch", &batch), ("cdc", &cdc)] {
+            let mut seen = BTreeSet::new();
+            for (native, r) in list.iter() {
+                let at = format!("engines.{engine}.{mode}[{native}]");
+                if !seen.insert(native) {
+                    bad.push(format!("{at}: listed twice"));
+                }
+                if r["sample"].as_sequence().is_none_or(|s| s.is_empty()) {
+                    bad.push(format!("{at}: no sample"));
+                }
+                let d = r["delivery"].as_str().unwrap_or("");
+                if !valid_delivery(d) {
+                    bad.push(format!(
+                        "{at}: delivery `{d}` is no Arrow type, canonical extension, TextForm \
+                         label or `refused`"
+                    ));
+                }
+                if mode == "batch" && !r["diverges"].is_null() {
+                    bad.push(format!("{at}: `diverges:` belongs on the cdc row"));
+                }
+            }
+        }
+        for (native, b) in &batch {
+            let Some((_, c)) = cdc.iter().find(|(n, _)| n == native) else {
+                bad.push(format!(
+                    "engines.{engine}: `{native}` is declared for batch only"
+                ));
+                continue;
+            };
+            let at = format!("engines.{engine}[{native}]");
+            for field in ["sample", "override"] {
+                if b[field] != c[field] {
+                    bad.push(format!("{at}: batch and cdc disagree on `{field}`"));
+                }
+            }
+            match (b["delivery"] != c["delivery"], c["diverges"].as_str()) {
+                (true, None) => bad.push(format!(
+                    "{at}: batch delivers {:?}, cdc {:?}, and the cdc row gives no `diverges:` \
+                     reason",
+                    b["delivery"], c["delivery"]
+                )),
+                (false, Some(_)) => {
+                    bad.push(format!("{at}: `diverges:` on rows that deliver alike"))
+                }
+                _ => {}
+            }
+        }
+        for (native, _) in &cdc {
+            if !batch.iter().any(|(n, _)| n == native) {
+                bad.push(format!(
+                    "engines.{engine}: `{native}` is declared for cdc only"
+                ));
+            }
+        }
+    }
+    bad
+}
+
+#[test]
+fn every_ledger_row_has_a_sample_a_real_delivery_and_a_twin_in_the_other_mode() {
+    let doc = ledger();
+    let total: usize = keys(&doc, "engines")
+        .iter()
+        .map(|e| rows(&doc, e, "batch").len())
+        .sum();
+    assert!(total >= 90, "the ledger lost its rows: {total}");
+    let bad = row_violations(&doc);
+    assert!(bad.is_empty(), "{LEDGER}:\n{}", bad.join("\n"));
+}
+
+#[test]
+fn a_row_declared_in_one_mode_only_is_refused() {
+    let mut doc = ledger();
+    let gone = doc["engines"]["mysql"]["cdc"]
+        .as_sequence_mut()
+        .unwrap()
+        .remove(0);
+    let bad = row_violations(&doc);
+    assert!(
+        bad.iter().any(|b| b.contains("declared for batch only")),
+        "dropping the cdc twin of {:?} went unnoticed: {bad:?}",
+        gone["native_type"]
+    );
+}
+
+/// The column types of `fn type_table` in the Oracle CDC suite, the one hand list the ledger did not replace.
+fn oracle_type_table_types() -> Vec<String> {
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/live/live_cdc_oracledb.rs");
+    let src = std::fs::read_to_string(path).expect("read live_cdc_oracledb.rs");
+    let body = &src[src.find("fn type_table()").expect("fn type_table")..];
+    // cdc_table("<prefix>", "<columns>"): the columns are the second string literal.
+    let ddl: String = body
+        .split('"')
+        .nth(3)
+        .expect("type_table's column list")
+        .split("\\\n")
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let (mut cols, mut depth, mut cur) = (Vec::new(), 0, String::new());
+    for ch in ddl.chars() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                cols.push(std::mem::take(&mut cur));
+                continue;
+            }
+            _ => {}
+        }
+        cur.push(ch);
+    }
+    cols.push(cur);
+    cols.iter()
+        .filter(|c| !c.contains("PRIMARY KEY"))
+        .map(|c| {
+            c.trim()
+                .split_once(' ')
+                .expect("name type")
+                .1
+                .trim()
+                .to_uppercase()
+        })
+        .collect()
+}
+
+#[test]
+fn the_oracle_cdc_type_table_is_covered_by_ledger_rows() {
+    let doc = ledger();
+    let declared: BTreeSet<String> = rows(&doc, "oracle", "cdc")
+        .into_iter()
+        .map(|(n, _)| n.to_uppercase())
+        .collect();
+    let types = oracle_type_table_types();
+    assert!(types.len() >= 15, "type_table parse produced {types:?}");
+    let missing: Vec<_> = types.iter().filter(|t| !declared.contains(*t)).collect();
+    assert!(
+        missing.is_empty(),
+        "live_cdc_oracledb.rs::type_table uses types with no oracle ledger row: {missing:?}"
+    );
 }

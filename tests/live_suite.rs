@@ -102,6 +102,8 @@ mod live_cdc_replica;
 mod live_cdc_schema_drift;
 #[path = "live/live_cdc_source_connections.rs"]
 mod live_cdc_source_connections;
+#[path = "live/live_cdc_type_parity.rs"]
+mod live_cdc_type_parity;
 #[path = "live/live_chaos.rs"]
 mod live_chaos;
 #[path = "live/live_chunked_recovery.rs"]
