@@ -1853,7 +1853,8 @@ def verify_harm_regression(led: Ledger) -> None:
             envdir = work / f"{engine}_{label}"
             _scale_cfg(engine, url, table, envdir)
             best: dict[str, int] = {}
-            for _ in range(3):
+            # Run 0 is an ungraded warm-up: a cold SQL Server plan reads 0 logical reads.
+            for i in range(4):
                 shutil.rmtree(envdir / "out", ignore_errors=True)
                 (envdir / "out").mkdir(parents=True, exist_ok=True)
                 before = _pg_counters(url) if engine == "postgres" else None
@@ -1865,7 +1866,7 @@ def verify_harm_regression(led: Ledger) -> None:
                 # meaning between releases (#312) and cannot be compared across them.
                 measured = ({k: after[k] - before[k] for k in after}
                             if before and after else reported)
-                if not reported:
+                if not reported or i == 0:
                     measured = {}
                 for m, d in measured.items():
                     best[m] = min(best.get(m, d), d)
