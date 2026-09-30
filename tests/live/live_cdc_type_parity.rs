@@ -524,7 +524,9 @@ fn duckdb_ledger_verdict(lg: &Ledger, st: &Stand, n: i64) -> Vec<String> {
            UNION ALL SELECT 'snapshot', CAST(id AS VARCHAR), {proj} FROM read_parquet('{cc}/snapshot/*.parquet') \
            UNION ALL SELECT 'stream', CAST(id AS VARCHAR), {proj} FROM read_parquet('{cc}/*.parquet') \
              WHERE __op IN ('insert', 'update') \
-           UNION ALL SELECT 'final', CAST(id AS VARCHAR), {proj} FROM fin",
+           UNION ALL SELECT 'final', CAST(id AS VARCHAR), {proj} FROM fin \
+           UNION ALL SELECT 'batch_stream', CAST(id AS VARCHAR), {proj} FROM read_parquet('{bc}/*.parquet') \
+             WHERE id IN (SELECT id FROM read_parquet('{cc}/*.parquet') WHERE __op IN ('insert', 'update'))",
         state_db(&st.batch),
         state_db(&st.cdc),
     );
@@ -775,12 +777,16 @@ fn duckdb_ledger_verdict(lg: &Ledger, st: &Stand, n: i64) -> Vec<String> {
         }
         if !arrow_row {
             let stat = |leg: &str| (counts[leg][1 + 2 * k], counts[leg][2 + 2 * k]);
-            for leg in ["batch", "final"] {
-                if stat(leg) != stat("source") {
+            for (leg, of) in [
+                ("batch", "source"),
+                ("final", "source"),
+                ("stream", "batch_stream"),
+            ] {
+                if stat(leg) != stat(of) {
                     bad.push(format!(
-                        "{what}: {leg} has (non-null, distinct) {:?}, the source {:?}",
+                        "{what}: {leg} has (non-null, distinct) {:?}, {of} {:?}",
                         stat(leg),
-                        stat("source")
+                        stat(of)
                     ));
                 }
             }
@@ -795,11 +801,15 @@ fn duckdb_ledger_verdict(lg: &Ledger, st: &Stand, n: i64) -> Vec<String> {
             }
         }
     }
-    for leg in ["batch", "final"] {
-        if counts[leg][0] != counts["source"][0] {
+    for (leg, of) in [
+        ("batch", "source"),
+        ("final", "source"),
+        ("stream", "batch_stream"),
+    ] {
+        if counts[leg][0] != counts[of][0] {
             bad.push(format!(
-                "{leg}: COUNT(*) {}, the source {}",
-                counts[leg][0], counts["source"][0]
+                "{leg}: COUNT(*) {}, {of} {}",
+                counts[leg][0], counts[of][0]
             ));
         }
     }
