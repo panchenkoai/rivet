@@ -359,7 +359,7 @@ def _load_side(binary: Path, prev: Path, root: Path, url: str, tag: str) -> dict
 def _load(led: Ledger, prev: Path, root: Path) -> None:
     """BigQuery load and compact, this binary against the previous release. Wall carries the
     warehouse's own queueing, so it gets RIVET_PERF_BQ_WALL_TOL (2.0) + 5 s; CPU and RSS are
-    rivet's and use the common tolerances. (ClickHouse joins once a previous release has it.)"""
+    rivet's and use the common tolerances."""
     url = os.environ.get("RIVET_ORACLE_POSTGRES_URL", "")
     if not url or not os.environ.get("BQ_ORACLE_PROJECT") or not os.environ.get("BQ_ORACLE_BUCKET"):
         led.skipped("bigquery", "-", SCEN, "load", "perf[bigquery/load]: no postgres URL or "
@@ -803,6 +803,93 @@ def _aa(led: Ledger, prev: Path, root: Path) -> None:
                        f"itself within the tolerances (wall {a.wall:.2f}/{b.wall:.2f}s)", "a/a")
 
 
+CH_URL, CH_AUTH = "http://127.0.0.1:8123", ("rivet", "rivet")
+
+
+def _ch(sql: str) -> str | None:
+    """One statement against the stand's ClickHouse over HTTP; the response text, None on error."""
+    import base64
+    import urllib.request
+
+    req = urllib.request.Request(CH_URL, data=sql.encode(), method="POST")
+    req.add_header("Authorization", "Basic " + base64.b64encode(":".join(CH_AUTH).encode()).decode())
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            return r.read().decode()
+    except OSError:
+        return None
+
+
+def _ch_load_side(binary: Path, prev: Path, root: Path, url: str, tag: str) -> dict[str, Sample] | None:
+    """`rivet load` (first and delta) by `binary` on the previous release's init config into
+    ClickHouse: per step, the minimum over REPS fresh databases. None on any failure or when
+    the view does not hold every source id."""
+    from . import gcp
+    from .upgrade import ROWS as LOAD_ROWS, _mutate
+
+    bucket = os.environ.get("BQ_ORACLE_BUCKET", "")
+    got: dict[str, list[Sample]] = {"load": [], "load-delta": []}
+    for i in range(REPS):
+        table, db = f"perf_ch_{os.getpid()}_{tag}_{i}", f"perf_ch_{os.getpid()}_{tag}_{i}"
+        d = root / f"chload_{tag}_{i}"
+        d.mkdir()
+        env = {"RIVET_PERF_URL": url, "RIVET_STATE_URL": "", "CLICKHOUSE_PASSWORD": CH_AUTH[1]}
+        try:
+            if not _seed("postgres", url, table, LOAD_ROWS, with_cursor=True):
+                return None
+            if _ch(f"CREATE DATABASE {db}") is None:
+                return None
+            if not run([str(prev), "init", "--source-env", "RIVET_PERF_URL", "--table", table, "--mode",
+                        "incremental", "--gcs-bucket", bucket, "--clickhouse-url", CH_URL,
+                        "--clickhouse-database", db, "--clickhouse-user", CH_AUTH[0], "-o", "c.yaml"],
+                       env=env, cwd=d).ok:
+                return None
+            for step, cmd in (("run", "run"), ("load", "load"), ("delta", None), ("run", "run"),
+                              ("load-delta", "load")):
+                if cmd is None:
+                    if not _mutate("postgres", url, table):
+                        return None
+                    continue
+                s = _timed(binary, d, env, cmd, "-c", "c.yaml")
+                if not s.ok:
+                    return None
+                if step in got:
+                    got[step].append(s)
+            n = _ch(f"SELECT count(DISTINCT id) FROM {db}.{table}")
+            if n is None or int(n.strip() or 0) != LOAD_ROWS + 300:
+                return None
+        finally:
+            _sql("postgres", url, f"DROP TABLE IF EXISTS {table};")
+            _ch(f"DROP DATABASE IF EXISTS {db}")
+            gcp.gcs_delete_prefix(bucket, f"exports/{table}/")
+    return {k: _best(v) for k, v in got.items()}
+
+
+def _ch_load(led: Ledger, prev: Path, root: Path) -> None:
+    """ClickHouse load, this binary against the previous release; wall gets the BigQuery cell's
+    RIVET_PERF_BQ_WALL_TOL (2.0) + 5 s because the parts are read from GCS."""
+    url = os.environ.get("RIVET_ORACLE_POSTGRES_URL", "")
+    if not url or not os.environ.get("BQ_ORACLE_BUCKET") or _ch("SELECT 1") is None:
+        led.skipped("clickhouse", "-", SCEN, "load", "perf[clickhouse/load]: no postgres URL, "
+                    "BQ_ORACLE_BUCKET or ClickHouse on :8123", "no clickhouse")
+        return
+    p, c = _ch_load_side(prev, prev, root, url, "prev"), _ch_load_side(rivet_bin(), prev, root, url, "cur")
+    wt = _tolerance(os.environ.get("RIVET_PERF_BQ_WALL_TOL") or "2.0")
+    for step in ("load", "load-delta"):
+        ps, cs = (p or {}).get(step), (c or {}).get(step)
+        if ps is None or cs is None:
+            _grade(led, "clickhouse", step, ps, cs)
+            continue
+        worse = [w for w in perf_verdict("clickhouse", ps, cs) if not w.startswith("wall")]
+        if cs.wall > ps.wall * wt + 5:
+            worse.append(f"wall {cs.wall:.2f}s > {ps.wall:.2f}s×{wt}+5")
+        shown = f"wall {cs.wall:.2f}/{ps.wall:.2f}s cpu {cs.cpu:.2f}/{ps.cpu:.2f}s rss {cs.rss // MIB}/{ps.rss // MIB}MB"
+        if worse:
+            led.failed("clickhouse", "-", SCEN, step, f"perf[clickhouse/{step}]: {'; '.join(worse)}", shown)
+        else:
+            led.passed("clickhouse", "-", SCEN, step, f"perf[clickhouse/{step}]: this/prev {shown}", shown)
+
+
 def verify_perf_regression(led: Ledger) -> None:
     """Wall, CPU, peak RSS and source harm per path, this binary against the previous release."""
     prev = _require_prev_binary(led, "all", "-", SCEN, "local", "perf regression")
@@ -817,4 +904,5 @@ def verify_perf_regression(led: Ledger) -> None:
     _conns(led, prev)
     _batch_conns(led, prev, root)
     _load(led, prev, root)
+    _ch_load(led, prev, root)
     _cdc20(led, prev, root)
