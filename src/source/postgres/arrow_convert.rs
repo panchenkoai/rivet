@@ -1406,6 +1406,18 @@ mod temporal_refusal_tests {
         );
         assert!(PgInt::from_sql(&Type::INT8, &7i32.to_be_bytes()).is_err());
         assert!(!<PgInt as FromSql>::accepts(&Type::BOOL));
+        for ty in [Type::INT2, Type::INT4, Type::INT8, Type::OID] {
+            assert!(<PgInt as FromSql>::accepts(&ty), "{ty}");
+        }
+    }
+
+    /// Side A keeps a decoded value and turns only a decode error into a missing cell.
+    #[test]
+    fn side_a_keeps_the_value_and_drops_only_an_error() {
+        use super::side_a;
+        assert_eq!(side_a(Ok(Some(7i16))), Some(7));
+        assert_eq!(side_a::<i16>(Ok(None)), None);
+        assert_eq!(side_a::<i16>(Err(anyhow::anyhow!("x"))), None);
     }
 
     /// No scalar cell is read with the panicking `Row::get` outside the text-typed arms.

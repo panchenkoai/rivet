@@ -316,8 +316,8 @@ fn run_pg_override(table: &PgTable, override_line: &str) -> (Option<i32>, String
 fn an_int2_and_int4_column_widened_by_an_int8_override_round_trip_exactly() {
     require_alive(LiveService::Postgres);
     let table = seed_pg_override_table(
-        "a int2 NOT NULL, b int4 NOT NULL",
-        "(1, -32768, -2147483648), (2, 32767, 2147483647), (3, -1, 0)",
+        "a int2 NOT NULL, b int4 NOT NULL, c int2 NOT NULL",
+        "(1, -32768, -2147483648, 7), (2, 32767, 2147483647, -7), (3, -1, 0, 32767)",
     );
     let rig = Rig::pg_batch(table.name())
         .export_line("columns:")

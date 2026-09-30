@@ -974,6 +974,18 @@ mod tests {
         let dt2 = |days, inc, scale| DateTime2::new(Date::new(days), Time::new(inc, scale));
         let cases: Vec<(ColumnData<'static>, &str)> = vec![
             (ColumnData::I32(Some(-7)), "-7"),
+            (ColumnData::I16(Some(-300)), "-300"),
+            (ColumnData::F32(Some(0.5)), "0.5"),
+            (
+                ColumnData::Xml(Some(std::borrow::Cow::Owned(tiberius::xml::XmlData::new(
+                    "<a/>",
+                )))),
+                "<a/>",
+            ),
+            (
+                ColumnData::DateTimeOffset(Some(DateTimeOffset::new(dt2(693_595, 36_000, 0), 60))),
+                "1900-01-01 11:00:00 +01:00",
+            ),
             (ColumnData::U8(Some(255)), "255"),
             (ColumnData::I64(Some(i64::MIN)), "-9223372036854775808"),
             (ColumnData::Bit(Some(true)), "1"),
