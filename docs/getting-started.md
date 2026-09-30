@@ -1,8 +1,8 @@
-_Last updated: 2026-07-09._
+_Last updated: 2026-09-30._
 
 # Getting Started
 
-Rivet exports tables from PostgreSQL, MySQL, and SQL Server (and collections from MongoDB) to Parquet (or CSV) files — locally, to S3, GCS, or Azure Blob Storage. Point it at a database, scaffold a config from your real tables, then run. (MongoDB has its own reference: [reference/mongodb.md](reference/mongodb.md).)
+Rivet exports tables from PostgreSQL, MySQL, SQL Server and Oracle (and collections from MongoDB) to Parquet (or CSV) files — locally, to S3, GCS, or Azure Blob Storage — and can load them into BigQuery, Snowflake or ClickHouse. Point it at a database, scaffold a config from your real tables, then run. (MongoDB and Oracle have their own references: [reference/mongodb.md](reference/mongodb.md), [reference/oracle.md](reference/oracle.md).)
 
 ```bash
 brew install panchenkoai/rivet/rivet
@@ -91,6 +91,11 @@ rivet check  -c rivet.yaml   # dry-run analysis per export
 rivet run    -c rivet.yaml --validate --reconcile
 ```
 
+> A `mode: full` export does not replace the previous run's files: each run adds a new
+> Parquet file beside the old one and warns about it. If you already ran the 60-second
+> demo above, `rm -r ./output/orders` before this run — or read only the files
+> `manifest.json` names.
+
 The full basic workflow (`init` → `doctor` → `check` → `run` → `state`) recorded as a single terminal cast:
 
 ![Basic workflow](gifs/basic.gif)
@@ -107,20 +112,22 @@ What each step does:
 Example summary card after a successful run:
 
 ```
-── orders ──
-  run_id:      orders_20260519T120000.123
-  status:      success
-  tuning:      profile=balanced (default), batch_size=10,000 (batch_size_memory_mb=32MiB → effective FETCH in logs)
-  rows:        5,432
-  files:       1
-  output:      file://./output
-  bytes read:    1.2 MB
-  bytes written: 847.0 KB
-  duration:    1.2s
-  peak RSS:    15 MB (sampled during run)
-  validated:   pass
-  schema:      unchanged
-  reconcile:   MATCH (5,432/5,432)
+✓ orders        full             500 rows    1 files    11.4 KB      0.1s  RSS  40 MB
+
+── orders ──────────────────────────────────────────────────
+  run_id:         orders_20260930T101641.154_92474
+  status:         success
+  tuning:         profile=balanced (default), batch_size=10,000 (batch_size_memory_mb=32MiB → effective FETCH in logs)
+  rows:           500
+  files:          1
+  output:         file://./output/orders/
+  bytes read:     31.7 KB
+  bytes written:  11.4 KB
+  duration:       105ms
+  peak RSS:       40 MB (sampled during run)
+  validated:      pass
+  schema:         unchanged
+  reconcile:      MATCH (500/500)
 ```
 
 ## 4 · Inspect & iterate
@@ -134,22 +141,29 @@ rivet journal      -c rivet.yaml --export orders   # per-run events / retries / 
 
 ![Post-run inspection: state show, metrics, state files, state progression](gifs/inspect.gif)
 
-To make the second run only export rows that changed, switch the export to **incremental** mode with a `cursor_column:` (must be monotonically increasing — usually `updated_at` or a sequence id):
+To make later runs export only the rows that changed, scaffold the export in **incremental** mode. `rivet init` picks the cursor column (it must only ever grow — usually `updated_at` or a sequence id) and writes it into the config:
+
+```bash
+rivet init --source-env DATABASE_URL --table orders --mode incremental -o rivet-incremental.yaml
+rivet run -c rivet-incremental.yaml     # first run: every row
+rivet run -c rivet-incremental.yaml     # later runs: only rows past the stored cursor
+rivet state show -c rivet-incremental.yaml   # the cursor each export will continue from
+```
+
+The generated export reads:
 
 ```yaml
 exports:
   - name: orders
-    query: "SELECT id, name, updated_at FROM orders"
+    query: >
+      SELECT "id", "name", "price", "updated_at"
+      FROM "orders"
     mode: incremental
     cursor_column: updated_at
-    format: parquet
-    skip_empty: true            # a run with no new rows reports `skipped`
-    destination:
-      type: local
-      path: ./output
+    # … format, meta_columns, destination as in the full scaffold
 ```
 
-Subsequent `rivet run` invocations will only fetch rows with `updated_at >` the stored cursor. For tables larger than ~5 M rows, switch to `mode: chunked` instead — see [modes/chunked.md](modes/chunked.md).
+Each run appends a file holding its delta to the same prefix; a run with nothing new writes no file and still succeeds. For tables larger than ~5 M rows, use `mode: chunked` instead — see [modes/chunked.md](modes/chunked.md).
 
 ---
 
@@ -190,33 +204,39 @@ parallel_export_processes: true   # top-level: parallelize the cheap (parallel_s
 
 ---
 
-## Load into BigQuery or Snowflake (optional)
+## Load into BigQuery, Snowflake or ClickHouse (optional)
 
-Rivet stops at typed Parquet by default. To load it into a warehouse, add a
-top-level `load:` block to the **same** config and run `rivet load` — the target
-table, column types, and source files are all derived from the export (nothing
-hand-typed):
+Rivet stops at typed Parquet by default. To load it into a warehouse, the config
+needs a cloud destination to stage in and a top-level `load:` block; `rivet load`
+then derives the target table, column types and source files from the export
+(nothing hand-typed). For BigQuery and ClickHouse `rivet init` writes both:
 
-```yaml
-# rivet.yaml — the export above, plus a load target
-load:
-  target: bigquery          # or: snowflake (+ connection / warehouse / database / schema / storage_integration)
-  project: my-gcp-project
-  dataset: analytics
-  cleanup_source: true      # wipe the staged Parquet once the load is row-count-verified
+```bash
+# BigQuery — stages in GCS
+rivet init --source-env DATABASE_URL --table orders \
+  --gcs-bucket my-bucket --bigquery-project my-gcp-project --bigquery-dataset analytics -o rivet.yaml
+
+# ClickHouse — stages in GCS or S3 (`--s3-bucket`); the password is read from CLICKHOUSE_PASSWORD
+rivet init --source-env DATABASE_URL --table orders \
+  --gcs-bucket my-bucket --clickhouse-url http://clickhouse:8123 --clickhouse-database raw -o rivet.yaml
 ```
 
 ```bash
-rivet run  -c rivet.yaml    # extract → GCS
+rivet run  -c rivet.yaml    # extract → the bucket
 rivet load -c rivet.yaml    # load → warehouse (native types; count-gated before any cleanup)
 ```
 
-The load follows the export's `mode:` — `full` overwrites the latest snapshot;
-`incremental` / `cdc` append to `<table>__changes` and expose a current-state
-dedup view keyed on the source primary key `rivet run` recorded (set `pk: [id]`
+The generated `load:` block carries `cleanup_source: true`: once a load is
+row-count-verified, the staged Parquet is deleted. Snowflake has no `init` flags
+yet — add its `load:` block by hand from [snowflake-load.md](recipes/snowflake-load.md).
+
+The load follows the export's `mode:` — `full` overwrites the table with the
+latest run; `incremental` / `cdc` append to `<table>__changes` and expose the
+current state keyed on the source primary key `rivet run` recorded (set `pk: [id]`
 in the `load:` block for a `query:` export or to override it). Recipes:
 [snowflake-load.md](recipes/snowflake-load.md) ·
-[cdc-bigquery-load.md](cdc-bigquery-load.md).
+[cdc-bigquery-load.md](cdc-bigquery-load.md) ·
+[clickhouse-load.md](recipes/clickhouse-load.md).
 
 ---
 
@@ -246,7 +266,7 @@ More failure modes (retries, schema drift, crash/resume) and exactly what rivet 
 |---|---|
 | Pick the right export mode for each table | [modes/](modes/) — full · incremental · chunked · time_window · cdc |
 | Configure S3 / GCS / Azure / stdout destinations | [destinations/](destinations/) |
-| Load exports into BigQuery / Snowflake | [recipes/snowflake-load.md](recipes/snowflake-load.md) · [cdc-bigquery-load.md](cdc-bigquery-load.md) |
+| Load exports into BigQuery / Snowflake / ClickHouse | [recipes/snowflake-load.md](recipes/snowflake-load.md) · [cdc-bigquery-load.md](cdc-bigquery-load.md) · [recipes/clickhouse-load.md](recipes/clickhouse-load.md) |
 | Look up a YAML field or a CLI flag | [reference/config.md](reference/config.md) · [reference/cli.md](reference/cli.md) |
 | Understand `run_id` / cursor / chunk / manifest / journal | [concepts.md](concepts.md) |
 | Tune for memory, throughput, source pressure | [reference/tuning.md](reference/tuning.md) · [best-practices/](best-practices/) |
