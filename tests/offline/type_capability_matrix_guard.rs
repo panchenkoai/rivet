@@ -10,6 +10,15 @@ use super::chunking_matrix_guard::{enum_variants, source_engine_variants};
 const LEDGER: &str = "docs/type-capability-matrix.yaml";
 const DELIVERY_RS: &str = "src/types/delivery.rs";
 const MODES: [&str; 2] = ["batch", "cdc"];
+/// The `render.canon` values tests/live/live_cdc_type_parity.rs implements.
+const CANONS: [&str; 6] = [
+    "number",
+    "timestamp",
+    "float32",
+    "float64",
+    "interval",
+    "datetime_tick",
+];
 
 /// `IsoTimestampNanos` -> `iso_timestamp_nanos`, the label rule `TextForm::label` follows.
 fn snake(ident: &str) -> String {
@@ -153,6 +162,23 @@ fn row_violations(doc: &Value) -> Vec<String> {
                 if mode == "batch" && !r["diverges"].is_null() {
                     bad.push(format!("{at}: `diverges:` belongs on the cdc row"));
                 }
+                if let Some(render) = r["render"].as_mapping() {
+                    for (k, v) in render {
+                        let (k, v) = (k.as_str().unwrap_or(""), v.as_str().unwrap_or(""));
+                        let known = match k {
+                            "source" => engine == "oracle",
+                            "server" => engine != "oracle",
+                            "duck" => true,
+                            "canon" => CANONS.contains(&v),
+                            _ => false,
+                        };
+                        if !known {
+                            bad.push(format!(
+                                "{at}: render `{k}: {v}` is not one the parity driver reads"
+                            ));
+                        }
+                    }
+                }
             }
         }
         for (native, b) in &batch {
@@ -163,7 +189,7 @@ fn row_violations(doc: &Value) -> Vec<String> {
                 continue;
             };
             let at = format!("engines.{engine}[{native}]");
-            for field in ["sample", "override"] {
+            for field in ["sample", "override", "render"] {
                 if b[field] != c[field] {
                     bad.push(format!("{at}: batch and cdc disagree on `{field}`"));
                 }

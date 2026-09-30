@@ -1,19 +1,25 @@
 //! The batch-equals-CDC contract, generated from `docs/type-capability-matrix.yaml`
 //! (ADR-0038 CP9, CP12). Per engine, one table holds a column for every ledger row,
-//! seeded with the row's samples; CDC runs `initial: snapshot`, then an UPDATE rewrites
-//! every column and a second run captures it, and a batch run reads the final state.
-//! Each column must arrive as the ledger declares in each mode, the two modes must hold
-//! the same values (read by DuckDB), and both must equal the source's own rendering.
+//! seeded with the row's samples; CDC runs `initial: snapshot`, then every column is
+//! rewritten and the samples inserted again, a second run captures that, and a batch run
+//! reads the final state. One DuckDB session then reads every stage it can reach — the
+//! source (ATTACHed read-only), the batch parts, the CDC snapshot and stream parts, the
+//! CDC final image, and both runs' state DBs — and grades, per column: the delivered type,
+//! each value as full-precision text, and COUNT(*), COUNT(col), COUNT(DISTINCT col).
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::common::*;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 struct Render {
+    /// The column as text on the source's own client — only for an engine DuckDB cannot attach.
     source: Option<String>,
-    parquet: Option<String>,
+    /// The column as text in DuckDB, applied identically to every stage DuckDB reads.
+    duck: Option<String>,
+    /// The column rendered by the source server itself, read through DuckDB's passthrough, where the scanner would narrow it.
+    server: Option<String>,
     canon: Option<String>,
 }
 
@@ -57,7 +63,8 @@ fn ledger(engine: &str) -> Ledger {
                 over: s(&r["override"]),
                 render: Render {
                     source: s(&r["render"]["source"]),
-                    parquet: s(&r["render"]["parquet"]),
+                    duck: s(&r["render"]["duck"]),
+                    server: s(&r["render"]["server"]),
                     canon: s(&r["render"]["canon"]),
                 },
                 diverges: s(&r["diverges"]),
@@ -77,7 +84,7 @@ fn ledger(engine: &str) -> Ledger {
         })
         .collect();
     assert!(
-        cdc.len() == batch.len(),
+        cdc.is_empty() || cdc.len() == batch.len(),
         "{engine}: cdc rows without a batch twin"
     );
     Ledger {
@@ -92,6 +99,9 @@ fn ledger(engine: &str) -> Ledger {
 
 /// `delivery` of a batch row whose type the batch run refuses by column.
 const REFUSED: &str = "refused";
+
+/// `render.duck` for a type DuckDB cannot read exactly (Decimal256 reads as DOUBLE, ADR-0038 CP11).
+const ARROW: &str = "arrow";
 
 /// The ledger without its batch-refused rows, and those rows as (batch, cdc) twins.
 fn split_refused(lg: Ledger) -> (Ledger, Vec<(Row, Row)>) {
@@ -114,28 +124,45 @@ fn split_refused(lg: Ledger) -> (Ledger, Vec<(Row, Row)>) {
     )
 }
 
+/// How the verdict reads the source.
+enum Source<'a> {
+    /// ATTACHed READ_ONLY in the verdict's own DuckDB session; `pass` runs server SQL there.
+    Attach {
+        engine: OracleEngine,
+        database: &'static str,
+        pass: &'static str,
+        /// Scanner settings run before the ATTACH (a scanner must not narrow what it reads).
+        settings: &'static str,
+        /// The server's own text of `{c}` (its type output function), for `server_text` rows.
+        server_text: &'static str,
+    },
+    /// No DuckDB scanner (Oracle): the database renders its own values through its client.
+    #[cfg_attr(not(feature = "oracle"), allow(dead_code))]
+    Client {
+        text_rows: &'a dyn Fn(&str) -> Vec<Vec<Option<String>>>,
+        render: &'static str,
+    },
+}
+
 /// What one engine needs from its test: SQL against the source and the two rigs.
 struct Stand<'a> {
     engine: &'static str,
+    /// The table as DML names it.
     table: String,
+    /// The table as the source catalog names it (DuckDB's ATTACH, the census).
+    bare: String,
     exec: &'a dyn Fn(&str),
-    text_rows: &'a dyn Fn(&str) -> Vec<Vec<Option<String>>>,
-    /// The source's own rendering of `{c}` as text, when a row names none.
-    source_text: &'static str,
+    source: Source<'a>,
     /// Called with the number of change rows the DML produced (SQL Server waits on its capture job).
     settle: &'a dyn Fn(i64),
+    /// Both rigs carry `census_oracle()`: their parts and state DBs are visible to DuckDB.
     cdc: Rig,
     batch: Rig,
-    host: PathBuf,
-    container: String,
 }
 
 type Cells = BTreeMap<i64, Vec<Option<String>>>;
 
-/// `render.parquet` value for a type DuckDB cannot read exactly (Decimal256 reads as DOUBLE, ADR-0038 CP11): Arrow's own display renders it.
-const ARROW: &str = "arrow";
-
-/// Rows of `[id, cells...]` keyed by id.
+/// Rows of `[id, cells...]` keyed by id; an id seen twice is a failure.
 fn keyed(rows: Vec<Vec<Option<String>>>) -> Cells {
     rows.into_iter()
         .map(|mut r| {
@@ -150,25 +177,20 @@ fn keyed(rows: Vec<Vec<Option<String>>>) -> Cells {
         })
 }
 
-/// DuckDB's rows of `select` over the parquet parts under the container dir `dir`.
-fn duck(select: &str, dir: &str, filter: &str) -> Cells {
-    let v = duckdb_run_sql_json(&format!(
-        "SELECT CAST(id AS VARCHAR), {select} FROM read_parquet('{dir}/*.parquet') {filter}"
-    ));
-    keyed(
-        v["rows"]
-            .as_array()
-            .unwrap_or_else(|| panic!("duckdb: {v}"))
-            .iter()
-            .map(|r| {
-                r.as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|c| c.as_str().map(str::to_string))
-                    .collect()
-            })
-            .collect(),
-    )
+/// The `{columns, rows}` of one named query as optional strings.
+fn cells(v: &serde_json::Value) -> Vec<Vec<Option<String>>> {
+    v["rows"]
+        .as_array()
+        .unwrap_or_else(|| panic!("duckdb: {v}"))
+        .iter()
+        .map(|r| {
+            r.as_array()
+                .unwrap()
+                .iter()
+                .map(|c| c.as_str().map(str::to_string))
+                .collect()
+        })
+        .collect()
 }
 
 /// Arrow's own display of `cols` in every part under `dir` (only rows whose `__op` is in `ops`, when given), keyed by id.
@@ -259,16 +281,91 @@ fn delivered(schema: &arrow::datatypes::Schema, col: &str) -> String {
 fn canon(v: &Option<String>, how: &Option<String>) -> Option<String> {
     v.as_ref().map(|s| match how.as_deref() {
         Some("number") => canon_num(s),
-        Some("timestamp") => canon_ts(s.trim_start_matches('+').trim()),
+        Some("timestamp") => canon_ts(s.trim_start_matches('+').trim().trim_end_matches("+00")),
         Some("float32") => s
             .parse::<f32>()
             .map_or_else(|e| panic!("{s}: {e}"), |f| f.to_string()),
         Some("float64") => s
             .parse::<f64>()
             .map_or_else(|e| panic!("{s}: {e}"), |f| f.to_string()),
+        Some("interval") => canon_interval(s),
+        Some("datetime_tick") => {
+            let (base, frac) = s.split_once('.').unwrap_or((s, "0"));
+            let f: f64 = format!("0.{frac}").parse().unwrap();
+            format!("{base}+{}/300", (f * 300.0).round() as i64)
+        }
         Some(other) => panic!("unknown canon `{other}`"),
         None => s.clone(),
     })
+}
+
+/// An ISO 8601 duration (`P1Y2M3DT4H5M6.5S`) or DuckDB's interval text (`1 year 2 months 3 days 04:05:06.5`) as `<months>m<days>d<micros>us`.
+fn canon_interval(s: &str) -> String {
+    let (mut months, mut days, mut micros) = (0i64, 0i64, 0i64);
+    let secs = |v: &str| -> i64 {
+        let (neg, v) = v.strip_prefix('-').map_or((false, v), |r| (true, r));
+        let (w, f) = v.split_once('.').unwrap_or((v, ""));
+        let us =
+            w.parse::<i64>().unwrap() * 1_000_000 + format!("{f:0<6}")[..6].parse::<i64>().unwrap();
+        if neg { -us } else { us }
+    };
+    if let Some(iso) = s.strip_prefix('P') {
+        let (date, time) = iso.split_once('T').unwrap_or((iso, ""));
+        let mut num = String::new();
+        for ch in date.chars() {
+            match ch {
+                'Y' => months += 12 * std::mem::take(&mut num).parse::<i64>().unwrap(),
+                'M' => months += std::mem::take(&mut num).parse::<i64>().unwrap(),
+                'D' => days += std::mem::take(&mut num).parse::<i64>().unwrap(),
+                c => num.push(c),
+            }
+        }
+        for ch in time.chars() {
+            match ch {
+                'H' => micros += 3_600_000_000 * std::mem::take(&mut num).parse::<i64>().unwrap(),
+                'M' => micros += 60_000_000 * std::mem::take(&mut num).parse::<i64>().unwrap(),
+                'S' => micros += secs(&std::mem::take(&mut num)),
+                c => num.push(c),
+            }
+        }
+    } else {
+        let words: Vec<&str> = s.split_whitespace().collect();
+        let mut i = 0;
+        while i < words.len() {
+            if let Some((h, rest)) = words[i].split_once(':') {
+                let (m, sec) = rest.split_once(':').unwrap();
+                let neg = h.starts_with('-');
+                let us = h.trim_start_matches('-').parse::<i64>().unwrap() * 3_600_000_000
+                    + m.parse::<i64>().unwrap() * 60_000_000
+                    + secs(sec);
+                micros += if neg { -us } else { us };
+                i += 1;
+                continue;
+            }
+            let v: i64 = words[i].parse().unwrap();
+            match words[i + 1].trim_end_matches('s') {
+                "year" => months += 12 * v,
+                "month" | "mon" => months += v,
+                "day" => days += v,
+                unit => panic!("interval unit `{unit}` in `{s}`"),
+            }
+            i += 2;
+        }
+    }
+    format!("{months}m{days}d{micros}us")
+}
+
+#[test]
+fn canon_interval_reads_both_renderings_alike() {
+    for (iso, duck) in [
+        ("P1Y2M3D", "1 year 2 months 3 days"),
+        ("P1DT4H5M6.5S", "1 day 04:05:06.5"),
+        ("PT-1H-2M", "-01:02:00"),
+        ("PT0S", "00:00:00"),
+    ] {
+        assert_eq!(canon_interval(iso), canon_interval(duck), "{iso} vs {duck}");
+    }
+    assert_ne!(canon_interval("P1M"), canon_interval("1 day"));
 }
 
 /// Column names `c0..` of the ledger rows.
@@ -337,77 +434,286 @@ fn rewrite(lg: &Ledger, st: &Stand, n: i64) {
     (st.settle)(2 * n + 2 * (n + 1) + n);
 }
 
-/// Every ledger row, read back by DuckDB (and Arrow) from both modes, against the ledger and the source; returns every violation.
-fn duckdb_ledger_verdict(lg: &Ledger, st: &Stand, n: i64) -> Vec<String> {
-    let (cols, t) = (columns(&lg.batch), &st.table);
-    let (bdir, cdir) = (st.host.join("batch"), st.host.join("cdc"));
-    let (bs, cs, ss) = (schema(&bdir), schema(&cdir), schema(&cdir.join("snapshot")));
-    let raw = cols.join(", ");
-    let rendered = |rows: &[Row]| -> String {
-        rows.iter()
-            .zip(&cols)
-            .map(|(r, c)| match r.render.parquet.as_deref() {
-                Some(ARROW) => "NULL".to_string(),
-                p => p.unwrap_or("CAST({c} AS VARCHAR)").replace("{c}", c),
-            })
+/// The DuckDB projection of every row: the same text for every stage DuckDB reads.
+fn projection(rows: &[Row]) -> String {
+    rows.iter()
+        .zip(columns(rows))
+        .map(|(r, c)| match r.render.duck.as_deref() {
+            Some(ARROW) => format!("CAST(NULL AS VARCHAR) AS {c}"),
+            d => format!(
+                "CAST({} AS VARCHAR) AS {c}",
+                d.unwrap_or("{c}").replace("{c}", &c)
+            ),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The attached source `from`, with every `render.server` column replaced by the server's own rendering read through `pass`.
+fn server_rendered(rows: &[Row], from: &str, pass: &str, bare: &str) -> String {
+    let server: Vec<(String, &str)> = rows
+        .iter()
+        .zip(columns(rows))
+        .filter_map(|(r, c)| r.render.server.as_deref().map(|e| (c, e)))
+        .collect();
+    if server.is_empty() {
+        return from.to_string();
+    }
+    let sql = format!(
+        "SELECT id, {} FROM {bare}",
+        server
+            .iter()
+            .map(|(c, e)| format!("{} AS {c}", e.replace("{c}", c)))
             .collect::<Vec<_>>()
             .join(", ")
-    };
-    let cb = format!("{}/batch", st.container);
-    let cc = format!("{}/cdc", st.container);
-    let b_raw = duck(&raw, &cb, "");
-    let b_txt = duck(&rendered(&lg.batch), &cb, "");
-    let upd = "WHERE __op IN ('update', 'insert')";
-    let c_raw = duck(&raw, &cc, upd);
-    let c_txt = duck(&rendered(&lg.cdc), &cc, upd);
-    let s_raw = duck(&raw, &format!("{cc}/snapshot"), "");
-    let source = |rows: &[Row]| -> Cells {
-        let exprs = rows
+    );
+    format!(
+        "(SELECT t.* REPLACE ({}) FROM {from} t JOIN {} p ON p.id = t.id)",
+        server
             .iter()
-            .zip(&cols)
-            .map(|(r, c)| {
-                r.render
-                    .source
-                    .as_deref()
-                    .unwrap_or(st.source_text)
-                    .replace("{c}", c)
-            })
+            .map(|(c, _)| format!("p.{c} AS {c}"))
             .collect::<Vec<_>>()
-            .join(", ");
-        let id = st.source_text.replace("{c}", "id");
-        keyed((st.text_rows)(&format!("SELECT {id}, {exprs} FROM {t}")))
-    };
-    let (src_b, src_c) = (source(&lg.batch), source(&lg.cdc));
-    let (a_b, a_c) = (
+            .join(", "),
+        pass.replace("{sql}", &sql.replace('\'', "''"))
+    )
+}
+
+/// The DuckDB state-DB path beside a `census_oracle()` rig's config.
+fn state_db(rig: &Rig) -> String {
+    format!(
+        "{}/.rivet_state.db",
+        rig.oracle_container_out().trim_end_matches("/out")
+    )
+}
+
+/// `COUNT(*)`, then `COUNT(col)` and `COUNT(DISTINCT col)` per column, over `leg`'s rows.
+fn counts_of(rows: &Cells, canons: &[Option<String>]) -> Vec<i64> {
+    let mut out = vec![rows.len() as i64];
+    for (k, how) in canons.iter().enumerate() {
+        let vals: Vec<String> = rows.values().filter_map(|r| canon(&r[k], how)).collect();
+        let distinct: std::collections::BTreeSet<&String> = vals.iter().collect();
+        out.push(vals.len() as i64);
+        out.push(distinct.len() as i64);
+    }
+    out
+}
+
+/// Every stage of one engine, read by one DuckDB session (the source by its client when DuckDB cannot attach it), against the ledger and each other; returns every violation.
+fn duckdb_ledger_verdict(lg: &Ledger, st: &Stand, n: i64) -> Vec<String> {
+    let cols = columns(&lg.batch);
+    let canons: Vec<Option<String>> = lg.batch.iter().map(|r| r.render.canon.clone()).collect();
+    let (bdir, cdir) = (st.batch.out_dir(), st.cdc.out_dir());
+    let (bc, cc) = (
+        st.batch.oracle_container_out(),
+        st.cdc.oracle_container_out(),
+    );
+    let (bs, cs, ss) = (schema(&bdir), schema(&cdir), schema(&cdir.join("snapshot")));
+    let proj = projection(&lg.batch);
+    let mut setup = format!(
+        "INSTALL sqlite; LOAD sqlite; \
+         ATTACH '{}' AS bst (TYPE sqlite, READ_ONLY); ATTACH '{}' AS cst (TYPE sqlite, READ_ONLY); \
+         CREATE TEMP VIEW fin AS SELECT * EXCLUDE (rn) FROM (SELECT *, row_number() OVER \
+           (PARTITION BY id ORDER BY __pos IS NULL, __seq DESC) AS rn FROM read_parquet(\
+           ['{cc}/snapshot/*.parquet', '{cc}/*.parquet'], union_by_name = true)) \
+           WHERE rn = 1 AND coalesce(__op, '') <> 'delete'; \
+         CREATE TEMP VIEW legs AS \
+           SELECT 'batch' AS leg, CAST(id AS VARCHAR) AS id, {proj} FROM read_parquet('{bc}/*.parquet') \
+           UNION ALL SELECT 'snapshot', CAST(id AS VARCHAR), {proj} FROM read_parquet('{cc}/snapshot/*.parquet') \
+           UNION ALL SELECT 'stream', CAST(id AS VARCHAR), {proj} FROM read_parquet('{cc}/*.parquet') \
+             WHERE __op IN ('insert', 'update') \
+           UNION ALL SELECT 'final', CAST(id AS VARCHAR), {proj} FROM fin",
+        state_db(&st.batch),
+        state_db(&st.cdc),
+    );
+    if let Source::Attach {
+        engine,
+        database,
+        settings,
+        pass,
+        ..
+    } = &st.source
+    {
+        let (attach, from) = engine.source_sql(database, &st.bare);
+        let from = server_rendered(&lg.batch, &from, pass, &st.bare);
+        setup = format!(
+            "{} {settings} {attach} {setup} UNION ALL SELECT 'source', CAST(id AS VARCHAR), {proj} FROM {from}",
+            engine.load_sql()
+        );
+    }
+    let stats = cols
+        .iter()
+        .map(|c| format!("count({c}), count(DISTINCT {c})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut queries = vec![
+        ("legs", "SELECT * FROM legs".to_string()),
+        (
+            "counts",
+            format!("SELECT leg, count(*), {stats} FROM legs GROUP BY leg"),
+        ),
+        // One query per state table: DuckDB 1.5.5 answers a UNION ALL of two sqlite
+        // scans with the first scan twice (measured 2026-09-30).
+        (
+            "bst_metrics",
+            "SELECT export_name, sum(total_rows) FROM bst.export_metrics GROUP BY 1".to_string(),
+        ),
+        (
+            "cst_metrics",
+            "SELECT export_name, sum(total_rows) FROM cst.export_metrics GROUP BY 1".to_string(),
+        ),
+        (
+            "bst_files",
+            "SELECT export_name, sum(row_count) FROM bst.file_log GROUP BY 1".to_string(),
+        ),
+        (
+            "cst_files",
+            "SELECT export_name, sum(row_count) FROM cst.file_log GROUP BY 1".to_string(),
+        ),
+        (
+            "bst_runs",
+            "SELECT export_name, status, count(*) FROM bst.run_status GROUP BY 1, 2".to_string(),
+        ),
+        (
+            "cst_runs",
+            "SELECT export_name, status, count(*) FROM cst.run_status GROUP BY 1, 2".to_string(),
+        ),
+        (
+            "cst_snapshot",
+            "SELECT export_name, table_name, count(*) FROM cst.cdc_snapshot \
+             WHERE completed_at IS NOT NULL GROUP BY 1, 2"
+                .to_string(),
+        ),
+        (
+            "parts",
+            format!(
+                "SELECT 'batch', count(*) FROM read_parquet('{bc}/*.parquet') \
+                 UNION ALL SELECT 'snapshot', count(*) FROM read_parquet('{cc}/snapshot/*.parquet') \
+                 UNION ALL SELECT 'stream', count(*) FROM read_parquet('{cc}/*.parquet')"
+            ),
+        ),
+    ];
+    if let Source::Attach {
+        engine,
+        database,
+        pass,
+        ..
+    } = &st.source
+    {
+        let (_, from) = engine.source_sql(database, &st.bare);
+        queries.push(("source_types", format!("DESCRIBE SELECT * FROM {from}")));
+        for (r, c) in lg.batch.iter().zip(&cols) {
+            if r.render.duck.as_deref() == Some(ARROW) {
+                assert!(
+                    !queries.iter().any(|(q, _)| *q == "arrow_source"),
+                    "one `duck: arrow` row per engine"
+                );
+                queries.push((
+                    "arrow_source",
+                    format!(
+                        "SELECT CAST(id AS VARCHAR), CAST({c} AS VARCHAR) FROM {}",
+                        pass.replace(
+                            "{sql}",
+                            &format!("SELECT id, {c}::text AS {c} FROM {}", st.bare)
+                        )
+                    ),
+                ));
+            }
+        }
+    }
+    let out = duckdb_session_json(&setup, &queries);
+    if std::env::var_os("LEDGER_DEBUG").is_some() {
+        eprintln!("{}", serde_json::to_string_pretty(&out).unwrap());
+    }
+
+    let mut legs: BTreeMap<String, Cells> = BTreeMap::new();
+    let mut by_leg: BTreeMap<String, Vec<Vec<Option<String>>>> = BTreeMap::new();
+    for mut r in cells(&out["legs"]) {
+        let leg = r.remove(0).expect("leg");
+        by_leg.entry(leg).or_default().push(r);
+    }
+    for (leg, rows) in by_leg {
+        legs.insert(leg, keyed(rows));
+    }
+    let mut counts: BTreeMap<String, Vec<i64>> = cells(&out["counts"])
+        .into_iter()
+        .map(|mut r| {
+            let leg = r.remove(0).expect("leg");
+            (
+                leg,
+                r.iter()
+                    .map(|v| v.as_deref().unwrap().parse().unwrap())
+                    .collect(),
+            )
+        })
+        .collect();
+    match &st.source {
+        Source::Client { text_rows, render } => {
+            let exprs = lg
+                .batch
+                .iter()
+                .zip(&cols)
+                .map(|(r, c)| {
+                    r.render
+                        .source
+                        .as_deref()
+                        .unwrap_or(render)
+                        .replace("{c}", c)
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let id = render.replace("{c}", "id");
+            let src = keyed(text_rows(&format!(
+                "SELECT {id}, {exprs} FROM {}",
+                st.table
+            )));
+            counts.insert("source".into(), counts_of(&src, &canons));
+            legs.insert("source".into(), src);
+        }
+        Source::Attach { .. } => {
+            for (r, c) in lg.batch.iter().zip(&cols) {
+                assert!(
+                    r.render.source.is_none(),
+                    "{}: {c} names a client-side source render, but DuckDB reads this source",
+                    st.engine
+                );
+            }
+        }
+    }
+    let (a_b, a_s) = (
         arrow_cells(&bdir, &cols, None),
         arrow_cells(&cdir, &cols, Some(&["update", "insert"])),
     );
-    let text = |r: &Row, duck: &Cells, arrow: &Cells, id: i64, k: usize| {
-        let cells = if r.render.parquet.as_deref() == Some(ARROW) {
-            arrow
-        } else {
-            duck
-        };
-        canon(&cells[&id][k], &r.render.canon)
-    };
+    let arrow_source = keyed(out.get("arrow_source").map(cells).unwrap_or_default());
 
+    let all: Vec<i64> = (1..=3 * n).collect();
     let captured: Vec<i64> = std::iter::once(1).chain(n + 1..=3 * n).collect();
-    assert_eq!(
-        c_raw.keys().copied().collect::<Vec<_>>(),
-        captured,
-        "{}: one captured change per rewritten or inserted row",
-        st.engine
-    );
-    assert_eq!(
-        b_raw.len() as i64,
-        3 * n,
-        "{}: the batch export holds every row",
-        st.engine
-    );
     let mut bad = Vec::new();
+    for (leg, want) in [
+        ("source", &all),
+        ("batch", &all),
+        ("final", &all),
+        ("stream", &captured),
+        ("snapshot", &(1..=2 * n).collect::<Vec<i64>>()),
+    ] {
+        let got: Vec<i64> = legs
+            .get(leg)
+            .map(|c| c.keys().copied().collect())
+            .unwrap_or_default();
+        if &got != want {
+            bad.push(format!("{leg}: ids {got:?}, want {want:?}"));
+        }
+    }
+    if !bad.is_empty() {
+        return bad;
+    }
+    let v = |leg: &str, id: i64, k: usize| canon(&legs[leg][&id][k], &canons[k]);
     for (k, (col, (b, c))) in cols.iter().zip(lg.batch.iter().zip(&lg.cdc)).enumerate() {
         let what = format!("{col} {}", b.native);
-        for (mode, want, sch) in [("batch", &b.delivery, &bs), ("cdc", &c.delivery, &cs)] {
+        for (mode, want, sch) in [
+            ("batch", &b.delivery, &bs),
+            ("cdc stream", &c.delivery, &cs),
+            ("cdc snapshot", &b.delivery, &ss),
+        ] {
             let got = delivered(sch, col);
             if &got != want {
                 bad.push(format!(
@@ -415,52 +721,150 @@ fn duckdb_ledger_verdict(lg: &Ledger, st: &Stand, n: i64) -> Vec<String> {
                 ));
             }
         }
-        if delivered(&ss, col) != delivered(&bs, col) {
-            bad.push(format!(
-                "{what}: the snapshot leg delivers `{}`, batch `{}`",
-                delivered(&ss, col),
-                delivered(&bs, col)
-            ));
+        let arrow_row = b.render.duck.as_deref() == Some(ARROW);
+        for &id in &all {
+            let src = if arrow_row {
+                canon(&arrow_source[&id][0], &canons[k])
+            } else {
+                v("source", id, k)
+            };
+            let (batch, fin) = if arrow_row {
+                (canon(&a_b[&id][k], &canons[k]), None)
+            } else {
+                (v("batch", id, k), Some(v("final", id, k)))
+            };
+            if batch != src {
+                bad.push(format!("{what} id {id}: batch {batch:?}, source {src:?}"));
+            }
+            if let Some(fin) = fin.filter(|f| *f != src) {
+                bad.push(format!(
+                    "{what} id {id}: CDC final image {fin:?}, source {src:?}"
+                ));
+            }
+        }
+        for &id in &captured {
+            if c.diverges.is_some() {
+                continue;
+            }
+            if !arrow_row && v("stream", id, k) != v("batch", id, k) {
+                bad.push(format!(
+                    "{what} id {id} (duckdb): cdc {:?}, batch {:?}",
+                    v("stream", id, k),
+                    v("batch", id, k)
+                ));
+            }
+            if a_s[&id][k] != a_b[&id][k] {
+                bad.push(format!(
+                    "{what} id {id} (arrow): cdc {:?}, batch {:?}",
+                    a_s[&id][k], a_b[&id][k]
+                ));
+            }
         }
         for i in 1..=n {
-            if s_raw[&i][k] != b_raw[&(n + i)][k] {
+            if !arrow_row && v("snapshot", i, k) != v("batch", n + i, k) {
                 bad.push(format!(
                     "{what} sample {i}: snapshot {:?}, batch {:?}",
-                    s_raw[&i][k],
-                    b_raw[&(n + i)][k]
+                    v("snapshot", i, k),
+                    v("batch", n + i, k)
                 ));
             }
         }
-        for id in &captured {
-            if c.diverges.is_none() {
-                for (via, cv, bv) in [("duckdb", &c_raw, &b_raw), ("arrow", &a_c, &a_b)] {
-                    if cv[id][k] != bv[id][k] {
-                        bad.push(format!(
-                            "{what} id {id} ({via}): cdc {:?}, batch {:?}",
-                            cv[id][k], bv[id][k]
-                        ));
-                    }
+        if !arrow_row {
+            let stat = |leg: &str| (counts[leg][1 + 2 * k], counts[leg][2 + 2 * k]);
+            for leg in ["batch", "final"] {
+                if stat(leg) != stat("source") {
+                    bad.push(format!(
+                        "{what}: {leg} has (non-null, distinct) {:?}, the source {:?}",
+                        stat(leg),
+                        stat("source")
+                    ));
                 }
             }
-            let (s, got) = (
-                canon(&src_c[id][k], &c.render.canon),
-                text(c, &c_txt, &a_c, *id, k),
-            );
-            if s != got {
-                bad.push(format!(
-                    "{what} id {id}: cdc renders {got:?}, the source {s:?}"
-                ));
-            }
         }
-        for id in b_txt.keys() {
-            let (s, got) = (
-                canon(&src_b[id][k], &b.render.canon),
-                text(b, &b_txt, &a_b, *id, k),
-            );
-            if s != got {
-                bad.push(format!(
-                    "{what} id {id}: batch renders {got:?}, the source {s:?}"
-                ));
+    }
+    for leg in ["batch", "final"] {
+        if counts[leg][0] != counts["source"][0] {
+            bad.push(format!(
+                "{leg}: COUNT(*) {}, the source {}",
+                counts[leg][0], counts["source"][0]
+            ));
+        }
+    }
+    bad.extend(state_violations(&out, st, n));
+    bad
+}
+
+/// The rows and runs rivet recorded in both state DBs against what DuckDB reads in the parts.
+fn state_violations(out: &serde_json::Value, st: &Stand, n: i64) -> Vec<String> {
+    let table = |q: &str| -> BTreeMap<String, i64> {
+        cells(&out[q])
+            .into_iter()
+            .map(|mut r| {
+                let v = r.pop().unwrap().map_or(0, |v| v.parse().unwrap());
+                (
+                    r.into_iter()
+                        .map(Option::unwrap)
+                        .collect::<Vec<_>>()
+                        .join("/"),
+                    v,
+                )
+            })
+            .collect()
+    };
+    let parts: BTreeMap<String, i64> = table("parts");
+    let (bname, cname) = (st.batch.export_name(), st.cdc.export_name());
+    let captured = cells(&out["cst_snapshot"])
+        .into_iter()
+        .find(|r| r[0].as_deref() == Some(cname))
+        .and_then(|r| r[1].clone())
+        .unwrap_or_default();
+    let snap = format!("{cname}__snapshot_{captured}");
+    let got = |q: &str, key: &str| table(q).get(key).copied();
+    let mut bad = Vec::new();
+    for (what, recorded, want) in [
+        ("batch parts", Some(parts["batch"]), 3 * n),
+        ("batch export_metrics", got("bst_metrics", bname), 3 * n),
+        ("batch file_log", got("bst_files", bname), 3 * n),
+        (
+            "batch successful runs",
+            got("bst_runs", &format!("{bname}/success")),
+            1,
+        ),
+        ("snapshot parts", Some(parts["snapshot"]), 2 * n),
+        ("snapshot export_metrics", got("cst_metrics", &snap), 2 * n),
+        ("snapshot file_log", got("cst_files", &snap), 2 * n),
+        (
+            "snapshot run",
+            got("cst_runs", &format!("{snap}/success")),
+            1,
+        ),
+        (
+            "stream export_metrics",
+            got("cst_metrics", cname),
+            parts["stream"],
+        ),
+        ("stream file_log", got("cst_files", cname), parts["stream"]),
+        (
+            "stream runs",
+            got("cst_runs", &format!("{cname}/success")),
+            2,
+        ),
+        (
+            "completed cdc_snapshot row",
+            got("cst_snapshot", &format!("{cname}/{captured}")),
+            1,
+        ),
+    ] {
+        if recorded != Some(want) {
+            bad.push(format!(
+                "state: {what} is {recorded:?}, DuckDB reads {want}"
+            ));
+        }
+    }
+    for q in ["bst_runs", "cst_runs"] {
+        for (key, count) in table(q) {
+            if !key.ends_with("/success") {
+                bad.push(format!("state: {q} holds {count} run(s) `{key}`"));
             }
         }
     }
@@ -485,54 +889,92 @@ fn seed_refused(rows: &[Row], st: &Stand) -> usize {
     n
 }
 
-/// Batch refuses every row by column (`batch_of` exports one column); CDC delivers each as its cdc twin declares, equal to the source; returns every violation.
+/// Batch refuses every row by column (`batch_of` exports one column); CDC delivers each as its cdc twin declares, equal to the source read in the same DuckDB session; returns every violation.
 fn duckdb_refused_verdict(
     rows: &[(Row, Row)],
     st: &Stand,
     n: usize,
     batch_of: &dyn Fn(&str) -> Rig,
 ) -> Vec<String> {
-    let cols = columns(&rows.iter().map(|(b, _)| b.clone()).collect::<Vec<_>>());
-    let cdir = st.host.join("cdc");
-    let cs = schema(&cdir);
-    let txt = duck(
-        &rows
-            .iter()
-            .zip(&cols)
-            .map(|((_, c), col)| {
-                c.render
-                    .parquet
-                    .as_deref()
-                    .unwrap_or("CAST({c} AS VARCHAR)")
-                    .replace("{c}", col)
-            })
-            .collect::<Vec<_>>()
-            .join(", "),
-        &format!("{}/cdc", st.container),
-        "WHERE __op = 'insert'",
-    );
-    let src = keyed((st.text_rows)(&format!(
-        "SELECT {}, {} FROM {}",
-        st.source_text.replace("{c}", "id"),
-        rows.iter()
-            .zip(&cols)
-            .map(|((_, c), col)| c
-                .render
-                .source
-                .as_deref()
-                .unwrap_or(st.source_text)
-                .replace("{c}", col))
-            .collect::<Vec<_>>()
-            .join(", "),
-        st.table
-    )));
-    assert_eq!(
-        txt.len(),
-        n,
-        "{}: one captured insert per sample row",
+    let cdc_rows: Vec<Row> = rows.iter().map(|(_, c)| c.clone()).collect();
+    let cols = columns(&cdc_rows);
+    let cc = st.cdc.oracle_container_out();
+    let cs = schema(&st.cdc.out_dir());
+    let Source::Attach {
+        engine,
+        database,
+        settings,
+        pass,
+        server_text,
+    } = &st.source
+    else {
+        panic!(
+            "{}: batch-refused rows need a DuckDB-attached source",
+            st.engine
+        )
+    };
+    assert!(
+        cdc_rows.iter().all(|r| r.delivery == "server_text") && !server_text.is_empty(),
+        "{}: batch-refused rows are graded against the server's own text",
         st.engine
     );
+    let (attach, _) = engine.source_sql(database, &st.bare);
+    let server_sql = format!(
+        "SELECT id, {} FROM {}",
+        cols.iter()
+            .map(|c| format!("{} AS {c}", server_text.replace("{c}", c)))
+            .collect::<Vec<_>>()
+            .join(", "),
+        st.bare
+    );
+    let from = pass.replace("{sql}", &server_sql.replace('\'', "''"));
+    let proj = projection(&cdc_rows);
+    let stats = cols
+        .iter()
+        .map(|c| format!("count({c}), count(DISTINCT {c})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let setup = format!(
+        "{} {settings} {attach} CREATE TEMP VIEW legs AS \
+           SELECT 'source' AS leg, CAST(id AS VARCHAR) AS id, {proj} FROM {from} \
+           UNION ALL SELECT 'stream', CAST(id AS VARCHAR), {proj} FROM read_parquet('{cc}/*.parquet') \
+             WHERE __op = 'insert'",
+        engine.load_sql()
+    );
+    let out = duckdb_session_json(
+        &setup,
+        &[
+            ("legs", "SELECT * FROM legs".to_string()),
+            (
+                "counts",
+                format!("SELECT leg, count(*), {stats} FROM legs GROUP BY leg ORDER BY leg"),
+            ),
+        ],
+    );
+    let mut legs: BTreeMap<String, Vec<Vec<Option<String>>>> = BTreeMap::new();
+    for mut r in cells(&out["legs"]) {
+        let leg = r.remove(0).expect("leg");
+        legs.entry(leg).or_default().push(r);
+    }
+    let (src, got) = (
+        keyed(legs.remove("source").unwrap_or_default()),
+        keyed(legs.remove("stream").unwrap_or_default()),
+    );
     let mut bad = Vec::new();
+    if got.len() != n || src.len() != n {
+        bad.push(format!(
+            "{} source rows and {} captured inserts, want {n} of each",
+            src.len(),
+            got.len()
+        ));
+        return bad;
+    }
+    let counts = cells(&out["counts"]);
+    if counts[0][1..] != counts[1][1..] {
+        bad.push(format!(
+            "(COUNT(*), COUNT(col), COUNT(DISTINCT col)) per leg differ: {counts:?}"
+        ));
+    }
     for (k, (col, (b, c))) in cols.iter().zip(rows).enumerate() {
         let what = format!("{col} {}", b.native);
         let said = batch_of(col).run_expect_fail();
@@ -541,14 +983,14 @@ fn duckdb_refused_verdict(
                 "{what}: the batch run did not refuse it by name:\n{said}"
             ));
         }
-        let got = delivered(&cs, col);
-        if got != c.delivery {
+        let d = delivered(&cs, col);
+        if d != c.delivery {
             bad.push(format!(
-                "{what}: cdc delivers `{got}`, the ledger says `{}`",
+                "{what}: cdc delivers `{d}`, the ledger says `{}`",
                 c.delivery
             ));
         }
-        for (id, row) in &txt {
+        for (id, row) in &got {
             let (s, g) = (
                 canon(&src[id][k], &c.render.canon),
                 canon(&row[k], &c.render.canon),
@@ -575,7 +1017,7 @@ fn columns_ddl(rows: &[Row], id_ddl: &str) -> String {
         .join(", ")
 }
 
-/// The `columns:` overrides the ledger declares, as one export line (empty when none).
+/// The `columns:` overrides the rows declare, as one export line (none when no row has one).
 fn overrides(rows: &[Row]) -> Option<String> {
     let o: Vec<String> = rows
         .iter()
@@ -585,11 +1027,22 @@ fn overrides(rows: &[Row]) -> Option<String> {
     (!o.is_empty()).then(|| format!("columns: {{ {} }}", o.join(", ")))
 }
 
-/// Apply the ledger's overrides, if any, to `rig`.
-fn with_overrides(rig: Rig, rows: &[Row]) -> Rig {
+/// Apply the rows' overrides, if any, to `rig`, and put its parts and state DB where DuckDB reads them.
+fn graded(rig: Rig, rows: &[Row]) -> Rig {
+    let rig = rig.census_oracle();
     match overrides(rows) {
         Some(line) => rig.export_line(&line),
         None => rig,
+    }
+}
+
+/// The batch rig's four-way census (source, parts, metrics, file_log, manifests) must agree at `want` rows.
+fn census_violations(rig: &Rig, want: i64) -> Vec<String> {
+    let c = rig.row_census();
+    if c.agrees() && c.source == want {
+        Vec::new()
+    } else {
+        vec![format!("batch row census disagrees (want {want}): {c:?}")]
     }
 }
 
@@ -607,20 +1060,6 @@ fn postgres_batch_and_cdc_deliver_every_ledger_row_alike() {
             .batch_execute(q)
             .unwrap_or_else(|e| panic!("{q}: {e}"))
     };
-    let text_rows = |q: &str| -> Vec<Vec<Option<String>>> {
-        let mut c = connect();
-        c.batch_execute("SET TimeZone = 'UTC'; SET intervalstyle = 'iso_8601'")
-            .unwrap();
-        c.query(q, &[])
-            .unwrap_or_else(|e| panic!("{q}: {e}"))
-            .iter()
-            .map(|r| {
-                (0..r.len())
-                    .map(|i| r.get::<_, Option<String>>(i))
-                    .collect()
-            })
-            .collect()
-    };
     let stand = |rows: &[Row], label: &str, snapshot: bool| {
         let table = unique_name(label);
         let slot = unique_name(&format!("{label}_slot"));
@@ -632,26 +1071,28 @@ fn postgres_batch_and_cdc_deliver_every_ledger_row_alike() {
             PgTable::adopt_on(POSTGRES_CDC_URL, table.clone()),
             Slot(slot.clone()),
         );
-        let (host, container) = duckdb_shared_workdir(&table);
-        let mut cdc = with_overrides(Rig::pg_cdc(&table, &slot), rows).dest_path(host.join("cdc"));
+        let mut cdc = Rig::pg_cdc(&table, &slot);
         if snapshot {
             cdc = cdc.cdc_line("initial: snapshot");
         }
-        let batch = with_overrides(Rig::pg_batch(&table), rows)
+        let batch = Rig::pg_batch(&table)
             .export_named(&format!("{table}_batch"))
-            .source_url(POSTGRES_CDC_URL)
-            .dest_path(host.join("batch"));
+            .source_url(POSTGRES_CDC_URL);
         let st = Stand {
             engine: "postgres",
+            bare: table.clone(),
             table,
             exec: &exec,
-            text_rows: &text_rows,
-            source_text: "{c}::text",
+            source: Source::Attach {
+                engine: OracleEngine::PostgresCdc,
+                database: "rivet",
+                pass: "postgres_query('src', '{sql}')",
+                settings: "SET pg_use_text_protocol = true;",
+                server_text: "CASE WHEN {c} IS NOT NULL THEN format('%s', {c}) END",
+            },
             settle: &|_| {},
-            cdc,
-            batch,
-            host,
-            container,
+            cdc: graded(cdc, rows),
+            batch: graded(batch, rows),
         };
         (st, guards)
     };
@@ -661,7 +1102,8 @@ fn postgres_batch_and_cdc_deliver_every_ledger_row_alike() {
     rewrite(&lg, &st, n);
     st.cdc.run_ok();
     st.batch.run_ok();
-    let bad = duckdb_ledger_verdict(&lg, &st, n);
+    let mut bad = duckdb_ledger_verdict(&lg, &st, n);
+    bad.extend(census_violations(&st.batch, 3 * n));
     assert!(
         bad.is_empty(),
         "{} ledger violations:\n{}",
@@ -702,54 +1144,38 @@ fn mysql_batch_and_cdc_deliver_every_ledger_row_alike() {
         ))
         .unwrap();
     let _t = MysqlCdcTable(table.clone());
-    let (host, container) = duckdb_shared_workdir(&table);
     let exec = |q: &str| {
         cdc_conn()
             .query_drop(q)
             .unwrap_or_else(|e| panic!("{q}: {e}"))
     };
-    let text_rows = |q: &str| -> Vec<Vec<Option<String>>> {
-        let mut c = cdc_conn();
-        c.query_drop("SET time_zone = '+00:00'").unwrap();
-        c.query::<mysql::Row, _>(q)
-            .unwrap_or_else(|e| panic!("{q}: {e}"))
-            .into_iter()
-            .map(|r| {
-                (0..r.len())
-                    .map(|i| match r.get::<mysql::Value, _>(i).unwrap() {
-                        mysql::Value::NULL => None,
-                        mysql::Value::Bytes(b) => Some(String::from_utf8(b).expect("utf-8 text")),
-                        other => panic!("{q}: column {i} is not text: {other:?}"),
-                    })
-                    .collect()
-            })
-            .collect()
-    };
-    let cdc = with_overrides(Rig::mysql_cdc(&table), &lg.batch)
-        .cdc_line("initial: snapshot")
-        .dest_path(host.join("cdc"));
-    let batch = with_overrides(Rig::mysql_batch(&table), &lg.batch)
+    let cdc = Rig::mysql_cdc(&table).cdc_line("initial: snapshot");
+    let batch = Rig::mysql_batch(&table)
         .export_named(&format!("{table}_batch"))
-        .source_url(MYSQL_CDC_URL)
-        .dest_path(host.join("batch"));
+        .source_url(MYSQL_CDC_URL);
     let st = Stand {
         engine: "mysql",
+        bare: table.clone(),
         table: table.clone(),
         exec: &exec,
-        text_rows: &text_rows,
-        source_text: "CAST({c} AS CHAR)",
+        source: Source::Attach {
+            engine: OracleEngine::MysqlCdc,
+            database: "rivet",
+            pass: "mysql_query('src', '{sql}')",
+            settings: "SET mysql_tinyint1_as_boolean = false; SET mysql_session_time_zone = '+00:00';",
+            server_text: "",
+        },
         settle: &|_| {},
-        cdc,
-        batch,
-        host,
-        container,
+        cdc: graded(cdc, &lg.batch),
+        batch: graded(batch, &lg.batch),
     };
     let n = seed(&lg, &st);
     st.cdc.run_ok();
     rewrite(&lg, &st, n);
     st.cdc.run_ok();
     st.batch.run_ok();
-    let bad = duckdb_ledger_verdict(&lg, &st, n);
+    let mut bad = duckdb_ledger_verdict(&lg, &st, n);
+    bad.extend(census_violations(&st.batch, 3 * n));
     assert!(
         bad.is_empty(),
         "{} ledger violations:\n{}",
@@ -774,32 +1200,33 @@ fn mssql_batch_and_cdc_deliver_every_ledger_row_alike() {
         ci: ci.clone(),
     };
     enable_cdc(&table, &ci);
-    let (host, container) = duckdb_shared_workdir(&table);
-    let cdc = with_overrides(Rig::mssql_cdc(&table, &ci), &lg.batch)
-        .cdc_line("initial: snapshot")
-        .dest_path(host.join("cdc"));
-    let batch = with_overrides(Rig::mssql_batch(&format!("{table}_batch")), &lg.batch)
-        .source_url(MSSQL_CDC_URL)
-        .query(&format!("SELECT * FROM dbo.{table}"))
-        .dest_path(host.join("batch"));
+    let cdc = Rig::mssql_cdc(&table, &ci).cdc_line("initial: snapshot");
+    let batch = Rig::mssql_batch(&table)
+        .export_named(&format!("{table}_batch"))
+        .source_url(MSSQL_CDC_URL);
     let st = Stand {
         engine: "mssql",
+        bare: table.clone(),
         table: format!("dbo.{table}"),
         exec: &mssql_cdc_exec,
-        text_rows: &mssql_cdc_text_rows,
-        source_text: "CONVERT(nvarchar(max), {c})",
+        source: Source::Attach {
+            engine: OracleEngine::MssqlCdc,
+            database: "rivet",
+            pass: "mssql_scan('src', '{sql}')",
+            settings: "",
+            server_text: "",
+        },
         settle: &|rows| wait_for_capture(&ci, rows),
-        cdc,
-        batch,
-        host,
-        container,
+        cdc: graded(cdc, &lg.batch),
+        batch: graded(batch, &lg.batch),
     };
     let n = seed(&lg, &st);
     st.cdc.run_ok();
     rewrite(&lg, &st, n);
     st.cdc.run_ok();
     st.batch.run_ok();
-    let bad = duckdb_ledger_verdict(&lg, &st, n);
+    let mut bad = duckdb_ledger_verdict(&lg, &st, n);
+    bad.extend(census_violations(&st.batch, 3 * n));
     assert!(
         bad.is_empty(),
         "{} ledger violations:\n{}",
@@ -808,6 +1235,7 @@ fn mssql_batch_and_cdc_deliver_every_ledger_row_alike() {
     );
 }
 
+/// DuckDB has no Oracle scanner, so the source leg is Oracle's own rendering through its client; parts and state DBs are read by DuckDB.
 #[cfg(feature = "oracle")]
 #[test]
 #[ignore = "live: requires the oracle service with LogMiner prerequisites + duckdb"]
@@ -818,23 +1246,20 @@ fn oracle_batch_and_cdc_deliver_every_ledger_row_alike() {
         "ledger_ora",
         &columns_ddl(&lg.batch, "id NUMBER(10) PRIMARY KEY"),
     );
-    let (host, container) = duckdb_shared_workdir(&t.name().to_lowercase());
-    let cdc = with_overrides(Rig::oracle_cdc(t.name()), &lg.batch)
-        .cdc_line("initial: snapshot")
-        .dest_path(host.join("cdc"));
-    let batch =
-        with_overrides(Rig::oracle_batch(t.name()), &lg.batch).dest_path(host.join("batch"));
+    let cdc = Rig::oracle_cdc(t.name()).cdc_line("initial: snapshot");
+    let batch = Rig::oracle_batch(t.name());
     let st = Stand {
         engine: "oracle",
+        bare: t.name().to_string(),
         table: t.name().to_string(),
         exec: &ora_exec,
-        text_rows: &ora_text_rows,
-        source_text: "TO_CHAR({c})",
+        source: Source::Client {
+            text_rows: &ora_text_rows,
+            render: "TO_CHAR({c})",
+        },
         settle: &|_| {},
-        cdc,
-        batch,
-        host,
-        container,
+        cdc: graded(cdc, &lg.batch),
+        batch: graded(batch, &lg.batch),
     };
     let n = seed(&lg, &st);
     st.cdc.run_ok();
