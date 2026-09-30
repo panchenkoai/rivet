@@ -194,11 +194,11 @@ fn capture_open_forensics(
 
 /// The run's column plan: the open probe's mappings under the run's type policy, before any runner reads data.
 fn plan_open_columns(
-    plan: &ResolvedRunPlan,
+    export_name: &str,
     open: &mut Option<Vec<crate::types::TypeMapping>>,
     strict: bool,
 ) -> Result<()> {
-    let subject = format!("export '{}'", plan.export_name);
+    let subject = format!("export '{export_name}'");
     match open.as_ref() {
         Some(m) => {
             let planned = crate::types::plan_columns(
@@ -1381,8 +1381,9 @@ fn execute_resolved_plan(
         });
     }
 
-    let gate = settle_columns_are_temporal(plan, summary.open_mappings.as_deref())
-        .and_then(|()| plan_open_columns(plan, &mut summary.open_mappings, tail.strict));
+    let gate = settle_columns_are_temporal(plan, summary.open_mappings.as_deref()).and_then(|()| {
+        plan_open_columns(&plan.export_name, &mut summary.open_mappings, tail.strict)
+    });
     let result = match gate {
         Err(e) => Err(e),
         Ok(()) if plan.strategy.requires_parallel_execution() => {
@@ -3460,6 +3461,31 @@ mod tests {
         assert_eq!(
             harm_deltas(&before, &after),
             vec![("shared".to_string(), 15)]
+        );
+    }
+
+    /// The run's plan refuses a Lossy column only under --strict, and a missing plan only under --strict.
+    #[test]
+    fn plan_open_columns_refuses_only_under_strict() {
+        use crate::types::{RivetType, SourceColumn, TypeFidelity, TypeMapping};
+        let lossy = || {
+            let mut m = TypeMapping::from_source(
+                &SourceColumn::simple("ts", "timestamp(9)", true),
+                RivetType::String,
+            );
+            m.fidelity = TypeFidelity::Lossy;
+            Some(vec![m])
+        };
+        let mut open = lossy();
+        assert!(plan_open_columns("e", &mut open, false).is_ok());
+        assert_eq!(open.as_ref().map(Vec::len), Some(1), "warn keeps the plan");
+        let err = plan_open_columns("e", &mut lossy(), true).unwrap_err();
+        assert!(format!("{err:#}").contains("ts"), "{err:#}");
+        assert!(plan_open_columns("e", &mut None, false).is_ok());
+        let err = plan_open_columns("e", &mut None, true).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("could not be resolved"),
+            "{err:#}"
         );
     }
 }

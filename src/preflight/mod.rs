@@ -2008,4 +2008,32 @@ mod tests {
         let h = dest_hint("dns error", DestinationType::S3).expect("hint");
         assert!(h.contains("region") || h.contains("endpoint"), "got: {h}");
     }
+
+    /// Only fatal violations are kept, each prefixed with its export and, for a multiplex stream, its table.
+    #[test]
+    fn fatal_violations_keep_the_fatal_ones_prefixed_with_export_and_table() {
+        use crate::types::{TypeFidelity, policy::PolicyViolation};
+        let v = |c: &str, fatal: bool| PolicyViolation {
+            column_name: c.into(),
+            fidelity: TypeFidelity::Unsupported,
+            message: format!("m-{c}"),
+            fatal,
+        };
+        let report = |table: Option<&str>, violations| type_report::ExportTypeReport {
+            export: "e".into(),
+            table: table.map(Into::into),
+            columns: vec![],
+            violations,
+            target_failures: false,
+            recovery_sql: None,
+        };
+        let got: Vec<String> = fatal_violations(&[
+            report(None, vec![v("a", true), v("b", false)]),
+            report(Some("t"), vec![v("c", true)]),
+        ])
+        .into_iter()
+        .map(|v| v.message)
+        .collect();
+        assert_eq!(got, vec!["export 'e': m-a", "export 'e' table 't': m-c"]);
+    }
 }

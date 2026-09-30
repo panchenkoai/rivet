@@ -121,11 +121,20 @@ pub fn plan_columns(
     subject: &str,
 ) -> crate::error::Result<Vec<TypeMapping>> {
     let violations = policy.validate(&mappings);
-    for v in violations.iter().filter(|v| !v.fatal) {
-        log::warn!("{subject}: {}", v.message);
+    for w in warnings(&violations, subject) {
+        log::warn!("{w}");
     }
     refuse_fatal(&violations, subject)?;
     Ok(mappings)
+}
+
+/// The warning line for each non-fatal violation, prefixed with `subject`.
+pub fn warnings(violations: &[PolicyViolation], subject: &str) -> Vec<String> {
+    violations
+        .iter()
+        .filter(|v| !v.fatal)
+        .map(|v| format!("{subject}: {}", v.message))
+        .collect()
 }
 
 /// `Err` naming every fatal violation (`RIVET_TYPE_UNSAFE_MAPPING`), `Ok` when none is fatal.
@@ -275,6 +284,21 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    /// Only the non-fatal violations become warning lines, each prefixed with the subject.
+    #[test]
+    fn warnings_are_the_non_fatal_violations_prefixed_with_the_subject() {
+        let v = |c: &str, fatal: bool| PolicyViolation {
+            column_name: c.into(),
+            fidelity: TypeFidelity::Lossy,
+            message: format!("m-{c}"),
+            fatal,
+        };
+        assert_eq!(
+            warnings(&[v("a", false), v("b", true), v("c", false)], "export 'e'"),
+            vec!["export 'e': m-a".to_string(), "export 'e': m-c".to_string()]
         );
     }
 }
