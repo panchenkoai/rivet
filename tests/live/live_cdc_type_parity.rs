@@ -33,10 +33,14 @@ struct Row {
     diverges: Option<String>,
     /// Why rivet misses this row's ADR target today; the row must keep failing until the named step fixes it.
     known_defect: Option<String>,
+    /// Samples (`NULL` for a NULL cell) whose value differs from the source today: a known_defect's value class.
+    defect_samples: Vec<String>,
     /// The ClickHouse column type `rivet load` builds for this row (cdc rows).
     clickhouse: Option<String>,
     /// Like `known_defect`, for the ClickHouse stage alone.
     clickhouse_defect: Option<String>,
+    /// Like `defect_samples`, for the ClickHouse stage alone.
+    clickhouse_defect_samples: Vec<String>,
     /// Today's behaviour of a known_defect row: the batch run refuses the column by name.
     batch_refuses: bool,
 }
@@ -54,6 +58,17 @@ fn ledger(engine: &str) -> Ledger {
         serde_yaml_ng::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
     let e = &doc["engines"][engine];
     let s = |v: &serde_yaml_ng::Value| v.as_str().map(str::to_string);
+    let list = |v: &serde_yaml_ng::Value| -> Vec<String> {
+        v.as_sequence()
+            .map(|l| l.iter().map(|x| s(x).expect("string")).collect())
+            .unwrap_or_default()
+    };
+    let render = |r: &serde_yaml_ng::Value| Render {
+        source: s(&r["source"]),
+        duck: s(&r["duck"]),
+        server: s(&r["server"]),
+        canon: s(&r["canon"]),
+    };
     let rows = |mode: &str| -> Vec<Row> {
         e[mode]
             .as_sequence()
@@ -69,16 +84,18 @@ fn ledger(engine: &str) -> Ledger {
                     .collect(),
                 delivery: s(&r["delivery"]).expect("delivery"),
                 over: s(&r["override"]),
-                render: Render {
-                    source: s(&r["render"]["source"]),
-                    duck: s(&r["render"]["duck"]),
-                    server: s(&r["render"]["server"]),
-                    canon: s(&r["render"]["canon"]),
-                },
+                // A known_defect row is graded at full precision for what it delivers today.
+                render: render(if r["today_render"].is_null() {
+                    &r["render"]
+                } else {
+                    &r["today_render"]
+                }),
                 diverges: s(&r["diverges"]),
                 known_defect: s(&r["known_defect"]),
+                defect_samples: list(&r["defect_samples"]),
                 clickhouse: s(&r["clickhouse"]),
                 clickhouse_defect: s(&r["clickhouse_defect"]),
+                clickhouse_defect_samples: list(&r["clickhouse_defect_samples"]),
                 batch_refuses: r["batch_refuses"].as_bool().unwrap_or(false),
             })
             .collect()
@@ -244,8 +261,22 @@ fn clickhouse_relation(sql: &str) -> String {
     )
 }
 
-/// The loaded view as DuckDB reads it, re-typed to each row's delivery (text from the bytes a ClickHouse `String` travels as, UUID from `FixedString(16)`, time of day from its decimal seconds, a naive timestamp from Parquet's UTC).
-fn warehouse_relation(rows: &[Row], w: &Warehouse) -> String {
+/// Whether a delivery is a timestamp without a zone.
+fn naive_ts(delivery: &str) -> bool {
+    delivery.starts_with("Timestamp(") && !delivery.contains(',')
+}
+
+/// The session time zone of the warehouse leg that reads naive timestamps as ClickHouse's own text.
+const CH_SESSION_TZ: &str = "Asia/Tokyo";
+
+/// The loaded view as DuckDB reads it, re-typed to each row's delivery (text from the bytes a ClickHouse `String` travels as, UUID from `FixedString(16)`, time of day from its decimal seconds, a naive timestamp from Parquet's UTC, or with `as_text` from ClickHouse's own text under a non-UTC session).
+fn warehouse_relation(rows: &[Row], w: &Warehouse, as_text: bool) -> String {
+    let naive: Vec<String> = rows
+        .iter()
+        .zip(columns(rows))
+        .filter(|(r, _)| as_text && naive_ts(&r.delivery))
+        .map(|(_, c)| c)
+        .collect();
     let text: Vec<String> = rows
         .iter()
         .zip(columns(rows))
@@ -263,7 +294,9 @@ fn warehouse_relation(rows: &[Row], w: &Warehouse) -> String {
                     "CAST(regexp_replace(lower(hex({c})), \
                      '^(.{{8}})(.{{4}})(.{{4}})(.{{4}})(.{{12}})$', '\\1-\\2-\\3-\\4-\\5') AS UUID)"
                 )
-            } else if d.starts_with("Timestamp(") && !d.contains(',') {
+            } else if naive_ts(d) && as_text {
+                format!("CAST(decode({c}) AS TIMESTAMP)")
+            } else if naive_ts(d) {
                 format!("CAST({c} AS TIMESTAMP)")
             } else if d.starts_with("Time64(") {
                 format!("TIME '00:00:00' + to_microseconds(CAST({c} * 1000000 AS BIGINT))")
@@ -273,10 +306,21 @@ fn warehouse_relation(rows: &[Row], w: &Warehouse) -> String {
             Some(format!("{e} AS {c}"))
         })
         .collect();
-    let from = clickhouse_relation(&format!(
-        "SELECT * FROM {}.{} WHERE NOT __is_deleted",
-        w.db, w.view
-    ));
+    let from = clickhouse_relation(&if naive.is_empty() {
+        format!("SELECT * FROM {}.{} WHERE NOT __is_deleted", w.db, w.view)
+    } else {
+        format!(
+            "SELECT * REPLACE ({}) FROM {}.{} WHERE NOT __is_deleted \
+             SETTINGS session_timezone = '{CH_SESSION_TZ}'",
+            naive
+                .iter()
+                .map(|c| format!("toString({c}) AS {c}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            w.db,
+            w.view
+        )
+    });
     if text.is_empty() {
         from
     } else {
@@ -413,15 +457,38 @@ fn canon(v: &Option<String>, how: &Option<String>) -> Option<String> {
             .parse::<f64>()
             .map_or_else(|e| panic!("{s}: {e}"), |f| f.to_string()),
         Some("interval") => canon_interval(s),
-        Some("datetime_tick") => {
-            let s = s.trim_end_matches("+00");
-            let (base, frac) = s.split_once('.').unwrap_or((s, "0"));
-            let f: f64 = format!("0.{frac}").parse().unwrap();
-            format!("{base}+{}/300", (f * 300.0).round() as i64)
-        }
+        Some("round_micros") => round_micros(s),
         Some(other) => panic!("unknown canon `{other}`"),
         None => s.clone(),
     })
+}
+
+/// A timestamp's text rounded half-up to the microsecond (SQL Server renders a DATETIME tick at 100 ns).
+fn round_micros(s: &str) -> String {
+    use chrono::Timelike;
+    let t = chrono::NaiveDateTime::parse_from_str(
+        s.trim_end_matches("+00").trim(),
+        "%Y-%m-%d %H:%M:%S%.f",
+    )
+    .unwrap_or_else(|e| panic!("{s}: {e}"));
+    let sub = i64::from(t.nanosecond() % 1_000);
+    let t = t + chrono::TimeDelta::nanoseconds(if sub >= 500 { 1_000 - sub } else { -sub });
+    t.format("%Y-%m-%d %H:%M:%S%.6f").to_string()
+}
+
+#[test]
+fn round_micros_rounds_the_server_tick_and_keeps_a_micro() {
+    for (got, want) in [
+        ("2026-01-15 13:45:30.1266667", "2026-01-15 13:45:30.126667"),
+        ("2026-01-15 13:45:30.126667", "2026-01-15 13:45:30.126667"),
+        ("2026-01-15 13:45:30.126666", "2026-01-15 13:45:30.126666"),
+        (
+            "2026-01-15 13:45:59.9999996+00",
+            "2026-01-15 13:46:00.000000",
+        ),
+    ] {
+        assert_eq!(round_micros(got), want);
+    }
 }
 
 /// An ISO 8601 duration (`P1Y2M3DT4H5M6.5S`) or DuckDB's interval text (`1 year 2 months 3 days 04:05:06.5`) as `<months>m<days>d<micros>us`.
@@ -603,12 +670,20 @@ fn server_rendered(rows: &[Row], from: &str, pass: &str, bare: &str) -> String {
     )
 }
 
-/// The DuckDB state-DB path beside a `census_oracle()` rig's config.
-fn state_db(rig: &Rig) -> String {
-    format!(
-        "{}/.rivet_state.db",
-        rig.oracle_container_out().trim_end_matches("/out")
-    )
+/// ATTACH the state backend a `census_oracle()` rig ran against as `alias`: Postgres when `RIVET_STATE_URL` names one, else the SQLite file beside its config.
+fn state_attach(rig: &Rig, alias: &str) -> String {
+    match std::env::var("RIVET_STATE_URL")
+        .ok()
+        .filter(|u| u.starts_with("postgres"))
+    {
+        Some(url) => format!(
+            "INSTALL postgres; LOAD postgres; ATTACH '{url}' AS {alias} (TYPE postgres, READ_ONLY);"
+        ),
+        None => format!(
+            "INSTALL sqlite; LOAD sqlite; ATTACH '{}/.rivet_state.db' AS {alias} (TYPE sqlite, READ_ONLY);",
+            rig.oracle_container_out().trim_end_matches("/out")
+        ),
+    }
 }
 
 /// `COUNT(*)`, then `COUNT(col)` and `COUNT(DISTINCT col)` per column, over `leg`'s rows.
@@ -635,8 +710,7 @@ fn duckdb_ledger_verdict(lg: &Ledger, st: &Stand, n: i64) -> Vec<String> {
     let (bs, cs, ss) = (schema(&bdir), schema(&cdir), schema(&cdir.join("snapshot")));
     let proj = projection(&lg.batch);
     let mut setup = format!(
-        "INSTALL sqlite; LOAD sqlite; \
-         ATTACH '{}' AS bst (TYPE sqlite, READ_ONLY); ATTACH '{}' AS cst (TYPE sqlite, READ_ONLY); \
+        "{} {} \
          CREATE TEMP VIEW fin AS SELECT * EXCLUDE (rn) FROM (SELECT *, row_number() OVER \
            (PARTITION BY id ORDER BY __pos IS NULL, __seq DESC) AS rn FROM read_parquet(\
            ['{cc}/snapshot/*.parquet', '{cc}/*.parquet'], union_by_name = true)) \
@@ -648,9 +722,13 @@ fn duckdb_ledger_verdict(lg: &Ledger, st: &Stand, n: i64) -> Vec<String> {
              WHERE __op IN ('insert', 'update') \
            UNION ALL SELECT 'final', CAST(id AS VARCHAR), {proj} FROM fin \
            UNION ALL SELECT 'batch_stream', CAST(id AS VARCHAR), {proj} FROM read_parquet('{bc}/*.parquet') \
-             WHERE id IN (SELECT id FROM read_parquet('{cc}/*.parquet') WHERE __op IN ('insert', 'update'))",
-        state_db(&st.batch),
-        state_db(&st.cdc),
+             WHERE id IN (SELECT id FROM read_parquet('{cc}/*.parquet') WHERE __op IN ('insert', 'update')) \
+           UNION ALL SELECT 'batch_snapshot', CAST(id AS VARCHAR), {proj} FROM read_parquet('{bc}/*.parquet') \
+             WHERE id BETWEEN {} AND {}",
+        state_attach(&st.batch, "bst"),
+        state_attach(&st.cdc, "cst"),
+        n + 1,
+        2 * n,
     );
     if let Source::Attach {
         engine,
@@ -670,8 +748,14 @@ fn duckdb_ledger_verdict(lg: &Ledger, st: &Stand, n: i64) -> Vec<String> {
     if let Some(w) = &st.warehouse {
         setup = format!(
             "INSTALL httpfs; LOAD httpfs; {setup} UNION ALL SELECT 'warehouse', CAST(id AS VARCHAR), {proj} FROM {}",
-            warehouse_relation(&lg.cdc, w)
+            warehouse_relation(&lg.cdc, w, false)
         );
+        if lg.cdc.iter().any(|r| naive_ts(&r.delivery)) {
+            setup = format!(
+                "{setup} UNION ALL SELECT 'warehouse_text', CAST(id AS VARCHAR), {proj} FROM {}",
+                warehouse_relation(&lg.cdc, w, true)
+            );
+        }
     }
     let stats = cols
         .iter()
@@ -696,8 +780,9 @@ fn duckdb_ledger_verdict(lg: &Ledger, st: &Stand, n: i64) -> Vec<String> {
             "counts",
             format!("SELECT leg, count(*), {stats} FROM legs GROUP BY leg"),
         ),
-        // One query per state table: DuckDB 1.5.5 answers a UNION ALL of two sqlite
-        // scans with the first scan twice (measured 2026-09-30).
+        // One query per state table: DuckDB 1.5.5 reuses one result for identical
+        // aggregate subplans over same-named tables in two attached sqlite DBs (a UNION
+        // ALL of ungrouped aggregates, a pair of scalar subqueries; measured 2026-09-30).
         (
             "bst_metrics",
             "SELECT export_name, sum(total_rows) FROM bst.export_metrics GROUP BY 1".to_string(),
@@ -837,9 +922,10 @@ fn duckdb_ledger_verdict(lg: &Ledger, st: &Stand, n: i64) -> Vec<String> {
             }
         }
     }
-    let (a_b, a_s) = (
+    let (a_b, a_s, a_snap) = (
         arrow_cells(&bdir, &cols, None),
         arrow_cells(&cdir, &cols, Some(&["update", "insert"])),
+        arrow_cells(&cdir.join("snapshot"), &cols, None),
     );
     let arrow_source = keyed(out.get("arrow_source").map(cells).unwrap_or_default());
     let arrow_warehouse = keyed(out.get("arrow_warehouse").map(cells).unwrap_or_default());
@@ -853,16 +939,19 @@ fn duckdb_ledger_verdict(lg: &Ledger, st: &Stand, n: i64) -> Vec<String> {
 
     let all: Vec<i64> = (1..=3 * n).collect();
     let captured: Vec<i64> = std::iter::once(1).chain(n + 1..=3 * n).collect();
+    let snapshot: Vec<i64> = (1..=2 * n).collect();
+    let wh_text = legs.contains_key("warehouse_text");
     let mut bad = Vec::new();
     for (leg, want) in [
         ("source", &all),
         ("batch", &all),
         ("final", &all),
         ("stream", &captured),
-        ("snapshot", &(1..=2 * n).collect::<Vec<i64>>()),
+        ("snapshot", &snapshot),
     ]
     .into_iter()
     .chain(st.warehouse.as_ref().map(|_| ("warehouse", &all)))
+    .chain(wh_text.then_some(("warehouse_text", &all)))
     {
         let got: Vec<i64> = legs
             .get(leg)
@@ -876,10 +965,23 @@ fn duckdb_ledger_verdict(lg: &Ledger, st: &Stand, n: i64) -> Vec<String> {
         return bad;
     }
     let v = |leg: &str, id: i64, k: usize| canon(&legs[leg][&id][k], &canons[k]);
+    // The sample literal source id `id` holds: `NULL` for id 1 (the rewrite nulls it) and past a row's samples.
+    let literal = |r: &Row, id: i64| -> String {
+        (id != 1)
+            .then(|| r.sample.get(((id - 1) % n) as usize).cloned())
+            .flatten()
+            .unwrap_or_else(|| "NULL".into())
+    };
+    // Snapshot id i holds what batch id `snap_twin(i)` holds (ids n+1..=2n were seeded NULL, like batch id 1).
+    let snap_twin = |i: i64| if i <= n { n + i } else { 1 };
     for (k, (col, (b, c))) in cols.iter().zip(lg.batch.iter().zip(&lg.cdc)).enumerate() {
         let what = format!("{col} {}", b.native);
-        let before = bad.len();
-        let mut wbad = Vec::new();
+        // A marker excuses only its declared class: the type labels (known_defect: the
+        // delivery and the ClickHouse type it drives; clickhouse_defect: the ClickHouse
+        // type) and source mismatches on the samples it names. All else stays strict.
+        let (kd, chd) = (b.known_defect.is_some(), c.clickhouse_defect.is_some());
+        let (mut kd_hits, mut ch_hits) = (0usize, 0usize);
+        let mut hit_samples: std::collections::BTreeSet<(bool, String)> = Default::default();
         for (mode, want, sch) in [
             ("batch", &b.delivery, &bs),
             ("cdc stream", &c.delivery, &cs),
@@ -887,30 +989,28 @@ fn duckdb_ledger_verdict(lg: &Ledger, st: &Stand, n: i64) -> Vec<String> {
         ] {
             let got = delivered(sch, col);
             if &got != want {
-                bad.push(format!(
-                    "{what}: {mode} delivers `{got}`, the ledger says `{want}`"
-                ));
+                if kd {
+                    kd_hits += 1;
+                } else {
+                    bad.push(format!(
+                        "{what}: {mode} delivers `{got}`, the ledger says `{want}`"
+                    ));
+                }
             }
         }
         let arrow_row = b.render.duck.as_deref() == Some(ARROW);
+        let mut off_source = Vec::new();
         for &id in &all {
             let src = if arrow_row {
                 canon(&arrow_source[&id][0], &canons[k])
             } else {
                 v("source", id, k)
             };
-            let (batch, fin) = if arrow_row {
-                (canon(&a_b[&id][k], &canons[k]), None)
+            if arrow_row {
+                off_source.push(("batch", id, canon(&a_b[&id][k], &canons[k]), src.clone()));
             } else {
-                (v("batch", id, k), Some(v("final", id, k)))
-            };
-            if batch != src {
-                bad.push(format!("{what} id {id}: batch {batch:?}, source {src:?}"));
-            }
-            if let Some(fin) = fin.filter(|f| *f != src) {
-                bad.push(format!(
-                    "{what} id {id}: CDC final image {fin:?}, source {src:?}"
-                ));
+                off_source.push(("batch", id, v("batch", id, k), src.clone()));
+                off_source.push(("CDC final image", id, v("final", id, k), src.clone()));
             }
             if st.warehouse.is_some() {
                 let wh = if arrow_row {
@@ -918,18 +1018,45 @@ fn duckdb_ledger_verdict(lg: &Ledger, st: &Stand, n: i64) -> Vec<String> {
                 } else {
                     v("warehouse", id, k)
                 };
-                if wh != src {
-                    wbad.push(format!("{what} id {id}: ClickHouse {wh:?}, source {src:?}"));
-                }
+                off_source.push(("ClickHouse", id, wh, src.clone()));
+            }
+            if wh_text && naive_ts(&c.delivery) {
+                off_source.push((
+                    "ClickHouse text (session_timezone Asia/Tokyo)",
+                    id,
+                    v("warehouse_text", id, k),
+                    src,
+                ));
+            }
+        }
+        for (leg, id, got, src) in off_source {
+            if got == src {
+                continue;
+            }
+            let lit = literal(b, id);
+            if b.defect_samples.contains(&lit) {
+                kd_hits += 1;
+                hit_samples.insert((false, lit));
+            } else if leg.starts_with("ClickHouse") && c.clickhouse_defect_samples.contains(&lit) {
+                ch_hits += 1;
+                hit_samples.insert((true, lit));
+            } else {
+                bad.push(format!("{what} id {id}: {leg} {got:?}, source {src:?}"));
             }
         }
         if st.warehouse.is_some() {
             let got = ch_types.get(col.as_str()).cloned();
             if got != c.clickhouse {
-                wbad.push(format!(
-                    "{what}: ClickHouse holds `{got:?}`, the ledger says `{:?}`",
-                    c.clickhouse
-                ));
+                if kd {
+                    kd_hits += 1;
+                } else if chd {
+                    ch_hits += 1;
+                } else {
+                    bad.push(format!(
+                        "{what}: ClickHouse holds `{got:?}`, the ledger says `{:?}`",
+                        c.clickhouse
+                    ));
+                }
             }
         }
         for &id in &captured {
@@ -950,33 +1077,41 @@ fn duckdb_ledger_verdict(lg: &Ledger, st: &Stand, n: i64) -> Vec<String> {
                 ));
             }
         }
-        for i in 1..=n {
-            if !arrow_row && v("snapshot", i, k) != v("batch", n + i, k) {
+        for &i in &snapshot {
+            let twin = snap_twin(i);
+            if !arrow_row && v("snapshot", i, k) != v("batch", twin, k) {
                 bad.push(format!(
-                    "{what} sample {i}: snapshot {:?}, batch {:?}",
+                    "{what} snapshot id {i} (duckdb): {:?}, batch id {twin} {:?}",
                     v("snapshot", i, k),
-                    v("batch", n + i, k)
+                    v("batch", twin, k)
+                ));
+            }
+            if a_snap[&i][k] != a_b[&twin][k] {
+                bad.push(format!(
+                    "{what} snapshot id {i} (arrow): {:?}, batch id {twin} {:?}",
+                    a_snap[&i][k], a_b[&twin][k]
                 ));
             }
         }
         if !arrow_row {
             let stat = |leg: &str| (counts[leg][1 + 2 * k], counts[leg][2 + 2 * k]);
-            for (leg, of) in [
-                ("batch", "source"),
-                ("final", "source"),
-                ("stream", "batch_stream"),
-                ("warehouse", "source"),
+            // A leg with named defect samples is graded against the source per id above.
+            let (kd_values, ch_values) = (
+                !b.defect_samples.is_empty(),
+                !c.clickhouse_defect_samples.is_empty(),
+            );
+            for (leg, of, excused) in [
+                ("batch", "source", kd_values),
+                ("final", "source", kd_values),
+                ("stream", "batch_stream", false),
+                ("snapshot", "batch_snapshot", false),
+                ("warehouse", "source", kd_values || ch_values),
             ] {
-                if leg == "warehouse" && st.warehouse.is_none() {
+                if excused || leg == "warehouse" && st.warehouse.is_none() {
                     continue;
                 }
                 if stat(leg) != stat(of) {
-                    let to = if leg == "warehouse" {
-                        &mut wbad
-                    } else {
-                        &mut bad
-                    };
-                    to.push(format!(
+                    bad.push(format!(
                         "{what}: {leg} has (non-null, distinct) {:?}, {of} {:?}",
                         stat(leg),
                         stat(of)
@@ -984,20 +1119,26 @@ fn duckdb_ledger_verdict(lg: &Ledger, st: &Stand, n: i64) -> Vec<String> {
                 }
             }
         }
-        match (&c.clickhouse_defect, wbad.is_empty()) {
-            (Some(_), true) => bad.push(format!(
-                "{what}: clickhouse_defect row now passes in ClickHouse — remove the marker"
-            )),
-            (Some(_), false) => {}
-            (None, _) => bad.extend(wbad),
+        if kd && kd_hits == 0 {
+            bad.push(format!(
+                "{what}: known_defect row now passes — remove the marker"
+            ));
         }
-        if b.known_defect.is_some() {
-            if bad.len() == before {
-                bad.push(format!(
-                    "{what}: known_defect row now passes — remove the marker"
-                ));
-            } else {
-                bad.truncate(before);
+        if chd && ch_hits == 0 {
+            bad.push(format!(
+                "{what}: clickhouse_defect row now passes in ClickHouse — remove the marker"
+            ));
+        }
+        for (ch, list) in [
+            (false, &b.defect_samples),
+            (true, &c.clickhouse_defect_samples),
+        ] {
+            for s in list {
+                if !hit_samples.contains(&(ch, s.clone())) {
+                    bad.push(format!(
+                        "{what}: defect sample `{s}` now matches the source — drop it from the ledger"
+                    ));
+                }
             }
         }
     }
@@ -1016,6 +1157,13 @@ fn duckdb_ledger_verdict(lg: &Ledger, st: &Stand, n: i64) -> Vec<String> {
                 counts[leg][0], counts[of][0]
             ));
         }
+    }
+    if counts["snapshot"][0] != 2 * n {
+        bad.push(format!(
+            "snapshot: COUNT(*) {}, want {}",
+            counts["snapshot"][0],
+            2 * n
+        ));
     }
     bad.extend(state_violations(&out, st, n));
     bad
@@ -1065,12 +1213,13 @@ fn state_violations(out: &serde_json::Value, st: &Stand, n: i64) -> Vec<String> 
             got("cst_runs", &format!("{snap}/success")),
             1,
         ),
+        ("stream parts", Some(parts["stream"]), 2 * n + 1),
         (
             "stream export_metrics",
             got("cst_metrics", cname),
-            parts["stream"],
+            2 * n + 1,
         ),
-        ("stream file_log", got("cst_files", cname), parts["stream"]),
+        ("stream file_log", got("cst_files", cname), 2 * n + 1),
         (
             "stream runs",
             got("cst_runs", &format!("{cname}/success")),
@@ -1090,7 +1239,9 @@ fn state_violations(out: &serde_json::Value, st: &Stand, n: i64) -> Vec<String> 
     }
     for q in ["bst_runs", "cst_runs"] {
         for (key, count) in table(q) {
-            if !key.ends_with("/success") {
+            // A shared Postgres state backend holds other tests' runs too.
+            let ours = key.starts_with(bname) || key.starts_with(cname);
+            if ours && !key.ends_with("/success") {
                 bad.push(format!("state: {q} holds {count} run(s) `{key}`"));
             }
         }

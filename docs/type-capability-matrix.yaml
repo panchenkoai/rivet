@@ -20,12 +20,19 @@
 #                         server  source-side SQL read through DuckDB's passthrough, for a
 #                                 column the DuckDB scanner would narrow
 #                         source  Oracle only (no DuckDB scanner): the client-side rendering
-#                         canon   number, timestamp, float32, float64, interval, datetime_tick
+#                         canon   number, timestamp, float32, float64, interval, round_micros
 #          diverges     on the cdc row only: why its delivery differs from batch (ADR ref)
 #          known_defect on both twins: why rivet misses the declared ADR target today and
-#                       which step fixes it; the driver fails if such a row starts passing
+#                       which step fixes it. It excuses only its declared class: the delivered
+#                       type (and the ClickHouse type it drives) and the samples below; every
+#                       other check stays strict, and the driver fails once the class passes
+#          today_render optional, beside known_defect: the render that grades what rivet
+#                       delivers today at full precision (e.g. microseconds of a ns target)
+#          defect_samples  optional, beside known_defect: sample literals (`NULL` for a NULL
+#                       cell) whose delivered value differs from the source today
 #          clickhouse   on cdc rows: the column type `rivet load` builds in ClickHouse
 #          clickhouse_defect  like known_defect, for the ClickHouse stage alone
+#          clickhouse_defect_samples  like defect_samples, for the ClickHouse stage alone
 #          setup:       engine-level DDL run before the table (types the rows name).
 #          A row in one mode has its twin, with the same sample and render, in the other.
 #          tests/live/live_cdc_type_parity.rs builds one table per engine from these rows;
@@ -167,17 +174,17 @@ engines:
       - {native_type: "INTEGER[]", sample: ["ARRAY[1, NULL, 3]", "'{}'"], delivery: "List(Int32)", render: {duck: "CAST(to_json({c}) AS VARCHAR)"}}
       - {native_type: "DOUBLE PRECISION[]", sample: ["ARRAY[2.5, -0.5]"], delivery: "List(Float64)", render: {duck: "CAST(to_json({c}) AS VARCHAR)"}}
       - {native_type: "NUMERIC(60,10)", sample: ["123456789012345678901234567890.0123456789"], delivery: "Decimal256(60, 10)", render: {duck: "arrow"}}
-      - {native_type: "NUMERIC", sample: ["1.50", "-0.000001234", "123456789012345678901234567890.123456789012", "'NaN'"], delivery: "decimal_plain", known_defect: "batch refuses the column; CDC carries test_decoding's unlabelled text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
-      - {native_type: "MONEY", sample: ["'12.34'"], delivery: "server_text", known_defect: "batch refuses the column; CDC carries test_decoding's unlabelled text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
-      - {native_type: "INET", sample: ["'192.168.0.1'"], delivery: "inet_text", known_defect: "batch refuses the column; CDC carries test_decoding's unlabelled text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
-      - {native_type: "CIDR", sample: ["'10.0.0.0/8'"], delivery: "inet_text", known_defect: "batch refuses the column; CDC carries test_decoding's unlabelled text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
-      - {native_type: "DATE[]", sample: ["ARRAY['2024-01-01'::date]"], delivery: "List(Date32)", known_defect: "batch refuses the column; CDC carries test_decoding's unlabelled text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
-      - {native_type: "TIMESTAMP[]", sample: ["ARRAY['2024-01-01 10:00:00'::timestamp]"], delivery: "List(Timestamp(µs))", known_defect: "batch refuses the column; CDC carries test_decoding's unlabelled text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
-      - {native_type: "TIMESTAMPTZ[]", sample: ["ARRAY['2024-01-01 10:00:00+00'::timestamptz]"], delivery: "List(Timestamp(µs, \"UTC\"))", known_defect: "batch refuses the column; CDC carries test_decoding's unlabelled text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
-      - {native_type: "TIME[]", sample: ["ARRAY['10:00:00'::time]"], delivery: "List(Time64(µs))", known_defect: "batch refuses the column; CDC carries test_decoding's unlabelled text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
-      - {native_type: "UUID[]", sample: ["ARRAY['12345678-1234-1234-1234-123456789012'::uuid]"], delivery: "List(FixedSizeBinary(16))", known_defect: "batch refuses the column; CDC carries test_decoding's unlabelled text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
-      - {native_type: "BYTEA[]", sample: ["ARRAY['\\xDEADBEEF'::bytea]"], delivery: "List(Binary)", known_defect: "batch refuses the column; CDC carries test_decoding's unlabelled text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
-      - {native_type: "NUMERIC[]", sample: ["ARRAY[1.5]::numeric[]"], delivery: "server_text", known_defect: "batch refuses the column; CDC carries test_decoding's unlabelled text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
+      - {native_type: "NUMERIC", sample: ["1.50", "-0.000001234", "123456789012345678901234567890.123456789012", "'NaN'"], delivery: "decimal_plain", known_defect: "batch refuses the column; CDC carries the server's own text labelled server_text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
+      - {native_type: "MONEY", sample: ["'12.34'"], delivery: "server_text", known_defect: "batch refuses the column; CDC carries the server's own text labelled server_text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
+      - {native_type: "INET", sample: ["'192.168.0.1'"], delivery: "inet_text", known_defect: "batch refuses the column; CDC carries the server's own text labelled server_text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
+      - {native_type: "CIDR", sample: ["'10.0.0.0/8'"], delivery: "inet_text", known_defect: "batch refuses the column; CDC carries the server's own text labelled server_text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
+      - {native_type: "DATE[]", sample: ["ARRAY['2024-01-01'::date]"], delivery: "List(Date32)", known_defect: "batch refuses the column; CDC carries the server's own text labelled server_text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
+      - {native_type: "TIMESTAMP[]", sample: ["ARRAY['2024-01-01 10:00:00'::timestamp]"], delivery: "List(Timestamp(µs))", known_defect: "batch refuses the column; CDC carries the server's own text labelled server_text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
+      - {native_type: "TIMESTAMPTZ[]", sample: ["ARRAY['2024-01-01 10:00:00+00'::timestamptz]"], delivery: "List(Timestamp(µs, \"UTC\"))", known_defect: "batch refuses the column; CDC carries the server's own text labelled server_text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
+      - {native_type: "TIME[]", sample: ["ARRAY['10:00:00'::time]"], delivery: "List(Time64(µs))", known_defect: "batch refuses the column; CDC carries the server's own text labelled server_text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
+      - {native_type: "UUID[]", sample: ["ARRAY['12345678-1234-1234-1234-123456789012'::uuid]"], delivery: "List(FixedSizeBinary(16))", known_defect: "batch refuses the column; CDC carries the server's own text labelled server_text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
+      - {native_type: "BYTEA[]", sample: ["ARRAY['\\xDEADBEEF'::bytea]"], delivery: "List(Binary)", known_defect: "batch refuses the column; CDC carries the server's own text labelled server_text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
+      - {native_type: "NUMERIC[]", sample: ["ARRAY[1.5]::numeric[]"], delivery: "server_text", known_defect: "batch refuses the column; CDC carries the server's own text labelled server_text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
     cdc:
       - {native_type: "TEXT", sample: ["'üñíçødé ''q'''", "'hello'"], delivery: "Utf8", clickhouse: "Nullable(String)"}
       - {native_type: "NUMERIC(18,2)", sample: ["999999999999.99"], delivery: "Decimal128(18, 2)", clickhouse: "Nullable(Decimal(18, 2))"}
@@ -200,21 +207,21 @@ engines:
       - {native_type: "CHAR(8)", sample: ["'pad'"], delivery: "Utf8", clickhouse: "Nullable(String)"}
       - {native_type: "VARCHAR(50)", sample: ["'plain varchar'"], delivery: "Utf8", clickhouse: "Nullable(String)"}
       - {native_type: "REAL", sample: ["3.14"], delivery: "Float32", clickhouse: "Nullable(Float32)"}
-      - {native_type: "TEXT[]", sample: ["ARRAY['with,comma', 'he said \"hi\"', NULL]", "ARRAY[]::text[]"], delivery: "List(Utf8)", render: {duck: "CAST(to_json({c}) AS VARCHAR)"}, clickhouse: "Array(Nullable(String))", clickhouse_defect: "a NULL array loads as [] (ClickHouse arrays cannot be NULL), so NULL and empty merge (ADR-0038 CP1, ClickHouse load step)"}
-      - {native_type: "INTEGER[]", sample: ["ARRAY[1, NULL, 3]", "'{}'"], delivery: "List(Int32)", render: {duck: "CAST(to_json({c}) AS VARCHAR)"}, clickhouse: "Array(Nullable(Int32))", clickhouse_defect: "a NULL array loads as [] (ClickHouse arrays cannot be NULL), so NULL and empty merge (ADR-0038 CP1, ClickHouse load step)"}
-      - {native_type: "DOUBLE PRECISION[]", sample: ["ARRAY[2.5, -0.5]"], delivery: "List(Float64)", render: {duck: "CAST(to_json({c}) AS VARCHAR)"}, clickhouse: "Array(Nullable(Float64))", clickhouse_defect: "a NULL array loads as [] (ClickHouse arrays cannot be NULL), so NULL and empty merge (ADR-0038 CP1, ClickHouse load step)"}
+      - {native_type: "TEXT[]", sample: ["ARRAY['with,comma', 'he said \"hi\"', NULL]", "ARRAY[]::text[]"], delivery: "List(Utf8)", render: {duck: "CAST(to_json({c}) AS VARCHAR)"}, clickhouse: "Array(Nullable(String))", clickhouse_defect: "a NULL array loads as [] (ClickHouse arrays cannot be NULL), so NULL and empty merge (ADR-0038 CP1, ClickHouse load step)", clickhouse_defect_samples: ["NULL"]}
+      - {native_type: "INTEGER[]", sample: ["ARRAY[1, NULL, 3]", "'{}'"], delivery: "List(Int32)", render: {duck: "CAST(to_json({c}) AS VARCHAR)"}, clickhouse: "Array(Nullable(Int32))", clickhouse_defect: "a NULL array loads as [] (ClickHouse arrays cannot be NULL), so NULL and empty merge (ADR-0038 CP1, ClickHouse load step)", clickhouse_defect_samples: ["NULL"]}
+      - {native_type: "DOUBLE PRECISION[]", sample: ["ARRAY[2.5, -0.5]"], delivery: "List(Float64)", render: {duck: "CAST(to_json({c}) AS VARCHAR)"}, clickhouse: "Array(Nullable(Float64))", clickhouse_defect: "a NULL array loads as [] (ClickHouse arrays cannot be NULL), so NULL and empty merge (ADR-0038 CP1, ClickHouse load step)", clickhouse_defect_samples: ["NULL"]}
       - {native_type: "NUMERIC(60,10)", sample: ["123456789012345678901234567890.0123456789"], delivery: "Decimal256(60, 10)", render: {duck: "arrow"}, clickhouse: "Nullable(Decimal(60, 10))"}
-      - {native_type: "NUMERIC", sample: ["1.50", "-0.000001234", "123456789012345678901234567890.123456789012", "'NaN'"], delivery: "decimal_plain", known_defect: "batch refuses the column; CDC carries test_decoding's unlabelled text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
-      - {native_type: "MONEY", sample: ["'12.34'"], delivery: "server_text", known_defect: "batch refuses the column; CDC carries test_decoding's unlabelled text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
-      - {native_type: "INET", sample: ["'192.168.0.1'"], delivery: "inet_text", known_defect: "batch refuses the column; CDC carries test_decoding's unlabelled text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
-      - {native_type: "CIDR", sample: ["'10.0.0.0/8'"], delivery: "inet_text", known_defect: "batch refuses the column; CDC carries test_decoding's unlabelled text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
-      - {native_type: "DATE[]", sample: ["ARRAY['2024-01-01'::date]"], delivery: "List(Date32)", known_defect: "batch refuses the column; CDC carries test_decoding's unlabelled text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
-      - {native_type: "TIMESTAMP[]", sample: ["ARRAY['2024-01-01 10:00:00'::timestamp]"], delivery: "List(Timestamp(µs))", known_defect: "batch refuses the column; CDC carries test_decoding's unlabelled text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
-      - {native_type: "TIMESTAMPTZ[]", sample: ["ARRAY['2024-01-01 10:00:00+00'::timestamptz]"], delivery: "List(Timestamp(µs, \"UTC\"))", known_defect: "batch refuses the column; CDC carries test_decoding's unlabelled text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
-      - {native_type: "TIME[]", sample: ["ARRAY['10:00:00'::time]"], delivery: "List(Time64(µs))", known_defect: "batch refuses the column; CDC carries test_decoding's unlabelled text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
-      - {native_type: "UUID[]", sample: ["ARRAY['12345678-1234-1234-1234-123456789012'::uuid]"], delivery: "List(FixedSizeBinary(16))", known_defect: "batch refuses the column; CDC carries test_decoding's unlabelled text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
-      - {native_type: "BYTEA[]", sample: ["ARRAY['\\xDEADBEEF'::bytea]"], delivery: "List(Binary)", known_defect: "batch refuses the column; CDC carries test_decoding's unlabelled text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
-      - {native_type: "NUMERIC[]", sample: ["ARRAY[1.5]::numeric[]"], delivery: "server_text", known_defect: "batch refuses the column; CDC carries test_decoding's unlabelled text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
+      - {native_type: "NUMERIC", sample: ["1.50", "-0.000001234", "123456789012345678901234567890.123456789012", "'NaN'"], delivery: "decimal_plain", known_defect: "batch refuses the column; CDC carries the server's own text labelled server_text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
+      - {native_type: "MONEY", sample: ["'12.34'"], delivery: "server_text", known_defect: "batch refuses the column; CDC carries the server's own text labelled server_text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
+      - {native_type: "INET", sample: ["'192.168.0.1'"], delivery: "inet_text", known_defect: "batch refuses the column; CDC carries the server's own text labelled server_text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
+      - {native_type: "CIDR", sample: ["'10.0.0.0/8'"], delivery: "inet_text", known_defect: "batch refuses the column; CDC carries the server's own text labelled server_text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
+      - {native_type: "DATE[]", sample: ["ARRAY['2024-01-01'::date]"], delivery: "List(Date32)", known_defect: "batch refuses the column; CDC carries the server's own text labelled server_text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
+      - {native_type: "TIMESTAMP[]", sample: ["ARRAY['2024-01-01 10:00:00'::timestamp]"], delivery: "List(Timestamp(µs))", known_defect: "batch refuses the column; CDC carries the server's own text labelled server_text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
+      - {native_type: "TIMESTAMPTZ[]", sample: ["ARRAY['2024-01-01 10:00:00+00'::timestamptz]"], delivery: "List(Timestamp(µs, \"UTC\"))", known_defect: "batch refuses the column; CDC carries the server's own text labelled server_text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
+      - {native_type: "TIME[]", sample: ["ARRAY['10:00:00'::time]"], delivery: "List(Time64(µs))", known_defect: "batch refuses the column; CDC carries the server's own text labelled server_text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
+      - {native_type: "UUID[]", sample: ["ARRAY['12345678-1234-1234-1234-123456789012'::uuid]"], delivery: "List(FixedSizeBinary(16))", known_defect: "batch refuses the column; CDC carries the server's own text labelled server_text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
+      - {native_type: "BYTEA[]", sample: ["ARRAY['\\xDEADBEEF'::bytea]"], delivery: "List(Binary)", known_defect: "batch refuses the column; CDC carries the server's own text labelled server_text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
+      - {native_type: "NUMERIC[]", sample: ["ARRAY[1.5]::numeric[]"], delivery: "server_text", known_defect: "batch refuses the column; CDC carries the server's own text labelled server_text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
   mysql:
     batch:
       - {native_type: "VARCHAR(200)", sample: ["'üñíçødé'"], delivery: "Utf8"}
@@ -225,7 +232,7 @@ engines:
       - {native_type: "TIMESTAMP(6) NULL", sample: ["'2035-08-07 09:08:07.987654'"], delivery: "Timestamp(µs, \"UTC\")", render: {duck: "strftime({c}, '%Y-%m-%d %H:%M:%S.%f')"}}
       - {native_type: "BINARY(4)", sample: ["UNHEX('00000000')"], delivery: "Binary", render: {duck: "lower(hex({c}))"}}
       - {native_type: "JSON", sample: ["JSON_OBJECT('tier','gold','n',1)", "'{\"k\": \"v\", \"n\": 42}'"], delivery: "arrow.json"}
-      - {native_type: "BOOLEAN", sample: ["TRUE", "1", "5", "-1"], delivery: "Int8", render: {duck: "CAST(CAST({c} AS TINYINT) AS VARCHAR)"}, known_defect: "TINYINT(1) delivered as Boolean: 5 and -1 arrive as true in batch, CDC and ClickHouse, a silent loss; exact native is Int8 (ADR-0038 CP1, MySQL engine step)"}
+      - {native_type: "BOOLEAN", sample: ["TRUE", "1", "5", "-1"], delivery: "Int8", render: {duck: "CAST(CAST({c} AS TINYINT) AS VARCHAR)"}, known_defect: "TINYINT(1) delivered as Boolean: 5 and -1 arrive as true in batch, CDC and ClickHouse, a silent loss; exact native is Int8 (ADR-0038 CP1, MySQL engine step)", defect_samples: ["5", "-1"]}
       - {native_type: "BIT(1)", sample: ["b'1'"], delivery: "Boolean"}
       - {native_type: "BIT(8)", sample: ["b'10101010'"], delivery: "Int64", render: {duck: "lpad(hex({c}), 2, '0')"}}
       - {native_type: "TINYINT", sample: ["127"], delivery: "Int16"}
@@ -257,7 +264,7 @@ engines:
       - {native_type: "TIMESTAMP(6) NULL", sample: ["'2035-08-07 09:08:07.987654'"], delivery: "Timestamp(µs, \"UTC\")", render: {duck: "strftime({c}, '%Y-%m-%d %H:%M:%S.%f')"}, clickhouse: "Nullable(DateTime64(6, 'UTC'))"}
       - {native_type: "BINARY(4)", sample: ["UNHEX('00000000')"], delivery: "Binary", render: {duck: "lower(hex({c}))"}, clickhouse: "Nullable(String)"}
       - {native_type: "JSON", sample: ["JSON_OBJECT('tier','gold','n',1)", "'{\"k\": \"v\", \"n\": 42}'"], delivery: "arrow.json", clickhouse: "Nullable(String)"}
-      - {native_type: "BOOLEAN", sample: ["TRUE", "1", "5", "-1"], delivery: "Int8", render: {duck: "CAST(CAST({c} AS TINYINT) AS VARCHAR)"}, known_defect: "TINYINT(1) delivered as Boolean: 5 and -1 arrive as true in batch, CDC and ClickHouse, a silent loss; exact native is Int8 (ADR-0038 CP1, MySQL engine step)", clickhouse: "Nullable(Int8)"}
+      - {native_type: "BOOLEAN", sample: ["TRUE", "1", "5", "-1"], delivery: "Int8", render: {duck: "CAST(CAST({c} AS TINYINT) AS VARCHAR)"}, known_defect: "TINYINT(1) delivered as Boolean: 5 and -1 arrive as true in batch, CDC and ClickHouse, a silent loss; exact native is Int8 (ADR-0038 CP1, MySQL engine step)", defect_samples: ["5", "-1"], clickhouse: "Nullable(Int8)"}
       - {native_type: "BIT(1)", sample: ["b'1'"], delivery: "Boolean", clickhouse: "Nullable(Bool)"}
       - {native_type: "BIT(8)", sample: ["b'10101010'"], delivery: "Int64", render: {duck: "lpad(hex({c}), 2, '0')"}, clickhouse: "Nullable(Int64)"}
       - {native_type: "TINYINT", sample: ["127"], delivery: "Int16", clickhouse: "Nullable(Int16)"}
@@ -287,7 +294,7 @@ engines:
       - {native_type: "BIT", sample: ["1"], delivery: "Boolean"}
       - {native_type: "VARCHAR(50)", sample: ["'hello'"], delivery: "Utf8"}
       - {native_type: "NVARCHAR(50)", sample: ["N'cafe-unicode'"], delivery: "Utf8"}
-      - {native_type: "DATETIME2", sample: ["'2026-06-23 10:00:00.1234567'"], delivery: "Timestamp(ns)", render: {canon: "timestamp"}, known_defect: "delivered at microseconds, the 100 ns digit dropped; exact native is Timestamp(ns) (ADR-0038 CP1, SQL Server engine step)"}
+      - {native_type: "DATETIME2", sample: ["'2026-06-23 10:00:00.1234567'"], delivery: "Timestamp(ns)", render: {canon: "timestamp"}, today_render: {server: "LEFT(CONVERT(varchar(max), {c}, 121), 26)", canon: "timestamp"}, known_defect: "delivered at microseconds, the 100 ns digit dropped; exact native is Timestamp(ns) (ADR-0038 CP1, SQL Server engine step)"}
       - {native_type: "DATETIMEOFFSET", sample: ["'2026-06-23 10:00:00 +05:30'"], delivery: "Timestamp(ns, \"UTC\")", render: {server: "CONVERT(varchar(max), CAST(SWITCHOFFSET({c}, '+00:00') AS DATETIME2(7)), 121)", canon: "timestamp"}, known_defect: "delivered at microseconds; exact native is Timestamp(ns, UTC) (ADR-0038 CP1, SQL Server engine step)"}
       - {native_type: "DATE", sample: ["'2026-06-23'"], delivery: "Date32"}
       - {native_type: "TIME", sample: ["'13:45:30.123456'"], delivery: "Time64(ns)", render: {server: "CONVERT(varchar(max), {c}, 114)", canon: "timestamp"}, known_defect: "delivered at microseconds; exact native is Time64(ns) (ADR-0038 CP1, SQL Server engine step)"}
@@ -295,7 +302,7 @@ engines:
       - {native_type: "VARBINARY(16)", sample: ["0xDEADBEEF"], delivery: "Binary", render: {duck: "lower(hex({c}))"}}
       - {native_type: "CHAR(8)", sample: ["'pad'"], delivery: "Utf8"}
       - {native_type: "NCHAR(8)", sample: ["N'ñpad'"], delivery: "Utf8", render: {server: "CAST({c} AS NVARCHAR(8))"}}
-      - {native_type: "DATETIME", sample: ["'2026-01-15T13:45:30.127'"], delivery: "Timestamp(µs)", render: {server: "CONVERT(varchar(max), CAST({c} AS DATETIME2(7)), 121)", canon: "datetime_tick"}}
+      - {native_type: "DATETIME", sample: ["'2026-01-15T13:45:30.127'"], delivery: "Timestamp(µs)", render: {server: "CONVERT(varchar(max), CAST({c} AS DATETIME2(7)), 121)", canon: "round_micros"}}
       - {native_type: "SMALLDATETIME", sample: ["'2026-01-15T13:45:00'"], delivery: "Timestamp(µs)"}
       - {native_type: "BINARY(8)", sample: ["0xAB"], delivery: "Binary", render: {duck: "lower(hex({c}))"}}
       - {native_type: "NUMERIC(10,3)", sample: ["12.345"], delivery: "Decimal128(10, 3)"}
@@ -309,7 +316,7 @@ engines:
       - {native_type: "BIT", sample: ["1"], delivery: "Boolean", clickhouse: "Nullable(Bool)"}
       - {native_type: "VARCHAR(50)", sample: ["'hello'"], delivery: "Utf8", clickhouse: "Nullable(String)"}
       - {native_type: "NVARCHAR(50)", sample: ["N'cafe-unicode'"], delivery: "Utf8", clickhouse: "Nullable(String)"}
-      - {native_type: "DATETIME2", sample: ["'2026-06-23 10:00:00.1234567'"], delivery: "Timestamp(ns)", render: {canon: "timestamp"}, known_defect: "delivered at microseconds, the 100 ns digit dropped; exact native is Timestamp(ns) (ADR-0038 CP1, SQL Server engine step)", clickhouse: "Nullable(DateTime64(7))"}
+      - {native_type: "DATETIME2", sample: ["'2026-06-23 10:00:00.1234567'"], delivery: "Timestamp(ns)", render: {canon: "timestamp"}, today_render: {server: "LEFT(CONVERT(varchar(max), {c}, 121), 26)", canon: "timestamp"}, known_defect: "delivered at microseconds, the 100 ns digit dropped; exact native is Timestamp(ns) (ADR-0038 CP1, SQL Server engine step)", clickhouse: "Nullable(DateTime64(7))"}
       - {native_type: "DATETIMEOFFSET", sample: ["'2026-06-23 10:00:00 +05:30'"], delivery: "Timestamp(ns, \"UTC\")", render: {server: "CONVERT(varchar(max), CAST(SWITCHOFFSET({c}, '+00:00') AS DATETIME2(7)), 121)", canon: "timestamp"}, known_defect: "delivered at microseconds; exact native is Timestamp(ns, UTC) (ADR-0038 CP1, SQL Server engine step)", clickhouse: "Nullable(DateTime64(7, 'UTC'))"}
       - {native_type: "DATE", sample: ["'2026-06-23'"], delivery: "Date32", clickhouse: "Nullable(Date32)"}
       - {native_type: "TIME", sample: ["'13:45:30.123456'"], delivery: "Time64(ns)", render: {server: "CONVERT(varchar(max), {c}, 114)", canon: "timestamp"}, known_defect: "delivered at microseconds; exact native is Time64(ns) (ADR-0038 CP1, SQL Server engine step)", clickhouse: "Nullable(Decimal(18, 7))"}
@@ -317,7 +324,7 @@ engines:
       - {native_type: "VARBINARY(16)", sample: ["0xDEADBEEF"], delivery: "Binary", render: {duck: "lower(hex({c}))"}, clickhouse: "Nullable(String)"}
       - {native_type: "CHAR(8)", sample: ["'pad'"], delivery: "Utf8", clickhouse: "Nullable(String)"}
       - {native_type: "NCHAR(8)", sample: ["N'ñpad'"], delivery: "Utf8", render: {server: "CAST({c} AS NVARCHAR(8))"}, clickhouse: "Nullable(String)"}
-      - {native_type: "DATETIME", sample: ["'2026-01-15T13:45:30.127'"], delivery: "Timestamp(µs)", render: {server: "CONVERT(varchar(max), CAST({c} AS DATETIME2(7)), 121)", canon: "datetime_tick"}, clickhouse: "Nullable(DateTime64(6))"}
+      - {native_type: "DATETIME", sample: ["'2026-01-15T13:45:30.127'"], delivery: "Timestamp(µs)", render: {server: "CONVERT(varchar(max), CAST({c} AS DATETIME2(7)), 121)", canon: "round_micros"}, clickhouse: "Nullable(DateTime64(6))"}
       - {native_type: "SMALLDATETIME", sample: ["'2026-01-15T13:45:00'"], delivery: "Timestamp(µs)", clickhouse: "Nullable(DateTime64(6))"}
       - {native_type: "BINARY(8)", sample: ["0xAB"], delivery: "Binary", render: {duck: "lower(hex({c}))"}, clickhouse: "Nullable(String)"}
       - {native_type: "NUMERIC(10,3)", sample: ["12.345"], delivery: "Decimal128(10, 3)", clickhouse: "Nullable(Decimal(10, 3))"}
@@ -335,7 +342,7 @@ engines:
       - {native_type: "BINARY_DOUBLE", sample: ["2.25", "BINARY_DOUBLE_INFINITY", "0.1"], delivery: "Float64", render: {canon: "float64"}}
       - {native_type: "DATE", sample: ["TO_DATE('2024-02-29 13:14:15','YYYY-MM-DD HH24:MI:SS')", "TO_DATE('0001-01-01','YYYY-MM-DD')"], delivery: "Timestamp(µs)", render: {source: "TO_CHAR(CAST({c} AS TIMESTAMP), 'SYYYY-MM-DD\"T\"HH24:MI:SS.FF6')", duck: "strftime({c}, '%Y-%m-%dT%H:%M:%S.%f')", canon: "timestamp"}}
       - {native_type: "TIMESTAMP(6)", sample: ["TO_TIMESTAMP('2024-02-29 13:14:15.123456','YYYY-MM-DD HH24:MI:SS.FF')", "TO_TIMESTAMP('9999-12-31 23:59:59.999999','YYYY-MM-DD HH24:MI:SS.FF')"], delivery: "Timestamp(µs)", render: {source: "TO_CHAR({c}, 'SYYYY-MM-DD\"T\"HH24:MI:SS.FF6')", duck: "strftime({c}, '%Y-%m-%dT%H:%M:%S.%f')", canon: "timestamp"}}
-      - {native_type: "TIMESTAMP(9)", sample: ["TO_TIMESTAMP('2024-02-29 13:14:15.123456789','YYYY-MM-DD HH24:MI:SS.FF')"], delivery: "Timestamp(ns)", render: {source: "TO_CHAR({c}, 'SYYYY-MM-DD\"T\"HH24:MI:SS.FF9')", duck: "strftime({c}, '%Y-%m-%dT%H:%M:%S.%n')", canon: "timestamp"}, known_defect: "delivered at microseconds, the sub-microsecond digits dropped; exact native is Timestamp(ns) (ADR-0038 CP1, Oracle engine step)"}
+      - {native_type: "TIMESTAMP(9)", sample: ["TO_TIMESTAMP('2024-02-29 13:14:15.123456789','YYYY-MM-DD HH24:MI:SS.FF')"], delivery: "Timestamp(ns)", render: {source: "TO_CHAR({c}, 'SYYYY-MM-DD\"T\"HH24:MI:SS.FF9')", duck: "strftime({c}, '%Y-%m-%dT%H:%M:%S.%n')", canon: "timestamp"}, today_render: {source: "SUBSTR(TO_CHAR({c}, 'SYYYY-MM-DD\"T\"HH24:MI:SS.FF9'), 1, 27)", duck: "strftime({c}, '%Y-%m-%dT%H:%M:%S.%f')", canon: "timestamp"}, known_defect: "delivered at microseconds, the sub-microsecond digits dropped; exact native is Timestamp(ns) (ADR-0038 CP1, Oracle engine step)"}
       - {native_type: "TIMESTAMP(6) WITH TIME ZONE", sample: ["TO_TIMESTAMP_TZ('2024-02-29 10:00:00.5 +02:00','YYYY-MM-DD HH24:MI:SS.FF TZH:TZM')", "TO_TIMESTAMP_TZ('2024-07-01 10:00:00 Europe/Berlin','YYYY-MM-DD HH24:MI:SS TZR')"], delivery: "Timestamp(µs, \"UTC\")", render: {source: "TO_CHAR(SYS_EXTRACT_UTC({c}), 'SYYYY-MM-DD\"T\"HH24:MI:SS.FF6')", duck: "strftime({c}, '%Y-%m-%dT%H:%M:%S.%f')", canon: "timestamp"}}
       - {native_type: "TIMESTAMP(6) WITH LOCAL TIME ZONE", sample: ["TO_TIMESTAMP_TZ('2024-02-29 10:00:00 -03:00','YYYY-MM-DD HH24:MI:SS TZH:TZM')"], delivery: "Timestamp(µs, \"UTC\")", render: {source: "TO_CHAR(SYS_EXTRACT_UTC({c}), 'SYYYY-MM-DD\"T\"HH24:MI:SS.FF6')", duck: "strftime({c}, '%Y-%m-%dT%H:%M:%S.%f')", canon: "timestamp"}}
       - {native_type: "VARCHAR2(100 CHAR)", sample: ["'it''s, \"q\"'", "'   '", "''"], delivery: "Utf8", render: {source: "{c}"}}
@@ -351,7 +358,7 @@ engines:
       - {native_type: "BINARY_DOUBLE", sample: ["2.25", "BINARY_DOUBLE_INFINITY", "0.1"], delivery: "Float64", render: {canon: "float64"}}
       - {native_type: "DATE", sample: ["TO_DATE('2024-02-29 13:14:15','YYYY-MM-DD HH24:MI:SS')", "TO_DATE('0001-01-01','YYYY-MM-DD')"], delivery: "Timestamp(µs)", render: {source: "TO_CHAR(CAST({c} AS TIMESTAMP), 'SYYYY-MM-DD\"T\"HH24:MI:SS.FF6')", duck: "strftime({c}, '%Y-%m-%dT%H:%M:%S.%f')", canon: "timestamp"}}
       - {native_type: "TIMESTAMP(6)", sample: ["TO_TIMESTAMP('2024-02-29 13:14:15.123456','YYYY-MM-DD HH24:MI:SS.FF')", "TO_TIMESTAMP('9999-12-31 23:59:59.999999','YYYY-MM-DD HH24:MI:SS.FF')"], delivery: "Timestamp(µs)", render: {source: "TO_CHAR({c}, 'SYYYY-MM-DD\"T\"HH24:MI:SS.FF6')", duck: "strftime({c}, '%Y-%m-%dT%H:%M:%S.%f')", canon: "timestamp"}}
-      - {native_type: "TIMESTAMP(9)", sample: ["TO_TIMESTAMP('2024-02-29 13:14:15.123456789','YYYY-MM-DD HH24:MI:SS.FF')"], delivery: "Timestamp(ns)", render: {source: "TO_CHAR({c}, 'SYYYY-MM-DD\"T\"HH24:MI:SS.FF9')", duck: "strftime({c}, '%Y-%m-%dT%H:%M:%S.%n')", canon: "timestamp"}, known_defect: "delivered at microseconds, the sub-microsecond digits dropped; exact native is Timestamp(ns) (ADR-0038 CP1, Oracle engine step)"}
+      - {native_type: "TIMESTAMP(9)", sample: ["TO_TIMESTAMP('2024-02-29 13:14:15.123456789','YYYY-MM-DD HH24:MI:SS.FF')"], delivery: "Timestamp(ns)", render: {source: "TO_CHAR({c}, 'SYYYY-MM-DD\"T\"HH24:MI:SS.FF9')", duck: "strftime({c}, '%Y-%m-%dT%H:%M:%S.%n')", canon: "timestamp"}, today_render: {source: "SUBSTR(TO_CHAR({c}, 'SYYYY-MM-DD\"T\"HH24:MI:SS.FF9'), 1, 27)", duck: "strftime({c}, '%Y-%m-%dT%H:%M:%S.%f')", canon: "timestamp"}, known_defect: "delivered at microseconds, the sub-microsecond digits dropped; exact native is Timestamp(ns) (ADR-0038 CP1, Oracle engine step)"}
       - {native_type: "TIMESTAMP(6) WITH TIME ZONE", sample: ["TO_TIMESTAMP_TZ('2024-02-29 10:00:00.5 +02:00','YYYY-MM-DD HH24:MI:SS.FF TZH:TZM')", "TO_TIMESTAMP_TZ('2024-07-01 10:00:00 Europe/Berlin','YYYY-MM-DD HH24:MI:SS TZR')"], delivery: "Timestamp(µs, \"UTC\")", render: {source: "TO_CHAR(SYS_EXTRACT_UTC({c}), 'SYYYY-MM-DD\"T\"HH24:MI:SS.FF6')", duck: "strftime({c}, '%Y-%m-%dT%H:%M:%S.%f')", canon: "timestamp"}}
       - {native_type: "TIMESTAMP(6) WITH LOCAL TIME ZONE", sample: ["TO_TIMESTAMP_TZ('2024-02-29 10:00:00 -03:00','YYYY-MM-DD HH24:MI:SS TZH:TZM')"], delivery: "Timestamp(µs, \"UTC\")", render: {source: "TO_CHAR(SYS_EXTRACT_UTC({c}), 'SYYYY-MM-DD\"T\"HH24:MI:SS.FF6')", duck: "strftime({c}, '%Y-%m-%dT%H:%M:%S.%f')", canon: "timestamp"}}
       - {native_type: "VARCHAR2(100 CHAR)", sample: ["'it''s, \"q\"'", "'   '", "''"], delivery: "Utf8", render: {source: "{c}"}}
