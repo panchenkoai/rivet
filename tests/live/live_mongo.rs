@@ -476,7 +476,8 @@ fn mongo_keyset_on_heterogeneous_id_errors_loudly_full_scan_still_works() {
     );
 
     // Full scan (no page_size) — a single cursor crosses BSON brackets — is whole.
-    let fs = batch(&db, "t");
+    let fs = batch(&db, "t")
+        .no_oracle("heterogeneous _id types: the DuckDB mongo scanner splits or nulls a mixed _id and cannot reproduce the source _id set");
     fs.run_ok();
     assert_eq!(
         duckdb_dir_parquet_distinct_strings(&fs.out_dir(), "_id").len(),
@@ -555,7 +556,8 @@ fn roast_null_and_object_id_must_not_slip_past_the_bracket_guard() {
     );
 
     // Full scan stays the remediation: all 4 docs, both bands.
-    let fs = batch(&db, "t");
+    let fs = batch(&db, "t")
+        .no_oracle("heterogeneous _id types: the DuckDB mongo scanner splits or nulls a mixed _id and cannot reproduce the source _id set");
     fs.run_ok();
     assert_eq!(
         duckdb_dir_parquet_distinct_strings(&fs.out_dir(), "_id").len(),
@@ -613,7 +615,8 @@ fn roast_nan_id_refused_for_keyset_and_parallel_full_scan_complete() {
     );
 
     // Remediation path: the full scan (single cursor, no seek) reads all 4.
-    let fs = batch(&db, "t");
+    let fs = batch(&db, "t")
+        .no_oracle("heterogeneous _id types: the DuckDB mongo scanner splits or nulls a mixed _id and cannot reproduce the source _id set");
     fs.run_ok();
     assert_eq!(
         duckdb_dir_parquet_distinct_strings(&fs.out_dir(), "_id").len(),

@@ -1287,6 +1287,10 @@ jobs:
       # entry-point guard in tests/offline/release_oracle_entrypoint_guard.rs).
       - name: The release oracle's env-flag grammar is one grammar
         run: python3 -m dev.release_oracle --self-test
+      - name: The value canon and the rig oracle's graders self-test
+        run: |
+          python3 -m dev.release_oracle.value_diff
+          python3 -m dev.release_oracle.rig_oracle
 
   test:
     name: Tests
@@ -1442,6 +1446,10 @@ jobs:
         with:
           toolchain: "1.94"
       - uses: Swatinem/rust-cache@v2
+      # uv runs the rig's default oracle (dev/release_oracle/rig_oracle.py, pinned by uv.lock).
+      - uses: taiki-e/install-action@v2.87.12
+        with:
+          tool: uv
 
       - name: Independent row-hash oracle deps
         # `xxhash` is what makes the row-hash check INDEPENDENT: it rebuilds the

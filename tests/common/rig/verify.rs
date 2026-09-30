@@ -1,0 +1,293 @@
+//! VERIFY — the rig's DEFAULT independent oracle. After every `run` that exits
+//! 0 the rig gathers FACTS (engine, source URL, table/query, the export's own
+//! filter, the Success manifests the run wrote, the state DB) and hands them to
+//! `dev/release_oracle/rig_oracle.py`, which owns the one DuckDB session and
+//! every check. Opt out only with `.no_oracle("<reason>")`; a rig the oracle
+//! cannot reach logs a `RIVET-ORACLE-SKIP` line, never silence.
+
+use super::*;
+use std::collections::BTreeSet;
+
+/// Manifest file names per graded directory (the out dir, then its `snapshot/` leg), taken before an invocation.
+pub(crate) type ManifestSnapshot = [(PathBuf, BTreeSet<String>); 2];
+
+impl Rig {
+    /// Opt this rig out of the default oracle; the reason is required and counted by an offline ceiling.
+    pub fn no_oracle(mut self, reason: &str) -> Self {
+        assert!(
+            !reason.trim().is_empty(),
+            "no_oracle needs a reason — say why this rig's output must not be graded"
+        );
+        self.oracle_off = Some(reason.to_string());
+        self
+    }
+
+    /// Snapshot the Success manifest names before a `run`, so the oracle can tell which ones this run wrote.
+    pub(crate) fn oracle_before(&self) -> ManifestSnapshot {
+        let out = self.out_dir();
+        let snap = out.join("snapshot");
+        [
+            (out.clone(), success_manifests(&out)),
+            (snap.clone(), success_manifests(&snap)),
+        ]
+    }
+
+    /// Grade a successful `run` with the default oracle; panics with every disagreement it reports.
+    pub(crate) fn oracle_after(
+        &self,
+        before: &ManifestSnapshot,
+        envs: &[(&str, &str)],
+        argv: &[String],
+    ) {
+        if self.oracle_off.is_some() {
+            return;
+        }
+        if let Some(why) = self.oracle_unreachable() {
+            return oracle_log("SKIP", &self.name, &why);
+        }
+        let cdc = self.mode == "cdc";
+        let [(out, seen), (snap, seen_snap)] = before;
+        let (now, now_snap) = (success_manifests(out), success_manifests(snap));
+        if now.is_subset(seen) && now_snap.is_subset(seen_snap) {
+            return oracle_log("SKIP", &self.name, "the run wrote no new Success manifest");
+        }
+        // CDC and delta modes grade the cumulative output; a snapshot run grades only what it declared.
+        let cumulative = cdc || self.oracle_is_delta();
+        let fresh = |all: &BTreeSet<String>, old: &BTreeSet<String>| -> Vec<String> {
+            all.difference(old).cloned().collect()
+        };
+        let graded = |all: &BTreeSet<String>, old: &BTreeSet<String>| -> Vec<String> {
+            if cumulative {
+                all.iter().cloned().collect()
+            } else {
+                fresh(all, old)
+            }
+        };
+        let state = envs
+            .iter()
+            .find(|(k, _)| *k == "RIVET_STATE_URL")
+            .map(|(_, v)| v.to_string())
+            .or_else(|| std::env::var("RIVET_STATE_URL").ok())
+            .filter(|u| u.starts_with("postgres"))
+            .or_else(|| {
+                let db = self.config_dir().join(".rivet_state.db");
+                db.is_file().then(|| db.display().to_string())
+            });
+        let url = oracle_source_url(&self.source_url);
+        let lines = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&self.extra_lines.join("\n"))
+            .unwrap_or_default();
+        let overrides: Vec<String> = lines
+            .get("columns")
+            .and_then(|c| c.as_mapping())
+            .map(|m| {
+                m.keys()
+                    .filter_map(|k| k.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let line = |k: &str| lines.get(k).and_then(|v| v.as_str()).map(str::to_string);
+        let cursor_expr =
+            (line("incremental_cursor_mode").as_deref() == Some("coalesce")).then(|| {
+                format!(
+                    "coalesce(\"{}\", \"{}\")",
+                    line("cursor_column").unwrap_or_default(),
+                    line("cursor_fallback_column").unwrap_or_default()
+                )
+            });
+        let spec = serde_json::json!({
+            "engine": self.source_type,
+            "url": url,
+            "database": url.rsplit('/').next().and_then(|s| s.split('?').next()).unwrap_or(""),
+            "table": self.tables.first(),
+            "query": self.query.as_deref().map(|q| rendered_query(q, argv)),
+            "mode": if cdc { "cdc" } else { "batch" },
+            "cumulative": cumulative,
+            "key": self.census_key.iter().collect::<Vec<_>>(),
+            "overrides": overrides,
+            "cursor_expr": cursor_expr,
+            "out_dir": out,
+            "manifests": graded(&now, seen),
+            "new_manifests": fresh(&now, seen),
+            "snapshot_dir": snap,
+            "snapshot_manifests": graded(&now_snap, seen_snap),
+            "new_snapshot_manifests": fresh(&now_snap, seen_snap),
+            "state": state,
+        });
+        let verdict = run_rig_oracle(&spec);
+        let failures: Vec<String> = verdict["failures"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|f| f.as_str().map(str::to_string))
+            .collect();
+        if failures.is_empty() {
+            return oracle_log("PASS", &self.name, &verdict["facts"].to_string());
+        }
+        oracle_log("FAIL", &self.name, &failures.join(" | "));
+        panic!(
+            "rig oracle: export '{}' disagrees with its source / rivet's own ledger \
+             (dev/release_oracle/rig_oracle.py; opt out only with `.no_oracle(\"<why>\")`):\n  - {}\n\
+             spec: {spec}\nverdict: {verdict}",
+            self.name,
+            failures.join("\n  - ")
+        );
+    }
+
+    /// Why this rig's output cannot be graded by the default oracle, or `None` when it can.
+    fn oracle_unreachable(&self) -> Option<String> {
+        if self.format != "parquet" {
+            return Some(format!(
+                "format `{}`: the oracle grades parquet",
+                self.format
+            ));
+        }
+        if self.dest_stdout {
+            return Some("stdout destination: nothing durable to read".into());
+        }
+        if self.cloud_dest.is_some() {
+            return Some("cloud destination: not wired into the default oracle yet".into());
+        }
+        if self.tables.len() > 1 {
+            return Some("multi-table capture: one sub-prefix per table, not graded yet".into());
+        }
+        if self
+            .extra_lines
+            .iter()
+            .any(|l| l.starts_with("partition_by"))
+        {
+            return Some("partition_by: hive sub-prefixes, not graded yet".into());
+        }
+        if self.mode == "time_window" {
+            return Some(
+                "time_window: the window is relative to the run's clock and no manifest records it"
+                    .into(),
+            );
+        }
+        None
+    }
+
+    /// Whether each run delivers only what changed since the last (incremental, keyset-incremental, Mongo resume).
+    fn oracle_is_delta(&self) -> bool {
+        self.mode == "incremental"
+            || self
+                .extra_lines
+                .iter()
+                .any(|l| l.contains("keyset_incremental: true"))
+            || self.source_lines.iter().any(|l| l.contains("resume: true"))
+    }
+
+    /// The directory the config (and so the state DB) lives in.
+    fn config_dir(&self) -> PathBuf {
+        self.config_dir_override
+            .clone()
+            .unwrap_or_else(|| self.dir.path().to_path_buf())
+    }
+}
+
+/// The query rivet ran: the rig's YAML string decoded, `${k}` replaced by `--param k=v` from `argv`.
+fn rendered_query(q: &str, argv: &[String]) -> String {
+    let mut q: String =
+        serde_yaml_ng::from_str(&format!("\"{q}\"")).unwrap_or_else(|_| q.to_string());
+    for w in argv.windows(2).filter(|w| w[0] == "--param") {
+        if let Some((k, v)) = w[1].split_once('=') {
+            q = q.replace(&format!("${{{k}}}"), v);
+        }
+    }
+    q
+}
+
+/// Run `dev/release_oracle/rig_oracle.py grade` (pinned by uv.lock) over `spec`; its JSON verdict.
+fn run_rig_oracle(spec: &serde_json::Value) -> serde_json::Value {
+    use std::io::Write as _;
+    let mut child = std::process::Command::new("uv")
+        .args([
+            "run",
+            "--frozen",
+            "--quiet",
+            "python",
+            "-m",
+            "dev.release_oracle.rig_oracle",
+            "grade",
+        ])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn `uv run` for the rig oracle — install uv (the oracle is pinned by uv.lock)");
+    child
+        .stdin
+        .take()
+        .expect("oracle stdin")
+        .write_all(spec.to_string().as_bytes())
+        .expect("write the oracle spec");
+    let out = child.wait_with_output().expect("wait for the rig oracle");
+    assert!(
+        out.status.success(),
+        "the rig oracle itself failed (a harness error, never a verdict):\n{}\nspec: {spec}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "rig oracle printed no JSON verdict ({e}):\n{}",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    })
+}
+
+/// Append one verdict line (`RIVET-ORACLE-<VERDICT> <test> [<export>] — <detail>`) to stderr and `RIVET_ORACLE_LOG`.
+fn oracle_log(verdict: &str, export: &str, detail: &str) {
+    let who = std::thread::current()
+        .name()
+        .unwrap_or("<unnamed test>")
+        .to_string();
+    let line = format!("RIVET-ORACLE-{verdict} {who} [{export}] — {detail}");
+    eprintln!("{line}");
+    let path = std::env::var("RIVET_ORACLE_LOG").unwrap_or_else(|_| {
+        format!(
+            "{}/rivet-oracle.log",
+            std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".into())
+        )
+    });
+    use std::io::Write as _;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = f.write_all(format!("{}\n", line.replace('\n', " ")).as_bytes());
+    }
+}
+
+/// Names of the Success manifests under `dir`, via the one declared-manifest resolver.
+fn success_manifests(dir: &Path) -> BTreeSet<String> {
+    super::super::parquet::declared_manifests(dir)
+        .into_iter()
+        .filter(|p| {
+            std::fs::read_to_string(p)
+                .ok()
+                .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+                .is_some_and(|d| {
+                    d.get("status")
+                        .and_then(|s| s.as_str())
+                        .is_none_or(|s| s.eq_ignore_ascii_case("success"))
+                })
+        })
+        .filter_map(|p| p.file_name()?.to_str().map(str::to_string))
+        .collect()
+}
+
+/// The source URL the oracle reads through: a toxiproxy front replaced by its upstream (a toxic left active cannot skew the read-back), the LogMiner user by the table owner.
+fn oracle_source_url(url: &str) -> String {
+    if url == super::super::env::ORACLE_CDC_URL {
+        return super::super::env::ORACLE_URL.to_string();
+    }
+    [
+        (":15432/", ":5432/"),
+        (":13306/", ":3306/"),
+        (":13307/", ":3307/"),
+        (":27019/", ":27017/"),
+    ]
+    .iter()
+    .fold(url.to_string(), |u, (from, to)| u.replace(from, to))
+}

@@ -100,6 +100,9 @@ fn transition_with(
     let rig = staged(rig, &next, second.path());
     match expect {
         Expect::Continues => {
+            let rig = rig.no_oracle(
+                "the continued delta starts past rows the prior stage delivered to another destination",
+            );
             rig.run_ok();
             assert_eq!(read_ids(second.path()), vec![11, 12, 13]);
         }

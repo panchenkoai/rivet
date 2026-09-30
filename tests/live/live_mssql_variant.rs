@@ -74,7 +74,8 @@ fn a_batch_export_delivers_sql_variant_and_udt_columns_as_the_source_renders_the
     }
     let want = source_rendering("rivet-mssql-1", &table);
     assert_eq!(want.len(), 6, "oracle rows: {want:?}");
-    let rig = Rig::mssql_batch(&table);
+    let rig = Rig::mssql_batch(&table)
+        .no_oracle("sql_variant / CLR UDT: the DuckDB mssql scanner renders ToString()/WKB where rivet delivers the wire bytes; no shared rendering to compare");
     rig.run_ok();
     assert_eq!(delivered(&rig.out_dir()), want);
 }
@@ -82,7 +83,10 @@ fn a_batch_export_delivers_sql_variant_and_udt_columns_as_the_source_renders_the
 #[test]
 #[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
 fn a_cdc_capture_delivers_sql_variant_and_udt_columns_as_the_source_renders_them() {
-    let mut sc = CdcScenario::mssql("mssql_cdc_variant", COLS);
+    let mut sc = CdcScenario::mssql_with("mssql_cdc_variant", COLS, |r, _| {
+        r.no_oracle("sql_variant / CLR UDT: the DuckDB mssql scanner renders ToString()/WKB where rivet delivers the wire bytes; no shared rendering to compare")
+    });
+    sc.rig.run_ok(); // pin
     let table = sc.table.clone();
     for sql in inserts(&table) {
         sc.sql(&sql);

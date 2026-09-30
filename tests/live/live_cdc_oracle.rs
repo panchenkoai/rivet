@@ -200,6 +200,7 @@ fn cdc_full_surface_cross_oracle_matches_literals() {
         String::from_utf8_lossy(&res.stderr)
     );
     let batch_rig = Rig::mysql_batch(&format!("{table}_batch"))
+        .no_oracle("query export over YEAR/BIT: a query exposes no catalog type, and the scanner reads YEAR as INTEGER and BIT as BLOB")
         .query(&format!("SELECT * FROM {table}"))
         .source_url(MYSQL_CDC_URL)
         .dest_path(batch_dir.clone());
