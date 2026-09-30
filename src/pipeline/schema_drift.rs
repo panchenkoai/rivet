@@ -110,8 +110,69 @@ pub(super) fn check_from_cdc_mappings(
     if fields.is_empty() {
         return Ok(());
     }
+    match state.get_stored_schema(key) {
+        Ok(Some(stored)) => {
+            if let Some(migrated) = migrate_upgrade_labels(&stored, mappings)
+                && let Err(e) = state.store_schema(key, &migrated)
+            {
+                log::warn!("schema drift: could not migrate the baseline of '{key}': {e:#}");
+            }
+        }
+        Ok(None) => {}
+        Err(e) => log::warn!("schema drift: could not read the baseline of '{key}': {e:#}"),
+    }
     let columns = crate::state::arrow_schema_to_columns(&arrow::datatypes::Schema::new(fields));
     check_and_persist(state, key, &columns, policy, &mut RunSummary::default())
+}
+
+/// True when `new` differs from its baseline entry only because rivet now labels it server text.
+///
+/// Before ADR-0038 the CDC sink wrote such a column as unlabelled Utf8 and the
+/// baseline recorded the planned type instead: nothing for an Unsupported type,
+/// the unbuildable Arrow type (e.g. `List(Date32)`) otherwise.
+pub(super) fn is_upgrade_label_migration(
+    old: Option<&SchemaColumn>,
+    new: &crate::types::TypeMapping,
+) -> bool {
+    use crate::types::{Delivery, TextForm, rivet_type_to_arrow};
+    new.delivery == Delivery::Text(TextForm::ServerText)
+        && old.map(|c| c.data_type.clone())
+            == rivet_type_to_arrow(&new.rivet_type).map(|dt| format!("{dt:?}"))
+}
+
+/// The baseline with every upgrade-label migration applied (one info line each), or `None` when nothing moved.
+fn migrate_upgrade_labels(
+    stored: &[SchemaColumn],
+    mappings: &[crate::types::TypeMapping],
+) -> Option<Vec<SchemaColumn>> {
+    let mut out = stored.to_vec();
+    let mut moved = false;
+    for m in mappings {
+        let at = out.iter().position(|c| c.name == m.column_name);
+        if !is_upgrade_label_migration(at.map(|i| &out[i]), m) {
+            continue;
+        }
+        let Some(field) = crate::types::build_arrow_field(m) else {
+            continue;
+        };
+        let col = SchemaColumn {
+            name: m.column_name.clone(),
+            data_type: format!("{:?}", field.data_type()),
+        };
+        log::info!(
+            "schema drift: column '{}' ({}) is now delivered as server text; the baseline \
+             from before ADR-0038 did not record it that way, so it is updated without \
+             reporting drift",
+            m.column_name,
+            m.source_native_type
+        );
+        match at {
+            Some(i) => out[i] = col,
+            None => out.push(col),
+        }
+        moved = true;
+    }
+    moved.then_some(out)
 }
 
 /// Deep core (private): detect drift of `columns` against the stored baseline for
@@ -209,6 +270,98 @@ mod tests {
     }
     fn summary() -> RunSummary {
         RunSummary::stub_for_testing("run-1", "orders")
+    }
+
+    fn mapping(name: &str, native: &str, t: crate::types::RivetType) -> crate::types::TypeMapping {
+        crate::types::TypeMapping::from_source(
+            &crate::types::SourceColumn::simple(name, native, true),
+            t,
+        )
+    }
+
+    fn server_text(
+        name: &str,
+        native: &str,
+        t: crate::types::RivetType,
+    ) -> crate::types::TypeMapping {
+        mapping(name, native, t).with_text(crate::types::TextForm::ServerText)
+    }
+
+    fn bare_numeric() -> crate::types::RivetType {
+        crate::types::RivetType::Unsupported {
+            native_type: "numeric".into(),
+            reason: "no precision".into(),
+        }
+    }
+
+    fn date_list() -> crate::types::RivetType {
+        crate::types::RivetType::List {
+            inner: Box::new(crate::types::RivetType::Date),
+        }
+    }
+
+    /// The label migration covers exactly what 0.30.0 recorded for an unbuildable column, nothing else.
+    #[test]
+    fn upgrade_label_migration_matches_only_what_the_old_baseline_recorded() {
+        let n = server_text("n", "numeric", bare_numeric());
+        assert!(
+            is_upgrade_label_migration(None, &n),
+            "0.30.0 recorded nothing"
+        );
+        assert!(!is_upgrade_label_migration(Some(&col("n", "Utf8")), &n));
+        assert!(!is_upgrade_label_migration(Some(&col("n", "Int64")), &n));
+
+        let d = server_text("d", "date[]", date_list());
+        let old_list = format!(
+            "{:?}",
+            crate::types::rivet_type_to_arrow(&date_list()).unwrap()
+        );
+        assert_eq!(
+            old_list, "List(Field { data_type: Date32, nullable: true })",
+            "what 0.30.0 stored, measured with its release binary"
+        );
+        assert!(is_upgrade_label_migration(Some(&col("d", &old_list)), &d));
+        assert!(
+            !is_upgrade_label_migration(None, &d),
+            "a List column was recorded"
+        );
+
+        let native = mapping("v", "bigint", crate::types::RivetType::Int64);
+        assert!(
+            !is_upgrade_label_migration(None, &native),
+            "a new native column drifts"
+        );
+        let text = mapping("s", "text", crate::types::RivetType::String);
+        assert!(!is_upgrade_label_migration(None, &text));
+    }
+
+    /// Under `fail`, a 0.30.0 baseline takes the server-text column silently; a genuinely new column still fails.
+    #[test]
+    fn cdc_gate_migrates_an_old_baseline_silently_and_still_fails_a_new_column() {
+        let st = StateStore::open_in_memory().unwrap();
+        let old_list = format!(
+            "{:?}",
+            crate::types::rivet_type_to_arrow(&date_list()).unwrap()
+        );
+        st.store_schema("k", &[col("id", "Int64"), col("d", &old_list)])
+            .unwrap();
+        let mut cols = vec![
+            mapping("id", "bigint", crate::types::RivetType::Int64),
+            server_text("n", "numeric", bare_numeric()),
+            server_text("d", "date[]", date_list()),
+        ];
+        check_from_cdc_mappings(&st, "k", &cols, SchemaDriftPolicy::Fail).unwrap();
+        let stored = st.get_stored_schema("k").unwrap().unwrap();
+        assert!(stored.contains(&col("n", "Utf8")), "{stored:?}");
+        assert!(stored.contains(&col("d", "Utf8")), "{stored:?}");
+
+        cols.push(mapping("extra", "bigint", crate::types::RivetType::Int64));
+        let err = check_from_cdc_mappings(&st, "k", &cols, SchemaDriftPolicy::Fail)
+            .expect_err("a genuinely new column still drifts");
+        assert!(
+            format!("{err:#}").contains("schema drift detected"),
+            "{err:#}"
+        );
     }
 
     #[test]

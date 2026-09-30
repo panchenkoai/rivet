@@ -820,7 +820,8 @@ fn oracle_class_census_is_pinned() {
 // (corrupt, retention gap, foreign DBID, no ALL COLUMNS logging, a LOB, an unknown
 // table), the NDJSON source-resolution CLI cell, and the shared intra-transaction check.
 // 2026-09-29: +1 independent — the Oracle TRUNCATE deferral cell reads run 1 through DuckDB.
-const PIN_INDEPENDENT: usize = 99;
+// 2026-09-30: +1 independent — the PG upgrade-baseline drift cell reads the capture through DuckDB.
+const PIN_INDEPENDENT: usize = 100;
 // 2026-09-28, source connection ceilings: +3 shared codec — the run's captured row is the
 // fixture check; the oracle is the server's own connection counter.
 // 2026-09-29: +2 shared codec — the Oracle TRUNCATE refusal on re-run and the uncaptured-truncate cell.

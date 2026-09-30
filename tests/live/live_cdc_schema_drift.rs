@@ -338,3 +338,89 @@ fn mysql_cdc_run_persists_source_harm_and_server_context_even_when_it_fails() {
         super::live_metrics_persist::MYSQL_HARM_COUNTERS,
     );
 }
+
+/// The `export_schema` baseline rivet 0.30.0 stored for this table (measured with the
+/// 0.30.0 release binary on 2026-09-30): the bare `numeric` absent, `date[]` as its List.
+const BASELINE_0_30_0: &str = r#"[{"name":"id","type":"Int64"},{"name":"d","type":"List(Field { data_type: Date32, nullable: true })"}]"#;
+
+/// Upgrading from 0.30.0 under `fail`: server-text columns join the baseline silently; a new column still refuses.
+#[test]
+#[ignore = "live: requires docker compose postgres-cdc (wal_level=logical)"]
+fn pg_cdc_upgrade_baseline_takes_server_text_silently_and_still_refuses_a_new_column() {
+    use postgres::NoTls;
+    let tbl = unique_name("cdc_drift_upg");
+    let slot = unique_name("rivet_drift_upg_slot");
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    c.batch_execute(&format!(
+        "CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, n NUMERIC, d DATE[])"
+    ))
+    .unwrap();
+    let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
+
+    let rig = Rig::pg_cdc(&tbl, &slot).export_line(DRIFT_FAIL);
+    rig.run_ok(); // creates the slot
+    let _slot = Slot(slot.clone());
+    let db = rig.config_path().parent().unwrap().join(".rivet_state.db");
+    let state = rusqlite::Connection::open(&db).unwrap();
+    let baseline = || -> String {
+        state
+            .query_row(
+                "SELECT columns_json FROM export_schema WHERE export_name = ?1",
+                [rig.export_name()],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    state
+        .execute(
+            "UPDATE export_schema SET columns_json = ?1 WHERE export_name = ?2",
+            [BASELINE_0_30_0, rig.export_name()],
+        )
+        .unwrap();
+    assert_eq!(
+        baseline(),
+        BASELINE_0_30_0,
+        "the 0.30.0 baseline is in place"
+    );
+
+    c.batch_execute(&format!(
+        "INSERT INTO {tbl} VALUES (1, 1.50, ARRAY['2024-01-01'::date])"
+    ))
+    .unwrap();
+    rig.run_ok();
+    let migrated: Vec<(String, String)> =
+        serde_json::from_str::<Vec<serde_json::Value>>(&baseline())
+            .unwrap()
+            .iter()
+            .map(|c| {
+                (
+                    c["name"].as_str().unwrap().to_string(),
+                    c["type"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+    for (name, ty) in [("id", "Int64"), ("n", "Utf8"), ("d", "Utf8")] {
+        assert!(
+            migrated.contains(&(name.to_string(), ty.to_string())),
+            "the baseline must now hold {name}: {ty}: {migrated:?}"
+        );
+    }
+    assert_eq!(
+        duckdb_declared_dir_id_set(&rig.out_dir()),
+        [1].into_iter().collect(),
+        "the run after the upgrade captures the change"
+    );
+
+    c.batch_execute(&format!(
+        "ALTER TABLE {tbl} ADD COLUMN extra INT; INSERT INTO {tbl} VALUES (2, 2, NULL, 7)"
+    ))
+    .unwrap();
+    let said = rig.run_expect_fail();
+    assert!(
+        said.contains(&format!(
+            "schema drift detected for export '{}'",
+            rig.export_name()
+        )) && said.contains("extra"),
+        "a genuinely new column still drifts under `fail`:\n{said}"
+    );
+}
