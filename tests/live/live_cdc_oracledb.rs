@@ -11,7 +11,7 @@ use std::path::Path;
 use crate::common::*;
 
 /// A `RIVET` table the capture user can read, logged with ALL columns (a whole row per change).
-fn cdc_table(prefix: &str, columns: &str) -> OracleTable {
+pub(crate) fn cdc_table(prefix: &str, columns: &str) -> OracleTable {
     let t = OracleTable::create(prefix, columns);
     ora_exec(&format!(
         "ALTER TABLE {} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS",
@@ -407,33 +407,6 @@ fn cells_sql(dir: &Path, cdc: bool) -> String {
         "SELECT {cols} FROM read_parquet('{}/*.parquet') ORDER BY ID",
         stage_for_duckdb(dir)
     )
-}
-
-#[test]
-#[ignore = "live: requires the oracle service with LogMiner prerequisites"]
-fn oracle_cdc_full_type_matrix_matches_batch() {
-    let _serial = cross_process_serial("oracle_cdc");
-    let d = tempfile::tempdir().unwrap();
-    let t = type_table();
-    let ckpt = d.path().join("cdc.ckpt");
-    rig(&t, &ckpt, &d.path().join("anchor")).run_ok();
-    seed_types(t.name());
-    let cdc_out = d.path().join("cdc");
-    rig(&t, &ckpt, &cdc_out).run_ok();
-    let batch = Rig::oracle_batch(t.name());
-    batch.run_ok();
-    let cdc = duckdb_run_sql_json(&cells_sql(&cdc_out, true));
-    let batch = duckdb_run_sql_json(&cells_sql(&batch.out_dir(), false));
-    assert_eq!(
-        cdc["rows"].as_array().map(Vec::len),
-        Some(4),
-        "every seeded row is captured"
-    );
-    assert_eq!(
-        (&cdc["columns"], &cdc["rows"]),
-        (&batch["columns"], &batch["rows"]),
-        "each captured value equals the batch export's"
-    );
 }
 
 #[test]

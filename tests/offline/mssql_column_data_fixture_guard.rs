@@ -31,33 +31,40 @@ const SRC: &str = "src/source/mssql/cdc.rs";
 ///
 /// Every one of these was RED-proven on 2026-08-02 by deleting the arm and
 /// running the named test against a live SQL Server — not assumed from the fact
-/// that a live suite exists.
+/// that a live suite exists. Re-proven 2026-09-30 against the ledger-generated
+/// test that replaced the type matrix: deleting the Date, Time or
+/// DateTime2|SmallDateTime arm fails its CDC run with
+/// RIVET_SOURCE_CDC_CELL_UNSUPPORTED, and the DateTime arm without
+/// `nearest_micro` fails it on column c13 (CDC .126666 against batch and source
+/// .126667).
 const ROW_BOUND: &[(&str, &str)] = &[
     (
         "Date",
         "needs a Row (tiberius decodes it via try_get) — live: \
-         mssql_cdc_full_type_matrix_matches_batch, RED \"column d: CDC differs from the \
-         batch export\"",
+         mssql_batch_and_cdc_deliver_every_ledger_row_alike, RED \"no decoder for a captured \
+         Date\"",
     ),
     (
         "Time",
-        "needs a Row — live: mssql_cdc_full_type_matrix_matches_batch, RED \"column t\"",
+        "needs a Row — live: mssql_batch_and_cdc_deliver_every_ledger_row_alike, RED \"no \
+         decoder for a captured Time\"",
     ),
     (
         "DateTime",
-        "needs a Row; shares an arm with DateTime2 and SmallDateTime, and the live \
-         fixture carries all three as SEPARATE columns — live: \
-         mssql_cdc_full_type_matrix_matches_batch, RED \"column dt2\"",
+        "needs a Row; its own arm rounds to the microsecond, and the ledger carries DATETIME, \
+         DATETIME2 and SMALLDATETIME as SEPARATE columns — live: \
+         mssql_batch_and_cdc_deliver_every_ledger_row_alike, RED \"c13 DATETIME\"",
     ),
     (
         "DateTime2",
-        "needs a Row; shares DateTime's arm, covered as its own column dt2 — live: \
-         mssql_cdc_full_type_matrix_matches_batch",
+        "needs a Row; shares SmallDateTime's arm, its own ledger column — live: \
+         mssql_batch_and_cdc_deliver_every_ledger_row_alike, RED \"no decoder for a captured \
+         DateTime2\"",
     ),
     (
         "SmallDateTime",
-        "needs a Row; shares DateTime's arm, covered as its own column sdt — live: \
-         mssql_cdc_full_type_matrix_matches_batch",
+        "needs a Row; shares DateTime2's arm, its own ledger column — live: \
+         mssql_batch_and_cdc_deliver_every_ledger_row_alike",
     ),
     (
         "DateTimeOffset",
@@ -172,7 +179,10 @@ fn a_row_bound_variant_the_mapper_dropped_must_leave_the_list() {
 fn every_row_bound_entry_names_the_live_test_that_covers_it() {
     let bad: Vec<&str> = ROW_BOUND
         .iter()
-        .filter(|(_, why)| !why.contains("live:") || !why.contains("mssql_cdc_"))
+        .filter(|(_, why)| {
+            !why.contains("live:")
+                || !(why.contains("mssql_cdc_") || why.contains("mssql_batch_and_cdc_"))
+        })
         .map(|(v, _)| *v)
         .collect();
     assert!(

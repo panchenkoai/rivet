@@ -83,6 +83,32 @@ pub fn duckdb_run_python(py: &str) -> String {
     String::from_utf8_lossy(&output.stdout).to_string()
 }
 
+/// Run `setup` then every named query on ONE DuckDB connection; `{name: {columns, rows}}`, cells `str()`-ed.
+pub fn duckdb_session_json(setup: &str, queries: &[(&str, String)]) -> serde_json::Value {
+    let qs = queries
+        .iter()
+        .map(|(n, q)| format!("({}, {})", python_repr(n), python_repr(q)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    duckdb_run_python_json(&format!(
+        r#"
+import duckdb, json, sys
+con = duckdb.connect()
+con.execute("SET enable_progress_bar=false")
+setup = {setup}
+if setup.strip():
+    con.execute(setup)
+out = {{}}
+for name, q in [{qs}]:
+    cur = con.execute(q)
+    out[name] = {{"columns": [d[0] for d in cur.description],
+                 "rows": [[None if v is None else str(v) for v in r] for r in cur.fetchall()]}}
+sys.stdout.write(json.dumps(out))
+"#,
+        setup = python_repr(setup),
+    ))
+}
+
 /// Like [`duckdb_run_python`] but parses stdout as JSON.
 pub fn duckdb_run_python_json(py: &str) -> serde_json::Value {
     let out = duckdb_run_python(py);

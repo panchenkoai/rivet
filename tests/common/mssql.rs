@@ -475,6 +475,31 @@ pub fn mssql_cdc_query_strings(sql: &str) -> Vec<String> {
     query_strings_at(1434, sql)
 }
 
+/// Every row of a query whose columns are all character types, as text, against `mssql-cdc`.
+pub fn mssql_cdc_text_rows(sql: &str) -> Vec<Vec<Option<String>>> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("mssql: tokio runtime");
+    rt.block_on(async {
+        let mut client = connect_at(1434).await;
+        let rows = client
+            .simple_query(sql)
+            .await
+            .unwrap_or_else(|e| panic!("mssql: {sql}: {e}"))
+            .into_first_result()
+            .await
+            .expect("mssql: rows");
+        rows.iter()
+            .map(|r| {
+                (0..r.len())
+                    .map(|i| r.get::<&str, _>(i).map(String::from))
+                    .collect()
+            })
+            .collect()
+    })
+}
+
 /// First column of every row as a string, against the shared `mssql` (`:1433`).
 pub fn mssql_query_strings(sql: &str) -> Vec<String> {
     query_strings_at(1433, sql)

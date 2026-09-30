@@ -76,16 +76,16 @@ const CASES: &[(&str, Expect, Expect, Expect, Expect, Expect)] = &[
     ),
     (
         "full_type_matrix",
-        Test("fn cdc_full_type_matrix_matches_batch"),
-        Test("fn pg_cdc_full_type_matrix_matches_batch"),
-        Test("fn mssql_cdc_full_type_matrix_matches_batch"),
+        Test("fn mysql_batch_and_cdc_deliver_every_ledger_row_alike"),
+        Test("fn postgres_batch_and_cdc_deliver_every_ledger_row_alike"),
+        Test("fn mssql_batch_and_cdc_deliver_every_ledger_row_alike"),
         NA(
             "CDC and batch render `document` through the SAME `document_to_json` \
             blob serializer — the batch mongo_batch_type_fidelity test pins the \
             type surface (large Int64 / Decimal128 verbatim); there is no per-op \
             typing that could diverge CDC from batch",
         ),
-        Test("fn oracle_cdc_full_type_matrix_matches_batch"),
+        Test("fn oracle_batch_and_cdc_deliver_every_ledger_row_alike"),
     ),
     (
         "update_delete_typed",
@@ -287,7 +287,7 @@ const CASES: &[(&str, Expect, Expect, Expect, Expect, Expect)] = &[
             type-fidelity test, and CDC shares the document_to_json renderer",
         ),
         NA(
-            "same anchoring; CDC==batch is oracle_cdc_full_type_matrix_matches_batch and the batch surface is graded against Oracle's own rendering in live_oracle",
+            "same anchoring; CDC==batch is oracle_batch_and_cdc_deliver_every_ledger_row_alike and the batch surface is graded against Oracle's own rendering in live_oracle",
         ),
     ),
     (
@@ -336,14 +336,18 @@ const CASES: &[(&str, Expect, Expect, Expect, Expect, Expect)] = &[
 #[test]
 fn every_cdc_engine_covers_every_conformance_case() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    // The ledger-generated batch-equals-CDC cells hold one test per engine.
+    let parity = fs::read_to_string(root.join("tests/live/live_cdc_type_parity.rs")).unwrap();
     let mut mysql_pg = fs::read_to_string(root.join("tests/live/live_cdc.rs")).unwrap();
     mysql_pg.push_str(&fs::read_to_string(root.join("tests/live/gremlin_cdc.rs")).unwrap());
     mysql_pg.push_str(&fs::read_to_string(root.join("tests/live/live_cdc_golden.rs")).unwrap());
     mysql_pg.push_str(&fs::read_to_string(root.join("tests/live/live_cdc_oracle.rs")).unwrap());
     mysql_pg.push_str(&fs::read_to_string(root.join("tests/live/live_cdc_mbt.rs")).unwrap());
-    let mssql = fs::read_to_string(root.join("tests/live/live_cdc_mssql.rs")).unwrap();
+    mysql_pg.push_str(&parity);
+    let mssql = fs::read_to_string(root.join("tests/live/live_cdc_mssql.rs")).unwrap() + &parity;
     let mongo = fs::read_to_string(root.join("tests/live/live_cdc_mongo.rs")).unwrap();
-    let oracle = fs::read_to_string(root.join("tests/live/live_cdc_oracledb.rs")).unwrap();
+    let oracle =
+        fs::read_to_string(root.join("tests/live/live_cdc_oracledb.rs")).unwrap() + &parity;
 
     let mut missing = Vec::new();
     for (case, my, pg, ms, mo, ora) in CASES {
@@ -821,7 +825,11 @@ fn oracle_class_census_is_pinned() {
 // table), the NDJSON source-resolution CLI cell, and the shared intra-transaction check.
 // 2026-09-29: +1 independent — the Oracle TRUNCATE deferral cell reads run 1 through DuckDB.
 // 2026-09-30: +1 independent — the PG upgrade-baseline drift cell reads the capture through DuckDB.
-const PIN_INDEPENDENT: usize = 100;
+// 2026-09-30: +4 independent — the ledger-generated batch-equals-CDC cells (one per SQL engine,
+// live_cdc_type_parity.rs), graded by DuckDB and the source's own rendering; -6 — the hand-written
+// per-engine type cells they replace (PG/MSSQL/Oracle full_type_matrix, PG/MySQL/MSSQL typed_values),
+// whose types and literals moved into docs/type-capability-matrix.yaml.
+const PIN_INDEPENDENT: usize = 98;
 // 2026-09-28, source connection ceilings: +3 shared codec — the run's captured row is the
 // fixture check; the oracle is the server's own connection counter.
 // 2026-09-29: +2 shared codec — the Oracle TRUNCATE refusal on re-run and the uncaptured-truncate cell.
@@ -832,7 +840,9 @@ const PIN_SELF_COUNTER: usize = 6;
 // 2026-09-29: +2 presence — the PG CDC LMT-timezone and DOMAIN parity cells compare CDC to batch output.
 // 2026-09-29: +2 presence — the MySQL out-of-range TIME and Oracle int-override refusals, whose oracle is the refusal plus the unmoved checkpoint.
 // 2026-09-30: +1 presence — the Oracle date-override refusal, whose oracle is the refusal plus the unmoved checkpoint.
-const PIN_PRESENCE: usize = 81;
+// 2026-09-30: -1 presence — the MySQL full_type_matrix cell (ArrayData CDC==batch), replaced by the
+// ledger-generated cell, which grades the same types independently.
+const PIN_PRESENCE: usize = 80;
 
 /// TIER 2 (harness audit, 2026-08-29): a test whose NAME makes a
 /// COMPLETENESS claim must carry a class-(a) INDEPENDENT oracle — not merely
