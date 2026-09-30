@@ -71,14 +71,14 @@ percent-encoding = "2"
 # work the same way they do on Postgres. Without this feature, the mysql
 # crate panics at connect time with "Client had asked for TLS connection
 # but TLS support is disabled" — operator-facing panic, no recoverable error.
-mysql = { version = "28", default-features = false, features = ["minimal", "native-tls", "binlog"] }
+mysql = { version = "28.0.3", default-features = false, features = ["minimal", "native-tls", "binlog"] }
 # MongoDB source driver (async, tokio). Bridged to the sync `Source` trait via a
 # per-source tokio runtime + `block_on`, exactly like the MSSQL/tiberius engine
 # (ADR-0011 keeps `Source` sync). Default features pull `rustls-tls` — the SAME
 # TLS stack tiberius/opendal/reqwest already link, so no second TLS tree is
 # added. `bson` is re-exported as `mongodb::bson` (no separate dep). One driver
-# crate + one wire protocol (OP_MSG) covers the whole MongoDB 4.2–8.0 range.
-mongodb = "3"
+# crate + one wire protocol (OP_MSG) covers the whole MongoDB 4.4–8.0 range.
+mongodb = "3.9.1"
 opendal = { version = "0.55", features = ["blocking", "services-fs", "services-s3", "services-gcs", "services-azblob"] }
 # `arrow_canonical_extension_types` enables parquet-rs to emit native Parquet
 # `LogicalType::Uuid` / `LogicalType::Json` whenever an Arrow field carries the
@@ -197,7 +197,7 @@ tokio = { version = "1.50.0", features = ["rt-multi-thread", "net", "time"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 # MongoDB live-test helper (tests/common/mongo.rs) seeds fixtures + drives
 # transactions through the async driver directly — same crate the lib uses.
-mongodb = "3"
+mongodb = "3.9.1"
 futures-util = "0.3"
 
 [[bench]]
