@@ -105,7 +105,7 @@ pub fn iso8601_duration(months: i32, days: i32, micros: i64) -> String {
         }
     }
     if micros != 0 {
-        let sign = if micros < 0 { "-" } else { "" };
+        let sign = if micros.is_negative() { "-" } else { "" };
         let abs = micros.unsigned_abs();
         let (h, m) = (abs / 3_600_000_000, abs / 60_000_000 % 60);
         let (s, frac) = (abs / 1_000_000 % 60, abs % 1_000_000);
@@ -131,7 +131,7 @@ pub fn iso_timestamp_nanos(dt: NaiveDateTime, zoned: bool) -> String {
     let y = dt.year();
     let year = match y {
         0..=9999 => format!("{y:04}"),
-        _ if y < 0 => format!("-{:04}", -y),
+        i32::MIN..=-1 => format!("-{:04}", -y),
         _ => format!("+{y}"),
     };
     let (sec, nanos) = match dt.nanosecond() {
