@@ -1281,13 +1281,14 @@ fn resolve_partition(
         LoadTarget::Snowflake { .. } => {
             super::snowflake::partition_expr(export, spec, &column_type)?
         }
-        LoadTarget::Clickhouse { .. } => bail!(
-            "export `{export}`: `partition:` is not supported for a ClickHouse load — the \
-             change log collapses versions only within a partition, so a row whose \
-             partition value changes would stay duplicated for ever (ADR-0035 CH8)"
-        ),
+        LoadTarget::Clickhouse { .. } => {
+            super::clickhouse::partition_expr(export, spec, &column_type)?
+        }
     };
-    if hourly_partitions_outlive_the_table(&key, spec.expiration_days) {
+    if let Some(w) = moving_partition_warning(export, &load.target, mode, &key) {
+        eprintln!("{w}");
+    }
+    if hourly_partitions_outlive_the_table(&load.target, &key, spec.expiration_days) {
         eprintln!("{}", hourly_limit_warning(export));
     }
     if mode != LoadMode::Full {
@@ -1315,6 +1316,27 @@ fn resolve_partition(
 }
 
 /// Whether an hourly key with this expiry can outgrow BigQuery's per-table partition cap.
+/// The ClickHouse CDC warning for a partition column that is not a creation stamp (ADR-0035 CH8).
+fn moving_partition_warning(
+    export: &str,
+    target: &LoadTarget,
+    mode: LoadMode,
+    key: &PartitionKey,
+) -> Option<String> {
+    let col = key.column()?;
+    (matches!(target, LoadTarget::Clickhouse { .. })
+        && mode == LoadMode::Cdc
+        && !crate::init::is_creation_stamp(col))
+    .then(|| {
+        format!(
+            "  warning: export `{export}`: the change log is partitioned by `{col}`, which is not \
+             a creation stamp — a row whose `{col}` changes leaves its older version in the old \
+             partition for ever (merges never cross partitions). The view still reads only the \
+             latest; partition by the date a row was created to keep one row per key"
+        )
+    })
+}
+
 /// The hourly-partition limit warning: the lossless fix first; expiry only as the deletion it is.
 fn hourly_limit_warning(export: &str) -> String {
     format!(
@@ -1325,14 +1347,21 @@ fn hourly_limit_warning(export: &str) -> String {
     )
 }
 
-fn hourly_partitions_outlive_the_table(key: &PartitionKey, expiration_days: Option<u32>) -> bool {
-    matches!(
-        key,
-        PartitionKey::Time {
-            granularity: Granularity::Hour,
-            ..
-        }
-    ) && expiration_days.is_none_or(|d| d > HOURLY_LIFETIME_DAYS)
+/// Whether a BigQuery table partitioned by `key` can outgrow its per-table partition cap.
+fn hourly_partitions_outlive_the_table(
+    target: &LoadTarget,
+    key: &PartitionKey,
+    expiration_days: Option<u32>,
+) -> bool {
+    matches!(target, LoadTarget::Bigquery { .. })
+        && matches!(
+            key,
+            PartitionKey::Time {
+                granularity: Granularity::Hour,
+                ..
+            }
+        )
+        && expiration_days.is_none_or(|d| d > HOURLY_LIFETIME_DAYS)
 }
 
 /// `NUMERIC(12, 2)` → `NUMERIC`, `ARRAY<INT64>` → `ARRAY`.
@@ -3206,38 +3235,115 @@ load: { target: bigquery, project: p, dataset: d, cluster_by: none }
         assert!(e.contains("not a plain SQL identifier"), "{e}");
     }
 
+    /// Every granularity maps to an expression exact over Date32/DateTime64's whole range
+    /// (`toDate` and `toStartOfHour` wrap outside 1970-2106, measured on 24.8.14).
     #[test]
-    fn clickhouse_refuses_every_partition_form_in_every_mode() {
+    fn clickhouse_partitions_a_date_column_in_every_mode_and_refuses_bigquery_only_forms() {
         let specs = [
-            typed("ts", "DateTime64(6)"),
+            typed("ts", "DateTime64(6, 'UTC')"),
+            typed("naive", "DateTime64(6)"),
             typed("d", "Date32"),
             typed("n", "Int64"),
         ];
         for mode in [LoadMode::Full, LoadMode::Incremental, LoadMode::Cdc] {
-            for block in [
-                serde_json::json!({ "column": "ts", "granularity": "month" }),
-                serde_json::json!({ "column": "d" }),
-                serde_json::json!({ "column": "n" }),
-                serde_json::json!({ "ingestion": "day" }),
-                serde_json::json!({ "range": { "column": "n", "start": 0, "end": 10, "interval": 1 } }),
-            ] {
-                let e = resolve_partition(
+            let resolve = |block: serde_json::Value| {
+                resolve_partition(
                     "e",
-                    &load_with(
-                        "clickhouse",
-                        serde_json::json!({ "partition": block.clone() }),
-                    ),
+                    &load_with("clickhouse", serde_json::json!({ "partition": block })),
                     mode,
                     &specs,
                     SpecFit::Strict,
                 )
-                .expect_err("ClickHouse takes no partition");
-                assert!(
-                    e.to_string().contains("ADR-0035 CH8"),
-                    "{mode:?} {block}: {e}"
-                );
+            };
+            for (block, expr) in [
+                (
+                    serde_json::json!({ "column": "ts", "granularity": "hour" }),
+                    "intDiv(toYYYYMMDDhhmmss(`ts`), 10000)",
+                ),
+                (
+                    serde_json::json!({ "column": "naive", "granularity": "hour" }),
+                    "intDiv(toYYYYMMDDhhmmss(`naive`), 10000)",
+                ),
+                (serde_json::json!({ "column": "ts" }), "toYYYYMMDD(`ts`)"),
+                (serde_json::json!({ "column": "d" }), "toYYYYMMDD(`d`)"),
+                (
+                    serde_json::json!({ "column": "d", "granularity": "month" }),
+                    "toYYYYMM(`d`)",
+                ),
+                (
+                    serde_json::json!({ "column": "ts", "granularity": "year" }),
+                    "toYear(`ts`)",
+                ),
+            ] {
+                let p = resolve(block.clone()).unwrap().unwrap();
+                assert_eq!(p.expr, expr, "{mode:?} {block}");
+                assert_eq!(p.key.column(), block["column"].as_str());
+            }
+            let err = |block| resolve(block).unwrap_err().to_string();
+            for (block, want) in [
+                (
+                    serde_json::json!({ "column": "d", "granularity": "hour" }),
+                    "`d` is a DATE32, which has no hours",
+                ),
+                (
+                    serde_json::json!({ "column": "n" }),
+                    "cannot partition on `n` (INT64)",
+                ),
+                (
+                    serde_json::json!({ "ingestion": "day" }),
+                    "ClickHouse has no load-time partitions",
+                ),
+                (
+                    serde_json::json!({ "range": { "column": "n", "start": 0, "end": 10, "interval": 1 } }),
+                    "`range` is BigQuery's integer-range partitioning",
+                ),
+                (
+                    serde_json::json!({ "column": "ts", "expiration_days": 30 }),
+                    "sets no partition expiry or partition filter",
+                ),
+                (
+                    serde_json::json!({ "column": "ts", "require_filter": true }),
+                    "sets no partition expiry or partition filter",
+                ),
+            ] {
+                let e = err(block.clone());
+                assert!(e.contains(want), "{mode:?} {block}: {e}");
             }
         }
+    }
+
+    /// Only a ClickHouse CDC log partitioned by something other than a creation stamp warns:
+    /// there a changed value leaves the old version in its old partition.
+    #[test]
+    fn a_clickhouse_change_log_warns_when_its_partition_column_can_move() {
+        let ch = load_with("clickhouse", serde_json::json!({})).target;
+        let bq = load_with("bigquery", serde_json::json!({})).target;
+        let key = |c: &str| PartitionKey::Time {
+            column: Some(c.into()),
+            granularity: Granularity::Month,
+        };
+        let w = moving_partition_warning("e", &ch, LoadMode::Cdc, &key("updated_at"))
+            .expect("a mutation stamp moves");
+        assert!(
+            w.contains("partitioned by `updated_at`, which is not a creation stamp")
+                && w.contains("The view still reads only the latest"),
+            "{w}"
+        );
+        assert!(moving_partition_warning("e", &ch, LoadMode::Cdc, &key("event_date")).is_some());
+        assert_eq!(
+            moving_partition_warning("e", &ch, LoadMode::Cdc, &key("CreatedAt")),
+            None
+        );
+        for mode in [LoadMode::Full, LoadMode::Incremental] {
+            assert_eq!(
+                moving_partition_warning("e", &ch, mode, &key("updated_at")),
+                None
+            );
+        }
+        assert_eq!(
+            moving_partition_warning("e", &bq, LoadMode::Cdc, &key("updated_at")),
+            None
+        );
     }
 
     #[test]
@@ -3298,19 +3404,23 @@ load: { target: bigquery, project: p, dataset: d, cluster_by: none }
 
     #[test]
     fn hourly_partitions_outlive_the_table_without_a_short_expiry() {
+        let bq = load_with("bigquery", serde_json::json!({})).target;
         let hourly = |column: Option<&str>| PartitionKey::Time {
             column: column.map(String::from),
             granularity: Granularity::Hour,
         };
         assert!(hourly_partitions_outlive_the_table(
+            &bq,
             &hourly(Some("ts")),
             None
         ));
         assert!(hourly_partitions_outlive_the_table(
+            &bq,
             &hourly(None),
             Some(417)
         ));
         assert!(!hourly_partitions_outlive_the_table(
+            &bq,
             &hourly(Some("ts")),
             Some(416)
         ));
@@ -3318,8 +3428,15 @@ load: { target: bigquery, project: p, dataset: d, cluster_by: none }
             column: Some("ts".into()),
             granularity: Granularity::Day,
         };
-        assert!(!hourly_partitions_outlive_the_table(&daily, None));
+        assert!(!hourly_partitions_outlive_the_table(&bq, &daily, None));
         assert_eq!(HOURLY_LIFETIME_DAYS, 416);
+        for other in ["snowflake", "clickhouse"] {
+            let target = load_with(other, serde_json::json!({})).target;
+            assert!(
+                !hourly_partitions_outlive_the_table(&target, &hourly(Some("ts")), None),
+                "the cap is BigQuery's: {other}"
+            );
+        }
     }
 
     #[test]

@@ -3,8 +3,8 @@
 //! prose. The uncoded `bail!` sites may only shrink: a new one fails this test, and so does a
 //! migration that forgets to lower the ceiling, so the win stays banked.
 
-/// Uncoded `bail!(` sites under `src/` on 2026-09-27, when the registry landed.
-const CEILING: usize = 429;
+/// Uncoded `bail!(` sites under `src/` (429 on 2026-09-27, when the registry landed).
+const CEILING: usize = 428;
 
 /// Occurrences of a bare `bail!(` (not `rivet_bail!` / `config_bail!`) in `text`.
 fn bare_bails(text: &str) -> usize {

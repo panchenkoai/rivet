@@ -239,6 +239,13 @@ pub trait ShapeControl {
 
 /// The one line a load prints when its warehouse cannot verify a table's shape.
 fn shape_unverified_note(warehouse: cdc::Warehouse, fqtn: &str) -> String {
+    if warehouse == cdc::Warehouse::ClickHouse {
+        return format!(
+            "  note: `{fqtn}` — ClickHouse re-creates a whole-table load in the declared shape and \
+             refuses a change log whose declared partition differs; `cluster_by` is not compared \
+             with an existing change log"
+        );
+    }
     format!(
         "  note: `{fqtn}` — {} has no shape control here, so its partitioning and clustering \
          are not compared with the config",
@@ -1204,6 +1211,7 @@ pub fn build_loader(plan: &plan::LoadPlan, run_id: &str) -> Box<dyn TargetLoader
             .named_collection(named_collection.clone())
             .ca_file(ca_file.clone())
             .cluster_by(plan.clustering.columns().to_vec())
+            .partition_by(plan.partition.as_ref().map(|p| p.expr.clone()))
             .cdc(plan.mode == plan::LoadMode::Cdc),
         ),
     }
@@ -1234,6 +1242,19 @@ fn build_bigquery_loader(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// ClickHouse's note says what it does compare (the log's partition); the others say nothing is.
+    #[test]
+    fn the_shape_note_says_what_each_warehouse_compares() {
+        let ch = shape_unverified_note(cdc::Warehouse::ClickHouse, "d.t__changes");
+        assert!(
+            ch.contains("refuses a change log whose declared partition differs")
+                && !ch.contains("no shape control"),
+            "{ch}"
+        );
+        let sf = shape_unverified_note(cdc::Warehouse::Snowflake, "d.t__changes");
+        assert!(sf.contains("has no shape control here"), "{sf}");
+    }
 
     fn report(rows: u64, jobs: usize, had: bool) -> CompactReport {
         CompactReport {

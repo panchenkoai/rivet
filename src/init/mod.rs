@@ -438,7 +438,7 @@ fn stamp_key(name: &str) -> String {
 
 /// Whether the column name means "when the row came to BE" — the partition key's
 /// first choice, ahead of any other business date.
-fn is_creation_stamp(name: &str) -> bool {
+pub(crate) fn is_creation_stamp(name: &str) -> bool {
     matches!(
         stamp_key(name).as_str(),
         "createdat"
@@ -655,6 +655,23 @@ pub struct InitYamlDestination {
 }
 
 impl InitYamlDestination {
+    /// The partition granularity init guesses for the named warehouse and its reason; `None` without one.
+    pub(crate) fn partition_guess(&self) -> Option<(&'static str, &'static str)> {
+        if self.clickhouse_url.is_some() {
+            Some((
+                "month",
+                "ClickHouse advises month or coarser; one INSERT block may touch at most 100 partitions",
+            ))
+        } else if self.bigquery_project.is_some() {
+            Some((
+                "day",
+                "day holds ~4,000 partitions (11 years); use month for a longer history",
+            ))
+        } else {
+            None
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.gcs_bucket.is_some() && self.s3_bucket.is_some() {
             anyhow::bail!("use at most one of --gcs-bucket and --s3-bucket");

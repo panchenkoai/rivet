@@ -8,7 +8,8 @@ the table; a full load killed at each of its fault points re-running to the sour
 a timestamp past DateTime64's range refused whether rivet sends the part or
 ClickHouse pulls it; an INSERT whose answer a proxy swallows resent into a CDC log
 (and not past five attempts) but never into a full load's swap table; an
-incremental export adopting the table behind a view; and `rivet init`'s
+incremental export adopting the table behind a view; partitioned full, CDC and
+incremental loads (ADR-0035 CH8); and `rivet init`'s
 ClickHouse flags. Oracles are the tests': the source and ClickHouse read back
 directly — never rivet's report.
 """
@@ -42,6 +43,10 @@ CELLS = {
     "a_cdc_insert_whose_every_answer_is_lost_fails_after_five_attempts": "retry:exhausted",
     "a_full_load_insert_whose_answer_is_lost_is_not_resent": "retry:full-not-resent",
     "a_full_load_killed_at_each_fault_point_re_runs_to_the_source": "full:crash-hooks",
+    "a_full_load_into_clickhouse_is_partitioned_by_month_as_declared": "partition:full",
+    "a_cdc_log_partitioned_by_a_moving_column_serves_one_latest_row_per_key": "partition:cdc",
+    "a_changed_partition_is_refused_before_it_touches_the_change_log": "partition:changed",
+    "a_partitioned_incremental_export_into_clickhouse_serves_the_latest_rows": "partition:incremental",
 }
 
 # The loader's own live tests: `#[ignore]` lib tests in src/load/clickhouse.rs, which

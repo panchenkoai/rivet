@@ -83,6 +83,51 @@ ClickHouse does not allow `PREWHERE` on the view. If you read `<table>__changes 
 directly, filter non-key columns in `WHERE`: a `PREWHERE` runs before the engine
 collapses versions and can return an old one.
 
+## Partitions
+
+`partition: { column, granularity }` partitions every table the load creates (the
+full-load table, and the change log of a CDC or incremental export) by a `Date32` or
+`DateTime64` column:
+
+| `granularity` | `PARTITION BY` | partition id of 2026-03-10 14:05 |
+|---|---|---|
+| `hour` (timestamps only) | `intDiv(toYYYYMMDDhhmmss(c), 10000)` | `2026031014` |
+| `day` | `toYYYYMMDD(c)` | `20260310` |
+| `month` | `toYYYYMM(c)` | `202603` |
+| `year` | `toYear(c)` | `2026` |
+
+These functions are exact over the whole 1900–2299 range. `toDate` and
+`toStartOfHour` would put a 1950 row in a 2129 partition, because they wrap outside
+1970–2106. A NULL value gets a partition of its own.
+
+```yaml
+load:
+  target: clickhouse
+  # …
+  partition: { column: created_at, granularity: month }
+```
+
+- **Pick `month` or coarser.** ClickHouse refuses an insert block that touches more
+  than 100 partitions (`max_partitions_per_insert_block`, "Too many partitions for
+  single INSERT block"). A part holding more than 100 days of history therefore fails
+  under `day`. `rivet init` guesses `month` for ClickHouse.
+- **A CDC log partitioned by a column that changes.** The engine merges the versions of
+  a key only within one partition. When an update moves a row to another partition,
+  its older version stays in the old partition for good, and `OPTIMIZE … FINAL` does
+  not remove it either (measured on 24.8.14). The view still returns one row per key,
+  the latest, because `FINAL` compares versions across partitions. The view pins
+  `do_not_merge_across_partitions_select_final = 0`, so a profile that turns that
+  setting on does not change it. The cost is storage and a slower `FINAL`. The load
+  warns when a CDC export partitions by anything but a creation stamp (`created_at`,
+  `CreatedDate`, …).
+- **Change the partition before the first load, not after.** A change log that exists
+  already keeps its partition. A load that declares a different one is refused before
+  it writes anything, and the refusal names both. A full-load table is created again on
+  every load, so it always takes the partition the config declares.
+- **Not on ClickHouse:** `range:` (BigQuery's integer ranges), `ingestion:` (use
+  `column: _rivet_exported_at`), `expiration_days` and `require_filter` (a TTL is the
+  table owner's decision). Each is refused by name.
+
 ## Letting ClickHouse read the bucket itself
 
 By default rivet reads each part from GCS and sends it to ClickHouse. With a
@@ -157,7 +202,6 @@ load:
 
 - **MongoDB CDC** into ClickHouse: the resume token has no integer order the
   change log can version by. Load it into BigQuery or Snowflake.
-- **`partition:`**: a change log collapses versions only within a partition.
 - **`rivet compact`** and **`layout: base_buffer`**: the engine collapses the log
   itself, so there is nothing to merge.
 - **A CDC stream over a table from an earlier full load**: refused; drop or

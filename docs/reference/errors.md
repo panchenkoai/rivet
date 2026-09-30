@@ -23,6 +23,7 @@ Every failure rivet names carries a stable `RIVET_<FAMILY>_<NAME>` code: in `--j
 | `RIVET_CONFIG_CDC_ROLLOVER_INVALID` | usage | 1 | set `cdc.rollover` to 1 or more, or omit it |
 | `RIVET_CONFIG_CDC_CONTINUOUS_UNSUPPORTED` | usage | 1 | omit `cdc.until_current` (or `--stream`) and run the bounded drain on a schedule |
 | `RIVET_CONFIG_CSV_LOAD_UNSUPPORTED` | usage | 1 | use `format: parquet` for an export with a `load:` section |
+| `RIVET_CONFIG_LOAD_PARTITION_UNSUPPORTED` | usage | 1 | partition by a date or time `column` + `granularity`, and drop the options the target refuses |
 | `RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED` | usage | 1 | use a mode this source supports (MongoDB: `full`) |
 | `RIVET_CONFIG_SOURCE_URL_SCHEME_MISMATCH` | usage | 1 | make `source.type` and the URL scheme name the same engine |
 | `RIVET_CONFIG_KEYSET_KEY_UUID_OVERRIDE` | usage | 1 | key the keyset on another unique column, or use `mode: full` for this table |

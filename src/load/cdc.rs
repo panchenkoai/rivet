@@ -750,14 +750,15 @@ pub fn dedup_view_sql(
     )
 }
 
-/// The ClickHouse current-state view: the engine keeps one version per key, `FINAL` reads it (ADR-0035 CH5).
+/// The ClickHouse current-state view: `FINAL` across partitions, pinned against a profile (ADR-0035 CH5, CH8).
 pub(crate) fn clickhouse_final_view(view_fqtn: &str, changes_fqtn: &str) -> String {
     let wh = Warehouse::ClickHouse;
     format!(
         "CREATE OR REPLACE VIEW {view} AS\n\
          SELECT * EXCEPT (__op, __pos, __seq, __ver),\n\
          \x20      ifNull(__op = 'delete', false) AS {flag}\n\
-         FROM {changes} FINAL",
+         FROM {changes} FINAL\n\
+         SETTINGS do_not_merge_across_partitions_select_final = 0",
         view = wh.quote_fqtn(view_fqtn),
         changes = wh.quote_fqtn(changes_fqtn),
         flag = DELETE_FLAG_COLUMN,
@@ -1150,7 +1151,8 @@ mod tests {
         assert_eq!(
             sql,
             "CREATE OR REPLACE VIEW `d`.`orders` AS\nSELECT * EXCEPT (__op, __pos, __seq, __ver),\n       \
-             ifNull(__op = 'delete', false) AS __is_deleted\nFROM `d`.`orders__changes` FINAL"
+             ifNull(__op = 'delete', false) AS __is_deleted\nFROM `d`.`orders__changes` FINAL\n\
+             SETTINGS do_not_merge_across_partitions_select_final = 0"
         );
         assert_eq!(
             [
