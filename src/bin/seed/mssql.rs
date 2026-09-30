@@ -134,6 +134,7 @@ async fn connect(url: &str) -> Result<MssqlClient> {
     config.port(port);
     config.database(db);
     config.authentication(AuthMethod::sql_server(user, pass));
+    config.command_timeout(None);
     config.encryption(EncryptionLevel::Required);
     config.trust_cert();
 

@@ -129,7 +129,7 @@ tokio = { version = "1.50.0", features = ["rt-multi-thread", "net", "time"] }
 #     don't hit this SecureTransport limitation.)
 # The MSSQL TLS config API (`trust_cert`/`trust_cert_ca`/`encryption`) is
 # backend-agnostic, so no source change is needed for the switch.
-tiberius = { version = "0.12", default-features = false, features = ["tds73", "chrono", "vendored-openssl"] }
+tiberius = { version = "0.13", default-features = false, features = ["tds73", "chrono", "vendored-openssl"] }
 # Oracle Database: Oracle's own pure-Rust thin driver (no Instant Client, so no
 # end-user-agreement licence to bundle). Beta — pinned exactly; see
 # dev/research/oracle-source.md. Behind the `oracle` feature (on by default).
@@ -192,7 +192,7 @@ proptest = "1"
 # MSSQL type-roundtrip harness (tests/common/mssql.rs) needs the async driver
 # directly to seed fixtures — same crates the lib uses, exposed to the
 # integration-test crate.
-tiberius = { version = "0.12", default-features = false, features = ["tds73", "chrono", "vendored-openssl"] }
+tiberius = { version = "0.13", default-features = false, features = ["tds73", "chrono", "vendored-openssl"] }
 tokio = { version = "1.50.0", features = ["rt-multi-thread", "net", "time"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 # MongoDB live-test helper (tests/common/mongo.rs) seeds fixtures + drives

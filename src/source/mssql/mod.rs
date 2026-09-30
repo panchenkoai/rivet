@@ -172,6 +172,8 @@ pub(crate) fn tiberius_config(
     config.port(port);
     config.database(database);
     config.authentication(AuthMethod::sql_server(user, password));
+    // No per-round-trip bound (0.13 defaults to 30 s): `statement_timeout_s` is the budget.
+    config.command_timeout(None);
 
     // SQL Server forces TLS on the login handshake regardless; map the
     // shared TlsConfig onto tiberius' cert-trust knobs. A private CA goes
@@ -296,26 +298,6 @@ pub(crate) fn parse_mssql_url(url: &str) -> Result<MssqlUrl> {
 }
 
 impl MssqlSource {
-    /// Refuse a result column the driver cannot parse before the query runs; a failed probe does not block the export.
-    fn refuse_undecodable_types(&mut self, query: &str) -> Result<()> {
-        let named =
-            match crate::source::Source::query_scalar(self, &undecodable_columns_probe(query)) {
-                Ok(v) => v.unwrap_or_default(),
-                Err(e) => {
-                    log::debug!("mssql: result-type probe unavailable ({e:#}); reading without it");
-                    return Ok(());
-                }
-            };
-        if named.trim().is_empty() {
-            return Ok(());
-        }
-        crate::rivet_bail!(
-            crate::error::codes::SOURCE_VALUE_UNREPRESENTABLE,
-            "mssql: column(s) {named} have a type rivet's SQL Server driver cannot read. \
-             Cast them in a query, e.g. CAST(col AS NVARCHAR(4000)), or leave them out"
-        )
-    }
-
     /// Connect to SQL Server, honouring the shared `TlsConfig`. `url` is the
     /// resolved `sqlserver://user:pass@host:port/db` form. A successful return
     /// has completed a TLS login handshake and a `SELECT 1` round-trip.
@@ -510,24 +492,6 @@ impl MssqlSource {
 /// parameters, rejecting anything outside the bounds the YAML overrides accept.
 /// SQL Server caps precision at 38 and scale ≤ precision, so a well-formed
 /// catalog row always passes; the guard defends against a degenerate row.
-/// Result column types the TDS driver cannot parse: it panics on them, and a release build aborts.
-const UNDECODABLE_TYPES: &[&str] = &["sql_variant"];
-
-/// The server-side probe naming every result column of `query` whose type the driver cannot parse.
-fn undecodable_columns_probe(query: &str) -> String {
-    let types = UNDECODABLE_TYPES
-        .iter()
-        .map(|t| format!("'{t}'"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!(
-        "SELECT STRING_AGG(name + ' (' + system_type_name + ')', ', ') \
-         FROM sys.dm_exec_describe_first_result_set(N'{}', NULL, 0) \
-         WHERE system_type_name IN ({types})",
-        query.replace('\'', "''")
-    )
-}
-
 fn catalog_decimal_to_params(precision: u8, scale: u8) -> Option<(u8, i8)> {
     if precision == 0 || precision > 38 {
         return None;
@@ -716,7 +680,6 @@ impl Source for MssqlSource {
         // `OFFSET 0 ROWS FETCH NEXT n ROWS ONLY` clause (T-SQL has no `LIMIT`).
         let built = build_export_query(request, crate::config::SourceType::Mssql);
         let sql = built.sql.clone();
-        self.refuse_undecodable_types(&sql)?;
         let overrides = request.column_overrides.clone();
         // Stream the result one Arrow batch at a time (peak RSS ≈ one batch,
         // independent of `chunk_size`) through the shared `AdaptiveBatchController`
@@ -939,7 +902,6 @@ impl Source for MssqlSource {
         // Recover declared decimal precision/scale from `sys.columns` — the same
         // catalog hint the full-export path applies — so a scan-free probe (CDC
         // resolve, `rivet check`) resolves decimals identically to a batch export.
-        self.refuse_undecodable_types(query)?;
         let decimal_hints = self.mssql_decimal_catalog_hints_opt(query);
         // Zero-row wrapper so the server returns column metadata without a scan.
         let wrapped = format!("SELECT * FROM ({query}) AS _rivet_q WHERE 1 = 0");
@@ -1629,13 +1591,6 @@ mod tests {
             parse("SELECT 'from x', amount FROM ledger WHERE note = 'paid from cash'"),
             Some(("dbo".into(), "ledger".into()))
         );
-    }
-
-    #[test]
-    fn the_undecodable_type_probe_quotes_the_query_and_names_sql_variant() {
-        let sql = super::undecodable_columns_probe("SELECT * FROM t WHERE s = 'x'");
-        assert!(sql.contains("N'SELECT * FROM t WHERE s = ''x'''"), "{sql}");
-        assert!(sql.contains("IN ('sql_variant')"), "{sql}");
     }
 
     #[test]

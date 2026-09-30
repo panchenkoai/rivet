@@ -814,4 +814,16 @@ exclude_re = [
     # the guard is what makes the branch equivalent, and it stays because `pairs`
     # is built one entry per captured table (2026-09-20).
     "replace \\+ with \\* in same_leaf_typed_pair",
+    # PostgreSQL batch cells read from a live `tokio_postgres::Row`, which no offline test can
+    # build. Each stub is killed by a live test (RED-checked 2026-09-30): `pg_cell` -> Ok(None)
+    # by `a_bool_override_on_an_integer_column_is_refused_by_name`; `pg_int_cell` -> Ok(None)
+    # by `an_int2_override_on_an_int8_value_that_does_not_fit_is_refused_by_name`; the side-A
+    # `int16`/`int32`/`int64` stubs by `an_int2_and_int4_column_widened_by_an_int8_override_round_trip_exactly`
+    # (its native int2/int4 and overridden int8 columns fail the always-on value checksum). The pure parts, `PgInt`'s
+    # decode and `side_a`, are unit-tested in postgres/arrow_convert.rs.
+    "replace pg_cell -> Result<Option<T>> with Ok\\(None\\)",
+    "replace pg_int_cell -> Result<Option<T>> with Ok\\(None\\)",
+    "replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::int16 -> Option<i16>",
+    "replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::int32 -> Option<i32>",
+    "replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::int64 -> Option<i64>",
 ]
