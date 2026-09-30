@@ -411,33 +411,6 @@ fn cells_sql(dir: &Path, cdc: bool) -> String {
 
 #[test]
 #[ignore = "live: requires the oracle service with LogMiner prerequisites"]
-fn oracle_cdc_full_type_matrix_matches_batch() {
-    let _serial = cross_process_serial("oracle_cdc");
-    let d = tempfile::tempdir().unwrap();
-    let t = type_table();
-    let ckpt = d.path().join("cdc.ckpt");
-    rig(&t, &ckpt, &d.path().join("anchor")).run_ok();
-    seed_types(t.name());
-    let cdc_out = d.path().join("cdc");
-    rig(&t, &ckpt, &cdc_out).run_ok();
-    let batch = Rig::oracle_batch(t.name());
-    batch.run_ok();
-    let cdc = duckdb_run_sql_json(&cells_sql(&cdc_out, true));
-    let batch = duckdb_run_sql_json(&cells_sql(&batch.out_dir(), false));
-    assert_eq!(
-        cdc["rows"].as_array().map(Vec::len),
-        Some(4),
-        "every seeded row is captured"
-    );
-    assert_eq!(
-        (&cdc["columns"], &cdc["rows"]),
-        (&batch["columns"], &batch["rows"]),
-        "each captured value equals the batch export's"
-    );
-}
-
-#[test]
-#[ignore = "live: requires the oracle service with LogMiner prerequisites"]
 fn oracle_cdc_non_utc_session_matches_batch() {
     // The capture user's own logon sets every rendering knob off its default; the
     // adapter's session pin must win, or dates, numbers and zones decode wrong.

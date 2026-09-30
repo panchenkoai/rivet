@@ -836,13 +836,13 @@ exclude_re = [
     "replace < with <= in timestamp_text",
     # Side A's `PgCellSource::utf8` reads a live `tokio_postgres::Row`. Its stubs and the TEXT
     # and INTERVAL arm deletions fail the value checksum in
-    # `pg_cdc_full_type_matrix_matches_batch` (a batch export of every PG type); the UUID arm
+    # `postgres_batch_and_cdc_deliver_every_ledger_row_alike` (a batch export of every PG ledger type); the UUID arm
     # (reached only under a `string` override) fails
     # `a_uuid_column_overridden_to_string_lands_as_postgres_own_text` (RED-checked 2026-09-30).
     "replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::utf8 -> Option<Cow<'_, \\[u8\\]>>",
     "delete match arm .* in <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::utf8",
     # PgCellSource::utf8's enum guard: `false` fails the checksum in
-    # `pg_cdc_full_type_matrix_matches_batch` (RED-checked); `true` is equivalent — no Utf8-typed
+    # `postgres_batch_and_cdc_deliver_every_ledger_row_alike` (RED-checked); `true` is equivalent — no Utf8-typed
     # PostgreSQL column reaches the fallthrough (every Utf8 wire type has its own arm), and one
     # that did would read the same text through AnyAsString.
     "replace match guard matches!\\(t.kind\\(\\), Kind::Enum\\(_\\)\\) with (true|false) in <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::utf8",

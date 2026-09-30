@@ -144,7 +144,10 @@ fn keyed(rows: Vec<Vec<Option<String>>>) -> Cells {
                 .expect("integer id");
             (id, r)
         })
-        .collect()
+        .fold(Cells::new(), |mut m, (id, r)| {
+            assert!(m.insert(id, r).is_none(), "id {id} read twice");
+            m
+        })
 }
 
 /// DuckDB's rows of `select` over the parquet parts under the container dir `dir`.
@@ -168,8 +171,8 @@ fn duck(select: &str, dir: &str, filter: &str) -> Cells {
     )
 }
 
-/// Arrow's own display of `cols` in every part under `dir` (updates only when `updates`), keyed by id.
-fn arrow_cells(dir: &Path, cols: &[String], updates: bool) -> Cells {
+/// Arrow's own display of `cols` in every part under `dir` (only rows whose `__op` is in `ops`, when given), keyed by id.
+fn arrow_cells(dir: &Path, cols: &[String], ops: Option<&[&str]>) -> Cells {
     use arrow::util::display::array_value_to_string;
     let mut out = Cells::new();
     for b in read_all_parts(dir) {
@@ -179,13 +182,13 @@ fn arrow_cells(dir: &Path, cols: &[String], updates: bool) -> Cells {
                 .unwrap_or_else(|| panic!("{name} missing under {}", dir.display()));
             b.column(i).clone()
         };
-        let (ids, op) = (col("id"), updates.then(|| col("__op")));
+        let (ids, op) = (col("id"), ops.map(|_| col("__op")));
         let vals: Vec<_> = cols.iter().map(|c| col(c)).collect();
         for r in 0..b.num_rows() {
-            if op
-                .as_ref()
-                .is_some_and(|o| array_value_to_string(o, r).unwrap() != "update")
-            {
+            if op.as_ref().is_some_and(|o| {
+                !ops.unwrap()
+                    .contains(&array_value_to_string(o, r).unwrap().as_str())
+            }) {
                 continue;
             }
             let id = canon_num(&array_value_to_string(&ids, r).unwrap())
@@ -195,7 +198,11 @@ fn arrow_cells(dir: &Path, cols: &[String], updates: bool) -> Cells {
                 .iter()
                 .map(|a| (!a.is_null(r)).then(|| array_value_to_string(a, r).unwrap()))
                 .collect();
-            out.insert(id, row);
+            assert!(
+                out.insert(id, row).is_none(),
+                "id {id} twice under {}",
+                dir.display()
+            );
         }
     }
     out
@@ -296,10 +303,11 @@ fn seed(lg: &Ledger, st: &Stand) -> i64 {
     for id in n + 1..=2 * n {
         (st.exec)(&format!("INSERT INTO {t} (id) VALUES ({id})"));
     }
+    (st.settle)(2 * n);
     n
 }
 
-/// One UPDATE per row rewrites every column: rows n+1..=2n take the samples, row 1 goes NULL.
+/// After the snapshot: one UPDATE per row rewrites every column (rows n+1..=2n take the samples, row 1 goes NULL), and rows 2n+1..=3n insert them again.
 fn rewrite(lg: &Ledger, st: &Stand, n: i64) {
     let (cols, t) = (columns(&lg.batch), &st.table);
     let set = |vals: &[String]| -> String {
@@ -318,11 +326,19 @@ fn rewrite(lg: &Ledger, st: &Stand, n: i64) {
     }
     let nulls = vec!["NULL".to_string(); cols.len()];
     (st.exec)(&format!("UPDATE {t} SET {} WHERE id = 1", set(&nulls)));
-    (st.settle)(2 * n + 2 * (n + 1));
+    for i in 0..n as usize {
+        (st.exec)(&format!(
+            "INSERT INTO {t} (id, {}) VALUES ({}, {})",
+            cols.join(", "),
+            2 * n + 1 + i as i64,
+            values(&lg.batch, i).join(", ")
+        ));
+    }
+    (st.settle)(2 * n + 2 * (n + 1) + n);
 }
 
-/// Every ledger row, read back by DuckDB (and Arrow) from both modes, against the ledger and the source; panics listing every failure.
-fn duckdb_ledger_verdict(lg: &Ledger, st: &Stand, n: i64) {
+/// Every ledger row, read back by DuckDB (and Arrow) from both modes, against the ledger and the source; returns every violation.
+fn duckdb_ledger_verdict(lg: &Ledger, st: &Stand, n: i64) -> Vec<String> {
     let (cols, t) = (columns(&lg.batch), &st.table);
     let (bdir, cdir) = (st.host.join("batch"), st.host.join("cdc"));
     let (bs, cs, ss) = (schema(&bdir), schema(&cdir), schema(&cdir.join("snapshot")));
@@ -341,7 +357,7 @@ fn duckdb_ledger_verdict(lg: &Ledger, st: &Stand, n: i64) {
     let cc = format!("{}/cdc", st.container);
     let b_raw = duck(&raw, &cb, "");
     let b_txt = duck(&rendered(&lg.batch), &cb, "");
-    let upd = "WHERE __op = 'update'";
+    let upd = "WHERE __op IN ('update', 'insert')";
     let c_raw = duck(&raw, &cc, upd);
     let c_txt = duck(&rendered(&lg.cdc), &cc, upd);
     let s_raw = duck(&raw, &format!("{cc}/snapshot"), "");
@@ -363,8 +379,8 @@ fn duckdb_ledger_verdict(lg: &Ledger, st: &Stand, n: i64) {
     };
     let (src_b, src_c) = (source(&lg.batch), source(&lg.cdc));
     let (a_b, a_c) = (
-        arrow_cells(&bdir, &cols, false),
-        arrow_cells(&cdir, &cols, true),
+        arrow_cells(&bdir, &cols, None),
+        arrow_cells(&cdir, &cols, Some(&["update", "insert"])),
     );
     let text = |r: &Row, duck: &Cells, arrow: &Cells, id: i64, k: usize| {
         let cells = if r.render.parquet.as_deref() == Some(ARROW) {
@@ -375,16 +391,16 @@ fn duckdb_ledger_verdict(lg: &Ledger, st: &Stand, n: i64) {
         canon(&cells[&id][k], &r.render.canon)
     };
 
-    let captured: Vec<i64> = std::iter::once(1).chain(n + 1..=2 * n).collect();
+    let captured: Vec<i64> = std::iter::once(1).chain(n + 1..=3 * n).collect();
     assert_eq!(
         c_raw.keys().copied().collect::<Vec<_>>(),
         captured,
-        "{}: one captured update per rewritten row",
+        "{}: one captured change per rewritten or inserted row",
         st.engine
     );
     assert_eq!(
         b_raw.len() as i64,
-        2 * n,
+        3 * n,
         "{}: the batch export holds every row",
         st.engine
     );
@@ -448,13 +464,7 @@ fn duckdb_ledger_verdict(lg: &Ledger, st: &Stand, n: i64) {
             }
         }
     }
-    assert!(
-        bad.is_empty(),
-        "{}: {} ledger violations:\n{}",
-        st.engine,
-        bad.len(),
-        bad.join("\n")
-    );
+    bad
 }
 
 /// Rows 1..=n of the batch-refused table hold the samples; returns n.
@@ -475,13 +485,13 @@ fn seed_refused(rows: &[Row], st: &Stand) -> usize {
     n
 }
 
-/// Batch refuses every row by column (`batch_of` exports one column); CDC delivers each as its cdc twin declares, equal to the source.
+/// Batch refuses every row by column (`batch_of` exports one column); CDC delivers each as its cdc twin declares, equal to the source; returns every violation.
 fn duckdb_refused_verdict(
     rows: &[(Row, Row)],
     st: &Stand,
     n: usize,
     batch_of: &dyn Fn(&str) -> Rig,
-) {
+) -> Vec<String> {
     let cols = columns(&rows.iter().map(|(b, _)| b.clone()).collect::<Vec<_>>());
     let cdir = st.host.join("cdc");
     let cs = schema(&cdir);
@@ -550,13 +560,7 @@ fn duckdb_refused_verdict(
             }
         }
     }
-    assert!(
-        bad.is_empty(),
-        "{}: {} ledger violations on batch-refused rows:\n{}",
-        st.engine,
-        bad.len(),
-        bad.join("\n")
-    );
+    bad
 }
 
 /// The `CREATE TABLE` column list for the ledger rows after `id_ddl`.
@@ -657,7 +661,13 @@ fn postgres_batch_and_cdc_deliver_every_ledger_row_alike() {
     rewrite(&lg, &st, n);
     st.cdc.run_ok();
     st.batch.run_ok();
-    duckdb_ledger_verdict(&lg, &st, n);
+    let bad = duckdb_ledger_verdict(&lg, &st, n);
+    assert!(
+        bad.is_empty(),
+        "{} ledger violations:\n{}",
+        bad.len(),
+        bad.join("\n")
+    );
 
     let refused_batch: Vec<Row> = refused.iter().map(|(b, _)| b.clone()).collect();
     let (st, _g2) = stand(&refused_batch, "ledger_pg_refused", false);
@@ -665,12 +675,18 @@ fn postgres_batch_and_cdc_deliver_every_ledger_row_alike() {
     let n = seed_refused(&refused_batch, &st);
     st.cdc.run_ok();
     let t = st.table.clone();
-    duckdb_refused_verdict(&refused, &st, n, &|col| {
+    let bad = duckdb_refused_verdict(&refused, &st, n, &|col| {
         Rig::pg_batch(&t)
             .export_named(&format!("{t}_{col}"))
             .source_url(POSTGRES_CDC_URL)
             .query(&format!("SELECT id, {col} FROM {t}"))
     });
+    assert!(
+        bad.is_empty(),
+        "{} violations on batch-refused rows:\n{}",
+        bad.len(),
+        bad.join("\n")
+    );
 }
 
 #[test]
@@ -733,7 +749,13 @@ fn mysql_batch_and_cdc_deliver_every_ledger_row_alike() {
     rewrite(&lg, &st, n);
     st.cdc.run_ok();
     st.batch.run_ok();
-    duckdb_ledger_verdict(&lg, &st, n);
+    let bad = duckdb_ledger_verdict(&lg, &st, n);
+    assert!(
+        bad.is_empty(),
+        "{} ledger violations:\n{}",
+        bad.len(),
+        bad.join("\n")
+    );
 }
 
 #[test]
@@ -777,7 +799,13 @@ fn mssql_batch_and_cdc_deliver_every_ledger_row_alike() {
     rewrite(&lg, &st, n);
     st.cdc.run_ok();
     st.batch.run_ok();
-    duckdb_ledger_verdict(&lg, &st, n);
+    let bad = duckdb_ledger_verdict(&lg, &st, n);
+    assert!(
+        bad.is_empty(),
+        "{} ledger violations:\n{}",
+        bad.len(),
+        bad.join("\n")
+    );
 }
 
 #[cfg(feature = "oracle")]
@@ -813,5 +841,11 @@ fn oracle_batch_and_cdc_deliver_every_ledger_row_alike() {
     rewrite(&lg, &st, n);
     st.cdc.run_ok();
     st.batch.run_ok();
-    duckdb_ledger_verdict(&lg, &st, n);
+    let bad = duckdb_ledger_verdict(&lg, &st, n);
+    assert!(
+        bad.is_empty(),
+        "{} ledger violations:\n{}",
+        bad.len(),
+        bad.join("\n")
+    );
 }

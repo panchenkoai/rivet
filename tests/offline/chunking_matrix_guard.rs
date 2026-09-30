@@ -292,12 +292,15 @@ const MATRICES: &[(&str, usize)] = &[
     // CDC per-type value fidelity — the change-stream sibling of type-fidelity, the
     // axis where findings #2 (MSSQL MONEY>2^53), #3 (MySQL ENUM cross-db) and #4
     // (BIT(64) bit 63) lived: batch correct, CDC/edge sibling not. Workhorse cells
-    // cite each engine's *_cdc_full_type_matrix_matches_batch (ArrayData equality
-    // CDC==batch); edge scenarios cite the range-specific tests. Row axis is
+    // cite each engine's ledger-generated *_batch_and_cdc_deliver_every_ledger_row_alike
+    // (CDC==batch and both==source via DuckDB); edge scenarios cite the range-specific
+    // tests. Row axis is
     // GENERATIVELY complete over RivetType (matrix_cdc_type_rows_cover_every_rivet_type).
     // 0 gaps: every (type × engine) cell is a test or a justified n/a.
     // Raised 0 -> 11 (2026-09-26): the Oracle column's honest gaps (batch-only phase 1).
-    ("docs/cdc-type-fidelity-matrix.yaml", 11),
+    // Lowered 11 -> 5 (2026-09-30): the Oracle integer/float/decimal/date-time/text/binary
+    // cells are graded independently by oracle_batch_and_cdc_deliver_every_ledger_row_alike.
+    ("docs/cdc-type-fidelity-matrix.yaml", 5),
     // Load spec (ADR-0034) — `load.partition` form × granularity × warehouse target. The
     // BigQuery form cells are live (run + load + tables.get per cell); Snowflake cells are
     // SQL-text proofs (no live Snowflake from this stand); duckdb/clickhouse are `na`. 0 gaps.
@@ -376,8 +379,8 @@ const ORACLE_STRENGTHS: &[&str] = &["independent", "differential", "self", "fail
 /// raise it — the ratchet drives the shared-decode-blind self-oracle debt to 0.
 const ORACLE_TRACKED: &[(&str, usize)] = &[
     // CDC value-decode — the differential debt was ground to 0: every (type × SQL
-    // engine) cell is now an INDEPENDENT DuckDB-vs-source oracle (via the three
-    // *_cdc_typed_values_match_source_via_duckdb_not_batch tests) or a fail_loud/na,
+    // engine) cell is now an INDEPENDENT DuckDB-vs-source oracle (via the ledger-generated
+    // *_batch_and_cdc_deliver_every_ledger_row_alike tests) or a fail_loud/na,
     // never the shared-decode *_matches_batch self-oracle. Ceiling 0: any new
     // differential CDC-type cell fails CI.
     ("docs/cdc-type-fidelity-matrix.yaml", 0),

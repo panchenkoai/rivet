@@ -36,28 +36,28 @@ const ROW_BOUND: &[(&str, &str)] = &[
     (
         "Date",
         "needs a Row (tiberius decodes it via try_get) — live: \
-         mssql_cdc_full_type_matrix_matches_batch, RED \"column d: CDC differs from the \
+         mssql_batch_and_cdc_deliver_every_ledger_row_alike, RED \"column d: CDC differs from the \
          batch export\"",
     ),
     (
         "Time",
-        "needs a Row — live: mssql_cdc_full_type_matrix_matches_batch, RED \"column t\"",
+        "needs a Row — live: mssql_batch_and_cdc_deliver_every_ledger_row_alike, RED \"column t\"",
     ),
     (
         "DateTime",
         "needs a Row; shares an arm with DateTime2 and SmallDateTime, and the live \
          fixture carries all three as SEPARATE columns — live: \
-         mssql_cdc_full_type_matrix_matches_batch, RED \"column dt2\"",
+         mssql_batch_and_cdc_deliver_every_ledger_row_alike, RED \"column dt2\"",
     ),
     (
         "DateTime2",
         "needs a Row; shares DateTime's arm, covered as its own column dt2 — live: \
-         mssql_cdc_full_type_matrix_matches_batch",
+         mssql_batch_and_cdc_deliver_every_ledger_row_alike",
     ),
     (
         "SmallDateTime",
         "needs a Row; shares DateTime's arm, covered as its own column sdt — live: \
-         mssql_cdc_full_type_matrix_matches_batch",
+         mssql_batch_and_cdc_deliver_every_ledger_row_alike",
     ),
     (
         "DateTimeOffset",
@@ -172,7 +172,10 @@ fn a_row_bound_variant_the_mapper_dropped_must_leave_the_list() {
 fn every_row_bound_entry_names_the_live_test_that_covers_it() {
     let bad: Vec<&str> = ROW_BOUND
         .iter()
-        .filter(|(_, why)| !why.contains("live:") || !why.contains("mssql_cdc_"))
+        .filter(|(_, why)| {
+            !why.contains("live:")
+                || !(why.contains("mssql_cdc_") || why.contains("mssql_batch_and_cdc_"))
+        })
         .map(|(v, _)| *v)
         .collect();
     assert!(

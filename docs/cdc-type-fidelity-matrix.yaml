@@ -6,10 +6,12 @@
 # (BIT(64) bit 63) lived: the batch path was correct, the CDC/edge sibling was not.
 # Same shape + drift-guard as the other ledgers. Cell = { test } | { gap } | { na }.
 #
-# The workhorse cells cite each engine's `*_cdc_full_type_matrix_matches_batch`
-# test (a comprehensive type table exported BOTH ways, asserted equal by ArrayData
-# — type AND value). The edge scenarios (money/enum/bit) cite the dedicated tests
-# that cover the value RANGE the full-type tables use small, safe values for.
+# The workhorse cells cite each engine's `<engine>_batch_and_cdc_deliver_every_ledger_row_alike`
+# (tests/live/live_cdc_type_parity.rs): one table per engine built from the rows of
+# docs/type-capability-matrix.yaml, exported both ways, each column compared across
+# modes and against the source's own rendering through DuckDB. The edge scenarios
+# (money/enum/bit) cite the dedicated tests that cover the value RANGE the ledger's
+# samples keep small.
 #
 # Mongo is a JSON-blob model: a change document rides a verbatim extended-JSON
 # `document` column, so per-column Parquet type fidelity is n/a EXCEPT where a
@@ -21,8 +23,8 @@
 # RivetType enum): a new type cannot ship without a CDC-fidelity row.
 #
 # ORACLE STRENGTH (matrix_oracle_strength_ratchet): a `test:` cell may carry
-# `oracle: independent|fail_loud|differential|self`. A bare `*_cdc_full_type_matrix_
-# matches_batch` cell is a DIFFERENTIAL self-oracle (CDC decode vs BATCH decode) —
+# `oracle: independent|fail_loud|differential|self`. A cell that only compares
+# CDC to batch is a DIFFERENTIAL self-oracle (CDC decode vs BATCH decode) —
 # it passes a bug both siblings SHARE (the class Form A misses). `oracle:
 # independent` marks a cell verified OUTSIDE rivet's decode family (a DuckDB /
 # source-vs-dest re-read, a hard-coded literal). An un-annotated test cell counts
@@ -34,43 +36,43 @@ engines: [postgres, mysql, mssql, mongo, oracle]
 scenarios:
   - id: type_boolean
     what: "boolean rides through the change stream as the same Arrow Boolean as batch"
-    postgres: { test: pg_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
-    mysql:   { test: mysql_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
-    mssql:   { test: mssql_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
+    postgres: { test: postgres_batch_and_cdc_deliver_every_ledger_row_alike, oracle: independent }
+    mysql:   { test: mysql_batch_and_cdc_deliver_every_ledger_row_alike, oracle: independent }
+    mssql:   { test: mssql_batch_and_cdc_deliver_every_ledger_row_alike, oracle: independent }
     mongo:    { na: "boolean rides the verbatim document blob, not a typed column" }
     oracle:   { gap: "not captured in the preview: a BOOLEAN column is refused by name at open (ColKind::of, column_kinds_cover_the_preview_types_and_refuse_the_rest), while batch exports it" }
 
   - id: type_integer_families
     what: "int16/32/64 + unsigned 64 (incl. BIGINT UNSIGNED > i64::MAX) survive CDC. MySQL cell is INDEPENDENT (DuckDB re-read vs the source literal), not a batch-differential"
-    postgres: { test: pg_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
-    mysql:    { test: mysql_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
-    mssql:    { test: mssql_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
+    postgres: { test: postgres_batch_and_cdc_deliver_every_ledger_row_alike, oracle: independent }
+    mysql:    { test: mysql_batch_and_cdc_deliver_every_ledger_row_alike, oracle: independent }
+    mssql:    { test: mssql_batch_and_cdc_deliver_every_ledger_row_alike, oracle: independent }
     mongo:    { test: mongo_cdc_change_stream_renders_tricky_bson_verbatim_like_batch, oracle: independent }
-    oracle:   { gap: "no independent Oracle cell: oracle_cdc_full_type_matrix_matches_batch is a DIFFERENTIAL self-oracle (CDC==batch; this file's weak-oracle ceiling is 0), and the literal unit test an_integral_number_is_an_int_and_a_fraction_stays_exact_text stops at decode, before the sink" }
+    oracle:   { test: oracle_batch_and_cdc_deliver_every_ledger_row_alike, oracle: independent }
 
   - id: type_float
     what: "real/double through CDC — hostile floats (NaN/Inf) match batch or fail loud"
-    postgres: { test: pg_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
-    mysql:   { test: mysql_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
-    mssql:   { test: mssql_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
+    postgres: { test: postgres_batch_and_cdc_deliver_every_ledger_row_alike, oracle: independent }
+    mysql:   { test: mysql_batch_and_cdc_deliver_every_ledger_row_alike, oracle: independent }
+    mssql:   { test: mssql_batch_and_cdc_deliver_every_ledger_row_alike, oracle: independent }
     mongo:    { na: "float rides the verbatim document blob, not a typed column" }
-    oracle:   { gap: "no independent Oracle cell: oracle_cdc_full_type_matrix_matches_batch (NaN/Inf rows) is a DIFFERENTIAL self-oracle (CDC==batch), and floats_raw_and_text_decode_as_mined stops at decode, before the sink" }
+    oracle:   { test: oracle_batch_and_cdc_deliver_every_ledger_row_alike, oracle: independent }
 
   - id: type_decimal
     what: "decimal(p,s) precision + scale through CDC (MySQL cell INDEPENDENT: DuckDB re-read vs source literal); MSSQL MONEY past the f64-exact 2^53 range fails loud, not falsely-exact (finding #2)"
-    postgres: { test: pg_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
-    mysql:    { test: mysql_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
+    postgres: { test: postgres_batch_and_cdc_deliver_every_ledger_row_alike, oracle: independent }
+    mysql:    { test: mysql_batch_and_cdc_deliver_every_ledger_row_alike, oracle: independent }
     mssql:    { test: cdc_money_past_f64_exact_range_fails_loud_not_a_falsely_exact_decimal, oracle: fail_loud }
     mongo:    { test: mongo_cdc_change_stream_renders_tricky_bson_verbatim_like_batch, oracle: independent }
-    oracle:   { gap: "no independent Oracle cell: oracle_cdc_full_type_matrix_matches_batch is a DIFFERENTIAL self-oracle (CDC==batch), and numbers_read_back_in_the_batch_exports_plain_form stops at decode, before the sink" }
+    oracle:   { test: oracle_batch_and_cdc_deliver_every_ledger_row_alike, oracle: independent }
 
   - id: type_date_time
     what: "date + time-of-day survive the change stream with the batch Arrow types"
-    postgres: { test: pg_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
-    mysql:   { test: mysql_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
-    mssql:    { test: mssql_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
+    postgres: { test: postgres_batch_and_cdc_deliver_every_ledger_row_alike, oracle: independent }
+    mysql:   { test: mysql_batch_and_cdc_deliver_every_ledger_row_alike, oracle: independent }
+    mssql:    { test: mssql_batch_and_cdc_deliver_every_ledger_row_alike, oracle: independent }
     mongo:    { na: "BSON dates ride the verbatim document blob; the extJSON test pins the mechanism" }
-    oracle:   { gap: "no independent Oracle cell: oracle_cdc_full_type_matrix_matches_batch is a DIFFERENTIAL self-oracle (CDC==batch), and timestamps_keep_microseconds_and_an_offset_moves_to_utc stops at decode, before the sink" }
+    oracle:   { test: oracle_batch_and_cdc_deliver_every_ledger_row_alike, oracle: independent }
 
   - id: type_timestamp_tz
     what: "naive vs tz-aware timestamp — CDC preserves the UTC instant under a non-default session/DB timezone (the +9h render-time trap)"
@@ -82,39 +84,39 @@ scenarios:
 
   - id: type_text
     what: "varchar/char/text through CDC — value + encoding verbatim"
-    postgres: { test: pg_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
-    mysql:   { test: mysql_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
-    mssql:    { test: mssql_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
+    postgres: { test: postgres_batch_and_cdc_deliver_every_ledger_row_alike, oracle: independent }
+    mysql:   { test: mysql_batch_and_cdc_deliver_every_ledger_row_alike, oracle: independent }
+    mssql:    { test: mssql_batch_and_cdc_deliver_every_ledger_row_alike, oracle: independent }
     mongo:    { test: mongo_cdc_change_stream_renders_tricky_bson_verbatim_like_batch, oracle: independent }
-    oracle:   { gap: "no independent Oracle cell: oracle_cdc_full_type_matrix_matches_batch is a DIFFERENTIAL self-oracle (CDC==batch), and floats_raw_and_text_decode_as_mined stops at decode, before the sink" }
+    oracle:   { test: oracle_batch_and_cdc_deliver_every_ledger_row_alike, oracle: independent }
 
   - id: type_binary
     what: "bytea/varbinary/binary through CDC as the same bytes"
-    postgres: { test: pg_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
-    mysql:   { test: mysql_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
-    mssql:    { test: mssql_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
+    postgres: { test: postgres_batch_and_cdc_deliver_every_ledger_row_alike, oracle: independent }
+    mysql:   { test: mysql_batch_and_cdc_deliver_every_ledger_row_alike, oracle: independent }
+    mssql:    { test: mssql_batch_and_cdc_deliver_every_ledger_row_alike, oracle: independent }
     mongo:    { na: "binary rides the verbatim document blob (BSON Binary → extJSON)" }
-    oracle:   { gap: "no independent Oracle cell: oracle_cdc_full_type_matrix_matches_batch (RAW) is a DIFFERENTIAL self-oracle (CDC==batch), and floats_raw_and_text_decode_as_mined stops at decode, before the sink" }
+    oracle:   { test: oracle_batch_and_cdc_deliver_every_ledger_row_alike, oracle: independent }
 
   - id: type_json
     what: "json/jsonb content fidelity through the change stream"
-    postgres: { test: pg_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
-    mysql:   { test: mysql_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
+    postgres: { test: postgres_batch_and_cdc_deliver_every_ledger_row_alike, oracle: independent }
+    mysql:   { test: mysql_batch_and_cdc_deliver_every_ledger_row_alike, oracle: independent }
     mssql:    { na: "SQL Server has no native JSON type; the CDC matrix fixture omits it by design" }
     mongo:    { test: mongo_cdc_change_stream_renders_tricky_bson_verbatim_like_batch, oracle: independent }
     oracle:   { gap: "not captured in the preview: a JSON column is refused by name at open (column_kinds_cover_the_preview_types_and_refuse_the_rest), while batch exports it" }
 
   - id: type_uuid
     what: "uuid — PG uuid / MySQL CHAR(36) / MSSQL uniqueidentifier → canonical value through CDC"
-    postgres: { test: pg_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
-    mysql:    { test: mysql_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
-    mssql:   { test: mssql_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
+    postgres: { test: postgres_batch_and_cdc_deliver_every_ledger_row_alike, oracle: independent }
+    mysql:    { test: mysql_batch_and_cdc_deliver_every_ledger_row_alike, oracle: independent }
+    mssql:   { test: mssql_batch_and_cdc_deliver_every_ledger_row_alike, oracle: independent }
     mongo:    { na: "a BSON uuid rides the verbatim document blob, not a typed column" }
     oracle:   { na: "Oracle has no UUID type (SYS_GUID() is RAW(16) — type_binary)" }
 
   - id: type_enum
     what: "enum label (not the wire index) through CDC — incl. a CROSS-DATABASE MySQL capture enriched from the table's own schema (finding #3)"
-    postgres: { test: pg_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
+    postgres: { test: postgres_batch_and_cdc_deliver_every_ledger_row_alike, oracle: independent }
     mysql:    { test: cdc_cross_database_enum_enriches_from_the_tables_own_schema, oracle: independent }
     mssql:    { na: "SQL Server has no ENUM type" }
     mongo:    { na: "no enum type; a string rides the document blob" }
@@ -123,7 +125,7 @@ scenarios:
   - id: type_set
     what: "MySQL SET — the comma-joined labels (not the raw bitmask) through CDC"
     postgres: { na: "PostgreSQL has no SET type" }
-    mysql:   { test: mysql_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
+    mysql:   { test: mysql_batch_and_cdc_deliver_every_ledger_row_alike, oracle: independent }
     mssql:    { na: "SQL Server has no SET type" }
     mongo:    { na: "no SET type" }
     oracle:   { na: "Oracle has no SET type" }
@@ -132,13 +134,13 @@ scenarios:
     what: "BIT(n) through CDC — BIT(1) boolean, BIT(n>1) integer; a BIT(64) with bit 63 set fails loud, never a silent NULL (finding #4)"
     postgres: { na: "PG bit/varbit is not in the CDC type fixture; covered as a follow-up" }
     mysql:    { test: build_column_narrows_int_and_fails_loud_on_overflow, oracle: fail_loud }
-    mssql:   { test: mssql_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
+    mssql:   { test: mssql_batch_and_cdc_deliver_every_ledger_row_alike, oracle: independent }
     mongo:    { na: "no BIT type" }
     oracle:   { na: "Oracle has no BIT type" }
 
   - id: type_money
     what: "MSSQL MONEY/SMALLMONEY — the exact scaled value through CDC (f64-delivered by tiberius), fails loud past the 2^53-exact range (finding #2)"
-    postgres: { na: "PostgreSQL money is discouraged and not in the CDC fixture" }
+    postgres: { na: "PostgreSQL money has no scaled-value path: CDC carries the server text and batch refuses it (the ledger's diverging money row)" }
     mysql:    { na: "MySQL has no MONEY type" }
     mssql:    { test: mssql_money_values_survive_batch_and_cdc, oracle: independent }
     mongo:    { na: "no MONEY type" }
@@ -146,7 +148,7 @@ scenarios:
 
   - id: type_interval
     what: "PostgreSQL interval — canonical ISO-8601 text through CDC, identical to batch"
-    postgres: { test: pg_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
+    postgres: { test: postgres_batch_and_cdc_deliver_every_ledger_row_alike, oracle: independent }
     mysql:    { na: "MySQL has no INTERVAL column type" }
     mssql:    { na: "SQL Server has no INTERVAL type" }
     mongo:    { na: "no interval type" }
