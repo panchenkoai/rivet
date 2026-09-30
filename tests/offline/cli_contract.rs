@@ -421,3 +421,23 @@ fn version_names_the_commit_beside_the_semver() {
     );
     assert_ne!(sha, "", "{out}");
 }
+
+/// A reader that closes the pipe (`rivet … | head`, `q` in a pager) ends the command
+/// with 141 and nothing on stderr — not a panic report and a backtrace hint.
+#[cfg(unix)]
+#[test]
+fn a_closed_stdout_ends_the_command_quietly_with_141() {
+    use std::process::Stdio;
+    let mut child = Command::new(RIVET_BIN)
+        .args(["schema", "config"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn rivet binary");
+    // The read end is gone before the child prints its first byte.
+    drop(child.stdout.take());
+    let out = child.wait_with_output().expect("wait");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(141), "stderr:\n{stderr}");
+    assert_eq!(stderr, "", "a closed pipe is not worth a panic report");
+}

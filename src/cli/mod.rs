@@ -22,8 +22,34 @@ mod validate;
 pub use args::parse_cli;
 pub use dispatch::dispatch;
 
+/// Exit status of a command whose reader closed its stdout: 128 + SIGPIPE, what a shell reports for `yes | head`.
+const CLOSED_STDOUT_EXIT: i32 = 141;
+
+/// Whether a panic message is std's `print!` failing on a closed pipe (EPIPE is 32 on Linux and macOS).
+fn is_closed_stdout_panic(msg: &str) -> bool {
+    msg.contains("failed printing to stdout") && msg.contains("os error 32")
+}
+
+/// End the command with 141 and no panic report when the reader of its stdout went away (`| head`, `q` in a pager).
+fn quiet_a_closed_stdout() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = info.payload();
+        let msg = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        if is_closed_stdout_panic(msg) {
+            std::process::exit(CLOSED_STDOUT_EXIT);
+        }
+        default(info)
+    }));
+}
+
 /// The `rivet` binary's entry point: parse, dispatch, report a failure, exit with its class.
 pub fn run_binary() {
+    quiet_a_closed_stdout();
     crate::redact::install_logger();
     #[cfg(feature = "oracle")]
     let _ = rustls::crypto::ring::default_provider().install_default();
