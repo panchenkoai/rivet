@@ -416,3 +416,28 @@ fn a_text_value_that_is_not_utf8_is_refused_by_name_not_a_panic() {
         "the refusal must name the column and the cause:\n{said}"
     );
 }
+
+/// A uuid column read as text through a `string` override lands as PostgreSQL's own `u::text`.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_uuid_column_overridden_to_string_lands_as_postgres_own_text() {
+    require_alive(LiveService::Postgres);
+    let table = seed_pg_override_table(
+        "u uuid NOT NULL",
+        "(1, '123e4567-e89b-12d3-a456-426614174000'), (2, 'ffffffff-0000-0000-0000-000000000001')",
+    );
+    let rig = Rig::pg_batch(table.name())
+        .export_line("columns:")
+        .export_line("  u: string");
+    rig.run_ok();
+    let want: std::collections::BTreeSet<String> = pg_connect()
+        .query(&format!("SELECT u::text FROM {}", table.name()), &[])
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_eq!(
+        duckdb_dir_parquet_distinct_strings(&rig.out_dir(), "u"),
+        want
+    );
+}
