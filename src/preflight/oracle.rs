@@ -50,6 +50,8 @@ fn diagnose_oracle(conn: &mut OracleSource, export: &ExportConfig) -> Result<Exp
         return Err(fail);
     }
 
+    override_case_fail_oracle(conn, export, base_query)?;
+
     let base_table_owned = strip_select_star_from(base_query)
         .map(std::borrow::Cow::Borrowed)
         .or_else(|| table_from_simple_query(base_query));
@@ -145,6 +147,24 @@ fn schema_fail_oracle(conn: &mut OracleSource, base_query: &str) -> Option<anyho
         return None;
     };
     Some(PreflightSchemaError::new(detail, code.to_string()).into_error())
+}
+
+/// Refuse a `columns:` key spelled in another case than the result column it means, as the run does.
+fn override_case_fail_oracle(
+    conn: &mut OracleSource,
+    export: &ExportConfig,
+    base_query: &str,
+) -> Result<()> {
+    let all = crate::plan::parse_column_overrides_pub(&export.columns, &export.name)?;
+    let keys: Vec<String> = crate::types::overrides_for_unit(&all, export.table.as_deref())
+        .into_keys()
+        .collect();
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let mappings = conn.type_mappings(base_query, &Default::default())?;
+    let names: Vec<&str> = mappings.iter().map(|m| m.column_name.as_str()).collect();
+    crate::pipeline::refuse_override_case_miss(&keys, &names)
 }
 
 /// The columns the export's strategy pages or tracks by, as written in the config.

@@ -20,20 +20,39 @@ code does not count.
 
 ## Where each engine stands (2026-09-28)
 
-### Oracle source, batch — Preview (#309)
+### Oracle source, batch — Preview (#309; GA items 2026-09-29)
 
 - **Met:**
-  - M1 (the common types; the type matrix is compared with Oracle's own rendering);
-  - M2;
+  - M1 (the type matrix and every `columns:` override decoder — `int2`, `float4`,
+    `float8` from BINARY_FLOAT, `date`, `timestamp_ns`, `timestamp_tz(_ns)`, `uuid`,
+    `text` from every type — compared with Oracle's own rendering; a WE8ISO8859P1
+    database's character types compared byte for byte with `UTL_I18N.STRING_TO_RAW`);
+  - M2 (a `date` override on a value with a time of day, a `uuid` override on a RAW
+    that is not 16 bytes and a `timestamp_ns` value past Arrow's range fail the run
+    with the column named);
+  - M3 (every batch runner hook — single, incremental, chunked range with and
+    without the checkpoint, sequential and parallel, keyset sequential and parallel —
+    faulted on Oracle, then recovered, with every declared row compared with the
+    database's own values; four Oracle faults in `dev/fault_catalog.yaml`, all
+    detected);
   - M4 (a non-default NLS session);
   - M5;
   - M6 (the `live_oracle` module and an engine-matrix cell);
-  - M7.
+  - `rivet init` scaffolds no keyset key the planner refuses
+    (`an_init_generated_config_runs_on_a_key_the_oracle_planner_cannot_seek`);
+  - a `columns:` key in the wrong case is refused by `rivet check` as well as the run.
 - **Open for GA:**
-  - `rivet init` scaffolds keys the planner refuses, on BINARY_FLOAT/DOUBLE/FLOAT/TSTZ;
-  - column overrides with no decoder pass `check` and then fail at run;
-  - override keys are case-sensitive;
-  - NVARCHAR2 on a non-Unicode character set is unmeasured;
+  - an override pairing with no decoder (a number type on a character column,
+    `decimal(p > 38, s)`) passes `check` and fails at run; the cross-engine refusal
+    is designed separately;
+  - M6's version matrix: only 23ai/26ai Free is gated. 21c XE is amd64-only and stops
+    with ORA-00442 under the arm64 stand's Rosetta emulation; 19c has no gvenzl image
+    (Oracle's registry image needs a sign-in and license acceptance);
+  - M7: a partial `--lib` run over the Oracle files (65 of 361 mutants) missed 36, all
+    in functions that need an Oracle connection except `budget_spent`, `unique_alias`
+    and `native_type`'s decision, which now have unit tests; the full and in-diff runs
+    are still to do;
+  - M8's driven run;
   - M9.
 
 ### Oracle source, CDC through LogMiner — Preview (#324, ADR-0037)

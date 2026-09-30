@@ -69,7 +69,28 @@ nor a `BINARY_FLOAT`/`BINARY_DOUBLE` or zoned `TIMESTAMP` keyset key.
 
 `columns:` override keys match the result's column names exactly; a key that
 matches one only when case is ignored (`created_at` for `CREATED_AT`) is refused
-(`RIVET_CONFIG_COLUMN_OVERRIDE_CASE`) rather than silently skipped.
+(`RIVET_CONFIG_COLUMN_OVERRIDE_CASE`) by `rivet check` and by the run, rather than
+silently skipped.
+
+### Column overrides
+
+A `columns:` override reads the Oracle column into the declared type:
+
+| Override | Oracle columns it reads |
+|---|---|
+| `int2`, `int4`, `int8`, `decimal(p ≤ 38, s)` | `NUMBER` |
+| `float4` | `NUMBER`, `BINARY_FLOAT` |
+| `float8` | `NUMBER`, `BINARY_FLOAT` (widened exactly), `BINARY_DOUBLE` |
+| `bool` | `BOOLEAN` |
+| `date` | `DATE`, `TIMESTAMP` holding midnight; a value with a time of day fails the run with the column named |
+| `timestamp`, `timestamp_tz` | `DATE`, `TIMESTAMP` (zoned ones through their UTC instant) |
+| `timestamp_ns`, `timestamp_tz_ns` | the same, keeping all nine fractional digits; a value outside 1677-09-21..2262-04-11 fails the run |
+| `binary` | `RAW`, `LONG RAW`, `BLOB` |
+| `uuid` | a 16-byte `RAW`/`BLOB`; any other length fails the run |
+| `text` | any exported column: numbers as exact text, `DATE`/`TIMESTAMP` as `SYYYY-MM-DDTHH24:MI:SS.FF6` (`FF9` when a value has sub-microsecond digits), binary floats as shortest round-trip text, `BOOLEAN` as `true`/`false`, `RAW`/`BLOB` as upper-case hex (`RAWTOHEX`) |
+
+Any other pairing (a number type on a character column, `decimal(p > 38, s)`)
+fails the run with the column named; `rivet check` does not refuse it yet.
 
 `tuning.statement_timeout_s` is enforced on the server: the driver's call timeout
 stops the query at the budget.
@@ -115,8 +136,14 @@ Parquet); dates before 1582-10-15 are not converted from Oracle's Julian calenda
   re-run stops there until you re-anchor and re-snapshot. It captures NUMBER, FLOAT, BINARY_FLOAT/DOUBLE, DATE, TIMESTAMP
   (every zone form), VARCHAR2/NVARCHAR2/CHAR/NCHAR and RAW columns and refuses a table
   with any other type by name.
-- Graded only against Oracle AI Database 23ai/26ai Free. 19c and 21c are untested.
-- `NVARCHAR2`/`NCHAR` on a database whose character set is not Unicode is untested.
+- Graded only against Oracle AI Database 23ai/26ai Free. 21c XE (amd64-only) does
+  not start under the arm64 stand's emulation (ORA-00442), and 19c has no freely
+  pullable image, so both are untested.
+- A non-Unicode database character set is live-tested on one: a WE8ISO8859P1 PDB
+  (national character set AL16UTF16). Latin-1 text in `VARCHAR2`/`CHAR`/`CLOB` and
+  non-Latin text (Cyrillic, CJK, a supplementary character) in
+  `NVARCHAR2`/`NCHAR`/`NCLOB` arrive byte-exact. Other single-byte and multi-byte
+  character sets are untested.
 - A table of exactly 1000 columns that has LOBs: the server-side empty-value flags
   would exceed Oracle's 1000-column select list, so zero-length LOBs read as NULL,
   with a warning.

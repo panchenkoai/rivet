@@ -10,7 +10,12 @@ fn ora<T>(r: Result<T, oracledb::Error>, what: &str) -> T {
 
 /// A connection as the stand's `rivet` user, session pinned to UTC.
 pub fn ora_conn() -> oracledb::Connection {
-    let rest = ORACLE_URL.strip_prefix("oracle://").unwrap();
+    ora_conn_to(ORACLE_URL)
+}
+
+/// A connection for `url` (`oracle://user:pass@host:port/service`), session pinned to UTC.
+pub fn ora_conn_to(url: &str) -> oracledb::Connection {
+    let rest = url.strip_prefix("oracle://").unwrap();
     let (cred, target) = rest.split_once('@').unwrap();
     let (user, pass) = cred.split_once(':').unwrap();
     let cfg = ora(
@@ -48,14 +53,24 @@ pub fn ora_system_exec(sql: &str) {
 
 /// Run one statement (DDL or DML) and commit.
 pub fn ora_exec(sql: &str) {
-    let conn = ora_conn();
+    ora_exec_on(ORACLE_URL, sql);
+}
+
+/// Run one statement (DDL or DML) against `url` and commit.
+pub fn ora_exec_on(url: &str, sql: &str) {
+    let conn = ora_conn_to(url);
     ora(conn.execute(sql, &[]), sql);
     ora(conn.commit(), "commit");
 }
 
 /// Every row of a query whose columns are all character types, as text.
 pub fn ora_text_rows(sql: &str) -> Vec<Vec<Option<String>>> {
-    let conn = ora_conn();
+    ora_text_rows_on(ORACLE_URL, sql)
+}
+
+/// [`ora_text_rows`] against `url`.
+pub fn ora_text_rows_on(url: &str, sql: &str) -> Vec<Vec<Option<String>>> {
+    let conn = ora_conn_to(url);
     let cursor = ora(conn.query(sql, &[]), sql);
     let n = cursor.columns().len();
     cursor
@@ -69,21 +84,26 @@ pub fn ora_text_rows(sql: &str) -> Vec<Vec<Option<String>>> {
 }
 
 /// A table named `<prefix>_<unique>` (upper-case, as Oracle stores it), dropped on scope exit.
-pub struct OracleTable(String);
+pub struct OracleTable(String, String);
 
 impl OracleTable {
     /// Create `name` with the given column list.
     pub fn create(prefix: &str, columns: &str) -> Self {
+        Self::create_on(ORACLE_URL, prefix, columns)
+    }
+
+    /// [`OracleTable::create`] in the database `url` names.
+    pub fn create_on(url: &str, prefix: &str, columns: &str) -> Self {
         let name = super::unique_name(prefix).to_uppercase();
-        ora_exec(&format!("CREATE TABLE {name} ({columns})"));
-        Self(name)
+        ora_exec_on(url, &format!("CREATE TABLE {name} ({columns})"));
+        Self(name, url.to_string())
     }
 
     /// Create a table whose catalog name is exactly `name` (quoted, so a mixed case survives); `name()` returns it quoted.
     pub fn create_exact(name: &str, columns: &str) -> Self {
         let quoted = format!("\"{name}\"");
         ora_exec(&format!("CREATE TABLE {quoted} ({columns})"));
-        Self(quoted)
+        Self(quoted, ORACLE_URL.to_string())
     }
 
     pub fn name(&self) -> &str {
@@ -93,7 +113,8 @@ impl OracleTable {
 
 impl Drop for OracleTable {
     fn drop(&mut self) {
-        if let Ok(conn) = std::panic::catch_unwind(ora_conn) {
+        let url = self.1.clone();
+        if let Ok(conn) = std::panic::catch_unwind(|| ora_conn_to(&url)) {
             let _ = conn.execute(&format!("DROP TABLE {} PURGE", self.0), &[]);
         }
     }

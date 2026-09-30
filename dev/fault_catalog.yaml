@@ -110,6 +110,9 @@
     - test: a_failed_chunk_must_fail_the_run_not_ship_a_short_export
       suite: live_suite
       needs: postgres
+    - test: every_chunked_range_runner_hook_loses_nothing_on_oracle
+      suite: live_suite
+      needs: oracle
 
 # The supplier moved into the shared FanIn; this mutant reintroduces the pre-#200 order for every parallel runner.
 - id: fan-in-bails-before-recording-parts
@@ -308,6 +311,63 @@
     - test: roast_mysql_cdc_refuses_a_truncate_instead_of_silently_diverging
       suite: live_suite
       needs: mysql-cdc
+
+# Oracle batch (M3). The runner hooks are engine-agnostic; the Oracle crash legs in
+# tests/live/live_oracle.rs (`every_*_runner_hook_loses_nothing_on_oracle`) grade them per runner.
+- id: oracle-session-sort-unpinned
+  class: "Oracle session keeps a linguistic NLS_SORT/NLS_COMP -> the keyset seek compares keys unlike ORDER BY and skips rows"
+  file: src/source/oracle/mod.rs
+  old: |2-
+        "ALTER SESSION SET NLS_SORT = BINARY",
+        "ALTER SESSION SET NLS_COMP = BINARY",
+  new: |2-
+        // NLS_SORT / NLS_COMP left to the session
+  detectors:
+    - test: a_linguistic_session_default_does_not_lose_keyset_rows
+      suite: live_suite
+      needs: oracle
+
+- id: oracle-lob-empty-flag-off
+  class: "Oracle zero-length CLOB/BLOB flag dropped -> an empty LOB silently becomes NULL"
+  file: src/source/oracle/kind.rs
+  old: |2-
+            matches!(self, Self::Clob | Self::Blob)
+  new: |2-
+            matches!(self, Self::Clob | Self::Blob) && false
+  detectors:
+    - test: oracle_full_export_matches_the_databases_own_rendering_for_every_type
+      suite: live_suite
+      needs: oracle
+    - test: a_column_named_like_the_lob_flag_does_not_collide
+      suite: live_suite
+      needs: oracle
+
+- id: oracle-sub-microsecond-cursor-refusal-off
+  class: "Oracle TIMESTAMP(7..9) incremental cursor accepted -> the saved cursor falls below its row, every run re-exports it"
+  file: src/source/oracle/mod.rs
+  old: |2-
+            if let Some(why) = sub_micro_cursor_refusal(request.incremental, &cursor_cols) {
+  new: |2-
+            if let Some(why) = sub_micro_cursor_refusal(request.incremental, &cursor_cols).filter(|_| false) {
+  detectors:
+    - test: an_incremental_cursor_on_a_nanosecond_timestamp_is_refused_before_it_re_exports
+      suite: live_suite
+      needs: oracle
+
+- id: oracle-date-override-drops-time
+  class: "Oracle `date` column override on a DATE with a time of day -> the time is silently truncated"
+  file: src/source/oracle/arrow_convert.rs
+  old: |2-
+            dt.time() == chrono::NaiveTime::MIN,
+  new: |2-
+            true,
+  detectors:
+    - test: a_date_override_refuses_a_value_with_a_time_of_day
+      suite: live_suite
+      needs: oracle
+    - test: a_date_is_whole_days_and_a_time_of_day_is_refused_by_name
+      suite: lib
+      needs: none
 
 - id: clickhouse-pull-skips-range-guard
   class: "ClickHouse load pulled through a named collection skips the DateTime64 range check -> 9999-12-31 stored clamped to 2299-12-31, silently"

@@ -826,4 +826,12 @@ exclude_re = [
     "replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::int16 -> Option<i16>",
     "replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::int32 -> Option<i32>",
     "replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::int64 -> Option<i64>",
+    # `override_case_fail_oracle` (preflight/oracle.rs) is glue: it reads the result schema
+    # from a live Oracle and hands it to the shared, unit-tested `refuse_override_case_miss`.
+    # Stubbed Ok, `check_refuses_a_column_override_key_in_the_wrong_case` goes red
+    # (RED-checked 2026-09-30).
+    "replace override_case_fail_oracle -> Result<\\(\\)> with Ok\\(\\(\\)\\)",
+    # Equivalent: `y < 0` and `y <= 0` differ only at year 0, which Oracle has no value for
+    # (its calendar goes from -1 to 1; ORA-01841), so no OracleTimestamp tells them apart.
+    "replace < with <= in timestamp_text",
 ]

@@ -182,6 +182,24 @@ services:
       timeout: 5s
       retries: 30
 
+  # A second Oracle Free whose LATIN1PDB has the WE8ISO8859P1 character set, for the
+  # non-Unicode character-type tests. Its own container: a PDB of another character set in
+  # the CDC stand's CDB makes LogMiner refuse every mining session (ORA-01305).
+  oracle-latin1:
+    image: gvenzl/oracle-free:23-slim-faststart
+    environment:
+      ORACLE_PASSWORD: rivet
+      RIVET_STAND_LATIN1_PDB: "1"
+    ports:
+      - "1531:1521"
+    volumes:
+      - ./dev/oracle/init:/container-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "healthcheck.sh"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
   # ---- CDC-configured source engines (cdc profile) --------------------------
   # Dedicated instances carrying the server-side config change data capture
   # needs — logical WAL (PostgreSQL), a REPLICATION grant (MySQL), the SQL
