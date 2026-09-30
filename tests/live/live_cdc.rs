@@ -2142,6 +2142,154 @@ fn cdc_column_overrides_apply_like_batch() {
     assert_cdc_matches_batch(&cdc_out, &batch_out);
 }
 
+/// A `float64` override on a MySQL DECIMAL reads the binlog's decimal text as the server's own DOUBLE, in CDC and batch alike.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn mysql_cdc_float_override_on_a_decimal_matches_the_servers_double_and_batch() {
+    use arrow::array::{Array, Float64Array, Int32Array};
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("cdc_f64dec");
+    let mut c = conn();
+    c.query_drop(format!(
+        "CREATE TABLE {tbl} (id INT PRIMARY KEY, amount DECIMAL(10,2))"
+    ))
+    .unwrap();
+    let _guard = Table(tbl.clone());
+    let ckpt = d.path().join("cdc.ckpt");
+    write_checkpoint(&mut c, &ckpt);
+    c.query_drop(format!(
+        "INSERT INTO {tbl} VALUES (1, 12345.67), (2, -0.10), (3, 0.05), (4, NULL)"
+    ))
+    .unwrap();
+    let want: Vec<(i32, Option<f64>)> = c
+        .query(format!(
+            "SELECT id, CAST(amount AS DOUBLE) FROM {tbl} ORDER BY id"
+        ))
+        .unwrap();
+
+    let cdc_out = d.path().join("cdc");
+    let batch_out = d.path().join("batch");
+    std::fs::create_dir_all(&cdc_out).unwrap();
+    std::fs::create_dir_all(&batch_out).unwrap();
+    Rig::mysql_cdc(&tbl)
+        .export_line("columns: { amount: float64 }")
+        .checkpoint_path(ckpt)
+        .dest_path(cdc_out.clone())
+        .run_ok();
+    Rig::mysql_batch(&tbl)
+        .export_named(&format!("{tbl}_batch"))
+        .source_url(MYSQL_CDC_URL)
+        .export_line("columns: { amount: float64 }")
+        .dest_path(batch_out.clone())
+        .run_ok();
+
+    let b = read_one_batch(&cdc_out);
+    let ids = b
+        .column_by_name("id")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    let amounts = b
+        .column_by_name("amount")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("the override makes the CDC column Float64");
+    let mut got: Vec<(i32, Option<f64>)> = (0..b.num_rows())
+        .map(|i| {
+            (
+                ids.value(i),
+                (!amounts.is_null(i)).then(|| amounts.value(i)),
+            )
+        })
+        .collect();
+    got.sort_by_key(|r| r.0);
+    assert_eq!(
+        got, want,
+        "CDC values must equal MySQL's own CAST(amount AS DOUBLE)"
+    );
+    assert_cdc_matches_batch(&cdc_out, &batch_out);
+}
+
+/// A bare PostgreSQL `numeric` arrives on CDC as the server's exact text, labelled server_text, with no policy warning.
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn pg_cdc_bare_numeric_is_delivered_as_labelled_server_text() {
+    use arrow::array::{Array, Int64Array, StringArray};
+    use postgres::NoTls;
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("cdc_bare_num");
+    let slot = unique_name("rivet_bare_num_slot");
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    c.batch_execute(&format!(
+        "CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, n NUMERIC)"
+    ))
+    .unwrap();
+    let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    let _slot = Slot(slot.clone());
+    c.batch_execute(&format!(
+        "INSERT INTO {tbl} VALUES (1, 1.50), (2, -0.000001234),
+           (3, 123456789012345678901234567890.123456789012), (4, 'NaN'), (5, NULL)"
+    ))
+    .unwrap();
+    let want: Vec<(i64, Option<String>)> = c
+        .query(&format!("SELECT id, n::text FROM {tbl} ORDER BY id"), &[])
+        .unwrap()
+        .iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect();
+
+    let out = d.path().join("cdc");
+    std::fs::create_dir_all(&out).unwrap();
+    let said = Rig::pg_cdc(&tbl, &slot)
+        .dest_path(out.clone())
+        .run_ok_capture();
+    assert!(
+        !said.contains("fidelity="),
+        "a server-text column is not a policy violation: {said}"
+    );
+
+    let b = read_one_batch(&out);
+    let field = b.schema().field_with_name("n").unwrap().clone();
+    assert_eq!(field.data_type(), &arrow::datatypes::DataType::Utf8);
+    assert_eq!(
+        field.metadata().get("rivet.text_form").map(String::as_str),
+        Some("server_text")
+    );
+    assert_eq!(
+        field.metadata().get("rivet.fidelity").map(String::as_str),
+        Some("logical_string")
+    );
+    let ids = b
+        .column_by_name("id")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let ns = b
+        .column_by_name("n")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let mut got: Vec<(i64, Option<String>)> = (0..b.num_rows())
+        .map(|i| {
+            (
+                ids.value(i),
+                (!ns.is_null(i)).then(|| ns.value(i).to_string()),
+            )
+        })
+        .collect();
+    got.sort_by_key(|r| r.0);
+    assert_eq!(got, want, "each value is the server's own n::text");
+}
+
 // The all-types parity contract for PostgreSQL — pins the test_decoding parse
 // fixes: uuid/bytea text→raw bytes, TIME→Time64, INTERVAL→the batch's ISO 8601
 // canon, NULLs of text-shaped columns staying NULL (not ""), ARRAYS as real

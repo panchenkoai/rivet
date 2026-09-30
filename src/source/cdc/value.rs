@@ -24,9 +24,7 @@ use arrow::datatypes::{DataType, TimeUnit};
 use chrono::{NaiveDate, NaiveDateTime};
 use serde_json::Value as Json;
 
-use anyhow::Context;
-
-use crate::error::Result;
+use crate::source::value_checksum::ListElem;
 
 /// Days from the Unix epoch (1970-01-01) for `Date32`.
 fn epoch_days(d: NaiveDate) -> i32 {
@@ -194,16 +192,6 @@ pub(crate) fn is_buildable(dt: &DataType) -> bool {
     )
 }
 
-/// The storage type the sink actually writes for a resolved column: the source's
-/// own Arrow type when [`build_column`] can produce it exactly, else `Utf8`
-/// (stringified). Keeps the schema field and the built array in lockstep.
-pub(crate) fn render_type(arrow_type: Option<&DataType>) -> DataType {
-    match arrow_type {
-        Some(dt) if is_buildable(dt) => dt.clone(),
-        _ => DataType::Utf8,
-    }
-}
-
 /// Canonical bytes for a `FixedSizeBinary(n)` cell, or `None` when the value
 /// genuinely cannot fill the width.
 ///
@@ -233,34 +221,154 @@ fn fixed_binary_bytes(by: &[u8], n: usize) -> Option<Vec<u8>> {
     None
 }
 
-/// The refusal for a non-NULL cell that column `col`'s Arrow type `dt` cannot hold.
-fn cell_mismatch(col: &str, dt: &DataType, v: &RivetValue) -> anyhow::Error {
-    let full = render_str(v);
-    let shown: String = full.chars().take(64).collect();
-    let more = if shown.len() < full.len() { "…" } else { "" };
-    anyhow::Error::new(crate::error::CodedError::new(
-        crate::error::codes::SOURCE_OVERRIDE_WIRE_MISMATCH,
-        format!(
-            "cdc: column '{col}' is {dt} but the captured value {shown:?}{more} cannot be read \
-             as that type; rivet refuses rather than writing NULL"
-        ),
-    ))
+/// A non-NULL cell its planned column type cannot hold: the row, the value, and why.
+///
+/// The builder knows no column name; the sink names the column once via [`CellRefusal::into_error`].
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CellRefusal {
+    pub row: usize,
+    pub value: RivetValue,
+    pub reason: String,
 }
 
-/// Build one Arrow column from typed cells (one per row; `None` ⇒ null). `dt` is
-/// the [`render_type`] — i.e. exactly the array type the schema field declares.
+/// Why a cell is refused when its variant has no reading as the column type at all.
+const NO_READING: &str = "cannot be read as that type";
+
+impl CellRefusal {
+    /// A refusal of `value` at `row` for `reason`.
+    fn new(row: usize, value: &RivetValue, reason: impl Into<String>) -> Self {
+        Self {
+            row,
+            value: value.clone(),
+            reason: reason.into(),
+        }
+    }
+
+    /// The coded run error naming `column` of type `dt`; `overridden` picks the override code and remedy.
+    pub(crate) fn into_error(self, column: &str, dt: &DataType, overridden: bool) -> anyhow::Error {
+        let full = render_str(&self.value);
+        let shown: String = full.chars().take(64).collect();
+        let more = if shown.len() < full.len() { "…" } else { "" };
+        let (code, remedy) = if overridden {
+            (
+                crate::error::codes::SOURCE_OVERRIDE_WIRE_MISMATCH,
+                format!(
+                    "correct or drop the `columns:` override for '{column}', then re-snapshot \
+                     the table"
+                ),
+            )
+        } else {
+            (
+                crate::error::codes::SOURCE_CDC_CELL_UNSUPPORTED,
+                "leave the column out of the capture, then re-snapshot the table".to_string(),
+            )
+        };
+        anyhow::Error::new(crate::error::CodedError::new(
+            code,
+            format!(
+                "cdc: column '{column}' is {dt} but the captured value {shown:?}{more} (row {}) \
+                 {}; rivet refuses rather than writing NULL. {remedy}",
+                self.row, self.reason
+            ),
+        ))
+    }
+}
+
+/// The value a Boolean column stores for `v`.
+fn bool_value(v: &RivetValue) -> Result<bool, String> {
+    match v {
+        RivetValue::Bool(b) => Ok(*b),
+        RivetValue::Int(i) => Ok(*i != 0),
+        RivetValue::UInt(u) => Ok(*u != 0),
+        _ => Err(NO_READING.into()),
+    }
+}
+
+/// The value an integer column of width `T` stores for `v`: exact integer text parses, overflow refuses.
+fn int_value<T: TryFrom<i128>>(v: &RivetValue) -> Result<T, String> {
+    let wide: i128 = match v {
+        RivetValue::Bool(b) => i128::from(*b),
+        RivetValue::Int(i) => i128::from(*i),
+        RivetValue::UInt(u) => i128::from(*u),
+        RivetValue::Bytes(b) => std::str::from_utf8(b)
+            .ok()
+            .and_then(crate::types::decimal::decimal_text_to_int)
+            .ok_or("is not an exact integer")?,
+        _ => return Err(NO_READING.into()),
+    };
+    T::try_from(wide).map_err(|_| {
+        "overflows the column's integer width (a BIT(64) with bit 63 set, or a BIGINT \
+         UNSIGNED past i64::MAX); map the column to decimal(20,0) or a wider type"
+            .into()
+    })
+}
+
+/// The value a Float64 column stores for `v`; decimal text parses through the shared parser.
+fn f64_value(v: &RivetValue) -> Result<f64, String> {
+    match v {
+        RivetValue::Float(f) => Ok(*f),
+        RivetValue::Int(i) => Ok(*i as f64),
+        RivetValue::UInt(u) => Ok(*u as f64),
+        RivetValue::Bytes(b) => std::str::from_utf8(b)
+            .ok()
+            .and_then(crate::types::decimal::decimal_text_to_float)
+            .ok_or_else(|| "is not a number".into()),
+        _ => Err(NO_READING.into()),
+    }
+}
+
+/// The value a Float32 column stores for `v`, cast directly (never through f64) so rounding matches batch.
+fn f32_value(v: &RivetValue) -> Result<f32, String> {
+    match v {
+        RivetValue::Float(f) => Ok(*f as f32),
+        RivetValue::Int(i) => Ok(*i as f32),
+        RivetValue::UInt(u) => Ok(*u as f32),
+        RivetValue::Bytes(b) => std::str::from_utf8(b)
+            .ok()
+            .and_then(crate::types::decimal::decimal_text_to_float)
+            .ok_or_else(|| "is not a number".into()),
+        _ => Err(NO_READING.into()),
+    }
+}
+
+/// The Date32 a DateTime at midnight stores; a time of day is refused, never dropped.
+fn date_value(v: &RivetValue) -> Result<i32, String> {
+    match v {
+        RivetValue::DateTime(d) if d.time() == chrono::NaiveTime::MIN => Ok(epoch_days(d.date())),
+        RivetValue::DateTime(_) => Err("has a time of day, which a `date` override would drop; \
+                                        declare it `timestamp`"
+            .into()),
+        _ => Err(NO_READING.into()),
+    }
+}
+
+/// The Time64 microseconds a time of day stores; a duration outside one day is refused.
+fn time_value(v: &RivetValue) -> Result<i64, String> {
+    match v {
+        RivetValue::TimeMicros(us) if crate::types::is_time_of_day(*us) => Ok(*us),
+        RivetValue::TimeMicros(_) => {
+            Err("is outside 00:00..24:00, which a Parquet TIME cannot hold".into())
+        }
+        _ => Err(NO_READING.into()),
+    }
+}
+
+/// Why a decimal cell is refused.
+const NOT_A_DECIMAL: &str = "is not representable in this decimal column (NaN/Infinity, more \
+                             fraction digits than the column's scale, or a MONEY value past the \
+                             f64-exact 2^53 range that tiberius already rounded)";
+
+/// Build one Arrow column of exactly `dt` from typed cells (one per row; `None` ⇒ null).
+///
+/// `dt` must satisfy [`is_buildable`]; the sink asserts that when it builds the schema.
+#[allow(clippy::redundant_closure_call)]
 pub(crate) fn build_column(
-    col: &str,
     dt: &DataType,
     cells: &[Option<&RivetValue>],
-) -> Result<ArrayRef> {
+) -> Result<ArrayRef, CellRefusal> {
     use RivetValue as V;
 
-    // Normalise the explicit NULL variant to a missing cell up front, for every
-    // builder arm at once. Without this the text arms (`Utf8`/`LargeUtf8`),
-    // which accept ANY value via `render_str`, rendered `RivetValue::Null` as
-    // an EMPTY STRING — every text/enum/json/interval NULL silently became ""
-    // (and "" is not even valid JSON for a json column).
+    // An explicit NULL is a missing cell in every arm, so no text arm renders it as "".
     let normalized: Vec<Option<&RivetValue>> = cells
         .iter()
         .map(|c| match c {
@@ -270,265 +378,133 @@ pub(crate) fn build_column(
         .collect();
     let cells: &[Option<&RivetValue>] = &normalized;
 
-    // Integers: the binlog/driver value is always the widest signed/unsigned, so
-    // narrow to the column's declared width. An overflow is NOT silently nulled —
-    // it fails LOUD, exactly like the batch export's `narrow` (mysql::arrow_convert).
-    // The real trigger is a BIT(64) with bit 63 set (BIT(n>1) resolves to Int64,
-    // and the BitUint fix widens it to u64 > i64::MAX) or a BIGINT UNSIGNED past
-    // i64::MAX; the batch export errors and tells the operator to map the column to
-    // decimal(20,0), so a silent NULL here — which the value-checksum could not even
-    // see (int_of agrees and skips) — would drop the value on CDC while batch
-    // surfaced it. A genuine NULL cell still builds a null.
-    macro_rules! int_col {
-        ($builder:ty, $ty:ty) => {{
-            let mut b = <$builder>::with_capacity(cells.len());
-            for c in cells {
+    macro_rules! typed_col {
+        ($builder:expr, $value:expr) => {{
+            let mut b = $builder;
+            for (row, c) in cells.iter().enumerate() {
                 match c {
-                    None | Some(V::Null) => b.append_null(),
-                    Some(V::Bool(x)) => b.append_value(*x as $ty),
-                    Some(V::Int(i)) => match <$ty>::try_from(*i) {
-                        Ok(v) => b.append_value(v),
-                        Err(_) => anyhow::bail!(
-                            "cdc: integer value {i} overflows the declared {} column \
-                             (a BIT(64) with bit 63 set, or a BIGINT UNSIGNED > i64::MAX); \
-                             map the column to decimal(20,0) or a wider type. The batch \
-                             export fails identically, never a silent null.",
-                            stringify!($ty)
-                        ),
+                    None => b.append_null(),
+                    Some(v) => match $value(*v) {
+                        Ok(x) => b.append_value(x),
+                        Err(reason) => return Err(CellRefusal::new(row, v, reason)),
                     },
-                    Some(V::UInt(u)) => match <$ty>::try_from(*u) {
-                        Ok(v) => b.append_value(v),
-                        Err(_) => anyhow::bail!(
-                            "cdc: integer value {u} overflows the declared {} column \
-                             (a BIT(64) with bit 63 set, or a BIGINT UNSIGNED > i64::MAX); \
-                             map the column to decimal(20,0) or a wider type. The batch \
-                             export fails identically, never a silent null.",
-                            stringify!($ty)
-                        ),
-                    },
-                    Some(v) => return Err(cell_mismatch(col, dt, v)),
                 }
             }
-            Arc::new(b.finish())
+            b.finish()
         }};
     }
 
+    let n = cells.len();
     Ok(match dt {
-        DataType::Boolean => {
-            let mut b = BooleanBuilder::with_capacity(cells.len());
-            for c in cells {
-                match c {
-                    Some(V::Bool(x)) => b.append_value(*x),
-                    Some(V::Int(i)) => b.append_value(*i != 0),
-                    Some(V::UInt(u)) => b.append_value(*u != 0),
-                    None => b.append_null(),
-                    Some(v) => return Err(cell_mismatch(col, dt, v)),
-                }
-            }
-            Arc::new(b.finish())
-        }
-        DataType::Int8 => int_col!(Int8Builder, i8),
-        DataType::Int16 => int_col!(Int16Builder, i16),
-        DataType::Int32 => int_col!(Int32Builder, i32),
-        DataType::Int64 => int_col!(Int64Builder, i64),
-        DataType::UInt8 => int_col!(UInt8Builder, u8),
-        DataType::UInt16 => int_col!(UInt16Builder, u16),
-        DataType::UInt32 => int_col!(UInt32Builder, u32),
-        DataType::UInt64 => int_col!(UInt64Builder, u64),
-        DataType::Float32 => {
-            let mut b = Float32Builder::with_capacity(cells.len());
-            for c in cells {
-                match c {
-                    Some(V::Float(f)) => b.append_value(*f as f32),
-                    Some(V::Int(i)) => b.append_value(*i as f32),
-                    Some(V::UInt(u)) => b.append_value(*u as f32),
-                    None => b.append_null(),
-                    Some(v) => return Err(cell_mismatch(col, dt, v)),
-                }
-            }
-            Arc::new(b.finish())
-        }
-        DataType::Float64 => {
-            let mut b = Float64Builder::with_capacity(cells.len());
-            for c in cells {
-                match c {
-                    Some(V::Float(f)) => b.append_value(*f),
-                    Some(V::Int(i)) => b.append_value(*i as f64),
-                    Some(V::UInt(u)) => b.append_value(*u as f64),
-                    None => b.append_null(),
-                    Some(v) => return Err(cell_mismatch(col, dt, v)),
-                }
-            }
-            Arc::new(b.finish())
-        }
-        DataType::Date32 => {
-            let mut b = Date32Builder::with_capacity(cells.len());
-            for c in cells {
-                match c {
-                    Some(V::DateTime(d)) => b.append_value(epoch_days(d.date())),
-                    None => b.append_null(),
-                    Some(v) => return Err(cell_mismatch(col, dt, v)),
-                }
-            }
-            Arc::new(b.finish())
-        }
+        DataType::Boolean => Arc::new(typed_col!(BooleanBuilder::with_capacity(n), bool_value)),
+        DataType::Int8 => Arc::new(typed_col!(Int8Builder::with_capacity(n), int_value::<i8>)),
+        DataType::Int16 => Arc::new(typed_col!(Int16Builder::with_capacity(n), int_value::<i16>)),
+        DataType::Int32 => Arc::new(typed_col!(Int32Builder::with_capacity(n), int_value::<i32>)),
+        DataType::Int64 => Arc::new(typed_col!(Int64Builder::with_capacity(n), int_value::<i64>)),
+        DataType::UInt8 => Arc::new(typed_col!(UInt8Builder::with_capacity(n), int_value::<u8>)),
+        DataType::UInt16 => Arc::new(typed_col!(
+            UInt16Builder::with_capacity(n),
+            int_value::<u16>
+        )),
+        DataType::UInt32 => Arc::new(typed_col!(
+            UInt32Builder::with_capacity(n),
+            int_value::<u32>
+        )),
+        DataType::UInt64 => Arc::new(typed_col!(
+            UInt64Builder::with_capacity(n),
+            int_value::<u64>
+        )),
+        DataType::Float32 => Arc::new(typed_col!(Float32Builder::with_capacity(n), f32_value)),
+        DataType::Float64 => Arc::new(typed_col!(Float64Builder::with_capacity(n), f64_value)),
+        DataType::Date32 => Arc::new(typed_col!(Date32Builder::with_capacity(n), date_value)),
+        // The `DateTime` is the UTC instant; a tz-aware column carries it with its zone label (batch parity).
         DataType::Timestamp(TimeUnit::Microsecond, tz) => {
-            // The `DateTime` is the UTC instant; a tz-aware column carries it with its
-            // zone label so it lands identically to the batch export (parity), never a
-            // naive cast that drops the zone.
-            let mut b = TimestampMicrosecondBuilder::with_capacity(cells.len());
-            for c in cells {
-                match c {
-                    Some(V::DateTime(d)) => b.append_value(d.and_utc().timestamp_micros()),
-                    None => b.append_null(),
-                    Some(v) => return Err(cell_mismatch(col, dt, v)),
+            let arr = typed_col!(
+                TimestampMicrosecondBuilder::with_capacity(n),
+                |v: &RivetValue| match v {
+                    V::DateTime(d) => Ok(d.and_utc().timestamp_micros()),
+                    _ => Err(NO_READING.to_string()),
                 }
-            }
-            let arr = b.finish();
+            );
             match tz {
                 Some(tz) => Arc::new(arr.with_timezone(tz.clone())),
                 None => Arc::new(arr),
             }
         }
-        DataType::Time64(TimeUnit::Microsecond) => {
-            let mut b = Time64MicrosecondBuilder::with_capacity(cells.len());
-            for c in cells {
-                match c {
-                    Some(V::TimeMicros(us)) => b.append_value(
-                        crate::source::mysql::time_of_day_in_range(*us)
-                            .with_context(|| format!("cdc: column '{col}'"))?,
-                    ),
-                    None => b.append_null(),
-                    Some(v) => return Err(cell_mismatch(col, dt, v)),
-                }
-            }
-            Arc::new(b.finish())
-        }
-        DataType::Decimal128(p, s) => {
-            let mut b = Decimal128Builder::with_capacity(cells.len())
-                .with_data_type(DataType::Decimal128(*p, *s));
-            for c in cells {
-                match c {
-                    None => b.append_null(),
-                    Some(v) => match decimal_to_i128(v, *s) {
-                        Some(i) => b.append_value(i),
-                        // A non-null cell that doesn't parse (PG 'NaN'::numeric,
-                        // ±Infinity, a non-finite money float) is unrepresentable
-                        // in a Parquet decimal — fail LOUD, exactly like the
-                        // batch export does, never a silent NULL.
-                        None => anyhow::bail!(
-                            "cdc: unsupported decimal payload {:?} (NaN/Infinity, \
-                             or a MONEY value past the f64-exact 2^53 range that \
-                             tiberius already rounded, is not representable in a \
-                             decimal column; batch fails identically)",
-                            render_str(v)
-                        ),
-                    },
-                }
-            }
-            Arc::new(b.finish())
-        }
-        // NUMERIC precision > 38 — same digit-exact parse, into i256.
-        DataType::Decimal256(p, s) => {
-            let mut b = arrow::array::Decimal256Builder::with_capacity(cells.len())
-                .with_data_type(DataType::Decimal256(*p, *s));
-            for c in cells {
-                match c {
-                    None => b.append_null(),
-                    Some(v) => match decimal_to_i256(v, *s) {
-                        Some(i) => b.append_value(i),
-                        None => anyhow::bail!(
-                            "cdc: unsupported decimal payload {:?} (NaN/Infinity, \
-                             or a MONEY value past the f64-exact 2^53 range that \
-                             tiberius already rounded, is not representable in a \
-                             decimal column; batch fails identically)",
-                            render_str(v)
-                        ),
-                    },
-                }
-            }
-            Arc::new(b.finish())
-        }
-        // One-dimensional arrays → a real List column, ELEMENT FIELD INCLUDED
-        // (name/nullability must match the batch schema for ArrayData parity).
+        DataType::Time64(TimeUnit::Microsecond) => Arc::new(typed_col!(
+            Time64MicrosecondBuilder::with_capacity(n),
+            time_value
+        )),
+        DataType::Decimal128(p, s) => Arc::new(typed_col!(
+            Decimal128Builder::with_capacity(n).with_data_type(DataType::Decimal128(*p, *s)),
+            |v: &RivetValue| decimal_to_i128(v, *s).ok_or_else(|| NOT_A_DECIMAL.to_string())
+        )),
+        DataType::Decimal256(p, s) => Arc::new(typed_col!(
+            arrow::array::Decimal256Builder::with_capacity(n)
+                .with_data_type(DataType::Decimal256(*p, *s)),
+            |v: &RivetValue| decimal_to_i256(v, *s).ok_or_else(|| NOT_A_DECIMAL.to_string())
+        )),
+        // One-dimensional arrays → a real List column, element field included (batch parity).
         DataType::List(field) => build_list_column(field, cells)?,
-        DataType::Binary => {
-            let mut b = BinaryBuilder::with_capacity(cells.len(), 0);
-            for c in cells {
-                match c {
-                    Some(V::Bytes(by)) => b.append_value(by),
-                    None => b.append_null(),
-                    Some(v) => return Err(cell_mismatch(col, dt, v)),
-                }
+        DataType::Binary => Arc::new(typed_col!(
+            BinaryBuilder::with_capacity(n, 0),
+            |v: &RivetValue| match v {
+                V::Bytes(by) => Ok(by.clone()),
+                _ => Err(NO_READING.to_string()),
+            }
+        )),
+        DataType::LargeBinary => Arc::new(typed_col!(
+            LargeBinaryBuilder::with_capacity(n, 0),
+            |v: &RivetValue| match v {
+                V::Bytes(by) => Ok(by.clone()),
+                _ => Err(NO_READING.to_string()),
+            }
+        )),
+        DataType::FixedSizeBinary(w) => {
+            // Width-`w` bytes, or (at w=16) the 36-char text UUID the MySQL binlog delivers.
+            let mut b = FixedSizeBinaryBuilder::with_capacity(n, *w);
+            for (row, c) in cells.iter().enumerate() {
+                let bytes = match c {
+                    None => {
+                        b.append_null();
+                        continue;
+                    }
+                    Some(v @ V::Bytes(by)) => fixed_binary_bytes(by, *w as usize)
+                        .ok_or_else(|| CellRefusal::new(row, v, NO_READING))?,
+                    Some(v) => return Err(CellRefusal::new(row, v, NO_READING)),
+                };
+                b.append_value(&bytes)
+                    .expect("fixed_binary_bytes returns exactly the column width");
             }
             Arc::new(b.finish())
         }
-        DataType::LargeBinary => {
-            let mut b = LargeBinaryBuilder::with_capacity(cells.len(), 0);
-            for c in cells {
-                match c {
-                    Some(V::Bytes(by)) => b.append_value(by),
-                    None => b.append_null(),
-                    Some(v) => return Err(cell_mismatch(col, dt, v)),
-                }
-            }
-            Arc::new(b.finish())
-        }
-        DataType::FixedSizeBinary(n) => {
-            let mut b = FixedSizeBinaryBuilder::with_capacity(cells.len(), *n);
-            for c in cells {
-                match c {
-                    // Width-`n` bytes, or (at n=16) the canonical 36-char text
-                    // UUID the MySQL binlog delivers for a CHAR/VARCHAR(36)
-                    // column under a `uuid` override — see `fixed_binary_bytes`.
-                    Some(v @ V::Bytes(by)) => match fixed_binary_bytes(by, *n as usize) {
-                        Some(bytes) => b.append_value(&bytes).map_err(|e| anyhow::anyhow!(e))?,
-                        None => return Err(cell_mismatch(col, dt, v)),
-                    },
-                    None => b.append_null(),
-                    Some(v) => return Err(cell_mismatch(col, dt, v)),
-                }
-            }
-            Arc::new(b.finish())
-        }
-        DataType::LargeUtf8 => {
-            let mut b = LargeStringBuilder::with_capacity(cells.len(), 0);
-            for c in cells {
-                match c {
-                    Some(v) => b.append_value(render_str(v)),
-                    None => b.append_null(),
-                }
-            }
-            Arc::new(b.finish())
-        }
-        // Utf8 + the catch-all: render anything to a string. `json` / `enum` ride
-        // here (physically `Utf8`); their logical-type marker lives on the field.
-        _ => {
-            let mut b = StringBuilder::with_capacity(cells.len(), 0);
-            for c in cells {
-                match c {
-                    Some(v) => b.append_value(render_str(v)),
-                    None => b.append_null(),
-                }
-            }
-            Arc::new(b.finish())
-        }
+        DataType::Utf8 => Arc::new(typed_col!(StringBuilder::with_capacity(n, 0), text_value)),
+        DataType::LargeUtf8 => Arc::new(typed_col!(
+            LargeStringBuilder::with_capacity(n, 0),
+            text_value
+        )),
+        other => unreachable!("build_column({other}): the sink asserts is_buildable first"),
     })
 }
 
-/// The CDC side-A fold: an INDEPENDENT per-column checksum computed from the
-/// typed cells (`RivetValue`s) — the source-side twin of
-/// [`crate::source::value_checksum::arrow_batch_checksums`] over the built
-/// array. Extraction mirrors [`build_column`] arm-for-arm (same narrowing,
-/// same decimal parse, same render), byte-encoded identically to the batch
-/// checksum canon, XOR-combined. A type the shared rule skips contributes 0 —
-/// the skip set cannot drift from the batch pass's. A mismatch against the
-/// built array means the builder changed a value between decode and Arrow.
+/// The text a Utf8 column stores for `v`; an array has no text reading here.
+fn text_value(v: &RivetValue) -> Result<String, String> {
+    match v {
+        RivetValue::Array(_) => Err("is an array, which a text column cannot hold".into()),
+        other => Ok(render_str(other)),
+    }
+}
+
+/// The CDC side-A fold: an independent per-column checksum of the typed cells.
+///
+/// The source-side twin of [`crate::source::value_checksum::arrow_batch_checksums`]
+/// over the built array; it reads each cell through the SAME value function the
+/// builder uses, so a mismatch means the builder changed a value after it was read.
 pub(crate) fn cells_checksum(dt: &DataType, cells: &[Option<&RivetValue>]) -> u64 {
     use RivetValue as V;
     use xxhash_rust::xxh3::xxh3_64;
 
-    use crate::source::value_checksum::{ListElem, encode_list_cell, is_covered};
+    use crate::source::value_checksum::{encode_list_cell, is_covered};
 
     if !is_covered(dt) {
         return 0;
@@ -541,63 +517,43 @@ pub(crate) fn cells_checksum(dt: &DataType, cells: &[Option<&RivetValue>]) -> u6
         };
         macro_rules! le {
             ($opt:expr) => {
-                if let Some(v) = $opt {
+                if let Ok(v) = $opt {
                     acc = acc.wrapping_add(xxh3_64(&v.to_le_bytes()));
                 }
             };
         }
         match dt {
             DataType::Boolean => {
-                let b = match c {
-                    V::Bool(x) => Some(*x),
-                    V::Int(i) => Some(*i != 0),
-                    V::UInt(u) => Some(*u != 0),
-                    _ => None,
-                };
-                if let Some(b) = b {
+                if let Ok(b) = bool_value(c) {
                     acc = acc.wrapping_add(xxh3_64(&[b as u8]));
                 }
             }
-            DataType::Int16 => le!(int_of::<i16>(c)),
-            DataType::Int32 => le!(int_of::<i32>(c)),
-            DataType::Int64 => le!(int_of::<i64>(c)),
-            DataType::UInt64 => le!(int_of::<u64>(c)),
-            // NOT float_of(c) as f32: i64→f64→f32 double-rounds differently
-            // than the builder's direct i64→f32 for large ints.
-            DataType::Float32 => le!(match c {
-                V::Float(f) => Some(*f as f32),
-                V::Int(i) => Some(*i as f32),
-                V::UInt(u) => Some(*u as f32),
-                _ => None,
-            }),
-            DataType::Float64 => le!(float_of(c)),
-            DataType::Date32 => le!(match c {
-                V::DateTime(dt) => Some(epoch_days(dt.date())),
-                _ => None,
-            }),
-            DataType::Timestamp(TimeUnit::Microsecond, _) => le!(match c {
-                V::DateTime(dt) => Some(dt.and_utc().timestamp_micros()),
-                _ => None,
-            }),
-            DataType::Time64(TimeUnit::Microsecond) => le!(match c {
-                V::TimeMicros(us) => Some(*us),
-                _ => None,
-            }),
-            DataType::Decimal128(_, s) => le!(decimal_to_i128(c, *s)),
-            DataType::Decimal256(_, s) => {
-                if let Some(v) = decimal_to_i256(c, *s) {
-                    acc = acc.wrapping_add(xxh3_64(&v.to_le_bytes()));
+            DataType::Int16 => le!(int_value::<i16>(c)),
+            DataType::Int32 => le!(int_value::<i32>(c)),
+            DataType::Int64 => le!(int_value::<i64>(c)),
+            DataType::UInt64 => le!(int_value::<u64>(c)),
+            DataType::Float32 => le!(f32_value(c)),
+            DataType::Float64 => le!(f64_value(c)),
+            DataType::Date32 => le!(date_value(c)),
+            DataType::Timestamp(TimeUnit::Microsecond, _) => {
+                if let V::DateTime(dt) = c {
+                    acc = acc.wrapping_add(xxh3_64(&dt.and_utc().timestamp_micros().to_le_bytes()));
                 }
             }
-            DataType::Utf8 => acc = acc.wrapping_add(xxh3_64(render_str(c).as_bytes())),
+            DataType::Time64(TimeUnit::Microsecond) => le!(time_value(c)),
+            DataType::Decimal128(_, s) => le!(decimal_to_i128(c, *s).ok_or(())),
+            DataType::Decimal256(_, s) => le!(decimal_to_i256(c, *s).ok_or(())),
+            DataType::Utf8 => {
+                if let Ok(s) = text_value(c) {
+                    acc = acc.wrapping_add(xxh3_64(s.as_bytes()));
+                }
+            }
             DataType::Binary => {
                 if let V::Bytes(by) = c {
                     acc = acc.wrapping_add(xxh3_64(by));
                 }
             }
             DataType::FixedSizeBinary(n) => {
-                // Same canonicalisation the builder applies, or the two sides
-                // disagree on exactly the cells the builder now recovers.
                 if let V::Bytes(by) = c
                     && let Some(bytes) = fixed_binary_bytes(by, *n as usize)
                 {
@@ -606,28 +562,13 @@ pub(crate) fn cells_checksum(dt: &DataType, cells: &[Option<&RivetValue>]) -> u6
             }
             DataType::List(f) => {
                 if let V::Array(elems) = c {
-                    let encoded: Vec<ListElem> = elems
+                    let encoded: Option<Vec<ListElem>> = elems
                         .iter()
-                        .map(|e| match (f.data_type(), e) {
-                            (_, V::Null) => ListElem::Null,
-                            (DataType::Boolean, V::Bool(b)) => ListElem::Bool(*b),
-                            (DataType::Int16, V::Int(i)) => {
-                                i16::try_from(*i).map_or(ListElem::Null, ListElem::I16)
-                            }
-                            (DataType::Int32, V::Int(i)) => {
-                                i32::try_from(*i).map_or(ListElem::Null, ListElem::I32)
-                            }
-                            (DataType::Int64, V::Int(i)) => ListElem::I64(*i),
-                            (DataType::Float32, V::Float(x)) => ListElem::F32(*x as f32),
-                            (DataType::Float64, V::Float(x)) => ListElem::F64(*x),
-                            (DataType::Float64, V::Int(i)) => ListElem::F64(*i as f64),
-                            (DataType::Utf8, other) => {
-                                ListElem::Str(render_str(other).into_bytes())
-                            }
-                            _ => ListElem::Null,
-                        })
+                        .map(|e| list_elem(f.data_type(), e).ok())
                         .collect();
-                    acc = acc.wrapping_add(xxh3_64(&encode_list_cell(&encoded)));
+                    if let Some(encoded) = encoded {
+                        acc = acc.wrapping_add(xxh3_64(&encode_list_cell(&encoded)));
+                    }
                 }
             }
             _ => {}
@@ -636,145 +577,85 @@ pub(crate) fn cells_checksum(dt: &DataType, cells: &[Option<&RivetValue>]) -> u6
     acc
 }
 
-/// The integer a [`build_column`] int arm would append for this cell — shared
-/// by the fold so narrowing (try_from ⇒ null on overflow) cannot drift.
-fn int_of<T: TryFrom<i64> + TryFrom<u64> + From<bool>>(v: &RivetValue) -> Option<T> {
-    match v {
-        RivetValue::Int(i) => T::try_from(*i).ok(),
-        RivetValue::UInt(u) => T::try_from(*u).ok(),
-        RivetValue::Bool(b) => Some(T::from(*b)),
-        _ => None,
-    }
+/// One list element as the checksum canon, read exactly as the list builder reads it.
+fn list_elem(elem: &DataType, e: &RivetValue) -> Result<ListElem, String> {
+    use RivetValue as V;
+    Ok(match (elem, e) {
+        (_, V::Null) => ListElem::Null,
+        (DataType::Boolean, V::Bool(b)) => ListElem::Bool(*b),
+        (DataType::Int16, V::Int(_)) => ListElem::I16(int_value(e)?),
+        (DataType::Int32, V::Int(_)) => ListElem::I32(int_value(e)?),
+        (DataType::Int64, V::Int(i)) => ListElem::I64(*i),
+        (DataType::Float32, V::Float(x)) => ListElem::F32(*x as f32),
+        (DataType::Float64, V::Float(x)) => ListElem::F64(*x),
+        (DataType::Float64, V::Int(i)) => ListElem::F64(*i as f64),
+        (DataType::Utf8, other) => ListElem::Str(text_value(other)?.into_bytes()),
+        _ => return Err(NO_READING.into()),
+    })
 }
 
-fn float_of(v: &RivetValue) -> Option<f64> {
-    match v {
-        RivetValue::Float(f) => Some(*f),
-        RivetValue::Int(i) => Some(*i as f64),
-        RivetValue::UInt(u) => Some(*u as f64),
-        _ => None,
-    }
-}
+/// Why a non-array cell cannot fill a one-dimensional list column.
+const NOT_ONE_DIMENSIONAL: &str = "is a multi-dimensional or non-representable array, which a \
+                                   one-dimensional list column cannot hold; cast the column to \
+                                   text in the source (e.g. col::text). The batch export fails \
+                                   identically";
 
-/// Build a `List<element>` column from [`RivetValue::Array`] cells. The child
-/// builder is chosen by the element type; the LIST FIELD itself is preserved
-/// (`with_field`) so the element name/nullability — and therefore the
-/// `ArrayData` — matches the batch export exactly. A NULL cell is a null list;
-/// an empty array is an empty (non-null) list; inner NULL elements survive.
+/// Build a `List<element>` column from [`RivetValue::Array`] cells, keeping the list field (batch parity).
+///
+/// A NULL cell is a null list; an empty array is an empty list; inner NULLs survive;
+/// an element the element type cannot hold refuses the whole cell.
 fn build_list_column(
     field: &arrow::datatypes::FieldRef,
     cells: &[Option<&RivetValue>],
-) -> Result<ArrayRef> {
+) -> Result<ArrayRef, CellRefusal> {
     use RivetValue as V;
     use arrow::array::ListBuilder;
 
     macro_rules! list_col {
-        ($child:expr, $append:expr) => {{
+        ($child:expr, $pat:pat => $val:expr) => {{
             let mut lb = ListBuilder::new($child).with_field(field.clone());
-            for c in cells {
+            for (row, c) in cells.iter().enumerate() {
                 match c {
-                    Some(V::Array(elems)) => {
+                    Some(v @ V::Array(elems)) => {
                         for e in elems {
-                            #[allow(clippy::redundant_closure_call)]
-                            $append(lb.values(), e);
+                            match list_elem(field.data_type(), e) {
+                                Ok(ListElem::Null) => lb.values().append_null(),
+                                Ok($pat) => lb.values().append_value($val),
+                                Ok(_) => {
+                                    unreachable!("list_elem returns the element type's variant")
+                                }
+                                Err(reason) => {
+                                    return Err(CellRefusal::new(
+                                        row,
+                                        v,
+                                        format!("has an element {:?} that {reason}", render_str(e)),
+                                    ));
+                                }
+                            }
                         }
                         lb.append(true);
                     }
-                    // NULL cell / inner NULL → a null list (empty array stays a
-                    // non-null empty list, handled by the Array arm above).
-                    None | Some(V::Null) => lb.append(false),
-                    // A non-null, non-array cell can only reach a one-dimensional
-                    // List column as a MULTI-dimensional PG array literal
-                    // (`{{1,2},{3,4}}`), which parse_pg_array_literal refuses to
-                    // flatten and preserves as raw text. rivet's List is 1-D and
-                    // cannot hold it — fail LOUD, exactly like the batch export
-                    // (arrow_convert.rs), never a silent null list.
-                    Some(other) => anyhow::bail!(
-                        "cdc: multi-dimensional / non-representable array value {:?} \
-                         cannot be stored in a one-dimensional list column; cast the \
-                         column to text in the source export (e.g. col::text). The \
-                         batch export fails identically.",
-                        render_str(other)
-                    ),
+                    None => lb.append(false),
+                    Some(other) => return Err(CellRefusal::new(row, other, NOT_ONE_DIMENSIONAL)),
                 }
             }
-            Ok(Arc::new(lb.finish()) as ArrayRef)
+            Arc::new(lb.finish()) as ArrayRef
         }};
     }
 
-    match field.data_type() {
-        DataType::Boolean => list_col!(
-            BooleanBuilder::new(),
-            |b: &mut BooleanBuilder, e: &RivetValue| {
-                match e {
-                    V::Bool(v) => b.append_value(*v),
-                    _ => b.append_null(),
-                }
-            }
-        ),
-        DataType::Int16 => list_col!(
-            Int16Builder::new(),
-            |b: &mut Int16Builder, e: &RivetValue| {
-                match e {
-                    V::Int(i) => match i16::try_from(*i) {
-                        Ok(v) => b.append_value(v),
-                        Err(_) => b.append_null(),
-                    },
-                    _ => b.append_null(),
-                }
-            }
-        ),
-        DataType::Int32 => list_col!(
-            Int32Builder::new(),
-            |b: &mut Int32Builder, e: &RivetValue| {
-                match e {
-                    V::Int(i) => match i32::try_from(*i) {
-                        Ok(v) => b.append_value(v),
-                        Err(_) => b.append_null(),
-                    },
-                    _ => b.append_null(),
-                }
-            }
-        ),
-        DataType::Int64 => list_col!(
-            Int64Builder::new(),
-            |b: &mut Int64Builder, e: &RivetValue| {
-                match e {
-                    V::Int(i) => b.append_value(*i),
-                    _ => b.append_null(),
-                }
-            }
-        ),
-        DataType::Float32 => list_col!(
-            Float32Builder::new(),
-            |b: &mut Float32Builder, e: &RivetValue| {
-                match e {
-                    V::Float(f) => b.append_value(*f as f32),
-                    _ => b.append_null(),
-                }
-            }
-        ),
-        DataType::Float64 => list_col!(
-            Float64Builder::new(),
-            |b: &mut Float64Builder, e: &RivetValue| {
-                match e {
-                    V::Float(f) => b.append_value(*f),
-                    V::Int(i) => b.append_value(*i as f64),
-                    _ => b.append_null(),
-                }
-            }
-        ),
+    Ok(match field.data_type() {
+        DataType::Boolean => list_col!(BooleanBuilder::new(), ListElem::Bool(x) => x),
+        DataType::Int16 => list_col!(Int16Builder::new(), ListElem::I16(x) => x),
+        DataType::Int32 => list_col!(Int32Builder::new(), ListElem::I32(x) => x),
+        DataType::Int64 => list_col!(Int64Builder::new(), ListElem::I64(x) => x),
+        DataType::Float32 => list_col!(Float32Builder::new(), ListElem::F32(x) => x),
+        DataType::Float64 => list_col!(Float64Builder::new(), ListElem::F64(x) => x),
         DataType::Utf8 => list_col!(
             StringBuilder::new(),
-            |b: &mut StringBuilder, e: &RivetValue| {
-                match e {
-                    V::Null => b.append_null(),
-                    other => b.append_value(render_str(other)),
-                }
-            }
+            ListElem::Str(x) => String::from_utf8(x).expect("text_value is UTF-8")
         ),
-        other => anyhow::bail!("unsupported list element type {other:?}"),
-    }
+        other => unreachable!("list of {other}: the sink asserts is_buildable first"),
+    })
 }
 
 /// The scaled-integer magnitude past which an f64 can no longer hold a
@@ -940,47 +821,41 @@ fn parse_enum_labels(native: &str) -> Vec<String> {
 }
 
 impl MysqlCellFix {
-    pub(crate) fn apply(&self, v: &RivetValue) -> RivetValue {
+    /// The value the typed column needs for wire value `v`, or why the wire value has no reading.
+    pub(crate) fn apply(&self, v: &RivetValue) -> Result<RivetValue, String> {
         use RivetValue as V;
-        match (self, v) {
+        Ok(match (self, v) {
             (_, V::Null) => V::Null,
-            (MysqlCellFix::TimestampEpoch, V::Bytes(b)) => std::str::from_utf8(b)
-                .ok()
-                .and_then(|s| {
-                    let (sec, frac) = match s.split_once('.') {
-                        Some((s, f)) => (s, f),
-                        None => (s, ""),
-                    };
-                    let secs: i64 = sec.parse().ok()?;
-                    let micros: u32 = if frac.is_empty() {
-                        0
-                    } else {
-                        format!("{frac:0<6}").get(..6)?.parse().ok()?
-                    };
-                    if (secs, micros) == (0, 0) {
-                        return None;
-                    }
-                    chrono::DateTime::from_timestamp(secs, micros * 1_000).map(|dt| dt.naive_utc())
-                })
-                .map_or(V::Null, V::DateTime),
+            (MysqlCellFix::TimestampEpoch, V::Bytes(b)) => match epoch_text(b) {
+                // '0000-00-00 00:00:00' arrives as epoch 0, which no real TIMESTAMP holds: NULL, as batch.
+                Some((0, 0)) => V::Null,
+                Some((secs, micros)) => chrono::DateTime::from_timestamp(secs, micros * 1_000)
+                    .map(|dt| V::DateTime(dt.naive_utc()))
+                    .ok_or("is past the range of a timestamp")?,
+                None => return Err("is not a binlog TIMESTAMP (epoch seconds text)".into()),
+            },
             (MysqlCellFix::BitBool, V::Bytes(b)) => V::Bool(b.iter().any(|x| *x != 0)),
             (MysqlCellFix::BitBool, V::Int(i)) => V::Bool(*i != 0),
             (MysqlCellFix::BitBool, V::UInt(u)) => V::Bool(*u != 0),
             (MysqlCellFix::BitUint, V::Bytes(b)) if b.len() <= 8 => {
                 V::UInt(b.iter().fold(0u64, |acc, x| (acc << 8) | *x as u64))
             }
-            (MysqlCellFix::YearText, V::Bytes(b)) => std::str::from_utf8(b)
-                .ok()
-                .and_then(|s| s.parse::<i64>().ok())
-                .map(|y| if y == 1900 { 0 } else { y })
-                .map_or(V::Null, V::Int),
+            (MysqlCellFix::YearText, V::Bytes(b)) => {
+                let y = std::str::from_utf8(b)
+                    .ok()
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .ok_or("is not a YEAR")?;
+                V::Int(if y == 1900 { 0 } else { y })
+            }
             (MysqlCellFix::MediumIntSign, V::Int(i)) if *i >= (1 << 23) => V::Int(*i - (1 << 24)),
             (MysqlCellFix::MediumIntSign, V::UInt(u)) => {
                 let i = *u as i64;
                 V::Int(if i >= (1 << 23) { i - (1 << 24) } else { i })
             }
-            (MysqlCellFix::EnumLabels(labels), V::Int(i)) => enum_label(labels, *i),
-            (MysqlCellFix::EnumLabels(labels), V::UInt(u)) => enum_label(labels, *u as i64),
+            (MysqlCellFix::EnumLabels(labels), V::Int(i)) => enum_label(labels, *i)?,
+            (MysqlCellFix::EnumLabels(labels), V::UInt(u)) => {
+                enum_label(labels, i64::try_from(*u).unwrap_or(i64::MAX))?
+            }
             (MysqlCellFix::SetLabels(labels), V::Bytes(b)) if b.len() <= 8 => {
                 // Little-endian storage: byte 0 carries members 1..=8.
                 let mask = b
@@ -997,8 +872,20 @@ impl MysqlCellFix {
                 V::Bytes(p)
             }
             (_, other) => other.clone(),
-        }
+        })
     }
+}
+
+/// `"secs[.frac]"` binlog TIMESTAMP text as (seconds, microseconds).
+fn epoch_text(b: &[u8]) -> Option<(i64, u32)> {
+    let s = std::str::from_utf8(b).ok()?;
+    let (sec, frac) = s.split_once('.').unwrap_or((s, ""));
+    let micros = if frac.is_empty() {
+        0
+    } else {
+        format!("{frac:0<6}").get(..6)?.parse().ok()?
+    };
+    Some((sec.parse().ok()?, micros))
 }
 
 fn set_labels(labels: &[String], mask: u64) -> RivetValue {
@@ -1012,14 +899,15 @@ fn set_labels(labels: &[String], mask: u64) -> RivetValue {
     RivetValue::Bytes(joined.into_bytes())
 }
 
-fn enum_label(labels: &[String], idx: i64) -> RivetValue {
+/// The label of 1-based ENUM index `idx`; 0 is MySQL's invalid-value sentinel `''`, past the list is refused.
+fn enum_label(labels: &[String], idx: i64) -> Result<RivetValue, String> {
     if idx <= 0 {
-        return RivetValue::Bytes(Vec::new()); // MySQL's invalid-value sentinel ''
+        return Ok(RivetValue::Bytes(Vec::new()));
     }
     labels
         .get(idx as usize - 1)
         .map(|l| RivetValue::Bytes(l.clone().into_bytes()))
-        .unwrap_or(RivetValue::Null)
+        .ok_or_else(|| format!("is past the column's {} ENUM labels", labels.len()))
 }
 
 /// Render `Bytes` to a string LOSSLESSLY: verbatim when the bytes are valid UTF-8
@@ -1056,7 +944,7 @@ fn render_str(v: &RivetValue) -> String {
         RivetValue::UInt(u) => u.to_string(),
         RivetValue::Float(f) => f.to_string(),
         RivetValue::DateTime(dt) => dt.to_string(),
-        RivetValue::TimeMicros(us) => us.to_string(),
+        RivetValue::TimeMicros(us) => crate::types::time_beyond_day(*us),
         RivetValue::Bytes(b) => bytes_to_recoverable_string(b),
         RivetValue::Array(v) => {
             let inner: Vec<String> = v.iter().map(render_str).collect();
@@ -1068,6 +956,11 @@ fn render_str(v: &RivetValue) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `build_column` with the sink's refusal wording for a non-overridden column `col`.
+    fn build(col: &str, dt: &DataType, cells: &[Option<&RivetValue>]) -> anyhow::Result<ArrayRef> {
+        build_column(dt, cells).map_err(|r| r.into_error(col, dt, false))
+    }
 
     #[test]
     fn to_json_bytes_are_lossless_utf8_verbatim_binary_hex() {
@@ -1190,7 +1083,7 @@ mod tests {
             ] {
                 // Result may be Ok or a LOUD Err (decimal refuses NaN-likes);
                 // the property is: no panic, ever.
-                let _ = build_column("c", &dt, &cells);
+                let _ = build("c", &dt, &cells);
             }
         }
     }
@@ -1229,7 +1122,12 @@ mod tests {
                 DataType::Int64,
                 // 9e9 fits i64 (narrowed from the u64 driver value); a u64 past
                 // i64::MAX is a loud error (build_column_narrows_int test).
-                vec![Some(V::Int(i64::MIN)), Some(V::UInt(9_000_000_000)), None],
+                vec![
+                    Some(V::Int(i64::MIN)),
+                    Some(V::UInt(9_000_000_000)),
+                    Some(V::Bytes(b"-42.00".to_vec())),
+                    None,
+                ],
             ),
             (
                 DataType::UInt64,
@@ -1237,11 +1135,21 @@ mod tests {
             ),
             (
                 DataType::Float32,
-                vec![Some(V::Float(1.5)), Some(V::Int(i64::MAX)), None],
+                vec![
+                    Some(V::Float(1.5)),
+                    Some(V::Int(i64::MAX)),
+                    Some(V::Bytes(b"0.1".to_vec())),
+                    None,
+                ],
             ),
             (
                 DataType::Float64,
-                vec![Some(V::Float(f64::NAN)), Some(V::UInt(3)), None],
+                vec![
+                    Some(V::Float(f64::NAN)),
+                    Some(V::UInt(3)),
+                    Some(V::Bytes(b"12345.67".to_vec())),
+                    None,
+                ],
             ),
             (
                 DataType::Date32,
@@ -1319,7 +1227,7 @@ mod tests {
         ];
         for (dt, owned) in cases {
             let cells: Vec<Option<&RivetValue>> = owned.iter().map(|c| c.as_ref()).collect();
-            let arr = build_column("c", &dt, &cells).unwrap();
+            let arr = build("c", &dt, &cells).unwrap();
             assert_eq!(
                 cells_checksum(&dt, &cells),
                 array_checksum(arr.as_ref()),
@@ -1360,7 +1268,7 @@ mod tests {
         let cells = [Some(&text), Some(&raw), None];
         let refs: Vec<Option<&RivetValue>> = cells.to_vec();
 
-        let arr = build_column("c", &dt, &refs).unwrap();
+        let arr = build("c", &dt, &refs).unwrap();
         let fsb = arr
             .as_any()
             .downcast_ref::<FixedSizeBinaryArray>()
@@ -1413,7 +1321,7 @@ mod tests {
         use arrow::array::Array;
         let cells: Vec<Option<&RivetValue>> = vec![Some(&RivetValue::Null), None];
         for dt in [DataType::Utf8, DataType::LargeUtf8] {
-            let arr = build_column("c", &dt, &cells).unwrap();
+            let arr = build("c", &dt, &cells).unwrap();
             assert!(
                 arr.is_null(0),
                 "{dt:?}: Some(Null) must append a NULL, not an empty string"
@@ -1434,7 +1342,9 @@ mod tests {
         };
 
         // TIMESTAMP(6): "epoch.micros" text → the UTC instant.
-        let ts = fix("timestamp(6)").apply(&V::Bytes(b"1893553445.678901".to_vec()));
+        let ts = fix("timestamp(6)")
+            .apply(&V::Bytes(b"1893553445.678901".to_vec()))
+            .unwrap();
         assert_eq!(
             ts,
             V::DateTime(
@@ -1446,46 +1356,69 @@ mod tests {
 
         // TIMESTAMP zero-date: the binlog carries '0000-00-00 00:00:00' as epoch 0, which no real
         // TIMESTAMP can hold (the range starts at 1970-01-01 00:00:01 UTC) — NULL, as the batch path.
-        assert_eq!(fix("timestamp").apply(&V::Bytes(b"0".to_vec())), V::Null);
         assert_eq!(
-            fix("timestamp(6)").apply(&V::Bytes(b"0.000000".to_vec())),
+            fix("timestamp").apply(&V::Bytes(b"0".to_vec())).unwrap(),
             V::Null
         );
         assert_eq!(
-            fix("timestamp").apply(&V::Bytes(b"1".to_vec())),
+            fix("timestamp(6)")
+                .apply(&V::Bytes(b"0.000000".to_vec()))
+                .unwrap(),
+            V::Null
+        );
+        assert_eq!(
+            fix("timestamp").apply(&V::Bytes(b"1".to_vec())).unwrap(),
             V::DateTime(chrono::DateTime::from_timestamp(1, 0).unwrap().naive_utc()),
             "the first real TIMESTAMP second stays a value"
         );
 
         // YEAR: the binlog decoder adds 1900 to the stored byte, so YEAR 0000 arrives as "1900"
         // (never a legal YEAR) and must read back as 0, as the batch path does.
-        assert_eq!(fix("year").apply(&V::Bytes(b"1900".to_vec())), V::Int(0));
-        assert_eq!(fix("year").apply(&V::Bytes(b"1901".to_vec())), V::Int(1901));
-        assert_eq!(fix("year").apply(&V::Bytes(b"2024".to_vec())), V::Int(2024));
+        assert_eq!(
+            fix("year").apply(&V::Bytes(b"1900".to_vec())).unwrap(),
+            V::Int(0)
+        );
+        assert_eq!(
+            fix("year").apply(&V::Bytes(b"1901".to_vec())).unwrap(),
+            V::Int(1901)
+        );
+        assert_eq!(
+            fix("year").apply(&V::Bytes(b"2024".to_vec())).unwrap(),
+            V::Int(2024)
+        );
 
         // BIT(1): one raw byte → Bool; BIT(8): big-endian bytes → UInt.
-        assert_eq!(fix("bit(1)").apply(&V::Bytes(vec![1])), V::Bool(true));
-        assert_eq!(fix("bit(8)").apply(&V::Bytes(vec![0xAA])), V::UInt(170));
+        assert_eq!(
+            fix("bit(1)").apply(&V::Bytes(vec![1])).unwrap(),
+            V::Bool(true)
+        );
+        assert_eq!(
+            fix("bit(8)").apply(&V::Bytes(vec![0xAA])).unwrap(),
+            V::UInt(170)
+        );
 
         // YEAR: text rendering → Int.
-        assert_eq!(fix("year").apply(&V::Bytes(b"2030".to_vec())), V::Int(2030));
+        assert_eq!(
+            fix("year").apply(&V::Bytes(b"2030".to_vec())).unwrap(),
+            V::Int(2030)
+        );
 
         // ENUM: 1-based index → label; 0 → '' (MySQL's invalid sentinel).
         let e = fix("enum('a','b','c')");
-        assert_eq!(e.apply(&V::Int(2)), V::Bytes(b"b".to_vec()));
-        assert_eq!(e.apply(&V::Int(0)), V::Bytes(Vec::new()));
+        assert_eq!(e.apply(&V::Int(2)).unwrap(), V::Bytes(b"b".to_vec()));
+        assert_eq!(e.apply(&V::Int(0)).unwrap(), V::Bytes(Vec::new()));
 
         // BINARY(4): trailing NULs trimmed by the driver → pad back to width.
         assert_eq!(
-            fix("binary(4)").apply(&V::Bytes(Vec::new())),
+            fix("binary(4)").apply(&V::Bytes(Vec::new())).unwrap(),
             V::Bytes(vec![0, 0, 0, 0])
         );
 
         // MEDIUMINT: 24-bit sign extension (0x800000 → −8388608); positives and
         // the unsigned variant untouched.
         let mi = fix("mediumint");
-        assert_eq!(mi.apply(&V::Int(8_388_608)), V::Int(-8_388_608));
-        assert_eq!(mi.apply(&V::Int(8_388_607)), V::Int(8_388_607));
+        assert_eq!(mi.apply(&V::Int(8_388_608)).unwrap(), V::Int(-8_388_608));
+        assert_eq!(mi.apply(&V::Int(8_388_607)).unwrap(), V::Int(8_388_607));
         assert!(
             mysql_cell_fix(crate::source::cdc::CdcEngine::Mysql, "mediumint unsigned").is_none()
         );
@@ -1493,11 +1426,14 @@ mod tests {
         // SET: bitmask (LE bytes) → comma-joined labels in declaration order,
         // the server's own rendering ('x,z' for bits 0+2 = 0x05).
         let st = fix("set('x','y','z')");
-        assert_eq!(st.apply(&V::Bytes(vec![0x05])), V::Bytes(b"x,z".to_vec()));
-        assert_eq!(st.apply(&V::UInt(0)), V::Bytes(Vec::new()));
+        assert_eq!(
+            st.apply(&V::Bytes(vec![0x05])).unwrap(),
+            V::Bytes(b"x,z".to_vec())
+        );
+        assert_eq!(st.apply(&V::UInt(0)).unwrap(), V::Bytes(Vec::new()));
 
         // NULL always stays NULL; other engines get no fix at all.
-        assert_eq!(fix("year").apply(&V::Null), V::Null);
+        assert_eq!(fix("year").apply(&V::Null).unwrap(), V::Null);
         assert!(mysql_cell_fix(crate::source::cdc::CdcEngine::Postgres, "bit(1)").is_none());
         // varbinary is NOT padded (only fixed-width binary is).
         assert!(mysql_cell_fix(crate::source::cdc::CdcEngine::Mysql, "varbinary(4)").is_none());
@@ -1536,12 +1472,12 @@ mod tests {
         assert!(decimal_to_i256(&RivetValue::Float(1e12), 4).is_none());
         // A small MONEY value still builds.
         let small = RivetValue::Float(12.34);
-        let ok = build_column("c", &DataType::Decimal128(19, 4), &[Some(&small)])
+        let ok = build("c", &DataType::Decimal128(19, 4), &[Some(&small)])
             .expect("a small MONEY value builds");
         assert_eq!(ok.len(), 1);
         // A huge MONEY value in a Decimal column fails loud with the 2^53 message.
         let huge = RivetValue::Float(1e12);
-        let err = build_column("c", &DataType::Decimal128(19, 4), &[Some(&huge)])
+        let err = build("c", &DataType::Decimal128(19, 4), &[Some(&huge)])
             .expect_err("a MONEY value past f64-exact range must fail loud, not round silently");
         let msg = err.to_string().to_lowercase();
         assert!(
@@ -1603,15 +1539,14 @@ mod tests {
         use arrow::array::{Array, Int32Array};
         // In-range values + a genuine null build cleanly.
         let (v7, vnull_src) = (RivetValue::Int(7), RivetValue::Int(-5));
-        let arr =
-            build_column("c", &DataType::Int32, &[Some(&v7), None, Some(&vnull_src)]).unwrap();
+        let arr = build("c", &DataType::Int32, &[Some(&v7), None, Some(&vnull_src)]).unwrap();
         let a = arr.as_any().downcast_ref::<Int32Array>().unwrap();
         assert_eq!(a.value(0), 7);
         assert!(a.is_null(1)); // null cell stays null
         assert_eq!(a.value(2), -5);
         // Overflow → loud error, not a silent null wrap.
         let vmax = RivetValue::Int(i64::MAX);
-        let err = build_column("c", &DataType::Int32, &[Some(&vmax)])
+        let err = build("c", &DataType::Int32, &[Some(&vmax)])
             .expect_err("an integer overflowing the declared width must fail loud");
         assert!(
             err.to_string().to_lowercase().contains("overflow"),
@@ -1621,7 +1556,7 @@ mod tests {
         // and must fail loud in an Int64 column, exactly like the batch export.
         let bit64 = RivetValue::UInt(u64::MAX);
         assert!(
-            build_column("c", &DataType::Int64, &[Some(&bit64)]).is_err(),
+            build("c", &DataType::Int64, &[Some(&bit64)]).is_err(),
             "a BIT(64) value past i64::MAX must fail loud, never a silent CDC null"
         );
     }
@@ -1637,26 +1572,16 @@ mod tests {
         let list_i32 = DataType::List(Arc::new(Field::new("item", DataType::Int32, true)));
         // A NULL cell is a valid null list — must still succeed.
         let none: Option<&RivetValue> = None;
-        build_column("c", &list_i32, &[none]).expect("a null cell builds a null list");
+        build("c", &list_i32, &[none]).expect("a null cell builds a null list");
         // The raw multi-dim literal (as text bytes) must fail loud.
         let raw = RivetValue::Bytes(b"{{1,2},{3,4}}".to_vec());
-        let err = build_column("c", &list_i32, &[Some(&raw)])
+        let err = build("c", &list_i32, &[Some(&raw)])
             .expect_err("a non-array cell in a list column must fail loud");
         let msg = err.to_string().to_lowercase();
         assert!(
             msg.contains("multi-dimensional") && msg.contains("::text"),
             "message must name the multi-dim cause and the ::text remediation: {msg}"
         );
-    }
-
-    #[test]
-    fn render_type_keeps_buildable_else_utf8() {
-        // real width kept (matches the batch export); json/uuid ride as their
-        // physical Utf8/FixedSizeBinary; a type the sink can't build → Utf8.
-        assert_eq!(render_type(Some(&DataType::Int32)), DataType::Int32);
-        assert_eq!(render_type(Some(&DataType::Utf8)), DataType::Utf8);
-        assert_eq!(render_type(Some(&DataType::Date64)), DataType::Utf8);
-        assert_eq!(render_type(None), DataType::Utf8);
     }
 
     /// The invariant that keeps schema and data in lockstep: every type
@@ -1692,21 +1617,19 @@ mod tests {
         ];
         for dt in &buildable {
             assert!(is_buildable(dt), "is_buildable must accept {dt:?}");
-            let arr = build_column("c", dt, &[None]).unwrap();
+            let arr = build("c", dt, &[None]).unwrap();
             assert_eq!(
                 arr.data_type(),
                 dt,
-                "build_column({dt:?}) produced a mismatched type"
+                "build({dt:?}) produced a mismatched type"
             );
         }
-        // A type the sink can't build is rejected and coarsened to Utf8 — never a
-        // field type with no matching builder.
+        // A type the sink can't build is rejected, so the resolver plans it as text.
         for dt in [
             DataType::Date64,
             DataType::Timestamp(TimeUnit::Nanosecond, None),
         ] {
             assert!(!is_buildable(&dt), "is_buildable must reject {dt:?}");
-            assert_eq!(render_type(Some(&dt)), DataType::Utf8);
         }
     }
 
@@ -1726,8 +1649,19 @@ mod tests {
             (DataType::UInt64, dec.clone()),
             (DataType::Int32, V::Float(1.5)),
             (DataType::Boolean, V::Bytes(b"t".to_vec())),
-            (DataType::Float32, dec.clone()),
-            (DataType::Float64, dec.clone()),
+            (DataType::Float32, V::Bytes(b"abc".to_vec())),
+            (DataType::Float64, V::Bytes(b"1.5x".to_vec())),
+            (DataType::Float64, V::Bool(true)),
+            (
+                DataType::Date32,
+                V::DateTime(
+                    NaiveDate::from_ymd_opt(2026, 1, 1)
+                        .unwrap()
+                        .and_hms_opt(13, 14, 0)
+                        .unwrap(),
+                ),
+            ),
+            (DataType::Utf8, V::Array(vec![V::Int(1)])),
             (DataType::Date32, V::Bytes(b"2026-01-01".to_vec())),
             (DataType::Date32, V::Int(3)),
             (
@@ -1751,7 +1685,7 @@ mod tests {
             (DataType::FixedSizeBinary(4), V::Int(7)),
         ];
         for (dt, v) in &cases {
-            let err = build_column("amount", dt, &[Some(v)])
+            let err = build("amount", dt, &[Some(v)])
                 .expect_err(&format!("{dt:?} must refuse {v:?}, not write NULL"));
             let msg = format!("{err:#}");
             assert!(
@@ -1762,7 +1696,7 @@ mod tests {
                 msg.contains(&format!("{:?}", render_str(v))),
                 "the refusal must show the value: {msg}"
             );
-            let arr = build_column("amount", dt, &[Some(&V::Null), None]).unwrap();
+            let arr = build("amount", dt, &[Some(&V::Null), None]).unwrap();
             assert_eq!(arr.null_count(), 2, "{dt:?}: a genuine NULL stays NULL");
         }
     }
@@ -1773,13 +1707,13 @@ mod tests {
         let long = RivetValue::Bytes(vec![b'9'; 500]);
         let msg = format!(
             "{:#}",
-            build_column("c", &DataType::Int64, &[Some(&long)]).unwrap_err()
+            build("c", &DataType::Int64, &[Some(&long)]).unwrap_err()
         );
         assert!(msg.contains(&format!("\"{}\"…", "9".repeat(64))), "{msg}");
         assert!(!msg.contains(&"9".repeat(65)), "{msg}");
         let short = format!(
             "{:#}",
-            build_column(
+            build(
                 "c",
                 &DataType::Int64,
                 &[Some(&RivetValue::Bytes(b"1.5".to_vec()))]
@@ -1787,7 +1721,7 @@ mod tests {
             .unwrap_err()
         );
         assert!(
-            short.contains("\"1.5\" cannot"),
+            short.contains("\"1.5\" (row 0)"),
             "no ellipsis on a short value: {short}"
         );
     }
@@ -1795,7 +1729,7 @@ mod tests {
     /// An unsigned cell in a Boolean column is true exactly when it is non-zero.
     #[test]
     fn an_unsigned_cell_in_a_boolean_column_is_true_when_non_zero() {
-        let arr = build_column(
+        let arr = build(
             "b",
             &DataType::Boolean,
             &[Some(&RivetValue::UInt(1)), Some(&RivetValue::UInt(0))],
@@ -1808,26 +1742,150 @@ mod tests {
         assert!(b.value(0) && !b.value(1));
     }
 
-    /// A MySQL TIME outside one day is refused exactly like the batch export; in-range times build.
+    /// A MySQL TIME outside one day is refused naming its row and value; in-range times build.
     #[test]
-    fn a_time_outside_one_day_is_refused_like_the_batch_export() {
+    fn a_time_outside_one_day_is_refused_by_row_and_value() {
         let dt = DataType::Time64(TimeUnit::Microsecond);
+        let ok = RivetValue::TimeMicros(0);
         for us in [
             (838 * 3600 + 59 * 60 + 59) * 1_000_000i64,
             -3_600_000_000,
             86_400_000_000,
         ] {
-            let err = build_column("t", &dt, &[Some(&RivetValue::TimeMicros(us))]).unwrap_err();
-            let msg = format!("{err:#}");
-            assert!(msg.contains("column 't'"), "{msg}");
-            assert!(msg.contains("is outside 00:00..24:00"), "{msg}");
-            let coded = err
-                .downcast_ref::<crate::error::CodedError>()
-                .expect("the batch's coded refusal survives the column context");
-            assert_eq!(coded.code(), "RIVET_SOURCE_VALUE_UNREPRESENTABLE");
+            let bad = RivetValue::TimeMicros(us);
+            let r = build_column(&dt, &[Some(&ok), Some(&bad)]).unwrap_err();
+            assert_eq!((r.row, &r.value), (1, &bad));
+            assert!(r.reason.contains("outside 00:00..24:00"), "{}", r.reason);
         }
         let ok = [0i64, 86_399_999_999].map(RivetValue::TimeMicros);
-        let arr = build_column("t", &dt, &[Some(&ok[0]), Some(&ok[1])]).unwrap();
+        let arr = build_column(&dt, &[Some(&ok[0]), Some(&ok[1])]).unwrap();
         assert_eq!(arr.null_count(), 0);
+    }
+
+    /// A DATE override refuses a DateTime with a time of day (batch wording) and keeps a midnight one.
+    #[test]
+    fn a_date_column_refuses_a_time_of_day_instead_of_dropping_it() {
+        use arrow::array::Date32Array;
+        let day = NaiveDate::from_ymd_opt(2024, 3, 15).unwrap();
+        let midnight = RivetValue::DateTime(day.and_hms_opt(0, 0, 0).unwrap());
+        let afternoon = RivetValue::DateTime(day.and_hms_opt(13, 14, 0).unwrap());
+        let r = build_column(&DataType::Date32, &[Some(&midnight), Some(&afternoon)]).unwrap_err();
+        assert_eq!((r.row, &r.value), (1, &afternoon));
+        assert!(
+            r.reason
+                .contains("has a time of day, which a `date` override would drop")
+                && r.reason.contains("declare it `timestamp`"),
+            "{}",
+            r.reason
+        );
+        let arr = build_column(&DataType::Date32, &[Some(&midnight)]).unwrap();
+        let d = arr.as_any().downcast_ref::<Date32Array>().unwrap();
+        assert_eq!(d.value(0), 19_797, "2024-03-15 is day 19797 of the epoch");
+    }
+
+    /// Decimal text fills a float column by the shared parser; non-numeric text is refused.
+    #[test]
+    fn float_columns_parse_decimal_text_and_refuse_words() {
+        use arrow::array::{Float32Array, Float64Array};
+        let cells = [
+            RivetValue::Bytes(b"1.5".to_vec()),
+            RivetValue::Bytes(b"-12345.67".to_vec()),
+            RivetValue::Bytes(b"0.10".to_vec()),
+        ];
+        let refs: Vec<Option<&RivetValue>> = cells.iter().map(Some).collect();
+        let a64 = build_column(&DataType::Float64, &refs).unwrap();
+        let a64 = a64.as_any().downcast_ref::<Float64Array>().unwrap();
+        assert_eq!(a64.values().to_vec(), vec![1.5, -12345.67, 0.1]);
+        let a32 = build_column(&DataType::Float32, &refs).unwrap();
+        let a32 = a32.as_any().downcast_ref::<Float32Array>().unwrap();
+        assert_eq!(a32.values().to_vec(), vec![1.5f32, -12345.67f32, 0.1f32]);
+        for dt in [DataType::Float32, DataType::Float64] {
+            let bad = RivetValue::Bytes(b"n/a".to_vec());
+            let r = build_column(&dt, &[Some(&bad)]).unwrap_err();
+            assert_eq!(
+                (r.row, &r.value, r.reason.as_str()),
+                (0, &bad, "is not a number")
+            );
+        }
+    }
+
+    /// Exact integer text fills an integer column; a fraction or overflow is refused.
+    #[test]
+    fn integer_columns_take_exact_integer_text_only() {
+        use arrow::array::Int32Array;
+        let cells = [
+            RivetValue::Bytes(b"42".to_vec()),
+            RivetValue::Bytes(b"-7.00".to_vec()),
+        ];
+        let refs: Vec<Option<&RivetValue>> = cells.iter().map(Some).collect();
+        let arr = build_column(&DataType::Int32, &refs).unwrap();
+        let a = arr.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(a.values().to_vec(), vec![42, -7]);
+        let frac = RivetValue::Bytes(b"1.5".to_vec());
+        let r = build_column(&DataType::Int32, &[Some(&frac)]).unwrap_err();
+        assert_eq!(r.reason, "is not an exact integer");
+        let big = RivetValue::Bytes(b"3000000000".to_vec());
+        let r = build_column(&DataType::Int32, &[Some(&big)]).unwrap_err();
+        assert!(r.reason.starts_with("overflows"), "{}", r.reason);
+    }
+
+    /// A list element that overflows or has the wrong variant refuses the cell, never a null element.
+    #[test]
+    fn a_list_element_that_does_not_fit_is_refused_not_nulled() {
+        use arrow::datatypes::Field;
+        let list = |t| DataType::List(Arc::new(Field::new("item", t, true)));
+        let cases = [
+            (list(DataType::Int16), RivetValue::Int(70_000)),
+            (list(DataType::Int32), RivetValue::Int(i64::MAX)),
+            (list(DataType::Int64), RivetValue::Bytes(b"x".to_vec())),
+            (list(DataType::Boolean), RivetValue::Int(1)),
+            (list(DataType::Float32), RivetValue::Bytes(b"x".to_vec())),
+            (list(DataType::Float64), RivetValue::Bool(true)),
+            (list(DataType::Utf8), RivetValue::Array(vec![])),
+        ];
+        for (dt, elem) in cases {
+            let cell = RivetValue::Array(vec![RivetValue::Null, elem.clone()]);
+            let r = build_column(&dt, &[None, Some(&cell)])
+                .expect_err(&format!("{dt}: {elem:?} must be refused"));
+            assert_eq!((r.row, &r.value), (1, &cell), "{dt}");
+            assert!(r.reason.starts_with("has an element"), "{}", r.reason);
+        }
+        let ok = RivetValue::Array(vec![RivetValue::Int(1), RivetValue::Null]);
+        let arr = build_column(&list(DataType::Int16), &[Some(&ok)]).unwrap();
+        assert_eq!(arr.len(), 1);
+    }
+
+    /// Every MySQL cell fix refuses a wire value it cannot read instead of returning NULL.
+    #[test]
+    fn mysql_cell_fixes_refuse_an_unreadable_wire_value() {
+        use RivetValue as V;
+        let fix = |native: &str| {
+            mysql_cell_fix(crate::source::cdc::CdcEngine::Mysql, native).expect(native)
+        };
+        assert!(fix("timestamp").apply(&V::Bytes(b"soon".to_vec())).is_err());
+        assert!(
+            fix("timestamp")
+                .apply(&V::Bytes(b"99999999999999999".to_vec()))
+                .is_err()
+        );
+        assert!(fix("year").apply(&V::Bytes(b"MMXXIV".to_vec())).is_err());
+        let e = fix("enum('a','b')");
+        let err = e.apply(&V::Int(3)).unwrap_err();
+        assert!(err.contains("past the column's 2 ENUM labels"), "{err}");
+        assert!(e.apply(&V::UInt(u64::MAX)).is_err());
+        assert_eq!(e.apply(&V::UInt(1)).unwrap(), V::Bytes(b"a".to_vec()));
+    }
+
+    /// A TIME rendered as text is `[-]hh:mm:ss.ffffff`, never raw microseconds.
+    #[test]
+    fn a_time_renders_as_time_beyond_day_text() {
+        let us = -(838 * 3600 + 59 * 60 + 59) * 1_000_000i64;
+        assert_eq!(render_str(&RivetValue::TimeMicros(us)), "-838:59:59.000000");
+        let arr = build_column(&DataType::Utf8, &[Some(&RivetValue::TimeMicros(1))]).unwrap();
+        let a = arr
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(a.value(0), "00:00:00.000001");
     }
 }

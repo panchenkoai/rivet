@@ -102,7 +102,6 @@ impl TypeMapping {
     }
 
     /// Deliver this column as canonical text: `Utf8`, `LogicalString`, `rivet.text_form` metadata.
-    #[allow(dead_code)]
     pub fn with_text(mut self, form: TextForm) -> Self {
         self.delivery = Delivery::Text(form);
         self.arrow_type = Some(DataType::Utf8);

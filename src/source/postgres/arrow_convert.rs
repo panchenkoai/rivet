@@ -88,9 +88,6 @@ impl<'a> PgFromSql<'a> for PgUuidBytes {
 /// wrapping `Add`, so PostgreSQL's legal `24:00:00` came back as `00:00:00`.
 struct PgTimeMicros(i64);
 
-/// Microseconds in one day: Arrow/Parquet TIME holds `[0, MICROS_PER_DAY)`.
-const MICROS_PER_DAY: i64 = 86_400_000_000;
-
 impl<'a> PgFromSql<'a> for PgTimeMicros {
     fn accepts(ty: &Type) -> bool {
         ty == &Type::TIME
@@ -101,7 +98,7 @@ impl<'a> PgFromSql<'a> for PgTimeMicros {
         raw: &'a [u8],
     ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
         let us = i64::from_be_bytes(raw.try_into()?);
-        if !(0..MICROS_PER_DAY).contains(&us) {
+        if !crate::types::is_time_of_day(us) {
             return Err(format!("time of {us} microseconds is outside 00:00..24:00").into());
         }
         Ok(Self(us))
@@ -1339,7 +1336,8 @@ mod decimal_override_tests {
 
 #[cfg(test)]
 mod temporal_refusal_tests {
-    use super::{MICROS_PER_DAY, PgInt, PgTimeMicros};
+    use super::{PgInt, PgTimeMicros};
+    use crate::types::MICROS_PER_DAY;
     use postgres::types::{FromSql, Type};
 
     /// PostgreSQL's legal `time '24:00:00'` is refused, not wrapped to midnight.

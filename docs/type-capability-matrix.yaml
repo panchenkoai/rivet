@@ -112,7 +112,20 @@ forms:
 engines:
   postgres:
     batch: {}
-    cdc: {}
+    cdc:
+      # test_decoding's own text, verbatim; any type the CDC builder has no
+      # native arm for (ADR-0038 CP4) is delivered the same way.
+      numeric: server_text              # no declared precision
+      money: server_text
+      inet: server_text
+      cidr: server_text
+      date[]: server_text               # arrays of these keep the server's literal
+      timestamp[]: server_text
+      timestamptz[]: server_text
+      time[]: server_text
+      uuid[]: server_text
+      bytea[]: server_text
+      numeric[]: server_text
   mysql:
     batch: {}
     cdc: {}

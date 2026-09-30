@@ -824,12 +824,14 @@ const PIN_INDEPENDENT: usize = 99;
 // 2026-09-28, source connection ceilings: +3 shared codec — the run's captured row is the
 // fixture check; the oracle is the server's own connection counter.
 // 2026-09-29: +2 shared codec — the Oracle TRUNCATE refusal on re-run and the uncaptured-truncate cell.
-const PIN_SHARED_CODEC: usize = 87;
+// 2026-09-30: +2 shared codec — the MySQL float-override and PG bare-numeric cells read the part with arrow; their expected values are the server's own CAST/::text.
+const PIN_SHARED_CODEC: usize = 89;
 const PIN_SELF_COUNTER: usize = 6;
 // 2026-09-28: +1 presence — the SQL Server undecodable-cell refusal, whose oracle is the refusal.
 // 2026-09-29: +2 presence — the PG CDC LMT-timezone and DOMAIN parity cells compare CDC to batch output.
 // 2026-09-29: +2 presence — the MySQL out-of-range TIME and Oracle int-override refusals, whose oracle is the refusal plus the unmoved checkpoint.
-const PIN_PRESENCE: usize = 80;
+// 2026-09-30: +1 presence — the Oracle date-override refusal, whose oracle is the refusal plus the unmoved checkpoint.
+const PIN_PRESENCE: usize = 81;
 
 /// TIER 2 (harness audit, 2026-08-29): a test whose NAME makes a
 /// COMPLETENESS claim must carry a class-(a) INDEPENDENT oracle — not merely

@@ -63,6 +63,14 @@ pub use source_column::ColumnOverride;
 /// declared precision/scale instead of autodetected (often unavailable) metadata.
 pub type ColumnOverrides = std::collections::HashMap<String, RivetType>;
 
+/// Microseconds in one day: an Arrow/Parquet `Time64` holds `[0, MICROS_PER_DAY)`.
+pub const MICROS_PER_DAY: i64 = 86_400_000_000;
+
+/// True when `us` is a time of day an Arrow/Parquet `Time64` can hold.
+pub fn is_time_of_day(us: i64) -> bool {
+    (0..MICROS_PER_DAY).contains(&us)
+}
+
 /// Narrow a parsed override map to ONE table: bare keys (`amount`) apply to
 /// every table; qualified keys (`orders.amount`) apply only to their table and
 /// WIN over a bare key for the same column. Foreign-qualified keys are
@@ -148,6 +156,14 @@ mod tests {
         let users = overrides_for_table(&all, "users");
         assert_eq!(users.get("v"), Some(&RivetType::Text), "bare fallback");
         assert_eq!(users.len(), 1, "foreign-qualified keys never leak");
+    }
+
+    #[test]
+    fn is_time_of_day_is_the_half_open_day() {
+        assert!(is_time_of_day(0));
+        assert!(is_time_of_day(86_399_999_999));
+        assert!(!is_time_of_day(86_400_000_000));
+        assert!(!is_time_of_day(-1));
     }
 
     #[test]

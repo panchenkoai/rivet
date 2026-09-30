@@ -414,7 +414,9 @@ impl crate::source::value_checksum::CellSource for MysqlCellSource<'_> {
         match self.rows[row].as_ref(col) {
             Some(Value::Float(v)) => Some(*v),
             Some(Value::Double(v)) => Some(*v as f32),
-            Some(Value::Bytes(bv)) => bytes_to_str(bv).and_then(|s| s.parse().ok()),
+            Some(Value::Bytes(bv)) => {
+                bytes_to_str(bv).and_then(crate::types::decimal::decimal_text_to_float)
+            }
             _ => None,
         }
     }
@@ -422,7 +424,9 @@ impl crate::source::value_checksum::CellSource for MysqlCellSource<'_> {
         match self.rows[row].as_ref(col) {
             Some(Value::Float(v)) => Some(*v as f64),
             Some(Value::Double(v)) => Some(*v),
-            Some(Value::Bytes(bv)) => bytes_to_str(bv).and_then(|s| s.parse().ok()),
+            Some(Value::Bytes(bv)) => {
+                bytes_to_str(bv).and_then(crate::types::decimal::decimal_text_to_float)
+            }
             _ => None,
         }
     }
@@ -593,9 +597,9 @@ fn mysql_time_of_day(v: Option<&Value>) -> Result<Option<i64>> {
     Ok(Some(time_of_day_in_range(us)?))
 }
 
-/// MySQL TIME microseconds unchanged when inside 00:00..24:00; a refusal otherwise (batch and CDC share it).
-pub(crate) fn time_of_day_in_range(us: i64) -> Result<i64> {
-    if !(0..86_400_000_000).contains(&us) {
+/// MySQL TIME microseconds unchanged when inside 00:00..24:00; a refusal with the MySQL remedy otherwise.
+fn time_of_day_in_range(us: i64) -> Result<i64> {
+    if !crate::types::is_time_of_day(us) {
         crate::rivet_bail!(
             crate::error::codes::SOURCE_VALUE_UNREPRESENTABLE,
             "mysql: TIME {} is outside 00:00..24:00, which a Parquet TIME cannot hold (MySQL TIME is a \
@@ -749,7 +753,9 @@ fn build_array(
                 match row.as_ref(col_idx) {
                     Some(Value::Float(v)) => b.append_value(*v),
                     Some(Value::Double(v)) => b.append_value(*v as f32),
-                    Some(Value::Bytes(bv)) => match bytes_to_str(bv).and_then(|s| s.parse().ok()) {
+                    Some(Value::Bytes(bv)) => match bytes_to_str(bv)
+                        .and_then(crate::types::decimal::decimal_text_to_float)
+                    {
                         Some(v) => b.append_value(v),
                         None => b.append_null(),
                     },
@@ -764,7 +770,9 @@ fn build_array(
                 match row.as_ref(col_idx) {
                     Some(Value::Float(v)) => b.append_value(*v as f64),
                     Some(Value::Double(v)) => b.append_value(*v),
-                    Some(Value::Bytes(bv)) => match bytes_to_str(bv).and_then(|s| s.parse().ok()) {
+                    Some(Value::Bytes(bv)) => match bytes_to_str(bv)
+                        .and_then(crate::types::decimal::decimal_text_to_float)
+                    {
                         Some(v) => b.append_value(v),
                         None => b.append_null(),
                     },

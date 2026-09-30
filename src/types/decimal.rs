@@ -232,9 +232,58 @@ fn pow10_i256(n: u32) -> Option<i256> {
     Some(acc)
 }
 
+/// Decimal text that is exactly an integer (`-42`, `42.00`); `None` for a fraction, non-numeric text or `i128` overflow.
+pub fn decimal_text_to_int(s: &str) -> Option<i128> {
+    let s = s.trim();
+    let (int, frac) = s.split_once('.').unwrap_or((s, ""));
+    let digits = int.strip_prefix(['-', '+']).unwrap_or(int);
+    if digits.is_empty()
+        || !digits.bytes().all(|b| b.is_ascii_digit())
+        || !frac.bytes().all(|b| b == b'0')
+    {
+        return None;
+    }
+    int.parse().ok()
+}
+
+/// Decimal text as the nearest float of type `F` (correctly rounded); `None` for non-numeric text.
+pub fn decimal_text_to_float<F: std::str::FromStr>(s: &str) -> Option<F> {
+    s.trim().parse().ok()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::decimal_str_to_scaled_i128;
+    use super::{decimal_str_to_scaled_i128, decimal_text_to_float, decimal_text_to_int};
+
+    #[test]
+    fn decimal_text_to_int_accepts_only_exact_integers() {
+        assert_eq!(decimal_text_to_int("42"), Some(42));
+        assert_eq!(decimal_text_to_int("-42"), Some(-42));
+        assert_eq!(decimal_text_to_int("+7"), Some(7));
+        assert_eq!(decimal_text_to_int(" 42.00 "), Some(42));
+        assert_eq!(decimal_text_to_int("0.0"), Some(0));
+        assert_eq!(
+            decimal_text_to_int("18446744073709551615"),
+            Some(18_446_744_073_709_551_615)
+        );
+        for bad in [
+            "1.5", "42.01", "", "-", ".0", "abc", "1e3", "--5", "4 2", "0x10", "1.5.0",
+        ] {
+            assert_eq!(decimal_text_to_int(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn decimal_text_to_float_parses_decimal_text_and_refuses_words() {
+        assert_eq!(decimal_text_to_float::<f64>("1.5"), Some(1.5));
+        assert_eq!(decimal_text_to_float::<f64>("-12345.67"), Some(-12345.67));
+        assert_eq!(decimal_text_to_float::<f64>(" 0.10 "), Some(0.1));
+        assert_eq!(decimal_text_to_float::<f32>("0.1"), Some(0.1f32));
+        assert_eq!(decimal_text_to_float::<f64>("1e3"), Some(1000.0));
+        for bad in ["", "abc", "1,5", "1.5x", "0x10"] {
+            assert_eq!(decimal_text_to_float::<f64>(bad), None, "{bad:?}");
+        }
+    }
 
     /// A NEGATIVE scale refuses a lossy down-scale, mirroring the positive-scale
     /// arm. `decimal(_,-2)` stores whole hundreds; "1250" is not a multiple of

@@ -425,7 +425,7 @@ pub(crate) fn value_from_binary(
 
 /// Raw `time` microseconds, refusing 24:00:00 (a day-length value no time-of-day can hold).
 fn time_micros(us: i64) -> Result<i64> {
-    if !(0..86_400_000_000).contains(&us) {
+    if !crate::types::is_time_of_day(us) {
         crate::rivet_bail!(
             crate::error::codes::SOURCE_CDC_CELL_UNSUPPORTED,
             "pgoutput: a `time` of {us} microseconds is outside 00:00:00..24:00:00 \

@@ -1574,7 +1574,31 @@ impl<'s> CdcSchemaResolver<'s> {
                 m.source_native_type = ct.to_string();
             }
         }
-        Ok(mappings)
+        mappings
+            .into_iter()
+            .map(|m| {
+                let overridden = overrides.contains_key(&m.column_name);
+                plan_cdc_delivery(m, overridden)
+            })
+            .collect()
+    }
+}
+
+/// The CDC plan for one column: kept when the builder builds it, else the server's own text; an unbuildable override is refused.
+pub(crate) fn plan_cdc_delivery(
+    m: crate::types::TypeMapping,
+    overridden: bool,
+) -> Result<crate::types::TypeMapping> {
+    match &m.arrow_type {
+        Some(dt) if value::is_buildable(dt) => Ok(m),
+        _ if overridden => crate::rivet_bail!(
+            crate::error::codes::SOURCE_OVERRIDE_WIRE_MISMATCH,
+            "cdc: column '{}' has a `columns:` override to {}, which the CDC change-event \
+             builder cannot produce; correct or drop the override",
+            m.column_name,
+            m.rivet_type.label()
+        ),
+        _ => Ok(m.with_text(crate::types::TextForm::ServerText)),
     }
 }
 
@@ -1790,6 +1814,7 @@ pub(crate) fn run_capture(
             dest_uri: o.dest_uri,
             row_hash: o.row_hash,
             partition: o.partition,
+            overridden: o.overrides.keys().cloned().collect(),
         });
     }
     let sink_cfg = sink::SinkConfig {
@@ -1927,6 +1952,46 @@ mod mod_decisions {
     /// TWO columns minimum: with one, `==` and `!=` are indistinguishable because
     /// there is no neighbour to pick up — the same reason the row-hash injectivity
     /// guard needed two fields.
+    /// A buildable column is kept, an unbuildable one becomes server text, an unbuildable override is refused.
+    #[test]
+    fn cdc_delivery_keeps_buildable_types_texts_the_rest_and_refuses_an_unbuildable_override() {
+        use crate::types::{
+            Delivery, RivetType, SourceColumn, TextForm, TimeUnit, TypeFidelity, TypeMapping,
+        };
+        let col = |native: &str, t: RivetType| {
+            TypeMapping::from_source(&SourceColumn::simple("c", native, true), t)
+        };
+        let kept = plan_cdc_delivery(col("bigint", RivetType::Int64), true).unwrap();
+        assert_eq!(kept.delivery, Delivery::Native);
+        assert_eq!(kept.arrow_type, Some(arrow::datatypes::DataType::Int64));
+
+        let numeric = RivetType::Unsupported {
+            native_type: "numeric".into(),
+            reason: "no precision".into(),
+        };
+        let date_list = RivetType::List {
+            inner: Box::new(RivetType::Date),
+        };
+        for t in [numeric, date_list] {
+            let m = plan_cdc_delivery(col("numeric", t.clone()), false).unwrap();
+            assert_eq!(m.delivery, Delivery::Text(TextForm::ServerText), "{t:?}");
+            assert_eq!(m.arrow_type, Some(arrow::datatypes::DataType::Utf8));
+            assert_eq!(m.fidelity, TypeFidelity::LogicalString);
+        }
+
+        let ns = RivetType::Timestamp {
+            unit: TimeUnit::Nanosecond,
+            timezone: None,
+        };
+        let err = plan_cdc_delivery(col("timestamp", ns), true).unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<crate::error::CodedError>()
+                .map(|c| c.code()),
+            Some("RIVET_SOURCE_OVERRIDE_WIRE_MISMATCH")
+        );
+        assert!(format!("{err:#}").contains("column 'c'"), "{err:#}");
+    }
+
     #[test]
     fn a_columns_native_type_is_looked_up_by_its_own_name() {
         let catalog = vec![
