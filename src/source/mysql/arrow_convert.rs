@@ -590,6 +590,11 @@ fn mysql_time_of_day(v: Option<&Value>) -> Result<Option<i64>> {
             "mysql: a TIME column delivered {other:?}; rivet refuses rather than writing NULL"
         ),
     };
+    Ok(Some(time_of_day_in_range(us)?))
+}
+
+/// MySQL TIME microseconds unchanged when inside 00:00..24:00; a refusal otherwise (batch and CDC share it).
+pub(crate) fn time_of_day_in_range(us: i64) -> Result<i64> {
     if !(0..86_400_000_000).contains(&us) {
         crate::rivet_bail!(
             crate::error::codes::SOURCE_VALUE_UNREPRESENTABLE,
@@ -598,7 +603,7 @@ fn mysql_time_of_day(v: Option<&Value>) -> Result<Option<i64>> {
             fmt_micros_as_time(us)
         );
     }
-    Ok(Some(us))
+    Ok(us)
 }
 
 /// `[-]H:MM:SS.ffffff` for a message.

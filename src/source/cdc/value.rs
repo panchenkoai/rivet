@@ -24,6 +24,8 @@ use arrow::datatypes::{DataType, TimeUnit};
 use chrono::{NaiveDate, NaiveDateTime};
 use serde_json::Value as Json;
 
+use anyhow::Context;
+
 use crate::error::Result;
 
 /// Days from the Unix epoch (1970-01-01) for `Date32`.
@@ -231,9 +233,27 @@ fn fixed_binary_bytes(by: &[u8], n: usize) -> Option<Vec<u8>> {
     None
 }
 
+/// The refusal for a non-NULL cell that column `col`'s Arrow type `dt` cannot hold.
+fn cell_mismatch(col: &str, dt: &DataType, v: &RivetValue) -> anyhow::Error {
+    let full = render_str(v);
+    let shown: String = full.chars().take(64).collect();
+    let more = if shown.len() < full.len() { "…" } else { "" };
+    anyhow::Error::new(crate::error::CodedError::new(
+        crate::error::codes::SOURCE_OVERRIDE_WIRE_MISMATCH,
+        format!(
+            "cdc: column '{col}' is {dt} but the captured value {shown:?}{more} cannot be read \
+             as that type; rivet refuses rather than writing NULL"
+        ),
+    ))
+}
+
 /// Build one Arrow column from typed cells (one per row; `None` ⇒ null). `dt` is
 /// the [`render_type`] — i.e. exactly the array type the schema field declares.
-pub(crate) fn build_column(dt: &DataType, cells: &[Option<&RivetValue>]) -> Result<ArrayRef> {
+pub(crate) fn build_column(
+    col: &str,
+    dt: &DataType,
+    cells: &[Option<&RivetValue>],
+) -> Result<ArrayRef> {
     use RivetValue as V;
 
     // Normalise the explicit NULL variant to a missing cell up front, for every
@@ -286,9 +306,7 @@ pub(crate) fn build_column(dt: &DataType, cells: &[Option<&RivetValue>]) -> Resu
                             stringify!($ty)
                         ),
                     },
-                    // A non-integer variant in an integer column is a separate
-                    // type-mismatch case, not an overflow — keep the null fallback.
-                    _ => b.append_null(),
+                    Some(v) => return Err(cell_mismatch(col, dt, v)),
                 }
             }
             Arc::new(b.finish())
@@ -303,7 +321,8 @@ pub(crate) fn build_column(dt: &DataType, cells: &[Option<&RivetValue>]) -> Resu
                     Some(V::Bool(x)) => b.append_value(*x),
                     Some(V::Int(i)) => b.append_value(*i != 0),
                     Some(V::UInt(u)) => b.append_value(*u != 0),
-                    _ => b.append_null(),
+                    None => b.append_null(),
+                    Some(v) => return Err(cell_mismatch(col, dt, v)),
                 }
             }
             Arc::new(b.finish())
@@ -323,7 +342,8 @@ pub(crate) fn build_column(dt: &DataType, cells: &[Option<&RivetValue>]) -> Resu
                     Some(V::Float(f)) => b.append_value(*f as f32),
                     Some(V::Int(i)) => b.append_value(*i as f32),
                     Some(V::UInt(u)) => b.append_value(*u as f32),
-                    _ => b.append_null(),
+                    None => b.append_null(),
+                    Some(v) => return Err(cell_mismatch(col, dt, v)),
                 }
             }
             Arc::new(b.finish())
@@ -335,7 +355,8 @@ pub(crate) fn build_column(dt: &DataType, cells: &[Option<&RivetValue>]) -> Resu
                     Some(V::Float(f)) => b.append_value(*f),
                     Some(V::Int(i)) => b.append_value(*i as f64),
                     Some(V::UInt(u)) => b.append_value(*u as f64),
-                    _ => b.append_null(),
+                    None => b.append_null(),
+                    Some(v) => return Err(cell_mismatch(col, dt, v)),
                 }
             }
             Arc::new(b.finish())
@@ -344,8 +365,9 @@ pub(crate) fn build_column(dt: &DataType, cells: &[Option<&RivetValue>]) -> Resu
             let mut b = Date32Builder::with_capacity(cells.len());
             for c in cells {
                 match c {
-                    Some(V::DateTime(dt)) => b.append_value(epoch_days(dt.date())),
-                    _ => b.append_null(),
+                    Some(V::DateTime(d)) => b.append_value(epoch_days(d.date())),
+                    None => b.append_null(),
+                    Some(v) => return Err(cell_mismatch(col, dt, v)),
                 }
             }
             Arc::new(b.finish())
@@ -357,8 +379,9 @@ pub(crate) fn build_column(dt: &DataType, cells: &[Option<&RivetValue>]) -> Resu
             let mut b = TimestampMicrosecondBuilder::with_capacity(cells.len());
             for c in cells {
                 match c {
-                    Some(V::DateTime(dt)) => b.append_value(dt.and_utc().timestamp_micros()),
-                    _ => b.append_null(),
+                    Some(V::DateTime(d)) => b.append_value(d.and_utc().timestamp_micros()),
+                    None => b.append_null(),
+                    Some(v) => return Err(cell_mismatch(col, dt, v)),
                 }
             }
             let arr = b.finish();
@@ -371,8 +394,12 @@ pub(crate) fn build_column(dt: &DataType, cells: &[Option<&RivetValue>]) -> Resu
             let mut b = Time64MicrosecondBuilder::with_capacity(cells.len());
             for c in cells {
                 match c {
-                    Some(V::TimeMicros(us)) => b.append_value(*us),
-                    _ => b.append_null(),
+                    Some(V::TimeMicros(us)) => b.append_value(
+                        crate::source::mysql::time_of_day_in_range(*us)
+                            .with_context(|| format!("cdc: column '{col}'"))?,
+                    ),
+                    None => b.append_null(),
+                    Some(v) => return Err(cell_mismatch(col, dt, v)),
                 }
             }
             Arc::new(b.finish())
@@ -430,7 +457,8 @@ pub(crate) fn build_column(dt: &DataType, cells: &[Option<&RivetValue>]) -> Resu
             for c in cells {
                 match c {
                     Some(V::Bytes(by)) => b.append_value(by),
-                    _ => b.append_null(),
+                    None => b.append_null(),
+                    Some(v) => return Err(cell_mismatch(col, dt, v)),
                 }
             }
             Arc::new(b.finish())
@@ -440,7 +468,8 @@ pub(crate) fn build_column(dt: &DataType, cells: &[Option<&RivetValue>]) -> Resu
             for c in cells {
                 match c {
                     Some(V::Bytes(by)) => b.append_value(by),
-                    _ => b.append_null(),
+                    None => b.append_null(),
+                    Some(v) => return Err(cell_mismatch(col, dt, v)),
                 }
             }
             Arc::new(b.finish())
@@ -452,13 +481,12 @@ pub(crate) fn build_column(dt: &DataType, cells: &[Option<&RivetValue>]) -> Resu
                     // Width-`n` bytes, or (at n=16) the canonical 36-char text
                     // UUID the MySQL binlog delivers for a CHAR/VARCHAR(36)
                     // column under a `uuid` override — see `fixed_binary_bytes`.
-                    // Anything genuinely unfillable still degrades to null rather
-                    // than failing the whole batch.
-                    Some(V::Bytes(by)) => match fixed_binary_bytes(by, *n as usize) {
+                    Some(v @ V::Bytes(by)) => match fixed_binary_bytes(by, *n as usize) {
                         Some(bytes) => b.append_value(&bytes).map_err(|e| anyhow::anyhow!(e))?,
-                        None => b.append_null(),
+                        None => return Err(cell_mismatch(col, dt, v)),
                     },
-                    _ => b.append_null(),
+                    None => b.append_null(),
+                    Some(v) => return Err(cell_mismatch(col, dt, v)),
                 }
             }
             Arc::new(b.finish())
@@ -1162,7 +1190,7 @@ mod tests {
             ] {
                 // Result may be Ok or a LOUD Err (decimal refuses NaN-likes);
                 // the property is: no panic, ever.
-                let _ = build_column(&dt, &cells);
+                let _ = build_column("c", &dt, &cells);
             }
         }
     }
@@ -1270,12 +1298,7 @@ mod tests {
             ),
             (
                 DataType::FixedSizeBinary(16),
-                // wrong width → builder nulls; the fold must too.
-                vec![
-                    Some(V::Bytes(vec![7u8; 16])),
-                    Some(V::Bytes(vec![1, 2])),
-                    None,
-                ],
+                vec![Some(V::Bytes(vec![7u8; 16])), None],
             ),
             (
                 list_utf8,
@@ -1296,7 +1319,7 @@ mod tests {
         ];
         for (dt, owned) in cases {
             let cells: Vec<Option<&RivetValue>> = owned.iter().map(|c| c.as_ref()).collect();
-            let arr = build_column(&dt, &cells).unwrap();
+            let arr = build_column("c", &dt, &cells).unwrap();
             assert_eq!(
                 cells_checksum(&dt, &cells),
                 array_checksum(arr.as_ref()),
@@ -1337,7 +1360,7 @@ mod tests {
         let cells = [Some(&text), Some(&raw), None];
         let refs: Vec<Option<&RivetValue>> = cells.to_vec();
 
-        let arr = build_column(&dt, &refs).unwrap();
+        let arr = build_column("c", &dt, &refs).unwrap();
         let fsb = arr
             .as_any()
             .downcast_ref::<FixedSizeBinaryArray>()
@@ -1362,19 +1385,6 @@ mod tests {
             "both ends must canonicalise identically — teaching only the builder \
              turns a CORRECT export into a checksum-mismatch failure at sink.rs"
         );
-    }
-
-    /// A value that is neither the declared width nor a parseable UUID still
-    /// degrades to null rather than failing the batch — the lenient half of the
-    /// contract is deliberate and must survive the fix above.
-    #[test]
-    fn a_fixed_size_binary_cell_that_is_neither_width_nor_uuid_stays_null() {
-        use RivetValue as V;
-        let dt = DataType::FixedSizeBinary(16);
-        let junk = V::Bytes(b"not-a-uuid".to_vec());
-        let refs: Vec<Option<&RivetValue>> = vec![Some(&junk)];
-        let arr = build_column(&dt, &refs).unwrap();
-        assert_eq!(arr.null_count(), 1, "unparseable stays null, no panic");
     }
 
     // Sensitivity: a corrupted cell must MOVE the fold, so the sink's compare
@@ -1403,7 +1413,7 @@ mod tests {
         use arrow::array::Array;
         let cells: Vec<Option<&RivetValue>> = vec![Some(&RivetValue::Null), None];
         for dt in [DataType::Utf8, DataType::LargeUtf8] {
-            let arr = build_column(&dt, &cells).unwrap();
+            let arr = build_column("c", &dt, &cells).unwrap();
             assert!(
                 arr.is_null(0),
                 "{dt:?}: Some(Null) must append a NULL, not an empty string"
@@ -1526,12 +1536,12 @@ mod tests {
         assert!(decimal_to_i256(&RivetValue::Float(1e12), 4).is_none());
         // A small MONEY value still builds.
         let small = RivetValue::Float(12.34);
-        let ok = build_column(&DataType::Decimal128(19, 4), &[Some(&small)])
+        let ok = build_column("c", &DataType::Decimal128(19, 4), &[Some(&small)])
             .expect("a small MONEY value builds");
         assert_eq!(ok.len(), 1);
         // A huge MONEY value in a Decimal column fails loud with the 2^53 message.
         let huge = RivetValue::Float(1e12);
-        let err = build_column(&DataType::Decimal128(19, 4), &[Some(&huge)])
+        let err = build_column("c", &DataType::Decimal128(19, 4), &[Some(&huge)])
             .expect_err("a MONEY value past f64-exact range must fail loud, not round silently");
         let msg = err.to_string().to_lowercase();
         assert!(
@@ -1593,14 +1603,15 @@ mod tests {
         use arrow::array::{Array, Int32Array};
         // In-range values + a genuine null build cleanly.
         let (v7, vnull_src) = (RivetValue::Int(7), RivetValue::Int(-5));
-        let arr = build_column(&DataType::Int32, &[Some(&v7), None, Some(&vnull_src)]).unwrap();
+        let arr =
+            build_column("c", &DataType::Int32, &[Some(&v7), None, Some(&vnull_src)]).unwrap();
         let a = arr.as_any().downcast_ref::<Int32Array>().unwrap();
         assert_eq!(a.value(0), 7);
         assert!(a.is_null(1)); // null cell stays null
         assert_eq!(a.value(2), -5);
         // Overflow → loud error, not a silent null wrap.
         let vmax = RivetValue::Int(i64::MAX);
-        let err = build_column(&DataType::Int32, &[Some(&vmax)])
+        let err = build_column("c", &DataType::Int32, &[Some(&vmax)])
             .expect_err("an integer overflowing the declared width must fail loud");
         assert!(
             err.to_string().to_lowercase().contains("overflow"),
@@ -1610,7 +1621,7 @@ mod tests {
         // and must fail loud in an Int64 column, exactly like the batch export.
         let bit64 = RivetValue::UInt(u64::MAX);
         assert!(
-            build_column(&DataType::Int64, &[Some(&bit64)]).is_err(),
+            build_column("c", &DataType::Int64, &[Some(&bit64)]).is_err(),
             "a BIT(64) value past i64::MAX must fail loud, never a silent CDC null"
         );
     }
@@ -1626,10 +1637,10 @@ mod tests {
         let list_i32 = DataType::List(Arc::new(Field::new("item", DataType::Int32, true)));
         // A NULL cell is a valid null list — must still succeed.
         let none: Option<&RivetValue> = None;
-        build_column(&list_i32, &[none]).expect("a null cell builds a null list");
+        build_column("c", &list_i32, &[none]).expect("a null cell builds a null list");
         // The raw multi-dim literal (as text bytes) must fail loud.
         let raw = RivetValue::Bytes(b"{{1,2},{3,4}}".to_vec());
-        let err = build_column(&list_i32, &[Some(&raw)])
+        let err = build_column("c", &list_i32, &[Some(&raw)])
             .expect_err("a non-array cell in a list column must fail loud");
         let msg = err.to_string().to_lowercase();
         assert!(
@@ -1681,7 +1692,7 @@ mod tests {
         ];
         for dt in &buildable {
             assert!(is_buildable(dt), "is_buildable must accept {dt:?}");
-            let arr = build_column(dt, &[None]).unwrap();
+            let arr = build_column("c", dt, &[None]).unwrap();
             assert_eq!(
                 arr.data_type(),
                 dt,
@@ -1697,5 +1708,126 @@ mod tests {
             assert!(!is_buildable(&dt), "is_buildable must reject {dt:?}");
             assert_eq!(render_type(Some(&dt)), DataType::Utf8);
         }
+    }
+
+    /// Every typed arm refuses a mismatched non-NULL cell by name, and still nulls a genuine NULL.
+    #[test]
+    fn a_mismatched_cell_is_refused_by_column_name_and_a_null_stays_null() {
+        use RivetValue as V;
+        let dec = V::Bytes(b"1.5".to_vec());
+        let cases: Vec<(DataType, V)> = vec![
+            (DataType::Int8, dec.clone()),
+            (DataType::Int16, dec.clone()),
+            (DataType::Int32, dec.clone()),
+            (DataType::Int64, dec.clone()),
+            (DataType::UInt8, dec.clone()),
+            (DataType::UInt16, dec.clone()),
+            (DataType::UInt32, dec.clone()),
+            (DataType::UInt64, dec.clone()),
+            (DataType::Int32, V::Float(1.5)),
+            (DataType::Boolean, V::Bytes(b"t".to_vec())),
+            (DataType::Float32, dec.clone()),
+            (DataType::Float64, dec.clone()),
+            (DataType::Date32, V::Bytes(b"2026-01-01".to_vec())),
+            (DataType::Date32, V::Int(3)),
+            (
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                V::Bytes(b"2026-01-01 00:00:00".to_vec()),
+            ),
+            (
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                V::Int(3),
+            ),
+            (
+                DataType::Time64(TimeUnit::Microsecond),
+                V::Bytes(b"12:00:00".to_vec()),
+            ),
+            (DataType::Binary, V::Int(7)),
+            (DataType::LargeBinary, V::Int(7)),
+            (
+                DataType::FixedSizeBinary(16),
+                V::Bytes(b"not-a-uuid".to_vec()),
+            ),
+            (DataType::FixedSizeBinary(4), V::Int(7)),
+        ];
+        for (dt, v) in &cases {
+            let err = build_column("amount", dt, &[Some(v)])
+                .expect_err(&format!("{dt:?} must refuse {v:?}, not write NULL"));
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("column 'amount'") && msg.contains(&dt.to_string()),
+                "the refusal must name the column and the type: {msg}"
+            );
+            assert!(
+                msg.contains(&format!("{:?}", render_str(v))),
+                "the refusal must show the value: {msg}"
+            );
+            let arr = build_column("amount", dt, &[Some(&V::Null), None]).unwrap();
+            assert_eq!(arr.null_count(), 2, "{dt:?}: a genuine NULL stays NULL");
+        }
+    }
+
+    /// A long offending value is shown truncated, not dumped whole into the message.
+    #[test]
+    fn a_mismatch_message_truncates_the_value() {
+        let long = RivetValue::Bytes(vec![b'9'; 500]);
+        let msg = format!(
+            "{:#}",
+            build_column("c", &DataType::Int64, &[Some(&long)]).unwrap_err()
+        );
+        assert!(msg.contains(&format!("\"{}\"…", "9".repeat(64))), "{msg}");
+        assert!(!msg.contains(&"9".repeat(65)), "{msg}");
+        let short = format!(
+            "{:#}",
+            build_column(
+                "c",
+                &DataType::Int64,
+                &[Some(&RivetValue::Bytes(b"1.5".to_vec()))]
+            )
+            .unwrap_err()
+        );
+        assert!(
+            short.contains("\"1.5\" cannot"),
+            "no ellipsis on a short value: {short}"
+        );
+    }
+
+    /// An unsigned cell in a Boolean column is true exactly when it is non-zero.
+    #[test]
+    fn an_unsigned_cell_in_a_boolean_column_is_true_when_non_zero() {
+        let arr = build_column(
+            "b",
+            &DataType::Boolean,
+            &[Some(&RivetValue::UInt(1)), Some(&RivetValue::UInt(0))],
+        )
+        .unwrap();
+        let b = arr
+            .as_any()
+            .downcast_ref::<arrow::array::BooleanArray>()
+            .unwrap();
+        assert!(b.value(0) && !b.value(1));
+    }
+
+    /// A MySQL TIME outside one day is refused exactly like the batch export; in-range times build.
+    #[test]
+    fn a_time_outside_one_day_is_refused_like_the_batch_export() {
+        let dt = DataType::Time64(TimeUnit::Microsecond);
+        for us in [
+            (838 * 3600 + 59 * 60 + 59) * 1_000_000i64,
+            -3_600_000_000,
+            86_400_000_000,
+        ] {
+            let err = build_column("t", &dt, &[Some(&RivetValue::TimeMicros(us))]).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(msg.contains("column 't'"), "{msg}");
+            assert!(msg.contains("is outside 00:00..24:00"), "{msg}");
+            let coded = err
+                .downcast_ref::<crate::error::CodedError>()
+                .expect("the batch's coded refusal survives the column context");
+            assert_eq!(coded.code(), "RIVET_SOURCE_VALUE_UNREPRESENTABLE");
+        }
+        let ok = [0i64, 86_399_999_999].map(RivetValue::TimeMicros);
+        let arr = build_column("t", &dt, &[Some(&ok[0]), Some(&ok[1])]).unwrap();
+        assert_eq!(arr.null_count(), 0);
     }
 }

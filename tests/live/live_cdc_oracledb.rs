@@ -42,6 +42,43 @@ fn ops(v: &[(i64, &str)]) -> Vec<(i64, String)> {
     v.iter().map(|(i, o)| (*i, o.to_string())).collect()
 }
 
+/// An `int4` override on a fractional NUMBER fails the CDC run by column, like batch, and never checkpoints.
+#[test]
+#[ignore = "live: requires the oracle service with LogMiner prerequisites"]
+fn oracle_cdc_an_int_override_on_a_fractional_number_fails_by_column_not_null() {
+    let _serial = cross_process_serial("oracle_cdc");
+    let d = tempfile::tempdir().unwrap();
+    let t = cdc_table(
+        "ora_cover",
+        "id NUMBER(18) PRIMARY KEY, amount NUMBER(10,2)",
+    );
+    let ckpt = d.path().join("cdc.ckpt");
+    let over = r#"columns: { AMOUNT: int4 }"#;
+    rig(&t, &ckpt, &d.path().join("anchor"))
+        .export_line(over)
+        .run_ok();
+    let anchored = std::fs::read(&ckpt).unwrap();
+    ora_exec(&format!("INSERT INTO {} VALUES (1, 1.5)", t.name()));
+
+    let batch = Rig::oracle_batch(t.name())
+        .export_line(over)
+        .run_expect_fail();
+    let err = rig(&t, &ckpt, &d.path().join("out"))
+        .export_line(over)
+        .run_expect_fail();
+    assert!(
+        err.contains("RIVET_SOURCE_OVERRIDE_WIRE_MISMATCH")
+            && err.contains("column 'AMOUNT' is Int32")
+            && err.contains("\"1.5\""),
+        "CDC must refuse naming the column, its type and the value: {err}\nbatch: {batch}"
+    );
+    assert_eq!(
+        std::fs::read(&ckpt).unwrap(),
+        anchored,
+        "a refused flush must not advance the checkpoint past the row"
+    );
+}
+
 #[test]
 #[ignore = "live: requires the oracle service with LogMiner prerequisites"]
 fn oracle_cdc_resume_captures_only_new_changes() {

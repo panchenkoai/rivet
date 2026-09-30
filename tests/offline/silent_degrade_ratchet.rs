@@ -3,7 +3,7 @@
 //! count under `src/source/` may only shrink.
 
 /// Occurrences under `src/source/` on 2026-09-29, when the ratchet landed.
-const CEILING: usize = 55;
+const CEILING: usize = 45;
 
 /// The shapes that swap an unreadable value for NULL or nothing.
 const SHAPES: &[&str] = &[
