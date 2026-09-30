@@ -162,17 +162,28 @@ fn row_violations(doc: &Value) -> Vec<String> {
                 if mode == "batch" && !r["diverges"].is_null() {
                     bad.push(format!("{at}: `diverges:` belongs on the cdc row"));
                 }
-                if let Some(why) = r["known_defect"].as_str() {
-                    if !(why.contains("ADR-") && why.contains("step")) {
+                for key in r.as_mapping().into_iter().flat_map(|m| m.keys()) {
+                    let key = key.as_str().unwrap_or("");
+                    let cdc_only = ["clickhouse", "clickhouse_defect"].contains(&key);
+                    if !ROW_KEYS.contains(&key) || cdc_only && mode != "cdc" {
+                        bad.push(format!("{at}: `{key}:` is not a {mode} row field"));
+                    }
+                }
+                for key in ["known_defect", "clickhouse_defect"] {
+                    if let Some(why) = r[key].as_str()
+                        && !(why.contains("ADR-") && why.contains("step"))
+                    {
                         bad.push(format!(
-                            "{at}: known_defect must name the ADR and the step that fixes it"
+                            "{at}: {key} must name the ADR and the step that fixes it"
                         ));
                     }
-                    if ["refused", "server_text"].contains(&d) || !r["diverges"].is_null() {
-                        bad.push(format!(
-                            "{at}: known_defect beside `{d}`/`diverges:` declares today's behaviour, not the ADR target"
-                        ));
-                    }
+                }
+                if !r["known_defect"].is_null()
+                    && (["refused", "server_text"].contains(&d) || !r["diverges"].is_null())
+                {
+                    bad.push(format!(
+                        "{at}: known_defect beside `{d}`/`diverges:` declares today's behaviour, not the ADR target"
+                    ));
                 }
                 if let Some(render) = r["render"].as_mapping() {
                     for (k, v) in render {
@@ -243,7 +254,20 @@ fn every_ledger_row_has_a_sample_a_real_delivery_and_a_twin_in_the_other_mode() 
 
 /// Rows the parity driver expects to fail until an engine step fixes them. Shrink-only:
 /// lower it the moment a marker goes, never raise it.
-const KNOWN_DEFECT_CEILING: usize = 6;
+const KNOWN_DEFECT_CEILING: usize = 11;
+
+/// The fields a ledger row may carry (`clickhouse*` on cdc rows only).
+const ROW_KEYS: [&str; 9] = [
+    "native_type",
+    "sample",
+    "delivery",
+    "override",
+    "render",
+    "diverges",
+    "known_defect",
+    "clickhouse",
+    "clickhouse_defect",
+];
 
 #[test]
 fn known_defect_rows_only_shrink() {
@@ -251,10 +275,15 @@ fn known_defect_rows_only_shrink() {
     let marked: Vec<String> = keys(&doc, "engines")
         .iter()
         .flat_map(|e| {
-            rows(&doc, e, "batch")
+            let batch = rows(&doc, e, "batch")
                 .into_iter()
                 .filter(|(_, r)| !r["known_defect"].is_null())
-                .map(move |(n, _)| format!("{e}:{n}"))
+                .map(move |(n, _)| format!("{e}:{n}"));
+            let warehouse = rows(&doc, e, "cdc")
+                .into_iter()
+                .filter(|(_, r)| !r["clickhouse_defect"].is_null())
+                .map(move |(n, _)| format!("{e}:{n} (ClickHouse)"));
+            batch.chain(warehouse).collect::<Vec<_>>()
         })
         .collect();
     assert_eq!(

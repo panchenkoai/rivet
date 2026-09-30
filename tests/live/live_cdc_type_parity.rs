@@ -33,6 +33,10 @@ struct Row {
     diverges: Option<String>,
     /// Why rivet misses this row's ADR target today; the row must keep failing until the named step fixes it.
     known_defect: Option<String>,
+    /// The ClickHouse column type `rivet load` builds for this row (cdc rows).
+    clickhouse: Option<String>,
+    /// Like `known_defect`, for the ClickHouse stage alone.
+    clickhouse_defect: Option<String>,
 }
 
 struct Ledger {
@@ -71,6 +75,8 @@ fn ledger(engine: &str) -> Ledger {
                 },
                 diverges: s(&r["diverges"]),
                 known_defect: s(&r["known_defect"]),
+                clickhouse: s(&r["clickhouse"]),
+                clickhouse_defect: s(&r["clickhouse_defect"]),
             })
             .collect()
     };
@@ -161,6 +167,121 @@ struct Stand<'a> {
     /// Both rigs carry `census_oracle()`: their parts and state DBs are visible to DuckDB.
     cdc: Rig,
     batch: Rig,
+    /// A second CDC export into the fake-gcs bucket that `rivet load` puts into ClickHouse.
+    warehouse: Option<Warehouse>,
+}
+
+/// A CDC rig loaded into a scratch ClickHouse database, dropped on drop.
+struct Warehouse {
+    rig: Rig,
+    db: String,
+    view: String,
+}
+
+impl Drop for Warehouse {
+    fn drop(&mut self) {
+        let _ = std::panic::catch_unwind(|| {
+            clickhouse_run_sql_json(&format!("DROP DATABASE IF EXISTS {}", self.db))
+        });
+    }
+}
+
+const CH_BUCKET: &str = "rivet-qa-ledger-parity";
+const CH_PASSWORD_ENV: &str = "RIVET_TEST_CH_PASSWORD";
+
+/// `rig` exporting to the fake-gcs bucket and loading into a fresh ClickHouse database; the view is named `view`.
+fn warehouse(rig: Rig, rows: &[Row], view: &str) -> Warehouse {
+    require_alive(LiveService::ClickHouse);
+    require_alive(LiveService::FakeGcs);
+    ensure_gcs_bucket(CH_BUCKET);
+    let db = unique_name("ledger_ch");
+    clickhouse_run_sql_json(&format!("CREATE DATABASE {db}"));
+    let rig = rig
+        .cdc("initial: snapshot")
+        .dest_gcs(CH_BUCKET, &unique_name("ledger"), FAKE_GCS_ENDPOINT)
+        .top_line(&format!(
+            "load: {{ target: clickhouse, url: \"{CLICKHOUSE_HTTP_URL}\", database: {db}, \
+             user: {CLICKHOUSE_USER}, password_env: {CH_PASSWORD_ENV}, pk: [id] }}"
+        ));
+    Warehouse {
+        rig: match overrides(rows) {
+            Some(line) => rig.export_line(&line),
+            None => rig,
+        },
+        db,
+        view: view.to_string(),
+    }
+}
+
+/// Run the CDC export (and the warehouse export beside it).
+fn capture(st: &Stand) {
+    st.cdc.run_ok();
+    if let Some(w) = &st.warehouse {
+        w.rig.run_ok();
+    }
+}
+
+/// `rivet load` of the warehouse export into ClickHouse.
+fn load(st: &Stand) {
+    if let Some(w) = &st.warehouse {
+        w.rig
+            .load_ok(&[], &[(CH_PASSWORD_ENV, CLICKHOUSE_PASSWORD)]);
+    }
+}
+
+/// `sql` against the stand's ClickHouse as a DuckDB relation (Parquet over httpfs, from inside the DuckDB container).
+fn clickhouse_relation(sql: &str) -> String {
+    let q: String = format!("{sql} FORMAT Parquet")
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect();
+    format!(
+        "read_parquet('http://{CLICKHOUSE_USER}:{CLICKHOUSE_PASSWORD}@clickhouse:8123/\
+         ?output_format_parquet_string_as_string=0&query={q}')"
+    )
+}
+
+/// The loaded view as DuckDB reads it, re-typed to each row's delivery (text from the bytes a ClickHouse `String` travels as, UUID from `FixedString(16)`, time of day from its decimal seconds, a naive timestamp from Parquet's UTC).
+fn warehouse_relation(rows: &[Row], w: &Warehouse) -> String {
+    let text: Vec<String> = rows
+        .iter()
+        .zip(columns(rows))
+        .filter_map(|(r, c)| {
+            let d = r.delivery.as_str();
+            let e = if d == "Utf8"
+                || d == "arrow.json"
+                || d.starts_with(|c: char| c.is_ascii_lowercase()) && !d.starts_with("arrow.")
+            {
+                format!("decode({c})")
+            } else if d == "List(Utf8)" {
+                format!("list_transform({c}, x -> decode(x))")
+            } else if d == "arrow.uuid" {
+                format!(
+                    "CAST(regexp_replace(lower(hex({c})), \
+                     '^(.{{8}})(.{{4}})(.{{4}})(.{{4}})(.{{12}})$', '\\1-\\2-\\3-\\4-\\5') AS UUID)"
+                )
+            } else if d.starts_with("Timestamp(") && !d.contains(',') {
+                format!("CAST({c} AS TIMESTAMP)")
+            } else if d.starts_with("Time64(") {
+                format!("TIME '00:00:00' + to_microseconds(CAST({c} * 1000000 AS BIGINT))")
+            } else {
+                return None;
+            };
+            Some(format!("{e} AS {c}"))
+        })
+        .collect();
+    let from = clickhouse_relation(&format!(
+        "SELECT * FROM {}.{} WHERE NOT __is_deleted",
+        w.db, w.view
+    ));
+    if text.is_empty() {
+        from
+    } else {
+        format!("(SELECT * REPLACE ({}) FROM {from})", text.join(", "))
+    }
 }
 
 type Cells = BTreeMap<i64, Vec<Option<String>>>;
@@ -293,6 +414,7 @@ fn canon(v: &Option<String>, how: &Option<String>) -> Option<String> {
             .map_or_else(|e| panic!("{s}: {e}"), |f| f.to_string()),
         Some("interval") => canon_interval(s),
         Some("datetime_tick") => {
+            let s = s.trim_end_matches("+00");
             let (base, frac) = s.split_once('.').unwrap_or((s, "0"));
             let f: f64 = format!("0.{frac}").parse().unwrap();
             format!("{base}+{}/300", (f * 300.0).round() as i64)
@@ -545,11 +667,29 @@ fn duckdb_ledger_verdict(lg: &Ledger, st: &Stand, n: i64) -> Vec<String> {
             engine.load_sql()
         );
     }
+    if let Some(w) = &st.warehouse {
+        setup = format!(
+            "INSTALL httpfs; LOAD httpfs; {setup} UNION ALL SELECT 'warehouse', CAST(id AS VARCHAR), {proj} FROM {}",
+            warehouse_relation(&lg.cdc, w)
+        );
+    }
     let stats = cols
         .iter()
         .map(|c| format!("count({c}), count(DISTINCT {c})"))
         .collect::<Vec<_>>()
         .join(", ");
+    let warehouse_types = st.warehouse.as_ref().map(|w| {
+        (
+            "ch_types",
+            format!(
+                "SELECT decode(name), decode(type) FROM {}",
+                clickhouse_relation(&format!(
+                    "SELECT name, type FROM system.columns WHERE database = '{}' AND table = '{}'",
+                    w.db, w.view
+                ))
+            ),
+        )
+    });
     let mut queries = vec![
         ("legs", "SELECT * FROM legs".to_string()),
         (
@@ -612,6 +752,18 @@ fn duckdb_ledger_verdict(lg: &Ledger, st: &Stand, n: i64) -> Vec<String> {
                     !queries.iter().any(|(q, _)| *q == "arrow_source"),
                     "one `duck: arrow` row per engine"
                 );
+                if let Some(w) = &st.warehouse {
+                    queries.push((
+                        "arrow_warehouse",
+                        format!(
+                            "SELECT decode(i), decode(v) FROM {}",
+                            clickhouse_relation(&format!(
+                                "SELECT toString(id) AS i, toString({c}) AS v FROM {}.{} WHERE NOT __is_deleted",
+                                w.db, w.view
+                            ))
+                        ),
+                    ));
+                }
                 queries.push((
                     "arrow_source",
                     format!(
@@ -625,6 +777,7 @@ fn duckdb_ledger_verdict(lg: &Ledger, st: &Stand, n: i64) -> Vec<String> {
             }
         }
     }
+    queries.extend(warehouse_types);
     let out = duckdb_session_json(&setup, &queries);
     if std::env::var_os("LEDGER_DEBUG").is_some() {
         eprintln!("{}", serde_json::to_string_pretty(&out).unwrap());
@@ -689,6 +842,14 @@ fn duckdb_ledger_verdict(lg: &Ledger, st: &Stand, n: i64) -> Vec<String> {
         arrow_cells(&cdir, &cols, Some(&["update", "insert"])),
     );
     let arrow_source = keyed(out.get("arrow_source").map(cells).unwrap_or_default());
+    let arrow_warehouse = keyed(out.get("arrow_warehouse").map(cells).unwrap_or_default());
+    let ch_types: BTreeMap<String, String> = out
+        .get("ch_types")
+        .map(cells)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| (r[0].clone().unwrap(), r[1].clone().unwrap()))
+        .collect();
 
     let all: Vec<i64> = (1..=3 * n).collect();
     let captured: Vec<i64> = std::iter::once(1).chain(n + 1..=3 * n).collect();
@@ -699,7 +860,10 @@ fn duckdb_ledger_verdict(lg: &Ledger, st: &Stand, n: i64) -> Vec<String> {
         ("final", &all),
         ("stream", &captured),
         ("snapshot", &(1..=2 * n).collect::<Vec<i64>>()),
-    ] {
+    ]
+    .into_iter()
+    .chain(st.warehouse.as_ref().map(|_| ("warehouse", &all)))
+    {
         let got: Vec<i64> = legs
             .get(leg)
             .map(|c| c.keys().copied().collect())
@@ -715,6 +879,7 @@ fn duckdb_ledger_verdict(lg: &Ledger, st: &Stand, n: i64) -> Vec<String> {
     for (k, (col, (b, c))) in cols.iter().zip(lg.batch.iter().zip(&lg.cdc)).enumerate() {
         let what = format!("{col} {}", b.native);
         let before = bad.len();
+        let mut wbad = Vec::new();
         for (mode, want, sch) in [
             ("batch", &b.delivery, &bs),
             ("cdc stream", &c.delivery, &cs),
@@ -745,6 +910,25 @@ fn duckdb_ledger_verdict(lg: &Ledger, st: &Stand, n: i64) -> Vec<String> {
             if let Some(fin) = fin.filter(|f| *f != src) {
                 bad.push(format!(
                     "{what} id {id}: CDC final image {fin:?}, source {src:?}"
+                ));
+            }
+            if st.warehouse.is_some() {
+                let wh = if arrow_row {
+                    canon(&arrow_warehouse[&id][0], &canons[k])
+                } else {
+                    v("warehouse", id, k)
+                };
+                if wh != src {
+                    wbad.push(format!("{what} id {id}: ClickHouse {wh:?}, source {src:?}"));
+                }
+            }
+        }
+        if st.warehouse.is_some() {
+            let got = ch_types.get(col.as_str()).cloned();
+            if got != c.clickhouse {
+                wbad.push(format!(
+                    "{what}: ClickHouse holds `{got:?}`, the ledger says `{:?}`",
+                    c.clickhouse
                 ));
             }
         }
@@ -781,15 +965,31 @@ fn duckdb_ledger_verdict(lg: &Ledger, st: &Stand, n: i64) -> Vec<String> {
                 ("batch", "source"),
                 ("final", "source"),
                 ("stream", "batch_stream"),
+                ("warehouse", "source"),
             ] {
+                if leg == "warehouse" && st.warehouse.is_none() {
+                    continue;
+                }
                 if stat(leg) != stat(of) {
-                    bad.push(format!(
+                    let to = if leg == "warehouse" {
+                        &mut wbad
+                    } else {
+                        &mut bad
+                    };
+                    to.push(format!(
                         "{what}: {leg} has (non-null, distinct) {:?}, {of} {:?}",
                         stat(leg),
                         stat(of)
                     ));
                 }
             }
+        }
+        match (&c.clickhouse_defect, wbad.is_empty()) {
+            (Some(_), true) => bad.push(format!(
+                "{what}: clickhouse_defect row now passes in ClickHouse — remove the marker"
+            )),
+            (Some(_), false) => {}
+            (None, _) => bad.extend(wbad),
         }
         if b.known_defect.is_some() {
             if bad.len() == before {
@@ -805,7 +1005,11 @@ fn duckdb_ledger_verdict(lg: &Ledger, st: &Stand, n: i64) -> Vec<String> {
         ("batch", "source"),
         ("final", "source"),
         ("stream", "batch_stream"),
+        ("warehouse", "source"),
     ] {
+        if leg == "warehouse" && st.warehouse.is_none() {
+            continue;
+        }
         if counts[leg][0] != counts[of][0] {
             bad.push(format!(
                 "{leg}: COUNT(*) {}, {of} {}",
@@ -1090,9 +1294,11 @@ fn postgres_batch_and_cdc_deliver_every_ledger_row_alike() {
             "CREATE TABLE {table} ({})",
             columns_ddl(rows, "id BIGINT PRIMARY KEY")
         ));
+        let wslot = unique_name(&format!("{label}_ch_slot"));
         let guards = (
             PgTable::adopt_on(POSTGRES_CDC_URL, table.clone()),
             Slot(slot.clone()),
+            Slot(wslot.clone()),
         );
         let mut cdc = Rig::pg_cdc(&table, &slot);
         if snapshot {
@@ -1101,6 +1307,7 @@ fn postgres_batch_and_cdc_deliver_every_ledger_row_alike() {
         let batch = Rig::pg_batch(&table)
             .export_named(&format!("{table}_batch"))
             .source_url(POSTGRES_CDC_URL);
+        let wh = snapshot.then(|| warehouse(Rig::pg_cdc(&table, &wslot), rows, &table));
         let st = Stand {
             engine: "postgres",
             bare: table.clone(),
@@ -1116,14 +1323,16 @@ fn postgres_batch_and_cdc_deliver_every_ledger_row_alike() {
             settle: &|_| {},
             cdc: graded(cdc, rows),
             batch: graded(batch, rows),
+            warehouse: wh,
         };
         (st, guards)
     };
     let (st, _g) = stand(&lg.batch, "ledger_pg", true);
     let n = seed(&lg, &st);
-    st.cdc.run_ok();
+    capture(&st);
     rewrite(&lg, &st, n);
-    st.cdc.run_ok();
+    capture(&st);
+    load(&st);
     st.batch.run_ok();
     let mut bad = duckdb_ledger_verdict(&lg, &st, n);
     bad.extend(census_violations(&st.batch, 3 * n));
@@ -1191,11 +1400,13 @@ fn mysql_batch_and_cdc_deliver_every_ledger_row_alike() {
         settle: &|_| {},
         cdc: graded(cdc, &lg.batch),
         batch: graded(batch, &lg.batch),
+        warehouse: Some(warehouse(Rig::mysql_cdc(&table), &lg.batch, &table)),
     };
     let n = seed(&lg, &st);
-    st.cdc.run_ok();
+    capture(&st);
     rewrite(&lg, &st, n);
-    st.cdc.run_ok();
+    capture(&st);
+    load(&st);
     st.batch.run_ok();
     let mut bad = duckdb_ledger_verdict(&lg, &st, n);
     bad.extend(census_violations(&st.batch, 3 * n));
@@ -1242,11 +1453,13 @@ fn mssql_batch_and_cdc_deliver_every_ledger_row_alike() {
         settle: &|rows| wait_for_capture(&ci, rows),
         cdc: graded(cdc, &lg.batch),
         batch: graded(batch, &lg.batch),
+        warehouse: Some(warehouse(Rig::mssql_cdc(&table, &ci), &lg.batch, &table)),
     };
     let n = seed(&lg, &st);
-    st.cdc.run_ok();
+    capture(&st);
     rewrite(&lg, &st, n);
-    st.cdc.run_ok();
+    capture(&st);
+    load(&st);
     st.batch.run_ok();
     let mut bad = duckdb_ledger_verdict(&lg, &st, n);
     bad.extend(census_violations(&st.batch, 3 * n));
@@ -1283,11 +1496,13 @@ fn oracle_batch_and_cdc_deliver_every_ledger_row_alike() {
         settle: &|_| {},
         cdc: graded(cdc, &lg.batch),
         batch: graded(batch, &lg.batch),
+        warehouse: None,
     };
     let n = seed(&lg, &st);
-    st.cdc.run_ok();
+    capture(&st);
     rewrite(&lg, &st, n);
-    st.cdc.run_ok();
+    capture(&st);
+    load(&st);
     st.batch.run_ok();
     let bad = duckdb_ledger_verdict(&lg, &st, n);
     assert!(
