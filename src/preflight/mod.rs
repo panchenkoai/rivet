@@ -478,11 +478,9 @@ pub fn check(
     let mut clean = true;
 
     if show_type_report {
-        let policy = if strict {
-            TypePolicy::strict()
-        } else {
-            TypePolicy::warn_only()
-        };
+        let policy = TypePolicy::from_strict(strict);
+        // Every fatal violation of every report, for the one refusal `run --strict` also raises.
+        let mut fatal = Vec::new();
 
         // Count hard target-FAIL columns (and remember which target) so that —
         // when --strict was NOT passed and the exit code is therefore 0 — we can
@@ -532,6 +530,7 @@ pub fn check(
             ) {
                 Ok(reports) => {
                     tally.add_export(eff_target, &reports);
+                    fatal.extend(fatal_violations(&reports));
                     for report in &reports {
                         if json_output {
                             // `--json` + `--type-report` interaction (DESIGN):
@@ -581,6 +580,7 @@ pub fn check(
         }
         match tally.outcome(strict, json_output) {
             TypeReportOutcome::Fail => {
+                crate::types::policy::refuse_fatal(&fatal, "rivet check")?;
                 anyhow::bail!("strict mode: unsafe type mappings found (see report above)")
             }
             TypeReportOutcome::Note => {
@@ -612,6 +612,27 @@ pub fn check(
     // `clean` = the type check surfaced no fatal mapping. The caller ANDs this
     // with the plan-compatibility gate before printing the success epilogue.
     Ok(clean)
+}
+
+/// The fatal violations of `reports`, each message prefixed with the report's export (and table).
+fn fatal_violations(
+    reports: &[type_report::ExportTypeReport],
+) -> Vec<crate::types::policy::PolicyViolation> {
+    reports
+        .iter()
+        .flat_map(|r| {
+            let unit = match &r.table {
+                Some(t) => format!("export '{}' table '{t}'", r.export),
+                None => format!("export '{}'", r.export),
+            };
+            r.violations.iter().filter(|v| v.fatal).map(move |v| {
+                crate::types::policy::PolicyViolation {
+                    message: format!("{unit}: {}", v.message),
+                    ..v.clone()
+                }
+            })
+        })
+        .collect()
 }
 
 /// `--strict` fails when any export's type report could not be built.

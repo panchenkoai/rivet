@@ -131,6 +131,7 @@ pub(super) fn run_cdc_export(
     config: &Config,
     export: &ExportConfig,
     state: &StateStore,
+    strict: bool,
 ) -> (Result<()>, RunSummary) {
     // No-silent-config-drop: warn (don't hard-fail — a shared default may set
     // meta_columns for a mixed batch+CDC config) that the request has no effect.
@@ -226,6 +227,7 @@ pub(super) fn run_cdc_export(
         &read_bytes,
         config_dir,
         meta.as_deref_mut(),
+        strict,
     );
     let duration_ms = started.elapsed().as_millis() as i64;
     let peak_rss_mb = rss_sampler
@@ -707,6 +709,7 @@ fn cdc_drift_key(export: &str, table: &str, multi: bool) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_cdc_inner(
     config: &Config,
     export: &ExportConfig,
@@ -715,6 +718,7 @@ fn run_cdc_inner(
     read_bytes: &std::sync::Arc<std::sync::atomic::AtomicU64>,
     config_dir: &std::path::Path,
     meta: Option<&mut (dyn crate::source::Source + 'static)>,
+    strict: bool,
 ) -> (Vec<crate::manifest::RunManifest>, Result<()>) {
     let url = match config.source.resolve_url() {
         Ok(u) => u,
@@ -894,6 +898,7 @@ fn run_cdc_inner(
             state: Some(state),
             schema_gate: Some(&schema_gate),
             meta,
+            policy: crate::types::policy::TypePolicy::from_strict(strict),
         },
         read_bytes,
     )

@@ -1227,4 +1227,7 @@ pub struct RunArgs {
     /// Query parameter: key=value (repeatable, substitutes ${key} in queries)
     #[arg(short, long = "param", value_name = "KEY=VALUE")]
     pub params: Vec<String>,
+    /// Refuse the run before any data is read if a column's type mapping is lossy or unsupported (default: warn and continue), the verdict `check --type-report --strict` gives
+    #[arg(long)]
+    pub strict: bool,
 }

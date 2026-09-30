@@ -192,6 +192,32 @@ fn capture_open_forensics(
     }
 }
 
+/// The run's column plan: the open probe's mappings under the run's type policy, before any runner reads data.
+fn plan_open_columns(
+    plan: &ResolvedRunPlan,
+    open: &mut Option<Vec<crate::types::TypeMapping>>,
+    strict: bool,
+) -> Result<()> {
+    let subject = format!("export '{}'", plan.export_name);
+    match open.as_ref() {
+        Some(m) => {
+            let planned = crate::types::plan_columns(
+                m.clone(),
+                &crate::types::policy::TypePolicy::from_strict(strict),
+                &subject,
+            )?;
+            *open = Some(planned);
+        }
+        None if strict => crate::rivet_bail!(
+            crate::error::codes::TYPE_UNSAFE_MAPPING,
+            "{subject}: strict mode: the column types could not be resolved at run start, so \
+             the type policy cannot be checked (run `rivet check --type-report` to see why)"
+        ),
+        None => {}
+    }
+    Ok(())
+}
+
 /// A settle column must be a date/timestamp: the window compares it with the source
 /// clock. Checked from the open probe so a wrong column fails before the query runs;
 /// the sink repeats the check on the schema it writes, for a run whose probe failed.
@@ -1146,6 +1172,8 @@ struct TailPolicy<'a> {
     /// events; apply logs them at validate time and journals none (existing
     /// behavior, preserved).
     plan_warnings: Vec<(String, String)>,
+    /// `--strict`: a lossy or unsupported column refuses the run; apply warns.
+    strict: bool,
 }
 
 /// Does this run's reconcile leg run? Pure, because the three-input condition
@@ -1353,7 +1381,9 @@ fn execute_resolved_plan(
         });
     }
 
-    let result = match settle_columns_are_temporal(plan, summary.open_mappings.as_deref()) {
+    let gate = settle_columns_are_temporal(plan, summary.open_mappings.as_deref())
+        .and_then(|()| plan_open_columns(plan, &mut summary.open_mappings, tail.strict));
+    let result = match gate {
         Err(e) => Err(e),
         Ok(()) if plan.strategy.requires_parallel_execution() => {
             if plan.strategy.is_resumable() {
@@ -1733,7 +1763,7 @@ fn run_export_job_inner(
         if let Some(failed) = outcomes.into_iter().find(|(res, _)| res.is_err()) {
             return failed;
         }
-        return super::cdc_job::run_cdc_export(config_path, config, export, state);
+        return super::cdc_job::run_cdc_export(config_path, config, export, state, opts.strict);
     }
     // A base-and-buffer table's rows carry the delete flag as DATA. `LOAD DATA`
     // fills a column the FILE lacks with NULL — never with the column's DEFAULT,
@@ -1835,6 +1865,7 @@ fn run_export_job_inner(
             notifications: config.notifications.as_ref(),
             record_load_spec: true,
             plan_warnings,
+            strict: opts.strict,
         },
         meta,
     )
@@ -1916,6 +1947,7 @@ pub(crate) fn run_export_job_with_chunk_source(
             // key it never asked for wiped the key `rivet run` had recorded.
             record_load_spec,
             plan_warnings: Vec::new(),
+            strict: false,
         },
         MetaConn::open(&plan.source),
     )
@@ -1947,6 +1979,7 @@ mod snapshot_leg_tests {
                 notifications: None,
                 record_load_spec: false,
                 plan_warnings: Vec::new(),
+                strict: false,
             },
             MetaConn::open(&plan.source),
         );

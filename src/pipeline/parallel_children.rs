@@ -63,6 +63,7 @@ pub(super) fn run_exports_as_child_processes(
     resume: bool,
     force: bool,
     params: Option<&std::collections::HashMap<String, String>>,
+    strict: bool,
     // Wave-wide max export-name width so the card table aligns across the
     // cost-gate's separate safe/lone batches, not just within one batch.
     name_floor: usize,
@@ -163,6 +164,9 @@ pub(super) fn run_exports_as_child_processes(
         }
         if force {
             cmd.arg("--force");
+        }
+        if strict {
+            cmd.arg("--strict");
         }
         if let Some(p) = params {
             for (k, v) in p {

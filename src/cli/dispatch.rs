@@ -393,6 +393,7 @@ fn dispatch_cdc(a: CdcArgs) -> Result<()> {
             // store, so every part reaches the database as it becomes durable.
             state: None,
             schema_gate: None,
+            policy: crate::types::policy::TypePolicy::warn_only(),
             meta: None,
         },
         &__cdc_read_bytes,
@@ -418,6 +419,7 @@ fn dispatch_run(args: crate::cli::args::RunArgs) -> Result<()> {
         summary_output,
         json,
         params,
+        strict,
     } = args;
     let p = parse_params(&params)?;
     let p = if p.is_empty() { None } else { Some(p) };
@@ -437,6 +439,7 @@ fn dispatch_run(args: crate::cli::args::RunArgs) -> Result<()> {
         parallel_export_processes,
         summary_output_path.as_deref(),
         json,
+        strict,
     )
 }
 

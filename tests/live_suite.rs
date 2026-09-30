@@ -239,6 +239,8 @@ mod live_source_parity_sweep;
 mod live_state_backend_parity;
 #[path = "live/live_temp_spill.rs"]
 mod live_temp_spill;
+#[path = "live/live_type_policy.rs"]
+mod live_type_policy;
 #[path = "live/live_wave_apply.rs"]
 mod live_wave_apply;
 #[path = "live/preflight_missing_table.rs"]

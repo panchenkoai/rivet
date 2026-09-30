@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **`rivet run` applies the type policy before it reads data.** A column whose mapping is `lossy`
+  or `unsupported` used to be reported only by `rivet check --type-report`, and the run wrote it
+  without a word. Batch and CDC runs, including `rivet cdc --output`, now log one warning per
+  such column before the first row is read. The warning has the wording `check` prints. The new
+  `rivet run --strict` refuses the run instead, before any part or checkpoint is written, and
+  names every such column with `RIVET_TYPE_UNSAFE_MAPPING` (exit 1). `rivet check --type-report
+  --strict` now refuses with the same code, so `check` and `run` agree on the verdict.
+
 ## 0.30.0 — 2026-09-29
 
 - **Breaking: a source URL whose scheme names another engine is refused.** `source.type` is the

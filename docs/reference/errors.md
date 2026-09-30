@@ -29,6 +29,7 @@ Every failure rivet names carries a stable `RIVET_<FAMILY>_<NAME>` code: in `--j
 | `RIVET_CONFIG_KEYSET_KEY_UUID_OVERRIDE` | usage | 1 | key the keyset on another unique column, or use `mode: full` for this table |
 | `RIVET_CONFIG_CURSOR_COLUMN_CASE` | usage | 1 | spell `cursor_column` exactly as the result set names the column |
 | `RIVET_CONFIG_COLUMN_OVERRIDE_CASE` | usage | 1 | spell the `columns:` key exactly as the result set names the column |
+| `RIVET_TYPE_UNSAFE_MAPPING` | usage | 1 | add a `columns:` override the engine delivers exactly, CAST or drop the column in the export's `query:`, or run without `--strict` to accept it with a warning |
 | `RIVET_SOURCE_STATEMENT_TIMEOUT` | environment | 2 if transient, else 1 | raise `tuning.statement_timeout_s`, or narrow the chunk |
 | `RIVET_SOURCE_CURSOR_FINER_THAN_MICROSECOND` | refusal | 5 | cursor on a column at microsecond precision or coarser, or cast the cursor to TIMESTAMP(6) in a curated query |
 | `RIVET_SOURCE_CDC_FOREIGN_CHECKPOINT` | refusal | 5 | delete the checkpoint so the next run anchors afresh FIRST, then re-snapshot the tables |
