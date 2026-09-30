@@ -114,7 +114,7 @@ fn a_read_blocked_longer_than_thirty_seconds_still_completes() {
         .source_line("  max_retries: 0");
     // A schema-modification lock blocks every reader, snapshot isolation included.
     let tx = format!(
-        "BEGIN TRAN; ALTER TABLE {table} ADD blocker INT NULL;\nWAITFOR DELAY '00:00:40';\nROLLBACK;"
+        "BEGIN TRAN; ALTER TABLE {table} ADD blocker INT NULL;\nWAITFOR DELAY '00:01:30';\nROLLBACK;"
     );
     // Resolved before the lock: OBJECT_ID itself waits on the schema lock it would look for.
     let oid = mssql_query_i64(&format!("SELECT OBJECT_ID('{table}')"));
