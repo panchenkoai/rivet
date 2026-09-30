@@ -162,6 +162,18 @@ fn row_violations(doc: &Value) -> Vec<String> {
                 if mode == "batch" && !r["diverges"].is_null() {
                     bad.push(format!("{at}: `diverges:` belongs on the cdc row"));
                 }
+                if let Some(why) = r["known_defect"].as_str() {
+                    if !(why.contains("ADR-") && why.contains("step")) {
+                        bad.push(format!(
+                            "{at}: known_defect must name the ADR and the step that fixes it"
+                        ));
+                    }
+                    if ["refused", "server_text"].contains(&d) || !r["diverges"].is_null() {
+                        bad.push(format!(
+                            "{at}: known_defect beside `{d}`/`diverges:` declares today's behaviour, not the ADR target"
+                        ));
+                    }
+                }
                 if let Some(render) = r["render"].as_mapping() {
                     for (k, v) in render {
                         let (k, v) = (k.as_str().unwrap_or(""), v.as_str().unwrap_or(""));
@@ -189,7 +201,7 @@ fn row_violations(doc: &Value) -> Vec<String> {
                 continue;
             };
             let at = format!("engines.{engine}[{native}]");
-            for field in ["sample", "override", "render"] {
+            for field in ["sample", "override", "render", "known_defect"] {
                 if b[field] != c[field] {
                     bad.push(format!("{at}: batch and cdc disagree on `{field}`"));
                 }
@@ -227,6 +239,31 @@ fn every_ledger_row_has_a_sample_a_real_delivery_and_a_twin_in_the_other_mode() 
     assert!(total >= 90, "the ledger lost its rows: {total}");
     let bad = row_violations(&doc);
     assert!(bad.is_empty(), "{LEDGER}:\n{}", bad.join("\n"));
+}
+
+/// Rows the parity driver expects to fail until an engine step fixes them. Shrink-only:
+/// lower it the moment a marker goes, never raise it.
+const KNOWN_DEFECT_CEILING: usize = 6;
+
+#[test]
+fn known_defect_rows_only_shrink() {
+    let doc = ledger();
+    let marked: Vec<String> = keys(&doc, "engines")
+        .iter()
+        .flat_map(|e| {
+            rows(&doc, e, "batch")
+                .into_iter()
+                .filter(|(_, r)| !r["known_defect"].is_null())
+                .map(move |(n, _)| format!("{e}:{n}"))
+        })
+        .collect();
+    assert_eq!(
+        marked.len(),
+        KNOWN_DEFECT_CEILING,
+        "known_defect rows {marked:?}: the ratchet expects exactly {KNOWN_DEFECT_CEILING}. \
+         Fewer means a fix landed — lower the ceiling; more means a new defect was blessed \
+         into the ledger instead of fixed"
+    );
 }
 
 #[test]

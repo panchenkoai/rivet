@@ -31,6 +31,8 @@ struct Row {
     over: Option<String>,
     render: Render,
     diverges: Option<String>,
+    /// Why rivet misses this row's ADR target today; the row must keep failing until the named step fixes it.
+    known_defect: Option<String>,
 }
 
 struct Ledger {
@@ -68,6 +70,7 @@ fn ledger(engine: &str) -> Ledger {
                     canon: s(&r["render"]["canon"]),
                 },
                 diverges: s(&r["diverges"]),
+                known_defect: s(&r["known_defect"]),
             })
             .collect()
     };
@@ -709,6 +712,7 @@ fn duckdb_ledger_verdict(lg: &Ledger, st: &Stand, n: i64) -> Vec<String> {
     let v = |leg: &str, id: i64, k: usize| canon(&legs[leg][&id][k], &canons[k]);
     for (k, (col, (b, c))) in cols.iter().zip(lg.batch.iter().zip(&lg.cdc)).enumerate() {
         let what = format!("{col} {}", b.native);
+        let before = bad.len();
         for (mode, want, sch) in [
             ("batch", &b.delivery, &bs),
             ("cdc stream", &c.delivery, &cs),
@@ -779,6 +783,15 @@ fn duckdb_ledger_verdict(lg: &Ledger, st: &Stand, n: i64) -> Vec<String> {
                         stat("source")
                     ));
                 }
+            }
+        }
+        if b.known_defect.is_some() {
+            if bad.len() == before {
+                bad.push(format!(
+                    "{what}: known_defect row now passes — remove the marker"
+                ));
+            } else {
+                bad.truncate(before);
             }
         }
     }

@@ -20,12 +20,14 @@
 #                         source  Oracle only (no DuckDB scanner): the client-side rendering
 #                         canon   number, timestamp, float32, float64, interval, datetime_tick
 #          diverges     on the cdc row only: why its delivery differs from batch (ADR ref)
+#          known_defect on both twins: why rivet misses the declared ADR target today and
+#                       which step fixes it; the driver fails if such a row starts passing
 #          setup:       engine-level DDL run before the table (types the rows name).
 #          A row in one mode has its twin, with the same sample and render, in the other.
 #          tests/live/live_cdc_type_parity.rs builds one table per engine from these rows;
 #          one DuckDB session grades the source, the batch parts, the CDC snapshot, stream and
 #          final image, and both state DBs: type, values, COUNT(*), COUNT(col), COUNT(DISTINCT).
-#          A delivery short of the exact native target stays declared at the target and RED.
+#          A delivery short of its ADR target stays declared at the target, marked known_defect.
 #
 # Guarded by tests/offline/type_capability_matrix_guard.rs.
 
@@ -149,7 +151,7 @@ engines:
       - {native_type: "DOUBLE PRECISION", sample: ["2.5", "1.5"], delivery: "Float64"}
       - {native_type: "DATE", sample: ["'2024-03-15'"], delivery: "Date32"}
       - {native_type: "TIME", sample: ["'14:30:00.123456'"], delivery: "Time64(µs)"}
-      - {native_type: "INTERVAL", sample: ["INTERVAL '1 year 2 mons 3 days'"], delivery: "Utf8", render: {canon: "interval"}}
+      - {native_type: "INTERVAL", sample: ["INTERVAL '1 year 2 mons 3 days'"], delivery: "iso8601_duration", render: {canon: "interval"}, known_defect: "ISO 8601 text without the rivet.text_form label (ADR-0038 CP2/CP5, PostgreSQL engine step)"}
       - {native_type: "rivet_status", sample: ["'active'"], delivery: "Utf8"}
       - {native_type: "rivet_status_typed", sample: ["'off'"], delivery: "Utf8"}
       - {native_type: "JSON", sample: ["'{\"k\": [1, 2]}'::json"], delivery: "arrow.json"}
@@ -186,7 +188,7 @@ engines:
       - {native_type: "DOUBLE PRECISION", sample: ["2.5", "1.5"], delivery: "Float64"}
       - {native_type: "DATE", sample: ["'2024-03-15'"], delivery: "Date32"}
       - {native_type: "TIME", sample: ["'14:30:00.123456'"], delivery: "Time64(µs)"}
-      - {native_type: "INTERVAL", sample: ["INTERVAL '1 year 2 mons 3 days'"], delivery: "Utf8", render: {canon: "interval"}}
+      - {native_type: "INTERVAL", sample: ["INTERVAL '1 year 2 mons 3 days'"], delivery: "iso8601_duration", render: {canon: "interval"}, known_defect: "ISO 8601 text without the rivet.text_form label (ADR-0038 CP2/CP5, PostgreSQL engine step)"}
       - {native_type: "rivet_status", sample: ["'active'"], delivery: "Utf8"}
       - {native_type: "rivet_status_typed", sample: ["'off'"], delivery: "Utf8"}
       - {native_type: "JSON", sample: ["'{\"k\": [1, 2]}'::json"], delivery: "arrow.json"}
@@ -280,10 +282,10 @@ engines:
       - {native_type: "BIT", sample: ["1"], delivery: "Boolean"}
       - {native_type: "VARCHAR(50)", sample: ["'hello'"], delivery: "Utf8"}
       - {native_type: "NVARCHAR(50)", sample: ["N'cafe-unicode'"], delivery: "Utf8"}
-      - {native_type: "DATETIME2", sample: ["'2026-06-23 10:00:00.1234567'"], delivery: "Timestamp(ns)", render: {canon: "timestamp"}}
-      - {native_type: "DATETIMEOFFSET", sample: ["'2026-06-23 10:00:00 +05:30'"], delivery: "Timestamp(ns, \"UTC\")", render: {server: "CONVERT(varchar(max), CAST(SWITCHOFFSET({c}, '+00:00') AS DATETIME2(7)), 121)", canon: "timestamp"}}
+      - {native_type: "DATETIME2", sample: ["'2026-06-23 10:00:00.1234567'"], delivery: "Timestamp(ns)", render: {canon: "timestamp"}, known_defect: "delivered at microseconds, the 100 ns digit dropped; exact native is Timestamp(ns) (ADR-0038 CP1, SQL Server engine step)"}
+      - {native_type: "DATETIMEOFFSET", sample: ["'2026-06-23 10:00:00 +05:30'"], delivery: "Timestamp(ns, \"UTC\")", render: {server: "CONVERT(varchar(max), CAST(SWITCHOFFSET({c}, '+00:00') AS DATETIME2(7)), 121)", canon: "timestamp"}, known_defect: "delivered at microseconds; exact native is Timestamp(ns, UTC) (ADR-0038 CP1, SQL Server engine step)"}
       - {native_type: "DATE", sample: ["'2026-06-23'"], delivery: "Date32"}
-      - {native_type: "TIME", sample: ["'13:45:30.123456'"], delivery: "Time64(ns)", render: {server: "CONVERT(varchar(max), {c}, 114)", canon: "timestamp"}}
+      - {native_type: "TIME", sample: ["'13:45:30.123456'"], delivery: "Time64(ns)", render: {server: "CONVERT(varchar(max), {c}, 114)", canon: "timestamp"}, known_defect: "delivered at microseconds; exact native is Time64(ns) (ADR-0038 CP1, SQL Server engine step)"}
       - {native_type: "UNIQUEIDENTIFIER", sample: ["'12345678-1234-1234-1234-123456789012'"], delivery: "arrow.uuid"}
       - {native_type: "VARBINARY(16)", sample: ["0xDEADBEEF"], delivery: "Binary", render: {duck: "lower(hex({c}))"}}
       - {native_type: "CHAR(8)", sample: ["'pad'"], delivery: "Utf8"}
@@ -302,10 +304,10 @@ engines:
       - {native_type: "BIT", sample: ["1"], delivery: "Boolean"}
       - {native_type: "VARCHAR(50)", sample: ["'hello'"], delivery: "Utf8"}
       - {native_type: "NVARCHAR(50)", sample: ["N'cafe-unicode'"], delivery: "Utf8"}
-      - {native_type: "DATETIME2", sample: ["'2026-06-23 10:00:00.1234567'"], delivery: "Timestamp(ns)", render: {canon: "timestamp"}}
-      - {native_type: "DATETIMEOFFSET", sample: ["'2026-06-23 10:00:00 +05:30'"], delivery: "Timestamp(ns, \"UTC\")", render: {server: "CONVERT(varchar(max), CAST(SWITCHOFFSET({c}, '+00:00') AS DATETIME2(7)), 121)", canon: "timestamp"}}
+      - {native_type: "DATETIME2", sample: ["'2026-06-23 10:00:00.1234567'"], delivery: "Timestamp(ns)", render: {canon: "timestamp"}, known_defect: "delivered at microseconds, the 100 ns digit dropped; exact native is Timestamp(ns) (ADR-0038 CP1, SQL Server engine step)"}
+      - {native_type: "DATETIMEOFFSET", sample: ["'2026-06-23 10:00:00 +05:30'"], delivery: "Timestamp(ns, \"UTC\")", render: {server: "CONVERT(varchar(max), CAST(SWITCHOFFSET({c}, '+00:00') AS DATETIME2(7)), 121)", canon: "timestamp"}, known_defect: "delivered at microseconds; exact native is Timestamp(ns, UTC) (ADR-0038 CP1, SQL Server engine step)"}
       - {native_type: "DATE", sample: ["'2026-06-23'"], delivery: "Date32"}
-      - {native_type: "TIME", sample: ["'13:45:30.123456'"], delivery: "Time64(ns)", render: {server: "CONVERT(varchar(max), {c}, 114)", canon: "timestamp"}}
+      - {native_type: "TIME", sample: ["'13:45:30.123456'"], delivery: "Time64(ns)", render: {server: "CONVERT(varchar(max), {c}, 114)", canon: "timestamp"}, known_defect: "delivered at microseconds; exact native is Time64(ns) (ADR-0038 CP1, SQL Server engine step)"}
       - {native_type: "UNIQUEIDENTIFIER", sample: ["'12345678-1234-1234-1234-123456789012'"], delivery: "arrow.uuid"}
       - {native_type: "VARBINARY(16)", sample: ["0xDEADBEEF"], delivery: "Binary", render: {duck: "lower(hex({c}))"}}
       - {native_type: "CHAR(8)", sample: ["'pad'"], delivery: "Utf8"}
@@ -320,7 +322,7 @@ engines:
       - {native_type: "FLOAT", sample: ["1.5"], delivery: "Float64", render: {canon: "float64"}}
   oracle:
     batch:
-      - {native_type: "NUMBER", sample: ["123.45", "12345678901234567890.123456789", "1E125", "-0.000000000000000000000000000000000000001"], delivery: "Utf8", render: {source: "TO_CHAR({c}, 'TM9')", canon: "number"}}
+      - {native_type: "NUMBER", sample: ["123.45", "12345678901234567890.123456789", "1E125", "-0.000000000000000000000000000000000000001"], delivery: "decimal_plain", render: {source: "TO_CHAR({c}, 'TM9')", canon: "number"}, known_defect: "plain decimal text without the rivet.text_form label (ADR-0038 CP5/CP11, Oracle engine step)"}
       - {native_type: "NUMBER(38,10)", sample: ["1.5", "1234567890123456789012345678.0123456789", "0.5"], delivery: "Decimal128(38, 10)", render: {source: "TO_CHAR({c}, 'TM9')", canon: "number"}}
       - {native_type: "NUMBER(9)", sample: ["42", "-999999999", "0"], delivery: "Int32", render: {source: "TO_CHAR({c}, 'TM9')", canon: "number"}}
       - {native_type: "NUMBER(18)", sample: ["9007199254740993", "-999999999999999999", "0"], delivery: "Int64", render: {source: "TO_CHAR({c}, 'TM9')", canon: "number"}}
@@ -328,7 +330,7 @@ engines:
       - {native_type: "BINARY_DOUBLE", sample: ["2.25", "BINARY_DOUBLE_INFINITY", "0.1"], delivery: "Float64", render: {canon: "float64"}}
       - {native_type: "DATE", sample: ["TO_DATE('2024-02-29 13:14:15','YYYY-MM-DD HH24:MI:SS')", "TO_DATE('0001-01-01','YYYY-MM-DD')"], delivery: "Timestamp(µs)", render: {source: "TO_CHAR(CAST({c} AS TIMESTAMP), 'SYYYY-MM-DD\"T\"HH24:MI:SS.FF6')", duck: "strftime({c}, '%Y-%m-%dT%H:%M:%S.%f')", canon: "timestamp"}}
       - {native_type: "TIMESTAMP(6)", sample: ["TO_TIMESTAMP('2024-02-29 13:14:15.123456','YYYY-MM-DD HH24:MI:SS.FF')", "TO_TIMESTAMP('9999-12-31 23:59:59.999999','YYYY-MM-DD HH24:MI:SS.FF')"], delivery: "Timestamp(µs)", render: {source: "TO_CHAR({c}, 'SYYYY-MM-DD\"T\"HH24:MI:SS.FF6')", duck: "strftime({c}, '%Y-%m-%dT%H:%M:%S.%f')", canon: "timestamp"}}
-      - {native_type: "TIMESTAMP(9)", sample: ["TO_TIMESTAMP('2024-02-29 13:14:15.123456789','YYYY-MM-DD HH24:MI:SS.FF')"], delivery: "Timestamp(ns)", render: {source: "TO_CHAR({c}, 'SYYYY-MM-DD\"T\"HH24:MI:SS.FF9')", duck: "strftime({c}, '%Y-%m-%dT%H:%M:%S.%n')", canon: "timestamp"}}
+      - {native_type: "TIMESTAMP(9)", sample: ["TO_TIMESTAMP('2024-02-29 13:14:15.123456789','YYYY-MM-DD HH24:MI:SS.FF')"], delivery: "Timestamp(ns)", render: {source: "TO_CHAR({c}, 'SYYYY-MM-DD\"T\"HH24:MI:SS.FF9')", duck: "strftime({c}, '%Y-%m-%dT%H:%M:%S.%n')", canon: "timestamp"}, known_defect: "delivered at microseconds, the sub-microsecond digits dropped; exact native is Timestamp(ns) (ADR-0038 CP1, Oracle engine step)"}
       - {native_type: "TIMESTAMP(6) WITH TIME ZONE", sample: ["TO_TIMESTAMP_TZ('2024-02-29 10:00:00.5 +02:00','YYYY-MM-DD HH24:MI:SS.FF TZH:TZM')", "TO_TIMESTAMP_TZ('2024-07-01 10:00:00 Europe/Berlin','YYYY-MM-DD HH24:MI:SS TZR')"], delivery: "Timestamp(µs, \"UTC\")", render: {source: "TO_CHAR(SYS_EXTRACT_UTC({c}), 'SYYYY-MM-DD\"T\"HH24:MI:SS.FF6')", duck: "strftime({c}, '%Y-%m-%dT%H:%M:%S.%f')", canon: "timestamp"}}
       - {native_type: "TIMESTAMP(6) WITH LOCAL TIME ZONE", sample: ["TO_TIMESTAMP_TZ('2024-02-29 10:00:00 -03:00','YYYY-MM-DD HH24:MI:SS TZH:TZM')"], delivery: "Timestamp(µs, \"UTC\")", render: {source: "TO_CHAR(SYS_EXTRACT_UTC({c}), 'SYYYY-MM-DD\"T\"HH24:MI:SS.FF6')", duck: "strftime({c}, '%Y-%m-%dT%H:%M:%S.%f')", canon: "timestamp"}}
       - {native_type: "VARCHAR2(100 CHAR)", sample: ["'it''s, \"q\"'", "'   '", "''"], delivery: "Utf8", render: {source: "{c}"}}
@@ -336,7 +338,7 @@ engines:
       - {native_type: "CHAR(5 CHAR)", sample: ["'ab'", "'x'"], delivery: "Utf8", render: {source: "{c}"}}
       - {native_type: "RAW(16)", sample: ["HEXTORAW('00FF10')", "HEXTORAW('01')"], delivery: "Binary", render: {source: "RAWTOHEX({c})", duck: "upper(hex({c}))"}}
     cdc:
-      - {native_type: "NUMBER", sample: ["123.45", "12345678901234567890.123456789", "1E125", "-0.000000000000000000000000000000000000001"], delivery: "Utf8", render: {source: "TO_CHAR({c}, 'TM9')", canon: "number"}}
+      - {native_type: "NUMBER", sample: ["123.45", "12345678901234567890.123456789", "1E125", "-0.000000000000000000000000000000000000001"], delivery: "decimal_plain", render: {source: "TO_CHAR({c}, 'TM9')", canon: "number"}, known_defect: "plain decimal text without the rivet.text_form label (ADR-0038 CP5/CP11, Oracle engine step)"}
       - {native_type: "NUMBER(38,10)", sample: ["1.5", "1234567890123456789012345678.0123456789", "0.5"], delivery: "Decimal128(38, 10)", render: {source: "TO_CHAR({c}, 'TM9')", canon: "number"}}
       - {native_type: "NUMBER(9)", sample: ["42", "-999999999", "0"], delivery: "Int32", render: {source: "TO_CHAR({c}, 'TM9')", canon: "number"}}
       - {native_type: "NUMBER(18)", sample: ["9007199254740993", "-999999999999999999", "0"], delivery: "Int64", render: {source: "TO_CHAR({c}, 'TM9')", canon: "number"}}
@@ -344,7 +346,7 @@ engines:
       - {native_type: "BINARY_DOUBLE", sample: ["2.25", "BINARY_DOUBLE_INFINITY", "0.1"], delivery: "Float64", render: {canon: "float64"}}
       - {native_type: "DATE", sample: ["TO_DATE('2024-02-29 13:14:15','YYYY-MM-DD HH24:MI:SS')", "TO_DATE('0001-01-01','YYYY-MM-DD')"], delivery: "Timestamp(µs)", render: {source: "TO_CHAR(CAST({c} AS TIMESTAMP), 'SYYYY-MM-DD\"T\"HH24:MI:SS.FF6')", duck: "strftime({c}, '%Y-%m-%dT%H:%M:%S.%f')", canon: "timestamp"}}
       - {native_type: "TIMESTAMP(6)", sample: ["TO_TIMESTAMP('2024-02-29 13:14:15.123456','YYYY-MM-DD HH24:MI:SS.FF')", "TO_TIMESTAMP('9999-12-31 23:59:59.999999','YYYY-MM-DD HH24:MI:SS.FF')"], delivery: "Timestamp(µs)", render: {source: "TO_CHAR({c}, 'SYYYY-MM-DD\"T\"HH24:MI:SS.FF6')", duck: "strftime({c}, '%Y-%m-%dT%H:%M:%S.%f')", canon: "timestamp"}}
-      - {native_type: "TIMESTAMP(9)", sample: ["TO_TIMESTAMP('2024-02-29 13:14:15.123456789','YYYY-MM-DD HH24:MI:SS.FF')"], delivery: "Timestamp(ns)", render: {source: "TO_CHAR({c}, 'SYYYY-MM-DD\"T\"HH24:MI:SS.FF9')", duck: "strftime({c}, '%Y-%m-%dT%H:%M:%S.%n')", canon: "timestamp"}}
+      - {native_type: "TIMESTAMP(9)", sample: ["TO_TIMESTAMP('2024-02-29 13:14:15.123456789','YYYY-MM-DD HH24:MI:SS.FF')"], delivery: "Timestamp(ns)", render: {source: "TO_CHAR({c}, 'SYYYY-MM-DD\"T\"HH24:MI:SS.FF9')", duck: "strftime({c}, '%Y-%m-%dT%H:%M:%S.%n')", canon: "timestamp"}, known_defect: "delivered at microseconds, the sub-microsecond digits dropped; exact native is Timestamp(ns) (ADR-0038 CP1, Oracle engine step)"}
       - {native_type: "TIMESTAMP(6) WITH TIME ZONE", sample: ["TO_TIMESTAMP_TZ('2024-02-29 10:00:00.5 +02:00','YYYY-MM-DD HH24:MI:SS.FF TZH:TZM')", "TO_TIMESTAMP_TZ('2024-07-01 10:00:00 Europe/Berlin','YYYY-MM-DD HH24:MI:SS TZR')"], delivery: "Timestamp(µs, \"UTC\")", render: {source: "TO_CHAR(SYS_EXTRACT_UTC({c}), 'SYYYY-MM-DD\"T\"HH24:MI:SS.FF6')", duck: "strftime({c}, '%Y-%m-%dT%H:%M:%S.%f')", canon: "timestamp"}}
       - {native_type: "TIMESTAMP(6) WITH LOCAL TIME ZONE", sample: ["TO_TIMESTAMP_TZ('2024-02-29 10:00:00 -03:00','YYYY-MM-DD HH24:MI:SS TZH:TZM')"], delivery: "Timestamp(µs, \"UTC\")", render: {source: "TO_CHAR(SYS_EXTRACT_UTC({c}), 'SYYYY-MM-DD\"T\"HH24:MI:SS.FF6')", duck: "strftime({c}, '%Y-%m-%dT%H:%M:%S.%f')", canon: "timestamp"}}
       - {native_type: "VARCHAR2(100 CHAR)", sample: ["'it''s, \"q\"'", "'   '", "''"], delivery: "Utf8", render: {source: "{c}"}}
