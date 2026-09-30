@@ -1651,7 +1651,10 @@ jobs:
         # pair (dev/pytools/cdc_stand), the second Oracle holding the WE8ISO8859P1
         # LATIN1PDB (`oracle-latin1`), and the audit's BigQuery cells. The release
         # gate runs every one of them (REPLICA_CELLS, verify_audit_suspects, the
-        # derived live-module cell).
+        # derived live-module cell). Quarantined here, not in the gate:
+        # `a_read_blocked_longer_than_thirty_seconds_still_completes`, whose reader
+        # was not blocked on 3 of 4 CI runs (0.6 s, 1 s, 17 s) while it holds on
+        # the stand; the cause is open.
         run: >-
           cargo test -- --ignored --skip content_export --skip validates --skip edge_cases
           --skip via_duckdb --skip mongo --skip warehouse_cell
@@ -1660,6 +1663,7 @@ jobs:
           --skip loads_into_bigquery_or_refuses_by_column
           --skip cleanup_source_never_deletes_parts --skip compact_after_a_source_alter
           --skip a_non_unicode_database_round_trips
+          --skip a_read_blocked_longer_than_thirty_seconds_still_completes
 
       - name: Stop services
         if: always()
