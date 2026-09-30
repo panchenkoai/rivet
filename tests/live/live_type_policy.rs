@@ -1,6 +1,7 @@
 //! The type policy runs in the run (ADR-0038 CP6): a lossy or unsupported column warns by
 //! default and refuses under `--strict` before any data is read, with the verdict and code
 //! `rivet check --type-report --strict` gives. The oracle for delivered rows is DuckDB.
+#![cfg(feature = "oracle")]
 
 use crate::common::*;
 
@@ -29,7 +30,6 @@ fn walkdir_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     out
 }
 
-#[cfg(feature = "oracle")]
 /// An Oracle table with one sub-microsecond `TIMESTAMP(9)` value (a Lossy mapping) in row 1.
 fn oracle_ts9_table() -> OracleTable {
     let t = OracleTable::create("tp_ts9", "id NUMBER(10) PRIMARY KEY, ts9 TIMESTAMP(9)");
@@ -41,7 +41,6 @@ fn oracle_ts9_table() -> OracleTable {
 }
 
 /// A Lossy CDC column (Oracle `TIMESTAMP(9)`, delivered at µs) warns by default; `--strict` refuses before any part or checkpoint.
-#[cfg(feature = "oracle")]
 #[test]
 #[ignore = "live: requires the oracle service with LogMiner prerequisites"]
 fn oracle_cdc_timestamp9_warns_by_default_and_strict_refuses_before_any_part_or_checkpoint() {
@@ -104,7 +103,6 @@ fn oracle_cdc_timestamp9_warns_by_default_and_strict_refuses_before_any_part_or_
     );
 }
 
-#[cfg(feature = "oracle")]
 #[test]
 #[ignore = "live: requires docker compose oracle"]
 fn oracle_batch_timestamp9_warns_by_default_and_strict_refuses_before_export() {
@@ -140,7 +138,6 @@ fn oracle_batch_timestamp9_warns_by_default_and_strict_refuses_before_export() {
     assert_eq!(duckdb_dir_scalar(&out, "count(*)", Some("\"ID\" = 1")), 1);
 }
 
-#[cfg(feature = "oracle")]
 #[test]
 #[ignore = "live: requires docker compose oracle"]
 fn check_strict_and_run_strict_refuse_the_same_config_with_the_same_code() {
