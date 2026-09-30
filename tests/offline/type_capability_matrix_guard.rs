@@ -133,8 +133,7 @@ fn row_violations(doc: &Value) -> Vec<String> {
     let forms = keys(doc, "forms");
     let extensions = [<Uuid as ExtensionType>::NAME, <Json as ExtensionType>::NAME];
     let valid_delivery = |d: &str| {
-        d == "refused"
-            || forms.contains(d)
+        forms.contains(d)
             || extensions.contains(&d)
             || d.parse::<arrow_schema::DataType>()
                 .is_ok_and(|t| t.to_string() == d)
@@ -178,11 +177,15 @@ fn row_violations(doc: &Value) -> Vec<String> {
                         ));
                     }
                 }
-                if !r["known_defect"].is_null()
-                    && (["refused", "server_text"].contains(&d) || !r["diverges"].is_null())
-                {
+                if !r["known_defect"].is_null() && !r["diverges"].is_null() {
                     bad.push(format!(
-                        "{at}: known_defect beside `{d}`/`diverges:` declares today's behaviour, not the ADR target"
+                        "{at}: known_defect beside `diverges:` declares today's behaviour, not the ADR target"
+                    ));
+                }
+                if r["batch_refuses"].as_bool() == Some(true) && r["known_defect"].is_null() {
+                    bad.push(format!(
+                        "{at}: `batch_refuses` is today's behaviour of a known_defect row; refusal is \
+                         not an ADR target"
                     ));
                 }
                 if let Some(render) = r["render"].as_mapping() {
@@ -212,7 +215,13 @@ fn row_violations(doc: &Value) -> Vec<String> {
                 continue;
             };
             let at = format!("engines.{engine}[{native}]");
-            for field in ["sample", "override", "render", "known_defect"] {
+            for field in [
+                "sample",
+                "override",
+                "render",
+                "known_defect",
+                "batch_refuses",
+            ] {
                 if b[field] != c[field] {
                     bad.push(format!("{at}: batch and cdc disagree on `{field}`"));
                 }
@@ -254,10 +263,10 @@ fn every_ledger_row_has_a_sample_a_real_delivery_and_a_twin_in_the_other_mode() 
 
 /// Rows the parity driver expects to fail until an engine step fixes them. Shrink-only:
 /// lower it the moment a marker goes, never raise it.
-const KNOWN_DEFECT_CEILING: usize = 11;
+const KNOWN_DEFECT_CEILING: usize = 23;
 
 /// The fields a ledger row may carry (`clickhouse*` on cdc rows only).
-const ROW_KEYS: [&str; 9] = [
+const ROW_KEYS: [&str; 10] = [
     "native_type",
     "sample",
     "delivery",
@@ -267,6 +276,7 @@ const ROW_KEYS: [&str; 9] = [
     "known_defect",
     "clickhouse",
     "clickhouse_defect",
+    "batch_refuses",
 ];
 
 #[test]

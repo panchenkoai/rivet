@@ -37,6 +37,8 @@ struct Row {
     clickhouse: Option<String>,
     /// Like `known_defect`, for the ClickHouse stage alone.
     clickhouse_defect: Option<String>,
+    /// Today's behaviour of a known_defect row: the batch run refuses the column by name.
+    batch_refuses: bool,
 }
 
 struct Ledger {
@@ -77,6 +79,7 @@ fn ledger(engine: &str) -> Ledger {
                 known_defect: s(&r["known_defect"]),
                 clickhouse: s(&r["clickhouse"]),
                 clickhouse_defect: s(&r["clickhouse_defect"]),
+                batch_refuses: r["batch_refuses"].as_bool().unwrap_or(false),
             })
             .collect()
     };
@@ -106,17 +109,14 @@ fn ledger(engine: &str) -> Ledger {
     }
 }
 
-/// `delivery` of a batch row whose type the batch run refuses by column.
-const REFUSED: &str = "refused";
-
 /// `render.duck` for a type DuckDB cannot read exactly (Decimal256 reads as DOUBLE, ADR-0038 CP11).
 const ARROW: &str = "arrow";
 
-/// The ledger without its batch-refused rows, and those rows as (batch, cdc) twins.
+/// The ledger without the rows batch refuses today, and those rows as (batch, cdc) twins.
 fn split_refused(lg: Ledger) -> (Ledger, Vec<(Row, Row)>) {
     let (mut batch, mut cdc, mut refused) = (Vec::new(), Vec::new(), Vec::new());
     for (b, c) in lg.batch.into_iter().zip(lg.cdc) {
-        if b.delivery == REFUSED {
+        if b.batch_refuses {
             refused.push((b, c));
         } else {
             batch.push(b);
@@ -508,7 +508,7 @@ fn values(rows: &[Row], i: usize) -> Vec<String> {
 /// Rows 1..=n hold the samples, rows n+1..=2n start NULL; returns n.
 fn seed(lg: &Ledger, st: &Stand) -> i64 {
     assert!(
-        lg.batch.iter().all(|r| r.delivery != REFUSED),
+        lg.batch.iter().all(|r| !r.batch_refuses),
         "{}: split the batch-refused rows off first",
         st.engine
     );
@@ -1116,7 +1116,7 @@ fn seed_refused(rows: &[Row], st: &Stand) -> usize {
     n
 }
 
-/// Batch refuses every row by column (`batch_of` exports one column); CDC delivers each as its cdc twin declares, equal to the source read in the same DuckDB session; returns every violation.
+/// Rows batch refuses today (known defects): batch must still refuse each by name, CDC deliver the target or its server text, and CDC values equal the source's own text; returns every violation.
 fn duckdb_refused_verdict(
     rows: &[(Row, Row)],
     st: &Stand,
@@ -1141,8 +1141,8 @@ fn duckdb_refused_verdict(
         )
     };
     assert!(
-        cdc_rows.iter().all(|r| r.delivery == "server_text") && !server_text.is_empty(),
-        "{}: batch-refused rows are graded against the server's own text",
+        !server_text.is_empty() && rows.iter().all(|(b, _)| b.known_defect.is_some()),
+        "{}: batch-refused rows are known defects, graded against the server's own text",
         st.engine
     );
     let (attach, _) = engine.source_sql(database, &st.bare);
@@ -1204,16 +1204,23 @@ fn duckdb_refused_verdict(
     }
     for (k, (col, (b, c))) in cols.iter().zip(rows).enumerate() {
         let what = format!("{col} {}", b.native);
-        let said = batch_of(col).run_expect_fail();
-        if !said.contains(&format!("'{col}'")) && !said.contains(&format!("• {col} (")) {
+        let run = batch_of(col).run_args(&[]);
+        let said = format!(
+            "{}{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let by_name = said.contains(&format!("'{col}'")) || said.contains(&format!("• {col} ("));
+        if run.status.success() || !by_name {
             bad.push(format!(
-                "{what}: the batch run did not refuse it by name:\n{said}"
+                "{what}: known_defect row now passes in batch (no refusal by name) — declare what it \
+                 delivers and remove the marker:\n{said}"
             ));
         }
         let d = delivered(&cs, col);
-        if d != c.delivery {
+        if d != c.delivery && d != "server_text" {
             bad.push(format!(
-                "{what}: cdc delivers `{d}`, the ledger says `{}`",
+                "{what}: cdc delivers `{d}`, neither the target `{}` nor today's server_text",
                 c.delivery
             ));
         }

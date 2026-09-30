@@ -8,8 +8,10 @@
 #          native_type  the column type as written in CREATE TABLE
 #          sample       SQL literals; sample i of every row lands in table row i
 #          delivery     the Arrow type (`DataType` display), a canonical extension name
-#                       (`arrow.uuid`), a TextForm label from `forms:` above, or `refused`
-#                       (the run fails naming the column)
+#                       (`arrow.uuid`), or a TextForm label from `forms:` above; always the
+#                       ADR target, never a refusal
+#          batch_refuses  on a known_defect row: today the batch run refuses the column by
+#                       name (the driver fails once it stops refusing)
 #          override     optional `columns:` override applied in both modes
 #          render       optional, `{c}` standing for the column; no render may narrow a value:
 #                         duck    the DuckDB projection applied alike to every stage DuckDB
@@ -165,17 +167,17 @@ engines:
       - {native_type: "INTEGER[]", sample: ["ARRAY[1, NULL, 3]", "'{}'"], delivery: "List(Int32)", render: {duck: "CAST(to_json({c}) AS VARCHAR)"}}
       - {native_type: "DOUBLE PRECISION[]", sample: ["ARRAY[2.5, -0.5]"], delivery: "List(Float64)", render: {duck: "CAST(to_json({c}) AS VARCHAR)"}}
       - {native_type: "NUMERIC(60,10)", sample: ["123456789012345678901234567890.0123456789"], delivery: "Decimal256(60, 10)", render: {duck: "arrow"}}
-      - {native_type: "NUMERIC", sample: ["1.50", "-0.000001234", "123456789012345678901234567890.123456789012", "'NaN'"], delivery: "refused"}
-      - {native_type: "MONEY", sample: ["'12.34'"], delivery: "refused"}
-      - {native_type: "INET", sample: ["'192.168.0.1'"], delivery: "refused"}
-      - {native_type: "CIDR", sample: ["'10.0.0.0/8'"], delivery: "refused"}
-      - {native_type: "DATE[]", sample: ["ARRAY['2024-01-01'::date]"], delivery: "refused"}
-      - {native_type: "TIMESTAMP[]", sample: ["ARRAY['2024-01-01 10:00:00'::timestamp]"], delivery: "refused"}
-      - {native_type: "TIMESTAMPTZ[]", sample: ["ARRAY['2024-01-01 10:00:00+00'::timestamptz]"], delivery: "refused"}
-      - {native_type: "TIME[]", sample: ["ARRAY['10:00:00'::time]"], delivery: "refused"}
-      - {native_type: "UUID[]", sample: ["ARRAY['12345678-1234-1234-1234-123456789012'::uuid]"], delivery: "refused"}
-      - {native_type: "BYTEA[]", sample: ["ARRAY['\\xDEADBEEF'::bytea]"], delivery: "refused"}
-      - {native_type: "NUMERIC[]", sample: ["ARRAY[1.5]::numeric[]"], delivery: "refused"}
+      - {native_type: "NUMERIC", sample: ["1.50", "-0.000001234", "123456789012345678901234567890.123456789012", "'NaN'"], delivery: "decimal_plain", known_defect: "batch refuses the column; CDC carries test_decoding's unlabelled text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
+      - {native_type: "MONEY", sample: ["'12.34'"], delivery: "server_text", known_defect: "batch refuses the column; CDC carries test_decoding's unlabelled text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
+      - {native_type: "INET", sample: ["'192.168.0.1'"], delivery: "inet_text", known_defect: "batch refuses the column; CDC carries test_decoding's unlabelled text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
+      - {native_type: "CIDR", sample: ["'10.0.0.0/8'"], delivery: "inet_text", known_defect: "batch refuses the column; CDC carries test_decoding's unlabelled text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
+      - {native_type: "DATE[]", sample: ["ARRAY['2024-01-01'::date]"], delivery: "List(Date32)", known_defect: "batch refuses the column; CDC carries test_decoding's unlabelled text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
+      - {native_type: "TIMESTAMP[]", sample: ["ARRAY['2024-01-01 10:00:00'::timestamp]"], delivery: "List(Timestamp(µs))", known_defect: "batch refuses the column; CDC carries test_decoding's unlabelled text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
+      - {native_type: "TIMESTAMPTZ[]", sample: ["ARRAY['2024-01-01 10:00:00+00'::timestamptz]"], delivery: "List(Timestamp(µs, \"UTC\"))", known_defect: "batch refuses the column; CDC carries test_decoding's unlabelled text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
+      - {native_type: "TIME[]", sample: ["ARRAY['10:00:00'::time]"], delivery: "List(Time64(µs))", known_defect: "batch refuses the column; CDC carries test_decoding's unlabelled text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
+      - {native_type: "UUID[]", sample: ["ARRAY['12345678-1234-1234-1234-123456789012'::uuid]"], delivery: "List(FixedSizeBinary(16))", known_defect: "batch refuses the column; CDC carries test_decoding's unlabelled text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
+      - {native_type: "BYTEA[]", sample: ["ARRAY['\\xDEADBEEF'::bytea]"], delivery: "List(Binary)", known_defect: "batch refuses the column; CDC carries test_decoding's unlabelled text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
+      - {native_type: "NUMERIC[]", sample: ["ARRAY[1.5]::numeric[]"], delivery: "server_text", known_defect: "batch refuses the column; CDC carries test_decoding's unlabelled text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
     cdc:
       - {native_type: "TEXT", sample: ["'üñíçødé ''q'''", "'hello'"], delivery: "Utf8", clickhouse: "Nullable(String)"}
       - {native_type: "NUMERIC(18,2)", sample: ["999999999999.99"], delivery: "Decimal128(18, 2)", clickhouse: "Nullable(Decimal(18, 2))"}
@@ -202,17 +204,17 @@ engines:
       - {native_type: "INTEGER[]", sample: ["ARRAY[1, NULL, 3]", "'{}'"], delivery: "List(Int32)", render: {duck: "CAST(to_json({c}) AS VARCHAR)"}, clickhouse: "Array(Nullable(Int32))", clickhouse_defect: "a NULL array loads as [] (ClickHouse arrays cannot be NULL), so NULL and empty merge (ADR-0038 CP1, ClickHouse load step)"}
       - {native_type: "DOUBLE PRECISION[]", sample: ["ARRAY[2.5, -0.5]"], delivery: "List(Float64)", render: {duck: "CAST(to_json({c}) AS VARCHAR)"}, clickhouse: "Array(Nullable(Float64))", clickhouse_defect: "a NULL array loads as [] (ClickHouse arrays cannot be NULL), so NULL and empty merge (ADR-0038 CP1, ClickHouse load step)"}
       - {native_type: "NUMERIC(60,10)", sample: ["123456789012345678901234567890.0123456789"], delivery: "Decimal256(60, 10)", render: {duck: "arrow"}, clickhouse: "Nullable(Decimal(60, 10))"}
-      - {native_type: "NUMERIC", sample: ["1.50", "-0.000001234", "123456789012345678901234567890.123456789012", "'NaN'"], delivery: "server_text", diverges: "batch has no decoder yet and refuses the column by name; CDC keeps test_decoding's own text (ADR-0038 CP4, CP12)"}
-      - {native_type: "MONEY", sample: ["'12.34'"], delivery: "server_text", diverges: "batch has no decoder yet and refuses the column by name; CDC keeps test_decoding's own text (ADR-0038 CP4, CP12)"}
-      - {native_type: "INET", sample: ["'192.168.0.1'"], delivery: "server_text", diverges: "batch has no decoder yet and refuses the column by name; CDC keeps test_decoding's own text (ADR-0038 CP4, CP12)"}
-      - {native_type: "CIDR", sample: ["'10.0.0.0/8'"], delivery: "server_text", diverges: "batch has no decoder yet and refuses the column by name; CDC keeps test_decoding's own text (ADR-0038 CP4, CP12)"}
-      - {native_type: "DATE[]", sample: ["ARRAY['2024-01-01'::date]"], delivery: "server_text", diverges: "batch has no decoder yet and refuses the column by name; CDC keeps test_decoding's own text (ADR-0038 CP4, CP12)"}
-      - {native_type: "TIMESTAMP[]", sample: ["ARRAY['2024-01-01 10:00:00'::timestamp]"], delivery: "server_text", diverges: "batch has no decoder yet and refuses the column by name; CDC keeps test_decoding's own text (ADR-0038 CP4, CP12)"}
-      - {native_type: "TIMESTAMPTZ[]", sample: ["ARRAY['2024-01-01 10:00:00+00'::timestamptz]"], delivery: "server_text", diverges: "batch has no decoder yet and refuses the column by name; CDC keeps test_decoding's own text (ADR-0038 CP4, CP12)"}
-      - {native_type: "TIME[]", sample: ["ARRAY['10:00:00'::time]"], delivery: "server_text", diverges: "batch has no decoder yet and refuses the column by name; CDC keeps test_decoding's own text (ADR-0038 CP4, CP12)"}
-      - {native_type: "UUID[]", sample: ["ARRAY['12345678-1234-1234-1234-123456789012'::uuid]"], delivery: "server_text", diverges: "batch has no decoder yet and refuses the column by name; CDC keeps test_decoding's own text (ADR-0038 CP4, CP12)"}
-      - {native_type: "BYTEA[]", sample: ["ARRAY['\\xDEADBEEF'::bytea]"], delivery: "server_text", diverges: "batch has no decoder yet and refuses the column by name; CDC keeps test_decoding's own text (ADR-0038 CP4, CP12)"}
-      - {native_type: "NUMERIC[]", sample: ["ARRAY[1.5]::numeric[]"], delivery: "server_text", diverges: "batch has no decoder yet and refuses the column by name; CDC keeps test_decoding's own text (ADR-0038 CP4, CP12)"}
+      - {native_type: "NUMERIC", sample: ["1.50", "-0.000001234", "123456789012345678901234567890.123456789012", "'NaN'"], delivery: "decimal_plain", known_defect: "batch refuses the column; CDC carries test_decoding's unlabelled text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
+      - {native_type: "MONEY", sample: ["'12.34'"], delivery: "server_text", known_defect: "batch refuses the column; CDC carries test_decoding's unlabelled text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
+      - {native_type: "INET", sample: ["'192.168.0.1'"], delivery: "inet_text", known_defect: "batch refuses the column; CDC carries test_decoding's unlabelled text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
+      - {native_type: "CIDR", sample: ["'10.0.0.0/8'"], delivery: "inet_text", known_defect: "batch refuses the column; CDC carries test_decoding's unlabelled text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
+      - {native_type: "DATE[]", sample: ["ARRAY['2024-01-01'::date]"], delivery: "List(Date32)", known_defect: "batch refuses the column; CDC carries test_decoding's unlabelled text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
+      - {native_type: "TIMESTAMP[]", sample: ["ARRAY['2024-01-01 10:00:00'::timestamp]"], delivery: "List(Timestamp(µs))", known_defect: "batch refuses the column; CDC carries test_decoding's unlabelled text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
+      - {native_type: "TIMESTAMPTZ[]", sample: ["ARRAY['2024-01-01 10:00:00+00'::timestamptz]"], delivery: "List(Timestamp(µs, \"UTC\"))", known_defect: "batch refuses the column; CDC carries test_decoding's unlabelled text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
+      - {native_type: "TIME[]", sample: ["ARRAY['10:00:00'::time]"], delivery: "List(Time64(µs))", known_defect: "batch refuses the column; CDC carries test_decoding's unlabelled text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
+      - {native_type: "UUID[]", sample: ["ARRAY['12345678-1234-1234-1234-123456789012'::uuid]"], delivery: "List(FixedSizeBinary(16))", known_defect: "batch refuses the column; CDC carries test_decoding's unlabelled text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
+      - {native_type: "BYTEA[]", sample: ["ARRAY['\\xDEADBEEF'::bytea]"], delivery: "List(Binary)", known_defect: "batch refuses the column; CDC carries test_decoding's unlabelled text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
+      - {native_type: "NUMERIC[]", sample: ["ARRAY[1.5]::numeric[]"], delivery: "server_text", known_defect: "batch refuses the column; CDC carries test_decoding's unlabelled text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
   mysql:
     batch:
       - {native_type: "VARCHAR(200)", sample: ["'üñíçødé'"], delivery: "Utf8"}
@@ -223,7 +225,7 @@ engines:
       - {native_type: "TIMESTAMP(6) NULL", sample: ["'2035-08-07 09:08:07.987654'"], delivery: "Timestamp(µs, \"UTC\")", render: {duck: "strftime({c}, '%Y-%m-%d %H:%M:%S.%f')"}}
       - {native_type: "BINARY(4)", sample: ["UNHEX('00000000')"], delivery: "Binary", render: {duck: "lower(hex({c}))"}}
       - {native_type: "JSON", sample: ["JSON_OBJECT('tier','gold','n',1)", "'{\"k\": \"v\", \"n\": 42}'"], delivery: "arrow.json"}
-      - {native_type: "BOOLEAN", sample: ["TRUE", "1"], delivery: "Boolean", render: {duck: "CAST(CAST({c} AS TINYINT) AS VARCHAR)"}}
+      - {native_type: "BOOLEAN", sample: ["TRUE", "1", "5", "-1"], delivery: "Int8", render: {duck: "CAST(CAST({c} AS TINYINT) AS VARCHAR)"}, known_defect: "TINYINT(1) delivered as Boolean: 5 and -1 arrive as true in batch, CDC and ClickHouse, a silent loss; exact native is Int8 (ADR-0038 CP1, MySQL engine step)"}
       - {native_type: "BIT(1)", sample: ["b'1'"], delivery: "Boolean"}
       - {native_type: "BIT(8)", sample: ["b'10101010'"], delivery: "Int64", render: {duck: "lpad(hex({c}), 2, '0')"}}
       - {native_type: "TINYINT", sample: ["127"], delivery: "Int16"}
@@ -255,7 +257,7 @@ engines:
       - {native_type: "TIMESTAMP(6) NULL", sample: ["'2035-08-07 09:08:07.987654'"], delivery: "Timestamp(µs, \"UTC\")", render: {duck: "strftime({c}, '%Y-%m-%d %H:%M:%S.%f')"}, clickhouse: "Nullable(DateTime64(6, 'UTC'))"}
       - {native_type: "BINARY(4)", sample: ["UNHEX('00000000')"], delivery: "Binary", render: {duck: "lower(hex({c}))"}, clickhouse: "Nullable(String)"}
       - {native_type: "JSON", sample: ["JSON_OBJECT('tier','gold','n',1)", "'{\"k\": \"v\", \"n\": 42}'"], delivery: "arrow.json", clickhouse: "Nullable(String)"}
-      - {native_type: "BOOLEAN", sample: ["TRUE", "1"], delivery: "Boolean", render: {duck: "CAST(CAST({c} AS TINYINT) AS VARCHAR)"}, clickhouse: "Nullable(Bool)"}
+      - {native_type: "BOOLEAN", sample: ["TRUE", "1", "5", "-1"], delivery: "Int8", render: {duck: "CAST(CAST({c} AS TINYINT) AS VARCHAR)"}, known_defect: "TINYINT(1) delivered as Boolean: 5 and -1 arrive as true in batch, CDC and ClickHouse, a silent loss; exact native is Int8 (ADR-0038 CP1, MySQL engine step)", clickhouse: "Nullable(Int8)"}
       - {native_type: "BIT(1)", sample: ["b'1'"], delivery: "Boolean", clickhouse: "Nullable(Bool)"}
       - {native_type: "BIT(8)", sample: ["b'10101010'"], delivery: "Int64", render: {duck: "lpad(hex({c}), 2, '0')"}, clickhouse: "Nullable(Int64)"}
       - {native_type: "TINYINT", sample: ["127"], delivery: "Int16", clickhouse: "Nullable(Int16)"}
