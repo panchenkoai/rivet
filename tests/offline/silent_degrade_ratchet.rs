@@ -2,8 +2,8 @@
 //! Every shape below turns "could not read it" into "there was nothing there"; the
 //! count under `src/source/` may only shrink.
 
-/// Occurrences under `src/source/` on 2026-09-29, when the ratchet landed.
-const CEILING: usize = 45;
+/// Occurrences under `src/source/` on 2026-09-30 (the CDC builder refuses instead of nulling).
+const CEILING: usize = 39;
 
 /// The shapes that swap an unreadable value for NULL or nothing.
 const SHAPES: &[&str] = &[
@@ -12,6 +12,8 @@ const SHAPES: &[&str] = &[
     "unwrap_or(RivetValue::Null)",
     "_ => b.append_null()",
     ".ok().flatten()",
+    "map_or(V::Null",
+    "Err(_) => b.append_null()",
 ];
 
 fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {

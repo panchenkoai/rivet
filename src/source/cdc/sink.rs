@@ -58,6 +58,8 @@ pub(crate) struct TableOutput<'a> {
     /// Keep each part within this many distinct partitions and note the count in its
     /// footer; `None` when the change log is not partitioned.
     pub partition: Option<crate::plan::rollover::PartitionRollover>,
+    /// Columns this table's `columns:` overrides name; a refused cell of one is an override mismatch.
+    pub overridden: std::collections::HashSet<String>,
 }
 
 /// Everything the sink needs that isn't the stream itself. `outputs` carries one
@@ -158,7 +160,7 @@ impl TableSink<'_> {
     }
 
     /// Build this table's schema before its first flush, so the concurrent encode only reads the sink.
-    fn prepare_schema(&mut self) {
+    fn prepare_schema(&mut self) -> Result<()> {
         // The schema is built lazily at the first flush so decimal column
         // scales can be refined from the data (SQL Server's metadata-only
         // resolve gives a placeholder scale of 0 — the same gap the batch path
@@ -168,7 +170,8 @@ impl TableSink<'_> {
             &mut self.out.columns,
             &self.buf,
             &self.out.row_hash,
-        );
+        )
+        .map(|_| ())
     }
 
     /// Encode + upload this table's buffered changes as one part per partition-budget slice.
@@ -189,6 +192,7 @@ impl TableSink<'_> {
             engine,
             &self.out.row_hash,
             self.out.partition.as_ref(),
+            &self.out.overridden,
         ) {
             Ok((batch, slices)) => upload_slices(
                 &batch,
@@ -361,7 +365,7 @@ fn roll_all(
         .filter(|&i| !sinks[i].buf.is_empty())
         .collect();
     for &i in &pending {
-        sinks[i].prepare_schema();
+        sinks[i].prepare_schema()?;
     }
     let uploaded = {
         let view: Vec<&TableSink<'_>> = pending.iter().map(|&i| &sinks[i]).collect();
@@ -682,7 +686,7 @@ fn ensure_schema(
     columns: &mut [TypeMapping],
     events: &[ChangeEvent],
     row_hash: &crate::config::RowHash,
-) -> SchemaRef {
+) -> Result<SchemaRef> {
     if schema.is_none() {
         refine_decimal_scales(columns, events);
         let mut fields = vec![
@@ -693,17 +697,17 @@ fn ensure_schema(
             Field::new("__seq", DataType::Int64, false),
         ];
         for m in columns.iter() {
-            // Reuse the batch path's field builder so json/uuid/enum carry their
-            // logical-type metadata + Parquet extension and ints keep their width.
-            // For a type the sink can't build exactly (or `Unsupported`), fall back
-            // to a plain `Utf8` field — matching the `Utf8` array `build_column`
-            // will produce — so the schema and the data never disagree.
-            let field = match &m.arrow_type {
-                Some(dt) if value::is_buildable(dt) => build_arrow_field(m)
-                    .unwrap_or_else(|| Field::new(&m.column_name, DataType::Utf8, m.nullable)),
-                _ => Field::new(&m.column_name, DataType::Utf8, m.nullable),
-            };
-            fields.push(field);
+            // Exactly the planned field: the resolver turned every type the builder
+            // cannot build into a text delivery, so a miss here is a rivet bug.
+            match build_arrow_field(m) {
+                Some(f) if value::is_buildable(f.data_type()) => fields.push(f),
+                _ => crate::rivet_bail!(
+                    crate::error::codes::INTERNAL_TYPE_BUILDER,
+                    "cdc: column '{}' is planned as {:?}, which the CDC builder cannot build",
+                    m.column_name,
+                    m.arrow_type
+                ),
+            }
         }
         if row_hash.enabled() {
             fields.push(Field::new(
@@ -714,7 +718,7 @@ fn ensure_schema(
         }
         *schema = Some(Arc::new(Schema::new(fields)));
     }
-    schema.clone().unwrap()
+    Ok(schema.clone().unwrap())
 }
 
 /// Fill a `Decimal128` column's scale from the data when the resolved scale is the
@@ -925,6 +929,7 @@ fn flush(
     engine: super::CdcEngine,
     row_hash: &crate::config::RowHash,
     partition: Option<&crate::plan::rollover::PartitionRollover>,
+    overridden: &std::collections::HashSet<String>,
 ) -> Result<EncodedBatch> {
     let ops: ArrayRef = Arc::new(
         events
@@ -1037,15 +1042,33 @@ fn flush(
         // one names-Arc (same TABLE_MAP / same wire session), so resolve this
         // column's image index once and reuse it by pointer identity.
         let memo = image_name_memo(events, &m.column_name);
-        let render = value::render_type(m.arrow_type.as_ref());
-        let owned: Option<Vec<Option<RivetValue>>> = fix.as_ref().map(|fix| {
-            events
-                .iter()
-                .map(|e| {
-                    image_cell(e, i, &m.column_name, &schema_names, memo).map(|v| fix.apply(v))
-                })
-                .collect()
-        });
+        // The planned type, as `ensure_schema` declared it (after the three meta columns).
+        let dt = schema.field(arrays.len()).data_type();
+        let refuse = |r: value::CellRefusal| {
+            r.into_error(&m.column_name, dt, overridden.contains(&m.column_name))
+        };
+        let owned: Option<Vec<Option<RivetValue>>> = match &fix {
+            Some(fix) => Some(
+                events
+                    .iter()
+                    .enumerate()
+                    .map(|(row, e)| {
+                        image_cell(e, i, &m.column_name, &schema_names, memo)
+                            .map(|v| {
+                                fix.apply(v).map_err(|r| value::CellRefusal {
+                                    row,
+                                    value: v.clone(),
+                                    reason: r.reason,
+                                    code: r.code,
+                                })
+                            })
+                            .transpose()
+                    })
+                    .collect::<std::result::Result<_, _>>()
+                    .map_err(refuse)?,
+            ),
+            None => None,
+        };
         let cells: Vec<Option<&RivetValue>> = match &owned {
             Some(o) => o.iter().map(|c| c.as_ref()).collect(),
             None => events
@@ -1053,12 +1076,12 @@ fn flush(
                 .map(|e| image_cell(e, i, &m.column_name, &schema_names, memo))
                 .collect(),
         };
-        let arr = value::build_column(&m.column_name, &render, &cells)?;
+        let arr = value::build_column(dt, &cells).map_err(refuse)?;
         // Two-ended value check, same contract as the batch export's Form A:
         // an independent fold of the typed cells vs a fold of the BUILT array.
         // A mismatch means the builder changed a value between decode and
         // Arrow — fail loud BEFORE the part is written, naming the column.
-        let source_sum = value::cells_checksum(&render, &cells);
+        let source_sum = value::cells_checksum(dt, &cells);
         let arrow_sum = crate::source::value_checksum::array_checksum(arr.as_ref());
         if source_sum != arrow_sum {
             crate::rivet_bail!(
@@ -2262,15 +2285,57 @@ mod tests {
         );
     }
 
-    /// The schema may only DECLARE a type `build_column` will actually produce.
-    ///
-    /// `ensure_schema` is pure and this guard had no unit test, so `replace match
-    /// guard value::is_buildable(dt) with true` survived. With it always true the
-    /// field is declared from `arrow_type` verbatim, while the array builder still
-    /// falls back to `Utf8` for a type it cannot build — schema and data disagree,
-    /// which is the one thing the fallback exists to prevent.
+    /// A refused cell names its column once, with the override code only when `columns:` names the column.
     #[test]
-    fn a_type_the_array_builder_cannot_build_is_declared_utf8_not_verbatim() {
+    fn a_refused_cell_names_the_column_and_picks_the_code_by_override() {
+        let mut ev = insert(0);
+        ev.after = Some(vec![RivetValue::Int(1), RivetValue::Bytes(b"1.5".to_vec())]);
+        let mut cols = int_col();
+        cols.push(TypeMapping {
+            column_name: "amount".into(),
+            ..int_col().remove(0)
+        });
+        let mut schema = None;
+        let sch = ensure_schema(
+            &mut schema,
+            &mut cols,
+            std::slice::from_ref(&ev),
+            &crate::config::RowHash::default(),
+        )
+        .unwrap();
+        let run = |overridden: &[&str]| {
+            let set = overridden.iter().map(|s| s.to_string()).collect();
+            let Err(err) = flush(
+                std::slice::from_ref(&ev),
+                &sch,
+                &cols,
+                crate::source::cdc::CdcEngine::Postgres,
+                &crate::config::RowHash::default(),
+                None,
+                &set,
+            ) else {
+                panic!("a non-integer cell in an Int64 column is refused")
+            };
+            let code = err
+                .downcast_ref::<crate::error::CodedError>()
+                .map(|c| c.code().to_string());
+            (format!("{err:#}"), code)
+        };
+        let (msg, code) = run(&["amount"]);
+        assert_eq!(code.as_deref(), Some("RIVET_SOURCE_OVERRIDE_WIRE_MISMATCH"));
+        assert_eq!(msg.matches("'amount'").count(), 2, "column + remedy: {msg}");
+        assert!(msg.contains("column 'amount' is Int64"), "{msg}");
+        assert!(msg.contains("\"1.5\""), "{msg}");
+        assert!(msg.contains("re-snapshot"), "{msg}");
+        assert!(!msg.contains("query:"), "CDC has no query: {msg}");
+        let (msg, code) = run(&["v"]);
+        assert_eq!(code.as_deref(), Some("RIVET_SOURCE_CDC_CELL_UNSUPPORTED"));
+        assert!(msg.contains("column 'amount' is Int64"), "{msg}");
+    }
+
+    /// The schema declares exactly the planned type; a type the builder cannot build is an internal error naming the column.
+    #[test]
+    fn the_schema_declares_the_planned_type_and_refuses_an_unbuildable_one_by_column() {
         let unbuildable = DataType::List(std::sync::Arc::new(Field::new(
             "item",
             DataType::Decimal128(10, 2),
@@ -2278,8 +2343,7 @@ mod tests {
         )));
         assert!(
             !value::is_buildable(&unbuildable),
-            "the fixture is inert: this type must be one the builder REFUSES, or \
-             both arms agree and the guard is untested"
+            "the fixture must be unbuildable"
         );
         let mut cols = vec![TypeMapping {
             column_name: "amounts".into(),
@@ -2288,36 +2352,49 @@ mod tests {
             ..int_col().remove(0)
         }];
         let mut schema = None;
-        let sch = ensure_schema(
+        let err = ensure_schema(
             &mut schema,
             &mut cols,
             &[insert(0)],
             &crate::config::RowHash::default(),
-        );
-        let f = sch
-            .field_with_name("amounts")
-            .expect("the column is declared");
+        )
+        .expect_err("an unbuildable planned type is refused at schema time");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("column 'amounts'"), "{msg}");
         assert_eq!(
-            f.data_type(),
-            &DataType::Utf8,
-            "a type the array builder falls back to Utf8 for must be DECLARED Utf8 — \
-             declaring it verbatim makes the schema describe data that is never written"
+            err.downcast_ref::<crate::error::CodedError>()
+                .map(|c| c.code()),
+            Some("RIVET_INTERNAL_TYPE_BUILDER")
         );
+        assert!(schema.is_none(), "no schema is cached for a refused plan");
 
-        // The buildable side, so the arm that stays is graded too.
-        let mut cols2 = int_col();
+        let mut cols2 = vec![
+            int_col().remove(0),
+            TypeMapping {
+                column_name: "n".into(),
+                source_native_type: "numeric".into(),
+                ..int_col().remove(0)
+            }
+            .with_text(crate::types::TextForm::ServerText),
+        ];
         let mut schema2 = None;
         let sch2 = ensure_schema(
             &mut schema2,
             &mut cols2,
             &[insert(0)],
             &crate::config::RowHash::default(),
-        );
+        )
+        .unwrap();
         assert_eq!(
             sch2.field_with_name("v").expect("declared").data_type(),
             &DataType::Int64,
-            "a buildable type keeps its own width; degrading everything to Utf8 would \
-             satisfy the assertion above and lose every type in the stream"
+            "a buildable type keeps its own width"
+        );
+        let n = sch2.field_with_name("n").expect("declared");
+        assert_eq!(n.data_type(), &DataType::Utf8);
+        assert_eq!(
+            n.metadata().get("rivet.text_form").map(String::as_str),
+            Some("server_text")
         );
     }
 
@@ -2625,6 +2702,7 @@ mod tests {
                             dest_uri: String::new(),
                             row_hash: crate::config::RowHash::All(false),
                             partition: None,
+                            overridden: Default::default(),
                         },
                         TableOutput {
                             table: "b".into(),
@@ -2633,6 +2711,7 @@ mod tests {
                             dest_uri: String::new(),
                             row_hash: crate::config::RowHash::All(false),
                             partition: None,
+                            overridden: Default::default(),
                         },
                     ],
                     ..base
@@ -3068,6 +3147,7 @@ mod tests {
                 dest_uri: String::new(),
                 row_hash: crate::config::RowHash::All(false),
                 partition: None,
+                overridden: Default::default(),
             }],
             engine: crate::source::cdc::CdcEngine::Mysql,
             format,
@@ -3163,6 +3243,7 @@ mod tests {
                 dest_uri: String::new(),
                 row_hash: crate::config::RowHash::All(false),
                 partition: None,
+                overridden: Default::default(),
             }
         }
         let base = cfg(&busy, &cols, FormatType::Parquet, 1);
@@ -3302,6 +3383,7 @@ mod tests {
                 dest_uri: String::new(),
                 row_hash: crate::config::RowHash::All(false),
                 partition: None,
+                overridden: Default::default(),
             })
             .collect()
     }
@@ -4010,6 +4092,7 @@ mod tests {
                     dest_uri: "a".into(),
                     row_hash: crate::config::RowHash::All(false),
                     partition: None,
+                    overridden: Default::default(),
                 },
                 TableOutput {
                     table: "b".into(),
@@ -4018,6 +4101,7 @@ mod tests {
                     dest_uri: "b".into(),
                     row_hash: crate::config::RowHash::All(false),
                     partition: None,
+                    overridden: Default::default(),
                 },
             ],
             engine: crate::source::cdc::CdcEngine::Mysql,

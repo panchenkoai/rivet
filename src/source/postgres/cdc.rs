@@ -1892,6 +1892,9 @@ fn map_pg_value(typ: &str, val: &str, quoted: bool) -> Option<RivetValue> {
     // array literal (`{a,"with,comma",NULL}`); parse to element values so the
     // sink builds a real List column (batch parity), never the literal text.
     if let Some(inner) = typ.strip_suffix("[]") {
+        if !array_elem_is_listed(inner) {
+            return Some(RivetValue::Bytes(val.as_bytes().to_vec()));
+        }
         return Some(parse_pg_array_literal(inner, val).map_or_else(
             || RivetValue::Bytes(val.as_bytes().to_vec()),
             RivetValue::Array,
@@ -1958,6 +1961,21 @@ fn map_pg_value(typ: &str, val: &str, quoted: bool) -> Option<RivetValue> {
     }
     // text / varchar / char / json / numeric / … → string bytes.
     Some(RivetValue::Bytes(val.as_bytes().to_vec()))
+}
+
+/// True when an array of `inner` becomes a CDC list column; other arrays travel as the server's own literal text.
+fn array_elem_is_listed(inner: &str) -> bool {
+    ![
+        "timestamp",
+        "time",
+        "date",
+        "uuid",
+        "bytea",
+        "numeric",
+        "money",
+    ]
+    .iter()
+    .any(|p| inner.starts_with(p))
 }
 
 /// Parse a PG array literal (`{alpha,"with,comma","he said \"hi\"",NULL}`)
@@ -2774,6 +2792,31 @@ mod tests {
         assert_eq!(map_pg_value("uuid", "not-hex", false), None);
     }
 
+    /// An array whose element has no CDC list column keeps the server's literal; a listed one parses.
+    #[test]
+    fn an_unlisted_array_keeps_the_servers_own_literal() {
+        for (typ, lit) in [
+            ("date[]", "{2024-01-01,NULL}"),
+            ("timestamp without time zone[]", "{\"2024-01-01 12:00:00\"}"),
+            ("uuid[]", "{550e8400-e29b-41d4-a716-446655440000}"),
+            ("numeric[]", "{1.50,2}"),
+            ("bytea[]", "{\"\\\\x00ff\"}"),
+        ] {
+            assert_eq!(
+                map_pg_value(typ, lit, false),
+                Some(RivetValue::Bytes(lit.as_bytes().to_vec())),
+                "{typ}"
+            );
+        }
+        assert_eq!(
+            map_pg_value("integer[]", "{1,NULL}", false),
+            Some(RivetValue::Array(vec![
+                RivetValue::Int(1),
+                RivetValue::Null
+            ]))
+        );
+    }
+
     proptest::proptest! {
         #![proptest_config(proptest::prelude::ProptestConfig {
             cases: 256, ..Default::default()
@@ -2949,16 +2992,16 @@ mod tests {
                     d[workday]:'2024-02-29'";
         let ev = parse_test_decoding("0/1", line, &domains).unwrap().unwrap();
         let after = ev.after.unwrap();
-        let qty = build_column("c", &DataType::Int32, &[Some(&after[1])]).unwrap();
+        let qty = build_column(&DataType::Int32, &[Some(&after[1])]).unwrap();
         let qty = qty.as_any().downcast_ref::<Int32Array>().unwrap();
         assert!(
             qty.is_valid(0),
             "a domain over integer must not build a NULL"
         );
         assert_eq!(qty.value(0), 5);
-        let ok = build_column("c", &DataType::Boolean, &[Some(&after[2])]).unwrap();
+        let ok = build_column(&DataType::Boolean, &[Some(&after[2])]).unwrap();
         assert!(ok.as_any().downcast_ref::<BooleanArray>().unwrap().value(0));
-        let d = build_column("c", &DataType::Date32, &[Some(&after[3])]).unwrap();
+        let d = build_column(&DataType::Date32, &[Some(&after[3])]).unwrap();
         let d = d.as_any().downcast_ref::<Date32Array>().unwrap();
         assert!(d.is_valid(0), "a nested date domain must not build a NULL");
         assert_eq!(d.value(0), 19_782, "2024-02-29 is day 19782 of the epoch");

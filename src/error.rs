@@ -498,7 +498,7 @@ pub mod codes {
     /// A `columns:` override declares a type the source's wire value cannot be read as.
     pub const SOURCE_OVERRIDE_WIRE_MISMATCH: Code = usage(
         "RIVET_SOURCE_OVERRIDE_WIRE_MISMATCH",
-        "remove or correct the column's `columns:` override, or CAST the column to that type in the export's `query:`",
+        "remove or correct the column's `columns:` override (batch: or CAST the column to that type in the export's `query:`; CDC: then re-snapshot the table)",
     );
     pub const LOAD_VALUE_OUT_OF_TARGET_RANGE: Code = refusal(
         "RIVET_LOAD_VALUE_OUT_OF_TARGET_RANGE",

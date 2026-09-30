@@ -79,6 +79,40 @@ fn oracle_cdc_an_int_override_on_a_fractional_number_fails_by_column_not_null() 
     );
 }
 
+/// A `date` override on a DATE holding 13:14 refuses the flush by column instead of dropping the time, and never checkpoints.
+#[test]
+#[ignore = "live: requires the oracle service with LogMiner prerequisites"]
+fn oracle_cdc_a_date_override_refuses_a_time_of_day_not_drops_it() {
+    let _serial = cross_process_serial("oracle_cdc");
+    let d = tempfile::tempdir().unwrap();
+    let t = cdc_table("ora_cdate", "id NUMBER(18) PRIMARY KEY, dt DATE");
+    let ckpt = d.path().join("cdc.ckpt");
+    let over = r#"columns: { DT: date }"#;
+    rig(&t, &ckpt, &d.path().join("anchor"))
+        .export_line(over)
+        .run_ok();
+    let anchored = std::fs::read(&ckpt).unwrap();
+    ora_exec(&format!(
+        "INSERT INTO {} VALUES (1, TO_DATE('2024-03-15 13:14:00', 'YYYY-MM-DD HH24:MI:SS'))",
+        t.name()
+    ));
+
+    let err = rig(&t, &ckpt, &d.path().join("out"))
+        .export_line(over)
+        .run_expect_fail();
+    assert!(
+        err.contains("RIVET_SOURCE_OVERRIDE_WIRE_MISMATCH")
+            && err.contains("column 'DT' is Date32")
+            && err.contains("has a time of day, which a `date` override would drop"),
+        "CDC must refuse naming the column and the dropped time: {err}"
+    );
+    assert_eq!(
+        std::fs::read(&ckpt).unwrap(),
+        anchored,
+        "a refused flush must not advance the checkpoint past the row"
+    );
+}
+
 #[test]
 #[ignore = "live: requires the oracle service with LogMiner prerequisites"]
 fn oracle_cdc_resume_captures_only_new_changes() {
