@@ -920,3 +920,558 @@ fn an_idle_incremental_run_after_the_first_pass_loads_cleanly() {
     load(&rig);
     assert_eq!(loaded(), pg_rows(&mut c, &tbl), "a later delta still lands");
 }
+
+/// The `load:` line for ClickHouse database `db` at `url`, plus `extra` keys (`, k: v`).
+fn load_line(url: &str, db: &Db, extra: &str) -> String {
+    format!(
+        "load: {{ target: clickhouse, url: \"{url}\", database: {}, user: {CLICKHOUSE_USER}, \
+         password_env: {PASSWORD_ENV}, pk: [id]{extra} }}",
+        db.0
+    )
+}
+
+/// A 9999-12-31 timestamp staged on S3 and PULLED by ClickHouse through the named
+/// collection is refused before any row lands, as a pushed one is: the pull reads the
+/// part's footer from the store first (until 2026-09-29 it was stored clamped to 2299).
+#[test]
+#[ignore = "live: requires clickhouse (named collections) + minio + postgres"]
+fn a_timestamp_clickhouse_cannot_hold_is_refused_when_pulled_too() {
+    require_alive(LiveService::ClickHouse);
+    require_alive(LiveService::Minio);
+    ensure_minio_bucket(S3_BUCKET);
+    let mut c = pg_connect();
+    let tbl = unique_name("rivet_ch_farpull");
+    c.batch_execute(&format!(
+        "CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, ts TIMESTAMP); \
+         INSERT INTO {tbl} VALUES (1, TIMESTAMP '2024-01-01 00:00:00'), \
+                                  (2, TIMESTAMP '9999-12-31 00:00:00')"
+    ))
+    .expect("seed");
+    let _t = PgTable::adopt(tbl.clone());
+    let db = Db::new("rivet_chtest");
+    let rig = on_s3(Rig::pg_batch(&tbl).mode("full")).top_line(&load_line(
+        CLICKHOUSE_HTTP_URL,
+        &db,
+        ", named_collection: rivet_stand_minio",
+    ));
+    let run = rig.run_args_env(&[], &MINIO_ENV);
+    assert!(
+        run.status.success(),
+        "run: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let mut envs = MINIO_ENV.to_vec();
+    envs.push((PASSWORD_ENV, CLICKHOUSE_PASSWORD));
+    let out = rig.load_args_env(&[], &envs);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "the pulled load must refuse:\n{err}");
+    assert!(
+        err.contains("column `ts` holds 9999-12-31 00:00, outside ClickHouse DateTime64's range"),
+        "{err}"
+    );
+    let rows = ch(&format!(
+        "SELECT sum(total_rows) FROM system.tables WHERE database = '{}' FORMAT TSV",
+        db.0
+    ));
+    assert_eq!(
+        rows, "0",
+        "no row reached any table, the clamped one least of all"
+    );
+}
+
+/// A TCP proxy in front of ClickHouse that counts INSERT requests and swallows the
+/// answer of the first `lose` of them after ClickHouse ran them.
+struct LossyProxy {
+    port: u16,
+    inserts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    budget: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl LossyProxy {
+    fn start(lose: usize) -> Self {
+        use std::io::{Read, Write};
+        use std::net::{Shutdown, TcpListener, TcpStream};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind the proxy");
+        let port = listener.local_addr().expect("proxy addr").port();
+        let inserts = Arc::new(AtomicUsize::new(0));
+        let budget = Arc::new(AtomicUsize::new(lose));
+        let (counted, lost) = (inserts.clone(), budget.clone());
+        let upstream_addr = CLICKHOUSE_HTTP_URL
+            .trim_start_matches("http://")
+            .to_string();
+        std::thread::spawn(move || {
+            for client in listener.incoming().flatten() {
+                let upstream = TcpStream::connect(&upstream_addr).expect("reach clickhouse");
+                let saw_insert = Arc::new(AtomicBool::new(false));
+                let mut c_in = client.try_clone().expect("clone client");
+                let mut u_out = upstream.try_clone().expect("clone upstream");
+                let (saw, counted) = (saw_insert.clone(), counted.clone());
+                std::thread::spawn(move || {
+                    let mut buf = vec![0u8; 64 * 1024];
+                    while let Ok(n) = c_in.read(&mut buf) {
+                        if n == 0 {
+                            break;
+                        }
+                        if buf[..n].windows(6).any(|w| w == b"INSERT") {
+                            counted.fetch_add(1, SeqCst);
+                            saw.store(true, SeqCst);
+                        }
+                        if u_out.write_all(&buf[..n]).is_err() {
+                            break;
+                        }
+                    }
+                    let _ = u_out.shutdown(Shutdown::Write);
+                });
+                let (mut u_in, mut c_out, budget) = (upstream, client, lost.clone());
+                std::thread::spawn(move || {
+                    let mut buf = vec![0u8; 64 * 1024];
+                    while let Ok(n) = u_in.read(&mut buf) {
+                        let lost = n > 0
+                            && saw_insert.swap(false, SeqCst)
+                            && budget
+                                .fetch_update(SeqCst, SeqCst, |b| b.checked_sub(1))
+                                .is_ok();
+                        if n == 0 || lost || c_out.write_all(&buf[..n]).is_err() {
+                            break;
+                        }
+                    }
+                    let _ = c_out.shutdown(Shutdown::Both);
+                    let _ = u_in.shutdown(Shutdown::Both);
+                });
+            }
+        });
+        LossyProxy {
+            port,
+            inserts,
+            budget,
+        }
+    }
+
+    /// Swallow the answers of the next `n` INSERTs.
+    fn lose(&self, n: usize) {
+        self.budget.store(n, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+
+    fn inserts(&self) -> usize {
+        self.inserts.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// An INSERT into a CDC change log whose answer is lost after ClickHouse ran it is sent
+/// again, and the load completes: the second copy carries the same key and version, so
+/// the view still equals the source row for row.
+#[test]
+#[ignore = "live: requires clickhouse + fake-gcs + mysql-cdc"]
+fn a_lost_insert_answer_is_resent_and_the_cdc_view_still_matches_the_source() {
+    require_alive(LiveService::ClickHouse);
+    require_alive(LiveService::FakeGcs);
+    ensure_gcs_bucket(BUCKET);
+    let (tbl, _guard) = seeded("rivet_ch_lost", 5);
+    let db = Db::new("rivet_chtest");
+    let proxy = LossyProxy::start(1);
+    let rig = Rig::mysql_cdc(&tbl)
+        .cdc("initial: snapshot")
+        .dest_gcs(BUCKET, &unique_name("chload"), FAKE_GCS_ENDPOINT)
+        .top_line(&load_line(&proxy.url(), &db, ""));
+    rig.run_ok();
+    load(&rig);
+    assert!(
+        proxy.inserts() >= 2,
+        "the lost INSERT was sent again ({} INSERTs)",
+        proxy.inserts()
+    );
+    clickhouse_rows_match_source(&format!("{}.{tbl}", db.0), source_rows(&tbl), "");
+}
+
+/// When every answer is lost the retries end: the load fails after exactly five attempts
+/// at the first part and says so.
+#[test]
+#[ignore = "live: requires clickhouse + fake-gcs + mysql-cdc"]
+fn a_cdc_insert_whose_every_answer_is_lost_fails_after_five_attempts() {
+    require_alive(LiveService::ClickHouse);
+    require_alive(LiveService::FakeGcs);
+    ensure_gcs_bucket(BUCKET);
+    let (tbl, _guard) = seeded("rivet_ch_lostall", 3);
+    let db = Db::new("rivet_chtest");
+    let proxy = LossyProxy::start(usize::MAX);
+    let rig = Rig::mysql_cdc(&tbl)
+        .cdc("initial: snapshot")
+        .dest_gcs(BUCKET, &unique_name("chload"), FAKE_GCS_ENDPOINT)
+        .top_line(&load_line(&proxy.url(), &db, ""));
+    rig.run_ok();
+    let out = rig.load_args_env(&[], &[(PASSWORD_ENV, CLICKHOUSE_PASSWORD)]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "the load must fail:\n{err}");
+    assert!(err.contains("failed on attempt 5 of 5"), "{err}");
+    assert_eq!(
+        proxy.inserts(),
+        5,
+        "one first try and four retries, no more"
+    );
+}
+
+/// A full load's INSERT into its swap table is NOT resent when its answer is lost: the
+/// swap table is a plain MergeTree, so a second copy would double the rows. The load
+/// fails, the old table keeps serving, and the next load replaces it with the source.
+#[test]
+#[ignore = "live: requires clickhouse + fake-gcs + postgres"]
+fn a_full_load_insert_whose_answer_is_lost_is_not_resent() {
+    require_alive(LiveService::ClickHouse);
+    require_alive(LiveService::FakeGcs);
+    ensure_gcs_bucket(BUCKET);
+    let (tbl, _t, mut c) = pg_batch_seeded("rivet_ch_lostfull", 5);
+    let db = Db::new("rivet_chtest");
+    let proxy = LossyProxy::start(0);
+    let rig = Rig::pg_batch(&tbl)
+        .mode("full")
+        .dest_gcs(BUCKET, &unique_name("chload"), FAKE_GCS_ENDPOINT)
+        .top_line(&load_line(&proxy.url(), &db, ""));
+    let table = format!("{}.{tbl}", db.0);
+    let loaded = || clickhouse_rows(&format!("SELECT id, v FROM {table} ORDER BY id FORMAT TSV"));
+    rig.run_ok();
+    load(&rig);
+    let before = pg_rows(&mut c, &tbl);
+    assert_eq!(loaded(), before);
+
+    c.batch_execute(&format!("UPDATE {tbl} SET v = 99 WHERE id = 1"))
+        .expect("change");
+    rig.run_ok();
+    let sent = proxy.inserts();
+    proxy.lose(1);
+    let out = rig.load_args_env(&[], &[(PASSWORD_ENV, CLICKHOUSE_PASSWORD)]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "the load must fail, not resend:\n{err}"
+    );
+    assert!(err.contains("failed on attempt 1 of 5"), "{err}");
+    assert_eq!(
+        proxy.inserts() - sent,
+        1,
+        "the swap-table INSERT went exactly once"
+    );
+    assert_eq!(loaded(), before, "the old table keeps serving");
+
+    load(&rig);
+    assert_eq!(
+        loaded(),
+        pg_rows(&mut c, &tbl),
+        "the next load lands the source"
+    );
+}
+
+/// A full load killed at each of its fault points (swap created, first part inserted,
+/// every part inserted, swap exchanged in) leaves either the old table or the new one,
+/// never a mix, and the next load serves the source exactly.
+#[test]
+#[ignore = "live: requires clickhouse + fake-gcs + postgres"]
+fn a_full_load_killed_at_each_fault_point_re_runs_to_the_source() {
+    require_alive(LiveService::ClickHouse);
+    require_alive(LiveService::FakeGcs);
+    ensure_gcs_bucket(BUCKET);
+    let (tbl, _t, mut c) = pg_batch_seeded("rivet_ch_fullcrash", 6);
+    let db = Db::new("rivet_chtest");
+    let rig = batch_into_clickhouse(
+        Rig::pg_batch(&tbl)
+            .mode("chunked")
+            .export_line("chunk_column: id")
+            .export_line("chunk_size: 2"),
+        &db,
+    );
+    let table = format!("{}.{tbl}", db.0);
+    let loaded = || clickhouse_rows(&format!("SELECT id, v FROM {table} ORDER BY id FORMAT TSV"));
+    rig.run_ok();
+    load(&rig);
+    let mut served = pg_rows(&mut c, &tbl);
+    assert_eq!(loaded(), served);
+
+    for (i, (hook, swapped)) in [
+        ("clickhouse_full_after_swap_created", false),
+        ("clickhouse_after_part:0", false),
+        ("clickhouse_full_before_swap_in", false),
+        ("clickhouse_full_after_exchange", true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        c.batch_execute(&format!(
+            "UPDATE {tbl} SET v = v + 100 WHERE id = 1; \
+             INSERT INTO {tbl} VALUES ({}, 7, TIMESTAMP '2026-01-02')",
+            100 + i
+        ))
+        .expect("change");
+        rig.run_ok();
+        let crashed = rig.load_args_env(
+            &[],
+            &[
+                (PASSWORD_ENV, CLICKHOUSE_PASSWORD),
+                ("RIVET_TEST_PANIC_AT", hook),
+            ],
+        );
+        let err = String::from_utf8_lossy(&crashed.stderr);
+        assert!(
+            !crashed.status.success() && err.contains("injected crash"),
+            "{hook} must stop the load:\n{err}"
+        );
+        let source = pg_rows(&mut c, &tbl);
+        let expected = if swapped { &source } else { &served };
+        assert_eq!(
+            &loaded(),
+            expected,
+            "{hook}: the old table or the new one, never a mix"
+        );
+        load(&rig);
+        assert_eq!(loaded(), source, "{hook}: the re-run serves the source");
+        served = source;
+    }
+}
+
+/// `system.tables.partition_key` of `db.name`, as ClickHouse spells it.
+fn partition_key(db: &Db, name: &str) -> String {
+    ch(&format!(
+        "SELECT partition_key FROM system.tables WHERE database = '{}' AND name = '{name}' \
+         FORMAT TSVRaw",
+        db.0
+    ))
+}
+
+/// A partitioned whole-table load: the table carries the declared key, each row sits in the
+/// month PostgreSQL itself names for it (a 1950 row included), and the data equals the source.
+#[test]
+#[ignore = "live: requires clickhouse + fake-gcs + postgres"]
+fn a_full_load_into_clickhouse_is_partitioned_by_month_as_declared() {
+    require_alive(LiveService::ClickHouse);
+    require_alive(LiveService::FakeGcs);
+    ensure_gcs_bucket(BUCKET);
+    let mut c = pg_connect();
+    let tbl = unique_name("rivet_ch_part_full");
+    c.batch_execute(&format!(
+        "CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v BIGINT, created_at TIMESTAMP); \
+         INSERT INTO {tbl} VALUES (1, 1, '1950-06-15 13:45:00'), (2, 2, '2026-01-05 00:00:00'), \
+           (3, 3, '2026-01-31 23:59:59'), (4, 4, '2026-03-01 00:00:00'), (5, 5, NULL)"
+    ))
+    .expect("seed");
+    let _t = PgTable::adopt(tbl.clone());
+    let db = Db::new("rivet_chtest");
+    let rig = Rig::pg_batch(&tbl)
+        .mode("full")
+        .dest_gcs(BUCKET, &unique_name("chload"), FAKE_GCS_ENDPOINT)
+        .top_line(&load_line(
+            CLICKHOUSE_HTTP_URL,
+            &db,
+            ", partition: { column: created_at, granularity: month }",
+        ));
+    rig.run_ok();
+    load(&rig);
+
+    let table = format!("{}.{tbl}", db.0);
+    assert_eq!(partition_key(&db, &tbl), "toYYYYMM(created_at)");
+    let months: Vec<String> = c
+        .query(
+            &format!(
+                "SELECT DISTINCT to_char(created_at, 'YYYYMM') FROM {tbl} \
+                 WHERE created_at IS NOT NULL ORDER BY 1"
+            ),
+            &[],
+        )
+        .expect("source months")
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_eq!(
+        ch(&format!(
+            "SELECT DISTINCT _partition_id FROM {table} WHERE created_at IS NOT NULL \
+             ORDER BY 1 FORMAT TSV"
+        )),
+        months.join("\n"),
+        "each row sits in the month the source names, 1950 included"
+    );
+    assert_eq!(
+        clickhouse_rows(&format!("SELECT id, v FROM {table} ORDER BY id FORMAT TSV")),
+        pg_rows(&mut c, &tbl)
+    );
+}
+
+/// A CDC log partitioned by a column that moves: the key whose `event_at` changes month
+/// keeps one version per partition in storage, and the view still returns exactly the
+/// source's latest row per key — also under a session that turns the cross-partition
+/// `FINAL` off, since the view pins it.
+#[test]
+#[ignore = "live: requires clickhouse + fake-gcs + mysql-cdc"]
+fn a_cdc_log_partitioned_by_a_moving_column_serves_one_latest_row_per_key() {
+    require_alive(LiveService::ClickHouse);
+    require_alive(LiveService::FakeGcs);
+    ensure_gcs_bucket(BUCKET);
+    let mut c = conn();
+    let tbl = unique_name("rivet_ch_part_cdc");
+    c.query_drop(format!(
+        "DROP TABLE IF EXISTS {tbl}; \
+         CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT, event_at DATETIME NOT NULL); \
+         INSERT INTO {tbl} VALUES (1, 1, '2026-01-10 00:00:00'), (2, 2, '2026-01-11 00:00:00'), \
+           (3, 3, '2026-02-01 00:00:00'), (4, 4, '1950-01-01 00:00:00'), \
+           (5, 5, '2026-02-02 00:00:00')"
+    ))
+    .expect("seed");
+    let _guard = Table(tbl.clone());
+    let db = Db::new("rivet_chtest");
+    let rig = Rig::mysql_cdc(&tbl)
+        .cdc("initial: snapshot")
+        .dest_gcs(BUCKET, &unique_name("chload"), FAKE_GCS_ENDPOINT)
+        .top_line(&load_line(
+            CLICKHOUSE_HTTP_URL,
+            &db,
+            ", partition: { column: event_at, granularity: month }",
+        ));
+    let view = format!("{}.{tbl}", db.0);
+    rig.run_ok();
+    load(&rig);
+    clickhouse_rows_match_source(&view, source_rows(&tbl), "");
+
+    c.query_drop(format!(
+        "UPDATE {tbl} SET v = 99, event_at = '2026-03-10 00:00:00' WHERE id = 1; \
+         UPDATE {tbl} SET v = 30 WHERE id = 3; \
+         UPDATE {tbl} SET v = 31, event_at = '2026-04-01 00:00:00' WHERE id = 3; \
+         DELETE FROM {tbl} WHERE id = 2"
+    ))
+    .expect("changes");
+    rig.run_ok();
+    let out = rig.load_args_env(&[], &[(PASSWORD_ENV, CLICKHOUSE_PASSWORD)]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "load: {err}");
+    assert!(
+        err.contains("partitioned by `event_at`, which is not a creation stamp"),
+        "the load warns that the column can move:\n{err}"
+    );
+
+    assert_eq!(
+        partition_key(&db, &format!("{tbl}__changes")),
+        "toYYYYMM(event_at)"
+    );
+    ch(&format!("OPTIMIZE TABLE {view}__changes FINAL"));
+    assert_eq!(
+        ch(&format!(
+            "SELECT groupArray(_partition_id) FROM (SELECT _partition_id FROM {view}__changes \
+             WHERE id = 1 ORDER BY 1) FORMAT TSV"
+        )),
+        "['202601','202603']",
+        "merges never cross partitions: the moved key keeps a version in each"
+    );
+    clickhouse_rows_match_source(&view, source_rows(&tbl), "2");
+    assert_eq!(
+        clickhouse_rows(&format!(
+            "SELECT id, v FROM {view} WHERE NOT __is_deleted ORDER BY id \
+             SETTINGS do_not_merge_across_partitions_select_final = 1 FORMAT TSV"
+        )),
+        source_rows(&tbl),
+        "the view pins the cross-partition FINAL against the session"
+    );
+}
+
+/// A change log created with one partition refuses a load declaring another, naming both,
+/// and the view keeps serving what it served.
+#[test]
+#[ignore = "live: requires clickhouse + fake-gcs + mysql-cdc"]
+fn a_changed_partition_is_refused_before_it_touches_the_change_log() {
+    require_alive(LiveService::ClickHouse);
+    require_alive(LiveService::FakeGcs);
+    ensure_gcs_bucket(BUCKET);
+    let mut c = conn();
+    let tbl = unique_name("rivet_ch_part_moved");
+    c.query_drop(format!(
+        "DROP TABLE IF EXISTS {tbl}; \
+         CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT, created_at DATETIME NOT NULL); \
+         INSERT INTO {tbl} VALUES (1, 1, '2026-01-10 00:00:00'), (2, 2, '2026-02-10 00:00:00')"
+    ))
+    .expect("seed");
+    let _guard = Table(tbl.clone());
+    let db = Db::new("rivet_chtest");
+    let by = |granularity: &str| {
+        Rig::mysql_cdc(&tbl)
+            .cdc("initial: snapshot")
+            .dest_gcs(BUCKET, &unique_name("chload"), FAKE_GCS_ENDPOINT)
+            .top_line(&load_line(
+                CLICKHOUSE_HTTP_URL,
+                &db,
+                &format!(", partition: {{ column: created_at, granularity: {granularity} }}"),
+            ))
+    };
+    let first = by("month");
+    first.run_ok();
+    load(&first);
+    let view = format!("{}.{tbl}", db.0);
+    let before = source_rows(&tbl);
+    clickhouse_rows_match_source(&view, before.clone(), "");
+
+    let second = by("year");
+    second.run_ok();
+    let out = second.load_args_env(&[], &[(PASSWORD_ENV, CLICKHOUSE_PASSWORD)]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success()
+            && err.contains(
+                "is partitioned by toYYYYMM(created_at), but the load declares toYear(`created_at`)"
+            ),
+        "a re-partitioned load must refuse, naming both keys:\n{err}"
+    );
+    assert_eq!(
+        ch(&format!("SELECT count() FROM {view}__changes")),
+        "2",
+        "nothing was written"
+    );
+    clickhouse_rows_match_source(&view, before, "");
+}
+
+/// A partitioned incremental export: the first pass lands a partitioned table, the first
+/// delta adopts it as the log (same key, so no refusal), and the view serves the source.
+#[test]
+#[ignore = "live: requires clickhouse + fake-gcs + postgres"]
+fn a_partitioned_incremental_export_into_clickhouse_serves_the_latest_rows() {
+    require_alive(LiveService::ClickHouse);
+    require_alive(LiveService::FakeGcs);
+    ensure_gcs_bucket(BUCKET);
+    let (tbl, _t, mut c) = pg_batch_seeded("rivet_ch_part_inc", 5);
+    let db = Db::new("rivet_chtest");
+    let rig = Rig::pg_batch(&tbl)
+        .mode("incremental")
+        .export_line("cursor_column: updated_at")
+        .dest_gcs(BUCKET, &unique_name("chload"), FAKE_GCS_ENDPOINT)
+        .top_line(&load_line(
+            CLICKHOUSE_HTTP_URL,
+            &db,
+            ", partition: { column: updated_at, granularity: month }",
+        ));
+    let view = format!("{}.{tbl}", db.0);
+
+    rig.run_ok();
+    load(&rig);
+    assert_eq!(partition_key(&db, &tbl), "toYYYYMM(updated_at)");
+    c.batch_execute(&format!(
+        "UPDATE {tbl} SET v = 99, updated_at = TIMESTAMP '2026-02-01' WHERE id = 1; \
+         INSERT INTO {tbl} VALUES (6, 6, TIMESTAMP '2026-03-01')"
+    ))
+    .expect("changes");
+    rig.run_ok();
+    load(&rig);
+
+    assert_eq!(
+        partition_key(&db, &format!("{tbl}__changes")),
+        "toYYYYMM(updated_at)",
+        "the log keeps the partition of the table it grew from"
+    );
+    assert_eq!(
+        ch(&format!(
+            "SELECT DISTINCT _partition_id FROM {view}__changes ORDER BY 1 FORMAT TSV"
+        )),
+        "202601\n202602\n202603"
+    );
+    assert_eq!(
+        clickhouse_rows(&format!("SELECT id, v FROM {view} ORDER BY id FORMAT TSV")),
+        pg_rows(&mut c, &tbl)
+    );
+}

@@ -1053,7 +1053,7 @@ fn flush(
                 .map(|e| image_cell(e, i, &m.column_name, &schema_names, memo))
                 .collect(),
         };
-        let arr = value::build_column(&render, &cells)?;
+        let arr = value::build_column(&m.column_name, &render, &cells)?;
         // Two-ended value check, same contract as the batch export's Form A:
         // an independent fold of the typed cells vs a fold of the BUILT array.
         // A mismatch means the builder changed a value between decode and

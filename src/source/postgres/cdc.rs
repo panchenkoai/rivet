@@ -2949,16 +2949,16 @@ mod tests {
                     d[workday]:'2024-02-29'";
         let ev = parse_test_decoding("0/1", line, &domains).unwrap().unwrap();
         let after = ev.after.unwrap();
-        let qty = build_column(&DataType::Int32, &[Some(&after[1])]).unwrap();
+        let qty = build_column("c", &DataType::Int32, &[Some(&after[1])]).unwrap();
         let qty = qty.as_any().downcast_ref::<Int32Array>().unwrap();
         assert!(
             qty.is_valid(0),
             "a domain over integer must not build a NULL"
         );
         assert_eq!(qty.value(0), 5);
-        let ok = build_column(&DataType::Boolean, &[Some(&after[2])]).unwrap();
+        let ok = build_column("c", &DataType::Boolean, &[Some(&after[2])]).unwrap();
         assert!(ok.as_any().downcast_ref::<BooleanArray>().unwrap().value(0));
-        let d = build_column(&DataType::Date32, &[Some(&after[3])]).unwrap();
+        let d = build_column("c", &DataType::Date32, &[Some(&after[3])]).unwrap();
         let d = d.as_any().downcast_ref::<Date32Array>().unwrap();
         assert!(d.is_valid(0), "a nested date domain must not build a NULL");
         assert_eq!(d.value(0), 19_782, "2024-02-29 is day 19782 of the epoch");

@@ -368,3 +368,41 @@
     - test: a_date_is_whole_days_and_a_time_of_day_is_refused_by_name
       suite: lib
       needs: none
+
+- id: clickhouse-pull-skips-range-guard
+  class: "ClickHouse load pulled through a named collection skips the DateTime64 range check -> 9999-12-31 stored clamped to 2299-12-31, silently"
+  file: src/load/clickhouse.rs
+  old: |2-
+            refuse_unholdable_timestamps(&meta, uri)?;
+  new: |2-
+            if !body.is_empty() {
+                refuse_unholdable_timestamps(&meta, uri)?;
+            }
+  detectors:
+    - test: a_timestamp_clickhouse_cannot_hold_is_refused_when_pulled_too
+      suite: live_suite
+      needs: clickhouse
+
+- id: clickhouse-swap-insert-resent
+  class: "ClickHouse full load resends a swap-table INSERT whose answer was lost -> the landed copy and the resent one both served, rows doubled"
+  file: src/load/clickhouse.rs
+  old: |2-
+            let rows = self.insert_uris(&swap, uris, Repeat::Undelivered)?;
+  new: |2-
+            let rows = self.insert_uris(&swap, uris, Repeat::Safe)?;
+  detectors:
+    - test: a_full_load_insert_whose_answer_is_lost_is_not_resent
+      suite: live_suite
+      needs: clickhouse
+
+- id: clickhouse-swap-table-kept-across-a-crash
+  class: "ClickHouse full load reuses a swap table a crashed load left filled -> the re-run appends to it and swaps in duplicated rows"
+  file: src/load/clickhouse.rs
+  old: |2-
+                "CREATE OR REPLACE TABLE",
+  new: |2-
+                "CREATE TABLE IF NOT EXISTS",
+  detectors:
+    - test: a_full_load_killed_at_each_fault_point_re_runs_to_the_source
+      suite: live_suite
+      needs: clickhouse

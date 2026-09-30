@@ -1003,13 +1003,13 @@ fn export_block_lines(
     // guess, said as one: the operator reviews it before the first load. Not on a
     // recipe — the load never reads one; its table's guess rides the stream's
     // `load.tables.<name>` instead.
-    if dest.bigquery_project.is_some()
+    if let Some((granularity, why)) = dest.partition_guess()
         && !recipe
         && let Some(col) = info.best_partition_column()
     {
         lines.push("    load:".to_string());
         lines.push(format!(
-            "      partition: {{ column: {}, granularity: day }}  # day holds ~4,000 partitions (11 years); use month for a longer history",
+            "      partition: {{ column: {}, granularity: {granularity} }}  # {why}",
             yaml_quote_if_needed(col)
         ));
     }
@@ -1167,15 +1167,15 @@ fn cdc_multiplex_export_lines(
 /// never loaded — and the bases were created unpartitioned under a config that
 /// visibly said otherwise.
 fn cdc_multiplex_load_lines(infos: &[TableInfo], dest: &InitYamlDestination) -> Vec<String> {
-    if dest.bigquery_project.is_none() {
+    let Some((granularity, why)) = dest.partition_guess() else {
         return Vec::new();
-    }
+    };
     let guesses: Vec<String> = infos
         .iter()
         .filter_map(|i| {
             i.best_partition_column().map(|col| {
                 format!(
-                    "        {}: {{ partition: {{ column: {}, granularity: day }} }}",
+                    "        {}: {{ partition: {{ column: {}, granularity: {granularity} }} }}",
                     yaml_quote_if_needed(&i.table),
                     yaml_quote_if_needed(col)
                 )
@@ -1187,7 +1187,7 @@ fn cdc_multiplex_load_lines(infos: &[TableInfo], dest: &InitYamlDestination) -> 
     }
     let mut lines = vec![
         "    load:".to_string(),
-        "      # Each table's warehouse partition, guessed from its own columns — day holds ~4,000 partitions (11 years); use month for a longer history".to_string(),
+        format!("      # Each table's warehouse partition, guessed from its own columns — {why}"),
         "      tables:".to_string(),
     ];
     lines.extend(guesses);
@@ -2378,7 +2378,7 @@ mod tests {
         assert_eq!(cfg.exports.len(), 3, "two recipes + the stream");
     }
 
-    /// With a warehouse, the whole-DB CDC scaffold's partition guesses must sit where
+    /// With BigQuery (day) or ClickHouse (month), the whole-DB scaffold's partition guesses sit where
     /// the LOAD reads them for a stream — `load.tables.<name>` on the stream — not on
     /// the recipes, which the load never reads (the bases came out unpartitioned under
     /// a config that visibly said `partition:`). The oracle is the resolver the load
@@ -2399,49 +2399,68 @@ mod tests {
                 col("created_at", "datetime"),
             ],
         };
-        let dest = InitYamlDestination {
+        use crate::config::load::{Granularity, PartitionForm};
+        let bigquery = InitYamlDestination {
             bigquery_project: Some("proj".into()),
             bigquery_dataset: Some("ds".into()),
             gcs_bucket: Some("b".into()),
             ..Default::default()
         };
-        let yaml = generate_schema_config(
-            &[mk("orders"), mk("items")],
-            "mysql://rivet:rivet@localhost/app",
-            &crate::init::SourceProvenance::Inline,
-            "MySQL database \"app\"",
-            &dest,
-            Some("cdc"),
-            None,
-        )
-        .unwrap();
-        let cfg = crate::config::Config::from_yaml(&yaml)
-            .expect("the scaffold must be a config rivet accepts");
-        let stream = cfg
-            .exports
-            .iter()
-            .find(|e| e.mode == crate::config::ExportMode::Cdc)
-            .expect("the cdc export");
-        for table in ["orders", "items"] {
-            let spec = crate::load::plan::resolved_partition(&cfg, stream, Some(table))
-                .unwrap_or_else(|| {
-                    panic!("{table} has a partition where the load reads it:\n{yaml}")
-                });
-            assert!(
-                matches!(
-                    spec.form,
-                    crate::config::load::PartitionForm::Column { ref column, granularity: crate::config::load::Granularity::Day } if column == "created_at"
-                ),
-                "{table}: {spec:?}"
-            );
+        let clickhouse = InitYamlDestination {
+            clickhouse_url: Some("http://ch:8123".into()),
+            clickhouse_database: Some("raw".into()),
+            gcs_bucket: Some("b".into()),
+            ..Default::default()
+        };
+        for (dest, want) in [
+            (bigquery, Granularity::Day),
+            (clickhouse, Granularity::Month),
+        ] {
+            for mode in [Some("cdc"), Some("incremental")] {
+                let yaml = generate_schema_config(
+                    &[mk("orders"), mk("items")],
+                    "mysql://rivet:rivet@localhost/app",
+                    &crate::init::SourceProvenance::Inline,
+                    "MySQL database \"app\"",
+                    &dest,
+                    mode,
+                    None,
+                )
+                .unwrap();
+                let cfg = crate::config::Config::from_yaml(&yaml)
+                    .expect("the scaffold must be a config rivet accepts");
+                for table in ["orders", "items"] {
+                    let export = cfg
+                        .exports
+                        .iter()
+                        .find(|e| {
+                            e.mode == crate::config::ExportMode::Cdc
+                                || (mode != Some("cdc") && e.name == table)
+                        })
+                        .expect("the export that loads the table");
+                    let spec = crate::load::plan::resolved_partition(&cfg, export, Some(table))
+                        .unwrap_or_else(|| {
+                            panic!("{table} has a partition where the load reads it:\n{yaml}")
+                        });
+                    assert!(
+                        matches!(
+                            spec.form,
+                            PartitionForm::Column { ref column, granularity } if column == "created_at" && granularity == want
+                        ),
+                        "{mode:?} {table}: {spec:?}"
+                    );
+                }
+                if mode == Some("cdc") {
+                    assert!(
+                        cfg.exports
+                            .iter()
+                            .filter(|e| e.mode != crate::config::ExportMode::Cdc)
+                            .all(|e| e.load.is_none()),
+                        "a recipe carries no `load:` block — the load never reads one:\n{yaml}"
+                    );
+                }
+            }
         }
-        assert!(
-            cfg.exports
-                .iter()
-                .filter(|e| e.mode != crate::config::ExportMode::Cdc)
-                .all(|e| e.load.is_none()),
-            "a recipe carries no `load:` block — the load never reads one:\n{yaml}"
-        );
     }
 
     /// The MySQL twin of the fallback below: N per-table CDC exports need N distinct
@@ -3089,7 +3108,7 @@ mod load_block_tests {
     }
 
     /// A ClickHouse scaffold names its endpoint, database and user, and promises no
-    /// compaction and no partition: ClickHouse loads do neither (ADR-0035).
+    /// compaction; the partition is guessed per table, never in the shared block (ADR-0035).
     #[test]
     fn a_clickhouse_load_block_carries_its_connection_and_no_layout() {
         let dest = InitYamlDestination {

@@ -748,6 +748,13 @@ exclude_re = [
     "replace <impl TargetLoader for ClickhouseLoader>::column_overlap -> Result<\\(u64, u64\\)>",
     "replace <impl TargetLoader for ClickhouseLoader>::row_count -> Result<u64>",
     "replace <impl TargetLoader for ClickhouseLoader>::adopt_as_changelog -> Result<\\(\\)>",
+    # `query_once` sends the RENAME of an incremental adoption: stubbed Ok, the log is never
+    # created and the next ALTER fails, which the live adoption cells catch. `client` built as
+    # a default client drops `load.ca_file` (and the timeout); what it decides is `http_client`,
+    # unit-tested next door, but no test serves https, so this stub is caught by nothing (the
+    # recipe's TLS limit and engine-maturity.md say so).
+    "replace ClickhouseLoader::query_once -> Result<String>",
+    "replace ClickhouseLoader::client -> Result<&reqwest::blocking::Client>",
     # `await_job`'s poll deadline, `started.elapsed() > budget`: EQUIVALENT against
     # `>=`, and the reason is the clock, not the coverage. The two differ on exactly
     # one input — elapsed EQUAL to the budget to the nanosecond — which no caller can

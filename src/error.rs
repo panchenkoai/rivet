@@ -378,6 +378,11 @@ pub mod codes {
         "RIVET_CONFIG_CSV_LOAD_UNSUPPORTED",
         "use `format: parquet` for an export with a `load:` section",
     );
+    /// A `partition:` form, option or column type the load target cannot take.
+    pub const CONFIG_LOAD_PARTITION_UNSUPPORTED: Code = usage(
+        "RIVET_CONFIG_LOAD_PARTITION_UNSUPPORTED",
+        "partition by a date or time `column` + `granularity`, and drop the options the target refuses",
+    );
     /// An export mode is not supported by the configured source type — today
     /// this is a non-SQL source (MongoDB) with any `mode:` other than `full`.
     pub const CONFIG_SOURCE_MODE_UNSUPPORTED: Code = usage(
@@ -525,6 +530,7 @@ pub mod codes {
         CONFIG_CDC_ROLLOVER_INVALID,
         CONFIG_CDC_CONTINUOUS_UNSUPPORTED,
         CONFIG_CSV_LOAD_UNSUPPORTED,
+        CONFIG_LOAD_PARTITION_UNSUPPORTED,
         CONFIG_SOURCE_MODE_UNSUPPORTED,
         CONFIG_SOURCE_URL_SCHEME_MISMATCH,
         CONFIG_KEYSET_KEY_UUID_OVERRIDE,
