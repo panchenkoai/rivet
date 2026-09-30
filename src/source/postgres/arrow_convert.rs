@@ -131,32 +131,73 @@ impl<'a> PgFromSql<'a> for PgInt {
 
 /// A `columns:` override the wire value cannot be read as, named instead of panicking in `Row::get`.
 fn pg_override_mismatch(
-    row: &Row,
-    col_idx: usize,
+    col: &str,
+    wire: &Type,
     declared: &str,
     cause: impl std::fmt::Display,
 ) -> anyhow::Error {
-    let c = &row.columns()[col_idx];
     anyhow::Error::new(crate::error::CodedError::new(
         crate::error::codes::SOURCE_OVERRIDE_WIRE_MISMATCH,
         format!(
-            "postgres: column `{}` is declared {declared} by a `columns:` override but \
-             PostgreSQL sends it as {} ({cause}) — rivet does not convert it. Remove the \
+            "postgres: column `{col}` is declared {declared} by a `columns:` override but \
+             PostgreSQL sends it as {wire} ({cause}) — rivet does not convert it. Remove the \
              override, or CAST the column to that type in the export's `query:`.",
-            c.name(),
-            c.type_()
         ),
     ))
 }
 
-/// Read one cell as `T`, turning a wire/override mismatch into a named error.
+/// A wire payload that does not decode (invalid UTF-8 from a SQL_ASCII server, a malformed value), refused by name.
+fn pg_undecodable(
+    col: &str,
+    wire: &Type,
+    cause: &(dyn std::error::Error + 'static),
+) -> anyhow::Error {
+    let msg = if cause.is::<std::str::Utf8Error>() || cause.is::<simdutf8::basic::Utf8Error>() {
+        format!(
+            "postgres: column `{col}` ({wire}) holds a value that is not valid UTF-8 ({cause}) — \
+             the server stored the bytes unchecked (a SQL_ASCII database does). rivet refuses \
+             rather than aborting or writing NULL. CAST the column to bytea in the export's \
+             `query:` (e.g. `{col}::bytea`), or convert the database to a UTF-8 server encoding."
+        )
+    } else {
+        format!(
+            "postgres: column `{col}` ({wire}) sent a malformed wire payload rivet cannot decode \
+             ({cause}). rivet refuses rather than writing NULL, because a NULL here is \
+             indistinguishable from a genuinely absent value. CAST the column to text in the \
+             export's `query:`, or exclude the column."
+        )
+    };
+    anyhow::Error::new(crate::error::CodedError::new(
+        crate::error::codes::SOURCE_VALUE_UNREPRESENTABLE,
+        msg,
+    ))
+}
+
+/// Name a failed cell read: a wire type the declared type rejects, or a payload that does not decode.
+fn pg_cell_error(
+    col: &str,
+    wire: &Type,
+    declared: &str,
+    cause: &(dyn std::error::Error + 'static),
+) -> anyhow::Error {
+    if cause.is::<postgres::types::WrongType>() {
+        pg_override_mismatch(col, wire, declared, cause)
+    } else {
+        pg_undecodable(col, wire, cause)
+    }
+}
+
+/// Read one cell as `T`, turning a wire/override mismatch or an undecodable payload into a named error.
 fn pg_cell<'a, T: PgFromSql<'a>>(
     row: &'a Row,
     col_idx: usize,
     declared: &str,
 ) -> Result<Option<T>> {
-    row.try_get::<_, Option<T>>(col_idx)
-        .map_err(|e| pg_override_mismatch(row, col_idx, declared, e))
+    row.try_get::<_, Option<T>>(col_idx).map_err(|e| {
+        let c = &row.columns()[col_idx];
+        let cause = std::error::Error::source(&e).unwrap_or(&e);
+        pg_cell_error(c.name(), c.type_(), declared, cause)
+    })
 }
 
 /// Side A re-reads a cell `build_array` already decoded; an error there surfaces as a checksum mismatch.
@@ -164,23 +205,28 @@ fn side_a<T>(cell: Result<Option<T>>) -> Option<T> {
     cell.ok().flatten()
 }
 
+/// Narrow a widened integer to the declared width, refusing a value that does not fit.
+fn narrow_int<T: TryFrom<i64>>(v: i64, col: &str, wire: &str, declared: &str) -> Result<T> {
+    T::try_from(v).map_err(|_| {
+        anyhow::Error::new(crate::error::CodedError::new(
+            crate::error::codes::SOURCE_VALUE_UNREPRESENTABLE,
+            format!(
+                "postgres: column `{col}` ({wire}) holds {v}, which does not fit the {declared} \
+                 declared by its `columns:` override — rivet refuses rather than wrapping \
+                 or writing NULL. Declare a wider integer type, or remove the override.",
+            ),
+        ))
+    })
+}
+
 /// An integer cell narrowed to the declared width, refusing a value that does not fit.
 fn pg_int_cell<T: TryFrom<i64>>(row: &Row, col_idx: usize, declared: &str) -> Result<Option<T>> {
     match pg_cell::<PgInt>(row, col_idx, declared)? {
         None => Ok(None),
-        Some(PgInt(v)) => T::try_from(v).map(Some).map_err(|_| {
+        Some(PgInt(v)) => {
             let c = &row.columns()[col_idx];
-            anyhow::Error::new(crate::error::CodedError::new(
-                crate::error::codes::SOURCE_VALUE_UNREPRESENTABLE,
-                format!(
-                    "postgres: column `{}` ({}) holds {v}, which does not fit the {declared} \
-                     declared by its `columns:` override — rivet refuses rather than wrapping \
-                     or writing NULL. Declare a wider integer type, or remove the override.",
-                    c.name(),
-                    c.type_()
-                ),
-            ))
-        }),
+            narrow_int(v, c.name(), &c.type_().to_string(), declared).map(Some)
+        }
     }
 }
 
@@ -562,10 +608,7 @@ pub(super) fn rows_to_record_batch_typed(
         arrays.push(arr);
     }
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;
-    // Form A value-checksum (always-on): an independent source-side pass over the
-    // raw pg values (A) vs the Arrow-side pass over the built batch (B). A mismatch
-    // means the value converter changed a value between read and Arrow build — fail
-    // loud rather than write the bad batch.
+    // Form A value-checksum: side A (raw pg values, same decoders) vs side B (built batch).
     let a =
         crate::source::value_checksum::source_checksums(schema, &PgCellSource { columns, rows });
     let b = crate::source::value_checksum::arrow_batch_checksums(&batch);
@@ -573,9 +616,10 @@ pub(super) fn rows_to_record_batch_typed(
     Ok(batch)
 }
 
-/// Side A of the Form A value-checksum for Postgres — an INDEPENDENT decode of the
-/// raw `Row` values (mirroring `build_array`'s per-type transform) so it equals side
-/// B on a correct build. Drives the shared
+/// Side A of the Form A value-checksum for Postgres — a second pass over the raw
+/// `Row` values that SHARES `build_array`'s cell decoders (`pg_cell`, `pg_int_cell`),
+/// so it catches builder/append faults, not decode faults (a decode fault is refused
+/// by the builder before the checksum runs). Drives the shared
 /// [`crate::source::value_checksum::source_checksums`] dispatch; each accessor holds
 /// the pg-specific extraction (OID widen, TIMESTAMPTZ, the text/json/numeric/uuid/
 /// interval/enum split, numeric wire → scaled i128). Bytes must match `feed_cell`
@@ -654,9 +698,9 @@ impl crate::source::value_checksum::CellSource for PgCellSource<'_> {
     fn utf8(&self, col: usize, row: usize) -> Option<Cow<'_, [u8]>> {
         let r = &self.rows[row];
         match self.columns[col].1 {
-            Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME => r
-                .get::<_, Option<&str>>(col)
-                .map(|t| Cow::Borrowed(t.as_bytes())),
+            Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME => {
+                side_a(pg_cell::<&str>(r, col, "string")).map(|t| Cow::Borrowed(t.as_bytes()))
+            }
             Type::JSON | Type::JSONB => match r.try_get::<_, Option<PgJsonRawText<'_>>>(col) {
                 Ok(Some(PgJsonRawText(t))) => Some(Cow::Borrowed(t.as_bytes())),
                 _ => None,
@@ -671,20 +715,13 @@ impl crate::source::value_checksum::CellSource for PgCellSource<'_> {
                 )),
                 _ => None,
             },
-            Type::INTERVAL => r
-                .try_get::<_, Option<PgInterval>>(col)
-                .ok()
-                .flatten()
-                .map(|iv| {
-                    Cow::Owned(
-                        pg_interval_to_iso8601(iv.months, iv.days, iv.microseconds).into_bytes(),
-                    )
-                }),
-            ref t if matches!(t.kind(), Kind::Enum(_)) => r
-                .try_get::<_, Option<AnyAsString>>(col)
-                .ok()
-                .flatten()
-                .map(|s| Cow::Owned(s.0.into_bytes())),
+            Type::INTERVAL => side_a(pg_cell::<PgInterval>(r, col, "string")).map(|iv| {
+                Cow::Owned(pg_interval_to_iso8601(iv.months, iv.days, iv.microseconds).into_bytes())
+            }),
+            ref t if matches!(t.kind(), Kind::Enum(_)) => {
+                side_a(pg_cell::<AnyAsString>(r, col, "string"))
+                    .map(|s| Cow::Owned(s.0.into_bytes()))
+            }
             _ => None,
         }
     }
@@ -937,14 +974,8 @@ fn build_pg_text_array(
     match *pg_type {
         Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME => {
             for row in rows {
-                // Borrow the cell as `&str` (a view into the Row's wire buffer)
-                // rather than `String`: the old owned read allocated + copied
-                // every text value, then `append_value` copied it again into the
-                // builder. `&str` drops the per-value alloc + the first copy —
-                // the same zero-copy read the JSON arm below already uses. The
-                // bytes appended are byte-identical (String = &str + to_owned).
-                let val: Option<&str> = row.get(col_idx);
-                match val {
+                // Borrowed `&str` (zero-copy); invalid UTF-8 is a named refusal, not a panic.
+                match pg_cell::<&str>(row, col_idx, "string")? {
                     Some(s) => {
                         value_within_ceiling(column, s.len(), max_value_bytes)?;
                         b.append_value(s);
@@ -1000,11 +1031,7 @@ fn build_pg_text_array(
         // Enum labels arrive as binary; read as UTF-8.
         _ if matches!(pg_type.kind(), Kind::Enum(_)) => {
             for row in rows {
-                match row
-                    .try_get::<_, Option<AnyAsString>>(col_idx)
-                    .ok()
-                    .flatten()
-                {
+                match pg_cell::<AnyAsString>(row, col_idx, "string")? {
                     Some(s) => b.append_value(&s.0),
                     None => b.append_null(),
                 }
@@ -1338,6 +1365,98 @@ mod decimal_override_tests {
 }
 
 #[cfg(test)]
+mod cell_refusal_tests {
+    use super::{narrow_int, pg_cell_error};
+    use crate::error::CodedError;
+    use postgres::types::{Type, WrongType};
+
+    fn code(e: &anyhow::Error) -> &'static str {
+        e.downcast_ref::<CodedError>().expect("coded").code()
+    }
+
+    /// Exact fits pass through; one past either bound, and an OID above i32::MAX, are refused.
+    #[test]
+    fn narrow_int_keeps_exact_fits_and_refuses_one_past_the_bound() {
+        assert_eq!(
+            narrow_int::<i16>(-32_768, "c", "int4", "int2").unwrap(),
+            i16::MIN
+        );
+        assert_eq!(
+            narrow_int::<i16>(32_767, "c", "int4", "int2").unwrap(),
+            i16::MAX
+        );
+        assert_eq!(
+            narrow_int::<i32>(2_147_483_647, "c", "oid", "int4").unwrap(),
+            i32::MAX
+        );
+        assert_eq!(
+            narrow_int::<i64>(4_000_000_000, "c", "oid", "int8").unwrap(),
+            4_000_000_000
+        );
+        for (v, wire) in [(-32_769i64, "int4"), (32_768, "int4")] {
+            let e = narrow_int::<i16>(v, "qty", wire, "int2").unwrap_err();
+            assert_eq!(code(&e), "RIVET_SOURCE_VALUE_UNREPRESENTABLE");
+            assert!(
+                e.to_string().contains(&format!("`qty` ({wire}) holds {v}")),
+                "{e}"
+            );
+        }
+        let e = narrow_int::<i32>(4_000_000_000, "o", "oid", "int4").unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("holds 4000000000, which does not fit the int4"),
+            "{e}"
+        );
+    }
+
+    /// Invalid UTF-8 from either decoder is a named value refusal with the bytea remedy.
+    #[test]
+    fn invalid_utf8_is_refused_by_name_not_as_an_override() {
+        let bytes: &[u8] = b"caf\xe9";
+        let std_err = std::str::from_utf8(std::hint::black_box(bytes)).unwrap_err();
+        let simd_err = simdutf8::basic::from_utf8(bytes).unwrap_err();
+        let causes: [&(dyn std::error::Error + 'static); 2] = [&std_err, &simd_err];
+        for cause in causes {
+            let e = pg_cell_error("name", &Type::TEXT, "string", cause);
+            assert_eq!(code(&e), "RIVET_SOURCE_VALUE_UNREPRESENTABLE");
+            let m = e.to_string();
+            assert!(
+                m.contains("column `name` (text) holds a value that is not valid UTF-8"),
+                "{m}"
+            );
+            assert!(
+                m.contains("`name::bytea`") && !m.contains("override"),
+                "{m}"
+            );
+        }
+    }
+
+    /// A malformed payload is a value refusal; only a rejected wire type blames the override.
+    #[test]
+    fn a_malformed_payload_is_not_reported_as_an_override_mismatch() {
+        let bad: Box<dyn std::error::Error + Sync + Send> =
+            "expected 16-byte interval, got 3".into();
+        let e = pg_cell_error("iv", &Type::INTERVAL, "string", &*bad);
+        assert_eq!(code(&e), "RIVET_SOURCE_VALUE_UNREPRESENTABLE");
+        assert!(
+            e.to_string()
+                .contains("`iv` (interval) sent a malformed wire payload"),
+            "{e}"
+        );
+        assert!(!e.to_string().contains("override"), "{e}");
+
+        let wrong = WrongType::new::<i32>(Type::TEXT);
+        let e = pg_cell_error("n", &Type::TEXT, "int4", &wrong);
+        assert_eq!(code(&e), "RIVET_SOURCE_OVERRIDE_WIRE_MISMATCH");
+        assert!(
+            e.to_string()
+                .contains("`n` is declared int4 by a `columns:` override"),
+            "{e}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod temporal_refusal_tests {
     use super::{MICROS_PER_DAY, PgInt, PgTimeMicros};
     use postgres::types::{FromSql, Type};
@@ -1420,15 +1539,15 @@ mod temporal_refusal_tests {
         assert_eq!(side_a::<i16>(Err(anyhow::anyhow!("x"))), None);
     }
 
-    /// No scalar cell is read with the panicking `Row::get` outside the text-typed arms.
+    /// No cell is read with the panicking `Row::get`; the only `.get(` calls are on non-Row receivers.
     #[test]
     fn no_scalar_column_is_read_with_panicking_get() {
         let src = include_str!("arrow_convert.rs");
         let product = &src[..src.find("#[cfg(test)]").unwrap()];
         let panicking: Vec<&str> = product
             .lines()
-            .filter(|l| l.contains("row.get(col_idx)") || l.contains(".get::<"))
-            .filter(|l| !l.contains("Option<&str>"))
+            .filter(|l| l.contains(".get(") || l.contains(".get::<"))
+            .filter(|l| !l.contains("columns().get(") && !l.contains("h.get(col.name())"))
             .collect();
         assert!(
             panicking.is_empty(),
