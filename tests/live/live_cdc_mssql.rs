@@ -1936,7 +1936,7 @@ fn mssql_cdc_schema_probe_follows_the_capture_instance_not_the_default_schema() 
 
     // The config an operator writes: the bare table name plus the capture instance
     // that says, unambiguously, which relation it means.
-    mssql_cdc_rig(&table, &ci, &ckpt, &out).no_oracle("the captured relation is resolved from the capture instance, not the configured table name the oracle reads").run_ok();
+    mssql_cdc_rig(&table, &ci, &ckpt, &out).run_ok();
 
     let batches = read_all_parts(&out);
     let cols: std::collections::BTreeSet<String> = batches
@@ -1973,7 +1973,6 @@ fn mssql_cdc_schema_probe_follows_the_capture_instance_not_the_default_schema() 
         "check",
         "--config",
         mssql_cdc_rig(&table, &ci, &ckpt, &out)
-            .no_oracle("the captured relation is resolved from the capture instance, not the configured table name the oracle reads")
             .config_path()
             .to_str()
             .unwrap(),
@@ -2072,7 +2071,6 @@ fn mssql_cdc_snapshot_leg_reads_the_captured_relation_not_the_default_schema() {
     let out = d.path().join("out");
     std::fs::create_dir_all(&out).unwrap();
     mssql_cdc_rig(&table, &ci, &ckpt, &out)
-        .no_oracle("the captured relation is resolved from the capture instance, not the configured table name the oracle reads")
         .cdc_line("initial: snapshot")
         .run_ok();
 
@@ -2170,8 +2168,7 @@ fn mssql_cdc_refuses_an_unknown_capture_instance_before_the_snapshot_is_durable(
 
     // The typo: a capture instance that does not exist.
     let typo = format!("{ci}_typo");
-    let rig = mssql_cdc_rig(&table, &typo, &ckpt, &out).cdc_line("initial: snapshot")
-        .no_oracle("the captured relation is resolved from the capture instance, not the configured table name the oracle reads");
+    let rig = mssql_cdc_rig(&table, &typo, &ckpt, &out).cdc_line("initial: snapshot");
     let said = rig.run_expect_fail();
     assert!(
         said.contains(&typo),
@@ -2187,8 +2184,7 @@ fn mssql_cdc_refuses_an_unknown_capture_instance_before_the_snapshot_is_durable(
     );
 
     // With the name corrected the run works, and the baseline is the real table's.
-    let ok_rig = mssql_cdc_rig(&table, &ci, &ckpt, &out).cdc_line("initial: snapshot")
-        .no_oracle("the captured relation is resolved from the capture instance, not the configured table name the oracle reads");
+    let ok_rig = mssql_cdc_rig(&table, &ci, &ckpt, &out).cdc_line("initial: snapshot");
     ok_rig.run_ok();
     let notes: std::collections::BTreeSet<String> =
         duckdb_dir_parquet_distinct_strings(&out.join("snapshot"), "note");

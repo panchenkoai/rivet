@@ -29,6 +29,7 @@ from __future__ import annotations
 import itertools
 import json
 import os
+import re
 import sys
 from collections import Counter
 
@@ -110,8 +111,6 @@ def type_loss(src: str, dst: str) -> str | None:
 
 def norm_native(t: str | bytes) -> str:
     """A declared source type in the ledger's spelling: upper case, single spaces, PostgreSQL's long names shortened (MySQL's catalog answers bytes)."""
-    import re
-
     t = t.decode() if isinstance(t, bytes) else t
     t = " ".join(t.upper().split()).replace(", ", ",")
     t = re.sub(r"^TIMESTAMP(\(\d+\))? WITHOUT TIME ZONE", r"TIMESTAMP\1", t)
@@ -123,8 +122,6 @@ def norm_native(t: str | bytes) -> str:
 
 def arrow_to_duck(delivery: str, text_forms: set[str]) -> str | None:
     """The DuckDB type a parquet column of the ledger's `delivery` reads as; `None` when the ledger names no Arrow type DuckDB maps one way."""
-    import re
-
     if delivery == "arrow.json":
         return "JSON"
     if delivery in text_forms:
@@ -367,11 +364,25 @@ def _source(ora, spec: dict, renders: dict) -> tuple[str, list[str], dict]:
         sch = schema or "dbo"
         if query:
             return f"mssql_scan('ms', {_lit(query)})", [], native
+        oid = f"OBJECT_ID({_lit(sch + '.' + leaf)})"
+        if spec.get("capture_instance"):
+            # A CDC export captures the relation its capture instance names, as rivet resolves it.
+            hit = ora.rows(
+                "SELECT * FROM mssql_scan('ms', " + _lit(
+                    "SELECT OBJECT_SCHEMA_NAME(ct.source_object_id) AS sch, OBJECT_NAME(ct.source_object_id) AS tbl, "
+                    "ct.source_object_id AS oid FROM cdc.change_tables ct WHERE ct.capture_instance = "
+                    f"N{_lit(spec['capture_instance'])}"
+                ) + ")"
+            )
+            if hit and hit[0][0] is None:
+                raise Unreachable(f"capture instance `{spec['capture_instance']}`: its source table was dropped, the change table remains")
+            if hit:
+                sch, leaf, oid = hit[0][0], hit[0][1], str(hit[0][2])
         key = [r[0] for r in ora.rows(
             "SELECT * FROM mssql_scan('ms', " + _lit(
                 "SELECT c.name FROM sys.indexes i JOIN sys.index_columns ic ON ic.object_id = i.object_id "
                 "AND ic.index_id = i.index_id JOIN sys.columns c ON c.object_id = ic.object_id AND "
-                f"c.column_id = ic.column_id WHERE i.is_primary_key = 1 AND i.object_id = OBJECT_ID({_lit(sch + '.' + leaf)}) "
+                f"c.column_id = ic.column_id WHERE i.is_primary_key = 1 AND i.object_id = {oid} "
                 "ORDER BY ic.key_ordinal"
             ) + ")"
         )]
@@ -394,6 +405,10 @@ def _source(ora, spec: dict, renders: dict) -> tuple[str, list[str], dict]:
         # The scanner infers a schema (flattening nested keys); only `_id` is shared with the document blob.
         return f'(SELECT "_id" FROM mg.{spec["database"]}.{_qi(leaf)})', ["_id"], native
     raise ValueError(f"no source reader for engine {engine!r}")
+
+
+class Unreachable(Exception):
+    """The source relation cannot be read for a stated reason: a named SKIP, never a pass."""
 
 
 def _attach(spec: dict) -> dict:
@@ -507,6 +522,11 @@ def compare(
             if isinstance(c, tuple) and c[0] == "ts":
                 return ("ts", _secs(decimal.Decimal(c[1]).quantize(decimal.Decimal("0.000001"), decimal.ROUND_HALF_UP)))
             return c
+        if how.get(i) == "seconds":
+            c = canon(v)
+            if isinstance(c, tuple) and c[0] == "dur" and c[1] == c[2] == 0:
+                return ("num", c[3])
+            return canon(_numtext(v))
         if how.get(i) == "float32":
             return struct.unpack("f", struct.pack("f", float(v)))[0]
         if i in bit and isinstance(v, (bytes, bytearray)):
@@ -561,6 +581,7 @@ def grade_findings(
     check_types: bool,
     overrides: frozenset = frozenset(),
     collapse: frozenset = frozenset(),
+    null_class: frozenset = frozenset(),
 ) -> list[str]:
     """Every disagreement in the findings `f`, one line each; empty means the run is sound. A column with a ledger row is graded against the row's delivery (a `known_defect` row is an expected divergence); one without is graded as not narrower than the source; a `columns:` override is the export's own declaration."""
     bad = []
@@ -580,6 +601,8 @@ def grade_findings(
         if f["src_count"] != f["dst_count"]:
             bad.append(f"COUNT(*): source {f['src_count']}, delivered {f['dst_count']}")
         for (col, *_), a, b in zip(f["pairs"], f["src_stats"], f["dst_stats"]):
+            if col in null_class:  # a declared NULL-class defect (a NULL array loads as [])
+                continue
             if a[0] != b[0]:
                 bad.append(f"COUNT(`{col}`) (non-null): source {a[0]}, delivered {b[0]}")
             if a[1] != b[1] and col not in collapse:
@@ -654,17 +677,36 @@ def _counters(ora, spec: dict, new_parts: list[str], run_ids: list[str]) -> dict
             "file_log_rows": fl_rows, "declared_parts": len(new_parts)}
 
 
-def _parts(ora, files: list[str]) -> str:
-    """A relation over parquet `files`; a Decimal256 column (wider than DuckDB's DECIMAL) is read by pyarrow as exact text."""
+def _duck_blind(t) -> bool:
+    """A parquet type DuckDB 1.5.5 reads short: Decimal256 (as DOUBLE), Time64(ns) and a zoned Timestamp(ns) (both at microseconds)."""
     import pyarrow as pa
+
+    return (
+        pa.types.is_decimal256(t)
+        or (pa.types.is_time64(t) and t.unit == "ns")
+        or (pa.types.is_timestamp(t) and t.unit == "ns" and t.tz is not None)
+    )
+
+
+def exact_text(table):
+    """`table` with every column DuckDB would read short cast by pyarrow to its exact text."""
+    import pyarrow as pa
+
+    for i, f in enumerate(table.schema):
+        if _duck_blind(f.type):
+            table = table.set_column(i, f.name, table[f.name].cast(pa.string()))
+    return table
+
+
+def _parts(ora, files: list[str]) -> str:
+    """A relation over parquet `files`; a column DuckDB reads short is read by pyarrow as exact text."""
     import pyarrow.parquet as pq
 
-    wide = [f.name for f in pq.read_schema(files[0]) if pa.types.is_decimal256(f.type)]
-    if not wide:
+    if not any(_duck_blind(f.type) for f in pq.read_schema(files[0])):
         return f"read_parquet({_plist(files)}, union_by_name = true)"
-    table = pa.concat_tables([pq.read_table(f) for f in files], promote_options="default")
-    for name in wide:
-        table = table.set_column(table.schema.get_field_index(name), name, table[name].cast(pa.string()))
+    import pyarrow as pa
+
+    table = exact_text(pa.concat_tables([pq.read_table(f) for f in files], promote_options="default"))
     view = f"parts_{next(_VIEWS)}"
     ora.db.register(view, table)
     return view
@@ -698,17 +740,8 @@ def grade(spec: dict) -> dict:
     run_ids, manifest_rows = manifest_facts(out_dir, spec["new_manifests"])
     ids, rows = manifest_facts(snap_dir, spec["new_snapshot_manifests"])
     run_ids, manifest_rows = run_ids + ids, manifest_rows + rows
-    rows, forms = ledger(engine, "cdc" if cdc else "batch")
-    renders = {
-        n: _render(r).get("server")
-        or (PG_TEXT if engine == "postgres" and (r.get("delivery") in forms or r.get("delivery") == "server_text" or r.get("batch_refuses")) else None)
-        for n, r in rows.items()
-    }
-    renders = {n: e for n, e in renders.items() if e}
-    renders.update({f"source:{n}": _render(r)["source"] for n, r in rows.items() if _render(r).get("source")})
+    rows, forms, renders, config = _prep(engine, cdc)
     kw = {"state": spec["state"]} if spec.get("state") else {}
-    # Two threads: every live test runs this, and a scanner opens a connection per thread.
-    config = {"threads": 2, **SCANNER_SETTINGS.get(engine, {})}
     with Oracle(config=config, **kw, **_attach(spec)) as ora:
         ora.db.sql("SET TimeZone = 'UTC'")
         src, key, native = _source(ora, spec, renders)
@@ -779,6 +812,165 @@ def grade(spec: dict) -> dict:
     return {"failures": failures, "notes": notes, "facts": facts, "key": key}
 
 
+def _prep(engine: str, cdc: bool) -> tuple[dict, set[str], dict, dict]:
+    """(ledger rows, TEXT forms, source-side renders, DuckDB config) for one session over `engine`."""
+    rows, forms = ledger(engine, "cdc" if cdc else "batch")
+    renders = {
+        n: _render(r).get("server")
+        or (PG_TEXT if engine == "postgres" and (r.get("delivery") in forms or r.get("delivery") == "server_text" or r.get("batch_refuses")) else None)
+        for n, r in rows.items()
+    }
+    renders = {n: e for n, e in renders.items() if e}
+    renders.update({f"source:{n}": _render(r)["source"] for n, r in rows.items() if _render(r).get("source")})
+    # Two threads: every live test runs this, and a scanner opens a connection per thread.
+    return rows, forms, renders, {"threads": 2, **SCANNER_SETTINGS.get(engine, {})}
+
+
+#: Columns a warehouse load adds beside the source's.
+WAREHOUSE_META = ("__is_deleted", "__op", "__pos", "__seq", "_rivet_")
+
+
+def _clickhouse(load: dict, password: str, sql: str) -> str:
+    """A DuckDB relation over ClickHouse's own answer to `sql`, fetched as Parquet over HTTP."""
+    from urllib.parse import quote, urlsplit
+
+    u = urlsplit(load.get("url") or "http://127.0.0.1:8123")
+    auth = f"user={quote(str(load.get('user') or 'default'))}&password={quote(password)}"
+    return f"read_parquet('{u.scheme}://{u.netloc}/?{auth}&query={quote(sql + ' FORMAT Parquet')}')"
+
+
+def grade_load(spec: dict) -> dict:
+    """Grade the warehouse table a `rivet load` (or `compact`) left: its live rows against the source, per column like a run."""
+    from .duck import Oracle
+
+    engine, cdc = spec["engine"], spec["mode"] == "cdc"
+    load = spec["load"]
+    target = str(load.get("target"))
+    if target not in ("clickhouse", "bigquery"):
+        return {"skip": f"load target `{target}`: the rig oracle grades clickhouse and bigquery"}
+    rows, forms, renders, config = _prep(engine, cdc)
+    kw = {"state": spec["state"]} if spec.get("state") else {}
+    if target == "bigquery":
+        os.environ["BQ_ORACLE_PROJECT"] = str(load.get("project") or "")
+        os.environ["BQ_ORACLE_DATASET"] = str(load.get("dataset") or "")
+        kw.update(bigquery=True, bq_dataset=str(load.get("dataset")))
+    notes: list[str] = []
+    try:
+        ora = Oracle(config=config, **kw, **_attach(spec))
+    except Exception as e:  # noqa: BLE001 — an absent warehouse credential is a named skip, never a pass
+        if target == "bigquery" and any(k in str(e).lower() for k in ("credential", "permission", "unauthenticated", "default credentials")):
+            return {"skip": f"BigQuery unreachable ({str(e)[:160]}): set BIGQUERY_TEST_PROJECT, RIVET_TEST_GCS_BUCKET and gcloud ADC"}
+        raise
+    with ora:
+        ora.db.sql("SET TimeZone = 'UTC'")
+        loaded = ora.rows(
+            f"SELECT target_table FROM {_state_table(ora, spec, 'load_run')} "
+            f"WHERE export_name = {_lit(spec['export'])} AND status = 'success' ORDER BY finished_at DESC LIMIT 1"
+        )
+        if not loaded:
+            return {"failures": [f"WAREHOUSE: no successful load_run row for export `{spec['export']}`"], "notes": notes}
+        fq = loaded[0][0]
+        leaf = fq.split(".")[-1]
+        src, key, native = _source(ora, spec, renders)
+        ora.db.sql(f"CREATE OR REPLACE TEMP TABLE source_rows AS SELECT * FROM {src}")
+        src = "source_rows"
+        if target == "clickhouse":
+            db = str(load.get("database") or "default")
+            password = spec.get("password") or ""
+            cols = ora.rows(f"SELECT * FROM {_clickhouse(load, password, f'SELECT name, type FROM system.columns WHERE database = {_lit(db)} AND table = {_lit(leaf)}')}")
+            wh_types = {n: t for n, t in cols}
+            # ClickHouse ships a binary String as invalid UTF-8; read it as the hex the source canon uses.
+            blobs = [c for c, t in _columns(ora, "source_rows") if t == "BLOB" and "String" in wh_types.get(c, "")]
+            # A Decimal wider than 38 digits reaches DuckDB as DOUBLE; read it as ClickHouse's exact text.
+            wide = {c for c, t in wh_types.items() if (m := re.search(r"Decimal\((\d+)", t)) and int(m.group(1)) > 38}
+            sel = ", ".join(f"hex(`{c}`) AS `{c}`" if c in blobs else f"toString(`{c}`) AS `{c}`" if c in wide else f"`{c}`" for c in wh_types)
+            rel = _clickhouse(load, password, f"SELECT {sel} FROM `{db}`.`{leaf}`")
+            if blobs:
+                rel = f"(SELECT * REPLACE ({', '.join(f'unhex(CAST({_qi(c)} AS VARCHAR)) AS {_qi(c)}' for c in blobs)}) FROM {rel})"
+            buffered = 0
+        else:
+            ds = str(load.get("dataset"))
+            # One catalog listing (seconds); a BigQuery query job costs ~10 s, a storage read ~2 s and reads tables only.
+            tables = {r[0] for r in ora.rows("SELECT table_name FROM duckdb_tables() WHERE database_name = 'bq'")}
+            rel = f"bq.{ds}.{leaf}" if leaf in tables else f"bigquery_query('bq', {_lit(f'SELECT * FROM `{fq}`')})"
+            wh_types = {}
+            buffered = f"{leaf}__changes" in tables
+        if not wh_types and target == "clickhouse":
+            return {"failures": [f"WAREHOUSE: `{fq}` does not exist in ClickHouse database `{db}`"], "notes": notes}
+        if buffered:
+            return {"skip": f"`{fq}__changes` holds an uncompacted buffer: the base is current only after `rivet compact`"}
+        try:
+            ora.db.sql(f"CREATE OR REPLACE TEMP TABLE wh_all AS SELECT * FROM {rel}")
+        except Exception as e:  # noqa: BLE001 — a table that requires a partition filter is read with an all-partitions one
+            m = re.search(r"filter over column\(s\) '([^']+)'", str(e))
+            if not m:
+                raise
+            c = m.group(1)
+            sql = f"SELECT * FROM `{fq}` WHERE `{c}` IS NULL OR `{c}` >= TIMESTAMP('0001-01-01')"
+            ora.db.sql(f"CREATE OR REPLACE TEMP TABLE wh_all AS SELECT * FROM bigquery_query('bq', {_lit(sql)})")
+        have = [c for c, _ in _columns(ora, "wh_all")]
+        keep = ", ".join(_qi(c) for c in have if not c.startswith(WAREHOUSE_META)) or "1"
+        if "__pos" in have and key:
+            # A change log: its live state is the latest image per key, deletes removed.
+            kl = ", ".join(_qi(k) for k in key)
+            seq = ", __seq DESC" if "__seq" in have else ""
+            folded = (f"(SELECT * FROM (SELECT *, row_number() OVER (PARTITION BY {kl} ORDER BY {pos_order(engine)} DESC{seq}) AS __rn "
+                      f"FROM wh_all) WHERE __rn = 1 AND coalesce(__op, '') <> 'delete')")
+            ora.db.sql(f"CREATE OR REPLACE TEMP TABLE wh AS SELECT {keep} FROM {folded}")
+            notes.append("change-log layout: graded at the latest image per key")
+        else:
+            live = "WHERE NOT __is_deleted" if "__is_deleted" in have else ""
+            ora.db.sql(f"CREATE OR REPLACE TEMP TABLE wh AS SELECT {keep} FROM wh_all {live}")
+        if (cdc or "__pos" in have) and key:
+            on = " AND ".join(f"CAST(s.{_qi(k)} AS VARCHAR) = CAST(w.{_qi(k)} AS VARCHAR)" for k in key)
+            if not spec.get("snapshot"):
+                src = f"(SELECT s.* FROM {src} s SEMI JOIN wh_all w ON {on})"
+                notes.append("no snapshot leg: only the keys the warehouse holds are graded")
+            if "__is_deleted" in have:
+                gone = ora.scalar(f"SELECT count(*) FROM source_rows s SEMI JOIN (SELECT * FROM wh_all WHERE __is_deleted) w ON {on}")
+                if gone:
+                    notes.append(f"{gone} key(s) flagged __is_deleted still exist in the source")
+        bits = frozenset(c for c, n in native.items() if n.startswith("BIT")) if engine == "mysql" else frozenset()
+        numbers = frozenset(c for c, n in native.items() if n.startswith(ORACLE_NUMERIC)) if engine == "oracle" else frozenset()
+        row_of = {c: rows[n] for c, n in native.items() if n in rows}
+        # The ledger names the ClickHouse load on its cdc rows only; a batch load lands in the same types.
+        ch_rows = ledger(engine, "cdc")[0] if target == "clickhouse" else {}
+        ch_of = {c: ch_rows[n] for c, n in native.items() if n in ch_rows}
+        defects = {
+            c: [None if x.upper() == "NULL" else x.strip("'") for x in (r.get("defect_samples") or [])]
+            for c, r in row_of.items() if r.get("known_defect")
+        }
+        defects.update({
+            c: [None if x.upper() == "NULL" else x.strip("'") for x in (r.get("clickhouse_defect_samples") or [])]
+            for c, r in ch_of.items() if r.get("clickhouse_defect")
+        })
+        canons = {c: _render(r)["canon"] for c, r in row_of.items() if _render(r).get("canon")}
+        # A TIME the ledger loads into ClickHouse as Decimal seconds is compared in seconds.
+        canons.update({c: "seconds" for c, r in ch_of.items()
+                       if target == "clickhouse" and str(r.get("clickhouse", "")).startswith(("Decimal", "Nullable(Decimal")) and native[c].startswith("TIME")})
+        duck = {} if engine == "oracle" else {c: _render(r)["duck"] for c, r in row_of.items() if _render(r).get("duck")}
+        f = compare(ora, src, "wh", bits, numbers, defects, duck, canons, engine != "oracle")
+        delivered = {d: t for _, _, d, t in f.get("pairs", [])}
+        collapse = frozenset(c for c in defects if defects[c] and delivered.get(c) == "BOOLEAN")
+    # The ClickHouse type the ledger names is graded below; the not-narrower rule covers the rest.
+    ledgered = frozenset(c for c, r in ch_of.items() if r.get("clickhouse"))
+    null_class = frozenset(c for c, xs in defects.items() if None in xs)
+    bad = grade_findings(f, {}, forms, native, engine != "mongo", frozenset(spec.get("overrides") or []) | ledgered,
+                         collapse=collapse, null_class=null_class)
+    for col, r in ch_of.items():
+        want, got = r.get("clickhouse"), wh_types.get(col)
+        # A known_defect delivery drives the ClickHouse type too: the marker excuses it.
+        excused = r.get("clickhouse_defect") or r.get("known_defect") or row_of.get(col, {}).get("known_defect")
+        if target != "clickhouse" or not want or excused or got is None:
+            continue
+        # A key column cannot be Nullable in ClickHouse.
+        if got != want and not (col in key and want == f"Nullable({got})"):
+            bad.append(f"TYPE: `{col}` ({native[col]}): the ledger loads ClickHouse {want}, the table has {got}")
+    bad += [f"WAREHOUSE: {n}" for n in notes if "still exist" in n]
+    return {"failures": [f"WAREHOUSE {target} `{fq}`: {b}" for b in bad], "notes": notes,
+            "facts": {k: v for k, v in f.items() if k not in ("pairs", "dst_cols", "src_stats", "dst_stats")}}
+
+
 def _self_test() -> None:
     assert type_loss("INTEGER", "BIGINT") is None
     assert type_loss("BIGINT", "INTEGER")
@@ -825,18 +1017,48 @@ def _self_test() -> None:
     assert norm_native("character varying(50)") == "VARCHAR(50)"
     assert arrow_to_duck('Timestamp(µs, "UTC")', set()) == "TIMESTAMP WITH TIME ZONE"
     assert arrow_to_duck("List(Decimal128(18, 2))", set()) == "DECIMAL(18,2)[]"
+    _ns_self_test()
     print("rig_oracle self-test ok")
 
 
+def _ns_self_test() -> None:
+    """A 9th fractional digit survives the read where DuckDB alone would drop it."""
+    import tempfile
+
+    import duckdb
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from .value_diff import canon
+
+    def written(ns: int) -> str:
+        f = tempfile.NamedTemporaryFile(suffix=".parquet", delete=False).name
+        pq.write_table(pa.table({
+            "t": pa.array([45_296_123_456_789 + ns], pa.time64("ns")),
+            "z": pa.array([1_700_000_000_123_456_789 + ns], pa.timestamp("ns", tz="UTC")),
+        }), f)
+        return f
+
+    full, cut = written(0), written(-789)
+    via_duck = lambda f: duckdb.sql(f"SELECT t::VARCHAR, z::VARCHAR FROM '{f}'").fetchall()  # noqa: E731
+    assert via_duck(full) == via_duck(cut), "DuckDB alone reads both shapes at microseconds"
+    ours = lambda f: [canon(v) for v in exact_text(pq.read_table(f)).to_pylist()[0].values()]  # noqa: E731
+    assert ours(full) != ours(cut), "the oracle must see the 9th digit a delivery truncated"
+    assert ours(full) == [("dur", 0, 0, "45296.123456789"), ("ts", "1700000000.123456789")], ours(full)
+
+
 if __name__ == "__main__":
-    if sys.argv[1:] == ["grade"]:
+    if sys.argv[1:] in (["grade"], ["grade-load"]):
         spec = json.load(sys.stdin)
+        run = grade if sys.argv[1] == "grade" else grade_load
         try:
-            verdict = grade(spec)
+            verdict = run(spec)
+        except Unreachable as e:
+            verdict = {"skip": str(e)}
         except Exception as e:  # noqa: BLE001 — a SQL Server catalog deadlock victim is retried once
             if "deadlock" not in str(e):
                 raise
-            verdict = grade(spec)
+            verdict = run(spec)
         sys.stdout.write(json.dumps(verdict, default=str))
     else:
         _self_test()

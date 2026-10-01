@@ -38,7 +38,7 @@ def canon(v: object) -> object:
     if isinstance(v, dt.timedelta):
         return ("dur", 0, 0, _secs(decimal.Decimal(v // dt.timedelta(microseconds=1)).scaleb(-6)))
     if isinstance(v, decimal.Decimal):
-        return ("num", format(v.normalize(), "f"))
+        return ("num", format(v.normalize(decimal.Context(prec=max(len(v.as_tuple().digits), 1))), "f"))
     if isinstance(v, int):
         return ("num", str(v))
     if isinstance(v, float):
@@ -455,6 +455,8 @@ def _self_test() -> None:
     assert canon(t) != canon(t.replace(microsecond=0)), "microseconds must count"
     assert canon(decimal.Decimal("1.50")) == canon(decimal.Decimal("1.5"))
     assert canon(decimal.Decimal("100")) == canon(100)
+    wide = "123456789012345678901234567890.012345678"
+    assert canon(decimal.Decimal(wide + "9")) != canon(decimal.Decimal(wide + "8")), "a 40-digit decimal keeps every digit"
     assert canon('{"b":1,"a":2}') == canon({"a": 2, "b": 1})
     assert canon(dt.time(4, 0)) != canon(dt.timedelta(hours=100)), "a wrapped TIME is a difference"
     assert diff_rows([{"id": 1, "u": u}], [{"id": 1, "u": b"\x00" * 16}]), "garbage bytes are a finding"

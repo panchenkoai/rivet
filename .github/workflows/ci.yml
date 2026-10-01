@@ -1287,10 +1287,14 @@ jobs:
       # entry-point guard in tests/offline/release_oracle_entrypoint_guard.rs).
       - name: The release oracle's env-flag grammar is one grammar
         run: python3 -m dev.release_oracle --self-test
+      # uv: the rig oracle's self-test writes and reads parquet through the pinned duckdb/pyarrow.
+      - uses: taiki-e/install-action@v2.87.12
+        with:
+          tool: uv
       - name: The value canon and the rig oracle's graders self-test
         run: |
-          python3 -m dev.release_oracle.value_diff
-          python3 -m dev.release_oracle.rig_oracle
+          uv run --frozen python -m dev.release_oracle.value_diff
+          uv run --frozen python -m dev.release_oracle.rig_oracle
 
   test:
     name: Tests

@@ -101,6 +101,69 @@ impl Rig {
                 fresh(all, old)
             }
         };
+        let mut spec = self.oracle_facts(envs, argv);
+        let more = serde_json::json!({
+            "cumulative": cumulative,
+            "out_dir": out,
+            "manifests": graded(&now, seen),
+            "new_manifests": fresh(&now, seen),
+            "snapshot_dir": snap,
+            "snapshot_manifests": graded(&now_snap, seen_snap),
+            "new_snapshot_manifests": fresh(&now_snap, seen_snap),
+        });
+        spec.as_object_mut()
+            .expect("facts are an object")
+            .extend(more.as_object().expect("an object").clone());
+        self.oracle_verdict(&spec, "grade");
+    }
+
+    /// Grade the warehouse table a successful `rivet load`/`compact` left, against the source.
+    pub(crate) fn oracle_after_load(&self, envs: &[(&str, &str)], argv: &[String]) {
+        if self.oracle_off.is_some() {
+            return;
+        }
+        if self.tables.len() > 1 {
+            return oracle_log(
+                "SKIP",
+                &self.name,
+                "load: a multi-table capture loads one table per source table, not graded yet",
+            );
+        }
+        let top = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&self.top_lines.join("\n"))
+            .unwrap_or_default();
+        let Some(load) = top.get("load").filter(|l| l.is_mapping()) else {
+            return oracle_log(
+                "SKIP",
+                &self.name,
+                "load: no top-level `load:` block to read the target from",
+            );
+        };
+        let env = |k: &str| {
+            envs.iter()
+                .find(|(n, _)| *n == k)
+                .map(|(_, v)| v.to_string())
+                .or_else(|| std::env::var(k).ok())
+        };
+        let password = load
+            .get("password_env")
+            .and_then(|v| v.as_str())
+            .and_then(env)
+            .unwrap_or_default();
+        let mut spec = self.oracle_facts(envs, argv);
+        let more = serde_json::json!({
+            "load": serde_json::to_value(load).unwrap_or_default(),
+            "password": password,
+            "export": self.name,
+            "snapshot": self.cdc_lines.iter().any(|l| l.contains("initial: snapshot") || l.contains("backfill")),
+        });
+        spec.as_object_mut()
+            .expect("facts are an object")
+            .extend(more.as_object().expect("an object").clone());
+        self.oracle_verdict(&spec, "grade-load");
+    }
+
+    /// The source facts every oracle verb needs: engine, URL, relation, key, overrides, cursor, state DB.
+    fn oracle_facts(&self, envs: &[(&str, &str)], argv: &[String]) -> serde_json::Value {
         let state = envs
             .iter()
             .find(|(k, _)| *k == "RIVET_STATE_URL")
@@ -132,26 +195,29 @@ impl Rig {
                     line("cursor_fallback_column").unwrap_or_default()
                 )
             });
-        let spec = serde_json::json!({
+        serde_json::json!({
             "engine": self.source_type,
             "url": url,
             "database": url.rsplit('/').next().and_then(|s| s.split('?').next()).unwrap_or(""),
             "table": self.tables.first(),
             "query": self.query.as_deref().map(|q| rendered_query(q, argv)),
-            "mode": if cdc { "cdc" } else { "batch" },
-            "cumulative": cumulative,
+            "mode": if self.mode == "cdc" { "cdc" } else { "batch" },
             "key": self.census_key.iter().collect::<Vec<_>>(),
             "overrides": overrides,
             "cursor_expr": cursor_expr,
-            "out_dir": out,
-            "manifests": graded(&now, seen),
-            "new_manifests": fresh(&now, seen),
-            "snapshot_dir": snap,
-            "snapshot_manifests": graded(&now_snap, seen_snap),
-            "new_snapshot_manifests": fresh(&now_snap, seen_snap),
             "state": state,
-        });
-        let verdict = run_rig_oracle(&spec);
+            "capture_instance": self.cdc_lines.iter().find_map(|l| l.strip_prefix("capture_instance: ")),
+        })
+    }
+
+    /// Run one oracle verb over `spec`; log PASS / SKIP / XFAIL, or panic with every disagreement.
+    fn oracle_verdict(&self, spec: &serde_json::Value, verb: &str) {
+        let t0 = std::time::Instant::now();
+        let verdict = run_rig_oracle(spec, verb);
+        let took = format!("{verb} {} ms", t0.elapsed().as_millis());
+        if let Some(why) = verdict["skip"].as_str() {
+            return oracle_log("SKIP", &self.name, &format!("{took}: {why}"));
+        }
         let failures: Vec<String> = verdict["failures"]
             .as_array()
             .into_iter()
@@ -159,7 +225,7 @@ impl Rig {
             .filter_map(|f| f.as_str().map(str::to_string))
             .collect();
         if failures.is_empty() {
-            return oracle_log("PASS", &self.name, &verdict["facts"].to_string());
+            return oracle_log("PASS", &self.name, &format!("{took} {}", verdict["facts"]));
         }
         if let Some(why) = &self.oracle_xfail {
             self.oracle_xfailed.set(true);
@@ -172,7 +238,7 @@ impl Rig {
         oracle_log("FAIL", &self.name, &failures.join(" | "));
         panic!(
             "rig oracle: export '{}' disagrees with its source / rivet's own ledger \
-             (dev/release_oracle/rig_oracle.py; opt out only with `.no_oracle(\"<why>\")`):\n  - {}\n\
+             (dev/release_oracle/rig_oracle.py {verb}; opt out only with `.no_oracle(\"<why>\")`):\n  - {}\n\
              spec: {spec}\nverdict: {verdict}",
             self.name,
             failures.join("\n  - ")
@@ -263,7 +329,7 @@ fn rendered_query(q: &str, argv: &[String]) -> String {
 }
 
 /// Run `dev/release_oracle/rig_oracle.py grade` (pinned by uv.lock) over `spec`; its JSON verdict.
-fn run_rig_oracle(spec: &serde_json::Value) -> serde_json::Value {
+fn run_rig_oracle(spec: &serde_json::Value, verb: &str) -> serde_json::Value {
     use std::io::Write as _;
     let mut child = std::process::Command::new("uv")
         .args([
@@ -273,7 +339,7 @@ fn run_rig_oracle(spec: &serde_json::Value) -> serde_json::Value {
             "python",
             "-m",
             "dev.release_oracle.rig_oracle",
-            "grade",
+            verb,
         ])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .stdin(std::process::Stdio::piped())

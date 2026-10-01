@@ -65,6 +65,11 @@ impl Rig {
         if let Some(b) = before.filter(|_| out.status.success()) {
             self.oracle_after(&b, envs, argv);
         }
+        if out.status.success()
+            && matches!(argv.first().map(String::as_str), Some("load" | "compact"))
+        {
+            self.oracle_after_load(envs, argv);
+        }
     }
 
     /// Run an ARBITRARY subcommand against this rig's config: `rivet <args…>
