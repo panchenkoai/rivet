@@ -344,13 +344,9 @@ fn a_plain_chunked_baseline_reads_each_id_once_in_its_recipe_chunks() {
         3,
         "the recipe's chunking reached the leg: 150 ids in chunks of 50"
     );
+    assert_eq!(dir_manifest_copy_id_set(&snap).len(), 150, "every id once");
     assert_eq!(
-        duckdb_declared_dir_id_set(&snap).len(),
-        150,
-        "every id once"
-    );
-    assert_eq!(
-        duckdb_declared_dir_scalar(&snap, "COUNT(*)"),
+        total_parquet_rows(&snap) as i64,
         query_one(&format!("SELECT COUNT(*) FROM {tbl}")),
         "no duplicate rows, graded against the source"
     );
@@ -360,7 +356,7 @@ fn a_plain_chunked_baseline_reads_each_id_once_in_its_recipe_chunks() {
         .expect("insert");
     rig.run_ok();
     assert_eq!(
-        duckdb_declared_dir_scalar(&snap, "COUNT(*)"),
+        total_parquet_rows(&snap),
         150,
         "the baseline is not re-read"
     );

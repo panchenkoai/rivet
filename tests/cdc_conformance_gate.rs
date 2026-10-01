@@ -831,7 +831,8 @@ fn oracle_class_census_is_pinned() {
 // per-engine type cells they replace (PG/MSSQL/Oracle full_type_matrix, PG/MySQL/MSSQL typed_values),
 // whose types and literals moved into docs/type-capability-matrix.yaml.
 // 2026-10-01: +2 independent - the Mongo deletes of `_id` null vs "null" (the known-defect roast cell and its pre-image remedy), read through DuckDB.
-const PIN_INDEPENDENT: usize = 100;
+// 2026-10-01: +1 independent - the CDC backfill leg on a plain chunked recipe, graded against the source count.
+const PIN_INDEPENDENT: usize = 101;
 // 2026-09-28, source connection ceilings: +3 shared codec — the run's captured row is the
 // fixture check; the oracle is the server's own connection counter.
 // 2026-09-29: +2 shared codec — the Oracle TRUNCATE refusal on re-run and the uncaptured-truncate cell.
