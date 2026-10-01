@@ -1453,8 +1453,9 @@ mod renderer_twins {
     }
 
     #[test]
-    #[ignore = "ADR-0038 divergence: cell_text renders a GUID upper-case, CP5 fixes Uuid36 lower-case; \
-                unified by the SQL Server step of the migration"]
+    /// Strict known divergence: ADR-0038 divergence: cell_text renders a GUID upper-case, CP5 fixes Uuid36 lower-case; unified by the SQL Server step of the migration
+    /// Passes while it diverges; when the step unifies it, this fails ("did not panic") and flips to a plain test.
+    #[should_panic(expected = "assertion")]
     fn guid_cell_text_matches_uuid36() {
         let g = tiberius::Uuid::from_bytes([0xAB; 16]);
         assert_eq!(

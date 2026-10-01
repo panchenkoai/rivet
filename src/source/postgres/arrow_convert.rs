@@ -1789,8 +1789,9 @@ mod renderer_twins {
     }
 
     #[test]
-    #[ignore = "ADR-0038 divergence: pg_interval_to_iso8601 keeps six fraction digits (PT0.500000S), \
-                iso8601_duration trims them (PT0.5S); unified by the PostgreSQL step of the migration"]
+    /// Strict known divergence: ADR-0038 divergence: pg_interval_to_iso8601 keeps six fraction digits (PT0.500000S), iso8601_duration trims them (PT0.5S); unified by the PostgreSQL step of the migration
+    /// Passes while it diverges; when the step unifies it, this fails ("did not panic") and flips to a plain test.
+    #[should_panic(expected = "assertion")]
     fn pg_interval_fraction_matches_the_canonical_duration() {
         for &(m, d, us) in &[(0, 0, 500_000), (0, 0, -1_500_000), (14, 3, 14_706_789_000)] {
             assert_eq!(

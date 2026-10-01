@@ -750,8 +750,9 @@ mod renderer_twins {
     }
 
     #[test]
-    #[ignore = "ADR-0038 divergence: upper_hex renders RAW/BLOB upper-case (RAWTOHEX), CP5 fixes HexBytes \
-                lower-case; unified by the Oracle step of the migration"]
+    /// Strict known divergence: ADR-0038 divergence: upper_hex renders RAW/BLOB upper-case (RAWTOHEX), CP5 fixes HexBytes lower-case; unified by the Oracle step of the migration
+    /// Passes while it diverges; when the step unifies it, this fails ("did not panic") and flips to a plain test.
+    #[should_panic(expected = "assertion")]
     fn upper_hex_matches_hex_bytes() {
         for b in byte_cases() {
             assert_eq!(upper_hex(&b), hex_bytes(&b));
@@ -770,8 +771,9 @@ mod renderer_twins {
     }
 
     #[test]
-    #[ignore = "ADR-0038 divergence: YEAR(9) TO MONTH reaches 999999999 years, past iso8601_duration's i32 \
-                months; the canonical signature widens in the Oracle step of the migration"]
+    /// Strict known divergence: ADR-0038 divergence: YEAR(9) TO MONTH reaches 999999999 years, past iso8601_duration's i32 months; the canonical signature widens in the Oracle step of the migration
+    /// Passes while it diverges; when the step unifies it, this fails ("did not panic") and flips to a plain test.
+    #[should_panic(expected = "assertion")]
     fn interval_ym_iso_matches_the_canonical_duration_at_year_9() {
         let months = i32::try_from(999_999_999i64 * 12 + 11);
         assert_eq!(
@@ -793,9 +795,9 @@ mod renderer_twins {
     }
 
     #[test]
-    #[ignore = "ADR-0038 divergence: timestamp_text writes six fraction digits for a whole microsecond and \
-                Oracle's signed year (1 BC = -0001), iso_timestamp_nanos always nine digits and the \
-                astronomical year (1 BC = 0000); unified by the Oracle step of the migration"]
+    /// Strict known divergence: ADR-0038 divergence: timestamp_text writes six fraction digits for a whole microsecond and Oracle's signed year (1 BC = -0001), iso_timestamp_nanos always nine digits and the astronomical year (1 BC = 0000); unified by the Oracle step of the migration
+    /// Passes while it diverges; when the step unifies it, this fails ("did not panic") and flips to a plain test.
+    #[should_panic(expected = "assertion")]
     fn timestamp_text_matches_iso_timestamp_nanos() {
         for t in [
             OracleTimestamp::new_timestamp(2024, 2, 29, 13, 14, 15, 123_456_000),

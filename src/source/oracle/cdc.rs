@@ -1607,8 +1607,9 @@ mod renderer_twins {
     }
 
     #[test]
-    #[ignore = "ADR-0038 divergence: canonical_number trims trailing fraction zeros (1.5, 0), decimal_plain \
-                keeps the column scale (1.50, 0.000); unified by the Oracle step of the migration"]
+    /// Strict known divergence: ADR-0038 divergence: canonical_number trims trailing fraction zeros (1.5, 0), decimal_plain keeps the column scale (1.50, 0.000); unified by the Oracle step of the migration
+    /// Passes while it diverges; when the step unifies it, this fails ("did not panic") and flips to a plain test.
+    #[should_panic(expected = "assertion")]
     fn canonical_number_keeps_the_scale_like_decimal_plain() {
         for (mined, u, s) in [("1.50", 150, 2), ("0.000", 0, 3)] {
             assert_eq!(

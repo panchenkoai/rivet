@@ -2018,8 +2018,9 @@ mod renderer_twins {
     use chrono::NaiveDate;
 
     #[test]
-    #[ignore = "ADR-0038 divergence: bytes_to_recoverable_string renders non-UTF-8 bytes as PG-style \\x-prefixed \
-                hex, CP5 HexBytes has no prefix; unified by the CDC builder step (CP12) of the migration"]
+    /// Strict known divergence: ADR-0038 divergence: bytes_to_recoverable_string renders non-UTF-8 bytes as PG-style \x-prefixed hex, CP5 HexBytes has no prefix; unified by the CDC builder step (CP12) of the migration
+    /// Passes while it diverges; when the step unifies it, this fails ("did not panic") and flips to a plain test.
+    #[should_panic(expected = "assertion")]
     fn non_utf8_bytes_render_like_hex_bytes() {
         for b in [vec![0xE9], vec![0xFF, 0x00, 0x80]] {
             assert_eq!(bytes_to_recoverable_string(&b), hex_bytes(&b));
@@ -2027,8 +2028,9 @@ mod renderer_twins {
     }
 
     #[test]
-    #[ignore = "ADR-0038 divergence: render_str and to_json write chrono's Display (2024-02-29 13:04:05.123), \
-                iso_timestamp_nanos writes 2024-02-29T13:04:05.123000000; unified by the CDC builder step (CP12)"]
+    /// Strict known divergence: ADR-0038 divergence: render_str and to_json write chrono's Display (2024-02-29 13:04:05.123), iso_timestamp_nanos writes 2024-02-29T13:04:05.123000000; unified by the CDC builder step (CP12)
+    /// Passes while it diverges; when the step unifies it, this fails ("did not panic") and flips to a plain test.
+    #[should_panic(expected = "assertion")]
     fn a_datetime_renders_like_iso_timestamp_nanos() {
         for (h, n) in [(13, 123_000_000), (0, 0), (23, 1)] {
             let dt = NaiveDate::from_ymd_opt(2024, 2, 29)

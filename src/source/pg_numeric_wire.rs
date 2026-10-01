@@ -345,8 +345,9 @@ mod renderer_twins {
     }
 
     #[test]
-    #[ignore = "ADR-0038 divergence: numeric_wire_normalized_plain drops trailing fraction zeros (1.5, 0), \
-                decimal_plain keeps the column scale (1.50, 0.000); unified by the PostgreSQL step of the migration"]
+    /// Strict known divergence: ADR-0038 divergence: numeric_wire_normalized_plain drops trailing fraction zeros (1.5, 0), decimal_plain keeps the column scale (1.50, 0.000); unified by the PostgreSQL step of the migration
+    /// Passes while it diverges; when the step unifies it, this fails ("did not panic") and flips to a plain test.
+    #[should_panic(expected = "assertion")]
     fn normalized_plain_keeps_the_scale_like_decimal_plain() {
         for (u, s) in [(150, 2), (0, 3), (-1_000, 3)] {
             assert_eq!(
