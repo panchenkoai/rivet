@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Commit messages carry no attribution trailers: drop Co-Authored-By / Claude-Session lines in place.
+#
+#   strip-trailers FILE        commit-msg: rewrite the message file without those lines
+#   strip-trailers --self-test check the filter on a fixture
+set -euo pipefail
+
+strip() {
+    # Drop the trailer lines, then the blank lines they leave at the end of the message.
+    grep -viE '^[[:space:]]*(co-authored-by|claude-session):' "$1" \
+        | awk '{ lines[NR] = $0 } END { n = NR; while (n > 0 && lines[n] ~ /^[[:space:]]*$/) n--; for (i = 1; i <= n; i++) print lines[i] }' \
+        > "$1.stripped" || true
+    mv "$1.stripped" "$1"
+}
+
+case "${1:-}" in
+--self-test)
+    t=$(mktemp)
+    printf 'feat: x\n\nBody line.\nCo-Authored-By: A <a@b>\nco-authored-by: B <b@c>\n\nClaude-Session: https://x\n\n' > "$t"
+    strip "$t"
+    want=$(printf 'feat: x\n\nBody line.')
+    [ "$(cat "$t")" = "$want" ] || { echo "strip-trailers self-test FAILED:"; cat "$t"; rm -f "$t"; exit 1; }
+    printf 'fix: keep\n\nMentions Co-Authored-By: inline, not a trailer.\n' > "$t"
+    strip "$t"
+    grep -q 'Mentions Co-Authored-By: inline' "$t" || { echo "strip-trailers self-test FAILED: dropped an inline mention"; rm -f "$t"; exit 1; }
+    rm -f "$t"
+    echo "strip-trailers self-test: ok"
+    ;;
+"")
+    echo "usage: strip-trailers FILE | --self-test" >&2
+    exit 2
+    ;;
+*)
+    strip "$1"
+    ;;
+esac
