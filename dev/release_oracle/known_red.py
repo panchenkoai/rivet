@@ -17,7 +17,23 @@ class KnownRed:
     expires: str  # YYYY-MM-DD
 
 
-KNOWN_RED: tuple[KnownRed, ...] = ()
+KNOWN_RED: tuple[KnownRed, ...] = (
+    KnownRed('upgrade[mssql/cdc-load]: cycle1/compact: prev exit 1: never loaded',
+             "`rivet init --mode cdc` on SQL Server writes per-table streams with no baseline and a base_buffer `load:` block, and prints load + compact as the next steps; the first compact refuses 'never loaded' (both 0.30.0 and this tree)",
+             "2026-10-31"),
+    KnownRed('upgrade[mssql/cdc-load/tz=+09:00]: cycle1/compact: prev exit 1: never loaded',
+             "`rivet init --mode cdc` on SQL Server writes per-table streams with no baseline and a base_buffer `load:` block, and prints load + compact as the next steps; the first compact refuses 'never loaded' (both 0.30.0 and this tree)",
+             "2026-10-31"),
+    KnownRed('upgrade[mongo/cdc-load]: cycle1/compact: prev exit 1: never loaded',
+             "`rivet init --mode cdc` on MongoDB writes per-table streams with no baseline and a base_buffer `load:` block, and prints load + compact as the next steps; the first compact refuses 'never loaded' (both 0.30.0 and this tree)",
+             "2026-10-31"),
+    KnownRed('upgrade[oracle/cdc-load]: anchor: prev exit 1 [RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED]',
+             '`rivet init --mode cdc` on Oracle writes a `load:` block that every command refuses (RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED: Oracle CDC load is not supported, ADR-0037), in 0.30.0 and this tree',
+             "2026-10-31"),
+    KnownRed('upgrade[oracle/cdc-load/tz=Asia/Tokyo]: anchor: prev exit 1 [RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED]',
+             '`rivet init --mode cdc` on Oracle writes a `load:` block that every command refuses (RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED: Oracle CDC load is not supported, ADR-0037), in 0.30.0 and this tree',
+             "2026-10-31"),
+)
 
 
 def match(msg: str, today: _dt.date | None = None) -> tuple[KnownRed | None, bool]:

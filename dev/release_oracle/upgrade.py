@@ -25,12 +25,8 @@ Per SQL engine, on the downloaded previous binary and this one:
              needs (RED: dropping it fails the load). The loaded-run skip set is NOT graded:
              init's `cleanup_source: true` deletes the first parts, so erasing it changes
              nothing here (measured).
-  cdc-load   MySQL CDC into BigQuery: the previous `init --mode cdc` config on three tables,
-             run → load → compact three cycles by the previous release and two by this
-             binary, with inserts, updates, a partition-moving update and a delete between
-             cycles. After every compact, through one DuckDB session (MySQL + BigQuery
-             attached): each base's live rows equal the source `id:v:epoch`, every deleted
-             id is flagged `__is_deleted`, no key twice, no `__changes` left.
+  cdc-load   per CDC engine into BigQuery, in UTC and a non-UTC source zone: the previous
+             `init --mode cdc` config continued by this binary (upgrade_cdc_load.py).
   cdc        per CDC engine: the previous release anchors a stream and captures a batch;
              this binary continues its checkpoint and captures exactly the next batch —
              nothing skipped, nothing of the first batch re-read.
@@ -54,20 +50,25 @@ from pathlib import Path
 from .core import Ledger, Proc, isolate_state_db, rivet_bin, run
 from .engines import sql as _sql
 from .regression import _require_prev_binary
+from .upgrade_cdc_load import cdc_load_cells
 
 __all__ = ["verify_upgrade_continuity"]
 
 SCEN = "upgrade_continuity"
 ROWS = 5000
 CRASH_ROWS = 250_000
-ENGINES = ("postgres", "mysql", "mssql")
+ENGINES = ("postgres", "mysql", "mssql", "oracle")
 
 
 def _seed(engine: str, url: str, table: str, rows: int, with_cursor: bool) -> bool:
     """(Re)create `table` holding ids 1..rows (and a cursor column when asked)."""
-    ts = {"postgres": "TIMESTAMPTZ", "mysql": "DATETIME(6)", "mssql": "DATETIME2"}[engine]
+    ts = {"postgres": "TIMESTAMPTZ", "mysql": "DATETIME(6)", "mssql": "DATETIME2", "oracle": "TIMESTAMP"}[engine]
     cols = f"id BIGINT PRIMARY KEY, v BIGINT NOT NULL{f', updated_at {ts} NOT NULL' if with_cursor else ''}"
-    if engine == "postgres":
+    if engine == "oracle":
+        cols = cols.replace("BIGINT", "NUMBER(19)")
+        val = ", TIMESTAMP '2026-01-01 00:00:00' + NUMTODSINTERVAL(level, 'SECOND')" if with_cursor else ""
+        body = f"INSERT INTO {table} SELECT level, level{val} FROM dual CONNECT BY level <= {rows};"
+    elif engine == "postgres":
         val = ", TIMESTAMPTZ '2026-01-01' + g * INTERVAL '1 second'" if with_cursor else ""
         body = f"INSERT INTO {table} SELECT g, g{val} FROM generate_series(1, {rows}) g;"
     elif engine == "mysql":
@@ -86,7 +87,11 @@ def _seed(engine: str, url: str, table: str, rows: int, with_cursor: bool) -> bo
 def _mutate(engine: str, url: str, table: str) -> bool:
     """Add ids ROWS+1..ROWS+300 and flip v for ids 1..50, each with a newer cursor."""
     lo, hi = ROWS + 1, ROWS + 300
-    if engine == "postgres":
+    if engine == "oracle":
+        sql = (f"INSERT INTO {table} SELECT level + {lo - 1}, level + {lo - 1}, TIMESTAMP '2026-06-01 00:00:00' "
+               f"+ NUMTODSINTERVAL(level + {lo - 1}, 'SECOND') FROM dual CONNECT BY level <= {hi - lo + 1}; "
+               f"UPDATE {table} SET v = -v, updated_at = TIMESTAMP '2026-07-01 00:00:00' WHERE id <= 50;")
+    elif engine == "postgres":
         sql = (f"INSERT INTO {table} SELECT g, g, TIMESTAMPTZ '2026-06-01' + g * INTERVAL '1 second' "
                f"FROM generate_series({lo}, {hi}) g; "
                f"UPDATE {table} SET v = -v, updated_at = TIMESTAMPTZ '2026-07-01' WHERE id <= 50;")
@@ -100,6 +105,11 @@ def _mutate(engine: str, url: str, table: str) -> bool:
                "AS n FROM sys.all_objects) q; "
                f"UPDATE {table} SET v = -v, updated_at = '2026-07-01' WHERE id <= 50;")
     return _sql(engine, url, sql).ok
+
+
+def _case(engine: str, table: str) -> str:
+    """The name as the engine's catalog holds it (Oracle stores unquoted names upper-case)."""
+    return table.upper() if engine == "oracle" else table
 
 
 def _declared(out: Path, select: str) -> list[tuple]:
@@ -148,7 +158,7 @@ class _Env:
 
 def _cursor_leg(led: Ledger, prev: Path, root: Path, engine: str, url: str, state_url: str) -> None:
     store = "pg-state" if state_url else "sqlite"
-    table = f"upg_cur_{engine[:2]}_{os.getpid()}_{store.replace('-', '')}"
+    table = _case(engine, f"upg_cur_{engine[:2]}_{os.getpid()}_{store.replace('-', '')}")
     if not _seed(engine, url, table, ROWS, with_cursor=True):
         led.failed(engine, "-", SCEN, store, f"upgrade[{engine}/cursor]: seed failed", "seed")
         return
@@ -229,7 +239,7 @@ def _fresh_leg(led: Ledger, e: _Env, engine: str, want: int) -> None:
 
 def _crash_leg(led: Ledger, prev: Path, root: Path, engine: str, url: str, state_url: str) -> None:
     store = "pg-state" if state_url else "sqlite"
-    table = f"upg_crash_{engine[:2]}_{os.getpid()}_{store.replace('-', '')}"
+    table = _case(engine, f"upg_crash_{engine[:2]}_{os.getpid()}_{store.replace('-', '')}")
     if not _seed(engine, url, table, CRASH_ROWS, with_cursor=False):
         led.failed(engine, "-", SCEN, store, f"upgrade[{engine}/crash]: seed failed", "seed")
         return
@@ -252,7 +262,49 @@ def _crash_leg(led: Ledger, prev: Path, root: Path, engine: str, url: str, state
         _sql(engine, url, f"DROP TABLE IF EXISTS {table};")
 
 
-CDC_ENGINES = ("postgres", "mysql", "mssql", "mongo")
+CDC_ENGINES = ("postgres", "mysql", "mssql", "mongo", "oracle")
+#: Oracle's CDC URL (the capture user) is not RIVET_CDC_ORACLE_URL, which would switch on other stages' Oracle CDC cells.
+CDC_URL_VARS = {"oracle": "RIVET_UPG_ORACLE_CDC_URL"}
+
+
+@contextmanager
+def _oracle_cdc_probe(url: str):
+    """An `ORC_UPG_PROBE` table the capture user streams, as `cdc_probe` yields it; dropped on exit."""
+    from types import SimpleNamespace
+
+    owner = os.environ.get("RIVET_ORACLE_ORACLE_URL", "")
+    work = Path(tempfile.mkdtemp(prefix="rivet-oracle-upgrade-ora-cdc-"))
+    t = "ORC_UPG_PROBE"
+    ok = bool(owner) and _sql("oracle", owner, (
+        f"DROP TABLE IF EXISTS {t}; CREATE TABLE {t} (id NUMBER(19) PRIMARY KEY, amount NUMBER(19), "
+        f"meta VARCHAR2(200)); ALTER TABLE {t} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS; "
+        f'GRANT SELECT ON {t} TO "C##RIVETCDC";')).ok
+    try:
+        if not ok:
+            yield None
+            return
+        schema = re.search(r"//([^:]+):", owner).group(1).upper()
+        (work / "c.yaml").write_text(
+            f"source:\n  type: oracle\n  url: \"{url}\"\nexports:\n  - name: orc_cdc_probe\n"
+            f"    table: {schema}.{t}\n    mode: cdc\n    format: parquet\n"
+            f"    cdc: {{ until_current: true, checkpoint: \"{work}/cdc.ckpt\" }}\n"
+            "    destination:\n      type: local\n      path: ./output/\n")
+        yield SimpleNamespace(id_col="ID"), work, ""
+    finally:
+        if owner:
+            _sql("oracle", owner, f"DROP TABLE IF EXISTS {t};")
+
+
+def _oracle_cdc_changes(url: str, lo: int) -> None:
+    """`CDC_CHANGES` changes from id `lo` in one transaction: inserts, then updates and deletes."""
+    from .perf import CDC_CHANGES
+
+    hi = lo + CDC_CHANGES - 1
+    _sql("oracle", os.environ["RIVET_ORACLE_ORACLE_URL"], (
+        f"INSERT INTO ORC_UPG_PROBE SELECT level + {lo - 1}, level + {lo - 1}, '{{\"k\":' || (level + {lo - 1}) || '}}' "
+        f"FROM dual CONNECT BY level <= {CDC_CHANGES}; "
+        f"UPDATE ORC_UPG_PROBE SET amount = amount + 1 WHERE id BETWEEN {lo} AND {hi} AND MOD(id, 10) = 0; "
+        f"DELETE FROM ORC_UPG_PROBE WHERE id BETWEEN {lo} AND {hi} AND MOD(id, 17) = 0;"))
 
 
 def _cdc_leg(led: Ledger, prev: Path, engine: str, url: str) -> None:
@@ -262,7 +314,9 @@ def _cdc_leg(led: Ledger, prev: Path, engine: str, url: str) -> None:
     from .cdc import cdc_probe
     from .perf import CDC_CHANGES, _cdc_changes
 
-    with cdc_probe(engine, url) as probe:
+    probe_cm, changes = ((_oracle_cdc_probe(url), lambda _e, _u, lo: _oracle_cdc_changes(_u, lo))
+                         if engine == "oracle" else (cdc_probe(engine, url), _cdc_changes))
+    with probe_cm as probe:
         if probe is None:
             led.failed(engine, "-", SCEN, "local", f"upgrade[{engine}/cdc]: the CDC source setup failed", "setup")
             return
@@ -270,10 +324,10 @@ def _cdc_leg(led: Ledger, prev: Path, engine: str, url: str) -> None:
         env = {"RIVET_STATE_URL": ""}
         out = work / "output"
         anchored = run([str(prev), "run", "-c", "c.yaml"], env=env, cwd=work, timeout=None)
-        _cdc_changes(engine, url, 1)
+        changes(engine, url, 1)
         first = run([str(prev), "run", "-c", "c.yaml"], env=env, cwd=work, timeout=None)
         before = _declared_names(out)
-        _cdc_changes(engine, url, 1 + CDC_CHANGES)
+        changes(engine, url, 1 + CDC_CHANGES)
         cont = run([str(rivet_bin()), "run", "-c", "c.yaml"], env=env, cwd=work, timeout=None)
         mine = sorted(str(p) for p in out.rglob("*.parquet") if p.name in _declared_names(out) - before)
         idc = f"CAST({eng.id_col} AS BIGINT)"  # MongoDB's `_id` lands as text
@@ -355,227 +409,6 @@ def _load_leg(led: Ledger, prev: Path, root: Path, url: str) -> None:
         gcp.gcs_delete_prefix(bucket, f"exports/{table}/")
 
 
-CDC_TABLES = 3
-CDC_SEED = 5
-#: Per cdc-load engine: the timestamp type, the source instant read natively (the column's
-#: epoch through the engine's own function, never a session-rendered text), the non-UTC zone.
-CDC_LOAD_ENGINES = {
-    "mysql": ("TIMESTAMP", "mysql_query('my', 'SELECT id, v, UNIX_TIMESTAMP(created_at) e FROM {t}')", "+09:00"),
-    "postgres": ("TIMESTAMPTZ", "postgres_query('pg', 'SELECT id, v, extract(epoch FROM created_at)::bigint e "
-                 "FROM {t}')", "Asia/Tokyo"),
-}
-
-
-def _cdc_state(o, src_rel: str, dset: str, t: str) -> tuple[str, str, str, int, bool]:
-    """(source `id:v:epoch`, base live `id:v:epoch`, flagged ids, rows minus distinct ids, buffer exists)."""
-    fp = "IFNULL(string_agg(format('{}:{}:{}', id, v, e::BIGINT), ',' ORDER BY id), '')"
-    src = o.scalar(f"SELECT {fp} FROM {src_rel.format(t=t)}")
-    live = o.scalar(f"SELECT {fp} FROM (SELECT id, v, epoch(created_at) e FROM bq.{dset}.{t} "
-                    "WHERE NOT __is_deleted)")
-    gone = o.scalar(f"SELECT IFNULL(string_agg(id::VARCHAR, ',' ORDER BY id), '') FROM bq.{dset}.{t} "
-                    "WHERE __is_deleted")
-    dup = o.scalar(f"SELECT count(*) - count(DISTINCT id) FROM bq.{dset}.{t}")
-    buf = o.scalar("SELECT count(*) FROM information_schema.tables WHERE table_catalog = 'bq' "
-                   f"AND table_schema = '{dset}' AND table_name = '{t}__changes'")
-    return src, live, gone, dup, buf > 0
-
-
-def _cdc_delta(sql, tables: list[str], cycle: int) -> bool:
-    """Cycle-specific inserts, updates, a partition-moving update and a delete in every table."""
-    for k, t in enumerate(tables):
-        b = k * 100
-        ins = ", ".join(f"({b + 10 * cycle + i}, {i}, '2026-02-0{cycle} 12:00:00')" for i in (1, 2, 3))
-        stmts = [f"INSERT INTO {t} (id, v, created_at) VALUES {ins};",
-                 f"UPDATE {t} SET v = {1000 * cycle} WHERE id = {b + 1 + cycle % 5};",
-                 f"DELETE FROM {t} WHERE id = {b + cycle};"]
-        if cycle >= 2:
-            # A row whose partition day moves, and a row the previous cycle inserted.
-            stmts += [f"UPDATE {t} SET created_at = '2025-12-2{cycle} 08:00:00' WHERE id = {b + 5};",
-                      f"UPDATE {t} SET v = -v WHERE id = {b + 10 * (cycle - 1) + 1};"]
-        if not sql(" ".join(stmts)).ok:
-            return False
-    return True
-
-
-@contextmanager
-def _cdc_source(engine: str, url: str, tz: str | None, tag: str):
-    """(url, sql runner, slot) for one cdc-load cell, with a non-UTC `tz` set here and reset on exit:
-    MySQL's GLOBAL time_zone; on PostgreSQL the default TimeZone of a database of the cell's own,
-    dropped after its slot."""
-    from urllib.parse import urlsplit, urlunsplit
-
-    from .cdc import _container_for, _mysql, _no_container
-    from .core import docker_exec
-
-    c = _container_for(url)
-    if engine == "mysql":
-        def root(q: str) -> Proc:
-            return docker_exec(c, "mysql", "-uroot", "-privet", "-N", stdin=q) if c else _no_container(url)
-        was = root("SELECT @@GLOBAL.time_zone;").stdout.strip() if tz else ""
-        if tz and (not was or not root(f"SET GLOBAL time_zone = '{tz}';").ok
-                   or _mysql(url, "SELECT @@session.time_zone;").stdout.split()[-1:] != [tz]):
-            raise RuntimeError(f"could not set the MySQL GLOBAL time_zone to {tz} (was {was!r})")
-        try:
-            yield url, lambda q: _mysql(url, q), None
-        finally:
-            if tz:
-                root(f"SET GLOBAL time_zone = '{was}';")
-        return
-    db = slot = f"upg_{tag}"
-    dburl = urlunsplit(urlsplit(url)._replace(path=f"/{db}"))
-
-    def psql(q: str, on: str = "rivet") -> Proc:
-        return docker_exec(c, "psql", "-U", "rivet", "-d", on, "-v", "ON_ERROR_STOP=1", "-tAq",
-                           stdin=q) if c else _no_container(url)
-
-    def drop() -> None:
-        psql("SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots "
-             f"WHERE slot_name = '{slot}' AND active_pid IS NOT NULL;")
-        psql(f"SELECT pg_drop_replication_slot('{slot}') FROM pg_replication_slots WHERE slot_name = '{slot}';")
-        psql(f"DROP DATABASE IF EXISTS {db} WITH (FORCE);")
-
-    drop()
-    made = psql(f"CREATE DATABASE {db};")
-    if not made.ok or (tz and (not psql(f"ALTER DATABASE {db} SET TimeZone = '{tz}';").ok
-                               or psql("SHOW TimeZone;", db).stdout.strip() != tz)):
-        drop()
-        raise RuntimeError(f"could not create the cell's database {db}: {made.stderr.strip()[-200:]}")
-    try:
-        yield dburl, lambda q: psql(q, db), slot
-    finally:
-        drop()
-
-
-def _cdc_load_leg(led: Ledger, prev: Path, root: Path, engine: str, url: str, tz: str | None = None) -> None:
-    """The previous release's `init --mode cdc` config, run → load → compact three times by it and
-    twice by this binary; after every compact each BigQuery base equals the source by value."""
-    import duckdb
-
-    from . import gcp
-    from .duck import BQ_DATASET_ENV, BQ_PROJECT_ENV, Oracle, bq_target
-    from ..pytools.registry import bq_tmp
-
-    name = f"upgrade[{engine}/cdc-load{f'/tz={tz}' if tz else ''}]"
-    target, bucket = bq_target(), os.environ.get("BQ_ORACLE_BUCKET", "")
-    if target is None or not bucket:
-        led.skipped(engine, "-", SCEN, "cdc-load", f"{name}: no {BQ_PROJECT_ENV} / {BQ_DATASET_ENV} "
-                    "/ BQ_ORACLE_BUCKET", "no bigquery")
-        return
-    ts_type, src_rel, _ = CDC_LOAD_ENGINES[engine]
-    proj = target[0]
-    tag = f"{engine[:2]}{'tz' if tz else ''}_{os.getpid()}"
-    tables = [f"upg_cdcw_{tag}_{k}" for k in range(CDC_TABLES)]
-    dset = bq_tmp(f"upgcdc_{tag}")
-    pfx = f"upgrade-cdc/{tag}"
-    d = root / f"cdc_load_{tag}"
-    d.mkdir()
-    seen: dict[str, set[int]] = {t: set() for t in tables}
-    attach: dict[str, str] = {}
-
-    def fail(stage: str, why: str) -> None:
-        led.failed(engine, "-", SCEN, "cdc-load", f"{name}: {stage}: {why}", stage)
-
-    def buffers() -> list[bool]:
-        with Oracle(bigquery=True, bq_dataset=dset, **attach) as o:
-            return [_cdc_state(o, src_rel, dset, t)[4] for t in tables]
-
-    try:
-        with _cdc_source(engine, url, tz, tag) as (curl, sql, slot):
-            attach[engine] = curl
-            env = {"RIVET_UPG_URL": curl, "RIVET_STATE_URL": ""}
-            for k, t in enumerate(tables):
-                rows = ", ".join(f"({k * 100 + i}, {i}, '2026-01-0{i} 10:00:00')" for i in range(1, CDC_SEED + 1))
-                if not sql(f"DROP TABLE IF EXISTS {t}; CREATE TABLE {t} (id BIGINT PRIMARY KEY, "
-                           f"v INT NOT NULL, created_at {ts_type} NOT NULL); INSERT INTO {t} VALUES {rows};").ok:
-                    return fail("seed", t)
-            gcp.bq_ensure_dataset(proj, dset)
-            init = run([str(prev), "init", "--source-env", "RIVET_UPG_URL", "--mode", "cdc", "--include",
-                        *tables, "--tls", "disable", "--gcs-bucket", bucket, "--bigquery-project", proj,
-                        "--bigquery-dataset", dset, "-o", "c.yaml"], env=env, cwd=d)
-            if not init.ok:
-                return fail("init", f"previous init: {(init.stderr or '').strip()[-240:]}")
-            # Harness isolation only: init writes fixed prefixes and a fixed PG slot name,
-            # shared by every run on the stand.
-            cfg = d / "c.yaml"
-            body = re.sub(r"prefix: (exports|cdc)/", rf"prefix: {pfx}/\1/", cfg.read_text())
-            if slot:
-                body = re.sub(r"slot: \S+", f"slot: {slot}", body)
-            cfg.write_text(body)
-            if [ln for ln in body.splitlines() if "prefix:" in ln and pfx not in ln] or (
-                    slot and f"slot: {slot}" not in body):
-                return fail("init", "a prefix or slot the harness could not isolate: " + body[:400])
-            cycles = [(prev, 0), (prev, 1), (prev, 2), (rivet_bin(), 3), (rivet_bin(), 4)]
-            for n, (binary, delta) in enumerate(cycles, 1):
-                who = "prev" if binary == prev else "this"
-                if delta and not _cdc_delta(sql, tables, delta):
-                    return fail(f"cycle{n}/delta", "source change failed")
-                if binary != prev and cycles[n - 2][0] == prev:
-                    chk = run([str(binary), "check", "-c", "c.yaml"], env=env, cwd=d, timeout=None)
-                    if not chk.ok:
-                        return fail("check", f"this binary refuses the previous init's config: "
-                                             f"{(chk.stderr or chk.out).strip()[-240:]}")
-                for step in ("run", "load", "compact"):
-                    if step == "compact" and n > 1 and not all(buffers()):
-                        # The positive control: a buffer check that never sees a buffer proves nothing.
-                        return fail(f"cycle{n}/load", f"{who}'s load left no `__changes` buffer: {buffers()}")
-                    extra = [] if step == "run" else ["--run-id", f"upg-{tag}-{n}"]
-                    p = run([str(binary), step, "-c", "c.yaml", *extra], env=env, cwd=d, timeout=None)
-                    if not p.ok:
-                        return fail(f"cycle{n}/{step}", f"{who} exit {p.returncode}: {(p.stderr or '').strip()[-240:]}")
-                bad = []
-                with Oracle(bigquery=True, bq_dataset=dset, **attach) as o:
-                    for t in tables:
-                        src, live, gone, dup, buf = _cdc_state(o, src_rel, dset, t)
-                        ids = {int(x.split(":")[0]) for x in src.split(",") if x}
-                        seen[t] |= ids
-                        want_gone = ",".join(str(i) for i in sorted(seen[t] - ids))
-                        if (live, gone, dup, buf) != (src, want_gone, 0, False):
-                            bad.append(f"{t}: live={live!r} src={src!r} flagged={gone!r} want={want_gone!r} "
-                                       f"dup={dup} buffer_left={buf}")
-                    part = o.scalar(f"SELECT IFNULL(string_agg(column_name, ','), '') FROM bigquery_query("
-                                    f"'{proj}', 'SELECT column_name FROM `{proj}.{dset}.INFORMATION_SCHEMA.COLUMNS` "
-                                    f"WHERE table_name = \"{tables[0]}\" AND is_partitioning_column = \"YES\"')")
-                if bad:
-                    return fail(f"cycle{n}", f"after {who}'s compact the base differs from the source — "
-                                             + "; ".join(bad)[:600])
-            led.passed(engine, "-", SCEN, "cdc-load", f"{name}: three cycles by the previous release, two "
-                       f"by this binary on its init config; after every compact each of {CDC_TABLES} bases "
-                       f"equals the source instant by value, deletes flagged, no duplicate key, no buffer left "
-                       f"(partition column: {part or 'none'})", "cdc-load")
-    except duckdb.Error as e:
-        # A base missing a column the source has is a finding, not a harness crash.
-        fail("oracle", f"the DuckDB read failed: {str(e)[:400]}")
-    except RuntimeError as e:
-        fail("setup", str(e))
-    finally:
-        if engine == "mysql":
-            from .cdc import _mysql
-            _mysql(url, " ".join(f"DROP TABLE IF EXISTS {t};" for t in tables))
-        if not os.environ.get("RIVET_UPG_KEEP"):
-            gcp.bq_delete_dataset(proj, dset)
-        gcp.gcs_delete_prefix(bucket, f"{pfx}/")
-
-
-def _cdc_load_cells(led: Ledger, prev: Path, root: Path) -> None:
-    """Every cdc-load cell, per engine in UTC then in a non-UTC source zone; the engines run side
-    by side, one engine's cells in turn (MySQL's zone is server-GLOBAL)."""
-    from concurrent.futures import ThreadPoolExecutor
-
-    lanes = [(e, os.environ[f"RIVET_CDC_{e.upper()}_URL"]) for e in CDC_LOAD_ENGINES
-             if os.environ.get(f"RIVET_CDC_{e.upper()}_URL")]
-    subs = [led.buffered_child() for _ in lanes]
-
-    def lane(i: int) -> None:
-        engine, url = lanes[i]
-        for tz in (None, CDC_LOAD_ENGINES[engine][2]):
-            _cdc_load_leg(subs[i], prev, root, engine, url, tz)
-
-    with ThreadPoolExecutor(max_workers=max(1, len(lanes))) as ex:
-        list(ex.map(lane, range(len(lanes))))
-    for sub in subs:
-        sub.flush_into(led)
-
-
 def verify_upgrade_continuity(led: Ledger) -> None:
     """The previous release's config, state and crash checkpoint, carried on by this binary."""
     prev = _require_prev_binary(led, "all", "-", SCEN, "local", "upgrade continuity")
@@ -603,9 +436,9 @@ def verify_upgrade_continuity(led: Ledger) -> None:
                 leg(led, prev, root, engine, url, fresh)
     if os.environ.get("RIVET_ORACLE_POSTGRES_URL"):
         _load_leg(led, prev, root, os.environ["RIVET_ORACLE_POSTGRES_URL"])
-    _cdc_load_cells(led, prev, root)
+    cdc_load_cells(led, prev, root)
     for engine in CDC_ENGINES:
-        cvar = f"RIVET_CDC_{engine.upper()}_URL"
+        cvar = CDC_URL_VARS.get(engine, f"RIVET_CDC_{engine.upper()}_URL")
         curl = os.environ.get(cvar, "")
         if not curl:
             led.skipped(engine, "-", SCEN, "local", f"upgrade[{engine}/cdc]: no {cvar}", "no url")
@@ -621,5 +454,5 @@ if __name__ == "__main__":
         _root = Path(tempfile.mkdtemp(prefix="rivet-oracle-upgrade-"))
         if os.environ.get("RIVET_ORACLE_POSTGRES_URL"):
             _load_leg(_led, _prev, _root, os.environ["RIVET_ORACLE_POSTGRES_URL"])
-        _cdc_load_cells(_led, _prev, _root)
+        cdc_load_cells(_led, _prev, _root)
     raise SystemExit(_led.report())

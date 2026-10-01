@@ -233,6 +233,10 @@ RIVET_ORACLE_POSTGRES_URL ?= postgresql://rivet:rivet@127.0.0.1:5432/rivet
 RIVET_ORACLE_MYSQL_URL    ?= mysql://rivet:rivet@127.0.0.1:3306/rivet
 RIVET_ORACLE_MSSQL_URL    ?= mssql://sa:Rivet_Passw0rd!@127.0.0.1:1433/rivet
 RIVET_ORACLE_MONGO_URL    ?= mongodb://127.0.0.1:27017/rivet
+RIVET_ORACLE_ORACLE_URL   ?= oracle://rivet:rivet@127.0.0.1:1521/FREEPDB1
+# The capture user for the upgrade stage's Oracle CDC legs. Not RIVET_CDC_ORACLE_URL:
+# that name would switch on other stages' Oracle CDC cells.
+RIVET_UPG_ORACLE_CDC_URL  ?= oracle://c%23%23rivetcdc:rivet@127.0.0.1:1521/FREEPDB1
 RIVET_CDC_POSTGRES_URL    ?= postgresql://rivet:rivet@127.0.0.1:5434/rivet
 RIVET_CDC_MYSQL_URL       ?= mysql://rivet:rivet@127.0.0.1:3307/rivet
 RIVET_CDC_MSSQL_URL       ?= mssql://sa:Rivet_Passw0rd!@127.0.0.1:1434/rivet
@@ -269,6 +273,8 @@ GATE_ENV = \
   RIVET_ORACLE_MYSQL_URL='$(RIVET_ORACLE_MYSQL_URL)' \
   RIVET_ORACLE_MSSQL_URL='$(RIVET_ORACLE_MSSQL_URL)' \
   RIVET_ORACLE_MONGO_URL='$(RIVET_ORACLE_MONGO_URL)' \
+  RIVET_ORACLE_ORACLE_URL='$(RIVET_ORACLE_ORACLE_URL)' \
+  RIVET_UPG_ORACLE_CDC_URL='$(RIVET_UPG_ORACLE_CDC_URL)' \
   RIVET_REGRESSION_SOURCE_URL='$(RIVET_ORACLE_POSTGRES_URL)' \
   RIVET_CDC_POSTGRES_URL='$(RIVET_CDC_POSTGRES_URL)' \
   RIVET_CDC_MYSQL_URL='$(RIVET_CDC_MYSQL_URL)' \
