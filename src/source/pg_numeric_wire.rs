@@ -292,3 +292,69 @@ mod tests {
         assert!(numeric_wire_normalized_plain(&wire).is_none());
     }
 }
+
+#[cfg(test)]
+mod renderer_twins {
+    use super::numeric_wire_normalized_plain;
+    use crate::types::decimal_plain;
+
+    /// The PG `numeric` wire payload for `unscaled * 10^-scale` with display scale `scale`.
+    fn wire(unscaled: i128, scale: u16) -> Vec<u8> {
+        let digits = unscaled.unsigned_abs().to_string();
+        let s = usize::from(scale);
+        let padded = format!("{digits:0>w$}", w = s + 1);
+        let (int, frac) = padded.split_at(padded.len() - s);
+        let int = format!("{int:0>w$}", w = int.len().div_ceil(4) * 4);
+        let frac = format!("{frac:0<w$}", w = frac.len().div_ceil(4) * 4);
+        let limbs: Vec<i16> = format!("{int}{frac}")
+            .as_bytes()
+            .chunks(4)
+            .map(|c| std::str::from_utf8(c).unwrap().parse().unwrap())
+            .collect();
+        let mut out = Vec::new();
+        out.extend_from_slice(&(limbs.len() as u16).to_be_bytes());
+        out.extend_from_slice(&((int.len() / 4) as i16 - 1).to_be_bytes());
+        out.extend_from_slice(&(if unscaled < 0 { 0x4000u16 } else { 0 }).to_be_bytes());
+        out.extend_from_slice(&scale.to_be_bytes());
+        for l in limbs {
+            out.extend_from_slice(&l.to_be_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn normalized_plain_matches_decimal_plain_without_trailing_zeros() {
+        for (u, s) in [
+            (12345, 2),
+            (-12345, 2),
+            (5, 3),
+            (-5, 3),
+            (42, 0),
+            (-42, 0),
+            (0, 0),
+            (-12_000, 0),
+            (99_999_999_999_999_999_999_999_999_999_999_999_999, 38),
+            (i128::MIN + 1, 0),
+        ] {
+            assert_eq!(
+                numeric_wire_normalized_plain(&wire(u, s)).as_deref(),
+                Some(decimal_plain(u, s as i8).as_str()),
+                "({u}, {s})"
+            );
+        }
+    }
+
+    #[test]
+    /// Strict known divergence: ADR-0038 divergence: numeric_wire_normalized_plain drops trailing fraction zeros (1.5, 0), decimal_plain keeps the column scale (1.50, 0.000); unified by the PostgreSQL step of the migration
+    /// Passes while it diverges; when the step unifies it, this fails ("did not panic") and flips to a plain test.
+    #[should_panic(expected = "assertion")]
+    fn normalized_plain_keeps_the_scale_like_decimal_plain() {
+        for (u, s) in [(150, 2), (0, 3), (-1_000, 3)] {
+            assert_eq!(
+                numeric_wire_normalized_plain(&wire(u, s)).as_deref(),
+                Some(decimal_plain(u, s as i8).as_str()),
+                "({u}, {s})"
+            );
+        }
+    }
+}

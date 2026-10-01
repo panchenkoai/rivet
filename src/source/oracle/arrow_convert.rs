@@ -730,3 +730,82 @@ mod tests {
         assert!(!sub_microsecond("number", 9));
     }
 }
+
+#[cfg(test)]
+mod renderer_twins {
+    use super::{interval_ym_iso, timestamp_datetime, timestamp_text, upper_hex};
+    use crate::types::{hex_bytes, iso_timestamp_nanos, iso8601_duration};
+    use oracledb::OracleTimestamp;
+
+    /// Byte strings every hex twin is fed.
+    fn byte_cases() -> Vec<Vec<u8>> {
+        vec![vec![], vec![0x00], vec![0x0A, 0xFF], (0..=255).collect()]
+    }
+
+    #[test]
+    fn upper_hex_matches_hex_bytes_but_for_case() {
+        for b in byte_cases() {
+            assert_eq!(upper_hex(&b).to_lowercase(), hex_bytes(&b));
+        }
+    }
+
+    #[test]
+    /// Strict known divergence: ADR-0038 divergence: upper_hex renders RAW/BLOB upper-case (RAWTOHEX), CP5 fixes HexBytes lower-case; unified by the Oracle step of the migration
+    /// Passes while it diverges; when the step unifies it, this fails ("did not panic") and flips to a plain test.
+    #[should_panic(expected = "assertion")]
+    fn upper_hex_matches_hex_bytes() {
+        for b in byte_cases() {
+            assert_eq!(upper_hex(&b), hex_bytes(&b));
+        }
+    }
+
+    #[test]
+    fn interval_ym_iso_matches_the_canonical_duration_inside_i32_months() {
+        for (y, m) in [(0, 0), (0, -3), (2, 0), (1, 2), (-1, -2), (178_956_970, 7)] {
+            assert_eq!(
+                interval_ym_iso(y, m),
+                iso8601_duration(y * 12 + m, 0, 0),
+                "({y}, {m})"
+            );
+        }
+    }
+
+    #[test]
+    /// Strict known divergence: ADR-0038 divergence: YEAR(9) TO MONTH reaches 999999999 years, past iso8601_duration's i32 months; the canonical signature widens in the Oracle step of the migration
+    /// Passes while it diverges; when the step unifies it, this fails ("did not panic") and flips to a plain test.
+    #[should_panic(expected = "assertion")]
+    fn interval_ym_iso_matches_the_canonical_duration_at_year_9() {
+        let months = i32::try_from(999_999_999i64 * 12 + 11);
+        assert_eq!(
+            months.map(|m| iso8601_duration(m, 0, 0)).ok().as_deref(),
+            Some(interval_ym_iso(999_999_999, 11).as_str())
+        );
+    }
+
+    #[test]
+    fn timestamp_text_matches_iso_timestamp_nanos_at_nanosecond_precision() {
+        for t in [
+            OracleTimestamp::new_timestamp(2024, 2, 29, 13, 14, 15, 1),
+            OracleTimestamp::new_timestamp(9999, 12, 31, 23, 59, 59, 999_999_999),
+            OracleTimestamp::new_timestamp(1, 1, 1, 0, 0, 0, 123_456_789),
+        ] {
+            let canonical = iso_timestamp_nanos(timestamp_datetime(&t).unwrap(), false);
+            assert_eq!(timestamp_text(&t), canonical, "{t}");
+        }
+    }
+
+    #[test]
+    /// Strict known divergence: ADR-0038 divergence: timestamp_text writes six fraction digits for a whole microsecond and Oracle's signed year (1 BC = -0001), iso_timestamp_nanos always nine digits and the astronomical year (1 BC = 0000); unified by the Oracle step of the migration
+    /// Passes while it diverges; when the step unifies it, this fails ("did not panic") and flips to a plain test.
+    #[should_panic(expected = "assertion")]
+    fn timestamp_text_matches_iso_timestamp_nanos() {
+        for t in [
+            OracleTimestamp::new_timestamp(2024, 2, 29, 13, 14, 15, 123_456_000),
+            OracleTimestamp::new_date(1970, 1, 1),
+            OracleTimestamp::new_date(-1, 6, 15),
+        ] {
+            let canonical = iso_timestamp_nanos(timestamp_datetime(&t).unwrap(), false);
+            assert_eq!(timestamp_text(&t), canonical, "{t}");
+        }
+    }
+}

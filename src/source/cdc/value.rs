@@ -2010,3 +2010,39 @@ mod tests {
         assert_eq!(a.value(0), "00:00:00.000001");
     }
 }
+
+#[cfg(test)]
+mod renderer_twins {
+    use super::{RivetValue, bytes_to_recoverable_string, render_str};
+    use crate::types::{hex_bytes, iso_timestamp_nanos};
+    use chrono::NaiveDate;
+
+    #[test]
+    /// Strict known divergence: ADR-0038 divergence: bytes_to_recoverable_string renders non-UTF-8 bytes as PG-style \x-prefixed hex, CP5 HexBytes has no prefix; unified by the CDC builder step (CP12) of the migration
+    /// Passes while it diverges; when the step unifies it, this fails ("did not panic") and flips to a plain test.
+    #[should_panic(expected = "assertion")]
+    fn non_utf8_bytes_render_like_hex_bytes() {
+        for b in [vec![0xE9], vec![0xFF, 0x00, 0x80]] {
+            assert_eq!(bytes_to_recoverable_string(&b), hex_bytes(&b));
+        }
+    }
+
+    #[test]
+    /// Strict known divergence: ADR-0038 divergence: render_str and to_json write chrono's Display (2024-02-29 13:04:05.123), iso_timestamp_nanos writes 2024-02-29T13:04:05.123000000; unified by the CDC builder step (CP12)
+    /// Passes while it diverges; when the step unifies it, this fails ("did not panic") and flips to a plain test.
+    #[should_panic(expected = "assertion")]
+    fn a_datetime_renders_like_iso_timestamp_nanos() {
+        for (h, n) in [(13, 123_000_000), (0, 0), (23, 1)] {
+            let dt = NaiveDate::from_ymd_opt(2024, 2, 29)
+                .unwrap()
+                .and_hms_nano_opt(h, 4, 5, n)
+                .unwrap();
+            let want = iso_timestamp_nanos(dt, false);
+            assert_eq!(render_str(&RivetValue::DateTime(dt)), want);
+            assert_eq!(
+                RivetValue::DateTime(dt).to_json(),
+                serde_json::Value::String(want)
+            );
+        }
+    }
+}
