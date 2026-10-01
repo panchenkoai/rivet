@@ -1071,7 +1071,7 @@ fn execute_load<R>(
         &target_fqtn,
         job.allow_source_drift,
     )? {
-        Some(i) if i.uris.is_empty() => {
+        Some(i) if nothing_to_load(job.mode, i.uris.is_empty()) => {
             ctx.active_at_fetch = i.active_at_fetch.clone();
             ctx.marker_active = i.marker_active.clone();
             print_up_to_date(&job);
@@ -2492,6 +2492,42 @@ mod load_ledger_tests {
         );
     }
 
+    /// A full export whose newest run is empty means the source is empty: the load must
+    /// reach the warehouse write (an empty replace), never consume the run as "up to date".
+    #[test]
+    fn an_empty_full_run_reaches_the_warehouse_write() {
+        let dir = tempfile::tempdir().expect("a temp prefix");
+        let state = StateStore::open_in_memory().unwrap();
+        let mut plan = cdc_plan(&dir, "orders_emptied");
+        plan.mode = load::plan::LoadMode::Full;
+        let mut m = super::live_only_decisions::success_manifest("r-empty", "unused.parquet");
+        m.parts.clear();
+        m.part_count = 0;
+        m.row_count = 0;
+        super::live_only_decisions::write_at(
+            &dir,
+            "p/manifest-r-empty.json",
+            &serde_json::to_vec(&m).unwrap(),
+        );
+        let mut job = cdc_job(&dir, &state, &plan);
+        job.mode = load::plan::LoadMode::Full;
+        let reached = std::cell::Cell::new(false);
+        let out = execute_load(
+            job,
+            |_| {},
+            |_, _, inputs, _| -> Result<(u64, ())> {
+                assert!(inputs.uris.is_empty(), "an empty run hands no files");
+                reached.set(true);
+                Ok((0, ()))
+            },
+            |_, _| {},
+        );
+        assert!(
+            reached.get(),
+            "an emptied full source must reach the warehouse write: {out:?}"
+        );
+    }
+
     /// The up-to-date line names the mode, the table and the warehouse, word for word.
     #[test]
     fn the_up_to_date_line_names_the_mode_table_and_warehouse() {
@@ -3008,6 +3044,8 @@ mod live_only_decisions {
         assert!(super::nothing_to_load(LoadMode::Incremental, true));
         assert!(super::nothing_to_load(LoadMode::Cdc, true));
         assert!(!super::nothing_to_load(LoadMode::Cdc, false));
+        assert!(!super::nothing_to_load(LoadMode::Incremental, false));
+        assert!(!super::nothing_to_load(LoadMode::Full, false));
     }
 
     #[test]
