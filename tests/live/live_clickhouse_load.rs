@@ -1475,3 +1475,164 @@ fn a_partitioned_incremental_export_into_clickhouse_serves_the_latest_rows() {
         pg_rows(&mut c, &tbl)
     );
 }
+
+// ─── cleanup_source + gc_orphans on every staging store, and the sibling they spare ───
+
+/// A staging object store on the stand.
+#[derive(Clone, Copy)]
+enum Store {
+    Gcs,
+    S3,
+    Azure,
+}
+
+impl Store {
+    /// The service is up and the bucket/container exists.
+    fn ready(self) {
+        match self {
+            Store::Gcs => {
+                require_alive(LiveService::FakeGcs);
+                ensure_gcs_bucket(BUCKET);
+            }
+            Store::S3 => {
+                require_alive(LiveService::Minio);
+                ensure_minio_bucket(S3_BUCKET);
+            }
+            Store::Azure => {
+                require_alive(LiveService::Azurite);
+                ensure_azure_container(AZ_CONTAINER);
+            }
+        }
+    }
+
+    /// `rig` staged on this store under `prefix`.
+    fn dest(self, rig: Rig, prefix: &str) -> Rig {
+        match self {
+            Store::Gcs => rig.dest_gcs(BUCKET, prefix, FAKE_GCS_ENDPOINT),
+            Store::S3 => rig.dest_s3(S3_BUCKET, prefix, MINIO_ENDPOINT),
+            Store::Azure => rig.dest_azure(AZ_CONTAINER, prefix),
+        }
+    }
+
+    /// The credentials a run or load needs for this store.
+    fn env(self) -> Vec<(&'static str, &'static str)> {
+        match self {
+            Store::Gcs => Vec::new(),
+            Store::S3 => MINIO_ENV.to_vec(),
+            Store::Azure => vec![("RIVET_TEST_AZURITE_KEY", AZURITE_KEY)],
+        }
+    }
+
+    /// Write a stray object at `key`, as a crashed extract leaves one.
+    fn put(self, key: &str) {
+        match self {
+            Store::Gcs => fake_gcs_put(BUCKET, key, b"orphan"),
+            Store::S3 => minio_put(S3_BUCKET, key, b"orphan"),
+            Store::Azure => azure_put(AZ_CONTAINER, key, b"orphan"),
+        }
+    }
+
+    /// Object names under `prefix`, sorted, read through the store's own API.
+    fn names(self, prefix: &str) -> Vec<String> {
+        let mut n = match self {
+            Store::Gcs => fake_gcs_names(BUCKET, prefix),
+            Store::S3 => minio_object_names(S3_BUCKET, prefix),
+            Store::Azure => azure_blob_names(AZ_CONTAINER, prefix),
+        };
+        n.sort();
+        n
+    }
+}
+
+/// A load with `cleanup_source` and `gc_orphans` empties its own prefix of Parquet and
+/// leaves `<prefix>_archive/` alone. The prefix is written WITHOUT a trailing slash, as an
+/// operator writes it, so a store's string-prefix listing of `<prefix>` also reaches the
+/// sibling unless the listing is cut at the directory boundary. The sibling holds a stray
+/// part and no manifest: a sibling RUN would make the load refuse two exports under one
+/// prefix (`ensure_single_export`), a second guard that hides the boundary.
+fn a_cleaned_prefix_spares_its_sibling(store: Store) {
+    require_alive(LiveService::ClickHouse);
+    store.ready();
+    let (tbl, _t, mut c) = pg_batch_seeded("rivet_ch_sib", 5);
+    let db = Db::new("rivet_chtest");
+    let base = unique_name("chsib");
+    let env = store.env();
+    let mut all = env.clone();
+    all.push((PASSWORD_ENV, CLICKHOUSE_PASSWORD));
+
+    let owner = store
+        .dest(Rig::pg_batch(&tbl).mode("full"), &base)
+        .dest_prefix_unslashed()
+        .top_line(&load_line(
+            CLICKHOUSE_HTTP_URL,
+            &db,
+            ", cleanup_source: true, gc_orphans: true",
+        ));
+    let run = owner.run_args_env(&[], &env);
+    assert!(
+        run.status.success(),
+        "run: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let mine = format!("{base}/{tbl}/");
+    let theirs = format!("{base}/{tbl}_archive/");
+    store.put(&format!("{mine}orphan.parquet"));
+    store.put(&format!("{theirs}part-000000.parquet"));
+    let sibling_before = store.names(&theirs);
+    assert_eq!(
+        sibling_before,
+        vec![format!("{theirs}part-000000.parquet")],
+        "fixture: the sibling holds one stray part"
+    );
+    assert!(
+        store
+            .names(&mine)
+            .iter()
+            .filter(|n| n.ends_with(".parquet"))
+            .count()
+            >= 2,
+        "fixture: the loaded prefix holds its run's part and a stray one"
+    );
+
+    owner.load_ok(&[], &all);
+    assert_eq!(
+        clickhouse_rows(&format!(
+            "SELECT id, v FROM {}.{tbl} ORDER BY id FORMAT TSV",
+            db.0
+        )),
+        pg_rows(&mut c, &tbl),
+        "the load delivered the source"
+    );
+    let left: Vec<String> = store
+        .names(&mine)
+        .into_iter()
+        .filter(|n| n.ends_with(".parquet"))
+        .collect();
+    assert!(
+        left.is_empty(),
+        "cleanup_source removed the loaded part and gc_orphans the stray one: {left:?}"
+    );
+    assert_eq!(
+        store.names(&theirs),
+        sibling_before,
+        "a sibling prefix that extends the loaded one is not this load's to clean"
+    );
+}
+
+#[test]
+#[ignore = "live: requires clickhouse + fake-gcs + postgres"]
+fn cleanup_and_gc_on_gcs_spare_a_sibling_prefix() {
+    a_cleaned_prefix_spares_its_sibling(Store::Gcs);
+}
+
+#[test]
+#[ignore = "live: requires clickhouse + minio + postgres"]
+fn cleanup_and_gc_on_s3_spare_a_sibling_prefix() {
+    a_cleaned_prefix_spares_its_sibling(Store::S3);
+}
+
+#[test]
+#[ignore = "live: requires clickhouse + azurite + postgres, and the az CLI on PATH"]
+fn cleanup_and_gc_on_azure_spare_a_sibling_prefix() {
+    a_cleaned_prefix_spares_its_sibling(Store::Azure);
+}

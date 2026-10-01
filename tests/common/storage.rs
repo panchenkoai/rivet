@@ -344,3 +344,101 @@ pub fn azure_parquet_total_rows(container: &str, prefix: &str) -> usize {
         })
         .sum()
 }
+
+/// Write `bytes` to `key` in a fake-gcs bucket through the JSON API's media upload.
+pub fn fake_gcs_put(bucket: &str, key: &str, bytes: &[u8]) {
+    let resp = reqwest::blocking::Client::new()
+        .post(format!(
+            "http://127.0.0.1:4443/upload/storage/v1/b/{bucket}/o?uploadType=media&name={}",
+            key.replace('/', "%2F")
+        ))
+        .body(bytes.to_vec())
+        .send()
+        .expect("fake-gcs upload");
+    assert!(
+        resp.status().is_success(),
+        "fake-gcs upload of {key}: {}",
+        resp.status()
+    );
+}
+
+/// Object names under `prefix` in a fake-gcs bucket; empty when none match.
+pub fn fake_gcs_names(bucket: &str, prefix: &str) -> Vec<String> {
+    fake_gcs_list_json(bucket, prefix)["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|i| i["name"].as_str().map(String::from))
+        .collect()
+}
+
+/// Write `bytes` to `key` in a MinIO bucket through `mc pipe` inside the container.
+pub fn minio_put(bucket: &str, key: &str, bytes: &[u8]) {
+    use std::io::Write;
+    let script = format!(
+        "mc alias set local http://127.0.0.1:9000 {MINIO_ACCESS_KEY} {MINIO_SECRET_KEY} >/dev/null 2>&1 && \
+         mc pipe local/{bucket}/{key}"
+    );
+    let mut child = Command::new("docker")
+        .args(["compose", "exec", "-T", "minio", "sh", "-c", &script])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn mc pipe");
+    child
+        .stdin
+        .take()
+        .expect("mc pipe stdin")
+        .write_all(bytes)
+        .expect("write mc pipe");
+    assert!(
+        child.wait().expect("mc pipe").success(),
+        "mc pipe {key} failed"
+    );
+}
+
+/// Object names under `prefix` in a MinIO bucket; empty when none match.
+pub fn minio_object_names(bucket: &str, prefix: &str) -> Vec<String> {
+    let script = format!(
+        "mc alias set local http://127.0.0.1:9000 {MINIO_ACCESS_KEY} {MINIO_SECRET_KEY} >/dev/null 2>&1 && \
+         mc ls --recursive local/{bucket}"
+    );
+    let ls = Command::new("docker")
+        .args(["compose", "exec", "-T", "minio", "sh", "-c", &script])
+        .output()
+        .expect("mc ls");
+    assert!(ls.status.success(), "mc ls local/{bucket} failed");
+    String::from_utf8_lossy(&ls.stdout)
+        .lines()
+        .filter_map(|l| l.split_whitespace().last())
+        .filter(|n| n.starts_with(prefix))
+        .map(String::from)
+        .collect()
+}
+
+/// Write `bytes` to blob `key` in an azurite container with the `az` CLI.
+pub fn azure_put(container: &str, key: &str, bytes: &[u8]) {
+    let file = tempfile::NamedTempFile::new().expect("blob temp file");
+    std::fs::write(file.path(), bytes).expect("write blob temp file");
+    let out = Command::new("az")
+        .args([
+            "storage",
+            "blob",
+            "upload",
+            "--container-name",
+            container,
+            "--name",
+            key,
+            "--file",
+            file.path().to_str().expect("utf-8 temp path"),
+            "--overwrite",
+            "--connection-string",
+            AZURITE_CONN_STRING,
+        ])
+        .output()
+        .expect("spawn az storage blob upload");
+    assert!(
+        out.status.success(),
+        "az storage blob upload {key}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
