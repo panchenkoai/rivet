@@ -486,6 +486,11 @@ pub mod codes {
         "RIVET_SOURCE_CDC_CELL_UNSUPPORTED",
         "leave the column out of the capture (SQL Server: @captured_column_list), then re-snapshot",
     );
+    /// A change moved a row to another partition of a table compacted by the buffer's partitions.
+    pub const CDC_PARTITION_MOVED: Code = refusal(
+        "RIVET_CDC_PARTITION_MOVED",
+        "partition the table by a column a change never moves (or `partition: none`), then recreate its base",
+    );
     pub const SOURCE_CDC_PREREQUISITE: Code = environment(
         "RIVET_SOURCE_CDC_PREREQUISITE",
         "apply the setup statement the message names, then re-run (docs/reference/cdc.md)",
@@ -551,6 +556,7 @@ pub mod codes {
         SOURCE_CDC_UNDECODABLE,
         SOURCE_CDC_CELL_UNSUPPORTED,
         SOURCE_CDC_PREREQUISITE,
+        CDC_PARTITION_MOVED,
         SOURCE_VALUE_UNREPRESENTABLE,
         SOURCE_OVERRIDE_WIRE_MISMATCH,
         STATE_SCHEMA_NEWER,

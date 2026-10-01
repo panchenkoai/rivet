@@ -15,6 +15,7 @@
 
 pub(crate) mod checkpoint_identity;
 pub(crate) mod identity;
+pub(crate) mod partition_guard;
 pub(crate) mod sink;
 pub(crate) mod spill;
 pub(crate) mod validate;
@@ -1644,6 +1645,8 @@ pub(crate) struct CaptureOutput<'a> {
     pub row_hash: crate::config::RowHash,
     /// The partition budget this table's change parts keep (changelog layout only).
     pub partition: Option<crate::plan::rollover::PartitionRollover>,
+    /// The partition key a change must not move (base-and-buffer layout only).
+    pub partition_guard: Option<partition_guard::PartitionGuard>,
 }
 
 /// Everything needed to capture a change stream to typed files, assembled once —
@@ -1780,6 +1783,7 @@ pub(crate) fn run_capture(
             dest_uri: o.dest_uri,
             row_hash: o.row_hash,
             partition: o.partition,
+            partition_guard: o.partition_guard,
             overridden: o.overrides.keys().cloned().collect(),
         });
     }

@@ -414,6 +414,12 @@ fn touched_days_script(
     )
 }
 
+/// Whether a compaction takes its partitions from the buffer alone: a MySQL stream
+/// refuses a change that moves a row to another partition (`partition_guard`).
+pub fn trusts_buffer_days(order: &CompactOrder) -> bool {
+    matches!(order, CompactOrder::Cdc(SourceEngine::MySql))
+}
+
 /// The partition column as a `DATE`. A TIMESTAMP is pinned to UTC: an unqualified
 /// `DATE(timestamp)` follows the project's `default_time_zone`, while the bounds it
 /// feeds are rendered `+00` and the table's partitions ARE UTC days — under any other
@@ -447,6 +453,7 @@ pub fn compact_probe_sql(
     pk: &[String],
     partition_col: Option<&str>,
     time_type: Option<&str>,
+    buffer_only: bool,
 ) -> String {
     let Some(c) = partition_col else {
         return format!(
@@ -454,12 +461,17 @@ pub fn compact_probe_sql(
         );
     };
     let pk_refs: Vec<&str> = pk.iter().map(String::as_str).collect();
+    let values = if buffer_only {
+        let own = time_type.map_or_else(|| format!("`{c}`"), |ty| date_of(&format!("`{c}`"), ty));
+        format!("SELECT {own} AS v FROM `{changes_fqtn}`")
+    } else {
+        touched_values_sql(changes_fqtn, base_fqtn, &pk_refs, c, time_type)
+    };
     format!(
         "SELECT (SELECT COUNT(*) FROM `{changes_fqtn}`) AS n, \
          IFNULL(CAST(MIN(v) AS STRING), '') AS lo, IFNULL(CAST(MAX(v) AS STRING), '') AS hi, \
          (SELECT COUNTIF(`{c}` IS NULL) FROM `{changes_fqtn}`) AS null_keys \
-         FROM ({})",
-        touched_values_sql(changes_fqtn, base_fqtn, &pk_refs, c, time_type)
+         FROM ({values})"
     )
 }
 
@@ -1410,6 +1422,7 @@ pub fn compact_script_sql(
     day_column: Option<&str>,
 ) -> String {
     let order = order.into();
+    let buffer_only = trusts_buffer_days(&order);
     let rename = rename_stmt(rename);
     let (columns, pk_refs, deleted_flag) = merge_inputs(specs, pk);
     let merge = |filter: &MergeFilter| {
@@ -1442,7 +1455,7 @@ pub fn compact_script_sql(
         all: "days".to_string(),
     });
     let null_keys = merge(&MergeFilter::NullKeys(col.to_string()));
-    let key0 = pk_refs.first().and_then(|k| {
+    let key0 = pk_refs.first().filter(|_| !buffer_only).and_then(|k| {
         specs
             .iter()
             .find(|s| s.column_name == *k)
@@ -1452,7 +1465,14 @@ pub fn compact_script_sql(
     let key_decls = key0.map_or_else(String::new, |(_, t)| {
         format!("DECLARE moved_bytes INT64 DEFAULT 0;\nDECLARE moved ARRAY<{t}> DEFAULT [];\n")
     });
-    let touched = touched_days_script(changes_fqtn, base_fqtn, &pk_refs, col, ty, key0);
+    let touched = if buffer_only {
+        format!(
+            "SET days = (SELECT IFNULL(ARRAY_AGG(DISTINCT {} IGNORE NULLS), []) FROM `{changes_fqtn}`);",
+            date_of(&format!("`{col}`"), ty)
+        )
+    } else {
+        touched_days_script(changes_fqtn, base_fqtn, &pk_refs, col, ty, key0)
+    };
     format!(
         "DECLARE n INT64 DEFAULT 0;\n\
          DECLARE null_keys INT64 DEFAULT 0;\n\
@@ -1544,7 +1564,7 @@ mod compact_tests {
                 meta_spec("created_at", "DATETIME"),
             ],
             &["id".to_string()],
-            SourceEngine::MySql,
+            SourceEngine::Postgres,
             Some("created_at"),
         );
         assert!(
@@ -1698,7 +1718,7 @@ mod compact_tests {
             None,
             &specs(),
             &["id".to_string()],
-            SourceEngine::MySql,
+            SourceEngine::Postgres,
             Some("created_at"),
         );
         assert!(
@@ -1763,6 +1783,24 @@ mod compact_tests {
             "{s}"
         );
 
+        let own = compact_script_sql(
+            "p.d.t",
+            "p.d.t__changes",
+            None,
+            &specs(),
+            &["id".to_string()],
+            SourceEngine::MySql,
+            Some("created_at"),
+        );
+        assert!(
+            own.contains(
+                "SET days = (SELECT IFNULL(ARRAY_AGG(DISTINCT DATE(`created_at`) IGNORE NULLS), []) FROM `p.d.t__changes`);\nWHILE"
+            ) && !own.contains("moved")
+                && own.matches("FROM `p.d.t` AS __rivet_t").count() == 0,
+            "a MySQL stream refuses a partition move, so its days are the buffer's alone and \
+             only the MERGE reads the base: {own}"
+        );
+
         let plain = compact_script_sql(
             "p.d.t",
             "p.d.t__changes",
@@ -1799,7 +1837,7 @@ mod compact_tests {
                 meta_spec("created_at", "TIMESTAMP"),
             ],
             &["id".to_string()],
-            SourceEngine::MySql,
+            SourceEngine::Postgres,
             Some("created_at"),
         );
         assert!(
@@ -2172,6 +2210,7 @@ mod compact_tests {
             &pk,
             Some("created_at"),
             Some("DATETIME"),
+            false,
         );
         assert!(
             t.contains("SELECT DATE(`created_at`) AS v FROM `p.d.t__changes` UNION ALL SELECT DATE(__rivet_t.`created_at`) FROM `p.d.t` AS __rivet_t WHERE EXISTS (SELECT 1 FROM `p.d.t__changes` AS __rivet_s WHERE __rivet_t.`id` = __rivet_s.`id`)")
@@ -2189,21 +2228,35 @@ mod compact_tests {
             &pk,
             Some("created_at"),
             Some("TIMESTAMP"),
+            false,
         );
         assert!(
             ts.contains("SELECT DATE(`created_at`, 'UTC') AS v FROM `p.d.t__changes` UNION ALL SELECT DATE(__rivet_t.`created_at`, 'UTC') FROM `p.d.t` AS __rivet_t"),
             "{ts}"
         );
-        let r = compact_probe_sql("p.d.t__changes", "p.d.t", &pk, Some("bucket"), None);
+        let r = compact_probe_sql("p.d.t__changes", "p.d.t", &pk, Some("bucket"), None, false);
         assert!(
             r.contains("SELECT `bucket` AS v FROM `p.d.t__changes` UNION ALL SELECT __rivet_t.`bucket` FROM `p.d.t` AS __rivet_t")
                 && !r.contains("DATE("),
             "{r}"
         );
-        let n = compact_probe_sql("p.d.t__changes", "p.d.t", &pk, None, None);
+        let n = compact_probe_sql("p.d.t__changes", "p.d.t", &pk, None, None, false);
         assert!(
             n.contains("'' AS lo") && n.contains("0 AS null_keys"),
             "{n}"
+        );
+        let own = compact_probe_sql(
+            "p.d.t__changes",
+            "p.d.t",
+            &pk,
+            Some("created_at"),
+            Some("TIMESTAMP"),
+            true,
+        );
+        assert!(
+            own.contains("FROM (SELECT DATE(`created_at`, 'UTC') AS v FROM `p.d.t__changes`)")
+                && !own.contains("`p.d.t` AS __rivet_t"),
+            "a stream that refuses a partition move ranges over the buffer alone: {own}"
         );
     }
 }
