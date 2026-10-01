@@ -1227,15 +1227,12 @@ fn head_group_continues_on_disk(
 /// `lsns[i]` is `evs[i]`'s start LSN; the last run stays open when the spilled tail starts in it.
 fn close_poll_groups(evs: &mut [ChangeEvent], lsns: &[String], tail_head_lsn: Option<&str>) {
     let mut start = 0;
-    while start < evs.len() {
-        let mut end = start;
-        while end < evs.len() && lsns[end] == lsns[start] {
-            end += 1;
-        }
-        let commit = Position(json!({ "lsn": lsns[start] }));
+    for group in lsns.chunk_by(|a, b| a == b) {
+        let end = start + group.len();
+        let commit = Position(json!({ "lsn": group[0] }));
         // Only zero vs non-zero is read: "part of this transaction is still on disk".
         let continues_on_disk = usize::from(head_group_continues_on_disk(
-            &lsns[start],
+            &group[0],
             end == evs.len(),
             tail_head_lsn,
         ));
