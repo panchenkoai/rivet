@@ -14,13 +14,11 @@
 //! | scaffold | run 1 | run 2 |
 //! |---|---|---|
 //! | `--mode incremental` | everything | only the new rows |
-//! | `--mode cdc`, one table | **nothing** — the slot anchors at the current WAL | only the new changes |
+//! | `--mode cdc`, one table (`initial: snapshot`) | the table's baseline | only the new changes |
 //! | `--mode cdc`, two tables (`backfill: auto`) | every table's baseline | only the new changes |
 //!
-//! The middle row is the one to read twice: a single-table CDC scaffold does
-//! NOT take everything on the first run, and init says so in its own next-steps
-//! ("the baseline is yours"). The guarantee holds for CDC only through the
-//! multi-table scaffold's `backfill: auto`.
+//! Until 2026-10-01 the one-table row was "nothing": that scaffold carried no
+//! baseline, and its first `rivet compact` refused a base never loaded.
 
 use crate::common::*;
 
@@ -30,7 +28,10 @@ fn ids_in(dir: &std::path::Path) -> Vec<i64> {
     use arrow::array::{Array, Int64Array};
     let mut ids = Vec::new();
     for b in read_all_parts(dir) {
-        let col = b.column_by_name("id").expect("every part carries `id`");
+        let col = b
+            .column_by_name("id")
+            .or_else(|| b.column_by_name("ID")) // Oracle's catalog spelling
+            .expect("every part carries `id`");
         let a = col
             .as_any()
             .downcast_ref::<Int64Array>()
@@ -77,6 +78,18 @@ fn init_ok(args: &[&str]) {
 /// Run rivet and return what it said, asserting it exited 0.
 fn rivet_ok(args: &[&str], envs: &[(&str, &str)]) -> String {
     let out = run_rivet_env(args, envs);
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "rivet {:?} failed:\n{said}", args[0]);
+    said
+}
+
+/// Run rivet in `dir` (a generated config's relative paths resolve there) and return what it said, asserting it exited 0.
+fn rivet_ok_in(dir: &std::path::Path, args: &[&str], envs: &[(&str, &str)]) -> String {
+    let out = run_rivet_in_dir(dir, args, envs);
     let said = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -640,12 +653,7 @@ fn a_generated_incremental_config_takes_everything_then_only_the_delta() {
 
     let db = [("DATABASE_URL", POSTGRES_URL)];
     let run = || {
-        let o = run_rivet_in_dir(dir.path(), &["run", "-c", "rivet.yaml"], &db);
-        assert!(
-            o.status.success(),
-            "rivet run failed:\n{}",
-            String::from_utf8_lossy(&o.stderr)
-        );
+        rivet_ok_in(dir.path(), &["run", "-c", "rivet.yaml"], &db);
     };
 
     run();
@@ -674,7 +682,7 @@ fn a_generated_incremental_config_takes_everything_then_only_the_delta() {
 
 #[test]
 #[ignore = "live: requires docker compose --profile cdc up -d postgres-cdc"]
-fn a_generated_single_table_cdc_config_takes_no_baseline_only_later_changes() {
+fn a_generated_single_table_cdc_config_takes_its_baseline_then_only_later_changes() {
     let table = unique_name("init_delta_cdc");
     let mut c =
         postgres::Client::connect(POSTGRES_CDC_URL, postgres::NoTls).expect("connect postgres-cdc");
@@ -707,30 +715,19 @@ fn a_generated_single_table_cdc_config_takes_no_baseline_only_later_changes() {
 
     let db = [("DATABASE_URL", POSTGRES_CDC_URL)];
     let run = || {
-        let o = run_rivet_in_dir(dir.path(), &["run", "-c", "rivet.yaml"], &db);
-        assert!(
-            o.status.success(),
-            "rivet run failed:\n{}",
-            String::from_utf8_lossy(&o.stderr)
-        );
+        rivet_ok_in(dir.path(), &["run", "-c", "rivet.yaml"], &db);
     };
 
     run();
     let out = dir.path().join("output").join(&table).join("cdc");
     assert!(
         parts_in(&out).is_empty(),
-        "the slot anchors at the CURRENT wal position, so the 10 pre-existing rows \
-         are NOT the stream's to capture — init says so in its own next steps"
+        "nothing changed after the anchor, so the STREAM holds no part"
     );
-    // …and no baseline leg ran at all. Without this the test reads as "no
-    // baseline" while checking only "no CHANGE parts directly here": a snapshot
-    // leg writes to `<dest>/snapshot/` (config::export docs), one level down,
-    // where the non-recursive reader above cannot see it. Measured: scaffolding
-    // `initial: snapshot` left every assertion green until this line existed.
-    assert!(
-        !out.join("snapshot").exists(),
-        "a single-table cdc scaffold must not carry a baseline leg — the baseline \
-         is the operator's, through `initial: snapshot` or a backfill recipe"
+    assert_eq!(
+        ids_in(&out.join("snapshot")),
+        (1..=10).collect::<Vec<i64>>(),
+        "the 10 pre-existing rows are the first run's baseline (`initial: snapshot`)"
     );
 
     c.batch_execute(&format!(
@@ -743,6 +740,11 @@ fn a_generated_single_table_cdc_config_takes_no_baseline_only_later_changes() {
         ids_in(&out),
         (11..=15).collect::<Vec<i64>>(),
         "run 2 must hold the changes since the anchor and nothing else"
+    );
+    assert_eq!(
+        ids_in(&out.join("snapshot")),
+        (1..=10).collect::<Vec<i64>>(),
+        "the baseline is not re-read"
     );
 }
 
@@ -790,12 +792,7 @@ fn a_generated_multi_table_cdc_config_takes_every_baseline_then_only_the_delta()
 
     let db = [("DATABASE_URL", POSTGRES_CDC_URL)];
     let run = || {
-        let o = run_rivet_in_dir(dir.path(), &["run", "-c", "rivet.yaml"], &db);
-        assert!(
-            o.status.success(),
-            "rivet run failed:\n{}",
-            String::from_utf8_lossy(&o.stderr)
-        );
+        rivet_ok_in(dir.path(), &["run", "-c", "rivet.yaml"], &db);
     };
     let root = dir.path().join("output").join("cdc");
     let snap = |t: &str| root.join(t).join("snapshot");
@@ -827,4 +824,353 @@ fn a_generated_multi_table_cdc_config_takes_every_baseline_then_only_the_delta()
     // double every snapshot, which is what makes this the load-bearing half.
     assert_eq!(ids_in(&snap(&a)), (1..=10).collect::<Vec<i64>>());
     assert_eq!(ids_in(&snap(&b)), (1..=7).collect::<Vec<i64>>());
+}
+
+// ── cdc: init --mode cdc → check → run → load → compact, per engine ───────
+
+/// One change a CDC chain applies to its source.
+#[derive(Clone, Copy)]
+enum Op {
+    Ins(i64),
+    Rename(i64),
+    Del(i64),
+}
+
+/// `op` as SQL on `table`, for the SQL engines (`name` is the only non-key column).
+fn op_sql(table: &str, op: Op) -> String {
+    match op {
+        Op::Ins(i) => format!("INSERT INTO {table} (id, name) VALUES ({i}, 'r{i}')"),
+        Op::Rename(i) => format!("UPDATE {table} SET name = 'changed' WHERE id = {i}"),
+        Op::Del(i) => format!("DELETE FROM {table} WHERE id = {i}"),
+    }
+}
+
+/// The ten seed rows, then the changes between the two cycles.
+fn seed_ops() -> Vec<Op> {
+    (1..=10).map(Op::Ins).collect()
+}
+fn change_ops() -> Vec<Op> {
+    vec![
+        Op::Ins(11),
+        Op::Ins(12),
+        Op::Ins(13),
+        Op::Rename(2),
+        Op::Del(3),
+    ]
+}
+
+/// Applies a list of changes to a source.
+type ApplyOps = Box<dyn Fn(&[Op])>;
+
+/// A source a generated CDC config captures: the URL rivet gets, init's table flags,
+/// how a change is applied, and the warehouse's reading of the key.
+struct CdcSource {
+    url: String,
+    init_args: Vec<String>,
+    apply: ApplyOps,
+    bq_id: &'static str,
+    /// The `name` field as the warehouse holds it.
+    bq_name: &'static str,
+    /// The warehouse table when it is not the export name (SQL Server qualifies it).
+    bq_table: Option<String>,
+}
+
+/// init `--mode cdc` with a warehouse, then the cycle init's own next steps print:
+/// `check`, `run`, `load`, changes, `run`, `load`, `compact`. The base must equal the
+/// source afterwards: twelve live keys, the rename merged, the delete flagged.
+fn cdc_warehouse_chain(src: CdcSource, bq: &BqLive) {
+    (src.apply)(&seed_ops());
+    let dir = tempfile::tempdir().expect("config dir");
+    let cfg_path = dir.path().join("rivet.yaml");
+    let cfg = cfg_path.to_str().unwrap();
+    let mut args: Vec<&str> = vec!["init", "--source", &src.url, "--mode", "cdc"];
+    args.extend(src.init_args.iter().map(String::as_str));
+    args.extend([
+        "--bigquery-project",
+        &bq.project,
+        "--bigquery-dataset",
+        &bq.dataset,
+        "--gcs-bucket",
+        &bq.bucket,
+        "--output",
+        cfg,
+    ]);
+    // Graded after the cycle, so a scaffold with no baseline fails on what it does, not what it says.
+    let next_steps = rivet_ok(&args, &[]);
+    let generated = std::fs::read_to_string(cfg).expect("generated config");
+    assert!(generated.contains("\nload:"), "{generated}");
+    let export = scaffolded_export(&generated);
+    let _gcs_guard = GcsPrefix(format!("gs://{}/exports/{export}/**", bq.bucket));
+    let export = src.bq_table.clone().unwrap_or(export);
+    let changes = format!("{export}__changes");
+    let _bq_guard = bq.cleanup(&[&export, &changes]);
+    let _slot = generated
+        .contains("slot:")
+        .then(|| Slot(scaffolded_slot(&generated)));
+    let db = [("DATABASE_URL", src.url.as_str())];
+
+    rivet_ok(&["check", "-c", cfg], &db);
+    rivet_ok(&["run", "-c", cfg], &db);
+    rivet_ok(&["load", "-c", cfg], &[]);
+    assert_eq!(
+        bq.read_bq_table_type(&export).as_deref(),
+        Some("BASE TABLE"),
+        "the first run's baseline lands as the base"
+    );
+    assert_eq!(bq.read_bq_count(&export), "10");
+
+    (src.apply)(&change_ops());
+    rivet_ok(&["run", "-c", cfg], &db);
+    rivet_ok(&["load", "-c", cfg], &[]);
+    let said = rivet_ok(&["compact", "-c", cfg], &[]);
+    assert!(said.contains("COMPACT OK"), "{said}");
+    assert!(
+        bq.read_bq_table_type(&changes).is_none(),
+        "the buffer is dropped after the merge"
+    );
+    let (id, name) = (src.bq_id, src.bq_name);
+    let rows = bq.read_bq_rows(&format!(
+        "SELECT COUNTIF(NOT __is_deleted) AS live, COUNT(DISTINCT {id}) AS keys, \
+         COUNTIF({id} = 3 AND __is_deleted) AS gone, \
+         COUNTIF({id} = 2 AND {name} = 'changed' AND NOT __is_deleted) AS renamed \
+         FROM `{}.{}.{export}`",
+        bq.project, bq.dataset
+    ));
+    let got = |k: &str| rows[0][k].as_str().map(str::to_string);
+    assert_eq!(
+        (got("live"), got("keys"), got("gone"), got("renamed")),
+        (
+            Some("12".into()),
+            Some("13".into()),
+            Some("1".into()),
+            Some("1".into())
+        ),
+        "base after compact: {rows:?}"
+    );
+    assert!(
+        next_steps.contains("rivet compact -c") && !next_steps.contains("CHANGES ONLY"),
+        "init's next steps must prescribe the cycle that just ran:\n{next_steps}"
+    );
+}
+
+#[test]
+#[ignore = "live: requires postgres-cdc + BigQuery creds"]
+fn a_generated_cdc_config_drives_run_load_compact_postgres() {
+    let Some(bq) = BqLive::from_env("init_cdc_pg") else {
+        return;
+    };
+    let table = unique_name("init_cdc_pg");
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, postgres::NoTls).expect("connect");
+    c.batch_execute(&format!(
+        "CREATE TABLE {table} (id BIGINT PRIMARY KEY, name TEXT NOT NULL)"
+    ))
+    .unwrap();
+    let _t = PgTable::adopt_on(POSTGRES_CDC_URL, table.clone());
+    let t = table.clone();
+    cdc_warehouse_chain(
+        CdcSource {
+            url: POSTGRES_CDC_URL.into(),
+            init_args: vec!["--table".into(), table],
+            apply: Box::new(move |ops| {
+                let mut c = postgres::Client::connect(POSTGRES_CDC_URL, postgres::NoTls).unwrap();
+                for op in ops {
+                    c.batch_execute(&op_sql(&t, *op)).unwrap();
+                }
+            }),
+            bq_id: "id",
+            bq_name: "name",
+            bq_table: None,
+        },
+        &bq,
+    );
+}
+
+#[test]
+#[ignore = "live: requires mysql-cdc + BigQuery creds"]
+fn a_generated_cdc_config_drives_run_load_compact_mysql() {
+    use mysql::prelude::Queryable as _;
+    let Some(bq) = BqLive::from_env("init_cdc_my") else {
+        return;
+    };
+    let table = unique_name("init_cdc_my");
+    let pool = mysql::Pool::new(MYSQL_CDC_URL).expect("mysql-cdc");
+    pool.get_conn()
+        .unwrap()
+        .query_drop(format!(
+            "CREATE TABLE {table} (id BIGINT PRIMARY KEY, name VARCHAR(64) NOT NULL)"
+        ))
+        .unwrap();
+    let _t = MysqlCdcTable(table.clone());
+    let t = table.clone();
+    cdc_warehouse_chain(
+        CdcSource {
+            url: MYSQL_CDC_URL.into(),
+            init_args: vec!["--table".into(), table],
+            apply: Box::new(move |ops| {
+                let mut c = pool.get_conn().unwrap();
+                for op in ops {
+                    c.query_drop(op_sql(&t, *op)).unwrap();
+                }
+            }),
+            bq_id: "id",
+            bq_name: "name",
+            bq_table: None,
+        },
+        &bq,
+    );
+}
+
+#[test]
+#[ignore = "live: requires mssql-cdc + BigQuery creds"]
+fn a_generated_cdc_config_drives_run_load_compact_mssql() {
+    let Some(bq) = BqLive::from_env("init_cdc_ms") else {
+        return;
+    };
+    let table = unique_name("init_cdc_ms");
+    let ci = format!("dbo_{table}");
+    mssql_cdc_exec(&format!(
+        "CREATE TABLE dbo.{table} (id BIGINT PRIMARY KEY, name NVARCHAR(64) NOT NULL)"
+    ));
+    let _t = MssqlCdcTable {
+        table: table.clone(),
+        ci: ci.clone(),
+    };
+    enable_cdc(&table, &ci);
+    let t = format!("dbo.{table}");
+    let ci_table = format!("dbo_{table}"); // the load names the warehouse table `<schema>_<table>`
+    let captured = std::cell::Cell::new(0i64);
+    cdc_warehouse_chain(
+        CdcSource {
+            url: MSSQL_CDC_URL.into(),
+            init_args: vec!["--table".into(), t.clone()],
+            apply: Box::new(move |ops| {
+                for op in ops {
+                    mssql_cdc_exec(&op_sql(&t, *op));
+                }
+                // An UPDATE is two change rows (before and after image).
+                let rows: i64 = ops
+                    .iter()
+                    .map(|o| if matches!(o, Op::Rename(_)) { 2 } else { 1 })
+                    .sum();
+                captured.set(captured.get() + rows);
+                wait_for_capture(&ci, captured.get());
+            }),
+            bq_id: "id",
+            bq_name: "name",
+            bq_table: Some(ci_table),
+        },
+        &bq,
+    );
+}
+
+#[test]
+#[ignore = "live: requires mongo-rs + BigQuery creds"]
+fn a_generated_cdc_config_drives_run_load_compact_mongo() {
+    use mongodb::bson::doc;
+    let Some(bq) = BqLive::from_env("init_cdc_mg") else {
+        return;
+    };
+    let db = unique_name("init_cdc_mg");
+    let _db = MongoDbGuard {
+        port: 27018,
+        db: db.clone(),
+    };
+    let m = MongoTest::connect(27018, &db);
+    m.create_empty_collection("events");
+    cdc_warehouse_chain(
+        CdcSource {
+            url: MongoTest::url(27018, &db),
+            init_args: vec!["--table".into(), "events".into()],
+            apply: Box::new(move |ops| {
+                for op in ops {
+                    match *op {
+                        Op::Ins(i) => m.insert_many(
+                            "events",
+                            vec![doc! { "_id": i, "name": format!("r{i}") }],
+                        ),
+                        Op::Rename(i) => m.upsert_set("events", i, "name", "changed"),
+                        Op::Del(i) => m.delete_one("events", i),
+                    }
+                }
+            }),
+            bq_id: "CAST(_id AS INT64)",
+            bq_name: "JSON_VALUE(document, '$.name')",
+            bq_table: None,
+        },
+        &bq,
+    );
+}
+
+#[cfg(feature = "oracle")]
+/// Oracle CDC does not load yet (ADR-0037): init writes no `load:` block even with a
+/// warehouse named, says why, and the config it writes passes `check` and captures the
+/// baseline to Parquet.
+#[test]
+#[ignore = "live: requires the oracle service with LogMiner prerequisites"]
+fn a_generated_oracle_cdc_config_has_no_load_block_and_runs_to_parquet() {
+    let _serial = cross_process_serial("oracle_cdc");
+    let t = crate::live_cdc_oracledb::cdc_table(
+        "init_cdc_ora",
+        "id NUMBER(18) PRIMARY KEY, name VARCHAR2(64) NOT NULL",
+    );
+    for op in seed_ops() {
+        ora_exec(&op_sql(t.name(), op));
+    }
+    let db = [("DATABASE_URL", ORACLE_CDC_URL)];
+    let init = |dir: &std::path::Path, warehouse: &[&str]| {
+        let mut args = vec![
+            "init",
+            "--source",
+            ORACLE_CDC_URL,
+            "--schema",
+            "RIVET",
+            "--table",
+            t.name(),
+            "--mode",
+            "cdc",
+            "--output",
+            "rivet.yaml",
+        ];
+        args.extend(warehouse);
+        let said = rivet_ok_in(dir, &args, &[]);
+        let generated = std::fs::read_to_string(dir.join("rivet.yaml")).unwrap();
+        rivet_ok_in(dir, &["check", "-c", "rivet.yaml"], &db);
+        (said, generated)
+    };
+
+    // A warehouse named: no `load:` block, the reason in the file, no load promised.
+    let wh = tempfile::tempdir().expect("config dir");
+    let (said, generated) = init(
+        wh.path(),
+        &[
+            "--gcs-bucket",
+            "b",
+            "--bigquery-project",
+            "p",
+            "--bigquery-dataset",
+            "d",
+        ],
+    );
+    assert!(
+        !said.contains("rivet load    -c") && said.contains("No `load:` block"),
+        "init's next steps must not promise a load:\n{said}"
+    );
+    assert!(
+        !generated.contains("\nload:")
+            && generated.contains("ADR-0037")
+            && generated.contains("initial: snapshot"),
+        "{generated}"
+    );
+
+    // What still works: run writes the baseline to Parquet.
+    let dir = tempfile::tempdir().expect("config dir");
+    let (_, generated) = init(dir.path(), &[]);
+    rivet_ok_in(dir.path(), &["run", "-c", "rivet.yaml"], &db);
+    let snap = dir
+        .path()
+        .join("output")
+        .join(scaffolded_export(&generated))
+        .join("cdc")
+        .join("snapshot");
+    assert_eq!(ids_in(&snap), (1..=10).collect::<Vec<i64>>());
 }

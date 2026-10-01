@@ -19,19 +19,19 @@ class KnownRed:
 
 KNOWN_RED: tuple[KnownRed, ...] = (
     KnownRed('upgrade[mssql/cdc-load]: cycle1/compact: prev exit 1: never loaded',
-             "`rivet init --mode cdc` on SQL Server writes per-table streams with no baseline and a base_buffer `load:` block, and prints load + compact as the next steps; the first compact refuses 'never loaded' (both 0.30.0 and this tree)",
+             "0.30.0's `rivet init --mode cdc` on SQL Server wrote a per-table stream with no baseline under a base_buffer `load:` block, so the first compact refuses 'never loaded'. Fixed in this tree: init writes `cdc.initial: snapshot` and `upgrade[mssql/cdc-load/init=this]` grades it green. This cell starts from the PREVIOUS release's init, so it stays red until a release carries the fix",
              "2026-10-31"),
     KnownRed('upgrade[mssql/cdc-load/tz=+09:00]: cycle1/compact: prev exit 1: never loaded',
-             "`rivet init --mode cdc` on SQL Server writes per-table streams with no baseline and a base_buffer `load:` block, and prints load + compact as the next steps; the first compact refuses 'never loaded' (both 0.30.0 and this tree)",
+             "0.30.0's `rivet init --mode cdc` on SQL Server wrote a per-table stream with no baseline under a base_buffer `load:` block, so the first compact refuses 'never loaded'. Fixed in this tree: init writes `cdc.initial: snapshot` and `upgrade[mssql/cdc-load/init=this]` grades it green. This cell starts from the PREVIOUS release's init, so it stays red until a release carries the fix",
              "2026-10-31"),
     KnownRed('upgrade[mongo/cdc-load]: cycle1/compact: prev exit 1: never loaded',
-             "`rivet init --mode cdc` on MongoDB writes per-table streams with no baseline and a base_buffer `load:` block, and prints load + compact as the next steps; the first compact refuses 'never loaded' (both 0.30.0 and this tree)",
+             "0.30.0's `rivet init --mode cdc` on MongoDB wrote a per-table stream with no baseline under a base_buffer `load:` block, so the first compact refuses 'never loaded'. Fixed in this tree: init writes `cdc.initial: snapshot` and `upgrade[mongo/cdc-load/init=this]` grades it green. This cell starts from the PREVIOUS release's init, so it stays red until a release carries the fix",
              "2026-10-31"),
     KnownRed('upgrade[oracle/cdc-load]: anchor: prev exit 1 [RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED]',
-             '`rivet init --mode cdc` on Oracle writes a `load:` block that every command refuses (RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED: Oracle CDC load is not supported, ADR-0037), in 0.30.0 and this tree',
+             "0.30.0's `rivet init --mode cdc` on Oracle wrote a `load:` block the loader refuses (RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED, ADR-0037). This tree's init writes none and says why (`upgrade[oracle/cdc-load/init=this]` grades that); loading Oracle CDC is the Oracle GA work, so this load cycle stays unsupported until then",
              "2026-10-31"),
     KnownRed('upgrade[oracle/cdc-load/tz=Asia/Tokyo]: anchor: prev exit 1 [RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED]',
-             '`rivet init --mode cdc` on Oracle writes a `load:` block that every command refuses (RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED: Oracle CDC load is not supported, ADR-0037), in 0.30.0 and this tree',
+             "0.30.0's `rivet init --mode cdc` on Oracle wrote a `load:` block the loader refuses (RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED, ADR-0037). This tree's init writes none and says why (`upgrade[oracle/cdc-load/init=this]` grades that); loading Oracle CDC is the Oracle GA work, so this load cycle stays unsupported until then",
              "2026-10-31"),
 )
 

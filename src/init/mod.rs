@@ -804,16 +804,17 @@ pub fn init(
             // scaffold (the discovery JSON isn't runnable).
             if matches!(format, InitFormat::Yaml) && runnable {
                 eprint!(
-                    "{}",
+                    "{}{}",
                     next_steps_block(
                         path,
                         provenance,
                         mode_override,
-                        text.contains("      backfill: auto"),
+                        has_baseline(&text),
                         text.contains("\nload:"),
                         text.contains("\n  layout: base_buffer"),
                         has_delta_export(&text)
-                    )
+                    ),
+                    no_load_note(&text)
                 );
             }
         }
@@ -823,16 +824,17 @@ pub fn init(
             print!("{text}");
             if matches!(format, InitFormat::Yaml) && runnable {
                 eprint!(
-                    "{}",
+                    "{}{}",
                     next_steps_block(
                         "rivet.yaml",
                         provenance,
                         mode_override,
-                        text.contains("      backfill: auto"),
+                        has_baseline(&text),
                         text.contains("\nload:"),
                         text.contains("\n  layout: base_buffer"),
                         has_delta_export(&text)
-                    )
+                    ),
+                    no_load_note(&text)
                 );
             }
         }
@@ -848,18 +850,32 @@ fn has_delta_export(yaml: &str) -> bool {
         .any(|l| matches!(l.trim(), "mode: cdc" | "mode: incremental"))
 }
 
+/// The next-steps line for a scaffold that left its `load:` block out because the loader refuses it.
+fn no_load_note(yaml: &str) -> &'static str {
+    if yaml.contains(yaml_scaffold::NO_LOAD_BLOCK) {
+        "\nNo `load:` block: `rivet load` cannot take this source's CDC stream yet (the reason \
+         is in the file). `rivet run` writes its Parquet; load those parts with your own tooling.\n"
+    } else {
+        ""
+    }
+}
+
+/// Whether a scaffold's CDC exports carry a first-run baseline, read from their `cdc:` keys.
+fn has_baseline(yaml: &str) -> bool {
+    yaml.lines()
+        .any(|l| l.starts_with("      backfill: auto") || l.starts_with("      initial: snapshot"))
+}
+
 /// The friendly "do this next" ladder printed after a YAML scaffold. For an
 /// inline `--source` URL it leads with a step-0 export reminder, because the
 /// scaffold deliberately writes `url_env: DATABASE_URL` (it never persists the
 /// literal URL) and would otherwise fail on an unset variable.
-/// `has_backfill` is read off the scaffold itself (`backfill: auto` present): only the
-/// consolidated multi-table shape carries a baseline; the per-table CDC scaffold
-/// (SQL Server, MongoDB, a non-`public` schema, a single table) captures changes only.
+/// `has_baseline` is read off the scaffold itself ([`has_baseline`]).
 fn next_steps_block(
     path: &str,
     provenance: &SourceProvenance,
     mode: Option<&str>,
-    has_backfill: bool,
+    has_baseline: bool,
     has_load: bool,
     has_compact: bool,
     has_delta: bool,
@@ -877,10 +893,11 @@ fn next_steps_block(
     ));
     // A CDC scaffold has no batch plan: `rivet plan` skips every export in it and
     // stops with "nothing to plan". Its schedule is the run itself.
-    if mode == Some("cdc") && has_backfill {
+    if mode == Some("cdc") && has_baseline {
         s.push_str(&format!(
-            "\nThe first run anchors the stream and reads every table's baseline through its \
-             recipe; each later run captures only the changes since. Put it on a schedule:\n  \
+            "\nThe first run anchors the stream and reads every table's baseline (through its \
+             recipe under `backfill: auto`, whole under `initial: snapshot`); each later run \
+             captures only the changes since. Put it on a schedule:\n  \
              rivet run   -c {path}                    # bounded (until_current) — safe to repeat\n"
         ));
     } else if mode == Some("cdc") {
@@ -1627,6 +1644,16 @@ fn relation_for_key(
 
 #[cfg(test)]
 mod tests {
+
+    /// `has_baseline` reads only the two baseline keys at the `cdc:` child indent.
+    #[test]
+    fn has_baseline_is_true_only_for_a_baseline_key_under_cdc() {
+        assert!(has_baseline("    cdc:\n      backfill: auto\n"));
+        assert!(has_baseline("    cdc:\n      initial: snapshot\n"));
+        assert!(!has_baseline("    cdc:\n      slot: s\n"));
+        assert!(!has_baseline("# initial: snapshot is not used here\n"));
+        assert!(!has_baseline("  initial: snapshot\n"));
+    }
     /// Recording primary keys must not re-load and re-VALIDATE the config.
     #[test]
     fn recording_primary_keys_does_not_validate_the_whole_config() {

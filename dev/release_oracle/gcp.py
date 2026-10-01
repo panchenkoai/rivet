@@ -13,6 +13,8 @@ import subprocess
 import threading
 import time
 import urllib.parse
+import urllib.request
+from pathlib import Path
 
 # gcloud hands back its CACHED token until that has under 5 min left, so a token
 # fetched now may expire in 5 min, not 60: re-ask every 4 (it costs ~0.3 s).
@@ -124,24 +126,38 @@ def bq_scalar(project: str, sql: str) -> str | None:
     return b["rows"][0]["f"][0]["v"]
 
 
-def gcs_delete_prefix(bucket: str, prefix: str) -> int:
-    """Delete every object under `prefix` (`gcloud storage rm -r`); the count deleted."""
-    host, n, page = "storage.googleapis.com", 0, ""
+def gcs_list(bucket: str, prefix: str) -> list[str]:
+    """Every object name under `prefix`."""
+    names, page = [], ""
     while True:
         q = urllib.parse.urlencode({"prefix": prefix, "fields": "items(name),nextPageToken",
                                     **({"pageToken": page} if page else {})})
-        st, b = _call(host, "GET", f"/storage/v1/b/{bucket}/o?{q}")
+        st, b = _call("storage.googleapis.com", "GET", f"/storage/v1/b/{bucket}/o?{q}")
         if st != 200:
             raise RuntimeError(f"gcs: list gs://{bucket}/{prefix} → {st} {b}")
-        for item in b.get("items", []):
-            name = urllib.parse.quote(item["name"], safe="")
-            dst, db = _call(host, "DELETE", f"/storage/v1/b/{bucket}/o/{name}")
-            if dst not in (200, 204, 404):
-                raise RuntimeError(f"gcs: delete {item['name']} → {dst} {db}")
-            n += 1
+        names += [item["name"] for item in b.get("items", [])]
         page = b.get("nextPageToken", "")
         if not page:
-            return n
+            return names
+
+
+def gcs_download(bucket: str, name: str, dest: Path) -> None:
+    """Write object `name`'s bytes to `dest`."""
+    url = f"https://storage.googleapis.com/storage/v1/b/{bucket}/o/{urllib.parse.quote(name, safe='')}?alt=media"
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token()}"})
+    with urllib.request.urlopen(req, timeout=300) as r:
+        dest.write_bytes(r.read())
+
+
+def gcs_delete_prefix(bucket: str, prefix: str) -> int:
+    """Delete every object under `prefix` (`gcloud storage rm -r`); the count deleted."""
+    names = gcs_list(bucket, prefix)
+    for item in names:
+        name = urllib.parse.quote(item, safe="")
+        dst, db = _call("storage.googleapis.com", "DELETE", f"/storage/v1/b/{bucket}/o/{name}")
+        if dst not in (200, 204, 404):
+            raise RuntimeError(f"gcs: delete {item} → {dst} {db}")
+    return len(names)
 
 
 def gcs_delete_prefixes(bucket: str, prefixes: list[str]) -> int:

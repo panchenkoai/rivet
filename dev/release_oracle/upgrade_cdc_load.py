@@ -6,6 +6,8 @@ update and a delete between cycles. After every compact each base's live rows eq
 `id:v:epoch`, every deleted id is flagged `__is_deleted`, no key is there twice and no `__changes`
 buffer is left. The source epoch is computed by the source engine itself, never read from a
 session-rendered text. Every SQL engine runs a second time with a non-UTC zone (see `Src.tz_note`).
+Every engine runs once more as `/init=this`: THIS binary's init config, five cycles by this binary, so
+a fix in init is graded before the previous release carries it.
 """
 
 from __future__ import annotations
@@ -41,6 +43,8 @@ class Src:
     anchor_first = False  # init writes no baseline: anchor the stream before the seed
     init_args: tuple[str, ...] = ("--tls", "disable")
     bq_id = "id"
+    bq_v = "CAST(v AS BIGINT)"
+    bq_epoch = "epoch(created_at)"
     tz_note = ""
 
     def __init__(self, url: str, tz: str | None, tag: str):
@@ -49,6 +53,10 @@ class Src:
 
     def name(self, k: int) -> str:
         return f"upg_cdcw_{self.tag}_{k}"
+
+    def bq_table(self, t: str) -> str:
+        """The warehouse table the load names for source table `t`."""
+        return t
 
     def lit(self, ts: str) -> str:
         return f"'{ts}'"
@@ -88,7 +96,8 @@ class Src:
 
 
 def _join(rows) -> str:
-    return ",".join(f"{int(i)}:{int(v)}:{int(e)}" for i, v, e in sorted(rows))
+    # Numeric order: a fingerprint parsed from text (sqlcmd, mongosh) must sort like one read as integers.
+    return ",".join(f"{i}:{v}:{e}" for i, v, e in sorted((int(i), int(v), int(e)) for i, v, e in rows))
 
 
 class MySQL(Src):
@@ -179,6 +188,9 @@ class MSSQL(Src):
         if tz:
             self.env = {"TZ": "Asia/Tokyo"}
 
+    def bq_table(self, t):
+        return f"dbo_{t}"  # the load names a SQL Server table `<schema>_<table>`
+
     def lit(self, ts):
         return f"'{ts} {self.tz or '+00:00'}'"
 
@@ -214,7 +226,8 @@ class MSSQL(Src):
         from .cdc import _sqlcmd
         out = _sqlcmd(self.url, q=f"SET NOCOUNT ON; SELECT CONCAT(id, ':', v, ':', DATEDIFF_BIG(second, "
                                   f"'1970-01-01', SWITCHOFFSET(created_at, 0))) FROM dbo.{t}").stdout
-        return _join(tuple(ln.split(":")) for ln in re.findall(r"^-?\d+:-?\d+:-?\d+$", out, re.M))
+        # sqlcmd pads a column to its width: the trailing blanks are not part of the value.
+        return _join(tuple(ln.split(":")) for ln in re.findall(r"^(-?\d+:-?\d+:-?\d+) *$", out, re.M))
 
 
 class Oracle(Src):
@@ -278,7 +291,9 @@ class Oracle(Src):
 class Mongo(Src):
     anchor_first = True
     init_args = ()
-    bq_id = "CAST(_id AS BIGINT)"  # MongoDB's `_id` lands as text
+    bq_id = "CAST(_id AS BIGINT)"  # MongoDB's `_id` lands as text, the rest as relaxed extended JSON
+    bq_v = "CAST(json_extract(document, '$.v') AS BIGINT)"
+    bq_epoch = "epoch(CAST(json_extract_string(document, '$.created_at.\"$date\"') AS TIMESTAMPTZ))"
 
     def sql(self, stmts):
         from .cdc import _mongosh
@@ -344,32 +359,77 @@ def _why(p: Proc) -> str:
 
 def _state(o, src: Src, dset: str, t: str) -> tuple[str, str, str, int, bool]:
     """(source `id:v:epoch`, base live `id:v:epoch`, flagged ids, rows minus distinct ids, buffer exists)."""
-    rel = f'bq.{dset}."{t}"'
+    w = src.bq_table(t)
+    rel = f'bq.{dset}."{w}"'
     i = src.bq_id
-    live = _join(o.rows(f"SELECT {i}, CAST(v AS BIGINT), epoch(created_at) FROM {rel} WHERE NOT __is_deleted"))
+    live = _join(o.rows(f"SELECT {i}, {src.bq_v}, {src.bq_epoch} FROM {rel} WHERE NOT __is_deleted"))
     gone = ",".join(str(int(r[0])) for r in sorted(o.rows(f"SELECT {i} FROM {rel} WHERE __is_deleted")))
     dup = o.scalar(f"SELECT count(*) - count(DISTINCT {i}) FROM {rel}")
     buf = o.scalar("SELECT count(*) FROM information_schema.tables WHERE table_catalog = 'bq' "
-                   f"AND table_schema = '{dset}' AND table_name = '{t}__changes'")
+                   f"AND table_schema = '{dset}' AND table_name = '{w}__changes'")
     return src.fp(o, t), live, gone, dup, buf > 0
 
 
-def cdc_load_leg(led: Ledger, prev: Path, root: Path, engine: str, url: str, tz: str | None = None) -> None:
-    """One cdc-load cell: the previous release's init config, three cycles by it and two by this binary."""
+def _oracle_no_load(led: Ledger, name: str, fail, step, body: str, bucket: str, pfx: str,
+                    tables: list[str], src: Src, d: Path) -> None:
+    """Oracle CDC does not load yet (ADR-0037; the GA work): init writes no `load:` block, says why,
+    and `run` writes every table's baseline to Parquet whose `id:v:epoch` equals the source's."""
+    import duckdb
+
+    from . import gcp
+    from .scenarios import _declared_read
+
+    if "\nload:" in body or "ADR-0037" not in body:
+        return fail("init", "an Oracle CDC scaffold must carry no `load:` block and name ADR-0037: " + body[-400:])
+    r = step(rivet_bin(), "run", "-c", "c.yaml")
+    if not r.ok:
+        return fail("run", f"this {_why(r)}")
+    names = gcp.gcs_list(bucket, f"{pfx}/")
+    bad = []
+    for t in tables:
+        # The snapshot leg's objects, then only the parts its manifest DECLARES (what a consumer reads).
+        objs = [n for n in names if f"/{t}/cdc/snapshot/" in n and "/" not in n.split("/snapshot/", 1)[1]]
+        local = d / "baseline" / t
+        local.mkdir(parents=True)
+        for n in objs:
+            gcp.gcs_download(bucket, n, local / n.rsplit("/", 1)[1])
+        declared = _declared_read(local, ".parquet")
+        if declared is None:
+            bad.append(f"{t}: the manifest declares no baseline Parquet ({len(objs)} objects)")
+            continue
+        got = _join(duckdb.sql(f"SELECT ID, V, epoch(CREATED_AT) FROM read_parquet({declared})").fetchall())
+        want = src.fp(None, t)
+        if not want or got != want:
+            bad.append(f"{t}: parquet={got!r} src={want!r}")
+    if bad:
+        return fail("run", "the baseline Parquet differs from the source — " + "; ".join(bad)[:600])
+    led.passed("oracle", "-", SCEN, "cdc-load", f"{name}: init writes no `load:` block (Oracle CDC load is "
+               f"the GA work, ADR-0037), `check` passes, `run` writes each of {len(tables)} tables' baseline "
+               "to Parquet equal to the source `id:v:epoch` (DuckDB over the Parquet, python-oracledb over "
+               "the source)", "cdc-load")
+
+
+def cdc_load_leg(led: Ledger, prev: Path, root: Path, engine: str, url: str, tz: str | None = None,
+                 init_this: bool = False) -> None:
+    """One cdc-load cell: the previous release's init config, three cycles by it and two by this binary;
+    with `init_this`, this binary's init config and five cycles by this binary."""
     import duckdb
 
     from . import gcp
     from .duck import BQ_DATASET_ENV, BQ_PROJECT_ENV, Oracle as Duck, bq_target
     from ..pytools.registry import bq_tmp
 
-    name = f"upgrade[{engine}/cdc-load{f'/tz={tz}' if tz else ''}]"
+    name = f"upgrade[{engine}/cdc-load{'/init=this' if init_this else ''}{f'/tz={tz}' if tz else ''}]"
     target, bucket = bq_target(), os.environ.get("BQ_ORACLE_BUCKET", "")
     if target is None or not bucket:
         led.skipped(engine, "-", SCEN, "cdc-load", f"{name}: no {BQ_PROJECT_ENV} / {BQ_DATASET_ENV} "
                     "/ BQ_ORACLE_BUCKET", "no bigquery")
         return
     proj = target[0]
-    tag = f"{engine[:2]}{'tz' if tz else ''}_{os.getpid()}"
+    tag = f"{engine[:2]}{'tz' if tz else ''}{'n' if init_this else ''}_{os.getpid()}"
+    initer = rivet_bin() if init_this else prev
+    # 0.30.0's init writes no baseline for a per-table stream; this tree's always does.
+    anchor_first = CDC_LOAD_ENGINES[engine][0].anchor_first and not init_this
     src = CDC_LOAD_ENGINES[engine][0](url, tz, tag)
     tables = [src.name(k) for k in range(CDC_TABLES)]
     dset = bq_tmp(f"upgcdc_{tag}")
@@ -385,7 +445,7 @@ def cdc_load_leg(led: Ledger, prev: Path, root: Path, engine: str, url: str, tz:
     def buffers() -> list[bool]:
         with Duck(bigquery=True, bq_dataset=dset, **src.attach) as o:
             return [o.scalar("SELECT count(*) FROM information_schema.tables WHERE table_catalog = 'bq' "
-                             f"AND table_schema = '{dset}' AND table_name = '{t}__changes'") > 0 for t in tables]
+                             f"AND table_schema = '{dset}' AND table_name = '{src.bq_table(t)}__changes'") > 0 for t in tables]
 
     try:
         with src:
@@ -397,14 +457,15 @@ def cdc_load_leg(led: Ledger, prev: Path, root: Path, engine: str, url: str, tz:
             for t in tables:
                 if not src.create(t):
                     return fail("seed", f"could not create {t}")
-            if not src.anchor_first and not all(src.apply(t, _ops(k, 0)) for k, t in enumerate(tables)):
+            if not anchor_first and not all(src.apply(t, _ops(k, 0)) for k, t in enumerate(tables)):
                 return fail("seed", "the seed rows failed")
             gcp.bq_ensure_dataset(proj, dset)
-            init = step(prev, "init", "--source-env", "RIVET_UPG_URL", "--mode", "cdc", "--include", *tables,
+            init = step(initer, "init", "--source-env", "RIVET_UPG_URL", "--mode", "cdc", "--include", *tables,
                         *src.init_args, "--gcs-bucket", bucket, "--bigquery-project", proj,
                         "--bigquery-dataset", dset, "-o", "c.yaml")
             if not init.ok:
-                return fail("init", f"previous init: {(init.stderr or '').strip()[-240:]}")
+                return fail("init", f"{'this' if init_this else 'previous'} init: "
+                                    f"{(init.stderr or '').strip()[-240:]}")
             # Harness isolation only: init writes fixed prefixes and a fixed PG slot name,
             # shared by every run on the stand.
             cfg = d / "c.yaml"
@@ -415,14 +476,20 @@ def cdc_load_leg(led: Ledger, prev: Path, root: Path, engine: str, url: str, tz:
             if [ln for ln in body.splitlines() if "prefix:" in ln and pfx not in ln] or (
                     src.slot and f"slot: {src.slot}" not in body):
                 return fail("init", "a prefix or slot the harness could not isolate: " + body[:400])
-            if src.anchor_first:
+            if init_this:
+                chk = step(initer, "check", "-c", "c.yaml")
+                if not chk.ok:
+                    return fail("check", f"this binary refuses its own init's config: {_why(chk)}")
+            if init_this and engine == "oracle":
+                return _oracle_no_load(led, name, fail, step, body, bucket, pfx, tables, src, d)
+            if anchor_first:
                 # init's own advice for a changes-only stream: anchor first, then the rows arrive.
                 a = step(prev, "run", "-c", "c.yaml")
                 if not a.ok:
                     return fail("anchor", f"prev {_why(a)}")
                 if not all(src.apply(t, _ops(k, 0)) for k, t in enumerate(tables)):
                     return fail("seed", "the seed rows failed")
-            cycles = [(prev, 0), (prev, 1), (prev, 2), (rivet_bin(), 3), (rivet_bin(), 4)]
+            cycles = [(initer, 0), (initer, 1), (initer, 2), (rivet_bin(), 3), (rivet_bin(), 4)]
             for n, (binary, delta) in enumerate(cycles, 1):
                 who = "prev" if binary == prev else "this"
                 if delta and not all(src.apply(t, _ops(k, delta)) for k, t in enumerate(tables)):
@@ -454,14 +521,15 @@ def cdc_load_leg(led: Ledger, prev: Path, root: Path, engine: str, url: str, tz:
                         return bad, o.scalar(
                             f"SELECT IFNULL(string_agg(column_name, ','), '') FROM bigquery_query('{proj}', "
                             f"'SELECT column_name FROM `{proj}.{dset}.INFORMATION_SCHEMA.COLUMNS` WHERE "
-                            f"table_name = \"{tables[0]}\" AND is_partitioning_column = \"YES\"')")
+                            f"table_name = \"{src.bq_table(tables[0])}\" AND is_partitioning_column = \"YES\"')")
 
                 bad, part = _transport_retry(grade)
                 if bad:
                     return fail(f"cycle{n}", f"after {who}'s compact the base differs from the source — "
                                              + "; ".join(bad)[:600])
-            led.passed(engine, "-", SCEN, "cdc-load", f"{name}: three cycles by the previous release, two "
-                       f"by this binary on its init config; after every compact each of {CDC_TABLES} bases "
+            how = ("five cycles by this binary on its own init config" if init_this else
+                   "three cycles by the previous release, two by this binary on its init config")
+            led.passed(engine, "-", SCEN, "cdc-load", f"{name}: {how}; after every compact each of {CDC_TABLES} bases "
                        f"equals the source instant by value, deletes flagged, no duplicate key, no buffer left "
                        f"(partition column: {part or 'none'}{f'; zone: {src.tz_note}' if tz else ''})", "cdc-load")
     except duckdb.Error as e:
@@ -495,6 +563,7 @@ def cdc_load_cells(led: Ledger, prev: Path, root: Path) -> None:
         tz = CDC_LOAD_ENGINES[engine][2]
         for z in (None, tz) if tz else (None,):
             cdc_load_leg(subs[i], prev, root, engine, url, z)
+        cdc_load_leg(subs[i], prev, root, engine, url, None, init_this=True)
 
     with ThreadPoolExecutor(max_workers=max(1, len(lanes))) as ex:
         list(ex.map(lane, range(len(lanes))))
