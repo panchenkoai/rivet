@@ -191,6 +191,11 @@ impl Case {
         envs: &[(&str, &str)],
         opts: &Opts,
     ) -> Result<(serde_json::Value, &'static str), String> {
+        if self.is_backfill_recipe(e) {
+            return Err(
+                "load: a `cdc.backfill` recipe is a read recipe, never a load target".into(),
+            );
+        }
         if e.get("tables").is_some() {
             return Err(
                 "load: a multi-table capture loads one table per source table, not graded yet"
@@ -277,6 +282,7 @@ impl Case {
         });
         Ok(serde_json::json!({
             "engine": s(src, "type"),
+            "export": s(e, "name"),
             "url": url,
             "database": url.rsplit('/').next().and_then(|d| d.split('?').next()).unwrap_or(""),
             "table": s(e, "table"),
@@ -338,6 +344,38 @@ impl Case {
             );
         }
         Ok(())
+    }
+
+    /// Whether a batch export is some CDC export's `backfill:` baseline (named, or paired by table), which `rivet load` never loads.
+    fn is_backfill_recipe(&self, e: &Value) -> bool {
+        let leaf = |t: &str| t.rsplit('.').next().unwrap_or(t).to_lowercase();
+        let (Some(name), Some(table)) = (s(e, "name"), s(e, "table")) else {
+            return false;
+        };
+        s(e, "mode") != Some("cdc")
+            && self
+                .cfg
+                .get("exports")
+                .and_then(Value::as_sequence)
+                .into_iter()
+                .flatten()
+                .filter(|c| s(c, "mode") == Some("cdc"))
+                .filter_map(|c| Some((c, c.get("cdc")?.get("backfill")?)))
+                .any(|(c, spec)| {
+                    let captured: Vec<String> = s(c, "table")
+                        .into_iter()
+                        .map(str::to_string)
+                        .chain(
+                            c.get("tables")
+                                .and_then(Value::as_sequence)
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|t| t.as_str().map(str::to_string)),
+                        )
+                        .collect();
+                    yaml_text(Some(spec)).contains(name)
+                        || captured.iter().any(|t| leaf(t) == leaf(table))
+                })
     }
 
     /// Whether each run delivers only what changed since the last (incremental, keyset-incremental, Mongo resume).
