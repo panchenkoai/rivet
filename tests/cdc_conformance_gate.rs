@@ -847,7 +847,9 @@ const PIN_SELF_COUNTER: usize = 6;
 // 2026-09-30: -1 presence — the MySQL full_type_matrix cell (ArrayData CDC==batch), replaced by the
 // ledger-generated cell, which grades the same types independently.
 // 2026-10-01: +1 presence — the MySQL partition-move refusal, whose oracle is the refusal twice plus the unchanged base row.
-const PIN_PRESENCE: usize = 81;
+// 2026-10-01: +1 presence — the Oracle anchor-under-concurrent-commits cell, whose oracle is the anchor's
+// low-water SCN being non-zero and every resume from it succeeding.
+const PIN_PRESENCE: usize = 82;
 
 /// TIER 2 (harness audit, 2026-08-29): a test whose NAME makes a
 /// COMPLETENESS claim must carry a class-(a) INDEPENDENT oracle — not merely

@@ -321,6 +321,53 @@ fn roast_oracle_cdc_large_transaction_is_atomic_across_a_mid_flush_crash() {
     );
 }
 
+/// An anchor pinned while other sessions commit records a real low-water SCN, never 0.
+#[test]
+#[ignore = "live: requires the oracle service with LogMiner prerequisites"]
+fn oracle_cdc_anchor_under_concurrent_commits_never_records_low_water_zero() {
+    let _serial = cross_process_serial("oracle_cdc");
+    let d = tempfile::tempdir().unwrap();
+    let t = cdc_table("ora_clw", "id NUMBER(18) PRIMARY KEY");
+    let churn = OracleTable::create("ora_clw_churn", "id NUMBER(18)");
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let loaders: Vec<_> = (0..6)
+        .map(|_| {
+            let sql = format!(
+                "BEGIN FOR i IN 1..500 LOOP INSERT INTO {} VALUES (i); COMMIT; END LOOP; END;",
+                churn.name()
+            );
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let conn = ora_conn();
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    conn.execute(&sql, &[]).unwrap();
+                }
+            })
+        })
+        .collect();
+    let low_waters: Vec<String> = (0..5)
+        .map(|i| {
+            let ckpt = d.path().join(format!("cdc{i}.ckpt"));
+            rig(&t, &ckpt, &d.path().join(format!("out{i}"))).run_ok();
+            let v: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&ckpt).unwrap()).unwrap();
+            v["low_water"].as_str().unwrap().to_string()
+        })
+        .collect();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    for l in loaders {
+        l.join().unwrap();
+    }
+    assert!(
+        !low_waters.iter().any(|l| l == "0"),
+        "a transaction with no start SCN yet must not pin the anchor at SCN 0: {low_waters:?}"
+    );
+    for i in 0..5 {
+        let ckpt = d.path().join(format!("cdc{i}.ckpt"));
+        rig(&t, &ckpt, &d.path().join(format!("resume{i}"))).run_ok();
+    }
+}
+
 #[test]
 #[ignore = "live: requires the oracle service with LogMiner prerequisites"]
 fn oracle_cdc_update_and_delete_carry_full_types() {
