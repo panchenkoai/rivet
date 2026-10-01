@@ -966,6 +966,90 @@ impl crate::source::value_checksum::CellSource for MssqlCellSource<'_> {
 mod tests {
     use super::*;
 
+    /// Two text columns: an nvarchar, and a sql_variant holding an int then NULL.
+    fn text_rows() -> Vec<Row> {
+        let row = |s: &str, v: ColumnData<'static>| {
+            Row::builder()
+                .column(
+                    "s",
+                    ColumnType::NVarchar,
+                    ColumnData::String(Some(s.to_string().into())),
+                )
+                .column("v", ColumnType::SSVariant, v)
+                .build()
+        };
+        vec![
+            row("h\u{e9}llo", ColumnData::I32(Some(42))),
+            row("", ColumnData::I32(None)),
+        ]
+    }
+
+    fn text_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("s", DataType::Utf8, true),
+            Field::new("v", DataType::Utf8, true),
+        ]))
+    }
+
+    /// nvarchar and sql_variant cells build as text, the variant's NULL stays NULL.
+    #[test]
+    fn text_and_variant_columns_build_and_pass_the_value_checksum() {
+        use arrow::array::{Array, AsArray};
+        let batch = mssql_rows_to_record_batch(&text_schema(), &text_rows(), None).unwrap();
+        let s = batch.column(0).as_string::<i32>();
+        assert_eq!((s.value(0), s.value(1)), ("h\u{e9}llo", ""));
+        let v = batch.column(1).as_string::<i32>();
+        assert_eq!(v.value(0), "42");
+        assert!(v.is_null(1));
+    }
+
+    /// Side A of a text column MISMATCHES an Arrow column whose cell was corrupted.
+    #[test]
+    fn a_corrupted_text_cell_fails_the_value_checksum() {
+        use arrow::array::StringArray;
+
+        use crate::source::value_checksum::{arrow_batch_checksums, source_checksums, verify};
+        let schema = text_schema();
+        let rows = text_rows();
+        let a = source_checksums(&schema, &MssqlCellSource { rows: &rows });
+        let batch = |s: [&str; 2], v: [Option<&str>; 2]| {
+            arrow::record_batch::RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(s.to_vec())),
+                    Arc::new(StringArray::from(v.to_vec())),
+                ],
+            )
+            .unwrap()
+        };
+        let good = batch(["h\u{e9}llo", ""], [Some("42"), None]);
+        verify(&a, &arrow_batch_checksums(&good), &schema).expect("a faithful build matches");
+        for (bad, col) in [
+            (batch(["hello", ""], [Some("42"), None]), "s"),
+            (batch(["h\u{e9}llo", ""], [Some("43"), None]), "v"),
+        ] {
+            let err = verify(&a, &arrow_batch_checksums(&bad), &schema).unwrap_err();
+            assert!(
+                err.to_string().contains(&format!("column '{col}'")),
+                "{err}"
+            );
+        }
+    }
+
+    /// A `string` override on an int column fails naming the column, never a stringified value.
+    #[test]
+    fn a_string_override_on_an_int_column_is_refused() {
+        let rows = [Row::builder()
+            .column("n", ColumnType::Int4, ColumnData::I32(Some(7)))
+            .build()];
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Utf8, true)]));
+        let err = mssql_rows_to_record_batch(&schema, &rows, None).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("column `n` is declared text"),
+            "{err:#}"
+        );
+    }
+
     /// Only sql_variant and CLR UDT columns ride as text; a native text or int column does not.
     #[test]
     fn only_variant_and_udt_columns_render_as_text() {

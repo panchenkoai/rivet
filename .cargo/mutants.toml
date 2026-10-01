@@ -838,8 +838,10 @@ exclude_re = [
     # The text builder's TEXT arm reads a live Row; deleting it fails
     # `full_export_preserves_string_and_null_distinction` (RED-checked 2026-09-30).
     "delete match arm Type::TEXT \\| Type::VARCHAR \\| Type::BPCHAR \\| Type::NAME in build_pg_text_array",
-    # v0.30.0 in-diff triage (2026-10-01). Each body below reads a live driver row
-    # (tokio_postgres / tiberius / oracledb), which no offline test can build. Every
+    # v0.30.0 in-diff triage (2026-10-01). Each body below reads a live driver row or
+    # connection: tokio_postgres::Row and oracledb's Row/Metadata have only pub(crate)
+    # constructors, and the MSSQL bodies need a client. The PgCellSource accessors are
+    # `side_a(pg_cell(row, ..))`, whose pure half `side_a` is unit-tested. Every
     # entry was RED-checked by hand (mutant applied, live test run, file restored):
     # - PgCellSource float32/float64/boolean/binary, None and a constant each:
     #   postgres_batch_and_cdc_deliver_every_ledger_row_alike fails "value checksum
@@ -850,20 +852,13 @@ exclude_re = [
     "replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::boolean -> Option<bool>",
     "replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::binary -> Option<Cow<'_, \\[u8\\]>>",
     "delete match arm Type::INTERVAL in build_pg_text_array",
-    # - MssqlCellSource::utf8 (None, empty): mssql_batch_and_cdc_deliver_every_ledger_row_alike
-    #   fails "value checksum mismatch in column 'c3'" and
-    #   a_batch_export_delivers_sql_variant_and_udt_columns_as_the_source_renders_them in 'v'.
-    "replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::utf8 -> Option<Cow<'_, \\[u8\\]>>",
-    # - mssql build_array's text-rendering guard: `false` fails the sql_variant batch test
-    #   ("is declared text ... sends it as I32"); `true` fails
-    #   mssql_a_string_override_on_an_int_column_is_refused_by_name (checksum mismatch in 'n').
-    # - its NULL guard `c.is_none_or(is_null_cell)`: `false` fails the sql_variant batch test.
-    #   `true` is EQUIVALENT. It differs only for a non-NULL cell cell_text cannot render,
-    #   and none exists: every non-NULL ColumnData variant has an arm, and the only `None`
-    #   inside one is a date outside chrono's +-262,143 years, which SQL Server's
-    #   0001-9999 range (+-14h offset) never reaches. The bail stays as a loud backstop.
-    "replace match guard rows .first\\(\\) .is_some_and\\(.*\\) with (true|false) in build_array",
-    "replace match guard c.is_none_or\\(is_null_cell\\) with (true|false) in build_array",
+    # - mssql build_array's NULL guard `c.is_none_or(is_null_cell)` -> `true` is EQUIVALENT.
+    #   It differs only for a non-NULL cell cell_text cannot render, and none exists: every
+    #   non-NULL ColumnData variant has an arm, and the only `None` inside one is a date
+    #   outside chrono's +-262,143 years, which SQL Server's 0001-9999 range (+-14h offset)
+    #   never reaches. The bail stays as a loud backstop. (`false`, the other guard and
+    #   MssqlCellSource::utf8 are graded offline through tiberius' Row::builder.)
+    "replace match guard c.is_none_or\\(is_null_cell\\) with true in build_array",
     # - MssqlChangeStream::fill -> Ok(()) never drains, so the CDC run polls forever:
     #   mssql_batch_and_cdc_deliver_every_ledger_row_alike and
     #   a_cdc_capture_delivers_sql_variant_and_udt_columns_as_the_source_renders_them
