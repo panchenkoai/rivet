@@ -529,3 +529,71 @@ fn duck_arrow_is_one_postgres_row_at_most() {
     assert_eq!(bad.len(), 2, "{bad:?}");
     assert!(bad[0].starts_with("engines.mysql:") && bad[1].starts_with("engines.postgres:"));
 }
+
+const FIDELITY: &str = "docs/cdc-type-fidelity-matrix.yaml";
+
+/// Every disagreement between the ledger's known_defect rows and the `known_defect:` lists of the CDC fidelity matrix.
+fn fidelity_violations(ledger: &Value, fidelity: &Value) -> Vec<String> {
+    let mut named = BTreeSet::new();
+    let mut bad = Vec::new();
+    for sc in fidelity["scenarios"].as_sequence().into_iter().flatten() {
+        for (engine, cell) in sc.as_mapping().into_iter().flatten() {
+            for n in cell["known_defect"].as_sequence().into_iter().flatten() {
+                let key = format!(
+                    "{}:{}",
+                    engine.as_str().unwrap_or(""),
+                    n.as_str().unwrap_or("")
+                );
+                if !named.insert(key.clone()) {
+                    bad.push(format!("{FIDELITY}: {key} is named in two cells"));
+                }
+            }
+        }
+    }
+    let marked: BTreeSet<String> = keys(ledger, "engines")
+        .iter()
+        .flat_map(|e| {
+            rows(ledger, e)
+                .into_iter()
+                .filter(|(_, r)| !r["known_defect"].is_null())
+                .map(move |(n, _)| format!("{e}:{n}"))
+        })
+        .collect();
+    for k in marked.difference(&named) {
+        bad.push(format!(
+            "{k}: a ledger known_defect no {FIDELITY} cell names"
+        ));
+    }
+    for k in named.difference(&marked) {
+        bad.push(format!(
+            "{k}: {FIDELITY} names a known_defect the ledger does not mark"
+        ));
+    }
+    bad
+}
+
+/// The CDC fidelity matrix parsed from the repo root.
+fn fidelity() -> Value {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(FIDELITY);
+    serde_yaml_ng::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+}
+
+#[test]
+fn the_cdc_fidelity_matrix_names_exactly_the_ledger_known_defects() {
+    let bad = fidelity_violations(&ledger(), &fidelity());
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+#[test]
+fn a_known_defect_fixed_in_the_ledger_only_is_refused() {
+    let mut doc = ledger();
+    row_mut(&mut doc, "mysql", "BOOLEAN")
+        .remove("known_defect")
+        .unwrap();
+    assert_eq!(
+        fidelity_violations(&doc, &fidelity()),
+        [format!(
+            "mysql:BOOLEAN: {FIDELITY} names a known_defect the ledger does not mark"
+        )]
+    );
+}
