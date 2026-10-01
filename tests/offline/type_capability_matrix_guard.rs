@@ -162,6 +162,7 @@ fn row_violations(doc: &Value) -> Vec<String> {
                     let key = key.as_str().unwrap_or("");
                     let cdc_only = [
                         "clickhouse",
+                        "today_clickhouse",
                         "clickhouse_defect",
                         "clickhouse_defect_samples",
                     ]
@@ -184,8 +185,34 @@ fn row_violations(doc: &Value) -> Vec<String> {
                         "{at}: known_defect beside `diverges:` declares today's behaviour, not the ADR target"
                     ));
                 }
+                if !r["known_defect"].is_null() {
+                    match r["today_delivery"].as_str() {
+                        None => bad.push(format!(
+                            "{at}: known_defect needs `today_delivery:`, the type rivet ships today"
+                        )),
+                        Some(t) if !valid_delivery(t) => bad.push(format!(
+                            "{at}: today_delivery `{t}` is no Arrow type, canonical extension or TextForm label"
+                        )),
+                        _ => {}
+                    }
+                }
+                if (!r["known_defect"].is_null() || !r["clickhouse_defect"].is_null())
+                    && !r["clickhouse"].is_null()
+                    && r["today_clickhouse"].is_null()
+                {
+                    bad.push(format!(
+                        "{at}: a marked row with a ClickHouse type needs `today_clickhouse:`"
+                    ));
+                }
+                if !r["today_clickhouse"].is_null()
+                    && r["known_defect"].is_null()
+                    && r["clickhouse_defect"].is_null()
+                {
+                    bad.push(format!("{at}: `today_clickhouse:` belongs beside a marker"));
+                }
                 for (key, marker) in [
                     ("today_render", "known_defect"),
+                    ("today_delivery", "known_defect"),
                     ("defect_samples", "known_defect"),
                     ("clickhouse_defect_samples", "clickhouse_defect"),
                 ] {
@@ -247,6 +274,7 @@ fn row_violations(doc: &Value) -> Vec<String> {
                 "override",
                 "render",
                 "known_defect",
+                "today_delivery",
                 "today_render",
                 "defect_samples",
                 "batch_refuses",
@@ -350,7 +378,7 @@ const KNOWN_DEFECTS: [&str; 41] = [
 ];
 
 /// The fields a ledger row may carry (`clickhouse*` on cdc rows only).
-const ROW_KEYS: [&str; 13] = [
+const ROW_KEYS: [&str; 15] = [
     "native_type",
     "sample",
     "delivery",
@@ -359,8 +387,10 @@ const ROW_KEYS: [&str; 13] = [
     "diverges",
     "known_defect",
     "today_render",
+    "today_delivery",
     "defect_samples",
     "clickhouse",
+    "today_clickhouse",
     "clickhouse_defect",
     "clickhouse_defect_samples",
     "batch_refuses",
@@ -495,4 +525,23 @@ fn the_oracle_cdc_type_table_is_covered_by_ledger_rows() {
         missing.is_empty(),
         "live_cdc_oracledb.rs::type_table uses types with no oracle ledger row: {missing:?}"
     );
+}
+
+#[test]
+fn a_known_defect_without_today_delivery_is_refused() {
+    let mut doc = ledger();
+    let row = doc["engines"]["mysql"]["cdc"]
+        .as_sequence_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|r| r["native_type"] == "BOOLEAN")
+        .unwrap()
+        .as_mapping_mut()
+        .unwrap();
+    row.remove("today_delivery").unwrap();
+    row.remove("today_clickhouse").unwrap();
+    let bad = row_violations(&doc);
+    for want in ["needs `today_delivery:`", "needs `today_clickhouse:`"] {
+        assert!(bad.iter().any(|b| b.contains(want)), "{want}: {bad:?}");
+    }
 }

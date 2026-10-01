@@ -33,10 +33,14 @@ struct Row {
     diverges: Option<String>,
     /// Why rivet misses this row's ADR target today; the row must keep failing until the named step fixes it.
     known_defect: Option<String>,
+    /// Beside a known_defect: the delivery rivet ships today (the driver fails on any third type).
+    today_delivery: Option<String>,
     /// Samples (`NULL` for a NULL cell) whose value differs from the source today: a known_defect's value class.
     defect_samples: Vec<String>,
     /// The ClickHouse column type `rivet load` builds for this row (cdc rows).
     clickhouse: Option<String>,
+    /// Beside a marker: the ClickHouse type `rivet load` builds today.
+    today_clickhouse: Option<String>,
     /// Like `known_defect`, for the ClickHouse stage alone.
     clickhouse_defect: Option<String>,
     /// Like `defect_samples`, for the ClickHouse stage alone.
@@ -92,6 +96,8 @@ fn ledger(engine: &str) -> Ledger {
                 }),
                 diverges: s(&r["diverges"]),
                 known_defect: s(&r["known_defect"]),
+                today_delivery: s(&r["today_delivery"]),
+                today_clickhouse: s(&r["today_clickhouse"]),
                 defect_samples: list(&r["defect_samples"]),
                 clickhouse: s(&r["clickhouse"]),
                 clickhouse_defect: s(&r["clickhouse_defect"]),
@@ -862,14 +868,16 @@ fn grade_column(what: &str, b: &Row, c: &Row, seen: &Seen) -> Vec<String> {
         } else {
             &b.delivery
         };
-        if got != want {
-            if kd {
-                kd_hits += 1;
-            } else {
-                bad.push(format!(
-                    "{what}: {mode} delivers `{got}`, the ledger says `{want}`"
-                ));
-            }
+        if got == want {
+            continue;
+        }
+        if kd && Some(got) == b.today_delivery.as_ref() {
+            kd_hits += 1;
+        } else {
+            bad.push(format!(
+                "{what}: {mode} delivers `{got}`, the ledger says `{want}` (today {:?})",
+                b.today_delivery
+            ));
         }
     }
     for (leg, lit, id, got, src) in &seen.values {
@@ -889,14 +897,15 @@ fn grade_column(what: &str, b: &Row, c: &Row, seen: &Seen) -> Vec<String> {
     if let Some(got) = &seen.clickhouse
         && *got != c.clickhouse
     {
-        if kd {
+        let today = *got == c.today_clickhouse;
+        if kd && today {
             kd_hits += 1;
-        } else if chd {
+        } else if chd && today {
             ch_hits += 1;
         } else {
             bad.push(format!(
-                "{what}: ClickHouse holds `{got:?}`, the ledger says `{:?}`",
-                c.clickhouse
+                "{what}: ClickHouse holds `{got:?}`, the ledger says `{:?}` (today {:?})",
+                c.clickhouse, c.today_clickhouse
             ));
         }
     }
@@ -935,6 +944,8 @@ fn graded_row(delivery: &str) -> Row {
         render: Render::default(),
         diverges: None,
         known_defect: None,
+        today_delivery: None,
+        today_clickhouse: None,
         defect_samples: Vec::new(),
         clickhouse: None,
         clickhouse_defect: None,
@@ -951,11 +962,13 @@ fn grade_column_excuses_only_the_declared_defect_class_and_flags_stale_markers()
     };
     let kd = Row {
         known_defect: s("ADR-0038 step"),
+        today_delivery: s("Boolean"),
         defect_samples: vec!["5".into(), "-1".into()],
         ..graded_row("Int8")
     };
     let chd = Row {
         clickhouse: s("Array(Nullable(String))"),
+        today_clickhouse: s("Array(Nullable(String))"),
         clickhouse_defect: s("ADR-0038 step"),
         clickhouse_defect_samples: vec!["NULL".into()],
         ..graded_row("List(Utf8)")
@@ -1024,6 +1037,37 @@ fn grade_column_excuses_only_the_declared_defect_class_and_flags_stale_markers()
                 ..Seen::default()
             },
             vec!["c0 T: defect sample `-1` now matches the source — drop it from the ledger"],
+        ),
+        (
+            "a delivery that is neither the target nor today's",
+            &kd,
+            Seen {
+                types: vec![
+                    ("batch", "Boolean".to_string()),
+                    ("cdc stream", "Utf8".to_string()),
+                ],
+                values: vec![
+                    value("batch", "5", "1", "5"),
+                    value("batch", "-1", "1", "-1"),
+                ],
+                ..Seen::default()
+            },
+            vec![
+                "c0 T: cdc stream delivers `Utf8`, the ledger says `Int8` (today Some(\"Boolean\"))",
+            ],
+        ),
+        (
+            "a ClickHouse type that is neither the target nor today's",
+            &chd,
+            Seen {
+                values: vec![value("ClickHouse", "NULL", "[]", "NULL")],
+                clickhouse: Some(s("Nullable(String)")),
+                ..Seen::default()
+            },
+            vec![
+                "c0 T: ClickHouse holds `Some(\"Nullable(String)\")`, the ledger says \
+                 `Some(\"Array(Nullable(String))\")` (today Some(\"Array(Nullable(String))\"))",
+            ],
         ),
     ];
     for (name, row, seen, want) in cases {
@@ -1687,10 +1731,10 @@ fn duckdb_refused_verdict(
             ));
         }
         let d = delivered(&cs, col);
-        if d != c.delivery && d != "server_text" {
+        if d != c.delivery && Some(&d) != c.today_delivery.as_ref() {
             bad.push(format!(
-                "{what}: cdc delivers `{d}`, neither the target `{}` nor today's server_text",
-                c.delivery
+                "{what}: cdc delivers `{d}`, neither the target `{}` nor today's {:?}",
+                c.delivery, c.today_delivery
             ));
         }
         for (id, row) in &got {
