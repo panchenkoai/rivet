@@ -247,6 +247,15 @@ impl Scns {
                 .and_then(|s| s.parse::<u64>().ok())
         };
         match (get("low_water"), get("commit_scn")) {
+            (Some(0), Some(_)) => crate::rivet_bail!(
+                crate::error::codes::SOURCE_CDC_CHECKPOINT_INVALID,
+                "oracle cdc: checkpoint '{path}' records a low-water SCN of 0. A rivet release \
+                 up to 0.30 wrote that when it read a transaction whose START_SCN was not \
+                 assigned yet: it is not a redo position, and no change was lost to log \
+                 retention. The true low-water is unknown, so resuming from any other SCN could \
+                 skip a long transaction's early changes. {}",
+                crate::source::cdc::checkpoint_identity::RECOVER
+            ),
             (Some(low_water), Some(commit_scn)) if low_water <= commit_scn => Ok(Self {
                 low_water,
                 commit_scn,
@@ -1479,6 +1488,28 @@ mod tests {
             identity_verdict(None, &server),
             IdentityVerdict::Unverifiable(_)
         ));
+    }
+
+    /// A 0.30 checkpoint with low-water 0 is refused as such, with the anchor-first remedy, never as LOST.
+    #[test]
+    fn a_low_water_of_zero_is_refused_as_a_release_defect_not_as_lost_changes() {
+        let pos = Position(serde_json::json!({"low_water": "0", "commit_scn": "9"}));
+        let err = Scns::from_position(&pos, "ck").unwrap_err().to_string();
+        assert!(err.contains("records a low-water SCN of 0"), "{err}");
+        assert!(err.contains("no change was lost to log retention"), "{err}");
+        assert!(!err.contains("LOST"), "{err}");
+        assert!(
+            err.ends_with(crate::source::cdc::checkpoint_identity::RECOVER),
+            "{err}"
+        );
+        let one = Position(serde_json::json!({"low_water": "1", "commit_scn": "9"}));
+        assert_eq!(
+            Scns::from_position(&one, "ck").unwrap(),
+            Scns {
+                low_water: 1,
+                commit_scn: 9
+            }
+        );
     }
 
     #[test]

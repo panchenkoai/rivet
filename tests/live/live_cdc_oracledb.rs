@@ -368,6 +368,29 @@ fn oracle_cdc_anchor_under_concurrent_commits_never_records_low_water_zero() {
     }
 }
 
+/// A checkpoint whose low-water is 0, as rivet 0.30 could write it, is refused as that defect, never as LOST.
+#[test]
+#[ignore = "live: requires the oracle service with LogMiner prerequisites"]
+fn oracle_cdc_a_0_30_low_water_zero_checkpoint_is_refused_precisely_not_as_lost() {
+    let _serial = cross_process_serial("oracle_cdc");
+    let d = tempfile::tempdir().unwrap();
+    let t = cdc_table("ora_clw0", "id NUMBER(18) PRIMARY KEY");
+    let ckpt = d.path().join("cdc.ckpt");
+    rig(&t, &ckpt, &d.path().join("anchor")).run_ok();
+    let mut v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&ckpt).unwrap()).unwrap();
+    v["low_water"] = "0".into();
+    std::fs::write(&ckpt, v.to_string()).unwrap();
+    ora_exec(&format!("INSERT INTO {} VALUES (1)", t.name()));
+    let err = rig(&t, &ckpt, &d.path().join("out")).run_expect_fail();
+    assert!(err.contains("records a low-water SCN of 0"), "{err}");
+    assert!(
+        err.contains("anchors afresh FIRST, then re-snapshot"),
+        "{err}"
+    );
+    assert!(!err.contains("LOST"), "{err}");
+}
+
 #[test]
 #[ignore = "live: requires the oracle service with LogMiner prerequisites"]
 fn oracle_cdc_update_and_delete_carry_full_types() {
