@@ -392,6 +392,8 @@ def _source(ora, spec: dict, renders: dict) -> tuple[str, list[str], dict]:
             "ELSE data_type END AS t FROM all_tab_columns "
             f"WHERE {owner} AND table_name = {_lit(leaf.upper())}",
         )}
+        if not query and not declared:
+            raise LookupError(f"table {table} does not exist (no column in all_tab_columns)")
         by_col = {c: renders.get(f"source:{n}") for c, n in declared.items()}
         sql = query.rstrip().rstrip(";") if query else oracle_table_select(spec["url"], table, {c: e for c, e in by_col.items() if e})
         native = {c: "NUMBER (by value)" for c in _oracle_register(ora, spec["url"], sql, frozenset(c for c, t in declared.items() if t == "JSON"))}
@@ -972,6 +974,9 @@ def delta_window(spec: dict, out_dir: str, graded: list[str]) -> tuple[dict, str
         with open(path) as f:
             record = json.load(f)
     low, col = record["dest"].setdefault(out_dir, [record["high"], record["col"]])
+    if spec.get("consumed"):
+        # The load deletes what it staged (`cleanup_source`): a run's own parts are all that remain, so it owes what came after the previous graded run.
+        low, col = record["high"], record["col"]
     # A bound on another cursor column says nothing about this one (a column switch needs a state reset).
     latest = [w for w in ((_load(out_dir, n).get("source") or {}).get("extraction") or {} for n in graded) if w.get("cursor_column")]
     return record, low if not latest or latest[-1]["cursor_column"] == col else None
@@ -1285,6 +1290,8 @@ def grade_load(spec: dict) -> dict:
                 kind = [r[0] for r in ora.rows(f"SELECT * FROM bigquery_query('bq', {_lit(sql)})")]
                 buffered = kind != ["VIEW"]
                 base = bool(kind)
+                if buffered and not base:
+                    return {"skip": f"`{fq}__changes` holds a base_buffer buffer beside no base table: a base dropped from under the stream cannot be told from rows never loaded"}
                 if not buffered:
                     rel = f"bigquery_query('bq', {_lit(f'SELECT * FROM `{fq}`')})"  # a view has no storage-API read
         if not wh_types and target == "clickhouse":

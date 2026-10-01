@@ -245,30 +245,35 @@ pub fn ensure_azure_container(container: &str) {
 pub fn minio_pull_prefix(bucket: &str, prefix: &str, into: &std::path::Path) -> usize {
     let ls_script = format!(
         "mc alias set local http://127.0.0.1:9000 {MINIO_ACCESS_KEY} {MINIO_SECRET_KEY} >/dev/null 2>&1 && \
-         mc ls --recursive local/{bucket}"
+         mc ls --recursive --json local/{bucket}"
     );
     let ls = Command::new("docker")
         .args(["compose", "exec", "-T", "minio", "sh", "-c", &ls_script])
         .output()
         .expect("mc ls");
-    if !ls.status.success() && String::from_utf8_lossy(&ls.stderr).contains("does not exist") {
-        return 0;
-    }
-    assert!(
-        ls.status.success(),
-        "mc ls local/{bucket} failed: {}",
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&ls.stdout),
         String::from_utf8_lossy(&ls.stderr)
     );
+    if !ls.status.success()
+        && (said.contains("does not exist") || said.contains("bucket is not valid"))
+    {
+        return 0;
+    }
+    assert!(ls.status.success(), "mc ls local/{bucket} failed: {said}");
+    // JSON keys, never whitespace-split text: a key may hold a space.
     let names: Vec<String> = String::from_utf8_lossy(&ls.stdout)
         .lines()
-        .filter_map(|l| l.split_whitespace().last())
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter_map(|v| v["key"].as_str().map(String::from))
         .filter(|n| n.starts_with(prefix))
-        .map(String::from)
         .collect();
     write_pulled(prefix, into, names, false, |name| {
         let cat_script = format!(
             "mc alias set local http://127.0.0.1:9000 {MINIO_ACCESS_KEY} {MINIO_SECRET_KEY} >/dev/null 2>&1 && \
-             mc cat local/{bucket}/{name}"
+             mc cat 'local/{bucket}/{}'",
+            name.replace('\'', "'\\''")
         );
         let cat = Command::new("docker")
             .args(["compose", "exec", "-T", "minio", "sh", "-c", &cat_script])

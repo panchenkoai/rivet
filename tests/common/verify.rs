@@ -303,6 +303,11 @@ impl Case {
                 "ranges": self.replay,
                 "range_column": e.get("chunk_by_days").is_none().then(|| s(e, "chunk_column")).flatten(),
                 "settle": e.get("settle").is_some(),
+                "consumed": ([e.get("load"), self.cfg.get("load")]
+                    .into_iter()
+                    .flatten()
+                    .find_map(|l| l.get("cleanup_source").and_then(Value::as_bool))
+                    == Some(true)),
                 "format": s(e, "format").unwrap_or("parquet"),
                 "stream": self.stream(e)?,
                 "partition_by": s(e, "partition_by"),
