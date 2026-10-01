@@ -1402,3 +1402,64 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod renderer_twins {
+    use super::{cell_text, numeric_to_decimal_string};
+    use crate::types::{decimal_plain, hex_bytes, uuid36};
+    use tiberius::ColumnData;
+
+    #[test]
+    fn numeric_text_matches_decimal_plain() {
+        for (u, s) in [
+            (12345, 2),
+            (-12345, 2),
+            (5, 3),
+            (-5, 3),
+            (150, 2),
+            (0, 0),
+            (0, 3),
+            (42, 0),
+            (-42, 0),
+            (i128::MIN, 0),
+            (i128::MAX, 38),
+            (99_999_999_999_999_999_999_999_999_999_999_999_999, 38),
+        ] {
+            assert_eq!(
+                numeric_to_decimal_string(u, s),
+                decimal_plain(u, s as i8),
+                "({u}, {s})"
+            );
+        }
+    }
+
+    #[test]
+    fn binary_cell_text_matches_hex_bytes() {
+        let all: Vec<u8> = (0..=255).collect();
+        for b in [vec![], vec![0x00], vec![0x0A, 0xFF], all] {
+            let cell = ColumnData::Binary(Some(b.clone().into()));
+            assert_eq!(cell_text(&cell), Some(hex_bytes(&b)));
+        }
+    }
+
+    #[test]
+    fn guid_cell_text_matches_uuid36_but_for_case() {
+        let g = tiberius::Uuid::from_bytes([0xAB; 16]);
+        let cell = ColumnData::Guid(Some(g));
+        assert_eq!(
+            cell_text(&cell).map(|t| t.to_lowercase()),
+            Some(uuid36(g.as_bytes()))
+        );
+    }
+
+    #[test]
+    #[ignore = "ADR-0038 divergence: cell_text renders a GUID upper-case, CP5 fixes Uuid36 lower-case; \
+                unified by the SQL Server step of the migration"]
+    fn guid_cell_text_matches_uuid36() {
+        let g = tiberius::Uuid::from_bytes([0xAB; 16]);
+        assert_eq!(
+            cell_text(&ColumnData::Guid(Some(g))),
+            Some(uuid36(g.as_bytes()))
+        );
+    }
+}

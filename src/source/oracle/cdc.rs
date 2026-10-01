@@ -1576,3 +1576,46 @@ mod tests {
         assert_eq!(event_spelling("ORDERS"), (String::new(), "ORDERS".into()));
     }
 }
+
+#[cfg(test)]
+mod renderer_twins {
+    use super::canonical_number;
+    use crate::types::decimal_plain;
+
+    #[test]
+    fn canonical_number_matches_decimal_plain_without_trailing_zeros() {
+        for (mined, u, s) in [
+            ("123.45", 12345, 2),
+            ("-123.45", -12345, 2),
+            ("-.005", -5, 3),
+            ("42", 42, 0),
+            ("-42", -42, 0),
+            ("0", 0, 0),
+            ("1.2E+4", 12_000, 0),
+            (
+                ".99999999999999999999999999999999999999",
+                99_999_999_999_999_999_999_999_999_999_999_999_999,
+                38,
+            ),
+        ] {
+            assert_eq!(
+                canonical_number(mined),
+                Some(decimal_plain(u, s)),
+                "{mined}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "ADR-0038 divergence: canonical_number trims trailing fraction zeros (1.5, 0), decimal_plain \
+                keeps the column scale (1.50, 0.000); unified by the Oracle step of the migration"]
+    fn canonical_number_keeps_the_scale_like_decimal_plain() {
+        for (mined, u, s) in [("1.50", 150, 2), ("0.000", 0, 3)] {
+            assert_eq!(
+                canonical_number(mined),
+                Some(decimal_plain(u, s)),
+                "{mined}"
+            );
+        }
+    }
+}

@@ -1754,3 +1754,61 @@ mod numeric_string_path_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod renderer_twins {
+    use super::pg_interval_to_iso8601;
+    use crate::types::{iso8601_duration, uuid36};
+
+    /// Inputs on which the PG interval renderer and the canonical one agree.
+    const AGREE: &[(i32, i32, i64)] = &[
+        (0, 0, 0),
+        (14, 3, 14_706_000_001),
+        (-14, 0, 0),
+        (12, 0, 0),
+        (-1, 5, 0),
+        (0, -1, 3_600_000_000),
+        (0, 0, -14_706_000_000),
+        (0, 0, 1),
+        (0, 0, 456_789),
+        (0, 0, 60_000_000),
+        (0, 0, 90_000_000_000),
+        (i32::MAX, i32::MAX, i64::MAX),
+        (i32::MIN, i32::MIN, i64::MIN),
+    ];
+
+    #[test]
+    fn pg_interval_matches_the_canonical_duration() {
+        for &(m, d, us) in AGREE {
+            assert_eq!(
+                pg_interval_to_iso8601(m, d, us),
+                iso8601_duration(m, d, us),
+                "({m}, {d}, {us})"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "ADR-0038 divergence: pg_interval_to_iso8601 keeps six fraction digits (PT0.500000S), \
+                iso8601_duration trims them (PT0.5S); unified by the PostgreSQL step of the migration"]
+    fn pg_interval_fraction_matches_the_canonical_duration() {
+        for &(m, d, us) in &[(0, 0, 500_000), (0, 0, -1_500_000), (14, 3, 14_706_789_000)] {
+            assert_eq!(
+                pg_interval_to_iso8601(m, d, us),
+                iso8601_duration(m, d, us),
+                "({m}, {d}, {us})"
+            );
+        }
+    }
+
+    #[test]
+    fn pg_uuid_text_matches_uuid36() {
+        let mixed = [
+            0x12, 0x3E, 0x45, 0x67, 0xE8, 0x9B, 0x12, 0xD3, 0xA4, 0x56, 0x42, 0x66, 0x14, 0x17,
+            0x40, 0x00,
+        ];
+        for b in [[0u8; 16], [0xFF; 16], mixed] {
+            assert_eq!(uuid::Uuid::from_bytes(b).to_string(), uuid36(&b));
+        }
+    }
+}
