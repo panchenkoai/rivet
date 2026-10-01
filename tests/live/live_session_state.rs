@@ -320,10 +320,12 @@ fn mysql_incremental_on_a_timestamp_cursor_reads_each_row_once_under_a_tokyo_ser
     assert_eq!(declared_rows(&rig), (450, 450), "both runs: every row once");
 }
 
+#[cfg(feature = "oracle")]
 /// An Oracle login whose every session opens in Asia/Tokyo with day-first NLS masks and a
 /// comma decimal separator (an AFTER LOGON trigger); trigger and user dropped on Drop.
 struct OddOracleUser(String);
 
+#[cfg(feature = "oracle")]
 impl OddOracleUser {
     const PASSWORD: &'static str = "Odd_passw0rd1";
 
@@ -359,6 +361,7 @@ impl OddOracleUser {
     }
 }
 
+#[cfg(feature = "oracle")]
 impl Drop for OddOracleUser {
     fn drop(&mut self) {
         let _ = std::panic::catch_unwind(|| {
@@ -369,6 +372,7 @@ impl Drop for OddOracleUser {
     }
 }
 
+#[cfg(feature = "oracle")]
 /// Insert `(ID, TS)` rows `lo..=hi`, `TS` = 2024-01-01 00:00:00.5 UTC + id minutes.
 fn oracle_ts_rows(t: &str, lo: i64, hi: i64) {
     ora_exec(&format!(
@@ -379,6 +383,7 @@ fn oracle_ts_rows(t: &str, lo: i64, hi: i64) {
     ));
 }
 
+#[cfg(feature = "oracle")]
 /// An Oracle login in Asia/Tokyo with day-first NLS masks: an incremental TIMESTAMP WITH TIME
 /// ZONE cursor reads each row once across runs; the rig's default oracle grades the values.
 #[test]
