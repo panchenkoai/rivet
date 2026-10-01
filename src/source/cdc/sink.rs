@@ -58,6 +58,8 @@ pub(crate) struct TableOutput<'a> {
     /// Keep each part within this many distinct partitions and note the count in its
     /// footer; `None` when the change log is not partitioned.
     pub partition: Option<crate::plan::rollover::PartitionRollover>,
+    /// The partition key a change must not move (base-and-buffer layout only).
+    pub partition_guard: Option<super::partition_guard::PartitionGuard>,
     /// Columns this table's `columns:` overrides name; a refused cell of one is an override mismatch.
     pub overridden: std::collections::HashSet<String>,
 }
@@ -542,6 +544,9 @@ pub(crate) fn run_to_files(
                     // Confirmed routed to a captured table → surface any deferred
                     // decode error (uncaptured tables' poison never applies).
                     ev.raise_poison()?;
+                    if let Some(g) = &sink.out.partition_guard {
+                        super::partition_guard::check(&ev, g, &sink.out.columns, cfg.engine)?;
+                    }
                     // TWO units on purpose: the rollover budget wants RESIDENT
                     // cost (what the buffer actually holds), the bytes-read metric
                     // wants DECODED payload (comparable with the batch path's
@@ -2555,6 +2560,7 @@ mod tests {
                             dest_uri: String::new(),
                             row_hash: crate::config::RowHash::All(false),
                             partition: None,
+                            partition_guard: None,
                             overridden: Default::default(),
                         },
                         TableOutput {
@@ -2564,6 +2570,7 @@ mod tests {
                             dest_uri: String::new(),
                             row_hash: crate::config::RowHash::All(false),
                             partition: None,
+                            partition_guard: None,
                             overridden: Default::default(),
                         },
                     ],
@@ -3000,6 +3007,7 @@ mod tests {
                 dest_uri: String::new(),
                 row_hash: crate::config::RowHash::All(false),
                 partition: None,
+                partition_guard: None,
                 overridden: Default::default(),
             }],
             engine: crate::source::cdc::CdcEngine::Mysql,
@@ -3096,6 +3104,7 @@ mod tests {
                 dest_uri: String::new(),
                 row_hash: crate::config::RowHash::All(false),
                 partition: None,
+                partition_guard: None,
                 overridden: Default::default(),
             }
         }
@@ -3236,6 +3245,7 @@ mod tests {
                 dest_uri: String::new(),
                 row_hash: crate::config::RowHash::All(false),
                 partition: None,
+                partition_guard: None,
                 overridden: Default::default(),
             })
             .collect()
@@ -3945,6 +3955,7 @@ mod tests {
                     dest_uri: "a".into(),
                     row_hash: crate::config::RowHash::All(false),
                     partition: None,
+                    partition_guard: None,
                     overridden: Default::default(),
                 },
                 TableOutput {
@@ -3954,6 +3965,7 @@ mod tests {
                     dest_uri: "b".into(),
                     row_hash: crate::config::RowHash::All(false),
                     partition: None,
+                    partition_guard: None,
                     overridden: Default::default(),
                 },
             ],
@@ -4120,6 +4132,53 @@ mod tests {
                 partial_write_risk: false,
             }
         }
+    }
+
+    /// An UPDATE that moves its row to another partition of a base-and-buffer table fails
+    /// the run before any part is written, the checkpoint persisted or the source acked.
+    #[test]
+    fn a_change_that_moves_its_partition_fails_the_run_before_any_part() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let ckpt = dir.path().join("cdc.ckpt");
+        let cols = int_col();
+        let update = |b: i64, a: i64| ChangeEvent {
+            op: ChangeOp::Update,
+            before: Some(vec![RivetValue::Int(b)]),
+            ..insert(a)
+        };
+        let mut stream = FakeStream {
+            events: VecDeque::from(vec![insert(1), update(1, 9), update(9, 15)]),
+            acked: Vec::new(),
+        };
+        let dest = local_dest(&out);
+        let mut c = cfg(dest.as_ref(), &cols, FormatType::Parquet, 10);
+        c.checkpoint = Some(ckpt.clone());
+        c.outputs[0].partition_guard = Some(super::super::partition_guard::PartitionGuard {
+            column: "v".into(),
+            unit: super::super::partition_guard::GuardUnit::Range {
+                start: 0,
+                end: 100,
+                interval: 10,
+            },
+        });
+
+        let res = run_to_files(&mut stream, c);
+
+        let err = res.1.expect_err("9 -> 15 crosses a range partition");
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some("RIVET_CDC_PARTITION_MOVED"),
+            "{err:#}"
+        );
+        let written: Vec<_> = std::fs::read_dir(out.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        assert!(written.is_empty(), "no part may be written: {written:?}");
+        assert!(stream.acked.is_empty(), "the source must not be acked");
+        assert!(!ckpt.exists(), "the checkpoint must not move");
     }
 
     #[test]
