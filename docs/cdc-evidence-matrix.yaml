@@ -204,21 +204,21 @@ shapes:
       The stand must exercise the configuration an untuned production server has. A stand
       pinned to a non-default makes the majority code path unreachable by every test.
     mutant: >
-      Reverse the positional index at sink.rs:755 (the nameless arm). Only a MINIMAL
-      -metadata target can see it.
+      Re-enable the open-time warn path (row_metadata_refusal -> None) or drop the per-event
+      nameless refusal in MysqlChangeStream::fill. Only a MINIMAL-metadata server can see it.
     postgres: { na: "test_decoding output is not configuration-dependent in this sense; the
         session-state class it DOES have (timezone/datestyle/bytea_output) is pinned on the
         reader's own connection and has its own non-default test" }
     mysql:
       sound: >-
-        closed 2026-08-25. docker-compose pins --binlog-row-metadata=FULL while MySQL's
-        own default is MINIMAL, so every live MySQL CDC test ran the by-NAME arm and the
-        positional arm plus its arity guard were unreachable. Two live tests now flip the
-        GLOBAL under a reset guard (`RowMetadata`, live_cdc.rs): under MINIMAL a same-arity
-        `MODIFY .. AFTER` across the resume boundary SWAPS the columns (measured a='BBB'
-        b='AAA', status success) and the run must warn; under FULL the same reorder maps
-        by name and the run must stay quiet. RED-proven both directions against
-        `row_metadata_warning` (always-None and always-Some).
+        MySQL's own default is binlog_row_metadata=MINIMAL, and rivet refuses it rather than
+        map values by position. The :3307 stand pins FULL; the MINIMAL default is exercised on
+        the isolated :3306 server under quiet_window_guard with a restore guard (`RowMetadata`,
+        live_cdc.rs): mysql_cdc_refuses_minimal_row_metadata_at_open (refused, no anchor
+        pinned, no part, ledger failed) and
+        mysql_cdc_refuses_a_minimal_backlog_after_the_server_is_switched_to_full (refused
+        naming the table and binlog position, checkpoint unmoved, no part). RED-proven against
+        both mutants above.
     mssql:    { na: "change tables carry a fixed column set from the capture instance; there is
         no server knob that changes the image shape the reader sees" }
     mongo:

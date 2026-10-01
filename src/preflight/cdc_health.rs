@@ -458,10 +458,22 @@ fn mysql_binlog_config_verdict(vars: &[(String, String)]) -> DoctorCheck {
             Some("SET GLOBAL binlog_row_image=FULL".into()),
         );
     }
+    if let Some(why) = crate::source::mysql::cdc::MysqlChangeStream::row_metadata_refusal(get(
+        "binlog_row_metadata",
+    )) {
+        return check(
+            name,
+            false,
+            Some(why),
+            Some("SET PERSIST binlog_row_metadata = FULL;".into()),
+        );
+    }
     check(
         name,
         true,
-        Some("log_bin=ON, binlog_format=ROW, binlog_row_image=FULL".into()),
+        Some(
+            "log_bin=ON, binlog_format=ROW, binlog_row_image=FULL, binlog_row_metadata=FULL".into(),
+        ),
         None,
     )
 }
@@ -541,7 +553,7 @@ fn mysql_checks(
 
     let vars: Vec<(String, String)> = conn.query(
         "SHOW GLOBAL VARIABLES WHERE Variable_name IN \
-         ('log_bin','binlog_format','binlog_row_image')",
+         ('log_bin','binlog_format','binlog_row_image','binlog_row_metadata')",
     )?;
     checks.push(mysql_binlog_config_verdict(&vars));
     // Binlog OFF ⇒ stop here. The retention probe below (`SHOW BINARY LOGS`) fails
@@ -1167,6 +1179,7 @@ mod tests {
             ("log_bin".into(), "ON".into()),
             ("binlog_format".into(), format.into()),
             ("binlog_row_image".into(), image.into()),
+            ("binlog_row_metadata".into(), "FULL".into()),
         ]
     }
 
@@ -1208,6 +1221,27 @@ mod tests {
         assert!(stmt.detail.unwrap().contains("STATEMENT"));
         let minimal = mysql_binlog_config_verdict(&vars("ROW", "MINIMAL"));
         assert!(!minimal.ok, "MINIMAL breaks the after-image / MERGE shape");
+    }
+
+    /// `binlog_row_metadata` other than FULL (or absent) fails the doctor, as it refuses the run.
+    #[test]
+    fn mysql_binlog_config_fails_on_row_metadata_other_than_full() {
+        let with_meta = |m: Option<&str>| {
+            let mut v = vars("ROW", "FULL");
+            v.retain(|(n, _)| n != "binlog_row_metadata");
+            v.extend(m.map(|m| ("binlog_row_metadata".to_string(), m.to_string())));
+            mysql_binlog_config_verdict(&v)
+        };
+        assert!(with_meta(Some("FULL")).ok);
+        for m in [Some("MINIMAL"), None] {
+            let verdict = with_meta(m);
+            assert!(!verdict.ok, "{m:?} must fail the doctor");
+            assert!(verdict.detail.unwrap().contains("binlog_row_metadata"));
+            assert_eq!(
+                verdict.hint.as_deref(),
+                Some("SET PERSIST binlog_row_metadata = FULL;")
+            );
+        }
     }
 
     #[test]

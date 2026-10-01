@@ -298,13 +298,8 @@ services:
       # writer pools + gremlins + grant tests) — same environment-ceiling
       # class as PG max_replication_slots.
       - "--max-connections=400"
-      # FULL puts column NAMES into TABLE_MAP optional metadata (8.0.1+) —
-      # the sink then maps binlog images BY NAME, closing the positional
-      # class on MySQL. MySQL's OWN default is MINIMAL, so this pin makes the
-      # stack UNLIKE a default deployment: two live tests flip the global back
-      # to MINIMAL under a reset guard (`RowMetadata`) precisely so the engine
-      # default is not the one configuration nothing exercises. rivet warns at
-      # run start when it sees a non-FULL value — measured swap, not folklore.
+      # FULL puts column NAMES into TABLE_MAP optional metadata (8.0.1+); rivet
+      # refuses MINIMAL (MySQL's own default), which maps values by position.
       - "--binlog-row-metadata=FULL"
     environment:
       MYSQL_ROOT_PASSWORD: rivet
@@ -432,6 +427,7 @@ services:
       - "--server-id=10"
       - "--log-bin=binlog"
       - "--binlog-format=ROW"
+      - "--binlog-row-metadata=FULL" # rivet refuses MINIMAL
       - "--gtid-mode=ON"
       - "--enforce-gtid-consistency=ON"
     environment:
@@ -457,6 +453,7 @@ services:
       - "--server-id=11"
       - "--log-bin=binlog"
       - "--binlog-format=ROW"
+      - "--binlog-row-metadata=FULL" # rivet refuses MINIMAL
       - "--log-replica-updates=ON" # re-log replicated changes into the replica's own binlog
       - "--gtid-mode=ON"
       - "--enforce-gtid-consistency=ON"
@@ -485,6 +482,7 @@ services:
       - "--server-id=12"
       - "--log-bin=binlog"
       - "--binlog-format=ROW"
+      - "--binlog-row-metadata=FULL" # rivet refuses MINIMAL
       - "--log-replica-updates=OFF"
       - "--gtid-mode=ON"
       - "--enforce-gtid-consistency=ON"

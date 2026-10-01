@@ -232,8 +232,7 @@ pub(crate) struct ChangeEvent {
     /// are name-addressable). With names present the sink maps the image BY
     /// NAME into the resolved schema — the positional-mapping corruption
     /// class (findings #37/#41/#42: mid-window DDL shifts, non-first PK
-    /// deletes) is unrepresentable. `None` ⇒ positional full row (MySQL
-    /// binlog carries no names; its arity guard stays load-bearing).
+    /// deletes) is unrepresentable. `None` is refused by the sink, never mapped by position.
     pub(crate) image_names: Option<std::sync::Arc<[String]>>,
     /// Ordinal of this change **within its source transaction** (0-based),
     /// stamped by [`TxnSeq`] as the stream is consumed. `position` alone is the
@@ -506,11 +505,6 @@ pub(crate) trait ChangeStream {
     /// Log this source retains on the reader's behalf, worth saying before the run; only a PostgreSQL slot pins log.
     fn retention_warnings(&mut self) -> Vec<String> {
         Vec::new()
-    }
-
-    /// The cost of mapping change images by position; only MySQL below `binlog_row_metadata=FULL` does.
-    fn positional_mapping_warning(&mut self) -> Option<String> {
-        None
     }
 
     /// Acknowledge that every change up to and including `position` is **durably
@@ -936,26 +930,6 @@ pub(crate) fn native_type_for<'a>(
 }
 
 impl CdcEngine {
-    /// Can this engine's wire format ever map a row image by POSITION rather than
-    /// by column name?
-    ///
-    /// MySQL only, and it is a property of the binlog: `binlog_row_metadata` may
-    /// omit column names, and the events replay whatever was in force when they
-    /// were WRITTEN. PostgreSQL's `test_decoding` names every column, SQL Server's
-    /// change tables are relational, and Mongo's events are documents — none of
-    /// them can produce a nameless image, so `None` there is a FACT and not a TODO.
-    ///
-    /// Extracted from `positional_mapping_warning`'s dispatch, which is live-only
-    /// glue: `-> None` survived, and with it the whole warning disappears on the one
-    /// engine that needs it. The fact now has one home instead of being restated in
-    /// a match arm and a doc comment.
-    pub(crate) fn maps_by_position(self) -> bool {
-        match self {
-            Self::Mysql => true,
-            Self::Postgres | Self::Mssql | Self::Mongo | Self::Oracle => false,
-        }
-    }
-
     /// Does this engine make the SERVER retain log on the reader's behalf?
     ///
     /// PostgreSQL only, and structurally: a replication slot is the one CDC anchor
@@ -1761,14 +1735,6 @@ pub(crate) fn run_capture(
             );
         }
     }
-    // `warn`, at run start, before a single event is read: an operator whose
-    // capture is about to map by position must learn it from the run rather than
-    // from a swapped column months later. `info` would be functionally silent at
-    // the default log level — the same rule the sparse-chunk warning follows.
-    let positional = stream.positional_mapping_warning();
-    if let Some(why) = positional {
-        log::warn!("{} cdc: {why}.", engine.label());
-    }
     let retention = stream.retention_warnings();
     for why in retention {
         log::warn!("{} cdc: {why}.", engine.label());
@@ -2059,72 +2025,22 @@ mod mod_decisions {
         );
     }
 
-    /// Both engine facts, EVERY variant — derived from the enum rather than typed
-    /// in, so a fifth CDC engine cannot arrive without an answer here.
-    ///
-    /// These were `match` arms inside live-only dispatchers, and their mutants
-    /// (`-> None`, `delete match arm`) survived: with `positional_mapping_warning`
-    /// silenced, the one engine that CAN map by position stops warning about it,
-    /// which is the exact class rounds 15-17 spent three rounds on.
+    /// The log-pinning fact, EVERY variant — only a PostgreSQL slot makes the server retain log for the reader.
     #[test]
-    fn every_cdc_engine_answers_both_engine_facts_and_only_one_engine_answers_yes() {
+    fn only_postgres_pins_log_for_the_reader() {
         let all = [
             CdcEngine::Mysql,
             CdcEngine::Postgres,
             CdcEngine::Mssql,
             CdcEngine::Mongo,
+            CdcEngine::Oracle,
         ];
-
-        let positional: Vec<CdcEngine> = all
-            .iter()
-            .copied()
-            .filter(|e| e.maps_by_position())
-            .collect();
-        assert_eq!(
-            positional,
-            vec![CdcEngine::Mysql],
-            "MySQL is the ONLY engine whose wire format can omit column names — \
-             `test_decoding` names every column, SQL Server's change tables are \
-             relational, Mongo's events are documents. Answering `false` for MySQL \
-             silences the warning on the one engine that needs it; answering `true` \
-             elsewhere warns about something those engines cannot do."
-        );
-
         let pinning: Vec<CdcEngine> = all
             .iter()
             .copied()
             .filter(|e| e.pins_log_for_reader())
             .collect();
-        assert_eq!(
-            pinning,
-            vec![CdcEngine::Postgres],
-            "a replication slot is the only anchor that makes the SERVER retain log \
-             until the reader acks — which is why PostgreSQL fills a disk where the \
-             others lose data to retention. Both errors are silent: `false` for PG \
-             drops the WAL-growth warning, `true` elsewhere promises a retention \
-             guarantee those engines do not give."
-        );
-
-        // MUTUALLY EXCLUSIVE, not a partition: SQL Server and MongoDB answer `false`
-        // to both, and that is correct — their logs neither omit column names nor
-        // wait on a reader. What must never happen is ONE engine claiming both,
-        // which would mean a nameless wire format whose retention rivet also owns.
-        for e in all {
-            assert!(
-                !(e.maps_by_position() && e.pins_log_for_reader()),
-                "{e:?} claims both facts. No engine has a nameless image AND a \
-                 reader-pinned log; an engine that did would need the positional \
-                 warning and the WAL-growth warning to agree about the same events, \
-                 and nothing in the sink arranges that."
-            );
-        }
-        assert_eq!(
-            all.iter().filter(|e| e.maps_by_position()).count()
-                + all.iter().filter(|e| e.pins_log_for_reader()).count(),
-            2,
-            "exactly two of the four answer yes to exactly one fact each — a count \
-             that would move the moment either predicate became `true` everywhere"
-        );
+        assert_eq!(pinning, vec![CdcEngine::Postgres]);
     }
 
     /// A stream that resolves no catalog identity must say NOTHING, not a name.

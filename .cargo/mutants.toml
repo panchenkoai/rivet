@@ -519,24 +519,6 @@ exclude_re = [
     # the same test also RED against the list-parse mutant and the un-addressed
     # refusal. MySQL guard disabled -> roast_mysql_cdc_refuses_a_truncate_instead_of_
     # silently_diverging FAILS, and again against the un-addressed variant.
-# `warn_positional_once` (src/source/cdc/sink.rs) is a LOG line and nothing else,
-    # so `-> ()` leaves every value and every count identical — it survives the lib
-    # suite by construction. It is not ungraded: the warning is the product surface
-    # round 15 argued for, and it has a live oracle.
-    #
-    # Live oracle proven by hand 2026-08-27 (mutant applied, live CDC suite run,
-    # reverted): stubbing the body -> roast_mysql_cdc_warns_on_a_minimal_backlog_a_
-    # full_server_would_hide FAILS, 105 pass / 1 fail. That test is the reason the
-    # warning exists — a server at FULL draining a backlog written under MINIMAL maps
-    # by POSITION, and the open-time probe answers about the present.
-    # MEASURED 2026-08-29 and RESTORED — the only one of seven that survived.
-    # Its stub was lifted and run: MISSED, exactly as the reasoning below says
-    # it must be (a log line is output-identical, so no value and no count
-    # changes and the lib suite cannot kill it by construction). Six sibling
-    # exclusions were lifted the same day and every one of THEIR stubs was
-    # caught, so this entry now rests on a measurement rather than on being
-    # unexamined.
-    "replace warn_positional_once with \\(\\)",
     # ── `src/source/cdc/mod.rs` live-only bodies (bucket 3, 2026-08-27) ──────────
     #
     # Three bodies that open a real source, a real destination or both, so a
@@ -565,9 +547,9 @@ exclude_re = [
     # against `--list`; never read a `--list` entry as a finding.
     #
     # The DECISIONS these bodies used to hold have been lifted out and are graded
-    # offline — `maps_by_position`, `pins_log_for_reader`, `tx_cap_from_env`,
+    # offline — `pins_log_for_reader`, `tx_cap_from_env`,
     # `image_name_memo`, `pass_must_roll`, `drain_is_complete`,
-    # `named_image_arity_mismatch`, `positional_image_width_mismatch`. What is left
+    # `named_image_arity_mismatch`. What is left
     # is sequencing, I/O and error context, which is what the exclusion claims and
     # all it claims; `live_only_purity_gate` holds each body at a shrink-only
     # ceiling so a decision cannot quietly move back in.
