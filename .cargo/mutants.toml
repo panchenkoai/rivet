@@ -884,4 +884,13 @@ exclude_re = [
     #   edge_oracle_types_export_losslessly ("unsupported database type DB_TYPE_OBJECT").
     "replace oracle_type_mappings -> Vec<TypeMapping> with vec!\\[\\]",
     "delete field query from struct ExportRequest expression in OracleSource::export_within_budget",
+    # - MssqlSource::export -> Ok(()) writes nothing: mssql_batch_and_cdc_deliver_every_ledger_row_alike
+    #   fails "no parquet part under ..." and the sql_variant batch test finds no file to read.
+    #   MssqlSource::type_mappings -> Ok(vec![]) records no column types, so the ledger test's
+    #   load fails "no column types recorded in the state DB". Oracle native_type stubs
+    #   lose the TIMESTAMP(9) lossy mark: the_type_report_marks_a_timestamp_9_column_lossy
+    #   fails `left: "exact", right: "lossy"`.
+    "replace <impl Source for MssqlSource>::export -> Result<\\(\\)> with Ok\\(\\(\\)\\)",
+    "replace <impl Source for MssqlSource>::type_mappings -> Result<Vec<TypeMapping>> with Ok\\(vec!\\[\\]\\)",
+    "replace native_type -> String with (String::new\\(\\)|.xyzzy.\\.into\\(\\))$",
 ]

@@ -118,6 +118,8 @@ const BASELINE: &[(&str, usize, usize, usize, usize)] = &[
     // statement-timeout arm), not grown by the exclusion; shrink as they are extracted.
     ("src/source/mssql/mod.rs::introspect_mssql_on", 0, 0, 2, 0),
     ("src/source/oracle/mod.rs::export_within_budget", 2, 0, 2, 2),
+    // Excluded 2026-10-01 (its Ok(()) stub only) at its existing decisions; shrink as they are extracted.
+    ("src/source/mssql/mod.rs::export", 3, 1, 2, 5),
     // The Postgres release of a state lease (heartbeat stop + row delete): glue.
     ("src/state/load_lease.rs::drop", 0, 0, 0, 0),
     (
