@@ -925,6 +925,12 @@ def grade_load(spec: dict) -> dict:
             ds = str(load.get("dataset"))
             # One catalog listing (seconds); a BigQuery query job costs ~10 s, a storage read ~2 s and reads tables only.
             tables = {r[0] for r in ora.rows("SELECT table_name FROM duckdb_tables() WHERE database_name = 'bq'")}
+            if leaf not in tables and not ora.scalar(
+                f"SELECT count(*) FROM {_state_table(ora, spec, 'load_run')} "
+                f"WHERE export_name = {_lit(spec['export'])} AND status = 'success' AND rows_loaded > 0"
+            ):
+                # Every success row is a skip ("up to date", 0 rows): nothing was ever loaded, so there is no table to grade.
+                return {"skip": f"no load has written `{fq}` yet (every load row for `{spec['export']}` loaded 0 rows)", "notes": notes}
             rel = f"bq.{ds}.{leaf}" if leaf in tables else f"bigquery_query('bq', {_lit(f'SELECT * FROM `{fq}`')})"
             wh_types = {}
             buffered = f"{leaf}__changes" in tables

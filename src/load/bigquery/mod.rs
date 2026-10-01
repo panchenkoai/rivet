@@ -627,15 +627,30 @@ impl TargetLoader for BigQueryLoader {
         // It must run BEFORE the rename below, which would otherwise fail on the name
         // already existing. Its rows are counted into this run's report: they really
         // were merged now.
+        let merging = format!("{table}__changes__merging");
+        let merging_fqtn = self.fqtn(&merging);
+        let leftover =
+            crate::load::before_write(api.table_metadata(&self.dataset, &merging))?.is_some();
+        // No buffer table → nothing to merge, said so by the report. Metadata, not
+        // a query job: `tables.get` is free and answers the same question. Read
+        // BEFORE the base is touched: a table never loaded (an empty source) has no
+        // base to ALTER, and the field read that as `Not found: Table` every cycle.
+        let buffer = crate::load::before_write(api.table_metadata(&self.dataset, &changes))?;
+        if nothing_to_compact(buffer.is_some(), leftover) {
+            return Ok(crate::load::CompactReport {
+                base,
+                changes_rows: 0,
+                merge_jobs: 0,
+                had_buffer: false,
+            });
+        }
         // A column the source gained reaches the base before any MERGE names it.
         if let Some(alter) = build_alter_add_columns_sql(&base, specs) {
             self.run_sql(&alter, "merge", table)?;
         }
-        let merging = format!("{table}__changes__merging");
-        let merging_fqtn = self.fqtn(&merging);
         let mut recovered_rows = 0u64;
         let mut recovered_jobs = 0usize;
-        if crate::load::before_write(api.table_metadata(&self.dataset, &merging))?.is_some() {
+        if leftover {
             eprintln!(
                 "  note: `{merging_fqtn}` is left over from a compaction that did not complete \
                  (its job died, or its MERGE failed — see that compact's error) — merging it \
@@ -659,10 +674,7 @@ impl TargetLoader for BigQueryLoader {
             recovered_jobs = jobs;
         }
 
-        // No buffer table → nothing to merge, said so by the report. Metadata, not
-        // a query job: `tables.get` is free and answers the same question.
-        let Some(buffer) = crate::load::before_write(api.table_metadata(&self.dataset, &changes))?
-        else {
+        let Some(buffer) = buffer else {
             // Recovered rows count even here: no LIVE buffer, yet this run really did
             // merge a leftover. Reporting zero would print "nothing to merge" over work
             // that just happened, and `had_buffer` follows the recovery for the same
@@ -974,9 +986,11 @@ pub(crate) fn clusterable(target_type: &str) -> bool {
     )
 }
 
-/// Whether a column name is one of rivet's CDC meta columns — filtered out of
-/// the data specs before the meta columns are prepended, so a schema can never
-/// declare `__op`/`__pos`/`__seq` twice.
+/// Whether a compaction has nothing to merge: no live buffer and no leftover of a merge that died.
+fn nothing_to_compact(buffer: bool, leftover: bool) -> bool {
+    !buffer && !leftover
+}
+
 /// The `(changes_rows, merge_jobs)` row the compaction script ends with; an
 /// unreadable row is an error, never a report that reads like an empty buffer.
 fn compact_summary(row: &[Option<String>]) -> Result<(u64, usize)> {

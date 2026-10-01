@@ -675,6 +675,52 @@ fn a_missing_base_refuses_the_compaction_and_keeps_the_buffer() {
     );
 }
 
+/// A table the pilot had from day one: EMPTY at the source. Its baseline writes no
+/// file, so no base is ever loaded and no buffer exists — and `compact` must say the
+/// no-op, not ALTER a base that is not there (field, 2026-10-01: five such tables
+/// failed every cycle with BigQuery's `Not found: Table`, and the cycle's exit code
+/// with them).
+#[test]
+#[ignore = "live: requires mysql-cdc + BigQuery creds"]
+fn a_table_that_was_never_loaded_is_a_said_no_op_for_compact() {
+    let Some(bq) = BqLive::from_env("compact_never") else {
+        return;
+    };
+    let scn = CdcScenario::mysql_with("compact_never", "id BIGINT PRIMARY KEY, v INT", |r, t| {
+        r.cdc("backfill: auto")
+            .also_batch_export("baseline", t, "full")
+            .dest_gcs_live(&bq.bucket, &bq.prefix)
+            .top_line(&bq.load_line(", pk: [id]"))
+    });
+    let table = scn.table.clone();
+    let changes = format!("{table}__changes");
+    let _cleanup = bq.cleanup(&[&table, &changes]);
+
+    scn.settle();
+    scn.rig.run_ok();
+    let said = load_ok(&scn.rig);
+    assert!(
+        said.contains("produced no files"),
+        "fixture: an empty table loads nothing, so no base exists:\n{said}"
+    );
+
+    assert_eq!(
+        bq.read_bq_table_type(&table),
+        None,
+        "fixture: no base was created"
+    );
+
+    let (ok, said) = compact(&scn.rig, &[]);
+    assert!(ok, "compact on a never-loaded table must exit 0:\n{said}");
+    assert!(said.contains("COMPACT SKIP"), "{said}");
+    assert!(!said.contains("Not found: Table"), "{said}");
+    assert_eq!(
+        bq.read_bq_table_type(&table),
+        None,
+        "compact created nothing"
+    );
+}
+
 /// A compaction whose process dies BEFORE its merge job: the buffer must survive
 /// whole, and the next compact applies every change exactly once. The sibling of
 /// the crash-after-merge case — there the script had already dropped the buffer.
