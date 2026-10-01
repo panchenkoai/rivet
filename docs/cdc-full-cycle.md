@@ -54,9 +54,10 @@ load: { target: bigquery, project: my-proj, dataset: my_ds, pk: auto }
   PostgreSQL `public`) scaffolds exactly this shape: one recipe per table — keyset
   where the table has a single-column keysettable key, range or `full` otherwise —
   and one `tables:` stream with `backfill: auto`. A single table, SQL Server,
-  MongoDB or a non-`public` schema get a per-table capture-only stream instead
-  (add `initial: snapshot` or a recipe + `backfill:` yourself). Add the `load:`
-  block and run.
+  MongoDB, Oracle or a non-`public` schema get one stream per table with
+  `initial: snapshot` instead. Pass `--bigquery-project`/`--bigquery-dataset` and
+  init writes the `load:` block too (not for Oracle: its CDC does not load yet,
+  ADR-0037).
 - A stream over several tables rarely shares one partition column or one key.
   Put the per-table layer on the stream's own `load:` block:
   `load: { partition: { column: created_at, granularity: day }, tables: { customers:

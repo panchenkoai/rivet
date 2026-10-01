@@ -124,24 +124,30 @@ def bq_scalar(project: str, sql: str) -> str | None:
     return b["rows"][0]["f"][0]["v"]
 
 
-def gcs_delete_prefix(bucket: str, prefix: str) -> int:
-    """Delete every object under `prefix` (`gcloud storage rm -r`); the count deleted."""
-    host, n, page = "storage.googleapis.com", 0, ""
+def gcs_list(bucket: str, prefix: str) -> list[str]:
+    """Every object name under `prefix`."""
+    names, page = [], ""
     while True:
         q = urllib.parse.urlencode({"prefix": prefix, "fields": "items(name),nextPageToken",
                                     **({"pageToken": page} if page else {})})
-        st, b = _call(host, "GET", f"/storage/v1/b/{bucket}/o?{q}")
+        st, b = _call("storage.googleapis.com", "GET", f"/storage/v1/b/{bucket}/o?{q}")
         if st != 200:
             raise RuntimeError(f"gcs: list gs://{bucket}/{prefix} → {st} {b}")
-        for item in b.get("items", []):
-            name = urllib.parse.quote(item["name"], safe="")
-            dst, db = _call(host, "DELETE", f"/storage/v1/b/{bucket}/o/{name}")
-            if dst not in (200, 204, 404):
-                raise RuntimeError(f"gcs: delete {item['name']} → {dst} {db}")
-            n += 1
+        names += [item["name"] for item in b.get("items", [])]
         page = b.get("nextPageToken", "")
         if not page:
-            return n
+            return names
+
+
+def gcs_delete_prefix(bucket: str, prefix: str) -> int:
+    """Delete every object under `prefix` (`gcloud storage rm -r`); the count deleted."""
+    names = gcs_list(bucket, prefix)
+    for item in names:
+        name = urllib.parse.quote(item, safe="")
+        dst, db = _call("storage.googleapis.com", "DELETE", f"/storage/v1/b/{bucket}/o/{name}")
+        if dst not in (200, 204, 404):
+            raise RuntimeError(f"gcs: delete {item} → {dst} {db}")
+    return len(names)
 
 
 def gcs_delete_prefixes(bucket: str, prefixes: list[str]) -> int:

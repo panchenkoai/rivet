@@ -348,13 +348,19 @@ impl LoadTarget {
 
     /// Why a CDC stream from `source` cannot load into this warehouse, or `None`.
     pub(crate) fn cdc_refusal(&self, source: crate::config::SourceType) -> Option<&'static str> {
-        match (self, source) {
-            (LoadTarget::Clickhouse { .. }, crate::config::SourceType::Mongo) => {
-                Some(MONGO_CDC_INTO_CLICKHOUSE)
-            }
-            (_, crate::config::SourceType::Oracle) => Some(ORACLE_CDC_NOT_LOADABLE),
-            _ => None,
-        }
+        cdc_refusal_into(self.name(), source)
+    }
+}
+
+/// Why a CDC stream from `source` cannot load into the warehouse named `target`, or `None`.
+pub(crate) fn cdc_refusal_into(
+    target: &str,
+    source: crate::config::SourceType,
+) -> Option<&'static str> {
+    match (target, source) {
+        ("clickhouse", crate::config::SourceType::Mongo) => Some(MONGO_CDC_INTO_CLICKHOUSE),
+        (_, crate::config::SourceType::Oracle) => Some(ORACLE_CDC_NOT_LOADABLE),
+        _ => None,
     }
 }
 

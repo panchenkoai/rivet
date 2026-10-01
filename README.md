@@ -51,11 +51,11 @@ rivet run  -c rivet.yaml                             # typed Parquet in ./output
 **Change data capture** — every INSERT / UPDATE / DELETE from the MySQL binlog, a PostgreSQL logical slot, SQL Server change tables, a MongoDB change stream or Oracle LogMiner (preview; bounded runs to files):
 
 ```bash
-rivet init --source-env DATABASE_URL --mode cdc -o cdc.yaml   # MySQL / PostgreSQL `public`, 2+ tables: one stream over every table
+rivet init --source-env DATABASE_URL --mode cdc -o cdc.yaml   # MySQL / PostgreSQL `public`, 2+ tables: one stream; otherwise one export per table
 rivet run  -c cdc.yaml                                        # first run: baseline snapshot; every run: drain to the log's current end, then exit
 ```
 
-The one stream with a first-run baseline is what init scaffolds for MySQL and PostgreSQL `public` with two or more tables. SQL Server, MongoDB, a non-`public` PostgreSQL schema or a single table get one capture-only export per table: add `cdc.initial: snapshot` (or a batch export plus `cdc.backfill: auto`) before the first run, or the warehouse gets only the changes made after it — init prints the same warning.
+Every CDC scaffold takes a first-run baseline. MySQL and PostgreSQL `public` with two or more tables get one stream whose baseline reads each table through a batch recipe (`cdc.backfill: auto`); SQL Server, MongoDB, Oracle, a non-`public` PostgreSQL schema or a single table get one export per table with `cdc.initial: snapshot`. Oracle CDC does not load into a warehouse yet (ADR-0037): init writes no `load:` block for it and says why in the file.
 
 **All the way into the warehouse** — generate the config with a bucket and a dataset, then one cycle per schedule tick:
 
