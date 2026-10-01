@@ -364,7 +364,13 @@ jobs:
         run: |
           export ${{ matrix.env }}=${{ matrix.tag }}
           docker compose --profile cdc up -d mysql-cdc postgres-cdc
+      - name: MySQL 5.7 is refused (no binlog_row_metadata), the expected outcome
+        if: matrix.engine == 'mysql' && matrix.tag == '5.7'
+        run: |
+          cargo build --bin rivet
+          dev/cdc/scout_mysql57_refusal.sh target/debug/rivet
       - name: Conformance subset
+        if: matrix.engine != 'mysql' || matrix.tag != '5.7'
         run: |
           if [ "${{ matrix.engine }}" = "mysql" ]; then
             FILTER="live_cdc::cdc_"

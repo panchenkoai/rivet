@@ -300,7 +300,7 @@ services:
       - "--max-connections=400"
       # FULL puts column NAMES into TABLE_MAP optional metadata (8.0.1+); rivet
       # refuses MINIMAL (MySQL's own default), which maps values by position.
-      - "--binlog-row-metadata=FULL"
+      - "--loose-binlog-row-metadata=FULL" # loose: 5.7 (the scout lane) has no such variable
     environment:
       MYSQL_ROOT_PASSWORD: rivet
       MYSQL_USER: rivet
