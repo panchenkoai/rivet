@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
-# The repository is English-only: a commit message with Cyrillic is refused (see .githooks/no-cyrillic).
+# No attribution trailers (stripped in place), and the repository is English-only (see .githooks/no-cyrillic).
 set -euo pipefail
+"$(dirname "$0")/strip-trailers" "$1"
 exec "$(dirname "$0")/no-cyrillic" --message "$1"

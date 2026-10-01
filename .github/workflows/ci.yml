@@ -1250,6 +1250,8 @@ jobs:
       # that contains a missed mutant.
       - name: Mutation outcome cache self-test
         run: python3 .github/scripts/mutants_cache.py --self-test
+      - name: Commit-msg trailer filter self-test
+        run: .githooks/strip-trailers --self-test
       - name: No live test grades rivet by rivet's own report alone (shrink-only)
         run: |
           python3 dev/pytools/self_oracle_lint.py --self-test
