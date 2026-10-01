@@ -1243,3 +1243,51 @@ fn mongo_cdc_streams_changes_from_a_secondary() {
         "both changes written on the primary must be captured from the secondary: got {ids:?}"
     );
 }
+
+/// A delete of `_id: null` and a delete of `_id: "null"` must be distinguishable in the change log.
+#[test]
+#[ignore = "known defect: a CDC delete carries only the flat `_id` text, so deletes of _id null and _id \"null\" are byte-identical rows (document NULL); live: requires docker compose up -d mongo-rs"]
+fn roast_mongo_cdc_deletes_of_null_and_string_null_id_are_distinguishable() {
+    use mongodb::bson::{Bson, doc};
+    require_alive(LiveService::MongoRs);
+    require_alive(LiveService::DuckDb);
+    let db = unique_name("cdc_nullid");
+    let m = MongoTest::connect(PORT, &db);
+    let _g = MongoDbGuard {
+        port: PORT,
+        db: db.clone(),
+    };
+    m.drop_collection("t");
+
+    let rig = cdc(&db, "t");
+    rig.run_ok(); // pin
+    m.insert_many(
+        "t",
+        vec![
+            doc! { "_id": Bson::Null, "v": 1 },
+            doc! { "_id": "null", "v": 2 },
+        ],
+    );
+    assert_eq!(
+        m.count("t"),
+        2,
+        "fixture: two documents, distinct by BSON type"
+    );
+    rig.run_ok();
+    m.delete_bson_id("t", Bson::Null);
+    m.delete_bson_id("t", Bson::String("null".into()));
+    rig.run_ok();
+
+    let dir = rig.out_dir();
+    let deletes = duckdb_declared_dir_scalar(&dir, "count(*) FILTER (WHERE __op = 'delete')");
+    assert_eq!(deletes, 2, "fixture: both deletes captured");
+    let distinct = duckdb_declared_dir_scalar(
+        &dir,
+        "count(DISTINCT (_id, coalesce(document::VARCHAR, '<null>'))) FILTER (WHERE __op = 'delete')",
+    );
+    assert_eq!(
+        distinct, 2,
+        "a downstream MERGE cannot tell which document was deleted when the two delete \
+         rows carry identical identity (_id, document)"
+    );
+}
