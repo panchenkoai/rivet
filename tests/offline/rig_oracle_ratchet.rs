@@ -22,7 +22,8 @@ use std::path::{Path, PathBuf};
 const NO_ORACLE_CEILING: usize = 17;
 
 /// Rust DuckDB-helper call sites across tests/ (see [`duckdb_helper_names`]).
-const DUCKDB_HELPER_CEILING: usize = 626;
+// 626 -> 630 (2026-10-01): #378 merged first and added 4 calls in its Mongo null-_id tests.
+const DUCKDB_HELPER_CEILING: usize = 630;
 
 /// Owned by a concurrent branch and migrated after it lands; not counted.
 const EXCLUDED: &[&str] = &["tests/live/live_cdc_type_parity.rs"];
