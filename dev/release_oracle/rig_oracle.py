@@ -1,13 +1,17 @@
 """The live suite's default oracle: one DuckDB session grades one run's declared output.
 
-Every `rivet run|load|compact --config` and `rivet apply <config.yaml>` a live test starts
-through the `Rig` or a shared `run_rivet*` helper reaches it; a hand-built spawn of the
-binary and a `Rig::spawn_args_env` child are not graded (counted by
-tests/offline/rig_oracle_ratchet.rs).
+Every `rivet run|load|compact --config`, `rivet apply <config.yaml | plan.json>` and reaped
+`Rig::spawn_args_env` child a live test starts through the `Rig` or a shared `run_rivet*`
+helper reaches it; a hand-built spawn of the binary is not graded (counted by
+tests/offline/rig_oracle_ratchet.rs). An exception in here fails the test as an oracle
+error, never a SKIP.
 
 tests/common/verify.rs only gathers facts from the config file — engine, source URL, table
 or query, the export's own filter, the manifests the run wrote, the state DB — and hands
-them here as JSON on stdin. This module owns every check: it ATTACHes the source and
+them here as JSON on stdin; a cloud destination (MinIO, fake-gcs or real GCS, Azurite) is
+pulled whole through the store's own API first, a multi-table capture is graded one table
+per sub-prefix, and destination placeholders are resolved independently. Parts are read as
+parquet (never a hive path's value in place of the file's column) or CSV (as text). This module owns every check: it ATTACHes the source and
 rivet's state DB READ_ONLY through `duck.Oracle`, reads only the parts the Success
 manifests declare, and grades per column
 
@@ -1112,8 +1116,12 @@ def grade(spec: dict) -> dict:
                 ora.db.sql("CREATE OR REPLACE TEMP TABLE got AS " + " UNION ALL BY NAME ".join(f"({x})" for x in legs))
                 if cumulative and key:
                     kl = ", ".join(_qi(k) for k in key)
+                    # A delta cannot express a delete: a key an EARLIER run delivered (graded then) that the source no longer holds is not owed.
+                    fresh = [i for i, m in enumerate(graded) if m in spec["new_manifests"]] or [-1]
+                    on = " AND ".join(f"CAST(s.{_qi(k)} AS VARCHAR) = CAST(g.{_qi(k)} AS VARCHAR)" for k in key)
                     dst = (f"(SELECT * EXCLUDE (__mseq, __rn) FROM (SELECT *, row_number() OVER "
-                           f"(PARTITION BY {kl} ORDER BY __mseq DESC) AS __rn FROM got) WHERE __rn = 1)")
+                           f"(PARTITION BY {kl} ORDER BY __mseq DESC) AS __rn FROM got) g WHERE __rn = 1 AND "
+                           f"(__mseq IN ({', '.join(map(str, fresh))}) OR EXISTS (SELECT 1 FROM source_rows s WHERE {on})))")
                 else:
                     dst = "(SELECT * EXCLUDE (__mseq) FROM got)"
         rc = spec.get("range_column")
@@ -1269,34 +1277,62 @@ def grade_load(spec: dict) -> dict:
             rel = f"bq.{ds}.{leaf}" if leaf in tables else f"bigquery_query('bq', {_lit(f'SELECT * FROM `{fq}`')})"
             wh_types = {}
             buffered = f"{leaf}__changes" in tables
+            if buffered:
+                # `<table>__changes` beside a VIEW is the changelog+view layout (the view is the current state);
+                # beside a base TABLE (or no base yet) it is base_buffer's uncompacted buffer.
+                proj, ds_ = fq.split(".")[:2]
+                sql = f"SELECT table_type FROM `{proj}.{ds_}`.INFORMATION_SCHEMA.TABLES WHERE table_name = '{leaf}'"
+                kind = [r[0] for r in ora.rows(f"SELECT * FROM bigquery_query('bq', {_lit(sql)})")]
+                buffered = kind != ["VIEW"]
+                base = bool(kind)
+                if not buffered:
+                    rel = f"bigquery_query('bq', {_lit(f'SELECT * FROM `{fq}`')})"  # a view has no storage-API read
         if not wh_types and target == "clickhouse":
             return {"failures": [f"WAREHOUSE: `{fq}` does not exist in ClickHouse database `{db}`"], "notes": notes}
         if buffered and spec.get("verb") == "compact":
             return {"failures": [f"WAREHOUSE bigquery `{fq}`: `rivet compact` exited 0 and left `{leaf}__changes` behind"], "notes": notes}
-        if buffered:
-            return {"skip": f"`{fq}__changes` holds an uncompacted buffer: the base is current only after `rivet compact`"}
+        if buffered and not key:
+            return {"skip": f"`{fq}__changes` holds an uncompacted buffer and the relation names no key to fold it into the base by"}
         try:
-            ora.db.sql(f"CREATE OR REPLACE TEMP TABLE wh_all AS SELECT * FROM {rel}")
+            if buffered:
+                # base ∪ buffer, folded per key below the way `rivet compact` merges them: a buffer row beats the base.
+                legs = ([f"(SELECT *, 0 AS _rivet_src FROM {rel})"] if base else []) + [f"(SELECT *, 1 AS _rivet_src FROM bq.{ds}.{leaf}__changes)"]
+                ora.db.sql(f"CREATE OR REPLACE TEMP TABLE wh_all AS {' UNION ALL BY NAME '.join(legs)}")
+                partial.append("base_buffer before `rivet compact`: graded base ∪ buffer folded per key, not the merge compact performs")
+            else:
+                ora.db.sql(f"CREATE OR REPLACE TEMP TABLE wh_all AS SELECT * FROM {rel}")
         except Exception as e:  # noqa: BLE001 — a table that requires a partition filter is read with an all-partitions one
             m = re.search(r"filter over column\(s\) '([^']+)'", str(e))
-            if not m:
+            if not m or buffered:
                 raise
             c = m.group(1)
             sql = f"SELECT * FROM `{fq}` WHERE `{c}` IS NULL OR `{c}` >= TIMESTAMP('0001-01-01')"
             ora.db.sql(f"CREATE OR REPLACE TEMP TABLE wh_all AS SELECT * FROM bigquery_query('bq', {_lit(sql)})")
         have = [c for c, _ in _columns(ora, "wh_all")]
         keep = ", ".join(_qi(c) for c in have if not c.startswith(WAREHOUSE_META)) or "1"
-        if "__pos" in have and key:
-            # A change log: its live state is the latest image per key, deletes removed.
+        if ("__pos" in have or "_rivet_src" in have) and key:
+            # A change log (or base ∪ buffer): its live state is the latest image per key, deletes removed.
             kl = ", ".join(_qi(k) for k in key)
             seq = ", __seq DESC" if "__seq" in have else ""
-            folded = (f"(SELECT * FROM (SELECT *, row_number() OVER (PARTITION BY {kl} ORDER BY {pos_order(engine)} DESC{seq}) AS __rn "
-                      f"FROM wh_all) WHERE __rn = 1 AND coalesce(__op, '') <> 'delete')")
+            # A buffer row beats the base, and a change beats a snapshot row (NULL `__pos`), as rivet's own current-state view orders them.
+            order = ", ".join(([ "_rivet_src DESC"] if "_rivet_src" in have else [])
+                              + ([f"__pos IS NOT NULL DESC, {pos_order(engine)} DESC"] if "__pos" in have else [])) + seq
+            gone = " AND NOT coalesce(__is_deleted, false)" if "__is_deleted" in have else ""
+            live_op = " AND coalesce(__op, '') <> 'delete'" if "__op" in have else ""
+            folded = (f"(SELECT * FROM (SELECT *, row_number() OVER (PARTITION BY {kl} ORDER BY {order}) AS __rn "
+                      f"FROM wh_all) WHERE __rn = 1{live_op}{gone})")
             ora.db.sql(f"CREATE OR REPLACE TEMP TABLE wh AS SELECT {keep} FROM {folded}")
             notes.append("change-log layout: graded at the latest image per key")
         else:
             live = "WHERE NOT __is_deleted" if "__is_deleted" in have else ""
             ora.db.sql(f"CREATE OR REPLACE TEMP TABLE wh AS SELECT {keep} FROM wh_all {live}")
+        if spec.get("delta") and not cdc and key:
+            # A delta load cannot express a delete: a key the source no longer holds stays in the warehouse by design.
+            on = " AND ".join(f"CAST(s.{_qi(k)} AS VARCHAR) = CAST(w.{_qi(k)} AS VARCHAR)" for k in key)
+            stale = ora.scalar(f"SELECT count(*) FROM wh w WHERE NOT EXISTS (SELECT 1 FROM source_rows s WHERE {on})")
+            if stale:
+                ora.db.sql(f"DELETE FROM wh w WHERE NOT EXISTS (SELECT 1 FROM source_rows s WHERE {on})")
+                partial.append(f"{stale} warehouse key(s) the source no longer holds are not graded: a delta load cannot express a delete")
         if (cdc or "__pos" in have) and key:
             on = " AND ".join(f"CAST(s.{_qi(k)} AS VARCHAR) = CAST(w.{_qi(k)} AS VARCHAR)" for k in key)
             if not spec.get("snapshot"):

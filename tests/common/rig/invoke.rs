@@ -457,7 +457,7 @@ impl std::ops::DerefMut for Spawned<'_> {
 impl Drop for Spawned<'_> {
     /// A child dropped before anyone reaped it was never graded: say so.
     fn drop(&mut self) {
-        if self.case.is_some() {
+        if self.case.is_some() && !std::thread::panicking() {
             crate::common::verify::log(
                 "SKIP",
                 &self.rig.name,

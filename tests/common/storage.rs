@@ -325,12 +325,21 @@ pub fn gcs_pull_prefix(
     into: &std::path::Path,
 ) -> usize {
     let http = reqwest::blocking::Client::new();
+    // A transport error (not a status) is retried twice: the real endpoint drops a connection now and then.
     let get = |url: &str, query: &[(&str, &str)]| {
-        let mut req = http.get(url).query(query);
-        if let Some(t) = token {
-            req = req.bearer_auth(t);
+        let mut last = None;
+        for _ in 0..3 {
+            let mut req = http.get(url).query(query);
+            if let Some(t) = token {
+                req = req.bearer_auth(t);
+            }
+            match req.send() {
+                Ok(r) => return r,
+                Err(e) => last = Some(e),
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
         }
-        req.send().unwrap_or_else(|e| panic!("GCS GET {url}: {e}"))
+        panic!("GCS GET {url}: {}", last.expect("an error"))
     };
     let list_url = format!("{base}/storage/v1/b/{bucket}/o");
     let (mut names, mut page) = (Vec::new(), String::new());

@@ -350,6 +350,7 @@ impl Case {
                 "password": password,
                 "export": s(e, "name"),
                 "verb": self.verb,
+                "delta": self.is_delta(e),
                 "snapshot": self.declares_snapshot(e) || yaml_text(e.get("cdc")).contains("backfill"),
                 "base": with_ext(&self.image(e, "anchor"), "parquet"),
                 "upper": with_ext(&self.image(e, "prev"), "parquet"),
