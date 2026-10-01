@@ -99,7 +99,7 @@ pub(crate) fn moves(before: &RivetValue, after: &RivetValue, unit: GuardUnit) ->
 }
 
 /// Refuse an UPDATE that moves its row to another partition, before any part is written.
-pub(crate) fn check(
+pub(crate) fn refuse_partition_move(
     ev: &ChangeEvent,
     guard: &PartitionGuard,
     columns: &[TypeMapping],
@@ -215,13 +215,31 @@ mod tests {
             (1, 9, false),
             (9, 10, true),
             (99, 100, true),
+            (0, 5, false),
             (-1, -5, false),
+            (-1, -15, false),
             (100, 5000, false),
         ] {
             assert_eq!(
                 moves(&RivetValue::Int(b), &RivetValue::Int(a), r),
                 want,
                 "{b} -> {a}"
+            );
+        }
+        assert!(
+            moves(&RivetValue::UInt(9), &RivetValue::UInt(10), r),
+            "an unsigned value"
+        );
+        let offset = GuardUnit::Range {
+            start: 3,
+            end: 103,
+            interval: 10,
+        };
+        for (b, a, want) in [(12, 14, true), (8, 12, false)] {
+            assert_eq!(
+                moves(&RivetValue::Int(b), &RivetValue::Int(a), offset),
+                want,
+                "{b} -> {a} from 3"
             );
         }
     }
@@ -275,7 +293,7 @@ mod tests {
     fn a_mysql_timestamp_update_is_refused_only_when_its_utc_day_changes() {
         let (cols, g) = (ts_col(), day_guard());
         // 2023-12-31 23:59:59 UTC and 2024-01-01 00:00:00 UTC, one second apart.
-        let moved = check(
+        let moved = refuse_partition_move(
             &update(Some("1704067199"), "1704067200"),
             &g,
             &cols,
@@ -292,7 +310,7 @@ mod tests {
                 && said.contains("2024-01-01T00:00:00.000000000Z"),
             "{said}"
         );
-        check(
+        refuse_partition_move(
             &update(Some("1704067200"), "1704153599"),
             &g,
             &cols,
@@ -305,14 +323,14 @@ mod tests {
     #[test]
     fn an_update_without_its_previous_value_is_refused_on_mysql_only() {
         let (cols, g) = (ts_col(), day_guard());
-        let e = check(&update(None, "1704067200"), &g, &cols, CdcEngine::Mysql)
+        let e = refuse_partition_move(&update(None, "1704067200"), &g, &cols, CdcEngine::Mysql)
             .expect_err("no before-image");
         assert_eq!(
             crate::error::error_code(&e),
             Some("RIVET_SOURCE_CDC_PREREQUISITE")
         );
         assert!(e.to_string().contains("binlog_row_image = FULL"), "{e}");
-        check(&update(None, "1704067200"), &g, &cols, CdcEngine::Postgres)
+        refuse_partition_move(&update(None, "1704067200"), &g, &cols, CdcEngine::Postgres)
             .expect("an engine whose compaction still finds moved rows itself");
     }
 

@@ -545,7 +545,12 @@ pub(crate) fn run_to_files(
                     // decode error (uncaptured tables' poison never applies).
                     ev.raise_poison()?;
                     if let Some(g) = &sink.out.partition_guard {
-                        super::partition_guard::check(&ev, g, &sink.out.columns, cfg.engine)?;
+                        super::partition_guard::refuse_partition_move(
+                            &ev,
+                            g,
+                            &sink.out.columns,
+                            cfg.engine,
+                        )?;
                     }
                     // TWO units on purpose: the rollover budget wants RESIDENT
                     // cost (what the buffer actually holds), the bytes-read metric
