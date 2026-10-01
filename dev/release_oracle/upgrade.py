@@ -348,6 +348,140 @@ def _load_leg(led: Ledger, prev: Path, root: Path, url: str) -> None:
         gcp.gcs_delete_prefix(bucket, f"exports/{table}/")
 
 
+CDC_TABLES = 3
+CDC_SEED = 5
+
+
+def _cdc_fp_mysql(url: str, table: str) -> tuple[str, set[int]]:
+    """The source's rows as one `id:v:epoch` string, and its id set."""
+    from .cdc import _mysql
+
+    p = _mysql(url, "SET SESSION group_concat_max_len = 1000000; SELECT IFNULL(GROUP_CONCAT("
+                    f"CONCAT(id, ':', v, ':', UNIX_TIMESTAMP(created_at)) ORDER BY id SEPARATOR ','), '') "
+                    f"AS fp FROM {table};")
+    if not p.ok:
+        raise RuntimeError(f"source read of {table} failed: {(p.stderr or '').strip()[-200:]}")
+    lines = [ln.strip() for ln in (p.stdout or "").splitlines() if ln.strip()]
+    fp = lines[1] if len(lines) >= 2 else ""  # line 0 is the `fp` header
+    return fp, {int(x.split(":")[0]) for x in fp.split(",") if ":" in x}
+
+
+def _cdc_fp_bq(proj: str, fq: str) -> tuple[str, str, int, bool]:
+    """(live fingerprint, flagged ids, rows minus distinct ids, buffer left) for one base table."""
+    from . import gcp
+
+    live = gcp.bq_scalar(proj, "SELECT IFNULL(STRING_AGG(FORMAT('%d:%d:%d', id, v, UNIX_SECONDS("
+                               f"created_at)), ',' ORDER BY id), '') FROM `{fq}` WHERE NOT __is_deleted") or ""
+    gone = gcp.bq_scalar(proj, "SELECT IFNULL(STRING_AGG(CAST(id AS STRING), ',' ORDER BY id), '') "
+                               f"FROM `{fq}` WHERE __is_deleted") or ""
+    dup = int(gcp.bq_scalar(proj, f"SELECT COUNT(*) - COUNT(DISTINCT id) FROM `{fq}`") or 0)
+    ds, t = fq.rsplit(".", 1)
+    buf = int(gcp.bq_scalar(proj, f"SELECT COUNT(*) FROM `{ds}.INFORMATION_SCHEMA.TABLES` "
+                                  f"WHERE table_name = '{t}__changes'") or 0) > 0
+    return live, gone, dup, buf
+
+
+def _cdc_delta(url: str, tables: list[str], cycle: int) -> None:
+    """Cycle-specific inserts, updates, a partition-moving update and a delete in every table."""
+    from .cdc import _mysql
+
+    for k, t in enumerate(tables):
+        b = k * 100
+        ins = ", ".join(f"({b + 10 * cycle + i}, {i}, '2026-02-0{cycle} 12:00:00')" for i in (1, 2, 3))
+        sql = [f"INSERT INTO {t} (id, v, created_at) VALUES {ins};",
+               f"UPDATE {t} SET v = {1000 * cycle} WHERE id = {b + 1 + cycle % 5};",
+               f"DELETE FROM {t} WHERE id = {b + cycle};"]
+        if cycle >= 2:
+            # A row whose partition day moves, and a row the previous cycle inserted.
+            sql += [f"UPDATE {t} SET created_at = '2025-12-2{cycle} 08:00:00' WHERE id = {b + 5};",
+                    f"UPDATE {t} SET v = -v WHERE id = {b + 10 * (cycle - 1) + 1};"]
+        _mysql(url, " ".join(sql))
+
+
+def _cdc_load_leg(led: Ledger, prev: Path, root: Path, url: str) -> None:
+    """The partner cycle: the previous release's `init --mode cdc` config, run → load → compact
+    three times by it, then twice by this binary; the compacted base equals the source by value."""
+    from . import gcp
+    from .cdc import _mysql
+    from ..pytools.registry import bq_tmp
+
+    proj, bucket = os.environ.get("BQ_ORACLE_PROJECT", ""), os.environ.get("BQ_ORACLE_BUCKET", "")
+    if not proj or not bucket:
+        led.skipped("mysql", "-", SCEN, "warehouse", "upgrade[mysql/cdc-warehouse]: no "
+                    "BQ_ORACLE_PROJECT / BQ_ORACLE_BUCKET", "no bigquery")
+        return
+    pid = os.getpid()
+    tables = [f"upg_cdcw_{pid}_{k}" for k in range(CDC_TABLES)]
+    dset = bq_tmp(f"upgcdc_{pid}")
+    pfx = f"upgrade-cdc/{pid}"
+    d = root / "cdc_warehouse"
+    d.mkdir()
+    env = {"RIVET_UPG_URL": url, "RIVET_STATE_URL": ""}
+    seen: dict[str, set[int]] = {t: set() for t in tables}
+
+    def fail(stage: str, why: str) -> None:
+        led.failed("mysql", "-", SCEN, "warehouse", f"upgrade[mysql/cdc-warehouse]: {stage}: {why}", stage)
+
+    try:
+        for k, t in enumerate(tables):
+            rows = ", ".join(f"({k * 100 + i}, {i}, '2026-01-0{i} 10:00:00')" for i in range(1, CDC_SEED + 1))
+            if not _mysql(url, f"DROP TABLE IF EXISTS {t}; CREATE TABLE {t} (id BIGINT PRIMARY KEY, "
+                               f"v INT NOT NULL, created_at TIMESTAMP NOT NULL); "
+                               f"INSERT INTO {t} VALUES {rows};").ok:
+                return fail("seed", t)
+        gcp.bq_ensure_dataset(proj, dset)
+        init = run([str(prev), "init", "--source-env", "RIVET_UPG_URL", "--mode", "cdc", "--include",
+                    *tables, "--tls", "disable", "--gcs-bucket", bucket, "--bigquery-project", proj,
+                    "--bigquery-dataset", dset, "-o", "c.yaml"], env=env, cwd=d)
+        if not init.ok:
+            return fail("init", f"previous init: {(init.stderr or '').strip()[-240:]}")
+        # Harness isolation only: init writes fixed prefixes, shared by every run on the stand bucket.
+        cfg = d / "c.yaml"
+        body = cfg.read_text()
+        cfg.write_text(body.replace("prefix: exports/", f"prefix: {pfx}/exports/")
+                           .replace("prefix: cdc/", f"prefix: {pfx}/cdc/"))
+        cycles = [(prev, 0), (prev, 1), (prev, 2), (rivet_bin(), 3), (rivet_bin(), 4)]
+        for n, (binary, delta) in enumerate(cycles, 1):
+            who = "prev" if binary == prev else "this"
+            if delta:
+                _cdc_delta(url, tables, delta)
+            if binary != prev and cycles[n - 2][0] == prev:
+                chk = run([str(binary), "check", "-c", "c.yaml"], env=env, cwd=d, timeout=None)
+                if not chk.ok:
+                    return fail("check", f"this binary refuses the previous init's config: "
+                                         f"{(chk.stderr or chk.out).strip()[-240:]}")
+            for step in ("run", "load", "compact"):
+                extra = [] if step == "run" else ["--run-id", f"upg-{pid}-{n}"]
+                p = run([str(binary), step, "-c", "c.yaml", *extra], env=env, cwd=d, timeout=None)
+                if not p.ok:
+                    return fail(f"cycle{n}/{step}", f"{who} exit {p.returncode}: {(p.stderr or '').strip()[-240:]}")
+            bad = []
+            for t in tables:
+                src, ids = _cdc_fp_mysql(url, t)
+                seen[t] |= ids
+                live, gone, dup, buf = _cdc_fp_bq(proj, f"{proj}.{dset}.{t}")
+                want_gone = ",".join(str(i) for i in sorted(seen[t] - ids))
+                if (live, gone, dup, buf) != (src, want_gone, 0, False):
+                    bad.append(f"{t}: live={live!r} src={src!r} flagged={gone!r} want={want_gone!r} "
+                               f"dup={dup} buffer_left={buf}")
+            if bad:
+                return fail(f"cycle{n}", f"after {who}'s compact the base differs from the source — "
+                                         + "; ".join(bad)[:600])
+        part = gcp.bq_scalar(proj, f"SELECT IFNULL(STRING_AGG(column_name), '') FROM `{proj}.{dset}"
+                                   f".INFORMATION_SCHEMA.COLUMNS` WHERE table_name = '{tables[0]}' "
+                                   "AND is_partitioning_column = 'YES'")
+        led.passed("mysql", "-", SCEN, "warehouse", f"upgrade[mysql/cdc-warehouse]: three cycles by the "
+                   f"previous release, two by this binary on its init config; after every compact each "
+                   f"of {CDC_TABLES} bases equals the source by value, deletes flagged, no duplicate key, "
+                   f"no buffer left (partition column: {part or 'none'})", "cdc-warehouse")
+    finally:
+        for t in tables:
+            _mysql(url, f"DROP TABLE IF EXISTS {t};")
+        if not os.environ.get("RIVET_UPG_KEEP"):
+            gcp.bq_delete_dataset(proj, dset)
+        gcp.gcs_delete_prefix(bucket, f"{pfx}/")
+
+
 def verify_upgrade_continuity(led: Ledger) -> None:
     """The previous release's config, state and crash checkpoint, carried on by this binary."""
     prev = _require_prev_binary(led, "all", "-", SCEN, "local", "upgrade continuity")
@@ -375,6 +509,8 @@ def verify_upgrade_continuity(led: Ledger) -> None:
                 leg(led, prev, root, engine, url, fresh)
     if os.environ.get("RIVET_ORACLE_POSTGRES_URL"):
         _load_leg(led, prev, root, os.environ["RIVET_ORACLE_POSTGRES_URL"])
+    if os.environ.get("RIVET_CDC_MYSQL_URL"):
+        _cdc_load_leg(led, prev, root, os.environ["RIVET_CDC_MYSQL_URL"])
     for engine in CDC_ENGINES:
         cvar = f"RIVET_CDC_{engine.upper()}_URL"
         curl = os.environ.get(cvar, "")
@@ -382,3 +518,16 @@ def verify_upgrade_continuity(led: Ledger) -> None:
             led.skipped(engine, "-", SCEN, "local", f"upgrade[{engine}/cdc]: no {cvar}", "no url")
             continue
         _cdc_leg(led, prev, engine, curl)
+
+
+if __name__ == "__main__":
+    # The warehouse legs alone: `RIVET_PREV_RELEASE_BIN=<old rivet> python -m dev.release_oracle.upgrade`.
+    _led = Ledger()
+    _prev = _require_prev_binary(_led, "all", "-", SCEN, "warehouse", "upgrade continuity")
+    if _prev is not None:
+        _root = Path(tempfile.mkdtemp(prefix="rivet-oracle-upgrade-"))
+        if os.environ.get("RIVET_ORACLE_POSTGRES_URL"):
+            _load_leg(_led, _prev, _root, os.environ["RIVET_ORACLE_POSTGRES_URL"])
+        if os.environ.get("RIVET_CDC_MYSQL_URL"):
+            _cdc_load_leg(_led, _prev, _root, os.environ["RIVET_CDC_MYSQL_URL"])
+    raise SystemExit(_led.report())
