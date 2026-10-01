@@ -235,6 +235,11 @@ def manifest_facts(root: str, manifests: list[str]) -> tuple[list[str], int]:
     return ids, rows
 
 
+def _render(row: dict) -> dict:
+    """The render that grades what rivet delivers today: `today_render` beside a known_defect, else `render`."""
+    return (row.get("today_render") if row.get("known_defect") else None) or row.get("render") or {}
+
+
 def _pg_projection(table: str, native: dict, renders: dict) -> str:
     """A server-side SELECT rendering each column the ledger renders server-side, and wide or unbounded numerics, with PostgreSQL's own text (the scanner reads those as DOUBLE)."""
     cols = []
@@ -439,7 +444,7 @@ def compare(
     exclude: frozenset = frozenset(),
     ticks: frozenset = frozenset(),
 ) -> dict:
-    """Column pairing, per-column counts and the canon multiset difference between `src` and `dst`; `bits` names MySQL BIT(n) columns (bytes read as an unsigned integer), `numbers` source columns read as numeric text, `exclude` columns not graded, `ticks` SQL Server DATETIME columns compared in its 1/300 s ticks."""
+    """Column pairing, per-column counts and the canon multiset difference between `src` and `dst`; `bits` names MySQL BIT(n) columns (bytes read as an unsigned integer), `numbers` source columns read as numeric text, `exclude` columns not graded, `ticks` columns rounded half-up to the microsecond (a SQL Server DATETIME tick rendered at 100 ns)."""
     import decimal
 
     from .value_diff import canon
@@ -487,7 +492,9 @@ def compare(
 
         if i in tick and v is not None:
             c = canon(v)
-            return ("tick", str(round(decimal.Decimal(c[1]) * 300))) if isinstance(c, tuple) and c[0] == "ts" else c
+            if isinstance(c, tuple) and c[0] == "ts":
+                return ("ts", _secs(decimal.Decimal(c[1]).quantize(decimal.Decimal("0.000001"), decimal.ROUND_HALF_UP)))
+            return c
         if i in bit and isinstance(v, (bytes, bytearray)):
             return int.from_bytes(v, "big")
         if i in nanos and (isinstance(v, int) or (isinstance(v, str) and v.lstrip("-").isdigit())):
@@ -637,7 +644,7 @@ def grade(spec: dict) -> dict:
     run_ids, manifest_rows = run_ids + ids, manifest_rows + rows
     rows, forms = ledger(engine, "cdc" if cdc else "batch")
     renders = {
-        n: (r.get("render") or {}).get("server")
+        n: _render(r).get("server")
         or ("{c}::text" if engine == "postgres" and (r.get("delivery") in forms or r.get("delivery") == "server_text") else None)
         for n, r in rows.items()
     }
@@ -695,9 +702,12 @@ def grade(spec: dict) -> dict:
             dst = mongo_document_columns(ora, src, dst)
         bits = frozenset(c for c, n in native.items() if n.startswith("BIT")) if engine == "mysql" else frozenset()
         numbers = frozenset(c for c, n in native.items() if n.startswith(ORACLE_NUMERIC)) if engine == "oracle" else frozenset()
-        xfail = frozenset(c for c, n in native.items() if (rows.get(n) or {}).get("known_defect"))
+        xfail = frozenset(
+            c for c, n in native.items()
+            if (rows.get(n) or {}).get("known_defect") and not (rows[n].get("today_render") or {}).get("server")
+        )
         notes += [f"`{c}` ({native[c]}) is a ledger known_defect: its values are the parity test's strict xfail" for c in sorted(xfail)]
-        ticks = frozenset(c for c, n in native.items() if ((rows.get(n) or {}).get("render") or {}).get("canon") == "datetime_tick")
+        ticks = frozenset(c for c, n in native.items() if _render(rows.get(n) or {}).get("canon") == "round_micros")
         f = compare(ora, src, dst, bits, numbers, xfail, ticks) if dst or not cdc else {}
         part_rows = ora.scalar(f"SELECT count(*) FROM {_parts(ora, new_parts)}") if new_parts else 0
         f.update(part_rows=part_rows, manifest_rows=manifest_rows, **_counters(ora, spec, new_parts, run_ids))
