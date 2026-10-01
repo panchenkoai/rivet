@@ -869,10 +869,11 @@ exclude_re = [
     #   OracleIntervalYM" for the arm). build_column's BinaryFloat (Float64 and Utf8),
     #   BinaryDouble and Raw|Blob arms: every_override_decoder_round_trips_against_oracles_rendering
     #   fails "unsupported conversion from binary_float to f64" / "binary_float to String" /
-    #   "binary_double to String" / "raw to String".
+    #   "binary_double to String" / "raw to String"; the Utf8 Boolean and Date|Timestamp arms
+    #   fail it with "boolean to String" / "timestamp to String".
     "replace interval_iso -> Result<Option<String>>",
     "delete match arm OraKind::IntervalDs in interval_iso",
-    "delete match arm OraKind::(BinaryFloat|BinaryDouble|Raw \\| OraKind::Blob) in build_column",
+    "delete match arm OraKind::(BinaryFloat|BinaryDouble|Boolean|Date \\| OraKind::Timestamp|Raw \\| OraKind::Blob) in build_column",
     # - oracle_type_mappings -> vec![] fails every live_oracle export ("must either specify
     #   a row count or at least one column"); its warning decision is the unit-tested
     #   with_oracle_warning. export_within_budget without the re-projected query fails
@@ -888,4 +889,8 @@ exclude_re = [
     "replace <impl Source for MssqlSource>::export -> Result<\\(\\)> with Ok\\(\\(\\)\\)",
     "replace <impl Source for MssqlSource>::type_mappings -> Result<Vec<TypeMapping>> with Ok\\(vec!\\[\\]\\)",
     "replace native_type -> String with (String::new\\(\\)|.xyzzy.\\.into\\(\\))$",
+    # - MysqlChangeStream::refuse_nameless_binlog -> Ok(()) lets a MINIMAL server open:
+    #   mysql_cdc_refuses_minimal_row_metadata_at_open fails "MINIMAL must fail the run".
+    #   Its legacy-server decision is the unit-tested row_metadata_or_legacy.
+    "replace MysqlChangeStream::refuse_nameless_binlog -> Result<\\(\\)> with Ok\\(\\(\\)\\)",
 ]
