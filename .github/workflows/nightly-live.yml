@@ -372,6 +372,7 @@ jobs:
       - name: Conformance subset
         if: matrix.engine != 'mysql' || matrix.tag != '5.7'
         run: |
+          set -o pipefail  # the default `bash -e` has none: `| tail -20` would hide a red subset
           if [ "${{ matrix.engine }}" = "mysql" ]; then
             FILTER="live_cdc::cdc_"
           else

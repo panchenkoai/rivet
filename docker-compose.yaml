@@ -290,7 +290,7 @@ services:
     # binlog is ON by default in MySQL 8 (ROW format); set a server id and grant
     # the REPLICATION privileges the binlog dump (`COM_BINLOG_DUMP`) needs.
     command:
-      - "--default-authentication-plugin=mysql_native_password"
+      - "--loose-default-authentication-plugin=mysql_native_password" # loose: 8.4 (a scout row) removed it
       - "--server-id=1"
       - "--log-bin=binlog"
       - "--binlog-format=ROW"

@@ -19,13 +19,18 @@ fn conn() -> mysql::PooledConn {
         .expect("mysql conn")
 }
 
+/// The binlog coordinates row: `SHOW BINARY LOG STATUS` (8.2+; 8.4 removed the old form), else `SHOW MASTER STATUS`.
+fn binlog_status(c: &mut mysql::PooledConn) -> mysql::Row {
+    c.query_first("SHOW BINARY LOG STATUS")
+        .or_else(|_| c.query_first("SHOW MASTER STATUS"))
+        .expect("binlog status")
+        .expect("binlog enabled")
+}
+
 /// Current `(binlog_file, pos)` written as the resume checkpoint JSON — so a CDC
 /// run starts from *here* and drains only what happens after.
 fn write_checkpoint(c: &mut mysql::PooledConn, path: &std::path::Path) {
-    let row: mysql::Row = c
-        .query_first("SHOW MASTER STATUS")
-        .expect("show master status")
-        .expect("binlog enabled");
+    let row = binlog_status(c);
     let file: String = row.get(0).unwrap();
     let pos: u64 = row.get(1).unwrap();
     std::fs::write(path, format!(r#"{{"file":"{file}","pos":{pos}}}"#)).unwrap();
@@ -9138,10 +9143,7 @@ fn roast_mysql_cdc_a_rolled_back_myisam_statement_is_framed_as_its_own_transacti
     let rig = Rig::mysql_cdc(&tbl).census_oracle();
     // Anchor BEFORE the churn: MySQL's checkpoint is client-side coordinates, so a
     // run without one re-anchors to "now" and would see neither transaction.
-    let row: mysql::Row = c
-        .query_first("SHOW MASTER STATUS")
-        .expect("show master status")
-        .expect("binlog enabled");
+    let row = binlog_status(&mut c);
     let (file, pos): (String, u64) = (row.get(0).unwrap(), row.get(1).unwrap());
     std::fs::write(
         rig.checkpoint(),
