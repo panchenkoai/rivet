@@ -159,7 +159,10 @@ def ledger(engine: str, mode: str) -> tuple[dict, set[str]]:
     with open(os.path.join(root, "docs", "type-capability-matrix.yaml")) as f:
         doc = yaml.safe_load(f)
     forms = set(doc.get("forms") or {})
-    rows = ((doc.get("engines") or {}).get(engine) or {}).get(mode) or []
+    # One `rows:` list serves both modes; its `clickhouse:` map is read under the flat keys below.
+    rows = ((doc.get("engines") or {}).get(engine) or {}).get("rows") or []
+    ch_keys = {"type": "clickhouse", "today": "today_clickhouse", "defect": "clickhouse_defect", "defect_samples": "clickhouse_defect_samples"}
+    rows = [{**r, **{ch_keys[k]: v for k, v in (r.get("clickhouse") or {}).items()}} if isinstance(r, dict) else r for r in rows]
     out = {norm_native(r["native_type"]): r for r in rows if isinstance(r, dict) and r.get("native_type")}
     for n, r in out.items():
         for render in (r.get("render") or {}, r.get("today_render") or {}):
