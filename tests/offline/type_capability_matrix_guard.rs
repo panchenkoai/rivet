@@ -17,7 +17,7 @@ const CANONS: [&str; 6] = [
     "float32",
     "float64",
     "interval",
-    "datetime_tick",
+    "round_micros",
 ];
 
 /// `IsoTimestampNanos` -> `iso_timestamp_nanos`, the label rule `TextForm::label` follows.
@@ -154,8 +154,9 @@ fn row_violations(doc: &Value) -> Vec<String> {
                 let d = r["delivery"].as_str().unwrap_or("");
                 if !valid_delivery(d) {
                     bad.push(format!(
-                        "{at}: delivery `{d}` is no Arrow type, canonical extension, TextForm \
-                         label or `refused`"
+                        "{at}: delivery `{d}` is no Arrow type, canonical extension or TextForm \
+                         label (a refused type declares its ADR target with known_defect and \
+                         batch_refuses)"
                     ));
                 }
                 if mode == "batch" && !r["diverges"].is_null() {
@@ -163,7 +164,12 @@ fn row_violations(doc: &Value) -> Vec<String> {
                 }
                 for key in r.as_mapping().into_iter().flat_map(|m| m.keys()) {
                     let key = key.as_str().unwrap_or("");
-                    let cdc_only = ["clickhouse", "clickhouse_defect"].contains(&key);
+                    let cdc_only = [
+                        "clickhouse",
+                        "clickhouse_defect",
+                        "clickhouse_defect_samples",
+                    ]
+                    .contains(&key);
                     if !ROW_KEYS.contains(&key) || cdc_only && mode != "cdc" {
                         bad.push(format!("{at}: `{key}:` is not a {mode} row field"));
                     }
@@ -182,14 +188,39 @@ fn row_violations(doc: &Value) -> Vec<String> {
                         "{at}: known_defect beside `diverges:` declares today's behaviour, not the ADR target"
                     ));
                 }
+                for (key, marker) in [
+                    ("today_render", "known_defect"),
+                    ("defect_samples", "known_defect"),
+                    ("clickhouse_defect_samples", "clickhouse_defect"),
+                ] {
+                    if !r[key].is_null() && r[marker].is_null() {
+                        bad.push(format!("{at}: `{key}:` belongs beside `{marker}:`"));
+                    }
+                }
+                let samples: Vec<&str> = r["sample"]
+                    .as_sequence()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .collect();
+                for key in ["defect_samples", "clickhouse_defect_samples"] {
+                    for d in r[key].as_sequence().into_iter().flatten() {
+                        let d = d.as_str().unwrap_or("");
+                        if d != "NULL" && !samples.contains(&d) {
+                            bad.push(format!(
+                                "{at}: {key} names `{d}`, neither a sample nor NULL"
+                            ));
+                        }
+                    }
+                }
                 if r["batch_refuses"].as_bool() == Some(true) && r["known_defect"].is_null() {
                     bad.push(format!(
                         "{at}: `batch_refuses` is today's behaviour of a known_defect row; refusal is \
                          not an ADR target"
                     ));
                 }
-                if let Some(render) = r["render"].as_mapping() {
-                    for (k, v) in render {
+                for render in ["render", "today_render"].map(|k| r[k].as_mapping()) {
+                    for (k, v) in render.into_iter().flatten() {
                         let (k, v) = (k.as_str().unwrap_or(""), v.as_str().unwrap_or(""));
                         let known = match k {
                             "source" => engine == "oracle",
@@ -220,6 +251,8 @@ fn row_violations(doc: &Value) -> Vec<String> {
                 "override",
                 "render",
                 "known_defect",
+                "today_render",
+                "defect_samples",
                 "batch_refuses",
             ] {
                 if b[field] != c[field] {
@@ -249,24 +282,79 @@ fn row_violations(doc: &Value) -> Vec<String> {
     bad
 }
 
+/// Rows per engine and mode; a ledger may grow past these, never fall below them.
+const ROW_FLOOR: [(&str, usize); 4] = [
+    ("postgres", 36),
+    ("mysql", 31),
+    ("mssql", 21),
+    ("oracle", 15),
+];
+
 #[test]
 fn every_ledger_row_has_a_sample_a_real_delivery_and_a_twin_in_the_other_mode() {
     let doc = ledger();
-    let total: usize = keys(&doc, "engines")
-        .iter()
-        .map(|e| rows(&doc, e, "batch").len())
-        .sum();
-    assert!(total >= 90, "the ledger lost its rows: {total}");
+    for (engine, floor) in ROW_FLOOR {
+        for mode in MODES {
+            let got = rows(&doc, engine, mode).len();
+            assert!(
+                got >= floor,
+                "engines.{engine}.{mode} lost rows: {got}, the floor is {floor}"
+            );
+        }
+    }
     let bad = row_violations(&doc);
     assert!(bad.is_empty(), "{LEDGER}:\n{}", bad.join("\n"));
 }
 
-/// Rows the parity driver expects to fail until an engine step fixes them. Shrink-only:
-/// lower it the moment a marker goes, never raise it.
-const KNOWN_DEFECT_CEILING: usize = 23;
+/// The rows the parity driver expects to miss their ADR target, as `engine:mode:native`
+/// (` (ClickHouse)` for a clickhouse_defect). A marker must be named here; a fix may leave
+/// its line, which is then deleted; a new defect is fixed, not added here.
+const KNOWN_DEFECTS: [&str; 41] = [
+    "postgres:batch:INTERVAL",
+    "postgres:batch:NUMERIC",
+    "postgres:batch:MONEY",
+    "postgres:batch:INET",
+    "postgres:batch:CIDR",
+    "postgres:batch:DATE[]",
+    "postgres:batch:TIMESTAMP[]",
+    "postgres:batch:TIMESTAMPTZ[]",
+    "postgres:batch:TIME[]",
+    "postgres:batch:UUID[]",
+    "postgres:batch:BYTEA[]",
+    "postgres:batch:NUMERIC[]",
+    "postgres:cdc:UUID (ClickHouse)",
+    "postgres:cdc:INTERVAL",
+    "postgres:cdc:TEXT[] (ClickHouse)",
+    "postgres:cdc:INTEGER[] (ClickHouse)",
+    "postgres:cdc:DOUBLE PRECISION[] (ClickHouse)",
+    "postgres:cdc:NUMERIC",
+    "postgres:cdc:MONEY",
+    "postgres:cdc:INET",
+    "postgres:cdc:CIDR",
+    "postgres:cdc:DATE[]",
+    "postgres:cdc:TIMESTAMP[]",
+    "postgres:cdc:TIMESTAMPTZ[]",
+    "postgres:cdc:TIME[]",
+    "postgres:cdc:UUID[]",
+    "postgres:cdc:BYTEA[]",
+    "postgres:cdc:NUMERIC[]",
+    "mysql:batch:BOOLEAN",
+    "mysql:cdc:BOOLEAN",
+    "mssql:batch:DATETIME2",
+    "mssql:batch:DATETIMEOFFSET",
+    "mssql:batch:TIME",
+    "mssql:cdc:DATETIME2",
+    "mssql:cdc:DATETIMEOFFSET",
+    "mssql:cdc:TIME",
+    "mssql:cdc:UNIQUEIDENTIFIER (ClickHouse)",
+    "oracle:batch:NUMBER",
+    "oracle:batch:TIMESTAMP(9)",
+    "oracle:cdc:NUMBER",
+    "oracle:cdc:TIMESTAMP(9)",
+];
 
 /// The fields a ledger row may carry (`clickhouse*` on cdc rows only).
-const ROW_KEYS: [&str; 10] = [
+const ROW_KEYS: [&str; 13] = [
     "native_type",
     "sample",
     "delivery",
@@ -274,34 +362,69 @@ const ROW_KEYS: [&str; 10] = [
     "render",
     "diverges",
     "known_defect",
+    "today_render",
+    "defect_samples",
     "clickhouse",
     "clickhouse_defect",
+    "clickhouse_defect_samples",
     "batch_refuses",
 ];
 
+/// Every marked row of `doc` as `KNOWN_DEFECTS` spells it.
+fn marked(doc: &Value) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for e in keys(doc, "engines") {
+        for mode in MODES {
+            for (n, r) in rows(doc, &e, mode) {
+                if !r["known_defect"].is_null() {
+                    out.insert(format!("{e}:{mode}:{n}"));
+                }
+                if !r["clickhouse_defect"].is_null() {
+                    out.insert(format!("{e}:{mode}:{n} (ClickHouse)"));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The markers of `doc` that `KNOWN_DEFECTS` does not name.
+fn known_defect_violations(doc: &Value) -> Vec<String> {
+    let named: BTreeSet<String> = KNOWN_DEFECTS.iter().map(|s| s.to_string()).collect();
+    marked(doc)
+        .difference(&named)
+        .map(|m| format!("{m}: a new known defect, blessed into the ledger instead of fixed"))
+        .collect()
+}
+
 #[test]
 fn known_defect_rows_only_shrink() {
-    let doc = ledger();
-    let marked: Vec<String> = keys(&doc, "engines")
-        .iter()
-        .flat_map(|e| {
-            let batch = rows(&doc, e, "batch")
-                .into_iter()
-                .filter(|(_, r)| !r["known_defect"].is_null())
-                .map(move |(n, _)| format!("{e}:{n}"));
-            let warehouse = rows(&doc, e, "cdc")
-                .into_iter()
-                .filter(|(_, r)| !r["clickhouse_defect"].is_null())
-                .map(move |(n, _)| format!("{e}:{n} (ClickHouse)"));
-            batch.chain(warehouse).collect::<Vec<_>>()
-        })
-        .collect();
+    let bad = known_defect_violations(&ledger());
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+#[test]
+fn a_known_defect_moved_to_another_row_is_refused() {
+    let mut doc = ledger();
+    let cdc = doc["engines"]["mysql"]["cdc"].as_sequence_mut().unwrap();
+    let marker = cdc
+        .iter_mut()
+        .find(|r| r["native_type"] == "BOOLEAN")
+        .and_then(|r| r.as_mapping_mut().unwrap().remove("known_defect"))
+        .unwrap();
+    let other = cdc
+        .iter_mut()
+        .find(|r| r["native_type"] == "DATETIME(6)")
+        .unwrap();
+    other
+        .as_mapping_mut()
+        .unwrap()
+        .insert("known_defect".into(), marker);
+    let bad = known_defect_violations(&doc);
     assert_eq!(
-        marked.len(),
-        KNOWN_DEFECT_CEILING,
-        "known_defect rows {marked:?}: the ratchet expects exactly {KNOWN_DEFECT_CEILING}. \
-         Fewer means a fix landed — lower the ceiling; more means a new defect was blessed \
-         into the ledger instead of fixed"
+        bad,
+        ["mysql:cdc:DATETIME(6): a new known defect, blessed into the ledger instead of fixed"],
+        "a marker moved to another row kept the count and went unnoticed"
     );
 }
 

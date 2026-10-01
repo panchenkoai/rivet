@@ -140,7 +140,7 @@ scenarios:
 
   - id: type_money
     what: "MSSQL MONEY/SMALLMONEY — the exact scaled value through CDC (f64-delivered by tiberius), fails loud past the 2^53-exact range (finding #2)"
-    postgres: { na: "PostgreSQL money has no scaled-value path: CDC carries the server text and batch refuses it (the ledger's diverging money row)" }
+    postgres: { na: "PostgreSQL money has no scaled-value path: CDC carries the server text and batch refuses it (the ledger's known_defect, batch_refuses money row)" }
     mysql:    { na: "MySQL has no MONEY type" }
     mssql:    { test: mssql_money_values_survive_batch_and_cdc, oracle: independent }
     mongo:    { na: "no MONEY type" }

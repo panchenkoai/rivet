@@ -35,8 +35,10 @@ const SRC: &str = "src/source/mssql/cdc.rs";
 /// test that replaced the type matrix: deleting the Date, Time or
 /// DateTime2|SmallDateTime arm fails its CDC run with
 /// RIVET_SOURCE_CDC_CELL_UNSUPPORTED, and the DateTime arm without
-/// `nearest_micro` fails it on column c13 (CDC .126666 against batch and source
-/// .126667).
+/// `nearest_micro` fails it on column c13 (CDC .126666 against batch .126667 by
+/// Arrow and DuckDB, and against the source's DATETIME2(7) text rounded to the
+/// microsecond; re-proven 2026-10-01 after the 1/300 s tick canon, which hid the
+/// DuckDB and source legs, became `round_micros`).
 const ROW_BOUND: &[(&str, &str)] = &[
     (
         "Date",

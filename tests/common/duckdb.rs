@@ -95,6 +95,7 @@ pub fn duckdb_session_json(setup: &str, queries: &[(&str, String)]) -> serde_jso
 import duckdb, json, sys
 con = duckdb.connect()
 con.execute("SET enable_progress_bar=false")
+con.execute("SET TimeZone='UTC'")
 setup = {setup}
 if setup.strip():
     con.execute(setup)
