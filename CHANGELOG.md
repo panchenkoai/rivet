@@ -22,6 +22,12 @@
   other tables too (five of 153 tables in a pilot run). The buffer is now checked first, and such a
   table is the `COMPACT SKIP` it always should have been.
 
+- **A full load of an emptied source empties the warehouse table again.** Since the change below,
+  a `mode: full` run that exported 0 rows was consumed as "up to date" and the warehouse kept rows
+  that no longer exist in the source. That run now reaches the full load's replace, which leaves
+  the table empty (BigQuery, ClickHouse; Snowflake refuses loudly, as before). Empty incremental and
+  CDC runs are still consumed as a 0-row success.
+
 - **`rivet load` consumes the extraction runs that produced no files.** An idle CDC cycle (no
   changes) writes a manifest with no parts; the load skipped it but never recorded it, so every
   later load re-read every such manifest again: a pilot with 110 idle tables read ~50 manifests per
