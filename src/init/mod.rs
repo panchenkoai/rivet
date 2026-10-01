@@ -1644,6 +1644,16 @@ fn relation_for_key(
 
 #[cfg(test)]
 mod tests {
+
+    /// `has_baseline` reads only the two baseline keys at the `cdc:` child indent.
+    #[test]
+    fn has_baseline_is_true_only_for_a_baseline_key_under_cdc() {
+        assert!(has_baseline("    cdc:\n      backfill: auto\n"));
+        assert!(has_baseline("    cdc:\n      initial: snapshot\n"));
+        assert!(!has_baseline("    cdc:\n      slot: s\n"));
+        assert!(!has_baseline("# initial: snapshot is not used here\n"));
+        assert!(!has_baseline("  initial: snapshot\n"));
+    }
     /// Recording primary keys must not re-load and re-VALIDATE the config.
     #[test]
     fn recording_primary_keys_does_not_validate_the_whole_config() {
