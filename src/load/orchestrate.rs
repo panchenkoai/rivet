@@ -1004,12 +1004,17 @@ impl LoadCtx<'_> {
 
 /// The "up to date" line of a load with nothing to write.
 fn print_up_to_date(job: &LoadJob<'_>) {
-    eprintln!(
+    eprintln!("{}", up_to_date_line(job));
+}
+
+/// The text of the "up to date" line, pure so its wording is graded.
+fn up_to_date_line(job: &LoadJob<'_>) -> String {
+    format!(
         "  {} {} → {}: up to date — every extraction run already loaded",
         up_to_date_label(job.mode),
         job.plan.table,
         job.plan.load.target.name(),
-    );
+    )
 }
 
 /// How the "up to date — every extraction run already loaded" line names this
@@ -2362,8 +2367,9 @@ mod load_ledger_tests {
         }
     }
 
-    /// A CDC load plan whose prefix `gs://b/p/` is the `p/` directory under `dir`.
-    fn cdc_plan(dir: &tempfile::TempDir) -> load::plan::LoadPlan {
+    /// A CDC load plan for `table` whose prefix `gs://b/p/` is the `p/` directory under `dir`.
+    /// Each test names its own table: the in-memory state's lease is a process-wide flock per table.
+    fn cdc_plan(dir: &tempfile::TempDir, table: &str) -> load::plan::LoadPlan {
         use load::plan::{CdcLayout, LoadMode, LoadPlan, LoadSection, LoadTarget};
         LoadPlan {
             deleted_flag: false,
@@ -2372,7 +2378,7 @@ mod load_ledger_tests {
             refusal: None,
             export_name: "orders".into(),
             unit: None,
-            table: "orders".into(),
+            table: table.into(),
             partition: None,
             specs: vec![],
             // The load addresses its parts by `gs://bucket/key` whatever backs the store:
@@ -2438,7 +2444,7 @@ mod load_ledger_tests {
     fn the_load_envelope_records_one_skip_row_for_an_empty_prefix() {
         let dir = tempfile::tempdir().expect("a temp prefix");
         let state = StateStore::open_in_memory().unwrap();
-        let plan = cdc_plan(&dir);
+        let plan = cdc_plan(&dir, "orders");
         load_nothing(cdc_job(&dir, &state, &plan));
 
         // `FakeLoader::fqtn` renders `db.<table>`, which is the name the ledger is keyed on.
@@ -2459,7 +2465,7 @@ mod load_ledger_tests {
     fn a_load_consumes_the_runs_that_produced_no_files() {
         let dir = tempfile::tempdir().expect("a temp prefix");
         let state = StateStore::open_in_memory().unwrap();
-        let plan = cdc_plan(&dir);
+        let plan = cdc_plan(&dir, "orders_idle");
         for run in ["r-idle-1", "r-idle-2"] {
             let mut m = super::live_only_decisions::success_manifest(run, "unused.parquet");
             m.parts.clear();
@@ -2473,16 +2479,57 @@ mod load_ledger_tests {
         }
         load_nothing(cdc_job(&dir, &state, &plan));
 
-        let consumed = state.loaded_source_run_ids("db.orders").unwrap();
+        let consumed = state.loaded_source_run_ids("db.orders_idle").unwrap();
         assert!(
             consumed.contains("r-idle-1") && consumed.contains("r-idle-2"),
             "both empty runs are recorded consumed: {consumed:?}"
         );
-        let loads = state.recent_loads(Some("db.orders"), 10).unwrap();
+        let loads = state.recent_loads(Some("db.orders_idle"), 10).unwrap();
         assert_eq!(loads.len(), 1);
         assert_eq!(
             (loads[0].status.as_str(), loads[0].rows_loaded),
             ("success", 0)
+        );
+    }
+
+    /// The up-to-date line names the mode, the table and the warehouse, word for word.
+    #[test]
+    fn the_up_to_date_line_names_the_mode_table_and_warehouse() {
+        let dir = tempfile::tempdir().expect("a temp prefix");
+        let state = StateStore::open_in_memory().unwrap();
+        let plan = cdc_plan(&dir, "orders");
+        assert_eq!(
+            up_to_date_line(&cdc_job(&dir, &state, &plan)),
+            "  cdc load orders → bigquery: up to date — every extraction run already loaded"
+        );
+    }
+
+    /// A run that DID produce files is loaded, not consumed as empty beside the idle ones.
+    #[test]
+    fn a_load_with_files_reaches_the_warehouse_write() {
+        let dir = tempfile::tempdir().expect("a temp prefix");
+        let state = StateStore::open_in_memory().unwrap();
+        let plan = cdc_plan(&dir, "orders_busy");
+        let m = super::live_only_decisions::success_manifest("r-busy", "part-0.parquet");
+        super::live_only_decisions::write_at(
+            &dir,
+            "p/manifest-r-busy.json",
+            &serde_json::to_vec(&m).unwrap(),
+        );
+        super::live_only_decisions::write_at(&dir, "p/part-0.parquet", b"PAR1");
+        let reached = std::cell::Cell::new(false);
+        let out = execute_load(
+            cdc_job(&dir, &state, &plan),
+            |_| {},
+            |_, _, _, _| -> Result<(u64, ())> {
+                reached.set(true);
+                Ok((1, ()))
+            },
+            |_, _| {},
+        );
+        assert!(
+            reached.get(),
+            "a run with a part must reach the warehouse write: {out:?}"
         );
     }
 
