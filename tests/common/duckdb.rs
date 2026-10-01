@@ -531,6 +531,37 @@ impl OracleEngine {
         }
     }
 
+    /// The table function that runs `{sql}` on the attached `src` server itself.
+    pub fn passthrough(self) -> &'static str {
+        match self {
+            Self::Postgres | Self::PostgresCdc => "postgres_query('src', '{sql}')",
+            Self::MysqlCdc | Self::MysqlMain => "mysql_query('src', '{sql}')",
+            Self::MssqlCdc | Self::MssqlMain => "mssql_scan('src', '{sql}')",
+            Self::MongoRs | Self::MongoMain => panic!("{self:?} has no SQL passthrough"),
+        }
+    }
+
+    /// Scanner settings run before the ATTACH so the scanner does not narrow what it reads.
+    pub fn scanner_settings(self) -> &'static str {
+        match self {
+            Self::Postgres | Self::PostgresCdc => "SET pg_use_text_protocol = true;",
+            Self::MysqlCdc | Self::MysqlMain => {
+                "SET mysql_tinyint1_as_boolean = false; SET mysql_session_time_zone = '+00:00';"
+            }
+            _ => "",
+        }
+    }
+
+    /// The server's own text of `{c}` (its type output function), where the engine has one.
+    pub fn server_text(self) -> Option<&'static str> {
+        match self {
+            Self::Postgres | Self::PostgresCdc => {
+                Some("CASE WHEN {c} IS NOT NULL THEN format('%s', {c}) END")
+            }
+            _ => None,
+        }
+    }
+
     /// SQL that makes this engine's data readable, and the table expression to read
     /// FROM. MongoDB has no `ATTACH` — its extension exposes the `mongo_scan(uri,
     /// db, collection)` table function instead — so the two are returned together

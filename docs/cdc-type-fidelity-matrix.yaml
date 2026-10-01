@@ -22,6 +22,11 @@
 # matrix_cdc_type_rows_cover_every_rivet_type in the drift-guard, derived from the
 # RivetType enum): a new type cannot ship without a CDC-fidelity row.
 #
+# KNOWN DEFECTS: a cell names, in `known_defect: [native, ...]`, every native type of its
+# engine that docs/type-capability-matrix.yaml marks known_defect for this family; each
+# ledger known_defect appears in exactly one cell and every name here is a ledger marker
+# (type_capability_matrix_guard.rs::the_cdc_fidelity_matrix_names_exactly_the_ledger_known_defects).
+#
 # ORACLE STRENGTH (matrix_oracle_strength_ratchet): a `test:` cell may carry
 # `oracle: independent|fail_loud|differential|self`. A cell that only compares
 # CDC to batch is a DIFFERENTIAL self-oracle (CDC decode vs BATCH decode) —
@@ -37,7 +42,7 @@ scenarios:
   - id: type_boolean
     what: "boolean rides through the change stream as the same Arrow Boolean as batch"
     postgres: { test: postgres_batch_and_cdc_deliver_every_ledger_row_alike, oracle: independent }
-    mysql:   { test: mysql_batch_and_cdc_deliver_every_ledger_row_alike, oracle: independent }
+    mysql:   { test: mysql_batch_and_cdc_deliver_every_ledger_row_alike, oracle: independent, known_defect: ["BOOLEAN"] }
     mssql:   { test: mssql_batch_and_cdc_deliver_every_ledger_row_alike, oracle: independent }
     mongo:    { na: "boolean rides the verbatim document blob, not a typed column" }
     oracle:   { gap: "not captured in the preview: a BOOLEAN column is refused by name at open (ColKind::of, column_kinds_cover_the_preview_types_and_refuse_the_rest), while batch exports it" }
@@ -60,25 +65,25 @@ scenarios:
 
   - id: type_decimal
     what: "decimal(p,s) precision + scale through CDC (MySQL cell INDEPENDENT: DuckDB re-read vs source literal); MSSQL MONEY past the f64-exact 2^53 range fails loud, not falsely-exact (finding #2)"
-    postgres: { test: postgres_batch_and_cdc_deliver_every_ledger_row_alike, oracle: independent }
+    postgres: { test: postgres_batch_and_cdc_deliver_every_ledger_row_alike, oracle: independent, known_defect: ["NUMERIC"] }
     mysql:    { test: mysql_batch_and_cdc_deliver_every_ledger_row_alike, oracle: independent }
     mssql:    { test: cdc_money_past_f64_exact_range_fails_loud_not_a_falsely_exact_decimal, oracle: fail_loud }
     mongo:    { test: mongo_cdc_change_stream_renders_tricky_bson_verbatim_like_batch, oracle: independent }
-    oracle:   { test: oracle_batch_and_cdc_deliver_every_ledger_row_alike, oracle: independent }
+    oracle:   { test: oracle_batch_and_cdc_deliver_every_ledger_row_alike, oracle: independent, known_defect: ["NUMBER"] }
 
   - id: type_date_time
     what: "date + time-of-day survive the change stream with the batch Arrow types"
     postgres: { test: postgres_batch_and_cdc_deliver_every_ledger_row_alike, oracle: independent }
     mysql:   { test: mysql_batch_and_cdc_deliver_every_ledger_row_alike, oracle: independent }
-    mssql:    { test: mssql_batch_and_cdc_deliver_every_ledger_row_alike, oracle: independent }
+    mssql:    { test: mssql_batch_and_cdc_deliver_every_ledger_row_alike, oracle: independent, known_defect: ["DATETIME2", "TIME"] }
     mongo:    { na: "BSON dates ride the verbatim document blob; the extJSON test pins the mechanism" }
-    oracle:   { test: oracle_batch_and_cdc_deliver_every_ledger_row_alike, oracle: independent }
+    oracle:   { test: oracle_batch_and_cdc_deliver_every_ledger_row_alike, oracle: independent, known_defect: ["TIMESTAMP(9)"] }
 
   - id: type_timestamp_tz
     what: "naive vs tz-aware timestamp — CDC preserves the UTC instant under a non-default session/DB timezone (the +9h render-time trap)"
     postgres: { test: pg_cdc_non_utc_database_timezone_matches_batch, oracle: independent }
     mysql:    { test: cdc_non_utc_server_timezone_matches_batch_and_utc_instant, oracle: independent }
-    mssql:    { test: mssql_cdc_datetimeoffset_value_is_preserved, oracle: independent }
+    mssql:    { test: mssql_cdc_datetimeoffset_value_is_preserved, oracle: independent, known_defect: ["DATETIMEOFFSET"] }
     mongo:    { na: "BSON dates ride the verbatim document blob" }
     oracle:   { gap: "no independent Oracle cell: oracle_cdc_non_utc_session_matches_batch (Asia/Tokyo + odd NLS logon trigger) is a DIFFERENTIAL self-oracle (CDC==batch), and the offset-to-UTC unit test stops at decode, before the sink" }
 
@@ -140,7 +145,7 @@ scenarios:
 
   - id: type_money
     what: "MSSQL MONEY/SMALLMONEY — the exact scaled value through CDC (f64-delivered by tiberius), fails loud past the 2^53-exact range (finding #2)"
-    postgres: { na: "PostgreSQL money has no scaled-value path: CDC carries the server text and batch refuses it (the ledger's known_defect, batch_refuses money row)" }
+    postgres: { test: postgres_batch_and_cdc_deliver_every_ledger_row_alike, oracle: independent, known_defect: ["MONEY"] }
     mysql:    { na: "MySQL has no MONEY type" }
     mssql:    { test: mssql_money_values_survive_batch_and_cdc, oracle: independent }
     mongo:    { na: "no MONEY type" }
@@ -148,7 +153,7 @@ scenarios:
 
   - id: type_interval
     what: "PostgreSQL interval — canonical ISO-8601 text through CDC, identical to batch"
-    postgres: { test: postgres_batch_and_cdc_deliver_every_ledger_row_alike, oracle: independent }
+    postgres: { test: postgres_batch_and_cdc_deliver_every_ledger_row_alike, oracle: independent, known_defect: ["INTERVAL"] }
     mysql:    { na: "MySQL has no INTERVAL column type" }
     mssql:    { na: "SQL Server has no INTERVAL type" }
     mongo:    { na: "no interval type" }
@@ -156,8 +161,16 @@ scenarios:
 
   - id: type_list
     what: "PostgreSQL 1-D arrays (int[]/text[]/…) as a real Arrow List through CDC; a multi-dimensional array fails loud, never a flat NULL list (finding #6)"
-    postgres: { test: multidim_array_literal_is_refused_not_flattened_to_bogus_nulls, oracle: fail_loud }
+    postgres: { test: multidim_array_literal_is_refused_not_flattened_to_bogus_nulls, oracle: fail_loud, known_defect: ["DATE[]", "TIMESTAMP[]", "TIMESTAMPTZ[]", "TIME[]", "UUID[]", "BYTEA[]", "NUMERIC[]"] }
     mysql:    { na: "MySQL has no array column type" }
     mssql:    { na: "SQL Server has no array column type" }
     mongo:    { na: "arrays ride the verbatim document blob (BSON array → extJSON)" }
     oracle:   { gap: "not captured in the preview: VARRAY / nested-table (collection) columns are outside the captured kinds and refused at open (ADR-0037 OR7); no Oracle-specific test pins it" }
+
+  - id: type_network
+    what: "PostgreSQL inet/cidr through CDC as the server's own address text"
+    postgres: { test: postgres_batch_and_cdc_deliver_every_ledger_row_alike, oracle: independent, known_defect: ["INET", "CIDR"] }
+    mysql:    { na: "MySQL has no network address type" }
+    mssql:    { na: "SQL Server has no network address type" }
+    mongo:    { na: "no network address type" }
+    oracle:   { na: "Oracle has no network address type" }

@@ -52,6 +52,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 // when downstream tests do `use common::*;`.  Same idea for `env` vs
 // `std::env`.
 mod bigquery;
+mod canon;
 mod clickhouse;
 mod duckdb;
 mod env;
@@ -72,6 +73,7 @@ mod toxi;
 mod verify;
 
 pub use bigquery::*;
+pub use canon::*;
 pub use clickhouse::*;
 pub use duckdb::*;
 pub use env::*;

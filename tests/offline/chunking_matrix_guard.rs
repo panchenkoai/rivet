@@ -111,7 +111,7 @@ const EXEMPT: &[(&str, &str)] = &[
         "docs/scenario-artifact-matrix.yaml",
         "tests/offline/scenario_artifact_matrix_guard.rs",
     ),
-    // Keyed on TextForm, ExportTarget and SourceType x mode, not on scenario cells.
+    // Keyed on TextForm, ExportTarget and SourceType, not on scenario cells.
     (
         "docs/type-capability-matrix.yaml",
         "tests/offline/type_capability_matrix_guard.rs",
