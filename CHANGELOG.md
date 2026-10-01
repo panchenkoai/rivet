@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **`rivet load` consumes the extraction runs that produced no files.** An idle CDC cycle (no
+  changes) writes a manifest with no parts; the load skipped it but never recorded it, so every
+  later load re-read every such manifest again: a pilot with 110 idle tables read ~50 manifests per
+  table per cycle, one more each cycle. Such runs are now recorded as a 0-row success, and the
+  next load reads only the runs since. Measured on the stand over three idle cycles: 1, 2, 3
+  manifests re-read before; 1, 1, 1 after.
+
 - **Breaking: MySQL CDC refuses `binlog_row_metadata = MINIMAL`.** It used to warn and map binlog
   values by position, so a column reorder or `ALTER` delivered them under the wrong names (source
   `(1, b='BBB', a='AAA')` arrived as `b='AAA', a='BBB'`). A server that is not at FULL, or that

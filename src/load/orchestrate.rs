@@ -722,23 +722,16 @@ fn prepare_load(
     if nothing_to_load(plan.mode, uris.is_empty()) {
         // Unloaded manifests that resolve to NO files: runs that legitimately
         // produced nothing (a CDC cycle with no changes, the anchor cycle of
-        // `initial: snapshot`). That is "up to date", not an error — the loader
-        // bails deeper down with "no Parquet URIs to append", which surfaced as a
-        // failed load the moment a zero-part manifest stopped dragging the whole
-        // prefix in behind it.
-        //
-        // NOT recorded consumed: the caller's skip path records no run ids, so
-        // an empty cycle is re-evaluated on every later load. Harmless (it
-        // resolves to nothing again and skips again) but it does mean the skip
-        // set omits runs that are, in fact, fully consumed — recording them is
-        // the follow-up.
+        // `initial: snapshot`). That is "up to date", not an error. They are
+        // handed back as inputs with no URIs, so the caller records them consumed:
+        // left unrecorded, every empty cycle was re-evaluated by every later load
+        // (a pilot read 50 manifests per idle table per cycle, growing by one each).
         println!(
             "  {} → {}: {} run(s) produced no files — nothing to load",
             plan.table,
             plan.load.target.name(),
             source_run_ids.len()
         );
-        return Ok(None);
     }
     // The manifests agree on their source — `ensure_single_export` refused the
     // prefix otherwise — so the first one speaks for all of them.
@@ -988,6 +981,10 @@ impl LoadCtx<'_> {
     fn record_skip(&self) {
         self.record(&[], 0, LoadStatus::Success.as_str());
     }
+    /// Runs that produced no files are consumed as a 0-row success, so no later load re-reads them.
+    fn record_empty_runs(&self, run_ids: &[String]) {
+        self.record(run_ids, 0, LoadStatus::Success.as_str());
+    }
 
     /// About to touch the warehouse. Survives only a process that DIED here; unwritable, the load must not write.
     fn record_writing(&self) -> Result<()> {
@@ -1003,6 +1000,16 @@ impl LoadCtx<'_> {
     fn record_success(&self, run_ids: &[String], rows: i64) {
         self.record(run_ids, rows, LoadStatus::Success.as_str());
     }
+}
+
+/// The "up to date" line of a load with nothing to write.
+fn print_up_to_date(job: &LoadJob<'_>) {
+    eprintln!(
+        "  {} {} → {}: up to date — every extraction run already loaded",
+        up_to_date_label(job.mode),
+        job.plan.table,
+        job.plan.load.target.name(),
+    );
 }
 
 /// How the "up to date — every extraction run already loaded" line names this
@@ -1059,6 +1066,13 @@ fn execute_load<R>(
         &target_fqtn,
         job.allow_source_drift,
     )? {
+        Some(i) if i.uris.is_empty() => {
+            ctx.active_at_fetch = i.active_at_fetch.clone();
+            ctx.marker_active = i.marker_active.clone();
+            print_up_to_date(&job);
+            ctx.record_empty_runs(&i.source_run_ids);
+            return Ok(None);
+        }
         Some(i) => {
             ctx.source_ident = i.source_ident.clone();
             ctx.active_at_fetch = i.active_at_fetch.clone();
@@ -1066,12 +1080,7 @@ fn execute_load<R>(
             i
         }
         None => {
-            let label = up_to_date_label(job.mode);
-            eprintln!(
-                "  {label} {} → {}: up to date — every extraction run already loaded",
-                job.plan.table,
-                job.plan.load.target.name(),
-            );
+            print_up_to_date(&job);
             ctx.record_skip();
             return Ok(None);
         }
@@ -2335,25 +2344,28 @@ mod load_ledger_tests {
         }
     }
 
-    /// The load ENVELOPE, driven offline for the first time.
-    ///
-    /// `execute_load` used to build its own warehouse adapter, so nothing below the CLI
-    /// could be exercised without credentials — `.cargo/mutants.toml` records the
-    /// measurement: with `run_loads` stubbed to `Ok(())` all twelve live tests matching
-    /// `load` stay GREEN, because not one of them invokes the subcommand. The adapter now
-    /// arrives on the job and a local destination resolves to a real filesystem store, so
-    /// the envelope's invariants are assertable here.
-    ///
-    /// This pins the up-to-date path: an empty prefix reaches no run, records exactly ONE
-    /// ledger row (`success`/0), and consumes nothing — the "every extraction run already
-    /// loaded" exit. RED against dropping `ctx.record_skip()`, which leaves a load that
-    /// silently wrote no audit row at all.
-    #[test]
-    fn the_load_envelope_records_one_skip_row_for_an_empty_prefix() {
+    /// A CDC load job over an fs-backed prefix rooted at `dir`, against an empty fake warehouse.
+    fn cdc_job<'a>(
+        dir: &tempfile::TempDir,
+        state: &'a StateStore,
+        plan: &'a load::plan::LoadPlan,
+    ) -> LoadJob<'a> {
+        LoadJob {
+            plan,
+            state: Some(state),
+            load_id: "L1",
+            allow_source_drift: false,
+            mode: load::plan::LoadMode::Cdc,
+            loader: Box::new(load::tests::fake_loader(0)),
+            store: crate::destination::gcs::GcsStore::open_fs(&dir.path().display().to_string())
+                .expect("a filesystem-backed store"),
+        }
+    }
+
+    /// A CDC load plan whose prefix `gs://b/p/` is the `p/` directory under `dir`.
+    fn cdc_plan(dir: &tempfile::TempDir) -> load::plan::LoadPlan {
         use load::plan::{CdcLayout, LoadMode, LoadPlan, LoadSection, LoadTarget};
-        let dir = tempfile::tempdir().expect("a temp prefix");
-        let state = StateStore::open_in_memory().unwrap();
-        let plan = LoadPlan {
+        LoadPlan {
             deleted_flag: false,
             renames: Vec::new(),
             rename_warnings: Vec::new(),
@@ -2392,18 +2404,11 @@ mod load_ledger_tests {
             clustering: load::plan::Clustering::Auto(vec![]),
             pinned_run: None,
             layout: CdcLayout::LogAndView,
-        };
-        let job = LoadJob {
-            plan: &plan,
-            state: Some(&state),
-            load_id: "L1",
-            allow_source_drift: false,
-            mode: LoadMode::Cdc,
-            loader: Box::new(load::tests::fake_loader(0)),
-            store: crate::destination::gcs::GcsStore::open_fs(&dir.path().display().to_string())
-                .expect("a filesystem-backed store"),
-        };
+        }
+    }
 
+    /// Drive an up-to-date load: the run closure must never be reached.
+    fn load_nothing(job: LoadJob<'_>) {
         let out = execute_load(
             job,
             |_| {},
@@ -2414,6 +2419,27 @@ mod load_ledger_tests {
         )
         .expect("an up-to-date load is not an error");
         assert!(out.is_none(), "an up-to-date load reports no work");
+    }
+
+    /// The load ENVELOPE, driven offline for the first time.
+    ///
+    /// `execute_load` used to build its own warehouse adapter, so nothing below the CLI
+    /// could be exercised without credentials — `.cargo/mutants.toml` records the
+    /// measurement: with `run_loads` stubbed to `Ok(())` all twelve live tests matching
+    /// `load` stay GREEN, because not one of them invokes the subcommand. The adapter now
+    /// arrives on the job and a local destination resolves to a real filesystem store, so
+    /// the envelope's invariants are assertable here.
+    ///
+    /// This pins the up-to-date path: an empty prefix reaches no run, records exactly ONE
+    /// ledger row (`success`/0), and consumes nothing — the "every extraction run already
+    /// loaded" exit. RED against dropping `ctx.record_skip()`, which leaves a load that
+    /// silently wrote no audit row at all.
+    #[test]
+    fn the_load_envelope_records_one_skip_row_for_an_empty_prefix() {
+        let dir = tempfile::tempdir().expect("a temp prefix");
+        let state = StateStore::open_in_memory().unwrap();
+        let plan = cdc_plan(&dir);
+        load_nothing(cdc_job(&dir, &state, &plan));
 
         // `FakeLoader::fqtn` renders `db.<table>`, which is the name the ledger is keyed on.
         let loads = state.recent_loads(Some("db.orders"), 10).unwrap();
@@ -2423,6 +2449,40 @@ mod load_ledger_tests {
         assert!(
             state.loaded_source_run_ids("db.orders").unwrap().is_empty(),
             "an up-to-date no-op consumes no runs"
+        );
+    }
+
+    /// Runs that produced no files (an idle CDC cycle) are consumed by the load that
+    /// found nothing in them: left unrecorded, every later load re-read their manifests
+    /// (a pilot: 50 manifests per idle table per cycle, one more each cycle).
+    #[test]
+    fn a_load_consumes_the_runs_that_produced_no_files() {
+        let dir = tempfile::tempdir().expect("a temp prefix");
+        let state = StateStore::open_in_memory().unwrap();
+        let plan = cdc_plan(&dir);
+        for run in ["r-idle-1", "r-idle-2"] {
+            let mut m = super::live_only_decisions::success_manifest(run, "unused.parquet");
+            m.parts.clear();
+            m.part_count = 0;
+            m.row_count = 0;
+            super::live_only_decisions::write_at(
+                &dir,
+                &format!("p/manifest-{run}.json"),
+                &serde_json::to_vec(&m).unwrap(),
+            );
+        }
+        load_nothing(cdc_job(&dir, &state, &plan));
+
+        let consumed = state.loaded_source_run_ids("db.orders").unwrap();
+        assert!(
+            consumed.contains("r-idle-1") && consumed.contains("r-idle-2"),
+            "both empty runs are recorded consumed: {consumed:?}"
+        );
+        let loads = state.recent_loads(Some("db.orders"), 10).unwrap();
+        assert_eq!(loads.len(), 1);
+        assert_eq!(
+            (loads[0].status.as_str(), loads[0].rows_loaded),
+            ("success", 0)
         );
     }
 
@@ -3045,7 +3105,7 @@ mod live_only_decisions {
         GcsStore::open_fs(dir.path().to_str().unwrap()).unwrap()
     }
 
-    fn write_at(dir: &tempfile::TempDir, rel: &str, bytes: &[u8]) {
+    pub(super) fn write_at(dir: &tempfile::TempDir, rel: &str, bytes: &[u8]) {
         let p = dir.path().join(rel);
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(p, bytes).unwrap();
@@ -3310,7 +3370,7 @@ mod live_only_decisions {
         );
     }
 
-    fn success_manifest(run: &str, part: &str) -> crate::manifest::RunManifest {
+    pub(super) fn success_manifest(run: &str, part: &str) -> crate::manifest::RunManifest {
         use crate::manifest::*;
         RunManifest {
             manifest_version: MANIFEST_VERSION,
