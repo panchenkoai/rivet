@@ -1677,6 +1677,17 @@ jobs:
           --skip a_non_unicode_database_round_trips
           --skip a_read_blocked_longer_than_thirty_seconds_still_completes
 
+      - name: Rig oracle verdict census
+        # A passing test's stderr is hidden, so the verdict log is the only proof the oracle ran.
+        if: ${{ !cancelled() }}
+        run: |
+          log=target/rivet-oracle.log
+          test -s "$log" || { echo "::error::no rig oracle verdict was logged ($log) - the oracle did not run"; exit 1; }
+          for v in PASS XFAIL SKIP FAIL; do printf '%s %s\n' "$v" "$(grep -c "^RIVET-ORACLE-$v " "$log" || true)"; done
+          grep '^RIVET-ORACLE-SKIP ' "$log" | sed 's/^[^—]*— //' | sort | uniq -c | sort -rn | head -20
+          pass=$(grep -c '^RIVET-ORACLE-PASS ' "$log" || true)
+          [ "$pass" -gt 0 ] || { echo "::error::the rig oracle logged no PASS verdict"; exit 1; }
+
       - name: Stop services
         if: always()
         run: docker compose down
