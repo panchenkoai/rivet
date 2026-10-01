@@ -10,6 +10,7 @@ W=$(mktemp -d)
 trap 'rm -rf "$W"' EXIT
 fail() { echo "FAIL: $*"; echo "--- run output:"; cat "$W/run.log" 2>/dev/null || true; exit 1; }
 
+for _ in $(seq 60); do docker exec "$C" mysql -h127.0.0.1 -urivet -privet rivet -e "SELECT 1" >/dev/null 2>&1 && break; sleep 3; done
 docker exec "$C" mysql -urivet -privet rivet -Ne "SELECT @@version" | grep -q '^5\.7\.' || fail "the server is not MySQL 5.7"
 docker exec "$C" mysql -urivet -privet rivet -e \
   "DROP TABLE IF EXISTS scout_t; CREATE TABLE scout_t (id BIGINT PRIMARY KEY, v INT); INSERT INTO scout_t VALUES (1, 1);"
