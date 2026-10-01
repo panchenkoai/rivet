@@ -273,3 +273,146 @@ fn pg_exported_instants_and_dates_equal_the_source_in_an_odd_session() {
         "every instant and every date is the source's, whatever the session zone"
     );
 }
+
+/// Insert `(id, ts)` for `ids`, `ts` = 2024-01-01 00:00:00.5 UTC + id minutes, from a UTC session.
+fn mysql_ts_rows(t: &str, ids: std::ops::RangeInclusive<i64>) {
+    use mysql::prelude::Queryable;
+    let mut c = mysql_connect();
+    c.query_drop("SET time_zone = '+00:00'")
+        .expect("utc session");
+    let values: Vec<String> = ids
+        .map(|i| format!("({i}, TIMESTAMP('2024-01-01 00:00:00.5') + INTERVAL {i} MINUTE)"))
+        .collect();
+    c.query_drop(format!("INSERT INTO {t} VALUES {}", values.join(", ")))
+        .expect("seed");
+}
+
+/// The MySQL server's zone at +09:00 (every new session inherits it): an incremental TIMESTAMP
+/// cursor reads each row once across runs. The rig's default oracle grades every exported
+/// instant against the source (RED without the session's UTC pin: each shifts by 9 h).
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn mysql_incremental_on_a_timestamp_cursor_reads_each_row_once_under_a_tokyo_server_zone() {
+    use mysql::prelude::Queryable;
+    require_alive(LiveService::Mysql);
+    let _quiet = quiet_window_guard();
+    let t = unique_name("ss_my");
+    mysql_connect()
+        .query_drop(format!(
+            "CREATE TABLE {t} (id BIGINT PRIMARY KEY, ts TIMESTAMP(6) NOT NULL)"
+        ))
+        .expect("create");
+    let _g = MysqlTable::adopt(t.clone());
+    mysql_ts_rows(&t, 1..=300);
+    let _tz = MysqlGlobal::set("time_zone", "+09:00");
+    assert_eq!(
+        MysqlGlobal::current("time_zone"),
+        "+09:00",
+        "the flip landed"
+    );
+    let rig = Rig::mysql_batch(&t)
+        .mode("incremental")
+        .export_line("cursor_column: ts");
+    rig.run_ok();
+    assert_eq!(declared_rows(&rig), (300, 300), "run 1");
+    mysql_ts_rows(&t, 301..=450);
+    rig.run_ok();
+    assert_eq!(declared_rows(&rig), (450, 450), "both runs: every row once");
+}
+
+#[cfg(feature = "oracle")]
+/// An Oracle login whose every session opens in Asia/Tokyo with day-first NLS masks and a
+/// comma decimal separator (an AFTER LOGON trigger); trigger and user dropped on Drop.
+struct OddOracleUser(String);
+
+#[cfg(feature = "oracle")]
+impl OddOracleUser {
+    const PASSWORD: &'static str = "Odd_passw0rd1";
+
+    fn create(table: &str) -> Self {
+        let name = unique_name("ora_odd").to_uppercase();
+        ora_system_exec(&format!(
+            "CREATE USER {name} IDENTIFIED BY \"{}\"",
+            Self::PASSWORD
+        ));
+        let user = Self(name);
+        ora_system_exec(&format!("GRANT CREATE SESSION TO {}", user.0));
+        ora_system_exec(&format!("GRANT SELECT ON RIVET.{table} TO {}", user.0));
+        ora_system_exec(&format!(
+            "CREATE OR REPLACE TRIGGER SYSTEM.{0}_LOGON AFTER LOGON ON {0}.SCHEMA \
+             BEGIN \
+               EXECUTE IMMEDIATE q'[ALTER SESSION SET NLS_DATE_FORMAT = 'DD-MON-RR']'; \
+               EXECUTE IMMEDIATE q'[ALTER SESSION SET NLS_TIMESTAMP_FORMAT = 'DD-MON-RR HH.MI.SSXFF AM']'; \
+               EXECUTE IMMEDIATE q'[ALTER SESSION SET NLS_TIMESTAMP_TZ_FORMAT = 'DD-MON-RR HH.MI.SSXFF AM TZR']'; \
+               EXECUTE IMMEDIATE q'[ALTER SESSION SET NLS_NUMERIC_CHARACTERS = ',.']'; \
+               EXECUTE IMMEDIATE q'[ALTER SESSION SET TIME_ZONE = 'Asia/Tokyo']'; \
+             END;",
+            user.0
+        ));
+        user
+    }
+
+    fn url(&self) -> String {
+        format!(
+            "oracle://{}:{}@127.0.0.1:1521/FREEPDB1",
+            self.0,
+            Self::PASSWORD
+        )
+    }
+}
+
+#[cfg(feature = "oracle")]
+impl Drop for OddOracleUser {
+    fn drop(&mut self) {
+        let _ = std::panic::catch_unwind(|| {
+            ora_system_exec(&format!("DROP TRIGGER SYSTEM.{}_LOGON", self.0))
+        });
+        let _ =
+            std::panic::catch_unwind(|| ora_system_exec(&format!("DROP USER {} CASCADE", self.0)));
+    }
+}
+
+#[cfg(feature = "oracle")]
+/// Insert `(ID, TS)` rows `lo..=hi`, `TS` = 2024-01-01 00:00:00.5 UTC + id minutes.
+fn oracle_ts_rows(t: &str, lo: i64, hi: i64) {
+    ora_exec(&format!(
+        "INSERT INTO {t} SELECT LEVEL + {off}, TIMESTAMP '2024-01-01 00:00:00.5 +00:00' \
+         + NUMTODSINTERVAL(LEVEL + {off}, 'MINUTE') FROM dual CONNECT BY LEVEL <= {n}",
+        off = lo - 1,
+        n = hi - lo + 1
+    ));
+}
+
+#[cfg(feature = "oracle")]
+/// An Oracle login in Asia/Tokyo with day-first NLS masks: an incremental TIMESTAMP WITH TIME
+/// ZONE cursor reads each row once across runs; the rig's default oracle grades the values.
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn oracle_incremental_on_a_tstz_cursor_reads_each_row_once_for_a_tokyo_day_first_login() {
+    require_alive(LiveService::Oracle);
+    let t = OracleTable::create(
+        "ss_ora",
+        "id NUMBER(10) PRIMARY KEY, ts TIMESTAMP(6) WITH TIME ZONE NOT NULL",
+    );
+    oracle_ts_rows(t.name(), 1, 300);
+    let user = OddOracleUser::create(t.name());
+    assert_eq!(
+        ora_text_rows_on(
+            &user.url(),
+            "SELECT value FROM nls_session_parameters WHERE parameter = 'NLS_TIMESTAMP_TZ_FORMAT'"
+        ),
+        vec![vec![Some("DD-MON-RR HH.MI.SSXFF AM TZR".to_string())]],
+        "fixture: the logon trigger shaped the session"
+    );
+    let rig = Rig::oracle_batch(t.name())
+        .export_named(&unique_name("ss_ora_exp"))
+        .query(&format!("SELECT ID, TS FROM RIVET.{}", t.name()))
+        .source_url(&user.url())
+        .mode("incremental")
+        .export_line("cursor_column: TS");
+    rig.run_ok();
+    assert_eq!(declared_rows(&rig), (300, 300), "run 1");
+    oracle_ts_rows(t.name(), 301, 450);
+    rig.run_ok();
+    assert_eq!(declared_rows(&rig), (450, 450), "both runs: every row once");
+}
