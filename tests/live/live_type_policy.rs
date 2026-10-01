@@ -56,7 +56,6 @@ fn oracle_cdc_timestamp9_warns_by_default_and_strict_refuses_before_any_part_or_
     let ckpt = d.path().join("cdc.ckpt");
     std::fs::create_dir_all(&out).unwrap();
     let rig = Rig::oracle_cdc(t.name())
-        .no_oracle("known defect: Oracle TIMESTAMP(9) is delivered as Timestamp(us), truncating nanoseconds (warned by the type policy, not refused)")
         .checkpoint_path(ckpt.clone())
         .dest_path(out.clone());
     let warned = |err: &str| err.contains("column 'TS9'") && err.contains("fidelity=lossy");
@@ -111,8 +110,7 @@ fn oracle_batch_timestamp9_warns_by_default_and_strict_refuses_before_export() {
     let t = oracle_ts9_table();
     let d = tempfile::tempdir().unwrap();
     let out = d.path().join("out");
-    let rig = Rig::oracle_batch(t.name()).dest_path(out.clone())
-        .no_oracle("known defect: Oracle TIMESTAMP(9) is delivered as Timestamp(us), truncating nanoseconds (warned by the type policy, not refused)");
+    let rig = Rig::oracle_batch(t.name()).dest_path(out.clone());
 
     let strict = rig.run_args(&["--strict"]);
     let err = String::from_utf8_lossy(&strict.stderr);

@@ -26,6 +26,7 @@ so its TYPE check sees text. The CDC checkpoint is not graded.
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import sys
@@ -40,9 +41,15 @@ INT_BITS = {
 }
 INT_DIGITS = {8: 3, 16: 5, 32: 10, 64: 20, 128: 39}
 #: (native source type, delivered DuckDB type) pairs the scanner's wider reading would misgrade: MySQL YEAR is 1901..2155.
-NATIVE_FITS = {("year", "SMALLINT"), ("binary_float", "FLOAT")}
+NATIVE_FITS = {("YEAR", "SMALLINT"), ("BINARY_FLOAT", "FLOAT")}
+#: Scanner settings that make the source read faithful (shared with tests/live/live_cdc_type_parity.rs):
+#: PostgreSQL's binary COPY drops char(n) padding; MySQL's scanner reads TINYINT(1) as BOOLEAN and its session zone moves TIMESTAMPs.
+SCANNER_SETTINGS = {
+    "postgres": {"pg_use_text_protocol": True},
+    "mysql": {"mysql_tinyint1_as_boolean": False, "mysql_session_time_zone": "+00:00"},
+}
 #: Oracle catalog types whose python-oracledb value is a number (read as exact text, compared by value).
-ORACLE_NUMERIC = {"number", "float", "binary_float", "binary_double"}
+ORACLE_NUMERIC = ("NUMBER", "FLOAT", "BINARY_FLOAT", "BINARY_DOUBLE")
 TS_RANK = {
     "DATE": 0, "TIMESTAMP_S": 1, "TIMESTAMP_MS": 2, "TIMESTAMP": 3,
     "TIMESTAMP WITH TIME ZONE": 3, "TIMESTAMP_NS": 4,
@@ -97,14 +104,57 @@ def type_loss(src: str, dst: str) -> str | None:
     return None
 
 
-def ledger_text_forms(engine: str, mode: str) -> set[str]:
-    """Native types the type ledger (docs/type-capability-matrix.yaml) delivers as TEXT for `engine` x `mode`."""
+def norm_native(t: str | bytes) -> str:
+    """A declared source type in the ledger's spelling: upper case, single spaces, PostgreSQL's long names shortened (MySQL's catalog answers bytes)."""
+    import re
+
+    t = t.decode() if isinstance(t, bytes) else t
+    t = " ".join(t.upper().split()).replace(", ", ",")
+    t = re.sub(r"^TIMESTAMP(\(\d+\))? WITHOUT TIME ZONE", r"TIMESTAMP\1", t)
+    t = re.sub(r"^TIMESTAMP(\(\d+\))? WITH TIME ZONE", r"TIMESTAMPTZ\1", t)
+    t = re.sub(r"^TIME(\(\d+\))? WITHOUT TIME ZONE", r"TIME\1", t)
+    t = re.sub(r"^CHARACTER VARYING", "VARCHAR", t)
+    return re.sub(r"^CHARACTER\b", "CHAR", t)
+
+
+def arrow_to_duck(delivery: str, text_forms: set[str]) -> str | None:
+    """The DuckDB type a parquet column of the ledger's `delivery` reads as; `None` when the ledger names no Arrow type DuckDB maps one way."""
+    import re
+
+    if delivery == "arrow.json":
+        return "JSON"
+    if delivery in text_forms:
+        return "VARCHAR"
+    fixed = {
+        "Int8": "TINYINT", "Int16": "SMALLINT", "Int32": "INTEGER", "Int64": "BIGINT",
+        "UInt8": "UTINYINT", "UInt16": "USMALLINT", "UInt32": "UINTEGER", "UInt64": "UBIGINT",
+        "Float32": "FLOAT", "Float64": "DOUBLE", "Boolean": "BOOLEAN", "Utf8": "VARCHAR",
+        "LargeUtf8": "VARCHAR", "Binary": "BLOB", "LargeBinary": "BLOB", "Date32": "DATE",
+        "Time64(µs)": "TIME", "Timestamp(µs)": "TIMESTAMP", "Timestamp(ns)": "TIMESTAMP_NS",
+        "Timestamp(ms)": "TIMESTAMP_MS", "Timestamp(s)": "TIMESTAMP_S", "arrow.uuid": "UUID",
+    }
+    if delivery in fixed:
+        return fixed[delivery]
+    if re.fullmatch(r'Timestamp\((s|ms|µs|ns), ".+"\)', delivery):
+        return "TIMESTAMP WITH TIME ZONE"
+    m = re.fullmatch(r"Decimal128\((\d+), (\d+)\)", delivery)
+    if m:
+        return f"DECIMAL({m.group(1)},{m.group(2)})"
+    m = re.fullmatch(r"List\((.+)\)", delivery)
+    inner = arrow_to_duck(m.group(1), text_forms) if m else None
+    return f"{inner}[]" if inner else None
+
+
+def ledger(engine: str, mode: str) -> tuple[dict, set[str]]:
+    """The type ledger's rows for `engine` x `mode` keyed by normalized native type, and its TEXT form names."""
     import yaml
 
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     with open(os.path.join(root, "docs", "type-capability-matrix.yaml")) as f:
         doc = yaml.safe_load(f)
-    return set(((doc.get("engines") or {}).get(engine) or {}).get(mode) or {})
+    forms = set(doc.get("forms") or {})
+    rows = ((doc.get("engines") or {}).get(engine) or {}).get(mode) or []
+    return {norm_native(r["native_type"]): r for r in rows if isinstance(r, dict) and r.get("native_type")}, forms
 
 
 def pos_order(engine: str) -> str:
@@ -185,17 +235,19 @@ def manifest_facts(root: str, manifests: list[str]) -> tuple[list[str], int]:
     return ids, rows
 
 
-def _pg_projection(table: str, native: dict, text_forms: set[str]) -> str:
-    """A server-side SELECT rendering ledger TEXT deliveries and unbounded numerics with PostgreSQL's own text (the scanner reads a bare numeric as DOUBLE)."""
+def _pg_projection(table: str, native: dict, renders: dict) -> str:
+    """A server-side SELECT rendering each column the ledger renders server-side, and wide or unbounded numerics, with PostgreSQL's own text (the scanner reads those as DOUBLE)."""
     cols = []
     for name, nat in native.items():
         q = _qi(name)
-        cols.append(f"{q}::text AS {q}" if nat in text_forms or nat in ("numeric", "numeric[]") else q)
+        wide = nat.startswith("NUMERIC(") and int(nat[8:].split(",")[0].rstrip(")")) > 38
+        expr = renders.get(nat) or ("{c}::text" if nat in ("NUMERIC", "NUMERIC[]") or wide else "{c}")
+        cols.append(f"{expr.replace('{c}', q)} AS {q}")
     return f"postgres_query('pg', {_lit('SELECT ' + ', '.join(cols) + ' FROM ' + table)})"
 
 
-def _oracle_register(ora, url: str, sql: str) -> dict:
-    """Rows of an Oracle SELECT (read by python-oracledb) registered as `ora_src`; NUMBER as exact text, INTERVAL YEAR TO MONTH as ISO text, VECTOR as a list, an object as JSON. Returns `{column: "number"}` for the NUMBER columns."""
+def _oracle_register(ora, url: str, sql: str, json_cols: frozenset = frozenset()) -> dict:
+    """Rows of an Oracle SELECT (read by python-oracledb) registered as `ora_src`; NUMBER as exact text, INTERVAL YEAR TO MONTH as ISO text, VECTOR as a list, a JSON column as JSON text. Returns `{column: "NUMBER"}` for the NUMBER columns."""
     import array
     import decimal
 
@@ -207,28 +259,32 @@ def _oracle_register(ora, url: str, sql: str) -> dict:
 
     def cell(name: str, v: object) -> object:
         if isinstance(v, decimal.Decimal):
-            numeric[name] = "number"
+            numeric[name] = "NUMBER"
             return str(v)
         if type(v).__name__ == "IntervalYM":
             return f"P{v.years}Y{v.months}M"
         if isinstance(v, array.array):
             return list(v)
         whole = lambda d: int(d) if d == d.to_integral_value() else float(d)  # noqa: E731 — JSON numbers as JSON reads them
-        return json.dumps(v, default=lambda d: whole(d) if isinstance(d, decimal.Decimal) else str(d)) if isinstance(v, dict) else v
+        as_json = v is not None and (name in json_cols or isinstance(v, dict))
+        return json.dumps(v, default=lambda d: whole(d) if isinstance(d, decimal.Decimal) else str(d)) if as_json else v
 
     names, rows = oracle_result(url, sql)
     cols = list(zip(*[[cell(n, v) for n, v in zip(names, r)] for r in rows])) or [[] for _ in names]
 
     def column(c: list) -> pa.Array:
-        a = pa.array(c)
+        try:
+            a = pa.array(c)
+        except (pa.ArrowInvalid, pa.ArrowTypeError):  # a column of mixed python types: compared as text
+            return pa.array([None if v is None else (v.hex() if isinstance(v, bytes) else str(v)) for v in c])
         return pa.array(c, pa.string()) if pa.types.is_null(a.type) else a
 
     ora.db.register("ora_src", pa.table({n: column(list(c)) for n, c in zip(names, cols)}))
     return numeric
 
 
-def _source(ora, spec: dict, text_forms: set[str]) -> tuple[str, list[str], dict]:
-    """(source relation, primary key columns, native type per column) for the spec's engine."""
+def _source(ora, spec: dict, renders: dict) -> tuple[str, list[str], dict]:
+    """(source relation, primary key columns, declared type per column in the ledger's spelling) for the spec's engine."""
     from .value_diff import oracle_rows
 
     engine, table, query = spec["engine"], spec.get("table") or "", spec.get("query")
@@ -237,14 +293,18 @@ def _source(ora, spec: dict, text_forms: set[str]) -> tuple[str, list[str], dict
     if engine == "oracle":
         from .value_diff import oracle_table_select
 
-        native = _oracle_register(ora, spec["url"], query.rstrip().rstrip(";") if query else oracle_table_select(spec["url"], table))
-        rel = "ora_src"
         owner = f"owner = {_lit(schema.upper())}" if schema else "owner = USER"
-        if not query:
-            native.update({r["COLUMN_NAME"]: r["DATA_TYPE"].lower() for r in oracle_rows(
-                spec["url"],
-                f"SELECT column_name, data_type FROM all_tab_columns WHERE {owner} AND table_name = {_lit(leaf.upper())}",
-            )})
+        declared = {} if query else {r["COLUMN_NAME"]: norm_native(r["T"]) for r in oracle_rows(
+            spec["url"],
+            "SELECT column_name, CASE WHEN data_type = 'NUMBER' AND data_precision IS NOT NULL THEN "
+            "'NUMBER(' || data_precision || CASE WHEN data_scale > 0 THEN ',' || data_scale END || ')' "
+            "ELSE data_type END AS t FROM all_tab_columns "
+            f"WHERE {owner} AND table_name = {_lit(leaf.upper())}",
+        )}
+        sql = query.rstrip().rstrip(";") if query else oracle_table_select(spec["url"], table)
+        native = _oracle_register(ora, spec["url"], sql, frozenset(c for c, t in declared.items() if t == "JSON"))
+        native.update(declared)
+        rel = "ora_src"
         key = [r["COLUMN_NAME"] for r in oracle_rows(
             spec["url"],
             "SELECT cc.column_name FROM all_constraints c JOIN all_cons_columns cc "
@@ -263,15 +323,13 @@ def _source(ora, spec: dict, text_forms: set[str]) -> tuple[str, list[str], dict
                 f"AND a.attnum = ANY(i.indkey) WHERE i.indrelid = {reg}::regclass AND i.indisprimary"
             ) + ")"
         )]
-        native = dict(ora.rows(
+        native = {c: norm_native(t) for c, t in ora.rows(
             "SELECT * FROM postgres_query('pg', " + _lit(
-                "SELECT a.attname::text, CASE WHEN t.typname LIKE '\\_%' THEN substr(t.typname, 2) || '[]' "
-                "WHEN t.typname = 'numeric' AND a.atttypmod <> -1 THEN format_type(a.atttypid, a.atttypmod) "
-                "ELSE t.typname::text END FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid "
+                "SELECT a.attname::text, format_type(a.atttypid, a.atttypmod) FROM pg_attribute a "
                 f"WHERE a.attrelid = {reg}::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum"
             ) + ")"
-        ))
-        return _pg_projection(table, native, text_forms), key, native
+        )}
+        return _pg_projection(table, native, renders), key, native
     if engine == "mysql":
         db = spec["database"]
         if query:
@@ -283,12 +341,12 @@ def _source(ora, spec: dict, text_forms: set[str]) -> tuple[str, list[str], dict
                 "ORDER BY ORDINAL_POSITION"
             ) + ")"
         )]
-        native = dict(ora.rows(
+        native = {c: "BOOLEAN" if norm_native(t) == "TINYINT(1)" else norm_native(t) for c, t in ora.rows(
             "SELECT * FROM mysql_query('my', " + _lit(
-                f"SELECT COLUMN_NAME, DATA_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = {_lit(schema or db)} "
+                f"SELECT COLUMN_NAME, COLUMN_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = {_lit(schema or db)} "
                 f"AND TABLE_NAME = {_lit(leaf)}"
             ) + ")"
-        ))
+        )}
         return f"my.{schema or db}.{leaf}", key, native
     if engine == "mssql":
         sch = schema or "dbo"
@@ -302,7 +360,21 @@ def _source(ora, spec: dict, text_forms: set[str]) -> tuple[str, list[str], dict
                 "ORDER BY ic.key_ordinal"
             ) + ")"
         )]
-        return f"ms.{sch}.{leaf}", key, native
+        native = {c: norm_native(t) for c, t in ora.rows(
+            "SELECT * FROM mssql_scan('ms', " + _lit(
+                "SELECT COLUMN_NAME, UPPER(DATA_TYPE) + CASE WHEN DATA_TYPE IN ('decimal', 'numeric') THEN "
+                "'(' + CAST(NUMERIC_PRECISION AS varchar) + ',' + CAST(NUMERIC_SCALE AS varchar) + ')' "
+                "WHEN CHARACTER_MAXIMUM_LENGTH > 0 THEN '(' + CAST(CHARACTER_MAXIMUM_LENGTH AS varchar) + ')' "
+                "ELSE '' END FROM INFORMATION_SCHEMA.COLUMNS "
+                f"WHERE TABLE_SCHEMA = {_lit(sch)} AND TABLE_NAME = {_lit(leaf)}"
+            ) + ")"
+        )}
+        # The scanner trims CHAR/NCHAR padding; the server's own cast keeps it.
+        renders = {**{n: "CAST({c} AS NVARCHAR(MAX))" for n in native.values() if n.startswith(("CHAR(", "NCHAR("))}, **renders}
+        if not any(n in renders for n in native.values()):
+            return f"ms.{sch}.{leaf}", key, native
+        cols = ", ".join(renders.get(n, "{c}").replace("{c}", f"[{c}]") + f" AS [{c}]" for c, n in native.items())
+        return f"mssql_scan('ms', {_lit(f'SELECT {cols} FROM [{sch}].[{leaf}]')})", key, native
     if engine == "mongo":
         # The scanner infers a schema (flattening nested keys); only `_id` is shared with the document blob.
         return f'(SELECT "_id" FROM mg.{spec["database"]}.{_qi(leaf)})', ["_id"], native
@@ -321,6 +393,9 @@ def _attach(spec: dict) -> dict:
     if engine == "mongo":
         u = urlparse(url)
         return {"mongo": f"mongodb://{u.netloc}/" + (f"?{u.query}" if u.query else "")}
+    if engine == "postgres":
+        styles = "options=-c%20DateStyle%3DISO%2CMDY%20-c%20IntervalStyle%3Dpostgres%20-c%20TimeZone%3DUTC%20-c%20bytea_output%3Dhex"
+        url = url + ("&" if "?" in url else "?") + styles
     return source_attach(engine, url)[0]
 
 
@@ -356,9 +431,15 @@ def _numtext(v: object) -> object:
 
 
 def compare(
-    ora, src: str, dst: str | None, bits: frozenset = frozenset(), numbers: frozenset = frozenset()
+    ora,
+    src: str,
+    dst: str | None,
+    bits: frozenset = frozenset(),
+    numbers: frozenset = frozenset(),
+    exclude: frozenset = frozenset(),
+    ticks: frozenset = frozenset(),
 ) -> dict:
-    """Column pairing, per-column counts and the canon multiset difference between `src` and `dst`; `bits` names MySQL BIT(n) columns (bytes read as an unsigned integer), `numbers` source columns read as numeric text."""
+    """Column pairing, per-column counts and the canon multiset difference between `src` and `dst`; `bits` names MySQL BIT(n) columns (bytes read as an unsigned integer), `numbers` source columns read as numeric text, `exclude` columns not graded, `ticks` SQL Server DATETIME columns compared in its 1/300 s ticks."""
     import decimal
 
     from .value_diff import canon
@@ -368,6 +449,8 @@ def compare(
     exact, folded = dict(dcols), {n.lower(): (n, t) for n, t in dcols}
     pairs, missing = [], []
     for name, st in scols:
+        if name in exclude:
+            continue
         hit = (name, exact[name]) if name in exact else folded.get(name.lower())
         if hit:
             pairs.append((name, st, hit[0], hit[1]))
@@ -397,10 +480,14 @@ def compare(
     numeric = {i for i, (s, st, _, dt) in enumerate(pairs) if _is_num(st) or _is_num(dt) or s in numbers}
     bit = {i for i, p in enumerate(pairs) if p[0] in bits}
     nanos = {i for i, (_, st, _, dt) in enumerate(pairs) if "TIMESTAMP_NS" in (st, dt)}
+    tick = {i for i, p in enumerate(pairs) if p[0] in ticks}
 
     def cell(i: int, v: object) -> object:
         from .value_diff import _secs
 
+        if i in tick and v is not None:
+            c = canon(v)
+            return ("tick", str(round(decimal.Decimal(c[1]) * 300))) if isinstance(c, tuple) and c[0] == "ts" else c
         if i in bit and isinstance(v, (bytes, bytearray)):
             return int.from_bytes(v, "big")
         if i in nanos and (isinstance(v, int) or (isinstance(v, str) and v.lstrip("-").isdigit())):
@@ -422,19 +509,26 @@ def compare(
 
 
 def grade_findings(
-    f: dict, text_forms: set[str], native: dict, check_types: bool, overrides: frozenset = frozenset()
+    f: dict,
+    rows: dict,
+    text_forms: set[str],
+    native: dict,
+    check_types: bool,
+    overrides: frozenset = frozenset(),
 ) -> list[str]:
-    """Every disagreement in the findings `f`, one line each; empty means the run is sound (a `columns:` override is the export's own declared type, not graded)."""
+    """Every disagreement in the findings `f`, one line each; empty means the run is sound. A column with a ledger row is graded against the row's delivery (a `known_defect` row is an expected divergence); one without is graded as not narrower than the source; a `columns:` override is the export's own declaration."""
     bad = []
     if f.get("dst_cols"):
         bad += [f"TYPE: source column `{m}` is absent from the delivered parquet" for m in f["missing"]]
     for col, st, _, dt in f.get("pairs", []) if check_types else []:
         nat = native.get(col)
-        if col in overrides or (nat, dt) in NATIVE_FITS:
+        row = rows.get(nat) if nat else None
+        if col in overrides or (nat, dt) in NATIVE_FITS or (row and row.get("known_defect")):
             continue
-        if nat in text_forms and dt != "VARCHAR":
-            bad.append(f"TYPE: `{col}` ({nat}) has a TEXT delivery in the type ledger but was delivered as {dt}")
-        elif (why := type_loss(st, dt)) is not None:
+        want = arrow_to_duck(row["delivery"], text_forms) if row else None
+        if want is not None and want != dt:
+            bad.append(f"TYPE: `{col}` ({nat}): the type ledger delivers {row['delivery']} ({want}), delivered {dt}")
+        elif want is None and (why := type_loss(st, dt)) is not None:
             bad.append(f"TYPE: `{col}` source {st} delivered as {dt}: {why}")
     if "src_count" in f:
         if f["src_count"] != f["dst_count"]:
@@ -466,10 +560,14 @@ def grade_findings(
     return bad
 
 
-def _state_table(ora, name: str) -> str:
-    """`st.<schema>.<name>` wherever the state DB keeps it (a least-privilege role keeps its own schema)."""
+def _state_table(ora, spec: dict, name: str) -> str:
+    """`st.<schema>.<name>` wherever the state DB keeps it (a least-privilege role keeps its own schema); asked of the state DB alone, since `duckdb_tables()` would enumerate every attached catalog (mongoc opened ~800 connections doing so)."""
+    if not str(spec.get("state") or "").startswith("postgres"):
+        return f"st.{name}"
     rows = ora.rows(
-        f"SELECT schema_name FROM duckdb_tables() WHERE database_name = 'st' AND table_name = {_lit(name)}"
+        "SELECT * FROM postgres_query('st', "
+        + _lit(f"SELECT table_schema::text FROM information_schema.tables WHERE table_name = {_lit(name)}")
+        + ")"
     )
     return f"st.{rows[0][0]}.{name}" if rows else f"st.{name}"
 
@@ -481,21 +579,40 @@ def _counters(ora, spec: dict, new_parts: list[str], run_ids: list[str]) -> dict
     ids = ", ".join(_lit(r) for r in run_ids)
     names = "[" + ", ".join(_lit(os.path.basename(p)) for p in new_parts) + "]::VARCHAR[]"
     runs, rows = ora.rows(
-        f"SELECT count(*), coalesce(sum(total_rows), 0) FROM {_state_table(ora, 'export_metrics')} "
+        f"SELECT count(*), coalesce(sum(total_rows), 0) FROM {_state_table(ora, spec, 'export_metrics')} "
         f"WHERE run_id IN ({ids}) AND status = 'success'"
     )[0]
     fl_parts, fl_rows = ora.rows(
         f"SELECT count(DISTINCT regexp_extract(file_name, '[^/]+$')), coalesce(sum(row_count), 0) "
-        f"FROM {_state_table(ora, 'file_log')} WHERE run_id IN ({ids}) "
+        f"FROM {_state_table(ora, spec, 'file_log')} WHERE run_id IN ({ids}) "
         f"AND list_contains({names}, regexp_extract(file_name, '[^/]+$'))"
     )[0]
     return {"metrics_runs": runs, "metrics_rows": rows, "file_log_parts": fl_parts,
             "file_log_rows": fl_rows, "declared_parts": len(new_parts)}
 
 
+def _parts(ora, files: list[str]) -> str:
+    """A relation over parquet `files`; a Decimal256 column (wider than DuckDB's DECIMAL) is read by pyarrow as exact text."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    wide = [f.name for f in pq.read_schema(files[0]) if pa.types.is_decimal256(f.type)]
+    if not wide:
+        return f"read_parquet({_plist(files)}, union_by_name = true)"
+    table = pa.concat_tables([pq.read_table(f) for f in files], promote_options="default")
+    for name in wide:
+        table = table.set_column(table.schema.get_field_index(name), name, table[name].cast(pa.string()))
+    view = f"parts_{next(_VIEWS)}"
+    ora.db.register(view, table)
+    return view
+
+
+_VIEWS = itertools.count()
+
+
 def _meta_leg(ora, files: list[str], engine: str, snapshot: bool) -> str:
     """One SELECT over `files` carrying `__op`, `__pos`, `__seq` and the change order `__ord` (a snapshot leg sorts first)."""
-    rel = f"read_parquet({_plist(files)}, union_by_name = true)"
+    rel = _parts(ora, files)
     have = {c for c, _ in _columns(ora, rel)}
     add = [] if "__op" in have else ["'snapshot' AS __op"]
     add += [] if "__pos" in have else ["'' AS __pos"]
@@ -518,13 +635,25 @@ def grade(spec: dict) -> dict:
     run_ids, manifest_rows = manifest_facts(out_dir, spec["new_manifests"])
     ids, rows = manifest_facts(snap_dir, spec["new_snapshot_manifests"])
     run_ids, manifest_rows = run_ids + ids, manifest_rows + rows
-    forms = ledger_text_forms(engine, "cdc" if cdc else "batch")
+    rows, forms = ledger(engine, "cdc" if cdc else "batch")
+    renders = {
+        n: (r.get("render") or {}).get("server")
+        or ("{c}::text" if engine == "postgres" and (r.get("delivery") in forms or r.get("delivery") == "server_text") else None)
+        for n, r in rows.items()
+    }
+    renders = {n: e for n, e in renders.items() if e}
     kw = {"state": spec["state"]} if spec.get("state") else {}
     # Two threads: every live test runs this, and a scanner opens a connection per thread.
-    with Oracle(config={"threads": 2}, **kw, **_attach(spec)) as ora:
+    config = {"threads": 2, **SCANNER_SETTINGS.get(engine, {})}
+    with Oracle(config=config, **kw, **_attach(spec)) as ora:
         ora.db.sql("SET TimeZone = 'UTC'")
-        src, key, native = _source(ora, spec, forms)
+        src, key, native = _source(ora, spec, renders)
         key = spec.get("key") or key
+        # One read of the source: each later DESCRIBE or scan would open fresh scanner connections (mongoc opened ~2k per test).
+        # A CDC pin run can precede the table; its empty stream never reads the source.
+        if not cdc or snaps or declared_parts(out_dir, graded):
+            ora.db.sql(f"CREATE OR REPLACE TEMP TABLE source_rows AS SELECT * FROM {src}")
+            src = "source_rows"
         filt = watermark(out_dir, graded, spec.get("cursor_expr")) if cumulative and not cdc else None
         if filt:
             ora.db.sql(f"CREATE OR REPLACE TEMP TABLE got AS SELECT *, 0 AS __mseq FROM {src} LIMIT 0")
@@ -551,7 +680,7 @@ def grade(spec: dict) -> dict:
                 notes.append("no primary key found: CDC values not graded")
         else:
             legs = [
-                f"SELECT *, {i} AS __mseq FROM read_parquet({_plist(ps)}, union_by_name = true)"
+                f"SELECT *, {i} AS __mseq FROM {_parts(ora, ps)}"
                 for i, ps in enumerate(declared_parts(out_dir, [m]) for m in graded) if ps
             ]
             if legs:
@@ -564,13 +693,16 @@ def grade(spec: dict) -> dict:
                     dst = "(SELECT * EXCLUDE (__mseq) FROM got)"
         if engine == "mongo" and dst:
             dst = mongo_document_columns(ora, src, dst)
-        bits = frozenset(c for c, n in native.items() if n == "bit") if engine == "mysql" else frozenset()
-        numbers = frozenset(c for c, n in native.items() if n in ORACLE_NUMERIC) if engine == "oracle" else frozenset()
-        f = compare(ora, src, dst, bits, numbers) if dst or not cdc else {}
-        part_rows = ora.scalar(f"SELECT count(*) FROM read_parquet({_plist(new_parts)}, union_by_name = true)") if new_parts else 0
+        bits = frozenset(c for c, n in native.items() if n.startswith("BIT")) if engine == "mysql" else frozenset()
+        numbers = frozenset(c for c, n in native.items() if n.startswith(ORACLE_NUMERIC)) if engine == "oracle" else frozenset()
+        xfail = frozenset(c for c, n in native.items() if (rows.get(n) or {}).get("known_defect"))
+        notes += [f"`{c}` ({native[c]}) is a ledger known_defect: its values are the parity test's strict xfail" for c in sorted(xfail)]
+        ticks = frozenset(c for c, n in native.items() if ((rows.get(n) or {}).get("render") or {}).get("canon") == "datetime_tick")
+        f = compare(ora, src, dst, bits, numbers, xfail, ticks) if dst or not cdc else {}
+        part_rows = ora.scalar(f"SELECT count(*) FROM {_parts(ora, new_parts)}") if new_parts else 0
         f.update(part_rows=part_rows, manifest_rows=manifest_rows, **_counters(ora, spec, new_parts, run_ids))
     overrides = frozenset(spec.get("overrides") or [])
-    failures = grade_findings(f, forms, native, engine != "mongo", overrides)
+    failures = grade_findings(f, rows, forms, native, engine != "mongo", overrides)
     facts = {k: v for k, v in f.items() if k not in ("pairs", "dst_cols", "src_stats", "dst_stats")}
     return {"failures": failures, "notes": notes, "facts": facts, "key": key}
 
@@ -595,19 +727,26 @@ def _self_test() -> None:
         "part_rows": 2, "manifest_rows": 2, "metrics_runs": 1, "metrics_rows": 5, "file_log_rows": 2,
         "file_log_parts": 1, "declared_parts": 1,
     }
-    bad = "\n".join(grade_findings(f, set(), {}, True))
+    bad = "\n".join(grade_findings(f, {}, set(), {}, True))
     for cls in ("column `gone`", "TYPE: `id`", "COUNT(*)", "COUNT(`id`)", "COUNT(DISTINCT `id`)", "VALUES",
                 "export_metrics.total_rows 5"):
         assert cls in bad, f"{cls} missing from {bad}"
     clean = {**f, "missing": [], "pairs": [["id", "BIGINT", "id", "BIGINT"]], "src_count": 2,
              "src_stats": [[2, 2]], "dst_stats": [[2, 2]], "only_src": 0, "metrics_rows": 2}
-    assert not grade_findings(clean, set(), {}, True), grade_findings(clean, set(), {}, True)
-    assert grade_findings({**clean, "file_log_rows": 3}, set(), {}, True), "a wrong file_log is a finding"
-    assert grade_findings({**clean, "file_log_parts": 0}, set(), {}, True), "a declared part file_log lacks is a finding"
+    assert not grade_findings(clean, {}, set(), {}, True), grade_findings(clean, {}, set(), {}, True)
+    assert grade_findings({**clean, "file_log_rows": 3}, {}, set(), {}, True), "a wrong file_log is a finding"
+    assert grade_findings({**clean, "file_log_parts": 0}, {}, set(), {}, True), "a declared part file_log lacks is a finding"
     assert _numtext("1.50") == _numtext("1.5000"), "a numeric text compares by value"
-    assert grade_findings({**clean, "manifest_rows": 3}, set(), {}, True), "a wrong manifest row_count is a finding"
+    assert grade_findings({**clean, "manifest_rows": 3}, {}, set(), {}, True), "a wrong manifest row_count is a finding"
     led = {**clean, "pairs": [["n", "DOUBLE", "n", "DOUBLE"]]}
-    assert any("TEXT delivery" in b for b in grade_findings(led, {"numeric"}, {"n": "numeric"}, True))
+    rows = {"NUMERIC": {"delivery": "decimal_plain"}, "BIGINT": {"delivery": "Int64", "known_defect": "x"}}
+    assert any("type ledger delivers decimal_plain" in b for b in grade_findings(led, rows, {"decimal_plain"}, {"n": "NUMERIC"}, True))
+    xfail = {**clean, "pairs": [["b", "BIGINT", "b", "INTEGER"]]}
+    assert not grade_findings(xfail, rows, set(), {"b": "BIGINT"}, True), "a known_defect row is an expected divergence"
+    assert norm_native("timestamp(6) without time zone[]") == "TIMESTAMP(6)[]"
+    assert norm_native("character varying(50)") == "VARCHAR(50)"
+    assert arrow_to_duck('Timestamp(µs, "UTC")', set()) == "TIMESTAMP WITH TIME ZONE"
+    assert arrow_to_duck("List(Decimal128(18, 2))", set()) == "DECIMAL(18,2)[]"
     print("rig_oracle self-test ok")
 
 

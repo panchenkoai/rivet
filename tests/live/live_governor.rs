@@ -834,7 +834,6 @@ fn mssql_adaptive_never_loses_to_its_own_baseline_on_an_idle_source() {
     const CEILING: usize = 4;
     let run = |adaptive: bool| -> (f64, String) {
         let rig = Rig::mssql_governor_batch(table.name())
-            .no_oracle("known defect: DATETIME2(7) is delivered as Timestamp(us), truncating the 100ns tick (arrow_convert.rs known gap 4)")
             .mode("chunked")
             .source_line("tuning:")
             .source_line(&format!("  adaptive: {adaptive}"))

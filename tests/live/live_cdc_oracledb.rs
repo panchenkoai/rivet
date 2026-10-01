@@ -438,9 +438,8 @@ fn oracle_cdc_non_utc_session_matches_batch() {
     rig(&t, &ckpt, &d.path().join("anchor")).run_ok();
     seed_types(t.name());
     let cdc_out = d.path().join("cdc");
-    rig(&t, &ckpt, &cdc_out).no_oracle("known defect: Oracle TIMESTAMP(9) is delivered as Timestamp(us), truncating nanoseconds (warned by the type policy, not refused)").run_ok();
-    let batch = Rig::oracle_batch(t.name())
-        .no_oracle("known defect: Oracle TIMESTAMP(9) is delivered as Timestamp(us), truncating nanoseconds (warned by the type policy, not refused)");
+    rig(&t, &ckpt, &cdc_out).run_ok();
+    let batch = Rig::oracle_batch(t.name());
     batch.run_ok();
     let cdc = duckdb_run_sql_json(&cells_sql(&cdc_out, true));
     let batch = duckdb_run_sql_json(&cells_sql(&batch.out_dir(), false));

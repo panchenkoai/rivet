@@ -16,10 +16,10 @@
 use std::path::{Path, PathBuf};
 
 /// `.no_oracle(` call sites across tests/, excluding the rig's own definition.
-const NO_ORACLE_CEILING: usize = 44;
+const NO_ORACLE_CEILING: usize = 24;
 
 /// Rust DuckDB-helper call sites across tests/ (see [`duckdb_helper_names`]).
-const DUCKDB_HELPER_CEILING: usize = 633;
+const DUCKDB_HELPER_CEILING: usize = 627;
 
 /// Owned by a concurrent branch and migrated after it lands; not counted.
 const EXCLUDED: &[&str] = &["tests/live/live_cdc_type_parity.rs"];

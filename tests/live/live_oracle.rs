@@ -146,8 +146,7 @@ fn oracle_full_export_matches_the_databases_own_rendering_for_every_type() {
     require_alive(LiveService::Oracle);
     let t = type_matrix_table();
     let out = tempfile::tempdir().unwrap();
-    let rig = Rig::oracle_batch(t.name()).dest_path(out.path().to_path_buf())
-        .no_oracle("known defect: Oracle TIMESTAMP(9) is delivered as Timestamp(us), truncating nanoseconds (warned by the type policy, not refused)");
+    let rig = Rig::oracle_batch(t.name()).dest_path(out.path().to_path_buf());
     let run = rig.run_args(&[]);
     assert!(
         run.status.success(),
@@ -472,7 +471,6 @@ fn every_seeded_oracle_table_exports_every_row() {
             .unwrap();
         let out = tempfile::tempdir().unwrap();
         let run = Rig::oracle_batch(table)
-            .no_oracle("known defect: Oracle TIMESTAMP(9) is delivered as Timestamp(us), truncating nanoseconds (warned by the type policy, not refused)")
             .dest_path(out.path().to_path_buf())
             .run_args(&[]);
         if !run.status.success() {

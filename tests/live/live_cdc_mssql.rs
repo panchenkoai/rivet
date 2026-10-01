@@ -425,7 +425,7 @@ fn mssql_cdc_update_and_delete_carry_full_types() {
     wait_for_capture(&ci, 1);
     let out = d.path().join("out");
     std::fs::create_dir_all(&out).unwrap();
-    mssql_cdc_rig(&table, &ci, &ckpt, &out).no_oracle("known defect: DATETIME2(7) is delivered as Timestamp(us), truncating the 100ns tick (arrow_convert.rs known gap 4)").run_ok();
+    mssql_cdc_rig(&table, &ci, &ckpt, &out).run_ok();
 
     mssql_cdc_exec(&format!(
         "UPDATE dbo.{table} SET amount=99999999999999.9999, \
@@ -437,8 +437,8 @@ fn mssql_cdc_update_and_delete_carry_full_types() {
     let batch_out = d.path().join("batch");
     std::fs::create_dir_all(&upd_out).unwrap();
     std::fs::create_dir_all(&batch_out).unwrap();
-    mssql_cdc_rig(&table, &ci, &ckpt, &upd_out).no_oracle("known defect: DATETIME2(7) is delivered as Timestamp(us), truncating the 100ns tick (arrow_convert.rs known gap 4)").run_ok();
-    mssql_full_rig(&table, &batch_out).no_oracle("known defect: DATETIME2(7) is delivered as Timestamp(us), truncating the 100ns tick (arrow_convert.rs known gap 4)").run_ok();
+    mssql_cdc_rig(&table, &ci, &ckpt, &upd_out).run_ok();
+    mssql_full_rig(&table, &batch_out).run_ok();
     let upd = read_one_batch(&upd_out);
     assert_eq!(upd.num_rows(), 1, "exactly the update after-image");
     let batch = read_one_batch(&batch_out);
@@ -457,7 +457,7 @@ fn mssql_cdc_update_and_delete_carry_full_types() {
     wait_for_capture(&ci, 4);
     let del_out = d.path().join("del");
     std::fs::create_dir_all(&del_out).unwrap();
-    mssql_cdc_rig(&table, &ci, &ckpt, &del_out).no_oracle("known defect: DATETIME2(7) is delivered as Timestamp(us), truncating the 100ns tick (arrow_convert.rs known gap 4)").run_ok();
+    mssql_cdc_rig(&table, &ci, &ckpt, &del_out).run_ok();
     let del = read_one_batch(&del_out);
     assert_eq!(del.num_rows(), 1);
     use arrow::array::Int32Array;

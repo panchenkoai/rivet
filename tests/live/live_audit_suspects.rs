@@ -227,7 +227,7 @@ fn mssql_incremental_on_a_legacy_datetime_cursor_takes_the_next_row_once() {
     ));
 
     let rig = Rig::mssql_batch(&table)
-        .no_oracle("legacy DATETIME is 1/300 s: rivet rounds it to the nearest microsecond, the DuckDB scanner truncates, and neither equals the source")
+        .no_oracle("query export over a legacy DATETIME: a query names no catalog type, so the 1/300 s tick canon cannot apply (the scanner truncates, rivet rounds)")
         .query(&format!("SELECT id, updated_at FROM {table}"))
         .mode("incremental")
         .export_line("cursor_column: updated_at");
@@ -830,7 +830,6 @@ fn parallel_keyset_incremental_on_an_mssql_datetime_key_exports_the_newest_row()
              INSERT INTO dbo.{table} VALUES {values}"
         ));
         let rig = Rig::mssql_batch(&table)
-            .no_oracle("known defect: DATETIME2(7) is delivered as Timestamp(us), truncating the 100ns tick (arrow_convert.rs known gap 4)")
             .duckdb_oracle()
             .mode("chunked")
             .export_line("chunk_by_key: ts")

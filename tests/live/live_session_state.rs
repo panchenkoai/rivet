@@ -218,7 +218,6 @@ fn mssql_incremental_on_a_datetime_cursor_reads_each_row_once_for_a_day_first_lo
     let (t, _g) = mssql_dt_table("ss_minc", 200);
     let login = DayFirstLogin::create();
     let rig = Rig::mssql_batch(&t)
-        .no_oracle("legacy DATETIME is 1/300 s: rivet rounds it to the nearest microsecond, the DuckDB scanner truncates, and neither equals the source")
         .source_url(&login.url())
         .mode("incremental")
         .export_line("cursor_column: ts");
@@ -237,7 +236,6 @@ fn mssql_date_window_chunks_read_each_row_once_for_a_day_first_login() {
     let (t, _g) = mssql_dt_table("ss_mdays", 300);
     let login = DayFirstLogin::create();
     let rig = Rig::mssql_batch(&t)
-        .no_oracle("legacy DATETIME is 1/300 s: rivet rounds it to the nearest microsecond, the DuckDB scanner truncates, and neither equals the source")
         .source_url(&login.url())
         .mode("chunked")
         .export_line("chunk_column: ts")
