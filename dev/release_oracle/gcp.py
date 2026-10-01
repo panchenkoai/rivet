@@ -13,6 +13,8 @@ import subprocess
 import threading
 import time
 import urllib.parse
+import urllib.request
+from pathlib import Path
 
 # gcloud hands back its CACHED token until that has under 5 min left, so a token
 # fetched now may expire in 5 min, not 60: re-ask every 4 (it costs ~0.3 s).
@@ -137,6 +139,14 @@ def gcs_list(bucket: str, prefix: str) -> list[str]:
         page = b.get("nextPageToken", "")
         if not page:
             return names
+
+
+def gcs_download(bucket: str, name: str, dest: Path) -> None:
+    """Write object `name`'s bytes to `dest`."""
+    url = f"https://storage.googleapis.com/storage/v1/b/{bucket}/o/{urllib.parse.quote(name, safe='')}?alt=media"
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token()}"})
+    with urllib.request.urlopen(req, timeout=300) as r:
+        dest.write_bytes(r.read())
 
 
 def gcs_delete_prefix(bucket: str, prefix: str) -> int:

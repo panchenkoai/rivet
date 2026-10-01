@@ -371,11 +371,13 @@ def _state(o, src: Src, dset: str, t: str) -> tuple[str, str, str, int, bool]:
 
 
 def _oracle_no_load(led: Ledger, name: str, fail, step, body: str, bucket: str, pfx: str,
-                    tables: list[str]) -> None:
+                    tables: list[str], src: Src, d: Path) -> None:
     """Oracle CDC does not load yet (ADR-0037; the GA work): init writes no `load:` block, says why,
-    and `run` writes every table's baseline to Parquet. The values are graded by the live test
-    `a_generated_oracle_cdc_config_has_no_load_block_and_runs_to_parquet`."""
+    and `run` writes every table's baseline to Parquet whose `id:v:epoch` equals the source's."""
+    import duckdb
+
     from . import gcp
+    from .scenarios import _declared_read
 
     if "\nload:" in body or "ADR-0037" not in body:
         return fail("init", "an Oracle CDC scaffold must carry no `load:` block and name ADR-0037: " + body[-400:])
@@ -383,13 +385,28 @@ def _oracle_no_load(led: Ledger, name: str, fail, step, body: str, bucket: str, 
     if not r.ok:
         return fail("run", f"this {_why(r)}")
     names = gcp.gcs_list(bucket, f"{pfx}/")
-    missing = [t for t in tables
-               if not any(f"/{t}/cdc/snapshot/" in n and n.endswith(".parquet") for n in names)]
-    if missing:
-        return fail("run", f"no baseline Parquet for {missing}: {names[:10]}")
+    bad = []
+    for t in tables:
+        # The snapshot leg's objects, then only the parts its manifest DECLARES (what a consumer reads).
+        objs = [n for n in names if f"/{t}/cdc/snapshot/" in n and "/" not in n.split("/snapshot/", 1)[1]]
+        local = d / "baseline" / t
+        local.mkdir(parents=True)
+        for n in objs:
+            gcp.gcs_download(bucket, n, local / n.rsplit("/", 1)[1])
+        declared = _declared_read(local, ".parquet")
+        if declared is None:
+            bad.append(f"{t}: the manifest declares no baseline Parquet ({len(objs)} objects)")
+            continue
+        got = _join(duckdb.sql(f"SELECT ID, V, epoch(CREATED_AT) FROM read_parquet({declared})").fetchall())
+        want = src.fp(None, t)
+        if not want or got != want:
+            bad.append(f"{t}: parquet={got!r} src={want!r}")
+    if bad:
+        return fail("run", "the baseline Parquet differs from the source — " + "; ".join(bad)[:600])
     led.passed("oracle", "-", SCEN, "cdc-load", f"{name}: init writes no `load:` block (Oracle CDC load is "
                f"the GA work, ADR-0037), `check` passes, `run` writes each of {len(tables)} tables' baseline "
-               "to Parquet", "cdc-load")
+               "to Parquet equal to the source `id:v:epoch` (DuckDB over the Parquet, python-oracledb over "
+               "the source)", "cdc-load")
 
 
 def cdc_load_leg(led: Ledger, prev: Path, root: Path, engine: str, url: str, tz: str | None = None,
@@ -464,7 +481,7 @@ def cdc_load_leg(led: Ledger, prev: Path, root: Path, engine: str, url: str, tz:
                 if not chk.ok:
                     return fail("check", f"this binary refuses its own init's config: {_why(chk)}")
             if init_this and engine == "oracle":
-                return _oracle_no_load(led, name, fail, step, body, bucket, pfx, tables)
+                return _oracle_no_load(led, name, fail, step, body, bucket, pfx, tables, src, d)
             if anchor_first:
                 # init's own advice for a changes-only stream: anchor first, then the rows arrive.
                 a = step(prev, "run", "-c", "c.yaml")
