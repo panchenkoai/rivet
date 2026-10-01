@@ -236,11 +236,7 @@ fn pow10_i256(n: u32) -> Option<i256> {
 pub fn decimal_text_to_int(s: &str) -> Option<i128> {
     let s = s.trim();
     let (int, frac) = s.split_once('.').unwrap_or((s, ""));
-    let digits = int.strip_prefix(['-', '+']).unwrap_or(int);
-    if digits.is_empty()
-        || !digits.bytes().all(|b| b.is_ascii_digit())
-        || !frac.bytes().all(|b| b == b'0')
-    {
+    if !frac.bytes().all(|b| b == b'0') {
         return None;
     }
     int.parse().ok()

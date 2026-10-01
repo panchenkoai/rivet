@@ -127,19 +127,31 @@ pub(super) fn oracle_type_mappings(
             let mapping = TypeMapping::from_source(&source, rivet);
             if overrides.contains_key(m.name()) {
                 mapping
-            } else if is_bare_number(OraKind::of(m), m.precision(), m.scale()) {
-                mapping.with_warning(bare_number_warning(m.name()))
-            } else if sub_microsecond(native, m.scale()) {
-                TypeMapping {
-                    fidelity: crate::types::TypeFidelity::Lossy,
-                    ..mapping
-                }
-                .with_warning(TIMESTAMP_NS_WARNING)
             } else {
-                mapping
+                with_oracle_warning(
+                    mapping,
+                    is_bare_number(OraKind::of(m), m.precision(), m.scale()),
+                    sub_microsecond(native, m.scale()),
+                )
             }
         })
         .collect()
+}
+
+/// The un-overridden mapping with its Oracle warning: bare NUMBER as text, or sub-µs truncation (lossy).
+fn with_oracle_warning(mapping: TypeMapping, bare_number: bool, sub_us: bool) -> TypeMapping {
+    if bare_number {
+        let name = mapping.column_name.clone();
+        mapping.with_warning(bare_number_warning(&name))
+    } else if sub_us {
+        TypeMapping {
+            fidelity: crate::types::TypeFidelity::Lossy,
+            ..mapping
+        }
+        .with_warning(TIMESTAMP_NS_WARNING)
+    } else {
+        mapping
+    }
 }
 
 /// True for a TIMESTAMP / INTERVAL DAY TO SECOND whose fraction is finer than the µs rivet keeps.
@@ -503,6 +515,25 @@ pub(super) fn rows_to_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sub_microsecond_column_is_marked_lossy_and_a_bare_number_warns_by_name() {
+        use crate::types::{SourceColumn, TypeFidelity};
+        let ts = || {
+            TypeMapping::from_source(
+                &SourceColumn::simple("TS9", "timestamp(9)", true),
+                RivetType::String,
+            )
+        };
+        let plain = with_oracle_warning(ts(), false, false);
+        assert_ne!(plain.fidelity, TypeFidelity::Lossy);
+        assert!(plain.warnings.is_empty());
+        let lossy = with_oracle_warning(ts(), false, true);
+        assert_eq!(lossy.fidelity, TypeFidelity::Lossy);
+        assert_eq!(lossy.warnings, vec![TIMESTAMP_NS_WARNING.to_string()]);
+        let bare = with_oracle_warning(ts(), true, false);
+        assert_eq!(bare.warnings, vec![bare_number_warning("TS9")]);
+    }
 
     #[test]
     fn number_precision_and_scale_pick_the_narrowest_lossless_type() {

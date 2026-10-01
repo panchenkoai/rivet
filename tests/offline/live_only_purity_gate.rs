@@ -105,6 +105,8 @@ const BASELINE: &[(&str, usize, usize, usize, usize)] = &[
     ("src/load/bigquery/mod.rs::rebuild_changelog", 0, 0, 0, 1),
     ("src/source/mysql/cdc.rs::fill", 0, 1, 4, 0),
     ("src/source/postgres/cdc.rs::fill", 1, 2, 4, 2),
+    // Excluded 2026-10-01; its transaction-group close moved out to `close_poll_groups`.
+    ("src/source/mssql/cdc.rs::fill", 0, 0, 1, 0),
     // ── the export RUNNERS ───────────────────────────────────────────────
     // The three big-table runners each own their execution loop, and each loop
     // is dense with pagination/plan arithmetic. These are the ceilings most
@@ -116,6 +118,8 @@ const BASELINE: &[(&str, usize, usize, usize, usize)] = &[
     // statement-timeout arm), not grown by the exclusion; shrink as they are extracted.
     ("src/source/mssql/mod.rs::introspect_mssql_on", 0, 0, 2, 0),
     ("src/source/oracle/mod.rs::export_within_budget", 2, 0, 2, 2),
+    // Excluded 2026-10-01 (its Ok(()) stub only) at its existing decisions; shrink as they are extracted.
+    ("src/source/mssql/mod.rs::export", 3, 1, 2, 5),
     // The Postgres release of a state lease (heartbeat stop + row delete): glue.
     ("src/state/load_lease.rs::drop", 0, 0, 0, 0),
     (

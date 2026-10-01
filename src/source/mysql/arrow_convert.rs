@@ -1892,6 +1892,7 @@ mod roast_mysql_bit_decode_tests {
             ("u64", v_uint(18_000_000_000_000_000_000)),
             ("f32", v_float(0.5)),
             ("f64", v_double(-1.25)),
+            ("f64_text", v_bytes(b"-2.5")),
             ("dec", v_bytes(b"150.05")),
             ("utf8", v_bytes("h\u{e9}llo".as_bytes())),
             ("bin", v_blob(&[0xde, 0xad])),
@@ -1915,6 +1916,21 @@ mod roast_mysql_bit_decode_tests {
         assert_eq!(s.uint64(col("u64"), 0), Some(18_000_000_000_000_000_000));
         assert_eq!(s.float32(col("f32"), 0), Some(0.5));
         assert_eq!(s.float64(col("f64"), 0), Some(-1.25));
+        assert_eq!(
+            s.float64(col("f64_text"), 0),
+            Some(-2.5),
+            "a text-wire double"
+        );
+        assert_eq!(
+            s.float32(col("f64"), 0),
+            Some(-1.25),
+            "a double read as float"
+        );
+        assert_eq!(
+            s.float32(col("f64_text"), 0),
+            Some(-2.5),
+            "a text-wire float"
+        );
         // decimal keeps the UNSCALED integer: 150.05 at scale 2 is 15005.
         assert_eq!(s.decimal128(col("dec"), 0, 2), Some(15005));
         assert_eq!(

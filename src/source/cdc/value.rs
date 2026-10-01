@@ -1897,6 +1897,63 @@ mod tests {
         assert_eq!(arr.len(), 1);
     }
 
+    /// A Boolean column reads a zero integer of either signedness as false and any other as true.
+    #[test]
+    fn a_boolean_reads_zero_as_false_for_signed_and_unsigned_wire_ints() {
+        use RivetValue as V;
+        for (v, want) in [
+            (V::Int(0), false),
+            (V::Int(-1), true),
+            (V::UInt(0), false),
+            (V::UInt(1), true),
+        ] {
+            assert_eq!(bool_value(&v), Ok(want), "{v:?}");
+        }
+    }
+
+    /// Each numeric reader takes every wire variant a driver delivers for it.
+    #[test]
+    fn numeric_readers_take_every_wire_variant() {
+        use RivetValue as V;
+        assert_eq!(int_value::<i16>(&V::Bool(true)), Ok(1));
+        assert_eq!(int_value::<i16>(&V::Bool(false)), Ok(0));
+        assert_eq!(f64_value(&V::Int(-3)), Ok(-3.0));
+        assert_eq!(f32_value(&V::UInt(7)), Ok(7.0));
+    }
+
+    /// Every list element type builds from its driver variant, and the cell fold equals the built list's fold.
+    #[test]
+    fn every_list_element_type_builds_from_its_driver_variant() {
+        use arrow::array::{Array, ListArray};
+        use arrow::datatypes::Field;
+
+        use crate::source::value_checksum::array_checksum;
+        use RivetValue as V;
+        let cases = [
+            (DataType::Boolean, V::Bool(true), "true"),
+            (DataType::Int64, V::Int(i64::MIN), "-9223372036854775808"),
+            (DataType::Float32, V::Float(1.5), "1.5"),
+            (DataType::Float64, V::Float(2.25), "2.25"),
+            (DataType::Float64, V::Int(3), "3.0"),
+        ];
+        for (elem, v, shown) in cases {
+            let dt = DataType::List(Arc::new(Field::new("item", elem.clone(), true)));
+            let cell = V::Array(vec![v.clone(), V::Null]);
+            let arr = build_column(&dt, &[Some(&cell)])
+                .unwrap_or_else(|r| panic!("{elem}: {v:?} refused: {}", r.reason));
+            let list = arr.as_any().downcast_ref::<ListArray>().unwrap().value(0);
+            assert_eq!(list.len(), 2, "{elem}");
+            assert!(list.is_null(1), "{elem}");
+            let got = arrow::util::display::array_value_to_string(&list, 0).unwrap();
+            assert_eq!(got, shown, "{elem}");
+            assert_eq!(
+                cells_checksum(&dt, &[Some(&cell)]),
+                array_checksum(arr.as_ref()),
+                "{elem}: cell fold drifted from the built list"
+            );
+        }
+    }
+
     /// Every MySQL cell fix refuses a wire value it cannot read instead of returning NULL.
     #[test]
     fn mysql_cell_fixes_refuse_an_unreadable_wire_value() {

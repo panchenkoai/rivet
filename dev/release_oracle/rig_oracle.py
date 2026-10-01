@@ -30,6 +30,7 @@ so its TYPE check sees text. The CDC checkpoint is not graded.
 
 from __future__ import annotations
 
+import datetime as dt
 import itertools
 import json
 import os
@@ -261,6 +262,17 @@ def _pg_projection(table: str, native: dict, renders: dict) -> str:
     return f"postgres_query('pg', {_lit('SELECT ' + ', '.join(cols) + ' FROM ' + table)})"
 
 
+def oracle_ds_iso(td: "dt.timedelta") -> str:
+    """An INTERVAL DAY TO SECOND (python-oracledb's timedelta) as ISO text with Oracle's own day field, every part carrying the sign."""
+    import decimal
+
+    total = td // dt.timedelta(microseconds=1)
+    days, rest = divmod(abs(total), 86_400_000_000)
+    sign = "-" if total < 0 else ""
+    secs = format((decimal.Decimal(rest).scaleb(-6)).normalize(), "f") if rest else "0"
+    return f"P{sign}{days}DT{sign}{secs}S"
+
+
 def _oracle_register(ora, url: str, sql: str, json_cols: frozenset = frozenset()) -> dict:
     """Rows of an Oracle SELECT (read by python-oracledb) registered as `ora_src`; NUMBER as exact text, INTERVAL YEAR TO MONTH as ISO text, VECTOR as a list, a JSON column as JSON text. Returns `{column: "NUMBER"}` for the NUMBER columns."""
     import array
@@ -278,6 +290,8 @@ def _oracle_register(ora, url: str, sql: str, json_cols: frozenset = frozenset()
             return str(v)
         if type(v).__name__ == "IntervalYM":
             return f"P{v.years}Y{v.months}M"
+        if isinstance(v, dt.timedelta):
+            return oracle_ds_iso(v)
         if isinstance(v, array.array):
             return list(v)
         whole = lambda d: int(d) if d == d.to_integral_value() else float(d)  # noqa: E731 — JSON numbers as JSON reads them
@@ -1036,6 +1050,14 @@ def _self_test() -> None:
     assert norm_native("character varying(50)") == "VARCHAR(50)"
     assert arrow_to_duck('Timestamp(µs, "UTC")', set()) == "TIMESTAMP WITH TIME ZONE"
     assert arrow_to_duck("List(Decimal128(18, 2))", set()) == "DECIMAL(18,2)[]"
+    from .value_diff import canon
+
+    one_day = dt.timedelta(days=1, hours=2, minutes=3, seconds=4, microseconds=5)
+    assert oracle_ds_iso(one_day) == "P1DT7384.000005S", oracle_ds_iso(one_day)
+    assert canon(oracle_ds_iso(one_day)) == canon("P1DT2H3M4.000005S"), "Oracle's day is its own field"
+    assert canon(oracle_ds_iso(-dt.timedelta(days=1, hours=2))) == canon("P-1DT-2H"), "the sign rides every part"
+    assert canon(oracle_ds_iso(dt.timedelta(0))) == canon("PT0S")
+    assert canon(oracle_ds_iso(one_day)) != canon("PT93784.000005S"), "a day is not folded into seconds"
     _ns_self_test()
     print("rig_oracle self-test ok")
 

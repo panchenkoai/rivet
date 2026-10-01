@@ -637,7 +637,7 @@ fn keyset_over_a_wide_table_survives_many_page_reexecutions() {
     );
 }
 
-/// Types past Arrow's direct reach: s > p, negative scale, YEAR(9) intervals, BC dates, XMLTYPE, VECTOR.
+/// Types past Arrow's direct reach: s > p, negative scale, YEAR(9) and DAY(9) intervals, BC dates, XMLTYPE, VECTOR.
 #[test]
 #[ignore = "live: requires docker compose oracle"]
 fn edge_oracle_types_export_losslessly() {
@@ -645,14 +645,16 @@ fn edge_oracle_types_export_losslessly() {
     let t = OracleTable::create(
         "ora_edge",
         "id NUMBER(10) PRIMARY KEY, nsp NUMBER(3,5), nneg NUMBER(5,-2), \
-         iym INTERVAL YEAR(9) TO MONTH, d DATE, x XMLTYPE, v VECTOR(3, FLOAT32)",
+         iym INTERVAL YEAR(9) TO MONTH, ids INTERVAL DAY(9) TO SECOND(6), d DATE, x XMLTYPE, \
+         v VECTOR(3, FLOAT32)",
     );
     for row in [
         "1, 0.00123, 12300, INTERVAL '999999999-11' YEAR(9) TO MONTH, \
-         TO_DATE('-0001-06-15','SYYYY-MM-DD'), XMLTYPE('<a>x</a>'), TO_VECTOR('[1.5, 2, -3]')",
+         INTERVAL '1 02:03:04.000005' DAY TO SECOND, TO_DATE('-0001-06-15','SYYYY-MM-DD'), XMLTYPE('<a>x</a>'), TO_VECTOR('[1.5, 2, -3]')",
         "2, -0.00999, -9999900, INTERVAL '-999999999-11' YEAR(9) TO MONTH, \
-         TO_DATE('-4712-01-01','SYYYY-MM-DD'), NULL, NULL",
-        "3, NULL, NULL, INTERVAL '0-0' YEAR TO MONTH, TO_DATE('2024-02-29','YYYY-MM-DD'), NULL, NULL",
+         INTERVAL '0 00:00:00' DAY TO SECOND, TO_DATE('-4712-01-01','SYYYY-MM-DD'), NULL, NULL",
+        "3, NULL, NULL, INTERVAL '0-0' YEAR TO MONTH, NULL, TO_DATE('2024-02-29','YYYY-MM-DD'), \
+         NULL, NULL",
     ] {
         ora_exec(&format!("INSERT INTO {} VALUES ({row})", t.name()));
     }
@@ -682,6 +684,10 @@ fn edge_oracle_types_export_losslessly() {
     assert_eq!(iym[&1].as_deref(), Some("P999999999Y11M"));
     assert_eq!(iym[&2].as_deref(), Some("P-999999999Y-11M"));
     assert_eq!(iym[&3].as_deref(), Some("PT0S"));
+    let ids = parquet_cells(out.path(), "IDS");
+    assert_eq!(ids[&1].as_deref(), Some("P1DT2H3M4.000005S"));
+    assert_eq!(ids[&2].as_deref(), Some("PT0S"));
+    assert_eq!(ids[&3], None);
     // DuckDB renders the calendar date (with its own BC marker); Oracle renders the same.
     let want_d: BTreeSet<String> = ora_text_rows(&format!(
         "SELECT TO_CHAR(d, 'YYYY-MM-DD') || CASE WHEN d < DATE '0001-01-01' THEN ' (BC)' END FROM {}",
@@ -1883,7 +1889,7 @@ fn an_incremental_cursor_on_a_nanosecond_timestamp_is_refused_before_it_re_expor
 
 /// The `columns:` override types beyond the autodetected ones, one column each.
 const OVERRIDE_DECODERS: &str = "columns: {N_SMALL: int16, D: date, TS9: timestamp_ns, \
-    TS6: timestamp_tz, DT: text, T9TXT: text, BD: text, BF: float64, B: text, RW: uuid, R8: text, \
+    TS6: timestamp_tz, DT: text, T9TXT: text, BD: text, BF: float64, BFT: text, B: text, RW: uuid, R8: text, \
     N_F4: float4, TZ9: timestamp_tz_ns}";
 
 /// A table whose every column is read through one of [`OVERRIDE_DECODERS`].
@@ -1892,20 +1898,20 @@ fn override_decoder_table() -> OracleTable {
         "ora_ovr",
         "id NUMBER(10) PRIMARY KEY, n_small NUMBER(4), d DATE, ts9 TIMESTAMP(9), \
          ts6 TIMESTAMP(6), dt DATE, t9txt TIMESTAMP(9), bd BINARY_DOUBLE, bf BINARY_FLOAT, \
-         b BOOLEAN, rw RAW(16), r8 RAW(8), n_f4 NUMBER(6,2), tz9 TIMESTAMP(9)",
+         bft BINARY_FLOAT, b BOOLEAN, rw RAW(16), r8 RAW(8), n_f4 NUMBER(6,2), tz9 TIMESTAMP(9)",
     );
     for row in [
         "1, 1234, DATE '2024-02-29', TIMESTAMP '2024-02-29 13:14:15.123456789', \
          TIMESTAMP '2024-02-29 13:14:15.123456', TO_DATE('2024-02-29 13:14:15','YYYY-MM-DD HH24:MI:SS'), \
-         TIMESTAMP '2024-02-29 13:14:15.000000001', 2.25, 0.1, TRUE, \
+         TIMESTAMP '2024-02-29 13:14:15.000000001', 2.25, 0.1, 0.1, TRUE, \
          HEXTORAW('00112233445566778899AABBCCDDEEFF'), HEXTORAW('DEADBEEF00'), 12.5, \
          TIMESTAMP '2024-02-29 13:14:15.987654321'",
         "2, -9999, DATE '0001-01-01', TIMESTAMP '1677-09-21 00:12:43.145224192', \
          TIMESTAMP '9999-12-31 23:59:59.999999', TO_DATE('-0001-06-15 23:59:59','SYYYY-MM-DD HH24:MI:SS'), \
-         TIMESTAMP '2024-01-01 00:00:00.5', -1.5E300D, -3.5, FALSE, \
+         TIMESTAMP '2024-01-01 00:00:00.5', -1.5E300D, -3.5, 3.4E38, FALSE, \
          HEXTORAW('FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF'), HEXTORAW('01'), -0.1, \
          TIMESTAMP '2262-04-11 23:47:16.854775807'",
-        "3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL",
+        "3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL",
     ] {
         ora_exec(&format!("INSERT INTO {} VALUES ({row})", t.name()));
     }
@@ -2003,6 +2009,11 @@ fn every_override_decoder_round_trips_against_oracles_rendering() {
         bits(parquet_cells(out.path(), "BF"), false),
         bits(oracle_cells(n, "TO_CHAR(bf)"), true),
         "BF widened to float64"
+    );
+    assert_eq!(
+        bits(parquet_cells(out.path(), "BFT"), true),
+        bits(oracle_cells(n, "TO_CHAR(bft)"), true),
+        "BFT as text"
     );
     assert_eq!(
         parquet_cells(out.path(), "DT")[&2].as_deref(),

@@ -1127,3 +1127,20 @@ mod cdc_stream_polarity_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod subcommand_error_tests {
+    use clap::Parser;
+
+    use crate::cli::args::Cli;
+
+    /// `run` and `cdc` hand their subcommand's failure back, never a silent success.
+    #[test]
+    fn run_and_cdc_return_the_subcommand_error() {
+        let dispatch = |argv: &[&str]| super::dispatch(Cli::try_parse_from(argv).unwrap());
+        let run = dispatch(&["rivet", "run", "--config", "/nonexistent/rivet.yaml"]);
+        assert!(run.is_err(), "run over a missing config succeeded");
+        let cdc = dispatch(&["rivet", "cdc", "--source", "nosuch://h/db", "--table", "t"]);
+        assert!(cdc.is_err(), "cdc over an unknown scheme succeeded");
+    }
+}

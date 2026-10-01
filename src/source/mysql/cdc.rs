@@ -344,15 +344,21 @@ impl MysqlChangeStream {
         ))
     }
 
+    /// The `binlog_row_metadata` read: a server that predates the variable (ER_UNKNOWN_SYSTEM_VARIABLE) reads as unset.
+    fn row_metadata_or_legacy(
+        read: std::result::Result<Option<String>, mysql::Error>,
+    ) -> std::result::Result<Option<String>, mysql::Error> {
+        match read {
+            Err(mysql::Error::MySqlError(e)) if e.code == 1193 => Ok(None),
+            other => other,
+        }
+    }
+
     /// Live half of [`Self::row_metadata_refusal`]: refuse at open unless the server writes column names.
     fn refuse_nameless_binlog(conn: &mut mysql::Conn) -> Result<()> {
         use mysql::prelude::Queryable;
-        let m: Option<String> = match conn.query_first("SELECT @@global.binlog_row_metadata") {
-            Ok(m) => m,
-            // ER_UNKNOWN_SYSTEM_VARIABLE: a server that predates the variable.
-            Err(mysql::Error::MySqlError(e)) if e.code == 1193 => None,
-            Err(e) => return Err(e.into()),
-        };
+        let m =
+            Self::row_metadata_or_legacy(conn.query_first("SELECT @@global.binlog_row_metadata"))?;
         if let Some(why) = Self::row_metadata_refusal(m.as_deref()) {
             crate::rivet_bail!(crate::error::codes::SOURCE_CDC_PREREQUISITE, "{why}");
         }
@@ -2508,6 +2514,25 @@ mod tests {
                 .unwrap()
                 .contains("binlog_row_metadata = MINIMAL")
         );
+    }
+
+    /// Only ER_UNKNOWN_SYSTEM_VARIABLE (a pre-8.0.1 server) reads as unset; any other error stays an error.
+    #[test]
+    fn only_an_unknown_variable_error_reads_as_an_unset_row_metadata() {
+        let err = |code| {
+            Err(mysql::Error::MySqlError(mysql::MySqlError {
+                state: "HY000".into(),
+                message: "x".into(),
+                code,
+            }))
+        };
+        let read = MysqlChangeStream::row_metadata_or_legacy;
+        assert_eq!(read(err(1193)).unwrap(), None);
+        assert!(
+            read(err(1227)).is_err(),
+            "a permission error is not an old server"
+        );
+        assert_eq!(read(Ok(Some("FULL".into()))).unwrap(), Some("FULL".into()));
     }
 
     /// A nameless rows event is refused as UNDECODABLE, naming the table and the binlog position.

@@ -1081,27 +1081,7 @@ impl MssqlChangeStream {
             .and_then(crate::source::cdc::spill::SpooledGroups::first_position)
             .and_then(|p| p.0.get("lsn").and_then(|l| l.as_str()).map(str::to_string));
 
-        let mut start = 0;
-        while start < evs.len() {
-            let mut end = start + 1;
-            while end < evs.len() && lsns[end] == lsns[start] {
-                end += 1;
-            }
-            let commit = Position(json!({ "lsn": lsns[start] }));
-            // Only zero vs non-zero is read: this says "part of this transaction is
-            // still on disk", which is all the head needs to know.
-            let continues_on_disk = usize::from(head_group_continues_on_disk(
-                &lsns[start],
-                end == evs.len(),
-                tail_head_lsn.as_deref(),
-            ));
-            crate::source::cdc::TxnFramer::close_head_of_group(
-                &mut evs[start..end],
-                &commit,
-                continues_on_disk,
-            );
-            start = end;
-        }
+        close_poll_groups(&mut evs, &lsns, tail_head_lsn.as_deref());
         for ev in evs {
             self.pending.push_back(ev);
         }
@@ -1240,6 +1220,29 @@ fn head_group_continues_on_disk(
     tail_head_lsn: Option<&str>,
 ) -> bool {
     is_last_head_group && tail_head_lsn == Some(group_lsn)
+}
+
+/// Close each run of rows sharing a start LSN (one source transaction) at its last row.
+///
+/// `lsns[i]` is `evs[i]`'s start LSN; the last run stays open when the spilled tail starts in it.
+fn close_poll_groups(evs: &mut [ChangeEvent], lsns: &[String], tail_head_lsn: Option<&str>) {
+    let mut start = 0;
+    for group in lsns.chunk_by(|a, b| a == b) {
+        let end = start + group.len();
+        let commit = Position(json!({ "lsn": group[0] }));
+        // Only zero vs non-zero is read: "part of this transaction is still on disk".
+        let continues_on_disk = usize::from(head_group_continues_on_disk(
+            &group[0],
+            end == evs.len(),
+            tail_head_lsn,
+        ));
+        crate::source::cdc::TxnFramer::close_head_of_group(
+            &mut evs[start..end],
+            &commit,
+            continues_on_disk,
+        );
+        start = end;
+    }
 }
 
 /// `__$operation` → canonical op. 1=delete, 2=insert, 4=update-after; 3 (update
@@ -2114,6 +2117,39 @@ mod tests {
         // has ended, whatever is on disk. Rows arrive in LSN order and `@to` bounds
         // a poll at a group boundary, so a spilled row can only belong to the last.
         assert!(!head_group_continues_on_disk("0x01", false, Some("0x01")));
+    }
+
+    #[test]
+    fn each_start_lsn_run_commits_only_on_its_last_row() {
+        let lsns: Vec<String> = ["a", "a", "b", "c", "c"].map(String::from).to_vec();
+        let ev = |lsn: &str| ChangeEvent {
+            op: ChangeOp::Insert,
+            schema: "dbo".into(),
+            table: "t".into(),
+            before: None,
+            after: None,
+            position: Position(json!({ "lsn": lsn })),
+            committed: true,
+            image_names: None,
+            seq: 0,
+            poison: None,
+        };
+        let close = |tail: Option<&str>| {
+            let mut evs: Vec<ChangeEvent> = lsns.iter().map(|l| ev(l)).collect();
+            close_poll_groups(&mut evs, &lsns, tail);
+            evs.iter().map(|e| e.committed).collect::<Vec<_>>()
+        };
+        assert_eq!(close(None), [false, true, true, false, true]);
+        assert_eq!(
+            close(Some("c")),
+            [false, true, true, false, false],
+            "c continues on disk"
+        );
+        assert_eq!(
+            close(Some("a")),
+            [false, true, true, false, true],
+            "only the last run can continue"
+        );
     }
 }
 

@@ -838,4 +838,59 @@ exclude_re = [
     # The text builder's TEXT arm reads a live Row; deleting it fails
     # `full_export_preserves_string_and_null_distinction` (RED-checked 2026-09-30).
     "delete match arm Type::TEXT \\| Type::VARCHAR \\| Type::BPCHAR \\| Type::NAME in build_pg_text_array",
+    # v0.30.0 in-diff triage (2026-10-01). Each body below reads a live driver row or
+    # connection: tokio_postgres::Row and oracledb's Row/Metadata have only pub(crate)
+    # constructors, and the MSSQL bodies need a client. The PgCellSource accessors are
+    # `side_a(pg_cell(row, ..))`, whose pure half `side_a` is unit-tested. Every
+    # entry was RED-checked by hand (mutant applied, live test run, file restored):
+    # - PgCellSource float32/float64/boolean/binary, None and a constant each:
+    #   postgres_batch_and_cdc_deliver_every_ledger_row_alike fails "value checksum
+    #   mismatch in column" c20 / c11 / c8 / c5. The INTERVAL arm of build_pg_text_array
+    #   fails the same test with "no text rendering for PostgreSQL wire type Interval".
+    "replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::float32 -> Option<f32>",
+    "replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::float64 -> Option<f64>",
+    "replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::boolean -> Option<bool>",
+    "replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::binary -> Option<Cow<'_, \\[u8\\]>>",
+    "delete match arm Type::INTERVAL in build_pg_text_array",
+    # - mssql build_array's NULL guard `c.is_none_or(is_null_cell)` -> `true` is EQUIVALENT.
+    #   It differs only for a non-NULL cell cell_text cannot render, and none exists: every
+    #   non-NULL ColumnData variant has an arm, and the only `None` inside one is a date
+    #   outside chrono's +-262,143 years, which SQL Server's 0001-9999 range (+-14h offset)
+    #   never reaches. The bail stays as a loud backstop. (`false`, the other guard and
+    #   MssqlCellSource::utf8 are graded offline through tiberius' Row::builder.)
+    "replace match guard c.is_none_or\\(is_null_cell\\) with true in build_array",
+    # - MssqlChangeStream::fill -> Ok(()) never drains, so the CDC run polls forever:
+    #   mssql_batch_and_cdc_deliver_every_ledger_row_alike and
+    #   a_cdc_capture_delivers_sql_variant_and_udt_columns_as_the_source_renders_them
+    #   both TIMEOUT at 240s. Its decisions are held by live_only_purity_gate.
+    "replace MssqlChangeStream::fill -> Result",
+    # - Oracle interval_iso (each stub, and the IntervalDs arm): edge_oracle_types_export_losslessly
+    #   fails on IYM/IDS ("unsupported conversion from interval day to second to
+    #   OracleIntervalYM" for the arm). build_column's BinaryFloat (Float64 and Utf8),
+    #   BinaryDouble and Raw|Blob arms: every_override_decoder_round_trips_against_oracles_rendering
+    #   fails "unsupported conversion from binary_float to f64" / "binary_float to String" /
+    #   "binary_double to String" / "raw to String"; the Utf8 Boolean and Date|Timestamp arms
+    #   fail it with "boolean to String" / "timestamp to String".
+    "replace interval_iso -> Result<Option<String>>",
+    "delete match arm OraKind::IntervalDs in interval_iso",
+    "delete match arm OraKind::(BinaryFloat|BinaryDouble|Boolean|Date \\| OraKind::Timestamp|Raw \\| OraKind::Blob) in build_column",
+    # - oracle_type_mappings -> vec![] fails every live_oracle export ("must either specify
+    #   a row count or at least one column"); its warning decision is the unit-tested
+    #   with_oracle_warning. export_within_budget without the re-projected query fails
+    #   edge_oracle_types_export_losslessly ("unsupported database type DB_TYPE_OBJECT").
+    "replace oracle_type_mappings -> Vec<TypeMapping> with vec!\\[\\]",
+    "delete field query from struct ExportRequest expression in OracleSource::export_within_budget",
+    # - MssqlSource::export -> Ok(()) writes nothing: mssql_batch_and_cdc_deliver_every_ledger_row_alike
+    #   fails "no parquet part under ..." and the sql_variant batch test finds no file to read.
+    #   MssqlSource::type_mappings -> Ok(vec![]) records no column types, so the ledger test's
+    #   load fails "no column types recorded in the state DB". Oracle native_type stubs
+    #   lose the TIMESTAMP(9) lossy mark: the_type_report_marks_a_timestamp_9_column_lossy
+    #   fails `left: "exact", right: "lossy"`.
+    "replace <impl Source for MssqlSource>::export -> Result<\\(\\)> with Ok\\(\\(\\)\\)",
+    "replace <impl Source for MssqlSource>::type_mappings -> Result<Vec<TypeMapping>> with Ok\\(vec!\\[\\]\\)",
+    "replace native_type -> String with (String::new\\(\\)|.xyzzy.\\.into\\(\\))$",
+    # - MysqlChangeStream::refuse_nameless_binlog -> Ok(()) lets a MINIMAL server open:
+    #   mysql_cdc_refuses_minimal_row_metadata_at_open fails "MINIMAL must fail the run".
+    #   Its legacy-server decision is the unit-tested row_metadata_or_legacy.
+    "replace MysqlChangeStream::refuse_nameless_binlog -> Result<\\(\\)> with Ok\\(\\(\\)\\)",
 ]
