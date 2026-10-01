@@ -356,6 +356,35 @@ fn a_full_load_into_clickhouse_replaces_the_table_with_the_current_source() {
     );
 }
 
+/// A full load of an emptied source empties the ClickHouse table: the empty newest run
+/// is an empty replace, not an "up to date" skip that keeps the stale rows.
+#[test]
+#[ignore = "live: requires clickhouse + fake-gcs + postgres"]
+fn a_full_load_of_an_emptied_source_empties_the_clickhouse_table() {
+    require_alive(LiveService::ClickHouse);
+    require_alive(LiveService::FakeGcs);
+    ensure_gcs_bucket(BUCKET);
+    let (tbl, _t, mut c) = pg_batch_seeded("rivet_ch_emptied", 5);
+    let db = Db::new("rivet_chtest");
+    let rig = batch_into_clickhouse(Rig::pg_batch(&tbl).mode("full"), &db);
+    let table = format!("{}.{tbl}", db.0);
+    let loaded = || clickhouse_rows(&format!("SELECT id, v FROM {table} ORDER BY id FORMAT TSV"));
+
+    rig.run_ok();
+    load(&rig);
+    assert_eq!(loaded().len(), 5);
+
+    c.batch_execute(&format!("TRUNCATE {tbl}"))
+        .expect("truncate");
+    rig.run_ok();
+    load(&rig);
+    assert_eq!(
+        loaded(),
+        pg_rows(&mut c, &tbl),
+        "the table matches the source's empty snapshot"
+    );
+}
+
 /// An incremental export: the first (cursor-less) run loads a table, the first
 /// delta renames it into the change log behind a view that picks the latest cursor.
 #[test]
