@@ -1,0 +1,502 @@
+"""upgrade[<engine>/cdc-load]: the previous release's `init --mode cdc` → BigQuery cycle, continued by this binary.
+
+Per CDC engine (MySQL, PostgreSQL, SQL Server, Oracle, MongoDB), on three tables: run → load → compact
+three cycles by the previous release and two by this binary, with inserts, updates, a partition-moving
+update and a delete between cycles. After every compact each base's live rows equal the source
+`id:v:epoch`, every deleted id is flagged `__is_deleted`, no key is there twice and no `__changes`
+buffer is left. The source epoch is computed by the source engine itself, never read from a
+session-rendered text. Every SQL engine runs a second time with a non-UTC zone (see `Src.tz_note`).
+"""
+
+from __future__ import annotations
+
+import os
+import re
+from pathlib import Path
+
+from .core import Ledger, Proc, rivet_bin, run
+
+SCEN = "upgrade_continuity"
+CDC_TABLES = 3
+CDC_SEED = 5
+
+
+def _ops(k: int, cycle: int) -> list[tuple]:
+    """Table `k`'s changes for `cycle` (0 = the seed): inserts, updates, a partition-moving update, a delete."""
+    b = k * 100
+    if cycle == 0:
+        return [("ins", b + i, i, f"2026-01-0{i} 10:00:00") for i in range(1, CDC_SEED + 1)]
+    ops = [("ins", b + 10 * cycle + i, i, f"2026-02-0{cycle} 12:00:00") for i in (1, 2, 3)]
+    ops += [("set_v", b + 1 + cycle % 5, 1000 * cycle), ("del", b + cycle)]
+    if cycle >= 2:
+        # A row whose partition day moves, and a row the previous cycle inserted.
+        ops += [("set_ts", b + 5, f"2025-12-2{cycle} 08:00:00"), ("neg", b + 10 * (cycle - 1) + 1)]
+    return ops
+
+
+class Src:
+    """One cdc-load cell's source: tables, changes, the engine-computed fingerprint, set-up and tear-down."""
+
+    ts_type = "TIMESTAMP"
+    anchor_first = False  # init writes no baseline: anchor the stream before the seed
+    init_args: tuple[str, ...] = ("--tls", "disable")
+    bq_id = "id"
+    tz_note = ""
+
+    def __init__(self, url: str, tz: str | None, tag: str):
+        self.url, self.tz, self.tag = url, tz, tag
+        self.rivet_url, self.slot, self.attach, self.env = url, None, {}, {}
+
+    def name(self, k: int) -> str:
+        return f"upg_cdcw_{self.tag}_{k}"
+
+    def lit(self, ts: str) -> str:
+        return f"'{ts}'"
+
+    def sql(self, stmts: list[str]) -> bool:
+        raise NotImplementedError
+
+    def create(self, t: str) -> bool:
+        return self.sql([f"DROP TABLE IF EXISTS {t}",
+                         f"CREATE TABLE {t} (id BIGINT PRIMARY KEY, v INT NOT NULL, created_at {self.ts_type} NOT NULL)"])
+
+    def drop(self, t: str) -> None:
+        self.sql([f"DROP TABLE IF EXISTS {t}"])
+
+    def render(self, t: str, op: tuple) -> str:
+        kind, i = op[0], op[1]
+        return {
+            "ins": lambda: f"INSERT INTO {t} (id, v, created_at) VALUES ({i}, {op[2]}, {self.lit(op[3])})",
+            "set_v": lambda: f"UPDATE {t} SET v = {op[2]} WHERE id = {i}",
+            "set_ts": lambda: f"UPDATE {t} SET created_at = {self.lit(op[2])} WHERE id = {i}",
+            "neg": lambda: f"UPDATE {t} SET v = -v WHERE id = {i}",
+            "del": lambda: f"DELETE FROM {t} WHERE id = {i}",
+        }[kind]()
+
+    def apply(self, t: str, ops: list[tuple]) -> bool:
+        return self.sql([self.render(t, op) for op in ops])
+
+    def fp(self, o, t: str) -> str:
+        """`id:v:epoch` of every source row, ordered by id, the epoch computed by the engine."""
+        raise NotImplementedError
+
+    def __enter__(self) -> "Src":
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        return None
+
+
+def _join(rows) -> str:
+    return ",".join(f"{int(i)}:{int(v)}:{int(e)}" for i, v, e in sorted(rows))
+
+
+class MySQL(Src):
+    tz_note = "the server's GLOBAL time_zone, restored on exit"
+
+    def sql(self, stmts):
+        from .cdc import _mysql
+        return _mysql(self.url, "; ".join(stmts) + ";").ok
+
+    def fp(self, o, t):
+        return _join(o.rows(f"SELECT * FROM mysql_query('my', 'SELECT id, v, UNIX_TIMESTAMP(created_at) FROM {t}')"))
+
+    def _root(self, q: str) -> Proc:
+        from .cdc import _container_for, _no_container
+        from .core import docker_exec
+        c = _container_for(self.url)
+        return docker_exec(c, "mysql", "-uroot", "-privet", "-N", stdin=q) if c else _no_container(self.url)
+
+    def __enter__(self):
+        from .cdc import _mysql
+        self.attach = {"mysql": self.url}
+        if self.tz:
+            self.was = self._root("SELECT @@GLOBAL.time_zone;").stdout.strip()
+            if (not self.was or not self._root(f"SET GLOBAL time_zone = '{self.tz}';").ok
+                    or _mysql(self.url, "SELECT @@session.time_zone;").stdout.split()[-1:] != [self.tz]):
+                raise RuntimeError(f"could not set the MySQL GLOBAL time_zone to {self.tz} (was {self.was!r})")
+        return self
+
+    def __exit__(self, *_exc):
+        if self.tz:
+            self._root(f"SET GLOBAL time_zone = '{self.was}';")
+
+
+class Postgres(Src):
+    ts_type = "TIMESTAMPTZ"
+    tz_note = "the default TimeZone of a database of the cell's own"
+
+    def __init__(self, url, tz, tag):
+        from urllib.parse import urlsplit, urlunsplit
+        super().__init__(url, tz, tag)
+        self.db = self.slot = f"upg_{tag}"
+        self.rivet_url = urlunsplit(urlsplit(url)._replace(path=f"/{self.db}"))
+        self.attach = {"postgres": self.rivet_url}
+
+    def _psql(self, q: str, on: str = "rivet") -> Proc:
+        from .cdc import _container_for, _no_container
+        from .core import docker_exec
+        c = _container_for(self.url)
+        return docker_exec(c, "psql", "-U", "rivet", "-d", on, "-v", "ON_ERROR_STOP=1", "-tAq",
+                           stdin=q) if c else _no_container(self.url)
+
+    def sql(self, stmts):
+        return self._psql("; ".join(stmts) + ";", self.db).ok
+
+    def fp(self, o, t):
+        return _join(o.rows("SELECT * FROM postgres_query('pg', 'SELECT id, v, extract(epoch FROM created_at)::bigint "
+                            f"FROM {t}')"))
+
+    def _drop_db(self) -> None:
+        # The slot first: a database a logical slot points into cannot be dropped.
+        self._psql("SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots "
+                   f"WHERE slot_name = '{self.slot}' AND active_pid IS NOT NULL;")
+        self._psql(f"SELECT pg_drop_replication_slot('{self.slot}') FROM pg_replication_slots "
+                   f"WHERE slot_name = '{self.slot}';")
+        self._psql(f"DROP DATABASE IF EXISTS {self.db} WITH (FORCE);")
+
+    def __enter__(self):
+        self._drop_db()
+        made = self._psql(f"CREATE DATABASE {self.db};")
+        if not made.ok or (self.tz and (not self._psql(f"ALTER DATABASE {self.db} SET TimeZone = '{self.tz}';").ok
+                                        or self._psql("SHOW TimeZone;", self.db).stdout.strip() != self.tz)):
+            self._drop_db()
+            raise RuntimeError(f"could not create the cell's database {self.db}: {made.stderr.strip()[-200:]}")
+        return self
+
+    def __exit__(self, *_exc):
+        self._drop_db()
+
+
+class MSSQL(Src):
+    ts_type = "DATETIMEOFFSET"
+    anchor_first = True
+    tz_note = ("SQL Server has no session zone: every value carries a +09:00 offset and rivet runs "
+               "under TZ=Asia/Tokyo")
+
+    def __init__(self, url, tz, tag):
+        super().__init__(url, tz, tag)
+        if tz:
+            self.env = {"TZ": "Asia/Tokyo"}
+
+    def lit(self, ts):
+        return f"'{ts} {self.tz or '+00:00'}'"
+
+    def sql(self, stmts):
+        from .cdc import _sqlcmd
+        return _sqlcmd(self.url, sql=";\n".join(stmts) + ";\n").ok
+
+    def create(self, t):
+        from .cdc import _lc_drop, _sqlcmd
+        from .core import wait_until
+        _lc_drop("mssql", self.url, t)
+        if not self.sql([f"CREATE TABLE dbo.{t} (id BIGINT PRIMARY KEY, v INT NOT NULL, created_at DATETIMEOFFSET NOT NULL)",
+                         f"EXEC sys.sp_cdc_enable_table @source_schema='dbo', @source_name='{t}', "
+                         f"@role_name=NULL, @capture_instance='dbo_{t}'"]):
+            return False
+        # The instance is usable once the capture job has run (fn_cdc_get_min_lsn non-NULL).
+        return wait_until(lambda: "NULL" not in _sqlcmd(
+            self.url, q=f"SET NOCOUNT ON; SELECT ISNULL(CONVERT(varchar(64), sys.fn_cdc_get_min_lsn('dbo_{t}'), 1), 'NULL')"
+        ).stdout, tries=40, delay=1.5)
+
+    def drop(self, t):
+        from .cdc import _lc_drop
+        _lc_drop("mssql", self.url, t)
+
+    def apply(self, t, ops):
+        from .cdc import _mssql_max_lsn, _wait_mssql_captured
+        before = _mssql_max_lsn(self.url)
+        ok = super().apply(t, ops)
+        _wait_mssql_captured(self.url, before)  # the capture job settles before the next run
+        return ok
+
+    def fp(self, o, t):
+        from .cdc import _sqlcmd
+        out = _sqlcmd(self.url, q=f"SET NOCOUNT ON; SELECT CONCAT(id, ':', v, ':', DATEDIFF_BIG(second, "
+                                  f"'1970-01-01', SWITCHOFFSET(created_at, 0))) FROM dbo.{t}").stdout
+        return _join(tuple(ln.split(":")) for ln in re.findall(r"^-?\d+:-?\d+:-?\d+$", out, re.M))
+
+
+class Oracle(Src):
+    """Oracle has no DuckDB scanner: the source fingerprint is read through python-oracledb."""
+
+    ts_type = "TIMESTAMP WITH TIME ZONE"
+    anchor_first = True
+    tz_note = ("the writing session's TIME_ZONE (values stored with the +09:00 region) and rivet's "
+               "client zone (TZ / ORA_SDTZ)")
+
+    def __init__(self, url, tz, tag):
+        from urllib.parse import unquote, urlparse
+        super().__init__(url, tz, tag)
+        self.owner_url = os.environ["RIVET_ORACLE_ORACLE_URL"]
+        self.owner = unquote(urlparse(self.owner_url).username or "").upper()
+        self.capture = unquote(urlparse(url).username or "")
+        self.init_args = ("--schema", self.owner)
+        if tz:
+            self.env = {"TZ": tz, "ORA_SDTZ": tz}
+
+    def name(self, k):
+        return super().name(k).upper()
+
+    def lit(self, ts):
+        return f"TIMESTAMP '{ts}'"
+
+    def sql(self, stmts):
+        from urllib.parse import unquote, urlparse
+
+        import oracledb
+        u = urlparse(self.owner_url)
+        try:
+            with oracledb.connect(user=unquote(u.username or ""), password=unquote(u.password or ""),
+                                  dsn=f"{u.hostname}:{u.port or 1521}/{u.path.lstrip('/')}") as con:
+                cur = con.cursor()
+                cur.execute(f"ALTER SESSION SET TIME_ZONE = '{self.tz or 'UTC'}'")
+                for s in stmts:
+                    cur.execute(s)
+                con.commit()
+            return True
+        except oracledb.DatabaseError:
+            return False
+
+    def create(self, t):
+        self.drop(t)
+        return self.sql([f"CREATE TABLE {t} (id NUMBER(18) PRIMARY KEY, v NUMBER(10) NOT NULL, "
+                         "created_at TIMESTAMP WITH TIME ZONE NOT NULL)",
+                         f"ALTER TABLE {t} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS",
+                         f'GRANT SELECT ON {t} TO "{self.capture.upper()}"'])
+
+    def drop(self, t):
+        self.sql([f"DROP TABLE {t} PURGE"])
+
+    def fp(self, o, t):
+        from .value_diff import oracle_rows
+        rows = oracle_rows(self.owner_url, "SELECT id, v, (CAST(SYS_EXTRACT_UTC(created_at) AS DATE) - "
+                                           f"DATE '1970-01-01') * 86400 e FROM {t}")
+        return _join((r["ID"], r["V"], r["E"]) for r in rows)
+
+
+class Mongo(Src):
+    anchor_first = True
+    init_args = ()
+    bq_id = "CAST(_id AS BIGINT)"  # MongoDB's `_id` lands as text
+
+    def sql(self, stmts):
+        from .cdc import _mongosh
+        return _mongosh(self.url, "; ".join(stmts)).ok
+
+    def create(self, t):
+        return self.sql([f"db.{t}.drop()", f'db.createCollection("{t}")'])
+
+    def drop(self, t):
+        self.sql([f"db.{t}.drop()"])
+
+    def render(self, t, op):
+        kind, i = op[0], f"NumberLong({op[1]})"
+        date = (lambda s: f'ISODate("{s.replace(" ", "T")}Z")')
+        return {
+            "ins": lambda: f"db.{t}.insertOne({{_id: {i}, v: NumberLong({op[2]}), created_at: {date(op[3])}}})",
+            "set_v": lambda: f"db.{t}.updateOne({{_id: {i}}}, {{$set: {{v: NumberLong({op[2]})}}}})",
+            "set_ts": lambda: f"db.{t}.updateOne({{_id: {i}}}, {{$set: {{created_at: {date(op[2])}}}}})",
+            "neg": lambda: f"db.{t}.updateOne({{_id: {i}}}, {{$mul: {{v: NumberLong(-1)}}}})",
+            "del": lambda: f"db.{t}.deleteOne({{_id: {i}}})",
+        }[kind]()
+
+    def fp(self, o, t):
+        from .cdc import _mongosh
+        out = _mongosh(self.url, f"db.{t}.find().toArray().forEach(d => print('ROW ' + d._id + ':' + d.v + ':' + "
+                                 "Math.floor(d.created_at.getTime() / 1000)))").stdout
+        return _join(tuple(m.split(":")) for m in re.findall(r"^ROW (-?\d+:-?\d+:-?\d+)$", out, re.M))
+
+
+#: Per cdc-load engine: the source class, the URL env vars it needs, its non-UTC zone (None: no variant).
+#: Oracle's capture URL is RIVET_UPG_ORACLE_CDC_URL, not RIVET_CDC_ORACLE_URL, which would switch on
+#: other stages' Oracle CDC cells.
+CDC_LOAD_ENGINES: dict[str, tuple[type[Src], tuple[str, ...], str | None]] = {
+    "mysql": (MySQL, ("RIVET_CDC_MYSQL_URL",), "+09:00"),
+    "postgres": (Postgres, ("RIVET_CDC_POSTGRES_URL",), "Asia/Tokyo"),
+    "mssql": (MSSQL, ("RIVET_CDC_MSSQL_URL",), "+09:00"),
+    "oracle": (Oracle, ("RIVET_UPG_ORACLE_CDC_URL", "RIVET_ORACLE_ORACLE_URL"), "Asia/Tokyo"),
+    "mongo": (Mongo, ("RIVET_CDC_MONGO_URL",), None),
+}
+
+
+def _transport_retry(read):
+    """`read()`, again (up to 3 tries) when DuckDB's BigQuery reader fails in transport (a CURL error)."""
+    import time
+
+    import duckdb
+
+    for attempt in range(3):
+        try:
+            return read()
+        except duckdb.Error as e:
+            if "CURL error" not in str(e) or attempt == 2:
+                raise
+            time.sleep(5)
+
+
+def _why(p: Proc) -> str:
+    """`exit N [RIVET_CODE]: <stderr tail>`: the code leads, so a known-red entry can name it."""
+    err = (p.stderr or "").strip()
+    code = re.search(r"\[(RIVET_[A-Z0-9_]+)\]", err)
+    return f"exit {p.returncode}{f' [{code.group(1)}]' if code else ''}: {err[-240:]}"
+
+
+def _state(o, src: Src, dset: str, t: str) -> tuple[str, str, str, int, bool]:
+    """(source `id:v:epoch`, base live `id:v:epoch`, flagged ids, rows minus distinct ids, buffer exists)."""
+    rel = f'bq.{dset}."{t}"'
+    i = src.bq_id
+    live = _join(o.rows(f"SELECT {i}, CAST(v AS BIGINT), epoch(created_at) FROM {rel} WHERE NOT __is_deleted"))
+    gone = ",".join(str(int(r[0])) for r in sorted(o.rows(f"SELECT {i} FROM {rel} WHERE __is_deleted")))
+    dup = o.scalar(f"SELECT count(*) - count(DISTINCT {i}) FROM {rel}")
+    buf = o.scalar("SELECT count(*) FROM information_schema.tables WHERE table_catalog = 'bq' "
+                   f"AND table_schema = '{dset}' AND table_name = '{t}__changes'")
+    return src.fp(o, t), live, gone, dup, buf > 0
+
+
+def cdc_load_leg(led: Ledger, prev: Path, root: Path, engine: str, url: str, tz: str | None = None) -> None:
+    """One cdc-load cell: the previous release's init config, three cycles by it and two by this binary."""
+    import duckdb
+
+    from . import gcp
+    from .duck import BQ_DATASET_ENV, BQ_PROJECT_ENV, Oracle as Duck, bq_target
+    from ..pytools.registry import bq_tmp
+
+    name = f"upgrade[{engine}/cdc-load{f'/tz={tz}' if tz else ''}]"
+    target, bucket = bq_target(), os.environ.get("BQ_ORACLE_BUCKET", "")
+    if target is None or not bucket:
+        led.skipped(engine, "-", SCEN, "cdc-load", f"{name}: no {BQ_PROJECT_ENV} / {BQ_DATASET_ENV} "
+                    "/ BQ_ORACLE_BUCKET", "no bigquery")
+        return
+    proj = target[0]
+    tag = f"{engine[:2]}{'tz' if tz else ''}_{os.getpid()}"
+    src = CDC_LOAD_ENGINES[engine][0](url, tz, tag)
+    tables = [src.name(k) for k in range(CDC_TABLES)]
+    dset = bq_tmp(f"upgcdc_{tag}")
+    pfx = f"upgrade-cdc/{tag}"
+    d = root / f"cdc_load_{tag}"
+    d.mkdir()
+    seen: dict[str, set[int]] = {t: set() for t in tables}
+    part = ""
+
+    def fail(stage: str, why: str) -> None:
+        led.failed(engine, "-", SCEN, "cdc-load", f"{name}: {stage}: {why}", stage)
+
+    def buffers() -> list[bool]:
+        with Duck(bigquery=True, bq_dataset=dset, **src.attach) as o:
+            return [o.scalar("SELECT count(*) FROM information_schema.tables WHERE table_catalog = 'bq' "
+                             f"AND table_schema = '{dset}' AND table_name = '{t}__changes'") > 0 for t in tables]
+
+    try:
+        with src:
+            env = {"RIVET_UPG_URL": src.rivet_url, "RIVET_STATE_URL": "", **src.env}
+
+            def step(binary: Path, *args: str) -> Proc:
+                return run([str(binary), *args], env=env, cwd=d, timeout=None)
+
+            for t in tables:
+                if not src.create(t):
+                    return fail("seed", f"could not create {t}")
+            if not src.anchor_first and not all(src.apply(t, _ops(k, 0)) for k, t in enumerate(tables)):
+                return fail("seed", "the seed rows failed")
+            gcp.bq_ensure_dataset(proj, dset)
+            init = step(prev, "init", "--source-env", "RIVET_UPG_URL", "--mode", "cdc", "--include", *tables,
+                        *src.init_args, "--gcs-bucket", bucket, "--bigquery-project", proj,
+                        "--bigquery-dataset", dset, "-o", "c.yaml")
+            if not init.ok:
+                return fail("init", f"previous init: {(init.stderr or '').strip()[-240:]}")
+            # Harness isolation only: init writes fixed prefixes and a fixed PG slot name,
+            # shared by every run on the stand.
+            cfg = d / "c.yaml"
+            body = re.sub(r"prefix: (exports|cdc)/", rf"prefix: {pfx}/\1/", cfg.read_text())
+            if src.slot:
+                body = re.sub(r"slot: \S+", f"slot: {src.slot}", body)
+            cfg.write_text(body)
+            if [ln for ln in body.splitlines() if "prefix:" in ln and pfx not in ln] or (
+                    src.slot and f"slot: {src.slot}" not in body):
+                return fail("init", "a prefix or slot the harness could not isolate: " + body[:400])
+            if src.anchor_first:
+                # init's own advice for a changes-only stream: anchor first, then the rows arrive.
+                a = step(prev, "run", "-c", "c.yaml")
+                if not a.ok:
+                    return fail("anchor", f"prev {_why(a)}")
+                if not all(src.apply(t, _ops(k, 0)) for k, t in enumerate(tables)):
+                    return fail("seed", "the seed rows failed")
+            cycles = [(prev, 0), (prev, 1), (prev, 2), (rivet_bin(), 3), (rivet_bin(), 4)]
+            for n, (binary, delta) in enumerate(cycles, 1):
+                who = "prev" if binary == prev else "this"
+                if delta and not all(src.apply(t, _ops(k, delta)) for k, t in enumerate(tables)):
+                    return fail(f"cycle{n}/delta", "source change failed")
+                if binary != prev and cycles[n - 2][0] == prev:
+                    chk = step(binary, "check", "-c", "c.yaml")
+                    if not chk.ok:
+                        return fail("check", f"this binary refuses the previous init's config: "
+                                             f"{(chk.stderr or chk.out).strip()[-240:]}")
+                for s in ("run", "load", "compact"):
+                    if s == "compact" and n > 1 and not all(_transport_retry(buffers)):
+                        # The positive control: a buffer check that never sees a buffer proves nothing.
+                        return fail(f"cycle{n}/load", f"{who}'s load left no `__changes` buffer: {buffers()}")
+                    extra = [] if s == "run" else ["--run-id", f"upg-{tag}-{n}"]
+                    p = step(binary, s, "-c", "c.yaml", *extra)
+                    if not p.ok:
+                        return fail(f"cycle{n}/{s}", f"{who} {_why(p)}")
+                def grade() -> tuple[list[str], str]:
+                    bad = []
+                    with Duck(bigquery=True, bq_dataset=dset, **src.attach) as o:
+                        for t in tables:
+                            want, live, gone, dup, buf = _state(o, src, dset, t)
+                            ids = {int(x.split(":")[0]) for x in want.split(",") if x}
+                            seen[t] |= ids
+                            want_gone = ",".join(str(i) for i in sorted(seen[t] - ids))
+                            if not want or (live, gone, dup, buf) != (want, want_gone, 0, False):
+                                bad.append(f"{t}: live={live!r} src={want!r} flagged={gone!r} "
+                                           f"want={want_gone!r} dup={dup} buffer_left={buf}")
+                        return bad, o.scalar(
+                            f"SELECT IFNULL(string_agg(column_name, ','), '') FROM bigquery_query('{proj}', "
+                            f"'SELECT column_name FROM `{proj}.{dset}.INFORMATION_SCHEMA.COLUMNS` WHERE "
+                            f"table_name = \"{tables[0]}\" AND is_partitioning_column = \"YES\"')")
+
+                bad, part = _transport_retry(grade)
+                if bad:
+                    return fail(f"cycle{n}", f"after {who}'s compact the base differs from the source — "
+                                             + "; ".join(bad)[:600])
+            led.passed(engine, "-", SCEN, "cdc-load", f"{name}: three cycles by the previous release, two "
+                       f"by this binary on its init config; after every compact each of {CDC_TABLES} bases "
+                       f"equals the source instant by value, deletes flagged, no duplicate key, no buffer left "
+                       f"(partition column: {part or 'none'}{f'; zone: {src.tz_note}' if tz else ''})", "cdc-load")
+    except duckdb.Error as e:
+        # A base missing a column the source has is a finding, not a harness crash.
+        fail("oracle", f"the DuckDB read failed: {str(e)[:400]}")
+    except RuntimeError as e:
+        fail("setup", str(e))
+    finally:
+        for t in tables:
+            src.drop(t)
+        if not os.environ.get("RIVET_UPG_KEEP"):
+            gcp.bq_delete_dataset(proj, dset)
+        gcp.gcs_delete_prefix(bucket, f"{pfx}/")
+
+
+def cdc_load_cells(led: Ledger, prev: Path, root: Path) -> None:
+    """Every cdc-load cell, per engine in UTC then in its non-UTC zone; the engines run side by side,
+    one engine's cells in turn (MySQL's zone is server-GLOBAL)."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    lanes = []
+    for e, (_, envs, _) in CDC_LOAD_ENGINES.items():
+        if all(os.environ.get(v) for v in envs):
+            lanes.append((e, os.environ[envs[0]]))
+        else:
+            led.skipped(e, "-", SCEN, "cdc-load", f"upgrade[{e}/cdc-load]: no {' / '.join(envs)}", "no url")
+    subs = [led.buffered_child() for _ in lanes]
+
+    def lane(i: int) -> None:
+        engine, url = lanes[i]
+        tz = CDC_LOAD_ENGINES[engine][2]
+        for z in (None, tz) if tz else (None,):
+            cdc_load_leg(subs[i], prev, root, engine, url, z)
+
+    with ThreadPoolExecutor(max_workers=max(1, len(lanes))) as ex:
+        list(ex.map(lane, range(len(lanes))))
+    for sub in subs:
+        sub.flush_into(led)
