@@ -1367,3 +1367,13 @@ fn an_empty_full_load_truncates_an_existing_table_and_creates_a_missing_one() {
         "CREATE TABLE `p.d.t` (\n  `id` INT64\n)\nCLUSTER BY `id`;"
     );
 }
+
+#[test]
+fn a_compaction_with_neither_buffer_nor_leftover_has_nothing_to_merge() {
+    assert!(nothing_to_compact(false, false));
+    assert!(!nothing_to_compact(true, false), "a live buffer is merged");
+    assert!(
+        !nothing_to_compact(false, true),
+        "a leftover of a merge that died is merged even with no live buffer"
+    );
+}

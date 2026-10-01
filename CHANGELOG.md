@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **`rivet compact` no longer fails on a table that was never loaded.** A source table that was
+  empty from the start loads nothing, so it has neither a base nor a `__changes` buffer in the
+  warehouse; `compact` still ran `ALTER TABLE` on the base before looking for the buffer, and
+  BigQuery answered `Not found: Table` on every cycle, failing the cycle's exit status for the
+  other tables too (five of 153 tables in a pilot run). The buffer is now checked first, and such a
+  table is the `COMPACT SKIP` it always should have been.
+
 - **`rivet load` consumes the extraction runs that produced no files.** An idle CDC cycle (no
   changes) writes a manifest with no parts; the load skipped it but never recorded it, so every
   later load re-read every such manifest again: a pilot with 110 idle tables read ~50 manifests per
