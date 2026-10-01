@@ -85,6 +85,7 @@ fn pg_cdc_retyped_column_refuses_under_fail_and_defers_not_drops() {
     use postgres::NoTls;
     let tbl = unique_name("cdc_drift_pg");
     let slot = unique_name("rivet_drift_slot");
+    let _slot = Slot::new(slot.clone());
     let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
     c.batch_execute(&format!(
         "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"
@@ -94,7 +95,6 @@ fn pg_cdc_retyped_column_refuses_under_fail_and_defers_not_drops() {
 
     let mut rig = Rig::pg_cdc(&tbl, &slot).export_line(DRIFT_FAIL);
     rig.run_ok(); // creates the slot and records the schema baseline
-    let _slot = Slot(slot.clone());
 
     c.batch_execute(&format!(
         "INSERT INTO {tbl} VALUES (1, 10); ALTER TABLE {tbl} ALTER COLUMN v TYPE BIGINT; \
@@ -350,6 +350,7 @@ fn pg_cdc_upgrade_baseline_takes_server_text_silently_and_still_refuses_a_new_co
     use postgres::NoTls;
     let tbl = unique_name("cdc_drift_upg");
     let slot = unique_name("rivet_drift_upg_slot");
+    let _slot = Slot::new(slot.clone());
     let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
     c.batch_execute(&format!(
         "CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, n NUMERIC, d DATE[])"
@@ -359,7 +360,6 @@ fn pg_cdc_upgrade_baseline_takes_server_text_silently_and_still_refuses_a_new_co
 
     let rig = Rig::pg_cdc(&tbl, &slot).export_line(DRIFT_FAIL);
     rig.run_ok(); // creates the slot
-    let _slot = Slot(slot.clone());
     let db = rig.config_path().parent().unwrap().join(".rivet_state.db");
     let state = rusqlite::Connection::open(&db).unwrap();
     let baseline = || -> String {

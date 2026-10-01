@@ -518,6 +518,7 @@ fn pg_cdc_resume_captures_only_new_changes() {
     let d = tempfile::tempdir().unwrap();
     let tbl = unique_name("rivet_cdc_pg");
     let slot = unique_name("rivet_regr_slot");
+    let _slot = Slot::new(slot.clone());
     let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
     c.batch_execute(&format!(
         "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"
@@ -530,7 +531,6 @@ fn pg_cdc_resume_captures_only_new_changes() {
         &[&slot],
     )
     .unwrap();
-    let _slot = Slot(slot.clone());
 
     c.execute(&format!("INSERT INTO {tbl} VALUES (1,10),(2,20)"), &[])
         .unwrap();
@@ -569,6 +569,7 @@ fn pg_cdc_intra_transaction_updates_get_distinct_seq() {
     let d = tempfile::tempdir().unwrap();
     let tbl = unique_name("rivet_cdc_pg_seq");
     let slot = unique_name("rivet_seq_slot");
+    let _slot = Slot::new(slot.clone());
     let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
     c.batch_execute(&format!(
         "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id INT PRIMARY KEY, counter BIGINT); \
@@ -581,7 +582,6 @@ fn pg_cdc_intra_transaction_updates_get_distinct_seq() {
         &[&slot],
     )
     .unwrap();
-    let _slot = Slot(slot.clone());
 
     // N updates of the SAME row in ONE transaction (a DO block is one txn).
     c.batch_execute(&format!(
@@ -604,6 +604,7 @@ fn pg_cdc_sum_reconciles_across_intra_txn_updates() {
     let d = tempfile::tempdir().unwrap();
     let tbl = unique_name("rivet_cdc_pg_sum");
     let slot = unique_name("rivet_sum_slot");
+    let _slot = Slot::new(slot.clone());
     let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
     c.batch_execute(&format!(
         "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v BIGINT NOT NULL); \
@@ -616,7 +617,6 @@ fn pg_cdc_sum_reconciles_across_intra_txn_updates() {
         &[&slot],
     )
     .unwrap();
-    let _slot = Slot(slot.clone());
 
     for txn in cdc_sum_workload(&tbl) {
         c.batch_execute(&format!("BEGIN; {}; COMMIT", txn.join("; ")))
@@ -840,6 +840,7 @@ fn pg_cdc_non_utc_database_timezone_matches_batch() {
     let cdc_db = CdcDb::new("cdc_tz");
     let tbl = unique_name("cdc_tz_pg");
     let slot = unique_name("rivet_tz_slot");
+    let _slot = Slot::new(slot.clone());
     let mut c = cdc_db.connect();
     c.batch_execute(&format!(
         "ALTER DATABASE {} SET timezone TO 'Asia/Tokyo'",
@@ -909,6 +910,7 @@ fn pg_cdc_unchanged_toast_recovers_from_replica_identity_full() {
     let d = tempfile::tempdir().unwrap();
     let tbl = unique_name("cdc_toast_full");
     let slot = unique_name("rivet_toast_full_slot");
+    let _slot = Slot::new(slot.clone());
     let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
     // EXTERNAL storage forces out-of-line TOAST (no compression); FULL puts the
     // pre-image value in `old-key`, so the unchanged column is recoverable.
@@ -929,7 +931,6 @@ fn pg_cdc_unchanged_toast_recovers_from_replica_identity_full() {
     // max_replication_slots=32, cascading into unrelated PG-CDC failures that
     // mask the real regression (r6 bughunt — the class the file's own SlotGuard
     // comment documents; the fix had guarded one test only).
-    let _slot = Slot(slot.clone());
     let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
     // Incompressible >2KB value → genuine external TOAST; then touch only `small`
     // so `big` decodes as the unchanged-toast marker in the new tuple.
@@ -985,6 +986,7 @@ fn pg_cdc_unchanged_toast_without_full_identity_fails_loud() {
     let d = tempfile::tempdir().unwrap();
     let tbl = unique_name("cdc_toast_default");
     let slot = unique_name("rivet_toast_default_slot");
+    let _slot = Slot::new(slot.clone());
     let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
     // EXTERNAL storage but DEFAULT replica identity (PK only) — no pre-image value.
     c.batch_execute(&format!(
@@ -1000,7 +1002,6 @@ fn pg_cdc_unchanged_toast_without_full_identity_fails_loud() {
     .unwrap();
     // RAII (r6 bughunt): the run_expect_fail below panics if rivet DOESN'T fail
     // loud — the trailing drop would then leak the slot on :5434.
-    let _slot = Slot(slot.clone());
     let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
     c.batch_execute(&format!(
         "INSERT INTO {tbl} (id, small, big) VALUES \
@@ -1040,6 +1041,7 @@ fn pg_cdc_non_iso_datestyle_and_escape_bytea_match_batch() {
     let cdc_db = CdcDb::new("cdc_fmt");
     let tbl = unique_name("cdc_fmt_pg");
     let slot = unique_name("rivet_fmt_slot");
+    let _slot = Slot::new(slot.clone());
     let mut c = cdc_db.connect();
     c.batch_execute(&format!(
         "ALTER DATABASE {db} SET datestyle TO 'German, DMY'; \
@@ -1085,6 +1087,7 @@ fn pg_cdc_lmt_timestamptz_under_a_named_zone_matches_batch() {
     let cdc_db = CdcDb::new("cdc_lmt");
     let tbl = unique_name("cdc_lmt_pg");
     let slot = unique_name("rivet_lmt_slot");
+    let _slot = Slot::new(slot.clone());
     let mut c = cdc_db.connect();
     c.batch_execute(&format!(
         "ALTER DATABASE {db} SET timezone TO 'Europe/Berlin'",
@@ -1127,6 +1130,7 @@ fn pg_cdc_domain_columns_decode_as_their_base_type_and_match_batch() {
     let cdc_db = CdcDb::new("cdc_domain");
     let tbl = unique_name("cdc_domain_pg");
     let slot = unique_name("rivet_domain_slot");
+    let _slot = Slot::new(slot.clone());
     let mut c = cdc_db.connect();
     c.batch_execute(&format!(
         "CREATE DOMAIN posint AS integer CHECK (VALUE > 0); \
@@ -1246,6 +1250,7 @@ fn pg_cdc_update_and_delete_carry_full_types() {
     let d = tempfile::tempdir().unwrap();
     let tbl = unique_name("cdc_updel_pg");
     let slot = unique_name("rivet_updel_slot");
+    let _slot = Slot::new(slot.clone());
     let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
     c.batch_execute(&format!(
         "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (
@@ -1259,7 +1264,6 @@ fn pg_cdc_update_and_delete_carry_full_types() {
         &[&slot],
     )
     .unwrap();
-    let _slot = Slot(slot.clone());
     c.batch_execute(&format!(
         "INSERT INTO {tbl} VALUES (1, 1.50, '2024-01-01T00:00:00Z',
            'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380011', ARRAY['a'], ARRAY[1],
@@ -1328,6 +1332,7 @@ fn pg_cdc_hostile_floats_match_batch_and_nan_numeric_fails_loudly() {
     let d = tempfile::tempdir().unwrap();
     let tbl = unique_name("cdc_hostile_pg");
     let slot = unique_name("rivet_hostile_slot");
+    let _slot = Slot::new(slot.clone());
     let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
     c.batch_execute(&format!(
         "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (
@@ -1340,7 +1345,6 @@ fn pg_cdc_hostile_floats_match_batch_and_nan_numeric_fails_loudly() {
         &[&slot],
     )
     .unwrap();
-    let _slot = Slot(slot.clone());
 
     // Leg 1: hostile FLOATS (representable) — full parity required.
     c.batch_execute(&format!(
@@ -1748,6 +1752,7 @@ fn pg_initial_snapshot_vanished_slot_fails_loudly_not_recreates() {
     let d = tempfile::tempdir().unwrap();
     let tbl = unique_name("cdc_init_vslot");
     let slot = unique_name("rivet_initv_slot");
+    let _slot = Slot::new(slot.clone());
     let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
     c.batch_execute(&format!(
         "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT); \
@@ -1852,6 +1857,7 @@ fn pg_cdc_mixed_transaction_ending_on_uncaptured_table_advances_checkpoint() {
     let orders = unique_name("cdc_mixp_o");
     let audit = unique_name("cdc_mixp_a");
     let slot = unique_name("rivet_mixp_slot");
+    let _slot = Slot::new(slot.clone());
     let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
     c.batch_execute(&format!(
         "DROP TABLE IF EXISTS {orders}; DROP TABLE IF EXISTS {audit}; \
@@ -1868,7 +1874,6 @@ fn pg_cdc_mixed_transaction_ending_on_uncaptured_table_advances_checkpoint() {
         &[&slot],
     )
     .unwrap();
-    let _slot = Slot(slot.clone());
     c.batch_execute(&format!(
         "BEGIN; INSERT INTO {orders} VALUES (1,10); INSERT INTO {audit} VALUES (1,99); COMMIT;"
     ))
@@ -1930,6 +1935,7 @@ fn pg_cdc_schema_qualified_table_config_captures_events() {
     let d = tempfile::tempdir().unwrap();
     let tbl = unique_name("cdc_qual_pg");
     let slot = unique_name("rivet_qual_slot");
+    let _slot = Slot::new(slot.clone());
     let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
     c.batch_execute(&format!(
         "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"
@@ -1941,7 +1947,6 @@ fn pg_cdc_schema_qualified_table_config_captures_events() {
         &[&slot],
     )
     .unwrap();
-    let _slot = Slot(slot.clone());
     c.execute(&format!("INSERT INTO {tbl} VALUES (1, 10)"), &[])
         .unwrap();
 
@@ -2010,6 +2015,7 @@ fn pg_cdc_initial_snapshot_covers_preexisting_rows_then_streams() {
     let d = tempfile::tempdir().unwrap();
     let tbl = unique_name("cdc_init_pg");
     let slot = unique_name("rivet_init_slot");
+    let _slot = Slot::new(slot.clone());
     let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
     c.batch_execute(&format!(
         "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT); \
@@ -2026,7 +2032,6 @@ fn pg_cdc_initial_snapshot_covers_preexisting_rows_then_streams() {
     let cfg = rig.config_path();
 
     run_rivet_ok(&cfg);
-    let _slot = Slot(slot.clone());
     assert_eq!(manifest_rows(&out.join("snapshot")), 2);
     assert_eq!(
         duckdb_dir_parquet_id_set(&out.join("snapshot"))
@@ -2176,6 +2181,7 @@ fn pg_cdc_bare_numeric_is_delivered_as_labelled_server_text() {
     let d = tempfile::tempdir().unwrap();
     let tbl = unique_name("cdc_bare_num");
     let slot = unique_name("rivet_bare_num_slot");
+    let _slot = Slot::new(slot.clone());
     let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
     c.batch_execute(&format!(
         "CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, n NUMERIC)"
@@ -2187,7 +2193,6 @@ fn pg_cdc_bare_numeric_is_delivered_as_labelled_server_text() {
         &[&slot],
     )
     .unwrap();
-    let _slot = Slot(slot.clone());
     c.batch_execute(&format!(
         "INSERT INTO {tbl} VALUES (1, 1.50), (2, -0.000001234),
            (3, 123456789012345678901234567890.123456789012), (4, 'NaN'), (5, NULL)"
@@ -2257,7 +2262,7 @@ fn pg_cdc_multi_table_stream_uses_one_slot_and_resumes() {
     let t2 = unique_name("rivet_cdc_mb");
     let slot = unique_name("rivet_multi_slot");
     // Before the first run: a run that creates the slot and then fails must not leak it.
-    let _slot = Slot(slot.clone());
+    let _slot = Slot::new(slot.clone());
     let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
     for t in [&t1, &t2] {
         c.batch_execute(&format!(
@@ -2335,6 +2340,7 @@ fn pg_cdc_multi_table_check_target_emits_one_resolver_document_per_table() {
     let t1 = unique_name("rivet_cdc_tr_a");
     let t2 = unique_name("rivet_cdc_tr_b");
     let slot = unique_name("rivet_tr_slot");
+    let _slot = Slot::new(slot.clone());
     let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
     for t in [&t1, &t2] {
         c.batch_execute(&format!(
@@ -2644,6 +2650,7 @@ fn pg_cdc_vanished_slot_with_checkpoint_fails_loudly_not_recreates() {
     let d = tempfile::tempdir().unwrap();
     let tbl = unique_name("rivet_cdc_gone");
     let slot = unique_name("rivet_gone_slot");
+    let _slot = Slot::new(slot.clone());
     let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
     c.batch_execute(&format!(
         "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"
@@ -2706,6 +2713,7 @@ fn pg_cdc_corrupt_checkpoint_fails_loud_not_silently_absent() {
     let d = tempfile::tempdir().unwrap();
     let tbl = unique_name("rivet_cdc_pgcorrupt");
     let slot = unique_name("rivet_corrupt_slot");
+    let _slot = Slot::new(slot.clone());
     let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
     c.batch_execute(&format!(
         "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"
@@ -2726,7 +2734,6 @@ fn pg_cdc_corrupt_checkpoint_fails_loud_not_silently_absent() {
     std::fs::create_dir_all(&out1).unwrap();
     let rig1 = rig_for(&out1);
     run_rivet_ok(&rig1.config_path());
-    let _slot = Slot(slot.clone());
 
     // Run 2 captures a change and pins a valid checkpoint file.
     c.execute(&format!("INSERT INTO {tbl} VALUES (1,10)"), &[])
@@ -2771,7 +2778,9 @@ fn doctor_reports_cdc_slot_health_and_flags_foreign_inactive_slots() {
     let d = tempfile::tempdir().unwrap();
     let tbl = unique_name("rivet_cdc_doc");
     let own_slot = unique_name("rivet_doc_slot");
+    let _own_slot = Slot::new(own_slot.clone());
     let foreign_slot = unique_name("abandoned_tool_slot");
+    let _foreign = Slot::new(foreign_slot.clone());
     let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
     c.batch_execute(&format!(
         "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"
@@ -2784,7 +2793,6 @@ fn doctor_reports_cdc_slot_health_and_flags_foreign_inactive_slots() {
         &[&foreign_slot],
     )
     .unwrap();
-    let _foreign = Slot(foreign_slot.clone());
 
     let out_dir = d.path().join("out");
     std::fs::create_dir_all(&out_dir).unwrap();
@@ -2838,7 +2846,7 @@ fn pg_cdc_idle_first_run_then_change_is_captured_not_skipped() {
     let tbl = unique_name("rivet_cdc_pgidle");
     let slot = unique_name("rivet_idle_slot");
     // Before the first run: a run that creates the slot and then fails must not leak it.
-    let _slot = Slot(slot.clone());
+    let _slot = Slot::new(slot.clone());
     let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
     c.batch_execute(&format!(
         "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"
@@ -2882,6 +2890,7 @@ fn pg_cdc_crash_after_flush_before_ack_does_not_advance_the_slot() {
     let d = tempfile::tempdir().unwrap();
     let tbl = unique_name("rivet_cdc_pgcrash");
     let slot = unique_name("rivet_crash_slot");
+    let _slot = Slot::new(slot.clone());
     let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
     c.batch_execute(&format!(
         "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"
@@ -2893,7 +2902,6 @@ fn pg_cdc_crash_after_flush_before_ack_does_not_advance_the_slot() {
         &[&slot],
     )
     .unwrap();
-    let _slot = Slot(slot.clone());
     c.execute(&format!("INSERT INTO {tbl} VALUES (1,10),(2,20)"), &[])
         .unwrap();
 
@@ -2946,6 +2954,7 @@ fn roast_pg_cdc_crash_in_a_re_drain_pass_stays_at_least_once() {
     let a = unique_name("rivet_cdc_rdcap");
     let b = unique_name("rivet_cdc_rdforgn");
     let slot = unique_name("rivet_rd_slot");
+    let _slot = Slot::new(slot.clone());
     let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
     c.batch_execute(&format!(
         "DROP TABLE IF EXISTS {a}; DROP TABLE IF EXISTS {b}; \
@@ -2960,7 +2969,6 @@ fn roast_pg_cdc_crash_in_a_re_drain_pass_stays_at_least_once() {
         &[&slot],
     )
     .unwrap();
-    let _slot = Slot(slot.clone());
     // A large UNCAPTURED transaction (pass 1 consumes + acks it), THEN A's
     // in-bound data as ONE 12-row transaction (read only after the slot slides).
     c.execute(
@@ -3025,6 +3033,7 @@ fn roast_pg_cdc_large_transaction_is_atomic_across_a_mid_flush_crash() {
     let d = tempfile::tempdir().unwrap();
     let tbl = unique_name("rivet_cdc_pgatomic");
     let slot = unique_name("rivet_atomic_slot");
+    let _slot = Slot::new(slot.clone());
     let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
     c.batch_execute(&format!(
         "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"
@@ -3036,7 +3045,6 @@ fn roast_pg_cdc_large_transaction_is_atomic_across_a_mid_flush_crash() {
         &[&slot],
     )
     .unwrap();
-    let _slot = Slot(slot.clone());
     // ONE transaction, 12 rows (> 2× the rollover of 5).
     c.execute(
         &format!("INSERT INTO {tbl} SELECT g, g FROM generate_series(0, 11) g"),
@@ -3152,6 +3160,7 @@ fn pg_cdc_column_types_match_batch_export() {
     let d = tempfile::tempdir().unwrap();
     let tbl = unique_name("rivet_cdc_pgtypes");
     let slot = unique_name("rivet_types_slot");
+    let _slot = Slot::new(slot.clone());
     let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
     c.batch_execute(&format!(
         "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id int, amount numeric(10,2), \
@@ -3164,7 +3173,6 @@ fn pg_cdc_column_types_match_batch_export() {
         &[&slot],
     )
     .unwrap();
-    let _slot = Slot(slot.clone());
     c.execute(
         &format!(
             "INSERT INTO {tbl} VALUES (1, 12.34, '{{\"k\":1}}', 'hi', \
@@ -3326,6 +3334,7 @@ fn pg_cdc_column_added_mid_stream_is_captured() {
     let d = tempfile::tempdir().unwrap();
     let tbl = unique_name("rivet_cdc_pgdrift");
     let slot = unique_name("rivet_drift_slot");
+    let _slot = Slot::new(slot.clone());
     let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
     c.batch_execute(&format!(
         "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"
@@ -3337,7 +3346,6 @@ fn pg_cdc_column_added_mid_stream_is_captured() {
         &[&slot],
     )
     .unwrap();
-    let _slot = Slot(slot.clone());
 
     // Run 1: capture a row under the original (id, v) schema.
     c.execute(&format!("INSERT INTO {tbl} VALUES (1, 10)"), &[])
@@ -3378,6 +3386,7 @@ fn pg_cdc_until_current_terminates_under_sustained_writes() {
     let d = tempfile::tempdir().unwrap();
     let tbl = unique_name("rivet_cdc_pghb");
     let slot = unique_name("rivet_hb_slot");
+    let _slot = Slot::new(slot.clone());
     let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
     c.batch_execute(&format!(
         "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"
@@ -3389,7 +3398,6 @@ fn pg_cdc_until_current_terminates_under_sustained_writes() {
         &[&slot],
     )
     .unwrap();
-    let _slot = Slot(slot.clone());
 
     // Pre-open backlog: ids 0..30 (the slot captures them because it exists first).
     for i in 0..30i64 {
@@ -3508,6 +3516,7 @@ fn roast_pg_until_current_open_bound_two_runs_lose_nothing() {
     use postgres::NoTls;
     let tbl = unique_name("rivet_cdc_pgob");
     let slot = unique_name("rivet_ob_slot");
+    let _slot = Slot::new(slot.clone());
     let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
     c.batch_execute(&format!(
         "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"
@@ -3519,7 +3528,6 @@ fn roast_pg_until_current_open_bound_two_runs_lose_nothing() {
         &[&slot],
     )
     .unwrap();
-    let _slot = Slot(slot.clone());
 
     // Pre-open backlog: ids 0..30.
     for i in 0..30i64 {
@@ -3688,6 +3696,7 @@ fn roast_mysql_until_current_open_bound_two_runs_lose_nothing() {
 fn roast_pg_cdc_refuses_a_partitioned_parent_before_acking_the_slot() {
     let cdc_db = CdcDb::new("cdc_part");
     let slot = unique_name("rivet_part_slot");
+    let _slot = Slot::new(slot.clone());
     let parent = unique_name("rivet_cdc_par").to_lowercase();
     let part = format!("{parent}_2026_01");
     let mut c = cdc_db.connect();
@@ -3816,6 +3825,7 @@ fn the_cdc_reader_reads_the_manifest_declared_parts_not_the_directory() {
     let cdc_db = CdcDb::new("cdc_declared");
     let tbl = unique_name("rivet_cdc_decl").to_lowercase();
     let slot = unique_name("rivet_decl_slot").to_lowercase();
+    let _slot = Slot::new(slot.clone());
     let mut c = cdc_db.connect();
     c.batch_execute(&format!(
         "CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"
@@ -4002,6 +4012,7 @@ fn roast_mysql_cdc_refuses_a_view_whose_binlog_identity_is_the_base_table() {
 fn roast_pg_cdc_refuses_a_config_whose_resolved_identity_routing_cannot_match() {
     let cdc_db = CdcDb::new("cdc_ident");
     let slot = unique_name("rivet_ident_slot").to_lowercase();
+    let _slot = Slot::new(slot.clone());
     let mut c = cdc_db.connect();
     // The case collision, spelled the way a real schema acquires one: a quoted
     // relation plus an unquoted sibling. Different COLUMNS on purpose — that is
@@ -4091,6 +4102,7 @@ fn roast_pg_cdc_refuses_a_truncate_instead_of_silently_diverging() {
     let tbl = unique_name("rivet_cdc_tr").to_lowercase();
     let other = unique_name("rivet_cdc_trother").to_lowercase();
     let slot = unique_name("rivet_trunc_slot").to_lowercase();
+    let _slot = Slot::new(slot.clone());
     let mut c = cdc_db.connect();
     c.batch_execute(&format!(
         "CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT); \
@@ -4145,6 +4157,7 @@ fn roast_pg_cdc_refuses_a_truncate_instead_of_silently_diverging() {
     // bite again. This export is anchored on the SAME slot span that holds the
     // truncate, so the event is inside its window by construction.
     let other_slot = unique_name("rivet_trunc_slot_b").to_lowercase();
+    let _other_slot = Slot::new(other_slot.clone());
     c.execute(
         "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
         &[&other_slot],
@@ -4174,6 +4187,7 @@ fn roast_pg_cdc_refuses_a_truncate_instead_of_silently_diverging() {
     // Ours goes SECOND on purpose — a first-position-only fixture would pass
     // against the very defect this exists to catch.
     let third_slot = unique_name("rivet_trunc_slot_c").to_lowercase();
+    let _third_slot = Slot::new(third_slot.clone());
     c.execute(
         "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
         &[&third_slot],
@@ -4345,6 +4359,7 @@ fn roast_pg_cdc_refuses_a_bare_table_name_that_matches_two_relations() {
     let cdc_db = CdcDb::new("cdc_bare");
     let tbl = unique_name("rivet_cdc_bare").to_lowercase();
     let slot = unique_name("rivet_bare_slot").to_lowercase();
+    let _slot = Slot::new(slot.clone());
     let mut c = cdc_db.connect();
     c.batch_execute(&format!(
         "CREATE TABLE {tbl} (id int PRIMARY KEY, v text); \
@@ -4475,6 +4490,7 @@ fn roast_pg_cdc_reaches_open_bound_past_a_large_empty_ddl_span() {
     let cdc_db = CdcDb::new("cdc_ddlspan");
     let a = unique_name("rivet_cdc_ddlspan");
     let slot = unique_name("rivet_ddl_slot");
+    let _slot = Slot::new(slot.clone());
     let mut c = cdc_db.connect();
     c.batch_execute(&format!("CREATE TABLE {a} (id BIGINT PRIMARY KEY, v INT)"))
         .unwrap();
@@ -4536,6 +4552,7 @@ fn roast_pg_cdc_empty_transaction_churn_must_not_pin_the_slot() {
     let cdc_db = CdcDb::new("cdc_empty");
     let tbl = unique_name("rivet_cdc_pgempty");
     let slot = unique_name("rivet_empty_slot");
+    let _slot = Slot::new(slot.clone());
     let mut c = cdc_db.connect();
     c.batch_execute(&format!(
         "CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"
@@ -4689,6 +4706,7 @@ fn roast_pg_cdc_ndjson_until_current_terminates_and_emits_backlog() {
     use postgres::NoTls;
     let tbl = unique_name("rivet_cdc_pgnd");
     let slot = unique_name("rivet_nd_slot");
+    let _slot = Slot::new(slot.clone());
     let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
     c.batch_execute(&format!(
         "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"
@@ -4700,7 +4718,6 @@ fn roast_pg_cdc_ndjson_until_current_terminates_and_emits_backlog() {
         &[&slot],
     )
     .unwrap();
-    let _slot = Slot(slot.clone());
 
     for i in 0..30i64 {
         c.execute(&format!("INSERT INTO {tbl} VALUES ({i},{i})"), &[])
@@ -4773,6 +4790,7 @@ fn roast_pg_cdc_reaches_open_bound_past_a_large_uncaptured_transaction() {
     let a = unique_name("rivet_cdc_capa");
     let b = unique_name("rivet_cdc_forgnb");
     let slot = unique_name("rivet_dens_slot");
+    let _slot = Slot::new(slot.clone());
     let mut c = cdc_db.connect();
     c.batch_execute(&format!(
         "CREATE TABLE {a} (id BIGINT PRIMARY KEY, v INT); \
@@ -4836,6 +4854,7 @@ fn roast_pg_cdc_drain_releases_pinned_wal_and_advances_xmin() {
     let cdc_db = CdcDb::new("cdc_walret");
     let tbl = unique_name("rivet_cdc_walret");
     let slot = unique_name("rivet_walret_slot");
+    let _slot = Slot::new(slot.clone());
     let mut c = cdc_db.connect();
     c.batch_execute(&format!(
         "CREATE TABLE {tbl} (id bigint primary key, v int, pad text)"
@@ -4926,6 +4945,7 @@ fn roast_pg_cdc_captures_a_silent_update_a_watermark_sync_would_miss() {
     let d = tempfile::tempdir().unwrap();
     let tbl = unique_name("rivet_cdc_silent");
     let slot = unique_name("rivet_silent_slot");
+    let _slot = Slot::new(slot.clone());
     let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
     c.batch_execute(&format!(
         "DROP TABLE IF EXISTS {tbl}; \
@@ -4938,7 +4958,6 @@ fn roast_pg_cdc_captures_a_silent_update_a_watermark_sync_would_miss() {
         &[&slot],
     )
     .unwrap();
-    let _slot = Slot(slot.clone());
 
     // Insert a row with a fixed watermark.
     c.execute(
@@ -4995,6 +5014,7 @@ fn roast_pg_cdc_oversized_transaction_bails_loud_not_oom() {
     let d = tempfile::tempdir().unwrap();
     let tbl = unique_name("rivet_cdc_bigtx");
     let slot = unique_name("rivet_bigtx_slot");
+    let _slot = Slot::new(slot.clone());
     let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
     c.batch_execute(&format!(
         "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id bigint primary key, v bigint)"
@@ -5006,7 +5026,6 @@ fn roast_pg_cdc_oversized_transaction_bails_loud_not_oom() {
         &[&slot],
     )
     .unwrap();
-    let _slot = Slot(slot.clone());
     // ONE transaction of 20 rows — over the cap-of-10 this run sets.
     c.execute(
         &format!("INSERT INTO {tbl} SELECT g, g FROM generate_series(1, 20) g"),
@@ -5060,6 +5079,7 @@ fn roast_pg_cdc_bounded_on_a_standby_fails_loud() {
     let d = tempfile::tempdir().unwrap();
     let tbl = unique_name("t_standby");
     let slot = unique_name("standby_slot");
+    let _slot = Slot::on(standby_url, slot.clone());
     let out = d.path().join("out");
     std::fs::create_dir_all(&out).unwrap();
     // A standby is just a source_url override on the canonical CDC rig — no
@@ -5118,6 +5138,7 @@ fn pg_cdc_streams_changes_from_a_standby_in_continuous_mode() {
     let mut sb = postgres::Client::connect(standby_url, postgres::NoTls).expect("connect standby");
     let tbl = unique_name("t_standby_stream");
     let slot = unique_name("standby_stream_slot");
+    let _slot = Slot::on(standby_url, slot.clone());
     p.batch_execute(&format!(
         "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"
     ))
@@ -5158,11 +5179,7 @@ fn pg_cdc_streams_changes_from_a_standby_in_continuous_mode() {
     let first = rig.run();
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     nudger.join().unwrap();
-    let drop_slot = |sb: &mut postgres::Client| {
-        let _ = sb.execute("SELECT pg_drop_replication_slot($1)", &[&slot]);
-    };
     if !first.status.success() {
-        drop_slot(&mut sb);
         panic!(
             "a continuous run must stream from a PostgreSQL 16 standby:\n{}",
             String::from_utf8_lossy(&first.stderr)
@@ -5173,7 +5190,6 @@ fn pg_cdc_streams_changes_from_a_standby_in_continuous_mode() {
         .unwrap();
     replicated(&mut sb, &format!("SELECT COUNT(*) FROM {tbl}"), 2);
     let second = rig.run();
-    drop_slot(&mut sb);
     assert!(
         second.status.success(),
         "the second standby run:\n{}",
@@ -5480,6 +5496,7 @@ fn roast_pg_cdc_destination_placeholders_resolve_like_the_batch_path() {
     let d = tempfile::tempdir().unwrap();
     let tbl = unique_name("cdc_placeholder");
     let slot = unique_name("rivet_placeholder_slot");
+    let _slot = Slot::new(slot.clone());
     let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
     c.batch_execute(&format!(
         "DROP TABLE IF EXISTS {tbl}; \
@@ -6623,6 +6640,7 @@ fn roast_pg_cdc_crash_between_checkpoint_and_ack_re_reads_and_releases_the_slot(
     let d = tempfile::tempdir().unwrap();
     let tbl = unique_name("rivet_cdc_pgckpt");
     let slot = unique_name("rivet_ckpt_slot");
+    let _slot = Slot::new(slot.clone());
     let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
     c.batch_execute(&format!(
         "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"
@@ -6634,7 +6652,6 @@ fn roast_pg_cdc_crash_between_checkpoint_and_ack_re_reads_and_releases_the_slot(
         &[&slot],
     )
     .unwrap();
-    let _slot = Slot(slot.clone());
     // Separate transactions so several parts roll: the crash must land in the
     // window, and a single transaction would give it only one chance.
     for g in 0..12 {
@@ -6751,8 +6768,10 @@ fn roast_pg_cdc_crash_between_checkpoint_and_ack_re_reads_and_releases_the_slot(
 fn roast_pg_cdc_run_warns_about_an_abandoned_slot_pinning_wal() {
     use postgres::NoTls;
     let tbl = unique_name("rivet_cdc_slotwarn");
-    let slot = unique_name("rivet_slotwarn").to_lowercase();
-    let orphan = unique_name("rivet_orphan").to_lowercase();
+    let slot = unique_name("rivet_warn_slot").to_lowercase();
+    let _slot = Slot::new(slot.clone());
+    let orphan = unique_name("rivet_orphan_slot").to_lowercase();
+    let _orphan_guard = Slot::new(orphan.clone());
     let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
     c.batch_execute(&format!(
         "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id BIGINT PRIMARY KEY)"
@@ -6766,8 +6785,6 @@ fn roast_pg_cdc_run_warns_about_an_abandoned_slot_pinning_wal() {
         )
         .unwrap();
     }
-    let _slot = Slot(slot.clone());
-    let _orphan_guard = Slot(orphan.clone());
     c.execute(&format!("INSERT INTO {tbl} VALUES (1)"), &[])
         .unwrap();
 
@@ -6847,6 +6864,7 @@ fn roast_pg_cdc_truncate_refusal_delivers_the_rows_it_already_read() {
     let ta = unique_name("rivet_cdc_trka").to_lowercase();
     let tb = unique_name("rivet_cdc_trkb").to_lowercase();
     let slot = unique_name("rivet_trk_slot").to_lowercase();
+    let _slot = Slot::new(slot.clone());
     let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
     c.batch_execute(&format!(
         "DROP TABLE IF EXISTS {ta}; DROP TABLE IF EXISTS {tb}; \
@@ -6861,7 +6879,6 @@ fn roast_pg_cdc_truncate_refusal_delivers_the_rows_it_already_read() {
         &[&slot],
     )
     .unwrap();
-    let _slot = Slot(slot.clone());
 
     // The bystander commits FIRST, in its own transaction, and is never truncated.
     c.execute(
@@ -7018,6 +7035,7 @@ fn mysql_cdc_refuses_a_minimal_backlog_after_the_server_is_switched_to_full() {
 fn roast_pg_cdc_folded_twin_refusal_names_both_relations() {
     let cdc_db = CdcDb::new("cdc_twin");
     let slot = unique_name("rivet_twin_slot").to_lowercase();
+    let _slot = Slot::new(slot.clone());
     let mut c = cdc_db.connect();
     c.batch_execute(
         "CREATE TABLE \"MixedCase\" (id int, v text); \
@@ -7029,7 +7047,6 @@ fn roast_pg_cdc_folded_twin_refusal_names_both_relations() {
         &[&slot],
     )
     .unwrap();
-    let _slot = Slot(slot.clone());
 
     let rig = Rig::pg_cdc("MixedCase", &slot).source_url(cdc_db.url());
     let said = rig.run_expect_fail();
@@ -7143,6 +7160,7 @@ fn roast_pg_cdc_truncate_inside_a_transaction_with_rows_still_refuses() {
     use postgres::NoTls;
     let tbl = unique_name("rivet_cdc_wedge").to_lowercase();
     let slot = unique_name("rivet_wedge_slot").to_lowercase();
+    let _slot = Slot::new(slot.clone());
     let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
     c.batch_execute(&format!(
         "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl}(id int PRIMARY KEY, v text)"
@@ -7154,7 +7172,6 @@ fn roast_pg_cdc_truncate_inside_a_transaction_with_rows_still_refuses() {
         &[&slot],
     )
     .unwrap();
-    let _slot = Slot(slot.clone());
 
     // The row change and the truncate in ONE transaction — the shape that left `tx`
     // non-empty and `pending` empty at the break.
@@ -7207,6 +7224,7 @@ fn roast_pg_cdc_truncate_inside_a_transaction_with_rows_still_refuses() {
 fn pg_cdc_classification_asks_about_the_resolved_relation_not_the_search_path_one() {
     let cdc_db = CdcDb::new("cdc_resolved");
     let slot = unique_name("rivet_resolved_slot");
+    let _slot = Slot::new(slot.clone());
     let name = unique_name("rivet_cdc_rv").to_lowercase();
     let mut c = cdc_db.connect();
     c.batch_execute(&format!(
@@ -7285,6 +7303,7 @@ fn pg_cdc_classification_asks_about_the_resolved_relation_not_the_search_path_on
 fn pg_cdc_matview_is_a_loud_partial_not_a_refusal() {
     let cdc_db = CdcDb::new("cdc_matview");
     let slot = unique_name("rivet_mv_slot");
+    let _slot = Slot::new(slot.clone());
     let base = unique_name("rivet_cdc_mvb").to_lowercase();
     let mv = format!("{base}_mv");
     let mut c = cdc_db.connect();
@@ -7353,6 +7372,7 @@ fn pg_cdc_matview_is_a_loud_partial_not_a_refusal() {
 fn pg_cdc_says_the_inheritance_gap_once_per_run_not_twice() {
     let cdc_db = CdcDb::new("cdc_partial_once");
     let slot = unique_name("rivet_partial_slot");
+    let _slot = Slot::new(slot.clone());
     let parent = unique_name("rivet_cdc_inh").to_lowercase();
     let child = format!("{parent}_child");
     let mut c = cdc_db.connect();
@@ -7612,7 +7632,7 @@ fn a_bounded_run_emits_a_distinct_barrier_per_cycle() {
     let d = tempfile::tempdir().unwrap();
     let tbl = unique_name("rivet_barrier").to_lowercase();
     let slot = unique_name("rivet_barrier_slot").to_lowercase();
-    let watcher = unique_name("rivet_barrier_watch").to_lowercase();
+    let _slot = Slot::new(slot.clone());
     let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
     c.batch_execute(&format!(
         "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"
@@ -7641,7 +7661,6 @@ fn a_bounded_run_emits_a_distinct_barrier_per_cycle() {
         &[&slot],
     )
     .expect("rivet's slot");
-    let _slot = Slot(slot.clone());
 
     let out = tempfile::tempdir().expect("out dir");
     // WITH a checkpoint, which is what a real bounded deployment has — the
@@ -7655,16 +7674,17 @@ fn a_bounded_run_emits_a_distinct_barrier_per_cycle() {
 
     let mut nonces: Vec<String> = Vec::new();
     for cycle in 0..2 {
+        let watcher = unique_name("rivet_barrier_watch_slot").to_lowercase();
+        // The guard, so a panic mid-cycle cannot leak an inactive slot onto the
+        // stand. Two slots leaked from a HAND probe earlier and broke the same two
+        // neighbours this test is gated for — the leak, not the test, was the
+        // cause, and only a `pg_replication_slots` read told them apart.
+        let _w = Slot::new(watcher.clone());
         c.execute(
             "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
             &[&watcher],
         )
         .expect("watcher slot");
-        // The guard, so a panic mid-cycle cannot leak an inactive slot onto the
-        // stand. Two slots leaked from a HAND probe earlier and broke the same two
-        // neighbours this test is gated for — the leak, not the test, was the
-        // cause, and only a `pg_replication_slots` read told them apart.
-        let _w = Slot(watcher.clone());
         c.batch_execute(&format!("INSERT INTO {tbl} VALUES ({cycle}, {cycle})"))
             .expect("seed");
         rig.run_ok();
@@ -7708,7 +7728,6 @@ fn a_bounded_run_emits_a_distinct_barrier_per_cycle() {
              database cannot end each other's runs: {nonce}"
         );
         nonces.push(nonce);
-        drop(_w); // before the next cycle recreates it under the same name
     }
 
     assert_ne!(
@@ -7920,13 +7939,10 @@ fn regenerate_the_pgoutput_fixture_from_the_rig_scenarios() {
 
     let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
     let tbl = "rivet_pgout_fx";
-    let slot = "rivet_pgout_fx_slot";
+    let slot = unique_name("rivet_pgout_fx_slot");
+    let _slot = Slot::new(slot.clone());
     let pubn = "rivet_pgout_fx_pub";
 
-    let _ = c.batch_execute(&format!(
-        "SELECT pg_drop_replication_slot('{slot}') FROM pg_replication_slots \
-         WHERE slot_name='{slot}'"
-    ));
     let _ = c.batch_execute(&format!("DROP PUBLICATION IF EXISTS {pubn}"));
     let _ = c.batch_execute(&format!("DROP TABLE IF EXISTS {tbl}"));
 
@@ -7940,7 +7956,6 @@ fn regenerate_the_pgoutput_fixture_from_the_rig_scenarios() {
         &[&slot],
     )
     .expect("pgoutput slot");
-    let _slot = Slot(slot.to_string());
 
     // THREE rows in ONE transaction: see `in_one_transaction`'s note — with one,
     // three different `committed` mutants are the same answer.
@@ -8080,7 +8095,7 @@ fn a_rolled_back_prepared_transaction_is_never_published_postgres() {
     ))
     .expect("create table");
     let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
-    let _slot = Slot(slot.clone());
+    let _slot = Slot::new(slot.clone());
 
     let out = tempfile::tempdir().expect("out dir");
     let rig = Rig::pg_cdc(&tbl, &slot).dest_path(out.path().to_path_buf());
@@ -8168,7 +8183,7 @@ fn the_pg_slot_is_not_two_phase_so_a_prepared_transaction_cannot_be_published_ea
     ))
     .expect("create table");
     let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
-    let _slot = Slot(slot.clone());
+    let _slot = Slot::new(slot.clone());
 
     // RIVET creates the slot, not this test. Pre-creating it here would grade the
     // test's own `pg_create_logical_replication_slot` call — the fixture-against-
@@ -8678,6 +8693,7 @@ fn an_idle_cycle_does_not_blind_validate_to_a_missing_part() {
 fn a_bounded_run_reaches_its_bound_across_an_empty_transaction_span() {
     let cdc_db = CdcDb::new("cdc_empty_span");
     let slot = unique_name("rivet_espan_slot").to_lowercase();
+    let _slot = Slot::new(slot.clone());
     let tbl = unique_name("rivet_cdc_espan").to_lowercase();
     let mut c = cdc_db.connect();
     c.batch_execute(&format!(
@@ -8759,27 +8775,22 @@ fn pg_cdc_a_transaction_past_the_memory_cap_spills_rather_than_failing() {
     let d = tempfile::tempdir().unwrap();
     let tbl = unique_name("cdc_spill_pg");
     let slot_spill = unique_name("rivet_spill_slot");
+    let _slot_spill = Slot::new(slot_spill.clone());
     let slot_plain = unique_name("rivet_plain_slot");
+    let _slot_plain = Slot::new(slot_plain.clone());
     let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
     c.batch_execute(&format!(
         "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} {ONE_TRANSACTION_DDL}"
     ))
     .unwrap();
     let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
-    // GUARDED: an aborted test that leaks a slot eats `max_replication_slots` for
-    // every later run on the stand (measured — 32 leaked, and the next run failed
-    // with "all replication slots are in use", which reads as a product bug).
-    let _guards: Vec<Slot> = [&slot_spill, &slot_plain]
-        .iter()
-        .map(|slot| {
-            c.execute(
-                "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
-                &[slot],
-            )
-            .unwrap();
-            Slot((*slot).clone())
-        })
-        .collect();
+    for slot in [&slot_spill, &slot_plain] {
+        c.execute(
+            "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+            &[slot],
+        )
+        .unwrap();
+    }
     // The big transaction, seeded AFTER both slots exist so both decode it…
     c.batch_execute(&one_transaction_of(&tbl, ROWS)).unwrap();
     // …and a SECOND one behind it, in the same read window. Handing out a spilled

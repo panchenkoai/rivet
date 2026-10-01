@@ -48,6 +48,7 @@ fn a_postgres_cdc_run_opens_at_most_two_source_connections() {
     let mut c = postgres::Client::connect(POSTGRES_CDC_URL, postgres::NoTls).unwrap();
     let tbl = unique_name("rivet_cdc_conns");
     let slot = unique_name("rivet_conns_slot");
+    let _slot = Slot::new(slot.clone());
     c.batch_execute(&format!(
         "CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT); ALTER TABLE {tbl} REPLICA IDENTITY FULL"
     ))

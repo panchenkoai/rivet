@@ -303,7 +303,7 @@ fn partner_shape_three_tables_one_stream_postgres() {
     // The product creates the slot at the first run's anchor step (after the seed,
     // so the baseline — not the stream — carries the seed); the guard drops it.
     let slot = unique_name("multi_pg_slot");
-    guards.push(Box::new(Slot(slot.clone())));
+    guards.push(Box::new(Slot::new(slot.clone())));
     let rig = shaped(
         Rig::pg_cdc(&tables[0], &slot).export_named("stream"),
         &tables,

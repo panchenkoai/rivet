@@ -128,6 +128,8 @@ mod schema_drift;
 mod schema_evolution;
 #[path = "offline/silent_degrade_ratchet.rs"]
 mod silent_degrade_ratchet;
+#[path = "offline/slot_guard_order_guard.rs"]
+mod slot_guard_order_guard;
 #[path = "offline/stand_registry_guard.rs"]
 mod stand_registry_guard;
 #[path = "offline/state_compat.rs"]

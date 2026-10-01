@@ -179,6 +179,7 @@ fn mysql_cdc_flush_past_the_partition_budget_is_cut_and_every_part_notes_its_par
 fn pg_cdc_flush_past_the_partition_budget_is_cut_and_every_part_notes_its_partitions() {
     let tbl = unique_name("pfooter_pg");
     let slot = unique_name("rivet_pfooter_slot");
+    let _slot = Slot::new(slot.clone());
     let mut c =
         postgres::Client::connect(POSTGRES_CDC_URL, postgres::NoTls).expect("connect postgres");
     c.batch_execute(&format!(
@@ -189,7 +190,6 @@ fn pg_cdc_flush_past_the_partition_budget_is_cut_and_every_part_notes_its_partit
     let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
     let rig = Rig::pg_cdc(&tbl, &slot).duckdb_oracle().top_line(CDC_LOAD);
     rig.run_ok(); // creates the slot
-    let _slot = Slot(slot.clone());
     c.batch_execute(&format!(
         "INSERT INTO {tbl} SELECT g, DATE '2000-01-01' + g, md5(g::text) \
          FROM generate_series(1, {ROWS}) g"

@@ -707,7 +707,7 @@ fn a_generated_single_table_cdc_config_takes_its_baseline_then_only_later_change
         cfg.to_str().unwrap(),
     ]);
     let generated = std::fs::read_to_string(&cfg).expect("generated config");
-    let _slot = Slot(scaffolded_slot(&generated));
+    let _slot = Slot::new(scaffolded_slot(&generated));
     assert!(
         generated.contains("until_current: true"),
         "an unbounded first run never returns, so there is no second run:\n{generated}"
@@ -783,7 +783,7 @@ fn a_generated_multi_table_cdc_config_takes_every_baseline_then_only_the_delta()
         cfg.to_str().unwrap(),
     ]);
     let generated = std::fs::read_to_string(&cfg).expect("generated config");
-    let _slot = Slot(scaffolded_slot(&generated));
+    let _slot = Slot::new(scaffolded_slot(&generated));
     assert!(
         generated.contains("backfill: auto"),
         "over two tables the scaffold must carry the baseline recipe — that is the \
@@ -906,7 +906,7 @@ fn cdc_warehouse_chain(src: CdcSource, bq: &BqLive) {
     let _bq_guard = bq.cleanup(&[&export, &changes]);
     let _slot = generated
         .contains("slot:")
-        .then(|| Slot(scaffolded_slot(&generated)));
+        .then(|| Slot::new(scaffolded_slot(&generated)));
     let db = [("DATABASE_URL", src.url.as_str())];
 
     rivet_ok(&["check", "-c", cfg], &db);
