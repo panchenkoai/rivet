@@ -1883,7 +1883,7 @@ fn an_incremental_cursor_on_a_nanosecond_timestamp_is_refused_before_it_re_expor
 
 /// The `columns:` override types beyond the autodetected ones, one column each.
 const OVERRIDE_DECODERS: &str = "columns: {N_SMALL: int16, D: date, TS9: timestamp_ns, \
-    TS6: timestamp_tz, DT: text, T9TXT: text, BD: text, BF: float64, B: text, RW: uuid, R8: text, \
+    TS6: timestamp_tz, DT: text, T9TXT: text, BD: text, BF: float64, BFT: text, B: text, RW: uuid, R8: text, \
     N_F4: float4, TZ9: timestamp_tz_ns}";
 
 /// A table whose every column is read through one of [`OVERRIDE_DECODERS`].
@@ -1892,20 +1892,20 @@ fn override_decoder_table() -> OracleTable {
         "ora_ovr",
         "id NUMBER(10) PRIMARY KEY, n_small NUMBER(4), d DATE, ts9 TIMESTAMP(9), \
          ts6 TIMESTAMP(6), dt DATE, t9txt TIMESTAMP(9), bd BINARY_DOUBLE, bf BINARY_FLOAT, \
-         b BOOLEAN, rw RAW(16), r8 RAW(8), n_f4 NUMBER(6,2), tz9 TIMESTAMP(9)",
+         bft BINARY_FLOAT, b BOOLEAN, rw RAW(16), r8 RAW(8), n_f4 NUMBER(6,2), tz9 TIMESTAMP(9)",
     );
     for row in [
         "1, 1234, DATE '2024-02-29', TIMESTAMP '2024-02-29 13:14:15.123456789', \
          TIMESTAMP '2024-02-29 13:14:15.123456', TO_DATE('2024-02-29 13:14:15','YYYY-MM-DD HH24:MI:SS'), \
-         TIMESTAMP '2024-02-29 13:14:15.000000001', 2.25, 0.1, TRUE, \
+         TIMESTAMP '2024-02-29 13:14:15.000000001', 2.25, 0.1, 0.1, TRUE, \
          HEXTORAW('00112233445566778899AABBCCDDEEFF'), HEXTORAW('DEADBEEF00'), 12.5, \
          TIMESTAMP '2024-02-29 13:14:15.987654321'",
         "2, -9999, DATE '0001-01-01', TIMESTAMP '1677-09-21 00:12:43.145224192', \
          TIMESTAMP '9999-12-31 23:59:59.999999', TO_DATE('-0001-06-15 23:59:59','SYYYY-MM-DD HH24:MI:SS'), \
-         TIMESTAMP '2024-01-01 00:00:00.5', -1.5E300D, -3.5, FALSE, \
+         TIMESTAMP '2024-01-01 00:00:00.5', -1.5E300D, -3.5, 3.4E38, FALSE, \
          HEXTORAW('FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF'), HEXTORAW('01'), -0.1, \
          TIMESTAMP '2262-04-11 23:47:16.854775807'",
-        "3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL",
+        "3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL",
     ] {
         ora_exec(&format!("INSERT INTO {} VALUES ({row})", t.name()));
     }
@@ -2002,6 +2002,11 @@ fn every_override_decoder_round_trips_against_oracles_rendering() {
         bits(parquet_cells(out.path(), "BF"), false),
         bits(oracle_cells(n, "TO_CHAR(bf)"), true),
         "BF widened to float64"
+    );
+    assert_eq!(
+        bits(parquet_cells(out.path(), "BFT"), true),
+        bits(oracle_cells(n, "TO_CHAR(bft)"), true),
+        "BFT as text"
     );
     assert_eq!(
         parquet_cells(out.path(), "DT")[&2].as_deref(),

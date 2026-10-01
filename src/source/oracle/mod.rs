@@ -257,6 +257,61 @@ fn declared_type(kind: OraKind, base: String, precision: u8, scale: i8) -> Strin
     }
 }
 
+/// An export query's re-projected select list.
+#[derive(Debug, PartialEq)]
+struct SelectList {
+    /// Some column is read through a conversion or carries an empty-value flag.
+    rewritten: bool,
+    /// Each column's expression, then the LOB empty-value flag columns.
+    cols: Vec<String>,
+    /// For a LOB column, the index of its flag column.
+    empty_flags: Vec<Option<usize>>,
+}
+
+/// The select list re-reading each `(name, kind)` column the way the row decoder needs it.
+fn select_list(cols: &[(&str, OraKind)]) -> SelectList {
+    let names: Vec<&str> = cols.iter().map(|(n, _)| *n).collect();
+    let mut rewritten = false;
+    let mut exprs = Vec::with_capacity(cols.len());
+    let mut flags = Vec::new();
+    let mut empty_flags = vec![None; cols.len()];
+    for (i, (name, k)) in cols.iter().enumerate() {
+        let quoted = crate::sql::quote_ident(crate::config::SourceType::Oracle, name);
+        match k.projection(&quoted) {
+            Some(expr) => {
+                rewritten = true;
+                exprs.push(format!("{expr} {quoted}"));
+            }
+            None => exprs.push(quoted.clone()),
+        }
+        if k.needs_empty_flag() {
+            rewritten = true;
+            empty_flags[i] = Some(cols.len() + flags.len());
+            let alias = unique_alias(&format!("_rivet_empty_{i}"), &names);
+            flags.push(format!(
+                "CASE WHEN DBMS_LOB.GETLENGTH({quoted}) = 0 THEN 1 END \"{alias}\""
+            ));
+        }
+    }
+    if cols.len() + flags.len() > MAX_SELECT_COLUMNS {
+        log::warn!(
+            "oracle: {} LOB column(s) read a zero-length value as NULL: the query already \
+             has {} columns and Oracle allows {MAX_SELECT_COLUMNS}, so the empty-value flags \
+             do not fit — select fewer columns in a `query:` to keep the distinction",
+            flags.len(),
+            cols.len()
+        );
+        flags.clear();
+        empty_flags.iter_mut().for_each(|f| *f = None);
+    }
+    exprs.extend(flags);
+    SelectList {
+        rewritten,
+        cols: exprs,
+        empty_flags,
+    }
+}
+
 /// An export query as rivet fetches it.
 struct Projection {
     sql: String,
@@ -354,41 +409,13 @@ impl OracleSource {
     fn projected(&self, query: &str) -> Result<Projection> {
         let metas = self.describe(query)?;
         let native: Vec<String> = metas.iter().map(native_type).collect();
-        let names: Vec<&str> = metas.iter().map(|m| m.name()).collect();
-        let mut rewritten = false;
-        let mut cols = Vec::with_capacity(metas.len());
-        let mut flags = Vec::new();
-        let mut empty_flags = vec![None; metas.len()];
-        for (i, m) in metas.iter().enumerate() {
-            let quoted = crate::sql::quote_ident(crate::config::SourceType::Oracle, m.name());
-            let k = OraKind::of(m);
-            match k.projection(&quoted) {
-                Some(expr) => {
-                    rewritten = true;
-                    cols.push(format!("{expr} {quoted}"));
-                }
-                None => cols.push(quoted.clone()),
-            }
-            if k.needs_empty_flag() {
-                rewritten = true;
-                empty_flags[i] = Some(metas.len() + flags.len());
-                let alias = unique_alias(&format!("_rivet_empty_{i}"), &names);
-                flags.push(format!(
-                    "CASE WHEN DBMS_LOB.GETLENGTH({quoted}) = 0 THEN 1 END \"{alias}\""
-                ));
-            }
-        }
-        if metas.len() + flags.len() > MAX_SELECT_COLUMNS {
-            log::warn!(
-                "oracle: {} LOB column(s) read a zero-length value as NULL: the query already \
-                 has {} columns and Oracle allows {MAX_SELECT_COLUMNS}, so the empty-value flags \
-                 do not fit — select fewer columns in a `query:` to keep the distinction",
-                flags.len(),
-                metas.len()
-            );
-            flags.clear();
-            empty_flags.iter_mut().for_each(|f| *f = None);
-        }
+        let kinds: Vec<(&str, OraKind)> =
+            metas.iter().map(|m| (m.name(), OraKind::of(m))).collect();
+        let SelectList {
+            rewritten,
+            cols,
+            empty_flags,
+        } = select_list(&kinds);
         let sql = if rewritten {
             if let Some(m) = metas.iter().find(|m| unreferenceable(m.name())) {
                 anyhow::bail!(
@@ -398,7 +425,6 @@ impl OracleSource {
                     m.name()
                 );
             }
-            cols.extend(flags);
             format!("SELECT {} FROM ({query}) \"_rivet_p\"", cols.join(", "))
         } else {
             query.to_string()
@@ -935,6 +961,39 @@ mod tests {
         assert_eq!(d(OraKind::TimestampTz, 0, 6), "base(6)");
         assert_eq!(d(OraKind::TimestampLtz, 0, 3), "base(3)");
         assert_eq!(d(OraKind::Text, 40, 0), "base");
+    }
+
+    #[test]
+    fn each_lob_flag_index_points_past_every_column_and_the_flags_before_it() {
+        let got = select_list(&[
+            ("ID", OraKind::Number),
+            ("C1", OraKind::Clob),
+            ("B2", OraKind::Blob),
+        ]);
+        assert!(got.rewritten);
+        assert_eq!(got.empty_flags, vec![None, Some(3), Some(4)]);
+        assert_eq!(got.cols.len(), 5);
+        assert!(got.cols[3].contains("\"C1\"") && got.cols[4].contains("\"B2\""));
+        assert!(!select_list(&[("ID", OraKind::Number)]).rewritten);
+    }
+
+    #[test]
+    fn lob_flags_are_dropped_only_past_the_select_column_limit() {
+        let names: Vec<String> = (0..MAX_SELECT_COLUMNS).map(|i| format!("N{i}")).collect();
+        let with_lob = |width: usize| {
+            let mut cols: Vec<(&str, OraKind)> = names[..width - 1]
+                .iter()
+                .map(|n| (n.as_str(), OraKind::Number))
+                .collect();
+            cols.push(("C", OraKind::Clob));
+            select_list(&cols)
+        };
+        let fits = with_lob(MAX_SELECT_COLUMNS - 1);
+        assert_eq!(fits.cols.len(), MAX_SELECT_COLUMNS);
+        assert_eq!(fits.empty_flags.last(), Some(&Some(MAX_SELECT_COLUMNS - 1)));
+        let over = with_lob(MAX_SELECT_COLUMNS);
+        assert_eq!(over.cols.len(), MAX_SELECT_COLUMNS);
+        assert!(over.empty_flags.iter().all(Option::is_none));
     }
 
     #[test]
