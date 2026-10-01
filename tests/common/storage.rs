@@ -233,46 +233,39 @@ pub fn ensure_azure_container(container: &str) {
     );
 }
 
-/// Pull every object under `prefix` into a LOCAL directory, preserving base
-/// names, and return how many were written.
+/// Pull every object under `prefix` into a LOCAL directory, each at its key relative to
+/// `prefix` (sub-prefixes become sub-directories), and return how many were written. A
+/// missing bucket pulls nothing.
 ///
-/// This exists so a cloud destination can be graded by the SAME oracle as a
-/// local one. The alternative — a store-specific "what was delivered" reader —
-/// is a second definition of delivered, and it drifts on the first fix: the
-/// local read-back was corrected to count only manifest-DECLARED parts (a crash
-/// leaves orphans no manifest names) while the cloud reader kept summing every
-/// object under the prefix, so resume cells on s3/gcs read 2000 rows from a
-/// 1000-row table. Pull the prefix, then run `dir_manifest_copy_id_set` /
-/// `dir_manifest_copy_total_rows` over it exactly as the local tests do.
-///
-/// Base names are preserved because that is what a manifest's `parts[].path`
-/// resolves to; a collision would silently drop an object, so it PANICS instead.
+/// This exists so a cloud destination can be graded by the SAME oracle as a local one:
+/// a store-specific "what was delivered" reader is a second definition of delivered,
+/// and it drifted on the first fix (resume cells on s3/gcs read 2000 rows from a
+/// 1000-row table). Keys keep their sub-prefixes: a CDC destination nests `snapshot/`
+/// and per-table prefixes whose manifest names collide when flattened.
 pub fn minio_pull_prefix(bucket: &str, prefix: &str, into: &std::path::Path) -> usize {
-    std::fs::create_dir_all(into).expect("create pull dir");
     let ls_script = format!(
         "mc alias set local http://127.0.0.1:9000 {MINIO_ACCESS_KEY} {MINIO_SECRET_KEY} >/dev/null 2>&1 && \
-         mc ls --recursive local/{bucket} 2>/dev/null"
+         mc ls --recursive local/{bucket}"
     );
     let ls = Command::new("docker")
         .args(["compose", "exec", "-T", "minio", "sh", "-c", &ls_script])
         .output()
         .expect("mc ls");
-    assert!(ls.status.success(), "mc ls failed");
-    let mut pulled = 0usize;
-    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for line in String::from_utf8_lossy(&ls.stdout).lines() {
-        let Some(name) = line.split_whitespace().last() else {
-            continue;
-        };
-        if !name.starts_with(prefix) {
-            continue;
-        }
-        let base = name.rsplit('/').next().unwrap_or(name).to_string();
-        assert!(
-            seen.insert(base.clone()),
-            "two objects under {prefix} share the base name {base} — flattening would \
-             silently drop one, and the manifest oracle resolves parts by base name"
-        );
+    if !ls.status.success() && String::from_utf8_lossy(&ls.stderr).contains("does not exist") {
+        return 0;
+    }
+    assert!(
+        ls.status.success(),
+        "mc ls local/{bucket} failed: {}",
+        String::from_utf8_lossy(&ls.stderr)
+    );
+    let names: Vec<String> = String::from_utf8_lossy(&ls.stdout)
+        .lines()
+        .filter_map(|l| l.split_whitespace().last())
+        .filter(|n| n.starts_with(prefix))
+        .map(String::from)
+        .collect();
+    write_pulled(prefix, into, names, false, |name| {
         let cat_script = format!(
             "mc alias set local http://127.0.0.1:9000 {MINIO_ACCESS_KEY} {MINIO_SECRET_KEY} >/dev/null 2>&1 && \
              mc cat local/{bucket}/{name}"
@@ -282,10 +275,167 @@ pub fn minio_pull_prefix(bucket: &str, prefix: &str, into: &std::path::Path) -> 
             .output()
             .expect("mc cat");
         assert!(cat.status.success(), "mc cat {name} failed");
-        std::fs::write(into.join(&base), cat.stdout).expect("write pulled object");
-        pulled += 1;
+        cat.stdout
+    })
+}
+
+/// Write each object `name` (fetched by `get`) under `into` at its key relative to `prefix`, percent-decoded when `decode`.
+fn write_pulled(
+    prefix: &str,
+    into: &std::path::Path,
+    names: Vec<String>,
+    decode: bool,
+    get: impl Fn(&str) -> Vec<u8>,
+) -> usize {
+    std::fs::create_dir_all(into).expect("create pull dir");
+    let mut seen = std::collections::BTreeSet::new();
+    for name in &names {
+        let rel = name[prefix.len()..].trim_start_matches('/');
+        let rel = if rel.is_empty() {
+            name.rsplit('/').next().unwrap_or(name)
+        } else {
+            rel
+        };
+        let rel = if decode {
+            percent_encoding::percent_decode_str(rel)
+                .decode_utf8_lossy()
+                .to_string()
+        } else {
+            rel.to_string()
+        };
+        let rel = rel.as_str();
+        assert!(
+            seen.insert(rel.to_string()),
+            "two objects under {prefix} map to {rel}"
+        );
+        let path = into.join(rel);
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("create pull sub-dir");
+        std::fs::write(&path, get(name)).expect("write pulled object");
     }
-    pulled
+    names.len()
+}
+
+/// Pull every object under `prefix` in a GCS bucket through the JSON API at `base` (fake-gcs, or
+/// `https://storage.googleapis.com` with a bearer `token`), like [`minio_pull_prefix`]; a missing bucket pulls nothing.
+pub fn gcs_pull_prefix(
+    base: &str,
+    bucket: &str,
+    prefix: &str,
+    token: Option<&str>,
+    into: &std::path::Path,
+) -> usize {
+    let http = reqwest::blocking::Client::new();
+    let get = |url: &str, query: &[(&str, &str)]| {
+        let mut req = http.get(url).query(query);
+        if let Some(t) = token {
+            req = req.bearer_auth(t);
+        }
+        req.send().unwrap_or_else(|e| panic!("GCS GET {url}: {e}"))
+    };
+    let list_url = format!("{base}/storage/v1/b/{bucket}/o");
+    let (mut names, mut page) = (Vec::new(), String::new());
+    loop {
+        let resp = get(&list_url, &[("prefix", prefix), ("pageToken", &page)]);
+        if resp.status() == 404 {
+            return 0;
+        }
+        assert!(
+            resp.status().is_success(),
+            "GCS list {bucket}/{prefix}: {}",
+            resp.status()
+        );
+        let doc: serde_json::Value = resp.json().expect("GCS list JSON");
+        names.extend(
+            doc["items"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|i| i["name"].as_str().map(String::from)),
+        );
+        match doc["nextPageToken"].as_str() {
+            Some(t) => page = t.to_string(),
+            None => break,
+        }
+    }
+    // ponytail: fake-gcs stores the keys rivet writes through opendal with `=` as a literal `%3D` (real GCS
+    // stores `=`, measured 2026-10-01), so an emulator pull decodes the key; a real-GCS pull never does.
+    write_pulled(prefix, into, names, token.is_none(), |name| {
+        let url = format!("{list_url}/{}", urlencoding_path(name));
+        let resp = get(&url, &[("alt", "media")]);
+        assert!(
+            resp.status().is_success(),
+            "GCS GET {name}: {}",
+            resp.status()
+        );
+        resp.bytes().expect("GCS object body").to_vec()
+    })
+}
+
+/// An object name as one percent-encoded URL path segment.
+fn urlencoding_path(name: &str) -> String {
+    name.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+/// Pull every blob under `prefix` in an azurite container (anonymous `List Blobs` and GET: the
+/// container is public-read, see [`ensure_azure_container`]), like [`minio_pull_prefix`]; a
+/// missing container pulls nothing.
+pub fn azure_pull_prefix(
+    endpoint: &str,
+    container: &str,
+    prefix: &str,
+    into: &std::path::Path,
+) -> usize {
+    let http = reqwest::blocking::Client::new();
+    let (mut names, mut marker) = (Vec::new(), String::new());
+    loop {
+        let resp = http
+            .get(format!("{endpoint}/{container}"))
+            .query(&[
+                ("restype", "container"),
+                ("comp", "list"),
+                ("prefix", prefix),
+                ("marker", &marker),
+            ])
+            .send()
+            .expect("azure list request");
+        if resp.status() == 404 {
+            return 0;
+        }
+        assert!(
+            resp.status().is_success(),
+            "azure list {container}/{prefix}: {}",
+            resp.status()
+        );
+        let xml = resp.text().expect("azure list body");
+        names.extend(azure_blob_names_from_list_xml(&xml));
+        match xml
+            .split("<NextMarker>")
+            .nth(1)
+            .and_then(|s| s.split("</NextMarker>").next())
+        {
+            Some(m) if !m.is_empty() => marker = m.to_string(),
+            _ => break,
+        }
+    }
+    write_pulled(prefix, into, names, false, |name| {
+        let resp = http
+            .get(format!("{endpoint}/{container}/{name}"))
+            .send()
+            .expect("azure blob download");
+        assert!(
+            resp.status().is_success(),
+            "azure GET {name}: {}",
+            resp.status()
+        );
+        resp.bytes().expect("azure blob body").to_vec()
+    })
 }
 
 /// Blob names under `prefix` in an azurite container, via anonymous HTTP

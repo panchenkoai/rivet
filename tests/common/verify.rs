@@ -11,8 +11,9 @@
 //! image, is `RIVET-ORACLE-PARTIAL`, never a plain PASS. Opt out only with `.no_oracle("<reason>")` on
 //! a rig or the `RIVET_TEST_NO_ORACLE=<reason>` env on a raw run (both counted by a
 //! shrink-only ceiling, both logged `RIVET-ORACLE-OFF`); an export the oracle cannot reach
-//! logs `RIVET-ORACLE-SKIP`. Not graded, each under its own ceiling: a hand-built
-//! `Command::new(RIVET_BIN)` and a child from `Rig::spawn_args_env` (logged as a SKIP).
+//! logs `RIVET-ORACLE-SKIP`; an exception inside the oracle FAILs the test as an oracle
+//! error. A `Rig::spawn_args_env` child is graded when its caller reaps it with exit 0;
+//! a hand-built `Command::new(RIVET_BIN)` is not graded (under its own ceiling).
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -51,6 +52,8 @@ pub(crate) struct Case {
     before: Vec<Result<ManifestSnapshot, String>>,
     /// A `--resume` run completes a crashed run's plan, made before this invocation.
     resume: bool,
+    /// The chunk ranges a sealed plan replays (computed when it was planned), else `null`.
+    replay: serde_json::Value,
 }
 
 /// Start grading `argv` (run with working directory `cwd`): `None` unless it is `run|load|compact --config <path>` or `apply <config.yaml>` and not opted out.
@@ -70,25 +73,42 @@ pub(crate) fn begin(argv: &[String], envs: &[(&str, &str)], cwd: Option<&Path>) 
         }
         out
     };
-    let cfg_path = if verb == "apply" {
-        // `apply <config.yaml>` runs the config's exports wave by wave: graded as a `run`.
-        let plan = argv.get(1).filter(|p| !p.starts_with('-'))?;
-        if !(plan.ends_with(".yaml") || plan.ends_with(".yml")) {
-            log(
-                "SKIP",
-                "*",
-                "apply of a sealed plan artifact: not graded yet",
-            );
-            return None;
-        }
-        verb = "run".into();
-        PathBuf::from(plan)
-    } else {
-        PathBuf::from(flag("--config", "-c").pop()?)
-    };
     let cwd = cwd
         .map(Path::to_path_buf)
         .unwrap_or_else(|| std::env::current_dir().expect("cwd"));
+    // A sealed plan artifact names its export and the config it was planned from; its resolved destination and query win.
+    let mut sealed: Option<(String, Value, String)> = None;
+    let mut replay = serde_json::Value::Null;
+    let cfg_path = if verb == "apply" {
+        // `apply <config.yaml>` runs the config's exports wave by wave: graded as a `run`.
+        let plan = argv.get(1).filter(|p| !p.starts_with('-'))?;
+        verb = "run".into();
+        if plan.ends_with(".yaml") || plan.ends_with(".yml") {
+            PathBuf::from(plan)
+        } else {
+            let doc: serde_json::Value = std::fs::read_to_string(cwd.join(plan))
+                .ok()
+                .and_then(|t| serde_json::from_str(&t).ok())?;
+            let (Some(cfg), Some(name)) =
+                (doc["config_path"].as_str(), doc["export_name"].as_str())
+            else {
+                log(
+                    "SKIP",
+                    "*",
+                    "apply of a plan artifact that names no config_path or export_name",
+                );
+                return None;
+            };
+            let plan = &doc["resolved_plan"];
+            let dest = serde_yaml_ng::to_value(&plan["destination"]).ok()?;
+            let query = plan["base_query"].as_str().unwrap_or_default().to_string();
+            replay = doc["computed"]["chunk_ranges"].clone();
+            sealed = Some((name.to_string(), dest, query));
+            PathBuf::from(cfg)
+        }
+    } else {
+        PathBuf::from(flag("--config", "-c").pop()?)
+    };
     let cfg_path = cwd.join(cfg_path);
     if let Some(why) = env_of(envs, NO_ORACLE_ENV) {
         assert!(!why.trim().is_empty(), "{NO_ORACLE_ENV} needs a reason");
@@ -119,14 +139,36 @@ pub(crate) fn begin(argv: &[String], envs: &[(&str, &str)], cwd: Option<&Path>) 
         );
         return None;
     };
-    let only = flag("--export", "-e");
+    let only = match &sealed {
+        Some((name, ..)) => vec![name.clone()],
+        None => flag("--export", "-e"),
+    };
+    let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let exports: Vec<Value> = cfg
         .get("exports")
         .and_then(Value::as_sequence)
         .into_iter()
         .flatten()
         .filter(|e| only.is_empty() || only.iter().any(|n| Some(n.as_str()) == s(e, "name")))
-        .cloned()
+        .flat_map(|e| {
+            let mut e = e.clone();
+            if let Some((_, dest, query)) = &sealed {
+                e["destination"] = dest.clone();
+                if let Some(m) = e
+                    .as_mapping_mut()
+                    .filter(|m| m.contains_key("query") || m.contains_key("query_file"))
+                {
+                    m.remove("query_file");
+                    m.insert("query".into(), query.as_str().into());
+                }
+            }
+            resolve_placeholders(&mut e, &date);
+            if verb == "run" {
+                per_table(&e)
+            } else {
+                vec![e]
+            }
+        })
         .collect();
     let mut case = Case {
         verb,
@@ -137,6 +179,7 @@ pub(crate) fn begin(argv: &[String], envs: &[(&str, &str)], cwd: Option<&Path>) 
         exports,
         before: Vec::new(),
         resume: argv.iter().any(|a| a == "--resume"),
+        replay,
     };
     if case.verb == "run" {
         case.before = case
@@ -144,11 +187,7 @@ pub(crate) fn begin(argv: &[String], envs: &[(&str, &str)], cwd: Option<&Path>) 
             .iter()
             .map(|e| {
                 case.unreachable(e)?;
-                // A bucket the test has not created yet holds no manifest.
-                let out =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| case.local_out(e)))
-                        .map_err(|_| String::new());
-                Ok(out.map(|o| manifests_of(&o)).unwrap_or_default())
+                Ok(case.manifests_of(e, &case.local_out(e)?))
             })
             .collect();
         // Every row changed before a CDC run opens its stream must be in it: image the source first.
@@ -223,9 +262,9 @@ impl Case {
         opts: &Opts,
     ) -> Result<(serde_json::Value, &'static str), String> {
         let [seen, seen_snap] = before.clone()?;
-        let out = &self.local_out(e);
+        let out = &self.local_out(e)?;
         let snap = &out.join("snapshot");
-        let (now, now_snap) = (success_manifests(out), success_manifests(snap));
+        let [now, now_snap] = self.manifests_of(e, out);
         // No new manifest: a snapshot run must have had an empty source (the oracle asks it); CDC and delta are still graded cumulatively.
         let nothing_new = now.is_subset(&seen) && now_snap.is_subset(&seen_snap);
         // CDC and delta modes grade the cumulative output; a snapshot run grades only what it declared.
@@ -260,7 +299,13 @@ impl Case {
                 "new_snapshot_manifests": fresh(&now_snap, &seen_snap),
                 "snapshot": self.declares_snapshot(e),
                 "resume": self.resume,
+                "replay": self.replay.as_array().is_some_and(|r| !r.is_empty()),
+                "ranges": self.replay,
+                "range_column": e.get("chunk_by_days").is_none().then(|| s(e, "chunk_column")).flatten(),
                 "settle": e.get("settle").is_some(),
+                "format": s(e, "format").unwrap_or("parquet"),
+                "stream": self.stream(e)?,
+                "partition_by": s(e, "partition_by"),
                 "base": with_ext(&self.image(e, "prev"), "parquet"),
                 "upper": with_ext(&self.image(e, "begin"), "parquet"),
                 "cursor_record": with_ext(&self.image(e, "cursor"), "json"),
@@ -382,43 +427,22 @@ impl Case {
     /// Why this export's output cannot be graded, or `Ok` when it can.
     fn unreachable(&self, e: &Value) -> Result<(), String> {
         let format = s(e, "format").unwrap_or("parquet");
-        if format != "parquet" {
-            return Err(format!("format `{format}`: the oracle grades parquet"));
+        if !matches!(format, "parquet" | "csv") {
+            return Err(format!(
+                "format `{format}`: the oracle grades parquet and csv"
+            ));
         }
         let dest = e.get("destination").ok_or("no destination")?;
         match s(dest, "type") {
-            Some("local") if s(dest, "path").is_some_and(|p| p.contains('{')) => {
-                return Err("a placeholder destination path: not resolved yet".into());
-            }
-            Some("local") => {}
+            Some("local") | Some("gcs") | Some("azure") => {}
             Some("stdout") => return Err("stdout destination: nothing durable to read".into()),
-            Some("s3") if s(e, "mode") == Some("cdc") => {
-                return Err(
-                    "CDC on MinIO: the pull flattens the prefix, and a CDC destination nests \
-                            sub-prefixes whose `_SUCCESS`/manifest names collide"
-                        .into(),
-                );
-            }
             Some("s3") if s(dest, "endpoint").is_some_and(|u| u.contains(":9000")) => {}
-            Some("gcs") if s(dest, "endpoint").is_none() => {
-                return Err(
-                    "real GCS destination: not pulled by the default oracle (needs \
-                            RIVET_TEST_GCS_BUCKET and ambient gcloud credentials)"
-                        .into(),
-                );
-            }
             other => {
                 return Err(format!(
                     "{} destination: no whole-prefix pull exists yet",
                     other.unwrap_or("?")
                 ));
             }
-        }
-        if e.get("tables").is_some() {
-            return Err("multi-table capture: one sub-prefix per table, not graded yet".into());
-        }
-        if e.get("partition_by").is_some() {
-            return Err("partition_by: hive sub-prefixes, not graded yet".into());
         }
         if s(e, "mode") == Some("time_window") {
             return Err(
@@ -427,6 +451,18 @@ impl Case {
             );
         }
         Ok(())
+    }
+
+    /// For one table of a multi-table capture: its table and every table's local destination (the run's ledger counts the whole stream).
+    fn stream(&self, e: &Value) -> Result<serde_json::Value, String> {
+        let Some(whole) = e.get("__stream") else {
+            return Ok(serde_json::Value::Null);
+        };
+        let dirs = per_table(whole)
+            .iter()
+            .map(|t| self.local_out(t))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(serde_json::json!({"table": s(e, "table"), "dirs": dirs}))
     }
 
     /// Whether a batch export is some CDC export's `backfill:` baseline (named, or paired by table), which `rivet load` never loads.
@@ -527,31 +563,197 @@ impl Case {
             return;
         };
         spec["image"] = with_ext(base, "parquet").display().to_string().into();
-        let got = run_rig_oracle(&spec, "image");
-        if got["image"].is_null() {
-            log(
-                "SKIP",
-                s(e, "name").unwrap_or("?"),
-                &format!("no source image before this CDC run: {}", got["why"]),
-            );
-        }
+        run_rig_oracle(&spec, "image");
     }
 
-    /// The destination as a local directory: the configured path, or a MinIO prefix pulled whole.
-    fn local_out(&self, e: &Value) -> PathBuf {
-        let dest = e.get("destination").expect("a destination");
-        if s(dest, "type") == Some("s3") {
-            let into = self.config_dir.join(super::unique_name("oracle_pull"));
-            super::storage::minio_pull_prefix(
-                s(dest, "bucket").expect("an s3 bucket"),
-                s(dest, "prefix").unwrap_or(""),
-                &into,
-            );
-            return into;
+    /// The destination as a local directory: the configured path, or a cloud prefix pulled whole (sub-prefixes kept) through the store's own API; a `{partition}` template is cut at its partition component.
+    fn local_out(&self, e: &Value) -> Result<PathBuf, String> {
+        let dest = e.get("destination").ok_or("no destination")?;
+        let field = if s(dest, "type") == Some("local") {
+            "path"
+        } else {
+            "prefix"
+        };
+        let (root, _) = split_partition(s(dest, field).unwrap_or(""), e)?;
+        if s(dest, "type") == Some("local") {
+            return Ok(self.cwd.join(root));
         }
-        self.cwd
-            .join(s(dest, "path").expect("a local destination path"))
+        use std::hash::{Hash as _, Hasher as _};
+        let mut h = std::hash::DefaultHasher::new();
+        (yaml_text(Some(dest)), &root).hash(&mut h);
+        let into = self
+            .config_dir
+            .join(format!(".oracle_pull/{:016x}", h.finish()));
+        let _ = std::fs::remove_dir_all(&into);
+        let bucket = s(dest, "bucket").ok_or("a cloud destination with no bucket")?;
+        match s(dest, "type") {
+            Some("s3") => {
+                super::storage::minio_pull_prefix(bucket, &root, &into);
+            }
+            Some("gcs") => match s(dest, "endpoint") {
+                Some(ep) => {
+                    super::storage::gcs_pull_prefix(
+                        &ep.replace(":14443", ":4443"),
+                        bucket,
+                        &root,
+                        None,
+                        &into,
+                    );
+                }
+                None => {
+                    let vars = "real GCS destination: set RIVET_TEST_GCS_BUCKET and host ADC \
+                                (`gcloud auth application-default login`)";
+                    std::env::var("RIVET_TEST_GCS_BUCKET").map_err(|_| vars.to_string())?;
+                    let token = std::process::Command::new("gcloud")
+                        .args(["auth", "application-default", "print-access-token"])
+                        .output()
+                        .ok()
+                        .filter(|o| o.status.success())
+                        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                        .ok_or(vars)?;
+                    super::storage::gcs_pull_prefix(
+                        "https://storage.googleapis.com",
+                        bucket,
+                        &root,
+                        Some(&token),
+                        &into,
+                    );
+                }
+            },
+            Some("azure") => {
+                let ep = s(dest, "endpoint").unwrap_or(super::env::AZURITE_ENDPOINT);
+                super::storage::azure_pull_prefix(ep.trim_end_matches('/'), bucket, &root, &into);
+            }
+            other => {
+                return Err(format!(
+                    "{} destination: no whole-prefix pull exists yet",
+                    other.unwrap_or("?")
+                ));
+            }
+        }
+        Ok(into)
     }
+
+    /// Success manifest names (relative to `out`) of the export's destination and its `snapshot/` leg; a `{partition}` template lists every `<col>=…` directory.
+    fn manifests_of(&self, e: &Value, out: &Path) -> ManifestSnapshot {
+        let dest = e.get("destination");
+        let field = if dest.and_then(|d| s(d, "type")) == Some("local") {
+            "path"
+        } else {
+            "prefix"
+        };
+        let template = dest.and_then(|d| s(d, field)).unwrap_or("");
+        let Ok((_, Some(rest))) = split_partition(template, e) else {
+            return [
+                success_manifests(out),
+                success_manifests(&out.join("snapshot")),
+            ];
+        };
+        let col = format!("{}=", s(e, "partition_by").unwrap_or_default());
+        let mut names = BTreeSet::new();
+        for d in std::fs::read_dir(out).into_iter().flatten().flatten() {
+            let part = d.file_name().to_string_lossy().to_string();
+            if part.starts_with(&col) && d.path().is_dir() {
+                let rel = Path::new(&part).join(rest.trim_matches('/'));
+                names.extend(
+                    success_manifests(&out.join(&rel))
+                        .into_iter()
+                        .map(|n| rel.join(n).display().to_string()),
+                );
+            }
+        }
+        [names, BTreeSet::new()]
+    }
+}
+
+/// `template` cut at a whole `{partition}` component: (the part before it, the part after it when present).
+fn split_partition(template: &str, e: &Value) -> Result<(String, Option<String>), String> {
+    let Some(i) = template.find("{partition}") else {
+        return Ok((template.to_string(), None));
+    };
+    let (head, tail) = (&template[..i], &template[i + "{partition}".len()..]);
+    if !(head.is_empty() || head.ends_with('/'))
+        || !(tail.is_empty() || tail.starts_with('/'))
+        || e.get("partition_by").is_none()
+    {
+        return Err(
+            "a `{partition}` token that is not a whole path component of a partition_by export"
+                .into(),
+        );
+    }
+    Ok((head.to_string(), Some(tail.to_string())))
+}
+
+/// Resolve the destination's `{date}`, `{export}` and `{table}` the way rivet documents them (the run's UTC date, the export name); `{run_id}` and `{partition}` stay.
+fn resolve_placeholders(e: &mut Value, date: &str) {
+    let name = s(e, "name").unwrap_or_default().to_string();
+    let Some(dest) = e.get_mut("destination").and_then(Value::as_mapping_mut) else {
+        return;
+    };
+    for k in ["path", "prefix"] {
+        if let Some(Value::String(v)) = dest.get_mut(k) {
+            *v = v
+                .replace("{date}", date)
+                .replace("{export}", &name)
+                .replace("{table}", &name);
+        }
+    }
+}
+
+/// A multi-table CDC capture as one export per table, each at its own `<destination>/<table>` sub-prefix and named `<export>/<table>`; any other export unchanged.
+fn per_table(e: &Value) -> Vec<Value> {
+    let tables: Vec<String> = match (s(e, "mode"), e.get("tables").and_then(Value::as_sequence)) {
+        (Some("cdc"), Some(t)) => t
+            .iter()
+            .filter_map(|t| t.as_str().map(String::from))
+            .collect(),
+        _ => return vec![e.clone()],
+    };
+    tables
+        .iter()
+        .map(|t| {
+            let mut one = e.clone();
+            let m = one.as_mapping_mut().expect("an export is a mapping");
+            m.remove("tables");
+            m.insert("table".into(), t.as_str().into());
+            m.insert("__stream".into(), e.clone());
+            // A `<table>.<column>` override names one table's column; other tables' entries are not this table's.
+            if let Some(cols) = m.get_mut("columns").and_then(Value::as_mapping_mut) {
+                *cols = cols
+                    .iter()
+                    .filter_map(|(k, v)| {
+                        let k = k.as_str()?;
+                        match k.rsplit_once('.') {
+                            Some((tbl, col)) if tbl == t => Some((col.into(), v.clone())),
+                            Some(_) => None,
+                            None => Some((k.into(), v.clone())),
+                        }
+                    })
+                    .collect();
+            }
+            m.insert(
+                "name".into(),
+                format!("{}/{t}", s(e, "name").unwrap_or("?")).into(),
+            );
+            if let Some(d) = one.get_mut("destination").and_then(Value::as_mapping_mut) {
+                let local = d.get("type").and_then(Value::as_str) == Some("local");
+                let k = if local { "path" } else { "prefix" };
+                let base = d
+                    .get(k)
+                    .and_then(Value::as_str)
+                    .unwrap_or(if local { "." } else { "" })
+                    .trim_end_matches('/')
+                    .to_string();
+                let v = match (local, base.is_empty()) {
+                    (true, _) => format!("{base}/{t}"),
+                    (false, true) => format!("{t}/"),
+                    (false, false) => format!("{base}/{t}/"),
+                };
+                d.insert(k.into(), v.into());
+            }
+            one
+        })
+        .collect()
 }
 
 /// `base` with `.ext` appended.
@@ -595,14 +797,6 @@ fn env_of(envs: &[(&str, &str)], k: &str) -> Option<String> {
         .find(|(n, _)| *n == k)
         .map(|(_, v)| v.to_string())
         .or_else(|| std::env::var(k).ok())
-}
-
-/// Both manifest legs of `out`.
-fn manifests_of(out: &Path) -> ManifestSnapshot {
-    [
-        success_manifests(out),
-        success_manifests(&out.join("snapshot")),
-    ]
 }
 
 /// Run one oracle verb over `spec`; log PASS / SKIP / XFAIL, or panic with every disagreement. Returns whether it XFAILed.
@@ -681,11 +875,20 @@ fn run_rig_oracle(spec: &serde_json::Value, verb: &str) -> serde_json::Value {
         .write_all(spec.to_string().as_bytes())
         .expect("write the oracle spec");
     let out = child.wait_with_output().expect("wait for the rig oracle");
-    assert!(
-        out.status.success(),
-        "the rig oracle itself failed (a harness error, never a verdict):\n{}\nspec: {spec}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        log(
+            "FAIL",
+            spec["export"].as_str().unwrap_or("*"),
+            &format!(
+                "oracle error ({verb}): {}",
+                err.lines().last().unwrap_or("")
+            ),
+        );
+        panic!(
+            "oracle error: dev/release_oracle/rig_oracle.py {verb} raised (an oracle bug, never a verdict):\n{err}\nspec: {spec}"
+        );
+    }
     serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
         panic!(
             "rig oracle printed no JSON verdict ({e}):\n{}",
@@ -762,5 +965,38 @@ fn the_oracle_resolves_config_vars_as_rivet_does_params_first() {
             &envs
         ),
         "q: from_param url: url_env keep: ${RIVET_ORACLE_UNSET_VAR}",
+    );
+}
+
+#[test]
+fn the_oracle_resolves_destination_placeholders_and_splits_a_capture_per_table() {
+    let mut e: Value = serde_yaml_ng::from_str(
+        "name: orders\nmode: cdc\ntables: [public.a, b]\ncolumns: {public.a.v: int8, b.w: text, x: text}\n\
+         destination: {type: gcs, bucket: k, prefix: 'runs/{date}/{export}/{table}/{run_id}'}",
+    )
+    .unwrap();
+    resolve_placeholders(&mut e, "2026-10-01");
+    assert_eq!(
+        s(&e["destination"], "prefix"),
+        Some("runs/2026-10-01/orders/orders/{run_id}")
+    );
+    let [a, b]: [Value; 2] = per_table(&e).try_into().unwrap();
+    assert_eq!(
+        (s(&a, "name"), s(&a, "table")),
+        (Some("orders/public.a"), Some("public.a"))
+    );
+    assert_eq!(
+        s(&b["destination"], "prefix"),
+        Some("runs/2026-10-01/orders/orders/{run_id}/b/")
+    );
+    assert_eq!(yaml_text(a.get("columns")), "v: int8\nx: text\n");
+    let p: Value = serde_yaml_ng::from_str("partition_by: d").unwrap();
+    assert_eq!(
+        split_partition("o/{partition}/e/", &p),
+        Ok(("o/".into(), Some("/e/".into())))
+    );
+    assert!(
+        split_partition("o/x{partition}", &p).is_err(),
+        "a token inside a component is not a hive directory"
     );
 }

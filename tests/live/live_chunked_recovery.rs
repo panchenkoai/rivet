@@ -1876,7 +1876,11 @@ fn success_marker_after_a_failed_rerun(s3: bool) -> [(bool, String); 2] {
     let observe = |rig: &Rig| {
         let pulled = tempfile::tempdir().unwrap();
         let dir = if s3 {
-            minio_pull_prefix(bucket, &prefix, pulled.path());
+            minio_pull_prefix(
+                bucket,
+                &format!("{prefix}/{}/", rig.export_name()),
+                pulled.path(),
+            );
             pulled.path().to_path_buf()
         } else {
             rig.out_dir()
