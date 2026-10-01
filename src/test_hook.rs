@@ -199,3 +199,31 @@ pub(crate) fn maybe_block_at(point: &str) {
         std::thread::sleep(std::time::Duration::from_millis(ms));
     }
 }
+
+/// Announce a skipped unit test through the suite's one countable `RIVET-SKIP` marker (stderr + `RIVET_SKIP_LOG`).
+#[cfg(test)]
+pub(crate) fn skip_live(why: &str) {
+    let who = std::thread::current()
+        .name()
+        .unwrap_or("<unnamed test>")
+        .to_string();
+    let line = format!("RIVET-SKIP {who} — {why}");
+    eprintln!("{line}");
+    let path = std::env::var("RIVET_SKIP_LOG").unwrap_or_else(|_| {
+        format!(
+            "{}/rivet-skips.log",
+            std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".into())
+        )
+    });
+    if let Some(dir) = std::path::Path::new(&path).parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    use std::io::Write as _;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = f.write_all(format!("{line}\n").as_bytes());
+    }
+}

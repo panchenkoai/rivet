@@ -948,8 +948,7 @@ fn bigquery_live_load_round_trips() {
     // `--ignored` (ci.yml) without warehouse creds, so a hard `.expect` here
     // would fail the run. With the project set (a live/nightly box) it runs.
     let Ok(project) = std::env::var("BIGQUERY_TEST_PROJECT") else {
-        eprintln!("skipping bigquery_live_load_round_trips: BIGQUERY_TEST_PROJECT unset");
-        return;
+        return crate::test_hook::skip_live("BIGQUERY_TEST_PROJECT unset");
     };
     let dataset =
         std::env::var("RIVET_BQ_TEST_DATASET").unwrap_or_else(|_| "rivet_test".to_string());
@@ -996,8 +995,7 @@ fn bigquery_live_load_round_trips() {
 fn bigquery_rest_transport_live_round_trips_a_query_job() {
     // Soft-skip when unconfigured — see bigquery_live_load_round_trips.
     let Ok(project) = std::env::var("BIGQUERY_TEST_PROJECT") else {
-        eprintln!("skipping bigquery_rest_transport_live: BIGQUERY_TEST_PROJECT unset");
-        return;
+        return crate::test_hook::skip_live("BIGQUERY_TEST_PROJECT unset");
     };
     let dataset = std::env::var("RIVET_BQ_TEST_DATASET")
         .or_else(|_| std::env::var("BIGQUERY_TEST_DATASET"))
@@ -1109,10 +1107,7 @@ fn bigquery_rest_transport_live_round_trips_a_query_job() {
 fn bigquery_live_cdc_view_dedups_at_least_once() {
     // Soft-skip when unconfigured — see bigquery_live_load_round_trips.
     let Ok(project) = std::env::var("BIGQUERY_TEST_PROJECT") else {
-        eprintln!(
-            "skipping bigquery_live_cdc_view_dedups_at_least_once: BIGQUERY_TEST_PROJECT unset"
-        );
-        return;
+        return crate::test_hook::skip_live("BIGQUERY_TEST_PROJECT unset");
     };
     let dataset =
         std::env::var("RIVET_BQ_TEST_DATASET").unwrap_or_else(|_| "rivet_test".to_string());
@@ -1192,8 +1187,7 @@ fn bigquery_live_cdc_view_dedups_at_least_once() {
 #[ignore = "live: requires BIGQUERY_TEST_PROJECT"]
 fn bigquery_live_adopts_a_full_load_table_as_the_changelog_baseline() {
     let Ok(project) = std::env::var("BIGQUERY_TEST_PROJECT") else {
-        eprintln!("skipping: BIGQUERY_TEST_PROJECT unset");
-        return;
+        return crate::test_hook::skip_live("BIGQUERY_TEST_PROJECT unset");
     };
     let dataset =
         std::env::var("RIVET_BQ_TEST_DATASET").unwrap_or_else(|_| "rivet_test".to_string());

@@ -999,8 +999,7 @@ mod tests {
         std::fs::set_permissions(&manifest_path, std::fs::Permissions::from_mode(0o000)).unwrap();
         if std::fs::read(&manifest_path).is_ok() {
             // euid 0 ignores file modes — the degraded state can't be staged.
-            eprintln!("skipping unreadable_manifest_fails_the_command: running as root");
-            return;
+            return crate::test_hook::skip_live("running as root: file modes are ignored");
         }
 
         let report = dir.path().join("report.json");

@@ -267,7 +267,8 @@ scenarios:
 
   - id: value_checksum_form_b
     what: "Form B — the sink's per-column value checksums are harvested into summary.column_checksums so finalize_manifest RECORDS them and `rivet validate` can re-read the parts and verify the Arrow→Parquet encode. The sink COMPUTES them for every runner (track_checksum in on_batch); since ADR-0028 every runner FEEDS them into summary.ledger and the HARVEST happens once at the finalize_export seam — no runner calls harvest itself (round-9 had fixed the computed-then-discarded bug per runner; the seam removes the per-runner call entirely). ADR-0029 then made the feed KEYED and the coverage COMPUTED: a runner contributes under a UnitId (its commit unit — Run for single, Chunk for chunked/checkpoint/mongo_parallel, Page for keyset-sequential, Range for keyset-PARALLEL, whose parts publish per page but whose checksums publish per committed range), commit::record_part registers the same UnitId for every manifest part, and the seam compares the two sets — full cover records, any uncovered or hydrated part suppresses. So the cells below grade MORE than before: each asserts its runner RECORDS column_checksums in the destination manifest, and a runner that paired its part and its checksum under different UnitIds now suppresses and turns its cell RED. The structural backstop grew the matching half — check_post_run_invariants rejects a state_backed success carrying column_checksums_short_cover (a part this run recorded whose unit contributed nothing, which on a SUCCESS can only be a mis-pairing), so the fail-safe-but-silent direction is loud on every runner under debug_assertions, the build live tests use."
-    single:         { test: pg_type_matrix_value_checksum_guard }
+    # pg_type_matrix_value_checksum_guard (the Form A guard) never reads column_checksums; this one asserts the manifest RECORDS them.
+    single:         { test: array_columns_reach_the_value_checksum }
     chunked:        { test: chunked_export_records_form_b_checksums_and_validate_passes }
     # The load-bearing half is that test's BASELINE arm: a clean parallel-checkpoint
     # run (parallel: 4, chunk_checkpoint: true) must record Form B in the destination
@@ -297,8 +298,9 @@ scenarios:
     # reads files_committed from the run's own metrics row and goes RED with the
     # record_part increment stubbed (left: Some(0), right: Some(2)).
     single:         { test: single_commit_error_still_counts_the_durable_parts_postgres }
-    chunked:        { na: "records INSIDE the per-chunk loop — write_sink_parts then record_part per chunk (run_chunked_sequential, chunked/exec.rs), so an error on chunk N leaves files_committed = the parts of chunks 0..N-1 by construction. The PARALLEL twin drains worker parts through record_part post-join BEFORE its `let errs = …; bail!` (exec.rs), which is the ordering keyset_parallel got wrong — so it too reports the durable count on abort by construction." }
-    chunked_checkpoint: { na: "same ordering, verified per runner: sequential_checkpoint.rs records inside the per-chunk loop; parallel_checkpoint.rs drains every worker part through record_part and only THEN evaluates the worker-error bail and the not-completed-task bail (parallel_checkpoint.rs, `let errs = poison::into_recover(errors)` after the drain loop). Nothing aborts above a pending drain." }
+    chunked:        { test: a_part_write_failing_mid_chunk_counts_the_earlier_parts_plain_sequential }
+    chunked_checkpoint: { test: a_part_write_failing_mid_chunk_counts_the_earlier_parts_sequential_checkpoint }
+    # The sequential keyset runner (run_keyset) is proven by a_part_write_failing_mid_page_counts_the_earlier_parts_sequential_keyset.
     keyset:         { test: parallel_keyset_worker_error_still_counts_the_durable_parts_postgres }
     mongo_parallel: { test: mongo_parallel_worker_error_still_counts_the_durable_parts }
     cdc:            { na: "no retry loop consumes it — run_cdc_export is never wrapped by decide_export_retry; the durable count still reaches the metrics row from the returned manifests (run_cdc_export), and the producer is pinned by a_failed_drain_still_reports_the_parts_it_made_durable (sink.rs)" }
@@ -506,7 +508,7 @@ scenarios:
   - id: cdc_backfill_leg
     what: "the CDC baseline leg under `cdc.backfill:` BORROWS its recipe's read (mode, key, workers, page size, resume, tuning, column types narrowed by the table label) and keeps its own identity and prefix — built once in `apply_backfill_recipe` and dispatched through the ordinary `run_export_job`, so WHICH runner runs is the recipe's mode, and no runner re-applies anything the leg could bypass. The cells name the recipe mode each is proven with."
     single:         { test: full_cdc_cycle_mysql }
-    chunked:        { test: a_crashed_chunked_baseline_finishes_on_the_next_plain_run }
+    chunked:        { test: a_plain_chunked_baseline_reads_each_id_once_in_its_recipe_chunks }
     chunked_checkpoint: { test: a_crashed_chunked_baseline_finishes_on_the_next_plain_run }
     keyset:         { test: a_crashed_keyset_baseline_finishes_on_the_next_plain_run }
     mongo_parallel: { na: "the leg is the recipe dispatched as a batch export (shared seam); a Mongo recipe is proven live with a full-scan recipe (full_cdc_cycle_mongo), a parallel-Mongo recipe borrows the same fields (backfill_leg_borrows_the_recipe_read_and_keeps_its_own_identity)" }

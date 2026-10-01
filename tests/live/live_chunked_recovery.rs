@@ -1718,12 +1718,17 @@ fn seed_rolling_table() -> PgTable {
 
 /// Fail a chunked run by `err_at`, grade `files_committed` against the parts on disk, re-run plainly.
 fn a_failed_chunks_durable_parts_are_counted(runner: &[&str], err_at: &str) {
+    a_failed_runs_durable_parts_are_counted("chunk_column: id", runner, err_at);
+}
+
+/// [`a_failed_chunks_durable_parts_are_counted`] for any chunked strategy line (`key`).
+fn a_failed_runs_durable_parts_are_counted(key: &str, runner: &[&str], err_at: &str) {
     require_alive(LiveService::Postgres);
     require_alive(LiveService::DuckDb);
     let table = seed_rolling_table();
     let mut rig = Rig::pg_batch(table.name())
         .mode("chunked")
-        .export_line("chunk_column: id")
+        .export_line(key)
         .export_line("chunk_size: 250")
         .export_line("compression: none")
         .export_line("max_file_size: 64KB")
@@ -1836,6 +1841,12 @@ fn a_part_write_failing_mid_chunk_counts_the_earlier_parts_plain_parallel() {
 #[ignore = "live: requires docker compose postgres"]
 fn a_part_write_failing_mid_chunk_counts_the_earlier_parts_plain_sequential() {
     a_failed_chunks_durable_parts_are_counted(&[], "sink_part_write:1");
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_part_write_failing_mid_page_counts_the_earlier_parts_sequential_keyset() {
+    a_failed_runs_durable_parts_are_counted("chunk_by_key: id", &[], "sink_part_write:1");
 }
 
 // ─── A failed run over a completed prefix retires its _SUCCESS ───────────────────
