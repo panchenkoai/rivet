@@ -44,6 +44,14 @@ slow-timeout = { period = "300s", terminate-after = 4 }
 # multi-table cycles and the pooled loads grade every loaded export (13-17 s per BigQuery
 # read under the full suite, 2026-10-01): nine and sixteen reads pass 240 s.
 
+# The SQL Server CDC cells queue on one cross-process lock (`cross_process_serial("mssql_cdc")`),
+# so a cell's clock includes its wait. The rig oracle images the source before every CDC run
+# (about a second each), and the queue reached 224-237 s for cells that passed and 240 s for two
+# that were killed while still waiting (2026-10-01 full suites).
+[[profile.default.overrides]]
+filter = 'test(/^live_cdc_mssql::/) or test(/^live_cdc_harm::a_mssql/)'
+slow-timeout = { period = "120s", terminate-after = 4 }
+
 # Oracle Free caps the server at two CPUs, so the Oracle cells share it four at a time;
 # the whole-schema export reads ~2M rows and gets the long ceiling. Its oracle read of
 # CONTENT_ITEMS (150k rows through python-oracledb) took 130 s and 437 s in two full

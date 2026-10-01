@@ -1288,13 +1288,14 @@ def grade_load(spec: dict) -> dict:
                          collapse=collapse, null_class=null_class)
     for col, r in ch_of.items():
         want, got = r.get("clickhouse"), wh_types.get(col)
-        # A known_defect delivery drives the ClickHouse type too: the marker excuses it.
-        excused = r.get("clickhouse_defect") or r.get("known_defect") or row_of.get(col, {}).get("known_defect")
-        if target != "clickhouse" or not want or excused or got is None:
+        if target != "clickhouse" or not want or got is None:
             continue
+        # A marked row (known_defect, or a ClickHouse defect) excuses only the type it declares today.
+        marked = r.get("clickhouse_defect") or r.get("known_defect") or row_of.get(col, {}).get("known_defect")
+        allowed = {want, r.get("today_clickhouse")} if marked else {want}
         # A key column cannot be Nullable in ClickHouse.
-        if got != want and not (col in key and want == f"Nullable({got})"):
-            bad.append(f"TYPE: `{col}` ({native[col]}): the ledger loads ClickHouse {want}, the table has {got}")
+        if not any(got == w or (col in key and w == f"Nullable({got})") for w in allowed if w):
+            bad.append(f"TYPE: `{col}` ({native[col]}): the ledger loads ClickHouse {sorted(w for w in allowed if w)}, the table has {got}")
     bad += [f"WAREHOUSE: {n}" for n in notes if "still exist" in n]
     out = {"failures": [f"WAREHOUSE {target} `{fq}`: {b}" for b in bad], "notes": notes,
            "facts": {k: v for k, v in f.items() if k not in ("pairs", "dst_cols", "src_stats", "dst_stats")}}
