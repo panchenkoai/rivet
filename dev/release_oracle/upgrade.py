@@ -25,6 +25,12 @@ Per SQL engine, on the downloaded previous binary and this one:
              needs (RED: dropping it fails the load). The loaded-run skip set is NOT graded:
              init's `cleanup_source: true` deletes the first parts, so erasing it changes
              nothing here (measured).
+  cdc-load   MySQL CDC into BigQuery: the previous `init --mode cdc` config on three tables,
+             run → load → compact three cycles by the previous release and two by this
+             binary, with inserts, updates, a partition-moving update and a delete between
+             cycles. After every compact, through one DuckDB session (MySQL + BigQuery
+             attached): each base's live rows equal the source `id:v:epoch`, every deleted
+             id is flagged `__is_deleted`, no key twice, no `__changes` left.
   cdc        per CDC engine: the previous release anchors a stream and captures a batch;
              this binary continues its checkpoint and captures exactly the next batch —
              nothing skipped, nothing of the first batch re-read.
@@ -350,38 +356,23 @@ def _load_leg(led: Ledger, prev: Path, root: Path, url: str) -> None:
 
 CDC_TABLES = 3
 CDC_SEED = 5
+CDC_LOAD = "upgrade[mysql/cdc-load]"
 
 
-def _cdc_fp_mysql(url: str, table: str) -> tuple[str, set[int]]:
-    """The source's rows as one `id:v:epoch` string, and its id set."""
-    from .cdc import _mysql
-
-    p = _mysql(url, "SET SESSION group_concat_max_len = 1000000; SELECT IFNULL(GROUP_CONCAT("
-                    f"CONCAT(id, ':', v, ':', UNIX_TIMESTAMP(created_at)) ORDER BY id SEPARATOR ','), '') "
-                    f"AS fp FROM {table};")
-    if not p.ok:
-        raise RuntimeError(f"source read of {table} failed: {(p.stderr or '').strip()[-200:]}")
-    lines = [ln.strip() for ln in (p.stdout or "").splitlines() if ln.strip()]
-    fp = lines[1] if len(lines) >= 2 else ""  # line 0 is the `fp` header
-    return fp, {int(x.split(":")[0]) for x in fp.split(",") if ":" in x}
-
-
-def _cdc_fp_bq(proj: str, fq: str) -> tuple[str, str, int, bool]:
-    """(live fingerprint, flagged ids, rows minus distinct ids, buffer left) for one base table."""
-    from . import gcp
-
-    live = gcp.bq_scalar(proj, "SELECT IFNULL(STRING_AGG(FORMAT('%d:%d:%d', id, v, UNIX_SECONDS("
-                               f"created_at)), ',' ORDER BY id), '') FROM `{fq}` WHERE NOT __is_deleted") or ""
-    gone = gcp.bq_scalar(proj, "SELECT IFNULL(STRING_AGG(CAST(id AS STRING), ',' ORDER BY id), '') "
-                               f"FROM `{fq}` WHERE __is_deleted") or ""
-    dup = int(gcp.bq_scalar(proj, f"SELECT COUNT(*) - COUNT(DISTINCT id) FROM `{fq}`") or 0)
-    ds, t = fq.rsplit(".", 1)
-    buf = int(gcp.bq_scalar(proj, f"SELECT COUNT(*) FROM `{ds}.INFORMATION_SCHEMA.TABLES` "
-                                  f"WHERE table_name = '{t}__changes'") or 0) > 0
-    return live, gone, dup, buf
+def _cdc_state(o, mydb: str, dset: str, t: str) -> tuple[str, str, str, int, bool]:
+    """(source `id:v:epoch`, base live `id:v:epoch`, flagged ids, rows minus distinct ids, buffer exists)."""
+    fp = "IFNULL(string_agg(format('{}:{}:{}', id, v, epoch(created_at)::BIGINT), ',' ORDER BY id), '')"
+    src = o.scalar(f"SELECT {fp} FROM my.{mydb}.{t}")
+    live = o.scalar(f"SELECT {fp} FROM bq.{dset}.{t} WHERE NOT __is_deleted")
+    gone = o.scalar(f"SELECT IFNULL(string_agg(id::VARCHAR, ',' ORDER BY id), '') FROM bq.{dset}.{t} "
+                    "WHERE __is_deleted")
+    dup = o.scalar(f"SELECT count(*) - count(DISTINCT id) FROM bq.{dset}.{t}")
+    buf = o.scalar("SELECT count(*) FROM information_schema.tables WHERE table_catalog = 'bq' "
+                   f"AND table_schema = '{dset}' AND table_name = '{t}__changes'")
+    return src, live, gone, dup, buf > 0
 
 
-def _cdc_delta(url: str, tables: list[str], cycle: int) -> None:
+def _cdc_delta(url: str, tables: list[str], cycle: int) -> bool:
     """Cycle-specific inserts, updates, a partition-moving update and a delete in every table."""
     from .cdc import _mysql
 
@@ -395,32 +386,45 @@ def _cdc_delta(url: str, tables: list[str], cycle: int) -> None:
             # A row whose partition day moves, and a row the previous cycle inserted.
             sql += [f"UPDATE {t} SET created_at = '2025-12-2{cycle} 08:00:00' WHERE id = {b + 5};",
                     f"UPDATE {t} SET v = -v WHERE id = {b + 10 * (cycle - 1) + 1};"]
-        _mysql(url, " ".join(sql))
+        if not _mysql(url, " ".join(sql)).ok:
+            return False
+    return True
 
 
 def _cdc_load_leg(led: Ledger, prev: Path, root: Path, url: str) -> None:
-    """The partner cycle: the previous release's `init --mode cdc` config, run → load → compact
-    three times by it, then twice by this binary; the compacted base equals the source by value."""
+    """The previous release's `init --mode cdc` config, run → load → compact three times by it and
+    twice by this binary; after every compact each BigQuery base equals the MySQL source by value."""
+    from urllib.parse import urlparse
+
+    import duckdb
+
     from . import gcp
     from .cdc import _mysql
+    from .duck import BQ_DATASET_ENV, BQ_PROJECT_ENV, Oracle, bq_target
     from ..pytools.registry import bq_tmp
 
-    proj, bucket = os.environ.get("BQ_ORACLE_PROJECT", ""), os.environ.get("BQ_ORACLE_BUCKET", "")
-    if not proj or not bucket:
-        led.skipped("mysql", "-", SCEN, "warehouse", "upgrade[mysql/cdc-warehouse]: no "
-                    "BQ_ORACLE_PROJECT / BQ_ORACLE_BUCKET", "no bigquery")
+    target, bucket = bq_target(), os.environ.get("BQ_ORACLE_BUCKET", "")
+    if target is None or not bucket:
+        led.skipped("mysql", "-", SCEN, "cdc-load", f"{CDC_LOAD}: no {BQ_PROJECT_ENV} / {BQ_DATASET_ENV} "
+                    "/ BQ_ORACLE_BUCKET", "no bigquery")
         return
+    proj = target[0]
     pid = os.getpid()
     tables = [f"upg_cdcw_{pid}_{k}" for k in range(CDC_TABLES)]
     dset = bq_tmp(f"upgcdc_{pid}")
     pfx = f"upgrade-cdc/{pid}"
-    d = root / "cdc_warehouse"
+    mydb = urlparse(url).path.lstrip("/")
+    d = root / "cdc_load"
     d.mkdir()
     env = {"RIVET_UPG_URL": url, "RIVET_STATE_URL": ""}
     seen: dict[str, set[int]] = {t: set() for t in tables}
 
     def fail(stage: str, why: str) -> None:
-        led.failed("mysql", "-", SCEN, "warehouse", f"upgrade[mysql/cdc-warehouse]: {stage}: {why}", stage)
+        led.failed("mysql", "-", SCEN, "cdc-load", f"{CDC_LOAD}: {stage}: {why}", stage)
+
+    def buffers() -> list[bool]:
+        with Oracle(bigquery=True, bq_dataset=dset, mysql=url) as o:
+            return [_cdc_state(o, mydb, dset, t)[4] for t in tables]
 
     try:
         for k, t in enumerate(tables):
@@ -437,43 +441,51 @@ def _cdc_load_leg(led: Ledger, prev: Path, root: Path, url: str) -> None:
             return fail("init", f"previous init: {(init.stderr or '').strip()[-240:]}")
         # Harness isolation only: init writes fixed prefixes, shared by every run on the stand bucket.
         cfg = d / "c.yaml"
-        body = cfg.read_text()
-        cfg.write_text(body.replace("prefix: exports/", f"prefix: {pfx}/exports/")
-                           .replace("prefix: cdc/", f"prefix: {pfx}/cdc/"))
+        body = re.sub(r"prefix: (exports|cdc)/", rf"prefix: {pfx}/\1/", cfg.read_text())
+        cfg.write_text(body)
+        if [ln for ln in body.splitlines() if "prefix:" in ln and pfx not in ln]:
+            return fail("init", "a prefix the harness could not isolate: " + body[:400])
         cycles = [(prev, 0), (prev, 1), (prev, 2), (rivet_bin(), 3), (rivet_bin(), 4)]
         for n, (binary, delta) in enumerate(cycles, 1):
             who = "prev" if binary == prev else "this"
-            if delta:
-                _cdc_delta(url, tables, delta)
+            if delta and not _cdc_delta(url, tables, delta):
+                return fail(f"cycle{n}/delta", "source change failed")
             if binary != prev and cycles[n - 2][0] == prev:
                 chk = run([str(binary), "check", "-c", "c.yaml"], env=env, cwd=d, timeout=None)
                 if not chk.ok:
                     return fail("check", f"this binary refuses the previous init's config: "
                                          f"{(chk.stderr or chk.out).strip()[-240:]}")
             for step in ("run", "load", "compact"):
+                if step == "compact" and n > 1 and not all(buffers()):
+                    # The positive control: a buffer check that never sees a buffer proves nothing.
+                    return fail(f"cycle{n}/load", f"{who}'s load left no `__changes` buffer: {buffers()}")
                 extra = [] if step == "run" else ["--run-id", f"upg-{pid}-{n}"]
                 p = run([str(binary), step, "-c", "c.yaml", *extra], env=env, cwd=d, timeout=None)
                 if not p.ok:
                     return fail(f"cycle{n}/{step}", f"{who} exit {p.returncode}: {(p.stderr or '').strip()[-240:]}")
             bad = []
-            for t in tables:
-                src, ids = _cdc_fp_mysql(url, t)
-                seen[t] |= ids
-                live, gone, dup, buf = _cdc_fp_bq(proj, f"{proj}.{dset}.{t}")
-                want_gone = ",".join(str(i) for i in sorted(seen[t] - ids))
-                if (live, gone, dup, buf) != (src, want_gone, 0, False):
-                    bad.append(f"{t}: live={live!r} src={src!r} flagged={gone!r} want={want_gone!r} "
-                               f"dup={dup} buffer_left={buf}")
+            with Oracle(bigquery=True, bq_dataset=dset, mysql=url) as o:
+                for t in tables:
+                    src, live, gone, dup, buf = _cdc_state(o, mydb, dset, t)
+                    ids = {int(x.split(":")[0]) for x in src.split(",") if x}
+                    seen[t] |= ids
+                    want_gone = ",".join(str(i) for i in sorted(seen[t] - ids))
+                    if (live, gone, dup, buf) != (src, want_gone, 0, False):
+                        bad.append(f"{t}: live={live!r} src={src!r} flagged={gone!r} want={want_gone!r} "
+                                   f"dup={dup} buffer_left={buf}")
+                part = o.scalar(f"SELECT IFNULL(string_agg(column_name, ','), '') FROM bigquery_query("
+                                f"'{proj}', 'SELECT column_name FROM `{proj}.{dset}.INFORMATION_SCHEMA.COLUMNS` "
+                                f"WHERE table_name = \"{tables[0]}\" AND is_partitioning_column = \"YES\"')")
             if bad:
                 return fail(f"cycle{n}", f"after {who}'s compact the base differs from the source — "
                                          + "; ".join(bad)[:600])
-        part = gcp.bq_scalar(proj, f"SELECT IFNULL(STRING_AGG(column_name), '') FROM `{proj}.{dset}"
-                                   f".INFORMATION_SCHEMA.COLUMNS` WHERE table_name = '{tables[0]}' "
-                                   "AND is_partitioning_column = 'YES'")
-        led.passed("mysql", "-", SCEN, "warehouse", f"upgrade[mysql/cdc-warehouse]: three cycles by the "
-                   f"previous release, two by this binary on its init config; after every compact each "
-                   f"of {CDC_TABLES} bases equals the source by value, deletes flagged, no duplicate key, "
-                   f"no buffer left (partition column: {part or 'none'})", "cdc-warehouse")
+        led.passed("mysql", "-", SCEN, "cdc-load", f"{CDC_LOAD}: three cycles by the previous release, two "
+                   f"by this binary on its init config; after every compact each of {CDC_TABLES} bases "
+                   f"equals the source by value, deletes flagged, no duplicate key, no buffer left "
+                   f"(partition column: {part or 'none'})", "cdc-load")
+    except duckdb.Error as e:
+        # A base missing a column the source has is a finding, not a harness crash.
+        fail("oracle", f"the DuckDB read failed: {str(e)[:400]}")
     finally:
         for t in tables:
             _mysql(url, f"DROP TABLE IF EXISTS {t};")
