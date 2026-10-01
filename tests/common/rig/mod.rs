@@ -76,6 +76,8 @@ pub struct Rig {
     /// instead of the tempdir. See [`Rig::dest_s3`] / [`Rig::dest_gcs`] /
     /// [`Rig::dest_azure`].
     cloud_dest: Option<CloudDest>,
+    /// Render the cloud prefix as `<prefix>/<export>` with no trailing slash (see `Rig::dest_prefix_unslashed`).
+    dest_prefix_unslashed: bool,
     /// `destination: { type: stdout }` — for dispatch tests whose subject is
     /// the stdout destination itself. See [`Rig::dest_stdout`].
     dest_stdout: bool,
@@ -150,6 +152,7 @@ impl Rig {
             oracle_xfailed: std::cell::Cell::new(false),
             top_lines: Vec::new(),
             cloud_dest: None,
+            dest_prefix_unslashed: false,
             materialized_copies: std::cell::RefCell::new(Vec::new()),
             past_renders: std::cell::RefCell::new(Vec::new()),
             dir: tempfile::tempdir().expect("rig tempdir"),
@@ -362,6 +365,12 @@ impl Rig {
     pub fn dest_stdout(mut self) -> Self {
         self.dest_stdout = true;
         self.dest_precreate = false;
+        self
+    }
+
+    /// Drop the trailing slash from the cloud prefix, the form an operator writes (`exports/orders`).
+    pub fn dest_prefix_unslashed(mut self) -> Self {
+        self.dest_prefix_unslashed = true;
         self
     }
 

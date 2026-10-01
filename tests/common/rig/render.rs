@@ -110,13 +110,14 @@ impl Rig {
         if self.dest_stdout {
             return "{ type: stdout }".to_string();
         }
+        let slash = if self.dest_prefix_unslashed { "" } else { "/" };
         match &self.cloud_dest {
             Some(CloudDest::S3 {
                 bucket,
                 prefix,
                 endpoint,
             }) => format!(
-                "{{ type: s3, bucket: {bucket}, prefix: \"{prefix}/{export}/\", region: us-east-1, \
+                "{{ type: s3, bucket: {bucket}, prefix: \"{prefix}/{export}{slash}\", region: us-east-1, \
                  endpoint: \"{endpoint}\", access_key_env: RIVET_TEST_MINIO_AK, \
                  secret_key_env: RIVET_TEST_MINIO_SK }}"
             ),
@@ -125,14 +126,14 @@ impl Rig {
                 prefix,
                 endpoint,
             }) => format!(
-                "{{ type: gcs, bucket: {bucket}, prefix: \"{prefix}/{export}/\", \
+                "{{ type: gcs, bucket: {bucket}, prefix: \"{prefix}/{export}{slash}\", \
                  endpoint: \"{endpoint}\", allow_anonymous: true }}"
             ),
             Some(CloudDest::GcsLive { bucket, prefix }) => {
-                format!("{{ type: gcs, bucket: {bucket}, prefix: \"{prefix}/{export}/\" }}")
+                format!("{{ type: gcs, bucket: {bucket}, prefix: \"{prefix}/{export}{slash}\" }}")
             }
             Some(CloudDest::Azure { container, prefix }) => format!(
-                "{{ type: azure, bucket: {container}, prefix: \"{prefix}/{export}/\", \
+                "{{ type: azure, bucket: {container}, prefix: \"{prefix}/{export}{slash}\", \
                  account_name: {act}, account_key_env: RIVET_TEST_AZURITE_KEY, \
                  endpoint: \"{ep}\" }}",
                 act = crate::common::env::AZURITE_ACCOUNT,
