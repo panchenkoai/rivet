@@ -14,6 +14,13 @@ pub fn mysql_connect() -> mysql::PooledConn {
     pool.get_conn().expect("connect to mysql")
 }
 
+/// A connection as the batch server's `root`: SET GLOBAL needs SYSTEM_VARIABLES_ADMIN, which `rivet` lacks.
+pub fn mysql_root_connect() -> mysql::PooledConn {
+    let pool = mysql::Pool::new(MYSQL_URL.replace("rivet:rivet@", "root:rivet@").as_str())
+        .expect("mysql root pool");
+    pool.get_conn().expect("connect to mysql as root")
+}
+
 /// RAII handle that drops the MySQL table on test exit.
 pub struct MysqlTable {
     name: String,
@@ -140,7 +147,7 @@ pub struct MysqlGlobal {
 impl MysqlGlobal {
     pub fn set(name: &str, value: &str) -> Self {
         use mysql::prelude::Queryable;
-        let mut c = mysql_connect();
+        let mut c = mysql_root_connect();
         let prev: String = c
             .query_first::<String, _>(format!("SELECT @@GLOBAL.{name}"))
             .unwrap_or_else(|e| panic!("read @@GLOBAL.{name}: {e}"))
@@ -168,7 +175,7 @@ impl MysqlGlobal {
 impl Drop for MysqlGlobal {
     fn drop(&mut self) {
         use mysql::prelude::Queryable;
-        if let Ok(mut c) = std::panic::catch_unwind(mysql_connect) {
+        if let Ok(mut c) = std::panic::catch_unwind(mysql_root_connect) {
             let _ = c.query_drop(format!("SET GLOBAL {} = '{}'", self.name, self.prev));
         }
     }

@@ -13,7 +13,8 @@ Per SQL engine, on the downloaded previous binary and this one:
   cursor     previous incremental run → source changes → this binary's run: every id
              once, every latest value right (the cursor in state is the artifact).
   crash      the previous binary crashes mid keyset run → this binary resumes it: every
-             id exactly once (the crash checkpoint is the artifact).
+             id exactly once, and no part the crashed run left is written again (the crash
+             checkpoint is the artifact; a restart from scratch rewrites the same part names).
   future     a state DB one schema version ahead of this binary is refused before any
              part is written (this binary is next release's "previous").
   fresh      the old config over the used prefix with an EMPTY state: no row is lost;
@@ -132,6 +133,12 @@ def _declared_names(out: Path) -> set[str]:
     return {Path(p).name for p in _manifest_declared_parts(out)}
 
 
+def _part_stats(out: Path) -> dict[str, tuple[int, int]]:
+    """Every parquet under `out` by name -> (inode, mtime_ns): a rewrite changes one of them."""
+    return {Path(f).name: (os.stat(f).st_ino, os.stat(f).st_mtime_ns)
+            for f in glob.glob(str(out / "**" / "*.parquet"), recursive=True)}
+
+
 def _strategy(p: Proc) -> list[str]:
     """The `Strategy:` lines a `rivet check` printed."""
     return [ln.strip() for ln in p.out.splitlines() if ln.strip().startswith("Strategy:")]
@@ -246,17 +253,23 @@ def _crash_leg(led: Ledger, prev: Path, root: Path, engine: str, url: str, state
     e = _Env(prev, root, engine, url, table, "chunked", state_url)
     try:
         crashed = e.rivet(prev, "run", "-c", "c.yaml", extra={"RIVET_TEST_PANIC_AT": "after_keyset_page:1"})
-        by_prev = {Path(f).name for f in glob.glob(str(e.dir / "output" / "**" / "*.parquet"), recursive=True)}
+        by_prev = _part_stats(e.dir / "output")
         r = e.rivet(rivet_bin(), "run", "-c", "c.yaml")
         got = _declared(e.dir / "output", "SELECT count(*), count(DISTINCT id) FROM {parts}")
-        # Resumed, not restarted: the parts the previous binary wrote before the crash are declared.
-        adopted = by_prev & _declared_names(e.dir / "output")
-        if e.init.ok and not crashed.ok and r.ok and adopted and got and got[0] == (CRASH_ROWS, CRASH_ROWS):
+        # Resumed, not restarted: the parts the previous binary wrote before the crash are declared,
+        # and none was written again — a restart rewrites the same part names, which the
+        # declared set and the counts cannot tell from a resume (the file's inode/mtime can).
+        adopted = set(by_prev) & _declared_names(e.dir / "output")
+        after = _part_stats(e.dir / "output")
+        rewritten = sorted(n for n, st in by_prev.items() if after.get(n) != st)
+        if (e.init.ok and not crashed.ok and r.ok and adopted and not rewritten and got
+                and got[0] == (CRASH_ROWS, CRASH_ROWS)):
             led.passed(engine, "-", SCEN, store, f"upgrade[{engine}/crash/{store}]: this binary resumed the "
                        f"previous release's crashed keyset run — {CRASH_ROWS} rows, each once")
         else:
             led.failed(engine, "-", SCEN, store, f"upgrade[{engine}/crash/{store}]: init ok={e.init.ok} "
-                       f"prev crashed={not crashed.ok} this ok={r.ok} pre-crash parts adopted={len(adopted)}/{len(by_prev)} (rows, ids)={got}: "
+                       f"prev crashed={not crashed.ok} this ok={r.ok} pre-crash parts adopted={len(adopted)}/{len(by_prev)} "
+                       f"rewritten={len(rewritten)} (rows, ids)={got}: "
                        f"{r.stderr.strip()[-200:]}", "crash")
     finally:
         _sql(engine, url, f"DROP TABLE IF EXISTS {table};")
