@@ -36,18 +36,25 @@ retries = 0
 # did not happen). The 300s x 4 = 1200s ceiling held with >=330s to spare;
 # 300s still WARNS early, and 4 periods kills a true hang at 20 minutes.
 [[profile.default.overrides]]
-filter = 'test(/same_named_configs_share_a_postgres_state_cdc_cycle$/) or test(/same_named_configs_share_a_postgres_state_batch_cycle$/) or test(/a_cdc_baseline_over_a_wide_history_lands_in_the_base_in_batches$/) or test(/a_wide_history_read_by_keyset_loads_daily_partitions_in_batches$/) or test(/base_and_buffer_cycle_run_load_compact_keeps_deletes_as_flags$/)'
+filter = 'test(/same_named_configs_share_a_postgres_state_cdc_cycle$/) or test(/same_named_configs_share_a_postgres_state_batch_cycle$/) or test(/a_cdc_baseline_over_a_wide_history_lands_in_the_base_in_batches$/) or test(/a_wide_history_read_by_keyset_loads_daily_partitions_in_batches$/) or test(/base_and_buffer_cycle_run_load_compact_keeps_deletes_as_flags$/) or test(/^live_cdc_full_cycle::/) or test(/bigquery_hourly_partitions_over_the_job_cap_load_in_budgeted_batches$/) or test(/^live_cdc_multi_table_cycle::/) or test(/^live_pool_ledger::/)'
 slow-timeout = { period = "300s", terminate-after = 4 }
+# The full CDC cycles measured 153-184 s on their own and grade BigQuery after every
+# load and compact (about 8.6 s per read, 2026-10-01); the hourly-partition cell ran past
+# 240 s even with the warehouse leg off. Both run with BIGQUERY_TEST_PROJECT set. The
+# multi-table cycles and the pooled loads grade every loaded export (13-17 s per BigQuery
+# read under the full suite, 2026-10-01): nine and sixteen reads pass 240 s.
 
 # Oracle Free caps the server at two CPUs, so the Oracle cells share it four at a time;
-# the whole-schema export reads ~2M rows and gets the long ceiling.
+# the whole-schema export reads ~2M rows and gets the long ceiling. Its oracle read of
+# CONTENT_ITEMS (150k rows through python-oracledb) took 130 s and 437 s in two full
+# suites (2026-10-01), so the pair gets 300 s x 4.
 [test-groups]
 oracle = { max-threads = 4 }
 
 [[profile.default.overrides]]
 filter = 'test(/^live_oracle::every_seeded_oracle_table_exports_every_row$/) or test(/^live_oracle::wide_clob_rows_stay_within_the_memory_budget$/)'
 test-group = 'oracle'
-slow-timeout = { period = "300s", terminate-after = 2 }
+slow-timeout = { period = "300s", terminate-after = 4 }
 
 [[profile.default.overrides]]
 filter = 'test(/^live_oracle::/)'

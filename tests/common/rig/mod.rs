@@ -20,6 +20,7 @@ mod invoke;
 mod materialize;
 mod oracle;
 mod render;
+mod verify;
 
 enum CloudDest {
     S3 {
@@ -75,11 +76,19 @@ pub struct Rig {
     /// instead of the tempdir. See [`Rig::dest_s3`] / [`Rig::dest_gcs`] /
     /// [`Rig::dest_azure`].
     cloud_dest: Option<CloudDest>,
+    /// Render the cloud prefix as `<prefix>/<export>` with no trailing slash (see `Rig::dest_prefix_unslashed`).
+    dest_prefix_unslashed: bool,
     /// `destination: { type: stdout }` — for dispatch tests whose subject is
     /// the stdout destination itself. See [`Rig::dest_stdout`].
     dest_stdout: bool,
     /// Key column for the census DISTINCT legs (see `Rig::census_key`).
     census_key: Option<String>,
+    /// Why this rig opted out of the default oracle (see `Rig::no_oracle`).
+    oracle_off: Option<String>,
+    /// A product defect the oracle must keep catching (see `Rig::oracle_known_defect`).
+    oracle_xfail: Option<String>,
+    /// Whether a graded run of an `oracle_xfail` rig disagreed, as the marker expects.
+    oracle_xfailed: std::cell::Cell<bool>,
     /// Top-level lines rendered after the exports. See [`Rig::top_line`].
     top_lines: Vec<String>,
     /// Caller-owned config copies produced by [`Rig::config_in`] — a
@@ -138,8 +147,12 @@ impl Rig {
             ckpt_override: None,
             dest_stdout: false,
             census_key: None,
+            oracle_off: None,
+            oracle_xfail: None,
+            oracle_xfailed: std::cell::Cell::new(false),
             top_lines: Vec::new(),
             cloud_dest: None,
+            dest_prefix_unslashed: false,
             materialized_copies: std::cell::RefCell::new(Vec::new()),
             past_renders: std::cell::RefCell::new(Vec::new()),
             dir: tempfile::tempdir().expect("rig tempdir"),
@@ -352,6 +365,12 @@ impl Rig {
     pub fn dest_stdout(mut self) -> Self {
         self.dest_stdout = true;
         self.dest_precreate = false;
+        self
+    }
+
+    /// Drop the trailing slash from the cloud prefix, the form an operator writes (`exports/orders`).
+    pub fn dest_prefix_unslashed(mut self) -> Self {
+        self.dest_prefix_unslashed = true;
         self
     }
 
@@ -650,6 +669,19 @@ pub fn read_all_parts(dir: &Path) -> Vec<arrow::record_batch::RecordBatch> {
 /// (One home for the run_cdc/run_ok copies four suites grew.)
 pub fn run_rivet_ok(cfg: &Path) {
     let out = super::runner::run_rivet(&["run", "--config", cfg.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "rivet run failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// [`run_rivet_ok`] outside the default oracle; the reason is required and counted by an offline ceiling.
+pub fn run_rivet_ok_no_oracle(cfg: &Path, reason: &str) {
+    let out = super::runner::run_rivet_env(
+        &["run", "--config", cfg.to_str().unwrap()],
+        &[(super::verify::NO_ORACLE_ENV, reason)],
+    );
     assert!(
         out.status.success(),
         "rivet run failed:\n{}",

@@ -269,20 +269,44 @@ fn naive_ts(delivery: &str) -> bool {
 /// The session time zone of the warehouse leg that reads naive timestamps as ClickHouse's own text.
 const CH_SESSION_TZ: &str = "Asia/Tokyo";
 
-/// The loaded view as DuckDB reads it, re-typed to each row's delivery (text from the bytes a ClickHouse `String` travels as, UUID from `FixedString(16)`, time of day from its decimal seconds, a naive timestamp from Parquet's UTC, or with `as_text` from ClickHouse's own text under a non-UTC session).
-fn warehouse_relation(rows: &[Row], w: &Warehouse, as_text: bool) -> String {
-    let naive: Vec<String> = rows
+/// The loaded view as DuckDB reads it, re-typed to each row's delivery (text from the bytes a ClickHouse `String` travels as, UUID from `FixedString(16)`, time of day from its decimal seconds, a naive timestamp from Parquet's UTC, or with `as_text` from ClickHouse's own text under a non-UTC session); a column `ns` names keeps every digit as text.
+fn warehouse_relation(
+    rows: &[Row],
+    w: &Warehouse,
+    as_text: bool,
+    ns: &[Option<arrow::datatypes::DataType>],
+) -> String {
+    use arrow::datatypes::DataType;
+    let ns_ts = |k: usize| matches!(ns[k], Some(DataType::Timestamp(..)));
+    let naive = |r: &Row| as_text && naive_ts(&r.delivery);
+    let ch_text: Vec<String> = rows
         .iter()
         .zip(columns(rows))
-        .filter(|(r, _)| as_text && naive_ts(&r.delivery))
-        .map(|(_, c)| c)
+        .enumerate()
+        .filter_map(|(k, (r, c))| {
+            if naive(r) {
+                Some(format!("toString({c}) AS {c}"))
+            } else if ns_ts(k) {
+                Some(format!("toString({c}, 'UTC') AS {c}"))
+            } else {
+                None
+            }
+        })
         .collect();
     let text: Vec<String> = rows
         .iter()
         .zip(columns(rows))
-        .filter_map(|(r, c)| {
+        .enumerate()
+        .filter_map(|(k, (r, c))| {
             let d = r.delivery.as_str();
-            let e = if d == "Utf8"
+            let e = if ns_ts(k) {
+                format!("decode({c})")
+            } else if ns[k].is_some() {
+                format!(
+                    "CAST(TIME '00:00:00' + to_seconds(CAST(floor({c}) AS BIGINT)) AS VARCHAR) \
+                     || '.' || split_part(CAST({c} AS VARCHAR), '.', 2)"
+                )
+            } else if d == "Utf8"
                 || d == "arrow.json"
                 || d.starts_with(|c: char| c.is_ascii_lowercase()) && !d.starts_with("arrow.")
             {
@@ -294,7 +318,7 @@ fn warehouse_relation(rows: &[Row], w: &Warehouse, as_text: bool) -> String {
                     "CAST(regexp_replace(lower(hex({c})), \
                      '^(.{{8}})(.{{4}})(.{{4}})(.{{4}})(.{{12}})$', '\\1-\\2-\\3-\\4-\\5') AS UUID)"
                 )
-            } else if naive_ts(d) && as_text {
+            } else if naive(r) {
                 format!("CAST(decode({c}) AS TIMESTAMP)")
             } else if naive_ts(d) {
                 format!("CAST({c} AS TIMESTAMP)")
@@ -306,17 +330,17 @@ fn warehouse_relation(rows: &[Row], w: &Warehouse, as_text: bool) -> String {
             Some(format!("{e} AS {c}"))
         })
         .collect();
-    let from = clickhouse_relation(&if naive.is_empty() {
+    let settings = if rows.iter().any(naive) {
+        format!(" SETTINGS session_timezone = '{CH_SESSION_TZ}'")
+    } else {
+        String::new()
+    };
+    let from = clickhouse_relation(&if ch_text.is_empty() {
         format!("SELECT * FROM {}.{} WHERE NOT __is_deleted", w.db, w.view)
     } else {
         format!(
-            "SELECT * REPLACE ({}) FROM {}.{} WHERE NOT __is_deleted \
-             SETTINGS session_timezone = '{CH_SESSION_TZ}'",
-            naive
-                .iter()
-                .map(|c| format!("toString({c}) AS {c}"))
-                .collect::<Vec<_>>()
-                .join(", "),
+            "SELECT * REPLACE ({}) FROM {}.{} WHERE NOT __is_deleted{settings}",
+            ch_text.join(", "),
             w.db,
             w.view
         )
@@ -361,7 +385,7 @@ fn cells(v: &serde_json::Value) -> Vec<Vec<Option<String>>> {
         .collect()
 }
 
-/// Arrow's own display of `cols` in every part under `dir` (only rows whose `__op` is in `ops`, when given), keyed by id.
+/// Arrow's own display of `cols` (all nine digits where `ns_text` applies) in every part under `dir` (only rows whose `__op` is in `ops`, when given), keyed by id.
 fn arrow_cells(dir: &Path, cols: &[String], ops: Option<&[&str]>) -> Cells {
     use arrow::util::display::array_value_to_string;
     let mut out = Cells::new();
@@ -386,7 +410,11 @@ fn arrow_cells(dir: &Path, cols: &[String], ops: Option<&[&str]>) -> Cells {
                 .unwrap();
             let row = vals
                 .iter()
-                .map(|a| (!a.is_null(r)).then(|| array_value_to_string(a, r).unwrap()))
+                .map(|a| {
+                    (!a.is_null(r)).then(|| {
+                        ns_text(a, r).unwrap_or_else(|| array_value_to_string(a, r).unwrap())
+                    })
+                })
                 .collect();
             assert!(
                 out.insert(id, row).is_none(),
@@ -445,6 +473,55 @@ fn delivered(schema: &arrow::datatypes::Schema, col: &str) -> String {
         .unwrap_or_else(|| f.data_type().to_string())
 }
 
+/// A field's Arrow type when it is nanosecond time: Time64(ns) or Timestamp(ns, any zone).
+fn ns_type(schema: &arrow::datatypes::Schema, col: &str) -> Option<arrow::datatypes::DataType> {
+    use arrow::datatypes::{DataType, TimeUnit};
+    let f = schema
+        .fields()
+        .iter()
+        .find(|f| f.name().eq_ignore_ascii_case(col))?;
+    matches!(
+        f.data_type(),
+        DataType::Time64(TimeUnit::Nanosecond) | DataType::Timestamp(TimeUnit::Nanosecond, _)
+    )
+    .then(|| f.data_type().clone())
+}
+
+/// Whether DuckDB 1.5.5 reads the field at microseconds: Time64(ns) and Timestamp(ns, <zone>) (measured; only a zoneless Timestamp(ns) reads exactly).
+fn duck_narrows(schema: &arrow::datatypes::Schema, col: &str) -> bool {
+    matches!(
+        ns_type(schema, col),
+        Some(arrow::datatypes::DataType::Time64(_))
+            | Some(arrow::datatypes::DataType::Timestamp(_, Some(_)))
+    )
+}
+
+/// All nine digits of a Time64(ns) or zoned Timestamp(ns) cell, spelled as DuckDB spells TIME / TIMESTAMPTZ in UTC; None for any other type.
+fn ns_text(a: &dyn arrow::array::Array, r: usize) -> Option<String> {
+    use arrow::array::AsArray;
+    use arrow::datatypes::{DataType, Time64NanosecondType, TimeUnit, TimestampNanosecondType};
+    match a.data_type() {
+        DataType::Time64(TimeUnit::Nanosecond) => {
+            let v = a.as_primitive::<Time64NanosecondType>().value(r);
+            let t = chrono::NaiveTime::from_num_seconds_from_midnight_opt(
+                (v / 1_000_000_000) as u32,
+                (v % 1_000_000_000) as u32,
+            )
+            .expect("time of day");
+            Some(t.format("%H:%M:%S%.9f").to_string())
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, Some(_)) => {
+            let v = a.as_primitive::<TimestampNanosecondType>().value(r);
+            Some(
+                chrono::DateTime::from_timestamp_nanos(v)
+                    .format("%Y-%m-%d %H:%M:%S%.9f+00")
+                    .to_string(),
+            )
+        }
+        _ => None,
+    }
+}
+
 /// `v` canonicalised as the row's render says.
 fn canon(v: &Option<String>, how: &Option<String>) -> Option<String> {
     v.as_ref().map(|s| match how.as_deref() {
@@ -488,6 +565,117 @@ fn round_micros_rounds_the_server_tick_and_keeps_a_micro() {
         ),
     ] {
         assert_eq!(round_micros(got), want);
+    }
+}
+
+/// Write `[id, Time64(ns), Timestamp(ns, UTC)]` rows to one parquet part under `dir` with arrow-rs (rivet's writer).
+fn write_ns_part(dir: &Path, rows: &[(i64, i64, i64)]) {
+    use arrow::array::{Int64Array, Time64NanosecondArray, TimestampNanosecondArray};
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use std::sync::Arc;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("c0", DataType::Time64(TimeUnit::Nanosecond), true),
+        Field::new(
+            "c1",
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+            true,
+        ),
+    ]));
+    let batch = arrow::record_batch::RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.0))),
+            Arc::new(Time64NanosecondArray::from_iter_values(
+                rows.iter().map(|r| r.1),
+            )),
+            Arc::new(
+                TimestampNanosecondArray::from_iter_values(rows.iter().map(|r| r.2))
+                    .with_timezone("UTC"),
+            ),
+        ],
+    )
+    .unwrap();
+    let f = std::fs::File::create(dir.join("part-0.parquet")).unwrap();
+    let mut w = parquet::arrow::ArrowWriter::try_new(f, schema, None).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+}
+
+#[test]
+fn arrow_cells_keeps_all_nine_digits_of_the_types_duckdb_narrows() {
+    // 13:45:30.123456789 and 2026-06-23 04:30:00.123456789 UTC, and their microsecond truncations.
+    let (t, ts) = (49_530_123_456_789_i64, 1_782_189_000_123_456_789_i64);
+    let (full, cut) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    write_ns_part(full.path(), &[(1, t, ts)]);
+    write_ns_part(cut.path(), &[(1, t - t % 1_000, ts - ts % 1_000)]);
+    let cols = ["c0".to_string(), "c1".to_string()];
+    let (a, b) = (
+        arrow_cells(full.path(), &cols, None),
+        arrow_cells(cut.path(), &cols, None),
+    );
+    assert_eq!(
+        a[&1],
+        vec![
+            Some("13:45:30.123456789".to_string()),
+            Some("2026-06-23 04:30:00.123456789+00".to_string())
+        ]
+    );
+    let ts_canon = Some("timestamp".to_string());
+    for k in 0..2 {
+        assert_ne!(
+            canon(&a[&1][k], &ts_canon),
+            canon(&b[&1][k], &ts_canon),
+            "c{k}: a truncated twin compares equal"
+        );
+    }
+    let s = schema(full.path());
+    assert!(duck_narrows(&s, "c0") && duck_narrows(&s, "c1") && !duck_narrows(&s, "id"));
+    // Counted over the Arrow text, a sub-microsecond difference stays distinct.
+    let mut two = Cells::new();
+    two.insert(1, a[&1].clone());
+    two.insert(2, vec![b[&1][0].clone(), b[&1][1].clone()]);
+    assert_eq!(
+        counts_of(&two, &[ts_canon.clone(), ts_canon]),
+        vec![2, 2, 2, 2, 2]
+    );
+}
+
+#[test]
+fn arrow_overlay_grades_every_delivered_leg_on_arrow_text() {
+    // DuckDB collapsed two ids that differ below the microsecond; Arrow keeps them apart.
+    let duck = |v: &str| -> Cells {
+        [
+            (1, vec![Some(v.to_string())]),
+            (2, vec![Some(v.to_string())]),
+        ]
+        .into()
+    };
+    let arrow: Cells = [
+        (1, vec![Some("13:45:30.123456789".to_string())]),
+        (2, vec![Some("13:45:30.123456".to_string())]),
+    ]
+    .into();
+    let legs_named = [
+        "batch",
+        "batch_stream",
+        "batch_snapshot",
+        "stream",
+        "snapshot",
+        "final",
+    ];
+    let mut legs: BTreeMap<String, Cells> = legs_named
+        .iter()
+        .map(|l| (l.to_string(), duck("13:45:30.123456")))
+        .collect();
+    legs.insert("source".into(), arrow.clone());
+    let mut counts: BTreeMap<String, Vec<i64>> =
+        legs.keys().map(|l| (l.clone(), vec![2, 2, 1])).collect();
+    let canons = [Some("timestamp".to_string())];
+    arrow_overlay(&mut legs, &mut counts, 0, &canons, &arrow, &arrow, &arrow);
+    for l in legs_named.iter().chain(&["source"]) {
+        assert_eq!(legs[*l], arrow, "{l}");
+        assert_eq!(counts[*l], vec![2, 2, 2], "{l}");
     }
 }
 
@@ -698,6 +886,43 @@ fn counts_of(rows: &Cells, canons: &[Option<String>]) -> Vec<i64> {
     out
 }
 
+/// Column `k` of every delivered leg replaced by Arrow's cells (DuckDB narrowed them), and every leg's (non-null, distinct) for `k` recounted over that text.
+fn arrow_overlay(
+    legs: &mut BTreeMap<String, Cells>,
+    counts: &mut BTreeMap<String, Vec<i64>>,
+    k: usize,
+    canons: &[Option<String>],
+    a_b: &Cells,
+    a_s: &Cells,
+    a_snap: &Cells,
+) {
+    for (leg, rows) in legs.iter_mut() {
+        let from: &[&Cells] = match leg.as_str() {
+            "batch" | "batch_stream" | "batch_snapshot" => &[a_b],
+            "stream" => &[a_s],
+            "snapshot" => &[a_snap],
+            // The final image is the last streamed row of an id, else its snapshot row.
+            "final" => &[a_s, a_snap],
+            _ => &[],
+        };
+        if !from.is_empty() {
+            for (id, row) in rows.iter_mut() {
+                row[k] = from
+                    .iter()
+                    .find_map(|a| a.get(id))
+                    .unwrap_or_else(|| panic!("{leg} id {id}: no Arrow row"))[k]
+                    .clone();
+            }
+        }
+        let n = counts_of(rows, canons);
+        let c = counts
+            .get_mut(leg)
+            .unwrap_or_else(|| panic!("no counts for {leg}"));
+        c[1 + 2 * k] = n[1 + 2 * k];
+        c[2 + 2 * k] = n[2 + 2 * k];
+    }
+}
+
 /// Every stage of one engine, read by one DuckDB session (the source by its client when DuckDB cannot attach it), against the ledger and each other; returns every violation.
 fn duckdb_ledger_verdict(lg: &Ledger, st: &Stand, n: i64) -> Vec<String> {
     let cols = columns(&lg.batch);
@@ -745,15 +970,17 @@ fn duckdb_ledger_verdict(lg: &Ledger, st: &Stand, n: i64) -> Vec<String> {
             engine.load_sql()
         );
     }
+    // What `rivet load` put into ClickHouse is the CDC delivery.
+    let wh_ns: Vec<_> = cols.iter().map(|c| ns_type(&cs, c)).collect();
     if let Some(w) = &st.warehouse {
         setup = format!(
             "INSTALL httpfs; LOAD httpfs; {setup} UNION ALL SELECT 'warehouse', CAST(id AS VARCHAR), {proj} FROM {}",
-            warehouse_relation(&lg.cdc, w, false)
+            warehouse_relation(&lg.cdc, w, false, &wh_ns)
         );
         if lg.cdc.iter().any(|r| naive_ts(&r.delivery)) {
             setup = format!(
                 "{setup} UNION ALL SELECT 'warehouse_text', CAST(id AS VARCHAR), {proj} FROM {}",
-                warehouse_relation(&lg.cdc, w, true)
+                warehouse_relation(&lg.cdc, w, true, &wh_ns)
             );
         }
     }
@@ -927,6 +1154,11 @@ fn duckdb_ledger_verdict(lg: &Ledger, st: &Stand, n: i64) -> Vec<String> {
         arrow_cells(&cdir, &cols, Some(&["update", "insert"])),
         arrow_cells(&cdir.join("snapshot"), &cols, None),
     );
+    for (k, c) in cols.iter().enumerate() {
+        if [&bs, &cs, &ss].iter().any(|s| duck_narrows(s, c)) {
+            arrow_overlay(&mut legs, &mut counts, k, &canons, &a_b, &a_s, &a_snap);
+        }
+    }
     let arrow_source = keyed(out.get("arrow_source").map(cells).unwrap_or_default());
     let arrow_warehouse = keyed(out.get("arrow_warehouse").map(cells).unwrap_or_default());
     let ch_types: BTreeMap<String, String> = out
@@ -1347,7 +1579,28 @@ fn duckdb_refused_verdict(
         ));
         return bad;
     }
-    let counts = cells(&out["counts"]);
+    // Rows ordered by leg: source, stream. A column DuckDB narrows takes Arrow's cells and is recounted over them.
+    let mut counts = cells(&out["counts"]);
+    let narrowed: Vec<usize> = (0..cols.len())
+        .filter(|&k| duck_narrows(&cs, &cols[k]))
+        .collect();
+    let mut got = got;
+    if !narrowed.is_empty() {
+        let a = arrow_cells(&st.cdc.out_dir(), &cols, Some(&["insert"]));
+        let canons: Vec<_> = cdc_rows.iter().map(|r| r.render.canon.clone()).collect();
+        for (id, row) in got.iter_mut() {
+            for &k in &narrowed {
+                row[k] = a[id][k].clone();
+            }
+        }
+        for (i, leg) in [&src, &got].into_iter().enumerate() {
+            let n = counts_of(leg, &canons);
+            for &k in &narrowed {
+                counts[i][2 + 2 * k] = Some(n[1 + 2 * k].to_string());
+                counts[i][3 + 2 * k] = Some(n[2 + 2 * k].to_string());
+            }
+        }
+    }
     if counts[0][1..] != counts[1][1..] {
         bad.push(format!(
             "(COUNT(*), COUNT(col), COUNT(DISTINCT col)) per leg differ: {counts:?}"

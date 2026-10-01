@@ -541,10 +541,10 @@ mod tests {
     #[test]
     fn pg_shared_state_cross_connection_visibility_and_supersession() {
         let Ok(url) = std::env::var("RIVET_TEST_STATE_URL") else {
-            return;
+            return crate::test_hook::skip_live("RIVET_TEST_STATE_URL unset");
         };
         if !url.starts_with("postgres") {
-            return;
+            return crate::test_hook::skip_live("RIVET_TEST_STATE_URL is not a postgres URL");
         }
         // Two connections = two processes on the same shared Postgres state.
         unsafe { std::env::set_var("RIVET_STATE_URL", &url) };

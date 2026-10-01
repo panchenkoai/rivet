@@ -1653,10 +1653,10 @@ mod tests {
     #[test]
     fn pg_upgrade_from_v18_lands_keyset_range_as_bigint_and_keeps_data() {
         let Ok(url) = std::env::var("RIVET_TEST_STATE_URL") else {
-            return;
+            return crate::test_hook::skip_live("RIVET_TEST_STATE_URL unset");
         };
         if !url.starts_with("postgres") {
-            return;
+            return crate::test_hook::skip_live("RIVET_TEST_STATE_URL is not a postgres URL");
         }
         let mut client = connect_pg(&url).expect("connect pg state");
         // Isolate: a fresh schema so the staged FIXED-name state tables never collide

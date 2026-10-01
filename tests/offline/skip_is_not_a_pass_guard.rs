@@ -268,3 +268,73 @@ fn a_live_test_that_skips_says_so_through_the_one_marker() {
         offenders.join("\n  ")
     );
 }
+
+/// A missing environment variable is a counted skip, never a silent green pass.
+///
+/// The shape is `let Ok(x) = std::env::var(..) else { return; };` — measured 2026-10-01
+/// in nine tests across src/ and tests/ (Snowflake, BigQuery, the Postgres state
+/// backend), each printing `ok` with no credential and four of them printing nothing.
+#[test]
+fn a_missing_env_var_returns_through_skip_live() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut offenders = Vec::new();
+    let mut seen = 0usize;
+    let mut stack = vec![root.join("src"), root.join("tests")];
+    while let Some(dir) = stack.pop() {
+        for p in std::fs::read_dir(&dir)
+            .expect("read dir")
+            .map(|e| e.expect("dir entry").path())
+        {
+            if p.is_dir() {
+                stack.push(p);
+                continue;
+            }
+            if p.extension().and_then(|x| x.to_str()) != Some("rs")
+                || p.ends_with("skip_is_not_a_pass_guard.rs")
+            {
+                continue;
+            }
+            let src = std::fs::read_to_string(&p).expect("read a source file");
+            let mut from = 0usize;
+            while let Some(rel) = src[from..].find("std::env::var(") {
+                let at = from + rel;
+                from = at + 1;
+                let line_start = src[..at].rfind('\n').map_or(0, |i| i + 1);
+                let head = src[line_start..at].trim_start();
+                if !(head.starts_with("let Ok(") || head.starts_with("let Some(")) {
+                    continue;
+                }
+                let stmt_end = src[at..].find(';').map_or(src.len(), |i| at + i);
+                let Some(else_rel) = src[at..stmt_end].find("else {") else {
+                    continue;
+                };
+                let body_start = at + else_rel;
+                let body_end = src[body_start..]
+                    .find("};")
+                    .map_or(src.len(), |i| body_start + i);
+                let body = &src[body_start..body_end];
+                if !body.contains("return") {
+                    continue;
+                }
+                seen += 1;
+                if !body.contains("skip_live(") {
+                    let line_no = src[..at].matches('\n').count() + 1;
+                    offenders.push(format!(
+                        "{}:{line_no}",
+                        p.strip_prefix(&root).unwrap_or(&p).display()
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        seen >= 9,
+        "found only {seen} env-var let-else returns — the scan lost its subject"
+    );
+    assert!(
+        offenders.is_empty(),
+        "these return early on a missing env var without `skip_live`, so a missing \
+         credential reads as a pass:\n  {}",
+        offenders.join("\n  ")
+    );
+}

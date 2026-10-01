@@ -49,6 +49,26 @@ const KEYSET_INCREMENTAL_EXT_ID: Stage = Stage(
         "keyset_incremental: true",
     ],
 );
+const PARALLEL_KEYSET_INCREMENTAL_ID: Stage = Stage(
+    "chunked",
+    &[
+        "chunk_by_key: id",
+        "chunk_size: 4",
+        "parallel: 2",
+        "chunk_checkpoint: true",
+        "keyset_incremental: true",
+    ],
+);
+const PARALLEL_KEYSET_INCREMENTAL_EXT_ID: Stage = Stage(
+    "chunked",
+    &[
+        "chunk_by_key: ext_id",
+        "chunk_size: 4",
+        "parallel: 2",
+        "chunk_checkpoint: true",
+        "keyset_incremental: true",
+    ],
+);
 const INCREMENTAL_ID: Stage = Stage("incremental", &["cursor_column: id"]);
 const INCREMENTAL_TIME: Stage = Stage("incremental", &["cursor_column: server_time"]);
 const INCREMENTAL_TIME_SETTLED: Stage = Stage(
@@ -100,6 +120,9 @@ fn transition_with(
     let rig = staged(rig, &next, second.path());
     match expect {
         Expect::Continues => {
+            let rig = rig.no_oracle(
+                "the continued delta starts past rows the prior stage delivered to another destination",
+            );
             rig.run_ok();
             assert_eq!(read_ids(second.path()), vec![11, 12, 13]);
         }
@@ -167,11 +190,18 @@ fn keyset_then_incremental_other_column(e: SqlEngine) {
     );
 }
 
+/// Both keyset runners refuse: the parallel one reads its anchor in its own call (`run_keyset_parallel`).
 fn keyset_incremental_key_change(e: SqlEngine) {
     transition(
         e,
         KEYSET_INCREMENTAL_ID,
         KEYSET_INCREMENTAL_EXT_ID,
+        Expect::Refused(&["`id`", "`ext_id`"]),
+    );
+    transition(
+        e,
+        PARALLEL_KEYSET_INCREMENTAL_ID,
+        PARALLEL_KEYSET_INCREMENTAL_EXT_ID,
         Expect::Refused(&["`id`", "`ext_id`"]),
     );
 }

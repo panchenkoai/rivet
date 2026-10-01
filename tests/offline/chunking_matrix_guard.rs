@@ -1506,3 +1506,157 @@ fn the_export_tail_seam_has_one_caller_and_no_runner_re_applies_it() {
         );
     }
 }
+
+// ── Guard #9: a runner cell's test exercises what its row claims ──────────────
+
+/// `(row, column or "*", tokens the cited test must reach, tokens it must not)`.
+///
+/// Each entry is a cell that once named a test which never touched the row's claim:
+/// a Form A guard cited for Form B (never read `column_checksums`), a checkpoint
+/// test cited for plain chunked, a sequential-only test hiding the parallel keyset
+/// anchor read.
+const RUNNER_CELL_CLAIMS: &[(&str, &str, &[&str], &[&str])] = &[
+    ("value_checksum_form_b", "*", &["column_checksums"], &[]),
+    ("files_committed_on_abort", "*", &["files_committed"], &[]),
+    (
+        "cdc_backfill_leg",
+        "chunked",
+        &["chunk_column"],
+        &["chunk_checkpoint: true"],
+    ),
+    ("cursor_ownership_guard", "keyset", &["parallel: "], &[]),
+];
+
+/// The text of the `fn`/`const` item whose header is `lines[line]`, up to its closing line.
+fn item_text(lines: &[&str], line: usize) -> String {
+    let head = lines[line];
+    let indent = head.len() - head.trim_start().len();
+    let is_fn = head.contains("fn ");
+    let mut out = String::new();
+    for (k, l) in lines[line..].iter().enumerate() {
+        out.push_str(l);
+        out.push('\n');
+        let at_indent = l.len() - l.trim_start().len() == indent;
+        let closes = if is_fn {
+            at_indent && l.trim() == "}"
+        } else {
+            l.trim_end().ends_with(';') && (at_indent || k == 0)
+        };
+        if closes {
+            break;
+        }
+    }
+    out
+}
+
+/// Every `fn`/`const` item in `text`, by name → its text (first definition wins).
+fn items_in(text: &str) -> HashMap<String, String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut items = HashMap::new();
+    for (i, l) in lines.iter().enumerate() {
+        let mut rest = l.trim_start();
+        for prefix in ["pub(crate) ", "pub(super) ", "pub ", "async ", "unsafe "] {
+            if let Some(r) = rest.strip_prefix(prefix) {
+                rest = r;
+            }
+        }
+        let Some(rest) = rest
+            .strip_prefix("fn ")
+            .or_else(|| rest.strip_prefix("const "))
+        else {
+            continue;
+        };
+        let name: String = rest
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if !name.is_empty() {
+            items.entry(name).or_insert_with(|| item_text(&lines, i));
+        }
+    }
+    items
+}
+
+/// The cited test's body plus every same-file `fn`/`const` it reaches by name, transitively.
+fn test_closure(name: &str) -> Option<String> {
+    let mut stack = vec![repo_root().join("src"), repo_root().join("tests")];
+    while let Some(dir) = stack.pop() {
+        for p in std::fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+        {
+            if p.is_dir() {
+                stack.push(p);
+                continue;
+            }
+            if p.extension().is_none_or(|x| x != "rs") {
+                continue;
+            }
+            let items = items_in(&std::fs::read_to_string(&p).unwrap_or_default());
+            if !items.contains_key(name) {
+                continue;
+            }
+            let (mut seen, mut todo, mut out) =
+                (HashSet::new(), vec![name.to_string()], String::new());
+            while let Some(n) = todo.pop() {
+                if !seen.insert(n.clone()) {
+                    continue;
+                }
+                let Some(body) = items.get(&n) else { continue };
+                out.push_str(body);
+                for ident in body.split(|c: char| !c.is_alphanumeric() && c != '_') {
+                    if items.contains_key(ident) && !seen.contains(ident) {
+                        todo.push(ident.to_string());
+                    }
+                }
+            }
+            return Some(out);
+        }
+    }
+    None
+}
+
+/// A runner cell names a test that reaches the row's claim, not a neighbouring one.
+#[test]
+fn runner_matrix_cells_exercise_what_their_row_claims() {
+    let matrix = load_matrix(RUNNER_MATRIX);
+    let mut graded = 0;
+    for (row, column, must, must_not) in RUNNER_CELL_CLAIMS {
+        let sc = matrix
+            .scenarios
+            .iter()
+            .find(|s| s.id == *row)
+            .unwrap_or_else(|| {
+                panic!("{RUNNER_MATRIX} has no row '{row}' — re-point RUNNER_CELL_CLAIMS")
+            });
+        for (col, cell) in sc.resolved_cells(&matrix.engines, RUNNER_MATRIX) {
+            if *column != "*" && col != *column {
+                continue;
+            }
+            let Some(test) = &cell.test else { continue };
+            let body = test_closure(test)
+                .unwrap_or_else(|| panic!("{row}.{col}: no `fn {test}` under src/ or tests/"));
+            graded += 1;
+            for tok in *must {
+                assert!(
+                    body.contains(tok),
+                    "{RUNNER_MATRIX} {row}.{col} cites `{test}`, which never reaches `{tok}` — \
+                     the cell claims what the test does not exercise"
+                );
+            }
+            for tok in *must_not {
+                assert!(
+                    !body.contains(tok),
+                    "{RUNNER_MATRIX} {row}.{col} cites `{test}`, which uses `{tok}` — it proves \
+                     a different runner than the column"
+                );
+            }
+        }
+    }
+    assert!(
+        graded >= 10,
+        "graded only {graded} cells — the claim table or the parse is broken"
+    );
+}

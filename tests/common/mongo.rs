@@ -186,6 +186,16 @@ impl MongoTest {
         });
     }
 
+    /// Delete the one document whose `_id` is exactly `id` (any BSON type).
+    pub fn delete_bson_id(&self, name: &str, id: Bson) {
+        self.rt.block_on(async {
+            self.coll(name)
+                .delete_one(doc! { "_id": id })
+                .await
+                .expect("mongo: delete_one");
+        });
+    }
+
     /// Apply `(id, field, value)` ops inside ONE transaction — the same `_id`
     /// touched twice is exactly the intra-transaction CDC-ordering case.
     pub fn txn_updates(&self, name: &str, ops: &[(i64, &str, &str)]) {

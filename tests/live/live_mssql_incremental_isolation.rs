@@ -33,7 +33,8 @@ fn run_across_a_mid_scan_commit(db: &str) -> (Rig, MssqlTable, String) {
         .query(&format!("SELECT id, version, updated_at FROM {table}"))
         .mode("incremental")
         .export_line("cursor_column: updated_at")
-        .duckdb_oracle();
+        .duckdb_oracle()
+        .no_oracle("a writer commits mid-run by design, and the query export names no key to fold versions by");
     rig.run_ok();
 
     let tx = format!(

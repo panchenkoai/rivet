@@ -455,6 +455,17 @@ mod tests {
     }
 
     #[test]
+    fn dir_boundary_never_lets_a_prefix_reach_a_sibling_that_extends_its_name() {
+        assert_eq!(dir_boundary("exports/orders"), "exports/orders/");
+        assert_eq!(dir_boundary("exports/orders/"), "exports/orders/");
+        assert_eq!(dir_boundary(""), "", "the bucket root stays the root");
+        assert!(
+            !"exports/orders_archive/a.parquet".starts_with(&dir_boundary("exports/orders")),
+            "a string-prefix store must not list the sibling"
+        );
+    }
+
+    #[test]
     fn read_returns_the_object_bytes() {
         let dir = tempfile::tempdir().unwrap();
         write_at(dir.path(), "p/hello.bin", b"payload");

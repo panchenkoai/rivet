@@ -450,6 +450,7 @@ fn derived_capture_marker_set_is_pinned() {
         // spawns rivet, so it is a capture marker like its siblings.
         "run_rivet_in_dir(",
         "run_rivet_ok(",
+        "run_rivet_ok_no_oracle(",
         "run_rivet_with_warn_log(",
         "run_with_env(",
         "run_with_envs(",
@@ -829,7 +830,9 @@ fn oracle_class_census_is_pinned() {
 // live_cdc_type_parity.rs), graded by DuckDB and the source's own rendering; -6 — the hand-written
 // per-engine type cells they replace (PG/MSSQL/Oracle full_type_matrix, PG/MySQL/MSSQL typed_values),
 // whose types and literals moved into docs/type-capability-matrix.yaml.
-const PIN_INDEPENDENT: usize = 98;
+// 2026-10-01: +2 independent - the Mongo deletes of `_id` null vs "null" (the known-defect roast cell and its pre-image remedy), read through DuckDB.
+// 2026-10-01: +1 independent - the CDC backfill leg on a plain chunked recipe, graded against the source count.
+const PIN_INDEPENDENT: usize = 101;
 // 2026-09-28, source connection ceilings: +3 shared codec — the run's captured row is the
 // fixture check; the oracle is the server's own connection counter.
 // 2026-09-29: +2 shared codec — the Oracle TRUNCATE refusal on re-run and the uncaptured-truncate cell.

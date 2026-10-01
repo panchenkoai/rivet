@@ -64,7 +64,7 @@ scenarios:
     oracle:   { gap: "no Oracle mode-transition live test (the transition logic is shared; the cursor/keyset state Oracle writes is unproven here)" }
 
   - id: keyset_incremental_key_change
-    what: "MT3 — keyset_incremental on id, then on another unique key: the keyset runner refuses its own anchor"
+    what: "MT3 — keyset_incremental on id, then on another unique key: BOTH keyset runners (sequential, and parallel, which reads the anchor in its own call) refuse their own anchor"
     postgres: { test: keyset_incremental_key_change_postgres }
     mysql:    { test: keyset_incremental_key_change_mysql }
     mssql:    { test: keyset_incremental_key_change_mssql }

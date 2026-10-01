@@ -30,15 +30,15 @@ def canon(v: object) -> object:
         return bytes(v).hex()
     if isinstance(v, dt.datetime):
         aware = v if v.tzinfo else v.replace(tzinfo=dt.timezone.utc)
-        return ("ts", (aware - _EPOCH) // dt.timedelta(microseconds=1))
+        return ("ts", _secs(decimal.Decimal((aware - _EPOCH) // dt.timedelta(microseconds=1)).scaleb(-6)))
     if isinstance(v, dt.date):
         return ("date", v.isoformat())
     if isinstance(v, dt.time):
-        return ("dur", 0, 0, v.hour * 3_600_000_000 + v.minute * 60_000_000 + v.second * 1_000_000 + v.microsecond)
+        return ("dur", 0, 0, _secs(decimal.Decimal(v.hour * 3600 + v.minute * 60 + v.second) + decimal.Decimal(v.microsecond).scaleb(-6)))
     if isinstance(v, dt.timedelta):
-        return ("dur", 0, 0, v // dt.timedelta(microseconds=1))
+        return ("dur", 0, 0, _secs(decimal.Decimal(v // dt.timedelta(microseconds=1)).scaleb(-6)))
     if isinstance(v, decimal.Decimal):
-        return ("num", format(v.normalize(), "f"))
+        return ("num", format(v.normalize(decimal.Context(prec=max(len(v.as_tuple().digits), 1))), "f"))
     if isinstance(v, int):
         return ("num", str(v))
     if isinstance(v, float):
@@ -49,11 +49,17 @@ def canon(v: object) -> object:
     if isinstance(v, dict):
         return {str(k): canon(x) for k, x in sorted(v.items())}
     if isinstance(v, str):
-        clock = re.fullmatch(r"(-?)(\d{1,3}):(\d{2}):(\d{2})(?:\.(\d{1,6}))?", v)
+        bc = _bc_text(v)
+        if bc is not None:
+            return ("bc", bc)
+        stamp = _timestamp_text(v)
+        if stamp is not None:
+            return ("ts", stamp)
+        clock = re.fullmatch(r"(-?)(\d{1,3}):(\d{2}):(\d{2})(?:\.(\d+))?", v)
         if clock:
             sign, h, m, sec, frac = clock.groups()
-            micros = ((int(h) * 60 + int(m)) * 60 + int(sec)) * 1_000_000 + int((frac or "0").ljust(6, "0"))
-            return ("dur", 0, 0, -micros if sign else micros)
+            total = decimal.Decimal((int(h) * 60 + int(m)) * 60 + int(sec)) + decimal.Decimal("0." + (frac or "0"))
+            return ("dur", 0, 0, _secs(-total if sign else total))
         interval = _interval(v)
         if interval is not None:
             return ("dur", *interval)
@@ -67,22 +73,58 @@ def canon(v: object) -> object:
     return str(v)
 
 
-def _interval(s: str) -> tuple[int, int, int] | None:
-    """(months, days, microseconds) of an ISO-8601 duration (`P1Y2M3D`) or DuckDB interval text (`1 year 2 months 3 days`)."""
+def _secs(d: decimal.Decimal) -> str:
+    """Seconds as an exact decimal string — every fractional digit the value carries, none invented."""
+    return format(d.normalize(), "f") if d else "0"
+
+
+def _bc_text(s: str) -> str | None:
+    """A BC date/timestamp text — Oracle's signed `-0001-06-15 …` or DuckDB's `0001-06-15 (BC) …` — as one form; `None` otherwise."""
+    m = re.fullmatch(r"-(\d{4}-\d{2}-\d{2})(.*)|(\d{4}-\d{2}-\d{2}) \(BC\)(.*)", s.strip())
+    if not m:
+        return None
+    day, rest = (m.group(1), m.group(2)) if m.group(1) else (m.group(3), m.group(4))
+    rest = re.sub(r"\.0+$", "", rest.strip().lstrip("T")) or "00:00:00"
+    return f"{day} {rest}"
+
+
+def _timestamp_text(s: str) -> str | None:
+    """Epoch seconds (exact, every fractional digit kept) of an ISO timestamp text, naive read as UTC; `None` when `s` is not one."""
+    m = re.fullmatch(
+        r"(\d{4}-\d{2}-\d{2})[ T](\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?\s*(Z|[+-]\d{2}(?::?\d{2})?)?", s.strip()
+    )
+    if not m:
+        return None
+    day, h, mi, sec, frac, zone = m.groups()
+    try:
+        base = dt.datetime.fromisoformat(f"{day}T{h}:{mi}:{sec}").replace(tzinfo=dt.timezone.utc)
+    except ValueError:
+        return None
+    offset = 0
+    if zone and zone != "Z":
+        zh, zm = zone[1:3], (zone[3:].lstrip(":") or "0")
+        offset = (int(zh) * 3600 + int(zm) * 60) * (1 if zone[0] == "+" else -1)
+    whole = (base - _EPOCH) // dt.timedelta(seconds=1) - offset
+    return _secs(decimal.Decimal(whole) + decimal.Decimal("0." + (frac or "0")))
+
+
+def _interval(s: str) -> tuple[int, int, str] | None:
+    """(months, days, exact seconds) of an ISO-8601 duration (`P1Y2M3D`) or DuckDB interval text (`1 year 2 months 3 days`)."""
     iso = re.fullmatch(
         r"P(?:(-?\d+)Y)?(?:(-?\d+)M)?(?:(-?\d+)D)?(?:T(?:(-?\d+)H)?(?:(-?\d+)M)?(?:(-?[\d.]+)S)?)?", s
     )
     if iso and s != "P":
         y, mo, d, h, mi, sec = (g or "0" for g in iso.groups())
-        micros = (int(h) * 3600 + int(mi) * 60) * 1_000_000 + round(float(sec) * 1_000_000)
-        return (int(y) * 12 + int(mo), int(d), micros)
+        secs = decimal.Decimal(int(h) * 3600 + int(mi) * 60) + decimal.Decimal(sec)
+        return (int(y) * 12 + int(mo), int(d), _secs(secs))
     parts = re.fullmatch(
         r"(?:(-?\d+) years? ?)?(?:(-?\d+) mons?(?:ths?)? ?)?(?:(-?\d+) days? ?)?(?:(-?\d+):(\d+):([\d.]+))?", s.strip()
     )
     if parts and any(parts.groups()):
         y, mo, d, h, mi, sec = (g or "0" for g in parts.groups())
-        micros = (int(h) * 3600 + int(mi) * 60) * 1_000_000 + round(float(sec) * 1_000_000)
-        return (int(y) * 12 + int(mo), int(d), micros)
+        hours = int(h)
+        secs = decimal.Decimal(abs(hours) * 3600 + int(mi) * 60) + decimal.Decimal(sec)
+        return (int(y) * 12 + int(mo), int(d), _secs(-secs if h.startswith("-") else secs))
     return None
 
 
@@ -182,6 +224,12 @@ def oracle_available() -> bool:
 
 def oracle_rows(url: str, sql: str) -> list[dict]:
     """Rows of `sql` read by python-oracledb (thin): exact Decimals, LOBs read in full (an empty LOB is b''/'', not NULL), session zone UTC."""
+    names, rows = oracle_result(url, sql)
+    return [dict(zip(names, row)) for row in rows]
+
+
+def oracle_result(url: str, sql: str) -> tuple[list[str], list[tuple]]:
+    """(column names, rows) of `sql` read by python-oracledb, as `oracle_rows` reads them — the names survive an empty result."""
     from urllib.parse import unquote, urlparse
 
     import oracledb
@@ -196,24 +244,31 @@ def oracle_rows(url: str, sql: str) -> list[dict]:
         cur.arraysize = 5000
         cur.execute(sql)
         names = [d[0] for d in cur.description]
-        return [
-            {n: (v.read() if isinstance(v, oracledb.LOB) else v) for n, v in zip(names, row)}
-            for row in cur.fetchall()
+        return names, [
+            tuple(v.read() if isinstance(v, oracledb.LOB) else v for v in row) for row in cur.fetchall()
         ]
 
 
-def oracle_table_select(url: str, table: str) -> str:
-    """`SELECT` of every column of `table`, a WITH TIME ZONE column cast AT TIME ZONE 'UTC' (python-oracledb thin drops the offset and refuses region names)."""
+def oracle_table_select(url: str, table: str, renders: dict | None = None) -> str:
+    """`SELECT` of every column of `table` (`OWNER.TABLE` allowed), DATE/TIMESTAMP as ISO text with every fractional digit (python-oracledb would truncate TIMESTAMP(9) to microseconds and refuses BC years), a WITH TIME ZONE column rendered at UTC; `renders` maps a column name to its own `{c}` expression."""
+    owner, name = table.split(".", 1) if "." in table else (None, table)
+    where = f"owner = '{owner.upper()}' AND " if owner else "owner = USER AND "
     cols = oracle_rows(
         url,
-        "SELECT column_name, data_type FROM user_tab_columns "
-        f"WHERE table_name = '{table.upper()}' ORDER BY column_id",
+        "SELECT column_name, data_type FROM all_tab_columns "
+        f"WHERE {where}table_name = '{name.upper()}' ORDER BY column_id",
     )
 
     def one(name: str, typ: str) -> str:
         q = f'"{name}"'
+        if renders and name in renders:
+            return f"{renders[name].replace('{c}', q)} AS {q}"
         if typ.endswith(" WITH TIME ZONE") and "LOCAL" not in typ:
-            return f"CAST({q} AT TIME ZONE 'UTC' AS TIMESTAMP(9)) AS {q}"
+            return f"TO_CHAR({q} AT TIME ZONE 'UTC', 'SYYYY-MM-DD HH24:MI:SS.FF9') AS {q}"
+        if typ.startswith("TIMESTAMP"):
+            return f"TO_CHAR({q}, 'SYYYY-MM-DD HH24:MI:SS.FF9') AS {q}"
+        if typ == "DATE":
+            return f"TO_CHAR({q}, 'SYYYY-MM-DD HH24:MI:SS') AS {q}"
         return q
 
     proj = ", ".join(one(c["COLUMN_NAME"], c["DATA_TYPE"]) for c in cols)
@@ -271,7 +326,9 @@ def mongo_document_columns(ora, source: str, dest: str) -> str:
             proj.append(f'CAST("_id" AS {typ}) AS "_id"')
             continue
         cell = f"document->'{name}'"
-        text = f"""CASE WHEN json_type({cell}) = 'OBJECT' THEN {cell}->>'$."$date"' ELSE document->>'{name}' END"""
+        # A one-key `$`-wrapper (`$date`, `$numberDecimal`, `$numberLong`, `$oid`) is unwrapped; any other value is read as is.
+        wrapped = f"json_type({cell}) = 'OBJECT' AND len(json_keys({cell})) = 1 AND starts_with(json_keys({cell})[1], '$')"
+        text = f"""CASE WHEN {wrapped} THEN {cell}->>('$."' || json_keys({cell})[1] || '"') ELSE document->>'{name}' END"""
         proj.append(f'CAST({text} AS {typ}) AS "{name}"')
     return f"(SELECT {', '.join(proj)} FROM {dest})"
 
@@ -398,6 +455,8 @@ def _self_test() -> None:
     assert canon(t) != canon(t.replace(microsecond=0)), "microseconds must count"
     assert canon(decimal.Decimal("1.50")) == canon(decimal.Decimal("1.5"))
     assert canon(decimal.Decimal("100")) == canon(100)
+    wide = "123456789012345678901234567890.012345678"
+    assert canon(decimal.Decimal(wide + "9")) != canon(decimal.Decimal(wide + "8")), "a 40-digit decimal keeps every digit"
     assert canon('{"b":1,"a":2}') == canon({"a": 2, "b": 1})
     assert canon(dt.time(4, 0)) != canon(dt.timedelta(hours=100)), "a wrapped TIME is a difference"
     assert diff_rows([{"id": 1, "u": u}], [{"id": 1, "u": b"\x00" * 16}]), "garbage bytes are a finding"
@@ -412,6 +471,16 @@ def _self_test() -> None:
     assert canon("-01:30:00") == canon(-dt.timedelta(hours=1, minutes=30))
     assert not diff_rows([{"id": 1, "b": b"\xff"}], [{"id": 1, "b": 255}], bits=frozenset({"b"}))
     assert canon("00:00:00") == canon("PT0S"), "a zero interval read as clock text or as ISO is one value"
+    assert canon("2035-08-07 09:08:07.1234567") != canon(dt.datetime(2035, 8, 7, 9, 8, 7, 123456)), \
+        "a 7th fractional digit the delivery truncated is a difference"
+    assert canon("2035-08-07 09:08:07.123456789") != canon("2035-08-07 09:08:07.123456"), "nanoseconds must count"
+    assert canon("2035-08-07 09:08:07.123456") == canon(t.replace(microsecond=123456)), "text and datetime are one value"
+    assert canon("2035-08-07 11:08:07.5+02") == canon("2035-08-07 09:08:07.500"), "an offset is applied, trailing zeros are not digits"
+    assert canon("09:08:07.1234567") != canon("09:08:07.123456"), "a TIME's 7th digit must count"
+    assert canon("PT0.0000001S") != canon("PT0S"), "a 100ns interval is not zero"
+    assert canon("-0001-06-15 00:00:00") == canon("0001-06-15 (BC) 00:00:00"), "Oracle and DuckDB spell 1 BC differently"
+    assert canon("-0001-06-15T00:00:00") == canon("0001-06-15 (BC) 00:00:00"), "an ISO `T` separator is not a difference"
+    assert canon("-0001-06-15 00:00:00") != canon("0001-06-15 00:00:00"), "BC is not AD"
     assert canon("P1D") != canon("24:00:00"), "one day and 24 hours differ in PostgreSQL interval semantics"
     good = {"run_ids": ["r"], "source": 3, "manifest": 3, "footers": 3, "metrics": 3, "file_log": 3,
             "loaded": 3, "warehouse": 3, "undeclared": [], "missing": []}

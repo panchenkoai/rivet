@@ -59,7 +59,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2.87.12
         with:
-          tool: cargo-nextest
+          # uv runs the rig's default oracle (dev/release_oracle/rig_oracle.py, pinned by uv.lock).
+          tool: cargo-nextest,uv
 
       - name: Start services
         # `proxysql` lives in the same `pool` docker-compose profile as
@@ -270,7 +271,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2.87.12
         with:
-          tool: cargo-nextest
+          # uv runs the rig's default oracle (dev/release_oracle/rig_oracle.py, pinned by uv.lock).
+          tool: cargo-nextest,uv
 
       - name: Start Mongo stack
         # minio + fake-gcs ride along for the engine-agnostic chunking_stand
@@ -359,13 +361,21 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2.87.12
         with:
-          tool: cargo-nextest
+          # uv runs the rig's default oracle (dev/release_oracle/rig_oracle.py, pinned by uv.lock).
+          tool: cargo-nextest,uv
       - name: Start the CDC stack at the scouted tag
         run: |
           export ${{ matrix.env }}=${{ matrix.tag }}
           docker compose --profile cdc up -d mysql-cdc postgres-cdc
-      - name: Conformance subset
+      - name: MySQL 5.7 is refused (no binlog_row_metadata), the expected outcome
+        if: matrix.engine == 'mysql' && matrix.tag == '5.7'
         run: |
+          cargo build --bin rivet
+          dev/cdc/scout_mysql57_refusal.sh target/debug/rivet
+      - name: Conformance subset
+        if: matrix.engine != 'mysql' || matrix.tag != '5.7'
+        run: |
+          set -o pipefail  # the default `bash -e` has none: `| tail -20` would hide a red subset
           if [ "${{ matrix.engine }}" = "mysql" ]; then
             FILTER="live_cdc::cdc_"
           else
@@ -392,7 +402,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2.87.12
         with:
-          tool: cargo-nextest
+          # uv runs the rig's default oracle (dev/release_oracle/rig_oracle.py, pinned by uv.lock).
+          tool: cargo-nextest,uv
       - name: Download the previous release binary
         # Downloaded, never rebuilt: the release profile is fat-LTO, and the
         # published asset is what users actually run.
@@ -447,7 +458,8 @@ jobs:
         if: steps.day.outputs.sunday == 'yes'
       - uses: taiki-e/install-action@v2.87.12
         with:
-          tool: cargo-nextest
+          # uv runs the rig's default oracle (dev/release_oracle/rig_oracle.py, pinned by uv.lock).
+          tool: cargo-nextest,uv
       - name: Start CDC stack
         if: steps.day.outputs.sunday == 'yes'
         run: docker compose --profile cdc up -d mysql-cdc
