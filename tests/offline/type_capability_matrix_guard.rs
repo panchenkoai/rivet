@@ -99,10 +99,11 @@ fn every_source_engine_has_one_rows_list() {
     for engine in &engines {
         let mut sections = keys(&doc["engines"], engine);
         sections.remove("setup");
+        sections.remove("renders");
         assert_eq!(
             sections,
             BTreeSet::from(["rows".to_string()]),
-            "engines.{engine} must have exactly `rows:` (plus an optional setup:)"
+            "engines.{engine} must have exactly `rows:` (plus an optional setup: and renders:)"
         );
     }
 }
@@ -135,7 +136,18 @@ fn row_violations(doc: &Value) -> Vec<String> {
     };
     let mut bad = Vec::new();
     for engine in keys(doc, "engines") {
-        let mut seen = BTreeSet::new();
+        let renders = &doc["engines"][engine.as_str()]["renders"];
+        for (d, render) in renders.as_mapping().into_iter().flatten() {
+            let d = d.as_str().unwrap_or("");
+            let at = format!("engines.{engine}.renders[{d}]");
+            if !valid_delivery(d) {
+                bad.push(format!(
+                    "{at}: `{d}` is no Arrow type, canonical extension or TextForm label"
+                ));
+            }
+            bad.extend(render_violations(&engine, &at, render));
+        }
+        let (mut seen, mut arrow_rows) = (BTreeSet::new(), Vec::new());
         for (native, r) in rows(doc, &engine) {
             let at = format!("engines.{engine}.rows[{native}]");
             if !seen.insert(native.clone()) {
@@ -241,23 +253,44 @@ fn row_violations(doc: &Value) -> Vec<String> {
                      not an ADR target"
                 ));
             }
-            for render in ["render", "today_render"].map(|k| r[k].as_mapping()) {
-                for (k, v) in render.into_iter().flatten() {
-                    let (k, v) = (k.as_str().unwrap_or(""), v.as_str().unwrap_or(""));
-                    let known = match k {
-                        "source" => engine == "oracle",
-                        "server" => engine != "oracle",
-                        "duck" => true,
-                        "canon" => CANONS.contains(&v),
-                        _ => false,
-                    };
-                    if !known {
-                        bad.push(format!(
-                            "{at}: render `{k}: {v}` is not one the parity driver reads"
-                        ));
-                    }
-                }
+            for key in ["render", "today_render"] {
+                bad.extend(render_violations(&engine, &at, &r[key]));
             }
+            let duck = if r["today_render"].is_null() {
+                r["render"]["duck"].as_str().or(renders[d]["duck"].as_str())
+            } else {
+                r["today_render"]["duck"].as_str()
+            };
+            if duck == Some("arrow") {
+                arrow_rows.push(native);
+            }
+        }
+        if arrow_rows.len() > usize::from(engine == "postgres") {
+            bad.push(format!(
+                "engines.{engine}: `duck: arrow` (Arrow's display instead of DuckDB) is for one \
+                 postgres row at most, here {arrow_rows:?}"
+            ));
+        }
+    }
+    bad
+}
+
+/// Every render field in `render` the parity driver does not read for `engine`.
+fn render_violations(engine: &str, at: &str, render: &Value) -> Vec<String> {
+    let mut bad = Vec::new();
+    for (k, v) in render.as_mapping().into_iter().flatten() {
+        let (k, v) = (k.as_str().unwrap_or(""), v.as_str().unwrap_or(""));
+        let known = match k {
+            "source" => engine == "oracle",
+            "server" => engine != "oracle",
+            "duck" => true,
+            "canon" => CANONS.contains(&v),
+            _ => false,
+        };
+        if !known {
+            bad.push(format!(
+                "{at}: render `{k}: {v}` is not one the parity driver reads"
+            ));
         }
     }
     bad
@@ -481,4 +514,18 @@ fn the_oracle_cdc_type_table_is_covered_by_ledger_rows() {
         missing.is_empty(),
         "live_cdc_oracledb.rs::type_table uses types with no oracle ledger row: {missing:?}"
     );
+}
+
+#[test]
+fn duck_arrow_is_one_postgres_row_at_most() {
+    let arrow = || -> Value { serde_yaml_ng::from_str("{duck: arrow}").unwrap() };
+    let mut doc = ledger();
+    row_mut(&mut doc, "mysql", "DOUBLE").insert("render".into(), arrow());
+    row_mut(&mut doc, "postgres", "NUMERIC(18,2)").insert("render".into(), arrow());
+    let bad: Vec<String> = row_violations(&doc)
+        .into_iter()
+        .filter(|b| b.contains("duck: arrow"))
+        .collect();
+    assert_eq!(bad.len(), 2, "{bad:?}");
+    assert!(bad[0].starts_with("engines.mysql:") && bad[1].starts_with("engines.postgres:"));
 }

@@ -13,7 +13,9 @@
 #                       ADR target, never a refusal
 #          batch_refuses  on a known_defect row: today the batch run refuses the column by
 #                       name (the driver fails once it stops refusing)
-#          render       optional, `{c}` standing for the column; no render may narrow a value:
+#          render       optional, `{c}` standing for the column, over the engine's `renders:`
+#                       entry for the row's delivery (what the delivery determines; a row
+#                       names only what its native type adds); no render may narrow a value:
 #                         duck    the DuckDB projection applied alike to every stage DuckDB
 #                                 reads (`arrow` for Decimal256, which DuckDB reads as DOUBLE,
 #                                 CP11: Arrow's display grades the parts instead; postgres only)
@@ -39,6 +41,10 @@
 #                         defect  like known_defect, for the ClickHouse stage alone
 #                         defect_samples  like defect_samples, for the ClickHouse stage alone
 #          setup:       engine-level DDL run before the table (types the rows name).
+#          renders:     engine-level, delivery -> render, merged under every row's own render.
+#          dev/release_oracle/rig_oracle.py reads the same rows: render (after renders:) and
+#          today_render (server, source, duck, canon), known_defect, defect_samples and
+#          clickhouse (type, defect, defect_samples).
 #          tests/live/live_cdc_type_parity.rs builds one table per engine from these rows;
 #          one DuckDB session grades the source, the batch parts, the CDC snapshot, stream and
 #          final image, both state DBs and the ClickHouse view `rivet load` builds (PostgreSQL,
@@ -152,13 +158,20 @@ engines:
     setup:
       - "DO $$ BEGIN CREATE TYPE rivet_status AS ENUM ('active','inactive','pending'); EXCEPTION WHEN duplicate_object THEN NULL; END $$"
       - "DO $$ BEGIN CREATE TYPE rivet_status_typed AS ENUM ('active','shipped','off'); EXCEPTION WHEN duplicate_object THEN NULL; END $$"
+    renders:
+      "Binary": {duck: "lower(hex({c}))"}
+      "iso8601_duration": {canon: "interval"}
+      "List(Utf8)": {duck: "CAST(to_json({c}) AS VARCHAR)"}
+      "List(Int32)": {duck: "CAST(to_json({c}) AS VARCHAR)"}
+      "List(Float64)": {duck: "CAST(to_json({c}) AS VARCHAR)"}
+      "Decimal256(60, 10)": {duck: "arrow"}
     rows:
       - {native_type: "TEXT", sample: ["'üñíçødé ''q'''", "'hello'"], delivery: "Utf8", clickhouse: {type: "Nullable(String)"}}
       - {native_type: "NUMERIC(18,2)", sample: ["999999999999.99"], delivery: "Decimal128(18, 2)", clickhouse: {type: "Nullable(Decimal(18, 2))"}}
       - {native_type: "NUMERIC(18,4)", sample: ["12345.6789"], delivery: "Decimal128(18, 4)", clickhouse: {type: "Nullable(Decimal(18, 4))"}}
       - {native_type: "TIMESTAMP", sample: ["'2035-08-07 09:08:07.987654'"], delivery: "Timestamp(µs)", clickhouse: {type: "Nullable(DateTime64(6))"}}
       - {native_type: "TIMESTAMPTZ", sample: ["'2019-02-03 08:07:06.554433+05'"], delivery: "Timestamp(µs, \"UTC\")", clickhouse: {type: "Nullable(DateTime64(6, 'UTC'))"}}
-      - {native_type: "BYTEA", sample: ["'\\x00ff01'::bytea", "'\\xDEADBEEF'"], delivery: "Binary", render: {duck: "lower(hex({c}))"}, clickhouse: {type: "Nullable(String)"}}
+      - {native_type: "BYTEA", sample: ["'\\x00ff01'::bytea", "'\\xDEADBEEF'"], delivery: "Binary", clickhouse: {type: "Nullable(String)"}}
       - {native_type: "UUID", sample: ["'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380011'", "'12345678-1234-1234-1234-123456789012'"], delivery: "arrow.uuid", clickhouse: {type: "Nullable(UUID)", today: "Nullable(FixedString(16))", defect: "loads as FixedString(16) bytes where ClickHouse has a native UUID (ADR-0038 CP1, ClickHouse load step)"}}
       - {native_type: "JSONB", sample: ["'{\"n\":1}'::jsonb", "'{\"k\": \"v\", \"n\": 42}'"], delivery: "arrow.json", clickhouse: {type: "Nullable(String)"}}
       - {native_type: "BOOLEAN", sample: ["TRUE", "true"], delivery: "Boolean", clickhouse: {type: "Nullable(Bool)"}}
@@ -167,17 +180,17 @@ engines:
       - {native_type: "DOUBLE PRECISION", sample: ["2.5", "1.5"], delivery: "Float64", clickhouse: {type: "Nullable(Float64)"}}
       - {native_type: "DATE", sample: ["'2024-03-15'"], delivery: "Date32", clickhouse: {type: "Nullable(Date32)"}}
       - {native_type: "TIME", sample: ["'14:30:00.123456'"], delivery: "Time64(µs)", clickhouse: {type: "Nullable(Decimal(18, 6))"}}
-      - {native_type: "INTERVAL", sample: ["INTERVAL '1 year 2 mons 3 days'"], delivery: "iso8601_duration", today_delivery: "Utf8", render: {canon: "interval"}, known_defect: "ISO 8601 text without the rivet.text_form label (ADR-0038 CP2/CP5, PostgreSQL engine step)", clickhouse: {type: "Nullable(String)", today: "Nullable(String)"}}
+      - {native_type: "INTERVAL", sample: ["INTERVAL '1 year 2 mons 3 days'"], delivery: "iso8601_duration", today_delivery: "Utf8", known_defect: "ISO 8601 text without the rivet.text_form label (ADR-0038 CP2/CP5, PostgreSQL engine step)", clickhouse: {type: "Nullable(String)", today: "Nullable(String)"}}
       - {native_type: "rivet_status", sample: ["'active'"], delivery: "Utf8", clickhouse: {type: "Nullable(String)"}}
       - {native_type: "rivet_status_typed", sample: ["'off'"], delivery: "Utf8", clickhouse: {type: "Nullable(String)"}}
       - {native_type: "JSON", sample: ["'{\"k\": [1, 2]}'::json"], delivery: "arrow.json", clickhouse: {type: "Nullable(String)"}}
       - {native_type: "CHAR(8)", sample: ["'pad'"], delivery: "Utf8", clickhouse: {type: "Nullable(String)"}}
       - {native_type: "VARCHAR(50)", sample: ["'plain varchar'"], delivery: "Utf8", clickhouse: {type: "Nullable(String)"}}
       - {native_type: "REAL", sample: ["3.14"], delivery: "Float32", clickhouse: {type: "Nullable(Float32)"}}
-      - {native_type: "TEXT[]", sample: ["ARRAY['with,comma', 'he said \"hi\"', NULL]", "ARRAY[]::text[]"], delivery: "List(Utf8)", render: {duck: "CAST(to_json({c}) AS VARCHAR)"}, clickhouse: {type: "Array(Nullable(String))", today: "Array(Nullable(String))", defect: "a NULL array loads as [] (ClickHouse arrays cannot be NULL), so NULL and empty merge (ADR-0038 CP1, ClickHouse load step)", defect_samples: ["NULL"]}}
-      - {native_type: "INTEGER[]", sample: ["ARRAY[1, NULL, 3]", "'{}'"], delivery: "List(Int32)", render: {duck: "CAST(to_json({c}) AS VARCHAR)"}, clickhouse: {type: "Array(Nullable(Int32))", today: "Array(Nullable(Int32))", defect: "a NULL array loads as [] (ClickHouse arrays cannot be NULL), so NULL and empty merge (ADR-0038 CP1, ClickHouse load step)", defect_samples: ["NULL"]}}
-      - {native_type: "DOUBLE PRECISION[]", sample: ["ARRAY[2.5, -0.5]"], delivery: "List(Float64)", render: {duck: "CAST(to_json({c}) AS VARCHAR)"}, clickhouse: {type: "Array(Nullable(Float64))", today: "Array(Nullable(Float64))", defect: "a NULL array loads as [] (ClickHouse arrays cannot be NULL), so NULL and empty merge (ADR-0038 CP1, ClickHouse load step)", defect_samples: ["NULL"]}}
-      - {native_type: "NUMERIC(60,10)", sample: ["123456789012345678901234567890.0123456789"], delivery: "Decimal256(60, 10)", render: {duck: "arrow"}, clickhouse: {type: "Nullable(Decimal(60, 10))"}}
+      - {native_type: "TEXT[]", sample: ["ARRAY['with,comma', 'he said \"hi\"', NULL]", "ARRAY[]::text[]"], delivery: "List(Utf8)", clickhouse: {type: "Array(Nullable(String))", today: "Array(Nullable(String))", defect: "a NULL array loads as [] (ClickHouse arrays cannot be NULL), so NULL and empty merge (ADR-0038 CP1, ClickHouse load step)", defect_samples: ["NULL"]}}
+      - {native_type: "INTEGER[]", sample: ["ARRAY[1, NULL, 3]", "'{}'"], delivery: "List(Int32)", clickhouse: {type: "Array(Nullable(Int32))", today: "Array(Nullable(Int32))", defect: "a NULL array loads as [] (ClickHouse arrays cannot be NULL), so NULL and empty merge (ADR-0038 CP1, ClickHouse load step)", defect_samples: ["NULL"]}}
+      - {native_type: "DOUBLE PRECISION[]", sample: ["ARRAY[2.5, -0.5]"], delivery: "List(Float64)", clickhouse: {type: "Array(Nullable(Float64))", today: "Array(Nullable(Float64))", defect: "a NULL array loads as [] (ClickHouse arrays cannot be NULL), so NULL and empty merge (ADR-0038 CP1, ClickHouse load step)", defect_samples: ["NULL"]}}
+      - {native_type: "NUMERIC(60,10)", sample: ["123456789012345678901234567890.0123456789"], delivery: "Decimal256(60, 10)", clickhouse: {type: "Nullable(Decimal(60, 10))"}}
       - {native_type: "NUMERIC", sample: ["1.50", "-0.000001234", "123456789012345678901234567890.123456789012", "'NaN'"], delivery: "decimal_plain", today_delivery: "server_text", known_defect: "batch refuses the column; CDC carries the server's own text labelled server_text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
       - {native_type: "MONEY", sample: ["'12.34'"], delivery: "server_text", today_delivery: "server_text", known_defect: "batch refuses the column; CDC carries the server's own text labelled server_text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
       - {native_type: "INET", sample: ["'192.168.0.1'"], delivery: "inet_text", today_delivery: "server_text", known_defect: "batch refuses the column; CDC carries the server's own text labelled server_text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
@@ -190,6 +203,9 @@ engines:
       - {native_type: "BYTEA[]", sample: ["ARRAY['\\xDEADBEEF'::bytea]"], delivery: "List(Binary)", today_delivery: "server_text", known_defect: "batch refuses the column; CDC carries the server's own text labelled server_text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
       - {native_type: "NUMERIC[]", sample: ["ARRAY[1.5]::numeric[]"], delivery: "server_text", today_delivery: "server_text", known_defect: "batch refuses the column; CDC carries the server's own text labelled server_text (ADR-0038 CP1/CP5, PostgreSQL engine step)", batch_refuses: true}
   mysql:
+    renders:
+      "Binary": {duck: "lower(hex({c}))"}
+      "Float32": {canon: "float32"}
     rows:
       - {native_type: "VARCHAR(200)", sample: ["'üñíçødé'"], delivery: "Utf8", clickhouse: {type: "Nullable(String)"}}
       - {native_type: "VARCHAR(20)", sample: ["'hello'"], delivery: "Utf8", clickhouse: {type: "Nullable(String)"}}
@@ -197,7 +213,7 @@ engines:
       - {native_type: "DECIMAL(18,4)", sample: ["12345.6789"], delivery: "Decimal128(18, 4)", clickhouse: {type: "Nullable(Decimal(18, 4))"}}
       - {native_type: "DATETIME(6)", sample: ["'2035-08-07 09:08:07.987654'"], delivery: "Timestamp(µs)", clickhouse: {type: "Nullable(DateTime64(6))"}}
       - {native_type: "TIMESTAMP(6) NULL", sample: ["'2035-08-07 09:08:07.987654'"], delivery: "Timestamp(µs, \"UTC\")", render: {duck: "strftime({c}, '%Y-%m-%d %H:%M:%S.%f')"}, clickhouse: {type: "Nullable(DateTime64(6, 'UTC'))"}}
-      - {native_type: "BINARY(4)", sample: ["UNHEX('00000000')"], delivery: "Binary", render: {duck: "lower(hex({c}))"}, clickhouse: {type: "Nullable(String)"}}
+      - {native_type: "BINARY(4)", sample: ["UNHEX('00000000')"], delivery: "Binary", clickhouse: {type: "Nullable(String)"}}
       - {native_type: "JSON", sample: ["JSON_OBJECT('tier','gold','n',1)", "'{\"k\": \"v\", \"n\": 42}'"], delivery: "arrow.json", clickhouse: {type: "Nullable(String)"}}
       - {native_type: "BOOLEAN", sample: ["TRUE", "1", "5", "-1"], delivery: "Int8", today_delivery: "Boolean", render: {duck: "CAST(CAST({c} AS TINYINT) AS VARCHAR)"}, known_defect: "TINYINT(1) delivered as Boolean: 5 and -1 arrive as true in batch, CDC and ClickHouse, a silent loss; exact native is Int8 (ADR-0038 CP1, MySQL engine step)", defect_samples: ["5", "-1"], clickhouse: {type: "Nullable(Int8)", today: "Nullable(Bool)"}}
       - {native_type: "BIT(1)", sample: ["b'1'"], delivery: "Boolean", clickhouse: {type: "Nullable(Bool)"}}
@@ -208,14 +224,14 @@ engines:
       - {native_type: "YEAR", sample: ["2024"], delivery: "Int16", clickhouse: {type: "Nullable(Int16)"}}
       - {native_type: "ENUM('a','b','c')", sample: ["'b'"], delivery: "Utf8", clickhouse: {type: "Nullable(String)"}}
       - {native_type: "ENUM('active','shipped','off')", sample: ["'off'"], delivery: "Utf8", clickhouse: {type: "Nullable(String)"}}
-      - {native_type: "VARBINARY(4)", sample: ["0xDEADBEEF"], delivery: "Binary", render: {duck: "lower(hex({c}))"}, clickhouse: {type: "Nullable(String)"}}
-      - {native_type: "BLOB", sample: ["0x0102"], delivery: "Binary", render: {duck: "lower(hex({c}))"}, clickhouse: {type: "Nullable(String)"}}
+      - {native_type: "VARBINARY(4)", sample: ["0xDEADBEEF"], delivery: "Binary", clickhouse: {type: "Nullable(String)"}}
+      - {native_type: "BLOB", sample: ["0x0102"], delivery: "Binary", clickhouse: {type: "Nullable(String)"}}
       - {native_type: "SMALLINT", sample: ["-32768"], delivery: "Int16", clickhouse: {type: "Nullable(Int16)"}}
       - {native_type: "MEDIUMINT", sample: ["-8388608"], delivery: "Int32", clickhouse: {type: "Nullable(Int32)"}}
       - {native_type: "INT", sample: ["-2147483648"], delivery: "Int32", clickhouse: {type: "Nullable(Int32)"}}
       - {native_type: "INT UNSIGNED", sample: ["4294967295"], delivery: "Int64", clickhouse: {type: "Nullable(Int64)"}}
       - {native_type: "BIGINT UNSIGNED", sample: ["18446744073709551615", "18000000000000000000"], delivery: "UInt64", clickhouse: {type: "Nullable(UInt64)"}}
-      - {native_type: "FLOAT", sample: ["1.5"], delivery: "Float32", render: {canon: "float32"}, clickhouse: {type: "Nullable(Float32)"}}
+      - {native_type: "FLOAT", sample: ["1.5"], delivery: "Float32", clickhouse: {type: "Nullable(Float32)"}}
       - {native_type: "DOUBLE", sample: ["-2.25", "1.5"], delivery: "Float64", clickhouse: {type: "Nullable(Float64)"}}
       - {native_type: "CHAR(8)", sample: ["'pad'"], delivery: "Utf8", clickhouse: {type: "Nullable(String)"}}
       - {native_type: "CHAR(36)", sample: ["'12345678-1234-1234-1234-123456789012'"], delivery: "Utf8", clickhouse: {type: "Nullable(String)"}}
@@ -223,44 +239,59 @@ engines:
       - {native_type: "SET('x','y','z')", sample: ["'x,z'"], delivery: "Utf8", clickhouse: {type: "Nullable(String)"}}
       - {native_type: "SET('a','b','c')", sample: ["'a,b'"], delivery: "Utf8", clickhouse: {type: "Nullable(String)"}}
   mssql:
+    renders:
+      "Binary": {duck: "lower(hex({c}))"}
+      "Float64": {canon: "float64"}
+      "Timestamp(ns)": {canon: "timestamp"}
     rows:
       - {native_type: "BIGINT", sample: ["9000000000000"], delivery: "Int64", clickhouse: {type: "Nullable(Int64)"}}
       - {native_type: "DECIMAL(18,4)", sample: ["12345.6789"], delivery: "Decimal128(18, 4)", clickhouse: {type: "Nullable(Decimal(18, 4))"}}
       - {native_type: "BIT", sample: ["1"], delivery: "Boolean", clickhouse: {type: "Nullable(Bool)"}}
       - {native_type: "VARCHAR(50)", sample: ["'hello'"], delivery: "Utf8", clickhouse: {type: "Nullable(String)"}}
       - {native_type: "NVARCHAR(50)", sample: ["N'cafe-unicode'"], delivery: "Utf8", clickhouse: {type: "Nullable(String)"}}
-      - {native_type: "DATETIME2", sample: ["'2026-06-23 10:00:00.1234567'"], delivery: "Timestamp(ns)", today_delivery: "Timestamp(µs)", render: {canon: "timestamp"}, today_render: {server: "LEFT(CONVERT(varchar(max), {c}, 121), 26)", canon: "timestamp"}, known_defect: "delivered at microseconds, the 100 ns digit dropped; exact native is Timestamp(ns) (ADR-0038 CP1, SQL Server engine step)", clickhouse: {type: "Nullable(DateTime64(7))", today: "Nullable(DateTime64(6))"}}
+      - {native_type: "DATETIME2", sample: ["'2026-06-23 10:00:00.1234567'"], delivery: "Timestamp(ns)", today_delivery: "Timestamp(µs)", today_render: {server: "LEFT(CONVERT(varchar(max), {c}, 121), 26)", canon: "timestamp"}, known_defect: "delivered at microseconds, the 100 ns digit dropped; exact native is Timestamp(ns) (ADR-0038 CP1, SQL Server engine step)", clickhouse: {type: "Nullable(DateTime64(7))", today: "Nullable(DateTime64(6))"}}
       - {native_type: "DATETIMEOFFSET", sample: ["'2026-06-23 10:00:00 +05:30'"], delivery: "Timestamp(ns, \"UTC\")", today_delivery: "Timestamp(µs, \"UTC\")", render: {server: "CONVERT(varchar(max), CAST(SWITCHOFFSET({c}, '+00:00') AS DATETIME2(7)), 121)", canon: "timestamp"}, today_render: {server: "LEFT(CONVERT(varchar(max), CAST(SWITCHOFFSET({c}, '+00:00') AS DATETIME2(7)), 121), 26)", canon: "timestamp"}, known_defect: "delivered at microseconds; exact native is Timestamp(ns, UTC) (ADR-0038 CP1, SQL Server engine step)", clickhouse: {type: "Nullable(DateTime64(7, 'UTC'))", today: "Nullable(DateTime64(6, 'UTC'))"}}
       - {native_type: "DATE", sample: ["'2026-06-23'"], delivery: "Date32", clickhouse: {type: "Nullable(Date32)"}}
       - {native_type: "TIME", sample: ["'13:45:30.123456'"], delivery: "Time64(ns)", today_delivery: "Time64(µs)", render: {server: "CONVERT(varchar(max), {c}, 114)", canon: "timestamp"}, known_defect: "delivered at microseconds; exact native is Time64(ns) (ADR-0038 CP1, SQL Server engine step)", clickhouse: {type: "Nullable(Decimal(18, 7))", today: "Nullable(Decimal(18, 6))"}}
       - {native_type: "UNIQUEIDENTIFIER", sample: ["'12345678-1234-1234-1234-123456789012'"], delivery: "arrow.uuid", clickhouse: {type: "Nullable(UUID)", today: "Nullable(FixedString(16))", defect: "loads as FixedString(16) bytes where ClickHouse has a native UUID (ADR-0038 CP1, ClickHouse load step)"}}
-      - {native_type: "VARBINARY(16)", sample: ["0xDEADBEEF"], delivery: "Binary", render: {duck: "lower(hex({c}))"}, clickhouse: {type: "Nullable(String)"}}
+      - {native_type: "VARBINARY(16)", sample: ["0xDEADBEEF"], delivery: "Binary", clickhouse: {type: "Nullable(String)"}}
       - {native_type: "CHAR(8)", sample: ["'pad'"], delivery: "Utf8", clickhouse: {type: "Nullable(String)"}}
       - {native_type: "NCHAR(8)", sample: ["N'ñpad'"], delivery: "Utf8", render: {server: "CAST({c} AS NVARCHAR(8))"}, clickhouse: {type: "Nullable(String)"}}
       - {native_type: "DATETIME", sample: ["'2026-01-15T13:45:30.127'"], delivery: "Timestamp(µs)", render: {server: "CONVERT(varchar(max), CAST({c} AS DATETIME2(7)), 121)", canon: "round_micros"}, clickhouse: {type: "Nullable(DateTime64(6))"}}
       - {native_type: "SMALLDATETIME", sample: ["'2026-01-15T13:45:00'"], delivery: "Timestamp(µs)", clickhouse: {type: "Nullable(DateTime64(6))"}}
-      - {native_type: "BINARY(8)", sample: ["0xAB"], delivery: "Binary", render: {duck: "lower(hex({c}))"}, clickhouse: {type: "Nullable(String)"}}
+      - {native_type: "BINARY(8)", sample: ["0xAB"], delivery: "Binary", clickhouse: {type: "Nullable(String)"}}
       - {native_type: "NUMERIC(10,3)", sample: ["12.345"], delivery: "Decimal128(10, 3)", clickhouse: {type: "Nullable(Decimal(10, 3))"}}
       - {native_type: "MONEY", sample: ["123.4567"], delivery: "Decimal128(19, 4)", clickhouse: {type: "Nullable(Decimal(19, 4))"}}
       - {native_type: "SMALLMONEY", sample: ["-0.01"], delivery: "Decimal128(19, 4)", clickhouse: {type: "Nullable(Decimal(19, 4))"}}
-      - {native_type: "VARBINARY(4)", sample: ["0xDEADBEEF"], delivery: "Binary", render: {duck: "lower(hex({c}))"}, clickhouse: {type: "Nullable(String)"}}
-      - {native_type: "FLOAT", sample: ["1.5"], delivery: "Float64", render: {canon: "float64"}, clickhouse: {type: "Nullable(Float64)"}}
+      - {native_type: "VARBINARY(4)", sample: ["0xDEADBEEF"], delivery: "Binary", clickhouse: {type: "Nullable(String)"}}
+      - {native_type: "FLOAT", sample: ["1.5"], delivery: "Float64", clickhouse: {type: "Nullable(Float64)"}}
   oracle:
+    renders:
+      "Binary": {source: "RAWTOHEX({c})", duck: "upper(hex({c}))"}
+      "decimal_plain": {source: "TO_CHAR({c}, 'TM9')", canon: "number"}
+      "Decimal128(38, 10)": {source: "TO_CHAR({c}, 'TM9')", canon: "number"}
+      "Int32": {source: "TO_CHAR({c}, 'TM9')", canon: "number"}
+      "Int64": {source: "TO_CHAR({c}, 'TM9')", canon: "number"}
+      "Float32": {canon: "float32"}
+      "Float64": {canon: "float64"}
+      "Timestamp(µs)": {source: "TO_CHAR(CAST({c} AS TIMESTAMP), 'SYYYY-MM-DD\"T\"HH24:MI:SS.FF6')", duck: "strftime({c}, '%Y-%m-%dT%H:%M:%S.%f')", canon: "timestamp"}
+      "Timestamp(µs, \"UTC\")": {source: "TO_CHAR(SYS_EXTRACT_UTC({c}), 'SYYYY-MM-DD\"T\"HH24:MI:SS.FF6')", duck: "strftime({c}, '%Y-%m-%dT%H:%M:%S.%f')", canon: "timestamp"}
+      "Timestamp(ns)": {source: "TO_CHAR({c}, 'SYYYY-MM-DD\"T\"HH24:MI:SS.FF9')", duck: "strftime({c}, '%Y-%m-%dT%H:%M:%S.%n')", canon: "timestamp"}
     rows:
-      - {native_type: "NUMBER", sample: ["123.45", "12345678901234567890.123456789", "1E125", "-0.000000000000000000000000000000000000001"], delivery: "decimal_plain", today_delivery: "Utf8", render: {source: "TO_CHAR({c}, 'TM9')", canon: "number"}, known_defect: "plain decimal text without the rivet.text_form label (ADR-0038 CP5/CP11, Oracle engine step)"}
-      - {native_type: "NUMBER(38,10)", sample: ["1.5", "1234567890123456789012345678.0123456789", "0.5"], delivery: "Decimal128(38, 10)", render: {source: "TO_CHAR({c}, 'TM9')", canon: "number"}}
-      - {native_type: "NUMBER(9)", sample: ["42", "-999999999", "0"], delivery: "Int32", render: {source: "TO_CHAR({c}, 'TM9')", canon: "number"}}
-      - {native_type: "NUMBER(18)", sample: ["9007199254740993", "-999999999999999999", "0"], delivery: "Int64", render: {source: "TO_CHAR({c}, 'TM9')", canon: "number"}}
-      - {native_type: "BINARY_FLOAT", sample: ["1.5", "BINARY_FLOAT_NAN", "-0.1"], delivery: "Float32", render: {canon: "float32"}}
-      - {native_type: "BINARY_DOUBLE", sample: ["2.25", "BINARY_DOUBLE_INFINITY", "0.1"], delivery: "Float64", render: {canon: "float64"}}
-      - {native_type: "DATE", sample: ["TO_DATE('2024-02-29 13:14:15','YYYY-MM-DD HH24:MI:SS')", "TO_DATE('0001-01-01','YYYY-MM-DD')"], delivery: "Timestamp(µs)", render: {source: "TO_CHAR(CAST({c} AS TIMESTAMP), 'SYYYY-MM-DD\"T\"HH24:MI:SS.FF6')", duck: "strftime({c}, '%Y-%m-%dT%H:%M:%S.%f')", canon: "timestamp"}}
-      - {native_type: "TIMESTAMP(6)", sample: ["TO_TIMESTAMP('2024-02-29 13:14:15.123456','YYYY-MM-DD HH24:MI:SS.FF')", "TO_TIMESTAMP('9999-12-31 23:59:59.999999','YYYY-MM-DD HH24:MI:SS.FF')"], delivery: "Timestamp(µs)", render: {source: "TO_CHAR({c}, 'SYYYY-MM-DD\"T\"HH24:MI:SS.FF6')", duck: "strftime({c}, '%Y-%m-%dT%H:%M:%S.%f')", canon: "timestamp"}}
-      - {native_type: "TIMESTAMP(9)", sample: ["TO_TIMESTAMP('2024-02-29 13:14:15.123456789','YYYY-MM-DD HH24:MI:SS.FF')"], delivery: "Timestamp(ns)", today_delivery: "Timestamp(µs)", render: {source: "TO_CHAR({c}, 'SYYYY-MM-DD\"T\"HH24:MI:SS.FF9')", duck: "strftime({c}, '%Y-%m-%dT%H:%M:%S.%n')", canon: "timestamp"}, today_render: {source: "SUBSTR(TO_CHAR({c}, 'SYYYY-MM-DD\"T\"HH24:MI:SS.FF9'), 1, 27)", duck: "strftime({c}, '%Y-%m-%dT%H:%M:%S.%f')", canon: "timestamp"}, known_defect: "delivered at microseconds, the sub-microsecond digits dropped; exact native is Timestamp(ns) (ADR-0038 CP1, Oracle engine step)"}
-      - {native_type: "TIMESTAMP(6) WITH TIME ZONE", sample: ["TO_TIMESTAMP_TZ('2024-02-29 10:00:00.5 +02:00','YYYY-MM-DD HH24:MI:SS.FF TZH:TZM')", "TO_TIMESTAMP_TZ('2024-07-01 10:00:00 Europe/Berlin','YYYY-MM-DD HH24:MI:SS TZR')"], delivery: "Timestamp(µs, \"UTC\")", render: {source: "TO_CHAR(SYS_EXTRACT_UTC({c}), 'SYYYY-MM-DD\"T\"HH24:MI:SS.FF6')", duck: "strftime({c}, '%Y-%m-%dT%H:%M:%S.%f')", canon: "timestamp"}}
-      - {native_type: "TIMESTAMP(6) WITH LOCAL TIME ZONE", sample: ["TO_TIMESTAMP_TZ('2024-02-29 10:00:00 -03:00','YYYY-MM-DD HH24:MI:SS TZH:TZM')"], delivery: "Timestamp(µs, \"UTC\")", render: {source: "TO_CHAR(SYS_EXTRACT_UTC({c}), 'SYYYY-MM-DD\"T\"HH24:MI:SS.FF6')", duck: "strftime({c}, '%Y-%m-%dT%H:%M:%S.%f')", canon: "timestamp"}}
+      - {native_type: "NUMBER", sample: ["123.45", "12345678901234567890.123456789", "1E125", "-0.000000000000000000000000000000000000001"], delivery: "decimal_plain", today_delivery: "Utf8", known_defect: "plain decimal text without the rivet.text_form label (ADR-0038 CP5/CP11, Oracle engine step)"}
+      - {native_type: "NUMBER(38,10)", sample: ["1.5", "1234567890123456789012345678.0123456789", "0.5"], delivery: "Decimal128(38, 10)"}
+      - {native_type: "NUMBER(9)", sample: ["42", "-999999999", "0"], delivery: "Int32"}
+      - {native_type: "NUMBER(18)", sample: ["9007199254740993", "-999999999999999999", "0"], delivery: "Int64"}
+      - {native_type: "BINARY_FLOAT", sample: ["1.5", "BINARY_FLOAT_NAN", "-0.1"], delivery: "Float32"}
+      - {native_type: "BINARY_DOUBLE", sample: ["2.25", "BINARY_DOUBLE_INFINITY", "0.1"], delivery: "Float64"}
+      - {native_type: "DATE", sample: ["TO_DATE('2024-02-29 13:14:15','YYYY-MM-DD HH24:MI:SS')", "TO_DATE('0001-01-01','YYYY-MM-DD')"], delivery: "Timestamp(µs)"}
+      - {native_type: "TIMESTAMP(6)", sample: ["TO_TIMESTAMP('2024-02-29 13:14:15.123456','YYYY-MM-DD HH24:MI:SS.FF')", "TO_TIMESTAMP('9999-12-31 23:59:59.999999','YYYY-MM-DD HH24:MI:SS.FF')"], delivery: "Timestamp(µs)"}
+      - {native_type: "TIMESTAMP(9)", sample: ["TO_TIMESTAMP('2024-02-29 13:14:15.123456789','YYYY-MM-DD HH24:MI:SS.FF')"], delivery: "Timestamp(ns)", today_delivery: "Timestamp(µs)", today_render: {source: "SUBSTR(TO_CHAR({c}, 'SYYYY-MM-DD\"T\"HH24:MI:SS.FF9'), 1, 27)", duck: "strftime({c}, '%Y-%m-%dT%H:%M:%S.%f')", canon: "timestamp"}, known_defect: "delivered at microseconds, the sub-microsecond digits dropped; exact native is Timestamp(ns) (ADR-0038 CP1, Oracle engine step)"}
+      - {native_type: "TIMESTAMP(6) WITH TIME ZONE", sample: ["TO_TIMESTAMP_TZ('2024-02-29 10:00:00.5 +02:00','YYYY-MM-DD HH24:MI:SS.FF TZH:TZM')", "TO_TIMESTAMP_TZ('2024-07-01 10:00:00 Europe/Berlin','YYYY-MM-DD HH24:MI:SS TZR')"], delivery: "Timestamp(µs, \"UTC\")"}
+      - {native_type: "TIMESTAMP(6) WITH LOCAL TIME ZONE", sample: ["TO_TIMESTAMP_TZ('2024-02-29 10:00:00 -03:00','YYYY-MM-DD HH24:MI:SS TZH:TZM')"], delivery: "Timestamp(µs, \"UTC\")"}
       - {native_type: "VARCHAR2(100 CHAR)", sample: ["'it''s, \"q\"'", "'   '", "''"], delivery: "Utf8", render: {source: "{c}"}}
       - {native_type: "NVARCHAR2(50)", sample: ["N'unicode ✓'", "N'日本語'"], delivery: "Utf8"}
       - {native_type: "CHAR(5 CHAR)", sample: ["'ab'", "'x'"], delivery: "Utf8", render: {source: "{c}"}}
-      - {native_type: "RAW(16)", sample: ["HEXTORAW('00FF10')", "HEXTORAW('01')"], delivery: "Binary", render: {source: "RAWTOHEX({c})", duck: "upper(hex({c}))"}}
+      - {native_type: "RAW(16)", sample: ["HEXTORAW('00FF10')", "HEXTORAW('01')"], delivery: "Binary"}
   mongo:
     rows: []

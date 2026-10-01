@@ -64,11 +64,15 @@ fn ledger(engine: &str) -> Ledger {
             .map(|l| l.iter().map(|x| s(x).expect("string")).collect())
             .unwrap_or_default()
     };
-    let render = |r: &serde_yaml_ng::Value| Render {
-        source: s(&r["source"]),
-        duck: s(&r["duck"]),
-        server: s(&r["server"]),
-        canon: s(&r["canon"]),
+    // A row's own render keys override what its delivery determines (`renders:`).
+    let render = |r: &serde_yaml_ng::Value, base: &serde_yaml_ng::Value| {
+        let k = |key: &str| s(&r[key]).or_else(|| s(&base[key]));
+        Render {
+            source: k("source"),
+            duck: k("duck"),
+            server: k("server"),
+            canon: k("canon"),
+        }
     };
     let rows = e["rows"]
         .as_sequence()
@@ -86,11 +90,14 @@ fn ledger(engine: &str) -> Ledger {
                     .collect(),
                 delivery: s(&r["delivery"]).expect("delivery"),
                 // A known_defect row is graded at full precision for what it delivers today.
-                render: render(if r["today_render"].is_null() {
-                    &r["render"]
+                render: if r["today_render"].is_null() {
+                    render(
+                        &r["render"],
+                        &e["renders"][r["delivery"].as_str().unwrap_or("")],
+                    )
                 } else {
-                    &r["today_render"]
-                }),
+                    render(&r["today_render"], &serde_yaml_ng::Value::Null)
+                },
                 known_defect: s(&r["known_defect"]),
                 today_delivery: s(&r["today_delivery"]),
                 defect_samples: list(&r["defect_samples"]),
@@ -128,15 +135,10 @@ fn split_refused(lg: Ledger) -> (Ledger, Vec<Row>) {
 
 /// How the verdict reads the source.
 enum Source<'a> {
-    /// ATTACHed READ_ONLY in the verdict's own DuckDB session; `pass` runs server SQL there.
+    /// ATTACHed READ_ONLY in the verdict's own DuckDB session, with the engine's scanner settings and passthrough.
     Attach {
         engine: OracleEngine,
         database: &'static str,
-        pass: &'static str,
-        /// Scanner settings run before the ATTACH (a scanner must not narrow what it reads).
-        settings: &'static str,
-        /// The server's own text of `{c}` (its type output function), for `server_text` rows.
-        server_text: &'static str,
     },
     /// No DuckDB scanner (Oracle): the database renders its own values through its client.
     #[cfg_attr(not(feature = "oracle"), allow(dead_code))]
@@ -1084,19 +1086,13 @@ fn duckdb_ledger_verdict(lg: &Ledger, st: &Stand, n: i64) -> Vec<String> {
         n + 1,
         2 * n,
     );
-    if let Source::Attach {
-        engine,
-        database,
-        settings,
-        pass,
-        ..
-    } = &st.source
-    {
+    if let Source::Attach { engine, database } = &st.source {
         let (attach, from) = engine.source_sql(database, &st.bare);
-        let from = server_rendered(&lg.rows, &from, pass, &st.bare);
+        let from = server_rendered(&lg.rows, &from, engine.passthrough(), &st.bare);
         setup = format!(
-            "{} {settings} {attach} {setup} UNION ALL SELECT 'source', CAST(id AS VARCHAR), {proj} FROM {from}",
-            engine.load_sql()
+            "{} {} {attach} {setup} UNION ALL SELECT 'source', CAST(id AS VARCHAR), {proj} FROM {from}",
+            engine.load_sql(),
+            engine.scanner_settings()
         );
     }
     // What `rivet load` put into ClickHouse is the CDC delivery.
@@ -1178,13 +1174,7 @@ fn duckdb_ledger_verdict(lg: &Ledger, st: &Stand, n: i64) -> Vec<String> {
             ),
         ),
     ];
-    if let Source::Attach {
-        engine,
-        database,
-        pass,
-        ..
-    } = &st.source
-    {
+    if let Source::Attach { engine, database } = &st.source {
         let (_, from) = engine.source_sql(database, &st.bare);
         queries.push(("source_types", format!("DESCRIBE SELECT * FROM {from}")));
         for (r, c) in lg.rows.iter().zip(&cols) {
@@ -1209,7 +1199,7 @@ fn duckdb_ledger_verdict(lg: &Ledger, st: &Stand, n: i64) -> Vec<String> {
                     "arrow_source",
                     format!(
                         "SELECT CAST(id AS VARCHAR), CAST({c} AS VARCHAR) FROM {}",
-                        pass.replace(
+                        engine.passthrough().replace(
                             "{sql}",
                             &format!("SELECT id, {c}::text AS {c} FROM {}", st.bare)
                         )
@@ -1576,24 +1566,23 @@ fn duckdb_refused_verdict(
     let cols = columns(rows);
     let cc = st.cdc.oracle_container_out();
     let cs = schema(&st.cdc.out_dir());
-    let Source::Attach {
-        engine,
-        database,
-        settings,
-        pass,
-        server_text,
-    } = &st.source
-    else {
+    let Source::Attach { engine, database } = &st.source else {
         panic!(
             "{}: batch-refused rows need a DuckDB-attached source",
             st.engine
         )
     };
     assert!(
-        !server_text.is_empty() && rows.iter().all(|r| r.known_defect.is_some()),
+        rows.iter().all(|r| r.known_defect.is_some()),
         "{}: batch-refused rows are known defects, graded against the server's own text",
         st.engine
     );
+    let server_text = engine.server_text().unwrap_or_else(|| {
+        panic!(
+            "{}: batch-refused rows need the server's own text",
+            st.engine
+        )
+    });
     let (attach, _) = engine.source_sql(database, &st.bare);
     let server_sql = format!(
         "SELECT id, {} FROM {}",
@@ -1603,7 +1592,9 @@ fn duckdb_refused_verdict(
             .join(", "),
         st.bare
     );
-    let from = pass.replace("{sql}", &server_sql.replace('\'', "''"));
+    let from = engine
+        .passthrough()
+        .replace("{sql}", &server_sql.replace('\'', "''"));
     let proj = projection(rows);
     let stats = cols
         .iter()
@@ -1611,11 +1602,12 @@ fn duckdb_refused_verdict(
         .collect::<Vec<_>>()
         .join(", ");
     let setup = format!(
-        "{} {settings} {attach} CREATE TEMP VIEW legs AS \
+        "{} {} {attach} CREATE TEMP VIEW legs AS \
            SELECT 'source' AS leg, CAST(id AS VARCHAR) AS id, {proj} FROM {from} \
            UNION ALL SELECT 'stream', CAST(id AS VARCHAR), {proj} FROM read_parquet('{cc}/*.parquet') \
              WHERE __op = 'insert'",
-        engine.load_sql()
+        engine.load_sql(),
+        engine.scanner_settings()
     );
     let out = duckdb_session_json(
         &setup,
@@ -1779,9 +1771,6 @@ fn postgres_batch_and_cdc_deliver_every_ledger_row_alike() {
             source: Source::Attach {
                 engine: OracleEngine::PostgresCdc,
                 database: "rivet",
-                pass: "postgres_query('src', '{sql}')",
-                settings: "SET pg_use_text_protocol = true;",
-                server_text: "CASE WHEN {c} IS NOT NULL THEN format('%s', {c}) END",
             },
             settle: &|_| {},
             cdc: graded(cdc),
@@ -1855,9 +1844,6 @@ fn mysql_batch_and_cdc_deliver_every_ledger_row_alike() {
         source: Source::Attach {
             engine: OracleEngine::MysqlCdc,
             database: "rivet",
-            pass: "mysql_query('src', '{sql}')",
-            settings: "SET mysql_tinyint1_as_boolean = false; SET mysql_session_time_zone = '+00:00';",
-            server_text: "",
         },
         settle: &|_| {},
         cdc: graded(cdc),
@@ -1908,9 +1894,6 @@ fn mssql_batch_and_cdc_deliver_every_ledger_row_alike() {
         source: Source::Attach {
             engine: OracleEngine::MssqlCdc,
             database: "rivet",
-            pass: "mssql_scan('src', '{sql}')",
-            settings: "",
-            server_text: "",
         },
         settle: &|rows| wait_for_capture(&ci, rows),
         cdc: graded(cdc),
