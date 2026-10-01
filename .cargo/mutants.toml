@@ -838,4 +838,50 @@ exclude_re = [
     # The text builder's TEXT arm reads a live Row; deleting it fails
     # `full_export_preserves_string_and_null_distinction` (RED-checked 2026-09-30).
     "delete match arm Type::TEXT \\| Type::VARCHAR \\| Type::BPCHAR \\| Type::NAME in build_pg_text_array",
+    # v0.30.0 in-diff triage (2026-10-01). Each body below reads a live driver row
+    # (tokio_postgres / tiberius / oracledb), which no offline test can build. Every
+    # entry was RED-checked by hand (mutant applied, live test run, file restored):
+    # - PgCellSource float32/float64/boolean/binary, None and a constant each:
+    #   postgres_batch_and_cdc_deliver_every_ledger_row_alike fails "value checksum
+    #   mismatch in column" c20 / c11 / c8 / c5. The INTERVAL arm of build_pg_text_array
+    #   fails the same test with "no text rendering for PostgreSQL wire type Interval".
+    "replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::float32 -> Option<f32>",
+    "replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::float64 -> Option<f64>",
+    "replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::boolean -> Option<bool>",
+    "replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::binary -> Option<Cow<'_, \\[u8\\]>>",
+    "delete match arm Type::INTERVAL in build_pg_text_array",
+    # - MssqlCellSource::utf8 (None, empty): mssql_batch_and_cdc_deliver_every_ledger_row_alike
+    #   fails "value checksum mismatch in column 'c3'" and
+    #   a_batch_export_delivers_sql_variant_and_udt_columns_as_the_source_renders_them in 'v'.
+    "replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::utf8 -> Option<Cow<'_, \\[u8\\]>>",
+    # - mssql build_array's text-rendering guard: `false` fails the sql_variant batch test
+    #   ("is declared text ... sends it as I32"); `true` fails
+    #   mssql_a_string_override_on_an_int_column_is_refused_by_name (checksum mismatch in 'n').
+    # - its NULL guard `c.is_none_or(is_null_cell)`: `false` fails the sql_variant batch test.
+    #   `true` is EQUIVALENT. It differs only for a non-NULL cell cell_text cannot render,
+    #   and none exists: every non-NULL ColumnData variant has an arm, and the only `None`
+    #   inside one is a date outside chrono's +-262,143 years, which SQL Server's
+    #   0001-9999 range (+-14h offset) never reaches. The bail stays as a loud backstop.
+    "replace match guard rows .first\\(\\) .is_some_and\\(.*\\) with (true|false) in build_array",
+    "replace match guard c.is_none_or\\(is_null_cell\\) with (true|false) in build_array",
+    # - MssqlChangeStream::fill -> Ok(()) never drains, so the CDC run polls forever:
+    #   mssql_batch_and_cdc_deliver_every_ledger_row_alike and
+    #   a_cdc_capture_delivers_sql_variant_and_udt_columns_as_the_source_renders_them
+    #   both TIMEOUT at 240s. Its decisions are held by live_only_purity_gate.
+    "replace MssqlChangeStream::fill -> Result",
+    # - Oracle interval_iso (each stub, and the IntervalDs arm): edge_oracle_types_export_losslessly
+    #   fails on IYM/IDS ("unsupported conversion from interval day to second to
+    #   OracleIntervalYM" for the arm). build_column's BinaryFloat (Float64 and Utf8),
+    #   BinaryDouble and Raw|Blob arms: every_override_decoder_round_trips_against_oracles_rendering
+    #   fails "unsupported conversion from binary_float to f64" / "binary_float to String" /
+    #   "binary_double to String" / "raw to String".
+    "replace interval_iso -> Result<Option<String>>",
+    "delete match arm OraKind::IntervalDs in interval_iso",
+    "delete match arm OraKind::(BinaryFloat|BinaryDouble|Raw \\| OraKind::Blob) in build_column",
+    # - oracle_type_mappings -> vec![] fails every live_oracle export ("must either specify
+    #   a row count or at least one column"); its warning decision is the unit-tested
+    #   with_oracle_warning. export_within_budget without the re-projected query fails
+    #   edge_oracle_types_export_losslessly ("unsupported database type DB_TYPE_OBJECT").
+    "replace oracle_type_mappings -> Vec<TypeMapping> with vec!\\[\\]",
+    "delete field query from struct ExportRequest expression in OracleSource::export_within_budget",
 ]

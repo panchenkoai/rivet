@@ -637,7 +637,7 @@ fn keyset_over_a_wide_table_survives_many_page_reexecutions() {
     );
 }
 
-/// Types past Arrow's direct reach: s > p, negative scale, YEAR(9) intervals, BC dates, XMLTYPE, VECTOR.
+/// Types past Arrow's direct reach: s > p, negative scale, YEAR(9) and DAY(9) intervals, BC dates, XMLTYPE, VECTOR.
 #[test]
 #[ignore = "live: requires docker compose oracle"]
 fn edge_oracle_types_export_losslessly() {
@@ -645,14 +645,16 @@ fn edge_oracle_types_export_losslessly() {
     let t = OracleTable::create(
         "ora_edge",
         "id NUMBER(10) PRIMARY KEY, nsp NUMBER(3,5), nneg NUMBER(5,-2), \
-         iym INTERVAL YEAR(9) TO MONTH, d DATE, x XMLTYPE, v VECTOR(3, FLOAT32)",
+         iym INTERVAL YEAR(9) TO MONTH, ids INTERVAL DAY(9) TO SECOND(6), d DATE, x XMLTYPE, \
+         v VECTOR(3, FLOAT32)",
     );
     for row in [
         "1, 0.00123, 12300, INTERVAL '999999999-11' YEAR(9) TO MONTH, \
-         TO_DATE('-0001-06-15','SYYYY-MM-DD'), XMLTYPE('<a>x</a>'), TO_VECTOR('[1.5, 2, -3]')",
+         INTERVAL '1 02:03:04.000005' DAY TO SECOND, TO_DATE('-0001-06-15','SYYYY-MM-DD'), XMLTYPE('<a>x</a>'), TO_VECTOR('[1.5, 2, -3]')",
         "2, -0.00999, -9999900, INTERVAL '-999999999-11' YEAR(9) TO MONTH, \
-         TO_DATE('-4712-01-01','SYYYY-MM-DD'), NULL, NULL",
-        "3, NULL, NULL, INTERVAL '0-0' YEAR TO MONTH, TO_DATE('2024-02-29','YYYY-MM-DD'), NULL, NULL",
+         INTERVAL '0 00:00:00' DAY TO SECOND, TO_DATE('-4712-01-01','SYYYY-MM-DD'), NULL, NULL",
+        "3, NULL, NULL, INTERVAL '0-0' YEAR TO MONTH, NULL, TO_DATE('2024-02-29','YYYY-MM-DD'), \
+         NULL, NULL",
     ] {
         ora_exec(&format!("INSERT INTO {} VALUES ({row})", t.name()));
     }
@@ -682,6 +684,10 @@ fn edge_oracle_types_export_losslessly() {
     assert_eq!(iym[&1].as_deref(), Some("P999999999Y11M"));
     assert_eq!(iym[&2].as_deref(), Some("P-999999999Y-11M"));
     assert_eq!(iym[&3].as_deref(), Some("PT0S"));
+    let ids = parquet_cells(out.path(), "IDS");
+    assert_eq!(ids[&1].as_deref(), Some("P1DT2H3M4.000005S"));
+    assert_eq!(ids[&2].as_deref(), Some("PT0S"));
+    assert_eq!(ids[&3], None);
     // DuckDB renders the calendar date (with its own BC marker); Oracle renders the same.
     let want_d: BTreeSet<String> = ora_text_rows(&format!(
         "SELECT TO_CHAR(d, 'YYYY-MM-DD') || CASE WHEN d < DATE '0001-01-01' THEN ' (BC)' END FROM {}",

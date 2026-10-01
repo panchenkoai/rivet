@@ -942,6 +942,18 @@ fn mssql_batch_decimal_and_uuid_overrides_on_other_wire_types_keep_their_values(
     );
 }
 
+/// A `string` override on a SQL Server int fails naming the column instead of stringifying it.
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn mssql_a_string_override_on_an_int_column_is_refused_by_name() {
+    let said = Rig::mssql_batch(&unique_name("aud_msstr"))
+        .query("SELECT 1 AS id, CAST(7 AS int) AS n")
+        .export_line("columns:")
+        .export_line("  n: string")
+        .run_expect_fail();
+    assert!(said.contains("column `n` is declared text"), "{said}");
+}
+
 /// A PostgreSQL value rivet cannot hold faithfully fails the run with the coded
 /// refusal naming the column — never a panic (exit 101), never a silent value.
 fn pg_value_refused(label: &str, select: &str, column: &str) {

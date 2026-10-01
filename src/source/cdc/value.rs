@@ -1897,6 +1897,30 @@ mod tests {
         assert_eq!(arr.len(), 1);
     }
 
+    /// A Boolean column reads a zero integer of either signedness as false and any other as true.
+    #[test]
+    fn a_boolean_reads_zero_as_false_for_signed_and_unsigned_wire_ints() {
+        use RivetValue as V;
+        for (v, want) in [
+            (V::Int(0), false),
+            (V::Int(-1), true),
+            (V::UInt(0), false),
+            (V::UInt(1), true),
+        ] {
+            assert_eq!(bool_value(&v), Ok(want), "{v:?}");
+        }
+    }
+
+    /// Each numeric reader takes every wire variant a driver delivers for it.
+    #[test]
+    fn numeric_readers_take_every_wire_variant() {
+        use RivetValue as V;
+        assert_eq!(int_value::<i16>(&V::Bool(true)), Ok(1));
+        assert_eq!(int_value::<i16>(&V::Bool(false)), Ok(0));
+        assert_eq!(f64_value(&V::Int(-3)), Ok(-3.0));
+        assert_eq!(f32_value(&V::UInt(7)), Ok(7.0));
+    }
+
     /// Every list element type builds from its driver variant, and the cell fold equals the built list's fold.
     #[test]
     fn every_list_element_type_builds_from_its_driver_variant() {

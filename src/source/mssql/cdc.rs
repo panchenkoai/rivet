@@ -1083,10 +1083,7 @@ impl MssqlChangeStream {
 
         let mut start = 0;
         while start < evs.len() {
-            let mut end = start + 1;
-            while end < evs.len() && lsns[end] == lsns[start] {
-                end += 1;
-            }
+            let end = lsn_group_end(&lsns, start);
             let commit = Position(json!({ "lsn": lsns[start] }));
             // Only zero vs non-zero is read: this says "part of this transaction is
             // still on disk", which is all the head needs to know.
@@ -1240,6 +1237,15 @@ fn head_group_continues_on_disk(
     tail_head_lsn: Option<&str>,
 ) -> bool {
     is_last_head_group && tail_head_lsn == Some(group_lsn)
+}
+
+/// The exclusive end of the run of rows sharing `lsns[start]` (one source transaction).
+fn lsn_group_end(lsns: &[String], start: usize) -> usize {
+    let mut end = start + 1;
+    while end < lsns.len() && lsns[end] == lsns[start] {
+        end += 1;
+    }
+    end
 }
 
 /// `__$operation` → canonical op. 1=delete, 2=insert, 4=update-after; 3 (update
@@ -2114,6 +2120,15 @@ mod tests {
         // has ended, whatever is on disk. Rows arrive in LSN order and `@to` bounds
         // a poll at a group boundary, so a spilled row can only belong to the last.
         assert!(!head_group_continues_on_disk("0x01", false, Some("0x01")));
+    }
+
+    #[test]
+    fn a_transaction_group_ends_at_the_first_row_with_another_start_lsn() {
+        let lsns: Vec<String> = ["a", "a", "b", "c", "c", "c"].map(String::from).to_vec();
+        assert_eq!(lsn_group_end(&lsns, 0), 2);
+        assert_eq!(lsn_group_end(&lsns, 2), 3);
+        assert_eq!(lsn_group_end(&lsns, 3), 6, "the last group runs to the end");
+        assert_eq!(lsn_group_end(&lsns[..1], 0), 1);
     }
 }
 

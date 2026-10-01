@@ -966,6 +966,16 @@ impl crate::source::value_checksum::CellSource for MssqlCellSource<'_> {
 mod tests {
     use super::*;
 
+    /// Only sql_variant and CLR UDT columns ride as text; a native text or int column does not.
+    #[test]
+    fn only_variant_and_udt_columns_render_as_text() {
+        use tiberius::ColumnType as T;
+        assert!(renders_as_text(T::SSVariant));
+        assert!(renders_as_text(T::Udt));
+        assert!(!renders_as_text(T::NVarchar));
+        assert!(!renders_as_text(T::Int4));
+    }
+
     /// Every base type a `sql_variant` or UDT can carry renders as SQL Server's own ISO text.
     #[test]
     fn a_variant_cell_renders_each_base_type_as_text() {
