@@ -522,37 +522,6 @@ fn ns_text(a: &dyn arrow::array::Array, r: usize) -> Option<String> {
     }
 }
 
-/// `v` canonicalised as the row's render says.
-fn canon(v: &Option<String>, how: &Option<String>) -> Option<String> {
-    v.as_ref().map(|s| match how.as_deref() {
-        Some("number") => canon_num(s),
-        Some("timestamp") => canon_ts(s.trim_start_matches('+').trim().trim_end_matches("+00")),
-        Some("float32") => s
-            .parse::<f32>()
-            .map_or_else(|e| panic!("{s}: {e}"), |f| f.to_string()),
-        Some("float64") => s
-            .parse::<f64>()
-            .map_or_else(|e| panic!("{s}: {e}"), |f| f.to_string()),
-        Some("interval") => canon_interval(s),
-        Some("round_micros") => round_micros(s),
-        Some(other) => panic!("unknown canon `{other}`"),
-        None => s.clone(),
-    })
-}
-
-/// A timestamp's text rounded half-up to the microsecond (SQL Server renders a DATETIME tick at 100 ns).
-fn round_micros(s: &str) -> String {
-    use chrono::Timelike;
-    let t = chrono::NaiveDateTime::parse_from_str(
-        s.trim_end_matches("+00").trim(),
-        "%Y-%m-%d %H:%M:%S%.f",
-    )
-    .unwrap_or_else(|e| panic!("{s}: {e}"));
-    let sub = i64::from(t.nanosecond() % 1_000);
-    let t = t + chrono::TimeDelta::nanoseconds(if sub >= 500 { 1_000 - sub } else { -sub });
-    t.format("%Y-%m-%d %H:%M:%S%.6f").to_string()
-}
-
 #[test]
 fn round_micros_rounds_the_server_tick_and_keeps_a_micro() {
     for (got, want) in [
@@ -677,62 +646,6 @@ fn arrow_overlay_grades_every_delivered_leg_on_arrow_text() {
         assert_eq!(legs[*l], arrow, "{l}");
         assert_eq!(counts[*l], vec![2, 2, 2], "{l}");
     }
-}
-
-/// An ISO 8601 duration (`P1Y2M3DT4H5M6.5S`) or DuckDB's interval text (`1 year 2 months 3 days 04:05:06.5`) as `<months>m<days>d<micros>us`.
-fn canon_interval(s: &str) -> String {
-    let (mut months, mut days, mut micros) = (0i64, 0i64, 0i64);
-    let secs = |v: &str| -> i64 {
-        let (neg, v) = v.strip_prefix('-').map_or((false, v), |r| (true, r));
-        let (w, f) = v.split_once('.').unwrap_or((v, ""));
-        let us =
-            w.parse::<i64>().unwrap() * 1_000_000 + format!("{f:0<6}")[..6].parse::<i64>().unwrap();
-        if neg { -us } else { us }
-    };
-    if let Some(iso) = s.strip_prefix('P') {
-        let (date, time) = iso.split_once('T').unwrap_or((iso, ""));
-        let mut num = String::new();
-        for ch in date.chars() {
-            match ch {
-                'Y' => months += 12 * std::mem::take(&mut num).parse::<i64>().unwrap(),
-                'M' => months += std::mem::take(&mut num).parse::<i64>().unwrap(),
-                'D' => days += std::mem::take(&mut num).parse::<i64>().unwrap(),
-                c => num.push(c),
-            }
-        }
-        for ch in time.chars() {
-            match ch {
-                'H' => micros += 3_600_000_000 * std::mem::take(&mut num).parse::<i64>().unwrap(),
-                'M' => micros += 60_000_000 * std::mem::take(&mut num).parse::<i64>().unwrap(),
-                'S' => micros += secs(&std::mem::take(&mut num)),
-                c => num.push(c),
-            }
-        }
-    } else {
-        let words: Vec<&str> = s.split_whitespace().collect();
-        let mut i = 0;
-        while i < words.len() {
-            if let Some((h, rest)) = words[i].split_once(':') {
-                let (m, sec) = rest.split_once(':').unwrap();
-                let neg = h.starts_with('-');
-                let us = h.trim_start_matches('-').parse::<i64>().unwrap() * 3_600_000_000
-                    + m.parse::<i64>().unwrap() * 60_000_000
-                    + secs(sec);
-                micros += if neg { -us } else { us };
-                i += 1;
-                continue;
-            }
-            let v: i64 = words[i].parse().unwrap();
-            match words[i + 1].trim_end_matches('s') {
-                "year" => months += 12 * v,
-                "month" | "mon" => months += v,
-                "day" => days += v,
-                unit => panic!("interval unit `{unit}` in `{s}`"),
-            }
-            i += 2;
-        }
-    }
-    format!("{months}m{days}d{micros}us")
 }
 
 #[test]
@@ -920,6 +833,217 @@ fn arrow_overlay(
             .unwrap_or_else(|| panic!("no counts for {leg}"));
         c[1 + 2 * k] = n[1 + 2 * k];
         c[2 + 2 * k] = n[2 + 2 * k];
+    }
+}
+
+/// (leg, sample literal, id, canonical value, canonical source value).
+type Graded = (&'static str, String, i64, Option<String>, Option<String>);
+
+/// What one column showed across the stages, as `grade_column` grades it.
+#[derive(Default)]
+struct Seen {
+    /// (stage, delivered type) per stage that carries a Parquet schema.
+    types: Vec<(&'static str, String)>,
+    /// Every leg graded against the source.
+    values: Vec<Graded>,
+    /// The ClickHouse column type, when a warehouse leg ran.
+    clickhouse: Option<Option<String>>,
+}
+
+/// The ledger verdict on one column: wrong types and values, excused only by the class a marker declares, and every marker or defect sample that no longer fires.
+fn grade_column(what: &str, b: &Row, c: &Row, seen: &Seen) -> Vec<String> {
+    let mut bad = Vec::new();
+    let (kd, chd) = (b.known_defect.is_some(), c.clickhouse_defect.is_some());
+    let (mut kd_hits, mut ch_hits) = (0usize, 0usize);
+    let mut hit_samples: std::collections::BTreeSet<(bool, &str)> = Default::default();
+    for (mode, got) in &seen.types {
+        let want = if *mode == "cdc stream" {
+            &c.delivery
+        } else {
+            &b.delivery
+        };
+        if got != want {
+            if kd {
+                kd_hits += 1;
+            } else {
+                bad.push(format!(
+                    "{what}: {mode} delivers `{got}`, the ledger says `{want}`"
+                ));
+            }
+        }
+    }
+    for (leg, lit, id, got, src) in &seen.values {
+        if got == src {
+            continue;
+        }
+        if b.defect_samples.contains(lit) {
+            kd_hits += 1;
+            hit_samples.insert((false, lit));
+        } else if leg.starts_with("ClickHouse") && c.clickhouse_defect_samples.contains(lit) {
+            ch_hits += 1;
+            hit_samples.insert((true, lit));
+        } else {
+            bad.push(format!("{what} id {id}: {leg} {got:?}, source {src:?}"));
+        }
+    }
+    if let Some(got) = &seen.clickhouse
+        && *got != c.clickhouse
+    {
+        if kd {
+            kd_hits += 1;
+        } else if chd {
+            ch_hits += 1;
+        } else {
+            bad.push(format!(
+                "{what}: ClickHouse holds `{got:?}`, the ledger says `{:?}`",
+                c.clickhouse
+            ));
+        }
+    }
+    if kd && kd_hits == 0 {
+        bad.push(format!(
+            "{what}: known_defect row now passes — remove the marker"
+        ));
+    }
+    if chd && ch_hits == 0 {
+        bad.push(format!(
+            "{what}: clickhouse_defect row now passes in ClickHouse — remove the marker"
+        ));
+    }
+    for (ch, list) in [
+        (false, &b.defect_samples),
+        (true, &c.clickhouse_defect_samples),
+    ] {
+        for s in list {
+            if !hit_samples.contains(&(ch, s.as_str())) {
+                bad.push(format!(
+                    "{what}: defect sample `{s}` now matches the source — drop it from the ledger"
+                ));
+            }
+        }
+    }
+    bad
+}
+
+/// A ledger row with only the fields `grade_column` reads.
+fn graded_row(delivery: &str) -> Row {
+    Row {
+        native: "T".into(),
+        sample: Vec::new(),
+        delivery: delivery.into(),
+        over: None,
+        render: Render::default(),
+        diverges: None,
+        known_defect: None,
+        defect_samples: Vec::new(),
+        clickhouse: None,
+        clickhouse_defect: None,
+        clickhouse_defect_samples: Vec::new(),
+        batch_refuses: false,
+    }
+}
+
+#[test]
+fn grade_column_excuses_only_the_declared_defect_class_and_flags_stale_markers() {
+    let s = |v: &str| Some(v.to_string());
+    let value = |leg: &'static str, lit: &str, got: &str, src: &str| {
+        (leg, lit.to_string(), 1, s(got), s(src))
+    };
+    let kd = Row {
+        known_defect: s("ADR-0038 step"),
+        defect_samples: vec!["5".into(), "-1".into()],
+        ..graded_row("Int8")
+    };
+    let chd = Row {
+        clickhouse: s("Array(Nullable(String))"),
+        clickhouse_defect: s("ADR-0038 step"),
+        clickhouse_defect_samples: vec!["NULL".into()],
+        ..graded_row("List(Utf8)")
+    };
+    let today = vec![("batch", "Boolean".to_string())];
+    let cases: Vec<(&str, &Row, Seen, Vec<&str>)> = vec![
+        (
+            "an excused sample",
+            &kd,
+            Seen {
+                types: today.clone(),
+                values: vec![
+                    value("batch", "5", "1", "5"),
+                    value("batch", "-1", "1", "-1"),
+                ],
+                ..Seen::default()
+            },
+            vec![],
+        ),
+        (
+            "an unexcused mismatch on a known_defect row",
+            &kd,
+            Seen {
+                types: today.clone(),
+                values: vec![
+                    value("batch", "5", "1", "5"),
+                    value("batch", "-1", "1", "-1"),
+                    value("CDC final image", "'x'", "y", "x"),
+                ],
+                ..Seen::default()
+            },
+            vec!["c0 T id 1: CDC final image Some(\"y\"), source Some(\"x\")"],
+        ),
+        (
+            "a clickhouse_defect sample on the batch leg",
+            &chd,
+            Seen {
+                values: vec![
+                    value("batch", "NULL", "[]", "NULL"),
+                    value("ClickHouse", "NULL", "[]", "NULL"),
+                ],
+                clickhouse: Some(s("Array(Nullable(String))")),
+                ..Seen::default()
+            },
+            vec!["c0 T id 1: batch Some(\"[]\"), source Some(\"NULL\")"],
+        ),
+        (
+            "a stale marker",
+            &kd,
+            Seen {
+                types: vec![("batch", "Int8".to_string())],
+                ..Seen::default()
+            },
+            vec![
+                "c0 T: known_defect row now passes — remove the marker",
+                "c0 T: defect sample `5` now matches the source — drop it from the ledger",
+                "c0 T: defect sample `-1` now matches the source — drop it from the ledger",
+            ],
+        ),
+        (
+            "a stale sample",
+            &kd,
+            Seen {
+                types: today.clone(),
+                values: vec![value("batch", "5", "1", "5")],
+                ..Seen::default()
+            },
+            vec!["c0 T: defect sample `-1` now matches the source — drop it from the ledger"],
+        ),
+    ];
+    for (name, row, seen, want) in cases {
+        assert_eq!(grade_column("c0 T", row, row, &seen), want, "{name}");
+    }
+    let samples = [
+        ("number", "1.50E2"),
+        ("timestamp", "2024-01-01 00:00:00.500000+00"),
+        ("float32", "1.5"),
+        ("float64", "2.25"),
+        ("interval", "P1Y2M3DT4H5M6.5S"),
+        ("round_micros", "2026-01-15 13:45:30.1266667"),
+    ];
+    assert_eq!(
+        samples.map(|(c, _)| c),
+        CANONS,
+        "a canon without a sample here"
+    );
+    for (how, v) in samples {
+        assert!(canon(&s(v), &s(how)).is_some(), "{how}");
     }
 }
 
@@ -1208,89 +1332,52 @@ fn duckdb_ledger_verdict(lg: &Ledger, st: &Stand, n: i64) -> Vec<String> {
     let snap_twin = |i: i64| if i <= n { n + i } else { 1 };
     for (k, (col, (b, c))) in cols.iter().zip(lg.batch.iter().zip(&lg.cdc)).enumerate() {
         let what = format!("{col} {}", b.native);
-        // A marker excuses only its declared class: the type labels (known_defect: the
-        // delivery and the ClickHouse type it drives; clickhouse_defect: the ClickHouse
-        // type) and source mismatches on the samples it names. All else stays strict.
-        let (kd, chd) = (b.known_defect.is_some(), c.clickhouse_defect.is_some());
-        let (mut kd_hits, mut ch_hits) = (0usize, 0usize);
-        let mut hit_samples: std::collections::BTreeSet<(bool, String)> = Default::default();
-        for (mode, want, sch) in [
-            ("batch", &b.delivery, &bs),
-            ("cdc stream", &c.delivery, &cs),
-            ("cdc snapshot", &b.delivery, &ss),
-        ] {
-            let got = delivered(sch, col);
-            if &got != want {
-                if kd {
-                    kd_hits += 1;
-                } else {
-                    bad.push(format!(
-                        "{what}: {mode} delivers `{got}`, the ledger says `{want}`"
-                    ));
-                }
-            }
-        }
         let arrow_row = b.render.duck.as_deref() == Some(ARROW);
-        let mut off_source = Vec::new();
+        let mut seen = Seen {
+            types: [("batch", &bs), ("cdc stream", &cs), ("cdc snapshot", &ss)]
+                .into_iter()
+                .map(|(mode, sch)| (mode, delivered(sch, col)))
+                .collect(),
+            values: Vec::new(),
+            clickhouse: st
+                .warehouse
+                .as_ref()
+                .map(|_| ch_types.get(col.as_str()).cloned()),
+        };
         for &id in &all {
             let src = if arrow_row {
                 canon(&arrow_source[&id][0], &canons[k])
             } else {
                 v("source", id, k)
             };
+            let mut push = |leg: &'static str, got: Option<String>| {
+                seen.values
+                    .push((leg, literal(b, id), id, got, src.clone()))
+            };
             if arrow_row {
-                off_source.push(("batch", id, canon(&a_b[&id][k], &canons[k]), src.clone()));
+                push("batch", canon(&a_b[&id][k], &canons[k]));
             } else {
-                off_source.push(("batch", id, v("batch", id, k), src.clone()));
-                off_source.push(("CDC final image", id, v("final", id, k), src.clone()));
+                push("batch", v("batch", id, k));
+                push("CDC final image", v("final", id, k));
             }
             if st.warehouse.is_some() {
-                let wh = if arrow_row {
-                    canon(&arrow_warehouse[&id][0], &canons[k])
-                } else {
-                    v("warehouse", id, k)
-                };
-                off_source.push(("ClickHouse", id, wh, src.clone()));
+                push(
+                    "ClickHouse",
+                    if arrow_row {
+                        canon(&arrow_warehouse[&id][0], &canons[k])
+                    } else {
+                        v("warehouse", id, k)
+                    },
+                );
             }
             if wh_text && naive_ts(&c.delivery) {
-                off_source.push((
+                push(
                     "ClickHouse text (session_timezone Asia/Tokyo)",
-                    id,
                     v("warehouse_text", id, k),
-                    src,
-                ));
+                );
             }
         }
-        for (leg, id, got, src) in off_source {
-            if got == src {
-                continue;
-            }
-            let lit = literal(b, id);
-            if b.defect_samples.contains(&lit) {
-                kd_hits += 1;
-                hit_samples.insert((false, lit));
-            } else if leg.starts_with("ClickHouse") && c.clickhouse_defect_samples.contains(&lit) {
-                ch_hits += 1;
-                hit_samples.insert((true, lit));
-            } else {
-                bad.push(format!("{what} id {id}: {leg} {got:?}, source {src:?}"));
-            }
-        }
-        if st.warehouse.is_some() {
-            let got = ch_types.get(col.as_str()).cloned();
-            if got != c.clickhouse {
-                if kd {
-                    kd_hits += 1;
-                } else if chd {
-                    ch_hits += 1;
-                } else {
-                    bad.push(format!(
-                        "{what}: ClickHouse holds `{got:?}`, the ledger says `{:?}`",
-                        c.clickhouse
-                    ));
-                }
-            }
-        }
+        bad.extend(grade_column(&what, b, c, &seen));
         for &id in &captured {
             if c.diverges.is_some() {
                 continue;
@@ -1347,28 +1434,6 @@ fn duckdb_ledger_verdict(lg: &Ledger, st: &Stand, n: i64) -> Vec<String> {
                         "{what}: {leg} has (non-null, distinct) {:?}, {of} {:?}",
                         stat(leg),
                         stat(of)
-                    ));
-                }
-            }
-        }
-        if kd && kd_hits == 0 {
-            bad.push(format!(
-                "{what}: known_defect row now passes — remove the marker"
-            ));
-        }
-        if chd && ch_hits == 0 {
-            bad.push(format!(
-                "{what}: clickhouse_defect row now passes in ClickHouse — remove the marker"
-            ));
-        }
-        for (ch, list) in [
-            (false, &b.defect_samples),
-            (true, &c.clickhouse_defect_samples),
-        ] {
-            for s in list {
-                if !hit_samples.contains(&(ch, s.clone())) {
-                    bad.push(format!(
-                        "{what}: defect sample `{s}` now matches the source — drop it from the ledger"
                     ));
                 }
             }

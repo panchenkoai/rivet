@@ -10,15 +10,11 @@ use super::chunking_matrix_guard::{enum_variants, source_engine_variants};
 const LEDGER: &str = "docs/type-capability-matrix.yaml";
 const DELIVERY_RS: &str = "src/types/delivery.rs";
 const MODES: [&str; 2] = ["batch", "cdc"];
-/// The `render.canon` values tests/live/live_cdc_type_parity.rs implements.
-const CANONS: [&str; 6] = [
-    "number",
-    "timestamp",
-    "float32",
-    "float64",
-    "interval",
-    "round_micros",
-];
+/// The `render.canon` values the parity driver implements, read from the driver's own canon module.
+#[allow(dead_code)]
+#[path = "../common/canon.rs"]
+mod canon;
+use canon::CANONS;
 
 /// `IsoTimestampNanos` -> `iso_timestamp_nanos`, the label rule `TextForm::label` follows.
 fn snake(ident: &str) -> String {
