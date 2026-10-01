@@ -1679,14 +1679,26 @@ jobs:
 
       - name: Rig oracle verdict census
         # A passing test's stderr is hidden, so the verdict log is the only proof the oracle ran.
+        # What it proves: the oracle graded at least one run, and the runs it did NOT fully grade
+        # (SKIP, PARTIAL) did not grow past the recorded ceilings. It cannot see a run no test
+        # started, nor a hand-built spawn (tests/offline/rig_oracle_ratchet.rs counts those).
+        # A ceiling is lowered when a gap closes, raised only in a reviewed diff.
         if: ${{ !cancelled() }}
+        env:
+          SKIP_CEILING: 400
+          PARTIAL_CEILING: 400
         run: |
           log=target/rivet-oracle.log
           test -s "$log" || { echo "::error::no rig oracle verdict was logged ($log) - the oracle did not run"; exit 1; }
-          for v in PASS XFAIL SKIP FAIL; do printf '%s %s\n' "$v" "$(grep -c "^RIVET-ORACLE-$v " "$log" || true)"; done
-          grep '^RIVET-ORACLE-SKIP ' "$log" | sed 's/^[^—]*— //' | sort | uniq -c | sort -rn | head -20
-          pass=$(grep -c '^RIVET-ORACLE-PASS ' "$log" || true)
-          [ "$pass" -gt 0 ] || { echo "::error::the rig oracle logged no PASS verdict"; exit 1; }
+          count() { grep -c "^RIVET-ORACLE-$1 " "$log" || true; }
+          for v in PASS PARTIAL XFAIL SKIP OFF FAIL; do printf '%s %s\n' "$v" "$(count "$v")"; done
+          echo "per reason (numbers folded to N):"
+          grep -E '^RIVET-ORACLE-(SKIP|PARTIAL|OFF) ' "$log" \
+            | sed -E 's/^RIVET-ORACLE-([A-Z]+) [^—]*— /\1 /; s/grade(-load)? [0-9]+ ms: ?//; s/ \{.*$//; s/[0-9]+/N/g' \
+            | sort | uniq -c | sort -rn
+          [ "$(count PASS)" -gt 0 ] || { echo "::error::the rig oracle logged no PASS verdict"; exit 1; }
+          [ "$(count SKIP)" -le "$SKIP_CEILING" ] || { echo "::error::$(count SKIP) SKIP verdicts, ceiling $SKIP_CEILING: a run the oracle used to grade is no longer graded"; exit 1; }
+          [ "$(count PARTIAL)" -le "$PARTIAL_CEILING" ] || { echo "::error::$(count PARTIAL) PARTIAL verdicts, ceiling $PARTIAL_CEILING"; exit 1; }
 
       - name: Stop services
         if: always()

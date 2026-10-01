@@ -1,13 +1,18 @@
 //! VERIFY — the default independent oracle for live tests. Every `rivet run|load|compact
-//! --config <path>` started through the shared runners (`run_rivet*` in runner.rs,
-//! `run_rivet_ok`, and the `Rig`) that exits 0 is graded: the FACTS come from the config
-//! file itself (source type and URL, each export's relation, mode, columns and destination,
-//! the state DB beside the config or `RIVET_STATE_URL`, the Success manifests the run
-//! wrote) and go to `dev/release_oracle/rig_oracle.py`, which owns the one DuckDB session
-//! and every check. Opt out only with `.no_oracle("<reason>")` on a rig or the
-//! `RIVET_TEST_NO_ORACLE=<reason>` env on a raw run (both counted by a shrink-only
-//! ceiling); an export the oracle cannot reach logs `RIVET-ORACLE-SKIP`, never silence.
-//! A `Command::new(RIVET_BIN)` built by hand is not graded (also a ceiling).
+//! --config <path>` and `rivet apply <config.yaml>` started through the shared runners
+//! (`run_rivet*` in runner.rs, `run_rivet_ok`, and the `Rig`) in the live suite,
+//! live_type_golden or live_differential that exits 0 is graded: the FACTS come from the
+//! config file itself (source type and URL, each export's relation, mode, columns and
+//! destination, the state DB beside the config or `RIVET_STATE_URL`, the Success manifests
+//! the run wrote) and go to `dev/release_oracle/rig_oracle.py`, which owns the one DuckDB
+//! session and every check. A CDC export without a snapshot leg is graded against source
+//! images the oracle takes before each run (every row changed between the stream's previous
+//! successful run and this one must be in it); a stream's first run, which has no earlier
+//! image, is `RIVET-ORACLE-PARTIAL`, never a plain PASS. Opt out only with `.no_oracle("<reason>")` on
+//! a rig or the `RIVET_TEST_NO_ORACLE=<reason>` env on a raw run (both counted by a
+//! shrink-only ceiling, both logged `RIVET-ORACLE-OFF`); an export the oracle cannot reach
+//! logs `RIVET-ORACLE-SKIP`. Not graded, each under its own ceiling: a hand-built
+//! `Command::new(RIVET_BIN)` and a child from `Rig::spawn_args_env` (logged as a SKIP).
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -20,10 +25,18 @@ pub const NO_ORACLE_ENV: &str = "RIVET_TEST_NO_ORACLE";
 /// Success manifest names in the destination and its `snapshot/` leg, taken before an invocation.
 type ManifestSnapshot = [BTreeSet<String>; 2];
 
+/// A known product defect a rig declares: the one export and failure class it excuses (rig_oracle.KNOWN_DEFECT_CLASSES).
+#[derive(Clone, Copy)]
+pub(crate) struct KnownDefect<'a> {
+    pub export: &'a str,
+    pub class: &'a str,
+    pub reason: &'a str,
+}
+
 /// What a caller adds to the config's facts: a strict known-defect marker and a key for a keyless relation.
 #[derive(Default)]
 pub(crate) struct Opts<'a> {
-    pub xfail: Option<&'a str>,
+    pub xfail: Option<KnownDefect<'a>>,
     pub key: Option<&'a str>,
 }
 
@@ -36,12 +49,14 @@ pub(crate) struct Case {
     params: Vec<(String, String)>,
     exports: Vec<Value>,
     before: Vec<Result<ManifestSnapshot, String>>,
+    /// A `--resume` run completes a crashed run's plan, made before this invocation.
+    resume: bool,
 }
 
-/// Start grading `argv` (run with working directory `cwd`): `None` unless it is `run|load|compact --config <path>` and not opted out.
+/// Start grading `argv` (run with working directory `cwd`): `None` unless it is `run|load|compact --config <path>` or `apply <config.yaml>` and not opted out.
 pub(crate) fn begin(argv: &[String], envs: &[(&str, &str)], cwd: Option<&Path>) -> Option<Case> {
-    let verb = argv.first()?.clone();
-    if !matches!(verb.as_str(), "run" | "load" | "compact") {
+    let mut verb = argv.first()?.clone();
+    if !matches!(verb.as_str(), "run" | "load" | "compact" | "apply") {
         return None;
     }
     let flag = |long: &str, short: &str| -> Vec<String> {
@@ -55,17 +70,55 @@ pub(crate) fn begin(argv: &[String], envs: &[(&str, &str)], cwd: Option<&Path>) 
         }
         out
     };
-    let cfg_path = PathBuf::from(flag("--config", "-c").pop()?);
+    let cfg_path = if verb == "apply" {
+        // `apply <config.yaml>` runs the config's exports wave by wave: graded as a `run`.
+        let plan = argv.get(1).filter(|p| !p.starts_with('-'))?;
+        if !(plan.ends_with(".yaml") || plan.ends_with(".yml")) {
+            log(
+                "SKIP",
+                "*",
+                "apply of a sealed plan artifact: not graded yet",
+            );
+            return None;
+        }
+        verb = "run".into();
+        PathBuf::from(plan)
+    } else {
+        PathBuf::from(flag("--config", "-c").pop()?)
+    };
     let cwd = cwd
         .map(Path::to_path_buf)
         .unwrap_or_else(|| std::env::current_dir().expect("cwd"));
     let cfg_path = cwd.join(cfg_path);
     if let Some(why) = env_of(envs, NO_ORACLE_ENV) {
         assert!(!why.trim().is_empty(), "{NO_ORACLE_ENV} needs a reason");
+        log("OFF", "*", &why);
         return None;
     }
-    let text = std::fs::read_to_string(&cfg_path).ok()?;
-    let cfg: Value = serde_yaml_ng::from_str(&text).ok()?;
+    let params: Vec<(String, String)> = flag("--param", "-p")
+        .iter()
+        .filter_map(|p| {
+            p.split_once('=')
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+        })
+        .collect();
+    let Some(text) = std::fs::read_to_string(&cfg_path).ok() else {
+        log(
+            "SKIP",
+            "*",
+            &format!("config {} is unreadable", cfg_path.display()),
+        );
+        return None;
+    };
+    let Some(cfg) = serde_yaml_ng::from_str::<Value>(&resolve_vars(&text, &params, envs)).ok()
+    else {
+        log(
+            "SKIP",
+            "*",
+            &format!("config {} does not parse", cfg_path.display()),
+        );
+        return None;
+    };
     let only = flag("--export", "-e");
     let exports: Vec<Value> = cfg
         .get("exports")
@@ -75,13 +128,6 @@ pub(crate) fn begin(argv: &[String], envs: &[(&str, &str)], cwd: Option<&Path>) 
         .filter(|e| only.is_empty() || only.iter().any(|n| Some(n.as_str()) == s(e, "name")))
         .cloned()
         .collect();
-    let params = flag("--param", "-p")
-        .iter()
-        .filter_map(|p| {
-            p.split_once('=')
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-        })
-        .collect();
     let mut case = Case {
         verb,
         config_dir: cfg_path.parent().map(Path::to_path_buf).unwrap_or_default(),
@@ -90,6 +136,7 @@ pub(crate) fn begin(argv: &[String], envs: &[(&str, &str)], cwd: Option<&Path>) 
         params,
         exports,
         before: Vec::new(),
+        resume: argv.iter().any(|a| a == "--resume"),
     };
     if case.verb == "run" {
         case.before = case
@@ -104,18 +151,23 @@ pub(crate) fn begin(argv: &[String], envs: &[(&str, &str)], cwd: Option<&Path>) 
                 Ok(out.map(|o| manifests_of(&o)).unwrap_or_default())
             })
             .collect();
+        // Every row changed before a CDC run opens its stream must be in it: image the source first.
+        for e in case.exports.iter().filter(|e| case.needs_image(e)) {
+            case.take_image(e, envs, &case.image(e, "begin"));
+        }
     }
     Some(case)
 }
 
-/// [`begin`] for a raw runner helper: only in the live suite (other test binaries drive rivet without a stand).
+/// [`begin`] for a raw runner helper: only in the binaries that run against the stand (offline test binaries drive rivet without one).
 pub(crate) fn begin_raw(
     argv: &[String],
     envs: &[(&str, &str)],
     cwd: Option<&Path>,
 ) -> Option<Case> {
-    module_path!()
-        .starts_with("live_suite")
+    ["live_suite", "live_type_golden", "live_differential"]
+        .iter()
+        .any(|b| module_path!().starts_with(b))
         .then(|| begin(argv, envs, cwd))
         .flatten()
 }
@@ -135,7 +187,30 @@ pub(crate) fn finish(case: Case, envs: &[(&str, &str)], opts: &Opts) -> bool {
             Ok((spec, verb)) => xfailed |= verdict_of(&name, &spec, verb, opts),
         }
     }
+    if case.verb == "run" {
+        // This run's pre-run image becomes the stream's `prev` (and, on its first successful run, its `anchor`).
+        for e in case.exports.iter().filter(|e| case.needs_image(e)) {
+            let [begin, prev, anchor] = ["begin", "prev", "anchor"].map(|k| case.image(e, k));
+            let first = !image_exists(&anchor);
+            for ext in ["parquet", "parquet.missing"] {
+                let _ = std::fs::remove_file(with_ext(&prev, ext));
+                let from = with_ext(&begin, ext);
+                if from.exists() {
+                    if first {
+                        std::fs::copy(&from, with_ext(&anchor, ext))
+                            .expect("keep the anchor image");
+                    }
+                    std::fs::rename(&from, with_ext(&prev, ext)).expect("keep the prev image");
+                }
+            }
+        }
+    }
     xfailed
+}
+
+/// Whether an image (or its absent-table marker) exists at `base`.
+fn image_exists(base: &Path) -> bool {
+    with_ext(base, "parquet").exists() || with_ext(base, "parquet.missing").exists()
 }
 
 impl Case {
@@ -151,9 +226,8 @@ impl Case {
         let out = &self.local_out(e);
         let snap = &out.join("snapshot");
         let (now, now_snap) = (success_manifests(out), success_manifests(snap));
-        if now.is_subset(&seen) && now_snap.is_subset(&seen_snap) {
-            return Err("the run wrote no new Success manifest".into());
-        }
+        // No new manifest: a snapshot run must have had an empty source (the oracle asks it); CDC and delta are still graded cumulatively.
+        let nothing_new = now.is_subset(&seen) && now_snap.is_subset(&seen_snap);
         // CDC and delta modes grade the cumulative output; a snapshot run grades only what it declared.
         let cumulative = s(e, "mode") == Some("cdc") || self.is_delta(e);
         let fresh = |all: &BTreeSet<String>, old: &BTreeSet<String>| -> Vec<String> {
@@ -166,16 +240,30 @@ impl Case {
                 fresh(all, old)
             }
         };
+        if nothing_new && !cumulative && self.is_backfill_recipe(e) {
+            return Err(
+                "a `cdc.backfill` recipe feeds its CDC export's stream, not its own destination"
+                    .into(),
+            );
+        }
         let mut spec = self.facts(e, envs, opts)?;
         spec.as_object_mut().expect("facts are an object").extend(
             serde_json::json!({
                 "cumulative": cumulative,
+                "nothing_new": nothing_new,
+                "stream_dirs": if self.needs_image(e) { self.stream_dirs(e, out) } else { Vec::new() },
                 "out_dir": out,
                 "manifests": graded(&now, &seen),
                 "new_manifests": fresh(&now, &seen),
                 "snapshot_dir": snap,
                 "snapshot_manifests": graded(&now_snap, &seen_snap),
                 "new_snapshot_manifests": fresh(&now_snap, &seen_snap),
+                "snapshot": self.declares_snapshot(e),
+                "resume": self.resume,
+                "settle": e.get("settle").is_some(),
+                "base": with_ext(&self.image(e, "prev"), "parquet"),
+                "upper": with_ext(&self.image(e, "begin"), "parquet"),
+                "cursor_record": with_ext(&self.image(e, "cursor"), "json"),
             })
             .as_object()
             .expect("an object")
@@ -210,14 +298,16 @@ impl Case {
         let password = s(load, "password_env")
             .and_then(|k| env_of(envs, k))
             .unwrap_or_default();
-        let cdc = yaml_text(e.get("cdc"));
         let mut spec = self.facts(e, envs, opts)?;
         spec.as_object_mut().expect("facts are an object").extend(
             serde_json::json!({
                 "load": serde_json::to_value(load).unwrap_or_default(),
                 "password": password,
                 "export": s(e, "name"),
-                "snapshot": cdc.contains("initial: snapshot") || cdc.contains("backfill"),
+                "verb": self.verb,
+                "snapshot": self.declares_snapshot(e) || yaml_text(e.get("cdc")).contains("backfill"),
+                "base": with_ext(&self.image(e, "anchor"), "parquet"),
+                "upper": with_ext(&self.image(e, "prev"), "parquet"),
             })
             .as_object()
             .expect("an object")
@@ -258,21 +348,14 @@ impl Case {
             ),
             _ => None,
         }
-        .map(|mut q| {
-            for (k, v) in &self.params {
-                q = q.replace(&format!("${{{k}}}"), v);
-            }
-            q
-        });
-        let overrides: Vec<String> = e
+        .map(|q| resolve_vars(&q, &self.params, envs));
+        let overrides: serde_json::Map<String, serde_json::Value> = e
             .get("columns")
             .and_then(Value::as_mapping)
-            .map(|m| {
-                m.keys()
-                    .filter_map(|k| k.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
+            .into_iter()
+            .flatten()
+            .filter_map(|(k, v)| Some((k.as_str()?.to_string(), v.as_str().into())))
+            .collect();
         let cursor_expr = (s(e, "incremental_cursor_mode") == Some("coalesce")).then(|| {
             format!(
                 "coalesce(\"{}\", \"{}\")",
@@ -385,6 +468,75 @@ impl Case {
             || yaml_text(self.cfg.get("source")).contains("resume: true")
     }
 
+    /// Whether a CDC export declares `initial: snapshot` (its stream carries a baseline leg).
+    fn declares_snapshot(&self, e: &Value) -> bool {
+        e.get("cdc").and_then(|c| s(c, "initial")) == Some("snapshot")
+    }
+
+    /// Whether a CDC export is graded from source images: one captured table.
+    fn needs_image(&self, e: &Value) -> bool {
+        s(e, "mode") == Some("cdc") && s(e, "table").is_some()
+    }
+
+    /// Where this stream's file of `kind` lives, without its extension: one stream per config directory and export (images: `begin` of this run, `prev` of the last successful run, `anchor` of the first; `cursor`: the delta record).
+    fn image(&self, e: &Value, kind: &str) -> PathBuf {
+        use std::hash::{Hash as _, Hasher as _};
+        let mut h = std::hash::DefaultHasher::new();
+        (&self.config_dir, s(e, "name")).hash(&mut h);
+        let target = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".into());
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(target)
+            .join("rivet-oracle-images");
+        std::fs::create_dir_all(&dir).expect("create the oracle image dir");
+        dir.join(format!("{:016x}-{kind}", h.finish()))
+    }
+
+    /// The OTHER local destinations this CDC stream has delivered into (recording `out` among them), each with its Success manifests: one stream, graded as the union of what it delivered.
+    fn stream_dirs(&self, e: &Value, out: &Path) -> Vec<serde_json::Value> {
+        let record = with_ext(&self.image(e, "dests"), "txt");
+        let mut dirs: Vec<String> = std::fs::read_to_string(&record)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        let here = out.display().to_string();
+        if !dirs.contains(&here) {
+            dirs.push(here.clone());
+            std::fs::write(&record, dirs.join("\n")).expect("record the stream's destinations");
+        }
+        dirs.iter()
+            .filter(|d| **d != here && Path::new(d).is_dir())
+            .map(|d| {
+                let d = Path::new(d);
+                serde_json::json!({
+                    "dir": d,
+                    "manifests": success_manifests(d),
+                    "snapshot_dir": d.join("snapshot"),
+                    "snapshot_manifests": success_manifests(&d.join("snapshot")),
+                })
+            })
+            .collect()
+    }
+
+    /// Write the export's current source image to `<base>.parquet` (or `<base>.parquet.missing` when the table does not exist yet); a failure leaves none.
+    fn take_image(&self, e: &Value, envs: &[(&str, &str)], base: &Path) {
+        for ext in ["parquet", "parquet.missing"] {
+            let _ = std::fs::remove_file(with_ext(base, ext));
+        }
+        let Ok(mut spec) = self.facts(e, envs, &Opts::default()) else {
+            return;
+        };
+        spec["image"] = with_ext(base, "parquet").display().to_string().into();
+        let got = run_rig_oracle(&spec, "image");
+        if got["image"].is_null() {
+            log(
+                "SKIP",
+                s(e, "name").unwrap_or("?"),
+                &format!("no source image before this CDC run: {}", got["why"]),
+            );
+        }
+    }
+
     /// The destination as a local directory: the configured path, or a MinIO prefix pulled whole.
     fn local_out(&self, e: &Value) -> PathBuf {
         let dest = e.get("destination").expect("a destination");
@@ -400,6 +552,30 @@ impl Case {
         self.cwd
             .join(s(dest, "path").expect("a local destination path"))
     }
+}
+
+/// `base` with `.ext` appended.
+fn with_ext(base: &Path, ext: &str) -> PathBuf {
+    PathBuf::from(format!("{}.{ext}", base.display()))
+}
+
+/// `${VAR}` in `text` resolved the way rivet resolves a config (src/config/resolve.rs): `--param` first, then the run's env; an unresolved one stays.
+fn resolve_vars(text: &str, params: &[(String, String)], envs: &[(&str, &str)]) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(i) = rest.find("${") {
+        let Some(j) = rest[i..].find('}') else { break };
+        let name = &rest[i + 2..i + j];
+        out.push_str(&rest[..i]);
+        let value = params
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.clone())
+            .or_else(|| env_of(envs, name).filter(|_| !name.is_empty()));
+        out.push_str(&value.unwrap_or_else(|| rest[i..=i + j].to_string()));
+        rest = &rest[i + j + 1..];
+    }
+    out + rest
 }
 
 /// A string field of a YAML mapping.
@@ -432,6 +608,13 @@ fn manifests_of(out: &Path) -> ManifestSnapshot {
 /// Run one oracle verb over `spec`; log PASS / SKIP / XFAIL, or panic with every disagreement. Returns whether it XFAILed.
 fn verdict_of(name: &str, spec: &serde_json::Value, verb: &str, opts: &Opts) -> bool {
     let t0 = std::time::Instant::now();
+    // A marker names one export and one failure class; the oracle says whether every failure is of it.
+    let marker = opts.xfail.filter(|k| k.export == name && verb == "grade");
+    let mut spec = spec.clone();
+    if let Some(k) = marker {
+        spec["known_defect"] = k.class.into();
+    }
+    let spec = &spec;
     let verdict = run_rig_oracle(spec, verb);
     let took = format!("{verb} {} ms", t0.elapsed().as_millis());
     if let Some(why) = verdict["skip"].as_str() {
@@ -445,11 +628,22 @@ fn verdict_of(name: &str, spec: &serde_json::Value, verb: &str, opts: &Opts) -> 
         .filter_map(|f| f.as_str().map(str::to_string))
         .collect();
     if failures.is_empty() {
-        log("PASS", name, &format!("{took} {}", verdict["facts"]));
+        match verdict["partial"].as_str() {
+            Some(gap) => log(
+                "PARTIAL",
+                name,
+                &format!("{took}: {gap} {}", verdict["facts"]),
+            ),
+            None => log("PASS", name, &format!("{took} {}", verdict["facts"])),
+        }
         return false;
     }
-    if let Some(why) = opts.xfail {
-        log("XFAIL", name, &format!("{why} — {}", failures.join(" | ")));
+    if let Some(k) = marker.filter(|_| verdict["known_defect"].as_bool() == Some(true)) {
+        log(
+            "XFAIL",
+            name,
+            &format!("[{}] {} — {}", k.class, k.reason, failures.join(" | ")),
+        );
         return true;
     }
     log("FAIL", name, &failures.join(" | "));
@@ -555,4 +749,18 @@ fn source_url(url: &str) -> String {
     ]
     .iter()
     .fold(url.to_string(), |u, (from, to)| u.replace(from, to))
+}
+
+#[test]
+fn the_oracle_resolves_config_vars_as_rivet_does_params_first() {
+    let params = [("T".to_string(), "from_param".to_string())];
+    let envs = [("T", "from_env"), ("U", "url_env")];
+    assert_eq!(
+        resolve_vars(
+            "q: ${T} url: ${U} keep: ${RIVET_ORACLE_UNSET_VAR}",
+            &params,
+            &envs
+        ),
+        "q: from_param url: url_env keep: ${RIVET_ORACLE_UNSET_VAR}",
+    );
 }

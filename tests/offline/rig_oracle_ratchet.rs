@@ -1,9 +1,10 @@
 //! Shrink-only ceilings for the rig's default oracle.
 //!
-//! Every successful `run|load|compact --config` started through the `Rig` or a
-//! shared runner helper is graded by `dev/release_oracle/rig_oracle.py`
-//! (tests/common/verify.rs, facts from the config file); a hand-built spawn is
-//! not. Three counts may only go down:
+//! Every successful `run|load|compact --config` and `apply <config.yaml>` started
+//! through the `Rig` or a shared runner helper is graded by
+//! `dev/release_oracle/rig_oracle.py` (tests/common/verify.rs, facts from the
+//! config file); a hand-built spawn and a `Rig::spawn_args_env` child are not.
+//! Four counts may only go down:
 //!
 //! * oracle opt-outs (`.no_oracle("<reason>")`, `run_rivet_ok_no_oracle`,
 //!   `RIVET_TEST_NO_ORACLE`) — each one is a live run no independent reader checks;
@@ -12,7 +13,9 @@
 //!   census) — the one DuckDB session belongs to the Python oracle, and these
 //!   are the calls still to migrate onto it;
 //! * hand-built `Command::new` spawns of the rivet binary in tests/live — runs
-//!   no oracle grades.
+//!   no oracle grades;
+//! * `Rig::spawn_args_env` call sites in tests/live — a live child the caller
+//!   reaps, logged as a SKIP and never graded.
 //!
 //! A count below its ceiling fails too, so every migration lowers the ceiling
 //! in the same diff and cannot be spent later as silent slack.
@@ -145,20 +148,22 @@ fn rust_duckdb_helper_call_sites_never_grow() {
     );
 }
 
-/// `(test fn, reason prefix)` of every `.oracle_known_defect(` site: a product defect the oracle must keep catching. Removing one is allowed; adding one is a reviewed diff here.
-const KNOWN_DEFECTS: &[(&str, &str)] = &[
+/// `(test fn, failure class, reason prefix)` of every `.oracle_known_defect(` site: a product defect the oracle must keep catching, excused only for its class. Removing one is allowed; adding one is a reviewed diff here.
+const KNOWN_DEFECTS: &[(&str, &str, &str)] = &[
     (
         "roast_pg_cdc_refuses_a_bare_table_name_that_matches_two_relations",
+        "delivered-only rows",
         "known defect: a bare-name capture delivers the WAL rows",
     ),
     (
         "pg_cdc_pk_changing_update_captures_and_does_not_brick",
+        "delivered-only rows",
         "known defect: a PK-changing UPDATE carries no delete",
     ),
 ];
 
-/// `(enclosing fn, reason)` of every `.oracle_known_defect("…")` call in `text`.
-fn known_defect_sites(text: &str) -> Vec<(String, String)> {
+/// `(enclosing fn, class, reason)` of every `.oracle_known_defect("<class>", "<reason>")` call in `text`.
+fn known_defect_sites(text: &str) -> Vec<(String, String, String)> {
     text.match_indices(".oracle_known_defect(")
         .map(|(i, _)| {
             let before = &text[..i];
@@ -171,19 +176,17 @@ fn known_defect_sites(text: &str) -> Vec<(String, String)> {
                         .collect::<String>()
                 })
                 .unwrap_or_default();
-            let reason = text[i..]
-                .split_once('"')
-                .and_then(|(_, r)| r.split_once('"'))
-                .map(|(r, _)| r.to_string())
-                .unwrap_or_default();
-            (f, reason)
+            let mut strings = text[i..].split('"').skip(1).step_by(2);
+            let class = strings.next().unwrap_or_default().to_string();
+            let reason = strings.next().unwrap_or_default().to_string();
+            (f, class, reason)
         })
         .collect()
 }
 
 #[test]
 fn oracle_known_defects_are_a_named_set_that_only_shrinks() {
-    let sites: Vec<(String, String)> = sources()
+    let sites: Vec<(String, String, String)> = sources()
         .iter()
         .filter(|(rel, _)| rel != "tests/common/rig/verify.rs")
         .flat_map(|(_, t)| known_defect_sites(t))
@@ -194,12 +197,12 @@ fn oracle_known_defects_are_a_named_set_that_only_shrinks() {
         "oracle_known_defect sites",
         "the marker moved",
     );
-    let unlisted: Vec<&(String, String)> = sites
+    let unlisted: Vec<&(String, String, String)> = sites
         .iter()
-        .filter(|(f, r)| {
+        .filter(|(f, c, r)| {
             !KNOWN_DEFECTS
                 .iter()
-                .any(|(kf, kp)| kf == f && r.starts_with(kp))
+                .any(|(kf, kc, kp)| kf == f && kc == c && r.starts_with(kp))
         })
         .collect();
     assert!(
@@ -242,5 +245,23 @@ fn raw_rivet_invocations_in_live_tests_never_grow() {
         "raw rivet invocations in tests/live: {n}, ceiling {RAW_RIVET_CEILING}. These runs bypass \
          the default oracle; drive rivet through `Rig` or a `run_rivet*` helper, and a \
          migrated call lowers the ceiling here."
+    );
+}
+
+/// `Rig::spawn_args_env` call sites in tests/live: children the oracle never grades.
+const SPAWNED_CEILING: usize = 7;
+
+#[test]
+fn spawned_children_in_live_tests_never_grow() {
+    let n: usize = sources()
+        .iter()
+        .filter(|(rel, _)| rel.starts_with("tests/live/"))
+        .map(|(_, t)| t.matches(".spawn_args_env(").count())
+        .sum();
+    assert_eq!(
+        n, SPAWNED_CEILING,
+        "`spawn_args_env` sites in tests/live: {n}, ceiling {SPAWNED_CEILING}. A spawned child's run \
+         is not graded; wait on the run through a graded `Rig` runner instead, and a migrated site \
+         lowers the ceiling here."
     );
 }

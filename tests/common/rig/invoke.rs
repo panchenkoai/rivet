@@ -315,8 +315,15 @@ impl Rig {
     /// For tests that must act on a running process — signal it, inspect its
     /// children, watch the staged `.tmp` appear — rather than wait for an exit
     /// status. `run_args_env` blocks until completion and so cannot express them.
-    /// The caller owns the `Child` and must reap it.
+    /// The caller owns the `Child` and must reap it; its run is not graded (logged as a SKIP, the sites under a ceiling).
     pub fn spawn_args_env(&self, extra: &[&str], envs: &[(&str, &str)]) -> std::process::Child {
+        if self.oracle_off.is_none() {
+            crate::common::verify::log(
+                "SKIP",
+                &self.name,
+                "a spawned child: the caller owns its exit, so its run is not graded",
+            );
+        }
         self.invoke_command(&self.run_argv(extra), envs)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())

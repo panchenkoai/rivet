@@ -15,13 +15,13 @@ impl Rig {
         self
     }
 
-    /// A known product defect the oracle must keep catching: a disagreement is expected, and a rig whose graded runs all agree fails with "now passes".
-    pub fn oracle_known_defect(mut self, reason: &str) -> Self {
+    /// A known product defect on this rig's own export: only failures of `class` (a name in rig_oracle.KNOWN_DEFECT_CLASSES) are excused, any other FAILs, and a rig that never shows the class fails with "now passes".
+    pub fn oracle_known_defect(mut self, class: &str, reason: &str) -> Self {
         assert!(
             !reason.trim().is_empty(),
             "oracle_known_defect needs a reason — name the defect and the step that fixes it"
         );
-        self.oracle_xfail = Some(reason.to_string());
+        self.oracle_xfail = Some((class.to_string(), reason.to_string()));
         self
     }
 
@@ -32,7 +32,13 @@ impl Rig {
         envs: &[(&str, &str)],
         cwd: Option<&Path>,
     ) -> Option<crate::common::verify::Case> {
-        if self.oracle_off.is_some() {
+        if let Some(why) = &self.oracle_off {
+            if matches!(
+                argv.first().map(String::as_str),
+                Some("run" | "load" | "compact" | "apply")
+            ) {
+                crate::common::verify::log("OFF", &self.name, why);
+            }
             return None;
         }
         crate::common::verify::begin(argv, envs, cwd)
@@ -41,7 +47,13 @@ impl Rig {
     /// Grade a successful invocation; records an expected known-defect disagreement.
     pub(crate) fn oracle_finish(&self, case: crate::common::verify::Case, envs: &[(&str, &str)]) {
         let opts = crate::common::verify::Opts {
-            xfail: self.oracle_xfail.as_deref(),
+            xfail: self.oracle_xfail.as_ref().map(|(class, reason)| {
+                crate::common::verify::KnownDefect {
+                    export: &self.name,
+                    class,
+                    reason,
+                }
+            }),
             key: self.census_key.as_deref(),
         };
         if crate::common::verify::finish(case, envs, &opts) {
@@ -53,7 +65,7 @@ impl Rig {
 impl Drop for Rig {
     /// A known-defect marker whose rig never disagreed fails the test: the defect is fixed and the marker must go.
     fn drop(&mut self) {
-        if let Some(why) = &self.oracle_xfail
+        if let Some((_, why)) = &self.oracle_xfail
             && !self.oracle_xfailed.get()
             && !std::thread::panicking()
         {

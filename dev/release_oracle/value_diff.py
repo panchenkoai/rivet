@@ -23,7 +23,7 @@ def canon(v: object) -> object:
     if v is None:
         return None
     if isinstance(v, bool):
-        return int(v)
+        return ("num", str(int(v)))
     if isinstance(v, uuid.UUID):
         return v.hex
     if isinstance(v, (bytes, bytearray, memoryview)):
@@ -43,11 +43,12 @@ def canon(v: object) -> object:
         return ("num", str(v))
     if isinstance(v, float):
         return ("num", repr(v))
+    if isinstance(v, (dict, JsonObject)):
+        # Keys sorted (jsonb and warehouse JSON reorder them); a duplicate key keeps every value, in document order.
+        return ["obj", *sorted(([str(k), canon(x)] for k, x in (v.items() if isinstance(v, dict) else v)), key=lambda p: p[0])]
     if isinstance(v, (list, tuple)):
         # rivet lands an array as ARRAY<STRUCT<item T>> (docs/type-mapping.md): same values, one wrapper deeper.
         return [canon(x["item"]) if isinstance(x, dict) and set(x) == {"item"} else canon(x) for x in v]
-    if isinstance(v, dict):
-        return {str(k): canon(x) for k, x in sorted(v.items())}
     if isinstance(v, str):
         bc = _bc_text(v)
         if bc is not None:
@@ -60,17 +61,29 @@ def canon(v: object) -> object:
             sign, h, m, sec, frac = clock.groups()
             total = decimal.Decimal((int(h) * 60 + int(m)) * 60 + int(sec)) + decimal.Decimal("0." + (frac or "0"))
             return ("dur", 0, 0, _secs(-total if sign else total))
-        interval = _interval(v)
+        try:
+            interval = _interval(v)
+        except decimal.InvalidOperation:
+            interval = None
         if interval is not None:
             return ("dur", *interval)
         s = v.strip()
         if s[:1] in "{[":
             try:
-                return canon(json.loads(s))
+                return canon(json_value(s))
             except ValueError:
                 pass
         return v
     return str(v)
+
+
+class JsonObject(list):
+    """A JSON object as its (key, value) pairs in document order: a duplicate key is kept, never collapsed."""
+
+
+def json_value(text: str) -> object:
+    """JSON text parsed exactly: numbers as Decimal (never float), objects as `JsonObject` pairs (duplicate keys survive)."""
+    return json.loads(text, parse_float=decimal.Decimal, object_pairs_hook=JsonObject)
 
 
 def _secs(d: decimal.Decimal) -> str:
@@ -458,6 +471,12 @@ def _self_test() -> None:
     wide = "123456789012345678901234567890.012345678"
     assert canon(decimal.Decimal(wide + "9")) != canon(decimal.Decimal(wide + "8")), "a 40-digit decimal keeps every digit"
     assert canon('{"b":1,"a":2}') == canon({"a": 2, "b": 1})
+    assert canon('{"a": 0.1000000000000000000001}') != canon('{"a":0.1}'), "a JSON number keeps every digit"
+    assert canon('{"x": 12345678901234567.89}') != canon('{"x":12345678901234568.0}'), "a JSON number is never read as a double"
+    assert canon('{"a":1,"a":2}') != canon('{"a":2}'), "a duplicate JSON key is kept, never collapsed to the last"
+    assert canon('{"a": 1.50, "b": [1]}') == canon('{"b":[1],"a":1.5}'), "key order and trailing zeros are not differences"
+    for bad in ("1:2:3.4.5", "PT1..S"):
+        assert canon(bad) == bad, f"malformed interval text {bad!r} is compared as text, never raises"
     assert canon(dt.time(4, 0)) != canon(dt.timedelta(hours=100)), "a wrapped TIME is a difference"
     assert diff_rows([{"id": 1, "u": u}], [{"id": 1, "u": b"\x00" * 16}]), "garbage bytes are a finding"
     assert not diff_rows([{"id": 1, "u": u}], [{"id": 1, "u": u.bytes}])
