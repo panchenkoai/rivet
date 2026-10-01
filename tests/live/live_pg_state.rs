@@ -488,10 +488,10 @@ fn pg_several_writers_migrating_one_database_at_once_all_succeed() {
     const WRITERS: usize = 4;
 
     let Ok(admin_url) = std::env::var("RIVET_TEST_STATE_URL") else {
-        return;
+        return crate::common::skip_live("RIVET_TEST_STATE_URL unset");
     };
     if !admin_url.starts_with("postgres") {
-        return;
+        return crate::common::skip_live("RIVET_TEST_STATE_URL is not a postgres URL");
     }
     let name = format!(
         "rivet_migrace_{}",

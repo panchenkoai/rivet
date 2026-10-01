@@ -994,8 +994,7 @@ mod tests {
     #[ignore = "live: requires SNOWFLAKE_TEST_CONNECTION"]
     fn snowflake_live_adopts_a_full_load_table_as_the_changelog_baseline() {
         let Ok(connection) = std::env::var("SNOWFLAKE_TEST_CONNECTION") else {
-            eprintln!("skipping: SNOWFLAKE_TEST_CONNECTION unset");
-            return;
+            return crate::test_hook::skip_live("SNOWFLAKE_TEST_CONNECTION unset");
         };
         let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
         let mut loader = SnowflakeLoader::new(connection);
