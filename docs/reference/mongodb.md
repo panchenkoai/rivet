@@ -462,9 +462,20 @@ the type (`1001` and `"1001"` render as *different* JSON text — `1001` vs
 `"1001"`), so a type-exact key is:
 
 ```sql
--- distinguishes int 1001 from string "1001"; correct on ANY collection
+-- distinguishes int 1001 from string "1001" wherever `document` is present
 TO_JSON_STRING(JSON_QUERY(PARSE_JSON(SAFE_CONVERT_BYTES_TO_STRING(document)), '$._id'))
 ```
+
+**This key needs every delete to carry its pre-image.** A delete without one has
+`document = NULL` and only the flat `_id` text, so it has no `document._id` to key
+on, and by the flat `_id` a delete of `_id: null` and a delete of `_id: "null"` are
+identical rows (measured:
+`live_cdc_mongo::roast_mongo_cdc_deletes_of_null_and_string_null_id_are_distinguishable`,
+a known defect). With `changeStreamPreAndPostImages` enabled on
+the collection (MongoDB 6.0+) before the deletes, each delete's `document` holds its
+typed `_id` and the two deletes differ
+(`live_cdc_mongo::mongo_cdc_pre_images_tell_deletes_of_null_and_string_null_id_apart`).
+Without pre-images, rivet's CDC output cannot tell such deletes apart.
 
 A CDC merge keyed on it, deduped by the order-preserving `__pos` (latest wins):
 
@@ -488,8 +499,8 @@ WHEN NOT MATCHED AND S.__op != 'delete' THEN INSERT (document) VALUES (S.documen
 Heterogeneous `_id` in one collection is **rare and discouraged** — it usually
 signals an app bug or a botched migration. Keyset paging and `parallel` reject it
 outright (see the caveat below), so it only ever reaches a full scan or CDC. The
-`document._id` key above is also correct on **uniform** collections, so it is a
-safe default if you would rather not special-case.
+`document._id` key above also works on **uniform** collections, under the same
+pre-image condition for deletes.
 
 ---
 
