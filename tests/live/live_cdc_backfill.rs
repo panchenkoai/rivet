@@ -325,6 +325,48 @@ fn a_crashed_chunked_baseline_finishes_on_the_next_plain_run() {
     );
 }
 
+/// A PLAIN chunked recipe (no `chunk_checkpoint`) runs the baseline through the plain
+/// chunked runner: one part per chunk, every id once, and the next run reads only the delta.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc up -d mysql-cdc"]
+fn a_plain_chunked_baseline_reads_each_id_once_in_its_recipe_chunks() {
+    let (tbl, _guard) = seeded("rivet_bf_plain", 150);
+    let rig = Rig::mysql_cdc(&tbl)
+        .cdc("backfill: auto")
+        .also_batch_export("baseline", &tbl, "chunked")
+        .also_export_line("chunk_column: id")
+        .also_export_line("chunk_size: 50");
+
+    rig.run_ok();
+    let snap = snapshot_dir(&rig);
+    assert_eq!(
+        declared_parquet_parts(&snap).len(),
+        3,
+        "the recipe's chunking reached the leg: 150 ids in chunks of 50"
+    );
+    assert_eq!(
+        duckdb_declared_dir_id_set(&snap).len(),
+        150,
+        "every id once"
+    );
+    assert_eq!(
+        duckdb_declared_dir_scalar(&snap, "COUNT(*)"),
+        query_one(&format!("SELECT COUNT(*) FROM {tbl}")),
+        "no duplicate rows, graded against the source"
+    );
+
+    conn()
+        .query_drop(format!("INSERT INTO {tbl} (id, v) VALUES (151, 151)"))
+        .expect("insert");
+    rig.run_ok();
+    assert_eq!(
+        duckdb_declared_dir_scalar(&snap, "COUNT(*)"),
+        150,
+        "the baseline is not re-read"
+    );
+    assert_eq!(total_parquet_rows(&rig.out_dir()), 1, "only the delta");
+}
+
 /// The KEYSET leg — the recipe `rivet init` scaffolds for every table with a
 /// single-column key, and the shape a 317M-row partner table gets — crashed after
 /// its first page is durable must finish on the next plain run, complete and
