@@ -1921,6 +1921,7 @@ fn every_override_decoder_round_trips_against_oracles_rendering() {
     let n = t.name();
     let out = tempfile::tempdir().unwrap();
     let run = Rig::oracle_batch(n)
+        .no_oracle("every column carries a declared `columns:` override whose own rendering is this test's subject")
         .export_line(OVERRIDE_DECODERS)
         .dest_path(out.path().to_path_buf())
         .run_args(&[]);

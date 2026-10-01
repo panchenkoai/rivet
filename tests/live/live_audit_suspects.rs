@@ -227,6 +227,7 @@ fn mssql_incremental_on_a_legacy_datetime_cursor_takes_the_next_row_once() {
     ));
 
     let rig = Rig::mssql_batch(&table)
+        .no_oracle("query export over a legacy DATETIME: a query names no catalog type, so the 1/300 s tick canon cannot apply (the scanner truncates, rivet rounds)")
         .query(&format!("SELECT id, updated_at FROM {table}"))
         .mode("incremental")
         .export_line("cursor_column: updated_at");
@@ -982,4 +983,20 @@ fn pg_batch_plain_timestamp_infinity_is_refused_not_a_panic() {
         "SELECT 1 AS id, '-infinity'::timestamp AS v",
         "v",
     );
+}
+
+/// A DATETIMEOFFSET's 7th fractional digit is graded at the microsecond delivery through the ledger's `today_render`, not failed for the known ns gap.
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn mssql_datetimeoffset_seventh_digit_is_graded_at_todays_precision() {
+    require_alive(LiveService::Mssql);
+    let table = unique_name("aud_dto7");
+    mssql_exec(&format!(
+        "CREATE TABLE {table} (id INT PRIMARY KEY, t DATETIMEOFFSET(7));
+         INSERT INTO {table} VALUES (1, '2026-06-23 10:00:00.1234567 +05:30'), (2, NULL);"
+    ));
+    let batches = Rig::mssql_batch(&table).run_and_read();
+    mssql_exec(&format!("DROP TABLE {table}"));
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(rows, 2, "both rows are delivered");
 }

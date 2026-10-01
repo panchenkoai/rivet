@@ -89,7 +89,9 @@ fn a_pg_cdc_drain_reads_the_wal_not_the_table_and_records_what_it_decoded() {
     ))
     .unwrap();
     let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
-    let rig = Rig::pg_cdc(&tbl, &slot).duckdb_oracle();
+    let rig = Rig::pg_cdc(&tbl, &slot).duckdb_oracle().no_oracle(
+        "the test counts reads of the source table; the oracle's own read-back would be counted",
+    );
     rig.run_ok(); // creates the slot
     let _slot = Slot(slot.clone());
     c.batch_execute(&format!(
@@ -135,7 +137,9 @@ fn a_mssql_cdc_drain_reads_the_change_table_not_the_source_table() {
         table: table.clone(),
         ci: ci.clone(),
     };
-    let rig = Rig::mssql_cdc(&table, &ci).duckdb_oracle();
+    let rig = Rig::mssql_cdc(&table, &ci).duckdb_oracle().no_oracle(
+        "the test counts reads of the source table; the oracle's own read-back would be counted",
+    );
     rig.run_ok(); // anchor
     mssql_cdc_exec(&format!(
         "INSERT INTO dbo.{table} SELECT n, n FROM (VALUES {}) v(n)",
@@ -209,7 +213,8 @@ fn a_mongo_cdc_drain_reads_the_oplog_not_the_collection() {
     );
     let rig = Rig::mongo_cdc("t")
         .source_url(&MongoTest::url(PORT, &db))
-        .duckdb_oracle();
+        .duckdb_oracle()
+        .no_oracle("the test counts reads of the source collection; the oracle's own read-back would be counted");
     rig.run_ok(); // anchor
     for i in TABLE_ROWS + 1..=TABLE_ROWS + CHANGES {
         m.upsert_set("t", i, "v", "x");

@@ -112,6 +112,8 @@ mod live_service_ports_guard;
 mod load_allow_source_drift;
 #[path = "offline/rig_adoption_guard.rs"]
 mod rig_adoption_guard;
+#[path = "offline/rig_oracle_ratchet.rs"]
+mod rig_oracle_ratchet;
 #[path = "offline/runner_frame_gate.rs"]
 mod runner_frame_gate;
 #[path = "offline/scenario_artifact_matrix_guard.rs"]

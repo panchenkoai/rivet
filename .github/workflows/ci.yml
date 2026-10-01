@@ -1287,6 +1287,14 @@ jobs:
       # entry-point guard in tests/offline/release_oracle_entrypoint_guard.rs).
       - name: The release oracle's env-flag grammar is one grammar
         run: python3 -m dev.release_oracle --self-test
+      # uv: the rig oracle's self-test writes and reads parquet through the pinned duckdb/pyarrow.
+      - uses: taiki-e/install-action@v2.87.12
+        with:
+          tool: uv
+      - name: The value canon and the rig oracle's graders self-test
+        run: |
+          uv run --frozen python -m dev.release_oracle.value_diff
+          uv run --frozen python -m dev.release_oracle.rig_oracle
 
   test:
     name: Tests
@@ -1442,6 +1450,10 @@ jobs:
         with:
           toolchain: "1.94"
       - uses: Swatinem/rust-cache@v2
+      # uv runs the rig's default oracle (dev/release_oracle/rig_oracle.py, pinned by uv.lock).
+      - uses: taiki-e/install-action@v2.87.12
+        with:
+          tool: uv
 
       - name: Independent row-hash oracle deps
         # `xxhash` is what makes the row-hash check INDEPENDENT: it rebuilds the
@@ -1664,6 +1676,17 @@ jobs:
           --skip cleanup_source_never_deletes_parts --skip compact_after_a_source_alter
           --skip a_non_unicode_database_round_trips
           --skip a_read_blocked_longer_than_thirty_seconds_still_completes
+
+      - name: Rig oracle verdict census
+        # A passing test's stderr is hidden, so the verdict log is the only proof the oracle ran.
+        if: ${{ !cancelled() }}
+        run: |
+          log=target/rivet-oracle.log
+          test -s "$log" || { echo "::error::no rig oracle verdict was logged ($log) - the oracle did not run"; exit 1; }
+          for v in PASS XFAIL SKIP FAIL; do printf '%s %s\n' "$v" "$(grep -c "^RIVET-ORACLE-$v " "$log" || true)"; done
+          grep '^RIVET-ORACLE-SKIP ' "$log" | sed 's/^[^—]*— //' | sort | uniq -c | sort -rn | head -20
+          pass=$(grep -c '^RIVET-ORACLE-PASS ' "$log" || true)
+          [ "$pass" -gt 0 ] || { echo "::error::the rig oracle logged no PASS verdict"; exit 1; }
 
       - name: Stop services
         if: always()

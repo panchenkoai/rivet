@@ -53,8 +53,9 @@ class Oracle:
         mongo: str | None = None,
         gcs: bool = False,
         state: str | None = None,
+        config: dict | None = None,
     ) -> None:
-        self.db = duckdb.connect()
+        self.db = duckdb.connect(config=config or {})
         self.project: str | None = None
         if gcs:
             import subprocess

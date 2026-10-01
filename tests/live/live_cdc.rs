@@ -4395,7 +4395,9 @@ fn roast_pg_cdc_refuses_a_bare_table_name_that_matches_two_relations() {
     c.batch_execute("DROP SCHEMA mv CASCADE").unwrap();
     c.execute(&format!("INSERT INTO {tbl} VALUES (3,'only')"), &[])
         .unwrap();
-    let quiet = Rig::pg_cdc(&tbl, &slot).source_url(cdc_db.url());
+    let quiet = Rig::pg_cdc(&tbl, &slot)
+        .source_url(cdc_db.url())
+        .oracle_known_defect("known defect: a bare-name capture delivers the WAL rows of a same-named relation in another schema or a matview into this export (PostgreSQL CDC engine step, identity::resolve_captured_table)");
     let out = quiet.run_ok_capture();
     assert!(
         !out.contains("could mean"),

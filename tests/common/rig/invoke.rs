@@ -41,6 +41,7 @@ impl Rig {
 
     /// Run to completion and collect the output.
     fn invoke(&self, argv: &[String], envs: &[(&str, &str)]) -> std::process::Output {
+        let before = (argv[0] == "run").then(|| self.oracle_before());
         let out = self
             .invoke_command(argv, envs)
             .output()
@@ -49,7 +50,26 @@ impl Rig {
         // configs even without --annotate-waves) — absorb it so the hand-edit
         // guard keeps firing only on edits made OUTSIDE an invocation.
         self.absorb_product_config_writes();
+        self.oracle_if_ok(before, &out, envs, argv);
         out
+    }
+
+    /// Hand a successful `run` to the default oracle (verify.rs).
+    fn oracle_if_ok(
+        &self,
+        before: Option<super::verify::ManifestSnapshot>,
+        out: &std::process::Output,
+        envs: &[(&str, &str)],
+        argv: &[String],
+    ) {
+        if let Some(b) = before.filter(|_| out.status.success()) {
+            self.oracle_after(&b, envs, argv);
+        }
+        if out.status.success()
+            && matches!(argv.first().map(String::as_str), Some("load" | "compact"))
+        {
+            self.oracle_after_load(envs, argv);
+        }
     }
 
     /// Run an ARBITRARY subcommand against this rig's config: `rivet <args…>
@@ -207,12 +227,14 @@ impl Rig {
     /// `Command::new(RIVET_BIN)` sites did, and the rig-adoption guard rightly
     /// refused them.
     pub fn run_in_dir(&self, dir: &std::path::Path) -> std::process::Output {
+        let before = Some(self.oracle_before());
         let out = self
             .invoke_command(&self.run_argv(&[]), &[])
             .current_dir(dir)
             .output()
             .expect("spawn rivet binary");
         self.absorb_product_config_writes();
+        self.oracle_if_ok(before, &out, &[], &self.run_argv(&[]));
         out
     }
 
@@ -273,16 +295,19 @@ impl Rig {
         let mut cmd = self.invoke_command(&self.run_argv(&[]), envs);
         cmd.stdout(std::fs::File::create(&out_path).expect("bounded stdout file"))
             .stderr(std::fs::File::create(&err_path).expect("bounded stderr file"));
+        let before = Some(self.oracle_before());
         let mut child = cmd.spawn().expect("spawn rivet binary");
         let start = std::time::Instant::now();
         loop {
             if let Some(status) = child.try_wait().expect("try_wait rivet") {
                 self.absorb_product_config_writes();
-                return Some(std::process::Output {
+                let out = std::process::Output {
                     status,
                     stdout: std::fs::read(&out_path).unwrap_or_default(),
                     stderr: std::fs::read(&err_path).unwrap_or_default(),
-                });
+                };
+                self.oracle_if_ok(before, &out, envs, &self.run_argv(&[]));
+                return Some(out);
             }
             if start.elapsed() >= timeout {
                 let _ = child.kill();
