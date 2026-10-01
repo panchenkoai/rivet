@@ -105,8 +105,6 @@ pub(crate) struct MysqlChangeStream {
     identity: (String, String),
     /// `binlog_row_image`'s verdict, read at open on the connection that dumps.
     row_image: crate::source::cdc::RowImage,
-    /// `binlog_row_metadata`'s warning, read at open on the connection that dumps.
-    positional: Option<String>,
 }
 
 impl MysqlChangeStream {
@@ -178,31 +176,6 @@ impl MysqlChangeStream {
         }
     }
 
-    /// Pure verdict on `binlog_row_metadata` — the engine setting that decides
-    /// whether the sink maps binlog images by NAME or by POSITION.
-    ///
-    /// A WARNING and not a refusal, unlike its sibling [`Self::row_image_verdict`],
-    /// and the asymmetry is the whole point: `binlog_row_image` defaults to FULL, so
-    /// refusing a non-FULL value refuses a setting somebody CHOSE.
-    /// `binlog_row_metadata` defaults to MINIMAL — refusing it would refuse every
-    /// MySQL nobody has touched.
-    ///
-    /// What MINIMAL costs, MEASURED (2026-08-25, MySQL 8.0.46) rather than argued:
-    /// a table `(id, a, b)` holding `(1, 'AAA', 'BBB')`, then
-    /// `ALTER TABLE .. MODIFY b VARCHAR(9) AFTER id`, then a resume across that
-    /// boundary — the schema is resolved at OPEN (new order) while the event
-    /// replays from the CHECKPOINT (old order), so the parquet came back
-    /// `a = 'BBB', b = 'AAA'`. Swapped, `status: success`, nothing in the log.
-    ///
-    /// The sink's arity guard cannot see it: a reorder does not change arity, and
-    /// under FULL the guard is skipped outright (`image_names.is_some()` ⇒ mapped by
-    /// name, which is reorder-proof). So FULL is not a tuning preference here — it
-    /// is what makes a mid-stream DDL safe.
-    ///
-    /// `None` (a server too old to have the variable — it is 8.0.1+) is NOT
-    /// evidence of a bad setting: MySQL 5.7 has no way to carry names, the sink
-    /// maps positionally there by construction, and a warning naming a variable
-    /// that does not exist is one an operator cannot act on.
     /// Read a resume position out of a checkpoint that has already PARSED.
     ///
     /// The MSSQL peer of this (`mssql::cdc::resume_from_checkpoint`) exists because
@@ -343,41 +316,47 @@ impl MysqlChangeStream {
             "mysql cdc: `{configured}` is unqualified, so it means the connection's own \
              database (`{own_db}`) — but an event for that name arrived from `{saw}`. The \
              binlog dump is server-wide and routing matches a bare name in any schema, so \
-             `{saw}.{configured}`'s rows would land in this export; under the default \
-             binlog_row_metadata=MINIMAL the wire carries no column names, so they are \
-             mapped by POSITION under THIS table's names. No catalog check can warn about \
+             `{saw}.{configured}`'s rows would land in this export under THIS table's \
+             name. No catalog check can warn about \
              this: information_schema is filtered by privilege, so a database this \
              connection cannot see still reaches the binlog. Qualify it \
              (`{saw}.{configured}`) if that is the one you meant."
         ))
     }
 
-    pub(crate) fn row_metadata_warning(metadata: Option<&str>) -> Option<String> {
-        let m = metadata?;
-        if m.eq_ignore_ascii_case("FULL") {
-            return None;
-        }
+    /// Refusal text unless `@@global.binlog_row_metadata` is FULL (`None`: the server has no such variable).
+    pub(crate) fn row_metadata_refusal(metadata: Option<&str>) -> Option<String> {
+        let setting = match metadata {
+            Some(m) if m.eq_ignore_ascii_case("FULL") => return None,
+            Some(m) => format!("the server has binlog_row_metadata = {m}"),
+            None => "the server has no binlog_row_metadata variable (MySQL before 8.0.1)".into(),
+        };
         Some(format!(
-            "the server has binlog_row_metadata = {m} (MySQL's default), so binlog row events \
-             carry no column NAMES and the sink maps values by POSITION. A same-arity DDL that \
-             reorders columns across a resume boundary then silently SWAPS them (measured: a \
-             MODIFY .. AFTER moved 'BBB' into column `a` and 'AAA' into `b`, with status \
-             success), and any arity-changing DDL mid-window aborts the flush instead. Set \
-             `binlog_row_metadata = FULL` (8.0.1+) — rivet then maps by name and both cases \
-             become safe"
+            "mysql cdc: {setting}, so binlog row events carry no column NAMES and values could \
+             only be mapped by POSITION: after a column reorder or ALTER they land under the \
+             wrong names (source `(1, b='BBB', a='AAA')` arrives as `b='AAA', a='BBB'`). rivet \
+             refuses to capture that. Fix: `SET PERSIST binlog_row_metadata = FULL;` (needs \
+             SYSTEM_VARIABLES_ADMIN or SUPER), or `binlog_row_metadata = FULL` under [mysqld] in \
+             the server's config file and a restart. Events already written under MINIMAL stay \
+             nameless after the switch and cannot be read safely, so if this export already has \
+             a checkpoint, after the switch: {}",
+            crate::source::cdc::checkpoint_identity::RECOVER
         ))
     }
 
-    /// Live half of [`Self::row_metadata_warning`]: one query at open, on a
-    /// connection that is about to dump. A connect/permission failure answers
-    /// "nothing to say" — this exists to catch a CONFIGURATION, not to police
-    /// access, the same contract as [`Self::row_image`].
-    fn row_metadata_on(conn: &mut mysql::Conn) -> Option<String> {
+    /// Live half of [`Self::row_metadata_refusal`]: refuse at open unless the server writes column names.
+    fn refuse_nameless_binlog(conn: &mut mysql::Conn) -> Result<()> {
         use mysql::prelude::Queryable;
-        let m: Option<String> = conn
-            .query_first("SELECT @@global.binlog_row_metadata")
-            .unwrap_or(None);
-        Self::row_metadata_warning(m.as_deref())
+        let m: Option<String> = match conn.query_first("SELECT @@global.binlog_row_metadata") {
+            Ok(m) => m,
+            // ER_UNKNOWN_SYSTEM_VARIABLE: a server that predates the variable.
+            Err(mysql::Error::MySqlError(e)) if e.code == 1193 => None,
+            Err(e) => return Err(e.into()),
+        };
+        if let Some(why) = Self::row_metadata_refusal(m.as_deref()) {
+            crate::rivet_bail!(crate::error::codes::SOURCE_CDC_PREREQUISITE, "{why}");
+        }
+        Ok(())
     }
 
     /// The binlog row-image verdict, asked on a connection the caller holds.
@@ -621,7 +600,6 @@ impl MysqlChangeStream {
             Self::check_configured_tables_are_routable(&mut conn, &configured_tables)?;
         }
         let row_image = Self::row_image_on(&mut conn);
-        let positional = Self::row_metadata_on(&mut conn);
         // Refuse a compressed binlog rather than read past it in silence.
         refuse_compressed_binlog(&mut conn)?;
         // Refuse a replica that does not re-log what it applies: its binlog holds none of it.
@@ -676,7 +654,6 @@ impl MysqlChangeStream {
             own_db,
             identity,
             row_image,
-            positional,
         })
     }
 
@@ -818,6 +795,8 @@ impl MysqlChangeStream {
         };
         // ONE connection for every question asked before the dump; it then dumps.
         let mut conn = connect_conn(url, tls)?;
+        // Before the anchor is written: a refused first run must not pin a MINIMAL span.
+        Self::refuse_nameless_binlog(&mut conn)?;
         if let Some(path) = ckpt
             && let Some(pos) = Position::load(path)?
             && let Some((file, p)) =
@@ -1091,6 +1070,12 @@ impl MysqlChangeStream {
                 };
                 let schema = tme.database_name().to_string();
                 let table = tme.table_name().to_string();
+                let Some(image_names) = image_names else {
+                    if undecodable_event_is_ours(Some((&schema, &table)), &self.configured_tables) {
+                        return Err(nameless_rows_refusal(&schema, &table, &self.file, log_pos));
+                    }
+                    return Ok(true); // another table's — the routing filter would drop it anyway
+                };
                 // WIRE-side ambiguity check: a bare configured name that has now
                 // matched events from two databases. The catalog cannot see this —
                 // information_schema is privilege-filtered while the binlog dump is
@@ -1132,8 +1117,7 @@ impl MysqlChangeStream {
                             .iter()
                             .map(|i| {
                                 image_names
-                                    .as_ref()
-                                    .and_then(|n| n.get(*i))
+                                    .get(*i)
                                     .cloned()
                                     .unwrap_or_else(|| format!("column {i}"))
                             })
@@ -1162,7 +1146,7 @@ impl MysqlChangeStream {
                         after: after.map(|(v, _)| v),
                         position: position.clone(),
                         committed: false,
-                        image_names: image_names.clone(),
+                        image_names: Some(image_names.clone()),
                         seq: 0, // stamped by TxnSeq as the stream is consumed
                         poison,
                     };
@@ -1422,6 +1406,22 @@ pub(crate) fn undecodable_rows_refusal_message(kind: UndecodableRows) -> String 
 
 fn undecodable_rows_event_refusal(ev: &RowsEventData<'_>) -> anyhow::Error {
     anyhow::anyhow!(undecodable_rows_refusal_message(classify_rows_event(ev)))
+}
+
+/// Refuse a captured table's rows event whose TABLE_MAP carries no column names (written under MINIMAL).
+fn nameless_rows_refusal(schema: &str, table: &str, file: &str, log_pos: u64) -> anyhow::Error {
+    anyhow::Error::new(crate::error::CodedError::new(
+        crate::error::codes::SOURCE_CDC_UNDECODABLE,
+        format!(
+            "mysql cdc: `{schema}`.`{table}`: the rows event ending at binlog position \
+             {file}:{log_pos} has a TABLE_MAP with no column names: it was written while the \
+             server had binlog_row_metadata = MINIMAL, and the events keep the setting in force \
+             when they were WRITTEN. rivet never maps values by position, which puts them under \
+             the wrong names after a column reorder or ALTER. Make sure the server now has \
+             `binlog_row_metadata = FULL` (`SET PERSIST binlog_row_metadata = FULL;`), then: {}",
+            crate::source::cdc::checkpoint_identity::RECOVER
+        ),
+    ))
 }
 
 fn compressed_payload_refusal() -> anyhow::Error {
@@ -2112,10 +2112,6 @@ impl ChangeStream for MysqlChangeStream {
         self.row_image.clone()
     }
 
-    fn positional_mapping_warning(&mut self) -> Option<String> {
-        self.positional.clone()
-    }
-
     fn engine(&self) -> crate::source::cdc::CdcEngine {
         crate::source::cdc::CdcEngine::Mysql
     }
@@ -2488,43 +2484,48 @@ mod tests {
         assert_eq!(t("TRUNCATE TABLE `unclosed"), None);
     }
 
-    /// The asymmetry with `row_image_verdict` is deliberate and this pins it: a
-    /// non-FULL `binlog_row_image` is REFUSED (somebody chose it, the default is
-    /// FULL); a non-FULL `binlog_row_metadata` is WARNED (the default IS non-FULL,
-    /// so refusing would refuse every untouched MySQL).
+    /// Any `binlog_row_metadata` but FULL (or none at all) is refused, and the text names the fix and the order.
     #[test]
-    fn minimal_row_metadata_warns_and_names_the_escape_while_full_stays_quiet() {
-        assert_eq!(
-            MysqlChangeStream::row_metadata_warning(Some("FULL")),
-            None,
-            "a correctly-configured server must stay quiet, or the warning fires on \
-             every run and stops being read"
-        );
-        assert_eq!(
-            MysqlChangeStream::row_metadata_warning(Some("full")),
-            None,
-            "the server renders this variable uppercase, but a proxy or a older \
-             build need not — compare case-insensitively like row_image_verdict"
-        );
-        assert_eq!(
-            MysqlChangeStream::row_metadata_warning(None),
-            None,
-            "a server too old to HAVE the variable (pre-8.0.1) maps positionally by \
-             construction; naming a variable that does not exist is a warning nobody \
-             can act on"
-        );
-        for m in ["MINIMAL", "minimal", "SOMETHING_NEW"] {
-            let w = MysqlChangeStream::row_metadata_warning(Some(m))
-                .unwrap_or_else(|| panic!("{m} is not FULL — the sink maps by POSITION"));
+    fn row_metadata_other_than_full_is_refused_with_the_sql_fix_and_the_recovery_order() {
+        assert_eq!(MysqlChangeStream::row_metadata_refusal(Some("FULL")), None);
+        assert_eq!(MysqlChangeStream::row_metadata_refusal(Some("full")), None);
+        for m in [Some("MINIMAL"), Some("minimal"), Some("NO_LOG"), None] {
+            let why = MysqlChangeStream::row_metadata_refusal(m)
+                .unwrap_or_else(|| panic!("{m:?} carries no column names and must be refused"));
+            assert!(why.contains("binlog_row_metadata"), "{why}");
             assert!(
-                w.contains("binlog_row_metadata = FULL"),
-                "the warning must name the ESCAPE, not just the risk: {w}"
+                why.contains("`SET PERSIST binlog_row_metadata = FULL;`"),
+                "{why}"
             );
+            assert!(why.contains("by POSITION"), "{why}");
             assert!(
-                w.contains("POSITION") && w.contains("SWAP"),
-                "and must say what it costs — measured, not hedged: {w}"
+                why.ends_with(crate::source::cdc::checkpoint_identity::RECOVER),
+                "the recovery must anchor FIRST, then re-snapshot: {why}"
             );
         }
+        assert!(
+            MysqlChangeStream::row_metadata_refusal(Some("MINIMAL"))
+                .unwrap()
+                .contains("binlog_row_metadata = MINIMAL")
+        );
+    }
+
+    /// A nameless rows event is refused as UNDECODABLE, naming the table and the binlog position.
+    #[test]
+    fn a_nameless_rows_event_refusal_names_table_position_and_code() {
+        let err = nameless_rows_refusal("shop", "orders", "binlog.000007", 4321);
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some("RIVET_SOURCE_CDC_UNDECODABLE")
+        );
+        let text = err.to_string();
+        assert!(text.contains("`shop`.`orders`"), "{text}");
+        assert!(text.contains("binlog.000007:4321"), "{text}");
+        assert!(text.contains("binlog_row_metadata = MINIMAL"), "{text}");
+        assert!(
+            text.contains("`SET PERSIST binlog_row_metadata = FULL;`"),
+            "{text}"
+        );
     }
 
     /// The MySQL routing guard's decision surface.

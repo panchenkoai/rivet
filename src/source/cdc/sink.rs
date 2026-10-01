@@ -36,7 +36,7 @@ use crate::manifest::{
 use crate::pipeline::commit::{PartRecord, write_part_file};
 use crate::pipeline::manifest_writer::{write_manifest, write_manifest_without_success_marker};
 use crate::source::cdc::value::{self, RivetValue};
-use crate::source::cdc::{ChangeEvent, ChangeOp, ChangeStream, Position, TxnSeq};
+use crate::source::cdc::{ChangeEvent, ChangeStream, Position, TxnSeq};
 use crate::types::{TypeMapping, build_arrow_field};
 
 /// One table's wiring in a (possibly multi-table) CDC run: where its parts go
@@ -279,34 +279,6 @@ impl TableSink<'_> {
 /// (`public.orders` — matches schema AND table). Adapters always emit schema
 /// and table separately; comparing the config string verbatim against the
 /// bare event table silently routed ZERO events for qualified configs.
-/// Warn ONCE per (schema, table) per process that images are mapping by position.
-///
-/// The truth about a MySQL binlog image is on the wire — a `TABLE_MAP` written at
-/// `binlog_row_metadata=MINIMAL` carries no column names, whatever the server's
-/// setting is today. `row_metadata_warning` (the open-time probe) is the early
-/// hint; this is the one that cannot be wrong.
-fn warn_positional_once(schema: &str, table: &str) {
-    use std::collections::HashSet;
-    use std::sync::{Mutex, OnceLock};
-    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-    let key = format!("{schema}.{table}");
-    let mut seen = SEEN
-        .get_or_init(|| Mutex::new(HashSet::new()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    if seen.insert(key.clone()) {
-        log::warn!(
-            "cdc: {key}: this change image carries no column NAMES, so values are \
-             mapped by POSITION. On MySQL that is `binlog_row_metadata = MINIMAL` \
-             (the server default) — note the events replay the setting in force when \
-             they were WRITTEN, so a server switched to FULL still drains a MINIMAL \
-             backlog this way. A same-arity DDL that reorders columns then silently \
-             SWAPS them; an arity-changing one aborts the flush. Set \
-             `binlog_row_metadata = FULL` (8.0.1+) and re-capture from before the DDL"
-        );
-    }
-}
-
 /// Does this configured `table:` name the relation an event came from?
 ///
 /// The ENGINE decides how many readings a dotted string has, and passing it is not
@@ -773,8 +745,7 @@ fn refine_decimal_scales(columns: &mut [TypeMapping], events: &[ChangeEvent]) {
 // the pair: `file_token_is_the_one_sidecar_sanitizer` asserts file_token's own
 // output and is structurally blind to a second implementation in another file.
 
-/// One cell of a row image — resolved by NAME when the image carries names, by
-/// POSITION when it does not.
+/// One cell of a row image, resolved by NAME (`flush` refuses a nameless image first).
 ///
 /// Hoisted out of `flush` because it was NESTED inside it. `flush` is live-only
 /// glue, so nothing offline could reach this, and a mutation run over
@@ -803,27 +774,25 @@ pub(crate) fn image_cell<'e>(
     } else {
         e.after.as_ref()?
     };
-    match &e.image_names {
-        Some(names) => match memo
-            .filter(|(m, _)| std::sync::Arc::ptr_eq(m, names))
-            .map(|(_, j)| j)
-            .unwrap_or_else(|| names.iter().position(|n| n == col))
+    let names = e.image_names.as_ref()?;
+    match memo
+        .filter(|(m, _)| std::sync::Arc::ptr_eq(m, names))
+        .map(|(_, j)| j)
+        .unwrap_or_else(|| names.iter().position(|n| n == col))
+    {
+        Some(j) => vals.get(j),
+        // Name absent: a mid-window RENAME leaves the value under its OLD
+        // name at the same position. Position is trusted only when the arity
+        // matches AND the name there is not itself a schema column — else an
+        // equal-arity DROP+ADD would hand this column a neighbour's value.
+        None if vals.len() == schema.len()
+            && names
+                .get(i)
+                .is_some_and(|old| !schema.contains(&old.as_str())) =>
         {
-            Some(j) => vals.get(j),
-            // Name absent: a mid-window RENAME leaves the value under its OLD
-            // name at the same position. Position is trusted only when the arity
-            // matches AND the name there is not itself a schema column — else an
-            // equal-arity DROP+ADD would hand this column a neighbour's value.
-            None if vals.len() == schema.len()
-                && names
-                    .get(i)
-                    .is_some_and(|old| !schema.contains(&old.as_str())) =>
-            {
-                vals.get(i)
-            }
-            None => None,
-        },
-        None => vals.get(i),
+            vals.get(i)
+        }
+        None => None,
     }
 }
 
@@ -878,29 +847,6 @@ pub(crate) fn named_image_arity_mismatch(ev: &ChangeEvent) -> Option<(usize, usi
     (n != names.len()).then_some((n, names.len()))
 }
 
-/// A NAMELESS image mapped by POSITION whose width disagrees with the schema —
-/// a DDL landed inside the capture window. `Some(values)` when it does.
-///
-/// The DELETE arm is `>` and not `!=` on purpose: a key-only delete legitimately
-/// carries FEWER values than the table has columns, so only an image WIDER than the
-/// schema is evidence of drift. `>` → `<` inverts that into "refuse every key-only
-/// delete and accept every wide one" — it survived offline because the condition
-/// sat inside live-only glue.
-pub(crate) fn positional_image_width_mismatch(ev: &ChangeEvent, ncols: usize) -> Option<usize> {
-    if ev.image_names.is_some() {
-        return None;
-    }
-    let is_delete = ev.op == ChangeOp::Delete;
-    let vals = if is_delete {
-        ev.before.as_ref()?
-    } else {
-        ev.after.as_ref()?
-    };
-    let n = vals.len();
-    let bad = if is_delete { n > ncols } else { n != ncols };
-    bad.then_some(n)
-}
-
 /// The O(1) name-lookup memo `image_cell` takes: this column's index in the
 /// image-names vector every event in the flush shares.
 ///
@@ -911,8 +857,7 @@ pub(crate) fn positional_image_width_mismatch(ev: &ChangeEvent, ncols: usize) ->
 /// shares one names-Arc, so a memo pointing at the wrong index maps EVERY row of
 /// that column to a neighbour's value.
 ///
-/// `None` when no event carries names (the positional engines) — then `image_cell`
-/// indexes by position and there is nothing to memoise.
+/// `None` when no event carries names; `flush` refuses such an image before reading it.
 pub(crate) fn image_name_memo<'a>(
     events: &'a [ChangeEvent],
     col: &str,
@@ -944,43 +889,20 @@ fn flush(
             .collect::<StringArray>(),
     );
     let seqs: ArrayRef = Arc::new(events.iter().map(|e| e.seq as i64).collect::<Int64Array>());
-    // Finding #37: a mid-window DDL desynchronizes the event images from the
-    // resolved schema — positional mapping then puts a dropped column's value
-    // into its NEIGHBOR (observed live: after DROP COLUMN a, row1's 'AAA'
-    // landed in column b, silently, status success). Binlog row events carry
-    // no column names, so v1 is the honest loud check: any image whose arity
-    // differs from the resolved schema aborts the flush with the recovery
-    // path spelled out. (Same-arity DDL — rename — is positionally safe;
-    // type changes are a schema-history feature, see the docs limitation.)
+    // Every image must carry its column names, and as many values as names.
     for ev in events {
-        // A DELETE's before-image may legitimately carry only the key
-        // columns (PostgreSQL test_decoding emits just the key; MySQL FULL
-        // row-image carries everything) — a SHORTER delete image maps by
-        // prefix; an image WIDER than the schema, or a non-delete image of
-        // ANY other arity, proves a stale pre-DDL layout.
-        if ev.image_names.is_some() {
-            // Named, but NOT unconditionally trustworthy — this bypass used to be
-            // `continue`, and a partial row image walked straight through it.
-            //
-            // MySQL builds `image_names` from the TABLE_MAP's full column list while
-            // the VALUES come from `BinlogRow::unwrap()`, which yields only the
-            // columns set in the image bitmap. Under `binlog_row_image = MINIMAL` (or
-            // NOBLOB, or a per-SESSION override the open-time `@@global` probe cannot
-            // see) the two disagree, `image_cell` resolves every name past the end of
-            // the short value vector, and the row lands ALL NULL. MEASURED on the
-            // mysql-cdc stand: an UPDATE written under MINIMAL delivered
-            // `id=NULL, a=NULL, b=NULL` at `status: success, rows: 1`, no warning,
-            // checkpoint advanced past it — the change gone for good.
-            //
-            // The events replay the setting in force when they were WRITTEN, which is
-            // the same present-tense trap the `binlog_row_metadata` probe below
-            // already documents. Arity is the evidence that survives the wire.
-            //
-            // A key-only DELETE is not a counter-example: PostgreSQL names only the
-            // key columns it also supplies, so its lengths agree.
-            let Some((n, nnames)) = named_image_arity_mismatch(ev) else {
-                continue; // named AND complete — mapped by name, arity-proof for any op
-            };
+        if ev.image_names.is_none() {
+            crate::rivet_bail!(
+                crate::error::codes::SOURCE_CDC_UNDECODABLE,
+                "cdc: {}.{}: a change image carries no column names; rivet never maps values \
+                 by position, which puts them under the wrong names after a column reorder or ALTER.",
+                ev.schema,
+                ev.table
+            );
+        }
+        // A PARTIAL image (MySQL `binlog_row_image` other than FULL when WRITTEN, a
+        // session override included) names every column but carries only some values.
+        if let Some((n, nnames)) = named_image_arity_mismatch(ev) {
             anyhow::bail!(
                 "cdc: {}.{}: a row image carries {n} value(s) under {} column \
                      name(s) — a PARTIAL image, which rivet cannot map without \
@@ -993,35 +915,6 @@ fn flush(
                 ev.schema,
                 ev.table,
                 nnames
-            );
-        }
-        // A NAMELESS image maps by POSITION, and this is the only place that knows
-        // it for certain. The open-time probe asks the server what
-        // `binlog_row_metadata` is set to NOW; these events replay whatever was in
-        // force when they were WRITTEN. MEASURED: a server at FULL draining a
-        // backlog written under MINIMAL, with a same-arity `MODIFY .. AFTER`
-        // across the resume boundary, produced `a='BBB', b='AAA'` — swapped,
-        // status success, and ZERO warnings, because the probe answered a question
-        // about the present.
-        //
-        // Once per table per flush, not per event: a MINIMAL backlog is every
-        // event, and a line per row is a line nobody reads.
-        warn_positional_once(&ev.schema, &ev.table);
-        if let Some(n) = positional_image_width_mismatch(ev, columns.len()) {
-            anyhow::bail!(
-                "cdc: an event for table '{}' carries {} column(s) but the resolved \
-                 schema has {} — a DDL landed inside this capture window, and mapping \
-                 by position would put values into the WRONG columns. Recover by \
-                 re-snapshotting the table — clear its `cdc_snapshot` row in the \
-                 state DB AND delete its snapshot/_SUCCESS marker (the two done- \
-                 signals are OR-ed; leaving either in place skips the snapshot) — or \
-                 by resetting the checkpoint past the DDL. \
-                 To make mid-stream DDL safe going forward, set \
-                 binlog_row_metadata=FULL on the MySQL server (8.0.1+) — rivet then \
-                 maps binlog images by column NAME and this error class disappears.",
-                ev.table,
-                n,
-                columns.len()
             );
         }
     }
@@ -1037,7 +930,7 @@ fn flush(
         // Finding #41: a NAMED key-only image (PG DELETE) maps by COLUMN NAME
         // into the resolved schema — positional mapping put a non-first PK's
         // value into column 0 and NULLed the PK, silently losing the delete
-        // downstream. Unnamed images stay positional (full rows).
+        // downstream.
         // O(1) name lookup for the common case: all events in a flush share
         // one names-Arc (same TABLE_MAP / same wire session), so resolve this
         // column's image index once and reuse it by pointer identity.
@@ -1824,28 +1717,37 @@ mod tests {
         ));
     }
 
-    // The nameless (binlog_row_metadata=MINIMAL) guard path: an image whose
-    // arity differs from the resolved schema must abort the flush loudly —
-    // name-mapped engines skip this, MySQL-without-FULL depends on it.
+    /// A nameless image is refused even at matching arity: rivet never maps by position.
     #[test]
-    fn nameless_arity_drift_fails_the_flush_loudly() {
+    fn a_nameless_image_fails_the_flush_and_writes_no_part() {
         let d = tempfile::tempdir().unwrap();
         let dest = local_dest(&d);
         let cols = int_col();
         let mut ev = insert(1);
-        ev.after = Some(vec![RivetValue::Int(1), RivetValue::Int(2)]); // 2 vs 1 col
         ev.image_names = None;
         let mut stream = FakeStream {
             events: vec![ev].into(),
             acked: Vec::new(),
         };
         let cfg = cfg(dest.as_ref(), &cols, FormatType::Parquet, 10);
-        let err = run_to_files(&mut stream, cfg)
-            .1
-            .expect_err("arity drift must fail");
+        let (manifests, outcome) = run_to_files(&mut stream, cfg);
+        let err = outcome.expect_err("a nameless image must fail the flush");
         assert!(
-            err.to_string().contains("WRONG columns"),
-            "must explain the misalignment: {err}"
+            manifests.iter().all(|m| m.part_count == 0),
+            "no part may be written from a nameless image"
+        );
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some("RIVET_SOURCE_CDC_UNDECODABLE")
+        );
+        assert!(
+            err.to_string()
+                .contains("s.t: a change image carries no column names"),
+            "{err}"
+        );
+        assert!(
+            stream.acked.is_empty(),
+            "nothing may be acked past a refused image"
         );
     }
 
@@ -2013,7 +1915,7 @@ mod tests {
             after: Some(vec![RivetValue::Int(id)]),
             position: Position(serde_json::json!({ "lsn": format!("{id:08X}") })),
             committed: true,
-            image_names: None,
+            image_names: Some(std::sync::Arc::from(vec!["v".to_string()])),
             seq: 0,
             poison: None,
         }
@@ -2073,9 +1975,15 @@ mod tests {
              the wrong cell for the whole flush"
         );
         assert!(
-            image_name_memo(&[insert(0)], "v").is_none(),
-            "no event carries names ⇒ no memo; the positional engines index by \
-             position and have nothing to memoise"
+            image_name_memo(
+                &[ChangeEvent {
+                    image_names: None,
+                    ..insert(0)
+                }],
+                "v"
+            )
+            .is_none(),
+            "no event carries names ⇒ no memo"
         );
         assert_eq!(
             image_cell(&e, 0, "b", &["a", "b"], memo),
@@ -2169,13 +2077,9 @@ mod tests {
             Some(&RivetValue::Int(7))
         );
 
-        // NO NAMES: purely positional, the pre-names engines' shape.
+        // NO NAMES: never read by position.
         let anon = ev(vec![RivetValue::Int(10), RivetValue::Int(20)], None);
-        assert_eq!(
-            image_cell(&anon, 1, "b", &["a", "b"], None),
-            Some(&RivetValue::Int(20))
-        );
-        assert_eq!(image_cell(&anon, 5, "b", &["a", "b"], None), None);
+        assert_eq!(image_cell(&anon, 1, "b", &["a", "b"], None), None);
     }
 
     /// The drain loop's two decisions, every combination — four mutants that
@@ -2290,6 +2194,10 @@ mod tests {
     fn a_refused_cell_names_the_column_and_picks_the_code_by_override() {
         let mut ev = insert(0);
         ev.after = Some(vec![RivetValue::Int(1), RivetValue::Bytes(b"1.5".to_vec())]);
+        ev.image_names = Some(std::sync::Arc::from(vec![
+            "v".to_string(),
+            "amount".to_string(),
+        ]));
         let mut cols = int_col();
         cols.push(TypeMapping {
             column_name: "amount".into(),
@@ -2406,7 +2314,7 @@ mod tests {
     /// `!=` → `==` refuses every image whose arity AGREES, i.e. the whole stream, so
     /// a green suite said nothing about the case that matters.
     #[test]
-    fn a_partial_named_image_and_a_post_ddl_positional_image_are_both_refused() {
+    fn a_partial_named_image_is_refused() {
         use std::sync::Arc;
         let names: Arc<[String]> =
             Arc::from(vec!["a".to_string(), "b".to_string(), "c".to_string()]);
@@ -2456,61 +2364,6 @@ mod tests {
                 ..insert(0)
             }),
             None
-        );
-
-        // POSITIONAL. Three schema columns throughout.
-        let anon = |op: ChangeOp, vals: Vec<i64>| {
-            let v: Vec<RivetValue> = vals.into_iter().map(RivetValue::Int).collect();
-            match op {
-                ChangeOp::Delete => ChangeEvent {
-                    op: ChangeOp::Delete,
-                    before: Some(v),
-                    after: None,
-                    image_names: None,
-                    ..insert(0)
-                },
-                _ => ChangeEvent {
-                    after: Some(v),
-                    image_names: None,
-                    ..insert(0)
-                },
-            }
-        };
-        assert_eq!(
-            positional_image_width_mismatch(&anon(ChangeOp::Insert, vec![1, 2, 3]), 3),
-            None
-        );
-        assert_eq!(
-            positional_image_width_mismatch(&anon(ChangeOp::Insert, vec![1, 2]), 3),
-            Some(2),
-            "a non-delete of any other width proves a stale pre-DDL layout; mapping \
-             it by position puts values into the WRONG columns"
-        );
-        assert_eq!(
-            positional_image_width_mismatch(&anon(ChangeOp::Insert, vec![1, 2, 3, 4]), 3),
-            Some(4)
-        );
-
-        // The DELETE arm is `>` and not `!=` ON PURPOSE, and this is the pair that
-        // says so: SHORTER is legitimate (a key-only delete), WIDER is drift.
-        // `>` → `<` swaps exactly these two answers.
-        assert_eq!(
-            positional_image_width_mismatch(&anon(ChangeOp::Delete, vec![1]), 3),
-            None,
-            "a key-only delete carries fewer values than the table has columns and \
-             maps by prefix — refusing it is an outage on every engine that emits one"
-        );
-        assert_eq!(
-            positional_image_width_mismatch(&anon(ChangeOp::Delete, vec![1, 2, 3]), 3),
-            None,
-            "a FULL delete image carries every column — MySQL's `binlog_row_image = \
-             FULL` emits exactly this, and it is the BOUNDARY: without it `>` and \
-             `>=` agree on every fixture and the mutant survives (measured)"
-        );
-        assert_eq!(
-            positional_image_width_mismatch(&anon(ChangeOp::Delete, vec![1, 2, 3, 4]), 3),
-            Some(4),
-            "an image WIDER than the schema is drift whatever the op"
         );
     }
 

@@ -329,6 +329,7 @@ log_bin           = ON       # binary logging on (often already on for replicati
 binlog_format     = ROW      # rivet needs row images, not statements — MIXED/STATEMENT will not work
 binlog_row_image  = FULL     # full before/after image — REQUIRED for the after-image / MERGE shape;
                              # MINIMAL drops unchanged columns and breaks "overwrite all columns"
+binlog_row_metadata = FULL   # REQUIRED (8.0.1+): column names in every TABLE_MAP; rivet refuses MINIMAL
 server_id         = 1        # any unique id for the source; rivet uses a DIFFERENT --server-id
 ```
 
@@ -344,6 +345,20 @@ Notes:
   batch path can go through a pooler, CDC cannot. Rivet probes the connection and
   fails fast with this exact reason if it sees a proxy, so point the source at the
   MySQL host (the replication endpoint), not the proxy port.
+- **`binlog_row_metadata = FULL` is required, and it is NOT MySQL's default.**
+  Under `MINIMAL` the binlog carries no column names, so values could only be
+  mapped by position, and after a column reorder or `ALTER` they land under the
+  wrong names. rivet refuses instead: the run fails at open with
+  `RIVET_SOURCE_CDC_PREREQUISITE`, and `rivet doctor` fails the "CDC binlog
+  server config" check. Fix it with `SET PERSIST binlog_row_metadata = FULL;`
+  (needs `SYSTEM_VARIABLES_ADMIN` or `SUPER`), or `binlog_row_metadata = FULL`
+  under `[mysqld]` and a restart. Events already written under `MINIMAL` stay
+  nameless after the switch: a run that reaches one of a captured table fails
+  with `RIVET_SOURCE_CDC_UNDECODABLE`, naming the table and the binlog position,
+  and writes no part. If the export already had a checkpoint, delete it so the
+  next run anchors afresh FIRST, then re-snapshot the tables (`mode: full`).
+  Snapshotting first leaves the changes in between in neither. MySQL before
+  8.0.1 has no such variable and is refused for the same reason.
 - `binlog_row_image = FULL` is MySQL's default; the risk is a source that has set
   it to `MINIMAL` to shrink the binlog — that path needs the column-mask MERGE,
   not the simple overwrite (see [Output shape](#output-shape)).
@@ -704,25 +719,13 @@ filling it with a neighbour's value (unless the dropped column sat at `c`'s
 position, which looks exactly like a rename and is read as one). A column ADDED while a run is open is not in
 that run's schema, so its values for that run's window are dropped — re-snapshot
 the table after an `ADD COLUMN` if those values matter. MySQL's binlog carries
-names only when the server runs with **`binlog_row_metadata=FULL`** (8.0.1+ —
-strongly recommended; the compose test stack sets it):
-
-```ini
-# my.cnf — makes mid-stream DDL safe for rivet CDC
-binlog_row_metadata = FULL
-```
-
-Under the **default `MINIMAL` the binlog is nameless and positional — expect
-runs to FAIL with an explicit error** ("an event … carries N column(s) but the
-resolved schema has M") whenever a DDL lands inside a capture window. That is
-deliberate: mapping by position would put values into the wrong columns
-silently, and a loud stop is the only safe behavior. Recover by
-re-snapshotting the table (or resetting the checkpoint past the DDL), and set
-`binlog_row_metadata=FULL` to retire this error class. DDL *between* runs is
-always fine — each run resolves the schema fresh. A mid-window RENAME is safe
-in both modes (same arity ⇒ positional fallback keeps the value). Same-arity
-TYPE changes remain undetectable without schema history (roadmap) — run type
-migrations and their backfills through a re-snapshot.
+names only when the server runs with **`binlog_row_metadata=FULL`** (8.0.1+),
+which rivet requires (see [MySQL — the binlog grants](#mysql--the-binlog-grants)), so MySQL behaves the
+same. rivet never maps a binlog image by position: a server at `MINIMAL` is
+refused at open, and an event written under `MINIMAL` is refused when it is
+read. DDL *between* runs is always fine, because each run resolves the schema
+fresh. Same-arity TYPE changes remain undetectable without schema history
+(roadmap): run type migrations and their backfills through a re-snapshot.
 
 **The value checksum runs on CDC too.** The same always-on two-ended check the
 batch export performs — an independent fold of the decoded cells vs a fold of

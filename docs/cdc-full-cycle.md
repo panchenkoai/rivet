@@ -14,7 +14,7 @@ The same sequence runs unattended as
 
 | engine | what the log needs | anchor model | `cdc.checkpoint:` |
 |---|---|---|---|
-| MySQL | `binlog_format=ROW`, `binlog_row_image=FULL`, a user with `REPLICATION SLAVE, REPLICATION CLIENT`; on RDS/Aurora: automated backups ON (retention > 0, else `log_bin=0`, ERROR 1381) and `CALL mysql.rds_set_configuration('binlog retention hours', N)` (ERROR 1236 otherwise) | client-side file — `{file, pos, server_uuid, gtid_executed}` | **required** for any `mode: cdc` |
+| MySQL | `binlog_format=ROW`, `binlog_row_image=FULL`, `binlog_row_metadata=FULL` (MINIMAL is refused), a user with `REPLICATION SLAVE, REPLICATION CLIENT`; on RDS/Aurora: automated backups ON (retention > 0, else `log_bin=0`, ERROR 1381) and `CALL mysql.rds_set_configuration('binlog retention hours', N)` (ERROR 1236 otherwise) | client-side file — `{file, pos, server_uuid, gtid_executed}` | **required** for any `mode: cdc` |
 | PostgreSQL | `wal_level=logical`, `max_replication_slots ≥ 1`, a role with `REPLICATION` | server-side slot | not needed (the slot is the anchor) |
 | SQL Server | SQL Server Agent running, `sys.sp_cdc_enable_db`, `sys.sp_cdc_enable_table` per table (one `cdc:` export per table — `tables:` is refused) | from-LSN floored at `fn_cdc_get_min_lsn` | required for a baseline |
 | MongoDB | a replica set (change streams), `directConnection` if port-mapped | resume token | **required** for any `mode: cdc` |

@@ -223,7 +223,8 @@ services:
     profiles: ["cdc"]
     restart: unless-stopped
     # 5.7: binlog is OFF by default — enable + ROW format. (No
-    # binlog-row-metadata flag before 8.0.1, so the sink maps positionally.)
+    # binlog-row-metadata before 8.0.1, so rivet CDC refuses this server;
+    # it stays for seed parity.)
     command:
       - "--default-authentication-plugin=mysql_native_password"
       - "--server-id=57"

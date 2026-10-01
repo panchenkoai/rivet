@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- **Breaking: MySQL CDC refuses `binlog_row_metadata = MINIMAL`.** It used to warn and map binlog
+  values by position, so a column reorder or `ALTER` delivered them under the wrong names (source
+  `(1, b='BBB', a='AAA')` arrived as `b='AAA', a='BBB'`). A server that is not at FULL, or that
+  predates the variable (MySQL before 8.0.1), now fails the run at open with
+  `RIVET_SOURCE_CDC_PREREQUISITE`, before a first run pins its anchor. The message names
+  `SET PERSIST binlog_row_metadata = FULL;`. A rows event written under MINIMAL is refused when read,
+  even after the server is switched to FULL, with `RIVET_SOURCE_CDC_UNDECODABLE` naming the table
+  and the binlog position. No part is written and the checkpoint does not move. Recovery: delete the
+  checkpoint so the next run anchors afresh first, then re-snapshot. `rivet doctor` fails the "CDC
+  binlog server config" check for the same settings. The CDC sink no longer maps any nameless image
+  by position.
+
 - **`rivet run` applies the type policy before it reads data.** A column whose mapping is `lossy`
   or `unsupported` used to be reported only by `rivet check --type-report`, and the run wrote it
   without a word. Batch and CDC runs, including `rivet cdc --output`, now log one warning per

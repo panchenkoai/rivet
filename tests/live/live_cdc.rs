@@ -5600,6 +5600,7 @@ fn roast_pg_cdc_destination_placeholders_resolve_like_the_batch_path() {
 fn mysql_cdc_refuses_a_compressed_binlog_instead_of_capturing_nothing() {
     let _serial = quiet_window_guard(); // :3306 GLOBAL flip — same lock as governor
     let root_url = MYSQL_URL.replace("rivet:rivet@", "root:rivet@");
+    let _meta = RowMetadata::set(&root_url, "FULL"); // :3306 runs MySQL's MINIMAL default
     let mut admin = match mysql::Conn::new(mysql::Opts::from_url(&root_url).unwrap()) {
         Ok(c) => c,
         Err(e) => panic!("cdc-profile MySQL admin connection: {e}"),
@@ -5730,6 +5731,7 @@ fn mysql_cdc_refuses_a_compressed_binlog_instead_of_capturing_nothing() {
 fn mysql_cdc_compressed_payload_in_stream_refuses_not_skips() {
     let _serial = quiet_window_guard(); // :3306 GLOBAL flip — same lock as governor
     let root_url = MYSQL_URL.replace("rivet:rivet@", "root:rivet@");
+    let _meta = RowMetadata::set(&root_url, "FULL"); // :3306 runs MySQL's MINIMAL default
     let mut admin = match mysql::Conn::new(mysql::Opts::from_url(&root_url).unwrap()) {
         Ok(c) => c,
         Err(e) => panic!("cdc-profile MySQL admin connection: {e}"),
@@ -6390,122 +6392,150 @@ fn mysql_cdc_refuses_a_partial_json_binlog_instead_of_dropping_the_update() {
     );
 }
 
-/// A guard that returns `binlog_row_metadata` to whatever the stack pinned.
+/// Sets `binlog_row_metadata` on the server at `root_url` and restores the prior value on drop.
 ///
-/// The variable is GLOBAL-only in MySQL 8 — there is no session scope to flip —
-/// so a test that leaves it MINIMAL silently changes every later test's engine.
-struct RowMetadata(String);
+/// Used only on the isolated :3306 server under `quiet_window_guard`: on :3307 a
+/// MINIMAL window would refuse every concurrent MySQL CDC test.
+struct RowMetadata(String, String);
 
 impl RowMetadata {
-    fn set(to: &str) -> Self {
-        let mut c = conn();
+    fn set(root_url: &str, to: &str) -> Self {
+        let mut c = mysql::Conn::new(mysql::Opts::from_url(root_url).unwrap()).expect("root conn");
         let was: String = c
             .query_first("SELECT @@GLOBAL.binlog_row_metadata")
             .expect("read binlog_row_metadata")
             .expect("a value");
         c.query_drop(format!("SET GLOBAL binlog_row_metadata={to}"))
-            .expect(
-                "SET GLOBAL binlog_row_metadata needs SYSTEM_VARIABLES_ADMIN — see \
-                 dev/cdc/mysql-grant.sql; without it MySQL's own default configuration is \
-                 the one configuration nothing tests",
-            );
-        Self(was)
+            .expect("SET GLOBAL binlog_row_metadata");
+        Self(root_url.to_string(), was)
     }
 }
 
 impl Drop for RowMetadata {
     fn drop(&mut self) {
-        if let Ok(mut c) = mysql::Pool::new(MYSQL_CDC_URL).and_then(|p| p.get_conn()) {
-            let _ = c.query_drop(format!("SET GLOBAL binlog_row_metadata={}", self.0));
+        if let Ok(mut c) = mysql::Conn::new(mysql::Opts::from_url(&self.0).unwrap()) {
+            let _ = c.query_drop(format!("SET GLOBAL binlog_row_metadata={}", self.1));
         }
     }
 }
 
-/// MySQL's DEFAULT `binlog_row_metadata=MINIMAL` maps binlog images POSITIONALLY,
-/// and a same-arity column reorder across the resume boundary silently swaps them.
-///
-/// The stack pins `--binlog-row-metadata=FULL` (docker-compose), which puts column
-/// NAMES into TABLE_MAP — so the sink takes the by-name arm and `continue`s past
-/// the arity guard entirely (`sink.rs`, `if ev.image_names.is_some()`). MySQL's own
-/// default is MINIMAL. Every live MySQL CDC test therefore runs the ONE
-/// configuration a user does not have, and the positional path plus the guard that
-/// protects it are reachable only from the default nobody exercises.
-///
-/// This is the measurement that decides how loud rivet should be about it. Under
-/// MINIMAL: the schema is resolved at OPEN, the events replay from the CHECKPOINT
-/// — so an `ALTER TABLE ... MODIFY b AFTER id` between the two puts a row written
-/// as `(id, a, b)` into columns resolved as `(id, b, a)`.
-#[test]
-#[ignore = "live: requires docker compose mysql-cdc (SYSTEM_VARIABLES_ADMIN)"]
-fn mysql_cdc_minimal_row_metadata_is_the_engine_default_and_reorders_silently() {
-    let _serial = cross_process_serial("mysql_cdc_row_metadata");
-    let _meta = RowMetadata::set("MINIMAL");
-    let table = unique_name("rivet_cdc_min");
-    let mut c = conn();
+/// A table on the isolated :3306 server, dropped on scope exit.
+struct BatchServerTable(String, String);
+
+impl Drop for BatchServerTable {
+    fn drop(&mut self) {
+        if let Ok(mut c) = mysql::Conn::new(mysql::Opts::from_url(&self.0).unwrap()) {
+            let _ = c.query_drop(format!("DROP TABLE IF EXISTS {}", self.1));
+        }
+    }
+}
+
+/// A `(id, a, b)` table on :3306 as root, for the row-metadata refusals.
+fn row_metadata_fixture(prefix: &str) -> (String, mysql::PooledConn, BatchServerTable) {
+    let root_url = MYSQL_URL.replace("rivet:rivet@", "root:rivet@");
+    let table = unique_name(prefix).to_lowercase();
+    let mut c = mysql::Pool::new(root_url.as_str())
+        .and_then(|p| p.get_conn())
+        .expect("root conn on :3306");
     c.query_drop(format!("DROP TABLE IF EXISTS {table}"))
         .unwrap();
     c.query_drop(format!(
         "CREATE TABLE {table}(id INT PRIMARY KEY, a VARCHAR(9), b VARCHAR(9))"
     ))
     .unwrap();
-    let _t = Table(table.clone());
+    let guard = BatchServerTable(root_url.clone(), table.clone());
+    (root_url, c, guard)
+}
 
-    let d = tempfile::tempdir().unwrap();
-    let ckpt = d.path().join("cdc.ckpt");
-    write_checkpoint(&mut c, &ckpt);
-    let rig = Rig::mysql_cdc(&table).checkpoint_path(ckpt.clone());
-
-    // Written under the OLD column order, read back under the new one.
-    c.query_drop(format!("INSERT INTO {table} VALUES (1,'AAA','BBB')"))
-        .unwrap();
-    c.query_drop(format!(
-        "ALTER TABLE {table} MODIFY COLUMN b VARCHAR(9) AFTER id"
-    ))
-    .unwrap();
-
-    let out = rig.out_dir();
-    let said = rig.run_ok_capture();
-
-    // The corruption is REAL and this test does not pretend otherwise: rivet cannot
-    // undo it after the fact, because under MINIMAL the wire carries no names to
-    // detect the reorder from. What it CAN do — and now does — is say so before a
-    // single event is read.
-    assert_eq!(
-        duckdb_dir_parquet_distinct_strings(&out, "a"),
-        ["BBB".to_string()].into_iter().collect(),
-        "MEASURED: positional mapping puts the OLD order's `b` into `a`. If this ever \
-         reads AAA the engine learned to map by name under MINIMAL and the warning \
-         below should go with it"
-    );
-    assert_eq!(
-        duckdb_dir_parquet_distinct_strings(&out, "b"),
-        ["AAA".to_string()].into_iter().collect(),
-        "...and symmetrically the OLD order's `a` into `b`"
-    );
-
-    // The load-bearing half: the operator is TOLD, at warn level, at run start.
+/// No run may leave a part, a delivered row, or a successful ledger row behind.
+fn assert_nothing_delivered(rig: &Rig) {
     assert!(
-        said.contains("binlog_row_metadata") && said.contains("POSITION"),
-        "a run that maps by position must say so — an operator who learns it from a \
-         swapped column months later cannot act on it. Got:\n{said}"
+        files_with_extension(&rig.out_dir(), "parquet").is_empty(),
+        "a refused run must write no part"
     );
+    let runs = StateDb::next_to_config(&rig.config_path()).export_runs();
     assert!(
-        said.contains("binlog_row_metadata = FULL"),
-        "the warning must name the ESCAPE, not just the risk. Got:\n{said}"
+        !runs.is_empty()
+            && runs
+                .iter()
+                .all(|(_, status, _, rows)| status == "failed" && *rows == 0),
+        "the ledger must record the run as failed with no rows: {runs:?}"
     );
 }
 
-/// ...and under the FULL the stack pins, the same reorder is mapped BY NAME and
-/// comes back correct, with no warning.
-///
-/// Without this half the test above proves only that a swap happens, not that the
-/// setting is what causes it — and the warning would be free to fire on every run,
-/// which is how a warning gets ignored.
+/// `binlog_row_metadata = MINIMAL` at open is refused before the first run pins an anchor.
 #[test]
-#[ignore = "live: requires docker compose mysql-cdc (SYSTEM_VARIABLES_ADMIN)"]
-fn mysql_cdc_full_row_metadata_maps_the_same_reorder_by_name_and_stays_quiet() {
-    let _serial = cross_process_serial("mysql_cdc_row_metadata");
-    let _meta = RowMetadata::set("FULL");
+#[ignore = "live: requires docker compose up -d mysql (:3306, log_bin=ON)"]
+fn mysql_cdc_refuses_minimal_row_metadata_at_open() {
+    let _serial = quiet_window_guard(); // :3306 GLOBAL flip — same lock as governor
+    let (root_url, mut c, t) = row_metadata_fixture("rivet_cdc_min");
+    let _meta = RowMetadata::set(&root_url, "MINIMAL");
+    let d = tempfile::tempdir().unwrap();
+    let ckpt = d.path().join("cdc.ckpt");
+    let rig = Rig::mysql_cdc(&t.1)
+        .source_url(&root_url)
+        .checkpoint_path(ckpt.clone());
+    c.query_drop(format!("INSERT INTO {} VALUES (1,'AAA','BBB')", t.1))
+        .unwrap();
+
+    let out = rig.run();
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!out.status.success(), "MINIMAL must fail the run:\n{said}");
+    assert!(said.contains("[RIVET_SOURCE_CDC_PREREQUISITE]"), "{said}");
+    assert!(
+        said.contains("the server has binlog_row_metadata = MINIMAL"),
+        "the refusal names the setting and its value: {said}"
+    );
+    assert!(
+        said.contains("`SET PERSIST binlog_row_metadata = FULL;`"),
+        "the refusal names the SQL fix: {said}"
+    );
+    assert!(
+        said.contains("anchors afresh FIRST, then re-snapshot"),
+        "the recovery is anchor first, then snapshot: {said}"
+    );
+    assert!(
+        !ckpt.exists(),
+        "a refused first run must not pin an anchor inside a MINIMAL span"
+    );
+    assert_eq!(
+        duckdb_total_parquet_rows(&rig.out_dir()),
+        0,
+        "no row delivered"
+    );
+    assert_nothing_delivered(&rig);
+
+    // `rivet doctor` reads the same server and must FAIL the same setting.
+    let doc = run_rivet(&[
+        "doctor",
+        "--config",
+        rig.config_path().to_str().unwrap(),
+        "--json",
+    ]);
+    let report: serde_json::Value =
+        serde_json::from_slice(&doc.stdout).expect("doctor --json output");
+    let check = report["checks"]
+        .as_array()
+        .expect("checks array")
+        .iter()
+        .find(|c| c["name"] == "CDC binlog server config")
+        .unwrap_or_else(|| panic!("doctor ran no CDC binlog server config check: {report}"))
+        .clone();
+    assert_eq!(check["ok"], false, "doctor must fail MINIMAL: {check}");
+    assert!(
+        check.to_string().contains("binlog_row_metadata"),
+        "doctor names the setting: {check}"
+    );
+}
+
+/// ...and under the FULL the stack pins, a reorder across the resume boundary maps BY NAME.
+#[test]
+#[ignore = "live: requires docker compose mysql-cdc"]
+fn mysql_cdc_full_row_metadata_maps_a_reorder_by_name_and_stays_quiet() {
     let table = unique_name("rivet_cdc_full");
     let mut c = conn();
     c.query_drop(format!("DROP TABLE IF EXISTS {table}"))
@@ -6533,18 +6563,12 @@ fn mysql_cdc_full_row_metadata_maps_the_same_reorder_by_name_and_stays_quiet() {
     assert_eq!(
         duckdb_dir_parquet_distinct_strings(&out, "a"),
         ["AAA".to_string()].into_iter().collect(),
-        "under FULL the image carries names, so the reorder maps correctly — this is \
-         the assertion that makes FULL the documented escape rather than folklore"
     );
     assert_eq!(
         duckdb_dir_parquet_distinct_strings(&out, "b"),
         ["BBB".to_string()].into_iter().collect()
     );
-    assert!(
-        !said.contains("binlog_row_metadata"),
-        "a correctly-configured server must stay quiet, or the warning becomes noise \
-         on every run and stops being read. Got:\n{said}"
-    );
+    assert!(!said.contains("binlog_row_metadata"), "{said}");
 }
 
 /// PostgreSQL crash between the checkpoint write and the slot ack — DOCUMENTED,
@@ -6894,82 +6918,78 @@ fn roast_pg_cdc_truncate_refusal_delivers_the_rows_it_already_read() {
     );
 }
 
-/// The metadata warning must come from the WIRE, not from the server's setting.
+/// A backlog written under MINIMAL is refused at its rows event once the server is FULL again.
 ///
-/// `row_metadata_warning` asks `@@global.binlog_row_metadata` at open. The events
-/// a run drains replay whatever was in force when they were WRITTEN — so a server
-/// switched to FULL yesterday still reads a MINIMAL backlog positionally, and the
-/// probe, asked about the present, says nothing.
-///
-/// MEASURED before the fix: anchor under FULL, one row written under MINIMAL,
-/// server back to FULL, then a same-arity `MODIFY .. AFTER` — the parquet came back
-/// `a='BBB', b='AAA'`, swapped, `status: success`, and ZERO warnings. The probe was
-/// not wrong about the variable; it was answering the wrong question.
-///
-/// The sink now warns when it takes the nameless arm, once per table, which is the
-/// only place that knows for certain.
+/// The open-time probe sees FULL; only the TABLE_MAP on the wire says the event is nameless.
 #[test]
-#[ignore = "live: requires docker compose mysql-cdc (SYSTEM_VARIABLES_ADMIN)"]
-fn roast_mysql_cdc_warns_on_a_minimal_backlog_a_full_server_would_hide() {
-    let _serial = cross_process_serial("mysql_cdc_row_metadata");
-    let _meta = RowMetadata::set("FULL");
-    let table = unique_name("rivet_cdc_wire").to_lowercase();
-    let mut c = conn();
-    c.query_drop(format!("DROP TABLE IF EXISTS {table}"))
-        .unwrap();
-    c.query_drop(format!(
-        "CREATE TABLE {table}(id INT PRIMARY KEY, a VARCHAR(9), b VARCHAR(9))"
-    ))
-    .unwrap();
-    let _t = Table(table.clone());
-
+#[ignore = "live: requires docker compose up -d mysql (:3306, log_bin=ON)"]
+fn mysql_cdc_refuses_a_minimal_backlog_after_the_server_is_switched_to_full() {
+    let _serial = quiet_window_guard(); // :3306 GLOBAL flip — same lock as governor
+    let (root_url, mut c, t) = row_metadata_fixture("rivet_cdc_wire");
+    let table = t.1.clone();
+    let _meta = RowMetadata::set(&root_url, "FULL");
     let d = tempfile::tempdir().unwrap();
     let ckpt = d.path().join("cdc.ckpt");
     write_checkpoint(&mut c, &ckpt);
-    let rig = Rig::mysql_cdc(&table).checkpoint_path(ckpt.clone());
+    let anchored = std::fs::read_to_string(&ckpt).unwrap();
+    let file = serde_json::from_str::<serde_json::Value>(&anchored).unwrap()["file"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let rig = Rig::mysql_cdc(&table)
+        .source_url(&root_url)
+        .checkpoint_path(ckpt.clone());
 
-    // Written under MINIMAL — the TABLE_MAP for THIS event carries no names.
     c.query_drop("SET GLOBAL binlog_row_metadata=MINIMAL")
         .unwrap();
     c.query_drop(format!("INSERT INTO {table} VALUES (1,'AAA','BBB')"))
         .unwrap();
-    // ...and the server is healthy again by the time the run opens, which is
-    // exactly what made the open-time probe silent.
     c.query_drop("SET GLOBAL binlog_row_metadata=FULL").unwrap();
     c.query_drop(format!(
         "ALTER TABLE {table} MODIFY COLUMN b VARCHAR(9) AFTER id"
     ))
     .unwrap();
+    c.query_drop(format!("INSERT INTO {table} VALUES (2,'CCC','DDD')"))
+        .unwrap();
     let now: String = c
         .query_first("SELECT @@GLOBAL.binlog_row_metadata")
         .unwrap()
         .unwrap();
-    assert_eq!(
-        now, "FULL",
-        "the fixture is inert unless the server LOOKS healthy at open — that is the \
-         whole point of this cell"
-    );
+    assert_eq!(now, "FULL", "the server must LOOK healthy at open");
 
-    let said = rig.run_ok_capture();
-    // The capture must have DELIVERED — the conformance gate requires every live CDC
-    // test to assert an outcome, and it is right: a warning test whose run captured
-    // zero rows would be asserting log text over an empty export. The values are the
-    // KNOWN-swapped ones; that corruption is this scenario's measured reality and is
-    // asserted as such by the sibling MINIMAL test above.
+    let out = rig.run();
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "a nameless backlog must fail the run:\n{said}"
+    );
+    assert!(said.contains("[RIVET_SOURCE_CDC_UNDECODABLE]"), "{said}");
+    assert!(
+        said.contains(&format!(
+            "`rivet`.`{table}`: the rows event ending at binlog position {file}:"
+        )),
+        "the refusal names the table and the binlog position: {said}"
+    );
+    assert!(said.contains("binlog_row_metadata = MINIMAL"), "{said}");
+    assert!(
+        said.contains("`SET PERSIST binlog_row_metadata = FULL;`"),
+        "{said}"
+    );
     assert_eq!(
-        duckdb_dir_parquet_i64(&rig.out_dir(), "id"),
-        vec![1],
-        "the MINIMAL backlog row must be delivered while the run warns"
+        std::fs::read_to_string(&ckpt).unwrap(),
+        anchored,
+        "the checkpoint must not advance past a refused event"
     );
-    assert!(
-        said.contains("mapped by POSITION"),
-        "a nameless image must be announced from the WIRE — the server's current \
-         setting cannot see a backlog written under the old one. Got:\n{said}"
+    assert_eq!(
+        duckdb_total_parquet_rows(&rig.out_dir()),
+        0,
+        "no row delivered"
     );
-    assert!(
-        said.contains("binlog_row_metadata = FULL"),
-        "and it must still name the escape: {said}"
-    );
+    assert_nothing_delivered(&rig);
 }
 
 /// A folded-twin refusal must name BOTH relations — resolution-first.

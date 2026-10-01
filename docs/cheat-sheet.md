@@ -137,7 +137,7 @@ Source prerequisites:
 | Engine | Server config |
 |---|---|
 | **PostgreSQL** | `wal_level=logical` (restart), `max_replication_slots>=1`, `max_wal_senders>=1`. For a DELETE to carry more than the primary key, `ALTER TABLE <t> REPLICA IDENTITY FULL` — the default (`d`) sends the key alone, which rivet warns about on every run |
-| **MySQL** | `log_bin=ON`, `binlog_format=ROW`, `binlog_row_image=FULL`, `binlog_row_metadata=FULL` (recommended), binlog retention ≫ the run interval |
+| **MySQL** | `log_bin=ON`, `binlog_format=ROW`, `binlog_row_image=FULL`, `binlog_row_metadata=FULL` (required; MINIMAL is refused), binlog retention ≫ the run interval |
 | **SQL Server** | SQL Server Agent running; Enterprise / Standard / Developer (not Express/Web) |
 | **MongoDB** | Replica set required (`?directConnection=true` for a port-mapped single node) |
 | **Oracle** (preview) | `ARCHIVELOG` mode, minimal supplemental logging, and `ALL COLUMNS` supplemental logging on each captured table (key-only logging is refused). The URL path is the pluggable database's service name; rivet mines from `CDB$ROOT`. Archived-log retention is the DBA's: nothing pins logs for rivet |
