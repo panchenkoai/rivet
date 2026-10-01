@@ -2251,6 +2251,8 @@ fn pg_cdc_multi_table_stream_uses_one_slot_and_resumes() {
     let t1 = unique_name("rivet_cdc_ma");
     let t2 = unique_name("rivet_cdc_mb");
     let slot = unique_name("rivet_multi_slot");
+    // Before the first run: a run that creates the slot and then fails must not leak it.
+    let _slot = Slot(slot.clone());
     let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
     for t in [&t1, &t2] {
         c.batch_execute(&format!(
@@ -2273,7 +2275,6 @@ fn pg_cdc_multi_table_stream_uses_one_slot_and_resumes() {
 
     // Run 1 creates the ONE slot and drains nothing.
     run_rivet_ok(&cfg);
-    let _slot = Slot(slot.clone());
     let n: i64 = c
         .query_one(
             "SELECT count(*)::bigint FROM pg_replication_slots WHERE slot_name = $1",
@@ -2831,6 +2832,8 @@ fn pg_cdc_idle_first_run_then_change_is_captured_not_skipped() {
     let d = tempfile::tempdir().unwrap();
     let tbl = unique_name("rivet_cdc_pgidle");
     let slot = unique_name("rivet_idle_slot");
+    // Before the first run: a run that creates the slot and then fails must not leak it.
+    let _slot = Slot(slot.clone());
     let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
     c.batch_execute(&format!(
         "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"
@@ -2842,7 +2845,6 @@ fn pg_cdc_idle_first_run_then_change_is_captured_not_skipped() {
     let out1 = d.path().join("out1");
     std::fs::create_dir_all(&out1).unwrap();
     run_rivet_ok(&pg_cdc_config(&d, &tbl, &slot, &out1));
-    let _slot = Slot(slot.clone());
     assert_eq!(manifest_rows(&out1), 0, "idle run 1 drains nothing");
 
     // A change lands BETWEEN the idle run and the next scheduler cycle.
