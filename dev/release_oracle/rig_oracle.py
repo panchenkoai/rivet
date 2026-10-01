@@ -1,10 +1,11 @@
-"""The Rust test rig's default oracle: one DuckDB session grades one run's declared output.
+"""The live suite's default oracle: one DuckDB session grades one run's declared output.
 
-Only runs driven through the `Rig` reach it; a live test that calls `run_rivet*` or the
-binary directly is not graded (counted by tests/offline/rig_oracle_ratchet.rs).
+Every `rivet run|load|compact --config` a live test starts through the `Rig` or a shared
+`run_rivet*` helper reaches it; a hand-built spawn of the binary is not graded (counted by
+tests/offline/rig_oracle_ratchet.rs).
 
-The rig (tests/common/rig/verify.rs) only gathers facts — engine, source URL, table or
-query, the export's own filter, the manifests the run wrote, the state DB — and hands
+tests/common/verify.rs only gathers facts from the config file — engine, source URL, table
+or query, the export's own filter, the manifests the run wrote, the state DB — and hands
 them here as JSON on stdin. This module owns every check: it ATTACHes the source and
 rivet's state DB READ_ONLY through `duck.Oracle`, reads only the parts the Success
 manifests declare, and grades per column
@@ -218,7 +219,7 @@ def in_run_order(root: str, manifests: list[str]) -> list[str]:
 
 
 def watermark(root: str, manifests: list[str], coalesced: str | None = None) -> str | None:
-    """The window a delta export has covered in THIS destination: up to the latest manifest's `cursor_high`, from the first manifest's `cursor_low` (exclusive, unless that row was delivered)."""
+    """The window a delta export has covered in THIS destination: up to the latest manifest's `cursor_high`, from the first manifest's `cursor_low` (exclusive, unless that row was delivered); a first run (no `cursor_low`) also read the NULL-cursor rows."""
     ordered = in_run_order(root, manifests)
     windows = [(_load(root, n).get("source") or {}).get("extraction") or {} for n in ordered]
     windows = [w for w in windows if w.get("cursor_column") and w.get("cursor_high") is not None]
@@ -226,11 +227,11 @@ def watermark(root: str, manifests: list[str], coalesced: str | None = None) -> 
         return None
     col = windows[-1]["cursor_column"]
     c = coalesced if col == "_rivet_coalesced_cursor" and coalesced else _qi(col)
-    preds = [f"{c} IS NOT NULL", f"{c} <= {_lit(str(windows[-1]['cursor_high']))}"]
+    high = f"{c} <= {_lit(str(windows[-1]['cursor_high']))}"
     low = windows[0].get("cursor_low")
-    if low is not None:
-        preds.append(f"({c} > {_lit(str(low))} OR CAST({c} AS VARCHAR) IN (SELECT CAST({c} AS VARCHAR) FROM got))")
-    return " AND ".join(preds)
+    if low is None:
+        return f"({c} IS NULL OR {high})"
+    return f"{c} IS NOT NULL AND {high} AND ({c} > {_lit(str(low))} OR CAST({c} AS VARCHAR) IN (SELECT CAST({c} AS VARCHAR) FROM got))"
 
 
 def manifest_facts(root: str, manifests: list[str]) -> tuple[list[str], int]:
@@ -427,8 +428,14 @@ def _attach(spec: dict) -> dict:
         u = urlparse(url)
         return {"mongo": f"mongodb://{u.netloc}/" + (f"?{u.query}" if u.query else "")}
     if engine == "postgres":
-        styles = "options=-c%20DateStyle%3DISO%2CMDY%20-c%20IntervalStyle%3Dpostgres%20-c%20TimeZone%3DUTC%20-c%20bytea_output%3Dhex"
-        url = url + ("&" if "?" in url else "?") + styles
+        from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
+
+        # The config's own `options` (a search_path) is kept; the scanner's text settings are appended to it.
+        styles = "-c DateStyle=ISO,MDY -c IntervalStyle=postgres -c TimeZone=UTC -c bytea_output=hex"
+        parts = urlsplit(url)
+        q = dict(parse_qsl(parts.query))
+        q["options"] = f"{q['options']} {styles}" if q.get("options") else styles
+        url = urlunsplit(parts._replace(query=urlencode(q, quote_via=lambda s, *_: quote(s, safe=""))))
     return source_attach(engine, url)[0]
 
 
@@ -755,6 +762,15 @@ def grade(spec: dict) -> dict:
             ora.db.sql(f"CREATE OR REPLACE TEMP TABLE source_rows AS SELECT * FROM {src}")
             src = "source_rows"
         filt = watermark(out_dir, graded, spec.get("cursor_expr")) if cumulative and not cdc else None
+        if cumulative and not cdc and spec.get("state") and spec.get("export"):
+            first = (_load(out_dir, graded[0]).get("source") or {}).get("extraction") or {} if graded else {}
+            mine = ", ".join(_lit(r) for r in manifest_facts(out_dir, graded)[0]) or "NULL"
+            earlier = ora.scalar(
+                f"SELECT count(*) FROM {_state_table(ora, spec, 'export_metrics')} WHERE export_name = {_lit(spec['export'])} "
+                f"AND status = 'success' AND run_id NOT IN ({mine})"
+            )
+            if earlier and first.get("cursor_low") is None:
+                raise Unreachable(f"delta export: {earlier} earlier run(s) delivered outside this destination, which records no lower bound")
         if filt:
             ora.db.sql(f"CREATE OR REPLACE TEMP TABLE got AS SELECT *, 0 AS __mseq FROM {src} LIMIT 0")
             src = f"(SELECT * FROM {src} WHERE {filt})"

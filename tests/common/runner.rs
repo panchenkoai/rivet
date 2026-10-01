@@ -72,10 +72,28 @@ pub fn write_config(tmpdir: &tempfile::TempDir, yaml: &str) -> PathBuf {
 /// cannot be spawned (which indicates a build-time problem, not a test
 /// failure).
 pub fn run_rivet(args: &[&str]) -> Output {
-    Command::new(rivet_bin())
-        .args(args)
-        .output()
-        .expect("spawn rivet binary")
+    graded(args, &[], None, || {
+        Command::new(rivet_bin())
+            .args(args)
+            .output()
+            .expect("spawn rivet binary")
+    })
+}
+
+/// Run `spawn` and hand a successful `run|load|compact --config` to the default oracle (verify.rs).
+fn graded(
+    args: &[&str],
+    envs: &[(&str, &str)],
+    cwd: Option<&std::path::Path>,
+    spawn: impl FnOnce() -> Output,
+) -> Output {
+    let argv: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    let case = super::verify::begin_raw(&argv, envs, cwd);
+    let out = spawn();
+    if let Some(case) = case.filter(|_| out.status.success()) {
+        super::verify::finish(case, envs, &Default::default());
+    }
+    out
 }
 
 /// `run_rivet` with extra environment variables (fault hooks, log levels).
@@ -85,7 +103,9 @@ pub fn run_rivet_env(args: &[&str], envs: &[(&str, &str)]) -> Output {
     for (k, v) in envs {
         cmd.env(k, v);
     }
-    cmd.output().expect("spawn rivet binary")
+    graded(args, envs, None, || {
+        cmd.output().expect("spawn rivet binary")
+    })
 }
 
 /// `run_rivet_env` with the process working directory set to `dir`.
@@ -102,7 +122,9 @@ pub fn run_rivet_in_dir(dir: &std::path::Path, args: &[&str], envs: &[(&str, &st
     for (k, v) in envs {
         cmd.env(k, v);
     }
-    cmd.output().expect("spawn rivet binary")
+    graded(args, envs, Some(dir), || {
+        cmd.output().expect("spawn rivet binary")
+    })
 }
 
 /// Spawn `rivet run --config <cfg>` and wait up to `timeout` for it to exit on
@@ -116,14 +138,20 @@ pub fn run_rivet_bounded(
     timeout: std::time::Duration,
 ) -> Option<std::time::Duration> {
     let start = std::time::Instant::now();
+    let argv = ["run", "--config", cfg.to_str().unwrap()];
+    let case = super::verify::begin_raw(&argv.map(String::from), &[], None);
     let mut child = Command::new(rivet_bin())
-        .args(["run", "--config", cfg.to_str().unwrap()])
+        .args(argv)
         .spawn()
         .expect("spawn rivet binary");
     loop {
         if let Some(status) = child.try_wait().expect("try_wait rivet") {
             assert!(status.success(), "bounded rivet run exited non-zero");
-            return Some(start.elapsed());
+            let took = start.elapsed();
+            if let Some(case) = case {
+                super::verify::finish(case, &[], &Default::default());
+            }
+            return Some(took);
         }
         if start.elapsed() >= timeout {
             let _ = child.kill();
@@ -138,11 +166,13 @@ pub fn run_rivet_bounded(
 /// visible in stderr.  Use this when a test needs to assert on warning messages
 /// emitted via the log crate (plan validation warnings, quality warnings, etc.).
 pub fn run_rivet_with_warn_log(args: &[&str]) -> Output {
-    Command::new(rivet_bin())
-        .args(args)
-        .env("RUST_LOG", "warn")
-        .output()
-        .expect("spawn rivet binary")
+    graded(args, &[], None, || {
+        Command::new(rivet_bin())
+            .args(args)
+            .env("RUST_LOG", "warn")
+            .output()
+            .expect("spawn rivet binary")
+    })
 }
 
 /// Convenience: `rivet run --config <path> --export <name>` and return the
@@ -192,10 +222,15 @@ pub fn run_rivet_args_bounded_env(
     for (k, v) in envs {
         cmd.env(k, v);
     }
+    let argv: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    let case = super::verify::begin_raw(&argv, envs, None);
     let mut child = cmd.spawn().expect("spawn rivet binary");
     loop {
         if let Some(status) = child.try_wait().expect("try_wait rivet") {
             assert!(status.success(), "bounded rivet run exited non-zero");
+            if let Some(case) = case {
+                super::verify::finish(case, envs, &Default::default());
+            }
             return Some(std::fs::read_to_string(&path).expect("read captured stdout"));
         }
         if start.elapsed() >= timeout {

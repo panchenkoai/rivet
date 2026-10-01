@@ -667,6 +667,19 @@ pub fn run_rivet_ok(cfg: &Path) {
     );
 }
 
+/// [`run_rivet_ok`] outside the default oracle; the reason is required and counted by an offline ceiling.
+pub fn run_rivet_ok_no_oracle(cfg: &Path, reason: &str) {
+    let out = super::runner::run_rivet_env(
+        &["run", "--config", cfg.to_str().unwrap()],
+        &[(super::verify::NO_ORACLE_ENV, reason)],
+    );
+    assert!(
+        out.status.success(),
+        "rivet run failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// `row_count` from the manifest under `out`.
 pub fn manifest_rows(out: &Path) -> i64 {
     let body = std::fs::read_to_string(out.join("manifest.json")).expect("manifest.json");

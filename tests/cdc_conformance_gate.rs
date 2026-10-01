@@ -450,6 +450,7 @@ fn derived_capture_marker_set_is_pinned() {
         // spawns rivet, so it is a capture marker like its siblings.
         "run_rivet_in_dir(",
         "run_rivet_ok(",
+        "run_rivet_ok_no_oracle(",
         "run_rivet_with_warn_log(",
         "run_with_env(",
         "run_with_envs(",
