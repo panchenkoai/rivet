@@ -259,6 +259,9 @@ exclude_re = [
     "replace row_estimate_mssql ->",
     "delete match arm \\(Some\\(rid\\), Some\\(st\\)\\) in run_keyset_parallel",
     "replace print_chunked_recovery with \\(\\)",
+    # print_up_to_date writes stderr only; its text is graded through up_to_date_line
+    # (the_up_to_date_line_names_the_mode_table_and_warehouse, the print_pool_estimate precedent).
+    "replace print_up_to_date with \\(\\)",
     # run_with_reconnect / run_mongo_parallel (ADR-0028 seam cut-over, PR: the
     # finalize-export-seam branch) are live-only export runners: the first wraps
     # run_single_export's retry loop over a real source connection, the second
