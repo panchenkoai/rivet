@@ -410,7 +410,9 @@ fn row_of(bq: &BqLive, table: &str, id: i64) -> (Option<i64>, Option<String>) {
 /// rows whose partition column is NULL merge on their own. A key with changes on
 /// BOTH sides of that split (its `created_at` set to NULL and back within one
 /// cycle) must still end at its LATEST change — the winner is chosen over the whole
-/// buffer, never per subset, or the order of the MERGE jobs decides the row.
+/// buffer, never per subset, or the order of the MERGE jobs decides the row. A move
+/// between two dated partitions is refused by the stream (see the next test), so key 2
+/// changes its time within its day.
 #[test]
 #[ignore = "live: requires mysql-cdc + BigQuery creds"]
 fn a_key_changed_across_the_partition_split_ends_at_its_latest_change() {
@@ -449,7 +451,7 @@ fn a_key_changed_across_the_partition_split_ends_at_its_latest_change() {
         "UPDATE {table} SET created_at = '2024-01-01 00:00:00', v = 30 WHERE id = 1"
     ));
     scn.sql(&format!(
-        "UPDATE {table} SET created_at = '2024-01-02 00:00:00', v = 200 WHERE id = 2"
+        "UPDATE {table} SET created_at = '2024-01-01 12:00:00', v = 200 WHERE id = 2"
     ));
     scn.sql(&format!(
         "UPDATE {table} SET created_at = NULL, v = 300 WHERE id = 2"
@@ -475,6 +477,60 @@ fn a_key_changed_across_the_partition_split_ends_at_its_latest_change() {
         base_profile(&bq, &table),
         (2, 2, 0, 0, 3),
         "still two live rows"
+    );
+}
+
+/// A base-and-buffer table compacts only the partitions its changes name, so an UPDATE that
+/// moves a row to another dated partition would leave the old copy behind. The stream
+/// refuses it before writing: the run fails naming both days, nothing new is buffered, and
+/// the checkpoint stays put, so the next run meets the same change and refuses again.
+#[test]
+#[ignore = "live: requires mysql-cdc + BigQuery creds"]
+fn a_change_that_moves_a_row_to_another_partition_is_refused_by_run() {
+    let Some(bq) = BqLive::from_env("compact_move") else {
+        return;
+    };
+    let mut scn =
+        CdcScenario::mysql_with(
+            "compact_move",
+            "id BIGINT PRIMARY KEY, v INT, created_at DATETIME NULL",
+            |r, t| {
+                r.cdc("backfill: auto")
+                    .also_batch_export("baseline", t, "full")
+                    .dest_gcs_live(&bq.bucket, &bq.prefix)
+                    .top_line(&bq.load_line(
+                        ", pk: [id], partition: { column: created_at, granularity: day }",
+                    ))
+            },
+        );
+    let table = scn.table.clone();
+    let changes = format!("{table}__changes");
+    let _cleanup = bq.cleanup(&[&table, &changes]);
+    scn.sql(&format!(
+        "INSERT INTO {table} (id, v, created_at) VALUES (1, 1, '2024-01-01 00:00:00')"
+    ));
+    scn.settle();
+    scn.rig.run_ok();
+    load_ok(&scn.rig);
+    assert_eq!(base_profile(&bq, &table).0, 1);
+
+    scn.sql(&format!(
+        "UPDATE {table} SET created_at = '2024-01-02 00:00:00', v = 2 WHERE id = 1"
+    ));
+    scn.settle();
+    for attempt in ["first", "second"] {
+        let err = scn.rig.run_expect_fail();
+        assert!(
+            err.contains("RIVET_CDC_PARTITION_MOVED")
+                && err.contains("2024-01-01T00:00:00")
+                && err.contains("2024-01-02T00:00:00"),
+            "the {attempt} run refuses the move, naming both days: {err}"
+        );
+    }
+    assert_eq!(
+        row_of(&bq, &table, 1),
+        (Some(1), Some("2024-01-01 00:00:00".to_string())),
+        "the refused change never reached the base"
     );
 }
 

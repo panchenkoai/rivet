@@ -162,6 +162,33 @@ fn a_mysql_cdc_stream_loads_into_clickhouse_and_the_view_matches_the_source() {
     clickhouse_rows_match_source(&view, source_rows(&tbl), "2");
 }
 
+/// A stream with no snapshot leg: the load holds exactly the rows changed after the pin run.
+#[test]
+#[ignore = "live: requires clickhouse + fake-gcs + mysql-cdc"]
+fn a_stream_only_cdc_load_holds_every_row_changed_after_the_pin() {
+    require_alive(LiveService::ClickHouse);
+    require_alive(LiveService::FakeGcs);
+    ensure_gcs_bucket(BUCKET);
+    let (tbl, _guard) = seeded("rivet_ch_stream", 2);
+    let db = Db::new("rivet_chstream");
+    let rig = Rig::mysql_cdc(&tbl)
+        .dest_gcs(BUCKET, &unique_name("chstream"), FAKE_GCS_ENDPOINT)
+        .top_line(&format!(
+            "load: {{ target: clickhouse, url: \"{CLICKHOUSE_HTTP_URL}\", database: {}, \
+             user: {CLICKHOUSE_USER}, password_env: {PASSWORD_ENV}, pk: [id] }}",
+            db.0
+        ));
+    rig.run_ok();
+    conn()
+        .query_drop(format!(
+            "INSERT INTO {tbl} (id, v) VALUES (3, 3), (4, 4), (5, 5)"
+        ))
+        .expect("changes");
+    rig.run_ok();
+    load(&rig);
+    clickhouse_rows_match_source(&format!("{}.{tbl}", db.0), vec![(3, 3), (4, 4), (5, 5)], "");
+}
+
 /// The same cycle from PostgreSQL: the version decodes an LSN (`hi/lo` hex).
 #[test]
 #[ignore = "live: requires clickhouse + fake-gcs + postgres-cdc"]

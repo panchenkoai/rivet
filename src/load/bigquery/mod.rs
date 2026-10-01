@@ -745,7 +745,14 @@ impl TargetLoader for BigQueryLoader {
                 .and_then(|c| specs.iter().find(|s| s.column_name == c))
                 .map_or("TIMESTAMP", |s| s.target_type.as_str())
         });
-        let probe = compact_probe_sql(&changes_fqtn, &base, pk, part_col, time_type);
+        let probe = compact_probe_sql(
+            &changes_fqtn,
+            &base,
+            pk,
+            part_col,
+            time_type,
+            crate::load::cdc::trusts_buffer_days(&order),
+        );
         let row = self
             .api()?
             .run_query_first_row(&probe, &self.labels("merge", table))?;

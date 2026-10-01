@@ -1278,7 +1278,10 @@ fn null_and_string_null_ids(pre_images: bool) -> Option<(MongoTest, MongoDbGuard
 
 /// A delete of `_id: null` and a delete of `_id: "null"` must be distinguishable in the change log.
 #[test]
-#[ignore = "known defect: a CDC delete carries only the flat `_id` text, so deletes of _id null and _id \"null\" are byte-identical rows (document NULL); live: requires docker compose up -d mongo-rs"]
+/// Strict known defect (Mongo engine step): a CDC delete carries only the flat `_id` text, so deletes of
+/// _id null and _id "null" are byte-identical rows; passes while that holds, fails ("did not panic") once fixed.
+#[ignore = "live: requires docker compose up -d mongo-rs"]
+#[should_panic(expected = "cannot tell which document was deleted")]
 fn roast_mongo_cdc_deletes_of_null_and_string_null_id_are_distinguishable() {
     use mongodb::bson::Bson;
     let (m, _g, rig) = null_and_string_null_ids(false).unwrap();
