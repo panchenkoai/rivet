@@ -331,9 +331,9 @@ fn every_ledger_row_has_a_sample_a_real_delivery_and_a_twin_in_the_other_mode() 
 }
 
 /// The rows the parity driver expects to miss their ADR target, as `engine:mode:native`
-/// (` (ClickHouse)` for a clickhouse_defect). A marker must be named here; a fix may leave
-/// its line, which is then deleted; a new defect is fixed, not added here.
-const KNOWN_DEFECTS: [&str; 41] = [
+/// (` (ClickHouse)` for a clickhouse_defect). Named and marked are the same set: a fix
+/// deletes its line here, and a new defect is fixed, not added here.
+const KNOWN_DEFECTS: &[&str] = &[
     "postgres:batch:INTERVAL",
     "postgres:batch:NUMERIC",
     "postgres:batch:MONEY",
@@ -414,12 +414,19 @@ fn marked(doc: &Value) -> BTreeSet<String> {
     out
 }
 
-/// The markers of `doc` that `KNOWN_DEFECTS` does not name.
+/// Every marker of `doc` that `KNOWN_DEFECTS` does not name, and every name with no marker left.
 fn known_defect_violations(doc: &Value) -> Vec<String> {
     let named: BTreeSet<String> = KNOWN_DEFECTS.iter().map(|s| s.to_string()).collect();
-    marked(doc)
-        .difference(&named)
-        .map(|m| format!("{m}: a new known defect, blessed into the ledger instead of fixed"))
+    let marked = marked(doc);
+    marked
+        .symmetric_difference(&named)
+        .map(|m| {
+            if marked.contains(m) {
+                format!("{m}: a new known defect, blessed into the ledger instead of fixed")
+            } else {
+                format!("{m}: fixed, its marker is gone — delete its KNOWN_DEFECTS line")
+            }
+        })
         .collect()
 }
 
@@ -449,7 +456,10 @@ fn a_known_defect_moved_to_another_row_is_refused() {
     let bad = known_defect_violations(&doc);
     assert_eq!(
         bad,
-        ["mysql:cdc:DATETIME(6): a new known defect, blessed into the ledger instead of fixed"],
+        [
+            "mysql:cdc:BOOLEAN: fixed, its marker is gone — delete its KNOWN_DEFECTS line",
+            "mysql:cdc:DATETIME(6): a new known defect, blessed into the ledger instead of fixed"
+        ],
         "a marker moved to another row kept the count and went unnoticed"
     );
 }
@@ -544,4 +554,25 @@ fn a_known_defect_without_today_delivery_is_refused() {
     for want in ["needs `today_delivery:`", "needs `today_clickhouse:`"] {
         assert!(bad.iter().any(|b| b.contains(want)), "{want}: {bad:?}");
     }
+}
+
+#[test]
+fn a_fixed_defect_left_in_known_defects_is_refused() {
+    let mut doc = ledger();
+    for mode in MODES {
+        doc["engines"]["mysql"][mode]
+            .as_sequence_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|r| r["native_type"] == "BOOLEAN")
+            .and_then(|r| r.as_mapping_mut().unwrap().remove("known_defect"))
+            .unwrap();
+    }
+    assert_eq!(
+        known_defect_violations(&doc),
+        [
+            "mysql:batch:BOOLEAN: fixed, its marker is gone — delete its KNOWN_DEFECTS line",
+            "mysql:cdc:BOOLEAN: fixed, its marker is gone — delete its KNOWN_DEFECTS line"
+        ]
+    );
 }
