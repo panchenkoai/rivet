@@ -200,7 +200,7 @@ impl Rig {
         let dest = base.join("out");
         std::fs::create_dir_all(&dest).expect("census destination");
         self.dest_override = Some(dest);
-        self.oracle_container_dir = self.oracle_container_dir.map(|c| format!("{c}/out"));
+        self.oracle_container_dir = self.oracle_container_dir.take().map(|c| format!("{c}/out"));
         self
     }
 

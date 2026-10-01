@@ -22,6 +22,16 @@ impl Rig {
         self
     }
 
+    /// A known product defect the oracle must keep catching: a disagreement is expected, and a rig whose graded runs all agree fails with "now passes".
+    pub fn oracle_known_defect(mut self, reason: &str) -> Self {
+        assert!(
+            !reason.trim().is_empty(),
+            "oracle_known_defect needs a reason — name the defect and the step that fixes it"
+        );
+        self.oracle_xfail = Some(reason.to_string());
+        self
+    }
+
     /// Snapshot the Success manifest names before a `run`, so the oracle can tell which ones this run wrote.
     pub(crate) fn oracle_before(&self) -> ManifestSnapshot {
         if self.oracle_off.is_some() || self.oracle_unreachable().is_some() {
@@ -150,6 +160,14 @@ impl Rig {
             .collect();
         if failures.is_empty() {
             return oracle_log("PASS", &self.name, &verdict["facts"].to_string());
+        }
+        if let Some(why) = &self.oracle_xfail {
+            self.oracle_xfailed.set(true);
+            return oracle_log(
+                "XFAIL",
+                &self.name,
+                &format!("{why} — {}", failures.join(" | ")),
+            );
         }
         oracle_log("FAIL", &self.name, &failures.join(" | "));
         panic!(
@@ -338,4 +356,16 @@ fn oracle_source_url(url: &str) -> String {
     ]
     .iter()
     .fold(url.to_string(), |u, (from, to)| u.replace(from, to))
+}
+
+impl Drop for Rig {
+    /// A known-defect marker whose rig never disagreed fails the test: the defect is fixed and the marker must go.
+    fn drop(&mut self) {
+        if let Some(why) = &self.oracle_xfail
+            && !self.oracle_xfailed.get()
+            && !std::thread::panicking()
+        {
+            panic!("oracle known defect now passes — remove the marker: {why}");
+        }
+    }
 }

@@ -83,6 +83,10 @@ pub struct Rig {
     census_key: Option<String>,
     /// Why this rig opted out of the default oracle (see `Rig::no_oracle`).
     oracle_off: Option<String>,
+    /// A product defect the oracle must keep catching (see `Rig::oracle_known_defect`).
+    oracle_xfail: Option<String>,
+    /// Whether a graded run of an `oracle_xfail` rig disagreed, as the marker expects.
+    oracle_xfailed: std::cell::Cell<bool>,
     /// Top-level lines rendered after the exports. See [`Rig::top_line`].
     top_lines: Vec<String>,
     /// Caller-owned config copies produced by [`Rig::config_in`] — a
@@ -142,6 +146,8 @@ impl Rig {
             dest_stdout: false,
             census_key: None,
             oracle_off: None,
+            oracle_xfail: None,
+            oracle_xfailed: std::cell::Cell::new(false),
             top_lines: Vec::new(),
             cloud_dest: None,
             materialized_copies: std::cell::RefCell::new(Vec::new()),

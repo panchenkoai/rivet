@@ -84,7 +84,7 @@ def _bc_text(s: str) -> str | None:
     if not m:
         return None
     day, rest = (m.group(1), m.group(2)) if m.group(1) else (m.group(3), m.group(4))
-    rest = re.sub(r"\.0+$", "", rest.strip()) or "00:00:00"
+    rest = re.sub(r"\.0+$", "", rest.strip().lstrip("T")) or "00:00:00"
     return f"{day} {rest}"
 
 
@@ -249,8 +249,8 @@ def oracle_result(url: str, sql: str) -> tuple[list[str], list[tuple]]:
         ]
 
 
-def oracle_table_select(url: str, table: str) -> str:
-    """`SELECT` of every column of `table` (`OWNER.TABLE` allowed), DATE/TIMESTAMP as ISO text with every fractional digit (python-oracledb would truncate TIMESTAMP(9) to microseconds and refuses BC years), a WITH TIME ZONE column rendered at UTC."""
+def oracle_table_select(url: str, table: str, renders: dict | None = None) -> str:
+    """`SELECT` of every column of `table` (`OWNER.TABLE` allowed), DATE/TIMESTAMP as ISO text with every fractional digit (python-oracledb would truncate TIMESTAMP(9) to microseconds and refuses BC years), a WITH TIME ZONE column rendered at UTC; `renders` maps a column name to its own `{c}` expression."""
     owner, name = table.split(".", 1) if "." in table else (None, table)
     where = f"owner = '{owner.upper()}' AND " if owner else "owner = USER AND "
     cols = oracle_rows(
@@ -261,6 +261,8 @@ def oracle_table_select(url: str, table: str) -> str:
 
     def one(name: str, typ: str) -> str:
         q = f'"{name}"'
+        if renders and name in renders:
+            return f"{renders[name].replace('{c}', q)} AS {q}"
         if typ.endswith(" WITH TIME ZONE") and "LOCAL" not in typ:
             return f"TO_CHAR({q} AT TIME ZONE 'UTC', 'SYYYY-MM-DD HH24:MI:SS.FF9') AS {q}"
         if typ.startswith("TIMESTAMP"):
@@ -475,6 +477,7 @@ def _self_test() -> None:
     assert canon("09:08:07.1234567") != canon("09:08:07.123456"), "a TIME's 7th digit must count"
     assert canon("PT0.0000001S") != canon("PT0S"), "a 100ns interval is not zero"
     assert canon("-0001-06-15 00:00:00") == canon("0001-06-15 (BC) 00:00:00"), "Oracle and DuckDB spell 1 BC differently"
+    assert canon("-0001-06-15T00:00:00") == canon("0001-06-15 (BC) 00:00:00"), "an ISO `T` separator is not a difference"
     assert canon("-0001-06-15 00:00:00") != canon("0001-06-15 00:00:00"), "BC is not AD"
     assert canon("P1D") != canon("24:00:00"), "one day and 24 hours differ in PostgreSQL interval semantics"
     good = {"run_ids": ["r"], "source": 3, "manifest": 3, "footers": 3, "metrics": 3, "file_log": 3,

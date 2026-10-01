@@ -16,7 +16,7 @@
 use std::path::{Path, PathBuf};
 
 /// `.no_oracle(` call sites across tests/, excluding the rig's own definition.
-const NO_ORACLE_CEILING: usize = 24;
+const NO_ORACLE_CEILING: usize = 22;
 
 /// Rust DuckDB-helper call sites across tests/ (see [`duckdb_helper_names`]).
 const DUCKDB_HELPER_CEILING: usize = 627;
@@ -133,5 +133,69 @@ fn rust_duckdb_helper_call_sites_never_grow() {
         n, DUCKDB_HELPER_CEILING,
         "Rust DuckDB helper call sites: {n}, ceiling {DUCKDB_HELPER_CEILING}. New reads go through \
          dev/release_oracle (the one DuckDB session); a migrated call lowers the ceiling here."
+    );
+}
+
+/// `(test fn, reason prefix)` of every `.oracle_known_defect(` site: a product defect the oracle must keep catching. Removing one is allowed; adding one is a reviewed diff here.
+const KNOWN_DEFECTS: &[(&str, &str)] = &[
+    (
+        "roast_pg_cdc_refuses_a_bare_table_name_that_matches_two_relations",
+        "known defect: a bare-name capture delivers the WAL rows",
+    ),
+    (
+        "pg_cdc_pk_changing_update_captures_and_does_not_brick",
+        "known defect: a PK-changing UPDATE carries no delete",
+    ),
+];
+
+/// `(enclosing fn, reason)` of every `.oracle_known_defect("…")` call in `text`.
+fn known_defect_sites(text: &str) -> Vec<(String, String)> {
+    text.match_indices(".oracle_known_defect(")
+        .map(|(i, _)| {
+            let before = &text[..i];
+            let f = before
+                .rfind("\nfn ")
+                .map(|j| {
+                    before[j + 4..]
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                        .collect::<String>()
+                })
+                .unwrap_or_default();
+            let reason = text[i..]
+                .split_once('"')
+                .and_then(|(_, r)| r.split_once('"'))
+                .map(|(r, _)| r.to_string())
+                .unwrap_or_default();
+            (f, reason)
+        })
+        .collect()
+}
+
+#[test]
+fn oracle_known_defects_are_a_named_set_that_only_shrinks() {
+    let sites: Vec<(String, String)> = sources()
+        .iter()
+        .filter(|(rel, _)| rel != "tests/common/rig/verify.rs")
+        .flat_map(|(_, t)| known_defect_sites(t))
+        .collect();
+    super::nonvacuity::require_enumerated(
+        sites.len(),
+        1,
+        "oracle_known_defect sites",
+        "the marker moved",
+    );
+    let unlisted: Vec<&(String, String)> = sites
+        .iter()
+        .filter(|(f, r)| {
+            !KNOWN_DEFECTS
+                .iter()
+                .any(|(kf, kp)| kf == f && r.starts_with(kp))
+        })
+        .collect();
+    assert!(
+        unlisted.is_empty(),
+        "new `.oracle_known_defect` site(s) {unlisted:?}: a known product defect is added to \
+         KNOWN_DEFECTS in a reviewed diff, never silently"
     );
 }
