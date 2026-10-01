@@ -1,9 +1,11 @@
-//! VERIFY — the rig's DEFAULT independent oracle. After every `run` that exits
-//! 0 the rig gathers FACTS (engine, source URL, table/query, the export's own
+//! VERIFY — the rig's DEFAULT independent oracle. After every `Rig` `run` that
+//! exits 0 the rig gathers FACTS (engine, source URL, table/query, the export's own
 //! filter, the Success manifests the run wrote, the state DB) and hands them to
 //! `dev/release_oracle/rig_oracle.py`, which owns the one DuckDB session and
 //! every check. Opt out only with `.no_oracle("<reason>")`; a rig the oracle
-//! cannot reach logs a `RIVET-ORACLE-SKIP` line, never silence.
+//! cannot reach logs a `RIVET-ORACLE-SKIP` line, never silence. Runs started
+//! outside the rig (`run_rivet*`, a bare `Command::new(RIVET_BIN)`) are NOT graded;
+//! their count is a shrink-only ceiling in tests/offline/rig_oracle_ratchet.rs.
 
 use super::*;
 use std::collections::BTreeSet;

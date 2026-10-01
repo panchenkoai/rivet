@@ -1,5 +1,8 @@
 """The Rust test rig's default oracle: one DuckDB session grades one run's declared output.
 
+Only runs driven through the `Rig` reach it; a live test that calls `run_rivet*` or the
+binary directly is not graded (counted by tests/offline/rig_oracle_ratchet.rs).
+
 The rig (tests/common/rig/verify.rs) only gathers facts — engine, source URL, table or
 query, the export's own filter, the manifests the run wrote, the state DB — and hands
 them here as JSON on stdin. This module owns every check: it ATTACHes the source and

@@ -1,14 +1,17 @@
 //! Shrink-only ceilings for the rig's default oracle.
 //!
 //! Every successful `Rig` run is graded by `dev/release_oracle/rig_oracle.py`
-//! (tests/common/rig/verify.rs). Two counts may only go down:
+//! (tests/common/rig/verify.rs); a run started outside the rig is not. Three
+//! counts may only go down:
 //!
 //! * `.no_oracle("<reason>")` opt-outs — each one is a live test whose output
 //!   no independent reader checks;
 //! * call sites of the Rust-side DuckDB helpers (`tests/common/duckdb.rs`, the
 //!   `duckdb_*` readers in `tests/common/parquet.rs`, the rig's container
 //!   census) — the one DuckDB session belongs to the Python oracle, and these
-//!   are the calls still to migrate onto it.
+//!   are the calls still to migrate onto it;
+//! * raw rivet invocations in tests/live (`run_rivet*(`, `Command::new` of the
+//!   binary) — runs no oracle grades.
 //!
 //! A count below its ceiling fails too, so every migration lowers the ceiling
 //! in the same diff and cannot be spent later as silent slack.
@@ -197,5 +200,52 @@ fn oracle_known_defects_are_a_named_set_that_only_shrinks() {
         unlisted.is_empty(),
         "new `.oracle_known_defect` site(s) {unlisted:?}: a known product defect is added to \
          KNOWN_DEFECTS in a reviewed diff, never silently"
+    );
+}
+
+/// Raw rivet invocations in tests/live (`run_rivet*(` and `Command::new(RIVET_BIN | rivet_bin())`): runs the rig oracle never sees.
+const RAW_RIVET_CEILING: usize = 387;
+
+/// Call sites of `run_rivet*(` helpers plus direct `Command::new` of the rivet binary in `text`.
+fn raw_rivet_sites(text: &str) -> usize {
+    let helpers = text
+        .match_indices("run_rivet")
+        .filter(|(i, _)| {
+            let before = &text[..*i];
+            let after = &text[i + "run_rivet".len()..];
+            let tail = after
+                .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .unwrap_or(after.len());
+            !before.ends_with("fn ")
+                && !before
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_alphanumeric() || c == '_')
+                && after[tail..].starts_with('(')
+        })
+        .count();
+    let direct = text.matches("Command::new(RIVET_BIN)").count()
+        + text.matches("Command::new(rivet_bin())").count();
+    helpers + direct
+}
+
+#[test]
+fn raw_rivet_invocations_in_live_tests_never_grow() {
+    let live: Vec<(String, String)> = sources()
+        .into_iter()
+        .filter(|(rel, _)| rel.starts_with("tests/live/"))
+        .collect();
+    super::nonvacuity::require_enumerated(
+        live.len(),
+        30,
+        "live test sources scanned",
+        "tests/live moved",
+    );
+    let n: usize = live.iter().map(|(_, t)| raw_rivet_sites(t)).sum();
+    assert_eq!(
+        n, RAW_RIVET_CEILING,
+        "raw rivet invocations in tests/live: {n}, ceiling {RAW_RIVET_CEILING}. These runs bypass \
+         the rig's default oracle; new tests drive rivet through `Rig`, and a migrated call \
+         lowers the ceiling here."
     );
 }
