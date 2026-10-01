@@ -363,6 +363,7 @@ fn soak_spill_postgres() {
 
     let tbl = unique_name("soak_spill_pg");
     let slot = unique_name("soak_spill_slot");
+    let _slot = Slot::new(slot.clone());
     let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect");
     c.batch_execute(&format!(
         "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} {ONE_TRANSACTION_DDL}"
@@ -374,7 +375,6 @@ fn soak_spill_postgres() {
         &[&slot],
     )
     .unwrap();
-    let _slot = Slot(slot.clone());
 
     // ONE rig for the whole soak: the same slot, the same checkpoint and the same
     // destination prefix on every cycle. That is the scheduler's own shape

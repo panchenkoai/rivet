@@ -1205,6 +1205,7 @@ fn pg_cdc_delete_with_non_first_pk_lands_in_the_pk_column() {
     use postgres::NoTls;
     let tbl = unique_name("cdc_pk_mid");
     let slot = unique_name("rivet_pkmid_slot");
+    let _slot = Slot::new(slot.clone());
     let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
     // PK deliberately NOT first; a compound variant covers the PK-in-the-
     // middle shape too.
@@ -1219,7 +1220,6 @@ fn pg_cdc_delete_with_non_first_pk_lands_in_the_pk_column() {
         &[&slot],
     )
     .unwrap();
-    let _slot = Slot(slot.clone());
     c.batch_execute(&format!(
         "INSERT INTO {tbl} VALUES ('alice', 42); DELETE FROM {tbl} WHERE id = 42;"
     ))
@@ -1283,6 +1283,7 @@ fn pg_cdc_pk_changing_update_captures_and_does_not_brick() {
     use postgres::NoTls;
     let tbl = unique_name("cdc_pkupd");
     let slot = unique_name("rivet_pkupd_slot");
+    let _slot = Slot::new(slot.clone());
     let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
     c.batch_execute(&format!(
         "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id INT PRIMARY KEY, v TEXT)"
@@ -1294,7 +1295,6 @@ fn pg_cdc_pk_changing_update_captures_and_does_not_brick() {
         &[&slot],
     )
     .unwrap();
-    let _slot = Slot(slot.clone());
     c.batch_execute(&format!(
         "INSERT INTO {tbl} VALUES (1,'a'); UPDATE {tbl} SET id = 2 WHERE id = 1;"
     ))

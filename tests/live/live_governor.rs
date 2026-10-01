@@ -1492,7 +1492,10 @@ fn mssql_governor_backs_off_under_real_log_flush_pressure() {
                                WHERE counter_name LIKE 'Log Flush Waits%' \
                                AND instance_name = '_Total'";
 
-    const ROWS: i64 = 20_000;
+    // Sized so the run outlasts the writer's cadence: at 20k rows a loaded stand
+    // finished the run in 2.0 s while the writer landed 3 batches (measured
+    // 2026-10-01 beside 99 MSSQL live tests; 4.2-5.5 s and 9-15 batches solo).
+    const ROWS: i64 = 60_000;
     let table = seed_mssql_governor_numeric_table(ROWS);
     let scratch = format!("{}_flush", table.name());
     mssql_governor_exec(&format!(
@@ -1542,8 +1545,20 @@ fn mssql_governor_backs_off_under_real_log_flush_pressure() {
     });
 
     // Let the writer drive the counter before rivet starts, so the governor's
-    // first sample PAIR already spans rising pressure.
-    std::thread::sleep(Duration::from_millis(500));
+    // first sample PAIR already spans rising pressure: wait for its own committed
+    // batches, not a fixed sleep (500 ms measured 0-2 batches).
+    const WARM_BATCHES: u64 = 5;
+    let warm_deadline = std::time::Instant::now() + Duration::from_secs(120);
+    while writer_batches.load(Ordering::Relaxed) < WARM_BATCHES {
+        assert!(
+            std::time::Instant::now() < warm_deadline,
+            "fixture went inert: the log-flush writer committed {} of {WARM_BATCHES} warm-up \
+             batches in 120 s",
+            writer_batches.load(Ordering::Relaxed)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let batches_at_start = writer_batches.load(Ordering::Relaxed);
     let waits_before = mssql_governor_query_i64(FLUSH_WAITS);
 
     let rig = Rig::mssql_governor_batch(table.name())
@@ -1591,6 +1606,11 @@ fn mssql_governor_backs_off_under_real_log_flush_pressure() {
         !writer_panicked,
         "the log-flush writer PANICKED, so the shed assertion below grades something \
          other than this fixture (it committed {batches} batches first)"
+    );
+    assert!(
+        batches > batches_at_start,
+        "fixture went inert: the writer committed no batch during the run \
+         ({batches_at_start} before it, {batches} after), so the pressure did not overlap it"
     );
     assert!(
         batches >= 5,

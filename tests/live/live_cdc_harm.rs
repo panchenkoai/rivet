@@ -82,6 +82,7 @@ fn a_mysql_cdc_drain_reads_the_binlog_not_the_table() {
 fn a_pg_cdc_drain_reads_the_wal_not_the_table_and_records_what_it_decoded() {
     let tbl = unique_name("harm_pg");
     let slot = unique_name("rivet_harm_slot");
+    let _slot = Slot::new(slot.clone());
     let mut c = postgres::Client::connect(POSTGRES_CDC_URL, postgres::NoTls).expect("connect");
     c.batch_execute(&format!(
         "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT); \
@@ -93,7 +94,6 @@ fn a_pg_cdc_drain_reads_the_wal_not_the_table_and_records_what_it_decoded() {
         "the test counts reads of the source table; the oracle's own read-back would be counted",
     );
     rig.run_ok(); // creates the slot
-    let _slot = Slot(slot.clone());
     c.batch_execute(&format!(
         "INSERT INTO {tbl} SELECT g, g FROM generate_series({}, {}) g",
         TABLE_ROWS + 1,

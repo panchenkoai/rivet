@@ -130,15 +130,49 @@ pub fn seed_pg_wide_table(row_count: i64, payload_len: usize) -> PgTable {
     PgTable::adopt(name)
 }
 
-/// RAII guard for a logical replication slot — drops it on scope exit so an
-/// aborted test never leaks a slot into `max_replication_slots`.
-pub struct Slot(pub String);
+/// RAII guard for a logical replication slot: on scope exit it terminates the
+/// slot's walsender (a timed-out run leaves it active) and drops the slot.
+pub struct Slot {
+    name: String,
+    url: String,
+}
+impl Slot {
+    /// Guard `name` on the CDC stand; build it BEFORE the first command that can create the slot.
+    pub fn new(name: impl Into<String>) -> Self {
+        let url = std::env::var("POSTGRES_CDC_URL")
+            .unwrap_or_else(|_| super::env::POSTGRES_CDC_URL.to_string());
+        Self::on(&url, name)
+    }
+
+    /// Guard `name` on the instance at `url`.
+    pub fn on(url: &str, name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            url: url.to_string(),
+        }
+    }
+}
 impl Drop for Slot {
     fn drop(&mut self) {
-        let url = std::env::var("POSTGRES_CDC_URL")
-            .unwrap_or_else(|_| "postgresql://rivet:rivet@127.0.0.1:5434/rivet".to_string());
-        if let Ok(mut c) = postgres::Client::connect(&url, postgres::NoTls) {
-            let _ = c.execute("SELECT pg_drop_replication_slot($1)", &[&self.0]);
+        let Ok(mut c) = postgres::Client::connect(&self.url, postgres::NoTls) else {
+            return;
+        };
+        for _ in 0..50 {
+            let _ = c.execute(
+                "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots \
+                 WHERE slot_name = $1 AND active_pid IS NOT NULL",
+                &[&self.name],
+            );
+            if c.execute(
+                "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots \
+                 WHERE slot_name = $1",
+                &[&self.name],
+            )
+            .is_ok()
+            {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
     }
 }

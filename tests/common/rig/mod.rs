@@ -838,6 +838,7 @@ impl CdcScenario {
     pub fn pg_with(label: &str, cols: &str, shape: impl FnOnce(Rig, &str) -> Rig) -> Self {
         let table = super::unique_name(label);
         let slot = super::unique_name(&format!("{label}_slot"));
+        let sguard = super::pg::Slot::new(slot.clone());
         let mut client = postgres::Client::connect(super::env::POSTGRES_CDC_URL, postgres::NoTls)
             .expect("connect postgres-cdc");
         client
@@ -852,7 +853,6 @@ impl CdcScenario {
                 &[&slot],
             )
             .unwrap();
-        let sguard = super::pg::Slot(slot.clone());
         Self {
             rig: shape(Rig::pg_cdc(&table, &slot), &table),
             table,

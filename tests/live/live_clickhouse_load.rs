@@ -171,7 +171,7 @@ fn a_postgres_cdc_stream_loads_into_clickhouse_and_the_view_matches_the_source()
     ensure_gcs_bucket(BUCKET);
     let tbl = unique_name("rivet_ch_pg");
     let slot = unique_name("rivet_ch_slot");
-    let _slot = Slot(slot.clone());
+    let _slot = Slot::new(slot.clone());
     let mut c = postgres::Client::connect(POSTGRES_CDC_URL, postgres::NoTls).expect("pg");
     c.batch_execute(&format!(
         "CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v BIGINT); \
@@ -646,7 +646,7 @@ fn a_change_log_with_tz_and_time_columns_takes_a_second_load() {
     ensure_gcs_bucket(BUCKET);
     let tbl = unique_name("rivet_ch_tz");
     let slot = unique_name("rivet_ch_tz_slot");
-    let _slot = Slot(slot.clone());
+    let _slot = Slot::new(slot.clone());
     let mut c = postgres::Client::connect(POSTGRES_CDC_URL, postgres::NoTls).expect("pg");
     c.batch_execute(&format!(
         "CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v BIGINT, at TIMESTAMPTZ, t TIME); \

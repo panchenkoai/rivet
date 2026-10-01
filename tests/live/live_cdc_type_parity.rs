@@ -1752,8 +1752,8 @@ fn postgres_batch_and_cdc_deliver_every_ledger_row_alike() {
         let wslot = unique_name(&format!("{label}_ch_slot"));
         let guards = (
             PgTable::adopt_on(POSTGRES_CDC_URL, table.clone()),
-            Slot(slot.clone()),
-            Slot(wslot.clone()),
+            Slot::new(slot.clone()),
+            Slot::new(wslot.clone()),
         );
         let mut cdc = Rig::pg_cdc(&table, &slot);
         if snapshot {

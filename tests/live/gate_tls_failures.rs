@@ -58,8 +58,9 @@ fn error_line(stderr: &str) -> String {
 #[test]
 #[ignore = "live: requires docker compose up -d postgres-cdc"]
 fn pg_cdc_tls_failure_is_not_buried_behind_the_setup_hint() {
-    let rig = Rig::pg_cdc("public.tls_probe", &unique_name("tls_slot"))
-        .source_line("tls: { mode: verify-full }");
+    let slot = unique_name("tls_slot");
+    let _slot = Slot::new(slot.clone());
+    let rig = Rig::pg_cdc("public.tls_probe", &slot).source_line("tls: { mode: verify-full }");
     let (code, stderr, _) = run_timed(&rig);
     assert_ne!(code, Some(0), "stderr:\n{stderr}");
     assert_eq!(
