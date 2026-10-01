@@ -69,6 +69,7 @@ mod sql_engine;
 mod state;
 mod storage;
 mod toxi;
+mod verify;
 
 pub use bigquery::*;
 pub use clickhouse::*;

@@ -1,10 +1,11 @@
-"""The Rust test rig's default oracle: one DuckDB session grades one run's declared output.
+"""The live suite's default oracle: one DuckDB session grades one run's declared output.
 
-Only runs driven through the `Rig` reach it; a live test that calls `run_rivet*` or the
-binary directly is not graded (counted by tests/offline/rig_oracle_ratchet.rs).
+Every `rivet run|load|compact --config` a live test starts through the `Rig` or a shared
+`run_rivet*` helper reaches it; a hand-built spawn of the binary is not graded (counted by
+tests/offline/rig_oracle_ratchet.rs).
 
-The rig (tests/common/rig/verify.rs) only gathers facts — engine, source URL, table or
-query, the export's own filter, the manifests the run wrote, the state DB — and hands
+tests/common/verify.rs only gathers facts from the config file — engine, source URL, table
+or query, the export's own filter, the manifests the run wrote, the state DB — and hands
 them here as JSON on stdin. This module owns every check: it ATTACHes the source and
 rivet's state DB READ_ONLY through `duck.Oracle`, reads only the parts the Success
 manifests declare, and grades per column
