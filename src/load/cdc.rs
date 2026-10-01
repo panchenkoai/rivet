@@ -365,7 +365,8 @@ fn key_array_type(target_type: &str) -> Option<&'static str> {
 
 /// Script statements that set `days` to the partition days a compaction touches, reading the
 /// base only for the updated/deleted keys whose row the buffer's own days do not contain
-/// (a key whose partition value changed, or a delete that carries no partition value).
+/// (a key whose partition value changed, or a delete that carries no partition value);
+/// a key the same buffer inserts is never looked up, and the moved set is found in one pass.
 fn touched_days_script(
     changes_fqtn: &str,
     base_fqtn: &str,
@@ -377,9 +378,15 @@ fn touched_days_script(
     let own = date_of(&format!("`{column}`"), column_type);
     let base_day = date_of(&format!("__rivet_t.`{column}`"), column_type);
     let join = key_join(pk);
+    let inserted = pk
+        .iter()
+        .map(|k| format!("__rivet_i.`{k}` = __rivet_s.`{k}`"))
+        .collect::<Vec<_>>()
+        .join(" AND ");
     let unmatched = format!(
         "FROM `{changes_fqtn}` AS __rivet_s WHERE IFNULL(__rivet_s.__op, '') != 'insert' AND NOT EXISTS \
-         (SELECT 1 FROM `{base_fqtn}` AS __rivet_t WHERE {join} AND \
+         (SELECT 1 FROM `{changes_fqtn}` AS __rivet_i WHERE {inserted} AND __rivet_i.__op = 'insert') \
+         AND NOT EXISTS (SELECT 1 FROM `{base_fqtn}` AS __rivet_t WHERE {join} AND \
          ({base_day} IN UNNEST(days) OR __rivet_t.`{column}` IS NULL))"
     );
     let add_days = |filter: &str| {
@@ -394,15 +401,17 @@ fn touched_days_script(
     ));
     let lookup = match key0 {
         Some((k, _)) => format!(
-            "SET moved_bytes = (SELECT IFNULL(SUM(BYTE_LENGTH(CAST(__rivet_s.`{k}` AS STRING)) + 16), 0) {unmatched});\n\
+            "SET (moved_bytes, moved) = (SELECT AS STRUCT b, IF(b <= {KEY_ARRAY_BYTES}, ks, []) FROM \
+             (SELECT IFNULL(SUM(BYTE_LENGTH(CAST(__rivet_s.`{k}` AS STRING)) + 16), 0) AS b, \
+             IFNULL(ARRAY_AGG(DISTINCT __rivet_s.`{k}` IGNORE NULLS LIMIT {}), []) AS ks {unmatched}));\n\
              IF moved_bytes > 0 THEN\n\
              \x20 IF moved_bytes <= {KEY_ARRAY_BYTES} THEN\n\
-             \x20   SET moved = (SELECT IFNULL(ARRAY_AGG(DISTINCT __rivet_s.`{k}` IGNORE NULLS), []) {unmatched});\n\
              \x20   {}\n\
              \x20 ELSE\n\
              \x20   {scan_all}\n\
              \x20 END IF;\n\
              END IF;",
+            KEY_ARRAY_BYTES / 16 + 1,
             add_days(&format!(
                 "__rivet_t.`{k}` IN UNNEST(moved) AND EXISTS (SELECT 1 FROM `{changes_fqtn}` AS __rivet_s WHERE {join})"
             ))
@@ -1715,14 +1724,24 @@ mod compact_tests {
             "the days start as the buffer's own: {s}"
         );
         let unmatched = "FROM `p.d.t__changes` AS __rivet_s WHERE IFNULL(__rivet_s.__op, '') != 'insert' AND NOT EXISTS \
-                         (SELECT 1 FROM `p.d.t` AS __rivet_t WHERE __rivet_t.`id` = __rivet_s.`id` AND \
+                         (SELECT 1 FROM `p.d.t__changes` AS __rivet_i WHERE __rivet_i.`id` = __rivet_s.`id` AND __rivet_i.__op = 'insert') \
+                         AND NOT EXISTS (SELECT 1 FROM `p.d.t` AS __rivet_t WHERE __rivet_t.`id` = __rivet_s.`id` AND \
                          (DATE(__rivet_t.`created_at`) IN UNNEST(days) OR __rivet_t.`created_at` IS NULL))";
         assert!(
             s.contains(&format!(
-                "SET moved_bytes = (SELECT IFNULL(SUM(BYTE_LENGTH(CAST(__rivet_s.`id` AS STRING)) + 16), 0) {unmatched});"
+                "SET (moved_bytes, moved) = (SELECT AS STRUCT b, IF(b <= 700000, ks, []) FROM \
+                 (SELECT IFNULL(SUM(BYTE_LENGTH(CAST(__rivet_s.`id` AS STRING)) + 16), 0) AS b, \
+                 IFNULL(ARRAY_AGG(DISTINCT __rivet_s.`id` IGNORE NULLS LIMIT 43751), []) AS ks {unmatched}));"
             )),
-            "only an updated/deleted key whose base row lies outside the buffer's days is looked up, \
-             and the check reads the base pruned to those days: {s}"
+            "only an updated/deleted key that the buffer does not insert and whose base row lies \
+             outside the buffer's days is looked up, its size and its keys in ONE pass over the \
+             base pruned to those days: {s}"
+        );
+        assert_eq!(
+            s.matches("AND NOT EXISTS (SELECT 1 FROM `p.d.t` AS __rivet_t")
+                .count(),
+            1,
+            "the moved set is read once — a pilot paid 2 x 2.2 GiB per table for reading it twice: {s}"
         );
         assert!(
             s.contains("DECLARE moved ARRAY<INT64> DEFAULT [];")

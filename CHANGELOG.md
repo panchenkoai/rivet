@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **`rivet compact` reads the moved-key set once, and never for a key the same buffer inserts.**
+  A key inserted and then updated before the compaction has no base row yet, but the day probe
+  counted it as a key whose day might have moved and read the base for it. Every busy table hit
+  that case on every cycle. The set was also read twice, once for its size and once for its keys.
+  On a pilot's largest table that was 2 x 2.2 GiB per cycle beside a 14 GiB MERGE. Both are gone:
+  on a 50M-row base a cycle with a real day move dropped from 112 MiB to 76 MiB of probe reads, and
+  an insert-then-update cycle no longer runs the moved-key lookup at all. The merged base is
+  identical. A key deleted in an earlier cycle and re-inserted with another day, then updated in
+  one cycle, now behaves like a plain re-insert: the old tombstone stays beside the new live row.
+
 - **`rivet load` consumes the extraction runs that produced no files.** An idle CDC cycle (no
   changes) writes a manifest with no parts; the load skipped it but never recorded it, so every
   later load re-read every such manifest again: a pilot with 110 idle tables read ~50 manifests per
