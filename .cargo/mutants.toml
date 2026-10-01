@@ -653,6 +653,13 @@ exclude_re = [
     # DDL, not a refusal; the test reads INFORMATION_SCHEMA, never rivet's exit.
     # The release gate's parallel engine matrix races exactly that.
     "replace pin_plan_to_its_run -> Result<load::plan::LoadPlan>",
+    # `mysql_checks` (preflight/cdc_health.rs) is doctor's MySQL glue: it opens a
+    # connection, reads SHOW GLOBAL VARIABLES / SHOW BINARY LOGS and pushes the verdicts
+    # of the pure `mysql_binlog_config_verdict` / checkpoint graders (unit-tested). Its
+    # body stub is born MISSED offline. Live:
+    # live_cdc::mysql_cdc_refuses_minimal_row_metadata_at_open, RED against the
+    # `Ok(())` stub (2026-10-01: "doctor ran no CDC binlog server config check").
+    "replace mysql_checks -> Result<\\(\\)> with Ok\\(\\(\\)\\)",
     # The base-and-buffer siblings of `load_one_cdc` / `run_loads` (2026-09-17):
     # the same live-only script (state DB, bucket listing, a BigQuery loader), so
     # their body stubs are born MISSED for the documented reason above. Their

@@ -6508,6 +6508,28 @@ fn mysql_cdc_refuses_minimal_row_metadata_at_open() {
         "no row delivered"
     );
     assert_nothing_delivered(&rig);
+
+    // `rivet doctor` reads the same server and must FAIL the same setting.
+    let doc = run_rivet(&[
+        "doctor",
+        "--config",
+        rig.config_path().to_str().unwrap(),
+        "--json",
+    ]);
+    let report: serde_json::Value =
+        serde_json::from_slice(&doc.stdout).expect("doctor --json output");
+    let check = report["checks"]
+        .as_array()
+        .expect("checks array")
+        .iter()
+        .find(|c| c["name"] == "CDC binlog server config")
+        .unwrap_or_else(|| panic!("doctor ran no CDC binlog server config check: {report}"))
+        .clone();
+    assert_eq!(check["ok"], false, "doctor must fail MINIMAL: {check}");
+    assert!(
+        check.to_string().contains("binlog_row_metadata"),
+        "doctor names the setting: {check}"
+    );
 }
 
 /// ...and under the FULL the stack pins, a reorder across the resume boundary maps BY NAME.
