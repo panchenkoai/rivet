@@ -192,6 +192,9 @@ def _self_test() -> int:
         got = env_flag("RIVET_ORACLE_SELFTEST_FLAG")
         assert got is expect, f"env_flag({raw!r}) = {got}, expected {expect}"
     os.environ.pop("RIVET_ORACLE_SELFTEST_FLAG", None)
+    assert cdc._gate_owned_state_db("rivet_state_gate_69094")
+    assert not cdc._gate_owned_state_db("rivet_state"), "the shared stand state db must never be reset"
+    assert "pg_tables" in cdc._PG_STATE_RESET_SQL and "current_schema()" in cdc._PG_STATE_RESET_SQL
 
     # The escape is the one that costs a release: argparse's default, the
     # authoritative reader in regression.py, and this table must agree on EVERY
