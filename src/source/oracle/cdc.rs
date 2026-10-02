@@ -411,9 +411,11 @@ pub(crate) fn re_plannable(e: &anyhow::Error) -> bool {
     e.is::<MissingRegisteredLog>() || names_a_log_set_change(&format!("{e:#}"))
 }
 
-/// The wait before re-plan `attempt` (0-based), or `None` when the attempts are spent.
-pub(crate) fn remine_backoff(attempt: u32) -> Option<std::time::Duration> {
-    (attempt < REMINE_ATTEMPTS).then(|| std::time::Duration::from_millis(200 << attempt))
+/// The wait before re-plan `attempt` (0-based) after `e`, or `None` when `e` is not
+/// [`re_plannable`] or the attempts are spent.
+pub(crate) fn remine_backoff(e: &anyhow::Error, attempt: u32) -> Option<std::time::Duration> {
+    (attempt < REMINE_ATTEMPTS && re_plannable(e))
+        .then(|| std::time::Duration::from_millis(200 << attempt))
 }
 
 /// `e` as rivet's own verdict when the log set kept changing (no setup hint rides on it), else `e`.
@@ -956,8 +958,8 @@ impl OracleChangeStream {
 
     /// Sleep before the next re-plan when `e` is a log-set change with attempts left; else the error.
     fn wait_to_remine(&mut self, e: anyhow::Error) -> Result<()> {
-        match remine_backoff(self.remines) {
-            Some(wait) if re_plannable(&e) => {
+        match remine_backoff(&e, self.remines) {
+            Some(wait) => {
                 log::warn!(
                     "oracle cdc: re-planning the redo logs in {wait:?} (attempt {} of \
                      {REMINE_ATTEMPTS}) after: {e:#}",
@@ -1475,10 +1477,13 @@ mod tests {
         )));
     }
 
-    /// Five re-plans with doubling waits from 200 ms, then the error.
+    /// Five re-plans with doubling waits from 200 ms, then the error; never for a non-log error.
     #[test]
     fn re_mining_is_bounded_with_a_doubling_backoff() {
-        let ms = |a| remine_backoff(a).map(|d| d.as_millis());
+        let grants = anyhow::anyhow!("oracle: ORA-01031: insufficient privileges");
+        assert_eq!(remine_backoff(&grants, 0), None);
+        let changed = anyhow::anyhow!("oracle: ORA-01368: Redo log file header mismatch");
+        let ms = |a| remine_backoff(&changed, a).map(|d| d.as_millis());
         assert_eq!(
             (0..=REMINE_ATTEMPTS + 1).map(ms).collect::<Vec<_>>(),
             [
