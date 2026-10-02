@@ -1396,6 +1396,8 @@ jobs:
   e2e:
     name: E2E matrix
     runs-on: ubuntu-latest
+    # The job normally takes ~45 minutes; anything near this bound is a hang, not a slow run.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7
 
@@ -1475,8 +1477,15 @@ jobs:
           cargo test --no-run
 
       - name: Services are up
+        # A hung `compose up` (an image pull that never returns) used to hold this step for the
+        # job's full 6 hours; the wait is bounded and a timeout names what was still starting.
+        timeout-minutes: 25
         run: |
-          while [ ! -f "$RUNNER_TEMP/compose.rc" ]; do sleep 2; done
+          for i in $(seq 1 600); do [ -f "$RUNNER_TEMP/compose.rc" ] && break; sleep 2; done
+          if [ ! -f "$RUNNER_TEMP/compose.rc" ]; then
+            echo "::error::docker compose up did not finish within 20 minutes"
+            cat "$RUNNER_TEMP/compose.log"; docker compose ps -a; exit 1
+          fi
           cat "$RUNNER_TEMP/compose.log"
           [ "$(cat "$RUNNER_TEMP/compose.rc")" = 0 ]
           # Re-open the shared mount after ClickHouse chowns /work to uid 101 on boot,
