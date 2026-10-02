@@ -1274,6 +1274,25 @@ def run_scenarios(led: Ledger, engine: str, tag: str, url: str) -> None:
 
 
 # ── state-migration parity PREFLIGHT (source-agnostic, runs once) ────────────
+#: The lib tests the state-migration parity stage runs WITH the state URL; the offline battery
+#: runs them without it (it measures offline coverage), so their self-skip there is graded here.
+STATE_URL_LIB_TESTS = (
+    "state::migrations::tests::pg_upgrade_from_v18_lands_keyset_range_as_bigint_and_keeps_data",
+    "state::run_status_store::tests::pg_shared_state_cross_connection_visibility_and_supersession",
+)
+
+
+def libtest_unrun(out: str, names: tuple[str, ...]) -> list[str]:
+    """The `names` libtest did not report `test <name> ... ok` for: a zero-match filter still exits 0."""
+    return [n for n in names if f"test {n} ... ok" not in out]
+
+
+def battery_skips(skip_log: Path) -> list[str]:
+    """The offline battery's self-skips no gate stage grades (`<test> — <why>`): each is a green test that ran nothing."""
+    return [f"{k} — {v}" for k, v in self_skipped(skip_log).items()
+            if k not in SKIP_ALLOWED and k not in STATE_URL_LIB_TESTS]
+
+
 def verify_state_migrations(led: Ledger) -> None:
     """The state layer has TWO migration arrays — MIGRATIONS (SQLite) and
     PG_MIGRATIONS (Postgres) — behind a dialect seam that ASSUMES they stay
@@ -1350,13 +1369,20 @@ def verify_state_migrations(led: Ledger) -> None:
     transcript = fresh.out
     upgrade = None
     if fresh.ok:
+        upgrade_skips = work_dir() / "state_parity.skips"
+        upgrade_skips.write_text("")
         upgrade = run(
             ["cargo", "test", "--manifest-path", str(ROOT / "Cargo.toml"), "--lib",
-             "--", "pg_upgrade_from_v18", "pg_shared_state_cross_connection"],
-            env={"RIVET_TEST_STATE_URL": state_url},
+             "--", "--exact", *STATE_URL_LIB_TESTS],
+            env={"RIVET_TEST_STATE_URL": state_url, "RIVET_SKIP_LOG": str(upgrade_skips)},
             timeout=NO_TIMEOUT,
         )
         transcript += upgrade.out
+        vacuous = libtest_unrun(upgrade.out, STATE_URL_LIB_TESTS) + [
+            f"{k} — {v}" for k, v in self_skipped(upgrade_skips).items()]
+        if vacuous:
+            transcript += "\nGATE: named upgrade test(s) did not run or SELF-SKIPPED: " + "; ".join(vacuous) + "\n"
+            upgrade = Proc(upgrade.argv, 1, upgrade.stdout, upgrade.stderr)
     log_path.write_text(transcript)
     if fresh.ok and upgrade is not None and upgrade.ok:
         _passed(
@@ -1368,7 +1394,7 @@ def verify_state_migrations(led: Ledger) -> None:
             led, "state", "migrations", "parity", "-",
             "state-migration parity FAILED — a schema drift between MIGRATIONS and "
             f"PG_MIGRATIONS (see {log_path})",
-            _first_match(transcript, r"must succeed|cannot convert|FAILED"),
+            _first_match(transcript, r"GATE: named|must succeed|cannot convert|FAILED"),
         )
 
 
@@ -1578,15 +1604,23 @@ def verify_live_only_coverage(led: Ledger) -> None:
             "live-only-cov: cargo-llvm-cov not installed (cargo install cargo-llvm-cov)",
             "no llvm-cov",
         )
+        skip_log = work_dir() / "offline_battery.skips"
+        skip_log.write_text("")
         plain = run(
             ["env", "-u", "RIVET_STATE_URL", "-u", "RIVET_TEST_STATE_URL",
              "cargo", "nextest", "run", "--manifest-path", str(ROOT / "Cargo.toml")],
+            env={"RIVET_SKIP_LOG": str(skip_log)},
             timeout=NO_TIMEOUT,
         )
         log = ROOT / "target" / "gate-failures" / f"offline_battery-{os.getpid()}.log"
         log.parent.mkdir(parents=True, exist_ok=True)
         log.write_text(plain.out)
-        if plain.ok:
+        skipped = battery_skips(skip_log)
+        if plain.ok and skipped:
+            _failed(led, "infra", "offline", "battery", "-",
+                    f"offline battery: {len(skipped)} test(s) SELF-SKIPPED and no gate stage grades them: "
+                    f"{'; '.join(skipped[:3])}", "vacuous self-skip")
+        elif plain.ok:
             _passed(led, "infra", "offline", "battery", "-",
                     "offline battery (lib + offline suites) passes without coverage")
         else:
@@ -1604,9 +1638,12 @@ def verify_live_only_coverage(led: Ledger) -> None:
     # pipeline::cli state tests failed against the shared Postgres on the first
     # gated run (2026-08-29). The coverage question is about the DEFAULT
     # offline battery, so the state overrides are stripped for this leg only.
+    skip_log = work_dir() / "offline_battery.skips"
+    skip_log.write_text("")
     build = run(
         ["env", "-u", "RIVET_STATE_URL", "-u", "RIVET_TEST_STATE_URL",
          "cargo", "llvm-cov", "nextest", "--lcov", "--output-path", str(lcov)],
+        env={"RIVET_SKIP_LOG": str(skip_log)},
         timeout=NO_TIMEOUT,
     )
     # Kept outside the run's work dir, which the gate deletes — the message must name a file that exists.
@@ -1619,6 +1656,15 @@ def verify_live_only_coverage(led: Ledger) -> None:
             f"live-only-cov: the instrumented offline battery FAILED: "
             f"{_first_match(build.out, r'FAIL|panicked|error')} · full output: {log}",
             _first_match(build.out, r"FAILED|error"),
+        )
+        return
+    skipped = battery_skips(skip_log)
+    if skipped:
+        _failed(
+            led, "infra", "live-only", "coverage", "-",
+            f"live-only-cov: {len(skipped)} offline test(s) SELF-SKIPPED and no gate stage grades them: "
+            f"{'; '.join(skipped[:3])} · full output: {log}",
+            "vacuous self-skip",
         )
         return
     verdict = run(

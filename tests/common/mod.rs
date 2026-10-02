@@ -150,6 +150,21 @@ pub fn skip_live(why: &str) {
     }
 }
 
+/// The Postgres state URL `RIVET_TEST_STATE_URL` names, or `None` after recording the skip.
+pub fn pg_state_url() -> Option<String> {
+    match std::env::var("RIVET_TEST_STATE_URL") {
+        Ok(url) if url.starts_with("postgres") => Some(url),
+        Ok(_) => {
+            skip_live("RIVET_TEST_STATE_URL is not a postgres URL");
+            None
+        }
+        Err(_) => {
+            skip_live("RIVET_TEST_STATE_URL unset");
+            None
+        }
+    }
+}
+
 pub fn unique_name(prefix: &str) -> String {
     let c = NAME_COUNTER.fetch_add(1, Ordering::SeqCst);
     let pid = std::process::id();

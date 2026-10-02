@@ -12,12 +12,9 @@
 
 use rivet::state::{StateRef, StateStore};
 
-/// Open a Postgres-backed `StateStore` at `RIVET_TEST_STATE_URL`, or `None` when it names no Postgres.
+/// Open a Postgres-backed `StateStore` on `RIVET_TEST_STATE_URL`, or `None` after recording the skip.
 fn pg_store() -> Option<StateStore> {
-    let url = std::env::var("RIVET_TEST_STATE_URL").ok()?;
-    if !url.starts_with("postgres") {
-        return None;
-    }
+    let url = crate::common::pg_state_url()?;
     Some(StateStore::open_at_ref(&StateRef::Postgres(url)).expect("open pg state store"))
 }
 
@@ -411,10 +408,11 @@ struct ScratchDb {
 
 impl ScratchDb {
     /// `CREATE DATABASE` on the server `admin_url` points at, returning `None`
-    /// when the url is not one this can take apart.
+    /// when the url is not one this can take apart; an unreachable server panics.
     fn create(admin_url: &str, name: &str) -> Option<Self> {
         admin_url.rsplit_once('/')?;
-        let mut admin = postgres::Client::connect(admin_url, postgres::NoTls).ok()?;
+        let mut admin = postgres::Client::connect(admin_url, postgres::NoTls)
+            .unwrap_or_else(|e| panic!("connecting to RIVET_TEST_STATE_URL as admin: {e:#}"));
         let _ = admin.batch_execute(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE);"));
         admin
             .batch_execute(&format!("CREATE DATABASE {name};"))
@@ -474,12 +472,9 @@ fn pg_several_writers_migrating_one_database_at_once_all_succeed() {
     use rivet::state::{StateRef, StateStore};
     const WRITERS: usize = 4;
 
-    let Ok(admin_url) = std::env::var("RIVET_TEST_STATE_URL") else {
-        return crate::common::skip_live("RIVET_TEST_STATE_URL unset");
+    let Some(admin_url) = crate::common::pg_state_url() else {
+        return;
     };
-    if !admin_url.starts_with("postgres") {
-        return crate::common::skip_live("RIVET_TEST_STATE_URL is not a postgres URL");
-    }
     let name = format!(
         "rivet_migrace_{}",
         chrono::Utc::now().timestamp_micros().unsigned_abs()
