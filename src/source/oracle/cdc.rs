@@ -423,6 +423,11 @@ pub(crate) fn re_plannable(e: &anyhow::Error) -> bool {
     e.is::<LogSetFault>() || names_a_log_set_change(&format!("{e:#}"))
 }
 
+/// Whether a `COUNT(*)` of online members still holding a file's sequence proves it unreused.
+pub(crate) fn still_holds(count: Option<&str>) -> bool {
+    count.is_some_and(|c| c != "0")
+}
+
 /// Whether the read of online file `f` must be proven whole before a group committed at
 /// `commit` is queued (`None`: the window is drained): the group lies past the file's end.
 pub(crate) fn read_past(f: &LogFile, commit: Option<u64>) -> bool {
@@ -1169,7 +1174,7 @@ impl OracleChangeStream {
                     f.sequence
                 ),
             )?;
-            if held.as_deref() == Some("0") {
+            if !still_holds(held.as_deref()) {
                 return Err(LogSetFault::Reused {
                     name: f.name,
                     sequence: f.sequence,
@@ -1556,6 +1561,9 @@ mod tests {
         ] {
             assert_eq!(read_past(f, commit), want, "{} at {commit:?}", f.name);
         }
+        assert!(still_holds(Some("1")));
+        assert!(!still_holds(Some("0")));
+        assert!(!still_holds(None), "an unread count proves nothing");
     }
 
     /// One stream spends exactly five re-plans on a log that keeps changing, then fails naming it.
