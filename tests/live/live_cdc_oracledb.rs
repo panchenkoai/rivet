@@ -972,15 +972,28 @@ fn oracle_cdc_a_redo_log_switch_during_mining_is_re_mined_not_failed() {
     let t = cdc_table("ora_cswitch", "id NUMBER(18) PRIMARY KEY, v NUMBER(18)");
     let ckpt = d.path().join("cdc.ckpt");
     rig(&t, &ckpt, &d.path().join("anchor")).run_ok();
-    const ROWS: i64 = 3000;
+    const BATCH: i64 = 50;
     const RUNS: usize = 12;
+    const MAX_RUNS: usize = 40;
     let stop = std::sync::Arc::new(AtomicBool::new(false));
     let writer = {
-        let sql = format!(
-            "BEGIN FOR i IN 1..{ROWS} LOOP INSERT INTO {} VALUES (i, i); COMMIT; END LOOP; END;",
-            t.name()
-        );
-        std::thread::spawn(move || ora_conn().execute(&sql, &[]).unwrap())
+        let (stop, table) = (stop.clone(), t.name().to_string());
+        std::thread::spawn(move || {
+            let conn = ora_conn();
+            let mut written = 0;
+            while !stop.load(Relaxed) {
+                let sql = format!(
+                    "BEGIN FOR i IN {}..{} LOOP INSERT INTO {table} VALUES (i, i); COMMIT; \
+                     END LOOP; END;",
+                    written + 1,
+                    written + BATCH
+                );
+                conn.execute(&sql, &[]).unwrap();
+                written += BATCH;
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            written
+        })
     };
     let switcher = {
         let stop = stop.clone();
@@ -1000,30 +1013,32 @@ fn oracle_cdc_a_redo_log_switch_during_mining_is_re_mined_not_failed() {
     let mut failures = Vec::new();
     let mut replans = 0;
     let out = d.path().join("out");
-    for _ in 0..RUNS {
+    let mut runs = 0;
+    while runs < RUNS || (replans == 0 && runs < MAX_RUNS) {
         let run = rig(&t, &ckpt, &out).run();
         let err = String::from_utf8_lossy(&run.stderr).into_owned();
         replans += err.matches("re-planning the redo logs").count();
         if !run.status.success() {
             failures.push(err.lines().last().unwrap_or_default().to_string());
         }
+        runs += 1;
     }
-    writer.join().unwrap();
     stop.store(true, Relaxed);
+    let written = writer.join().unwrap();
     let switches = switcher.join().unwrap();
     rig(&t, &ckpt, &out).run_ok();
     assert!(
         failures.is_empty(),
-        "{} of {RUNS} runs failed under {switches} log switches: {failures:#?}",
+        "{} of {runs} runs failed under {switches} log switches: {failures:#?}",
         failures.len()
     );
-    let want: Vec<(i64, String)> = (1..=ROWS).map(|i| (i, "insert".to_string())).collect();
+    let want: Vec<(i64, String)> = (1..=written).map(|i| (i, "insert".to_string())).collect();
     assert_eq!(
         cdc_id_ops(&out),
         want,
         "every row exactly once across the runs"
     );
-    eprintln!("{replans} re-plans over {RUNS} runs under {switches} log switches");
+    eprintln!("{replans} re-plans over {runs} runs under {switches} log switches");
     assert!(
         replans > 0,
         "no run met a changed log set, so the storm proved nothing"
