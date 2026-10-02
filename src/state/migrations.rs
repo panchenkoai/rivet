@@ -992,18 +992,24 @@ const PG_MIGRATIONS: &[(i64, &str)] = &[
             captured_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_load_spec_version_unit ON load_spec_version(export_name, unit);
-        INSERT INTO load_spec_version (export_name, unit, columns_json, primary_key_json, captured_at)
-            SELECT export_name, unit, columns_json, primary_key_json, MIN(captured_at)
-            FROM export_load_spec_run
-            GROUP BY export_name, unit, columns_json, primary_key_json;
-        ALTER TABLE export_load_spec_run ADD COLUMN IF NOT EXISTS spec_id BIGINT;
-        UPDATE export_load_spec_run r SET spec_id = v.spec_id FROM load_spec_version v
-            WHERE v.export_name = r.export_name AND v.unit = r.unit
-              AND v.columns_json = r.columns_json
-              AND v.primary_key_json IS NOT DISTINCT FROM r.primary_key_json;
-        ALTER TABLE export_load_spec_run ALTER COLUMN spec_id SET NOT NULL;
-        ALTER TABLE export_load_spec_run DROP COLUMN IF EXISTS columns_json;
-        ALTER TABLE export_load_spec_run DROP COLUMN IF EXISTS primary_key_json;
+        DO $$ BEGIN
+          IF EXISTS (SELECT 1 FROM information_schema.columns
+                     WHERE table_schema = current_schema()
+                       AND table_name = 'export_load_spec_run' AND column_name = 'columns_json') THEN
+            INSERT INTO load_spec_version (export_name, unit, columns_json, primary_key_json, captured_at)
+                SELECT export_name, unit, columns_json, primary_key_json, MIN(captured_at)
+                FROM export_load_spec_run
+                GROUP BY export_name, unit, columns_json, primary_key_json;
+            ALTER TABLE export_load_spec_run ADD COLUMN IF NOT EXISTS spec_id BIGINT;
+            UPDATE export_load_spec_run r SET spec_id = v.spec_id FROM load_spec_version v
+                WHERE v.export_name = r.export_name AND v.unit = r.unit
+                  AND v.columns_json = r.columns_json
+                  AND v.primary_key_json IS NOT DISTINCT FROM r.primary_key_json;
+            ALTER TABLE export_load_spec_run ALTER COLUMN spec_id SET NOT NULL;
+            ALTER TABLE export_load_spec_run DROP COLUMN columns_json;
+            ALTER TABLE export_load_spec_run DROP COLUMN IF EXISTS primary_key_json;
+          END IF;
+        END $$;
         CREATE INDEX IF NOT EXISTS idx_file_log_run ON file_log(run_id, file_name);
         CREATE INDEX IF NOT EXISTS idx_export_metrics_export ON export_metrics(export_name, id DESC);",
     ),
@@ -1203,27 +1209,29 @@ pub(super) fn migrate_pg(client: &mut postgres::Client) -> Result<()> {
     // of a shared deployment.
     let mut tx = client
         .transaction()
-        .map_err(|e| anyhow::anyhow!("state(pg): begin migration: {:#}", e))?;
+        .map_err(|e| anyhow::anyhow!("state(pg): begin migration: {}", super::pg_detail(&e)))?;
     tx.batch_execute(&format!(
         "SELECT pg_advisory_xact_lock({PG_MIGRATION_LOCK});"
     ))
-    .map_err(|e| anyhow::anyhow!("state(pg): take migration lock: {:#}", e))?;
+    .map_err(|e| anyhow::anyhow!("state(pg): take migration lock: {}", super::pg_detail(&e)))?;
     migrate_pg_locked(&mut tx)?;
     tx.commit()
-        .map_err(|e| anyhow::anyhow!("state(pg): commit migration: {:#}", e))
+        .map_err(|e| anyhow::anyhow!("state(pg): commit migration: {}", super::pg_detail(&e)))
 }
 
 fn migrate_pg_locked(client: &mut postgres::Transaction<'_>) -> Result<()> {
     client
         .batch_execute("CREATE TABLE IF NOT EXISTS rivet_schema_version (version BIGINT NOT NULL);")
-        .map_err(|e| anyhow::anyhow!("state(pg): create version table: {:#}", e))?;
+        .map_err(|e| {
+            anyhow::anyhow!("state(pg): create version table: {}", super::pg_detail(&e))
+        })?;
 
     let current: i64 = client
         .query_one(
             "SELECT COALESCE(MAX(version), 0) FROM rivet_schema_version",
             &[],
         )
-        .map_err(|e| anyhow::anyhow!("state(pg): read schema version: {:#}", e))?
+        .map_err(|e| anyhow::anyhow!("state(pg): read schema version: {}", super::pg_detail(&e)))?
         .get(0);
 
     for &(ver, sql) in PG_MIGRATIONS {
@@ -1233,9 +1241,13 @@ fn migrate_pg_locked(client: &mut postgres::Transaction<'_>) -> Result<()> {
                 "{} INSERT INTO rivet_schema_version (version) VALUES ({});",
                 sql, ver
             );
-            client
-                .batch_execute(&batch)
-                .map_err(|e| anyhow::anyhow!("state(pg): migration v{} failed: {:#}", ver, e))?;
+            client.batch_execute(&batch).map_err(|e| {
+                anyhow::anyhow!(
+                    "state(pg): migration v{} failed: {}",
+                    ver,
+                    super::pg_detail(&e)
+                )
+            })?;
         }
     }
 
@@ -1245,7 +1257,9 @@ fn migrate_pg_locked(client: &mut postgres::Transaction<'_>) -> Result<()> {
             "DELETE FROM rivet_schema_version \
              WHERE version < (SELECT MAX(version) FROM rivet_schema_version);",
         )
-        .map_err(|e| anyhow::anyhow!("state(pg): prune schema versions: {:#}", e))?;
+        .map_err(|e| {
+            anyhow::anyhow!("state(pg): prune schema versions: {}", super::pg_detail(&e))
+        })?;
 
     // Verify the DB actually reached the expected version.
     let final_version: i64 = client
@@ -1253,7 +1267,12 @@ fn migrate_pg_locked(client: &mut postgres::Transaction<'_>) -> Result<()> {
             "SELECT COALESCE(MAX(version), 0) FROM rivet_schema_version",
             &[],
         )
-        .map_err(|e| anyhow::anyhow!("state(pg): read final schema version: {:#}", e))?
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "state(pg): read final schema version: {}",
+                super::pg_detail(&e)
+            )
+        })?
         .get(0);
     if final_version > SCHEMA_VERSION {
         crate::rivet_bail!(
@@ -1788,6 +1807,72 @@ mod tests {
 
         client
             .batch_execute("DROP SCHEMA IF EXISTS rivet_upgrade_test CASCADE;")
+            .unwrap();
+    }
+
+    #[test]
+    fn pg_v32_replays_over_a_load_spec_table_already_in_its_v32_shape() {
+        let Ok(url) = std::env::var("RIVET_TEST_STATE_URL") else {
+            return crate::test_hook::skip_live("RIVET_TEST_STATE_URL unset");
+        };
+        if !url.starts_with("postgres") {
+            return crate::test_hook::skip_live("RIVET_TEST_STATE_URL is not a postgres URL");
+        }
+        let mut client = connect_pg(&url).expect("connect pg state");
+        client
+            .batch_execute(
+                "DROP SCHEMA IF EXISTS rivet_v32_replay_test CASCADE; \
+                 CREATE SCHEMA rivet_v32_replay_test; SET search_path TO rivet_v32_replay_test; \
+                 CREATE TABLE rivet_schema_version (version BIGINT NOT NULL);",
+            )
+            .unwrap();
+        for &(ver, sql) in PG_MIGRATIONS {
+            if ver <= 31 {
+                client
+                    .batch_execute(&format!(
+                        "BEGIN; {sql} INSERT INTO rivet_schema_version (version) VALUES ({ver}); COMMIT;"
+                    ))
+                    .unwrap();
+            }
+        }
+        client
+            .batch_execute(
+                "INSERT INTO export_load_spec_run \
+                     (export_name, unit, run_id, columns_json, primary_key_json, captured_at) \
+                 VALUES ('t', '', 'r1', '[a]', NULL, '1'), ('t', '', 'r2', '[a]', NULL, '2');",
+            )
+            .unwrap();
+        migrate_pg(&mut client).expect("v31 -> v32 on a populated db");
+        // A partial reset (the gate's CDC parity stage drops a fixed table list) leaves
+        // the load-spec tables in their v32 shape and no version table.
+        let others: Vec<String> = client
+            .query(
+                "SELECT tablename FROM pg_tables WHERE schemaname = 'rivet_v32_replay_test' \
+                   AND tablename NOT IN ('export_load_spec_run', 'load_spec_version')",
+                &[],
+            )
+            .unwrap()
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+        client
+            .batch_execute(&format!("DROP TABLE {} CASCADE;", others.join(", ")))
+            .unwrap();
+        migrate_pg(&mut client).expect("the ladder must replay over a v32-shaped load-spec table");
+        let unresolved: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM export_load_spec_run r \
+                 LEFT JOIN load_spec_version v USING (spec_id) WHERE v.spec_id IS NULL",
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            unresolved, 0,
+            "every run row still resolves to its spec version"
+        );
+        client
+            .batch_execute("DROP SCHEMA IF EXISTS rivet_v32_replay_test CASCADE;")
             .unwrap();
     }
 

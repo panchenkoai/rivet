@@ -116,9 +116,9 @@ impl StateStore {
             }
             StateConn::Postgres(client) => {
                 let mut c = client.borrow_mut();
-                let mut tx = c
-                    .transaction()
-                    .map_err(|e| anyhow::anyhow!("state(pg): begin transaction: {:#}", e))?;
+                let mut tx = c.transaction().map_err(|e| {
+                    anyhow::anyhow!("state(pg): begin transaction: {}", super::pg_detail(&e))
+                })?;
                 for (i, (start, end)) in ranges.iter().enumerate() {
                     tx.execute(
                         "INSERT INTO chunk_task (run_id, chunk_index, start_key, end_key, status, attempts, updated_at)
@@ -131,10 +131,10 @@ impl StateStore {
                             &now,
                         ],
                     )
-                    .map_err(|e| anyhow::anyhow!("state(pg): insert chunk_task: {:#}", e))?;
+                    .map_err(|e| anyhow::anyhow!("state(pg): insert chunk_task: {}", super::pg_detail(&e)))?;
                 }
                 tx.commit()
-                    .map_err(|e| anyhow::anyhow!("state(pg): commit: {:#}", e))?;
+                    .map_err(|e| anyhow::anyhow!("state(pg): commit: {}", super::pg_detail(&e)))?;
             }
         }
         Ok(())
@@ -244,7 +244,9 @@ impl StateStore {
                          RETURNING chunk_index, start_key, end_key",
                         &[&now, &run_id],
                     )
-                    .map_err(|e| anyhow::anyhow!("state(pg): claim chunk: {:#}", e))?;
+                    .map_err(|e| {
+                        anyhow::anyhow!("state(pg): claim chunk: {}", super::pg_detail(&e))
+                    })?;
                 Ok(rows.first().map(|row| (row.get(0), row.get(1), row.get(2))))
             }
         }
