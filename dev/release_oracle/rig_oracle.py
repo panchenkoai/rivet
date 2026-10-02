@@ -1322,11 +1322,16 @@ def grade_load(spec: dict) -> dict:
                 ora.db.sql(f"CREATE OR REPLACE TEMP TABLE wh_all AS SELECT * FROM {rel}")
         except Exception as e:  # noqa: BLE001 — a table that requires a partition filter is read with an all-partitions one
             m = re.search(r"filter over column\(s\) '([^']+)'", str(e))
-            if not m or buffered:
+            if storage_schema_lags(e) and not buffered:
+                # The Storage API still serves the schema before an ALTER; a query job reads the table as it is now.
+                ora.db.sql(f"CREATE OR REPLACE TEMP TABLE wh_all AS SELECT * FROM bigquery_query('bq', {_lit(f'SELECT * FROM `{fq}`')})")
+                m = None
+            elif not m or buffered:
                 raise
-            c = m.group(1)
-            sql = f"SELECT * FROM `{fq}` WHERE `{c}` IS NULL OR `{c}` >= TIMESTAMP('0001-01-01')"
-            ora.db.sql(f"CREATE OR REPLACE TEMP TABLE wh_all AS SELECT * FROM bigquery_query('bq', {_lit(sql)})")
+            if m:
+                c = m.group(1)
+                sql = f"SELECT * FROM `{fq}` WHERE `{c}` IS NULL OR `{c}` >= TIMESTAMP('0001-01-01')"
+                ora.db.sql(f"CREATE OR REPLACE TEMP TABLE wh_all AS SELECT * FROM bigquery_query('bq', {_lit(sql)})")
         have = [c for c, _ in _columns(ora, "wh_all")]
         keep = ", ".join(_qi(c) for c in have if not c.startswith(WAREHOUSE_META)) or "1"
         if ("__pos" in have or "_rivet_src" in have) and key:
@@ -1435,6 +1440,11 @@ def grade_load(spec: dict) -> dict:
 TRANSIENT_CURL = re.compile(r"CURL error \[(7|28|35|52|55|56)\]")
 
 
+def storage_schema_lags(e: BaseException) -> bool:
+    """True when a Storage API read session names a column the table gained after the session's schema snapshot."""
+    return "read session" in str(e) and "do not exist in the table schema" in str(e)
+
+
 def transient(e: BaseException) -> bool:
     """True for a failure that says nothing about the data: a deadlock victim or a dropped transport."""
     return "deadlock" in str(e) or TRANSIENT_CURL.search(str(e)) is not None
@@ -1449,6 +1459,11 @@ def _self_test() -> None:
     assert transient(RuntimeError("PerformWork() - CURL error [35]=SSL connect error"))
     assert transient(RuntimeError("PerformWork() - CURL error [28]=Timeout was reached"))
     assert transient(RuntimeError("Transaction (Process ID 61) was deadlocked ... chosen as the deadlock victim"))
+    assert transient(RuntimeError("BigQuery Authentication Failed\n\nUnderlying authentication error:\n  PerformWork() - CURL error [28]=Timeout was reached"))
+    assert not transient(RuntimeError("BigQuery Authentication Failed\n\nNo usable authentication credentials were found."))
+    assert storage_schema_lags(RuntimeError("Binder Error: Error while creating read session: Permanent error, with a last "
+                                            "message of request failed: The following selected fields do not exist in the table schema: w"))
+    assert not storage_schema_lags(RuntimeError("Binder Error: Referenced column \"w\" not found"))
     assert not transient(RuntimeError("CURL error [22]=HTTP response code said error"))
     assert not transient(RuntimeError("CURL error [356]=x")), "a code must match whole"
     assert not transient(RuntimeError("Binder Error: Referenced column \"id\" not found"))
