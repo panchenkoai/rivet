@@ -239,3 +239,140 @@ fn cdc_from_a_replica_that_does_not_relog_refuses_instead_of_capturing_nothing()
         "the row reached the replica, and the run exited 0 — so it must be in the output"
     );
 }
+
+const PRIMARY_RIVET: &str = "mysql://rivet:rivet@127.0.0.1:3308/rivet";
+
+/// A capture read from the replica, then the replica "fails" and rivet is pointed at the primary.
+struct Failover {
+    table: String,
+    _dir: tempfile::TempDir,
+    ckpt: std::path::PathBuf,
+    out: std::path::PathBuf,
+    parts_before: std::collections::BTreeSet<std::path::PathBuf>,
+    on_primary: Rig,
+}
+
+/// Parquet parts under `dir`.
+fn parts(dir: &std::path::Path) -> std::collections::BTreeSet<std::path::PathBuf> {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "parquet"))
+        .collect()
+}
+
+/// `(op, id)` of every row in `batches`.
+fn ops_of(batches: &[arrow::record_batch::RecordBatch]) -> Vec<(String, i32)> {
+    use arrow::array::{Array, Int32Array, StringArray};
+    let mut out = Vec::new();
+    for b in batches {
+        let col = |n: &str| b.column(b.schema().index_of(n).unwrap()).clone();
+        let (op, id) = (col("__op"), col("id"));
+        let op = op.as_any().downcast_ref::<StringArray>().unwrap();
+        let id = id.as_any().downcast_ref::<Int32Array>().unwrap();
+        for i in 0..b.num_rows() {
+            out.push((op.value(i).to_string(), id.value(i)));
+        }
+    }
+    out
+}
+
+/// Replica capture of ids 1-2, then ids 3-4 written on the primary while rivet is switched to it.
+fn failover(tag: &str) -> Failover {
+    ensure_replication();
+    let mut p = conn(PRIMARY);
+    let table = unique_name(tag);
+    p.query_drop(format!("DROP TABLE IF EXISTS {table}"))
+        .unwrap();
+    p.query_drop(format!("CREATE TABLE {table} (id INT PRIMARY KEY, v INT)"))
+        .unwrap();
+    let rows = format!("SELECT COUNT(*) FROM {table}");
+    let replicated = |n: i64| {
+        wait_replica("rows replicated", |r| {
+            r.query_first::<i64, _>(&rows).ok().flatten() == Some(n)
+        })
+    };
+    replicated(0);
+    let dir = tempfile::tempdir().unwrap();
+    let ckpt = dir.path().join("ckpt");
+    let out = dir.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let on = |url: &str| {
+        Rig::mysql_cdc(&table)
+            .source_url(url)
+            .checkpoint_path(ckpt.clone())
+            .dest_path(out.clone())
+    };
+    let on_replica = on(REPLICA_RIVET);
+    on_replica.run_ok(); // anchors on the replica's binlog
+    p.query_drop(format!("INSERT INTO {table} VALUES (1, 10), (2, 20)"))
+        .unwrap();
+    replicated(2);
+    on_replica.run_ok();
+    assert_eq!(
+        ops_of(&read_all_parts(&out)),
+        vec![("insert".into(), 1), ("insert".into(), 2)],
+        "fixture: the replica capture holds ids 1-2"
+    );
+    p.query_drop(format!("INSERT INTO {table} VALUES (3, 30), (4, 40)"))
+        .unwrap();
+    replicated(4);
+    Failover {
+        parts_before: parts(&out),
+        on_primary: on(PRIMARY_RIVET),
+        table,
+        _dir: dir,
+        ckpt,
+        out,
+    }
+}
+
+/// A checkpoint from one cluster member resumed against another after a failover is refused,
+/// never applied as binlog coordinates of a different server: no part, no checkpoint move. On this
+/// stand both identity tiers refuse (server_uuid differs, and the replica's own GTIDs are not on the
+/// primary), so it goes RED only when the whole check is off (verified by disabling `enforce`).
+#[test]
+#[ignore = "live: requires docker compose --profile replica (mysql-primary :3308 → mysql-replica :3309)"]
+fn a_failover_to_another_cluster_member_is_refused_not_resumed_at_foreign_coordinates() {
+    let f = failover("rep_failover_safe");
+    let ckpt_before = std::fs::read(&f.ckpt).unwrap();
+    let said = f.on_primary.run_expect_fail();
+    assert!(
+        said.contains("RIVET_SOURCE_CDC_FOREIGN_CHECKPOINT"),
+        "the switch to another server is refused by name: {said}"
+    );
+    assert_eq!(
+        std::fs::read(&f.ckpt).unwrap(),
+        ckpt_before,
+        "the checkpoint did not move"
+    );
+    assert_eq!(parts(&f.out), f.parts_before, "no part was written");
+    let _ = conn(PRIMARY).query_drop(format!("DROP TABLE IF EXISTS {}", f.table));
+}
+
+/// Strict known defect (MySQL CDC failover step): resuming on another cluster member by GTID is not
+/// implemented, so the run is refused; passes while that holds, fails ("did not panic") once rivet
+/// follows the failover and captures exactly ids 3-4.
+#[test]
+#[ignore = "live: requires docker compose --profile replica (mysql-primary :3308 → mysql-replica :3309)"]
+#[should_panic(expected = "rivet did not follow the failover")]
+fn cdc_follows_a_failover_to_another_cluster_member_by_gtid() {
+    let f = failover("rep_failover_follow");
+    let res = f.on_primary.run_args(&[]);
+    let _ = conn(PRIMARY).query_drop(format!("DROP TABLE IF EXISTS {}", f.table));
+    assert!(
+        res.status.success(),
+        "rivet did not follow the failover to another cluster member: {}",
+        String::from_utf8_lossy(&res.stderr)
+    );
+    assert_eq!(
+        ops_of(&read_all_parts(&f.out)),
+        vec![
+            ("insert".into(), 1),
+            ("insert".into(), 2),
+            ("insert".into(), 3),
+            ("insert".into(), 4)
+        ],
+        "across the failover every change is captured exactly once, none skipped"
+    );
+}

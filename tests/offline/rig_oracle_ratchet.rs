@@ -159,6 +159,11 @@ const KNOWN_DEFECTS: &[(&str, &str, &str)] = &[
         "delivered-only rows",
         "known defect: a PK-changing UPDATE carries no delete",
     ),
+    (
+        "a_pg_failover_to_the_standby_without_a_checkpoint_loses_the_rows_written_during_the_switch",
+        "undelivered rows",
+        "known defect: a PostgreSQL CDC failover without `cdc.checkpoint` creates a new slot",
+    ),
 ];
 
 /// `(enclosing fn, class, reason)` of every `.oracle_known_defect("<class>", "<reason>")` call in `text`.
