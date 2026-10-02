@@ -840,7 +840,8 @@ const PIN_INDEPENDENT: usize = 104;
 // fixture check; the oracle is the server's own connection counter.
 // 2026-09-29: +2 shared codec — the Oracle TRUNCATE refusal on re-run and the uncaptured-truncate cell.
 // 2026-09-30: +2 shared codec — the MySQL float-override and PG bare-numeric cells read the part with arrow; their expected values are the server's own CAST/::text.
-const PIN_SHARED_CODEC: usize = 89;
+// 2026-10-02: +1 shared codec - Oracle CDC under a redo log switch storm; each run is graded by the default oracle, exactly-once by the seed.
+const PIN_SHARED_CODEC: usize = 90;
 const PIN_SELF_COUNTER: usize = 6;
 // 2026-09-28: +1 presence — the SQL Server undecodable-cell refusal, whose oracle is the refusal.
 // 2026-09-29: +2 presence — the PG CDC LMT-timezone and DOMAIN parity cells compare CDC to batch output.
