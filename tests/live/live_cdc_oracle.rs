@@ -4,8 +4,9 @@
 //! CDC, then have two real OLAP engines read the output and assert the values.
 //!
 //! Needs the `cdc` profile (mysql-cdc) AND the `loaders` profile (rivet-duckdb +
-//! rivet-clickhouse), so it runs in nightly. The test name carries `via_duckdb`
-//! so the per-commit CI (which has no loaders) skips it like the other oracle tests.
+//! rivet-clickhouse). Both CI live stacks start all three, so the PR E2E job and
+//! the nightly run it; a `via_duckdb` in a live_suite test NAME would hand it to
+//! the `--skip via_duckdb` that exists for the live_differential binary.
 //!
 //!     docker compose --profile cdc --profile loaders up -d mysql-cdc duckdb clickhouse
 //!     cargo test --test live_suite -- --ignored
@@ -14,8 +15,8 @@ use crate::common::*;
 use mysql::prelude::Queryable;
 
 #[test]
-#[ignore = "live+loaders: cdc + loaders profiles (nightly); reads CDC parquet via_duckdb + clickhouse"]
-fn cdc_types_round_trip_via_duckdb_and_clickhouse() {
+#[ignore = "live+loaders: requires mysql-cdc + duckdb + clickhouse; reads the CDC parquet through both"]
+fn cdc_types_round_trip_through_duckdb_and_clickhouse() {
     let mut c = mysql::Pool::new(MYSQL_CDC_URL)
         .expect("mysql-cdc pool")
         .get_conn()
@@ -364,7 +365,7 @@ fn norm_decimal(s: &str) -> String {
 /// collection)` — which is why `source_sql` returns the read expression alongside
 /// the attach statement instead of assuming every engine attaches.
 #[test]
-#[ignore = "live: requires docker compose mssql-cdc, mongo-rs and duckdb"]
+#[ignore = "live+gate-only: requires mssql-cdc, mongo-rs and duckdb together, which no CI job starts"]
 fn the_duckdb_oracle_reaches_sql_server_and_mongodb_too() {
     require_alive(LiveService::DuckDb);
     let tbl = unique_name("orc_reach").to_lowercase();

@@ -1638,52 +1638,45 @@ jobs:
         # `content_items` fixture that takes minutes to seed and is exercised
         # by the `nightly-live` workflow instead.
         #
-        # Skip the type round-trip oracle tests (`validates` = duckdb/clickhouse/
-        # pyarrow readers; `edge_cases` = the duckdb-backed pg_edge_cases AND
-        # mysql_edge_cases modules). They need the DuckDB/ClickHouse containers
-        # this job does not start and run in the dedicated `test-type-validators`
-        # job instead. Both substrings are unique to the `type_roundtrip` binary.
-        # `--skip via_duckdb` excludes tests/live_differential.rs: it hard-requires
-        # the `duckdb` reader container (require_alive(DuckDb)) + the
-        # ./tests/.live-tmp:/work shared mount, neither of which this job sets up.
-        # It runs in the `test-type-validators` job instead (which has both).
-        # live_crash_soak.rs stays here — it re-reads the destination in-process
-        # (arrow/parquet-rs), no duckdb needed.
+        # ONE skip policy, graded offline by tests/offline/live_skip_policy_guard.rs
+        # against this list, the nightly's two filters and every live test's
+        # `#[ignore]` reason: a test marked `live+gate-only:` needs a topology no CI
+        # job holds and must be skipped here AND in the nightly; everything else
+        # must run in the nightly (live-full, or mongo-versions for a mongo test)
+        # and, minus `content_export`, here. Substrings match the full `module::fn`
+        # name, so a term that catches a second test by accident fails the guard
+        # (`validates` once took two Postgres audit tests along with the
+        # type_roundtrip readers).
         #
-        # Skip the MongoDB suites (`live_mongo*` + `live_cdc_mongo`): they need the
-        # mongo / mongo-rs / mongo-auth stack this job does not start. MongoDB is a
-        # document store with its own heavy 3-container stack (standalone + replica
-        # set + auth), so — exactly like live-full in nightly-live — it is owned by
-        # the dedicated `mongo-versions` matrix job (4.4 → 8.0) instead. `--skip
-        # mongo` covers every Mongo test by substring — the live_mongo* / live_cdc_mongo
-        # modules AND the Mongo cells of the engine-agnostic chunking_stand
-        # (`stand_*_mongo`), which a module-prefix skip like `--skip live_mongo` misses.
-        # Skip the warehouse cells (`tests/oracle_fixture_matrix.rs`, every test
-        # prefixed `warehouse_cell_`): they drive a REAL BigQuery/Snowflake target
-        # and need RIVET_TEST_GCS_BUCKET plus warehouse credentials, which this job
-        # does not have and no workflow supplies. They used to be SELECTED here and
-        # pass in 0.00s — the harness returned an empty oracle list on a missing
-        # env, and `assert_all_pass` walks straight through an empty list, so 20
-        # cells reported green while verifying nothing. The runners now report
-        # `Skipped`, which the strength floor treats as a failure (its own doc said
-        # so all along), so the exclusion has to be written HERE where a reader can
-        # see it rather than hidden in the harness.
-        # Skip the topologies this runner cannot hold and the cells that need a real
-        # BigQuery (no credentials here): the SQL Server availability group (two
-        # SQL Server containers + dev/mssql-ag/setup.sh), the PostgreSQL 16 standby
-        # pair (dev/pytools/cdc_stand; `from_a_standby`, `failover_to_the_standby`), the second Oracle holding the WE8ISO8859P1
-        # LATIN1PDB (`oracle-latin1`), and the audit's BigQuery cells. The release
-        # gate runs every one of them (REPLICA_CELLS, verify_audit_suspects, the
-        # derived live-module cell). Quarantined here, not in the gate:
-        # `a_read_blocked_longer_than_thirty_seconds_still_completes`, whose reader
-        # was not blocked on 3 of 4 CI runs (0.6 s, 1 s, 17 s) while it holds on
-        # the stand; the cause is open.
+        # Steps of THIS job run the type_roundtrip binary (`validates` = the duckdb/
+        # clickhouse/pyarrow/bigquery/snowflake readers, `edge_cases` = pg_edge_cases
+        # + mysql_edge_cases) and the live_differential binary (`via_duckdb`) with
+        # their own filters, so the plain `--ignored` sweep skips them to avoid a
+        # second run. Skip the warehouse cells (`tests/oracle_fixture_matrix.rs`,
+        # `warehouse_cell_*`): they drive a REAL BigQuery/Snowflake target and need
+        # credentials no workflow supplies; the runners report `Skipped` on a missing
+        # env, which the strength floor fails, so the exclusion is written here.
+        #
+        # Skip every test whose path names mongo: this stack starts no mongo service
+        # (see the compose line above), and the nightly `mongo-versions` job owns all
+        # of them against 4.4 → 8.0 — the live_mongo* / live_cdc_mongo modules, the
+        # `stand_*_mongo` cells and the mongo cases of the engine-agnostic modules.
+        #
+        # The rest are `live+gate-only` tests, by topology: the SQL Server availability
+        # group (two containers + dev/mssql-ag/setup.sh), the PostgreSQL 16 standby pair
+        # (dev/pytools/cdc_stand), the second Oracle holding the LATIN1 PDB
+        # (`oracle-latin1`), the audit's BigQuery cells (they panic without creds), and
+        # one quarantine: `a_read_blocked_longer_than_thirty_seconds_still_completes`,
+        # whose reader was not blocked on 3 of 4 CI runs (0.6 s, 1 s, 17 s) while it
+        # holds on the stand; the cause is open. The release gate runs every one of them
+        # (REPLICA_CELLS, verify_cdc_standby, verify_audit_suspects, the derived
+        # live-module cell) and FAILS when their stand is down.
         run: >-
           cargo test -- --ignored --skip content_export --skip validates --skip edge_cases
           --skip via_duckdb --skip mongo --skip warehouse_cell
           --skip readable_secondary --skip mssql_checkpoint_follows_a_failover
           --skip mssql_checkpoint_from_another_database --skip from_a_standby
-          --skip failover_to_the_standby
+          --skip failover_to_the_standby --skip bounded_on_a_standby
           --skip loads_into_bigquery_or_refuses_by_column
           --skip cleanup_source_never_deletes_parts --skip compact_after_a_source_alter
           --skip a_non_unicode_database_round_trips

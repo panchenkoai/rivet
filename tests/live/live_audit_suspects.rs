@@ -286,7 +286,7 @@ fn mysql_cdc_a_dropped_and_recreated_captured_table_is_refused_not_merged() {
 }
 
 #[test]
-#[ignore = "live: requires mysql-cdc + BigQuery creds"]
+#[ignore = "live+gate-only: requires mysql-cdc + BigQuery creds (panics without them; no CI job has them)"]
 fn a_cdc_export_altered_between_runs_loads_into_bigquery_or_refuses_by_column() {
     let Some(bq) = BqLive::from_env("aud_mixed") else {
         panic!("BIGQUERY_TEST_PROJECT / RIVET_TEST_GCS_BUCKET unset: this cell cannot run");
@@ -360,7 +360,7 @@ fn a_cdc_export_altered_between_runs_loads_into_bigquery_or_refuses_by_column() 
 }
 
 #[test]
-#[ignore = "live: requires mysql-cdc + BigQuery creds"]
+#[ignore = "live+gate-only: requires mysql-cdc + BigQuery creds (panics without them; no CI job has them)"]
 fn compact_after_a_source_alter_carries_the_new_column_into_the_base() {
     let Some(bq) = BqLive::from_env("aud_compact") else {
         panic!("BIGQUERY_TEST_PROJECT / RIVET_TEST_GCS_BUCKET unset: this cell cannot run");
@@ -426,7 +426,7 @@ fn compact_after_a_source_alter_carries_the_new_column_into_the_base() {
 }
 
 #[test]
-#[ignore = "live: requires mysql-cdc + BigQuery creds"]
+#[ignore = "live+gate-only: requires mysql-cdc + BigQuery creds (panics without them; no CI job has them)"]
 fn cleanup_source_never_deletes_parts_an_extract_committed_during_the_load() {
     let Some(bq) = BqLive::from_env("aud_cleanup") else {
         panic!("BIGQUERY_TEST_PROJECT / RIVET_TEST_GCS_BUCKET unset: this cell cannot run");

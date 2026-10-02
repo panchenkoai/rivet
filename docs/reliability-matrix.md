@@ -110,7 +110,7 @@ Per-backend commit contracts: [ADR-0004](adr/0004-destination-write-contracts.md
 | Area | PR CI | Nightly | Manual | Notes |
 |---|:---:|:---:|:---:|---|
 | Per-type golden round-trip (PG + MySQL) | ✅ gate | ✅ | — | `live_type_golden` — runs in dedicated `test-type-golden` job with live DBs |
-| Per-type round-trip via oracle (SQL Server) | ✅ gate | ✅ | — | `type_roundtrip::{duckdb,clickhouse}_validates_mssql_type_matrix_parquet` — `test-type-validators` job (DuckDB + ClickHouse readers) |
+| Per-type round-trip via oracle (SQL Server) | ✅ gate | ✅ | — | `type_roundtrip::{duckdb,clickhouse}_validates_mssql_type_matrix_parquet` — the e2e job's type round-trip step (DuckDB + ClickHouse readers) |
 | Parquet round-trip | ✅ | ✅ | — | `live_parquet_roundtrip`, `format_golden`, `format_fuzz` |
 | Format writer (CSV + Parquet, row-group golden) | ✅ gate | ✅ | — | `format_golden`, the `Tests` job's stability step |
 | Type policy + ExportTarget compat (BigQuery) | ✅ | ✅ | — | covered in `live_cli_flags --type-report` |
@@ -125,7 +125,7 @@ Per-backend commit contracts: [ADR-0004](adr/0004-destination-write-contracts.md
 | PostgreSQL | 12, 13, 14, 15 | — | ✅ | `python3 -m dev.pytools.legacy_stand full-matrix`, opt-in compose profile |
 | MySQL | 8.0 | ✅ | ✅ | Primary target |
 | MySQL | 5.7 | — | ✅ | `python3 -m dev.pytools.legacy_stand full-matrix` — known view-syntax gap in `init.sql`, see [reference/compatibility.md](reference/compatibility.md#mysql-57--window-functions) |
-| SQL Server | 2022 | ✅ | ✅ | Primary target; `test-type-validators` (type matrix) + `e2e` (live_mssql_* recovery/resume/reconcile) jobs |
+| SQL Server | 2022 | ✅ | ✅ | Primary target; `e2e` job: the type round-trip step (type matrix) + the live sweep (live_mssql_* recovery/resume/reconcile) |
 | MongoDB | 7.0 | — | ✅ | Primary target; nightly `mongo-versions` matrix (dispatchable) |
 | MongoDB | 4.4, 5.0, 6.0, 8.0 | — | ✅ | Nightly `mongo-versions` matrix (batch + CDC); CDC capability tiers — 4.4/5.0 current-state, 6.0+ full pre-images |
 

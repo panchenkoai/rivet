@@ -200,47 +200,38 @@ jobs:
         # this exact step since the same breakage hit it there.
         run: python3 -m pip install --break-system-packages xxhash
 
-      - name: Run FULL live suite (skip 1M-row stress + the type-validator job's tests)
-        # Everything #[ignore]d — light suite (also covered by per-PR e2e,
-        # which is cheap insurance against docker-compose regressions like
-        # an image tag breaking pgBouncer) plus content_export_under_update.
-        # Skips the 1M-row "max_pressure" test that genuinely takes 3–5 min
-        # even when seeded; leave that one for manual runs.
+      - name: Run FULL live suite
+        # Everything #[ignore]d that a CI stack can hold. The exclusion list is the
+        # same as ci.yml e2e's `--skip` list minus `content_export` (the per-PR job
+        # cuts that fixture for time; this run takes it), and
+        # tests/offline/live_skip_policy_guard.rs fails when the two drift or when a
+        # term here drops a test no `live+gate-only:` marker excuses.
         #
-        # `validates`, `edge_cases`, and the `via_duckdb` differential tests
-        # stay skipped for TIME, not permissions (the .live-tmp prolog above
-        # now provisions the shared mount here too): all three have a
-        # dedicated home in ci.yml's `test-type-validators` job on every PR.
-        # `--skip mongo` (substring), NOT `--skip live_mongo --skip live_cdc_mongo`
-        # (module prefixes): the prefix form missed the engine-agnostic
-        # `chunking_stand::stand_*_mongo` tests, which were then SELECTED on this
-        # mongo-less stack and panicked at require_alive — the exact latent
-        # failure the matrix audit predicted. Every Mongo test (module-named or
-        # stand_*) is owned by the `mongo-versions` job, same as ci.yml's e2e.
-        # Skip the warehouse cells (`tests/oracle_fixture_matrix.rs`, every test
-        # prefixed `warehouse_cell_`): they drive a REAL BigQuery/Snowflake target
-        # and need RIVET_TEST_GCS_BUCKET plus warehouse credentials, which this job
-        # does not have and no workflow supplies. They used to be SELECTED here and
-        # pass in 0.00s — the harness returned an empty oracle list on a missing
-        # env, and `assert_all_pass` walks straight through an empty list, so 20
-        # cells reported green while verifying nothing. The runners now report
-        # `Skipped`, which the strength floor treats as a failure (its own doc said
-        # so all along), so the exclusion has to be written HERE where a reader can
-        # see it rather than hidden in the harness.
+        # `full_content_export_max_pressure` (1M rows, 3–5 min even seeded) is
+        # gate-only. `validates`, `edge_cases` and `via_duckdb` name the type_roundtrip
+        # and live_differential binaries, which ci.yml's e2e job runs as its own
+        # steps on every PR; `warehouse_cell` needs BigQuery/Snowflake credentials no
+        # workflow has. `--skip mongo` (substring), NOT `--skip live_mongo --skip
+        # live_cdc_mongo` (module prefixes): the prefix form missed the
+        # engine-agnostic `chunking_stand::stand_*_mongo` tests, which were then
+        # SELECTED on this mongo-less stack and panicked at require_alive. Every test
+        # whose path names mongo is owned by the `mongo-versions` job below, which
+        # selects by the same substring.
+        # The remaining terms are the `live+gate-only` topologies this stack cannot
+        # hold (SQL Server AG, PG 16 standby pair, the LATIN1 Oracle PDB), the
+        # audit's BigQuery cells, and the read-blocked quarantine; the release gate
+        # runs every one of them and fails when their stand is down.
         run: |
           # nextest, not plain `cargo test`: tests/live_suite.rs's own header
           # says the per-test process isolation this consolidation relies on is
           # GONE under the default libtest harness — and getrusage(RUSAGE_
           # CHILDREN) claims (soak_spill's RSS ceiling) are unattributable when
           # sibling tests share one process (harness audit, 2026-08-29).
-          # The second skip line is ci.yml e2e's list, for the same reasons: topologies
-          # this runner cannot hold (SQL Server AG, PG 16 standby pair, the LATIN1 Oracle
-          # PDB), cells that need a real BigQuery, and the read-blocked quarantine. The
-          # release gate runs every one of them.
           cargo nextest run --release --run-ignored ignored-only --no-fail-fast \
             -E 'not (test(full_content_export_max_pressure) or test(validates) or test(edge_cases) or test(via_duckdb) or test(mongo) or test(warehouse_cell)
                  or test(readable_secondary) or test(mssql_checkpoint_follows_a_failover) or test(mssql_checkpoint_from_another_database)
-                 or test(from_a_standby) or test(loads_into_bigquery_or_refuses_by_column) or test(cleanup_source_never_deletes_parts)
+                 or test(from_a_standby) or test(failover_to_the_standby) or test(bounded_on_a_standby)
+                 or test(loads_into_bigquery_or_refuses_by_column) or test(cleanup_source_never_deletes_parts)
                  or test(compact_after_a_source_alter) or test(a_non_unicode_database_round_trips)
                  or test(a_read_blocked_longer_than_thirty_seconds_still_completes))'
 
@@ -312,15 +303,16 @@ jobs:
           sudo chmod -R 0777 tests/.live-tmp
 
       - name: Run Mongo live tests
-        # `live_mongo` matches every live_mongo* module (batch, crash-recovery,
-        # harm-permission, retry-and-faults); `live_cdc_mongo` the CDC suite.
-        # The four `stand_*_mongo` names are the chunking_stand Mongo cells —
-        # positional filters are substrings, so they are named EXACTLY (a bare
-        # `stand_` would also select the mysql/mssql stand tests, whose engines
-        # this slim stack does not run).
+        # Every live_suite test whose path names mongo, by the same `mongo` substring
+        # ci.yml e2e and live-full SKIP on — the live_mongo* / live_cdc_mongo modules,
+        # the chunking_stand `stand_*_mongo` cells and the mongo cases of the
+        # engine-agnostic modules (full cycle, compact, init, shape drift, soak).
+        # An explicit name list here once left 14 of them with no CI runner at all.
+        # `and not`: the one mongo test that also needs mssql-cdc, which this slim
+        # stack does not start (`live+gate-only`; the release gate runs it).
         run: |
           cargo nextest run --release --run-ignored ignored-only --no-fail-fast \
-            -E 'binary(live_suite) and (test(live_mongo) or test(live_cdc_mongo) or test(stand_dest_gcs_mongo) or test(stand_dest_s3_mongo) or test(stand_format_csv_mongo) or test(stand_compression_codecs_mongo))'
+            -E 'binary(live_suite) and test(mongo) and not (test(the_duckdb_oracle_reaches_sql_server_and_mongodb_too))'
 
       - name: Dump Mongo logs on failure
         if: failure()

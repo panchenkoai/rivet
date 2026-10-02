@@ -21,8 +21,8 @@ use crate::common::*;
 
 #[test]
 #[ignore = "live: requires docker compose postgres"]
-// AUDIT-RED observability: `rivet metrics -c <nonexistent>.yaml` exits 0 with "No metrics recorded yet" instead of erroring on the missing config. Asserts CORRECT behavior; expected to FAIL until fixed.
-fn audit_metrics_validates_config_path() {
+// observability: `rivet metrics -c <missing>.yaml` must refuse the path and exit non-zero (fixed; it used to print "No metrics recorded yet" and exit 0).
+fn audit_metrics_refuses_a_missing_config_path() {
     require_alive(LiveService::Postgres);
 
     // Point --config at a path that does NOT exist, inside a *fresh* empty

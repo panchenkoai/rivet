@@ -102,7 +102,7 @@ fn a_cdc_capture_delivers_sql_variant_and_udt_columns_as_the_source_renders_them
 /// `command_timeout(None)` is removed: tiberius 0.13's 30 s default did not fire while the
 /// server held the lock (measured 2026-09-30), so this guards the outcome, not that setting.
 #[test]
-#[ignore = "live: requires docker compose mssql"]
+#[ignore = "live+gate-only: requires docker compose mssql; quarantined from CI, where the reader was not blocked on 3 of 4 runs (cause open)"]
 fn a_read_blocked_longer_than_thirty_seconds_still_completes() {
     require_alive(LiveService::Mssql);
     let table = format!("rivet.dbo.{}", unique_name("mssql_slow"));

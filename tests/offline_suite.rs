@@ -112,6 +112,8 @@ mod error_code_ratchet;
 mod live_only_purity_gate;
 #[path = "offline/live_service_ports_guard.rs"]
 mod live_service_ports_guard;
+#[path = "offline/live_skip_policy_guard.rs"]
+mod live_skip_policy_guard;
 #[path = "offline/load_allow_source_drift.rs"]
 mod load_allow_source_drift;
 #[path = "offline/nextest_groups_guard.rs"]
