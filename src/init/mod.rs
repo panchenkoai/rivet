@@ -776,7 +776,7 @@ pub fn init(
         );
     }
     let runnable = decisions.needs_cursor.is_empty();
-    warn_marked_exports(&decisions);
+    eprint!("{}", marked_exports_warning(&decisions));
 
     match output {
         Some(path) => {
@@ -1165,14 +1165,15 @@ fn cursor_missing_message(names: &[String], mode: Option<&str>, whole_schema: bo
 }
 
 /// One line per informational decision, naming every export it was made for.
-fn warn_marked_exports(d: &yaml_scaffold::ScaffoldDecisions) {
+fn marked_exports_warning(d: &yaml_scaffold::ScaffoldDecisions) -> String {
+    let mut out = String::new();
     if !d.skipped.is_empty() {
-        eprintln!(
+        out.push_str(&format!(
             "rivet: {} table(s) were left out of the config — see the `# SKIPPED` comments \
-             for why: {}",
+             for why: {}\n",
             d.skipped.len(),
             d.skipped.join(", ")
-        );
+        ));
     }
     for (names, what) in [
         (
@@ -1187,13 +1188,14 @@ fn warn_marked_exports(d: &yaml_scaffold::ScaffoldDecisions) {
         ),
     ] {
         if !names.is_empty() {
-            eprintln!(
-                "rivet: {} export(s) {what}: {}",
+            out.push_str(&format!(
+                "rivet: {} export(s) {what}: {}\n",
                 names.len(),
                 names.join(", ")
-            );
+            ));
         }
     }
+    out
 }
 
 fn snapshot_of(
@@ -1668,6 +1670,37 @@ mod tests {
             vec!["user-events".to_string()]
         );
         assert!(decided("postgresql://u:p@h/db", None, &["a", "b"]).is_empty());
+    }
+
+    /// Each informational decision prints one line naming every export it covers; none prints nothing.
+    #[test]
+    fn marked_exports_warning_names_every_export_per_decision() {
+        assert_eq!(marked_exports_warning(&ScaffoldDecisions::default()), "");
+        let only_chunk = marked_exports_warning(&ScaffoldDecisions {
+            no_chunk_key: vec!["k".into()],
+            ..Default::default()
+        });
+        assert_eq!(
+            only_chunk,
+            "rivet: 1 export(s) have no integer column or keysettable primary key, so they were \
+             written as `mode: full` instead of `chunked`: k\n"
+        );
+        let all = marked_exports_warning(&ScaffoldDecisions {
+            skipped: vec!["Orders".into(), "Items".into()],
+            insert_only: vec!["a".into(), "b".into()],
+            no_chunk_key: vec!["k".into()],
+            ..Default::default()
+        });
+        assert_eq!(
+            all,
+            "rivet: 2 table(s) were left out of the config — see the `# SKIPPED` comments for \
+             why: Orders, Items\n\
+             rivet: 2 export(s) use a cursor that does not change on UPDATE: updated rows are \
+             never re-exported (set `cursor_column:` to an updated_at-style column, or use \
+             `mode: cdc`): a, b\n"
+                .to_string()
+                + &only_chunk
+        );
     }
 
     #[test]
