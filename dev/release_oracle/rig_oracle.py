@@ -1,13 +1,17 @@
 """The live suite's default oracle: one DuckDB session grades one run's declared output.
 
-Every `rivet run|load|compact --config` and `rivet apply <config.yaml>` a live test starts
-through the `Rig` or a shared `run_rivet*` helper reaches it; a hand-built spawn of the
-binary and a `Rig::spawn_args_env` child are not graded (counted by
-tests/offline/rig_oracle_ratchet.rs).
+Every `rivet run|load|compact --config`, `rivet apply <config.yaml | plan.json>` and reaped
+`Rig::spawn_args_env` child a live test starts through the `Rig` or a shared `run_rivet*`
+helper reaches it; a hand-built spawn of the binary is not graded (counted by
+tests/offline/rig_oracle_ratchet.rs). An exception in here fails the test as an oracle
+error, never a SKIP.
 
 tests/common/verify.rs only gathers facts from the config file — engine, source URL, table
 or query, the export's own filter, the manifests the run wrote, the state DB — and hands
-them here as JSON on stdin. This module owns every check: it ATTACHes the source and
+them here as JSON on stdin; a cloud destination (MinIO, fake-gcs or real GCS, Azurite) is
+pulled whole through the store's own API first, a multi-table capture is graded one table
+per sub-prefix, and destination placeholders are resolved independently. Parts are read as
+parquet (never a hive path's value in place of the file's column) or CSV (as text). This module owns every check: it ATTACHes the source and
 rivet's state DB READ_ONLY through `duck.Oracle`, reads only the parts the Success
 manifests declare, and grades per column
 
@@ -261,8 +265,9 @@ def declared_parts(root: str, manifests: list[str]) -> list[str]:
 
     out = set()
     for name in manifests:
+        base = os.path.dirname(os.path.join(root, name))
         for part in success_part_names(_load(root, name)):
-            p = part if os.path.isabs(part) else os.path.join(root, part)
+            p = part if os.path.isabs(part) else os.path.join(base, part)
             if os.path.isfile(p):
                 out.add(p)
     return sorted(out)
@@ -290,12 +295,11 @@ def _render(row: dict) -> dict:
 
 
 def _pg_projection(table: str, native: dict, renders: dict) -> str:
-    """A server-side SELECT rendering each column the ledger renders server-side, and wide or unbounded numerics, with PostgreSQL's own text (the scanner reads those as DOUBLE)."""
+    """A server-side SELECT rendering each column the ledger renders server-side, and every numeric, with PostgreSQL's own text (the scanner reads a wide one as DOUBLE, and a NaN has no DECIMAL)."""
     cols = []
     for name, nat in native.items():
         q = _qi(name)
-        wide = nat.startswith("NUMERIC(") and int(nat[8:].split(",")[0].rstrip(")")) > 38
-        expr = renders.get(nat) or (PG_TEXT if nat in ("NUMERIC", "NUMERIC[]") or wide else "{c}")
+        expr = renders.get(nat) or (PG_TEXT if nat == "NUMERIC[]" or re.fullmatch(r"NUMERIC(\(.*\))?", nat) else "{c}")
         cols.append(f"{expr.replace('{c}', q)} AS {q}")
     return f"postgres_query('pg', {_lit('SELECT ' + ', '.join(cols) + ' FROM ' + table)})"
 
@@ -388,6 +392,8 @@ def _source(ora, spec: dict, renders: dict) -> tuple[str, list[str], dict]:
             "ELSE data_type END AS t FROM all_tab_columns "
             f"WHERE {owner} AND table_name = {_lit(leaf.upper())}",
         )}
+        if not query and not declared:
+            raise LookupError(f"table {table} does not exist (no column in all_tab_columns)")
         by_col = {c: renders.get(f"source:{n}") for c, n in declared.items()}
         sql = query.rstrip().rstrip(";") if query else oracle_table_select(spec["url"], table, {c: e for c, e in by_col.items() if e})
         native = {c: "NUMBER (by value)" for c in _oracle_register(ora, spec["url"], sql, frozenset(c for c, t in declared.items() if t == "JSON"))}
@@ -490,6 +496,15 @@ def _source(ora, spec: dict, renders: dict) -> tuple[str, list[str], dict]:
 
 class Unreachable(Exception):
     """The source relation cannot be read for a stated reason: a named SKIP, never a pass."""
+
+
+#: Engine messages that say the relation is not there (yet), the only source error a CDC stream may precede.
+ABSENT = ("does not exist", "not found", "invalid object name", "doesn't exist", "cross-database references are not implemented")
+
+
+def absent(e: Exception) -> bool:
+    """Whether `e` says the source relation does not exist."""
+    return any(k in str(e).lower() for k in ABSENT)
 
 
 def _attach(spec: dict) -> dict:
@@ -739,8 +754,8 @@ def grade_findings(
     if "metrics_runs" in f:
         if f["metrics_runs"] == 0:
             bad.append("COUNTER: export_metrics has no success row for this run")
-        elif f["metrics_rows"] != parts:
-            bad.append(f"COUNTER: export_metrics.total_rows {f['metrics_rows']}, this run's declared parts hold {parts}")
+        elif f["metrics_rows"] != f.get("stream_rows", parts):
+            bad.append(f"COUNTER: export_metrics.total_rows {f['metrics_rows']}, this run's declared parts hold {f.get('stream_rows', parts)}")
         if f["file_log_parts"] != f["declared_parts"]:
             bad.append(f"COUNTER: file_log records {f['file_log_parts']} of this run's {f['declared_parts']} declared part(s)")
         elif f["file_log_rows"] != parts:
@@ -792,23 +807,41 @@ def _state_table(ora, spec: dict, name: str) -> str:
     return f"st.{rows[0][0]}.{name}" if rows else f"st.{name}"
 
 
+def stream_parts(stream: dict, run_ids: list[str]) -> list[str]:
+    """Every part a multi-table capture's run declared, across all its tables' destinations (and their `snapshot/` legs)."""
+    out = []
+    for d in stream["dirs"]:
+        for root in (d, os.path.join(d, "snapshot")):
+            names = [n for n in (os.listdir(root) if os.path.isdir(root) else []) if n.startswith("manifest-") and n.endswith(".json")]
+            out += declared_parts(root, [n for n in names if _load(root, n).get("run_id") in run_ids])
+    return out
+
+
 def _counters(ora, spec: dict, new_parts: list[str], run_ids: list[str]) -> dict:
-    """rivet's own ledger for this run: export_metrics success rows and the file_log rows of the declared parts."""
+    """rivet's own ledger for this run: export_metrics success rows and the file_log rows of the declared parts (one table of a multi-table capture: its ledger names are `<table>/<part>`, its metrics row counts the whole stream)."""
     if not (spec.get("state") and run_ids):
         return {}
     ids = ", ".join(_lit(r) for r in run_ids)
-    names = "[" + ", ".join(_lit(os.path.basename(p)) for p in new_parts) + "]::VARCHAR[]"
+    stream = spec.get("stream")
+    # A capture's own parts are ledgered as `<table>/<part>`; its baseline (snapshot) parts under their own unique names.
+    ledger = (lambda p: os.path.basename(p) if "snapshot" in p.split(os.sep) else f"{stream['table']}/{os.path.basename(p)}") if stream else os.path.basename
+    names = "[" + ", ".join(_lit(ledger(p)) for p in new_parts) + "]::VARCHAR[]"
+    match = "file_name" if stream else "regexp_extract(file_name, '[^/]+$')"
     runs, rows = ora.rows(
         f"SELECT count(*), coalesce(sum(total_rows), 0) FROM {_state_table(ora, spec, 'export_metrics')} "
         f"WHERE run_id IN ({ids}) AND status = 'success'"
     )[0]
     fl_parts, fl_rows = ora.rows(
-        f"SELECT count(DISTINCT regexp_extract(file_name, '[^/]+$')), coalesce(sum(row_count), 0) "
+        f"SELECT count(DISTINCT {match}), coalesce(sum(row_count), 0) "
         f"FROM {_state_table(ora, spec, 'file_log')} WHERE run_id IN ({ids}) "
-        f"AND list_contains({names}, regexp_extract(file_name, '[^/]+$'))"
+        f"AND list_contains({names}, {match})"
     )[0]
-    return {"metrics_runs": runs, "metrics_rows": rows, "file_log_parts": fl_parts,
-            "file_log_rows": fl_rows, "declared_parts": len(new_parts)}
+    out = {"metrics_runs": runs, "metrics_rows": rows, "file_log_parts": fl_parts,
+           "file_log_rows": fl_rows, "declared_parts": len(new_parts)}
+    if stream:
+        every = stream_parts(stream, run_ids)
+        out["stream_rows"] = ora.scalar(f"SELECT count(*) FROM {_parts(ora, every, spec.get('format') or 'parquet')}") if every else 0
+    return out
 
 
 def _duck_blind(t) -> bool:
@@ -832,12 +865,15 @@ def exact_text(table):
     return table
 
 
-def _parts(ora, files: list[str]) -> str:
-    """A relation over parquet `files`; a column DuckDB reads short is read by pyarrow as exact text."""
+def _parts(ora, files: list[str], fmt: str = "parquet") -> str:
+    """A relation over the delivered `files`: parquet as written (never a hive path's value in place of the file's column; a column DuckDB reads short read by pyarrow as exact text), CSV as the text of its own header and cells (`""` is an empty string, an empty cell NULL)."""
     import pyarrow.parquet as pq
 
+    if fmt == "csv":
+        return (f"read_csv({_plist(files)}, header = true, all_varchar = true, delim = ',', quote = '\"', "
+                "escape = '\"', allow_quoted_nulls = false, union_by_name = true)")
     if not any(_duck_blind(f.type) for f in pq.read_schema(files[0])):
-        return f"read_parquet({_plist(files)}, union_by_name = true)"
+        return f"read_parquet({_plist(files)}, union_by_name = true, hive_partitioning = false)"
     import pyarrow as pa
 
     table = exact_text(pa.concat_tables([pq.read_table(f) for f in files], promote_options="default"))
@@ -848,10 +884,35 @@ def _parts(ora, files: list[str]) -> str:
 
 _VIEWS = itertools.count()
 
+#: The directory label rivet gives a partition_by bucket of NULL values.
+HIVE_NULL = "__HIVE_DEFAULT_PARTITION__"
 
-def _meta_leg(ora, files: list[str], engine: str, snapshot: bool) -> str:
+
+def csv_text(cols: list[tuple[str, str]]) -> str:
+    """A projection of typed source columns to the text rivet's CSV writer documents for them (true/false, lower-case hex, hyphenated UUID); every other column as it is, compared by value."""
+    def one(c: str, t: str) -> str:
+        q = _qi(c)
+        expr = {"BOOLEAN": f"CASE WHEN {q} THEN 'true' WHEN NOT {q} THEN 'false' END",
+                "BLOB": f"lower(hex({q}))", "UUID": f"CAST({q} AS VARCHAR)"}.get(t, q)
+        return f"{expr} AS {q}"
+
+    return ", ".join(one(c, t) for c, t in cols) or "1"
+
+
+def misfiled(ora, parts: list[str], col: str) -> list[str]:
+    """A partition_by part whose `<col>=<label>` directory does not label its rows' values (the label is a prefix of the value's text; the NULL bucket holds NULLs only)."""
+    label = f"regexp_extract(filename, {_lit('/' + re.escape(col) + '=([^/]+)/')}, 1)"
+    n = ora.scalar(
+        f"SELECT count(*) FROM (SELECT CAST({_qi(col)} AS VARCHAR) AS v, {label} AS b FROM "
+        f"read_parquet({_plist(parts)}, filename = true, hive_partitioning = false, union_by_name = true)) "
+        f"WHERE b = '' OR CASE WHEN b = {_lit(HIVE_NULL)} THEN v IS NOT NULL ELSE v IS NULL OR NOT starts_with(v, b) END"
+    )
+    return [f"PARTITION: {n} row(s) sit under a `{col}=` directory whose label does not match their value"] if n else []
+
+
+def _meta_leg(ora, files: list[str], engine: str, snapshot: bool, fmt: str = "parquet") -> str:
     """One SELECT over `files` carrying `__op`, `__pos`, `__seq` and the change order `__ord` (a snapshot leg sorts first)."""
-    rel = _parts(ora, files)
+    rel = _parts(ora, files, fmt)
     have = {c for c, _ in _columns(ora, rel)}
     add = [] if "__op" in have else ["'snapshot' AS __op"]
     add += [] if "__pos" in have else ["'' AS __pos"]
@@ -913,6 +974,9 @@ def delta_window(spec: dict, out_dir: str, graded: list[str]) -> tuple[dict, str
         with open(path) as f:
             record = json.load(f)
     low, col = record["dest"].setdefault(out_dir, [record["high"], record["col"]])
+    if spec.get("consumed"):
+        # The load deletes what it staged (`cleanup_source`): a run's own parts are all that remain, so it owes what came after the previous graded run.
+        low, col = record["high"], record["col"]
     # A bound on another cursor column says nothing about this one (a column switch needs a state reset).
     latest = [w for w in ((_load(out_dir, n).get("source") or {}).get("extraction") or {} for n in graded) if w.get("cursor_column")]
     return record, low if not latest or latest[-1]["cursor_column"] == col else None
@@ -946,24 +1010,21 @@ def take_image(spec: dict) -> dict:
 
     path = spec["image"]
     _, _, renders, config = _prep(spec["engine"], True)
-    try:
-        with Oracle(config=config, **_attach(spec)) as ora:
-            try:
-                src, key, _ = _source(ora, spec, renders)
-                if spec["engine"] == "mssql" and key:
-                    src = _mssql_captured(spec, key)
-                ora.db.sql(f"CREATE OR REPLACE TEMP TABLE source_rows AS SELECT * FROM {src}")
-            except Exception as e:  # noqa: BLE001 — the captured table may not exist yet; every later row is then new
-                if not any(k in str(e).lower() for k in ("does not exist", "not found", "invalid object name", "doesn't exist")):
-                    raise
-                for p in (path, path + ".missing"):
-                    if os.path.exists(p):
-                        os.remove(p)
-                open(path + ".missing", "w").close()
-                return {"image": "absent"}
-            write_image(ora, "source_rows", path)
-    except Exception as e:  # noqa: BLE001 — no image: the run is graded as a named partial verdict, never a pass
-        return {"image": None, "why": str(e)[:300]}
+    with Oracle(config=config, **_attach(spec)) as ora:
+        try:
+            src, key, _ = _source(ora, spec, renders)
+            if spec["engine"] == "mssql" and key:
+                src = _mssql_captured(spec, key)
+            ora.db.sql(f"CREATE OR REPLACE TEMP TABLE source_rows AS SELECT * FROM {src}")
+        except Exception as e:  # noqa: BLE001 — the captured table may not exist yet; every later row is then new
+            if not absent(e):
+                raise
+            for p in (path, path + ".missing"):
+                if os.path.exists(p):
+                    os.remove(p)
+            open(path + ".missing", "w").close()
+            return {"image": "absent"}
+        write_image(ora, "source_rows", path)
     return {"image": "image"}
 
 
@@ -976,6 +1037,7 @@ def grade(spec: dict) -> dict:
     extra: list[str] = []
     partial: list[str] = []
     engine, cdc, cumulative = spec["engine"], spec["mode"] == "cdc", spec.get("cumulative", False)
+    fmt = spec.get("format") or "parquet"
     out_dir, snap_dir = spec["out_dir"], spec["snapshot_dir"]
     low = None
     graded = in_run_order(out_dir, spec["manifests"])
@@ -996,7 +1058,7 @@ def grade(spec: dict) -> dict:
             # One read of the source: each later DESCRIBE or scan would open fresh scanner connections (mongoc opened ~2k per test).
             ora.db.sql(f"CREATE OR REPLACE TEMP TABLE source_rows AS SELECT * FROM {src}")
         except Exception as e:  # noqa: BLE001 — a CDC pin run can precede the table it captures
-            if not (cdc and not changes and not snaps):
+            if not (cdc and not changes and not snaps and absent(e)):
                 raise
             raise Unreachable(f"CDC: an empty stream over a table the source cannot read yet ({str(e)[:120]})") from e
         src = "source_rows"
@@ -1005,8 +1067,8 @@ def grade(spec: dict) -> dict:
         if cdc:
             if not key:
                 raise Unreachable("CDC on a relation with no primary key (and no census key): its values cannot be folded per row")
-            legs = [_meta_leg(ora, changes, engine, False)] if changes else []
-            legs += [_meta_leg(ora, snaps, engine, True)] if snaps else []
+            legs = [_meta_leg(ora, changes, engine, False, fmt)] if changes else []
+            legs += [_meta_leg(ora, snaps, engine, True, fmt)] if snaps else []
             kl = ", ".join(_qi(k) for k in key)
             if legs:
                 ora.db.sql("CREATE OR REPLACE TEMP TABLE ev AS " + " UNION ALL BY NAME ".join(f"({x})" for x in legs))
@@ -1052,23 +1114,34 @@ def grade(spec: dict) -> dict:
                     src = f"(SELECT * FROM {src} WHERE {c} <= {_lit(str(w['cursor_high']))})"
                     partial.append("`settle:` holds young rows back by rivet's clock: rows past rivet's cursor_high are not graded")
             legs = [
-                f"SELECT *, {i} AS __mseq FROM {_parts(ora, ps)}"
+                f"SELECT *, {i} AS __mseq FROM {_parts(ora, ps, fmt)}"
                 for i, ps in enumerate(declared_parts(out_dir, [m]) for m in graded) if ps
             ]
             if legs:
                 ora.db.sql("CREATE OR REPLACE TEMP TABLE got AS " + " UNION ALL BY NAME ".join(f"({x})" for x in legs))
                 if cumulative and key:
                     kl = ", ".join(_qi(k) for k in key)
+                    # A delta cannot express a delete: a key an EARLIER run delivered (graded then) that the source no longer holds is not owed.
+                    fresh = [i for i, m in enumerate(graded) if m in spec["new_manifests"]] or [-1]
+                    on = " AND ".join(f"CAST(s.{_qi(k)} AS VARCHAR) = CAST(g.{_qi(k)} AS VARCHAR)" for k in key)
                     dst = (f"(SELECT * EXCLUDE (__mseq, __rn) FROM (SELECT *, row_number() OVER "
-                           f"(PARTITION BY {kl} ORDER BY __mseq DESC) AS __rn FROM got) WHERE __rn = 1)")
+                           f"(PARTITION BY {kl} ORDER BY __mseq DESC) AS __rn FROM got) g WHERE __rn = 1 AND "
+                           f"(__mseq IN ({', '.join(map(str, fresh))}) OR EXISTS (SELECT 1 FROM source_rows s WHERE {on})))")
                 else:
                     dst = "(SELECT * EXCLUDE (__mseq) FROM got)"
-        if spec.get("resume") and not cumulative and dst and key:
-            # A resume completes a plan made before this invocation; the source may have moved since.
+        rc = spec.get("range_column")
+        if spec.get("replay") and rc and rc in {c for c, _ in _columns(ora, "source_rows")}:
+            # A sealed plan owes exactly the source rows inside the chunk ranges it carries (inclusive, as planned).
+            within = " OR ".join(f"{_qi(rc)} BETWEEN {int(lo)} AND {int(hi)}" for lo, hi in spec["ranges"])
+            src = f"(SELECT * FROM {src} WHERE {within})"
+        elif (spec.get("resume") or spec.get("replay")) and not cumulative and dst and key:
+            # A resume (or a sealed plan's ranges) completes a plan made before this invocation; the source may have moved since.
             kl = ", ".join(_qi(k) for k in key)
             on = " AND ".join(f"CAST(s.{_qi(k)} AS VARCHAR) = CAST(e.{_qi(k)} AS VARCHAR)" for k in key)
             src = f"(SELECT s.* FROM {src} s SEMI JOIN (SELECT DISTINCT {kl} FROM got) e ON {on})"
-            partial.append("a `--resume` run completes a plan made before it: the delivered rows are graded, completeness against that plan is not")
+            partial.append("a `--resume` run completes a plan made before it: the delivered rows are graded, completeness against that plan is not"
+                           if spec.get("resume") else
+                           "a sealed plan replays the chunk ranges it was planned with: the delivered rows are graded, completeness against the live source is not")
         if engine == "mongo":
             partial.append("Mongo: only `_id` is graded (the scanner's inferred schema shares nothing else with the document blob)")
             if dst:
@@ -1080,12 +1153,15 @@ def grade(spec: dict) -> dict:
         row_of = {c: rows[n] for c, n in native.items() if n in rows}
         defects = {c: [x.strip("'") for x in r.get("defect_samples") or []] for c, r in row_of.items() if r.get("known_defect")}
         # Oracle: its source leg is the client-side `source` render; a DuckDB render (strftime: astronomical years) would grade a different calendar.
-        duck = {} if engine == "oracle" else {c: _render(r)["duck"] for c, r in row_of.items() if _render(r).get("duck")}
+        # A CSV holds text: no DuckDB render applies to it; the source is rendered as the CSV writer documents its text.
+        duck = {} if engine == "oracle" or fmt == "csv" else {c: _render(r)["duck"] for c, r in row_of.items() if _render(r).get("duck")}
         canons = {c: _render(r)["canon"] for c, r in row_of.items() if _render(r).get("canon")}
         verbatim = frozenset(
             c for c, n in native.items()
             if (engine == "postgres" and n == "JSON") or (TEXT_NATIVE.match(n) and c not in duck and c not in canons and c not in numbers)
         )
+        if fmt == "csv":
+            src = f"(SELECT {csv_text(_columns(ora, 'source_rows'))} FROM {src})"
         f = compare(ora, src, dst, bits, numbers, defects, duck, canons, engine != "oracle", verbatim, key)
         if spec.get("nothing_new") and not cumulative:
             if spec.get("resume"):
@@ -1102,10 +1178,12 @@ def grade(spec: dict) -> dict:
         collapse = frozenset(
             c for c in defects if defects[c] and delivered.get(c) == "BOOLEAN"
         )
-        f["text_form"] = _text_form_mismatches(new_parts, row_of, forms)
-        part_rows = ora.scalar(f"SELECT count(*) FROM {_parts(ora, new_parts)}") if new_parts else 0
+        f["text_form"] = _text_form_mismatches(new_parts, row_of, forms) if fmt == "parquet" else []
+        if spec.get("partition_by") and new_parts:
+            extra += misfiled(ora, new_parts, spec["partition_by"])
+        part_rows = ora.scalar(f"SELECT count(*) FROM {_parts(ora, new_parts, fmt)}") if new_parts else 0
         f.update(part_rows=part_rows, manifest_rows=manifest_rows, **_counters(ora, spec, new_parts, run_ids))
-    failures = grade_findings(f, rows, forms, native, engine != "mongo", spec.get("overrides") or {}, collapse)
+    failures = grade_findings(f, rows, forms, native, engine != "mongo" and fmt == "parquet", spec.get("overrides") or {}, collapse)
     failures += (f.get("text_form") or []) + extra
     facts = {k: v for k, v in f.items() if k not in ("pairs", "dst_cols", "src_stats", "dst_stats")}
     out = {"failures": failures, "notes": notes, "facts": facts, "key": key}
@@ -1204,34 +1282,64 @@ def grade_load(spec: dict) -> dict:
             rel = f"bq.{ds}.{leaf}" if leaf in tables else f"bigquery_query('bq', {_lit(f'SELECT * FROM `{fq}`')})"
             wh_types = {}
             buffered = f"{leaf}__changes" in tables
+            if buffered:
+                # `<table>__changes` beside a VIEW is the changelog+view layout (the view is the current state);
+                # beside a base TABLE (or no base yet) it is base_buffer's uncompacted buffer.
+                proj, ds_ = fq.split(".")[:2]
+                sql = f"SELECT table_type FROM `{proj}.{ds_}`.INFORMATION_SCHEMA.TABLES WHERE table_name = '{leaf}'"
+                kind = [r[0] for r in ora.rows(f"SELECT * FROM bigquery_query('bq', {_lit(sql)})")]
+                buffered = kind != ["VIEW"]
+                base = bool(kind)
+                if buffered and not base:
+                    return {"skip": f"`{fq}__changes` holds a base_buffer buffer beside no base table: a base dropped from under the stream cannot be told from rows never loaded"}
+                if not buffered:
+                    rel = f"bigquery_query('bq', {_lit(f'SELECT * FROM `{fq}`')})"  # a view has no storage-API read
         if not wh_types and target == "clickhouse":
             return {"failures": [f"WAREHOUSE: `{fq}` does not exist in ClickHouse database `{db}`"], "notes": notes}
         if buffered and spec.get("verb") == "compact":
             return {"failures": [f"WAREHOUSE bigquery `{fq}`: `rivet compact` exited 0 and left `{leaf}__changes` behind"], "notes": notes}
-        if buffered:
-            return {"skip": f"`{fq}__changes` holds an uncompacted buffer: the base is current only after `rivet compact`"}
+        if buffered and not key:
+            return {"skip": f"`{fq}__changes` holds an uncompacted buffer and the relation names no key to fold it into the base by"}
         try:
-            ora.db.sql(f"CREATE OR REPLACE TEMP TABLE wh_all AS SELECT * FROM {rel}")
+            if buffered:
+                # base ∪ buffer, folded per key below the way `rivet compact` merges them: a buffer row beats the base.
+                legs = ([f"(SELECT *, 0 AS _rivet_src FROM {rel})"] if base else []) + [f"(SELECT *, 1 AS _rivet_src FROM bq.{ds}.{leaf}__changes)"]
+                ora.db.sql(f"CREATE OR REPLACE TEMP TABLE wh_all AS {' UNION ALL BY NAME '.join(legs)}")
+                partial.append("base_buffer before `rivet compact`: graded base ∪ buffer folded per key, not the merge compact performs")
+            else:
+                ora.db.sql(f"CREATE OR REPLACE TEMP TABLE wh_all AS SELECT * FROM {rel}")
         except Exception as e:  # noqa: BLE001 — a table that requires a partition filter is read with an all-partitions one
             m = re.search(r"filter over column\(s\) '([^']+)'", str(e))
-            if not m:
+            if not m or buffered:
                 raise
             c = m.group(1)
             sql = f"SELECT * FROM `{fq}` WHERE `{c}` IS NULL OR `{c}` >= TIMESTAMP('0001-01-01')"
             ora.db.sql(f"CREATE OR REPLACE TEMP TABLE wh_all AS SELECT * FROM bigquery_query('bq', {_lit(sql)})")
         have = [c for c, _ in _columns(ora, "wh_all")]
         keep = ", ".join(_qi(c) for c in have if not c.startswith(WAREHOUSE_META)) or "1"
-        if "__pos" in have and key:
-            # A change log: its live state is the latest image per key, deletes removed.
+        if ("__pos" in have or "_rivet_src" in have) and key:
+            # A change log (or base ∪ buffer): its live state is the latest image per key, deletes removed.
             kl = ", ".join(_qi(k) for k in key)
             seq = ", __seq DESC" if "__seq" in have else ""
-            folded = (f"(SELECT * FROM (SELECT *, row_number() OVER (PARTITION BY {kl} ORDER BY {pos_order(engine)} DESC{seq}) AS __rn "
-                      f"FROM wh_all) WHERE __rn = 1 AND coalesce(__op, '') <> 'delete')")
+            # A buffer row beats the base, and a change beats a snapshot row (NULL `__pos`), as rivet's own current-state view orders them.
+            order = ", ".join(([ "_rivet_src DESC"] if "_rivet_src" in have else [])
+                              + ([f"__pos IS NOT NULL DESC, {pos_order(engine)} DESC"] if "__pos" in have else [])) + seq
+            gone = " AND NOT coalesce(__is_deleted, false)" if "__is_deleted" in have else ""
+            live_op = " AND coalesce(__op, '') <> 'delete'" if "__op" in have else ""
+            folded = (f"(SELECT * FROM (SELECT *, row_number() OVER (PARTITION BY {kl} ORDER BY {order}) AS __rn "
+                      f"FROM wh_all) WHERE __rn = 1{live_op}{gone})")
             ora.db.sql(f"CREATE OR REPLACE TEMP TABLE wh AS SELECT {keep} FROM {folded}")
             notes.append("change-log layout: graded at the latest image per key")
         else:
             live = "WHERE NOT __is_deleted" if "__is_deleted" in have else ""
             ora.db.sql(f"CREATE OR REPLACE TEMP TABLE wh AS SELECT {keep} FROM wh_all {live}")
+        if spec.get("delta") and not cdc and key:
+            # A delta load cannot express a delete: a key the source no longer holds stays in the warehouse by design.
+            on = " AND ".join(f"CAST(s.{_qi(k)} AS VARCHAR) = CAST(w.{_qi(k)} AS VARCHAR)" for k in key)
+            stale = ora.scalar(f"SELECT count(*) FROM wh w WHERE NOT EXISTS (SELECT 1 FROM source_rows s WHERE {on})")
+            if stale:
+                ora.db.sql(f"DELETE FROM wh w WHERE NOT EXISTS (SELECT 1 FROM source_rows s WHERE {on})")
+                partial.append(f"{stale} warehouse key(s) the source no longer holds are not graded: a delta load cannot express a delete")
         if (cdc or "__pos" in have) and key:
             on = " AND ".join(f"CAST(s.{_qi(k)} AS VARCHAR) = CAST(w.{_qi(k)} AS VARCHAR)" for k in key)
             if not spec.get("snapshot"):
@@ -1386,6 +1494,7 @@ def _self_test() -> None:
     assert canon(oracle_ds_iso(one_day)) != canon("PT93784.000005S"), "a day is not folded into seconds"
     _ns_self_test()
     _compare_self_test()
+    _layout_self_test()
     print("rig_oracle self-test ok")
 
 
@@ -1468,6 +1577,46 @@ def _compare_self_test() -> None:
         assert got == ["2", "4"], f"an added column alone changes no row, got {got}"
         assert sorted(r[0] for r in ora.rows(f"SELECT id FROM {changed_keys(ora, None, 't', ['id'])}")) == ["1", "2", "4"], \
             "with no table at the anchor every row is new"
+
+
+def _layout_self_test() -> None:
+    """The delivered layouts the oracle reads: CSV text, sub-prefix manifests, hive buckets, absence, numeric text."""
+    import tempfile
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    assert absent(Exception('relation "t" does not exist')) and absent(Exception("cross-database references are not implemented"))
+    assert not absent(Exception('Conversion Error: Could not convert string "NaN" to DECIMAL(18,2)')), "a read error is an oracle error, never absence"
+    assert "format(''%s'', \"n\")" in _pg_projection("t", {"n": "NUMERIC(18,2)"}, {}), "a bounded NUMERIC is read as text: NaN has no DECIMAL"
+    with tempfile.TemporaryDirectory() as d:
+        ora = _Mem()
+        ora.db.sql("CREATE TABLE src AS SELECT * FROM (VALUES (1, true, '\\x0A\\xFF'::BLOB, '', NULL::VARCHAR, 1.50::DECIMAL(10,2), 'a,\"b'), "
+                   "(2, false, ''::BLOB, 'x', 'y', 2.00, 'z')) v(id, b, bin, e, n, m, q)")
+        csv = os.path.join(d, "p.csv")
+        with open(csv, "w") as fh:
+            fh.write('id,b,bin,e,n,m,q\n1,true,0aff,"",,1.50,"a,""b"\n2,false,"",x,y,2.00,z\n')
+        ora.db.sql(f"CREATE TABLE got AS SELECT * FROM {_parts(ora, [csv], 'csv')}")
+        src = f"(SELECT {csv_text(_columns(ora, 'src'))} FROM src)"
+        f = compare(ora, src, "got", numbers=frozenset({"m"}), verbatim=frozenset({"e", "n", "q"}))
+        assert (f["only_src"], f["only_dst"], f["missing"]) == (0, 0, []), f"rivet's documented CSV text is the source: {f}"
+        with open(csv, "w") as fh:
+            fh.write('id,b,bin,e,n,m\n1,true,0aff,,,1.50\n2,false,"",x,y,2.00\n')
+        ora.db.sql(f"CREATE OR REPLACE TABLE got AS SELECT * FROM {_parts(ora, [csv], 'csv')}")
+        f = compare(ora, src, "got", numbers=frozenset({"m"}), verbatim=frozenset({"e", "n", "q"}))
+        assert f["missing"] == ["q"] and f["only_src"] == 1, f"a dropped column and an empty string written as NULL are differences: {f}"
+
+        for day, v in (("2024-01-01", "2024-01-01 10:00:00"), ("2024-01-02", "2024-01-03 00:00:00"), (HIVE_NULL, None)):
+            os.makedirs(os.path.join(d, f"c={day}", "exp"))
+            pq.write_table(pa.table({"c": pa.array([v], pa.string())}), os.path.join(d, f"c={day}", "exp", "part.parquet"))
+            with open(os.path.join(d, f"c={day}", "exp", "manifest-r.json"), "w") as fh:
+                json.dump({"status": "success", "run_id": "r", "parts": [{"path": "part.parquet"}]}, fh)
+        names = [f"c={day}/exp/manifest-r.json" for day in ("2024-01-01", "2024-01-02", HIVE_NULL)]
+        parts = declared_parts(d, names)
+        assert len(parts) == 3, f"a manifest in a sub-prefix declares parts beside itself: {parts}"
+        assert misfiled(ora, parts, "c") == ["PARTITION: 1 row(s) sit under a `c=` directory whose label does not match their value"], \
+            "a row under the wrong day's directory is a finding; the NULL bucket holding NULL is not"
+        assert stream_parts({"dirs": [os.path.join(d, "c=2024-01-01", "exp")]}, ["r"]) and not stream_parts({"dirs": [d]}, ["r"])
 
 
 def _ns_self_test() -> None:
