@@ -20,7 +20,7 @@
 
 use std::path::{Path, PathBuf};
 
-/// Oracle opt-outs in tests/live: `.no_oracle(`, `run_rivet_ok_no_oracle(`, the `RIVET_TEST_NO_ORACLE` env.
+/// Oracle opt-outs in tests/live: `.no_oracle(`, `run_rivet_ok_no_oracle(`, the `RIVET_TEST_NO_ORACLE` env by literal or by its `NO_ORACLE_ENV` constant.
 // 17 -> 21 (2026-10-02): live_cdc_source_connections counts source connections, which the oracle's own read would add to.
 const NO_ORACLE_CEILING: usize = 21;
 
@@ -117,11 +117,13 @@ fn no_oracle_opt_outs_never_grow() {
             t.matches(".no_oracle(").count()
                 + t.matches("run_rivet_ok_no_oracle(").count()
                 + t.matches("\"RIVET_TEST_NO_ORACLE\"").count()
+                // The same env through its exported constant (tests/common/verify.rs::NO_ORACLE_ENV).
+                + t.matches("NO_ORACLE_ENV").count()
         })
         .sum();
     assert_eq!(
         n, NO_ORACLE_CEILING,
-        "oracle opt-outs (`.no_oracle(`, `run_rivet_ok_no_oracle(`, `RIVET_TEST_NO_ORACLE`): {n}, ceiling {NO_ORACLE_CEILING}. A new opt-out needs a reviewed \
+        "oracle opt-outs (`.no_oracle(`, `run_rivet_ok_no_oracle(`, `RIVET_TEST_NO_ORACLE`, `NO_ORACLE_ENV`): {n}, ceiling {NO_ORACLE_CEILING}. A new opt-out needs a reviewed \
          reason and a raised ceiling; a removed one lowers the ceiling in the same diff."
     );
 }

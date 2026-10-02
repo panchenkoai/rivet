@@ -420,7 +420,9 @@ fn every_verify_name_in_a_matrix_note_resolves() {
 /// definition, the guard — agreed it was covered.
 ///
 /// So this asks the other half: for every gate function, is there a CALL SITE?
-/// A call is an occurrence of `name(` that is not the `def`. Cross-module calls
+/// A call is an occurrence of `name(` in CODE that is not the `def`: `#` comments
+/// and docstrings are stripped first, so a stage switched off with one `#` is an
+/// orphan here (it read as called until 2026-10-02). Cross-module calls
 /// (`blessed_flow.verify_blessed_flow(...)`) and same-module ones both count;
 /// what does not count is the definition alone.
 #[test]
@@ -434,11 +436,13 @@ fn every_gate_function_has_a_call_site() {
             )
         })
         .collect();
-    let all: String = sources
-        .iter()
-        .map(|(_, s)| s.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
+    let all: String = super::release_oracle_entrypoint_guard::strip_python_comments(
+        &sources
+            .iter()
+            .map(|(_, s)| s.as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
 
     let mut defined: Vec<String> = Vec::new();
     for line in all.lines() {

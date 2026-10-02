@@ -251,7 +251,7 @@ fn every_makefile_gate_invocation_carries_a_baseline_or_gives_it_up_by_name() {
 /// well enough to keep a `#` inside a string, which is all these checks need. A
 /// docstring's prose is dropped along with the comments — also correct here,
 /// since prose is exactly what must not satisfy a call-site check.
-fn strip_python_comments(src: &str) -> String {
+pub(crate) fn strip_python_comments(src: &str) -> String {
     let mut out = String::with_capacity(src.len());
     // Over CHARS, not bytes: this file is full of em-dashes, and byte-slicing it
     // panics on the first one.

@@ -71,6 +71,53 @@ class Cell:
     detail: str = ""
 
 
+#: Stage function name -> ledger rows it recorded this run (filled by `record_stage_runs` wrappers).
+STAGES_RUN: dict[str, int] = {}
+#: Every `sc_*` / `verify_*` name `record_stage_runs` found in the gate's modules.
+STAGES_DEFINED: set[str] = set()
+_STAGES_LOCK = threading.Lock()
+
+
+def record_stage_runs(modules: Iterable[object]) -> None:
+    """Wrap every `sc_*` / `verify_*` bound in `modules` so a call records its name and the rows it added to the ledger it was handed."""
+    for mod in modules:
+        for name, fn in list(vars(mod).items()):
+            if not (name.startswith(("sc_", "verify_")) and callable(fn)):
+                continue
+            STAGES_DEFINED.add(name)
+            if getattr(fn, "_stage_recorded", False):
+                continue
+
+            def wrapped(*args, _name=name, _fn=fn, **kw):
+                led = args[0] if args and isinstance(args[0], Ledger) else None
+                before = len(led.cells) if led else 0
+                try:
+                    return _fn(*args, **kw)
+                finally:
+                    added = len(led.cells) - before if led else 0
+                    with _STAGES_LOCK:
+                        STAGES_RUN[_name] = STAGES_RUN.get(_name, 0) + added
+
+            wrapped._stage_recorded = True  # type: ignore[attr-defined]
+            wrapped.__name__ = name
+            setattr(mod, name, wrapped)
+
+
+def matrix_test_stages(doc: dict, defined: set[str]) -> dict[str, str]:
+    """The `test` rows of the gate matrix -> the stage each must run: `verify_<id>` for a preflight (and an infra row that has one), `sc_<id>` for a scenario with any `test` cell."""
+    out: dict[str, str] = {}
+    for row in doc.get("preflights") or []:
+        if row.get("status") == "test":
+            out[f"verify_{row['id']}"] = f"preflight `{row['id']}`"
+    for row in doc.get("infra") or []:
+        if row.get("status") == "test" and f"verify_{row['id']}" in defined:
+            out[f"verify_{row['id']}"] = f"infra `{row['id']}`"
+    for row in doc.get("scenarios") or []:
+        if any(v == "test" for k, v in row.items() if k not in ("id", "what")):
+            out[f"sc_{row['id']}"] = f"scenario `{row['id']}`"
+    return out
+
+
 class Ledger:
     """Every check's outcome, and the one place that decides releasability.
 
@@ -225,6 +272,22 @@ class Ledger:
                        "remove it from dev/release_oracle/known_red.py")
                 self.bad(msg)
                 self.add("-", "-", "known_red", "-", Status.FAIL, msg)
+
+    def close_matrix_rows(self, doc: dict | None = None) -> None:
+        """After a FULL run: every `test` row of docs/release-gate-matrix.yaml ran its stage, and the stage recorded a row."""
+        if doc is None:
+            import yaml
+            doc = yaml.safe_load((ROOT / "docs/release-gate-matrix.yaml").read_text())
+        for fn, row in sorted(matrix_test_stages(doc, STAGES_DEFINED).items()):
+            rows = STAGES_RUN.get(fn)
+            if rows is None:
+                why = f"{row} is `test` in docs/release-gate-matrix.yaml but {fn}() never ran this gate"
+            elif rows == 0:
+                why = f"{row} ran {fn}() and it recorded no ledger row: a check that graded nothing"
+            else:
+                continue
+            self.bad(why)
+            self.add("-", "-", "matrix_rows", "-", Status.FAIL, why)
 
     def skipped(self, engine: str, version: str, scenario: str, store: str, msg: str, detail: str = "") -> None:
         self.skip(msg)
