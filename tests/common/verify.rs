@@ -584,6 +584,7 @@ impl Case {
         if s(dest, "type") == Some("local") {
             return Ok(self.cwd.join(root));
         }
+        let root = object_key_prefix(&root);
         use std::hash::{Hash as _, Hasher as _};
         let mut h = std::hash::DefaultHasher::new();
         (yaml_text(Some(dest)), &root).hash(&mut h);
@@ -673,6 +674,17 @@ impl Case {
 }
 
 /// `template` cut at a whole `{partition}` component: (the part before it, the part after it when present).
+/// The object-key prefix a cloud destination writes under: no empty segment (`a//b` and `/a` land at `a/b`, `a`), a trailing `/` kept.
+fn object_key_prefix(prefix: &str) -> String {
+    let segs: Vec<&str> = prefix.split('/').filter(|s| !s.is_empty()).collect();
+    let tail = if prefix.ends_with('/') && !segs.is_empty() {
+        "/"
+    } else {
+        ""
+    };
+    format!("{}{tail}", segs.join("/"))
+}
+
 fn split_partition(template: &str, e: &Value) -> Result<(String, Option<String>), String> {
     let Some(i) = template.find("{partition}") else {
         return Ok((template.to_string(), None));
@@ -958,6 +970,17 @@ fn source_url(url: &str) -> String {
     ]
     .iter()
     .fold(url.to_string(), |u, (from, to)| u.replace(from, to))
+}
+
+#[test]
+fn the_oracle_pulls_the_key_prefix_a_doubled_slash_lands_at() {
+    assert_eq!(
+        object_key_prefix("rivet-live/u/my//users/"),
+        "rivet-live/u/my/users/"
+    );
+    assert_eq!(object_key_prefix("/a//b"), "a/b");
+    assert_eq!(object_key_prefix("a/b/"), "a/b/");
+    assert_eq!(object_key_prefix("/"), "");
 }
 
 #[test]

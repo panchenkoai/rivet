@@ -58,11 +58,10 @@ ADJUDICATED: dict[str, tuple[str, int]] = {
     # the standard this list is held to: an adjudication survives only until
     # someone runs the mutant it stands in for.
     "check": ("cli tests spawn the binary; measured 8% of body (preflight/mod.rs)", 25),
-    # `dispatch` (cli/dispatch.rs) — the CLI's routing: the offline integration suite
-    # spawns the binary through it (measured 41% of body), and its `-> Ok(())` stub
-    # fails 15 tests of tests/offline_suite.rs (measured 2026-09-26). Excluded only
-    # because the in-diff gate runs `-- --lib --bins`, which spawns no binary.
-    "dispatch": ("cli tests spawn the binary; stub fails 15 offline_suite tests", 50),
+    # `print_up_to_date` (load/orchestrate.rs) — log-only like warn_positional_once: its
+    # `()` stub survives the whole offline battery (4198 tests, measured 2026-10-02), and
+    # its text is graded through `up_to_date_line`.
+    "print_up_to_date": ("log-only fn, excluded as output-identical; text graded via up_to_date_line", 100),
     # The binary's entry (`main` → `cli::run_binary`): the same measurement, 26 tests.
     "main": ("cli tests spawn the binary; stub fails 26 offline_suite tests", 100),
     "run_binary": ("cli tests spawn the binary; stub fails 26 offline_suite tests", 100),

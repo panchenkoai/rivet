@@ -21,7 +21,8 @@
 use std::path::{Path, PathBuf};
 
 /// Oracle opt-outs in tests/live: `.no_oracle(`, `run_rivet_ok_no_oracle(`, the `RIVET_TEST_NO_ORACLE` env.
-const NO_ORACLE_CEILING: usize = 17;
+// 17 -> 21 (2026-10-02): live_cdc_source_connections counts source connections, which the oracle's own read would add to.
+const NO_ORACLE_CEILING: usize = 21;
 
 /// Rust DuckDB-helper call sites across tests/ (see [`duckdb_helper_names`]).
 // 626 -> 630 (2026-10-01): #378 merged first and added 4 calls in its Mongo null-_id tests.

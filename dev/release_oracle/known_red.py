@@ -33,6 +33,12 @@ KNOWN_RED: tuple[KnownRed, ...] = (
     KnownRed('upgrade[oracle/cdc-load/tz=Asia/Tokyo]: anchor: prev exit 1 [RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED]',
              "0.30.0's `rivet init --mode cdc` on Oracle wrote a `load:` block the loader refuses (RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED, ADR-0037). This tree's init writes none and says why (`upgrade[oracle/cdc-load/init=this]` grades that); loading Oracle CDC is the Oracle GA work, so this load cycle stays unsupported until then",
              "2026-10-31"),
+    KnownRed('sentinels[rivet_sent_ts9/full]: SUCCEEDED WITH A CHANGED VALUE: `V` differs',
+             "Oracle TIMESTAMP(9) is delivered at microseconds today: docs/type-capability-matrix.yaml's oracle TIMESTAMP(9) row is a known_defect (exact native is Timestamp(ns), ADR-0038 CP1, Oracle engine step), so the 1 ns sentinel lands truncated",
+             "2026-10-31"),
+    KnownRed('sentinels[rivet_sent_ts9/keyset]: SUCCEEDED WITH A CHANGED VALUE: `V` differs',
+             "Oracle TIMESTAMP(9) is delivered at microseconds today: docs/type-capability-matrix.yaml's oracle TIMESTAMP(9) row is a known_defect (exact native is Timestamp(ns), ADR-0038 CP1, Oracle engine step), so the 1 ns sentinel lands truncated",
+             "2026-10-31"),
 )
 
 

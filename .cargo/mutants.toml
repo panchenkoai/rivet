@@ -701,11 +701,6 @@ exclude_re = [
     "replace <impl super::ShapeControl for BigQueryLoader>::rebuild_changelog -> Result<\\(\\)>",
     "replace <impl super::ShapeControl for BigQueryLoader>::rebuild_leftovers -> Result<Vec<String>>",
     "replace BigQueryApi::run_query_first_row -> Result<Vec<Option<String>>>",
-    # The CLI's one routing function (cli/dispatch.rs): its body stub is born MISSED
-    # under `--lib --bins`, which runs no binary. The offline integration suite drives
-    # the binary through it: stubbing it to `Ok(())` fails 15 tests of
-    # tests/offline_suite.rs (measured 2026-09-26).
-    "replace dispatch -> Result<\\(\\)> with Ok\\(\\(\\)\\)",
     # The binary's entry — `main` (src/main.rs) and the `cli::run_binary` it calls — is the
     # same case: born MISSED under `--lib --bins`, which spawns no binary. Stubbing either to
     # `()` fails 26 tests of tests/offline_suite.rs (measured 2026-09-27).
