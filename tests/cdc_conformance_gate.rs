@@ -594,6 +594,75 @@ fn clip_to_first_fn_body(raw: &str) -> &str {
     raw
 }
 
+/// `chunk` with `//` and `/* */` comments removed (string and char literals kept), so a marker in a comment grades nothing.
+fn strip_rust_comments(chunk: &str) -> String {
+    let c: Vec<char> = chunk.chars().collect();
+    let mut out = String::with_capacity(chunk.len());
+    let mut i = 0;
+    while i < c.len() {
+        match c[i] {
+            '"' => {
+                // a string literal: copied whole, escapes included
+                out.push(c[i]);
+                i += 1;
+                while i < c.len() && c[i] != '"' {
+                    if c[i] == '\\' && i + 1 < c.len() {
+                        out.push(c[i]);
+                        i += 1;
+                    }
+                    out.push(c[i]);
+                    i += 1;
+                }
+            }
+            '\'' if i + 2 < c.len()
+                && (c[i + 2] == '\''
+                    || (c[i + 1] == '\\' && i + 3 < c.len() && c[i + 3] == '\'')) =>
+            {
+                // a char literal ('x' or '\n'), never a lifetime: copied up to its closing quote
+                let n = if c[i + 1] == '\\' { 4 } else { 3 };
+                out.extend(&c[i..i + n - 1]);
+                i += n - 1;
+            }
+            '/' if i + 1 < c.len() && c[i + 1] == '/' => {
+                while i < c.len() && c[i] != '\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            '/' if i + 1 < c.len() && c[i + 1] == '*' => {
+                i += 2;
+                while i + 1 < c.len() && !(c[i] == '*' && c[i + 1] == '/') {
+                    i += 1;
+                }
+                i += 2;
+                continue;
+            }
+            _ => {}
+        }
+        if i < c.len() {
+            out.push(c[i]);
+        }
+        i += 1;
+    }
+    out
+}
+
+#[test]
+fn a_marker_in_a_comment_is_not_an_outcome() {
+    let chunk = "fn t() {\n    // the parquet_ rows are compared by the gate\n    /* duckdb_ too */\n    rig.run_ok(); // query_row\n}\n";
+    let code = strip_rust_comments(chunk);
+    for marker in ["parquet_", "duckdb_", "query_row"] {
+        assert!(!code.contains(marker), "{marker} survived in: {code}");
+    }
+    assert!(code.contains("rig.run_ok();"));
+    let kept =
+        strip_rust_comments("let u = \"postgres://h/d\"; let q = '\"'; let s = '/'; // gone");
+    assert_eq!(
+        kept,
+        "let u = \"postgres://h/d\"; let q = '\"'; let s = '/'; "
+    );
+}
+
 /// The clipper itself must not lend a neighbor's marker — RED against the
 /// unclipped split (the helper text below would leak into the chunk).
 #[test]
@@ -749,7 +818,7 @@ fn oracle_class_census_is_pinned() {
         }
         let src = fs::read_to_string(&path).unwrap();
         for raw in src.split("#[test]").skip(1) {
-            let chunk = clip_to_first_fn_body(raw);
+            let chunk = &strip_rust_comments(clip_to_first_fn_body(raw));
             let runs_capture = chunk.contains("run_cdc(")
                 || chunk.contains("Command::new(RIVET_BIN)")
                 || derived_capture_markers()
@@ -908,7 +977,7 @@ fn every_completeness_named_cdc_test_carries_an_independent_oracle() {
         }
         let src = fs::read_to_string(&path).unwrap();
         for raw in src.split("#[test]").skip(1) {
-            let chunk = clip_to_first_fn_body(raw);
+            let chunk = &strip_rust_comments(clip_to_first_fn_body(raw));
             let fn_name = chunk
                 .lines()
                 .find_map(|l| l.trim().strip_prefix("fn "))
@@ -998,7 +1067,7 @@ fn every_live_cdc_test_asserts_an_outcome() {
         // asserts) graded green off the neighbor's text (r3 bughunt,
         // reproduced against live_cdc_mongo).
         for raw in src.split("#[test]").skip(1) {
-            let chunk = clip_to_first_fn_body(raw);
+            let chunk = &strip_rust_comments(clip_to_first_fn_body(raw));
             let name = chunk
                 .lines()
                 .find_map(|l| l.trim().strip_prefix("fn "))

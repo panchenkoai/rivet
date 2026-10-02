@@ -44,7 +44,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from .core import Ledger, Status, engine_container, verify_no_invariant_violations, docker, have, remove_engine_containers, rivet, rivet_bin, run, sqlcmd, target_dir, verify_nextest_grading, HERE, ROOT
+from .core import Ledger, Status, engine_container, verify_no_invariant_violations, docker, have, record_stage_runs, remove_engine_containers, rivet, rivet_bin, run, sqlcmd, target_dir, verify_nextest_grading, HERE, ROOT
 from . import (
     bigquery,
     blessed_flow,
@@ -179,6 +179,65 @@ _ENV_FLAG_TABLE = {
     # An unrecognised value is TRUE — see env_flag's docstring on direction.
     "maybe": True,
 }
+
+
+def _gate_modules() -> list[object]:
+    """Every module of this package (imported) plus this entry point: where a stage function can be bound."""
+    import importlib
+    import pkgutil
+    pkg = sys.modules[__package__]
+    mods: list[object] = [importlib.import_module(f"{__package__}.{m.name}")
+                          for m in pkgutil.iter_modules(pkg.__path__) if m.name != "__main__"]
+    return mods + [sys.modules[__name__]]
+
+
+def _stages_self_test() -> None:
+    """Stage recording counts the rows a stage adds; the end-of-run matrix check fails on a stage that never ran or graded nothing; the real matrix resolves to recorded stages."""
+    import types
+
+    import yaml
+
+    from .core import STAGES_DEFINED, STAGES_RUN, matrix_test_stages
+
+    m = types.ModuleType("probe_stage_module")
+    m.verify_a = lambda led: led.passed("-", "-", "a", "-", "a ran")
+    m.sc_b = lambda led, engine: None
+    m.helper = lambda led: led.passed("-", "-", "h", "-", "not a stage")
+    record_stage_runs([m])
+    assert {"verify_a", "sc_b"} <= STAGES_DEFINED and "helper" not in STAGES_DEFINED
+    probe = Ledger(colour=False)
+    probe._buf = []
+    m.verify_a(probe)
+    m.sc_b(probe, "postgres")
+    m.sc_b(probe, "mysql")
+    assert STAGES_RUN["verify_a"] == 1 and STAGES_RUN["sc_b"] == 0, STAGES_RUN
+    record_stage_runs([m])
+    m.verify_a(probe)
+    assert STAGES_RUN["verify_a"] == 2, "re-recording must not wrap the wrapper"
+    doc = {
+        "preflights": [{"id": "a", "status": "test"}, {"id": "off", "status": "gap"}],
+        "infra": [{"id": "undriven", "status": "test"}],
+        "scenarios": [{"id": "b", "what": "w", "postgres": "test", "mysql": {"na": "r"}},
+                      {"id": "c", "what": "w", "postgres": {"gap": "r"}},
+                      {"id": "never", "what": "w", "postgres": "test"}],
+    }
+    assert matrix_test_stages(doc, {"verify_a", "sc_b"}) == {
+        "verify_a": "preflight `a`", "sc_b": "scenario `b`", "sc_never": "scenario `never`"}, \
+        matrix_test_stages(doc, {"verify_a", "sc_b"})
+    probe.close_matrix_rows(doc)
+    fails = [c.detail for c in probe.cells if c.status is Status.FAIL]
+    assert len(fails) == 2 and "sc_b() and it recorded no ledger row" in fails[0] and "sc_never() never ran" in fails[1], fails
+    import ast
+
+    real = yaml.safe_load((ROOT / "docs/release-gate-matrix.yaml").read_text())
+    # Read by `ast`, not imported: the self-test runs on a bare python3 without duckdb.
+    defined = {n.name for f in HERE.glob("*.py") for n in ast.parse(f.read_text()).body
+               if isinstance(n, ast.FunctionDef) and n.name.startswith(("sc_", "verify_"))}
+    want = matrix_test_stages(real, defined)
+    assert len(want) > 40, f"the real matrix resolves to only {len(want)} stages"
+    missing = sorted(set(want) - defined)
+    assert not missing, f"`test` rows whose stage the gate cannot record: {missing}"
+    print(f"self-test ok: {len(want)} matrix `test` rows resolve to recorded stages; a stage that never ran or graded nothing fails the run")
 
 
 def _self_test() -> int:
@@ -439,6 +498,7 @@ def _self_test() -> int:
 
     sentinels._self_test()
     print("self-test ok: sentinel verdicts (exact, or a loud non-panic refusal on a risky value)")
+    _stages_self_test()
     print("\nregression stage (child harness, stand, banner):")
     return regression._self_test()
 
@@ -1174,6 +1234,7 @@ def main(argv: list[str] | None = None) -> int:
     os.environ.setdefault("BLESS_DUCKDB", "1" if ns.bless_local else "0")
     os.environ.setdefault("BLESS_CDC", "1" if ns.bless_cdc else "0")
 
+    record_stage_runs(_gate_modules())
     led = Ledger()
     work = Path(tempfile.mkdtemp(prefix="rivet-oracle-"))
     os.environ["WORK"] = str(work)
@@ -1268,6 +1329,9 @@ def main(argv: list[str] | None = None) -> int:
         # Only a FULL run can say a known red no longer fires.
         if not (ns.engines or ns.versions or ns.no_cloud or ns.latest_only):
             led.close_known_red()
+            # A bless run returns before most stages on purpose (run_scenarios), so it cannot grade the matrix.
+            if not (ns.bless_local or ns.bless_cdc):
+                led.close_matrix_rows()
         rc = led.report()
         # A run that graded nothing against the previous release has to say so
         # AFTER the verdict, where the reader's eye lands: `RELEASE-READY` is

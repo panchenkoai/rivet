@@ -73,3 +73,13 @@ impl Drop for Rig {
         }
     }
 }
+
+#[test]
+#[should_panic(expected = "oracle known defect now passes")]
+fn a_known_defect_marker_that_never_fired_fails_the_test_at_drop() {
+    let rig = Rig::pg_batch("never_run").oracle_known_defect(
+        "delivered-only rows",
+        "a marker on a rig that never disagreed",
+    );
+    drop(rig);
+}

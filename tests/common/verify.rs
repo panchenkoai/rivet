@@ -385,16 +385,21 @@ impl Case {
             _ => return Err("structured source (host/user/database): not graded yet".into()),
         };
         let url = source_url(&raw);
+        let db = self.config_dir.join(".rivet_state.db");
         let state = envs
             .iter()
             .find(|(n, _)| *n == "RIVET_STATE_URL")
             .map(|(_, v)| v.to_string())
             .or_else(super::state::state_url_under_test)
             .filter(|u| u.starts_with("postgres"))
-            .or_else(|| {
-                let db = self.config_dir.join(".rivet_state.db");
-                db.is_file().then(|| db.display().to_string())
-            });
+            .or_else(|| db.is_file().then(|| db.display().to_string()));
+        // A run with no findable state is graded PARTIAL, never a silent PASS of a ledger leg that was not compared.
+        let state_missing = state.is_none().then(|| {
+            format!(
+                "no state DB: {} is absent and neither the run's RIVET_STATE_URL nor the backend under test (RIVET_GATE_STATE_URL) is postgres, so rivet's ledger (export_metrics, file_log) was not compared",
+                db.display()
+            )
+        });
         let query = match (s(e, "query"), s(e, "query_file")) {
             (Some(q), _) => Some(q.to_string()),
             (_, Some(f)) => Some(
@@ -430,6 +435,7 @@ impl Case {
             "overrides": overrides,
             "cursor_expr": cursor_expr,
             "state": state,
+            "state_missing": state_missing,
             "capture_instance": e.get("cdc").and_then(|c| s(c, "capture_instance")),
         }))
     }
@@ -833,42 +839,103 @@ fn verdict_of(name: &str, spec: &serde_json::Value, verb: &str, opts: &Opts) -> 
     let spec = &spec;
     let verdict = run_rig_oracle(spec, verb);
     let took = format!("{verb} {} ms", t0.elapsed().as_millis());
-    if let Some(why) = verdict["skip"].as_str() {
-        log("SKIP", name, &format!("{took}: {why}"));
-        return false;
-    }
-    let failures: Vec<String> = verdict["failures"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|f| f.as_str().map(str::to_string))
-        .collect();
-    if failures.is_empty() {
-        match verdict["partial"].as_str() {
-            Some(gap) => log(
-                "PARTIAL",
-                name,
-                &format!("{took}: {gap} {}", verdict["facts"]),
-            ),
-            None => log("PASS", name, &format!("{took} {}", verdict["facts"])),
+    match decide(&verdict, marker, spec["state_missing"].as_str()) {
+        Outcome::Skip(why) => log("SKIP", name, &format!("{took}: {why}")),
+        Outcome::Pass(facts) => log("PASS", name, &format!("{took} {facts}")),
+        Outcome::Partial(detail) => log("PARTIAL", name, &format!("{took}: {detail}")),
+        Outcome::Xfail(detail) => {
+            log("XFAIL", name, &detail);
+            return true;
         }
-        return false;
+        Outcome::Fail(failures) => {
+            log("FAIL", name, &failures.join(" | "));
+            panic!(
+                "rig oracle: export '{name}' disagrees with its source / rivet's own ledger \
+                 (dev/release_oracle/rig_oracle.py {verb}; opt out only with `.no_oracle(\"<why>\")` or \
+                 {NO_ORACLE_ENV}=<why>):\n  - {}\nspec: {spec}\nverdict: {verdict}",
+                failures.join("\n  - ")
+            );
+        }
     }
-    if let Some(k) = marker.filter(|_| verdict["known_defect"].as_bool() == Some(true)) {
-        log(
-            "XFAIL",
-            name,
-            &format!("[{}] {} — {}", k.class, k.reason, failures.join(" | ")),
-        );
-        return true;
+    false
+}
+
+/// What one oracle verdict means for the test: the verdict word and its log detail.
+#[derive(Debug, PartialEq)]
+enum Outcome {
+    Skip(String),
+    Pass(String),
+    Partial(String),
+    Xfail(String),
+    Fail(Vec<String>),
+}
+
+/// The oracle's JSON read against its contract (`{skip: str}` | `{failures: [str], partial?: str, known_defect?: bool}`): any other shape panics as an oracle error, never a PASS.
+fn decide(
+    verdict: &serde_json::Value,
+    marker: Option<KnownDefect>,
+    state_missing: Option<&str>,
+) -> Outcome {
+    let obj = verdict
+        .as_object()
+        .unwrap_or_else(|| panic!("oracle verdict is not a JSON object: {verdict}"));
+    if let Some(skip) = obj.get("skip") {
+        let why = skip
+            .as_str()
+            .unwrap_or_else(|| panic!("oracle verdict `skip` is not a string: {verdict}"));
+        return Outcome::Skip(why.to_string());
     }
-    log("FAIL", name, &failures.join(" | "));
-    panic!(
-        "rig oracle: export '{name}' disagrees with its source / rivet's own ledger \
-         (dev/release_oracle/rig_oracle.py {verb}; opt out only with `.no_oracle(\"<why>\")` or \
-         {NO_ORACLE_ENV}=<why>):\n  - {}\nspec: {spec}\nverdict: {verdict}",
-        failures.join("\n  - ")
-    );
+    let failures: Vec<String> = match obj.get("failures").and_then(|f| f.as_array()) {
+        Some(items) => items
+            .iter()
+            .map(|f| {
+                f.as_str().map(str::to_string).unwrap_or_else(|| {
+                    panic!("oracle verdict `failures` holds a non-string finding: {f} in {verdict}")
+                })
+            })
+            .collect(),
+        None => panic!(
+            "oracle verdict has no `failures` array (the contract is `skip: str` or `failures: [str]`): {verdict}"
+        ),
+    };
+    let partial = obj.get("partial").map(|p| {
+        p.as_str()
+            .unwrap_or_else(|| panic!("oracle verdict `partial` is not a string: {verdict}"))
+            .to_string()
+    });
+    let facts = obj.get("facts").cloned().unwrap_or(serde_json::Value::Null);
+    if failures.is_empty() {
+        let gaps: Vec<String> = state_missing
+            .map(str::to_string)
+            .into_iter()
+            .chain(partial)
+            .collect();
+        return if gaps.is_empty() {
+            Outcome::Pass(facts.to_string())
+        } else {
+            Outcome::Partial(format!("{} {facts}", gaps.join("; ")))
+        };
+    }
+    if let Some(k) = marker {
+        let covered = match obj.get("known_defect") {
+            Some(v) => v.as_bool().unwrap_or_else(|| {
+                panic!("oracle verdict `known_defect` is not a bool: {verdict}")
+            }),
+            None => panic!(
+                "the spec named known defect class `{}` and the oracle's verdict carries no `known_defect` bool: {verdict}",
+                k.class
+            ),
+        };
+        if covered {
+            return Outcome::Xfail(format!(
+                "[{}] {} — {}",
+                k.class,
+                k.reason,
+                failures.join(" | ")
+            ));
+        }
+    }
+    Outcome::Fail(failures)
 }
 
 /// Run `dev/release_oracle/rig_oracle.py <verb>` (pinned by uv.lock) over `spec`; its JSON verdict.
@@ -1031,5 +1098,111 @@ fn the_oracle_resolves_destination_placeholders_and_splits_a_capture_per_table()
     assert!(
         split_partition("o/x{partition}", &p).is_err(),
         "a token inside a component is not a hive directory"
+    );
+}
+
+/// A marker for the verdict-reader tests: one export, one class.
+fn a_marker() -> KnownDefect<'static> {
+    KnownDefect {
+        export: "e",
+        class: "delivered-only rows",
+        reason: "a probe marker",
+    }
+}
+
+#[test]
+fn the_verdict_reader_grades_the_contract_shapes() {
+    use serde_json::json;
+    assert_eq!(
+        decide(&json!({"failures": [], "facts": {"n": 1}}), None, None),
+        Outcome::Pass(r#"{"n":1}"#.into())
+    );
+    assert_eq!(
+        decide(
+            &json!({"failures": ["COUNT(*): source 1, delivered 2"]}),
+            None,
+            None
+        ),
+        Outcome::Fail(vec!["COUNT(*): source 1, delivered 2".into()])
+    );
+    assert_eq!(
+        decide(&json!({"skip": "no stand"}), None, None),
+        Outcome::Skip("no stand".into())
+    );
+    assert!(matches!(
+        decide(&json!({"failures": [], "partial": "the stream's first graded run"}), None, None),
+        Outcome::Partial(d) if d.starts_with("the stream's first graded run")
+    ));
+    assert!(
+        matches!(
+            decide(&json!({"failures": []}), None, Some("no state DB: x is absent")),
+            Outcome::Partial(d) if d.starts_with("no state DB: x is absent")
+        ),
+        "a run with no findable state DB is PARTIAL, not PASS"
+    );
+}
+
+#[test]
+fn a_known_defect_excuses_only_the_failures_the_oracle_marks_as_its_class() {
+    use serde_json::json;
+    let of_class = json!({"failures": ["COUNT(*): source 1, delivered 2"], "known_defect": true});
+    assert!(matches!(
+        decide(&of_class, Some(a_marker()), None),
+        Outcome::Xfail(_)
+    ));
+    let other = json!({"failures": ["COUNT(*): source 2, delivered 1"], "known_defect": false});
+    assert!(
+        matches!(decide(&other, Some(a_marker()), None), Outcome::Fail(_)),
+        "a failure outside the marked class FAILs even with a marker"
+    );
+    assert!(
+        matches!(decide(&of_class, None, None), Outcome::Fail(_)),
+        "without a marker the oracle's bool excuses nothing"
+    );
+}
+
+#[test]
+#[should_panic(expected = "non-string finding")]
+fn an_object_finding_is_an_oracle_error_not_a_pass() {
+    decide(
+        &serde_json::json!({"failures": [{"line": "x"}]}),
+        None,
+        None,
+    );
+}
+
+#[test]
+#[should_panic(expected = "no `failures` array")]
+fn a_renamed_failures_key_is_an_oracle_error_not_a_pass() {
+    decide(
+        &serde_json::json!({"failure": ["x"], "facts": {}}),
+        None,
+        None,
+    );
+}
+
+#[test]
+#[should_panic(expected = "no `failures` array")]
+fn a_non_array_failures_is_an_oracle_error_not_a_pass() {
+    decide(&serde_json::json!({"failures": "x"}), None, None);
+}
+
+#[test]
+#[should_panic(expected = "`known_defect` is not a bool")]
+fn a_non_bool_known_defect_is_an_oracle_error() {
+    decide(
+        &serde_json::json!({"failures": ["x"], "known_defect": "yes"}),
+        Some(a_marker()),
+        None,
+    );
+}
+
+#[test]
+#[should_panic(expected = "carries no `known_defect` bool")]
+fn a_marked_spec_whose_verdict_lost_the_known_defect_key_is_an_oracle_error() {
+    decide(
+        &serde_json::json!({"failures": ["x"]}),
+        Some(a_marker()),
+        None,
     );
 }
