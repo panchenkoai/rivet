@@ -1482,6 +1482,7 @@ mod tests {
         let changed = || anyhow::anyhow!("oracle: ORA-01368: Redo log file header mismatch");
         let mut spent = 0;
         let waits: Vec<u128> = std::iter::from_fn(|| spend_remine(&mut spent, changed()).ok())
+            .take(10)
             .map(|d| d.as_millis())
             .collect();
         assert_eq!((waits, spent), (vec![200, 400, 800, 1600, 3200], 5));
