@@ -724,11 +724,13 @@ mod tests {
         assert_ne!(summary.status, "skipped");
     }
 
-    /// single grades nothing itself: it hands what its sink measured to the ledger,
-    /// whose seam grades every runner, and a short run still succeeds in the runner.
+    /// single grades nothing itself: it writes its part and hands what its sink measured
+    /// to the ledger, whose seam grades every runner.
     #[test]
     fn single_feeds_its_quality_measurements_to_the_ledger_and_grades_nothing() {
+        let out = tempfile::tempdir().unwrap();
         let mut plan = minimal_plan();
+        plan.destination.path = Some(out.path().to_string_lossy().into_owned());
         plan.quality = Some(crate::config::QualityConfig {
             row_count_min: Some(100),
             row_count_max: None,
@@ -739,6 +741,8 @@ mod tests {
         let (result, summary) = run(&mut RowSource(3), &plan);
         result.expect("the runner no longer applies the gate");
         assert_eq!(summary.quality_passed, None);
+        assert_eq!(summary.files_committed, 1, "a 3-row run commits its part");
+        assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 1);
         let q = &summary.ledger.observed.quality;
         assert!(
             q.columns.is_some(),
