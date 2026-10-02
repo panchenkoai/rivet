@@ -315,20 +315,25 @@ impl Rig {
     /// For tests that must act on a running process — signal it, inspect its
     /// children, watch the staged `.tmp` appear — rather than wait for an exit
     /// status. `run_args_env` blocks until completion and so cannot express them.
-    /// The caller owns the `Child` and must reap it; its run is not graded (logged as a SKIP, the sites under a ceiling).
-    pub fn spawn_args_env(&self, extra: &[&str], envs: &[(&str, &str)]) -> std::process::Child {
-        if self.oracle_off.is_none() {
-            crate::common::verify::log(
-                "SKIP",
-                &self.name,
-                "a spawned child: the caller owns its exit, so its run is not graded",
-            );
-        }
-        self.invoke_command(&self.run_argv(extra), envs)
+    /// The caller reaps it through [`Spawned`]; a reaping that sees exit 0 grades the run like any other.
+    pub fn spawn_args_env(&self, extra: &[&str], envs: &[(&str, &str)]) -> Spawned<'_> {
+        let argv = self.run_argv(extra);
+        let case = self.oracle_begin(&argv, envs, None);
+        let child = self
+            .invoke_command(&argv, envs)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
-            .expect("spawn rivet")
+            .expect("spawn rivet");
+        Spawned {
+            rig: self,
+            child,
+            case,
+            envs: envs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
     }
 
     /// Run rivet; panic unless it succeeds.
@@ -384,5 +389,80 @@ impl Rig {
     /// mid-stream outage that rivet may either retry through or safely refuse).
     pub fn run(&self) -> std::process::Output {
         self.run_args(&[])
+    }
+}
+
+/// A live `rivet run` child of [`Rig::spawn_args_env`]: a `Child` (by deref) whose reaping grades the run when it exited 0.
+pub struct Spawned<'a> {
+    rig: &'a Rig,
+    child: std::process::Child,
+    case: Option<crate::common::verify::Case>,
+    envs: Vec<(String, String)>,
+}
+
+impl Spawned<'_> {
+    /// [`std::process::Child::wait`], then grade a successful run.
+    pub fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let status = self.child.wait()?;
+        self.reaped(status);
+        Ok(status)
+    }
+
+    /// [`std::process::Child::try_wait`], then grade a successful run once it has exited.
+    pub fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        let status = self.child.try_wait()?;
+        if let Some(st) = status {
+            self.reaped(st);
+        }
+        Ok(status)
+    }
+
+    /// [`Spawned::wait`] with the (discarded, so empty) output.
+    pub fn wait_with_output(mut self) -> std::io::Result<std::process::Output> {
+        let status = self.wait()?;
+        Ok(std::process::Output {
+            status,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        })
+    }
+
+    /// Grade the run once, if it exited 0.
+    fn reaped(&mut self, status: std::process::ExitStatus) {
+        self.rig.absorb_product_config_writes();
+        if let Some(case) = self.case.take().filter(|_| status.success()) {
+            let envs: Vec<(&str, &str)> = self
+                .envs
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
+            self.rig.oracle_finish(case, &envs);
+        }
+    }
+}
+
+impl std::ops::Deref for Spawned<'_> {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.child
+    }
+}
+
+impl std::ops::DerefMut for Spawned<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.child
+    }
+}
+
+impl Drop for Spawned<'_> {
+    /// A child dropped before anyone reaped it was never graded: say so.
+    fn drop(&mut self) {
+        if self.case.is_some() && !std::thread::panicking() {
+            crate::common::verify::log(
+                "SKIP",
+                &self.rig.name,
+                "a spawned child dropped before it was reaped",
+            );
+        }
     }
 }
