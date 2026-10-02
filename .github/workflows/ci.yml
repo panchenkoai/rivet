@@ -1689,7 +1689,7 @@ jobs:
         # A CDC stream's first run lands in SKIP (it delivered nothing) or PARTIAL (it delivered some)
         # depending on timing, so those two classes share one ceiling; every other class keeps its own.
         env:
-          SKIP_CEILING: 230  # +2 (#398): its ClickHouse emptied-source test stages through fake-gcs, which the oracle cannot pull yet
+          SKIP_CEILING: 231  # +2 (#398) and +1 (#399): their ClickHouse load tests stage through fake-gcs, which the oracle cannot pull yet
           PARTIAL_CEILING: 39
           FIRST_RUN_CEILING: 253
         run: |
