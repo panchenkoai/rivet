@@ -387,28 +387,46 @@ pub(crate) fn names_a_log_set_change(rendered: &str) -> bool {
             .any(log_set_changed)
 }
 
-/// `V$LOGMNR_LOGS.STATUS = 4` inside `[low_water, end]`: a needed file is missing from the registered list.
+/// A registered log set rivet itself found unsound.
 #[derive(Debug)]
-pub(crate) struct MissingRegisteredLog(pub u64, pub u64);
+pub(crate) enum LogSetFault {
+    /// `V$LOGMNR_LOGS.STATUS = 4` inside `[low_water, end]`: a needed file is missing from the list.
+    Hole(u64, u64),
+    /// An online member was reused for another sequence before the read was known complete.
+    Reused { name: String, sequence: u64 },
+}
 
-impl std::fmt::Display for MissingRegisteredLog {
+impl std::fmt::Display for LogSetFault {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "oracle cdc: LogMiner reports a missing log file inside SCN {}..{} — the changes it \
-             held are LOST to this stream. Restore the archived log, or delete the checkpoint \
-             (anchor first, then re-snapshot).",
-            self.0, self.1
-        )
+        match self {
+            Self::Hole(lo, hi) => write!(
+                f,
+                "oracle cdc: LogMiner reports a missing log file inside SCN {lo}..{hi} — the \
+                 changes it held are LOST to this stream. Restore the archived log, or delete \
+                 the checkpoint (anchor first, then re-snapshot)."
+            ),
+            Self::Reused { name, sequence } => write!(
+                f,
+                "oracle cdc: the online redo log {name} was reused while LogMiner read sequence \
+                 {sequence}, so its tail may be unread; nothing past it was checkpointed, so \
+                 rerunning resumes without loss"
+            ),
+        }
     }
 }
 
-impl std::error::Error for MissingRegisteredLog {}
+impl std::error::Error for LogSetFault {}
 
-/// Whether `e` may be cured by re-listing the logs: a log-set-change ORA code, or a registered
-/// list LogMiner found a hole in (a file reused between the listing and `ADD_LOGFILE`).
+/// Whether `e` may be cured by re-listing the logs: a log-set-change ORA code, or a
+/// [`LogSetFault`] (an online file reused between the listing and the read).
 pub(crate) fn re_plannable(e: &anyhow::Error) -> bool {
-    e.is::<MissingRegisteredLog>() || names_a_log_set_change(&format!("{e:#}"))
+    e.is::<LogSetFault>() || names_a_log_set_change(&format!("{e:#}"))
+}
+
+/// Whether the read of online file `f` must be proven whole before a group committed at
+/// `commit` is queued (`None`: the window is drained): the group lies past the file's end.
+pub(crate) fn read_past(f: &LogFile, commit: Option<u64>) -> bool {
+    commit.is_none_or(|c| c >= f.next)
 }
 
 /// The wait before re-plan `attempt` (0-based) after `e`, or `None` when `e` is not
@@ -845,6 +863,8 @@ pub(crate) struct OracleChangeStream {
     mined_through: u64,
     /// Re-plans spent on a redo log set that changed under LogMiner.
     remines: u32,
+    /// Online files of the current session not yet proven read whole.
+    unverified: Vec<LogFile>,
 }
 
 /// One mined row that matters to the stream.
@@ -933,6 +953,7 @@ impl OracleChangeStream {
             yielded_since_ack: false,
             mined_through: from.commit_scn,
             remines: 0,
+            unverified: Vec::new(),
         };
         if !stream.exhausted {
             stream.mine()?;
@@ -960,8 +981,9 @@ impl OracleChangeStream {
                 after,
                 self.frontier,
             ) {
-                Ok(cursor) => {
+                Ok((cursor, online)) => {
                     self.cursor = Some(cursor);
+                    self.unverified = online;
                     return Ok(());
                 }
                 Err(e) => std::thread::sleep(spend_remine(&mut self.remines, e)?),
@@ -1082,7 +1104,7 @@ impl OracleChangeStream {
             Some(m) => m,
             None => match self.next_mined()? {
                 Some(m) => m,
-                None => return Ok(false),
+                None => return self.prove_online_read(None).map(|()| false),
             },
         };
         let first = match first {
@@ -1126,9 +1148,36 @@ impl OracleChangeStream {
         let mut events: Vec<ChangeEvent> =
             order.into_iter().filter_map(|i| slots[i].take()).collect();
         TxnFramer::close_group(&mut events, &pos);
+        self.prove_online_read(self.carry.is_some().then_some(commit))?;
         self.queue.extend(events);
         self.mined_through = commit;
         Ok(true)
+    }
+
+    /// Prove every online file [`read_past`] `commit` still holds its sequence (a reuse would have
+    /// cut its tail unseen), or fail with [`LogSetFault::Reused`] so the window is re-mined.
+    fn prove_online_read(&mut self, commit: Option<u64>) -> Result<()> {
+        while let Some(i) = self.unverified.iter().position(|f| read_past(f, commit)) {
+            let f = self.unverified.remove(i);
+            let held = scalar(
+                &self.conn,
+                &format!(
+                    "SELECT TO_CHAR(COUNT(*)) FROM v$log l JOIN v$logfile m ON m.group# = l.group# \
+                      WHERE m.member = {} AND l.thread# = {} AND l.sequence# = {}",
+                    lit(&f.name),
+                    f.thread,
+                    f.sequence
+                ),
+            )?;
+            if held.as_deref() == Some("0") {
+                return Err(LogSetFault::Reused {
+                    name: f.name,
+                    sequence: f.sequence,
+                }
+                .into());
+            }
+        }
+        Ok(())
     }
 
     fn save_frontier(&mut self) -> Result<()> {
@@ -1147,16 +1196,22 @@ impl OracleChangeStream {
     }
 }
 
-/// Add the files covering `[from.low_water, frontier]`, start LogMiner, and open the contents query.
+/// Add the files covering `[from.low_water, frontier]`, start LogMiner, and open the contents
+/// query; also the planned files that are online members (reusable while read).
 fn start_mining(
     conn: &Connection,
     identity: &OraIdentity,
     tables: &[Captured],
     from: Scns,
     frontier: Scns,
-) -> Result<Cursor> {
+) -> Result<(Cursor, Vec<LogFile>)> {
     let (archived, online) = list_logs(conn, &identity.resetlogs)?;
     let files = plan_logs(&archived, &online, from.low_water, frontier.commit_scn)?;
+    let reusable: Vec<LogFile> = files
+        .iter()
+        .filter(|f| online.contains(f))
+        .cloned()
+        .collect();
     let adds: String = files
         .iter()
         .enumerate()
@@ -1183,13 +1238,15 @@ fn start_mining(
         "SELECT TO_CHAR(COUNT(*)) FROM v$logmnr_logs WHERE status = 4",
     )?;
     if missing.as_deref() != Some("0") {
-        return Err(MissingRegisteredLog(from.low_water, frontier.commit_scn).into());
+        return Err(LogSetFault::Hole(from.low_water, frontier.commit_scn).into());
     }
-    conn.query(
-        &contents_sql(tables, &identity.con_name, from.commit_scn),
-        &[],
-    )
-    .ora()
+    let cursor = conn
+        .query(
+            &contents_sql(tables, &identity.con_name, from.commit_scn),
+            &[],
+        )
+        .ora()?;
+    Ok((cursor, reusable))
 }
 
 /// Whether a mined DDL statement removes rows without redo per row: `TRUNCATE …` or `ALTER … TRUNCATE [SUB]PARTITION`.
@@ -1456,15 +1513,23 @@ mod tests {
         }
     }
 
-    /// A hole LogMiner found in the registered list re-plans too; rivet's other verdicts do not.
+    /// A hole or a reused online file re-plans too, each naming itself when it stays; rivet's other verdicts do not.
     #[test]
     fn a_hole_in_the_registered_list_is_re_planned_and_still_says_lost_when_it_stays() {
-        let hole = anyhow::Error::from(MissingRegisteredLog(10, 20));
+        let hole = anyhow::Error::from(LogSetFault::Hole(10, 20));
         assert!(re_plannable(&hole));
         assert!(
             format!("{:#}", log_set_changed_error(hole))
                 .starts_with("oracle cdc: LogMiner reports a missing log file inside SCN 10..20")
         );
+        let reused = anyhow::Error::from(LogSetFault::Reused {
+            name: "/redo01.log".into(),
+            sequence: 7,
+        });
+        assert!(re_plannable(&reused));
+        assert!(format!("{:#}", log_set_changed_error(reused)).starts_with(
+            "oracle cdc: the online redo log /redo01.log was reused while LogMiner read sequence 7"
+        ));
         assert!(re_plannable(&anyhow::anyhow!(
             "oracle: ORA-01368: Redo log file header mismatch"
         )));
@@ -1474,6 +1539,23 @@ mod tests {
         assert!(!re_plannable(&anyhow::anyhow!(
             "oracle cdc: redo sequence 7 of thread 1 is missing — LOST"
         )));
+    }
+
+    /// An online file is proven whole only once a queued group lies past its end, or the window is drained.
+    #[test]
+    fn an_online_read_is_proven_once_the_stream_is_past_the_file() {
+        let closed = log("/redo01.log", 7, 100, 200);
+        let current = log("/redo02.log", 8, 200, u64::MAX);
+        for (f, commit, want) in [
+            (&closed, Some(199), false),
+            (&closed, Some(200), true),
+            (&closed, Some(201), true),
+            (&closed, None, true),
+            (&current, Some(u64::MAX - 1), false),
+            (&current, None, true),
+        ] {
+            assert_eq!(read_past(f, commit), want, "{} at {commit:?}", f.name);
+        }
     }
 
     /// One stream spends exactly five re-plans on a log that keeps changing, then fails naming it.
