@@ -301,6 +301,29 @@ fn mongo_cdc_mixed_transaction_ending_on_uncaptured_table() {
     );
 }
 
+/// A standalone server (no change streams) under `initial: snapshot` is refused before the anchor and the snapshot leg write anything.
+#[test]
+#[ignore = "live: requires docker compose up -d mongo"]
+fn mongo_cdc_initial_snapshot_on_a_standalone_is_refused_before_any_write() {
+    require_alive(LiveService::Mongo);
+    let db = unique_name("cdc_standalone");
+    let m = MongoTest::connect(27017, &db);
+    let _g = MongoDbGuard {
+        port: 27017,
+        db: db.clone(),
+    };
+    m.upsert_set("t", 1, "v", "a");
+    let d = tempfile::tempdir().unwrap();
+    let (ckpt, out) = (d.path().join("cdc.ckpt"), d.path().join("out"));
+    Rig::mongo_cdc("t")
+        .source_url(&MongoTest::url(27017, &db))
+        .cdc("initial: snapshot")
+        .checkpoint_path(ckpt.clone())
+        .dest_path(out.clone())
+        .run_expect_fail();
+    assert_refused_before_any_write(&out, &ckpt);
+}
+
 #[test]
 #[ignore = "live: requires docker compose up -d mongo-rs"]
 fn roast_corrupt_checkpoint_fails_loudly_not_silent_reanchor() {

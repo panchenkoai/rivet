@@ -767,6 +767,23 @@ fn oracle_cdc_table_without_all_column_logging_is_refused() {
     );
 }
 
+/// Under `initial: snapshot` the logging refusal comes before the anchor and the snapshot leg write anything.
+#[test]
+#[ignore = "live: requires the oracle service with LogMiner prerequisites"]
+fn oracle_cdc_initial_snapshot_is_refused_before_any_write() {
+    let _serial = cross_process_serial("oracle_cdc");
+    let d = tempfile::tempdir().unwrap();
+    let t = OracleTable::create("ora_csnaplog", "id NUMBER(18) PRIMARY KEY, v NUMBER(18)");
+    ora_exec(&format!("GRANT SELECT ON {} TO c##rivetcdc", t.name()));
+    ora_exec(&format!("INSERT INTO {} VALUES (1, 1)", t.name()));
+    let (ckpt, out) = (d.path().join("cdc.ckpt"), d.path().join("out"));
+    let err = rig(&t, &ckpt, &out)
+        .cdc("initial: snapshot")
+        .run_expect_fail();
+    assert!(err.contains("[RIVET_SOURCE_CDC_PREREQUISITE]"), "{err}");
+    assert_refused_before_any_write(&out, &ckpt);
+}
+
 #[test]
 #[ignore = "live: requires the oracle service with LogMiner prerequisites"]
 fn oracle_cdc_a_lob_column_is_refused_by_name() {

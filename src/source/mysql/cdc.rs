@@ -365,6 +365,19 @@ impl MysqlChangeStream {
         Ok(())
     }
 
+    /// The open's refusals (row metadata, compression, replica re-log, routing), asked before any anchor or snapshot part is written.
+    pub(crate) fn refuse_unmet_prerequisites(
+        url: &str,
+        tls: Option<&TlsConfig>,
+        configured_tables: &[String],
+    ) -> Result<()> {
+        let mut conn = connect_conn(url, tls)?;
+        Self::refuse_nameless_binlog(&mut conn)?;
+        refuse_compressed_binlog(&mut conn)?;
+        refuse_replica_without_relog(&mut conn)?;
+        Self::check_configured_tables_are_routable(&mut conn, configured_tables)
+    }
+
     /// The binlog row-image verdict, asked on a connection the caller holds.
     fn row_image_on(conn: &mut mysql::Conn) -> super::super::cdc::RowImage {
         use mysql::prelude::Queryable;
