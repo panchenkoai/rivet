@@ -714,7 +714,9 @@ fn seed_dense_wide_for_split(eng: Eng, rows: i64) -> (String, StandCleanup) {
 /// One width for every split fixture. Named rather than repeated so widening it
 /// again (if a future runner still lands under R=3.0) is one edit, and so a
 /// reader can see the dense and gappy fixtures are deliberately the same shape.
-const SPLIT_PAD_BYTES: usize = 200;
+/// 200 -> 600 (2026-10-02): the gate measured MSSQL at ratio 2.64-2.69 (sibling ~310 ms);
+/// at 600 the three MSSQL split cells measured 5.04-11.74 over three runs (200: 3.03-5.97).
+const SPLIT_PAD_BYTES: usize = 600;
 
 /// `seed_dense` with a `pad` column of `pad_bytes` characters.
 ///

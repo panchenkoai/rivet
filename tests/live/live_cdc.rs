@@ -6558,6 +6558,62 @@ fn mysql_cdc_refuses_minimal_row_metadata_at_open() {
     );
 }
 
+/// Under `initial: snapshot` the MINIMAL refusal comes before the anchor and the snapshot leg write anything.
+#[test]
+#[ignore = "live: requires docker compose up -d mysql (:3306, log_bin=ON)"]
+fn mysql_cdc_initial_snapshot_is_refused_before_any_write() {
+    let _serial = quiet_window_guard(); // :3306 GLOBAL flip — same lock as governor
+    let (root_url, mut c, t) = row_metadata_fixture("rivet_cdc_minsnap");
+    let _meta = RowMetadata::set(&root_url, "MINIMAL");
+    c.query_drop(format!("INSERT INTO {} VALUES (1,'AAA','BBB')", t.1))
+        .unwrap();
+    let d = tempfile::tempdir().unwrap();
+    let (ckpt, out) = (d.path().join("cdc.ckpt"), d.path().join("out"));
+    let err = Rig::mysql_cdc(&t.1)
+        .source_url(&root_url)
+        .cdc("initial: snapshot")
+        .checkpoint_path(ckpt.clone())
+        .dest_path(out.clone())
+        .run_expect_fail();
+    assert!(err.contains("[RIVET_SOURCE_CDC_PREREQUISITE]"), "{err}");
+    assert_refused_before_any_write(&out, &ckpt);
+}
+
+/// A PostgreSQL routing refusal under `initial: snapshot` comes before the slot and the snapshot leg.
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn pg_cdc_initial_snapshot_is_refused_before_any_write() {
+    let cdc_db = CdcDb::new("cdc_refsnap");
+    let slot = unique_name("rivet_refsnap_slot");
+    let _slot = Slot::new(slot.clone());
+    let name = unique_name("rivet_cdc_refsnap").to_lowercase();
+    let mut c = cdc_db.connect();
+    c.batch_execute(&format!(
+        "CREATE TABLE {name}_base (id BIGINT PRIMARY KEY, v INT); \
+         INSERT INTO {name}_base VALUES (1,10),(2,20); \
+         CREATE VIEW {name} AS SELECT id, v FROM {name}_base"
+    ))
+    .unwrap();
+    let d = tempfile::tempdir().unwrap();
+    let (ckpt, out) = (d.path().join("cdc.ckpt"), d.path().join("out"));
+    let err = Rig::pg_cdc(&name, &slot)
+        .source_url(cdc_db.url())
+        .cdc("initial: snapshot")
+        .checkpoint_path(ckpt.clone())
+        .dest_path(out.clone())
+        .run_expect_fail();
+    assert!(err.contains("is a VIEW"), "{err}");
+    assert_refused_before_any_write(&out, &ckpt);
+    let slot_exists: bool = c
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
+            &[&slot],
+        )
+        .unwrap()
+        .get(0);
+    assert!(!slot_exists, "a refused run must create no slot");
+}
+
 /// ...and under the FULL the stack pins, a reorder across the resume boundary maps BY NAME.
 #[test]
 #[ignore = "live: requires docker compose mysql-cdc"]

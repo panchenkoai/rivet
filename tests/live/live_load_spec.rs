@@ -639,12 +639,13 @@ fn temporal_pg_table(prefix: &str, n: i64) -> (String, Box<dyn std::any::Any>) {
     (table, guard)
 }
 
+/// Rows over the five days before today, so a declared partition expiry never drops them.
 fn add_temporal_rows(table: &str, from: i64, to: i64) {
     SqlEngine::Pg.exec(&format!(
         "INSERT INTO {table} (id, ts, dt, d, n, v) SELECT g, \
-         TIMESTAMPTZ '2026-09-01 10:00:00+00' + (g % 5) * INTERVAL '1 day', \
-         TIMESTAMP '2026-09-01 10:00:00' + (g % 5) * INTERVAL '1 day', \
-         DATE '2026-09-01' + (g % 5)::int, g * 7, 'v' || g FROM generate_series({from}, {to}) g"
+         date_trunc('day', now()) - INTERVAL '5 days 14 hours' + (g % 5) * INTERVAL '1 day', \
+         date_trunc('day', now() AT TIME ZONE 'UTC') - INTERVAL '5 days 14 hours' + (g % 5) * INTERVAL '1 day', \
+         CURRENT_DATE - 5 + (g % 5)::int, g * 7, 'v' || g FROM generate_series({from}, {to}) g"
     ));
 }
 

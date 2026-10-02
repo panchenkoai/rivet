@@ -820,13 +820,7 @@ impl OracleChangeStream {
             conn.execute(sql, &[]).ora()?;
         }
         let (_, con_name, con_dbid) = container(&conn)?;
-        let captured = resolve_tables(&conn, tables)?;
-        if let Some(why) = logging_check(&conn, &captured)? {
-            crate::rivet_bail!(
-                crate::error::codes::SOURCE_CDC_PREREQUISITE,
-                "oracle cdc: {why}"
-            );
-        }
+        let captured = vetted_tables(&conn, tables)?;
         let low_water = low_water_here(&conn)?;
         let identity = root_identity(&conn, con_name, con_dbid)?;
         let frontier = pin_frontier(&conn, low_water)?;
@@ -1259,6 +1253,29 @@ pub(crate) fn checkpoint_problem(pos: &Position, path: &str) -> Option<String> {
 }
 
 /// Anchor a first run: persist the open-time frontier so an idle first run still has a start.
+/// The configured tables resolved and vetted, refused unless every one is logged with ALL columns.
+fn vetted_tables(conn: &Connection, tables: &[String]) -> Result<Vec<Captured>> {
+    let captured = resolve_tables(conn, tables)?;
+    if let Some(why) = logging_check(conn, &captured)? {
+        crate::rivet_bail!(
+            crate::error::codes::SOURCE_CDC_PREREQUISITE,
+            "oracle cdc: {why}"
+        );
+    }
+    Ok(captured)
+}
+
+/// The open's refusals (container, table vetting, supplemental logging), asked before any anchor or snapshot part is written.
+pub(crate) fn refuse_unmet_prerequisites(
+    url: &str,
+    tls: Option<&TlsConfig>,
+    tables: &[String],
+) -> Result<()> {
+    let conn = connect(url, tls)?;
+    container(&conn)?;
+    vetted_tables(&conn, tables).map(|_| ())
+}
+
 pub(crate) fn pin_checkpoint_at_current(
     url: &str,
     tls: Option<&TlsConfig>,

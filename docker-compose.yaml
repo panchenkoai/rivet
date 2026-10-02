@@ -630,8 +630,8 @@ services:
       postgres:
         condition: service_healthy
     healthcheck:
-      # edoburu image does not bundle pg_isready; use a raw TCP connect.
-      test: ["CMD-SHELL", "(echo > /dev/tcp/127.0.0.1/6432) >/dev/null 2>&1 || exit 1"]
+      # The image's /bin/sh is busybox, which has no /dev/tcp; it ships pg_isready.
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-p", "6432"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -655,7 +655,7 @@ services:
       postgres-state:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "(echo > /dev/tcp/127.0.0.1/6433) >/dev/null 2>&1 || exit 1"]
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-p", "6433"]
       interval: 5s
       timeout: 3s
       retries: 10

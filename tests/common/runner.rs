@@ -199,6 +199,33 @@ pub fn files_with_extension(dir: &std::path::Path, ext: &str) -> Vec<std::path::
         .collect()
 }
 
+/// Every file under `dir`, at any depth (empty when `dir` does not exist).
+pub fn files_under(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return vec![];
+    };
+    rd.filter_map(Result::ok)
+        .flat_map(|e| {
+            let p = e.path();
+            if p.is_dir() { files_under(&p) } else { vec![p] }
+        })
+        .collect()
+}
+
+/// A refused CDC run with `initial: snapshot` wrote nothing: no part, no manifest, no marker, no checkpoint.
+pub fn assert_refused_before_any_write(out: &std::path::Path, ckpt: &std::path::Path) {
+    let written = files_under(out);
+    assert!(
+        written.is_empty(),
+        "a refused run must write no snapshot part, manifest or marker: {written:?}"
+    );
+    assert!(
+        !ckpt.exists(),
+        "a refused run must write no checkpoint: {}",
+        ckpt.display()
+    );
+}
+
 /// Like [`run_rivet_bounded`], but for arbitrary CLI args (e.g. the `rivet cdc`
 /// NDJSON driver) with stdout captured — `Some(stdout)` on clean exit within
 /// the ceiling, `None` if it had to be killed (the caller asserts on that).

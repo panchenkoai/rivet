@@ -36,13 +36,15 @@ retries = 0
 # did not happen). The 300s x 4 = 1200s ceiling held with >=330s to spare;
 # 300s still WARNS early, and 4 periods kills a true hang at 20 minutes.
 [[profile.default.overrides]]
-filter = 'test(/same_named_configs_share_a_postgres_state_cdc_cycle$/) or test(/same_named_configs_share_a_postgres_state_batch_cycle$/) or test(/a_cdc_baseline_over_a_wide_history_lands_in_the_base_in_batches$/) or test(/a_wide_history_read_by_keyset_loads_daily_partitions_in_batches$/) or test(/base_and_buffer_cycle_run_load_compact_keeps_deletes_as_flags$/) or test(/^live_cdc_full_cycle::/) or test(/bigquery_hourly_partitions_over_the_job_cap_load_in_budgeted_batches$/) or test(/^live_cdc_multi_table_cycle::/) or test(/^live_pool_ledger::/)'
+filter = 'test(/same_named_configs_share_a_postgres_state_cdc_cycle$/) or test(/same_named_configs_share_a_postgres_state_batch_cycle$/) or test(/a_cdc_baseline_over_a_wide_history_lands_in_the_base_in_batches$/) or test(/a_wide_history_read_by_keyset_loads_daily_partitions_in_batches$/) or test(/base_and_buffer_cycle_run_load_compact_keeps_deletes_as_flags$/) or test(/^live_cdc_full_cycle::/) or test(/bigquery_hourly_partitions_over_the_job_cap_load_in_budgeted_batches$/) or test(/^live_cdc_multi_table_cycle::/) or test(/^live_pool_ledger::/) or test(/^live_cdc_backfill::repeated_runs_of_one_config_append_only_the_delta_to_the_changelog$/) or test(/^live_load_spec::bigquery_changelog_follows_a_written_cluster_by_and_repartitions_only_on_rebuild$/) or test(/^live_load_spec::bigquery_range_and_load_time_partitions_land_as_declared$/)'
 slow-timeout = { period = "300s", terminate-after = 4 }
 # The full CDC cycles measured 153-184 s on their own and grade BigQuery after every
 # load and compact (about 8.6 s per read, 2026-10-01); the hourly-partition cell ran past
 # 240 s even with the warehouse leg off. Both run with BIGQUERY_TEST_PROJECT set. The
 # multi-table cycles and the pooled loads grade every loaded export (13-17 s per BigQuery
 # read under the full suite, 2026-10-01): nine and sixteen reads pass 240 s.
+# The three BigQuery cells added 2026-10-02 passed 240 s only by the oracle's BigQuery reads
+# (14-36 s each; the range/load-time cell alone grades four tables).
 
 # The SQL Server CDC cells queue on one cross-process lock (`cross_process_serial("mssql_cdc")`),
 # so a cell's clock includes its wait. The rig oracle images the source before every CDC run
@@ -58,6 +60,11 @@ slow-timeout = { period = "120s", terminate-after = 4 }
 # suites (2026-10-01), so the pair gets 300 s x 4.
 [test-groups]
 oracle = { max-threads = 4 }
+# The tests that take `toxiproxy_guard()` (one cross-process flock): queued in nextest, not on the
+# flock, so the wait is not counted against a test's timeout. `live_pool_ledger` holds it 185-408 s,
+# and three users were killed at 240 s while still waiting (2026-10-02 gate). The list is checked
+# against the tests that call the guard by tests/offline/nextest_groups_guard.rs.
+toxiproxy = { max-threads = 1 }
 
 [[profile.default.overrides]]
 filter = 'test(/^live_oracle::every_seeded_oracle_table_exports_every_row$/) or test(/^live_oracle::wide_clob_rows_stay_within_the_memory_budget$/)'
@@ -67,6 +74,10 @@ slow-timeout = { period = "300s", terminate-after = 4 }
 [[profile.default.overrides]]
 filter = 'test(/^live_oracle::/)'
 test-group = 'oracle'
+
+[[profile.default.overrides]]
+filter = 'test(=gremlin_cdc::gremlin_cdc_binlog_cut_mid_drain_fails_loud_then_recovers) or test(=gremlin_cdc::gremlin_cdc_gcs_upload_cut_fails_loud_then_recovers_without_clobber) or test(=live_chaos::high_latency_does_not_cause_false_positive_transient_classification) or test(=live_chaos::chunked_export_completes_through_temporary_proxy_disable) or test(=live_mongo_retry_and_faults::mongo_export_survives_transient_latency_added_via_toxiproxy) or test(=live_mongo_retry_and_faults::mongo_export_recovers_after_mid_stream_proxy_disable_then_enable_with_retries) or test(=live_mongo_retry_and_faults::mongo_export_fails_cleanly_when_proxy_is_disabled_before_run) or test(=live_mysql_retry_and_faults::mysql_clean_via_toxi_works_as_a_baseline_and_exports_successfully) or test(=live_mysql_retry_and_faults::mysql_export_survives_transient_latency_added_via_toxiproxy) or test(=live_mysql_retry_and_faults::mysql_export_fails_cleanly_when_toxiproxy_is_disabled_before_run) or test(=live_mysql_retry_and_faults::mysql_export_recovers_after_mid_stream_proxy_disable_then_enable_with_retries) or test(=live_pool_ledger::a_pooled_load_through_a_throttled_ledger_loses_no_table) or test(=live_pool_ledger::a_ledger_cut_mid_load_fails_loudly_and_the_next_run_finishes_the_job) or test(=live_pool_toxiproxy::pool_apply_through_a_bandwidth_capped_link_is_exact_and_grades_itself) or test(=live_pool_toxiproxy::pool_apply_resume_skips_complete_exports_and_loses_nothing) or test(=live_pool_toxiproxy::pool_apply_two_heavy_exports_both_complete) or test(=live_retry_and_faults::clean_postgres_via_toxi_works_as_a_baseline_and_exports_successfully) or test(=live_retry_and_faults::export_survives_transient_latency_added_via_toxiproxy) or test(=live_retry_and_faults::export_fails_cleanly_when_toxiproxy_is_disabled_before_run) or test(=live_retry_and_faults::export_recovers_after_mid_stream_proxy_disable_then_enable_with_retries) or test(=live_state_backend::a_state_ledger_lost_mid_run_fails_loudly_and_the_next_run_delivers_every_row_once)'
+test-group = 'toxiproxy'
 
 [profile.ci]
 # CI tolerates a single flaky retry and reports every failure (no early bail),

@@ -75,6 +75,7 @@ from ..pytools.ab_regression import (
 from ..pytools.field_replay import (
     FLIP as _FR_FLIP,
     LEG_PLAN as _FR_LEG_PLAN,
+    leg_tags as _fr_leg_tags,
     LEG_TIMEOUT as _FR_LEG_TIMEOUT,
     RESTORE_WORST_CASE as _FR_CLEANUP_WORST_CASE,
     STAND_FLIPPED_MARKER as _FR_FLIPPED,
@@ -1083,7 +1084,7 @@ def verify_previous_release_differential(led: Ledger) -> None:
 #
 #   1 the OLD binary must shed at least once     (the fixture is live)
 #   2 the NEW binary sheds zero on an idle source (the symptom is gone)
-#   3 new makespan <= old * 1.05                  (the fix costs nothing)
+#   3 median new makespan <= median old * 1.05    (the fix costs nothing; 3 legs each)
 #   4 identical rows per export                   (it delivers the same data)
 #
 # Each becomes its own ledger row, because "field replay FAILED" as a single
@@ -1613,8 +1614,7 @@ def _self_test() -> int:
                 "backed_off": shed, "recovered": 0, "rows": rows, "stderr_tail": []}
 
     runs = {}
-    for side, adaptive in _FR_LEG_PLAN:
-        tag = f"{side}-{'on' if adaptive else 'off'}"
+    for side, adaptive, tag in _fr_leg_tags():
         runs[tag] = _leg(tag, 300, 3 if tag == "old-on" else 0)
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):

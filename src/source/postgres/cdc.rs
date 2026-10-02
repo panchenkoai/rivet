@@ -576,6 +576,16 @@ impl PgChangeStream {
         Ok(())
     }
 
+    /// The routing refusals, asked before any slot or snapshot part is written.
+    pub(crate) fn refuse_unroutable_tables(
+        conn_str: &str,
+        tls: Option<&TlsConfig>,
+        configured_tables: &[String],
+    ) -> Result<()> {
+        let mut client = super::connect_client_raw(conn_str, tls)?;
+        Self::check_configured_tables_are_routable(&mut client, configured_tables, false)
+    }
+
     // Eight positional arguments, and a struct would not improve it: every one is
     // a distinct decision the caller must make consciously (which slot, whether a
     // resume is expected, the peek budget, the drain bound, what may be routed,

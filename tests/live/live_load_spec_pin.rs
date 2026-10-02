@@ -47,12 +47,12 @@ fn a_load_is_typed_from_its_own_run_not_from_the_last_writer_of_its_name() {
     let rig_my = my
         .rig(&t_my)
         .export_named("users")
-        .dest_gcs_live(&bq.bucket, &format!("{}my/", bq.prefix))
+        .dest_gcs_live(&bq.bucket, &format!("{}/my", bq.prefix))
         .top_line(&bq.load_line(""));
     let rig_pg = pg
         .rig(&t_pg)
         .export_named("users")
-        .dest_gcs_live(&bq.bucket, &format!("{}pg/", bq.prefix))
+        .dest_gcs_live(&bq.bucket, &format!("{}/pg", bq.prefix))
         .top_line(&bq.load_line(""));
 
     // A runs, then B runs: B's spec is now the by-name row for `users`.

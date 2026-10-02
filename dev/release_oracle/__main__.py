@@ -564,6 +564,7 @@ def preflight(led: Ledger, *, bless_gifs: bool = False) -> None:
     # so it belongs with the file-level guards rather than after twenty
     # minutes of bring-up.
     blessed_flow.verify_flag_surface(led)
+    blessed_flow.verify_run_strict(led)
     # The instructional GIFs are documentation that can go stale silently — they
     # are binary assets, so no test reads them and no diff flags them. Placed
     # among the cheap file-level guards, before anything spends twenty minutes on

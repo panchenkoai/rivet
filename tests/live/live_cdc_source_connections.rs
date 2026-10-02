@@ -13,6 +13,9 @@
 
 use crate::common::*;
 
+/// Every run here is measured, and the default oracle's own read of the source would be counted with it.
+const COUNTED: &str = "the test counts source connections; the oracle's own read would be counted";
+
 /// True (and a skip is recorded) unless the stand is ours alone for this test.
 fn not_exclusive() -> bool {
     let shared = std::env::var("RIVET_TEST_EXCLUSIVE").is_err();
@@ -54,7 +57,7 @@ fn a_postgres_cdc_run_opens_at_most_two_source_connections() {
     ))
     .unwrap();
     let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
-    let rig = Rig::pg_cdc(&tbl, &slot);
+    let rig = Rig::pg_cdc(&tbl, &slot).no_oracle(COUNTED);
     rig.run_ok();
     c.execute(&format!("INSERT INTO {tbl} VALUES (1, 10)"), &[])
         .unwrap();
@@ -98,7 +101,7 @@ fn a_mysql_cdc_run_opens_at_most_two_source_connections() {
     c.query_drop(format!("CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"))
         .unwrap();
     let _tbl = MysqlCdcTable(tbl.clone());
-    let rig = Rig::mysql_cdc(&tbl);
+    let rig = Rig::mysql_cdc(&tbl).no_oracle(COUNTED);
     rig.run_ok();
     c.query_drop(format!("INSERT INTO {tbl} VALUES (1, 10)"))
         .unwrap();
@@ -145,7 +148,7 @@ fn a_sql_server_cdc_run_opens_at_most_two_source_connections() {
         table: table.clone(),
         ci: ci.clone(),
     };
-    let rig = Rig::mssql_cdc(&table, &ci);
+    let rig = Rig::mssql_cdc(&table, &ci).no_oracle(COUNTED);
     rig.run_ok();
     mssql_cdc_exec(&format!("INSERT INTO dbo.{table} VALUES (1, 10)"));
     wait_for_capture(&ci, 1);
@@ -181,10 +184,11 @@ const KEYSET: &[&str] = &["chunk_by_key: id", "chunk_checkpoint: true"];
 fn batch_run_opens(engine: SqlEngine, lines: &[&str]) -> i64 {
     let (t, _guard) = engine.create("rivet_batch_conns", "id INT PRIMARY KEY, v INT");
     engine.exec(&format!("INSERT INTO {t} VALUES (1, 10), (2, 20)"));
+    let rig = engine.rig(&t).no_oracle(COUNTED);
     let rig = if lines.is_empty() {
-        engine.rig(&t)
+        rig
     } else {
-        engine.rig(&t).restage("chunked", lines)
+        rig.restage("chunked", lines)
     };
     rig.run_ok();
     match engine {
