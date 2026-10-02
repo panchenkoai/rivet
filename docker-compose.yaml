@@ -837,7 +837,8 @@ services:
     ports:
       - "27022:27017"
     healthcheck:
-      test: ["CMD-SHELL", "mongosh --quiet --eval 'var st; try{st=rs.status()}catch(e){st={ok:0}}; if(!st.ok){try{rs.initiate({_id:\"rs2\",members:[{_id:0,host:\"mongo-rs2-a:27017\",priority:1},{_id:1,host:\"mongo-rs2-b:27017\",priority:0}]})}catch(e){}}; db.isMaster().ismaster?quit(0):quit(1)'"]
+      # `mongo` is the 4.4 fallback (no mongosh there), as on mongo-rs.
+      test: ["CMD-SHELL", "mongosh --quiet --eval 'var st; try{st=rs.status()}catch(e){st={ok:0}}; if(!st.ok){try{rs.initiate({_id:\"rs2\",members:[{_id:0,host:\"mongo-rs2-a:27017\",priority:1},{_id:1,host:\"mongo-rs2-b:27017\",priority:0}]})}catch(e){}}; db.isMaster().ismaster?quit(0):quit(1)' || mongo --quiet --eval 'var st; try{st=rs.status()}catch(e){st={ok:0}}; if(!st.ok){try{rs.initiate({_id:\"rs2\",members:[{_id:0,host:\"mongo-rs2-a:27017\",priority:1},{_id:1,host:\"mongo-rs2-b:27017\",priority:0}]})}catch(e){}}; db.isMaster().ismaster?quit(0):quit(1)'"]
       interval: 5s
       timeout: 5s
       retries: 30
@@ -850,7 +851,7 @@ services:
     ports:
       - "27023:27017"
     healthcheck:
-      test: ["CMD-SHELL", "mongosh --quiet --eval 'db.isMaster().secondary?quit(0):quit(1)'"]
+      test: ["CMD-SHELL", "mongosh --quiet --eval 'db.isMaster().secondary?quit(0):quit(1)' || mongo --quiet --eval 'db.isMaster().secondary?quit(0):quit(1)'"]
       interval: 5s
       timeout: 5s
       retries: 30

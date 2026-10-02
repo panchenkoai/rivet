@@ -29,7 +29,7 @@ jobs:
   live-full:
     name: Full live suite (incl. content_load)
     # Heavier than the per-PR `e2e` job — give it more time.
-    timeout-minutes: 60
+    timeout-minutes: 120
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -62,6 +62,21 @@ jobs:
           # uv runs the rig's default oracle (dev/release_oracle/rig_oracle.py, pinned by uv.lock).
           tool: cargo-nextest,uv
 
+      - name: Build release (rivet + seed + every test binary), before the stack starts
+        # `--bin seed` builds the auxiliary src/bin/seed.rs target on top of
+        # the default `rivet` binary so the heavy content_items fixture can
+        # be populated without `cargo run`'s rebuild overhead. The seed bin is
+        # gated behind the off-by-default `dev-seed` feature (so `cargo install`
+        # never ships the destructive TRUNCATE tool), hence `--features dev-seed`.
+        # The fat-LTO test link runs HERE, before ~20 containers take the runner's
+        # memory: compiled with the stack up, the runner died mid-link with exit 143
+        # ("The runner has received a shutdown signal") on 2026-09-29..10-02.
+        # nextest reuses these artifacts (same profile, same features).
+        run: |
+          cargo build --release --bin rivet --bin seed --features dev-seed
+          cargo test --release --no-run
+          free -m
+
       - name: Start services
         # `proxysql` lives in the same `pool` docker-compose profile as
         # `pgbouncer` and is required by tests/live_pool_safety.rs MySQL
@@ -87,10 +102,6 @@ jobs:
         run: |
           echo "Waiting for Postgres..."
           for i in $(seq 1 30); do docker compose exec -T postgres pg_isready -U rivet && break || sleep 2; done
-          echo "Waiting for MongoDB (standalone + replica set)..."
-          for i in $(seq 1 40); do docker compose exec -T mongo mongosh --quiet --eval 'db.runCommand({ping:1})' >/dev/null 2>&1 && break || sleep 2; done
-          # rs.status().ok is 1 only once the healthcheck has run rs.initiate.
-          for i in $(seq 1 40); do docker compose exec -T mongo-rs mongosh --quiet --eval 'rs.status().ok' 2>/dev/null | grep -q 1 && break || sleep 2; done
           echo "Waiting for MySQL..."
           for i in $(seq 1 30); do docker compose exec -T mysql mysqladmin ping -h localhost -uroot -privet 2>/dev/null && break || sleep 2; done
           echo "Waiting for pgBouncer..."
@@ -132,14 +143,6 @@ jobs:
           for i in $(seq 1 40); do docker compose exec -T mssql-governor /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'Rivet_Passw0rd!' -C -Q 'SELECT 1' >/dev/null 2>&1 && break || sleep 2; done
           docker compose exec -T mssql-governor /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'Rivet_Passw0rd!' -C -Q "IF DB_ID('rivet') IS NULL CREATE DATABASE rivet;"
 
-      - name: Build release (rivet + seed)
-        # `--bin seed` builds the auxiliary src/bin/seed.rs target on top of
-        # the default `rivet` binary so the heavy content_items fixture can
-        # be populated without `cargo run`'s rebuild overhead. The seed bin is
-        # gated behind the off-by-default `dev-seed` feature (so `cargo install`
-        # never ships the destructive TRUNCATE tool), hence `--features dev-seed`.
-        run: cargo build --release --bin rivet --bin seed --features dev-seed
-
       - name: Seed light fixtures (orders, etc.)
         run: |
           PGPASSWORD=rivet psql -h localhost -U rivet -d rivet -f dev/e2e/seed_pg.sql
@@ -176,7 +179,9 @@ jobs:
             --content-items 60000
 
       - name: Disk snapshot — post-build
-        run: df -h /
+        run: |
+          df -h /
+          free -m
 
       - name: Independent row-hash oracle deps
         # `xxhash` is what makes the row-hash check INDEPENDENT: it rebuilds the
@@ -223,8 +228,16 @@ jobs:
           # GONE under the default libtest harness — and getrusage(RUSAGE_
           # CHILDREN) claims (soak_spill's RSS ceiling) are unattributable when
           # sibling tests share one process (harness audit, 2026-08-29).
-          cargo nextest run --release --run-ignored ignored-only \
-            -E 'not (test(full_content_export_max_pressure) or test(validates) or test(edge_cases) or test(via_duckdb) or test(mongo) or test(warehouse_cell))'
+          # The second skip line is ci.yml e2e's list, for the same reasons: topologies
+          # this runner cannot hold (SQL Server AG, PG 16 standby pair, the LATIN1 Oracle
+          # PDB), cells that need a real BigQuery, and the read-blocked quarantine. The
+          # release gate runs every one of them.
+          cargo nextest run --release --run-ignored ignored-only --no-fail-fast \
+            -E 'not (test(full_content_export_max_pressure) or test(validates) or test(edge_cases) or test(via_duckdb) or test(mongo) or test(warehouse_cell)
+                 or test(readable_secondary) or test(mssql_checkpoint_follows_a_failover) or test(mssql_checkpoint_from_another_database)
+                 or test(from_a_standby) or test(loads_into_bigquery_or_refuses_by_column) or test(cleanup_source_never_deletes_parts)
+                 or test(compact_after_a_source_alter) or test(a_non_unicode_database_round_trips)
+                 or test(a_read_blocked_longer_than_thirty_seconds_still_completes))'
 
       - name: Dump service logs on failure
         if: failure()
@@ -288,7 +301,9 @@ jobs:
           # silently does not: every live_cdc_mongo test died on
           # `docker inspect failed: No such object: rivet-duckdb`, red on all five
           # matrix cells for at least ten consecutive nights (2026-08-16).
-          docker compose up -d --wait mongo mongo-rs mongo-auth toxiproxy minio fake-gcs duckdb
+          # mongo-rs2-a/-b (`replica` profile): the two-member set whose SECONDARY
+          # mongo_cdc_streams_changes_from_a_secondary reads, on :27022/:27023.
+          docker compose --profile replica up -d --wait mongo mongo-rs mongo-auth mongo-rs2-a mongo-rs2-b toxiproxy minio fake-gcs duckdb
           sudo chmod -R 0777 tests/.live-tmp
 
       - name: Run Mongo live tests
@@ -299,13 +314,13 @@ jobs:
         # `stand_` would also select the mysql/mssql stand tests, whose engines
         # this slim stack does not run).
         run: |
-          cargo nextest run --release --run-ignored ignored-only \
+          cargo nextest run --release --run-ignored ignored-only --no-fail-fast \
             -E 'binary(live_suite) and (test(live_mongo) or test(live_cdc_mongo) or test(stand_dest_gcs_mongo) or test(stand_dest_s3_mongo) or test(stand_format_csv_mongo) or test(stand_compression_codecs_mongo))'
 
       - name: Dump Mongo logs on failure
         if: failure()
         run: |
-          for s in mongo mongo-rs mongo-auth; do
+          for s in mongo mongo-rs mongo-auth mongo-rs2-a mongo-rs2-b; do
             echo "::group::$s"; docker compose logs --no-color "$s" | tail -100; echo "::endgroup::"
           done
 
@@ -364,9 +379,14 @@ jobs:
           # uv runs the rig's default oracle (dev/release_oracle/rig_oracle.py, pinned by uv.lock).
           tool: cargo-nextest,uv
       - name: Start the CDC stack at the scouted tag
+        # `duckdb` is the rig's default oracle reader (rivet-duckdb); without it every
+        # graded cell failed on `No such container: rivet-duckdb` (2026-10-01..02).
         run: |
           export ${{ matrix.env }}=${{ matrix.tag }}
+          mkdir -p tests/.live-tmp
           docker compose --profile cdc up -d mysql-cdc postgres-cdc
+          docker compose up -d --wait duckdb
+          sudo chmod -R 0777 tests/.live-tmp
       - name: MySQL 5.7 is refused (no binlog_row_metadata), the expected outcome
         if: matrix.engine == 'mysql' && matrix.tag == '5.7'
         run: |
@@ -375,15 +395,13 @@ jobs:
       - name: Conformance subset
         if: matrix.engine != 'mysql' || matrix.tag != '5.7'
         run: |
-          set -o pipefail  # the default `bash -e` has none: `| tail -20` would hide a red subset
           if [ "${{ matrix.engine }}" = "mysql" ]; then
             FILTER="live_cdc::cdc_"
           else
             FILTER="live_cdc::pg_cdc_"
           fi
-          cargo nextest run --run-ignored ignored-only \
-            -E "binary(live_suite) and test($FILTER) and not (test(gcs) or test(toxiproxy))" \
-            2>&1 | tail -20
+          cargo nextest run --run-ignored ignored-only --no-fail-fast \
+            -E "binary(live_suite) and test($FILTER) and not (test(gcs) or test(toxiproxy))"
       - name: Stop services
         if: always()
         run: docker compose down -v
@@ -466,14 +484,11 @@ jobs:
       - name: Build + soak 45m
         if: steps.day.outputs.sunday == 'yes'
         run: |
-          # duckdb is NOT in Ubuntu's apt archives — install the official
-          # binary and verify it, or the soak's gap check cannot run (and it
-          # now fails loud rather than silently skipping).
-          curl -fsSL https://install.duckdb.org | sh
-          export PATH="$HOME/.duckdb/cli/latest:$PATH"
-          duckdb --version
+          # `uv run`: the soak's gap check reads through the uv-pinned duckdb package
+          # (dev/pytools/duckcli.py), never a CLI on PATH; under bare python3 it
+          # refused with "duckdb missing" on 2026-09-27.
           cargo build --release
-          python3 -m dev.pytools.cdc_soak soak 45 target/release/rivet
+          uv run python -m dev.pytools.cdc_soak soak 45 target/release/rivet
       - name: Stop services
         if: always()
         run: docker compose down -v
