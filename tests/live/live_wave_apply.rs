@@ -208,6 +208,26 @@ fn resume_skips_a_completed_export_with_a_templated_destination() {
     );
 }
 
+/// A `{date}` batch destination lands under the run's UTC day, which the default oracle resolves on its own.
+#[test]
+#[ignore = "live: postgres"]
+fn a_date_templated_destination_lands_under_the_run_day() {
+    require_alive(LiveService::Postgres);
+    let table = seed_pg_numeric_table(20);
+    let out = tempfile::tempdir().unwrap();
+    Rig::pg_batch(table.name())
+        .dest_path(out.path().join("{date}"))
+        .run_ok();
+    let day = out
+        .path()
+        .join(chrono::Utc::now().format("%Y-%m-%d").to_string());
+    assert!(
+        day.join("_SUCCESS").exists(),
+        "the export must land under {}",
+        day.display()
+    );
+}
+
 /// `rivet plan` is READ-ONLY without `--annotate-waves`: it must not write the
 /// config AT ALL — neither replace a hand-tuned `wave:` nor ADD one to a blank
 /// export. `--annotate-waves` is the only thing that writes.

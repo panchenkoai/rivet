@@ -207,7 +207,7 @@ fn a_skipped_run_on_s3_leaves_no_live_running_marker() {
     );
 
     let dir = tempfile::tempdir().unwrap();
-    minio_pull_prefix(bucket, &prefix, dir.path());
+    minio_pull_prefix(bucket, &format!("{prefix}/{export}/"), dir.path());
     let live: Vec<String> = std::fs::read_dir(dir.path())
         .unwrap()
         .filter_map(|e| e.ok())

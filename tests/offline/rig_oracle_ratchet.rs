@@ -3,8 +3,8 @@
 //! Every successful `run|load|compact --config` and `apply <config.yaml>` started
 //! through the `Rig` or a shared runner helper is graded by
 //! `dev/release_oracle/rig_oracle.py` (tests/common/verify.rs, facts from the
-//! config file); a hand-built spawn and a `Rig::spawn_args_env` child are not.
-//! Four counts may only go down:
+//! config file), and so is a `Rig::spawn_args_env` child its caller reaps with
+//! exit 0; a hand-built spawn is not. Three counts may only go down:
 //!
 //! * oracle opt-outs (`.no_oracle("<reason>")`, `run_rivet_ok_no_oracle`,
 //!   `RIVET_TEST_NO_ORACLE`) — each one is a live run no independent reader checks;
@@ -13,9 +13,7 @@
 //!   census) — the one DuckDB session belongs to the Python oracle, and these
 //!   are the calls still to migrate onto it;
 //! * hand-built `Command::new` spawns of the rivet binary in tests/live — runs
-//!   no oracle grades;
-//! * `Rig::spawn_args_env` call sites in tests/live — a live child the caller
-//!   reaps, logged as a SKIP and never graded.
+//!   no oracle grades.
 //!
 //! A count below its ceiling fails too, so every migration lowers the ceiling
 //! in the same diff and cannot be spent later as silent slack.
@@ -245,23 +243,5 @@ fn raw_rivet_invocations_in_live_tests_never_grow() {
         "raw rivet invocations in tests/live: {n}, ceiling {RAW_RIVET_CEILING}. These runs bypass \
          the default oracle; drive rivet through `Rig` or a `run_rivet*` helper, and a \
          migrated call lowers the ceiling here."
-    );
-}
-
-/// `Rig::spawn_args_env` call sites in tests/live: children the oracle never grades.
-const SPAWNED_CEILING: usize = 7;
-
-#[test]
-fn spawned_children_in_live_tests_never_grow() {
-    let n: usize = sources()
-        .iter()
-        .filter(|(rel, _)| rel.starts_with("tests/live/"))
-        .map(|(_, t)| t.matches(".spawn_args_env(").count())
-        .sum();
-    assert_eq!(
-        n, SPAWNED_CEILING,
-        "`spawn_args_env` sites in tests/live: {n}, ceiling {SPAWNED_CEILING}. A spawned child's run \
-         is not graded; wait on the run through a graded `Rig` runner instead, and a migrated site \
-         lowers the ceiling here."
     );
 }
