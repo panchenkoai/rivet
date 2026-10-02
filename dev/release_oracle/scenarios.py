@@ -1768,6 +1768,32 @@ REPLICA_CELLS = (
     ("mssql-failover-checkpoint", (1440, 1441),
      "mssql_checkpoint_follows_a_failover_to_the_secondary",
      "docker compose --profile replica up -d mssql-ag-primary mssql-ag-secondary && dev/mssql-ag/setup.sh"),
+    # MySQL's checkpoint carries the server identity: a switch from the replica to another
+    # cluster member is refused, never resumed at the old server's binlog coordinates.
+    ("mysql-failover-refused", (3308, 3309),
+     "a_failover_to_another_cluster_member_is_refused_not_resumed_at_foreign_coordinates",
+     "docker compose --profile replica up -d mysql-primary mysql-replica"),
+    # Strict known defect: following that failover by GTID is not implemented. The row passes
+    # while the run is refused and fails ("did not panic") the day rivet follows it.
+    ("mysql-failover-follow-known-defect", (3308, 3309),
+     "cdc_follows_a_failover_to_another_cluster_member_by_gtid",
+     "docker compose --profile replica up -d mysql-primary mysql-replica"),
+    # PostgreSQL: the slot lives on the server, so the standby has none. With a checkpoint
+    # that is refused; without one the gap is lost (an oracle-graded known defect); following
+    # the failover is a strict known defect.
+    ("postgres-failover-refused", (5436, 5437),
+     "a_pg_failover_to_the_standby_with_a_checkpoint_is_refused_not_resumed_on_a_new_slot",
+     "python3 -m dev.pytools.cdc_stand standby"),
+    ("postgres-failover-no-checkpoint-known-defect", (5436, 5437),
+     "a_pg_failover_to_the_standby_without_a_checkpoint_loses_the_rows_written_during_the_switch",
+     "python3 -m dev.pytools.cdc_stand standby"),
+    ("postgres-failover-follow-known-defect", (5436, 5437),
+     "pg_cdc_follows_a_failover_to_the_standby",
+     "python3 -m dev.pytools.cdc_stand standby"),
+    # MongoDB: the resume token lives in the shared oplog, so the stream follows.
+    ("mongo-failover-follows", (27022, 27023),
+     "mongo_cdc_follows_a_failover_to_another_replica_set_member",
+     "docker compose --profile replica up -d mongo-rs2-a mongo-rs2-b"),
 )
 
 

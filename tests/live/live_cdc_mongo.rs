@@ -1267,6 +1267,83 @@ fn mongo_cdc_streams_changes_from_a_secondary() {
     );
 }
 
+/// `(op, _id)` of every row in `batches`.
+fn op_doc_ids(batches: &[arrow::record_batch::RecordBatch]) -> Vec<(String, String)> {
+    use arrow::array::{Array, StringArray};
+    let mut out = Vec::new();
+    for b in batches {
+        let col = |n: &str| b.column(b.schema().index_of(n).unwrap()).clone();
+        let (op, id) = (col("__op"), col("_id"));
+        let op = op.as_any().downcast_ref::<StringArray>().unwrap();
+        let id = id.as_any().downcast_ref::<StringArray>().unwrap();
+        for i in 0..b.num_rows() {
+            out.push((op.value(i).to_string(), id.value(i).to_string()));
+        }
+    }
+    out
+}
+
+/// A capture read from a secondary, then the same config pointed at another member (the primary)
+/// after that secondary "fails": the resume token lives in the replica set's shared oplog, so the
+/// stream continues there and every change is captured exactly once, none skipped.
+#[test]
+#[ignore = "live: requires docker compose --profile replica up -d mongo-rs2-a mongo-rs2-b"]
+fn mongo_cdc_follows_a_failover_to_another_replica_set_member() {
+    for port in [27022u16, 27023] {
+        assert!(
+            std::net::TcpStream::connect_timeout(
+                &format!("127.0.0.1:{port}").parse().unwrap(),
+                std::time::Duration::from_millis(500),
+            )
+            .is_ok(),
+            "fixture: the rs2 replica set is not up on :{port}"
+        );
+    }
+    let db = unique_name("cdc_failover");
+    let primary = MongoTest::connect(27022, &db);
+    let secondary = MongoTest::connect(27023, &db);
+    primary.drop_collection("t");
+    let on_secondary = format!("{}&readPreference=secondary", MongoTest::url(27023, &db));
+    let on_primary = MongoTest::url(27022, &db);
+    let rig = Rig::mongo_cdc("t").source_url_env("RIVET_FAILOVER_URL");
+    let run_on = |url: &str| {
+        let out = rig.run_args_env(&[], &[("RIVET_FAILOVER_URL", url)]);
+        assert!(
+            out.status.success(),
+            "the run against {url} failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    let reached = |n: u64| {
+        for _ in 0..60 {
+            if secondary.count("t") == n {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        panic!("fixture: the secondary never reached {n} document(s)");
+    };
+    run_on(&on_secondary); // anchor, on the secondary
+    primary.upsert_set("t", 1, "v", "a");
+    primary.upsert_set("t", 2, "v", "b");
+    reached(2);
+    run_on(&on_secondary);
+    primary.upsert_set("t", 3, "v", "c");
+    primary.upsert_set("t", 4, "v", "d");
+    reached(4);
+    run_on(&on_primary);
+    let ids: Vec<String> = op_doc_ids(&read_all_parts(&rig.out_dir()))
+        .into_iter()
+        .map(|(_, id)| id)
+        .collect();
+    assert_eq!(
+        ids,
+        ["1", "2", "3", "4"],
+        "across the failover every change is captured exactly once, none skipped"
+    );
+    primary.drop_collection("t");
+}
+
 /// Documents `{_id: null}` and `{_id: "null"}` (with collection pre-images when asked) and a CDC rig pinned past them; None when the server has no pre-images.
 fn null_and_string_null_ids(pre_images: bool) -> Option<(MongoTest, MongoDbGuard, Rig)> {
     use mongodb::bson::{Bson, doc};

@@ -529,6 +529,22 @@ checkpoint so CDC re-anchors **first**, then re-snapshot the table with `mode: f
 in the other order, the changes between the snapshot and the new anchor land in neither.
 A checkpoint written before rivet recorded the identity resumes with a warning.
 
+**PostgreSQL — the slot does not survive a failover.** The slot is the resume position, and
+it lives on the server it was created on, so a promoted standby has none. With
+`cdc.checkpoint:` set, rivet refuses to continue there (`slot … is missing but prior-run
+evidence exists`) and writes nothing. **Without a checkpoint it creates a new slot with a
+warning, and the changes written between the failover and that run are lost** — set
+`cdc.checkpoint:` on any stream that may fail over. Following a failover (failover slots,
+PostgreSQL 17+) is not implemented.
+
+**MongoDB — the stream follows a member switch.** The resume token lives in the replica
+set's shared oplog, so pointing the same config at another member continues the stream
+with every change captured once (verified live; a primary election itself is not yet
+exercised).
+
+**Oracle — not measured.** A checkpoint from another database is refused; what a Data Guard
+failover does to it is untested.
+
 So the answer to "can I read the log from a slave?" is **yes on all four engines**, each
 verified live: MySQL (with `log_replica_updates = ON`), PostgreSQL 16+ in continuous mode,
 a SQL Server readable secondary, and a MongoDB secondary. Point `source.url` at the replica;
