@@ -1544,17 +1544,14 @@ def verify_cdc_standby(led: Ledger) -> None:
     if not have("cargo"):
         _skipped(led, "infra", "pg", "cdc-standby", "-", "cdc-standby: cargo absent", "no cargo")
         return
+    RAN_LIVE_TESTS.add(CDC_STANDBY_TEST)
     if not _tcp_open("127.0.0.1", 5436):
-        _skipped(
-            led, "infra", "pg", "cdc-standby", "-",
-            "cdc-standby: :5436 unreachable (python3 -m dev.pytools.cdc_stand standby)",
-            "standby down",
-        )
+        _replica_down(led, "cdc-standby", ":5436 unreachable", "python3 -m dev.pytools.cdc_stand standby")
         return
     _drive_live_tests(
         led, "infra", "pg", "cdc-standby",
         "CDC on a PostgreSQL standby (bounded run must fail loud, actionable)",
-        ["roast_pg_cdc_bounded_on_a_standby_fails_loud"],
+        [CDC_STANDBY_TEST],
         "cdc_standby.log",
         "CDC standby loud-fail",
     )
@@ -1678,18 +1675,17 @@ def verify_replica_read(led: Ledger) -> None:
     the no-master-access topology end to end.
 
     Needs the `replica` compose profile (mysql-primary :3308 → mysql-replica
-    :3309); SKIP when it is down.
+    :3309); FAIL when it is down unless given up by `--without-replica-topologies`.
     """
     if not have("cargo"):
         _skipped(led, "replica", "read", "-", "-", "replica read: cargo absent", "no cargo")
         return
+    # Registered up front, whatever the ports say: these rows are the verdict on their
+    # tests, so the derived live-modules cell must not run them a second time.
+    RAN_LIVE_TESTS.update([REPLICA_READ_TEST, *(test for _, _, test, _ in REPLICA_CELLS)])
     if not _tcp_open("127.0.0.1", 3309):
-        _skipped(
-            led, "replica", "read", "-", "-",
-            "replica read: no mysql-replica :3309 "
-            "(docker compose --profile replica up -d mysql-primary mysql-replica)",
-            "no replica",
-        )
+        _replica_down(led, "read", "no mysql-replica :3309",
+                      "docker compose --profile replica up -d mysql-primary mysql-replica")
         return
     led.phase(
         "Replica read (rivet captures a read-replica's re-logged binlog — "
@@ -1702,7 +1698,7 @@ def verify_replica_read(led: Ledger) -> None:
         # harness, where `--test-threads=1` was the mitigation.
         ["cargo", "nextest", "run", "--manifest-path", str(ROOT / "Cargo.toml"),
          "--test", "live_suite", "--run-ignored", "all", "--no-fail-fast",
-         "-E", "test(/cdc_reads_changes_from_a_replica$/)"],
+         "-E", f"test(/::{REPLICA_READ_TEST}$/)"],
         env=release_bin_env(),
         timeout=NO_TIMEOUT,
     )
@@ -1719,11 +1715,12 @@ def verify_replica_read(led: Ledger) -> None:
             _first_match(p.out, r"FAILED|panic|assert|error"),
         )
 
-    # The other replica topologies, one row each: a missing service SKIPs its own row
-    # and names what to start; it never hides the rows after it.
+    # The other replica topologies, one row each: a missing service FAILS its own row
+    # (or SKIPs it by name under the escape) and never hides the rows after it.
     for label, ports, test, hint in REPLICA_CELLS:
-        if not all(_tcp_open("127.0.0.1", port) for port in ports):
-            _skipped(led, "replica", label, "-", "-", f"replica {label}: not up — {hint}", "no replica")
+        down = [port for port in ports if not _tcp_open("127.0.0.1", port)]
+        if down:
+            _replica_down(led, label, "port(s) " + ", ".join(f":{p}" for p in down) + " closed", hint)
             continue
         cell_log = work_dir() / f"replica_{label}.log"
         p = run(
@@ -1741,6 +1738,45 @@ def verify_replica_read(led: Ledger) -> None:
                 f"replica {label} FAILED (see {cell_log})",
                 _first_match(p.out, r"FAILED|panic|assert|error"),
             )
+
+
+#: The MySQL re-logging replica test `verify_replica_read` drives first.
+REPLICA_READ_TEST = "cdc_reads_changes_from_a_replica"
+#: The PostgreSQL standby test `verify_cdc_standby` drives.
+CDC_STANDBY_TEST = "roast_pg_cdc_bounded_on_a_standby_fails_loud"
+
+# The named escape for a replica stand that is down, spelled like regression.py's: one
+# flag, one env var, one reader; `__main__` publishes argv into the env after parsing.
+_REPLICA_ESCAPE_FLAG = "--without-replica-topologies"
+_REPLICA_ESCAPE_ENV = "RIVET_ORACLE_WITHOUT_REPLICA_TOPOLOGIES"
+
+
+def without_replica_topologies() -> bool:
+    """True when the operator DELIBERATELY gave up every replica/standby topology row."""
+    return os.environ.get(_REPLICA_ESCAPE_ENV, "").strip().lower() not in ("", "0", "false", "no", "off")
+
+
+def set_without_replica_topologies(on: bool) -> None:
+    """Publish the escape into the environment (one writer, after argv is parsed)."""
+    if on:
+        os.environ[_REPLICA_ESCAPE_ENV] = "1"
+    else:
+        os.environ.pop(_REPLICA_ESCAPE_ENV, None)
+
+
+def _replica_down(led: Ledger, label: str, what: str, hint: str) -> None:
+    """A replica topology that is down FAILS its row — SKIP only under the named escape."""
+    if without_replica_topologies():
+        _skipped(led, "replica", label, "-", "-",
+                 f"replica {label}: {what} — GIVEN UP on purpose by {_REPLICA_ESCAPE_FLAG} "
+                 f"({hint}). This run does NOT grade the replica topologies and cannot support a tag.",
+                 f"no replica (given up by {_REPLICA_ESCAPE_FLAG}: NOT release-graded)")
+        return
+    _failed(led, "replica", label, "-", "-",
+            f"replica {label}: {what} — the release gate is the ONLY runner of this topology "
+            f"(CI skips it by name), so a down stand is an ungraded release, not a skip. "
+            f"Start it: {hint}; or give every replica row up by name with {_REPLICA_ESCAPE_FLAG}.",
+            "replica stand down")
 
 
 # Replica topologies beyond the MySQL re-logging replica: (row, ports, test, how to start).

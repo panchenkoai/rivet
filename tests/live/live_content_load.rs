@@ -267,7 +267,7 @@ fn pg_content_export_under_update_pressure() {
 /// cargo test --test live_suite full_content_export -- --include-ignored
 /// ```
 #[test]
-#[ignore = "live: slow (~3–5 min), requires docker compose up -d postgres with content_items seeded"]
+#[ignore = "live+gate-only: slow (~3–5 min), left to the release gate; requires docker compose up -d postgres with content_items seeded"]
 fn pg_full_content_export_max_pressure() {
     require_alive(LiveService::Postgres);
 

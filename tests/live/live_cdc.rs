@@ -5049,7 +5049,7 @@ fn roast_pg_cdc_oversized_transaction_bails_loud_not_oom() {
 }
 
 #[test]
-#[ignore = "live: requires the cdc-standby profile — python3 -m dev.pytools.cdc_stand standby (pg-cdc-standby on :5436)"]
+#[ignore = "live+gate-only: requires the cdc-standby profile — python3 -m dev.pytools.cdc_stand standby (pg-cdc-standby on :5436)"]
 fn roast_pg_cdc_bounded_on_a_standby_fails_loud() {
     // A bounded (until_current) CDC run against a PostgreSQL STANDBY (in recovery)
     // must fail LOUD with an actionable message: pg_current_wal_lsn() is
@@ -5118,7 +5118,7 @@ fn roast_pg_cdc_bounded_on_a_standby_fails_loud() {
 }
 
 #[test]
-#[ignore = "live: requires the cdc-standby profile — python3 -m dev.pytools.cdc_stand standby (pg-cdc-primary :5437 → pg-cdc-standby :5436)"]
+#[ignore = "live+gate-only: requires the cdc-standby profile — python3 -m dev.pytools.cdc_stand standby (pg-cdc-primary :5437 → pg-cdc-standby :5436)"]
 fn pg_cdc_streams_changes_from_a_standby_in_continuous_mode() {
     let (primary_url, standby_url) = (
         "postgresql://rivet:rivet@127.0.0.1:5437/rivet",
@@ -5318,7 +5318,7 @@ fn pg_failover(tag: &str, with_checkpoint: bool, mark: impl FnOnce(Rig) -> Rig) 
 
 /// With a checkpoint, a failover to a server without the slot is refused, not resumed on a new slot.
 #[test]
-#[ignore = "live: requires the cdc-standby profile — python3 -m dev.pytools.cdc_stand standby (pg-cdc-primary :5437 → pg-cdc-standby :5436)"]
+#[ignore = "live+gate-only: requires the cdc-standby profile — python3 -m dev.pytools.cdc_stand standby (pg-cdc-primary :5437 → pg-cdc-standby :5436)"]
 fn a_pg_failover_to_the_standby_with_a_checkpoint_is_refused_not_resumed_on_a_new_slot() {
     let f = pg_failover("pg_fo_ckpt", true, |r| r);
     let parts_before = read_all_parts(&f.rig.out_dir()).len();
@@ -5339,7 +5339,7 @@ fn a_pg_failover_to_the_standby_with_a_checkpoint_is_refused_not_resumed_on_a_ne
 /// creates a new slot there with only a warning, and the rows written during the switch (ids 3-4)
 /// are lost; the oracle reports "now passes" once rivet refuses or follows instead.
 #[test]
-#[ignore = "live: requires the cdc-standby profile — python3 -m dev.pytools.cdc_stand standby (pg-cdc-primary :5437 → pg-cdc-standby :5436)"]
+#[ignore = "live+gate-only: requires the cdc-standby profile — python3 -m dev.pytools.cdc_stand standby (pg-cdc-primary :5437 → pg-cdc-standby :5436)"]
 fn a_pg_failover_to_the_standby_without_a_checkpoint_loses_the_rows_written_during_the_switch() {
     let f = pg_failover("pg_fo_nockpt", false, |r| {
         r.oracle_known_defect(
@@ -5366,7 +5366,7 @@ fn a_pg_failover_to_the_standby_without_a_checkpoint_loses_the_rows_written_duri
 /// server, so the run is refused; passes while that holds, fails ("did not panic") once rivet follows
 /// the failover and captures ids 1-4 exactly once.
 #[test]
-#[ignore = "live: requires the cdc-standby profile — python3 -m dev.pytools.cdc_stand standby (pg-cdc-primary :5437 → pg-cdc-standby :5436)"]
+#[ignore = "live+gate-only: requires the cdc-standby profile — python3 -m dev.pytools.cdc_stand standby (pg-cdc-primary :5437 → pg-cdc-standby :5436)"]
 #[should_panic(expected = "rivet did not follow the failover")]
 fn pg_cdc_follows_a_failover_to_the_standby() {
     let f = pg_failover("pg_fo_follow", true, |r| r);

@@ -208,8 +208,8 @@ seed-garbage-mssql:
 # one, and the three stages then run and grade for real — the driver's banner and
 # its closing line are keyed on the baseline rather than on this flag, so such a
 # run is reported honestly instead of being announced as a skip it was not.
-release-oracle:  ## Release gate, BARE: only what is already in your shell. With no RIVET_PREV_RELEASE_BIN in your environment the prev-release comparison is GIVEN UP by name (cannot support a tag); with one exported, those three stages run and grade. Read the SKIP count — with nothing set it is ~95 PASS / 60 SKIP and still prints RELEASE-READY.
-	$(PY) -m dev.release_oracle --without-prev-release-comparison $(ARGS)
+release-oracle:  ## Release gate, BARE: only what is already in your shell. With no RIVET_PREV_RELEASE_BIN in your environment the prev-release comparison is GIVEN UP by name (cannot support a tag); with one exported, those three stages run and grade. The replica/standby topology rows are GIVEN UP by name too (a down stand is SKIP here, FAIL in release-oracle-full). Read the SKIP count — with nothing set it is ~95 PASS / 60 SKIP and still prints RELEASE-READY.
+	$(PY) -m dev.release_oracle --without-prev-release-comparison --without-replica-topologies $(ARGS)
 
 # ─── the gate's environment, assembled ────────────────────────────────────────
 #

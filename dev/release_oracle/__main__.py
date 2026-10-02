@@ -209,11 +209,51 @@ def _self_test() -> int:
             assert parse_args(["--without-prev-release-comparison"]).without_prev_release_comparison
             os.environ["RIVET_ORACLE_LATEST_ONLY"] = raw
             assert parse_args([]).latest_only is expect, raw
+            # The replica escape shares the grammar: a `=0` that gave the stand up would be the
+            # same defect, one stage over.
+            os.environ[scenarios._REPLICA_ESCAPE_ENV] = raw
+            assert scenarios.without_replica_topologies() is expect, raw
+            assert parse_args([]).without_replica_topologies is expect, raw
+            assert parse_args(["--without-replica-topologies"]).without_replica_topologies
     finally:
         os.environ.pop(regression._ESCAPE_ENV, None)
         os.environ.pop("RIVET_ORACLE_LATEST_ONLY", None)
+        os.environ.pop(scenarios._REPLICA_ESCAPE_ENV, None)
         if saved is not None:
             os.environ[regression._ESCAPE_ENV] = saved
+    # A down replica stand is a FAIL row unless the escape names the give-up.
+    saved_replica = os.environ.pop(scenarios._REPLICA_ESCAPE_ENV, None)
+    try:
+        strict = Ledger(colour=False)
+        scenarios._replica_down(strict, "probe", ":1 closed", "start it")
+        assert strict.red and strict.cells[-1].status is Status.FAIL, "a down replica stand must FAIL the row"
+        scenarios.set_without_replica_topologies(True)
+        lenient = Ledger(colour=False)
+        scenarios._replica_down(lenient, "probe", ":1 closed", "start it")
+        assert not lenient.red and lenient.cells[-1].status is Status.SKIP, "the escape must turn it into a SKIP"
+        assert scenarios._REPLICA_ESCAPE_FLAG in lenient.cells[-1].detail, "the SKIP row must name the escape"
+        # The replica stages register their tests whatever the ports say, so the derived
+        # live-modules cell never runs them again (a stand that is down, probed as closed).
+        if have("cargo"):
+            from .core import RAN_LIVE_TESTS
+            real_probe, real_ran = scenarios._tcp_open, set(RAN_LIVE_TESTS)
+            scenarios._tcp_open = lambda *a, **k: False
+            try:
+                probe_led = Ledger(colour=False)
+                scenarios.verify_replica_read(probe_led)
+                scenarios.verify_cdc_standby(probe_led)
+                expected = {scenarios.REPLICA_READ_TEST, scenarios.CDC_STANDBY_TEST,
+                            *(t for _, _, t, _ in scenarios.REPLICA_CELLS)}
+                assert expected <= RAN_LIVE_TESTS, f"replica tests not registered as run: {expected - RAN_LIVE_TESTS}"
+                assert all(c.status is Status.SKIP for c in probe_led.cells), probe_led.cells
+            finally:
+                scenarios._tcp_open = real_probe
+                RAN_LIVE_TESTS.clear()
+                RAN_LIVE_TESTS.update(real_ran)
+    finally:
+        scenarios.set_without_replica_topologies(False)
+        if saved_replica is not None:
+            os.environ[scenarios._REPLICA_ESCAPE_ENV] = saved_replica
 
     print(f"self-test ok: {len(_ENV_FLAG_TABLE)} spellings — argparse, env_flag and "
           "regression.without_prev_release_comparison() agree on every one")
@@ -373,6 +413,9 @@ def _self_test() -> int:
     live_src = "\n".join(f.read_text() for f in (ROOT / "tests" / "live").glob("*.rs"))
     for key in SKIP_ALLOWED:
         assert f"fn {key.split('::')[-1]}(" in live_src, f"SKIP_ALLOWED names no live test: {key}"
+    # A replica row whose test was renamed would grade an empty nextest run as PASS.
+    for name in (scenarios.REPLICA_READ_TEST, scenarios.CDC_STANDBY_TEST, *(t for _, _, t, _ in scenarios.REPLICA_CELLS)):
+        assert f"fn {name}(" in live_src, f"a replica cell names no live test: {name}"
     assert exclusive_tests(), "no live+exclusive test found — the exclusive pass would grade nothing"
     print("self-test ok: live modules are derived; perf tolerances grade regressions, not noise")
     import json as _json
@@ -447,6 +490,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "green gate — the one leg that would have caught it reported a non-failure "
         "because it never ran. Use it for local partial runs; a run carrying this flag "
         "cannot support a tag.",
+    )
+    ap.add_argument(
+        "--without-replica-topologies",
+        action="store_true",
+        default=scenarios.without_replica_topologies(),
+        help="GIVE UP every replica/standby topology row (mysql replicas, the PostgreSQL "
+        "standby pair, the SQL Server availability group, the second mongo replica set): a "
+        "stand that is down then records SKIP instead of FAIL. The release gate is the ONLY "
+        "runner of those tests (CI skips them by name), so without this flag a down stand is "
+        "an ungraded release and fails. Use it for local partial runs; a run carrying this "
+        "flag cannot support a tag.",
     )
     ap.add_argument("--no-cloud", action="store_true", help="local stage only (skip BigQuery)")
     ap.add_argument("--keep", action="store_true", help="leave engine containers up (debug)")
@@ -1169,6 +1223,10 @@ def main(argv: list[str] | None = None) -> int:
         # on the BASELINE, never on the flag alone: the flag does not decide (see
         # `regression.prev_release_banner`).
         regression.set_without_prev_release_comparison(ns.without_prev_release_comparison)
+        scenarios.set_without_replica_topologies(ns.without_replica_topologies)
+        if ns.without_replica_topologies:
+            print("  replica topologies: GIVEN UP by --without-replica-topologies — a down stand "
+                  "records SKIP; this run cannot support a tag")
         banner, footer = regression.prev_release_banner(
             regression.prev_binary(), ns.without_prev_release_comparison)
         for line in banner:

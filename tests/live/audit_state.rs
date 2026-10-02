@@ -138,10 +138,10 @@ fn audit_reset_clears_progression() {
     );
 }
 
-// AUDIT-RED state-guardrails: `state show -c <garbage>.yaml` returns false "No state" exit 0 and leaks .rivet_state.db. Asserts CORRECT behavior; expected to FAIL until fixed.
+// state-guardrails: `state show -c <missing>.yaml` must refuse the path, exit non-zero and create no state DB beside it (fixed; it used to print "No state" and exit 0).
 #[test]
 #[ignore = "live: postgres"]
-fn audit_state_show_validates_config_path() {
+fn audit_state_show_refuses_a_missing_config_path() {
     require_alive(LiveService::Postgres);
 
     // Point at a config path that does not exist. A read-only inspect must

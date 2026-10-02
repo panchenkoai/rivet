@@ -33,7 +33,7 @@ const BASELINE: &[(&str, usize)] = &[
     // `--config <path>` to every invocation, and `init` takes no config. The eighth
     // is the ClickHouse twin (2026-09-25, ADR-0035).
     ("live_init_extended.rs", 8),
-    // audit_metrics_validates_config_path's SUBJECT is a nonexistent --config
+    // audit_metrics_refuses_a_missing_config_path's SUBJECT is a nonexistent --config
     // path — a rig owns a real config, so that one raw invocation is the test.
     ("audit_observability.rs", 1),
     ("audit_state.rs", 1), // missing-config-path IS the subject

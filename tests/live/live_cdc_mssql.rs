@@ -2681,7 +2681,7 @@ fn mssql_cdc_a_marker_only_snapshot_survives_a_fresh_state_db() {
 }
 
 #[test]
-#[ignore = "live: requires docker compose --profile replica up -d mssql-ag-primary mssql-ag-secondary, then dev/mssql-ag/setup.sh"]
+#[ignore = "live+gate-only: requires docker compose --profile replica up -d mssql-ag-primary mssql-ag-secondary, then dev/mssql-ag/setup.sh"]
 fn mssql_cdc_reads_changes_from_a_readable_secondary() {
     const PRIMARY: u16 = 1440;
     const SECONDARY: u16 = 1441;
@@ -2770,7 +2770,7 @@ fn require_port(port: u16, what: &str) {
 }
 
 #[test]
-#[ignore = "live: requires docker compose mssql-cdc :1434 and the replica-profile AG primary :1440"]
+#[ignore = "live+gate-only: requires docker compose mssql-cdc :1434 and the replica-profile AG primary :1440"]
 fn mssql_checkpoint_from_another_database_is_refused() {
     const OTHER: u16 = 1440;
     require_port(
@@ -2896,7 +2896,7 @@ fn mssql_checkpoint_on_a_database_restored_from_backup_is_refused() {
 }
 
 #[test]
-#[ignore = "live: requires the replica-profile availability group :1440/:1441 (dev/mssql-ag/setup.sh)"]
+#[ignore = "live+gate-only: requires the replica-profile availability group :1440/:1441 (dev/mssql-ag/setup.sh)"]
 fn mssql_checkpoint_follows_a_failover_to_the_secondary() {
     const PRIMARY: u16 = 1440;
     const SECONDARY: u16 = 1441;
