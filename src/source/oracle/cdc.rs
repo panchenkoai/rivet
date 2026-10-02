@@ -418,6 +418,19 @@ pub(crate) fn remine_backoff(e: &anyhow::Error, attempt: u32) -> Option<std::tim
         .then(|| std::time::Duration::from_millis(200 << attempt))
 }
 
+/// Spend one of `spent` re-plans on `e`: the wait before it, or `e` as the final error.
+pub(crate) fn spend_remine(spent: &mut u32, e: anyhow::Error) -> Result<std::time::Duration> {
+    let Some(wait) = remine_backoff(&e, *spent) else {
+        return Err(log_set_changed_error(e));
+    };
+    *spent += 1;
+    log::warn!(
+        "oracle cdc: re-planning the redo logs in {wait:?} (attempt {spent} of \
+         {REMINE_ATTEMPTS}) after: {e:#}"
+    );
+    Ok(wait)
+}
+
 /// `e` as rivet's own verdict when the log set kept changing (no setup hint rides on it), else `e`.
 pub(crate) fn log_set_changed_error(e: anyhow::Error) -> anyhow::Error {
     if !names_a_log_set_change(&format!("{e:#}")) {
@@ -951,25 +964,8 @@ impl OracleChangeStream {
                     self.cursor = Some(cursor);
                     return Ok(());
                 }
-                Err(e) => self.wait_to_remine(e)?,
+                Err(e) => std::thread::sleep(spend_remine(&mut self.remines, e)?),
             }
-        }
-    }
-
-    /// Sleep before the next re-plan when `e` is a log-set change with attempts left; else the error.
-    fn wait_to_remine(&mut self, e: anyhow::Error) -> Result<()> {
-        match remine_backoff(&e, self.remines) {
-            Some(wait) => {
-                log::warn!(
-                    "oracle cdc: re-planning the redo logs in {wait:?} (attempt {} of \
-                     {REMINE_ATTEMPTS}) after: {e:#}",
-                    self.remines + 1
-                );
-                self.remines += 1;
-                std::thread::sleep(wait);
-                Ok(())
-            }
-            _ => Err(log_set_changed_error(e)),
         }
     }
 
@@ -1291,7 +1287,10 @@ impl ChangeStream for OracleChangeStream {
                 Ok(true) => {}
                 Ok(false) => self.exhausted = true,
                 Err(e) => {
-                    if let Err(e) = self.wait_to_remine(e).and_then(|()| self.mine()) {
+                    let remined = spend_remine(&mut self.remines, e)
+                        .map(std::thread::sleep)
+                        .and_then(|()| self.mine());
+                    if let Err(e) = remined {
                         return Some(Err(e));
                     }
                 }
@@ -1475,6 +1474,25 @@ mod tests {
         assert!(!re_plannable(&anyhow::anyhow!(
             "oracle cdc: redo sequence 7 of thread 1 is missing — LOST"
         )));
+    }
+
+    /// One stream spends exactly five re-plans on a log that keeps changing, then fails naming it.
+    #[test]
+    fn a_stream_spends_its_re_plan_budget_once_then_says_what_happened() {
+        let changed = || anyhow::anyhow!("oracle: ORA-01368: Redo log file header mismatch");
+        let mut spent = 0;
+        let waits: Vec<u128> = std::iter::from_fn(|| spend_remine(&mut spent, changed()).ok())
+            .map(|d| d.as_millis())
+            .collect();
+        assert_eq!((waits, spent), (vec![200, 400, 800, 1600, 3200], 5));
+        let last = spend_remine(&mut spent, changed()).unwrap_err();
+        assert!(format!("{last:#}").starts_with("oracle cdc: the redo log changed"));
+        let mut fresh = 0;
+        let grants = spend_remine(&mut fresh, anyhow::anyhow!("oracle: ORA-01031: x"));
+        assert_eq!(
+            (format!("{:#}", grants.unwrap_err()), fresh),
+            ("oracle: ORA-01031: x".into(), 0)
+        );
     }
 
     /// Five re-plans with doubling waits from 200 ms, then the error; never for a non-log error.
