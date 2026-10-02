@@ -977,6 +977,36 @@ impl CdcEngine {
         self.source_type().label()
     }
 
+    /// Refuse a source the capture open would refuse, before the anchor or any snapshot part is written.
+    pub(crate) fn refuse_unmet_prerequisites(
+        self,
+        url: &str,
+        tls: Option<&crate::config::TlsConfig>,
+        tables: &[String],
+    ) -> Result<()> {
+        match self {
+            Self::Mysql => {
+                crate::source::mysql::cdc::MysqlChangeStream::refuse_unmet_prerequisites(
+                    url, tls, tables,
+                )
+            }
+            Self::Postgres => {
+                crate::source::postgres::cdc::PgChangeStream::refuse_unroutable_tables(
+                    url, tls, tables,
+                )
+            }
+            #[cfg(feature = "oracle")]
+            Self::Oracle => {
+                crate::source::oracle::cdc::refuse_unmet_prerequisites(url, tls, tables)
+            }
+            #[cfg(not(feature = "oracle"))]
+            Self::Oracle => Err(crate::source::oracle_feature_missing()),
+            // Their refusals already run in the anchor step (`ensure_anchor`) or in
+            // `initial_snapshot_pending`'s capture-instance check, both before a snapshot.
+            Self::Mssql | Self::Mongo => Ok(()),
+        }
+    }
+
     /// Ensure the resume anchor EXISTS — `initial: snapshot` step ① and the
     /// single entry point for anchor creation (idempotent: a present anchor is
     /// never moved). The per-engine anchor models (see the process rules):

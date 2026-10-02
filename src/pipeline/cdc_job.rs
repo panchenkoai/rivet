@@ -452,6 +452,11 @@ pub(super) fn initial_snapshot_pending(
         None => false,
     };
     let (pending_idx, resume_expected) = snapshot_plan(&done_flags, ckpt_resume);
+    // A source the drain's open would refuse is refused here, before the anchor and the
+    // snapshot legs write anything (a MySQL 5.7 run left a part and a checkpoint behind).
+    if writes_before_the_drain(&pending_idx) {
+        engine.refuse_unmet_prerequisites(&url, tls, &tables)?;
+    }
 
     // The pairing, resolved by the same function config load already admitted — so
     // a reference the run would reject cannot have reached this point, and the
@@ -636,6 +641,11 @@ fn synth_snapshot_export(
     // it matters most for.
     debug_assert_eq!(synth.meta_columns.row_hash, export.meta_columns.row_hash);
     synth
+}
+
+/// Whether this run writes (a pending snapshot leg) before the drain opens, so the open's refusals must run first.
+fn writes_before_the_drain(pending_idx: &[usize]) -> bool {
+    !pending_idx.is_empty()
 }
 
 /// The pure `initial: snapshot` decision, split out of the I/O in
@@ -1648,6 +1658,13 @@ mod tests {
             "/data/cdc/orders",
             "local paths go through the filesystem join — no trailing slash needed"
         );
+    }
+
+    #[test]
+    fn only_a_pending_snapshot_leg_writes_before_the_drain() {
+        assert!(!writes_before_the_drain(&[]));
+        assert!(writes_before_the_drain(&[0]));
+        assert!(writes_before_the_drain(&[1, 2]));
     }
 
     // ── snapshot_plan: the pure `initial: snapshot` decision ─────────────────

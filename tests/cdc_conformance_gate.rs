@@ -834,7 +834,8 @@ fn oracle_class_census_is_pinned() {
 // 2026-10-01: +1 independent - the CDC backfill leg on a plain chunked recipe, graded against the source count.
 // 2026-10-01: +1 independent - compact on a table never loaded, the base's absence read through `bq`.
 // 2026-10-02: +1 independent - the MySQL partition move, its delete+insert read in the buffer and its one row in the base through `bq` (was presence: the refusal).
-const PIN_INDEPENDENT: usize = 103;
+// 2026-10-02: +1 independent - the PG refusal under `initial: snapshot`, its slot's absence read from pg_replication_slots.
+const PIN_INDEPENDENT: usize = 104;
 // 2026-09-28, source connection ceilings: +3 shared codec — the run's captured row is the
 // fixture check; the oracle is the server's own connection counter.
 // 2026-09-29: +2 shared codec — the Oracle TRUNCATE refusal on re-run and the uncaptured-truncate cell.
@@ -851,7 +852,9 @@ const PIN_SELF_COUNTER: usize = 6;
 // low-water SCN being non-zero and every resume from it succeeding.
 // 2026-10-01: +1 presence — the Oracle low-water-0 checkpoint refusal, whose oracle is the refusal's text.
 // 2026-10-02: -1 presence — the MySQL partition-move refusal became a delivery test graded through `bq` (moved to independent).
-const PIN_PRESENCE: usize = 82;
+// 2026-10-02: +3 presence - the MySQL, Oracle and Mongo refusals under `initial: snapshot`, whose oracle is an empty
+// destination tree and an absent checkpoint file.
+const PIN_PRESENCE: usize = 85;
 
 /// TIER 2 (harness audit, 2026-08-29): a test whose NAME makes a
 /// COMPLETENESS claim must carry a class-(a) INDEPENDENT oracle — not merely
