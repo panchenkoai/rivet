@@ -206,21 +206,43 @@ impl QualityTracker {
         Ok(())
     }
 
-    /// Fold another sink's measurements in: counts add, distinct sets union, caps union.
+    /// Fold another sink's measurements in: null counts add, distinct sets union up to
+    /// `unique_max_entries` (counting only the values folded in), caps union.
     pub(crate) fn merge(&mut self, other: QualityTracker) {
+        let QualityTracker {
+            columns,
+            null_counts,
+            unique_sets,
+            unique_non_null_counts,
+            unique_capped,
+            ..
+        } = other;
         if self.columns.is_none() {
-            self.columns = other.columns;
+            self.columns = columns;
         }
-        for (col, n) in other.null_counts {
+        let cap = self.columns.as_ref().and_then(|q| q.unique_max_entries);
+        for (col, n) in null_counts {
             *self.null_counts.entry(col).or_default() += n;
         }
-        for (col, set) in other.unique_sets {
-            self.unique_sets.entry(col).or_default().extend(set);
+        self.unique_capped.extend(unique_capped);
+        for (col, set) in unique_sets {
+            let own_dupes = unique_non_null_counts
+                .get(&col)
+                .copied()
+                .unwrap_or(0)
+                .saturating_sub(set.len());
+            let mine = self.unique_sets.entry(col.clone()).or_default();
+            let mut folded = 0;
+            for h in set {
+                if cap.is_some_and(|c| mine.len() >= c) {
+                    self.unique_capped.insert(col.clone());
+                    break;
+                }
+                mine.insert(h);
+                folded += 1;
+            }
+            *self.unique_non_null_counts.entry(col).or_default() += own_dupes + folded;
         }
-        for (col, n) in other.unique_non_null_counts {
-            *self.unique_non_null_counts.entry(col).or_default() += n;
-        }
-        self.unique_capped.extend(other.unique_capped);
     }
 
     /// The verdict against the tracker's own rules, given the run's row count.
@@ -551,6 +573,40 @@ mod tests {
         assert!(
             t.resolve_columns(&other).is_err(),
             "a real schema still refuses"
+        );
+    }
+
+    /// The merged distinct set stays inside `unique_max_entries`, and a value left out at
+    /// the cap is not counted, so the capped column warns instead of reporting a phantom
+    /// duplicate; one sink's own duplicates survive the merge.
+    #[test]
+    fn merge_stops_at_the_unique_cap_without_inventing_duplicates() {
+        let qc = QualityConfig {
+            row_count_min: None,
+            row_count_max: None,
+            null_ratio_max: HashMap::new(),
+            unique_columns: vec!["id".into()],
+            unique_max_entries: Some(4),
+        };
+        let sink = |ids: &[u64], non_null: usize| {
+            let mut t = QualityTracker::new(Some(qc.clone()));
+            t.unique_sets
+                .insert("id".into(), ids.iter().copied().collect());
+            t.unique_non_null_counts.insert("id".into(), non_null);
+            t
+        };
+        let mut merged = sink(&[1, 2, 3], 4); // one duplicate inside this sink
+        merged.merge(sink(&[4, 5], 2));
+        assert_eq!(
+            merged.unique_sets["id"].len(),
+            4,
+            "the union stops at the cap"
+        );
+        assert!(merged.unique_capped.contains("id"));
+        assert_eq!(merged.unique_non_null_counts["id"], 5, "4 seen + 1 folded");
+        assert_eq!(
+            fails(&merged.issues(9)),
+            vec!["column 'id': at least 1 duplicate values out of 9 rows"]
         );
     }
 

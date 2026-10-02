@@ -730,6 +730,12 @@ pub(crate) mod tests {
                 && sink.quality.null_counts.is_empty(),
             "drain must TAKE the sink's accumulators, not copy them"
         );
+        sink.quality.null_counts = [("id".to_string(), 5usize)].into();
+        assert_eq!(
+            sink.take_shape().quality.null_counts.get("id"),
+            Some(&5usize),
+            "the chunked runners' feed must carry the quality measurements too"
+        );
     }
 
     #[test]
