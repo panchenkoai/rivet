@@ -963,6 +963,8 @@ fn oracle_cdc_byte_cap_counts_the_first_row_and_defers_not_drops() {
 }
 
 /// Runs that mine while another session switches the redo log in a tight loop deliver every row exactly once.
+/// RED with no re-plan (every run fails ORA-01368/01291) and, at a measured ~1 in 6, with no
+/// online-read proof (a run's tail silently lost while the checkpoint moves to its frontier).
 #[test]
 #[ignore = "live: requires the oracle service with LogMiner prerequisites"]
 fn oracle_cdc_a_redo_log_switch_during_mining_is_re_mined_not_failed() {
@@ -974,7 +976,6 @@ fn oracle_cdc_a_redo_log_switch_during_mining_is_re_mined_not_failed() {
     rig(&t, &ckpt, &d.path().join("anchor")).run_ok();
     const BATCH: i64 = 50;
     const RUNS: usize = 12;
-    const MAX_RUNS: usize = 40;
     let stop = std::sync::Arc::new(AtomicBool::new(false));
     let writer = {
         let (stop, table) = (stop.clone(), t.name().to_string());
@@ -990,7 +991,7 @@ fn oracle_cdc_a_redo_log_switch_during_mining_is_re_mined_not_failed() {
                 );
                 conn.execute(&sql, &[]).unwrap();
                 written += BATCH;
-                std::thread::sleep(std::time::Duration::from_millis(50));
+                std::thread::sleep(std::time::Duration::from_millis(10));
             }
             written
         })
@@ -1013,15 +1014,13 @@ fn oracle_cdc_a_redo_log_switch_during_mining_is_re_mined_not_failed() {
     let mut failures = Vec::new();
     let mut replans = 0;
     let out = d.path().join("out");
-    let mut runs = 0;
-    while runs < RUNS || (replans == 0 && runs < MAX_RUNS) {
+    for _ in 0..RUNS {
         let run = rig(&t, &ckpt, &out).run();
         let err = String::from_utf8_lossy(&run.stderr).into_owned();
         replans += err.matches("re-planning the redo logs").count();
         if !run.status.success() {
             failures.push(err.lines().last().unwrap_or_default().to_string());
         }
-        runs += 1;
     }
     stop.store(true, Relaxed);
     let written = writer.join().unwrap();
@@ -1029,7 +1028,7 @@ fn oracle_cdc_a_redo_log_switch_during_mining_is_re_mined_not_failed() {
     rig(&t, &ckpt, &out).run_ok();
     assert!(
         failures.is_empty(),
-        "{} of {runs} runs failed under {switches} log switches: {failures:#?}",
+        "{} of {RUNS} runs failed under {switches} log switches: {failures:#?}",
         failures.len()
     );
     let want: Vec<(i64, String)> = (1..=written).map(|i| (i, "insert".to_string())).collect();
@@ -1038,7 +1037,7 @@ fn oracle_cdc_a_redo_log_switch_during_mining_is_re_mined_not_failed() {
         want,
         "every row exactly once across the runs"
     );
-    eprintln!("{replans} re-plans over {runs} runs under {switches} log switches");
+    eprintln!("{replans} re-plans over {RUNS} runs under {switches} log switches");
     assert!(
         replans > 0,
         "no run met a changed log set, so the storm proved nothing"
