@@ -20,6 +20,7 @@ This document contains the help content for the `rivet` command-line program.
 * [`rivet state progression`↴](#rivet-state-progression)
 * [`rivet state runs`↴](#rivet-state-runs)
 * [`rivet state finish-run`↴](#rivet-state-finish-run)
+* [`rivet state vacuum`↴](#rivet-state-vacuum)
 * [`rivet state loads`↴](#rivet-state-loads)
 * [`rivet completions`↴](#rivet-completions)
 * [`rivet init`↴](#rivet-init)
@@ -212,6 +213,7 @@ Manage export state
 * `progression` — Show committed / verified export boundaries (the last fully-exported cursor position)
 * `runs` — Show the run-status ledger (extraction-run lifecycle rows gc/cleanup read)
 * `finish-run` — Terminal-stamp a run-status row you KNOW is dead (hard crash, no successful successor) — the escape hatch for a prefix frozen by a stale `running` row
+* `vacuum` — Shrink a SQLite state DB: rewrite it without the free pages deletes and migrations leave behind (takes the write lock while it runs; PostgreSQL state is left to autovacuum)
 * `loads` — Show the load ledger (`rivet load` runs recorded in the state DB)
 
 
@@ -331,6 +333,18 @@ Terminal-stamp a run-status row you KNOW is dead (hard crash, no successful succ
 
 * `-c`, `--config <CONFIG>`
 * `--run-id <RUN_ID>` — The run id to close (find it with `rivet state runs -c <config> --running`)
+
+
+
+## `rivet state vacuum`
+
+Shrink a SQLite state DB: rewrite it without the free pages deletes and migrations leave behind (takes the write lock while it runs; PostgreSQL state is left to autovacuum)
+
+**Usage:** `rivet state vacuum --config <CONFIG>`
+
+###### **Options:**
+
+* `-c`, `--config <CONFIG>`
 
 
 

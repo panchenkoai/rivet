@@ -822,6 +822,7 @@ fn dispatch_state(action: StateAction) -> Result<()> {
             json,
         } => show_runs(&config, running, last, json),
         StateAction::FinishRun { config, run_id } => finish_run_cmd(&config, &run_id),
+        StateAction::Vacuum { config } => vacuum_cmd(&config),
         StateAction::Loads {
             config,
             target,
@@ -916,6 +917,23 @@ fn show_runs(config: &str, running_only: bool, last: usize, json: bool) -> Resul
 /// `rivet state finish-run`: stamp a dead run's row `interrupted`. Refuses
 /// loudly on a typo'd id and no-ops honestly on an already-terminal row —
 /// only a `running` row is ever touched.
+/// `rivet state vacuum`: compact a SQLite state DB and print the size change.
+fn vacuum_cmd(config: &str) -> Result<()> {
+    require_config_file(config)?;
+    match StateStore::open(config)?.vacuum()? {
+        Some((before, after)) => println!(
+            "state DB vacuumed: {:.1} MB -> {:.1} MB",
+            before as f64 / 1e6,
+            after as f64 / 1e6
+        ),
+        None => println!(
+            "state DB is PostgreSQL: nothing to do, its autovacuum reuses free space \
+             (run VACUUM FULL yourself to return it to the OS)"
+        ),
+    }
+    Ok(())
+}
+
 fn finish_run_cmd(config: &str, run_id: &str) -> Result<()> {
     use crate::state::FinishOutcome;
     require_config_file(config)?;
