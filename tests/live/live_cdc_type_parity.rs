@@ -746,12 +746,9 @@ fn server_rendered(rows: &[Row], from: &str, pass: &str, bare: &str) -> String {
     )
 }
 
-/// ATTACH the state backend a `census_oracle()` rig ran against as `alias`: Postgres when `RIVET_STATE_URL` names one, else the SQLite file beside its config.
+/// ATTACH the state backend a `census_oracle()` rig ran against as `alias`: Postgres when the gate grades one, else the SQLite file beside its config.
 fn state_attach(rig: &Rig, alias: &str) -> String {
-    match std::env::var("RIVET_STATE_URL")
-        .ok()
-        .filter(|u| u.starts_with("postgres"))
-    {
+    match state_url_under_test() {
         Some(url) => format!(
             "INSTALL postgres; LOAD postgres; ATTACH '{url}' AS {alias} (TYPE postgres, READ_ONLY);"
         ),

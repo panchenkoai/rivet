@@ -322,16 +322,20 @@ impl StateDb {
     }
 }
 
-/// The primary key recorded for `export`, from the backend rivet used: Postgres when
-/// `RIVET_STATE_URL` names one, else the SQLite file beside `cfg`.
-pub fn recorded_primary_key(cfg: &std::path::Path, export: &str) -> Option<Vec<String>> {
-    let pg = std::env::var("RIVET_STATE_URL")
+/// The Postgres state backend the gate grades (`RIVET_GATE_STATE_URL`), handed to every rivet child as `RIVET_STATE_URL`; `None` is SQLite beside the config.
+pub fn state_url_under_test() -> Option<String> {
+    std::env::var("RIVET_GATE_STATE_URL")
         .ok()
-        .filter(|u| u.starts_with("postgres"));
-    match pg {
+        .filter(|u| u.starts_with("postgres"))
+}
+
+/// The primary key recorded for `export`, from the backend rivet used: Postgres when
+/// the gate grades one, else the SQLite file beside `cfg`.
+pub fn recorded_primary_key(cfg: &std::path::Path, export: &str) -> Option<Vec<String>> {
+    match state_url_under_test() {
         Some(url) => {
             let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap_or_else(|e| {
-                panic!("connect to the Postgres state at RIVET_STATE_URL: {e}")
+                panic!("connect to the Postgres state at RIVET_GATE_STATE_URL: {e}")
             });
             client
                 .query_opt(
@@ -355,13 +359,10 @@ pub fn recorded_primary_key(cfg: &std::path::Path, export: &str) -> Option<Vec<S
 /// under a Postgres pass opens an EMPTY database and panics on the missing table —
 /// two gates lost the `batches:refusal` cell to exactly that.
 pub fn ledger_load_statuses(cfg: &std::path::Path, target_table: &str) -> Vec<String> {
-    let pg = std::env::var("RIVET_STATE_URL")
-        .ok()
-        .filter(|u| u.starts_with("postgres"));
-    match pg {
+    match state_url_under_test() {
         Some(url) => {
             let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap_or_else(|e| {
-                panic!("connect to the Postgres state at RIVET_STATE_URL: {e}")
+                panic!("connect to the Postgres state at RIVET_GATE_STATE_URL: {e}")
             });
             client
                 .query(
