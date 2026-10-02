@@ -843,7 +843,8 @@ const PIN_INDEPENDENT: usize = 104;
 // 2026-10-02: +1 shared_codec - the MySQL failover GTID-follow strict known defect, whose oracle is the parts read back.
 // 2026-10-02: +1 shared_codec - the MongoDB failover follow, read back through its parts (the PostgreSQL
 // failover cells run their capture through a helper the census does not see).
-const PIN_SHARED_CODEC: usize = 91;
+// 2026-10-02: +1 shared codec - Oracle CDC under a redo log switch storm; each run is graded by the default oracle, exactly-once by the seed.
+const PIN_SHARED_CODEC: usize = 92;
 const PIN_SELF_COUNTER: usize = 6;
 // 2026-09-28: +1 presence — the SQL Server undecodable-cell refusal, whose oracle is the refusal.
 // 2026-09-29: +2 presence — the PG CDC LMT-timezone and DOMAIN parity cells compare CDC to batch output.

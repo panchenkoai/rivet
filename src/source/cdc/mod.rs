@@ -2374,6 +2374,32 @@ mod setup_hint {
         );
     }
 
+    /// A redo log that kept changing under LogMiner reaches the operator as that, never as a grants problem.
+    #[cfg(feature = "oracle")]
+    #[test]
+    fn an_oracle_log_set_change_does_not_get_the_setup_hint() {
+        let driver = || anyhow::anyhow!("oracle: ORA-01368: Redo log file header mismatch");
+        let shown = format!(
+            "{:#}",
+            super::with_setup_hint(
+                crate::source::oracle::cdc::log_set_changed_error(driver()),
+                super::ORACLE_CDC_HINT
+            )
+        );
+        assert!(
+            shown.starts_with("oracle cdc: the redo log changed under LogMiner"),
+            "{shown}"
+        );
+        assert!(
+            format!(
+                "{:#}",
+                super::with_setup_hint(driver(), super::ORACLE_CDC_HINT)
+            )
+            .starts_with("if this is a permissions/setup error"),
+            "the bare driver error is what got the hint before the wrap"
+        );
+    }
+
     #[test]
     fn a_tls_handshake_failure_does_not_get_the_setup_hint() {
         let tls = anyhow::anyhow!("error performing TLS handshake: server does not support TLS");
