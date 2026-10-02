@@ -1519,7 +1519,31 @@ FLAG_EXCUSED = {
                         "every refusal between them.",
     "--clickhouse-database": "the other half of the ClickHouse `load:` scaffold — see --clickhouse-url.",
     "--clickhouse-user": "the ClickHouse `load:` scaffold's user — see --clickhouse-url.",
+    "--strict": "needs a column whose mapping is lossy, which the blessed postgres chain has none of. "
+                "Carried INSIDE the gate by blessed_flow.verify_run_strict: an Oracle TIMESTAMP(9) "
+                "export is refused by `run --strict` with RIVET_TYPE_UNSAFE_MAPPING and no part, "
+                "and without --strict it warns naming the column and delivers the row.",
 }
+
+#: `run --strict` (ADR-0038 step 2), carried by tests/live/live_type_policy.rs.
+STRICT_CELLS = {
+    "oracle_batch_timestamp9_warns_by_default_and_strict_refuses_before_export": "run:strict",
+    "check_strict_and_run_strict_refuse_the_same_config_with_the_same_code": "run:strict=check",
+}
+
+
+def verify_run_strict(led: Ledger) -> None:
+    """`run --strict` refuses an unsafe mapping with RIVET_TYPE_UNSAFE_MAPPING; without it the run warns and delivers."""
+    from .shared_state import run_rig_tests
+
+    led.phase("run --strict — an unsafe type mapping refused, or warned and delivered")
+    run_rig_tests(
+        led, "run_strict", tuple(STRICT_CELLS),
+        cell=STRICT_CELLS.__getitem__,
+        msg=lambda n: f"run_strict[{STRICT_CELLS[n]}] · {n.replace('_', ' ')}",
+        cloud=False,
+        services=(("oracle", 1521),),
+    )
 
 
 def _cli_flags(cmd: str) -> set[str]:

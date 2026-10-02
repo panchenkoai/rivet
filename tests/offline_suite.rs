@@ -114,6 +114,8 @@ mod live_only_purity_gate;
 mod live_service_ports_guard;
 #[path = "offline/load_allow_source_drift.rs"]
 mod load_allow_source_drift;
+#[path = "offline/nextest_groups_guard.rs"]
+mod nextest_groups_guard;
 #[path = "offline/rig_adoption_guard.rs"]
 mod rig_adoption_guard;
 #[path = "offline/rig_oracle_ratchet.rs"]

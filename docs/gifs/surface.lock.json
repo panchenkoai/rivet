@@ -1,25 +1,25 @@
 {
   "_comment": "Surface digests captured when the GIFs were last rendered. A digest that no longer matches means the recording and the binary have diverged \u2014 re-render that tape, then re-bless it BY NAME (blessing everything would stamp un-rendered GIFs as current).",
   "surfaces": {
-    "basic": "849139b993d856b0",
+    "basic": "a3cd23c6dbb94110",
     "cdc": "20b0a917b11b9665",
-    "cdc-parallel": "7a59e0ad936dfd20",
+    "cdc-parallel": "cee63f509c3a14ce",
     "check-verdict": "dfd87032b1ee440f",
-    "chunked-progress": "7a59e0ad936dfd20",
-    "coalesce-cursor": "803c4cf273ad6987",
+    "chunked-progress": "cee63f509c3a14ce",
+    "coalesce-cursor": "95813cdee7c135e6",
     "discover-artifact": "b2534470d53dbcdc",
-    "doctor-gcs": "264dffd40f5eb5c1",
+    "doctor-gcs": "951680a68bc8186f",
     "error-cdc-access": "f8135cda1a679e05",
     "error-config-typo": "dfd87032b1ee440f",
     "error-connection": "f70422846e03251d",
     "error-missing-table": "dfd87032b1ee440f",
-    "incremental-cursor": "803c4cf273ad6987",
+    "incremental-cursor": "95813cdee7c135e6",
     "init-scaffold": "b2534470d53dbcdc",
     "inspect": "69aa68876b22a7ee",
-    "parallel-cards": "7a59e0ad936dfd20",
+    "parallel-cards": "cee63f509c3a14ce",
     "plan-apply": "e324441b3f14b427",
     "plan-campaign": "b4d2fd624d990804",
-    "pool-detect": "7a59e0ad936dfd20",
-    "reconcile-repair": "8b96a5ccd0ebc499"
+    "pool-detect": "cee63f509c3a14ce",
+    "reconcile-repair": "4770f29e5172e335"
   }
 }

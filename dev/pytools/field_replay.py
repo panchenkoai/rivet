@@ -20,7 +20,8 @@ rationalised afterwards:
   1. FIXTURE IS LIVE   the OLD binary must shed at least once. Without this the
                        run reproduces nothing and the rest grades air.
   2. SYMPTOM GONE      the NEW binary sheds ZERO times on an idle source.
-  3. NO REGRESSION     new makespan <= old makespan * 1.05.
+  3. NO REGRESSION     median new makespan <= median old makespan * 1.05, over
+                       TIMING_SAMPLES adaptive-ON legs per binary.
   4. SAME DATA         every export delivers the same row count on both.
 
 Criterion 1 is the one that makes the others mean anything: it is the
@@ -102,6 +103,7 @@ import re
 import shutil
 import signal
 import sqlite3
+import statistics
 import sys
 import time
 from pathlib import Path
@@ -136,7 +138,13 @@ LEG_TIMEOUT = float(os.environ.get("RIVET_FIELD_TIMEOUT") or 3600)
 # it read the SAME `RIVET_FIELD_TIMEOUT` for a single whole-harness budget, so
 # the wrapper always expired first (X vs 4X) and SIGKILLed the harness — the one
 # signal the restore contract below cannot survive.
-LEG_PLAN = (("old", False), ("old", True), ("new", False), ("new", True))
+# Criterion 3 compares MEDIANS of `TIMING_SAMPLES` adaptive-ON legs per binary,
+# interleaved old/new: one leg each read 26.9 s vs 25.5 s once (gate 2026-10-02)
+# where five re-measurements all sat at 25.4-25.8 s. The repeats cost about
+# 2 x (TIMING_SAMPLES - 1) x 25 s of wall time.
+TIMING_SAMPLES = 3
+LEG_PLAN = (("old", False), ("old", True), ("new", False), ("new", True)) + tuple(
+    (side, True) for _ in range(TIMING_SAMPLES - 1) for side in ("old", "new"))
 
 # Empty means "SQLite beside the config" — see the state note in the docstring.
 # `run()` merges over os.environ, so CLEARING an inherited value needs the empty
@@ -547,11 +555,26 @@ def leg_tag(side: str, adaptive: bool) -> str:
     return f"{side}-{'on' if adaptive else 'off'}"
 
 
-def run_leg(binary: Path, side: str, adaptive: bool) -> dict:
+def leg_tags() -> list[tuple[str, bool, str]]:
+    """`(side, adaptive, tag)` per LEG_PLAN entry; a repeat of a leg is tagged `<tag>-<n>`."""
+    seen: dict[str, int] = {}
+    out = []
+    for side, adaptive in LEG_PLAN:
+        base = leg_tag(side, adaptive)
+        seen[base] = seen.get(base, 0) + 1
+        out.append((side, adaptive, base if seen[base] == 1 else f"{base}-{seen[base]}"))
+    return out
+
+
+def samples(runs: dict, base: str) -> list[dict]:
+    """Every leg of `runs` that is `base` or a repeat of it."""
+    return [r for t, r in runs.items() if t == base or t.startswith(base + "-")]
+
+
+def run_leg(binary: Path, side: str, adaptive: bool, tag: str) -> dict:
     """One leg. `side` is passed in rather than derived from the binary path, so
     pointing the harness at the same binary twice (its own self-test) still gives
     each leg its own work dir instead of the second overwriting the first."""
-    tag = leg_tag(side, adaptive)
     work = WORK / tag
     if work.exists():
         shutil.rmtree(work)
@@ -678,19 +701,21 @@ def _self_test() -> int:
                 "rows": rows, "stderr_tail": []}
 
     def graded(old_on_wall, old_on_shed, new_on_wall, new_on_shed, *,
-               old_timed_out=False, new_timed_out=False):
+               old_timed_out=False, new_timed_out=False, repeats=None):
+        repeats = repeats or {}
         # Built from LEG_PLAN, not from a typed list of four tags: a fifth leg
         # must extend this fixture rather than break it. (The `want` this
         # replaces asserted `len(LEG_PLAN) == 4` against a literal sitting beside
         # it — it graded nothing, and went RED on exactly the change the derived
         # leg count exists to allow.)
         runs = {}
-        for side, adaptive in LEG_PLAN:
-            tag = leg_tag(side, adaptive)
+        for side, adaptive, tag in leg_tags():
             if tag == "old-on":
                 runs[tag] = leg(tag, old_on_wall, old_on_shed, old_timed_out)
             elif tag == "new-on":
                 runs[tag] = leg(tag, new_on_wall, new_on_shed, new_timed_out)
+            elif adaptive:
+                runs[tag] = leg(tag, repeats.get(tag, old_on_wall if side == "old" else new_on_wall), 0)
             else:
                 runs[tag] = leg(tag, 300, 0)
         buf = io.StringIO()
@@ -740,6 +765,17 @@ def _self_test() -> int:
     want("…and its detail does NOT claim a shed was observed",
          "a shed was observed" not in d.get("1", ""), d.get("1", "<no criterion 1 line>"))
 
+    want(f"the plan times each binary {TIMING_SAMPLES}x on adaptive ON",
+         len(samples({t: 0 for _, _, t in leg_tags()}, "old-on")) == TIMING_SAMPLES
+         == len(samples({t: 0 for _, _, t in leg_tags()}, "new-on")) >= 3)
+    rc, v, out, d = graded(25.5, 3, 26.9, 0, repeats={"old-on-2": 25.6, "new-on-2": 25.5,
+                                                       "old-on-3": 25.7, "new-on-3": 25.6})
+    want("one slow NEW leg past 5% does not fail criterion 3 when the median holds",
+         v.get("3") == "PASS", d.get("3", ""))
+    rc, v, out, d = graded(25.5, 3, 26.9, 0, repeats={"old-on-2": 25.6, "new-on-2": 27.0,
+                                                       "old-on-3": 25.7, "new-on-3": 25.6})
+    want("a median NEW past 5% fails criterion 3", v.get("3") == "FAIL", d.get("3", ""))
+
     # NOT here: whether the wrapper's criterion regex parses this harness's
     # output (and refuses `stand_mutated_line`). That regex lives in
     # `dev/release_oracle/regression.py`, which imports this module — re-typing a
@@ -774,8 +810,8 @@ def main() -> int:
         seed()
         with TmpTableGlobals():
             runs = {}
-            for side, adaptive in LEG_PLAN:
-                r = run_leg(binaries[side], side, adaptive)
+            for side, adaptive, tag in leg_tags():
+                r = run_leg(binaries[side], side, adaptive, tag)
                 runs[r["tag"]] = r
         rc = report(runs)
     if RESTORE_FAILED:
@@ -805,8 +841,8 @@ def _ungraded(*legs: dict) -> str:
 
 def report(runs: dict) -> int:
     print(f"\n{'run':12}{'exit':>6}{'wall_s':>9}{'backed_off':>12}{'recovered':>11}{'exports':>9}")
-    for side, adaptive in LEG_PLAN:
-        r = runs[leg_tag(side, adaptive)]
+    for _, _, tag in leg_tags():
+        r = runs[tag]
         print(f"{r['tag']:12}{r['exit']:>6}{r['wall']:>9.1f}{r['backed_off']:>12}"
               f"{r['recovered']:>11}{len(r['rows']):>9}"
               + ("   ! TIMED OUT — a floor, not a measurement" if r["timed_out"] else ""))
@@ -837,10 +873,13 @@ def report(runs: dict) -> int:
     verdicts.append(("2 symptom gone (new sheds 0 on an idle source)",
                      not why and new_on["backed_off"] == 0,
                      why or f"new shed {new_on['backed_off']}x"))
-    why = _ungraded(old_on, new_on)
-    verdicts.append(("3 no makespan regression (new <= old * 1.05)",
-                     not why and new_on["wall"] <= old_on["wall"] * 1.05,
-                     why or f"{new_on['wall']:.1f}s vs {old_on['wall']:.1f}s"))
+    olds, news = samples(runs, "old-on"), samples(runs, "new-on")
+    why = _ungraded(*olds, *news)
+    old_w = statistics.median(r["wall"] for r in olds)
+    new_w = statistics.median(r["wall"] for r in news)
+    verdicts.append(("3 no makespan regression (median new <= median old * 1.05)",
+                     not why and new_w <= old_w * 1.05,
+                     why or f"median {new_w:.1f}s vs {old_w:.1f}s over {len(news)}+{len(olds)} legs"))
     why = _ungraded(old_on, new_on)
     same = old_on["rows"] == new_on["rows"] and bool(new_on["rows"])
     verdicts.append(("4 same data delivered", not why and same,

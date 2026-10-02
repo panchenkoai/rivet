@@ -49,6 +49,7 @@ import json
 import os
 import re
 import sys
+import time
 from collections import Counter
 
 META = ("__op", "__pos", "__seq")
@@ -1219,6 +1220,16 @@ def _clickhouse(load: dict, password: str, sql: str) -> str:
     return f"read_parquet('{u.scheme}://{u.netloc}/?{auth}&query={quote(sql + ' FORMAT Parquet')}')"
 
 
+def load_run_filter(spec: dict) -> str:
+    """This export's `load_run` rows: rivet keys them by the table it loads (the source table, else the export
+    name, a schema dot folded to `_`) and by `<dataset>.<table>`, never by the export name."""
+    load = spec["load"]
+    leaf = str(spec.get("table") or spec["export"]).replace(".", "_")
+    # BigQuery writes `<project>.<dataset>.<table>`, ClickHouse `<database>.<table>`.
+    fq = f"{load.get('database') or 'default'}.{leaf}" if load.get("target") == "clickhouse" else f".{load.get('dataset')}.{leaf}"
+    return f"export_name = {_lit(leaf)} AND ends_with(target_table, {_lit(fq)})"
+
+
 def grade_load(spec: dict) -> dict:
     """Grade the warehouse table a `rivet load` (or `compact`) left: its live rows against the source, per column like a run."""
     from .duck import Oracle
@@ -1244,12 +1255,13 @@ def grade_load(spec: dict) -> dict:
         raise
     with ora:
         ora.db.sql("SET TimeZone = 'UTC'")
+        mine = load_run_filter(spec)
         loaded = ora.rows(
             f"SELECT target_table FROM {_state_table(ora, spec, 'load_run')} "
-            f"WHERE export_name = {_lit(spec['export'])} AND status = 'success' ORDER BY finished_at DESC LIMIT 1"
+            f"WHERE {mine} AND status = 'success' ORDER BY finished_at DESC LIMIT 1"
         )
         if not loaded:
-            return {"failures": [f"WAREHOUSE: no successful load_run row for export `{spec['export']}`"], "notes": notes}
+            return {"failures": [f"WAREHOUSE: no successful load_run row for export `{spec['export']}` ({mine})"], "notes": notes}
         fq = loaded[0][0]
         leaf = fq.split(".")[-1]
         src, key, native = _source(ora, spec, renders)
@@ -1275,7 +1287,7 @@ def grade_load(spec: dict) -> dict:
             tables = {r[0] for r in ora.rows("SELECT table_name FROM duckdb_tables() WHERE database_name = 'bq'")}
             if leaf not in tables and not ora.scalar(
                 f"SELECT count(*) FROM {_state_table(ora, spec, 'load_run')} "
-                f"WHERE export_name = {_lit(spec['export'])} AND status = 'success' AND rows_loaded > 0"
+                f"WHERE {mine} AND status = 'success' AND rows_loaded > 0"
             ):
                 # Every success row is a skip ("up to date", 0 rows): nothing was ever loaded, so there is no table to grade.
                 return {"skip": f"no load has written `{fq}` yet (every load row for `{spec['export']}` loaded 0 rows)", "notes": notes}
@@ -1310,11 +1322,16 @@ def grade_load(spec: dict) -> dict:
                 ora.db.sql(f"CREATE OR REPLACE TEMP TABLE wh_all AS SELECT * FROM {rel}")
         except Exception as e:  # noqa: BLE001 — a table that requires a partition filter is read with an all-partitions one
             m = re.search(r"filter over column\(s\) '([^']+)'", str(e))
-            if not m or buffered:
+            if storage_schema_lags(e) and not buffered:
+                # The Storage API still serves the schema before an ALTER; a query job reads the table as it is now.
+                ora.db.sql(f"CREATE OR REPLACE TEMP TABLE wh_all AS SELECT * FROM bigquery_query('bq', {_lit(f'SELECT * FROM `{fq}`')})")
+                m = None
+            elif not m or buffered:
                 raise
-            c = m.group(1)
-            sql = f"SELECT * FROM `{fq}` WHERE `{c}` IS NULL OR `{c}` >= TIMESTAMP('0001-01-01')"
-            ora.db.sql(f"CREATE OR REPLACE TEMP TABLE wh_all AS SELECT * FROM bigquery_query('bq', {_lit(sql)})")
+            if m:
+                c = m.group(1)
+                sql = f"SELECT * FROM `{fq}` WHERE `{c}` IS NULL OR `{c}` >= TIMESTAMP('0001-01-01')"
+                ora.db.sql(f"CREATE OR REPLACE TEMP TABLE wh_all AS SELECT * FROM bigquery_query('bq', {_lit(sql)})")
         have = [c for c, _ in _columns(ora, "wh_all")]
         keep = ", ".join(_qi(c) for c in have if not c.startswith(WAREHOUSE_META)) or "1"
         if ("__pos" in have or "_rivet_src" in have) and key:
@@ -1418,7 +1435,38 @@ def grade_load(spec: dict) -> dict:
     return out
 
 
+#: libcurl codes a BigQuery read dies of without a verdict: couldn't connect (7), timeout (28),
+#: SSL connect (35), send/recv failure (55/56), and an empty reply (52).
+TRANSIENT_CURL = re.compile(r"CURL error \[(7|28|35|52|55|56)\]")
+
+
+def storage_schema_lags(e: BaseException) -> bool:
+    """True when a Storage API read session names a column the table gained after the session's schema snapshot."""
+    return "read session" in str(e) and "do not exist in the table schema" in str(e)
+
+
+def transient(e: BaseException) -> bool:
+    """True for a failure that says nothing about the data: a deadlock victim or a dropped transport."""
+    return "deadlock" in str(e) or TRANSIENT_CURL.search(str(e)) is not None
+
+
 def _self_test() -> None:
+    bq = {"target": "bigquery", "project": "p", "dataset": "d"}
+    assert load_run_filter({"export": "users", "table": "public.users_pg", "load": bq}) == \
+        "export_name = 'public_users_pg' AND ends_with(target_table, '.d.public_users_pg')"
+    assert "'q'" in load_run_filter({"export": "q", "table": None, "load": bq}), "a query export is keyed by its name"
+    assert "'db.t'" in load_run_filter({"export": "x", "table": "t", "load": {"target": "clickhouse", "database": "db"}})
+    assert transient(RuntimeError("PerformWork() - CURL error [35]=SSL connect error"))
+    assert transient(RuntimeError("PerformWork() - CURL error [28]=Timeout was reached"))
+    assert transient(RuntimeError("Transaction (Process ID 61) was deadlocked ... chosen as the deadlock victim"))
+    assert transient(RuntimeError("BigQuery Authentication Failed\n\nUnderlying authentication error:\n  PerformWork() - CURL error [28]=Timeout was reached"))
+    assert not transient(RuntimeError("BigQuery Authentication Failed\n\nNo usable authentication credentials were found."))
+    assert storage_schema_lags(RuntimeError("Binder Error: Error while creating read session: Permanent error, with a last "
+                                            "message of request failed: The following selected fields do not exist in the table schema: w"))
+    assert not storage_schema_lags(RuntimeError("Binder Error: Referenced column \"w\" not found"))
+    assert not transient(RuntimeError("CURL error [22]=HTTP response code said error"))
+    assert not transient(RuntimeError("CURL error [356]=x")), "a code must match whole"
+    assert not transient(RuntimeError("Binder Error: Referenced column \"id\" not found"))
     assert type_loss("INTEGER", "BIGINT") is None
     assert type_loss("BIGINT", "INTEGER")
     assert type_loss("UBIGINT", "BIGINT")
@@ -1649,14 +1697,17 @@ if __name__ == "__main__":
     if sys.argv[1:] in (["grade"], ["grade-load"], ["image"]):
         spec = json.load(sys.stdin)
         run = {"grade": grade, "grade-load": grade_load, "image": take_image}[sys.argv[1]]
-        try:
-            verdict = run(spec)
-        except Unreachable as e:
-            verdict = {"skip": str(e)}
-        except Exception as e:  # noqa: BLE001 — a SQL Server catalog deadlock victim is retried once
-            if "deadlock" not in str(e):
-                raise
-            verdict = run(spec)
+        for attempt in range(3):
+            try:
+                verdict = run(spec)
+                break
+            except Unreachable as e:
+                verdict = {"skip": str(e)}
+                break
+            except Exception as e:  # noqa: BLE001 — every read is idempotent, so a transient one is re-run
+                if attempt == 2 or not transient(e):
+                    raise
+                time.sleep(2 * (attempt + 1))
         if verdict.get("failures") and spec.get("known_defect"):
             verdict["known_defect"] = known_defect_covers(spec["known_defect"], verdict["failures"])
         sys.stdout.write(json.dumps(verdict, default=str))
