@@ -511,6 +511,40 @@ const MIGRATIONS: &[(i64, &str)] = &[
             expires_at TEXT NOT NULL
         );",
     ),
+    // v32: a run's load spec references a deduplicated spec version; file_log/export_metrics lookup indexes.
+    (
+        32,
+        "CREATE TABLE load_spec_version (
+            spec_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            export_name TEXT NOT NULL,
+            unit TEXT NOT NULL DEFAULT '',
+            columns_json TEXT NOT NULL,
+            primary_key_json TEXT,
+            captured_at TEXT NOT NULL
+        );
+        CREATE INDEX idx_load_spec_version_unit ON load_spec_version(export_name, unit);
+        INSERT INTO load_spec_version (export_name, unit, columns_json, primary_key_json, captured_at)
+            SELECT export_name, unit, columns_json, primary_key_json, MIN(captured_at)
+            FROM export_load_spec_run
+            GROUP BY export_name, unit, columns_json, primary_key_json;
+        ALTER TABLE export_load_spec_run RENAME TO export_load_spec_run_v31;
+        CREATE TABLE export_load_spec_run (
+            export_name TEXT NOT NULL,
+            unit TEXT NOT NULL DEFAULT '',
+            run_id TEXT NOT NULL,
+            spec_id INTEGER NOT NULL,
+            captured_at TEXT NOT NULL,
+            PRIMARY KEY (export_name, unit, run_id)
+        );
+        INSERT INTO export_load_spec_run (export_name, unit, run_id, spec_id, captured_at)
+            SELECT r.export_name, r.unit, r.run_id, v.spec_id, r.captured_at
+            FROM export_load_spec_run_v31 r JOIN load_spec_version v
+              ON v.export_name = r.export_name AND v.unit = r.unit
+             AND v.columns_json = r.columns_json AND v.primary_key_json IS r.primary_key_json;
+        DROP TABLE export_load_spec_run_v31;
+        CREATE INDEX IF NOT EXISTS idx_file_log_run ON file_log(run_id, file_name);
+        CREATE INDEX IF NOT EXISTS idx_export_metrics_export ON export_metrics(export_name, id DESC);",
+    ),
 ];
 
 /// PostgreSQL-compatible DDL.  Column types differ from SQLite (BIGSERIAL,
@@ -946,6 +980,33 @@ const PG_MIGRATIONS: &[(i64, &str)] = &[
             expires_at TIMESTAMPTZ NOT NULL
         );",
     ),
+    // v32: see the SQLite ladder. Postgres keeps the table and swaps its columns.
+    (
+        32,
+        "CREATE TABLE IF NOT EXISTS load_spec_version (
+            spec_id BIGSERIAL PRIMARY KEY,
+            export_name TEXT NOT NULL,
+            unit TEXT NOT NULL DEFAULT '',
+            columns_json TEXT NOT NULL,
+            primary_key_json TEXT,
+            captured_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_load_spec_version_unit ON load_spec_version(export_name, unit);
+        INSERT INTO load_spec_version (export_name, unit, columns_json, primary_key_json, captured_at)
+            SELECT export_name, unit, columns_json, primary_key_json, MIN(captured_at)
+            FROM export_load_spec_run
+            GROUP BY export_name, unit, columns_json, primary_key_json;
+        ALTER TABLE export_load_spec_run ADD COLUMN IF NOT EXISTS spec_id BIGINT;
+        UPDATE export_load_spec_run r SET spec_id = v.spec_id FROM load_spec_version v
+            WHERE v.export_name = r.export_name AND v.unit = r.unit
+              AND v.columns_json = r.columns_json
+              AND v.primary_key_json IS NOT DISTINCT FROM r.primary_key_json;
+        ALTER TABLE export_load_spec_run ALTER COLUMN spec_id SET NOT NULL;
+        ALTER TABLE export_load_spec_run DROP COLUMN IF EXISTS columns_json;
+        ALTER TABLE export_load_spec_run DROP COLUMN IF EXISTS primary_key_json;
+        CREATE INDEX IF NOT EXISTS idx_file_log_run ON file_log(run_id, file_name);
+        CREATE INDEX IF NOT EXISTS idx_export_metrics_export ON export_metrics(export_name, id DESC);",
+    ),
 ];
 
 // ─── SQLite migration ─────────────────────────────────────────────────────────
@@ -1287,8 +1348,11 @@ mod tests {
         // SQLite cannot ALTER a primary key, so a key change REBUILDS the table
         // (CREATE + copy) where Postgres alters in place: the one sanctioned
         // asymmetry, listed by version and table.
-        const REBUILT_ON_SQLITE_ONLY: &[(i64, &str)] =
-            &[(29, "cdc_snapshot"), (30, "export_state")];
+        const REBUILT_ON_SQLITE_ONLY: &[(i64, &str)] = &[
+            (29, "cdc_snapshot"),
+            (30, "export_state"),
+            (32, "export_load_spec_run"),
+        ];
         for &(v, sql) in MIGRATIONS {
             if let Some(pg_tables) = pg.get(&v) {
                 let mut sqlite_tables = table_names(sql);
