@@ -727,7 +727,7 @@ pub fn init(
     if matches!(format, InitFormat::Yaml) {
         refuse_unsupported_forced_mode(source_url, mode_override)?;
     }
-    let (text, yaml_decimal_review, snapshots) = match format {
+    let (scaffold, snapshots) = match format {
         InitFormat::Yaml => init_yaml(
             tls,
             source_url,
@@ -757,31 +757,26 @@ pub fn init(
                 );
             }
             (
-                init_discovery_json(tls, source_url, table, schema, filter)?,
-                false,
                 // `--discover` writes a SURVEY, not a config — there is no
                 // strategy decision to record the evidence for.
+                yaml_scaffold::Scaffold {
+                    text: init_discovery_json(tls, source_url, table, schema, filter)?,
+                    decisions: Default::default(),
+                },
                 Vec::new(),
             )
         }
     };
+    let yaml_scaffold::Scaffold { text, decisions } = scaffold;
 
-    let needs_cursor = match format {
-        InitFormat::Yaml => {
-            yaml_scaffold::exports_marked(&text, yaml_scaffold::INIT_CURSOR_REVIEW_MARKER)
-        }
-        InitFormat::DiscoveryJson => Vec::new(),
-    };
-    if !needs_cursor.is_empty() {
+    if !decisions.needs_cursor.is_empty() {
         eprintln!(
             "{}",
-            cursor_missing_message(&needs_cursor, mode_override, table.is_none())
+            cursor_missing_message(&decisions.needs_cursor, mode_override, table.is_none())
         );
     }
-    let runnable = needs_cursor.is_empty();
-    if matches!(format, InitFormat::Yaml) {
-        warn_marked_exports(&text);
-    }
+    let runnable = decisions.needs_cursor.is_empty();
+    warn_marked_exports(&decisions);
 
     match output {
         Some(path) => {
@@ -793,7 +788,7 @@ pub fn init(
                 InitFormat::DiscoveryJson => "Discovery artifact",
             };
             eprintln!("{label_written} written to {path}");
-            if matches!(format, InitFormat::Yaml) && yaml_decimal_review {
+            if decisions.decimal_review {
                 eprintln!(
                     "rivet: note: YAML uses default decimal(38,18) for column(s) with NUMERIC without (p,s) in the DDL — search for `{}` under columns: and fix before production.",
                     yaml_scaffold::INIT_DECIMAL_REVIEW_MARKER
@@ -805,16 +800,8 @@ pub fn init(
             if matches!(format, InitFormat::Yaml) && runnable {
                 eprint!(
                     "{}{}",
-                    next_steps_block(
-                        path,
-                        provenance,
-                        mode_override,
-                        has_baseline(&text),
-                        text.contains("\nload:"),
-                        text.contains("\n  layout: base_buffer"),
-                        has_delta_export(&text)
-                    ),
-                    no_load_note(&text)
+                    next_steps_block(path, provenance, mode_override, &decisions),
+                    no_load_note(&decisions)
                 );
             }
         }
@@ -825,16 +812,8 @@ pub fn init(
             if matches!(format, InitFormat::Yaml) && runnable {
                 eprint!(
                     "{}{}",
-                    next_steps_block(
-                        "rivet.yaml",
-                        provenance,
-                        mode_override,
-                        has_baseline(&text),
-                        text.contains("\nload:"),
-                        text.contains("\n  layout: base_buffer"),
-                        has_delta_export(&text)
-                    ),
-                    no_load_note(&text)
+                    next_steps_block("rivet.yaml", provenance, mode_override, &decisions),
+                    no_load_note(&decisions)
                 );
             }
         }
@@ -843,16 +822,9 @@ pub fn init(
     Ok(())
 }
 
-/// Whether a scaffold has an export in a delta mode, read from its `mode:` lines (a comment
-/// that mentions a mode is not one).
-fn has_delta_export(yaml: &str) -> bool {
-    yaml.lines()
-        .any(|l| matches!(l.trim(), "mode: cdc" | "mode: incremental"))
-}
-
 /// The next-steps line for a scaffold that left its `load:` block out because the loader refuses it.
-fn no_load_note(yaml: &str) -> &'static str {
-    if yaml.contains(yaml_scaffold::NO_LOAD_BLOCK) {
+fn no_load_note(d: &yaml_scaffold::ScaffoldDecisions) -> &'static str {
+    if d.load_refused {
         "\nNo `load:` block: `rivet load` cannot take this source's CDC stream yet (the reason \
          is in the file). `rivet run` writes its Parquet; load those parts with your own tooling.\n"
     } else {
@@ -860,26 +832,23 @@ fn no_load_note(yaml: &str) -> &'static str {
     }
 }
 
-/// Whether a scaffold's CDC exports carry a first-run baseline, read from their `cdc:` keys.
-fn has_baseline(yaml: &str) -> bool {
-    yaml.lines()
-        .any(|l| l.starts_with("      backfill: auto") || l.starts_with("      initial: snapshot"))
-}
-
 /// The friendly "do this next" ladder printed after a YAML scaffold. For an
 /// inline `--source` URL it leads with a step-0 export reminder, because the
 /// scaffold deliberately writes `url_env: DATABASE_URL` (it never persists the
 /// literal URL) and would otherwise fail on an unset variable.
-/// `has_baseline` is read off the scaffold itself ([`has_baseline`]).
 fn next_steps_block(
     path: &str,
     provenance: &SourceProvenance,
     mode: Option<&str>,
-    has_baseline: bool,
-    has_load: bool,
-    has_compact: bool,
-    has_delta: bool,
+    d: &yaml_scaffold::ScaffoldDecisions,
 ) -> String {
+    let yaml_scaffold::ScaffoldDecisions {
+        has_baseline,
+        has_load,
+        compacts: has_compact,
+        has_delta,
+        ..
+    } = *d;
     let mut s = String::from("\nNext steps:\n");
     if matches!(provenance, SourceProvenance::Inline) {
         s.push_str(
@@ -1115,30 +1084,20 @@ fn init_yaml(
     dest: &InitYamlDestination,
     filter: &TableFilter,
     mode_override: Option<&str>,
-) -> Result<(String, bool, Vec<crate::state::StrategySnapshot>)> {
+) -> Result<(yaml_scaffold::Scaffold, Vec<crate::state::StrategySnapshot>)> {
     if let Some(t) = table {
         let info = introspect_single_table(tls, source_url, t, schema)?;
-        let hint = yaml_scaffold::table_has_unbounded_decimal_columns(&info);
         let snaps = vec![snapshot_of(&info, mode_override, source_url)];
-        let yaml = yaml_scaffold::generate_config(
-            &info,
-            source_url,
-            provenance,
-            dest,
-            mode_override,
-            tls,
-        )?;
-        return Ok((yaml, hint, snaps));
+        let scaffold =
+            yaml_scaffold::scaffold_table(&info, source_url, provenance, dest, mode_override, tls)?;
+        return Ok((scaffold, snaps));
     }
     let infos = introspect_all(tls, source_url, schema, filter)?;
     if infos.is_empty() {
         return Err(no_tables_error(filter));
     }
     let label = schema_scope_label(source_url, schema, infos.len())?;
-    let hint = infos
-        .iter()
-        .any(yaml_scaffold::table_has_unbounded_decimal_columns);
-    let yaml = yaml_scaffold::generate_schema_config(
+    let scaffold = yaml_scaffold::scaffold_schema(
         &infos,
         source_url,
         provenance,
@@ -1151,7 +1110,7 @@ fn init_yaml(
         .iter()
         .map(|i| snapshot_of(i, mode_override, source_url))
         .collect();
-    Ok((yaml, hint, snaps))
+    Ok((scaffold, snaps))
 }
 
 /// The decision plus the EVIDENCE it was made from, for the state store.
@@ -1205,30 +1164,28 @@ fn cursor_missing_message(names: &[String], mode: Option<&str>, whole_schema: bo
     )
 }
 
-/// One line per informational marker, naming every export that carries it.
-fn warn_marked_exports(text: &str) {
-    let skipped = yaml_scaffold::skipped_tables(text);
-    if !skipped.is_empty() {
+/// One line per informational decision, naming every export it was made for.
+fn warn_marked_exports(d: &yaml_scaffold::ScaffoldDecisions) {
+    if !d.skipped.is_empty() {
         eprintln!(
             "rivet: {} table(s) were left out of the config — see the `# SKIPPED` comments \
              for why: {}",
-            skipped.len(),
-            skipped.join(", ")
+            d.skipped.len(),
+            d.skipped.join(", ")
         );
     }
-    for (marker, what) in [
+    for (names, what) in [
         (
-            yaml_scaffold::INIT_INSERT_ONLY_MARKER,
+            &d.insert_only,
             "use a cursor that does not change on UPDATE: updated rows are never re-exported \
              (set `cursor_column:` to an updated_at-style column, or use `mode: cdc`)",
         ),
         (
-            yaml_scaffold::INIT_NO_CHUNK_KEY_MARKER,
+            &d.no_chunk_key,
             "have no integer column or keysettable primary key, so they were written as \
              `mode: full` instead of `chunked`",
         ),
     ] {
-        let names = yaml_scaffold::exports_marked(text, marker);
         if !names.is_empty() {
             eprintln!(
                 "rivet: {} export(s) {what}: {}",
@@ -1644,16 +1601,8 @@ fn relation_for_key(
 
 #[cfg(test)]
 mod tests {
+    use super::yaml_scaffold::ScaffoldDecisions;
 
-    /// `has_baseline` reads only the two baseline keys at the `cdc:` child indent.
-    #[test]
-    fn has_baseline_is_true_only_for_a_baseline_key_under_cdc() {
-        assert!(has_baseline("    cdc:\n      backfill: auto\n"));
-        assert!(has_baseline("    cdc:\n      initial: snapshot\n"));
-        assert!(!has_baseline("    cdc:\n      slot: s\n"));
-        assert!(!has_baseline("# initial: snapshot is not used here\n"));
-        assert!(!has_baseline("  initial: snapshot\n"));
-    }
     /// Recording primary keys must not re-load and re-VALIDATE the config.
     #[test]
     fn recording_primary_keys_does_not_validate_the_whole_config() {
@@ -1684,17 +1633,41 @@ mod tests {
         );
     }
 
-    /// Every export that needs a cursor is named at once, read from the scaffold text.
+    /// Every table the scaffold leaves out is named, in config order, from the decision that left it out.
     #[test]
-    fn every_skipped_table_is_named_from_its_comment() {
-        let cfg = "exports:\n  # SKIPPED Orders: its name cannot be a `table:` shortcut\n  \
-                   #   (wrapped)\n  - name: kept\n  # SKIPPED collection user-events: its name \
-                   cannot pass the `table:`\n";
+    fn every_skipped_table_is_named_from_the_decision() {
+        let named = |n: &str| TableInfo {
+            table: n.into(),
+            ..make_table(100, vec![col("id", "bigint", true)])
+        };
+        let decided = |url: &str, mode: Option<&str>, tables: &[&str]| {
+            let infos: Vec<TableInfo> = tables.iter().map(|n| named(n)).collect();
+            yaml_scaffold::scaffold_schema(
+                &infos,
+                url,
+                &SourceProvenance::Inline,
+                "db",
+                &InitYamlDestination::default(),
+                mode,
+                None,
+            )
+            .unwrap()
+            .decisions
+            .skipped
+        };
         assert_eq!(
-            yaml_scaffold::skipped_tables(cfg),
-            vec!["Orders".to_string(), "user-events".to_string()]
+            decided(
+                "postgresql://u:p@h/db",
+                Some("cdc"),
+                &["Orders", "kept", "Items"]
+            ),
+            vec!["Orders".to_string(), "Items".to_string()]
         );
-        assert!(yaml_scaffold::skipped_tables("exports:\n  - name: a\n").is_empty());
+        assert_eq!(
+            decided("mongodb://u:p@h/db", None, &["user-events", "kept"]),
+            vec!["user-events".to_string()]
+        );
+        assert!(decided("postgresql://u:p@h/db", None, &["a", "b"]).is_empty());
     }
 
     #[test]
@@ -1715,26 +1688,45 @@ mod tests {
 
     #[test]
     fn exports_needing_a_cursor_names_every_one_of_them() {
-        use super::yaml_scaffold::{INIT_CURSOR_REVIEW_MARKER, exports_marked};
-        let exports_needing_a_cursor = |t: &str| exports_marked(t, INIT_CURSOR_REVIEW_MARKER);
-        let cfg = format!(
-            "exports:\n\
-             \x20 - name: good_one\n    mode: incremental\n    cursor_column: updated_at\n\
-             \x20 - name: no_stamp_a\n    mode: incremental\n    # {m} — set cursor_column: <col> manually\n\
-             \x20 - name: also_good\n    mode: incremental\n    cursor_column: changed_at\n\
-             \x20 - name: no_stamp_b\n    mode: incremental\n    # {m} — set cursor_column: <col> manually\n",
-            m = INIT_CURSOR_REVIEW_MARKER
-        );
-        assert_eq!(
-            exports_needing_a_cursor(&cfg),
-            vec!["no_stamp_a".to_string(), "no_stamp_b".to_string()],
-            "every offender, in file order — naming only the first is what made \
-             finding three take three init runs"
-        );
+        let stamped = |n: &str| TableInfo {
+            table: n.into(),
+            ..make_table(100, vec![col("updated_at", "timestamp", false)])
+        };
+        let unstamped = |n: &str| TableInfo {
+            table: n.into(),
+            ..make_table(100, vec![col("email", "text", false)])
+        };
+        let needs_cursor = |mode: &str, infos: &[TableInfo]| {
+            yaml_scaffold::scaffold_schema(
+                infos,
+                "postgresql://u:p@h/db",
+                &SourceProvenance::Inline,
+                "db",
+                &InitYamlDestination::default(),
+                Some(mode),
+                None,
+            )
+            .unwrap()
+            .decisions
+            .needs_cursor
+        };
+        let infos = [
+            stamped("good_one"),
+            unstamped("no_stamp_a"),
+            stamped("also_good"),
+            unstamped("no_stamp_b"),
+        ];
+        for mode in ["incremental", "time_window"] {
+            assert_eq!(
+                needs_cursor(mode, &infos),
+                vec!["no_stamp_a".to_string(), "no_stamp_b".to_string()],
+                "{mode}: every offender, in file order — naming only the first is what made \
+                 finding three take three init runs"
+            );
+        }
         assert!(
-            exports_needing_a_cursor("exports:\n  - name: fine\n    cursor_column: ts\n")
-                .is_empty(),
-            "a scaffold with no marker reports nothing"
+            needs_cursor("incremental", &infos[..1]).is_empty(),
+            "a scaffold with a cursor for every export reports nothing"
         );
     }
 
@@ -1804,10 +1796,10 @@ mod tests {
             "rivet.yaml",
             &super::SourceProvenance::Env("X".into()),
             Some("cdc"),
-            true,
-            false,
-            false,
-            false,
+            &ScaffoldDecisions {
+                has_baseline: true,
+                ..Default::default()
+            },
         );
         assert!(s.contains("rivet doctor -c rivet.yaml"), "block:\n{s}");
         assert!(
@@ -1825,10 +1817,7 @@ mod tests {
             "rivet.yaml",
             &super::SourceProvenance::Env("X".into()),
             Some("cdc"),
-            false,
-            false,
-            false,
-            false,
+            &ScaffoldDecisions::default(),
         );
         assert!(
             s.contains("CHANGES ONLY") && !s.contains("through its recipe"),
@@ -1842,25 +1831,17 @@ mod tests {
     /// with a warehouse printed both lines while its own `load:` comment said every
     /// load OVERWRITES the table and compact would only say "skipped".
     #[test]
-    fn a_delta_export_is_read_from_mode_lines_not_comments() {
-        assert!(super::has_delta_export("    mode: incremental\n"));
-        assert!(super::has_delta_export("    mode: cdc\n"));
-        assert!(!super::has_delta_export(
-            "    mode: full\n    # switch to `mode: incremental` on 'updated_at'\n"
-        ));
-    }
-
-    #[test]
     fn next_steps_block_prescribes_compact_only_for_a_base_and_buffer_scaffold() {
         let block = |has_compact: bool| {
             super::next_steps_block(
                 "rivet.yaml",
                 &super::SourceProvenance::Env("X".into()),
                 None,
-                false,
-                true,
-                has_compact,
-                false,
+                &ScaffoldDecisions {
+                    has_load: true,
+                    compacts: has_compact,
+                    ..Default::default()
+                },
             )
         };
         let compacting = block(true);
@@ -1882,10 +1863,11 @@ mod tests {
             "rivet.yaml",
             &super::SourceProvenance::Env("X".into()),
             Some("cdc"),
-            false,
-            true,
-            false,
-            true,
+            &ScaffoldDecisions {
+                has_load: true,
+                has_delta: true,
+                ..Default::default()
+            },
         );
         assert!(
             appending.contains("appends to <table>__changes")
@@ -1896,10 +1878,10 @@ mod tests {
             "rivet.yaml",
             &super::SourceProvenance::Env("X".into()),
             Some("cdc"),
-            false,
-            false,
-            false,
-            true,
+            &ScaffoldDecisions {
+                has_delta: true,
+                ..Default::default()
+            },
         );
         assert!(
             !no_load.contains("rivet load"),
@@ -1913,10 +1895,7 @@ mod tests {
             "rivet.yaml",
             &super::SourceProvenance::Env("X".into()),
             None,
-            false,
-            false,
-            false,
-            false,
+            &ScaffoldDecisions::default(),
         );
         // The core three-step path is always present.
         assert!(s.contains("rivet doctor -c rivet.yaml"), "block:\n{s}");
@@ -2704,27 +2683,20 @@ mod tests {
         );
     }
 
-    fn scaffold(info: &TableInfo, mode: Option<&str>) -> String {
-        let dest = InitYamlDestination {
-            gcs_bucket: None,
-            gcs_credentials_file: None,
-            s3_bucket: None,
-            s3_region: None,
-            bigquery_project: None,
-            bigquery_dataset: None,
-            clickhouse_url: None,
-            clickhouse_database: None,
-            clickhouse_user: None,
-        };
-        yaml_scaffold::generate_config(
+    fn scaffolded(info: &TableInfo, mode: Option<&str>) -> yaml_scaffold::Scaffold {
+        yaml_scaffold::scaffold_table(
             info,
             "postgresql://localhost/db",
             &super::SourceProvenance::Inline,
-            &dest,
+            &InitYamlDestination::default(),
             mode,
             None,
         )
         .unwrap()
+    }
+
+    fn scaffold(info: &TableInfo, mode: Option<&str>) -> String {
+        scaffolded(info, mode).text
     }
 
     #[test]
@@ -2743,7 +2715,7 @@ mod tests {
         assert!(yaml.contains("    mode: full"), "got:\n{yaml}");
         assert!(!yaml.contains("chunk_column"), "got:\n{yaml}");
         assert_eq!(
-            yaml_scaffold::exports_marked(&yaml, yaml_scaffold::INIT_NO_CHUNK_KEY_MARKER),
+            scaffolded(&info, Some("chunked")).decisions.no_chunk_key,
             vec!["orders".to_string()]
         );
         let d = yaml_scaffold::decided_strategy(&info, Some("chunked"), true);
@@ -2811,7 +2783,9 @@ mod tests {
         );
         let yaml = scaffold(&by_id, Some("incremental"));
         assert_eq!(
-            yaml_scaffold::exports_marked(&yaml, yaml_scaffold::INIT_INSERT_ONLY_MARKER),
+            scaffolded(&by_id, Some("incremental"))
+                .decisions
+                .insert_only,
             vec!["orders".to_string()],
             "got:\n{yaml}"
         );
@@ -2824,7 +2798,10 @@ mod tests {
         );
         let yaml = scaffold(&by_stamp, Some("incremental"));
         assert!(
-            yaml_scaffold::exports_marked(&yaml, yaml_scaffold::INIT_INSERT_ONLY_MARKER).is_empty(),
+            scaffolded(&by_stamp, Some("incremental"))
+                .decisions
+                .insert_only
+                .is_empty(),
             "got:\n{yaml}"
         );
     }
