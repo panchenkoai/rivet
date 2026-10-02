@@ -1693,7 +1693,7 @@ jobs:
         env:
           SKIP_CEILING: 49
           PARTIAL_CEILING: 39
-          FIRST_RUN_CEILING: 277
+          FIRST_RUN_CEILING: 288  # +11 (#402): its Oracle anchor tests open a fresh stream per anchor
           # Timing moves a few verdicts between runs of one commit (measured: cdc.backfill 14-16,
           # first-run CDC 103-105); each ceiling allows that much and no more.
           NOISE: 3
