@@ -1303,21 +1303,32 @@ def _db_name(url: str) -> str:
     return re.sub(r".*/([^/?]+).*", r"\1", url)
 
 
+#: Drops every table of the connection's current schema: derived from the catalog, so a table added by a later migration cannot survive a reset.
+_PG_STATE_RESET_SQL = (
+    "DO $$ DECLARE t text; BEGIN "
+    "FOR t IN SELECT tablename FROM pg_tables WHERE schemaname = current_schema() LOOP "
+    "EXECUTE format('DROP TABLE IF EXISTS %I CASCADE', t); END LOOP; END $$;"
+)
+
+
+def _gate_owned_state_db(db: str) -> bool:
+    """Whether `db` is a per-run gate state database (core.isolate_state_db), the only kind a reset may empty."""
+    return db.startswith("rivet_state_gate_")
+
+
 def _cdc_pg_state_reset(surl: str) -> None:
     """Reset the PG state db to empty so a parity snapshot reflects ONE run, not
     the accumulated history (the SQLite leg is a fresh file per run)."""
     c = _container_for(surl)
     if c is None:
         return
-    tables = (
-        "run_status,export_metrics,run_journal,run_aggregate,export_state,export_schema,"
-        "schema_version,rivet_schema_version,cdc_snapshot,file_log,chunk_run,chunk_task,"
-        "keyset_range,export_progression,export_shape,export_harm,load_run,loaded_source_run"
-    )
-    docker_exec(
-        c, "psql", "-U", "rivet", "-d", _db_name(surl), "-q", "-c",
-        f"DROP TABLE IF EXISTS {tables} CASCADE;",
-    )
+    db = _db_name(surl)
+    if not _gate_owned_state_db(db):
+        raise RuntimeError(
+            f"cdc state-parity: refusing to empty '{db}': only a per-run gate state db "
+            "(rivet_state_gate_*) may be reset"
+        )
+    docker_exec(c, "psql", "-U", "rivet", "-d", db, "-q", "-v", "ON_ERROR_STOP=1", "-c", _PG_STATE_RESET_SQL)
 
 
 def _cdc_state_snapshot_pg(surl: str) -> dict[str, str]:
