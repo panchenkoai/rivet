@@ -1692,3 +1692,55 @@ fn cleanup_and_gc_on_s3_spare_a_sibling_prefix() {
 fn cleanup_and_gc_on_azure_spare_a_sibling_prefix() {
     a_cleaned_prefix_spares_its_sibling(Store::Azure);
 }
+
+/// A `keyset_incremental` export delivers only the keys past its anchor, so its load
+/// must accumulate: each run's delta joins the earlier rows, and a run with no new key
+/// leaves the table as it was rather than replacing it with nothing.
+#[test]
+#[ignore = "live: requires clickhouse + fake-gcs + postgres"]
+fn a_keyset_incremental_export_into_clickhouse_accumulates_every_run() {
+    require_alive(LiveService::ClickHouse);
+    require_alive(LiveService::FakeGcs);
+    ensure_gcs_bucket(BUCKET);
+    let (tbl, _t, mut c) = pg_batch_seeded("rivet_ch_ksinc", 100);
+    let db = Db::new("rivet_chtest");
+    let rig = batch_into_clickhouse(
+        Rig::pg_batch(&tbl).restage(
+            "chunked",
+            &[
+                "chunk_by_key: id",
+                "chunk_size: 30",
+                "keyset_incremental: true",
+            ],
+        ),
+        &db,
+    );
+    let loaded = || {
+        clickhouse_rows(&format!(
+            "SELECT id, v FROM {}.{tbl} ORDER BY id FORMAT TSV",
+            db.0
+        ))
+    };
+
+    rig.run_ok();
+    load(&rig);
+    assert_eq!(loaded().len(), 100, "the first run loads the whole table");
+    assert_eq!(loaded(), pg_rows(&mut c, &tbl));
+
+    c.batch_execute(&format!(
+        "INSERT INTO {tbl} SELECT g, g, TIMESTAMP '2026-01-02' FROM generate_series(101, 120) g"
+    ))
+    .expect("insert new keys");
+    rig.run_ok();
+    load(&rig);
+    assert_eq!(loaded().len(), 120, "the delta joins the earlier rows");
+    assert_eq!(loaded(), pg_rows(&mut c, &tbl));
+
+    rig.run_ok();
+    load(&rig);
+    assert_eq!(
+        loaded(),
+        pg_rows(&mut c, &tbl),
+        "a run with no new key changes nothing"
+    );
+}

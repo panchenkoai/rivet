@@ -1131,3 +1131,58 @@ fn bigquery_incremental_onto_a_table_already_in_the_dataset_is_refused_every_tim
         "a stop before the write is journaled `refused`, never `failed`"
     );
 }
+
+/// A `keyset_incremental` export delivers only the keys past its anchor, so its load
+/// must accumulate: each run's delta joins the earlier rows, and a run with no new key
+/// leaves the table as it was rather than replacing it with nothing.
+#[test]
+#[ignore = "live: requires docker compose up -d postgres + BigQuery creds"]
+fn bigquery_keyset_incremental_load_accumulates_every_run() {
+    let Some(bq) = BqLive::from_env("bq_keyset_inc") else {
+        return;
+    };
+    let e = SqlEngine::Pg;
+    e.alive();
+    let (table, _guard) = e.table("bq_keyset_inc");
+    let changes = format!("{table}__changes");
+    let _cleanup = bq.cleanup(&[&table, &changes]);
+    e.insert(&table, 1..=100, 10, Some(1));
+    let rig = e
+        .rig(&table)
+        .restage(
+            "chunked",
+            &[
+                "chunk_by_key: id",
+                "chunk_size: 30",
+                "keyset_incremental: true",
+            ],
+        )
+        .dest_gcs_live(&bq.bucket, &bq.prefix)
+        .top_line(&bq.load_line(""));
+    let ids = || {
+        let rows = bq.read_bq_rows(&format!(
+            "SELECT COUNT(*) AS n, COUNT(DISTINCT id) AS d, MIN(id) AS lo, MAX(id) AS hi \
+             FROM `{}.{}.{table}`",
+            bq.project, bq.dataset
+        ));
+        ["n", "d", "lo", "hi"].map(|k| rows[0][k].as_str().unwrap_or("NULL").to_string())
+    };
+    let ids_1_to = |n: i64| [n, n, 1, n].map(|v| v.to_string());
+
+    rig.run_ok();
+    load_ok(&rig);
+    assert_eq!(ids(), ids_1_to(100), "the first run loads the whole table");
+
+    e.insert(&table, 101..=120, 5, Some(2));
+    rig.run_ok();
+    load_ok(&rig);
+    assert_eq!(ids(), ids_1_to(120), "the delta joins the earlier rows");
+
+    rig.run_ok();
+    load_ok(&rig);
+    assert_eq!(
+        ids(),
+        ids_1_to(120),
+        "a run with no new key changes nothing"
+    );
+}
