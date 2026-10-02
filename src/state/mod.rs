@@ -113,6 +113,14 @@ pub enum StateRef {
     Postgres(String),
 }
 
+/// An error with its cause appended: `postgres::Error` displays only "db error", the server's message is its source.
+pub(super) fn pg_detail(e: &dyn std::error::Error) -> String {
+    match e.source() {
+        Some(cause) => format!("{e}: {cause}"),
+        None => e.to_string(),
+    }
+}
+
 /// Redact the password from a PostgreSQL URL for safe use in log/error messages.
 /// `postgresql://user:SECRET@host/db` → `postgresql://user:***@host/db`
 /// Uses `rfind('@')` so passwords containing `@` are handled correctly.
@@ -518,6 +526,30 @@ mod tests {
         assert_eq!(pg_sql("no placeholders"), "no placeholders");
         // ?N with two digits
         assert_eq!(pg_sql("?10 AND ?11"), "$10 AND $11");
+    }
+
+    #[test]
+    fn pg_detail_appends_the_cause_the_error_itself_does_not_print() {
+        #[derive(Debug)]
+        struct Outer(std::io::Error);
+        impl std::fmt::Display for Outer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("db error")
+            }
+        }
+        impl std::error::Error for Outer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let e = Outer(std::io::Error::other(
+            "ERROR: column \"columns_json\" does not exist",
+        ));
+        assert_eq!(
+            pg_detail(&e),
+            "db error: ERROR: column \"columns_json\" does not exist"
+        );
+        assert_eq!(pg_detail(&std::io::Error::other("plain")), "plain");
     }
 
     #[test]
