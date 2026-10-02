@@ -181,7 +181,8 @@ writing, `run_export_job` graded `summary.total_rows` after the runner returned,
 behind a `matches!(strategy, Chunked | Keyset)` allow-list — and the second home
 checked row counts only. The sink's `QualityTracker` is now an `Observations`
 field: every runner already hands it on with `take_observations` / `take_shape`,
-the ledger merges the sinks (counts add, distinct sets union), and
+the ledger merges the sinks (null counts add, distinct sets union up to
+`unique_max_entries`, counting only the values folded in), and
 `finalize_export` grades the merge once against `plan.quality`. Null-ratio and
 uniqueness reach every runner; a runner with no `quality:` block is graded by
 nothing. The cost, accepted: `single` now fails after its parts are durable, as
