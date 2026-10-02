@@ -961,3 +961,73 @@ fn oracle_cdc_byte_cap_counts_the_first_row_and_defers_not_drops() {
         "the refused transaction is re-read on the next run, never skipped"
     );
 }
+
+/// Runs that mine while another session switches the redo log in a tight loop deliver every row exactly once.
+#[test]
+#[ignore = "live: requires the oracle service with LogMiner prerequisites"]
+fn oracle_cdc_a_redo_log_switch_during_mining_is_re_mined_not_failed() {
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    let _serial = cross_process_serial("oracle_cdc");
+    let d = tempfile::tempdir().unwrap();
+    let t = cdc_table("ora_cswitch", "id NUMBER(18) PRIMARY KEY, v NUMBER(18)");
+    let ckpt = d.path().join("cdc.ckpt");
+    rig(&t, &ckpt, &d.path().join("anchor")).run_ok();
+    const ROWS: i64 = 3000;
+    const RUNS: usize = 12;
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let writer = {
+        let sql = format!(
+            "BEGIN FOR i IN 1..{ROWS} LOOP INSERT INTO {} VALUES (i, i); COMMIT; END LOOP; END;",
+            t.name()
+        );
+        std::thread::spawn(move || ora_conn().execute(&sql, &[]).unwrap())
+    };
+    let switcher = {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            let root = ORACLE_URL
+                .replace("rivet:rivet@", "system:rivet@")
+                .replace("/FREEPDB1", "/FREE");
+            let cdb = ora_conn_to(&root);
+            let mut n = 0u32;
+            while !stop.load(Relaxed) {
+                cdb.execute("ALTER SYSTEM SWITCH LOGFILE", &[]).unwrap();
+                n += 1;
+            }
+            n
+        })
+    };
+    let mut failures = Vec::new();
+    let mut outs = Vec::new();
+    let mut replans = 0;
+    for i in 0..RUNS {
+        let out = d.path().join(format!("out{i}"));
+        let run = rig(&t, &ckpt, &out).run();
+        let err = String::from_utf8_lossy(&run.stderr).into_owned();
+        replans += err.matches("re-planning the logs").count();
+        if !run.status.success() {
+            failures.push(err.lines().last().unwrap_or_default().to_string());
+        }
+        outs.push(out);
+    }
+    writer.join().unwrap();
+    stop.store(true, Relaxed);
+    let switches = switcher.join().unwrap();
+    let last = d.path().join("last");
+    rig(&t, &ckpt, &last).run_ok();
+    outs.push(last);
+    assert!(
+        failures.is_empty(),
+        "{} of {RUNS} runs failed under {switches} log switches: {failures:#?}",
+        failures.len()
+    );
+    let mut got: Vec<(i64, String)> = outs.iter().flat_map(|o| cdc_id_ops(o)).collect();
+    got.sort();
+    let want: Vec<(i64, String)> = (1..=ROWS).map(|i| (i, "insert".to_string())).collect();
+    assert_eq!(got, want, "every row exactly once across the runs");
+    eprintln!("{replans} re-plans over {RUNS} runs under {switches} log switches");
+    assert!(
+        replans > 0,
+        "no run met a changed log set, so the storm proved nothing"
+    );
+}

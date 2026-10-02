@@ -367,6 +367,43 @@ pub(crate) fn frontier_is_due(
     exhausted && !outstanding && frontier.commit_scn > from.commit_scn
 }
 
+/// How many times one stream re-plans its logs after the redo log set changed under LogMiner.
+const REMINE_ATTEMPTS: u32 = 5;
+
+/// Whether an ORA code means a registered redo file no longer holds what was listed: ORA-00310
+/// (archived log holds another sequence), ORA-01291 (missing log file), ORA-01368 (log header
+/// mismatch). Oracle's action for each is to register the right file, so none is a setup error.
+pub(crate) fn log_set_changed(code: u32) -> bool {
+    matches!(code, 310 | 1291 | 1368)
+}
+
+/// Whether a rendered driver error (never rivet's own `oracle cdc:` verdict) carries any ORA code
+/// [`log_set_changed`] accepts.
+pub(crate) fn names_a_log_set_change(rendered: &str) -> bool {
+    !rendered.contains("oracle cdc:")
+        && rendered
+            .match_indices("ORA-")
+            .filter_map(|(i, _)| rendered.get(i + 4..i + 9)?.parse().ok())
+            .any(log_set_changed)
+}
+
+/// The wait before re-plan `attempt` (0-based), or `None` when the attempts are spent.
+pub(crate) fn remine_backoff(attempt: u32) -> Option<std::time::Duration> {
+    (attempt < REMINE_ATTEMPTS).then(|| std::time::Duration::from_millis(200 << attempt))
+}
+
+/// `e` as rivet's own verdict when the log set kept changing (no setup hint rides on it), else `e`.
+pub(crate) fn log_set_changed_error(e: anyhow::Error) -> anyhow::Error {
+    if !names_a_log_set_change(&format!("{e:#}")) {
+        return e;
+    }
+    e.context(format!(
+        "oracle cdc: the redo log changed under LogMiner {REMINE_ATTEMPTS} times while mining \
+         (a log switch reused or archived a file it had registered); nothing past the last \
+         acknowledged change was checkpointed, so rerunning resumes without loss"
+    ))
+}
+
 /// A configured table resolved to the catalog, with the spelling its events carry.
 #[derive(Debug, Clone)]
 struct Captured {
@@ -640,7 +677,8 @@ fn pin_frontier(conn: &Connection, low_water: u64) -> Result<Scns> {
     })
 }
 
-/// The available redo files of the current incarnation.
+/// The available redo files of the current incarnation, online read FIRST: a group is archived
+/// before it is reused, so a sequence that leaves the online list in between is already archived.
 fn list_logs(conn: &Connection, resetlogs: &str) -> Result<(Vec<LogFile>, Vec<LogFile>)> {
     let parse = |r: Vec<Option<String>>| -> Option<LogFile> {
         let n = |i: usize| r.get(i)?.as_deref()?.parse::<u64>().ok();
@@ -652,15 +690,6 @@ fn list_logs(conn: &Connection, resetlogs: &str) -> Result<(Vec<LogFile>, Vec<Lo
             next: n(4).unwrap_or(u64::MAX),
         })
     };
-    let archived = rows(
-        conn,
-        &format!(
-            "SELECT name, TO_CHAR(thread#), TO_CHAR(sequence#), TO_CHAR(first_change#), \
-                    TO_CHAR(next_change#) FROM v$archived_log \
-              WHERE status = 'A' AND deleted = 'NO' AND name IS NOT NULL \
-                AND resetlogs_change# = {resetlogs} ORDER BY dest_id, thread#, sequence#"
-        ),
-    )?;
     let online = rows(
         conn,
         "SELECT MIN(f.member), TO_CHAR(l.thread#), TO_CHAR(l.sequence#), \
@@ -669,6 +698,15 @@ fn list_logs(conn: &Connection, resetlogs: &str) -> Result<(Vec<LogFile>, Vec<Lo
            FROM v$log l JOIN v$logfile f ON f.group# = l.group# \
           WHERE l.status <> 'UNUSED' GROUP BY l.thread#, l.sequence#, l.first_change#, \
                 l.next_change#, l.status ORDER BY l.thread#, l.sequence#",
+    )?;
+    let archived = rows(
+        conn,
+        &format!(
+            "SELECT name, TO_CHAR(thread#), TO_CHAR(sequence#), TO_CHAR(first_change#), \
+                    TO_CHAR(next_change#) FROM v$archived_log \
+              WHERE status = 'A' AND deleted = 'NO' AND name IS NOT NULL \
+                AND resetlogs_change# = {resetlogs} ORDER BY dest_id, thread#, sequence#"
+        ),
     )?;
     Ok((
         archived.into_iter().filter_map(parse).collect(),
@@ -764,6 +802,10 @@ pub(crate) struct OracleChangeStream {
     pending_truncate: Option<String>,
     /// An event was handed out since the last ack, so a TRUNCATE must wait for it to be flushed.
     yielded_since_ack: bool,
+    /// The commit SCN of the last whole commit group queued; a re-mine resumes after it.
+    mined_through: u64,
+    /// Re-plans spent on a redo log set that changed under LogMiner.
+    remines: u32,
 }
 
 /// One mined row that matters to the stream.
@@ -836,15 +878,10 @@ impl OracleChangeStream {
                 frontier
             }
         };
-        let cursor = if from.commit_scn >= frontier.commit_scn {
-            None
-        } else {
-            Some(start_mining(&conn, &identity, &captured, from, frontier)?)
-        };
-        Ok(Self {
+        let mut stream = Self {
             conn,
-            exhausted: cursor.is_none(),
-            cursor,
+            exhausted: from.commit_scn >= frontier.commit_scn,
+            cursor: None,
             tables: captured,
             identity,
             from,
@@ -855,7 +892,58 @@ impl OracleChangeStream {
             outstanding: None,
             pending_truncate: None,
             yielded_since_ack: false,
-        })
+            mined_through: from.commit_scn,
+            remines: 0,
+        };
+        if !stream.exhausted {
+            stream.mine()?;
+        }
+        Ok(stream)
+    }
+
+    /// (Re)start mining the same window after the last queued commit group, re-planning the logs
+    /// with backoff while the log set changes under LogMiner.
+    fn mine(&mut self) -> Result<()> {
+        self.cursor = None;
+        self.carry = None;
+        let after = Scns {
+            low_water: self.from.low_water,
+            commit_scn: self.mined_through,
+        };
+        loop {
+            let _ = self
+                .conn
+                .execute("BEGIN SYS.DBMS_LOGMNR.END_LOGMNR; END;", &[]);
+            match start_mining(
+                &self.conn,
+                &self.identity,
+                &self.tables,
+                after,
+                self.frontier,
+            ) {
+                Ok(cursor) => {
+                    self.cursor = Some(cursor);
+                    return Ok(());
+                }
+                Err(e) => self.wait_to_remine(e)?,
+            }
+        }
+    }
+
+    /// Sleep before the next re-plan when `e` is a log-set change with attempts left; else the error.
+    fn wait_to_remine(&mut self, e: anyhow::Error) -> Result<()> {
+        match remine_backoff(self.remines) {
+            Some(wait) if names_a_log_set_change(&format!("{e:#}")) => {
+                log::warn!(
+                    "oracle cdc: the redo log changed under LogMiner ({e:#}); re-planning the \
+                     logs in {wait:?}"
+                );
+                self.remines += 1;
+                std::thread::sleep(wait);
+                Ok(())
+            }
+            _ => Err(log_set_changed_error(e)),
+        }
     }
 
     /// The next mined change or captured-table TRUNCATE, or `None` at the end of the window.
@@ -1016,6 +1104,7 @@ impl OracleChangeStream {
             order.into_iter().filter_map(|i| slots[i].take()).collect();
         TxnFramer::close_group(&mut events, &pos);
         self.queue.extend(events);
+        self.mined_through = commit;
         Ok(true)
     }
 
@@ -1175,11 +1264,15 @@ impl ChangeStream for OracleChangeStream {
         {
             return Some(Err(truncate_error(why.clone())));
         }
-        if self.queue.is_empty() && !self.exhausted {
+        while self.queue.is_empty() && !self.exhausted {
             match self.fill() {
                 Ok(true) => {}
                 Ok(false) => self.exhausted = true,
-                Err(e) => return Some(Err(e)),
+                Err(e) => {
+                    if let Err(e) = self.wait_to_remine(e).and_then(|()| self.mine()) {
+                        return Some(Err(e));
+                    }
+                }
             }
         }
         match self.queue.pop_front() {
@@ -1291,6 +1384,97 @@ pub(crate) fn pin_checkpoint_at_current(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only the documented "registered file no longer matches" codes re-plan; grants and corruption do not.
+    #[test]
+    fn only_a_changed_log_set_is_re_mined() {
+        for (code, want) in [
+            (310, true),
+            (1291, true),
+            (1368, true),
+            (0, false),
+            (309, false),
+            (311, false),
+            (353, false),
+            (368, false),
+            (1031, false),
+            (1284, false),
+            (1290, false),
+            (1292, false),
+            (1307, false),
+            (1367, false),
+            (1369, false),
+        ] {
+            assert_eq!(log_set_changed(code), want, "ORA-{code:05}");
+        }
+    }
+
+    /// The code is read from the driver's rendering; rivet's own verdicts never re-mine.
+    #[test]
+    fn a_log_set_change_is_read_from_the_driver_text_only() {
+        for (text, want) in [
+            (
+                "oracle: ORA-01368: Redo log file header mismatch for thread 1 sequence 5757.",
+                true,
+            ),
+            (
+                "oracle: ORA-06512: at line 1\nORA-01291: missing log file",
+                true,
+            ),
+            ("oracle: ORA-00310: archived log contains sequence 7", true),
+            ("oracle: ORA-01031: insufficient privileges", false),
+            ("oracle: ORA-1368", false),
+            ("oracle: ORA-013", false),
+            ("no code at all", false),
+            (
+                "oracle cdc: LogMiner reports missing redo (ORA-01291) — LOST",
+                false,
+            ),
+        ] {
+            assert_eq!(names_a_log_set_change(text), want, "{text}");
+        }
+    }
+
+    /// Five re-plans with doubling waits from 200 ms, then the error.
+    #[test]
+    fn re_mining_is_bounded_with_a_doubling_backoff() {
+        let ms = |a| remine_backoff(a).map(|d| d.as_millis());
+        assert_eq!(
+            (0..=REMINE_ATTEMPTS + 1).map(ms).collect::<Vec<_>>(),
+            [
+                Some(200),
+                Some(400),
+                Some(800),
+                Some(1600),
+                Some(3200),
+                None,
+                None
+            ]
+        );
+    }
+
+    /// A spent re-plan budget leads with what happened; any other error passes through untouched.
+    #[test]
+    fn a_log_set_that_kept_changing_says_so() {
+        let shown = format!(
+            "{:#}",
+            log_set_changed_error(anyhow::anyhow!(
+                "oracle: ORA-01368: Redo log file header mismatch for thread 1 sequence 5757."
+            ))
+        );
+        assert!(
+            shown.starts_with("oracle cdc: the redo log changed under LogMiner 5 times")
+                && shown.ends_with(
+                    "ORA-01368: Redo log file header mismatch for thread 1 sequence 5757."
+                ),
+            "{shown}"
+        );
+        let other = "oracle: ORA-01031: insufficient privileges";
+        assert_eq!(
+            format!("{:#}", log_set_changed_error(anyhow::anyhow!(other))),
+            other
+        );
+    }
 
     /// A transaction with no start SCN yet (0) never drags the low-water mark to SCN 0.
     #[test]
