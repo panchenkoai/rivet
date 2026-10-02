@@ -370,6 +370,7 @@ impl ExportSink {
         crate::pipeline::commit::Observations {
             drift_schema: self.dest_schema.as_deref().cloned(),
             column_max_bytes: std::mem::take(&mut self.column_max_bytes),
+            quality: std::mem::take(&mut self.quality),
         }
     }
 
@@ -379,6 +380,7 @@ impl ExportSink {
         crate::pipeline::commit::Observations {
             drift_schema: None,
             column_max_bytes: std::mem::take(&mut self.column_max_bytes),
+            quality: std::mem::take(&mut self.quality),
         }
     }
 
@@ -721,6 +723,8 @@ impl ExportSink {
         }
     }
 
+    /// This sink's own verdict; the product grades the run-wide merge at the finalize seam.
+    #[cfg(test)]
     pub fn run_quality_checks(&self) -> Vec<crate::quality::QualityIssue> {
         self.quality.issues(self.total_rows)
     }

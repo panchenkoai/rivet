@@ -174,6 +174,19 @@ output). The cure rhymes: resolve through the one function that enumerates
 every strategy. Wherever a fan-out re-implements a decision its dispatcher
 could own, this class is waiting.
 
+## Amendment 2026-10-02: the quality gate is applied at the seam
+
+The `quality:` gate had two homes — `run_single_export` graded its sink before
+writing, `run_export_job` graded `summary.total_rows` after the runner returned,
+behind a `matches!(strategy, Chunked | Keyset)` allow-list — and the second home
+checked row counts only. The sink's `QualityTracker` is now an `Observations`
+field: every runner already hands it on with `take_observations` / `take_shape`,
+the ledger merges the sinks (counts add, distinct sets union), and
+`finalize_export` grades the merge once against `plan.quality`. Null-ratio and
+uniqueness reach every runner; a runner with no `quality:` block is graded by
+nothing. The cost, accepted: `single` now fails after its parts are durable, as
+the drift gate already does, with the `failed` manifest describing them.
+
 ## Amendment 2026-09-26: the seam covers the batch runners, not CDC
 
 `mode: cdc` returns from the dispatcher before `execute_resolved_plan`. Its drain writes its

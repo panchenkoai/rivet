@@ -925,7 +925,6 @@ mod tests {
         let err: anyhow::Error =
             crate::error::DataIntegrityError::new(crate::quality::failure_message(
                 "session_timeouts",
-                None,
                 &["column 'timeout_ms': 3 duplicate values"],
             ))
             .into();

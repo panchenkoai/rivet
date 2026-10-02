@@ -122,10 +122,12 @@ pub(crate) struct Observations {
     /// Max observed byte length per column (shape-drift warn input); merged
     /// by max so worker/part order is irrelevant.
     pub(in crate::pipeline) column_max_bytes: std::collections::HashMap<String, u64>,
+    /// What the sink measured against the `quality:` rules; graded once at the seam.
+    pub(in crate::pipeline) quality: crate::quality::QualityTracker,
 }
 
 impl Observations {
-    /// Fold another sink's observations in: first schema wins, shape max-merges.
+    /// Fold another sink's observations in: first schema wins, shape max-merges, quality sums.
     pub(in crate::pipeline) fn merge(&mut self, other: Observations) {
         if self.drift_schema.is_none() {
             self.drift_schema = other.drift_schema;
@@ -134,6 +136,7 @@ impl Observations {
             let e = self.column_max_bytes.entry(col).or_insert(0);
             *e = (*e).max(len);
         }
+        self.quality.merge(other.quality);
     }
 }
 
@@ -694,6 +697,7 @@ pub(crate) mod tests {
         sink.checksum_key_col = Some(0);
         sink.cursor_column = Some("id".to_string());
         sink.column_max_bytes = [("id".to_string(), 8u64)].into();
+        sink.quality.null_counts = [("id".to_string(), 3usize)].into();
 
         let mut led = CommitLedger::default();
         sink.drain_observations_into(&mut led);
@@ -710,13 +714,20 @@ pub(crate) mod tests {
         assert_eq!(led.integrity.column_checksums.get("id"), Some(&41u64));
         assert_eq!(led.integrity.checksum_key_column.as_deref(), Some("id"));
         assert_eq!(led.observed.column_max_bytes.get("id"), Some(&8u64));
+        assert_eq!(
+            led.observed.quality.null_counts.get("id"),
+            Some(&3usize),
+            "the sink's quality measurements must reach the ledger"
+        );
         assert!(
             led.integrity.covered_units.contains(&UnitId::Run),
             "the integrity drain must REGISTER its commit unit, or the seam reads \
              every part single wrote as uncovered and suppresses Form B"
         );
         assert!(
-            sink.column_checksums.is_empty() && sink.column_max_bytes.is_empty(),
+            sink.column_checksums.is_empty()
+                && sink.column_max_bytes.is_empty()
+                && sink.quality.null_counts.is_empty(),
             "drain must TAKE the sink's accumulators, not copy them"
         );
     }

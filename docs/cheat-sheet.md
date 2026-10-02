@@ -440,8 +440,8 @@ exports:
     quality:
       row_count_min: 1000
       row_count_max: 10000000
-      null_ratio_max: { {{PK}}: 0.0 }   # single runner only
-      unique_columns: [{{PK}}]          # single runner only
+      null_ratio_max: { {{PK}}: 0.0 }
+      unique_columns: [{{PK}}]
       unique_max_entries: 1000000       # always cap memory
 ```
 
