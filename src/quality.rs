@@ -24,22 +24,14 @@ pub enum Severity {
     Fail,
 }
 
-/// The single home for the operator-facing quality-gate *failure contract*: the
-/// "N check(s) failed" body, the per-issue bullet layout, and the remediation
-/// hint. Both the single-export gate (`pipeline::single`) and the chunked
-/// aggregate gate (`pipeline::job`) format failures through here so the message
-/// — which is a de-facto public contract — cannot drift between modes.
-///
-/// `context` tags the gate when it matters (e.g. `Some("chunked aggregate")`,
-/// where only row-count bounds are checked); `None` for the full per-export gate.
-pub fn failure_message(export_name: &str, context: Option<&str>, failing: &[&str]) -> String {
-    let ctx = context.map(|c| format!(" ({c})")).unwrap_or_default();
+/// The operator-facing quality-gate failure contract: the "N check(s) failed" body, one
+/// bullet per failing check, and the remediation hint.
+pub fn failure_message(export_name: &str, failing: &[&str]) -> String {
     format!(
-        "export '{}': {} quality check(s) failed{}:\n  - {}\n  \
+        "export '{}': {} quality check(s) failed:\n  - {}\n  \
          Fix the source data, or adjust the thresholds under `quality:` in your config.",
         export_name,
         failing.len(),
-        ctx,
         failing.join("\n  - "),
     )
 }
@@ -110,9 +102,10 @@ pub fn check_row_count(actual: usize, config: &QualityConfig) -> Vec<QualityIssu
 ///
 /// Seven of `ExportSink`'s fields were this one concern, and nothing in the write path
 /// reads them: the tracker needs the batch, the resolved dest schema, and the run's row
-/// count, and it answers with issues. Keeping it whole means the sink's interface no
-/// longer carries the accumulators, and the rules are testable without a writer.
-#[derive(Default)]
+/// count, and it answers with issues. Every sink of a run feeds one; the runner hands it
+/// on as an observation (`pipeline::commit::Observations`), the ledger merges them, and
+/// the finalize seam grades the merged tracker once for every runner.
+#[derive(Debug, Clone, Default)]
 pub(crate) struct QualityTracker {
     pub(crate) columns: Option<QualityConfig>,
     pub(crate) null_counts: HashMap<String, usize>,
@@ -147,6 +140,10 @@ impl QualityTracker {
         let Some(qc) = &self.columns else {
             return Ok(());
         };
+        // A zero-row result arrives as `Schema::empty()`: no columns to bind, no cells to measure.
+        if dest_schema.fields().is_empty() {
+            return Ok(());
+        }
         let available: Vec<String> = dest_schema
             .fields()
             .iter()
@@ -209,12 +206,57 @@ impl QualityTracker {
         Ok(())
     }
 
-    /// The verdict, given the run's row count — the one number the rules need that the
-    /// tracker does not own.
+    /// Fold another sink's measurements in: null counts add, distinct sets union up to
+    /// `unique_max_entries` (counting only the values folded in), caps union.
+    pub(crate) fn merge(&mut self, other: QualityTracker) {
+        let QualityTracker {
+            columns,
+            null_counts,
+            unique_sets,
+            unique_non_null_counts,
+            unique_capped,
+            ..
+        } = other;
+        if self.columns.is_none() {
+            self.columns = columns;
+        }
+        let cap = self.columns.as_ref().and_then(|q| q.unique_max_entries);
+        for (col, n) in null_counts {
+            *self.null_counts.entry(col).or_default() += n;
+        }
+        self.unique_capped.extend(unique_capped);
+        for (col, set) in unique_sets {
+            let own_dupes = unique_non_null_counts
+                .get(&col)
+                .copied()
+                .unwrap_or(0)
+                .saturating_sub(set.len());
+            let mine = self.unique_sets.entry(col.clone()).or_default();
+            let mut folded = 0;
+            for h in set {
+                if cap.is_some_and(|c| mine.len() >= c) {
+                    self.unique_capped.insert(col.clone());
+                    break;
+                }
+                mine.insert(h);
+                folded += 1;
+            }
+            *self.unique_non_null_counts.entry(col).or_default() += own_dupes + folded;
+        }
+    }
+
+    /// The verdict against the tracker's own rules, given the run's row count.
+    #[cfg(test)]
     pub(crate) fn issues(&self, total_rows: usize) -> Vec<QualityIssue> {
-        let Some(qc) = &self.columns else {
-            return Vec::new();
-        };
+        match &self.columns {
+            Some(qc) => self.issues_for(qc, total_rows),
+            None => Vec::new(),
+        }
+    }
+
+    /// The verdict against `qc`, given the run's row count — the one number the rules
+    /// need that the tracker does not own.
+    pub(crate) fn issues_for(&self, qc: &QualityConfig, total_rows: usize) -> Vec<QualityIssue> {
         let mut issues = Vec::new();
         issues.extend(check_row_count(total_rows, qc));
         if total_rows == 0 {
@@ -265,57 +307,25 @@ impl QualityTracker {
     }
 }
 
-/// True when the config asks for null/unique checks, which the multi-part runners (chunked/keyset) never evaluate.
-pub(crate) fn has_multi_part_unsupported_checks(qc: &QualityConfig) -> bool {
-    !qc.null_ratio_max.is_empty() || !qc.unique_columns.is_empty()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use arrow::array::{Int64Array, StringArray};
 
-    #[test]
-    fn only_null_or_unique_checks_are_unsupported_on_multi_part_runners() {
-        let base = || QualityConfig {
-            row_count_min: Some(1),
-            row_count_max: None,
-            null_ratio_max: Default::default(),
-            unique_columns: Vec::new(),
-            unique_max_entries: None,
-        };
-        assert!(
-            !has_multi_part_unsupported_checks(&base()),
-            "row_count is run-wide"
-        );
-        let mut nulls = base();
-        nulls.null_ratio_max.insert("a".into(), 0.1);
-        assert!(has_multi_part_unsupported_checks(&nulls));
-        let mut unique = base();
-        unique.unique_columns.push("id".into());
-        assert!(has_multi_part_unsupported_checks(&unique));
-    }
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
 
-    /// The shared failure contract (used by both pipeline gates): names the
-    /// export, lists every failing check as a bullet, carries the remediation
-    /// hint, and tags the gate when given a context. Tested once here so the
-    /// two call sites don't each re-assert it via `contains()`.
+    /// The failure contract names the export, bullets every failing check, and carries
+    /// the remediation hint.
     #[test]
     fn failure_message_lists_checks_and_hint() {
-        let m = failure_message("orders", None, &["row count 42 < min 100"]);
+        let m = failure_message("orders", &["row count 42 < min 100"]);
         assert!(m.contains("export 'orders': 1 quality check(s) failed:"));
         assert!(m.contains("\n  - row count 42 < min 100"));
         assert!(m.contains("adjust the thresholds under `quality:`"));
-        assert!(
-            !m.contains("aggregate"),
-            "no context tag when context is None"
-        );
 
-        let c = failure_message("events", Some("chunked aggregate"), &["a", "b"]);
-        assert!(c.contains("2 quality check(s) failed (chunked aggregate):"));
-        assert!(c.contains("\n  - a\n  - b"));
+        let c = failure_message("events", &["a", "b"]);
+        assert!(c.contains("2 quality check(s) failed:\n  - a\n  - b"));
     }
     use std::sync::Arc;
 
@@ -498,6 +508,105 @@ mod tests {
             msg.starts_with("quality.unique_columns: column 'seen_at'")
                 && msg.ends_with("Remove it from `quality.unique_columns`."),
             "{msg}"
+        );
+    }
+
+    /// Two sinks that each saw one copy of a value hold no duplicate alone; merged they
+    /// hold one, their null counts add into one ratio, and a cap on either side caps the whole.
+    #[test]
+    fn merge_finds_a_duplicate_split_across_two_sinks_and_adds_nulls() {
+        let b1 = make_batch(&[Some(1), Some(2)], &[Some("a"), None]);
+        let b2 = make_batch(&[Some(2), Some(3)], &[None, None]);
+        let qc = QualityConfig {
+            row_count_min: None,
+            row_count_max: None,
+            null_ratio_max: [("name".to_string(), 0.5)].into(),
+            unique_columns: vec!["id".into()],
+            unique_max_entries: Some(10),
+        };
+        let mut t1 = QualityTracker::new(Some(qc.clone()));
+        t1.resolve_columns(&b1.schema()).unwrap();
+        t1.track(&b1).unwrap();
+        let mut t2 = QualityTracker::new(Some(qc.clone()));
+        t2.resolve_columns(&b2.schema()).unwrap();
+        t2.track(&b2).unwrap();
+        let dupes =
+            |issues: Vec<QualityIssue>| issues.iter().any(|i| i.message.contains("duplicate"));
+        assert!(
+            !dupes(t1.issues_for(&qc, 2)) && !dupes(t2.issues(2)),
+            "neither sink alone holds the duplicate"
+        );
+
+        let mut merged = QualityTracker::default();
+        merged.merge(t1);
+        merged.merge(t2);
+        assert_eq!(merged.null_counts.get("name"), Some(&3));
+        assert_eq!(merged.unique_non_null_counts.get("id"), Some(&4));
+        assert_eq!(
+            fails(&merged.issues_for(&qc, 4)),
+            vec![
+                "column 'name': null ratio 0.7500 exceeds threshold 0.5000",
+                "column 'id': 1 duplicate values out of 4 rows",
+            ]
+        );
+        assert!(merged.columns.is_some(), "the first fed rules are kept");
+        assert!(
+            QualityTracker::default().issues(4).is_empty(),
+            "a tracker with no rules has no verdict of its own"
+        );
+
+        let mut capped = QualityTracker::default();
+        capped.unique_capped.insert("id".into());
+        merged.merge(capped);
+        assert!(merged.unique_capped.contains("id"));
+    }
+
+    /// An empty page / chunk / range arrives as `Schema::empty()`; it measures nothing and
+    /// must not be read as "the rule's column is missing" (it killed every keyset run
+    /// whose range ended on an empty page). A real schema without the column still refuses.
+    #[test]
+    fn a_zero_row_empty_schema_binds_nothing_and_is_not_a_ghost_column() {
+        let mut t = unique_tracker("id", &make_batch(&[], &[]).schema());
+        t.resolve_columns(&Schema::empty())
+            .expect("an empty schema is a zero-row result, not a missing column");
+        let other = Schema::new(vec![Field::new("other", DataType::Int64, true)]);
+        assert!(
+            t.resolve_columns(&other).is_err(),
+            "a real schema still refuses"
+        );
+    }
+
+    /// The merged distinct set stays inside `unique_max_entries`, and a value left out at
+    /// the cap is not counted, so the capped column warns instead of reporting a phantom
+    /// duplicate; one sink's own duplicates survive the merge.
+    #[test]
+    fn merge_stops_at_the_unique_cap_without_inventing_duplicates() {
+        let qc = QualityConfig {
+            row_count_min: None,
+            row_count_max: None,
+            null_ratio_max: HashMap::new(),
+            unique_columns: vec!["id".into()],
+            unique_max_entries: Some(4),
+        };
+        let sink = |ids: &[u64], non_null: usize| {
+            let mut t = QualityTracker::new(Some(qc.clone()));
+            t.unique_sets
+                .insert("id".into(), ids.iter().copied().collect());
+            t.unique_non_null_counts.insert("id".into(), non_null);
+            t
+        };
+        let mut merged = sink(&[1, 2, 3], 4); // one duplicate inside this sink
+        merged.merge(sink(&[4, 5], 2));
+        assert_eq!(
+            merged.unique_sets["id"].len(),
+            4,
+            "the union stops at the cap"
+        );
+        assert!(merged.unique_capped.contains("id"));
+        assert_eq!(merged.unique_non_null_counts["id"], 5, "4 seen + 1 folded");
+        assert_eq!(
+            fails(&merged.issues(9)),
+            vec!["column 'id': at least 1 duplicate values out of 9 rows"]
         );
     }
 

@@ -1,8 +1,11 @@
 # Quality Checks
 
 Rivet can run lightweight data quality assertions at export time and block the
-pipeline if they fail. Quality checks are declared per-export and run as the
-data flows through the sink — no separate query is needed.
+pipeline if they fail. Quality checks are declared per-export and measured as the
+data flows through the sink — no separate query is needed. Every runner (single,
+chunked, keyset, parallel) is graded the same way, once, after its last part is
+written; a failing check exits 3 and the parts already written stay in place,
+described by the `failed` manifest.
 
 ---
 
@@ -12,8 +15,8 @@ data flows through the sink — no separate query is needed.
 |---|---|---|---|
 | Row count minimum | `row_count_min` | Fail | Export fails if fewer rows than threshold |
 | Row count maximum | `row_count_max` | Fail | Export fails if more rows than threshold |
-| Null ratio | `null_ratio_max` | Fail | Export fails if null fraction exceeds threshold per column. **Single-runner only** — not enforced on chunked / keyset / parallel-Mongo (each part is independent). |
-| Uniqueness | `unique_columns` | Fail | Export fails if duplicate values detected. **Single-runner only** — not enforced on the multi-part runners; only `row_count` bounds run there. |
+| Null ratio | `null_ratio_max` | Fail | Export fails if the null fraction of a column, over the whole run, exceeds the threshold. |
+| Uniqueness | `unique_columns` | Fail | Export fails if a value repeats anywhere in the run — across chunks, pages and parallel workers too. |
 | Uniqueness cap | `unique_max_entries` | Warn | Stops tracking after N distinct values; emits a warning |
 
 ---

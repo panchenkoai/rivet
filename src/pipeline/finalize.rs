@@ -38,7 +38,8 @@ use super::summary::RunSummary;
 ///      chunked runs its gate pre-chunk via `check_from_type_mappings`
 ///      (ADR-0021) and feeds no drift schema here, by design),
 ///   3. Form-B value-checksum harvest into the summary/manifest,
-///   4. the shape-drift advisory warn.
+///   4. the shape-drift advisory warn,
+///   5. the `quality:` gate over the merged measurements of every sink.
 ///
 /// Ordering is load-bearing and encoded HERE, once: the gate + harvest run
 /// before `finalize_manifest` (a drift `fail` must abort before a manifest
@@ -126,7 +127,47 @@ pub(super) fn finalize_export(
         }
     }
 
-    Ok(())
+    apply_quality_gate(plan, &ledger.observed.quality, summary)
+}
+
+/// Grade the run's merged quality measurements against `plan.quality`; a `Fail` issue is a data-integrity error (exit 3).
+fn apply_quality_gate(
+    plan: &ResolvedRunPlan,
+    measured: &crate::quality::QualityTracker,
+    summary: &mut RunSummary,
+) -> Result<()> {
+    let Some(qc) = &plan.quality else {
+        return Ok(());
+    };
+    let issues = measured.issues_for(qc, summary.total_rows as usize);
+    let mut fails = Vec::new();
+    for issue in &issues {
+        let level = match issue.severity {
+            crate::quality::Severity::Fail => "FAIL",
+            crate::quality::Severity::Warn => "WARN",
+        };
+        log::warn!("quality {}: {}", level, issue.message);
+        summary
+            .journal
+            .record(crate::journal::RunEvent::QualityIssue {
+                severity: level.to_string(),
+                message: issue.message.clone(),
+            });
+        if issue.severity == crate::quality::Severity::Fail {
+            fails.push(issue.message.as_str());
+        }
+    }
+    summary.quality_passed = Some(fails.is_empty());
+    if fails.is_empty() {
+        return Ok(());
+    }
+    Err(
+        crate::error::DataIntegrityError::new(crate::quality::failure_message(
+            &plan.export_name,
+            &fails,
+        ))
+        .into(),
+    )
 }
 
 /// ADR-0028, the FAILURE half of the seam (bughunt 2026-08-21, MED): a run
@@ -1394,6 +1435,128 @@ mod tests {
         assert!(
             !warned(&summary),
             "shape_drift_warn_factor 0.0 means DISABLED — the seam must not warn"
+        );
+    }
+
+    fn quality(
+        rows: Option<usize>,
+        nulls: &[(&str, f64)],
+        unique: &[&str],
+    ) -> crate::config::QualityConfig {
+        crate::config::QualityConfig {
+            row_count_min: rows,
+            row_count_max: None,
+            null_ratio_max: nulls.iter().map(|(c, r)| (c.to_string(), *r)).collect(),
+            unique_columns: unique.iter().map(|c| c.to_string()).collect(),
+            unique_max_entries: Some(10),
+        }
+    }
+
+    /// One observation carrying `nulls` NULLs in `name` and `ids` hashed under `id`.
+    fn measured(nulls: usize, ids: &[u64]) -> crate::pipeline::commit::Observations {
+        let mut quality = crate::quality::QualityTracker::default();
+        quality.null_counts.insert("name".into(), nulls);
+        quality
+            .unique_sets
+            .insert("id".into(), ids.iter().copied().collect());
+        quality
+            .unique_non_null_counts
+            .insert("id".into(), ids.len());
+        crate::pipeline::commit::Observations {
+            quality,
+            ..Default::default()
+        }
+    }
+
+    /// The seam is the quality gate's one home: with no rules it decides nothing, with
+    /// rules it records the verdict, and a `Fail` issue is a typed exit-3 error whose
+    /// text is the shared failure contract. It needs no runner and no state.
+    #[test]
+    fn finalize_export_grades_the_quality_rules_once_for_every_runner() {
+        use crate::pipeline::summary::RunSummary;
+        let dir = tempfile::tempdir().unwrap();
+
+        let plan = fin_plan(dir.path());
+        let mut summary = RunSummary {
+            total_rows: 3,
+            ..Default::default()
+        };
+        finalize_export(&plan, None, &mut summary).unwrap();
+        assert_eq!(summary.quality_passed, None, "no rules, no verdict");
+
+        let mut plan = fin_plan(dir.path());
+        plan.quality = Some(quality(Some(3), &[], &[]));
+        let mut summary = RunSummary {
+            total_rows: 3,
+            ..Default::default()
+        };
+        finalize_export(&plan, None, &mut summary).unwrap();
+        assert_eq!(summary.quality_passed, Some(true));
+
+        // A zero-row run still reaches row_count_min (single used to early-return).
+        plan.quality = Some(quality(Some(100), &[], &[]));
+        let mut summary = RunSummary::default();
+        let err = finalize_export(&plan, None, &mut summary).expect_err("3 < 100 must fail");
+        assert!(
+            err.downcast_ref::<crate::error::DataIntegrityError>()
+                .is_some(),
+            "a quality failure is a typed data-integrity error"
+        );
+        assert_eq!(crate::error::classify_exit(&err), 3);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("export 'public.orders': 1 quality check(s) failed:\n  - row_count 0 below minimum 100"),
+            "{msg}"
+        );
+        assert_eq!(summary.quality_passed, Some(false));
+        assert!(
+            summary.journal.quality_issues().iter().any(|e| matches!(
+                &e.event,
+                crate::journal::RunEvent::QualityIssue { severity, .. } if severity == "FAIL"
+            )),
+            "the failing check is journaled"
+        );
+    }
+
+    /// The gate reads the MERGED measurements: two sinks that each saw `id = 7` once are
+    /// a duplicate together, and their NULL counts add into one ratio.
+    #[test]
+    fn finalize_export_quality_gate_merges_every_sinks_measurements() {
+        use crate::pipeline::summary::RunSummary;
+        let dir = tempfile::tempdir().unwrap();
+        let mut plan = fin_plan(dir.path());
+        plan.quality = Some(quality(None, &[("name", 0.5)], &["id"]));
+
+        let mut summary = RunSummary {
+            total_rows: 4,
+            ..Default::default()
+        };
+        summary.ledger.observe(measured(1, &[7, 8]));
+        summary.ledger.observe(measured(2, &[7, 9]));
+        let err = finalize_export(&plan, None, &mut summary).expect_err("merged must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("2 quality check(s) failed:\n  - column 'name': null ratio 0.7500 exceeds threshold 0.5000\n  - column 'id': 1 duplicate values out of 4 rows"),
+            "{msg}"
+        );
+
+        // A capped column is a WARN: journaled, never a failure.
+        let mut summary = RunSummary {
+            total_rows: 4,
+            ..Default::default()
+        };
+        let mut capped = measured(0, &[1, 2, 3, 4]);
+        capped.quality.unique_capped.insert("id".into());
+        summary.ledger.observe(capped);
+        finalize_export(&plan, None, &mut summary).unwrap();
+        assert_eq!(summary.quality_passed, Some(true));
+        assert!(
+            summary.journal.quality_issues().iter().any(|e| matches!(
+                &e.event,
+                crate::journal::RunEvent::QualityIssue { severity, message }
+                    if severity == "WARN" && message.contains("capped at 10 entries")
+            )),
+            "the cap warning is journaled"
         );
     }
 

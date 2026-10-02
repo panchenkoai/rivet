@@ -1527,6 +1527,7 @@ const RUNNER_CELL_CLAIMS: &[(&str, &str, &[&str], &[&str])] = &[
         &["chunk_checkpoint: true"],
     ),
     ("cursor_ownership_guard", "keyset", &["parallel: "], &[]),
+    ("quality_gates", "*", &["quality:"], &[]),
 ];
 
 /// The text of the `fn`/`const` item whose header is `lines[line]`, up to its closing line.

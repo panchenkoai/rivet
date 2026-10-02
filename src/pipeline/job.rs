@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use crate::config::{Config, ExportConfig};
-use crate::error::{DataIntegrityError, Result};
+use crate::error::Result;
 use crate::plan::{DiagnosticLevel, ExtractionStrategy, ResolvedRunPlan, validate_plan};
 use crate::state::StateStore;
 
@@ -322,65 +322,6 @@ fn build_metric_row(
         offending_value: summary.offending_value.clone(),
         server_context_json: summary.server_context_json.clone(),
     }
-}
-
-fn run_chunked_quality_gate(
-    result: Result<()>,
-    plan: &ResolvedRunPlan,
-    summary: &mut RunSummary,
-) -> Result<()> {
-    result?;
-
-    // The MULTI-PART runners — chunked AND keyset (which also backs parallel-Mongo,
-    // routed through the Keyset strategy) — own their own execution loop and never
-    // reach single mode's per-part sink.run_quality_checks(). So the run-wide
-    // row_count completeness gate (row_count_min, Severity::Fail → exit 3) must run
-    // HERE for all of them. It was Chunked-only, so a truncated keyset/parallel
-    // extract (the paths auto-selected for LARGE tables, where completeness matters
-    // most) exited 0/success with the tripwire silently disarmed.
-    if !matches!(
-        plan.strategy,
-        ExtractionStrategy::Chunked(_) | ExtractionStrategy::Keyset(_)
-    ) {
-        return Ok(());
-    }
-    let qc = match &plan.quality {
-        Some(q) => q,
-        None => return Ok(()),
-    };
-
-    let total = summary.total_rows as usize;
-    let row_issues = crate::quality::check_row_count(total, qc);
-    let has_unsupported = crate::quality::has_multi_part_unsupported_checks(qc);
-
-    if has_unsupported {
-        log::warn!(
-            "export '{}': quality checks null_ratio_max and unique_columns are not supported on the multi-part runners (chunked / keyset / parallel-Mongo) — each part processes independently; only row_count bounds are checked",
-            plan.export_name
-        );
-    }
-
-    if !row_issues.is_empty() {
-        for issue in &row_issues {
-            log::warn!("quality FAIL: {}", issue.message);
-        }
-        summary.quality_passed = Some(false);
-        // Surface *which* checks failed via the shared failure contract — see
-        // `crate::quality::failure_message`. (Chunked mode only aggregates
-        // row_count; null/unique are per-chunk and warn-logged above.) Tagged as
-        // a data-integrity failure (exit 3) so a scheduler stops rather than
-        // retries; the message text is unchanged.
-        let fails: Vec<&str> = row_issues.iter().map(|i| i.message.as_str()).collect();
-        return Err(DataIntegrityError::new(crate::quality::failure_message(
-            &plan.export_name,
-            Some("multi-part aggregate"),
-            &fails,
-        ))
-        .into());
-    }
-
-    summary.quality_passed = Some(true);
-    Ok(())
 }
 
 /// The PostgreSQL temp-spill counter carried in a harm snapshot; `None` for other engines.
@@ -1320,7 +1261,7 @@ fn dispatches_to_cdc_runner(mode: crate::config::ExportMode) -> bool {
 }
 
 /// THE post-plan execution script, written once: rss/forensics/harm bracket →
-/// dispatch → ADR-0028 seam → bracket close → quality gate → status → diagnosis
+/// dispatch → ADR-0028 seam (incl. the quality gate) → bracket close → status → diagnosis
 /// → [reconcile] → journal → ledger close → manifest → cursor → keyset anchor →
 /// validate → metrics → report → [notify] → final fold. Ordering comments are
 /// load-bearing and live HERE only. LIVE-ONLY BY CONSTRUCTION (real source +
@@ -1442,7 +1383,6 @@ fn execute_resolved_plan(
     // status resolution below — the deltas are what the DIAGNOSIS reads.
     let harm_delta_vec = harm.close_on_meta(&mut meta, state, &mut summary);
     let tuning_class = plan.tuning.profile_name().to_string();
-    let result = run_chunked_quality_gate(result, plan, &mut summary);
     let failed = result.is_err();
     match &result {
         Ok(()) => {
@@ -2860,14 +2800,7 @@ mod tests {
         assert!(summary.validated.is_none());
     }
 
-    // ── run_chunked_quality_gate ────────────────────────────────────────────
-    //
-    // The chunked quality gate is the post-aggregation row-count check that
-    // fires AFTER every chunk has been written and the totals are known.
-    // It is the only quality validation chunked mode supports — null_ratio
-    // and unique_columns are explicitly out of scope because each chunk
-    // processes independently. Tests pin the gate logic so changes to chunked
-    // quality semantics surface as visible diffs, not silent behaviour drift.
+    // ── plan fixtures ───────────────────────────────────────────────────────
 
     use crate::config::QualityConfig;
     use crate::config::{
@@ -2995,168 +2928,6 @@ mod tests {
             shape_drift_warn_factor: 0.0,
             parquet: None,
         }
-    }
-
-    fn fresh_summary(plan: &ResolvedRunPlan, total_rows: i64) -> RunSummary {
-        let mut s = RunSummary::stub_for_testing("r", plan.export_name.clone());
-        s.total_rows = total_rows;
-        s.batch_size = 10_000;
-        s.mode = "chunked".into();
-        s.compression = "none".into();
-        s
-    }
-
-    #[test]
-    fn chunked_quality_gate_passes_through_existing_error() {
-        // If the chunked run already failed, the gate must NOT mask that with
-        // a successful Ok — the original error wins.
-        let plan = chunked_plan_with_quality(None);
-        let mut summary = fresh_summary(&plan, 0);
-        let result = run_chunked_quality_gate(
-            Err(anyhow::anyhow!("chunk 3 failed to write")),
-            &plan,
-            &mut summary,
-        );
-        let err = result.unwrap_err();
-        assert!(
-            err.to_string().contains("chunk 3 failed"),
-            "must propagate original error: {err}"
-        );
-        // quality_passed must remain None — we never got to evaluate it.
-        assert!(summary.quality_passed.is_none());
-    }
-
-    #[test]
-    fn chunked_quality_gate_no_quality_config_marks_no_decision() {
-        // Without quality config, gate is a no-op and quality_passed stays None.
-        let plan = chunked_plan_with_quality(None);
-        let mut summary = fresh_summary(&plan, 5_000);
-        run_chunked_quality_gate(Ok(()), &plan, &mut summary).expect("must pass");
-        assert!(summary.quality_passed.is_none());
-    }
-
-    #[test]
-    fn chunked_quality_gate_row_count_within_bounds_passes() {
-        let plan = chunked_plan_with_quality(Some(QualityConfig {
-            row_count_min: Some(100),
-            row_count_max: Some(10_000),
-            null_ratio_max: Default::default(),
-            unique_columns: Vec::new(),
-            unique_max_entries: None,
-        }));
-        let mut summary = fresh_summary(&plan, 5_000);
-        run_chunked_quality_gate(Ok(()), &plan, &mut summary).expect("in bounds must pass");
-        assert_eq!(summary.quality_passed, Some(true));
-    }
-
-    #[test]
-    fn chunked_quality_gate_row_count_below_min_fails() {
-        let plan = chunked_plan_with_quality(Some(QualityConfig {
-            row_count_min: Some(100),
-            row_count_max: None,
-            null_ratio_max: Default::default(),
-            unique_columns: Vec::new(),
-            unique_max_entries: None,
-        }));
-        let mut summary = fresh_summary(&plan, 42);
-        let err =
-            run_chunked_quality_gate(Ok(()), &plan, &mut summary).expect_err("below min must fail");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("quality check(s) failed") && msg.contains("multi-part aggregate"),
-            "error must name the failed quality gate: {err}"
-        );
-        assert!(
-            msg.contains("  - "),
-            "error must surface the specific failing check(s), not just a generic message: {err}"
-        );
-        // The chunked quality bail carries the DataIntegrityError marker → exit
-        // class 3 (STOP). The operator message is unchanged (asserted above).
-        assert!(
-            err.downcast_ref::<DataIntegrityError>().is_some(),
-            "chunked quality-gate failure must be a typed data-integrity error"
-        );
-        assert_eq!(crate::error::classify_exit(&err), 3);
-        assert_eq!(summary.quality_passed, Some(false));
-    }
-
-    #[test]
-    fn keyset_quality_gate_row_count_below_min_fails() {
-        // RED before the guard broadened Chunked → Chunked|Keyset: keyset (and
-        // parallel-Mongo, which is the Keyset strategy) early-returned Ok, so the
-        // row_count_min tripwire was SILENTLY DISARMED on the large-table runners —
-        // a truncated extract exited 0/success. The gate must fire (exit 3) here too.
-        let mut plan = chunked_plan_with_quality(Some(QualityConfig {
-            row_count_min: Some(100),
-            row_count_max: None,
-            null_ratio_max: Default::default(),
-            unique_columns: Vec::new(),
-            unique_max_entries: None,
-        }));
-        plan.strategy = ExtractionStrategy::Keyset(crate::plan::KeysetPlan {
-            key_column: "id".into(),
-            chunk_size: 500,
-            checkpoint: false,
-            incremental: false,
-            parallel: 1,
-        });
-        let mut summary = fresh_summary(&plan, 42);
-        let err = run_chunked_quality_gate(Ok(()), &plan, &mut summary)
-            .expect_err("keyset below-min must FAIL, not silently pass");
-        assert_eq!(crate::error::classify_exit(&err), 3);
-        assert_eq!(summary.quality_passed, Some(false));
-    }
-
-    #[test]
-    fn chunked_quality_gate_row_count_above_max_fails() {
-        let plan = chunked_plan_with_quality(Some(QualityConfig {
-            row_count_min: None,
-            row_count_max: Some(1_000),
-            null_ratio_max: Default::default(),
-            unique_columns: Vec::new(),
-            unique_max_entries: None,
-        }));
-        let mut summary = fresh_summary(&plan, 50_000);
-        let err =
-            run_chunked_quality_gate(Ok(()), &plan, &mut summary).expect_err("above max must fail");
-        assert!(err.to_string().contains("quality"), "error: {err}");
-        assert_eq!(summary.quality_passed, Some(false));
-    }
-
-    #[test]
-    fn chunked_quality_gate_skips_unsupported_checks_with_warning() {
-        // null_ratio_max and unique_columns are explicitly out of scope for
-        // chunked mode. They must NOT cause failure; row_count alone decides.
-        let plan = chunked_plan_with_quality(Some(QualityConfig {
-            row_count_min: Some(10),
-            row_count_max: None,
-            null_ratio_max: [("name".into(), 0.1)].into_iter().collect(),
-            unique_columns: vec!["id".into()],
-            unique_max_entries: None,
-        }));
-        let mut summary = fresh_summary(&plan, 1_000);
-        run_chunked_quality_gate(Ok(()), &plan, &mut summary)
-            .expect("unsupported checks must not fail in chunked mode");
-        assert_eq!(summary.quality_passed, Some(true));
-    }
-
-    #[test]
-    fn chunked_quality_gate_inactive_on_non_chunked_strategy() {
-        // The gate must early-return on Snapshot/Incremental etc. — those
-        // strategies validate inline via the streaming sink.
-        let mut plan = chunked_plan_with_quality(Some(QualityConfig {
-            row_count_min: Some(99_999), // would fail if evaluated
-            row_count_max: None,
-            null_ratio_max: Default::default(),
-            unique_columns: Vec::new(),
-            unique_max_entries: None,
-        }));
-        plan.strategy = ExtractionStrategy::Snapshot;
-        let mut summary = fresh_summary(&plan, 10);
-        // No-op for non-chunked: must not fail even though min would not be met.
-        run_chunked_quality_gate(Ok(()), &plan, &mut summary)
-            .expect("non-chunked strategy must skip the gate");
-        assert!(summary.quality_passed.is_none());
     }
 
     // ── build_metric_row ────────────────────────────────────────────────────

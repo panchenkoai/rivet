@@ -221,6 +221,8 @@ mod live_pool_ledger;
 mod live_pool_safety;
 #[path = "live/live_pool_toxiproxy.rs"]
 mod live_pool_toxiproxy;
+#[path = "live/live_quality_gate.rs"]
+mod live_quality_gate;
 #[path = "live/live_reconcile_repair.rs"]
 mod live_reconcile_repair;
 #[path = "live/live_resume.rs"]

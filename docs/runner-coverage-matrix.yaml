@@ -239,13 +239,14 @@ scenarios:
     cdc:            { test: mysql_cdc_retyped_column_refuses_under_fail_and_defers_not_drops }
 
   - id: quality_gates
-    what: "the `quality:` block's tripwires. `row_count_min`/`max` is the COMPLETENESS gate (Severity::Fail -> exit 3) and must fire on every runner: it was Chunked-only once, so a truncated keyset/parallel extract — the paths auto-selected for LARGE tables, where completeness matters most — exited 0 with the tripwire silently disarmed (`run_chunked_quality_gate`, job.rs). `null_ratio_max` and `unique_columns` are single-batch checks by construction. Added as a row because the feature had none: the tests existed, scattered across three files, with nothing asking whether every runner was among them."
-    single:         { test: row_count_min_gate_fails_when_below_threshold }
-    chunked:        { test: gremlin_chunked_empty_middle_chunk_does_not_false_fire_row_count_min }
-    chunked_checkpoint: { na: "not a per-runner re-application: the gate runs in `run_export_job` AFTER the runner returns, keyed on `plan.strategy` (Chunked | Keyset), so every chunked variant is inside the same arm as the cell to the left — there is no checkpoint-specific code path to bypass it" }
-    keyset:         { test: keyset_quality_gate_failure_exits_data_integrity_3 }
-    mongo_parallel: { na: "runs UNDER `ExtractionStrategy::Keyset` (single.rs: a Mongo keyset export with parallel > 1 fans _id-range workers), so it takes the Keyset arm of the same match — the cell to the left is the same code. A separate strategy variant would need its own `test` cell here." }
-    cdc:            { na: "not applied on the drain by design — the gate lives in execute_resolved_plan, which CDC returns before; the run warns when `quality:` is set (cdc_ignored_knobs_warning, pinned by cdc_names_every_batch_only_knob_it_ignores_and_only_those and the live a_cdc_export_names_the_batch_knobs_its_drain_ignores)" }
+    what: "the `quality:` block — row_count_min/max, null_ratio_max, unique_columns. Every sink MEASURES (QualityTracker in on_batch); the runner hands the tracker on as an Observation (take_observations / take_shape), the ledger MERGES the sinks (null counts add, distinct sets union up to unique_max_entries), and finalize_export GRADES the merge once against plan.quality — Severity::Fail -> DataIntegrityError, exit 3 — for every runner. No runner applies a gate and no strategy allow-list decides who gets one (the list bit twice: Chunked-only disarmed keyset, then the multi-part gate checked row_count only). Each SQL cell duplicates a value across two MIDDLE chunks / pages / ranges, so a runner that fed one end of its run, or a seam that graded one sink, stays RED."
+    single:         { test: quality_gate_fails_a_duplicate_on_the_single_runner }
+    chunked:        { test: quality_gate_fails_a_duplicate_split_across_chunks }
+    chunked_checkpoint: { test: quality_gate_fails_a_duplicate_split_across_checkpoint_chunks }
+    keyset:         { test: quality_gate_fails_a_duplicate_split_across_keyset_pages }
+    # The Mongo export is `_id` + `document` (never null, never duplicated), so this cell trips row_count_min; the FEED is the same KeysetPage.observed path the keyset cell grades.
+    mongo_parallel: { test: quality_gate_fails_a_short_mongo_parallel_export }
+    cdc:            { na: "not applied on the drain by design — the gate lives at the finalize_export seam, which CDC returns before; the run warns when `quality:` is set (cdc_ignored_knobs_warning, pinned by cdc_names_every_batch_only_knob_it_ignores_and_only_those and the live a_cdc_export_names_the_batch_knobs_its_drain_ignores)" }
 
   - id: shape_drift_warn
     what: "detect_shape_drift — advisory warning when a string/binary column's max byte length grows past the factor. Applied once at the finalize_export seam from the ledger's max-merged shape bytes; every runner feeds its sinks' bytes (Observations via take_observations / take_shape). Each test widens ONE row in a MIDDLE chunk/page/range, so a runner that fed only its first or only its last sink stays RED."

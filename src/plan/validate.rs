@@ -32,7 +32,6 @@ pub fn validate_plan(plan: &ResolvedRunPlan) -> Vec<Diagnostic> {
     check_stdout_chunked(&mut diags, plan);
     check_incremental_reconcile(&mut diags, plan);
     check_time_window_reconcile(&mut diags, plan);
-    check_quality_chunked(&mut diags, plan);
     check_quality_unique_no_cap(&mut diags, plan);
     check_resume_without_checkpoint(&mut diags, plan);
     check_stdout_manifest(&mut diags, plan);
@@ -102,30 +101,6 @@ fn check_incremental_reconcile(diags: &mut Vec<Diagnostic>, plan: &ResolvedRunPl
                 "export '{}': reconcile runs COUNT(*) on the full base query but only \
                  rows newer than the cursor are exported; the count will always appear \
                  mismatched after the first run",
-                plan.export_name
-            ),
-        });
-    }
-}
-
-/// `quality + chunked/keyset` — only the run-wide row_count bounds are checked; null/unique checks never run.
-fn check_quality_chunked(diags: &mut Vec<Diagnostic>, plan: &ResolvedRunPlan) {
-    let Some(qc) = &plan.quality else { return };
-    if matches!(
-        &plan.strategy,
-        ExtractionStrategy::Chunked(_) | ExtractionStrategy::Keyset(_)
-    ) {
-        let unevaluated = if crate::quality::has_multi_part_unsupported_checks(qc) {
-            "; null_ratio_max and unique_columns are NOT evaluated"
-        } else {
-            ""
-        };
-        diags.push(Diagnostic {
-            level: DiagnosticLevel::Warning,
-            rule: "quality-chunked-partial",
-            message: format!(
-                "export '{}': on chunked/keyset runs only row_count_min/row_count_max are \
-                 checked, against the run-wide total{unevaluated}",
                 plan.export_name
             ),
         });
@@ -394,72 +369,6 @@ mod tests {
         );
     }
 
-    // --- quality-chunked-partial ---
-
-    #[test]
-    fn quality_with_chunked_warns() {
-        let mut p = base_plan();
-        p.strategy = chunked_plan_strategy(false);
-        p.quality = Some(QualityConfig {
-            row_count_min: Some(1),
-            row_count_max: None,
-            null_ratio_max: Default::default(),
-            unique_columns: vec![],
-            unique_max_entries: None,
-        });
-        let diags = validate_plan(&p);
-        assert!(
-            diags.iter().any(|d| d.rule == "quality-chunked-partial"
-                && d.level == DiagnosticLevel::Warning),
-            "expected quality-chunked-partial warning, got: {:?}",
-            rules(&diags)
-        );
-    }
-
-    #[test]
-    fn quality_chunked_partial_says_row_count_is_run_wide_and_unique_is_not_evaluated() {
-        for strategy in [chunked_plan_strategy(false), keyset_plan_strategy()] {
-            let mut p = base_plan();
-            p.strategy = strategy;
-            p.quality = Some(QualityConfig {
-                row_count_min: Some(10),
-                row_count_max: None,
-                null_ratio_max: Default::default(),
-                unique_columns: vec!["id".into()],
-                unique_max_entries: None,
-            });
-            let diags = validate_plan(&p);
-            let d = diags
-                .iter()
-                .find(|d| d.rule == "quality-chunked-partial")
-                .expect("warning");
-            assert_eq!(
-                d.message,
-                "export 'test': on chunked/keyset runs only row_count_min/row_count_max \
-                 are checked, against the run-wide total; null_ratio_max and unique_columns \
-                 are NOT evaluated"
-            );
-        }
-    }
-
-    #[test]
-    fn quality_with_snapshot_is_clean() {
-        let mut p = base_plan();
-        p.quality = Some(QualityConfig {
-            row_count_min: Some(1),
-            row_count_max: None,
-            null_ratio_max: Default::default(),
-            unique_columns: vec![],
-            unique_max_entries: None,
-        });
-        let diags = validate_plan(&p);
-        assert!(
-            diags.iter().all(|d| d.rule != "quality-chunked-partial"),
-            "unexpected quality-chunked-partial, got: {:?}",
-            rules(&diags)
-        );
-    }
-
     // --- resume-no-checkpoint ---
 
     #[test]
@@ -582,7 +491,7 @@ mod tests {
     // ─────┼─────────────┼─────────────┼─────────────────────────┼─────────────────────────────────────────
     //  M1  │ Snapshot    │ Local       │ —                       │ Clean           (clean_plan_produces_no_diagnostics)
     //  M2  │ Snapshot    │ Local       │ reconcile               │ Clean           (snapshot_with_reconcile_is_clean)
-    //  M3  │ Snapshot    │ Local       │ quality                 │ Clean           (quality_with_snapshot_is_clean)
+    //  M3  │ Snapshot    │ Local       │ quality                 │ Clean
     //  M4  │ Snapshot    │ Local       │ max_file_size           │ Clean           (local_with_max_file_size_is_clean)
     //  M5  │ Incremental │ Local       │ —                       │ Clean
     //  M6  │ Chunked     │ Local       │ checkpoint + resume     │ Clean           (resume_with_chunked_checkpoint_is_clean)
@@ -595,14 +504,14 @@ mod tests {
     //  M13 │ Stdout      │ —           │ chunked + max_file_size │ Rejected×2+Degraded (all three rules)
     //  M14 │ Incremental │ Local       │ reconcile               │ Warning         (incremental_with_reconcile_warns)
     //  M15 │ TimeWindow  │ Local       │ reconcile               │ Warning         [time-window-reconcile-mismatch]
-    //  M16 │ Chunked     │ Local       │ quality (no checkpoint) │ Warning         (quality_with_chunked_warns)
+    //  M16 │ Chunked     │ Local       │ quality (no checkpoint) │ Clean           (the gate grades every runner at the finalize seam)
     //  M17 │ Snapshot    │ Local       │ resume                  │ Warning         (resume_without_checkpoint_warns)
     //  M18 │ Incremental │ Local       │ resume                  │ Warning         [resume-no-checkpoint]
     //  M19 │ Chunked     │ Local       │ no-checkpoint + resume  │ Warning         (resume_with_chunked_no_checkpoint_warns)
     //  M20 │ Stdout      │ —           │ incremental + reconcile │ Warning+Degraded [incremental-reconcile-mismatch, stdout-manifest-phantom]
     //  M21 │ Keyset      │ Local       │ —                       │ Clean
     //  M22 │ Stdout      │ —           │ keyset                  │ Rejected+Degraded [stdout-no-keyset, stdout-manifest-phantom]
-    //  M23 │ Keyset      │ Local       │ quality                 │ Warning         (roast_quality_with_keyset_warns)
+    //  M23 │ Keyset      │ Local       │ quality                 │ Clean
     //  M24 │ Keyset      │ Local       │ resume                  │ Warning         [resume-no-checkpoint]
     //  M25 │ Keyset      │ Local       │ reconcile               │ Clean           (full-table export; COUNT(*) matches)
     //  M26 │ Stdout      │ —           │ keyset + max_file_size  │ Rejected×2+Degraded [stdout-no-split, stdout-no-keyset, stdout-manifest-phantom]
@@ -905,31 +814,6 @@ mod tests {
         );
     }
 
-    // ROAST-RED plan-keyset-rules: quality checks run per-part for Keyset exactly as
-    // for Chunked, but check_quality_chunked matches only Chunked(_) — keyset + quality
-    // produces no quality-chunked-partial warning.
-    // Asserts CORRECT behavior; expected to FAIL until the fix lands.
-    #[test]
-    fn roast_quality_with_keyset_warns() {
-        let mut p = base_plan();
-        p.strategy = keyset_plan_strategy();
-        p.quality = Some(QualityConfig {
-            row_count_min: Some(1),
-            row_count_max: None,
-            null_ratio_max: Default::default(),
-            unique_columns: vec![],
-            unique_max_entries: None,
-        });
-        let diags = validate_plan(&p);
-        assert!(
-            diags.iter().any(|d| d.rule == "quality-chunked-partial"
-                && d.level == DiagnosticLevel::Warning),
-            "keyset quality checks run per-page part — expected quality-chunked-partial \
-             warning as for chunked, got: {:?}",
-            rules(&diags)
-        );
-    }
-
     // M21 — Keyset + Local + no flags → Clean
     #[test]
     fn matrix_m21_keyset_local_no_flags_is_clean() {
@@ -968,9 +852,6 @@ mod tests {
             rules(&diags)
         );
     }
-
-    // M23 — Keyset + Local + quality → Warning [quality-chunked-partial]
-    //        (covered by roast_quality_with_keyset_warns above — cross-reference only)
 
     // M24 — Keyset + Local + resume → Warning [resume-no-checkpoint]
     //        keyset has no checkpoint support; --resume is silently ignored

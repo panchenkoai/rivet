@@ -343,7 +343,7 @@ pub(super) fn run_single_export(
     // ADR-0029: feed the OBSERVATION half of the ledger the moment the read is
     // done — the dest schema this run SAW and the shape bytes it measured carry
     // no coverage obligation, so recording them early can never be wrong. Every
-    // `?` below (the quality gate, `RunnerFrame::open`, and above all the
+    // `?` below (`RunnerFrame::open`, and above all the
     // per-part `write_part_file` inside the commit loop) used to escape ABOVE
     // the single tail drain, so a run that failed mid-write pinned the STALE
     // open-time fingerprint onto a Failed manifest describing parts written
@@ -355,45 +355,6 @@ pub(super) fn run_single_export(
         plan.export_name,
         sink.total_rows
     );
-
-    // Run quality checks BEFORE the empty-export early return so that
-    // row_count_min fires even when the source returned zero rows.
-    let quality_issues = sink.run_quality_checks();
-    if !quality_issues.is_empty() {
-        for issue in &quality_issues {
-            let level = match issue.severity {
-                crate::quality::Severity::Fail => "FAIL",
-                crate::quality::Severity::Warn => "WARN",
-            };
-            log::warn!("quality {}: {}", level, issue.message);
-            summary.journal.record(RunEvent::QualityIssue {
-                severity: level.to_string(),
-                message: issue.message.clone(),
-            });
-        }
-        let fails: Vec<&str> = quality_issues
-            .iter()
-            .filter(|i| i.severity == crate::quality::Severity::Fail)
-            .map(|i| i.message.as_str())
-            .collect();
-        if !fails.is_empty() {
-            summary.quality_passed = Some(false);
-            // Surface *which* checks failed (they're already computed +
-            // warn-logged above) via the shared failure contract in
-            // `crate::quality` so single and chunked modes can't drift. Tagged
-            // as a data-integrity failure (exit 3) so a scheduler stops rather
-            // than retries — the message text is unchanged.
-            return Err(DataIntegrityError::new(crate::quality::failure_message(
-                &plan.export_name,
-                None,
-                &fails,
-            ))
-            .into());
-        }
-    }
-    if plan.quality.is_some() {
-        summary.quality_passed = Some(true);
-    }
 
     if sink.total_rows == 0 {
         log::info!("export '{}': no data to export", plan.export_name);
@@ -763,57 +724,32 @@ mod tests {
         assert_ne!(summary.status, "skipped");
     }
 
-    // ── quality gate ──────────────────────────────────────────────────────────
-
-    /// When quality.row_count_min is set and actual rows fall short, the run fails.
+    /// single grades nothing itself: it writes its part and hands what its sink measured
+    /// to the ledger, whose seam grades every runner.
     #[test]
-    fn quality_row_count_min_fail_aborts_run() {
-        use crate::config::QualityConfig;
+    fn single_feeds_its_quality_measurements_to_the_ledger_and_grades_nothing() {
+        let out = tempfile::tempdir().unwrap();
         let mut plan = minimal_plan();
-        plan.quality = Some(QualityConfig {
-            row_count_min: Some(100), // require 100 rows minimum
+        plan.destination.path = Some(out.path().to_string_lossy().into_owned());
+        plan.quality = Some(crate::config::QualityConfig {
+            row_count_min: Some(100),
             row_count_max: None,
             null_ratio_max: Default::default(),
-            unique_columns: vec![],
+            unique_columns: vec!["id".into()],
             unique_max_entries: None,
         });
-        // Source only emits 3 rows → quality gate should fire Severity::Fail
         let (result, summary) = run(&mut RowSource(3), &plan);
-        let err = result.unwrap_err();
+        result.expect("the runner no longer applies the gate");
+        assert_eq!(summary.quality_passed, None);
+        assert_eq!(summary.files_committed, 1, "a 3-row run commits its part");
+        assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 1);
+        let q = &summary.ledger.observed.quality;
         assert!(
-            err.to_string().contains("quality"),
-            "expected quality error: {err}"
+            q.columns.is_some(),
+            "the rules travel with the measurements"
         );
-        // The quality bail carries the DataIntegrityError marker → exit class 3
-        // (STOP), and the operator message is unchanged (asserted above).
-        assert!(
-            err.downcast_ref::<DataIntegrityError>().is_some(),
-            "quality-gate failure must be a typed data-integrity error"
-        );
-        assert_eq!(crate::error::classify_exit(&err), 3);
-        assert_eq!(summary.quality_passed, Some(false));
-    }
-
-    /// When quality.row_count_max is set and actual rows exceed it, the run fails.
-    #[test]
-    fn quality_row_count_max_fail_aborts_run() {
-        use crate::config::QualityConfig;
-        let mut plan = minimal_plan();
-        plan.quality = Some(QualityConfig {
-            row_count_min: None,
-            row_count_max: Some(2), // max 2 rows
-            null_ratio_max: Default::default(),
-            unique_columns: vec![],
-            unique_max_entries: None,
-        });
-        // Source emits 10 rows → exceeds max
-        let (result, summary) = run(&mut RowSource(10), &plan);
-        let err = result.unwrap_err();
-        assert!(
-            err.to_string().contains("quality"),
-            "expected quality error: {err}"
-        );
-        assert_eq!(summary.quality_passed, Some(false));
+        assert_eq!(q.unique_non_null_counts.get("id"), Some(&3));
+        assert_eq!(q.unique_sets.get("id").map(|s| s.len()), Some(3));
     }
 
     // ── decide_export_retry: retry/reconnect decision matrix ────────────────
@@ -913,7 +849,6 @@ mod tests {
     fn decide_retry_a_quality_stop_named_like_a_timeout_bails_original() {
         let err: anyhow::Error = DataIntegrityError::new(crate::quality::failure_message(
             "session_timeouts",
-            None,
             &["column 'timeout_ms': 3 duplicate values"],
         ))
         .into();
