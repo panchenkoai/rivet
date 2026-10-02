@@ -424,6 +424,46 @@ class Proc:
         return self.stdout + self.stderr
 
 
+#: Every RIVET_* variable the gate, the Rust harness or the Makefile's GATE_ENV READS from the
+#: shell. Any other RIVET_* in the inherited environment is the PRODUCT's (a fault hook, a state
+#: URL, a tuning knob left over from a manual repro) and is dropped before the first cell: `run()`
+#: merges os.environ into every child, so a leftover looked like a product failure in every cell.
+#: Enumerated from the code, graded by tests/offline/harness_env_hygiene_guard.rs.
+HARNESS_ENV: frozenset[str] = frozenset((
+    "RIVET_ALLOW_WORKTREE_LIVE", "RIVET_BIN", "RIVET_BIN_OVERRIDE",
+    "RIVET_CDC_STATE_URL", "RIVET_CONC_SRC_CONTAINER", "RIVET_CONC_SRC_URL", "RIVET_CONC_STATE_URL",
+    "RIVET_FAILURE_MONGO_URL", "RIVET_FIELD_LOCK", "RIVET_FIELD_MYSQL_CONTAINER", "RIVET_FIELD_REPLAY_BIN",
+    "RIVET_FLOW_VERDICTS", "RIVET_GATE_SHARED_STATE", "RIVET_GATE_STATE_URL",
+    "RIVET_HARM_SLACK", "RIVET_HARM_TOL",
+    "RIVET_ORACLE_DOCKER", "RIVET_ORACLE_LATEST_ONLY", "RIVET_ORACLE_LOG", "RIVET_ORACLE_SELFTEST_FLAG",
+    "RIVET_ORACLE_VERSIONS", "RIVET_ORACLE_WITHOUT_PREV_RELEASE", "RIVET_ORACLE_WORK",
+    "RIVET_PERF_BQ_WALL_TOL", "RIVET_PERF_CPU_TOL", "RIVET_PERF_RSS_TOL", "RIVET_PERF_WALL_TOL",
+    "RIVET_PREV_RELEASE_BIN", "RIVET_REGENERATE_FIXTURES", "RIVET_REGRESSION_SOURCE_URL",
+    "RIVET_REGRESSION_WALL_TOL", "RIVET_SCALE_CHUNK", "RIVET_SCALE_RSS_TOL",
+    "RIVET_SF_CONNECTION", "RIVET_SF_DATABASE", "RIVET_SF_SCHEMA", "RIVET_SF_STORAGE_INTEGRATION",
+    "RIVET_SF_WAREHOUSE", "RIVET_SKIP_LOG", "RIVET_SNOWFLAKE_KEY",
+    "RIVET_SOAK_BYTE_CAP", "RIVET_SOAK_ROLLOVER", "RIVET_SOAK_ROLLOVER_MB", "RIVET_SWEEP_STATE_CONTAINER",
+    "RIVET_TEST_BQ_DATASET", "RIVET_TEST_EXCLUSIVE", "RIVET_TEST_GCS_BUCKET", "RIVET_TEST_ORACLE_LATIN1_URL",
+    "RIVET_TEST_STATE_TOXI_URL", "RIVET_TEST_STATE_URL", "RIVET_TINYFS_DIR",
+    "RIVET_UPG_KEEP", "RIVET_UPG_ORACLE_CDC_URL",
+))
+#: The per-engine URL families (`RIVET_CDC_<ENGINE>_URL`, `RIVET_ORACLE_<ENGINE>_URL`), read by name.
+HARNESS_ENV_FAMILY = re.compile(r"^RIVET_(CDC|ORACLE)_[A-Z0-9]+_URL$")
+
+
+def is_harness_env(name: str) -> bool:
+    """Is `name` a RIVET_* variable the harness itself reads (so the shell may hand it in)?"""
+    return name in HARNESS_ENV or bool(HARNESS_ENV_FAMILY.match(name))
+
+
+def scrub_inherited_rivet_env() -> list[str]:
+    """Drop every inherited RIVET_* that is not the harness's own; return the dropped names."""
+    dropped = sorted(k for k in os.environ if k.startswith("RIVET_") and not is_harness_env(k))
+    for k in dropped:
+        del os.environ[k]
+    return dropped
+
+
 def run(
     argv: Sequence[str],
     *,

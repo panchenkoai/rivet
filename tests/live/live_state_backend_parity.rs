@@ -70,11 +70,10 @@ fn drop_source(table: &str) {
 /// the same pre-seeded source table.
 fn assert_single_run_parity(build: impl Fn() -> Rig, pg_url: &str, expected: usize) {
     // SQLite state — RIVET_STATE_URL pinned EMPTY on the child, not merely
-    // absent: the harness only ADDS env (no env_clear), so an ambient
-    // RIVET_STATE_URL from the operator's shell would silently switch this
-    // leg to Postgres and the parity test would compare Postgres to Postgres
-    // (r4 bughunt). Empty fails the starts_with("postgres") check in
-    // StateStore::open, forcing the SQLite arm regardless of the shell.
+    // absent: the harness strips the shell's RIVET_* but re-adds the gate's
+    // backend under test (RIVET_GATE_STATE_URL), which would switch this leg to
+    // Postgres and compare Postgres to Postgres (r4 bughunt). Empty fails the
+    // starts_with("postgres") check in StateStore::open, forcing the SQLite arm.
     let s = build();
     let out = s.run_with_env("RIVET_STATE_URL", "");
     assert!(

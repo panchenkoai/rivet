@@ -174,18 +174,20 @@ pub fn live_shared_tmp_host() -> std::path::PathBuf {
     // checkout's is a DIR — that is the cheap, reliable tell.
     let git = root.join(".git");
     let dir = root.join("tests").join(".live-tmp");
-    // A SYMLINKED `tests/.live-tmp` IS the reconciliation this guard exists to
-    // demand, so accept it instead of refusing: it resolves to the checkout
-    // `docker compose up` was started from, i.e. the very directory the
-    // containers bind-mount at /work (verified 2026-09-21 by comparing
-    // st_dev/st_ino against `docker inspect rivet-duckdb`). The guard only ever
-    // asked "is this a worktree?", never "do the paths actually diverge?" —
-    // measured cost of that gap: NINE gate cells lost per run (network faults,
-    // mongo SCRAM, and every pool / pool-split cell), each panicking here, while
-    // CI never sees it because CI is a plain checkout that `mkdir -p`s the dir.
-    let reconciled = std::fs::symlink_metadata(&dir)
-        .map(|m| m.file_type().is_symlink())
-        .unwrap_or(false);
+    // A `tests/.live-tmp` SYMLINKED at the MAIN checkout's own tests/.live-tmp
+    // IS the reconciliation this guard exists to demand, so accept it: that is
+    // the directory the containers bind-mount at /work when the stand was
+    // started from the main checkout. "Is a symlink" alone was not enough — a
+    // link at another worktree's dir, or a dangling one, read as reconciled and
+    // the oracle then saw 0 rows or stale data (hunt H4-6). Measured cost of
+    // refusing every worktree outright: NINE gate cells lost per run, while CI
+    // never sees it because CI is a plain checkout that `mkdir -p`s the dir.
+    let main_live_tmp = main_checkout(&git).map(|m| m.join("tests").join(".live-tmp"));
+    let reconciled = std::fs::symlink_metadata(&dir).is_ok_and(|m| m.file_type().is_symlink())
+        && matches!(
+            (dir.canonicalize(), main_live_tmp.as_deref().map(std::path::Path::canonicalize)),
+            (Ok(a), Some(Ok(b))) if a == b
+        );
     if git.is_file() && !reconciled && std::env::var_os("RIVET_ALLOW_WORKTREE_LIVE").is_none() {
         panic!(
             "live tests are running from a git WORKTREE ({}), but the duckdb/clickhouse \
@@ -193,13 +195,27 @@ pub fn live_shared_tmp_host() -> std::path::PathBuf {
              started from — the paths diverge and the oracle reads the wrong directory. \
              Run live tests from the main checkout (where you started the stand); or, if you \
              genuinely started the stand from THIS worktree, set RIVET_ALLOW_WORKTREE_LIVE=1; \
-             or symlink tests/.live-tmp at the stand checkout's own tests/.live-tmp, which \
-             makes the two paths the SAME directory and is accepted without the env var.",
-            root.display()
+             or symlink tests/.live-tmp at the main checkout's own tests/.live-tmp ({}; this \
+             one resolves to {}), which makes the two paths the SAME directory and is accepted \
+             without the env var.",
+            root.display(),
+            main_live_tmp
+                .as_deref()
+                .map_or("<unknown>".to_string(), |p| p.display().to_string()),
+            std::fs::read_link(&dir)
+                .map_or("<not a symlink>".to_string(), |p| p.display().to_string()),
         );
     }
     std::fs::create_dir_all(&dir).expect("create tests/.live-tmp");
     dir
+}
+
+/// The main checkout a worktree's `.git` FILE points at (`gitdir: <main>/.git/worktrees/<name>`).
+fn main_checkout(git_file: &std::path::Path) -> Option<std::path::PathBuf> {
+    let text = std::fs::read_to_string(git_file).ok()?;
+    let gitdir = text.strip_prefix("gitdir:")?.trim();
+    let (main, _) = gitdir.split_once("/.git/worktrees/")?;
+    Some(std::path::PathBuf::from(main))
 }
 
 /// In-container view of [`live_shared_tmp_host`]. Used to build paths that

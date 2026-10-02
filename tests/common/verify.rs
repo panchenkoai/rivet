@@ -385,7 +385,11 @@ impl Case {
             _ => return Err("structured source (host/user/database): not graded yet".into()),
         };
         let url = source_url(&raw);
-        let state = env_of(envs, "RIVET_STATE_URL")
+        let state = envs
+            .iter()
+            .find(|(n, _)| *n == "RIVET_STATE_URL")
+            .map(|(_, v)| v.to_string())
+            .or_else(super::state::state_url_under_test)
             .filter(|u| u.starts_with("postgres"))
             .or_else(|| {
                 let db = self.config_dir.join(".rivet_state.db");

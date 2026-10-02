@@ -10,21 +10,15 @@
 //!
 //! The test database must exist; tables are created / migrated automatically.
 
-use rivet::state::StateStore;
+use rivet::state::{StateRef, StateStore};
 
-/// Open a Postgres-backed `StateStore` using `RIVET_TEST_STATE_URL`, or skip
-/// the test if the variable is not set.
+/// Open a Postgres-backed `StateStore` at `RIVET_TEST_STATE_URL`, or `None` when it names no Postgres.
 fn pg_store() -> Option<StateStore> {
     let url = std::env::var("RIVET_TEST_STATE_URL").ok()?;
     if !url.starts_with("postgres") {
         return None;
     }
-    // Temporarily set RIVET_STATE_URL so StateStore::open() picks up Postgres.
-    // Safety: tests are single-threaded at the point this helper is called.
-    unsafe { std::env::set_var("RIVET_STATE_URL", &url) };
-    let store = StateStore::open(":memory:").expect("open pg state store");
-    unsafe { std::env::remove_var("RIVET_STATE_URL") };
-    Some(store)
+    Some(StateStore::open_at_ref(&StateRef::Postgres(url)).expect("open pg state store"))
 }
 
 /// PARITY: the per-table lease refuses a second holder on Postgres exactly as it
@@ -227,14 +221,7 @@ fn pg_metrics_record_and_query() {
 #[test]
 #[ignore]
 fn pg_chunk_checkpoint_claim_complete() {
-    let url = match std::env::var("RIVET_TEST_STATE_URL") {
-        Ok(u) if u.starts_with("postgres") => u,
-        _ => return,
-    };
-    // Safety: test is single-threaded at this point.
-    unsafe { std::env::set_var("RIVET_STATE_URL", &url) };
-    let s = StateStore::open(":memory:").expect("open pg state store");
-    unsafe { std::env::remove_var("RIVET_STATE_URL") };
+    let Some(s) = pg_store() else { return };
 
     let run_id = format!("pg_test_run_{}", chrono::Utc::now().timestamp_micros());
     s.create_chunk_run(&run_id, "pg_orders", "hash_abc", 3)

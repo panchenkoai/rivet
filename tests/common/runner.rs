@@ -43,8 +43,7 @@ pub fn rivet_bin() -> &'static str {
 /// `rivet --version` of whatever [`rivet_bin`] resolved to, for a measurement to
 /// print. A number without the binary that produced it is not a comparison.
 pub fn rivet_bin_label() -> String {
-    let v = Command::new(rivet_bin())
-        .arg("--version")
+    let v = rivet_command(&["--version"], &[])
         .output()
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
@@ -68,16 +67,44 @@ pub fn write_config(tmpdir: &tempfile::TempDir, yaml: &str) -> PathBuf {
     path
 }
 
+/// A `rivet` command with every inherited `RIVET_*` stripped; the child sees only the state backend under test and `envs`.
+pub fn rivet_command(args: &[impl AsRef<std::ffi::OsStr>], envs: &[(&str, &str)]) -> Command {
+    let mut cmd = Command::new(rivet_bin());
+    cmd.args(args);
+    for (k, _) in std::env::vars_os() {
+        if k.to_string_lossy().starts_with("RIVET_") {
+            cmd.env_remove(&k);
+        }
+    }
+    note_ignored_shell_state_url();
+    if let Some(url) = super::state::state_url_under_test() {
+        cmd.env("RIVET_STATE_URL", url);
+    }
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    cmd
+}
+
+/// Say once per process that a shell `RIVET_STATE_URL` does not reach rivet; the harness knob is `RIVET_GATE_STATE_URL`.
+fn note_ignored_shell_state_url() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let shell = std::env::var("RIVET_STATE_URL").is_ok_and(|u| u.starts_with("postgres"));
+        if shell && super::state::state_url_under_test().is_none() {
+            eprintln!(
+                "NOTE: RIVET_STATE_URL is set in the shell but stripped from every rivet the \
+                 harness spawns; set RIVET_GATE_STATE_URL to grade Postgres state"
+            );
+        }
+    });
+}
+
 /// Run `rivet <args...>` and capture stdout/stderr.  Panics if the process
 /// cannot be spawned (which indicates a build-time problem, not a test
 /// failure).
 pub fn run_rivet(args: &[&str]) -> Output {
-    graded(args, &[], None, || {
-        Command::new(rivet_bin())
-            .args(args)
-            .output()
-            .expect("spawn rivet binary")
-    })
+    run_rivet_env(args, &[])
 }
 
 /// Run `spawn` and hand a successful `run|load|compact --config` to the default oracle (verify.rs).
@@ -98,11 +125,7 @@ fn graded(
 
 /// `run_rivet` with extra environment variables (fault hooks, log levels).
 pub fn run_rivet_env(args: &[&str], envs: &[(&str, &str)]) -> Output {
-    let mut cmd = Command::new(rivet_bin());
-    cmd.args(args);
-    for (k, v) in envs {
-        cmd.env(k, v);
-    }
+    let mut cmd = rivet_command(args, envs);
     graded(args, envs, None, || {
         cmd.output().expect("spawn rivet binary")
     })
@@ -117,11 +140,8 @@ pub fn run_rivet_env(args: &[&str], envs: &[(&str, &str)]) -> Output {
 /// config the way its next-steps text tells an operator to — from the directory
 /// holding it — is therefore only expressible with the CWD set.
 pub fn run_rivet_in_dir(dir: &std::path::Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
-    let mut cmd = Command::new(rivet_bin());
-    cmd.args(args).current_dir(dir);
-    for (k, v) in envs {
-        cmd.env(k, v);
-    }
+    let mut cmd = rivet_command(args, envs);
+    cmd.current_dir(dir);
     graded(args, envs, Some(dir), || {
         cmd.output().expect("spawn rivet binary")
     })
@@ -140,8 +160,7 @@ pub fn run_rivet_bounded(
     let start = std::time::Instant::now();
     let argv = ["run", "--config", cfg.to_str().unwrap()];
     let case = super::verify::begin_raw(&argv.map(String::from), &[], None);
-    let mut child = Command::new(rivet_bin())
-        .args(argv)
+    let mut child = rivet_command(&argv, &[])
         .spawn()
         .expect("spawn rivet binary");
     loop {
@@ -167,9 +186,7 @@ pub fn run_rivet_bounded(
 /// emitted via the log crate (plan validation warnings, quality warnings, etc.).
 pub fn run_rivet_with_warn_log(args: &[&str]) -> Output {
     graded(args, &[], None, || {
-        Command::new(rivet_bin())
-            .args(args)
-            .env("RUST_LOG", "warn")
+        rivet_command(args, &[("RUST_LOG", "warn")])
             .output()
             .expect("spawn rivet binary")
     })
@@ -244,11 +261,8 @@ pub fn run_rivet_args_bounded_env(
     let path = dir.path().join("stdout");
     let stdout = std::fs::File::create(&path).expect("stdout capture file");
     let start = std::time::Instant::now();
-    let mut cmd = Command::new(rivet_bin());
-    cmd.args(args).stdout(stdout);
-    for (k, v) in envs {
-        cmd.env(k, v);
-    }
+    let mut cmd = rivet_command(args, envs);
+    cmd.stdout(stdout);
     let argv: Vec<String> = args.iter().map(|a| a.to_string()).collect();
     let case = super::verify::begin_raw(&argv, envs, None);
     let mut child = cmd.spawn().expect("spawn rivet binary");

@@ -31,12 +31,7 @@ impl Rig {
 
     /// The single `Command` builder behind every runner wrapper.
     fn invoke_command(&self, argv: &[String], envs: &[(&str, &str)]) -> std::process::Command {
-        let mut cmd = std::process::Command::new(crate::common::runner::rivet_bin());
-        cmd.args(argv);
-        for (k, v) in envs {
-            cmd.env(k, v);
-        }
-        cmd
+        crate::common::runner::rivet_command(argv, envs)
     }
 
     /// Run to completion and collect the output.

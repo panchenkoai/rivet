@@ -69,6 +69,8 @@ mod examples_parse;
 mod extension_seam;
 #[path = "offline/format_fuzz.rs"]
 mod format_fuzz;
+#[path = "offline/harness_env_hygiene_guard.rs"]
+mod harness_env_hygiene_guard;
 #[path = "offline/harness_metrics_guard.rs"]
 mod harness_metrics_guard;
 #[path = "offline/mssql_column_data_fixture_guard.rs"]

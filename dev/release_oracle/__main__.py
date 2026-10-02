@@ -1136,6 +1136,10 @@ def main(argv: list[str] | None = None) -> int:
     if (argv if argv is not None else sys.argv[1:]) == ["--self-test"]:
         return _self_test()
     ns = parse_args(argv)
+    from .core import scrub_inherited_rivet_env
+    dropped = scrub_inherited_rivet_env()
+    if dropped:
+        print(f"  dropped from the inherited environment (the product's, not the gate's): {' '.join(dropped)}")
     lock = _hold_gate_lock()
     if lock is None:
         print(f"another gate run holds {target_dir() / '.gate.lock'} — two runs in one tree clean "
@@ -1202,11 +1206,16 @@ def main(argv: list[str] | None = None) -> int:
                 os.environ["RIVET_TEST_STATE_TOXI_URL"] = _up.urlunsplit(
                     (t.scheme, f"{t.username}:{t.password}@127.0.0.1:15433", t.path, "", ""))
                 print(f"  per-run state DB: {t.path.lstrip('/')} (dropped at exit)")
+        # RIVET_STATE_URL reaches the cells the gate spawns itself; RIVET_GATE_STATE_URL is
+        # how the Rust harness learns the backend under test and re-adds it to every rivet
+        # it spawns (it strips the shell's RIVET_* first). Both say the same thing.
         if state_url:
             os.environ["RIVET_STATE_URL"] = state_url
+            os.environ["RIVET_GATE_STATE_URL"] = state_url
             backend = f"POSTGRES ({state_url.split('@')[-1]})"
         else:
             os.environ.pop("RIVET_STATE_URL", None)
+            os.environ.pop("RIVET_GATE_STATE_URL", None)
             backend = "SQLITE (a .rivet_state.db beside each config — the default)"
         print(f"  state backend under test: {backend}")
         print("  a pass grades ONE backend; --state-url runs the same cells against the other")
