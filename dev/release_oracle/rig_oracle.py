@@ -769,6 +769,9 @@ KNOWN_DEFECT_CLASSES = {
     "delivered-only rows": lambda line: bool(re.match(r"VALUES: 0 source row\(s\) not delivered, [1-9]", line)) or bool(
         (m := re.match(r"COUNT\(.*: source (\d+), delivered (\d+)$", line)) and int(m.group(2)) > int(m.group(1))
     ),
+    "undelivered rows": lambda line: bool(re.match(r"VALUES: [1-9]\d* source row\(s\) not delivered, 0 ", line)) or bool(
+        (m := re.match(r"COUNT\(.*: source (\d+), delivered (\d+)$", line)) and int(m.group(2)) < int(m.group(1))
+    ),
 }
 
 
@@ -1522,6 +1525,12 @@ def _self_test() -> None:
     assert not known_defect_covers("delivered-only rows", [*phantom, "TYPE: `v` source BIGINT delivered as INTEGER: x"])
     assert not known_defect_covers("delivered-only rows", ["VALUES: 1 source row(s) not delivered, 1 delivered row(s) not in the source"])
     assert not known_defect_covers("delivered-only rows", []), "no disagreement is not the defect"
+    lost = ["COUNT(*): source 4, delivered 2", "COUNT(DISTINCT `id`): source 4, delivered 2",
+            "VALUES: 2 source row(s) not delivered, 0 delivered row(s) not in the source; differing column(s) []"]
+    assert known_defect_covers("undelivered rows", lost)
+    assert not known_defect_covers("undelivered rows", phantom), "a phantom row is another class"
+    assert not known_defect_covers("undelivered rows", ["VALUES: 2 source row(s) not delivered, 1 delivered row(s) not in the source"])
+    assert not known_defect_covers("undelivered rows", []), "no disagreement is not the defect"
     nulled = {**xfail, "dst_stats": [[1, 1]]}
     assert any("COUNT(`b`)" in b for b in grade_findings(nulled, rows, set(), {"b": "BIGINT"}, True)), \
         "a known_defect column whose non-null count drops is still reported"

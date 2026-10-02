@@ -646,6 +646,12 @@ pub enum StateAction {
         #[arg(long)]
         run_id: String,
     },
+    /// Shrink a SQLite state DB: rewrite it without the free pages deletes and migrations
+    /// leave behind (takes the write lock while it runs; PostgreSQL state is left to autovacuum)
+    Vacuum {
+        #[arg(short, long)]
+        config: String,
+    },
     /// Show the load ledger (`rivet load` runs recorded in the state DB)
     Loads {
         #[arg(short, long)]

@@ -333,6 +333,24 @@ impl StateStore {
         })
     }
 
+    /// Rewrite a SQLite state DB without its free pages; `(bytes_before, bytes_after)`, `None` on Postgres.
+    pub fn vacuum(&self) -> Result<Option<(i64, i64)>> {
+        let StateConn::Sqlite(c) = &self.conn else {
+            return Ok(None);
+        };
+        let size = || -> Result<i64> {
+            Ok(c.query_row(
+                "SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()",
+                [],
+                |r| r.get(0),
+            )?)
+        };
+        let before = size()?;
+        c.execute_batch("VACUUM;")?;
+        c.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+        Ok(Some((before, size()?)))
+    }
+
     /// Run raw SQL on an in-memory store, to put it in a state no product path reaches.
     #[cfg(test)]
     pub(crate) fn exec_for_test(&self, sql: &str) {
@@ -360,6 +378,32 @@ fn is_plaintext_remote(url: &str) -> bool {
 }
 
 // ─── Migration tests ──────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod vacuum {
+    use super::StateStore;
+
+    #[test]
+    fn vacuum_returns_the_free_pages_and_keeps_every_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = StateStore::open_at_path(&dir.path().join("state.db")).unwrap();
+        s.exec_for_test(
+            "CREATE TABLE junk (b BLOB);
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2000)
+             INSERT INTO junk SELECT randomblob(1000) FROM n;
+             DELETE FROM junk WHERE rowid > 10;",
+        );
+        let (before, after) = s.vacuum().unwrap().unwrap();
+        assert!(
+            before > 1_500_000 && after < before / 4,
+            "{before} -> {after}"
+        );
+        let left = s
+            .query_opt("SELECT COUNT(*) FROM junk", &[], |r| r.i64(0))
+            .unwrap();
+        assert_eq!(left, Some(10));
+    }
+}
 
 #[cfg(test)]
 mod plaintext_remote_warning {

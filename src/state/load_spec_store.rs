@@ -106,21 +106,39 @@ impl StateStore {
         )?;
         // The same spec under ITS run: what `rivet load` pins a plan to, so a
         // same-named export of another config sharing this state DB cannot type it.
+        // The run row references a deduplicated version instead of copying the spec.
+        let spec_match = "export_name = ?1 AND unit = ?2 AND columns_json = ?3
+                 AND COALESCE(primary_key_json, '') = COALESCE(?4, '')";
         self.execute(
-            "INSERT INTO export_load_spec_run
-                 (export_name, unit, run_id, columns_json, primary_key_json, captured_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT (export_name, unit, run_id) DO UPDATE SET
-                 columns_json     = excluded.columns_json,
-                 primary_key_json = excluded.primary_key_json,
-                 captured_at      = excluded.captured_at",
+            &format!(
+                "INSERT INTO load_spec_version
+                     (export_name, unit, columns_json, primary_key_json, captured_at)
+                 SELECT ?1, ?2, ?3, ?4, ?5
+                 WHERE NOT EXISTS (SELECT 1 FROM load_spec_version WHERE {spec_match})"
+            ),
             &[
                 export_name.into(),
                 unit.unwrap_or("").into(),
-                run_id.into(),
+                columns_json.clone().into(),
+                primary_key_json.clone().into(),
+                now.clone().into(),
+            ],
+        )?;
+        self.execute(
+            &format!(
+                "INSERT INTO export_load_spec_run (export_name, unit, run_id, spec_id, captured_at)
+                 VALUES (?1, ?2, ?6, (SELECT MAX(spec_id) FROM load_spec_version WHERE {spec_match}), ?5)
+                 ON CONFLICT (export_name, unit, run_id) DO UPDATE SET
+                     spec_id     = excluded.spec_id,
+                     captured_at = excluded.captured_at"
+            ),
+            &[
+                export_name.into(),
+                unit.unwrap_or("").into(),
                 columns_json.into(),
                 primary_key_json.into(),
                 now.into(),
+                run_id.into(),
             ],
         )?;
         Ok(())
@@ -137,8 +155,9 @@ impl StateStore {
         run_id: &str,
     ) -> Result<Option<LoadSpec>> {
         let row = self.query_opt(
-            "SELECT columns_json, primary_key_json, captured_at FROM export_load_spec_run
-             WHERE export_name = ?1 AND unit = ?2 AND run_id = ?3",
+            "SELECT v.columns_json, v.primary_key_json, r.captured_at
+             FROM export_load_spec_run r JOIN load_spec_version v ON v.spec_id = r.spec_id
+             WHERE r.export_name = ?1 AND r.unit = ?2 AND r.run_id = ?3",
             &[export_name.into(), unit.unwrap_or("").into(), run_id.into()],
             |r| (r.text(0), r.opt_text(1), r.text(2)),
         )?;
@@ -324,6 +343,32 @@ mod tests {
     /// each with an export called `users` over a different source — must each keep
     /// the spec THEIR run recorded: the by-name row is last-writer-wins, the
     /// by-run row is what the load pins to.
+    #[test]
+    fn runs_with_an_unchanged_spec_share_one_stored_version() {
+        let s = StateStore::open_in_memory().unwrap();
+        let cols = vec![col("id", RivetType::Int64)];
+        let key = ["id".to_string()];
+        let versions = || {
+            s.query_opt("SELECT COUNT(*) FROM load_spec_version", &[], |r| r.i64(0))
+                .unwrap()
+                .unwrap()
+        };
+        for run in ["r1", "r2", "r3"] {
+            s.record_load_spec("t", None, &cols, Some(&key), run)
+                .unwrap();
+        }
+        assert_eq!(versions(), 1, "an unchanged spec is stored once");
+        s.record_load_spec("t", None, &cols, None, "r4").unwrap();
+        assert_eq!(versions(), 2, "a keyless spec is a new version");
+        s.record_load_spec("t", None, &cols, Some(&key), "r5")
+            .unwrap();
+        assert_eq!(versions(), 2, "a returning spec reuses its version");
+        let r4 = s.load_spec_of_run("t", None, "r4").unwrap().unwrap();
+        assert_eq!((r4.columns, r4.primary_key), (cols.clone(), None));
+        let r1 = s.load_spec_of_run("t", None, "r1").unwrap().unwrap();
+        assert_eq!(r1.primary_key, Some(key.to_vec()));
+    }
+
     #[test]
     fn each_run_keeps_its_own_spec_while_the_by_name_row_follows_the_last_writer() {
         let s = StateStore::open_in_memory().unwrap();

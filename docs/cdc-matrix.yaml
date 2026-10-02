@@ -167,6 +167,14 @@ scenarios:
     mongo:    { na: "a MongoDB secondary serves change streams fine (they read the oplog); reading CDC from a secondary is a supported topology, not a fail-loud case" }
     oracle:   { gap: "not measured: a bounded drain pointed at a Data Guard standby is untested, so whether it fails loud or mines is unknown" }
 
+  - id: cdc_failover_to_another_member
+    what: "a failover: the member rivet reads from fails and the SAME config is pointed at another member of the cluster. Nothing may be lost or duplicated silently: rivet either refuses loudly (no part, checkpoint unmoved) or continues with every change exactly once. A cell that does neither is a strict known defect, so the gate flips the day it is fixed"
+    postgres: { test: a_pg_failover_to_the_standby_with_a_checkpoint_is_refused_not_resumed_on_a_new_slot, note: "with `cdc.checkpoint` the missing slot is refused. Two strict known defects: without a checkpoint a new slot is created with only a warning and the rows written during the switch are lost (a_pg_failover_to_the_standby_without_a_checkpoint_loses_the_rows_written_during_the_switch, graded by the rig oracle as undelivered rows); following the failover is not implemented (pg_cdc_follows_a_failover_to_the_standby)" }
+    mysql:    { test: a_failover_to_another_cluster_member_is_refused_not_resumed_at_foreign_coordinates, note: "refused by server identity (server_uuid, then the GTID set); following the failover by GTID is a strict known defect (cdc_follows_a_failover_to_another_cluster_member_by_gtid)" }
+    mssql:    { test: mssql_checkpoint_follows_a_failover_to_the_secondary }
+    mongo:    { test: mongo_cdc_follows_a_failover_to_another_replica_set_member, note: "the resume token lives in the replica set's shared oplog, so the stream continues on another member; a primary election (stepdown) is not exercised: the stand's second member has priority 0" }
+    oracle:   { gap: "not measured: no Data Guard stand, so what a failover does to an Oracle CDC checkpoint is unknown (another database is refused: oracle_cdc_checkpoint_from_another_database_is_refused)" }
+
   - id: cdc_oversized_transaction_bails_loud
     what: "a transaction is buffered WHOLE (never split across parts), so an oversized one would OOM — each adapter caps its per-transaction buffer (max_tx_rows(), default 5M, and max_tx_bytes(), default 2 GiB of RESIDENT cost — at resident rates the byte cap fires first on any realistic row) and BY DEFAULT bails loudly naming the cap, never a silent OOM or partial capture. With RIVET_CDC_SPILL_DIR set the same threshold spills the tail to disk instead and the run proceeds — the *_past_the_memory_cap_* tests cover that branch; these four cover the refusal, which is why they must run WITHOUT the env var. One shared helper but FOUR call sites — each adapter's own guard is RED-proven, not just the helper"
     postgres: { test: roast_pg_cdc_oversized_transaction_bails_loud_not_oom }

@@ -157,7 +157,9 @@ const MATRICES: &[(&str, usize)] = &[
     // filled — every cell is a test or a justified n/a.
     // Raised 0 -> 21 (2026-09-26): the Oracle column's honest gaps (batch-only phase 1).
     // Lowered 20 -> 5 (2026-09-29): Oracle CDC shipped (#324); its live tests fill the cells.
-    ("docs/cdc-matrix.yaml", 5),
+    // Raised 5 -> 6 (2026-10-02): the new failover row's Oracle cell is an honest gap (no Data
+    // Guard stand), recorded rather than left out of the matrix.
+    ("docs/cdc-matrix.yaml", 6),
     // Resilience / crash-recovery (BATCH + cross-cutting). Both Mongo holes closed:
     // batch-clobber filled with a live test; crash-after-source-read is na (that
     // hook is single.rs-only, and Mongo runs the keyset path).

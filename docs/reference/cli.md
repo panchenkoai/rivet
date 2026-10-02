@@ -743,6 +743,14 @@ rivet state reset-chunks --config <PATH> --failed
 
 Then run `rivet run --config <PATH> --resume` (or a normal run without `--resume`) as needed.
 
+### `rivet state vacuum`
+
+Shrink a SQLite state DB. Deleted rows and schema migrations leave free pages that SQLite reuses but never returns to the disk; `VACUUM` rewrites the file without them and prints the size before and after (a pilot state DB went from 46.8 MB to 18.8 MB after the v32 migration). It takes the database's write lock while it runs, so concurrent runs wait for it (`busy_timeout`, 10 s). On a PostgreSQL state it does nothing: autovacuum reuses the space there.
+
+```bash
+rivet state vacuum --config <PATH>
+```
+
 ### `rivet state progression`
 
 Show explicit **committed** and **verified** export boundaries (Epic G / [ADR-0008](../adr/0008-export-progression.md)).

@@ -840,8 +840,11 @@ const PIN_INDEPENDENT: usize = 104;
 // fixture check; the oracle is the server's own connection counter.
 // 2026-09-29: +2 shared codec — the Oracle TRUNCATE refusal on re-run and the uncaptured-truncate cell.
 // 2026-09-30: +2 shared codec — the MySQL float-override and PG bare-numeric cells read the part with arrow; their expected values are the server's own CAST/::text.
+// 2026-10-02: +1 shared_codec - the MySQL failover GTID-follow strict known defect, whose oracle is the parts read back.
+// 2026-10-02: +1 shared_codec - the MongoDB failover follow, read back through its parts (the PostgreSQL
+// failover cells run their capture through a helper the census does not see).
 // 2026-10-02: +1 shared codec - Oracle CDC under a redo log switch storm; each run is graded by the default oracle, exactly-once by the seed.
-const PIN_SHARED_CODEC: usize = 90;
+const PIN_SHARED_CODEC: usize = 92;
 const PIN_SELF_COUNTER: usize = 6;
 // 2026-09-28: +1 presence — the SQL Server undecodable-cell refusal, whose oracle is the refusal.
 // 2026-09-29: +2 presence — the PG CDC LMT-timezone and DOMAIN parity cells compare CDC to batch output.
@@ -855,7 +858,8 @@ const PIN_SELF_COUNTER: usize = 6;
 // 2026-10-02: -1 presence — the MySQL partition-move refusal became a delivery test graded through `bq` (moved to independent).
 // 2026-10-02: +3 presence - the MySQL, Oracle and Mongo refusals under `initial: snapshot`, whose oracle is an empty
 // destination tree and an absent checkpoint file.
-const PIN_PRESENCE: usize = 85;
+// 2026-10-02: +1 presence — the MySQL failover refusal, whose oracle is the refusal plus the unmoved checkpoint and parts.
+const PIN_PRESENCE: usize = 86;
 
 /// TIER 2 (harness audit, 2026-08-29): a test whose NAME makes a
 /// COMPLETENESS claim must carry a class-(a) INDEPENDENT oracle — not merely

@@ -5202,6 +5202,189 @@ fn pg_cdc_streams_changes_from_a_standby_in_continuous_mode() {
     );
 }
 
+const PG_FAILOVER_PRIMARY: &str = "postgresql://rivet:rivet@127.0.0.1:5437/rivet";
+const PG_FAILOVER_STANDBY: &str = "postgresql://rivet:rivet@127.0.0.1:5436/rivet";
+const PG_FAILOVER_URL: &str = "RIVET_FAILOVER_URL";
+
+/// A capture on the primary (ids 1-2), then ids 3-4 written while the same config is pointed at the standby.
+struct PgFailover {
+    rig: Rig,
+    _guards: (PgTable, Slot, Slot),
+}
+
+/// `(op, id)` of every row in `batches`, the id read as i64 whatever its integer width.
+fn op_ids(batches: &[arrow::record_batch::RecordBatch]) -> Vec<(String, i64)> {
+    use arrow::array::{Array, Int64Array, StringArray};
+    let mut out = Vec::new();
+    for b in batches {
+        let op = b.column(b.schema().index_of("__op").unwrap()).clone();
+        let id = arrow::compute::cast(
+            b.column(b.schema().index_of("id").unwrap()),
+            &arrow::datatypes::DataType::Int64,
+        )
+        .unwrap();
+        let op = op.as_any().downcast_ref::<StringArray>().unwrap();
+        let id = id.as_any().downcast_ref::<Int64Array>().unwrap();
+        for i in 0..b.num_rows() {
+            out.push((op.value(i).to_string(), id.value(i)));
+        }
+    }
+    out
+}
+
+/// Run `rig` against `url` while the primary keeps logging standby snapshots (a slot created on a standby waits for one).
+fn run_on(rig: &Rig, url: &str) -> std::process::Output {
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let nudger = {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            let mut c = postgres::Client::connect(PG_FAILOVER_PRIMARY, postgres::NoTls).unwrap();
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = c.execute("SELECT pg_log_standby_snapshot()", &[]);
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            }
+        })
+    };
+    let out = rig.run_args_env(&[], &[(PG_FAILOVER_URL, url)]);
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    nudger.join().unwrap();
+    out
+}
+
+/// The capture before the switch, and the rows the standby holds after it.
+fn pg_failover(tag: &str, with_checkpoint: bool, mark: impl FnOnce(Rig) -> Rig) -> PgFailover {
+    for port in ["5436", "5437"] {
+        assert!(
+            std::net::TcpStream::connect_timeout(
+                &format!("127.0.0.1:{port}").parse().unwrap(),
+                std::time::Duration::from_millis(500),
+            )
+            .is_ok(),
+            "fixture: the cdc-standby pair is not up on :{port}"
+        );
+    }
+    let mut p = postgres::Client::connect(PG_FAILOVER_PRIMARY, postgres::NoTls).unwrap();
+    let mut sb = postgres::Client::connect(PG_FAILOVER_STANDBY, postgres::NoTls).unwrap();
+    let tbl = unique_name(tag);
+    let slot = unique_name(&format!("{tag}_slot"));
+    p.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"
+    ))
+    .unwrap();
+    let guards = (
+        PgTable::adopt_on(PG_FAILOVER_PRIMARY, tbl.clone()),
+        Slot::on(PG_FAILOVER_PRIMARY, slot.clone()),
+        Slot::on(PG_FAILOVER_STANDBY, slot.clone()),
+    );
+    let mut rig = Rig::pg_cdc(&tbl, &slot)
+        .source_url_env(PG_FAILOVER_URL)
+        .continuous();
+    if with_checkpoint {
+        let ckpt = rig.checkpoint();
+        rig = rig.checkpoint_path(ckpt);
+    }
+    let rig = mark(rig);
+    let on_primary = |rig: &Rig| {
+        let out = run_on(rig, PG_FAILOVER_PRIMARY);
+        assert!(
+            out.status.success(),
+            "fixture: a run on the primary failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    on_primary(&rig); // creates the slot on the primary
+    p.batch_execute(&format!("INSERT INTO {tbl} VALUES (1, 10), (2, 20)"))
+        .unwrap();
+    on_primary(&rig);
+    assert_eq!(
+        op_ids(&read_all_parts(&rig.out_dir())),
+        vec![("insert".into(), 1), ("insert".into(), 2)],
+        "fixture: the primary capture holds ids 1-2"
+    );
+    p.batch_execute(&format!("INSERT INTO {tbl} VALUES (3, 30), (4, 40)"))
+        .unwrap();
+    let rows = format!("SELECT COUNT(*) FROM {tbl}");
+    for _ in 0..60 {
+        if sb.query_one(&rows, &[]).ok().map(|r| r.get::<_, i64>(0)) == Some(4) {
+            return PgFailover {
+                rig,
+                _guards: guards,
+            };
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    panic!("fixture: the standby never received ids 3-4");
+}
+
+/// With a checkpoint, a failover to a server without the slot is refused, not resumed on a new slot.
+#[test]
+#[ignore = "live: requires the cdc-standby profile — python3 -m dev.pytools.cdc_stand standby (pg-cdc-primary :5437 → pg-cdc-standby :5436)"]
+fn a_pg_failover_to_the_standby_with_a_checkpoint_is_refused_not_resumed_on_a_new_slot() {
+    let f = pg_failover("pg_fo_ckpt", true, |r| r);
+    let parts_before = read_all_parts(&f.rig.out_dir()).len();
+    let out = run_on(&f.rig, PG_FAILOVER_STANDBY);
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success() && said.contains("is missing but prior-run evidence exists"),
+        "the switch to a server without the slot is refused by name:\n{said}"
+    );
+    assert_eq!(
+        read_all_parts(&f.rig.out_dir()).len(),
+        parts_before,
+        "no part was written"
+    );
+}
+
+/// Strict known defect (graded by the rig oracle): without a checkpoint, a failover to the standby
+/// creates a new slot there with only a warning, and the rows written during the switch (ids 3-4)
+/// are lost; the oracle reports "now passes" once rivet refuses or follows instead.
+#[test]
+#[ignore = "live: requires the cdc-standby profile — python3 -m dev.pytools.cdc_stand standby (pg-cdc-primary :5437 → pg-cdc-standby :5436)"]
+fn a_pg_failover_to_the_standby_without_a_checkpoint_loses_the_rows_written_during_the_switch() {
+    let f = pg_failover("pg_fo_nockpt", false, |r| {
+        r.oracle_known_defect(
+            "undelivered rows",
+            "known defect: a PostgreSQL CDC failover without `cdc.checkpoint` creates a new slot on the \
+             new server with only a warning, so the rows written during the switch are lost \
+             (PostgreSQL CDC failover step)",
+        )
+    });
+    let out = run_on(&f.rig, PG_FAILOVER_STANDBY);
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() && said.contains("creating replication slot"),
+        "the run on the standby creates a new slot and warns:\n{said}"
+    );
+    assert_eq!(
+        op_ids(&read_all_parts(&f.rig.out_dir())),
+        vec![("insert".into(), 1), ("insert".into(), 2)],
+        "ids 3-4, written during the switch, are not captured"
+    );
+}
+
+/// Strict known defect (PostgreSQL CDC failover step): a logical slot does not exist on the promoted
+/// server, so the run is refused; passes while that holds, fails ("did not panic") once rivet follows
+/// the failover and captures ids 1-4 exactly once.
+#[test]
+#[ignore = "live: requires the cdc-standby profile — python3 -m dev.pytools.cdc_stand standby (pg-cdc-primary :5437 → pg-cdc-standby :5436)"]
+#[should_panic(expected = "rivet did not follow the failover")]
+fn pg_cdc_follows_a_failover_to_the_standby() {
+    let f = pg_failover("pg_fo_follow", true, |r| r);
+    let out = run_on(&f.rig, PG_FAILOVER_STANDBY);
+    assert!(
+        out.status.success(),
+        "rivet did not follow the failover to the standby:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        op_ids(&read_all_parts(&f.rig.out_dir())),
+        (1..=4)
+            .map(|i| ("insert".to_string(), i))
+            .collect::<Vec<_>>(),
+        "across the failover every change is captured exactly once, none skipped"
+    );
+}
+
 /// Finding #3: MySQL CDC enriches ENUM/SET labels from information_schema.COLUMNS.
 /// The old query pinned `TABLE_SCHEMA = DATABASE()` and dropped any `db.`
 /// qualifier, so a CROSS-DATABASE capture — a table in a database OTHER than the
