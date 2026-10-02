@@ -544,27 +544,37 @@ pub(crate) fn run_to_files(
                     // Confirmed routed to a captured table → surface any deferred
                     // decode error (uncaptured tables' poison never applies).
                     ev.raise_poison()?;
-                    if let Some(g) = &sink.out.partition_guard {
-                        super::partition_guard::refuse_partition_move(
-                            &ev,
-                            g,
-                            &sink.out.columns,
-                            cfg.engine,
-                        )?;
-                    }
-                    // TWO units on purpose: the rollover budget wants RESIDENT
-                    // cost (what the buffer actually holds), the bytes-read metric
-                    // wants DECODED payload (comparable with the batch path's
-                    // figure). One `eb` feeding both silently inflated the metric
-                    // ~4-13x when the estimate was re-based to resident.
-                    total_bytes += ev.estimated_bytes();
+                    // DECODED payload for the bytes-read metric (comparable with the batch
+                    // path's figure): one source event, however many rows it is written as.
                     read_bytes.fetch_add(
                         ev.payload_bytes() as u64,
                         std::sync::atomic::Ordering::Relaxed,
                     );
-                    sink.buf.push(ev);
-                    total_rows += 1;
-                    emitted += 1;
+                    let split = match &sink.out.partition_guard {
+                        Some(g) => super::partition_guard::split_partition_move(
+                            &ev,
+                            g,
+                            &sink.out.columns,
+                            cfg.engine,
+                        )?,
+                        None => None,
+                    };
+                    let routed = match split {
+                        Some((delete, mut insert)) => {
+                            insert.seq = txn_seq.next(&insert.position);
+                            vec![delete, insert]
+                        }
+                        None => vec![ev],
+                    };
+                    for ev in routed {
+                        // RESIDENT cost for the rollover budget (what the buffer holds); the
+                        // bytes-read metric above wants DECODED payload. One `eb` feeding both
+                        // silently inflated the metric ~4-13x when the estimate was re-based.
+                        total_bytes += ev.estimated_bytes();
+                        sink.buf.push(ev);
+                        total_rows += 1;
+                        emitted += 1;
+                    }
                     if policy.should_roll(total_rows, total_bytes, committed) {
                         roll_all(&mut sinks, stream, &run, &last_commit, &mut unacked_commit)?;
                         total_rows = 0;
@@ -4139,13 +4149,12 @@ mod tests {
         }
     }
 
-    /// An UPDATE that moves its row to another partition of a base-and-buffer table fails
-    /// the run before any part is written, the checkpoint persisted or the source acked.
+    /// An UPDATE that moves its row to another partition of a base-and-buffer table is written as
+    /// a delete of the old row and an insert of the new one, the insert ordered after the delete.
     #[test]
-    fn a_change_that_moves_its_partition_fails_the_run_before_any_part() {
-        let dir = tempfile::tempdir().unwrap();
+    fn a_change_that_moves_its_partition_is_written_as_a_delete_then_an_insert() {
+        use arrow::array::{Array, Int64Array, StringArray};
         let out = tempfile::tempdir().unwrap();
-        let ckpt = dir.path().join("cdc.ckpt");
         let cols = int_col();
         let update = |b: i64, a: i64| ChangeEvent {
             op: ChangeOp::Update,
@@ -4158,7 +4167,6 @@ mod tests {
         };
         let dest = local_dest(&out);
         let mut c = cfg(dest.as_ref(), &cols, FormatType::Parquet, 10);
-        c.checkpoint = Some(ckpt.clone());
         c.outputs[0].partition_guard = Some(super::super::partition_guard::PartitionGuard {
             column: "v".into(),
             unit: super::super::partition_guard::GuardUnit::Range {
@@ -4169,21 +4177,53 @@ mod tests {
         });
 
         let res = run_to_files(&mut stream, c);
+        res.1.expect("a partition move is delivered, not refused");
 
-        let err = res.1.expect_err("9 -> 15 crosses a range partition");
-        assert_eq!(
-            crate::error::error_code(&err),
-            Some("RIVET_CDC_PARTITION_MOVED"),
-            "{err:#}"
-        );
-        let written: Vec<_> = std::fs::read_dir(out.path())
+        let mut rows: Vec<(i64, String, String, i64)> = Vec::new();
+        for entry in std::fs::read_dir(out.path()).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|e| e != "parquet") {
+                continue;
+            }
+            let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+                std::fs::File::open(&path).unwrap(),
+            )
             .unwrap()
-            .flatten()
-            .map(|e| e.path())
-            .collect();
-        assert!(written.is_empty(), "no part may be written: {written:?}");
-        assert!(stream.acked.is_empty(), "the source must not be acked");
-        assert!(!ckpt.exists(), "the checkpoint must not move");
+            .build()
+            .unwrap();
+            for b in reader {
+                let b = b.unwrap();
+                let col = |n: &str| b.column(b.schema().index_of(n).unwrap()).clone();
+                let (v, op, pos, seq) = (col("v"), col("__op"), col("__pos"), col("__seq"));
+                let v = v.as_any().downcast_ref::<Int64Array>().unwrap();
+                let op = op.as_any().downcast_ref::<StringArray>().unwrap();
+                let pos = pos.as_any().downcast_ref::<StringArray>().unwrap();
+                let seq = seq.as_any().downcast_ref::<Int64Array>().unwrap();
+                for i in 0..b.num_rows() {
+                    rows.push((
+                        v.value(i),
+                        op.value(i).into(),
+                        pos.value(i).into(),
+                        seq.value(i),
+                    ));
+                }
+            }
+        }
+        let ops: Vec<(i64, &str)> = rows.iter().map(|(v, op, _, _)| (*v, op.as_str())).collect();
+        assert_eq!(
+            ops,
+            vec![(1, "insert"), (9, "update"), (9, "delete"), (15, "insert")],
+            "1 -> 9 stays in its partition; 9 -> 15 is the old row deleted, the new one inserted"
+        );
+        let (del, ins) = (&rows[2], &rows[3]);
+        assert!(
+            del.2 == ins.2 && ins.3 > del.3,
+            "same source position, the insert's __seq after the delete's so it wins the merge: {rows:?}"
+        );
+        assert!(
+            !stream.acked.is_empty(),
+            "the move's transaction is acked like any other"
+        );
     }
 
     #[test]

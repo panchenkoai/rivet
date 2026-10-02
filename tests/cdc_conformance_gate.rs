@@ -833,7 +833,8 @@ fn oracle_class_census_is_pinned() {
 // 2026-10-01: +2 independent - the Mongo deletes of `_id` null vs "null" (the known-defect roast cell and its pre-image remedy), read through DuckDB.
 // 2026-10-01: +1 independent - the CDC backfill leg on a plain chunked recipe, graded against the source count.
 // 2026-10-01: +1 independent - compact on a table never loaded, the base's absence read through `bq`.
-const PIN_INDEPENDENT: usize = 102;
+// 2026-10-02: +1 independent - the MySQL partition move, its delete+insert read in the buffer and its one row in the base through `bq` (was presence: the refusal).
+const PIN_INDEPENDENT: usize = 103;
 // 2026-09-28, source connection ceilings: +3 shared codec — the run's captured row is the
 // fixture check; the oracle is the server's own connection counter.
 // 2026-09-29: +2 shared codec — the Oracle TRUNCATE refusal on re-run and the uncaptured-truncate cell.
@@ -846,11 +847,11 @@ const PIN_SELF_COUNTER: usize = 6;
 // 2026-09-30: +1 presence — the Oracle date-override refusal, whose oracle is the refusal plus the unmoved checkpoint.
 // 2026-09-30: -1 presence — the MySQL full_type_matrix cell (ArrayData CDC==batch), replaced by the
 // ledger-generated cell, which grades the same types independently.
-// 2026-10-01: +1 presence — the MySQL partition-move refusal, whose oracle is the refusal twice plus the unchanged base row.
 // 2026-10-01: +1 presence — the Oracle anchor-under-concurrent-commits cell, whose oracle is the anchor's
 // low-water SCN being non-zero and every resume from it succeeding.
 // 2026-10-01: +1 presence — the Oracle low-water-0 checkpoint refusal, whose oracle is the refusal's text.
-const PIN_PRESENCE: usize = 83;
+// 2026-10-02: -1 presence — the MySQL partition-move refusal became a delivery test graded through `bq` (moved to independent).
+const PIN_PRESENCE: usize = 82;
 
 /// TIER 2 (harness audit, 2026-08-29): a test whose NAME makes a
 /// COMPLETENESS claim must carry a class-(a) INDEPENDENT oracle — not merely
