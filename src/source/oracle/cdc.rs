@@ -247,6 +247,15 @@ impl Scns {
                 .and_then(|s| s.parse::<u64>().ok())
         };
         match (get("low_water"), get("commit_scn")) {
+            (Some(0), Some(_)) => crate::rivet_bail!(
+                crate::error::codes::SOURCE_CDC_CHECKPOINT_INVALID,
+                "oracle cdc: checkpoint '{path}' records a low-water SCN of 0. A rivet release \
+                 up to 0.30 wrote that when it read a transaction whose START_SCN was not \
+                 assigned yet: it is not a redo position, and no change was lost to log \
+                 retention. The true low-water is unknown, so resuming from any other SCN could \
+                 skip a long transaction's early changes. {}",
+                crate::source::cdc::checkpoint_identity::RECOVER
+            ),
             (Some(low_water), Some(commit_scn)) if low_water <= commit_scn => Ok(Self {
                 low_water,
                 commit_scn,
@@ -594,11 +603,32 @@ fn root_identity(conn: &Connection, con_name: String, con_dbid: String) -> Resul
 /// container: from `CDB$ROOT` a common user's `V$TRANSACTION` shows only the root's rows
 /// (measured), so it must be read in the PDB before the switch.
 fn low_water_here(conn: &Connection) -> Result<u64> {
-    scn(
+    let r = rows(
         conn,
-        "SELECT TO_CHAR(LEAST(NVL((SELECT MIN(start_scn) FROM v$transaction), current_scn), \
-                current_scn)) FROM v$database",
-    )
+        "SELECT TO_CHAR(d.current_scn), TO_CHAR(t.start_scn) \
+           FROM v$database d LEFT JOIN v$transaction t ON 1 = 1",
+    )?;
+    let parse = |c: &Option<String>| c.as_deref().and_then(|s| s.parse::<u64>().ok());
+    let current = r.first().and_then(|r| r.first().and_then(parse));
+    let starts: Option<Vec<u64>> = r
+        .iter()
+        .filter_map(|r| r.get(1).cloned().flatten())
+        .map(|s| s.parse().ok())
+        .collect();
+    current
+        .zip(starts)
+        .map(|(current, starts)| low_water_of(current, &starts))
+        .ok_or_else(|| anyhow::anyhow!("oracle cdc: could not read the low-water SCN"))
+}
+
+/// The oldest open transaction's start SCN, or `current`; a `START_SCN` of 0 is a transaction
+/// not yet assigned one (it has written no change), never SCN 0.
+fn low_water_of(current: u64, starts: &[u64]) -> u64 {
+    starts
+        .iter()
+        .copied()
+        .filter(|&s| s != 0)
+        .fold(current, u64::min)
 }
 
 /// `(low_water, bound)`: the low-water mark read first (in the PDB), then the current SCN.
@@ -1245,6 +1275,15 @@ pub(crate) fn pin_checkpoint_at_current(
 mod tests {
     use super::*;
 
+    /// A transaction with no start SCN yet (0) never drags the low-water mark to SCN 0.
+    #[test]
+    fn an_unassigned_start_scn_is_not_scn_zero() {
+        assert_eq!(low_water_of(500, &[]), 500);
+        assert_eq!(low_water_of(500, &[0]), 500);
+        assert_eq!(low_water_of(500, &[0, 420, 0, 450]), 420);
+        assert_eq!(low_water_of(500, &[600]), 500);
+    }
+
     /// Mined DDL text that removes rows is a truncate; every other DDL is not.
     #[test]
     fn only_table_and_partition_truncates_count_as_truncates() {
@@ -1449,6 +1488,28 @@ mod tests {
             identity_verdict(None, &server),
             IdentityVerdict::Unverifiable(_)
         ));
+    }
+
+    /// A 0.30 checkpoint with low-water 0 is refused as such, with the anchor-first remedy, never as LOST.
+    #[test]
+    fn a_low_water_of_zero_is_refused_as_a_release_defect_not_as_lost_changes() {
+        let pos = Position(serde_json::json!({"low_water": "0", "commit_scn": "9"}));
+        let err = Scns::from_position(&pos, "ck").unwrap_err().to_string();
+        assert!(err.contains("records a low-water SCN of 0"), "{err}");
+        assert!(err.contains("no change was lost to log retention"), "{err}");
+        assert!(!err.contains("LOST"), "{err}");
+        assert!(
+            err.ends_with(crate::source::cdc::checkpoint_identity::RECOVER),
+            "{err}"
+        );
+        let one = Position(serde_json::json!({"low_water": "1", "commit_scn": "9"}));
+        assert_eq!(
+            Scns::from_position(&one, "ck").unwrap(),
+            Scns {
+                low_water: 1,
+                commit_scn: 9
+            }
+        );
     }
 
     #[test]
