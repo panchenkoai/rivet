@@ -387,6 +387,30 @@ pub(crate) fn names_a_log_set_change(rendered: &str) -> bool {
             .any(log_set_changed)
 }
 
+/// `V$LOGMNR_LOGS.STATUS = 4` inside `[low_water, end]`: a needed file is missing from the registered list.
+#[derive(Debug)]
+pub(crate) struct MissingRegisteredLog(pub u64, pub u64);
+
+impl std::fmt::Display for MissingRegisteredLog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "oracle cdc: LogMiner reports a missing log file inside SCN {}..{} — the changes it \
+             held are LOST to this stream. Restore the archived log, or delete the checkpoint \
+             (anchor first, then re-snapshot).",
+            self.0, self.1
+        )
+    }
+}
+
+impl std::error::Error for MissingRegisteredLog {}
+
+/// Whether `e` may be cured by re-listing the logs: a log-set-change ORA code, or a registered
+/// list LogMiner found a hole in (a file reused between the listing and `ADD_LOGFILE`).
+pub(crate) fn re_plannable(e: &anyhow::Error) -> bool {
+    e.is::<MissingRegisteredLog>() || names_a_log_set_change(&format!("{e:#}"))
+}
+
 /// The wait before re-plan `attempt` (0-based), or `None` when the attempts are spent.
 pub(crate) fn remine_backoff(attempt: u32) -> Option<std::time::Duration> {
     (attempt < REMINE_ATTEMPTS).then(|| std::time::Duration::from_millis(200 << attempt))
@@ -933,10 +957,11 @@ impl OracleChangeStream {
     /// Sleep before the next re-plan when `e` is a log-set change with attempts left; else the error.
     fn wait_to_remine(&mut self, e: anyhow::Error) -> Result<()> {
         match remine_backoff(self.remines) {
-            Some(wait) if names_a_log_set_change(&format!("{e:#}")) => {
+            Some(wait) if re_plannable(&e) => {
                 log::warn!(
-                    "oracle cdc: the redo log changed under LogMiner ({e:#}); re-planning the \
-                     logs in {wait:?}"
+                    "oracle cdc: re-planning the redo logs in {wait:?} (attempt {} of \
+                     {REMINE_ATTEMPTS}) after: {e:#}",
+                    self.remines + 1
                 );
                 self.remines += 1;
                 std::thread::sleep(wait);
@@ -1159,14 +1184,9 @@ fn start_mining(
         conn,
         "SELECT TO_CHAR(COUNT(*)) FROM v$logmnr_logs WHERE status = 4",
     )?;
-    anyhow::ensure!(
-        missing.as_deref() == Some("0"),
-        "oracle cdc: LogMiner reports a missing log file inside SCN {}..{} — the changes it \
-         held are LOST to this stream. Restore the archived log, or delete the checkpoint \
-         (anchor first, then re-snapshot).",
-        from.low_water,
-        frontier.commit_scn
-    );
+    if missing.as_deref() != Some("0") {
+        return Err(MissingRegisteredLog(from.low_water, frontier.commit_scn).into());
+    }
     conn.query(
         &contents_sql(tables, &identity.con_name, from.commit_scn),
         &[],
@@ -1433,6 +1453,26 @@ mod tests {
         ] {
             assert_eq!(names_a_log_set_change(text), want, "{text}");
         }
+    }
+
+    /// A hole LogMiner found in the registered list re-plans too; rivet's other verdicts do not.
+    #[test]
+    fn a_hole_in_the_registered_list_is_re_planned_and_still_says_lost_when_it_stays() {
+        let hole = anyhow::Error::from(MissingRegisteredLog(10, 20));
+        assert!(re_plannable(&hole));
+        assert!(
+            format!("{:#}", log_set_changed_error(hole))
+                .starts_with("oracle cdc: LogMiner reports a missing log file inside SCN 10..20")
+        );
+        assert!(re_plannable(&anyhow::anyhow!(
+            "oracle: ORA-01368: Redo log file header mismatch"
+        )));
+        assert!(!re_plannable(&anyhow::anyhow!(
+            "oracle: ORA-01031: insufficient privileges"
+        )));
+        assert!(!re_plannable(&anyhow::anyhow!(
+            "oracle cdc: redo sequence 7 of thread 1 is missing — LOST"
+        )));
     }
 
     /// Five re-plans with doubling waits from 200 ms, then the error.

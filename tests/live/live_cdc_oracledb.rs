@@ -1004,7 +1004,7 @@ fn oracle_cdc_a_redo_log_switch_during_mining_is_re_mined_not_failed() {
         let out = d.path().join(format!("out{i}"));
         let run = rig(&t, &ckpt, &out).run();
         let err = String::from_utf8_lossy(&run.stderr).into_owned();
-        replans += err.matches("re-planning the logs").count();
+        replans += err.matches("re-planning the redo logs").count();
         if !run.status.success() {
             failures.push(err.lines().last().unwrap_or_default().to_string());
         }
