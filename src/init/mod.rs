@@ -769,11 +769,8 @@ pub fn init(
     };
     let yaml_scaffold::Scaffold { text, decisions } = scaffold;
 
-    if !decisions.needs_cursor.is_empty() {
-        eprintln!(
-            "{}",
-            cursor_missing_message(&decisions.needs_cursor, mode_override, table.is_none())
-        );
+    if let Some(notice) = cursor_notice(&decisions, mode_override, table.is_none()) {
+        eprintln!("{notice}");
     }
     let runnable = decisions.needs_cursor.is_empty();
     eprint!("{}", marked_exports_warning(&decisions));
@@ -788,11 +785,8 @@ pub fn init(
                 InitFormat::DiscoveryJson => "Discovery artifact",
             };
             eprintln!("{label_written} written to {path}");
-            if decisions.decimal_review {
-                eprintln!(
-                    "rivet: note: YAML uses default decimal(38,18) for column(s) with NUMERIC without (p,s) in the DDL — search for `{}` under columns: and fix before production.",
-                    yaml_scaffold::INIT_DECIMAL_REVIEW_MARKER
-                );
+            if let Some(notice) = decimal_notice(&decisions) {
+                eprintln!("{notice}");
             }
             // Don't leave the user holding a cold artifact — show the path from
             // "I have a config" to "I have parquet files". Only for the YAML
@@ -1137,6 +1131,26 @@ fn mark_mssql_catalog_exact(info: &mut TableInfo) {
         k: 0,
         w: 0,
     });
+}
+
+/// The stderr line naming every export init could not give a cursor, when there is one.
+fn cursor_notice(
+    d: &yaml_scaffold::ScaffoldDecisions,
+    mode: Option<&str>,
+    whole_schema: bool,
+) -> Option<String> {
+    (!d.needs_cursor.is_empty())
+        .then(|| cursor_missing_message(&d.needs_cursor, mode, whole_schema))
+}
+
+/// The stderr note for a scaffold that wrote the default `decimal(38,18)`, when it did.
+fn decimal_notice(d: &yaml_scaffold::ScaffoldDecisions) -> Option<String> {
+    d.decimal_review.then(|| {
+        format!(
+            "rivet: note: YAML uses default decimal(38,18) for column(s) with NUMERIC without (p,s) in the DDL — search for `{}` under columns: and fix before production.",
+            yaml_scaffold::INIT_DECIMAL_REVIEW_MARKER
+        )
+    })
 }
 
 /// The line naming every export init could not give a cursor, with the ways out that apply to this invocation.
@@ -1701,6 +1715,78 @@ mod tests {
                 .to_string()
                 + &only_chunk
         );
+    }
+
+    fn schema_scaffold(infos: &[TableInfo], mode: Option<&str>) -> yaml_scaffold::Scaffold {
+        yaml_scaffold::scaffold_schema(
+            infos,
+            "postgresql://u:p@h/db",
+            &SourceProvenance::Inline,
+            "db",
+            &InitYamlDestination::default(),
+            mode,
+            None,
+        )
+        .unwrap()
+    }
+
+    /// A schema-wide init names the cursor-less exports on stderr, and says nothing when every export has a cursor.
+    #[test]
+    fn a_schema_init_prints_the_cursor_notice_only_when_an_export_lacks_a_cursor() {
+        let table = |n: &str, ty: &str| TableInfo {
+            table: n.into(),
+            ..make_table(100, vec![col("c", ty, false)])
+        };
+        let lacking = schema_scaffold(
+            &[
+                table("stamped", "timestamp"),
+                table("bare_a", "text"),
+                table("bare_b", "text"),
+            ],
+            Some("incremental"),
+        );
+        let notice = cursor_notice(&lacking.decisions, Some("incremental"), true)
+            .expect("two exports lack a cursor");
+        assert!(
+            notice.starts_with("rivet: 2 export(s) have no timestamp column")
+                && notice.ends_with(": bare_a, bare_b"),
+            "{notice}"
+        );
+        let clean = schema_scaffold(&[table("stamped", "timestamp")], Some("incremental"));
+        assert_eq!(
+            cursor_notice(&clean.decisions, Some("incremental"), true),
+            None
+        );
+    }
+
+    /// A schema-wide init that wrote the default decimal(38,18) says so on stderr; one that did not stays quiet.
+    #[test]
+    fn a_schema_init_prints_the_decimal_note_only_when_it_wrote_the_default_decimal() {
+        let plain = TableInfo {
+            table: "plain".into(),
+            ..make_table(100, vec![col("id", "bigint", true)])
+        };
+        let ledger = TableInfo {
+            table: "ledger".into(),
+            ..make_table(
+                100,
+                vec![col("id", "bigint", true), col("amount", "numeric", false)],
+            )
+        };
+        let with_default = schema_scaffold(&[plain.clone(), ledger], None);
+        assert!(
+            with_default.text.contains("decimal(38,18)"),
+            "{}",
+            with_default.text
+        );
+        let note = decimal_notice(&with_default.decisions).expect("the default was written");
+        assert!(
+            note.starts_with("rivet: note: YAML uses default decimal(38,18)")
+                && note.contains("search for `# REVIEW:`"),
+            "{note}"
+        );
+        let without = schema_scaffold(&[plain], None);
+        assert_eq!(decimal_notice(&without.decisions), None);
     }
 
     #[test]
