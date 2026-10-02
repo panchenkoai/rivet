@@ -109,16 +109,15 @@ from its run's spec. Other partition keys (hour, month, year, integer ranges)
 keep a constant `MIN..MAX` range per window in separate jobs — the truncation
 forms did not prune when measured. An empty buffer is just dropped.
 
-**The partition column must not move.** The merge reads only the partitions the
-buffer's rows name, so a row whose partition value moves to another partition
-would keep its old copy in a partition the merge never reads. On MySQL the stream
-sees each UPDATE before and after, and `rivet run` refuses one that moves a row
-between two partitions (`RIVET_CDC_PARTITION_MOVED`), before writing anything and
-without moving the checkpoint; the fix is a partition column a change never moves
-(or `partition: none`) and a recreated base. A change to or from NULL is not a
-move: every merge reads the NULL partition. This needs `binlog_row_image = FULL`;
-an UPDATE without the previous value is refused (`RIVET_SOURCE_CDC_PREREQUISITE`).
-Other engines still look moved rows up in the base during `compact`.
+**A row that moves to another partition.** The merge reads only the partitions the
+buffer's rows name. On MySQL the stream sees each UPDATE before and after, and
+writes one that moves a row between two partitions as a delete of the old row and
+an insert of the new one, with a warning naming both values. The delete puts the
+old partition in the buffer, so the merge reads it, and the base keeps one row, in
+its new partition. A change to or from NULL stays an update: every merge reads the
+NULL partition. This needs `binlog_row_image = FULL`; an UPDATE without the previous
+value is refused (`RIVET_SOURCE_CDC_PREREQUISITE`). Other engines still look moved
+rows up in the base during `compact`.
 
 What a cycle bills: BigQuery charges every statement that reads a table at
 least 10 MB per table, so a compaction with changes bills a 30 MB floor (the

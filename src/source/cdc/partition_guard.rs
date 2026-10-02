@@ -1,10 +1,10 @@
-//! A base-and-buffer table's partition key must not move under a change.
+//! An UPDATE that moves a row to another partition of a base-and-buffer table.
 //!
 //! `rivet compact` merges the buffer into the base only within the partitions the
-//! buffer's own rows name. An UPDATE that moves a row from one partition to another
-//! leaves its old copy in a partition the merge never reads, so the base would hold the
-//! key twice. The stream sees the row before and after the change, so it refuses such a
-//! change before any part is written, and the operator re-partitions the table.
+//! buffer's own rows name, so the row's OLD partition must be among them. The stream
+//! sees the row before and after the change, so it writes such an UPDATE as a delete of
+//! the old row and an insert of the new one: the delete carries the old partition into
+//! the buffer, and the insert, ordered after it, is the key's latest change.
 
 use anyhow::Result;
 
@@ -98,15 +98,15 @@ pub(crate) fn moves(before: &RivetValue, after: &RivetValue, unit: GuardUnit) ->
     }
 }
 
-/// Refuse an UPDATE that moves its row to another partition, before any part is written.
-pub(crate) fn refuse_partition_move(
+/// A moving UPDATE as `(delete of the old row, insert of the new one)`, `None` for any other change.
+pub(crate) fn split_partition_move(
     ev: &ChangeEvent,
     guard: &PartitionGuard,
     columns: &[TypeMapping],
     engine: CdcEngine,
-) -> Result<()> {
+) -> Result<Option<(ChangeEvent, ChangeEvent)>> {
     if ev.op != ChangeOp::Update {
-        return Ok(());
+        return Ok(None);
     }
     let table = &ev.table;
     let col = &guard.column;
@@ -127,13 +127,13 @@ pub(crate) fn refuse_partition_move(
             crate::rivet_bail!(
                 crate::error::codes::SOURCE_CDC_PREREQUISITE,
                 "mysql cdc: `{table}` is loaded as base + buffer partitioned by `{col}`, and an \
-                 UPDATE arrived without the row's previous `{col}`, so rivet cannot tell whether \
-                 it moved the row to another partition. The server needs `binlog_row_image = FULL` \
+                 UPDATE arrived without the row's previous `{col}`, so rivet cannot tell which \
+                 partition holds the old row. The server needs `binlog_row_image = FULL` \
                  (`SET PERSIST binlog_row_image = FULL;`). No part was written and the checkpoint \
                  did not move."
             );
         }
-        return Ok(());
+        return Ok(None);
     };
     let native = columns
         .iter()
@@ -145,27 +145,34 @@ pub(crate) fn refuse_partition_move(
     };
     // A cell the decoder cannot read is refused by the part writer with its own code.
     let (Some(before), Some(after)) = (fixed(before), fixed(after)) else {
-        return Ok(());
+        return Ok(None);
     };
-    if moves(&before, &after, guard.unit) {
-        let zoned = native.to_ascii_lowercase().starts_with("timestamp");
-        crate::rivet_bail!(
-            crate::error::codes::CDC_PARTITION_MOVED,
-            "cdc: `{table}` is loaded as base + buffer partitioned by `{col}`, and an UPDATE at \
-             {pos} moved a row from `{col}` = {b} to {a}, another partition. `rivet compact` \
-             merges only the partitions the changes name, so the row's old copy would stay \
-             behind and the base would hold its key twice. Partition this table by a column a \
-             change never moves (or `partition: none`), then recreate its base. No part was \
-             written and the checkpoint did not move.",
-            pos = ev.position.0,
-            b = shown(&before, zoned),
-            a = shown(&after, zoned),
-        );
+    if !moves(&before, &after, guard.unit) {
+        return Ok(None);
     }
-    Ok(())
+    let zoned = native.to_ascii_lowercase().starts_with("timestamp");
+    log::warn!(
+        "cdc: `{table}` moved a row from `{col}` = {b} to {a}, another partition (at {pos}); \
+         written as a delete of the old row and an insert of the new one",
+        pos = ev.position.0,
+        b = shown(&before, zoned),
+        a = shown(&after, zoned),
+    );
+    let delete = ChangeEvent {
+        op: ChangeOp::Delete,
+        after: None,
+        committed: false,
+        ..ev.clone()
+    };
+    let insert = ChangeEvent {
+        op: ChangeOp::Insert,
+        before: None,
+        ..ev.clone()
+    };
+    Ok(Some((delete, insert)))
 }
 
-/// A partition value as the refusal names it.
+/// A partition value as the warning names it.
 fn shown(v: &RivetValue, zoned: bool) -> String {
     match v {
         RivetValue::DateTime(dt) => crate::types::iso_timestamp_nanos(*dt, zoned),
@@ -288,50 +295,61 @@ mod tests {
         }
     }
 
-    /// A MySQL TIMESTAMP arrives as epoch text; the guard compares its UTC days, not the text.
+    /// A MySQL TIMESTAMP arrives as epoch text; the split compares its UTC days, not the text.
     #[test]
-    fn a_mysql_timestamp_update_is_refused_only_when_its_utc_day_changes() {
+    fn a_mysql_timestamp_update_splits_only_when_its_utc_day_changes() {
         let (cols, g) = (ts_col(), day_guard());
         // 2023-12-31 23:59:59 UTC and 2024-01-01 00:00:00 UTC, one second apart.
-        let moved = refuse_partition_move(
-            &update(Some("1704067199"), "1704067200"),
-            &g,
-            &cols,
-            CdcEngine::Mysql,
-        )
-        .expect_err("a day boundary crossed");
+        let ev = update(Some("1704067199"), "1704067200");
+        let (delete, insert) = split_partition_move(&ev, &g, &cols, CdcEngine::Mysql)
+            .unwrap()
+            .expect("a day boundary crossed");
         assert_eq!(
-            crate::error::error_code(&moved),
-            Some("RIVET_CDC_PARTITION_MOVED")
+            (
+                delete.op,
+                delete.before.clone(),
+                delete.after.clone(),
+                delete.committed
+            ),
+            (ChangeOp::Delete, ev.before.clone(), None, false),
+            "the delete carries the OLD row and never closes the transaction"
         );
-        let said = moved.to_string();
+        assert_eq!(
+            (
+                insert.op,
+                insert.before.clone(),
+                insert.after.clone(),
+                insert.committed
+            ),
+            (ChangeOp::Insert, None, ev.after.clone(), true),
+            "the insert carries the NEW row and keeps the commit boundary"
+        );
+        let same_day = update(Some("1704067200"), "1704153599");
         assert!(
-            said.contains("2023-12-31T23:59:59.000000000Z")
-                && said.contains("2024-01-01T00:00:00.000000000Z"),
-            "{said}"
+            split_partition_move(&same_day, &g, &cols, CdcEngine::Mysql)
+                .unwrap()
+                .is_none(),
+            "the same UTC day is an ordinary update"
         );
-        refuse_partition_move(
-            &update(Some("1704067200"), "1704153599"),
-            &g,
-            &cols,
-            CdcEngine::Mysql,
-        )
-        .expect("the same UTC day");
     }
 
-    /// Without the row's previous value MySQL cannot be checked, so it is refused; other engines are not.
+    /// Without the row's previous value MySQL cannot know the old partition, so it is refused; other engines are not.
     #[test]
     fn an_update_without_its_previous_value_is_refused_on_mysql_only() {
         let (cols, g) = (ts_col(), day_guard());
-        let e = refuse_partition_move(&update(None, "1704067200"), &g, &cols, CdcEngine::Mysql)
+        let e = split_partition_move(&update(None, "1704067200"), &g, &cols, CdcEngine::Mysql)
             .expect_err("no before-image");
         assert_eq!(
             crate::error::error_code(&e),
             Some("RIVET_SOURCE_CDC_PREREQUISITE")
         );
         assert!(e.to_string().contains("binlog_row_image = FULL"), "{e}");
-        refuse_partition_move(&update(None, "1704067200"), &g, &cols, CdcEngine::Postgres)
-            .expect("an engine whose compaction still finds moved rows itself");
+        assert!(
+            split_partition_move(&update(None, "1704067200"), &g, &cols, CdcEngine::Postgres)
+                .unwrap()
+                .is_none(),
+            "an engine whose compaction still finds moved rows itself"
+        );
     }
 
     #[test]

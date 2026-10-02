@@ -480,13 +480,14 @@ fn a_key_changed_across_the_partition_split_ends_at_its_latest_change() {
     );
 }
 
-/// A base-and-buffer table compacts only the partitions its changes name, so an UPDATE that
-/// moves a row to another dated partition would leave the old copy behind. The stream
-/// refuses it before writing: the run fails naming both days, nothing new is buffered, and
-/// the checkpoint stays put, so the next run meets the same change and refuses again.
+/// A base-and-buffer table compacts only the partitions its changes name. An UPDATE that moves
+/// a row to another dated partition is written as a delete of the old row (carrying the old
+/// day into the buffer) and an insert of the new one, so `compact` reads both days and the
+/// base ends with ONE row in the new day — no copy left behind, no base lookup — and `run`
+/// says so in a warning naming both days.
 #[test]
 #[ignore = "live: requires mysql-cdc + BigQuery creds"]
-fn a_change_that_moves_a_row_to_another_partition_is_refused_by_run() {
+fn a_change_that_moves_a_row_to_another_partition_lands_in_its_new_day() {
     let Some(bq) = BqLive::from_env("compact_move") else {
         return;
     };
@@ -507,30 +508,41 @@ fn a_change_that_moves_a_row_to_another_partition_is_refused_by_run() {
     let changes = format!("{table}__changes");
     let _cleanup = bq.cleanup(&[&table, &changes]);
     scn.sql(&format!(
-        "INSERT INTO {table} (id, v, created_at) VALUES (1, 1, '2024-01-01 00:00:00')"
+        "INSERT INTO {table} (id, v, created_at) VALUES (1, 1, '2024-01-01 00:00:00'), (2, 2, '2024-01-01 00:00:00')"
     ));
     scn.settle();
     scn.rig.run_ok();
     load_ok(&scn.rig);
-    assert_eq!(base_profile(&bq, &table).0, 1);
+    assert_eq!(base_profile(&bq, &table).0, 2);
 
     scn.sql(&format!(
-        "UPDATE {table} SET created_at = '2024-01-02 00:00:00', v = 2 WHERE id = 1"
+        "UPDATE {table} SET created_at = '2024-01-02 00:00:00', v = 10 WHERE id = 1"
     ));
     scn.settle();
-    for attempt in ["first", "second"] {
-        let err = scn.rig.run_expect_fail();
-        assert!(
-            err.contains("RIVET_CDC_PARTITION_MOVED")
-                && err.contains("2024-01-01T00:00:00")
-                && err.contains("2024-01-02T00:00:00"),
-            "the {attempt} run refuses the move, naming both days: {err}"
-        );
-    }
+    let said = scn.rig.run_ok_capture();
+    assert!(
+        said.contains("moved a row from `created_at` = 2024-01-01T00:00:00")
+            && said.contains("to 2024-01-02T00:00:00")
+            && said.contains("written as a delete of the old row and an insert of the new one"),
+        "run warns about the move, naming both days: {said}"
+    );
+    load_ok(&scn.rig);
+    assert_eq!(
+        bq.read_bq_count(&changes),
+        "2",
+        "the move is buffered as two rows: the old row's delete and the new row's insert"
+    );
+    let (ok, said) = compact(&scn.rig, &[]);
+    assert!(ok && said.contains("COMPACT OK"), "{said}");
     assert_eq!(
         row_of(&bq, &table, 1),
-        (Some(1), Some("2024-01-01 00:00:00".to_string())),
-        "the refused change never reached the base"
+        (Some(10), Some("2024-01-02 00:00:00".to_string())),
+        "the moved row lives in its new day with its new values"
+    );
+    assert_eq!(
+        base_profile(&bq, &table),
+        (2, 2, 0, 0, 3),
+        "still two rows, both live: the old copy was not left behind"
     );
 }
 

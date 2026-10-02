@@ -2,18 +2,20 @@
 
 ## Unreleased
 
-- **Breaking: a MySQL CDC change that moves a row to another partition of a base-and-buffer
-  table fails the run.** `rivet compact` merges only the partitions its changes name. To
-  catch a row whose partition value changed, it used to look every updated key up in the
-  base on every cycle; a pilot paid 2 x 2.2 GiB per large table per cycle for that, mostly
-  for keys inserted and updated in the same cycle, and no row there ever moved. Now the
-  partitions come from the buffer alone, and `rivet run` refuses an UPDATE whose before and
-  after values fall in different partitions with `RIVET_CDC_PARTITION_MOVED` (exit 5),
-  naming both values. No part is written and the checkpoint does not move. The fix is a
-  partition column a change never moves (or `partition: none`) and a recreated base. A
-  change to or from NULL is not a move. An UPDATE without the row's previous value
-  (`binlog_row_image` not FULL) is refused with `RIVET_SOURCE_CDC_PREREQUISITE`. Other
-  engines, and the change-log layout, are unchanged.
+- **MySQL CDC `compact` reads the base only in its MERGE.** `rivet compact` merges only the
+  partitions its changes name. To catch a row whose partition value changed, it used to look
+  every updated key up in the base on every cycle; a pilot paid 2 x 2.2 GiB per large table
+  per cycle for that, mostly for keys inserted and updated in the same cycle, and no row
+  there ever moved. Now the partitions come from the buffer alone. An UPDATE that moves a row
+  between two partitions of a base-and-buffer table is written by `rivet run` as a delete of
+  the old row and an insert of the new one, with a warning naming both values: the delete
+  carries the old partition into the buffer, so the MERGE reads it and the base keeps one row,
+  in its new partition. A change to or from NULL is written as an update, as before.
+- **Breaking: MySQL CDC refuses an UPDATE without the row's previous value on a partitioned
+  base-and-buffer table.** Without it (`binlog_row_image` not FULL) the old partition is
+  unknown, so the run fails with `RIVET_SOURCE_CDC_PREREQUISITE` naming
+  `SET PERSIST binlog_row_image = FULL;`, before any part is written. Other engines, and the
+  change-log layout, are unchanged.
 
 - **`rivet compact` no longer fails on a table that was never loaded.** A source table that was
   empty from the start loads nothing, so it has neither a base nor a `__changes` buffer in the
