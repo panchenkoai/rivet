@@ -178,8 +178,7 @@ pub const REBASELINE_REMEDY: &str = "Re-baseline the stream in one run: delete t
 pub fn follow_rebaseline_remedy(rig: &mut Rig, has_baseline: bool) {
     let _ = std::fs::remove_file(rig.checkpoint());
     if has_baseline {
-        let cleared =
-            StateDb::next_to_config(&rig.config_path()).clear_cdc_snapshot(rig.export_name());
+        let cleared = clear_cdc_snapshot(&rig.config_path(), rig.export_name());
         assert!(
             cleared > 0,
             "fixture: the export had no `cdc_snapshot` row to clear"

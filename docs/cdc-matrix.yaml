@@ -183,6 +183,14 @@ scenarios:
     mongo:    { na: "no per-transaction buffering — each change-stream event is one document, flushed independently; there is no whole-transaction buffer to bound" }
     oracle:   { test: oracle_cdc_byte_cap_counts_the_first_row_and_defers_not_drops }
 
+  - id: cdc_rebaseline_remedy_recovers
+    what: "a data-loss warning or refusal's re-baseline remedy, followed as printed from the state that printed it, recovers the rows the stream lost (the default rig oracle grades the remedy run against the source). The text is checkpoint_identity::RECOVER, pinned by a hand-written literal; `re-snapshot (mode: full)` was refused for a CDC export and for a batch export into its destination"
+    postgres: { test: pg_slot_created_warning_remedy_recovers_the_row_written_while_the_slot_was_gone }
+    mysql:    { test: mysql_missing_checkpoint_refusal_remedy_recovers_the_row_written_while_it_was_gone }
+    mssql:    { test: mssql_retention_gap_refusal_remedy_recovers_the_rows_the_cleanup_removed }
+    mongo:    { test: mongo_missing_checkpoint_warning_remedy_recovers_the_document_written_while_it_was_gone }
+    oracle:   { test: oracle_cdc_truncate_refusal_remedy_recovers_the_row_written_after_it }
+
   # ── Harm / operational-cost contracts (the price CDC charges the source) ──────
   - id: cdc_drain_releases_pinned_wal
     what: "the disk-fill harm: an un-consumed logical slot pins WAL (and holds catalog_xmin, blocking vacuum); a bounded drain must advance confirmed_flush past the drained span so pg_wal_lsn_diff(current, confirmed_flush_lsn) collapses (restart_lsn / catalog_xmin follow at the next checkpoint). Oracle: the server's pg_replication_slots, not rivet's counters"

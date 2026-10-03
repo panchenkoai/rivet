@@ -57,13 +57,6 @@ impl StateDb {
         Self { conn }
     }
 
-    /// Delete `export`'s `cdc_snapshot` rows, as an operator clearing that done-signal would; returns how many went.
-    pub fn clear_cdc_snapshot(&self, export: &str) -> usize {
-        self.conn
-            .execute("DELETE FROM cdc_snapshot WHERE export_name = ?1", [export])
-            .expect("delete cdc_snapshot rows")
-    }
-
     /// `run_id` of the most recent `export_metrics` row for `export`.
     pub fn latest_run_id(&self, export: &str) -> String {
         self.conn
@@ -357,6 +350,23 @@ pub fn recorded_primary_key(cfg: &std::path::Path, export: &str) -> Option<Vec<S
         None => StateDb::next_to_config(cfg)
             .load_spec(export, None)
             .and_then(|(_, k)| k),
+    }
+}
+
+/// Delete `export`'s `cdc_snapshot` rows from the backend the run used, as an operator clearing that done-signal would; returns how many went.
+pub fn clear_cdc_snapshot(cfg: &std::path::Path, export: &str) -> u64 {
+    const SQL: &str = "DELETE FROM cdc_snapshot WHERE export_name = $1";
+    match state_url_under_test() {
+        Some(url) => postgres::Client::connect(&url, postgres::NoTls)
+            .unwrap_or_else(|e| {
+                panic!("connect to the Postgres state at RIVET_GATE_STATE_URL: {e}")
+            })
+            .execute(SQL, &[&export])
+            .expect("delete cdc_snapshot rows"),
+        None => StateDb::next_to_config(cfg)
+            .conn
+            .execute(&SQL.replace("$1", "?1"), [export])
+            .expect("delete cdc_snapshot rows") as u64,
     }
 }
 

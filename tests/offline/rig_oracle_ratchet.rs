@@ -167,6 +167,21 @@ const KNOWN_DEFECTS: &[(&str, &str, &str)] = &[
         "undelivered rows",
         "known defect: a PostgreSQL CDC failover without `cdc.checkpoint` creates a new slot",
     ),
+    (
+        "pg_slot_created_warning_remedy_recovers_the_row_written_while_the_slot_was_gone",
+        "undelivered rows",
+        "known defect: a PostgreSQL slot dropped under a stream with no checkpoint or baseline",
+    ),
+    (
+        "mysql_missing_checkpoint_warning_remedy_recovers_the_row_written_while_it_was_gone",
+        "undelivered rows",
+        "known defect: a lost MySQL checkpoint on a stream with no baseline",
+    ),
+    (
+        "mongo_missing_checkpoint_warning_remedy_recovers_the_document_written_while_it_was_gone",
+        "undelivered rows",
+        "known defect: a lost MongoDB checkpoint on a stream with no baseline",
+    ),
 ];
 
 /// `(enclosing fn, class, reason)` of every `.oracle_known_defect("<class>", "<reason>")` call in `text`.
