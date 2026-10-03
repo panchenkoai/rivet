@@ -69,7 +69,6 @@ from pathlib import Path
 from . import blessed_path, cdc, gcp, scenarios
 from ..pytools import registry
 from .core import (
-    run,
     Ledger,
     ROOT,
     cell_gate,
@@ -1092,9 +1091,7 @@ def _load_leg(led: Ledger, cell: Cell, tag: str, work: Path, env: dict, url: str
     the link back to the extract run whose parts were consumed — and nothing
     asserted it existed.
     """
-    proj = os.environ.get("BQ_ORACLE_PROJECT") or run(
-        ["gcloud", "config", "get-value", "project"]).stdout.strip()
-    bucket = os.environ.get("BQ_ORACLE_BUCKET", "rivet_data_test")
+    proj, bucket = os.environ.get("BQ_ORACLE_PROJECT", ""), os.environ.get("BQ_ORACLE_BUCKET", "")
     # Per ENGINE, because `rivet load` derives the warehouse table from `table:`
     # — so all four engines' `users` land on ONE table. rivet caught this itself
     # and refused ("last loaded from `postgres:users`"), which is the guard doing

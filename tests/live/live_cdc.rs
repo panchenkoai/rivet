@@ -6542,6 +6542,75 @@ fn mysql_cdc_cli_stream_with_a_cap_terminates_and_accepts_a_server_id() {
     );
 }
 
+/// The PostgreSQL `--output` leg of the capped-run cell below: run 2 owes what run 1's cap left behind.
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn pg_cdc_cli_a_capped_run_leaves_its_remainder_to_the_next_run() {
+    use postgres::NoTls;
+    let tbl = unique_name("rivet_cdc_pgdefer");
+    let slot = unique_name("rivet_defer_slot");
+    let _slot = Slot::new(slot.clone());
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"
+    ))
+    .unwrap();
+    let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
+    let out = tempfile::tempdir().unwrap();
+    let dir = out.path().to_str().unwrap().to_string();
+    let run = |cap: &[&str]| {
+        let mut args = vec!["cdc", "--source", POSTGRES_CDC_URL, "--slot", &slot];
+        args.extend(["--table", &tbl, "--output", &dir]);
+        args.extend(cap);
+        run_rivet_args_bounded(&args, std::time::Duration::from_secs(60))
+            .expect("a bounded `rivet cdc` run terminates");
+    };
+    run(&[]);
+    c.batch_execute(&format!("INSERT INTO {tbl} VALUES (1,1),(2,2),(3,3)"))
+        .unwrap();
+    c.batch_execute(&format!("INSERT INTO {tbl} VALUES (4,4),(5,5),(6,6)"))
+        .unwrap();
+    run(&["--max-events", "2"]);
+    let ids: std::collections::BTreeSet<i64> =
+        read_cdc_changes(out.path()).iter().map(|c| c.id).collect();
+    assert_eq!(ids, (1..=3).collect(), "the cap stops at tx1's commit");
+    run(&[]);
+}
+
+/// A `--max-events` run that stops at its cap owes the rest to the stream's next run: the rig oracle grades run 2 on everything since run 1's base.
+#[test]
+#[ignore = "live: requires docker compose mysql-cdc (binlog)"]
+fn mysql_cdc_cli_a_capped_run_leaves_its_remainder_to_the_next_run() {
+    let mut c = conn();
+    let tbl = unique_name("rivet_cdc_defer");
+    c.query_drop(format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"
+    ))
+    .expect("create table");
+    let _t = MysqlCdcTable(tbl.clone());
+    let d = tempfile::tempdir().unwrap();
+    let ckpt = d.path().join("ck").to_str().unwrap().to_string();
+    let run = |cap: &[&str]| {
+        let mut args = vec!["cdc", "--source", MYSQL_CDC_URL, "--table", &tbl];
+        args.extend(["--checkpoint", &ckpt]);
+        args.extend(cap);
+        run_rivet_args_bounded(&args, std::time::Duration::from_secs(60))
+            .expect("a bounded `rivet cdc` run terminates")
+    };
+    run(&[]);
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (1,1),(2,2),(3,3)"))
+        .expect("tx1");
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (4,4),(5,5),(6,6)"))
+        .expect("tx2");
+    let ids: std::collections::BTreeSet<i64> = run(&["--max-events", "2"])
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter_map(|v| v.get("after")?.get(0)?.as_i64())
+        .collect();
+    assert_eq!(ids, (1..=3).collect(), "the cap stops at tx1's commit");
+    run(&[]);
+}
+
 /// `rivet cdc --source-env` / `--source-file`, and the ArgGroup that keeps them
 /// mutually exclusive.
 ///
