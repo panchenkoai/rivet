@@ -342,8 +342,9 @@ def mutants(out: Path, base: str, jobs: int) -> tuple[str, str]:
     (out / "pr.diff").write_text(diff)
     env = {k: v for k, v in os.environ.items() if k != "CARGO_TARGET_DIR"}
     listing = out / "mutants-list.log"
-    rc = subprocess.run([CARGO, "mutants", "--in-diff", str(out / "pr.diff"), "--list", "--colors=never"],
-                        cwd=ROOT, env=env, stdout=listing.open("w"), stderr=subprocess.STDOUT).returncode
+    with listing.open("w") as fh, (out / "mutants-list.err").open("w") as err:
+        rc = subprocess.run([CARGO, "mutants", "--in-diff", str(out / "pr.diff"), "--list", "--colors=never"],
+                            cwd=ROOT, env=env, stdout=fh, stderr=err).returncode
     if rc != 0:
         return "FAIL", f"cargo mutants --list exited {rc}: cannot tell 'no mutants' from a broken tool; log {listing}"
     count = sum(1 for line in listing.read_text().splitlines() if line.strip())
