@@ -1866,6 +1866,7 @@ fn a_keyset_incremental_export_from_sql_server_accumulates_in_clickhouse() {
     a_keyset_incremental_export_accumulates_in_clickhouse(SqlEngine::Mssql);
 }
 
+#[cfg(feature = "oracle")]
 #[test]
 #[ignore = "live: requires clickhouse + fake-gcs + oracle"]
 fn a_keyset_incremental_export_from_oracle_accumulates_in_clickhouse() {

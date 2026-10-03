@@ -164,6 +164,7 @@ fn quality_gate_fails_a_duplicate_across_parallel_keyset_ranges_ending_empty_mss
     assert_failed_as_single_does("keyset-parallel", r.status.code(), &r.stderr, DUPLICATE_24);
 }
 
+#[cfg(feature = "oracle")]
 #[test]
 #[ignore = "live: requires docker compose oracle"]
 fn quality_gate_fails_a_duplicate_across_parallel_keyset_ranges_ending_empty_oracle() {

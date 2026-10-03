@@ -3,10 +3,12 @@
 #![allow(dead_code)]
 
 use super::{
-    LiveService, MSSQL_URL, MYSQL_URL, MssqlTable, MysqlTable, ORACLE_URL, OracleTable,
-    POSTGRES_URL, PgTable, Rig, mssql_exec, mssql_query_strings, mysql_connect, ora_exec,
-    ora_text_rows, pg_connect, read_all_parts, require_alive, unique_name,
+    LiveService, MSSQL_URL, MYSQL_URL, MssqlTable, MysqlTable, POSTGRES_URL, PgTable, Rig,
+    mssql_exec, mssql_query_strings, mysql_connect, pg_connect, read_all_parts, require_alive,
+    unique_name,
 };
+#[cfg(feature = "oracle")]
+use super::{ORACLE_URL, OracleTable, ora_exec, ora_text_rows};
 use ::mysql::prelude::Queryable;
 use arrow::array::{Array, Int32Array, Int64Array};
 use std::path::Path;
@@ -16,6 +18,7 @@ pub enum SqlEngine {
     Mysql,
     Pg,
     Mssql,
+    #[cfg(feature = "oracle")]
     Oracle,
 }
 
@@ -26,6 +29,7 @@ impl SqlEngine {
             SqlEngine::Mysql => LiveService::Mysql,
             SqlEngine::Pg => LiveService::Postgres,
             SqlEngine::Mssql => LiveService::Mssql,
+            #[cfg(feature = "oracle")]
             SqlEngine::Oracle => LiveService::Oracle,
         });
     }
@@ -36,6 +40,7 @@ impl SqlEngine {
             SqlEngine::Mysql => MYSQL_URL,
             SqlEngine::Pg => POSTGRES_URL,
             SqlEngine::Mssql => MSSQL_URL,
+            #[cfg(feature = "oracle")]
             SqlEngine::Oracle => ORACLE_URL,
         }
     }
@@ -46,6 +51,7 @@ impl SqlEngine {
             SqlEngine::Mysql => mysql_connect().query_drop(sql).expect("mysql exec"),
             SqlEngine::Pg => pg_connect().batch_execute(sql).expect("pg exec"),
             SqlEngine::Mssql => mssql_exec(sql),
+            #[cfg(feature = "oracle")]
             SqlEngine::Oracle => ora_exec(sql),
         }
     }
@@ -53,6 +59,7 @@ impl SqlEngine {
     /// `name` as this engine's DDL/SQL must spell it to keep it lower-case (Oracle folds bare names up).
     pub fn col(self, name: &str) -> String {
         match self {
+            #[cfg(feature = "oracle")]
             SqlEngine::Oracle => format!("\"{name}\""),
             _ => name.to_string(),
         }
@@ -61,6 +68,7 @@ impl SqlEngine {
     /// The 64-bit integer column type.
     pub fn int64(self) -> &'static str {
         match self {
+            #[cfg(feature = "oracle")]
             SqlEngine::Oracle => "NUMBER(19)",
             _ => "BIGINT",
         }
@@ -94,6 +102,7 @@ impl SqlEngine {
                 })
                 .collect(),
             ),
+            #[cfg(feature = "oracle")]
             SqlEngine::Oracle => text(
                 ora_text_rows(&format!(
                     "SELECT TO_CHAR(\"id\"), TO_CHAR(\"v\") FROM {table} ORDER BY \"id\""
@@ -109,6 +118,7 @@ impl SqlEngine {
     pub fn ago(self, minutes: i64) -> String {
         match self {
             SqlEngine::Mysql => format!("UTC_TIMESTAMP(6) - INTERVAL {minutes} MINUTE"),
+            #[cfg(feature = "oracle")]
             SqlEngine::Oracle => {
                 format!("SYS_EXTRACT_UTC(SYSTIMESTAMP) - NUMTODSINTERVAL({minutes}, 'MINUTE')")
             }
@@ -125,6 +135,7 @@ impl SqlEngine {
             SqlEngine::Mysql => "DATETIME(6)",
             SqlEngine::Pg => "TIMESTAMP",
             SqlEngine::Mssql => "DATETIME2(6)",
+            #[cfg(feature = "oracle")]
             SqlEngine::Oracle => "TIMESTAMP(6)",
         };
         let i = self.int64();
@@ -139,6 +150,7 @@ impl SqlEngine {
 
     /// A fresh table with the given column definitions and its drop guard.
     pub fn create(self, prefix: &str, columns: &str) -> (String, Box<dyn std::any::Any>) {
+        #[cfg(feature = "oracle")]
         if let SqlEngine::Oracle = self {
             let t = OracleTable::create(prefix, columns);
             return (t.name().to_string(), Box::new(t));
@@ -149,6 +161,7 @@ impl SqlEngine {
             SqlEngine::Mysql => Box::new(MysqlTable::adopt(name.clone())),
             SqlEngine::Pg => Box::new(PgTable::adopt(name.clone())),
             SqlEngine::Mssql => Box::new(MssqlTable::adopt(name.clone())),
+            #[cfg(feature = "oracle")]
             SqlEngine::Oracle => unreachable!("created above"),
         };
         (name, guard)
@@ -178,6 +191,7 @@ impl SqlEngine {
             SqlEngine::Mysql => Rig::mysql_batch(export),
             SqlEngine::Pg => Rig::pg_batch(export),
             SqlEngine::Mssql => Rig::mssql_batch(export),
+            #[cfg(feature = "oracle")]
             SqlEngine::Oracle => Rig::oracle_batch(export),
         }
     }

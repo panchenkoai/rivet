@@ -120,6 +120,7 @@ fn ts_type(e: SqlEngine) -> &'static str {
         SqlEngine::Pg => "TIMESTAMP",
         SqlEngine::Mysql => "DATETIME(6)",
         SqlEngine::Mssql => "DATETIME2(6)",
+        #[cfg(feature = "oracle")]
         SqlEngine::Oracle => "TIMESTAMP(6)",
     }
 }
