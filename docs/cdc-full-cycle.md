@@ -190,9 +190,10 @@ did not grow); live state still equals the source.
 - **Log gone** (slot invalidated, binlog purged — ERROR 1236, MSSQL below
   retention): re-baseline in ONE run, in the product's own order — the run pins
   the anchor first, then re-reads the baseline. To make it do that: delete the
-  checkpoint (MySQL / SQL Server / MongoDB) or let the slot be recreated
-  (PostgreSQL), AND clear the export's `cdc_snapshot` row and the table's
-  `snapshot/_SUCCESS`, AND truncate `<table>__changes` before the next load (a
+  checkpoint file if there is one, AND give the export `cdc.initial: snapshot`
+  if it has no baseline, or clear the export's `cdc_snapshot` row and the
+  table's `snapshot/_SUCCESS` if it has one, AND truncate `<table>__changes`
+  before the next load (a
   re-read baseline has no `__pos`, so the log cannot be deduplicated across it;
   the load refuses without the truncate). Deleting the checkpoint alone is
   refused: prior-run evidence exists and the run would re-anchor over a gap.

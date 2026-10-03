@@ -121,6 +121,12 @@ impl Rig {
         cfg
     }
 
+    /// Append a `cdc:` entry over the same config path, for a second stage that gives the stream a knob it ran without.
+    pub fn amend_cdc_line(&mut self, line: &str) -> PathBuf {
+        self.cdc_lines.push(line.to_string());
+        self.rerender_all_materializations()
+    }
+
     pub fn amend_export_lines(&mut self, lines: &[&str]) -> PathBuf {
         for l in lines {
             self.extra_lines.push((*l).to_string());

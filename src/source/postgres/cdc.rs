@@ -130,8 +130,9 @@ pub(crate) fn slot_created_warning(slot: &str) -> String {
         "pg cdc: creating replication slot '{slot}' — capture starts at the CURRENT WAL \
          position, so changes written before now are NOT captured. On a first run this is \
          expected. If this slot existed before, it was dropped or invalidated and the changes \
-         since then are unrecoverable: re-snapshot (mode: full) before trusting this stream. \
-         Set `cdc.checkpoint:` to turn this case into a hard error instead of a warning."
+         since then are not in this stream. {} Set `cdc.checkpoint:` to turn this case into a \
+         hard error instead of a warning.",
+        crate::source::cdc::checkpoint_identity::RECOVER
     )
 }
 
@@ -140,30 +141,15 @@ pub(crate) fn pg_slot_missing_refusal(slot: &str, prior: PriorRun) -> String {
     const CKPT: &str = "the checkpoint file holds a position from a prior run";
     const SNAP: &str = "a prior run completed this export's snapshot (the state DB's \
                         `cdc_snapshot` row or the destination's snapshot/_SUCCESS marker)";
-    let resnapshot = "clear the export's `cdc_snapshot` row in the state DB AND delete the \
-         destination's snapshot/_SUCCESS marker (the two done-signals are OR-ed, so leaving \
-         either in place repeats this refusal). If a warehouse load consumes this stream, ALSO \
-         truncate its `<table>__changes` table before the next load. Then re-run: rivet creates \
-         the new slot BEFORE it re-snapshots, so nothing falls between the two (see \
-         cdc-failure-modes.md).";
-    let (evidence, steps) = match (prior.checkpoint, prior.snapshot) {
-        (true, true) => (
-            format!("{CKPT} and {SNAP}"),
-            format!("To re-snapshot: delete the checkpoint file, {resnapshot}"),
-        ),
-        (true, false) => (
-            CKPT.to_string(),
-            format!(
-                "Without a baseline (`initial: snapshot` or `backfill:`), deleting the \
-                 checkpoint file re-anchors at the current position and accepts the gap. To \
-                 re-snapshot instead: delete the checkpoint file, {resnapshot}"
-            ),
-        ),
-        (false, _) => (SNAP.to_string(), format!("To re-snapshot: {resnapshot}")),
+    let evidence = match (prior.checkpoint, prior.snapshot) {
+        (true, true) => format!("{CKPT} and {SNAP}"),
+        (true, false) => CKPT.to_string(),
+        (false, _) => SNAP.to_string(),
     };
     format!(
         "pg cdc: slot '{slot}' is missing but {evidence} — the slot was dropped or invalidated, \
-         and the changes since then are no longer in the log. {steps}"
+         and the changes since then are no longer in the log. {}",
+        crate::source::cdc::checkpoint_identity::RECOVER
     )
 }
 
@@ -1429,11 +1415,11 @@ pub(crate) fn truncate_refusal_message(schema: &str, table: &str) -> String {
          MEASURED — a truncate followed by an ordinary INSERT leaves the second run \
          failing identically. \
          \
-         Re-snapshot the table (`mode: full`) to re-establish the baseline, and then \
-         get the stream past this commit: \
+         First get the slot past this commit: \
          SELECT pg_replication_slot_advance('<slot>', '<lsn past the truncate>'); \
-         Re-snapshotting ALONE leaves the capture wedged, because the slot has not \
-         moved."
+         re-baselining ALONE leaves the capture wedged, because the slot has not moved. \
+         Then: {}",
+        crate::source::cdc::checkpoint_identity::RECOVER
     )
 }
 
@@ -3604,22 +3590,24 @@ mod slot_creation_warning_tests {
     /// had no guard at all and took the silent branch.
     ///
     /// This pins the message because the branch that emits it needs a live
-    /// server. It asserts the three things an operator acts on, not the prose.
+    /// server; the remedy is the re-baseline the live cell runs.
     #[test]
     fn the_created_slot_warning_names_the_loss_and_the_remedy() {
-        let w = slot_created_warning("rivet_orders");
-        assert!(w.contains("rivet_orders"), "must name the slot: {w}");
-        assert!(
-            w.contains("NOT captured"),
-            "must say what was skipped, in words a scanning operator catches: {w}"
-        );
-        assert!(
-            w.contains("mode: full"),
-            "must name the recovery — re-snapshot — not just the symptom: {w}"
-        );
-        assert!(
-            w.contains("cdc.checkpoint"),
-            "must name the setting that upgrades this to a hard error: {w}"
+        assert_eq!(
+            slot_created_warning("rivet_orders"),
+            "pg cdc: creating replication slot 'rivet_orders' — capture starts at the CURRENT \
+             WAL position, so changes written before now are NOT captured. On a first run this \
+             is expected. If this slot existed before, it was dropped or invalidated and the \
+             changes since then are not in this stream. Re-baseline the stream in one run: \
+             delete the checkpoint file if there is one; give the export a baseline \
+             (`cdc.initial: snapshot` or `backfill:`) if it has none, or clear both done-signals \
+             of the one it has (its `cdc_snapshot` row in the state DB and the destination's \
+             snapshot/_SUCCESS marker; either one left in place skips the baseline); and if a \
+             warehouse load consumes this stream, truncate its `<table>__changes` table before \
+             the next load. That run anchors FIRST and re-reads the table after, so nothing \
+             falls between the two. A separate `mode: full` export does not re-baseline the \
+             stream. Set `cdc.checkpoint:` to turn this case into a hard error instead of a \
+             warning."
         );
     }
 
@@ -3632,16 +3620,13 @@ mod slot_creation_warning_tests {
         };
         assert_eq!(
             super::pg_slot_missing_refusal("rivet_orders", both),
-            "pg cdc: slot 'rivet_orders' is missing but the checkpoint file holds a position from \
+            format!(
+                "pg cdc: slot 'rivet_orders' is missing but the checkpoint file holds a position from \
              a prior run and a prior run completed this export's snapshot (the state DB's \
              `cdc_snapshot` row or the destination's snapshot/_SUCCESS marker) — the slot was \
-             dropped or invalidated, and the changes since then are no longer in the log. To \
-             re-snapshot: delete the checkpoint file, clear the export's `cdc_snapshot` row in \
-             the state DB AND delete the destination's snapshot/_SUCCESS marker (the two \
-             done-signals are OR-ed, so leaving either in place repeats this refusal). If a \
-             warehouse load consumes this stream, ALSO truncate its `<table>__changes` table \
-             before the next load. Then re-run: rivet creates the new slot BEFORE it \
-             re-snapshots, so nothing falls between the two (see cdc-failure-modes.md)."
+             dropped or invalidated, and the changes since then are no longer in the log. {}",
+                crate::source::cdc::checkpoint_identity::RECOVER
+            )
         );
     }
 

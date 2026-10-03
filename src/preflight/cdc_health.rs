@@ -526,12 +526,10 @@ fn mysql_ckpt_verdict(export: &str, ckpt: MysqlCkpt, logs: &[(String, u64)]) -> 
                         "checkpoint {file}:{pos} is below binlog retention (file purged) — the \
                          next run fails with ERROR 1236"
                     )),
-                    Some(
-                        "restart CDC from a fresh checkpoint FIRST, then re-snapshot \
-                         (mode: full) — snapshotting first leaves the changes in between \
-                         in neither; size binlog retention above your CDC cadence"
-                            .into(),
-                    ),
+                    Some(format!(
+                        "{} Size binlog retention above your CDC cadence.",
+                        crate::source::cdc::checkpoint_identity::RECOVER
+                    )),
                 );
             };
             let lag: i64 = (logs[idx].1 as i64 - pos as i64).max(0)
@@ -713,11 +711,7 @@ fn mssql_verdicts(
                                 "checkpoint LSN {ckpt} is below the retained minimum {min} — the \
                                  cleanup job removed changes past it; the next run fails loudly"
                             )),
-                            Some(
-                                "restart CDC from a fresh checkpoint, THEN re-snapshot (mode: full) — \
-                                 snapshotting first leaves the changes in between in neither"
-                                    .into(),
-                            ),
+                            Some(crate::source::cdc::checkpoint_identity::RECOVER.into()),
                         ));
                     } else {
                         out.push(check(
@@ -907,12 +901,7 @@ fn mongo_checks(
                     name,
                     false,
                     Some(format!("{why} — the run refuses this file")),
-                    Some(
-                        "restore the checkpoint, or delete it to accept a fresh anchor at \
-                         the current cluster time (which SKIPS everything since it was \
-                         written — re-snapshot if that gap matters)"
-                            .into(),
-                    ),
+                    Some(restore_or_recover()),
                 )),
             },
             Err(why) => checks.push(check(
@@ -1019,20 +1008,13 @@ mod tests {
             "a dropped slot under an existing checkpoint is not a first run: {c:?}"
         );
         assert_eq!(
-            c.detail.as_deref(),
-            Some(
+            c.detail,
+            Some(format!(
                 "pg cdc: slot 'rivet_orders' is missing but the checkpoint file holds a position \
                  from a prior run — the slot was dropped or invalidated, and the changes since \
-                 then are no longer in the log. Without a baseline (`initial: snapshot` or \
-                 `backfill:`), deleting the checkpoint file re-anchors at the current position \
-                 and accepts the gap. To re-snapshot instead: delete the checkpoint file, clear \
-                 the export's `cdc_snapshot` row in the state DB AND delete the destination's \
-                 snapshot/_SUCCESS marker (the two done-signals are OR-ed, so leaving either in \
-                 place repeats this refusal). If a warehouse load consumes this stream, ALSO \
-                 truncate its `<table>__changes` table before the next load. Then re-run: rivet \
-                 creates the new slot BEFORE it re-snapshots, so nothing falls between the two \
-                 (see cdc-failure-modes.md)."
-            ),
+                 then are no longer in the log. {}",
+                crate::source::cdc::checkpoint_identity::RECOVER
+            )),
             "doctor checks the checkpoint only, so it must name the checkpoint and nothing else"
         );
     }

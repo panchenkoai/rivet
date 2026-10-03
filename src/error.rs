@@ -462,24 +462,24 @@ pub mod codes {
     );
     pub const SOURCE_CDC_FOREIGN_CHECKPOINT: Code = refusal(
         "RIVET_SOURCE_CDC_FOREIGN_CHECKPOINT",
-        "delete the checkpoint so the next run anchors afresh FIRST, then re-snapshot the tables",
+        "re-baseline the stream: delete the checkpoint, give the export a baseline (`cdc.initial: snapshot`) or clear its done-signals, then re-run",
     );
     pub const SOURCE_CDC_CHECKPOINT_INVALID: Code = refusal(
         "RIVET_SOURCE_CDC_CHECKPOINT_INVALID",
-        "restore the checkpoint file, or delete it so the stream anchors FIRST, then re-snapshot",
+        "restore the checkpoint file, or re-baseline the stream: delete it, give the export a baseline (`cdc.initial: snapshot`) or clear its done-signals, then re-run",
     );
     pub const SOURCE_CDC_LOG_GAP: Code = refusal(
         "RIVET_SOURCE_CDC_LOG_GAP",
-        "restore the missing log, or delete the checkpoint so the stream anchors FIRST, then re-snapshot",
+        "restore the missing log, or re-baseline the stream: delete the checkpoint, give the export a baseline (`cdc.initial: snapshot`) or clear its done-signals, then re-run",
     );
     /// A captured table was TRUNCATEd: its removed rows have no change events to retract them downstream.
     pub const SOURCE_CDC_TRUNCATED: Code = refusal(
         "RIVET_SOURCE_CDC_TRUNCATED",
-        "delete the checkpoint so the stream anchors FIRST, then re-snapshot the table",
+        "re-baseline the stream: delete the checkpoint (PostgreSQL: first advance the slot past the truncate), give the export a baseline (`cdc.initial: snapshot`) or clear its done-signals, then re-run",
     );
     pub const SOURCE_CDC_UNDECODABLE: Code = refusal(
         "RIVET_SOURCE_CDC_UNDECODABLE",
-        "re-snapshot the table: delete the checkpoint first so the stream anchors, then snapshot",
+        "re-baseline the stream: delete the checkpoint, give the export a baseline (`cdc.initial: snapshot`) or clear its done-signals, then re-run",
     );
     /// A captured cell holding a value the CDC decoder has no faithful reading for.
     pub const SOURCE_CDC_CELL_UNSUPPORTED: Code = refusal(

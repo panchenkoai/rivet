@@ -1036,17 +1036,10 @@ impl CdcEngine {
                         // deleted it still had `done == true` from the row, and the
                         // identical bail fired again on the next run, forever.
                         "{} cdc: checkpoint '{}' is missing but prior-run evidence exists — \
-                         either restore the checkpoint file, or re-snapshot: clear the \
-                         export's `cdc_snapshot` row in the state DB AND delete the \
-                         destination's snapshot/_SUCCESS marker (the two done-signals \
-                         are OR-ed, so leaving either in place skips the snapshot). If a \
-                         warehouse load consumes this stream, ALSO truncate its \
-                         `<table>__changes` table before the next load: a re-snapshot \
-                         row carries NULL `__pos` and LOSES the dedup to every \
-                         already-loaded change row, so the current-state view would \
-                         silently serve pre-gap values (see cdc-failure-modes.md)",
+                         restore the checkpoint file, or: {}",
                         self.label(),
-                        ckpt.display()
+                        ckpt.display(),
+                        checkpoint_identity::RECOVER
                     );
                 }
                 match self {
