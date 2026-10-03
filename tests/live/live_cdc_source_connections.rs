@@ -236,6 +236,10 @@ fn batch_run_opens(engine: SqlEngine, lines: &[&str]) -> i64 {
                 logins() - before - probe
             })
         }
+        #[cfg(feature = "oracle")]
+        SqlEngine::Oracle => {
+            unreachable!("this connection census runs on PG, MySQL and SQL Server")
+        }
     }
 }
 

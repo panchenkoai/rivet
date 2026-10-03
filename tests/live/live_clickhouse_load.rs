@@ -286,6 +286,51 @@ fn a_sql_server_cdc_stream_loads_into_clickhouse_and_the_view_matches_the_source
     clickhouse_rows_match_source(&view, source(), "2");
 }
 
+/// A primary-key-changing UPDATE on SQL Server reaches ClickHouse as a delete of the old
+/// key and an insert of the new one: the old key is flagged deleted, never left live.
+#[test]
+#[ignore = "live: requires clickhouse + fake-gcs + mssql-cdc with SQL Server Agent"]
+fn a_sql_server_primary_key_move_flags_the_old_key_deleted_in_clickhouse() {
+    require_alive(LiveService::ClickHouse);
+    require_alive(LiveService::FakeGcs);
+    ensure_gcs_bucket(BUCKET);
+    let _serial = cross_process_serial("mssql_cdc");
+    let table = unique_name("rivet_ch_mspk");
+    let ci = format!("dbo_{table}");
+    mssql_cdc_drop_table(&format!("dbo.{table}"));
+    mssql_cdc_exec(&format!(
+        "CREATE TABLE dbo.{table}(id BIGINT PRIMARY KEY, v BIGINT)"
+    ));
+    enable_cdc(&table, &ci);
+    let _guard = MssqlCdcTable {
+        table: table.clone(),
+        ci: ci.clone(),
+    };
+    mssql_cdc_exec(&format!("INSERT INTO dbo.{table} VALUES (1,1),(2,2),(3,3)"));
+    wait_for_capture(&ci, 3);
+    let source = || {
+        pairs(
+            &mssql_cdc_query_strings(&format!(
+                "SELECT CONCAT(id, CHAR(9), v) FROM dbo.{table} ORDER BY id"
+            ))
+            .join("\n"),
+        )
+    };
+    let db = Db::new("rivet_chtest");
+    let rig = into_clickhouse(Rig::mssql_cdc(&table, &ci).cdc("until_current: true"), &db);
+    let view = format!("{}.{table}", db.0);
+
+    rig.run_ok();
+    load(&rig);
+    clickhouse_rows_match_source(&view, source(), "");
+
+    mssql_cdc_exec(&format!("UPDATE dbo.{table} SET id = 101 WHERE id = 1"));
+    wait_for_capture(&ci, 5);
+    rig.run_ok();
+    load(&rig);
+    clickhouse_rows_match_source(&view, source(), "1");
+}
+
 /// A load that dies after appending but before recording itself re-appends every
 /// part on the next load: the copies share key and version, so the view is
 /// unchanged and the count gate still passes.
@@ -1743,4 +1788,87 @@ fn a_keyset_incremental_export_into_clickhouse_accumulates_every_run() {
         pg_rows(&mut c, &tbl),
         "a run with no new key changes nothing"
     );
+}
+
+/// A `keyset_incremental` export from `engine` into ClickHouse: the first run loads the
+/// table, a delta joins it, and a run with no new key leaves it as it was (#399).
+fn a_keyset_incremental_export_accumulates_in_clickhouse(engine: SqlEngine) {
+    require_alive(LiveService::ClickHouse);
+    require_alive(LiveService::FakeGcs);
+    engine.alive();
+    ensure_gcs_bucket(BUCKET);
+    let (id, v, int) = (engine.col("id"), engine.col("v"), engine.int64());
+    let (tbl, _guard) = engine.create(
+        "rivet_ch_ksinc",
+        &format!("{id} {int} PRIMARY KEY, {v} {int}"),
+    );
+    let insert = |ids: std::ops::RangeInclusive<i64>| {
+        let rows: Vec<String> = ids.map(|g| format!("({g}, {g})")).collect();
+        engine.exec(&format!("INSERT INTO {tbl} VALUES {}", rows.join(", ")));
+    };
+    insert(1..=100);
+    let db = Db::new("rivet_chtest");
+    let rig = batch_into_clickhouse(
+        engine.rig(&tbl).restage(
+            "chunked",
+            &[
+                "chunk_by_key: id",
+                "chunk_size: 30",
+                "keyset_incremental: true",
+            ],
+        ),
+        &db,
+    );
+    let loaded = || {
+        clickhouse_rows(&format!(
+            "SELECT id, v FROM {}.`{tbl}` ORDER BY id FORMAT TSV",
+            db.0
+        ))
+    };
+
+    rig.run_ok();
+    load(&rig);
+    assert_eq!(
+        loaded().len(),
+        100,
+        "{engine:?}: the first run loads the whole table"
+    );
+    assert_eq!(loaded(), engine.id_v_pairs(&tbl));
+
+    insert(101..=120);
+    rig.run_ok();
+    load(&rig);
+    assert_eq!(
+        loaded().len(),
+        120,
+        "{engine:?}: the delta joins the earlier rows"
+    );
+    assert_eq!(loaded(), engine.id_v_pairs(&tbl));
+
+    rig.run_ok();
+    load(&rig);
+    assert_eq!(
+        loaded(),
+        engine.id_v_pairs(&tbl),
+        "{engine:?}: a run with no new key changes nothing"
+    );
+}
+
+#[test]
+#[ignore = "live: requires clickhouse + fake-gcs + mysql"]
+fn a_keyset_incremental_export_from_mysql_accumulates_in_clickhouse() {
+    a_keyset_incremental_export_accumulates_in_clickhouse(SqlEngine::Mysql);
+}
+
+#[test]
+#[ignore = "live: requires clickhouse + fake-gcs + mssql"]
+fn a_keyset_incremental_export_from_sql_server_accumulates_in_clickhouse() {
+    a_keyset_incremental_export_accumulates_in_clickhouse(SqlEngine::Mssql);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires clickhouse + fake-gcs + oracle"]
+fn a_keyset_incremental_export_from_oracle_accumulates_in_clickhouse() {
+    a_keyset_incremental_export_accumulates_in_clickhouse(SqlEngine::Oracle);
 }

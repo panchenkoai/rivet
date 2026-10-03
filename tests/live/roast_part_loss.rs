@@ -274,3 +274,51 @@ fn roast_keyset_split_parts_parquet_all_rows_reach_destination() {
          of rows at the destination than the seeded {N}"
     );
 }
+
+// ─── every engine — rotation graded by the default rig oracle ────────────────
+
+/// Run `rig` with a 64 KB cap over 100-row uncompressed row groups and 250-row batches and
+/// require several parts; the rig's default oracle (one DuckDB session) then grades every
+/// declared part against the source: count, distinct key and values.
+fn rotation_reaches_destination(rig: Rig, what: &str) {
+    let rig = rig
+        .export_line("compression: none")
+        .export_line("max_file_size: 64KB")
+        .export_line("parquet: { row_group_strategy: fixed_rows, row_group_rows: 100 }")
+        .export_line("tuning: {batch_size: 250}");
+    rig.run_ok();
+    let parts = files_with_extension(&rig.out_dir(), "parquet").len();
+    assert!(
+        parts >= 2,
+        "{what}: the cap must rotate the export into several parts, got {parts}"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn rotated_parts_reach_the_destination_whole_mssql() {
+    require_alive(LiveService::Mssql);
+    let e = SqlEngine::Mssql;
+    let (t, _guard) = e.create(
+        "rot_ms",
+        "id BIGINT PRIMARY KEY, payload VARCHAR(1100) NOT NULL",
+    );
+    e.exec(&format!(
+        "INSERT INTO {t} SELECT n, REPLICATE(CONVERT(VARCHAR(32), HASHBYTES('MD5', CAST(n AS VARCHAR(20))), 2), 32) \
+         FROM (SELECT TOP 1000 ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS n \
+               FROM sys.all_objects a CROSS JOIN sys.all_objects b) s"
+    ));
+    rotation_reaches_destination(e.rig(&t), "mssql rotation");
+}
+
+#[test]
+#[ignore = "live: requires docker compose mongo"]
+fn rotated_parts_reach_the_destination_whole_mongo() {
+    require_alive(LiveService::Mongo);
+    let db = unique_name("mrot");
+    let m = MongoTest::connect(27017, &db);
+    m.append_padded("bench", 1..=1000, 1000);
+    let rig = Rig::mongo_batch("bench").source_url(&MongoTest::url(27017, &db));
+    rotation_reaches_destination(rig, "mongo rotation");
+    m.drop_database();
+}

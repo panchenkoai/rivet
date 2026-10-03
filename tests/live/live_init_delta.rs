@@ -114,20 +114,14 @@ impl Drop for GcsPrefix {
 
 // ── the warehouse half: init → run → load → compact, per engine ──────────
 
-fn source_url(e: SqlEngine) -> &'static str {
-    match e {
-        SqlEngine::Pg => POSTGRES_URL,
-        SqlEngine::Mysql => MYSQL_URL,
-        SqlEngine::Mssql => MSSQL_URL,
-    }
-}
-
 /// A timestamp type init scores as a cursor candidate, spelled per engine.
 fn ts_type(e: SqlEngine) -> &'static str {
     match e {
         SqlEngine::Pg => "TIMESTAMP",
         SqlEngine::Mysql => "DATETIME(6)",
         SqlEngine::Mssql => "DATETIME2(6)",
+        #[cfg(feature = "oracle")]
+        SqlEngine::Oracle => "TIMESTAMP(6)",
     }
 }
 
@@ -193,7 +187,7 @@ fn warehouse_chain(e: SqlEngine, label: &str) {
     init_ok(&[
         "init",
         "--source",
-        source_url(e),
+        e.url(),
         "--table",
         &init_table,
         "--mode",
@@ -214,7 +208,7 @@ fn warehouse_chain(e: SqlEngine, label: &str) {
     // the dataset, and a panic between them must still tear both down.
     let _bq_guard = bq.cleanup(&[&export, &changes]);
     let _gcs_guard = GcsPrefix(format!("gs://{}/exports/{export}/**", bq.bucket));
-    let db = [("DATABASE_URL", source_url(e))];
+    let db = [("DATABASE_URL", e.url())];
     let fq = |t: &str| format!("`{}.{}.{t}`", bq.project, bq.dataset);
 
     // 1. First pass: the whole table lands as a plain base, and there is no

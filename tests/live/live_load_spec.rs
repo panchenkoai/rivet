@@ -365,11 +365,7 @@ fn apply_keeps_the_key_run_recorded(e: SqlEngine) {
     e.exec(&format!(
         "INSERT INTO {table} (a_key, b_key, v) VALUES (1, 2, 'x'), (2, 2, 'y'), (3, 1, 'z')"
     ));
-    let url = match e {
-        SqlEngine::Mysql => MYSQL_URL,
-        SqlEngine::Pg => POSTGRES_URL,
-        SqlEngine::Mssql => MSSQL_URL,
-    };
+    let url = e.url();
     let rig = e.rig(&table).source_url_env("DATABASE_URL").top_line(LOAD);
     let cfg = rig.config_path();
     let env = [("DATABASE_URL", url)];
