@@ -390,7 +390,8 @@ mod tests {
                 Observations::default(),
                 Ok(UnitChecksums::default()),
                 |s| {
-                    assert_eq!(s.files_committed % 2, 0, "checkpoint before a part");
+                    let recorded = 2 * (n as usize + 1);
+                    assert_eq!(s.files_committed, recorded, "checkpoint before a part");
                     Ok(())
                 },
             )
