@@ -459,19 +459,21 @@ impl ChangeEvent {
     /// the round-1 hunt caught on the NDJSON driver). A discoverable method the
     /// next sink calls, not a rule two drivers must each remember to inline.
     pub(crate) fn raise_poison(&self) -> Result<()> {
-        if let Some(poison) = &self.poison {
-            anyhow::bail!("{poison}");
-        }
-        Ok(())
+        raise_deferred(&self.poison)
     }
 
     /// Surface the old image's deferred decode error; for a consumer that writes the old image.
     pub(crate) fn raise_before_poison(&self) -> Result<()> {
-        if let Some(poison) = &self.before_poison {
-            anyhow::bail!("{poison}");
-        }
-        Ok(())
+        raise_deferred(&self.before_poison)
     }
+}
+
+/// A deferred decode error as the run's failure.
+fn raise_deferred(poison: &Option<String>) -> Result<()> {
+    if let Some(poison) = poison {
+        anyhow::bail!("{poison}");
+    }
+    Ok(())
 }
 
 /// The seam every engine reader satisfies: a blocking pull of canonical changes.
@@ -3209,6 +3211,20 @@ mod tests {
             ..ev
         };
         assert!(super::ndjson_line(&full).get("before_columns").is_none());
+    }
+
+    /// The NDJSON driver prints the old image, so it raises the old image's deferred refusal too.
+    #[test]
+    fn ndjson_run_raises_an_old_image_poison_for_a_captured_table() {
+        let mut ev = poison_event("orders");
+        ev.before_poison = ev.poison.take();
+        let mut s = OneShot(Some(ev));
+        let err = super::run(&mut s, None, vec!["orders".into()], None)
+            .expect_err("an old image NDJSON would print undecodable must bail");
+        assert!(
+            format!("{err:#}").contains("REPLICA IDENTITY FULL"),
+            "got: {err:#}"
+        );
     }
 
     // An UNCAPTURED table's poison must be dropped (parallel-slot contamination
