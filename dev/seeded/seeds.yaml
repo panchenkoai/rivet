@@ -59,11 +59,11 @@ seeds:
       mongo:
         cells: [rotated_parts_reach_the_destination_whole_mongo]
 
-  - name: keyset-incremental-overwrite
-    class: a keyset_incremental export plans its warehouse load as an overwrite instead of an append
-    history: "#399 - BigQuery and ClickHouse held 100, then 20, then 20 rows"
+  - name: delta-run-loaded-as-overwrite
+    class: a run that continues past its last key (SQL keyset_incremental, Mongo source.mongo.resume) plans its warehouse load as a whole-table overwrite instead of an append
+    history: "#399 - BigQuery and ClickHouse held 100, then 20, then 20 rows; 2026-10-03 - a Mongo resume export loaded 500 of 2500 documents into ClickHouse"
     scope: source
-    patch: keyset-incremental-overwrite/shared.patch
+    patch: delta-run-loaded-as-overwrite/shared.patch
     engines:
       postgres:
         cells: [a_keyset_incremental_export_into_clickhouse_accumulates_every_run]
@@ -74,9 +74,12 @@ seeds:
       oracle:
         cells: [a_keyset_incremental_export_from_oracle_accumulates_in_clickhouse]
       mongo:
-        na: Mongo has no chunk_by_key / keyset_incremental export mode
+        patch: delta-run-loaded-as-overwrite/mongo.patch
+        cells: [a_mongo_resume_export_into_clickhouse_accumulates_every_run]
       lib:
-        cells: ["lib:load_mode_of_every_mode_with_and_without_keyset_incremental"]
+        cells:
+          - "lib:load_mode_of_every_mode_with_and_without_keyset_incremental"
+          - "lib:a_mongo_resume_export_plans_an_append_ordered_by_its_id"
 
   - name: pk-move-without-delete
     class: a primary-key-changing UPDATE reaches the destination without the delete of the old key

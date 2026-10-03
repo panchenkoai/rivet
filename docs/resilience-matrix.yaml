@@ -50,7 +50,7 @@ scenarios:
     postgres: { test: crash_after_cursor_commit_is_recoverable_with_full_state }
     mysql:    { test: mysql_crash_after_cursor_commit_is_recoverable_with_full_state }
     mssql:    { test: mssql_crash_after_cursor_commit_is_recoverable_with_full_state }
-    mongo:    { na: "Mongo's keyset full export has no cursor-commit boundary of this shape (documented in live_mongo_crash_recovery.rs) — the file/manifest boundaries above cover it" }
+    mongo:    { test: mongo_resume_crash_after_keyset_page_recovers_manifest_driven }
     oracle:   { gap: "no Oracle crash-hook test" }
 
   # ── chunked (checkpoint) at-least-once ────────────────────────────────────

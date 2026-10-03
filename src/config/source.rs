@@ -105,8 +105,12 @@ pub struct MongoConfig {
     /// With keyset paging (`page_size`), persist the last committed `_id` and
     /// **resume** from it next run — a crashed export continues where it left
     /// off, and a re-run captures only documents inserted since (ObjectId `_id`
-    /// is time-ordered). Default `false` re-reads the whole collection each run
-    /// (plain `mode: full` semantics). No effect without `page_size`.
+    /// is time-ordered), which `rivet load` appends rather than overwrites. For
+    /// append-only collections: an update to a document already read is never
+    /// re-read, and after a whole re-read (`rivet state reset`) the warehouse view
+    /// may serve either copy of a document updated in between. Default `false`
+    /// re-reads the whole collection each run (plain `mode: full` semantics). No
+    /// effect without `page_size`.
     #[serde(default)]
     pub resume: bool,
 }

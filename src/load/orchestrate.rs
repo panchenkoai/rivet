@@ -175,6 +175,7 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
                             args.rebuild_changelog,
                             state.as_ref(),
                             &load_id,
+                            &args.config,
                         )? {
                             Some(report) => {
                                 println!(
@@ -460,10 +461,23 @@ pub(super) fn take_table_lease<'a>(
 /// config-fix hint when neither the config nor the recorded source key gives one.
 pub(super) fn require_pk<'a>(plan: &'a load::plan::LoadPlan, mode: &str) -> Result<&'a [String]> {
     if plan.pk.is_empty() {
+        let what = match plan.continued_key {
+            true => {
+                "loads by append (each run carries only the keys past the last one)".to_string()
+            }
+            false => format!("is mode: {mode}"),
+        };
+        let why = match plan.load.pk {
+            load::plan::KeyColumns::None => {
+                "its `load:` block sets `pk: none`, so name the key there instead (e.g. `pk: [id]`)"
+            }
+            _ => {
+                "`rivet run` recorded none (a `query:` export, or a table without one), so \
+                 declare it in the export's `load:` block (e.g. `pk: [id]`)"
+            }
+        };
         anyhow::bail!(
-            "export `{}` is mode: {mode} but has no primary key for the current-state dedup \
-             view — `rivet run` recorded none (a `query:` export, or a table without one), so \
-             declare it in the export's `load:` block (e.g. `pk: [id]`)",
+            "export `{}` {what} but has no primary key for the current-state dedup view — {why}",
             plan.export_name
         );
     }
@@ -1785,12 +1799,37 @@ fn split_runs(runs: &[(String, crate::manifest::RunManifest)]) -> SplitRuns {
     out
 }
 
+/// Why a continued-key export's table, last loaded (newest-first `loads`) as an overwrite, may lack rows; `None` otherwise.
+fn overwritten_delta_warning(
+    continued_key: bool,
+    loads: &[crate::state::LoadRecord],
+    fqtn: &str,
+    export: &str,
+    config: &str,
+) -> Option<String> {
+    let last = loads
+        .iter()
+        .find(|r| r.status == LoadStatus::Success.as_str());
+    let overwrote = last.is_some_and(|r| r.mode == load::plan::LoadMode::Full.ledger_str());
+    (continued_key && overwrote).then(|| {
+        format!(
+            "`{fqtn}` was last loaded as a whole-table overwrite, and export `{export}` now \
+             loads by append because each run carries only the keys past the last one \
+             (`keyset_incremental` / `source.mongo.resume`). rivet 0.30 and older loaded such \
+             an export by overwriting the table with each run's new keys, so it may lack rows \
+             earlier runs delivered. To restore it: `rivet state reset -c {config} --export \
+             {export}`, then `rivet run -c {config}` and `rivet load -c {config}`."
+        )
+    })
+}
+
 /// Load a single export's INCREMENTAL runs. A run that re-read the whole table (the
 /// first run, or one after `state reset`) lands as `<table>` exactly like a full load;
 /// a delta APPENDs into `<table>__changes` — turning a `<table>` table into the log
 /// first — behind a current-state view deduped to the latest row per PK by the
 /// export's `cursor_column`. Ledger-driven exactly like CDC — only the not-yet-loaded
 /// runs are loaded, so re-loads don't double and `cleanup_source` is safe.
+#[allow(clippy::too_many_arguments)]
 fn load_one_incremental(
     plan: &load::plan::LoadPlan,
     run_id: &str,
@@ -1799,6 +1838,7 @@ fn load_one_incremental(
     rebuild_changelog: bool,
     state: Option<&StateStore>,
     load_id: &str,
+    config: &str,
 ) -> Result<Option<IncrementalReport>> {
     let cursor = plan.cursor_column.clone().ok_or_else(|| {
         anyhow::anyhow!(
@@ -1816,6 +1856,22 @@ fn load_one_incremental(
         loader: load::build_loader(plan, run_id),
         store: load::open_store(&plan.destination)?,
     };
+    let fqtn = job.loader.fqtn(&plan.table);
+    let loads = match state.map(|s| s.recent_loads(Some(&fqtn), 50)).transpose() {
+        Ok(rows) => rows.unwrap_or_default(),
+        Err(e) => {
+            log::warn!(
+                "could not read the load ledger for `{fqtn}`, so this load cannot tell whether an \
+                 earlier load overwrote it with only one run's keys: {e:#}"
+            );
+            Vec::new()
+        }
+    };
+    if let Some(warning) =
+        overwritten_delta_warning(plan.continued_key, &loads, &fqtn, &plan.export_name, config)
+    {
+        log::warn!("{warning}");
+    }
     execute_load(
         job,
         |inputs| {
@@ -2172,6 +2228,7 @@ mod load_ledger_tests {
             },
             mode: LoadMode::Cdc,
             cursor_column: None,
+            continued_key: false,
             pk: vec![],
             clustering: load::plan::Clustering::Auto(vec![]),
             pinned_run: None,
@@ -2200,6 +2257,17 @@ mod load_ledger_tests {
                 "the refusal must name the export's OWN mode, not a fixed label: {err}"
             );
         }
+
+        // A continued-key export with an explicit `pk: none` names that setting, not a missing record.
+        let mut keyless = plan.clone();
+        keyless.continued_key = true;
+        keyless.load.pk = load::plan::KeyColumns::None;
+        assert_eq!(
+            require_pk(&keyless, "incremental").unwrap_err().to_string(),
+            "export `c1` loads by append (each run carries only the keys past the last one) but \
+             has no primary key for the current-state dedup view — its `load:` block sets \
+             `pk: none`, so name the key there instead (e.g. `pk: [id]`)"
+        );
     }
 
     /// Round-7 rebuild of the round-6 guard: the SHAPE is prefix-anchored (a
@@ -2406,6 +2474,7 @@ mod load_ledger_tests {
             },
             mode: LoadMode::Cdc,
             cursor_column: None,
+            continued_key: false,
             pk: vec![],
             clustering: load::plan::Clustering::Auto(vec![]),
             pinned_run: None,
@@ -4269,5 +4338,59 @@ mod load_message_tests {
             buffered.summary(),
             "3 rows buffered into p.d.orders__changes | `rivet compact` merges them into p.d.orders"
         );
+    }
+}
+
+#[cfg(test)]
+mod overwritten_delta_tests {
+    use super::overwritten_delta_warning;
+    use crate::state::LoadRecord;
+
+    fn load(mode: &str, status: &str) -> LoadRecord {
+        LoadRecord {
+            load_id: "l".into(),
+            export_name: "t".into(),
+            target_table: "db.t".into(),
+            warehouse: "clickhouse".into(),
+            mode: mode.into(),
+            source_run_ids: vec![],
+            rows_loaded: 1,
+            status: status.into(),
+            finished_at: "2026-10-03T00:00:00Z".into(),
+            source_ident: String::new(),
+        }
+    }
+
+    /// A continued-key export whose newest successful load overwrote its table is warned once, with the remedy.
+    #[test]
+    fn a_continued_key_export_last_loaded_as_an_overwrite_is_warned_with_its_remedy() {
+        let warn = |continued, loads: &[LoadRecord]| {
+            overwritten_delta_warning(continued, loads, "db.t", "t", "rivet.yaml")
+        };
+        assert_eq!(
+            warn(
+                true,
+                &[load("incremental", "failed"), load("full", "success")]
+            )
+            .as_deref(),
+            Some(
+                "`db.t` was last loaded as a whole-table overwrite, and export `t` now loads by \
+                 append because each run carries only the keys past the last one \
+                 (`keyset_incremental` / `source.mongo.resume`). rivet 0.30 and older loaded such \
+                 an export by overwriting the table with each run's new keys, so it may lack rows \
+                 earlier runs delivered. To restore it: `rivet state reset -c rivet.yaml --export \
+                 t`, then `rivet run -c rivet.yaml` and `rivet load -c rivet.yaml`."
+            )
+        );
+        assert_eq!(
+            warn(
+                true,
+                &[load("incremental", "success"), load("full", "success")]
+            ),
+            None
+        );
+        assert_eq!(warn(false, &[load("full", "success")]), None);
+        assert_eq!(warn(true, &[load("full", "failed")]), None);
+        assert_eq!(warn(true, &[]), None);
     }
 }

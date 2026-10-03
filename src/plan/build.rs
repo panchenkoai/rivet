@@ -273,6 +273,34 @@ pub(crate) fn build_plan_on(
     })
 }
 
+/// The key a clean re-run continues past (SQL `keyset_incremental`, Mongo `source.mongo.resume`), or `None` when every run reads the whole range.
+pub(crate) fn continued_key<'a>(config: &'a Config, export: &'a ExportConfig) -> Option<&'a str> {
+    match export.mode {
+        ExportMode::Chunked => keyset_continued_key(export),
+        ExportMode::Full
+            if config.source.source_type == crate::config::SourceType::Mongo
+                && config
+                    .source
+                    .mongo
+                    .as_ref()
+                    .is_some_and(|m| m.resume && m.page_size.is_some()) =>
+        {
+            Some("_id")
+        }
+        ExportMode::Full | ExportMode::Incremental | ExportMode::TimeWindow | ExportMode::Cdc => {
+            None
+        }
+    }
+}
+
+/// The key a `keyset_incremental` export continues past: the config-free half of [`continued_key`].
+fn keyset_continued_key(export: &ExportConfig) -> Option<&str> {
+    export
+        .chunk_by_key
+        .as_deref()
+        .filter(|_| export.keyset_incremental)
+}
+
 /// The strategy for `mode: full`. Source-aware: a MongoDB source with
 /// `source.mongo.page_size` reads by `_id`-keyset pages (bounded query time,
 /// per-page parts, the base for parallel `_id`-range reads) instead of one
@@ -288,11 +316,7 @@ fn full_strategy(config: &Config, export: &ExportConfig) -> ExtractionStrategy {
             chunk_size: page.max(1),
             // Resume is opt-in: default keeps `mode: full` re-reading each run.
             checkpoint: mongo.resume,
-            // Mongo `resume` has always meant "continue from the last _id each
-            // run" (incremental-append on an append-only _id stream), so map it to
-            // the incremental opt-in to preserve that behaviour under the
-            // crash-recovery/incremental split.
-            incremental: mongo.resume,
+            incremental: continued_key(config, export).is_some(),
             // `parallel: N` fans N `_id`-range workers (Mongo reader only).
             parallel: export.parallel,
         });
@@ -586,10 +610,8 @@ fn heavy_chunk_warning(
 /// anchor and advances it at success). Same formula as sequential — the runner
 /// applies the incremental floor/ceiling across its N ranges.
 fn keyset_recovery(export: &ExportConfig) -> (bool, bool) {
-    (
-        export.chunk_checkpoint || export.keyset_incremental,
-        export.keyset_incremental,
-    )
+    let incremental = keyset_continued_key(export).is_some();
+    (export.chunk_checkpoint || incremental, incremental)
 }
 
 /// Refuse a MySQL keyset key under a `uuid` override: the seek binds hex text, which is not the key's stored order.
