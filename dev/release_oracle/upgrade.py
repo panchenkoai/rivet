@@ -334,7 +334,7 @@ def _cdc_leg(led: Ledger, prev: Path, engine: str, url: str) -> None:
             led.failed(engine, "-", SCEN, "local", f"upgrade[{engine}/cdc]: the CDC source setup failed", "setup")
             return
         eng, work, _ = probe
-        env = {"RIVET_STATE_URL": ""}
+        env = {"RIVET_STATE_URL": "", "RIVET_GATE_STATE_URL": ""}
         out = work / "output"
         anchored = run([str(prev), "run", "-c", "c.yaml"], env=env, cwd=work, timeout=None)
         changes(engine, url, 1)
@@ -380,7 +380,7 @@ def _load_leg(led: Ledger, prev: Path, root: Path, url: str) -> None:
         return
     d = root / "load"
     d.mkdir()
-    env = {"RIVET_UPG_URL": url, "RIVET_STATE_URL": ""}
+    env = {"RIVET_UPG_URL": url, "RIVET_STATE_URL": "", "RIVET_GATE_STATE_URL": ""}
     try:
         gcp.bq_ensure_dataset(proj, dset)
         init = run([str(prev), "init", "--source-env", "RIVET_UPG_URL", "--table", table, "--mode",

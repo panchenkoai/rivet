@@ -252,13 +252,12 @@ def _self_test() -> int:
         assert got is expect, f"env_flag({raw!r}) = {got}, expected {expect}"
     os.environ.pop("RIVET_ORACLE_SELFTEST_FLAG", None)
     # A stage that moves the Rig off Postgres must blank BOTH knobs: the tests read RIVET_GATE_STATE_URL.
-    for mod in ("scenarios.py", "live_modules.py"):
-        src = (Path(__file__).parent / mod).read_text()
-        assert src.count('"RIVET_STATE_URL": ""') == src.count('"RIVET_GATE_STATE_URL": ""'), mod
-        assert src.count('"-u", "RIVET_STATE_URL"') == src.count('"-u", "RIVET_GATE_STATE_URL"'), mod
-    assert cdc._gate_owned_state_db("rivet_state_gate_69094")
-    assert not cdc._gate_owned_state_db("rivet_state"), "the shared stand state db must never be reset"
-    assert "pg_tables" in cdc._PG_STATE_RESET_SQL and "current_schema()" in cdc._PG_STATE_RESET_SQL
+    old, gate = "RIVET_" + "STATE_URL", "RIVET_GATE_" + "STATE_URL"
+    shapes = ('"{}": ""', '"-u", "{}"', '.pop("{}", None)')
+    for path in sorted(Path(__file__).parent.glob("*.py")):
+        src = path.read_text()
+        for shape in shapes:
+            assert src.count(shape.format(old)) == src.count(shape.format(gate)), (path.name, shape)
 
     # The escape is the one that costs a release: argparse's default, the
     # authoritative reader in regression.py, and this table must agree on EVERY

@@ -227,7 +227,7 @@ def verify_state_backend_parity(
     # fresh backend. Postgres is shared with the rest of the gate, hence the
     # export-name scoping on every query.
     sq_cfg = cfg_at(work / "sqlite")
-    sq = rivet("run", "-c", str(sq_cfg), env={"RIVET_STATE_URL": ""}, timeout=NO_TIMEOUT)
+    sq = rivet("run", "-c", str(sq_cfg), env={"RIVET_STATE_URL": "", "RIVET_GATE_STATE_URL": ""}, timeout=NO_TIMEOUT)
     pg_cfg = cfg_at(work / "pg")
     pg = rivet("run", "-c", str(pg_cfg), env={"RIVET_STATE_URL": state_url}, timeout=NO_TIMEOUT)
     if not sq.ok or not pg.ok:

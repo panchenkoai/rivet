@@ -177,7 +177,7 @@ def _init_dir(prev: Path, root: Path, tag: str, url: str, table: str, mode: str)
     d = root / tag
     d.mkdir(parents=True)
     p = run([str(prev), "init", "--source-env", "RIVET_PERF_URL", "--table", table, "--mode", mode,
-             "-o", "c.yaml"], env={"RIVET_PERF_URL": url, "RIVET_STATE_URL": ""}, cwd=d)
+             "-o", "c.yaml"], env={"RIVET_PERF_URL": url, "RIVET_STATE_URL": "", "RIVET_GATE_STATE_URL": ""}, cwd=d)
     return d if p.ok else None
 
 
@@ -191,7 +191,7 @@ def _fresh(d: Path) -> None:
 def _batch_path(binary: Path, d: Path, url: str, engine: str, table: str, path: str,
                 rows: int = ROWS, idc: str = "id") -> Sample | None:
     """Warm up, then the minimum of REPS measured runs of one batch path."""
-    env = {"RIVET_PERF_URL": url, "RIVET_STATE_URL": ""}
+    env = {"RIVET_PERF_URL": url, "RIVET_STATE_URL": "", "RIVET_GATE_STATE_URL": ""}
     samples: list[Sample] = []
     for i in range(REPS + 1):
         if path == "incremental":
@@ -289,7 +289,7 @@ def _multi_side(binary: Path, prev: Path, root: Path, url: str, tag: str) -> Sam
         f"INSERT INTO {t} SELECT g, md5(g::text) FROM generate_series(1, {MULTI_ROWS}) g;" for t in tables))
     d = root / f"multi_{tag}"
     d.mkdir()
-    env = {"RIVET_PERF_URL": url, "RIVET_STATE_URL": ""}
+    env = {"RIVET_PERF_URL": url, "RIVET_STATE_URL": "", "RIVET_GATE_STATE_URL": ""}
     try:
         p = run([str(prev), "init", "--source-env", "RIVET_PERF_URL", "--include", f"{pre}*",
                  "--mode", "full", "-o", "c.yaml"], env=env, cwd=d)
@@ -325,7 +325,7 @@ def _load_side(binary: Path, prev: Path, root: Path, url: str, tag: str) -> dict
         table, dset = f"perf_ld_{os.getpid()}_{tag}_{i}", bq_tmp(f"perf_{os.getpid()}_{tag}_{i}")
         d = root / f"load_{tag}_{i}"
         d.mkdir()
-        env = {"RIVET_PERF_URL": url, "RIVET_STATE_URL": ""}
+        env = {"RIVET_PERF_URL": url, "RIVET_STATE_URL": "", "RIVET_GATE_STATE_URL": ""}
         try:
             if not _seed("postgres", url, table, LOAD_ROWS, with_cursor=True):
                 return None
@@ -540,7 +540,7 @@ def _snapshot_side(binary: Path, engine: str, url: str) -> Sample | None:
             eng, work, _ = probe
             _cdc_changes(engine, url, 1)
             want = rows(engine, url, "orc_cdc_probe")
-            s = _timed(binary, work, {"RIVET_STATE_URL": ""}, "run", "-c", "c.yaml",
+            s = _timed(binary, work, {"RIVET_STATE_URL": "", "RIVET_GATE_STATE_URL": ""}, "run", "-c", "c.yaml",
                        probe=url if engine == "postgres" else "")
             got = _declared(work / "output", f"SELECT count(DISTINCT {eng.id_col}) FROM {{parts}}")
             if not s.ok or not want or not got or got[0][0] != want:
@@ -562,7 +562,7 @@ def _conns_side(binary: Path, engine: str, url: str) -> int | None:
     host = u.netloc.rsplit("@", 1)
     via = urllib.parse.urlunsplit(u._replace(netloc=(host[0] + "@" if len(host) == 2 else "")
                                              + f"127.0.0.1:{proxy.port}"))
-    env = {"RIVET_STATE_URL": ""}
+    env = {"RIVET_STATE_URL": "", "RIVET_GATE_STATE_URL": ""}
     try:
         with cdc_probe(engine, url, config_url=via) as probe:
             if probe is None:
@@ -624,7 +624,7 @@ def _batch_conns_side(binary: Path, prev: Path, root: Path, engine: str, url: st
         d = _init_dir(prev, root, f"bconns_{engine}_{mode}_{tag}", via, table, mode)
         if d is None:
             return None
-        env = {"RIVET_PERF_URL": via, "RIVET_STATE_URL": ""}
+        env = {"RIVET_PERF_URL": via, "RIVET_STATE_URL": "", "RIVET_GATE_STATE_URL": ""}
         if run([str(binary), "run", "-c", "c.yaml"], env=env, cwd=d, timeout=None).returncode:
             return None
         _fresh(d)
@@ -670,7 +670,7 @@ def _cdc_side(binary: Path, engine: str, url: str, path: str = "cdc") -> Sample 
     """
     from .cdc import cdc_probe
 
-    env = {"RIVET_STATE_URL": ""}
+    env = {"RIVET_STATE_URL": "", "RIVET_GATE_STATE_URL": ""}
     if path == "cdc-spill":
         env |= {"RIVET_CDC_MAX_TX_ROWS": str(CDC_CHANGES // 20), "RIVET_CDC_SPILL_DIR": "1"}
     with cdc_probe(engine, url) as probe:
@@ -708,7 +708,7 @@ def _cdc20_side(binary: Path, prev: Path, root: Path, url: str, tag: str) -> Sam
                                   "v TEXT);" for t in tables))
     d = root / f"cdc20_{tag}"
     d.mkdir()
-    env = {"RIVET_PERF_URL": url, "RIVET_STATE_URL": ""}
+    env = {"RIVET_PERF_URL": url, "RIVET_STATE_URL": "", "RIVET_GATE_STATE_URL": ""}
     try:
         p = run([str(prev), "init", "--source-env", "RIVET_PERF_URL", "--include", f"pc20_{os.getpid()}_*",
                  "--mode", "cdc", "-o", "c.yaml"], env=env, cwd=d)
@@ -833,7 +833,7 @@ def _ch_load_side(binary: Path, prev: Path, root: Path, url: str, tag: str) -> d
         table, db = f"perf_ch_{os.getpid()}_{tag}_{i}", f"perf_ch_{os.getpid()}_{tag}_{i}"
         d = root / f"chload_{tag}_{i}"
         d.mkdir()
-        env = {"RIVET_PERF_URL": url, "RIVET_STATE_URL": "", "CLICKHOUSE_PASSWORD": CH_AUTH[1]}
+        env = {"RIVET_PERF_URL": url, "RIVET_STATE_URL": "", "RIVET_GATE_STATE_URL": "", "CLICKHOUSE_PASSWORD": CH_AUTH[1]}
         try:
             if not _seed("postgres", url, table, LOAD_ROWS, with_cursor=True):
                 return None

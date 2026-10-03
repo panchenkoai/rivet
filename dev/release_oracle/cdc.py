@@ -1151,7 +1151,7 @@ def _cdc_state_parity(led: Ledger) -> None:
     # ever created, and the comparison SKIPped itself with "state db unreadable"
     # — the parity check quietly absent in exactly the configuration that makes
     # parity worth checking. An empty `RIVET_STATE_URL` pins it.
-    sqlite_only = {"RIVET_STATE_URL": ""}
+    sqlite_only = {"RIVET_STATE_URL": "", "RIVET_GATE_STATE_URL": ""}
     rivet("run", "-c", str(cap1.yaml), env=sqlite_only)
     _cdc_postgres_changes(url)
     rivet("run", "-c", str(cap1.yaml), env=sqlite_only)

@@ -449,7 +449,7 @@ def cdc_load_leg(led: Ledger, prev: Path, root: Path, engine: str, url: str, tz:
 
     try:
         with src:
-            env = {"RIVET_UPG_URL": src.rivet_url, "RIVET_STATE_URL": "", **src.env}
+            env = {"RIVET_UPG_URL": src.rivet_url, "RIVET_STATE_URL": "", "RIVET_GATE_STATE_URL": "", **src.env}
 
             def step(binary: Path, *args: str) -> Proc:
                 return run([str(binary), *args], env=env, cwd=d, timeout=None)

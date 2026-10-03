@@ -413,7 +413,7 @@ def _tolerance(raw: str) -> float:
 # An empty value means "SQLite beside the config" (verified against the PUBLISHED
 # binary, not just the current tree), and `run`'s env MERGES over os.environ, so
 # clearing requires the empty string rather than a missing key.
-_ISOLATED_STATE = {"RIVET_STATE_URL": ""}
+_ISOLATED_STATE = {"RIVET_STATE_URL": "", "RIVET_GATE_STATE_URL": ""}
 
 
 def _regr_psql(url: str, sql: str) -> Proc:
