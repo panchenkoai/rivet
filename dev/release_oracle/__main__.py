@@ -205,6 +205,42 @@ def _gate_modules() -> list[object]:
     return mods + [sys.modules[__name__]]
 
 
+def _raising_stage_self_test() -> None:
+    """A stage whose setup raises records one FAIL row naming it and its first error line; the run still reports NOT RELEASABLE and exits 1."""
+    import contextlib
+    import io
+    import types
+
+    from . import core
+
+    def verify_boom(led: Ledger, engine: str) -> None:
+        raise SystemExit("uv sync in /x/tree failed:\n  × Failed to build `pyarrow==18.1.0`")
+
+    m = types.ModuleType("probe_raising_stage")
+    m.verify_boom = verify_boom
+    m.verify_after = lambda led: led.passed("-", "-", "after", "-", "the next stage still ran")
+    record_stage_runs([m])
+    led = Ledger(colour=False)
+    out = io.StringIO()
+    saved = core.TIMINGS_HISTORY
+    with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(out), \
+            contextlib.redirect_stderr(io.StringIO()):
+        core.TIMINGS_HISTORY = Path(tmp) / "timings.jsonl"
+        try:
+            m.verify_boom(led, "postgres")
+            m.verify_after(led)
+            rc = led.report()
+            wrote = core.TIMINGS_HISTORY.read_text()
+        finally:
+            core.TIMINGS_HISTORY = saved
+    fails = [c for c in led.cells if c.status is Status.FAIL]
+    assert len(fails) == 1 and fails[0].scenario == "verify_boom" and fails[0].engine == "postgres", led.cells
+    assert fails[0].detail == "verify_boom raised SystemExit: uv sync in /x/tree failed:", fails[0].detail
+    assert [c.scenario for c in led.cells] == ["verify_boom", "after"], led.cells
+    assert rc == 1 and "NOT RELEASABLE" in out.getvalue() and '"verdict": "NOT RELEASABLE"' in wrote, (rc, wrote)
+    print("self-test ok: a stage that raises is one FAIL row naming it; the gate still reports and exits 1")
+
+
 def _stages_self_test() -> None:
     """Stage recording counts the rows a stage adds; the end-of-run matrix check fails on a stage that never ran or graded nothing; the real matrix resolves to recorded stages."""
     import types
@@ -228,6 +264,7 @@ def _stages_self_test() -> None:
     record_stage_runs([m])
     m.verify_a(probe)
     assert STAGES_RUN["verify_a"] == 2, "re-recording must not wrap the wrapper"
+    _raising_stage_self_test()
     doc = {
         "preflights": [{"id": "a", "status": "test"}, {"id": "off", "status": "gap"}],
         "infra": [{"id": "undriven", "status": "test"}],

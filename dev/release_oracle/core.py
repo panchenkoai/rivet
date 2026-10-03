@@ -79,7 +79,7 @@ _STAGES_LOCK = threading.Lock()
 
 
 def record_stage_runs(modules: Iterable[object]) -> None:
-    """Wrap every `sc_*` / `verify_*` bound in `modules` so a call records its name and the rows it added to the ledger it was handed."""
+    """Wrap every `sc_*` / `verify_*` bound in `modules` so a call records its name and the rows it added, and a raise becomes a FAIL row instead of ending the gate."""
     for mod in modules:
         for name, fn in list(vars(mod).items()):
             if not (name.startswith(("sc_", "verify_")) and callable(fn)):
@@ -93,6 +93,15 @@ def record_stage_runs(modules: Iterable[object]) -> None:
                 before = len(led.cells) if led else 0
                 try:
                     return _fn(*args, **kw)
+                except (Exception, SystemExit) as e:
+                    if led is None:
+                        raise
+                    import traceback
+                    traceback.print_exc()
+                    eng = args[1] if len(args) > 1 and isinstance(args[1], str) else "-"
+                    first = next((ln for ln in str(e).splitlines() if ln.strip()), "")
+                    led.failed(eng, "-", _name, "-", f"{_name} raised {type(e).__name__}: {first}")
+                    return None
                 finally:
                     added = len(led.cells) - before if led else 0
                     with _STAGES_LOCK:
