@@ -19,23 +19,6 @@ fn conn() -> mysql::PooledConn {
         .expect("mysql conn")
 }
 
-/// The binlog coordinates row: `SHOW BINARY LOG STATUS` (8.2+; 8.4 removed the old form), else `SHOW MASTER STATUS`.
-fn binlog_status(c: &mut mysql::PooledConn) -> mysql::Row {
-    c.query_first("SHOW BINARY LOG STATUS")
-        .or_else(|_| c.query_first("SHOW MASTER STATUS"))
-        .expect("binlog status")
-        .expect("binlog enabled")
-}
-
-/// Current `(binlog_file, pos)` written as the resume checkpoint JSON — so a CDC
-/// run starts from *here* and drains only what happens after.
-fn write_checkpoint(c: &mut mysql::PooledConn, path: &std::path::Path) {
-    let row = binlog_status(c);
-    let file: String = row.get(0).unwrap();
-    let pos: u64 = row.get(1).unwrap();
-    std::fs::write(path, format!(r#"{{"file":"{file}","pos":{pos}}}"#)).unwrap();
-}
-
 /// The CDC rig for this file — ONE builder behind both accessors below.
 fn cdc_rig(tbl: &str, ckpt: &std::path::Path, out: &std::path::Path) -> Rig {
     Rig::mysql_cdc(tbl)
@@ -160,7 +143,9 @@ fn cdc_column_types_match_a_batch_full_export() {
     .unwrap();
 
     let ckpt = d.path().join("cdc.ckpt");
-    write_checkpoint(&mut c, &ckpt);
+    Rig::mysql_cdc(&tbl)
+        .checkpoint_path(ckpt.clone())
+        .pin_binlog_here();
     c.query_drop(format!(
         r#"INSERT INTO {tbl} VALUES (2, 56.78, 9000000001, '{{"k":2}}')"#
     ))
@@ -201,7 +186,9 @@ fn cdc_captures_json_as_valid_json() {
     ))
     .unwrap();
     let ckpt = d.path().join("cdc.ckpt");
-    write_checkpoint(&mut c, &ckpt);
+    Rig::mysql_cdc(&tbl)
+        .checkpoint_path(ckpt.clone())
+        .pin_binlog_here();
     c.query_drop(format!(
         r#"INSERT INTO {tbl} VALUES (1, '{{"a":1,"b":[2,3]}}')"#
     ))
@@ -232,7 +219,9 @@ fn cdc_picks_up_a_column_added_between_runs() {
     c.query_drop(format!("CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"))
         .unwrap();
     let ckpt = d.path().join("cdc.ckpt");
-    write_checkpoint(&mut c, &ckpt);
+    Rig::mysql_cdc(&tbl)
+        .checkpoint_path(ckpt.clone())
+        .pin_binlog_here();
 
     // Run 1: capture a row under the original (id, v) schema.
     c.query_drop(format!("INSERT INTO {tbl} VALUES (1, 10)"))
@@ -277,7 +266,9 @@ fn cdc_throughput_drains_a_large_backlog() {
     c.query_drop(format!("CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"))
         .unwrap();
     let ckpt = d.path().join("cdc.ckpt");
-    write_checkpoint(&mut c, &ckpt);
+    Rig::mysql_cdc(&tbl)
+        .checkpoint_path(ckpt.clone())
+        .pin_binlog_here();
 
     // Seed N changes (1000-row INSERT batches).
     let mut id = 0;
@@ -338,7 +329,9 @@ fn cdc_intra_transaction_updates_get_distinct_seq() {
     c.query_drop(format!("INSERT INTO {tbl} VALUES (1, 0)"))
         .unwrap();
     let ckpt = d.path().join("cdc.ckpt");
-    write_checkpoint(&mut c, &ckpt);
+    Rig::mysql_cdc(&tbl)
+        .checkpoint_path(ckpt.clone())
+        .pin_binlog_here();
 
     // N updates of the SAME row in a SINGLE transaction.
     c.query_drop("START TRANSACTION").unwrap();
@@ -372,7 +365,9 @@ fn cdc_sum_reconciles_across_intra_txn_updates() {
     ))
     .unwrap();
     let ckpt = d.path().join("cdc.ckpt");
-    write_checkpoint(&mut c, &ckpt);
+    Rig::mysql_cdc(&tbl)
+        .checkpoint_path(ckpt.clone())
+        .pin_binlog_here();
 
     for txn in cdc_sum_workload(&tbl) {
         c.query_drop("START TRANSACTION").unwrap();
@@ -465,7 +460,9 @@ fn cdc_crash_after_flush_before_ack_re_reads_on_resume() {
     c.query_drop(format!("CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"))
         .unwrap();
     let ckpt = d.path().join("cdc.ckpt");
-    write_checkpoint(&mut c, &ckpt);
+    Rig::mysql_cdc(&tbl)
+        .checkpoint_path(ckpt.clone())
+        .pin_binlog_here();
     c.query_drop(format!("INSERT INTO {tbl} VALUES (1,10),(2,20)"))
         .unwrap();
 
@@ -2083,7 +2080,9 @@ fn cdc_column_overrides_apply_like_batch() {
     let _guard = Table(tbl.clone());
 
     let ckpt = d.path().join("cdc.ckpt");
-    write_checkpoint(&mut c, &ckpt);
+    Rig::mysql_cdc(&tbl)
+        .checkpoint_path(ckpt.clone())
+        .pin_binlog_here();
     c.query_drop(format!(
         "INSERT INTO {tbl} VALUES (1, 18446744073709551615)"
     ))
@@ -2128,7 +2127,9 @@ fn mysql_cdc_float_override_on_a_decimal_matches_the_servers_double_and_batch() 
     .unwrap();
     let _guard = Table(tbl.clone());
     let ckpt = d.path().join("cdc.ckpt");
-    write_checkpoint(&mut c, &ckpt);
+    Rig::mysql_cdc(&tbl)
+        .checkpoint_path(ckpt.clone())
+        .pin_binlog_here();
     c.query_drop(format!(
         "INSERT INTO {tbl} VALUES (1, 12345.67), (2, -0.10), (3, 0.05), (4, NULL)"
     ))
@@ -3368,7 +3369,9 @@ fn cdc_resume_captures_only_new_changes() {
         .unwrap();
 
     let ckpt = d.path().join("cdc.ckpt");
-    write_checkpoint(&mut c, &ckpt);
+    Rig::mysql_cdc(&tbl)
+        .checkpoint_path(ckpt.clone())
+        .pin_binlog_here();
 
     // First batch of changes, then capture: drains exactly these two.
     c.query_drop(format!("INSERT INTO {tbl} VALUES (1,10),(2,20)"))
@@ -3413,7 +3416,9 @@ fn cdc_run_is_recorded_in_state_db() {
 
     let d = tempfile::tempdir().unwrap();
     let ckpt = d.path().join("cdc.ckpt");
-    write_checkpoint(&mut c, &ckpt);
+    Rig::mysql_cdc(&tbl)
+        .checkpoint_path(ckpt.clone())
+        .pin_binlog_here();
     c.query_drop(format!("INSERT INTO {tbl} VALUES (1,10),(2,20),(3,30)"))
         .unwrap();
     // `census_oracle()` owns the workdir, the destination AND the config placement —
@@ -3614,7 +3619,9 @@ fn cdc_until_current_terminates_under_sustained_writes() {
     c.query_drop(format!("CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"))
         .unwrap();
     let ckpt = d.path().join("cdc.ckpt");
-    write_checkpoint(&mut c, &ckpt); // pin before the backlog
+    Rig::mysql_cdc(&tbl)
+        .checkpoint_path(ckpt.clone())
+        .pin_binlog_here(); // pin before the backlog
 
     // Pre-open backlog: ids 0..30.
     let vals: Vec<String> = (0..30).map(|i| format!("({i},{i})")).collect();
@@ -3769,7 +3776,7 @@ fn roast_mysql_until_current_open_bound_two_runs_lose_nothing() {
     c.query_drop(format!("CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"))
         .unwrap();
     let rig = Rig::mysql_cdc(&tbl);
-    write_checkpoint(&mut c, &rig.checkpoint()); // pin before the backlog
+    rig.pin_binlog_here(); // pin before the backlog
 
     // Pre-open backlog: ids 0..30.
     let vals: Vec<String> = (0..30).map(|i| format!("({i},{i})")).collect();
@@ -4804,7 +4811,9 @@ fn roast_mysql_cdc_cli_max_events_below_a_transaction_still_advances_the_checkpo
 
     let d = tempfile::tempdir().unwrap();
     let ckpt = d.path().join("ck");
-    write_checkpoint(&mut c, &ckpt); // anchor at NOW, so only what follows is in scope
+    Rig::mysql_cdc(&tbl)
+        .checkpoint_path(ckpt.clone())
+        .pin_binlog_here(); // anchor at NOW, so only what follows is in scope
 
     // ONE transaction of five rows — longer than the cap below, and released
     // whole at its XID, so a hard per-event stop lands with no boundary to save.
@@ -6257,7 +6266,9 @@ fn roast_mysql_cdc_cli_rollover_keeps_transactions_whole_and_two_runs_do_not_clo
     let ckpt = d.path().join("ck");
     let out = d.path().join("out");
     std::fs::create_dir_all(&out).unwrap();
-    write_checkpoint(&mut c, &ckpt); // anchor at NOW
+    Rig::mysql_cdc(&tbl)
+        .checkpoint_path(ckpt.clone())
+        .pin_binlog_here(); // anchor at NOW
 
     let ckpt_s = ckpt.to_str().unwrap().to_string();
     let out_s = out.to_str().unwrap().to_string();
@@ -6366,7 +6377,9 @@ fn mysql_cdc_cli_csv_output_is_wired_and_readable() {
     let ckpt = d.path().join("ck");
     let out = d.path().join("out");
     std::fs::create_dir_all(&out).unwrap();
-    write_checkpoint(&mut c, &ckpt);
+    Rig::mysql_cdc(&tbl)
+        .checkpoint_path(ckpt.clone())
+        .pin_binlog_here();
 
     c.query_drop(format!("INSERT INTO {tbl} VALUES (1,1),(2,2),(3,3)"))
         .expect("seed");
@@ -6450,7 +6463,9 @@ fn mysql_cdc_cli_stream_with_a_cap_terminates_and_accepts_a_server_id() {
 
     let d = tempfile::tempdir().unwrap();
     let ckpt = d.path().join("ck");
-    write_checkpoint(&mut c, &ckpt);
+    Rig::mysql_cdc(&tbl)
+        .checkpoint_path(ckpt.clone())
+        .pin_binlog_here();
     // Two transactions, so the soft cap has a boundary to stop at that is NOT the
     // end of the stream — the same activation threshold the bounded-cap test needs.
     c.query_drop(format!("INSERT INTO {tbl} VALUES (1,1),(2,2),(3,3)"))
@@ -6511,7 +6526,9 @@ fn mysql_cdc_cli_stream_with_a_cap_terminates_and_accepts_a_server_id() {
     // bounded run does (its twin: roast_pg_cdc_ndjson_until_current_terminates).
     // `None` here means the watchdog had to kill it — which is the pass.
     let ckpt2 = d.path().join("ck2");
-    write_checkpoint(&mut c, &ckpt2);
+    Rig::mysql_cdc(&tbl)
+        .checkpoint_path(ckpt2.clone())
+        .pin_binlog_here();
     let never = run_rivet_args_bounded(
         &[
             "cdc",
@@ -6574,7 +6591,9 @@ fn mysql_cdc_cli_resolves_the_source_from_env_and_file_alike() {
         let ckpt = d
             .path()
             .join(format!("ck_{}", form.join("_").replace('/', "_")));
-        write_checkpoint(&mut conn(), &ckpt);
+        Rig::mysql_cdc(&tbl)
+            .checkpoint_path(ckpt.clone())
+            .pin_binlog_here();
         // Each form captures the SAME change, written after its own anchor.
         conn()
             .query_drop(format!("INSERT INTO {tbl} VALUES (7,7)"))
@@ -6987,8 +7006,8 @@ fn mysql_cdc_full_row_metadata_maps_a_reorder_by_name_and_stays_quiet() {
 
     let d = tempfile::tempdir().unwrap();
     let ckpt = d.path().join("cdc.ckpt");
-    write_checkpoint(&mut c, &ckpt);
     let rig = Rig::mysql_cdc(&table).checkpoint_path(ckpt.clone());
+    rig.pin_binlog_here();
 
     c.query_drop(format!("INSERT INTO {table} VALUES (1,'AAA','BBB')"))
         .unwrap();
@@ -7369,15 +7388,15 @@ fn mysql_cdc_refuses_a_minimal_backlog_after_the_server_is_switched_to_full() {
     let _meta = RowMetadata::set(&root_url, "FULL");
     let d = tempfile::tempdir().unwrap();
     let ckpt = d.path().join("cdc.ckpt");
-    write_checkpoint(&mut c, &ckpt);
+    let rig = Rig::mysql_cdc(&table)
+        .source_url(&root_url)
+        .checkpoint_path(ckpt.clone());
+    rig.pin_binlog_here();
     let anchored = std::fs::read_to_string(&ckpt).unwrap();
     let file = serde_json::from_str::<serde_json::Value>(&anchored).unwrap()["file"]
         .as_str()
         .unwrap()
         .to_string();
-    let rig = Rig::mysql_cdc(&table)
-        .source_url(&root_url)
-        .checkpoint_path(ckpt.clone());
 
     c.query_drop("SET GLOBAL binlog_row_metadata=MINIMAL")
         .unwrap();
@@ -7521,8 +7540,8 @@ fn roast_mysql_cdc_refuses_a_bare_name_a_second_database_also_holds() {
 
     let d = tempfile::tempdir().unwrap();
     let ckpt = d.path().join("cdc.ckpt");
-    write_checkpoint(&mut c, &ckpt);
     let rig = Rig::mysql_cdc(&table).checkpoint_path(ckpt);
+    rig.pin_binlog_here();
     let said = rig.run_expect_fail();
 
     {
@@ -8903,7 +8922,7 @@ fn an_existing_working_directory_checkpoint_is_not_stranded_by_the_new_resolutio
     // config-relative location has none.
     let by_config = cfg.parent().expect("config dir").join("legacy.ckpt");
     assert!(by_config.is_file(), "run 1 must have written a checkpoint");
-    std::fs::rename(&by_config, cwd.path().join("legacy.ckpt")).expect("move it to the CWD");
+    rig.move_checkpoint(&by_config, &cwd.path().join("legacy.ckpt"), cwd.path());
 
     c.query_drop(format!("INSERT INTO {tbl} VALUES (1,10),(2,20)"))
         .expect("seed between runs");
@@ -9404,9 +9423,8 @@ fn mysql_cdc_a_transaction_past_the_memory_cap_spills_rather_than_failing() {
     // the state DB lives beside the config and the oracle reads from inside a
     // container, so hand-building those paths is the smell the rig removes.
     let rig = Rig::mysql_cdc(&tbl).census_oracle();
-    let ckpt = rig.checkpoint();
     // Anchor FIRST, so the stream starts here and drains only what follows.
-    write_checkpoint(&mut c, &ckpt);
+    rig.pin_binlog_here();
     mysql_seed_one_transaction(&mut c, &tbl, 1..=ROWS);
     mysql_seed_one_transaction(&mut c, &tbl, ROWS + 1..=ROWS + TAIL_TX);
 
@@ -9569,13 +9587,7 @@ fn roast_mysql_cdc_a_rolled_back_myisam_statement_is_framed_as_its_own_transacti
     let rig = Rig::mysql_cdc(&tbl).census_oracle();
     // Anchor BEFORE the churn: MySQL's checkpoint is client-side coordinates, so a
     // run without one re-anchors to "now" and would see neither transaction.
-    let row = binlog_status(&mut c);
-    let (file, pos): (String, u64) = (row.get(0).unwrap(), row.get(1).unwrap());
-    std::fs::write(
-        rig.checkpoint(),
-        format!(r#"{{"file":"{file}","pos":{pos}}}"#),
-    )
-    .unwrap();
+    rig.pin_binlog_here();
 
     mysql_seed_rolled_back_transaction(&mut c, &tbl, 1..=KEPT_BY_MYISAM);
     mysql_seed_one_transaction(&mut c, &tbl, 100..=99 + COMMITTED);
@@ -9752,7 +9764,7 @@ fn mysql_cdc_time_outside_one_day_is_refused_like_batch_and_never_checkpointed()
 
     let rig = Rig::mysql_cdc(&tbl);
     let ckpt = rig.checkpoint();
-    write_checkpoint(&mut c, &ckpt);
+    rig.pin_binlog_here();
     let anchored = std::fs::read(&ckpt).unwrap();
     c.query_drop(format!(
         "INSERT INTO {tbl} VALUES (1, '838:59:59'), (2, '-01:00:00')"

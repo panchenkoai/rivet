@@ -60,9 +60,9 @@ fn setup_and_apply(
     // Checkpoint AFTER clearing, so the capture sees only this case's ops.
     let d = tempfile::tempdir().unwrap();
     let ckpt = d.path().join("ckpt");
-    let row: mysql::Row = c.query_first("SHOW MASTER STATUS").unwrap().unwrap();
-    let (file, pos): (String, u64) = (row.get(0).unwrap(), row.get(1).unwrap());
-    std::fs::write(&ckpt, format!(r#"{{"file":"{file}","pos":{pos}}}"#)).unwrap();
+    Rig::mysql_cdc(table)
+        .checkpoint_path(ckpt.clone())
+        .pin_binlog_here();
 
     let mut expected: HashMap<u32, i32> = HashMap::new();
     for op in ops {

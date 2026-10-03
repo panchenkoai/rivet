@@ -62,6 +62,7 @@ from . import (
     release_path,
     scenarios,
     shared_state,
+    skip_census,
     state_parity,
     tls_downgrade,
     upgrade,
@@ -552,8 +553,6 @@ def _self_test() -> int:
     state_parity_duckdb._self_test()
     print("self-test ok: state parity excludes surrogate keys by rule and compares a reference by content")
     _stages_self_test()
-    from . import skip_census
-
     skip_census._self_test()
     print("\nregression stage (child harness, stand, banner):")
     return regression._self_test()
@@ -1299,6 +1298,8 @@ def main(argv: list[str] | None = None) -> int:
     led = Ledger()
     work = Path(tempfile.mkdtemp(prefix="rivet-oracle-"))
     os.environ["WORK"] = str(work)
+    # Every live test this gate starts appends its rig oracle verdict here; verify_oracle_verdict_census grades it.
+    os.environ["RIVET_ORACLE_LOG"] = str(work / "rivet-oracle.log")
     try:
         from datetime import datetime, timezone
 
@@ -1386,6 +1387,7 @@ def main(argv: list[str] | None = None) -> int:
             ])
         # Last: it runs every live_suite test no cell above already ran.
         live_modules.verify_live_modules(led)
+        skip_census.verify_oracle_verdict_census(led)
         verify_seeded_recall(led, ns.with_seeded_recall)
         verify_no_invariant_violations(led)
         # Only a FULL run can say a known red no longer fires.
