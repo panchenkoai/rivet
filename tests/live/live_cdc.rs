@@ -1787,9 +1787,21 @@ fn pg_initial_snapshot_vanished_slot_fails_loudly_not_recreates() {
         "a vanished slot with a completed snapshot behind it must FAIL, not silently re-anchor"
     );
     let stderr = String::from_utf8_lossy(&res.stderr);
+    // No checkpoint is configured, so the only evidence the anchor step found is the snapshot.
+    let expected = format!(
+        "pg cdc: slot '{slot}' is missing but a prior run completed this export's snapshot (the \
+         state DB's `cdc_snapshot` row or the destination's snapshot/_SUCCESS marker) — the slot \
+         was dropped or invalidated, and the changes since then are no longer in the log. To \
+         re-snapshot: clear the export's `cdc_snapshot` row in the state DB AND delete the \
+         destination's snapshot/_SUCCESS marker (the two done-signals are OR-ed, so leaving \
+         either in place repeats this refusal). If a warehouse load consumes this stream, ALSO \
+         truncate its `<table>__changes` table before the next load. Then re-run: rivet creates \
+         the new slot BEFORE it re-snapshots, so nothing falls between the two (see \
+         cdc-failure-modes.md)."
+    );
     assert!(
-        stderr.contains("slot") && (stderr.contains("missing") || stderr.contains("dropped")),
-        "the failure must explain the vanished slot: {stderr}"
+        stderr.contains(&expected),
+        "the refusal must name the snapshot it found, and only that:\n{stderr}"
     );
 }
 
@@ -2695,9 +2707,22 @@ fn pg_cdc_vanished_slot_with_checkpoint_fails_loudly_not_recreates() {
         "a vanished slot with an existing checkpoint must fail the run, not silently re-create"
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
+    // A changes-only export's drain checks only the checkpoint, so the refusal names it alone.
+    let expected = format!(
+        "pg cdc: slot '{slot}' is missing but the checkpoint file holds a position from a prior \
+         run — the slot was dropped or invalidated, and the changes since then are no longer in \
+         the log. Without a baseline (`initial: snapshot` or `backfill:`), deleting the \
+         checkpoint file re-anchors at the current position and accepts the gap. To re-snapshot \
+         instead: delete the checkpoint file, clear the export's `cdc_snapshot` row in the state \
+         DB AND delete the destination's snapshot/_SUCCESS marker (the two done-signals are \
+         OR-ed, so leaving either in place repeats this refusal). If a warehouse load consumes \
+         this stream, ALSO truncate its `<table>__changes` table before the next load. Then \
+         re-run: rivet creates the new slot BEFORE it re-snapshots, so nothing falls between the \
+         two (see cdc-failure-modes.md)."
+    );
     assert!(
-        stderr.contains("re-snapshot") || stderr.contains("missing"),
-        "the failure must carry the re-snapshot hint, got:\n{stderr}"
+        stderr.contains(&expected),
+        "the refusal must name the checkpoint it found, and only that:\n{stderr}"
     );
 }
 
@@ -5457,7 +5482,8 @@ fn a_pg_failover_to_the_standby_with_a_checkpoint_is_refused_not_resumed_on_a_ne
     let out = run_on(&f.rig, PG_FAILOVER_STANDBY);
     let said = String::from_utf8_lossy(&out.stderr);
     assert!(
-        !out.status.success() && said.contains("is missing but prior-run evidence exists"),
+        !out.status.success()
+            && said.contains("is missing but the checkpoint file holds a position"),
         "the switch to a server without the slot is refused by name:\n{said}"
     );
     assert_eq!(

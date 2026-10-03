@@ -91,6 +91,22 @@ impl ChangeOp {
     }
 }
 
+/// The prior-run evidence a caller checked before a missing server-side anchor is refused.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PriorRun {
+    /// The checkpoint file holds a position.
+    pub(crate) checkpoint: bool,
+    /// A table's snapshot is recorded done (state DB `cdc_snapshot` row or `snapshot/_SUCCESS`).
+    pub(crate) snapshot: bool,
+}
+
+impl PriorRun {
+    /// Whether any evidence of a prior run was found.
+    pub(crate) fn any(self) -> bool {
+        self.checkpoint || self.snapshot
+    }
+}
+
 /// An opaque, engine-shaped resume position — MySQL `{file, pos}`, a PostgreSQL
 /// LSN, a SQL Server LSN. Persisted verbatim as the checkpoint; each engine
 /// interprets its own shape when resuming. Compared only for equality.
@@ -960,26 +976,26 @@ impl CdcEngine {
     /// the checkpoint is pinned at first open, and so are Mongo's resume token
     /// and Oracle's SCN; MSSQL floors at `fn_cdc_get_min_lsn` without one
     /// (over-reads, never skips).
-    /// `resume_expected` = prior-run evidence exists — a missing server-side
-    /// anchor then fails LOUDLY instead of silently re-anchoring at "current".
+    /// `prior` = the prior-run evidence found — any of it makes a missing server-side
+    /// anchor fail LOUDLY instead of silently re-anchoring at "current".
     pub(crate) fn ensure_anchor(
         self,
         url: &str,
         slot: &str,
         checkpoint: Option<&std::path::Path>,
         tls: Option<&crate::config::TlsConfig>,
-        resume_expected: bool,
+        prior: PriorRun,
     ) -> Result<()> {
         match self {
             Self::Postgres => {
                 // Slot creation IS the anchor; open() creates it only on a
-                // genuine FIRST run (resume_expected=false).
+                // genuine FIRST run (no prior-run evidence).
                 // Anchor-only open: it creates the slot and is dropped without
                 // reading, so the peek bound is irrelevant.
                 drop(crate::source::postgres::cdc::PgChangeStream::open(
                     url,
                     slot,
-                    resume_expected,
+                    prior,
                     tls,
                     PeekBound::Unbounded,
                     DrainMode::Continuous, // anchor-only open — never read, no bound to pin
@@ -1007,7 +1023,7 @@ impl CdcEngine {
                 if Position::load(ckpt)?.is_some() {
                     return Ok(()); // anchored already — never move it
                 }
-                if resume_expected {
+                if prior.any() {
                     // Prior-run evidence (a completed snapshot marker) with a
                     // MISSING checkpoint: pinning "current" would silently skip
                     // everything since the loss — and on MSSQL would actively
@@ -1290,12 +1306,16 @@ pub(crate) fn create_change_stream(
             // then MISSING, it was dropped/invalidated and silently recreating it
             // at the current position would skip everything since (a silent gap).
             // Propagate a corrupt/truncated checkpoint (#99): `.ok()` swallowed it
-            // into resume_expected=false, so a dropped slot got silently recreated
+            // into "no checkpoint", so a dropped slot got silently recreated
             // at 'current' and skipped every change since — the anti-gap guard
-            // (missing slot + resume_expected) never fired.
-            let resume_expected = match cfg.checkpoint.as_deref() {
-                Some(p) => Position::load(p)?.is_some(),
-                None => false,
+            // (missing slot + prior-run evidence) never fired. The drain reads the
+            // checkpoint only; the snapshot done-signals are the anchor step's.
+            let prior = PriorRun {
+                checkpoint: match cfg.checkpoint.as_deref() {
+                    Some(p) => Position::load(p)?.is_some(),
+                    None => false,
+                },
+                snapshot: false,
             };
             // The routing check runs inside `open`, on the stream's own connection: its
             // refusals are rivet's own `pg cdc:` / `cdc:` verdicts, which
@@ -1305,7 +1325,7 @@ pub(crate) fn create_change_stream(
                 crate::source::postgres::cdc::PgChangeStream::open(
                     url,
                     slot,
-                    resume_expected,
+                    prior,
                     tls,
                     peek,
                     cfg.drain,
@@ -2231,6 +2251,32 @@ mod mod_decisions {
 }
 
 #[cfg(test)]
+mod prior_run {
+    use super::PriorRun;
+
+    /// `any` is the OR of the two kinds of evidence, over all four combinations.
+    #[test]
+    fn any_is_true_when_either_kind_of_evidence_was_found() {
+        for (checkpoint, snapshot, any) in [
+            (false, false, false),
+            (true, false, true),
+            (false, true, true),
+            (true, true, true),
+        ] {
+            assert_eq!(
+                PriorRun {
+                    checkpoint,
+                    snapshot
+                }
+                .any(),
+                any,
+                "checkpoint={checkpoint} snapshot={snapshot}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod setup_hint_doc_pointers {
     /// cdc.md names the transaction caps and the opt-in spill the adapters actually read.
     #[test]
@@ -2375,7 +2421,7 @@ mod setup_hint {
         let open = crate::source::postgres::cdc::PgChangeStream::open(
             "postgresql://u:p@127.0.0.1:1/db",
             "s",
-            false,
+            super::PriorRun::default(),
             None,
             super::PeekBound::Unbounded,
             super::DrainMode::Continuous,
@@ -2810,7 +2856,10 @@ mod tests {
                     "unused",
                     Some(&missing),
                     None,
-                    true, // resume evidence exists
+                    PriorRun {
+                        checkpoint: false,
+                        snapshot: true,
+                    },
                 )
                 .expect_err("missing checkpoint + evidence must bail, not re-pin");
             let msg = err.to_string();

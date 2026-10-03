@@ -451,7 +451,7 @@ pub(super) fn initial_snapshot_pending(
         Some(p) => crate::source::cdc::Position::load(p)?.is_some(),
         None => false,
     };
-    let (pending_idx, resume_expected) = snapshot_plan(&done_flags, ckpt_resume);
+    let (pending_idx, prior) = snapshot_plan(&done_flags, ckpt_resume);
     // A source the drain's open would refuse is refused here, before the anchor and the
     // snapshot legs write anything (a MySQL 5.7 run left a part and a checkpoint behind).
     if writes_before_the_drain(&pending_idx) {
@@ -467,7 +467,7 @@ pub(super) fn initial_snapshot_pending(
     // The anchor — one entry point; `ensure_anchor` picks the engine's
     // mechanism (idempotent: a present anchor is never moved). After the refusal
     // above, so a refused config leaves no slot or checkpoint behind.
-    engine.ensure_anchor(&url, &slot, ckpt_path.as_deref(), tls, resume_expected)?;
+    engine.ensure_anchor(&url, &slot, ckpt_path.as_deref(), tls, prior)?;
 
     // The anchor STRING for the snapshot stamp (round-10 STRUCT): rendered by
     // the same `Position.0.to_string()` the drain writes into `__pos`, read
@@ -652,22 +652,28 @@ fn writes_before_the_drain(pending_idx: &[usize]) -> bool {
 /// [`initial_snapshot_pending`] so it can be unit-tested. Given, per table in
 /// order, whether its snapshot is already `done` (state DB OR the legacy GCS
 /// marker) and whether a checkpoint position survives (`ckpt_resume`), returns
-/// the indices still PENDING a snapshot and whether the anchor step must treat a
-/// missing server-side anchor as resume evidence.
+/// the indices still PENDING a snapshot and the prior-run evidence the anchor step
+/// must treat a missing server-side anchor against.
 ///
 /// A `done` snapshot is never re-run — the state DB remembers it even after
-/// `cleanup_source` wiped the bucket marker. `resume_expected` is `true` when
-/// ANY prior evidence exists — a live checkpoint OR any done snapshot — so a
+/// `cleanup_source` wiped the bucket marker. The evidence is set when ANY of it
+/// exists — a live checkpoint OR any done snapshot — so a
 /// lost server-side anchor fails LOUD instead of silently re-anchoring at
 /// "current" (finding #28).
-fn snapshot_plan(done_flags: &[bool], ckpt_resume: bool) -> (Vec<usize>, bool) {
+fn snapshot_plan(
+    done_flags: &[bool],
+    ckpt_resume: bool,
+) -> (Vec<usize>, crate::source::cdc::PriorRun) {
     let pending = done_flags
         .iter()
         .enumerate()
         .filter_map(|(i, &done)| (!done).then_some(i))
         .collect();
-    let resume_expected = ckpt_resume || done_flags.iter().any(|&d| d);
-    (pending, resume_expected)
+    let prior = crate::source::cdc::PriorRun {
+        checkpoint: ckpt_resume,
+        snapshot: done_flags.iter().any(|&d| d),
+    };
+    (pending, prior)
 }
 
 /// A multi-table stream lands each table under its own sub-prefix of the
@@ -1669,11 +1675,21 @@ mod tests {
 
     // ── snapshot_plan: the pure `initial: snapshot` decision ─────────────────
 
+    use crate::source::cdc::PriorRun;
+
+    const SNAPSHOT_ONLY: PriorRun = PriorRun {
+        checkpoint: false,
+        snapshot: true,
+    };
+
     #[test]
     fn snapshot_plan_first_run_snapshots_all_with_no_resume_evidence() {
         // Nothing done, no checkpoint → snapshot every table, and this is a
-        // genuine first anchor (resume_expected=false).
-        assert_eq!(snapshot_plan(&[false, false], false), (vec![0, 1], false));
+        // genuine first anchor (no prior-run evidence).
+        assert_eq!(
+            snapshot_plan(&[false, false], false),
+            (vec![0, 1], PriorRun::default())
+        );
     }
 
     #[test]
@@ -1683,7 +1699,7 @@ mod tests {
         // that prior evidence forces the fail-loud anchor guard (#28).
         assert_eq!(
             snapshot_plan(&[true, true], false),
-            (Vec::<usize>::new(), true)
+            (Vec::<usize>::new(), SNAPSHOT_ONLY)
         );
     }
 
@@ -1691,21 +1707,36 @@ mod tests {
     fn snapshot_plan_partial_snapshots_only_the_undone() {
         // One table done, one not → snapshot only the undone; a done sibling is
         // still resume evidence.
-        assert_eq!(snapshot_plan(&[true, false], false), (vec![1], true));
+        assert_eq!(
+            snapshot_plan(&[true, false], false),
+            (vec![1], SNAPSHOT_ONLY)
+        );
     }
 
     #[test]
     fn snapshot_plan_checkpoint_alone_is_resume_evidence() {
         // No snapshot done but a live checkpoint survives → still snapshot (the
         // marker is gone), yet the checkpoint alone makes a lost anchor fail loud.
-        assert_eq!(snapshot_plan(&[false], true), (vec![0], true));
+        assert_eq!(
+            snapshot_plan(&[false], true),
+            (
+                vec![0],
+                PriorRun {
+                    checkpoint: true,
+                    snapshot: false
+                }
+            )
+        );
     }
 
     #[test]
     fn snapshot_plan_no_evidence_is_a_legitimate_first_anchor() {
         // Nothing done, no checkpoint → snapshot, and no evidence means the
         // anchor is a legitimate first anchor, not a loud failure.
-        assert_eq!(snapshot_plan(&[false], false), (vec![0], false));
+        assert_eq!(
+            snapshot_plan(&[false], false),
+            (vec![0], PriorRun::default())
+        );
     }
 
     /// Both arms of the byte-budget supplier — the decision the sink's own test
