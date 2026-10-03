@@ -76,72 +76,74 @@ impl StateStore {
         // Bound, not `CASE WHEN ?4 IS NULL`: Postgres cannot type a parameter from `IS NULL`.
         let key_origin = primary_key_json.as_ref().map(|_| "run".to_string());
         let now = chrono::Utc::now().to_rfc3339();
-        self.execute(
-            "INSERT INTO export_load_spec
-                 (export_name, unit, columns_json, primary_key_json, key_origin,
-                  run_id, origin, captured_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'run', ?7)
-             ON CONFLICT (export_name, unit) DO UPDATE SET
-                 columns_json     = excluded.columns_json,
-                 primary_key_json = CASE
-                     WHEN excluded.primary_key_json IS NOT NULL THEN excluded.primary_key_json
-                     WHEN export_load_spec.key_origin = 'init' THEN export_load_spec.primary_key_json
-                     ELSE NULL END,
-                 key_origin       = CASE
-                     WHEN excluded.primary_key_json IS NOT NULL THEN 'run'
-                     WHEN export_load_spec.key_origin = 'init' THEN 'init'
-                     ELSE NULL END,
-                 run_id           = excluded.run_id,
-                 origin           = excluded.origin,
-                 captured_at      = excluded.captured_at",
-            &[
-                export_name.into(),
-                unit.unwrap_or("").into(),
-                columns_json.clone().into(),
-                primary_key_json.clone().into(),
-                key_origin.into(),
-                run_id.into(),
-                now.clone().into(),
-            ],
-        )?;
-        // The same spec under ITS run: what `rivet load` pins a plan to, so a
-        // same-named export of another config sharing this state DB cannot type it.
-        // The run row references a deduplicated version instead of copying the spec.
-        let spec_match = "export_name = ?1 AND unit = ?2 AND columns_json = ?3
-                 AND COALESCE(primary_key_json, '') = COALESCE(?4, '')";
-        self.execute(
-            &format!(
-                "INSERT INTO load_spec_version
-                     (export_name, unit, columns_json, primary_key_json, captured_at)
-                 SELECT ?1, ?2, ?3, ?4, ?5
-                 WHERE NOT EXISTS (SELECT 1 FROM load_spec_version WHERE {spec_match})"
-            ),
-            &[
-                export_name.into(),
-                unit.unwrap_or("").into(),
-                columns_json.clone().into(),
-                primary_key_json.clone().into(),
-                now.clone().into(),
-            ],
-        )?;
-        self.execute(
-            &format!(
-                "INSERT INTO export_load_spec_run (export_name, unit, run_id, spec_id, captured_at)
-                 VALUES (?1, ?2, ?6, (SELECT MAX(spec_id) FROM load_spec_version WHERE {spec_match}), ?5)
-                 ON CONFLICT (export_name, unit, run_id) DO UPDATE SET
-                     spec_id     = excluded.spec_id,
-                     captured_at = excluded.captured_at"
-            ),
-            &[
-                export_name.into(),
-                unit.unwrap_or("").into(),
-                columns_json.into(),
-                primary_key_json.into(),
-                now.into(),
-                run_id.into(),
-            ],
-        )?;
-        Ok(())
+        self.transaction(|| {
+            self.execute(
+                "INSERT INTO export_load_spec
+                     (export_name, unit, columns_json, primary_key_json, key_origin,
+                      run_id, origin, captured_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'run', ?7)
+                 ON CONFLICT (export_name, unit) DO UPDATE SET
+                     columns_json     = excluded.columns_json,
+                     primary_key_json = CASE
+                         WHEN excluded.primary_key_json IS NOT NULL THEN excluded.primary_key_json
+                         WHEN export_load_spec.key_origin = 'init' THEN export_load_spec.primary_key_json
+                         ELSE NULL END,
+                     key_origin       = CASE
+                         WHEN excluded.primary_key_json IS NOT NULL THEN 'run'
+                         WHEN export_load_spec.key_origin = 'init' THEN 'init'
+                         ELSE NULL END,
+                     run_id           = excluded.run_id,
+                     origin           = excluded.origin,
+                     captured_at      = excluded.captured_at",
+                &[
+                    export_name.into(),
+                    unit.unwrap_or("").into(),
+                    columns_json.clone().into(),
+                    primary_key_json.clone().into(),
+                    key_origin.into(),
+                    run_id.into(),
+                    now.clone().into(),
+                ],
+            )?;
+            // The same spec under ITS run: what `rivet load` pins a plan to, so a
+            // same-named export of another config sharing this state DB cannot type it.
+            // The run row references a deduplicated version instead of copying the spec.
+            let spec_match = "export_name = ?1 AND unit = ?2 AND columns_json = ?3
+                     AND COALESCE(primary_key_json, '') = COALESCE(?4, '')";
+            self.execute(
+                &format!(
+                    "INSERT INTO load_spec_version
+                         (export_name, unit, columns_json, primary_key_json, captured_at)
+                     SELECT ?1, ?2, ?3, ?4, ?5
+                     WHERE NOT EXISTS (SELECT 1 FROM load_spec_version WHERE {spec_match})"
+                ),
+                &[
+                    export_name.into(),
+                    unit.unwrap_or("").into(),
+                    columns_json.clone().into(),
+                    primary_key_json.clone().into(),
+                    now.clone().into(),
+                ],
+            )?;
+            self.execute(
+                &format!(
+                    "INSERT INTO export_load_spec_run (export_name, unit, run_id, spec_id, captured_at)
+                     VALUES (?1, ?2, ?6, (SELECT MAX(spec_id) FROM load_spec_version WHERE {spec_match}), ?5)
+                     ON CONFLICT (export_name, unit, run_id) DO UPDATE SET
+                         spec_id     = excluded.spec_id,
+                         captured_at = excluded.captured_at"
+                ),
+                &[
+                    export_name.into(),
+                    unit.unwrap_or("").into(),
+                    columns_json.into(),
+                    primary_key_json.into(),
+                    now.into(),
+                    run_id.into(),
+                ],
+            )?;
+            Ok(())
+        })
     }
 
     /// The spec `run_id` recorded for one unit — `None` for a run that predates the
@@ -297,6 +299,24 @@ mod tests {
             nullable: true,
             warnings: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_spec_whose_per_run_row_fails_records_nothing() {
+        let s = StateStore::open_in_memory().unwrap();
+        s.exec_for_test(
+            "CREATE TRIGGER fail_run_row BEFORE INSERT ON export_load_spec_run \
+             BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+        );
+        s.record_load_spec(
+            "orders",
+            None,
+            &[col("id", RivetType::Int64)],
+            None,
+            "run_1",
+        )
+        .unwrap_err();
+        assert!(s.load_spec("orders", None).unwrap().is_none());
     }
 
     #[test]

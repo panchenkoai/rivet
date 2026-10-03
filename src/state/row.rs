@@ -12,10 +12,13 @@
 //! [`StateStore::query`] / [`query_opt`] / [`execute`] run a statement on the
 //! right backend so a caller writes its SQL + params + ONE extraction closure.
 //!
+//! [`StateStore::transaction`] is the seam's unit of work: seam statements run
+//! inside its closure commit together or not at all, on either backend.
+//!
 //! Methods whose two arms have genuinely DIVERGENT SQL (not just placeholder
-//! style) — e.g. `claim_next_chunk_task`'s `FOR UPDATE SKIP LOCKED`, the
-//! batch-vs-loop inserts — keep their explicit two-arm match; this seam is for the
-//! ~40-50 sites that differ only in dialect ceremony.
+//! style) — `claim_next_chunk_task`'s `FOR UPDATE SKIP LOCKED` vs SQLite's rowid +
+//! IMMEDIATE transaction — keep their explicit two-arm match; this seam is for
+//! every site that differs only in dialect ceremony.
 
 use crate::error::Result;
 
@@ -224,6 +227,41 @@ impl StateStore {
             }
         }
     }
+
+    /// Run `work` as one unit of work: its statements commit together on `Ok` and roll back on `Err` or panic; a nested call joins the open one.
+    pub(super) fn transaction<T>(&self, work: impl FnOnce() -> Result<T>) -> Result<T> {
+        if self.in_tx.get() {
+            return work();
+        }
+        self.batch("BEGIN")?;
+        self.in_tx.set(true);
+        let open = OpenTx(self);
+        let out = work()?;
+        self.batch("COMMIT")?;
+        self.in_tx.set(false);
+        drop(open);
+        Ok(out)
+    }
+
+    /// Run a parameterless statement on the active backend.
+    fn batch(&self, sql: &str) -> Result<()> {
+        match &self.conn {
+            StateConn::Sqlite(c) => Ok(c.execute_batch(sql)?),
+            StateConn::Postgres(client) => Ok(client.borrow_mut().batch_execute(sql)?),
+        }
+    }
+}
+
+/// An open unit of work; dropping it before `COMMIT` succeeded rolls the transaction back.
+struct OpenTx<'a>(&'a StateStore);
+
+impl Drop for OpenTx<'_> {
+    /// Roll back when the unit of work did not commit.
+    fn drop(&mut self) {
+        if self.0.in_tx.replace(false) {
+            let _ = self.0.batch("ROLLBACK");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -303,5 +341,77 @@ mod tests {
             }),
             "state column e is text, not an integer (INT2/INT4/INT8)"
         );
+    }
+
+    const INSERT: &str = "INSERT INTO export_state (export_name, last_cursor_value, last_run_at) \
+                          VALUES (?1, NULL, 'now')";
+
+    /// Rows in `export_state`, as `store` sees them.
+    fn count(store: &StateStore) -> i64 {
+        store
+            .query_opt("SELECT COUNT(*) FROM export_state", &[], |r| r.i64(0))
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn a_committed_unit_of_work_is_visible_to_another_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let a = StateStore::open_at_path(&path).unwrap();
+        a.transaction(|| {
+            a.execute(INSERT, &["x".into()])?;
+            a.execute(INSERT, &["y".into()])?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(count(&StateStore::open_at_path(&path).unwrap()), 2);
+    }
+
+    #[test]
+    fn a_failed_unit_of_work_rolls_back_its_earlier_statements() {
+        let s = StateStore::open_in_memory().unwrap();
+        let r = s.transaction(|| -> Result<()> {
+            s.execute(INSERT, &["a".into()])?;
+            Err(anyhow::anyhow!("the second statement failed"))
+        });
+        assert!(r.is_err());
+        assert_eq!(count(&s), 0, "the first statement must not survive");
+        s.transaction(|| s.execute(INSERT, &["b".into()]).map(drop))
+            .unwrap();
+        assert_eq!(count(&s), 1, "the store opens a fresh unit afterwards");
+    }
+
+    #[test]
+    fn a_nested_unit_of_work_joins_the_outer_one() {
+        let s = StateStore::open_in_memory().unwrap();
+        let r = s.transaction(|| -> Result<()> {
+            s.transaction(|| s.execute(INSERT, &["inner".into()]).map(drop))?;
+            Err(anyhow::anyhow!(
+                "the outer unit fails after the inner one returned"
+            ))
+        });
+        assert!(r.is_err());
+        assert_eq!(
+            count(&s),
+            0,
+            "the inner write rolls back with the outer unit"
+        );
+    }
+
+    #[test]
+    fn a_panicking_unit_of_work_rolls_back_and_the_store_stays_usable() {
+        let s = StateStore::open_in_memory().unwrap();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = s.transaction(|| -> Result<()> {
+                s.execute(INSERT, &["p".into()])?;
+                panic!("worker panicked mid-unit")
+            });
+        }));
+        assert!(r.is_err());
+        assert_eq!(count(&s), 0);
+        s.transaction(|| s.execute(INSERT, &["after".into()]).map(drop))
+            .unwrap();
+        assert_eq!(count(&s), 1);
     }
 }

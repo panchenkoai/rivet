@@ -534,3 +534,46 @@ fn pg_several_writers_migrating_one_database_at_once_all_succeed() {
          these versions have duplicate rows (version, times applied): {dupes:?}"
     );
 }
+
+/// A chunk run whose task insert fails on Postgres leaves no `in_progress` run behind: the
+/// state store's unit of work rolls the run row back with the failed task rows.
+#[test]
+#[ignore]
+fn pg_a_chunk_run_whose_task_insert_fails_is_not_left_open() {
+    let Ok(admin_url) = std::env::var("RIVET_TEST_STATE_URL") else {
+        return crate::common::skip_live("RIVET_TEST_STATE_URL unset");
+    };
+    if !admin_url.starts_with("postgres") {
+        return crate::common::skip_live("RIVET_TEST_STATE_URL is not a postgres URL");
+    }
+    let name = format!(
+        "rivet_uow_{}",
+        chrono::Utc::now().timestamp_micros().unsigned_abs()
+    );
+    let Some(scratch) = ScratchDb::create(&admin_url, &name) else {
+        return;
+    };
+    let s = StateStore::open_at_ref(&StateRef::Postgres(scratch.url())).unwrap();
+    let mut client = postgres::Client::connect(&scratch.url(), postgres::NoTls).unwrap();
+    client
+        .batch_execute(
+            "CREATE FUNCTION fail_task() RETURNS trigger LANGUAGE plpgsql AS \
+             $$ BEGIN RAISE EXCEPTION 'injected task insert failure'; END $$;
+             CREATE TRIGGER fail_task BEFORE INSERT ON chunk_task \
+             FOR EACH ROW EXECUTE FUNCTION fail_task();",
+        )
+        .unwrap();
+    s.open_chunk_run("run-1", "orders", "h", 3, &[(1, 10), (11, 20)])
+        .unwrap_err();
+    assert!(
+        s.find_in_progress_chunk_run("orders").unwrap().is_none(),
+        "the chunk_run row must roll back with its failed task insert"
+    );
+
+    client
+        .batch_execute("DROP TRIGGER fail_task ON chunk_task;")
+        .unwrap();
+    s.open_chunk_run("run-2", "orders", "h", 3, &[(1, 10), (11, 20)])
+        .unwrap();
+    assert_eq!(s.count_chunk_tasks_total("run-2").unwrap(), 2);
+}

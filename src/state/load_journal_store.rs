@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use crate::error::Result;
 
-use super::{StateConn, StateStore};
+use super::StateStore;
 
 /// One `rivet load` invocation's ledger record: the `load_run` audit row plus
 /// the extraction `source_run_ids` it consumed (written into `loaded_source_run`
@@ -63,103 +63,57 @@ impl StateStore {
         // leave its runs retryable, never mark them loaded (else their data is
         // skipped on every subsequent load).
         let mark_loaded = rec.status == LoadStatus::Success.as_str();
-        match &self.conn {
-            StateConn::Sqlite(c) => {
-                // One transaction: the audit row + the skip-set rows commit
-                // together, so a crash mid-write never leaves a `success` load_run
-                // with a PARTIAL loaded_source_run (which would re-select the
-                // unmarked runs next load).
-                let tx = c.unchecked_transaction()?;
-                tx.execute(
-                    "INSERT OR REPLACE INTO load_run
-                       (load_id, export_name, target_table, warehouse, mode,
-                        source_run_ids, rows_loaded, status, finished_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                    rusqlite::params![
-                        rec.load_id,
-                        rec.export_name,
-                        rec.target_table,
-                        rec.warehouse,
-                        rec.mode,
-                        run_ids_json,
-                        rec.rows_loaded,
-                        rec.status,
-                        rec.finished_at,
-                    ],
-                )?;
-                if mark_loaded {
-                    for rid in &rec.source_run_ids {
-                        tx.execute(
-                            "INSERT OR REPLACE INTO loaded_source_run
-                               (target_table, source_run_id, load_id, loaded_at, source_ident)
-                             VALUES (?1, ?2, ?3, ?4, ?5)",
-                            rusqlite::params![
-                                rec.target_table,
-                                rid,
-                                rec.load_id,
-                                rec.finished_at,
-                                rec.source_ident,
-                            ],
-                        )?;
-                    }
+        // One transaction: the audit row and the skip-set rows commit together, so a
+        // crash mid-write never leaves a `success` load_run with a PARTIAL skip set.
+        self.transaction(|| {
+            self.execute(
+                "INSERT INTO load_run
+                   (load_id, export_name, target_table, warehouse, mode,
+                    source_run_ids, rows_loaded, status, finished_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT (load_id) DO UPDATE SET
+                     export_name    = excluded.export_name,
+                     target_table   = excluded.target_table,
+                     warehouse      = excluded.warehouse,
+                     mode           = excluded.mode,
+                     source_run_ids = excluded.source_run_ids,
+                     rows_loaded    = excluded.rows_loaded,
+                     status         = excluded.status,
+                     finished_at    = excluded.finished_at",
+                &[
+                    rec.load_id.as_str().into(),
+                    rec.export_name.as_str().into(),
+                    rec.target_table.as_str().into(),
+                    rec.warehouse.as_str().into(),
+                    rec.mode.as_str().into(),
+                    run_ids_json.as_str().into(),
+                    rec.rows_loaded.into(),
+                    rec.status.as_str().into(),
+                    rec.finished_at.as_str().into(),
+                ],
+            )?;
+            if mark_loaded {
+                for rid in &rec.source_run_ids {
+                    self.execute(
+                        "INSERT INTO loaded_source_run
+                           (target_table, source_run_id, load_id, loaded_at, source_ident)
+                         VALUES (?1, ?2, ?3, ?4, ?5)
+                         ON CONFLICT (target_table, source_run_id) DO UPDATE SET
+                             load_id      = excluded.load_id,
+                             loaded_at    = excluded.loaded_at,
+                             source_ident = excluded.source_ident",
+                        &[
+                            rec.target_table.as_str().into(),
+                            rid.as_str().into(),
+                            rec.load_id.as_str().into(),
+                            rec.finished_at.as_str().into(),
+                            rec.source_ident.as_str().into(),
+                        ],
+                    )?;
                 }
-                tx.commit()?;
             }
-            StateConn::Postgres(client) => {
-                // One transaction (mirrors the SQLite arm): the audit row and the
-                // skip-set rows commit atomically.
-                let mut c = client.borrow_mut();
-                let mut tx = c.transaction()?;
-                tx.execute(
-                    "INSERT INTO load_run
-                       (load_id, export_name, target_table, warehouse, mode,
-                        source_run_ids, rows_loaded, status, finished_at)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                     ON CONFLICT (load_id) DO UPDATE SET
-                         export_name    = excluded.export_name,
-                         target_table   = excluded.target_table,
-                         warehouse      = excluded.warehouse,
-                         mode           = excluded.mode,
-                         source_run_ids = excluded.source_run_ids,
-                         rows_loaded    = excluded.rows_loaded,
-                         status         = excluded.status,
-                         finished_at    = excluded.finished_at",
-                    &[
-                        &rec.load_id,
-                        &rec.export_name,
-                        &rec.target_table,
-                        &rec.warehouse,
-                        &rec.mode,
-                        &run_ids_json,
-                        &rec.rows_loaded,
-                        &rec.status,
-                        &rec.finished_at,
-                    ],
-                )?;
-                if mark_loaded {
-                    for rid in &rec.source_run_ids {
-                        tx.execute(
-                            "INSERT INTO loaded_source_run
-                               (target_table, source_run_id, load_id, loaded_at, source_ident)
-                             VALUES ($1, $2, $3, $4, $5)
-                             ON CONFLICT (target_table, source_run_id) DO UPDATE SET
-                                 load_id      = excluded.load_id,
-                                 loaded_at    = excluded.loaded_at,
-                                 source_ident = excluded.source_ident",
-                            &[
-                                &rec.target_table,
-                                rid,
-                                &rec.load_id,
-                                &rec.finished_at,
-                                &rec.source_ident,
-                            ],
-                        )?;
-                    }
-                }
-                tx.commit()?;
-            }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// The extraction run_ids already loaded into `target_table` — the skip set
@@ -364,6 +318,18 @@ mod tests {
             s.loaded_source_idents("p.d.other").unwrap().is_empty(),
             "an unidentified load must not manufacture a phantom owner"
         );
+    }
+
+    #[test]
+    fn a_load_whose_skip_set_write_fails_records_nothing() {
+        let s = StateStore::open_in_memory().unwrap();
+        s.exec_for_test(
+            "CREATE TRIGGER fail_mark BEFORE INSERT ON loaded_source_run \
+             BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+        );
+        s.store_load(&rec("L1", "p.d.t", &["r1"], 10, "success"))
+            .unwrap_err();
+        assert!(s.recent_loads(Some("p.d.t"), 10).unwrap().is_empty());
     }
 
     #[test]
