@@ -475,6 +475,37 @@ struct Captured {
     ev_table: String,
     columns: Vec<(String, ColKind)>,
     names: Arc<[String]>,
+    /// Whether a row keeps its ROWID for a whole transaction: a heap table without row movement.
+    rowid_stable: bool,
+}
+
+/// A mined change's row identity: its ROWID on a table where it is stable, `None` elsewhere.
+pub(crate) fn row_identity(
+    rowid: Option<&str>,
+    stable: bool,
+    owner: &str,
+    table: &str,
+) -> Result<Option<String>> {
+    if !stable {
+        return Ok(None);
+    }
+    match rowid {
+        Some(r)
+            if !r
+                .get(6..)
+                .is_some_and(|tail| tail.bytes().all(|b| b == b'A')) =>
+        {
+            Ok(Some(r.to_string()))
+        }
+        other => crate::rivet_bail!(
+            crate::error::codes::SOURCE_CDC_UNDECODABLE,
+            "oracle cdc: LogMiner gave a change to heap table `{owner}.{table}` no row id ({}). \
+             rivet pairs the key moves of one statement by it, so it refuses rather than guess. \
+             Re-snapshot the table (delete the checkpoint first so the stream anchors, then \
+             snapshot).",
+            other.unwrap_or("NULL")
+        ),
+    }
 }
 
 /// The configured `[owner.]table` split the way routing compares it.
@@ -603,6 +634,16 @@ fn resolve_tables(conn: &Connection, configured: &[String]) -> Result<Vec<Captur
         );
         let (ev_schema, ev_table) = event_spelling(cfg);
         let names: Arc<[String]> = columns.iter().map(|(n, _)| n.clone()).collect();
+        let rowid_stable = scalar(
+            conn,
+            &format!(
+                "SELECT CASE WHEN row_movement = 'DISABLED' AND iot_type IS NULL THEN 'Y' END \
+                   FROM all_tables WHERE owner = {} AND table_name = {}",
+                lit(&o),
+                lit(&t)
+            ),
+        )?
+        .is_some();
         out.push(Captured {
             owner: o,
             table: t,
@@ -610,6 +651,7 @@ fn resolve_tables(conn: &Connection, configured: &[String]) -> Result<Vec<Captur
             ev_table,
             columns,
             names,
+            rowid_stable,
         });
     }
     Ok(out)
@@ -807,6 +849,7 @@ fn contents_sql(tables: &[Captured], con_name: &str, after_commit: u64) -> Strin
         "TO_CHAR(STATUS)".into(),
         "INFO".into(),
         "CASE WHEN OPERATION = 'DDL' THEN SQL_REDO END".into(),
+        "ROW_ID".into(),
     ];
     for j in 0..slots {
         select.push(per_slot(j, &|s| {
@@ -1059,7 +1102,7 @@ impl OracleChangeStream {
         let mut before = Vec::with_capacity(t.columns.len());
         let mut after = Vec::with_capacity(t.columns.len());
         for (j, (name, kind)) in t.columns.iter().enumerate() {
-            let present: u8 = text(9 + 3 * j)?.and_then(|s| s.parse().ok()).unwrap_or(0);
+            let present: u8 = text(10 + 3 * j)?.and_then(|s| s.parse().ok()).unwrap_or(0);
             let (b, a) = image_sides(op, present).ok_or_else(|| {
                 anyhow::anyhow!(
                     "oracle cdc: a {op:?} of `{owner}.{table}` carries no value for {name} — its \
@@ -1069,7 +1112,7 @@ impl OracleChangeStream {
                 )
             })?;
             let value = |side: Side| -> Result<RivetValue> {
-                let raw = text(if side == Side::Redo { 10 } else { 11 } + 3 * j)?;
+                let raw = text(if side == Side::Redo { 11 } else { 12 } + 3 * j)?;
                 match raw {
                     None => Ok(RivetValue::Null),
                     Some(s) => decode(*kind, &s)
@@ -1084,6 +1127,7 @@ impl OracleChangeStream {
             }
         }
         let commit: u64 = text(0)?.and_then(|s| s.parse().ok()).unwrap_or(0);
+        let row_id = row_identity(text(9)?.as_deref(), t.rowid_stable, &owner, &table)?;
         Ok(Mined {
             commit,
             sequence: text(1)?.and_then(|s| s.parse().ok()).unwrap_or(0),
@@ -1099,6 +1143,8 @@ impl OracleChangeStream {
                 image_names: Some(Arc::clone(&t.names)),
                 seq: 0,
                 poison: None,
+                row_id,
+                before_names: None,
             },
         })
     }
@@ -1794,6 +1840,27 @@ mod tests {
             RivetValue::Bytes(b"it's, \"q\" ".to_vec())
         );
         assert!(decode(ColKind::Raw, "xyz").is_err());
+    }
+
+    /// A ROWID rides only a table where it is stable; there a missing or placeholder one is refused.
+    #[test]
+    fn a_row_identity_is_the_rowid_of_a_stable_table_and_its_absence_is_refused() {
+        assert_eq!(
+            row_identity(Some("AAAVrgAAYAABQk7AAB"), true, "R", "T").unwrap(),
+            Some("AAAVrgAAYAABQk7AAB".to_string())
+        );
+        for unstable in [Some("AAAVrgAAYAABQk7AAB"), Some("AAAVrnAAAAAAAAAAAA"), None] {
+            assert_eq!(row_identity(unstable, false, "R", "T").unwrap(), None);
+        }
+        for missing in [None, Some("AAAVrnAAAAAAAAAAAA"), Some("AAAVrn")] {
+            let e = row_identity(missing, true, "R", "T").expect_err("refused");
+            assert_eq!(
+                crate::error::error_code(&e),
+                Some("RIVET_SOURCE_CDC_UNDECODABLE"),
+                "{missing:?}"
+            );
+            assert!(e.to_string().contains("heap table `R.T` no row id"), "{e}");
+        }
     }
 
     #[test]

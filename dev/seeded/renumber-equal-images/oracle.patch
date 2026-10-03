@@ -1,0 +1,13 @@
+diff --git a/src/source/oracle/cdc.rs b/src/source/oracle/cdc.rs
+index 2a4c1db9..ed0e4090 100644
+--- a/src/source/oracle/cdc.rs
++++ b/src/source/oracle/cdc.rs
+@@ -1143,7 +1143,7 @@ impl OracleChangeStream {
+                 image_names: Some(Arc::clone(&t.names)),
+                 seq: 0,
+                 poison: None,
+-                row_id,
++                row_id: row_id.filter(|_| false),
+                 before_names: None,
+             },
+         })

@@ -997,6 +997,8 @@ impl MssqlChangeStream {
                 image_names: Some(std::sync::Arc::from(names)),
                 seq: 0, // stamped by TxnSeq as the stream is consumed
                 poison: None,
+                row_id: None,
+                before_names: None,
             };
             // Memory backstop: a `__$start_lsn` group can be arbitrarily large and is
             // buffered whole. Past the cap the event spills through the general tagged

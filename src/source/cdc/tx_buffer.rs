@@ -350,6 +350,8 @@ mod tests {
             image_names: None,
             seq: 0,
             poison: None,
+            row_id: None,
+            before_names: None,
         }
     }
 

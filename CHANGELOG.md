@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+- **CDC: an UPDATE that changes the key is written as a delete of the old key and an insert
+  of the new row** (ADR-0030, accepted), on PostgreSQL, MySQL and Oracle. SQL Server's change
+  table already did this, and MongoDB's `_id` cannot change.
+  - Before, it was one `update` under the new key. Every latest-image-per-key merge (BigQuery,
+    Snowflake, ClickHouse, the documented `MERGE`) kept the old key live beside the new one,
+    while row counts still reconciled.
+  - The key is the export's declared `load.pk:`, otherwise the table's primary key, read from
+    the source when the run starts. A catalog error there now fails the run. `pk: none` splits
+    nothing. A declared key column the table does not have fails the run at the start.
+  - An UPDATE is a key change only when its old image carries every key column and one
+    differs. A column PostgreSQL's replica identity did not log is absent, never NULL.
+  - The delete and the insert share `__pos`, and the insert's `__seq` comes after the delete's.
+  - An Oracle statement that renumbers keys (`id = id + 1`) keeps every row, told apart by
+    LogMiner's `ROW_ID` on a heap table without row movement. A change there with no `ROW_ID`
+    is refused. On an index-organized table, or one with row movement, a renumber over rows
+    whose non-key values are all equal loses a row.
+  - `rivet cdc` NDJSON stdout does not split. Its `before` stays the old image as the engine
+    logged it. A line whose old image is not the row's columns (PostgreSQL without
+    `REPLICA IDENTITY FULL`) now also has `before_columns`, naming those cells.
+- **PostgreSQL CDC warns about a table whose changes carry no old image.** This covers
+  `REPLICA IDENTITY NOTHING`, no primary key, and a `DEFERRABLE` primary key. On such a table
+  a DELETE retracts nothing downstream, and a key change leaves the old key live. The warning
+  names the table schema-qualified, with its remedy. The existing key-only-delete warning now
+  names what each table's DELETE carries (its primary key, or its replica identity index's
+  columns), instead of saying "the primary key" for every non-FULL table.
+
 - **MySQL CDC `compact` reads the base only in its MERGE.** `rivet compact` merges only the
   partitions its changes name. To catch a row whose partition value changed, it used to look
   every updated key up in the base on every cycle; a pilot paid 2 x 2.2 GiB per large table

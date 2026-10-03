@@ -60,6 +60,8 @@ pub(crate) struct TableOutput<'a> {
     pub partition: Option<crate::plan::rollover::PartitionRollover>,
     /// The partition key a change must not move (base-and-buffer layout only).
     pub partition_guard: Option<super::partition_guard::PartitionGuard>,
+    /// The key the load merges by; an UPDATE that changes it is written as a delete and an insert.
+    pub key: Vec<String>,
     /// Columns this table's `columns:` overrides name; a refused cell of one is an override mismatch.
     pub overridden: std::collections::HashSet<String>,
 }
@@ -132,6 +134,8 @@ struct TableSink<'a> {
     column_sums: std::collections::BTreeMap<String, u64>,
     /// How many of `parts` the last per-roll manifest already declared.
     manifested_parts: usize,
+    /// The open transaction's moved-in keys, which order a statement's key moves.
+    moved: super::partition_guard::MovedIn,
 }
 
 /// The facts one sink run shares across every table and every roll: who it is, how it writes, where it records.
@@ -273,6 +277,7 @@ impl TableSink<'_> {
         self.parts.push(part);
         self.seq += 1;
         self.buf.clear();
+        self.moved.reset();
     }
 }
 
@@ -450,6 +455,7 @@ pub(crate) fn run_to_files(
             seq: 0,
             column_sums: std::collections::BTreeMap::new(),
             manifested_parts: 0,
+            moved: Default::default(),
         })
         .collect();
 
@@ -550,28 +556,26 @@ pub(crate) fn run_to_files(
                         ev.payload_bytes() as u64,
                         std::sync::atomic::Ordering::Relaxed,
                     );
-                    let split = match &sink.out.partition_guard {
-                        Some(g) => super::partition_guard::split_partition_move(
-                            &ev,
-                            g,
-                            &sink.out.columns,
-                            cfg.engine,
-                        )?,
-                        None => None,
-                    };
+                    let split = super::partition_guard::split_move(
+                        &ev,
+                        &sink.out.key,
+                        sink.out.partition_guard.as_ref(),
+                        &sink.out.columns,
+                        cfg.engine,
+                    )?;
                     let routed = match split {
                         Some((delete, mut insert)) => {
                             insert.seq = txn_seq.next(&insert.position);
-                            vec![delete, insert]
+                            vec![(delete, false), (insert, true)]
                         }
-                        None => vec![ev],
+                        None => vec![(ev, false)],
                     };
-                    for ev in routed {
+                    for (ev, moved_in) in routed {
                         // RESIDENT cost for the rollover budget (what the buffer holds); the
                         // bytes-read metric above wants DECODED payload. One `eb` feeding both
                         // silently inflated the metric ~4-13x when the estimate was re-based.
                         total_bytes += ev.estimated_bytes();
-                        sink.buf.push(ev);
+                        sink.moved.push(&mut sink.buf, ev, &sink.out.key, moved_in);
                         total_rows += 1;
                         emitted += 1;
                     }
@@ -1938,6 +1942,8 @@ mod tests {
             image_names: Some(std::sync::Arc::from(vec!["v".to_string()])),
             seq: 0,
             poison: None,
+            row_id: None,
+            before_names: None,
         }
     }
 
@@ -2576,6 +2582,7 @@ mod tests {
                             row_hash: crate::config::RowHash::All(false),
                             partition: None,
                             partition_guard: None,
+                            key: Vec::new(),
                             overridden: Default::default(),
                         },
                         TableOutput {
@@ -2586,6 +2593,7 @@ mod tests {
                             row_hash: crate::config::RowHash::All(false),
                             partition: None,
                             partition_guard: None,
+                            key: Vec::new(),
                             overridden: Default::default(),
                         },
                     ],
@@ -2988,6 +2996,8 @@ mod tests {
             image_names: None,
             seq: 0,
             poison: None,
+            row_id: None,
+            before_names: None,
         };
         let mut cols = vec![
             decimal_col("placeholder", 38, 0), // SQL Server: scale unknown at resolve
@@ -3023,6 +3033,7 @@ mod tests {
                 row_hash: crate::config::RowHash::All(false),
                 partition: None,
                 partition_guard: None,
+                key: Vec::new(),
                 overridden: Default::default(),
             }],
             engine: crate::source::cdc::CdcEngine::Mysql,
@@ -3120,6 +3131,7 @@ mod tests {
                 row_hash: crate::config::RowHash::All(false),
                 partition: None,
                 partition_guard: None,
+                key: Vec::new(),
                 overridden: Default::default(),
             }
         }
@@ -3261,6 +3273,7 @@ mod tests {
                 row_hash: crate::config::RowHash::All(false),
                 partition: None,
                 partition_guard: None,
+                key: Vec::new(),
                 overridden: Default::default(),
             })
             .collect()
@@ -3971,6 +3984,7 @@ mod tests {
                     row_hash: crate::config::RowHash::All(false),
                     partition: None,
                     partition_guard: None,
+                    key: Vec::new(),
                     overridden: Default::default(),
                 },
                 TableOutput {
@@ -3981,6 +3995,7 @@ mod tests {
                     row_hash: crate::config::RowHash::All(false),
                     partition: None,
                     partition_guard: None,
+                    key: Vec::new(),
                     overridden: Default::default(),
                 },
             ],
@@ -4149,11 +4164,84 @@ mod tests {
         }
     }
 
+    /// `(file, v, __op, __pos, __seq)` of every row of every parquet part under `dir`, in file order.
+    fn part_rows(dir: &Path) -> Vec<(String, i64, String, String, i64)> {
+        use arrow::array::{Int64Array, StringArray};
+        let mut files: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|e| e == "parquet"))
+            .collect();
+        files.sort();
+        let mut rows = Vec::new();
+        for path in files {
+            let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+                std::fs::File::open(&path).unwrap(),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+            for b in reader {
+                let b = b.unwrap();
+                let col = |n: &str| b.column(b.schema().index_of(n).unwrap()).clone();
+                let (v, op, pos, seq) = (col("v"), col("__op"), col("__pos"), col("__seq"));
+                let v = v.as_any().downcast_ref::<Int64Array>().unwrap();
+                let op = op.as_any().downcast_ref::<StringArray>().unwrap();
+                let pos = pos.as_any().downcast_ref::<StringArray>().unwrap();
+                let seq = seq.as_any().downcast_ref::<Int64Array>().unwrap();
+                for i in 0..b.num_rows() {
+                    rows.push((
+                        path.display().to_string(),
+                        v.value(i),
+                        op.value(i).into(),
+                        pos.value(i).into(),
+                        seq.value(i),
+                    ));
+                }
+            }
+        }
+        rows
+    }
+
+    /// A key move is a delete then an insert at one position, the insert's `__seq` after, in one part.
+    #[test]
+    fn a_change_that_moves_its_key_is_written_as_a_delete_then_an_insert_in_one_part() {
+        let out = tempfile::tempdir().unwrap();
+        let cols = int_col();
+        let update = |b: i64, a: i64| ChangeEvent {
+            op: ChangeOp::Update,
+            before: Some(vec![RivetValue::Int(b)]),
+            ..insert(a)
+        };
+        let mut stream = FakeStream {
+            events: VecDeque::from(vec![insert(1), update(1, 9), update(9, 9)]),
+            acked: Vec::new(),
+        };
+        let dest = local_dest(&out);
+        let mut c = cfg(dest.as_ref(), &cols, FormatType::Parquet, 1);
+        c.outputs[0].key = vec!["v".into()];
+        run_to_files(&mut stream, c)
+            .1
+            .expect("a key move is delivered");
+
+        let rows = part_rows(out.path());
+        let ops: Vec<(i64, &str)> = rows.iter().map(|r| (r.1, r.2.as_str())).collect();
+        assert_eq!(
+            ops,
+            vec![(1, "insert"), (1, "delete"), (9, "insert"), (9, "update")],
+            "1 -> 9 retracts 1 and inserts 9; 9 -> 9 keeps its key and stays an update"
+        );
+        let (del, ins) = (&rows[1], &rows[2]);
+        assert!(
+            del.0 == ins.0 && del.3 == ins.3 && ins.4 > del.4,
+            "one part, one position, the insert after the delete: {rows:?}"
+        );
+    }
+
     /// An UPDATE that moves its row to another partition of a base-and-buffer table is written as
     /// a delete of the old row and an insert of the new one, the insert ordered after the delete.
     #[test]
     fn a_change_that_moves_its_partition_is_written_as_a_delete_then_an_insert() {
-        use arrow::array::{Array, Int64Array, StringArray};
         let out = tempfile::tempdir().unwrap();
         let cols = int_col();
         let update = |b: i64, a: i64| ChangeEvent {
@@ -4179,36 +4267,10 @@ mod tests {
         let res = run_to_files(&mut stream, c);
         res.1.expect("a partition move is delivered, not refused");
 
-        let mut rows: Vec<(i64, String, String, i64)> = Vec::new();
-        for entry in std::fs::read_dir(out.path()).unwrap() {
-            let path = entry.unwrap().path();
-            if path.extension().is_none_or(|e| e != "parquet") {
-                continue;
-            }
-            let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
-                std::fs::File::open(&path).unwrap(),
-            )
-            .unwrap()
-            .build()
-            .unwrap();
-            for b in reader {
-                let b = b.unwrap();
-                let col = |n: &str| b.column(b.schema().index_of(n).unwrap()).clone();
-                let (v, op, pos, seq) = (col("v"), col("__op"), col("__pos"), col("__seq"));
-                let v = v.as_any().downcast_ref::<Int64Array>().unwrap();
-                let op = op.as_any().downcast_ref::<StringArray>().unwrap();
-                let pos = pos.as_any().downcast_ref::<StringArray>().unwrap();
-                let seq = seq.as_any().downcast_ref::<Int64Array>().unwrap();
-                for i in 0..b.num_rows() {
-                    rows.push((
-                        v.value(i),
-                        op.value(i).into(),
-                        pos.value(i).into(),
-                        seq.value(i),
-                    ));
-                }
-            }
-        }
+        let rows: Vec<(i64, String, String, i64)> = part_rows(out.path())
+            .into_iter()
+            .map(|(_, v, op, pos, seq)| (v, op, pos, seq))
+            .collect();
         let ops: Vec<(i64, &str)> = rows.iter().map(|(v, op, _, _)| (*v, op.as_str())).collect();
         assert_eq!(
             ops,
