@@ -43,6 +43,12 @@ scenarios:
     incremental: { na: "append never issues a truncate, so an empty delta set is inherently a no-op" }
     cdc:         { na: "append never issues a truncate, so an empty run set is inherently a no-op" }
 
+  - id: continued_key_run_loads_as_append
+    what: "a run that continues past its last key on a clean re-run (SQL `keyset_incremental`, Mongo `source.mongo.resume`) carries only the new keys, so it loads by APPEND, never as a latest-run overwrite; the plan and the load read both spellings through one predicate (`plan::build::continued_key`)"
+    full:        { na: "a continued-key run is never planned as full — that IS the defect this row guards" }
+    incremental: { test: a_mongo_resume_export_into_clickhouse_accumulates_every_run }
+    cdc:         { na: "a cdc stream is a change log, not a key-continued batch" }
+
   - id: append_selects_only_unloaded_runs
     what: "append modes load ONLY the runs the ledger has not yet loaded — resolved from manifest parts, with the bucket listing as fallback"
     full:        { na: "full selects the single latest run, not an unloaded set" }

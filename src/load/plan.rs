@@ -439,25 +439,33 @@ pub fn plan_loads(config_path: &str) -> Result<Vec<LoadPlan>> {
 /// delta-style mode fails to COMPILE here until someone picks its load
 /// semantics, instead of silently defaulting to OVERWRITE (the
 /// incremental-overwrite data-loss class).
-pub fn load_mode_of(export: &crate::config::ExportConfig) -> LoadMode {
+pub fn load_mode_of(
+    config: &crate::config::Config,
+    export: &crate::config::ExportConfig,
+) -> LoadMode {
+    use crate::config::ExportMode;
     match export.mode {
-        crate::config::ExportMode::Cdc => LoadMode::Cdc,
-        crate::config::ExportMode::Incremental => LoadMode::Incremental,
-        crate::config::ExportMode::Full => LoadMode::Full, // whole result set
+        ExportMode::Cdc => LoadMode::Cdc,
+        ExportMode::Incremental => LoadMode::Incremental,
         // only the keys past the last run's: a delta, never the whole table
-        crate::config::ExportMode::Chunked if export.keyset_incremental => LoadMode::Incremental,
-        crate::config::ExportMode::Chunked => LoadMode::Full, // parallel full snapshot
-        crate::config::ExportMode::TimeWindow => LoadMode::Full, // the current window, whole
+        ExportMode::Full | ExportMode::Chunked
+            if crate::plan::build::continued_key(config, export).is_some() =>
+        {
+            LoadMode::Incremental
+        }
+        ExportMode::Full => LoadMode::Full,    // whole result set
+        ExportMode::Chunked => LoadMode::Full, // parallel full snapshot
+        ExportMode::TimeWindow => LoadMode::Full, // the current window, whole
     }
 }
 
-/// The column an incremental load's current state is ordered by: the export's cursor, or
-/// the key a `keyset_incremental` export continues past.
-fn load_cursor_column(export: &crate::config::ExportConfig) -> Option<&str> {
-    match export.keyset_incremental {
-        true => export.chunk_by_key.as_deref(),
-        false => export.cursor_column.as_deref(),
-    }
+/// The column an incremental load's current state is ordered by: the key a continued
+/// export seeks past, or the export's cursor.
+fn load_cursor_column<'a>(
+    config: &'a crate::config::Config,
+    export: &'a crate::config::ExportConfig,
+) -> Option<&'a str> {
+    crate::plan::build::continued_key(config, export).or(export.cursor_column.as_deref())
 }
 
 /// One export's effective load settings: the shared section, the export's own `load:`
@@ -505,7 +513,7 @@ pub fn resolved_deleted_flag(
 ) -> bool {
     effective_load(config, export, table)
         .and_then(|eff| eff.deleted_flag)
-        .unwrap_or(matches!(load_mode_of(export), LoadMode::Cdc))
+        .unwrap_or(matches!(load_mode_of(config, export), LoadMode::Cdc))
 }
 
 /// Whether the BASE table this export lands carries `__is_deleted` as data.
@@ -556,7 +564,7 @@ pub fn resolved_layout(
     let eff = effective_load(config, export, table);
     let choice = eff.as_ref().and_then(|eff| eff.layout);
     let compacts = eff.as_ref().is_some_and(|l| l.target.compacts());
-    cdc_layout(export, load_mode_of(export), choice, compacts)
+    cdc_layout(export, load_mode_of(config, export), choice, compacts)
 }
 
 fn cdc_layout(
@@ -818,7 +826,7 @@ fn build_plans_keyed(
         // ExportMode then fails to COMPILE here until someone picks its load
         // semantics, instead of silently defaulting to OVERWRITE (the
         // incremental-overwrite data-loss class).
-        let mode = load_mode_of(export);
+        let mode = load_mode_of(cfg, export);
         if matches!(export.mode, crate::config::ExportMode::TimeWindow) {
             // Full OVERWRITE by design — and said out loud (round-6): each
             // load replaces the warehouse table with the CURRENT window, so
@@ -877,7 +885,7 @@ fn build_plans_keyed(
                 .unwrap_or(matches!(mode, LoadMode::Cdc)),
             load: eff_load,
             mode,
-            cursor_column: load_cursor_column(export).map(folded),
+            cursor_column: load_cursor_column(cfg, export).map(folded),
             pk,
             clustering,
             pinned_run: None,
@@ -3795,13 +3803,19 @@ load:
             (ExportMode::Chunked, false) => LoadMode::Full,
             (ExportMode::Full | ExportMode::TimeWindow, _) => LoadMode::Full,
         };
+        let cfg = crate::config::Config::from_yaml(
+            "source:\n  type: postgres\n  url: \"postgresql://localhost/test\"\n\
+             exports:\n  - name: t\n    table: t\n    format: parquet\n    destination:\n      type: local\n      path: ./o\n",
+        )
+        .unwrap();
         for mode in modes {
             for keyset_incremental in [false, true] {
                 let mut e = crate::config::sample_export("t");
                 e.mode = mode;
                 e.keyset_incremental = keyset_incremental;
+                e.chunk_by_key = Some("id".into());
                 assert_eq!(
-                    load_mode_of(&e),
+                    load_mode_of(&cfg, &e),
                     expected(mode, keyset_incremental),
                     "{mode:?} keyset_incremental={keyset_incremental}"
                 );
@@ -3832,5 +3846,30 @@ load:
         let snapshot = plan("");
         assert_eq!(snapshot.mode, LoadMode::Full);
         assert_eq!(snapshot.cursor_column.as_deref(), Some("ts"));
+    }
+
+    /// A Mongo `source.mongo.resume` export continues past its last `_id` exactly as
+    /// `keyset_incremental` does, so it plans the same append ordered by `_id`.
+    #[test]
+    fn a_mongo_resume_export_plans_an_append_ordered_by_its_id() {
+        let plan = |resume: bool| {
+            let cfg = crate::config::Config::from_yaml(&format!(
+                "source:\n  type: mongo\n  url: \"mongodb://localhost/test\"\n  \
+                 mongo:\n    page_size: 500\n    resume: {resume}\n\
+                 exports:\n  - name: ev\n    table: ev\n    mode: full\n    format: parquet\n    \
+                 destination:\n      type: gcs\n      bucket: b\n      prefix: ev/\n\
+                 load:\n  target: bigquery\n  project: p\n  dataset: d\n"
+            ))
+            .unwrap();
+            let load = cfg.load.clone().unwrap();
+            let reports = vec![report("ev", vec![col("_id", TargetStatus::Ok)])];
+            build_plans(&cfg, &load, reports).unwrap().remove(0)
+        };
+        let resumed = plan(true);
+        assert_eq!(resumed.mode, LoadMode::Incremental);
+        assert_eq!(resumed.cursor_column.as_deref(), Some("_id"));
+        let snapshot = plan(false);
+        assert_eq!(snapshot.mode, LoadMode::Full);
+        assert_eq!(snapshot.cursor_column, None);
     }
 }

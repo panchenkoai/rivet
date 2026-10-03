@@ -273,6 +273,24 @@ pub(crate) fn build_plan_on(
     })
 }
 
+/// The key a clean re-run continues past (SQL `keyset_incremental`, Mongo `source.mongo.resume`), or `None` when every run reads the whole range.
+pub(crate) fn continued_key<'a>(config: &'a Config, export: &'a ExportConfig) -> Option<&'a str> {
+    match export.mode {
+        ExportMode::Chunked if export.keyset_incremental => export.chunk_by_key.as_deref(),
+        ExportMode::Full
+            if config.source.source_type == crate::config::SourceType::Mongo
+                && config
+                    .source
+                    .mongo
+                    .as_ref()
+                    .is_some_and(|m| m.resume && m.page_size.is_some()) =>
+        {
+            Some("_id")
+        }
+        _ => None,
+    }
+}
+
 /// The strategy for `mode: full`. Source-aware: a MongoDB source with
 /// `source.mongo.page_size` reads by `_id`-keyset pages (bounded query time,
 /// per-page parts, the base for parallel `_id`-range reads) instead of one
@@ -288,11 +306,7 @@ fn full_strategy(config: &Config, export: &ExportConfig) -> ExtractionStrategy {
             chunk_size: page.max(1),
             // Resume is opt-in: default keeps `mode: full` re-reading each run.
             checkpoint: mongo.resume,
-            // Mongo `resume` has always meant "continue from the last _id each
-            // run" (incremental-append on an append-only _id stream), so map it to
-            // the incremental opt-in to preserve that behaviour under the
-            // crash-recovery/incremental split.
-            incremental: mongo.resume,
+            incremental: continued_key(config, export).is_some(),
             // `parallel: N` fans N `_id`-range workers (Mongo reader only).
             parallel: export.parallel,
         });
