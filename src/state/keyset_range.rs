@@ -14,7 +14,7 @@
 
 use crate::error::Result;
 
-use super::{StateConn, StateStore, pg_sql};
+use super::StateStore;
 
 /// One persisted range of a parallel keyset run.
 #[derive(Debug, Clone)]
@@ -47,27 +47,29 @@ impl StateStore {
         ranges: &[(Option<String>, Option<String>)],
     ) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
-        self.execute(
-            "DELETE FROM keyset_range WHERE export_name = ?1",
-            &[export_name.into()],
-        )?;
-        for (idx, (lo, hi)) in ranges.iter().enumerate() {
+        self.transaction(|| {
             self.execute(
-                "INSERT INTO keyset_range \
-                 (export_name, run_id, range_index, lo, hi, done, updated_at, key_column) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7)",
-                &[
-                    export_name.into(),
-                    run_id.into(),
-                    (idx as i64).into(),
-                    lo.clone().into(),
-                    hi.clone().into(),
-                    now.as_str().into(),
-                    key_column.into(),
-                ],
+                "DELETE FROM keyset_range WHERE export_name = ?1",
+                &[export_name.into()],
             )?;
-        }
-        Ok(())
+            for (idx, (lo, hi)) in ranges.iter().enumerate() {
+                self.execute(
+                    "INSERT INTO keyset_range \
+                     (export_name, run_id, range_index, lo, hi, done, updated_at, key_column) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7)",
+                    &[
+                        export_name.into(),
+                        run_id.into(),
+                        (idx as i64).into(),
+                        lo.clone().into(),
+                        hi.clone().into(),
+                        now.as_str().into(),
+                        key_column.into(),
+                    ],
+                )?;
+            }
+            Ok(())
+        })
     }
 
     /// Load the persisted ranges for a resuming run, ordered by `range_index`.
@@ -153,56 +155,33 @@ impl StateStore {
         // belonging to ANOTHER run's recovery set left behind by a crash (H1).
         let done_sql = "UPDATE keyset_range SET done = 1, updated_at = ?1 \
              WHERE export_name = ?2 AND range_index = ?3 AND run_id = ?4";
-        match &self.conn {
-            StateConn::Sqlite(conn) => {
-                let tx = conn.unchecked_transaction()?;
-                for p in parts {
-                    tx.execute(
-                        file_sql,
-                        rusqlite::params![
-                            run_id,
-                            export_name,
-                            p.file_name,
-                            p.rows,
-                            p.bytes,
-                            format,
-                            compression,
-                            now
-                        ],
-                    )?;
-                }
-                tx.execute(
-                    done_sql,
-                    rusqlite::params![now, export_name, range_index, run_id],
+        self.transaction(|| {
+            for p in parts {
+                self.execute(
+                    file_sql,
+                    &[
+                        run_id.into(),
+                        export_name.into(),
+                        p.file_name.as_str().into(),
+                        p.rows.into(),
+                        p.bytes.into(),
+                        format.into(),
+                        compression.into(),
+                        now.as_str().into(),
+                    ],
                 )?;
-                tx.commit()?;
             }
-            StateConn::Postgres(client) => {
-                let mut client = client.borrow_mut();
-                let mut tx = client.transaction()?;
-                for p in parts {
-                    tx.execute(
-                        &pg_sql(file_sql),
-                        &[
-                            &run_id,
-                            &export_name,
-                            &p.file_name,
-                            &p.rows,
-                            &p.bytes,
-                            &format,
-                            &compression,
-                            &now,
-                        ],
-                    )?;
-                }
-                tx.execute(
-                    &pg_sql(done_sql),
-                    &[&now, &export_name, &range_index, &run_id],
-                )?;
-                tx.commit()?;
-            }
-        }
-        Ok(())
+            self.execute(
+                done_sql,
+                &[
+                    now.as_str().into(),
+                    export_name.into(),
+                    range_index.into(),
+                    run_id.into(),
+                ],
+            )?;
+            Ok(())
+        })
     }
 }
 
@@ -212,6 +191,44 @@ mod tests {
 
     fn store() -> StateStore {
         StateStore::open_in_memory().expect("in-memory store")
+    }
+
+    #[test]
+    fn a_failed_range_set_rewrite_keeps_the_prior_set() {
+        let s = store();
+        s.persist_keyset_ranges(
+            "exp",
+            "run-1",
+            "id",
+            &[(None, Some("5".into())), (Some("5".into()), None)],
+        )
+        .unwrap();
+        s.exec_for_test(
+            "CREATE TRIGGER fail_range BEFORE INSERT ON keyset_range \
+             BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+        );
+        s.persist_keyset_ranges("exp", "run-2", "id", &[(None, None)])
+            .unwrap_err();
+        assert_eq!(s.load_keyset_ranges("exp", "run-1", "id").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_range_whose_done_flip_fails_records_no_parts() {
+        let s = store();
+        s.persist_keyset_ranges("exp", "run-1", "id", &[(None, None)])
+            .unwrap();
+        s.exec_for_test(
+            "CREATE TRIGGER fail_done BEFORE UPDATE ON keyset_range \
+             BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+        );
+        let part = KeysetRangePart {
+            file_name: "p0.parquet".into(),
+            rows: 3,
+            bytes: 30,
+        };
+        s.commit_keyset_range("run-1", "exp", 0, &[part], "parquet", None)
+            .unwrap_err();
+        assert!(s.get_files(Some("exp"), 10).unwrap().is_empty());
     }
 
     #[test]

@@ -223,6 +223,8 @@ pub struct StateStore {
     pub(super) conn: StateConn,
     /// Serialisable reference for reconnection (parallel chunk workers).
     pub(super) state_ref: StateRef,
+    /// Whether a [`StateStore::transaction`] is open on `conn`.
+    pub(super) in_tx: std::cell::Cell<bool>,
 }
 
 impl StateStore {
@@ -256,6 +258,7 @@ impl StateStore {
                 Ok(Self {
                     conn: StateConn::Sqlite(conn),
                     state_ref: StateRef::Sqlite(db_path.clone()),
+                    in_tx: Default::default(),
                 })
             }
             StateRef::Postgres(url) => Self::open_postgres(url),
@@ -296,6 +299,7 @@ impl StateStore {
         Ok(Self {
             conn: StateConn::Sqlite(conn),
             state_ref: StateRef::Sqlite(db_path),
+            in_tx: Default::default(),
         })
     }
 
@@ -312,6 +316,7 @@ impl StateStore {
         Ok(Self {
             conn: StateConn::Postgres(Box::new(std::cell::RefCell::new(client))),
             state_ref: StateRef::Postgres(url.to_string()),
+            in_tx: Default::default(),
         })
     }
 
@@ -338,6 +343,7 @@ impl StateStore {
         Ok(Self {
             conn: StateConn::Sqlite(conn),
             state_ref: StateRef::Sqlite(std::path::PathBuf::from(":memory:")),
+            in_tx: Default::default(),
         })
     }
 
@@ -376,6 +382,7 @@ impl StateStore {
         Ok(Self {
             conn: StateConn::Sqlite(conn),
             state_ref: StateRef::Sqlite(db_path.to_path_buf()),
+            in_tx: Default::default(),
         })
     }
 }
