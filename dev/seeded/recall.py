@@ -136,10 +136,10 @@ def grade(row: Row, control: dict[str, str], seeded: dict[str, str] | None) -> V
     """CAUGHT iff a cell green on the unpatched tree is red on the patched one; `seeded=None` = the patched tree did not build."""
     if row.na:
         return Verdict(row, NA, row.na)
-    if not row.cells:
-        return Verdict(row, MISSED, "no cell catches this class on this engine")
     if seeded is None:
         return Verdict(row, BROKEN, "the patched tree does not build — a red build is not a catch")
+    if not row.cells:
+        return Verdict(row, MISSED, "no cell catches this class on this engine")
     green = [c for c in row.cells if control.get(c) == "PASS"]
     if not green:
         said = ", ".join(f"{c}={control.get(c, 'ABSENT')}" for c in row.cells)
@@ -193,6 +193,10 @@ def prepare_tree(base: Path) -> tuple[Path, str]:
         main_live = (ROOT / "tests" / ".live-tmp").resolve()
         main_live.mkdir(parents=True, exist_ok=True)
         live.symlink_to(main_live)
+    # The Rig's oracle runs `uv run` in the tree; parallel first uses race to build one .venv.
+    venv = sh(["uv", "sync", "--frozen", "-q"], cwd=tree)
+    if venv.returncode != 0:
+        raise SystemExit(f"uv sync in {tree} failed:\n{venv.stdout}")
     return tree, sha
 
 
@@ -230,7 +234,9 @@ class Cargo:
 
     @staticmethod
     def binaries(cells) -> list[str]:
-        """The nextest binary flags these cells need."""
+        """The nextest binary flags these cells need; a seed with no cells still compiles the library."""
+        if not cells:
+            return ["--lib"]
         flags = []
         if any(not c.startswith(LIB) for c in cells):
             flags += ["--test", "live_suite"]
@@ -288,7 +294,7 @@ def recall(led: Ledger, rows: list[Row]) -> list[Verdict]:
             p = sh(["git", "-C", str(tree), "apply", "--check", str(HERE / r.patch)])
             if p.returncode != 0:
                 verdicts[r] = Verdict(r, STALE, stale_message(r.seed, text, p.stdout))
-    live = [r for r in rows if r not in verdicts and not r.na and r.cells]
+    live = [r for r in rows if r not in verdicts and not r.na]
     control_cells = sorted({c for r in live for c in r.cells})
     control: dict[str, str] = {}
     if control_cells:
@@ -306,10 +312,6 @@ def recall(led: Ledger, rows: list[Row]) -> list[Verdict]:
         cells = sorted({c for r in group for c in r.cells if control.get(c) == "PASS"})
         name = patch.replace("/", "__").removesuffix(".patch")
         led.phase(f"SEED {patch} — {', '.join(r.engine for r in group)} ({len(cells)} control-green cell(s))")
-        if not cells:
-            for r in group:
-                verdicts[r] = grade(r, control, {})
-            continue
         snap = apply_seed(tree, HERE / patch)
         try:
             b = cargo.build(cells, logs / f"{name}.build.log")
@@ -318,7 +320,7 @@ def recall(led: Ledger, rows: list[Row]) -> list[Verdict]:
                 led.bad(f"{why} (see {logs / f'{name}.build.log'})")
                 seeded = None
             else:
-                seeded = cargo.run(cells, logs / f"{name}.log")
+                seeded = cargo.run(cells, logs / f"{name}.log") if cells else {}
         finally:
             restore(tree, snap)
         for r in group:
@@ -406,6 +408,7 @@ def self_test() -> int:
     assert grade(pg, {"t1": "PASS", "t2": "PASS"}, {"t1": "SKIP", "t2": "ABSENT"}).status == MISSED
     assert grade(pg, {"t1": "PASS", "t2": "PASS"}, None).status == BROKEN
     assert grade(Row("s", "mysql", "p.patch", ()), {}, {}).status == MISSED
+    assert grade(Row("s", "mysql", "p.patch", ()), {}, None).status == BROKEN, "a cell-less seed must still compile"
     assert grade(Row("s", "mongo", na="immutable"), {}, {}).status == NA
     sample = (
         "        PASS [   1.0s] (1/4) rivet-cli::live_suite live_a::t1\n"
