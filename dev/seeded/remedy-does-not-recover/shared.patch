@@ -1,0 +1,21 @@
+diff --git a/src/source/cdc/checkpoint_identity.rs b/src/source/cdc/checkpoint_identity.rs
+index 74a80d8b..cd438adb 100644
+--- a/src/source/cdc/checkpoint_identity.rs
++++ b/src/source/cdc/checkpoint_identity.rs
+@@ -4,13 +4,9 @@
+ use crate::error::Result;
+ 
+ /// The re-baseline remedy every CDC data-loss message ends with, in the order the product runs it.
+-pub(crate) const RECOVER: &str = "Re-baseline the stream in one run: delete the checkpoint \
+-     file if there is one; give the export a baseline (`cdc.initial: snapshot` or `backfill:`) if \
+-     it has none, or clear both done-signals of the one it has (its `cdc_snapshot` row in the \
+-     state DB and the destination's snapshot/_SUCCESS marker; either one left in place skips the \
+-     baseline); and if a warehouse load consumes this stream, truncate its `<table>__changes` \
+-     table before the next load. That run anchors FIRST and re-reads the table after, so nothing \
+-     falls between the two. A separate `mode: full` export does not re-baseline the stream.";
++pub(crate) const RECOVER: &str = "Delete the checkpoint so the next run anchors afresh FIRST, \
++     then re-snapshot the tables (`mode: full`): snapshotting first leaves the changes in \
++     between in neither.";
+ 
+ /// What a resume may do given the checkpoint's recorded identity and the server's.
+ #[derive(Debug, PartialEq, Eq)]
