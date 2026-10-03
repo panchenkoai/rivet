@@ -112,12 +112,7 @@ fn cloud_multipart_s3_rotation_distinct_keys_and_all_rows() {
     // List FULL keys from the bucket root (rivet uses `prefix` as a string
     // prefix, not a directory, so the object key is `<prefix><filename>` with no
     // separator). Filter to this run's unique prefix.
-    let list_script = format!(
-        "mc alias set local http://127.0.0.1:9000 {MINIO_ACCESS_KEY} {MINIO_SECRET_KEY} >/dev/null 2>&1 && \
-         mc ls --recursive local/{bucket}"
-    );
-    let ls = std::process::Command::new("docker")
-        .args(["compose", "exec", "-T", "minio", "sh", "-c", &list_script])
+    let ls = minio_mc(&format!("mc ls --recursive local/{bucket}"))
         .output()
         .expect("mc ls");
     assert!(
@@ -139,12 +134,7 @@ fn cloud_multipart_s3_rotation_distinct_keys_and_all_rows() {
     // Download each object via `mc cat` (raw bytes to stdout) and sum rows.
     let mut total = 0usize;
     for key in keys.iter().filter(|k| k.ends_with(".parquet")) {
-        let cat_script = format!(
-            "mc alias set local http://127.0.0.1:9000 {MINIO_ACCESS_KEY} {MINIO_SECRET_KEY} >/dev/null 2>&1 && \
-             mc cat local/{bucket}/{key}"
-        );
-        let cat = std::process::Command::new("docker")
-            .args(["compose", "exec", "-T", "minio", "sh", "-c", &cat_script])
+        let cat = minio_mc(&format!("mc cat local/{bucket}/{key}"))
             .output()
             .expect("mc cat");
         assert!(

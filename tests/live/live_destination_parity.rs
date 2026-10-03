@@ -94,14 +94,11 @@ fn s3_minio_destination_produces_one_parquet_with_all_rows() {
     // Enumerate what MinIO received via `mc ls` inside the container.  This
     // keeps assertions independent of opendal internals and avoids staging
     // a mirror directory via `mc cp` (which is fragile across tmp paths).
-    let script = format!(
-        "mc alias set local http://127.0.0.1:9000 {MINIO_ACCESS_KEY} {MINIO_SECRET_KEY} >/dev/null 2>&1 && \
-         mc ls --recursive local/{bucket}/{prefix} 2>/dev/null"
-    );
-    let ls = std::process::Command::new("docker")
-        .args(["compose", "exec", "-T", "minio", "sh", "-c", &script])
-        .output()
-        .expect("mc ls");
+    let ls = minio_mc(&format!(
+        "mc ls --recursive local/{bucket}/{prefix} 2>/dev/null"
+    ))
+    .output()
+    .expect("mc ls");
     assert!(
         ls.status.success(),
         "mc ls inside minio failed: stderr:\n{}",
@@ -244,22 +241,11 @@ fn destination_parity_row_counts_match_across_local_s3_gcs() {
     // re-downloading.  Simpler: trust that rivet wrote what the RunSummary
     // reported via `--validate` — invoke exports with validate flag; since
     // we already ran once without it, do a cheap check: mc ls.
-    let s3_list_script = format!(
-        "mc alias set local http://127.0.0.1:9000 {MINIO_ACCESS_KEY} {MINIO_SECRET_KEY} >/dev/null 2>&1 && \
-         mc ls local/{s3_bucket}/{s3_prefix} 2>/dev/null | wc -l"
-    );
-    let s3_count_out = std::process::Command::new("docker")
-        .args([
-            "compose",
-            "exec",
-            "-T",
-            "minio",
-            "sh",
-            "-c",
-            &s3_list_script,
-        ])
-        .output()
-        .expect("mc ls");
+    let s3_count_out = minio_mc(&format!(
+        "mc ls local/{s3_bucket}/{s3_prefix} 2>/dev/null | wc -l"
+    ))
+    .output()
+    .expect("mc ls");
     let s3_file_count: usize = String::from_utf8_lossy(&s3_count_out.stdout)
         .trim()
         .parse()

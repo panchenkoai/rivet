@@ -7,33 +7,76 @@ use std::net::TcpStream;
 use std::process::Command;
 
 use super::env::{
-    AZURITE_CONN_STRING, LiveService, MINIO_ACCESS_KEY, MINIO_SECRET_KEY, require_alive,
+    AZURITE_CONN_STRING, LiveService, MINIO_ACCESS_KEY, MINIO_ENDPOINT, MINIO_SECRET_KEY,
+    require_alive,
 };
 
-/// Idempotently create `bucket` in the local MinIO instance via `mc` inside
-/// the running container.  Does nothing if the bucket already exists.
-///
-/// Implementation: `docker compose exec -T minio sh -c "mc alias set ... && mc mb -p local/<bucket>"`.
-/// Uses `-T` so cargo does not fight with the container for a TTY.  Panics
-/// with an actionable message if `docker` is not on PATH — live tests need
-/// it anyway.
+/// Idempotently create `bucket` in the local MinIO; an existing bucket is success.
 pub fn ensure_minio_bucket(bucket: &str) {
     require_alive(LiveService::Minio);
-    let script = format!(
-        "mc alias set local http://127.0.0.1:9000 {MINIO_ACCESS_KEY} {MINIO_SECRET_KEY} >/dev/null 2>&1 && \
-         mc mb -p local/{bucket} >/dev/null 2>&1 || true"
-    );
-    let status = Command::new("docker")
-        .args(["compose", "exec", "-T", "minio", "sh", "-c", &script])
-        .status()
-        .expect(
-            "failed to spawn `docker compose exec minio` — \
-             live tests for S3/MinIO require docker CLI on PATH",
-        );
+    let out = minio_mc(&format!("mc mb --ignore-existing local/{bucket}"))
+        .output()
+        .expect("spawn `docker exec` — live S3/MinIO tests need the docker CLI on PATH");
     assert!(
-        status.success(),
-        "`mc mb local/{bucket}` inside minio container failed with {status}"
+        out.status.success(),
+        "`mc mb --ignore-existing local/{bucket}` in container `{}` failed ({}):\n{}{}",
+        minio_container(),
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// The running container publishing MinIO's host port, found by port so no compose project name is needed.
+pub fn minio_container() -> &'static str {
+    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        let port = MINIO_ENDPOINT
+            .rsplit(':')
+            .next()
+            .expect("MINIO_ENDPOINT has a port");
+        container_for_port(port)
+    })
+}
+
+/// The name of the running container that publishes host `port`; panics naming the port when none does.
+fn container_for_port(port: &str) -> String {
+    let out = Command::new("docker")
+        .args([
+            "ps",
+            "--filter",
+            &format!("publish={port}"),
+            "--format",
+            "{{.Names}}",
+        ])
+        .output()
+        .expect("spawn `docker ps` — live S3/MinIO tests need the docker CLI on PATH");
+    assert!(
+        out.status.success(),
+        "`docker ps --filter publish={port}` failed ({}): {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            panic!(
+                "no running container publishes host port {port} (MinIO, {MINIO_ENDPOINT}) — \
+                 start the stand's `minio` service"
+            )
+        })
+}
+
+/// `docker exec -i <minio> sh -c "mc alias set local … && <mc>"`: an `mc` command against the local MinIO.
+pub fn minio_mc(mc: &str) -> Command {
+    let script = format!(
+        "mc alias set local http://127.0.0.1:9000 {MINIO_ACCESS_KEY} {MINIO_SECRET_KEY} >/dev/null && {mc}"
+    );
+    let mut cmd = Command::new("docker");
+    cmd.args(["exec", "-i", minio_container(), "sh", "-c", &script]);
+    cmd
 }
 
 /// Idempotently create `bucket` in the fake-gcs server via its HTTP API.
@@ -71,12 +114,7 @@ pub fn minio_parquet_total_rows(bucket: &str, prefix: &str) -> usize {
     // and that differs between a directory-style prefix (`prefix/file`) and
     // rivet's string-style concatenation (`prefixfile`). Bucket-level names are
     // always full keys; filter by prefix ourselves.
-    let ls_script = format!(
-        "mc alias set local http://127.0.0.1:9000 {MINIO_ACCESS_KEY} {MINIO_SECRET_KEY} >/dev/null 2>&1 && \
-         mc ls --recursive local/{bucket} 2>/dev/null"
-    );
-    let ls = Command::new("docker")
-        .args(["compose", "exec", "-T", "minio", "sh", "-c", &ls_script])
+    let ls = minio_mc(&format!("mc ls --recursive local/{bucket} 2>/dev/null"))
         .output()
         .expect("mc ls");
     assert!(ls.status.success(), "mc ls failed");
@@ -92,12 +130,7 @@ pub fn minio_parquet_total_rows(bucket: &str, prefix: &str) -> usize {
         if !name.starts_with(prefix) || !name.ends_with(".parquet") {
             continue;
         }
-        let cat_script = format!(
-            "mc alias set local http://127.0.0.1:9000 {MINIO_ACCESS_KEY} {MINIO_SECRET_KEY} >/dev/null 2>&1 && \
-             mc cat local/{bucket}/{name}"
-        );
-        let cat = Command::new("docker")
-            .args(["compose", "exec", "-T", "minio", "sh", "-c", &cat_script])
+        let cat = minio_mc(&format!("mc cat local/{bucket}/{name}"))
             .output()
             .expect("mc cat");
         assert!(cat.status.success(), "mc cat {name} failed");
@@ -243,12 +276,7 @@ pub fn ensure_azure_container(container: &str) {
 /// 1000-row table). Keys keep their sub-prefixes: a CDC destination nests `snapshot/`
 /// and per-table prefixes whose manifest names collide when flattened.
 pub fn minio_pull_prefix(bucket: &str, prefix: &str, into: &std::path::Path) -> usize {
-    let ls_script = format!(
-        "mc alias set local http://127.0.0.1:9000 {MINIO_ACCESS_KEY} {MINIO_SECRET_KEY} >/dev/null 2>&1 && \
-         mc ls --recursive --json local/{bucket}"
-    );
-    let ls = Command::new("docker")
-        .args(["compose", "exec", "-T", "minio", "sh", "-c", &ls_script])
+    let ls = minio_mc(&format!("mc ls --recursive --json local/{bucket}"))
         .output()
         .expect("mc ls");
     let said = format!(
@@ -270,15 +298,12 @@ pub fn minio_pull_prefix(bucket: &str, prefix: &str, into: &std::path::Path) -> 
         .filter(|n| n.starts_with(prefix))
         .collect();
     write_pulled(prefix, into, names, false, |name| {
-        let cat_script = format!(
-            "mc alias set local http://127.0.0.1:9000 {MINIO_ACCESS_KEY} {MINIO_SECRET_KEY} >/dev/null 2>&1 && \
-             mc cat 'local/{bucket}/{}'",
+        let cat = minio_mc(&format!(
+            "mc cat 'local/{bucket}/{}'",
             name.replace('\'', "'\\''")
-        );
-        let cat = Command::new("docker")
-            .args(["compose", "exec", "-T", "minio", "sh", "-c", &cat_script])
-            .output()
-            .expect("mc cat");
+        ))
+        .output()
+        .expect("mc cat");
         assert!(cat.status.success(), "mc cat {name} failed");
         cat.stdout
     })
@@ -539,12 +564,7 @@ pub fn fake_gcs_names(bucket: &str, prefix: &str) -> Vec<String> {
 /// Write `bytes` to `key` in a MinIO bucket through `mc pipe` inside the container.
 pub fn minio_put(bucket: &str, key: &str, bytes: &[u8]) {
     use std::io::Write;
-    let script = format!(
-        "mc alias set local http://127.0.0.1:9000 {MINIO_ACCESS_KEY} {MINIO_SECRET_KEY} >/dev/null 2>&1 && \
-         mc pipe local/{bucket}/{key}"
-    );
-    let mut child = Command::new("docker")
-        .args(["compose", "exec", "-T", "minio", "sh", "-c", &script])
+    let mut child = minio_mc(&format!("mc pipe local/{bucket}/{key}"))
         .stdin(std::process::Stdio::piped())
         .spawn()
         .expect("spawn mc pipe");
@@ -562,12 +582,7 @@ pub fn minio_put(bucket: &str, key: &str, bytes: &[u8]) {
 
 /// Object names under `prefix` in a MinIO bucket; empty when none match.
 pub fn minio_object_names(bucket: &str, prefix: &str) -> Vec<String> {
-    let script = format!(
-        "mc alias set local http://127.0.0.1:9000 {MINIO_ACCESS_KEY} {MINIO_SECRET_KEY} >/dev/null 2>&1 && \
-         mc ls --recursive local/{bucket}"
-    );
-    let ls = Command::new("docker")
-        .args(["compose", "exec", "-T", "minio", "sh", "-c", &script])
+    let ls = minio_mc(&format!("mc ls --recursive local/{bucket}"))
         .output()
         .expect("mc ls");
     assert!(ls.status.success(), "mc ls local/{bucket} failed");
