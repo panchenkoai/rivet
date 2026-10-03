@@ -105,7 +105,7 @@ const BASELINE: &[(&str, usize, usize, usize, usize)] = &[
     ("src/load/bigquery/mod.rs::rebuild_changelog", 0, 0, 0, 1),
     ("src/source/mysql/cdc.rs::fill", 0, 1, 4, 0),
     ("src/source/postgres/cdc.rs::fill", 1, 2, 4, 2),
-    // Excluded 2026-10-01; its transaction-group close moved out to `close_poll_groups`.
+    // Excluded 2026-10-01; its transaction-group close moved out to `tx_buffer::close_runs`.
     ("src/source/mssql/cdc.rs::fill", 0, 0, 1, 0),
     // ── the export RUNNERS ───────────────────────────────────────────────
     // The three big-table runners each own their execution loop, and each loop

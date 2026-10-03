@@ -27,7 +27,7 @@ use serde_json::json;
 
 use crate::config::TlsConfig;
 use crate::error::Result;
-use crate::source::cdc::spill::{SpillFile, SpooledTx};
+use crate::source::cdc::tx_buffer::{SpooledTail, TxBuffer, replay};
 use crate::source::cdc::value::RivetValue;
 use crate::source::cdc::{ChangeEvent, ChangeOp, ChangeStream, DrainMode, Position};
 
@@ -50,7 +50,7 @@ pub(crate) struct PgChangeStream {
     /// A field rather than a local of `fill`, because it OUTLIVES the peek window
     /// that produced it: the rows leave one at a time through `next_change`, which
     /// is the whole point — the tail never exists in memory as a whole.
-    spooled: Option<SpooledTx>,
+    spooled: Option<SpooledTail>,
     /// Wire budget per `peek` — the memory bound of the drain (O(batch), not
     /// O(total backlog)). One ack cadence (the part rollover); see
     /// [`wire_budget`]. Slot progress past a foreign/empty span larger than one
@@ -768,15 +768,13 @@ impl PgChangeStream {
         // its transaction's COMMIT LSN — the only valid slot-advance boundary and
         // the commit-boundary resume position. Logical decoding only ever emits
         // complete, committed transactions.
-        let mut tx: Vec<ChangeEvent> = Vec::new();
-        // Round-2 audit #9: running byte footprint of the buffered transaction —
-        // the row cap alone is a poor bound when cells are large. Reset at BEGIN
-        // (the start of accumulation), summed on each push.
-        let mut tx_bytes = 0usize;
-        // The in-flight transaction's TAIL, once it has outgrown the memory cap.
-        // Local, like `tx`: `upto_nchanges` only ever stops at a commit boundary, so
-        // a transaction cannot straddle two peek windows.
-        let mut spill: Option<SpillFile> = None;
+        // The transaction being framed, with its memory cap and spill (`tx_buffer`).
+        // Local: `upto_nchanges` only ever stops at a commit boundary, so a
+        // transaction cannot straddle two peek windows.
+        let mut tx = TxBuffer::new(
+            crate::source::cdc::CdcEngine::Postgres,
+            self.spill_dir.clone(),
+        );
         // Set when the window ended EARLY to hand out a spilled tail in order —
         // which is not the same thing as the window being drained. Conflating them
         // would end a bounded run at the first oversized transaction, deferring
@@ -790,51 +788,19 @@ impl PgChangeStream {
                 let commit_lsn = parse_lsn(&lsn).unwrap_or(0);
                 match tx_disposition(commit_lsn, self.frontier, self.bound) {
                     TxDisposition::Yield => {
-                        let tail_len = spill.as_ref().map_or(0, SpillFile::len);
-                        if !tx.is_empty() || tail_len > 0 {
+                        let commit = Position(json!({ "lsn": lsn }));
+                        // #158: commit LSN on all, committed on the transaction's LAST
+                        // event — on disk when it spilled (`TxBuffer::close_transaction`).
+                        let (head, tail) = tx.close_transaction(&commit, &lsn)?;
+                        if !head.is_empty() || tail.is_some() {
                             self.yielded_data = true;
                         }
-                        let commit = Position(json!({ "lsn": lsn }));
-                        // #158: the shared close — commit LSN on all, committed on
-                        // the last event of the TRANSACTION (BEGIN…COMMIT frames one
-                        // here). Otherwise a transaction larger than `rollover` rolls
-                        // + acks MID-transaction and a crash before the tail's flush
-                        // loses it (the slot advanced past the commit — resume never
-                        // re-reads it, an at-least-once break). With a spilled tail
-                        // the last event is on DISK, which is exactly what `tail_len`
-                        // tells `close_head_of_group`.
-                        let mut group: Vec<ChangeEvent> = std::mem::take(&mut tx);
-                        let head_len = group.len();
-                        crate::source::cdc::TxnFramer::close_head_of_group(
-                            &mut group, &commit, tail_len,
-                        );
-                        for ev in group {
-                            self.pending.push_back(ev);
-                        }
+                        self.pending.extend(head);
                         self.frontier = commit_lsn;
                         self.frontier_text = Some(lsn.clone());
                         yielded_any = true;
-                        if let Some(sp) = spill.take() {
-                            // What the memory cap actually bought, in the operator's
-                            // terms. Also the only externally visible measure of the
-                            // split: a test can read rows and order back from the
-                            // parquet, but "how much never entered memory" exists
-                            // nowhere else — and a spill that silently keeps
-                            // everything buffered delivers identical rows.
-                            // `warn`, not `info`: the default log level hides
-                            // `info`, so an info-level report of a run's memory
-                            // behaviour is functionally silent — the same reason
-                            // the sparse-chunk diagnostic is a warn. It fires only
-                            // for a transaction that actually spilled, which is
-                            // rare by construction.
-                            log::warn!(
-                                "pg cdc: transaction at {lsn} delivered {} rows from \
-                                 memory and {} from disk ({} bytes spilled)",
-                                head_len,
-                                sp.len(),
-                                sp.bytes()
-                            );
-                            self.spooled = Some(SpooledTx::new(sp.into_reader()?, commit));
+                        if tail.is_some() {
+                            self.spooled = tail;
                             // END the window here. The tail leaves through
                             // `next_change` one row at a time, and a LATER
                             // transaction in this same peek would otherwise reach
@@ -849,10 +815,7 @@ impl PgChangeStream {
                         }
                     }
                     // Already yielded on a prior (un-acked) peek ⇒ drop, idempotent.
-                    TxDisposition::AlreadyYielded => {
-                        tx.clear();
-                        spill = None;
-                    }
+                    TxDisposition::AlreadyYielded => tx.clear(),
                     // Committed after this bounded run opened — the next run's
                     // work. Peeks return transactions in commit order, so
                     // everything after this one is past the bound too: stop.
@@ -880,11 +843,9 @@ impl PgChangeStream {
                 self.exhausted = true;
                 break;
             } else if data.starts_with("BEGIN") {
-                tx.clear();
-                tx_bytes = 0;
-                // Dropping the file too — a transaction that never reached its
+                // Dropping any spill too — a transaction that never reached its
                 // COMMIT in this window is re-read from the slot next time.
-                spill = None;
+                tx.clear();
             } else if let Some((schema, table)) = truncate_targets(&data)
                 .into_iter()
                 .find(|(sc, tb)| truncate_is_ours(sc, tb, &self.configured_tables))
@@ -942,51 +903,10 @@ impl PgChangeStream {
                 self.exhausted = true;
                 break;
             } else if let Some(ev) = parse_test_decoding(&lsn, &data, &self.domains)? {
-                if let Some(sp) = spill.as_mut() {
-                    // Past the cap: keep the RAW wire row and throw the event away.
-                    //
-                    // The parse above is not wasted — it is what tells us this line
-                    // IS a change. A line that decodes to nothing (a marker, a
-                    // future `test_decoding` addition) must not enter the spill,
-                    // because the tail's LENGTH is what decides which row carries
-                    // `committed`; a record that decoded to `None` on the way out
-                    // would leave the flag on a row that is not the last one.
-                    sp.push(&encode_wire_row(&lsn, &data))?;
-                    continue;
-                }
-                tx_bytes = tx_bytes.saturating_add(ev.estimated_bytes());
-                tx.push(ev);
-                // Memory backstop, matching the MySQL adapter's MAX_TX_ROWS: a
-                // transaction is buffered whole (never split across parts), so an
-                // oversized one grows unbounded.
-                //
-                // Crossing the cap no longer FAILS the run where the operator has
-                // given rivet somewhere to spill: the head stays in memory, the tail
-                // goes to disk as raw wire rows, and the cap becomes the memory
-                // CEILING it was always standing in for. With nowhere to spill it is
-                // still a refusal — filling an unknown filesystem is not an
-                // improvement on a clear error.
-                if let Err(e) = crate::source::cdc::check_tx_buffer_caps("pg", tx.len(), tx_bytes) {
-                    let Some(dir) = self.spill_dir.clone() else {
-                        return Err(e);
-                    };
-                    log::warn!(
-                        "pg cdc: transaction at {lsn} passed the in-memory cap at {} \
-                         rows / {tx_bytes} bytes — spilling the rest to {} rather \
-                         than failing the run, which is what this used to do. The \
-                         transaction is still delivered whole and atomically. Note \
-                         this moves the ADAPTER's copy to disk; the sink still holds \
-                         the whole transaction (a part is never split across one), so \
-                         peak memory falls only modestly — measured ~11% on a \
-                         100k-row transaction, not to the cap. Expect this line once \
-                         per peek until the sink acks past the commit: a slot peek \
-                         does not consume, so an un-acked transaction is re-read (and \
-                         re-spilled) on the next pass.",
-                        tx.len(),
-                        dir.display()
-                    );
-                    spill = Some(SpillFile::create(&dir, "pg-tx")?);
-                }
+                // Past the cap the RAW wire row is spilled and the parse above only
+                // proved the line IS a change: a line that decodes to nothing must not
+                // enter the spill, since the tail's length decides which row closes it.
+                tx.push(ev, |_| encode_wire_row(&lsn, &data), &lsn)?;
             }
         }
         // Short window (backlog fit in one peek) OR a full window that yielded
@@ -1013,10 +933,7 @@ impl PgChangeStream {
     /// an ERROR rather than a skip: the tail's length decides which row carries
     /// `committed`, so a silently skipped row would move the transaction's end.
     fn next_spooled(&mut self) -> Result<Option<ChangeEvent>> {
-        let Some(sp) = self.spooled.as_mut() else {
-            return Ok(None);
-        };
-        let out = sp.next_event(|rec| {
+        replay(&mut self.spooled, |rec| {
             let (lsn, data) = decode_wire_row(rec)?;
             parse_test_decoding(&lsn, &data, &self.domains)?.ok_or_else(|| {
                 anyhow::anyhow!(
@@ -1026,13 +943,7 @@ impl PgChangeStream {
                      commit boundary onto the wrong row."
                 )
             })
-        })?;
-        if out.is_none() || sp.remaining() == 0 {
-            // Drop the reader as soon as the tail is done, so the file is gone the
-            // moment it is no longer needed rather than at the next call.
-            self.spooled = None;
-        }
-        Ok(out)
+        })
     }
 
     /// Zero-yield release: called at clean exhaust. A run whose every

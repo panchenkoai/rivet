@@ -55,20 +55,14 @@ pub(crate) struct MysqlChangeStream {
     /// — thousands of identical parses inside a single large transaction.
     tables: HashMap<u64, CachedTableMap>,
     pending: VecDeque<ChangeEvent>,
-    /// The current transaction's rows, held until the `XID` (commit) event so the
-    /// whole transaction is released atomically with the commit position.
-    tx: Vec<ChangeEvent>,
-    /// Where an oversized transaction's tail goes. MySQL's crate hands over PARSED
-    /// events — there is no wire to keep — so the tail is written through the
-    /// general tagged frame rather than PostgreSQL's raw rows.
-    spill_dir: Option<std::path::PathBuf>,
-    /// The in-flight transaction's tail, once it has outgrown the memory cap.
-    ///
-    /// A FIELD, not a local: a MySQL transaction spans many `fill` calls (one per
-    /// binlog event), unlike PostgreSQL's, which is framed inside a single peek.
-    spill: Option<crate::source::cdc::spill::SpillFile>,
+    /// The current transaction, held until its commit marker so it is released
+    /// atomically with the commit position; past the memory cap its tail spills
+    /// through the general tagged frame (the crate hands over PARSED events, so there
+    /// is no wire to keep). A FIELD, not a local: a MySQL transaction spans many
+    /// `fill` calls, one per binlog event.
+    tx: crate::source::cdc::tx_buffer::TxBuffer,
     /// A committed transaction whose tail is still being handed out from disk.
-    spooled: Option<crate::source::cdc::spill::SpooledTx>,
+    spooled: Option<crate::source::cdc::tx_buffer::SpooledTail>,
     /// A failure while SEALING a spill, raised on the next `next()`.
     ///
     /// `close_transaction_at` returns a bool (it means "keep reading"), so it has
@@ -76,9 +70,6 @@ pub(crate) struct MysqlChangeStream {
     /// transaction without its tail — a half-transaction the sink would flush and
     /// checkpoint past, which is the loss this whole path exists to avoid.
     spill_error: Option<anyhow::Error>,
-    /// Running byte footprint of `tx` (round-2 audit #9): the row cap alone is a
-    /// poor bound when cells are large. Reset when `tx` is drained/cleared.
-    tx_bytes: usize,
     file: String,
     /// Open-time `(binlog_file, pos)` ceiling for a bounded run — the first
     /// commit past it ends the stream (`BINLOG_DUMP_NON_BLOCK`'s EOF stays as
@@ -657,14 +648,13 @@ impl MysqlChangeStream {
             configured_tables,
             tables: HashMap::new(),
             pending: VecDeque::new(),
-            // Overridden by `open_or_resume`, which knows the checkpoint's location.
-            // Overridden by `open_or_resume`, the one production constructor.
-            spill_dir: None,
-            spill: None,
             spooled: None,
             spill_error: None,
-            tx: Vec::new(),
-            tx_bytes: 0,
+            // Given its spill directory by `open_or_resume`, the one production constructor.
+            tx: crate::source::cdc::tx_buffer::TxBuffer::new(
+                crate::source::cdc::CdcEngine::Mysql,
+                None,
+            ),
             file,
             bound,
             past_bound: false,
@@ -809,7 +799,10 @@ impl MysqlChangeStream {
         // alone and fell back to a cwd-relative path — the shipped image runs at
         // `/`, where that is an EACCES at the exact moment the cap is crossed.
         let with_dir = |mut s: Self| {
-            s.spill_dir = spill_dir.clone();
+            s.tx = crate::source::cdc::tx_buffer::TxBuffer::new(
+                crate::source::cdc::CdcEngine::Mysql,
+                spill_dir.clone(),
+            );
             s
         };
         // ONE connection for every question asked before the dump; it then dumps.
@@ -892,61 +885,13 @@ impl MysqlChangeStream {
         .map(with_dir)
     }
 
-    /// Open the spill once the buffered transaction passes the in-memory cap.
-    ///
-    /// With a spill directory NAMED (`RIVET_CDC_SPILL_DIR` — see `spill_dir_for`),
-    /// crossing the cap no longer fails the run: the head stays in memory, the tail
-    /// goes to disk through the general tagged frame, and the transaction is still
-    /// delivered whole and atomically. Without one the cap keeps its original
-    /// meaning and REFUSES — an earlier version of this comment said the directory
-    /// "always resolves", which was true for one day and then reverted, because
-    /// spilling does not bound memory end to end and must not silently replace a
-    /// guard that does refuse.
-    fn open_spill_if_past_cap(&mut self, log_pos: u64) -> Result<()> {
-        if self.spill.is_some() {
-            return Ok(());
-        }
-        let Err(cap_error) =
-            crate::source::cdc::check_tx_buffer_caps("mysql", self.tx.len(), self.tx_bytes)
-        else {
-            return Ok(());
-        };
-        // No spill directory named ⇒ the cap keeps its original meaning: REFUSE.
-        // See `spill_dir_for` — spilling does not bound memory end to end, so it
-        // must not silently replace a guard that does refuse.
-        let Some(dir) = self.spill_dir.clone() else {
-            return Err(cap_error);
-        };
-        log::warn!(
-            "mysql cdc: transaction at {}:{log_pos} passed the in-memory cap at {} \
-             rows / {} bytes — spilling the rest to {} rather than failing the run, \
-             which is what this used to do. The transaction is still delivered whole \
-             and atomically. Note this moves the ADAPTER's copy to disk; the sink \
-             still holds the whole transaction (a part is never split across one), so \
-             peak memory falls only modestly — measured ~11% on PostgreSQL's 100k-row \
-             transaction, not to the cap.",
-            self.file,
-            self.tx.len(),
-            self.tx_bytes,
-            dir.display()
-        );
-        self.spill = Some(crate::source::cdc::spill::SpillFile::create(
-            &dir, "mysql-tx",
-        )?);
-        Ok(())
-    }
-
     /// One row of a spilled tail: decode it through the general frame, stamp it,
     /// and drop the reader once the last row is out.
     fn next_spooled(&mut self) -> Result<Option<ChangeEvent>> {
-        let Some(sp) = self.spooled.as_mut() else {
-            return Ok(None);
-        };
-        let out = sp.next_event(crate::source::cdc::spill::decode_event)?;
-        if out.is_none() || sp.remaining() == 0 {
-            self.spooled = None;
-        }
-        Ok(out)
+        crate::source::cdc::tx_buffer::replay(
+            &mut self.spooled,
+            crate::source::cdc::spill::decode_event,
+        )
     }
 
     /// Release the buffered transaction at `log_pos`, or end the stream when the
@@ -963,48 +908,23 @@ impl MysqlChangeStream {
     fn close_transaction_at(&mut self, log_pos: u64) -> bool {
         if commit_past_bound(&self.file, log_pos, self.bound.as_ref()) {
             self.tx.clear();
-            self.tx_bytes = 0;
-            self.spill = None;
             self.past_bound = true;
             return false;
         }
         let commit = self.position_at(log_pos);
-        let mut tx: Vec<ChangeEvent> = self.tx.drain(..).collect();
-        self.tx_bytes = 0;
-        let tail_len = self
-            .spill
-            .as_ref()
-            .map_or(0, crate::source::cdc::spill::SpillFile::len);
-        // #158: the shared close — commit position on all, committed on the last
-        // event of the TRANSACTION (the marker frames the whole boundary). With a
-        // spilled tail that last event is on DISK, which is what `tail_len` says.
-        let head_len = tx.len();
-        crate::source::cdc::TxnFramer::close_head_of_group(&mut tx, &commit, tail_len);
-        for ev in tx {
-            self.pending.push_back(ev);
-        }
-        if let Some(sp) = self.spill.take() {
-            // `warn`, not `info`: the default level hides info, so an info-level
-            // report of a run's memory behaviour is functionally silent. It fires
-            // only for a transaction that actually spilled.
-            log::warn!(
-                "mysql cdc: transaction at {}:{log_pos} delivered {head_len} rows \
-                 from memory and {} from disk ({} bytes spilled)",
-                self.file,
-                sp.len(),
-                sp.bytes()
-            );
-            let reader = match sp.into_reader() {
-                Ok(r) => r,
-                Err(e) => {
-                    // Sealing the log is the one step here that can fail, and a
-                    // silent drop would deliver the head without its tail — a
-                    // half-transaction the sink would flush and checkpoint past.
-                    self.spill_error = Some(e);
-                    return true;
-                }
-            };
-            self.spooled = Some(crate::source::cdc::spill::SpooledTx::new(reader, commit));
+        // #158: commit position on all, committed on the transaction's LAST event —
+        // on disk when it spilled (`TxBuffer::close_transaction`).
+        match self
+            .tx
+            .close_transaction(&commit, &format_args!("{}:{log_pos}", self.file))
+        {
+            Ok((head, tail)) => {
+                self.pending.extend(head);
+                self.spooled = tail;
+            }
+            // Sealing the spill can fail, and a silent drop would deliver the head
+            // without its tail — a half-transaction the sink would checkpoint past.
+            Err(e) => self.spill_error = Some(e),
         }
         true
     }
@@ -1169,14 +1089,6 @@ impl MysqlChangeStream {
                         seq: 0, // stamped by TxnSeq as the stream is consumed
                         poison,
                     };
-                    if let Some(sp) = self.spill.as_mut() {
-                        // Past the cap: the event goes to disk through the general
-                        // tagged frame and never enters `tx`.
-                        sp.push(&crate::source::cdc::spill::encode_event(&ev))?;
-                        continue;
-                    }
-                    self.tx_bytes = self.tx_bytes.saturating_add(ev.estimated_bytes());
-                    self.tx.push(ev);
                     // PER ROW, not per binlog event. One `WriteRows` event carries
                     // MANY rows, so a check after the loop lets the whole event land
                     // in memory first — with a transaction written as a single large
@@ -1184,7 +1096,11 @@ impl MysqlChangeStream {
                     // nothing. (Only rows in LATER events would have spilled, which
                     // depends on `binlog_row_event_max_size` rather than on the cap
                     // the operator set.)
-                    self.open_spill_if_past_cap(log_pos)?;
+                    self.tx.push(
+                        ev,
+                        crate::source::cdc::spill::encode_event,
+                        &format_args!("{}:{log_pos}", self.file),
+                    )?;
                 }
             }
             // XID = transaction commit. Stamp the commit position on every change
@@ -1236,7 +1152,7 @@ impl MysqlChangeStream {
             // so an XA branch on a table nobody captures must not be an outage for
             // exports that never read it.
             Some(EventData::XaPrepareLogEvent(_)) => {
-                if let Some(ev) = self.tx.iter().find(|ev| {
+                if let Some(ev) = self.tx.head().iter().find(|ev| {
                     undecodable_event_is_ours(
                         Some((&ev.schema, &ev.table)),
                         &self.configured_tables,
@@ -1248,20 +1164,18 @@ impl MysqlChangeStream {
                 // unreachable honestly: the scan above covers only the in-memory
                 // head, and past the cap every later row went to disk without
                 // entering `tx` — so a branch whose captured rows sit only in the
-                // tail would pass the scan and `self.spill = None` would DELETE
+                // tail would pass the scan and `self.tx.clear()` would DELETE
                 // them, permanently and silently. Refuse instead: nothing has been
                 // handed to the sink, so the bail loses nothing (at-least-once
                 // re-reads from the checkpoint), and the message names both facts
                 // the operator needs.
-                if let Some(sp) = &self.spill {
-                    anyhow::bail!("{}", xa_prepare_spilled_tail_refusal_message(sp.len()));
+                if let Some(rows) = self.tx.spilled_rows() {
+                    anyhow::bail!("{}", xa_prepare_spilled_tail_refusal_message(rows));
                 }
                 // Nothing of ours in the branch: drop it rather than leave it for the
                 // next commit to stamp and fuse. The sink would route these rows away,
                 // but only after they had already corrupted that transaction's framing.
                 self.tx.clear();
-                self.tx_bytes = 0;
-                self.spill = None;
             }
             Some(EventData::QueryEvent(qe))
                 if drop_table_targets(&qe.query(), &qe.schema()).is_some_and(|ts| {
