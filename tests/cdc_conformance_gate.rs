@@ -914,7 +914,9 @@ const PIN_INDEPENDENT: usize = 106;
 // 2026-10-02: +1 shared_codec - the MongoDB failover follow, read back through its parts (the PostgreSQL
 // failover cells run their capture through a helper the census does not see).
 // 2026-10-02: +1 shared codec - Oracle CDC under a redo log switch storm; each run is graded by the default oracle, exactly-once by the seed.
-const PIN_SHARED_CODEC: usize = 92;
+// 2026-10-03: +2 shared codec - the PostgreSQL and SQL Server capped `rivet cdc --output` cells; their cap is read
+// back through the parts, the remainder by the rig oracle grading the next run.
+const PIN_SHARED_CODEC: usize = 94;
 const PIN_SELF_COUNTER: usize = 6;
 // 2026-09-28: +1 presence — the SQL Server undecodable-cell refusal, whose oracle is the refusal.
 // 2026-09-29: +2 presence — the PG CDC LMT-timezone and DOMAIN parity cells compare CDC to batch output.
@@ -929,7 +931,9 @@ const PIN_SELF_COUNTER: usize = 6;
 // 2026-10-02: +3 presence - the MySQL, Oracle and Mongo refusals under `initial: snapshot`, whose oracle is an empty
 // destination tree and an absent checkpoint file.
 // 2026-10-02: +1 presence — the MySQL failover refusal, whose oracle is the refusal plus the unmoved checkpoint and parts.
-const PIN_PRESENCE: usize = 86;
+// 2026-10-03: +2 presence - the MySQL and MongoDB capped `rivet cdc` NDJSON cells; the test reads the cap's stop
+// point off stdout, the rig oracle (which this census does not see) grades both runs against the source.
+const PIN_PRESENCE: usize = 88;
 
 /// TIER 2 (harness audit, 2026-08-29): a test whose NAME makes a
 /// COMPLETENESS claim must carry a class-(a) INDEPENDENT oracle — not merely

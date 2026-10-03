@@ -1426,3 +1426,47 @@ fn mongo_cdc_pre_images_tell_deletes_of_null_and_string_null_id_apart() {
         "with pre-images each delete's document holds its typed _id"
     );
 }
+
+/// A `rivet cdc --max-events` run on MongoDB stops at its cap and owes the rest to the next run, graded by the rig oracle as a pair.
+#[test]
+#[ignore = "live: requires docker compose up -d mongo-rs"]
+fn mongo_cdc_cli_a_capped_run_leaves_its_remainder_to_the_next_run() {
+    require_alive(LiveService::MongoRs);
+    use mongodb::bson::doc;
+    let db = unique_name("cdc_cli_defer");
+    let m = MongoTest::connect(PORT, &db);
+    m.drop_collection("docs");
+    let d = tempfile::tempdir().expect("tempdir");
+    let ckpt = d.path().join("cli.ckpt").to_str().unwrap().to_string();
+    let url = MongoTest::url(PORT, &db);
+    let run = |cap: &[&str]| {
+        let mut args = vec![
+            "cdc",
+            "--source",
+            &url,
+            "--table",
+            "docs",
+            "--checkpoint",
+            &ckpt,
+        ];
+        args.extend(cap);
+        run_rivet_args_bounded_env(&args, &[], std::time::Duration::from_secs(60))
+            .expect("a bounded `rivet cdc` run terminates")
+    };
+    run(&[]);
+    m.insert_many(
+        "docs",
+        (1..=4_i64).map(|i| doc! { "_id": i, "v": i }).collect(),
+    );
+    let first: std::collections::BTreeSet<i64> = run(&["--max-events", "2"])
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter_map(|v| v.get("after")?.get(0)?.as_i64())
+        .collect();
+    assert_eq!(
+        first,
+        [1, 2].into(),
+        "the cap stops after two single-document commits"
+    );
+    run(&[]);
+}

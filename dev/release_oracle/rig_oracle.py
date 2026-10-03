@@ -891,6 +891,15 @@ def _parts(ora, files: list[str], fmt: str = "parquet") -> str:
 
 _VIEWS = itertools.count()
 
+
+def _ndjson(ora, files: list[str], engine: str) -> str:
+    """The change lines a `rivet cdc` run printed: each image's positions named by the CDC row's columns (Mongo `_id`, `document`; else the source's, in order) as their JSON text, with `__op`, `__pos`, `__seq`."""
+    cols = ["_id", "document"] if engine == "mongo" else [c for c, _ in _columns(ora, "source_rows")]
+    img = "CASE WHEN json_extract_string(json, '$.op') = 'delete' THEN 'before' ELSE 'after' END"
+    sel = ", ".join(f"json_extract_string(json, '$.' || {img} || '[{i}]') AS {_qi(c)}" for i, c in enumerate(cols))
+    return (f"(SELECT {sel}, json_extract_string(json, '$.op') AS __op, CAST(json_extract(json, '$.pos') AS VARCHAR) AS __pos, "
+            f"CAST(json_extract(json, '$.seq') AS BIGINT) AS __seq FROM read_ndjson_objects({_plist(files)}))")
+
 #: The directory label rivet gives a partition_by bucket of NULL values.
 HIVE_NULL = "__HIVE_DEFAULT_PARTITION__"
 
@@ -919,7 +928,7 @@ def misfiled(ora, parts: list[str], col: str) -> list[str]:
 
 def _meta_leg(ora, files: list[str], engine: str, snapshot: bool, fmt: str = "parquet") -> str:
     """One SELECT over `files` carrying `__op`, `__pos`, `__seq` and the change order `__ord` (a snapshot leg sorts first)."""
-    rel = _parts(ora, files, fmt)
+    rel = _ndjson(ora, files, engine) if fmt == "ndjson" else _parts(ora, files, fmt)
     have = {c for c, _ in _columns(ora, rel)}
     add = [] if "__op" in have else ["'snapshot' AS __op"]
     add += [] if "__pos" in have else ["'' AS __pos"]
@@ -1170,6 +1179,9 @@ def grade(spec: dict) -> dict:
     with Oracle(config=config, **kw, **_attach(spec)) as ora:
         ora.db.sql("SET TimeZone = 'UTC'")
         changes = declared_parts(out_dir, graded) + [p for d in others for p in declared_parts(d["dir"], d["manifests"])] if cdc else []
+        if fmt == "ndjson":
+            # `rivet cdc` without `--output` prints its changes: every line this stream printed, kept by the harness.
+            changes = [spec["ndjson"]] if os.path.isfile(spec["ndjson"]) and os.path.getsize(spec["ndjson"]) else []
         try:
             src, key, native = _source(ora, spec, renders)
             # One read of the source: each later DESCRIBE or scan would open fresh scanner connections (mongoc opened ~2k per test).
@@ -1275,13 +1287,13 @@ def grade(spec: dict) -> dict:
         defects = {c: [x.strip("'") for x in r.get("defect_samples") or []] for c, r in row_of.items() if r.get("known_defect")}
         # Oracle: its source leg is the client-side `source` render; a DuckDB render (strftime: astronomical years) would grade a different calendar.
         # A CSV holds text: no DuckDB render applies to it; the source is rendered as the CSV writer documents its text.
-        duck = {} if engine == "oracle" or fmt == "csv" else {c: _render(r)["duck"] for c, r in row_of.items() if _render(r).get("duck")}
+        duck = {} if engine == "oracle" or fmt in ("csv", "ndjson") else {c: _render(r)["duck"] for c, r in row_of.items() if _render(r).get("duck")}
         canons = {c: _render(r)["canon"] for c, r in row_of.items() if _render(r).get("canon")}
         verbatim = frozenset(
             c for c, n in native.items()
             if (engine == "postgres" and n == "JSON") or (TEXT_NATIVE.match(n) and c not in duck and c not in canons and c not in numbers)
         )
-        if fmt == "csv":
+        if fmt in ("csv", "ndjson"):
             src = f"(SELECT {csv_text(_columns(ora, 'source_rows'))} FROM {src})"
         f = compare(ora, src, dst, bits, numbers, defects, duck, canons, engine != "oracle", verbatim, key)
         if spec.get("nothing_new") and not cumulative:
@@ -1672,6 +1684,7 @@ def _self_test() -> None:
     _anchor_self_test()
     _compare_self_test()
     _layout_self_test()
+    _ndjson_self_test()
     print("rig_oracle self-test ok")
 
 
@@ -1690,6 +1703,21 @@ class _Mem:
     def scalar(self, sql: str) -> object:
         """The first cell of `sql`."""
         return self.rows(sql)[0][0]
+
+
+def _ndjson_self_test() -> None:
+    """A `rivet cdc` NDJSON line reads back by the source's column names: a delete's key from its before image, its position as text."""
+    import tempfile
+
+    ora = _Mem()
+    ora.db.sql("CREATE TABLE source_rows (id BIGINT, v VARCHAR)")
+    path = os.path.join(tempfile.mkdtemp(prefix="rig-ndjson-"), "e.jsonl")
+    with open(path, "w") as f:
+        f.write('{"op":"insert","table":"t","before":null,"after":[1,"a"],"pos":{"lsn":"0/10"},"seq":0}\n'
+                '{"op":"delete","table":"t","before":[2,null],"after":null,"pos":{"lsn":"0/20"},"seq":1}\n')
+    got = ora.rows(f"SELECT id, v, __op, json_extract_string(__pos, '$.lsn'), __seq FROM {_ndjson(ora, [path], 'postgres')} ORDER BY __seq")
+    assert got == [("1", "a", "insert", "0/10", 0), ("2", None, "delete", "0/20", 1)], got
+    assert [c for c, _ in _columns(ora, _ndjson(ora, [path], "mongo"))][:2] == ["_id", "document"]
 
 
 def _compare_self_test() -> None:

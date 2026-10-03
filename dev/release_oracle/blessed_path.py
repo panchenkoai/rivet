@@ -673,8 +673,7 @@ def sc_bq_cycle(led: Ledger, engine: str, tag: str, url: str, table: str) -> Non
     state stops measuring the run in front of it — the same reason the prefix is
     cleared before the export rather than after.
     """
-    proj = os.environ.get("BQ_ORACLE_PROJECT") or run(
-        ["gcloud", "config", "get-value", "project"]).stdout.strip()
+    proj = os.environ.get("BQ_ORACLE_PROJECT", "")
     # PER SOURCE, which is what the gate's README already promises this variable
     # does ("one dataset PER SOURCE is derived from this") and what this line did
     # not do. `rivet load` derives the warehouse table from `table:`, so every
@@ -691,7 +690,7 @@ def sc_bq_cycle(led: Ledger, engine: str, tag: str, url: str, table: str) -> Non
     # work dir and bucket prefix below already carried the tag; this did not.
     dset = ((os.environ.get("BQ_ORACLE_DATASET") or registry.bq_tmp("gate"))
             + "_" + scenarios.Scope(engine, tag).key)
-    bucket = os.environ.get("BQ_ORACLE_BUCKET", "rivet_data_test")
+    bucket = os.environ.get("BQ_ORACLE_BUCKET", "")
     if not have("bq") or not proj:
         led.skipped(engine, tag, "blessed:bq", "bigquery",
                     f"{engine} {tag} · bigquery — no bq CLI or project", "no creds")

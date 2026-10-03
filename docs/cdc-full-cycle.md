@@ -205,8 +205,9 @@ did not grow); live state still equals the source.
 
 ```sh
 docker compose --profile cdc up -d
-export BIGQUERY_TEST_PROJECT=<gcp-project> RIVET_TEST_GCS_BUCKET=<bucket>   # RIVET_TEST_BQ_DATASET optional
 cargo test --test live_suite full_cdc_cycle -- --ignored --test-threads=1
 ```
 
-Without the warehouse env the four tests skip, by name.
+The project and bucket are dev/stand/registry.yaml's (`BIGQUERY_TEST_PROJECT` /
+`RIVET_TEST_GCS_BUCKET` override them). Without a Google credential
+(`gcloud auth login`) the four tests skip, by name.

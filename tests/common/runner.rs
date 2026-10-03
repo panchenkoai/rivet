@@ -117,7 +117,8 @@ fn graded(
     let argv: Vec<String> = args.iter().map(|a| a.to_string()).collect();
     let case = super::verify::begin_raw(&argv, envs, cwd);
     let out = spawn();
-    if let Some(case) = case.filter(|_| out.status.success()) {
+    if let Some(mut case) = case.filter(|_| out.status.success()) {
+        case.delivered(&out.stdout);
         super::verify::finish(case, envs, &Default::default());
     }
     out
@@ -269,10 +270,12 @@ pub fn run_rivet_args_bounded_env(
     loop {
         if let Some(status) = child.try_wait().expect("try_wait rivet") {
             assert!(status.success(), "bounded rivet run exited non-zero");
-            if let Some(case) = case {
+            let stdout = std::fs::read_to_string(&path).expect("read captured stdout");
+            if let Some(mut case) = case {
+                case.delivered(stdout.as_bytes());
                 super::verify::finish(case, envs, &Default::default());
             }
-            return Some(std::fs::read_to_string(&path).expect("read captured stdout"));
+            return Some(stdout);
         }
         if start.elapsed() >= timeout {
             let _ = child.kill();

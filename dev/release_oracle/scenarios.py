@@ -1912,14 +1912,9 @@ def verify_audit_suspects(led: Ledger) -> None:
     """The contract audit's silent-loss cells (cleanup race, keyset collation, MySQL
     STATEMENT/DROP, Mongo drop, compact ADD COLUMN, MSSQL DATETIME), one row per case;
     the BigQuery cells get the same warehouse environment the rig cells do."""
-    proj = os.environ.get("BQ_ORACLE_PROJECT") or (
-        run(["gcloud", "config", "get-value", "project"]).stdout.strip() if have("gcloud") else "")
     _run_live_modules(led, "audit", "audit suspects",
                       "silent-loss cells from the 2026-09-26 contract audit (live_audit_suspects)",
-                      ["live_audit_suspects"],
-                      env={"BIGQUERY_TEST_PROJECT": proj,
-                           "RIVET_TEST_GCS_BUCKET": os.environ.get("BQ_ORACLE_BUCKET",
-                                                                   "rivet_data_test")})
+                      ["live_audit_suspects"])
 
 
 def verify_cdc_harm(led: Ledger) -> None:

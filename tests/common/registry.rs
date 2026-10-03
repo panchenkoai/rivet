@@ -44,6 +44,20 @@ pub fn stand_bq_e2e() -> &'static str {
     text(&["bigquery", "e2e"])
 }
 
+/// The BigQuery project and GCS bucket the live tests use: `BIGQUERY_TEST_PROJECT` / `RIVET_TEST_GCS_BUCKET` when set, else the registry's.
+pub fn warehouse() -> (String, String) {
+    let pick = |var: &str, path: &[&str]| {
+        std::env::var(var)
+            .ok()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| text(path).to_string())
+    };
+    (
+        pick("BIGQUERY_TEST_PROJECT", &["bigquery", "project"]),
+        pick("RIVET_TEST_GCS_BUCKET", &["gcs", "bucket"]),
+    )
+}
+
 /// The BigQuery location every test dataset is created in.
 pub fn stand_bq_location() -> &'static str {
     text(&["bigquery", "location"])
