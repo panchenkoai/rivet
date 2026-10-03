@@ -184,12 +184,12 @@ scenarios:
     oracle:   { test: oracle_cdc_byte_cap_counts_the_first_row_and_defers_not_drops }
 
   - id: cdc_rebaseline_remedy_recovers
-    what: "a data-loss warning or refusal's re-baseline remedy, followed as printed from the state that printed it, recovers the rows the stream lost (the default rig oracle grades the remedy run against the source). The text is checkpoint_identity::RECOVER, pinned by a hand-written literal; `re-snapshot (mode: full)` was refused for a CDC export and for a batch export into its destination"
+    what: "a data-loss warning or refusal's re-baseline remedy, followed as printed from the state that printed it, recovers the rows the stream lost and leaves no removed row live in the destination (the default rig oracle grades the remedy run against the source; a truncated row goes out as a change part first). The text is checkpoint_identity::RECOVER, pinned by a hand-written literal; `re-snapshot (mode: full)` was refused for a CDC export and for a batch export into its destination"
     postgres: { test: pg_slot_created_warning_remedy_recovers_the_row_written_while_the_slot_was_gone }
     mysql:    { test: mysql_missing_checkpoint_refusal_remedy_recovers_the_row_written_while_it_was_gone }
     mssql:    { test: mssql_retention_gap_refusal_remedy_recovers_the_rows_the_cleanup_removed }
     mongo:    { test: mongo_missing_checkpoint_warning_remedy_recovers_the_document_written_while_it_was_gone }
-    oracle:   { test: oracle_cdc_truncate_refusal_remedy_recovers_the_row_written_after_it }
+    oracle:   { test: oracle_cdc_truncate_refusal_remedy_leaves_no_removed_row_live_in_the_prefix }
 
   # ── Harm / operational-cost contracts (the price CDC charges the source) ──────
   - id: cdc_drain_releases_pinned_wal

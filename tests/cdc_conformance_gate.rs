@@ -438,6 +438,8 @@ fn derived_capture_marker_set_is_pinned() {
         "run_in_dir(",
         "run_ok(",
         "run_ok_capture(",
+        // `Rig::run_ok_capture_known_defect` — one run with a known defect excused.
+        "run_ok_capture_known_defect(",
         "run_rivet(",
         "run_rivet_args_bounded(",
         "run_rivet_args_bounded_env(",
@@ -911,7 +913,10 @@ fn oracle_class_census_is_pinned() {
 // 2026-10-03: +2 independent - the PG and MySQL crash mid spilled tail cells, the union of both runs read through DuckDB.
 // 2026-10-03: +2 independent - the Mongo re-baseline remedy cell, and mongo_cdc_initial_snapshot_covers_preexisting_rows
 // (was presence), now that `walkdir_parquet_ids` (DuckDB) is classified.
-const PIN_INDEPENDENT: usize = 108;
+// 2026-10-03: +3 independent - the BigQuery truncate re-baseline cell (read through `bq`), and the PG
+// single- and multi-table truncate re-baseline cells, classed by the `query_one(` that reads the slot's
+// truncate LSN; their row oracle is arrow plus the default oracle.
+const PIN_INDEPENDENT: usize = 111;
 // 2026-09-28, source connection ceilings: +3 shared codec — the run's captured row is the
 // fixture check; the oracle is the server's own connection counter.
 // 2026-09-29: +2 shared codec — the Oracle TRUNCATE refusal on re-run and the uncaptured-truncate cell.
@@ -922,7 +927,9 @@ const PIN_INDEPENDENT: usize = 108;
 // 2026-10-02: +1 shared codec - Oracle CDC under a redo log switch storm; each run is graded by the default oracle, exactly-once by the seed.
 // 2026-10-03: +6 shared codec - the PG, MySQL, SQL Server and Oracle re-baseline remedy cells read the
 // snapshot through `dir_parquet_id_set` / `dir_parquet_i64` (arrow); each run is graded by the default oracle.
-const PIN_SHARED_CODEC: usize = 98;
+// 2026-10-03: +2 shared codec - the PG multi-table slot-loss re-baseline cell, and the Oracle log-gap
+// refusal, which now follows its remedy and reads the baseline with arrow (was presence).
+const PIN_SHARED_CODEC: usize = 100;
 const PIN_SELF_COUNTER: usize = 6;
 // 2026-09-28: +1 presence — the SQL Server undecodable-cell refusal, whose oracle is the refusal.
 // 2026-09-29: +2 presence — the PG CDC LMT-timezone and DOMAIN parity cells compare CDC to batch output.
@@ -938,7 +945,8 @@ const PIN_SELF_COUNTER: usize = 6;
 // destination tree and an absent checkpoint file.
 // 2026-10-02: +1 presence — the MySQL failover refusal, whose oracle is the refusal plus the unmoved checkpoint and parts.
 // 2026-10-03: -1 presence — mongo_cdc_initial_snapshot_covers_preexisting_rows moved to independent.
-const PIN_PRESENCE: usize = 85;
+// 2026-10-03: -1 presence — oracle_cdc_resume_past_log_retention_fails_loudly moved to shared codec.
+const PIN_PRESENCE: usize = 84;
 
 /// TIER 2 (harness audit, 2026-08-29): a test whose NAME makes a
 /// COMPLETENESS claim must carry a class-(a) INDEPENDENT oracle — not merely

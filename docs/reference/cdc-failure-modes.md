@@ -30,7 +30,7 @@ warning *before* the run — run it in your scheduler's pre-flight step.
 | **SQL Server Agent stopped** | Capture freezes — no new change-table rows are produced; a run drains what exists and then sees nothing new. | Start SQL Server Agent; capture resumes and the next run catches up. | `rivet doctor` reports the Agent service state; a stopped Agent is flagged. |
 | **Corrupt or unreadable checkpoint file** | **Fails loud** on garbage / truncated / empty checkpoints (invalid JSON — a serde error surfaces; never a silent re-anchor). A wrong-engine checkpoint that is still *valid JSON* passes the shared loader (the position is stored as an opaque JSON blob) and only fails when the engine interprets it — don't rely on that as a guard. | Restore the checkpoint from backup, or [re-baseline](#the-shape-of-every-recovery). | Keep the checkpoint on durable, non-ephemeral storage; back it up alongside the destination. |
 | **Missing checkpoint parent directory** (first run) | The checkpoint save **creates parent directories** — the scaffolded `./cdc/TABLE.ckpt` no longer fails a fresh quickstart (fixed in 0.16.5). | None — handled. | — |
-| **DDL inside a capture window** | PostgreSQL & SQL Server map images **by column name** — a `DROP COLUMN` or rename between runs captures correctly, and an equal-arity `DROP`+`ADD` leaves the new column NULL for older images (unless the dropped column sat at the new one's position, which is read as a rename). A column **added while a run is open** is not in that run's schema: its values for that run are dropped and acked (re-snapshot to recover them). MySQL behaves the same under `binlog_row_metadata=FULL`, which rivet requires: a server at `MINIMAL` is refused at open (`RIVET_SOURCE_CDC_PREREQUISITE`), and an event written under `MINIMAL` is refused when read (`RIVET_SOURCE_CDC_UNDECODABLE`, naming the table and binlog position), never mapped by position. | For a `MINIMAL` backlog: switch to FULL, then [re-baseline](#the-shape-of-every-recovery). Same-arity **type** changes (undetectable without schema history): re-snapshot through the migration. | Set `binlog_row_metadata=FULL` (MySQL 8.0.1+); run type-changing migrations + their backfills through a re-snapshot. |
+| **DDL inside a capture window** | PostgreSQL & SQL Server map images **by column name** — a `DROP COLUMN` or rename between runs captures correctly, and an equal-arity `DROP`+`ADD` leaves the new column NULL for older images (unless the dropped column sat at the new one's position, which is read as a rename). A column **added while a run is open** is not in that run's schema: its values for that run are dropped and acked ([re-baseline](#the-shape-of-every-recovery) to recover them). MySQL behaves the same under `binlog_row_metadata=FULL`, which rivet requires: a server at `MINIMAL` is refused at open (`RIVET_SOURCE_CDC_PREREQUISITE`), and an event written under `MINIMAL` is refused when read (`RIVET_SOURCE_CDC_UNDECODABLE`, naming the table and binlog position), never mapped by position. | For a `MINIMAL` backlog: switch to FULL, then [re-baseline](#the-shape-of-every-recovery). Same-arity **type** changes (undetectable without schema history): [re-baseline](#the-shape-of-every-recovery) through the migration. | Set `binlog_row_metadata=FULL` (MySQL 8.0.1+); run type-changing migrations + their backfills through a [re-baseline](#the-shape-of-every-recovery). |
 | **A single transaction larger than memory** | The MySQL adapter buffers a whole transaction until its COMMIT (never splits it — the resume invariant); memory is **O(largest transaction)**, ~1.4 KB RSS per buffered row (100k rows ≈ 170 MB). Hard per-transaction caps bail loudly before OOM: 5M buffered rows and 2 GiB estimated bytes by default (`RIVET_CDC_MAX_TX_ROWS` / `RIVET_CDC_MAX_TX_BYTES` override them — raise only when a transaction this large is genuinely expected). | Split bulk backfills into batched transactions, or run them through `mode: full` / `initial: snapshot` (the batch path streams). | Do bulk operations in batches. Opt-in spilling exists: set `RIVET_CDC_SPILL_DIR` (a directory — relative forms resolve against the config's directory — or `1` to place it beside the checkpoint, falling back to `<config dir>/.rivet/spill` when the export has none) and a transaction past the cap spills its tail to disk instead of failing — the transaction is still delivered whole. (PostgreSQL, MySQL and SQL Server; Oracle ignores the variable and always refuses at the cap.) Note the measured limit: this moves the *adapter's* copy only (~11% of peak RSS on a 100k-row transaction); the sink still buffers a whole transaction, so the caps stay the honest guard and spilling off stays the default. |
 | **Destination outage mid-drain** (S3/GCS/Azure unreachable) | **No loss** — `peek → flush → ack`: an un-flushed part is not acked, so the next run re-reads those changes. The run fails loud on the write error. | Restore the destination and re-run; the un-acked changes replay. | Alert on run failure; the at-least-once contract makes this a delay, not a loss. |
 | **Process crash mid-drain** (`kill -9`, OOM, node reboot) | **No loss** — the checkpoint advances only after parts are durably committed and acked; a crash re-reads the un-acked tail. Verified: kill mid-5k-drain → resume captures all 5,000. | Re-run; resume continues from the last committed position. | — |
@@ -50,17 +50,24 @@ Two recovery paths cover the table:
    - delete the checkpoint file if there is one (PostgreSQL after a TRUNCATE:
      first move the slot past it with `pg_replication_slot_advance`, as the
      error says);
-   - give the export a baseline, `cdc.initial: snapshot` (or `backfill:`), if
-     it has none; if it has one, clear BOTH its done-signals: the export's
-     `cdc_snapshot` row in the state DB
-     (`DELETE FROM cdc_snapshot WHERE export_name = '<export>'`) and the
-     destination's `snapshot/_SUCCESS` marker. They are OR-ed, so either one
-     left in place skips the baseline;
+   - move every file out of the export's destination (for a `tables:` export,
+     every table's directory under it). The parts there still hold rows the
+     source may no longer have — a row the TRUNCATE removed, or one deleted
+     during the gap, has no event that retracts it — so a reader of the prefix
+     would keep serving it. Each table's `snapshot/_SUCCESS` marker goes with
+     them. A reader that already copied earlier parts elsewhere drops them too;
+   - delete the export's `cdc_snapshot` rows from the state DB, one per table
+     (`DELETE FROM cdc_snapshot WHERE export_name = '<export>'`). The state row
+     and the marker are OR-ed: either one left in place skips that table's
+     baseline;
+   - give the export `cdc.initial: snapshot` if it has none;
    - if a warehouse load consumes this stream, truncate its `<table>__changes`
-     table before the next load (a re-read baseline has no `__pos`, so the
-     log cannot be deduplicated across it; the load refuses without the
-     truncate);
-   - re-run. The run anchors FIRST and re-reads the table after, so nothing
+     table before the next load. A key deleted during the gap has no row in the
+     new baseline, so its older change rows would stay live; on PostgreSQL, and
+     under `layout: base_buffer`, the baseline rows also carry no `__pos`, so
+     every older change outranks them. The load refuses the baseline until the
+     log is empty;
+   - re-run. The run anchors FIRST and re-reads every table after, so nothing
      falls between the two.
 
    A separate `mode: full` export is not a re-baseline. With the `cdc:` block

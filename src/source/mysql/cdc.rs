@@ -1070,11 +1070,11 @@ impl MysqlChangeStream {
                              and refuses rather than writing NULL (which discards the \
                              whole document while every count agrees) or the crate's \
                              `base64:type<N>:…` placeholder (a marker where a number \
-                             belongs). A `mode: full` export of this table renders it \
-                             correctly — the server does the rendering there — so \
-                             snapshot the column, or store it as a JSON string in the \
-                             source so the binlog carries text.",
-                            cols.join(", ")
+                             belongs). A snapshot read renders it correctly — the server \
+                             does the rendering there — so store it as a JSON string in \
+                             the source so the binlog carries text, then: {}",
+                            cols.join(", "),
+                            crate::source::cdc::checkpoint_identity::RECOVER
                         )
                     });
                     let ev = ChangeEvent {
@@ -1826,9 +1826,8 @@ pub(crate) fn xa_prepare_spilled_tail_refusal_message(tail_rows: usize) -> Strin
          lands AFTER the PREPARE the re-read stops at). To proceed: raise \
          RIVET_CDC_MAX_TX_ROWS/_BYTES past this branch's size so the whole branch \
          is scanned in memory — if the branch does not touch a captured table, \
-         capture then continues; if it does, the plain XA refusal fires next with \
-         its own recovery (re-anchor the checkpoint past the branch FIRST, then \
-         re-snapshot the captured tables)."
+         capture then continues; if it does, the plain XA refusal fires next and \
+         names the re-baseline that moves the stream past the branch."
     )
 }
 
@@ -2081,8 +2080,8 @@ mod tests {
             "the one rung that can un-wedge a not-ours branch"
         );
         assert!(
-            msg.contains("re-anchor") && msg.contains("re-snapshot"),
-            "the always-working escape, in the load-bearing order"
+            msg.contains("the plain XA refusal fires next and names the re-baseline"),
+            "the always-working escape is the plain refusal's re-baseline"
         );
         assert!(
             !msg.contains("frames normally"),
@@ -2120,7 +2119,8 @@ mod tests {
         );
         let err = v.verdict().enforce().expect_err("enforced, it refuses");
         assert!(
-            err.to_string().contains("mode: full"),
+            err.to_string()
+                .ends_with(crate::source::cdc::checkpoint_identity::RECOVER),
             "and name the recovery, which is a re-snapshot: the old coordinates \
              cannot be carried to a new server at all"
         );
@@ -2133,7 +2133,10 @@ mod tests {
         assert!(
             v.warning()
                 .expect("but it must SAY so")
-                .contains("per-server"),
+                .contains("per-server")
+                && v.warning()
+                    .unwrap()
+                    .ends_with(crate::source::cdc::checkpoint_identity::RECOVER),
             "the warning has to name the hazard, not just admit ignorance"
         );
 
@@ -3093,25 +3096,26 @@ impl CheckpointIdentity {
     pub(crate) fn verdict(&self) -> IdentityVerdict {
         match (self.refusal(), self.warning()) {
             (Some(why), _) => IdentityVerdict::Foreign(why),
-            (None, Some(warn)) => IdentityVerdict::Unverifiable(warn.into()),
+            (None, Some(warn)) => IdentityVerdict::Unverifiable(warn),
             (None, None) => IdentityVerdict::Ok,
         }
     }
 
     /// What to WARN about when the resume proceeds but could not be verified.
-    pub(crate) fn warning(&self) -> Option<&'static str> {
+    pub(crate) fn warning(&self) -> Option<String> {
         match self {
-            Self::Unverifiable => Some(
+            Self::Unverifiable => Some(format!(
                 "mysql cdc: this checkpoint carries no server identity, so rivet cannot \
                  confirm it belongs to the server it is resuming against. It was written \
                  before rivet recorded one. Binlog coordinates are per-server — if this \
-                 config has ever been pointed at a different host, delete the checkpoint \
-                 and re-snapshot rather than trusting the resume.",
-            ),
+                 config has ever been pointed at a different host, do not trust the resume. {}",
+                crate::source::cdc::checkpoint_identity::RECOVER
+            )),
             Self::GtidUnanswered => Some(
                 "mysql cdc: the server gave no answer to GTID_SUBSET for this checkpoint's \
                  GTID set, so a RESET MASTER since it was written cannot be ruled out; \
-                 resuming on the server uuid alone.",
+                 resuming on the server uuid alone."
+                    .to_string(),
             ),
             _ => None,
         }

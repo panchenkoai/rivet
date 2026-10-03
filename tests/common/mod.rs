@@ -167,25 +167,29 @@ pub fn pg_state_url() -> Option<String> {
 
 /// The re-baseline remedy every CDC data-loss message prints, written out by hand (never read from `src/`).
 pub const REBASELINE_REMEDY: &str = "Re-baseline the stream in one run: delete the checkpoint \
-     file if there is one; give the export a baseline (`cdc.initial: snapshot` or `backfill:`) if \
-     it has none, or clear both done-signals of the one it has (its `cdc_snapshot` row in the \
-     state DB and the destination's snapshot/_SUCCESS marker; either one left in place skips the \
-     baseline); and if a warehouse load consumes this stream, truncate its `<table>__changes` \
-     table before the next load. That run anchors FIRST and re-reads the table after, so nothing \
-     falls between the two. A separate `mode: full` export does not re-baseline the stream.";
+     file if there is one; move every file out of the export's destination (for a `tables:` \
+     export, every table's directory under it): the parts there still hold rows the source may \
+     no longer have, and each table's snapshot/_SUCCESS marker goes with them; delete the \
+     export's `cdc_snapshot` rows (one per table) from the state DB; give the export \
+     `cdc.initial: snapshot` if it has none; and if a warehouse load consumes this stream, \
+     truncate its `<table>__changes` table before the next load. That run anchors FIRST and \
+     re-reads every table after, so nothing falls between the two. A separate `mode: full` \
+     export does not re-baseline the stream.";
 
-/// Follow [`REBASELINE_REMEDY`] on a single-table rig, step by step as printed, then run once.
+/// Follow [`REBASELINE_REMEDY`] on a rig with a local destination, step by step as printed, then run once.
 pub fn follow_rebaseline_remedy(rig: &mut Rig, has_baseline: bool) {
     let _ = std::fs::remove_file(rig.checkpoint());
-    if has_baseline {
-        let cleared = clear_cdc_snapshot(&rig.config_path(), rig.export_name());
-        assert!(
-            cleared > 0,
-            "fixture: the export had no `cdc_snapshot` row to clear"
-        );
-        std::fs::remove_file(rig.out_dir().join("snapshot").join("_SUCCESS"))
-            .expect("fixture: the export had no snapshot/_SUCCESS marker to delete");
-    } else {
+    let out = rig.out_dir();
+    std::fs::rename(&out, out.with_extension("pre-rebaseline"))
+        .expect("move the destination's files aside");
+    std::fs::create_dir_all(&out).expect("recreate the destination");
+    let cleared = clear_cdc_snapshot(&rig.config_path(), rig.export_name());
+    assert_eq!(
+        cleared > 0,
+        has_baseline,
+        "fixture: {cleared} `cdc_snapshot` row(s) for an export whose baseline is {has_baseline}"
+    );
+    if !has_baseline {
         rig.amend_cdc_line("initial: snapshot");
     }
     rig.run_ok();

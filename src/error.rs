@@ -462,29 +462,29 @@ pub mod codes {
     );
     pub const SOURCE_CDC_FOREIGN_CHECKPOINT: Code = refusal(
         "RIVET_SOURCE_CDC_FOREIGN_CHECKPOINT",
-        "re-baseline the stream: delete the checkpoint, give the export a baseline (`cdc.initial: snapshot`) or clear its done-signals, then re-run",
+        "re-baseline the stream: delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, give it `cdc.initial: snapshot`, then re-run",
     );
     pub const SOURCE_CDC_CHECKPOINT_INVALID: Code = refusal(
         "RIVET_SOURCE_CDC_CHECKPOINT_INVALID",
-        "restore the checkpoint file, or re-baseline the stream: delete it, give the export a baseline (`cdc.initial: snapshot`) or clear its done-signals, then re-run",
+        "restore the checkpoint file, or re-baseline the stream: delete it, empty the export's destination, clear its `cdc_snapshot` rows, give it `cdc.initial: snapshot`, then re-run",
     );
     pub const SOURCE_CDC_LOG_GAP: Code = refusal(
         "RIVET_SOURCE_CDC_LOG_GAP",
-        "restore the missing log, or re-baseline the stream: delete the checkpoint, give the export a baseline (`cdc.initial: snapshot`) or clear its done-signals, then re-run",
+        "restore the missing log, or re-baseline the stream: delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, give it `cdc.initial: snapshot`, then re-run",
     );
     /// A captured table was TRUNCATEd: its removed rows have no change events to retract them downstream.
     pub const SOURCE_CDC_TRUNCATED: Code = refusal(
         "RIVET_SOURCE_CDC_TRUNCATED",
-        "re-baseline the stream: delete the checkpoint (PostgreSQL: first advance the slot past the truncate), give the export a baseline (`cdc.initial: snapshot`) or clear its done-signals, then re-run",
+        "re-baseline the stream: delete the checkpoint (PostgreSQL: first advance the slot past the truncate), empty the export's destination, clear its `cdc_snapshot` rows, give it `cdc.initial: snapshot`, then re-run",
     );
     pub const SOURCE_CDC_UNDECODABLE: Code = refusal(
         "RIVET_SOURCE_CDC_UNDECODABLE",
-        "re-baseline the stream: delete the checkpoint, give the export a baseline (`cdc.initial: snapshot`) or clear its done-signals, then re-run",
+        "re-baseline the stream: delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, give it `cdc.initial: snapshot`, then re-run",
     );
     /// A captured cell holding a value the CDC decoder has no faithful reading for.
     pub const SOURCE_CDC_CELL_UNSUPPORTED: Code = refusal(
         "RIVET_SOURCE_CDC_CELL_UNSUPPORTED",
-        "leave the column out of the capture (SQL Server: @captured_column_list), then re-snapshot",
+        "leave the column out of the capture (SQL Server: @captured_column_list), then re-baseline the stream: delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, give it `cdc.initial: snapshot`, then re-run",
     );
     pub const SOURCE_CDC_PREREQUISITE: Code = environment(
         "RIVET_SOURCE_CDC_PREREQUISITE",

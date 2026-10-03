@@ -352,7 +352,7 @@ Recovery:
 | Symptom | Action |
 |---|---|
 | Run failed | Re-run. The checkpoint did not advance, so the data is re-read, not lost |
-| PG slot invalidated/dropped, MySQL binlog purged (ERROR 1236), MSSQL below retention, Oracle archived logs gone, a TRUNCATE | Re-baseline in ONE run (the run anchors first, then re-reads the table): delete the checkpoint file if there is one, AND give the export `cdc.initial: snapshot` if it has no baseline, or clear the export's `cdc_snapshot` row + `snapshot/_SUCCESS` if it has one, AND truncate `<table>__changes` before the next load; then re-run. A separate `mode: full` export does not re-baseline the stream (it is refused into the stream's destination) |
+| PG slot invalidated/dropped, MySQL binlog purged (ERROR 1236), MSSQL below retention, Oracle archived logs gone, a TRUNCATE | Re-baseline in ONE run (the run anchors first, then re-reads every table): delete the checkpoint file if there is one, AND move every file out of the export's destination (old parts still hold removed rows; every `snapshot/_SUCCESS` goes with them), AND delete the export's `cdc_snapshot` rows, AND give the export `cdc.initial: snapshot` if it has none, AND truncate `<table>__changes` before the next load; then re-run. A separate `mode: full` export does not re-baseline the stream (it is refused into the stream's destination) |
 | MySQL checkpoint used against another server | Refused on purpose. Re-baseline on the new host, same steps |
 
 ---

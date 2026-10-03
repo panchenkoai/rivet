@@ -145,6 +145,10 @@ seeds:
         cells:
           - pg_slot_created_warning_remedy_recovers_the_row_written_while_the_slot_was_gone
           - pg_missing_slot_refusal_remedy_recovers_the_row_written_while_the_slot_was_gone
+          - pg_multi_table_missing_slot_refusal_remedy_re_reads_every_table
+          - pg_truncate_refusal_remedy_leaves_no_removed_row_live_in_the_prefix
+          - pg_multi_table_truncate_remedy_recovers_the_other_tables_row_the_advance_skipped
+          - rebaseline_remedy_after_a_truncate_leaves_no_removed_key_live_in_bigquery_postgres
       mysql:
         cells:
           - mysql_missing_checkpoint_warning_remedy_recovers_the_row_written_while_it_was_gone
@@ -154,6 +158,9 @@ seeds:
       mongo:
         cells: [mongo_missing_checkpoint_warning_remedy_recovers_the_document_written_while_it_was_gone]
       oracle:
-        cells: [oracle_cdc_truncate_refusal_remedy_recovers_the_row_written_after_it]
+        cells:
+          - oracle_cdc_truncate_refusal_remedy_leaves_no_removed_row_live_in_the_prefix
+          - oracle_cdc_resume_past_log_retention_fails_loudly
       lib:
-        cells: ["lib:the_rebaseline_remedy_names_the_steps_the_product_runs"]
+        cells:
+          - "lib:the_rebaseline_remedy_names_the_steps_the_product_runs"

@@ -190,12 +190,14 @@ did not grow); live state still equals the source.
 - **Log gone** (slot invalidated, binlog purged — ERROR 1236, MSSQL below
   retention): re-baseline in ONE run, in the product's own order — the run pins
   the anchor first, then re-reads the baseline. To make it do that: delete the
-  checkpoint file if there is one, AND give the export `cdc.initial: snapshot`
-  if it has no baseline, or clear the export's `cdc_snapshot` row and the
-  table's `snapshot/_SUCCESS` if it has one, AND truncate `<table>__changes`
-  before the next load (a re-read baseline has no `__pos`, so the log cannot
-  be deduplicated across it; the load refuses without the truncate); then
-  re-run. Deleting the checkpoint alone is refused once a baseline completed
+  checkpoint file if there is one, AND move every file out of the export's
+  destination (old parts still hold removed rows; every `snapshot/_SUCCESS`
+  goes with them), AND delete the export's `cdc_snapshot` rows, AND give the
+  export `cdc.initial: snapshot` if it has none, AND truncate
+  `<table>__changes` before the next load (a key deleted during the gap has no
+  baseline row to supersede its older changes; the load refuses without the
+  truncate); then re-run. The full list:
+  [re-baseline](reference/cdc-failure-modes.md#the-shape-of-every-recovery). Deleting the checkpoint alone is refused once a baseline completed
   (prior-run evidence exists); on an export without a baseline it re-anchors
   with a warning and accepts the gap.
 - **MySQL checkpoint used against another server**: refused on purpose; same

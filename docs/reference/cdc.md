@@ -806,9 +806,9 @@ outside the database that issued it.
 
 Re-run to resume from the last checkpoint (the common case). If the run reports the
 position is unrecoverable (PostgreSQL slot invalidated, MySQL binlog purged, SQL
-Server retention exceeded), **[re-baseline](cdc-failure-modes.md#the-shape-of-every-recovery) the stream**: delete the checkpoint, give the
-export `cdc.initial: snapshot` (or clear the done-signals of the baseline it has), and
-re-run. That run anchors first and re-reads the table after, so the stream overlaps the
+Server retention exceeded), **[re-baseline](cdc-failure-modes.md#the-shape-of-every-recovery) the stream**: delete the checkpoint, move every
+file out of the export's destination, delete its `cdc_snapshot` rows, give it
+`cdc.initial: snapshot` if it has none, and re-run. That run anchors first and re-reads the table after, so the stream overlaps the
 snapshot (duplicates, which the load deduplicates) instead of leaving the changes in
 between in neither. A separate `mode: full` export is not a re-baseline.
 

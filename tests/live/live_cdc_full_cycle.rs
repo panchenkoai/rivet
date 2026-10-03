@@ -245,3 +245,87 @@ fn full_cdc_cycle_mongo() {
     let scn = CdcScenario::mongo_with("cycle_mg", |r, t| shaped(r, t, "_id", &bq));
     full_cycle(scn, bq);
 }
+
+/// A truncate whose pre-truncate part was flushed but never loaded: the remedy, followed as printed with a BigQuery load, leaves only the source's rows live.
+#[test]
+#[ignore = "live: requires postgres-cdc (wal_level=logical) + BigQuery creds"]
+fn rebaseline_remedy_after_a_truncate_leaves_no_removed_key_live_in_bigquery_postgres() {
+    use postgres::NoTls;
+    let Some(bq) = BqLive::from_env("rb_trunc_pg") else {
+        return;
+    };
+    let table = unique_name("rb_trunc_pg");
+    let slot = unique_name("rb_trunc_pg_slot");
+    let _slot = Slot::new(slot.clone());
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {table}; CREATE TABLE {table} (id BIGINT PRIMARY KEY, v INT); \
+         INSERT INTO {table} VALUES (1, 1), (2, 2), (3, 3)"
+    ))
+    .unwrap();
+    let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, table.clone());
+    let changes = format!("{table}__changes");
+    let _cleanup = bq.cleanup(&[&table, &changes]);
+    let rig = Rig::pg_cdc(&table, &slot)
+        .cdc("initial: snapshot")
+        .dest_gcs_live(&bq.bucket, &bq.prefix)
+        .top_line(&bq.load_line(", pk: [id]"));
+    rig.run_ok();
+    load_ok(&rig);
+    c.execute(&format!("INSERT INTO {table} VALUES (4, 4)"), &[])
+        .unwrap();
+    c.execute(&format!("TRUNCATE {table}"), &[]).unwrap();
+    c.execute(&format!("INSERT INTO {table} VALUES (5, 5)"), &[])
+        .unwrap();
+    let parts_before = bq.gcs_objects().len();
+    let said = rig.run_expect_fail();
+    assert!(
+        said.contains("was TRUNCATEd") && said.contains(REBASELINE_REMEDY),
+        "the refusal names the re-baseline remedy:\n{said}"
+    );
+    assert!(
+        bq.gcs_objects().len() > parts_before,
+        "fixture: the refused run flushed the change before the truncate as a part"
+    );
+    let past: String = c
+        .query_one(
+            &format!(
+                "WITH p AS (SELECT lsn, data FROM pg_logical_slot_peek_changes('{slot}', NULL, NULL)) \
+                 SELECT min(lsn)::text FROM p WHERE data LIKE 'COMMIT%' \
+                 AND lsn > (SELECT max(lsn) FROM p WHERE data LIKE '%{table}%: TRUNCATE:%')"
+            ),
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    c.execute(
+        &format!("SELECT pg_replication_slot_advance('{slot}', '{past}')"),
+        &[],
+    )
+    .unwrap();
+    bq.delete_objects("");
+    assert!(
+        clear_cdc_snapshot(&rig.config_path(), rig.export_name()) > 0,
+        "fixture: the export had a `cdc_snapshot` row to clear"
+    );
+    bq.exec(&format!(
+        "TRUNCATE TABLE `{}.{}.{changes}`",
+        bq.project, bq.dataset
+    ));
+    rig.run_ok();
+    load_ok(&rig);
+    let live: Vec<String> = bq
+        .read_bq_rows(&format!(
+            "SELECT CAST(id AS STRING) AS id FROM `{}.{}.{table}` ORDER BY id",
+            bq.project, bq.dataset
+        ))
+        .iter()
+        .map(|r| r["id"].as_str().expect("an id").to_string())
+        .collect();
+    assert_eq!(
+        live,
+        vec!["5".to_string()],
+        "only the row written after the truncate is live; the flushed but unloaded \
+         pre-truncate insert (4) and the truncated rows (1-3) are not"
+    );
+}

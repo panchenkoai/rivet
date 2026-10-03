@@ -185,9 +185,10 @@ const KNOWN_DEFECTS: &[(&str, &str, &str)] = &[
     ),
 ];
 
-/// `(enclosing fn, class, reason)` of every `.oracle_known_defect("<class>", "<reason>")` call in `text`.
+/// `(enclosing fn, class, reason)` of every `.oracle_known_defect(` / `.run_ok_capture_known_defect(` call in `text`.
 fn known_defect_sites(text: &str) -> Vec<(String, String, String)> {
     text.match_indices(".oracle_known_defect(")
+        .chain(text.match_indices(".run_ok_capture_known_defect("))
         .map(|(i, _)| {
             let before = &text[..i];
             let f = before

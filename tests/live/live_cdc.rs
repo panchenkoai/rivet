@@ -1814,10 +1814,7 @@ fn pg_slot_created_warning_remedy_recovers_the_row_written_while_the_slot_was_go
     ))
     .unwrap();
     let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
-    let mut rig = Rig::pg_cdc(&tbl, &slot).oracle_known_defect(
-            "undelivered rows",
-            "known defect: a PostgreSQL slot dropped under a stream with no checkpoint or baseline is re-created with only a warning, so the row written in the gap is lost until the warning's re-baseline runs",
-        );
+    let mut rig = Rig::pg_cdc(&tbl, &slot);
     rig.run_ok();
     c.batch_execute(&format!("INSERT INTO {tbl} VALUES (1, 10)"))
         .unwrap();
@@ -1826,7 +1823,12 @@ fn pg_slot_created_warning_remedy_recovers_the_row_written_while_the_slot_was_go
         .unwrap();
     c.batch_execute(&format!("INSERT INTO {tbl} VALUES (2, 20)"))
         .unwrap();
-    let said = rig.run_ok_capture();
+    let said = rig.run_ok_capture_known_defect(
+        "undelivered rows",
+        "known defect: a PostgreSQL slot dropped under a stream with no checkpoint or baseline \
+         is re-created with only a warning, so the row written in the gap is lost until the \
+         warning's re-baseline runs",
+    );
     assert!(
         said.contains(&format!("pg cdc: creating replication slot '{slot}'"))
             && said.contains(REBASELINE_REMEDY),
@@ -1875,22 +1877,183 @@ fn pg_missing_slot_refusal_remedy_recovers_the_row_written_while_the_slot_was_go
     );
 }
 
+/// A `tables:` stream whose slot was lost under a completed baseline: the remedy, followed as printed, re-reads every table.
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical) + the rivet-duckdb oracle"]
+fn pg_multi_table_missing_slot_refusal_remedy_re_reads_every_table() {
+    use postgres::NoTls;
+    let (ta, tb) = (unique_name("cdc_mrb_a"), unique_name("cdc_mrb_b"));
+    let slot = unique_name("rivet_mrb_slot");
+    let _slot = Slot::new(slot.clone());
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    for t in [&ta, &tb] {
+        c.batch_execute(&format!(
+            "DROP TABLE IF EXISTS {t}; CREATE TABLE {t} (id INT PRIMARY KEY, v INT); \
+             INSERT INTO {t} VALUES (1, 10)"
+        ))
+        .unwrap();
+    }
+    let _guards = (
+        PgTable::adopt_on(POSTGRES_CDC_URL, ta.clone()),
+        PgTable::adopt_on(POSTGRES_CDC_URL, tb.clone()),
+    );
+    let mut rig = Rig::pg_cdc(&ta, &slot)
+        .tables(&[&ta, &tb])
+        .cdc_line("initial: snapshot");
+    rig.run_ok();
+    c.execute("SELECT pg_drop_replication_slot($1)", &[&slot])
+        .unwrap();
+    for t in [&ta, &tb] {
+        c.execute(&format!("INSERT INTO {t} VALUES (2, 20)"), &[])
+            .unwrap();
+    }
+    let said = rig.run_expect_fail();
+    assert!(
+        said.contains("is missing but a prior run completed this export's snapshot")
+            && said.contains(REBASELINE_REMEDY),
+        "the refusal names the re-baseline remedy:\n{said}"
+    );
+    follow_rebaseline_remedy(&mut rig, true);
+    for t in [&ta, &tb] {
+        assert_eq!(
+            dir_parquet_id_set(&rig.out_dir().join(t).join("snapshot")),
+            [1, 2].into(),
+            "table {t}: the re-read baseline holds the row written while the slot was gone"
+        );
+    }
+}
+
+/// A truncate after its rows went out as change parts: the slot advanced as the refusal says, then the remedy, leaves the prefix holding only the source's rows.
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical) + the rivet-duckdb oracle"]
+fn pg_truncate_refusal_remedy_leaves_no_removed_row_live_in_the_prefix() {
+    use postgres::NoTls;
+    let tbl = unique_name("cdc_trrb");
+    let slot = unique_name("rivet_trrb");
+    let _slot = Slot::new(slot.clone());
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"
+    ))
+    .unwrap();
+    let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
+    let mut rig = Rig::pg_cdc(&tbl, &slot);
+    rig.run_ok();
+    c.execute(&format!("INSERT INTO {tbl} VALUES (1, 10)"), &[])
+        .unwrap();
+    rig.run_ok();
+    c.execute(&format!("TRUNCATE {tbl}"), &[]).unwrap();
+    c.execute(&format!("INSERT INTO {tbl} VALUES (2, 20)"), &[])
+        .unwrap();
+    let said = rig.run_expect_fail();
+    assert!(
+        said.contains("was TRUNCATEd") && said.contains(REBASELINE_REMEDY),
+        "the refusal names the slot advance and the re-baseline remedy:\n{said}"
+    );
+    let past: String = c
+        .query_one(
+            &format!(
+                "WITH p AS (SELECT lsn, data FROM pg_logical_slot_peek_changes('{slot}', NULL, NULL)) \
+                 SELECT min(lsn)::text FROM p WHERE data LIKE 'COMMIT%' \
+                 AND lsn > (SELECT max(lsn) FROM p WHERE data LIKE '%{tbl}%: TRUNCATE:%')"
+            ),
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    c.execute(
+        &format!("SELECT pg_replication_slot_advance('{slot}', '{past}')"),
+        &[],
+    )
+    .unwrap();
+    follow_rebaseline_remedy(&mut rig, false);
+    assert_eq!(
+        dir_parquet_id_set(&rig.out_dir().join("snapshot")),
+        [2].into(),
+        "the remedy's baseline holds the row written after the truncate, and only it"
+    );
+}
+
+/// A `tables:` stream whose truncate transaction also wrote another table: the slot advance skips that row, and the remedy's re-read of every table recovers it.
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical) + the rivet-duckdb oracle"]
+fn pg_multi_table_truncate_remedy_recovers_the_other_tables_row_the_advance_skipped() {
+    use postgres::NoTls;
+    let (ta, tb) = (unique_name("cdc_mtr_a"), unique_name("cdc_mtr_b"));
+    let slot = unique_name("rivet_mtr_slot");
+    let _slot = Slot::new(slot.clone());
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    for t in [&ta, &tb] {
+        c.batch_execute(&format!(
+            "DROP TABLE IF EXISTS {t}; CREATE TABLE {t} (id INT PRIMARY KEY, v INT); \
+             INSERT INTO {t} VALUES (1, 10)"
+        ))
+        .unwrap();
+    }
+    let _guards = (
+        PgTable::adopt_on(POSTGRES_CDC_URL, ta.clone()),
+        PgTable::adopt_on(POSTGRES_CDC_URL, tb.clone()),
+    );
+    let mut rig = Rig::pg_cdc(&ta, &slot)
+        .tables(&[&ta, &tb])
+        .cdc_line("initial: snapshot");
+    rig.run_ok();
+    c.batch_execute(&format!(
+        "BEGIN; TRUNCATE {ta}; INSERT INTO {tb} VALUES (2, 20); COMMIT"
+    ))
+    .unwrap();
+    c.execute(&format!("INSERT INTO {ta} VALUES (2, 20)"), &[])
+        .unwrap();
+    let said = rig.run_expect_fail();
+    assert!(
+        said.contains("was TRUNCATEd") && said.contains(REBASELINE_REMEDY),
+        "the refusal names the slot advance and the re-baseline remedy:\n{said}"
+    );
+    let past: String = c
+        .query_one(
+            &format!(
+                "WITH p AS (SELECT lsn, data FROM pg_logical_slot_peek_changes('{slot}', NULL, NULL)) \
+                 SELECT min(lsn)::text FROM p WHERE data LIKE 'COMMIT%' \
+                 AND lsn > (SELECT max(lsn) FROM p WHERE data LIKE '%{ta}%: TRUNCATE:%')"
+            ),
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    c.execute(
+        &format!("SELECT pg_replication_slot_advance('{slot}', '{past}')"),
+        &[],
+    )
+    .unwrap();
+    follow_rebaseline_remedy(&mut rig, true);
+    assert_eq!(
+        dir_parquet_id_set(&rig.out_dir().join(&ta).join("snapshot")),
+        [2].into(),
+        "the truncated table's baseline holds only the row written after the truncate"
+    );
+    assert_eq!(
+        dir_parquet_id_set(&rig.out_dir().join(&tb).join("snapshot")),
+        [1, 2].into(),
+        "the other table's baseline holds the row its truncate transaction wrote"
+    );
+}
+
 /// A lost checkpoint's warning remedy, followed as printed, re-reads a row written while it was gone.
 #[test]
 #[ignore = "live: requires docker compose --profile cdc mysql-cdc + the rivet-duckdb oracle"]
 fn mysql_missing_checkpoint_warning_remedy_recovers_the_row_written_while_it_was_gone() {
-    let mut s = CdcScenario::mysql_with("cdc_ckgap", "id INT PRIMARY KEY, v BIGINT", |r, _| {
-        r.oracle_known_defect(
-            "undelivered rows",
-            "known defect: a lost MySQL checkpoint on a stream with no baseline re-anchors with only a warning, so the row written in the gap is lost until the warning's re-baseline runs",
-        )
-    });
+    let mut s = CdcScenario::mysql_with("cdc_ckgap", "id INT PRIMARY KEY, v BIGINT", |r, _| r);
     s.rig.run_ok();
     s.insert(1);
     s.rig.run_ok();
     std::fs::remove_file(s.rig.checkpoint()).expect("the checkpoint the run wrote");
     s.insert(2);
-    let said = s.rig.run_ok_capture();
+    let said = s.rig.run_ok_capture_known_defect(
+        "undelivered rows",
+        "known defect: a lost MySQL checkpoint on a stream with no baseline re-anchors with \
+         only a warning, so the row written in the gap is lost until the warning's \
+         re-baseline runs",
+    );
     assert!(
         said.contains("mysql cdc: no checkpoint at") && said.contains(REBASELINE_REMEDY),
         "the re-anchor warns with the re-baseline remedy:\n{said}"
@@ -9117,9 +9280,9 @@ fn a_json_opaque_leaf_is_refused_loudly_and_only_for_the_captured_table() {
          somewhere'. Got:\n{said}"
     );
     assert!(
-        said.contains("mode: full") || said.to_lowercase().contains("snapshot"),
+        said.contains(REBASELINE_REMEDY),
         "and hand over what actually works: the server renders this document \
-         correctly for a batch read, so snapshotting the column is the way out. \
+         correctly for a snapshot read, so the stream's re-baseline is the way out. \
          Got:\n{said}"
     );
 }

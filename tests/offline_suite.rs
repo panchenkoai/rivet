@@ -93,6 +93,8 @@ mod oracle_read_scope_guard;
 mod perf_matrix_guard;
 #[path = "offline/planner_fuzz.rs"]
 mod planner_fuzz;
+#[path = "offline/rebaseline_remedy_one_home.rs"]
+mod rebaseline_remedy_one_home;
 #[path = "offline/redaction_invariant.rs"]
 mod redaction_invariant;
 #[path = "offline/release_gate_matrix_guard.rs"]

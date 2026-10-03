@@ -32,12 +32,12 @@ Every failure rivet names carries a stable `RIVET_<FAMILY>_<NAME>` code: in `--j
 | `RIVET_TYPE_UNSAFE_MAPPING` | usage | 1 | add a `columns:` override the engine delivers exactly, CAST or drop the column in the export's `query:`, or run without `--strict` to accept it with a warning |
 | `RIVET_SOURCE_STATEMENT_TIMEOUT` | environment | 2 if transient, else 1 | raise `tuning.statement_timeout_s`, or narrow the chunk |
 | `RIVET_SOURCE_CURSOR_FINER_THAN_MICROSECOND` | refusal | 5 | cursor on a column at microsecond precision or coarser, or cast the cursor to TIMESTAMP(6) in a curated query |
-| `RIVET_SOURCE_CDC_FOREIGN_CHECKPOINT` | refusal | 5 | re-baseline the stream: delete the checkpoint, give the export a baseline (`cdc.initial: snapshot`) or clear its done-signals, then re-run |
-| `RIVET_SOURCE_CDC_CHECKPOINT_INVALID` | refusal | 5 | restore the checkpoint file, or re-baseline the stream: delete it, give the export a baseline (`cdc.initial: snapshot`) or clear its done-signals, then re-run |
-| `RIVET_SOURCE_CDC_LOG_GAP` | refusal | 5 | restore the missing log, or re-baseline the stream: delete the checkpoint, give the export a baseline (`cdc.initial: snapshot`) or clear its done-signals, then re-run |
-| `RIVET_SOURCE_CDC_TRUNCATED` | refusal | 5 | re-baseline the stream: delete the checkpoint (PostgreSQL: first advance the slot past the truncate), give the export a baseline (`cdc.initial: snapshot`) or clear its done-signals, then re-run |
-| `RIVET_SOURCE_CDC_UNDECODABLE` | refusal | 5 | re-baseline the stream: delete the checkpoint, give the export a baseline (`cdc.initial: snapshot`) or clear its done-signals, then re-run |
-| `RIVET_SOURCE_CDC_CELL_UNSUPPORTED` | refusal | 5 | leave the column out of the capture (SQL Server: @captured_column_list), then re-snapshot |
+| `RIVET_SOURCE_CDC_FOREIGN_CHECKPOINT` | refusal | 5 | re-baseline the stream: delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, give it `cdc.initial: snapshot`, then re-run |
+| `RIVET_SOURCE_CDC_CHECKPOINT_INVALID` | refusal | 5 | restore the checkpoint file, or re-baseline the stream: delete it, empty the export's destination, clear its `cdc_snapshot` rows, give it `cdc.initial: snapshot`, then re-run |
+| `RIVET_SOURCE_CDC_LOG_GAP` | refusal | 5 | restore the missing log, or re-baseline the stream: delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, give it `cdc.initial: snapshot`, then re-run |
+| `RIVET_SOURCE_CDC_TRUNCATED` | refusal | 5 | re-baseline the stream: delete the checkpoint (PostgreSQL: first advance the slot past the truncate), empty the export's destination, clear its `cdc_snapshot` rows, give it `cdc.initial: snapshot`, then re-run |
+| `RIVET_SOURCE_CDC_UNDECODABLE` | refusal | 5 | re-baseline the stream: delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, give it `cdc.initial: snapshot`, then re-run |
+| `RIVET_SOURCE_CDC_CELL_UNSUPPORTED` | refusal | 5 | leave the column out of the capture (SQL Server: @captured_column_list), then re-baseline the stream: delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, give it `cdc.initial: snapshot`, then re-run |
 | `RIVET_SOURCE_CDC_PREREQUISITE` | environment | 2 if transient, else 1 | apply the setup statement the message names, then re-run (docs/reference/cdc.md) |
 | `RIVET_SOURCE_VALUE_UNREPRESENTABLE` | refusal | 5 | map the value to a representable one in the export's `query:`, or exclude the column |
 | `RIVET_SOURCE_OVERRIDE_WIRE_MISMATCH` | usage | 1 | remove or correct the column's `columns:` override (batch: or CAST the column to that type in the export's `query:`; CDC: then re-snapshot the table) |

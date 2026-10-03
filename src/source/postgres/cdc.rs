@@ -2476,7 +2476,8 @@ mod tests {
 
         let msg = truncate_refusal_message("public", "orders");
         assert!(
-            msg.contains("public.orders") && msg.contains("mode: full"),
+            msg.contains("public.orders")
+                && msg.ends_with(crate::source::cdc::checkpoint_identity::RECOVER),
             "the refusal must name the table AND the re-snapshot that recovers from \
              it; a bail with no way forward just moves the operator's problem: {msg}"
         );
@@ -3599,15 +3600,16 @@ mod slot_creation_warning_tests {
              WAL position, so changes written before now are NOT captured. On a first run this \
              is expected. If this slot existed before, it was dropped or invalidated and the \
              changes since then are not in this stream. Re-baseline the stream in one run: \
-             delete the checkpoint file if there is one; give the export a baseline \
-             (`cdc.initial: snapshot` or `backfill:`) if it has none, or clear both done-signals \
-             of the one it has (its `cdc_snapshot` row in the state DB and the destination's \
-             snapshot/_SUCCESS marker; either one left in place skips the baseline); and if a \
-             warehouse load consumes this stream, truncate its `<table>__changes` table before \
-             the next load. That run anchors FIRST and re-reads the table after, so nothing \
-             falls between the two. A separate `mode: full` export does not re-baseline the \
-             stream. Set `cdc.checkpoint:` to turn this case into a hard error instead of a \
-             warning."
+             delete the checkpoint file if there is one; move every file out of the export's \
+             destination (for a `tables:` export, every table's directory under it): the parts \
+             there still hold rows the source may no longer have, and each table's \
+             snapshot/_SUCCESS marker goes with them; delete the export's `cdc_snapshot` rows \
+             (one per table) from the state DB; give the export `cdc.initial: snapshot` if it \
+             has none; and if a warehouse load consumes this stream, truncate its \
+             `<table>__changes` table before the next load. That run anchors FIRST and re-reads \
+             every table after, so nothing falls between the two. A separate `mode: full` export \
+             does not re-baseline the stream. Set `cdc.checkpoint:` to turn this case into a \
+             hard error instead of a warning."
         );
     }
 

@@ -254,18 +254,18 @@ fn mongo_cdc_initial_snapshot_covers_preexisting_rows() {
 fn mongo_missing_checkpoint_warning_remedy_recovers_the_document_written_while_it_was_gone() {
     require_alive(LiveService::MongoRs);
     require_alive(LiveService::DuckDb);
-    let mut s = CdcScenario::mongo_with("cdc_ckgap", |r, _| {
-        r.oracle_known_defect(
-            "undelivered rows",
-            "known defect: a lost MongoDB checkpoint on a stream with no baseline re-anchors with only a warning, so the document written in the gap is lost until the warning's re-baseline runs",
-        )
-    });
+    let mut s = CdcScenario::mongo_with("cdc_ckgap", |r, _| r);
     s.rig.run_ok();
     s.insert(1);
     s.rig.run_ok();
     std::fs::remove_file(s.rig.checkpoint()).expect("the checkpoint the run wrote");
     s.insert(2);
-    let said = s.rig.run_ok_capture();
+    let said = s.rig.run_ok_capture_known_defect(
+        "undelivered rows",
+        "known defect: a lost MongoDB checkpoint on a stream with no baseline re-anchors with \
+         only a warning, so the document written in the gap is lost until the warning's \
+         re-baseline runs",
+    );
     assert!(
         said.contains("mongodb cdc: no checkpoint at") && said.contains(REBASELINE_REMEDY),
         "the re-anchor warns with the re-baseline remedy:\n{said}"
