@@ -217,6 +217,8 @@ pub(crate) struct ChangeEvent {
     pub(crate) row_id: Option<String>,
     /// Names of `before`'s cells when they are not `image_names` (PostgreSQL's key-only pre-image).
     pub(crate) before_names: Option<std::sync::Arc<[String]>>,
+    /// A deferred refusal of an undecodable old-image cell, raised only where the old image is written.
+    pub(crate) before_poison: Option<String>,
 }
 
 /// Stamps each change with its intra-transaction ordinal ([`ChangeEvent::seq`]).
@@ -430,11 +432,20 @@ impl ChangeEvent {
                 a.len() * std::mem::size_of::<String>() + a.iter().map(String::len).sum::<usize>();
             own / std::sync::Arc::strong_count(a).max(1)
         });
+        let before_names = self.before_names.as_ref().map_or(0, |a| {
+            let own: usize =
+                a.len() * std::mem::size_of::<String>() + a.iter().map(String::len).sum::<usize>();
+            own / std::sync::Arc::strong_count(a).max(1)
+        });
+        let text = |s: &Option<String>| s.as_ref().map_or(0, String::len);
         std::mem::size_of::<Self>()
             + self.schema.len()
             + self.table.len()
-            + self.poison.as_ref().map_or(0, String::len)
+            + text(&self.poison)
+            + text(&self.before_poison)
+            + text(&self.row_id)
             + names
+            + before_names
             + img(&self.before)
             + img(&self.after)
             + json_resident_bytes(&self.position.0)
@@ -449,6 +460,14 @@ impl ChangeEvent {
     /// next sink calls, not a rule two drivers must each remember to inline.
     pub(crate) fn raise_poison(&self) -> Result<()> {
         if let Some(poison) = &self.poison {
+            anyhow::bail!("{poison}");
+        }
+        Ok(())
+    }
+
+    /// Surface the old image's deferred decode error; for a consumer that writes the old image.
+    pub(crate) fn raise_before_poison(&self) -> Result<()> {
+        if let Some(poison) = &self.before_poison {
             anyhow::bail!("{poison}");
         }
         Ok(())
@@ -520,13 +539,6 @@ pub(crate) trait ChangeStream {
     fn engine(&self) -> CdcEngine;
 }
 
-/// `rivet cdc` driver. Streams canonical changes from any engine adapter,
-/// emitting one NDJSON object per change to stdout and persisting the resume
-/// position after each (when `checkpoint` is set). Stops at end of stream,
-/// `max_events`, or interruption.
-///
-/// (The typed Parquet/CSV sink is the separate [`sink::run_to_files`] driver —
-/// ADR-0023 keeps the two loops apart on purpose.)
 /// The first declared key column the table does not have, matched as images match names.
 pub(crate) fn undeclared_key_column<'k>(
     key: &'k [String],
@@ -562,6 +574,13 @@ pub(crate) fn ndjson_line(ev: &ChangeEvent) -> serde_json::Value {
     line
 }
 
+/// `rivet cdc` driver. Streams canonical changes from any engine adapter,
+/// emitting one NDJSON object per change to stdout and persisting the resume
+/// position after each (when `checkpoint` is set). Stops at end of stream,
+/// `max_events`, or interruption.
+///
+/// (The typed Parquet/CSV sink is the separate [`sink::run_to_files`] driver —
+/// ADR-0023 keeps the two loops apart on purpose.)
 pub(crate) fn run(
     stream: &mut dyn ChangeStream,
     checkpoint: Option<PathBuf>,
@@ -602,6 +621,7 @@ pub(crate) fn run(
         // `unchanged-toast-datum` sentinel verbatim as the column value (silent
         // corruption). An uncaptured table's poison was already dropped above.
         ev.raise_poison()?;
+        ev.raise_before_poison()?;
         println!("{}", ndjson_line(&ev));
         emitted += 1;
         // Checkpoint AFTER emitting the captured event — never before. A crash in
@@ -2144,6 +2164,7 @@ mod mod_decisions {
             poison: None,
             row_id: None,
             before_names: None,
+            before_poison: None,
         };
         let mut seq = TxnSeq::default();
 
@@ -2190,6 +2211,7 @@ mod mod_decisions {
             poison: None,
             row_id: None,
             before_names: None,
+            before_poison: None,
         };
         let empty = mk(None, None).estimated_bytes();
         // The FIXED cost of a buffered change: the struct in the queue's backing
@@ -2629,6 +2651,7 @@ mod tests {
             poison: None,
             row_id: None,
             before_names: None,
+            before_poison: None,
         };
         // tx1 = 1,2,3 (boundary at 3) and tx2 = 4,5,6 (boundary at 6). The cap is
         // 2, so it lands INSIDE tx1 — the shape with no boundary to stop at.
@@ -2960,6 +2983,7 @@ mod tests {
             poison: None,
             row_id: None,
             before_names: None,
+            before_poison: None,
         }
     }
 
@@ -3064,6 +3088,7 @@ mod tests {
             ),
             row_id: None,
             before_names: None,
+            before_poison: None,
         }
     }
 
@@ -3109,6 +3134,48 @@ mod tests {
         );
     }
 
+    /// The resident cost counts an event's own old-image names, row id and old-image poison.
+    #[test]
+    fn estimated_bytes_counts_before_names_row_id_and_before_poison() {
+        let bare = super::ChangeEvent {
+            op: super::ChangeOp::Update,
+            schema: "public".into(),
+            table: "t".into(),
+            before: Some(vec![RivetValue::Int(1)]),
+            after: Some(vec![RivetValue::Int(2)]),
+            position: Position(serde_json::json!({ "lsn": "0/ABC" })),
+            committed: true,
+            image_names: None,
+            seq: 0,
+            poison: None,
+            row_id: None,
+            before_names: None,
+            before_poison: None,
+        };
+        let base = bare.estimated_bytes();
+        let names = super::ChangeEvent {
+            before_names: Some(vec!["identifier".to_string()].into()),
+            ..bare.clone()
+        };
+        assert_eq!(
+            names.estimated_bytes(),
+            base + std::mem::size_of::<String>() + "identifier".len()
+        );
+        let shared = names.before_names.clone();
+        assert_eq!(
+            names.estimated_bytes(),
+            base + (std::mem::size_of::<String>() + "identifier".len()) / 2,
+            "an Arc held twice charges each holder half"
+        );
+        drop(shared);
+        let ids = super::ChangeEvent {
+            row_id: Some("AAAVrg".into()),
+            before_poison: Some("bad".into()),
+            ..bare
+        };
+        assert_eq!(ids.estimated_bytes(), base + 6 + 3);
+    }
+
     /// A key-only pre-image prints as carried, named by `before_columns`; a key move stays one update.
     #[test]
     fn an_ndjson_line_names_a_key_only_pre_image_and_does_not_split() {
@@ -3125,6 +3192,7 @@ mod tests {
             poison: None,
             row_id: None,
             before_names: Some(vec!["id".to_string()].into()),
+            before_poison: None,
         };
         assert_eq!(
             super::ndjson_line(&ev),
@@ -3136,6 +3204,7 @@ mod tests {
         );
         let full = super::ChangeEvent {
             before_names: None,
+            before_poison: None,
             before: Some(vec![RivetValue::Bytes(b"a".to_vec()), RivetValue::Int(1)]),
             ..ev
         };
@@ -3197,6 +3266,7 @@ mod tests {
             poison: None,
             row_id: None,
             before_names: None,
+            before_poison: None,
         };
         let payload = ev.payload_bytes();
         assert_eq!(

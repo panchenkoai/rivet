@@ -154,6 +154,7 @@ pub(crate) fn split_move(
     if !moved {
         return Ok(None);
     }
+    ev.raise_before_poison()?;
     let delete = ChangeEvent {
         op: ChangeOp::Delete,
         after: None,
@@ -453,6 +454,7 @@ mod tests {
             poison: None,
             row_id: None,
             before_names: None,
+            before_poison: None,
         }
     }
 
@@ -568,6 +570,7 @@ mod tests {
                 let ev = ChangeEvent {
                     before: Some(before),
                     before_names: Some(names.into()),
+                    before_poison: None,
                     after: Some(after.clone()),
                     image_names: Some(vec!["a".into(), "b".into(), "v".into()].into()),
                     ..update(None, "0")
@@ -604,6 +607,54 @@ mod tests {
             key_text(&["a".to_string()], &[Bytes(b"Null".to_vec())], &key[..1]),
             "NULL and the text `Null`"
         );
+    }
+
+    /// An undecodable old cell refuses only a split, which writes the old image; a kept update never reads it.
+    #[test]
+    fn an_undecodable_old_cell_refuses_a_split_and_nothing_else() {
+        use RivetValue::{Int, Null};
+        let key = vec!["id".to_string()];
+        for undecodable_is_key in [true, false] {
+            for key_changes in [true, false] {
+                for undecodable in [true, false] {
+                    let old_id = if undecodable && undecodable_is_key {
+                        Null
+                    } else {
+                        Int(1)
+                    };
+                    let old_v = if undecodable && !undecodable_is_key {
+                        Null
+                    } else {
+                        Int(5)
+                    };
+                    let new_id = if key_changes { Int(2) } else { Int(1) };
+                    let ev = ChangeEvent {
+                        before: Some(vec![old_id, old_v]),
+                        after: Some(vec![new_id, Int(6)]),
+                        image_names: Some(vec!["id".into(), "v".into()].into()),
+                        before_poison: undecodable.then(|| "old cell undecodable".to_string()),
+                        ..update(None, "0")
+                    };
+                    let got = split_move(&ev, &key, None, &[], CdcEngine::Postgres);
+                    let case = format!(
+                        "key cell {undecodable_is_key}, key changes {key_changes}, undecodable {undecodable}"
+                    );
+                    let splits = key_changes || (undecodable && undecodable_is_key);
+                    match (undecodable && splits, got) {
+                        (true, Err(e)) => {
+                            assert!(e.to_string().contains("old cell undecodable"), "{case}")
+                        }
+                        (false, Ok(split)) => assert_eq!(split.is_some(), splits, "{case}"),
+                        (want_refusal, other) => {
+                            panic!(
+                                "{case}: refusal expected {want_refusal}, got {:?}",
+                                other.map(|s| s.is_some())
+                            )
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// The key is compared by NAME across full images, never by position in a partial one.

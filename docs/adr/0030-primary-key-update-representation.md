@@ -179,8 +179,16 @@ base-and-buffer table, is written as `delete(before)` at the event's `__seq` and
     and `pg_cdc_a_declared_key_absent_from_the_old_key_does_not_split`, now see
     one `update`.
   - An old cell PostgreSQL cannot decode (`infinity`, a BC date, 24:00) is
-    refused like the same cell in a new row, never written as the NULL of a
-    delete (`pg_cdc_an_undecodable_old_cell_in_a_key_move_is_refused_not_nulled`).
+    carried as `ChangeEvent.before_poison`. It is raised only where the old image
+    is written: the delete of a split (`split_move`), and `rivet cdc` NDJSON
+    `before`. So a key move over such a cell is refused
+    (`pg_cdc_an_undecodable_old_cell_in_a_key_move_is_refused_not_nulled`). An
+    UPDATE that keeps its key is delivered as before this ADR
+    (`pg_cdc_an_undecodable_old_cell_beside_an_unchanged_key_is_delivered`).
+  - A first cut poisoned the whole event. Review then found the regression
+    (measured, live): a FULL table holding `infinity` from before the capture,
+    `UPDATE SET v = 'b', valid_until = '2025-01-01'` (no key change), was refused
+    naming `valid_until` at every replay of that position.
 - **A statement that renumbers keys.** Oracle checks uniqueness per statement, so
   `UPDATE t SET id = id + 1` is logged as `1 -> 2`, then `2 -> 3`. Split naively,
   the delete of key 2 lands after the insert that moved row 1 into 2, and that
@@ -270,10 +278,15 @@ MongoDB.
   logged before a row moves into it, and there is nothing to pair. SQL Server
   logs each key's delete before its insert at one `__$seqval` (measured), with
   no row identity.
-- **A PostgreSQL table whose changes carry no old image.** Three tables are
-  affected: one under `REPLICA IDENTITY NOTHING`, one under `DEFAULT` with no
-  primary key, and one whose primary key is `DEFERRABLE` (a deferrable key is not
-  used as the replica identity).
+- **A PostgreSQL table whose changes carry no old image.** Four tables are
+  affected:
+  - one under `REPLICA IDENTITY NOTHING`;
+  - one under `USING INDEX` whose index was dropped. The PostgreSQL docs say "If
+    this index is dropped, the behavior is the same as `NOTHING`". Measured:
+    `relreplident` stays `i`, and the DELETE reads `(no-tuple-data)`.
+  - one under `DEFAULT` with no primary key;
+  - one whose primary key is `DEFERRABLE` (a deferrable key is not used as the
+    replica identity).
   - Measured with `test_decoding`: the UPDATE carries no `old-key:` section, and
     a DELETE reads `(no-tuple-data)`.
   - So no split happens, and the old key stays live. That is the pre-ADR
@@ -283,8 +296,10 @@ MongoDB.
     predates this ADR and is its own defect.
   - The capture warns at open, once per such table, naming it schema-qualified,
     with the cause, the loss and the remedy (`no_old_key_warning`, decided by
-    `old_image` over `pg_class.relreplident` and `pg_index.indimmediate`,
-    resolved by `to_regclass`). The key-only-delete warning names what each other
+    `old_image` over `pg_class.relreplident`, the primary key's
+    `pg_index.indimmediate` and whether an `indisreplident` index exists,
+    resolved by `to_regclass`). A first cut read `relreplident = 'i'` as "the
+    index's columns" even after the index was dropped. The key-only-delete warning names what each other
     non-FULL table's DELETE carries (`row_image_verdict`).
   - Every remedy was measured from the degraded state.
     - `REPLICA IDENTITY FULL` makes the UPDATE carry the whole old row.
@@ -299,6 +314,21 @@ MongoDB.
     Oracle (measured: `old-key: id:1 v:'a' new-tuple: id:2 v:'a'`, then
     `2 -> 3`, then `3 -> 4`, each with the whole old row), so the split and the
     renumber ordering apply.
+- **SQL Server.** An UPDATE of the primary key is the change table's own delete
+  and insert. This was measured on a clustered key and on a nonclustered key over a heap
+  (`UPDATE SET id = 9`, `SET id = id + 10`: each key's op 1 then op 2 at one
+  `__$seqval`). rivet reads `N'all'`, which returns only an UPDATE's new row, so
+  an in-place UPDATE of a declared `load.pk:` that is not the primary key (op 3/4,
+  measured) is not split, and its old key stays live. Reading `N'all update old'`
+  would carry the old image; that belongs to the SQL Server adapter, not this
+  sink rule.
+- **PostgreSQL FULL, a NULL old key cell.** `test_decoding` does not print a NULL
+  old cell (measured: `old-key: id[integer]:1 v[text]:'a'` for a row whose `code`
+  was NULL). A declared key column that goes from NULL to a value is absent from
+  the old image, so that UPDATE is not split.
+- **MySQL session-level `NOBLOB`.** An UPDATE that changes both the key and a
+  BLOB column carries an old image without the unchanged BLOBs. The image cannot
+  be read by name, so it is not split. The global setting is refused at open.
 - **A key column the replica identity does not log.** Under
   `REPLICA IDENTITY USING INDEX` on an index that is not the key, or with a
   declared `load.pk:` that is not the primary key, an UPDATE that changes such a

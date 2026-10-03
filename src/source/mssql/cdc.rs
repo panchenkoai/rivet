@@ -999,6 +999,7 @@ impl MssqlChangeStream {
                 poison: None,
                 row_id: None,
                 before_names: None,
+                before_poison: None,
             };
             // Memory backstop: a `__$start_lsn` group can be arbitrarily large and is
             // buffered whole. Past the cap the event spills through the general tagged

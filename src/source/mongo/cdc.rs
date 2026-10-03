@@ -775,6 +775,7 @@ fn to_change_event(
         poison: None,
         row_id: None,
         before_names: None,
+        before_poison: None,
     };
     // #158: Mongo's model — a SINGLE-document write's change event IS its own commit (post-commit
     // oplog), so it is a boundary. A MULTI-document transaction (one lsid/txnNumber) shares one

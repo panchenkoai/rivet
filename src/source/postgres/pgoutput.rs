@@ -716,6 +716,7 @@ impl Assembler {
                     poison: None,
                     row_id: None,
                     before_names: None,
+                    before_poison: None,
                 }
             })
             .collect()

@@ -800,6 +800,7 @@ mod tests {
             poison: None,
             row_id: None,
             before_names: None,
+            before_poison: None,
         };
         use crate::source::cdc::RivetValue as V;
         let seeds = [
@@ -1419,6 +1420,7 @@ pub(crate) fn encode_event(ev: &ChangeEvent) -> Vec<u8> {
     out.extend_from_slice(&ev.seq.to_be_bytes());
     put_opt_str(&mut out, ev.poison.as_deref());
     put_opt_str(&mut out, ev.row_id.as_deref());
+    put_opt_str(&mut out, ev.before_poison.as_deref());
     put_names(&mut out, ev.image_names.as_deref());
     put_names(&mut out, ev.before_names.as_deref());
     put_image(&mut out, ev.before.as_deref());
@@ -1523,6 +1525,11 @@ pub(crate) fn decode_event(rec: &[u8]) -> Result<ChangeEvent> {
     } else {
         Some(c.string()?)
     };
+    let before_poison = if c.u8()? == 0 {
+        None
+    } else {
+        Some(c.string()?)
+    };
     let image_names = get_names(&mut c)?;
     let before_names = get_names(&mut c)?;
     let before = get_image(&mut c)?;
@@ -1550,6 +1557,7 @@ pub(crate) fn decode_event(rec: &[u8]) -> Result<ChangeEvent> {
         poison,
         row_id,
         before_names,
+        before_poison,
     })
 }
 
@@ -1576,6 +1584,7 @@ mod frame_tests {
             poison: None,
             row_id: None,
             before_names: None,
+            before_poison: None,
         }
     }
 
@@ -1606,6 +1615,7 @@ mod frame_tests {
             poison,
             row_id,
             before_names,
+            before_poison,
         } = &back;
         assert_eq!(op.as_str(), e.op.as_str(), "op");
         assert_eq!(schema, &e.schema, "schema");
@@ -1615,6 +1625,7 @@ mod frame_tests {
         assert_eq!(seq, &e.seq, "seq");
         assert_eq!(poison, &e.poison, "poison");
         assert_eq!(row_id, &e.row_id, "row_id");
+        assert_eq!(before_poison, &e.before_poison, "before_poison");
         assert_eq!(
             before_names.as_deref(),
             e.before_names.as_deref(),
@@ -1752,6 +1763,9 @@ mod frame_tests {
         let mut r = ev();
         r.row_id = Some("AAAVrgAAYAABQk7AAA".into());
         cases.push(("row id", r));
+        let mut bp = ev();
+        bp.before_poison = Some(String::new());
+        cases.push(("before poison empty", bp));
         let mut b = ev();
         b.before_names = Some(vec!["id".to_string()].into());
         cases.push(("before names", b));
@@ -2056,6 +2070,7 @@ mod spill_cost {
             poison: None,
             row_id: None,
             before_names: None,
+            before_poison: None,
         }
     }
 
@@ -2253,6 +2268,7 @@ mod event_cost {
             poison: None,
             row_id: None,
             before_names: None,
+            before_poison: None,
         }
     }
 

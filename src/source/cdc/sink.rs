@@ -1944,6 +1944,7 @@ mod tests {
             poison: None,
             row_id: None,
             before_names: None,
+            before_poison: None,
         }
     }
 
@@ -2998,6 +2999,7 @@ mod tests {
             poison: None,
             row_id: None,
             before_names: None,
+            before_poison: None,
         };
         let mut cols = vec![
             decimal_col("placeholder", 38, 0), // SQL Server: scale unknown at resolve

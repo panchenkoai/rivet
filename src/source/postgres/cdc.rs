@@ -357,22 +357,13 @@ pub(crate) fn classify_routing(rel: &RelationRouting<'_>) -> RoutingVerdict {
 }
 
 impl PgChangeStream {
-    /// Connect and ensure a `test_decoding` logical slot named `slot` exists
-    /// (idempotent — reuses an existing slot, which is how a real run resumes).
-    ///
-    /// `prior` = the prior-run evidence the caller found. With any, a
-    /// MISSING slot is a loud error, never a silent re-create: the slot was
-    /// dropped or invalidated, and a fresh slot would anchor at the *current*
-    /// position — silently skipping every change since the drop.
-    ///
-    /// A [`DrainMode::BoundedAtOpen`] run snapshots `pg_current_wal_lsn()` once
-    /// and stops at the first commit past it — see [`Self::bound`].
     /// Each captured table's old image, from its replica identity and primary key; a catalog error answers nothing.
     pub(crate) fn old_images_on(client: &mut Client, tables: &[String]) -> Vec<(String, OldImage)> {
         let Ok(rows) = client.query(
             "SELECT quote_ident(n.nspname) || '.' || quote_ident(c.relname), c.relreplident::text, \
                     (SELECT i.indimmediate FROM pg_index i \
-                      WHERE i.indrelid = c.oid AND i.indisprimary) \
+                      WHERE i.indrelid = c.oid AND i.indisprimary), \
+                    EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = c.oid AND i.indisreplident) \
                FROM unnest($1::text[]) AS t(name) \
                JOIN pg_class c ON c.oid = to_regclass(t.name) \
                JOIN pg_namespace n ON n.oid = c.relnamespace \
@@ -382,7 +373,12 @@ impl PgChangeStream {
             return Vec::new();
         };
         rows.iter()
-            .map(|r| (r.get(0), old_image(&r.get::<_, String>(1), r.get(2))))
+            .map(|r| {
+                (
+                    r.get(0),
+                    old_image(&r.get::<_, String>(1), r.get(2), r.get(3)),
+                )
+            })
             .collect()
     }
 
@@ -568,6 +564,16 @@ impl PgChangeStream {
         Self::check_configured_tables_are_routable(&mut client, configured_tables, false)
     }
 
+    /// Connect and ensure a `test_decoding` logical slot named `slot` exists
+    /// (idempotent — reuses an existing slot, which is how a real run resumes).
+    ///
+    /// `prior` = the prior-run evidence the caller found. With any, a
+    /// MISSING slot is a loud error, never a silent re-create: the slot was
+    /// dropped or invalidated, and a fresh slot would anchor at the *current*
+    /// position — silently skipping every change since the drop.
+    ///
+    /// A [`DrainMode::BoundedAtOpen`] run snapshots `pg_current_wal_lsn()` once
+    /// and stops at the first commit past it — see [`Self::bound`].
     // Eight positional arguments, and a struct would not improve it: every one is
     // a distinct decision the caller must make consciously (which slot, whether a
     // resume is expected, the peek budget, the drain bound, what may be routed,
@@ -1468,23 +1474,26 @@ pub(crate) fn parse_test_decoding(
     let unrecovered = recover_unchanged_toast(&mut named, old_named.as_deref());
     // Same deferral, same reason: the slot decodes every table in the database, so
     // an unrepresentable value on an UNCAPTURED table must not bail this run.
-    let infinite: Vec<String> = named
-        .iter()
-        .chain(old_named.iter().flatten())
-        .filter(|c| c.unrepresentable)
-        .map(|c| c.name.clone())
-        .collect();
-    let infinity_poison = (!infinite.is_empty()).then(|| {
-        format!(
-            "pg cdc: {schema}.{table}: column(s) [{}] hold a value rivet cannot decode \
-             faithfully (e.g. `infinity`, a BC date, a time of 24:00:00). rivet \
-             refuses rather than writing NULL, because a NULL here is \
-             indistinguishable from a genuinely absent value and every count and \
-             checksum would agree about the loss. Map such values to representable \
-             ones in the source, or exclude the column from capture.",
-            infinite.join(", ")
-        )
-    });
+    let undecodable = |cols: &[ParsedColumn]| {
+        let bad: Vec<&str> = cols
+            .iter()
+            .filter(|c| c.unrepresentable)
+            .map(|c| c.name.as_str())
+            .collect();
+        (!bad.is_empty()).then(|| {
+            format!(
+                "pg cdc: {schema}.{table}: column(s) [{}] hold a value rivet cannot decode \
+                 faithfully (e.g. `infinity`, a BC date, a time of 24:00:00). rivet \
+                 refuses rather than writing NULL, because a NULL here is \
+                 indistinguishable from a genuinely absent value and every count and \
+                 checksum would agree about the loss. Map such values to representable \
+                 ones in the source, or exclude the column from capture.",
+                bad.join(", ")
+            )
+        })
+    };
+    let infinity_poison = undecodable(&named);
+    let before_poison = old_named.as_deref().and_then(undecodable);
     let poison = (!unrecovered.is_empty()).then(|| {
         format!(
             "pg cdc: {schema}.{table}: column(s) [{}] arrived as an unchanged-TOAST \
@@ -1534,6 +1543,7 @@ pub(crate) fn parse_test_decoding(
         poison: poison.or(infinity_poison),
         row_id: None,
         before_names,
+        before_poison,
     }))
 }
 
@@ -1550,15 +1560,21 @@ pub(crate) enum OldImage {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum NoOldKey {
     IdentityNothing,
+    DroppedIdentityIndex,
     DeferrableKey,
     NoPrimaryKey,
 }
 
-/// The old image `relreplident` gives, with `pk_immediate` the primary key's `indimmediate` (`None`: no key).
-pub(crate) fn old_image(relreplident: &str, pk_immediate: Option<bool>) -> OldImage {
+/// The old image `relreplident` gives: `pk_immediate` is the primary key's `indimmediate`, `identity_index` whether an `indisreplident` index exists.
+pub(crate) fn old_image(
+    relreplident: &str,
+    pk_immediate: Option<bool>,
+    identity_index: bool,
+) -> OldImage {
     match (relreplident, pk_immediate) {
         ("f", _) => OldImage::WholeRow,
-        ("i", _) => OldImage::IndexColumns,
+        ("i", _) if identity_index => OldImage::IndexColumns,
+        ("i", _) => OldImage::NoKey(NoOldKey::DroppedIdentityIndex),
         ("n", _) => OldImage::NoKey(NoOldKey::IdentityNothing),
         (_, Some(true)) => OldImage::PrimaryKey,
         (_, Some(false)) => OldImage::NoKey(NoOldKey::DeferrableKey),
@@ -1574,6 +1590,16 @@ pub(crate) fn no_old_key_warning(table: &str, why: NoOldKey) -> String {
             format!(
                 "Run `ALTER TABLE {table} REPLICA IDENTITY FULL;`, or `ALTER TABLE {table} \
                  REPLICA IDENTITY DEFAULT;` if it has a primary key"
+            ),
+        ),
+        NoOldKey::DroppedIdentityIndex => (
+            "has REPLICA IDENTITY USING INDEX on an index that no longer exists, which PostgreSQL \
+             treats as NOTHING"
+                .to_string(),
+            format!(
+                "Run `ALTER TABLE {table} REPLICA IDENTITY FULL;`, or `ALTER TABLE {table} \
+                 REPLICA IDENTITY USING INDEX <index>;` on an existing unique index of NOT NULL \
+                 columns"
             ),
         ),
         NoOldKey::DeferrableKey => (
@@ -1605,7 +1631,10 @@ pub(crate) fn row_image_verdict(images: &[(String, OldImage)]) -> crate::source:
         .iter()
         .filter_map(|(t, img)| match img {
             OldImage::PrimaryKey => Some(format!("{t} (its primary key)")),
-            OldImage::IndexColumns => Some(format!("{t} (its replica identity index's columns)")),
+            OldImage::IndexColumns => Some(format!(
+                "{t} (its replica identity index's columns; an UPDATE that changes a key column \
+                 outside that index stays one update)"
+            )),
             OldImage::WholeRow | OldImage::NoKey(_) => None,
         })
         .collect();
@@ -2936,7 +2965,7 @@ mod tests {
         assert_eq!(ev.before, None);
     }
 
-    /// An old-image cell rivet cannot decode poisons the event by name, as the same cell in a new row does.
+    /// An undecodable old-image cell is a deferred refusal of the OLD image only; the event itself is clean.
     #[test]
     fn an_undecodable_old_image_cell_poisons_the_update() {
         let line = "table public.t: UPDATE: old-key: id[integer]:1 \
@@ -2945,9 +2974,10 @@ mod tests {
         let ev = parse_test_decoding("0/ABC", line, &Domains::new())
             .unwrap()
             .unwrap();
+        assert_eq!(ev.poison, None, "the new row decodes");
         let poison = ev
-            .poison
-            .expect("the old `infinity` is refused, not nulled");
+            .before_poison
+            .expect("the old `infinity` is refused where the old image is written");
         assert!(
             poison.contains("column(s) [valid_until] hold a value"),
             "{poison}"
@@ -3739,16 +3769,17 @@ mod slot_creation_warning_tests {
     #[test]
     fn old_image_follows_the_replica_identity_and_the_key() {
         use crate::source::postgres::cdc::{NoOldKey::*, OldImage::*, old_image};
-        for (ident, pk, want) in [
-            ("f", Some(false), WholeRow),
-            ("f", None, WholeRow),
-            ("i", Some(true), IndexColumns),
-            ("n", Some(true), NoKey(IdentityNothing)),
-            ("d", Some(true), PrimaryKey),
-            ("d", Some(false), NoKey(DeferrableKey)),
-            ("d", None, NoKey(NoPrimaryKey)),
+        for (ident, pk, index, want) in [
+            ("f", Some(false), false, WholeRow),
+            ("f", None, false, WholeRow),
+            ("i", Some(true), true, IndexColumns),
+            ("i", Some(true), false, NoKey(DroppedIdentityIndex)),
+            ("n", Some(true), false, NoKey(IdentityNothing)),
+            ("d", Some(true), false, PrimaryKey),
+            ("d", Some(false), false, NoKey(DeferrableKey)),
+            ("d", None, false, NoKey(NoPrimaryKey)),
         ] {
-            assert_eq!(old_image(ident, pk), want, "{ident} {pk:?}");
+            assert_eq!(old_image(ident, pk, index), want, "{ident} {pk:?} {index}");
         }
     }
 
@@ -3775,6 +3806,15 @@ mod slot_creation_warning_tests {
                 "table s.t1 has REPLICA IDENTITY NOTHING, {lost} Run `ALTER TABLE s.t1 REPLICA \
                  IDENTITY FULL;`, or `ALTER TABLE s.t1 REPLICA IDENTITY DEFAULT;` if it has a \
                  primary key"
+            )
+        );
+        assert_eq!(
+            no_old_key_warning("s.t1", DroppedIdentityIndex),
+            format!(
+                "table s.t1 has REPLICA IDENTITY USING INDEX on an index that no longer exists, \
+                 which PostgreSQL treats as NOTHING, {lost} Run `ALTER TABLE s.t1 REPLICA \
+                 IDENTITY FULL;`, or `ALTER TABLE s.t1 REPLICA IDENTITY USING INDEX <index>;` on \
+                 an existing unique index of NOT NULL columns"
             )
         );
         assert_eq!(
@@ -3808,7 +3848,8 @@ mod slot_creation_warning_tests {
                 why,
                 "2 of the captured table(s) put only a key in a DELETE, while INSERT and UPDATE \
                  keep their whole new-row image: public.orders (its primary key), public.items \
-                 (its replica identity index's columns). `ALTER TABLE <t> REPLICA IDENTITY FULL` \
+                 (its replica identity index's columns; an UPDATE that changes a key column \
+                 outside that index stays one update). `ALTER TABLE <t> REPLICA IDENTITY FULL` \
                  if the before-image matters"
             ),
             other => panic!("a key-only identity must warn, got {other:?}"),

@@ -583,8 +583,10 @@ So the MERGE below retracts the old key with no extra step. The key is the
 export's declared `load.pk:` when there is one, otherwise the table's primary
 key, read from the source at the start of the run. `pk: none` means no key, so
 nothing is split. A declared key column the table does not have fails the run at
-the start, naming the column. SQL Server's change table already records such an
-UPDATE as a delete and an insert; MongoDB's `_id` cannot change.
+the start, naming the column. SQL Server's change table already records an
+UPDATE of the primary key as a delete and an insert. This was measured with a
+clustered key and with a nonclustered key on a heap; rivet reads only the new row
+of any other UPDATE. MongoDB's `_id` cannot change.
 
 An UPDATE counts as a key change only when its old image carries EVERY key
 column and one of them differs. A column the old image does not carry is absent,
@@ -615,16 +617,37 @@ What this does not handle:
   non-key columns are all equal loses a row. The same applies to PostgreSQL with
   a `DEFERRABLE` primary key under `REPLICA IDENTITY FULL`, which carries no row
   identity.
-- **A PostgreSQL table whose changes carry no old image.** This is a table with
-  `REPLICA IDENTITY NOTHING`, a table without a primary key under
-  `REPLICA IDENTITY DEFAULT`, or a table whose primary key is `DEFERRABLE`
-  (PostgreSQL does not use a deferrable key as the replica identity). An UPDATE on
+- **A key change the old image cannot show stays one `update`, and its old key
+  stays live.** Nothing warns about these cases:
+  - PostgreSQL under `REPLICA IDENTITY FULL`, with a declared `load.pk:` column
+    that goes from NULL to a value. `test_decoding` does not print the NULL old
+    cell, so the old image does not carry that key column.
+  - MySQL with a session-level `binlog_row_image = NOBLOB` (the global setting is
+    refused at the start), when one UPDATE changes both the key and a BLOB/TEXT
+    column. The old image then lacks the unchanged BLOBs and cannot be read by
+    name.
+  - SQL Server with a declared `load.pk:` that is not the primary key. An UPDATE
+    of that column is an update in place, and rivet reads only the new row.
+- **A PostgreSQL table whose changes carry no old image.** This covers four
+  cases:
+  - a table with `REPLICA IDENTITY NOTHING`;
+  - `REPLICA IDENTITY USING INDEX` on an index that has since been dropped, which
+    PostgreSQL treats as `NOTHING`;
+  - a table without a primary key under `REPLICA IDENTITY DEFAULT`;
+  - a table whose primary key is `DEFERRABLE` (PostgreSQL does not use a
+    deferrable key as the replica identity). An UPDATE on
   such a table carries no old values, and a DELETE carries no columns at all. So a
   key change stays one `update` and the old key stays live, and a DELETE retracts
   nothing downstream. The run warns at the start, naming each such table
   schema-qualified, with its remedy: `REPLICA IDENTITY FULL`; for a deferrable
   key, also `REPLICA IDENTITY USING INDEX` on a non-deferrable unique index (which
-  then rejects `SET id = id + 1`); for no key, a primary key.
+  then rejects `SET id = id + 1`); for a dropped index, an existing one; for no
+  key, a primary key.
+
+An old-image cell rivet cannot decode (`infinity`, a BC date, 24:00) refuses the
+run only where the old image is written: the delete of a key change, and the
+`before` of `rivet cdc` NDJSON. An UPDATE that keeps its key is delivered as
+before.
 
 Downstream applies it by primary key:
 
@@ -713,10 +736,12 @@ prefix to stay small.
 Without `--output`, rivet emits the changes as NDJSON (one JSON object per change)
 to stdout, as the engine delivered them: `op`, `schema`, `table`, `before`,
 `after`, `pos`, `seq`. NDJSON is NOT split: a key change is one `update` line.
-`before` holds the old image's cells in the order the engine logged them. When
-those are not the row's columns (PostgreSQL logs only the replica identity's
-columns unless it is `FULL`), the line adds `before_columns`, which names them;
-a column it does not name was not logged.
+`before` holds the old image's cells in the order the engine logged them. On
+PostgreSQL every UPDATE that carries an old image also gets `before_columns`, which
+names those cells. That is the replica identity's columns, or under
+`REPLICA IDENTITY FULL` the whole old row minus its NULL cells, which
+`test_decoding` does not print. A column `before_columns` does not name was
+either not logged or NULL.
 
 ## Why CDC is gentle on the source
 

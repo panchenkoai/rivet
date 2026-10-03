@@ -1145,6 +1145,7 @@ impl OracleChangeStream {
                 poison: None,
                 row_id,
                 before_names: None,
+                before_poison: None,
             },
         })
     }

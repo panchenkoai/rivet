@@ -1523,6 +1523,28 @@ fn pg_cdc_an_undecodable_old_cell_in_a_key_move_is_refused_not_nulled() {
     );
 }
 
+/// An UPDATE that keeps its key writes no old image, so an undecodable old cell (`infinity`, from
+/// before the capture) beside it does not refuse the change: it is delivered as one update.
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn pg_cdc_an_undecodable_old_cell_beside_an_unchanged_key_is_delivered() {
+    let tbl = unique_name("cdc_pkinfk");
+    let ops = pg_capture_ops(
+        &tbl,
+        &format!(
+            "CREATE TABLE {tbl} (id INT PRIMARY KEY, v TEXT, valid_until TIMESTAMPTZ); \
+             ALTER TABLE {tbl} REPLICA IDENTITY FULL; \
+             INSERT INTO {tbl} VALUES (1, 'a', 'infinity');"
+        ),
+        &format!("UPDATE {tbl} SET v = 'b', valid_until = '2025-01-01' WHERE id = 1;"),
+        |r| r,
+    );
+    assert_eq!(
+        ops,
+        vec![("update".to_string(), Some(1), Some("b".to_string()))]
+    );
+}
+
 /// A table whose changes carry no old image (a DEFERRABLE key under REPLICA IDENTITY DEFAULT,
 /// REPLICA IDENTITY NOTHING, no primary key) gets a warning naming it schema-qualified, the cause,
 /// what is lost, and the remedy. A same-named table in another schema with an ordinary key gets none.
@@ -1601,6 +1623,30 @@ fn pg_cdc_warns_about_a_table_whose_changes_carry_no_old_image() {
          if it has a primary key"
     );
     assert!(out.contains(&want), "want {want:?} in:\n{out}");
+    let dropped = format!("public.{}", unique_name("cdc_pkdix"));
+    let out = said(
+        &dropped,
+        &format!(
+            "CREATE TABLE {dropped} (id INT PRIMARY KEY, v TEXT NOT NULL); \
+             CREATE UNIQUE INDEX {}_v ON {dropped} (v); \
+             ALTER TABLE {dropped} REPLICA IDENTITY USING INDEX {}_v; \
+             DROP INDEX {}_v;",
+            dropped.trim_start_matches("public."),
+            dropped.trim_start_matches("public."),
+            dropped
+        ),
+    );
+    let want = format!(
+        "postgres cdc: table {dropped} has REPLICA IDENTITY USING INDEX on an index that no \
+         longer exists, which PostgreSQL treats as NOTHING, {lost} Run `ALTER TABLE {dropped} \
+         REPLICA IDENTITY FULL;`, or `ALTER TABLE {dropped} REPLICA IDENTITY USING INDEX \
+         <index>;` on an existing unique index of NOT NULL columns"
+    );
+    assert!(out.contains(&want), "want {want:?} in:\n{out}");
+    assert!(
+        !out.contains(&format!("{dropped} (its replica identity index")),
+        "a dropped index is not a key-only delete: {out}"
+    );
     let keyless = format!("public.{}", unique_name("cdc_pknok"));
     let out = said(
         &keyless,

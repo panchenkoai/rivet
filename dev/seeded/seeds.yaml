@@ -135,10 +135,12 @@ seeds:
           - pg_cdc_a_declared_key_absent_from_the_old_key_does_not_split
           - an_update_of_a_replica_identity_index_reaches_the_base_as_one_update_postgres
       mysql:
+        # A unit on a fabricated NOBLOB-shaped image (mysql_common pushes only the bitmap's columns); no live
+        # NOBLOB cell, because a global NOBLOB/MINIMAL is refused at open and a session-level writer is not staged.
         patch: absent-old-cell-read-as-moved-key/lib.patch
         cells: ["lib:a_key_moves_only_when_a_key_column_differs_between_full_images"]
       mssql:
-        na: the change table's update rows carry every captured column in both images, so no key cell is ever absent
+        na: rivet reads fn_cdc_get_all_changes with N'all', which returns only an UPDATE's new row (op 4; map_op drops op 3), so an UPDATE reaches split_move with no old image and key_moves never reads one. A primary-key UPDATE arrives as the change table's own delete + insert (measured 2026-10-03 on a clustered key and on a nonclustered key over a heap)
       oracle:
         na: a change whose redo lacks any captured column's value is refused in `mined` (image_sides), so an Oracle image never has an absent cell
       mongo:
