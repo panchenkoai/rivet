@@ -40,15 +40,6 @@ struct Leg {
     seen_runs: Vec<String>,
 }
 
-fn state_url() -> Option<String> {
-    let url = std::env::var("RIVET_TEST_STATE_URL").ok()?;
-    if !url.starts_with("postgres") {
-        skip_live("shared-state: RIVET_TEST_STATE_URL is not Postgres — nothing to share");
-        return None;
-    }
-    Some(url)
-}
-
 /// A per-engine dataset, recreated empty, so four same-named exports can each
 /// own their table and a crashed earlier invocation leaves nothing behind.
 fn dataset_for(bq: &BqLive, engine: &str) -> BqLive {
@@ -302,7 +293,7 @@ fn warehouse_counts(
 ) -> (i64, i64, i64) {
     if bq.read_bq_table_type(&format!("{wh}__changes")).is_some() {
         // The same shared state every other step of the leg runs against.
-        let state = state_url().expect("the shared state URL that admitted this test");
+        let state = pg_state_url().expect("the shared state URL that admitted this test");
         let cfg = cfg.to_string_lossy();
         let out = run_rivet_env(&["compact", "-c", &cfg], &[("RIVET_STATE_URL", &state)]);
         assert!(
@@ -600,7 +591,7 @@ fn same_named_configs_share_a_postgres_state_cdc_cycle() {
     let Some(bq) = BqLive::from_env("same_cdc") else {
         return;
     };
-    let Some(state) = state_url() else {
+    let Some(state) = pg_state_url() else {
         return;
     };
     require_alive(LiveService::MongoRs);
@@ -615,7 +606,7 @@ fn same_named_configs_share_a_postgres_state_batch_cycle() {
     let Some(bq) = BqLive::from_env("same_batch") else {
         return;
     };
-    let Some(state) = state_url() else {
+    let Some(state) = pg_state_url() else {
         return;
     };
     require_alive(LiveService::MongoRs);
@@ -631,7 +622,7 @@ fn same_named_configs_share_a_postgres_state_batch_cycle() {
 #[ignore = "live: requires postgres + mysql + a Postgres state URL"]
 fn same_named_incremental_configs_on_a_postgres_state_keep_their_own_cursor() {
     use mysql::prelude::Queryable as _;
-    let Some(state) = state_url() else {
+    let Some(state) = pg_state_url() else {
         return;
     };
     let name = unique_name("sn_inc");

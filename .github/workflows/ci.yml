@@ -1682,14 +1682,51 @@ jobs:
           --skip a_non_unicode_database_round_trips
           --skip a_read_blocked_longer_than_thirty_seconds_still_completes
 
+      - name: Self-skip census
+        # libtest prints `ok` for a test that returned early, so `skip_live` writes every self-skip
+        # to target/rivet-skips.log. The release gate fails any self-skip outside core.SKIP_ALLOWED;
+        # this job applies the same list plus the prerequisites it knowingly lacks, named in LACKING
+        # so a reader sees what this job does NOT grade. Any other self-skip is a test this job was to
+        # run and did not. (Before this step 10 of the 11 live_pg_state tests, among others, passed here
+        # in 0.00 s with no record at all; measured 2026-10-02.)
+        if: ${{ !cancelled() }}
+        env:
+          # One prerequisite per line; a skip whose reason names it is explained.
+          LACKING: |
+            BIGQUERY_TEST_PROJECT
+            SNOWFLAKE_TEST_CONNECTION
+            RIVET_TEST_STATE_URL
+            RIVET_TEST_EXCLUSIVE
+            pgbouncer-state (:6433)
+            pg18-batch (:5518)
+            duckdb package is not importable
+            duckdb CLI: false
+          # BIGQUERY_TEST_PROJECT / SNOWFLAKE_TEST_CONNECTION: no warehouse credentials here (same as
+          #   `--skip warehouse_cell`); the lib's ignored warehouse tests run under `--ignored` too.
+          # RIVET_TEST_STATE_URL: postgres-state is not started here; the gate runs the Postgres-state
+          #   tests (verify_state_migrations, the derived live-module cell).
+          # RIVET_TEST_EXCLUSIVE: the suite runs threaded on a shared stand; the gate runs those alone.
+          # pgbouncer-state / pg18-batch: services this job's compose line does not start.
+          # duckdb package / CLI: the source-parity sweeps spawn bare `python3`, which has no pinned
+          #   duckdb outside `uv run`, and the drain row-hash test calls a host `duckdb` binary; the
+          #   gate runs all three (`uv run` puts the pinned package first; its host has the binary).
+          #   Measured: these were the 3 unexplained self-skips on this step's first run.
+        run: |
+          python3 -m dev.release_oracle.skip_census target/rivet-skips.log --lacking "$LACKING"
+
       - name: Rig oracle verdict census
         # A passing test's stderr is hidden, so the verdict log is the only proof the oracle ran.
         # What it proves: the oracle graded at least one run, and the runs it did NOT fully grade
         # (SKIP, PARTIAL) did not grow past the recorded ceilings. It cannot see a run no test
         # started, nor a hand-built spawn (tests/offline/rig_oracle_ratchet.rs counts those).
-        # A ceiling is lowered when a gap closes, raised only in a reviewed diff (measured on #393: SKIP 331 = 103 first-run + 228, PARTIAL 189 = 150 first-run + 39;
-        # on #401: SKIP 174 = 125 first-run + 49, PARTIAL 191 = 152 first-run + 39. FIRST_RUN rose 253 -> 277 because
-        # multi-table and cloud CDC streams, SKIPped whole before #401, now reach the first-run classes).
+        # Each count must land within NOISE of its ceiling BOTH ways: over it is a run the oracle used to
+        # grade and no longer does; under it is a closed gap, and the ceiling comes down in the same PR so
+        # a later regression cannot spend the headroom (the offline ratchets in tests/offline/*_ratchet.rs
+        # are exact for the same reason). Measured on #393: SKIP 331 = 103 first-run + 228, PARTIAL 189 =
+        # 150 first-run + 39; on #401: SKIP 174 = 125 first-run + 49, PARTIAL 191 = 152 first-run + 39.
+        # FIRST_RUN rose 253 -> 277 because multi-table and cloud CDC streams, SKIPped whole before #401,
+        # now reach the first-run classes; on main @ae9afce0 (run 37064116384): SKIP 188 = 139 + 49,
+        # PARTIAL 204 = 165 + 39, FIRST_RUN 304.
         if: ${{ !cancelled() }}
         # A CDC stream's first run lands in SKIP (it delivered nothing) or PARTIAL (it delivered some)
         # depending on timing, so those two classes share one ceiling; every other class keeps its own.
@@ -1697,8 +1734,10 @@ jobs:
           SKIP_CEILING: 49
           PARTIAL_CEILING: 39
           FIRST_RUN_CEILING: 304  # +14 measured on #411: its redo-log-switch storm test opens 12 fresh streams, plus #407 failover cells
-          # Timing moves a few verdicts between runs of one commit (measured: cdc.backfill 14-16,
-          # first-run CDC 103-105); each ceiling allows that much and no more.
+          # Timing moves a few verdicts between runs of one commit, in every counter: the
+          # `cdc.backfill` SKIP class 14-16 and `settle:` PARTIALs ride rivet's clock, first-run CDC
+          # 103-105. An exact band would fail a clean commit, so each counter allows that much, in
+          # both directions, and no more.
           NOISE: 3
         run: |
           log=target/rivet-oracle.log
@@ -1714,9 +1753,14 @@ jobs:
           fs=$(first SKIP "the stream's first run delivered nothing")
           fp=$(first PARTIAL "the stream's first graded run")
           echo "first CDC runs: SKIP $fs + PARTIAL $fp = $((fs + fp)) (ceiling $FIRST_RUN_CEILING)"
-          [ $((fs + fp)) -le $((FIRST_RUN_CEILING + NOISE)) ] || { echo "::error::$((fs + fp)) first-run CDC verdicts, ceiling $FIRST_RUN_CEILING"; exit 1; }
-          [ $(( $(count SKIP) - fs )) -le $((SKIP_CEILING + NOISE)) ] || { echo "::error::$(( $(count SKIP) - fs )) SKIP verdicts besides first CDC runs, ceiling $SKIP_CEILING: a run the oracle used to grade is no longer graded"; exit 1; }
-          [ $(( $(count PARTIAL) - fp )) -le $((PARTIAL_CEILING + NOISE)) ] || { echo "::error::$(( $(count PARTIAL) - fp )) PARTIAL verdicts besides first CDC runs, ceiling $PARTIAL_CEILING"; exit 1; }
+          # band LABEL COUNT CEILING: within NOISE of the ceiling, both ways.
+          band() {
+            [ "$2" -le $(($3 + NOISE)) ] || { echo "::error::$2 $1, ceiling $3: a run the oracle used to grade is no longer graded"; exit 1; }
+            [ "$2" -ge $(($3 - NOISE)) ] || { echo "::error::$2 $1, ceiling $3: a gap closed - lower the ceiling to $2 in this PR so a later regression cannot spend the headroom"; exit 1; }
+          }
+          band "first-run CDC verdicts" $((fs + fp)) "$FIRST_RUN_CEILING"
+          band "SKIP verdicts besides first CDC runs" $(( $(count SKIP) - fs )) "$SKIP_CEILING"
+          band "PARTIAL verdicts besides first CDC runs" $(( $(count PARTIAL) - fp )) "$PARTIAL_CEILING"
 
       - name: Stop services
         if: always()

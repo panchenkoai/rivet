@@ -378,9 +378,25 @@ def _self_test() -> int:
             _sc.verify_live_only_coverage(probe)
             rows = {c.scenario: c.status for c in probe.cells}
             assert rows.get("battery") == want, probe.cells
+        # A self-skip in the battery fails its row unless another stage grades that test.
+        for skipped, want in (("other::t — X unset", Status.FAIL),
+                              (f"{_sc.STATE_URL_LIB_TESTS[0]} — RIVET_TEST_STATE_URL unset", Status.PASS)):
+            def _skipping_run(argv, env=None, _line=skipped, **_k):
+                if "llvm-cov" in argv:
+                    return _core.Proc(list(argv), 1, "", "")
+                Path(env["RIVET_SKIP_LOG"]).write_text(f"RIVET-SKIP {_line}\n")
+                return _core.Proc(list(argv), 0, "", "")
+            _sc.run = _skipping_run
+            probe = Ledger(colour=False)
+            _sc.verify_live_only_coverage(probe)
+            rows = {c.scenario: c.status for c in probe.cells}
+            assert rows.get("battery") == want, (skipped, probe.cells)
     finally:
         _sc.run, _sc.have = real_run, real_have
-    print("self-test ok: without cargo-llvm-cov the offline battery is still graded")
+    names = _sc.STATE_URL_LIB_TESTS
+    assert _sc.libtest_unrun("running 0 tests\ntest result: ok. 0 passed", names) == list(names)
+    assert _sc.libtest_unrun("".join(f"test {n} ... ok\n" for n in names), names) == []
+    print("self-test ok: without cargo-llvm-cov the offline battery is still graded, its self-skips too")
     # A graded harm counter past prev × tol + slack fails; noise within it passes; a counter
     # only one binary records is not compared.
     hv = regression.harm_verdict
@@ -499,6 +515,9 @@ def _self_test() -> int:
     sentinels._self_test()
     print("self-test ok: sentinel verdicts (exact, or a loud non-panic refusal on a risky value)")
     _stages_self_test()
+    from . import skip_census
+
+    skip_census._self_test()
     print("\nregression stage (child harness, stand, banner):")
     return regression._self_test()
 

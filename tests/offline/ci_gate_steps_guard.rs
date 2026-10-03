@@ -61,6 +61,11 @@ const GATES: &[(&str, &str, &str)] = &[
         "PR regression matrices (cli + cfg + path)",
         "python3 -m dev.pytools.matrices --tier=pr --skip-compose | tee dev/matrices/run.log",
     ),
+    (
+        "e2e",
+        "Self-skip census",
+        "python3 -m dev.release_oracle.skip_census target/rivet-skips.log --lacking \"$LACKING\"",
+    ),
 ];
 
 fn steps_of(ci: &serde_yaml_ng::Value, job: &str) -> Vec<serde_yaml_ng::Value> {

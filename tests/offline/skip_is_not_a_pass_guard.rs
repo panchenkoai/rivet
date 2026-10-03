@@ -19,7 +19,7 @@
 //! failed — an early return of an empty vec from a runner whose result feeds the
 //! floor.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn harness_source() -> String {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/harness/mod.rs");
@@ -327,8 +327,10 @@ fn a_missing_env_var_returns_through_skip_live() {
             }
         }
     }
+    // 9 -> 7 (2026-10-02): three tests/live sites now go through `pg_state_url()`, which
+    // `every_env_gated_live_test_records_its_skip` below grades in every shape.
     assert!(
-        seen >= 9,
+        seen >= 7,
         "found only {seen} env-var let-else returns — the scan lost its subject"
     );
     assert!(
@@ -337,4 +339,189 @@ fn a_missing_env_var_returns_through_skip_live() {
          credential reads as a pass:\n  {}",
         offenders.join("\n  ")
     );
+}
+
+/// Every `.rs` file under `dir`, recursively.
+fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    for e in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display())) {
+        let p = e.unwrap().path();
+        if p.is_dir() {
+            rs_files(&p, out);
+        } else if p.extension().is_some_and(|x| x == "rs") {
+            out.push(p);
+        }
+    }
+}
+
+/// `line` with its string literals blanked, so a `?` or `return` inside a message is not code.
+fn without_strings(line: &str) -> String {
+    let mut out = String::new();
+    let mut in_str = false;
+    let mut escaped = false;
+    for c in line.chars() {
+        match (in_str, c) {
+            (true, '\\') if !escaped => escaped = true,
+            (true, '"') if !escaped => in_str = false,
+            (true, _) => escaped = false,
+            (false, '"') => in_str = true,
+            (false, c) => out.push(c),
+        }
+    }
+    out
+}
+
+/// True when the function enclosing `lines[i]` returns a `Result`: its `?` names an error to a caller.
+fn in_result_fn(lines: &[&str], i: usize) -> bool {
+    let Some(start) = (0..=i).rev().find(|&j| lines[j].contains("fn ")) else {
+        return false;
+    };
+    let sig: String = lines[start..=i]
+        .iter()
+        .take_while(|l| !l.contains('{'))
+        .chain(lines[start..=i].iter().find(|l| l.contains('{')))
+        .copied()
+        .collect();
+    sig.contains("Result<")
+}
+
+/// True for a line that leaves the function carrying nothing: `return;`, `return None`, `=> None`, a bare `None`.
+fn is_silent_exit(code: &str) -> bool {
+    let t = code
+        .trim()
+        .trim_end_matches(',')
+        .trim_end_matches(';')
+        .trim();
+    t == "return"
+        || t == "None"
+        || t == "return None"
+        || t.starts_with("return skip_live(")
+        || t.contains("=> return")
+        || t.contains("=> None")
+        || t.contains("{ return }")
+        || t.contains("{ return; }")
+}
+
+/// `(file:line, why)` for every env lookup whose failure branch leaves the test without a skip record.
+fn silent_env_exits(path: &Path, src: &str) -> Vec<(String, &'static str)> {
+    let lines: Vec<&str> = src.lines().collect();
+    let mut out = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        if !(line.contains("env::var(") || line.contains("env::var_os(")) {
+            continue;
+        }
+        let site = format!("{}:{}", path.display(), i + 1);
+        if without_strings(line).contains('?') && !in_result_fn(&lines, i) {
+            out.push((
+                site,
+                "a bare `?` on the lookup yields None/() with no skip record",
+            ));
+            continue;
+        }
+        // The branches the lookup feeds are written within the next few lines of the same item:
+        // every exit that carries nothing needs a `skip_live` of its own, so two failure arms need two.
+        let window: Vec<String> = lines[i..(i + 9).min(lines.len())]
+            .iter()
+            .enumerate()
+            .take_while(|(k, l)| {
+                *k == 0 || !(l.starts_with('}') || l.trim_start().starts_with("fn "))
+            })
+            .map(|(_, l)| without_strings(l))
+            .collect();
+        let exits = window.iter().filter(|l| is_silent_exit(l)).count();
+        let skips = window.iter().filter(|l| l.contains("skip_live")).count();
+        if exits > skips {
+            out.push((
+                site,
+                "an exit after the lookup with no `skip_live` call of its own",
+            ));
+        }
+    }
+    out
+}
+
+/// Every env lookup under tests/live + tests/common, in ANY shape: the let-else scan above
+/// missed `env::var(..).ok()?` (`state_url()`, which left the v30 cursor regression test green
+/// in 0.00 s with no record) and `match .. { _ => return }` (ten live_pg_state tests).
+#[test]
+fn every_env_gated_live_test_records_its_skip() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    rs_files(&root.join("tests/live"), &mut files);
+    rs_files(&root.join("tests/common"), &mut files);
+    let mut lookups = 0usize;
+    let mut offenders = Vec::new();
+    for f in &files {
+        let src = std::fs::read_to_string(f).unwrap();
+        lookups += src.matches("env::var").count();
+        offenders.extend(silent_env_exits(f, &src));
+    }
+    assert!(
+        lookups >= 25,
+        "derived only {lookups} env lookups under tests/live + tests/common — the derivation is \
+         broken, and a broken derivation grades nothing while looking green"
+    );
+    assert!(
+        offenders.is_empty(),
+        "{} env lookup(s) leave a test green without a skip record — call `skip_live` (or a helper \
+         that does, like `pg_state_url`) before returning:\n{}",
+        offenders.len(),
+        offenders
+            .iter()
+            .map(|(site, why)| format!("  {site}: {why}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+#[test]
+fn the_guard_sees_the_silent_shapes_and_not_the_recorded_ones() {
+    let bad = [
+        "fn a() -> Option<String> {",
+        "    let u = std::env::var(\"X\").ok()?;",
+        "    Some(u)",
+        "}",
+        "fn b() {",
+        "    if std::env::var(\"Y\").is_err() {",
+        "        return;",
+        "    }",
+        "}",
+        "fn c() -> Option<String> {",
+        "    match std::env::var(\"Z\") {",
+        "        Ok(u) if u.starts_with(\"p\") => Some(u),",
+        "        Ok(_) => {",
+        "            skip_live(\"not p\");",
+        "            None",
+        "        }",
+        "        Err(_) => None,",
+        "    }",
+        "}",
+    ]
+    .join("\n");
+    let got = silent_env_exits(Path::new("t.rs"), &bad);
+    assert_eq!(got.len(), 3, "{got:?}");
+    let ok = [
+        "fn c() {",
+        "    let Ok(u) = std::env::var(\"X\") else {",
+        "        return skip_live(\"X unset?\");",
+        "    };",
+        "}",
+        "fn d(&self) -> Result<PathBuf, String> {",
+        "    std::env::var(\"B\").map_err(|_| \"B\".to_string())?;",
+        "    Ok(x)",
+        "}",
+        "fn e() -> String {",
+        "    std::env::var(\"Z\").unwrap_or_else(|_| \"z\".into())",
+        "}",
+        "fn f() {",
+        "    if std::env::var(\"W\").is_err() {",
+        "        skip_live(",
+        "            \"W unset\",",
+        "        );",
+        "        return;",
+        "    }",
+        "}",
+    ]
+    .join("\n");
+    let got = silent_env_exits(Path::new("t.rs"), &ok);
+    assert!(got.is_empty(), "{got:?}");
 }

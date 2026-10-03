@@ -580,7 +580,7 @@ def source_parity(binary: str | Path | None = None) -> int:
     if not (rivet.is_file() and os.access(rivet, os.X_OK)):
         raise shell.Fail(f"rivet not at {spelled}", code=2)
     if not shell.have("duckdb"):
-        raise shell.Fail("duckdb CLI not on PATH", code=2)
+        raise shell.Fail("the pinned duckdb package is not importable — run through `uv run`", code=2)
 
     t = Tally()
     out = Path(tempfile.mkdtemp(prefix="rivet-parity-cdc-"))

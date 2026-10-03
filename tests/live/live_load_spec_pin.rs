@@ -22,12 +22,9 @@ fn a_load_is_typed_from_its_own_run_not_from_the_last_writer_of_its_name() {
     let Some(bq) = BqLive::from_env("pin") else {
         return;
     };
-    let Ok(state_url) = std::env::var("RIVET_TEST_STATE_URL") else {
-        return skip_live("RIVET_TEST_STATE_URL unset");
+    let Some(state_url) = pg_state_url() else {
+        return;
     };
-    if !state_url.starts_with("postgres") {
-        return skip_live("RIVET_TEST_STATE_URL is not a postgres URL");
-    }
     let my = SqlEngine::Mysql;
     let pg = SqlEngine::Pg;
     my.alive();

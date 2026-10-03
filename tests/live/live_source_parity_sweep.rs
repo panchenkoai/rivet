@@ -28,13 +28,13 @@ fn run_sweep(module: &str) {
         .expect("spawn sweep module");
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    // exit 2 = environment/setup missing (duckdb CLI not on PATH, rivet not built,
-    // a service down). That is NOT a corruption signal — skip rather than fail, so
-    // this test is inert in jobs that don't provide the sweep's deps (e.g. the E2E
-    // matrix has no host `duckdb` CLI). Corruption is exit 1; a clean run is exit 0.
+    // exit 2 = environment/setup missing (the pinned duckdb package not importable by
+    // this `python3`, rivet not built, a service down): a skip that names the cause from
+    // stderr, never a corruption signal. Corruption is exit 1; a clean run is exit 0.
     if out.status.code() == Some(2) {
         crate::common::skip_live(&format!(
-            "{module}: sweep dependencies unavailable in this environment:\n{stdout}"
+            "{module}: sweep dependencies unavailable in this environment: {}{stdout}",
+            stderr.trim()
         ));
         return;
     }

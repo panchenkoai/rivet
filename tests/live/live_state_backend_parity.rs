@@ -41,12 +41,6 @@ fn id_count_set(dir: &std::path::Path) -> (usize, BTreeSet<i64>) {
     (count, keys)
 }
 
-/// The Postgres STATE backend URL (not the source), or None to skip.
-fn pg_state_url() -> Option<String> {
-    let u = std::env::var("RIVET_TEST_STATE_URL").ok()?;
-    u.starts_with("postgres").then_some(u)
-}
-
 /// Seed a fresh `1..=n` BIGINT-keyed source table in the source Postgres and return
 /// its fully-qualified name. Dropped by the caller.
 fn seed_source(table: &str, n: usize) {
@@ -122,10 +116,7 @@ fn parallel_checkpoint(rig: Rig) -> Rig {
 #[ignore = "live: requires docker postgres + RIVET_TEST_STATE_URL (postgres state db)"]
 fn state_parity_parallel_keyset_checkpoint() {
     require_alive(LiveService::Postgres);
-    let Some(pg) = pg_state_url() else {
-        skip_live("RIVET_TEST_STATE_URL not set");
-        return;
-    };
+    let Some(pg) = pg_state_url() else { return };
     let table = unique_name("sp_ckpt");
     seed_source(&table, N);
     let t = format!("public.{table}");
@@ -150,10 +141,7 @@ fn incremental(rig: Rig) -> Rig {
 #[ignore = "live: requires docker postgres + RIVET_TEST_STATE_URL (postgres state db)"]
 fn state_parity_incremental_cursor() {
     require_alive(LiveService::Postgres);
-    let Some(pg) = pg_state_url() else {
-        skip_live("RIVET_TEST_STATE_URL not set");
-        return;
-    };
+    let Some(pg) = pg_state_url() else { return };
     let table = unique_name("sp_incr");
     seed_source(&table, N);
     let t = format!("public.{table}");
@@ -208,10 +196,7 @@ fn state_parity_incremental_cursor() {
 #[ignore = "live: requires docker postgres + RIVET_TEST_STATE_URL (postgres state db)"]
 fn state_parity_parallel_keyset_crash_resume() {
     require_alive(LiveService::Postgres);
-    let Some(pg) = pg_state_url() else {
-        skip_live("RIVET_TEST_STATE_URL not set");
-        return;
-    };
+    let Some(pg) = pg_state_url() else { return };
     let table = unique_name("sp_crash");
     seed_source(&table, N);
     let t = format!("public.{table}");
