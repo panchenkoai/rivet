@@ -6,7 +6,10 @@
 
 use crate::common::*;
 
-const BOUNCER_STATE_URL: &str = "postgresql://rivet:rivet@127.0.0.1:6433/rivet_state_bouncer";
+/// The `RIVET_STATE_URL` that reaches `db` (a database on the state server) through the pooler.
+fn through_the_pooler(db: &ScratchStateDb) -> String {
+    format!("postgresql://rivet:rivet@127.0.0.1:6433/{}", db.name)
+}
 
 /// Two runs of one export started together through the pooler: at most one may proceed.
 #[test]
@@ -31,13 +34,15 @@ fn two_runs_of_one_export_through_a_transaction_pooler_never_both_proceed() {
         .export_line("chunk_checkpoint: true")
         .export_line("chunk_size: 50000");
     let cfg = rig.config_path();
+    let db = ScratchStateDb::new("pooler_lease");
+    let url = through_the_pooler(&db);
     let run = |delay_ms: u64| {
-        let cfg = cfg.clone();
+        let (cfg, url) = (cfg.clone(), url.clone());
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(delay_ms));
             run_rivet_env(
                 &["run", "-c", cfg.to_str().unwrap()],
-                &[("RIVET_STATE_URL", BOUNCER_STATE_URL)],
+                &[("RIVET_STATE_URL", url.as_str())],
             )
         })
     };
@@ -84,8 +89,10 @@ fn a_run_killed_on_this_host_does_not_block_the_next_one() {
         .export_line("chunk_by_key: id")
         .export_line("chunk_checkpoint: true")
         .export_line("chunk_size: 5000");
+    let db = ScratchStateDb::new("pooler_kill");
+    let url = through_the_pooler(&db);
     let env = [
-        ("RIVET_STATE_URL", BOUNCER_STATE_URL),
+        ("RIVET_STATE_URL", url.as_str()),
         ("RIVET_STATE_LEASE_TTL_S", "600"),
     ];
     let mut first = rig.spawn_args_env(&[], &env);

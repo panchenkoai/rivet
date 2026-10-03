@@ -53,6 +53,7 @@ try:  # importable both as a package module and as a plain sibling file
                        nextest_filter, nextest_outcomes, nextest_passed, nextest_started, port_of, release_bin_env,
                        rivet, rivet_bin, run, sqlcmd, test_passed)
     from ..pytools.duckcli import ARGV as DUCKDB
+    from . import state_lib
 except ImportError:  # pragma: no cover - depends on how the driver is invoked
     from core import (  # type: ignore
         HERE,
@@ -81,6 +82,7 @@ except ImportError:  # pragma: no cover - depends on how the driver is invoked
         test_passed,
     )
     DUCKDB = [sys.executable, str(Path(__file__).resolve().parents[1] / "pytools" / "duckcli.py")]
+    import state_lib  # type: ignore
 
 __all__ = [
     "run_scenarios",
@@ -1274,23 +1276,10 @@ def run_scenarios(led: Ledger, engine: str, tag: str, url: str) -> None:
 
 
 # ── state-migration parity PREFLIGHT (source-agnostic, runs once) ────────────
-#: The lib tests the state-migration parity stage runs WITH the state URL; the offline battery
-#: runs them without it (it measures offline coverage), so their self-skip there is graded here.
-STATE_URL_LIB_TESTS = (
-    "state::migrations::tests::pg_upgrade_from_v18_lands_keyset_range_as_bigint_and_keeps_data",
-    "state::run_status_store::tests::pg_shared_state_cross_connection_visibility_and_supersession",
-)
-
-
-def libtest_unrun(out: str, names: tuple[str, ...]) -> list[str]:
-    """The `names` libtest did not report `test <name> ... ok` for: a zero-match filter still exits 0."""
-    return [n for n in names if f"test {n} ... ok" not in out]
-
-
 def battery_skips(skip_log: Path) -> list[str]:
     """The offline battery's self-skips no gate stage grades (`<test> — <why>`): each is a green test that ran nothing."""
     return [f"{k} — {v}" for k, v in self_skipped(skip_log).items()
-            if k not in SKIP_ALLOWED and k not in STATE_URL_LIB_TESTS]
+            if k not in SKIP_ALLOWED and not state_lib.selected(k)]
 
 
 def verify_state_migrations(led: Ledger) -> None:
@@ -1352,9 +1341,8 @@ def verify_state_migrations(led: Ledger) -> None:
     # The test binary itself is debug (fast to build) and only ORCHESTRATES — the
     # rivet process it spawns is the RELEASE binary via RIVET_BIN, so the gate
     # blesses what ships. Two legs: the parity fixtures on a FRESH db (live_suite)
-    # and the in-place UPGRADE path (a lib test that stages a populated v18 db and
-    # migrates it to HEAD — a migration that works clean but breaks on populated
-    # old data slips past the fresh-db parity otherwise).
+    # and the state lib tests with the URL (state_lib.py, the selection CI runs too),
+    # among them the in-place UPGRADE path from a populated v18 db.
     log_path = work_dir() / "state_parity.log"
     fresh = run(
         # nextest (process-per-test). `state_parity_` is a PREFIX: the SUBSTRING
@@ -1372,14 +1360,12 @@ def verify_state_migrations(led: Ledger) -> None:
         upgrade_skips = work_dir() / "state_parity.skips"
         upgrade_skips.write_text("")
         upgrade = run(
-            ["cargo", "test", "--manifest-path", str(ROOT / "Cargo.toml"), "--lib",
-             "--", "--exact", *STATE_URL_LIB_TESTS],
+            state_lib.argv(),
             env={"RIVET_TEST_STATE_URL": state_url, "RIVET_SKIP_LOG": str(upgrade_skips)},
             timeout=NO_TIMEOUT,
         )
         transcript += upgrade.out
-        vacuous = libtest_unrun(upgrade.out, STATE_URL_LIB_TESTS) + [
-            f"{k} — {v}" for k, v in self_skipped(upgrade_skips).items()]
+        vacuous = state_lib.vacuous(upgrade.out, self_skipped(upgrade_skips))
         if vacuous:
             transcript += "\nGATE: named upgrade test(s) did not run or SELF-SKIPPED: " + "; ".join(vacuous) + "\n"
             upgrade = Proc(upgrade.argv, 1, upgrade.stdout, upgrade.stderr)
