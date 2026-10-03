@@ -3164,9 +3164,8 @@ fn crash_with_a_spilled_tail(rig: &Rig) -> String {
     log
 }
 
-/// The union of both runs' parts, read by DuckDB, must hold the transaction exactly once.
-fn assert_spilled_transaction_whole_once(out: &std::path::Path) {
-    let ids = duckdb_dir_parquet_i64(out, "id");
+/// The union of both runs' parts (`ids`, read by DuckDB) must hold the transaction exactly once.
+fn assert_spilled_transaction_whole_once(ids: &[i64]) {
     let got: std::collections::BTreeSet<i64> = ids.iter().copied().collect();
     let want: std::collections::BTreeSet<i64> = (0..SPILL_CRASH_ROWS).collect();
     assert_eq!(
@@ -3230,7 +3229,7 @@ fn roast_pg_cdc_a_crash_mid_spilled_tail_loses_no_transaction_on_resume() {
         "the resume run must succeed: {}",
         String::from_utf8_lossy(&resumed.stderr)
     );
-    assert_spilled_transaction_whole_once(&out);
+    assert_spilled_transaction_whole_once(&duckdb_dir_parquet_i64(&out, "id"));
 }
 
 /// A crash while a spilled MySQL transaction is replayed must lose none of it on resume.
@@ -3271,7 +3270,7 @@ fn roast_mysql_cdc_a_crash_mid_spilled_tail_loses_no_transaction_on_resume() {
         "the resume run must succeed: {}",
         String::from_utf8_lossy(&resumed.stderr)
     );
-    assert_spilled_transaction_whole_once(&out);
+    assert_spilled_transaction_whole_once(&duckdb_dir_parquet_i64(&out, "id"));
 }
 
 fn pg_full_config(d: &tempfile::TempDir, tbl: &str, out: &std::path::Path) -> std::path::PathBuf {
