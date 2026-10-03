@@ -102,6 +102,9 @@ seeds:
     patch: empty-page-fails-quality/shared.patch
     engines:
       postgres:
+        # Only the parallel-keyset cell reaches an empty page (measured 2026-10-03); the
+        # other six fixtures never end a page or chunk empty, so they stay green under
+        # this seed and grade the duplicate only.
         cells:
           - quality_gate_fails_a_duplicate_on_the_single_runner
           - quality_gate_fails_a_duplicate_split_across_keyset_pages
@@ -111,13 +114,13 @@ seeds:
           - quality_gate_fails_a_duplicate_split_across_checkpoint_chunks
           - quality_gate_fails_a_duplicate_split_across_parallel_checkpoint_chunks
       mongo:
-        cells: [quality_gate_fails_a_short_mongo_parallel_export]
+        na: "no empty schema to seed - the Mongo reader announces its fixed blob schema (_id, document) before it reads, on every page and range (blob_schema() in MongoSource::export), so Schema::empty() never reaches the quality tracker"
       mysql:
         cells: [quality_gate_fails_a_duplicate_across_parallel_keyset_ranges_ending_empty_mysql]
       mssql:
-        cells: [quality_gate_fails_a_duplicate_across_parallel_keyset_ranges_ending_empty_mssql]
+        na: "no empty schema to seed - a zero-row SQL Server page still builds its schema from the result set's column metadata (emit_mssql_batch on the empty final batch), never Schema::empty(); measured 2026-10-03: quality_gate_fails_a_duplicate_across_parallel_keyset_ranges_ending_empty_mssql, whose four ranges each end on an empty page, stayed green under the seed"
       oracle:
-        cells: [quality_gate_fails_a_duplicate_across_parallel_keyset_ranges_ending_empty_oracle]
+        na: "no empty schema to seed - the Oracle reader builds its schema from the statement's column metadata and announces it before the first fetch, so a zero-row page carries its columns; measured 2026-10-03: quality_gate_fails_a_duplicate_across_parallel_keyset_ranges_ending_empty_oracle, whose four ranges each end on an empty page, stayed green under the seed"
       lib:
         cells: ["lib:a_zero_row_empty_schema_binds_nothing_and_is_not_a_ghost_column"]
 
