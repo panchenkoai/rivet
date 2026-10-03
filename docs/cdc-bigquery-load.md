@@ -119,6 +119,21 @@ NULL partition. This needs `binlog_row_image = FULL`; an UPDATE without the prev
 value is refused (`RIVET_SOURCE_CDC_PREREQUISITE`). Other engines still look moved
 rows up in the base during `compact`.
 
+**A row whose key changes.** On every engine but MongoDB (whose `_id` cannot
+change), the stream writes an UPDATE that changes the key as a delete of the old
+key and an insert of the new row
+([ADR-0030](adr/0030-primary-key-update-representation.md)), with the exceptions
+listed in docs/reference/cdc.md (for example a PostgreSQL table whose changes
+carry no old image). `compact` merges the pair as it merges any delete and
+insert: the base flags the old key `__is_deleted` and holds one live row under
+the new key. A key move that also changes the day lands in its new day. On
+PostgreSQL the delete carries the old key alone, and `compact` finds the old
+day by looking the key up in the base. Measured on MySQL and PostgreSQL with a
+day-partitioned base: `UPDATE SET id = 11 WHERE id = 1` and
+`UPDATE SET id = 12, created_at = <next day> WHERE id = 2` end with 4 base rows,
+2 live (11 and 12, in their days) and 2 flagged (1 and 2)
+(`a_key_move_leaves_one_live_row_per_key_in_a_partitioned_base_{mysql,postgres}`).
+
 What a cycle bills: BigQuery charges every statement that reads a table at
 least 10 MB per table, so a compaction with changes bills a 30 MB floor (the
 probe, and the MERGE over two tables); one without changes bills nothing. The

@@ -1,0 +1,12 @@
+diff --git a/src/source/cdc/partition_guard.rs b/src/source/cdc/partition_guard.rs
+--- a/src/source/cdc/partition_guard.rs
++++ b/src/source/cdc/partition_guard.rs
+@@ -131,7 +131,7 @@ pub(crate) fn split_move(
+     if ev.op != ChangeOp::Update {
+         return Ok(None);
+     }
+-    let moved = key_moves(ev, key)
++    let moved = (engine != CdcEngine::Postgres && key_moves(ev, key))
+         || match guard {
+             Some(g) => partition_moves(ev, g, columns, engine)?,
+             None => false,

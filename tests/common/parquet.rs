@@ -672,6 +672,7 @@ pub fn assert_intra_transaction_seq(out: &Path, n: i64) {
 
 /// A captured change: the columns the reconciliation needs (`id BIGINT, v
 /// BIGINT` + the CDC meta). `v` on a delete is the (irrelevant) before-image.
+#[derive(Debug)]
 pub struct CdcChange {
     pub id: i64,
     pub v: i64,

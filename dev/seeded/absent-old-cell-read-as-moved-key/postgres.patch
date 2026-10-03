@@ -1,0 +1,19 @@
+diff --git a/src/source/postgres/cdc.rs b/src/source/postgres/cdc.rs
+index 9626675b..224718ef 100644
+--- a/src/source/postgres/cdc.rs
++++ b/src/source/postgres/cdc.rs
+@@ -1475,7 +1475,13 @@ pub(crate) fn parse_test_decoding(
+         ChangeOp::Delete => (Some(cols), None, Some(names), None),
+         ChangeOp::Update => {
+             let (before, before_names) = old.unzip();
+-            (before, Some(cols), Some(names), before_names)
++            let before = before.zip(before_names).map(|(v, bn)| {
++                names
++                    .iter()
++                    .map(|n| bn.iter().position(|b| b == n).map_or(RivetValue::Null, |i| v[i].clone()))
++                    .collect()
++            });
++            (before, Some(cols), Some(names), None)
+         }
+         ChangeOp::Insert => (None, Some(cols), Some(names), None),
+     };
