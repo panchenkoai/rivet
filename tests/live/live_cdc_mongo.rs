@@ -257,8 +257,7 @@ fn mongo_missing_checkpoint_warning_remedy_recovers_the_document_written_while_i
     let mut s = CdcScenario::mongo_with("cdc_ckgap", |r, _| {
         r.oracle_known_defect(
             "undelivered rows",
-            "the document written while the checkpoint was gone is lost until the warning's \
-             re-baseline runs",
+            "known defect: a lost MongoDB checkpoint on a stream with no baseline re-anchors with only a warning, so the document written in the gap is lost until the warning's re-baseline runs",
         )
     });
     s.rig.run_ok();

@@ -1815,9 +1815,9 @@ fn pg_slot_created_warning_remedy_recovers_the_row_written_while_the_slot_was_go
     .unwrap();
     let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
     let mut rig = Rig::pg_cdc(&tbl, &slot).oracle_known_defect(
-        "undelivered rows",
-        "the row written while the slot was gone is lost until the warning's re-baseline runs",
-    );
+            "undelivered rows",
+            "known defect: a PostgreSQL slot dropped under a stream with no checkpoint or baseline is re-created with only a warning, so the row written in the gap is lost until the warning's re-baseline runs",
+        );
     rig.run_ok();
     c.batch_execute(&format!("INSERT INTO {tbl} VALUES (1, 10)"))
         .unwrap();
@@ -1882,8 +1882,7 @@ fn mysql_missing_checkpoint_warning_remedy_recovers_the_row_written_while_it_was
     let mut s = CdcScenario::mysql_with("cdc_ckgap", "id INT PRIMARY KEY, v BIGINT", |r, _| {
         r.oracle_known_defect(
             "undelivered rows",
-            "the row written while the checkpoint was gone is lost until the warning's \
-             re-baseline runs",
+            "known defect: a lost MySQL checkpoint on a stream with no baseline re-anchors with only a warning, so the row written in the gap is lost until the warning's re-baseline runs",
         )
     });
     s.rig.run_ok();
