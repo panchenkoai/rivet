@@ -4357,12 +4357,14 @@ fn roast_pg_cdc_refuses_a_truncate_instead_of_silently_diverging() {
         "the refusal must name the way OUT of the wedge, not only the re-snapshot: \
          re-snapshotting alone leaves the slot where it is. Got:\n{said}"
     );
-    // The route the message names must actually work.
+    // The route the message names must actually work: advance past the last truncate's
+    // commit, not past every pending commit, or the clean (77,770) behind it is skipped.
     let past: String = c
         .query_one(
             &format!(
-                "SELECT max(lsn)::text FROM pg_logical_slot_peek_changes('{slot}', NULL, NULL) \
-                 WHERE data LIKE '%COMMIT%'"
+                "WITH p AS (SELECT lsn, data FROM pg_logical_slot_peek_changes('{slot}', NULL, NULL)) \
+                 SELECT min(lsn)::text FROM p WHERE data LIKE 'COMMIT%' \
+                 AND lsn > (SELECT max(lsn) FROM p WHERE data LIKE '%{tbl}%: TRUNCATE:%')"
             ),
             &[],
         )
@@ -4375,9 +4377,23 @@ fn roast_pg_cdc_refuses_a_truncate_instead_of_silently_diverging() {
     .unwrap();
     c.execute(&format!("INSERT INTO {tbl} VALUES (88,880)"), &[])
         .unwrap();
-    Rig::pg_cdc(&format!("public.{tbl}"), &slot)
+    let resumed = Rig::pg_cdc(&format!("public.{tbl}"), &slot)
         .source_url(cdc_db.url())
-        .run_ok();
+        .no_oracle(
+            "the stream delivered (1,10),(2,20) before the TRUNCATE it refused; the refusal \
+             prescribes a re-snapshot this test does not take, so the destination keeps them",
+        );
+    resumed.run_ok();
+    let mut ids: Vec<i64> = read_cdc_changes(&resumed.out_dir())
+        .iter()
+        .map(|c| c.id)
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        vec![77, 88],
+        "after the advance the stream must deliver every clean change behind the truncate"
+    );
 }
 
 /// MySQL peer of `roast_pg_cdc_refuses_a_truncate_instead_of_silently_diverging`,
