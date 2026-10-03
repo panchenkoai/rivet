@@ -1899,7 +1899,7 @@ fn a_mongo_resume_export_into_clickhouse_accumulates_every_run() {
             .collect::<Vec<i64>>()
     };
     let loaded = || -> Vec<i64> {
-        ch(&format!(
+        clickhouse_rows_tsv(&format!(
             "SELECT toString(_id) FROM {}.t ORDER BY toInt64OrZero(toString(_id)) FORMAT TSV",
             db.0
         ))
