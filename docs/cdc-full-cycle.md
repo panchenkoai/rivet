@@ -193,10 +193,11 @@ did not grow); live state still equals the source.
   checkpoint file if there is one, AND give the export `cdc.initial: snapshot`
   if it has no baseline, or clear the export's `cdc_snapshot` row and the
   table's `snapshot/_SUCCESS` if it has one, AND truncate `<table>__changes`
-  before the next load (a
-  re-read baseline has no `__pos`, so the log cannot be deduplicated across it;
-  the load refuses without the truncate). Deleting the checkpoint alone is
-  refused: prior-run evidence exists and the run would re-anchor over a gap.
+  before the next load (a re-read baseline has no `__pos`, so the log cannot
+  be deduplicated across it; the load refuses without the truncate); then
+  re-run. Deleting the checkpoint alone is refused once a baseline completed
+  (prior-run evidence exists); on an export without a baseline it re-anchors
+  with a warning and accepts the gap.
 - **MySQL checkpoint used against another server**: refused on purpose; same
   order on the new host.
 - **`rivet validate --config cfg.yaml`** certifies both legs — the baseline under
