@@ -34,7 +34,7 @@ seeds:
         patch: committed-every-event/oracle.patch
         cells: [roast_oracle_cdc_large_transaction_is_atomic_across_a_mid_flush_crash]
       mongo:
-        na: committed on every event IS the MongoDB contract (TxnFramer::single_event_commit, #158) - its consume-free resume token re-reads a mid-transaction tail, so there is no defect to seed
+        na: "committed on every event IS the MongoDB contract (TxnFramer::single_event_commit, #158) - its consume-free resume token re-reads a mid-transaction tail, so there is no defect to seed"
 
   - name: row-lost-at-rotation
     class: the shared batch writer drops the first row written into each part it rotates to (max_file_size)
