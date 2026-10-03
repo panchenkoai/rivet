@@ -538,6 +538,10 @@ def _self_test() -> int:
 
     sentinels._self_test()
     print("self-test ok: sentinel verdicts (exact, or a loud non-panic refusal on a risky value)")
+    from . import state_parity_duckdb
+
+    state_parity_duckdb._self_test()
+    print("self-test ok: state parity excludes surrogate keys by rule and compares a reference by content")
     _stages_self_test()
     from . import skip_census
 
