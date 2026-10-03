@@ -501,13 +501,6 @@ mod tests {
     /// committed but not yet manifested.
     #[test]
     fn a_running_successor_does_not_supersede_but_a_finished_one_does() {
-        // `open_in_memory` EXPLICITLY, not `open`. `open` consults the process-global
-        // `RIVET_STATE_URL`, and the Postgres test below SETS that variable mid-run
-        // (`unsafe set_var` … `remove_var`) — so when the dev stand supplies
-        // `RIVET_TEST_STATE_URL` and both tests run in one process, this store
-        // silently opened POSTGRES instead and the first assertion failed. Measured:
-        // green alone, red in the full suite. A test that names its backend cannot
-        // be moved by another test's environment.
         let st = StateStore::open_in_memory().expect("state");
         let (pa, pb) = ("gs://b/e/runA/", "gs://b/e/runB/");
         st.begin_run("r1", "e", pa, "2026-01-01T00:00:01Z").unwrap();
@@ -547,10 +540,9 @@ mod tests {
             return crate::test_hook::skip_live("RIVET_TEST_STATE_URL is not a postgres URL");
         }
         // Two connections = two processes on the same shared Postgres state.
-        unsafe { std::env::set_var("RIVET_STATE_URL", &url) };
-        let a = StateStore::open(":memory:").expect("conn A");
-        let b = StateStore::open(":memory:").expect("conn B");
-        unsafe { std::env::remove_var("RIVET_STATE_URL") };
+        let pg = crate::state::StateRef::Postgres(url);
+        let a = StateStore::open_at_ref(&pg).expect("conn A");
+        let b = StateStore::open_at_ref(&pg).expect("conn B");
 
         let pid = std::process::id();
         let exp = format!("conc_test_{pid}");

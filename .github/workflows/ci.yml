@@ -1398,6 +1398,12 @@ jobs:
     runs-on: ubuntu-latest
     # The job normally takes ~45 minutes; anything near this bound is a hang, not a slow run.
     timeout-minutes: 120
+    env:
+      # The Postgres STATE backend for the tests that grade it (live_pg_state, live_state_backend_parity,
+      # live_shared_state_same_name, the PG-gated lib tests in src/state), on a per-run database made
+      # in "Wait for services". Only RIVET_TEST_STATE_URL: RIVET_STATE_URL / RIVET_GATE_STATE_URL stay
+      # unset, so every Rig and SQLite-reading test keeps its SQLite state beside the config.
+      RIVET_TEST_STATE_URL: postgresql://rivet:rivet@127.0.0.1:5433/rivet_state_ci
     steps:
       - uses: actions/checkout@v7
 
@@ -1448,7 +1454,7 @@ jobs:
           # quiet-window lock. On the shared instance the two canaries failed in
           # OPPOSITE directions and both blamed the product for the schedule; they were
           # the dominant E2E flake through 2026-08-16/17.
-          ( docker compose --profile pool --profile cdc --profile replica --profile governor up -d postgres mysql mssql mssql-governor minio fake-gcs azurite toxiproxy pgbouncer proxysql postgres-cdc mysql-cdc mssql-cdc mysql-primary mysql-replica mysql-replica-nolog duckdb clickhouse oracle > "$RUNNER_TEMP/compose.log" 2>&1; echo $? > "$RUNNER_TEMP/compose.rc" ) &
+          ( docker compose --profile pool --profile cdc --profile replica --profile governor up -d postgres postgres-state mysql mssql mssql-governor minio fake-gcs azurite toxiproxy pgbouncer proxysql postgres-cdc mysql-cdc mssql-cdc mysql-primary mysql-replica mysql-replica-nolog duckdb clickhouse oracle > "$RUNNER_TEMP/compose.log" 2>&1; echo $? > "$RUNNER_TEMP/compose.rc" ) &
 
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -1496,6 +1502,9 @@ jobs:
         run: |
           echo "Waiting for Postgres..."
           for i in $(seq 1 30); do docker compose exec -T postgres pg_isready -U rivet && break || sleep 2; done
+          echo "Waiting for the Postgres state server, then its per-run database (RIVET_TEST_STATE_URL)..."
+          for i in $(seq 1 30); do docker compose exec -T postgres-state pg_isready -U rivet && break || sleep 2; done
+          docker compose exec -T postgres-state psql -U rivet -d postgres -v ON_ERROR_STOP=1 -c "CREATE DATABASE rivet_state_ci"
           echo "Waiting for MySQL..."
           for i in $(seq 1 30); do docker compose exec -T mysql mysqladmin ping -h localhost -uroot -privet 2>/dev/null && break || sleep 2; done
           echo "Waiting for pgBouncer..."
@@ -1627,6 +1636,13 @@ jobs:
         # the diff between pre/post is the smoking gun.
         run: df -h /
 
+      - name: State lib tests on the Postgres state backend
+        # The PG-gated unit tests in src/state are not #[ignore]d, so the `--ignored` sweep below never
+        # selects them and the `Tests` job runs them without a state URL (they self-skip there).
+        if: ${{ !cancelled() }}
+        run: |
+          cargo test --lib -- state::
+
       - name: Run live cargo integration tests
         if: ${{ !cancelled() }}
         # Activates every `tests/live_*.rs` binary that is `#[ignore]`d by
@@ -1695,22 +1711,15 @@ jobs:
           LACKING: |
             BIGQUERY_TEST_PROJECT
             SNOWFLAKE_TEST_CONNECTION
-            RIVET_TEST_STATE_URL
             RIVET_TEST_EXCLUSIVE
             pgbouncer-state (:6433)
             pg18-batch (:5518)
-            duckdb package is not importable
-            duckdb CLI: false
           # BIGQUERY_TEST_PROJECT / SNOWFLAKE_TEST_CONNECTION: no warehouse credentials here (same as
           #   `--skip warehouse_cell`); the lib's ignored warehouse tests run under `--ignored` too.
-          # RIVET_TEST_STATE_URL: postgres-state is not started here; the gate runs the Postgres-state
-          #   tests (verify_state_migrations, the derived live-module cell).
           # RIVET_TEST_EXCLUSIVE: the suite runs threaded on a shared stand; the gate runs those alone.
           # pgbouncer-state / pg18-batch: services this job's compose line does not start.
-          # duckdb package / CLI: the source-parity sweeps spawn bare `python3`, which has no pinned
-          #   duckdb outside `uv run`, and the drain row-hash test calls a host `duckdb` binary; the
-          #   gate runs all three (`uv run` puts the pinned package first; its host has the binary).
-          #   Measured: these were the 3 unexplained self-skips on this step's first run.
+          # Not lacked: RIVET_TEST_STATE_URL (job env, per-run DB on postgres-state) and the pinned
+          #   duckdb (the source-parity sweeps and the drain row-hash test spawn `uv run` themselves).
         run: |
           python3 -m dev.release_oracle.skip_census target/rivet-skips.log --lacking "$LACKING"
 

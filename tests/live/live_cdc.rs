@@ -9585,7 +9585,7 @@ fn roast_mysql_cdc_a_rolled_back_myisam_statement_is_framed_as_its_own_transacti
 /// cross-leg integrity column. RED against un-framing the canonical image in
 /// `src/enrich.rs` (the v1 bare-separator bug shape).
 #[test]
-#[ignore = "live: requires docker compose --profile cdc mysql-cdc + host duckdb + python3+xxhash"]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc + uv"]
 fn cdc_drain_row_hash_matches_the_independent_implementation() {
     let d = tempfile::tempdir().unwrap();
     let tbl = unique_name("cdc_rowhash_val");
@@ -9629,35 +9629,15 @@ fn cdc_drain_row_hash_matches_the_independent_implementation() {
     .unwrap();
     run_rivet_ok(&cfg); // drain leg -> out/cdc-*.parquet
 
-    // ENV PRECHECK (completeness critic: the nightly runner installs neither
-    // host duckdb nor python-xxhash, and a missing dep must read as a SKIP,
-    // never as "the independent implementation DISAGREES"). Loud skip, not
-    // silent: absence-is-not-success.
-    let duck_ok = std::process::Command::new("duckdb")
-        .arg("--version")
-        .output()
-        .is_ok_and(|o| o.status.success());
-    let xxh_ok = std::process::Command::new("python3")
-        .args(["-c", "import xxhash"])
-        .output()
-        .is_ok_and(|o| o.status.success());
-    if !duck_ok || !xxh_ok {
-        skip_live(&format!(
-            "host oracle deps missing (duckdb CLI: {duck_ok}, python3+xxhash: {xxh_ok}) \
-             — install both to grade the drain leg's hashes"
-        ));
-        return;
-    }
-
-    // Leg 1 of the oracle: DuckDB (host CLI) renders the drain parquet.
+    // Leg 1 of the oracle: DuckDB (the uv-pinned package, through dev/pytools/duckcli.py) renders the drain parquet.
     let q = format!(
         "SELECT id, a, b, _rivet_row_hash AS h FROM read_parquet('{}/cdc-*.parquet') ORDER BY id",
         out.display()
     );
-    let duck = std::process::Command::new("duckdb")
-        .args(["-json", "-c", &q])
+    let duck = uv_python()
+        .args(["dev/pytools/duckcli.py", "-json", "-c", &q])
         .output()
-        .expect("host duckdb CLI (brew install duckdb) — the independent reader");
+        .expect("spawn `uv run` for duckcli — install uv (the oracle is pinned by uv.lock)");
     assert!(
         duck.status.success(),
         "duckdb read failed: {}",
@@ -9684,13 +9664,13 @@ fn cdc_drain_row_hash_matches_the_independent_implementation() {
         ),
     )
     .unwrap();
-    let mut child = std::process::Command::new("python3")
+    let mut child = uv_python()
         .arg(&py_script)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .expect("python3 with xxhash — the independent hasher");
+        .expect("spawn `uv run` for the independent hasher (xxhash, pinned by uv.lock)");
     use std::io::Write as _;
     child.stdin.take().unwrap().write_all(&duck.stdout).unwrap();
     let py_out = child.wait_with_output().unwrap();
@@ -9705,6 +9685,14 @@ fn cdc_drain_row_hash_matches_the_independent_implementation() {
         String::from_utf8_lossy(&py_out.stdout).contains("OK 4"),
         "positive control: the checker must have graded all four rows"
     );
+}
+
+/// `uv run python` in the repo root: the interpreter with the uv-pinned duckdb and xxhash.
+fn uv_python() -> std::process::Command {
+    let mut c = std::process::Command::new("uv");
+    c.args(["run", "--frozen", "--quiet", "python"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"));
+    c
 }
 
 /// A MySQL TIME outside one day fails the CDC run with the batch export's own refusal, and the checkpoint stays put.

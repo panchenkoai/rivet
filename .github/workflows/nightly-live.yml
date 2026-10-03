@@ -95,13 +95,16 @@ jobs:
           # it every test that writes a shared workdir EACCESes — the first
           # nightly after the cdc-oracle suite landed failed exactly there.
           mkdir -p tests/.live-tmp
-          docker compose --profile pool --profile loaders --profile cdc --profile replica --profile governor up -d postgres mysql mssql mssql-governor minio fake-gcs azurite toxiproxy pgbouncer proxysql duckdb clickhouse postgres-cdc mysql-cdc mssql-cdc mysql-primary mysql-replica mysql-replica-nolog oracle
+          docker compose --profile pool --profile loaders --profile cdc --profile replica --profile governor up -d postgres postgres-state mysql mssql mssql-governor minio fake-gcs azurite toxiproxy pgbouncer proxysql duckdb clickhouse postgres-cdc mysql-cdc mssql-cdc mysql-primary mysql-replica mysql-replica-nolog oracle
           sudo chmod -R 0777 tests/.live-tmp
 
       - name: Wait for services
         run: |
           echo "Waiting for Postgres..."
           for i in $(seq 1 30); do docker compose exec -T postgres pg_isready -U rivet && break || sleep 2; done
+          echo "Waiting for the Postgres state server, then its per-run database (RIVET_TEST_STATE_URL)..."
+          for i in $(seq 1 30); do docker compose exec -T postgres-state pg_isready -U rivet && break || sleep 2; done
+          docker compose exec -T postgres-state psql -U rivet -d postgres -v ON_ERROR_STOP=1 -c "CREATE DATABASE rivet_state_ci"
           echo "Waiting for MySQL..."
           for i in $(seq 1 30); do docker compose exec -T mysql mysqladmin ping -h localhost -uroot -privet 2>/dev/null && break || sleep 2; done
           echo "Waiting for pgBouncer..."
@@ -221,6 +224,9 @@ jobs:
         # hold (SQL Server AG, PG 16 standby pair, the LATIN1 Oracle PDB), the
         # audit's BigQuery cells, and the read-blocked quarantine; the release gate
         # runs every one of them and fails when their stand is down.
+        env:
+          # Same as ci.yml's E2E job: the Postgres-state tests only; RIVET_STATE_URL / RIVET_GATE_STATE_URL stay unset.
+          RIVET_TEST_STATE_URL: postgresql://rivet:rivet@127.0.0.1:5433/rivet_state_ci
         run: |
           # nextest, not plain `cargo test`: tests/live_suite.rs's own header
           # says the per-test process isolation this consolidation relies on is
