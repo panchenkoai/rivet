@@ -1579,7 +1579,7 @@ def verify_live_only_coverage(led: Ledger) -> None:
             "no llvm-cov",
         )
         plain = run(
-            ["env", "-u", "RIVET_STATE_URL", "-u", "RIVET_TEST_STATE_URL",
+            ["env", "-u", "RIVET_STATE_URL", "-u", "RIVET_GATE_STATE_URL", "-u", "RIVET_TEST_STATE_URL",
              "cargo", "nextest", "run", "--manifest-path", str(ROOT / "Cargo.toml")],
             timeout=NO_TIMEOUT,
         )
@@ -1605,7 +1605,7 @@ def verify_live_only_coverage(led: Ledger) -> None:
     # gated run (2026-08-29). The coverage question is about the DEFAULT
     # offline battery, so the state overrides are stripped for this leg only.
     build = run(
-        ["env", "-u", "RIVET_STATE_URL", "-u", "RIVET_TEST_STATE_URL",
+        ["env", "-u", "RIVET_STATE_URL", "-u", "RIVET_GATE_STATE_URL", "-u", "RIVET_TEST_STATE_URL",
          "cargo", "llvm-cov", "nextest", "--lcov", "--output-path", str(lcov)],
         timeout=NO_TIMEOUT,
     )
@@ -1873,7 +1873,7 @@ def verify_batch_resume(led: Ledger) -> None:
     # SQLite even when the gate grades the Postgres backend (release-oracle-full does).
     _run_live_modules(led, "resume", "batch resume",
                       "`rivet run --resume` after a crash (live_chunked_recovery + live_resume)",
-                      ["live_chunked_recovery", "live_resume"], env={"RIVET_STATE_URL": ""})
+                      ["live_chunked_recovery", "live_resume"], env={"RIVET_STATE_URL": "", "RIVET_GATE_STATE_URL": ""})
 
 
 def verify_audit_suspects(led: Ledger) -> None:
@@ -1895,7 +1895,7 @@ def verify_cdc_harm(led: Ledger) -> None:
     server's own table-level counters (live_cdc_harm)."""
     _run_live_modules(led, "cdc_harm", "cdc harm",
                       "a CDC drain costs the source a fraction of one scan (live_cdc_harm)",
-                      ["live_cdc_harm"], env={"RIVET_STATE_URL": ""})
+                      ["live_cdc_harm"], env={"RIVET_STATE_URL": "", "RIVET_GATE_STATE_URL": ""})
 
 
 def verify_session_state(led: Ledger) -> None:

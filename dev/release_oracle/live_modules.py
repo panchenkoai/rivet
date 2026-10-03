@@ -59,7 +59,7 @@ def verify_live_modules(led: Ledger) -> None:
     state = os.environ.get("RIVET_CDC_STATE_URL") or os.environ.get("RIVET_GATE_STATE_URL") or ""
     proj = os.environ.get("BQ_ORACLE_PROJECT") or (
         run(["gcloud", "config", "get-value", "project"]).stdout.strip() if have("gcloud") else "")
-    env = {"RIVET_STATE_URL": "", "RIVET_TEST_STATE_URL": state, "BIGQUERY_TEST_PROJECT": proj,
+    env = {"RIVET_STATE_URL": "", "RIVET_GATE_STATE_URL": "", "RIVET_TEST_STATE_URL": state, "BIGQUERY_TEST_PROJECT": proj,
            "RIVET_TEST_GCS_BUCKET": os.environ.get("BQ_ORACLE_BUCKET", "rivet_data_test")}
     _run_live_modules(led, "live", "live modules",
                       f"every other live_suite module ({len(left)}), derived from tests/live_suite.rs",

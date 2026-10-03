@@ -251,6 +251,11 @@ def _self_test() -> int:
         got = env_flag("RIVET_ORACLE_SELFTEST_FLAG")
         assert got is expect, f"env_flag({raw!r}) = {got}, expected {expect}"
     os.environ.pop("RIVET_ORACLE_SELFTEST_FLAG", None)
+    # A stage that moves the Rig off Postgres must blank BOTH knobs: the tests read RIVET_GATE_STATE_URL.
+    for mod in ("scenarios.py", "live_modules.py"):
+        src = (Path(__file__).parent / mod).read_text()
+        assert src.count('"RIVET_STATE_URL": ""') == src.count('"RIVET_GATE_STATE_URL": ""'), mod
+        assert src.count('"-u", "RIVET_STATE_URL"') == src.count('"-u", "RIVET_GATE_STATE_URL"'), mod
     assert cdc._gate_owned_state_db("rivet_state_gate_69094")
     assert not cdc._gate_owned_state_db("rivet_state"), "the shared stand state db must never be reset"
     assert "pg_tables" in cdc._PG_STATE_RESET_SQL and "current_schema()" in cdc._PG_STATE_RESET_SQL
