@@ -167,6 +167,25 @@ pub(crate) fn pg_slot_missing_refusal(slot: &str, prior: PriorRun) -> String {
     )
 }
 
+/// What `open` does about the slot: reuse it, create it, or refuse with the text to show.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SlotAction {
+    Reuse,
+    Create,
+    Refuse(String),
+}
+
+/// Decides [`SlotAction`] from whether the slot exists and the prior-run evidence found.
+pub(crate) fn slot_action(slot: &str, exists: bool, prior: PriorRun) -> SlotAction {
+    if exists {
+        SlotAction::Reuse
+    } else if prior.any() {
+        SlotAction::Refuse(pg_slot_missing_refusal(slot, prior))
+    } else {
+        SlotAction::Create
+    }
+}
+
 /// What one CONFIGURED table can contribute to a `test_decoding` stream —
 /// the pure half of [`PgChangeStream::check_configured_tables_are_routable`].
 ///
@@ -662,28 +681,29 @@ impl PgChangeStream {
                 &[&slot],
             )?
             .get(0);
-        if !exists {
-            if prior.any() {
-                anyhow::bail!("{}", pg_slot_missing_refusal(slot, prior));
+        match slot_action(slot, exists, prior) {
+            SlotAction::Reuse => {}
+            SlotAction::Refuse(why) => anyhow::bail!("{why}"),
+            SlotAction::Create => {
+                // Creating the slot anchors capture at the CURRENT WAL position:
+                // everything already written is unreachable from here. That is correct
+                // and expected on a first run — and indistinguishable, from inside this
+                // process, from a slot an admin or a failover dropped out from under a
+                // running deployment.
+                //
+                // `Refuse` only fires on prior-run evidence (a checkpoint
+                // position, or at the anchor step a completed snapshot), and
+                // `cdc.checkpoint` is optional on PostgreSQL precisely because
+                // the slot itself is the server-side anchor. So the configuration most
+                // reliant on the slot is the one with no evidence that it ever existed,
+                // and the silent branch was the one it took. Loud beats silent: rivet
+                // cannot know which case this is, but the operator can.
+                log::warn!("{}", slot_created_warning(slot));
+                client.execute(
+                    "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+                    &[&slot],
+                )?;
             }
-            // Creating the slot anchors capture at the CURRENT WAL position:
-            // everything already written is unreachable from here. That is correct
-            // and expected on a first run — and indistinguishable, from inside this
-            // process, from a slot an admin or a failover dropped out from under a
-            // running deployment.
-            //
-            // The hard bail above only fires on prior-run evidence (a checkpoint
-            // position, or at the anchor step a completed snapshot), and
-            // `cdc.checkpoint` is optional on PostgreSQL precisely because
-            // the slot itself is the server-side anchor. So the configuration most
-            // reliant on the slot is the one with no evidence that it ever existed,
-            // and the silent branch was the one it took. Loud beats silent: rivet
-            // cannot know which case this is, but the operator can.
-            log::warn!("{}", slot_created_warning(slot));
-            client.execute(
-                "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
-                &[&slot],
-            )?;
         }
         // Snapshot the bound AFTER the slot exists, so a commit landing between
         // slot creation and this read is ≤ bound (captured this run, not lost
@@ -3623,6 +3643,46 @@ mod slot_creation_warning_tests {
              before the next load. Then re-run: rivet creates the new slot BEFORE it \
              re-snapshots, so nothing falls between the two (see cdc-failure-modes.md)."
         );
+    }
+
+    /// Every (slot exists × checkpoint × snapshot) cell: reuse, create on no evidence, refuse naming what was found.
+    #[test]
+    fn slot_action_reuses_creates_or_refuses_by_existence_and_evidence() {
+        use super::{PriorRun, SlotAction, slot_action};
+        let prior = |checkpoint, snapshot| PriorRun {
+            checkpoint,
+            snapshot,
+        };
+        for (c, n) in [(false, false), (true, false), (false, true), (true, true)] {
+            assert_eq!(slot_action("s", true, prior(c, n)), SlotAction::Reuse);
+        }
+        assert_eq!(
+            slot_action("s", false, prior(false, false)),
+            SlotAction::Create,
+            "no prior-run evidence is a first run: the slot is created"
+        );
+        for (c, n, lead) in [
+            (
+                true,
+                false,
+                "pg cdc: slot 's' is missing but the checkpoint file holds a position from a prior run — ",
+            ),
+            (
+                false,
+                true,
+                "pg cdc: slot 's' is missing but a prior run completed this export's snapshot (the state DB's `cdc_snapshot` row or the destination's snapshot/_SUCCESS marker) — ",
+            ),
+            (
+                true,
+                true,
+                "pg cdc: slot 's' is missing but the checkpoint file holds a position from a prior run and a prior run completed",
+            ),
+        ] {
+            match slot_action("s", false, prior(c, n)) {
+                SlotAction::Refuse(why) => assert!(why.starts_with(lead), "({c}, {n}): {why}"),
+                other => panic!("({c}, {n}) must refuse, got {other:?}"),
+            }
+        }
     }
 
     /// #161: both directions of the replica-identity verdict.

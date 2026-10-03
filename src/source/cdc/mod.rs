@@ -2251,6 +2251,32 @@ mod mod_decisions {
 }
 
 #[cfg(test)]
+mod prior_run {
+    use super::PriorRun;
+
+    /// `any` is the OR of the two kinds of evidence, over all four combinations.
+    #[test]
+    fn any_is_true_when_either_kind_of_evidence_was_found() {
+        for (checkpoint, snapshot, any) in [
+            (false, false, false),
+            (true, false, true),
+            (false, true, true),
+            (true, true, true),
+        ] {
+            assert_eq!(
+                PriorRun {
+                    checkpoint,
+                    snapshot
+                }
+                .any(),
+                any,
+                "checkpoint={checkpoint} snapshot={snapshot}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod setup_hint_doc_pointers {
     /// cdc.md names the transaction caps and the opt-in spill the adapters actually read.
     #[test]
