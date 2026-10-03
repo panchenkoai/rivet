@@ -1,5 +1,7 @@
 //! VERIFY — the default independent oracle for live tests. Every `rivet run|load|compact
-//! --config <path>` and `rivet apply <config.yaml>` started through the shared runners
+//! --config <path>`, `rivet apply <config.yaml>` and `rivet cdc` (graded as the `run` of the config
+//! its flags are equivalent to; a `--max-events` run that reached its cap defers what it owed past
+//! it to the stream's next run, logged `RIVET-ORACLE-PARTIAL`) started through the shared runners
 //! (`run_rivet*` in runner.rs, `run_rivet_ok`, and the `Rig`) in the live suite,
 //! live_type_golden or live_differential that exits 0 is graded: the FACTS come from the
 //! config file itself (source type and URL, each export's relation, mode, columns and
@@ -56,14 +58,116 @@ pub(crate) struct Case {
     resume: bool,
     /// The chunk ranges a sealed plan replays (computed when it was planned), else `null`.
     replay: serde_json::Value,
+    /// A `rivet cdc` invocation's own surface, graded as the `run` of the config it is equivalent to.
+    cli: Option<CdcCli>,
+    /// Per export, the NDJSON change lines this `rivet cdc` run printed for its table.
+    events: Vec<usize>,
 }
 
-/// Start grading `argv` (run with working directory `cwd`): `None` unless it is `run|load|compact --config <path>` or `apply <config.yaml>` and not opted out.
+/// What a `rivet cdc` invocation adds to its equivalent config: its `--max-events` cap, and whether it printed NDJSON (no `--output`).
+#[derive(Clone, Copy)]
+struct CdcCli {
+    max_events: Option<usize>,
+    ndjson: bool,
+}
+
+/// The config a `rivet cdc` invocation is equivalent to (src/cli/dispatch.rs `dispatch_cdc`): one export per `--table`, its stream named by `--slot` (PostgreSQL) or `--checkpoint`; a run with no checkpoint is a stream of its own, anchored at its open.
+fn cdc_cli_config(
+    flag: &dyn Fn(&str, &str) -> Vec<String>,
+    envs: &[(&str, &str)],
+    cwd: &Path,
+) -> Result<(Value, CdcCli), String> {
+    let one = |f: &str| flag(f, f).pop();
+    let (field, raw) = [
+        ("url", "--source"),
+        ("url_env", "--source-env"),
+        ("url_file", "--source-file"),
+    ]
+    .into_iter()
+    .find_map(|(k, f)| one(f).map(|v| (k, v)))
+    .ok_or("`rivet cdc` with no source flag")?;
+    let url = match field {
+        "url" => raw.clone(),
+        "url_env" => env_of(envs, &raw).ok_or(format!("--source-env `{raw}` is not set"))?,
+        _ => std::fs::read_to_string(cwd.join(&raw))
+            .map_err(|err| format!("--source-file `{raw}`: {err}"))?
+            .trim()
+            .to_string(),
+    };
+    let engine = match url.split("://").next().unwrap_or_default() {
+        "postgres" | "postgresql" => "postgres",
+        "mysql" => "mysql",
+        "sqlserver" | "mssql" => "mssql",
+        "mongodb" | "mongodb+srv" => "mongo",
+        "oracle" => "oracle",
+        other => return Err(format!("`rivet cdc` over an unknown scheme `{other}://`")),
+    };
+    let tables = flag("--table", "--table");
+    if tables.is_empty() {
+        return Err(
+            "`rivet cdc` with no --table captures every table: nothing names the relation to grade"
+                .into(),
+        );
+    }
+    let output = one("--output");
+    let cli = CdcCli {
+        max_events: one("--max-events").and_then(|n| n.parse().ok()),
+        ndjson: output.is_none(),
+    };
+    let images = image_dir();
+    let checkpoint = one("--checkpoint").unwrap_or_else(|| {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let fresh = format!("no-checkpoint-{}-{n}-{nanos}", std::process::id());
+        images.join(fresh).display().to_string()
+    });
+    let format = match &output {
+        Some(_) => one("--format").unwrap_or_else(|| "parquet".into()),
+        None => "ndjson".into(),
+    };
+    let dest = output.unwrap_or_else(|| images.join("ndjson-out").display().to_string());
+    let exports: Vec<serde_json::Value> = tables
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "name": t,
+                "mode": "cdc",
+                "table": t,
+                "format": format,
+                "cdc": {
+                    "slot": one("--slot").unwrap_or_else(|| "rivet_slot".into()),
+                    "checkpoint": checkpoint,
+                    "capture_instance": one("--capture-instance"),
+                },
+                "destination": {"type": "local", "path": dest},
+            })
+        })
+        .collect();
+    let cfg = serde_json::json!({"source": {"type": engine, field: raw}, "exports": exports});
+    let cfg = serde_yaml_ng::to_value(cfg).map_err(|e| e.to_string())?;
+    Ok((cfg, cli))
+}
+
+/// The directory the oracle keeps its source images and stream records in.
+fn image_dir() -> PathBuf {
+    let target = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".into());
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(target)
+        .join("rivet-oracle-images");
+    std::fs::create_dir_all(&dir).expect("create the oracle image dir");
+    dir
+}
+
+/// Start grading `argv` (run with working directory `cwd`): `None` unless it is `run|load|compact --config <path>`, `apply <config.yaml>` or `cdc` and not opted out.
 pub(crate) fn begin(argv: &[String], envs: &[(&str, &str)], cwd: Option<&Path>) -> Option<Case> {
     let mut verb = argv.first()?.clone();
-    if !matches!(verb.as_str(), "run" | "load" | "compact" | "apply") {
+    if !matches!(verb.as_str(), "run" | "load" | "compact" | "apply" | "cdc") {
         return None;
     }
+    let cdc_cli = verb == "cdc";
     let flag = |long: &str, short: &str| -> Vec<String> {
         let mut out = Vec::new();
         for (i, a) in argv.iter().enumerate() {
@@ -81,7 +185,11 @@ pub(crate) fn begin(argv: &[String], envs: &[(&str, &str)], cwd: Option<&Path>) 
     // A sealed plan artifact names its export and the config it was planned from; its resolved destination and query win.
     let mut sealed: Option<(String, Value, String)> = None;
     let mut replay = serde_json::Value::Null;
-    let cfg_path = if verb == "apply" {
+    let cfg_path = if cdc_cli {
+        // `rivet cdc` anchors its relative paths to its working directory (src/cli/dispatch.rs `dispatch_cdc`).
+        verb = "run".into();
+        PathBuf::from("rivet-cdc.yaml")
+    } else if verb == "apply" {
         // `apply <config.yaml>` runs the config's exports wave by wave: graded as a `run`.
         let plan = argv.get(1).filter(|p| !p.starts_with('-'))?;
         verb = "run".into();
@@ -124,22 +232,37 @@ pub(crate) fn begin(argv: &[String], envs: &[(&str, &str)], cwd: Option<&Path>) 
                 .map(|(k, v)| (k.to_string(), v.to_string()))
         })
         .collect();
-    let Some(text) = std::fs::read_to_string(&cfg_path).ok() else {
-        log(
-            "SKIP",
-            "*",
-            &format!("config {} is unreadable", cfg_path.display()),
-        );
-        return None;
-    };
-    let Some(cfg) = serde_yaml_ng::from_str::<Value>(&resolve_vars(&text, &params, envs)).ok()
-    else {
-        log(
-            "SKIP",
-            "*",
-            &format!("config {} does not parse", cfg_path.display()),
-        );
-        return None;
+    let mut cli = None;
+    let cfg = if cdc_cli {
+        match cdc_cli_config(&flag, envs, &cwd) {
+            Ok((cfg, c)) => {
+                cli = Some(c);
+                cfg
+            }
+            Err(why) => {
+                log("SKIP", "*", &why);
+                return None;
+            }
+        }
+    } else {
+        let Some(text) = std::fs::read_to_string(&cfg_path).ok() else {
+            log(
+                "SKIP",
+                "*",
+                &format!("config {} is unreadable", cfg_path.display()),
+            );
+            return None;
+        };
+        let Some(cfg) = serde_yaml_ng::from_str::<Value>(&resolve_vars(&text, &params, envs)).ok()
+        else {
+            log(
+                "SKIP",
+                "*",
+                &format!("config {} does not parse", cfg_path.display()),
+            );
+            return None;
+        };
+        cfg
     };
     let only = match &sealed {
         Some((name, ..)) => vec![name.clone()],
@@ -182,6 +305,8 @@ pub(crate) fn begin(argv: &[String], envs: &[(&str, &str)], cwd: Option<&Path>) 
         before: Vec::new(),
         resume: argv.iter().any(|a| a == "--resume"),
         replay,
+        cli,
+        events: Vec::new(),
     };
     if case.verb == "run" {
         case.before = case
@@ -221,8 +346,23 @@ pub(crate) fn begin_raw(
 /// Grade a finished invocation that exited 0; panics with every disagreement, returns whether a known defect disagreed as marked.
 pub(crate) fn finish(case: Case, envs: &[(&str, &str)], opts: &Opts) -> bool {
     let mut xfailed = false;
+    assert!(
+        !case.cli.is_some_and(|c| c.ndjson) || case.events.len() == case.exports.len(),
+        "a `rivet cdc` NDJSON run reached the oracle without its stdout: its runner must hand it to `Case::delivered`"
+    );
+    let deferred = case.deferred();
     for (i, e) in case.exports.iter().enumerate() {
         let name = s(e, "name").unwrap_or("?").to_string();
+        if let Some(cap) = deferred {
+            log(
+                "PARTIAL",
+                &name,
+                &format!(
+                    "a bounded run reached --max-events {cap}: what it owed past its bound is graded on the stream's next run, against everything since this run's base"
+                ),
+            );
+            continue;
+        }
         let verdict = if case.verb == "run" {
             case.grade_run(e, &case.before[i], envs, opts)
         } else {
@@ -233,7 +373,7 @@ pub(crate) fn finish(case: Case, envs: &[(&str, &str)], opts: &Opts) -> bool {
             Ok((spec, verb)) => xfailed |= verdict_of(&name, &spec, verb, opts),
         }
     }
-    if case.verb == "run" {
+    if case.verb == "run" && deferred.is_none() {
         // This run's pre-run image becomes the stream's `prev` (and, on its first successful run, its `anchor`).
         for e in case.exports.iter().filter(|e| case.needs_image(e)) {
             let [begin, prev, anchor] = ["begin", "prev", "anchor"].map(|k| case.image(e, k));
@@ -260,6 +400,67 @@ fn image_exists(base: &Path) -> bool {
 }
 
 impl Case {
+    /// Record what a `rivet cdc` NDJSON run printed: each export's change lines appended to its stream's event log.
+    pub(crate) fn delivered(&mut self, stdout: &[u8]) {
+        if !self.cli.is_some_and(|c| c.ndjson) {
+            return;
+        }
+        let text = String::from_utf8_lossy(stdout);
+        self.events = self
+            .exports
+            .iter()
+            .map(|e| {
+                let table = s(e, "table").unwrap_or_default();
+                let leaf = table.rsplit('.').next().unwrap_or(table).to_lowercase();
+                let mine: String = text
+                    .lines()
+                    .filter(|l| {
+                        serde_json::from_str::<serde_json::Value>(l)
+                            .ok()
+                            .and_then(|v| v["table"].as_str().map(str::to_lowercase))
+                            == Some(leaf.clone())
+                    })
+                    .map(|l| format!("{l}\n"))
+                    .collect();
+                use std::io::Write as _;
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(with_ext(&self.image(e, "events"), "jsonl"))
+                    .and_then(|mut f| f.write_all(mine.as_bytes()))
+                    .expect("append the stream's NDJSON events");
+                mine.lines().count()
+            })
+            .collect();
+    }
+
+    /// `Some(cap)` when a `--max-events` run delivered its cap: it stopped at its bound, not at the log end it opened at.
+    fn deferred(&self) -> Option<usize> {
+        let cli = self.cli?;
+        let cap = cli.max_events?;
+        let got: usize = if cli.ndjson {
+            self.events.iter().sum()
+        } else {
+            self.exports
+                .iter()
+                .zip(&self.before)
+                .filter_map(|(e, before)| {
+                    let out = self.local_out(e).ok()?;
+                    let [seen, _] = before.as_ref().ok()?;
+                    let [now, _] = self.manifests_of(e, &out);
+                    Some(
+                        now.difference(seen)
+                            .filter_map(|m| std::fs::read_to_string(out.join(m)).ok())
+                            .filter_map(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+                            .filter_map(|d| d["row_count"].as_u64())
+                            .sum::<u64>() as usize,
+                    )
+                })
+                .sum()
+        };
+        (got >= cap).then_some(cap)
+    }
+
     /// The `run` spec for one export: its facts plus the manifests this run wrote.
     fn grade_run(
         &self,
@@ -323,6 +524,7 @@ impl Case {
                 "anchor": with_ext(&self.image(e, "anchor"), "parquet"),
                 "anchor_keys": with_ext(&self.image(e, "anchor-keys"), "parquet"),
                 "cursor_record": with_ext(&self.image(e, "cursor"), "json"),
+                "ndjson": with_ext(&self.image(e, "events"), "jsonl"),
             })
             .as_object()
             .expect("an object")
@@ -396,15 +598,17 @@ impl Case {
         };
         let url = source_url(&raw);
         let db = self.config_dir.join(".rivet_state.db");
+        // `rivet cdc` keeps no ledger: its manifests and checkpoint are its whole run record (src/cli/dispatch.rs).
         let state = envs
             .iter()
             .find(|(n, _)| *n == "RIVET_STATE_URL")
             .map(|(_, v)| v.to_string())
             .or_else(super::state::state_url_under_test)
             .filter(|u| u.starts_with("postgres"))
-            .or_else(|| db.is_file().then(|| db.display().to_string()));
+            .or_else(|| db.is_file().then(|| db.display().to_string()))
+            .filter(|_| self.cli.is_none());
         // A run with no findable state is graded PARTIAL, never a silent PASS of a ledger leg that was not compared.
-        let state_missing = state.is_none().then(|| {
+        let state_missing = (state.is_none() && self.cli.is_none()).then(|| {
             format!(
                 "no state DB: {} is absent and neither the run's RIVET_STATE_URL nor the backend under test (RIVET_GATE_STATE_URL) is postgres, so rivet's ledger (export_metrics, file_log) was not compared",
                 db.display()
@@ -453,7 +657,7 @@ impl Case {
     /// Why this export's output cannot be graded, or `Ok` when it can.
     fn unreachable(&self, e: &Value) -> Result<(), String> {
         let format = s(e, "format").unwrap_or("parquet");
-        if !matches!(format, "parquet" | "csv") {
+        if !matches!(format, "parquet" | "csv") && !self.cli.is_some_and(|c| c.ndjson) {
             return Err(format!(
                 "format `{format}`: the oracle grades parquet and csv"
             ));
@@ -545,12 +749,7 @@ impl Case {
         use std::hash::{Hash as _, Hasher as _};
         let mut h = std::hash::DefaultHasher::new();
         self.stream_id(e).hash(&mut h);
-        let target = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".into());
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join(target)
-            .join("rivet-oracle-images");
-        std::fs::create_dir_all(&dir).expect("create the oracle image dir");
-        dir.join(format!("{:016x}-{kind}", h.finish()))
+        image_dir().join(format!("{:016x}-{kind}", h.finish()))
     }
 
     /// The stream an export continues: a CDC table's PostgreSQL slot or checkpoint file (every config naming it shares it), else its config directory and name.
@@ -668,9 +867,7 @@ impl Case {
                     );
                 }
                 None => {
-                    let vars = "real GCS destination: set RIVET_TEST_GCS_BUCKET and host ADC \
-                                (`gcloud auth application-default login`)";
-                    std::env::var("RIVET_TEST_GCS_BUCKET").map_err(|_| vars.to_string())?;
+                    let vars = "real GCS destination: no host ADC (`gcloud auth application-default login`)";
                     let token = std::process::Command::new("gcloud")
                         .args(["auth", "application-default", "print-access-token"])
                         .output()

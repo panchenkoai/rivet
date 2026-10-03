@@ -1749,8 +1749,9 @@ jobs:
         # depending on timing, so those two classes share one ceiling; every other class keeps its own.
         env:
           SKIP_CEILING: 49
-          PARTIAL_CEILING: 39
-          FIRST_RUN_CEILING: 61  # 304 -> 61 measured on #433 (2026-10-03): first runs are graded from the stream's anchor; the rest are MySQL checkpoints a test wrote itself
+          # 39 -> 45: `rivet cdc` subcommand runs are graded now; a run that reached its --max-events cap is a PARTIAL whose remainder the stream's next run owes (six cells in this lane).
+          PARTIAL_CEILING: 45
+          FIRST_RUN_CEILING: 67  # 304 -> 61 measured on #433 (2026-10-03): first runs are graded from the stream's anchor; the rest are MySQL checkpoints a test wrote itself. 61 -> 67: six `rivet cdc` subcommand runs on MySQL checkpoints a test wrote itself, ungraded before
           # Timing moves a few verdicts between runs of one commit, in every counter: the
           # `cdc.backfill` SKIP class 14-16 and `settle:` PARTIALs ride rivet's clock, first-run CDC
           # 103-105. An exact band would fail a clean commit, so each counter allows that much, in

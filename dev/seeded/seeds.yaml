@@ -134,3 +134,21 @@ seeds:
         cells: ["lib:pg_v32_replays_over_a_load_spec_table_already_in_its_v32_shape"]
       sqlite-state:
         na: the SQLite ladder never replays over leftovers - its version row lives in the same file and the ladder runs under BEGIN IMMEDIATE, so a migration there is not required to be idempotent
+
+  - name: capped-run-skips-remainder
+    class: a `rivet cdc --max-events` run that stops at its cap moves its checkpoint past the changes after the cap, so the next run never delivers them
+    history: "the rig oracle graded no `rivet cdc` subcommand run until it learned the subcommand and paired a capped run with the next one"
+    scope: source
+    patch: capped-run-skips-remainder/shared.patch
+    engines:
+      mysql:
+        cells: [mysql_cdc_cli_a_capped_run_leaves_its_remainder_to_the_next_run]
+      mongo:
+        cells: [mongo_cdc_cli_a_capped_run_leaves_its_remainder_to_the_next_run]
+      # The capped cells on these three drive `--output` (the file sink), not the NDJSON driver this patch seeds.
+      postgres:
+        cells: []
+      mssql:
+        cells: []
+      oracle:
+        cells: []

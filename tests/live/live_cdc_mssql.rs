@@ -1702,6 +1702,62 @@ fn mssql_cdc_cli_path_case_only_table_mismatch_must_not_silently_drop_events() {
     );
 }
 
+/// A `rivet cdc --max-events` run on SQL Server stops at a commit and owes the rest to the next run, graded by the rig oracle as a pair.
+#[test]
+#[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
+fn mssql_cdc_cli_a_capped_run_leaves_its_remainder_to_the_next_run() {
+    let _serial = cross_process_serial("mssql_cdc");
+    let table = format!("CliDefer{}", std::process::id() % 100_000);
+    let ci = format!("dbo_{table}");
+    mssql_cdc_drop_table(&format!("dbo.{table}"));
+    mssql_cdc_exec(&format!(
+        "CREATE TABLE dbo.{table} (id int PRIMARY KEY, v int)"
+    ));
+    enable_cdc(&table, &ci);
+    let _guard = MssqlCdcTable {
+        table: table.clone(),
+        ci: ci.clone(),
+    };
+    let d = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let ckpt = d.path().join("ck").to_str().unwrap().to_string();
+    let dir = out.path().to_str().unwrap().to_string();
+    let qualified = format!("dbo.{table}");
+    let run = |cap: &[&str]| {
+        let mut args = vec!["cdc", "--source", MSSQL_CDC_URL, "--capture-instance", &ci];
+        args.extend([
+            "--table",
+            &qualified,
+            "--checkpoint",
+            &ckpt,
+            "--output",
+            &dir,
+        ]);
+        args.extend(cap);
+        run_rivet_args_bounded(&args, Duration::from_secs(90))
+            .expect("a bounded `rivet cdc` run terminates");
+    };
+    mssql_cdc_exec(&format!("INSERT INTO dbo.{table} VALUES (0,0);"));
+    wait_for_capture(&ci, 1);
+    run(&[]);
+    mssql_cdc_exec(&format!(
+        "INSERT INTO dbo.{table} VALUES (1,1),(2,2),(3,3);"
+    ));
+    mssql_cdc_exec(&format!(
+        "INSERT INTO dbo.{table} VALUES (4,4),(5,5),(6,6);"
+    ));
+    wait_for_capture(&ci, 7);
+    run(&["--max-events", "2"]);
+    let ids: std::collections::BTreeSet<i64> =
+        read_cdc_changes(out.path()).iter().map(|c| c.id).collect();
+    assert_eq!(
+        ids,
+        (0..=3).collect(),
+        "the cap stops at the first statement's commit"
+    );
+    run(&[]);
+}
+
 /// A checkpoint that PARSES but has no `lsn` silently re-reads the whole change
 /// table — the guard at the parse site claims it doesn't.
 ///
