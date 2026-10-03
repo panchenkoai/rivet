@@ -311,18 +311,19 @@ def clippy(out: Path, label: str, extra: list[str]) -> tuple[str, str]:
     return "FAIL", f"exit {rc}, {errs} error line(s); log {log}"
 
 
-FRESH = re.compile(r"^\s*Fresh rivet-cli\b", re.M)
+COMPILED = re.compile(r"^\s*Compiling rivet-cli\b", re.M)
 DONE = re.compile(r"(\d+) mutants tested in [^:]*: (.*)")
 
 
 def mutant_verdict(mdir: Path, rc: int, log_text: str) -> tuple[str, str]:
-    """Grade a finished `cargo mutants` output dir: no Fresh mutant build, no missed, no timeout."""
+    """Grade a finished `cargo mutants` output dir: every mutant compiled, none missed, none timed out."""
     if rc not in (0, 2, 3):
         return "FAIL", f"cargo-mutants exited {rc}: the tool or the tree broke, not a verdict"
     done = DONE.search(log_text)
     if not done:
         return "FAIL", "no `N mutants tested` summary line: the run has no verdict"
-    fresh = [p.name for p in sorted((mdir / "log").glob("*.log")) if p.name != "baseline.log" and FRESH.search(p.read_text(errors="ignore"))]
+    # The test phase legitimately prints `Fresh` after the build phase compiled the mutant; a log with no `Compiling` was never built.
+    fresh = [p.name for p in sorted((mdir / "log").glob("*.log")) if p.name != "baseline.log" and not COMPILED.search(p.read_text(errors="ignore"))]
     if fresh:
         return "FAIL", f"{len(fresh)} mutant build(s) were Fresh (never compiled): {', '.join(fresh[:3])}"
     missed = [m for m in (mdir / "missed.txt").read_text().splitlines() if m] if (mdir / "missed.txt").exists() else []
@@ -474,7 +475,7 @@ def self_test() -> int:
         m = Path(t) / "mutants.out"
         (m / "log").mkdir(parents=True)
         (m / "log/baseline.log").write_text("       Fresh rivet-cli v1 (/x)\n")
-        (m / "log/src_a.rs_line_3.log").write_text("   Compiling rivet-cli v1 (/x)\n")
+        (m / "log/src_a.rs_line_3.log").write_text("   Compiling rivet-cli v1 (/x)\n*** cargo test\n       Fresh rivet-cli v1 (/x)\n")
         (m / "missed.txt").write_text("")
         ok = "3 mutants tested in 1m: 3 caught"
         assert mutant_verdict(m, 0, ok)[0] == "PASS", mutant_verdict(m, 0, ok)
