@@ -3,7 +3,7 @@
 //! count under `src/source/` may only shrink.
 
 /// Occurrences under `src/source/` on 2026-09-30 (the CDC builder refuses instead of nulling).
-const CEILING: usize = 39;
+const CEILING: usize = 39; // ratchet-pin: silent-degrade-shapes
 
 /// The shapes that swap an unreadable value for NULL or nothing.
 const SHAPES: &[&str] = &[

@@ -77,4 +77,10 @@ if [ -n "$_base" ]; then
   fi
 fi
 
+# Every commit leaving the machine: English, no attribution trailer, no closing keyword before #N.
+if _mb="$(git merge-base origin/main HEAD 2>/dev/null)"; then
+  echo "pre-push: commit message rules"
+  python3 dev/pytools/pr_ready.py text --commits "$_mb..HEAD"
+fi
+
 echo "pre-push: ok"
