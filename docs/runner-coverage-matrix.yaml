@@ -243,7 +243,7 @@ scenarios:
     single:         { test: quality_gate_fails_a_duplicate_on_the_single_runner }
     chunked:        { test: quality_gate_fails_a_duplicate_split_across_chunks }
     chunked_checkpoint: { test: quality_gate_fails_a_duplicate_split_across_checkpoint_chunks }
-    keyset:         { test: quality_gate_fails_a_duplicate_split_across_keyset_pages }
+    keyset:         { test: quality_gate_fails_a_duplicate_split_across_keyset_pages, note: "keyset_PARALLEL is graded per SQL engine over ranges that each end on an EMPTY page (#419, seeded recall `empty-page-fails-quality`): quality_gate_fails_a_duplicate_split_across_parallel_keyset_ranges on PostgreSQL, quality_gate_fails_a_duplicate_across_parallel_keyset_ranges_ending_empty_mysql / _mssql / _oracle on the others" }
     # The Mongo export is `_id` + `document` (never null, never duplicated), so this cell trips row_count_min; the FEED is the same KeysetPage.observed path the keyset cell grades.
     mongo_parallel: { test: quality_gate_fails_a_short_mongo_parallel_export }
     cdc:            { na: "not applied on the drain by design — the gate lives at the finalize_export seam, which CDC returns before; the run warns when `quality:` is set (cdc_ignored_knobs_warning, pinned by cdc_names_every_batch_only_knob_it_ignores_and_only_those and the live a_cdc_export_names_the_batch_knobs_its_drain_ignores)" }

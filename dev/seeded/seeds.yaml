@@ -55,9 +55,9 @@ seeds:
           - every_single_runner_hook_loses_nothing_on_oracle
           - every_chunked_range_runner_hook_loses_nothing_on_oracle
       mssql:
-        cells: []
+        cells: [rotated_parts_reach_the_destination_whole_mssql]
       mongo:
-        cells: []
+        cells: [rotated_parts_reach_the_destination_whole_mongo]
 
   - name: keyset-incremental-overwrite
     class: a keyset_incremental export plans its warehouse load as an overwrite instead of an append
@@ -68,11 +68,11 @@ seeds:
       postgres:
         cells: [a_keyset_incremental_export_into_clickhouse_accumulates_every_run]
       mysql:
-        cells: []
+        cells: [a_keyset_incremental_export_from_mysql_accumulates_in_clickhouse]
       mssql:
-        cells: []
+        cells: [a_keyset_incremental_export_from_sql_server_accumulates_in_clickhouse]
       oracle:
-        cells: []
+        cells: [a_keyset_incremental_export_from_oracle_accumulates_in_clickhouse]
       mongo:
         na: Mongo has no chunk_by_key / keyset_incremental export mode
       lib:
@@ -85,7 +85,7 @@ seeds:
     engines:
       mssql:
         patch: pk-move-without-delete/mssql.patch
-        cells: []
+        cells: [a_sql_server_primary_key_move_flags_the_old_key_deleted_in_clickhouse]
       postgres:
         na: not fixed, so nothing to re-introduce - update(new) with no delete of the old key IS the shipped behaviour (ADR-0030 proposed; pg_cdc_pk_changing_update_captures_and_does_not_brick carries it as a known defect)
       mysql:
@@ -113,11 +113,11 @@ seeds:
       mongo:
         cells: [quality_gate_fails_a_short_mongo_parallel_export]
       mysql:
-        cells: []
+        cells: [quality_gate_fails_a_duplicate_across_parallel_keyset_ranges_ending_empty_mysql]
       mssql:
-        cells: []
+        cells: [quality_gate_fails_a_duplicate_across_parallel_keyset_ranges_ending_empty_mssql]
       oracle:
-        cells: []
+        cells: [quality_gate_fails_a_duplicate_across_parallel_keyset_ranges_ending_empty_oracle]
       lib:
         cells: ["lib:a_zero_row_empty_schema_binds_nothing_and_is_not_a_ghost_column"]
 
