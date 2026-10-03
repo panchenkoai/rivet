@@ -6515,6 +6515,22 @@ fn mysql_cdc_cli_stream_with_a_cap_terminates_and_accepts_a_server_id() {
         "a cap of 2 must stop at tx1's boundary: {{1,2}} means it cut the transaction, \
          {{1..=6}} means the cap stopped nothing"
     );
+    // The capped run deferred tx2: a bounded run of the same stream owes it, and the rig oracle grades the pair.
+    run_rivet_args_bounded(
+        &[
+            "cdc",
+            "--source",
+            MYSQL_CDC_URL,
+            "--table",
+            &tbl,
+            "--checkpoint",
+            ckpt.to_str().unwrap(),
+            "--server-id",
+            "919191",
+        ],
+        std::time::Duration::from_secs(60),
+    )
+    .expect("the follow-up bounded run terminates");
 
     // And the half that actually proves `--stream` was HONOURED. Everything above
     // holds for a bounded run too — with a cap of 2 both modes stop at the same

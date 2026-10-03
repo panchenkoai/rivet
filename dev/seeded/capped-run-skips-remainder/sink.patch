@@ -1,0 +1,17 @@
+diff --git a/src/source/cdc/sink.rs b/src/source/cdc/sink.rs
+index 64604f50..750b7d2f 100644
+--- a/src/source/cdc/sink.rs
++++ b/src/source/cdc/sink.rs
+@@ -592,6 +592,12 @@ pub(crate) fn run_to_files(
+                 // block, so a boundary on an uncaptured table still honours it.
+                 if committed && cfg.max_events.is_some_and(|m| emitted >= m) {
+                     hit_max = true;
++                    while let Some(Ok(rest)) = stream.next_change() {
++                        if rest.committed {
++                            last_commit = Some(rest.position.clone());
++                            unacked_commit = true;
++                        }
++                    }
+                     break;
+                 }
+             }

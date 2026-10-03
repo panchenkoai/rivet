@@ -1,7 +1,7 @@
 //! VERIFY — the default independent oracle for live tests. Every `rivet run|load|compact
 //! --config <path>`, `rivet apply <config.yaml>` and `rivet cdc` (graded as the `run` of the config
 //! its flags are equivalent to; a `--max-events` run that reached its cap defers what it owed past
-//! it to the stream's next run, logged `RIVET-ORACLE-PARTIAL`) started through the shared runners
+//! it to the stream's next run, logged `RIVET-ORACLE-DEFERRED`; the census requires that run's verdict) started through the shared runners
 //! (`run_rivet*` in runner.rs, `run_rivet_ok`, and the `Rig`) in the live suite,
 //! live_type_golden or live_differential that exits 0 is graded: the FACTS come from the
 //! config file itself (source type and URL, each export's relation, mode, columns and
@@ -407,7 +407,7 @@ pub(crate) fn finish(case: Case, envs: &[(&str, &str)], opts: &Opts) -> bool {
         let name = s(e, "name").unwrap_or("?").to_string();
         if let Some(cap) = deferred {
             log(
-                "PARTIAL",
+                "DEFERRED",
                 &name,
                 &format!(
                     "a bounded run reached --max-events {cap}: what it owed past its bound is graded on the stream's next run, against everything since this run's base"
@@ -806,7 +806,15 @@ impl Case {
 
     /// Every file the oracle keeps for this export's stream, existing or not.
     fn stream_records(&self, e: &Value) -> Vec<PathBuf> {
-        let kinds = ["begin", "prev", "anchor", "anchor-keys", "dests", "cursor", "events"];
+        let kinds = [
+            "begin",
+            "prev",
+            "anchor",
+            "anchor-keys",
+            "dests",
+            "cursor",
+            "events",
+        ];
         let exts = ["parquet", "parquet.missing", "txt", "json", "jsonl"];
         kinds
             .iter()

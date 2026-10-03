@@ -1595,7 +1595,6 @@ fn mssql_cdc_case_only_table_mismatch_must_not_silently_drop_events() {
 /// `configured_tables`, so the guard has the same subject it does in config mode.
 /// The `--output` leg is used (durable sink + checkpoint), because the drop is
 /// only dangerous once a checkpoint can advance.
-// AUDIT-RED cdc-cli-identity: a case-only --table mismatch on the CLI path routes ZERO events while the checkpoint advances — expected to FAIL until the CLI passes --table as configured_tables.
 #[test]
 #[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
 fn mssql_cdc_cli_path_case_only_table_mismatch_must_not_silently_drop_events() {
@@ -1615,13 +1614,14 @@ fn mssql_cdc_cli_path_case_only_table_mismatch_must_not_silently_drop_events() {
     };
 
     let d = tempfile::tempdir().unwrap();
-    let out = tempfile::tempdir().unwrap();
+    let dest = tempfile::tempdir().unwrap();
     let ckpt = d.path().join("cli.ckpt");
 
-    // The CLI invocation, mirroring config mode's mismatch: --table in a case the
-    // catalog does not use. The anchor is allowed to REFUSE (the guard firing at
-    // open is exactly the fix) — refusing before any checkpoint advances is the
-    // outcome this test wants.
+    mssql_cdc_exec(&format!(
+        "INSERT INTO dbo.{table} VALUES (1,'a'),(2,'b'),(3,'c');"
+    ));
+    wait_for_capture(ci, 3);
+    // The CLI invocation, mirroring config mode's mismatch: --table in a case the catalog does not use.
     let cli = |dir: &std::path::Path, tbl: &str| {
         run_rivet_env(
             &[
@@ -1641,65 +1641,20 @@ fn mssql_cdc_cli_path_case_only_table_mismatch_must_not_silently_drop_events() {
         )
     };
 
-    let anchor = cli(out.path(), &table.to_lowercase());
-    if !anchor.status.success() {
-        let why = String::from_utf8_lossy(&anchor.stderr);
-        assert!(
-            why.contains("no configured table matches"),
-            "the CLI anchor run failed for an unrelated reason:\n{why}"
-        );
-        return; // refused at open, before any checkpoint could advance — correct
-    }
-
-    mssql_cdc_exec(&format!(
-        "INSERT INTO dbo.{table} VALUES (1,'a'),(2,'b'),(3,'c');"
-    ));
-    wait_for_capture(ci, 3);
-
-    let o = cli(out.path(), &table.to_lowercase());
-    if !o.status.success() {
-        return; // refused — the guard the fix adds; correct
-    }
-
-    // Read the captured EVENTS back (the sibling test's oracle) — part
-    // presence alone is the weak "mc ls | wc -l" class the matrix audit
-    // banned; the content read costs nothing more and grades honestly.
-    let captured = read_cdc_changes(out.path()).len();
-    if captured > 0 {
-        return; // routed correctly; nothing to guard
-    }
-
-    // Captured nothing AND exited 0 — the pre-fix silent drop. Prove the changes
-    // were there all along: a correctly-cased CLI run against a FRESH checkpoint
-    // recovers them (parts appear on disk).
-    let still_in_ct = mssql_cdc_query_i64(&format!("SELECT COUNT(*) FROM cdc.{ci}_CT"));
-    let out_fixed = tempfile::tempdir().unwrap();
-    let fixed_ckpt = d.path().join("cli_fixed.ckpt");
-    let _ = run_rivet_env(
-        &[
-            "cdc",
-            "--source",
-            MSSQL_CDC_URL,
-            "--capture-instance",
-            ci,
-            "--table",
-            &format!("dbo.{table}"),
-            "--checkpoint",
-            fixed_ckpt.to_str().unwrap(),
-            "--output",
-            out_fixed.path().to_str().unwrap(),
-        ],
-        &[],
+    // The guard fires at open: the run refuses before any part or checkpoint, so the rig oracle has no
+    // delivered run to grade here; the refusal and the untouched destination are this test's oracle.
+    let out = cli(dest.path(), &table.to_lowercase());
+    assert!(
+        !out.status.success(),
+        "a case-only --table mismatch must refuse, not run: {}",
+        String::from_utf8_lossy(&out.stdout)
     );
-    let after_fix = read_cdc_changes(out_fixed.path()).len();
-
-    panic!(
-        "the `rivet cdc` CLI path captured 0 of the {still_in_ct} change row(s) on a case-only \
-         --table mismatch and exited 0; a correctly-cased run wrote {after_fix} part(s). The CLI \
-         passed configured_tables = Vec::new() (dispatch.rs), which disables the catalog-identity \
-         cross-check (mssql/cdc.rs), so the guard the config path has never fired here — every \
-         event was dropped while the checkpoint advanced past it."
+    let why = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        why.contains("no configured table matches"),
+        "the refusal must name the unmatched table, not fail for an unrelated reason:\n{why}"
     );
+    assert_refused_before_any_write(dest.path(), &ckpt);
 }
 
 /// A `rivet cdc --max-events` run on SQL Server stops at a commit and owes the rest to the next run, graded by the rig oracle as a pair.
