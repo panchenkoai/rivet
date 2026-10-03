@@ -151,13 +151,29 @@ impl StateRow for postgres::Row {
         self.get(i)
     }
     fn i64(&self, i: usize) -> i64 {
-        self.get(i)
+        pg_int(self, i)
+            .unwrap_or_else(|| panic!("state column {} is NULL", self.columns()[i].name()))
     }
     fn opt_i64(&self, i: usize) -> Option<i64> {
-        self.get(i)
+        pg_int(self, i)
     }
     fn opt_bool(&self, i: usize) -> Option<bool> {
         self.get(i)
+    }
+}
+
+/// Read Postgres column `i` of any integer width (INT2/INT4/INT8) as i64; any other type panics naming the column and its type.
+fn pg_int(row: &postgres::Row, i: usize) -> Option<i64> {
+    use postgres::types::Type;
+    let col = &row.columns()[i];
+    match *col.type_() {
+        Type::INT2 => row.get::<_, Option<i16>>(i).map(i64::from),
+        Type::INT4 => row.get::<_, Option<i32>>(i).map(i64::from),
+        Type::INT8 => row.get(i),
+        ref other => panic!(
+            "state column {} is {other}, not an integer (INT2/INT4/INT8)",
+            col.name()
+        ),
     }
 }
 
@@ -249,5 +265,43 @@ mod tests {
             )
             .unwrap();
         assert_eq!(none, None);
+    }
+
+    /// The Postgres accessor reads every integer width, NULL as None, and refuses a non-integer by name and type.
+    #[test]
+    fn pg_accessor_reads_every_integer_width_and_refuses_other_types() {
+        let Ok(url) = std::env::var("RIVET_TEST_STATE_URL") else {
+            return crate::test_hook::skip_live("RIVET_TEST_STATE_URL unset");
+        };
+        if !url.starts_with("postgres") {
+            return crate::test_hook::skip_live("RIVET_TEST_STATE_URL is not a postgres URL");
+        }
+        let mut client = super::super::connect_pg(&url).expect("connect pg state");
+        let row = client
+            .query_one(
+                "SELECT CAST(-7 AS INT2) AS a, 70000 AS b, CAST(5000000000 AS INT8) AS c, \
+                 CAST(NULL AS INT4) AS d, 'x' AS e",
+                &[],
+            )
+            .unwrap();
+        let r: &dyn StateRow = &row;
+        assert_eq!((r.i64(0), r.i64(1), r.i64(2)), (-7, 70000, 5_000_000_000));
+        assert_eq!((r.opt_i64(1), r.opt_i64(3)), (Some(70000), None));
+        let msg = |f: &dyn Fn()| {
+            let e = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_err();
+            e.downcast_ref::<String>().cloned().unwrap_or_default()
+        };
+        assert_eq!(
+            msg(&|| {
+                r.i64(3);
+            }),
+            "state column d is NULL"
+        );
+        assert_eq!(
+            msg(&|| {
+                r.opt_i64(4);
+            }),
+            "state column e is text, not an integer (INT2/INT4/INT8)"
+        );
     }
 }
