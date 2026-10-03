@@ -1,12 +1,14 @@
 diff --git a/src/source/postgres/cdc.rs b/src/source/postgres/cdc.rs
-index cbcc0b43..6c841cd5 100644
+index d224486d..2915598e 100644
 --- a/src/source/postgres/cdc.rs
 +++ b/src/source/postgres/cdc.rs
-@@ -808,6 +808,7 @@ impl PgChangeStream {
-                         crate::source::cdc::TxnFramer::close_head_of_group(
-                             &mut group, &commit, tail_len,
-                         );
-+                        group.iter_mut().for_each(|e| e.committed = true);
-                         for ev in group {
-                             self.pending.push_back(ev);
+@@ -791,7 +791,8 @@ impl PgChangeStream {
+                         let commit = Position(json!({ "lsn": lsn }));
+                         // #158: commit LSN on all, committed on the transaction's LAST
+                         // event — on disk when it spilled (`TxBuffer::close_transaction`).
+-                        let (head, tail) = tx.close_transaction(&commit, &lsn)?;
++                        let (mut head, tail) = tx.close_transaction(&commit, &lsn)?;
++                        head.iter_mut().for_each(|e| e.committed = true);
+                         if !head.is_empty() || tail.is_some() {
+                             self.yielded_data = true;
                          }

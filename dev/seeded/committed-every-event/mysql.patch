@@ -1,12 +1,14 @@
 diff --git a/src/source/mysql/cdc.rs b/src/source/mysql/cdc.rs
-index 9b835aa8..59a0409a 100644
+index d7667763..e68f6b64 100644
 --- a/src/source/mysql/cdc.rs
 +++ b/src/source/mysql/cdc.rs
-@@ -980,6 +980,7 @@ impl MysqlChangeStream {
-         // spilled tail that last event is on DISK, which is what `tail_len` says.
-         let head_len = tx.len();
-         crate::source::cdc::TxnFramer::close_head_of_group(&mut tx, &commit, tail_len);
-+        tx.iter_mut().for_each(|e| e.committed = true);
-         for ev in tx {
-             self.pending.push_back(ev);
-         }
+@@ -918,7 +918,8 @@ impl MysqlChangeStream {
+             .tx
+             .close_transaction(&commit, &format_args!("{}:{log_pos}", self.file))
+         {
+-            Ok((head, tail)) => {
++            Ok((mut head, tail)) => {
++                head.iter_mut().for_each(|e| e.committed = true);
+                 self.pending.extend(head);
+                 self.spooled = tail;
+             }
