@@ -2045,8 +2045,8 @@ pub(crate) mod tests {
     fn spec(status: TargetStatus) -> Vec<TargetColumnSpec> {
         vec![TargetColumnSpec {
             column_name: "id".into(),
-            target_type: "INT64".into(),
-            autoload_type: String::new(),
+            target_type: crate::types::target::BqType::Int64.into(),
+            autoload_type: crate::types::target::BqType::Int64.into(),
             status,
             note: None,
             cast_sql: None,

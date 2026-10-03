@@ -87,7 +87,7 @@
 use super::TargetLoader;
 use super::bq_rest::BigQueryApi;
 use crate::load::plan::{Clustering, Granularity, PartitionForm, PartitionKey, TablePartition};
-use crate::types::target::TargetColumnSpec;
+use crate::types::target::{BqType, TargetColumnSpec, TargetType};
 use anyhow::{Context as _, Result, bail};
 use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
@@ -743,7 +743,7 @@ impl TargetLoader for BigQueryLoader {
         let time_type = matches!(key, Some(PartitionKey::Time { .. })).then(|| {
             part_col
                 .and_then(|c| specs.iter().find(|s| s.column_name == c))
-                .map_or("TIMESTAMP", |s| s.target_type.as_str())
+                .map_or(&TargetType::BigQuery(BqType::Timestamp), |s| &s.target_type)
         });
         let probe = compact_probe_sql(
             &changes_fqtn,
@@ -906,7 +906,7 @@ impl super::ShapeControl for BigQueryLoader {
 pub(crate) fn partition_expr(
     export: &str,
     form: &PartitionForm,
-    column_type: &dyn Fn(&str) -> Result<String>,
+    column_type: &dyn Fn(&str) -> Result<TargetType>,
 ) -> Result<(PartitionKey, String)> {
     Ok(match form {
         PartitionForm::Column {
@@ -915,18 +915,25 @@ pub(crate) fn partition_expr(
         } => {
             let t = column_type(column)?;
             let g = granularity.as_sql();
-            let expr = match (t.as_str(), granularity) {
-                ("TIMESTAMP", _) => format!("TIMESTAMP_TRUNC(`{column}`, {g})"),
-                ("DATETIME", _) => format!("DATETIME_TRUNC(`{column}`, {g})"),
-                ("DATE", Granularity::Day) => format!("`{column}`"),
-                ("DATE", Granularity::Hour) => bail!(
+            let expr = match (&t, granularity) {
+                (TargetType::BigQuery(BqType::Timestamp), _) => {
+                    format!("TIMESTAMP_TRUNC(`{column}`, {g})")
+                }
+                (TargetType::BigQuery(BqType::DateTime), _) => {
+                    format!("DATETIME_TRUNC(`{column}`, {g})")
+                }
+                (TargetType::BigQuery(BqType::Date), Granularity::Day) => format!("`{column}`"),
+                (TargetType::BigQuery(BqType::Date), Granularity::Hour) => bail!(
                     "export `{export}`: `{column}` is a DATE, which has no hours — partition it \
                      by day, month or year"
                 ),
-                ("DATE", _) => format!("DATE_TRUNC(`{column}`, {g})"),
+                (TargetType::BigQuery(BqType::Date), _) => {
+                    format!("DATE_TRUNC(`{column}`, {g})")
+                }
                 _ => bail!(
-                    "export `{export}`: cannot partition on `{column}` ({t}); BigQuery partitions \
-                     a DATE, DATETIME or TIMESTAMP column by time, or an INT64 column with `range`"
+                    "export `{export}`: cannot partition on `{column}` ({}); BigQuery partitions \
+                     a DATE, DATETIME or TIMESTAMP column by time, or an INT64 column with `range`",
+                    crate::load::plan::base_type(&t)
                 ),
             };
             (
@@ -944,9 +951,10 @@ pub(crate) fn partition_expr(
             interval,
         } => {
             let t = column_type(column)?;
-            if t != "INT64" {
+            if t != TargetType::BigQuery(BqType::Int64) {
                 bail!(
-                    "export `{export}`: `range` partitions an INT64 column, and `{column}` is {t}"
+                    "export `{export}`: `range` partitions an INT64 column, and `{column}` is {}",
+                    crate::load::plan::base_type(&t)
                 );
             }
             (
@@ -976,20 +984,19 @@ pub(crate) fn partition_expr(
 }
 
 /// Whether BigQuery can cluster a column of this native type.
-pub(crate) fn clusterable(target_type: &str) -> bool {
-    let base = crate::load::plan::base_type(target_type);
+pub(crate) fn clusterable(target_type: &TargetType) -> bool {
     matches!(
-        base.as_str(),
-        "BIGNUMERIC"
-            | "BOOL"
-            | "DATE"
-            | "DATETIME"
-            | "GEOGRAPHY"
-            | "INT64"
-            | "NUMERIC"
-            | "RANGE"
-            | "STRING"
-            | "TIMESTAMP"
+        target_type,
+        TargetType::BigQuery(
+            BqType::BigNumeric
+                | BqType::Bool
+                | BqType::Date
+                | BqType::DateTime
+                | BqType::Int64
+                | BqType::Numeric
+                | BqType::String
+                | BqType::Timestamp
+        )
     )
 }
 

@@ -10,7 +10,7 @@
 //! config was parsed TWICE (once here, once in the child) with different
 //! `${VAR}` resolution. Both are gone: one parse, one resolver, no argv.
 
-use crate::types::target::TargetColumnSpec;
+use crate::types::target::{TargetColumnSpec, TargetType};
 use anyhow::{Context, Result, bail};
 
 use crate::config::load::HOURLY_LIFETIME_DAYS;
@@ -1187,7 +1187,7 @@ fn resolve_keys(
         specs
             .iter()
             .find(|s| s.column_name == c)
-            .map(|s| s.target_type.as_str())
+            .map(|s| &s.target_type)
     };
     if fit == SpecFit::Strict
         && let Some(missing) = pk.iter().find(|c| type_of(c).is_none())
@@ -1271,7 +1271,7 @@ fn resolve_partition(
     {
         return Ok(None);
     }
-    let column_type = |c: &str| -> Result<String> {
+    let column_type = |c: &str| -> Result<TargetType> {
         if !super::is_safe_load_ident(c) {
             bail!(
                 "export `{export}`: partition column `{}` is not a plain SQL identifier \
@@ -1282,7 +1282,7 @@ fn resolve_partition(
         specs
             .iter()
             .find(|s| s.column_name == c)
-            .map(|s| base_type(&s.target_type))
+            .map(|s| s.target_type.clone())
             .with_context(|| format!("export `{export}`: partition column `{c}` {NOT_A_COLUMN}"))
     };
     let (key, expr) = match &load.target {
@@ -1375,9 +1375,10 @@ fn hourly_partitions_outlive_the_table(
         && expiration_days.is_none_or(|d| d > HOURLY_LIFETIME_DAYS)
 }
 
-/// `NUMERIC(12, 2)` → `NUMERIC`, `ARRAY<INT64>` → `ARRAY`.
-pub(crate) fn base_type(target_type: &str) -> String {
+/// A type's name without parameters for a message: `NUMERIC(12, 2)` → `NUMERIC`, `ARRAY<INT64>` → `ARRAY`.
+pub(crate) fn base_type(target_type: &TargetType) -> String {
     target_type
+        .to_string()
         .split(['(', '<'])
         .next()
         .unwrap_or_default()
@@ -1585,7 +1586,7 @@ mod tests {
 
     use crate::preflight::type_report::{ExportTypeReport, TypeReportRow};
     use crate::types::TypeFidelity;
-    use crate::types::target::{ExportTarget, TargetInput};
+    use crate::types::target::{BqType, ChType, ExportTarget, SfType, TargetInput};
 
     /// A report row as `type_report::collect_report` builds one — from the
     /// resolver's OWN [`TargetColumnSpec`], split across the row's optional
@@ -1614,8 +1615,8 @@ mod tests {
     fn col(name: &str, status: TargetStatus) -> TypeReportRow {
         row_from_spec(&TargetColumnSpec {
             column_name: name.into(),
-            target_type: "STRING".into(),
-            autoload_type: "STRING".into(),
+            target_type: BqType::String.into(),
+            autoload_type: BqType::String.into(),
             status,
             note: None,
             cast_sql: None,
@@ -1626,8 +1627,8 @@ mod tests {
     fn ts_col(name: &str) -> TypeReportRow {
         row_from_spec(&TargetColumnSpec {
             column_name: name.into(),
-            target_type: "TIMESTAMP".into(),
-            autoload_type: "TIMESTAMP".into(),
+            target_type: BqType::Timestamp.into(),
+            autoload_type: BqType::Timestamp.into(),
             status: TargetStatus::Ok,
             note: None,
             cast_sql: None,
@@ -2623,13 +2624,13 @@ load:
 
         let plans = plan_loads(&path).unwrap();
         assert_eq!(plans.len(), 1);
-        let specs: Vec<(&str, &str)> = plans[0]
+        let specs: Vec<(&str, String)> = plans[0]
             .specs
             .iter()
-            .map(|s| (s.column_name.as_str(), s.target_type.as_str()))
+            .map(|s| (s.column_name.as_str(), s.target_type.to_string()))
             .collect();
         assert_eq!(specs.len(), 2, "{specs:?}");
-        assert_eq!(specs[0], ("id", "INT64"));
+        assert_eq!(specs[0], ("id", "INT64".to_string()));
         assert_eq!(specs[1].0, "amount");
         assert!(specs[1].1.starts_with("NUMERIC"), "{specs:?}");
         assert_eq!(plans[0].pk, vec!["id"], "pk: auto is the recorded key");
@@ -2655,11 +2656,12 @@ load:
         );
     }
 
-    fn typed(name: &str, ty: &str) -> TargetColumnSpec {
+    fn typed(name: &str, ty: impl Into<TargetType>) -> TargetColumnSpec {
+        let ty = ty.into();
         TargetColumnSpec {
             column_name: name.into(),
-            target_type: ty.into(),
-            autoload_type: ty.into(),
+            target_type: ty.clone(),
+            autoload_type: ty,
             status: TargetStatus::Ok,
             note: None,
             cast_sql: None,
@@ -2979,8 +2981,8 @@ load: { target: bigquery, project: p, dataset: d, cluster_by: none }
     fn spec_named(name: &str) -> TargetColumnSpec {
         TargetColumnSpec {
             column_name: name.into(),
-            target_type: "STRING".into(),
-            autoload_type: "STRING".into(),
+            target_type: BqType::String.into(),
+            autoload_type: BqType::String.into(),
             status: TargetStatus::Ok,
             note: None,
             cast_sql: None,
@@ -3012,9 +3014,9 @@ load: { target: bigquery, project: p, dataset: d, cluster_by: none }
     #[test]
     fn auto_keys_come_from_the_recorded_key_and_skip_unclusterable_columns() {
         let specs = [
-            typed("tenant", "INT64"),
-            typed("score", "FLOAT64"),
-            typed("id", "STRING"),
+            typed("tenant", BqType::Int64),
+            typed("score", BqType::Float64),
+            typed("id", BqType::String),
         ];
         let recorded = cols(&["tenant", "score", "id"]);
         let (pk, cluster) = resolve_keys(
@@ -3032,7 +3034,7 @@ load: { target: bigquery, project: p, dataset: d, cluster_by: none }
     #[test]
     fn auto_clustering_keeps_the_first_four_key_columns_only_on_bigquery() {
         let names = ["a", "b", "c", "d", "e"];
-        let specs: Vec<_> = names.iter().map(|n| typed(n, "INT64")).collect();
+        let specs: Vec<_> = names.iter().map(|n| typed(n, BqType::Int64)).collect();
         let resolve = |target| {
             resolve_keys(
                 "e",
@@ -3050,7 +3052,7 @@ load: { target: bigquery, project: p, dataset: d, cluster_by: none }
 
     #[test]
     fn explicit_clustering_is_refused_when_bigquery_cannot_hold_it() {
-        let specs = [typed("id", "INT64"), typed("score", "FLOAT64")];
+        let specs = [typed("id", BqType::Int64), typed("score", BqType::Float64)];
         let err = |extra| {
             resolve_keys(
                 "e",
@@ -3074,7 +3076,7 @@ load: { target: bigquery, project: p, dataset: d, cluster_by: none }
     /// refusal comes at plan time, not after the append (which would then be retried).
     #[test]
     fn resolve_keys_refuses_a_pk_column_the_export_does_not_have() {
-        let specs = [typed("id", "INT64"), typed("v", "STRING")];
+        let specs = [typed("id", BqType::Int64), typed("v", BqType::String)];
         let e = resolve_keys(
             "e",
             &load_with("bigquery", serde_json::json!({ "pk": ["idd"] })),
@@ -3105,7 +3107,7 @@ load: { target: bigquery, project: p, dataset: d, cluster_by: none }
 
     #[test]
     fn an_explicit_pk_wins_over_the_recorded_key_and_none_clusters_nothing() {
-        let specs = [typed("id", "INT64"), typed("ext", "INT64")];
+        let specs = [typed("id", BqType::Int64), typed("ext", BqType::Int64)];
         let recorded = cols(&["id"]);
         let resolve = |extra| {
             resolve_keys(
@@ -3133,7 +3135,7 @@ load: { target: bigquery, project: p, dataset: d, cluster_by: none }
             "e",
             &load_with("bigquery", serde_json::json!({})),
             None,
-            &[typed("id", "INT64")],
+            &[typed("id", BqType::Int64)],
             SpecFit::Strict,
         )
         .unwrap();
@@ -3156,11 +3158,11 @@ load: { target: bigquery, project: p, dataset: d, cluster_by: none }
     #[test]
     fn bigquery_partition_expressions_follow_the_column_type() {
         let specs = [
-            typed("ts", "TIMESTAMP"),
-            typed("dt", "DATETIME"),
-            typed("d", "DATE"),
-            typed("n", "INT64"),
-            typed("v", "STRING"),
+            typed("ts", BqType::Timestamp),
+            typed("dt", BqType::DateTime),
+            typed("d", BqType::Date),
+            typed("n", BqType::Int64),
+            typed("v", BqType::String),
         ];
         let expr = |block: serde_json::Value| resolve_bq(block, &specs).unwrap().unwrap().expr;
         let col = |c: &str, g: &str| serde_json::json!({ "column": c, "granularity": g });
@@ -3221,10 +3223,10 @@ load: { target: bigquery, project: p, dataset: d, cluster_by: none }
     #[test]
     fn bigquery_partition_refuses_a_form_the_column_type_cannot_take() {
         let specs = [
-            typed("ts", "TIMESTAMP"),
-            typed("d", "DATE"),
-            typed("v", "STRING"),
-            typed("n", "INT64"),
+            typed("ts", BqType::Timestamp),
+            typed("d", BqType::Date),
+            typed("v", BqType::String),
+            typed("n", BqType::Int64),
         ];
         let err = |block: serde_json::Value| resolve_bq(block, &specs).unwrap_err().to_string();
         let e = err(serde_json::json!({ "column": "d", "granularity": "hour" }));
@@ -3251,10 +3253,10 @@ load: { target: bigquery, project: p, dataset: d, cluster_by: none }
     #[test]
     fn clickhouse_partitions_a_date_column_in_every_mode_and_refuses_bigquery_only_forms() {
         let specs = [
-            typed("ts", "DateTime64(6, 'UTC')"),
-            typed("naive", "DateTime64(6)"),
-            typed("d", "Date32"),
-            typed("n", "Int64"),
+            typed("ts", ChType::DateTime64(6, Some("UTC".into()))),
+            typed("naive", ChType::DateTime64(6, None)),
+            typed("d", ChType::Date32),
+            typed("n", ChType::Int64),
         ];
         for mode in [LoadMode::Full, LoadMode::Incremental, LoadMode::Cdc] {
             let resolve = |block: serde_json::Value| {
@@ -3360,9 +3362,9 @@ load: { target: bigquery, project: p, dataset: d, cluster_by: none }
     #[test]
     fn snowflake_partition_is_a_leading_date_trunc_and_refuses_bigquery_only_forms() {
         let specs = [
-            typed("ts", "TIMESTAMP_NTZ(6)"),
-            typed("d", "DATE"),
-            typed("n", "NUMBER(38,0)"),
+            typed("ts", SfType::TimestampNtz),
+            typed("d", SfType::Date),
+            typed("n", SfType::NumberPs(38, 0)),
         ];
         let resolve = |block: serde_json::Value| {
             resolve_partition(

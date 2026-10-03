@@ -12,7 +12,7 @@ use crate::source;
 use crate::types::{
     ColumnOverrides, TypeFidelity,
     policy::{PolicyAction, PolicyViolation, TypePolicy},
-    target::{ExportTarget, TargetInput, TargetStatus},
+    target::{ExportTarget, TargetInput, TargetStatus, TargetType},
 };
 
 /// One row in the type report (and the JSON output — roadmap §9).
@@ -27,7 +27,7 @@ pub struct TypeReportRow {
     pub warnings: Vec<String>,
     /// Present when `--target` is set.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub target_type: Option<String>,
+    pub target_type: Option<TargetType>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_status: Option<TargetStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -36,7 +36,7 @@ pub struct TypeReportRow {
     /// only when it diverges from `target_type` (e.g. BigQuery autoloads JSON
     /// as BYTES). Present when `--target` is set and autoload ≠ native.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub autoload_type: Option<String>,
+    pub autoload_type: Option<TargetType>,
     /// Materialization / load-schema hint (L5) to recover the native type.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cast_sql: Option<String>,
@@ -671,7 +671,10 @@ pub fn print_table(report: &ExportTypeReport, target: Option<ExportTarget>) {
 
     if target.is_some() {
         let tgt_w = col_width(&report.columns, |r| {
-            r.target_type.as_deref().unwrap_or("-").len()
+            r.target_type
+                .as_ref()
+                .map_or_else(|| "-".to_string(), ToString::to_string)
+                .len()
         })
         .max("Target type".len());
         let sta_w = "Status".len();
@@ -692,7 +695,10 @@ pub fn print_table(report: &ExportTypeReport, target: Option<ExportTarget>) {
         );
         for row in &report.columns {
             let status_label = row.target_status.as_ref().map(|s| s.label()).unwrap_or("-");
-            let tgt_type = row.target_type.as_deref().unwrap_or("-");
+            let tgt_type = row
+                .target_type
+                .as_ref()
+                .map_or_else(|| "-".to_string(), ToString::to_string);
             let status_marker = match &row.target_status {
                 Some(TargetStatus::Fail) => " ✗",
                 Some(TargetStatus::Warn) => " ~",

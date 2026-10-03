@@ -4,8 +4,8 @@ use crate::types::target::TargetStatus;
 fn spec(name: &str, cast: Option<&str>, status: TargetStatus) -> TargetColumnSpec {
     TargetColumnSpec {
         column_name: name.into(),
-        target_type: "X".into(),
-        autoload_type: "Y".into(),
+        target_type: BqType::Json.into(),
+        autoload_type: BqType::Bytes.into(),
         status,
         note: None,
         cast_sql: cast.map(String::from),
@@ -311,14 +311,32 @@ fn the_log_never_expires_partitions_on_the_export_stamp() {
 }
 
 #[test]
-fn clusterable_reads_the_type_name_before_its_parameters() {
-    assert!(clusterable("NUMERIC(12, 2)"));
-    assert!(clusterable("DATETIME"));
-    assert!(clusterable("STRING"));
-    assert!(!clusterable("FLOAT64"));
-    assert!(!clusterable("ARRAY<INT64>"));
-    assert!(!clusterable("JSON"));
-    assert!(!clusterable("BYTES"));
+fn clusterable_names_the_types_bigquery_clusters_on() {
+    for t in [
+        BqType::BigNumeric,
+        BqType::Bool,
+        BqType::Date,
+        BqType::DateTime,
+        BqType::Int64,
+        BqType::Numeric,
+        BqType::String,
+        BqType::Timestamp,
+    ] {
+        assert!(clusterable(&t.clone().into()), "{t}");
+    }
+    for t in [
+        BqType::Float64,
+        BqType::Time,
+        BqType::Bytes,
+        BqType::Json,
+        BqType::Array(Box::new(BqType::Int64)),
+    ] {
+        assert!(!clusterable(&t.clone().into()), "{t}");
+    }
+    assert!(
+        !clusterable(&crate::types::target::SfType::Date.into()),
+        "a Snowflake type is not a BigQuery clustering key"
+    );
 }
 
 /// A `tables.get` resource with the given partitioning, clustering and options.
@@ -514,11 +532,11 @@ fn a_changelog_is_partitioned_like_the_table_but_never_requires_a_filter() {
     );
 }
 
-fn typed(name: &str, target_type: &str) -> TargetColumnSpec {
+fn typed(name: &str, target_type: BqType) -> TargetColumnSpec {
     TargetColumnSpec {
         column_name: name.into(),
         target_type: target_type.into(),
-        autoload_type: "BYTES".into(),
+        autoload_type: BqType::Bytes.into(),
         status: TargetStatus::Ok,
         note: None,
         cast_sql: None,
@@ -528,9 +546,9 @@ fn typed(name: &str, target_type: &str) -> TargetColumnSpec {
 #[test]
 fn schema_declares_each_columns_native_target_type() {
     let s = build_schema(&[
-        typed("id", "INT64"),
-        typed("json_col", "JSON"),
-        typed("dt_col", "DATETIME"),
+        typed("id", BqType::Int64),
+        typed("json_col", BqType::Json),
+        typed("dt_col", BqType::DateTime),
     ]);
     assert!(s.contains("`id` INT64"));
     assert!(s.contains("`json_col` JSON"));
@@ -539,7 +557,7 @@ fn schema_declares_each_columns_native_target_type() {
 
 #[test]
 fn load_data_declares_native_schema_and_is_a_free_batch_load() {
-    let schema = build_schema(&[typed("id", "INT64"), typed("json_col", "JSON")]);
+    let schema = build_schema(&[typed("id", BqType::Int64), typed("json_col", BqType::Json)]);
     let sql = build_load_data_sql("p.d.orders", true, &schema, None, &[], None, &uris());
     assert!(sql.starts_with("LOAD DATA OVERWRITE `p.d.orders` ("));
     // Native types declared inline → BigQuery coerces on load, for free.
@@ -552,14 +570,14 @@ fn load_data_declares_native_schema_and_is_a_free_batch_load() {
 
 #[test]
 fn load_data_append_uses_into() {
-    let schema = build_schema(&[typed("id", "INT64")]);
+    let schema = build_schema(&[typed("id", BqType::Int64)]);
     let sql = build_load_data_sql("p.d.orders", false, &schema, None, &[], None, &uris());
     assert!(sql.starts_with("LOAD DATA INTO `p.d.orders`"));
 }
 
 #[test]
 fn load_data_emits_partition_and_cluster_when_configured() {
-    let schema = build_schema(&[typed("id", "INT64")]);
+    let schema = build_schema(&[typed("id", BqType::Int64)]);
     let sql = build_load_data_sql(
         "p.d.orders",
         true,
@@ -669,7 +687,7 @@ fn an_unclustered_changelog_carries_no_cluster_clause() {
 
 #[test]
 fn create_changes_clusters_on_pk_capped_at_four_columns() {
-    let schema = build_schema(&[typed("__op", "STRING"), typed("id", "INT64")]);
+    let schema = build_schema(&[typed("__op", BqType::String), typed("id", BqType::Int64)]);
     let sql = build_create_changes_sql("p.d.orders__changes", &schema, None, &["id".into()]);
     assert!(sql.starts_with("CREATE TABLE IF NOT EXISTS `p.d.orders__changes` ("));
     assert!(sql.contains("CLUSTER BY `id`"));
@@ -854,15 +872,15 @@ fn sanitize_label_does_not_collapse_two_distinct_tables_into_one() {
 #[test]
 fn schema_reconciliation_adds_columns_and_never_replaces() {
     let specs = [
-        spec("id", None, TargetStatus::Ok),
-        spec("_rivet_row_hash", None, TargetStatus::Ok),
+        typed("id", BqType::Int64),
+        typed("_rivet_row_hash", BqType::Int64),
     ];
     let sql = build_alter_add_columns_sql("p.d.t__changes", &specs).unwrap();
     assert!(sql.starts_with("ALTER TABLE `p.d.t__changes`"), "{sql}");
     // IF NOT EXISTS on every column: the statement runs on every load, and
     // a load must not fail because a column it declares is already there.
     assert_eq!(sql.matches("ADD COLUMN IF NOT EXISTS").count(), 2, "{sql}");
-    assert!(sql.contains("`_rivet_row_hash` X"), "{sql}");
+    assert!(sql.contains("`_rivet_row_hash` INT64"), "{sql}");
     for forbidden in ["REPLACE", "DROP", "CREATE", "TRUNCATE", "OVERWRITE"] {
         assert!(
             !sql.contains(forbidden),
@@ -1122,7 +1140,15 @@ fn bigquery_live_cdc_view_dedups_at_least_once() {
         .split(',')
         .map(|c| {
             let (name, ty) = c.split_once(':').expect("data col must be name:TYPE");
-            typed(name, ty)
+            let ty = crate::types::parse_type_str(ty).expect("a column type");
+            crate::types::target::ExportTarget::BigQuery.resolve_column(
+                crate::types::target::TargetInput {
+                    column_name: name,
+                    rivet_type: &ty,
+                    arrow_type: None,
+                    fidelity: crate::types::TypeFidelity::Exact,
+                },
+            )
         })
         .collect();
     let expected_state: u64 = std::env::var("RIVET_BQ_CDC_EXPECTED_STATE")
@@ -1235,7 +1261,7 @@ fn bigquery_live_adopts_a_full_load_table_as_the_changelog_baseline() {
 
     fixture(&fq).expect("fixture table");
     let before = loader.object_kind(&table);
-    let specs = [typed("id", "INT64"), typed("v", "STRING")];
+    let specs = [typed("id", BqType::Int64), typed("v", BqType::String)];
     let adopted = crate::load::adopt_full_load_table(
         &loader,
         &table,

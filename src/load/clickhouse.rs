@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail};
 
 use super::cdc::{self, Warehouse};
 use super::{GcsStore, ObjectKind, TargetLoader};
-use crate::types::target::TargetColumnSpec;
+use crate::types::target::{ChType, TargetColumnSpec, TargetType};
 
 /// HTTP timeout for one ClickHouse call (20 min); one part's INSERT is seconds on a LAN.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(1200);
@@ -757,7 +757,7 @@ fn canonical_types_sql(types: &[String]) -> String {
 pub(crate) fn partition_expr(
     export: &str,
     spec: &crate::load::plan::PartitionSpec,
-    column_type: &dyn Fn(&str) -> Result<String>,
+    column_type: &dyn Fn(&str) -> Result<TargetType>,
 ) -> Result<(crate::load::plan::PartitionKey, String)> {
     use crate::load::plan::{Granularity, PartitionForm, PartitionKey};
     if spec.expiration_days.is_some() || spec.require_filter {
@@ -784,17 +784,18 @@ pub(crate) fn partition_expr(
              `column: _rivet_exported_at` (the export stamp) instead"
         ),
     };
-    let t = column_type(column)?;
-    if !t.starts_with("DATE") {
+    let ty = column_type(column)?;
+    let t = crate::load::plan::base_type(&ty);
+    let TargetType::ClickHouse(ch @ (ChType::Date32 | ChType::DateTime64(..))) = &ty else {
         crate::rivet_bail!(
             crate::error::codes::CONFIG_LOAD_PARTITION_UNSUPPORTED,
             "export `{export}`: cannot partition on `{column}` ({t}); a ClickHouse load partitions \
              a Date32 or DateTime64 column by time"
         );
-    }
+    };
     let c = Warehouse::ClickHouse.quote_ident(column);
     let expr = match granularity {
-        Granularity::Hour if !t.starts_with("DATETIME") => crate::rivet_bail!(
+        Granularity::Hour if !matches!(ch, ChType::DateTime64(..)) => crate::rivet_bail!(
             crate::error::codes::CONFIG_LOAD_PARTITION_UNSUPPORTED,
             "export `{export}`: `{column}` is a {t}, which has no hours — partition it by day, \
              month or year"
@@ -848,26 +849,24 @@ fn columns_ddl(specs: &[TargetColumnSpec], not_null: &[String]) -> String {
 /// JSON and UUID are declared as what their Parquet converts into (`String`, the 16 raw
 /// bytes); a `JSON` or `UUID` column refuses the insert (measured).
 fn column_type(spec: &TargetColumnSpec, not_null: bool) -> String {
-    let t = landed_type(&spec.target_type);
-    if not_null || t.starts_with("Array(") || t.starts_with("LowCardinality(") {
-        t
+    let t = match &spec.target_type {
+        TargetType::ClickHouse(t) => TargetType::ClickHouse(landed_type(t)),
+        other => other.clone(),
+    };
+    if not_null || matches!(t, TargetType::ClickHouse(ChType::Array(_))) {
+        t.to_string()
     } else {
         format!("Nullable({t})")
     }
 }
 
 /// A resolved type with JSON and UUID, also as Array elements, replaced by what they land as.
-fn landed_type(t: &str) -> String {
+fn landed_type(t: &ChType) -> ChType {
     match t {
-        "JSON" => "String".to_string(),
-        "UUID" => "FixedString(16)".to_string(),
-        _ => match t
-            .strip_prefix("Array(Nullable(")
-            .and_then(|r| r.strip_suffix("))"))
-        {
-            Some(inner) => format!("Array(Nullable({}))", landed_type(inner)),
-            None => t.to_string(),
-        },
+        ChType::Json => ChType::String,
+        ChType::Uuid => ChType::FixedString16,
+        ChType::Array(inner) => ChType::Array(Box::new(landed_type(inner))),
+        other => other.clone(),
     }
 }
 
@@ -993,16 +992,31 @@ fn trim_ch_error(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::target::TargetStatus;
+    use crate::types::target::{ExportTarget, TargetInput};
+    use crate::types::{RivetType, TypeFidelity};
 
-    fn spec(name: &str, ty: &str) -> TargetColumnSpec {
-        TargetColumnSpec {
-            column_name: name.to_string(),
-            target_type: ty.to_string(),
-            autoload_type: String::new(),
-            status: TargetStatus::Ok,
-            note: None,
-            cast_sql: None,
+    /// The ClickHouse resolver's own spec for a column of `ty`.
+    fn spec(name: &str, ty: RivetType) -> TargetColumnSpec {
+        ExportTarget::ClickHouse.resolve_column(TargetInput {
+            column_name: name,
+            rivet_type: &ty,
+            arrow_type: None,
+            fidelity: TypeFidelity::Exact,
+        })
+    }
+
+    /// A list of `inner`.
+    fn list(inner: RivetType) -> RivetType {
+        RivetType::List {
+            inner: Box::new(inner),
+        }
+    }
+
+    /// A microsecond UTC timestamp.
+    fn utc_micros() -> RivetType {
+        RivetType::Timestamp {
+            unit: crate::types::TimeUnit::Microsecond,
+            timezone: Some("UTC".into()),
         }
     }
 
@@ -1010,9 +1024,9 @@ mod tests {
     fn key_columns_are_not_null_and_the_rest_nullable() {
         let ddl = columns_ddl(
             &[
-                spec("id", "Int64"),
-                spec("tags", "Array(Nullable(String))"),
-                spec("at", "DateTime64(6, 'UTC')"),
+                spec("id", RivetType::Int64),
+                spec("tags", list(RivetType::String)),
+                spec("at", utc_micros()),
             ],
             &["id".to_string()],
         );
@@ -1028,10 +1042,10 @@ mod tests {
     fn json_and_uuid_land_as_their_parquet_types_also_inside_an_array() {
         let ddl = columns_ddl(
             &[
-                spec("u", "UUID"),
-                spec("j", "JSON"),
-                spec("us", "Array(Nullable(UUID))"),
-                spec("js", "Array(Nullable(JSON))"),
+                spec("u", RivetType::Uuid),
+                spec("j", RivetType::Json),
+                spec("us", list(RivetType::Uuid)),
+                spec("js", list(RivetType::Json)),
             ],
             &[],
         );
@@ -1064,10 +1078,13 @@ mod tests {
 
     #[test]
     fn the_log_puts_rivets_columns_first_and_never_twice() {
-        let names: Vec<String> = changelog_specs(&[spec("__op", "String"), spec("id", "Int64")])
-            .into_iter()
-            .map(|s| s.column_name)
-            .collect();
+        let names: Vec<String> = changelog_specs(&[
+            spec("__op", RivetType::String),
+            spec("id", RivetType::Int64),
+        ])
+        .into_iter()
+        .map(|s| s.column_name)
+        .collect();
         assert_eq!(names, ["__op", "__pos", "__seq", "id"]);
     }
 
@@ -1218,7 +1235,7 @@ mod tests {
         assert_eq!(alter_add_columns_sql("`d`.`t`", &[], &[]), None);
         let sql = alter_add_columns_sql(
             "`d`.`t`",
-            &[spec("id", "Int64"), spec("v", "String")],
+            &[spec("id", RivetType::Int64), spec("v", RivetType::String)],
             &["id".into()],
         )
         .expect("one ALTER");
@@ -1397,7 +1414,7 @@ mod tests {
         loader
             .query(&format!("CREATE DATABASE IF NOT EXISTS {db}"))
             .unwrap();
-        let specs = [spec("id", "Int64"), spec("v", "String")];
+        let specs = [spec("id", RivetType::Int64), spec("v", RivetType::String)];
         loader
             .append_changelog("t", &specs, &[], &["id".to_string()])
             .unwrap();
@@ -1463,7 +1480,12 @@ mod tests {
             .query(&format!("CREATE DATABASE IF NOT EXISTS {db}"))
             .unwrap();
         loader
-            .append_changelog("t", &[spec("id", "Int64")], &[], &["id".to_string()])
+            .append_changelog(
+                "t",
+                &[spec("id", RivetType::Int64)],
+                &[],
+                &["id".to_string()],
+            )
             .unwrap();
         let changes = loader.quoted("t__changes");
         let insert = |pos: &str| {
@@ -1535,7 +1557,7 @@ mod tests {
         loader
             .query(&format!("CREATE DATABASE IF NOT EXISTS {db}"))
             .unwrap();
-        let specs = [spec("id", "Int64"), spec("v", "String")];
+        let specs = [spec("id", RivetType::Int64), spec("v", RivetType::String)];
         let pk = ["id".to_string()];
         let uri = |name: &str| format!("gs://rivet-qa-ch-pull/{db}/{name}");
         let written = loader
