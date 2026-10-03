@@ -43,7 +43,9 @@ WHAT MAKES IT FAIL RATHER THAN PASS QUIETLY
 
 from __future__ import annotations
 
+import re
 import shutil
+import sqlite3
 from pathlib import Path
 
 from .core import Ledger, have, run
@@ -73,6 +75,57 @@ VOLATILE_TABLES = {"export_harm"}
 # six differed, and these two are the ones that are SUPPOSED to.
 VOLATILE_COLUMNS = {"duration_ms", "peak_rss_mb", "longest_chunk_ms"}
 
+# Run identity and wall-clock stamps: two runs differ here by construction.
+IDENTITY_COLUMNS = {"rowid", "run_id", "run_at", "started_at", "finished_at",
+                    "created_at", "updated_at", "recorded_at"}
+
+# A SQLite surrogate key column, as rivet's migrations declare one.
+_SQLITE_SURROGATE = re.compile(r"(\w+)\s+INTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT", re.I)
+
+
+def surrogate_keys(sqlite_ddl, pg_serial) -> dict[str, set[str]]:
+    """Map each surrogate autoincrement key column name to the tables that mint it, from SQLite DDL and Postgres sequence-backed columns."""
+    keys: dict[str, set[str]] = {}
+    for table, sql in sqlite_ddl:
+        for col in _SQLITE_SURROGATE.findall(sql or ""):
+            keys.setdefault(col, set()).add(table)
+    for table, col in pg_serial:
+        keys.setdefault(col, set()).add(table)
+    return keys
+
+
+def comparable(cols: list[str], keys: dict[str, set[str]]) -> list[str]:
+    """The columns whose values are compared: not a surrogate key or a reference to one, not identity, not volatile."""
+    return [c for c in cols
+            if c not in keys and c not in IDENTITY_COLUMNS and c not in VOLATILE_COLUMNS]
+
+
+def references(table: str, cols: list[str], keys: dict[str, set[str]]) -> dict[str, str]:
+    """Surrogate-key columns of `table` minted by exactly one OTHER table, mapped to that owner, so their content can be resolved."""
+    return {c: next(iter(keys[c])) for c in cols
+            if c in keys and len(keys[c]) == 1 and keys[c] != {table}}
+
+
+def _self_test() -> None:
+    """Surrogate enumeration and reference resolution, without a store."""
+    keys = surrogate_keys(
+        [("load_spec_version", "CREATE TABLE load_spec_version (spec_id INTEGER PRIMARY KEY "
+                               "AUTOINCREMENT, columns_json TEXT NOT NULL)"),
+         ("export_load_spec_run", "CREATE TABLE export_load_spec_run (run_id TEXT NOT NULL, "
+                                  "spec_id INTEGER NOT NULL)"),
+         ("file_log", "CREATE TABLE file_log (id integer primary key autoincrement, bytes INTEGER)")],
+        [("export_metrics", "id")],
+    )
+    assert keys == {"spec_id": {"load_spec_version"}, "id": {"file_log", "export_metrics"}}, keys
+    run_cols = ["captured_at", "export_name", "run_id", "spec_id", "unit"]
+    assert comparable(run_cols, keys) == ["captured_at", "export_name", "unit"]
+    assert references("export_load_spec_run", run_cols, keys) == {"spec_id": "load_spec_version"}
+    assert references("load_spec_version", ["spec_id"], keys) == {}, "an owner resolves nothing"
+    assert references("export_metrics", ["id"], keys) == {}, "an ambiguous key is excluded, not joined"
+    src = Path(__file__).resolve().parents[2] / "src" / "state" / "migrations.rs"
+    assert {"id", "spec_id"} <= set(_SQLITE_SURROGATE.findall(src.read_text())), \
+        "the surrogate pattern no longer matches rivet's own migrations"
+
 
 def _duck(sql: str) -> tuple[str, bool]:
     """Run one DuckDB script; return (stdout, ok). The exit status is carried
@@ -80,6 +133,24 @@ def _duck(sql: str) -> tuple[str, bool]:
     gate had in `concurrency._psql_state` and still has in `state_parity._psql`."""
     p = run([*DUCKDB, "-noheader", "-list", "-c", sql])
     return (p.stdout.strip(), p.ok)
+
+
+def _shared_cols(pre: str, t: str) -> list[str] | None:
+    """Columns of `t` present on both sides, canonically ordered so each side's digest expression is identical; None when unreadable."""
+    out, ok = _duck(
+        pre
+        + f"""
+        SELECT string_agg(column_name, ',' ORDER BY column_name) FROM (
+          SELECT column_name FROM duckdb_columns()
+          WHERE database_name='sq' AND table_name='{t}'
+          INTERSECT
+          SELECT column_name FROM duckdb_columns()
+          WHERE database_name='pg' AND table_name='{t}'
+        );
+        """
+    )
+    cols = [c for c in out.strip().split(",") if c]
+    return cols if ok and cols else None
 
 
 def _attach(sqlite_db: Path, pg_url: str) -> str:
@@ -126,6 +197,26 @@ def verify_state_parity_independent(
             shutil.copy2(s, tmp.with_name(tmp.name + side))
 
     pre = _attach(tmp, pg_url)
+
+    # Surrogate keys come from the sequences of each store, so they differ on a reused
+    # Postgres DB; they are excluded by rule and a reference to one is compared by content.
+    with sqlite3.connect(tmp) as c:
+        ddl = c.execute("SELECT name, sql FROM sqlite_master WHERE type = 'table'").fetchall()
+    serial_out, ok = _duck(
+        pre
+        + "SELECT table_name || '|' || column_name FROM postgres_query('pg', "
+        "'SELECT table_name::text AS table_name, column_name::text AS column_name "
+        "FROM information_schema.columns WHERE table_schema = current_schema() "
+        "AND (column_default LIKE ''nextval(%'' OR is_identity = ''YES'')');"
+    )
+    keys = surrogate_keys(
+        ddl, [tuple(x.strip().split("|", 1)) for x in serial_out.splitlines() if "|" in x])
+    if not ok or not keys:
+        led.failed("-", "-", "state_parity_independent", "-",
+                   "state-parity[independent]: could not enumerate the stores' surrogate keys — "
+                   "comparing them would compare two sequences, not two backends",
+                   "no surrogate keys")
+        return
 
     # Tables present on BOTH, carrying `export_name`, excluding bookkeeping.
     excl = ", ".join(f"'{b}'" for b in sorted(BOOKKEEPING))
@@ -198,33 +289,33 @@ def verify_state_parity_independent(
                 compared.append("run_journal(shape)")
             continue
 
-        # Columns shared by both sides, canonically ordered, so the digest
-        # expression is identical on each side by construction.
-        cols_out, ok = _duck(
-            pre
-            + f"""
-            SELECT string_agg(column_name, ',' ORDER BY column_name) FROM (
-              SELECT column_name FROM duckdb_columns()
-              WHERE database_name='sq' AND table_name='{t}'
-              INTERSECT
-              SELECT column_name FROM duckdb_columns()
-              WHERE database_name='pg' AND table_name='{t}'
-            );
-            """
-        )
-        cols = [c for c in cols_out.strip().split(",") if c]
-        if not ok or not cols:
+        cols = _shared_cols(pre, t)
+        if not cols:
             problems.append(f"{t}: could not resolve a shared column set")
             continue
-        # Identity columns differ between two runs BY CONSTRUCTION (row ids,
-        # run ids, wall-clock stamps). Comparing them would only prove that two
-        # runs are two runs.
-        data_cols = [
-            c for c in cols
-            if c not in ("id", "rowid", "run_id", "run_at", "started_at", "finished_at",
-                         "created_at", "updated_at", "recorded_at")
-            and c not in VOLATILE_COLUMNS
-        ]
+        # Identity columns differ between two runs BY CONSTRUCTION (surrogate
+        # ids, run ids, wall-clock stamps). Comparing them would only prove that
+        # two runs are two runs. A reference to another table's surrogate key is
+        # compared by the CONTENT it resolves to instead.
+        data_cols = comparable(cols, keys)
+        refs = references(t, cols, keys)
+        resolved: dict[str, list[str]] = {}
+        for r, owner in sorted(refs.items()):
+            owner_cols = comparable(_shared_cols(pre, owner) or [], keys)
+            if not owner_cols:
+                problems.append(f"{t}.{r}: could not resolve {owner}'s columns")
+            resolved[r] = owner_cols
+            data_cols += [f"{r}__{oc}" for oc in owner_cols]
+
+        def source(side: str) -> str:
+            """The table on one side, joined to the content its surrogate references resolve to."""
+            if not refs:
+                return f"{side}.{t}"
+            extra = [f"o{i}.{oc} AS {r}__{oc}"
+                     for i, r in enumerate(sorted(refs)) for oc in resolved[r]]
+            joins = [f"LEFT JOIN {side}.{refs[r]} o{i} ON o{i}.{r} = x.{r}"
+                     for i, r in enumerate(sorted(refs))]
+            return f"(SELECT x.*, {', '.join(extra)} FROM {side}.{t} x {' '.join(joins)}) s"
         if not data_cols:
             continue
         # NORMALISE identity out of the VALUES rather than dropping more
@@ -277,7 +368,7 @@ def verify_state_parity_independent(
             q = pre + "".join(
                 f"""
                 SELECT '{side}' || ':' || coalesce(md5(string_agg({n}, chr(10) ORDER BY {n})), '-')
-                FROM {side}.{t} WHERE export_name = '{export}';
+                FROM {source(side)} WHERE export_name = '{export}';
                 """
                 for side in ("sq", "pg")
             )
@@ -301,6 +392,18 @@ def verify_state_parity_independent(
                for x in cnt_out.splitlines() if ":" in x}
         if not cnt_ok or cnt.get("sq") != cnt.get("pg"):
             diffs.append(f"ROW COUNT {cnt.get('sq')} vs {cnt.get('pg')}")
+        # A reference that resolves to nothing reads as NULL on both sides and would agree vacuously.
+        for r, owner in sorted(refs.items()):
+            dq = pre + "".join(
+                f"SELECT '{side}:' || count(*) FROM {side}.{t} x WHERE x.export_name = '{export}' "
+                f"AND NOT EXISTS (SELECT 1 FROM {side}.{owner} o WHERE o.{r} = x.{r});"
+                for side in ("sq", "pg")
+            )
+            d_out, d_ok = _duck(dq)
+            dangling = {x.split(":", 1)[0]: x.split(":", 1)[1]
+                        for x in d_out.splitlines() if ":" in x}
+            if not d_ok or dangling != {"sq": "0", "pg": "0"}:
+                diffs.append(f"{r} resolves to no {owner} row ({dangling or 'unreadable'})")
 
         compared.append(f"{t}({len(data_cols)} cols)")
         if diffs:
@@ -315,6 +418,8 @@ def verify_state_parity_independent(
         "-", "-", "state_parity_independent", "-",
         f"state-parity[independent]: DuckDB attached BOTH stores and every value crossed "
         f"ONE decoder — {len(compared)} table(s) ({', '.join(compared)}) agree on row count "
-        f"AND on a PER-COLUMN digest of every shared column, scoped to export '{export}'. "
+        f"AND on a PER-COLUMN digest of every shared column, scoped to export '{export}'; "
+        f"surrogate keys ({', '.join(sorted(keys))}) are excluded by rule and a reference to "
+        f"one is compared by the content it resolves to. "
         f"A digest, unlike a count, cannot be satisfied by two different rows.",
     )
