@@ -181,6 +181,19 @@ _ENV_FLAG_TABLE = {
 }
 
 
+def verify_seeded_recall(led: Ledger, enabled: bool) -> None:
+    """Seeded-defect recall (dev/seeded): every known bug class re-introduced must turn its catching cells red."""
+    if not enabled:
+        led.skipped("-", "harness", "seeded_recall", "-",
+                    "seeded-defect recall: opt-in (--with-seeded-recall or RIVET_ORACLE_SEEDED_RECALL=1)")
+        return
+    import yaml
+
+    from dev.seeded import recall as seeded
+
+    seeded.recall(led, seeded.parse_manifest(yaml.safe_load(seeded.MANIFEST.read_text())))
+
+
 def _gate_modules() -> list[object]:
     """Every module of this package (imported) plus this entry point: where a stage function can be bound."""
     import importlib
@@ -258,6 +271,13 @@ def _self_test() -> int:
         src = path.read_text()
         for shape in shapes:
             assert src.count(shape.format(old)) == src.count(shape.format(gate)), (path.name, shape)
+    from dev.seeded import recall as seeded
+
+    seeded.self_test()
+    off = Ledger(colour=False)
+    off._buf = []
+    verify_seeded_recall(off, False)
+    assert [c.status for c in off.cells] == [Status.SKIP], "a disabled recall stage must say so, not vanish"
 
     # The escape is the one that costs a release: argparse's default, the
     # authoritative reader in regression.py, and this table must agree on EVERY
@@ -588,6 +608,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "an ungraded release and fails. Use it for local partial runs; a run carrying this "
         "flag cannot support a tag.",
     )
+    ap.add_argument(
+        "--with-seeded-recall", action="store_true", default=env_flag("RIVET_ORACLE_SEEDED_RECALL"),
+        help="also run the seeded-defect recall stage (dev/seeded): re-introduce each known bug class "
+             "as a source patch in a scratch tree, build it, and require its catching cells to go red. "
+             "Slow (one build per seed), so opt-in; `make seeded-recall` runs it alone.")
     ap.add_argument("--no-cloud", action="store_true", help="local stage only (skip BigQuery)")
     ap.add_argument("--keep", action="store_true", help="leave engine containers up (debug)")
     ap.add_argument(
@@ -1348,6 +1373,7 @@ def main(argv: list[str] | None = None) -> int:
             ])
         # Last: it runs every live_suite test no cell above already ran.
         live_modules.verify_live_modules(led)
+        verify_seeded_recall(led, ns.with_seeded_recall)
         verify_no_invariant_violations(led)
         # Only a FULL run can say a known red no longer fires.
         if not (ns.engines or ns.versions or ns.no_cloud or ns.latest_only):

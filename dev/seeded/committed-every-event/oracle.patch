@@ -1,0 +1,12 @@
+diff --git a/src/source/oracle/cdc.rs b/src/source/oracle/cdc.rs
+index 25a4f9ee..5ceb4358 100644
+--- a/src/source/oracle/cdc.rs
++++ b/src/source/oracle/cdc.rs
+@@ -1153,6 +1153,7 @@ impl OracleChangeStream {
+         let mut events: Vec<ChangeEvent> =
+             order.into_iter().filter_map(|i| slots[i].take()).collect();
+         TxnFramer::close_group(&mut events, &pos);
++        events.iter_mut().for_each(|e| e.committed = true);
+         self.prove_online_read(self.carry.is_some().then_some(commit))?;
+         self.queue.extend(events);
+         self.mined_through = commit;

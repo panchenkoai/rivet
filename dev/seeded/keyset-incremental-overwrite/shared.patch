@@ -1,0 +1,12 @@
+diff --git a/src/load/plan.rs b/src/load/plan.rs
+index 9e2cd18c..482ecac6 100644
+--- a/src/load/plan.rs
++++ b/src/load/plan.rs
+@@ -445,7 +445,6 @@ pub fn load_mode_of(export: &crate::config::ExportConfig) -> LoadMode {
+         crate::config::ExportMode::Incremental => LoadMode::Incremental,
+         crate::config::ExportMode::Full => LoadMode::Full, // whole result set
+         // only the keys past the last run's: a delta, never the whole table
+-        crate::config::ExportMode::Chunked if export.keyset_incremental => LoadMode::Incremental,
+         crate::config::ExportMode::Chunked => LoadMode::Full, // parallel full snapshot
+         crate::config::ExportMode::TimeWindow => LoadMode::Full, // the current window, whole
+     }

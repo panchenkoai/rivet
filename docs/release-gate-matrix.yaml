@@ -373,6 +373,13 @@ infra:
     note: "SCRAM half gated: verify_auth drives mongo_readonly_login_exports_despite_denied_harm_probe
       (least-privilege export, DuckDB-graded) + mongo_wrong_password_fails_loud_and_writes_nothing
       (refusal names auth, zero parquet). RESIDUAL: x509 cert auth is a separate provisioning class"
+  - id: seeded_recall
+    status: partial
+    note: "verify_seeded_recall re-introduces every known bug class in dev/seeded/seeds.yaml as a
+      source patch in a scratch worktree, builds it, and requires the declared catching cells
+      (green on the unpatched tree) to go red; MISSED / STALE / BROKEN / NO-CONTROL rows fail.
+      RESIDUAL: opt-in (--with-seeded-recall / RIVET_ORACLE_SEEDED_RECALL=1, or `make seeded-recall`),
+      it records a SKIP otherwise; several classes have engines with no catching cell (see the manifest)"
   - id: cdc_standby
     infra: ["pg-cdc-standby"]
     status: test

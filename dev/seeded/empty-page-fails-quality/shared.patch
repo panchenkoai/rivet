@@ -1,0 +1,15 @@
+diff --git a/src/quality.rs b/src/quality.rs
+index f5463c98..bcfa180a 100644
+--- a/src/quality.rs
++++ b/src/quality.rs
+@@ -140,10 +140,6 @@ impl QualityTracker {
+         let Some(qc) = &self.columns else {
+             return Ok(());
+         };
+-        // A zero-row result arrives as `Schema::empty()`: no columns to bind, no cells to measure.
+-        if dest_schema.fields().is_empty() {
+-            return Ok(());
+-        }
+         let available: Vec<String> = dest_schema
+             .fields()
+             .iter()

@@ -1,0 +1,133 @@
+# Seeded-defect recall: known product-bug classes, kept as source patches.
+#
+# `python -m dev.seeded` (or `make seeded-recall`) applies each patch to a scratch
+# worktree of HEAD, builds it, runs ONLY the cells declared to catch it, and records
+# CAUGHT (a cell green on the unpatched tree goes red) or MISSED. See docs/seeded-recall.md.
+#
+# Every seed names every engine of its scope:
+#   scope: source  -> postgres, mysql, mssql, mongo, oracle
+#   scope: state   -> postgres-state, sqlite-state
+# plus, optionally, `lib` (an engine-agnostic unit test of the shared code path).
+# An engine entry is either
+#   patch: <path under dev/seeded/>   (falls back to the seed's own `patch:`)
+#   cells: [test fn names]            (live_suite tests; `lib:<name>` for a unit test)
+# or
+#   na: <why the code path does not exist on this engine>
+# `cells: []` means the code path exists and NO cell catches it: a MISSED row by declaration.
+
+seeds:
+  - name: committed-every-event
+    class: a CDC adapter marks `committed` on every event instead of only the last event of a source transaction
+    history: PG and SQL Server lost 7 of 12 rows at rollover 5 (#158)
+    scope: source
+    engines:
+      postgres:
+        patch: committed-every-event/postgres.patch
+        cells: [roast_pg_cdc_large_transaction_is_atomic_across_a_mid_flush_crash]
+      mysql:
+        patch: committed-every-event/mysql.patch
+        cells: [roast_mysql_cdc_large_transaction_is_atomic_across_a_mid_flush_crash]
+      mssql:
+        patch: committed-every-event/mssql.patch
+        cells: [roast_mssql_cdc_large_transaction_is_atomic_across_a_mid_flush_crash]
+      oracle:
+        patch: committed-every-event/oracle.patch
+        cells: [roast_oracle_cdc_large_transaction_is_atomic_across_a_mid_flush_crash]
+      mongo:
+        na: committed on every event IS the MongoDB contract (TxnFramer::single_event_commit, #158) - its consume-free resume token re-reads a mid-transaction tail, so there is no defect to seed
+
+  - name: row-lost-at-rotation
+    class: the shared batch writer drops the first row written into each part it rotates to (max_file_size)
+    history: the rotated-part loss class (roast_part_loss); counters agree with the loss, so only an independent re-read sees it
+    scope: source
+    patch: row-lost-at-rotation/shared.patch
+    engines:
+      postgres:
+        cells:
+          - roast_chunked_split_parts_all_rows_reach_destination
+          - max_file_size_holds_under_auto_sized_row_groups
+      mysql:
+        cells:
+          - roast_keyset_split_parts_all_rows_reach_destination
+          - roast_keyset_split_parts_parquet_all_rows_reach_destination
+      oracle:
+        cells:
+          - every_single_runner_hook_loses_nothing_on_oracle
+          - every_chunked_range_runner_hook_loses_nothing_on_oracle
+      mssql:
+        cells: []
+      mongo:
+        cells: []
+
+  - name: keyset-incremental-overwrite
+    class: a keyset_incremental export plans its warehouse load as an overwrite instead of an append
+    history: "#399 - BigQuery and ClickHouse held 100, then 20, then 20 rows"
+    scope: source
+    patch: keyset-incremental-overwrite/shared.patch
+    engines:
+      postgres:
+        cells: [a_keyset_incremental_export_into_clickhouse_accumulates_every_run]
+      mysql:
+        cells: []
+      mssql:
+        cells: []
+      oracle:
+        cells: []
+      mongo:
+        na: Mongo has no chunk_by_key / keyset_incremental export mode
+      lib:
+        cells: ["lib:load_mode_of_every_mode_with_and_without_keyset_incremental"]
+
+  - name: pk-move-without-delete
+    class: a primary-key-changing UPDATE reaches the destination without the delete of the old key
+    history: ADR-0030; the split that once emitted delete+insert on PostgreSQL was reverted for shipping corruption
+    scope: source
+    engines:
+      mssql:
+        patch: pk-move-without-delete/mssql.patch
+        cells: []
+      postgres:
+        na: not fixed, so nothing to re-introduce - update(new) with no delete of the old key IS the shipped behaviour (ADR-0030 proposed; pg_cdc_pk_changing_update_captures_and_does_not_brick carries it as a known defect)
+      mysql:
+        na: not fixed, so nothing to re-introduce - same ADR-0030 limitation as PostgreSQL, and no live test exercises a PK move on MySQL at all
+      oracle:
+        na: not fixed, so nothing to re-introduce - LogMiner reports a PK move as one UPDATE and the adapter emits update(new) (ADR-0030); no live test exercises it
+      mongo:
+        na: _id is immutable, so a key move cannot be expressed
+
+  - name: empty-page-fails-quality
+    class: an empty keyset page / chunk arrives as Schema::empty() and the quality gate reads it as a missing rule column
+    history: "#419 - every keyset run under unique_columns whose range ended on an empty page failed"
+    scope: source
+    patch: empty-page-fails-quality/shared.patch
+    engines:
+      postgres:
+        cells:
+          - quality_gate_fails_a_duplicate_on_the_single_runner
+          - quality_gate_fails_a_duplicate_split_across_keyset_pages
+          - quality_gate_fails_a_duplicate_split_across_parallel_keyset_ranges
+          - quality_gate_fails_a_duplicate_split_across_chunks
+          - quality_gate_fails_a_duplicate_split_across_parallel_chunks
+          - quality_gate_fails_a_duplicate_split_across_checkpoint_chunks
+          - quality_gate_fails_a_duplicate_split_across_parallel_checkpoint_chunks
+      mongo:
+        cells: [quality_gate_fails_a_short_mongo_parallel_export]
+      mysql:
+        cells: []
+      mssql:
+        cells: []
+      oracle:
+        cells: []
+      lib:
+        cells: ["lib:a_zero_row_empty_schema_binds_nothing_and_is_not_a_ghost_column"]
+
+  - name: pg-migration-not-idempotent
+    class: a PostgreSQL state migration that fails when the ladder replays over tables already in its shape
+    history: "#413 - v32 read columns_json from a table that no longer had it; 317 gate cells failed"
+    scope: state
+    engines:
+      postgres-state:
+        patch: pg-migration-not-idempotent/postgres-state.patch
+        cells: ["lib:pg_v32_replays_over_a_load_spec_table_already_in_its_v32_shape"]
+      sqlite-state:
+        na: the SQLite ladder never replays over leftovers - its version row lives in the same file and the ladder runs under BEGIN IMMEDIATE, so a migration there is not required to be idempotent

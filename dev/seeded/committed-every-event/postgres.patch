@@ -1,0 +1,12 @@
+diff --git a/src/source/postgres/cdc.rs b/src/source/postgres/cdc.rs
+index cbcc0b43..6c841cd5 100644
+--- a/src/source/postgres/cdc.rs
++++ b/src/source/postgres/cdc.rs
+@@ -808,6 +808,7 @@ impl PgChangeStream {
+                         crate::source::cdc::TxnFramer::close_head_of_group(
+                             &mut group, &commit, tail_len,
+                         );
++                        group.iter_mut().for_each(|e| e.committed = true);
+                         for ev in group {
+                             self.pending.push_back(ev);
+                         }

@@ -1,0 +1,18 @@
+diff --git a/src/pipeline/sink/mod.rs b/src/pipeline/sink/mod.rs
+index 6adc9ea7..0f0e4e06 100644
+--- a/src/pipeline/sink/mod.rs
++++ b/src/pipeline/sink/mod.rs
+@@ -787,6 +787,13 @@ impl ExportSink {
+ 
+     /// Write one slice that is known to fit the current part's partition budget.
+     fn write_batch_part(&mut self, dest_batch: &RecordBatch) -> Result<()> {
++        let n = dest_batch.num_rows();
++        let rotated = if self.part_rows == 0 && self.total_rows > 0 && n > 1 {
++            dest_batch.slice(1, n - 1)
++        } else {
++            dest_batch.clone()
++        };
++        let dest_batch = &rotated;
+         self.total_rows += dest_batch.num_rows();
+         // Feed the running row count to the progress bar *during* the read, not
+         // only when the chunk completes (throttled to ~8/s).

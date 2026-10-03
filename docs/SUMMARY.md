@@ -104,6 +104,7 @@
 - [Cross-tool benchmark harness](bench/README.md)
 - [Benchmark report — v0.5.0 (historical)](archive/benchmark_report_v0.5.0.md)
 - [Mutation-testing plan](mutation-plan.md)
+- [Seeded-defect recall](seeded-recall.md)
 - [Release checklist](release-checklist.md)
 - [Terminal walkthroughs](gifs/README.md)
 

@@ -1,0 +1,12 @@
+diff --git a/src/source/mssql/cdc.rs b/src/source/mssql/cdc.rs
+index 685052a1..c98362b7 100644
+--- a/src/source/mssql/cdc.rs
++++ b/src/source/mssql/cdc.rs
+@@ -1241,6 +1241,7 @@ fn close_poll_groups(evs: &mut [ChangeEvent], lsns: &[String], tail_head_lsn: Op
+             &commit,
+             continues_on_disk,
+         );
++        evs[start..end].iter_mut().for_each(|e| e.committed = true);
+         start = end;
+     }
+ }
