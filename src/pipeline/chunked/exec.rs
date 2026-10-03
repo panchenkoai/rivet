@@ -117,7 +117,7 @@ pub(crate) fn run_chunked_sequential(
             sink.total_rows
         );
 
-        if sink.total_rows > 0 {
+        let (parts, wrote) = if sink.total_rows > 0 {
             // Guarded once at run start (above); per-chunk writers open UNGUARDED
             // so a large chunked export pays ONE manifest GET, not one per chunk
             // (roast 2026-08-09). Satisfies the unguarded_callers_also_guard lint
@@ -125,56 +125,33 @@ pub(crate) fn run_chunked_sequential(
             crate::test_hook::maybe_transient_once("chunk_write")?;
             let frame = crate::pipeline::frame::RunnerFrame::open_unguarded(plan)?;
             let base = super::chunk_part_filename(&plan.export_name, i, &frame.ext);
-            let dest = frame.dest;
-            // Shared commit path (I1→I2→I7 + counters + journal + fault hooks).
-            // write_sink_parts drains every part the sink produced — the
-            // final temp file plus anything maybe_split rotated at
-            // max_file_size — so rotation cannot drop data.
-            let (recs, wrote) = super::super::commit::write_sink_parts(
-                dest.as_ref(),
+            // write_sink_parts drains every part the sink produced — the final temp
+            // file plus anything maybe_split rotated at max_file_size.
+            super::super::commit::write_sink_parts(
+                frame.dest.as_ref(),
                 &mut sink,
                 plan.validate.then_some(plan.format),
                 |idx, count| super::super::commit::part_indexed_name(&base, idx, count),
-            );
-            if plan.validate && wrote.is_ok() {
-                summary.validated = Some(true);
-            }
-            // record_part journals the ChunkCompleted event with file_name=Some. Every
-            // durable part is recorded, a failed write's earlier siblings included.
-            for rec in &recs {
-                super::super::commit::record_part(
-                    plan,
-                    summary,
-                    state,
-                    rec,
-                    super::super::commit::PartKind::Chunk {
-                        chunk_index: i as i64,
-                    },
-                    // ADR-0029: the chunk is this runner's commit unit — the
-                    // feed below is the same loop iteration over the same sink.
-                    super::super::commit::UnitId::Chunk(i as i64),
-                );
-            }
-            wrote?;
+            )
         } else {
-            // Empty chunk: no file, but still journal completion so the run
-            // record covers every chunk index. record_part only handles the
-            // non-empty case (it always writes a part), so we record inline.
-            summary.journal.record(RunEvent::ChunkCompleted {
-                chunk_index: i as i64,
-                rows: 0,
-                file_name: None,
-            });
-        }
-        // ADR-0028: feed this chunk's shape bytes and Form-B checksums into the run
-        // ledger (both empty for a zero-row chunk); the seam applies them once.
+            (Vec::new(), Ok(()))
+        };
         // Shape only, no schema: chunked runs its drift gate PRE-chunk from
         // type_mappings (ADR-0021), and a fed schema would re-run it post-run.
-        summary.ledger.observe(sink.take_shape());
-        sink.drain_integrity_into(
-            super::super::commit::UnitId::Chunk(i as i64),
-            &mut summary.ledger,
-        );
+        let shape = sink.take_shape();
+        let checksums = wrote.map(|()| sink.take_checksums());
+        let chunk_index = i as i64;
+        crate::pipeline::fan_in::commit_unit(
+            plan,
+            summary,
+            state,
+            super::super::commit::UnitId::Chunk(chunk_index),
+            parts,
+            |_| super::super::commit::PartKind::Chunk { chunk_index },
+            shape,
+            checksums,
+            |_| Ok(()),
+        )?;
     }
 
     pb.finish(summary.total_rows);
@@ -589,6 +566,70 @@ mod tests {
         s.mode = "chunked".into();
         s.compression = "none".into();
         s
+    }
+
+    /// Three `id` rows on the first export call, a schema with no rows after it.
+    struct RowsThenEmpty(usize);
+
+    impl crate::source::Source for RowsThenEmpty {
+        fn query_scalar(&mut self, _sql: &str) -> crate::error::Result<Option<String>> {
+            unimplemented!("not needed in chunked exec tests")
+        }
+        fn export(
+            &mut self,
+            _request: &crate::source::ExportRequest<'_>,
+            sink: &mut dyn BatchSink,
+        ) -> crate::error::Result<()> {
+            use arrow::datatypes::{DataType, Field, Schema};
+            let schema =
+                std::sync::Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+            sink.on_schema(std::sync::Arc::clone(&schema))?;
+            self.0 += 1;
+            if self.0 > 1 {
+                return Ok(());
+            }
+            let ids = arrow::array::Int64Array::from(vec![1, 2, 3]);
+            sink.on_batch(&arrow::record_batch::RecordBatch::try_new(
+                schema,
+                vec![std::sync::Arc::new(ids)],
+            )?)
+        }
+        fn type_mappings(
+            &mut self,
+            _query: &str,
+            _column_overrides: &crate::types::ColumnOverrides,
+        ) -> crate::error::Result<Vec<crate::types::TypeMapping>> {
+            Ok(vec![])
+        }
+    }
+
+    /// A chunk with rows commits its part; a chunk that saw a schema but no rows writes nothing and journals its completion.
+    #[test]
+    fn sequential_writes_only_the_chunk_that_has_rows() {
+        let out = tempfile::tempdir().unwrap();
+        let mut plan = chunked_plan_struct();
+        plan.destination.path = Some(out.path().to_string_lossy().into_owned());
+        let mut summary = empty_summary(&plan);
+        run_chunked_sequential(
+            &mut RowsThenEmpty(0),
+            &plan,
+            &mut summary,
+            None,
+            ChunkSource::Precomputed(vec![(1, 100), (101, 200)]),
+        )
+        .unwrap();
+        assert_eq!((summary.total_rows, summary.files_committed), (3, 1));
+        let empty_done = summary.journal.entries.iter().any(|e| {
+            matches!(
+                e.event,
+                RunEvent::ChunkCompleted {
+                    chunk_index: 1,
+                    rows: 0,
+                    file_name: None
+                }
+            )
+        });
+        assert!(empty_done, "the empty chunk journals its completion");
     }
 
     // ── sequential ───────────────────────────────────────────────────────────

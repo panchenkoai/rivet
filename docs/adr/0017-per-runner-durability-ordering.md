@@ -212,6 +212,22 @@ ledger's contract is above it), inline copies of the governor guards in keyset,
 and a panicking Mongo worker handing back nothing it had written. Work
 distribution (spawner, pool, per-range) and the reads (ADR-0028) stay per runner.
 
+## Amendment 2026-10-03 — the sequential runners commit through the same module
+
+The four sequential runners (single, plain sequential chunked, sequential checkpoint,
+sequential keyset) no longer spell out the unit commit by hand. Each calls
+`pipeline::fan_in::commit_unit` once per unit (the run, a chunk, a page) with the parts
+`commit::write_sink_parts` made durable and the unit's outcome. `commit_unit` and
+`FanIn::finish` share one private order — observations, every durable part through
+`record_part` (on the failure path too), then the committed checksums — and only a
+committed unit goes on to the `validate` verdict and the runner's CHECKPOINT, passed in
+as a closure: the `chunk_task` flip for sequential checkpoint, the high-water cursor for
+sequential keyset, nothing for single and plain sequential chunked. So "checkpoint after
+the parts are durable" is stated once, not four times. The `file_log` timing of the
+table above is unchanged: inline, per unit. One visible difference: `single` now
+records its parts after the unit's last write instead of after each write (the order
+the chunked runners already had), and its fault hook is the shared `sink_part_write:N`.
+
 ## References
 
 - `src/pipeline/commit.rs` — the shared `record_part` body that runs

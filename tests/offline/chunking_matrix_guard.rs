@@ -1145,6 +1145,8 @@ const COMMIT_DRAIN: &str = "commit::record_part(";
 /// A runner that drains through the fan-in (`FanIn::finish` calls `record_part`)
 /// is a commit loop too — found by where it builds the fan-in.
 const FAN_IN_DRAIN: &str = "fan_in::FanIn::default()";
+/// A sequential runner commits each unit inline through the same module.
+const INLINE_DRAIN: &str = "fan_in::commit_unit(";
 /// The CDC drain's commit call: `mode: cdc` returns from job.rs before the batch
 /// tail and commits through its own per-table sinks under `src/source/cdc`.
 const CDC_DRAIN: &str = "].record_part(";
@@ -1343,13 +1345,14 @@ fn runner_matrix_columns_are_derived_from_the_commit_loops() {
     super::nonvacuity::require_needle(
         &super::nonvacuity::subject_text("src/pipeline/single.rs"),
         "src/pipeline/single.rs",
-        COMMIT_DRAIN,
+        INLINE_DRAIN,
         1,
-        "If the commit drain moved off `commit::record_part`, re-point COMMIT_DRAIN at the \
-         new seam — the runner set is DERIVED from it, so a stale token derives nothing.",
+        "If the sequential commit moved off `fan_in::commit_unit`, re-point INLINE_DRAIN at \
+         the new seam — the runner set is DERIVED from it, so a stale token derives nothing.",
     );
     let mut loops = top_level_callers_of(COMMIT_DRAIN);
     loops.extend(top_level_callers_of(FAN_IN_DRAIN));
+    loops.extend(top_level_callers_of(INLINE_DRAIN));
     super::nonvacuity::require_needle(
         &super::nonvacuity::subject_text("src/source/cdc/sink.rs"),
         "src/source/cdc/sink.rs",

@@ -1,9 +1,12 @@
-//! The fan-in of a parallel runner: what its workers made durable, what they saw,
-//! what committed and what failed — collected from any thread and drained on the
-//! parent in ONE fixed order. Work distribution (spawner, pool, per-range) stays
-//! with each runner; this module owns only the tail that kept shipping bugs when
-//! four runners each wrote it (a bail above the part drain, observations dropped
-//! below the bail, a panicking worker skipping the drain, guards re-implemented).
+//! Committing a unit, in ONE fixed order (ADR-0017): what it SAW, every part it made
+//! durable (`record_part`, on the failure path too), then — only once the unit
+//! committed — its checksums, the `validate` verdict and the runner's checkpoint.
+//! Two adapters share that order: [`commit_unit`] inline for the sequential runners,
+//! [`FanIn`] collected from any thread and drained on the parent for the parallel
+//! ones. Work distribution (spawner, pool, per-range) stays with each runner; this
+//! module owns only the tail that kept shipping bugs when each runner wrote it (a
+//! bail above the part drain, observations dropped below the bail, a panicking
+//! worker skipping the drain, guards re-implemented).
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Mutex;
@@ -14,6 +17,7 @@ use super::commit::{Observations, PartKind, PartRecord, UnitChecksums, UnitId, r
 use super::governor::{GovernorHarness, WorkerFinished};
 use super::summary::RunSummary;
 use crate::error::Result;
+use crate::journal::RunEvent;
 use crate::plan::ResolvedRunPlan;
 use crate::state::StateStore;
 
@@ -105,22 +109,94 @@ impl FanIn {
         if let Some(g) = governor {
             g.drain_into(summary);
         }
-        summary.ledger.observe(inner(self.observed));
-        for (i, (unit, rec)) in inner(self.parts).into_iter().enumerate() {
-            record_part(plan, summary, file_log, &rec, kind(i, unit), unit);
-        }
-        for (unit, c) in inner(self.committed) {
-            summary.ledger.contribute(unit, c);
-        }
+        record_units(
+            plan,
+            summary,
+            file_log,
+            inner(self.observed),
+            inner(self.parts),
+            kind,
+            inner(self.committed),
+        );
         let errors = inner(self.errors);
         if errors.is_empty() {
-            if plan.validate {
-                summary.validated = Some(true);
-            }
+            mark_validated(plan, summary);
             Ok(())
         } else {
             Err(on_err(&errors))
         }
+    }
+}
+
+/// Commit one unit inline: observations, every durable part, then — only if `outcome` is
+/// `Ok` — its checksums, the empty-chunk journal entry, the `validate` verdict and `checkpoint`.
+#[allow(clippy::too_many_arguments)] // the unit's identity, output and checkpoint are the arity
+pub(crate) fn commit_unit(
+    plan: &ResolvedRunPlan,
+    summary: &mut RunSummary,
+    file_log: Option<&StateStore>,
+    unit: UnitId,
+    parts: Vec<PartRecord>,
+    kind: impl Fn(usize) -> PartKind,
+    observed: Observations,
+    outcome: Result<UnitChecksums>,
+    checkpoint: impl FnOnce(&RunSummary) -> Result<()>,
+) -> Result<()> {
+    let empty = parts.is_empty();
+    let (committed, failed) = match outcome {
+        Ok(c) => (Some((unit, c)), None),
+        Err(e) => (None, Some(e)),
+    };
+    record_units(
+        plan,
+        summary,
+        file_log,
+        observed,
+        parts.into_iter().map(|p| (unit, p)),
+        |i, _| kind(i),
+        committed,
+    );
+    if let Some(e) = failed {
+        return Err(e);
+    }
+    if !empty {
+        mark_validated(plan, summary);
+    } else if let UnitId::Chunk(chunk_index) = unit {
+        summary.journal.record(RunEvent::ChunkCompleted {
+            chunk_index,
+            rows: 0,
+            file_name: None,
+        });
+    }
+    checkpoint(summary)
+}
+
+/// The shared order: observations, every durable part through `record_part`, then committed checksums.
+fn record_units(
+    plan: &ResolvedRunPlan,
+    summary: &mut RunSummary,
+    file_log: Option<&StateStore>,
+    observed: Observations,
+    parts: impl IntoIterator<Item = (UnitId, PartRecord)>,
+    kind: impl Fn(usize, UnitId) -> PartKind,
+    committed: impl IntoIterator<Item = (UnitId, UnitChecksums)>,
+) {
+    summary.ledger.observe(observed);
+    for (i, (unit, rec)) in parts.into_iter().enumerate() {
+        record_part(plan, summary, file_log, &rec, kind(i, unit), unit);
+    }
+    for (unit, c) in committed {
+        summary.ledger.contribute(unit, c);
+    }
+}
+
+/// Under `validate`, record the pass once: the verdict and its journal entry.
+fn mark_validated(plan: &ResolvedRunPlan, summary: &mut RunSummary) {
+    if plan.validate && summary.validated != Some(true) {
+        summary.validated = Some(true);
+        summary
+            .journal
+            .record(RunEvent::ValidationResult { passed: true });
     }
 }
 
@@ -277,6 +353,134 @@ mod tests {
                 summary.validated,
                 validate.then_some(true),
                 "validate={validate}"
+            );
+        }
+    }
+
+    fn validations(summary: &RunSummary) -> usize {
+        summary
+            .journal
+            .entries
+            .iter()
+            .filter(|e| matches!(e.event, RunEvent::ValidationResult { .. }))
+            .count()
+    }
+
+    /// The checkpoint runs only after every part of the unit is recorded, then the verdict is journaled once.
+    #[test]
+    fn a_committed_unit_checkpoints_after_its_parts_are_recorded() {
+        let mut plan = test_plan();
+        plan.validate = true;
+        let mut summary = test_summary(&plan);
+        for n in 0..2 {
+            let parts = synthetic_parts(2)
+                .into_iter()
+                .map(|mut p| {
+                    p.file_name = format!("u{n}_{}", p.file_name);
+                    p
+                })
+                .collect();
+            commit_unit(
+                &plan,
+                &mut summary,
+                None,
+                UnitId::Chunk(n),
+                parts,
+                |_| PartKind::Chunk { chunk_index: 0 },
+                Observations::default(),
+                Ok(UnitChecksums::default()),
+                |s| {
+                    let recorded = 2 * (n as usize + 1);
+                    assert_eq!(s.files_committed, recorded, "checkpoint before a part");
+                    Ok(())
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(summary.files_committed, 4);
+        assert_eq!(summary.validated, Some(true));
+        assert_eq!(validations(&summary), 1, "the verdict is journaled once");
+        assert!(
+            summary
+                .ledger
+                .integrity
+                .covered_units
+                .contains(&UnitId::Chunk(1))
+        );
+    }
+
+    /// A failed unit records its durable parts and what it saw, then returns its own error: no checksums, no verdict, no checkpoint.
+    #[test]
+    fn a_failed_unit_records_its_parts_and_skips_the_checkpoint() {
+        let mut plan = test_plan();
+        plan.validate = true;
+        let mut summary = test_summary(&plan);
+        let mut o = Observations::default();
+        o.column_max_bytes.insert("name".into(), 7);
+        let err = commit_unit(
+            &plan,
+            &mut summary,
+            None,
+            UnitId::Page(3),
+            synthetic_parts(1),
+            |_| PartKind::Chunk { chunk_index: 3 },
+            o,
+            Err(anyhow::anyhow!("part 1 failed")),
+            |_| panic!("a failed unit must not checkpoint"),
+        )
+        .unwrap_err();
+        assert_eq!(err.to_string(), "part 1 failed");
+        assert_eq!(summary.files_committed, 1);
+        assert_eq!(summary.validated, None);
+        assert!(summary.ledger.integrity.covered_units.is_empty());
+        assert_eq!(
+            summary.ledger.observed.column_max_bytes.get("name"),
+            Some(&7)
+        );
+    }
+
+    /// An empty chunk journals its completion and checkpoints without a verdict; an empty non-chunk unit journals nothing.
+    #[test]
+    fn an_empty_unit_checkpoints_and_only_a_chunk_journals_its_completion() {
+        for (unit, journaled) in [(UnitId::Chunk(5), 1), (UnitId::Run, 0)] {
+            let mut plan = test_plan();
+            plan.validate = true;
+            let mut summary = test_summary(&plan);
+            let mut checkpointed = false;
+            commit_unit(
+                &plan,
+                &mut summary,
+                None,
+                unit,
+                Vec::new(),
+                |_| PartKind::Chunk { chunk_index: 5 },
+                Observations::default(),
+                Ok(UnitChecksums::default()),
+                |_| {
+                    checkpointed = true;
+                    Ok(())
+                },
+            )
+            .unwrap();
+            let completed = summary
+                .journal
+                .entries
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        e.event,
+                        RunEvent::ChunkCompleted {
+                            chunk_index: 5,
+                            rows: 0,
+                            file_name: None
+                        }
+                    )
+                })
+                .count();
+            assert_eq!((completed, checkpointed), (journaled, true), "{unit:?}");
+            assert_eq!(
+                summary.validated, None,
+                "{unit:?}: an empty unit validated nothing"
             );
         }
     }

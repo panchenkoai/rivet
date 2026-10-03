@@ -110,9 +110,6 @@ fn export_one_chunk_range(
         debris.append(&mut recs);
         return Err(e);
     }
-    if plan.validate {
-        summary.validated = Some(true);
-    }
 
     let rows = sink.total_rows;
     Ok((rows, recs, sink.take_checksums(), sink.take_shape()))
@@ -259,51 +256,39 @@ pub(crate) fn run_chunked_sequential_checkpoint(
                 r
             }
         };
+        let unit = super::super::commit::UnitId::Chunk(chunk_index);
+        let kind = |_| super::super::commit::PartKind::Chunk { chunk_index };
         match chunk_result {
             Ok((rows, parts, chunk_checksums, chunk_shape)) => {
                 pb.inc(summary.total_rows + rows as i64);
-                // ADR-0028: feed the run ledger; the seam applies it once, at
-                // the dispatcher (shape only — chunked's drift gate stays
-                // pre-chunk, ADR-0021). ADR-0029: contributed under the chunk
-                // this loop iteration just committed — the unit its record_part
-                // calls use below.
-                summary.ledger.observe(chunk_shape);
-                summary.ledger.contribute(
-                    super::super::commit::UnitId::Chunk(chunk_index),
-                    chunk_checksums,
-                );
-                // Shared commit path for the non-empty branch (I2/M1 + counters
-                // + ChunkCompleted journal + I7 file-log + fault hooks).
-                // Empty chunks have no file to record but still need to journal
-                // completion + finalize the chunk_task so the run accounts for
-                // every claimed index.
-                let fname: Option<String> = if parts.is_empty() {
-                    summary.journal.record(RunEvent::ChunkCompleted {
-                        chunk_index,
-                        rows: 0,
-                        file_name: None,
-                    });
-                    None
-                } else {
-                    for rec in &parts {
-                        super::super::commit::record_part(
-                            plan,
-                            summary,
-                            Some(state),
-                            rec,
-                            super::super::commit::PartKind::Chunk { chunk_index },
-                            super::super::commit::UnitId::Chunk(chunk_index),
-                        );
-                    }
-                    // chunk_task carries one file name; for a rotation-split
-                    // chunk store the first sibling. The manifest records all
-                    // siblings, so a missing one fails destination verification
-                    // loudly instead of being silently skipped on resume.
-                    Some(parts[0].file_name.clone())
-                };
-                crate::test_hook::maybe_panic_at_chunk("after_chunk_file", chunk_index);
-                state.complete_chunk_task(&run_id, chunk_index, rows as i64, fname.as_deref())?;
-                crate::test_hook::maybe_panic_at_chunk("after_chunk_complete", chunk_index);
+                // chunk_task carries one file name; for a rotation-split chunk store
+                // the first sibling. The manifest records all siblings, so a missing
+                // one fails destination verification loudly instead of being
+                // silently skipped on resume.
+                let fname = parts.first().map(|p| p.file_name.clone());
+                // Shape only — chunked's drift gate stays pre-chunk, ADR-0021. The
+                // chunk_task flip is this runner's checkpoint, after its parts.
+                crate::pipeline::fan_in::commit_unit(
+                    plan,
+                    summary,
+                    Some(state),
+                    unit,
+                    parts,
+                    kind,
+                    chunk_shape,
+                    Ok(chunk_checksums),
+                    |_| {
+                        crate::test_hook::maybe_panic_at_chunk("after_chunk_file", chunk_index);
+                        state.complete_chunk_task(
+                            &run_id,
+                            chunk_index,
+                            rows as i64,
+                            fname.as_deref(),
+                        )?;
+                        crate::test_hook::maybe_panic_at_chunk("after_chunk_complete", chunk_index);
+                        Ok(())
+                    },
+                )?;
             }
             Err(e) => {
                 let msg = crate::redact::redact_error(&e);
@@ -321,16 +306,19 @@ pub(crate) fn run_chunked_sequential_checkpoint(
                     error: msg.clone(),
                     attempt: 1,
                 });
-                for rec in &debris {
-                    super::super::commit::record_part(
-                        plan,
-                        summary,
-                        Some(state),
-                        rec,
-                        super::super::commit::PartKind::Chunk { chunk_index },
-                        super::super::commit::UnitId::Chunk(chunk_index),
-                    );
-                }
+                // The failed chunk's durable parts are recorded; the error it hands
+                // back is `e`, already logged above.
+                let _ = crate::pipeline::fan_in::commit_unit(
+                    plan,
+                    summary,
+                    Some(state),
+                    unit,
+                    debris,
+                    kind,
+                    Default::default(),
+                    Err(e),
+                    |_| Ok(()),
+                );
                 state.fail_chunk_task(&run_id, chunk_index, &msg, retryable)?;
             }
         }

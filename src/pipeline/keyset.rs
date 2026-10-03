@@ -234,6 +234,11 @@ fn highest_range_max(range_maxes: Vec<Option<String>>) -> Option<String> {
     range_maxes.into_iter().rev().flatten().next()
 }
 
+/// The page's high-water key rides only on its LAST part (v25): the point the whole page is committed.
+fn page_part_cursor(pi: usize, n_parts: usize, high_water: &Option<String>) -> Option<String> {
+    (pi + 1 == n_parts).then(|| high_water.clone()).flatten()
+}
+
 /// "The single row at offset `off`" clause (after the `ORDER BY`), per dialect.
 fn nth_row_clause(st: crate::config::SourceType, off: i64) -> String {
     use crate::config::SourceType::*;
@@ -1119,26 +1124,27 @@ pub(crate) fn run_keyset(
             dest.as_ref(),
             &base,
         );
+        let unit = super::commit::UnitId::Page(pages as i64);
         let page = match page {
             Ok(page) => page,
+            // A page that failed part-way: its earlier parts are durable, so they are
+            // recorded (no cursor_high — the page never completed) before the error
+            // leaves, or `files_committed` under-counts for the retry guard.
             Err(e) => {
-                // A page that failed part-way: its earlier parts are durable, so they
-                // are recorded (no cursor_high — the page never completed) before the
-                // error leaves, or `files_committed` under-counts for the retry guard.
-                for rec in &parts {
-                    super::commit::record_part(
-                        plan,
-                        summary,
-                        state,
-                        rec,
-                        super::commit::PartKind::Page {
-                            page_index: pages as i64,
-                            cursor_high: None,
-                        },
-                        super::commit::UnitId::Page(pages as i64),
-                    );
-                }
-                return Err(e);
+                return super::fan_in::commit_unit(
+                    plan,
+                    summary,
+                    state,
+                    unit,
+                    parts,
+                    |_| super::commit::PartKind::Page {
+                        page_index: pages as i64,
+                        cursor_high: None,
+                    },
+                    Default::default(),
+                    Err(e),
+                    |_| Ok(()),
+                );
             }
         };
         let Some(mut page) = page else {
@@ -1158,66 +1164,44 @@ pub(crate) fn run_keyset(
             summary.cursor_low = page.first_cursor.clone();
         }
 
-        // ADR-0028: feed the run ledger from this page — the seam
-        // (`finalize::finalize_export`) pins the fingerprint, runs the drift
-        // gate and harvests Form B once, at the dispatcher. No application here.
-        summary.ledger.observe(std::mem::take(&mut page.observed));
-        // ADR-0029: the sequential runner's commit unit is the PAGE — this feed
-        // and the `record_part` calls below are the same loop iteration over the
-        // same page, so the two sets agree by construction.
-        summary.ledger.contribute(
-            super::commit::UnitId::Page(pages as i64),
-            std::mem::take(&mut page.checksums),
-        );
-        if plan.validate {
-            summary.validated = Some(true);
-        }
-        // Record the parts FIRST, tracking whether EVERY part deduped. With v25 the cursor
-        // reconcile (above) means a committed page is never re-read, so a dedup normally fires only
-        // in the mid-page-crash fallback (below); `record_part` counts each part's rows once, so a
-        // deduped re-read of a rehydrated part adds nothing.
+        // v25: stamp the page's high-water key ONLY on the LAST part's file_log row — the
+        // point at which the WHOLE page is committed. On resume, `last` reconciles to the max
+        // committed `cursor_high`, so a page that fully committed is skipped (never re-read →
+        // no dup). A crash MID-page (last part absent → no cursor_high for this page) does NOT
+        // advance the reconcile, so the page re-reads and its already-committed parts are
+        // handled by the run-id part naming — a recoverable dup, never LOSS.
         let n_parts = parts.len();
-        for (pi, rec) in parts.iter().enumerate() {
-            // v25: stamp the page's high-water key ONLY on the LAST part's file_log row — the
-            // point at which the WHOLE page is committed. On resume, `last` reconciles to the max
-            // committed `cursor_high`, so a page that fully committed is skipped (never re-read →
-            // no dup, the measured single-part fix). A crash MID-page (only earlier parts written,
-            // last part absent → no cursor_high for this page) does NOT advance the reconcile, so
-            // the page re-reads and its already-committed parts are handled by the run-id part
-            // naming — a recoverable dup, never LOSS. Stamping every part with the page's eventual
-            // high-water would falsely mark a mid-page crash "done" and DROP its uncommitted parts
-            // (there is no per-part key to reconcile against — KeysetPage carries only next_cursor).
-            let is_last = pi + 1 == n_parts;
-            super::commit::record_part(
-                plan,
-                summary,
-                state,
-                rec,
-                super::commit::PartKind::Page {
-                    page_index: pages as i64,
-                    cursor_high: if is_last {
-                        page.next_cursor.clone()
-                    } else {
-                        None
-                    },
-                },
-                super::commit::UnitId::Page(pages as i64),
-            );
-        }
-        // Persist the high-water mark AFTER the parts are durably committed, so a
-        // resume continues from committed data (peek→flush→ack). The crash window
-        // between the commit and this line is at-least-once: the last page is
-        // re-read (downstream dedup / reconcile absorbs it), never lost.
-        if kp.checkpoint
-            && let (Some(st), Some(v)) = (state, page.next_cursor.as_ref())
-        {
-            st.update_with_column(
-                &plan.export_name,
-                &plan.source.state_key(),
-                v,
-                &kp.key_column,
-            )?;
-        }
+        let high_water = page.next_cursor.clone();
+        // ADR-0029: the sequential runner's commit unit is the PAGE. The checkpoint
+        // persists the high-water mark AFTER the parts are durably committed, so a
+        // resume continues from committed data (peek→flush→ack); a crash between the
+        // two re-reads the last page, never loses it.
+        super::fan_in::commit_unit(
+            plan,
+            summary,
+            state,
+            unit,
+            parts,
+            |pi| super::commit::PartKind::Page {
+                page_index: pages as i64,
+                cursor_high: page_part_cursor(pi, n_parts, &high_water),
+            },
+            std::mem::take(&mut page.observed),
+            Ok(std::mem::take(&mut page.checksums)),
+            |_| {
+                if kp.checkpoint
+                    && let (Some(st), Some(v)) = (state, page.next_cursor.as_ref())
+                {
+                    st.update_with_column(
+                        &plan.export_name,
+                        &plan.source.state_key(),
+                        v,
+                        &kp.key_column,
+                    )?;
+                }
+                Ok(())
+            },
+        )?;
         // Fault point: page durably committed (parts + file_log + cursor advanced),
         // NO destination manifest yet — a crash here must be resume-recoverable
         // MANIFEST-DRIVEN (round-5): the resume rehydrates this page from file_log.
@@ -1463,6 +1447,17 @@ mod tests {
             t.chars()
                 .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
         );
+    }
+
+    /// Only the last part of a page carries the page's high-water key; earlier parts and an unkeyed page carry none.
+    #[test]
+    fn only_a_pages_last_part_carries_its_high_water() {
+        let hw = Some("42".to_string());
+        assert_eq!(page_part_cursor(0, 3, &hw), None);
+        assert_eq!(page_part_cursor(1, 3, &hw), None);
+        assert_eq!(page_part_cursor(2, 3, &hw), hw);
+        assert_eq!(page_part_cursor(0, 1, &hw), hw);
+        assert_eq!(page_part_cursor(0, 1, &None), None);
     }
 
     // ── highest_range_max: cursor_high = the top populated range's max ────────

@@ -701,7 +701,7 @@ pub(crate) mod tests {
 
         let mut led = CommitLedger::default();
         sink.drain_observations_into(&mut led);
-        sink.drain_integrity_into(UnitId::Run, &mut led);
+        led.contribute(UnitId::Run, sink.take_checksums());
 
         assert_eq!(
             led.observed

@@ -212,7 +212,7 @@ PG_CASES = [
     PgCase("a_single_incr", ["mode: incremental", "cursor_column: id", "compression: none",
                              "max_file_size: 64KB",
                              "parquet: { row_group_strategy: fixed_rows, row_group_rows: 100 }",
-                             "tuning: { batch_size: 100 }"], "single_part_commit:1"),
+                             "tuning: { batch_size: 100 }"], "sink_part_write:1"),
     PgCase("b_chunked_par", ["mode: chunked", "chunk_column: id", "chunk_size: 250", "parallel: 4"],
            "chunk_export:1"),
     PgCase("c_ckpt_seq", ["mode: chunked", "chunk_column: id", "chunk_size: 250",

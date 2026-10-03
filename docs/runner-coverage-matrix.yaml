@@ -297,7 +297,10 @@ scenarios:
     # 2026-08-29 harness round wired maybe_error_at_index("single_part_commit", i)
     # into the commit loop and PROVED the construction at the boundary: the test
     # reads files_committed from the run's own metrics row and goes RED with the
-    # record_part increment stubbed (left: Some(0), right: Some(2)).
+    # record_part increment stubbed (left: Some(0), right: Some(2)). Since
+    # 2026-10-03 every sequential runner commits a unit through
+    # fan_in::commit_unit and writes through commit::write_sink_parts, so the hook
+    # is the shared `sink_part_write:N` on all four.
     single:         { test: single_commit_error_still_counts_the_durable_parts_postgres }
     chunked:        { test: a_part_write_failing_mid_chunk_counts_the_earlier_parts_plain_sequential }
     chunked_checkpoint: { test: a_part_write_failing_mid_chunk_counts_the_earlier_parts_sequential_checkpoint }
