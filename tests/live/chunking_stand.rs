@@ -1878,14 +1878,11 @@ fn run_dest_s3(eng: Eng) {
         "s3 run failed; stderr:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let script = format!(
-        "mc alias set local http://127.0.0.1:9000 {MINIO_ACCESS_KEY} {MINIO_SECRET_KEY} >/dev/null 2>&1 && \
-         mc ls --recursive local/{bucket}/{prefix} 2>/dev/null"
-    );
-    let ls = std::process::Command::new("docker")
-        .args(["compose", "exec", "-T", "minio", "sh", "-c", &script])
-        .output()
-        .expect("mc ls");
+    let ls = minio_mc(&format!(
+        "mc ls --recursive local/{bucket}/{prefix} 2>/dev/null"
+    ))
+    .output()
+    .expect("mc ls");
     let listing = String::from_utf8_lossy(&ls.stdout);
     assert!(
         listing.matches(".parquet").count() >= 1,
@@ -2102,14 +2099,11 @@ fn stand_dest_s3_mongo() {
         "mongo s3 run failed; stderr:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let script = format!(
-        "mc alias set local http://127.0.0.1:9000 {MINIO_ACCESS_KEY} {MINIO_SECRET_KEY} >/dev/null 2>&1 && \
-         mc ls --recursive local/{bucket}/{prefix} 2>/dev/null"
-    );
-    let ls = std::process::Command::new("docker")
-        .args(["compose", "exec", "-T", "minio", "sh", "-c", &script])
-        .output()
-        .expect("mc ls");
+    let ls = minio_mc(&format!(
+        "mc ls --recursive local/{bucket}/{prefix} 2>/dev/null"
+    ))
+    .output()
+    .expect("mc ls");
     let listing = String::from_utf8_lossy(&ls.stdout);
     assert!(
         listing.matches(".parquet").count() >= 1,

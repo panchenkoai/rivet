@@ -1527,15 +1527,30 @@ mod tests {
         )
         .cdc(true)
         .named_collection(Some("rivet_stand_minio".into()));
+        // The MinIO container is found by the port it publishes, not by a compose project name.
+        let ps = std::process::Command::new("docker")
+            .args(["ps", "--filter", "publish=9000", "--format", "{{.Names}}"])
+            .output()
+            .expect("spawn `docker ps`");
+        let minio = String::from_utf8_lossy(&ps.stdout)
+            .lines()
+            .next()
+            .map(str::to_string)
+            .expect("no running container publishes host port 9000 (MinIO)");
         let made = std::process::Command::new("docker")
-            .args(["compose", "exec", "-T", "minio", "sh", "-c"])
+            .args(["exec", &minio, "sh", "-c"])
             .arg(
-                "mc alias set local http://127.0.0.1:9000 minioadmin minioadmin >/dev/null 2>&1 \
-                 && mc mb -p local/rivet-qa-ch-pull >/dev/null 2>&1 || true",
+                "mc alias set local http://127.0.0.1:9000 minioadmin minioadmin >/dev/null \
+                 && mc mb --ignore-existing local/rivet-qa-ch-pull",
             )
-            .status()
-            .expect("docker compose exec minio");
-        assert!(made.success(), "creating the MinIO bucket failed: {made}");
+            .output()
+            .expect("spawn `docker exec`");
+        assert!(
+            made.status.success(),
+            "`mc mb local/rivet-qa-ch-pull` in container `{minio}` failed ({}): {}",
+            made.status,
+            String::from_utf8_lossy(&made.stderr)
+        );
         let write = |name: &str, select: &str| {
             loader
                 .query(&format!(
