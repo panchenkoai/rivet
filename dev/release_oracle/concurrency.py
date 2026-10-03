@@ -150,6 +150,7 @@ def _run_writers(cfgs: list[Path], state_url: str | None) -> tuple[list[int], st
         env["RIVET_STATE_URL"] = state_url
     else:
         env.pop("RIVET_STATE_URL", None)
+        env.pop("RIVET_GATE_STATE_URL", None)
     procs = [
         (
             c,
