@@ -1698,6 +1698,11 @@ jobs:
           --skip a_non_unicode_database_round_trips
           --skip a_read_blocked_longer_than_thirty_seconds_still_completes
 
+      - name: Kernel OOM kills (on failure)
+        # A process the kernel kills leaves no stderr of its own; the kernel log names it.
+        if: ${{ failure() }}
+        run: sudo dmesg -T | grep -iE 'out of memory|oom-kill|killed process' || echo "no OOM kill in the kernel log"
+
       - name: Self-skip census
         # libtest prints `ok` for a test that returned early, so `skip_live` writes every self-skip
         # to target/rivet-skips.log. The release gate fails any self-skip outside core.SKIP_ALLOWED;

@@ -988,50 +988,109 @@ fn decide(
     Outcome::Fail(failures)
 }
 
-/// Run `dev/release_oracle/rig_oracle.py <verb>` (pinned by uv.lock) over `spec`; its JSON verdict.
+/// The uv-synced interpreter, resolved once: `uv run` reports a Python killed by a signal as a bare exit 1.
+fn oracle_python() -> &'static str {
+    static PY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PY.get_or_init(|| {
+        let out = std::process::Command::new("uv")
+            .args([
+                "run",
+                "--frozen",
+                "--quiet",
+                "python",
+                "-c",
+                "import sys; print(sys.executable)",
+            ])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()
+            .expect(
+                "spawn `uv run` for the rig oracle — install uv (the oracle is pinned by uv.lock)",
+            );
+        assert!(
+            out.status.success(),
+            "uv could not resolve the rig oracle's interpreter ({}):\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    })
+}
+
+/// Run `dev/release_oracle/rig_oracle.py <verb>` (pinned by uv.lock) over `spec` within `TIMEOUT_SECS`; its JSON verdict.
 fn run_rig_oracle(spec: &serde_json::Value, verb: &str) -> serde_json::Value {
-    use std::io::Write as _;
-    let mut child = std::process::Command::new("uv")
-        .args([
-            "run",
-            "--frozen",
-            "--quiet",
-            "python",
-            "-m",
-            "dev.release_oracle.rig_oracle",
-            verb,
-        ])
+    use std::io::{Read as _, Write as _};
+    use std::os::unix::process::CommandExt as _;
+    const TIMEOUT_SECS: u64 = 300;
+    let mut child = std::process::Command::new(oracle_python())
+        .args(["-m", "dev.release_oracle.rig_oracle", verb])
+        .env("PYTHONFAULTHANDLER", "1")
+        .process_group(0)
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .expect("spawn `uv run` for the rig oracle — install uv (the oracle is pinned by uv.lock)");
+        .expect("spawn the rig oracle's interpreter");
     child
         .stdin
         .take()
         .expect("oracle stdin")
         .write_all(spec.to_string().as_bytes())
         .expect("write the oracle spec");
-    let out = child.wait_with_output().expect("wait for the rig oracle");
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
+    let drain = |mut r: Box<dyn std::io::Read + Send>| {
+        std::thread::spawn(move || {
+            let mut b = Vec::new();
+            let _ = r.read_to_end(&mut b);
+            b
+        })
+    };
+    let stdout = drain(Box::new(child.stdout.take().expect("oracle stdout")));
+    let stderr = drain(Box::new(child.stderr.take().expect("oracle stderr")));
+    let started = std::time::Instant::now();
+    let group = child.id() as i32;
+    let mut timed_out = false;
+    let status = loop {
+        if let Some(st) = child.try_wait().expect("poll the rig oracle") {
+            break st;
+        }
+        if !timed_out && started.elapsed().as_secs() >= TIMEOUT_SECS {
+            // SIGABRT first: Python's faulthandler prints every thread's stack, then the group dies.
+            timed_out = true;
+            unsafe { libc::kill(-group, libc::SIGABRT) };
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            unsafe { libc::kill(-group, libc::SIGKILL) };
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let out = stdout.join().unwrap_or_default();
+    let err = String::from_utf8_lossy(&stderr.join().unwrap_or_default()).into_owned();
+    if timed_out || !status.success() {
+        let why = if timed_out {
+            format!("timed out after {TIMEOUT_SECS}s and was killed")
+        } else {
+            format!(
+                "exited {status} after {:.1}s",
+                started.elapsed().as_secs_f64()
+            )
+        };
         log(
             "FAIL",
             spec["export"].as_str().unwrap_or("*"),
             &format!(
-                "oracle error ({verb}): {}",
-                err.lines().last().unwrap_or("")
+                "oracle error ({verb}): {why}: {}",
+                err.lines().last().unwrap_or("<empty stderr>")
             ),
         );
         panic!(
-            "oracle error: dev/release_oracle/rig_oracle.py {verb} raised (an oracle bug, never a verdict):\n{err}\nspec: {spec}"
+            "oracle error: dev/release_oracle/rig_oracle.py {verb} {why} (an oracle bug, never a verdict)\n\
+             stderr:\n{err}\nstdout:\n{}\nspec: {spec}",
+            String::from_utf8_lossy(&out)
         );
     }
-    serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+    serde_json::from_slice(&out).unwrap_or_else(|e| {
         panic!(
             "rig oracle printed no JSON verdict ({e}):\n{}",
-            String::from_utf8_lossy(&out.stdout)
+            String::from_utf8_lossy(&out)
         )
     })
 }

@@ -962,9 +962,9 @@ fn oracle_cdc_byte_cap_counts_the_first_row_and_defers_not_drops() {
     );
 }
 
-/// Runs that mine while another session switches the redo log in a tight loop deliver every row exactly once.
-/// RED with no re-plan (every run fails ORA-01368/01291) and, at a measured ~1 in 6, with no
-/// online-read proof (a run's tail silently lost while the checkpoint moves to its frontier).
+/// Runs whose LogMiner session has every online redo group reused under it deliver every row exactly once.
+/// Each run mines a backlog from a fresh log; once the server shows rivet's session reading V$LOGMNR_CONTENTS
+/// the test switches through every group. RED with no re-plan (ORA-01368/01291) and with the switch removed.
 #[test]
 #[ignore = "live: requires the oracle service with LogMiner prerequisites"]
 fn oracle_cdc_a_redo_log_switch_during_mining_is_re_mined_not_failed() {
@@ -975,7 +975,21 @@ fn oracle_cdc_a_redo_log_switch_during_mining_is_re_mined_not_failed() {
     let ckpt = d.path().join("cdc.ckpt");
     rig(&t, &ckpt, &d.path().join("anchor")).run_ok();
     const BATCH: i64 = 50;
-    const RUNS: usize = 12;
+    const RUNS: usize = 6;
+    const FILL: i64 = 50_000;
+    const FILL_BASE: i64 = 1_000_000_000;
+    const READING: &str = "SELECT TO_CHAR(COUNT(*)) FROM v$session s JOIN v$sql q \
+                           ON q.sql_id IN (s.sql_id, s.prev_sql_id) \
+                           WHERE s.username = 'C##RIVETCDC' \
+                           AND q.sql_fulltext LIKE '%FROM V$LOGMNR_CONTENTS%'";
+    let root = ORACLE_URL
+        .replace("rivet:rivet@", "system:rivet@")
+        .replace("/FREEPDB1", "/FREE");
+    let groups: usize = ora_text_rows_on(&root, "SELECT TO_CHAR(COUNT(*)) FROM v$log")[0][0]
+        .as_deref()
+        .unwrap()
+        .parse()
+        .unwrap();
     let stop = std::sync::Arc::new(AtomicBool::new(false));
     let writer = {
         let (stop, table) = (stop.clone(), t.name().to_string());
@@ -991,55 +1005,79 @@ fn oracle_cdc_a_redo_log_switch_during_mining_is_re_mined_not_failed() {
                 );
                 conn.execute(&sql, &[]).unwrap();
                 written += BATCH;
-                std::thread::sleep(std::time::Duration::from_millis(10));
+                std::thread::sleep(std::time::Duration::from_millis(100));
             }
             written
         })
     };
-    let switcher = {
-        let stop = stop.clone();
-        std::thread::spawn(move || {
-            let root = ORACLE_URL
-                .replace("rivet:rivet@", "system:rivet@")
-                .replace("/FREEPDB1", "/FREE");
-            let cdb = ora_conn_to(&root);
-            let mut n = 0u32;
-            while !stop.load(Relaxed) {
-                cdb.execute("ALTER SYSTEM SWITCH LOGFILE", &[]).unwrap();
-                n += 1;
-            }
-            n
-        })
-    };
     let mut failures = Vec::new();
-    let mut replans = 0;
+    let mut unmet = Vec::new();
     let out = d.path().join("out");
-    for _ in 0..RUNS {
-        let run = rig(&t, &ckpt, &out).run();
+    for n in 0..RUNS {
+        let base = FILL_BASE + n as i64 * FILL;
+        ora_exec(&format!(
+            "INSERT INTO {} SELECT {base} + LEVEL, LEVEL FROM dual CONNECT BY LEVEL <= {FILL}",
+            t.name()
+        ));
+        ora_exec_on(&root, "ALTER SYSTEM SWITCH LOGFILE");
+        let done = AtomicBool::new(false);
+        let started = std::time::Instant::now();
+        let (run, switched_at) = std::thread::scope(|s| {
+            let switcher = s.spawn(|| {
+                let cdb = ora_conn_to(&root);
+                let reading = || {
+                    let row = cdb.query(READING, &[]).unwrap().next().unwrap().unwrap();
+                    row.get::<String>(0).unwrap() != "0"
+                };
+                while !reading() {
+                    if done.load(Relaxed) {
+                        return None;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                let seen = started.elapsed();
+                for _ in 0..groups {
+                    cdb.execute("ALTER SYSTEM SWITCH LOGFILE", &[]).unwrap();
+                }
+                Some((seen, started.elapsed()))
+            });
+            let run = rig(&t, &ckpt, &out).run();
+            done.store(true, Relaxed);
+            (run, switcher.join().unwrap())
+        });
         let err = String::from_utf8_lossy(&run.stderr).into_owned();
-        replans += err.matches("re-planning the redo logs").count();
+        let replans = err.matches("re-planning the redo logs").count();
+        eprintln!(
+            "run {n}: {replans} re-plan(s); read seen/switched at {switched_at:?} of {:?}",
+            started.elapsed()
+        );
+        if replans == 0 {
+            unmet.push((n, switched_at));
+        }
         if !run.status.success() {
             failures.push(err.lines().last().unwrap_or_default().to_string());
         }
     }
     stop.store(true, Relaxed);
     let written = writer.join().unwrap();
-    let switches = switcher.join().unwrap();
     rig(&t, &ckpt, &out).run_ok();
     assert!(
         failures.is_empty(),
-        "{} of {RUNS} runs failed under {switches} log switches: {failures:#?}",
+        "{} of {RUNS} runs failed with {groups} log switches each: {failures:#?}",
         failures.len()
     );
-    let want: Vec<(i64, String)> = (1..=written).map(|i| (i, "insert".to_string())).collect();
+    let want: Vec<(i64, String)> = (1..=written)
+        .chain(FILL_BASE + 1..=FILL_BASE + RUNS as i64 * FILL)
+        .map(|i| (i, "insert".to_string()))
+        .collect();
     assert_eq!(
         cdc_id_ops(&out),
         want,
         "every row exactly once across the runs"
     );
-    eprintln!("{replans} re-plans over {RUNS} runs under {switches} log switches");
     assert!(
-        replans > 0,
-        "no run met a changed log set, so the storm proved nothing"
+        unmet.is_empty(),
+        "runs (index, (read seen, switched)) that met no changed log set, so they proved \
+         nothing: {unmet:?}"
     );
 }

@@ -277,11 +277,12 @@ fn run_pool_split_rerun_with(
     let cfg = rig.config_path();
 
     // Prime durations, clear, so the split fires on run 1.
+    let primed = run_rivet_env(&["apply", cfg.to_str().unwrap(), "--pool", "2"], &[]);
     assert!(
-        run_rivet_env(&["apply", cfg.to_str().unwrap(), "--pool", "2"], &[])
-            .status
-            .success(),
-        "priming run must succeed"
+        primed.status.success(),
+        "priming run must succeed ({}):\n{}",
+        primed.status,
+        String::from_utf8_lossy(&primed.stderr)
     );
     for d in [rig.out_dir(), rig.out_dir_for("split_sibling")] {
         let _ = std::fs::remove_dir_all(&d);

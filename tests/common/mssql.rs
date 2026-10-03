@@ -382,9 +382,21 @@ pub fn seed_mssql_numeric_table(row_count: i64) -> MssqlTable {
 ///
 /// The concurrency-governor canaries need a SQL Server nobody else is writing
 /// to: the signal they assert on is `Log Flush Waits/sec` with the `_Total`
-/// instance, which is server-wide. See `env::MSSQL_GOVERNOR_URL`.
+/// instance, which is server-wide. See `env::MSSQL_GOVERNOR_URL`. Query Store is
+/// switched off first: its background flushes commit in `rivet` on their own clock.
 pub fn seed_mssql_governor_numeric_table(row_count: i64) -> MssqlTable {
+    exec_at(1435, "ALTER DATABASE rivet SET QUERY_STORE = OFF");
     seed_mssql_numeric_table_at(1435, row_count)
+}
+
+/// The governor instance's `Log Flush Waits` per database, as `db=count` pairs.
+pub fn mssql_governor_flush_waits_by_db() -> String {
+    query_strings_at(
+        1435,
+        "SELECT STRING_AGG(RTRIM(instance_name) + '=' + CAST(cntr_value AS varchar(20)), ' ') \
+         FROM sys.dm_os_performance_counters WHERE counter_name LIKE 'Log Flush Waits%'",
+    )
+    .concat()
 }
 
 fn seed_mssql_numeric_table_at(port: u16, row_count: i64) -> MssqlTable {

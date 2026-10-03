@@ -865,9 +865,17 @@ fn mssql_adaptive_never_loses_to_its_own_baseline_on_an_idle_source() {
     const FLUSH_WAITS: &str = "SELECT cntr_value FROM sys.dm_os_performance_counters \
                                WHERE counter_name LIKE 'Log Flush Waits%' \
                                AND instance_name = '_Total'";
-    let waits_before = mssql_governor_query_i64(FLUSH_WAITS);
+    let (by_db_before, waits_before) = (
+        mssql_governor_flush_waits_by_db(),
+        mssql_governor_query_i64(FLUSH_WAITS),
+    );
     let (wall_on, stderr_on) = run(true);
     let flush_waits = mssql_governor_query_i64(FLUSH_WAITS) - waits_before;
+    let by_db = format!(
+        "per database before: {by_db_before}\nper database after:  {}",
+        mssql_governor_flush_waits_by_db()
+    );
+    eprintln!("graded run: +{flush_waits} log flush waits on the governor instance\n{by_db}");
     assert_governor_awake(&stderr_on, "mssql");
     // What an idle source must NOT produce is a shed that STAYS — not a shed.
     //
@@ -899,7 +907,7 @@ fn mssql_adaptive_never_loses_to_its_own_baseline_on_an_idle_source() {
         flush_waits <= IDLE_CEILING,
         "FIXTURE, not product: the source was NOT idle during the graded run \
          (+{flush_waits} log flush waits, ceiling {IDLE_CEILING}) — the governor shed for \
-         real pressure and was RIGHT. Something is still writing to :1435.\n{stderr_on}"
+         real pressure and was RIGHT. Something is still writing to :1435.\n{by_db}\n{stderr_on}"
     );
     assert!(
         !shed_never_recovered(&levels, MIN_PARALLEL, CEILING),
