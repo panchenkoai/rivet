@@ -26,9 +26,12 @@ Per SQL engine, on the downloaded previous binary and this one:
              needs (RED: dropping it fails the load). The loaded-run skip set is NOT graded:
              init's `cleanup_source: true` deletes the first parts, so erasing it changes
              nothing here (measured).
-  resume-load  the previous release overwrote a Mongo `resume` export's BigQuery table with
-             each run's new documents; this binary's first load warns with the remedy, and
-             `state reset` + run + load leaves the table equal to the source `_id` set.
+  resume-load  per engine, a continued-key export into BigQuery (MongoDB `page_size` + `resume`;
+             the SQL engines' previous `init --mode chunked` config with its scaffolded
+             `keyset_incremental` switched on), run + loaded twice by the previous release, then by
+             this binary. A previous release that OVERWROTE (the table holds fewer keys than the
+             source had) must be warned about on the first load, and `state reset` + run + load
+             must restore every key; one that appended must draw no warning and stay complete.
   cdc-load   per CDC engine into BigQuery, in UTC and a non-UTC source zone: the previous
              `init --mode cdc` config continued by this binary (upgrade_cdc_load.py).
   cdc        per CDC engine: the previous release anchors a stream and captures a batch;
@@ -425,81 +428,179 @@ def _load_leg(led: Ledger, prev: Path, root: Path, url: str) -> None:
         gcp.gcs_delete_prefix(bucket, f"exports/{table}/")
 
 
-def _continued_key_load_leg(led: Ledger, prev: Path, root: Path, url: str) -> None:
-    """A Mongo `resume` export the previous release loaded by overwrite: this binary warns, and the remedy restores it."""
+class _MongoKeys:
+    """A Mongo collection of ObjectId documents: the source side of a resume-load cell."""
+
+    def __init__(self, url: str, name: str):
+        import pymongo
+
+        self.coll = pymongo.MongoClient(url, serverSelectionTimeoutMS=5000).get_default_database("rivet")[name]
+
+    def add(self, n: int) -> bool:
+        self.coll.insert_many([{"v": i} for i in range(n)])
+        return True
+
+    def keys(self) -> list:
+        return sorted(str(d["_id"]) for d in self.coll.find({}, {"_id": 1}))
+
+    @staticmethod
+    def norm(v: str):
+        return v
+
+    def drop(self) -> None:
+        self.coll.drop()
+
+
+class _SqlKeys:
+    """A SQL table of ids 1..n: the source side of a keyset_incremental resume-load cell."""
+
+    def __init__(self, engine: str, url: str, name: str):
+        self.engine, self.url, self.name, self.n = engine, url, name, 0
+
+    def add(self, n: int) -> bool:
+        lo, hi = self.n + 1, self.n + n
+        if self.n == 0:
+            ok = _seed(self.engine, self.url, self.name, n, with_cursor=False)
+        elif self.engine == "oracle":
+            ok = _sql(self.engine, self.url, f"INSERT INTO {self.name} SELECT level + {lo - 1}, level FROM dual "
+                      f"CONNECT BY level <= {n}").ok
+        elif self.engine == "postgres":
+            ok = _sql(self.engine, self.url, f"INSERT INTO {self.name} SELECT g, g FROM generate_series({lo}, {hi}) g;").ok
+        elif self.engine == "mysql":
+            ok = _sql(self.engine, self.url, f"INSERT INTO {self.name} WITH RECURSIVE g(n) AS (SELECT {lo} UNION ALL "
+                      f"SELECT n + 1 FROM g WHERE n < {hi}) SELECT n, n FROM g;").ok
+        else:
+            ok = _sql(self.engine, self.url, f"INSERT INTO {self.name} SELECT n, n FROM (SELECT TOP ({n}) "
+                      f"ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) + {lo - 1} AS n FROM sys.all_objects) q;").ok
+        self.n = hi if ok else self.n
+        return ok
+
+    def keys(self) -> list:
+        return list(range(1, self.n + 1))
+
+    @staticmethod
+    def norm(v: str):
+        return int(v)
+
+    def drop(self) -> None:
+        _sql(self.engine, self.url, f"DROP TABLE IF EXISTS {self.name};")
+
+
+RESUME_LOAD_ENGINES = ("mongo", *ENGINES)
+
+
+def _continued_key_load_cells(led: Ledger, prev: Path, root: Path) -> None:
+    """upgrade[<engine>/resume-load] for every engine with a URL, each recorded PASS, FAIL or a named SKIP."""
+    proj, bucket = os.environ.get("BQ_ORACLE_PROJECT", ""), os.environ.get("BQ_ORACLE_BUCKET", "")
+    for engine in RESUME_LOAD_ENGINES:
+        var = f"RIVET_ORACLE_{engine.upper()}_URL"
+        url = os.environ.get(var, "")
+        why = "no BQ_ORACLE_PROJECT / BQ_ORACLE_BUCKET" if not (proj and bucket) else f"no {var}" if not url else ""
+        if why:
+            led.skipped(engine, "-", SCEN, "resume-load", f"upgrade[{engine}/resume-load]: {why}", why)
+            continue
+        _continued_key_load_leg(led, prev, root, engine, url, proj, bucket)
+
+
+def _continued_key_load_leg(led: Ledger, prev: Path, root: Path, engine: str, url: str, proj: str,
+                            bucket: str) -> None:
+    """A continued-key export the previous release loaded twice, then this binary: complete, or warned and restored."""
     from . import gcp
     from ..pytools.registry import bq_tmp
 
-    row = ("mongo", "-", SCEN, "resume-load")
-    proj, bucket = os.environ.get("BQ_ORACLE_PROJECT", ""), os.environ.get("BQ_ORACLE_BUCKET", "")
-    if not proj or not bucket:
-        led.skipped(*row, "upgrade[mongo/resume-load]: no BQ_ORACLE_PROJECT / BQ_ORACLE_BUCKET", "no bigquery")
-        return
-    try:
-        import pymongo
-    except ImportError:
-        led.skipped(*row, "upgrade[mongo/resume-load]: pymongo absent", "no pymongo")
-        return
-    coll = f"upg_resume_{os.getpid()}"
-    dset = bq_tmp(f"upgres_{os.getpid()}")
-    d = root / "resume-load"
+    row, tag = (engine, "-", SCEN, "resume-load"), f"upgrade[{engine}/resume-load]"
+    name = _case(engine, f"upg_ck_{engine[:2]}_{os.getpid()}")
+    dset = bq_tmp(f"upgck_{engine[:2]}_{os.getpid()}")
+    d = root / f"resume-load-{engine}"
     d.mkdir()
-    (d / "c.yaml").write_text(
-        "source:\n  type: mongo\n  url_env: RIVET_UPG_URL\n  mongo:\n    page_size: 500\n    resume: true\n"
-        f"exports:\n  - name: {coll}\n    table: {coll}\n    mode: full\n    format: parquet\n"
-        f"    destination: {{ type: gcs, bucket: {bucket}, prefix: \"exports/{coll}/\" }}\n"
-        f"load:\n  target: bigquery\n  project: {proj}\n  dataset: {dset}\n  pk: auto\n"
-    )
     env = {"RIVET_UPG_URL": url, "RIVET_STATE_URL": "", "RIVET_GATE_STATE_URL": ""}
-    client = pymongo.MongoClient(url, serverSelectionTimeoutMS=5000)
-    docs = client.get_default_database("rivet")[coll]
+    if engine == "mongo":
+        try:
+            src = _MongoKeys(url, name)
+        except ImportError:
+            led.skipped(*row, f"{tag}: pymongo absent", "no pymongo")
+            return
+    else:
+        src = _SqlKeys(engine, url, name)
 
     def step(binary: Path, *args: str) -> Proc | None:
         p = run([str(binary), *args, "-c", "c.yaml"], env=env, cwd=d, timeout=None)
         if not p.ok:
-            led.failed(*row, f"upgrade[mongo/resume-load]: {' '.join(args)} by "
-                       f"{'prev' if binary == prev else 'this'} failed: {p.stderr.strip()[-200:]}", args[0])
+            led.failed(*row, f"{tag}: {' '.join(args)} by {'prev' if binary == prev else 'this'} failed: "
+                       f"{p.stderr.strip()[-200:]}", args[0])
         return p if p.ok else None
 
-    def loaded() -> list[str]:
-        # `bq query` prints 100 rows unless told otherwise; the collection holds thousands.
-        p = run(["bq", f"--project_id={proj}", "query", "--nouse_legacy_sql", "--format=json",
-                 "--max_rows=1000000", f"SELECT _id FROM `{proj}.{dset}.{coll}` ORDER BY _id"], timeout=600)
-        return [r["_id"] for r in json.loads(p.stdout or "[]")] if p.ok else []
+    def loaded() -> list:
+        # The table the load names, matched in BigQuery's own listing (`bq query` caps at 100 rows unless told).
+        ls = run(["bq", f"--project_id={proj}", "ls", "--format=json", "--max_results=100", dset], timeout=300)
+        names = [t["tableReference"]["tableId"] for t in json.loads(ls.stdout or "[]")] if ls.ok else []
+        table = next((t for t in names if t.lower().endswith(name.lower())), None)
+        if table is None:
+            return []
+        key = "_id" if engine == "mongo" else "id"
+        p = run(["bq", f"--project_id={proj}", "query", "--nouse_legacy_sql", "--format=json", "--max_rows=1000000",
+                 f"SELECT CAST({key} AS STRING) k FROM `{proj}.{dset}.{table}`"], timeout=600)
+        return sorted(src.norm(r["k"]) for r in json.loads(p.stdout or "[]")) if p.ok else []
 
     try:
         gcp.bq_ensure_dataset(proj, dset)
-        docs.insert_many([{"v": i} for i in range(2000)])
+        if not src.add(2000):
+            led.failed(*row, f"{tag}: seed failed", "seed")
+            return
+        if engine == "mongo":
+            (d / "c.yaml").write_text(
+                "source:\n  type: mongo\n  url_env: RIVET_UPG_URL\n  mongo:\n    page_size: 500\n    resume: true\n"
+                f"exports:\n  - name: {name}\n    table: {name}\n    mode: full\n    format: parquet\n"
+                f"    destination: {{ type: gcs, bucket: {bucket}, prefix: \"exports/{name}/\" }}\n"
+                f"load:\n  target: bigquery\n  project: {proj}\n  dataset: {dset}\n  pk: auto\n")
+        else:
+            # The previous release's own config, with the opt-in it scaffolds commented out switched on.
+            init = run([str(prev), "init", "--source-env", "RIVET_UPG_URL", "--table", name, "--mode", "chunked",
+                        "--gcs-bucket", bucket, "--bigquery-project", proj, "--bigquery-dataset", dset,
+                        "-o", "c.yaml"], env=env, cwd=d)
+            text = (d / "c.yaml").read_text() if init.ok else ""
+            if "# keyset_incremental: true" not in text:
+                led.failed(*row, f"{tag}: previous init wrote no keyset_incremental opt-in: "
+                           f"{init.stderr.strip()[-200:]}", "init")
+                return
+            (d / "c.yaml").write_text(text.replace("# keyset_incremental: true", "keyset_incremental: true", 1))
+        export = re.search(r"^\s*- name: (\S+)", (d / "c.yaml").read_text(), re.M).group(1)
         for _ in range(2):
             if not (step(prev, "run") and step(prev, "load")):
                 return
-            docs.insert_many([{"v": i} for i in range(500)])
-        damaged = len(loaded())
+            if not src.add(500):
+                led.failed(*row, f"{tag}: insert failed", "seed")
+                return
+        before, damaged = len(src.keys()) - 500, len(loaded())
+        overwrote = damaged < before
         if not step(rivet_bin(), "run"):
             return
         first = step(rivet_bin(), "load")
         if not first:
             return
-        warned = (f"was last loaded as a whole-table overwrite, and export `{coll}` now loads by append" in first.stderr
-                  and f"`rivet state reset -c c.yaml --export {coll}`" in first.stderr)
-        if not (step(rivet_bin(), "state", "reset", "--export", coll) and step(rivet_bin(), "run")
-                and step(rivet_bin(), "load")):
+        warned = (f"was last loaded as a whole-table overwrite, and export `{export}` now loads by append"
+                  in first.stderr and f"`rivet state reset -c c.yaml --export {export}`" in first.stderr)
+        if warned != overwrote:
+            led.failed(*row, f"{tag}: the previous release left {damaged} of {before} keys "
+                       f"(overwrote={overwrote}) but this binary's first load warned={warned}", "warning")
             return
-        want = sorted(str(o["_id"]) for o in docs.find({}, {"_id": 1}))
-        got = loaded()
-        if warned and got == want:
-            led.passed(*row, f"upgrade[mongo/resume-load]: the previous release left {damaged} of "
-                       f"{len(want) - 500} documents; this binary's first load warned with the remedy, "
-                       f"and the remedy restored all {len(want)}")
+        if overwrote and not (step(rivet_bin(), "state", "reset", "--export", export)
+                              and step(rivet_bin(), "run") and step(rivet_bin(), "load")):
+            return
+        want, got = src.keys(), loaded()
+        said = (f"the previous release overwrote ({damaged} of {before} keys left); this binary's first load "
+                f"warned with the remedy, and the remedy restored" if overwrote else
+                f"the previous release appended ({damaged} of {before} keys); this binary's load stayed silent and kept")
+        if got == want:
+            led.passed(*row, f"{tag}: {said} all {len(want)}")
         else:
-            led.failed(*row, f"upgrade[mongo/resume-load]: warned={warned}, warehouse {len(got)} ids "
-                       f"(distinct {len(set(got))}) vs source {len(want)}, equal={got == want}",
-                       "warning" if not warned else "remedy")
+            led.failed(*row, f"{tag}: warehouse {len(got)} keys (distinct {len(set(got))}) vs source {len(want)} "
+                       f"after {'the remedy' if overwrote else 'the first load'}", "remedy" if overwrote else "append")
     finally:
-        docs.drop()
+        src.drop()
         if not os.environ.get("RIVET_UPG_KEEP"):
             gcp.bq_delete_dataset(proj, dset)
-        gcp.gcs_delete_prefix(bucket, f"exports/{coll}/")
+        gcp.gcs_delete_prefix(bucket, f"exports/{name}/")
 
 
 def verify_upgrade_continuity(led: Ledger) -> None:
@@ -529,8 +630,9 @@ def verify_upgrade_continuity(led: Ledger) -> None:
                 leg(led, prev, root, engine, url, fresh)
     if os.environ.get("RIVET_ORACLE_POSTGRES_URL"):
         _load_leg(led, prev, root, os.environ["RIVET_ORACLE_POSTGRES_URL"])
-    if os.environ.get("RIVET_ORACLE_MONGO_URL"):
-        _continued_key_load_leg(led, prev, root, os.environ["RIVET_ORACLE_MONGO_URL"])
+    else:
+        led.skipped("postgres", "-", SCEN, "load", "upgrade[postgres/load]: no RIVET_ORACLE_POSTGRES_URL", "no url")
+    _continued_key_load_cells(led, prev, root)
     cdc_load_cells(led, prev, root)
     for engine in CDC_ENGINES:
         cvar = CDC_URL_VARS.get(engine, f"RIVET_CDC_{engine.upper()}_URL")
@@ -549,7 +651,9 @@ if __name__ == "__main__":
         _root = Path(tempfile.mkdtemp(prefix="rivet-oracle-upgrade-"))
         if os.environ.get("RIVET_ORACLE_POSTGRES_URL"):
             _load_leg(_led, _prev, _root, os.environ["RIVET_ORACLE_POSTGRES_URL"])
-        if os.environ.get("RIVET_ORACLE_MONGO_URL"):
-            _continued_key_load_leg(_led, _prev, _root, os.environ["RIVET_ORACLE_MONGO_URL"])
+        else:
+            _led.skipped("postgres", "-", SCEN, "load", "upgrade[postgres/load]: no RIVET_ORACLE_POSTGRES_URL",
+                         "no url")
+        _continued_key_load_cells(_led, _prev, _root)
         cdc_load_cells(_led, _prev, _root)
     raise SystemExit(_led.report())

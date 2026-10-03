@@ -66,7 +66,7 @@ set, so live state is `WHERE NOT __is_deleted`.
 |---|---|
 | `full`, `chunked`, `time_window` | `<table>`, a `MergeTree` replaced whole by every load (filled beside it, then swapped in). Not a run that continues past its last key (`keyset_incremental`, Mongo `source.mongo.resume`): it holds only new keys and loads like `incremental` |
 | `cdc` | `<table>__changes`, a `ReplacingMergeTree` keyed on the primary key, and the view `<table>` |
-| `incremental` | the first run lands `<table>` as a `MergeTree`; the first delta renames it to `<table>__changes` and `<table>` becomes a view picking the latest cursor per key |
+| `incremental` | the first run lands `<table>` as a `MergeTree`; the first delta renames it to `<table>__changes` and `<table>` becomes a view picking the latest cursor per key. A continued-key export never lands `<table>` as a table: its first run already goes to `<table>__changes` behind the view |
 
 For a CDC table the engine keeps one version per key: the highest version, computed
 from the change's source position (PostgreSQL LSN, MySQL binlog file number + offset,

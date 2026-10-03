@@ -142,10 +142,7 @@ fn mongo_parallel_two_rapid_runs_into_same_prefix_do_not_clobber() {
     );
 }
 
-/// Under `resume: true` each keyset page commits the `_id` cursor: a crash after page 0's
-/// commit, then a clean re-run, must leave every document in a manifest-declared part,
-/// exactly once (the re-run continues past the cursor, so page 0 lives only in the
-/// crashed run's parts).
+/// A `resume` crash after page 0's cursor commit, then a re-run, declares every document once.
 #[test]
 #[ignore = "live: requires docker compose up -d mongo"]
 fn mongo_resume_crash_after_keyset_page_recovers_manifest_driven() {

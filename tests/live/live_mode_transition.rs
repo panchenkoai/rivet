@@ -155,8 +155,7 @@ fn continued(rig: Rig) -> Rig {
     )
 }
 
-/// Run a Mongo export (`prior` source options, `parallel`) over `_id` 1..=10, add 11..=13, switch
-/// to `page_size` + `resume` and check what the first resumed run reads.
+/// Export `_id` 1..=10 with `prior`, add 11..=13, switch to `page_size` + `resume`, check the first resumed run.
 fn mongo_switch_to_resume(prior: Option<&str>, parallel: bool, expect: Expect) {
     require_alive(LiveService::Mongo);
     let db = unique_name("mt_mongo");

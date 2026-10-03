@@ -410,7 +410,7 @@ What the load does for each export `mode:`:
 
 | mode | warehouse result |
 |---|---|
-| `full` | `OVERWRITE` the table with the latest snapshot. Re-running is idempotent. Exception: a run that continues past its last key (Mongo `source.mongo.resume: true`; `chunked` with `keyset_incremental: true`) holds only the new keys, so it loads like `incremental`, ordered by that key |
+| `full` | `OVERWRITE` the table with the latest snapshot. Re-running is idempotent. Exception: a run that continues past its last key (Mongo `source.mongo.resume: true`; `chunked` with `keyset_incremental: true`) holds only the new keys, so it loads like `incremental` (`log_view`), ordered by that key. Not yet under `layout: base_buffer`: no first pass lands the base, so `rivet compact` refuses |
 | `incremental` | `log_view` (default): append to `<table>__changes`, plus a current-state view deduped on `pk`. `layout: base_buffer`: the first pass lands `<table>` as a physical base, every later delta lands in the buffer `<table>__changes`, and `rivet compact` merges it in (latest per `pk`) and drops the buffer — the cycle is `run → load → compact`. **DELETES ARE NOT CAPTURED**: a cursor read only sees rows whose cursor advanced, and a deleted row has none, so the warehouse keeps it forever (`deleted_flag` is off for non-CDC, so there is no `__is_deleted` to set). Use `mode: cdc` if deletions must reach the warehouse |
 | `cdc` | append to `<table>__changes`, plus a view keeping the latest `(__pos, __seq)` per PK with `__is_deleted` (soft delete: live rows are `WHERE NOT __is_deleted`) |
 | `cdc` with `tables:` | one `__changes` table and one view per source table |

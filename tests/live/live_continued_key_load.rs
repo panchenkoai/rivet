@@ -4,8 +4,7 @@ use crate::common::*;
 
 const MONGO_PORT: u16 = 27017;
 
-/// A Mongo `source.mongo.resume` export's second run holds only the new documents, so its
-/// BigQuery load must append them to the first run's rather than replace the table.
+/// A Mongo `resume` export's BigQuery load appends each run's new documents, never replaces the table.
 #[test]
 #[ignore = "live: requires mongo + BigQuery creds"]
 fn a_mongo_resume_export_into_bigquery_accumulates_every_run() {

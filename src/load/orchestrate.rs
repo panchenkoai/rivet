@@ -461,10 +461,23 @@ pub(super) fn take_table_lease<'a>(
 /// config-fix hint when neither the config nor the recorded source key gives one.
 pub(super) fn require_pk<'a>(plan: &'a load::plan::LoadPlan, mode: &str) -> Result<&'a [String]> {
     if plan.pk.is_empty() {
+        let what = match plan.continued_key {
+            true => {
+                "loads by append (each run carries only the keys past the last one)".to_string()
+            }
+            false => format!("is mode: {mode}"),
+        };
+        let why = match plan.load.pk {
+            load::plan::KeyColumns::None => {
+                "its `load:` block sets `pk: none`, so name the key there instead (e.g. `pk: [id]`)"
+            }
+            _ => {
+                "`rivet run` recorded none (a `query:` export, or a table without one), so \
+                 declare it in the export's `load:` block (e.g. `pk: [id]`)"
+            }
+        };
         anyhow::bail!(
-            "export `{}` is mode: {mode} but has no primary key for the current-state dedup \
-             view — `rivet run` recorded none (a `query:` export, or a table without one), so \
-             declare it in the export's `load:` block (e.g. `pk: [id]`)",
+            "export `{}` {what} but has no primary key for the current-state dedup view — {why}",
             plan.export_name
         );
     }
@@ -1786,12 +1799,6 @@ fn split_runs(runs: &[(String, crate::manifest::RunManifest)]) -> SplitRuns {
     out
 }
 
-/// Load a single export's INCREMENTAL runs. A run that re-read the whole table (the
-/// first run, or one after `state reset`) lands as `<table>` exactly like a full load;
-/// a delta APPENDs into `<table>__changes` — turning a `<table>` table into the log
-/// first — behind a current-state view deduped to the latest row per PK by the
-/// export's `cursor_column`. Ledger-driven exactly like CDC — only the not-yet-loaded
-/// runs are loaded, so re-loads don't double and `cleanup_source` is safe.
 /// Why a continued-key export's table, last loaded (newest-first `loads`) as an overwrite, may lack rows; `None` otherwise.
 fn overwritten_delta_warning(
     continued_key: bool,
@@ -1816,6 +1823,12 @@ fn overwritten_delta_warning(
     })
 }
 
+/// Load a single export's INCREMENTAL runs. A run that re-read the whole table (the
+/// first run, or one after `state reset`) lands as `<table>` exactly like a full load;
+/// a delta APPENDs into `<table>__changes` — turning a `<table>` table into the log
+/// first — behind a current-state view deduped to the latest row per PK by the
+/// export's `cursor_column`. Ledger-driven exactly like CDC — only the not-yet-loaded
+/// runs are loaded, so re-loads don't double and `cleanup_source` is safe.
 #[allow(clippy::too_many_arguments)]
 fn load_one_incremental(
     plan: &load::plan::LoadPlan,
@@ -1844,9 +1857,16 @@ fn load_one_incremental(
         store: load::open_store(&plan.destination)?,
     };
     let fqtn = job.loader.fqtn(&plan.table);
-    let loads = state
-        .and_then(|s| s.recent_loads(Some(&fqtn), 50).ok())
-        .unwrap_or_default();
+    let loads = match state.map(|s| s.recent_loads(Some(&fqtn), 50)).transpose() {
+        Ok(rows) => rows.unwrap_or_default(),
+        Err(e) => {
+            log::warn!(
+                "could not read the load ledger for `{fqtn}`, so this load cannot tell whether an \
+                 earlier load overwrote it with only one run's keys: {e:#}"
+            );
+            Vec::new()
+        }
+    };
     if let Some(warning) =
         overwritten_delta_warning(plan.continued_key, &loads, &fqtn, &plan.export_name, config)
     {
@@ -2237,6 +2257,17 @@ mod load_ledger_tests {
                 "the refusal must name the export's OWN mode, not a fixed label: {err}"
             );
         }
+
+        // A continued-key export with an explicit `pk: none` names that setting, not a missing record.
+        let mut keyless = plan.clone();
+        keyless.continued_key = true;
+        keyless.load.pk = load::plan::KeyColumns::None;
+        assert_eq!(
+            require_pk(&keyless, "incremental").unwrap_err().to_string(),
+            "export `c1` loads by append (each run carries only the keys past the last one) but \
+             has no primary key for the current-state dedup view — its `load:` block sets \
+             `pk: none`, so name the key there instead (e.g. `pk: [id]`)"
+        );
     }
 
     /// Round-7 rebuild of the round-6 guard: the SHAPE is prefix-anchored (a
