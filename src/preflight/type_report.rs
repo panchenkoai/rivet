@@ -652,21 +652,33 @@ pub fn report_from_mappings(
 
 /// Print the report as a human-readable table to stdout.
 pub fn print_table(report: &ExportTypeReport, target: Option<ExportTarget>) {
+    print!("{}", render_table(report, target));
+}
+
+/// The report as the human-readable table [`print_table`] prints.
+fn render_table(report: &ExportTypeReport, target: Option<ExportTarget>) -> String {
+    let mut out = String::new();
+    macro_rules! ln {
+        ($($arg:tt)*) => {{
+            out.push_str(&format!($($arg)*));
+            out.push('\n');
+        }};
+    }
     let col_w = col_width(&report.columns, |r| r.column.len());
     let src_w = col_width(&report.columns, |r| r.source_type.len()).max("Source type".len());
     let rv_w = col_width(&report.columns, |r| r.rivet_type.len()).max("Rivet type".len());
     let arr_w = col_width(&report.columns, |r| r.arrow_type.len()).max("Arrow type".len());
     let fid_w = "logical_string".len();
 
-    println!();
+    ln!("");
     if let Some(tgt) = target {
-        println!(
+        ln!(
             "Export: {}  [target: {}]",
             report.display_name(),
             tgt.label()
         );
     } else {
-        println!("Export: {}", report.display_name());
+        ln!("Export: {}", report.display_name());
     }
 
     if target.is_some() {
@@ -679,7 +691,7 @@ pub fn print_table(report: &ExportTypeReport, target: Option<ExportTarget>) {
         .max("Target type".len());
         let sta_w = "Status".len();
 
-        println!(
+        ln!(
             "  {:<col_w$}  {:<src_w$}  {:<rv_w$}  {:<arr_w$}  {:<fid_w$}  {:<tgt_w$}  {:<sta_w$}",
             "Column",
             "Source type",
@@ -689,9 +701,15 @@ pub fn print_table(report: &ExportTypeReport, target: Option<ExportTarget>) {
             "Target type",
             "Status"
         );
-        println!(
+        ln!(
             "  {:-<col_w$}  {:-<src_w$}  {:-<rv_w$}  {:-<arr_w$}  {:-<fid_w$}  {:-<tgt_w$}  {:-<sta_w$}",
-            "", "", "", "", "", "", ""
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            ""
         );
         for row in &report.columns {
             let status_label = row.target_status.as_ref().map(|s| s.label()).unwrap_or("-");
@@ -704,7 +722,7 @@ pub fn print_table(report: &ExportTypeReport, target: Option<ExportTarget>) {
                 Some(TargetStatus::Warn) => " ~",
                 _ => "",
             };
-            println!(
+            ln!(
                 "  {:<col_w$}  {:<src_w$}  {:<rv_w$}  {:<arr_w$}  {}{:<rest$}  {:<tgt_w$}  {}{}",
                 row.column,
                 row.source_type,
@@ -718,29 +736,37 @@ pub fn print_table(report: &ExportTypeReport, target: Option<ExportTarget>) {
                 rest = fid_w - row.fidelity.label().len(),
             );
             if let Some(autoload) = &row.autoload_type {
-                println!("  {:<col_w$}    autoload: {}", "", autoload);
+                ln!("  {:<col_w$}    autoload: {}", "", autoload);
             }
             if let Some(note) = &row.target_note {
-                println!("  {:<col_w$}    note: {}", "", note);
+                ln!("  {:<col_w$}    note: {}", "", note);
             }
             if let Some(cast) = &row.cast_sql {
-                println!("  {:<col_w$}    recover: {}", "", cast);
+                ln!("  {:<col_w$}    recover: {}", "", cast);
             }
             for w in &row.warnings {
-                println!("  {:<col_w$}    warning: {}", "", w);
+                ln!("  {:<col_w$}    warning: {}", "", w);
             }
         }
     } else {
-        println!(
+        ln!(
             "  {:<col_w$}  {:<src_w$}  {:<rv_w$}  {:<arr_w$}  {:<fid_w$}",
-            "Column", "Source type", "Rivet type", "Arrow type", "Fidelity"
+            "Column",
+            "Source type",
+            "Rivet type",
+            "Arrow type",
+            "Fidelity"
         );
-        println!(
+        ln!(
             "  {:-<col_w$}  {:-<src_w$}  {:-<rv_w$}  {:-<arr_w$}  {:-<fid_w$}",
-            "", "", "", "", ""
+            "",
+            "",
+            "",
+            "",
+            ""
         );
         for row in &report.columns {
-            println!(
+            ln!(
                 "  {:<col_w$}  {:<src_w$}  {:<rv_w$}  {:<arr_w$}  {}{}",
                 row.column,
                 row.source_type,
@@ -750,30 +776,31 @@ pub fn print_table(report: &ExportTypeReport, target: Option<ExportTarget>) {
                 fidelity_marker(row.fidelity),
             );
             for w in &row.warnings {
-                println!("  {:<col_w$}    warning: {}", "", w);
+                ln!("  {:<col_w$}    warning: {}", "", w);
             }
         }
     }
 
     if !report.violations.is_empty() {
-        println!();
+        ln!("");
         for v in &report.violations {
             let prefix = if v.fatal { "  FAIL" } else { "  WARN" };
-            println!("{}: {}", prefix, v.message);
+            ln!("{}: {}", prefix, v.message);
         }
     }
 
     if let Some(sql) = &report.recovery_sql {
-        println!();
-        println!(
+        ln!("");
+        ln!(
             "  {} type recovery — bare autoload degrades JSON/UUID→BYTES, naive",
             target.map(|t| t.label()).unwrap_or("target")
         );
-        println!("  timestamp→TIMESTAMP, array→RECORD; load with --autodetect then run:");
+        ln!("  timestamp→TIMESTAMP, array→RECORD; load with --autodetect then run:");
         for line in sql.lines() {
-            println!("    {line}");
+            ln!("    {line}");
         }
     }
+    out
 }
 
 fn col_width(rows: &[TypeReportRow], f: impl Fn(&TypeReportRow) -> usize) -> usize {
@@ -1394,6 +1421,50 @@ exports:
             cast_sql: None,
         };
         assert_eq!(col_width(&[row], |r| r.column.len()), 8);
+    }
+
+    /// With a target, the table shows each column's typed target type, its autoload and its recovery cast.
+    #[test]
+    fn the_target_table_renders_the_typed_target_and_autoload() {
+        use crate::types::target::BqType;
+        let row = TypeReportRow {
+            column: "payload".into(),
+            source_type: "jsonb".into(),
+            rivet_type: "json".into(),
+            arrow_type: "Utf8".into(),
+            fidelity: TypeFidelity::Exact,
+            warnings: vec![],
+            target_type: Some(BqType::Json.into()),
+            target_status: Some(TargetStatus::Warn),
+            target_note: None,
+            autoload_type: Some(BqType::Bytes.into()),
+            cast_sql: Some("PARSE_JSON(SAFE_CONVERT_BYTES_TO_STRING(payload))".into()),
+        };
+        let report = ExportTypeReport {
+            export: "e".into(),
+            table: None,
+            columns: vec![row],
+            violations: vec![PolicyViolation {
+                column_name: "payload".into(),
+                fidelity: TypeFidelity::Lossy,
+                message: "payload is lossy".into(),
+                fatal: false,
+            }],
+            target_failures: false,
+            recovery_sql: None,
+        };
+        let text = render_table(&report, Some(ExportTarget::BigQuery));
+        assert!(text.ends_with("\n  WARN: payload is lossy\n"), "{text}");
+        assert!(text.contains("Export: e  [target: bigquery]"), "{text}");
+        assert!(
+            text.contains("  exact           JSON         warn ~"),
+            "{text}"
+        );
+        assert!(text.contains("    autoload: BYTES"), "{text}");
+        assert!(
+            text.contains("    recover: PARSE_JSON(SAFE_CONVERT_BYTES_TO_STRING(payload))"),
+            "{text}"
+        );
     }
 
     #[test]

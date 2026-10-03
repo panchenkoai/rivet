@@ -741,16 +741,16 @@ impl TargetLoader for BigQueryLoader {
         // A time key's column type decides whether the probe's `DATE()` is pinned to
         // UTC; `TIMESTAMP` when the specs do not name the column.
         let time_type = matches!(key, Some(PartitionKey::Time { .. })).then(|| {
-            part_col
-                .and_then(|c| specs.iter().find(|s| s.column_name == c))
-                .map_or(&TargetType::BigQuery(BqType::Timestamp), |s| &s.target_type)
+            part_col.map_or(BqType::Timestamp.into(), |c| {
+                crate::load::cdc::column_type_of(specs, c)
+            })
         });
         let probe = compact_probe_sql(
             &changes_fqtn,
             &base,
             pk,
             part_col,
-            time_type,
+            time_type.as_ref(),
             crate::load::cdc::trusts_buffer_days(&order),
         );
         let row = self

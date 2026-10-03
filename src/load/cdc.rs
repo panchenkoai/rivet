@@ -437,7 +437,7 @@ fn date_of(col_sql: &str, target_type: &TargetType) -> String {
 
 /// The partition column's warehouse type, `TIMESTAMP` when the specs do not name it —
 /// the conservative reading, since only that one carries a zone.
-fn column_type_of(specs: &[TargetColumnSpec], col: &str) -> TargetType {
+pub(crate) fn column_type_of(specs: &[TargetColumnSpec], col: &str) -> TargetType {
     specs
         .iter()
         .find(|s| s.column_name == col)
