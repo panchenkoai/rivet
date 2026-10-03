@@ -449,16 +449,7 @@ fn soak_spill_mysql() {
     let rig = Rig::mysql_cdc(&tbl).census_oracle();
     // Anchor BEFORE any data, so the stream starts here and every cycle is captured.
     // MySQL has no server-side anchor: its checkpoint is client-side coordinates.
-    let row: mysql::Row = c
-        .query_first("SHOW MASTER STATUS")
-        .expect("show master status")
-        .expect("binlog enabled");
-    let (file, pos): (String, u64) = (row.get(0).unwrap(), row.get(1).unwrap());
-    std::fs::write(
-        rig.checkpoint(),
-        format!(r#"{{"file":"{file}","pos":{pos}}}"#),
-    )
-    .unwrap();
+    rig.pin_binlog_here();
 
     let mut seeded = 0usize;
     for cycle in 1..=cycles {
