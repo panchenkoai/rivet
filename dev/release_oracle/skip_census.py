@@ -5,11 +5,21 @@ declares it lacks (`--lacking NAME`, matched against the reason); any other skip
 was to run and did not.
 
     python3 -m dev.release_oracle.skip_census target/rivet-skips.log --lacking BIGQUERY_TEST_PROJECT
+
+`--verdicts LOG --lane ci|gate` grades the rig oracle's verdict log (`RIVET-ORACLE-<VERDICT> <test>
+[<export>] — <detail>`, tests/common/verify.rs) instead: a passing test's stderr is hidden, so the
+log is the only proof the oracle ran. Each count of runs the oracle did not fully grade must land
+within its noise of the lane's ceiling, both ways: over it is a run the oracle used to grade and no
+longer does; under it is a closed gap, and the ceiling comes down in the same PR.
+
+    python3 -m dev.release_oracle.skip_census --verdicts target/rivet-oracle.log --lane ci
 """
 from __future__ import annotations
 
 import argparse
+import re
 import sys
+from collections import Counter
 import tempfile
 from pathlib import Path
 
@@ -20,6 +30,94 @@ def unexplained(skips: dict[str, str], lacking: list[str]) -> dict[str, str]:
     """The skips neither `SKIP_ALLOWED` nor a `lacking` prerequisite named in the reason explains."""
     return {t: why for t, why in skips.items()
             if t not in SKIP_ALLOWED and not any(l in why for l in lacking)}
+
+
+#: A CDC stream's first run is SKIP when it delivered nothing and PARTIAL when it delivered some (timing decides), so one ceiling counts both.
+FIRST_RUN = {"SKIP": "the stream's first run delivered nothing", "PARTIAL": "the stream's first graded run"}
+
+#: Per lane, per counter: (ceiling, noise). Noise is what rivet's clock moves between runs of one commit (the
+#: `cdc.backfill` SKIPs, `settle:` PARTIALs). The gate runs every live module (CI skips the warehouse, Mongo and
+#: exclusive ones), so only the first-run counter transfers to it. Measured on #433 (CI run 37108478817):
+#: first-run 61, all MySQL checkpoints a test wrote itself; with Rig::pin_binlog_here recording their anchor: 0.
+VERDICT_CEILINGS: dict[str, dict[str, tuple[int, int]]] = {
+    "ci": {
+        "first-run": (0,  # ratchet-pin: rig-oracle-first-run
+                      0),
+        "skip": (49,  # ratchet-pin: rig-oracle-skip
+                 3),
+        "partial": (39,  # ratchet-pin: rig-oracle-partial
+                    3),
+    },
+    "gate": {"first-run": (0,  # ratchet-pin: rig-oracle-first-run-gate
+                           0)},
+}
+
+
+def verdict_counts(text: str) -> Counter:
+    """Verdict lines per class, plus `first-run` and the SKIP/PARTIAL counts besides it (`skip`, `partial`)."""
+    lines = [l for l in text.splitlines() if l.startswith("RIVET-ORACLE-")]
+    n: Counter = Counter(re.match(r"RIVET-ORACLE-([A-Z]+) ", l).group(1) for l in lines if re.match(r"RIVET-ORACLE-[A-Z]+ ", l))
+    first = {v: sum(1 for l in lines if l.startswith(f"RIVET-ORACLE-{v} ") and why in l) for v, why in FIRST_RUN.items()}
+    n["first-run"] = sum(first.values())
+    n["skip"], n["partial"] = n["SKIP"] - first["SKIP"], n["PARTIAL"] - first["PARTIAL"]
+    return n
+
+
+def verdict_reasons(text: str) -> Counter:
+    """SKIP/PARTIAL/OFF lines per reason, numbers folded to N."""
+    out: Counter = Counter()
+    for l in text.splitlines():
+        m = re.match(r"RIVET-ORACLE-(SKIP|PARTIAL|OFF) [^—]*— (.*)", l)
+        if m:
+            why = re.sub(r" \{.*$", "", re.sub(r"grade(-load)? \d+ ms: ?", "", m.group(2)))
+            out[f"{m.group(1)} {re.sub(r'[0-9]+', 'N', why)}"] += 1
+    return out
+
+
+def verdict_errors(text: str, lane: str) -> list[str]:
+    """What is wrong with a lane's verdict log: no verdict, no PASS, or a counter outside its band."""
+    if not text.strip():
+        return ["no rig oracle verdict was logged - the oracle did not run"]
+    n = verdict_counts(text)
+    if not n["PASS"]:
+        return ["the rig oracle logged no PASS verdict"]
+    errs = []
+    for what, (ceiling, noise) in VERDICT_CEILINGS[lane].items():
+        if n[what] > ceiling + noise:
+            errs.append(f"{n[what]} {what} verdicts, ceiling {ceiling}: a run the oracle used to grade is no longer graded")
+        elif n[what] < ceiling - noise:
+            errs.append(f"{n[what]} {what} verdicts, ceiling {ceiling}: a gap closed - lower {lane}/{what} to {n[what]} "
+                        "in VERDICT_CEILINGS so a later regression cannot spend the headroom")
+    return errs
+
+
+def verdict_report(text: str, lane: str) -> list[str]:
+    """The counts a lane's census prints: per class, per reason, and each banded counter against its ceiling."""
+    n = verdict_counts(text)
+    out = [f"{v} {n[v]}" for v in ("PASS", "PARTIAL", "XFAIL", "SKIP", "OFF", "FAIL")]
+    out += ["per reason (numbers folded to N):"] + [f"{c:7d} {r}" for r, c in verdict_reasons(text).most_common()]
+    out += [f"{what}: {n[what]} (ceiling {c} +-{z})" for what, (c, z) in VERDICT_CEILINGS[lane].items()]
+    return out
+
+
+def verify_oracle_verdict_census(led, log: Path | None = None) -> None:
+    """Gate cell: the rig oracle graded the live modules this gate ran, and its ungraded first CDC runs stay within the gate's ceilings."""
+    import os
+
+    log = log or Path(os.environ.get("RIVET_ORACLE_LOG", ""))
+    led.phase(f"Rig oracle verdict census · {log}")
+    text = log.read_text() if log.is_file() else ""
+    for line in verdict_report(text, "gate"):
+        print(f"  {line}")
+    errs = verdict_errors(text, "gate")
+    for e in errs:
+        led.failed("all", "-", "oracle-verdict-census", "-", f"rig oracle verdict census: {e} ({log})", "census")
+    if not errs:
+        n = verdict_counts(text)
+        led.passed("all", "-", "oracle-verdict-census", "-",
+                   f"rig oracle verdict census: first CDC runs ungraded {n['first-run']} (ceiling "
+                   f"{VERDICT_CEILINGS['gate']['first-run'][0]}), PASS {n['PASS']}, SKIP {n['SKIP']}, "
+                   f"PARTIAL {n['PARTIAL']}, OFF {n['OFF']}", "census")
 
 
 def _lacking(raw: list[str]) -> list[str]:
@@ -42,7 +140,43 @@ def _self_test() -> int:
     assert unexplained(skips, _lacking(["BIGQUERY_TEST_PROJECT\n\npgbouncer-state (:6433)\n"])) == {}
     assert unexplained(self_skipped(log.with_name("absent")), []) == {}, "no log is no skip"
     print("self-test ok: a self-skip is explained by SKIP_ALLOWED or a named lacking prerequisite, never silently")
+    _verdict_self_test()
     return 0
+
+
+def at_ceiling(lane: str) -> str:
+    """A verdict log whose every banded counter of `lane` sits exactly at its ceiling."""
+    c = {k: v[0] for k, v in VERDICT_CEILINGS[lane].items()}
+    lines = ["RIVET-ORACLE-PASS live_x::a [e] — grade 12 ms: ok"]
+    lines += [f"RIVET-ORACLE-PARTIAL live_x::f{i} [e] — grade 3 ms: {FIRST_RUN['PARTIAL']} (no source image)" for i in range(c["first-run"])]
+    lines += [f"RIVET-ORACLE-SKIP live_x::s{i} [e] — stdout destination" for i in range(c.get("skip", 0))]
+    lines += [f"RIVET-ORACLE-PARTIAL live_x::p{i} [e] — settle: rows past cursor_high" for i in range(c.get("partial", 0))]
+    return "\n".join(lines) + "\n"
+
+
+def _verdict_self_test() -> None:
+    """RED-provable: one ungraded first CDC run more than the ceiling fails every lane; so does an empty log."""
+    extra = f"RIVET-ORACLE-SKIP live_x::new [e] — grade 1 ms: {FIRST_RUN['SKIP']}, and no earlier source image\n"
+    for lane in VERDICT_CEILINGS:
+        log = at_ceiling(lane)
+        assert verdict_errors(log, lane) == [], (lane, verdict_errors(log, lane))
+        noise = VERDICT_CEILINGS[lane]["first-run"][1]
+        errs = verdict_errors(log + extra * (noise + 1), lane)
+        assert len(errs) == 1 and "first-run" in errs[0] and "no longer graded" in errs[0], (lane, errs)
+        assert verdict_errors("", lane) and verdict_errors(log.replace("PASS", "OFF"), lane)
+    n = verdict_counts(at_ceiling("ci") + "RIVET-ORACLE-SKIP t [e] — " + FIRST_RUN["SKIP"] + "\n")
+    ci = {k: v[0] for k, v in VERDICT_CEILINGS["ci"].items()}
+    assert (n["first-run"], n["skip"], n["partial"]) == (ci["first-run"] + 1, ci["skip"], ci["partial"]), n
+    assert verdict_reasons("RIVET-ORACLE-OFF t [e] — grade-load 41 ms: why 7 {x: 1}") == Counter({"OFF why N": 1})
+    from .core import Ledger, Status
+
+    log = Path(tempfile.mkdtemp(prefix="rivet-verdict-census-")) / "oracle.log"
+    for body, want in ((at_ceiling("gate"), Status.PASS), (at_ceiling("gate") + extra, Status.FAIL)):
+        log.write_text(body)
+        led = Ledger(colour=False)
+        verify_oracle_verdict_census(led, log)
+        assert [c.status for c in led.cells] == [want], [(c.status, c.detail) for c in led.cells]
+    print("self-test ok: the oracle verdict census fails one ungraded first CDC run past its ceiling, and an empty log")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -50,10 +184,19 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("log", nargs="?", type=Path, help="the RIVET_SKIP_LOG file (default target/rivet-skips.log)")
     ap.add_argument("--lacking", action="append", default=[],
                     help="a prerequisite this lane does not provide; a skip whose reason names it is explained")
+    ap.add_argument("--verdicts", type=Path, help="grade this rig oracle verdict log instead of a skip log")
+    ap.add_argument("--lane", choices=sorted(VERDICT_CEILINGS), default="ci", help="whose ceilings --verdicts reads")
     ap.add_argument("--self-test", action="store_true")
     ns = ap.parse_args(argv)
     if ns.self_test:
         return _self_test()
+    if ns.verdicts:
+        text = ns.verdicts.read_text() if ns.verdicts.exists() else ""
+        print("\n".join(verdict_report(text, ns.lane)))
+        errs = verdict_errors(text, ns.lane)
+        for e in errs:
+            print(f"::error::{e} ({ns.verdicts})", file=sys.stderr)
+        return 1 if errs else 0
     log = ns.log or Path("target/rivet-skips.log")
     skips = self_skipped(log)
     for t, why in sorted(skips.items()):

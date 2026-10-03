@@ -66,6 +66,11 @@ const GATES: &[(&str, &str, &str)] = &[
         "Self-skip census",
         "python3 -m dev.release_oracle.skip_census target/rivet-skips.log --lacking \"$LACKING\"",
     ),
+    (
+        "e2e",
+        "Rig oracle verdict census",
+        "python3 -m dev.release_oracle.skip_census --verdicts target/rivet-oracle.log --lane ci",
+    ),
 ];
 
 fn steps_of(ci: &serde_yaml_ng::Value, job: &str) -> Vec<serde_yaml_ng::Value> {

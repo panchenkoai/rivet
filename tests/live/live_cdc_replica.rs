@@ -116,12 +116,12 @@ fn cdc_reads_changes_from_a_replica() {
 
     // Checkpoint at the replica's own binlog position (rivet resumes the REPLICA's
     // binlog, not the primary's).
-    let mut rr = conn(REPLICA_ROOT);
-    let row: mysql::Row = rr.query_first("SHOW MASTER STATUS").unwrap().unwrap();
-    let (file, pos): (String, u64) = (row.get(0).unwrap(), row.get(1).unwrap());
     let d = tempfile::tempdir().unwrap();
     let ckpt = d.path().join("ckpt");
-    std::fs::write(&ckpt, format!(r#"{{"file":"{file}","pos":{pos}}}"#)).unwrap();
+    Rig::mysql_cdc(&table)
+        .source_url(REPLICA_RIVET)
+        .checkpoint_path(ckpt.clone())
+        .pin_binlog_here();
 
     // Apply changes on the PRIMARY; they replicate into the replica's binlog.
     let mut expected: HashMap<u32, i32> = HashMap::new();

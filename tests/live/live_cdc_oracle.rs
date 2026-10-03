@@ -32,9 +32,9 @@ fn cdc_types_round_trip_through_duckdb_and_clickhouse() {
     // Checkpoint, then one fully-typed row.
     let d = tempfile::tempdir().unwrap();
     let ckpt = d.path().join("ckpt");
-    let row: mysql::Row = c.query_first("SHOW MASTER STATUS").unwrap().unwrap();
-    let (file, pos): (String, u64) = (row.get(0).unwrap(), row.get(1).unwrap());
-    std::fs::write(&ckpt, format!(r#"{{"file":"{file}","pos":{pos}}}"#)).unwrap();
+    Rig::mysql_cdc(table)
+        .checkpoint_path(ckpt.clone())
+        .pin_binlog_here();
     c.query_drop(format!(
         r#"INSERT INTO {table} VALUES (1, 12.34, 9000000000, '{{"k":1}}')"#
     ))
@@ -168,9 +168,9 @@ fn cdc_full_surface_cross_oracle_matches_literals() {
 
     let d = tempfile::tempdir().unwrap();
     let ckpt = d.path().join("ckpt");
-    let row: mysql::Row = c.query_first("SHOW MASTER STATUS").unwrap().unwrap();
-    let (file, pos): (String, u64) = (row.get(0).unwrap(), row.get(1).unwrap());
-    std::fs::write(&ckpt, format!(r#"{{"file":"{file}","pos":{pos}}}"#)).unwrap();
+    Rig::mysql_cdc(table)
+        .checkpoint_path(ckpt.clone())
+        .pin_binlog_here();
 
     // Golden rows — every literal below derives from these three lines.
     c.query_drop(format!(
