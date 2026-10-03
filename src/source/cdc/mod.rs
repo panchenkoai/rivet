@@ -213,6 +213,10 @@ pub(crate) struct ChangeEvent {
     /// of bailing; the sink raises it iff the event matches a captured table (the
     /// single routing authority), and drops it silently otherwise. `None` = clean.
     pub(crate) poison: Option<String>,
+    /// The changed row's identity within its transaction (Oracle's ROWID where stable); `None` elsewhere.
+    pub(crate) row_id: Option<String>,
+    /// Names of `before`'s cells when they are not `image_names` (PostgreSQL's key-only pre-image).
+    pub(crate) before_names: Option<std::sync::Arc<[String]>>,
 }
 
 /// Stamps each change with its intra-transaction ordinal ([`ChangeEvent::seq`]).
@@ -523,6 +527,41 @@ pub(crate) trait ChangeStream {
 ///
 /// (The typed Parquet/CSV sink is the separate [`sink::run_to_files`] driver —
 /// ADR-0023 keeps the two loops apart on purpose.)
+/// The first declared key column the table does not have, matched as images match names.
+pub(crate) fn undeclared_key_column<'k>(
+    key: &'k [String],
+    columns: &[crate::types::TypeMapping],
+) -> Option<&'k str> {
+    key.iter()
+        .find(|k| {
+            !columns
+                .iter()
+                .any(|c| c.column_name == **k || c.column_name.eq_ignore_ascii_case(k))
+        })
+        .map(String::as_str)
+}
+
+/// One `rivet cdc` stdout line: the change as the engine delivered it, never split.
+pub(crate) fn ndjson_line(ev: &ChangeEvent) -> serde_json::Value {
+    let to_json = |img: &Option<Vec<RivetValue>>| {
+        img.as_ref()
+            .map(|vs| vs.iter().map(RivetValue::to_json).collect::<Vec<_>>())
+    };
+    let mut line = serde_json::json!({
+        "op": ev.op.as_str(),
+        "schema": ev.schema,
+        "table": ev.table,
+        "before": to_json(&ev.before),
+        "after": to_json(&ev.after),
+        "pos": ev.position.0,
+        "seq": ev.seq,
+    });
+    if let Some(names) = &ev.before_names {
+        line["before_columns"] = serde_json::json!(names.as_ref());
+    }
+    line
+}
+
 pub(crate) fn run(
     stream: &mut dyn ChangeStream,
     checkpoint: Option<PathBuf>,
@@ -563,20 +602,7 @@ pub(crate) fn run(
         // `unchanged-toast-datum` sentinel verbatim as the column value (silent
         // corruption). An uncaptured table's poison was already dropped above.
         ev.raise_poison()?;
-        let to_json = |img: &Option<Vec<RivetValue>>| {
-            img.as_ref()
-                .map(|vs| vs.iter().map(RivetValue::to_json).collect::<Vec<_>>())
-        };
-        let line = serde_json::json!({
-            "op": ev.op.as_str(),
-            "schema": ev.schema,
-            "table": ev.table,
-            "before": to_json(&ev.before),
-            "after": to_json(&ev.after),
-            "pos": ev.position.0,
-            "seq": ev.seq,
-        });
-        println!("{line}");
+        println!("{}", ndjson_line(&ev));
         emitted += 1;
         // Checkpoint AFTER emitting the captured event — never before. A crash in
         // the window between the checkpoint save and the emit would advance the
@@ -1643,6 +1669,8 @@ pub(crate) struct CaptureOutput<'a> {
     pub partition: Option<crate::plan::rollover::PartitionRollover>,
     /// The partition key a change must not move (base-and-buffer layout only).
     pub partition_guard: Option<partition_guard::PartitionGuard>,
+    /// The load's declared merge key; `None` reads the table's primary key at open.
+    pub key: Option<Vec<String>>,
 }
 
 /// Everything needed to capture a change stream to typed files, assembled once —
@@ -1767,6 +1795,27 @@ pub(crate) fn run_capture(
         {
             return (Vec::new(), Err(e));
         }
+        let key = match o.key {
+            Some(k) => match undeclared_key_column(&k, &columns) {
+                Some(missing) => {
+                    return (
+                        Vec::new(),
+                        Err(anyhow::anyhow!(
+                            "export '{}' table '{}': `load.pk` names `{missing}`, which the table \
+                             does not have, so rivet cannot tell an UPDATE that changes the key \
+                             from one that does not. Fix `pk:` in the `load:` block.",
+                            cap.export_name,
+                            o.table
+                        )),
+                    );
+                }
+                None => k,
+            },
+            None => match resolver.source().primary_key(&probe) {
+                Ok(k) => k.unwrap_or_default(),
+                Err(e) => return (Vec::new(), Err(e)),
+            },
+        };
         if let Some(w) =
             sink::unbudgetable_partition_warning(&o.table, o.partition.as_ref(), &columns)
         {
@@ -1780,6 +1829,7 @@ pub(crate) fn run_capture(
             row_hash: o.row_hash,
             partition: o.partition,
             partition_guard: o.partition_guard,
+            key,
             overridden: o.overrides.keys().cloned().collect(),
         });
     }
@@ -2092,6 +2142,8 @@ mod mod_decisions {
             image_names: None,
             seq: 999, // a value the stamp must OVERWRITE, so `-> ()` cannot pass
             poison: None,
+            row_id: None,
+            before_names: None,
         };
         let mut seq = TxnSeq::default();
 
@@ -2136,6 +2188,8 @@ mod mod_decisions {
             image_names: None,
             seq: 0,
             poison: None,
+            row_id: None,
+            before_names: None,
         };
         let empty = mk(None, None).estimated_bytes();
         // The FIXED cost of a buffered change: the struct in the queue's backing
@@ -2573,6 +2627,8 @@ mod tests {
             image_names: None,
             seq: 0,
             poison: None,
+            row_id: None,
+            before_names: None,
         };
         // tx1 = 1,2,3 (boundary at 3) and tx2 = 4,5,6 (boundary at 6). The cap is
         // 2, so it lands INSIDE tx1 — the shape with no boundary to stop at.
@@ -2902,6 +2958,8 @@ mod tests {
             image_names: None,
             seq: 0,
             poison: None,
+            row_id: None,
+            before_names: None,
         }
     }
 
@@ -3004,6 +3062,8 @@ mod tests {
                 "pg cdc: public.orders: column [big] unchanged-TOAST — REPLICA IDENTITY FULL"
                     .into(),
             ),
+            row_id: None,
+            before_names: None,
         }
     }
 
@@ -3019,6 +3079,67 @@ mod tests {
             format!("{err:#}").contains("REPLICA IDENTITY FULL"),
             "got: {err:#}"
         );
+    }
+
+    /// A declared key column is found by exact or case-folded name; the first missing one is named.
+    #[test]
+    fn an_undeclared_key_column_is_named_and_a_case_folded_one_is_found() {
+        let cols: Vec<crate::types::TypeMapping> = ["ID", "code"]
+            .iter()
+            .map(|n| crate::types::TypeMapping {
+                column_name: n.to_string(),
+                source_native_type: "bigint".into(),
+                rivet_type: crate::types::RivetType::Int64,
+                arrow_type: None,
+                fidelity: crate::types::TypeFidelity::Exact,
+                nullable: true,
+                warnings: vec![],
+                delivery: crate::types::Delivery::Native,
+            })
+            .collect();
+        let k = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            super::undeclared_key_column(&k(&["id", "code"]), &cols),
+            None
+        );
+        assert_eq!(super::undeclared_key_column(&k(&[]), &cols), None);
+        assert_eq!(
+            super::undeclared_key_column(&k(&["code", "sku", "x"]), &cols),
+            Some("sku")
+        );
+    }
+
+    /// A key-only pre-image prints as carried, named by `before_columns`; a key move stays one update.
+    #[test]
+    fn an_ndjson_line_names_a_key_only_pre_image_and_does_not_split() {
+        let ev = super::ChangeEvent {
+            op: super::ChangeOp::Update,
+            schema: "public".into(),
+            table: "t".into(),
+            before: Some(vec![RivetValue::Int(1)]),
+            after: Some(vec![RivetValue::Bytes(b"a".to_vec()), RivetValue::Int(2)]),
+            position: Position(serde_json::json!({ "lsn": "0/ABC" })),
+            committed: true,
+            image_names: Some(vec!["v".to_string(), "id".to_string()].into()),
+            seq: 0,
+            poison: None,
+            row_id: None,
+            before_names: Some(vec!["id".to_string()].into()),
+        };
+        assert_eq!(
+            super::ndjson_line(&ev),
+            serde_json::json!({
+                "op": "update", "schema": "public", "table": "t",
+                "before": [1], "before_columns": ["id"], "after": ["a", 2],
+                "pos": { "lsn": "0/ABC" }, "seq": 0,
+            })
+        );
+        let full = super::ChangeEvent {
+            before_names: None,
+            before: Some(vec![RivetValue::Bytes(b"a".to_vec()), RivetValue::Int(1)]),
+            ..ev
+        };
+        assert!(super::ndjson_line(&full).get("before_columns").is_none());
     }
 
     // An UNCAPTURED table's poison must be dropped (parallel-slot contamination
@@ -3074,6 +3195,8 @@ mod tests {
             image_names: None,
             seq: 0,
             poison: None,
+            row_id: None,
+            before_names: None,
         };
         let payload = ev.payload_bytes();
         assert_eq!(

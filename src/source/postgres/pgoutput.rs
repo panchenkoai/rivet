@@ -714,6 +714,8 @@ impl Assembler {
                     image_names: rel.map(|x| x.names.clone()),
                     seq: 0, // stamped by TxnSeq as the stream is consumed
                     poison: None,
+                    row_id: None,
+                    before_names: None,
                 }
             })
             .collect()

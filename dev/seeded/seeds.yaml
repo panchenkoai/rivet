@@ -80,20 +80,69 @@ seeds:
 
   - name: pk-move-without-delete
     class: a primary-key-changing UPDATE reaches the destination without the delete of the old key
-    history: ADR-0030; the split that once emitted delete+insert on PostgreSQL was reverted for shipping corruption
+    history: ADR-0030; the first PostgreSQL split was reverted for writing the old key under the wrong names, and every latest-image-per-key merge kept the old key live beside the new one until the split moved into the shared sink (split_move)
     scope: source
     engines:
+      postgres:
+        patch: pk-move-without-delete/postgres.patch
+        cells:
+          - pg_cdc_pk_changing_update_captures_and_does_not_brick
+          - a_postgres_cdc_stream_loads_into_clickhouse_and_the_view_matches_the_source
+          - a_key_move_leaves_one_live_row_per_key_in_a_partitioned_base_postgres
+      mysql:
+        patch: pk-move-without-delete/mysql.patch
+        cells:
+          - mysql_cdc_a_composite_key_move_is_a_delete_then_an_insert
+          - a_mysql_cdc_stream_loads_into_clickhouse_and_the_view_matches_the_source
+          - a_key_move_leaves_one_live_row_per_key_in_a_partitioned_base_mysql
       mssql:
         patch: pk-move-without-delete/mssql.patch
-        cells: [a_sql_server_primary_key_move_flags_the_old_key_deleted_in_clickhouse]
-      postgres:
-        na: not fixed, so nothing to re-introduce - update(new) with no delete of the old key IS the shipped behaviour (ADR-0030 proposed; pg_cdc_pk_changing_update_captures_and_does_not_brick carries it as a known defect)
-      mysql:
-        na: not fixed, so nothing to re-introduce - same ADR-0030 limitation as PostgreSQL, and no live test exercises a PK move on MySQL at all
+        cells:
+          - a_sql_server_primary_key_move_flags_the_old_key_deleted_in_clickhouse
+          - a_sql_server_cdc_stream_loads_into_clickhouse_and_the_view_matches_the_source
       oracle:
-        na: not fixed, so nothing to re-introduce - LogMiner reports a PK move as one UPDATE and the adapter emits update(new) (ADR-0030); no live test exercises it
+        patch: pk-move-without-delete/oracle.patch
+        cells: [oracle_cdc_a_primary_key_update_is_a_delete_then_an_insert]
       mongo:
         na: _id is immutable, so a key move cannot be expressed
+
+  - name: renumber-equal-images
+    class: a statement that renumbers keys over rows whose images are equal loses a row, because a delete is paired with the wrong moved-in insert
+    history: ADR-0030 amendment 2026-10-03 - with images alone, Oracle `UPDATE t SET id = id + 1` over rows that differ only in the key read as one row moved twice; the LogMiner ROW_ID now pairs them
+    scope: source
+    engines:
+      oracle:
+        patch: renumber-equal-images/oracle.patch
+        cells: [oracle_cdc_a_renumber_over_rows_with_equal_images_keeps_every_row]
+      postgres:
+        na: no row identity reaches the stream (test_decoding carries no ctid), so there is nothing to drop; an immediate key never logs a delete after a row moved into its key, and the DEFERRABLE-key case is the documented limitation
+      mysql:
+        na: the binlog carries no row identity, and an immediate unique check never lets a row move onto a key another row still holds, so the ambiguity cannot arise
+      mssql:
+        na: the change table carries no row identity, so there is nothing to drop; it records a renumber as each key's delete then its insert at one __$seqval (measured 2026-10-03), so no delete follows the row moved into its key
+      mongo:
+        na: _id is immutable, so no statement renumbers keys
+
+  - name: absent-old-cell-read-as-moved-key
+    class: an old image that does not carry a key column is read as if the column changed, so a non-key UPDATE is split into a delete with a NULL key and an insert
+    history: ADR-0030 amendment 2026-10-03 - the first cut padded PostgreSQL's key-only old image with NULL; an UPDATE of a replica identity index `email` became delete (id NULL) + insert
+    scope: source
+    engines:
+      postgres:
+        patch: absent-old-cell-read-as-moved-key/postgres.patch
+        cells:
+          - pg_cdc_an_update_of_a_replica_identity_index_that_is_not_the_key_stays_one_update
+          - pg_cdc_a_declared_key_absent_from_the_old_key_does_not_split
+          - an_update_of_a_replica_identity_index_reaches_the_base_as_one_update_postgres
+      mysql:
+        patch: absent-old-cell-read-as-moved-key/lib.patch
+        cells: ["lib:a_key_moves_only_when_a_key_column_differs_between_full_images"]
+      mssql:
+        na: the change table's update rows carry every captured column in both images, so no key cell is ever absent
+      oracle:
+        na: a change whose redo lacks any captured column's value is refused in `mined` (image_sides), so an Oracle image never has an absent cell
+      mongo:
+        na: _id is immutable, so no UPDATE can change a document's key
 
   - name: empty-page-fails-quality
     class: an empty keyset page / chunk arrives as Schema::empty() and the quality gate reads it as a missing rule column

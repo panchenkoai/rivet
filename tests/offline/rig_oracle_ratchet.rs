@@ -23,7 +23,8 @@ use std::path::{Path, PathBuf};
 /// Oracle opt-outs in tests/live: `.no_oracle(`, `run_rivet_ok_no_oracle(`, the `RIVET_TEST_NO_ORACLE` env by literal or by its `NO_ORACLE_ENV` constant.
 // 17 -> 21 (2026-10-02): live_cdc_source_connections counts source connections, which the oracle's own read would add to.
 // 21 -> 22 (2026-10-03): the PG truncate refusal's resumed run keeps the pre-truncate rows the refusal says only a re-snapshot removes.
-const NO_ORACLE_CEILING: usize = 22;
+// 22 -> 23 (2026-10-03): pg_cdc_a_declared_key_absent_from_the_old_key_does_not_split merges by a declared `load.pk: [code]`; the oracle dedups by the source primary key `id`.
+const NO_ORACLE_CEILING: usize = 23;
 
 /// Rust DuckDB-helper call sites across tests/ (see [`duckdb_helper_names`]).
 // 626 -> 630 (2026-10-01): #378 merged first and added 4 calls in its Mongo null-_id tests.
@@ -157,11 +158,6 @@ const KNOWN_DEFECTS: &[(&str, &str, &str)] = &[
         "roast_pg_cdc_refuses_a_bare_table_name_that_matches_two_relations",
         "delivered-only rows",
         "known defect: a bare-name capture delivers the WAL rows",
-    ),
-    (
-        "pg_cdc_pk_changing_update_captures_and_does_not_brick",
-        "delivered-only rows",
-        "known defect: a PK-changing UPDATE carries no delete",
     ),
     (
         "a_pg_failover_to_the_standby_without_a_checkpoint_loses_the_rows_written_during_the_switch",
