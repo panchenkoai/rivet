@@ -57,6 +57,13 @@ impl StateDb {
         Self { conn }
     }
 
+    /// Delete `export`'s `cdc_snapshot` rows, as an operator clearing that done-signal would; returns how many went.
+    pub fn clear_cdc_snapshot(&self, export: &str) -> usize {
+        self.conn
+            .execute("DELETE FROM cdc_snapshot WHERE export_name = ?1", [export])
+            .expect("delete cdc_snapshot rows")
+    }
+
     /// `run_id` of the most recent `export_metrics` row for `export`.
     pub fn latest_run_id(&self, export: &str) -> String {
         self.conn

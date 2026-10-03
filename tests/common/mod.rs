@@ -165,6 +165,33 @@ pub fn pg_state_url() -> Option<String> {
     }
 }
 
+/// The re-baseline remedy every CDC data-loss message prints, written out by hand (never read from `src/`).
+pub const REBASELINE_REMEDY: &str = "Re-baseline the stream in one run: delete the checkpoint \
+     file if there is one; give the export a baseline (`cdc.initial: snapshot` or `backfill:`) if \
+     it has none, or clear both done-signals of the one it has (its `cdc_snapshot` row in the \
+     state DB and the destination's snapshot/_SUCCESS marker; either one left in place skips the \
+     baseline); and if a warehouse load consumes this stream, truncate its `<table>__changes` \
+     table before the next load. That run anchors FIRST and re-reads the table after, so nothing \
+     falls between the two. A separate `mode: full` export does not re-baseline the stream.";
+
+/// Follow [`REBASELINE_REMEDY`] on a single-table rig, step by step as printed, then run once.
+pub fn follow_rebaseline_remedy(rig: &mut Rig, has_baseline: bool) {
+    let _ = std::fs::remove_file(rig.checkpoint());
+    if has_baseline {
+        let cleared =
+            StateDb::next_to_config(&rig.config_path()).clear_cdc_snapshot(rig.export_name());
+        assert!(
+            cleared > 0,
+            "fixture: the export had no `cdc_snapshot` row to clear"
+        );
+        std::fs::remove_file(rig.out_dir().join("snapshot").join("_SUCCESS"))
+            .expect("fixture: the export had no snapshot/_SUCCESS marker to delete");
+    } else {
+        rig.amend_cdc_line("initial: snapshot");
+    }
+    rig.run_ok();
+}
+
 pub fn unique_name(prefix: &str) -> String {
     let c = NAME_COUNTER.fetch_add(1, Ordering::SeqCst);
     let pid = std::process::id();

@@ -867,9 +867,9 @@ impl MysqlChangeStream {
                  before, it was deleted or the config moved: a RELATIVE \
                  `cdc.checkpoint:` is resolved against the CONFIG FILE's directory, so \
                  the path above is where rivet looked — and the changes since it was \
-                 written are gone from this stream. Re-snapshot (`mode: full`) before \
-                 trusting the result.",
-                path.display()
+                 written are gone from this stream. {}",
+                path.display(),
+                crate::source::cdc::checkpoint_identity::RECOVER
             );
             Self::write_anchor(path, &file, pos, &identity)?;
         }
@@ -1712,9 +1712,8 @@ pub(crate) fn drop_refusal_message(target: Option<&(String, String)>) -> String 
     format!(
         "mysql cdc: captured table {what} was DROPped, and this reader cannot represent that as a \
          change. Skipping it would leave every row it held live in the destination, and a table \
-         re-created under the same name would continue that history as if it were one table. \
-         Recover in rivet's OWN order: re-anchor FIRST (delete the checkpoint so the next run pins \
-         a fresh one), THEN re-snapshot the table (`mode: full`)."
+         re-created under the same name would continue that history as if it were one table. {}",
+        crate::source::cdc::checkpoint_identity::RECOVER
     )
 }
 
@@ -1761,8 +1760,8 @@ pub(crate) fn statement_dml_refusal_message(target: Option<&(String, String)>) -
          session ran with binlog_format=STATEMENT or MIXED), and this reader decodes only row \
          events. Skipping it would drop the change while the checkpoint moves past it. Set \
          binlog_format=ROW for every writer — the global setting does not bind a session that \
-         changes its own — then recover in rivet's OWN order: re-anchor FIRST (delete the \
-         checkpoint so the next run pins a fresh one), THEN re-snapshot the table (`mode: full`)."
+         changes its own — then: {}",
+        crate::source::cdc::checkpoint_identity::RECOVER
     )
 }
 
@@ -1782,11 +1781,8 @@ pub(crate) fn truncate_refusal_message(schema: &str, table: &str) -> String {
          change. Skipping it would leave every row the truncate removed sitting in the \
          destination with no DELETE to retract it — the source empty, the destination \
          not, permanently, because those rows left the source without events and no \
-         later capture can reconcile them. Recover in rivet's OWN order: re-anchor \
-         FIRST (delete the checkpoint so the next run pins a fresh one), THEN \
-         re-snapshot the table (`mode: full`). Snapshotting first leaves everything \
-         changed between the snapshot and the new anchor in neither — a silent gap \
-         as wide as the snapshot takes."
+         later capture can reconcile them. {}",
+        crate::source::cdc::checkpoint_identity::RECOVER
     )
 }
 
@@ -1852,14 +1848,11 @@ pub(crate) fn xa_prepare_refusal_message(schema: &str, table: &str) -> String {
          stamped with someone else's commit. Fabricating a row is worse than failing, \
          so the run stops with the checkpoint unmoved.\n\n\
          This does NOT clear by re-running: the prepare stays in the binlog and every \
-         run from this checkpoint reaches it again. To move past it, recover in \
-         rivet's OWN order — re-anchor FIRST (delete the checkpoint so the next run \
-         pins a fresh one), THEN re-snapshot the table (`mode: full`). Snapshotting \
-         first leaves everything changed between the snapshot and the new anchor in \
-         neither, and re-anchoring alone skips every change since the old position. To avoid it, \
+         run from this checkpoint reaches it again. To move past it: {} To avoid it, \
          do not drive captured tables through an XA transaction manager until rivet \
          frames XA branches by their xid; those tables can be exported with `mode: \
-         full` meanwhile."
+         full` meanwhile.",
+        crate::source::cdc::checkpoint_identity::RECOVER
     )
 }
 
