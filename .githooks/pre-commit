@@ -81,10 +81,10 @@ if [ -n "$staged_list" ]; then
     fi
 fi
 
-# The repository is English-only (code, comments, docs, commit messages): refuse
-# Cyrillic in the lines this commit adds. Test data that needs it carries `allow-cyrillic`.
+# The repository is English-only: refuse Cyrillic in the lines this commit adds.
+# Test data that needs it carries `allow-cyrillic`.
 echo "pre-commit: Cyrillic guard"
-"$(dirname "$0")/no-cyrillic" --staged
+python3 "$(dirname "$0")/../dev/pytools/pr_ready.py" text --staged
 
 echo "pre-commit: cargo fmt --all -- --check"
 cargo fmt --all -- --check

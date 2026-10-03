@@ -26,12 +26,25 @@ agreement.
 ## Before submitting changes
 
 ```bash
-cargo fmt --all -- --check     # formatting
-cargo clippy --all-targets -- -D warnings  # lints (zero warnings policy)
-cargo test --all-targets       # offline tests, no database needed
+make pr-ready                  # what a PR must pass; paste the summary block it prints into the PR body
+make pr-ready ARGS=--fast      # the same without mutation testing (reported NOT RUN, never omitted)
+make live CMD="cargo nextest run --run-ignored only -E 'test(name)'"   # a live run, in a machine-wide slot
 ```
 
-All three checks must pass. CI enforces them on every push and PR.
+`make pr-ready` runs the offline suite, clippy with default features and with
+`--no-default-features --features jemalloc`, `cargo mutants --in-diff` over the
+branch, and the PR rules (`dev/pytools/pr_ready.py`), which the `PR rules`
+workflow enforces on the PR itself:
+
+- commit messages and the PR title/body are English, carry no `Co-Authored-By` /
+  `Claude-Session` trailer, and never put fix/close/resolve before `#N` (write `see #N`);
+- a raised ratchet pin (any line or block marked `ratchet-pin:`) is named in a
+  `## Ratchets raised` section of the PR body; lowering one needs nothing;
+- a change under `src/` adds an entry under `## Unreleased` in CHANGELOG.md, or the
+  PR body says `No user-visible change`.
+
+Live runs (`make test-live`, `make live`, the type matrices, the soak) wait for one of
+`LIVE_SLOTS` (default 2) machine-wide slots; the release gate takes all of them.
 
 To catch the fmt + clippy failures locally *before* committing, enable the
 version-controlled git hooks (once per clone):
@@ -47,6 +60,8 @@ With the hooks enabled:
   regenerates the JSON schema + reference docs and stages them into your commit
   (`git add -u schemas docs`), and runs cargo audit when installed — bypass with
   `git commit --no-verify`.
+- **`commit-msg`** strips attribution trailers and refuses Cyrillic or a closing
+  keyword before `#N` in the message.
 - **`pre-push`** runs the offline test suite (`cargo test --tests` — lib +
   integration, benches excluded) before the push leaves your machine — bypass
   with `git push --no-verify`.

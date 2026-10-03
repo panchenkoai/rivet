@@ -89,6 +89,7 @@ const ENGINE_PRODUCED: &[&str] = &[
 
 /// Local renderers measured 2026-10-01 (`src/source/`-relative `file::fn`). Shrink-only.
 const CEILING: &[(&str, &[&str])] = &[
+    // ratchet-pin: local-renderers strings
     (
         "decimal_plain",
         &[
@@ -131,7 +132,7 @@ const CEILING: &[(&str, &[&str])] = &[
         ],
     ),
     ("bit_string", &[]),
-];
+]; // ratchet-pin: end
 
 /// Shape matches read and classified as NOT a value's delivered text: (form, site, why).
 const NOT_A_VALUE: &[(&str, &str, &str)] = &[
