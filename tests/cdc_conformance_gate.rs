@@ -904,7 +904,8 @@ fn oracle_class_census_is_pinned() {
 // 2026-10-01: +1 independent - compact on a table never loaded, the base's absence read through `bq`.
 // 2026-10-02: +1 independent - the MySQL partition move, its delete+insert read in the buffer and its one row in the base through `bq` (was presence: the refusal).
 // 2026-10-02: +1 independent - the PG refusal under `initial: snapshot`, its slot's absence read from pg_replication_slots.
-const PIN_INDEPENDENT: usize = 104;
+// 2026-10-03: +2 independent - the PG and MySQL crash mid spilled tail cells, the union of both runs read through DuckDB.
+const PIN_INDEPENDENT: usize = 106;
 // 2026-09-28, source connection ceilings: +3 shared codec — the run's captured row is the
 // fixture check; the oracle is the server's own connection counter.
 // 2026-09-29: +2 shared codec — the Oracle TRUNCATE refusal on re-run and the uncaptured-truncate cell.

@@ -3141,6 +3141,138 @@ fn roast_mysql_cdc_large_transaction_is_atomic_across_a_mid_flush_crash() {
     );
 }
 
+/// Rows of the spilled transaction in the two crash-mid-tail tests: over the cap of 4 and past 2× the rollover of 5.
+const SPILL_CRASH_ROWS: i64 = 12;
+
+/// Run 1 spills the transaction's tail and crashes at the first ack; returns its stderr.
+fn crash_with_a_spilled_tail(rig: &Rig) -> String {
+    let crashed = rig.run_with_envs(&[
+        ("RIVET_CDC_MAX_TX_ROWS", "4"),
+        ("RIVET_CDC_SPILL_DIR", "1"),
+        ("RIVET_TEST_PANIC_AT", "cdc_after_ack"),
+    ]);
+    assert!(
+        !crashed.status.success(),
+        "the injected crash must fail run 1"
+    );
+    let log = String::from_utf8_lossy(&crashed.stderr).to_string();
+    assert!(
+        log.contains("passed the in-memory cap") && log.contains(" from disk ("),
+        "the fixture is inert unless run 1 SPILLED and replayed part of the tail \
+         before the crash. stderr: {log}"
+    );
+    log
+}
+
+/// The union of both runs' parts (`ids`, read by DuckDB) must hold the transaction exactly once.
+fn assert_spilled_transaction_whole_once(ids: &[i64]) {
+    let got: std::collections::BTreeSet<i64> = ids.iter().copied().collect();
+    let want: std::collections::BTreeSet<i64> = (0..SPILL_CRASH_ROWS).collect();
+    assert_eq!(
+        got, want,
+        "every row of the spilled transaction must survive the crash — a missing \
+         row means the sink checkpointed and acked past the commit while the rest \
+         of the tail was still in the dead process's spill file"
+    );
+    assert_eq!(
+        ids.len(),
+        SPILL_CRASH_ROWS as usize,
+        "no row may arrive twice across the crash + resume"
+    );
+}
+
+/// A crash while a spilled PostgreSQL transaction is replayed must lose none of it on resume.
+///
+/// One 12-row transaction over a cap of 4 (head in memory, tail on disk) at
+/// rollover 5, crash at the first ack. Framed correctly, the only `committed` row is
+/// the tail's last, so the first ack follows the whole transaction. Marking spilled
+/// rows `committed` lets the sink ack the commit LSN after 5 rows, and the slot then
+/// sits past the rows still on disk.
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn roast_pg_cdc_a_crash_mid_spilled_tail_loses_no_transaction_on_resume() {
+    use postgres::NoTls;
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("cdc_spillcrash_pg");
+    let slot = unique_name("rivet_spillcrash_slot");
+    let _slot = Slot::new(slot.clone());
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"
+    ))
+    .unwrap();
+    let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    c.execute(
+        &format!(
+            "INSERT INTO {tbl} SELECT g, g FROM generate_series(0, {}) g",
+            SPILL_CRASH_ROWS - 1
+        ),
+        &[],
+    )
+    .unwrap();
+
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let rig = Rig::pg_cdc(&tbl, &slot)
+        .cdc("rollover: 5")
+        .dest_path(out.clone());
+    crash_with_a_spilled_tail(&rig);
+    let resumed =
+        rig.run_with_envs(&[("RIVET_CDC_MAX_TX_ROWS", "4"), ("RIVET_CDC_SPILL_DIR", "1")]);
+    assert!(
+        resumed.status.success(),
+        "the resume run must succeed: {}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    assert_spilled_transaction_whole_once(&duckdb_dir_parquet_i64(&out, "id"));
+}
+
+/// A crash while a spilled MySQL transaction is replayed must lose none of it on resume.
+///
+/// The MySQL sibling: the binlog checkpoint is the transaction's commit position on
+/// every row, so a `committed` on a spilled row lets the sink checkpoint that
+/// position after 5 rows, and the resume reads strictly after it.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn roast_mysql_cdc_a_crash_mid_spilled_tail_loses_no_transaction_on_resume() {
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("cdc_spillcrash_my");
+    let mut c = conn();
+    c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
+    c.query_drop(format!("CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"))
+        .unwrap();
+    let _drop = Table(tbl.clone());
+
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let rig = Rig::mysql_cdc(&tbl)
+        .cdc("rollover: 5")
+        .dest_path(out.clone());
+    // MySQL has no server-side anchor: pin the checkpoint BEFORE the transaction.
+    rig.run_ok();
+    let vals = (0..SPILL_CRASH_ROWS)
+        .map(|i| format!("({i},{i})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    c.query_drop(format!("INSERT INTO {tbl} VALUES {vals}"))
+        .unwrap();
+
+    crash_with_a_spilled_tail(&rig);
+    let resumed =
+        rig.run_with_envs(&[("RIVET_CDC_MAX_TX_ROWS", "4"), ("RIVET_CDC_SPILL_DIR", "1")]);
+    assert!(
+        resumed.status.success(),
+        "the resume run must succeed: {}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    assert_spilled_transaction_whole_once(&duckdb_dir_parquet_i64(&out, "id"));
+}
+
 fn pg_full_config(d: &tempfile::TempDir, tbl: &str, out: &std::path::Path) -> std::path::PathBuf {
     Rig::pg_batch(&format!("{tbl}_batch"))
         .query(&format!("SELECT * FROM {tbl}"))

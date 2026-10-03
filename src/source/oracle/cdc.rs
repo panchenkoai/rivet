@@ -1124,7 +1124,15 @@ impl OracleChangeStream {
         let mut bytes = first.event.estimated_bytes();
         let mut group = vec![first];
         loop {
-            crate::source::cdc::check_tx_buffer_caps("oracle", group.len(), bytes)?;
+            crate::source::cdc::tx_buffer::check_tx_buffer_caps(
+                crate::source::cdc::CdcEngine::Oracle,
+                group.len(),
+                bytes,
+                (
+                    crate::source::cdc::max_tx_rows(),
+                    crate::source::cdc::max_tx_bytes(),
+                ),
+            )?;
             match self.next_mined()? {
                 Some(Mine::Change(m)) if joins_commit_group(commit, m.commit) => {
                     bytes += m.event.estimated_bytes();
