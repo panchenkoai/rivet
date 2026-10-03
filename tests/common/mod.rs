@@ -183,7 +183,11 @@ pub fn follow_rebaseline_remedy(rig: &mut Rig, has_baseline: bool) {
     std::fs::rename(&out, out.with_extension("pre-rebaseline"))
         .expect("move the destination's files aside");
     std::fs::create_dir_all(&out).expect("recreate the destination");
-    let cleared = clear_cdc_snapshot(&rig.config_path(), rig.export_name());
+    let cleared = clear_cdc_snapshot(
+        &rig.config_path(),
+        rig.export_name(),
+        &out.to_string_lossy(),
+    );
     assert_eq!(
         cleared > 0,
         has_baseline,

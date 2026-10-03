@@ -56,9 +56,12 @@ Two recovery paths cover the table:
      during the gap, has no event that retracts it — so a reader of the prefix
      would keep serving it. Each table's `snapshot/_SUCCESS` marker goes with
      them. A reader that already copied earlier parts elsewhere drops them too;
-   - delete the export's `cdc_snapshot` rows from the state DB, one per table
-     (`DELETE FROM cdc_snapshot WHERE export_name = '<export>'`). The state row
-     and the marker are OR-ed: either one left in place skips that table's
+   - delete the export's `cdc_snapshot` rows from the state DB, one per table:
+     `DELETE FROM cdc_snapshot WHERE export_name = '<export>' AND (prefix = ''
+     OR prefix LIKE '%<destination path or prefix>%')`. The `prefix` clause
+     matters on a state DB that several configs share: `export_name` alone
+     also matches another config's export of the same name. The state row and
+     the marker are OR-ed: either one left in place skips that table's
      baseline;
    - give the export `cdc.initial: snapshot` if it has none;
    - if a warehouse load consumes this stream, truncate its `<table>__changes`

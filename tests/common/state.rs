@@ -353,19 +353,20 @@ pub fn recorded_primary_key(cfg: &std::path::Path, export: &str) -> Option<Vec<S
     }
 }
 
-/// Delete `export`'s `cdc_snapshot` rows from the backend the run used, as an operator clearing that done-signal would; returns how many went.
-pub fn clear_cdc_snapshot(cfg: &std::path::Path, export: &str) -> u64 {
-    const SQL: &str = "DELETE FROM cdc_snapshot WHERE export_name = $1";
+/// Delete `export`'s `cdc_snapshot` rows under destination `dest` from the backend the run used, as the documented SQL does; returns how many went.
+pub fn clear_cdc_snapshot(cfg: &std::path::Path, export: &str, dest: &str) -> u64 {
+    const SQL: &str = "DELETE FROM cdc_snapshot WHERE export_name = $1 \
+                       AND (prefix = '' OR prefix LIKE '%' || $2 || '%')";
     match state_url_under_test() {
         Some(url) => postgres::Client::connect(&url, postgres::NoTls)
             .unwrap_or_else(|e| {
                 panic!("connect to the Postgres state at RIVET_GATE_STATE_URL: {e}")
             })
-            .execute(SQL, &[&export])
+            .execute(SQL, &[&export, &dest])
             .expect("delete cdc_snapshot rows"),
         None => StateDb::next_to_config(cfg)
             .conn
-            .execute(&SQL.replace("$1", "?1"), [export])
+            .execute(&SQL.replace("$1", "?1").replace("$2", "?2"), [export, dest])
             .expect("delete cdc_snapshot rows") as u64,
     }
 }

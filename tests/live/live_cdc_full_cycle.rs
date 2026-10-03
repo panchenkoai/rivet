@@ -305,7 +305,11 @@ fn rebaseline_remedy_after_a_truncate_leaves_no_removed_key_live_in_bigquery_pos
     .unwrap();
     bq.delete_objects("");
     assert!(
-        clear_cdc_snapshot(&rig.config_path(), rig.export_name()) > 0,
+        clear_cdc_snapshot(
+            &rig.config_path(),
+            rig.export_name(),
+            &format!("{}/{}", bq.bucket, bq.prefix)
+        ) > 0,
         "fixture: the export had a `cdc_snapshot` row to clear"
     );
     bq.exec(&format!(
