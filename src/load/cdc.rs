@@ -26,7 +26,7 @@
 //! functions are also *warehouse*-specific ([`Warehouse`]): BigQuery reads JSON
 //! with `JSON_VALUE`, Snowflake with `PARSE_JSON(...):path`.
 
-use crate::types::target::{TargetColumnSpec, TargetStatus};
+use crate::types::target::{BqType, ChType, SfType, TargetColumnSpec, TargetStatus, TargetType};
 
 /// The source engine a change log came from — selects how `__pos` is parsed
 /// into a sortable key.
@@ -218,23 +218,23 @@ pub(crate) fn is_meta_column(name: &str) -> bool {
 }
 
 pub fn meta_column_specs(warehouse: Warehouse) -> Vec<TargetColumnSpec> {
-    let (str_ty, int_ty) = match warehouse {
-        Warehouse::BigQuery => ("STRING", "INT64"),
-        Warehouse::Snowflake => ("VARCHAR", "INTEGER"),
-        Warehouse::ClickHouse => ("String", "Int64"),
+    let (str_ty, int_ty): (TargetType, TargetType) = match warehouse {
+        Warehouse::BigQuery => (BqType::String.into(), BqType::Int64.into()),
+        Warehouse::Snowflake => (SfType::Varchar.into(), SfType::Integer.into()),
+        Warehouse::ClickHouse => (ChType::String.into(), ChType::Int64.into()),
     };
     ["__op", "__pos"]
         .into_iter()
-        .map(|name| meta_spec(name, str_ty))
+        .map(|name| meta_spec(name, str_ty.clone()))
         .chain(std::iter::once(meta_spec("__seq", int_ty)))
         .collect()
 }
 
-fn meta_spec(name: &str, ty: &str) -> TargetColumnSpec {
+fn meta_spec(name: &str, ty: TargetType) -> TargetColumnSpec {
     TargetColumnSpec {
         column_name: name.into(),
-        target_type: ty.into(),
-        autoload_type: String::new(),
+        autoload_type: ty.clone(),
+        target_type: ty,
         status: TargetStatus::Ok,
         note: None,
         cast_sql: None,
@@ -268,9 +268,9 @@ pub(crate) fn is_reserved_column(name: &str) -> bool {
 /// of a base-and-buffer load (the baseline Parquet carries it as `false`).
 pub fn flag_spec(warehouse: Warehouse) -> TargetColumnSpec {
     let ty = match warehouse {
-        Warehouse::BigQuery => "BOOL",
-        Warehouse::Snowflake => "BOOLEAN",
-        Warehouse::ClickHouse => "Bool",
+        Warehouse::BigQuery => BqType::Bool.into(),
+        Warehouse::Snowflake => SfType::Boolean.into(),
+        Warehouse::ClickHouse => ChType::Bool.into(),
     };
     meta_spec(DELETE_FLAG_COLUMN, ty)
 }
@@ -322,7 +322,7 @@ fn touched_values_sql(
     base_fqtn: &str,
     pk: &[&str],
     column: &str,
-    as_date: Option<&str>,
+    as_date: Option<&TargetType>,
 ) -> String {
     let (own, base) = match as_date {
         Some(ty) => (
@@ -344,22 +344,24 @@ const KEY_ARRAY_BYTES: u64 = 700_000;
 
 /// The script-variable element type for a key column's warehouse type; `None` for a type
 /// an `IN UNNEST` key filter does not cover (floats, bytes, containers).
-fn key_array_type(target_type: &str) -> Option<&'static str> {
-    let head: String = target_type
-        .trim()
-        .chars()
-        .take_while(|c| c.is_ascii_alphanumeric())
-        .collect::<String>()
-        .to_ascii_uppercase();
-    match head.as_str() {
-        "INT64" | "INTEGER" | "INT" | "BIGINT" => Some("INT64"),
-        "STRING" => Some("STRING"),
-        "NUMERIC" | "DECIMAL" => Some("NUMERIC"),
-        "BIGNUMERIC" | "BIGDECIMAL" => Some("BIGNUMERIC"),
-        "DATE" => Some("DATE"),
-        "DATETIME" => Some("DATETIME"),
-        "TIMESTAMP" => Some("TIMESTAMP"),
-        _ => None,
+fn key_array_type(target_type: &TargetType) -> Option<&'static str> {
+    let TargetType::BigQuery(t) = target_type else {
+        return None;
+    };
+    match t {
+        BqType::Int64 => Some("INT64"),
+        BqType::String => Some("STRING"),
+        BqType::Numeric => Some("NUMERIC"),
+        BqType::BigNumeric => Some("BIGNUMERIC"),
+        BqType::Date => Some("DATE"),
+        BqType::DateTime => Some("DATETIME"),
+        BqType::Timestamp => Some("TIMESTAMP"),
+        BqType::Bool
+        | BqType::Float64
+        | BqType::Time
+        | BqType::Bytes
+        | BqType::Json
+        | BqType::Array(_) => None,
     }
 }
 
@@ -371,7 +373,7 @@ fn touched_days_script(
     base_fqtn: &str,
     pk: &[&str],
     column: &str,
-    column_type: &str,
+    column_type: &TargetType,
     key0: Option<(&str, &str)>,
 ) -> String {
     let own = date_of(&format!("`{column}`"), column_type);
@@ -425,8 +427,8 @@ pub fn trusts_buffer_days(order: &CompactOrder) -> bool {
 /// feeds are rendered `+00` and the table's partitions ARE UTC days — under any other
 /// default the two disagreed by up to a day at both ends (a skipped winner, a
 /// re-inserted key). A DATE or DATETIME takes no zone.
-fn date_of(col_sql: &str, target_type: &str) -> String {
-    if target_type.eq_ignore_ascii_case("TIMESTAMP") {
+fn date_of(col_sql: &str, target_type: &TargetType) -> String {
+    if *target_type == TargetType::BigQuery(BqType::Timestamp) {
         format!("DATE({col_sql}, 'UTC')")
     } else {
         format!("DATE({col_sql})")
@@ -435,11 +437,13 @@ fn date_of(col_sql: &str, target_type: &str) -> String {
 
 /// The partition column's warehouse type, `TIMESTAMP` when the specs do not name it —
 /// the conservative reading, since only that one carries a zone.
-fn column_type_of<'a>(specs: &'a [TargetColumnSpec], col: &str) -> &'a str {
+pub(crate) fn column_type_of(specs: &[TargetColumnSpec], col: &str) -> TargetType {
     specs
         .iter()
         .find(|s| s.column_name == col)
-        .map_or("TIMESTAMP", |s| s.target_type.as_str())
+        .map_or(TargetType::BigQuery(BqType::Timestamp), |s| {
+            s.target_type.clone()
+        })
 }
 
 /// `(rows, min, max, null_count)` — rows and NULLs of the buffer, min/max of the
@@ -452,7 +456,7 @@ pub fn compact_probe_sql(
     base_fqtn: &str,
     pk: &[String],
     partition_col: Option<&str>,
-    time_type: Option<&str>,
+    time_type: Option<&TargetType>,
     buffer_only: bool,
 ) -> String {
     let Some(c) = partition_col else {
@@ -495,11 +499,11 @@ pub fn day_windows(
 }
 
 /// A `date` as a literal of the partition column's BigQuery type.
-pub fn time_literal(target_type: &str, date: chrono::NaiveDate) -> String {
+pub fn time_literal(target_type: &TargetType, date: chrono::NaiveDate) -> String {
     let d = date.format("%Y-%m-%d");
-    match target_type.to_ascii_uppercase().as_str() {
-        "DATE" => format!("DATE '{d}'"),
-        "DATETIME" => format!("DATETIME '{d}T00:00:00'"),
+    match target_type {
+        TargetType::BigQuery(BqType::Date) => format!("DATE '{d}'"),
+        TargetType::BigQuery(BqType::DateTime) => format!("DATETIME '{d}T00:00:00'"),
         _ => format!("TIMESTAMP '{d} 00:00:00+00'"),
     }
 }
@@ -560,7 +564,7 @@ pub enum MergeFilter {
     /// `column_type` decides whether `DATE()` is pinned to UTC (see [`date_of`]).
     Days {
         column: String,
-        column_type: String,
+        column_type: TargetType,
         chunk: String,
         all: String,
     },
@@ -1259,11 +1263,7 @@ pub fn plan_compact_merges(
     let mut merges = Vec::new();
     match (key, part_col) {
         (Some(PartitionKey::Time { granularity, .. }), Some(col)) if !probe.lo.is_empty() => {
-            let ty = specs
-                .iter()
-                .find(|s| s.column_name == col)
-                .map(|s| s.target_type.as_str())
-                .unwrap_or("TIMESTAMP");
+            let ty = &column_type_of(specs, col);
             // Days per window such that no window touches more than 4,000 partitions
             // of this granularity. Finite on every arm: `chrono` panics past
             // ~10^11 days, and a sentinel here did exactly that on a monthly table.
@@ -1447,10 +1447,10 @@ pub fn compact_script_sql(
             merge_all = merge(&MergeFilter::All)
         );
     };
-    let ty = column_type_of(specs, col);
+    let ty = &column_type_of(specs, col);
     let by_days = merge(&MergeFilter::Days {
         column: col.to_string(),
-        column_type: ty.to_string(),
+        column_type: ty.clone(),
         chunk: "chunk".to_string(),
         all: "days".to_string(),
     });
@@ -1541,27 +1541,35 @@ mod compact_tests {
     #[test]
     fn a_key_type_gets_an_array_element_type_only_when_in_unnest_covers_it() {
         for (t, want) in [
-            ("INT64", Some("INT64")),
-            ("STRING", Some("STRING")),
-            ("NUMERIC(20, 0)", Some("NUMERIC")),
-            ("BIGNUMERIC(50,10)", Some("BIGNUMERIC")),
-            ("timestamp", Some("TIMESTAMP")),
-            ("DATE", Some("DATE")),
-            ("DATETIME", Some("DATETIME")),
-            ("FLOAT64", None),
-            ("BYTES", None),
-            ("ARRAY<INT64>", None),
+            (BqType::Int64, Some("INT64")),
+            (BqType::String, Some("STRING")),
+            (BqType::Numeric, Some("NUMERIC")),
+            (BqType::BigNumeric, Some("BIGNUMERIC")),
+            (BqType::Timestamp, Some("TIMESTAMP")),
+            (BqType::Date, Some("DATE")),
+            (BqType::DateTime, Some("DATETIME")),
+            (BqType::Bool, None),
+            (BqType::Float64, None),
+            (BqType::Time, None),
+            (BqType::Bytes, None),
+            (BqType::Json, None),
+            (BqType::Array(Box::new(BqType::Int64)), None),
         ] {
-            assert_eq!(key_array_type(t), want, "{t}");
+            assert_eq!(key_array_type(&t.clone().into()), want, "{t}");
         }
+        assert_eq!(
+            key_array_type(&SfType::NumberPs(38, 0).into()),
+            None,
+            "only a BigQuery type declares a BigQuery script variable"
+        );
         let s = compact_script_sql(
             "p.d.t",
             "p.d.t__changes",
             None,
             &[
-                meta_spec("id", "BYTES"),
-                meta_spec("v", "INT64"),
-                meta_spec("created_at", "DATETIME"),
+                meta_spec("id", BqType::Bytes.into()),
+                meta_spec("v", BqType::Int64.into()),
+                meta_spec("created_at", BqType::DateTime.into()),
             ],
             &["id".to_string()],
             SourceEngine::Postgres,
@@ -1833,8 +1841,8 @@ mod compact_tests {
             "p.d.t__changes",
             None,
             &[
-                meta_spec("id", "INT64"),
-                meta_spec("created_at", "TIMESTAMP"),
+                meta_spec("id", BqType::Int64.into()),
+                meta_spec("created_at", BqType::Timestamp.into()),
             ],
             &["id".to_string()],
             SourceEngine::Postgres,
@@ -1854,7 +1862,10 @@ mod compact_tests {
             "p.d.my-orders",
             "p.d.my-orders__changes",
             None,
-            &[meta_spec("order", "INT64"), meta_spec("created_at", "DATE")],
+            &[
+                meta_spec("order", BqType::Int64.into()),
+                meta_spec("created_at", BqType::Date.into()),
+            ],
             &["order".to_string()],
             SourceEngine::Postgres,
             Some("created_at"),
@@ -1894,10 +1905,10 @@ mod compact_tests {
 
     fn specs() -> Vec<TargetColumnSpec> {
         vec![
-            meta_spec("id", "INT64"),
-            meta_spec("v", "INT64"),
-            meta_spec("created_at", "DATETIME"),
-            meta_spec("__is_deleted", "BOOL"),
+            meta_spec("id", BqType::Int64.into()),
+            meta_spec("v", BqType::Int64.into()),
+            meta_spec("created_at", BqType::DateTime.into()),
+            meta_spec("__is_deleted", BqType::Bool.into()),
         ]
     }
 
@@ -2190,13 +2201,13 @@ mod compact_tests {
     #[test]
     fn time_literals_follow_the_columns_type() {
         let d = chrono::NaiveDate::from_ymd_opt(2026, 9, 17).unwrap();
-        assert_eq!(time_literal("DATE", d), "DATE '2026-09-17'");
+        assert_eq!(time_literal(&BqType::Date.into(), d), "DATE '2026-09-17'");
         assert_eq!(
-            time_literal("DATETIME", d),
+            time_literal(&BqType::DateTime.into(), d),
             "DATETIME '2026-09-17T00:00:00'"
         );
         assert_eq!(
-            time_literal("TIMESTAMP", d),
+            time_literal(&BqType::Timestamp.into(), d),
             "TIMESTAMP '2026-09-17 00:00:00+00'"
         );
     }
@@ -2209,7 +2220,7 @@ mod compact_tests {
             "p.d.t",
             &pk,
             Some("created_at"),
-            Some("DATETIME"),
+            Some(&BqType::DateTime.into()),
             false,
         );
         assert!(
@@ -2227,7 +2238,7 @@ mod compact_tests {
             "p.d.t",
             &pk,
             Some("created_at"),
-            Some("TIMESTAMP"),
+            Some(&BqType::Timestamp.into()),
             false,
         );
         assert!(
@@ -2250,7 +2261,7 @@ mod compact_tests {
             "p.d.t",
             &pk,
             Some("created_at"),
-            Some("TIMESTAMP"),
+            Some(&BqType::Timestamp.into()),
             true,
         );
         assert!(
@@ -2285,8 +2296,8 @@ mod compact_column_tests {
             granularity: Granularity::Year,
         };
         let specs = vec![
-            meta_spec("id", "INT64"),
-            meta_spec("created_at", "DATETIME"),
+            meta_spec("id", BqType::Int64.into()),
+            meta_spec("created_at", BqType::DateTime.into()),
             flag_spec(Warehouse::BigQuery),
         ];
         let plans = plan_compact_merges(
@@ -2314,8 +2325,8 @@ mod compact_column_tests {
     #[test]
     fn the_compaction_script_merges_data_columns_only() {
         let mut specs = meta_column_specs(Warehouse::BigQuery);
-        specs.push(meta_spec("id", "INT64"));
-        specs.push(meta_spec("v", "INT64"));
+        specs.push(meta_spec("id", BqType::Int64.into()));
+        specs.push(meta_spec("v", BqType::Int64.into()));
         specs.push(flag_spec(Warehouse::BigQuery));
         let s = compact_script_sql(
             "p.d.t",
@@ -2394,7 +2405,10 @@ mod compact_flag_tests {
     /// against a base that does not have it.
     #[test]
     fn a_base_without_the_delete_flag_merges_without_naming_it() {
-        let data = vec![meta_spec("id", "INT64"), meta_spec("v", "INT64")];
+        let data = vec![
+            meta_spec("id", BqType::Int64.into()),
+            meta_spec("v", BqType::Int64.into()),
+        ];
         let mut flagged = data.clone();
         flagged.push(flag_spec(Warehouse::BigQuery));
         let build = |specs: &[TargetColumnSpec]| {

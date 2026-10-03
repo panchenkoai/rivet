@@ -1038,7 +1038,7 @@ mod tests {
                 arrow_type: "-".into(),
                 fidelity: crate::types::TypeFidelity::Exact,
                 warnings: vec![],
-                target_type: Some("BIGNUMERIC".into()),
+                target_type: Some(crate::types::target::BqType::BigNumeric.into()),
                 target_status: Some(TargetStatus::Fail),
                 target_note: None,
                 autoload_type: None,

@@ -206,10 +206,10 @@ pub struct TargetColumnSpec {
     /// Name copied through so a `Vec<TargetColumnSpec>` is self-describing.
     pub column_name: String,
     /// Native warehouse type for full fidelity, e.g. "JSON", "UBIGINT", "NUMERIC".
-    pub target_type: String,
+    pub target_type: TargetType,
     /// Type a generic Parquet reader infers without a declared schema. May
     /// differ from `target_type` (e.g. BigQuery autoloads JSON as "BYTES").
-    pub autoload_type: String,
+    pub autoload_type: TargetType,
     pub status: TargetStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
@@ -219,23 +219,276 @@ pub struct TargetColumnSpec {
     pub cast_sql: Option<String>,
 }
 
+/// A warehouse's native column type, closed per target; loaders match on it and `Display` renders the DDL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TargetType {
+    BigQuery(BqType),
+    Snowflake(SfType),
+    ClickHouse(ChType),
+    DuckDb(DuckType),
+    /// No type: the column does not map (a `Fail` row), rendered `-`.
+    Unmapped,
+}
+
+/// A BigQuery column type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BqType {
+    Bool,
+    Int64,
+    Float64,
+    Numeric,
+    BigNumeric,
+    Date,
+    Time,
+    Timestamp,
+    DateTime,
+    String,
+    Bytes,
+    Json,
+    /// `ARRAY<STRUCT<item T>>`, the shape list inference loads a Parquet list as.
+    Array(Box<BqType>),
+}
+
+/// A Snowflake column type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SfType {
+    Boolean,
+    /// `NUMBER` with no precision.
+    Number,
+    /// `NUMBER(p,s)`.
+    NumberPs(u8, i8),
+    Float,
+    Date,
+    Time,
+    TimestampTz,
+    TimestampNtz,
+    Text,
+    Varchar,
+    Integer,
+    Binary,
+    Variant,
+    Array,
+}
+
+/// A ClickHouse column type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChType {
+    Bool,
+    Int16,
+    Int32,
+    Int64,
+    UInt64,
+    Float32,
+    Float64,
+    /// `Decimal(p, s)`.
+    Decimal(u16, i8),
+    /// `Decimal64(s)`.
+    Decimal64(u8),
+    Date32,
+    /// `DateTime64(p)` or `DateTime64(p, 'tz')`.
+    DateTime64(u8, Option<String>),
+    String,
+    Json,
+    Uuid,
+    /// `FixedString(16)`.
+    FixedString16,
+    /// `Array(Nullable(T))`.
+    Array(Box<ChType>),
+}
+
+/// A DuckDB column type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DuckType {
+    Boolean,
+    SmallInt,
+    Integer,
+    BigInt,
+    UBigInt,
+    Float,
+    Double,
+    /// `DECIMAL` with no precision.
+    DecimalBare,
+    /// `DECIMAL(p,s)`.
+    Decimal(u8, i8),
+    /// `DECIMAL(38,*)`, a decimal past DuckDB's precision.
+    DecimalWide,
+    Date,
+    Time,
+    TimestampTz,
+    TimestampNs,
+    Timestamp,
+    Varchar,
+    Blob,
+    Json,
+    Uuid,
+    Interval,
+    /// `T[]`.
+    List(Box<DuckType>),
+}
+
+impl From<BqType> for TargetType {
+    fn from(t: BqType) -> Self {
+        Self::BigQuery(t)
+    }
+}
+
+impl From<SfType> for TargetType {
+    fn from(t: SfType) -> Self {
+        Self::Snowflake(t)
+    }
+}
+
+impl From<ChType> for TargetType {
+    fn from(t: ChType) -> Self {
+        Self::ClickHouse(t)
+    }
+}
+
+impl From<DuckType> for TargetType {
+    fn from(t: DuckType) -> Self {
+        Self::DuckDb(t)
+    }
+}
+
+impl std::fmt::Display for TargetType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BigQuery(t) => t.fmt(f),
+            Self::Snowflake(t) => t.fmt(f),
+            Self::ClickHouse(t) => t.fmt(f),
+            Self::DuckDb(t) => t.fmt(f),
+            Self::Unmapped => f.write_str("-"),
+        }
+    }
+}
+
+impl std::fmt::Display for BqType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::Bool => "BOOL",
+            Self::Int64 => "INT64",
+            Self::Float64 => "FLOAT64",
+            Self::Numeric => "NUMERIC",
+            Self::BigNumeric => "BIGNUMERIC",
+            Self::Date => "DATE",
+            Self::Time => "TIME",
+            Self::Timestamp => "TIMESTAMP",
+            Self::DateTime => "DATETIME",
+            Self::String => "STRING",
+            Self::Bytes => "BYTES",
+            Self::Json => "JSON",
+            Self::Array(inner) => return write!(f, "ARRAY<STRUCT<item {inner}>>"),
+        };
+        f.write_str(name)
+    }
+}
+
+impl std::fmt::Display for SfType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::Boolean => "BOOLEAN",
+            Self::Number => "NUMBER",
+            Self::NumberPs(p, s) => return write!(f, "NUMBER({p},{s})"),
+            Self::Float => "FLOAT",
+            Self::Date => "DATE",
+            Self::Time => "TIME",
+            Self::TimestampTz => "TIMESTAMP_TZ",
+            Self::TimestampNtz => "TIMESTAMP_NTZ",
+            Self::Text => "TEXT",
+            Self::Varchar => "VARCHAR",
+            Self::Integer => "INTEGER",
+            Self::Binary => "BINARY",
+            Self::Variant => "VARIANT",
+            Self::Array => "ARRAY",
+        };
+        f.write_str(name)
+    }
+}
+
+impl std::fmt::Display for ChType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::Bool => "Bool",
+            Self::Int16 => "Int16",
+            Self::Int32 => "Int32",
+            Self::Int64 => "Int64",
+            Self::UInt64 => "UInt64",
+            Self::Float32 => "Float32",
+            Self::Float64 => "Float64",
+            Self::Decimal(p, s) => return write!(f, "Decimal({p}, {s})"),
+            Self::Decimal64(s) => return write!(f, "Decimal64({s})"),
+            Self::Date32 => "Date32",
+            Self::DateTime64(p, None) => return write!(f, "DateTime64({p})"),
+            Self::DateTime64(p, Some(tz)) => return write!(f, "DateTime64({p}, '{tz}')"),
+            Self::String => "String",
+            Self::Json => "JSON",
+            Self::Uuid => "UUID",
+            Self::FixedString16 => "FixedString(16)",
+            Self::Array(inner) => return write!(f, "Array(Nullable({inner}))"),
+        };
+        f.write_str(name)
+    }
+}
+
+impl std::fmt::Display for DuckType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::Boolean => "BOOLEAN",
+            Self::SmallInt => "SMALLINT",
+            Self::Integer => "INTEGER",
+            Self::BigInt => "BIGINT",
+            Self::UBigInt => "UBIGINT",
+            Self::Float => "FLOAT",
+            Self::Double => "DOUBLE",
+            Self::DecimalBare => "DECIMAL",
+            Self::Decimal(p, s) => return write!(f, "DECIMAL({p},{s})"),
+            Self::DecimalWide => "DECIMAL(38,*)",
+            Self::Date => "DATE",
+            Self::Time => "TIME",
+            Self::TimestampTz => "TIMESTAMPTZ",
+            Self::TimestampNs => "TIMESTAMP_NS",
+            Self::Timestamp => "TIMESTAMP",
+            Self::Varchar => "VARCHAR",
+            Self::Blob => "BLOB",
+            Self::Json => "JSON",
+            Self::Uuid => "UUID",
+            Self::Interval => "INTERVAL",
+            Self::List(inner) => return write!(f, "{inner}[]"),
+        };
+        f.write_str(name)
+    }
+}
+
+impl Serialize for TargetType {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}
+
+#[cfg(test)]
+impl PartialEq<&str> for TargetType {
+    fn eq(&self, other: &&str) -> bool {
+        self.to_string().as_str() == *other
+    }
+}
+
 /// Internal per-type resolution result, before the column name and cast
 /// substitution are applied.
-struct Resolved {
-    target_type: String,
-    autoload_type: String,
+struct Resolved<T> {
+    /// `None` when the column does not map (a `Fail`).
+    target_type: Option<T>,
+    autoload_type: Option<T>,
     status: TargetStatus,
     note: Option<String>,
     /// `cast_sql` template with a `{col}` placeholder, or `None`.
     cast: Option<String>,
 }
 
-impl Resolved {
-    fn ok(t: impl Into<String>) -> Self {
-        let t = t.into();
+impl<T: Clone + Into<TargetType>> Resolved<T> {
+    fn ok(t: T) -> Self {
         Self {
-            autoload_type: t.clone(),
-            target_type: t,
+            autoload_type: Some(t.clone()),
+            target_type: Some(t),
             status: TargetStatus::Ok,
             note: None,
             cast: None,
@@ -243,25 +496,19 @@ impl Resolved {
     }
     /// Native type that *autoloads as something else* — the divergence the
     /// resolver exists to surface.
-    fn diverge(
-        native: impl Into<String>,
-        autoload: impl Into<String>,
-        note: impl Into<String>,
-        cast: Option<&str>,
-    ) -> Self {
+    fn diverge(native: T, autoload: T, note: impl Into<String>, cast: Option<&str>) -> Self {
         Self {
-            target_type: native.into(),
-            autoload_type: autoload.into(),
+            target_type: Some(native),
+            autoload_type: Some(autoload),
             status: TargetStatus::Warn,
             note: Some(note.into()),
             cast: cast.map(str::to_string),
         }
     }
-    fn warn(t: impl Into<String>, note: impl Into<String>) -> Self {
-        let t = t.into();
+    fn warn(t: T, note: impl Into<String>) -> Self {
         Self {
-            autoload_type: t.clone(),
-            target_type: t,
+            autoload_type: Some(t.clone()),
+            target_type: Some(t),
             status: TargetStatus::Warn,
             note: Some(note.into()),
             cast: None,
@@ -269,8 +516,8 @@ impl Resolved {
     }
     fn fail(note: impl Into<String>) -> Self {
         Self {
-            target_type: "-".into(),
-            autoload_type: "-".into(),
+            target_type: None,
+            autoload_type: None,
             status: TargetStatus::Fail,
             note: Some(note.into()),
             cast: None,
@@ -279,8 +526,8 @@ impl Resolved {
     fn into_spec(self, input: &TargetInput<'_>) -> TargetColumnSpec {
         TargetColumnSpec {
             column_name: input.column_name.to_string(),
-            target_type: self.target_type,
-            autoload_type: self.autoload_type,
+            target_type: self.target_type.map_or(TargetType::Unmapped, Into::into),
+            autoload_type: self.autoload_type.map_or(TargetType::Unmapped, Into::into),
             status: self.status,
             note: self.note,
             cast_sql: self.cast.map(|t| t.replace("{col}", input.column_name)),
@@ -371,29 +618,29 @@ mod bigquery {
         native(input.rivet_type).into_spec(input)
     }
 
-    fn native(t: &RivetType) -> Resolved {
+    fn native(t: &RivetType) -> Resolved<BqType> {
         match t {
-            RivetType::Bool => Resolved::ok("BOOL"),
-            RivetType::Int16 | RivetType::Int32 | RivetType::Int64 => Resolved::ok("INT64"),
+            RivetType::Bool => Resolved::ok(BqType::Bool),
+            RivetType::Int16 | RivetType::Int32 | RivetType::Int64 => Resolved::ok(BqType::Int64),
             // u64 > i64::MAX overflows the INT64 autoload and cannot be
             // recovered post-load (the bits are already wrong). The only fix is
             // source-side: map the column to decimal(20,0) with a column
             // override so it rides as Parquet DECIMAL → BigQuery NUMERIC.
             RivetType::UInt64 => Resolved::diverge(
-                "NUMERIC",
-                "INT64",
+                BqType::Numeric,
+                BqType::Int64,
                 "UINT64 > INT64_MAX overflows the INT64 autoload and cannot be recovered after \
                  load — map the column to decimal(20,0) with a source column override",
                 None,
             ),
-            RivetType::Float32 | RivetType::Float64 => Resolved::ok("FLOAT64"),
+            RivetType::Float32 | RivetType::Float64 => Resolved::ok(BqType::Float64),
             RivetType::Decimal { precision, scale } => decimal(*precision, *scale),
-            RivetType::Date => Resolved::ok("DATE"),
-            RivetType::Time { .. } => Resolved::ok("TIME"),
+            RivetType::Date => Resolved::ok(BqType::Date),
+            RivetType::Time { .. } => Resolved::ok(BqType::Time),
             // tz-aware timestamp → instant → TIMESTAMP, autoloads cleanly.
             RivetType::Timestamp {
                 timezone: Some(_), ..
-            } => Resolved::ok("TIMESTAMP"),
+            } => Resolved::ok(BqType::Timestamp),
             // Nanosecond naive timestamp (the `timestamp_ns` override, e.g. SQL
             // Server datetime2(7)) has no BigQuery native temporal type: the loader
             // does not recognise the Parquet TIMESTAMP(NANOS) logical type and
@@ -406,8 +653,8 @@ mod bigquery {
                 unit: TimeUnit::Nanosecond,
                 timezone: None,
             } => Resolved::diverge(
-                "INT64",
-                "INT64",
+                BqType::Int64,
+                BqType::Int64,
                 "nanosecond timestamp has no BigQuery native type — autoloads as INT64 (raw \
                  nanos, lossless); a native TIMESTAMP via TIMESTAMP_MICROS(DIV(col,1000)) drops \
                  sub-µs precision. Prefer `timestamp` (microsecond) for BigQuery targets.",
@@ -417,48 +664,48 @@ mod bigquery {
             // ignores Parquet isAdjustedToUTC=false and yields TIMESTAMP
             // (verified). `DATETIME(ts)` recovers the wall-clock after load.
             RivetType::Timestamp { timezone: None, .. } => Resolved::diverge(
-                "DATETIME",
-                "TIMESTAMP",
+                BqType::DateTime,
+                BqType::Timestamp,
                 "naive timestamp autoloads as TIMESTAMP (an instant); recover wall-clock with \
                  DATETIME(col) after load",
                 Some("DATETIME({col})"),
             ),
-            RivetType::String | RivetType::Text | RivetType::Enum => Resolved::ok("STRING"),
-            RivetType::Binary => Resolved::ok("BYTES"),
+            RivetType::String | RivetType::Text | RivetType::Enum => Resolved::ok(BqType::String),
+            RivetType::Binary => Resolved::ok(BqType::Bytes),
             // Parquet JSON logical type autoloads as BYTES in BigQuery
             // (verified). Declare JSON in the load schema for native JSON.
             RivetType::Json => Resolved::diverge(
-                "JSON",
-                "BYTES",
+                BqType::Json,
+                BqType::Bytes,
                 "Parquet JSON logical type autoloads as BYTES in BigQuery; recover native JSON \
                  with PARSE_JSON(SAFE_CONVERT_BYTES_TO_STRING(col)) after load",
                 Some("PARSE_JSON(SAFE_CONVERT_BYTES_TO_STRING({col}))"),
             ),
             // BigQuery has no UUID type: the landing zone keeps the 16 bytes; consumers render text in a view.
             RivetType::Uuid => Resolved::warn(
-                "BYTES",
+                BqType::Bytes,
                 "BigQuery has no UUID type: the column lands as its 16 bytes; render the text in \
                  a view with TO_HEX(col)",
             ),
-            RivetType::Interval => Resolved::ok("STRING"),
+            RivetType::Interval => Resolved::ok(BqType::String),
             RivetType::List { inner } => list(inner),
             RivetType::Unsupported { .. } => Resolved::fail(unsupported_reason(t)),
         }
     }
 
-    fn decimal(p: u8, s: i8) -> Resolved {
+    fn decimal(p: u8, s: i8) -> Resolved<BqType> {
         if s < 0 {
             return Resolved::fail(format!(
                 "BigQuery has no negative scale; decimal({p},{s}) needs a STRING/INT64 cast"
             ));
         }
         let native = if p <= NUMERIC_MAX_P && s <= NUMERIC_MAX_S {
-            "NUMERIC"
+            BqType::Numeric
         } else if p <= BIGNUMERIC_MAX_P
             && s <= BIGNUMERIC_MAX_S
             && i16::from(p) - i16::from(s) <= BIGNUMERIC_MAX_INT_DIGITS
         {
-            "BIGNUMERIC"
+            BqType::BigNumeric
         } else {
             return Resolved::fail(format!(
                 "decimal({p},{s}) exceeds BigQuery BIGNUMERIC limits (max 76,38, and at most \
@@ -469,14 +716,10 @@ mod bigquery {
         Resolved::ok(native)
     }
 
-    fn list(inner: &RivetType) -> Resolved {
-        let inner_r = native(inner);
-        if inner_r.status == TargetStatus::Fail {
-            return Resolved::fail(format!(
-                "ARRAY of unsupported element: {}",
-                inner_r.target_type
-            ));
-        }
+    fn list(inner: &RivetType) -> Resolved<BqType> {
+        let Some(inner) = native(inner).target_type else {
+            return Resolved::fail("ARRAY of unsupported element: -");
+        };
         // Rivet writes the Parquet list element as `item` (arrow-rs default, not
         // the spec's `element`), so with `enable_list_inference` BigQuery loads an
         // array as ARRAY<STRUCT<item T>> (== REPEATED RECORD{item}). Declare THAT
@@ -487,7 +730,7 @@ mod bigquery {
         // shape), so this is a warn, not a divergence — flatten to a scalar array
         // after load with `ARRAY(SELECT el.item FROM UNNEST(col) AS el)`.
         Resolved::warn(
-            format!("ARRAY<STRUCT<item {}>>", inner_r.target_type),
+            BqType::Array(Box::new(inner)),
             "arrays load as ARRAY<STRUCT<item T>> (nested, element named `item`); \
              flatten to a scalar array with ARRAY(SELECT el.item FROM UNNEST(col) AS el)",
         )
@@ -505,33 +748,33 @@ mod duckdb {
 
     /// DuckDB honors every native Parquet logical type Rivet writes, so
     /// `autoload_type == target_type` for all supported variants (verified).
-    fn native(t: &RivetType) -> Resolved {
+    fn native(t: &RivetType) -> Resolved<DuckType> {
         match t {
-            RivetType::Bool => Resolved::ok("BOOLEAN"),
-            RivetType::Int16 => Resolved::ok("SMALLINT"),
-            RivetType::Int32 => Resolved::ok("INTEGER"),
-            RivetType::Int64 => Resolved::ok("BIGINT"),
-            RivetType::UInt64 => Resolved::ok("UBIGINT"),
-            RivetType::Float32 => Resolved::ok("FLOAT"),
-            RivetType::Float64 => Resolved::ok("DOUBLE"),
+            RivetType::Bool => Resolved::ok(DuckType::Boolean),
+            RivetType::Int16 => Resolved::ok(DuckType::SmallInt),
+            RivetType::Int32 => Resolved::ok(DuckType::Integer),
+            RivetType::Int64 => Resolved::ok(DuckType::BigInt),
+            RivetType::UInt64 => Resolved::ok(DuckType::UBigInt),
+            RivetType::Float32 => Resolved::ok(DuckType::Float),
+            RivetType::Float64 => Resolved::ok(DuckType::Double),
             RivetType::Decimal { precision, scale } => {
                 if *scale < 0 {
                     Resolved::warn(
-                        "DECIMAL",
+                        DuckType::DecimalBare,
                         format!(
                             "DuckDB has no negative scale; decimal({precision},{scale}) loads via cast"
                         ),
                     )
                 } else if *precision <= 38 {
-                    Resolved::ok(format!("DECIMAL({precision},{scale})"))
+                    Resolved::ok(DuckType::Decimal(*precision, *scale))
                 } else {
                     // DuckDB DECIMAL maxes at precision 38; a wider decimal autoloads
                     // as DOUBLE (lossy past 2^53, verified live). Tell that truth as a
                     // divergence, not a same-type warn — and no cast recovers a DOUBLE,
                     // so the recovery is upstream (narrow the source precision).
                     Resolved::diverge(
-                        "DECIMAL(38,*)",
-                        "DOUBLE",
+                        DuckType::DecimalWide,
+                        DuckType::Double,
                         format!(
                             "decimal({precision},{scale}) exceeds DuckDB DECIMAL(38); autoloads \
                              as DOUBLE (lossy past 2^53) — narrow the source precision if exact \
@@ -541,34 +784,29 @@ mod duckdb {
                     )
                 }
             }
-            RivetType::Date => Resolved::ok("DATE"),
-            RivetType::Time { .. } => Resolved::ok("TIME"),
+            RivetType::Date => Resolved::ok(DuckType::Date),
+            RivetType::Time { .. } => Resolved::ok(DuckType::Time),
             RivetType::Timestamp {
                 timezone: Some(_), ..
-            } => Resolved::ok("TIMESTAMPTZ"),
+            } => Resolved::ok(DuckType::TimestampTz),
             // DuckDB has a native nanosecond timestamp; the `timestamp_ns` override
             // round-trips losslessly (verified live 2026-06-07).
             RivetType::Timestamp {
                 unit: TimeUnit::Nanosecond,
                 timezone: None,
-            } => Resolved::ok("TIMESTAMP_NS"),
-            RivetType::Timestamp { timezone: None, .. } => Resolved::ok("TIMESTAMP"),
-            RivetType::String | RivetType::Text | RivetType::Enum => Resolved::ok("VARCHAR"),
-            RivetType::Binary => Resolved::ok("BLOB"),
-            RivetType::Json => Resolved::ok("JSON"),
-            RivetType::Uuid => Resolved::ok("UUID"),
-            RivetType::Interval => Resolved::ok("INTERVAL"),
-            RivetType::List { inner } => {
-                let inner_r = native(inner);
-                if inner_r.status == TargetStatus::Fail {
-                    Resolved::fail(format!(
-                        "LIST of unsupported element: {}",
-                        inner_r.target_type
-                    ))
-                } else {
-                    Resolved::ok(format!("{}[]", inner_r.target_type))
-                }
+            } => Resolved::ok(DuckType::TimestampNs),
+            RivetType::Timestamp { timezone: None, .. } => Resolved::ok(DuckType::Timestamp),
+            RivetType::String | RivetType::Text | RivetType::Enum => {
+                Resolved::ok(DuckType::Varchar)
             }
+            RivetType::Binary => Resolved::ok(DuckType::Blob),
+            RivetType::Json => Resolved::ok(DuckType::Json),
+            RivetType::Uuid => Resolved::ok(DuckType::Uuid),
+            RivetType::Interval => Resolved::ok(DuckType::Interval),
+            RivetType::List { inner } => match native(inner).target_type {
+                Some(inner) => Resolved::ok(DuckType::List(Box::new(inner))),
+                None => Resolved::fail("LIST of unsupported element: -"),
+            },
             RivetType::Unsupported { .. } => Resolved::fail(unsupported_reason(t)),
         }
     }
@@ -587,22 +825,24 @@ mod snowflake {
     /// (2026-06-01). Needs `BINARY_AS_TEXT=FALSE` in the file format; cast column
     /// refs are double-quoted because INFER_SCHEMA names are lowercase and
     /// case-sensitive.
-    fn native(t: &RivetType) -> Resolved {
+    fn native(t: &RivetType) -> Resolved<SfType> {
         match t {
-            RivetType::Bool => Resolved::ok("BOOLEAN"),
-            RivetType::Int16 | RivetType::Int32 | RivetType::Int64 => Resolved::ok("NUMBER(38,0)"),
+            RivetType::Bool => Resolved::ok(SfType::Boolean),
+            RivetType::Int16 | RivetType::Int32 | RivetType::Int64 => {
+                Resolved::ok(SfType::NumberPs(38, 0))
+            }
             // u64 > INT64_MAX overflows the Parquet read; fix at source.
             RivetType::UInt64 => Resolved::diverge(
-                "NUMBER(20,0)",
-                "NUMBER(38,0)",
+                SfType::NumberPs(20, 0),
+                SfType::NumberPs(38, 0),
                 "UINT64 > INT64_MAX overflows the Parquet read; map to decimal(20,0) at source",
                 None,
             ),
-            RivetType::Float32 | RivetType::Float64 => Resolved::ok("FLOAT"),
+            RivetType::Float32 | RivetType::Float64 => Resolved::ok(SfType::Float),
             RivetType::Decimal { precision, scale } => {
                 if *scale < 0 {
                     Resolved::warn(
-                        "NUMBER",
+                        SfType::Number,
                         format!(
                             "Snowflake NUMBER has no negative scale; decimal({precision},{scale}) loads via cast"
                         ),
@@ -617,14 +857,14 @@ mod snowflake {
                          narrow the source precision, or load as FLOAT via a declared schema (lossy)"
                     ))
                 } else {
-                    Resolved::ok(format!("NUMBER({precision},{scale})"))
+                    Resolved::ok(SfType::NumberPs(*precision, *scale))
                 }
             }
-            RivetType::Date => Resolved::ok("DATE"),
+            RivetType::Date => Resolved::ok(SfType::Date),
             // TIME autoloads as NUMBER (µs of day); rebuild with TIME_FROM_PARTS.
             RivetType::Time { .. } => Resolved::diverge(
-                "TIME",
-                "NUMBER(38,0)",
+                SfType::Time,
+                SfType::NumberPs(38, 0),
                 "TIME autoloads as NUMBER (µs of day); recover with TIME_FROM_PARTS after load",
                 Some(r#"TIME_FROM_PARTS(0,0,FLOOR("{col}"/1000000),MOD("{col}",1000000)*1000)"#),
             ),
@@ -632,8 +872,8 @@ mod snowflake {
             RivetType::Timestamp {
                 timezone: Some(_), ..
             } => Resolved::diverge(
-                "TIMESTAMP_TZ",
-                "TIMESTAMP_NTZ",
+                SfType::TimestampTz,
+                SfType::TimestampNtz,
                 "tz timestamp autoloads as TIMESTAMP_NTZ — ALTER SESSION SET TIMEZONE='UTC' before COPY so the instant matches",
                 None,
             ),
@@ -646,57 +886,53 @@ mod snowflake {
                 unit: TimeUnit::Nanosecond,
                 timezone: None,
             } => Resolved::diverge(
-                "TIMESTAMP_NTZ",
-                "NUMBER(38,0)",
+                SfType::TimestampNtz,
+                SfType::NumberPs(38, 0),
                 "nanosecond timestamp autoloads as NUMBER (ns since epoch); recover with \
                  TO_TIMESTAMP_NTZ(col, 9) after load — Snowflake TIMESTAMP_NTZ holds full ns precision",
                 Some(r#"TO_TIMESTAMP_NTZ("{col}", 9)"#),
             ),
             // naive timestamp autoloads as NUMBER (µs since epoch).
             RivetType::Timestamp { timezone: None, .. } => Resolved::diverge(
-                "TIMESTAMP_NTZ",
-                "NUMBER(38,0)",
+                SfType::TimestampNtz,
+                SfType::NumberPs(38, 0),
                 "naive timestamp autoloads as NUMBER (µs since epoch); recover with TO_TIMESTAMP_NTZ after load",
                 Some(r#"TO_TIMESTAMP_NTZ("{col}", 6)"#),
             ),
-            RivetType::String | RivetType::Text | RivetType::Enum => Resolved::ok("TEXT"),
+            RivetType::String | RivetType::Text | RivetType::Enum => Resolved::ok(SfType::Text),
             // bytea/blob needs BINARY_AS_TEXT=FALSE or non-UTF8 bytes fail.
             RivetType::Binary => Resolved::warn(
-                "BINARY",
+                SfType::Binary,
                 "set BINARY_AS_TEXT=FALSE in the Parquet FILE FORMAT or non-UTF8 bytes fail to load",
             ),
             // JSON autoloads as TEXT; PARSE_JSON recovers native VARIANT.
             RivetType::Json => Resolved::diverge(
-                "VARIANT",
-                "TEXT",
+                SfType::Variant,
+                SfType::Text,
                 "JSON autoloads as TEXT; recover native VARIANT with PARSE_JSON after load",
                 Some(r#"PARSE_JSON("{col}")"#),
             ),
             // UUID (FixedSizeBinary 16) autoloads as 16-byte BINARY.
             RivetType::Uuid => Resolved::diverge(
-                "TEXT",
-                "BINARY",
+                SfType::Text,
+                SfType::Binary,
                 "UUID autoloads as 16-byte BINARY; recover canonical text with HEX_ENCODE + REGEXP after load",
                 Some(
                     r#"REGEXP_REPLACE(LOWER(HEX_ENCODE("{col}")),'^(.{8})(.{4})(.{4})(.{4})(.{12})$','\\1-\\2-\\3-\\4-\\5')"#,
                 ),
             ),
-            RivetType::Interval => Resolved::ok("TEXT"),
+            RivetType::Interval => Resolved::ok(SfType::Text),
             // A Parquet list autoloads as VARIANT (holding the JSON array), not
             // native ARRAY — verified live 2026-06-01: INFER_SCHEMA reports
             // VARIANT for both `tags` (text[]) and `nums` (int[]). Recover the
             // native ARRAY with `::ARRAY` after load.
             RivetType::List { inner } => {
-                let inner_r = native(inner);
-                if inner_r.status == TargetStatus::Fail {
-                    Resolved::fail(format!(
-                        "ARRAY of unsupported element: {}",
-                        inner_r.target_type
-                    ))
+                if native(inner).target_type.is_none() {
+                    Resolved::fail("ARRAY of unsupported element: -")
                 } else {
                     Resolved::diverge(
-                        "ARRAY",
-                        "VARIANT",
+                        SfType::Array,
+                        SfType::Variant,
                         "list autoloads as VARIANT (the JSON array); recover native ARRAY with ::ARRAY after load",
                         Some(r#""{col}"::ARRAY"#),
                     )
@@ -734,18 +970,18 @@ mod clickhouse {
     /// `UInt64`, `Decimal`, `DateTime64` (naive *and* tz) and `Array`, so most
     /// types autoload exactly. Divergences: `UUID` -> `FixedString(16)`, `JSON`
     /// -> `String`, and `TIME` (no native type -> `Int64`, µs of day).
-    fn native(t: &RivetType) -> Resolved {
+    fn native(t: &RivetType) -> Resolved<ChType> {
         match t {
-            RivetType::Bool => Resolved::ok("Bool"),
-            RivetType::Int16 => Resolved::ok("Int16"),
-            RivetType::Int32 => Resolved::ok("Int32"),
-            RivetType::Int64 => Resolved::ok("Int64"),
+            RivetType::Bool => Resolved::ok(ChType::Bool),
+            RivetType::Int16 => Resolved::ok(ChType::Int16),
+            RivetType::Int32 => Resolved::ok(ChType::Int32),
+            RivetType::Int64 => Resolved::ok(ChType::Int64),
             // Native unsigned 64-bit — ClickHouse holds the full UInt64 range, so
             // the overflow that forces BigQuery/Snowflake to a load-schema note
             // never happens here. The headline difference from the cloud warehouses.
-            RivetType::UInt64 => Resolved::ok("UInt64"),
-            RivetType::Float32 => Resolved::ok("Float32"),
-            RivetType::Float64 => Resolved::ok("Float64"),
+            RivetType::UInt64 => Resolved::ok(ChType::UInt64),
+            RivetType::Float32 => Resolved::ok(ChType::Float32),
+            RivetType::Float64 => Resolved::ok(ChType::Float64),
             RivetType::Decimal { precision, scale } => {
                 if *scale < 0 {
                     // A bare `Decimal` is ClickHouse's Decimal(10, 0) — not this type. The
@@ -758,7 +994,7 @@ mod clickhouse {
                         ))
                     } else {
                         Resolved::warn(
-                            format!("Decimal({width}, 0)"),
+                            ChType::Decimal(width, 0),
                             format!(
                                 "ClickHouse Decimal has no negative scale; decimal({precision},{scale}) \
                                  is declared Decimal({width}, 0), which holds its whole numbers exactly"
@@ -774,10 +1010,10 @@ mod clickhouse {
                          narrow the source precision"
                     ))
                 } else {
-                    Resolved::ok(format!("Decimal({precision}, {scale})"))
+                    Resolved::ok(ChType::Decimal(u16::from(*precision), *scale))
                 }
             }
-            RivetType::Date => Resolved::ok("Date32"),
+            RivetType::Date => Resolved::ok(ChType::Date32),
             // No time-of-day type: an Int64 column keeps whole seconds only (measured:
             // 13:45:07.123456 -> 49507); Decimal64 keeps the fraction (49507.123456).
             RivetType::Time { unit } => {
@@ -788,8 +1024,8 @@ mod clickhouse {
                     TimeUnit::Nanosecond => 9,
                 };
                 Resolved::diverge(
-                    format!("Decimal64({p})"),
-                    "Int64",
+                    ChType::Decimal64(p),
+                    ChType::Int64,
                     "ClickHouse has no TIME type: rivet load declares seconds since midnight as \
                      Decimal64, keeping the fraction; a plain Parquet autoload reads Int64 whole \
                      seconds",
@@ -805,26 +1041,22 @@ mod clickhouse {
                     TimeUnit::Microsecond => 6,
                     TimeUnit::Nanosecond => 9,
                 };
-                let ty = match timezone {
-                    Some(tz) => format!("DateTime64({p}, '{tz}')"),
-                    None => format!("DateTime64({p})"),
-                };
                 Resolved::warn(
-                    ty,
+                    ChType::DateTime64(p, timezone.clone()),
                     "DateTime64 holds 1900-01-01 to 2299-12-31; rivet load refuses a part holding a \
                      value outside it, but a load pulled through a named collection (or any other \
                      reader) gets the nearest end, silently",
                 )
             }
-            RivetType::String | RivetType::Text | RivetType::Enum => Resolved::ok("String"),
+            RivetType::String | RivetType::Text | RivetType::Enum => Resolved::ok(ChType::String),
             // ClickHouse String holds arbitrary bytes, so bytea/blob round-trips
             // losslessly — no BINARY_AS_TEXT caveat like Snowflake.
-            RivetType::Binary => Resolved::ok("String"),
+            RivetType::Binary => Resolved::ok(ChType::String),
             // Parquet JSON autoloads as String holding the valid JSON text, and `rivet
             // load` declares String: a JSON column refuses the Parquet insert (measured).
             RivetType::Json => Resolved::diverge(
-                "JSON",
-                "String",
+                ChType::Json,
+                ChType::String,
                 "JSON lands as String holding the valid JSON text (rivet load declares String; \
                  a ClickHouse JSON column refuses the Parquet insert); read it with the \
                  JSONExtract* functions",
@@ -834,24 +1066,21 @@ mod clickhouse {
             // The bytes are the canonical UUID; recover the native UUID with the
             // hex -> dashed-text -> toUUID round-trip clickhouse_load pins.
             RivetType::Uuid => Resolved::diverge(
-                "UUID",
-                "FixedString(16)",
+                ChType::Uuid,
+                ChType::FixedString16,
                 "UUID autoloads as FixedString(16); recover the native UUID with toUUID after load",
                 Some(
                     "toUUID(concat(substring(lower(hex({col})),1,8),'-',substring(lower(hex({col})),9,4),'-',substring(lower(hex({col})),13,4),'-',substring(lower(hex({col})),17,4),'-',substring(lower(hex({col})),21,12)))",
                 ),
             ),
-            RivetType::Interval => Resolved::ok("String"),
+            RivetType::Interval => Resolved::ok(ChType::String),
             // A Parquet list autoloads as a native Array (verified: tags ->
             // Array(Nullable(String)), nums -> Array(Nullable(Int32))).
             RivetType::List { inner } => {
                 let inner_r = native(inner);
-                if inner_r.status == TargetStatus::Fail {
-                    Resolved::fail(format!(
-                        "Array of unsupported element: {}",
-                        inner_r.target_type
-                    ))
-                } else {
+                if let (Some(inner), Some(inner_autoload)) =
+                    (inner_r.target_type, inner_r.autoload_type)
+                {
                     let null_note = "a ClickHouse Array cannot be NULL: a NULL list loads as [], \
                                      the same value as an empty list";
                     let note = match &inner_r.note {
@@ -859,11 +1088,13 @@ mod clickhouse {
                         None => null_note.to_string(),
                     };
                     Resolved::diverge(
-                        format!("Array(Nullable({}))", inner_r.target_type),
-                        format!("Array(Nullable({}))", inner_r.autoload_type),
+                        ChType::Array(Box::new(inner)),
+                        ChType::Array(Box::new(inner_autoload)),
                         note,
                         None,
                     )
+                } else {
+                    Resolved::fail("Array of unsupported element: -")
                 }
             }
             RivetType::Unsupported { .. } => Resolved::fail(unsupported_reason(t)),
@@ -910,6 +1141,103 @@ mod tests {
         let plain = named(ExportTarget::BigQuery, "comment");
         assert_eq!((plain.status, plain.note), (TargetStatus::Ok, None));
     }
+    /// Every target type renders the exact DDL spelling the resolver emitted as text before it was typed.
+    #[test]
+    fn every_target_type_renders_its_ddl_spelling() {
+        let utc = Some("UTC".to_string());
+        let cases: Vec<(TargetType, &str)> = vec![
+            (BqType::Bool.into(), "BOOL"),
+            (BqType::Int64.into(), "INT64"),
+            (BqType::Float64.into(), "FLOAT64"),
+            (BqType::Numeric.into(), "NUMERIC"),
+            (BqType::BigNumeric.into(), "BIGNUMERIC"),
+            (BqType::Date.into(), "DATE"),
+            (BqType::Time.into(), "TIME"),
+            (BqType::Timestamp.into(), "TIMESTAMP"),
+            (BqType::DateTime.into(), "DATETIME"),
+            (BqType::String.into(), "STRING"),
+            (BqType::Bytes.into(), "BYTES"),
+            (BqType::Json.into(), "JSON"),
+            (
+                BqType::Array(Box::new(BqType::Array(Box::new(BqType::Int64)))).into(),
+                "ARRAY<STRUCT<item ARRAY<STRUCT<item INT64>>>>",
+            ),
+            (SfType::Boolean.into(), "BOOLEAN"),
+            (SfType::Number.into(), "NUMBER"),
+            (SfType::NumberPs(38, 0).into(), "NUMBER(38,0)"),
+            (SfType::Float.into(), "FLOAT"),
+            (SfType::Date.into(), "DATE"),
+            (SfType::Time.into(), "TIME"),
+            (SfType::TimestampTz.into(), "TIMESTAMP_TZ"),
+            (SfType::TimestampNtz.into(), "TIMESTAMP_NTZ"),
+            (SfType::Text.into(), "TEXT"),
+            (SfType::Varchar.into(), "VARCHAR"),
+            (SfType::Integer.into(), "INTEGER"),
+            (SfType::Binary.into(), "BINARY"),
+            (SfType::Variant.into(), "VARIANT"),
+            (SfType::Array.into(), "ARRAY"),
+            (ChType::Bool.into(), "Bool"),
+            (ChType::Int16.into(), "Int16"),
+            (ChType::Int32.into(), "Int32"),
+            (ChType::Int64.into(), "Int64"),
+            (ChType::UInt64.into(), "UInt64"),
+            (ChType::Float32.into(), "Float32"),
+            (ChType::Float64.into(), "Float64"),
+            (ChType::Decimal(76, 2).into(), "Decimal(76, 2)"),
+            (ChType::Decimal64(6).into(), "Decimal64(6)"),
+            (ChType::Date32.into(), "Date32"),
+            (ChType::DateTime64(9, None).into(), "DateTime64(9)"),
+            (ChType::DateTime64(3, utc).into(), "DateTime64(3, 'UTC')"),
+            (ChType::String.into(), "String"),
+            (ChType::Json.into(), "JSON"),
+            (ChType::Uuid.into(), "UUID"),
+            (ChType::FixedString16.into(), "FixedString(16)"),
+            (
+                ChType::Array(Box::new(ChType::Array(Box::new(ChType::Uuid)))).into(),
+                "Array(Nullable(Array(Nullable(UUID))))",
+            ),
+            (DuckType::Boolean.into(), "BOOLEAN"),
+            (DuckType::SmallInt.into(), "SMALLINT"),
+            (DuckType::Integer.into(), "INTEGER"),
+            (DuckType::BigInt.into(), "BIGINT"),
+            (DuckType::UBigInt.into(), "UBIGINT"),
+            (DuckType::Float.into(), "FLOAT"),
+            (DuckType::Double.into(), "DOUBLE"),
+            (DuckType::DecimalBare.into(), "DECIMAL"),
+            (DuckType::Decimal(18, 2).into(), "DECIMAL(18,2)"),
+            (DuckType::DecimalWide.into(), "DECIMAL(38,*)"),
+            (DuckType::Date.into(), "DATE"),
+            (DuckType::Time.into(), "TIME"),
+            (DuckType::TimestampTz.into(), "TIMESTAMPTZ"),
+            (DuckType::TimestampNs.into(), "TIMESTAMP_NS"),
+            (DuckType::Timestamp.into(), "TIMESTAMP"),
+            (DuckType::Varchar.into(), "VARCHAR"),
+            (DuckType::Blob.into(), "BLOB"),
+            (DuckType::Json.into(), "JSON"),
+            (DuckType::Uuid.into(), "UUID"),
+            (DuckType::Interval.into(), "INTERVAL"),
+            (
+                DuckType::List(Box::new(DuckType::List(Box::new(DuckType::Json)))).into(),
+                "JSON[][]",
+            ),
+            (TargetType::Unmapped, "-"),
+        ];
+        for (t, want) in cases {
+            assert_eq!(t.to_string(), want, "{t:?}");
+        }
+    }
+
+    /// The `--json` report carries a target type as its DDL string, as it did before the type was typed.
+    #[test]
+    fn a_target_type_serialises_as_its_ddl_string() {
+        let spec = ch(&RivetType::List {
+            inner: Box::new(RivetType::Uuid),
+        });
+        let v = serde_json::to_value(&spec).unwrap();
+        assert_eq!(v["target_type"], "Array(Nullable(UUID))");
+        assert_eq!(v["autoload_type"], "Array(Nullable(FixedString(16)))");
+    }
+
     fn duck(rt: &RivetType) -> TargetColumnSpec {
         ExportTarget::DuckDb.resolve_column(input(rt))
     }
@@ -1062,7 +1390,7 @@ mod tests {
         // warn: BigQuery autodetect produces the same nested shape → no divergence.
         assert_eq!(s.autoload_type, "ARRAY<STRUCT<item STRING>>");
         assert!(
-            !s.target_type.starts_with("REPEATED "),
+            !s.target_type.to_string().starts_with("REPEATED "),
             "must not emit invalid REPEATED DDL"
         );
         assert_eq!(s.status, TargetStatus::Warn);
@@ -1376,8 +1704,8 @@ mod tests {
     fn clickhouse_grades_a_column_name_the_load_refuses_as_fail() {
         let mut spec = TargetColumnSpec {
             column_name: "naïve col".into(),
-            target_type: "String".into(),
-            autoload_type: "String".into(),
+            target_type: ChType::String.into(),
+            autoload_type: ChType::String.into(),
             status: TargetStatus::Ok,
             note: None,
             cast_sql: None,
@@ -1412,7 +1740,7 @@ mod tests {
             timezone: None,
         });
         assert_eq!(
-            (ts.target_type.as_str(), ts.status),
+            (ts.target_type.to_string().as_str(), ts.status),
             ("DateTime64(6)", TargetStatus::Warn)
         );
         assert!(
@@ -1435,7 +1763,10 @@ mod tests {
             inner: Box::new(RivetType::Uuid),
         });
         assert_eq!(
-            (uuids.target_type.as_str(), uuids.autoload_type.as_str()),
+            (
+                uuids.target_type.to_string().as_str(),
+                uuids.autoload_type.to_string().as_str()
+            ),
             ("Array(Nullable(UUID))", "Array(Nullable(FixedString(16)))"),
             "an array's autoload is its element's"
         );
@@ -1584,7 +1915,7 @@ mod tests {
             scale: 0,
         };
         assert_eq!(
-            (ch(&zero).status, ch(&zero).target_type.as_str()),
+            (ch(&zero).status, ch(&zero).target_type.to_string().as_str()),
             (TargetStatus::Ok, "Decimal(10, 0)"),
             "scale 0 is an ordinary decimal"
         );

@@ -17,7 +17,7 @@
 //! warehouse credits can be summed after the fact.
 
 use super::TargetLoader;
-use crate::types::target::TargetColumnSpec;
+use crate::types::target::{SfType, TargetColumnSpec, TargetType};
 use anyhow::{Context, Result, bail};
 use std::process::Command;
 
@@ -474,7 +474,7 @@ impl SnowflakeLoader {
 pub(crate) fn partition_expr(
     export: &str,
     spec: &crate::load::plan::PartitionSpec,
-    column_type: &dyn Fn(&str) -> Result<String>,
+    column_type: &dyn Fn(&str) -> Result<TargetType>,
 ) -> Result<(crate::load::plan::PartitionKey, String)> {
     use crate::load::plan::{PartitionForm, PartitionKey};
     if spec.expiration_days.is_some() || spec.require_filter {
@@ -494,10 +494,14 @@ pub(crate) fn partition_expr(
         );
     };
     let t = column_type(column)?;
-    if !(t.starts_with("DATE") || t.starts_with("TIMESTAMP")) {
+    if !matches!(
+        t,
+        TargetType::Snowflake(SfType::Date | SfType::TimestampTz | SfType::TimestampNtz)
+    ) {
         bail!(
-            "export `{export}`: cannot partition on `{column}` ({t}); Snowflake clusters a DATE \
-             or TIMESTAMP column by time"
+            "export `{export}`: cannot partition on `{column}` ({}); Snowflake clusters a DATE \
+             or TIMESTAMP column by time",
+            crate::load::plan::base_type(&t)
         );
     }
     Ok((
@@ -556,7 +560,7 @@ fn build_alter_add_columns_sql(fqtn: &str, specs: &[TargetColumnSpec]) -> String
 /// (Rivet's Snowflake resolver maps JSON → `VARIANT`); a plain `COPY` would
 /// leave it a string.
 fn needs_parse_json(spec: &TargetColumnSpec) -> bool {
-    spec.target_type.eq_ignore_ascii_case("VARIANT")
+    spec.target_type == TargetType::Snowflake(SfType::Variant)
 }
 
 /// Keep a table name safe for a stage name / query tag (alnum + underscore).
@@ -641,11 +645,11 @@ mod tests {
     use super::*;
     use crate::types::target::TargetStatus;
 
-    fn spec(name: &str, ty: &str) -> TargetColumnSpec {
+    fn spec(name: &str, ty: SfType) -> TargetColumnSpec {
         TargetColumnSpec {
             column_name: name.to_string(),
-            target_type: ty.to_string(),
-            autoload_type: String::new(),
+            autoload_type: ty.clone().into(),
+            target_type: ty.into(),
             status: TargetStatus::Ok,
             note: None,
             cast_sql: None,
@@ -694,9 +698,9 @@ mod tests {
     #[test]
     fn variant_columns_are_parsed_scalars_pass_through() {
         let specs = [
-            spec("id", "NUMBER(38,0)"),
-            spec("meta", "VARIANT"),
-            spec("created", "DATE"),
+            spec("id", SfType::NumberPs(38, 0)),
+            spec("meta", SfType::Variant),
+            spec("created", SfType::Date),
         ];
         let sel = SnowflakeLoader::build_copy_select(&specs);
         assert_eq!(sel, "$1:id, PARSE_JSON($1:meta), $1:created");
@@ -704,7 +708,10 @@ mod tests {
 
     #[test]
     fn schema_ddl_and_column_list_are_unquoted() {
-        let specs = [spec("id", "NUMBER(38,0)"), spec("meta", "VARIANT")];
+        let specs = [
+            spec("id", SfType::NumberPs(38, 0)),
+            spec("meta", SfType::Variant),
+        ];
         assert_eq!(
             SnowflakeLoader::build_schema_ddl(&specs),
             "  id NUMBER(38,0),\n  meta VARIANT"
@@ -726,7 +733,7 @@ mod tests {
         let append = l
             .build_append_changelog_sql(
                 "t",
-                &[spec("id", "NUMBER")],
+                &[spec("id", SfType::Number)],
                 &["gs://b/p/part-0.parquet".to_string()],
             )
             .unwrap();
@@ -765,8 +772,8 @@ mod tests {
     #[test]
     fn alter_add_columns_reconciles_an_existing_log_and_never_replaces_it() {
         let specs = vec![
-            spec("__op", "VARCHAR"),
-            spec(crate::enrich::COL_ROW_HASH, "NUMBER(38,0)"),
+            spec("__op", SfType::Varchar),
+            spec(crate::enrich::COL_ROW_HASH, SfType::NumberPs(38, 0)),
         ];
         let sql = build_alter_add_columns_sql("DB.SC.t__changes", &specs);
         assert!(
@@ -797,7 +804,7 @@ mod tests {
     /// the COPY that names the columns.
     #[test]
     fn the_append_script_alters_between_the_create_and_the_copy() {
-        let specs = vec![spec("id", "NUMBER"), spec("__op", "VARCHAR")];
+        let specs = vec![spec("id", SfType::Number), spec("__op", SfType::Varchar)];
         let mut l = SnowflakeLoader::new("c");
         l.database = "DB".into();
         l.schema = "SC".into();
@@ -883,11 +890,11 @@ mod tests {
         l
     }
 
-    fn col(name: &str, ty: &str) -> TargetColumnSpec {
+    fn col(name: &str, ty: SfType) -> TargetColumnSpec {
         TargetColumnSpec {
             column_name: name.into(),
+            autoload_type: ty.clone().into(),
             target_type: ty.into(),
-            autoload_type: String::new(),
             status: TargetStatus::Ok,
             note: None,
             cast_sql: None,
@@ -935,7 +942,7 @@ mod tests {
         let sql = l
             .build_materialize_sql(
                 "orders",
-                &[col("id", "NUMBER(38,0)")],
+                &[col("id", SfType::NumberPs(38, 0))],
                 &["gs://bkt/exports/orders/part-0.parquet".to_string()],
             )
             .expect("the overwrite script builds");
@@ -1013,7 +1020,7 @@ mod tests {
                 loader.warehouse
             ))
             .expect("fixture table");
-        let specs = [col("id", "NUMBER"), col("v", "VARCHAR")];
+        let specs = [col("id", SfType::Number), col("v", SfType::Varchar)];
         let adopted = crate::load::adopt_full_load_table(
             &loader,
             &table,

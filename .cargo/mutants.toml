@@ -262,6 +262,9 @@ exclude_re = [
     # print_up_to_date writes stderr only; its text is graded through up_to_date_line
     # (the_up_to_date_line_names_the_mode_table_and_warehouse, the print_pool_estimate precedent).
     "replace print_up_to_date with \\(\\)",
+    # print_table writes stdout only; its text is graded through render_table
+    # (the_target_table_renders_the_typed_target_and_autoload, the print_pool_estimate precedent).
+    "replace print_table with \\(\\)",
     # run_with_reconnect / run_mongo_parallel (ADR-0028 seam cut-over, PR: the
     # finalize-export-seam branch) are live-only export runners: the first wraps
     # run_single_export's retry loop over a real source connection, the second
