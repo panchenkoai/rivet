@@ -1924,3 +1924,45 @@ fn a_failed_rerun_retires_the_prior_success_marker_s3() {
         "a _SUCCESS beside a failed canonical manifest reads as complete to a sensor"
     );
 }
+
+/// A chunk run whose task list never landed is not resumed as a zero-chunk success:
+/// the open fails, and the next plain run plans afresh; the rig oracle grades its delivery against the source.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_chunk_run_whose_task_insert_failed_is_not_resumed_as_an_empty_success() {
+    require_alive(LiveService::Postgres);
+
+    let table = seed_pg_numeric_table(150);
+    let export = unique_name("chunk_open_fault");
+    let rig = Rig::pg_batch(&export)
+        .query(&format!("SELECT id, name FROM {}", table.name()))
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 50")
+        .export_line("chunk_checkpoint: true");
+    let cfg = rig.config_path();
+    let db = cfg.parent().unwrap().join(".rivet_state.db");
+    drop(rivet::state::StateStore::open_at_path(&db).expect("create the state DB"));
+    open_state_db(&cfg)
+        .execute_batch(
+            "CREATE TRIGGER fail_task BEFORE INSERT ON chunk_task \
+             BEGIN SELECT RAISE(ABORT, 'injected task insert failure'); END;",
+        )
+        .unwrap();
+
+    let failed = rig.run_args(&["--export", &export]);
+    assert!(
+        !failed.status.success(),
+        "the run whose task insert fails must exit non-zero"
+    );
+    open_state_db(&cfg)
+        .execute_batch("DROP TRIGGER fail_task;")
+        .unwrap();
+
+    let next = rig.run_args(&["--export", &export]);
+    assert!(
+        next.status.success(),
+        "the next plain run must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&next.stderr)
+    );
+}

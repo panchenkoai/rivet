@@ -440,8 +440,13 @@ pub(super) fn ensure_chunk_checkpoint_plan(
     // scheduler ticks can slip through. When the index rejects this create, another
     // run won the race: map it to the same 'still in progress' bail, not a raw DB
     // constraint error.
-    if let Err(e) = state.create_chunk_run(&summary.run_id, &plan.export_name, &plan_hash, max_att)
-    {
+    if let Err(e) = state.open_chunk_run(
+        &summary.run_id,
+        &plan.export_name,
+        &plan_hash,
+        max_att,
+        chunks,
+    ) {
         if let Ok(Some((rid, _))) = state.find_in_progress_chunk_run(&plan.export_name) {
             anyhow::bail!(
                 "export '{}': chunk checkpoint run '{}' still in progress (a concurrent run won the race); use `rivet run {} --export {} --resume` or `rivet state reset-chunks {} --export {}`",
@@ -455,7 +460,6 @@ pub(super) fn ensure_chunk_checkpoint_plan(
         }
         return Err(e);
     }
-    state.insert_chunk_tasks(&summary.run_id, chunks)?;
     log::info!(
         "export '{}': chunk checkpoint: {} tasks saved (run_id={})",
         plan.export_name,
@@ -842,6 +846,42 @@ mod tests {
         assert!(msg.contains("still in progress"), "got: {msg}");
         assert!(msg.contains("--resume"), "must hint at --resume");
         assert!(msg.contains("reset-chunks"), "must hint at reset-chunks");
+    }
+
+    /// A chunk run whose task list failed to land must not be left for a plain run to resume as a zero-chunk success.
+    #[test]
+    fn a_failed_task_insert_leaves_no_chunk_run_to_resume_as_an_empty_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateStore::open_at_path(&dir.path().join("state.db")).unwrap();
+        let plan = make_plan("orders");
+        let cp = chunked_plan(&plan).clone();
+        let mut summary = make_summary(&plan, "run-1");
+        state.exec_for_test(
+            "CREATE TRIGGER fail_task BEFORE INSERT ON chunk_task \
+             BEGIN SELECT RAISE(ABORT, 'injected task insert failure'); END;",
+        );
+        ensure_chunk_checkpoint_plan(
+            &state,
+            &plan,
+            &cp,
+            &mut summary,
+            &[(1, 100), (101, 200)],
+            "rivet.yaml",
+        )
+        .expect_err("the task insert fails");
+        state.exec_for_test("DROP TRIGGER fail_task;");
+
+        let (_lease, resumed) = claim_checkpoint_run(&state, &plan).unwrap();
+        assert!(
+            resumed.is_none(),
+            "a plain run must start fresh, not resume a chunk run that has no tasks"
+        );
+        assert!(
+            state
+                .find_in_progress_chunk_run("orders")
+                .unwrap()
+                .is_none()
+        );
     }
 
     // ── record_chunked_commit ─────────────────────────────────────────────

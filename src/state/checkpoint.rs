@@ -64,6 +64,7 @@ impl StateStore {
         )
     }
 
+    /// Open an `in_progress` chunk run with no tasks (tests seed tasks separately).
     pub fn create_chunk_run(
         &self,
         run_id: &str,
@@ -71,19 +72,23 @@ impl StateStore {
         plan_hash: &str,
         max_chunk_attempts: u32,
     ) -> Result<()> {
-        let now = chrono::Utc::now().to_rfc3339();
-        self.execute(
-            "INSERT INTO chunk_run (run_id, export_name, plan_hash, status, max_chunk_attempts, created_at, updated_at)
-             VALUES (?1, ?2, ?3, 'in_progress', ?4, ?5, ?5)",
-            &[
-                run_id.into(),
-                export_name.into(),
-                plan_hash.into(),
-                (max_chunk_attempts as i64).into(),
-                now.into(),
-            ],
-        )?;
-        Ok(())
+        self.open_chunk_run(run_id, export_name, plan_hash, max_chunk_attempts, &[])
+    }
+
+    /// Open an `in_progress` chunk run together with its task list, committed in one transaction.
+    pub fn open_chunk_run(
+        &self,
+        run_id: &str,
+        export_name: &str,
+        plan_hash: &str,
+        max_chunk_attempts: u32,
+        ranges: &[(i64, i64)],
+    ) -> Result<()> {
+        self.write_chunk_run(
+            Some((export_name, plan_hash, max_chunk_attempts)),
+            run_id,
+            ranges,
+        )
     }
 
     /// Divergent-by-design (row.rs exemption): a transactional batch insert on
@@ -93,10 +98,28 @@ impl StateStore {
         if ranges.is_empty() {
             return Ok(());
         }
+        self.write_chunk_run(None, run_id, ranges)
+    }
+
+    /// Insert an optional `chunk_run` row and its `chunk_task` rows in one transaction.
+    fn write_chunk_run(
+        &self,
+        run: Option<(&str, &str, u32)>,
+        run_id: &str,
+        ranges: &[(i64, i64)],
+    ) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
+        let run_sql = "INSERT INTO chunk_run (run_id, export_name, plan_hash, status, max_chunk_attempts, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'in_progress', ?4, ?5, ?5)";
         match &self.conn {
             StateConn::Sqlite(c) => {
                 let tx = c.unchecked_transaction()?;
+                if let Some((export_name, plan_hash, max)) = run {
+                    tx.execute(
+                        run_sql,
+                        rusqlite::params![run_id, export_name, plan_hash, max as i64, now],
+                    )?;
+                }
                 {
                     let mut stmt = tx.prepare(
                         "INSERT INTO chunk_task (run_id, chunk_index, start_key, end_key, status, attempts, updated_at)
@@ -119,6 +142,15 @@ impl StateStore {
                 let mut tx = c.transaction().map_err(|e| {
                     anyhow::anyhow!("state(pg): begin transaction: {}", super::pg_detail(&e))
                 })?;
+                if let Some((export_name, plan_hash, max)) = run {
+                    tx.execute(
+                        &super::pg_sql(run_sql),
+                        &[&run_id, &export_name, &plan_hash, &(max as i64), &now],
+                    )
+                    .map_err(|e| {
+                        anyhow::anyhow!("state(pg): insert chunk_run: {}", super::pg_detail(&e))
+                    })?;
+                }
                 for (i, (start, end)) in ranges.iter().enumerate() {
                     tx.execute(
                         "INSERT INTO chunk_task (run_id, chunk_index, start_key, end_key, status, attempts, updated_at)
