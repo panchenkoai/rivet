@@ -401,15 +401,6 @@ impl ExportSink {
         ledger.observe(self.take_observations());
     }
 
-    /// Contribute [`Self::take_checksums`] to `ledger` under `unit`.
-    pub(in crate::pipeline) fn drain_integrity_into(
-        &mut self,
-        unit: crate::pipeline::commit::UnitId,
-        ledger: &mut crate::pipeline::commit::CommitLedger,
-    ) {
-        ledger.contribute(unit, self.take_checksums());
-    }
-
     /// The column this sink's Form-B checksums are keyed to, or `None` when they are
     /// un-keyed.
     ///

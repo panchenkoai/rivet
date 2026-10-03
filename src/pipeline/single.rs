@@ -11,7 +11,6 @@ use super::RunSummary;
 use super::chunked::{run_chunked_sequential, run_chunked_sequential_checkpoint};
 use super::retry::{RetryClass, classify_error};
 use super::sink::ExportSink;
-use super::validate::validate_output;
 use crate::error::{DataIntegrityError, Result};
 use crate::journal::RunEvent;
 use crate::plan::{ExtractionStrategy, ResolvedRunPlan};
@@ -361,8 +360,6 @@ pub(super) fn run_single_export(
         return Ok(());
     }
 
-    let parts = sink.seal_parts()?;
-
     let frame = super::frame::RunnerFrame::open(plan)?;
     let (dest, ext) = (frame.dest, frame.ext);
     let ext = ext.as_str();
@@ -373,52 +370,27 @@ pub(super) fn run_single_export(
     // (LocalDestination idempotent_overwrite) — a real incremental-delta loss.
     let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
 
-    for (part_idx, part) in parts.iter().enumerate() {
-        // Test-only: a RETURNED error mid-commit-loop (not a crash — a panic
-        // never reaches the retry decider at all). Proves the boundary the
-        // runner-coverage matrix argues "by construction": an error at part N
-        // leaves files_committed = N for decide_export_retry's duplicate
-        // guard, because parts 0..N-1 already went through record_part.
-        if let Err(e) =
-            crate::test_hook::maybe_error_at_index("single_part_commit", part_idx as i64)
-        {
-            anyhow::bail!("part {part_idx}: {e}");
-        }
-        if plan.validate {
-            validate_output(part.tmp.path(), plan.format, part.rows)?;
-            summary.validated = Some(true);
-            summary
-                .journal
-                .record(RunEvent::ValidationResult { passed: true });
-        }
-
-        let file_name = part_file_name(&plan.export_name, &ts, part_idx, parts.len(), ext);
-
-        // ADR-0001 I1→I2→I7 + the I2/I3 fault windows + the manifest/journal/
-        // counters all live in `commit::{write_part_file,record_part}` now (one
-        // home for the ordering that used to be copied across runners).
-        let rec = super::commit::write_part_file(
-            dest.as_ref(),
-            part.tmp.path(),
-            part.rows as i64,
-            file_name,
-        )?;
-        super::commit::record_part(
-            plan,
-            summary,
-            state,
-            &rec,
-            super::commit::PartKind::File {
-                part_index: part_idx,
-            },
-            // ADR-0029: single's commit unit is the whole invocation — ONE sink
-            // accumulated the checksums of every part in this loop, so the
-            // drain below either covers them all or (on a mid-loop bail, which
-            // skips it) none. Keying per part_index would claim a per-part
-            // correspondence the sink does not have.
-            super::commit::UnitId::Run,
-        );
-    }
+    let (parts, wrote) = super::commit::write_sink_parts(
+        dest.as_ref(),
+        &mut sink,
+        plan.validate.then_some(plan.format),
+        |idx, count| part_file_name(&plan.export_name, &ts, idx, count, ext),
+    );
+    // ADR-0029: single's commit unit is the whole invocation — ONE sink accumulated
+    // the checksums of every part, so they cover all of them or (on a mid-write
+    // failure) none. Observations were fed above, at read end.
+    let checksums = wrote.map(|()| sink.take_checksums());
+    super::fan_in::commit_unit(
+        plan,
+        summary,
+        state,
+        super::commit::UnitId::Run,
+        parts,
+        |part_index| super::commit::PartKind::File { part_index },
+        Default::default(),
+        checksums,
+        |_| Ok(()),
+    )?;
 
     // Round-2 audit #12: record the incremental cursor RANGE on the summary but do
     // NOT advance the state cursor here. Under ADR-0001 the DESTINATION is the
@@ -444,14 +416,6 @@ pub(super) fn run_single_export(
         summary.cursor_low = prior_low;
         summary.cursor_high = Some(last_val.clone());
     }
-
-    // ADR-0028/0029: feed the INTEGRITY half — every part of this run is now
-    // committed and recorded under `UnitId::Run`, so the sink's accumulated
-    // Form-B checksums cover exactly them. The seam
-    // (`finalize::finalize_export`, called by the dispatcher) applies the
-    // fingerprint pin, the `on_schema_drift` gate, the Form-B harvest and the
-    // shape-drift warn; the application lives in no runner.
-    sink.drain_integrity_into(super::commit::UnitId::Run, &mut summary.ledger);
 
     // "data phase complete", not "completed successfully": the post-run gates
     // (drift policy, quality) run at the dispatcher AFTER this returns — a run

@@ -2281,7 +2281,7 @@ fn every_single_runner_hook_loses_nothing_on_oracle() {
         (PANIC, "after_source_read"),
         (PANIC, "after_file_write"),
         (PANIC, "after_manifest_update"),
-        (ERROR, "single_part_commit:1"),
+        (ERROR, "sink_part_write:1"),
     ] {
         let rig = crash_rig(t.name(), "full", &[]);
         let ctx = format!("single {fault:?}");
@@ -2300,7 +2300,7 @@ fn every_incremental_runner_hook_loses_nothing_on_oracle() {
         (PANIC, "after_file_write"),
         (PANIC, "after_manifest_update"),
         (PANIC, "after_cursor_commit"),
-        (ERROR, "single_part_commit:1"),
+        (ERROR, "sink_part_write:1"),
     ] {
         let ctx = format!("incremental {fault:?}");
         let t = crash_table(600);

@@ -37,13 +37,13 @@ fn single_commit_error_still_counts_the_durable_parts_postgres() {
         .export_line("  row_group_strategy: fixed_rows")
         .export_line("  row_group_rows: 100")
         .export_line("tuning: {batch_size: 100}");
-    let out = rig.run_with_env("RIVET_TEST_ERROR_AT", "single_part_commit:2");
+    let out = rig.run_with_env("RIVET_TEST_ERROR_AT", "sink_part_write:2");
     assert!(
         !out.status.success(),
         "an injected commit-loop error must fail the run"
     );
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("single_part_commit"),
+        String::from_utf8_lossy(&out.stderr).contains("sink_part_write"),
         "the failure must be OUR injected error, not a fixture accident: {}",
         String::from_utf8_lossy(&out.stderr)
     );
