@@ -248,6 +248,36 @@ fn mongo_cdc_initial_snapshot_covers_preexisting_rows() {
     );
 }
 
+/// A lost checkpoint's warning remedy, followed as printed, re-reads a document written while it was gone.
+#[test]
+#[ignore = "live: requires docker compose up -d mongo-rs + the rivet-duckdb oracle"]
+fn mongo_missing_checkpoint_warning_remedy_recovers_the_document_written_while_it_was_gone() {
+    require_alive(LiveService::MongoRs);
+    require_alive(LiveService::DuckDb);
+    let mut s = CdcScenario::mongo_with("cdc_ckgap", |r, _| {
+        r.oracle_known_defect(
+            "undelivered rows",
+            "known defect: a lost MongoDB checkpoint on a stream with no baseline re-anchors with only a warning, so the document written in the gap is lost until the warning's re-baseline runs",
+        )
+    });
+    s.rig.run_ok();
+    s.insert(1);
+    s.rig.run_ok();
+    std::fs::remove_file(s.rig.checkpoint()).expect("the checkpoint the run wrote");
+    s.insert(2);
+    let said = s.rig.run_ok_capture();
+    assert!(
+        said.contains("mongodb cdc: no checkpoint at") && said.contains(REBASELINE_REMEDY),
+        "the re-anchor warns with the re-baseline remedy:\n{said}"
+    );
+    follow_rebaseline_remedy(&mut s.rig, false);
+    assert_eq!(
+        walkdir_parquet_ids(&s.rig.out_dir(), "snapshot"),
+        ["1".to_string(), "2".to_string()].into(),
+        "the remedy's baseline holds the document written while the checkpoint was gone"
+    );
+}
+
 /// Distinct `_id` values across `.parquet` files under any subdir of `root`
 /// whose path contains `marker` (e.g. the `snapshot/` handoff dir).
 fn walkdir_parquet_ids(root: &std::path::Path, marker: &str) -> std::collections::BTreeSet<String> {

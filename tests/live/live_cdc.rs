@@ -1791,17 +1791,140 @@ fn pg_initial_snapshot_vanished_slot_fails_loudly_not_recreates() {
     let expected = format!(
         "pg cdc: slot '{slot}' is missing but a prior run completed this export's snapshot (the \
          state DB's `cdc_snapshot` row or the destination's snapshot/_SUCCESS marker) — the slot \
-         was dropped or invalidated, and the changes since then are no longer in the log. To \
-         re-snapshot: clear the export's `cdc_snapshot` row in the state DB AND delete the \
-         destination's snapshot/_SUCCESS marker (the two done-signals are OR-ed, so leaving \
-         either in place repeats this refusal). If a warehouse load consumes this stream, ALSO \
-         truncate its `<table>__changes` table before the next load. Then re-run: rivet creates \
-         the new slot BEFORE it re-snapshots, so nothing falls between the two (see \
-         cdc-failure-modes.md)."
+         was dropped or invalidated, and the changes since then are no longer in the log. \
+         {REBASELINE_REMEDY}"
     );
     assert!(
         stderr.contains(&expected),
         "the refusal must name the snapshot it found, and only that:\n{stderr}"
+    );
+}
+
+/// The slot-created warning's remedy, followed as printed, re-reads a row written while the slot was gone.
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical) + the rivet-duckdb oracle"]
+fn pg_slot_created_warning_remedy_recovers_the_row_written_while_the_slot_was_gone() {
+    use postgres::NoTls;
+    let tbl = unique_name("cdc_slotgap");
+    let slot = unique_name("rivet_slotgap");
+    let _slot = Slot::new(slot.clone());
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"
+    ))
+    .unwrap();
+    let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
+    let mut rig = Rig::pg_cdc(&tbl, &slot).oracle_known_defect(
+            "undelivered rows",
+            "known defect: a PostgreSQL slot dropped under a stream with no checkpoint or baseline is re-created with only a warning, so the row written in the gap is lost until the warning's re-baseline runs",
+        );
+    rig.run_ok();
+    c.batch_execute(&format!("INSERT INTO {tbl} VALUES (1, 10)"))
+        .unwrap();
+    rig.run_ok();
+    c.execute("SELECT pg_drop_replication_slot($1)", &[&slot])
+        .unwrap();
+    c.batch_execute(&format!("INSERT INTO {tbl} VALUES (2, 20)"))
+        .unwrap();
+    let said = rig.run_ok_capture();
+    assert!(
+        said.contains(&format!("pg cdc: creating replication slot '{slot}'"))
+            && said.contains(REBASELINE_REMEDY),
+        "the re-created slot warns with the re-baseline remedy:\n{said}"
+    );
+    follow_rebaseline_remedy(&mut rig, false);
+    assert_eq!(
+        dir_parquet_id_set(&rig.out_dir().join("snapshot")),
+        [1, 2].into(),
+        "the remedy's baseline holds the row written while the slot was gone"
+    );
+}
+
+/// A slot lost under a completed baseline: the refusal's remedy, followed as printed, re-reads the row written in the gap.
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical) + the rivet-duckdb oracle"]
+fn pg_missing_slot_refusal_remedy_recovers_the_row_written_while_the_slot_was_gone() {
+    use postgres::NoTls;
+    let tbl = unique_name("cdc_slotref");
+    let slot = unique_name("rivet_slotref");
+    let _slot = Slot::new(slot.clone());
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT); \
+         INSERT INTO {tbl} VALUES (1, 10)"
+    ))
+    .unwrap();
+    let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
+    let mut rig = Rig::pg_cdc(&tbl, &slot).cdc_line("initial: snapshot");
+    rig.run_ok();
+    c.execute("SELECT pg_drop_replication_slot($1)", &[&slot])
+        .unwrap();
+    c.batch_execute(&format!("INSERT INTO {tbl} VALUES (2, 20)"))
+        .unwrap();
+    let said = rig.run_expect_fail();
+    assert!(
+        said.contains("is missing but a prior run completed this export's snapshot")
+            && said.contains(REBASELINE_REMEDY),
+        "the refusal names the re-baseline remedy:\n{said}"
+    );
+    follow_rebaseline_remedy(&mut rig, true);
+    assert_eq!(
+        dir_parquet_id_set(&rig.out_dir().join("snapshot")),
+        [1, 2].into(),
+        "the re-read baseline holds the row written while the slot was gone"
+    );
+}
+
+/// A lost checkpoint's warning remedy, followed as printed, re-reads a row written while it was gone.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc + the rivet-duckdb oracle"]
+fn mysql_missing_checkpoint_warning_remedy_recovers_the_row_written_while_it_was_gone() {
+    let mut s = CdcScenario::mysql_with("cdc_ckgap", "id INT PRIMARY KEY, v BIGINT", |r, _| {
+        r.oracle_known_defect(
+            "undelivered rows",
+            "known defect: a lost MySQL checkpoint on a stream with no baseline re-anchors with only a warning, so the row written in the gap is lost until the warning's re-baseline runs",
+        )
+    });
+    s.rig.run_ok();
+    s.insert(1);
+    s.rig.run_ok();
+    std::fs::remove_file(s.rig.checkpoint()).expect("the checkpoint the run wrote");
+    s.insert(2);
+    let said = s.rig.run_ok_capture();
+    assert!(
+        said.contains("mysql cdc: no checkpoint at") && said.contains(REBASELINE_REMEDY),
+        "the re-anchor warns with the re-baseline remedy:\n{said}"
+    );
+    follow_rebaseline_remedy(&mut s.rig, false);
+    assert_eq!(
+        dir_parquet_id_set(&s.rig.out_dir().join("snapshot")),
+        [1, 2].into(),
+        "the remedy's baseline holds the row written while the checkpoint was gone"
+    );
+}
+
+/// A checkpoint lost under a completed baseline: the refusal's remedy, followed as printed, re-reads the row written since.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc + the rivet-duckdb oracle"]
+fn mysql_missing_checkpoint_refusal_remedy_recovers_the_row_written_while_it_was_gone() {
+    let mut s = CdcScenario::mysql_with("cdc_ckref", "id INT PRIMARY KEY, v BIGINT", |r, _| {
+        r.cdc_line("initial: snapshot")
+    });
+    s.insert(1);
+    s.rig.run_ok();
+    std::fs::remove_file(s.rig.checkpoint()).expect("the checkpoint the run wrote");
+    s.insert(2);
+    let said = s.rig.run_expect_fail();
+    assert!(
+        said.contains("is missing but prior-run evidence exists")
+            && said.contains(REBASELINE_REMEDY),
+        "the refusal names the re-baseline remedy:\n{said}"
+    );
+    follow_rebaseline_remedy(&mut s.rig, true);
+    assert_eq!(
+        dir_parquet_id_set(&s.rig.out_dir().join("snapshot")),
+        [1, 2].into(),
+        "the re-read baseline holds the row written while the checkpoint was gone"
     );
 }
 
@@ -2711,14 +2834,7 @@ fn pg_cdc_vanished_slot_with_checkpoint_fails_loudly_not_recreates() {
     let expected = format!(
         "pg cdc: slot '{slot}' is missing but the checkpoint file holds a position from a prior \
          run — the slot was dropped or invalidated, and the changes since then are no longer in \
-         the log. Without a baseline (`initial: snapshot` or `backfill:`), deleting the \
-         checkpoint file re-anchors at the current position and accepts the gap. To re-snapshot \
-         instead: delete the checkpoint file, clear the export's `cdc_snapshot` row in the state \
-         DB AND delete the destination's snapshot/_SUCCESS marker (the two done-signals are \
-         OR-ed, so leaving either in place repeats this refusal). If a warehouse load consumes \
-         this stream, ALSO truncate its `<table>__changes` table before the next load. Then \
-         re-run: rivet creates the new slot BEFORE it re-snapshots, so nothing falls between the \
-         two (see cdc-failure-modes.md)."
+         the log. {REBASELINE_REMEDY}"
     );
     assert!(
         stderr.contains(&expected),
@@ -4299,7 +4415,7 @@ fn roast_pg_cdc_refuses_a_truncate_instead_of_silently_diverging() {
          Output:\n{said}"
     );
     assert!(
-        said.contains("TRUNCATE") && said.contains("mode: full"),
+        said.contains("TRUNCATE") && said.contains(REBASELINE_REMEDY),
         "the refusal must name what happened AND the re-snapshot that recovers \
          from it — a bail with no way forward just moves the operator's problem. \
          Output:\n{said}"
@@ -4469,7 +4585,7 @@ fn roast_mysql_cdc_refuses_a_truncate_instead_of_silently_diverging() {
 
     let msg = rig().run_expect_fail();
     assert!(
-        msg.contains("TRUNCATE") && msg.contains("mode: full"),
+        msg.contains("TRUNCATE") && msg.contains(REBASELINE_REMEDY),
         "the run must refuse and name both what happened and the re-snapshot that \
          recovers from it — shipping the 2 inserts as a success leaves them in the \
          destination with nothing to retract them. Got: {msg}"
@@ -6878,7 +6994,7 @@ fn mysql_cdc_refuses_minimal_row_metadata_at_open() {
         "the refusal names the SQL fix: {said}"
     );
     assert!(
-        said.contains("anchors afresh FIRST, then re-snapshot"),
+        said.contains(REBASELINE_REMEDY),
         "the recovery is anchor first, then snapshot: {said}"
     );
     assert!(
@@ -8233,7 +8349,7 @@ fn a_mysql_checkpoint_from_another_server_is_refused() {
          happened needs to know which is which. Got:\n{said}"
     );
     assert!(
-        said.contains("mode: full"),
+        said.contains(REBASELINE_REMEDY),
         "and name the recovery: coordinates cannot be carried to a new server at \
          all, so a re-snapshot is the only path. Got:\n{said}"
     );
