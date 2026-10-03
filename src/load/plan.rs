@@ -246,6 +246,8 @@ pub struct LoadPlan {
     /// The incremental cursor column (from `cursor_column:`) — the dedup view's
     /// latest-per-PK ordering key. `Some` only for [`LoadMode::Incremental`].
     pub cursor_column: Option<String>,
+    /// Whether each run continues past the last key (`plan::build::continued_key`), so carries only new keys.
+    pub continued_key: bool,
     /// The resolved dedup key: the configured `pk`, or the recorded source key for `auto`.
     pub pk: Vec<String>,
     /// The clustering of the table the load writes.
@@ -459,8 +461,7 @@ pub fn load_mode_of(
     }
 }
 
-/// The column an incremental load's current state is ordered by: the key a continued
-/// export seeks past, or the export's cursor.
+/// The column an incremental load's view orders by: the continued key, else the export's cursor.
 fn load_cursor_column<'a>(
     config: &'a crate::config::Config,
     export: &'a crate::config::ExportConfig,
@@ -886,6 +887,7 @@ fn build_plans_keyed(
             load: eff_load,
             mode,
             cursor_column: load_cursor_column(cfg, export).map(folded),
+            continued_key: crate::plan::build::continued_key(cfg, export).is_some(),
             pk,
             clustering,
             pinned_run: None,
@@ -1159,6 +1161,7 @@ pub(crate) fn test_plan(mode: LoadMode, gcs_prefix: &str) -> LoadPlan {
         },
         mode,
         cursor_column: None,
+        continued_key: false,
         pk: vec!["id".into()],
         clustering: Clustering::Auto(vec![]),
         pinned_run: None,

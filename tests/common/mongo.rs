@@ -167,6 +167,31 @@ impl MongoTest {
         self.insert_many(name, docs);
     }
 
+    /// Append `n` docs with fresh (ascending) ObjectId `_id`s.
+    pub fn append_objectid(&self, name: &str, n: i64) {
+        let docs = (0..n)
+            .map(|i| doc! { "seq": i, "v": format!("v{i}") })
+            .collect();
+        self.insert_many(name, docs);
+    }
+
+    /// Every `_id` of `name` as rivet's `_id` column renders it (ObjectId as hex), sorted.
+    pub fn ids(&self, name: &str) -> Vec<String> {
+        self.rt.block_on(async {
+            let mut cur = self.coll(name).find(doc! {}).await.expect("mongo: find");
+            let mut out = Vec::new();
+            while let Some(d) = cur.try_next().await.expect("mongo: cursor") {
+                out.push(match d.get("_id") {
+                    Some(Bson::ObjectId(o)) => o.to_hex(),
+                    Some(other) => other.to_string(),
+                    None => continue,
+                });
+            }
+            out.sort();
+            out
+        })
+    }
+
     pub fn upsert_set(&self, name: &str, id: i64, field: &str, val: &str) {
         self.rt.block_on(async {
             self.coll(name)

@@ -26,6 +26,9 @@ Per SQL engine, on the downloaded previous binary and this one:
              needs (RED: dropping it fails the load). The loaded-run skip set is NOT graded:
              init's `cleanup_source: true` deletes the first parts, so erasing it changes
              nothing here (measured).
+  resume-load  the previous release overwrote a Mongo `resume` export's BigQuery table with
+             each run's new documents; this binary's first load warns with the remedy, and
+             `state reset` + run + load leaves the table equal to the source `_id` set.
   cdc-load   per CDC engine into BigQuery, in UTC and a non-UTC source zone: the previous
              `init --mode cdc` config continued by this binary (upgrade_cdc_load.py).
   cdc        per CDC engine: the previous release anchors a stream and captures a batch;
@@ -422,6 +425,82 @@ def _load_leg(led: Ledger, prev: Path, root: Path, url: str) -> None:
         gcp.gcs_delete_prefix(bucket, f"exports/{table}/")
 
 
+def _continued_key_load_leg(led: Ledger, prev: Path, root: Path, url: str) -> None:
+    """A Mongo `resume` export the previous release loaded by overwrite: this binary warns, and the remedy restores it."""
+    from . import gcp
+    from .bigquery import _bq_json
+    from ..pytools.registry import bq_tmp
+
+    row = ("mongo", "-", SCEN, "resume-load")
+    proj, bucket = os.environ.get("BQ_ORACLE_PROJECT", ""), os.environ.get("BQ_ORACLE_BUCKET", "")
+    if not proj or not bucket:
+        led.skipped(*row, "upgrade[mongo/resume-load]: no BQ_ORACLE_PROJECT / BQ_ORACLE_BUCKET", "no bigquery")
+        return
+    try:
+        import pymongo
+    except ImportError:
+        led.skipped(*row, "upgrade[mongo/resume-load]: pymongo absent", "no pymongo")
+        return
+    coll = f"upg_resume_{os.getpid()}"
+    dset = bq_tmp(f"upgres_{os.getpid()}")
+    d = root / "resume-load"
+    d.mkdir()
+    (d / "c.yaml").write_text(
+        "source:\n  type: mongo\n  url_env: RIVET_UPG_URL\n  mongo:\n    page_size: 500\n    resume: true\n"
+        f"exports:\n  - name: {coll}\n    table: {coll}\n    mode: full\n    format: parquet\n"
+        f"    destination: {{ type: gcs, bucket: {bucket}, prefix: \"exports/{coll}/\" }}\n"
+        f"load:\n  target: bigquery\n  project: {proj}\n  dataset: {dset}\n  pk: auto\n"
+    )
+    env = {"RIVET_UPG_URL": url, "RIVET_STATE_URL": "", "RIVET_GATE_STATE_URL": ""}
+    client = pymongo.MongoClient(url, serverSelectionTimeoutMS=5000)
+    docs = client.get_default_database("rivet")[coll]
+
+    def step(binary: Path, *args: str) -> Proc | None:
+        p = run([str(binary), *args, "-c", "c.yaml"], env=env, cwd=d, timeout=None)
+        if not p.ok:
+            led.failed(*row, f"upgrade[mongo/resume-load]: {' '.join(args)} by "
+                       f"{'prev' if binary == prev else 'this'} failed: {p.stderr.strip()[-200:]}", args[0])
+        return p if p.ok else None
+
+    def loaded() -> list[str]:
+        got = _bq_json(proj, f"SELECT _id FROM `{proj}.{dset}.{coll}` ORDER BY _id")
+        return [r["_id"] for r in got]
+
+    try:
+        gcp.bq_ensure_dataset(proj, dset)
+        docs.insert_many([{"v": i} for i in range(2000)])
+        for _ in range(2):
+            if not (step(prev, "run") and step(prev, "load")):
+                return
+            docs.insert_many([{"v": i} for i in range(500)])
+        damaged = len(loaded())
+        if not step(rivet_bin(), "run"):
+            return
+        first = step(rivet_bin(), "load")
+        if not first:
+            return
+        warned = (f"was last loaded as a whole-table overwrite, and export `{coll}` now loads by append" in first.stderr
+                  and f"`rivet state reset -c c.yaml --export {coll}`" in first.stderr)
+        if not (step(rivet_bin(), "state", "reset", "--export", coll) and step(rivet_bin(), "run")
+                and step(rivet_bin(), "load")):
+            return
+        want = sorted(str(o["_id"]) for o in docs.find({}, {"_id": 1}))
+        got = loaded()
+        if warned and got == want:
+            led.passed(*row, f"upgrade[mongo/resume-load]: the previous release left {damaged} of "
+                       f"{len(want) - 300} documents; this binary's first load warned with the remedy, "
+                       f"and the remedy restored all {len(want)}")
+        else:
+            led.failed(*row, f"upgrade[mongo/resume-load]: warned={warned}, warehouse {len(got)} ids "
+                       f"(distinct {len(set(got))}) vs source {len(want)}, equal={got == want}",
+                       "warning" if not warned else "remedy")
+    finally:
+        docs.drop()
+        if not os.environ.get("RIVET_UPG_KEEP"):
+            gcp.bq_delete_dataset(proj, dset)
+        gcp.gcs_delete_prefix(bucket, f"exports/{coll}/")
+
+
 def verify_upgrade_continuity(led: Ledger) -> None:
     """The previous release's config, state and crash checkpoint, carried on by this binary."""
     prev = _require_prev_binary(led, "all", "-", SCEN, "local", "upgrade continuity")
@@ -449,6 +528,8 @@ def verify_upgrade_continuity(led: Ledger) -> None:
                 leg(led, prev, root, engine, url, fresh)
     if os.environ.get("RIVET_ORACLE_POSTGRES_URL"):
         _load_leg(led, prev, root, os.environ["RIVET_ORACLE_POSTGRES_URL"])
+    if os.environ.get("RIVET_ORACLE_MONGO_URL"):
+        _continued_key_load_leg(led, prev, root, os.environ["RIVET_ORACLE_MONGO_URL"])
     cdc_load_cells(led, prev, root)
     for engine in CDC_ENGINES:
         cvar = CDC_URL_VARS.get(engine, f"RIVET_CDC_{engine.upper()}_URL")
@@ -467,5 +548,7 @@ if __name__ == "__main__":
         _root = Path(tempfile.mkdtemp(prefix="rivet-oracle-upgrade-"))
         if os.environ.get("RIVET_ORACLE_POSTGRES_URL"):
             _load_leg(_led, _prev, _root, os.environ["RIVET_ORACLE_POSTGRES_URL"])
+        if os.environ.get("RIVET_ORACLE_MONGO_URL"):
+            _continued_key_load_leg(_led, _prev, _root, os.environ["RIVET_ORACLE_MONGO_URL"])
         cdc_load_cells(_led, _prev, _root)
     raise SystemExit(_led.report())

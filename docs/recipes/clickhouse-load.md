@@ -64,7 +64,7 @@ set, so live state is `WHERE NOT __is_deleted`.
 
 | Export mode | In ClickHouse |
 |---|---|
-| `full`, `chunked`, `time_window` | `<table>`, a `MergeTree` replaced whole by every load (filled beside it, then swapped in) |
+| `full`, `chunked`, `time_window` | `<table>`, a `MergeTree` replaced whole by every load (filled beside it, then swapped in). Not a run that continues past its last key (`keyset_incremental`, Mongo `source.mongo.resume`): it holds only new keys and loads like `incremental` |
 | `cdc` | `<table>__changes`, a `ReplacingMergeTree` keyed on the primary key, and the view `<table>` |
 | `incremental` | the first run lands `<table>` as a `MergeTree`; the first delta renames it to `<table>__changes` and `<table>` becomes a view picking the latest cursor per key |
 

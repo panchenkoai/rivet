@@ -175,6 +175,7 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
                             args.rebuild_changelog,
                             state.as_ref(),
                             &load_id,
+                            &args.config,
                         )? {
                             Some(report) => {
                                 println!(
@@ -1791,6 +1792,31 @@ fn split_runs(runs: &[(String, crate::manifest::RunManifest)]) -> SplitRuns {
 /// first — behind a current-state view deduped to the latest row per PK by the
 /// export's `cursor_column`. Ledger-driven exactly like CDC — only the not-yet-loaded
 /// runs are loaded, so re-loads don't double and `cleanup_source` is safe.
+/// Why a continued-key export's table, last loaded (newest-first `loads`) as an overwrite, may lack rows; `None` otherwise.
+fn overwritten_delta_warning(
+    continued_key: bool,
+    loads: &[crate::state::LoadRecord],
+    fqtn: &str,
+    export: &str,
+    config: &str,
+) -> Option<String> {
+    let last = loads
+        .iter()
+        .find(|r| r.status == LoadStatus::Success.as_str());
+    let overwrote = last.is_some_and(|r| r.mode == load::plan::LoadMode::Full.ledger_str());
+    (continued_key && overwrote).then(|| {
+        format!(
+            "`{fqtn}` was last loaded as a whole-table overwrite, and export `{export}` now \
+             loads by append because each run carries only the keys past the last one \
+             (`keyset_incremental` / `source.mongo.resume`). rivet 0.30 and older loaded such \
+             an export by overwriting the table with each run's new keys, so it may lack rows \
+             earlier runs delivered. To restore it: `rivet state reset -c {config} --export \
+             {export}`, then `rivet run -c {config}` and `rivet load -c {config}`."
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn load_one_incremental(
     plan: &load::plan::LoadPlan,
     run_id: &str,
@@ -1799,6 +1825,7 @@ fn load_one_incremental(
     rebuild_changelog: bool,
     state: Option<&StateStore>,
     load_id: &str,
+    config: &str,
 ) -> Result<Option<IncrementalReport>> {
     let cursor = plan.cursor_column.clone().ok_or_else(|| {
         anyhow::anyhow!(
@@ -1816,6 +1843,15 @@ fn load_one_incremental(
         loader: load::build_loader(plan, run_id),
         store: load::open_store(&plan.destination)?,
     };
+    let fqtn = job.loader.fqtn(&plan.table);
+    let loads = state
+        .and_then(|s| s.recent_loads(Some(&fqtn), 50).ok())
+        .unwrap_or_default();
+    if let Some(warning) =
+        overwritten_delta_warning(plan.continued_key, &loads, &fqtn, &plan.export_name, config)
+    {
+        log::warn!("{warning}");
+    }
     execute_load(
         job,
         |inputs| {
@@ -2172,6 +2208,7 @@ mod load_ledger_tests {
             },
             mode: LoadMode::Cdc,
             cursor_column: None,
+            continued_key: false,
             pk: vec![],
             clustering: load::plan::Clustering::Auto(vec![]),
             pinned_run: None,
@@ -2406,6 +2443,7 @@ mod load_ledger_tests {
             },
             mode: LoadMode::Cdc,
             cursor_column: None,
+            continued_key: false,
             pk: vec![],
             clustering: load::plan::Clustering::Auto(vec![]),
             pinned_run: None,
@@ -4269,5 +4307,59 @@ mod load_message_tests {
             buffered.summary(),
             "3 rows buffered into p.d.orders__changes | `rivet compact` merges them into p.d.orders"
         );
+    }
+}
+
+#[cfg(test)]
+mod overwritten_delta_tests {
+    use super::overwritten_delta_warning;
+    use crate::state::LoadRecord;
+
+    fn load(mode: &str, status: &str) -> LoadRecord {
+        LoadRecord {
+            load_id: "l".into(),
+            export_name: "t".into(),
+            target_table: "db.t".into(),
+            warehouse: "clickhouse".into(),
+            mode: mode.into(),
+            source_run_ids: vec![],
+            rows_loaded: 1,
+            status: status.into(),
+            finished_at: "2026-10-03T00:00:00Z".into(),
+            source_ident: String::new(),
+        }
+    }
+
+    /// A continued-key export whose newest successful load overwrote its table is warned once, with the remedy.
+    #[test]
+    fn a_continued_key_export_last_loaded_as_an_overwrite_is_warned_with_its_remedy() {
+        let warn = |continued, loads: &[LoadRecord]| {
+            overwritten_delta_warning(continued, loads, "db.t", "t", "rivet.yaml")
+        };
+        assert_eq!(
+            warn(
+                true,
+                &[load("incremental", "failed"), load("full", "success")]
+            )
+            .as_deref(),
+            Some(
+                "`db.t` was last loaded as a whole-table overwrite, and export `t` now loads by \
+                 append because each run carries only the keys past the last one \
+                 (`keyset_incremental` / `source.mongo.resume`). rivet 0.30 and older loaded such \
+                 an export by overwriting the table with each run's new keys, so it may lack rows \
+                 earlier runs delivered. To restore it: `rivet state reset -c rivet.yaml --export \
+                 t`, then `rivet run -c rivet.yaml` and `rivet load -c rivet.yaml`."
+            )
+        );
+        assert_eq!(
+            warn(
+                true,
+                &[load("incremental", "success"), load("full", "success")]
+            ),
+            None
+        );
+        assert_eq!(warn(false, &[load("full", "success")]), None);
+        assert_eq!(warn(true, &[load("full", "failed")]), None);
+        assert_eq!(warn(true, &[]), None);
     }
 }

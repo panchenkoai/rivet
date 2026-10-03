@@ -1873,6 +1873,17 @@ fn a_keyset_incremental_export_from_oracle_accumulates_in_clickhouse() {
     a_keyset_incremental_export_accumulates_in_clickhouse(SqlEngine::Oracle);
 }
 
+/// A Mongo `source.mongo.resume` export into ClickHouse database `db`, keyed by `pk: auto`.
+fn mongo_resume_into_clickhouse(mdb: &str, db: &Db) -> Rig {
+    Rig::mongo_batch("t")
+        .source_url(&MongoTest::url(MONGO_PORT, mdb))
+        .mongo("page_size: 500, resume: true")
+        .dest_gcs(BUCKET, &unique_name("chload"), FAKE_GCS_ENDPOINT)
+        .top_line(&load_line(CLICKHOUSE_HTTP_URL, db, "").replace("pk: [id]", "pk: auto"))
+}
+
+const MONGO_PORT: u16 = 27017;
+
 /// A Mongo `source.mongo.resume` export continues past its last `_id` like a
 /// `keyset_incremental` one, so its load must accumulate: run 2's new documents join
 /// run 1's rather than replace them.
@@ -1883,48 +1894,36 @@ fn a_mongo_resume_export_into_clickhouse_accumulates_every_run() {
     require_alive(LiveService::FakeGcs);
     require_alive(LiveService::Mongo);
     ensure_gcs_bucket(BUCKET);
-    const MONGO_PORT: u16 = 27017;
     let mdb = unique_name("chmresume");
     let m = MongoTest::connect(MONGO_PORT, &mdb);
-    m.seed_int_id("t", 2000);
+    m.seed_objectid("t", 2000);
     let db = Db::new("rivet_chtest");
-    let rig = Rig::mongo_batch("t")
-        .source_url(&MongoTest::url(MONGO_PORT, &mdb))
-        .mongo("page_size: 500, resume: true")
-        .dest_gcs(BUCKET, &unique_name("chload"), FAKE_GCS_ENDPOINT)
-        .top_line(&load_line(CLICKHOUSE_HTTP_URL, &db, "").replace("pk: [id]", "pk: [_id]"));
-    let source = || {
-        m.current_state_i64("t", "v")
-            .into_keys()
-            .collect::<Vec<i64>>()
-    };
-    let loaded = || -> Vec<i64> {
+    let rig = mongo_resume_into_clickhouse(&mdb, &db);
+    let clickhouse_ids = |db: &Db| -> Vec<String> {
         clickhouse_rows_tsv(&format!(
-            "SELECT toString(_id) FROM {}.t ORDER BY toInt64OrZero(toString(_id)) FORMAT TSV",
+            "SELECT _id FROM {}.t ORDER BY _id FORMAT TSV",
             db.0
         ))
         .lines()
-        .map(|l| l.parse().expect("an integer _id"))
+        .map(str::to_string)
         .collect()
     };
 
     rig.run_ok();
     load(&rig);
     assert_eq!(
-        loaded(),
-        source(),
+        clickhouse_ids(&db),
+        m.ids("t"),
         "the first run loads the whole collection"
     );
 
-    for i in 2001..=2500 {
-        m.upsert_set("t", i, "v", "new");
-    }
+    m.append_objectid("t", 500);
     rig.run_ok();
     load(&rig);
     assert_eq!(
-        loaded().len(),
+        clickhouse_ids(&db).len(),
         2500,
         "the resumed run's 500 new documents join the first 2000, not replace them"
     );
-    assert_eq!(loaded(), source());
+    assert_eq!(clickhouse_ids(&db), m.ids("t"));
 }

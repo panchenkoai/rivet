@@ -276,7 +276,7 @@ pub(crate) fn build_plan_on(
 /// The key a clean re-run continues past (SQL `keyset_incremental`, Mongo `source.mongo.resume`), or `None` when every run reads the whole range.
 pub(crate) fn continued_key<'a>(config: &'a Config, export: &'a ExportConfig) -> Option<&'a str> {
     match export.mode {
-        ExportMode::Chunked if export.keyset_incremental => export.chunk_by_key.as_deref(),
+        ExportMode::Chunked => keyset_continued_key(export),
         ExportMode::Full
             if config.source.source_type == crate::config::SourceType::Mongo
                 && config
@@ -287,8 +287,18 @@ pub(crate) fn continued_key<'a>(config: &'a Config, export: &'a ExportConfig) ->
         {
             Some("_id")
         }
-        _ => None,
+        ExportMode::Full | ExportMode::Incremental | ExportMode::TimeWindow | ExportMode::Cdc => {
+            None
+        }
     }
+}
+
+/// The key a `keyset_incremental` export continues past: the config-free half of [`continued_key`].
+fn keyset_continued_key(export: &ExportConfig) -> Option<&str> {
+    export
+        .chunk_by_key
+        .as_deref()
+        .filter(|_| export.keyset_incremental)
 }
 
 /// The strategy for `mode: full`. Source-aware: a MongoDB source with
@@ -600,10 +610,8 @@ fn heavy_chunk_warning(
 /// anchor and advances it at success). Same formula as sequential — the runner
 /// applies the incremental floor/ceiling across its N ranges.
 fn keyset_recovery(export: &ExportConfig) -> (bool, bool) {
-    (
-        export.chunk_checkpoint || export.keyset_incremental,
-        export.keyset_incremental,
-    )
+    let incremental = keyset_continued_key(export).is_some();
+    (export.chunk_checkpoint || incremental, incremental)
 }
 
 /// Refuse a MySQL keyset key under a `uuid` override: the seek binds hex text, which is not the key's stored order.
