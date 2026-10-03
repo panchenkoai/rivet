@@ -1735,14 +1735,15 @@ jobs:
         # 150 first-run + 39; on #401: SKIP 174 = 125 first-run + 49, PARTIAL 191 = 152 first-run + 39.
         # FIRST_RUN rose 253 -> 277 because multi-table and cloud CDC streams, SKIPped whole before #401,
         # now reach the first-run classes; on main @ae9afce0 (run 37064116384): SKIP 188 = 139 + 49,
-        # PARTIAL 204 = 165 + 39, FIRST_RUN 304.
+        # PARTIAL 204 = 165 + 39, FIRST_RUN 304; on #433 (run 37108478817): SKIP 50 = 1 + 49, PARTIAL 99 = 60 + 39,
+        # FIRST_RUN 61.
         if: ${{ !cancelled() }}
         # A CDC stream's first run lands in SKIP (it delivered nothing) or PARTIAL (it delivered some)
         # depending on timing, so those two classes share one ceiling; every other class keeps its own.
         env:
           SKIP_CEILING: 49
           PARTIAL_CEILING: 39
-          FIRST_RUN_CEILING: 304  # +14 measured on #411: its redo-log-switch storm test opens 12 fresh streams, plus #407 failover cells
+          FIRST_RUN_CEILING: 61  # 304 -> 61 measured on #433 (2026-10-03): first runs are graded from the stream's anchor; the rest are MySQL checkpoints a test wrote itself
           # Timing moves a few verdicts between runs of one commit, in every counter: the
           # `cdc.backfill` SKIP class 14-16 and `settle:` PARTIALs ride rivet's clock, first-run CDC
           # 103-105. An exact band would fail a clean commit, so each counter allows that much, in

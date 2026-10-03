@@ -7,8 +7,10 @@
 //! the run wrote) and go to `dev/release_oracle/rig_oracle.py`, which owns the one DuckDB
 //! session and every check. A CDC export without a snapshot leg is graded against source
 //! images the oracle takes before each run (every row changed between the stream's previous
-//! successful run and this one must be in it); a stream's first run, which has no earlier
-//! image, is `RIVET-ORACLE-PARTIAL`, never a plain PASS. Opt out only with `.no_oracle("<reason>")` on
+//! successful run, else its anchor, and this one must be in it). A stream is its PostgreSQL
+//! slot or its checkpoint file, whichever config names it; its anchor is recorded before a
+//! run, including one that then fails. A stream anchored before any run the oracle saw is
+//! `RIVET-ORACLE-PARTIAL` on its first run, never a plain PASS. Opt out only with `.no_oracle("<reason>")` on
 //! a rig or the `RIVET_TEST_NO_ORACLE=<reason>` env on a raw run (both counted by a
 //! shrink-only ceiling, both logged `RIVET-ORACLE-OFF`); an export the oracle cannot reach
 //! logs `RIVET-ORACLE-SKIP`; an exception inside the oracle FAILs the test as an oracle
@@ -187,7 +189,12 @@ pub(crate) fn begin(argv: &[String], envs: &[(&str, &str)], cwd: Option<&Path>) 
             .iter()
             .map(|e| {
                 case.unreachable(e)?;
-                Ok(case.manifests_of(e, &case.local_out(e)?))
+                let out = case.local_out(e)?;
+                if case.needs_image(e) {
+                    // A run that later fails still delivered what its Success manifests declare.
+                    case.stream_dirs(e, &out);
+                }
+                Ok(case.manifests_of(e, &out))
             })
             .collect();
         // Every row changed before a CDC run opens its stream must be in it: image the source first.
@@ -313,6 +320,8 @@ impl Case {
                 "partition_by": s(e, "partition_by"),
                 "base": with_ext(&self.image(e, "prev"), "parquet"),
                 "upper": with_ext(&self.image(e, "begin"), "parquet"),
+                "anchor": with_ext(&self.image(e, "anchor"), "parquet"),
+                "anchor_keys": with_ext(&self.image(e, "anchor-keys"), "parquet"),
                 "cursor_record": with_ext(&self.image(e, "cursor"), "json"),
             })
             .as_object()
@@ -359,6 +368,7 @@ impl Case {
                 "snapshot": self.declares_snapshot(e) || yaml_text(e.get("cdc")).contains("backfill"),
                 "base": with_ext(&self.image(e, "anchor"), "parquet"),
                 "upper": with_ext(&self.image(e, "prev"), "parquet"),
+                "anchor_keys": with_ext(&self.image(e, "anchor-keys"), "parquet"),
             })
             .as_object()
             .expect("an object")
@@ -530,17 +540,47 @@ impl Case {
         s(e, "mode") == Some("cdc") && s(e, "table").is_some()
     }
 
-    /// Where this stream's file of `kind` lives, without its extension: one stream per config directory and export (images: `begin` of this run, `prev` of the last successful run, `anchor` of the first; `cursor`: the delta record).
+    /// Where this stream's file of `kind` lives, without its extension (images: `begin` of this run, `prev` of the last successful run, `anchor` where the stream began; `cursor`: the delta record).
     fn image(&self, e: &Value, kind: &str) -> PathBuf {
         use std::hash::{Hash as _, Hasher as _};
         let mut h = std::hash::DefaultHasher::new();
-        (&self.config_dir, s(e, "name")).hash(&mut h);
+        self.stream_id(e).hash(&mut h);
         let target = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".into());
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join(target)
             .join("rivet-oracle-images");
         std::fs::create_dir_all(&dir).expect("create the oracle image dir");
         dir.join(format!("{:016x}-{kind}", h.finish()))
+    }
+
+    /// The stream an export continues: a CDC table's PostgreSQL slot or checkpoint file (every config naming it shares it), else its config directory and name.
+    fn stream_id(&self, e: &Value) -> String {
+        let cdc = e.get("cdc").filter(|_| s(e, "mode") == Some("cdc"));
+        let table = s(e, "table").unwrap_or_default();
+        let pg = self.cfg.get("source").and_then(|src| s(src, "type")) == Some("postgres");
+        match (
+            cdc.and_then(|c| s(c, "slot")).filter(|_| pg),
+            self.checkpoint(e),
+        ) {
+            (Some(slot), _) => format!("slot {slot} {table}"),
+            (None, Some(ckpt)) if !pg => format!("checkpoint {} {table}", ckpt.display()),
+            _ => format!(
+                "{} {}",
+                self.config_dir.display(),
+                s(e, "name").unwrap_or("?")
+            ),
+        }
+    }
+
+    /// The CDC checkpoint file the export names, resolved as rivet resolves it (the config's directory, unless only the working directory holds it).
+    fn checkpoint(&self, e: &Value) -> Option<PathBuf> {
+        let raw = Path::new(s(e.get("cdc")?, "checkpoint")?);
+        let (by_cfg, by_cwd) = (self.config_dir.join(raw), self.cwd.join(raw));
+        Some(if by_cwd.exists() && !by_cfg.exists() {
+            by_cwd
+        } else {
+            by_cfg
+        })
     }
 
     /// The OTHER local destinations this CDC stream has delivered into (recording `out` among them), each with its Success manifests: one stream, graded as the union of what it delivered.
@@ -570,7 +610,7 @@ impl Case {
             .collect()
     }
 
-    /// Write the export's current source image to `<base>.parquet` (or `<base>.parquet.missing` when the table does not exist yet); a failure leaves none.
+    /// Write the export's current source image to `<base>.parquet` (or `<base>.parquet.missing` when the table does not exist yet), and the stream's anchor when this image can say where it is; a failure leaves none.
     fn take_image(&self, e: &Value, envs: &[(&str, &str)], base: &Path) {
         for ext in ["parquet", "parquet.missing"] {
             let _ = std::fs::remove_file(with_ext(base, ext));
@@ -579,6 +619,16 @@ impl Case {
             return;
         };
         spec["image"] = with_ext(base, "parquet").display().to_string().into();
+        spec["anchor"] = with_ext(&self.image(e, "anchor"), "parquet")
+            .display()
+            .to_string()
+            .into();
+        spec["anchor_keys"] = with_ext(&self.image(e, "anchor-keys"), "parquet")
+            .display()
+            .to_string()
+            .into();
+        spec["slot"] = e.get("cdc").and_then(|c| s(c, "slot")).into();
+        spec["checkpoint"] = self.checkpoint(e).map(|p| p.display().to_string()).into();
         run_rig_oracle(&spec, "image");
     }
 

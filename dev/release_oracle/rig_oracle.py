@@ -34,8 +34,11 @@ stream's previous graded run ended (the oracle's own record; rivet's `cursor_low
 `__seq`; snapshot leg first, deletes removed) against the source's current rows: all of
 them when a snapshot leg exists or `initial: snapshot` is declared, else every row changed
 between source images the oracle took before the stream's previous successful run and
-before this one, plus the keys the stream touched. A stream's first run has no earlier
-image: its verdict is `partial`, never a plain pass; a keyless CDC relation is a SKIP. Mongo
+before this one, plus the keys the stream touched. A stream's first successful run is graded
+from its ANCHOR (recorded before a run while the stream's slot or checkpoint did not exist
+yet: that run's own image, all of SQL Server's capture instance; a PostgreSQL slot found
+existing adds the keys its pending changes name); a stream anchored before any run the
+oracle saw is `partial`, never a plain pass; a keyless CDC relation is a SKIP. Mongo
 grades `_id` only, reported as `partial`. Oracle is read through python-oracledb (DuckDB has
 no scanner), so its TYPE check sees text and grades a NUMBER from its catalog type. The CDC
 checkpoint is not graded.
@@ -1009,7 +1012,7 @@ def _mssql_captured(spec: dict, key: list[str]) -> str:
 
 
 def take_image(spec: dict) -> dict:
-    """Write the source image a CDC export without a snapshot leg is graded from: the captured table as it stands before a run opens its stream."""
+    """Write the source image a CDC export without a snapshot leg is graded from: the captured table as it stands before a run opens its stream (and, when `spec["anchor"]` is set, the stream's anchor)."""
     from .duck import Oracle
 
     path = spec["image"]
@@ -1023,13 +1026,123 @@ def take_image(spec: dict) -> dict:
         except Exception as e:  # noqa: BLE001 — the captured table may not exist yet; every later row is then new
             if not absent(e):
                 raise
-            for p in (path, path + ".missing"):
-                if os.path.exists(p):
-                    os.remove(p)
-            open(path + ".missing", "w").close()
-            return {"image": "absent"}
+            _mark_absent(path)
+            return {"image": "absent", "anchor": record_anchor(ora, spec, path, [])}
         write_image(ora, "source_rows", path)
-    return {"image": "image"}
+        return {"image": "image", "anchor": record_anchor(ora, spec, path, key)}
+
+
+def _clear_image(base: str) -> None:
+    """Remove the image at `base` in either form (parquet, or the absent-table marker)."""
+    for p in (base, base + ".missing"):
+        if os.path.exists(p):
+            os.remove(p)
+
+
+def _mark_absent(base: str) -> None:
+    """Record at `base` that the table did not exist (nothing was there to owe)."""
+    _clear_image(base)
+    open(base + ".missing", "w").close()
+
+
+def anchor_action(engine: str, held: bool | None, recorded: bool) -> str | None:
+    """What the begin image says about the stream's anchor: `begin` (this run anchors at its open), `owe_all` (SQL Server reads its whole capture instance), `slot` (an existing PostgreSQL slot: this image plus the keys it holds), or `None` (keep what is recorded, or nothing is knowable)."""
+    if held is None:
+        return None
+    if not held:
+        return "owe_all" if engine == "mssql" else "begin"
+    if recorded:
+        return None
+    return "slot" if engine == "postgres" else None
+
+
+def record_anchor(ora, spec: dict, begin: str, key: list[str]) -> str | None:
+    """Record the stream's anchor at `spec["anchor"]` per `anchor_action`: held is whether the slot (PostgreSQL) or the checkpoint file exists before this run."""
+    import shutil
+
+    anchor, keys = spec.get("anchor"), spec.get("anchor_keys")
+    if not anchor:
+        return None
+    engine, slot, ckpt = spec["engine"], spec.get("slot"), spec.get("checkpoint")
+    if engine == "postgres":
+        held = slot_exists(ora, slot) if slot else None
+    else:
+        held = os.path.isfile(ckpt) if ckpt else None
+    act = anchor_action(engine, held, image_state(anchor) is not None)
+    if act is None:
+        return None
+    pending = None
+    if act == "slot" and key and keys:
+        try:
+            pending = slot_keys(ora, slot, spec.get("table") or "", key)
+        except Exception as e:  # noqa: BLE001 — a process holding the slot hides its pending changes: the anchor stays unknown
+            if "is active for PID" not in str(e):
+                raise
+            return None
+    if keys and os.path.exists(keys):
+        os.remove(keys)
+    if act == "owe_all" or image_state(begin) == "absent":
+        _mark_absent(anchor)
+    else:
+        _clear_image(anchor)
+        shutil.copyfile(begin, anchor)
+    if pending is not None:
+        write_keys(pending, key, keys)
+    return act
+
+
+def slot_exists(ora, slot: str) -> bool:
+    """Whether PostgreSQL holds the replication slot `slot`."""
+    sql = f"SELECT count(*) FROM pg_replication_slots WHERE slot_name = {_lit(slot)}"
+    return bool(ora.scalar(f"SELECT * FROM postgres_query('pg', {_lit(sql)})"))
+
+
+def slot_keys(ora, slot: str, table: str, key: list[str]) -> list[tuple[str, ...]]:
+    """The key texts of `table`'s rows the slot holds changes for, from the server's own `test_decoding` text, peeked (never consumed)."""
+    sql = f"SELECT n.nspname::text, c.relname::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.oid = {_lit(table)}::regclass"
+    rel = ora.rows(f"SELECT * FROM postgres_query('pg', {_lit(sql)})")[0]
+    peek = f"SELECT data FROM pg_logical_slot_peek_changes({_lit(slot)}, NULL, NULL)"
+    return test_decoding_keys([r[0] for r in ora.rows(f"SELECT * FROM postgres_query('pg', {_lit(peek)})")], tuple(rel), key)
+
+
+_TD_IDENT = r'"(?:[^"]|"")*"|[^\s".:\[]+'
+_TD_ROW = re.compile(rf"^table ({_TD_IDENT})\.({_TD_IDENT}): (?:INSERT|UPDATE|DELETE): (.*)$", re.S)
+_TD_COL = re.compile(rf"(old-key:|new-tuple:)|({_TD_IDENT})\[[^\]]*(?:\[\])*\]:('(?:[^']|'')*'|\S+)")
+
+
+def _td_unquote(s: str, q: str) -> str:
+    """A `test_decoding` identifier (`"`) or literal (`'`) as its text."""
+    return s[1:-1].replace(q + q, q) if s.startswith(q) else s
+
+
+def test_decoding_keys(lines: list[str], rel: tuple[str, str], key: list[str]) -> list[tuple[str, ...]]:
+    """Every key (as text) `test_decoding` change lines name for relation `(schema, name)`: an UPDATE's old key and new tuple both."""
+    out: set[tuple[str, ...]] = set()
+    for line in lines:
+        m = _TD_ROW.match(line)
+        if not m or (_td_unquote(m.group(1), '"'), _td_unquote(m.group(2), '"')) != rel:
+            continue
+        groups: list[dict] = [{}]
+        for t in _TD_COL.finditer(m.group(3)):
+            if t.group(1):
+                groups.append({})
+            else:
+                groups[-1][_td_unquote(t.group(2), '"')] = t.group(3)
+        for g in groups:
+            vals = [g.get(k) for k in key]
+            if all(v is not None and v != "null" for v in vals):
+                out.add(tuple(_td_unquote(v, "'") for v in vals))
+    return sorted(out)
+
+
+def write_keys(keys: list[tuple[str, ...]], cols: list[str], path: str) -> None:
+    """Write key texts as a parquet of VARCHAR `cols` (a temp file renamed)."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    tmp = path + ".tmp.parquet"
+    pq.write_table(pa.table({c: pa.array([k[i] for k in keys], pa.string()) for i, c in enumerate(cols)}), tmp)
+    os.replace(tmp, path)
 
 
 def grade(spec: dict) -> dict:
@@ -1086,8 +1199,12 @@ def grade(spec: dict) -> dict:
             if not snaps and not (spec.get("snapshot") and not image_state(spec.get("base"))):
                 as_text = ", ".join(f"CAST({_qi(k)} AS VARCHAR) AS {_qi(k)}" for k in key)
                 touched = [f"SELECT DISTINCT {as_text} FROM ev"] if legs else []
-                # Without a baseline the stream must hold every row changed between its previous successful run's start and this run's.
+                # Without a baseline the stream must hold every row changed between its previous successful run's start (else its anchor) and this run's.
                 changed = changes_between(ora, spec.get("base"), spec.get("upper"), key)
+                if changed is None and not image_state(spec.get("base")):
+                    changed = changes_between(ora, spec.get("anchor"), spec.get("upper"), key)
+                    if changed and os.path.isfile(spec.get("anchor_keys") or ""):
+                        touched.append(f"SELECT {kl} FROM read_parquet({_lit(spec['anchor_keys'])})")
                 if changed:
                     touched.append(f"SELECT {kl} FROM {changed}")
                 elif legs:
@@ -1370,6 +1487,8 @@ def grade_load(spec: dict) -> dict:
                 state = changes_between(ora, spec.get("base"), spec.get("upper"), key)
                 if state:
                     held.append(f"SELECT {kl} FROM {state}")
+                    if os.path.isfile(spec.get("anchor_keys") or ""):
+                        held.append(f"SELECT {kl} FROM read_parquet({_lit(spec['anchor_keys'])})")
                 else:
                     partial.append("CDC load without a snapshot leg and no source images of its stream: only the keys the warehouse holds are graded")
                 ek = " AND ".join(f"CAST(s.{_qi(k)} AS VARCHAR) = e.{_qi(k)}" for k in key)
@@ -1550,6 +1669,7 @@ def _self_test() -> None:
     assert canon(oracle_ds_iso(dt.timedelta(0))) == canon("PT0S")
     assert canon(oracle_ds_iso(one_day)) != canon("PT93784.000005S"), "a day is not folded into seconds"
     _ns_self_test()
+    _anchor_self_test()
     _compare_self_test()
     _layout_self_test()
     print("rig_oracle self-test ok")
@@ -1634,6 +1754,36 @@ def _compare_self_test() -> None:
         assert got == ["2", "4"], f"an added column alone changes no row, got {got}"
         assert sorted(r[0] for r in ora.rows(f"SELECT id FROM {changed_keys(ora, None, 't', ['id'])}")) == ["1", "2", "4"], \
             "with no table at the anchor every row is new"
+
+
+def _anchor_self_test() -> None:
+    """Where a stream anchors, and the keys a PostgreSQL slot's pending changes name."""
+    import tempfile
+
+    for engine in ("mysql", "oracle", "mongo", "postgres"):
+        assert anchor_action(engine, False, True) == "begin", f"{engine}: no slot/checkpoint yet, so this run anchors at its open"
+    assert anchor_action("mssql", False, False) == "owe_all", "SQL Server with no checkpoint reads its whole capture instance"
+    assert anchor_action("postgres", True, False) == "slot", "a slot found existing anchored before this run"
+    assert anchor_action("postgres", True, True) is None and anchor_action("mysql", True, True) is None, "a recorded anchor is kept"
+    assert anchor_action("mysql", True, False) is None, "a checkpoint no seen run wrote: the anchor is unknowable"
+    assert anchor_action("mssql", None, False) is None, "no slot or checkpoint configured: nothing to say"
+    lines = [
+        "BEGIN 1",
+        "table public.t: INSERT: id[bigint]:1 \"Order\"[text]:'a'' id[bigint]:9' v[integer]:1",
+        "table public.t: UPDATE: old-key: id[bigint]:2 new-tuple: id[bigint]:3 \"Order\"[text]:null v[integer[]]:'{1}'",
+        "table public.t: DELETE: id[bigint]:4",
+        "table public.t: DELETE: (no-tuple-data)",
+        "table public.other: INSERT: id[bigint]:5",
+        "table \"S\".\"T x\": INSERT: \"K\"[text]:'it''s' n[int]:6",
+        "COMMIT 1",
+    ]
+    assert test_decoding_keys(lines, ("public", "t"), ["id"]) == [("1",), ("2",), ("3",), ("4",)], \
+        "every key a change names, an UPDATE's old and new; never a token inside a quoted value or another table's"
+    assert test_decoding_keys(lines, ("S", "T x"), ["K", "n"]) == [("it's", "6")], "quoted identifiers and literals are unquoted"
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "k.parquet")
+        write_keys([("1",), ("2",)], ["id"], p)
+        assert _Mem().rows(f"SELECT id FROM read_parquet({_lit(p)}) ORDER BY id") == [("1",), ("2",)]
 
 
 def _layout_self_test() -> None:
