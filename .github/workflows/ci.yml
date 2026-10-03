@@ -1454,7 +1454,7 @@ jobs:
           # quiet-window lock. On the shared instance the two canaries failed in
           # OPPOSITE directions and both blamed the product for the schedule; they were
           # the dominant E2E flake through 2026-08-16/17.
-          ( docker compose --profile pool --profile cdc --profile replica --profile governor up -d postgres postgres-state mysql mssql mssql-governor minio fake-gcs azurite toxiproxy pgbouncer proxysql postgres-cdc mysql-cdc mssql-cdc mysql-primary mysql-replica mysql-replica-nolog duckdb clickhouse oracle > "$RUNNER_TEMP/compose.log" 2>&1; echo $? > "$RUNNER_TEMP/compose.rc" ) &
+          ( docker compose --profile pool --profile cdc --profile replica --profile governor up -d postgres postgres-state mysql mssql mssql-governor minio fake-gcs azurite toxiproxy pgbouncer pgbouncer-state proxysql postgres-cdc mysql-cdc mssql-cdc mysql-primary mysql-replica mysql-replica-nolog duckdb clickhouse oracle > "$RUNNER_TEMP/compose.log" 2>&1; echo $? > "$RUNNER_TEMP/compose.rc" ) &
 
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -1509,6 +1509,8 @@ jobs:
           for i in $(seq 1 30); do docker compose exec -T mysql mysqladmin ping -h localhost -uroot -privet 2>/dev/null && break || sleep 2; done
           echo "Waiting for pgBouncer..."
           for i in $(seq 1 30); do (exec 3<>/dev/tcp/127.0.0.1/6432) 2>/dev/null && break || sleep 1; done
+          echo "Waiting for pgBouncer in front of the state server..."
+          for i in $(seq 1 30); do (exec 3<>/dev/tcp/127.0.0.1/6433) 2>/dev/null && break || sleep 1; done
           echo "Waiting for ProxySQL..."
           # 6033 is the client-facing MySQL protocol port; 6032 admin comes
           # up first but we wait for 6033 so backend wiring is in place.
@@ -1640,8 +1642,9 @@ jobs:
         # The PG-gated unit tests in src/state are not #[ignore]d, so the `--ignored` sweep below never
         # selects them and the `Tests` job runs them without a state URL (they self-skip there).
         if: ${{ !cancelled() }}
-        run: |
-          cargo test --lib -- state::
+        # The selection is dev/release_oracle/state_lib.py, the one the release gate runs; it fails when
+        # no test passed or one self-skipped.
+        run: python3 -m dev.release_oracle.state_lib
 
       - name: Run live cargo integration tests
         if: ${{ !cancelled() }}
@@ -1717,12 +1720,11 @@ jobs:
             BIGQUERY_TEST_PROJECT
             SNOWFLAKE_TEST_CONNECTION
             RIVET_TEST_EXCLUSIVE
-            pgbouncer-state (:6433)
             pg18-batch (:5518)
           # BIGQUERY_TEST_PROJECT / SNOWFLAKE_TEST_CONNECTION: no warehouse credentials here (same as
           #   `--skip warehouse_cell`); the lib's ignored warehouse tests run under `--ignored` too.
           # RIVET_TEST_EXCLUSIVE: the suite runs threaded on a shared stand; the gate runs those alone.
-          # pgbouncer-state / pg18-batch: services this job's compose line does not start.
+          # pg18-batch: a service this job's compose line does not start.
           # Not lacked: RIVET_TEST_STATE_URL (job env, per-run DB on postgres-state) and the pinned
           #   duckdb (the source-parity sweeps and the drain row-hash test spawn `uv run` themselves).
         run: |

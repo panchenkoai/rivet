@@ -404,7 +404,8 @@ def _self_test() -> int:
             assert rows.get("battery") == want, probe.cells
         # A self-skip in the battery fails its row unless another stage grades that test.
         for skipped, want in (("other::t — X unset", Status.FAIL),
-                              (f"{_sc.STATE_URL_LIB_TESTS[0]} — RIVET_TEST_STATE_URL unset", Status.PASS)):
+                              ("state::row::tests::pg_accessor_reads_every_integer_width_and_refuses_other_types"
+                               " — RIVET_TEST_STATE_URL unset", Status.PASS)):
             def _skipping_run(argv, env=None, _line=skipped, **_k):
                 if "llvm-cov" in argv:
                     return _core.Proc(list(argv), 1, "", "")
@@ -417,9 +418,17 @@ def _self_test() -> int:
             assert rows.get("battery") == want, (skipped, probe.cells)
     finally:
         _sc.run, _sc.have = real_run, real_have
-    names = _sc.STATE_URL_LIB_TESTS
-    assert _sc.libtest_unrun("running 0 tests\ntest result: ok. 0 passed", names) == list(names)
-    assert _sc.libtest_unrun("".join(f"test {n} ... ok\n" for n in names), names) == []
+    from . import state_lib as _sl
+    assert _sl.vacuous("running 0 tests\ntest result: ok. 0 passed; 0 failed", {}), "a zero-match filter graded nothing"
+    assert _sl.vacuous("test result: ok. 9 passed; 0 failed", {"state::x::t": "RIVET_TEST_STATE_URL unset"})
+    assert _sl.vacuous("test result: ok. 9 passed; 0 failed", {}) == []
+    import subprocess
+    _a = _sl.argv()
+    _seen = subprocess.run(_a[:_a.index("cargo")] + ["printenv"], capture_output=True, text=True,
+                           env={**os.environ, "RIVET_STATE_URL": "postgresql://x", "RIVET_GATE_STATE_URL": "postgresql://x",
+                                "RIVET_TEST_STATE_URL": "postgresql://t"}).stdout
+    assert "RIVET_TEST_STATE_URL=postgresql://t" in _seen and "RIVET_STATE_URL=" not in _seen.replace(
+        "RIVET_TEST_STATE_URL=", "") and "RIVET_GATE_STATE_URL" not in _seen, "the state lib tests see only RIVET_TEST_STATE_URL"
     print("self-test ok: without cargo-llvm-cov the offline battery is still graded, its self-skips too")
     # A graded harm counter past prev × tol + slack fails; noise within it passes; a counter
     # only one binary records is not compared.
