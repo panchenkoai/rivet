@@ -193,6 +193,15 @@ pub fn mssql_try_exec(sql: &str) -> bool {
     soft_exec_at(1433, sql)
 }
 
+/// Run T-SQL on `mssql` (`:1433`) once, without the setup retry; the server's error text on failure.
+pub fn mssql_exec_once(sql: &str) -> Result<(), String> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("mssql: tokio runtime")
+        .block_on(run_batch(1433, sql))
+}
+
 /// As [`mssql_exec`], but against the CDC `mssql-cdc` instance (`:1434`).
 pub fn mssql_cdc_exec(sql: &str) {
     exec_at(1434, sql)
