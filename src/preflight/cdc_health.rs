@@ -266,8 +266,8 @@ pub(crate) fn pg_foreign_slots_warning(
 /// gave a green light and then a wall. Postgres was the one engine missing this:
 /// MySQL, SQL Server and Mongo each load the checkpoint through `Position::load`
 /// in this file, and the MSSQL arm's comment records the same defect MEASURED
-/// there. The message below is the run's own, verbatim, so the operator is told
-/// the same thing twice rather than two different things.
+/// there. The message below is the run's own for the same evidence (a checkpoint
+/// only: doctor reads no snapshot done-signal), so the drain and doctor agree.
 fn pg_slot_verdict(
     export: &str,
     slot: &str,
@@ -279,7 +279,13 @@ fn pg_slot_verdict(
         None if resume_ckpt => check(
             name,
             false,
-            Some(crate::source::postgres::cdc::pg_slot_missing_refusal(slot)),
+            Some(crate::source::postgres::cdc::pg_slot_missing_refusal(
+                slot,
+                crate::source::cdc::PriorRun {
+                    checkpoint: true,
+                    snapshot: false,
+                },
+            )),
             None,
         ),
         None => check(
@@ -1012,32 +1018,22 @@ mod tests {
             !c.ok,
             "a dropped slot under an existing checkpoint is not a first run: {c:?}"
         );
-        let detail = c.detail.expect("the verdict must say why");
         assert_eq!(
-            detail,
-            crate::source::postgres::cdc::pg_slot_missing_refusal("rivet_orders"),
-            "preflight and run must tell the operator the same thing"
-        );
-        assert!(
-            detail.contains("prior-run evidence exists"),
-            "it must name the state, not just fail: {detail}"
-        );
-        for step in [
-            "delete the checkpoint file if one is configured",
-            "clear the export's `cdc_snapshot` row in the state DB",
-            "delete the destination's snapshot/_SUCCESS marker",
-            "truncate its `<table>__changes` table",
-            "rivet creates the new slot BEFORE it re-snapshots",
-        ] {
-            assert!(
-                detail.contains(step),
-                "the recovery must name `{step}` — deleting the checkpoint alone leaves \
-                 the OR-ed done-signals set and repeats this refusal forever: {detail}"
-            );
-        }
-        assert!(
-            !detail.contains("mode: full"),
-            "`mode: full` clears neither done-signal: {detail}"
+            c.detail.as_deref(),
+            Some(
+                "pg cdc: slot 'rivet_orders' is missing but the checkpoint file holds a position \
+                 from a prior run — the slot was dropped or invalidated, and the changes since \
+                 then are no longer in the log. Without a baseline (`initial: snapshot` or \
+                 `backfill:`), deleting the checkpoint file re-anchors at the current position \
+                 and accepts the gap. To re-snapshot instead: delete the checkpoint file, clear \
+                 the export's `cdc_snapshot` row in the state DB AND delete the destination's \
+                 snapshot/_SUCCESS marker (the two done-signals are OR-ed, so leaving either in \
+                 place repeats this refusal). If a warehouse load consumes this stream, ALSO \
+                 truncate its `<table>__changes` table before the next load. Then re-run: rivet \
+                 creates the new slot BEFORE it re-snapshots, so nothing falls between the two \
+                 (see cdc-failure-modes.md)."
+            ),
+            "doctor checks the checkpoint only, so it must name the checkpoint and nothing else"
         );
     }
 

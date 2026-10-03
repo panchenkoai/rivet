@@ -29,7 +29,7 @@ use crate::config::TlsConfig;
 use crate::error::Result;
 use crate::source::cdc::tx_buffer::{SpooledTail, TxBuffer, replay};
 use crate::source::cdc::value::RivetValue;
-use crate::source::cdc::{ChangeEvent, ChangeOp, ChangeStream, DrainMode, Position};
+use crate::source::cdc::{ChangeEvent, ChangeOp, ChangeStream, DrainMode, Position, PriorRun};
 
 /// Polls a logical slot and yields canonical changes.
 /// Domain type label -> its base type label, as `test_decoding` names both.
@@ -135,18 +135,35 @@ pub(crate) fn slot_created_warning(slot: &str) -> String {
     )
 }
 
-/// The refusal for a missing slot under prior-run evidence, shared by the run and `rivet doctor`.
-pub(crate) fn pg_slot_missing_refusal(slot: &str) -> String {
-    format!(
-        "pg cdc: slot '{slot}' is missing but prior-run evidence exists (a checkpoint and/or a \
-         completed snapshot) — the slot was dropped or invalidated, and the changes since then \
-         are no longer in the log. To re-snapshot: delete the checkpoint file if one is \
-         configured, clear the export's `cdc_snapshot` row in the state DB AND delete the \
+/// The refusal for a missing slot, naming exactly the prior-run evidence the caller checked.
+pub(crate) fn pg_slot_missing_refusal(slot: &str, prior: PriorRun) -> String {
+    const CKPT: &str = "the checkpoint file holds a position from a prior run";
+    const SNAP: &str = "a prior run completed this export's snapshot (the state DB's \
+                        `cdc_snapshot` row or the destination's snapshot/_SUCCESS marker)";
+    let resnapshot = "clear the export's `cdc_snapshot` row in the state DB AND delete the \
          destination's snapshot/_SUCCESS marker (the two done-signals are OR-ed, so leaving \
          either in place repeats this refusal). If a warehouse load consumes this stream, ALSO \
          truncate its `<table>__changes` table before the next load. Then re-run: rivet creates \
          the new slot BEFORE it re-snapshots, so nothing falls between the two (see \
-         cdc-failure-modes.md)."
+         cdc-failure-modes.md).";
+    let (evidence, steps) = match (prior.checkpoint, prior.snapshot) {
+        (true, true) => (
+            format!("{CKPT} and {SNAP}"),
+            format!("To re-snapshot: delete the checkpoint file, {resnapshot}"),
+        ),
+        (true, false) => (
+            CKPT.to_string(),
+            format!(
+                "Without a baseline (`initial: snapshot` or `backfill:`), deleting the \
+                 checkpoint file re-anchors at the current position and accepts the gap. To \
+                 re-snapshot instead: delete the checkpoint file, {resnapshot}"
+            ),
+        ),
+        (false, _) => (SNAP.to_string(), format!("To re-snapshot: {resnapshot}")),
+    };
+    format!(
+        "pg cdc: slot '{slot}' is missing but {evidence} — the slot was dropped or invalidated, \
+         and the changes since then are no longer in the log. {steps}"
     )
 }
 
@@ -324,7 +341,7 @@ impl PgChangeStream {
     /// Connect and ensure a `test_decoding` logical slot named `slot` exists
     /// (idempotent — reuses an existing slot, which is how a real run resumes).
     ///
-    /// `resume_expected` = a prior run's checkpoint exists. In that case a
+    /// `prior` = the prior-run evidence the caller found. With any, a
     /// MISSING slot is a loud error, never a silent re-create: the slot was
     /// dropped or invalidated, and a fresh slot would anchor at the *current*
     /// position — silently skipping every change since the drop.
@@ -594,7 +611,7 @@ impl PgChangeStream {
     pub(crate) fn open(
         conn_str: &str,
         slot: &str,
-        resume_expected: bool,
+        prior: PriorRun,
         tls: Option<&TlsConfig>,
         peek: crate::source::cdc::PeekBound,
         mode: DrainMode,
@@ -646,8 +663,8 @@ impl PgChangeStream {
             )?
             .get(0);
         if !exists {
-            if resume_expected {
-                anyhow::bail!("{}", pg_slot_missing_refusal(slot));
+            if prior.any() {
+                anyhow::bail!("{}", pg_slot_missing_refusal(slot, prior));
             }
             // Creating the slot anchors capture at the CURRENT WAL position:
             // everything already written is unreachable from here. That is correct
@@ -655,8 +672,9 @@ impl PgChangeStream {
             // process, from a slot an admin or a failover dropped out from under a
             // running deployment.
             //
-            // The hard bail above only fires when a checkpoint FILE proves a prior
-            // run, and `cdc.checkpoint` is optional on PostgreSQL precisely because
+            // The hard bail above only fires on prior-run evidence (a checkpoint
+            // position, or at the anchor step a completed snapshot), and
+            // `cdc.checkpoint` is optional on PostgreSQL precisely because
             // the slot itself is the server-side anchor. So the configuration most
             // reliant on the slot is the one with no evidence that it ever existed,
             // and the silent branch was the one it took. Loud beats silent: rivet
@@ -3289,7 +3307,7 @@ mod tests {
         let mut s = PgChangeStream::open(
             CONN,
             SLOT,
-            false,
+            PriorRun::default(),
             None,
             crate::source::cdc::PeekBound::Sized(10_000),
             DrainMode::Continuous,
@@ -3582,6 +3600,28 @@ mod slot_creation_warning_tests {
         assert!(
             w.contains("cdc.checkpoint"),
             "must name the setting that upgrades this to a hard error: {w}"
+        );
+    }
+
+    /// The anchor step (`initial: snapshot` / `backfill:`) can find both kinds of evidence; the refusal names both.
+    #[test]
+    fn the_missing_slot_refusal_names_the_checkpoint_and_the_snapshot_when_both_were_found() {
+        let both = super::PriorRun {
+            checkpoint: true,
+            snapshot: true,
+        };
+        assert_eq!(
+            super::pg_slot_missing_refusal("rivet_orders", both),
+            "pg cdc: slot 'rivet_orders' is missing but the checkpoint file holds a position from \
+             a prior run and a prior run completed this export's snapshot (the state DB's \
+             `cdc_snapshot` row or the destination's snapshot/_SUCCESS marker) — the slot was \
+             dropped or invalidated, and the changes since then are no longer in the log. To \
+             re-snapshot: delete the checkpoint file, clear the export's `cdc_snapshot` row in \
+             the state DB AND delete the destination's snapshot/_SUCCESS marker (the two \
+             done-signals are OR-ed, so leaving either in place repeats this refusal). If a \
+             warehouse load consumes this stream, ALSO truncate its `<table>__changes` table \
+             before the next load. Then re-run: rivet creates the new slot BEFORE it \
+             re-snapshots, so nothing falls between the two (see cdc-failure-modes.md)."
         );
     }
 

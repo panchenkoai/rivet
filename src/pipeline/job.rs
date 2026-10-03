@@ -1610,7 +1610,7 @@ fn record_snapshot_done(
     // `cleanup_source` later wipes the GCS `snapshot/_SUCCESS` too, the
     // NEXT run finds no evidence and re-snapshots the whole table —
     // wasteful (a fresh full re-read + re-load), NOT data loss: the
-    // checkpoint survived, so `snapshot_plan`'s `resume_expected` keeps the
+    // checkpoint survived, so `snapshot_plan`'s `PriorRun` keeps the
     // anchor and no changes are skipped.
     // The LABEL, never the relation read. `snapshot_plan` asks this store
     // with the configured string, and on SQL Server `synth.table` is the
