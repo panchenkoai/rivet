@@ -1,0 +1,14 @@
+diff --git a/src/source/mysql/cdc.rs b/src/source/mysql/cdc.rs
+index d7667763..e68f6b64 100644
+--- a/src/source/mysql/cdc.rs
++++ b/src/source/mysql/cdc.rs
+@@ -918,7 +918,8 @@ impl MysqlChangeStream {
+             .tx
+             .close_transaction(&commit, &format_args!("{}:{log_pos}", self.file))
+         {
+-            Ok((head, tail)) => {
++            Ok((mut head, tail)) => {
++                head.iter_mut().for_each(|e| e.committed = true);
+                 self.pending.extend(head);
+                 self.spooled = tail;
+             }

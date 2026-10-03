@@ -338,3 +338,12 @@ release-oracle-bless: release-oracle-prev-bin  ## Re-capture the verdict + duckd
 	@prev=$$(ls -t -d $(PREV_RELEASE_DIR)/rivet-v*/rivet 2>/dev/null | head -1); \
 	 echo "  previous release: $${prev:-<none — the scale legs will SKIP and the regression / differential / field-replay legs will FAIL; re-run release-oracle-prev-bin, or give the comparison up by name with ARGS=--without-prev-release-comparison>}"; \
 	 env $(GATE_ENV) RIVET_PREV_RELEASE_BIN="$$prev" $(PY) -m dev.release_oracle --bless-local $(ARGS)
+
+# Seeded-defect recall (docs/seeded-recall.md): each known bug class in dev/seeded/seeds.yaml is
+# applied as a source patch to a scratch worktree of HEAD, built, and must turn its catching cells
+# red (after the same cells passed on the unpatched tree). Needs the live stand. Narrow it with
+# SEEDED_ARGS="--seeds committed-every-event --engines postgres". In the gate: --with-seeded-recall.
+SEEDED_ARGS ?=
+.PHONY: seeded-recall
+seeded-recall:  ## Seeded-defect recall: re-introduce every known bug class and require the harness to catch it.
+	env $(GATE_ENV) $(PY) -m dev.seeded $(SEEDED_ARGS)

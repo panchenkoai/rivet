@@ -1,0 +1,41 @@
+diff --git a/src/state/migrations.rs b/src/state/migrations.rs
+index 8c540fc6..0adec139 100644
+--- a/src/state/migrations.rs
++++ b/src/state/migrations.rs
+@@ -992,24 +992,18 @@ const PG_MIGRATIONS: &[(i64, &str)] = &[
+             captured_at TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_load_spec_version_unit ON load_spec_version(export_name, unit);
+-        DO $$ BEGIN
+-          IF EXISTS (SELECT 1 FROM information_schema.columns
+-                     WHERE table_schema = current_schema()
+-                       AND table_name = 'export_load_spec_run' AND column_name = 'columns_json') THEN
+-            INSERT INTO load_spec_version (export_name, unit, columns_json, primary_key_json, captured_at)
+-                SELECT export_name, unit, columns_json, primary_key_json, MIN(captured_at)
+-                FROM export_load_spec_run
+-                GROUP BY export_name, unit, columns_json, primary_key_json;
+-            ALTER TABLE export_load_spec_run ADD COLUMN IF NOT EXISTS spec_id BIGINT;
+-            UPDATE export_load_spec_run r SET spec_id = v.spec_id FROM load_spec_version v
+-                WHERE v.export_name = r.export_name AND v.unit = r.unit
+-                  AND v.columns_json = r.columns_json
+-                  AND v.primary_key_json IS NOT DISTINCT FROM r.primary_key_json;
+-            ALTER TABLE export_load_spec_run ALTER COLUMN spec_id SET NOT NULL;
+-            ALTER TABLE export_load_spec_run DROP COLUMN columns_json;
+-            ALTER TABLE export_load_spec_run DROP COLUMN IF EXISTS primary_key_json;
+-          END IF;
+-        END $$;
++        INSERT INTO load_spec_version (export_name, unit, columns_json, primary_key_json, captured_at)
++            SELECT export_name, unit, columns_json, primary_key_json, MIN(captured_at)
++            FROM export_load_spec_run
++            GROUP BY export_name, unit, columns_json, primary_key_json;
++        ALTER TABLE export_load_spec_run ADD COLUMN IF NOT EXISTS spec_id BIGINT;
++        UPDATE export_load_spec_run r SET spec_id = v.spec_id FROM load_spec_version v
++            WHERE v.export_name = r.export_name AND v.unit = r.unit
++              AND v.columns_json = r.columns_json
++              AND v.primary_key_json IS NOT DISTINCT FROM r.primary_key_json;
++        ALTER TABLE export_load_spec_run ALTER COLUMN spec_id SET NOT NULL;
++        ALTER TABLE export_load_spec_run DROP COLUMN IF EXISTS columns_json;
++        ALTER TABLE export_load_spec_run DROP COLUMN IF EXISTS primary_key_json;
+         CREATE INDEX IF NOT EXISTS idx_file_log_run ON file_log(run_id, file_name);
+         CREATE INDEX IF NOT EXISTS idx_export_metrics_export ON export_metrics(export_name, id DESC);",
+     ),

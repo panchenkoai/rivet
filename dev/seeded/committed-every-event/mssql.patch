@@ -1,0 +1,17 @@
+diff --git a/src/source/mssql/cdc.rs b/src/source/mssql/cdc.rs
+index ef3b4e4f..50e1785d 100644
+--- a/src/source/mssql/cdc.rs
++++ b/src/source/mssql/cdc.rs
+@@ -1007,10 +1007,11 @@ impl MssqlChangeStream {
+         // #158: a batch holds one or more transactions, each a run of rows sharing
+         // `__$start_lsn` (its position); each closes on its own last row, and the
+         // last stays open when the spilled tail continues it.
+-        let (evs, spooled) = batch.close_groups(
++        let (mut evs, spooled) = batch.close_groups(
+             crate::source::cdc::spill::decode_event,
+             &max_lsn.as_deref().unwrap_or(""),
+         )?;
++        evs.iter_mut().for_each(|e| e.committed = true);
+         self.pending.extend(evs);
+         self.spooled = spooled;
+         match max_lsn {

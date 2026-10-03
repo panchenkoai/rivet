@@ -1,0 +1,20 @@
+diff --git a/src/source/mssql/cdc.rs b/src/source/mssql/cdc.rs
+index 685052a1..a23f6d14 100644
+--- a/src/source/mssql/cdc.rs
++++ b/src/source/mssql/cdc.rs
+@@ -1175,6 +1175,15 @@ impl ChangeStream for MssqlChangeStream {
+             }
+         }
+         if let Some(ev) = self.pending.pop_front() {
++            if ev.op == crate::source::cdc::ChangeOp::Delete
++                && self.pending.front().is_some_and(|n| {
++                    n.op == crate::source::cdc::ChangeOp::Insert
++                        && n.table == ev.table
++                        && n.position == ev.position
++                })
++            {
++                return self.next_change();
++            }
+             return Some(Ok(ev));
+         }
+         // A spilled tail outranks another poll: its rows belong to transactions
