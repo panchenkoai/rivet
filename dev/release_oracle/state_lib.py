@@ -24,8 +24,8 @@ FILTER = "state::"
 
 
 def argv() -> list[str]:
-    """The one cargo invocation that runs the state lib tests."""
-    return ["cargo", "test", "--manifest-path", str(ROOT / "Cargo.toml"), "--lib", "--", FILTER]
+    """The one cargo invocation that runs the state lib tests, the URL reaching them only as RIVET_TEST_STATE_URL."""
+    return ["env", "-u", "RIVET_STATE_URL", "-u", "RIVET_GATE_STATE_URL", "cargo", "test", "--manifest-path", str(ROOT / "Cargo.toml"), "--lib", "--", FILTER]
 
 
 def selected(test: str) -> bool:
@@ -48,7 +48,7 @@ def main() -> int:
     sys.stderr.write(p.stderr)
     bad = vacuous(p.stdout, self_skipped(skip_log))
     for why in bad:
-        print(f"::error::state lib tests graded nothing: {why}")
+        print(f"::error::a state lib test graded nothing: {why}")
     return p.returncode or (1 if bad else 0)
 
 

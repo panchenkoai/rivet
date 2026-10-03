@@ -422,6 +422,13 @@ def _self_test() -> int:
     assert _sl.vacuous("running 0 tests\ntest result: ok. 0 passed; 0 failed", {}), "a zero-match filter graded nothing"
     assert _sl.vacuous("test result: ok. 9 passed; 0 failed", {"state::x::t": "RIVET_TEST_STATE_URL unset"})
     assert _sl.vacuous("test result: ok. 9 passed; 0 failed", {}) == []
+    import subprocess
+    _a = _sl.argv()
+    _seen = subprocess.run(_a[:_a.index("cargo")] + ["printenv"], capture_output=True, text=True,
+                           env={**os.environ, "RIVET_STATE_URL": "postgresql://x", "RIVET_GATE_STATE_URL": "postgresql://x",
+                                "RIVET_TEST_STATE_URL": "postgresql://t"}).stdout
+    assert "RIVET_TEST_STATE_URL=postgresql://t" in _seen and "RIVET_STATE_URL=" not in _seen.replace(
+        "RIVET_TEST_STATE_URL=", "") and "RIVET_GATE_STATE_URL" not in _seen, "the state lib tests see only RIVET_TEST_STATE_URL"
     print("self-test ok: without cargo-llvm-cov the offline battery is still graded, its self-skips too")
     # A graded harm counter past prev × tol + slack fails; noise within it passes; a counter
     # only one binary records is not compared.
