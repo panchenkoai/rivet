@@ -57,6 +57,30 @@ fn no_live_or_common_test_sets_process_env() {
     );
 }
 
+/// No lib test moves `StateStore::open` of every concurrent test onto Postgres by setting `RIVET_STATE_URL`.
+#[test]
+fn no_lib_test_sets_the_state_url_for_the_process() {
+    let hits: Vec<String> = rust_files(&root().join("src"))
+        .iter()
+        .flat_map(|f| {
+            let rel = f.strip_prefix(root()).unwrap().display().to_string();
+            std::fs::read_to_string(f)
+                .unwrap()
+                .lines()
+                .enumerate()
+                .filter(|(_, l)| l.contains("set_var(\"RIVET_STATE_URL\""))
+                .map(|(i, l)| format!("{rel}:{}: {}", i + 1, l.trim()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert!(
+        hits.is_empty(),
+        "open the store at StateRef::Postgres(url) instead; a process-wide RIVET_STATE_URL turned \
+         a_garbage_state_db_reports_corruption_not_a_phantom_process red whenever RIVET_TEST_STATE_URL was set:\n{}",
+        hits.join("\n")
+    );
+}
+
 /// The `RIVET_*` names in `HARNESS_ENV` in core.py.
 fn gate_allow_list(core: &str) -> BTreeSet<String> {
     let start = core

@@ -1222,12 +1222,12 @@ fn every_live_cdc_test_asserts_an_outcome() {
                 || chunk.contains("duckdb_assert_complete(")
                 || chunk.contains("duckdb_assert_at_least_once(")
                 || chunk.contains("duckdb_assert_rows_and_distinct(")
-                // The HOST duckdb CLI as a read-back (round-5 row-hash value
-                // oracle): the test pipes `duckdb -json` output into an
+                // The uv-pinned duckdb (dev/pytools/duckcli.py) as a read-back (round-5
+                // row-hash value oracle): the test pipes `-json` output into an
                 // independent python re-implementation and asserts per-row
                 // equality plus a graded-row positive control — the same
                 // independent-reader rationale as the container helpers above.
-                || chunk.contains("Command::new(\"duckdb\")")
+                || chunk.contains("dev/pytools/duckcli.py")
                 // `Rig::assert_complete` is the same oracle behind a method.
                 || chunk.contains("assert_complete(")
                 || chunk.contains("read_all(")
