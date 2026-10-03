@@ -92,6 +92,10 @@ GOLDEN = {
 }
 
 
+#: Mongo's delta export: keyset pages by `_id` that a re-run continues past.
+MONGO_RESUME = "  mongo: { page_size: 200, resume: true }\n"
+
+
 # CDC stands — SEPARATE instances carrying the server-side config change capture
 # needs (logical WAL, a REPLICATION grant, the SQL Server Agent), on the shared
 # port + 1. A CDC scenario creates and drops its OWN table here, which does not
@@ -361,11 +365,11 @@ def rivet_bin() -> str:
     return os.environ.get("RIVET", str(REPO_ROOT / "target" / "debug" / "rivet"))
 
 
-def _cfg(work: Path, eng: str, name: str, mode_lines: str, top: str = "") -> Path:
+def _cfg(work: Path, eng: str, name: str, mode_lines: str, top: str = "", source: str = "") -> Path:
     g = GOLDEN[eng]
     p = work / "rivet.yaml"
     p.write_text(
-        f"source:\n  type: {eng}\n  url_env: RIVET_SCEN_URL\n"
+        f"source:\n  type: {eng}\n  url_env: RIVET_SCEN_URL\n{source}"
         f"exports:\n  - name: {name}\n    table: {g['table']}\n"
         f"{mode_lines}"
         f"    destination: {{ type: local, path: {work / 'out'} }}\n{top}"
@@ -567,12 +571,17 @@ def execute(sid: str, eng: str, work: Path) -> tuple[str, str]:
             return ("fail", "the injected worker error did not fail the run — fixture is inert")
         return ("ok", "")
     if sid == "incremental_twice":
-        if not g["cursor"]:
+        if eng == "mongo":
+            # Mongo's delta export: `page_size` + `resume` continues past the last `_id`.
+            cfg = _cfg(work, eng, name, "    mode: full\n    format: parquet\n",
+                       source=MONGO_RESUME)
+        elif not g["cursor"]:
             return ("skip", f"{eng} has no cursor column in the golden seed")
-        cfg = _cfg(
-            work, eng, name,
-            f"    mode: incremental\n    cursor_column: {g['cursor']}\n    format: parquet\n",
-        )
+        else:
+            cfg = _cfg(
+                work, eng, name,
+                f"    mode: incremental\n    cursor_column: {g['cursor']}\n    format: parquet\n",
+            )
         a = _run(cfg, eng)
         b = _run(cfg, eng)
         return ("ok", "") if a.ok and b.ok else ("fail", (a.out + b.out).strip())
@@ -698,9 +707,9 @@ def load_scenario(sid: str, eng: str, work: Path):
     # by leaving this cell red.
     src_table = g["table"].split(".")[-1] if eng == "mssql" else g["table"]
 
-    def cfg_text(mode_lines, load_extra=""):
+    def cfg_text(mode_lines, load_extra="", source=""):
         return (
-            f"source:\n  type: {eng}\n  url_env: RIVET_SCEN_URL\n"
+            f"source:\n  type: {eng}\n  url_env: RIVET_SCEN_URL\n{source}"
             f"exports:\n  - name: {tbl}\n    table: {src_table}\n{mode_lines}"
             f"    destination: {{ type: gcs, bucket: {bucket}, prefix: {pfx} }}\n"
             f"load:\n  target: bigquery\n  project: {proj}\n  dataset: {dset}\n{load_extra}"
@@ -735,10 +744,24 @@ def load_scenario(sid: str, eng: str, work: Path):
             # trigger is an error that reaches `summary.status = "failed"`, which
             # the keyset worker hook produces (verified: one manifest, status
             # `failed`).
-            cfg.write_text(cfg_text(
-                f"    mode: chunked\n    chunk_by_key: {g['pk']}\n    chunk_size: 200\n"
-                f"    parallel: 4\n    format: parquet\n"))
-            run_export({"RIVET_TEST_ERROR_AT": "keyset_parallel_worker:2"})
+            if eng == "mongo":
+                # Mongo's caught worker error is the `_id`-range reader's; its append
+                # mode is `page_size` + `resume` (a continued key), keyed by `pk: auto`.
+                aborted = (cfg_text("    mode: full\n    parallel: 4\n    format: parquet\n",
+                                    source="  mongo: { page_size: 200 }\n"),
+                           {"RIVET_TEST_ERROR_AT": "mongo_parallel_worker:2"})
+                append = cfg_text("    mode: full\n    format: parquet\n", "  pk: auto\n",
+                                  source=MONGO_RESUME)
+            else:
+                aborted = (cfg_text(
+                    f"    mode: chunked\n    chunk_by_key: {g['pk']}\n    chunk_size: 200\n"
+                    f"    parallel: 4\n    format: parquet\n"),
+                    {"RIVET_TEST_ERROR_AT": "keyset_parallel_worker:2"})
+                append = cfg_text(
+                    f"    mode: incremental\n    cursor_column: {g['cursor']}\n"
+                    f"    format: parquet\n", "  pk: [id]\n")
+            cfg.write_text(aborted[0])
+            run_export(aborted[1])
             # The successful run must be an APPEND mode. In `full` the loader
             # takes `latest_full` — only the newest manifest — so the Failed one
             # never reaches `reconcile` and the scenario grades nothing: the
@@ -751,30 +774,17 @@ def load_scenario(sid: str, eng: str, work: Path):
             # and BigQuery refuses ("is not allowed for this operation because it
             # is currently a TABLE"). Same mode throughout is the only coherent
             # setup.
-            inc = (
-                f"    mode: incremental\n    cursor_column: {g['cursor']}\n"
-                f"    format: parquet\n"
-            )
-            cfg.write_text(cfg_text(inc, "  pk: [id]\n"))
-            if g["cursor"] is None:
-                # Mongo has no cursor-column incremental mode, so there is no
-                # append target to seed and no delta to land. Its equivalent is
-                # the change stream, which this stand cannot run (standalone
-                # mongod, no replica set).
-                return ("skip", "no incremental mode on this engine — its append "
-                                "path is CDC, which needs a replica set")
+            cfg.write_text(append)
             if not run_export().ok or not run_load().ok:
                 return ("fail", "could not pre-create the append target")
             # Now the aborted run: a CAUGHT error (a panic dies before
             # `finalize_manifest` and leaves no manifest at all).
-            cfg.write_text(cfg_text(
-                f"    mode: chunked\n    chunk_by_key: {g['pk']}\n    chunk_size: 200\n"
-                f"    parallel: 4\n    format: parquet\n"))
-            run_export({"RIVET_TEST_ERROR_AT": "keyset_parallel_worker:2"})
+            cfg.write_text(aborted[0])
+            run_export(aborted[1])
             # …and the delta. APPEND mode on purpose: in `full` the loader takes
             # `latest_full` — the newest manifest only — so the Failed one never
             # reaches `reconcile` and the scenario would grade nothing.
-            cfg.write_text(cfg_text(inc, "  pk: [id]\n"))
+            cfg.write_text(append)
             if not run_export().ok:
                 return ("fail", "the delta export failed")
             r = run_load()

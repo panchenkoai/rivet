@@ -141,3 +141,30 @@ fn mongo_parallel_two_rapid_runs_into_same_prefix_do_not_clobber() {
         "run-unique manifest copies must sum both parallel runs' rows"
     );
 }
+
+/// Under `resume: true` each keyset page commits the `_id` cursor: a crash after page 0's
+/// commit, then a clean re-run, must leave every document in a manifest-declared part,
+/// exactly once (the re-run continues past the cursor, so page 0 lives only in the
+/// crashed run's parts).
+#[test]
+#[ignore = "live: requires docker compose up -d mongo"]
+fn mongo_resume_crash_after_keyset_page_recovers_manifest_driven() {
+    require_alive(LiveService::Mongo);
+    let db = unique_name("crash_res");
+    MongoTest::connect(PORT, &db).seed_int_id("t", 5000);
+    let rig = Rig::mongo_batch("t")
+        .source_url(&MongoTest::url(PORT, &db))
+        .mongo("page_size: 1000, resume: true");
+
+    let crashed = rig.run_with_env("RIVET_TEST_PANIC_AT", "after_keyset_page:0");
+    assert!(
+        !crashed.status.success(),
+        "the page-0 crash must fail the run"
+    );
+    rig.run_ok();
+    assert_eq!(
+        dir_manifest_copy_total_rows(&rig.out_dir()),
+        5000,
+        "the manifests must declare every document once, page 0 included"
+    );
+}

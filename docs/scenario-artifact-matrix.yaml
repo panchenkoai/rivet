@@ -178,8 +178,8 @@ scenarios:
 
   - id: incremental_twice
     what: "two incremental runs over a cursor column, the second after new rows."
-    note: "mongo has no cursor-column incremental mode — its equivalent is the CDC change stream, covered by cdc_until_current_twice. oracle is not run here: dev/pytools/scenario_artifacts.py has no Oracle golden-seed mapping yet (tracked; the batch source is phase 1)."
-    engines: [postgres, mysql, mssql]
+    note: "mongo runs its delta export, `source.mongo` page_size + resume (continues past the last `_id`). oracle is not run here: dev/pytools/scenario_artifacts.py has no Oracle golden-seed mapping yet (tracked; the batch source is phase 1)."
+    engines: [postgres, mysql, mssql, mongo]
     expect:
       run_status_running: []
       export_metrics_rows: 2

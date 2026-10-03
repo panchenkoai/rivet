@@ -428,7 +428,6 @@ def _load_leg(led: Ledger, prev: Path, root: Path, url: str) -> None:
 def _continued_key_load_leg(led: Ledger, prev: Path, root: Path, url: str) -> None:
     """A Mongo `resume` export the previous release loaded by overwrite: this binary warns, and the remedy restores it."""
     from . import gcp
-    from .bigquery import _bq_json
     from ..pytools.registry import bq_tmp
 
     row = ("mongo", "-", SCEN, "resume-load")
@@ -463,8 +462,10 @@ def _continued_key_load_leg(led: Ledger, prev: Path, root: Path, url: str) -> No
         return p if p.ok else None
 
     def loaded() -> list[str]:
-        got = _bq_json(proj, f"SELECT _id FROM `{proj}.{dset}.{coll}` ORDER BY _id")
-        return [r["_id"] for r in got]
+        # `bq query` prints 100 rows unless told otherwise; the collection holds thousands.
+        p = run(["bq", f"--project_id={proj}", "query", "--nouse_legacy_sql", "--format=json",
+                 "--max_rows=1000000", f"SELECT _id FROM `{proj}.{dset}.{coll}` ORDER BY _id"], timeout=600)
+        return [r["_id"] for r in json.loads(p.stdout or "[]")] if p.ok else []
 
     try:
         gcp.bq_ensure_dataset(proj, dset)
@@ -488,7 +489,7 @@ def _continued_key_load_leg(led: Ledger, prev: Path, root: Path, url: str) -> No
         got = loaded()
         if warned and got == want:
             led.passed(*row, f"upgrade[mongo/resume-load]: the previous release left {damaged} of "
-                       f"{len(want) - 300} documents; this binary's first load warned with the remedy, "
+                       f"{len(want) - 500} documents; this binary's first load warned with the remedy, "
                        f"and the remedy restored all {len(want)}")
         else:
             led.failed(*row, f"upgrade[mongo/resume-load]: warned={warned}, warehouse {len(got)} ids "
