@@ -1,0 +1,18 @@
+# CDC example for the repo's logical-replication fixture
+# (docker compose --profile cdc up -d postgres-cdc; port 5434, wal_level=logical).
+source:
+  type: postgres
+  url_env: RIVET_PG_CDC_URL
+  tls: { mode: disable }
+
+exports:
+  - name: orders_cdc
+    table: orders
+    mode: cdc
+    format: parquet
+    cdc:
+      slot: rivet_provider_orders
+      checkpoint: orders_cdc.ckpt
+      until_current: true
+      max_events: 100000
+    destination: { type: local, path: ./orders_cdc/ }

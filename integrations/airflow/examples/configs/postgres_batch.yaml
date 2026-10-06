@@ -1,0 +1,23 @@
+# Batch example for the repo's PostgreSQL fixture (docker compose up -d postgres; port 5432).
+# Relative destination paths resolve against the task's working directory: the DAG sets it.
+source:
+  type: postgres
+  url_env: RIVET_PG_URL
+  tls: { mode: disable }
+
+exports:
+  - name: users
+    query: SELECT id, name, email, age, balance, is_active, created_at, updated_at FROM users
+    mode: full
+    format: parquet
+    destination: { type: local, path: ./users/ }
+  - name: orders
+    query: SELECT id, user_id, product, quantity, price, status, ordered_at, updated_at FROM orders
+    mode: full
+    format: parquet
+    destination: { type: local, path: ./orders/ }
+  - name: events
+    query: SELECT id, user_id, event_type, created_at FROM events
+    mode: full
+    format: parquet
+    destination: { type: local, path: ./events/ }
