@@ -333,6 +333,26 @@ impl BqLive {
         }
     }
 
+    /// Delete every object under `prefix/sub` (`""`: the whole prefix) and require it gone.
+    pub fn delete_objects(&self, sub: &str) {
+        let at = if sub.is_empty() {
+            self.prefix.clone()
+        } else {
+            format!("{}/{sub}", self.prefix)
+        };
+        gcs_delete_prefix(&self.bucket, &at);
+        let left: Vec<String> = self
+            .gcs_objects()
+            .into_iter()
+            .filter(|o| o.starts_with(&format!("{at}/")))
+            .collect();
+        assert!(
+            left.is_empty(),
+            "objects left under gs://{}/{at}: {left:?}",
+            self.bucket
+        );
+    }
+
     pub fn load_line(&self, extra: &str) -> String {
         format!(
             "load: {{ target: bigquery, project: {}, dataset: {}{extra} }}",

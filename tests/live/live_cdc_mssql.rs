@@ -940,8 +940,40 @@ fn mssql_cdc_resume_past_retention_errors_not_a_silent_gap() {
     );
     let stderr = String::from_utf8_lossy(&res.stderr);
     assert!(
-        stderr.contains("older than") && stderr.contains("re-snapshot"),
+        stderr.contains("older than") && stderr.contains(REBASELINE_REMEDY),
         "the error must name the retention gap + the re-snapshot remedy, got:\n{stderr}"
+    );
+}
+
+/// A resume past change-table retention: the refusal's remedy, followed as printed, re-reads the rows the cleanup removed.
+#[test]
+#[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC + the rivet-duckdb oracle"]
+fn mssql_retention_gap_refusal_remedy_recovers_the_rows_the_cleanup_removed() {
+    let _serial = cross_process_serial("mssql_cdc");
+    let mut s = CdcScenario::mssql("cdc_retgap", "id INT PRIMARY KEY, v INT");
+    s.insert(1);
+    s.settle();
+    s.rig.run_ok();
+    s.insert(2);
+    s.insert(3);
+    s.settle();
+    mssql_cdc_exec(&format!(
+        "DECLARE @lw binary(10) = sys.fn_cdc_get_max_lsn(); \
+         EXEC sys.sp_cdc_cleanup_change_table @capture_instance = N'dbo_{}', \
+         @low_water_mark = @lw, @threshold = 5000;",
+        s.table
+    ));
+    let said = s.rig.run_expect_fail();
+    assert!(
+        said.contains("older than the SQL Server CDC change-table retention")
+            && said.contains(REBASELINE_REMEDY),
+        "the retention refusal names the re-baseline remedy:\n{said}"
+    );
+    follow_rebaseline_remedy(&mut s.rig, false);
+    assert_eq!(
+        dir_parquet_id_set(&s.rig.out_dir().join("snapshot")),
+        [1, 2, 3].into(),
+        "the remedy's baseline holds the rows the cleanup removed from the change table"
     );
 }
 

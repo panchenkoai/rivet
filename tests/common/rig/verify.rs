@@ -25,6 +25,24 @@ impl Rig {
         self
     }
 
+    /// Run once with a known product defect excused for THIS run only: the run must show it, and every later run is graded strictly.
+    pub fn run_ok_capture_known_defect(&mut self, class: &str, reason: &str) -> String {
+        assert!(
+            !reason.trim().is_empty() && self.oracle_xfail.is_none(),
+            "run_ok_capture_known_defect needs a reason and a rig without a rig-wide marker"
+        );
+        self.oracle_xfail = Some((class.to_string(), reason.to_string()));
+        self.oracle_xfailed.set(false);
+        let said = self.run_ok_capture();
+        let fired = self.oracle_xfailed.replace(false);
+        self.oracle_xfail = None;
+        assert!(
+            fired,
+            "oracle known defect now passes — remove the marker: {reason}"
+        );
+        said
+    }
+
     /// Pin this MySQL CDC rig's stream at the server's current binlog position: its checkpoint, and the oracle's anchor image at that position.
     pub fn pin_binlog_here(&self) {
         use mysql::prelude::Queryable as _;

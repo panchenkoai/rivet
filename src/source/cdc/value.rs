@@ -289,7 +289,10 @@ impl CellRefusal {
         } else {
             (
                 crate::error::codes::SOURCE_CDC_CELL_UNSUPPORTED,
-                "leave the column out of the capture, then re-snapshot the table".to_string(),
+                format!(
+                    "leave the column out of the capture, then: {}",
+                    crate::source::cdc::checkpoint_identity::RECOVER
+                ),
             )
         };
         anyhow::Error::new(crate::error::CodedError::new(

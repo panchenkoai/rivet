@@ -355,9 +355,8 @@ Notes:
   under `[mysqld]` and a restart. Events already written under `MINIMAL` stay
   nameless after the switch: a run that reaches one of a captured table fails
   with `RIVET_SOURCE_CDC_UNDECODABLE`, naming the table and the binlog position,
-  and writes no part. If the export already had a checkpoint, delete it so the
-  next run anchors afresh FIRST, then re-snapshot the tables (`mode: full`).
-  Snapshotting first leaves the changes in between in neither. MySQL before
+  and writes no part. If the export already had a checkpoint,
+  [re-baseline](cdc-failure-modes.md#the-shape-of-every-recovery) the stream after the switch. MySQL before
   8.0.1 has no such variable and is refused for the same reason.
 - `binlog_row_image = FULL` is MySQL's default; the risk is a source that has set
   it to `MINIMAL` to shrink the binlog — that path needs the column-mask MERGE,
@@ -456,7 +455,7 @@ Notes:
   `SELECT` grant** above.
 - **Retention:** the cleanup job keeps ~3 days by default. If rivet is offline
   longer than retention, the saved LSN falls below `sys.fn_cdc_get_min_lsn()` and
-  the read errors — fall back to a full re-snapshot.
+  the read errors — [re-baseline](cdc-failure-modes.md#the-shape-of-every-recovery) the stream.
 
 ### Oracle — LogMiner (preview)
 
@@ -516,17 +515,16 @@ can serve that log is an engine + replica-config question, not a rivet limitatio
 `{file, pos}` (not GTID), and a replica's binlog coordinates are its *own*, not the
 primary's. A checkpoint taken against one replica does **not** transfer to another
 host, and rivet refuses one written by a different server (it records `server_uuid`).
-If you fail over (to a different replica, or to the primary), delete the checkpoint so
-CDC anchors on the new host **first**, then re-snapshot the table (`mode: full`).
+If you fail over (to a different replica, or to the primary), [re-baseline](cdc-failure-modes.md#the-shape-of-every-recovery) the
+stream on the new host.
 
 **SQL Server — the checkpoint follows a failover, and nothing else.** An availability
 group's replicas share one log, so a checkpoint written on the primary resumes on a
 secondary (verified live). The checkpoint records the database's `family_guid` and
 `recovery_fork_guid`, and rivet refuses to resume against a database whose
 `family_guid` differs (another server's database: its LSNs address a different log) or
-whose `recovery_fork_guid` changed (a `RESTORE` rewound the log). Recover by deleting the
-checkpoint so CDC re-anchors **first**, then re-snapshot the table with `mode: full` —
-in the other order, the changes between the snapshot and the new anchor land in neither.
+whose `recovery_fork_guid` changed (a `RESTORE` rewound the log). Recover with a
+[re-baseline](cdc-failure-modes.md#the-shape-of-every-recovery): the run anchors first and re-reads the table after.
 A checkpoint written before rivet recorded the identity resumes with a warning.
 
 **PostgreSQL — the slot does not survive a failover.** The slot is the resume position, and
@@ -813,15 +811,15 @@ tables) always name every image column, so rivet maps values by NAME: a
 equal-arity `DROP a` + `ADD c` leaves `c` NULL for the older images rather than
 filling it with a neighbour's value (unless the dropped column sat at `c`'s
 position, which looks exactly like a rename and is read as one). A column ADDED while a run is open is not in
-that run's schema, so its values for that run's window are dropped — re-snapshot
-the table after an `ADD COLUMN` if those values matter. MySQL's binlog carries
+that run's schema, so its values for that run's window are dropped — [re-baseline](cdc-failure-modes.md#the-shape-of-every-recovery)
+the stream after an `ADD COLUMN` if those values matter. MySQL's binlog carries
 names only when the server runs with **`binlog_row_metadata=FULL`** (8.0.1+),
 which rivet requires (see [MySQL — the binlog grants](#mysql--the-binlog-grants)), so MySQL behaves the
 same. rivet never maps a binlog image by position: a server at `MINIMAL` is
 refused at open, and an event written under `MINIMAL` is refused when it is
 read. DDL *between* runs is always fine, because each run resolves the schema
 fresh. Same-arity TYPE changes remain undetectable without schema history
-(roadmap): run type migrations and their backfills through a re-snapshot.
+(roadmap): run type migrations and their backfills through a [re-baseline](cdc-failure-modes.md#the-shape-of-every-recovery).
 
 **The value checksum runs on CDC too.** The same always-on two-ended check the
 batch export performs — an independent fold of the decoded cells vs a fold of
@@ -837,12 +835,14 @@ For the full operational failure playbook — every symptom, what rivet does, ho
 checkpoint exists but the slot is gone (dropped by an operator, or invalidated
 and removed), rivet refuses to re-create it — a fresh slot would anchor at the
 *current* position and silently skip everything since the drop. The run fails
-with the re-snapshot hint; delete the checkpoint file only when you explicitly
-accept a fresh anchor.
+with the [re-baseline](cdc-failure-modes.md#the-shape-of-every-recovery) steps; delete the checkpoint file alone only when you explicitly
+accept a fresh anchor and the gap. Without a checkpoint or a completed baseline,
+rivet cannot tell a dropped slot from a first run: it creates the slot and warns
+with the same steps.
 
 **Bound the blast radius:** set `max_slot_wal_keep_size` (PG 13+). PostgreSQL then
 **invalidates the slot** rather than fill the disk; rivet's next run fails with a
-slot-invalidated error and you re-snapshot. **Monitor** `pg_replication_slots`
+slot-invalidated error and you [re-baseline](cdc-failure-modes.md#the-shape-of-every-recovery). **Monitor** `pg_replication_slots`
 (`active`, and `restart_lsn` vs the current LSN = how much WAL the slot is holding).
 
 > **`rivet doctor` automates this monitoring.** For a config with `mode: cdc`
@@ -859,16 +859,15 @@ slot-invalidated error and you re-snapshot. **Monitor** `pg_replication_slots`
 If rivet is offline long enough that the saved binlog position is **purged**
 (`binlog_expire_logs_seconds` / `PURGE BINARY LOGS`), the resume read fails with
 MySQL **ERROR 1236** (the requested binlog file is gone). The position is
-unrecoverable — delete the checkpoint so CDC re-anchors **first**, then
-**re-snapshot** (`mode: full`). Size binlog retention comfortably above your CDC cadence.
+unrecoverable — [re-baseline](cdc-failure-modes.md#the-shape-of-every-recovery) the stream. Size binlog retention comfortably above your CDC cadence.
 
 ### SQL Server — the checkpoint fell below retention
 
 If the saved LSN falls **below** `sys.fn_cdc_get_min_lsn()` (the cleanup job — ~3
 days by default — removed the changes after it), rivet **fails loudly** — *"the
-resume position is older than the change-table retention … re-snapshot"* — rather
-than resume from the new min and **silently skip the gap**. Delete the checkpoint so
-CDC re-anchors **first**, then re-snapshot. Also watch for a **non-advancing `sys.fn_cdc_get_max_lsn()`**:
+resume position is older than the SQL Server CDC change-table retention … Re-baseline the stream"* —
+rather than resume from the new min and **silently skip the gap**. [re-baseline](cdc-failure-modes.md#the-shape-of-every-recovery) the
+stream. Also watch for a **non-advancing `sys.fn_cdc_get_max_lsn()`**:
 that means the **Agent capture job stopped**, so the change tables are frozen — read
 "no rows" as "the job is down", not "no changes".
 
@@ -876,8 +875,8 @@ that means the **Agent capture job stopped**, so the change tables are frozen �
 
 If the checkpoint needs redo older than the oldest archived log still listed (RMAN
 `DELETE INPUT`, a retention policy), or a log sequence is missing in between, the run
-fails with *"… LOST to this stream"* instead of mining from whatever remains. Delete
-the checkpoint so the next run anchors **first**, then re-snapshot the table.
+fails with *"… LOST to this stream"* instead of mining from whatever remains.
+Restore the archived log, or [re-baseline](cdc-failure-modes.md#the-shape-of-every-recovery) the stream.
 
 A checkpoint written against another database (a different `DBID`, a `RESETLOGS`
 since, or another pluggable database) is refused the same way: an SCN means nothing
@@ -887,11 +886,11 @@ outside the database that issued it.
 
 Re-run to resume from the last checkpoint (the common case). If the run reports the
 position is unrecoverable (PostgreSQL slot invalidated, MySQL binlog purged, SQL
-Server retention exceeded), **restart CDC from a new checkpoint first, then
-re-snapshot the table with `mode: full`** — the only safe recovery once the source log
-no longer covers the gap. The order matters: the new anchor must exist before the
-snapshot reads, so the stream overlaps the snapshot (duplicates, which the load
-deduplicates) instead of leaving the changes in between in neither.
+Server retention exceeded), **[re-baseline](cdc-failure-modes.md#the-shape-of-every-recovery) the stream**: delete the checkpoint, move every
+file out of the export's destination, delete its `cdc_snapshot` rows, give it
+`cdc.initial: snapshot` if it has none, and re-run. That run anchors first and re-reads the table after, so the stream overlaps the
+snapshot (duplicates, which the load deduplicates) instead of leaving the changes in
+between in neither. A separate `mode: full` export is not a re-baseline.
 
 ## Limitations (current)
 
@@ -914,8 +913,8 @@ engines. What remains:
   the intended model.
 - **Schema drift:** the sink schema is frozen at the first flush — a column added
   mid-run is not picked up until the next run re-resolves the table, and its values
-  captured in the meantime are dropped (the events are still acked) — re-snapshot
-  the table to recover them.
+  captured in the meantime are dropped (the events are still acked) — [re-baseline](cdc-failure-modes.md#the-shape-of-every-recovery)
+  the stream to recover them.
 - **No lag metric:** the run records rows / files / bytes / duration / status, but
   not replication lag ("how far behind the source is") — the next observability step.
 - **Pre-image completeness** depends on the source config: full UPDATE/DELETE

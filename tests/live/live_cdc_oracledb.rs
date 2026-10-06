@@ -524,10 +524,7 @@ fn oracle_cdc_a_0_30_low_water_zero_checkpoint_is_refused_precisely_not_as_lost(
     ora_exec(&format!("INSERT INTO {} VALUES (1)", t.name()));
     let err = rig(&t, &ckpt, &d.path().join("out")).run_expect_fail();
     assert!(err.contains("records a low-water SCN of 0"), "{err}");
-    assert!(
-        err.contains("anchors afresh FIRST, then re-snapshot"),
-        "{err}"
-    );
+    assert!(err.contains(REBASELINE_REMEDY), "{err}");
     assert!(!err.contains("LOST"), "{err}");
 }
 
@@ -730,7 +727,7 @@ fn expect_truncate_refusal(rig: &Rig, out: &Path, table: &str, ctx: &str) {
     );
     assert!(
         err.contains(&format!("oracle cdc: `RIVET.{table}` was TRUNCATEd"))
-            && err.contains("re-anchor FIRST")
+            && err.contains(REBASELINE_REMEDY)
             && err.contains("RIVET_SOURCE_CDC_TRUNCATED"),
         "{ctx}: stderr:\n{err}"
     );
@@ -758,6 +755,33 @@ fn oracle_cdc_refuses_a_truncate_of_a_captured_table_on_every_rerun() {
     assert!(
         cdc_id_ops(&out2).is_empty() && cdc_id_ops(&out3).is_empty(),
         "nothing past the truncate is delivered"
+    );
+}
+
+/// A truncate after its rows went out as change parts: the remedy, followed as printed, leaves the prefix holding only the source's rows.
+#[test]
+#[ignore = "live: requires the oracle service with LogMiner prerequisites + the rivet-duckdb oracle"]
+fn oracle_cdc_truncate_refusal_remedy_leaves_no_removed_row_live_in_the_prefix() {
+    let _serial = cross_process_serial("oracle_cdc");
+    let t = cdc_table("ora_ctrr", "id NUMBER(18) PRIMARY KEY, v NUMBER(18)");
+    let mut rig = Rig::oracle_cdc(t.name());
+    rig.run_ok();
+    ora_exec(&format!("INSERT INTO {} VALUES (1, 10)", t.name()));
+    rig.run_ok();
+    assert_eq!(
+        cdc_id_ops(&rig.out_dir()),
+        ops(&[(1, "insert")]),
+        "row 1 went out as a change part"
+    );
+    ora_exec(&format!("TRUNCATE TABLE {}", t.name()));
+    ora_exec(&format!("INSERT INTO {} VALUES (2, 20)", t.name()));
+    let out = rig.out_dir();
+    expect_truncate_refusal(&rig, &out, t.name(), "the run after the truncate");
+    follow_rebaseline_remedy(&mut rig, false);
+    assert_eq!(
+        dir_parquet_i64(&out.join("snapshot"), "id"),
+        vec![2],
+        "the remedy's baseline holds the row written after the truncate, and only it"
     );
 }
 
@@ -874,10 +898,19 @@ fn oracle_cdc_resume_past_log_retention_fails_loudly() {
     let t = cdc_table("ora_cgone", "id NUMBER(18) PRIMARY KEY, v NUMBER(18)");
     let ckpt = d.path().join("cdc.ckpt");
     rig(&t, &ckpt, &d.path().join("anchor")).run_ok();
+    ora_exec(&format!("INSERT INTO {} VALUES (1, 10)", t.name()));
     rewrite_checkpoint(&ckpt, |v| v["low_water"] = "1".into());
-    let err = rig(&t, &ckpt, &d.path().join("out")).run_expect_fail();
+    let out = d.path().join("out");
+    let mut r = rig(&t, &ckpt, &out);
+    let err = r.run_expect_fail();
     assert!(err.contains("LOST to this stream"), "{err}");
-    assert!(err.contains("anchors afresh FIRST"), "{err}");
+    assert!(err.contains(REBASELINE_REMEDY), "{err}");
+    follow_rebaseline_remedy(&mut r, false);
+    assert_eq!(
+        dir_parquet_i64(&out.join("snapshot"), "id"),
+        vec![1],
+        "the remedy's baseline holds the row the lost redo carried"
+    );
 }
 
 #[test]

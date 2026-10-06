@@ -248,6 +248,36 @@ fn mongo_cdc_initial_snapshot_covers_preexisting_rows() {
     );
 }
 
+/// A lost checkpoint's warning remedy, followed as printed, re-reads a document written while it was gone.
+#[test]
+#[ignore = "live: requires docker compose up -d mongo-rs + the rivet-duckdb oracle"]
+fn mongo_missing_checkpoint_warning_remedy_recovers_the_document_written_while_it_was_gone() {
+    require_alive(LiveService::MongoRs);
+    require_alive(LiveService::DuckDb);
+    let mut s = CdcScenario::mongo_with("cdc_ckgap", |r, _| r);
+    s.rig.run_ok();
+    s.insert(1);
+    s.rig.run_ok();
+    std::fs::remove_file(s.rig.checkpoint()).expect("the checkpoint the run wrote");
+    s.insert(2);
+    let said = s.rig.run_ok_capture_known_defect(
+        "undelivered rows",
+        "known defect: a lost MongoDB checkpoint on a stream with no baseline re-anchors with \
+         only a warning, so the document written in the gap is lost until the warning's \
+         re-baseline runs",
+    );
+    assert!(
+        said.contains("mongodb cdc: no checkpoint at") && said.contains(REBASELINE_REMEDY),
+        "the re-anchor warns with the re-baseline remedy:\n{said}"
+    );
+    follow_rebaseline_remedy(&mut s.rig, false);
+    assert_eq!(
+        walkdir_parquet_ids(&s.rig.out_dir(), "snapshot"),
+        ["1".to_string(), "2".to_string()].into(),
+        "the remedy's baseline holds the document written while the checkpoint was gone"
+    );
+}
+
 /// Distinct `_id` values across `.parquet` files under any subdir of `root`
 /// whose path contains `marker` (e.g. the `snapshot/` handoff dir).
 fn walkdir_parquet_ids(root: &std::path::Path, marker: &str) -> std::collections::BTreeSet<String> {
@@ -346,6 +376,38 @@ fn roast_corrupt_checkpoint_fails_loudly_not_silent_reanchor() {
 
     // The run must FAIL — never exit 0 having silently re-anchored past the change.
     let _stderr = rig.run_expect_fail();
+
+    // `rivet doctor` reads the same file and must FAIL it with the run's remedy:
+    // unparseable first, then valid JSON that holds no resume token.
+    for (file, why) in [
+        (&b"{ not valid json at all"[..], "is corrupt or truncated"),
+        (&b"{}"[..], "the run refuses this file"),
+    ] {
+        std::fs::write(rig.checkpoint(), file).unwrap();
+        let doc = rig.cli(&["doctor", "--json"]);
+        let report: serde_json::Value =
+            serde_json::from_slice(&doc.stdout).expect("doctor --json output");
+        let check = report["checks"]
+            .as_array()
+            .expect("checks array")
+            .iter()
+            .find(|c| {
+                c["name"]
+                    .as_str()
+                    .is_some_and(|n| n.starts_with("CDC checkpoint (export '"))
+            })
+            .unwrap_or_else(|| panic!("doctor ran no CDC checkpoint check: {report}"));
+        assert_eq!(check["ok"], false, "doctor must fail the file: {check}");
+        assert!(
+            check["detail"].as_str().is_some_and(|d| d.contains(why)),
+            "doctor says why ({why}): {check}"
+        );
+        assert_eq!(
+            check["hint"],
+            format!("restore the file, or: {REBASELINE_REMEDY}"),
+            "doctor's remedy is the run's own"
+        );
+    }
 }
 
 #[test]

@@ -3,10 +3,16 @@
 
 use crate::error::Result;
 
-/// The recovery every foreign-checkpoint refusal ends with, in the only order that loses nothing.
-pub(crate) const RECOVER: &str = "Delete the checkpoint so the next run anchors afresh FIRST, \
-     then re-snapshot the tables (`mode: full`): snapshotting first leaves the changes in \
-     between in neither.";
+/// The re-baseline remedy every CDC data-loss message ends with, in the order the product runs it.
+pub(crate) const RECOVER: &str = "Re-baseline the stream in one run: delete the checkpoint \
+     file if there is one; move every file out of the export's destination (for a `tables:` \
+     export, every table's directory under it): the parts there still hold rows the source may \
+     no longer have, and each table's snapshot/_SUCCESS marker goes with them; delete the \
+     export's `cdc_snapshot` rows (one per table) from the state DB; give the export \
+     `cdc.initial: snapshot` if it has none; and if a warehouse load consumes this stream, \
+     truncate its `<table>__changes` table before the next load. That run anchors FIRST and \
+     re-reads every table after, so nothing falls between the two. A separate `mode: full` \
+     export does not re-baseline the stream.";
 
 /// What a resume may do given the checkpoint's recorded identity and the server's.
 #[derive(Debug, PartialEq, Eq)]
@@ -38,6 +44,23 @@ impl IdentityVerdict {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The remedy text, pinned against a hand-written copy.
+    #[test]
+    fn the_rebaseline_remedy_names_the_steps_the_product_runs() {
+        assert_eq!(
+            RECOVER,
+            "Re-baseline the stream in one run: delete the checkpoint file if there is one; move \
+             every file out of the export's destination (for a `tables:` export, every table's \
+             directory under it): the parts there still hold rows the source may no longer have, \
+             and each table's snapshot/_SUCCESS marker goes with them; delete the export's \
+             `cdc_snapshot` rows (one per table) from the state DB; give the export \
+             `cdc.initial: snapshot` if it has none; and if a warehouse load consumes this \
+             stream, truncate its `<table>__changes` table before the next load. That run anchors \
+             FIRST and re-reads every table after, so nothing falls between the two. A separate \
+             `mode: full` export does not re-baseline the stream."
+        );
+    }
 
     #[test]
     fn a_foreign_verdict_refuses_with_exit_5_and_the_recovery_order() {
