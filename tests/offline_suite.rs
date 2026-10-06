@@ -7,8 +7,8 @@
 //! harness still collects every `#[test]` from each module.
 //!
 //! Run these under cargo-nextest (process-per-test) — as the pre-push hook does WHEN nextest is
-//! installed. The PR gate does NOT: `.github/workflows/ci.yml:1232` (job `test:`) runs
-//! `cargo test --all-targets`, and `nextest` appears zero times in that workflow, so in CI this
+//! installed. The PR gate does NOT: `.github/workflows/ci.yml` (job `test:`) runs
+//! `cargo test --all-targets` (only the E2E live sweep runs under nextest there), so in CI this
 //! suite runs threaded and `.config/nextest.toml`'s slow-timeout/retry settings do not apply.
 //! (This line claimed "and CI do" until 2026-09-21; it was never true.) Under the
 //! plain libtest harness (`cargo test --test offline_suite`) every `#[test]` here runs as a THREAD

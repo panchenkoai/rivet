@@ -34,9 +34,9 @@ else
   # it.
   #
   # This used to end "CI runs under nextest regardless", which was NOT true and is the
-  # reason to install it rather than rely on the gate: `.github/workflows/ci.yml:1232`
-  # (job `test:`) runs `cargo test --all-targets`, and `nextest` appears ZERO times in
-  # ci.yml — only nightly-live.yml uses it, for `live_suite`. So the PR gate runs the
+  # reason to install it rather than rely on the gate: `.github/workflows/ci.yml`
+  # (job `test:`) runs `cargo test --all-targets`; nextest runs only the live sweep there
+  # (the E2E legs) and in nightly-live.yml. So the PR gate runs the
   # consolidated offline suite threaded too, with no per-test timeout from
   # .config/nextest.toml. Corrected 2026-09-21; wiring CI to nextest is a separate call.
   echo "pre-push: cargo test --tests (NO per-test isolation — install cargo-nextest)"

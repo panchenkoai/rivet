@@ -1,9 +1,16 @@
-//! The `toxiproxy` nextest test-group names exactly the live tests that take `toxiproxy_guard()`.
+//! Each flock-backed nextest test-group names exactly the live tests that take its flock.
 
 use std::collections::BTreeSet;
 
-/// `module::test` for every `#[test]` under tests/live whose body calls `toxiproxy_guard()`.
-fn guard_users(root: &std::path::Path) -> BTreeSet<String> {
+/// (test-group, the call that takes its cross-process flock)
+const GROUPS: &[(&str, &str)] = &[
+    ("toxiproxy", "toxiproxy_guard()"),
+    ("mssql_cdc", "cross_process_serial(\"mssql_cdc\")"),
+    ("oracle_cdc", "cross_process_serial(\"oracle_cdc\")"),
+];
+
+/// `module::test` for every `#[test]` under tests/live whose body holds `call`.
+fn guard_users(root: &std::path::Path, call: &str) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     for e in std::fs::read_dir(root.join("tests/live"))
         .expect("read tests/live")
@@ -23,7 +30,7 @@ fn guard_users(root: &std::path::Path) -> BTreeSet<String> {
                 .and_then(|(_, rest)| rest.split_once('('))
                 .map(|(n, _)| n.trim().to_string())
                 .expect("a #[test] is followed by its fn");
-            if body.contains("toxiproxy_guard()") {
+            if body.contains(call) {
                 out.insert(format!("{stem}::{name}"));
             }
         }
@@ -31,12 +38,13 @@ fn guard_users(root: &std::path::Path) -> BTreeSet<String> {
     out
 }
 
-/// `module::test` for every `test(=…)` in the override that assigns `test-group = 'toxiproxy'`.
-fn grouped(toml: &str) -> BTreeSet<String> {
+/// `module::test` for every `test(=…)` in the override that assigns `test-group = '<group>'`.
+fn grouped(toml: &str, group: &str) -> BTreeSet<String> {
+    let assign = format!("test-group = '{group}'");
     let block = toml
         .split("[[profile.default.overrides]]")
-        .find(|b| b.contains("test-group = 'toxiproxy'"))
-        .expect("an override assigns the toxiproxy test-group");
+        .find(|b| b.contains(&assign))
+        .unwrap_or_else(|| panic!("no override assigns the {group} test-group"));
     block
         .split("test(=")
         .skip(1)
@@ -45,19 +53,25 @@ fn grouped(toml: &str) -> BTreeSet<String> {
 }
 
 #[test]
-fn the_toxiproxy_test_group_names_every_flock_user_and_nothing_else() {
+fn every_flock_test_group_names_every_flock_user_and_nothing_else() {
     let root = super::nonvacuity::repo_root();
-    let users = guard_users(&root);
-    assert!(
-        users.len() >= 2,
-        "found {} toxiproxy_guard users — the scan is broken",
-        users.len()
-    );
     let toml = std::fs::read_to_string(root.join(".config/nextest.toml")).expect("nextest.toml");
-    assert_eq!(
-        grouped(&toml),
-        users,
-        "a test that takes toxiproxy_guard() must sit in the `toxiproxy` test-group (.config/nextest.toml), \
-         or it waits on the flock inside its own timeout"
-    );
+    for (group, call) in GROUPS {
+        let users = guard_users(&root, call);
+        assert!(
+            users.len() >= 2,
+            "found {} `{call}` users — the scan is broken",
+            users.len()
+        );
+        assert_eq!(
+            grouped(&toml, group),
+            users,
+            "a test that takes `{call}` must sit in the `{group}` test-group (.config/nextest.toml), \
+             or it waits on the flock inside its own timeout, holding a runner slot"
+        );
+        assert!(
+            toml.contains(&format!("{group} = {{ max-threads = 1 }}")),
+            "the `{group}` test-group must run one test at a time: its users share one flock"
+        );
+    }
 }
