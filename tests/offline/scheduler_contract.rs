@@ -574,8 +574,8 @@ fn a_wrong_type_an_unknown_word_or_a_moved_key_is_refused() {
     let cases: &[(&str, &str, Value)] = &[
         ("run_entry.json", "/stop_reason", json!("whatever")),
         ("run_entry.json", "/rows", json!("many")),
-        ("run_entry.json", "/status", json!("done")),
-        ("run_entry.json", "/status", json!("interrupted")),
+        ("run_entry_skipped.json", "/status", json!("done")),
+        ("run_entry_skipped.json", "/status", json!("interrupted")),
         ("run_entry_skipped.json", "/stop_reason", json!("caught_up")),
         (
             "run_entry_crashed.json",
