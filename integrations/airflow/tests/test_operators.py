@@ -277,6 +277,15 @@ def test_a_connection_becomes_an_env_url_and_is_never_a_rendered_field(rig: Rig,
     assert connection_url(conn) == "postgresql://rivet:p%40ss%2Fw%3Ard@db:5432/app?sslmode=require"
     assert connection_url(SimpleNamespace(conn_type="mssql", login=None, password=None, host="h", port=None, schema="d",
                                           extra_dejson={})) == "sqlserver://h/d"
+    generic = SimpleNamespace(conn_id="rivet_pg", conn_type="generic", login="u", password="p", host="h", port=1, schema="d", extra_dejson={})
+    assert connection_url(generic, "postgresql") == "postgresql://u:p@h:1/d"
+    monkeypatch.setattr("airflow_provider_rivet.operators.BaseHook.get_connection", lambda conn_id: generic)
+    exc, ti = rig.run(rig.operator(RivetRunOperator, export="orders", env={}, env_from_connections={"RIVET_PG_URL": "rivet_pg"}))
+    assert isinstance(exc, AirflowFailException) and not rig.calls(), "a connection type that names no rivet scheme is refused"
+    assert ti.store[("task", "return_value")]["preflight_refusal"] == "RIVET_AIRFLOW_CONNECTION_SCHEME"
+    explicit = rig.operator(RivetRunOperator, export="orders", env={}, env_from_connections={"RIVET_PG_URL": ("rivet_pg", "postgresql")})
+    rig.run(explicit)
+    assert rig.calls()[-1]["env"]["RIVET_PG_URL"] == "postgresql://u:p@h:1/d"
     monkeypatch.setattr("airflow_provider_rivet.operators.BaseHook.get_connection", lambda conn_id: conn)
     op = rig.operator(RivetRunOperator, export="orders", env={}, env_from_connections={"RIVET_PG_URL": "rivet_pg"})
     payload, _ = rig.run(op)

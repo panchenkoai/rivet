@@ -14,12 +14,19 @@ from .preflight import PreflightRefusal
 
 XCOM_KEY = "return_value"
 _SCHEMES = {"postgres": "postgresql", "mssql": "sqlserver", "mongo": "mongodb"}
+RIVET_SCHEMES = ("postgresql", "postgres", "mysql", "sqlserver", "mongodb", "mongodb+srv", "oracle")
 
 
-def connection_url(conn: Any) -> str:
-    """A rivet URL from an Airflow Connection's fields, in rivet's scheme, credentials percent-encoded."""
+def connection_url(conn: Any, scheme: Optional[str] = None) -> str:
+    """A rivet URL from an Airflow Connection's fields, credentials percent-encoded; an unknown scheme is refused."""
     extra = getattr(conn, "extra_dejson", None) or {}
-    scheme = extra.get("rivet_scheme") or _SCHEMES.get(conn.conn_type, conn.conn_type)
+    scheme = scheme or extra.get("rivet_scheme") or _SCHEMES.get(conn.conn_type, conn.conn_type)
+    if scheme not in RIVET_SCHEMES:
+        raise PreflightRefusal(
+            "RIVET_AIRFLOW_CONNECTION_SCHEME",
+            f"connection `{getattr(conn, 'conn_id', '?')}` has conn_type `{conn.conn_type}`, which names no rivet URL "
+            f"scheme; pass the scheme as (conn_id, scheme) or set the connection extra `rivet_scheme` to one of {RIVET_SCHEMES}",
+        )
     auth = ""
     if conn.login:
         auth = quote(conn.login, safe="")
@@ -59,7 +66,7 @@ class RivetBaseOperator(BaseOperator):
         plan_file: Optional[str] = None,
         rivet_bin: str = "rivet",
         env: Optional[Mapping[str, str]] = None,
-        env_from_connections: Optional[Mapping[str, str]] = None,
+        env_from_connections: Optional[Mapping[str, Any]] = None,
         deployment: str = "auto",
         extra_args: Optional[Sequence[str]] = None,
         lock_wait: int = 600,
@@ -93,8 +100,9 @@ class RivetBaseOperator(BaseOperator):
         """The subprocess environment: the worker's, the declared names, and URLs from Connections."""
         env = dict(os.environ)
         env.update({str(k): str(v) for k, v in (self.env or {}).items()})
-        for name, conn_id in (self.env_from_connections or {}).items():
-            env[name] = connection_url(BaseHook.get_connection(conn_id))
+        for name, ref in (self.env_from_connections or {}).items():
+            conn_id, scheme = (ref, None) if isinstance(ref, str) else (ref[0], ref[1])
+            env[name] = connection_url(BaseHook.get_connection(conn_id), scheme)
         return env
 
     def _emit(self, record: dict[str, Any]) -> None:
@@ -127,16 +135,26 @@ class RivetBaseOperator(BaseOperator):
         ti.xcom_push(key=XCOM_KEY, value=payload)
         raise (AirflowException if retry else AirflowFailException)(text)
 
+    def _refuse(self, ti: Any, refusal: PreflightRefusal) -> None:
+        """Log and publish a refusal made before rivet started, then fail without retry."""
+        self._emit({"event": "rivet.refused", "code": refusal.code, "text": str(refusal)})
+        payload = {"command": self.command, "decision": "fail", "preflight_refusal": refusal.code, "units": []}
+        self._fail(ti, payload, str(refusal), retry=False)
+
     def execute(self, context: Any) -> dict[str, Any]:
         """Run the command; return the XCom payload or raise by the contract's retry table."""
         ti = context["ti"]
         run_id = str(context.get("run_id") or getattr(ti, "run_id", "run"))
         map_index = getattr(ti, "map_index", -1)
         task_part = ti.task_id if map_index in (-1, None) else f"{ti.task_id}-{map_index}"
+        try:
+            env = self._environment()
+        except PreflightRefusal as refusal:
+            self._refuse(ti, refusal)
         request = Request(
             command=self.command,
             config=self.config,
-            env=self._environment(),
+            env=env,
             export=self.export,
             table=self.table,
             rivet_bin=self.rivet_bin,
@@ -154,9 +172,7 @@ class RivetBaseOperator(BaseOperator):
         try:
             outcome = invoke(request, self._emit, self._hold)
         except PreflightRefusal as refusal:
-            self._emit({"event": "rivet.refused", "code": refusal.code, "text": str(refusal)})
-            payload = {"command": self.command, "decision": "fail", "preflight_refusal": refusal.code, "units": []}
-            self._fail(ti, payload, str(refusal), retry=False)
+            self._refuse(ti, refusal)
         finally:
             self._proc = None
         return self._settle(ti, run_id, task_part, outcome)

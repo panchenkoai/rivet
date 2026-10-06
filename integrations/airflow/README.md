@@ -257,9 +257,12 @@ worker, or `env_from_connections={"RIVET_STATE_URL": "rivet_state"}`.
 - rivet is configured through environment variables and nothing else. The subprocess gets the
   worker's environment, plus `env` (templated, visible in the UI: non-secret values only), plus
   `env_from_connections={ENV_NAME: conn_id}`, which builds a URL from an Airflow Connection's
-  fields inside `execute` (rivet's scheme, credentials percent-encoded; the connection extras
-  `rivet_scheme` and `rivet_params` override the scheme and add a query string). It is not a
-  templated field. argv carries the config path, export names and flags.
+  fields inside `execute`, credentials percent-encoded. The scheme comes from
+  `{ENV_NAME: (conn_id, "postgresql")}`, else the connection extra `rivet_scheme`, else the
+  connection type (`postgres`, `mysql`, `mssql`, `mongo`, `oracle`); a type that names no rivet
+  scheme, such as `generic`, is refused before rivet starts
+  (`RIVET_AIRFLOW_CONNECTION_SCHEME`). The extra `rivet_params` adds a query string. It is not
+  a templated field. argv carries the config path, export names and flags.
 - XCom carries code, class, exit_code, retryable, action, kind, counts, `stop_reason`, the
   degradations and file paths. It never carries the error `message`: redaction covers
   credentials only, and error text can embed source cell values.
