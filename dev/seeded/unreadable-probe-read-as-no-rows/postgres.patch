@@ -1,0 +1,24 @@
+diff --git a/src/source/postgres/mod.rs b/src/source/postgres/mod.rs
+index 36666758..1b6c5b8e 100644
+--- a/src/source/postgres/mod.rs
++++ b/src/source/postgres/mod.rs
+@@ -758,9 +758,6 @@ impl super::Source for PostgresSource {
+         if let Ok(Some(v)) = row.try_get::<_, Option<f64>>(0) {
+             return Ok(Some(v.to_string()));
+         }
+-        if let Ok(Some(v)) = row.try_get::<_, Option<i16>>(0) {
+-            return Ok(Some(v.to_string()));
+-        }
+         if let Ok(Some(v)) = row.try_get::<_, Option<u32>>(0) {
+             return Ok(Some(v.to_string()));
+         }
+@@ -792,7 +789,8 @@ impl super::Source for PostgresSource {
+         ) {
+             return Ok(None);
+         }
+-        anyhow::bail!(unreadable_probe(row.columns()[0].type_().name(), sql))
++        let _ = unreadable_probe(row.columns()[0].type_().name(), sql);
++        Ok(None)
+     }
+ 
+     fn type_mappings(
