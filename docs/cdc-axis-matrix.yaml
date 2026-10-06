@@ -310,7 +310,7 @@ shape_axes:
 
 # Rows with `coverage: gap`. LOWER when one gets covered; raising it is a
 # deliberate act that belongs in the same commit as the reason.
-gap_ratchet: 2
+gap_ratchet: 2  # ratchet-pin: cdc-axis-gaps
 
 # ── properties the sweep pins that are not axes ──────────────────────────────
 # Design decisions the sweep would otherwise silently tolerate a change to.

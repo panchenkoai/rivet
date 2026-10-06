@@ -373,6 +373,13 @@ infra:
     note: "SCRAM half gated: verify_auth drives mongo_readonly_login_exports_despite_denied_harm_probe
       (least-privilege export, DuckDB-graded) + mongo_wrong_password_fails_loud_and_writes_nothing
       (refusal names auth, zero parquet). RESIDUAL: x509 cert auth is a separate provisioning class"
+  - id: oracle_verdict_census
+    status: test
+    note: "verify_oracle_verdict_census (dev/release_oracle/skip_census.py) reads the rig oracle verdict
+      log every live test of this gate appended to (RIVET_ORACLE_LOG, set once per gate run): no verdict
+      or no PASS fails, and the CDC first runs the oracle could not grade from an anchor must sit at the
+      gate's ceiling in skip_census.VERDICT_CEILINGS (the same table CI's census step reads). Self-test
+      RED-proven against a log with one extra ungraded first run"
   - id: seeded_recall
     status: partial
     note: "verify_seeded_recall re-introduces every known bug class in dev/seeded/seeds.yaml as a

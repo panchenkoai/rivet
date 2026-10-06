@@ -22,6 +22,90 @@
   whose rows change belongs on `mode: incremental` or `mode: cdc`. `load.layout: base_buffer`
   does not work for them yet: no run lands the base, so `rivet compact` refuses.
 
+## 0.31.0 — 2026-10-04
+
+- **A resumed chunked run with no tasks is no longer an empty success.** A checkpointed chunked
+  run wrote its run row and its task rows in two writes. When the task write failed, the run row
+  stayed behind with no tasks; the next plain run resumed it, found nothing to do, exited 0 and
+  delivered 0 of 150 rows (measured). The run row and its tasks are now written in one
+  transaction, so a run opens with its tasks or not at all.
+
+- **A `keyset_incremental` export loads as an append, not an overwrite.** Each run of such an
+  export delivers only the keys past its anchor, but `rivet load` treated it as a full load and
+  replaced the warehouse table with the newest delta. Measured on a PostgreSQL source (ids
+  1..100, then 101..120, then no change): BigQuery and ClickHouse held 100, then 20, then 20
+  rows. It now loads as an incremental load ordered by `chunk_by_key`. A table that an earlier
+  release already overwrote is not repaired by the upgrade; it holds only the last delta until
+  the source is re-read in full.
+
+- **CDC refuses a value its column type cannot hold instead of writing NULL.** The CDC sink
+  appended NULL when a change event's value did not fit its column (integers, Boolean, floats,
+  dates, timestamps, times, binary). Only a source NULL is NULL now; any other mismatch fails the
+  flush and names the column.
+
+- **The PostgreSQL batch reader refuses an undecodable cell instead of panicking or writing
+  NULL.** A text or enum cell that is not valid UTF-8 fails with
+  `RIVET_SOURCE_VALUE_UNREPRESENTABLE` naming the column (text used to panic, enum wrote NULL).
+  Integer overrides decode at the wire width and widen exactly; a narrowing value that does not
+  fit is refused by name.
+
+- **Oracle CDC re-mines when the redo log set changes under LogMiner.** A log switch that reused
+  or archived an online redo file LogMiner had registered failed the run with ORA-01368 behind a
+  permissions hint, and a sequence archived between two catalog reads could be refused as lost.
+  The run now re-plans the logs and restarts mining after the last queued commit group, five
+  times with a doubling backoff, before failing with a message that names the cause.
+
+- **Oracle CDC no longer pins its low-water mark at SCN 0.** A transaction with a slot but no
+  start SCN yet shows `START_SCN = 0`; the anchor took it as the minimum, and the next run
+  planned redo from SCN 0 and refused with a false "changes LOST".
+
+- **CDC refuses an unmet prerequisite before the anchor and the snapshot write.** Under
+  `initial: snapshot` the first run pinned its anchor and wrote the snapshot part, manifest and
+  marker before the engine's refusals ran, so a source that cannot be captured was refused only
+  after a part and a checkpoint were on disk. The refusals now run first (MySQL: row metadata,
+  binlog compression, replica re-log, routing; Oracle: container, table vetting, supplemental
+  logging; PostgreSQL: routing).
+
+- **The PostgreSQL missing-slot refusal names the evidence it found.** When the replication slot
+  is gone but an earlier run left a checkpoint, a completed snapshot, or both, the refusal now
+  says which, and gives the recovery steps for that case.
+
+- **`rivet init --mode cdc` scaffolds a config that runs.** SQL Server, MongoDB, a single table
+  and a non-`public` PostgreSQL schema got a stream with no baseline under a base-and-buffer load
+  block, so the first `rivet compact` refused; Oracle got a `load:` block every command refuses.
+  Every CDC scaffold now takes a baseline, and none carries a load block the loader refuses.
+
+- **ClickHouse loads accept `partition:`.** `partition: { column, granularity }` maps to
+  `PARTITION BY` on the full-load table and both change logs. A part ClickHouse pulls is
+  footer-checked for the DateTime64 range before insert (it used to be stored clamped),
+  statements that are safe to repeat are retried up to five times, and `load.ca_file` sets the
+  CA bundle.
+
+- **Oracle batch: override decoders, case refusal at `check`, non-Unicode national charsets.**
+  Row decoders for int2, date, timestamp_ns, uuid, float8 and text overrides; `rivet check`
+  refuses a wrong-case `columns:` key as the run does; NVARCHAR2, NCHAR and NCLOB round-trip
+  byte-exact on a WE8ISO8859P1 database.
+
+- **The CDC sink builds exactly the planned column type.** A column the CDC builder cannot build
+  is planned as server text and labelled so in the Parquet metadata; a `Date32` column refuses a
+  time of day; integer and float overrides accept decimal text through one parser.
+
+- **New: `rivet state vacuum`.** It shrinks a SQLite state database (VACUUM plus a truncating
+  checkpoint) and prints the size before and after; on a PostgreSQL state it does nothing.
+  Measured on a pilot state copy: 46.8 MB to 18.8 MB, with 32 concurrent runs on the same file
+  and no failed run.
+
+- **State schema v32.** A run's load spec is stored once per distinct version instead of once
+  per run (a pilot state held 9,029 run rows for 154 distinct specs). The migration runs on the
+  first command; binaries older than this release refuse a v32 state, so upgrade every host
+  that shares a state together. The PostgreSQL migration replays safely over a partly migrated
+  schema, and the PostgreSQL state reads every integer width (a resumed parallel keyset run
+  could panic on an INT4).
+
+- **Dependencies.** `mysql` 28.0.3 (28.0.0 was yanked), `mongodb` 3.9.1 (a change-stream loop
+  and two CVEs), `tiberius` 0.13 (SQL Server `sql_variant` and CLR types read as text).
+  `cargo audit` is clean.
+
 - **MySQL CDC `compact` reads the base only in its MERGE.** `rivet compact` merges only the
   partitions its changes name. To catch a row whose partition value changed, it used to look
   every updated key up in the base on every cycle; a pilot paid 2 x 2.2 GiB per large table

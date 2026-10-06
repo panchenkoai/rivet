@@ -1925,34 +1925,3 @@ fn a_mongo_resume_export_into_clickhouse_accumulates_every_run() {
     );
     assert_eq!(clickhouse_ids(&db), m.ids("t"));
 }
-
-#[test]
-#[ignore = "probe"]
-fn zz_probe_l3() {
-    for variant in ["load-each-run", "load-once-after-three-runs"] {
-        let mdb = unique_name("chl3");
-        let m = MongoTest::connect(MONGO_PORT, &mdb);
-        m.seed_int_id("t", 10);
-        let db = Db::new("rivet_chtest");
-        let rig = Rig::mongo_batch("t")
-            .source_url(&MongoTest::url(MONGO_PORT, &mdb))
-            .mongo("page_size: 4")
-            .dest_gcs(BUCKET, &unique_name("chload"), FAKE_GCS_ENDPOINT)
-            .top_line(&load_line(CLICKHOUSE_HTTP_URL, &db, "").replace("pk: [id]", "pk: auto"))
-            .no_oracle("probe");
-        for i in 1..=3 {
-            rig.run_ok();
-            if variant == "load-each-run" || i == 3 { load(&rig); }
-            m.upsert_set("t", 5, "v", &format!("u{i}"));
-        }
-        let rig = rig.mongo("page_size: 4, resume: true");
-        rig.run_ok();
-        let out = rig.load_args_env(&[], &[(PASSWORD_ENV, CLICKHOUSE_PASSWORD)]);
-        eprintln!("PROBE-L3 {variant} load stdout: {}", String::from_utf8_lossy(&out.stdout).trim());
-        eprintln!("PROBE-L3 {variant} stderr-notes: {}", String::from_utf8_lossy(&out.stderr).lines().filter(|l| l.contains("note") || l.contains("WARN") || l.contains("overwrite")).collect::<Vec<_>>().join(" || "));
-        eprintln!("PROBE-L3 {variant} source _id5: {:?}", m.current_state_i64("t", "v").get(&5));
-        eprintln!("PROBE-L3 {variant} view _id5: {}", clickhouse_rows_tsv(&format!("SELECT document FROM {}.t WHERE _id = '5' FORMAT TSV", db.0)));
-        eprintln!("PROBE-L3 {variant} log copies of _id5: {}", clickhouse_rows_tsv(&format!("SELECT count(), groupArray(document) FROM {}.t__changes WHERE _id = '5' FORMAT TSV", db.0)));
-        eprintln!("PROBE-L3 {variant} log rows / view rows: {} / {}", clickhouse_rows_tsv(&format!("SELECT count() FROM {}.t__changes FORMAT TSV", db.0)), clickhouse_rows_tsv(&format!("SELECT count() FROM {}.t FORMAT TSV", db.0)));
-    }
-}

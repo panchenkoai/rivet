@@ -27,6 +27,7 @@
 # current code no longer yields. No dated section emptied. Entries sharing file+line+text differ in
 # column — distinct mutants, kept. The 1081 entries directly under this header
 # name no oracle of their own; the blanket verdict above is all they carry.
+# ratchet-pin: mutants-baseline lines
 src/destination/cloud.rs:180:9: replace <impl super::Destination for CloudDestination<B>>::write -> Result<super::WriteOutcome> with Ok(Default::default())
 src/destination/cloud.rs:233:9: replace <impl super::Destination for CloudDestination<B>>::list_prefix -> Result<Vec<super::ObjectMeta>> with Ok(vec![])
 src/destination/cloud.rs:237:41: replace || with && in <impl super::Destination for CloudDestination<B>>::list_prefix
