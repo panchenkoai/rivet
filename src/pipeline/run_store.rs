@@ -267,7 +267,8 @@ mod tests {
         // single.rs's incremental path technically supports this when
         // the progression write is skipped — e.g., a future flag).
         let state = StateStore::open_in_memory().unwrap();
-        let plan = incremental_plan("orders");
+        let mut plan = incremental_plan("orders");
+        plan.base_query = "SELECT id, updated_at FROM \"shop\".\"orders_src\" WHERE id > 0".into();
         let summary = test_summary(&plan, "run-1");
 
         RunStore::finalize(&state, &plan, &summary)
@@ -285,6 +286,17 @@ mod tests {
             cursor.cursor_column.as_deref(),
             Some("updated_at"),
             "MT4: every cursor write records its identity"
+        );
+        let scope = plan.source.state_key();
+        let said = state
+            .claim_stream("orders", &scope, "shop.customers", true)
+            .expect_err("MT8: the cursor write recorded the relation the plan reads")
+            .to_string();
+        assert!(said.contains("reading `shop.orders_src`"), "{said}");
+        assert!(
+            state
+                .claim_stream("orders", &scope, &plan.stream(), true)
+                .is_ok()
         );
     }
 

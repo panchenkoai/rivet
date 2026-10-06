@@ -339,25 +339,28 @@ pub(crate) fn outer_from_relation(query: &str) -> Option<String> {
         b'[' => Some(b']'),
         _ => None,
     };
-    let (mut i, mut depth) = (0usize, 0i32);
-    let after_from = loop {
-        let c = *b.get(i)?;
-        if let Some(end) = closer(c) {
-            i += 1 + b[i + 1..].iter().position(|&x| x == end)?;
-        } else if c == b'(' {
-            depth += 1;
-        } else if c == b')' {
-            depth -= 1;
-        } else if depth == 0
-            && b.len() >= i + 4
+    let (mut depth, mut quote) = (0i32, None);
+    let after_from = b.iter().enumerate().find_map(|(i, &c)| {
+        if let Some(end) = quote {
+            quote = Some(end).filter(|&e| e != c);
+            return None;
+        }
+        quote = closer(c);
+        match c {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            _ => {}
+        }
+        let keyword = depth == 0
+            && b[i..].len() >= 4
             && b[i..i + 4].eq_ignore_ascii_case(b"from")
             && (i == 0 || !ident(b[i - 1]))
-            && b.get(i + 4).is_none_or(|&n| !ident(n))
-        {
-            break i + 4;
-        }
-        i += 1;
-    };
+            && b.get(i + 4).is_none_or(|&n| !ident(n));
+        keyword.then_some(i + 4)
+    })?;
+    if quote.is_some() {
+        return None;
+    }
     let mut rest = query[after_from..].trim_start();
     let mut parts: Vec<&str> = Vec::new();
     loop {
@@ -426,6 +429,20 @@ mod tests {
         );
         assert_eq!(rel("SELECT * FROM (SELECT 1) x"), None);
         assert_eq!(rel("SELECT 1"), None);
+        assert_eq!(rel("FROM t"), t("t"));
+        assert_eq!(rel("SELECT xfrom FROM t"), t("t"));
+        assert_eq!(rel("SELECT fromx FROM t"), t("t"));
+        assert_eq!(rel("SELECT 1 FROM\tt"), t("t"));
+        assert_eq!(rel("SELECT (SELECT max(id) FROM inner_t) m"), None);
+        assert_eq!(rel("SELECT ((1)) FROM t"), t("t"));
+        assert_eq!(rel("SELECT ')' FROM t"), t("t"));
+        assert_eq!(rel("SELECT \"a(\" FROM t"), t("t"));
+        assert_eq!(rel("SELECT [from] FROM t"), t("t"));
+        assert_eq!(rel("SELECT 1 FROM t.\"u v\".w x"), t("t.u v.w"));
+        assert_eq!(rel("SELECT 1 FROM t."), None);
+        assert_eq!(rel("SELECT 1 FROM \"\""), None);
+        assert_eq!(rel("SELECT 1 fro"), None);
+        assert_eq!(rel("SELECT 1 FROM 'literal'"), None);
         assert_eq!(rel("SELECT fromage FROM"), None);
         assert_eq!(rel("SELECT 'unterminated FROM t"), None);
     }
