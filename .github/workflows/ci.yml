@@ -1393,48 +1393,75 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release
 
-  e2e:
-    name: E2E matrix
+  # The E2E check is four jobs' worth of runners instead of one 50-minute job (measured 49-52 min:
+  # 39 of them the live sweep on one runner). `e2e-build` compiles the test binaries once into a
+  # nextest archive; `e2e` runs four legs on a full stack each (`pre`: the small suites, once;
+  # `i/N`: one partition of the live sweep); `e2e-matrix` carries the required check name and
+  # grades the censuses over the union of the legs' logs.
+  e2e-build:
+    name: E2E build (nextest archive)
     runs-on: ubuntu-latest
-    # The job normally takes ~45 minutes; anything near this bound is a hang, not a slow run.
-    timeout-minutes: 120
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      # No free-disk step: the runner starts with 83 GB free of 145 GB, the build ends ~70 GB used
+      # and a leg ~90 GB (measured on PR #452's first run; each job prints `df` every run).
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # One cache for this job and the `pre` leg below, saved here only.
+          shared-key: e2e-debug
+      - uses: taiki-e/install-action@v2.87.17
+        with:
+          tool: cargo-nextest
+      - name: Build rivet and every test binary (debug), once
+        # Debug, not --release: these suites grade CORRECTNESS on small fixtures, so
+        # the fat-LTO release build buys nothing here; `build-release` keeps it.
+        run: |
+          cargo nextest archive --archive-file "$RUNNER_TEMP/e2e-nextest.tar.zst"
+          ls -l "$RUNNER_TEMP/e2e-nextest.tar.zst"
+          df -h /
+      - uses: actions/upload-artifact@v7
+        with:
+          name: e2e-nextest-archive
+          path: ${{ runner.temp }}/e2e-nextest.tar.zst
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
+
+  e2e:
+    name: E2E (${{ matrix.leg }})
+    needs: e2e-build
+    runs-on: ubuntu-latest
+    # A leg takes ~20 minutes; anything near this bound is a hang, not a slow run.
+    timeout-minutes: 60
+    strategy:
+      # A red leg must not cancel the others: the verdict names every failing test of the matrix.
+      fail-fast: false
+      matrix:
+        # `pre` runs the small suites; `i/N` is nextest's `--partition count:i/N` of the live sweep.
+        # tests/offline/ci_gate_steps_guard.rs fails a list that is not `pre` plus every i of one N.
+        # One leg per runner: the stack's ports and fixtures are per runner.
+        leg: [pre, 1/3, 2/3, 3/3]
     env:
       # The Postgres STATE backend for the tests that grade it (live_pg_state, live_state_backend_parity,
       # live_shared_state_same_name, the PG-gated lib tests in src/state), on a per-run database made
       # in "Wait for services". Only RIVET_TEST_STATE_URL: RIVET_STATE_URL / RIVET_GATE_STATE_URL stay
       # unset, so every Rig and SQLite-reading test keeps its SQLite state beside the config.
       RIVET_TEST_STATE_URL: postgresql://rivet:rivet@127.0.0.1:5433/rivet_state_ci
+      # Where every test of the leg records its self-skips and rig-oracle verdicts; `e2e-matrix`
+      # grades the union of the legs' files.
+      RIVET_SKIP_LOG: ${{ github.workspace }}/target/rivet-skips.log
+      RIVET_ORACLE_LOG: ${{ github.workspace }}/target/rivet-oracle.log
     steps:
       - uses: actions/checkout@v7
 
-      # GitHub-hosted ubuntu-latest ships with ~14 GB free on `/`. This job
-      # then asks for ~3 GB of toolchain + ~3-4 GB of `cargo build --release`
-      # target + another ~3-5 GB of test-profile rebuild + 7 docker images
-      # (postgres / mysql / minio / fake-gcs / toxiproxy / pgbouncer /
-      # proxysql) + seed fixtures + per-test temp output. Headroom is gone
-      # before the test step starts, and a worker hitting ENOSPC mid-run
-      # surfaces as a non-obvious `Process completed with exit code 101`
-      # because cargo's diagnostic gets garbled when stderr write fails.
-      # The action below removes the pre-installed .NET / Android SDK /
-      # Haskell GHC / CodeQL / dotnet caches Rivet never touches, freeing
-      # ~30 GB. Cheap (~15 s wall) and the recommended fix per
-      # https://github.com/actions/runner-images/issues/2840.
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@main
-        with:
-          large-packages: false # keeps the action fast; the big wins are below
-          tool-cache: true
-          android: true
-          dotnet: true
-          haskell: true
-          swap-storage: false # leave swap (host may need it under load)
-      - name: Disk snapshot — pre-build
-        run: df -h /
-
-      - name: Start services (in the background, while the build runs)
+      - name: Start services (in the background)
         # `up -d` pulls ~20 images and starts them; that used to happen, and then be
         # waited on, BEFORE the build. It runs in the background now and overlaps the
-        # compile; "Services are up" below joins it and fails the job on its exit code.
+        # compile or the archive download; "Services are up" below joins it and fails the job on its exit code.
         #
         # Include `toxiproxy` so the retry / chaos / crash-recovery live-test
         # binaries have the proxy admin API available on :8474.
@@ -1457,13 +1484,18 @@ jobs:
           ( docker compose --profile pool --profile cdc --profile replica --profile governor up -d postgres postgres-state mysql mssql mssql-governor minio fake-gcs azurite toxiproxy pgbouncer pgbouncer-state proxysql postgres-cdc mysql-cdc mssql-cdc mysql-primary mysql-replica mysql-replica-nolog duckdb clickhouse oracle > "$RUNNER_TEMP/compose.log" 2>&1; echo $? > "$RUNNER_TEMP/compose.rc" ) &
 
       - uses: dtolnay/rust-toolchain@master
+        if: ${{ matrix.leg == 'pre' }}
         with:
           toolchain: "1.94"
       - uses: Swatinem/rust-cache@v2
+        if: ${{ matrix.leg == 'pre' }}
+        with:
+          shared-key: e2e-debug
+          save-if: false
       # uv runs the rig's default oracle (dev/release_oracle/rig_oracle.py, pinned by uv.lock).
       - uses: taiki-e/install-action@v2.87.17
         with:
-          tool: uv
+          tool: cargo-nextest,uv
 
       - name: Independent row-hash oracle deps
         # `xxhash` is what makes the row-hash check INDEPENDENT: it rebuilds the
@@ -1474,13 +1506,19 @@ jobs:
         # installed here (measured: 699 passed, 1 failed, three runs running).
         run: python3 -m pip install --break-system-packages xxhash
 
-      - name: Build rivet and every test binary (debug)
-        # ONE compile for every suite below, overlapping the service start-up.
-        # Debug, not --release: these suites grade CORRECTNESS on small fixtures, so
-        # the fat-LTO release build buys nothing here; `build-release` keeps it.
+      - name: Build rivet and the small suites' binaries (debug)
+        # The `pre` suites run through cargo (their commands are the ones the release gate and the
+        # Makefile run), so this leg compiles on the cache `e2e-build` saved.
+        if: ${{ matrix.leg == 'pre' }}
         run: |
           cargo build
           cargo test --no-run
+
+      - uses: actions/download-artifact@v8
+        if: ${{ matrix.leg != 'pre' }}
+        with:
+          name: e2e-nextest-archive
+          path: ${{ runner.temp }}
 
       - name: Services are up
         # A hung `compose up` (an image pull that never returns) used to hold this step for the
@@ -1520,12 +1558,12 @@ jobs:
           # blobs over HTTP and creates its container via the (preinstalled) az CLI.
           for i in $(seq 1 30); do (exec 3<>/dev/tcp/127.0.0.1/10000) 2>/dev/null && break || sleep 1; done
           echo "Waiting for SQL Server..."
-          # mssql has a sqlcmd SELECT-1 healthcheck (start_period 30s); wait on it
-          # so the live_mssql_* suites can connect + seed. The governor instance
+          # Wait until sqlcmd answers so the live_mssql_* suites can connect + seed
+          # (by service, not container name: compose names it `rivet-mssql-1`). The governor instance
           # gets the same wait AND its `rivet` database created — the canaries
           # seed into it, and an unwaited second SQL Server is exactly the
           # "enabled is not ready" trap this repo already paid for once.
-          for i in $(seq 1 40); do [ "$(docker inspect -f '{{.State.Health.Status}}' rivet-mssql 2>/dev/null)" = "healthy" ] && break || sleep 2; done
+          for i in $(seq 1 40); do docker compose exec -T mssql /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'Rivet_Passw0rd!' -C -Q 'SELECT 1' >/dev/null 2>&1 && break || sleep 2; done
           for i in $(seq 1 40); do docker compose exec -T mssql-governor /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'Rivet_Passw0rd!' -C -Q 'SELECT 1' >/dev/null 2>&1 && break || sleep 2; done
           echo "Waiting for CDC services (cdc profile)..."
           # Dedicated CDC instances: logical WAL (PostgreSQL :5434), a REPLICATION
@@ -1581,29 +1619,29 @@ jobs:
       # The suites below were jobs of their own, each compiling the crate again on a
       # runner that started a subset of these same services.
       - name: Type-golden tests (semantic gate)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.leg == 'pre' }}
         run: cargo test --test live_type_golden -- --ignored
 
       - name: Type round-trip validators — DuckDB · ClickHouse · pyarrow (semantic gate)
         # `--skip bigquery`: the cloud-warehouse cells need GCP credentials CI has
         # not got (the manual `make test-types-bigquery` target covers them).
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.leg == 'pre' }}
         run: cargo test --test type_roundtrip -- --include-ignored --skip bigquery
 
       - name: Differential correctness at scale (DuckDB vs source)
         # tests/live_differential.rs — an INDEPENDENT reader (DuckDB) must agree with
         # the source field for field, on a clean chunked export and a crash + resume.
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.leg == 'pre' }}
         run: cargo test --test live_differential -- --ignored
 
       - name: Create matrix navigation links
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.leg == 'pre' }}
         env:
           RIVET_BIN: ${{ github.workspace }}/target/debug/rivet
         run: python3 -m dev.pytools.matrix_common setup-links
 
       - name: PR regression matrices (cli + cfg + path)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.leg == 'pre' }}
         env:
           RIVET_BIN: ${{ github.workspace }}/target/debug/rivet
         # `shell: bash` + pipefail: Actions' default `bash -e` has no pipefail, so
@@ -1614,7 +1652,7 @@ jobs:
           python3 -m dev.pytools.matrices --tier=pr --skip-compose | tee dev/matrices/run.log
 
       - name: Upload matrix logs on failure
-        if: failure()
+        if: ${{ failure() && matrix.leg == 'pre' }}
         uses: actions/upload-artifact@v7
         with:
           name: matrices-pr-logs
@@ -1625,29 +1663,28 @@ jobs:
           retention-days: 14
 
       - name: Run E2E test suite
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.leg == 'pre' }}
         env:
           MINIO_ACCESS_KEY: minioadmin
           MINIO_SECRET_KEY: minioadmin
           RIVET: ./target/debug/rivet
         run: python3 -m dev.pytools.e2e
 
-      - name: Disk snapshot — post-build
-        # Surfaces remaining headroom for the test-profile recompile + per-
-        # test output below. If a future regression burns through the buffer,
-        # the diff between pre/post is the smoking gun.
-        run: df -h /
-
       - name: State lib tests on the Postgres state backend
         # The PG-gated unit tests in src/state are not #[ignore]d, so the `--ignored` sweep below never
         # selects them and the `Tests` job runs them without a state URL (they self-skip there).
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.leg == 'pre' }}
         # The selection is dev/release_oracle/state_lib.py, the one the release gate runs; it fails when
         # no test passed or one self-skipped.
         run: python3 -m dev.release_oracle.state_lib
 
+      - name: Ignored doc-tests
+        # `cargo test -- --ignored` listed the lib's `ignore` doc-tests too; nextest runs no doc-test.
+        if: ${{ !cancelled() && matrix.leg == 'pre' }}
+        run: cargo test --doc -- --ignored
+
       - name: Run live cargo integration tests
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.leg != 'pre' }}
         # Activates every `tests/live_*.rs` binary that is `#[ignore]`d by
         # default (Phase A–G of the QA backlog).  Cross-process synchronisation
         # on the shared Toxiproxy admin API is enforced by an flock-based
@@ -1656,6 +1693,13 @@ jobs:
         # Skip the heavy `content_export` tests — they assert a 50K+ row
         # `content_items` fixture that takes minutes to seed and is exercised
         # by the `nightly-live` workflow instead.
+        #
+        # One nextest partition of the archive `e2e-build` made: a test is its own process, so the
+        # flock users queue in their test-groups (.config/nextest.toml) and not on a runner slot.
+        # `--profile pr` keeps retries at 0 and gives the debug build its own ceilings. The archive
+        # is extracted over the checkout because the tests hold `CARGO_BIN_EXE_rivet` as a
+        # compile-time path. `--run-ignored only` and the `--skip` terms after `--` select what
+        # `cargo test -- --ignored --skip ...` selected (substring match on the full name).
         #
         # ONE skip policy, graded offline by tests/offline/live_skip_policy_guard.rs
         # against this list, the nightly's two filters and every live test's
@@ -1691,7 +1735,10 @@ jobs:
         # (REPLICA_CELLS, verify_cdc_standby, verify_audit_suspects, the derived
         # live-module cell) and FAILS when their stand is down.
         run: >-
-          cargo test -- --ignored --skip content_export --skip validates --skip edge_cases
+          cargo nextest run --archive-file "$RUNNER_TEMP/e2e-nextest.tar.zst"
+          --extract-to "$GITHUB_WORKSPACE" --extract-overwrite
+          --profile pr --run-ignored only --partition count:${{ matrix.leg }}
+          -- --skip content_export --skip validates --skip edge_cases
           --skip via_duckdb --skip mongo --skip warehouse_cell
           --skip readable_secondary --skip mssql_checkpoint_follows_a_failover
           --skip mssql_checkpoint_from_another_database --skip from_a_standby
@@ -1706,9 +1753,62 @@ jobs:
         if: ${{ failure() }}
         run: sudo dmesg -T | grep -iE 'out of memory|oom-kill|killed process' || echo "no OOM kill in the kernel log"
 
+      - name: Disk snapshot
+        if: ${{ !cancelled() }}
+        run: df -h /
+
+      - name: This leg's skip and verdict logs
+        # An absent file is an empty one: a leg that skipped nothing still hands over both.
+        if: ${{ !cancelled() }}
+        run: mkdir -p target && touch "$RIVET_SKIP_LOG" "$RIVET_ORACLE_LOG"
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: e2e-logs-${{ strategy.job-index }}
+          path: |
+            target/rivet-skips.log
+            target/rivet-oracle.log
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Stop services
+        if: always()
+        run: docker compose down
+
+  # The REQUIRED check (branch protection knows this name). `always()`: a job skipped by a failed
+  # `needs` counts as passing for a required check, so this one runs and fails instead.
+  e2e-matrix:
+    name: E2E matrix
+    needs: e2e
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Every leg passed
+        # `needs.<matrix job>.result` is `success` only when every leg succeeded: a failed,
+        # cancelled or skipped leg (a failed build skips them all) fails the check.
+        run: |
+          echo "e2e legs: ${{ needs.e2e.result }}"
+          [ "${{ needs.e2e.result }}" = success ]
+      - uses: actions/checkout@v7
+        if: ${{ !cancelled() }}
+      - uses: actions/download-artifact@v8
+        if: ${{ !cancelled() }}
+        with:
+          pattern: e2e-logs-*
+          path: e2e-logs
+      - name: One log of the whole matrix
+        # The ceilings below are totals of the whole E2E check, so the censuses read the legs' logs as one.
+        if: ${{ !cancelled() }}
+        run: |
+          mkdir -p target
+          cat e2e-logs/*/rivet-skips.log > target/rivet-skips.log
+          cat e2e-logs/*/rivet-oracle.log > target/rivet-oracle.log
+          wc -l e2e-logs/*/*.log target/rivet-skips.log target/rivet-oracle.log
+
       - name: Self-skip census
-        # libtest prints `ok` for a test that returned early, so `skip_live` writes every self-skip
-        # to target/rivet-skips.log. The release gate fails any self-skip outside core.SKIP_ALLOWED;
+        # A test that returned early still passes, so `skip_live` writes every self-skip to the leg's
+        # RIVET_SKIP_LOG. The release gate fails any self-skip outside core.SKIP_ALLOWED;
         # this job applies the same list plus the prerequisites it knowingly lacks, named in LACKING
         # so a reader sees what this job does NOT grade. Any other self-skip is a test this job was to
         # run and did not. (Before this step 10 of the 11 live_pg_state tests, among others, passed here
@@ -1723,7 +1823,7 @@ jobs:
             pg18-batch (:5518)
           # BIGQUERY_TEST_PROJECT / SNOWFLAKE_TEST_CONNECTION: no warehouse credentials here (same as
           #   `--skip warehouse_cell`); the lib's ignored warehouse tests run under `--ignored` too.
-          # RIVET_TEST_EXCLUSIVE: the suite runs threaded on a shared stand; the gate runs those alone.
+          # RIVET_TEST_EXCLUSIVE: the suite runs in parallel on a shared stand; the gate runs those alone.
           # pg18-batch: a service this job's compose line does not start.
           # Not lacked: RIVET_TEST_STATE_URL (job env, per-run DB on postgres-state) and the pinned
           #   duckdb (the source-parity sweeps and the drain row-hash test spawn `uv run` themselves).
@@ -1737,9 +1837,6 @@ jobs:
         if: ${{ !cancelled() }}
         run: python3 -m dev.release_oracle.skip_census --verdicts target/rivet-oracle.log --lane ci
 
-      - name: Stop services
-        if: always()
-        run: docker compose down
 
   audit:
     name: Security audit
