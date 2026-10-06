@@ -900,4 +900,20 @@ exclude_re = [
     #   mysql_cdc_refuses_minimal_row_metadata_at_open fails "MINIMAL must fail the run".
     #   Its legacy-server decision is the unit-tested row_metadata_or_legacy.
     "replace MysqlChangeStream::refuse_nameless_binlog -> Result<\\(\\)> with Ok\\(\\(\\)\\)",
+    # Two catalog reads that take a live handle (PR #435), each stub applied by hand, the live
+    # module run under nextest, the file restored from a snapshot: 2026-10-06.
+    # - resolve_tables -> Ok(vec![]) (Oracle `&Connection`) vets and captures no table, so the
+    #   open fails: 29 of 33 live_cdc_oracledb tests FAIL (33 passed before and after), led by
+    #   oracle_cdc_a_primary_key_update_is_a_delete_then_an_insert ("rig run failed for
+    #   'ORA_PKMV_…'", status failed, rows 0). Only this stub is excluded: the body's refusal
+    #   decisions stay in the corpus.
+    "replace resolve_tables -> Result<Vec<Captured>> with Ok\\(vec!\\[\\]\\)$",
+    # - PgChangeStream::old_images_on -> vec![] (Postgres `&mut Client`) reads no replica
+    #   identity, so the run-start warning is never said:
+    #   pg_cdc_warns_about_a_table_whose_changes_carry_no_old_image fails `want "postgres cdc:
+    #   table … has a DEFERRABLE primary key, …" in:` (8 passed -> 7 passed, 1 failed -> passed).
+    #   The other seven pg_cdc_ key-move tests stay green under it: the stub feeds warnings only,
+    #   the split reads the event's own old image. Its decisions are the unit-tested old_image,
+    #   no_old_key_warning and row_image_verdict; the row mapping needs a `postgres::Row`.
+    "replace PgChangeStream::old_images_on -> Vec<\\(String, OldImage\\)> with vec!\\[\\]$",
 ]
