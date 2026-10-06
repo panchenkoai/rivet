@@ -8,6 +8,19 @@
 # installed some other way).
 PY ?= uv run python
 
+# Live runs share the machine through LIVE_SLOTS slots (dev/pytools/live_slot.py, OS file
+# locks): every live target below waits for a free slot, and the release gate takes all of them.
+LIVE_SLOTS ?= 2
+LIVE = python3 dev/pytools/live_slot.py --slots $(LIVE_SLOTS) --
+LIVE_ALL = python3 dev/pytools/live_slot.py --slots $(LIVE_SLOTS) --all --
+
+.PHONY: pr-ready live
+pr-ready:  ## Everything a PR must pass before it is opened; paste the summary block into the PR body. ARGS=--fast skips mutants (reported NOT RUN); ARGS='--body FILE' grades the PR body's declarations.
+	python3 dev/pytools/pr_ready.py run $(ARGS)
+
+live:  ## Any live command inside a slot: make live CMD="cargo nextest run --run-ignored only -E 'test(x)'"
+	$(LIVE) $(CMD)
+
 .PHONY: test-types test-types-live test-types-property test-types-validators test-types-bigquery test-types-snowflake sweep-test-db sweep-test-cloud test-live seed-build seed-db seed-postgres seed-mysql seed-mssql seed-mongo seed-oracle seed-garbage seed-garbage-postgres seed-garbage-mysql seed-garbage-mssql
 
 # PR-fast: offline type-mapping contracts (no docker).
@@ -16,21 +29,21 @@ test-types:
 
 # Full type matrix: MySQL + PostgreSQL × Parquet + CSV (docker required).
 test-types-live:
-	cargo test --test type_roundtrip -- --include-ignored
+	$(LIVE) cargo test --test type_roundtrip -- --include-ignored
 
 # Property-based value round-trip (OPT-3): random in-range values → MySQL →
 # Parquet → read-back, asserting every value survives. Requires `docker compose
 # up -d mysql`. Tune case count with PROPTEST_CASES (default 12).
 test-types-property:
-	cargo test --test type_roundtrip mysql_value_roundtrip -- --ignored
+	$(LIVE) cargo test --test type_roundtrip mysql_value_roundtrip -- --ignored
 
 # Independent-reader validators: PG/MySQL matrix → Parquet → {DuckDB, ClickHouse}.
 # Requires `docker compose up -d postgres mysql duckdb clickhouse` first.
 # See ADR-0014; the duckdb + clickhouse services are oracles for the Parquet
 # layer, not productive components.
 test-types-validators:
-	cargo test --test type_roundtrip duckdb_validates -- --ignored --test-threads=1
-	cargo test --test type_roundtrip clickhouse_validates -- --ignored --test-threads=1
+	$(LIVE) cargo test --test type_roundtrip duckdb_validates -- --ignored --test-threads=1
+	$(LIVE) cargo test --test type_roundtrip clickhouse_validates -- --ignored --test-threads=1
 
 # Cloud validator: PG/MySQL matrix → Parquet → BigQuery (real warehouse oracle).
 # Requires:
@@ -42,7 +55,7 @@ test-types-validators:
 # BigQuery's autoload actually does to rivet Parquet today.
 # Example: `BIGQUERY_TEST_PROJECT=my-proj make test-types-bigquery`.
 test-types-bigquery:
-	cargo test --test type_roundtrip bigquery_validates -- --include-ignored --test-threads=1
+	$(LIVE) cargo test --test type_roundtrip bigquery_validates -- --include-ignored --test-threads=1
 
 # Cloud validator: PG matrix → Parquet → Snowflake (real warehouse oracle).
 # The CI guardian for the Snowflake resolver claims in src/types/target.rs —
@@ -55,7 +68,7 @@ test-types-bigquery:
 #   - docker-compose postgres for the source database.
 # Example: `SNOWFLAKE_TEST_CONNECTION=rivet make test-types-snowflake`.
 test-types-snowflake:
-	cargo test --test type_roundtrip snowflake_validates -- --include-ignored --test-threads=1
+	$(LIVE) cargo test --test type_roundtrip snowflake_validates -- --include-ignored --test-threads=1
 
 # Drop test-fixture tables left behind by INTERRUPTED live runs (a killed test
 # process skips the RAII Drop guard, so the slow cloud suites can leak
@@ -75,13 +88,13 @@ sweep-test-cloud:
 SOAK_ARGS ?=
 .PHONY: soak
 soak:
-	$(PY) -m dev.pytools.soak $(SOAK_ARGS)
+	$(LIVE) $(PY) -m dev.pytools.soak $(SOAK_ARGS)
 
 # Full live suite under nextest (per-test isolation), sweeping stale fixtures
 # FIRST so an interrupted prior run never pollutes the shared `rivet` DB.
 # Requires `docker compose up -d` (postgres + mysql + the validator containers).
 test-live: sweep-test-db
-	cargo nextest run --run-ignored all
+	$(LIVE) cargo nextest run --run-ignored all
 
 # ── Fixture seed ────────────────────────────────────────────────────────────
 # Regenerate the shared live-test dataset (orders/users/events/page_views/
@@ -209,7 +222,7 @@ seed-garbage-mssql:
 # its closing line are keyed on the baseline rather than on this flag, so such a
 # run is reported honestly instead of being announced as a skip it was not.
 release-oracle:  ## Release gate, BARE: only what is already in your shell. With no RIVET_PREV_RELEASE_BIN in your environment the prev-release comparison is GIVEN UP by name (cannot support a tag); with one exported, those three stages run and grade. The replica/standby topology rows are GIVEN UP by name too (a down stand is SKIP here, FAIL in release-oracle-full). Read the SKIP count — with nothing set it is ~95 PASS / 60 SKIP and still prints RELEASE-READY.
-	$(PY) -m dev.release_oracle --without-prev-release-comparison --without-replica-topologies $(ARGS)
+	$(LIVE_ALL) $(PY) -m dev.release_oracle --without-prev-release-comparison --without-replica-topologies $(ARGS)
 
 # ─── the gate's environment, assembled ────────────────────────────────────────
 #
@@ -327,7 +340,7 @@ release-oracle-full: release-oracle-prev-bin  ## Release gate with the WHOLE env
 	@# reaches here with an empty $$prev is telling you the download failed.
 	@prev=$$(ls -t -d $(PREV_RELEASE_DIR)/rivet-v*/rivet 2>/dev/null | head -1); \
 	 echo "  previous release: $${prev:-<none — the scale legs will SKIP and the regression / differential / field-replay legs will FAIL; re-run release-oracle-prev-bin, or give the comparison up by name with ARGS=--without-prev-release-comparison>}"; \
-	 env $(GATE_ENV) RIVET_PREV_RELEASE_BIN="$$prev" $(PY) -m dev.release_oracle $(ARGS)
+	 $(LIVE_ALL) env $(GATE_ENV) RIVET_PREV_RELEASE_BIN="$$prev" $(PY) -m dev.release_oracle $(ARGS)
 
 release-oracle-bless: release-oracle-prev-bin  ## Re-capture the verdict + duckdb-type goldens. Deliberate: a golden must be written by rivet's own code, never edited by hand.
 	@rm -rf target/package
@@ -337,7 +350,7 @@ release-oracle-bless: release-oracle-prev-bin  ## Re-capture the verdict + duckd
 	@# binary it had just fetched. Same threading as release-oracle-full.
 	@prev=$$(ls -t -d $(PREV_RELEASE_DIR)/rivet-v*/rivet 2>/dev/null | head -1); \
 	 echo "  previous release: $${prev:-<none — the scale legs will SKIP and the regression / differential / field-replay legs will FAIL; re-run release-oracle-prev-bin, or give the comparison up by name with ARGS=--without-prev-release-comparison>}"; \
-	 env $(GATE_ENV) RIVET_PREV_RELEASE_BIN="$$prev" $(PY) -m dev.release_oracle --bless-local $(ARGS)
+	 $(LIVE_ALL) env $(GATE_ENV) RIVET_PREV_RELEASE_BIN="$$prev" $(PY) -m dev.release_oracle --bless-local $(ARGS)
 
 # Seeded-defect recall (docs/seeded-recall.md): each known bug class in dev/seeded/seeds.yaml is
 # applied as a source patch to a scratch worktree of HEAD, built, and must turn its catching cells
@@ -346,4 +359,4 @@ release-oracle-bless: release-oracle-prev-bin  ## Re-capture the verdict + duckd
 SEEDED_ARGS ?=
 .PHONY: seeded-recall
 seeded-recall:  ## Seeded-defect recall: re-introduce every known bug class and require the harness to catch it.
-	env $(GATE_ENV) $(PY) -m dev.seeded $(SEEDED_ARGS)
+	$(LIVE) env $(GATE_ENV) $(PY) -m dev.seeded $(SEEDED_ARGS)

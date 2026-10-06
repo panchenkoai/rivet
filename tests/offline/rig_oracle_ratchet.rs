@@ -29,7 +29,7 @@ const NO_ORACLE_CEILING: usize = 23;
 /// Rust DuckDB-helper call sites across tests/ (see [`duckdb_helper_names`]).
 // 626 -> 630 (2026-10-01): #378 merged first and added 4 calls in its Mongo null-_id tests.
 // 630 -> 632 (2026-10-03): the PG/MySQL crash-mid-spilled-tail cells; on PG the rig oracle grades only the keys a stream's first run touched and passed 5 of 12 rows under the loss mutant.
-const DUCKDB_HELPER_CEILING: usize = 632;
+const DUCKDB_HELPER_CEILING: usize = 632; // ratchet-pin: duckdb-helper-sites
 
 /// Owned by a concurrent branch and migrated after it lands; not counted.
 const EXCLUDED: &[&str] = &["tests/live/live_cdc_type_parity.rs"];
@@ -154,6 +154,7 @@ fn rust_duckdb_helper_call_sites_never_grow() {
 
 /// `(test fn, failure class, reason prefix)` of every `.oracle_known_defect(` site: a product defect the oracle must keep catching, excused only for its class. Removing one is allowed; adding one is a reviewed diff here.
 const KNOWN_DEFECTS: &[(&str, &str, &str)] = &[
+    // ratchet-pin: oracle-known-defects strings
     (
         "roast_pg_cdc_refuses_a_bare_table_name_that_matches_two_relations",
         "delivered-only rows",
@@ -164,7 +165,7 @@ const KNOWN_DEFECTS: &[(&str, &str, &str)] = &[
         "undelivered rows",
         "known defect: a PostgreSQL CDC failover without `cdc.checkpoint` creates a new slot",
     ),
-];
+]; // ratchet-pin: end
 
 /// `(enclosing fn, class, reason)` of every `.oracle_known_defect("<class>", "<reason>")` call in `text`.
 fn known_defect_sites(text: &str) -> Vec<(String, String, String)> {
@@ -217,7 +218,7 @@ fn oracle_known_defects_are_a_named_set_that_only_shrinks() {
 }
 
 /// Hand-built spawns of the rivet binary in tests/live: runs the default oracle never sees (the `Rig` and the `run_rivet*` helpers are graded).
-const RAW_RIVET_CEILING: usize = 17;
+const RAW_RIVET_CEILING: usize = 17; // ratchet-pin: raw-rivet-invocations
 
 /// `Command::new` of the rivet binary in `text`, in each spelling the suite uses.
 fn raw_rivet_sites(text: &str) -> usize {

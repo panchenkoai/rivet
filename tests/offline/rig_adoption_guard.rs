@@ -18,6 +18,7 @@ use std::collections::BTreeMap;
 /// `Command::new(RIVET_BIN)` + `write_config(` in the file. Shrink freely;
 /// grow only with a reason in the PR.
 const BASELINE: &[(&str, usize)] = &[
+    // ratchet-pin: bespoke-runner-sites sum
     // ── the init-subject class: REASONED ceilings, not migration targets ──
     // `rivet init` PRODUCES configs; the rig OWNS a config. A rig-shaped init
     // test would test the rig's YAML against init's YAML — two generators, no
@@ -40,7 +41,7 @@ const BASELINE: &[(&str, usize)] = &[
     // live_cli_flags: the one kept site is `rivet completions bash` — a
     // config-less subcommand a rig (which OWNS a config) cannot express.
     ("live_cli_flags.rs", 1),
-];
+]; // ratchet-pin: end
 
 fn bespoke_sites(path: &std::path::Path) -> usize {
     // NOT `unwrap_or_default()`: an unreadable file scored ZERO bespoke sites,

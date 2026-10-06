@@ -9,7 +9,8 @@
 //! images the oracle takes before each run (every row changed between the stream's previous
 //! successful run, else its anchor, and this one must be in it). A stream is its PostgreSQL
 //! slot or its checkpoint file, whichever config names it; its anchor is recorded before a
-//! run, including one that then fails. A stream anchored before any run the oracle saw is
+//! run, including one that then fails, or by `Rig::pin_binlog_here` where a test writes the
+//! checkpoint itself. A stream anchored before any run the oracle saw is
 //! `RIVET-ORACLE-PARTIAL` on its first run, never a plain PASS. Opt out only with `.no_oracle("<reason>")` on
 //! a rig or the `RIVET_TEST_NO_ORACLE=<reason>` env on a raw run (both counted by a
 //! shrink-only ceiling, both logged `RIVET-ORACLE-OFF`); an export the oracle cannot reach
@@ -60,6 +61,77 @@ pub(crate) struct Case {
 
 /// Start grading `argv` (run with working directory `cwd`): `None` unless it is `run|load|compact --config <path>` or `apply <config.yaml>` and not opted out.
 pub(crate) fn begin(argv: &[String], envs: &[(&str, &str)], cwd: Option<&Path>) -> Option<Case> {
+    let mut case = parse(argv, envs, cwd)?;
+    if case.verb == "run" {
+        case.before = case
+            .exports
+            .iter()
+            .map(|e| {
+                case.unreachable(e)?;
+                let out = case.local_out(e)?;
+                if case.needs_image(e) {
+                    // A run that later fails still delivered what its Success manifests declare.
+                    case.stream_dirs(e, &out);
+                }
+                Ok(case.manifests_of(e, &out))
+            })
+            .collect();
+        // Every row changed before a CDC run opens its stream must be in it: image the source first.
+        for e in case.exports.iter().filter(|e| case.needs_image(e)) {
+            case.take_image(e, envs, &case.image(e, "begin"));
+        }
+    }
+    Some(case)
+}
+
+/// Start every CDC stream `cfg` names afresh at the source as it stands now, recording the anchor a run that opened its stream here would; its checkpoint must not exist yet.
+pub(crate) fn anchor_streams_here(cfg: &Path) {
+    let argv = ["run", "--config", &cfg.display().to_string()].map(String::from);
+    let case = parse(&argv, &[], None).expect("the rig's own config parses");
+    let mut anchored = 0;
+    for e in case.exports.iter().filter(|e| case.needs_image(e)) {
+        for f in case.stream_records(e) {
+            let _ = std::fs::remove_file(f);
+        }
+        let got = case.take_image(e, &[], &case.image(e, "begin"));
+        assert_eq!(
+            got.as_ref().map(|v| v["anchor"].clone()),
+            Some("begin".into()),
+            "the oracle did not record {cfg:?}'s anchor at this position: {got:?}"
+        );
+        anchored += 1;
+    }
+    assert!(
+        anchored > 0,
+        "{cfg:?} names no single-table CDC stream to anchor"
+    );
+}
+
+/// Move the checkpoint `from` -> `to` and the oracle's record of its stream with it, so `cfg` run from `cwd` continues one stream across the move.
+pub(crate) fn move_checkpoint(cfg: &Path, cwd: &Path, from: &Path, to: &Path) {
+    let argv = ["run", "--config", &cfg.display().to_string()].map(String::from);
+    let case = parse(&argv, &[], Some(cwd)).expect("the rig's own config parses");
+    let streams: Vec<&Value> = case
+        .exports
+        .iter()
+        .filter(|e| case.needs_image(e))
+        .collect();
+    let before: Vec<Vec<PathBuf>> = streams.iter().map(|e| case.stream_records(e)).collect();
+    std::fs::rename(from, to).expect("move the checkpoint");
+    for (e, old) in streams.iter().zip(before) {
+        let new = case.stream_records(e);
+        assert_ne!(
+            old, new,
+            "the move left {cfg:?}'s stream where it was: nothing to follow"
+        );
+        for (o, n) in old.iter().zip(new).filter(|(o, _)| o.exists()) {
+            std::fs::rename(o, n).expect("move the stream's record");
+        }
+    }
+}
+
+/// The invocation `argv` describes, parsed from its config; no source is read.
+fn parse(argv: &[String], envs: &[(&str, &str)], cwd: Option<&Path>) -> Option<Case> {
     let mut verb = argv.first()?.clone();
     if !matches!(verb.as_str(), "run" | "load" | "compact" | "apply") {
         return None;
@@ -172,7 +244,7 @@ pub(crate) fn begin(argv: &[String], envs: &[(&str, &str)], cwd: Option<&Path>) 
             }
         })
         .collect();
-    let mut case = Case {
+    Some(Case {
         verb,
         config_dir: cfg_path.parent().map(Path::to_path_buf).unwrap_or_default(),
         cfg,
@@ -182,27 +254,7 @@ pub(crate) fn begin(argv: &[String], envs: &[(&str, &str)], cwd: Option<&Path>) 
         before: Vec::new(),
         resume: argv.iter().any(|a| a == "--resume"),
         replay,
-    };
-    if case.verb == "run" {
-        case.before = case
-            .exports
-            .iter()
-            .map(|e| {
-                case.unreachable(e)?;
-                let out = case.local_out(e)?;
-                if case.needs_image(e) {
-                    // A run that later fails still delivered what its Success manifests declare.
-                    case.stream_dirs(e, &out);
-                }
-                Ok(case.manifests_of(e, &out))
-            })
-            .collect();
-        // Every row changed before a CDC run opens its stream must be in it: image the source first.
-        for e in case.exports.iter().filter(|e| case.needs_image(e)) {
-            case.take_image(e, envs, &case.image(e, "begin"));
-        }
-    }
-    Some(case)
+    })
 }
 
 /// [`begin`] for a raw runner helper: only in the binaries that run against the stand (offline test binaries drive rivet without one).
@@ -553,6 +605,16 @@ impl Case {
         dir.join(format!("{:016x}-{kind}", h.finish()))
     }
 
+    /// Every file the oracle keeps for this export's stream, existing or not.
+    fn stream_records(&self, e: &Value) -> Vec<PathBuf> {
+        let kinds = ["begin", "prev", "anchor", "anchor-keys", "dests", "cursor"];
+        let exts = ["parquet", "parquet.missing", "txt", "json"];
+        kinds
+            .iter()
+            .flat_map(|k| exts.map(|x| with_ext(&self.image(e, k), x)))
+            .collect()
+    }
+
     /// The stream an export continues: a CDC table's PostgreSQL slot or checkpoint file (every config naming it shares it), else its config directory and name.
     fn stream_id(&self, e: &Value) -> String {
         let cdc = e.get("cdc").filter(|_| s(e, "mode") == Some("cdc"));
@@ -611,13 +673,16 @@ impl Case {
     }
 
     /// Write the export's current source image to `<base>.parquet` (or `<base>.parquet.missing` when the table does not exist yet), and the stream's anchor when this image can say where it is; a failure leaves none.
-    fn take_image(&self, e: &Value, envs: &[(&str, &str)], base: &Path) {
+    fn take_image(
+        &self,
+        e: &Value,
+        envs: &[(&str, &str)],
+        base: &Path,
+    ) -> Option<serde_json::Value> {
         for ext in ["parquet", "parquet.missing"] {
             let _ = std::fs::remove_file(with_ext(base, ext));
         }
-        let Ok(mut spec) = self.facts(e, envs, &Opts::default()) else {
-            return;
-        };
+        let mut spec = self.facts(e, envs, &Opts::default()).ok()?;
         spec["image"] = with_ext(base, "parquet").display().to_string().into();
         spec["anchor"] = with_ext(&self.image(e, "anchor"), "parquet")
             .display()
@@ -629,7 +694,7 @@ impl Case {
             .into();
         spec["slot"] = e.get("cdc").and_then(|c| s(c, "slot")).into();
         spec["checkpoint"] = self.checkpoint(e).map(|p| p.display().to_string()).into();
-        run_rig_oracle(&spec, "image");
+        Some(run_rig_oracle(&spec, "image"))
     }
 
     /// The destination as a local directory: the configured path, or a cloud prefix pulled whole (sub-prefixes kept) through the store's own API; a `{partition}` template is cut at its partition component.

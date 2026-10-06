@@ -194,7 +194,8 @@ def prepare_tree(base: Path) -> tuple[Path, str]:
         main_live.mkdir(parents=True, exist_ok=True)
         live.symlink_to(main_live)
     # The Rig's oracle runs `uv run` in the tree; parallel first uses race to build one .venv.
-    venv = sh(["uv", "sync", "--frozen", "-q"], cwd=tree)
+    # On this harness's own interpreter: left to discovery, uv picks whatever Python PATH offers.
+    venv = sh(["uv", "sync", "--frozen", "-q", "--python", sys.executable], cwd=tree)
     if venv.returncode != 0:
         raise SystemExit(f"uv sync in {tree} failed:\n{venv.stdout}")
     return tree, sha

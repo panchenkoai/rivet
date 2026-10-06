@@ -32,7 +32,7 @@ const SWEEP: &str = "dev/pytools/cdc_sweep.py";
 
 /// Rows with `coverage: gap`. LOWER when one gets covered; never raise without
 /// the reason landing in the same commit.
-const GAP_RATCHET: usize = 2;
+const GAP_RATCHET: usize = 2; // ratchet-pin: cdc-axis-gaps
 
 fn matrix() -> Value {
     let s = fs::read_to_string(MATRIX).unwrap_or_else(|e| panic!("read {MATRIX}: {e}"));

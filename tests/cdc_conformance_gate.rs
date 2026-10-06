@@ -906,7 +906,7 @@ fn oracle_class_census_is_pinned() {
 // 2026-10-02: +1 independent - the PG refusal under `initial: snapshot`, its slot's absence read from pg_replication_slots.
 // 2026-10-03: +2 independent - the PG and MySQL crash mid spilled tail cells, the union of both runs read through DuckDB.
 // 2026-10-03: +1 independent - the PG update of a replica identity index through BigQuery, its buffer and base read through `bq` (the two key-move cells run through a helper the census does not see).
-const PIN_INDEPENDENT: usize = 107;
+const PIN_INDEPENDENT: usize = 107; // ratchet-pin: cdc-census-independent min
 // 2026-09-28, source connection ceilings: +3 shared codec — the run's captured row is the
 // fixture check; the oracle is the server's own connection counter.
 // 2026-09-29: +2 shared codec — the Oracle TRUNCATE refusal on re-run and the uncaptured-truncate cell.
@@ -918,8 +918,8 @@ const PIN_INDEPENDENT: usize = 107;
 // 2026-10-03: +2 shared codec - the MySQL composite-key move and the Oracle primary-key move (ADR-0030), whose delete+insert shape is read from the parts; the rig oracle grades the rows.
 // 2026-10-03: +2 shared codec - the Oracle renumber over rows equal but for the key (ADR-0030 ROWID pairing), read through its parts; and the PG deferrable-key warning, whose oracle is the warning text plus the captured row read back.
 // 2026-10-03: +1 shared codec - the Oracle key move of a row wider than 255 columns, read through its parts.
-const PIN_SHARED_CODEC: usize = 97;
-const PIN_SELF_COUNTER: usize = 6;
+const PIN_SHARED_CODEC: usize = 97; // ratchet-pin: cdc-census-shared-codec
+const PIN_SELF_COUNTER: usize = 6; // ratchet-pin: cdc-census-self-counter
 // 2026-09-28: +1 presence — the SQL Server undecodable-cell refusal, whose oracle is the refusal.
 // 2026-09-29: +2 presence — the PG CDC LMT-timezone and DOMAIN parity cells compare CDC to batch output.
 // 2026-09-29: +2 presence — the MySQL out-of-range TIME and Oracle int-override refusals, whose oracle is the refusal plus the unmoved checkpoint.
@@ -934,7 +934,7 @@ const PIN_SELF_COUNTER: usize = 6;
 // destination tree and an absent checkpoint file.
 // 2026-10-02: +1 presence — the MySQL failover refusal, whose oracle is the refusal plus the unmoved checkpoint and parts.
 // 2026-10-03: +1 presence - the PG refusal of an undecodable old cell in a key move, whose oracle is the refusal naming the column.
-const PIN_PRESENCE: usize = 87;
+const PIN_PRESENCE: usize = 87; // ratchet-pin: cdc-census-presence
 
 /// TIER 2 (harness audit, 2026-08-29): a test whose NAME makes a
 /// COMPLETENESS claim must carry a class-(a) INDEPENDENT oracle — not merely
