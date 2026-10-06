@@ -818,8 +818,36 @@ fn list_logs(conn: &Connection, resetlogs: &str) -> Result<(Vec<LogFile>, Vec<Lo
     ))
 }
 
-/// The contents query: one row per captured change, three value slots per column.
-fn contents_sql(tables: &[Captured], con_name: &str, after_commit: u64) -> String {
+/// The contents query's columns ahead of the per-column slots, in select order.
+const FIXED_COLUMNS: [&str; 10] = [
+    "TO_CHAR(COMMIT_SCN)",
+    "TO_CHAR(SEQUENCE#)",
+    "RAWTOHEX(XID)",
+    "OPERATION",
+    "SEG_OWNER",
+    "TABLE_NAME",
+    "TO_CHAR(STATUS)",
+    "INFO",
+    "CASE WHEN OPERATION = 'DDL' THEN SQL_REDO END",
+    "ROW_ID",
+];
+
+/// Select-list index of column `j`'s `COLUMN_PRESENT` bits.
+fn presence_slot(j: usize) -> usize {
+    FIXED_COLUMNS.len() + 3 * j
+}
+
+/// Select-list index of column `j`'s mined value from `side`.
+fn value_slot(j: usize, side: Side) -> usize {
+    presence_slot(j)
+        + match side {
+            Side::Redo => 1,
+            Side::Undo => 2,
+        }
+}
+
+/// The contents query's select list: the fixed columns, then three slots per column.
+fn contents_select(tables: &[Captured]) -> Vec<String> {
     let slots = tables.iter().map(|t| t.columns.len()).max().unwrap_or(0);
     let is = |t: &Captured| {
         format!(
@@ -839,32 +867,36 @@ fn contents_sql(tables: &[Captured], con_name: &str, after_commit: u64) -> Strin
             .collect();
         format!("CASE{arms} END")
     };
-    let mut select = vec![
-        "TO_CHAR(COMMIT_SCN)".to_string(),
-        "TO_CHAR(SEQUENCE#)".into(),
-        "RAWTOHEX(XID)".into(),
-        "OPERATION".into(),
-        "SEG_OWNER".into(),
-        "TABLE_NAME".into(),
-        "TO_CHAR(STATUS)".into(),
-        "INFO".into(),
-        "CASE WHEN OPERATION = 'DDL' THEN SQL_REDO END".into(),
-        "ROW_ID".into(),
-    ];
+    let mut select = vec![String::new(); presence_slot(slots)];
+    for (slot, fixed) in select.iter_mut().zip(FIXED_COLUMNS) {
+        *slot = fixed.into();
+    }
     for j in 0..slots {
-        select.push(per_slot(j, &|s| {
+        select[presence_slot(j)] = per_slot(j, &|s| {
             format!(
                 "TO_CHAR(SYS.DBMS_LOGMNR.COLUMN_PRESENT(REDO_VALUE, {s}) * 2 \
                  + SYS.DBMS_LOGMNR.COLUMN_PRESENT(UNDO_VALUE, {s}))"
             )
-        }));
-        select.push(per_slot(j, &|s| {
+        });
+        select[value_slot(j, Side::Redo)] = per_slot(j, &|s| {
             format!("SYS.DBMS_LOGMNR.MINE_VALUE(REDO_VALUE, {s})")
-        }));
-        select.push(per_slot(j, &|s| {
+        });
+        select[value_slot(j, Side::Undo)] = per_slot(j, &|s| {
             format!("SYS.DBMS_LOGMNR.MINE_VALUE(UNDO_VALUE, {s})")
-        }));
+        });
     }
+    select
+}
+
+/// The contents query: one row per captured change of `tables` committed after `after_commit`.
+fn contents_sql(tables: &[Captured], con_name: &str, after_commit: u64) -> String {
+    let is = |t: &Captured| {
+        format!(
+            "SEG_OWNER = {} AND TABLE_NAME = {}",
+            lit(&t.owner),
+            lit(&t.table)
+        )
+    };
     let captured: Vec<String> = tables.iter().map(|t| format!("({})", is(t))).collect();
     let container = if con_name.is_empty() {
         String::new()
@@ -875,7 +907,7 @@ fn contents_sql(tables: &[Captured], con_name: &str, after_commit: u64) -> Strin
         "SELECT {} FROM V$LOGMNR_CONTENTS WHERE OPERATION = 'MISSING_SCN' OR ({container}\
          COMMIT_SCN > {after_commit} AND OPERATION IN ('INSERT', 'UPDATE', 'DELETE', \
          'UNSUPPORTED', 'DDL') AND ({}))",
-        select.join(", "),
+        contents_select(tables).join(", "),
         captured.join(" OR ")
     )
 }
@@ -1102,7 +1134,9 @@ impl OracleChangeStream {
         let mut before = Vec::with_capacity(t.columns.len());
         let mut after = Vec::with_capacity(t.columns.len());
         for (j, (name, kind)) in t.columns.iter().enumerate() {
-            let present: u8 = text(10 + 3 * j)?.and_then(|s| s.parse().ok()).unwrap_or(0);
+            let present: u8 = text(presence_slot(j))?
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
             let (b, a) = image_sides(op, present).ok_or_else(|| {
                 anyhow::anyhow!(
                     "oracle cdc: a {op:?} of `{owner}.{table}` carries no value for {name} — its \
@@ -1112,7 +1146,7 @@ impl OracleChangeStream {
                 )
             })?;
             let value = |side: Side| -> Result<RivetValue> {
-                let raw = text(if side == Side::Redo { 11 } else { 12 } + 3 * j)?;
+                let raw = text(value_slot(j, side))?;
                 match raw {
                     None => Ok(RivetValue::Null),
                     Some(s) => decode(*kind, &s)
@@ -1522,6 +1556,116 @@ pub(crate) fn pin_checkpoint_at_current(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn captured(owner: &str, table: &str, cols: &[&str]) -> Captured {
+        Captured {
+            owner: owner.into(),
+            table: table.into(),
+            ev_schema: owner.into(),
+            ev_table: table.into(),
+            columns: cols
+                .iter()
+                .map(|c| (c.to_string(), ColKind::Text))
+                .collect(),
+            names: Arc::from(cols.iter().map(|c| c.to_string()).collect::<Vec<_>>()),
+            rowid_stable: true,
+        }
+    }
+
+    #[test]
+    fn the_slot_layout_is_three_per_column_after_the_fixed_columns() {
+        assert_eq!(FIXED_COLUMNS.len(), 10);
+        assert_eq!(
+            [presence_slot(0), presence_slot(1), presence_slot(4)],
+            [10, 13, 22]
+        );
+        assert_eq!(
+            [value_slot(0, Side::Redo), value_slot(0, Side::Undo)],
+            [11, 12]
+        );
+        assert_eq!(
+            [value_slot(4, Side::Redo), value_slot(4, Side::Undo)],
+            [23, 24]
+        );
+    }
+
+    #[test]
+    fn the_slot_the_query_fills_for_a_column_is_the_slot_the_reader_asks_for() {
+        let tables = [
+            captured("APP", "ORDERS", &["ID", "NOTE", "AT"]),
+            captured("O'X", "T", &["K"]),
+        ];
+        let select = contents_select(&tables);
+        assert_eq!(select.len(), 10 + 3 * 3, "the widest table sizes the list");
+        assert_eq!(select[..10], FIXED_COLUMNS);
+        for (j, col) in ["ID", "NOTE", "AT"].iter().enumerate() {
+            let spec = format!("'APP.ORDERS.{col}'");
+            let wide = "CASE WHEN SEG_OWNER = 'APP' AND TABLE_NAME = 'ORDERS' THEN";
+            let narrow = if j == 0 {
+                " WHEN SEG_OWNER = 'O''X' AND TABLE_NAME = 'T' THEN"
+            } else {
+                ""
+            };
+            let k = "'O''X.T.K'";
+            let arm = |f: &dyn Fn(&str) -> String| {
+                let tail = if j == 0 {
+                    format!("{narrow} {}", f(k))
+                } else {
+                    String::new()
+                };
+                format!("{wide} {}{tail} END", f(&spec))
+            };
+            assert_eq!(
+                select[presence_slot(j)],
+                arm(&|s| format!(
+                    "TO_CHAR(SYS.DBMS_LOGMNR.COLUMN_PRESENT(REDO_VALUE, {s}) * 2 + \
+                     SYS.DBMS_LOGMNR.COLUMN_PRESENT(UNDO_VALUE, {s}))"
+                ))
+            );
+            assert_eq!(
+                select[value_slot(j, Side::Redo)],
+                arm(&|s| format!("SYS.DBMS_LOGMNR.MINE_VALUE(REDO_VALUE, {s})"))
+            );
+            assert_eq!(
+                select[value_slot(j, Side::Undo)],
+                arm(&|s| format!("SYS.DBMS_LOGMNR.MINE_VALUE(UNDO_VALUE, {s})"))
+            );
+        }
+    }
+
+    #[test]
+    fn the_contents_query_is_byte_identical_to_the_one_before_the_layout_was_named() {
+        let tables = [
+            captured("APP", "ORDERS", &["ID", "NOTE", "AT"]),
+            captured("O'X", "T", &["K"]),
+        ];
+        assert_eq!(
+            contents_sql(&tables, "PDB1", 42),
+            include_str!("fixtures/contents_two_tables.sql")
+        );
+    }
+
+    #[test]
+    fn the_contents_query_names_its_operations_container_and_floor() {
+        let one = [captured("O'X", "T", &["K"])];
+        let sql = contents_sql(&one, "", 7);
+        assert!(
+            sql.starts_with(&format!("SELECT {}, CASE WHEN ", FIXED_COLUMNS.join(", "))),
+            "{sql}"
+        );
+        assert!(
+            sql.ends_with(
+                " FROM V$LOGMNR_CONTENTS WHERE OPERATION = 'MISSING_SCN' OR (COMMIT_SCN > 7 AND \
+                 OPERATION IN ('INSERT', 'UPDATE', 'DELETE', 'UNSUPPORTED', 'DDL') AND \
+                 ((SEG_OWNER = 'O''X' AND TABLE_NAME = 'T')))"
+            ),
+            "{sql}"
+        );
+        assert!(
+            contents_sql(&one, "PDB1", 7)
+                .contains(" OR (SRC_CON_NAME = 'PDB1' AND COMMIT_SCN > 7 AND ")
+        );
+    }
 
     /// Only the documented "registered file no longer matches" codes re-plan; grants and corruption do not.
     #[test]
