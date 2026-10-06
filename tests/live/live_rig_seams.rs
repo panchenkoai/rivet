@@ -76,7 +76,10 @@ fn doctor_and_the_run_it_predicts_agree_on_a_fresh_mongo_stream() {
 #[test]
 #[ignore = "live: requires the oracle service with LogMiner prerequisites"]
 fn doctor_and_the_run_it_predicts_agree_on_a_fresh_oracle_stream() {
-    let t = crate::live_cdc_oracledb::cdc_table("seam_doc_or", "id NUMBER PRIMARY KEY, v NUMBER");
+    let t = crate::live_cdc_oracledb::cdc_table(
+        "seam_doc_or",
+        "id NUMBER(18) PRIMARY KEY, v NUMBER(18)",
+    );
     let rig = Rig::oracle_cdc(t.name());
     rig.run_ok();
     ora_exec(&format!("INSERT INTO {} VALUES (1, 1)", t.name()));
