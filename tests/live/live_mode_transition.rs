@@ -120,9 +120,7 @@ fn transition_with(
     let rig = staged(rig, &next, second.path());
     match expect {
         Expect::Continues => {
-            let rig = rig.no_oracle(
-                "the continued delta starts past rows the prior stage delivered to another destination",
-            );
+            let rig = continued(rig);
             rig.run_ok();
             assert_eq!(read_ids(second.path()), vec![11, 12, 13]);
         }
@@ -147,6 +145,60 @@ fn transition_with(
             rig.run_ok();
             assert_eq!(read_ids(second.path()), (1..=13).collect::<Vec<_>>());
         }
+    }
+}
+
+/// A rig whose next run continues past rows the prior stage delivered to another destination.
+fn continued(rig: Rig) -> Rig {
+    rig.no_oracle(
+        "the continued delta starts past rows the prior stage delivered to another destination",
+    )
+}
+
+/// Export `_id` 1..=10 with `prior`, add 11..=13, switch to `page_size` + `resume`, check the first resumed run.
+fn mongo_switch_to_resume(prior: Option<&str>, parallel: bool, expect: Expect) {
+    require_alive(LiveService::Mongo);
+    let db = unique_name("mt_mongo");
+    let m = MongoTest::connect(27017, &db);
+    m.seed_int_id("t", 10);
+    let (first, second) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let mut rig = Rig::mongo_batch("t").source_url(&MongoTest::url(27017, &db));
+    if let Some(opts) = prior {
+        rig = rig.mongo(opts);
+    }
+    let lines: &[&str] = if parallel { &["parallel: 2"] } else { &[] };
+    let rig = rig
+        .restage("full", lines)
+        .dest_path(first.path().to_path_buf());
+    rig.run_ok();
+    let ids = |dir: &Path| -> Vec<i64> {
+        let mut v: Vec<i64> = dir_parquet_distinct_strings(dir, "_id")
+            .iter()
+            .map(|s| s.parse().expect("an integer _id"))
+            .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(ids(first.path()), (1..=10).collect::<Vec<_>>());
+
+    for i in 11..=13 {
+        m.upsert_set("t", i, "v", "new");
+    }
+    let rig = rig
+        .mongo("page_size: 4, resume: true")
+        .restage("full", &[])
+        .dest_path(second.path().to_path_buf());
+    match expect {
+        Expect::Continues => {
+            let rig = continued(rig);
+            rig.run_ok();
+            assert_eq!(ids(second.path()), vec![11, 12, 13]);
+        }
+        Expect::FullPass => {
+            rig.run_ok();
+            assert_eq!(ids(second.path()), (1..=13).collect::<Vec<_>>());
+        }
+        Expect::Refused(_) => unreachable!("no Mongo switch to resume is refused"),
     }
 }
 
@@ -510,4 +562,25 @@ fn legacy_keyset_state_then_other_column_postgres() {
 #[ignore = "live: requires docker compose mssql"]
 fn legacy_keyset_state_then_other_column_mssql() {
     legacy_keyset_state_then_other_column(SqlEngine::Mssql);
+}
+
+/// MT1 — a plain Mongo full scan stores no `_id`; the first `resume` run is a full pass.
+#[test]
+#[ignore = "live: requires docker compose up -d mongo"]
+fn full_then_resume_mongo() {
+    mongo_switch_to_resume(None, false, Expect::FullPass);
+}
+
+/// MT2 — a `page_size` keyset records its final `_id`; `resume` continues past it.
+#[test]
+#[ignore = "live: requires docker compose up -d mongo"]
+fn keyset_then_resume_mongo() {
+    mongo_switch_to_resume(Some("page_size: 4"), false, Expect::Continues);
+}
+
+/// The parallel `_id`-range reader records no `_id`; the first `resume` run is a full pass.
+#[test]
+#[ignore = "live: requires docker compose up -d mongo"]
+fn parallel_keyset_then_resume_mongo() {
+    mongo_switch_to_resume(Some("page_size: 4"), true, Expect::FullPass);
 }

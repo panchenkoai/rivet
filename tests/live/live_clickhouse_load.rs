@@ -1875,3 +1875,56 @@ fn a_keyset_incremental_export_from_sql_server_accumulates_in_clickhouse() {
 fn a_keyset_incremental_export_from_oracle_accumulates_in_clickhouse() {
     a_keyset_incremental_export_accumulates_in_clickhouse(SqlEngine::Oracle);
 }
+
+/// A Mongo `source.mongo.resume` export into ClickHouse database `db`, keyed by `pk: auto`.
+fn mongo_resume_into_clickhouse(mdb: &str, db: &Db) -> Rig {
+    Rig::mongo_batch("t")
+        .source_url(&MongoTest::url(MONGO_PORT, mdb))
+        .mongo("page_size: 500, resume: true")
+        .dest_gcs(BUCKET, &unique_name("chload"), FAKE_GCS_ENDPOINT)
+        .top_line(&load_line(CLICKHOUSE_HTTP_URL, db, "").replace("pk: [id]", "pk: auto"))
+}
+
+const MONGO_PORT: u16 = 27017;
+
+/// A Mongo `resume` export's ClickHouse load appends each run's new documents, never replaces the table.
+#[test]
+#[ignore = "live: requires clickhouse + fake-gcs + mongo"]
+fn a_mongo_resume_export_into_clickhouse_accumulates_every_run() {
+    require_alive(LiveService::ClickHouse);
+    require_alive(LiveService::FakeGcs);
+    require_alive(LiveService::Mongo);
+    ensure_gcs_bucket(BUCKET);
+    let mdb = unique_name("chmresume");
+    let m = MongoTest::connect(MONGO_PORT, &mdb);
+    m.seed_objectid("t", 2000);
+    let db = Db::new("rivet_chtest");
+    let rig = mongo_resume_into_clickhouse(&mdb, &db);
+    let clickhouse_ids = |db: &Db| -> Vec<String> {
+        clickhouse_rows_tsv(&format!(
+            "SELECT _id FROM {}.t ORDER BY _id FORMAT TSV",
+            db.0
+        ))
+        .lines()
+        .map(str::to_string)
+        .collect()
+    };
+
+    rig.run_ok();
+    load(&rig);
+    assert_eq!(
+        clickhouse_ids(&db),
+        m.ids("t"),
+        "the first run loads the whole collection"
+    );
+
+    m.append_objectid("t", 500);
+    rig.run_ok();
+    load(&rig);
+    assert_eq!(
+        clickhouse_ids(&db).len(),
+        2500,
+        "the resumed run's 500 new documents join the first 2000, not replace them"
+    );
+    assert_eq!(clickhouse_ids(&db), m.ids("t"));
+}

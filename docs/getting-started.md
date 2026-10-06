@@ -211,7 +211,9 @@ rivet run  -c rivet.yaml    # extract → GCS
 rivet load -c rivet.yaml    # load → warehouse (native types; count-gated before any cleanup)
 ```
 
-The load follows the export's `mode:` — `full` overwrites the latest snapshot;
+The load follows the export's `mode:` — `full` overwrites the latest snapshot
+(except a Mongo `source.mongo.resume` export or a chunked `keyset_incremental`
+one, whose runs hold only new keys and so append like `incremental`);
 `incremental` / `cdc` append to `<table>__changes` and expose a current-state
 dedup view keyed on the source primary key `rivet run` recorded (set `pk: [id]`
 in the `load:` block for a `query:` export or to override it). Recipes:

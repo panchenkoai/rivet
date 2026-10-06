@@ -47,6 +47,27 @@
   `RIVET_SOURCE_CDC_FOREIGN_CHECKPOINT`, `_CHECKPOINT_INVALID`, `_LOG_GAP`, `_TRUNCATED`,
   `_UNDECODABLE` and `_CELL_UNSUPPORTED` say the same; the codes are unchanged. An alert that
   matches on the old wording (`re-snapshot`, `mode: full`) needs updating.
+- **Behaviour change: an export that continues past its last key loads by append.** Two
+  kinds of export hold only the keys past the previous run: a MongoDB `mode: full` export
+  with `source.mongo.page_size` and `source.mongo.resume: true`, and a `mode: chunked` export
+  with `keyset_incremental: true`. `rivet load` treated their runs as whole-table runs and
+  overwrote the warehouse table with each run's new keys. Measured on ClickHouse, a collection
+  of 2,500 documents loaded as 500. MongoDB resume exports now load like `mode: incremental`,
+  as `keyset_incremental` ones do since 0.31.0: they append
+  to `<table>__changes` behind a view that keeps one row per key. **Upgrading:** a table that
+  rivet 0.31 or older loaded this way (0.30 or older for `keyset_incremental`, whose append
+  load shipped in 0.31.0) already lacks its earlier rows, and the first load after
+  the upgrade does not bring them back. That load warns ``` `<table>` was last loaded as a
+  whole-table overwrite, and export `<export>` now loads by append ``` and names the remedy:
+  `rivet state reset -c <config> --export <export>`, then `rivet run` and `rivet load`. The
+  next run re-reads the whole source and the view then holds every row. The release gate's
+  `upgrade[<engine>/resume-load]` leg runs this upgrade and remedy from the previous release
+  into BigQuery for MongoDB, PostgreSQL, MySQL, SQL Server and Oracle. An append load needs a
+  key, so such an export with `load.pk: none` is now refused, naming that setting. Limits:
+  these exports assume an append-only source; after such a re-read, the view may serve either
+  copy of a row that changed since its earlier load (measured: the stale copy once). A source
+  whose rows change belongs on `mode: incremental` or `mode: cdc`. `load.layout: base_buffer`
+  does not work for them yet: no run lands the base, so `rivet compact` refuses.
 
 ## 0.31.0 — 2026-10-04
 

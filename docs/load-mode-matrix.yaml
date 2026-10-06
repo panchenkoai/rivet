@@ -22,6 +22,13 @@
 # contract that mode does not have (full has no dedup view; incremental/cdc never
 # OVERWRITE, so never truncate).
 
+# Premise of every `full` cell: a LoadMode::Full run is a whole snapshot. A run that continues
+# past its last key (chunked `keyset_incremental`, Mongo `source.mongo.resume`) is planned as
+# incremental by `load_mode_of` through `plan::build::continued_key`; that is pinned by the lib
+# tests load_mode_of_every_mode_with_and_without_keyset_incremental and
+# a_mongo_resume_export_plans_an_append_ordered_by_its_id, and re-introduced by the seed
+# delta-run-loaded-as-overwrite.
+
 engines: [full, incremental, cdc]
 
 scenarios:
@@ -42,6 +49,12 @@ scenarios:
     full:        { test: latest_full_of_no_staged_runs_is_empty_so_the_caller_no_ops_without_truncating }
     incremental: { na: "append never issues a truncate, so an empty delta set is inherently a no-op" }
     cdc:         { na: "append never issues a truncate, so an empty run set is inherently a no-op" }
+
+  - id: continued_key_run_loads_as_append
+    what: "a run that continues past its last key on a clean re-run (SQL `keyset_incremental`, Mongo `source.mongo.resume`) carries only the new keys, so it loads by APPEND, never as a latest-run overwrite; the plan and the load read both spellings through one predicate (`plan::build::continued_key`)"
+    full:        { na: "load_mode_of never plans a continued-key run as full (lib: a_mongo_resume_export_plans_an_append_ordered_by_its_id, load_mode_of_every_mode_with_and_without_keyset_incremental)" }
+    incremental: { test: a_mongo_resume_export_into_clickhouse_accumulates_every_run }
+    cdc:         { na: "a cdc stream is a change log, not a key-continued batch" }
 
   - id: append_selects_only_unloaded_runs
     what: "append modes load ONLY the runs the ledger has not yet loaded — resolved from manifest parts, with the bucket listing as fallback"
