@@ -501,9 +501,9 @@ pub(crate) fn row_identity(
             crate::error::codes::SOURCE_CDC_UNDECODABLE,
             "oracle cdc: LogMiner gave a change to heap table `{owner}.{table}` no row id ({}). \
              rivet pairs the key moves of one statement by it, so it refuses rather than guess. \
-             Re-snapshot the table (delete the checkpoint first so the stream anchors, then \
-             snapshot).",
-            other.unwrap_or("NULL")
+             {}",
+            other.unwrap_or("NULL"),
+            crate::source::cdc::checkpoint_identity::RECOVER
         ),
     }
 }
