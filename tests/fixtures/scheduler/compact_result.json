@@ -12,8 +12,8 @@
     {
       "export": "users_cdc",
       "table": "users",
-      "status": "nothing_to_do",
-      "skip_reason": null,
+      "status": "skipped",
+      "skip_reason": "no_buffer",
       "rows": 0,
       "error": null
     },
@@ -21,7 +21,15 @@
       "export": "countries",
       "table": "countries",
       "status": "skipped",
-      "skip_reason": "a full load overwrites its table; nothing to merge",
+      "skip_reason": "full_load",
+      "rows": 0,
+      "error": null
+    },
+    {
+      "export": "audit_cdc",
+      "table": "audit",
+      "status": "skipped",
+      "skip_reason": "log_view",
       "rows": 0,
       "error": null
     },

@@ -38,7 +38,31 @@ const RUN_STATUS: &[&str] = &["success", "failed", "skipped"];
 const STOP_REASON: &[&str] = &["caught_up", "max_events"];
 const LOAD_STATUS: &[&str] = &["loaded", "skipped", "failed"];
 const LOAD_SKIP: &[&str] = &["up_to_date"];
-const COMPACT_STATUS: &[&str] = &["compacted", "nothing_to_do", "skipped", "failed"];
+const COMPACT_STATUS: &[&str] = &["compacted", "skipped", "failed"];
+const COMPACT_SKIP: &[&str] = &[
+    "no_buffer",
+    "full_load",
+    "log_view",
+    "warehouse_never_compacts",
+];
+
+/// Each compact skip reason and a fragment of the text `src/load/compact.rs` prints for it.
+const COMPACT_SKIP_TEXT: &[(&str, &str)] = &[
+    ("no_buffer", "COMPACT SKIP [{}]: no `{}__changes` buffer"),
+    ("full_load", "\"a full load overwrites its table;"),
+    ("log_view", "\"a changelog + view table (no `cdc.backfill:`"),
+    (
+        "log_view",
+        "\"a changelog + view table; `load.layout: base_buffer`",
+    ),
+    (
+        "warehouse_never_compacts",
+        "\"this warehouse keeps a change log behind a view and never compacts;",
+    ),
+];
+
+/// Words the contract dropped; no fixture and no line of the ADR may carry one.
+const RETIRED: &[&str] = &["nothing_to_do"];
 
 const ERROR: &[Field] = &[
     ("code", Str, true),
@@ -155,10 +179,13 @@ const SHAPES: &[(&str, Rule)] = &[
         check_json_errors(v, at, Fold::Loads)
     }),
     ("load_result.json", |v, at| {
-        check_table_result(v, at, LOAD_STATUS, Some(LOAD_SKIP))
+        check_table_result(v, at, LOAD_STATUS, LOAD_SKIP)
     }),
     ("compact_result.json", |v, at| {
-        check_table_result(v, at, COMPACT_STATUS, None)
+        check_table_result(v, at, COMPACT_STATUS, COMPACT_SKIP)
+    }),
+    ("compact_result_log_only.json", |v, at| {
+        check_table_result(v, at, COMPACT_STATUS, COMPACT_SKIP)
     }),
     ("xcom_unit.json", check_xcom),
     ("xcom_unit_load.json", check_xcom),
@@ -396,7 +423,7 @@ fn check_table_result(
     v: &Value,
     at: &str,
     statuses: &'static [&'static str],
-    skips: Option<&'static [&'static str]>,
+    skips: &'static [&'static str],
 ) -> Check {
     shape(
         v,
@@ -412,7 +439,7 @@ fn check_table_result(
             ("export", Str, false),
             ("table", Str, false),
             ("status", Word(statuses), false),
-            ("skip_reason", skips.map_or(Str, Word), true),
+            ("skip_reason", Word(skips), true),
             ("rows", Int, false),
             ("error", Nested, true),
         ];
@@ -474,7 +501,7 @@ fn check_xcom(v: &Value, at: &str) -> Check {
 fn class_without_object(exit_status: Option<i64>) -> (&'static str, Option<i64>) {
     match exit_status {
         None => ("crashed", None),
-        Some(c @ 1..=6) => (CLASS_NAMES[c as usize - 1].1, Some(c)),
+        Some(c @ (1 | 3..=6)) => (CLASS_NAMES[c as usize - 1].1, Some(c)),
         Some(101) => ("internal", Some(6)),
         Some(129..=255) => ("crashed", None),
         Some(_) => ("generic", Some(1)),
@@ -500,10 +527,13 @@ fn check_exit_without_object(v: &Value, at: &str) -> Check {
         require(status != Some(0), || {
             format!("{at}: exit 0 is not a failure")
         })?;
-        let coded = matches!(status, Some(1..=6));
+        let coded = matches!(status, Some(1 | 3..=6));
         let mut object = r["object"].clone();
+        require(status != Some(2) || object["retryable"] == false, || {
+            format!("{at}: exit 2 with no error object is a usage error and is never retried")
+        })?;
         require(object["message"].is_null() == coded, || {
-            format!("{at}: exit 1-6 carries no message; every other row names what was seen")
+            format!("{at}: exit 1, 3-6 carries no message; every other row names what was seen")
         })?;
         if coded {
             object["message"] = json!("-");
@@ -528,6 +558,31 @@ fn check_exit_without_object(v: &Value, at: &str) -> Check {
     require(seen == all, || {
         format!("{at}: one row per line of the D8 table; shown {seen:?}")
     })
+}
+
+/// No key and no string anywhere inside `v` carries a retired word.
+fn no_retired_word(v: &Value, at: &str) -> Check {
+    let clean = |s: &str| {
+        require(RETIRED.iter().all(|w| !s.contains(w)), || {
+            format!("{at}: `{s}` carries a word the contract retired")
+        })
+    };
+    match v {
+        Value::String(s) => clean(s),
+        Value::Array(a) => a.iter().try_for_each(|child| no_retired_word(child, at)),
+        Value::Object(m) => m.iter().try_for_each(|(k, child)| {
+            clean(k)?;
+            no_retired_word(child, at)
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// The fixture `name` holds its shape and carries no retired word.
+fn holds(name: &str, v: &Value) -> Check {
+    let rule = SHAPES.iter().find(|s| s.0 == name).expect(name).1;
+    no_retired_word(v, name)?;
+    rule(v, name)
 }
 
 /// Every string value stored under `key` anywhere inside `v`.
@@ -562,8 +617,8 @@ fn every_fixture_is_pinned_and_holds_its_shape() {
         on_disk, pinned,
         "fixture files and SHAPES must list the same names"
     );
-    for (name, check) in SHAPES {
-        if let Err(why) = check(&fixture(name), name) {
+    for (name, _) in SHAPES {
+        if let Err(why) = holds(name, &fixture(name)) {
             panic!("{why}");
         }
     }
@@ -613,11 +668,25 @@ fn a_wrong_type_an_unknown_word_or_a_moved_key_is_refused() {
                 "export 'orders_cdc' exited with status 5; export 'events' exited with status signal"
             ),
         ),
+        ("load_result.json", "/per_table/1/status", json!(RETIRED[0])),
         (
-            "load_result.json",
+            "compact_result.json",
             "/per_table/1/status",
-            json!("nothing_to_do"),
+            json!(RETIRED[0]),
         ),
+        (
+            "compact_result.json",
+            "/per_table/1/skip_reason",
+            json!(RETIRED[0]),
+        ),
+        (
+            "compact_result.json",
+            "/per_table/1/skip_reason",
+            json!("up_to_date"),
+        ),
+        ("xcom_unit_load.json", "/status", json!(RETIRED[0])),
+        ("error_object.json", "/message", json!(RETIRED[0])),
+        ("run_entry.json", "/export_name", json!(RETIRED[0])),
         ("xcom_unit.json", "/files", Value::Null),
         ("xcom_unit.json", "/status", json!("loaded")),
         ("xcom_unit_load.json", "/files", json!(3)),
@@ -645,6 +714,24 @@ fn a_wrong_type_an_unknown_word_or_a_moved_key_is_refused() {
             json!("retryable"),
         ),
         ("exit_without_object.json", "/1/exit_status", json!(42)),
+        (
+            "exit_without_object.json",
+            "/1/object/retryable",
+            json!(true),
+        ),
+        (
+            "exit_without_object.json",
+            "/1/object",
+            json!({ "code": null, "kind": null, "class": "retryable", "exit_code": 2,
+                    "retryable": true, "action": null, "message": null }),
+        ),
+        (
+            "exit_without_object.json",
+            "/1/object",
+            json!({ "code": null, "kind": null, "class": "retryable", "exit_code": 2,
+                    "retryable": true, "action": null,
+                    "message": "rivet exited 2 and printed no error object" }),
+        ),
         ("json_errors_load.json", "/failures/0/table", Value::Null),
         ("load_result.json", "/per_table/0/status", json!("skipped")),
         (
@@ -662,11 +749,15 @@ fn a_wrong_type_an_unknown_word_or_a_moved_key_is_refused() {
             "/per_table/2/skip_reason",
             Value::Null,
         ),
+        (
+            "compact_result.json",
+            "/per_table/2/skip_reason",
+            json!("a full load overwrites its table; nothing to merge"),
+        ),
         ("xcom_unit.json", "/error/message", json!("text")),
         ("xcom_unit.json", "/stop_reason", json!("done")),
     ];
     for (name, pointer, bad) in cases {
-        let check = SHAPES.iter().find(|s| s.0 == *name).expect(name).1;
         let mut v = fixture(name);
         let (parent, key) = pointer.rsplit_once('/').unwrap();
         let slot = v
@@ -677,7 +768,7 @@ fn a_wrong_type_an_unknown_word_or_a_moved_key_is_refused() {
             other => other[key] = bad.clone(),
         }
         assert!(
-            check(&v, name).is_err(),
+            holds(name, &v).is_err(),
             "{name}: {pointer} = {bad} must be refused"
         );
     }
@@ -761,6 +852,7 @@ fn the_adr_and_the_fixtures_spell_every_vocabulary_word() {
         ("load_result", "status", LOAD_STATUS),
         ("load_result", "skip_reason", LOAD_SKIP),
         ("compact_result", "status", COMPACT_STATUS),
+        ("compact_result", "skip_reason", COMPACT_SKIP),
     ];
     for (family, key, words) in sets {
         let want: BTreeSet<String> = words.iter().map(|w| w.to_string()).collect();
@@ -768,6 +860,12 @@ fn the_adr_and_the_fixtures_spell_every_vocabulary_word() {
             shown(family, key),
             want,
             "{family}*.json must show every `{key}` word of the contract, and no other"
+        );
+    }
+    for word in RETIRED {
+        assert!(
+            !adr.contains(word),
+            "{ADR} still writes the retired `{word}`"
         );
     }
     let classes = CLASS_NAMES.iter().map(|c| &c.1).chain(&["crashed"]);
@@ -946,15 +1044,29 @@ fn the_fixture_texts_are_the_products_own() {
         "the entry keeps the text the parent stores, which has no export prefix"
     );
     let compact = source("src/load/compact.rs");
-    let mut reasons = BTreeSet::new();
-    values_of(&fixture("compact_result.json"), "skip_reason", &mut reasons);
-    assert!(!reasons.is_empty(), "show a skipped table");
-    for reason in reasons {
+    let predicate = compact
+        .split("fn compact_skip_reason(")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .expect("the predicate that passes a table by");
+    for (word, text) in COMPACT_SKIP_TEXT {
         assert!(
-            compact.contains(&format!("\"{reason}\"")),
-            "`{reason}` is not a text compact_skip_reason returns"
+            compact.contains(text),
+            "compact no longer prints `{text}`: `{word}` names nothing"
         );
     }
+    let worded: BTreeSet<&str> = COMPACT_SKIP_TEXT.iter().map(|t| t.0).collect();
+    assert_eq!(
+        worded,
+        COMPACT_SKIP.iter().copied().collect(),
+        "every compact skip reason names a text the product prints"
+    );
+    let in_predicate = |t: &&(&str, &str)| predicate.contains(t.1);
+    assert_eq!(
+        COMPACT_SKIP_TEXT.iter().filter(in_predicate).count(),
+        predicate.matches("Some(").count(),
+        "compact_skip_reason gained or lost a reason: give it a word in COMPACT_SKIP_TEXT"
+    );
 }
 
 #[test]

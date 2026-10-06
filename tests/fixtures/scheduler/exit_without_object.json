@@ -18,11 +18,11 @@
     "object": {
       "code": null,
       "kind": null,
-      "class": "retryable",
-      "exit_code": 2,
-      "retryable": true,
+      "class": "generic",
+      "exit_code": 1,
+      "retryable": false,
       "action": null,
-      "message": null
+      "message": "rivet exited 2 and printed no error object"
     }
   },
   {
