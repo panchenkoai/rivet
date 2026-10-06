@@ -2227,6 +2227,14 @@ mod mod_decisions {
              which made `RIVET_CDC_MAX_TX_BYTES: 2 GiB` mean ~25 GiB of memory"
         );
 
+        let mut poisoned = mk(None, None);
+        poisoned.poison = Some("x".repeat(7));
+        assert_eq!(poisoned.estimated_bytes(), empty + 7);
+        poisoned.before_poison = Some("y".repeat(11));
+        assert_eq!(poisoned.estimated_bytes(), empty + 7 + 11);
+        poisoned.row_id = Some("z".repeat(13));
+        assert_eq!(poisoned.estimated_bytes(), empty + 7 + 11 + 13);
+
         // The COMMIT POSITION is charged, and it is the dominant term: the framer
         // clones it onto every event of a transaction, and a one-key JSON object
         // costs a whole BTreeMap node (measured 475 B). An estimate that ignores it
