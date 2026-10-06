@@ -1,0 +1,13 @@
+diff --git a/src/source/cdc/partition_guard.rs b/src/source/cdc/partition_guard.rs
+index c0afe4d7..5bb1efc8 100644
+--- a/src/source/cdc/partition_guard.rs
++++ b/src/source/cdc/partition_guard.rs
+@@ -109,7 +109,7 @@ fn named<'a>(
+     img: Option<&'a Vec<RivetValue>>,
+ ) -> Option<(&'a [String], &'a [RivetValue])> {
+     let (n, v) = (names?, img?);
+-    (n.len() == v.len()).then_some((n, v))
++    Some((n, v))
+ }
+ 
+ /// An event's pre-image with its names: `before_names` when the engine gave its own, else `image_names`.

@@ -219,6 +219,146 @@ fn oracle_cdc_intra_transaction_updates_get_distinct_seq() {
     assert_intra_transaction_seq(&out, N);
 }
 
+/// A primary-key UPDATE is a delete of the old key then an insert of the new row (ADR-0030), one
+/// position, the insert after; and `id = id + 1`, which Oracle logs as `1 -> 2` before `2 -> 3`,
+/// keeps every moved row. The deduped capture equals the source.
+#[test]
+#[ignore = "live: requires the oracle service with LogMiner prerequisites"]
+fn oracle_cdc_a_primary_key_update_is_a_delete_then_an_insert() {
+    let _serial = cross_process_serial("oracle_cdc");
+    let d = tempfile::tempdir().unwrap();
+    let t = cdc_table("ora_pkmv", "v NUMBER(18), id NUMBER(18) PRIMARY KEY");
+    let ckpt = d.path().join("cdc.ckpt");
+    rig(&t, &ckpt, &d.path().join("anchor")).run_ok();
+    ora_exec(&format!(
+        "INSERT INTO {} (v, id) SELECT level * 10, level FROM dual CONNECT BY level <= 3",
+        t.name()
+    ));
+    ora_exec(&format!("UPDATE {} SET id = 9 WHERE id = 3", t.name()));
+    ora_exec(&format!("UPDATE {} SET id = id + 1 WHERE id < 9", t.name()));
+    let out = d.path().join("out");
+    rig(&t, &ckpt, &out).run_ok();
+    let changes = read_cdc_changes(&out);
+    let del = changes
+        .iter()
+        .find(|c| c.id == 3 && c.op == "delete" && c.v == 30);
+    let ins = changes.iter().find(|c| c.id == 9 && c.op == "insert");
+    assert!(
+        del.zip(ins)
+            .is_some_and(|(d, i)| d.pos == i.pos && i.seq > d.seq && i.v == 30),
+        "3 -> 9 is the old row's delete then the new row's insert at one position: {changes:?}"
+    );
+    let source: i64 = ora_text_rows(&format!(
+        "SELECT TO_CHAR(SUM(v * 1000 + id)) FROM {}",
+        t.name()
+    ))[0][0]
+        .as_deref()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(source, 10_002 + 20_003 + 30_009);
+    let keyed: Vec<CdcChange> = changes
+        .into_iter()
+        .map(|c| CdcChange {
+            v: c.v * 1000 + c.id,
+            ..c
+        })
+        .collect();
+    assert_eq!(
+        deduped_current_sum(keyed, CdcEngine::Oracle),
+        source,
+        "deduped by (__pos, __seq), the capture holds exactly the source's rows"
+    );
+}
+
+/// Rows that differ ONLY in their key, renumbered by one statement: the images cannot tell the
+/// row that held key 2 from the row moved into it, the ROWID can. The deduped capture is the source.
+#[test]
+#[ignore = "live: requires the oracle service with LogMiner prerequisites"]
+fn oracle_cdc_a_renumber_over_rows_with_equal_images_keeps_every_row() {
+    let _serial = cross_process_serial("oracle_cdc");
+    let d = tempfile::tempdir().unwrap();
+    let t = cdc_table("ora_pkeq", "v NUMBER(18), id NUMBER(18) PRIMARY KEY");
+    let ckpt = d.path().join("cdc.ckpt");
+    rig(&t, &ckpt, &d.path().join("anchor")).run_ok();
+    ora_exec(&format!(
+        "INSERT INTO {} (v, id) SELECT 7, level FROM dual CONNECT BY level <= 4",
+        t.name()
+    ));
+    ora_exec(&format!("UPDATE {} SET id = id + 1", t.name()));
+    let out = d.path().join("out");
+    rig(&t, &ckpt, &out).run_ok();
+    let source: i64 = ora_text_rows(&format!(
+        "SELECT TO_CHAR(SUM(v * 1000 + id)) FROM {}",
+        t.name()
+    ))[0][0]
+        .as_deref()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(source, 7_002 + 7_003 + 7_004 + 7_005);
+    let keyed: Vec<CdcChange> = read_cdc_changes(&out)
+        .into_iter()
+        .map(|c| CdcChange {
+            v: c.v * 1000 + c.id,
+            ..c
+        })
+        .collect();
+    assert_eq!(
+        deduped_current_sum(keyed, CdcEngine::Oracle),
+        source,
+        "deduped by (__pos, __seq), the capture holds keys 2..=5, one row each"
+    );
+}
+
+/// A heap row of more than 255 columns (stored as chained pieces) whose key moves: its redo still
+/// carries a ROW_ID, the run succeeds, and the deduped capture is the source.
+#[test]
+#[ignore = "live: requires the oracle service with LogMiner prerequisites"]
+fn oracle_cdc_a_key_move_of_a_row_wider_than_255_columns_is_captured_not_refused() {
+    let _serial = cross_process_serial("oracle_cdc");
+    let wide: String = (1..=278).map(|i| format!(", c{i} NUMBER(18)")).collect();
+    for (prefix, cols, changes) in [(
+        "ora_wide",
+        format!("v NUMBER(18), id NUMBER(18) PRIMARY KEY{wide}"),
+        [
+            "INSERT INTO {t} (v, id, c278) VALUES (10, 1, 5)",
+            "INSERT INTO {t} (v, id, c278) VALUES (10, 2, 5)",
+            "UPDATE {t} SET id = id + 1, c278 = 6",
+        ],
+    )] {
+        let d = tempfile::tempdir().unwrap();
+        let t = cdc_table(prefix, &cols);
+        let ckpt = d.path().join("cdc.ckpt");
+        rig(&t, &ckpt, &d.path().join("anchor")).run_ok();
+        for sql in &changes {
+            ora_exec(&sql.replace("{t}", t.name()));
+        }
+        let out = d.path().join("out");
+        rig(&t, &ckpt, &out).run_ok();
+        let source: i64 = ora_text_rows(&format!(
+            "SELECT TO_CHAR(SUM(v * 1000 + id)) FROM {}",
+            t.name()
+        ))[0][0]
+            .as_deref()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let keyed: Vec<CdcChange> = read_cdc_changes(&out)
+            .into_iter()
+            .map(|c| CdcChange {
+                v: c.v * 1000 + c.id,
+                ..c
+            })
+            .collect();
+        assert_eq!(
+            deduped_current_sum(keyed, CdcEngine::Oracle),
+            source,
+            "{prefix}: the deduped capture is the source"
+        );
+    }
+}
+
 #[test]
 #[ignore = "live: requires the oracle service with LogMiner prerequisites"]
 fn oracle_cdc_sum_reconciles_across_intra_txn_updates() {

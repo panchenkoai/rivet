@@ -207,10 +207,10 @@ preflights:
       SPEC. Debezium reads the same window from the same engine and the two captures are
       compared in DuckDB on (op, key, VALUES). The value comparison is load-bearing: without it
       a parquet with 100% of a column NULLed reports AGREE, measured, so a run that compared only
-      (op, key) is graded a FAILURE here rather than accepted. `key-update` is excluded and the
-      reason is written at the call site: rivet emits update(new) where Debezium emits
-      delete(old)+insert(new), which is a representation decision, and a cell that EXPECTS a
-      difference goes green the day someone fixes it."
+      (op, key) is graded a FAILURE here rather than accepted. `key-update` runs on every engine
+      but MongoDB (`_id` cannot change): since ADR-0030 (2026-10-03) rivet writes a key change as
+      delete(old)+insert(new), as Debezium does; before, it was update(new) and the cell was
+      excluded."
     infra: [docker]
     status: test        # verify_cdc_differential (dev/release_oracle/cdc.py)
   - id: row_hash

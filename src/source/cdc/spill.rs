@@ -798,6 +798,9 @@ mod tests {
             )),
             seq: 0,
             poison: None,
+            row_id: None,
+            before_names: None,
+            before_poison: None,
         };
         use crate::source::cdc::RivetValue as V;
         let seeds = [
@@ -1416,19 +1419,40 @@ pub(crate) fn encode_event(ev: &ChangeEvent) -> Vec<u8> {
     out.push(u8::from(ev.committed));
     out.extend_from_slice(&ev.seq.to_be_bytes());
     put_opt_str(&mut out, ev.poison.as_deref());
-    match ev.image_names.as_deref() {
-        None => out.push(0),
-        Some(names) => {
-            out.push(1);
-            put_len(&mut out, names.len());
-            for n in names {
-                put_str(&mut out, n);
-            }
-        }
-    }
+    put_opt_str(&mut out, ev.row_id.as_deref());
+    put_opt_str(&mut out, ev.before_poison.as_deref());
+    put_names(&mut out, ev.image_names.as_deref());
+    put_names(&mut out, ev.before_names.as_deref());
     put_image(&mut out, ev.before.as_deref());
     put_image(&mut out, ev.after.as_deref());
     out
+}
+
+/// A name list is `None` (absent) or a list, and the two are distinct.
+fn put_names(out: &mut Vec<u8>, names: Option<&[String]>) {
+    match names {
+        None => out.push(0),
+        Some(names) => {
+            out.push(1);
+            put_len(out, names.len());
+            for n in names {
+                put_str(out, n);
+            }
+        }
+    }
+}
+
+/// Read what [`put_names`] wrote.
+fn get_names(c: &mut Cur<'_>) -> Result<Option<std::sync::Arc<[String]>>> {
+    if c.u8()? == 0 {
+        return Ok(None);
+    }
+    let n = c.len()?;
+    let mut names = Vec::with_capacity(n.min(4096));
+    for _ in 0..n {
+        names.push(c.string()?);
+    }
+    Ok(Some(names.into()))
 }
 
 fn put_opt_str(out: &mut Vec<u8>, s: Option<&str>) {
@@ -1496,16 +1520,18 @@ pub(crate) fn decode_event(rec: &[u8]) -> Result<ChangeEvent> {
     } else {
         Some(c.string()?)
     };
-    let image_names: Option<std::sync::Arc<[String]>> = if c.u8()? == 0 {
+    let row_id = if c.u8()? == 0 {
         None
     } else {
-        let n = c.len()?;
-        let mut names = Vec::with_capacity(n.min(4096));
-        for _ in 0..n {
-            names.push(c.string()?);
-        }
-        Some(names.into())
+        Some(c.string()?)
     };
+    let before_poison = if c.u8()? == 0 {
+        None
+    } else {
+        Some(c.string()?)
+    };
+    let image_names = get_names(&mut c)?;
+    let before_names = get_names(&mut c)?;
     let before = get_image(&mut c)?;
     let after = get_image(&mut c)?;
     // TRAILING BYTES are an error, not slack. A frame this build reads as complete
@@ -1529,6 +1555,9 @@ pub(crate) fn decode_event(rec: &[u8]) -> Result<ChangeEvent> {
         image_names,
         seq,
         poison,
+        row_id,
+        before_names,
+        before_poison,
     })
 }
 
@@ -1553,6 +1582,9 @@ mod frame_tests {
             // hiding accumulation arithmetic.
             seq: 7,
             poison: None,
+            row_id: None,
+            before_names: None,
+            before_poison: None,
         }
     }
 
@@ -1581,6 +1613,9 @@ mod frame_tests {
             image_names,
             seq,
             poison,
+            row_id,
+            before_names,
+            before_poison,
         } = &back;
         assert_eq!(op.as_str(), e.op.as_str(), "op");
         assert_eq!(schema, &e.schema, "schema");
@@ -1589,6 +1624,13 @@ mod frame_tests {
         assert_eq!(committed, &e.committed, "committed");
         assert_eq!(seq, &e.seq, "seq");
         assert_eq!(poison, &e.poison, "poison");
+        assert_eq!(row_id, &e.row_id, "row_id");
+        assert_eq!(before_poison, &e.before_poison, "before_poison");
+        assert_eq!(
+            before_names.as_deref(),
+            e.before_names.as_deref(),
+            "before_names"
+        );
         assert_eq!(
             image_names.as_deref(),
             e.image_names.as_deref(),
@@ -1718,6 +1760,18 @@ mod frame_tests {
         let mut h = ev();
         h.poison = Some(String::new());
         cases.push(("poison empty", h));
+        let mut r = ev();
+        r.row_id = Some("AAAVrgAAYAABQk7AAA".into());
+        cases.push(("row id", r));
+        let mut bp = ev();
+        bp.before_poison = Some(String::new());
+        cases.push(("before poison empty", bp));
+        let mut b = ev();
+        b.before_names = Some(vec!["id".to_string()].into());
+        cases.push(("before names", b));
+        let mut b0 = ev();
+        b0.before_names = Some(Vec::<String>::new().into());
+        cases.push(("before names empty", b0));
         let mut i = ev();
         i.image_names = Some(Vec::<String>::new().into());
         cases.push(("names empty", i));
@@ -2014,6 +2068,9 @@ mod spill_cost {
             )),
             seq: i,
             poison: None,
+            row_id: None,
+            before_names: None,
+            before_poison: None,
         }
     }
 
@@ -2209,6 +2266,9 @@ mod event_cost {
             image_names: Some(names.clone()),
             seq: i,
             poison: None,
+            row_id: None,
+            before_names: None,
+            before_poison: None,
         }
     }
 
