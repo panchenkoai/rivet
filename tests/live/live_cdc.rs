@@ -5245,7 +5245,7 @@ fn roast_pg_cdc_bounded_on_a_standby_fails_loud() {
     // not provision it. Self-gate: SKIP (loudly) when :5436 is unreachable rather
     // than fail on a Connection-refused that never reaches the recovery check
     // under test. When the profile IS up, the assertions below run for real.
-    let standby_url = "postgresql://rivet:rivet@127.0.0.1:5436/rivet";
+    let standby_url = PG_STANDBY_URL;
     if std::net::TcpStream::connect_timeout(
         &"127.0.0.1:5436".parse().unwrap(),
         std::time::Duration::from_millis(500),
@@ -5302,10 +5302,7 @@ fn roast_pg_cdc_bounded_on_a_standby_fails_loud() {
 #[test]
 #[ignore = "live+gate-only: requires the cdc-standby profile — python3 -m dev.pytools.cdc_stand standby (pg-cdc-primary :5437 → pg-cdc-standby :5436)"]
 fn pg_cdc_streams_changes_from_a_standby_in_continuous_mode() {
-    let (primary_url, standby_url) = (
-        "postgresql://rivet:rivet@127.0.0.1:5437/rivet",
-        "postgresql://rivet:rivet@127.0.0.1:5436/rivet",
-    );
+    let (primary_url, standby_url) = (PG_STANDBY_PRIMARY_URL, PG_STANDBY_URL);
     for port in ["5436", "5437"] {
         if std::net::TcpStream::connect_timeout(
             &format!("127.0.0.1:{port}").parse().unwrap(),
@@ -5341,26 +5338,8 @@ fn pg_cdc_streams_changes_from_a_standby_in_continuous_mode() {
         1,
     );
 
-    // A logical slot on a standby waits for the primary to log a running-transactions
-    // snapshot; ask for one while the first run creates it.
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let nudger = {
-        let stop = stop.clone();
-        let url = primary_url.to_string();
-        std::thread::spawn(move || {
-            let mut c = postgres::Client::connect(&url, postgres::NoTls).unwrap();
-            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                let _ = c.execute("SELECT pg_log_standby_snapshot()", &[]);
-                std::thread::sleep(std::time::Duration::from_millis(300));
-            }
-        })
-    };
-    let rig = Rig::pg_cdc(&tbl, &slot)
-        .source_url(standby_url)
-        .continuous();
-    let first = rig.run();
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    nudger.join().unwrap();
+    let rig = Rig::pg_cdc_standby(&tbl, &slot).continuous();
+    let first = rig.run_nudged(&[]);
     if !first.status.success() {
         panic!(
             "a continuous run must stream from a PostgreSQL 16 standby:\n{}",
@@ -5384,8 +5363,8 @@ fn pg_cdc_streams_changes_from_a_standby_in_continuous_mode() {
     );
 }
 
-const PG_FAILOVER_PRIMARY: &str = "postgresql://rivet:rivet@127.0.0.1:5437/rivet";
-const PG_FAILOVER_STANDBY: &str = "postgresql://rivet:rivet@127.0.0.1:5436/rivet";
+const PG_FAILOVER_PRIMARY: &str = PG_STANDBY_PRIMARY_URL;
+const PG_FAILOVER_STANDBY: &str = PG_STANDBY_URL;
 const PG_FAILOVER_URL: &str = "RIVET_FAILOVER_URL";
 
 /// A capture on the primary (ids 1-2), then ids 3-4 written while the same config is pointed at the standby.
@@ -5416,21 +5395,7 @@ fn op_ids(batches: &[arrow::record_batch::RecordBatch]) -> Vec<(String, i64)> {
 
 /// Run `rig` against `url` while the primary keeps logging standby snapshots (a slot created on a standby waits for one).
 fn run_on(rig: &Rig, url: &str) -> std::process::Output {
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let nudger = {
-        let stop = stop.clone();
-        std::thread::spawn(move || {
-            let mut c = postgres::Client::connect(PG_FAILOVER_PRIMARY, postgres::NoTls).unwrap();
-            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                let _ = c.execute("SELECT pg_log_standby_snapshot()", &[]);
-                std::thread::sleep(std::time::Duration::from_millis(300));
-            }
-        })
-    };
-    let out = rig.run_args_env(&[], &[(PG_FAILOVER_URL, url)]);
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    nudger.join().unwrap();
-    out
+    rig.run_nudged(&[(PG_FAILOVER_URL, url)])
 }
 
 /// The capture before the switch, and the rows the standby holds after it.
