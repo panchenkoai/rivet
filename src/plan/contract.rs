@@ -481,6 +481,32 @@ mod tests {
     }
 
     #[test]
+    fn only_strategies_a_clean_run_resumes_continue_the_stored_cursor() {
+        let keyset = |incremental| {
+            ExtractionStrategy::Keyset(KeysetPlan {
+                key_column: "id".into(),
+                chunk_size: 1000,
+                checkpoint: true,
+                incremental,
+                parallel: 1,
+            })
+        };
+        let incremental = ExtractionStrategy::Incremental(IncrementalCursorPlan {
+            primary_column: "updated_at".into(),
+            fallback_column: None,
+            mode: IncrementalCursorMode::SingleColumn,
+            settle: None,
+        });
+        assert!(incremental.continues_stored_cursor());
+        assert!(keyset(true).continues_stored_cursor());
+        assert!(
+            !keyset(false).continues_stored_cursor(),
+            "a crash-recovery keyset clears the stale high-water at a fresh start"
+        );
+        assert!(!ExtractionStrategy::Snapshot.continues_stored_cursor());
+    }
+
+    #[test]
     fn reconcile_subset_skip_covers_every_delta_strategy() {
         // #bughunt HIGH: the #102 reconcile exit gate turned a STRUCTURAL count
         // mismatch into a false exit-3 for keyset_incremental + time_window (only
