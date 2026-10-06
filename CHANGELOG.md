@@ -116,7 +116,6 @@
   and two CVEs), `tiberius` 0.13 (SQL Server `sql_variant` and CLR types read as text).
   `cargo audit` is clean.
 
-
 - **MySQL CDC `compact` reads the base only in its MERGE.** `rivet compact` merges only the
   partitions its changes name. To catch a row whose partition value changed, it used to look
   every updated key up in the base on every cycle; a pilot paid 2 x 2.2 GiB per large table
