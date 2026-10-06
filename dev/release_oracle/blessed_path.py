@@ -167,6 +167,11 @@ def _block(engine: str, scenario: str, table: str) -> str:
     )
 
 
+def cell_export(work: Path) -> str:
+    """A cell's export name: its scratch dir's name (engine, version, table, scenario, store, backend) and the run's."""
+    return f"{work.name}_{work.parent.name}"
+
+
 def cloud_prefix(engine: str, tag: str, table: str, scenario: str) -> str:
     """The object-store prefix for one cell, unique per gate invocation.
 
@@ -354,6 +359,67 @@ def _run_ids(work: Path) -> list[str]:
     return out
 
 
+def _cell_config(engine: str, scenario: str, table: str, export: str, tls: str, dest_block: str) -> str:
+    """init's scaffold narrowed to one export: the source block and tls posture init chose, one table, one destination."""
+    return (
+        f"source:\n"
+        f"  type: {engine}\n"
+        f"  url_env: ORACLE_URL\n"
+        f"  tls: {{ mode: {tls} }}\n"
+        f"{SCENARIOS[scenario].get('source', '')}"
+        f"exports:\n"
+        f"  - name: {export}\n"
+        f"    table: {table}\n"
+        f"{_block(engine, scenario, table)}\n"
+        f"    format: parquet\n"
+        f"{dest_block}\n"
+    )
+
+
+#: What rivet does TODAY when two configs share one state DB and one export name and read different collections
+#: with `mongo.resume`: `collides` (the second continues from the first one's `_id` and ships short with exit 0),
+#: `refused`, or `independent`. Whether it should refuse is an open product question (see the gate report of
+#: 25e6a47b); when that lands, this is the one value to flip.
+SAME_NAME_RESUME_TODAY = "collides"
+
+
+def same_name_outcome(second_ok: bool, delivered: int, source: int) -> str:
+    """Classify the second same-named export: refused, delivered in full, or continued from the other's cursor."""
+    return "refused" if not second_ok else "independent" if delivered == source else "collides"
+
+
+def sc_same_name_resume(led: Ledger, engine: str, tag: str, url: str, state_url: str = "") -> None:
+    """DOCUMENTS today's behaviour of two same-named `mongo.resume` exports of different collections on one state."""
+    first, second = GOLDEN_TABLES[0], GOLDEN_TABLES[1]
+    work = scenarios.Scope(engine, tag).dir("samename", "pg" if state_url else "sq")
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True, exist_ok=True)
+    env = {**scenarios._store_env(url), "RIVET_STATE_URL": state_url}
+    cell, export = "blessed:same_name", cell_export(work)
+    got = []
+    for t in (first, second):
+        out = work / f"out_{t}"
+        cfg = work / f"{t}.yaml"
+        cfg.write_text(_cell_config(engine, "mongo_resume", t, export, "disable",
+                                    f"    destination: {{type: local, path: {out}/}}"))
+        r = rivet("run", "-c", str(cfg), env=env, timeout=scenarios.NO_TIMEOUT)
+        rows = _parquet_rows_and_files(out)[0] if r.ok else -1
+        # No declared part and none on disk is an export of zero rows; a part DuckDB could not read is not.
+        unread = rows < 0 and any(out.rglob("*.parquet"))
+        got.append((r, -1 if unread or not r.ok else max(rows, 0), _source_rows(engine, url, t)))
+    (r1, rows1, src1), (r2, rows2, src2) = got
+    if not r1.ok or src1 < 1 or src2 < 1 or rows1 != src1 or (r2.ok and rows2 < 0):
+        return led.failed(engine, tag, cell, "local", f"{engine} {tag} · same-name resume — the fixture is inert: the "
+                          f"first export ({first}) delivered {rows1} of {src1} ({r1.why}); {second} holds {src2}", "inert")
+    seen = same_name_outcome(r2.ok, rows2, src2)
+    what = (f"{engine} {tag} · same-name resume — two configs, one state, export `{export}`: after {first} "
+            f"({rows1} rows), {second} is `{seen}` (exit {r2.returncode}, {rows2} of {src2} rows delivered)")
+    if seen != SAME_NAME_RESUME_TODAY:
+        return led.failed(engine, tag, cell, "local", f"{what}; the gate pins `{SAME_NAME_RESUME_TODAY}` as today's "
+                          "behaviour — if the product changed on purpose, flip SAME_NAME_RESUME_TODAY", seen)
+    led.passed(engine, tag, cell, "local", f"DOCUMENTS (open product question, not an endorsement): {what}", seen)
+
+
 def sc_blessed_path(
     led: Ledger,
     engine: str,
@@ -371,6 +437,7 @@ def sc_blessed_path(
     chain is walked on both rather than assumed transferable.
     """
     work = scenarios.Scope(engine, tag).dir("blessed", table, scenario, store, "pg" if state_url else "sq")
+    export = cell_export(work)
     shutil.rmtree(work, ignore_errors=True)
     work.mkdir(parents=True, exist_ok=True)
     dest_dir = work / "out"
@@ -444,19 +511,7 @@ def sc_blessed_path(
         dest_block = "    destination:\n" + raw.rstrip("\n")
     # Carry init's OWN tls posture into the narrowed config (do not hand-write
     # one) — the whole point is the chain runs over what init generated.
-    tls = f"\n  tls: {{ mode: {init_tls} }}"
-    cfg.write_text(
-        f"source:\n"
-        f"  type: {engine}\n"
-        f"  url_env: ORACLE_URL{tls}\n"
-        f"{SCENARIOS[scenario].get('source', '')}"
-        f"exports:\n"
-        f"  - name: blessed\n"
-        f"    table: {table}\n"
-        f"{_block(engine, scenario, table)}\n"
-        f"    format: parquet\n"
-        f"{dest_block}\n"
-    )
+    cfg.write_text(_cell_config(engine, scenario, table, export, init_tls, dest_block))
 
     # ── doctor / check ────────────────────────────────────────────────────────
     for stage in ("doctor", "check"):
@@ -504,14 +559,6 @@ def sc_blessed_path(
     # a shape assertion is what stayed green for two months while apply
     # rejected every plan.json on disk (the `verify` field became required and
     # the fixture test never deserialized with the real type).
-    # Watermark BEFORE apply: export_metrics has no run_id, and every cell names its
-    # export 'blessed' on a shared long-lived Postgres ledger, so `id > pg_mark` is the
-    # only way to isolate THIS run's row (a constant-name count passes on history — the
-    # very defect this cell's docstring warns about; mirrors blessed_flow._state_watermark).
-    pg_mark = 0
-    if state_url:
-        w = _pg_query(state_url, "SELECT coalesce(max(id),0) FROM export_metrics")
-        pg_mark = int(w) if w and w.lstrip("-").isdigit() else 0
     r = rivet("apply", str(plan_path), env=env, timeout=scenarios.NO_TIMEOUT)
     if not _stage(led, engine, tag, store, "apply", r.ok, f"exit={r.returncode} {r.stderr[-200:]}"):
         _downstream_unreached(led, engine, tag, store, "apply")
@@ -551,9 +598,7 @@ def sc_blessed_path(
         # Scoped to THIS RUN, not just this export name. An unscoped count on the
         # shared, long-lived Postgres ledger passes on history — the cell stayed green
         # even if apply recorded NOTHING for this run (the exact defect the docstring
-        # above claims to prevent, caught by the harness bughunt). export_metrics has
-        # no run_id → the pre-apply watermark (id > pg_mark) isolates it; file_log and
-        # run_status ARE run-scoped → the exact rows this run wrote. Mirrors blessed_flow.
+        # above claims to prevent, caught by the harness bughunt). Mirrors blessed_flow.
         ids = _run_ids(work)
         idlist = ", ".join(f"'{r}'" for r in ids) if ids else "''"
         scoped = {
@@ -561,7 +606,7 @@ def sc_blessed_path(
             # by run_id, not a watermark: under the parallel gate a concurrent sibling
             # 'blessed' cell inserts id>mark rows on the shared ledger, so the watermark
             # counted a sibling and an export_metrics-specific regression passed. run_id
-            # isolates THIS run regardless of concurrency. (pg_mark now vestigial.)
+            # isolates THIS run regardless of concurrency.
             "export_metrics": f"SELECT count(*) FROM export_metrics WHERE run_id IN ({idlist})",
             "file_log":       f"SELECT count(*) FROM file_log WHERE run_id IN ({idlist})",
             "run_status":     f"SELECT count(*) FROM run_status WHERE run_id IN ({idlist})",
@@ -575,7 +620,7 @@ def sc_blessed_path(
         else:
             missing = [t for t, n in got.items() if n < 1]
             ok = not missing
-            detail = (f"(export=blessed, {len(ids)} run id(s)): "
+            detail = (f"(export={export}, {len(ids)} run id(s)): "
                       + ", ".join(f"{t}={n}" for t, n in got.items()))
     else:
         db = cfg.parent / ".rivet_state.db"
@@ -808,6 +853,8 @@ def verify_blessed_path(
     # reader can decode what rivet wrote — does not multiply with the row count. Kept
     # sequential (one real BQ job; the BQ golden stage already parallelises engines).
     sc_bq_cycle(led, engine, tag, url, tables[0])
+    if engine == "mongo" and not table:
+        sc_same_name_resume(led, engine, tag, url, state_url)
 
     if not tasks:
         return

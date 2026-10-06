@@ -52,13 +52,14 @@ class Status(str, Enum):
     """A cell's outcome.
 
     `SKIP` is load-bearing: a down service or an absent credential must never
-    read as a pass. Only `FAIL` sets the non-zero exit.
+    read as a pass. `FAIL` and `INFRA` set the non-zero exit; only `FAIL` says the product is wrong.
     """
 
     PASS = "PASS"
     FAIL = "FAIL"
     SKIP = "SKIP"
     KNOWN = "KNOWN"  # a failure recorded in known_red.py with a reason, in date
+    INFRA = "INFRA"  # the ORACLE could not read (its own transport), so the cell graded nothing
 
 
 @dataclass(frozen=True)
@@ -298,6 +299,11 @@ class Ledger:
             self.bad(why)
             self.add("-", "-", "matrix_rows", "-", Status.FAIL, why)
 
+    def ungraded(self, engine: str, version: str, scenario: str, store: str, msg: str, detail: str = "") -> None:
+        """The oracle's own infrastructure failed: blocking, and never a verdict on the product."""
+        self._emit(self._c("1;35", f"  ⚠ ORACLE INFRA (the cell graded nothing; re-run it) — {msg}"))
+        self.add(engine, version, scenario, store, Status.INFRA, detail or msg)
+
     def skipped(self, engine: str, version: str, scenario: str, store: str, msg: str, detail: str = "") -> None:
         self.skip(msg)
         self.add(engine, version, scenario, store, Status.SKIP, detail or msg)
@@ -307,7 +313,16 @@ class Ledger:
     def red(self) -> bool:
         return any(c.status is Status.FAIL for c in self.cells)
 
-    def report(self) -> int:
+    @property
+    def ungraded_cells(self) -> int:
+        return sum(c.status is Status.INFRA for c in self.cells)
+
+    def verdict(self) -> str:
+        """The run's verdict, derived from the rows: a product FAIL outranks an ungraded cell."""
+        return "NOT RELEASABLE" if self.red else "NOT GRADED" if self.ungraded_cells else "RELEASE-READY"
+
+    def report(self, *, full: bool = False) -> int:
+        """Print the table and the verdict; only a `full` gate run records a timings line and may say RELEASE-READY."""
         print()
         self.phase("Release Oracle result")
         print(f"  {'ENGINE':<10} {'VER':<6} {'SCENARIO':<16} {'STORE':<8} STATUS")
@@ -374,20 +389,37 @@ class Ledger:
                     print(f"  {sum(ds) / 60.0:6.1f} min  {key:28} n={len(ds):<4} "
                           f"mean={sum(ds) / len(ds):5.1f}s  max={max(ds):5.1f}s")
                 print()
-        record_timings(
-            TIMINGS_HISTORY, timed, self._spans,
-            "NOT RELEASABLE" if self.red else "RELEASE-READY",
-            sum(c.status is Status.PASS for c in self.cells),
-            sum(c.status is Status.FAIL for c in self.cells),
-        )
+        verdict = self.verdict()
+        if full:
+            record_timings(
+                TIMINGS_HISTORY, timed, self._spans, verdict,
+                sum(c.status is Status.PASS for c in self.cells),
+                sum(c.status is Status.FAIL for c in self.cells),
+            )
         known = [c for c in self.cells if c.status is Status.KNOWN]
         if known:
             print(self._c("1;33", f"  {len(known)} KNOWN RED cell(s), each recorded in known_red.py with a reason and an expiry."))
+        if self.ungraded_cells:
+            print(self._c("1;35", f"  {self.ungraded_cells} cell(s) NOT GRADED: the oracle's own read failed (see ⚠ above). "
+                                  "Not a product verdict; re-run them."))
         if self.red:
             print(self._c("1;31", "  NOT RELEASABLE — one or more cells failed (see ✗ above)."))
             return 1
+        if self.ungraded_cells:
+            print(self._c("1;35", "  NOT GRADED — no cell failed, and the cells above were never graded."))
+            return 1
+        if not full:
+            print(self._c("1;33", f"  PARTIAL RUN — the {len(self.cells)} row(s) selected carry no failure. Not a gate "
+                                  "verdict, and no timings line was written."))
+            return 0
         print(self._c("1;32", "  RELEASE-READY — every non-skipped cell is green."))
         return 0
+
+
+def first_error(text: str) -> str:
+    """The first line of a command's output that names an error, else its last non-empty line."""
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    return next((ln for ln in lines if re.match(r"(?i)(error\b|\[RIVET_|.*\berror:)", ln)), lines[-1] if lines else "")
 
 
 #: One JSON line per full gate run (gitignored): where the wall-clock went, so a slow run is compared, not guessed.
@@ -494,6 +526,15 @@ class Proc:
     def out(self) -> str:
         """stdout+stderr, for the cases that genuinely want the transcript."""
         return self.stdout + self.stderr
+
+    @property
+    def why(self) -> str:
+        """`exit N [RIVET_CODE]: <first error line>` for a ledger row; the whole stderr goes to the gate's stderr."""
+        err = (self.stderr or self.stdout or "").strip()
+        if err:
+            print(f"── {' '.join(map(str, self.argv))[-200:]} (exit {self.returncode}) ──\n{err}", file=sys.stderr, flush=True)
+        code = re.search(r"\[(RIVET_[A-Z0-9_]+)\]", err)
+        return f"exit {self.returncode}{f' [{code.group(1)}]' if code else ''}: {first_error(err)[:300]}"
 
 
 #: Every RIVET_* variable the gate, the Rust harness or the Makefile's GATE_ENV READS from the

@@ -19,6 +19,8 @@ readers disagreeing is the finding; one reader agreeing with itself is not.
 from __future__ import annotations
 
 import os
+import re
+import time
 
 import duckdb
 
@@ -26,6 +28,41 @@ import duckdb
 BQ_PROJECT_ENV = "BQ_ORACLE_PROJECT"
 BQ_DATASET_ENV = "BQ_ORACLE_DATASET"
 
+#: A read may be tried this many times, and all tries and pauses together may take this long.
+READ_TRIES, READ_BUDGET_S = 3, 180.0
+
+
+#: libcurl codes a BigQuery read dies of without a verdict: couldn't connect (7), timeout (28),
+#: SSL connect (35), send/recv failure (55/56), and an empty reply (52).
+TRANSIENT_CURL = re.compile(r"CURL error \[(7|28|35|52|55|56)\]")
+
+
+class OracleUnavailable(Exception):
+    """The oracle's own transport failed on every try: the cell graded nothing, which is not a product verdict."""
+
+
+def transient(e: BaseException) -> bool:
+    """Whether a DuckDB error is the reader's transport (curl, a dropped BigQuery Storage read session), not the data."""
+    s = str(e)
+    return bool(TRANSIENT_CURL.search(s)) or bool(
+        "read session" in s and re.search(r"\b(CANCELLED|UNAVAILABLE|DEADLINE_EXCEEDED|ABORTED)\b", s))
+
+
+def retry(read, *, tries: int = READ_TRIES, budget: float = READ_BUDGET_S, pause: float = 5.0,
+          clock=time.monotonic, sleep=time.sleep):
+    """`read()`, again while it fails in transport, within `tries` and `budget` seconds; then `OracleUnavailable`."""
+    start = clock()
+    for attempt in range(1, tries + 1):
+        try:
+            return read()
+        except duckdb.Error as e:
+            if not transient(e):
+                raise
+            spent = clock() - start
+            if attempt == tries or spent + pause >= budget:
+                raise OracleUnavailable(f"{attempt} of {tries} tries in {spent:.0f}s (budget {budget:.0f}s): "
+                                        f"{str(e)[:300]}") from e
+            sleep(pause)
 
 
 def bq_target() -> tuple[str, str] | None:
@@ -101,11 +138,11 @@ class Oracle:
 
     def rows(self, sql: str) -> list[tuple]:
         """Every row of one query, over whatever is attached."""
-        return self.db.sql(sql).fetchall()
+        return retry(lambda: self.db.sql(sql).fetchall())
 
     def scalar(self, sql: str):
         """The first column of the first row — the shape a count check wants."""
-        row = self.db.sql(sql).fetchone()
+        row = retry(lambda: self.db.sql(sql).fetchone())
         return None if row is None else row[0]
 
     def close(self) -> None:

@@ -6220,8 +6220,11 @@ fn roast_pg_cdc_destination_placeholders_resolve_like_the_batch_path() {
 /// The restore guard stays anyway: a panic here must not leave a server global
 /// flipped for whatever runs next.
 #[test]
-#[ignore = "live: requires docker compose up -d mysql (:3306, log_bin=ON)"]
+#[ignore = "live+exclusive: flips a :3306 GLOBAL every new session inherits — set RIVET_TEST_EXCLUSIVE=1"]
 fn mysql_cdc_refuses_a_compressed_binlog_instead_of_capturing_nothing() {
+    if binlog_compression_needs_the_stand() {
+        return;
+    }
     let _serial = quiet_window_guard(); // :3306 GLOBAL flip — same lock as governor
     let root_url = MYSQL_URL.replace("rivet:rivet@", "root:rivet@");
     let _meta = RowMetadata::set(&root_url, "FULL"); // :3306 runs MySQL's MINIMAL default
@@ -6338,6 +6341,18 @@ fn mysql_cdc_refuses_a_compressed_binlog_instead_of_capturing_nothing() {
     );
 }
 
+/// True (and a skip is recorded) unless the stand is ours alone: a session opened while the global is ON keeps writing compressed transactions.
+fn binlog_compression_needs_the_stand() -> bool {
+    let shared = std::env::var("RIVET_TEST_EXCLUSIVE").is_err();
+    if shared {
+        skip_live(
+            "flips MySQL's global binlog_transaction_compression, which every session opened \
+             meanwhile inherits — run with RIVET_TEST_EXCLUSIVE=1 and --test-threads=1",
+        );
+    }
+    shared
+}
+
 /// #200-2: the STREAM-time sibling of the open-time guard above. Compression can
 /// be turned on AFTER a run has opened (the open-time `refuse_compressed_binlog`
 /// saw it OFF and passed), leaving a `Transaction_payload_event` in the binlog
@@ -6351,8 +6366,11 @@ fn mysql_cdc_refuses_a_compressed_binlog_instead_of_capturing_nothing() {
 /// OFF at open (guard passes again) so the compressed span reaches `fill()`. The
 /// resume must FAIL loudly, not report a clean zero-capture.
 #[test]
-#[ignore = "live: requires docker compose up -d mysql (:3306, log_bin=ON, 8.0.20+)"]
+#[ignore = "live+exclusive: flips a :3306 GLOBAL every new session inherits — set RIVET_TEST_EXCLUSIVE=1"]
 fn mysql_cdc_compressed_payload_in_stream_refuses_not_skips() {
+    if binlog_compression_needs_the_stand() {
+        return;
+    }
     let _serial = quiet_window_guard(); // :3306 GLOBAL flip — same lock as governor
     let root_url = MYSQL_URL.replace("rivet:rivet@", "root:rivet@");
     let _meta = RowMetadata::set(&root_url, "FULL"); // :3306 runs MySQL's MINIMAL default
