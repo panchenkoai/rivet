@@ -39,6 +39,8 @@ feature set + rust-analyzer version + this tool's schema version (`SCHEMA` in `c
 when a fact changes meaning), plus a hash of the uncommitted changes under `src/`, `tests/`,
 `benches/`, `examples/`, `Cargo.toml`, `Cargo.lock` and `build.rs` (then `meta.dirty` is true). The
 git, ADR and glossary facts are cheap and recomputed on every `collect`. `--force` re-indexes.
+The raw index is stored under the tree ids of those inputs rather than the commit, so a commit that
+touches only docs or tooling re-derives the facts in seconds without re-indexing.
 
 rust-analyzer must be installed for the pinned toolchain: `rustup component add rust-analyzer rust-src`.
 

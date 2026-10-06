@@ -740,8 +740,9 @@ def collect(root: Path, features: str, backend: str, out_dir: Path, engines: dic
         facts = cached
         facts["meta"]["cache"] = "hit"
     else:
-        raw = hashlib.sha1("|".join([features, ra or "", dirty]).encode()).hexdigest()[:10]
-        scip_path = out_dir / f"{sha[:12]}-{raw}.scip"
+        inputs = gitfacts.git(root, "ls-tree", "HEAD", "--", *config.INDEX_INPUTS)
+        raw = hashlib.sha1("|".join([inputs, features, ra or "", dirty]).encode()).hexdigest()[:12]
+        scip_path = out_dir / f"index-{raw}.scip"
         if force and scip_path.exists():
             scip_path.unlink()
         derived, timing = index_half(root, features, backend, engines, scip_path)
