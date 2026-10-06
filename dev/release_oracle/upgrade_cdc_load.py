@@ -335,28 +335,6 @@ CDC_LOAD_ENGINES: dict[str, tuple[type[Src], tuple[str, ...], str | None]] = {
 }
 
 
-def _transport_retry(read):
-    """`read()`, again (up to 3 tries) when DuckDB's BigQuery reader fails in transport (a CURL error)."""
-    import time
-
-    import duckdb
-
-    for attempt in range(3):
-        try:
-            return read()
-        except duckdb.Error as e:
-            if "CURL error" not in str(e) or attempt == 2:
-                raise
-            time.sleep(5)
-
-
-def _why(p: Proc) -> str:
-    """`exit N [RIVET_CODE]: <stderr tail>`: the code leads, so a known-red entry can name it."""
-    err = (p.stderr or "").strip()
-    code = re.search(r"\[(RIVET_[A-Z0-9_]+)\]", err)
-    return f"exit {p.returncode}{f' [{code.group(1)}]' if code else ''}: {err[-240:]}"
-
-
 def _state(o, src: Src, dset: str, t: str) -> tuple[str, str, str, int, bool]:
     """(source `id:v:epoch`, base live `id:v:epoch`, flagged ids, rows minus distinct ids, buffer exists)."""
     w = src.bq_table(t)
@@ -383,7 +361,7 @@ def _oracle_no_load(led: Ledger, name: str, fail, step, body: str, bucket: str, 
         return fail("init", "an Oracle CDC scaffold must carry no `load:` block and name ADR-0037: " + body[-400:])
     r = step(rivet_bin(), "run", "-c", "c.yaml")
     if not r.ok:
-        return fail("run", f"this {_why(r)}")
+        return fail("run", f"this {r.why}")
     names = gcp.gcs_list(bucket, f"{pfx}/")
     bad = []
     for t in tables:
@@ -416,7 +394,7 @@ def cdc_load_leg(led: Ledger, prev: Path, root: Path, engine: str, url: str, tz:
     import duckdb
 
     from . import gcp
-    from .duck import BQ_DATASET_ENV, BQ_PROJECT_ENV, Oracle as Duck, bq_target
+    from .duck import BQ_DATASET_ENV, BQ_PROJECT_ENV, Oracle as Duck, OracleUnavailable, bq_target, retry
     from ..pytools.registry import bq_tmp
 
     name = f"upgrade[{engine}/cdc-load{'/init=this' if init_this else ''}{f'/tz={tz}' if tz else ''}]"
@@ -465,7 +443,7 @@ def cdc_load_leg(led: Ledger, prev: Path, root: Path, engine: str, url: str, tz:
                         "--bigquery-dataset", dset, "-o", "c.yaml")
             if not init.ok:
                 return fail("init", f"{'this' if init_this else 'previous'} init: "
-                                    f"{(init.stderr or '').strip()[-240:]}")
+                                    f"{init.why}")
             # Harness isolation only: init writes fixed prefixes and a fixed PG slot name,
             # shared by every run on the stand.
             cfg = d / "c.yaml"
@@ -479,14 +457,14 @@ def cdc_load_leg(led: Ledger, prev: Path, root: Path, engine: str, url: str, tz:
             if init_this:
                 chk = step(initer, "check", "-c", "c.yaml")
                 if not chk.ok:
-                    return fail("check", f"this binary refuses its own init's config: {_why(chk)}")
+                    return fail("check", f"this binary refuses its own init's config: {chk.why}")
             if init_this and engine == "oracle":
                 return _oracle_no_load(led, name, fail, step, body, bucket, pfx, tables, src, d)
             if anchor_first:
                 # init's own advice for a changes-only stream: anchor first, then the rows arrive.
                 a = step(prev, "run", "-c", "c.yaml")
                 if not a.ok:
-                    return fail("anchor", f"prev {_why(a)}")
+                    return fail("anchor", f"prev {a.why}")
                 if not all(src.apply(t, _ops(k, 0)) for k, t in enumerate(tables)):
                     return fail("seed", "the seed rows failed")
             cycles = [(initer, 0), (initer, 1), (initer, 2), (rivet_bin(), 3), (rivet_bin(), 4)]
@@ -498,15 +476,15 @@ def cdc_load_leg(led: Ledger, prev: Path, root: Path, engine: str, url: str, tz:
                     chk = step(binary, "check", "-c", "c.yaml")
                     if not chk.ok:
                         return fail("check", f"this binary refuses the previous init's config: "
-                                             f"{(chk.stderr or chk.out).strip()[-240:]}")
+                                             f"{chk.why}")
                 for s in ("run", "load", "compact"):
-                    if s == "compact" and n > 1 and not all(_transport_retry(buffers)):
+                    if s == "compact" and n > 1 and not all(retry(buffers)):
                         # The positive control: a buffer check that never sees a buffer proves nothing.
                         return fail(f"cycle{n}/load", f"{who}'s load left no `__changes` buffer: {buffers()}")
                     extra = [] if s == "run" else ["--run-id", f"upg-{tag}-{n}"]
                     p = step(binary, s, "-c", "c.yaml", *extra)
                     if not p.ok:
-                        return fail(f"cycle{n}/{s}", f"{who} {_why(p)}")
+                        return fail(f"cycle{n}/{s}", f"{who} {p.why}")
                 def grade() -> tuple[list[str], str]:
                     bad = []
                     with Duck(bigquery=True, bq_dataset=dset, **src.attach) as o:
@@ -523,7 +501,7 @@ def cdc_load_leg(led: Ledger, prev: Path, root: Path, engine: str, url: str, tz:
                             f"'SELECT column_name FROM `{proj}.{dset}.INFORMATION_SCHEMA.COLUMNS` WHERE "
                             f"table_name = \"{src.bq_table(tables[0])}\" AND is_partitioning_column = \"YES\"')")
 
-                bad, part = _transport_retry(grade)
+                bad, part = retry(grade)
                 if bad:
                     return fail(f"cycle{n}", f"after {who}'s compact the base differs from the source — "
                                              + "; ".join(bad)[:600])
@@ -532,6 +510,8 @@ def cdc_load_leg(led: Ledger, prev: Path, root: Path, engine: str, url: str, tz:
             led.passed(engine, "-", SCEN, "cdc-load", f"{name}: {how}; after every compact each of {CDC_TABLES} bases "
                        f"equals the source instant by value, deletes flagged, no duplicate key, no buffer left "
                        f"(partition column: {part or 'none'}{f'; zone: {src.tz_note}' if tz else ''})", "cdc-load")
+    except OracleUnavailable as e:
+        led.ungraded(engine, "-", SCEN, "cdc-load", f"{name}: oracle: the BigQuery read did not complete: {e}", "oracle")
     except duckdb.Error as e:
         # A base missing a column the source has is a finding, not a harness crash.
         fail("oracle", f"the DuckDB read failed: {str(e)[:400]}")

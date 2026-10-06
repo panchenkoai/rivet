@@ -1584,11 +1584,6 @@ def grade_load(spec: dict) -> dict:
     return out
 
 
-#: libcurl codes a BigQuery read dies of without a verdict: couldn't connect (7), timeout (28),
-#: SSL connect (35), send/recv failure (55/56), and an empty reply (52).
-TRANSIENT_CURL = re.compile(r"CURL error \[(7|28|35|52|55|56)\]")
-
-
 def storage_schema_lags(e: BaseException) -> bool:
     """True when a Storage API read session names a column the table gained after the session's schema snapshot."""
     return "read session" in str(e) and "do not exist in the table schema" in str(e)
@@ -1596,7 +1591,9 @@ def storage_schema_lags(e: BaseException) -> bool:
 
 def transient(e: BaseException) -> bool:
     """True for a failure that says nothing about the data: a deadlock victim or a dropped transport."""
-    return "deadlock" in str(e) or TRANSIENT_CURL.search(str(e)) is not None
+    from .duck import transient as transport_down
+
+    return "deadlock" in str(e) or transport_down(e)
 
 
 def _self_test() -> None:
@@ -1614,6 +1611,52 @@ def _self_test() -> None:
                                             "message of request failed: The following selected fields do not exist in the table schema: w"))
     assert not storage_schema_lags(RuntimeError("Binder Error: Referenced column \"w\" not found"))
     assert not transient(RuntimeError("CURL error [22]=HTTP response code said error"))
+    cancelled = RuntimeError("Binder Error: Error while creating read session: Permanent error, with a last message of CANCELLED")
+    assert transient(cancelled) and not storage_schema_lags(cancelled), "a dropped BigQuery read session is transport"
+    assert not transient(RuntimeError("Binder Error: Error while creating read session: Permanent error, with a last "
+                                      "message of request failed: The following selected fields do not exist in the table schema: w"))
+    assert not transient(RuntimeError('Binder Error: Referenced column "CANCELLED" not found'))
+    import duckdb
+
+    from . import duck
+
+    cancelled = duckdb.BinderException("Error while creating read session: Permanent error, with a last message of CANCELLED")
+    calls, slept = [], []
+
+    def dropped():
+        calls.append(1)
+        raise cancelled
+
+    try:
+        duck.retry(dropped, sleep=slept.append)
+    except duck.OracleUnavailable as e:
+        assert "CANCELLED" in str(e), e
+    else:
+        raise AssertionError("a read session dropped on every try must end as OracleUnavailable")
+    assert len(calls) == duck.READ_TRIES and len(slept) == duck.READ_TRIES - 1, (calls, slept)
+    calls.clear()
+
+    def dropped_once():
+        calls.append(1)
+        if len(calls) == 1:
+            raise cancelled
+        return "rows"
+
+    assert duck.retry(dropped_once, sleep=slept.append) == "rows" and len(calls) == 2, calls
+    now = iter([0.0, 176.0])
+    calls.clear()
+    try:
+        duck.retry(dropped, clock=lambda: next(now), sleep=slept.append)
+    except duck.OracleUnavailable:
+        assert len(calls) == 1, "past the budget the oracle must give up, not wait for another try"
+    wrong = duckdb.BinderException('Referenced column "w" not found')
+    try:
+        duck.retry(lambda: (_ for _ in ()).throw(wrong), sleep=slept.append)
+    except duckdb.BinderException:
+        pass
+    else:
+        raise AssertionError("a wrong-data error must surface as itself, never as an infrastructure verdict")
+
     assert not transient(RuntimeError("CURL error [356]=x")), "a code must match whole"
     assert not transient(RuntimeError("Binder Error: Referenced column \"id\" not found"))
     assert type_loss("INTEGER", "BIGINT") is None

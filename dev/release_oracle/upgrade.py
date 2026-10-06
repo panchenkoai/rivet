@@ -57,7 +57,7 @@ import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 
-from .core import Ledger, Proc, isolate_state_db, rivet_bin, run
+from .core import Ledger, Proc, first_error, isolate_state_db, rivet_bin, run
 from .engines import sql as _sql
 from .regression import _require_prev_binary
 from .upgrade_cdc_load import cdc_load_cells
@@ -183,7 +183,7 @@ def _cursor_leg(led: Ledger, prev: Path, root: Path, engine: str, url: str, stat
     try:
         if not e.init.ok:
             led.failed(engine, "-", SCEN, store, f"upgrade[{engine}/config]: previous init failed: "
-                       f"{e.init.stderr.strip()[-200:]}", "init")
+                       f"{first_error(e.init.stderr)[:300]}", "init")
             return
         # The upgrade order: the previous release ran first, THEN this binary arrives (its
         # `check` may migrate the state, which the previous one could no longer open).
@@ -209,7 +209,7 @@ def _cursor_leg(led: Ledger, prev: Path, root: Path, engine: str, url: str, stat
         else:
             led.failed(engine, "-", SCEN, store, f"upgrade[{engine}/cursor/{store}]: prev ok={r1.ok} "
                        f"this ok={r2.ok} (distinct ids, wrong latest, rows)={got} want ({want}, 0, {ROWS + 350}): "
-                       f"{r2.stderr.strip()[-200:]}", "cursor")
+                       f"{first_error(r2.stderr)[:300]}", "cursor")
             return
         if state_url == "":
             _future_leg(led, e, engine)
@@ -236,7 +236,7 @@ def _future_leg(led: Ledger, e: _Env, engine: str) -> None:
                    f"by this v{ver} binary before any part is written")
     else:
         led.failed(engine, "-", SCEN, "future", f"upgrade[{engine}/future]: exit ok={p.ok}, parts "
-                   f"{before}->{e.parquet_count()}: {said.strip()[-200:]}", "future")
+                   f"{before}->{e.parquet_count()}: {first_error(said)[:300]}", "future")
 
 
 def _fresh_leg(led: Ledger, e: _Env, engine: str, want: int) -> None:
@@ -251,7 +251,7 @@ def _fresh_leg(led: Ledger, e: _Env, engine: str, want: int) -> None:
                    f"prefix loses nothing — {want} ids; it re-baselined {again} rows (written again)")
     else:
         led.failed(engine, "-", SCEN, "fresh", f"upgrade[{engine}/fresh]: ok={p.ok} {got}: "
-                   f"{p.stderr.strip()[-200:]}", "fresh")
+                   f"{first_error(p.stderr)[:300]}", "fresh")
 
 
 def _crash_leg(led: Ledger, prev: Path, root: Path, engine: str, url: str, state_url: str) -> None:
@@ -280,7 +280,7 @@ def _crash_leg(led: Ledger, prev: Path, root: Path, engine: str, url: str, state
             led.failed(engine, "-", SCEN, store, f"upgrade[{engine}/crash/{store}]: init ok={e.init.ok} "
                        f"prev crashed={not crashed.ok} this ok={r.ok} pre-crash parts adopted={len(adopted)}/{len(by_prev)} "
                        f"rewritten={len(rewritten)} (rows, ids)={got}: "
-                       f"{r.stderr.strip()[-200:]}", "crash")
+                       f"{first_error(r.stderr)[:300]}", "crash")
     finally:
         _sql(engine, url, f"DROP TABLE IF EXISTS {table};")
 
@@ -369,7 +369,7 @@ def _cdc_leg(led: Ledger, prev: Path, engine: str, url: str) -> None:
         else:
             led.failed(engine, "-", SCEN, "local", f"upgrade[{engine}/cdc]: prev anchor ok={anchored.ok} "
                        f"prev capture ok={first.ok} this ok={cont.ok}; {shown}: "
-                       f"{(cont.stderr or first.stderr or anchored.stderr).strip()[-200:]}", "cdc")
+                       f"{first_error(cont.stderr or first.stderr or anchored.stderr)[:300]}", "cdc")
 
 
 def _load_leg(led: Ledger, prev: Path, root: Path, url: str) -> None:
@@ -406,7 +406,7 @@ def _load_leg(led: Ledger, prev: Path, root: Path, url: str) -> None:
             if not init.ok or not ok:
                 why = init.stderr if not init.ok else ("" if binary is None else p.stderr)
                 led.failed("postgres", "-", SCEN, "load", f"upgrade[postgres/load]: {step} by "
-                           f"{'prev' if binary == prev else 'this'} failed: {why.strip()[-200:]}", step)
+                           f"{'prev' if binary == prev else 'this'} failed: {first_error(why)[:300]}", step)
                 return
         src = _sql("postgres", url, f"SELECT 'rows=' || count(*) FROM {table};")
         m = re.search(r"rows=(\d+)", src.stdout or "") if src.ok else None
@@ -531,7 +531,7 @@ def _continued_key_load_leg(led: Ledger, prev: Path, root: Path, engine: str, ur
         p = run([str(binary), *args, "-c", "c.yaml"], env=env, cwd=d, timeout=None)
         if not p.ok:
             led.failed(*row, f"{tag}: {' '.join(args)} by {'prev' if binary == prev else 'this'} failed: "
-                       f"{p.stderr.strip()[-200:]}", args[0])
+                       f"{first_error(p.stderr)[:300]}", args[0])
         return p if p.ok else None
 
     def loaded() -> list:
@@ -565,7 +565,7 @@ def _continued_key_load_leg(led: Ledger, prev: Path, root: Path, engine: str, ur
             text = (d / "c.yaml").read_text() if init.ok else ""
             if "# keyset_incremental: true" not in text:
                 led.failed(*row, f"{tag}: previous init wrote no keyset_incremental opt-in: "
-                           f"{init.stderr.strip()[-200:]}", "init")
+                           f"{first_error(init.stderr)[:300]}", "init")
                 return
             (d / "c.yaml").write_text(text.replace("# keyset_incremental: true", "keyset_incremental: true", 1))
         export = re.search(r"^\s*- name: (\S+)", (d / "c.yaml").read_text(), re.M).group(1)
