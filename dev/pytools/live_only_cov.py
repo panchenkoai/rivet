@@ -44,7 +44,7 @@ ROOT = Path(__file__).resolve().parents[2]
 # (credential-gated oracle), the other is listed as a candidate for
 # UN-excluding rather than excused. Exceed the ceiling and the tool goes red —
 # the adjudication is graded, not asserted.
-ADJUDICATED: dict[str, tuple[str, int]] = {
+ADJUDICATED: dict[str, tuple[str, int]] = {  # ratchet-pin: live-only-adjudicated sum
     # Excluded as OUTPUT-IDENTICAL (a log line — `-> ()` changes no value, so
     # the lib suite cannot kill it by construction), NOT as unreachable; its
     # oracle is live (roast_mysql_cdc_warns_on_a_minimal_backlog...). 100% of
@@ -65,7 +65,7 @@ ADJUDICATED: dict[str, tuple[str, int]] = {
     # The binary's entry (`main` → `cli::run_binary`): the same measurement, 26 tests.
     "main": ("cli tests spawn the binary; stub fails 26 offline_suite tests", 100),
     "run_binary": ("cli tests spawn the binary; stub fails 26 offline_suite tests", 100),
-}
+}  # ratchet-pin: end
 
 
 def live_only_functions() -> list[tuple[str, str]]:

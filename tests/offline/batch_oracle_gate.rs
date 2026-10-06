@@ -403,7 +403,7 @@ fn every_completeness_named_batch_test_carries_an_independent_oracle() {
     // completeness in its NAME arrives with an independent oracle or does not
     // arrive. Raising this number is a decision someone argues for in the
     // commit that raises it.
-    const WEAK_RATCHET: usize = 0;
+    const WEAK_RATCHET: usize = 0; // ratchet-pin: batch-weak-oracles
     assert_eq!(
         weak.len(),
         WEAK_RATCHET,
