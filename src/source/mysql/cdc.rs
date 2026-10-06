@@ -1088,6 +1088,9 @@ impl MysqlChangeStream {
                         image_names: Some(image_names.clone()),
                         seq: 0, // stamped by TxnSeq as the stream is consumed
                         poison,
+                        row_id: None,
+                        before_names: None,
+                        before_poison: None,
                     };
                     // PER ROW, not per binlog event. One `WriteRows` event carries
                     // MANY rows, so a check after the loop lets the whole event land

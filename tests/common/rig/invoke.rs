@@ -385,6 +385,79 @@ impl Rig {
     pub fn run(&self) -> std::process::Output {
         self.run_args(&[])
     }
+
+    /// [`Rig::run_args_env`] while the cdc-standby primary logs a running-transactions snapshot every 300 ms (what a slot created on its standby waits for).
+    pub fn run_nudged(&self, envs: &[(&str, &str)]) -> std::process::Output {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let nudger = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let mut c = postgres::Client::connect(
+                    crate::common::env::PG_STANDBY_PRIMARY_URL,
+                    postgres::NoTls,
+                )
+                .expect("connect the cdc-standby primary");
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = c.execute("SELECT pg_log_standby_snapshot()", &[]);
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                }
+            })
+        };
+        let out = self.run_args_env(&[], envs);
+        stop.store(true, Ordering::Relaxed);
+        nudger.join().expect("the standby nudger");
+        out
+    }
+
+    /// `rivet doctor --json`, then the run it predicts: panics when doctor reported all_ok and the run refused; returns (doctor's all_ok, the run).
+    pub fn run_after_doctor(&self) -> (bool, std::process::Output) {
+        let doctor = self.cli(&["doctor", "--json"]);
+        let run = self.run();
+        match doctor_agrees_with_run(&doctor.stdout, run.status.success()) {
+            Ok(green) => (green, run),
+            Err(why) => panic!(
+                "{why} — rig '{}', run stderr:\n{}",
+                self.name,
+                String::from_utf8_lossy(&run.stderr)
+            ),
+        }
+    }
+}
+
+/// Doctor's all_ok when the run after it agrees, else why not (all_ok, then a refused run); an unreadable report is an error.
+pub(crate) fn doctor_agrees_with_run(report: &[u8], run_ok: bool) -> Result<bool, String> {
+    let v: serde_json::Value = serde_json::from_slice(report).unwrap_or_else(|e| {
+        panic!(
+            "`rivet doctor --json` printed no JSON report ({e}):\n{}",
+            String::from_utf8_lossy(report)
+        )
+    });
+    let green = v["all_ok"]
+        .as_bool()
+        .unwrap_or_else(|| panic!("the doctor report has no `all_ok` bool: {v}"));
+    if green && !run_ok {
+        return Err(format!(
+            "doctor and run disagree: doctor reported all_ok, the run refused; doctor: {v}"
+        ));
+    }
+    Ok(green)
+}
+
+#[test]
+fn a_green_doctor_followed_by_a_refused_run_is_a_disagreement() {
+    let green = br#"{"all_ok": true, "checks": []}"#;
+    let red = br#"{"all_ok": false, "checks": []}"#;
+    assert!(doctor_agrees_with_run(green, false).is_err());
+    assert_eq!(doctor_agrees_with_run(green, true), Ok(true));
+    assert_eq!(doctor_agrees_with_run(red, false), Ok(false));
+    assert_eq!(doctor_agrees_with_run(red, true), Ok(false));
+}
+
+#[test]
+#[should_panic(expected = "no `all_ok` bool")]
+fn a_doctor_report_without_all_ok_is_an_error_not_agreement() {
+    let _ = doctor_agrees_with_run(br#"{"ok": true}"#, false);
 }
 
 /// A live `rivet run` child of [`Rig::spawn_args_env`]: a `Child` (by deref) whose reaping grades the run when it exited 0.

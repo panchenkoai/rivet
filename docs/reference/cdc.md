@@ -574,6 +574,79 @@ delete   {"file":"binlog.000046","pos":683} 0      2    bob     200
 - the source columns, **typed** (resolved from the source schema), carrying the
   **after-image** for insert/update and the **key (before-image)** for delete.
 
+**An UPDATE that changes the key** is written as two rows: a `delete` of the old
+key, then an `insert` of the new row, at the same `__pos` with the insert's
+`__seq` after the delete's ([ADR-0030](../adr/0030-primary-key-update-representation.md)).
+So the MERGE below retracts the old key with no extra step. The key is the
+export's declared `load.pk:` when there is one, otherwise the table's primary
+key, read from the source at the start of the run. `pk: none` means no key, so
+nothing is split. A declared key column the table does not have fails the run at
+the start, naming the column. SQL Server's change table already records an
+UPDATE of the primary key as a delete and an insert. This was measured with a
+clustered key and with a nonclustered key on a heap; rivet reads only the new row
+of any other UPDATE. MongoDB's `_id` cannot change.
+
+An UPDATE counts as a key change only when its old image carries EVERY key
+column and one of them differs. A column the old image does not carry is absent,
+not NULL. On PostgreSQL the old image is what the replica identity logs: the
+whole row under `REPLICA IDENTITY FULL`, and otherwise only the identity's
+columns, and only when one of them changes. So an UPDATE that changes a key
+column the identity does not log stays one `update`, and its old key stays live
+downstream. This happens under `REPLICA IDENTITY USING INDEX` on an index that is
+not the key, and with a declared `load.pk:` that is not the primary key. Use
+`REPLICA IDENTITY FULL` for such a table.
+
+**A statement that renumbers keys.** Oracle checks uniqueness per statement, so
+`UPDATE t SET id = id + 1` is logged as `1 -> 2`, then `2 -> 3`. The delete of 2
+belongs to the row that held 2 before the statement, not to the row that just
+moved into it, and rivet orders it before that row's insert. It tells the two
+rows apart by LogMiner's `ROW_ID`, so rows whose other columns are equal (a
+junction table) keep every row. On a heap table without row movement, a change
+whose `ROW_ID` is missing is refused (`RIVET_SOURCE_CDC_UNDECODABLE`) rather than
+guessed.
+
+What this does not handle:
+
+- **An Oracle table whose ROWID can change inside a transaction.** This is an
+  index-organized table (LogMiner gives every row of one the same placeholder
+  `ROW_ID`) or a table with `ENABLE ROW MOVEMENT` (an UPDATE that moves a row to
+  another partition reports the row's old `ROW_ID`, and the row's next change its
+  new one). There rivet compares images instead, and a renumber over rows whose
+  non-key columns are all equal loses a row. The same applies to PostgreSQL with
+  a `DEFERRABLE` primary key under `REPLICA IDENTITY FULL`, which carries no row
+  identity.
+- **A key change the old image cannot show stays one `update`, and its old key
+  stays live.** Nothing warns about these cases:
+  - PostgreSQL under `REPLICA IDENTITY FULL`, with a declared `load.pk:` column
+    that goes from NULL to a value. `test_decoding` does not print the NULL old
+    cell, so the old image does not carry that key column.
+  - MySQL with a session-level `binlog_row_image = NOBLOB` (the global setting is
+    refused at the start), when one UPDATE changes both the key and a BLOB/TEXT
+    column. The old image then lacks the unchanged BLOBs and cannot be read by
+    name.
+  - SQL Server with a declared `load.pk:` that is not the primary key. An UPDATE
+    of that column is an update in place, and rivet reads only the new row.
+- **A PostgreSQL table whose changes carry no old image.** This covers four
+  cases:
+  - a table with `REPLICA IDENTITY NOTHING`;
+  - `REPLICA IDENTITY USING INDEX` on an index that has since been dropped, which
+    PostgreSQL treats as `NOTHING`;
+  - a table without a primary key under `REPLICA IDENTITY DEFAULT`;
+  - a table whose primary key is `DEFERRABLE` (PostgreSQL does not use a
+    deferrable key as the replica identity). An UPDATE on
+  such a table carries no old values, and a DELETE carries no columns at all. So a
+  key change stays one `update` and the old key stays live, and a DELETE retracts
+  nothing downstream. The run warns at the start, naming each such table
+  schema-qualified, with its remedy: `REPLICA IDENTITY FULL`; for a deferrable
+  key, also `REPLICA IDENTITY USING INDEX` on a non-deferrable unique index (which
+  then rejects `SET id = id + 1`); for a dropped index, an existing one; for no
+  key, a primary key.
+
+An old-image cell rivet cannot decode (`infinity`, a BC date, 24:00) refuses the
+run only where the old image is written: the delete of a key change, and the
+`before` of `rivet cdc` NDJSON. An UPDATE that keeps its key is delivered as
+before.
+
 Downstream applies it by primary key:
 
 ```sql
@@ -658,8 +731,15 @@ all cycles, which is the intended at-least-once stream — dedupe by PK + `__op`
 `__pos` downstream, and archive parts you have already loaded if you want the
 prefix to stay small.
 
-Without `--output`, rivet emits the same information as NDJSON (one JSON object
-per change) to stdout.
+Without `--output`, rivet emits the changes as NDJSON (one JSON object per change)
+to stdout, as the engine delivered them: `op`, `schema`, `table`, `before`,
+`after`, `pos`, `seq`. NDJSON is NOT split: a key change is one `update` line.
+`before` holds the old image's cells in the order the engine logged them. On
+PostgreSQL every UPDATE that carries an old image also gets `before_columns`, which
+names those cells. That is the replica identity's columns, or under
+`REPLICA IDENTITY FULL` the whole old row minus its NULL cells, which
+`test_decoding` does not print. A column `before_columns` does not name was
+either not logged or NULL.
 
 ## Why CDC is gentle on the source
 

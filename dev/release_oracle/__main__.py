@@ -590,6 +590,9 @@ def _self_test() -> int:
     state_parity_duckdb._self_test()
     print("self-test ok: state parity excludes surrogate keys by rule and compares a reference by content")
     _stages_self_test()
+    from . import upgrade_matrix
+
+    upgrade_matrix._self_test()
     skip_census._self_test()
     print("\nregression stage (child harness, stand, banner):")
     return regression._self_test()

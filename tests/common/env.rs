@@ -72,6 +72,11 @@ pub const POSTGRES_CDC_URL: &str = "postgresql://rivet:rivet@127.0.0.1:5434/rive
 pub const MYSQL_CDC_URL: &str = "mysql://rivet:rivet@127.0.0.1:3307/rivet";
 pub const MSSQL_CDC_URL: &str = "sqlserver://sa:Rivet_Passw0rd!@127.0.0.1:1434/rivet";
 
+/// The `cdc-standby` profile (`python3 -m dev.pytools.cdc_stand standby`): a PostgreSQL 16
+/// primary and its streaming replica, which [`crate::common::Rig::pg_cdc_standby`] captures from.
+pub const PG_STANDBY_PRIMARY_URL: &str = "postgresql://rivet:rivet@127.0.0.1:5437/rivet";
+pub const PG_STANDBY_URL: &str = "postgresql://rivet:rivet@127.0.0.1:5436/rivet";
+
 /// SQL Server for the CONCURRENCY GOVERNOR canaries (`service: mssql-governor`,
 /// port :1435, `governor` profile).
 ///

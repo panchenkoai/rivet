@@ -118,7 +118,7 @@ pub(crate) enum SpooledTail {
     /// One transaction: the tail's last row closes it.
     One(SpooledTx),
     /// Several transactions (SQL Server): each row's successor decides whether it closes one.
-    Groups(SpooledGroups),
+    Groups(Box<SpooledGroups>),
 }
 
 impl TxBuffer {
@@ -237,7 +237,7 @@ impl TxBuffer {
             &mut head,
             tail.as_ref().and_then(SpooledGroups::first_position),
         );
-        Ok((head, tail.map(SpooledTail::Groups)))
+        Ok((head, tail.map(|g| SpooledTail::Groups(Box::new(g)))))
     }
 }
 
@@ -350,6 +350,9 @@ mod tests {
             image_names: None,
             seq: 0,
             poison: None,
+            row_id: None,
+            before_names: None,
+            before_poison: None,
         }
     }
 

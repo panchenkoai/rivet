@@ -546,6 +546,134 @@ fn a_change_that_moves_a_row_to_another_partition_lands_in_its_new_day() {
     );
 }
 
+/// A key move in the same day and a key move into another day (ADR-0030): each leaves its old key
+/// flagged and ONE live row under the new key, in its new day.
+fn key_move_cycle(mut scn: CdcScenario, bq: &BqLive) {
+    let table = scn.table.clone();
+    let changes = format!("{table}__changes");
+    let _cleanup = bq.cleanup(&[&table, &changes]);
+    scn.sql(&format!(
+        "INSERT INTO {table} (id, v, created_at) VALUES (1, 1, '2024-01-01 00:00:00'), \
+         (2, 2, '2024-01-01 00:00:00')"
+    ));
+    scn.settle();
+    scn.rig.run_ok();
+    load_ok(&scn.rig);
+    assert_eq!(base_profile(bq, &table), (2, 2, 0, 0, 3));
+    scn.sql(&format!("UPDATE {table} SET id = 11 WHERE id = 1"));
+    scn.sql(&format!(
+        "UPDATE {table} SET id = 12, created_at = '2024-01-02 00:00:00' WHERE id = 2"
+    ));
+    scn.settle();
+    scn.rig.run_ok();
+    load_ok(&scn.rig);
+    let (ok, said) = compact(&scn.rig, &[]);
+    assert!(ok && said.contains("COMPACT OK"), "{said}");
+    assert_eq!(
+        base_profile(bq, &table),
+        (4, 2, 2, 0, 23),
+        "two old keys flagged, two new keys live: no old key left live"
+    );
+    let flagged: Vec<String> = bq
+        .read_bq_rows(&format!(
+            "SELECT CAST(id AS STRING) AS id FROM `{}.{}.{table}` WHERE __is_deleted ORDER BY id",
+            bq.project, bq.dataset
+        ))
+        .iter()
+        .map(|r| r["id"].as_str().expect("id").to_string())
+        .collect();
+    assert_eq!(flagged, ["1", "2"], "the flagged rows are the old keys");
+    assert_eq!(
+        row_of(bq, &table, 11),
+        (Some(1), Some("2024-01-01 00:00:00".to_string()))
+    );
+    assert_eq!(
+        row_of(bq, &table, 12),
+        (Some(2), Some("2024-01-02 00:00:00".to_string())),
+        "the key that also changed day lives in its new day"
+    );
+}
+
+/// The day-partitioned key-move cycle with the shape every test here uses.
+fn key_move_shape(rig: Rig, table: &str, bq: &BqLive) -> Rig {
+    rig.cdc("backfill: auto")
+        .also_batch_export("baseline", table, "full")
+        .dest_gcs_live(&bq.bucket, &bq.prefix)
+        .top_line(&bq.load_line(", pk: [id], partition: { column: created_at, granularity: day }"))
+}
+
+#[test]
+#[ignore = "live: requires mysql-cdc + BigQuery creds"]
+fn a_key_move_leaves_one_live_row_per_key_in_a_partitioned_base_mysql() {
+    let Some(bq) = BqLive::from_env("compact_kmv_my") else {
+        return;
+    };
+    let scn = CdcScenario::mysql_with(
+        "compact_kmv_my",
+        "id BIGINT PRIMARY KEY, v INT, created_at DATETIME NULL",
+        |r, t| key_move_shape(r, t, &bq),
+    );
+    key_move_cycle(scn, &bq);
+}
+
+/// PostgreSQL's delete carries the old key alone, so its old day is found in the base by key.
+#[test]
+#[ignore = "live: requires postgres-cdc + BigQuery creds"]
+fn a_key_move_leaves_one_live_row_per_key_in_a_partitioned_base_postgres() {
+    let Some(bq) = BqLive::from_env("compact_kmv_pg") else {
+        return;
+    };
+    let scn = CdcScenario::pg_with(
+        "compact_kmv_pg",
+        "id BIGINT PRIMARY KEY, v INT, created_at TIMESTAMP NULL",
+        |r, t| key_move_shape(r, t, &bq),
+    );
+    key_move_cycle(scn, &bq);
+}
+
+/// REPLICA IDENTITY USING INDEX on a non-key `email`: an UPDATE of `email` logs the old `email`
+/// alone, which is not a key change, so the buffer holds one update and no NULL-keyed delete.
+#[test]
+#[ignore = "live: requires postgres-cdc + BigQuery creds"]
+fn an_update_of_a_replica_identity_index_reaches_the_base_as_one_update_postgres() {
+    let Some(bq) = BqLive::from_env("compact_idx_pg") else {
+        return;
+    };
+    let mut scn = CdcScenario::pg_with(
+        "compact_idx_pg",
+        "id BIGINT PRIMARY KEY, email TEXT NOT NULL, v INT",
+        |r, t| tombstone_shape(r, t, "id", &bq),
+    );
+    let table = scn.table.clone();
+    let changes = format!("{table}__changes");
+    let _cleanup = bq.cleanup(&[&table, &changes]);
+    scn.sql(&format!(
+        "CREATE UNIQUE INDEX {table}_email ON {table} (email); \
+         ALTER TABLE {table} REPLICA IDENTITY USING INDEX {table}_email; \
+         INSERT INTO {table} VALUES (1, 'a@x', 1), (2, 'b@x', 2)"
+    ));
+    scn.rig.run_ok();
+    load_ok(&scn.rig);
+    scn.sql(&format!("UPDATE {table} SET email = 'c@x' WHERE id = 1"));
+    scn.rig.run_ok();
+    load_ok(&scn.rig);
+    assert_eq!(
+        (
+            bq.read_bq_count_where(&changes, "__op = 'delete'"),
+            bq.read_bq_count_where(&changes, "id IS NULL")
+        ),
+        ("0".to_string(), "0".to_string()),
+        "the buffer holds the update alone"
+    );
+    let (ok, said) = compact(&scn.rig, &[]);
+    assert!(ok && said.contains("COMPACT OK"), "{said}");
+    assert_eq!(base_profile(&bq, &table), (2, 2, 0, 0, 3));
+    assert_eq!(
+        bq.read_bq_count_where(&table, "id = 1 AND email = 'c@x'"),
+        "1"
+    );
+}
+
 /// Two `rivet compact` of one table AT ONCE (a scheduler double-fire): the lease
 /// admits one; the other is refused by name — or, arriving after the winner's
 /// DROP, finds no buffer. Either way the base ends with each change applied
