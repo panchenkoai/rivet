@@ -35,7 +35,7 @@ INDEPENDENT = re.compile(
 )
 
 #: `file::test` → why it is allowed today. Shrink-only.
-SELF_ONLY: dict[str, str] = {
+SELF_ONLY: dict[str, str] = {  # ratchet-pin: self-only-tests strings
     "audit_repair.rs::audit_repair_then_reconcile_converges": "listed 2026-09-27",
     "live_cdc.rs::cdc_crash_after_flush_before_ack_re_reads_on_resume": "listed 2026-09-27",
     "live_cdc.rs::cdc_idle_first_run_then_change_is_captured_not_skipped": "listed 2026-09-27",
@@ -57,7 +57,7 @@ SELF_ONLY: dict[str, str] = {
     "live_cdc_mssql.rs::mssql_cdc_resume_captures_only_new_changes": "listed 2026-09-27",
     "live_keyset_parallel.rs::parallel_keyset_midrange_error_counts_pre_failure_page_parts_postgres": "listed 2026-09-27",
     "live_pg_state.rs::pg_metrics_record_and_query": "listed 2026-09-27",
-}
+}  # ratchet-pin: end
 
 
 def tests_in(text: str) -> list[tuple[str, str]]:

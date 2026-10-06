@@ -26,7 +26,7 @@ const MATRIX: &str = "docs/attestation-matrix.yaml";
 /// without saying why in the row itself.
 /// History: 2 -> 1 (`part_rows`, footer vs manifest) -> 0 (`schema_fingerprint`,
 /// sensitivity to real DDL). At zero, a NEW unverified claim is a deliberate act.
-const UNVERIFIED_RATCHET: usize = 0;
+const UNVERIFIED_RATCHET: usize = 0; // ratchet-pin: unverified-claims
 
 fn claims() -> Vec<Value> {
     let s = super::nonvacuity::subject_text(MATRIX);

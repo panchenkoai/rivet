@@ -41,8 +41,18 @@ FIRST_RUN = {"SKIP": "the stream's first run delivered nothing", "PARTIAL": "the
 #: first-run 61, all MySQL checkpoints a test wrote itself; with Rig::pin_binlog_here recording their anchor: 0.
 #: `deferred`: the capped `rivet cdc` runs a lane runs (each owes its remainder to the stream's next run, graded there).
 VERDICT_CEILINGS: dict[str, dict[str, tuple[int, int]]] = {
-    "ci": {"first-run": (0, 0), "skip": (49, 3), "partial": (39, 3), "deferred": (6, 0)},
-    "gate": {"first-run": (0, 0)},
+    "ci": {
+        "first-run": (0,  # ratchet-pin: rig-oracle-first-run
+                      0),
+        "skip": (49,  # ratchet-pin: rig-oracle-skip
+                 3),
+        "partial": (39,  # ratchet-pin: rig-oracle-partial
+                    3),
+        "deferred": (6,  # ratchet-pin: rig-oracle-deferred
+                     0),
+    },
+    "gate": {"first-run": (0,  # ratchet-pin: rig-oracle-first-run-gate
+                           0)},
 }
 
 
