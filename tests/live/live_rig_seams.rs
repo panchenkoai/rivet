@@ -23,7 +23,7 @@ fn doctor_and_the_run_it_predicts_agree_on_a_fresh_postgres_stream() {
     s.insert(1);
     doctor_green_then_run_ok(&s.rig);
     assert_eq!(
-        manifest_rows(&s.rig.out_dir()),
+        read_cdc_changes(&s.rig.out_dir()).len(),
         1,
         "the run delivered the one change"
     );
@@ -37,7 +37,7 @@ fn doctor_and_the_run_it_predicts_agree_on_a_fresh_mysql_stream() {
     s.insert(1);
     doctor_green_then_run_ok(&s.rig);
     assert_eq!(
-        manifest_rows(&s.rig.out_dir()),
+        read_cdc_changes(&s.rig.out_dir()).len(),
         1,
         "the run delivered the one change"
     );
@@ -52,7 +52,7 @@ fn doctor_and_the_run_it_predicts_agree_on_a_fresh_sql_server_stream() {
     s.settle();
     doctor_green_then_run_ok(&s.rig);
     assert_eq!(
-        manifest_rows(&s.rig.out_dir()),
+        read_cdc_changes(&s.rig.out_dir()).len(),
         1,
         "the run delivered the one change"
     );
@@ -66,7 +66,7 @@ fn doctor_and_the_run_it_predicts_agree_on_a_fresh_mongo_stream() {
     s.insert(1);
     doctor_green_then_run_ok(&s.rig);
     assert_eq!(
-        manifest_rows(&s.rig.out_dir()),
+        read_mongo_cdc_changes(&s.rig.out_dir()).len(),
         1,
         "the run delivered the one change"
     );
@@ -82,7 +82,7 @@ fn doctor_and_the_run_it_predicts_agree_on_a_fresh_oracle_stream() {
     ora_exec(&format!("INSERT INTO {} VALUES (1, 1)", t.name()));
     doctor_green_then_run_ok(&rig);
     assert_eq!(
-        manifest_rows(&rig.out_dir()),
+        read_cdc_changes(&rig.out_dir()).len(),
         1,
         "the run delivered the one change"
     );
