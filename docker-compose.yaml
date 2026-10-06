@@ -643,7 +643,9 @@ services:
     image: edoburu/pgbouncer:latest
     profiles: ["pool"]
     environment:
-      DATABASE_URL: "postgres://rivet:rivet@postgres-state:5432/rivet_state_bouncer"
+      # No database name: the image then routes EVERY database name to postgres-state (`* =`), so a
+      # test pools a scratch database of its own rather than one the stand was given by hand.
+      DATABASE_URL: "postgres://rivet:rivet@postgres-state:5432"
       POOL_MODE: transaction
       DEFAULT_POOL_SIZE: 1  # one server connection: every client shares it, deterministically
       MAX_CLIENT_CONN: 50

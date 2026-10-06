@@ -96,6 +96,7 @@ impl Decisions {
 /// pure function next door plus its unit test, which is what the six
 /// extractions this ledger was born from ended up as.
 const BASELINE: &[(&str, usize, usize, usize, usize)] = &[
+    // ratchet-pin: live-only-purity sum
     // ── qualified exclusions (`Type::f`, `<impl Tr for T>::f`) ─────────────
     // Visible to this gate since 2026-09-23: the parser read only a bare leading
     // identifier, so every qualified whole-function exclusion was skipped and
@@ -214,7 +215,7 @@ const BASELINE: &[(&str, usize, usize, usize, usize)] = &[
     // `TargetFailTally::add_export`, where the in-diff gate's `+=` → `*=`/`-=`
     // mutants are graded instead of MISSED.
     ("src/preflight/mod.rs::check", 2, 0, 5, 1),
-];
+]; // ratchet-pin: end
 
 // ── reading the live-only set out of the mutation config ─────────────────
 

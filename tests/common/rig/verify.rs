@@ -43,6 +43,38 @@ impl Rig {
         said
     }
 
+    /// Pin this MySQL CDC rig's stream at the server's current binlog position: its checkpoint, and the oracle's anchor image at that position.
+    pub fn pin_binlog_here(&self) {
+        use mysql::prelude::Queryable as _;
+        assert_eq!(
+            self.source_type, "mysql",
+            "a binlog pin is a MySQL checkpoint"
+        );
+        let ckpt = self.checkpoint();
+        let _ = std::fs::remove_file(&ckpt);
+        let mut c = mysql::Pool::new(self.source_url.as_str())
+            .expect("mysql pool")
+            .get_conn()
+            .expect("mysql conn");
+        // `SHOW BINARY LOG STATUS` from 8.2 on (8.4 removed the old form), else `SHOW MASTER STATUS`.
+        let row: mysql::Row = c
+            .query_first("SHOW BINARY LOG STATUS")
+            .or_else(|_| c.query_first("SHOW MASTER STATUS"))
+            .expect("binlog status")
+            .expect("binlog enabled");
+        let (file, pos): (String, u64) = (row.get(0).unwrap(), row.get(1).unwrap());
+        if self.oracle_off.is_none() {
+            crate::common::verify::anchor_streams_here(&self.config_path());
+        }
+        std::fs::write(&ckpt, format!(r#"{{"file":"{file}","pos":{pos}}}"#))
+            .expect("write the checkpoint");
+    }
+
+    /// Move this rig's CDC checkpoint `from` -> `to` for runs from `cwd`; the oracle's stream follows the file.
+    pub fn move_checkpoint(&self, from: &Path, to: &Path, cwd: &Path) {
+        crate::common::verify::move_checkpoint(&self.config_path(), cwd, from, to);
+    }
+
     /// Start grading `argv` through the config-derived oracle, unless this rig opted out.
     pub(crate) fn oracle_begin(
         &self,

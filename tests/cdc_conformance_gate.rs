@@ -916,7 +916,7 @@ fn oracle_class_census_is_pinned() {
 // 2026-10-03: +3 independent - the BigQuery truncate re-baseline cell (read through `bq`), and the PG
 // single- and multi-table truncate re-baseline cells, classed by the `query_one(` that reads the slot's
 // truncate LSN; their row oracle is arrow plus the default oracle.
-const PIN_INDEPENDENT: usize = 111;
+const PIN_INDEPENDENT: usize = 111; // ratchet-pin: cdc-census-independent min
 // 2026-09-28, source connection ceilings: +3 shared codec — the run's captured row is the
 // fixture check; the oracle is the server's own connection counter.
 // 2026-09-29: +2 shared codec — the Oracle TRUNCATE refusal on re-run and the uncaptured-truncate cell.
@@ -929,8 +929,8 @@ const PIN_INDEPENDENT: usize = 111;
 // snapshot through `dir_parquet_id_set` / `dir_parquet_i64` (arrow); each run is graded by the default oracle.
 // 2026-10-03: +2 shared codec - the PG multi-table slot-loss re-baseline cell, and the Oracle log-gap
 // refusal, which now follows its remedy and reads the baseline with arrow (was presence).
-const PIN_SHARED_CODEC: usize = 100;
-const PIN_SELF_COUNTER: usize = 6;
+const PIN_SHARED_CODEC: usize = 100; // ratchet-pin: cdc-census-shared-codec
+const PIN_SELF_COUNTER: usize = 6; // ratchet-pin: cdc-census-self-counter
 // 2026-09-28: +1 presence — the SQL Server undecodable-cell refusal, whose oracle is the refusal.
 // 2026-09-29: +2 presence — the PG CDC LMT-timezone and DOMAIN parity cells compare CDC to batch output.
 // 2026-09-29: +2 presence — the MySQL out-of-range TIME and Oracle int-override refusals, whose oracle is the refusal plus the unmoved checkpoint.
@@ -946,7 +946,7 @@ const PIN_SELF_COUNTER: usize = 6;
 // 2026-10-02: +1 presence — the MySQL failover refusal, whose oracle is the refusal plus the unmoved checkpoint and parts.
 // 2026-10-03: -1 presence — mongo_cdc_initial_snapshot_covers_preexisting_rows moved to independent.
 // 2026-10-03: -1 presence — oracle_cdc_resume_past_log_retention_fails_loudly moved to shared codec.
-const PIN_PRESENCE: usize = 84;
+const PIN_PRESENCE: usize = 84; // ratchet-pin: cdc-census-presence
 
 /// TIER 2 (harness audit, 2026-08-29): a test whose NAME makes a
 /// COMPLETENESS claim must carry a class-(a) INDEPENDENT oracle — not merely

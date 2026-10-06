@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# No attribution trailers (stripped in place), and the repository is English-only (see .githooks/no-cyrillic).
+# No attribution trailers (stripped in place); then the message rules in dev/pytools/pr_ready.py.
 set -euo pipefail
 "$(dirname "$0")/strip-trailers" "$1"
-exec "$(dirname "$0")/no-cyrillic" --message "$1"
+exec python3 "$(dirname "$0")/../dev/pytools/pr_ready.py" text --message "$1"

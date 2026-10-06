@@ -62,6 +62,7 @@ from . import (
     release_path,
     scenarios,
     shared_state,
+    skip_census,
     state_parity,
     tls_downgrade,
     upgrade,
@@ -204,6 +205,42 @@ def _gate_modules() -> list[object]:
     return mods + [sys.modules[__name__]]
 
 
+def _raising_stage_self_test() -> None:
+    """A stage whose setup raises records one FAIL row naming it and its first error line; the run still reports NOT RELEASABLE and exits 1."""
+    import contextlib
+    import io
+    import types
+
+    from . import core
+
+    def verify_boom(led: Ledger, engine: str) -> None:
+        raise SystemExit("uv sync in /x/tree failed:\n  × Failed to build `pyarrow==18.1.0`")
+
+    m = types.ModuleType("probe_raising_stage")
+    m.verify_boom = verify_boom
+    m.verify_after = lambda led: led.passed("-", "-", "after", "-", "the next stage still ran")
+    record_stage_runs([m])
+    led = Ledger(colour=False)
+    out = io.StringIO()
+    saved = core.TIMINGS_HISTORY
+    with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(out), \
+            contextlib.redirect_stderr(io.StringIO()):
+        core.TIMINGS_HISTORY = Path(tmp) / "timings.jsonl"
+        try:
+            m.verify_boom(led, "postgres")
+            m.verify_after(led)
+            rc = led.report()
+            wrote = core.TIMINGS_HISTORY.read_text()
+        finally:
+            core.TIMINGS_HISTORY = saved
+    fails = [c for c in led.cells if c.status is Status.FAIL]
+    assert len(fails) == 1 and fails[0].scenario == "verify_boom" and fails[0].engine == "postgres", led.cells
+    assert fails[0].detail == "verify_boom raised SystemExit: uv sync in /x/tree failed:", fails[0].detail
+    assert [c.scenario for c in led.cells] == ["verify_boom", "after"], led.cells
+    assert rc == 1 and "NOT RELEASABLE" in out.getvalue() and '"verdict": "NOT RELEASABLE"' in wrote, (rc, wrote)
+    print("self-test ok: a stage that raises is one FAIL row naming it; the gate still reports and exits 1")
+
+
 def _stages_self_test() -> None:
     """Stage recording counts the rows a stage adds; the end-of-run matrix check fails on a stage that never ran or graded nothing; the real matrix resolves to recorded stages."""
     import types
@@ -227,6 +264,7 @@ def _stages_self_test() -> None:
     record_stage_runs([m])
     m.verify_a(probe)
     assert STAGES_RUN["verify_a"] == 2, "re-recording must not wrap the wrapper"
+    _raising_stage_self_test()
     doc = {
         "preflights": [{"id": "a", "status": "test"}, {"id": "off", "status": "gap"}],
         "infra": [{"id": "undriven", "status": "test"}],
@@ -404,7 +442,8 @@ def _self_test() -> int:
             assert rows.get("battery") == want, probe.cells
         # A self-skip in the battery fails its row unless another stage grades that test.
         for skipped, want in (("other::t — X unset", Status.FAIL),
-                              (f"{_sc.STATE_URL_LIB_TESTS[0]} — RIVET_TEST_STATE_URL unset", Status.PASS)):
+                              ("state::row::tests::pg_accessor_reads_every_integer_width_and_refuses_other_types"
+                               " — RIVET_TEST_STATE_URL unset", Status.PASS)):
             def _skipping_run(argv, env=None, _line=skipped, **_k):
                 if "llvm-cov" in argv:
                     return _core.Proc(list(argv), 1, "", "")
@@ -417,9 +456,17 @@ def _self_test() -> int:
             assert rows.get("battery") == want, (skipped, probe.cells)
     finally:
         _sc.run, _sc.have = real_run, real_have
-    names = _sc.STATE_URL_LIB_TESTS
-    assert _sc.libtest_unrun("running 0 tests\ntest result: ok. 0 passed", names) == list(names)
-    assert _sc.libtest_unrun("".join(f"test {n} ... ok\n" for n in names), names) == []
+    from . import state_lib as _sl
+    assert _sl.vacuous("running 0 tests\ntest result: ok. 0 passed; 0 failed", {}), "a zero-match filter graded nothing"
+    assert _sl.vacuous("test result: ok. 9 passed; 0 failed", {"state::x::t": "RIVET_TEST_STATE_URL unset"})
+    assert _sl.vacuous("test result: ok. 9 passed; 0 failed", {}) == []
+    import subprocess
+    _a = _sl.argv()
+    _seen = subprocess.run(_a[:_a.index("cargo")] + ["printenv"], capture_output=True, text=True,
+                           env={**os.environ, "RIVET_STATE_URL": "postgresql://x", "RIVET_GATE_STATE_URL": "postgresql://x",
+                                "RIVET_TEST_STATE_URL": "postgresql://t"}).stdout
+    assert "RIVET_TEST_STATE_URL=postgresql://t" in _seen and "RIVET_STATE_URL=" not in _seen.replace(
+        "RIVET_TEST_STATE_URL=", "") and "RIVET_GATE_STATE_URL" not in _seen, "the state lib tests see only RIVET_TEST_STATE_URL"
     print("self-test ok: without cargo-llvm-cov the offline battery is still graded, its self-skips too")
     # A graded harm counter past prev × tol + slack fails; noise within it passes; a counter
     # only one binary records is not compared.
@@ -543,8 +590,6 @@ def _self_test() -> int:
     state_parity_duckdb._self_test()
     print("self-test ok: state parity excludes surrogate keys by rule and compares a reference by content")
     _stages_self_test()
-    from . import skip_census
-
     skip_census._self_test()
     print("\nregression stage (child harness, stand, banner):")
     return regression._self_test()
@@ -1290,6 +1335,8 @@ def main(argv: list[str] | None = None) -> int:
     led = Ledger()
     work = Path(tempfile.mkdtemp(prefix="rivet-oracle-"))
     os.environ["WORK"] = str(work)
+    # Every live test this gate starts appends its rig oracle verdict here; verify_oracle_verdict_census grades it.
+    os.environ["RIVET_ORACLE_LOG"] = str(work / "rivet-oracle.log")
     try:
         from datetime import datetime, timezone
 
@@ -1377,6 +1424,7 @@ def main(argv: list[str] | None = None) -> int:
             ])
         # Last: it runs every live_suite test no cell above already ran.
         live_modules.verify_live_modules(led)
+        skip_census.verify_oracle_verdict_census(led)
         verify_seeded_recall(led, ns.with_seeded_recall)
         verify_no_invariant_violations(led)
         # Only a FULL run can say a known red no longer fires.

@@ -95,7 +95,7 @@ jobs:
           # it every test that writes a shared workdir EACCESes — the first
           # nightly after the cdc-oracle suite landed failed exactly there.
           mkdir -p tests/.live-tmp
-          docker compose --profile pool --profile loaders --profile cdc --profile replica --profile governor up -d postgres postgres-state mysql mssql mssql-governor minio fake-gcs azurite toxiproxy pgbouncer proxysql duckdb clickhouse postgres-cdc mysql-cdc mssql-cdc mysql-primary mysql-replica mysql-replica-nolog oracle
+          docker compose --profile pool --profile loaders --profile cdc --profile replica --profile governor up -d postgres postgres-state mysql mssql mssql-governor minio fake-gcs azurite toxiproxy pgbouncer pgbouncer-state proxysql duckdb clickhouse postgres-cdc mysql-cdc mssql-cdc mysql-primary mysql-replica mysql-replica-nolog oracle
           sudo chmod -R 0777 tests/.live-tmp
 
       - name: Wait for services
@@ -109,6 +109,8 @@ jobs:
           for i in $(seq 1 30); do docker compose exec -T mysql mysqladmin ping -h localhost -uroot -privet 2>/dev/null && break || sleep 2; done
           echo "Waiting for pgBouncer..."
           for i in $(seq 1 30); do (exec 3<>/dev/tcp/127.0.0.1/6432) 2>/dev/null && break || sleep 1; done
+          echo "Waiting for pgBouncer in front of the state server..."
+          for i in $(seq 1 30); do (exec 3<>/dev/tcp/127.0.0.1/6433) 2>/dev/null && break || sleep 1; done
           echo "Waiting for ProxySQL..."
           # 6033 is the client-facing MySQL protocol port; 6032 admin comes
           # up first but we wait for 6033 so backend wiring is in place.
