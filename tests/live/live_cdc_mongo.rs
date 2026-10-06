@@ -376,6 +376,38 @@ fn roast_corrupt_checkpoint_fails_loudly_not_silent_reanchor() {
 
     // The run must FAIL — never exit 0 having silently re-anchored past the change.
     let _stderr = rig.run_expect_fail();
+
+    // `rivet doctor` reads the same file and must FAIL it with the run's remedy:
+    // unparseable first, then valid JSON that holds no resume token.
+    for (file, why) in [
+        (&b"{ not valid json at all"[..], "is corrupt or truncated"),
+        (&b"{}"[..], "the run refuses this file"),
+    ] {
+        std::fs::write(rig.checkpoint(), file).unwrap();
+        let doc = rig.cli(&["doctor", "--json"]);
+        let report: serde_json::Value =
+            serde_json::from_slice(&doc.stdout).expect("doctor --json output");
+        let check = report["checks"]
+            .as_array()
+            .expect("checks array")
+            .iter()
+            .find(|c| {
+                c["name"]
+                    .as_str()
+                    .is_some_and(|n| n.starts_with("CDC checkpoint (export '"))
+            })
+            .unwrap_or_else(|| panic!("doctor ran no CDC checkpoint check: {report}"));
+        assert_eq!(check["ok"], false, "doctor must fail the file: {check}");
+        assert!(
+            check["detail"].as_str().is_some_and(|d| d.contains(why)),
+            "doctor says why ({why}): {check}"
+        );
+        assert_eq!(
+            check["hint"],
+            format!("restore the file, or: {REBASELINE_REMEDY}"),
+            "doctor's remedy is the run's own"
+        );
+    }
 }
 
 #[test]

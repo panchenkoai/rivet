@@ -863,6 +863,44 @@ fn oracle_checks(
     Ok(())
 }
 
+/// The replica-set requirement and the declared capture-fidelity tier of a probed server.
+fn mongo_capability_verdicts(
+    cap: &crate::source::mongo::cdc::MongoCdcCapability,
+) -> Vec<DoctorCheck> {
+    vec![
+        // Hard requirement: change streams need a replica set.
+        check(
+            "CDC replica set".into(),
+            cap.is_replica_set,
+            Some(if cap.is_replica_set {
+                format!("replica set (server {})", cap.server_version)
+            } else {
+                format!(
+                    "server {} is standalone — change streams unavailable",
+                    cap.server_version
+                )
+            }),
+            (!cap.is_replica_set).then(|| {
+                "MongoDB change streams require a replica set (a single-node one is fine): restart \
+                 mongod with --replSet and run rs.initiate()"
+                    .to_string()
+            }),
+        ),
+        // The fidelity tier — informational (never a failure), but hinted for upgrade
+        // on the degraded tier so the degrade is declared, not silent.
+        check(
+            "CDC capture tier".into(),
+            true,
+            Some(cap.tier().to_string()),
+            (cap.major < 6).then(|| {
+                "upgrade to MongoDB 6.0+ and enable changeStreamPreAndPostImages for point-in-time \
+                 post-images and delete pre-images"
+                    .to_string()
+            }),
+        ),
+    ]
+}
+
 fn mongo_checks(
     url: &str,
     tls: Option<&crate::config::TlsConfig>,
@@ -912,42 +950,50 @@ fn mongo_checks(
             )),
         }
     }
-    // Hard requirement: change streams need a replica set.
-    checks.push(check(
-        "CDC replica set".into(),
-        cap.is_replica_set,
-        Some(if cap.is_replica_set {
-            format!("replica set (server {})", cap.server_version)
-        } else {
-            format!(
-                "server {} is standalone — change streams unavailable",
-                cap.server_version
-            )
-        }),
-        (!cap.is_replica_set).then(|| {
-            "MongoDB change streams require a replica set (a single-node one is fine): restart \
-             mongod with --replSet and run rs.initiate()"
-                .to_string()
-        }),
-    ));
-    // The fidelity tier — informational (never a failure), but hinted for upgrade
-    // on the degraded tier so the degrade is declared, not silent.
-    checks.push(check(
-        "CDC capture tier".into(),
-        true,
-        Some(cap.tier().to_string()),
-        (cap.major < 6).then(|| {
-            "upgrade to MongoDB 6.0+ and enable changeStreamPreAndPostImages for point-in-time \
-             post-images and delete pre-images"
-                .to_string()
-        }),
-    ));
+    checks.extend(mongo_capability_verdicts(&cap));
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A standalone fails with the replica-set remedy; the tier hints an upgrade only below 6.0.
+    #[test]
+    fn mongo_capability_verdicts_fail_a_standalone_and_hint_only_below_six() {
+        let cap = |is_replica_set, major| crate::source::mongo::cdc::MongoCdcCapability {
+            is_replica_set,
+            server_version: format!("{major}.0.1"),
+            major,
+        };
+        let v = mongo_capability_verdicts(&cap(true, 6));
+        assert_eq!(v.len(), 2);
+        assert_eq!((v[0].name.as_str(), v[0].ok), ("CDC replica set", true));
+        assert_eq!(v[0].detail.as_deref(), Some("replica set (server 6.0.1)"));
+        assert_eq!(v[0].hint, None);
+        assert_eq!((v[1].name.as_str(), v[1].ok), ("CDC capture tier", true));
+        assert_eq!(v[1].detail.as_deref(), Some(cap(true, 6).tier()));
+        assert_eq!(v[1].hint, None, "6.0 is the full tier: no upgrade hint");
+        assert_eq!(mongo_capability_verdicts(&cap(true, 7))[1].hint, None);
+
+        let v = mongo_capability_verdicts(&cap(false, 5));
+        assert!(!v[0].ok, "a standalone cannot open a change stream");
+        assert_eq!(
+            v[0].detail.as_deref(),
+            Some("server 5.0.1 is standalone — change streams unavailable")
+        );
+        assert!(
+            v[0].hint
+                .as_deref()
+                .is_some_and(|h| h.contains("--replSet"))
+        );
+        assert!(v[1].ok, "the tier is informational");
+        assert!(
+            v[1].hint
+                .as_deref()
+                .is_some_and(|h| h.contains("upgrade to MongoDB 6.0+"))
+        );
+    }
 
     /// `collect` is the doctor's CDC entry point: nothing for a config without a
     /// stream, and — when the probe cannot even resolve the source — ONE failed
