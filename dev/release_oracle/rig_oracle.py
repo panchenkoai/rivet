@@ -528,6 +528,9 @@ def _attach(spec: dict) -> dict:
 
         # The config's own `options` (a search_path) is kept; the scanner's text settings are appended to it.
         styles = "-c DateStyle=ISO,MDY -c IntervalStyle=postgres -c TimeZone=UTC -c bytea_output=hex"
+        if "://" not in url:
+            # A libpq keyword/value string takes the settings as one more pair.
+            return source_attach(engine, f"{url} options='{styles}'")[0]
         parts = urlsplit(url)
         q = dict(parse_qsl(parts.query))
         q["options"] = f"{q['options']} {styles}" if q.get("options") else styles

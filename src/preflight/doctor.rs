@@ -39,7 +39,8 @@ fn print_doctor_json(config_path: &str, all_ok: bool, checks: &[DoctorCheck]) {
 /// a `println!` and a `push` maintained in parallel at every site). A `FAIL`
 /// always carries `detail` at its call sites; `unwrap_or("")` is a belt-and-
 /// braces fallback, not an expected path.
-fn emit_check(checks: &mut Vec<DoctorCheck>, json: bool, check: DoctorCheck) {
+fn emit_check(checks: &mut Vec<DoctorCheck>, json: bool, mut check: DoctorCheck) {
+    check.detail = check.detail.map(|d| crate::redact::redact_secrets(&d));
     if !json {
         if check.ok {
             // Every pre-existing OK check carries `detail: None`, so this line is
@@ -833,6 +834,29 @@ pub(super) fn destination_error_hint(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A check's detail is redacted where it is recorded, so the text line and the JSON report carry the same masked string.
+    #[test]
+    fn a_recorded_check_carries_no_password() {
+        let mut checks = Vec::new();
+        emit_check(
+            &mut checks,
+            true,
+            DoctorCheck {
+                name: "Source auth error".into(),
+                ok: false,
+                detail: Some(
+                    "nothing is listening on host=h port=1 user=u password=S3cr3tPw dbname=d"
+                        .into(),
+                ),
+                hint: None,
+            },
+        );
+        assert_eq!(
+            checks[0].detail.as_deref(),
+            Some("nothing is listening on host=h port=1 user=u password=*** dbname=d")
+        );
+    }
 
     #[test]
     fn every_tls_mode_a_tls_hint_names_is_one_the_loader_accepts() {

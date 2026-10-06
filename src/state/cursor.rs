@@ -38,6 +38,7 @@ impl StateStore {
     /// The cursor of `export_name` writing to `scope` (its destination), or the legacy
     /// pre-v30 row no scoped run has claimed yet.
     pub fn get(&self, export_name: &str, scope: &str) -> Result<CursorState> {
+        self.adopt_unmasked_scope(export_name, scope)?;
         Ok(self
             .query_opt(
                 "SELECT last_cursor_value, last_run_at, cursor_column FROM export_state \
@@ -62,6 +63,7 @@ impl StateStore {
     /// Move the legacy (unscoped) row to `scope` if this scope has none yet: the first
     /// scoped writer continues it, and no other config sharing the name can read it after.
     fn claim_legacy_row(&self, export_name: &str, scope: &str) -> Result<()> {
+        self.adopt_unmasked_scope(export_name, scope)?;
         if scope.is_empty() {
             return Ok(());
         }
@@ -70,6 +72,34 @@ impl StateStore {
              AND NOT EXISTS (SELECT 1 FROM export_state WHERE export_name = ?1 AND prefix = ?2)",
             &[export_name.into(), scope.into()],
         )?;
+        Ok(())
+    }
+
+    /// Move the newest row whose scope was stored with its password unmasked onto `scope`, and delete every such row left: nothing reads them and they hold the password.
+    fn adopt_unmasked_scope(&self, export_name: &str, scope: &str) -> Result<()> {
+        if !scope.contains("***") {
+            return Ok(());
+        }
+        let stored = self.query(
+            "SELECT prefix FROM export_state WHERE export_name = ?1 AND prefix <> ?2 \
+             ORDER BY last_run_at DESC NULLS LAST",
+            &[export_name.into(), scope.into()],
+            |r| r.text(0),
+        )?;
+        for unmasked in stored
+            .iter()
+            .filter(|p| crate::redact::redact_keyword_passwords(p) == scope)
+        {
+            self.execute(
+                "UPDATE export_state SET prefix = ?2 WHERE export_name = ?1 AND prefix = ?3 \
+                 AND NOT EXISTS (SELECT 1 FROM export_state WHERE export_name = ?1 AND prefix = ?2)",
+                &[export_name.into(), scope.into(), unmasked.as_str().into()],
+            )?;
+            self.execute(
+                "DELETE FROM export_state WHERE export_name = ?1 AND prefix = ?2",
+                &[export_name.into(), unmasked.as_str().into()],
+            )?;
+        }
         Ok(())
     }
 
@@ -179,6 +209,7 @@ impl StateStore {
 
     /// The persisted in-progress keyset run_id, or None when no run is in progress.
     pub fn get_resume_run_id(&self, export_name: &str, scope: &str) -> Result<Option<String>> {
+        self.adopt_unmasked_scope(export_name, scope)?;
         let sql = "SELECT resume_run_id FROM export_state \
                    WHERE export_name = ?1 AND (prefix = ?2 OR prefix = '') \
                    ORDER BY prefix DESC LIMIT 1";
@@ -334,6 +365,116 @@ mod tests {
             "claimed: no other scope inherits it"
         );
         assert_eq!(s.list_all().unwrap().len(), 1, "moved, not copied");
+    }
+
+    const MASKED: &str = "postgres://host=h user=u password=*** dbname=d";
+    const UNMASKED: &str = "postgres://host=h user=u password=s3cr3tpw dbname=d";
+
+    fn scopes(s: &StateStore) -> Vec<String> {
+        s.query(
+            "SELECT prefix FROM export_state ORDER BY prefix",
+            &[],
+            |r| r.text(0),
+        )
+        .unwrap()
+    }
+
+    /// A cursor stored under the unmasked scope continues under the masked one, and the password leaves the table.
+    #[test]
+    fn a_cursor_stored_with_its_password_unmasked_is_adopted_by_the_masked_scope() {
+        let s = store();
+        s.update_with_column("orders", UNMASKED, "100", "id")
+            .unwrap();
+        s.set_resume_run_id("orders", UNMASKED, "r1").unwrap();
+        s.update_with_column("orders", "postgres://other:5432/d", "7", "id")
+            .unwrap();
+        s.update_with_column("users", UNMASKED, "55", "id").unwrap();
+        assert_eq!(
+            s.get("orders", MASKED)
+                .unwrap()
+                .last_cursor_value
+                .as_deref(),
+            Some("100")
+        );
+        assert_eq!(
+            s.get_resume_run_id("orders", MASKED).unwrap().as_deref(),
+            Some("r1")
+        );
+        assert_eq!(
+            scopes(&s),
+            [MASKED, UNMASKED, "postgres://other:5432/d"],
+            "this export's row moved; another source and another export are untouched"
+        );
+        assert_eq!(
+            s.get("orders", "postgres://other:5432/d")
+                .unwrap()
+                .last_cursor_value
+                .as_deref(),
+            Some("7")
+        );
+    }
+
+    /// Each reader and the writer adopt on their own: none relies on another having run first.
+    #[test]
+    fn the_resume_run_id_reader_and_the_writer_adopt_an_unmasked_scope_too() {
+        let s = store();
+        s.set_resume_run_id("orders", UNMASKED, "r1").unwrap();
+        assert_eq!(
+            s.get_resume_run_id("orders", MASKED).unwrap().as_deref(),
+            Some("r1")
+        );
+        assert_eq!(scopes(&s), [MASKED]);
+
+        let s = store();
+        s.update_with_column("orders", UNMASKED, "100", "id")
+            .unwrap();
+        s.set_resume_run_id("orders", MASKED, "r2").unwrap();
+        assert_eq!(scopes(&s), [MASKED]);
+        assert_eq!(
+            s.get("orders", MASKED)
+                .unwrap()
+                .last_cursor_value
+                .as_deref(),
+            Some("100"),
+            "the write continued the stored cursor instead of starting a second row"
+        );
+    }
+
+    /// After a password rotation two unmasked rows exist: the newest is adopted, and a row already under the masked scope outranks both.
+    #[test]
+    fn the_newest_unmasked_row_is_adopted_and_the_masked_row_outranks_it() {
+        let rotated = "postgres://host=h user=u password=rotated dbname=d";
+        let stage = |s: &StateStore, scope: &str, value: &str, at: &str| {
+            s.execute(
+                "INSERT INTO export_state (export_name, prefix, last_cursor_value, last_run_at) \
+                 VALUES ('orders', ?1, ?2, ?3)",
+                &[scope.into(), value.into(), at.into()],
+            )
+            .unwrap();
+        };
+        let s = store();
+        stage(&s, UNMASKED, "100", "2026-09-01T00:00:00+00:00");
+        stage(&s, rotated, "200", "2026-10-01T00:00:00+00:00");
+        assert_eq!(
+            s.get("orders", MASKED)
+                .unwrap()
+                .last_cursor_value
+                .as_deref(),
+            Some("200")
+        );
+        assert_eq!(scopes(&s), [MASKED], "the older copy is deleted");
+
+        let s = store();
+        stage(&s, MASKED, "300", "2026-08-01T00:00:00+00:00");
+        stage(&s, UNMASKED, "100", "2026-09-01T00:00:00+00:00");
+        assert_eq!(
+            s.get("orders", MASKED)
+                .unwrap()
+                .last_cursor_value
+                .as_deref(),
+            Some("300")
+        );
+        assert_eq!(scopes(&s), [MASKED]);
     }
 
     #[test]

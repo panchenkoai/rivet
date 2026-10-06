@@ -295,7 +295,7 @@ fn reject_unrecoverable_inline_url(artifact: &PlanArtifact) -> Result<()> {
     let url_redacted = source
         .url
         .as_deref()
-        .is_some_and(|u| u.contains("REDACTED@"));
+        .is_some_and(|u| u.contains("REDACTED@") || crate::redact::has_keyword_password(u));
     if !url_redacted {
         return Ok(());
     }
@@ -475,6 +475,25 @@ mod tests {
         // …but host WITHOUT user is not enough (`&&`, not `||`).
         reject_unrecoverable_inline_url(&set(redacted, None, None, Some("h"), None))
             .expect_err("host without user cannot rebuild the connection");
+        // A keyword/value string whose password was masked is refused the same way…
+        let masked = Some("host=h user=u password=*** dbname=d");
+        let err = reject_unrecoverable_inline_url(&set(masked, None, None, None, None))
+            .expect_err("a masked keyword/value password cannot authenticate");
+        assert!(
+            err.to_string().contains("url_env: <VAR>"),
+            "names the remedy: {err:#}"
+        );
+        reject_unrecoverable_inline_url(&set(masked, Some("DB_URL"), None, None, None))
+            .expect("url_env recovers");
+        // …and one that never held a password is appliable as it is.
+        reject_unrecoverable_inline_url(&set(
+            Some("host=/var/run/postgresql user=u dbname=d"),
+            None,
+            None,
+            None,
+            None,
+        ))
+        .expect("no password was stripped");
     }
 
     // ── staleness enforcement ────────────────────────────────────────────────

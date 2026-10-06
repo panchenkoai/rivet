@@ -279,6 +279,7 @@ impl SourceConfig {
     /// - `password` → always `None` (plaintext password never leaves the process).
     /// - `url` containing `user[:password]@` → userinfo segment replaced with `"REDACTED"`.
     /// - `url` query secrets (`password=`, `*_token=`, …) → value replaced with `***`.
+    /// - `url` in keyword/value form (`host=… password=…`, `…;PWD=…`) → password value replaced with `***`.
     /// - `url_env`, `url_file`, `password_env` — kept (env var **names** and file paths
     ///   are references, not secrets; `apply` needs them to re-resolve credentials).
     /// - `host`, `port`, `user`, `database` — kept (structured connection metadata).
@@ -294,6 +295,13 @@ impl SourceConfig {
             redacted = true;
         }
 
+        if let Some(ref raw) = out.url {
+            let masked = crate::redact::redact_keyword_passwords(raw);
+            if masked != *raw {
+                out.url = Some(masked);
+                redacted = true;
+            }
+        }
         if let Some(ref raw) = out.url
             && let Some((userinfo_end, scheme_end)) = find_userinfo(raw)
         {
@@ -602,12 +610,13 @@ fn find_userinfo(raw: &str) -> Option<(usize, usize)> {
     (at < authority_end || rest[..at].contains(':')).then_some((scheme + at, scheme))
 }
 
-/// `engine://host:port/database` of `url`, credentials, query and fragment dropped.
+/// `engine://host:port/database` of `url`, credentials, query and fragment dropped; a keyword/value string keeps its pairs with the password masked.
 pub(crate) fn source_state_key(source_type: SourceType, url: &str) -> String {
     let rest = url.split_once("://").map_or(url, |(_, r)| r);
     let rest = find_userinfo(url).map_or(rest, |(at, _)| &url[at + 1..]);
     let at_host = rest.split(['?', '#']).next().unwrap_or(rest);
-    format!("{source_type:?}://{}", at_host.trim_end_matches('/')).to_lowercase()
+    let key = format!("{source_type:?}://{}", at_host.trim_end_matches('/')).to_lowercase();
+    crate::redact::redact_keyword_passwords(&key)
 }
 
 #[cfg(test)]
@@ -705,6 +714,65 @@ mod tests {
         let mut src = make_source(SourceType::Postgres);
         src.url = Some("postgresql://u:pw@db.host:5432/app".into());
         assert_eq!(src.state_key(), "postgres://db.host:5432/app");
+    }
+
+    /// A keyword/value string keeps its pairs in the key, the password masked; a rotated password keeps the key.
+    #[test]
+    fn a_source_state_key_masks_a_keyword_value_password() {
+        let dsn = |pw: &str| format!("host=Db.Host port=5432 user=App password={pw} dbname=app");
+        let key = source_state_key(SourceType::Postgres, &dsn("S3cr3tPw"));
+        assert_eq!(
+            key,
+            "postgres://host=db.host port=5432 user=app password=*** dbname=app"
+        );
+        assert_eq!(key, source_state_key(SourceType::Postgres, &dsn("rotated")));
+        let before_the_mask =
+            "postgres://host=db.host port=5432 user=app password=s3cr3tpw dbname=app";
+        assert_eq!(
+            crate::redact::redact_keyword_passwords(before_the_mask),
+            key,
+            "a key stored before the mask must mask to today's key (the state store adopts on that)"
+        );
+        assert_eq!(
+            source_state_key(
+                SourceType::Postgres,
+                "host=Db.Host port=5432 user=App dbname=app"
+            ),
+            "postgres://host=db.host port=5432 user=app dbname=app",
+            "a string with no password is keyed as before"
+        );
+    }
+
+    #[test]
+    fn redact_keyword_value_url_masks_the_password_and_keeps_the_rest() {
+        for (raw, want) in [
+            (
+                "host=h port=5432 user=u password=S3cr3tPw dbname=d",
+                "host=h port=5432 user=u password=*** dbname=d",
+            ),
+            (
+                "Server=h,1433;Database=d;User Id=u;PWD=S3cr3tPw;",
+                "Server=h,1433;Database=d;User Id=u;PWD=***;",
+            ),
+            (
+                "sqlserver://h:1433;databaseName=app;user=sa;password=p@S3cr3tPw",
+                "sqlserver://h:1433;databaseName=app;user=sa;password=***",
+            ),
+        ] {
+            let mut src = make_source(SourceType::Postgres);
+            src.url = Some(raw.into());
+            let (redacted, flag) = src.redact_for_artifact();
+            assert!(flag, "a masked password is flagged: {raw}");
+            assert_eq!(redacted.url.as_deref(), Some(want), "{raw}");
+        }
+        let mut src = make_source(SourceType::Postgres);
+        src.url = Some("host=/var/run/postgresql user=u dbname=d".into());
+        let (kept, flag) = src.redact_for_artifact();
+        assert!(!flag, "nothing to mask, nothing flagged");
+        assert_eq!(
+            kept.url.as_deref(),
+            Some("host=/var/run/postgresql user=u dbname=d")
+        );
     }
 
     #[test]
