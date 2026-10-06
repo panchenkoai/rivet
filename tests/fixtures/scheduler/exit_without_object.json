@@ -1,0 +1,158 @@
+[
+  {
+    "exit_status": 1,
+    "signal": null,
+    "object": {
+      "code": null,
+      "kind": null,
+      "class": "generic",
+      "exit_code": 1,
+      "retryable": false,
+      "action": null,
+      "message": null
+    }
+  },
+  {
+    "exit_status": 2,
+    "signal": null,
+    "object": {
+      "code": null,
+      "kind": null,
+      "class": "retryable",
+      "exit_code": 2,
+      "retryable": true,
+      "action": null,
+      "message": null
+    }
+  },
+  {
+    "exit_status": 3,
+    "signal": null,
+    "object": {
+      "code": null,
+      "kind": null,
+      "class": "data_integrity",
+      "exit_code": 3,
+      "retryable": false,
+      "action": null,
+      "message": null
+    }
+  },
+  {
+    "exit_status": 4,
+    "signal": null,
+    "object": {
+      "code": null,
+      "kind": null,
+      "class": "schema_drift",
+      "exit_code": 4,
+      "retryable": false,
+      "action": null,
+      "message": null
+    }
+  },
+  {
+    "exit_status": 5,
+    "signal": null,
+    "object": {
+      "code": null,
+      "kind": null,
+      "class": "refusal",
+      "exit_code": 5,
+      "retryable": false,
+      "action": null,
+      "message": null
+    }
+  },
+  {
+    "exit_status": 6,
+    "signal": null,
+    "object": {
+      "code": null,
+      "kind": null,
+      "class": "internal",
+      "exit_code": 6,
+      "retryable": false,
+      "action": null,
+      "message": null
+    }
+  },
+  {
+    "exit_status": 101,
+    "signal": null,
+    "object": {
+      "code": null,
+      "kind": null,
+      "class": "internal",
+      "exit_code": 6,
+      "retryable": false,
+      "action": null,
+      "message": "rivet exited 101 and printed no error object"
+    }
+  },
+  {
+    "exit_status": 137,
+    "signal": null,
+    "object": {
+      "code": null,
+      "kind": null,
+      "class": "crashed",
+      "exit_code": null,
+      "retryable": true,
+      "action": null,
+      "message": "rivet exited 137 and printed no error object"
+    }
+  },
+  {
+    "exit_status": 143,
+    "signal": null,
+    "object": {
+      "code": null,
+      "kind": null,
+      "class": "crashed",
+      "exit_code": null,
+      "retryable": true,
+      "action": null,
+      "message": "rivet exited 143 and printed no error object"
+    }
+  },
+  {
+    "exit_status": null,
+    "signal": 9,
+    "object": {
+      "code": null,
+      "kind": null,
+      "class": "crashed",
+      "exit_code": null,
+      "retryable": true,
+      "action": null,
+      "message": "rivet was killed by signal 9"
+    }
+  },
+  {
+    "exit_status": 42,
+    "signal": null,
+    "object": {
+      "code": null,
+      "kind": null,
+      "class": "generic",
+      "exit_code": 1,
+      "retryable": false,
+      "action": null,
+      "message": "rivet exited 42 and printed no error object"
+    }
+  },
+  {
+    "exit_status": 127,
+    "signal": null,
+    "object": {
+      "code": null,
+      "kind": null,
+      "class": "generic",
+      "exit_code": 1,
+      "retryable": false,
+      "action": null,
+      "message": "rivet exited 127 and printed no error object"
+    }
+  }
+]

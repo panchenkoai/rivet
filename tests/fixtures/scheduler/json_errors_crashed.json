@@ -16,7 +16,7 @@
       "exit_code": null,
       "retryable": true,
       "action": null,
-      "message": "export 'events' exited with status signal"
+      "message": "exited with status signal"
     }
   ]
 }

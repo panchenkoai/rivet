@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::process::Command;
 
-use rivet::error::{ExitClass, codes};
+use rivet::error::{ExitClass, classify_exit, codes};
 use serde_json::{Value, json};
 
 const ADR: &str = "docs/adr/0039-scheduler-contract.md";
@@ -34,19 +34,11 @@ use Ty::*;
 /// A key, its type, and whether `null` is allowed.
 type Field = (&'static str, Ty, bool);
 
-const RUN_STATUS: &[&str] = &["success", "failed", "skipped", "interrupted"];
+const RUN_STATUS: &[&str] = &["success", "failed", "skipped"];
 const STOP_REASON: &[&str] = &["caught_up", "max_events"];
-const LOAD_STATUS: &[&str] = &["loaded", "nothing_to_do", "failed"];
+const LOAD_STATUS: &[&str] = &["loaded", "skipped", "failed"];
+const LOAD_SKIP: &[&str] = &["up_to_date"];
 const COMPACT_STATUS: &[&str] = &["compacted", "nothing_to_do", "skipped", "failed"];
-const UNIT_STATUS: &[&str] = &[
-    "success",
-    "failed",
-    "skipped",
-    "interrupted",
-    "loaded",
-    "compacted",
-    "nothing_to_do",
-];
 
 const ERROR: &[Field] = &[
     ("code", Str, true),
@@ -111,6 +103,21 @@ const JSON_ERRORS_NOT_YET_EMITTED: &[&str] = &[
     // ratchet-pin: end
 ];
 
+/// Members of a killed child's run entry that the parent still writes blank.
+const CRASHED_ENTRY_NOT_YET_FILLED: &[&str] = &[
+    // ratchet-pin: scheduler-contract-crashed-entry-not-yet-filled strings
+    "run_id", "mode",
+    // ratchet-pin: end
+];
+
+/// Which of the product's three folds built a `--json-errors` text.
+#[derive(Clone, Copy)]
+enum Fold {
+    Exports,
+    Loads,
+    Children,
+}
+
 /// The class name ADR-0039 gives each exit code; `crashed` is the class of no exit code.
 const CLASS_NAMES: &[(i32, &str)] = &[
     (1, "generic"),
@@ -128,19 +135,34 @@ const SHAPES: &[(&str, Rule)] = &[
         check_error(v, at, true, &[])
     }),
     ("run_entry.json", check_run_entry),
+    ("run_entry_caught_up.json", check_run_entry),
+    ("run_entry_skipped.json", check_run_entry),
     ("run_entry_failed.json", check_run_entry),
     ("run_entry_crashed.json", check_run_entry),
-    ("json_errors.json", check_json_errors),
-    ("json_errors_uncoded.json", check_json_errors),
-    ("json_errors_crashed.json", check_json_errors),
-    ("json_errors_load.json", check_json_errors),
+    ("json_errors.json", |v, at| {
+        check_json_errors(v, at, Fold::Exports)
+    }),
+    ("json_errors_uncoded.json", |v, at| {
+        check_json_errors(v, at, Fold::Exports)
+    }),
+    ("json_errors_crashed.json", |v, at| {
+        check_json_errors(v, at, Fold::Children)
+    }),
+    ("json_errors_mixed.json", |v, at| {
+        check_json_errors(v, at, Fold::Children)
+    }),
+    ("json_errors_load.json", |v, at| {
+        check_json_errors(v, at, Fold::Loads)
+    }),
     ("load_result.json", |v, at| {
-        check_table_result(v, at, LOAD_STATUS)
+        check_table_result(v, at, LOAD_STATUS, Some(LOAD_SKIP))
     }),
     ("compact_result.json", |v, at| {
-        check_table_result(v, at, COMPACT_STATUS)
+        check_table_result(v, at, COMPACT_STATUS, None)
     }),
     ("xcom_unit.json", check_xcom),
+    ("xcom_unit_load.json", check_xcom),
+    ("exit_without_object.json", check_exit_without_object),
 ];
 
 /// The repository root.
@@ -246,9 +268,10 @@ fn check_run_entry(v: &Value, at: &str) -> Check {
     })?;
     if failed {
         check_error(&v["error"], &format!("{at}.error"), true, &[])?;
-        require(v["error_message"].is_string(), || {
-            format!("{at}: a failed entry keeps error_message")
-        })?;
+        require(
+            v["error_message"].is_string() && v["error_message"] == v["error"]["message"],
+            || format!("{at}: a failed entry keeps error_message, and error.message is that text"),
+        )?;
     }
     require(
         v["stop_reason"].is_null() != (cdc && v["status"] == "success"),
@@ -269,9 +292,35 @@ fn check_run_entry(v: &Value, at: &str) -> Check {
     Ok(())
 }
 
-/// The text the two folds give N failures: the representative one last, the others listed.
-fn folded_text(failures: &[Value], primary: usize, exit_class: i64) -> String {
+/// How stop-worthy a failure is; `None` for a killed unit, which has no exit code.
+fn stop_rank(f: &Value) -> Option<u8> {
+    let class = ExitClass::from_code(f["exit_code"].as_i64()? as i32)?;
+    Some(class.stop_rank())
+}
+
+/// The text each of the three folds gives N failures.
+fn folded_text(failures: &[Value], primary: usize, exit_class: i64, fold: Fold) -> String {
     let msg = |f: &Value| f["message"].as_str().unwrap_or_default().to_string();
+    if let Fold::Children = fold {
+        let parts: Vec<String> = failures
+            .iter()
+            .map(|f| {
+                let status = f["exit_code"]
+                    .as_i64()
+                    .map_or("signal".to_string(), |c| c.to_string());
+                format!(
+                    "export '{}' exited with status {status}",
+                    f["export"].as_str().unwrap_or_default()
+                )
+            })
+            .collect();
+        let class = if failures.iter().any(|f| !f["exit_code"].is_null()) {
+            format!(": exit class {exit_class}")
+        } else {
+            String::new()
+        };
+        return format!("{}{class}", parts.join("; "));
+    }
     if failures.len() == 1 {
         return msg(&failures[0]);
     }
@@ -280,18 +329,19 @@ fn folded_text(failures: &[Value], primary: usize, exit_class: i64) -> String {
         .map(|i| msg(&failures[i]))
         .collect();
     let (n, others, primary) = (failures.len(), others.join("; "), msg(&failures[primary]));
-    if failures[0]["table"].is_null() {
-        format!(
+    match fold {
+        Fold::Loads => {
+            format!("{n} load(s) failed; representative error follows (also: {others}): {primary}")
+        }
+        _ => format!(
             "{n} export(s) failed; representative error follows (also: {others}): \
              exit class {exit_class}: {primary}"
-        )
-    } else {
-        format!("{n} load(s) failed; representative error follows (also: {others}): {primary}")
+        ),
     }
 }
 
-/// The one-line `--json-errors` object.
-fn check_json_errors(v: &Value, at: &str) -> Check {
+/// The one-line `--json-errors` object, its text built by `fold`.
+fn check_json_errors(v: &Value, at: &str, fold: Fold) -> Check {
     let coded = v.get("code").is_some();
     let mut fields = JSON_ERRORS.to_vec();
     fields.retain(|f| coded || f.0 != "code");
@@ -315,27 +365,39 @@ fn check_json_errors(v: &Value, at: &str) -> Check {
         .ok_or_else(|| format!("{at}.failures: not an array"))?;
     for (i, f) in failures.iter().enumerate() {
         check_error(f, &format!("{at}.failures[{i}]"), true, UNIT)?;
-        require(
-            f["table"].is_null() == failures[0]["table"].is_null(),
-            || format!("{at}.failures[{i}]: one command names tables on all entries or none"),
-        )?;
+        require(f["table"].is_null() != matches!(fold, Fold::Loads), || {
+            format!("{at}.failures[{i}]: only a load or compact failure names a table")
+        })?;
     }
     if failures.is_empty() {
         return Ok(());
     }
-    let code = v.get("code").cloned().unwrap_or(Value::Null);
-    let primary = failures
-        .iter()
-        .position(|f| f["class"] == v["class"] && f["code"] == code)
-        .ok_or_else(|| format!("{at}: the top level describes none of failures[]"))?;
-    let text = folded_text(failures, primary, exit_class);
+    let primary = (0..failures.len())
+        .filter(|i| stop_rank(&failures[*i]).is_some())
+        .max_by_key(|i| stop_rank(&failures[*i]))
+        .unwrap_or(0);
+    for key in ["code", "kind", "class", "exit_code", "retryable", "action"] {
+        let top = v.get(key).cloned().unwrap_or(Value::Null);
+        require(top == failures[primary][key], || {
+            format!(
+                "{at}.{key}: the representative is failures[{primary}], the highest stop_rank \
+                 among the units that reported an exit code"
+            )
+        })?;
+    }
+    let text = folded_text(failures, primary, exit_class, fold);
     require(v["error"] == text, || {
         format!("{at}.error: the fold emits `{text}`")
     })
 }
 
 /// The object `rivet load` / `rivet compact` print, with that command's `statuses`.
-fn check_table_result(v: &Value, at: &str, statuses: &'static [&'static str]) -> Check {
+fn check_table_result(
+    v: &Value,
+    at: &str,
+    statuses: &'static [&'static str],
+    skips: Option<&'static [&'static str]>,
+) -> Check {
     shape(
         v,
         at,
@@ -350,7 +412,7 @@ fn check_table_result(v: &Value, at: &str, statuses: &'static [&'static str]) ->
             ("export", Str, false),
             ("table", Str, false),
             ("status", Word(statuses), false),
-            ("skip_reason", Str, true),
+            ("skip_reason", skips.map_or(Str, Word), true),
             ("rows", Int, false),
             ("error", Nested, true),
         ];
@@ -373,21 +435,99 @@ fn check_table_result(v: &Value, at: &str, statuses: &'static [&'static str]) ->
 fn check_xcom(v: &Value, at: &str) -> Check {
     let mut fields = UNIT.to_vec();
     fields.extend_from_slice(&[
-        ("status", Word(UNIT_STATUS), false),
+        ("status", Str, false),
         ("run_id", Str, false),
         ("rows", Int, false),
-        ("files", Int, false),
+        ("files", Int, true),
         ("stop_reason", Word(STOP_REASON), true),
         ("error", Nested, true),
     ]);
     shape(v, at, &fields)?;
-    require((v["status"] == "failed") != v["error"].is_null(), || {
+    let (status, of_table) = (
+        v["status"].as_str().unwrap_or_default(),
+        !v["table"].is_null(),
+    );
+    let known = if of_table {
+        LOAD_STATUS.contains(&status) || COMPACT_STATUS.contains(&status)
+    } else {
+        RUN_STATUS.contains(&status)
+    };
+    require(known, || {
+        format!("{at}: `{status}` is not a status of this kind of unit")
+    })?;
+    require(v["files"].is_null() == of_table, || {
+        format!("{at}: files is a number for a run unit and null for a load or compact unit")
+    })?;
+    require(!of_table || v["stop_reason"].is_null(), || {
+        format!("{at}: only a run unit has a stop_reason")
+    })?;
+    require((status == "failed") != v["error"].is_null(), || {
         format!("{at}: error iff failed")
     })?;
     if !v["error"].is_null() {
         check_error(&v["error"], &format!("{at}.error"), false, &[])?;
     }
     Ok(())
+}
+
+/// The class ADR-0039 D8 gives a process that ended without printing an error object.
+fn class_without_object(exit_status: Option<i64>) -> (&'static str, Option<i64>) {
+    match exit_status {
+        None => ("crashed", None),
+        Some(c @ 1..=6) => (CLASS_NAMES[c as usize - 1].1, Some(c)),
+        Some(101) => ("internal", Some(6)),
+        Some(129..=255) => ("crashed", None),
+        Some(_) => ("generic", Some(1)),
+    }
+}
+
+/// The table an integration builds the error object from when rivet printed none.
+fn check_exit_without_object(v: &Value, at: &str) -> Check {
+    let rows = v.as_array().ok_or_else(|| format!("{at}: not an array"))?;
+    let mut seen = BTreeSet::new();
+    for (i, r) in rows.iter().enumerate() {
+        let at = format!("{at}[{i}]");
+        let fields = [
+            ("exit_status", Int, true),
+            ("signal", Int, true),
+            ("object", Nested, false),
+        ];
+        shape(r, &at, &fields)?;
+        let status = r["exit_status"].as_i64();
+        require(status.is_some() != r["signal"].is_u64(), || {
+            format!("{at}: a process ends on an exit status or on a signal, never both")
+        })?;
+        require(status != Some(0), || {
+            format!("{at}: exit 0 is not a failure")
+        })?;
+        let coded = matches!(status, Some(1..=6));
+        let mut object = r["object"].clone();
+        require(object["message"].is_null() == coded, || {
+            format!("{at}: exit 1-6 carries no message; every other row names what was seen")
+        })?;
+        if coded {
+            object["message"] = json!("-");
+        }
+        check_error(&object, &format!("{at}.object"), true, &[])?;
+        let (class, exit_code) = class_without_object(status);
+        require(
+            object["class"] == class && object["exit_code"] == json!(exit_code),
+            || format!("{at}: ADR-0039 D8 says {class}, exit_code {exit_code:?}"),
+        )?;
+        require(object["code"].is_null(), || {
+            format!("{at}: a built object has no code")
+        })?;
+        seen.insert(match status {
+            Some(c @ (1..=6 | 101)) => c,
+            Some(129..=255) => 129,
+            Some(_) => 0,
+            None => -1,
+        });
+    }
+    let all: BTreeSet<i64> = (-1..=6).chain([101, 129]).collect();
+    require(seen == all, || {
+        format!("{at}: one row per line of the D8 table; shown {seen:?}")
+    })
 }
 
 /// Every string value stored under `key` anywhere inside `v`.
@@ -435,6 +575,13 @@ fn a_wrong_type_an_unknown_word_or_a_moved_key_is_refused() {
         ("run_entry.json", "/stop_reason", json!("whatever")),
         ("run_entry.json", "/rows", json!("many")),
         ("run_entry.json", "/status", json!("done")),
+        ("run_entry.json", "/status", json!("interrupted")),
+        ("run_entry_skipped.json", "/stop_reason", json!("caught_up")),
+        (
+            "run_entry_crashed.json",
+            "/error/message",
+            json!("export 'events' exited with status signal"),
+        ),
         ("run_entry.json", "/tables/0/rows", json!("1200")),
         ("run_entry.json", "/tables", Value::Null),
         ("run_entry_failed.json", "/error", Value::Null),
@@ -452,6 +599,52 @@ fn a_wrong_type_an_unknown_word_or_a_moved_key_is_refused() {
         ("json_errors.json", "/failures/0/table", json!("orders")),
         ("json_errors_crashed.json", "/exit_class", json!(2)),
         ("json_errors_crashed.json", "/class", json!("generic")),
+        (
+            "json_errors_crashed.json",
+            "/error",
+            json!("exited with status signal"),
+        ),
+        ("json_errors_mixed.json", "/class", json!("crashed")),
+        ("json_errors_mixed.json", "/exit_class", json!(1)),
+        (
+            "json_errors_mixed.json",
+            "/error",
+            json!(
+                "export 'orders_cdc' exited with status 5; export 'events' exited with status signal"
+            ),
+        ),
+        (
+            "load_result.json",
+            "/per_table/1/status",
+            json!("nothing_to_do"),
+        ),
+        ("xcom_unit.json", "/files", Value::Null),
+        ("xcom_unit.json", "/status", json!("loaded")),
+        ("xcom_unit_load.json", "/files", json!(3)),
+        ("xcom_unit_load.json", "/status", json!("success")),
+        ("xcom_unit_load.json", "/stop_reason", json!("caught_up")),
+        ("exit_without_object.json", "/0/object/message", json!("x")),
+        (
+            "exit_without_object.json",
+            "/6/object/class",
+            json!("generic"),
+        ),
+        (
+            "exit_without_object.json",
+            "/7/object/class",
+            json!("generic"),
+        ),
+        (
+            "exit_without_object.json",
+            "/7/object/retryable",
+            json!(false),
+        ),
+        (
+            "exit_without_object.json",
+            "/10/object/class",
+            json!("retryable"),
+        ),
+        ("exit_without_object.json", "/1/exit_status", json!(42)),
         ("json_errors_load.json", "/failures/0/table", Value::Null),
         ("load_result.json", "/per_table/0/status", json!("skipped")),
         (
@@ -495,43 +688,151 @@ fn a_wrong_type_an_unknown_word_or_a_moved_key_is_refused() {
         check_xcom(&renamed, "xcom").is_err(),
         "one name for the unit"
     );
+    let mut load = fixture("json_errors_load.json");
+    let generic = load["failures"][0].clone();
+    for key in ["kind", "class", "exit_code", "retryable", "action"] {
+        load[key] = generic[key].clone();
+    }
+    load["exit_class"] = json!(1);
+    load["error"] = json!(folded_text(
+        load["failures"].as_array().unwrap(),
+        0,
+        1,
+        Fold::Loads
+    ));
+    let why = check_json_errors(&load, "load", Fold::Loads).unwrap_err();
+    assert!(
+        why.contains("highest stop_rank"),
+        "a generic failure never represents a batch that holds a retryable one: {why}"
+    );
     let mut uncoded = fixture("json_errors_uncoded.json");
     uncoded.as_object_mut().unwrap().remove("kind");
-    assert!(check_json_errors(&uncoded, "uncoded").is_err());
+    assert!(check_json_errors(&uncoded, "uncoded", Fold::Exports).is_err());
+}
+
+/// The words stored under `key` in the fixtures whose name starts with `family`.
+fn shown(family: &str, key: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for (name, _) in SHAPES.iter().filter(|s| s.0.starts_with(family)) {
+        values_of(&fixture(name), key, &mut out);
+    }
+    out
 }
 
 #[test]
 fn the_fixtures_show_every_case_the_contract_names() {
-    let (mut classes, mut statuses, mut stops) =
-        (BTreeSet::new(), BTreeSet::new(), BTreeSet::new());
-    for (name, _) in SHAPES {
-        let v = fixture(name);
-        values_of(&v, "class", &mut classes);
-        values_of(&v, "status", &mut statuses);
-        values_of(&v, "stop_reason", &mut stops);
-    }
-    for class in ["crashed", "retryable", "refusal", "generic"] {
+    let classes = shown("", "class");
+    for class in ["crashed", "retryable", "refusal", "generic", "internal"] {
         assert!(classes.contains(class), "no fixture shows class `{class}`");
     }
-    for status in LOAD_STATUS.iter().chain(COMPACT_STATUS) {
-        assert!(statuses.contains(*status), "no fixture shows `{status}`");
-    }
-    assert!(stops.iter().all(|s| STOP_REASON.contains(&s.as_str())));
     assert!(fixture("json_errors_uncoded.json").get("code").is_none());
     assert!(fixture("json_errors.json")["code"].is_string());
-    for name in ["json_errors.json", "json_errors_load.json"] {
+    for name in [
+        "json_errors.json",
+        "json_errors_load.json",
+        "json_errors_mixed.json",
+    ] {
         let n = fixture(name)["failures"].as_array().unwrap().len();
         assert!(
             n >= 2,
             "{name}: failures[] lists ALL failed units: show two"
         );
     }
+    let mixed = shown("json_errors_mixed.json", "class");
+    assert!(
+        mixed.contains("crashed") && mixed.len() >= 2,
+        "the mixed fixture shows a killed child beside one that reported an exit code"
+    );
     assert_eq!(
         CLASS_NAMES.len(),
         (0..=255)
             .filter(|c| ExitClass::from_code(*c).is_some())
             .count(),
         "every exit class has exactly one name"
+    );
+}
+
+#[test]
+fn the_adr_and_the_fixtures_spell_every_vocabulary_word() {
+    let adr = source(ADR);
+    let sets: &[(&str, &str, &[&str])] = &[
+        ("run_entry", "status", RUN_STATUS),
+        ("run_entry", "stop_reason", STOP_REASON),
+        ("load_result", "status", LOAD_STATUS),
+        ("load_result", "skip_reason", LOAD_SKIP),
+        ("compact_result", "status", COMPACT_STATUS),
+    ];
+    for (family, key, words) in sets {
+        let want: BTreeSet<String> = words.iter().map(|w| w.to_string()).collect();
+        assert_eq!(
+            shown(family, key),
+            want,
+            "{family}*.json must show every `{key}` word of the contract, and no other"
+        );
+    }
+    let classes = CLASS_NAMES.iter().map(|c| &c.1).chain(&["crashed"]);
+    for word in sets.iter().flat_map(|s| s.2).chain(classes) {
+        assert!(
+            adr.contains(&format!("`{word}`")),
+            "{ADR} never writes `{word}`, a word the fixtures and this test use"
+        );
+    }
+}
+
+#[test]
+fn a_killed_childs_entry_is_the_target_shape_until_the_parent_fills_it() {
+    let aggregate = source("src/pipeline/aggregate.rs");
+    let fallback = aggregate
+        .split("out.push(entry.unwrap_or_else(")
+        .nth(1)
+        .and_then(|rest| rest.split("}));").next())
+        .expect("the entry the parent writes for a child with no metric row");
+    let blank: BTreeSet<&str> = ["run_id", "mode"]
+        .into_iter()
+        .filter(|key| fallback.contains(&format!("{key}: String::new(),")))
+        .collect();
+    let listed: BTreeSet<&str> = CRASHED_ENTRY_NOT_YET_FILLED.iter().copied().collect();
+    assert_eq!(
+        blank, listed,
+        "CRASHED_ENTRY_NOT_YET_FILLED is exactly what the parent still writes blank"
+    );
+    assert!(
+        CRASHED_ENTRY_NOT_YET_FILLED.len() <= 2,
+        "two members were blank when ADR-0039 was accepted"
+    );
+    let entry = fixture("run_entry_crashed.json");
+    for key in ["run_id", "mode"] {
+        assert!(entry[key] != "", "the contract fills `{key}`");
+    }
+}
+
+#[test]
+fn today_the_exit_of_an_untyped_fold_follows_its_text_documents_two_requirements() {
+    let killed = |name: &str| {
+        classify_exit(&anyhow::anyhow!(
+            "export '{name}' exited with status signal"
+        ))
+    };
+    assert_eq!(killed("events"), 1);
+    assert_eq!(killed("dns_events"), 2, "the export NAME decided the exit");
+    assert_eq!(killed("orders_timeout"), 2);
+
+    let load = fixture("json_errors_load.json");
+    let text = |i: usize| load["failures"][i]["message"].as_str().unwrap().to_string();
+    assert_eq!(classify_exit(&anyhow::anyhow!(text(1))), 2);
+    let folded = anyhow::anyhow!(text(1)).context(format!(
+        "2 load(s) failed; representative error follows (also: {})",
+        text(0)
+    ));
+    assert_eq!(
+        format!("{folded:#}"),
+        load["error"],
+        "this is the text aggregate_load_failures builds"
+    );
+    assert_eq!(
+        classify_exit(&folded),
+        1,
+        "the OTHER failure's text decided the exit; the contract says 2"
     );
 }
 
@@ -633,8 +934,16 @@ fn the_fixture_texts_are_the_products_own() {
     assert!(
         children.contains(r#"unwrap_or_else(|| "signal".to_string())"#)
             && children.contains(r#"format!("export '{name}' {msg}")"#)
-            && children.contains(r#"format!("exited with status {code}")"#),
-        "the killed-child text changed: update the crashed fixtures"
+            && children.contains(r#"format!("exited with status {code}")"#)
+            && children.contains("wait_failures.insert(name.clone(), msg.clone());")
+            && children.contains(r#"let msg = failures.join("; ");"#)
+            && children.contains("PreclassifiedExit(code)).context(msg)"),
+        "the killed-child text or the child fold changed: update the crashed and mixed fixtures"
+    );
+    assert_eq!(
+        fixture("run_entry_crashed.json")["error_message"],
+        "exited with status signal",
+        "the entry keeps the text the parent stores, which has no export prefix"
     );
     let compact = source("src/load/compact.rs");
     let mut reasons = BTreeSet::new();

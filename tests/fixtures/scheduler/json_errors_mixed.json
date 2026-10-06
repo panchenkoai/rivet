@@ -1,0 +1,34 @@
+{
+  "error": "export 'orders_cdc' exited with status 5; export 'events' exited with status signal: exit class 5",
+  "exit_class": 5,
+  "code": "RIVET_SOURCE_CDC_LOG_GAP",
+  "exit_code": 5,
+  "class": "refusal",
+  "kind": "refusal",
+  "retryable": false,
+  "action": "restore the missing log, or re-baseline the stream: delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, give it `cdc.initial: snapshot`, then re-run",
+  "failures": [
+    {
+      "export": "orders_cdc",
+      "table": null,
+      "code": "RIVET_SOURCE_CDC_LOG_GAP",
+      "kind": "refusal",
+      "class": "refusal",
+      "exit_code": 5,
+      "retryable": false,
+      "action": "restore the missing log, or re-baseline the stream: delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, give it `cdc.initial: snapshot`, then re-run",
+      "message": "export 'orders_cdc': the checkpoint position is no longer in the source log"
+    },
+    {
+      "export": "events",
+      "table": null,
+      "code": null,
+      "kind": null,
+      "class": "crashed",
+      "exit_code": null,
+      "retryable": true,
+      "action": null,
+      "message": "exited with status signal"
+    }
+  ]
+}

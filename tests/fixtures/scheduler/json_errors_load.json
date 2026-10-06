@@ -1,10 +1,10 @@
 {
-  "error": "2 load(s) failed; representative error follows (also: table 'events': the warehouse answered 503): table 'users': permission denied on dataset analytics",
-  "exit_class": 1,
-  "exit_code": 1,
-  "class": "generic",
+  "error": "2 load(s) failed; representative error follows (also: table 'users': permission denied on dataset analytics): table 'events': connection reset by peer",
+  "exit_class": 2,
+  "exit_code": 2,
+  "class": "retryable",
   "kind": null,
-  "retryable": false,
+  "retryable": true,
   "action": null,
   "failures": [
     {
@@ -27,7 +27,7 @@
       "exit_code": 2,
       "retryable": true,
       "action": null,
-      "message": "table 'events': the warehouse answered 503"
+      "message": "table 'events': connection reset by peer"
     }
   ]
 }

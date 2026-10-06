@@ -12,8 +12,8 @@
     {
       "export": "countries",
       "table": "countries",
-      "status": "nothing_to_do",
-      "skip_reason": null,
+      "status": "skipped",
+      "skip_reason": "up_to_date",
       "rows": 0,
       "error": null
     },
@@ -30,7 +30,7 @@
         "exit_code": 2,
         "retryable": true,
         "action": null,
-        "message": "table 'events': the warehouse answered 503"
+        "message": "table 'events': connection reset by peer"
       }
     }
   ]

@@ -8,7 +8,7 @@
   "bytes_read": 0,
   "duration_ms": 4200,
   "mode": "chunked",
-  "error_message": "export 'events' exited with status signal",
+  "error_message": "exited with status signal",
   "error": {
     "code": null,
     "kind": null,
@@ -16,7 +16,7 @@
     "exit_code": null,
     "retryable": true,
     "action": null,
-    "message": "export 'events' exited with status signal"
+    "message": "exited with status signal"
   },
   "stop_reason": null,
   "tables": null

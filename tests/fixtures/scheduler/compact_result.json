@@ -38,7 +38,7 @@
         "exit_code": 2,
         "retryable": true,
         "action": null,
-        "message": "table 'events': the warehouse answered 503"
+        "message": "table 'events': connection reset by peer"
       }
     }
   ]

@@ -1,0 +1,10 @@
+{
+  "export": "orders_cdc",
+  "table": "orders",
+  "status": "loaded",
+  "run_id": "20261006T101900.456-load",
+  "rows": 1200,
+  "files": null,
+  "stop_reason": null,
+  "error": null
+}
