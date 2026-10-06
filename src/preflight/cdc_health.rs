@@ -867,38 +867,37 @@ fn oracle_checks(
 fn mongo_capability_verdicts(
     cap: &crate::source::mongo::cdc::MongoCdcCapability,
 ) -> Vec<DoctorCheck> {
-    vec![
-        // Hard requirement: change streams need a replica set.
-        check(
-            "CDC replica set".into(),
-            cap.is_replica_set,
-            Some(if cap.is_replica_set {
-                format!("replica set (server {})", cap.server_version)
-            } else {
-                format!(
-                    "server {} is standalone — change streams unavailable",
-                    cap.server_version
-                )
-            }),
-            (!cap.is_replica_set).then(|| {
-                "MongoDB change streams require a replica set (a single-node one is fine): restart \
+    // Hard requirement: change streams need a replica set.
+    let replica_set = check(
+        "CDC replica set".into(),
+        cap.is_replica_set,
+        Some(if cap.is_replica_set {
+            format!("replica set (server {})", cap.server_version)
+        } else {
+            format!(
+                "server {} is standalone — change streams unavailable",
+                cap.server_version
+            )
+        }),
+        (!cap.is_replica_set).then(|| {
+            "MongoDB change streams require a replica set (a single-node one is fine): restart \
                  mongod with --replSet and run rs.initiate()"
-                    .to_string()
-            }),
-        ),
-        // The fidelity tier — informational (never a failure), but hinted for upgrade
-        // on the degraded tier so the degrade is declared, not silent.
-        check(
-            "CDC capture tier".into(),
-            true,
-            Some(cap.tier().to_string()),
-            (cap.major < 6).then(|| {
-                "upgrade to MongoDB 6.0+ and enable changeStreamPreAndPostImages for point-in-time \
+                .to_string()
+        }),
+    );
+    // The fidelity tier — informational (never a failure), but hinted for upgrade
+    // on the degraded tier so the degrade is declared, not silent.
+    let tier = check(
+        "CDC capture tier".into(),
+        true,
+        Some(cap.tier().to_string()),
+        (cap.major < 6).then(|| {
+            "upgrade to MongoDB 6.0+ and enable changeStreamPreAndPostImages for point-in-time \
                  post-images and delete pre-images"
-                    .to_string()
-            }),
-        ),
-    ]
+                .to_string()
+        }),
+    );
+    vec![replica_set, tier]
 }
 
 fn mongo_checks(
