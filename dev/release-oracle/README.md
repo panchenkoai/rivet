@@ -125,8 +125,8 @@ verdict.
 RIVET_PREV_RELEASE_BIN      /path/to/DOWNLOADED release binary   # REQUIRED for a release run: regression + differential + field replay (absent ⇒ FAIL, not SKIP); also the scale baseline
 RIVET_REGRESSION_SOURCE_URL postgresql://…                       # a PG the cell may seed regr_probe into
 RIVET_SCALE_<ENGINE>_URL    …                                    # batch-tier DBs, per engine
-BQ_ORACLE_PROJECT           …                                    # BigQuery stage
-BQ_ORACLE_DATASET           …                                    # one dataset PER SOURCE is derived from this
+BQ_ORACLE_PROJECT           …   # BigQuery stage; default dev/stand/registry.yaml's, when a Google credential is at hand
+BQ_ORACLE_DATASET           …   # one dataset PER SOURCE is derived from this; default rivet_tmp_gate
 ```
 
 `RIVET_PREV_RELEASE_BIN` must be a **downloaded release asset**
@@ -342,7 +342,8 @@ the declared parts in real GCS (httpfs, bearer token from `gcloud auth print-acc
 ledger (`export_metrics`, `file_log`, `load_run`) and BigQuery. All seven counts must be equal, the
 manifests must name one run, and the bucket must hold exactly the declared parts.
 
-Set `BQ_ORACLE_PROJECT` + `BQ_ORACLE_DATASET` (with ADC) to run it. Absent creds →
+It runs on the registry's warehouse whenever a Google credential is at hand
+(`BQ_ORACLE_PROJECT` / `BQ_ORACLE_DATASET` override it). Absent creds →
 the stage is **SKIP**, never a silent pass — but a real release build must run it
 green.
 
@@ -382,4 +383,4 @@ Re-bless the local goldens (verdicts + DuckDB type/fidelity) on purpose with
 
 Requires: docker, the `rivet` release binary, `duckdb`, `python3` (stdlib only),
 and — for the final stage — `bq` + ADC + a real GCS staging bucket
-(`BQ_ORACLE_BUCKET`, default `rivet_data_test`).
+(`BQ_ORACLE_BUCKET`, default: dev/stand/registry.yaml's `gcs.bucket`).

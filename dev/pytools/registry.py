@@ -46,6 +46,12 @@ def _running_container(declared: str, url: str) -> str:
     return found[0] if len(found) == 1 else declared
 
 
+def warehouse() -> tuple[str, str, str]:
+    """(BigQuery project, GCS bucket, BigQuery location) of the stand's warehouse."""
+    r = load()
+    return r["bigquery"]["project"], r["gcs"]["bucket"], r["bigquery"]["location"]
+
+
 def bq_tmp(name: str) -> str:
     """A disposable BigQuery dataset name — the only kind the sweep may drop."""
     return load()["bigquery"]["tmp_prefix"] + name
@@ -68,6 +74,7 @@ def orphaned(name: str) -> bool:
 def _self_test() -> None:
     assert source("postgres")["container"] == "rivet-postgres-1"
     assert bq_tmp("gate").startswith("rivet_tmp_")
+    assert all(warehouse()), "the registry names a project, a bucket and a location"
     assert not orphaned("users"), "a persistent fixture is never an orphan"
     assert not orphaned(f"t_{os.getpid()}_3"), "a live process's object is spared"
     dead = 2**22 + 12345

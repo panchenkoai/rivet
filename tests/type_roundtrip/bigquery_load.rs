@@ -14,13 +14,10 @@
 //! * The `c_bigint_u: decimal(20,0)` workaround keeps working — without it
 //!   BigQuery's Parquet reader also rejects `UINT64 > 2^63-1`.
 //!
-//! Gating: requires `BIGQUERY_TEST_PROJECT` env + `bq` CLI on PATH. Tests
-//! skip cleanly otherwise so CI without GCP credentials stays green.
-//!
-//! Configurable via env:
-//!   BIGQUERY_TEST_PROJECT  — required, e.g. `rivet-data-tool`
-//!   BIGQUERY_TEST_DATASET  — optional, default `rivet_type_lab`
-//!   BIGQUERY_TEST_LOCATION — optional, default `EU`
+//! Gating: a Google credential + `bq` CLI on PATH; each test records a skip naming
+//! what is missing otherwise. The project, dataset and location are the stand
+//! registry's (dev/stand/registry.yaml); `BIGQUERY_TEST_PROJECT`,
+//! `BIGQUERY_TEST_DATASET` and `BIGQUERY_TEST_LOCATION` override them.
 
 use crate::common::*;
 
@@ -75,18 +72,20 @@ fn skip_live(why: &str) {
     }
 }
 
+/// The registry's warehouse (env overrides it) when a credential and the `bq` CLI are at hand, else `None` after a skip naming what is missing.
 fn bq_config() -> Option<BqConfig> {
-    let project = std::env::var("BIGQUERY_TEST_PROJECT").ok()?;
     // `bq --version` is the cheapest reachable probe.
     if Command::new("bq").arg("--version").output().is_err() {
         skip_live("`bq` CLI not on PATH");
         return None;
     }
+    let (project, _) = warehouse_or_skip("bq_type_lab")?;
     Some(BqConfig {
         project,
         dataset: std::env::var("BIGQUERY_TEST_DATASET")
-            .unwrap_or_else(|_| "rivet_type_lab".to_string()),
-        location: std::env::var("BIGQUERY_TEST_LOCATION").unwrap_or_else(|_| "EU".to_string()),
+            .unwrap_or_else(|_| stand_bq_e2e().to_string()),
+        location: std::env::var("BIGQUERY_TEST_LOCATION")
+            .unwrap_or_else(|_| stand_bq_location().to_string()),
     })
 }
 
@@ -190,7 +189,6 @@ impl BqConfig {
 fn bigquery_validates_postgres_type_matrix_parquet() {
     require_alive(LiveService::Postgres);
     let Some(cfg) = bq_config() else {
-        skip_live("BIGQUERY_TEST_PROJECT not set");
         return;
     };
 
@@ -333,7 +331,6 @@ fn bigquery_validates_postgres_type_matrix_parquet() {
 fn bigquery_validates_mysql_type_matrix_parquet() {
     require_alive(LiveService::Mysql);
     let Some(cfg) = bq_config() else {
-        skip_live("BIGQUERY_TEST_PROJECT not set");
         return;
     };
 
@@ -492,7 +489,6 @@ exports:
 fn bigquery_validates_mssql_type_matrix_parquet() {
     require_alive(LiveService::Mssql);
     let Some(cfg) = bq_config() else {
-        skip_live("BIGQUERY_TEST_PROJECT not set");
         return;
     };
 

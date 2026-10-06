@@ -38,7 +38,7 @@ from pathlib import Path
 from .cdc import _mysql, _psql
 from ..pytools import registry
 from . import gcp
-from .core import Ledger, have, rivet, run
+from .core import Ledger, have, rivet
 from .scenarios import NO_TIMEOUT, work_dir
 
 # Per-invocation TABLE names, so a concurrent invocation's `DROP TABLE` cannot hit
@@ -135,8 +135,7 @@ def _shape_problems(body: str) -> list[str]:
 
 def verify_partner_shape(led: Ledger) -> None:
     led.phase("Partner shape — `rivet init --mode cdc` over 3 tables → anchor + backfill → load → delta → load (BigQuery)")
-    proj = os.environ.get("BQ_ORACLE_PROJECT") or run(["gcloud", "config", "get-value", "project"]).stdout.strip()
-    bucket = os.environ.get("BQ_ORACLE_BUCKET", "rivet_data_test")
+    proj, bucket = os.environ.get("BQ_ORACLE_PROJECT", ""), os.environ.get("BQ_ORACLE_BUCKET", "")
     if not have("gcloud") or not proj:
         led.skipped("-", "partner", "shape", "gcs",
                     "partner shape: no `gcloud` (the REST token) or no project (set BQ_ORACLE_PROJECT)", "no gcloud")

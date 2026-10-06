@@ -13,7 +13,7 @@ from __future__ import annotations
 import os
 import re
 
-from .core import RAN_LIVE_MODULES, RAN_LIVE_TESTS, ROOT, Ledger, have, run
+from .core import RAN_LIVE_MODULES, RAN_LIVE_TESTS, ROOT, Ledger
 from .scenarios import _run_live_modules
 
 __all__ = ["verify_live_modules", "live_suite_modules", "exclusive_tests", "EXCLUDED"]
@@ -57,10 +57,7 @@ def verify_live_modules(led: Ledger) -> None:
     # a Postgres state URL for the ones that share one — and NO ambient RIVET_STATE_URL, which
     # would move every SQLite-reading test onto Postgres (the batch_resume lesson).
     state = os.environ.get("RIVET_CDC_STATE_URL") or os.environ.get("RIVET_GATE_STATE_URL") or ""
-    proj = os.environ.get("BQ_ORACLE_PROJECT") or (
-        run(["gcloud", "config", "get-value", "project"]).stdout.strip() if have("gcloud") else "")
-    env = {"RIVET_STATE_URL": "", "RIVET_GATE_STATE_URL": "", "RIVET_TEST_STATE_URL": state, "BIGQUERY_TEST_PROJECT": proj,
-           "RIVET_TEST_GCS_BUCKET": os.environ.get("BQ_ORACLE_BUCKET", "rivet_data_test")}
+    env = {"RIVET_STATE_URL": "", "RIVET_GATE_STATE_URL": "", "RIVET_TEST_STATE_URL": state}
     _run_live_modules(led, "live", "live modules",
                       f"every other live_suite module ({len(left)}), derived from tests/live_suite.rs",
                       left, env=env,

@@ -56,8 +56,8 @@ STATE_URL = os.environ.get(
     "RIVET_MW_STATE_URL", "postgresql://rivet:rivet@localhost:5433/rivet_state"
 )
 STATE_CONTAINER = os.environ.get("RIVET_SWEEP_STATE_CONTAINER", "rivet-postgres-state-1")
-BUCKET = os.environ.get("BQ_ORACLE_BUCKET", "rivet_data_test")
-BQ_PROJECT = os.environ.get("BQ_ORACLE_PROJECT", "rivet-data-tool")
+BQ_PROJECT, BUCKET = (os.environ.get("BQ_ORACLE_PROJECT") or registry.warehouse()[0],
+                      os.environ.get("BQ_ORACLE_BUCKET") or registry.warehouse()[1])
 BQ_DATASET = os.environ.get("BQ_ORACLE_DATASET") or registry.load()["bigquery"]["e2e"]
 
 #: Rows each engine contributes, and where its id range starts. Disjoint by

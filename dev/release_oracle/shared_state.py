@@ -59,15 +59,9 @@ def run_rig_tests(led: Ledger, scenario: str, tests: tuple[str, ...],
     checks = [("cargo", have("cargo"))]
     if cloud:
         state = os.environ.get("RIVET_CDC_STATE_URL") or os.environ.get("RIVET_CONC_STATE_URL") or ""
-        proj = os.environ.get("BQ_ORACLE_PROJECT") or (
-            run(["gcloud", "config", "get-value", "project"]).stdout.strip() if have("gcloud") else "")
         checks += [("gcloud", have("gcloud")), ("Postgres state URL", state.startswith("postgres")),
-                   ("BigQuery project", bool(proj))]
-        env.update({
-            "RIVET_TEST_STATE_URL": state,
-            "BIGQUERY_TEST_PROJECT": proj,
-            "RIVET_TEST_GCS_BUCKET": os.environ.get("BQ_ORACLE_BUCKET", "rivet_data_test"),
-        })
+                   ("a Google credential (BQ_ORACLE_PROJECT)", bool(os.environ.get("BQ_ORACLE_PROJECT")))]
+        env["RIVET_TEST_STATE_URL"] = state
     checks += [(f"{name} (:{port})", _listening(port)) for name, port in services]
     missing = [w for w, ok in checks if not ok]
     if missing:

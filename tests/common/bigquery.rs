@@ -46,6 +46,18 @@ fn token(refresh: bool) -> Option<String> {
     Some(tok)
 }
 
+/// The warehouse project and bucket (super::registry::warehouse) when a Google credential is at hand, else `None` after a skip naming what is missing.
+pub fn warehouse_or_skip(label: &str) -> Option<(String, String)> {
+    let (project, bucket) = super::registry::warehouse();
+    if token(false).is_none() {
+        super::skip_live(&format!(
+            "{label}: no Google credential for BIGQUERY_TEST_PROJECT={project} (`gcloud auth print-access-token` failed: run `gcloud auth login` and `gcloud auth application-default login`)"
+        ));
+        return None;
+    }
+    Some((project, bucket))
+}
+
 /// (status, JSON body) of one authorised request, or None when it could not be made;
 /// a 401 re-asks gcloud for a token once. Never panics — the Drop cleanups use it.
 fn try_call(
@@ -250,17 +262,9 @@ pub struct BqLive {
 }
 
 impl BqLive {
-    /// `BIGQUERY_TEST_PROJECT` + `RIVET_TEST_GCS_BUCKET`, or `None` with a skip note; the dataset is this test's own disposable one unless `RIVET_TEST_BQ_DATASET` names a shared one.
+    /// The registry's warehouse (env overrides it), or `None` with a skip note when no Google credential is at hand; the dataset is this test's own disposable one unless `RIVET_TEST_BQ_DATASET` names a shared one.
     pub fn from_env(label: &str) -> Option<Self> {
-        let (Ok(project), Ok(bucket)) = (
-            std::env::var("BIGQUERY_TEST_PROJECT"),
-            std::env::var("RIVET_TEST_GCS_BUCKET"),
-        ) else {
-            super::skip_live(&format!(
-                "{label}: BIGQUERY_TEST_PROJECT / RIVET_TEST_GCS_BUCKET unset"
-            ));
-            return None;
-        };
+        let (project, bucket) = warehouse_or_skip(label)?;
         let unique = super::unique_name(label);
         let (dataset, owned) = match std::env::var("RIVET_TEST_BQ_DATASET") {
             Ok(shared) => (shared, false),

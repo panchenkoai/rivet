@@ -48,12 +48,11 @@ test-types-validators:
 # Cloud validator: PG/MySQL matrix → Parquet → BigQuery (real warehouse oracle).
 # Requires:
 #   - `bq` CLI on PATH and authenticated (`gcloud auth application-default login`).
-#   - BIGQUERY_TEST_PROJECT env var. Optional: BIGQUERY_TEST_DATASET (default
-#     `rivet_type_lab`), BIGQUERY_TEST_LOCATION (default `EU`).
+#   - The project, dataset and location come from dev/stand/registry.yaml;
+#     BIGQUERY_TEST_PROJECT / BIGQUERY_TEST_DATASET / BIGQUERY_TEST_LOCATION override them.
 #   - docker-compose postgres + mysql for the source databases.
 # Mirrors the docs/recipes/snowflake-load.md fidelity table — pins what
 # BigQuery's autoload actually does to rivet Parquet today.
-# Example: `BIGQUERY_TEST_PROJECT=my-proj make test-types-bigquery`.
 test-types-bigquery:
 	$(LIVE) cargo test --test type_roundtrip bigquery_validates -- --include-ignored --test-threads=1
 
@@ -261,12 +260,9 @@ RIVET_CDC_MONGO_URL       ?= mongodb://127.0.0.1:27018/rivet?directConnection=tr
 RIVET_GATE_STATE_URL      ?= postgresql://rivet:rivet@127.0.0.1:5433/rivet_state
 RIVET_SWEEP_STATE_CONTAINER ?= rivet-postgres-state-1
 RIVET_CONC_SRC_CONTAINER  ?= rivet-postgres-1
-# Not hard-coded to anyone's project: whatever `gcloud` is pointed at. Empty ⇒
-# the BigQuery legs SKIP with that reason, which is correct on a machine with no
-# warehouse.
-BQ_ORACLE_PROJECT         ?= $(shell gcloud config get-value project 2>/dev/null)
-BQ_ORACLE_DATASET         ?= rivet_tmp_gate
-BQ_ORACLE_BUCKET          ?= rivet_data_test
+# BQ_ORACLE_PROJECT / _DATASET / _BUCKET override the warehouse; left empty, the gate
+# takes dev/stand/registry.yaml's when a Google credential is at hand, and its
+# BigQuery legs SKIP naming the missing credential otherwise.
 # OUTSIDE target/: the oracle's first act is `cargo clean` (the gate builds the
 # binary it grades), which silently deleted a baseline downloaded into
 # target/prev-release — the regression leg then "declared-skipped" on every

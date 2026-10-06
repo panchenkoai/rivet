@@ -987,11 +987,7 @@ fn oracle_cdc_cli_resolves_the_source_from_env_and_file_alike() {
         ora_exec(&format!("INSERT INTO {} VALUES ({id}, {id})", t.name()));
         let out = run_rivet_args_bounded_env(&args, envs, std::time::Duration::from_secs(90))
             .unwrap_or_else(|| panic!("`rivet cdc {}` did not terminate", form.join(" ")));
-        out.lines()
-            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-            .filter(|v| v.get("table").and_then(|x| x.as_str()) == Some(t.name()))
-            .filter_map(|v| v.get("after")?.get(0)?.as_i64())
-            .collect::<std::collections::BTreeSet<i64>>()
+        ndjson_after_ids(&out, t.name())
     };
     let inline = capture(&["--source", ORACLE_CDC_URL], &[], 1);
     assert_eq!(inline, [1].into(), "the inline form captures its change");

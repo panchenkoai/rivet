@@ -189,6 +189,27 @@ seeds:
       sqlite-state:
         na: the SQLite ladder never replays over leftovers - its version row lives in the same file and the ladder runs under BEGIN IMMEDIATE, so a migration there is not required to be idempotent
 
+  - name: capped-run-skips-remainder
+    class: a `rivet cdc --max-events` run that stops at its cap moves its position past the changes after the cap, so the next run never delivers them
+    history: "the rig oracle graded no `rivet cdc` subcommand run until it learned the subcommand and paired a capped run with the next one (#441)"
+    scope: source
+    engines:
+      mysql:
+        patch: capped-run-skips-remainder/ndjson.patch
+        cells: [mysql_cdc_cli_a_capped_run_leaves_its_remainder_to_the_next_run]
+      mongo:
+        patch: capped-run-skips-remainder/ndjson.patch
+        cells: [mongo_cdc_cli_a_capped_run_leaves_its_remainder_to_the_next_run]
+      postgres:
+        patch: capped-run-skips-remainder/sink.patch
+        cells: [pg_cdc_cli_a_capped_run_leaves_its_remainder_to_the_next_run]
+      mssql:
+        patch: capped-run-skips-remainder/sink.patch
+        cells: [mssql_cdc_cli_a_capped_run_leaves_its_remainder_to_the_next_run]
+      oracle:
+        patch: capped-run-skips-remainder/sink.patch
+        cells: [oracle_cdc_cli_writes_csv_parts_and_stops_at_the_cap_on_a_commit]
+
   - name: remedy-does-not-recover
     class: a CDC data-loss message prescribes a re-baseline that cannot be followed from the state that printed it
     history: "the slot-created warning and every re-anchor refusal said `re-snapshot (mode: full)`, which is refused for a CDC export and for a batch export into its destination"

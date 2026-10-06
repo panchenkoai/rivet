@@ -679,7 +679,9 @@ def bq_env():
         proj = r.stdout.strip() if r.ok else ""
     if not proj or proj == "(unset)":
         return None
-    bucket = os.environ.get("RIVET_SCEN_GCS_BUCKET", "rivet_data_test")
+    from . import registry
+
+    bucket = os.environ.get("RIVET_SCEN_GCS_BUCKET") or registry.warehouse()[1]
     if not shell.run(["gcloud", "storage", "ls", f"gs://{bucket}/"], timeout=120).ok:
         return None
     return proj, os.environ.get("RIVET_SCEN_BQ_DATASET", "rivet_scen"), bucket
