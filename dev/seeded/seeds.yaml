@@ -239,3 +239,39 @@ seeds:
       lib:
         cells:
           - "lib:the_rebaseline_remedy_names_the_steps_the_product_runs"
+
+  - name: progress-inherited-by-another-stream
+    class: stored progress (incremental cursor, keyset high-water, resume anchor) is continued by an export that reads another table or collection
+    history: "2026-10-06 - two same-named exports on one state database, or one export repointed without a reset: exit 0 with _SUCCESS and 0 of 1000 rows (v0.30.0, v0.31.0)"
+    scope: source
+    patch: progress-inherited-by-another-stream/shared.patch
+    engines:
+      postgres:
+        cells:
+          - incremental_repointed_at_another_table_postgres
+          - incremental_query_repointed_at_another_table_postgres
+          - keyset_incremental_repointed_at_another_table_postgres
+          - parallel_keyset_incremental_repointed_at_another_table_postgres
+      mysql:
+        cells:
+          - incremental_repointed_at_another_table_mysql
+          - incremental_query_repointed_at_another_table_mysql
+          - keyset_incremental_repointed_at_another_table_mysql
+          - parallel_keyset_incremental_repointed_at_another_table_mysql
+      mssql:
+        cells:
+          - incremental_repointed_at_another_table_mssql
+          - incremental_query_repointed_at_another_table_mssql
+          - keyset_incremental_repointed_at_another_table_mssql
+          - parallel_keyset_incremental_repointed_at_another_table_mssql
+      oracle:
+        cells:
+          - incremental_repointed_at_another_table_oracle
+          - incremental_query_repointed_at_another_table_oracle
+          - keyset_incremental_repointed_at_another_table_oracle
+          - parallel_keyset_incremental_repointed_at_another_table_oracle
+      mongo:
+        cells: [resume_repointed_at_another_collection_mongo]
+      lib:
+        cells:
+          - "lib:a_stored_cursor_is_refused_for_another_table_every_time_until_a_reset"

@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- **Breaking: a run refuses to continue from progress stored for another table or collection**
+  (`RIVET_STATE_CURSOR_STREAM_MISMATCH`, exit 5, nothing read or written). The stored incremental
+  cursor, `keyset_incremental` high-water, MongoDB `resume` `_id` and interrupted-run anchor now
+  record the relation they were read from.
+  - Before (0.30.0, 0.31.0 and earlier): an export repointed at another table without
+    `rivet state reset`, or two exports with one name in one state database reading different
+    tables, continued from the other table's value: exit 0, `_SUCCESS`, 0 of 1000 rows.
+  - The relation is the first one the query's outermost `FROM` names (`table:` or `query:`),
+    quotes stripped. Changing the columns, the filter or a join keeps the cursor. `orders` and
+    `public.orders` are the same relation; `a.orders` and `b.orders` are not. A query whose `FROM`
+    is a subquery names none and is not checked.
+  - Remedy: give each export that shares a state database its own name; if you repointed an
+    export, `rivet state reset -c <config> --export <name>` starts the new table with a full pass.
+    The reset discards the progress of every export of that name in the state database.
+  - Upgrade: state schema v33 (one nullable column; releases before this one refuse a migrated
+    state database, as with every schema bump). Progress written by an earlier release names no
+    relation: the first run adopts the relation it reads, logs one `WARN` saying so, and keeps the
+    cursor. It does not reset and does not refuse, so a repoint made BEFORE the upgrade is not
+    detected.
+  - An export whose `FROM` relation comes from a `--param` that changes between runs is now
+    refused when it continues a stored cursor.
+
 - **Breaking: CDC writes an UPDATE that changes the key as a delete of the old key and an insert
   of the new row** (ADR-0030, accepted), on PostgreSQL, MySQL and Oracle. SQL Server's change
   table already did this, and MongoDB's `_id` cannot change.

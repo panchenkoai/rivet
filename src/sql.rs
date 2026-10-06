@@ -330,8 +330,105 @@ pub(crate) fn oracle_catalog_preds(qualified: &str) -> (String, String) {
     }
 }
 
+/// The first relation the outermost `FROM` of `query` names, quotes stripped (`schema.table`); `None` for a subquery or no `FROM`.
+pub(crate) fn outer_from_relation(query: &str) -> Option<String> {
+    let b = query.as_bytes();
+    let ident = |c: u8| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'$' | b'#') || c >= 0x80;
+    let closer = |c: u8| match c {
+        b'\'' | b'"' | b'`' => Some(c),
+        b'[' => Some(b']'),
+        _ => None,
+    };
+    let (mut i, mut depth) = (0usize, 0i32);
+    let after_from = loop {
+        let c = *b.get(i)?;
+        if let Some(end) = closer(c) {
+            i += 1 + b[i + 1..].iter().position(|&x| x == end)?;
+        } else if c == b'(' {
+            depth += 1;
+        } else if c == b')' {
+            depth -= 1;
+        } else if depth == 0
+            && b.len() >= i + 4
+            && b[i..i + 4].eq_ignore_ascii_case(b"from")
+            && (i == 0 || !ident(b[i - 1]))
+            && b.get(i + 4).is_none_or(|&n| !ident(n))
+        {
+            break i + 4;
+        }
+        i += 1;
+    };
+    let mut rest = query[after_from..].trim_start();
+    let mut parts: Vec<&str> = Vec::new();
+    loop {
+        let first = *rest.as_bytes().first()?;
+        let (part, tail) = match closer(first).filter(|_| first != b'\'') {
+            Some(end) => {
+                let close = rest[1..].find(end as char)? + 1;
+                (&rest[1..close], &rest[close + 1..])
+            }
+            None => {
+                let end = rest.bytes().position(|c| !ident(c)).unwrap_or(rest.len());
+                (&rest[..end], &rest[end..])
+            }
+        };
+        if part.is_empty() {
+            return None;
+        }
+        parts.push(part);
+        match tail.strip_prefix('.') {
+            Some(next) => rest = next,
+            None => return Some(parts.join(".")),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn outer_from_relation_names_the_object_a_query_reads_and_nothing_else() {
+        let rel = |q: &str| outer_from_relation(q);
+        let t = |s: &str| Some(s.to_string());
+        assert_eq!(rel("SELECT * FROM orders"), t("orders"));
+        assert_eq!(
+            rel("SELECT \"id\", \"updated_at\"\nFROM \"orders\"\n"),
+            t("orders")
+        );
+        assert_eq!(
+            rel("select `id` from `shop`.`orders` o where o.id > 1"),
+            t("shop.orders")
+        );
+        assert_eq!(
+            rel("SELECT id FROM [dbo].[order lines] AS l"),
+            t("dbo.order lines")
+        );
+        assert_eq!(rel("SELECT id FROM RIVET.ORDERS"), t("RIVET.ORDERS"));
+        assert_eq!(
+            rel(
+                "SELECT id, extract(year FROM created) y, 'x from y' s FROM orders JOIN users u ON 1=1"
+            ),
+            t("orders")
+        );
+        assert_eq!(
+            rel("WITH recent AS (SELECT * FROM archive) SELECT * FROM recent"),
+            t("recent")
+        );
+        assert_eq!(
+            rel("SELECT id FROM orders"),
+            rel("SELECT id, added_later FROM orders WHERE id > 0"),
+            "a changed projection or filter reads the same object"
+        );
+        assert_ne!(rel("SELECT id FROM orders"), rel("SELECT id FROM orders_b"));
+        assert_ne!(
+            rel("SELECT id FROM a.orders"),
+            rel("SELECT id FROM b.orders")
+        );
+        assert_eq!(rel("SELECT * FROM (SELECT 1) x"), None);
+        assert_eq!(rel("SELECT 1"), None);
+        assert_eq!(rel("SELECT fromage FROM"), None);
+        assert_eq!(rel("SELECT 'unterminated FROM t"), None);
+    }
 
     #[test]
     fn oracle_derived_aliases_are_quoted_and_carry_no_as() {

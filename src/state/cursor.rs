@@ -22,9 +22,13 @@ fn identity_matches(owner: &str, expected: &str, legacy: bool) -> bool {
             .is_some_and(|rest| rest.starts_with(','))
 }
 
-/// Whether two recorded streams name different objects; an empty one (a `query:` export) names none.
+/// Whether two recorded streams provably name different objects: an empty one names none, and a bare name may be the qualified one.
 fn streams_differ(stored: &str, now: &str) -> bool {
-    !stored.is_empty() && !now.is_empty() && stored != now
+    let qualifies = |long: &str, short: &str| {
+        long.strip_suffix(short)
+            .is_some_and(|q| q.is_empty() || q.ends_with('.'))
+    };
+    !stored.is_empty() && !now.is_empty() && !qualifies(stored, now) && !qualifies(now, stored)
 }
 
 /// The progress a run would continue from, worded for a message: an interrupted run's anchor, else the cursor a clean run seeks from.
@@ -460,7 +464,24 @@ mod tests {
     }
 
     #[test]
-    fn a_query_export_names_no_stream_and_is_never_refused_or_adopted() {
+    fn a_qualifier_added_to_the_same_name_is_not_another_stream_but_another_qualifier_is() {
+        for (stored, now, differ) in [
+            ("orders", "orders", false),
+            ("orders", "public.orders", false),
+            ("shop.orders", "orders", false),
+            ("a.orders", "b.orders", true),
+            ("orders", "reorders", true),
+            ("reorders", "orders", true),
+            ("orders", "public.orders_b", true),
+            ("", "orders", false),
+            ("orders", "", false),
+        ] {
+            assert_eq!(streams_differ(stored, now), differ, "{stored} vs {now}");
+        }
+    }
+
+    #[test]
+    fn a_query_naming_no_relation_is_never_refused_or_adopted() {
         let s = store();
         s.update_with_column("orders", "pg/db", "110", "id", "orders_a")
             .unwrap();

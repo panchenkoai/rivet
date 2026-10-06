@@ -118,3 +118,48 @@ scenarios:
     mssql:    { test: legacy_incremental_state_then_other_column_mssql }
     mongo:    { na: "a Mongo export accepts only mode: full or cdc (validate_non_sql_source_modes, src/config/mod.rs:543-554), so there is no incremental / chunked mode to switch from or into; the switch Mongo has (into page_size + resume) is graded by the three *_then_resume_mongo cells" }
     oracle:   { gap: "no Oracle mode-transition live test (the transition logic is shared; the cursor/keyset state Oracle writes is unproven here)" }
+
+  # Stream identity: the stored progress names the table / collection it was read from. Each cell
+  # exports table A, switches the SAME export name and state to table B without a reset, requires the
+  # refusal (exit 5, RIVET_STATE_CURSOR_STREAM_MISMATCH, nothing written) TWICE, then re-reads every
+  # row of B after the remedy.
+
+  - id: incremental_repointed_at_another_table
+    what: "one config repointed in place (table:): refused twice; full pass of the new table after state reset"
+    postgres: { test: incremental_repointed_at_another_table_postgres }
+    mysql:    { test: incremental_repointed_at_another_table_mysql }
+    mssql:    { test: incremental_repointed_at_another_table_mssql }
+    oracle:   { test: incremental_repointed_at_another_table_oracle }
+    mongo:    { na: "a Mongo export accepts only mode: full or cdc; its stored-cursor continuation (page_size + resume) is the keyset_incremental_repointed row" }
+
+  - id: incremental_query_repointed_at_another_table
+    what: "the rivet init shape (query:): a column added to the SELECT keeps the cursor; another FROM table is refused twice"
+    postgres: { test: incremental_query_repointed_at_another_table_postgres }
+    mysql:    { test: incremental_query_repointed_at_another_table_mysql }
+    mssql:    { test: incremental_query_repointed_at_another_table_mssql }
+    oracle:   { test: incremental_query_repointed_at_another_table_oracle }
+    mongo:    { na: "a Mongo export names a collection, never a query" }
+
+  - id: keyset_incremental_repointed_at_another_table
+    what: "keyset_incremental high-water (Mongo: resume) repointed in place: refused twice"
+    postgres: { test: keyset_incremental_repointed_at_another_table_postgres }
+    mysql:    { test: keyset_incremental_repointed_at_another_table_mysql }
+    mssql:    { test: keyset_incremental_repointed_at_another_table_mssql }
+    oracle:   { test: keyset_incremental_repointed_at_another_table_oracle }
+    mongo:    { test: resume_repointed_at_another_collection_mongo }
+
+  - id: parallel_keyset_incremental_repointed_at_another_table
+    what: "parallel keyset_incremental anchor repointed in place: refused twice"
+    postgres: { test: parallel_keyset_incremental_repointed_at_another_table_postgres }
+    mysql:    { test: parallel_keyset_incremental_repointed_at_another_table_mysql }
+    mssql:    { test: parallel_keyset_incremental_repointed_at_another_table_mssql }
+    oracle:   { test: parallel_keyset_incremental_repointed_at_another_table_oracle }
+    mongo:    { na: "the parallel _id-range reader records no _id (parallel_keyset_then_resume_mongo), so it has no stored progress to inherit" }
+
+  - id: shared_name_another_table
+    what: "two configs, one export name, one Postgres state database, two tables: the second is refused twice until it has its own name (skips without RIVET_GATE_STATE_URL)"
+    postgres: { test: incremental_shared_name_another_table_postgres }
+    mysql:    { test: incremental_shared_name_another_table_mysql }
+    mssql:    { test: incremental_shared_name_another_table_mssql }
+    oracle:   { test: incremental_shared_name_another_table_oracle }
+    mongo:    { test: resume_shared_name_another_collection_mongo }

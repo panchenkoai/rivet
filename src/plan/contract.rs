@@ -241,9 +241,9 @@ pub enum ExtractionStrategy {
 }
 
 impl ResolvedRunPlan {
-    /// The stream stored progress belongs to: the export's `table:` as declared; empty for a `query:` export.
-    pub fn stream(&self) -> &str {
-        self.source_table.as_deref().unwrap_or_default()
+    /// The stream stored progress belongs to: the relation the query's outermost `FROM` names; empty when it names none.
+    pub fn stream(&self) -> String {
+        crate::sql::outer_from_relation(&self.base_query).unwrap_or_default()
     }
 }
 

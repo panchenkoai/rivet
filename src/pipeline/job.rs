@@ -1279,7 +1279,7 @@ fn execute_resolved_plan(
         .claim_stream(
             &plan.export_name,
             &plan.source.state_key(),
-            plan.stream(),
+            &plan.stream(),
             plan.strategy.continues_stored_cursor(),
         )
         .and_then(|()| chunked::claim_checkpoint_run(state, plan));

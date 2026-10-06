@@ -526,7 +526,7 @@ fn run_keyset_parallel(
                 &key,
                 &lo_hi_pairs(&fresh),
             )?;
-            st.set_resume_run_id(&plan.export_name, &scope, &summary.run_id, plan.stream())?;
+            st.set_resume_run_id(&plan.export_name, &scope, &summary.run_id, &plan.stream())?;
             fresh
         }
         _ => sample_parallel_ranges(src, plan, &key, parallel, floor_r, ceil_r)?,
@@ -1077,7 +1077,7 @@ pub(crate) fn run_keyset(
                 if !kp.incremental {
                     st.clear_cursor_value(&plan.export_name, &scope)?;
                 }
-                st.set_resume_run_id(&plan.export_name, &scope, &summary.run_id, plan.stream())?;
+                st.set_resume_run_id(&plan.export_name, &scope, &summary.run_id, &plan.stream())?;
             }
         }
     }
@@ -1197,7 +1197,7 @@ pub(crate) fn run_keyset(
                         &plan.source.state_key(),
                         v,
                         &kp.key_column,
-                        plan.stream(),
+                        &plan.stream(),
                     )?;
                 }
                 Ok(())

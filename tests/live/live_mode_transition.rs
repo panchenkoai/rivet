@@ -718,10 +718,56 @@ fn stream_shared_name(engine: SqlEngine, stage: Stage) {
     assert_eq!(ids(second.path()), (1..=10).collect::<Vec<_>>());
 }
 
-/// Mongo `resume`: export collection `hi` (`_id` 101..=110), repoint the same export at `lo` (`_id` 1..=10) without a reset.
-#[test]
-#[ignore = "live: requires docker compose up -d mongo"]
-fn resume_repointed_at_another_collection_mongo() {
+/// The `rivet init` shape (`query:`): a column added to the SELECT keeps the cursor; another FROM table is refused.
+fn stream_query_repoint(engine: SqlEngine) {
+    engine.alive();
+    let (a, _ga) = engine.table("stream_a");
+    let (b, _gb) = engine.table("stream_b");
+    engine.insert(&a, 101..=110, 170, Some(10));
+    engine.insert(&b, 1..=10, 180, Some(10));
+    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let ids = |out: &Path| delivered_ids(engine, out);
+    let stage = INCREMENTAL_ID;
+
+    let rig = engine
+        .rig(&a)
+        .query(&format!("SELECT id, ext_id, server_time FROM {a}"));
+    let rig = staged_for(engine, rig, &stage, dirs[0].path());
+    rig.run_ok();
+    assert_eq!(ids(dirs[0].path()), (101..=110).collect::<Vec<_>>());
+
+    engine.insert(&a, 111..=113, 160, Some(10));
+    let wider = rig.query(&format!(
+        "SELECT id, ext_id, server_time, time_spent FROM {a} WHERE id > 0"
+    ));
+    let wider = continued(staged_for(engine, wider, &stage, dirs[1].path()));
+    wider.run_ok();
+    assert_eq!(
+        ids(dirs[1].path()),
+        vec![111, 112, 113],
+        "the cursor is kept"
+    );
+
+    let other = wider.query(&format!("SELECT id, ext_id, server_time FROM {b}"));
+    let other = staged_for(engine, other, &stage, dirs[2].path());
+    refused_twice_for_the_stream(&other, dirs[2].path(), &a, &b, &ids);
+    let reset = other.cli(&["state", "reset", "--export", &a]);
+    assert!(
+        reset.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reset.stderr)
+    );
+    other.run_ok();
+    assert_eq!(ids(dirs[2].path()), (1..=10).collect::<Vec<_>>());
+}
+
+/// Mongo `resume`: export collection `hi` (`_id` 101..=110), then read `lo` (`_id` 1..=10) under the same export name and state.
+fn mongo_stream(shared_name: bool) {
+    if shared_name && state_url_under_test().is_none() {
+        return skip_live(
+            "RIVET_GATE_STATE_URL unset: two configs share one state only on the Postgres backend",
+        );
+    }
     require_alive(LiveService::Mongo);
     let db = unique_name("mt_stream");
     let m = MongoTest::connect(27017, &db);
@@ -738,24 +784,50 @@ fn resume_repointed_at_another_collection_mongo() {
         v.sort();
         v
     };
-    let rig = Rig::mongo_batch("hi")
-        .source_url(&MongoTest::url(27017, &db))
-        .mongo("page_size: 4, resume: true")
-        .dest_path(first.path().to_path_buf());
+    let name = unique_name("hi");
+    let rig_for = |coll: &str, out: &Path| {
+        Rig::mongo_batch(coll)
+            .export_named(&name)
+            .source_url(&MongoTest::url(27017, &db))
+            .mongo("page_size: 4, resume: true")
+            .dest_path(out.to_path_buf())
+    };
+    let rig = rig_for("hi", first.path());
     rig.run_ok();
     assert_eq!(ids(first.path()), (101..=110).collect::<Vec<_>>());
 
-    let rig = rig.repoint("lo").dest_path(second.path().to_path_buf());
+    let rig = if shared_name {
+        rig_for("lo", second.path())
+    } else {
+        rig.repoint("lo").dest_path(second.path().to_path_buf())
+    };
     refused_twice_for_the_stream(&rig, second.path(), "hi", "lo", &ids);
 
-    let reset = rig.cli(&["state", "reset", "--export", "hi"]);
-    assert!(
-        reset.status.success(),
-        "{}",
-        String::from_utf8_lossy(&reset.stderr)
-    );
+    let rig = if shared_name {
+        rig.export_named(&unique_name("own"))
+    } else {
+        let reset = rig.cli(&["state", "reset", "--export", &name]);
+        assert!(
+            reset.status.success(),
+            "{}",
+            String::from_utf8_lossy(&reset.stderr)
+        );
+        rig
+    };
     rig.run_ok();
     assert_eq!(ids(second.path()), (1..=10).collect::<Vec<_>>());
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mongo"]
+fn resume_repointed_at_another_collection_mongo() {
+    mongo_stream(false);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mongo"]
+fn resume_shared_name_another_collection_mongo() {
+    mongo_stream(true);
 }
 
 #[test]
@@ -856,4 +928,29 @@ fn incremental_shared_name_another_table_mssql() {
 #[ignore = "live: requires docker compose oracle"]
 fn incremental_shared_name_another_table_oracle() {
     stream_shared_name(SqlEngine::Oracle, INCREMENTAL_ID);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn incremental_query_repointed_at_another_table_mysql() {
+    stream_query_repoint(SqlEngine::Mysql);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn incremental_query_repointed_at_another_table_postgres() {
+    stream_query_repoint(SqlEngine::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn incremental_query_repointed_at_another_table_mssql() {
+    stream_query_repoint(SqlEngine::Mssql);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn incremental_query_repointed_at_another_table_oracle() {
+    stream_query_repoint(SqlEngine::Oracle);
 }
