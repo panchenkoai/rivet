@@ -1,0 +1,33 @@
+{
+  "error": "2 load(s) failed; representative error follows (also: table 'events': the warehouse answered 503): table 'users': permission denied on dataset analytics",
+  "exit_class": 1,
+  "exit_code": 1,
+  "class": "generic",
+  "kind": null,
+  "retryable": false,
+  "action": null,
+  "failures": [
+    {
+      "export": "users_cdc",
+      "table": "users",
+      "code": null,
+      "kind": null,
+      "class": "generic",
+      "exit_code": 1,
+      "retryable": false,
+      "action": null,
+      "message": "table 'users': permission denied on dataset analytics"
+    },
+    {
+      "export": "events",
+      "table": "events",
+      "code": null,
+      "kind": null,
+      "class": "retryable",
+      "exit_code": 2,
+      "retryable": true,
+      "action": null,
+      "message": "table 'events': the warehouse answered 503"
+    }
+  ]
+}

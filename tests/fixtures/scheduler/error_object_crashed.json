@@ -1,0 +1,9 @@
+{
+  "code": null,
+  "kind": null,
+  "class": "crashed",
+  "exit_code": null,
+  "retryable": true,
+  "action": null,
+  "message": "rivet was killed by signal 9"
+}

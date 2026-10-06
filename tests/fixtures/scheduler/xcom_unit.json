@@ -1,5 +1,6 @@
 {
-  "unit": "orders_cdc",
+  "export": "orders_cdc",
+  "table": null,
   "status": "failed",
   "run_id": "20261006T101500.123-orders_cdc",
   "rows": 0,
@@ -11,6 +12,6 @@
     "class": "refusal",
     "exit_code": 5,
     "retryable": false,
-    "action": "restore the missing log, or delete the checkpoint so the stream anchors FIRST, then re-snapshot"
+    "action": "restore the missing log, or re-baseline the stream: delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, give it `cdc.initial: snapshot`, then re-run"
   }
 }

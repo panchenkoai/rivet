@@ -1,0 +1,22 @@
+{
+  "error": "export 'events' exited with status signal",
+  "exit_class": 1,
+  "exit_code": null,
+  "class": "crashed",
+  "kind": null,
+  "retryable": true,
+  "action": null,
+  "failures": [
+    {
+      "export": "events",
+      "table": null,
+      "code": null,
+      "kind": null,
+      "class": "crashed",
+      "exit_code": null,
+      "retryable": true,
+      "action": null,
+      "message": "export 'events' exited with status signal"
+    }
+  ]
+}

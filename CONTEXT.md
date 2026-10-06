@@ -167,8 +167,9 @@ mode (as a type name — `until_current` remains the user-facing config key).
 **Error object**:
 The one machine shape of a failure — `code`, `kind`, `class`, `exit_code`,
 `retryable`, `action`, `message` — produced by one function and carried by every
-emitter. A consumer branches on `retryable`, never on text or a table of exit
-codes. _Avoid_: error class (that is the text-derived `error_class` metric
+emitter. A consumer branches on `retryable` ("a re-run without human action may
+succeed"), never on text or a table of exit codes. A unit killed by a signal
+has the class `crashed`: no exit code, retryable under its own short budget. _Avoid_: error class (that is the text-derived `error_class` metric
 label), error payload.
 
 **Stop reason**:
@@ -177,12 +178,15 @@ drain's own cap flag, never inferred from counts. _Avoid_: drain status, backlog
 flag.
 
 **State identity**:
-The credential-free source key a state records as its owner. A declared
-`sqlite:` state directory holding another source's state is refused
-(`RIVET_STATE_FOREIGN`). _Avoid_: pipeline id, config hash.
+The credential-free source key (`SourceConfig::state_key`,
+`engine://host:port/database`) a state records as its owner. A declared
+`sqlite:` state directory is refused (`RIVET_STATE_FOREIGN`) only when its key
+and the command's key are both non-empty and differ. Not the load's
+`source_ident` (`engine:schema.table`), which guards one warehouse table. _Avoid_: pipeline id, config hash.
 
 **Run lease**:
-The `run:<export>` lease the process running an export holds for the whole run;
+The per-export lease (key `chunk-run:<export>`, kept for upgrade compatibility)
+the process running an export holds for the whole run;
 a second process waits for it up to `--lock-wait`. It lives in the state, so it
 does not fence two hosts with separate state. _Avoid_: run lock, config lock.
 

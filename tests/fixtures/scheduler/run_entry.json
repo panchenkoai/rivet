@@ -12,7 +12,15 @@
   "error": null,
   "stop_reason": "max_events",
   "tables": [
-    { "table": "orders", "rows": 1200, "files": 3 },
-    { "table": "users", "rows": 0, "files": 0 }
+    {
+      "table": "orders",
+      "rows": 1200,
+      "files": 3
+    },
+    {
+      "table": "users",
+      "rows": 0,
+      "files": 0
+    }
   ]
 }

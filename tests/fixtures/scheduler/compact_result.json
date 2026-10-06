@@ -1,19 +1,27 @@
 {
-  "run_id": "20261006T101900.456-load",
+  "run_id": "20261006T102300.789-compact",
   "per_table": [
     {
       "export": "orders_cdc",
       "table": "orders",
-      "status": "loaded",
+      "status": "compacted",
       "skip_reason": null,
       "rows": 1200,
       "error": null
     },
     {
-      "export": "countries",
-      "table": "countries",
+      "export": "users_cdc",
+      "table": "users",
       "status": "nothing_to_do",
       "skip_reason": null,
+      "rows": 0,
+      "error": null
+    },
+    {
+      "export": "countries",
+      "table": "countries",
+      "status": "skipped",
+      "skip_reason": "a full load overwrites its table; nothing to merge",
       "rows": 0,
       "error": null
     },
