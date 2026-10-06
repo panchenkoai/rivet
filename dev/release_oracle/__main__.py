@@ -766,13 +766,21 @@ def _self_test() -> int:
 
     with _tf.TemporaryDirectory() as d:
         hist = Path(d) / "t.jsonl"
-        record_timings(hist, [("A", 60.0), ("B", 120.0)], [("s", 30.0)], "RELEASE-READY", 3, 0)
+        first = record_timings(hist, [("A", 60.0), ("B", 120.0)], [("s", 30.0)], "RELEASE-READY", 3, 0,
+                               {"A — detail": (1.26, 30.04)})
+        assert first["phases_load1"] == {"A": [1.3, 30.0]} and first["cores"], first
+        timed = Ledger(colour=False)
+        timed._buf = []
+        timed.phase("one")
+        timed.phase("two")
+        lo, hi = timed._phase_load["one"]
+        assert lo > 0 and hi > 0, "a phase must record the load average it opened and closed under"
         second = record_timings(hist, [("A", 180.0), ("B", 120.0)], [], "NOT RELEASABLE", 2, 1)
         lines = hist.read_text().splitlines()
         assert len(lines) == 2, lines
         assert _json.loads(lines[0])["total_min"] == 3.0 and second["total_min"] == 5.0, lines
         assert second["phases_min"] == {"A": 3.0, "B": 2.0} and second["failed"] == 1, second
-    print("self-test ok: gate timings append one history line per run")
+    print("self-test ok: gate timings append one history line per run, with each phase's load average")
     _stage_table_self_test()
     from . import sentinels
 
