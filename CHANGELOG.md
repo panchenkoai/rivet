@@ -2,9 +2,11 @@
 
 ## Unreleased
 
-- **CDC: an UPDATE that changes the key is written as a delete of the old key and an insert
+- **Breaking: CDC writes an UPDATE that changes the key as a delete of the old key and an insert
   of the new row** (ADR-0030, accepted), on PostgreSQL, MySQL and Oracle. SQL Server's change
   table already did this, and MongoDB's `_id` cannot change.
+  - Upgrading does not retract rows already delivered by earlier releases under an old key: that key
+    stays live in the destination until you remove it.
   - Before, it was one `update` under the new key. Every latest-image-per-key merge (BigQuery,
     Snowflake, ClickHouse, the documented `MERGE`) kept the old key live beside the new one,
     while row counts still reconciled.
