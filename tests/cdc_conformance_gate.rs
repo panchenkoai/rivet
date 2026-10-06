@@ -428,6 +428,7 @@ fn derived_capture_marker_set_is_pinned() {
         "cli_in_dir(",
         "drain_and_read(",
         "run(",
+        "run_after_doctor(",
         "run_and_read(",
         "run_args(",
         "run_args_env(",
@@ -436,6 +437,7 @@ fn derived_capture_marker_set_is_pinned() {
         // `cdc.checkpoint:` contract (a relative path must follow the CONFIG, not the
         // process CWD). It spawns rivet, so it is a capture marker like its siblings.
         "run_in_dir(",
+        "run_nudged(",
         "run_ok(",
         "run_ok_capture(",
         "run_rivet(",
