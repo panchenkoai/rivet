@@ -229,7 +229,7 @@ def _raising_stage_self_test() -> None:
         try:
             m.verify_boom(led, "postgres")
             m.verify_after(led)
-            rc = led.report()
+            rc = led.report(full=True)
             wrote = core.TIMINGS_HISTORY.read_text()
         finally:
             core.TIMINGS_HISTORY = saved
@@ -239,6 +239,62 @@ def _raising_stage_self_test() -> None:
     assert [c.scenario for c in led.cells] == ["verify_boom", "after"], led.cells
     assert rc == 1 and "NOT RELEASABLE" in out.getvalue() and '"verdict": "NOT RELEASABLE"' in wrote, (rc, wrote)
     print("self-test ok: a stage that raises is one FAIL row naming it; the gate still reports and exits 1")
+
+
+def _verdict_scope_self_test() -> None:
+    """A partial run writes no timings line and never prints RELEASE-READY; an ungraded cell blocks without reading as a product failure."""
+    import contextlib
+    import io
+
+    from . import core
+
+    def report(led: Ledger, full: bool) -> tuple[int, str, str]:
+        out, saved = io.StringIO(), core.TIMINGS_HISTORY
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(out):
+            core.TIMINGS_HISTORY = Path(tmp) / "timings.jsonl"
+            try:
+                rc = led.report(full=full)
+                wrote = core.TIMINGS_HISTORY.read_text() if core.TIMINGS_HISTORY.exists() else ""
+            finally:
+                core.TIMINGS_HISTORY = saved
+        return rc, out.getvalue(), wrote
+
+    green = Ledger(colour=False)
+    green.passed("-", "-", "s", "-", "four cells of a re-run")
+    rc, said, wrote = report(green, full=False)
+    assert rc == 0 and wrote == "" and "RELEASE-READY" not in said and "PARTIAL RUN" in said, (rc, said, wrote)
+    rc, said, wrote = report(green, full=True)
+    assert rc == 0 and '"verdict": "RELEASE-READY"' in wrote and "RELEASE-READY" in said, (rc, said, wrote)
+
+    infra = Ledger(colour=False)
+    infra.passed("-", "-", "s", "-", "a graded cell")
+    infra.ungraded("-", "-", "s", "-", "the BigQuery read did not complete")
+    rc, said, wrote = report(infra, full=True)
+    assert rc == 1 and not infra.red and '"verdict": "NOT GRADED"' in wrote, (rc, wrote)
+    assert "NOT GRADED" in said and "NOT RELEASABLE" not in said and "RELEASE-READY" not in said, said
+    rc, said, _ = report(infra, full=False)
+    assert rc == 1 and "PARTIAL RUN" not in said, "an ungraded cell must block a partial run too"
+    infra.failed("-", "-", "s", "-", "the base differs from the source")
+    assert infra.verdict() == "NOT RELEASABLE", "a product failure outranks an ungraded cell"
+
+    from .core import Proc, first_error
+    err = ("warning: 2 tables have no primary key\nError: [RIVET_LOAD_REFUSED] load refused: the base is ahead\n"
+           "  hint: re-run with --run-id\nman" "ifests=1 parquet_files=1 expected_rows=5300")
+    assert first_error(err) == "Error: [RIVET_LOAD_REFUSED] load refused: the base is ahead", first_error(err)
+    assert first_error("no marker here\nlast line") == "last line" and first_error("") == ""
+    with contextlib.redirect_stderr(io.StringIO()) as full_text:
+        why = Proc(["rivet", "load"], 1, "", err).why
+    assert why == "exit 1 [RIVET_LOAD_REFUSED]: Error: [RIVET_LOAD_REFUSED] load refused: the base is ahead", why
+    assert "expected_rows=5300" in full_text.getvalue(), "the whole stderr belongs in the log"
+
+    from .blessed_path import GOLDEN_TABLES, SCENARIOS, cell_export, same_name_outcome
+    names = [cell_export(scenarios.Scope("mongo", v).dir("blessed", t, sc, store, st))
+             for v in ("4.4", "8") for t in GOLDEN_TABLES for sc in SCENARIOS for store in ("local", "gcs") for st in ("pg", "sq")]
+    assert len(set(names)) == len(names), "two blessed-path cells share an export name (and so a lease and a cursor)"
+    assert [same_name_outcome(False, -1, 9), same_name_outcome(True, 9, 9), same_name_outcome(True, 4, 9)] == \
+        ["refused", "independent", "collides"]
+    print("self-test ok: partial runs write no verdict line; an oracle outage is NOT GRADED, not a product failure; "
+          "rows keep the first error line; blessed-path cells have distinct export names")
 
 
 def _stages_self_test() -> None:
@@ -265,6 +321,7 @@ def _stages_self_test() -> None:
     m.verify_a(probe)
     assert STAGES_RUN["verify_a"] == 2, "re-recording must not wrap the wrapper"
     _raising_stage_self_test()
+    _verdict_scope_self_test()
     doc = {
         "preflights": [{"id": "a", "status": "test"}, {"id": "off", "status": "gap"}],
         "infra": [{"id": "undriven", "status": "test"}],
@@ -1447,13 +1504,14 @@ def main(argv: list[str] | None = None) -> int:
         skip_census.verify_oracle_verdict_census(led)
         verify_seeded_recall(led, ns.with_seeded_recall)
         verify_no_invariant_violations(led)
-        # Only a FULL run can say a known red no longer fires.
-        if not (ns.engines or ns.versions or ns.no_cloud or ns.latest_only):
+        # Only a FULL run can say a known red no longer fires, and only one writes a verdict line.
+        full = not (ns.engines or ns.versions or ns.no_cloud or ns.latest_only)
+        if full:
             led.close_known_red()
             # A bless run returns before most stages on purpose (run_scenarios), so it cannot grade the matrix.
             if not (ns.bless_local or ns.bless_cdc):
                 led.close_matrix_rows()
-        rc = led.report()
+        rc = led.report(full=full and not (ns.bless_local or ns.bless_cdc))
         # A run that graded nothing against the previous release has to say so
         # AFTER the verdict, where the reader's eye lands: `RELEASE-READY` is
         # derived from the rows and is literally true ("every non-skipped cell is

@@ -200,7 +200,7 @@ def cell(led: Ledger, prev: Path, root: Path, engine: str, url: str, family: tup
                     "-o", "c.yaml"], env=env, cwd=d)
         if not init.ok:
             return led.skipped(engine, "-", SCEN, store, f"{name}: the previous release's init refuses it: "
-                               f"{(init.stderr or '').strip()[-200:]}", "init refused")
+                               f"{init.why}", "init refused")
         cfg_path = d / "c.yaml"
         if line:
             text = opt_in(cfg_path.read_text(), line)
@@ -218,7 +218,7 @@ def cell(led: Ledger, prev: Path, root: Path, engine: str, url: str, family: tup
             if not p.ok:
                 who = "previous" if binary == prev else "this"
                 return led.failed(engine, "-", SCEN, store, f"{name}: {step} by {who} failed: "
-                                  f"{(p.stderr or '').strip()[-240:]}", step)
+                                  f"{p.why}", step)
         cfg = yaml.safe_load(cfg_path.read_text())
         export = cfg["exports"][0]
         spec = {"engine": engine, "url": url, "database": url.rsplit("/", 1)[-1].split("?")[0],

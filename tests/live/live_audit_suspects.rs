@@ -461,8 +461,7 @@ fn cleanup_source_never_deletes_parts_an_extract_committed_during_the_load() {
     let mut raced = false;
     for delay_s in [4u64, 7, 10, 13] {
         let started = std::time::Instant::now();
-        let load = std::process::Command::new(rivet_bin())
-            .args(["load", "-c", cfg.to_str().unwrap()])
+        let load = rivet_command(&["load", "-c", cfg.to_str().unwrap()], &[])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
