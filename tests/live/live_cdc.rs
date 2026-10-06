@@ -4843,16 +4843,9 @@ fn roast_mysql_cdc_cli_max_events_below_a_transaction_still_advances_the_checkpo
             std::time::Duration::from_secs(60),
         )
     };
-    let ids = |out: &str, tbl: &str| -> std::collections::BTreeSet<i64> {
-        out.lines()
-            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-            .filter(|v| v.get("table").and_then(|t| t.as_str()) == Some(tbl))
-            .filter_map(|v| v.get("after")?.get(0)?.as_i64())
-            .collect()
-    };
 
     let first = cdc_run().expect("run 1 must terminate");
-    let ids1 = ids(&first, &tbl);
+    let ids1 = ndjson_after_ids(&first, &tbl);
     // The cap is SOFT: it overshoots to the commit boundary rather than cutting
     // the transaction, which is the only way it can checkpoint at all.
     assert_eq!(
@@ -4862,7 +4855,7 @@ fn roast_mysql_cdc_cli_max_events_below_a_transaction_still_advances_the_checkpo
     );
 
     let second = cdc_run().expect("run 2 must terminate");
-    let ids2 = ids(&second, &tbl);
+    let ids2 = ndjson_after_ids(&second, &tbl);
     assert!(
         ids2.is_empty(),
         "run 2 must emit nothing — the checkpoint advanced past the transaction. Re-emitting \
@@ -4936,12 +4929,7 @@ fn roast_pg_cdc_ndjson_until_current_terminates_and_emits_backlog() {
     bg.stop();
     let stdout = out.expect("bounded NDJSON run must terminate under sustained writes");
 
-    let ids: std::collections::BTreeSet<i64> = stdout
-        .lines()
-        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .filter(|v| v.get("table").and_then(|t| t.as_str()) == Some(tbl.as_str()))
-        .filter_map(|v| v.get("after")?.get(0)?.as_i64())
-        .collect();
+    let ids = ndjson_after_ids(&stdout, &tbl);
     for i in 0..30 {
         assert!(
             ids.contains(&i),
@@ -6500,12 +6488,7 @@ fn mysql_cdc_cli_stream_with_a_cap_terminates_and_accepts_a_server_id() {
          stops when the watchdog kills it wedges every scheduler slot it runs in",
     );
 
-    let ids: std::collections::BTreeSet<i64> = stdout
-        .lines()
-        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .filter(|v| v.get("table").and_then(|t| t.as_str()) == Some(tbl.as_str()))
-        .filter_map(|v| v.get("after")?.get(0)?.as_i64())
-        .collect();
+    let ids = ndjson_after_ids(&stdout, &tbl);
     // The cap is SOFT: it stops at the first commit boundary past N, so tx1 lands
     // whole and tx2 does not. Asserting the exact set pins both halves — that it
     // did not cut tx1 at 2, and that it did not run the stream to its end.
@@ -6635,13 +6618,10 @@ fn mysql_cdc_cli_a_capped_run_leaves_its_remainder_to_the_next_run() {
         .expect("tx1");
     c.query_drop(format!("INSERT INTO {tbl} VALUES (4,4),(5,5),(6,6)"))
         .expect("tx2");
-    let ids: std::collections::BTreeSet<i64> = run(&["--max-events", "2"])
-        .lines()
-        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .filter_map(|v| v.get("after")?.get(0)?.as_i64())
-        .collect();
-    assert_eq!(ids, (1..=3).collect(), "the cap stops at tx1's commit");
-    run(&[]);
+    let capped = ndjson_after_ids(&run(&["--max-events", "2"]), &tbl);
+    assert_eq!(capped, (1..=3).collect(), "the cap stops at tx1's commit");
+    let rest = ndjson_after_ids(&run(&[]), &tbl);
+    assert_eq!(rest, (4..=6).collect(), "the next run delivers tx2");
 }
 
 /// `rivet cdc --source-env` / `--source-file`, and the ArgGroup that keeps them
@@ -6692,11 +6672,7 @@ fn mysql_cdc_cli_resolves_the_source_from_env_and_file_alike() {
         args.extend_from_slice(&["--table", &tbl, "--checkpoint", &ck]);
         let out = run_rivet_args_bounded_env(&args, envs, std::time::Duration::from_secs(60))
             .unwrap_or_else(|| panic!("`rivet cdc {}` did not terminate", form.join(" ")));
-        out.lines()
-            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-            .filter(|v| v.get("table").and_then(|t| t.as_str()) == Some(tbl.as_str()))
-            .filter_map(|v| v.get("after")?.get(0)?.as_i64())
-            .collect()
+        ndjson_after_ids(&out, &tbl)
     };
 
     let inline = capture(&["--source", MYSQL_CDC_URL], &[]);

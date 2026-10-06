@@ -1161,6 +1161,7 @@ fn every_live_cdc_test_asserts_an_outcome() {
                 // decoding the CLI's NDJSON event stream and asserting on the
                 // decoded events (the cdc-cli termination/backlog tests);
                 || chunk.contains("serde_json::from_str::<serde_json::Value>")
+                || chunk.contains("ndjson_after_ids(") // `rivet cdc` stdout ids, strict
                 // Parquet re-read helpers (tests/common/parquet.rs): the seq
                 // helper reads __seq/__pos/counter columns back via the ARROW
                 // readers (shared codec — the duckdb_dir_* twins are the

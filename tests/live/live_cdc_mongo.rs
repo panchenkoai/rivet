@@ -1458,15 +1458,12 @@ fn mongo_cdc_cli_a_capped_run_leaves_its_remainder_to_the_next_run() {
         "docs",
         (1..=4_i64).map(|i| doc! { "_id": i, "v": i }).collect(),
     );
-    let first: std::collections::BTreeSet<i64> = run(&["--max-events", "2"])
-        .lines()
-        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .filter_map(|v| v.get("after")?.get(0)?.as_i64())
-        .collect();
+    let capped = ndjson_after_ids(&run(&["--max-events", "2"]), "docs");
     assert_eq!(
-        first,
+        capped,
         [1, 2].into(),
         "the cap stops after two single-document commits"
     );
-    run(&[]);
+    let rest = ndjson_after_ids(&run(&[]), "docs");
+    assert_eq!(rest, [3, 4].into(), "the next run delivers the remainder");
 }

@@ -285,3 +285,56 @@ pub fn run_rivet_args_bounded_env(
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
+
+/// First-column integer keys of the `after` images a `rivet cdc` NDJSON run printed for `table`; a line it cannot read is a panic, never a skipped id.
+pub fn ndjson_after_ids(stdout: &str, table: &str) -> std::collections::BTreeSet<i64> {
+    let lines = stdout.lines().filter(|l| !l.trim().is_empty());
+    lines
+        .map(|l| {
+            serde_json::from_str::<serde_json::Value>(l)
+                .unwrap_or_else(|e| panic!("`rivet cdc` stdout line is not JSON ({e}): {l}"))
+        })
+        .filter(|v| v["table"].as_str() == Some(table) && !v["after"].is_null())
+        .map(|v| {
+            let key = &v["after"][0];
+            ndjson_key(key).unwrap_or_else(|| panic!("no integer key in after[0]: {v}"))
+        })
+        .collect()
+}
+
+/// An NDJSON key cell as an integer: a JSON number (SQL engines) or its decimal text (MongoDB's flat `_id`).
+fn ndjson_key(key: &serde_json::Value) -> Option<i64> {
+    key.as_i64().or_else(|| key.as_str()?.parse().ok())
+}
+
+#[cfg(test)]
+mod ndjson_tests {
+    use super::ndjson_after_ids;
+
+    #[test]
+    fn ndjson_after_ids_reads_numeric_and_text_keys_of_one_table() {
+        let out = concat!(
+            r#"{"table":"t","after":[1,"a"]}"#,
+            "\n",
+            r#"{"table":"t","after":["2","{}"]}"#,
+            "\n",
+            r#"{"table":"t","before":[3],"after":null}"#,
+            "\n",
+            r#"{"table":"other","after":[9]}"#,
+            "\n",
+        );
+        assert_eq!(ndjson_after_ids(out, "t"), [1, 2].into());
+    }
+
+    #[test]
+    #[should_panic(expected = "no integer key in after[0]")]
+    fn ndjson_after_ids_refuses_a_key_it_cannot_read() {
+        ndjson_after_ids(r#"{"table":"t","after":["abc"]}"#, "t");
+    }
+
+    #[test]
+    #[should_panic(expected = "is not JSON")]
+    fn ndjson_after_ids_refuses_a_line_that_is_not_json() {
+        ndjson_after_ids("done: 2 events", "t");
+    }
+}
