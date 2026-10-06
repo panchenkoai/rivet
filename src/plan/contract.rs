@@ -240,6 +240,13 @@ pub enum ExtractionStrategy {
     },
 }
 
+impl ResolvedRunPlan {
+    /// The stream stored progress belongs to: the export's `table:` as declared; empty for a `query:` export.
+    pub fn stream(&self) -> &str {
+        self.source_table.as_deref().unwrap_or_default()
+    }
+}
+
 impl ExtractionStrategy {
     pub fn mode_label(&self) -> &'static str {
         match self {
@@ -295,6 +302,12 @@ impl ExtractionStrategy {
             ExtractionStrategy::Keyset(k) => Some(k.key_column.clone()),
             _ => None,
         }
+    }
+
+    /// Whether a clean run seeks from the stored cursor (incremental, `keyset_incremental`, Mongo `resume`).
+    pub fn continues_stored_cursor(&self) -> bool {
+        matches!(self, ExtractionStrategy::Incremental(_))
+            || matches!(self, ExtractionStrategy::Keyset(kp) if kp.incremental)
     }
 
     /// Primary cursor column name for incremental exports (`None` for other strategies).

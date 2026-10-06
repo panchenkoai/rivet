@@ -22,6 +22,24 @@ fn identity_matches(owner: &str, expected: &str, legacy: bool) -> bool {
             .is_some_and(|rest| rest.starts_with(','))
 }
 
+/// Whether two recorded streams name different objects; an empty one (a `query:` export) names none.
+fn streams_differ(stored: &str, now: &str) -> bool {
+    !stored.is_empty() && !now.is_empty() && stored != now
+}
+
+/// The progress a run would continue from, worded for a message: an interrupted run's anchor, else the cursor a clean run seeks from.
+fn held_progress(
+    cursor: Option<&str>,
+    anchor: Option<&str>,
+    continues_cursor: bool,
+) -> Option<String> {
+    match (anchor, cursor) {
+        (Some(run), _) => Some(format!("interrupted run {run}")),
+        (None, Some(v)) if continues_cursor => Some(format!("cursor `{v}`")),
+        _ => None,
+    }
+}
+
 /// The cursor column an incremental run's `key_descriptor_json` names, or `None` for
 /// any other strategy's descriptor.
 fn descriptor_cursor_column(descriptor: &str) -> Option<String> {
@@ -98,6 +116,59 @@ impl StateStore {
         Ok(state)
     }
 
+    /// Refuse progress stored for another stream (table / collection); adopt a row written before streams were recorded.
+    pub fn claim_stream(
+        &self,
+        export_name: &str,
+        scope: &str,
+        stream: &str,
+        continues_cursor: bool,
+    ) -> Result<()> {
+        let row = self.query_opt(
+            "SELECT stream, last_cursor_value, resume_run_id FROM export_state \
+             WHERE export_name = ?1 AND (prefix = ?2 OR prefix = '') \
+             ORDER BY prefix DESC LIMIT 1",
+            &[export_name.into(), scope.into()],
+            |r| (r.opt_text(0), r.opt_text(1), r.opt_text(2)),
+        )?;
+        let Some((stored, cursor, anchor)) = row else {
+            return Ok(());
+        };
+        let Some(held) = held_progress(cursor.as_deref(), anchor.as_deref(), continues_cursor)
+        else {
+            return Ok(());
+        };
+        match stored {
+            None if stream.is_empty() => {}
+            None => {
+                self.execute(
+                    "UPDATE export_state SET stream = ?3 WHERE export_name = ?1 \
+                     AND (prefix = ?2 OR prefix = '') AND stream IS NULL",
+                    &[export_name.into(), scope.into(), stream.into()],
+                )?;
+                log::warn!(
+                    "export '{export_name}': its stored progress ({held}) predates stream \
+                     tracking — recorded as belonging to `{stream}`, which this export reads now"
+                );
+            }
+            Some(stored) if streams_differ(&stored, stream) => {
+                crate::rivet_bail!(
+                    crate::error::codes::STATE_CURSOR_STREAM_MISMATCH,
+                    "export '{export_name}': its stored progress ({held}) was written reading \
+                     `{stored}`, but this export reads `{stream}` — continuing from it would \
+                     skip rows of `{stream}`; nothing was read or written.\n  \
+                     Hint: two exports sharing a name in one state database need their own names \
+                     (or their own state). If this export was repointed, \
+                     `rivet state reset -c <config> --export {export_name}` starts `{stream}` over \
+                     with a full pass — it discards the progress of EVERY export named \
+                     '{export_name}' in this state database."
+                );
+            }
+            Some(_) => {}
+        }
+        Ok(())
+    }
+
     /// Owner of a pre-v26 row: the key of the latest successful run that wrote this
     /// value — a keyset run's `chunk_key`, or the cursor column an incremental run
     /// named in its key descriptor.
@@ -116,23 +187,25 @@ impl StateStore {
         })
     }
 
-    /// Advance the cursor and record which column/key it belongs to.
+    /// Advance the cursor and record which column/key and which stream it belongs to.
     pub fn update_with_column(
         &self,
         export_name: &str,
         scope: &str,
         cursor_value: &str,
         cursor_column: &str,
+        stream: &str,
     ) -> Result<()> {
         self.claim_legacy_row(export_name, scope)?;
         let now = chrono::Utc::now().to_rfc3339();
         let sql = "INSERT INTO export_state \
-             (export_name, prefix, last_cursor_value, last_run_at, cursor_column)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+             (export_name, prefix, last_cursor_value, last_run_at, cursor_column, stream)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(export_name, prefix) DO UPDATE SET
                 last_cursor_value = excluded.last_cursor_value,
                 last_run_at = excluded.last_run_at,
-                cursor_column = excluded.cursor_column";
+                cursor_column = excluded.cursor_column,
+                stream = excluded.stream";
         self.execute(
             sql,
             &[
@@ -141,6 +214,7 @@ impl StateStore {
                 cursor_value.into(),
                 now.into(),
                 cursor_column.into(),
+                stream.into(),
             ],
         )?;
         Ok(())
@@ -164,15 +238,29 @@ impl StateStore {
     /// in-progress keyset run_id beside the resume cursor, so a crash+resume reuses
     /// it and reconstructs every committed page's manifest part from file_log. Set on
     /// the first checkpointed run, read on resume, cleared when the run finalizes.
-    pub fn set_resume_run_id(&self, export_name: &str, scope: &str, run_id: &str) -> Result<()> {
+    pub fn set_resume_run_id(
+        &self,
+        export_name: &str,
+        scope: &str,
+        run_id: &str,
+        stream: &str,
+    ) -> Result<()> {
         self.claim_legacy_row(export_name, scope)?;
         let now = chrono::Utc::now().to_rfc3339();
-        let sql = "INSERT INTO export_state (export_name, prefix, resume_run_id, last_run_at)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(export_name, prefix) DO UPDATE SET resume_run_id = excluded.resume_run_id";
+        let sql =
+            "INSERT INTO export_state (export_name, prefix, resume_run_id, last_run_at, stream)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(export_name, prefix) DO UPDATE SET \
+                resume_run_id = excluded.resume_run_id, stream = excluded.stream";
         self.execute(
             sql,
-            &[export_name.into(), scope.into(), run_id.into(), now.into()],
+            &[
+                export_name.into(),
+                scope.into(),
+                run_id.into(),
+                now.into(),
+                stream.into(),
+            ],
         )?;
         Ok(())
     }
@@ -277,17 +365,134 @@ mod tests {
         StateStore::open_in_memory().expect("in-memory store")
     }
 
+    fn stream_refusal(s: &StateStore, stream: &str, continues: bool) -> Option<String> {
+        s.claim_stream("orders", "pg/db", stream, continues)
+            .err()
+            .map(|e| {
+                assert_eq!(
+                    crate::error::error_code(&e),
+                    Some("RIVET_STATE_CURSOR_STREAM_MISMATCH")
+                );
+                assert_eq!(crate::error::classify_exit(&e), 5);
+                e.to_string()
+            })
+    }
+
+    #[test]
+    fn a_stored_cursor_is_refused_for_another_table_every_time_until_a_reset() {
+        let s = store();
+        s.update_with_column("orders", "pg/db", "110", "id", "orders_a")
+            .unwrap();
+        assert_eq!(stream_refusal(&s, "orders_a", true), None, "its own stream");
+        for cycle in 1..=2 {
+            let said = stream_refusal(&s, "orders_b", true).expect("refused");
+            for want in ["`orders_a`", "`orders_b`", "cursor `110`", "own names"] {
+                assert!(said.contains(want), "cycle {cycle}: {want} in {said}");
+            }
+            assert!(
+                said.contains("`rivet state reset -c <config> --export orders`"),
+                "{said}"
+            );
+        }
+        assert_eq!(
+            s.get("orders", "pg/db")
+                .unwrap()
+                .last_cursor_value
+                .as_deref(),
+            Some("110"),
+            "a refusal changes nothing"
+        );
+        s.reset("orders").unwrap();
+        assert_eq!(stream_refusal(&s, "orders_b", true), None);
+    }
+
+    #[test]
+    fn a_stale_cursor_no_clean_run_seeks_from_is_not_progress_but_an_anchor_is() {
+        let s = store();
+        s.update_with_column("orders", "pg/db", "110", "id", "orders_a")
+            .unwrap();
+        assert_eq!(stream_refusal(&s, "orders_b", false), None);
+        s.set_resume_run_id("orders", "pg/db", "run_7", "orders_a")
+            .unwrap();
+        let said = stream_refusal(&s, "orders_b", false).expect("an interrupted run is progress");
+        assert!(said.contains("interrupted run run_7"), "{said}");
+        assert_eq!(stream_refusal(&s, "orders_a", false), None);
+    }
+
+    #[test]
+    fn an_anchor_records_its_stream_before_any_cursor_exists() {
+        let s = store();
+        s.set_resume_run_id("orders", "pg/db", "run_1", "orders_a")
+            .unwrap();
+        assert!(stream_refusal(&s, "orders_b", true).is_some());
+        assert_eq!(
+            s.claim_stream("orders", "my/db", "orders_b", true).ok(),
+            Some(()),
+            "another source scope holds no progress"
+        );
+    }
+
+    #[test]
+    fn progress_written_before_streams_were_recorded_is_adopted_once_then_guarded() {
+        let s = store();
+        s.update_with_column("orders", "pg/db", "110", "id", "orders_a")
+            .unwrap();
+        s.execute("UPDATE export_state SET stream = NULL", &[])
+            .unwrap();
+        assert_eq!(
+            stream_refusal(&s, "orders_b", true),
+            None,
+            "adopted, not refused"
+        );
+        assert_eq!(
+            s.get("orders", "pg/db")
+                .unwrap()
+                .last_cursor_value
+                .as_deref(),
+            Some("110"),
+            "adopted, not reset"
+        );
+        assert!(
+            stream_refusal(&s, "orders_a", true).is_some(),
+            "now `orders_b`'s"
+        );
+        assert_eq!(stream_refusal(&s, "orders_b", true), None);
+    }
+
+    #[test]
+    fn a_query_export_names_no_stream_and_is_never_refused_or_adopted() {
+        let s = store();
+        s.update_with_column("orders", "pg/db", "110", "id", "orders_a")
+            .unwrap();
+        assert_eq!(stream_refusal(&s, "", true), None, "table then query");
+        s.update_with_column("orders", "pg/db", "120", "id", "")
+            .unwrap();
+        assert_eq!(
+            stream_refusal(&s, "orders_b", true),
+            None,
+            "query then table"
+        );
+        s.execute("UPDATE export_state SET stream = NULL", &[])
+            .unwrap();
+        assert_eq!(stream_refusal(&s, "", true), None);
+        assert!(
+            stream_refusal(&s, "orders_b", true).is_none()
+                && stream_refusal(&s, "orders_a", true).is_some(),
+            "a query run adopted nothing; the first table did"
+        );
+    }
+
     #[test]
     fn two_configs_with_one_export_name_keep_separate_cursors() {
         let s = store();
-        s.update_with_column("orders", "pg/out", "2026-09-01", "updated_at")
+        s.update_with_column("orders", "pg/out", "2026-09-01", "updated_at", "")
             .unwrap();
         assert_eq!(
             s.get("orders", "my/out").unwrap().last_cursor_value,
             None,
             "another destination starts from nothing"
         );
-        s.update_with_column("orders", "my/out", "2026-01-01", "updated_at")
+        s.update_with_column("orders", "my/out", "2026-01-01", "updated_at", "")
             .unwrap();
         assert_eq!(
             s.get("orders", "pg/out")
@@ -303,7 +508,7 @@ mod tests {
                 .as_deref(),
             Some("2026-01-01")
         );
-        s.set_resume_run_id("orders", "pg/out", "r1").unwrap();
+        s.set_resume_run_id("orders", "pg/out", "r1", "").unwrap();
         assert_eq!(s.get_resume_run_id("orders", "my/out").unwrap(), None);
     }
 
@@ -319,7 +524,7 @@ mod tests {
             Some("100"),
             "read before any claim"
         );
-        s.update_with_column("orders", "a/out", "200", "id")
+        s.update_with_column("orders", "a/out", "200", "id", "")
             .unwrap();
         assert_eq!(
             s.get("orders", "a/out")
@@ -340,7 +545,7 @@ mod tests {
     fn a_resume_run_id_in_any_scope_is_seen_until_every_scope_is_cleared() {
         let s = store();
         assert!(!s.has_resume_run_id_in_any_scope("orders").unwrap());
-        s.set_resume_run_id("orders", "pg/out", "r1").unwrap();
+        s.set_resume_run_id("orders", "pg/out", "r1", "").unwrap();
         assert!(s.has_resume_run_id_in_any_scope("orders").unwrap());
         assert!(!s.has_resume_run_id_in_any_scope("other").unwrap());
         s.clear_resume_run_id_every_scope("orders").unwrap();
@@ -391,7 +596,7 @@ mod tests {
         // resume_run_id it is about to set (crash-recovery needs that).
         let s = store();
         s.update_legacy("orders", "9000000").unwrap();
-        s.set_resume_run_id("orders", "", "run_2").unwrap();
+        s.set_resume_run_id("orders", "", "run_2", "").unwrap();
         s.clear_cursor_value("orders", "").unwrap();
         assert!(
             s.get("orders", "").unwrap().last_cursor_value.is_none(),
@@ -547,7 +752,7 @@ mod tests {
     #[test]
     fn get_owned_accepts_the_identity_that_wrote_the_cursor() {
         let s = store();
-        s.update_with_column("orders", "", "100", "id").unwrap();
+        s.update_with_column("orders", "", "100", "id", "").unwrap();
         let c = s.get_owned("orders", "", "id").unwrap();
         assert_eq!(c.last_cursor_value.as_deref(), Some("100"));
         assert_eq!(c.cursor_column.as_deref(), Some("id"));
@@ -556,7 +761,7 @@ mod tests {
     #[test]
     fn get_owned_refuses_a_cursor_written_for_another_column() {
         let s = store();
-        s.update_with_column("orders", "", "3711169", "idvisit")
+        s.update_with_column("orders", "", "3711169", "idvisit", "")
             .unwrap();
         let e = s
             .get_owned("orders", "", "visit_last_action_time")
@@ -587,7 +792,7 @@ mod tests {
     #[test]
     fn update_keeps_the_recorded_column() {
         let s = store();
-        s.update_with_column("orders", "", "1", "id").unwrap();
+        s.update_with_column("orders", "", "1", "id", "").unwrap();
         s.update_legacy("orders", "2").unwrap();
         assert_eq!(
             s.get("orders", "").unwrap().cursor_column.as_deref(),
@@ -598,7 +803,7 @@ mod tests {
     #[test]
     fn get_owned_without_a_cursor_value_never_refuses() {
         let s = store();
-        s.set_resume_run_id("orders", "", "r1").unwrap();
+        s.set_resume_run_id("orders", "", "r1", "").unwrap();
         assert!(s.get_owned("orders", "", "anything").is_ok());
     }
 

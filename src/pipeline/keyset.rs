@@ -526,7 +526,7 @@ fn run_keyset_parallel(
                 &key,
                 &lo_hi_pairs(&fresh),
             )?;
-            st.set_resume_run_id(&plan.export_name, &scope, &summary.run_id)?;
+            st.set_resume_run_id(&plan.export_name, &scope, &summary.run_id, plan.stream())?;
             fresh
         }
         _ => sample_parallel_ranges(src, plan, &key, parallel, floor_r, ceil_r)?,
@@ -1077,7 +1077,7 @@ pub(crate) fn run_keyset(
                 if !kp.incremental {
                     st.clear_cursor_value(&plan.export_name, &scope)?;
                 }
-                st.set_resume_run_id(&plan.export_name, &scope, &summary.run_id)?;
+                st.set_resume_run_id(&plan.export_name, &scope, &summary.run_id, plan.stream())?;
             }
         }
     }
@@ -1197,6 +1197,7 @@ pub(crate) fn run_keyset(
                         &plan.source.state_key(),
                         v,
                         &kp.key_column,
+                        plan.stream(),
                     )?;
                 }
                 Ok(())
@@ -1294,7 +1295,7 @@ mod tests {
     #[test]
     fn a_parallel_incremental_run_refuses_a_sequential_anchor_whose_cursor_ran_ahead() {
         let st = StateStore::open_in_memory().unwrap();
-        st.set_resume_run_id("e", "p", "seq").unwrap();
+        st.set_resume_run_id("e", "p", "seq", "").unwrap();
         let err =
             resume_anchor(Some(&st), "e", "p", Some("seq".into()), true, "id", true).unwrap_err();
         assert!(
@@ -1314,7 +1315,7 @@ mod tests {
         let st = StateStore::open_in_memory().unwrap();
         let ranges = [(None, Some("5".to_string())), (Some("5".to_string()), None)];
         let anchored = |rid: &str, ranged_on: Option<&str>| {
-            st.set_resume_run_id("e", "p", rid).unwrap();
+            st.set_resume_run_id("e", "p", rid, "").unwrap();
             if let Some(key) = ranged_on {
                 st.persist_keyset_ranges("e", rid, key, &ranges).unwrap();
             }

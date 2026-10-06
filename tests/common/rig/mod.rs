@@ -282,6 +282,12 @@ impl Rig {
         self
     }
 
+    /// Point the same export (name, config dir and state DB kept) at another table or collection.
+    pub fn repoint(mut self, table: &str) -> Self {
+        self.tables = vec![table.to_string()];
+        self
+    }
+
     /// Query-based export (replaces the `table:` shortcut in the render).
     pub fn query(mut self, sql: &str) -> Self {
         self.query = Some(sql.to_string());

@@ -43,6 +43,7 @@ Every failure rivet names carries a stable `RIVET_<FAMILY>_<NAME>` code: in `--j
 | `RIVET_SOURCE_OVERRIDE_WIRE_MISMATCH` | usage | 1 | remove or correct the column's `columns:` override (batch: or CAST the column to that type in the export's `query:`; CDC: then re-snapshot the table) |
 | `RIVET_STATE_SCHEMA_NEWER` | refusal | 5 | upgrade rivet, or point this binary at a state DB it created |
 | `RIVET_STATE_CURSOR_OWNER_MISMATCH` | refusal | 5 | `rivet state reset -c <config> --export <name>` to start the new cursor with a full pass, or restore the previous cursor column |
+| `RIVET_STATE_CURSOR_STREAM_MISMATCH` | refusal | 5 | give each export that shares this state database its own name; if this export was repointed, `rivet state reset -c <config> --export <name>` starts the new table with a full pass (it discards the progress of every export of that name in the state database) |
 | `RIVET_STATE_KEYSET_SEQUENTIAL_ANCHOR_UNFINISHED` | refusal | 5 | re-run once with `parallel: 1` to finish the interrupted run, then raise `parallel:` |
 | `RIVET_LOAD_VALUE_OUT_OF_TARGET_RANGE` | refusal | 5 | the warehouse type cannot hold this value; declare a wider type (e.g. String) for the column, or fix the source value |
 | `RIVET_LOAD_COUNT_MISMATCH` | integrity | 3 | compare the warehouse table with the run's manifest before re-running; the source is kept |

@@ -456,6 +456,11 @@ pub mod codes {
         "RIVET_STATE_CURSOR_OWNER_MISMATCH",
         "`rivet state reset -c <config> --export <name>` to start the new cursor with a full pass, or restore the previous cursor column",
     );
+    /// Stored progress (cursor, keyset high-water, resume anchor) belongs to another table or collection.
+    pub const STATE_CURSOR_STREAM_MISMATCH: Code = refusal(
+        "RIVET_STATE_CURSOR_STREAM_MISMATCH",
+        "give each export that shares this state database its own name; if this export was repointed, `rivet state reset -c <config> --export <name>` starts the new table with a full pass (it discards the progress of every export of that name in the state database)",
+    );
     pub const SOURCE_CURSOR_FINER_THAN_MICROSECOND: Code = refusal(
         "RIVET_SOURCE_CURSOR_FINER_THAN_MICROSECOND",
         "cursor on a column at microsecond precision or coarser, or cast the cursor to TIMESTAMP(6) in a curated query",
@@ -555,6 +560,7 @@ pub mod codes {
         SOURCE_OVERRIDE_WIRE_MISMATCH,
         STATE_SCHEMA_NEWER,
         STATE_CURSOR_OWNER_MISMATCH,
+        STATE_CURSOR_STREAM_MISMATCH,
         STATE_KEYSET_SEQUENTIAL_ANCHOR_UNFINISHED,
         LOAD_VALUE_OUT_OF_TARGET_RANGE,
         LOAD_COUNT_MISMATCH,

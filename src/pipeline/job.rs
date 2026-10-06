@@ -1275,7 +1275,15 @@ fn execute_resolved_plan(
     tail: TailPolicy<'_>,
     mut meta: MetaConn<'_>,
 ) -> (Result<()>, RunSummary) {
-    let (_run_lease, recovered) = match chunked::claim_checkpoint_run(state, plan) {
+    let claim = state
+        .claim_stream(
+            &plan.export_name,
+            &plan.source.state_key(),
+            plan.stream(),
+            plan.strategy.continues_stored_cursor(),
+        )
+        .and_then(|()| chunked::claim_checkpoint_run(state, plan));
+    let (_run_lease, recovered) = match claim {
         Ok(claim) => claim,
         Err(e) => {
             let summary = synthetic_failed_summary(&plan.export_name, &e);

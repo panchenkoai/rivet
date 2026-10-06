@@ -584,3 +584,276 @@ fn keyset_then_resume_mongo() {
 fn parallel_keyset_then_resume_mongo() {
     mongo_switch_to_resume(Some("page_size: 4"), true, Expect::FullPass);
 }
+
+const STREAM_CODE: &str = "RIVET_STATE_CURSOR_STREAM_MISMATCH";
+
+/// Two runs in a row refuse with the stream code (exit 5) naming both streams, and write nothing to `out`.
+fn refused_twice_for_the_stream(
+    rig: &Rig,
+    out: &Path,
+    stored: &str,
+    now: &str,
+    ids: &dyn Fn(&Path) -> Vec<i64>,
+) {
+    for cycle in 1..=2 {
+        let o = rig.run();
+        let said = String::from_utf8_lossy(&o.stderr).to_string();
+        assert_eq!(
+            o.status.code(),
+            Some(5),
+            "cycle {cycle}: a refusal, not a run:\n{said}"
+        );
+        for want in [STREAM_CODE, stored, now, "state reset"] {
+            assert!(
+                said.contains(want),
+                "cycle {cycle}: refusal must name {want}:\n{said}"
+            );
+        }
+        assert!(ids(out).is_empty(), "cycle {cycle}: nothing exported");
+        assert!(!out.join("_SUCCESS").exists(), "cycle {cycle}: no _SUCCESS");
+    }
+}
+
+/// `stage` on this rig, with key and cursor columns named as the engine's catalog holds them (Oracle folds to upper case).
+fn staged_for(engine: SqlEngine, rig: Rig, stage: &Stage, out: &Path) -> Rig {
+    let lines: Vec<String> = stage
+        .1
+        .iter()
+        .map(|l| match l.split_once(": ") {
+            Some((k @ ("chunk_by_key" | "cursor_column"), v)) if engine.folds_upper() => {
+                format!("{k}: {}", v.to_uppercase())
+            }
+            _ => l.to_string(),
+        })
+        .collect();
+    let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+    rig.restage(stage.0, &lines).dest_path(out.to_path_buf())
+}
+
+/// Sorted ids re-read from every part under `out`, whatever case and integer type the engine gives the column.
+fn delivered_ids(engine: SqlEngine, out: &Path) -> Vec<i64> {
+    use arrow::array::{Array, Int64Array};
+    let col = if engine.folds_upper() { "ID" } else { "id" };
+    let mut v = Vec::new();
+    for b in read_all_parts(out) {
+        let ids = arrow::compute::cast(
+            b.column_by_name(col).expect("the id column"),
+            &arrow::datatypes::DataType::Int64,
+        )
+        .expect("an integer id");
+        let ids = ids.as_any().downcast_ref::<Int64Array>().unwrap();
+        v.extend((0..ids.len()).map(|i| ids.value(i)));
+    }
+    v.sort();
+    v
+}
+
+/// Export table A (ids 101..=110) with `stage`, repoint the SAME export at table B (ids 1..=10) without a reset.
+fn stream_repoint(engine: SqlEngine, stage: Stage) {
+    engine.alive();
+    let (a, _ga) = engine.table("stream_a");
+    let (b, _gb) = engine.table("stream_b");
+    engine.insert(&a, 101..=110, 170, Some(10));
+    engine.insert(&b, 1..=10, 180, Some(10));
+    let (first, second) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let ids = |out: &Path| delivered_ids(engine, out);
+
+    let rig = staged_for(engine, engine.rig(&a), &stage, first.path());
+    rig.run_ok();
+    assert_eq!(ids(first.path()), (101..=110).collect::<Vec<_>>());
+
+    let rig = staged_for(engine, rig.repoint(&b), &stage, second.path());
+    refused_twice_for_the_stream(&rig, second.path(), &a, &b, &ids);
+
+    let reset = rig.cli(&["state", "reset", "--export", &a]);
+    assert!(
+        reset.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reset.stderr)
+    );
+    rig.run_ok();
+    assert_eq!(ids(second.path()), (1..=10).collect::<Vec<_>>());
+}
+
+/// Two configs, one export name, one Postgres state, two tables: the second is refused until it has its own name.
+fn stream_shared_name(engine: SqlEngine, stage: Stage) {
+    if state_url_under_test().is_none() {
+        return skip_live(
+            "RIVET_GATE_STATE_URL unset: two configs share one state only on the Postgres backend",
+        );
+    }
+    engine.alive();
+    let (a, _ga) = engine.table("stream_a");
+    let (b, _gb) = engine.table("stream_b");
+    engine.insert(&a, 101..=110, 170, Some(10));
+    engine.insert(&b, 1..=10, 180, Some(10));
+    let (first, second) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let ids = |out: &Path| delivered_ids(engine, out);
+    let shared = unique_name("shared");
+
+    let one = staged_for(
+        engine,
+        engine.rig(&a).export_named(&shared),
+        &stage,
+        first.path(),
+    );
+    one.run_ok();
+    assert_eq!(ids(first.path()), (101..=110).collect::<Vec<_>>());
+
+    let two = staged_for(
+        engine,
+        engine.rig(&b).export_named(&shared),
+        &stage,
+        second.path(),
+    );
+    refused_twice_for_the_stream(&two, second.path(), &a, &b, &ids);
+
+    let own = staged_for(
+        engine,
+        two.export_named(&unique_name("own")),
+        &stage,
+        second.path(),
+    );
+    own.run_ok();
+    assert_eq!(ids(second.path()), (1..=10).collect::<Vec<_>>());
+}
+
+/// Mongo `resume`: export collection `hi` (`_id` 101..=110), repoint the same export at `lo` (`_id` 1..=10) without a reset.
+#[test]
+#[ignore = "live: requires docker compose up -d mongo"]
+fn resume_repointed_at_another_collection_mongo() {
+    require_alive(LiveService::Mongo);
+    let db = unique_name("mt_stream");
+    let m = MongoTest::connect(27017, &db);
+    m.seed_int_id("lo", 10);
+    for i in 101..=110 {
+        m.upsert_set("hi", i, "v", "row");
+    }
+    let (first, second) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let ids = |dir: &Path| -> Vec<i64> {
+        let mut v: Vec<i64> = dir_parquet_distinct_strings(dir, "_id")
+            .iter()
+            .map(|s| s.parse().expect("an integer _id"))
+            .collect();
+        v.sort();
+        v
+    };
+    let rig = Rig::mongo_batch("hi")
+        .source_url(&MongoTest::url(27017, &db))
+        .mongo("page_size: 4, resume: true")
+        .dest_path(first.path().to_path_buf());
+    rig.run_ok();
+    assert_eq!(ids(first.path()), (101..=110).collect::<Vec<_>>());
+
+    let rig = rig.repoint("lo").dest_path(second.path().to_path_buf());
+    refused_twice_for_the_stream(&rig, second.path(), "hi", "lo", &ids);
+
+    let reset = rig.cli(&["state", "reset", "--export", "hi"]);
+    assert!(
+        reset.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reset.stderr)
+    );
+    rig.run_ok();
+    assert_eq!(ids(second.path()), (1..=10).collect::<Vec<_>>());
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn incremental_repointed_at_another_table_mysql() {
+    stream_repoint(SqlEngine::Mysql, INCREMENTAL_ID);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn incremental_repointed_at_another_table_postgres() {
+    stream_repoint(SqlEngine::Pg, INCREMENTAL_ID);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn incremental_repointed_at_another_table_mssql() {
+    stream_repoint(SqlEngine::Mssql, INCREMENTAL_ID);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn incremental_repointed_at_another_table_oracle() {
+    stream_repoint(SqlEngine::Oracle, INCREMENTAL_ID);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn keyset_incremental_repointed_at_another_table_mysql() {
+    stream_repoint(SqlEngine::Mysql, KEYSET_INCREMENTAL_ID);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn keyset_incremental_repointed_at_another_table_postgres() {
+    stream_repoint(SqlEngine::Pg, KEYSET_INCREMENTAL_ID);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn keyset_incremental_repointed_at_another_table_mssql() {
+    stream_repoint(SqlEngine::Mssql, KEYSET_INCREMENTAL_ID);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn keyset_incremental_repointed_at_another_table_oracle() {
+    stream_repoint(SqlEngine::Oracle, KEYSET_INCREMENTAL_ID);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn parallel_keyset_incremental_repointed_at_another_table_mysql() {
+    stream_repoint(SqlEngine::Mysql, PARALLEL_KEYSET_INCREMENTAL_ID);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn parallel_keyset_incremental_repointed_at_another_table_postgres() {
+    stream_repoint(SqlEngine::Pg, PARALLEL_KEYSET_INCREMENTAL_ID);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn parallel_keyset_incremental_repointed_at_another_table_mssql() {
+    stream_repoint(SqlEngine::Mssql, PARALLEL_KEYSET_INCREMENTAL_ID);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn parallel_keyset_incremental_repointed_at_another_table_oracle() {
+    stream_repoint(SqlEngine::Oracle, PARALLEL_KEYSET_INCREMENTAL_ID);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn incremental_shared_name_another_table_mysql() {
+    stream_shared_name(SqlEngine::Mysql, INCREMENTAL_ID);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn incremental_shared_name_another_table_postgres() {
+    stream_shared_name(SqlEngine::Pg, INCREMENTAL_ID);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn incremental_shared_name_another_table_mssql() {
+    stream_shared_name(SqlEngine::Mssql, INCREMENTAL_ID);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn incremental_shared_name_another_table_oracle() {
+    stream_shared_name(SqlEngine::Oracle, INCREMENTAL_ID);
+}

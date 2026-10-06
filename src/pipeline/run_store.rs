@@ -118,6 +118,7 @@ impl<'a> RunStore<'a> {
                 &self.plan.source.state_key(),
                 cursor_val,
                 &column,
+                self.plan.stream(),
             )?;
 
             // Test fault-point: cursor advanced, but the outer-pipeline
