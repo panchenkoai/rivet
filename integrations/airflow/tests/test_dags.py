@@ -119,6 +119,31 @@ def test_batch_dag_refuses_contradictory_arguments(plan_file: str) -> None:
         build_batch_dag("b", config="c", exports=["a"], compact_exports=["zzz"])
     with pytest.raises(ValueError, match="needs load=True"):
         build_batch_dag("b", config="c", exports=["a"], compact_exports=["a"], load=False)
+    with pytest.raises(ValueError, match="`exports` is empty"):
+        build_batch_dag("b", config="c", exports=[])
+    with pytest.raises(ValueError, match="`tables` lists"):
+        build_cdc_dag("c", config="c", export="e", tables=[])
+
+
+def no_callback(task: object) -> bool:
+    """True when a task has no failure callback (Airflow 2 keeps `None`, Airflow 3 an empty list)."""
+    return not task.on_failure_callback
+
+
+def alert(context: object) -> None:
+    """A failure callback that does nothing."""
+
+
+def test_the_watcher_carries_no_failure_callback_from_default_args() -> None:
+    args = {"retries": 2, "on_failure_callback": alert}
+    batch = build_batch_dag("b", config="c", exports=["a"], default_args=args)
+    cdc = build_cdc_dag("c", config="c", export="e", tables=["t"], default_args=args)
+    for dag in (batch, cdc):
+        assert no_callback(dag.get_task("watcher")), "the watcher would send a second message with no rivet result in it"
+        others = [t for t in dag.tasks if t.task_id != "watcher"]
+        assert others and all(not no_callback(t) for t in others)
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text()
+    assert "The `watcher` task carries no failure callback" in readme
 
 
 def test_cdc_dag_is_one_run_then_load_and_compact_per_table() -> None:

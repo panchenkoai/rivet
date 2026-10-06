@@ -37,9 +37,9 @@ def read_plan_layout(plan_file: str) -> list[dict[str, Any]]:
 
 
 def _watch(dag: DAG) -> None:
-    """Add the task that fails the run when any other task failed (Airflow's watcher pattern)."""
+    """Add the task that fails the run when any other task failed; it carries no failure callback of its own."""
     tasks = list(dag.tasks)
-    tasks >> RivetRunWatcher(task_id=WATCHER_ID, trigger_rule="one_failed", retries=0, dag=dag)
+    tasks >> RivetRunWatcher(task_id=WATCHER_ID, trigger_rule="one_failed", retries=0, on_failure_callback=None, dag=dag)
 
 
 def _dag(dag_id: str, tags: Sequence[str], dag_kwargs: Mapping[str, Any]) -> DAG:
@@ -73,6 +73,8 @@ def build_batch_dag(
     """plan -> apply / load / compact groups, chained per export: apply.X >> load.X >> compact.X."""
     if (plan_file is None) == (exports is None):
         raise ValueError("give exactly one of `plan_file` (waves from rivet plan) or `exports` (one wave)")
+    if exports is not None and not exports:
+        raise ValueError("`exports` is empty: name at least one export, or give `plan_file`")
     if extract not in ("apply", "run"):
         raise ValueError("`extract` is 'apply' or 'run'")
     waves = read_plan_layout(plan_file) if plan_file else [{"wave": 1, "exports": list(exports or ()), "heavy": []}]

@@ -37,7 +37,10 @@ CLOUD_ENV = {
 STDERR_TAIL = 1 << 20
 QUERY_OWNERS = ".rivet_airflow_query_files.json"
 PLAN_ERRORS = (ValueError, KeyError, IndexError, TypeError, AttributeError)
+STATE_ENV = ("RIVET_STATE_URL",)
 _SAFE = re.compile(r"[^A-Za-z0-9_.-]+")
+_PLAIN = re.compile(r"[a-z0-9_][a-z0-9_.-]{0,79}")
+_HASHED = re.compile(r".*-[0-9a-f]{12}")
 _LOG_FILE = re.compile(r"^(?P<attempt>.+)\.[a-z]+\.(?:stderr|stdout)\.log$")
 
 
@@ -48,6 +51,26 @@ def worker_environment(
     patterns = [*ENV_ALLOWLIST, *passthrough, *(name for cloud in clouds for name in CLOUD_ENV[cloud])]
     source = os.environ if environ is None else environ
     return {k: v for k, v in source.items() if any(fnmatch.fnmatchcase(k, pattern) for pattern in patterns)}
+
+
+def path_name(*parts: Any) -> str:
+    """One path component for user-supplied names, never shared by two different inputs.
+
+    A lone lower-case name of safe characters is kept as it is. Anything else (other characters, upper case,
+    several parts, a leading dot, over 80 characters, or a name shaped like this function's own output) becomes
+    a readable form plus 12 hex digits of the SHA-256 of the exact input.
+    """
+    texts = [str(part) for part in parts]
+    if len(texts) == 1 and _PLAIN.fullmatch(texts[0]) and not _HASHED.fullmatch(texts[0]):
+        return texts[0]
+    readable = "__".join(_SAFE.sub("_", text) for text in texts)[:80]
+    return f"{readable}-{hashlib.sha256(json.dumps(texts).encode()).hexdigest()[:12]}"
+
+
+def undeclared_state_variables(env: Mapping[str, str], environ: Optional[Mapping[str, str]] = None) -> list[str]:
+    """Names of the worker's state-selecting variables that the task's environment would not carry to rivet."""
+    source = os.environ if environ is None else environ
+    return [name for name in STATE_ENV if source.get(name) and name not in env]
 
 
 def plan_layout(plan: Any) -> list[dict[str, Any]]:
@@ -84,7 +107,7 @@ class Request:
     stderr_dir: Optional[str] = None
     stream_stderr: bool = False
     log_keep: Optional[int] = 10
-    label: Sequence[str] = ("dag", "run", "task", "1")
+    label: Sequence[Any] = ("dag", "run", "task", 1)
     upstream_markers: Sequence[str] = ()
 
 
@@ -152,8 +175,10 @@ class _Session:
         self.argvs: list[list[str]] = []
         self.stderr_path: Optional[str] = None
         self.tmp: Optional[Path] = None
-        dag, run, task, attempt = (_SAFE.sub("_", str(part)) for part in request.label)
-        self.name = f"{run}__{task}__{attempt}"
+        dag, run, task = (path_name(part) for part in request.label[:3])
+        attempt = f"try{int(request.label[3])}"
+        self.run = run
+        self.name = path_name(*request.label[1:3], attempt)
         self.log_name = f"{run}__{attempt}"
         if pf.state_dir is not None:
             self.work = _private_dir(pf.state_dir, "airflow", dag)
@@ -387,7 +412,7 @@ def _tail(path: Path) -> str:
 def copy_name(source: Path, only_export: Optional[str] = None) -> str:
     """The name of a config's copy: its own stem plus a hash of its absolute path, so two sources never share one."""
     digest = hashlib.sha256(str(source).encode()).hexdigest()[:8]
-    suffix = f"--{_SAFE.sub('_', only_export)}" if only_export is not None else ""
+    suffix = f"--{path_name(only_export)}" if only_export is not None else ""
     return f"{source.stem}.{digest}{suffix}{source.suffix or '.yaml'}"
 
 
@@ -471,6 +496,18 @@ def _unexpired(artifact: Path) -> bool:
     return expires > datetime.now(timezone.utc)
 
 
+def _refuse_foreign_artifact(artifact: Path, export: str) -> None:
+    """Refuse a sealed plan artifact that records another export than the one being applied; the file is left alone."""
+    doc = _read_json(artifact)
+    if isinstance(doc, dict) and doc.get("export_name") != export:
+        raise PreflightRefusal(
+            "RIVET_AIRFLOW_PLAN_ARTIFACT_FOREIGN",
+            f"the sealed plan artifact {artifact} is for export `{doc.get('export_name')}`, not `{export}`: applying "
+            "it would extract the other export under this task's name. It is neither applied nor replaced; delete "
+            "the file once you know what wrote it",
+        )
+
+
 def _entries(s: _Session, doc: Any, key: str) -> list[dict[str, Any]]:
     """The unit entries of a result file; anything that is not a list of objects is dropped and recorded."""
     entries = doc.get(key) if isinstance(doc, dict) else None
@@ -532,9 +569,8 @@ def _apply(s: _Session) -> Outcome:
     """`rivet plan -e X -o artifact` when no unexpired artifact exists, then `rivet apply artifact`."""
     export = s.req.export or ""
     cfg = s.config_for(None)
-    run_part = _SAFE.sub("_", str(s.req.label[1]))
-    artifact = s.work / "plans" / run_part / f"{_SAFE.sub('_', export)}.json"
-    artifact.parent.mkdir(parents=True, exist_ok=True)
+    artifact = _private_dir(s.work, "plans", s.run) / f"{path_name(export)}.json"
+    _refuse_foreign_artifact(artifact, export)
     if not _unexpired(artifact):
         plan_argv = [s.pf.binary, "plan", "--config", cfg, "--export", export, "--format", "json"]
         plan_argv += ["--output", str(artifact), "--json-errors"]
@@ -542,6 +578,7 @@ def _apply(s: _Session) -> Outcome:
         error = s.classify(planned)
         if error is not None:
             return s.outcome(planned, [UnitResult(export, status="failed", error=error)], error)
+        _refuse_foreign_artifact(artifact, export)
     has_summary = s.pf.caps.has_flag("apply", "--summary-output")
     summary = s.work / f"{s.name}.summary.json"
     argv = [s.pf.binary, "apply", str(artifact)]
@@ -617,7 +654,7 @@ def _load(s: _Session) -> Outcome:
         s.degraded.add("load_table_filter")
         if s.pf.state_dir is not None:
             locks = _private_dir(s.pf.state_dir, "airflow", "locks")
-            lock = open(locks / f"{_SAFE.sub('_', export or 'config')}.lock", "w")
+            lock = open(locks / f"{path_name(export or 'config')}.lock", "w")
             fcntl.flock(lock, fcntl.LOCK_EX)
     try:
         step = s.step(cmd, argv)

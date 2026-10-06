@@ -216,7 +216,7 @@ The exception text is `[code] class: action (export)`. It never contains rivet's
 
 **The crashed budget across tries.** Airflow clears a task instance's XCom at the start of every
 try, so the count cannot live there. On a local worker the operator keeps a small ledger file,
-`<state_dir>/airflow/<dag_id>/crashed/<run_id>__<task_id>.json`, holding `[try, max_tries]` for
+`<state_dir>/airflow/<dag_id>/crashed/<run_id>__<task_id>-<hash>.json`, holding `[try, max_tries]` for
 every try that ended in a crash. A crash is retried when fewer than `crashed_retries` earlier
 crashes carry the task instance's current `max_tries`. Airflow moves `max_tries` when a task is
 cleared, so a manual clear gets a fresh budget; changing `retries` in the DAG file in the middle
@@ -250,6 +250,16 @@ PostgreSQL state is `RIVET_STATE_URL=postgresql://...` in the task's environment
 `env_from_connections={"RIVET_STATE_URL": "rivet_state"}`, or set it on the worker and name it in
 `env_passthrough=["RIVET_STATE_URL"]` (a worker variable is not inherited unless it is named).
 
+**A `RIVET_STATE_URL` set on the worker and not passed on is refused.** If the worker's
+environment has a non-empty `RIVET_STATE_URL` and the task's environment would not carry one
+(not in `env_passthrough`, `env` or `env_from_connections`), the task fails before rivet starts
+with `RIVET_AIRFLOW_STATE_ENV_NOT_PASSED` and is not retried: rivet would otherwise run green on
+an empty SQLite state while the real state sits in the database the worker names. The message
+names the variable and never its value. Fix it one of two ways: inherit the worker's value with
+`env_passthrough=["RIVET_STATE_URL"]`, or give the task its own value with
+`env_from_connections={"RIVET_STATE_URL": "<conn_id>"}` (or `env`). If the worker's variable is
+not meant for this pipeline, unset it on the worker.
+
 ### Local worker setup guide
 
 1. **Create the state directory yourself, once, on storage that outlives the worker process.**
@@ -271,8 +281,21 @@ PostgreSQL state is `RIVET_STATE_URL=postgresql://...` in the task's environment
    - every relative `query_file` of the config, copied to the same relative path (see 5), and
      `.rivet_airflow_query_files.json`, which records the config directory each one came from.
    - a relative `cdc.checkpoint`, which resolves beside the copied config, that is, here.
-   - `airflow/<dag_id>/`: sealed plan artifacts, the crashed ledger, scratch files; `airflow/locks/`.
+   - `airflow/<dag_id>/`: sealed plan artifacts (`plans/<run_id>/<export>.json`), the crashed
+     ledger, scratch files; `airflow/locks/`.
    - `logs/<dag_id>/<task_id>/`: rivet's stdout and stderr, one file per step and try.
+   - **How a name becomes a path.** A DAG id, task id, run id or export name that is one lower-case
+     word of `a-z 0-9 _ . -` (at most 80 characters, not starting with `.` or `-`) is used as it
+     is. Any other name (other characters such as `:` `+` or non-ASCII letters, upper case, a
+     mapped task's `task_id[index]`) is written as its readable form (each run of other
+     characters replaced by `_`) followed by `-` and 12 hex digits of the SHA-256 of the exact
+     name: run id `scheduled__2026-10-06T00:00:00+00:00` becomes
+     `scheduled__2026-10-06T00_00_00_00_00-b07b0ae9e551`. Two different names
+     therefore never share a directory, a sealed plan, a log file or a ledger, also on a file
+     system that ignores case.
+   - A sealed plan artifact records the export it was made for. `apply` refuses one that records
+     another export (`RIVET_AIRFLOW_PLAN_ARTIFACT_FOREIGN`) and leaves the file as it is, so the
+     retry is refused for the same reason until a person deletes it.
    - `.rivet_airflow_marker`: a random id written by the first task that used the directory.
 
    The copies and every file under `airflow/` and `logs/` are created with mode `0600`, in
@@ -371,6 +394,10 @@ dag = build_batch_dag(
     default_args={"retries": 2, "on_failure_callback": slack_failure_callback("slack_webhook")},
 )
 ```
+
+The `watcher` task carries no failure callback: the builders set its `on_failure_callback` to
+none, so a failed run sends one message per failed task and nothing for the watcher (which has no
+rivet result to show).
 
 It needs `apache-airflow-providers-slack` (the `slack` extra) and a Slack incoming-webhook
 connection. The message shows task, run, and per failed unit the export, `[code]`, class,

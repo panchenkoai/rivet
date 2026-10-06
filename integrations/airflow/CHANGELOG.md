@@ -44,5 +44,15 @@ Changed before the first release, after review (see the README sections named):
 - The crashed-budget ledger fails closed (`crashed_ledger`) and is keyed by `max_tries`, so
   lowering `retries` cannot reset it. ("Retries")
 - `RivetPlanOperator` swaps the layout file in only when a builder can read it.
+- Every path component made from a DAG id, task id, run id or export name is unique to that
+  name: a name that is not one lower-case word of safe characters gets a hash of the exact name
+  appended. Two exports or two DAGs whose names differed only in replaced characters shared one
+  sealed plan, so one export applied the other's plan and was never extracted. `apply` also
+  refuses an artifact that records another export (`RIVET_AIRFLOW_PLAN_ARTIFACT_FOREIGN`).
+  ("Local worker setup guide")
+- A non-empty `RIVET_STATE_URL` in the worker's environment that the task would not pass to
+  rivet is refused before rivet starts (`RIVET_AIRFLOW_STATE_ENV_NOT_PASSED`).
+- `build_batch_dag(exports=[])` raises `ValueError`; the watcher carries no failure callback, so
+  a callback in `default_args` fires once per failed task.
 - `connection_url`: a password without a login, IPv6 hosts, Oracle `service_name`, an encoded
   database name. The version has one source, `airflow_provider_rivet/__init__.py`.

@@ -6,8 +6,11 @@ import json
 import logging
 from pathlib import Path
 
+import airflow
 import pytest
 from conftest import NEW_FLAGS, SECRET, DagRig
+
+AIRFLOW_MAJOR = int(airflow.__version__.split(".")[0])
 
 REFUSED = {"exit": 5, "line": {"error": "refused: row 4111-1111", "exit_class": 5, "code": "RIVET_SOURCE_CDC_LOG_GAP"}}
 BATCH_CONFIG = """\
@@ -155,6 +158,36 @@ def test_a_failed_cdc_load_blocks_its_own_compaction_only(cdc: DagRig) -> None:
     assert (tasks["load.orders"], tasks["compact.orders"]) == (FAILED, BLOCKED)
     assert (tasks["run"], tasks["load.users"], tasks["compact.users"]) == (OK, OK, OK)
     assert tasks["watcher"] == FAILED and state == FAILED
+
+
+def test_a_failure_callback_from_default_args_fires_for_the_failed_task_and_not_for_the_watcher(batch: DagRig) -> None:
+    batch.scenario(**{"apply:b": REFUSED})
+    fired = batch.tmp / "fired.txt"
+    state, tasks = batch.run_dag("build_batch_dag", "alert_once", exports=["a", "b"], load=False, failures_to=fired)
+    assert (tasks["apply.b"], tasks["watcher"], state) == (FAILED, FAILED, FAILED)
+    assert fired.read_text().split() == ["apply.b"], "one alert per failure: the watcher sends none of its own"
+
+
+NON_ASCII = ("\u0437\u0430\u043a\u0430\u0437\u044b", "\u043a\u043b\u0438\u0435\u043d\u0442\u044b")
+
+
+@pytest.mark.skipif(
+    AIRFLOW_MAJOR >= 3, reason="Airflow 3 dag.test() cannot run a non-ASCII task id (latin-1 in its API client)"
+)
+def test_two_non_ascii_exports_of_one_dag_are_each_planned_and_extracted(dag_rig: DagRig) -> None:
+    exports = "".join(f"  - {{name: {json.dumps(n)}, query: SELECT 1, mode: full}}\n" for n in NON_ASCII)
+    dag_rig.config.write_text(f"source:\n  type: postgres\n  url_env: RIVET_PG_URL\nexports:\n{exports}")
+    state, tasks = dag_rig.run_dag("build_batch_dag", "non_ascii_exports", exports=list(NON_ASCII), load=False)
+    assert state == OK and tasks.pop("watcher") == SKIPPED and set(tasks.values()) == {OK} and len(tasks) == 2
+    steps = [c for c in dag_rig.ran() if c[0] != "metrics"]
+    assert sorted(steps) == sorted([(step, n) for n in NON_ASCII for step in ("plan", "apply")]), steps
+    artifacts = {c["argv"][1] for c in dag_rig.calls() if c["argv"][0] == "apply"}
+    assert len(artifacts) == 2 and sorted(json.loads(Path(a).read_text())["export_name"] for a in artifacts) == sorted(NON_ASCII)
+
+
+def test_an_empty_export_list_is_refused_when_the_dag_is_built(dag_rig: DagRig) -> None:
+    with pytest.raises(ValueError, match="`exports` is empty"):
+        dag_rig.run_dag("build_batch_dag", "no_exports", exports=[])
 
 
 def scan(root: Path, needle: bytes) -> list[str]:

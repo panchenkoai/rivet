@@ -3,12 +3,23 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 from urllib.parse import quote
 
 from ._compat import AirflowException, AirflowFailException, AirflowSkipException, BaseHook, BaseOperator
-from .invocation import _SAFE, CLOUD_ENV, Outcome, Request, _stop, crashed_retry_allowed, invoke, worker_environment
+from .invocation import (
+    CLOUD_ENV,
+    Outcome,
+    Request,
+    _stop,
+    crashed_retry_allowed,
+    invoke,
+    path_name,
+    undeclared_state_variables,
+    worker_environment,
+)
 from .preflight import PreflightRefusal
 
 XCOM_KEY = "return_value"
@@ -111,6 +122,15 @@ class RivetBaseOperator(BaseOperator):
         for name, ref in (self.env_from_connections or {}).items():
             conn_id, scheme = (ref, None) if isinstance(ref, str) else (ref[0], ref[1])
             env[name] = connection_url(BaseHook.get_connection(conn_id), scheme)
+        for name in undeclared_state_variables(env, os.environ):
+            raise PreflightRefusal(
+                "RIVET_AIRFLOW_STATE_ENV_NOT_PASSED",
+                f"the worker's environment sets {name} and this task would not pass it to rivet, which would then "
+                f"run on an empty SQLite state and treat every export as a first run. Either inherit the worker's "
+                f'value with env_passthrough=["{name}"], or give the task its own with '
+                f'env_from_connections={{"{name}": "<conn_id>"}} (or `env`); unset it on the worker if it is not '
+                "meant for this pipeline",
+            )
         return env
 
     def _emit(self, record: dict[str, Any]) -> None:
@@ -155,7 +175,7 @@ class RivetBaseOperator(BaseOperator):
         ti = context["ti"]
         run_id = str(context.get("run_id") or getattr(ti, "run_id", "run"))
         map_index = getattr(ti, "map_index", -1)
-        task_part = ti.task_id if map_index in (-1, None) else f"{ti.task_id}-{map_index}"
+        task_part = ti.task_id if map_index in (-1, None) else f"{ti.task_id}[{map_index}]"
         try:
             env = self._environment()
         except PreflightRefusal as refusal:
@@ -176,7 +196,7 @@ class RivetBaseOperator(BaseOperator):
             stderr_dir=self.stderr_dir,
             stream_stderr=self.stream_stderr,
             log_keep=self.log_keep,
-            label=(ti.dag_id, run_id, task_part, f"try{ti.try_number}"),
+            label=(ti.dag_id, run_id, task_part, ti.try_number),
             upstream_markers=self._upstream_markers(ti),
         )
         try:
@@ -205,8 +225,8 @@ class RivetBaseOperator(BaseOperator):
         if decision == "retry_crashed":
             ledger = None
             if outcome.marker is not None and self.state_dir:
-                name = f"{_SAFE.sub('_', run_id)}__{_SAFE.sub('_', task_part)}.json"
-                ledger = Path(self.state_dir) / "airflow" / _SAFE.sub("_", ti.dag_id) / "crashed" / name
+                name = f"{path_name(run_id, task_part)}.json"
+                ledger = Path(self.state_dir) / "airflow" / path_name(ti.dag_id) / "crashed" / name
             allowed, problem = crashed_retry_allowed(ledger, ti.try_number, ti.max_tries, self.crashed_retries)
             payload["crashed_retry"] = allowed
             if ledger is None or problem:

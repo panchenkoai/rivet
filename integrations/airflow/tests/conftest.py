@@ -167,6 +167,7 @@ def own_temp_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     path = tmp_path / "tmp"
     path.mkdir()
     monkeypatch.setattr(tempfile, "tempdir", str(path))
+    monkeypatch.delenv("RIVET_STATE_URL", raising=False)
     return path
 
 
@@ -193,8 +194,13 @@ class DagRig(Rig):
         self.home = Path(home)
         (self.home / "dags").mkdir(exist_ok=True)
 
-    def run_dag(self, builder: str, dag_id: str, env: dict | None = None, **kwargs: Any) -> tuple[str, dict[str, str]]:
-        """Build a DAG with one of the package's builders and run it; (run state, state by task id)."""
+    def run_dag(
+        self, builder: str, dag_id: str, env: dict | None = None, failures_to: Path | None = None, **kwargs: Any
+    ) -> tuple[str, dict[str, str]]:
+        """Build a DAG with one of the package's builders and run it; (run state, state by task id).
+
+        With `failures_to`, `default_args` carries a failure callback that appends the failed task's id to that file.
+        """
         kwargs.setdefault("config", str(self.config))
         kwargs.setdefault("state_dir", str(self.state_dir))
         kwargs.setdefault("default_args", {"retries": 0})
@@ -207,7 +213,11 @@ class DagRig(Rig):
             f"from airflow_provider_rivet.dags import {builder}\n"
             f"kwargs = {kwargs!r}\n"
             f"kwargs['operator_kwargs']['env'] = {{name: os.environ[name] for name in {sorted(env)!r}}}\n"
-            f"dag = {builder}({dag_id!r}, **kwargs)\n"
+            "def record(context):\n"
+            f"    with open({str(failures_to)!r}, 'a') as log:\n"
+            "        log.write(context['ti'].task_id + '\\n')\n"
+            + ("kwargs['default_args']['on_failure_callback'] = record\n" if failures_to else "")
+            + f"dag = {builder}({dag_id!r}, **kwargs)\n"
         )
         before = {name: os.environ.get(name) for name in env}
         os.environ.update(env)

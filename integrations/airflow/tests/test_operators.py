@@ -14,6 +14,7 @@ import pytest
 from airflow.exceptions import AirflowException, AirflowFailException, AirflowSkipException
 from conftest import NEW_FLAGS, SECRET, FakeTI, Rig, fixture
 
+from airflow_provider_rivet import invocation
 from airflow_provider_rivet.invocation import ENV_ALLOWLIST, crashed_retry_allowed
 from airflow_provider_rivet.dags import read_plan_layout
 from airflow_provider_rivet.operators import (
@@ -440,7 +441,8 @@ def test_the_subprocess_gets_the_allow_list_and_what_the_operator_declares_and_n
     rig: Rig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     secrets = {"AIRFLOW__CORE__FERNET_KEY": "k", "MY_DB_PASSWORD": "p", "AWS_SECRET_ACCESS_KEY": "a",
-               "GOOGLE_APPLICATION_CREDENTIALS": "/g.json", "AZURE_CLIENT_SECRET": "z", "RIVET_OTHER_URL": "u"}
+               "GOOGLE_APPLICATION_CREDENTIALS": "/g.json", "AZURE_CLIENT_SECRET": "z", "RIVET_OTHER_URL": "u",
+               "HOMEBREW_GITHUB_API_TOKEN": "h", "LANGSMITH_API_KEY": "l", "PATH_SECRET": "s", "TZ_TOKEN": "t"}
     allowed = {"TZ": "UTC", "LC_ALL": "C", "HTTPS_PROXY": "http://proxy:3128", "SSL_CERT_FILE": "/ca.pem"}
     for name, value in {**secrets, **allowed}.items():
         monkeypatch.setenv(name, value)
@@ -452,7 +454,7 @@ def test_the_subprocess_gets_the_allow_list_and_what_the_operator_declares_and_n
     rig.run(wide)
     keys = set(rig.calls()[-1]["env_keys"])
     assert {"RIVET_OTHER_URL", "MY_DB_PASSWORD", "AWS_SECRET_ACCESS_KEY", "GOOGLE_APPLICATION_CREDENTIALS"} <= keys
-    assert not keys & {"AZURE_CLIENT_SECRET", "AIRFLOW__CORE__FERNET_KEY"}
+    assert not keys & {"AZURE_CLIENT_SECRET", "AIRFLOW__CORE__FERNET_KEY", "HOMEBREW_GITHUB_API_TOKEN", "PATH_SECRET"}
     with pytest.raises(ValueError, match="cloud_credentials"):
         RivetRunOperator(task_id="t", config="c.yaml", cloud_credentials=["gcs"])
     readme = (Path(__file__).resolve().parents[1] / "README.md").read_text()
@@ -547,3 +549,165 @@ def test_connection_url_keeps_a_lone_password_brackets_ipv6_and_reads_the_oracle
     oracle = {"conn_type": "oracle", "login": "u", "password": "p", "port": 1521, "schema": "HR"}
     assert connection_url(conn(**oracle, extra_dejson={"service_name": "ORCLPDB1"})) == "oracle://u:p@h:1521/ORCLPDB1"
     assert connection_url(conn(**oracle)) == "oracle://u:p@h:1521/HR"
+
+
+def test_a_declared_env_value_wins_over_the_workers_value_for_the_same_name(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TZ", "UTC")
+    monkeypatch.setenv("RIVET_PG_URL", "postgresql://worker-value/db")
+    rig.scenario(record_env=["RIVET_PG_URL", "TZ"])
+    op = rig.operator(RivetRunOperator, export="orders", env={"RIVET_PG_URL": SECRET, "TZ": "Asia/Tokyo"}, env_passthrough=["RIVET_PG_URL"])
+    rig.run(op)
+    assert rig.calls()[-1]["env"] == {"RIVET_PG_URL": SECRET, "TZ": "Asia/Tokyo"}
+
+
+def test_an_older_wider_log_file_and_directory_are_made_private(rig: Rig) -> None:
+    for name in ("logs", "airflow"):
+        (rig.state_dir / name).mkdir()
+        (rig.state_dir / name).chmod(0o777)
+    op = rig.operator(RivetRunOperator, export="orders")
+    first = Path(rig.run(op)[0]["stderr_path"])
+    for wide in (first, first.parent, first.parent.parent):
+        wide.chmod(0o777 if wide.is_dir() else 0o666)
+    again = Path(rig.run(op)[0]["stderr_path"])
+    assert again == first and mode(first) == 0o600, "a file of the same name left wider by an earlier writer is tightened"
+    assert [mode(d) for d in (first.parent, first.parent.parent, rig.state_dir / "logs", rig.state_dir / "airflow")] == [0o700] * 4
+
+
+def test_a_path_name_is_readable_and_never_shared_by_two_different_names() -> None:
+    name = invocation.path_name
+    assert [name(n) for n in ("orders", "apply.orders_cdc", "manual__2026-10-06", "9x")] == ["orders", "apply.orders_cdc", "manual__2026-10-06", "9x"]
+    cyrillic = ("\u0437\u0430\u043a\u0430\u0437\u044b", "\u043a\u043b\u0438\u0435\u043d\u0442\u044b")
+    hostile = ["a:b", "a+b", "a_b", "a b", "A_b", "", ".", "..", ".hidden", "-x", "x" * 300, "x" * 301, *cyrillic]
+    hostile += [name(n) for n in ("a:b", *cyrillic)] + ["a/../../b", "a\x00b", "a\nb"]
+    made = [name(n) for n in hostile]
+    assert len({m.lower() for m in made}) == len(hostile), "also on a file system that ignores case"
+    assert all(invocation._SAFE.sub("_", m) == m and m not in (".", "..") and 0 < len(m.encode()) < 120 for m in made)
+    assert name("a:b").startswith("a_b-") and name("a_b") == "a_b"
+    assert name("run", "task") != name("run__task") and name("a__b", "c") != name("a", "b__c")
+    assert name("load", "1") != name("load-1") and name("orders") == name("orders")
+
+
+COLLIDING = [
+    ("\u0437\u0430\u043a\u0430\u0437\u044b", "\u043a\u043b\u0438\u0435\u043d\u0442\u044b"),
+    ("a:b", "a+b"),
+    ("a b", "a_b"),
+    ("Orders", "orders"),
+]
+
+
+@pytest.mark.parametrize("names", COLLIDING, ids=["non-ascii", "punctuation", "space", "case"])
+def test_two_exports_whose_names_sanitise_to_one_get_their_own_plan_and_are_both_extracted(rig: Rig, names: tuple) -> None:
+    one, two = names
+    exports = "".join(f"  - {{name: {json.dumps(n)}, query: SELECT 1, mode: full}}\n" for n in names)
+    rig.config.write_text(f"source:\n  type: postgres\n  url_env: RIVET_PG_URL\nexports:\n{exports}")
+    for n in names:
+        payload, _ = rig.run(rig.operator(RivetApplyOperator, task_id="t", export=n))
+        assert payload["decision"] == "success" and [u["export"] for u in payload["units"]] == [n]
+    steps = [(c["argv"][0], c["export"]) for c in rig.calls() if c["argv"][0] != "metrics"]
+    assert steps == [("plan", one), ("apply", one), ("plan", two), ("apply", two)], "each export is planned and applies its own plan"
+    artifacts = [c["argv"][1] for c in rig.calls() if c["argv"][0] == "apply"]
+    assert artifacts[0].lower() != artifacts[1].lower()
+    assert [json.loads(Path(a).read_text())["export_name"] for a in artifacts] == [one, two]
+    for n in names:
+        rig.run(rig.operator(RivetLoadOperator, task_id="t", export=n))
+    narrowed = [c["argv"][2] for c in rig.calls() if c["argv"][0] == "load"]
+    assert narrowed[0].lower() != narrowed[1].lower(), "the single-export copies of the config are separate files"
+    assert [c["export"] for c in rig.calls() if c["argv"][0] == "load"] == [one, two]
+
+
+@pytest.mark.parametrize(
+    "ids",
+    [
+        [{"dag_id": "\u043f\u0440\u043e\u0434\u0430\u0436\u0438"}, {"dag_id": "\u0441\u043a\u043b\u0430\u0434"}],
+        [{"dag_id": "Sales"}, {"dag_id": "sales"}],
+        [{"task_id": "load.\u0437\u0430\u043a\u0430\u0437\u044b"}, {"task_id": "load.\u043a\u043b\u0438\u0435\u043d\u0442\u044b"}],
+        [{"task_id": "load", "map_index": 1}, {"task_id": "load-1"}],
+        [{"run_id": "manual__2026-10-06T00:00:00+00:00"}, {"run_id": "manual__2026-10-06T00_00_00_00_00"}],
+    ],
+    ids=["dag-non-ascii", "dag-case", "task-non-ascii", "mapped-task", "run-id"],
+)
+def test_two_dags_tasks_or_runs_whose_ids_sanitise_to_one_share_no_artifact_log_or_ledger(rig: Rig, ids: list) -> None:
+    def ti(which: int, try_number: int = 1) -> FakeTI:
+        made = FakeTI(try_number=try_number)
+        for field, value in ids[which].items():
+            setattr(made, field, value)
+        return made
+
+    keep = None if "run_id" in ids[0] else 1
+    op = rig.operator(RivetApplyOperator, export="orders", log_keep=keep)
+    first, _ = rig.run(op, ti(0))
+    second, _ = rig.run(op, ti(1))
+    retried, _ = rig.run(op, ti(1, try_number=2))
+    artifacts = [c["argv"][1] for c in rig.calls() if c["argv"][0] == "apply"]
+    if "task_id" in ids[0]:
+        assert len(set(artifacts)) == 1, "two tasks of one run and one export replay one sealed plan"
+    else:
+        assert [c["argv"][0] for c in rig.calls()].count("plan") == 2, "the second id plans for itself; only its own retry replays"
+        assert artifacts[0].lower() != artifacts[1].lower() and artifacts[1] == artifacts[2]
+    logs = [Path(p["stderr_path"]) for p in (first, second, retried)]
+    assert str(logs[0]).lower() != str(logs[1]).lower()
+    assert logs[0].exists(), "pruning the second id's tries leaves the first id's files alone"
+    assert logs[1].exists() is (keep is None) and logs[2].exists(), "retention counts the tries of one task of one DAG"
+    rig.scenario(apply={"signal": "SIGKILL"})
+    crashed = [rig.run(op, ti(0, try_number=3))[0], rig.run(op, ti(1, try_number=4))[0]]
+    assert [type(c) for c in crashed] == [AirflowException, AirflowException], "each id has its own crashed budget"
+
+
+def test_a_sealed_plan_made_for_another_export_is_refused_and_refused_again_on_the_retry(rig: Rig) -> None:
+    op = rig.operator(RivetApplyOperator, export="orders")
+    rig.run(op)
+    artifact = Path(rig.argv("apply")[1])
+    foreign = json.dumps({**json.loads(artifact.read_text()), "export_name": "users"})
+    artifact.write_text(foreign)
+    before = len(rig.calls())
+    outcomes = [rig.run(op, FakeTI(try_number=n)) for n in (2, 3)]
+    for exc, ti in outcomes:
+        assert isinstance(exc, AirflowFailException), exc
+        assert ti.store[("task", "return_value")]["preflight_refusal"] == "RIVET_AIRFLOW_PLAN_ARTIFACT_FOREIGN"
+        assert "`users`" in str(exc) and "`orders`" in str(exc)
+    assert str(outcomes[0][0]) == str(outcomes[1][0]), "the second cycle refuses for the same reason"
+    assert len(rig.calls()) == before, "neither a plan nor an apply ran"
+    assert artifact.read_text() == foreign, "the refusal leaves the artifact as it found it"
+    artifact.unlink()
+    payload, _ = rig.run(op, FakeTI(try_number=4))
+    assert payload["decision"] == "success" and json.loads(artifact.read_text())["export_name"] == "orders"
+
+
+def test_a_plan_that_writes_an_artifact_for_another_export_is_not_applied(rig: Rig) -> None:
+    script = rig.bin / "rivet"
+    script.write_text(script.read_text().replace('{"export_name": value_of(argv, "--export"),', '{"export_name": "users",'))
+    exc, ti = rig.run(rig.operator(RivetApplyOperator, export="orders"))
+    assert isinstance(exc, AirflowFailException), exc
+    assert ti.store[("task", "return_value")]["preflight_refusal"] == "RIVET_AIRFLOW_PLAN_ARTIFACT_FOREIGN"
+    assert [c["argv"][0] for c in rig.calls()] == ["plan"]
+
+
+STATE_URL = "postgresql://state:st4te-pw@state-db/rivet_state"
+
+
+def test_a_worker_state_url_the_task_does_not_pass_on_is_refused_before_rivet_starts(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setenv("RIVET_STATE_URL", STATE_URL)
+    op = rig.operator(RivetRunOperator, export="orders")
+    outcomes = [rig.run(op, FakeTI(try_number=n)) for n in (1, 2)]
+    for exc, ti in outcomes:
+        assert isinstance(exc, AirflowFailException), exc
+        assert ti.store[("task", "return_value")]["preflight_refusal"] == "RIVET_AIRFLOW_STATE_ENV_NOT_PASSED"
+        text = str(exc)
+        assert "RIVET_STATE_URL" in text and 'env_passthrough=["RIVET_STATE_URL"]' in text and "env_from_connections" in text
+        blob = text + json.dumps(ti.store[("task", "return_value")]) + json.dumps(rig.records) + caplog.text
+        assert "st4te-pw" not in blob and "state-db" not in blob, "the value is never shown"
+    assert not rig.calls(), "rivet is not started on an empty SQLite state"
+    assert not (rig.state_dir / "logs").exists() and not list(rig.state_dir.glob("*.yaml"))
+    passed = rig.operator(RivetRunOperator, export="orders", env_passthrough=["RIVET_STATE_URL"])
+    payload, _ = rig.run(passed)
+    assert payload["decision"] == "success" and "state_url_sqlite" not in payload["degraded"]
+    declared = rig.operator(RivetRunOperator, export="orders", env={"RIVET_PG_URL": SECRET, "RIVET_STATE_URL": "postgresql://other/db"})
+    rig.run(declared)
+    assert [c["env"]["RIVET_STATE_URL"] for c in rig.calls()] == [STATE_URL, "postgresql://other/db"]
+    monkeypatch.setenv("RIVET_STATE_URL", "")
+    payload, _ = rig.run(rig.operator(RivetRunOperator, export="orders"))
+    assert payload["decision"] == "success", "an empty worker variable selects nothing"
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text()
+    assert "RIVET_AIRFLOW_STATE_ENV_NOT_PASSED" in readme and "RIVET_AIRFLOW_PLAN_ARTIFACT_FOREIGN" in readme
