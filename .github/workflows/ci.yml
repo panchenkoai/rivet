@@ -1404,11 +1404,8 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
-      # ubuntu-latest ships ~14 GB free on `/`; the debug target, ~20 images and the tests' output
-      # need more. The pre-installed SDKs rivet never touches go in the BACKGROUND (the
-      # free-disk-space action took 2+ minutes of every run on the critical path).
-      - name: Free disk space (in the background)
-        run: (sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL > /dev/null 2>&1 &)
+      # No free-disk step: the runner starts with 83 GB free of 145 GB, the build ends ~70 GB used
+      # and a leg ~90 GB (measured on PR #452's first run; each job prints `df` every run).
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.94"
@@ -1460,11 +1457,6 @@ jobs:
       RIVET_ORACLE_LOG: ${{ github.workspace }}/target/rivet-oracle.log
     steps:
       - uses: actions/checkout@v7
-      # ubuntu-latest ships ~14 GB free on `/`; the debug target, ~20 images and the tests' output
-      # need more. The pre-installed SDKs rivet never touches go in the BACKGROUND (the
-      # free-disk-space action took 2+ minutes of every run on the critical path).
-      - name: Free disk space (in the background)
-        run: (sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL > /dev/null 2>&1 &)
 
       - name: Start services (in the background)
         # `up -d` pulls ~20 images and starts them; that used to happen, and then be
