@@ -44,7 +44,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from .core import Ledger, Status, engine_container, verify_no_invariant_violations, docker, have, record_stage_runs, remove_engine_containers, rivet, rivet_bin, run, sqlcmd, target_dir, verify_nextest_grading, HERE, ROOT
+from .core import Ledger, Status, engine_container, verify_no_invariant_violations, docker, have, record_stage_runs, remove_engine_containers, rivet, rivet_bin, run, run_lanes, sqlcmd, target_dir, verify_nextest_grading, HERE, ROOT
 from . import (
     bigquery,
     blessed_flow,
@@ -295,6 +295,105 @@ def _verdict_scope_self_test() -> None:
         ["refused", "independent", "collides"]
     print("self-test ok: partial runs write no verdict line; an oracle outage is NOT GRADED, not a product failure; "
           "rows keep the first error line; blessed-path cells have distinct export names")
+
+
+def _lanes_self_test() -> None:
+    """Lanes overlap, one lane's cells never do, rows flush in list order, a raise keeps every row; the upgrade
+    cells sharing a source server share a lane; grading a load leaves the process environment alone."""
+    import threading
+
+    both, busy, overlap = threading.Barrier(2, timeout=10), {"a": 0, "b": 0}, []
+
+    def cell(lane: str, n: int, meet: bool = False):
+        def run_cell(sub: Ledger) -> None:
+            busy[lane] += 1
+            overlap.append(busy[lane])
+            if meet:
+                both.wait()  # raises unless the other lane is inside its cell at the same time
+            time.sleep(0.02)
+            busy[lane] -= 1
+            sub.passed("-", "-", "lanes", lane, f"{lane}{n}")
+        return run_cell
+
+    led = Ledger(colour=False)
+    led._buf = []
+    run_lanes(led, [("a", cell("a", 1, True)), ("b", cell("b", 1, True)), ("a", cell("a", 2)), ("b", cell("b", 2)),
+                    ("a", cell("a", 3))])
+    assert [c.detail for c in led.cells] == ["a1", "b1", "a2", "b2", "a3"], led.cells
+    assert set(overlap) == {1}, f"two cells of one lane ran at once: {overlap}"
+
+    def boom(sub: Ledger) -> None:
+        raise RuntimeError("cell blew up")
+
+    led = Ledger(colour=False)
+    led._buf = []
+    try:
+        run_lanes(led, [("a", cell("a", 1)), ("b", boom), ("a", cell("a", 2))])
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("a raising cell must reach the stage, which records it")
+    assert [c.detail for c in led.cells] == ["a1", "a2"], "rows recorded beside a raising cell were dropped"
+
+    # The gate's own URLs (Makefile GATE_ENV): nine servers; Oracle's batch, resume-load and CDC cells share one.
+    from . import upgrade, upgrade_matrix
+    urls = {"RIVET_ORACLE_POSTGRES_URL": "postgresql://rivet:rivet@127.0.0.1:5432/rivet",
+            "RIVET_ORACLE_MYSQL_URL": "mysql://rivet:rivet@127.0.0.1:3306/rivet",
+            "RIVET_ORACLE_MSSQL_URL": "mssql://sa:Rivet_Passw0rd!@127.0.0.1:1433/rivet",
+            "RIVET_ORACLE_MONGO_URL": "mongodb://127.0.0.1:27017/rivet",
+            "RIVET_ORACLE_ORACLE_URL": "oracle://rivet:rivet@localhost:1521/FREEPDB1",
+            "RIVET_UPG_ORACLE_CDC_URL": "oracle://c%23%23rivetcdc:rivet@127.0.0.1:1521/FREEPDB1",
+            "RIVET_CDC_POSTGRES_URL": "postgresql://rivet:rivet@127.0.0.1:5434/rivet",
+            "RIVET_CDC_MYSQL_URL": "mysql://rivet:rivet@127.0.0.1:3307/rivet",
+            "RIVET_CDC_MSSQL_URL": "mssql://sa:Rivet_Passw0rd!@127.0.0.1:1434/rivet",
+            "RIVET_CDC_MONGO_URL": "mongodb://127.0.0.1:27018/rivet?directConnection=true",
+            "BQ_ORACLE_PROJECT": "p", "BQ_ORACLE_BUCKET": "b"}
+    saved = {k: os.environ.get(k) for k in urls}
+    os.environ.update(urls)
+    try:
+        cells = upgrade.warehouse_lane_cells(Path("prev"), Path("root"))
+    finally:
+        for k, v in saved.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+    lanes: dict[object, int] = {}
+    for lane, _ in cells:
+        lanes[lane] = lanes.get(lane, 0) + 1
+    ports = {str(k).rsplit(":", 1)[-1] for k in lanes if k is not None}
+    assert ports == {"5432", "3306", "1433", "27017", "1521", "5434", "3307", "1434", "27018"} and None not in lanes, lanes
+    fam = len(upgrade_matrix.rows()) * len(upgrade_matrix.TARGETS)
+    assert lanes["127.0.0.1:1521"] == fam + 1 + 3, f"Oracle's matrix, resume-load and cdc-load cells are not one lane: {lanes}"
+    assert lanes["127.0.0.1:3307"] == 3 and lanes["127.0.0.1:5432"] == fam + 1, lanes
+
+    # grade_load hands its BigQuery target to the session; the environment every other lane reads stays as it was.
+    import types
+
+    from . import rig_oracle
+    seen: dict = {}
+
+    class _Stop(Exception):
+        pass
+
+    def _oracle(**kw):
+        seen.update(kw)
+        raise _Stop
+
+    fake = types.ModuleType(f"{__package__}.duck")
+    fake.Oracle = _oracle
+    real, before = sys.modules.get(fake.__name__), dict(os.environ)
+    sys.modules[fake.__name__] = fake
+    try:
+        rig_oracle.grade_load({"engine": "postgres", "mode": "batch", "state": "", "url": "postgresql://x/y",
+                               "load": {"target": "bigquery", "project": "proj-of-the-cell", "dataset": "ds_of_the_cell"}})
+    except _Stop:
+        pass
+    finally:
+        sys.modules.pop(fake.__name__, None)
+        if real is not None:
+            sys.modules[fake.__name__] = real
+    assert dict(os.environ) == before, "grade_load wrote the process environment: cells in other lanes read it"
+    assert (seen.get("bq_project"), seen.get("bq_dataset")) == ("proj-of-the-cell", "ds_of_the_cell"), seen
+    print(f"self-test ok: {len(cells)} upgrade cells in {len(lanes)} lanes, one per source server; lanes overlap, "
+          "a lane is serial, rows flush in ledger order; grade_load leaves the environment alone")
 
 
 def _stages_self_test() -> None:
@@ -650,6 +749,7 @@ def _self_test() -> int:
     from . import upgrade_matrix
 
     upgrade_matrix._self_test()
+    _lanes_self_test()
     skip_census._self_test()
     print("\nregression stage (child harness, stand, banner):")
     return regression._self_test()
@@ -1236,18 +1336,9 @@ def _run_one_engine(led: Ledger, ns: argparse.Namespace, engine: str) -> None:
         f"{engine}: {len(version_lines)} versions, up to {workers} concurrent "
         f"(--version-parallel {cap})"
     )
-    subs = [led.buffered_child() for _ in version_lines]
-    from concurrent.futures import ThreadPoolExecutor
-
-    def _one(pair: tuple[Ledger, str]) -> None:
-        sub, line = pair
-        with sub.span(f"{engine} {line.split()[0]}: version-total"):
-            _run_one_version(sub, ns, engine, line)
-
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        list(ex.map(_one, zip(subs, version_lines)))
-    for sub in subs:
-        sub.flush_into(led)
+    run_lanes(led, [(line, _timed(f"{engine} {line.split()[0]}: version-total",
+                                  lambda sub, line=line: _run_one_version(sub, ns, engine, line)))
+                    for line in version_lines], workers=workers)
 
 
 def _run_one_version(led: Ledger, ns: argparse.Namespace, engine: str, line: str) -> None:
@@ -1284,22 +1375,18 @@ def _run_one_version(led: Ledger, ns: argparse.Namespace, engine: str, line: str
         docker("rm", "-fv", engine_container(engine, tag))
 
 
+def _timed(span: str, fn: Callable[[Ledger], None]) -> Callable[[Ledger], None]:
+    """`fn` with its wall-clock recorded as `span` on the ledger it runs into."""
+    def run_timed(sub: Ledger) -> None:
+        with sub.span(span):
+            fn(sub)
+    return run_timed
+
+
 def run_concurrently(led: Ledger, title: str, stages: list[tuple[str, Callable[[Ledger], None]]]) -> None:
     """Run independent gate stages at once, each into a buffered sub-ledger flushed in list order."""
-    from concurrent.futures import ThreadPoolExecutor
-
     led.phase(title)
-    subs = [led.buffered_child() for _ in stages]
-
-    def _one(i: int) -> None:
-        name, fn = stages[i]
-        with subs[i].span(f"{name}: stage-total"):
-            fn(subs[i])
-
-    with ThreadPoolExecutor(max_workers=len(stages)) as ex:
-        list(ex.map(_one, range(len(stages))))
-    for sub in subs:
-        sub.flush_into(led)
+    run_lanes(led, [(name, _timed(f"{name}: stage-total", fn)) for name, fn in stages])
 
 
 def engine_loop(led: Ledger, ns: argparse.Namespace) -> None:
@@ -1323,19 +1410,8 @@ def engine_loop(led: Ledger, ns: argparse.Namespace) -> None:
         f"Engine matrix — {len(engines)} engines, up to {workers} concurrent "
         f"(wall ≈ slowest engine; scenarios race on the shared state backend)"
     )
-    subs = {e: led.buffered_child() for e in engines}
-    from concurrent.futures import ThreadPoolExecutor
-
-    def _run(e: str) -> None:
-        # The per-engine total wall-clock — the "which engine is the long pole"
-        # number the opaque matrix phase can't give under parallelism.
-        with subs[e].span(f"{e}: engine-total"):
-            _run_one_engine(subs[e], ns, e)
-
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        list(ex.map(_run, engines))
-    for engine in engines:  # deterministic order, not completion order
-        subs[engine].flush_into(led)
+    run_lanes(led, [(e, _timed(f"{e}: engine-total", lambda sub, e=e: _run_one_engine(sub, ns, e)))
+                    for e in engines], workers=workers)
 
 
 def _hold_gate_lock():

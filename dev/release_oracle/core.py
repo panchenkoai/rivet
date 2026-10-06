@@ -658,6 +658,41 @@ def cell_gate() -> threading.BoundedSemaphore:
     return _cell_gate
 
 
+def server_of(url: str) -> str:
+    """`host:port` of a connection URL: two cells with the same value share one server (localhost is 127.0.0.1)."""
+    import urllib.parse
+
+    u = urllib.parse.urlsplit(url)
+    host = (u.hostname or "").lower()
+    return f"{'127.0.0.1' if host == 'localhost' else host}:{u.port}"
+
+
+def run_lanes(led: "Ledger", cells: Sequence[tuple[object, Callable[["Ledger"], None]]], *,
+              workers: int | None = None) -> None:
+    """Run `(lane, fn)` cells: one lane's cells in list order, lanes side by side; every cell's rows are buffered and flushed in list order."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    subs = [led.buffered_child() for _ in cells]
+    lanes: dict[object, list[int]] = {}
+    for i, (lane, _) in enumerate(cells):
+        lanes.setdefault(lane, []).append(i)
+
+    def _lane(idx: list[int]) -> BaseException | None:
+        for i in idx:
+            try:
+                cells[i][1](subs[i])
+            except (Exception, SystemExit) as e:  # noqa: BLE001 — re-raised below, after every row is flushed
+                return e
+        return None
+
+    with ThreadPoolExecutor(max_workers=max(1, min(workers or len(lanes), len(lanes)))) as ex:
+        raised = [e for e in ex.map(_lane, lanes.values()) if e is not None]
+    for sub in subs:
+        sub.flush_into(led)
+    if raised:
+        raise raised[0]
+
+
 def wait_until(check, *, tries: int = 45, delay: float = 2.0) -> bool:
     """Poll `check()` until true. Returns False on exhaustion — never raises, so
     a caller records a SKIP instead of aborting the whole gate."""

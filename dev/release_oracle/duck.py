@@ -84,6 +84,7 @@ class Oracle:
         *,
         bigquery: bool = False,
         bq_dataset: str | None = None,
+        bq_project: str | None = None,
         mysql: str | None = None,
         postgres: str | None = None,
         mssql: str | None = None,
@@ -120,8 +121,8 @@ class Oracle:
             self.db.sql(f"INSTALL {kind}; LOAD {kind};")
             self.db.sql(f"ATTACH '{state}' AS st (TYPE {kind}, READ_ONLY)")
         if bigquery:
-            target = bq_target()
-            if target is None:
+            target = (bq_project, bq_dataset or "") if bq_project is not None else bq_target()
+            if target is None or not target[0]:
                 raise RuntimeError(
                     f"BigQuery oracle needs {BQ_PROJECT_ENV} and {BQ_DATASET_ENV} — "
                     "call `bq_target()` first and SKIP the cell when it returns None, "
