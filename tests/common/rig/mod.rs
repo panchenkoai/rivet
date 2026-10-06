@@ -322,8 +322,9 @@ impl Rig {
         self
     }
 
-    /// `source.mongo.*` options, e.g. `.mongo("page_size: 500, resume: true")`.
+    /// `source.mongo.*` options, e.g. `.mongo("page_size: 500, resume: true")`; a second call replaces the first.
     pub fn mongo(mut self, opts: &str) -> Self {
+        self.source_lines.retain(|l| !l.starts_with("mongo:"));
         self.source_lines.push(format!("mongo: {{ {opts} }}"));
         self
     }

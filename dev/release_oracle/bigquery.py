@@ -669,7 +669,7 @@ def run_bigquery_golden(
         return
 
     led.phase(f"BigQuery golden stage ({proj}.{dset}_<engine>) — one dataset PER SOURCE")
-    bucket = os.environ.get("BQ_ORACLE_BUCKET") or "rivet_data_test"
+    bucket = os.environ.get("BQ_ORACLE_BUCKET", "")
     matrix = _matrix_cfg("bq", "tables")  # the single comprehensive matrix name
     work = _work_dir()
 

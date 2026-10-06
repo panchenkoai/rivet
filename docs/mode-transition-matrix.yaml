@@ -12,7 +12,7 @@ scenarios:
     postgres: { test: full_then_incremental_postgres }
     mysql:    { test: full_then_incremental_mysql }
     mssql:    { test: full_then_incremental_mssql }
-    mongo:    { na: "Mongo batch has no cursor-column incremental to switch into" }
+    mongo:    { test: full_then_resume_mongo }
     oracle:   { gap: "no Oracle mode-transition live test (the transition logic is shared; the cursor/keyset state Oracle writes is unproven here)" }
 
   - id: time_window_then_incremental
@@ -20,7 +20,7 @@ scenarios:
     postgres: { test: time_window_then_incremental_postgres }
     mysql:    { test: time_window_then_incremental_mysql }
     mssql:    { test: time_window_then_incremental_mssql }
-    mongo:    { na: "Mongo batch has no cursor-column incremental to switch into" }
+    mongo:    { na: "a Mongo export accepts only mode: full or cdc (validate_non_sql_source_modes, src/config/mod.rs:543-554), so there is no incremental / chunked mode to switch from or into; the switch Mongo has (into page_size + resume) is graded by the three *_then_resume_mongo cells" }
     oracle:   { gap: "no Oracle mode-transition live test (the transition logic is shared; the cursor/keyset state Oracle writes is unproven here)" }
 
   - id: range_chunked_then_incremental
@@ -28,7 +28,7 @@ scenarios:
     postgres: { test: range_chunked_then_incremental_postgres }
     mysql:    { test: range_chunked_then_incremental_mysql }
     mssql:    { test: range_chunked_then_incremental_mssql }
-    mongo:    { na: "Mongo batch has no cursor-column incremental to switch into" }
+    mongo:    { na: "a Mongo export accepts only mode: full or cdc (validate_non_sql_source_modes, src/config/mod.rs:543-554), so there is no incremental / chunked mode to switch from or into; the switch Mongo has (into page_size + resume) is graded by the three *_then_resume_mongo cells" }
     oracle:   { gap: "no Oracle mode-transition live test (the transition logic is shared; the cursor/keyset state Oracle writes is unproven here)" }
 
   - id: keyset_then_incremental_same_key
@@ -36,7 +36,7 @@ scenarios:
     postgres: { test: keyset_then_incremental_same_key_postgres }
     mysql:    { test: keyset_then_incremental_same_key_mysql }
     mssql:    { test: keyset_then_incremental_same_key_mssql }
-    mongo:    { na: "Mongo batch has no cursor-column incremental to switch into" }
+    mongo:    { test: keyset_then_resume_mongo }
     oracle:   { gap: "no Oracle mode-transition live test (the transition logic is shared; the cursor/keyset state Oracle writes is unproven here)" }
 
   - id: keyset_checkpoint_then_incremental_same_key
@@ -44,7 +44,7 @@ scenarios:
     postgres: { test: keyset_checkpoint_then_incremental_same_key_postgres }
     mysql:    { test: keyset_checkpoint_then_incremental_same_key_mysql }
     mssql:    { test: keyset_checkpoint_then_incremental_same_key_mssql }
-    mongo:    { na: "Mongo batch has no cursor-column incremental to switch into" }
+    mongo:    { na: "a Mongo export accepts only mode: full or cdc (validate_non_sql_source_modes, src/config/mod.rs:543-554), so there is no incremental / chunked mode to switch from or into; the switch Mongo has (into page_size + resume) is graded by the three *_then_resume_mongo cells" }
     oracle:   { gap: "no Oracle mode-transition live test (the transition logic is shared; the cursor/keyset state Oracle writes is unproven here)" }
 
   - id: parallel_keyset_then_incremental_same_key
@@ -52,7 +52,7 @@ scenarios:
     postgres: { test: parallel_keyset_then_incremental_same_key_postgres }
     mysql:    { test: parallel_keyset_then_incremental_same_key_mysql }
     mssql:    { test: parallel_keyset_then_incremental_same_key_mssql }
-    mongo:    { na: "Mongo batch has no cursor-column incremental to switch into" }
+    mongo:    { test: parallel_keyset_then_resume_mongo }
     oracle:   { gap: "no Oracle mode-transition live test (the transition logic is shared; the cursor/keyset state Oracle writes is unproven here)" }
 
   - id: keyset_then_incremental_other_column
@@ -60,7 +60,7 @@ scenarios:
     postgres: { test: keyset_then_incremental_other_column_postgres }
     mysql:    { test: keyset_then_incremental_other_column_mysql }
     mssql:    { test: keyset_then_incremental_other_column_mssql }
-    mongo:    { na: "Mongo batch has no cursor-column incremental to switch into" }
+    mongo:    { na: "a Mongo export accepts only mode: full or cdc (validate_non_sql_source_modes, src/config/mod.rs:543-554), so there is no incremental / chunked mode to switch from or into; the switch Mongo has (into page_size + resume) is graded by the three *_then_resume_mongo cells" }
     oracle:   { gap: "no Oracle mode-transition live test (the transition logic is shared; the cursor/keyset state Oracle writes is unproven here)" }
 
   - id: keyset_incremental_key_change
@@ -68,7 +68,7 @@ scenarios:
     postgres: { test: keyset_incremental_key_change_postgres }
     mysql:    { test: keyset_incremental_key_change_mysql }
     mssql:    { test: keyset_incremental_key_change_mssql }
-    mongo:    { na: "Mongo _id keyset resume has its own checkpoint, not export_state" }
+    mongo:    { na: "the Mongo keyset key is always _id (full_strategy, src/plan/build.rs) and chunk_by_key is refused outside mode: chunked (src/config/mod.rs:1360-1364), so the key cannot change" }
     oracle:   { gap: "no Oracle mode-transition live test (the transition logic is shared; the cursor/keyset state Oracle writes is unproven here)" }
 
   - id: incremental_then_keyset_incremental_same_key
@@ -76,7 +76,7 @@ scenarios:
     postgres: { test: incremental_then_keyset_incremental_same_key_postgres }
     mysql:    { test: incremental_then_keyset_incremental_same_key_mysql }
     mssql:    { test: incremental_then_keyset_incremental_same_key_mssql }
-    mongo:    { na: "Mongo batch has no cursor-column incremental to switch into" }
+    mongo:    { na: "a Mongo export accepts only mode: full or cdc (validate_non_sql_source_modes, src/config/mod.rs:543-554), so there is no incremental / chunked mode to switch from or into; the switch Mongo has (into page_size + resume) is graded by the three *_then_resume_mongo cells" }
     oracle:   { gap: "no Oracle mode-transition live test (the transition logic is shared; the cursor/keyset state Oracle writes is unproven here)" }
 
   - id: incremental_cursor_change
@@ -84,7 +84,7 @@ scenarios:
     postgres: { test: incremental_cursor_change_postgres }
     mysql:    { test: incremental_cursor_change_mysql }
     mssql:    { test: incremental_cursor_change_mssql }
-    mongo:    { na: "Mongo batch has no cursor-column incremental to switch into" }
+    mongo:    { na: "a Mongo export accepts only mode: full or cdc (validate_non_sql_source_modes, src/config/mod.rs:543-554), so there is no incremental / chunked mode to switch from or into; the switch Mongo has (into page_size + resume) is graded by the three *_then_resume_mongo cells" }
     oracle:   { gap: "no Oracle mode-transition live test (the transition logic is shared; the cursor/keyset state Oracle writes is unproven here)" }
 
   - id: incremental_single_to_coalesce
@@ -92,7 +92,7 @@ scenarios:
     postgres: { test: incremental_single_to_coalesce_postgres }
     mysql:    { test: incremental_single_to_coalesce_mysql }
     mssql:    { test: incremental_single_to_coalesce_mssql }
-    mongo:    { na: "Mongo batch has no cursor-column incremental to switch into" }
+    mongo:    { na: "a Mongo export accepts only mode: full or cdc (validate_non_sql_source_modes, src/config/mod.rs:543-554), so there is no incremental / chunked mode to switch from or into; the switch Mongo has (into page_size + resume) is graded by the three *_then_resume_mongo cells" }
     oracle:   { gap: "no Oracle mode-transition live test (the transition logic is shared; the cursor/keyset state Oracle writes is unproven here)" }
 
   - id: incremental_adding_settle
@@ -100,7 +100,7 @@ scenarios:
     postgres: { test: incremental_adding_settle_postgres }
     mysql:    { test: incremental_adding_settle_mysql }
     mssql:    { test: incremental_adding_settle_mssql }
-    mongo:    { na: "Mongo batch has no cursor-column incremental to switch into" }
+    mongo:    { na: "a Mongo export accepts only mode: full or cdc (validate_non_sql_source_modes, src/config/mod.rs:543-554), so there is no incremental / chunked mode to switch from or into; the switch Mongo has (into page_size + resume) is graded by the three *_then_resume_mongo cells" }
     oracle:   { gap: "no Oracle mode-transition live test (the transition logic is shared; the cursor/keyset state Oracle writes is unproven here)" }
 
   - id: legacy_keyset_state_then_other_column
@@ -108,7 +108,7 @@ scenarios:
     postgres: { test: legacy_keyset_state_then_other_column_postgres }
     mysql:    { test: legacy_keyset_state_then_other_column_mysql }
     mssql:    { test: legacy_keyset_state_then_other_column_mssql }
-    mongo:    { na: "Mongo batch has no cursor-column incremental to switch into" }
+    mongo:    { na: "a Mongo export accepts only mode: full or cdc (validate_non_sql_source_modes, src/config/mod.rs:543-554), so there is no incremental / chunked mode to switch from or into; the switch Mongo has (into page_size + resume) is graded by the three *_then_resume_mongo cells" }
     oracle:   { gap: "no Oracle mode-transition live test (the transition logic is shared; the cursor/keyset state Oracle writes is unproven here)" }
 
   - id: legacy_incremental_state_then_other_column
@@ -116,5 +116,5 @@ scenarios:
     postgres: { test: legacy_incremental_state_then_other_column_postgres }
     mysql:    { test: legacy_incremental_state_then_other_column_mysql }
     mssql:    { test: legacy_incremental_state_then_other_column_mssql }
-    mongo:    { na: "Mongo batch has no cursor-column incremental to switch into" }
+    mongo:    { na: "a Mongo export accepts only mode: full or cdc (validate_non_sql_source_modes, src/config/mod.rs:543-554), so there is no incremental / chunked mode to switch from or into; the switch Mongo has (into page_size + resume) is graded by the three *_then_resume_mongo cells" }
     oracle:   { gap: "no Oracle mode-transition live test (the transition logic is shared; the cursor/keyset state Oracle writes is unproven here)" }

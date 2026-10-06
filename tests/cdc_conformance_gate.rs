@@ -935,7 +935,9 @@ const PIN_INDEPENDENT: usize = 112; // ratchet-pin: cdc-census-independent min
 // snapshot through `dir_parquet_id_set` / `dir_parquet_i64` (arrow); each run is graded by the default oracle.
 // 2026-10-03: +2 shared codec - the PG multi-table slot-loss re-baseline cell, and the Oracle log-gap
 // refusal, which now follows its remedy and reads the baseline with arrow (was presence).
-const PIN_SHARED_CODEC: usize = 105; // ratchet-pin: cdc-census-shared-codec
+// 2026-10-03: +2 shared codec - the PostgreSQL and SQL Server capped `rivet cdc --output` cells read the
+// cap's stop point through `read_cdc_changes(`; -1: the SQL Server case-only refusal test moved to presence.
+const PIN_SHARED_CODEC: usize = 106; // ratchet-pin: cdc-census-shared-codec
 const PIN_SELF_COUNTER: usize = 6; // ratchet-pin: cdc-census-self-counter
 // 2026-09-28: +1 presence — the SQL Server undecodable-cell refusal, whose oracle is the refusal.
 // 2026-09-29: +2 presence — the PG CDC LMT-timezone and DOMAIN parity cells compare CDC to batch output.
@@ -953,7 +955,10 @@ const PIN_SELF_COUNTER: usize = 6; // ratchet-pin: cdc-census-self-counter
 // 2026-10-03: +1 presence - the PG refusal of an undecodable old cell in a key move, whose oracle is the refusal naming the column.
 // 2026-10-03: -1 presence — mongo_cdc_initial_snapshot_covers_preexisting_rows moved to independent.
 // 2026-10-03: -1 presence — oracle_cdc_resume_past_log_retention_fails_loudly moved to shared codec.
-const PIN_PRESENCE: usize = 85; // ratchet-pin: cdc-census-presence
+// 2026-10-03: +2 presence - the MySQL and MongoDB capped `rivet cdc` NDJSON cells; the test reads the cap's stop
+// point off stdout, the rig oracle (which this census does not see) grades both runs against the source.
+// 2026-10-06: +1 presence - the SQL Server case-only `--table` mismatch refusal, whose oracle is the refusal text and an untouched destination.
+const PIN_PRESENCE: usize = 88; // ratchet-pin: cdc-census-presence
 
 /// TIER 2 (harness audit, 2026-08-29): a test whose NAME makes a
 /// COMPLETENESS claim must carry a class-(a) INDEPENDENT oracle — not merely
@@ -1180,6 +1185,7 @@ fn every_live_cdc_test_asserts_an_outcome() {
                 // decoding the CLI's NDJSON event stream and asserting on the
                 // decoded events (the cdc-cli termination/backlog tests);
                 || chunk.contains("serde_json::from_str::<serde_json::Value>")
+                || chunk.contains("ndjson_after_ids(") // `rivet cdc` stdout ids, strict
                 // Parquet re-read helpers (tests/common/parquet.rs): the seq
                 // helper reads __seq/__pos/counter columns back via the ARROW
                 // readers (shared codec — the duckdb_dir_* twins are the

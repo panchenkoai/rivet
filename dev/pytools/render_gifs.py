@@ -63,6 +63,7 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import registry  # noqa: E402
 import shell  # noqa: E402
 from shell import Fail, ROOT, bad, log, ok, run, warn  # noqa: E402
 
@@ -81,7 +82,7 @@ PG_PASSWORD = os.environ.get("PGPASSWORD") or "rivet"
 PG_DB = os.environ.get("PGDATABASE") or "rivet"
 DATABASE_URL = f"postgresql://{PG_USER}:{PG_PASSWORD}@{PG_HOST}:{PG_PORT}/{PG_DB}"
 
-GCS_DEMO_BUCKET = os.environ.get("GCS_DEMO_BUCKET") or "rivet_data_test"
+GCS_DEMO_BUCKET = os.environ.get("GCS_DEMO_BUCKET") or registry.warehouse()[1]
 GCS_DEMO_PREFIX = os.environ.get("GCS_DEMO_PREFIX") or "rivet-gif-demo/"
 
 LIBPQ_PSQL = Path("/opt/homebrew/opt/libpq/bin/psql")

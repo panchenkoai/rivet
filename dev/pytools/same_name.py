@@ -45,8 +45,8 @@ RIVET = os.environ.get("RIVET_BIN", str(ROOT / "target" / "release" / "rivet"))
 STATE_URL = os.environ.get(
     "RIVET_SN_STATE_URL", "postgresql://rivet:rivet@localhost:5433/rivet_state"
 )
-BUCKET = os.environ.get("BQ_ORACLE_BUCKET", "rivet_data_test")
-BQ_PROJECT = os.environ.get("BQ_ORACLE_PROJECT", "rivet-data-tool")
+BQ_PROJECT, BUCKET = (os.environ.get("BQ_ORACLE_PROJECT") or registry.warehouse()[0],
+                      os.environ.get("BQ_ORACLE_BUCKET") or registry.warehouse()[1])
 BQ_DATASET = os.environ.get("BQ_ORACLE_DATASET") or registry.load()["bigquery"]["e2e"]
 
 TABLE = "same_name_probe"
