@@ -159,6 +159,14 @@ scenarios:
     mongo:    { na: "same — the change stream's full_document is the whole post-image regardless of which fields changed; framed once on PG" }
     oracle:   { na: "same — LogMiner redo records the row change regardless of which columns moved; the after-image is proven by oracle_cdc_update_and_delete_carry_full_types, framed once on PG" }
 
+  - id: cdc_primary_key_change
+    what: "an UPDATE that changes the key (the declared `load.pk`, else the table's primary key) is written as a delete of the old key then an insert of the new row, at one `__pos` with the insert's `__seq` after the delete's (ADR-0030), so a latest-image-per-key merge holds only the new key. Oracle also renumbers keys in one statement (`id = id + 1`, logged 1->2 before 2->3) without losing a row whose images differ"
+    postgres: { test: pg_cdc_pk_changing_update_captures_and_does_not_brick, note: "the key is not the leading column, so an old key laid out under the wrong names goes RED; the ClickHouse cycle a_postgres_cdc_stream_loads_into_clickhouse_and_the_view_matches_the_source flags the old key in the view, and the BigQuery base+buffer cycle a_key_move_leaves_one_live_row_per_key_in_a_partitioned_base_postgres leaves one live row per key. An old image that does not carry every key column never splits (pg_cdc_an_update_of_a_replica_identity_index_that_is_not_the_key_stays_one_update, pg_cdc_a_declared_key_absent_from_the_old_key_does_not_split); a table whose changes carry no old image is warned about at open (pg_cdc_warns_about_a_table_whose_changes_carry_no_old_image)" }
+    mysql:    { test: mysql_cdc_a_composite_key_move_is_a_delete_then_an_insert, note: "a composite key read from the catalog; a value change beside it stays an update. The ClickHouse cycle a_mysql_cdc_stream_loads_into_clickhouse_and_the_view_matches_the_source flags the old key in the view; the BigQuery base+buffer cycle a_key_move_leaves_one_live_row_per_key_in_a_partitioned_base_mysql leaves one live row per key" }
+    mssql:    { test: a_sql_server_cdc_stream_loads_into_clickhouse_and_the_view_matches_the_source, note: "the change table itself records a key update as a delete and an insert; the cycle flags the old key in the view" }
+    mongo:    { na: "_id is immutable, so a key change cannot be expressed" }
+    oracle:   { test: oracle_cdc_a_primary_key_update_is_a_delete_then_an_insert, note: "rows that differ only in the key are told apart by the LogMiner ROWID (oracle_cdc_a_renumber_over_rows_with_equal_images_keeps_every_row); an index-organized or row-movement table has no stable ROWID and keeps the image rule (ADR-0030; a_renumber_over_equal_images_without_a_row_id_documents_the_lost_row); a row wider than 255 columns keeps its ROWID (oracle_cdc_a_key_move_of_a_row_wider_than_255_columns_is_captured_not_refused)" }
+
   - id: cdc_bounded_on_standby_fails_loud
     what: "bounded until_current CDC on a PostgreSQL STANDBY (in recovery) must fail LOUD with an actionable message — pg_current_wal_lsn() is unavailable and a logical slot cannot be created in recovery; the adapter checks pg_is_in_recovery() up front and names the escape (stream continuously / point at the primary). Requires the opt-in cdc-standby compose profile (python3 -m dev.pytools.cdc_stand standby)"
     postgres: { test: roast_pg_cdc_bounded_on_a_standby_fails_loud }
@@ -182,6 +190,14 @@ scenarios:
     mssql:    { test: roast_mssql_cdc_oversized_transaction_bails_loud_not_oom }
     mongo:    { na: "no per-transaction buffering — each change-stream event is one document, flushed independently; there is no whole-transaction buffer to bound" }
     oracle:   { test: oracle_cdc_byte_cap_counts_the_first_row_and_defers_not_drops }
+
+  - id: cdc_rebaseline_remedy_recovers
+    what: "a data-loss warning or refusal's re-baseline remedy, followed as printed from the state that printed it, recovers the rows the stream lost and leaves no removed row live in the destination (the default rig oracle grades the remedy run against the source; a truncated row goes out as a change part first). The text is checkpoint_identity::RECOVER, pinned by a hand-written literal; `re-snapshot (mode: full)` was refused for a CDC export and for a batch export into its destination"
+    postgres: { test: pg_slot_created_warning_remedy_recovers_the_row_written_while_the_slot_was_gone }
+    mysql:    { test: mysql_missing_checkpoint_refusal_remedy_recovers_the_row_written_while_it_was_gone }
+    mssql:    { test: mssql_retention_gap_refusal_remedy_recovers_the_rows_the_cleanup_removed }
+    mongo:    { test: mongo_missing_checkpoint_warning_remedy_recovers_the_document_written_while_it_was_gone }
+    oracle:   { test: oracle_cdc_truncate_refusal_remedy_leaves_no_removed_row_live_in_the_prefix }
 
   # ── Harm / operational-cost contracts (the price CDC charges the source) ──────
   - id: cdc_drain_releases_pinned_wal

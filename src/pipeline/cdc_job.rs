@@ -813,6 +813,8 @@ fn run_cdc_inner(
                 .then(|| crate::load::plan::resolved_partition(config, export, Some(t)))
                 .flatten()
                 .and_then(|s| crate::source::cdc::partition_guard::PartitionGuard::of(&s.form)),
+            key: crate::load::plan::effective_load(config, export, Some(t))
+                .and_then(|l| l.pk.declared()),
         })
         .collect();
     let now = chrono::Utc::now().to_rfc3339();

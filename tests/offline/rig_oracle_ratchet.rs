@@ -23,7 +23,8 @@ use std::path::{Path, PathBuf};
 /// Oracle opt-outs in tests/live: `.no_oracle(`, `run_rivet_ok_no_oracle(`, the `RIVET_TEST_NO_ORACLE` env by literal or by its `NO_ORACLE_ENV` constant.
 // 17 -> 21 (2026-10-02): live_cdc_source_connections counts source connections, which the oracle's own read would add to.
 // 21 -> 22 (2026-10-03): the PG truncate refusal's resumed run keeps the pre-truncate rows the refusal says only a re-snapshot removes.
-const NO_ORACLE_CEILING: usize = 22; // ratchet-pin: no-oracle-opt-outs
+// 22 -> 23 (2026-10-03): pg_cdc_a_declared_key_absent_from_the_old_key_does_not_split merges by a declared `load.pk: [code]`; the oracle dedups by the source primary key `id`.
+const NO_ORACLE_CEILING: usize = 23; // ratchet-pin: no-oracle-opt-outs
 
 /// Rust DuckDB-helper call sites across tests/ (see [`duckdb_helper_names`]).
 // 626 -> 630 (2026-10-01): #378 merged first and added 4 calls in its Mongo null-_id tests.
@@ -160,20 +161,31 @@ const KNOWN_DEFECTS: &[(&str, &str, &str)] = &[
         "known defect: a bare-name capture delivers the WAL rows",
     ),
     (
-        "pg_cdc_pk_changing_update_captures_and_does_not_brick",
-        "delivered-only rows",
-        "known defect: a PK-changing UPDATE carries no delete",
-    ),
-    (
         "a_pg_failover_to_the_standby_without_a_checkpoint_loses_the_rows_written_during_the_switch",
         "undelivered rows",
         "known defect: a PostgreSQL CDC failover without `cdc.checkpoint` creates a new slot",
     ),
+    (
+        "pg_slot_created_warning_remedy_recovers_the_row_written_while_the_slot_was_gone",
+        "undelivered rows",
+        "known defect: a PostgreSQL slot dropped under a stream with no checkpoint or baseline",
+    ),
+    (
+        "mysql_missing_checkpoint_warning_remedy_recovers_the_row_written_while_it_was_gone",
+        "undelivered rows",
+        "known defect: a lost MySQL checkpoint on a stream with no baseline",
+    ),
+    (
+        "mongo_missing_checkpoint_warning_remedy_recovers_the_document_written_while_it_was_gone",
+        "undelivered rows",
+        "known defect: a lost MongoDB checkpoint on a stream with no baseline",
+    ),
 ]; // ratchet-pin: end
 
-/// `(enclosing fn, class, reason)` of every `.oracle_known_defect("<class>", "<reason>")` call in `text`.
+/// `(enclosing fn, class, reason)` of every `.oracle_known_defect(` / `.run_ok_capture_known_defect(` call in `text`.
 fn known_defect_sites(text: &str) -> Vec<(String, String, String)> {
     text.match_indices(".oracle_known_defect(")
+        .chain(text.match_indices(".run_ok_capture_known_defect("))
         .map(|(i, _)| {
             let before = &text[..i];
             let f = before

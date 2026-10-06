@@ -186,6 +186,11 @@ impl Rig {
         r
     }
 
+    /// PostgreSQL CDC from the cdc-standby replica; drive it with [`Rig::run_nudged`] (a slot created on a standby waits for the primary's snapshot).
+    pub fn pg_cdc_standby(table: &str, slot: &str) -> Self {
+        Self::pg_cdc(table, slot).source_url(super::env::PG_STANDBY_URL)
+    }
+
     /// Batch constructors — one per engine, main-stack URLs. `mode` defaults
     /// to `full`; switch flows flip it via [`Rig::mode`].
     pub fn mysql_batch(table: &str) -> Self {

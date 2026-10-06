@@ -2,6 +2,52 @@
 
 ## Unreleased
 
+- **Breaking: CDC writes an UPDATE that changes the key as a delete of the old key and an insert
+  of the new row** (ADR-0030, accepted), on PostgreSQL, MySQL and Oracle. SQL Server's change
+  table already did this, and MongoDB's `_id` cannot change.
+  - Upgrading does not retract rows already delivered by earlier releases under an old key: that key
+    stays live in the destination until you remove it.
+  - Before, it was one `update` under the new key. Every latest-image-per-key merge (BigQuery,
+    Snowflake, ClickHouse, the documented `MERGE`) kept the old key live beside the new one,
+    while row counts still reconciled.
+  - The key is the export's declared `load.pk:`, otherwise the table's primary key, read from
+    the source when the run starts. A catalog error there now fails the run. `pk: none` splits
+    nothing. A declared key column the table does not have now fails `rivet run` at the start
+    (the extract); before, only `rivet load` refused it.
+  - An UPDATE is a key change only when its old image carries every key column and one
+    differs. A column PostgreSQL's replica identity did not log is absent, never NULL.
+  - The delete and the insert share `__pos`, and the insert's `__seq` comes after the delete's.
+  - An Oracle statement that renumbers keys (`id = id + 1`) keeps every row, told apart by
+    LogMiner's `ROW_ID` on a heap table without row movement. A change there with no `ROW_ID`
+    is refused. On an index-organized table, or one with row movement, a renumber over rows
+    whose non-key values are all equal loses a row.
+  - `rivet cdc` NDJSON stdout does not split. Its `before` stays the old image as the engine
+    logged it. Every PostgreSQL UPDATE line with an old image now also has `before_columns`,
+    naming those cells (under `REPLICA IDENTITY FULL`, the old row minus its NULL cells).
+  - An old-image cell rivet cannot decode refuses the run where the old image is written:
+    the delete of a key change, and NDJSON `before`.
+- **PostgreSQL CDC warns about a table whose changes carry no old image.** This covers
+  `REPLICA IDENTITY NOTHING`, a dropped `REPLICA IDENTITY USING INDEX` index, no primary key,
+  and a `DEFERRABLE` primary key. On such a table
+  a DELETE retracts nothing downstream, and a key change leaves the old key live. The warning
+  names the table schema-qualified, with its remedy. The existing key-only-delete warning now
+  names what each table's DELETE carries (its primary key, or its replica identity index's
+  columns), instead of saying "the primary key" for every non-FULL table.
+- **CDC data-loss messages name a re-baseline you can follow.** The PostgreSQL slot-created
+  warning and the refusals and warnings for a lost or unusable CDC position (dropped slot,
+  purged binlog, change table past retention, deleted archive logs, a foreign or invalid
+  checkpoint, TRUNCATE, DROP, an undecodable change) told the operator to
+  `re-snapshot (mode: full)`. From the state that printed it, that is refused: a `cdc:`
+  block is only valid with `mode: cdc`, and a batch export cannot write into the stream's
+  destination. Every such message, and the matching `rivet doctor` hints, now ends with one
+  text: delete the checkpoint, move every file out of the export's destination (its old parts
+  still hold rows the source no longer has), delete the export's `cdc_snapshot` rows, give it
+  `cdc.initial: snapshot` if it has none, truncate `<table>__changes` before the next load,
+  and re-run; that run anchors first and re-reads every table after. The actions of
+  `RIVET_SOURCE_CDC_FOREIGN_CHECKPOINT`, `_CHECKPOINT_INVALID`, `_LOG_GAP`, `_TRUNCATED`,
+  `_UNDECODABLE` and `_CELL_UNSUPPORTED` say the same; the codes are unchanged. An alert that
+  matches on the old wording (`re-snapshot`, `mode: full`) needs updating.
+
 ## 0.31.0 — 2026-10-04
 
 - **A resumed chunked run with no tasks is no longer an empty success.** A checkpointed chunked

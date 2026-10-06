@@ -1274,9 +1274,9 @@ fn pg_mbt_cfg(tbl: &str, slot: &str) -> Rig {
     Rig::pg_cdc(tbl, slot)
 }
 
-// Finding #42 (live): updating the PRIMARY KEY is a legal operation —
-// test_decoding renders `old-key: … new-tuple: …`, and gluing the sections
-// bricked the stream permanently behind a misleading "DDL" arity failure.
+// Finding #42 (live): updating the PRIMARY KEY is a legal operation, and ADR-0030 writes it
+// as a delete of the old key then an insert of the new row. The key is NOT the leading column:
+// the reverted first split put the old key under the after-image's names (`v` = "1", `id` NULL).
 #[test]
 #[ignore = "live: requires docker compose postgres (wal_level=logical)"]
 fn pg_cdc_pk_changing_update_captures_and_does_not_brick() {
@@ -1286,7 +1286,7 @@ fn pg_cdc_pk_changing_update_captures_and_does_not_brick() {
     let _slot = Slot::new(slot.clone());
     let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
     c.batch_execute(&format!(
-        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id INT PRIMARY KEY, v TEXT)"
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (v TEXT, id INT PRIMARY KEY)"
     ))
     .unwrap();
     let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
@@ -1296,49 +1296,416 @@ fn pg_cdc_pk_changing_update_captures_and_does_not_brick() {
     )
     .unwrap();
     c.batch_execute(&format!(
-        "INSERT INTO {tbl} VALUES (1,'a'); UPDATE {tbl} SET id = 2 WHERE id = 1;"
+        "INSERT INTO {tbl} VALUES ('a', 1); UPDATE {tbl} SET id = 2 WHERE id = 1;"
     ))
     .unwrap();
 
-    let rig = pg_mbt_cfg(&tbl, &slot).oracle_known_defect("delivered-only rows", "known defect: a PK-changing UPDATE carries no delete of the old key, so the after-image keeps a phantom row (PostgreSQL CDC engine step, test_decoding old-key)");
+    let rig = pg_mbt_cfg(&tbl, &slot);
     let out = rig.out_dir();
     rig.run_ok();
 
-    use arrow::array::{Int32Array, StringArray};
-    let mut update_after: Option<(i32, String)> = None;
+    use arrow::array::{Int32Array, Int64Array, StringArray};
+    type Row = (String, i64, String, Option<i32>, Option<String>);
+    let mut rows: Vec<Row> = Vec::new();
     for b in read_all_parts(&out) {
-        let op = b
-            .column(b.schema().index_of("__op").unwrap())
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap()
-            .clone();
-        let id = b
-            .column(b.schema().index_of("id").unwrap())
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap()
-            .clone();
-        let v = b
-            .column(b.schema().index_of("v").unwrap())
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap()
-            .clone();
+        let col = |n: &str| b.column(b.schema().index_of(n).unwrap()).clone();
+        let (op, pos, seq, id, v) = (col("__op"), col("__pos"), col("__seq"), col("id"), col("v"));
+        let op = op.as_any().downcast_ref::<StringArray>().unwrap();
+        let pos = pos.as_any().downcast_ref::<StringArray>().unwrap();
+        let seq = seq.as_any().downcast_ref::<Int64Array>().unwrap();
+        let id = id.as_any().downcast_ref::<Int32Array>().unwrap();
+        let v = v.as_any().downcast_ref::<StringArray>().unwrap();
         for r in 0..b.num_rows() {
-            // Back to `update` — the split that briefly made this an insert was
-            // REVERTED for shipping corruption (see the note in postgres/cdc.rs).
-            // ADR-0030's limitation stands: the new tuple arrives as an update and
-            // the old key is not retracted.
-            if op.value(r) == "update" {
-                update_after = Some((id.value(r), v.value(r).to_string()));
-            }
+            rows.push((
+                pos.value(r).to_string(),
+                seq.value(r),
+                op.value(r).to_string(),
+                (!id.is_null(r)).then(|| id.value(r)),
+                (!v.is_null(r)).then(|| v.value(r).to_string()),
+            ));
         }
     }
+    rows.sort();
+    let shape: Vec<(&str, Option<i32>, Option<&str>)> = rows
+        .iter()
+        .map(|(_, _, op, id, v)| (op.as_str(), *id, v.as_deref()))
+        .collect();
     assert_eq!(
-        update_after,
-        Some((2, "a".to_string())),
-        "the update's after-image is the NEW tuple (id=2), stream not bricked"
+        shape,
+        vec![
+            ("insert", Some(1), Some("a")),
+            ("delete", Some(1), None),
+            ("insert", Some(2), Some("a")),
+        ],
+        "the key move is a delete of the OLD key (in `id`, not `v`) then an insert of the new row"
+    );
+    assert!(
+        rows[1].0 == rows[2].0 && rows[2].1 > rows[1].1,
+        "one position, the insert after the delete: {rows:?}"
+    );
+}
+
+/// `(op, id, v)` of every row a PostgreSQL capture of `tbl` delivers after `changes`, in `__seq` order.
+fn pg_capture_ops(
+    tbl: &str,
+    create: &str,
+    changes: &str,
+    adjust: impl FnOnce(Rig) -> Rig,
+) -> Vec<(String, Option<i32>, Option<String>)> {
+    use postgres::NoTls;
+    let slot = unique_name("rivet_pkabs_slot");
+    let _slot = Slot::new(slot.clone());
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    c.batch_execute(&format!("DROP TABLE IF EXISTS {tbl}; {create}"))
+        .unwrap();
+    let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.to_string());
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    c.batch_execute(changes).unwrap();
+    let rig = adjust(pg_mbt_cfg(tbl, &slot));
+    let out = rig.out_dir();
+    rig.run_ok();
+    let mut rows = Vec::new();
+    for b in read_all_parts(&out) {
+        let col = |n: &str| b.column(b.schema().index_of(n).unwrap()).clone();
+        let (op, seq, id, v) = (col("__op"), col("__seq"), col("id"), col("v"));
+        let op = op.as_any().downcast_ref::<StringArray>().unwrap();
+        let seq = seq.as_any().downcast_ref::<Int64Array>().unwrap();
+        let id = id
+            .as_any()
+            .downcast_ref::<arrow::array::Int32Array>()
+            .unwrap();
+        let v = v.as_any().downcast_ref::<StringArray>().unwrap();
+        for r in 0..b.num_rows() {
+            rows.push((
+                seq.value(r),
+                op.value(r).to_string(),
+                (!id.is_null(r)).then(|| id.value(r)),
+                (!v.is_null(r)).then(|| v.value(r).to_string()),
+            ));
+        }
+    }
+    rows.sort_by_key(|r| r.0);
+    rows.into_iter().map(|(_, op, id, v)| (op, id, v)).collect()
+}
+
+/// REPLICA IDENTITY USING INDEX on a unique `email` that is not the key: the old-key section
+/// carries `email` alone, so `id` is ABSENT from the pre-image, not changed; an UPDATE of
+/// `email` stays one update, never a delete with a NULL key.
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn pg_cdc_an_update_of_a_replica_identity_index_that_is_not_the_key_stays_one_update() {
+    let tbl = unique_name("cdc_pkidx");
+    let ops = pg_capture_ops(
+        &tbl,
+        &format!(
+            "CREATE TABLE {tbl} (id INT PRIMARY KEY, email TEXT NOT NULL, v TEXT); \
+             CREATE UNIQUE INDEX {tbl}_email ON {tbl} (email); \
+             ALTER TABLE {tbl} REPLICA IDENTITY USING INDEX {tbl}_email;"
+        ),
+        &format!(
+            "INSERT INTO {tbl} VALUES (1, 'a@x', 'z'); UPDATE {tbl} SET email = 'b@x' WHERE id = 1;"
+        ),
+        |r| r,
+    );
+    assert_eq!(
+        ops,
+        vec![
+            ("insert".to_string(), Some(1), Some("z".to_string())),
+            ("update".to_string(), Some(1), Some("z".to_string())),
+        ],
+        "an update that did not change `id` is one update"
+    );
+}
+
+/// A declared `load.pk: [code]` that is not the table's primary key: an UPDATE of `id` carries the
+/// old `id` alone, so `code` is absent from the pre-image and the change stays one update.
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn pg_cdc_a_declared_key_absent_from_the_old_key_does_not_split() {
+    let tbl = unique_name("cdc_pkdecl");
+    let ops = pg_capture_ops(
+        &tbl,
+        &format!("CREATE TABLE {tbl} (id INT PRIMARY KEY, code TEXT, v TEXT);"),
+        &format!("INSERT INTO {tbl} VALUES (1, 'c1', 'z'); UPDATE {tbl} SET id = 2 WHERE id = 1;"),
+        |r| {
+            r.top_line(&format!(
+                "load: {{ target: clickhouse, url: \"{CLICKHOUSE_HTTP_URL}\", database: \
+                 rivet_pkdecl, user: {CLICKHOUSE_USER}, password_env: RIVET_PKDECL_UNUSED, \
+                 pk: [code] }}"
+            ))
+            .no_oracle(
+                "the rig oracle dedups by the source primary key `id`; this export merges by its \
+                 declared `load.pk: [code]`, under which the capture holds one row (asserted here)",
+            )
+        },
+    );
+    assert_eq!(
+        ops,
+        vec![
+            ("insert".to_string(), Some(1), Some("z".to_string())),
+            ("update".to_string(), Some(2), Some("z".to_string())),
+        ],
+        "the declared key `code` did not change and its old value was not on the wire"
+    );
+}
+
+/// A DEFERRABLE key under REPLICA IDENTITY FULL lets one statement renumber keys (`1 -> 2` logged
+/// before `2 -> 3`) with no row identity on the wire: the images decide, and every row survives.
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn pg_cdc_a_renumber_under_a_deferrable_key_keeps_every_row() {
+    let tbl = unique_name("cdc_pkren");
+    let ops = pg_capture_ops(
+        &tbl,
+        &format!(
+            "CREATE TABLE {tbl} (id INT PRIMARY KEY DEFERRABLE INITIALLY IMMEDIATE, v TEXT); \
+             ALTER TABLE {tbl} REPLICA IDENTITY FULL;"
+        ),
+        &format!(
+            "INSERT INTO {tbl} VALUES (1, 'a'), (2, 'b'), (3, 'c'); UPDATE {tbl} SET id = id + 1;"
+        ),
+        |r| r,
+    );
+    let mut live: std::collections::BTreeMap<i32, Option<String>> = Default::default();
+    for (op, id, v) in &ops {
+        let id = id.expect("every delivered row carries its key");
+        if op == "delete" {
+            live.remove(&id);
+        } else {
+            live.insert(id, v.clone());
+        }
+    }
+    let want: std::collections::BTreeMap<i32, Option<String>> = [(2, "a"), (3, "b"), (4, "c")]
+        .into_iter()
+        .map(|(k, v)| (k, Some(v.to_string())))
+        .collect();
+    assert_eq!(
+        live, want,
+        "applied in __seq order, the capture is the source: {ops:?}"
+    );
+}
+
+/// An old row whose non-key cell cannot be decoded (`infinity`) must not become the NULL of a
+/// key move's delete: the run refuses it, as it refuses the same cell in a new row.
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn pg_cdc_an_undecodable_old_cell_in_a_key_move_is_refused_not_nulled() {
+    use postgres::NoTls;
+    let tbl = unique_name("cdc_pkinf");
+    let slot = unique_name("rivet_pkinf_slot");
+    let _slot = Slot::new(slot.clone());
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {tbl}; \
+         CREATE TABLE {tbl} (id INT PRIMARY KEY, valid_until TIMESTAMPTZ); \
+         ALTER TABLE {tbl} REPLICA IDENTITY FULL; \
+         INSERT INTO {tbl} VALUES (1, 'infinity');"
+    ))
+    .unwrap();
+    let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    c.batch_execute(&format!(
+        "UPDATE {tbl} SET id = 2, valid_until = '2025-01-01' WHERE id = 1;"
+    ))
+    .unwrap();
+    let said = pg_mbt_cfg(&tbl, &slot).run_expect_fail();
+    assert!(
+        said.contains("column(s) [valid_until] hold a value rivet cannot decode"),
+        "the old row's `infinity` is refused by name: {said}"
+    );
+}
+
+/// An UPDATE that keeps its key writes no old image, so an undecodable old cell (`infinity`, from
+/// before the capture) beside it does not refuse the change: it is delivered as one update.
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn pg_cdc_an_undecodable_old_cell_beside_an_unchanged_key_is_delivered() {
+    let tbl = unique_name("cdc_pkinfk");
+    let ops = pg_capture_ops(
+        &tbl,
+        &format!(
+            "CREATE TABLE {tbl} (id INT PRIMARY KEY, v TEXT, valid_until TIMESTAMPTZ); \
+             ALTER TABLE {tbl} REPLICA IDENTITY FULL; \
+             INSERT INTO {tbl} VALUES (1, 'a', 'infinity');"
+        ),
+        &format!("UPDATE {tbl} SET v = 'b', valid_until = '2025-01-01' WHERE id = 1;"),
+        |r| r,
+    );
+    assert_eq!(
+        ops,
+        vec![("update".to_string(), Some(1), Some("b".to_string()))]
+    );
+}
+
+/// A table whose changes carry no old image (a DEFERRABLE key under REPLICA IDENTITY DEFAULT,
+/// REPLICA IDENTITY NOTHING, no primary key) gets a warning naming it schema-qualified, the cause,
+/// what is lost, and the remedy. A same-named table in another schema with an ordinary key gets none.
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn pg_cdc_warns_about_a_table_whose_changes_carry_no_old_image() {
+    use postgres::NoTls;
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    let schema = unique_name("rivet_pkdef_s");
+    c.batch_execute(&format!("CREATE SCHEMA {schema}")).unwrap();
+    let mut said = |tbl: &str, create: &str| {
+        let slot = unique_name("rivet_pkdef_slot");
+        let _slot = Slot::new(slot.clone());
+        c.batch_execute(&format!("DROP TABLE IF EXISTS {tbl}; {create}"))
+            .unwrap();
+        let guard = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.to_string());
+        c.execute(
+            "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+            &[&slot],
+        )
+        .unwrap();
+        c.batch_execute(&format!("INSERT INTO {tbl} VALUES (1, 'a')"))
+            .unwrap();
+        let rig = pg_mbt_cfg(tbl, &slot);
+        let out = rig.run_ok_capture();
+        let rows: usize = read_all_parts(&rig.out_dir())
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(rows, 1, "the warned table is still captured: {out}");
+        drop(guard);
+        out
+    };
+    let lost = "so an UPDATE carries no old values and a DELETE carries no columns at all: a \
+                DELETE retracts nothing downstream, and an UPDATE that changes the key leaves the \
+                old key live.";
+    let name = unique_name("cdc_pkdef");
+    let public = format!("public.{name}");
+    let other = format!("{schema}.{name}");
+    let ordinary = said(
+        &public,
+        &format!("CREATE TABLE {public} (id INT PRIMARY KEY, v TEXT)"),
+    );
+    let deferrable = said(
+        &other,
+        &format!(
+            "CREATE TABLE {other} (id INT PRIMARY KEY DEFERRABLE INITIALLY IMMEDIATE, v TEXT)"
+        ),
+    );
+    let want = format!(
+        "postgres cdc: table {other} has a DEFERRABLE primary key, which PostgreSQL does not use \
+         as the replica identity, {lost} Run `ALTER TABLE {other} REPLICA IDENTITY FULL;` (the \
+         key stays deferrable), or `ALTER TABLE {other} REPLICA IDENTITY USING INDEX <index>;` on \
+         a non-deferrable unique index of the key columns (that index checks uniqueness row by \
+         row, so it rejects a statement such as `SET id = id + 1`)"
+    );
+    assert!(
+        deferrable.contains(&want),
+        "want {want:?} in:\n{deferrable}"
+    );
+    assert!(
+        !ordinary.contains("carries no old values") && !ordinary.contains(schema.as_str()),
+        "the same name in another schema is not this table: {ordinary}"
+    );
+    let nothing = format!("public.{}", unique_name("cdc_pknot"));
+    let out = said(
+        &nothing,
+        &format!(
+            "CREATE TABLE {nothing} (id INT PRIMARY KEY, v TEXT); \
+             ALTER TABLE {nothing} REPLICA IDENTITY NOTHING;"
+        ),
+    );
+    let want = format!(
+        "postgres cdc: table {nothing} has REPLICA IDENTITY NOTHING, {lost} Run `ALTER TABLE \
+         {nothing} REPLICA IDENTITY FULL;`, or `ALTER TABLE {nothing} REPLICA IDENTITY DEFAULT;` \
+         if it has a primary key"
+    );
+    assert!(out.contains(&want), "want {want:?} in:\n{out}");
+    let dropped = format!("public.{}", unique_name("cdc_pkdix"));
+    let out = said(
+        &dropped,
+        &format!(
+            "CREATE TABLE {dropped} (id INT PRIMARY KEY, v TEXT NOT NULL); \
+             CREATE UNIQUE INDEX {}_v ON {dropped} (v); \
+             ALTER TABLE {dropped} REPLICA IDENTITY USING INDEX {}_v; \
+             DROP INDEX {}_v;",
+            dropped.trim_start_matches("public."),
+            dropped.trim_start_matches("public."),
+            dropped
+        ),
+    );
+    let want = format!(
+        "postgres cdc: table {dropped} has REPLICA IDENTITY USING INDEX on an index that no \
+         longer exists, which PostgreSQL treats as NOTHING, {lost} Run `ALTER TABLE {dropped} \
+         REPLICA IDENTITY FULL;`, or `ALTER TABLE {dropped} REPLICA IDENTITY USING INDEX \
+         <index>;` on an existing unique index of NOT NULL columns"
+    );
+    assert!(out.contains(&want), "want {want:?} in:\n{out}");
+    assert!(
+        !out.contains(&format!("{dropped} (its replica identity index")),
+        "a dropped index is not a key-only delete: {out}"
+    );
+    let keyless = format!("public.{}", unique_name("cdc_pknok"));
+    let out = said(
+        &keyless,
+        &format!("CREATE TABLE {keyless} (id INT, v TEXT)"),
+    );
+    let want = format!(
+        "postgres cdc: table {keyless} has no primary key and REPLICA IDENTITY DEFAULT, {lost} Run \
+         `ALTER TABLE {keyless} REPLICA IDENTITY FULL;`, or give it a primary key"
+    );
+    assert!(out.contains(&want), "want {want:?} in:\n{out}");
+    c.batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .unwrap();
+}
+
+/// A MySQL binlog UPDATE always carries a before-image, so the move is the KEY columns differing:
+/// a composite key's second column moves (delete + insert), a value change stays an update. The
+/// key is read from the catalog at open (no `load.pk:`), and the rig oracle grades the parts.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn mysql_cdc_a_composite_key_move_is_a_delete_then_an_insert() {
+    let mut scn = CdcScenario::mysql("cdc_pkmv", "v INT, a INT, b INT, PRIMARY KEY (a, b)");
+    let t = scn.table.clone();
+    scn.sql(&format!("INSERT INTO {t} VALUES (10, 1, 1), (20, 1, 2)"));
+    scn.sql(&format!("UPDATE {t} SET b = 3 WHERE a = 1 AND b = 2"));
+    scn.sql(&format!("UPDATE {t} SET v = 11 WHERE a = 1 AND b = 1"));
+    use arrow::array::{Int32Array, Int64Array, StringArray};
+    let mut rows: Vec<(String, i64, String, i32, i32)> = Vec::new();
+    for b in scn.drain_and_read() {
+        let col = |n: &str| b.column(b.schema().index_of(n).unwrap()).clone();
+        let (op, pos, seq, k, v) = (col("__op"), col("__pos"), col("__seq"), col("b"), col("v"));
+        let op = op.as_any().downcast_ref::<StringArray>().unwrap();
+        let pos = pos.as_any().downcast_ref::<StringArray>().unwrap();
+        let seq = seq.as_any().downcast_ref::<Int64Array>().unwrap();
+        let k = k.as_any().downcast_ref::<Int32Array>().unwrap();
+        let v = v.as_any().downcast_ref::<Int32Array>().unwrap();
+        for r in 0..b.num_rows() {
+            rows.push((
+                pos.value(r).to_string(),
+                seq.value(r),
+                op.value(r).to_string(),
+                k.value(r),
+                v.value(r),
+            ));
+        }
+    }
+    let shape: Vec<(&str, i32, i32)> = rows
+        .iter()
+        .filter(|r| r.2 != "insert" || r.3 != 1 && r.3 != 2)
+        .map(|(_, _, op, k, v)| (op.as_str(), *k, *v))
+        .collect();
+    assert_eq!(
+        shape,
+        vec![("delete", 2, 20), ("insert", 3, 20), ("update", 1, 11)],
+        "b 2 -> 3 retracts (1, 2) and inserts (1, 3); v 10 -> 11 keeps its key: {rows:?}"
+    );
+    let (del, ins) = (&rows[2], &rows[3]);
+    assert!(
+        del.0 == ins.0 && ins.1 > del.1,
+        "one position, the insert after the delete: {rows:?}"
     );
 }
 

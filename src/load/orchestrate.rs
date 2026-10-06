@@ -1521,10 +1521,10 @@ fn rebaseline_refusal(target_fqtn: &str, warehouse: crate::load::cdc::Warehouse)
 fn rebaseline_refusal_text(quoted_changes: &str) -> String {
     format!(
         "refusing to append a RE-baseline: this load carries snapshot parquet, but \
-         {quoted_changes} already holds real change rows — a re-snapshot row \
+         {quoted_changes} already holds real change rows — a re-baseline row \
          carries NULL `__pos` and LOSES the dedup to every prior change, so the \
          current-state view would keep serving PRE-GAP values for exactly the rows \
-         this re-snapshot fixed — and even an anchor-stamped baseline cannot \
+         this re-baseline fixed — and even an anchor-stamped baseline cannot \
          express a PK DELETED during the gap (no row, no tombstone: its stale \
          pre-gap rows would win). Nothing was consumed by this refusal. Recovery: \
          1) TRUNCATE TABLE {quoted_changes}; 2) re-run this same `rivet load` \
@@ -1615,7 +1615,7 @@ fn load_one_cdc(
                         "  note: this STATELESS load re-selects the snapshot leg every \
                          cycle (at-least-once, absorbed by the dedup view) — the \
                          re-baseline refusal needs the ledger to tell a genuine \
-                         re-snapshot from a routine re-load, so it does not apply here.",
+                         re-baseline from a routine re-load, so it does not apply here.",
                     ),
                     RebaselineAction::Proceed => {}
                 }

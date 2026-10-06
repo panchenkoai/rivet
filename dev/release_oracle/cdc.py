@@ -1392,12 +1392,11 @@ def _cdc_state_snapshot_pg(surl: str) -> dict[str, str]:
 # is written down in that directory's README, and each one presents identically:
 # "started and captured nothing".
 #
-# Scenario choice, said plainly: `key-update` is EXCLUDED. rivet emits `update(new)`
-# where Debezium emits `delete(old)+insert(new)`, identically on PostgreSQL and
-# MySQL, and that is a representation decision rather than a defect — a gate cell
-# that EXPECTS a difference would go green on the day someone fixes it, which is
-# the wrong direction for a ratchet. It belongs in the ADR, not here.
-_DIFFERENTIAL_SCENARIOS = ("crud", "wide-txn", "mid-stream-table")
+# `key-update` runs on every engine but MongoDB, whose `_id` cannot change: since
+# ADR-0030 was accepted (2026-10-03) rivet writes a key change as delete(old) +
+# insert(new), as Debezium does.
+_DIFFERENTIAL_SCENARIOS = ("crud", "wide-txn", "mid-stream-table", "key-update")
+_DIFFERENTIAL_NA = {("mongo", "key-update")}
 
 
 def verify_cdc_differential(led: "Ledger") -> None:
@@ -1436,6 +1435,8 @@ def _differential_engine(led: "Ledger", eng: str, runner: Path) -> None:
     """Every differential scenario for one engine, in order, graded into `led`."""
     with led.span(f"differential {eng}"):
         for scen in _DIFFERENTIAL_SCENARIOS:
+            if (eng, scen) in _DIFFERENTIAL_NA:
+                continue
             # The timeout is a GRADED outcome, never an uncaught exception: a hung
             # harness (rivet run has no inner timeout; a bound regression hangs it)
             # used to raise TimeoutExpired straight through main's try/finally —

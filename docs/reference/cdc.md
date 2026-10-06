@@ -355,9 +355,8 @@ Notes:
   under `[mysqld]` and a restart. Events already written under `MINIMAL` stay
   nameless after the switch: a run that reaches one of a captured table fails
   with `RIVET_SOURCE_CDC_UNDECODABLE`, naming the table and the binlog position,
-  and writes no part. If the export already had a checkpoint, delete it so the
-  next run anchors afresh FIRST, then re-snapshot the tables (`mode: full`).
-  Snapshotting first leaves the changes in between in neither. MySQL before
+  and writes no part. If the export already had a checkpoint,
+  [re-baseline](cdc-failure-modes.md#the-shape-of-every-recovery) the stream after the switch. MySQL before
   8.0.1 has no such variable and is refused for the same reason.
 - `binlog_row_image = FULL` is MySQL's default; the risk is a source that has set
   it to `MINIMAL` to shrink the binlog — that path needs the column-mask MERGE,
@@ -456,7 +455,7 @@ Notes:
   `SELECT` grant** above.
 - **Retention:** the cleanup job keeps ~3 days by default. If rivet is offline
   longer than retention, the saved LSN falls below `sys.fn_cdc_get_min_lsn()` and
-  the read errors — fall back to a full re-snapshot.
+  the read errors — [re-baseline](cdc-failure-modes.md#the-shape-of-every-recovery) the stream.
 
 ### Oracle — LogMiner (preview)
 
@@ -516,17 +515,16 @@ can serve that log is an engine + replica-config question, not a rivet limitatio
 `{file, pos}` (not GTID), and a replica's binlog coordinates are its *own*, not the
 primary's. A checkpoint taken against one replica does **not** transfer to another
 host, and rivet refuses one written by a different server (it records `server_uuid`).
-If you fail over (to a different replica, or to the primary), delete the checkpoint so
-CDC anchors on the new host **first**, then re-snapshot the table (`mode: full`).
+If you fail over (to a different replica, or to the primary), [re-baseline](cdc-failure-modes.md#the-shape-of-every-recovery) the
+stream on the new host.
 
 **SQL Server — the checkpoint follows a failover, and nothing else.** An availability
 group's replicas share one log, so a checkpoint written on the primary resumes on a
 secondary (verified live). The checkpoint records the database's `family_guid` and
 `recovery_fork_guid`, and rivet refuses to resume against a database whose
 `family_guid` differs (another server's database: its LSNs address a different log) or
-whose `recovery_fork_guid` changed (a `RESTORE` rewound the log). Recover by deleting the
-checkpoint so CDC re-anchors **first**, then re-snapshot the table with `mode: full` —
-in the other order, the changes between the snapshot and the new anchor land in neither.
+whose `recovery_fork_guid` changed (a `RESTORE` rewound the log). Recover with a
+[re-baseline](cdc-failure-modes.md#the-shape-of-every-recovery): the run anchors first and re-reads the table after.
 A checkpoint written before rivet recorded the identity resumes with a warning.
 
 **PostgreSQL — the slot does not survive a failover.** The slot is the resume position, and
@@ -575,6 +573,79 @@ delete   {"file":"binlog.000046","pos":683} 0      2    bob     200
   distinct `__pos`, so its `__seq` is always `0`.)
 - the source columns, **typed** (resolved from the source schema), carrying the
   **after-image** for insert/update and the **key (before-image)** for delete.
+
+**An UPDATE that changes the key** is written as two rows: a `delete` of the old
+key, then an `insert` of the new row, at the same `__pos` with the insert's
+`__seq` after the delete's ([ADR-0030](../adr/0030-primary-key-update-representation.md)).
+So the MERGE below retracts the old key with no extra step. The key is the
+export's declared `load.pk:` when there is one, otherwise the table's primary
+key, read from the source at the start of the run. `pk: none` means no key, so
+nothing is split. A declared key column the table does not have fails the run at
+the start, naming the column. SQL Server's change table already records an
+UPDATE of the primary key as a delete and an insert. This was measured with a
+clustered key and with a nonclustered key on a heap; rivet reads only the new row
+of any other UPDATE. MongoDB's `_id` cannot change.
+
+An UPDATE counts as a key change only when its old image carries EVERY key
+column and one of them differs. A column the old image does not carry is absent,
+not NULL. On PostgreSQL the old image is what the replica identity logs: the
+whole row under `REPLICA IDENTITY FULL`, and otherwise only the identity's
+columns, and only when one of them changes. So an UPDATE that changes a key
+column the identity does not log stays one `update`, and its old key stays live
+downstream. This happens under `REPLICA IDENTITY USING INDEX` on an index that is
+not the key, and with a declared `load.pk:` that is not the primary key. Use
+`REPLICA IDENTITY FULL` for such a table.
+
+**A statement that renumbers keys.** Oracle checks uniqueness per statement, so
+`UPDATE t SET id = id + 1` is logged as `1 -> 2`, then `2 -> 3`. The delete of 2
+belongs to the row that held 2 before the statement, not to the row that just
+moved into it, and rivet orders it before that row's insert. It tells the two
+rows apart by LogMiner's `ROW_ID`, so rows whose other columns are equal (a
+junction table) keep every row. On a heap table without row movement, a change
+whose `ROW_ID` is missing is refused (`RIVET_SOURCE_CDC_UNDECODABLE`) rather than
+guessed.
+
+What this does not handle:
+
+- **An Oracle table whose ROWID can change inside a transaction.** This is an
+  index-organized table (LogMiner gives every row of one the same placeholder
+  `ROW_ID`) or a table with `ENABLE ROW MOVEMENT` (an UPDATE that moves a row to
+  another partition reports the row's old `ROW_ID`, and the row's next change its
+  new one). There rivet compares images instead, and a renumber over rows whose
+  non-key columns are all equal loses a row. The same applies to PostgreSQL with
+  a `DEFERRABLE` primary key under `REPLICA IDENTITY FULL`, which carries no row
+  identity.
+- **A key change the old image cannot show stays one `update`, and its old key
+  stays live.** Nothing warns about these cases:
+  - PostgreSQL under `REPLICA IDENTITY FULL`, with a declared `load.pk:` column
+    that goes from NULL to a value. `test_decoding` does not print the NULL old
+    cell, so the old image does not carry that key column.
+  - MySQL with a session-level `binlog_row_image = NOBLOB` (the global setting is
+    refused at the start), when one UPDATE changes both the key and a BLOB/TEXT
+    column. The old image then lacks the unchanged BLOBs and cannot be read by
+    name.
+  - SQL Server with a declared `load.pk:` that is not the primary key. An UPDATE
+    of that column is an update in place, and rivet reads only the new row.
+- **A PostgreSQL table whose changes carry no old image.** This covers four
+  cases:
+  - a table with `REPLICA IDENTITY NOTHING`;
+  - `REPLICA IDENTITY USING INDEX` on an index that has since been dropped, which
+    PostgreSQL treats as `NOTHING`;
+  - a table without a primary key under `REPLICA IDENTITY DEFAULT`;
+  - a table whose primary key is `DEFERRABLE` (PostgreSQL does not use a
+    deferrable key as the replica identity). An UPDATE on
+  such a table carries no old values, and a DELETE carries no columns at all. So a
+  key change stays one `update` and the old key stays live, and a DELETE retracts
+  nothing downstream. The run warns at the start, naming each such table
+  schema-qualified, with its remedy: `REPLICA IDENTITY FULL`; for a deferrable
+  key, also `REPLICA IDENTITY USING INDEX` on a non-deferrable unique index (which
+  then rejects `SET id = id + 1`); for a dropped index, an existing one; for no
+  key, a primary key.
+
+An old-image cell rivet cannot decode (`infinity`, a BC date, 24:00) refuses the
+run only where the old image is written: the delete of a key change, and the
+`before` of `rivet cdc` NDJSON. An UPDATE that keeps its key is delivered as
+before.
 
 Downstream applies it by primary key:
 
@@ -660,8 +731,15 @@ all cycles, which is the intended at-least-once stream — dedupe by PK + `__op`
 `__pos` downstream, and archive parts you have already loaded if you want the
 prefix to stay small.
 
-Without `--output`, rivet emits the same information as NDJSON (one JSON object
-per change) to stdout.
+Without `--output`, rivet emits the changes as NDJSON (one JSON object per change)
+to stdout, as the engine delivered them: `op`, `schema`, `table`, `before`,
+`after`, `pos`, `seq`. NDJSON is NOT split: a key change is one `update` line.
+`before` holds the old image's cells in the order the engine logged them. On
+PostgreSQL every UPDATE that carries an old image also gets `before_columns`, which
+names those cells. That is the replica identity's columns, or under
+`REPLICA IDENTITY FULL` the whole old row minus its NULL cells, which
+`test_decoding` does not print. A column `before_columns` does not name was
+either not logged or NULL.
 
 ## Why CDC is gentle on the source
 
@@ -733,15 +811,15 @@ tables) always name every image column, so rivet maps values by NAME: a
 equal-arity `DROP a` + `ADD c` leaves `c` NULL for the older images rather than
 filling it with a neighbour's value (unless the dropped column sat at `c`'s
 position, which looks exactly like a rename and is read as one). A column ADDED while a run is open is not in
-that run's schema, so its values for that run's window are dropped — re-snapshot
-the table after an `ADD COLUMN` if those values matter. MySQL's binlog carries
+that run's schema, so its values for that run's window are dropped — [re-baseline](cdc-failure-modes.md#the-shape-of-every-recovery)
+the stream after an `ADD COLUMN` if those values matter. MySQL's binlog carries
 names only when the server runs with **`binlog_row_metadata=FULL`** (8.0.1+),
 which rivet requires (see [MySQL — the binlog grants](#mysql--the-binlog-grants)), so MySQL behaves the
 same. rivet never maps a binlog image by position: a server at `MINIMAL` is
 refused at open, and an event written under `MINIMAL` is refused when it is
 read. DDL *between* runs is always fine, because each run resolves the schema
 fresh. Same-arity TYPE changes remain undetectable without schema history
-(roadmap): run type migrations and their backfills through a re-snapshot.
+(roadmap): run type migrations and their backfills through a [re-baseline](cdc-failure-modes.md#the-shape-of-every-recovery).
 
 **The value checksum runs on CDC too.** The same always-on two-ended check the
 batch export performs — an independent fold of the decoded cells vs a fold of
@@ -757,12 +835,14 @@ For the full operational failure playbook — every symptom, what rivet does, ho
 checkpoint exists but the slot is gone (dropped by an operator, or invalidated
 and removed), rivet refuses to re-create it — a fresh slot would anchor at the
 *current* position and silently skip everything since the drop. The run fails
-with the re-snapshot hint; delete the checkpoint file only when you explicitly
-accept a fresh anchor.
+with the [re-baseline](cdc-failure-modes.md#the-shape-of-every-recovery) steps; delete the checkpoint file alone only when you explicitly
+accept a fresh anchor and the gap. Without a checkpoint or a completed baseline,
+rivet cannot tell a dropped slot from a first run: it creates the slot and warns
+with the same steps.
 
 **Bound the blast radius:** set `max_slot_wal_keep_size` (PG 13+). PostgreSQL then
 **invalidates the slot** rather than fill the disk; rivet's next run fails with a
-slot-invalidated error and you re-snapshot. **Monitor** `pg_replication_slots`
+slot-invalidated error and you [re-baseline](cdc-failure-modes.md#the-shape-of-every-recovery). **Monitor** `pg_replication_slots`
 (`active`, and `restart_lsn` vs the current LSN = how much WAL the slot is holding).
 
 > **`rivet doctor` automates this monitoring.** For a config with `mode: cdc`
@@ -779,16 +859,15 @@ slot-invalidated error and you re-snapshot. **Monitor** `pg_replication_slots`
 If rivet is offline long enough that the saved binlog position is **purged**
 (`binlog_expire_logs_seconds` / `PURGE BINARY LOGS`), the resume read fails with
 MySQL **ERROR 1236** (the requested binlog file is gone). The position is
-unrecoverable — delete the checkpoint so CDC re-anchors **first**, then
-**re-snapshot** (`mode: full`). Size binlog retention comfortably above your CDC cadence.
+unrecoverable — [re-baseline](cdc-failure-modes.md#the-shape-of-every-recovery) the stream. Size binlog retention comfortably above your CDC cadence.
 
 ### SQL Server — the checkpoint fell below retention
 
 If the saved LSN falls **below** `sys.fn_cdc_get_min_lsn()` (the cleanup job — ~3
 days by default — removed the changes after it), rivet **fails loudly** — *"the
-resume position is older than the change-table retention … re-snapshot"* — rather
-than resume from the new min and **silently skip the gap**. Delete the checkpoint so
-CDC re-anchors **first**, then re-snapshot. Also watch for a **non-advancing `sys.fn_cdc_get_max_lsn()`**:
+resume position is older than the SQL Server CDC change-table retention … Re-baseline the stream"* —
+rather than resume from the new min and **silently skip the gap**. [re-baseline](cdc-failure-modes.md#the-shape-of-every-recovery) the
+stream. Also watch for a **non-advancing `sys.fn_cdc_get_max_lsn()`**:
 that means the **Agent capture job stopped**, so the change tables are frozen — read
 "no rows" as "the job is down", not "no changes".
 
@@ -796,8 +875,8 @@ that means the **Agent capture job stopped**, so the change tables are frozen �
 
 If the checkpoint needs redo older than the oldest archived log still listed (RMAN
 `DELETE INPUT`, a retention policy), or a log sequence is missing in between, the run
-fails with *"… LOST to this stream"* instead of mining from whatever remains. Delete
-the checkpoint so the next run anchors **first**, then re-snapshot the table.
+fails with *"… LOST to this stream"* instead of mining from whatever remains.
+Restore the archived log, or [re-baseline](cdc-failure-modes.md#the-shape-of-every-recovery) the stream.
 
 A checkpoint written against another database (a different `DBID`, a `RESETLOGS`
 since, or another pluggable database) is refused the same way: an SCN means nothing
@@ -807,11 +886,11 @@ outside the database that issued it.
 
 Re-run to resume from the last checkpoint (the common case). If the run reports the
 position is unrecoverable (PostgreSQL slot invalidated, MySQL binlog purged, SQL
-Server retention exceeded), **restart CDC from a new checkpoint first, then
-re-snapshot the table with `mode: full`** — the only safe recovery once the source log
-no longer covers the gap. The order matters: the new anchor must exist before the
-snapshot reads, so the stream overlaps the snapshot (duplicates, which the load
-deduplicates) instead of leaving the changes in between in neither.
+Server retention exceeded), **[re-baseline](cdc-failure-modes.md#the-shape-of-every-recovery) the stream**: delete the checkpoint, move every
+file out of the export's destination, delete its `cdc_snapshot` rows, give it
+`cdc.initial: snapshot` if it has none, and re-run. That run anchors first and re-reads the table after, so the stream overlaps the
+snapshot (duplicates, which the load deduplicates) instead of leaving the changes in
+between in neither. A separate `mode: full` export is not a re-baseline.
 
 ## Limitations (current)
 
@@ -834,8 +913,8 @@ engines. What remains:
   the intended model.
 - **Schema drift:** the sink schema is frozen at the first flush — a column added
   mid-run is not picked up until the next run re-resolves the table, and its values
-  captured in the meantime are dropped (the events are still acked) — re-snapshot
-  the table to recover them.
+  captured in the meantime are dropped (the events are still acked) — [re-baseline](cdc-failure-modes.md#the-shape-of-every-recovery)
+  the stream to recover them.
 - **No lag metric:** the run records rows / files / bytes / duration / status, but
   not replication lag ("how far behind the source is") — the next observability step.
 - **Pre-image completeness** depends on the source config: full UPDATE/DELETE

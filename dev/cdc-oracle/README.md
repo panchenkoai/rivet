@@ -90,11 +90,11 @@ and an event matching NEITHER surfaces as `UNKNOWN-SHAPE` rather than being
 dropped — a lenient normaliser would reintroduce the exact class this exists to
 catch.
 
-## Status (2026-08-25)
+## Status (2026-08-25; key-update re-measured 2026-10-03)
 
     engine      crud    key-update   wide-txn      mid-stream-table
-    postgres    AGREE   DIFFERS      AGREE 75/75   AGREE
-    mysql       AGREE   DIFFERS      AGREE 75/75   AGREE
+    postgres    AGREE   AGREE        AGREE 75/75   AGREE
+    mysql       AGREE   AGREE        AGREE 75/75   AGREE
     mssql       AGREE   AGREE        AGREE 99ev    AGREE
     mongo       AGREE*  na           AGREE 75/75   AGREE     (* delete excluded, see below)
 
@@ -105,9 +105,10 @@ of a column NULLed reported AGREE. That is now RED-proven to fail, and a run
 WITHOUT `--value` says so in its own output rather than claiming a comparison it
 did not make.
 
-All sixteen cells settled: fifteen agreements, one difference, one `na`.
+All sixteen cells settled on 2026-08-25: fifteen agreements, one difference, one
+`na`. The difference was key-update, closed by ADR-0030 on 2026-10-03.
 
-**The key-update finding**, and it SURVIVED the harness being fixed — which is the
+**The key-update finding (closed 2026-10-03)**, and it SURVIVED the harness being fixed — which is the
 only reason to trust it. `UPDATE t SET id=9 WHERE id=1` gives `delete(1)+insert(9)`
 from Debezium and `update(9)` from rivet, identically on PostgreSQL and MySQL, so
 it is rivet's representation choice rather than a plugin artefact. A consumer
@@ -216,7 +217,8 @@ what the gate MEANS:
 - An AGREE that compared only `(op, key)` is a FAILURE, not a pass. The row claims
   a value-level check, the comparison names its own scope in its output, and that
   is checked rather than assumed.
-- `key-update` is excluded. rivet emits `update(new)` where Debezium emits
-  `delete(old)+insert(new)`, identically on PostgreSQL and MySQL — a representation
-  decision that belongs in an ADR. A gate cell EXPECTING a difference would go
-  green the day someone fixes it, which is the wrong direction for a ratchet.
+- `key-update` runs on every engine but MongoDB. Until 2026-10-03 it was excluded,
+  because rivet emitted `update(new)` where Debezium emits `delete(old)+insert(new)`
+  and a cell EXPECTING a difference goes green the day someone fixes it. ADR-0030
+  made rivet split the change too; on 2026-10-03 `run.py --scenario key-update`
+  reported AGREE on postgres, mysql and mssql.

@@ -122,8 +122,8 @@ fn dropped_capture_message(op: &OperationType, db: &str, coll: Option<&str>) -> 
     format!(
         "mongodb cdc: captured {what} was removed by `{op:?}`, and a change stream carries no \
          per-document deletes for that — skipping it would leave every document it held live in \
-         the destination. Recover in rivet's OWN order: re-anchor FIRST (delete the checkpoint so \
-         the next run pins a fresh one), THEN re-snapshot the collection (`mode: full`)."
+         the destination. {}",
+        crate::source::cdc::checkpoint_identity::RECOVER
     )
 }
 
@@ -561,8 +561,10 @@ impl MongoChangeStream {
                  On a first run that is expected. If this checkpoint existed before, it \
                  was deleted or the config moved: a RELATIVE `cdc.checkpoint:` is \
                  resolved against the CONFIG FILE's directory, so the path above is \
-                 where rivet looked — re-snapshot before trusting this stream.",
-                ckpt.display()
+                 where rivet looked, and the changes since it was written are gone from \
+                 this stream. {}",
+                ckpt.display(),
+                crate::source::cdc::checkpoint_identity::RECOVER
             );
         }
         Ok(this)
@@ -773,6 +775,9 @@ fn to_change_event(
         image_names: Some(std::sync::Arc::clone(&IMAGE_NAMES)),
         seq: 0, // stamped by TxnSeq as the stream is consumed
         poison: None,
+        row_id: None,
+        before_names: None,
+        before_poison: None,
     };
     // #158: Mongo's model — a SINGLE-document write's change event IS its own commit (post-commit
     // oplog), so it is a boundary. A MULTI-document transaction (one lsid/txnNumber) shares one
@@ -830,15 +835,14 @@ fn diagnose_stream_error(e: mongodb::error::Error) -> anyhow::Error {
              the event carries the post-image, the pre-image and the envelope in ONE \
              document, so a document over roughly 8 MB can cross it on an update. \
              This is not a setup problem and it does not clear on retry: the run stops \
-             at the same event every time. Recovery is a RE-SNAPSHOT — run this \
-             collection with `mode: full` (verified: a batch read of the same 9 MB \
-             document succeeds, because the snapshot reads the document rather than \
-             an event carrying two copies of it), then move the checkpoint past the \
-             stuck position. Do NOT just delete the checkpoint: on its own that \
-             re-anchors at NOW and drops the change with nothing standing in for it. \
-             Turning `changeStreamPreAndPostImages` off does NOT unstick THIS event \
-             either — the pre-image was already recorded when the change happened — \
-             though it does prevent the next one. Server error: {text}"
+             at the same event every time. Recovery is a re-baseline, whose snapshot \
+             reads the document rather than an event carrying two copies of it \
+             (verified: a batch read of the same 9 MB document succeeds). {} Deleting \
+             the checkpoint WITHOUT the baseline re-anchors at NOW and drops the change \
+             with nothing standing in for it. Turning `changeStreamPreAndPostImages` off \
+             does NOT unstick THIS event either — the pre-image was already recorded when \
+             the change happened — though it does prevent the next one. Server error: {text}",
+            crate::source::cdc::checkpoint_identity::RECOVER
         );
     }
     anyhow::Error::from(e)

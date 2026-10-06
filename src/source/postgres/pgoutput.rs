@@ -678,10 +678,9 @@ impl Assembler {
                 anyhow::bail!(
                     "pgoutput: TRUNCATE of {} — this reader cannot represent it as a \
                      change. Every row the truncate removed would sit in the \
-                     destination with no DELETE to retract it. Recover in rivet's own \
-                     order: re-anchor FIRST (a fresh checkpoint), THEN re-snapshot \
-                     (`mode: full`).",
-                    named.join(", ")
+                     destination with no DELETE to retract it. {}",
+                    named.join(", "),
+                    crate::source::cdc::checkpoint_identity::RECOVER
                 )
             }
             // A barrier is not a change. It is also not something to swallow: the
@@ -714,6 +713,9 @@ impl Assembler {
                     image_names: rel.map(|x| x.names.clone()),
                     seq: 0, // stamped by TxnSeq as the stream is consumed
                     poison: None,
+                    row_id: None,
+                    before_names: None,
+                    before_poison: None,
                 }
             })
             .collect()
