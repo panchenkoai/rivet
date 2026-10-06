@@ -914,8 +914,8 @@ const PIN_INDEPENDENT: usize = 106; // ratchet-pin: cdc-census-independent min
 // 2026-10-02: +1 shared_codec - the MongoDB failover follow, read back through its parts (the PostgreSQL
 // failover cells run their capture through a helper the census does not see).
 // 2026-10-02: +1 shared codec - Oracle CDC under a redo log switch storm; each run is graded by the default oracle, exactly-once by the seed.
-// 2026-10-03: +1 shared codec - the PostgreSQL capped `rivet cdc --output` cell; its cap is read
-// back through the parts, the remainder by the rig oracle grading the next run.
+// 2026-10-03: +2 shared codec - the PostgreSQL and SQL Server capped `rivet cdc --output` cells read the
+// cap's stop point through `read_cdc_changes(`; -1: the SQL Server case-only refusal test moved to presence.
 const PIN_SHARED_CODEC: usize = 93; // ratchet-pin: cdc-census-shared-codec
 const PIN_SELF_COUNTER: usize = 6; // ratchet-pin: cdc-census-self-counter
 // 2026-09-28: +1 presence — the SQL Server undecodable-cell refusal, whose oracle is the refusal.
