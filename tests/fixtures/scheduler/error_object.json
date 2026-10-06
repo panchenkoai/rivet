@@ -1,0 +1,9 @@
+{
+  "code": "RIVET_SOURCE_CDC_LOG_GAP",
+  "kind": "refusal",
+  "class": "refusal",
+  "exit_code": 5,
+  "retryable": false,
+  "action": "restore the missing log, or re-baseline the stream: delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, give it `cdc.initial: snapshot`, then re-run",
+  "message": "export 'orders_cdc': the checkpoint position is no longer in the source log"
+}

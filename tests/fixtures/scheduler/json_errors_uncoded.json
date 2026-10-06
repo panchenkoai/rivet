@@ -1,0 +1,22 @@
+{
+  "error": "export 'events': connection reset by peer",
+  "exit_class": 2,
+  "exit_code": 2,
+  "class": "retryable",
+  "kind": null,
+  "retryable": true,
+  "action": null,
+  "failures": [
+    {
+      "export": "events",
+      "table": null,
+      "code": null,
+      "kind": null,
+      "class": "retryable",
+      "exit_code": 2,
+      "retryable": true,
+      "action": null,
+      "message": "export 'events': connection reset by peer"
+    }
+  ]
+}

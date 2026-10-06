@@ -1,0 +1,13 @@
+{
+  "run_id": "20261006T102400.012-compact",
+  "per_table": [
+    {
+      "export": "orders_cdc",
+      "table": "orders",
+      "status": "skipped",
+      "skip_reason": "warehouse_never_compacts",
+      "rows": 0,
+      "error": null
+    }
+  ]
+}

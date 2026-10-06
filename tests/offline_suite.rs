@@ -107,6 +107,8 @@ mod resource_smoke;
 mod retry_integration;
 #[path = "offline/run_summary_contract.rs"]
 mod run_summary_contract;
+#[path = "offline/scheduler_contract.rs"]
+mod scheduler_contract;
 
 #[path = "offline/cli_flag_coverage_guard.rs"]
 mod cli_flag_coverage_guard;

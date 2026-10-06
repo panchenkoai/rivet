@@ -3,7 +3,8 @@
 **Status**: Accepted
 **Date**: 2026-07
 **Amends**: [ADR-0002 — CLI Product vs Library](0002-cli-product-vs-library.md)
-**Context**: A private, source-available companion crate — **`rivet-pro`** (BSL 1.1, separate repo) — now builds the paid tier (warehouse load, whole-database discovery, continuous CDC) on top of the OSS engine. It links the `rivet` library and depends on a small set of already-`pub` items. ADR-0002 declares the library "not a stable public API" and (Consequence #4 / *Future library path*) prescribes extracting a separate `rivet-engine` crate *if* a stable embedding surface is ever needed. This ADR decides what to do now that there is exactly **one, first-party** embedding consumer.
+**Amended by**: [ADR-0039 — The Scheduler Contract](0039-scheduler-contract.md) (2026-10-06, see *Amendment* below)
+**Context**: A private, source-available companion crate — **`rivet-pro`** (BSL 1.1, separate repo) — now builds the paid tier (whole-database discovery, continuous CDC) on top of the OSS engine. It links the `rivet` library and depends on a small set of already-`pub` items. ADR-0002 declares the library "not a stable public API" and (Consequence #4 / *Future library path*) prescribes extracting a separate `rivet-engine` crate *if* a stable embedding surface is ever needed. This ADR decides what to do now that there is exactly **one, first-party** embedding consumer.
 
 ---
 
@@ -51,7 +52,15 @@ Everything else in the library keeps the ADR-0002 posture: `pub` only for the te
 
 ### The CLI superset uses the process boundary, not a Rust API
 
-`rivet-pro` ships a superset `rivet` binary (OSS subcommands + `load`/`discover`/`daemon`). It composes them at the **argv/process boundary**: unknown subcommands are delegated to the OSS `rivet` binary (already a stable product contract — config YAML + exit-code taxonomy + manifest). The `cli` module is deliberately **binary-only** (declared in `main.rs`, absent from `lib.rs`; its dispatch reaches `crate::init`, also binary-only). Pulling `cli` into the library to expose `Commands`/`dispatch` would violate ADR-0002's minimal-library principle and freeze the entire command surface. We do not do that.
+`rivet-pro` ships a superset `rivet` binary (OSS subcommands + `discover`/`daemon`). It composes them at the **argv/process boundary**: unknown subcommands are delegated to the OSS `rivet` binary (already a stable product contract — config YAML + exit-code taxonomy + manifest). The `cli` module is deliberately **binary-only** (declared in `main.rs`, absent from `lib.rs`; its dispatch reaches `crate::init`, also binary-only). Pulling `cli` into the library to expose `Commands`/`dispatch` would violate ADR-0002's minimal-library principle and freeze the entire command surface. We do not do that.
+
+### Amendment (2026-10-06) — the load and compact operators, orchestration and alerting are open source
+
+Until this amendment the Context listed the warehouse load in the paid tier and the paragraph above listed `load` among the subcommands the superset binary adds. Both lists were corrected in place, because `rivet load` and `rivet compact` are subcommands of the OSS binary (`Commands::Load`, `src/cli/args.rs:196`; `Commands::Compact`, `src/cli/args.rs:231`), dispatched to `load::orchestrate::run_loads` and `load::compact::run_compacts` (`src/cli/dispatch.rs:110-129`), with BigQuery, Snowflake and ClickHouse as targets (`LoadTargetKind`, `src/config/load.rs:135-139`). Nothing else in those lists is changed by this amendment.
+
+What it decides: **the scheduler operators for `load` and `compact`, and the orchestration and alerting integrations as a whole, are open source and live in this repository** — the operators for `run` / `apply`, `load` and `compact`, their DAG builders, and the notification formatters. They drive the OSS binary at the same argv/process boundary this ADR already names as the product contract, now specified by [ADR-0039](0039-scheduler-contract.md). An operator for an OSS subcommand that was itself paid would make the OSS command unusable under a scheduler without the private crate, which is the dependency direction the *Rationale* below forbids.
+
+The seam table and its enforcement are unchanged.
 
 ---
 
