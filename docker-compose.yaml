@@ -575,6 +575,8 @@ services:
   # --- Monitoring stack (Postgres metrics under load) ---
   postgres-exporter:
     image: prometheuscommunity/postgres-exporter:latest
+    # Dashboards only: no test or gate reads these. Start them by name or with --profile observability.
+    profiles: ["observability"]
     environment:
       DATA_SOURCE_NAME: "postgresql://rivet:rivet@postgres:5432/rivet?sslmode=disable"
     ports:
@@ -584,6 +586,8 @@ services:
 
   prometheus:
     image: prom/prometheus:latest
+    # Dashboards only: no test or gate reads these. Start them by name or with --profile observability.
+    profiles: ["observability"]
     volumes:
       - ./dev/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
     ports:
@@ -593,6 +597,8 @@ services:
 
   grafana:
     image: grafana/grafana:latest
+    # Dashboards only: no test or gate reads these. Start them by name or with --profile observability.
+    profiles: ["observability"]
     environment:
       GF_SECURITY_ADMIN_USER: admin
       GF_SECURITY_ADMIN_PASSWORD: admin
