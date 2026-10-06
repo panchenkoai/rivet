@@ -1002,10 +1002,10 @@ def run_stages(led: Ledger, stages: Sequence[Stage]) -> None:
 
 
 def build_stages(ns: argparse.Namespace, built: dict) -> list[Stage]:
-    """The clean build, then the object stores."""
+    """The clean build and what only waits beside it."""
     build = [Stage("clean tree", lambda led: built.update(ok=clean_tree_and_build(led, fast=ns.fast_clean)),
                    frozenset({CARGO}))] if not ns.no_clean else []
-    return [*build, Stage("object stores", start_stores, frozenset({ALONE}))]
+    return [*build, Stage("object stores", start_stores, frozenset({"the object-store fakes"}))]
 
 
 def gate_stages(ns: argparse.Namespace) -> list[Stage]:
