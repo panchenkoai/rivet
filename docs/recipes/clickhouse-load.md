@@ -209,5 +209,3 @@ load:
   anchor on, so to keep the table's existing rows also set `cdc.initial: snapshot`
   (or a `cdc.backfill:`) and `rivet run` again before the load; the stream is
   already anchored, so the snapshot overlaps it and nothing falls between them.
-- **A primary-key update** leaves the old key live, as on every warehouse
-  ([ADR-0030](../adr/0030-primary-key-update-representation.md)).
