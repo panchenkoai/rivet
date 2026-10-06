@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 from urllib.parse import quote
 
 from ._compat import AirflowException, AirflowFailException, AirflowSkipException, BaseHook, BaseOperator
-from .invocation import _SAFE, Outcome, Request, _stop, crashed_retry_allowed, invoke
+from .invocation import _SAFE, CLOUD_ENV, Outcome, Request, _stop, crashed_retry_allowed, invoke, worker_environment
 from .preflight import PreflightRefusal
 
 XCOM_KEY = "return_value"
@@ -27,15 +26,17 @@ def connection_url(conn: Any, scheme: Optional[str] = None) -> str:
             f"connection `{getattr(conn, 'conn_id', '?')}` has conn_type `{conn.conn_type}`, which names no rivet URL "
             f"scheme; pass the scheme as (conn_id, scheme) or set the connection extra `rivet_scheme` to one of {RIVET_SCHEMES}",
         )
-    auth = ""
-    if conn.login:
-        auth = quote(conn.login, safe="")
-        if conn.password:
-            auth += ":" + quote(conn.password, safe="")
-        auth += "@"
+    auth = quote(conn.login or "", safe="")
+    if conn.password:
+        auth += ":" + quote(conn.password, safe="")
+    auth += "@" if auth else ""
+    host = conn.host or ""
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
     port = f":{conn.port}" if conn.port else ""
+    database = (extra.get("service_name") if scheme == "oracle" else None) or conn.schema or ""
     params = f"?{extra['rivet_params']}" if extra.get("rivet_params") else ""
-    return f"{scheme}://{auth}{conn.host or ''}{port}/{conn.schema or ''}{params}"
+    return f"{scheme}://{auth}{host}{port}/{quote(str(database), safe='')}{params}"
 
 
 class RivetBaseOperator(BaseOperator):
@@ -50,7 +51,6 @@ class RivetBaseOperator(BaseOperator):
         "state_dir",
         "plan_file",
         "extra_args",
-        "env",
         "stderr_dir",
         "cwd",
     )
@@ -67,18 +67,23 @@ class RivetBaseOperator(BaseOperator):
         rivet_bin: str = "rivet",
         env: Optional[Mapping[str, str]] = None,
         env_from_connections: Optional[Mapping[str, Any]] = None,
+        env_passthrough: Sequence[str] = (),
+        cloud_credentials: Sequence[str] = (),
         deployment: str = "auto",
         extra_args: Optional[Sequence[str]] = None,
         lock_wait: int = 600,
         crashed_retries: int = 1,
         stderr_dir: Optional[str] = None,
         stream_stderr: bool = False,
+        log_keep: Optional[int] = 10,
         cwd: Optional[str] = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         if self.needs_export and not export:
             raise ValueError(f"{type(self).__name__} needs `export`")
+        if set(cloud_credentials) - set(CLOUD_ENV):
+            raise ValueError(f"cloud_credentials names {sorted(CLOUD_ENV)}, got {sorted(cloud_credentials)}")
         self.config = config
         self.export = export
         self.table = table
@@ -87,18 +92,21 @@ class RivetBaseOperator(BaseOperator):
         self.rivet_bin = rivet_bin
         self.env = env
         self.env_from_connections = env_from_connections
+        self.env_passthrough = tuple(env_passthrough)
+        self.cloud_credentials = tuple(cloud_credentials)
         self.deployment = deployment
         self.extra_args = extra_args
         self.lock_wait = lock_wait
         self.crashed_retries = crashed_retries
         self.stderr_dir = stderr_dir
         self.stream_stderr = stream_stderr
+        self.log_keep = log_keep
         self.cwd = cwd
         self._proc: Any = None
 
     def _environment(self) -> dict[str, str]:
-        """The subprocess environment: the worker's, the declared names, and URLs from Connections."""
-        env = dict(os.environ)
+        """The subprocess environment: the worker's allow-listed names, the declared ones, and URLs from Connections."""
+        env = worker_environment(self.env_passthrough, self.cloud_credentials)
         env.update({str(k): str(v) for k, v in (self.env or {}).items()})
         for name, ref in (self.env_from_connections or {}).items():
             conn_id, scheme = (ref, None) if isinstance(ref, str) else (ref[0], ref[1])
@@ -127,8 +135,9 @@ class RivetBaseOperator(BaseOperator):
         upstream = sorted(self.upstream_task_ids)
         if not upstream:
             return []
-        pulled = ti.xcom_pull(task_ids=upstream, key=XCOM_KEY) or []
-        return [p["state_marker"] for p in pulled if isinstance(p, dict) and p.get("state_marker")]
+        pulled = ti.xcom_pull(task_ids=upstream, key=XCOM_KEY)
+        values = [] if pulled is None else [pulled] if isinstance(pulled, dict) else list(pulled)
+        return [p["state_marker"] for p in values if isinstance(p, dict) and p.get("state_marker")]
 
     def _fail(self, ti: Any, payload: dict[str, Any], text: str, retry: bool) -> None:
         """Publish the payload, then raise the exception Airflow retries or the one it does not."""
@@ -166,6 +175,7 @@ class RivetBaseOperator(BaseOperator):
             cwd=self.cwd,
             stderr_dir=self.stderr_dir,
             stream_stderr=self.stream_stderr,
+            log_keep=self.log_keep,
             label=(ti.dag_id, run_id, task_part, f"try{ti.try_number}"),
             upstream_markers=self._upstream_markers(ti),
         )
@@ -197,8 +207,10 @@ class RivetBaseOperator(BaseOperator):
             if outcome.marker is not None and self.state_dir:
                 name = f"{_SAFE.sub('_', run_id)}__{_SAFE.sub('_', task_part)}.json"
                 ledger = Path(self.state_dir) / "airflow" / _SAFE.sub("_", ti.dag_id) / "crashed" / name
-            allowed = crashed_retry_allowed(ledger, ti.try_number, ti.max_tries, self.retries or 0, self.crashed_retries)
+            allowed, problem = crashed_retry_allowed(ledger, ti.try_number, ti.max_tries, self.crashed_retries)
             payload["crashed_retry"] = allowed
+            if ledger is None or problem:
+                payload["degraded"] = sorted({*payload["degraded"], "crashed_ledger"})
             self._emit(
                 {
                     "event": "rivet.crashed",
@@ -206,6 +218,7 @@ class RivetBaseOperator(BaseOperator):
                     "budget": self.crashed_retries,
                     "try_number": ti.try_number,
                     "airflow_tries_left": ti.try_number <= ti.max_tries,
+                    "ledger_problem": problem,
                 }
             )
             self._fail(ti, payload, text, retry=allowed)
@@ -265,3 +278,13 @@ class RivetWaveBarrier(BaseOperator):
     def execute(self, context: Any) -> None:
         """Nothing to run."""
         return None
+
+
+class RivetRunWatcher(BaseOperator):
+    """Fails when any task of the run failed, so the DAG run is failed whichever tasks are its leaves."""
+
+    ui_color = "#f1f3f4"
+
+    def execute(self, context: Any) -> None:
+        """Runs only under `trigger_rule="one_failed"`; always fails."""
+        raise AirflowFailException("a task of this DAG run failed; see the failed and upstream_failed tasks")

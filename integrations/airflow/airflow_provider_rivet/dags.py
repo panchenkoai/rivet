@@ -1,4 +1,4 @@
-"""DAG builders: TaskGroups are the picture, dependencies run per table."""
+"""DAG builders: TaskGroups are the picture, dependencies run per table, and a watcher fails the run on any failure."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
 from ._compat import DAG, TaskGroup
+from .invocation import PLAN_ERRORS, plan_layout
 from .operators import (
     RivetApplyOperator,
     RivetCdcRunOperator,
@@ -15,30 +16,30 @@ from .operators import (
     RivetLoadOperator,
     RivetPlanOperator,
     RivetRunOperator,
+    RivetRunWatcher,
     RivetWaveBarrier,
 )
 
 ORDER_ONLY = "all_done"
+WATCHER_ID = "watcher"
 DEFAULT_ARGS = {"retries": 2, "retry_delay": timedelta(minutes=5)}
 
 
 def read_plan_layout(plan_file: str) -> list[dict[str, Any]]:
     """Waves from a `rivet plan --format json` file: `[{"wave", "exports", "heavy"}]`, lowest wave first."""
     try:
-        plan = json.loads(Path(plan_file).read_text())
-        campaign = plan[0]["prioritization"]["campaign"]
-    except (OSError, ValueError, KeyError, IndexError, TypeError) as exc:
+        return plan_layout(json.loads(Path(plan_file).read_text()))
+    except (OSError, *PLAN_ERRORS) as exc:
         raise RuntimeError(
             f"{plan_file} is missing or is not `rivet plan --format json` output ({type(exc).__name__}); "
             f"write it with: rivet plan --config <config> --format json > {plan_file}"
         ) from exc
-    cost = {e["export_name"]: e.get("cost_class") for e in campaign.get("ordered_exports", [])}
-    waves = sorted(campaign["waves"], key=lambda w: w["wave"])
-    return [
-        {"wave": w["wave"], "exports": list(w["exports"]), "heavy": [n for n in w["exports"] if cost.get(n) != "low"]}
-        for w in waves
-        if w["exports"]
-    ]
+
+
+def _watch(dag: DAG) -> None:
+    """Add the task that fails the run when any other task failed (Airflow's watcher pattern)."""
+    tasks = list(dag.tasks)
+    tasks >> RivetRunWatcher(task_id=WATCHER_ID, trigger_rule="one_failed", retries=0, dag=dag)
 
 
 def _dag(dag_id: str, tags: Sequence[str], dag_kwargs: Mapping[str, Any]) -> DAG:
@@ -85,35 +86,25 @@ def build_batch_dag(
     extract_cls = RivetApplyOperator if extract == "apply" else RivetRunOperator
 
     with _dag(dag_id, ("rivet", "batch"), dag_kwargs) as dag:
+        plan = RivetPlanOperator(task_id="plan", plan_file=plan_file, **common) if plan_file and refresh_plan else None
         apply_tasks: dict[str, Any] = {}
         with TaskGroup(group_id="apply"):
-            previous: Optional[Any] = None
+            wave_done: Optional[Any] = None
             for index, wave in enumerate(waves):
-                chained: Optional[Any] = None
+                heavy_done: Optional[Any] = None
                 for name in wave["exports"]:
-                    ordered = previous is not None or (name in wave["heavy"] and chained is not None)
-                    task = extract_cls(
-                        task_id=name,
-                        export=name,
-                        trigger_rule=ORDER_ONLY if ordered or (plan_file and refresh_plan) else "all_success",
-                        **common,
-                    )
+                    task = extract_cls(task_id=name, export=name, **common)
                     apply_tasks[name] = task
-                    if previous is not None:
-                        previous >> task
-                    if name in wave["heavy"]:
-                        if chained is not None:
-                            chained >> task
-                        chained = task
+                    for gate in (plan, wave_done, heavy_done if name in wave["heavy"] else None):
+                        if gate is not None:
+                            gate >> task
+                    if name in wave["heavy"] and name != wave["heavy"][-1]:
+                        heavy_done = RivetWaveBarrier(task_id=f"after_{name}", trigger_rule=ORDER_ONLY)
+                        task >> heavy_done
                 if index < len(waves) - 1:
-                    barrier = RivetWaveBarrier(task_id=f"wave_{wave['wave']}_done", trigger_rule=ORDER_ONLY)
+                    wave_done = RivetWaveBarrier(task_id=f"wave_{wave['wave']}_done", trigger_rule=ORDER_ONLY)
                     for name in wave["exports"]:
-                        apply_tasks[name] >> barrier
-                    previous = barrier
-        if plan_file and refresh_plan:
-            plan = RivetPlanOperator(task_id="plan", plan_file=plan_file, **common)
-            for name in waves[0]["exports"]:
-                plan >> apply_tasks[name]
+                        apply_tasks[name] >> wave_done
         load_tasks: dict[str, Any] = {}
         if load:
             with TaskGroup(group_id="load"):
@@ -125,6 +116,7 @@ def build_batch_dag(
                 for name in names:
                     if name in compact_exports:
                         load_tasks[name] >> RivetCompactOperator(task_id=name, export=name, **common)
+        _watch(dag)
     return dag
 
 
@@ -150,12 +142,11 @@ def build_cdc_dag(
             loads = {}
             with TaskGroup(group_id="load"):
                 for table in tables:
-                    loads[table] = RivetLoadOperator(
-                        task_id=table, export=export, table=table, trigger_rule=ORDER_ONLY, **common
-                    )
+                    loads[table] = RivetLoadOperator(task_id=table, export=export, table=table, **common)
                     run >> loads[table]
             if compact:
                 with TaskGroup(group_id="compact"):
                     for table in tables:
                         loads[table] >> RivetCompactOperator(task_id=table, export=export, table=table, **common)
+        _watch(dag)
     return dag

@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import json
+import re
+from importlib import metadata
 from pathlib import Path
 
 import pytest
 
-from airflow_provider_rivet import get_provider_info
+from airflow_provider_rivet import __version__, get_provider_info
 from airflow_provider_rivet.callbacks import format_failure
 from airflow_provider_rivet.dags import build_batch_dag, build_cdc_dag, read_plan_layout
-from airflow_provider_rivet.operators import RivetApplyOperator, RivetRunOperator
+from airflow_provider_rivet.operators import RivetApplyOperator, RivetRunOperator, RivetRunWatcher, RivetWaveBarrier
 
 from conftest import fixture
 
@@ -61,29 +63,35 @@ def test_the_plan_layout_orders_waves_and_marks_the_heavy_exports(plan_file: str
 def test_batch_dag_has_three_groups_and_per_table_chains(plan_file: str) -> None:
     dag = build_batch_dag("b", config="/c/pg.yaml", state_dir="/state", plan_file=plan_file, compact_exports=["big"])
     assert sorted(dag.task_ids) == sorted(
-        ["plan", "apply.a", "apply.b", "apply.wave_2_done", "apply.big", "apply.huge",
-         "load.a", "load.b", "load.big", "load.huge", "compact.big"]
+        ["plan", "apply.a", "apply.b", "apply.wave_2_done", "apply.big", "apply.after_big", "apply.huge",
+         "load.a", "load.b", "load.big", "load.huge", "compact.big", "watcher"]
     )
-    assert set(dag.task_group.children) == {"plan", "apply", "load", "compact"}
+    assert set(dag.task_group.children) == {"plan", "apply", "load", "compact", "watcher"}
     assert edges(dag) == {
-        ("plan", "apply.a"), ("plan", "apply.b"),
+        ("plan", "apply.a"), ("plan", "apply.b"), ("plan", "apply.big"), ("plan", "apply.huge"),
         ("apply.a", "apply.wave_2_done"), ("apply.b", "apply.wave_2_done"),
         ("apply.wave_2_done", "apply.big"), ("apply.wave_2_done", "apply.huge"),
-        ("apply.big", "apply.huge"),
+        ("apply.big", "apply.after_big"), ("apply.after_big", "apply.huge"),
         ("apply.a", "load.a"), ("apply.b", "load.b"), ("apply.big", "load.big"), ("apply.huge", "load.huge"),
         ("load.big", "compact.big"),
-    }
+    } | {(t, "watcher") for t in dag.task_ids if t != "watcher"}
 
 
 def test_a_failed_table_does_not_gate_another_tables_load(plan_file: str) -> None:
     dag = build_batch_dag("b", config="/c/pg.yaml", state_dir="/state", plan_file=plan_file, compact_exports=["big"])
     assert dag.get_task("load.b").upstream_task_ids == {"apply.b"}
     assert "apply.a" not in upstream_closure(dag, "load.b") and "load.a" not in upstream_closure(dag, "load.b")
-    assert dag.get_task("load.b").trigger_rule == "all_success"
     assert dag.get_task("compact.big").upstream_task_ids == {"load.big"}
-    for ordered in ("apply.a", "apply.wave_2_done", "apply.big", "apply.huge"):
-        assert dag.get_task(ordered).trigger_rule == "all_done", f"{ordered}: ordering edges must not gate on success"
+    for ordering in ("apply.wave_2_done", "apply.after_big"):
+        assert dag.get_task(ordering).trigger_rule == "all_done", f"{ordering}: an ordering point waits, it does not gate"
+        assert isinstance(dag.get_task(ordering), RivetWaveBarrier)
+    for gated in ("apply.a", "apply.big", "apply.huge", "load.b", "compact.big"):
+        assert dag.get_task(gated).trigger_rule == "all_success", gated
+    assert dag.get_task("apply.huge").upstream_task_ids == {"plan", "apply.wave_2_done", "apply.after_big"}
     assert "apply.a" in upstream_closure(dag, "load.big"), "a later wave is ordered after the earlier one"
+    watcher = dag.get_task("watcher")
+    assert isinstance(watcher, RivetRunWatcher) and watcher.trigger_rule == "one_failed" and watcher.retries == 0
+    assert watcher.upstream_task_ids == set(dag.task_ids) - {"watcher"}
 
 
 def test_batch_dag_limits_overlap_and_passes_one_state_directory_to_every_task(plan_file: str) -> None:
@@ -98,7 +106,8 @@ def test_batch_dag_limits_overlap_and_passes_one_state_directory_to_every_task(p
 
 def test_batch_dag_from_an_explicit_list_and_with_rivet_run() -> None:
     dag = build_batch_dag("b", config="/c/pg.yaml", state_dir="/s", exports=["x", "y"], extract="run", load=False)
-    assert sorted(dag.task_ids) == ["apply.x", "apply.y"] and not edges(dag)
+    assert sorted(dag.task_ids) == ["apply.x", "apply.y", "watcher"]
+    assert edges(dag) == {("apply.x", "watcher"), ("apply.y", "watcher")}
     assert isinstance(dag.get_task("apply.x"), RivetRunOperator) and dag.get_task("apply.x").export == "x"
     assert dag.get_task("apply.x").trigger_rule == "all_success"
 
@@ -114,15 +123,16 @@ def test_batch_dag_refuses_contradictory_arguments(plan_file: str) -> None:
 
 def test_cdc_dag_is_one_run_then_load_and_compact_per_table() -> None:
     dag = build_cdc_dag("c", config="/c/cdc.yaml", export="app_cdc", tables=["orders", "users"], state_dir="/state")
-    assert sorted(dag.task_ids) == ["compact.orders", "compact.users", "load.orders", "load.users", "run"]
-    assert set(dag.task_group.children) == {"run", "load", "compact"}
+    assert sorted(dag.task_ids) == ["compact.orders", "compact.users", "load.orders", "load.users", "run", "watcher"]
+    assert set(dag.task_group.children) == {"run", "load", "compact", "watcher"}
     assert edges(dag) == {
         ("run", "load.orders"), ("run", "load.users"),
         ("load.orders", "compact.orders"), ("load.users", "compact.users"),
-    }
+    } | {(t, "watcher") for t in dag.task_ids if t != "watcher"}
+    assert dag.get_task("watcher").trigger_rule == "one_failed"
     for table in ("orders", "users"):
         load = dag.get_task(f"load.{table}")
-        assert load.trigger_rule == "all_done", "a load runs whatever the drain delivered or however it ended"
+        assert load.trigger_rule == "all_success", "nothing is loaded after a drain that did not succeed"
         assert (load.export, load.table) == ("app_cdc", table)
         assert dag.get_task(f"compact.{table}").trigger_rule == "all_success"
     assert "load.orders" not in upstream_closure(dag, "compact.users")
@@ -130,13 +140,17 @@ def test_cdc_dag_is_one_run_then_load_and_compact_per_table() -> None:
 
 
 def test_cdc_dag_without_compact_or_load() -> None:
-    assert sorted(build_cdc_dag("c", config="c", export="e", tables=["t"], compact=False).task_ids) == ["load.t", "run"]
-    assert build_cdc_dag("c2", config="c", export="e", tables=[], load=False).task_ids == ["run"]
+    assert sorted(build_cdc_dag("c", config="c", export="e", tables=["t"], compact=False).task_ids) == ["load.t", "run", "watcher"]
+    assert sorted(build_cdc_dag("c2", config="c", export="e", tables=[], load=False).task_ids) == ["run", "watcher"]
 
 
-def test_the_provider_entry_point_names_the_distribution() -> None:
+def test_the_provider_entry_point_names_the_distribution_and_the_version_has_one_source() -> None:
     info = get_provider_info()
-    assert info["package-name"] == "airflow-provider-rivet" and info["versions"]
+    assert info["package-name"] == "airflow-provider-rivet" and info["versions"] == [__version__]
+    pyproject = (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text()
+    assert 'dynamic = ["version"]' in pyproject and 'path = "airflow_provider_rivet/__init__.py"' in pyproject
+    assert not re.search(r"^version\s*=", pyproject, re.M), "the version is written in __init__.py only"
+    assert metadata.version("airflow-provider-rivet") == __version__
 
 
 def test_the_slack_text_has_code_class_action_and_no_error_message() -> None:

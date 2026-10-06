@@ -27,6 +27,7 @@ rivet_provider_cdc = build_cdc_dag(
     load=os.environ.get("RIVET_EXAMPLE_LOAD") == "1",
     operator_kwargs={
         "rivet_bin": os.environ.get("RIVET_BIN", "rivet"),
+        "env_passthrough": ["RIVET_PG_CDC_URL"],
         "cwd": os.environ.get("RIVET_EXAMPLE_OUT_DIR"),
     },
 )

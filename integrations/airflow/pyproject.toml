@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "airflow-provider-rivet"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Apache Airflow operators and DAG builders that run the rivet binary on the worker"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -30,6 +30,9 @@ Source = "https://github.com/panchenkoai/rivet"
 
 [project.entry-points.apache_airflow_provider]
 provider_info = "airflow_provider_rivet:get_provider_info"
+
+[tool.hatch.version]
+path = "airflow_provider_rivet/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["airflow_provider_rivet"]

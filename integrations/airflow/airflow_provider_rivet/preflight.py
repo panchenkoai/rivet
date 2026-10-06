@@ -102,6 +102,34 @@ def check_state_dir(state_dir: Optional[str]) -> Path:
     return path
 
 
+def check_nothing_left_beside_config(config_path: str, config: dict[str, Any], state_dir: Path, sqlite: bool, export: Optional[str]) -> None:
+    """Refuse when state or a CDC checkpoint sits beside the original config and the copy in `state_dir` would not see it."""
+    origin = Path(config_path).resolve().parent
+    if origin == state_dir.resolve():
+        return
+    left = origin / STATE_DB_NAME
+    if sqlite and left.exists() and not (state_dir / STATE_DB_NAME).exists():
+        raise PreflightRefusal(
+            "RIVET_AIRFLOW_STATE_BESIDE_CONFIG",
+            f"{left} exists and {state_dir} has no {STATE_DB_NAME}: rivet would start from an empty state there and "
+            f"treat every export as a first run. Stop every run of this config, then move the file (with its -wal and "
+            f"-shm files) into {state_dir}; or delete it if that state is not this pipeline's; see {SETUP_GUIDE}",
+        )
+    for entry in config.get("exports") or []:
+        cdc = entry.get("cdc") if isinstance(entry, dict) else None
+        ref = cdc.get("checkpoint") if isinstance(cdc, dict) else None
+        if not ref or os.path.isabs(str(ref)) or export not in (None, entry.get("name")):
+            continue
+        if (origin / str(ref)).exists() and not (state_dir / str(ref)).exists():
+            raise PreflightRefusal(
+                "RIVET_AIRFLOW_CHECKPOINT_BESIDE_CONFIG",
+                f"the checkpoint of `{entry.get('name')}` is at {origin / str(ref)}, and under Airflow the relative "
+                f"`cdc.checkpoint` resolves in the state directory: a stream that starts without its checkpoint "
+                f"re-anchors and skips the changes in between. Stop the stream, then move the file to "
+                f"{state_dir / str(ref)}; see {SETUP_GUIDE}",
+            )
+
+
 def run_preflight(
     *,
     rivet_bin: str,
@@ -158,6 +186,7 @@ def run_preflight(
                 f"an upstream task of this DAG run used another state directory than {state_dir} on this worker "
                 f"(marker {others[0][:8]} against {result.marker[:8]}); every task must see the same path; see {SETUP_GUIDE}",
             )
+        check_nothing_left_beside_config(config_path, config, result.state_dir, state_kind == "sqlite", export)
         if state_kind == "sqlite":
             result.warnings.append(
                 ("sqlite_single_host", f"SQLite state in {state_dir}: this setup is single-host; see {SETUP_GUIDE}")

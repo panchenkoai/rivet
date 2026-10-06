@@ -13,7 +13,7 @@ _VERSION_RE = re.compile(r"rivet\s+(\d+)\.(\d+)\.(\d+)")
 
 @dataclass(frozen=True)
 class Degradation:
-    """One thing ADR-0039 promises that a binary may lack, and what the package does instead."""
+    """One thing ADR-0039 promises that a binary, its output or the worker may lack, and what the package does instead."""
 
     key: str
     missing: str
@@ -83,6 +83,30 @@ DEGRADATIONS: dict[str, Degradation] = {
             "`--summary-output` on `rivet load` / `rivet compact`",
             "status comes from the exit code only: `skipped` and row counts are unknown",
             "flag",
+        ),
+        Degradation(
+            "stderr_temp",
+            "a declared state directory or `stderr_dir` on the worker",
+            "stdout and stderr files go to a private per-user directory under the temp directory; a pod loses them",
+            "worker",
+        ),
+        Degradation(
+            "crashed_ledger",
+            "a readable, writable crashed-budget ledger in the state directory",
+            "no crash retry beyond the first `crashed_retries` tries without a ledger; none at all with a broken one",
+            "worker",
+        ),
+        Degradation(
+            "result_malformed",
+            "an error object or result entry with the contract's keys and types",
+            "the entry is read by the exit-code table, a bad value is null, an unknown status counts as failed",
+            "output",
+        ),
+        Degradation(
+            "exit_zero_failed_unit",
+            "a non-zero exit whenever the summary reports a failed unit",
+            "the task fails by the worst failed unit of the summary although the process exited 0",
+            "output",
         ),
     )
 }

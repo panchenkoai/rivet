@@ -26,6 +26,7 @@ rivet_provider_batch = build_batch_dag(
     load=os.environ.get("RIVET_EXAMPLE_LOAD") == "1",
     operator_kwargs={
         "rivet_bin": os.environ.get("RIVET_BIN", "rivet"),
+        "env_passthrough": ["RIVET_PG_URL"],
         "cwd": os.environ.get("RIVET_EXAMPLE_OUT_DIR"),
     },
 )

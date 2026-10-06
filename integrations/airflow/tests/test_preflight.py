@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import ast
 import os
+import subprocess
+from pathlib import Path
 
 import pytest
 from airflow.exceptions import AirflowFailException
-from conftest import NEW_FLAGS, FakeTI, Rig
+from conftest import FIXTURES, NEW_FLAGS, FakeTI, Rig
 
 from airflow_provider_rivet import _yaml
 from airflow_provider_rivet.capabilities import probe
@@ -47,7 +50,8 @@ def test_a_pod_refuses_cdc_even_with_postgres_state(rig: Rig) -> None:
 def test_a_pod_with_postgres_state_runs_a_batch_export_and_writes_nothing_to_the_state_directory(rig: Rig) -> None:
     op = rig.operator(RivetRunOperator, export="orders", deployment="pod", env=PG_STATE)
     payload, _ = rig.run(op)
-    assert payload["decision"] == "success" and payload["stderr_path"] is None and payload["state_marker"] is None
+    assert payload["decision"] == "success" and payload["state_marker"] is None
+    assert not Path(payload["stderr_path"]).is_relative_to(rig.state_dir)
     assert rig.argv("run")[2] == str(rig.config.resolve()), "the config is run in place"
     assert list(rig.state_dir.iterdir()) == []
     assert "state_url_sqlite" not in payload["degraded"]
@@ -127,11 +131,125 @@ def test_flags_are_probed_from_help_as_whole_words(rig: Rig) -> None:
     assert not caps.has_flag("run", "--no-notify")
 
 
-def test_a_relative_query_file_is_made_absolute_in_the_materialised_config(rig: Rig) -> None:
-    rig.config.write_text(rig.config.read_text().replace("query: SELECT * FROM orders", "query_file: sql/orders.sql"))
+def with_query_file(rig: Rig, ref: str = "sql/orders.sql") -> None:
+    """Point the `orders` export at a query file."""
+    rig.config.write_text(rig.config.read_text().replace("query: SELECT * FROM orders", f"query_file: {ref}"))
+
+
+def test_a_relative_query_file_stays_relative_and_is_copied_beside_the_materialised_config(rig: Rig) -> None:
+    (rig.config_dir / "sql").mkdir()
+    (rig.config_dir / "sql" / "orders.sql").write_text("SELECT 42")
+    with_query_file(rig)
+    payload, _ = rig.run(rig.operator(RivetRunOperator, export="orders"))
+    assert payload["decision"] == "success", rig.calls()
+    assert rig.copy().read_text() == rig.config.read_text(), "the copy is the config as written, comments and all"
+    assert _yaml.load(rig.copy().read_text())["exports"][0]["query_file"] == "sql/orders.sql"
+    assert rig.calls()[-1]["sql"] == {"orders": "SELECT 42"}, "rivet read the SQL through the relative path"
+    (rig.config_dir / "sql" / "orders.sql").write_text("SELECT 43")
     rig.run(rig.operator(RivetRunOperator, export="orders"))
-    copy = _yaml.load((rig.state_dir / "pg.yaml").read_text())
-    assert copy["exports"][0]["query_file"] == str(rig.config_dir.resolve() / "sql/orders.sql")
+    assert rig.calls()[-1]["sql"] == {"orders": "SELECT 43"}, "an edit of the original reaches the next task"
+    rig.run(rig.operator(RivetLoadOperator, export="orders"))
+    assert _yaml.load(rig.copy("orders").read_text())["exports"][0]["query_file"] == "sql/orders.sql"
+
+
+def test_the_fake_binary_refuses_a_query_file_by_rivets_own_rule(rig: Rig) -> None:
+    source = (FIXTURES.parents[2] / "src" / "config" / "export.rs").read_text()
+    tree = ast.parse((Path(__file__).parent / "fake_rivet.py").read_text())
+    rules = next(ast.literal_eval(n.value) for n in tree.body if isinstance(n, ast.Assign) and n.targets[0].id == "QUERY_FILE_RULES")
+    assert len(rules) == 3 and all(rule in source for rule in rules), "the fake's refusal texts are rivet's"
+    outside = rig.tmp / "outside.sql"
+    outside.write_text("SELECT 1")
+    (rig.config_dir / "link.sql").symlink_to(outside)
+    for ref, rule in ((str(outside), rules[0]), ("../outside.sql", rules[1]), ("link.sql", rules[2])):
+        rig.config.write_text(rig.config.read_text().replace("query: SELECT * FROM orders", f"query_file: {ref}"))
+        done = subprocess.run([str(rig.bin / "rivet"), "run", "--config", str(rig.config)], capture_output=True, text=True)
+        assert done.returncode == 1 and rule in done.stderr, ref
+        rig.config.write_text(rig.config.read_text().replace(f"query_file: {ref}", "query: SELECT * FROM orders"))
+
+
+def test_a_query_file_rivet_would_not_read_is_refused_before_rivet_starts(rig: Rig) -> None:
+    outside = rig.tmp / "outside.sql"
+    outside.write_text("SELECT 1")
+    (rig.config_dir / "link.sql").symlink_to(outside)
+    (rig.config_dir / "sql").mkdir()
+    (rig.config_dir / "inside.sql").write_text("SELECT 1")
+    for ref in (str(outside), "../outside.sql", "sql/../inside.sql", "link.sql", "sql/missing.sql"):
+        with_query_file(rig, ref)
+        assert refused(rig, rig.operator(RivetRunOperator, export="orders")) == "RIVET_AIRFLOW_QUERY_FILE", ref
+        assert ref in rig.events("rivet.refused")[-1]["text"]
+        rig.config.write_text(rig.config.read_text().replace(f"query_file: {ref}", "query: SELECT * FROM orders"))
+    with_query_file(rig, "sql/missing.sql")
+    payload, _ = rig.run(rig.operator(RivetRunOperator, export="users"))
+    assert payload["decision"] == "success", "a missing file of another export is that export's problem"
+
+
+def test_two_configs_with_one_basename_get_their_own_copies(rig: Rig) -> None:
+    other = rig.tmp / "cfg2" / "pg.yaml"
+    other.parent.mkdir()
+    other.write_text(rig.config.read_text().replace("SELECT * FROM orders", "SELECT id FROM orders"))
+    rig.run(rig.operator(RivetRunOperator, export="orders"))
+    rig.run(rig.operator(RivetRunOperator, export="orders", config=str(other)))
+    first, second = rig.calls()[-2]["argv"][2], rig.calls()[-1]["argv"][2]
+    assert (first, second) == (str(rig.copy()), str(rig.copy(config=other))) and first != second
+    assert Path(first).read_text() == rig.config.read_text() and Path(second).read_text() == other.read_text()
+
+
+def test_two_config_directories_cannot_put_different_files_at_one_relative_path_of_a_state_directory(rig: Rig) -> None:
+    other = rig.tmp / "cfg2" / "other.yaml"
+    for folder, sql in ((rig.config_dir, "SELECT 1"), (other.parent, "SELECT 2")):
+        (folder / "sql").mkdir(parents=True)
+        (folder / "sql" / "orders.sql").write_text(sql)
+    with_query_file(rig)
+    other.write_text(rig.config.read_text())
+    rig.run(rig.operator(RivetRunOperator, export="orders"))
+    exc, ti = rig.run(rig.operator(RivetRunOperator, export="orders", config=str(other)))
+    assert isinstance(exc, AirflowFailException) and len(rig.calls()) == 1
+    assert ti.store[("task", "return_value")]["preflight_refusal"] == "RIVET_AIRFLOW_QUERY_FILE"
+    assert str(rig.config_dir.resolve()) in str(exc) and "separate state directories" in str(exc)
+    assert (rig.state_dir / "sql" / "orders.sql").read_text() == "SELECT 1"
+    sibling = rig.config_dir / "second.yaml"
+    sibling.write_text(rig.config.read_text())
+    payload, _ = rig.run(rig.operator(RivetRunOperator, export="orders", config=str(sibling)))
+    assert payload["decision"] == "success", "two configs of one directory share their query files"
+
+
+def test_a_state_database_left_beside_the_original_config_is_refused_until_it_is_moved(rig: Rig) -> None:
+    (rig.config_dir / ".rivet_state.db").write_bytes(b"state")
+    for _cycle in (1, 2):
+        assert refused(rig, rig.operator(RivetRunOperator, export="orders")) == "RIVET_AIRFLOW_STATE_BESIDE_CONFIG"
+    text = rig.events("rivet.refused")[-1]["text"]
+    assert str(rig.config_dir.resolve() / ".rivet_state.db") in text and str(rig.state_dir) in text and "move" in text
+    assert not (rig.state_dir / ".rivet_state.db").exists(), "a refusal writes nothing that would lift it"
+    payload, _ = rig.run(rig.operator(RivetRunOperator, export="orders", env=PG_STATE))
+    assert payload["decision"] == "success", "PostgreSQL state does not read the file"
+    (rig.config_dir / ".rivet_state.db").rename(rig.state_dir / ".rivet_state.db")
+    payload, _ = rig.run(rig.operator(RivetRunOperator, export="orders"))
+    assert payload["decision"] == "success"
+
+
+def test_a_cdc_checkpoint_left_beside_the_original_config_is_refused_until_it_is_moved(rig: Rig) -> None:
+    rig.config.write_text(rig.config.read_text().replace("    mode: cdc\n", "    mode: cdc\n    cdc:\n      checkpoint: ckpt/orders.ckpt\n"))
+    (rig.config_dir / "ckpt").mkdir()
+    (rig.config_dir / "ckpt" / "orders.ckpt").write_text("lsn")
+    for _cycle in (1, 2):
+        assert refused(rig, rig.operator(RivetCdcRunOperator, export="orders_cdc")) == "RIVET_AIRFLOW_CHECKPOINT_BESIDE_CONFIG"
+    assert str(rig.state_dir / "ckpt" / "orders.ckpt") in rig.events("rivet.refused")[-1]["text"]
+    assert not (rig.state_dir / "ckpt").exists()
+    batch, _ = rig.run(rig.operator(RivetRunOperator, export="orders"))
+    assert batch["decision"] == "success", "an export that is not the stream is not held by its checkpoint"
+    (rig.state_dir / "ckpt").mkdir()
+    (rig.config_dir / "ckpt" / "orders.ckpt").rename(rig.state_dir / "ckpt" / "orders.ckpt")
+    payload, _ = rig.run(rig.operator(RivetCdcRunOperator, export="orders_cdc"))
+    assert payload["decision"] == "success"
+    assert "checkpoint: ckpt/orders.ckpt" in rig.copy().read_text(), "the path stays relative: it resolves in the state directory"
+
+
+def test_a_relative_destination_path_is_left_as_written_and_resolves_against_the_working_directory(rig: Rig) -> None:
+    rig.config.write_text(rig.config.read_text().replace("    mode: full\n", "    mode: full\n    destination: {type: local, path: ./out/}\n", 1))
+    rig.run(rig.operator(RivetRunOperator, export="orders"))
+    assert "path: ./out/" in rig.copy().read_text() and rig.calls()[-1]["cwd"] == str(rig.config_dir.resolve())
+    rig.run(rig.operator(RivetRunOperator, export="orders", cwd=str(rig.tmp.resolve())))
+    assert rig.calls()[-1]["cwd"] == str(rig.tmp.resolve())
 
 
 def test_the_config_reader_keeps_yaml_1_1_words_as_strings() -> None:

@@ -1,7 +1,9 @@
-"""Test harness: a throwaway AIRFLOW_HOME, a fake `rivet` on PATH and a task instance that is a plain object."""
+"""Test harness: a throwaway AIRFLOW_HOME, a fake `rivet`, a plain task instance, and real DAG runs through `dag.test()`."""
 
 from __future__ import annotations
 
+import hashlib
+import importlib.util
 import json
 import os
 import sys
@@ -66,10 +68,25 @@ class FakeTI:
         self.store[(self.task_id, key)] = value
 
     def xcom_pull(self, task_ids: Any = None, key: str = "return_value") -> Any:
-        """One value for a task id, a list for several."""
+        """One value for a task id; for several, a sequence with Airflow 2.10's truth-value trap."""
         if isinstance(task_ids, str):
             return self.store.get((task_ids, key))
-        return [self.store[(t, key)] for t in task_ids if (t, key) in self.store]
+        return LazyPull([self.store[(t, key)] for t in task_ids if (t, key) in self.store])
+
+
+class LazyPull:
+    """`LazyXComSelectSequence` as Airflow 2.10.5 behaves: iterable, and `bool()` of an empty one raises."""
+
+    def __init__(self, values: list) -> None:
+        self.values = values
+
+    def __iter__(self) -> Any:
+        return iter(self.values)
+
+    def __bool__(self) -> bool:
+        if not self.values:
+            raise TypeError("__bool__ should return bool, returned NoneType")
+        return True
 
 
 class Rig:
@@ -97,6 +114,13 @@ class Rig:
         """Set what the fake binary does next."""
         self.spec = {"record_env": ["RIVET_PG_URL", "RIVET_STATE_URL"], "leak_env": ["RIVET_PG_URL"], **spec}
         (self.bin / "scenario.json").write_text(json.dumps(self.spec))
+
+    def copy(self, export: str | None = None, config: Path | None = None) -> Path:
+        """Where the package materialises a config in the state directory: named after the source path's hash."""
+        source = (config or self.config).resolve()
+        digest = hashlib.sha256(str(source).encode()).hexdigest()[:8]
+        suffix = f"--{export}" if export else ""
+        return self.state_dir / f"{source.stem}.{digest}{suffix}{source.suffix}"
 
     def calls(self) -> list[dict]:
         """Every non-probe call the fake binary received."""
@@ -137,7 +161,74 @@ class Rig:
         return [r for r in self.records if r.get("event") == name]
 
 
+@pytest.fixture(autouse=True)
+def own_temp_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Each test gets its own `tempfile.gettempdir()`, so a stateless worker's files stay inside the test."""
+    path = tmp_path / "tmp"
+    path.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(path))
+    return path
+
+
 @pytest.fixture
 def rig(tmp_path: Path) -> Rig:
     """A fresh rig per test."""
     return Rig(tmp_path)
+
+
+@pytest.fixture(scope="session")
+def airflow_db() -> str:
+    """A migrated SQLite metadata database in the throwaway AIRFLOW_HOME; the path of that home."""
+    from airflow.utils import db
+
+    db.resetdb()
+    return os.environ["AIRFLOW_HOME"]
+
+
+class DagRig(Rig):
+    """A rig whose DAGs are written to the dags folder and run by `dag.test()` with real task instances."""
+
+    def __init__(self, tmp: Path, home: str) -> None:
+        super().__init__(tmp)
+        self.home = Path(home)
+        (self.home / "dags").mkdir(exist_ok=True)
+
+    def run_dag(self, builder: str, dag_id: str, env: dict | None = None, **kwargs: Any) -> tuple[str, dict[str, str]]:
+        """Build a DAG with one of the package's builders and run it; (run state, state by task id)."""
+        kwargs.setdefault("config", str(self.config))
+        kwargs.setdefault("state_dir", str(self.state_dir))
+        kwargs.setdefault("default_args", {"retries": 0})
+        op = {"rivet_bin": str(self.bin / "rivet"), "deployment": "local"}
+        kwargs["operator_kwargs"] = {**op, **kwargs.get("operator_kwargs", {})}
+        env = env or {"RIVET_PG_URL": SECRET}
+        path = self.home / "dags" / f"{dag_id}.py"
+        path.write_text(
+            "import os\n"
+            f"from airflow_provider_rivet.dags import {builder}\n"
+            f"kwargs = {kwargs!r}\n"
+            f"kwargs['operator_kwargs']['env'] = {{name: os.environ[name] for name in {sorted(env)!r}}}\n"
+            f"dag = {builder}({dag_id!r}, **kwargs)\n"
+        )
+        before = {name: os.environ.get(name) for name in env}
+        os.environ.update(env)
+        try:
+            spec = importlib.util.spec_from_file_location(dag_id, path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            run = module.dag.test()
+            states = {ti.task_id: str(getattr(ti.state, "value", ti.state)) for ti in run.get_task_instances()}
+            return str(getattr(run.state, "value", run.state)), states
+        finally:
+            path.unlink()
+            for name, value in before.items():
+                os.environ.pop(name, None) if value is None else os.environ.__setitem__(name, value)
+
+    def ran(self) -> list[tuple[str, str]]:
+        """(subcommand, export) of every call the fake binary received."""
+        return [(c["argv"][0], c["export"]) for c in self.calls()]
+
+
+@pytest.fixture
+def dag_rig(tmp_path: Path, airflow_db: str) -> DagRig:
+    """A fresh rig per test over the session's metadata database."""
+    return DagRig(tmp_path, airflow_db)

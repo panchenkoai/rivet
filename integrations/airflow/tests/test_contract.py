@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import re
 
 import pytest
 from conftest import FIXTURES, fixture
@@ -96,7 +97,11 @@ def test_the_exception_text_has_code_class_action_and_unit_and_no_message() -> N
     assert error.message not in text
 
 
-def test_every_degradation_is_documented_in_the_readme() -> None:
-    readme = (FIXTURES.parents[2] / "integrations" / "airflow" / "README.md").read_text()
+def test_every_degradation_is_documented_in_the_readme_and_every_recorded_key_is_a_degradation() -> None:
+    package = FIXTURES.parents[2] / "integrations" / "airflow"
+    readme = (package / "README.md").read_text()
     for key in DEGRADATIONS:
-        assert f"`{key}`" in readme, f"README has no row for degradation `{key}`"
+        assert f"| `{key}` |" in readme, f"README has no row for degradation `{key}`"
+    source = "".join(p.read_text() for p in (package / "airflow_provider_rivet").glob("*.py"))
+    recorded = set(re.findall(r'degraded\.add\("([a-z_]+)"\)', source)) | set(re.findall(r'\*payload\["degraded"\], "([a-z_]+)"', source))
+    assert len(recorded) >= 14 and recorded == set(DEGRADATIONS), recorded ^ set(DEGRADATIONS)
