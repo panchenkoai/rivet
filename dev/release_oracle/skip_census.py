@@ -39,6 +39,7 @@ FIRST_RUN = {"SKIP": "the stream's first run delivered nothing", "PARTIAL": "the
 #: `cdc.backfill` SKIPs, `settle:` PARTIALs). The gate runs every live module (CI skips the warehouse, Mongo and
 #: exclusive ones), so only the first-run counter transfers to it. Measured on #433 (CI run 37108478817):
 #: first-run 61, all MySQL checkpoints a test wrote itself; with Rig::pin_binlog_here recording their anchor: 0.
+#: `deferred`: the capped `rivet cdc` runs a lane runs (each owes its remainder to the stream's next run, graded there).
 VERDICT_CEILINGS: dict[str, dict[str, tuple[int, int]]] = {
     "ci": {
         "first-run": (0,  # ratchet-pin: rig-oracle-first-run
@@ -47,6 +48,8 @@ VERDICT_CEILINGS: dict[str, dict[str, tuple[int, int]]] = {
                  3),
         "partial": (39,  # ratchet-pin: rig-oracle-partial
                     3),
+        "deferred": (6,  # ratchet-pin: rig-oracle-deferred
+                     0),
     },
     "gate": {"first-run": (0,  # ratchet-pin: rig-oracle-first-run-gate
                            0)},
@@ -60,7 +63,29 @@ def verdict_counts(text: str) -> Counter:
     first = {v: sum(1 for l in lines if l.startswith(f"RIVET-ORACLE-{v} ") and why in l) for v, why in FIRST_RUN.items()}
     n["first-run"] = sum(first.values())
     n["skip"], n["partial"] = n["SKIP"] - first["SKIP"], n["PARTIAL"] - first["PARTIAL"]
+    n["deferred"] = n["DEFERRED"]
     return n
+
+
+#: The verdicts that grade a deferred run's remainder: the stream's next run compared with the source.
+GRADED = ("PASS", "FAIL", "XFAIL", "PARTIAL")
+
+
+def unpaid_deferrals(text: str) -> list[str]:
+    """Every DEFERRED verdict no later graded verdict of the same test and export follows: a capped run whose remainder nothing graded."""
+    out, owed = [], {}
+    for l in text.splitlines():
+        m = re.match(r"RIVET-ORACLE-([A-Z]+) (\S+) \[(.*?)\] — ", l)
+        if not m:
+            continue
+        verdict, who = m.group(1), (m.group(2), m.group(3))
+        if verdict == "DEFERRED":
+            owed[who] = l
+        elif verdict in GRADED:
+            owed.pop(who, None)
+    for (test, export), l in owed.items():
+        out.append(f"{test} [{export}]: a capped run deferred its remainder and no later run of the stream was graded")
+    return out
 
 
 def verdict_reasons(text: str) -> Counter:
@@ -81,7 +106,7 @@ def verdict_errors(text: str, lane: str) -> list[str]:
     n = verdict_counts(text)
     if not n["PASS"]:
         return ["the rig oracle logged no PASS verdict"]
-    errs = []
+    errs = unpaid_deferrals(text)
     for what, (ceiling, noise) in VERDICT_CEILINGS[lane].items():
         if n[what] > ceiling + noise:
             errs.append(f"{n[what]} {what} verdicts, ceiling {ceiling}: a run the oracle used to grade is no longer graded")
@@ -94,7 +119,7 @@ def verdict_errors(text: str, lane: str) -> list[str]:
 def verdict_report(text: str, lane: str) -> list[str]:
     """The counts a lane's census prints: per class, per reason, and each banded counter against its ceiling."""
     n = verdict_counts(text)
-    out = [f"{v} {n[v]}" for v in ("PASS", "PARTIAL", "XFAIL", "SKIP", "OFF", "FAIL")]
+    out = [f"{v} {n[v]}" for v in ("PASS", "PARTIAL", "DEFERRED", "XFAIL", "SKIP", "OFF", "FAIL")]
     out += ["per reason (numbers folded to N):"] + [f"{c:7d} {r}" for r, c in verdict_reasons(text).most_common()]
     out += [f"{what}: {n[what]} (ceiling {c} +-{z})" for what, (c, z) in VERDICT_CEILINGS[lane].items()]
     return out
@@ -151,6 +176,9 @@ def at_ceiling(lane: str) -> str:
     lines += [f"RIVET-ORACLE-PARTIAL live_x::f{i} [e] — grade 3 ms: {FIRST_RUN['PARTIAL']} (no source image)" for i in range(c["first-run"])]
     lines += [f"RIVET-ORACLE-SKIP live_x::s{i} [e] — stdout destination" for i in range(c.get("skip", 0))]
     lines += [f"RIVET-ORACLE-PARTIAL live_x::p{i} [e] — settle: rows past cursor_high" for i in range(c.get("partial", 0))]
+    for i in range(c.get("deferred", 0)):
+        lines += [f"RIVET-ORACLE-DEFERRED live_x::d{i} [t] — a bounded run reached --max-events 2",
+                  f"RIVET-ORACLE-PASS live_x::d{i} [t] — grade 3 ms {{}}"]
     return "\n".join(lines) + "\n"
 
 
@@ -168,6 +196,12 @@ def _verdict_self_test() -> None:
     ci = {k: v[0] for k, v in VERDICT_CEILINGS["ci"].items()}
     assert (n["first-run"], n["skip"], n["partial"]) == (ci["first-run"] + 1, ci["skip"], ci["partial"]), n
     assert verdict_reasons("RIVET-ORACLE-OFF t [e] — grade-load 41 ms: why 7 {x: 1}") == Counter({"OFF why N": 1})
+    unpaid = at_ceiling("ci").replace("RIVET-ORACLE-PASS live_x::d0 [t]", "RIVET-ORACLE-SKIP live_x::d0 [t]")
+    assert unpaid_deferrals(unpaid) == ["live_x::d0 [t]: a capped run deferred its remainder and no later run of the stream was graded"], \
+        unpaid_deferrals(unpaid)
+    assert any("deferred its remainder" in e for e in verdict_errors(unpaid, "ci")), "an unpaid deferral fails the lane"
+    assert unpaid_deferrals("RIVET-ORACLE-DEFERRED a [t] — x\nRIVET-ORACLE-PASS a [u] — y\n"), "another export's verdict pays nothing"
+    assert not unpaid_deferrals("RIVET-ORACLE-DEFERRED a [t] — x\nRIVET-ORACLE-PARTIAL a [t] — Mongo: only `_id`\n")
     from .core import Ledger, Status
 
     log = Path(tempfile.mkdtemp(prefix="rivet-verdict-census-")) / "oracle.log"

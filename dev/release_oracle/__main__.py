@@ -860,7 +860,7 @@ def preflight(led: Ledger, *, bless_gifs: bool = False) -> None:
         src_url=os.environ.get(
             "RIVET_CONC_SRC_URL", "postgresql://rivet:rivet@localhost:5432/rivet"
         ),
-        bucket=os.environ.get("BQ_ORACLE_BUCKET") or "rivet_data_test",
+        bucket=os.environ.get("BQ_ORACLE_BUCKET", ""),
     )
 
 
@@ -1295,6 +1295,22 @@ def _hold_gate_lock():
     return fh
 
 
+def _warehouse_env() -> str:
+    """Fill the BigQuery/GCS env every leg and live test reads from dev/stand/registry.yaml where the shell left it empty, when a Google credential is at hand; the line saying which."""
+    from ..pytools.registry import bq_tmp, warehouse
+
+    if not run(["gcloud", "auth", "print-access-token"]).ok:
+        return ("BigQuery/GCS legs SKIP: no Google credential (`gcloud auth print-access-token` failed: "
+                "`gcloud auth login` and `gcloud auth application-default login`)")
+    project, bucket, location = warehouse()
+    for var, value in (("BQ_ORACLE_PROJECT", project), ("BQ_ORACLE_BUCKET", bucket), ("BQ_ORACLE_DATASET", bq_tmp("gate"))):
+        os.environ[var] = os.environ.get(var) or value
+    for var, value in (("BIGQUERY_TEST_PROJECT", os.environ["BQ_ORACLE_PROJECT"]),
+                       ("RIVET_TEST_GCS_BUCKET", os.environ["BQ_ORACLE_BUCKET"]), ("BIGQUERY_TEST_LOCATION", location)):
+        os.environ[var] = os.environ.get(var) or value
+    return f"warehouse: BigQuery {os.environ['BQ_ORACLE_PROJECT']} ({location}), GCS bucket {os.environ['BQ_ORACLE_BUCKET']}"
+
+
 def main(argv: list[str] | None = None) -> int:
     if (argv if argv is not None else sys.argv[1:]) == ["--self-test"]:
         return _self_test()
@@ -1330,6 +1346,7 @@ def main(argv: list[str] | None = None) -> int:
               file=sys.stderr)
         return 2
 
+    print(f"  {_warehouse_env()}")
     os.environ.setdefault("BLESS_VERDICTS", "1" if ns.bless_local else "0")
     os.environ.setdefault("BLESS_DUCKDB", "1" if ns.bless_local else "0")
     os.environ.setdefault("BLESS_CDC", "1" if ns.bless_cdc else "0")

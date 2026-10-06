@@ -130,8 +130,10 @@ DATE_COLUMN = {"users": "created_at", "orders": "ordered_at", "content_items": "
 # level of the chain.
 #
 # `applies` keeps a scenario off a table it cannot run rather than letting it
-# fail as if the product were broken: date windows need a timestamp column,
-# and Mongo has neither range nor keyset chunking.
+# fail as if the product were broken: date windows need a timestamp column, and
+# Mongo refuses `mode: chunked` (validate_non_sql_source_modes, src/config/mod.rs).
+# Mongo's keyset is `source.mongo.page_size`: sequential with `resume` (a
+# continued-key export) and the `_id`-range reader with `parallel`.
 SCENARIOS: dict[str, dict] = {
     "full":     {"block": "    mode: full", "applies": lambda t, e: True},
     "keyset":   {"block": "    mode: chunked\n    chunk_by_key: id\n    chunk_size: 20000",
@@ -147,6 +149,10 @@ SCENARIOS: dict[str, dict] = {
     # column and suggested the right one.
     "datewin":  {"block": "    mode: chunked\n    chunk_column: {date_col}\n    chunk_by_days: 30",
                  "applies": lambda t, e: e != "mongo" and t in DATE_COLUMN},
+    "mongo_resume":   {"block": "    mode: full", "source": "  mongo: { page_size: 20000, resume: true }\n",
+                       "applies": lambda t, e: e == "mongo"},
+    "mongo_parallel": {"block": "    mode: full\n    parallel: 4", "source": "  mongo: { page_size: 20000 }\n",
+                       "applies": lambda t, e: e == "mongo"},
 }
 
 
@@ -443,6 +449,7 @@ def sc_blessed_path(
         f"source:\n"
         f"  type: {engine}\n"
         f"  url_env: ORACLE_URL{tls}\n"
+        f"{SCENARIOS[scenario].get('source', '')}"
         f"exports:\n"
         f"  - name: blessed\n"
         f"    table: {table}\n"
@@ -673,8 +680,7 @@ def sc_bq_cycle(led: Ledger, engine: str, tag: str, url: str, table: str) -> Non
     state stops measuring the run in front of it — the same reason the prefix is
     cleared before the export rather than after.
     """
-    proj = os.environ.get("BQ_ORACLE_PROJECT") or run(
-        ["gcloud", "config", "get-value", "project"]).stdout.strip()
+    proj = os.environ.get("BQ_ORACLE_PROJECT", "")
     # PER SOURCE, which is what the gate's README already promises this variable
     # does ("one dataset PER SOURCE is derived from this") and what this line did
     # not do. `rivet load` derives the warehouse table from `table:`, so every
@@ -691,7 +697,7 @@ def sc_bq_cycle(led: Ledger, engine: str, tag: str, url: str, table: str) -> Non
     # work dir and bucket prefix below already carried the tag; this did not.
     dset = ((os.environ.get("BQ_ORACLE_DATASET") or registry.bq_tmp("gate"))
             + "_" + scenarios.Scope(engine, tag).key)
-    bucket = os.environ.get("BQ_ORACLE_BUCKET", "rivet_data_test")
+    bucket = os.environ.get("BQ_ORACLE_BUCKET", "")
     if not have("bq") or not proj:
         led.skipped(engine, tag, "blessed:bq", "bigquery",
                     f"{engine} {tag} · bigquery — no bq CLI or project", "no creds")

@@ -47,7 +47,9 @@ idempotent by construction:
   retry's extra files or a half-finished run can't double-load.
 - **`mode: full` OVERWRITEs.** Re-running a full load re-materialises the latest
   snapshot; the table lands identical, not doubled (live-verified: two loads of
-  a 3-row table → 3 rows, not 6).
+  a 3-row table → 3 rows, not 6). The exception is a Mongo `source.mongo.resume`
+  export (and a chunked `keyset_incremental` one): each run holds only the keys
+  past the last one, so it appends like `mode: incremental`.
 - **`mode: incremental` / `mode: cdc` append + dedup.** For mutable sources the
   load appends to `<table>__changes` and exposes a current-state view
   (latest-per-PK, deletes flagged) — the built-in equivalent of the manual

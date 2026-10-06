@@ -114,6 +114,8 @@ mod live_cli_flags;
 mod live_clickhouse_load;
 #[path = "live/live_content_load.rs"]
 mod live_content_load;
+#[path = "live/live_continued_key_load.rs"]
+mod live_continued_key_load;
 #[path = "live/live_crash_recovery.rs"]
 mod live_crash_recovery;
 #[path = "live/live_crash_soak.rs"]

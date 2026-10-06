@@ -1,0 +1,16 @@
+diff --git a/src/source/cdc/mod.rs b/src/source/cdc/mod.rs
+index 47a75268..04797aa1 100644
+--- a/src/source/cdc/mod.rs
++++ b/src/source/cdc/mod.rs
+@@ -596,6 +596,11 @@ pub(crate) fn run(
+         // same place. `--checkpoint ck --max-events 100` against a bulk load made no
+         // progress, ever. Overshooting to the boundary is the price of progressing.
+         if committed && max_events.is_some_and(|m| emitted >= m) {
++            while let Some(Ok(rest)) = stream.next_change() {
++                if rest.committed && let Some(p) = &checkpoint {
++                    stream.checkpoint_of(&rest.position).save(p)?;
++                }
++            }
+             break;
+         }
+     }

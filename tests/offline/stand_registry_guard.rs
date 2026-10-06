@@ -58,9 +58,6 @@ fn no_bigquery_dataset_name_is_spelled_outside_the_registry() {
         r#"["'=]\s*(rivet_(e2e|matrix|blessed[a-z_]*|same_[a-z_]+|partner_[a-z_]+|tmp_[a-z_]*))\b"#,
     )
     .unwrap();
-    let tmp = registry::stand()["bigquery"]["tmp_prefix"]
-        .as_str()
-        .unwrap();
     let mut offenders = Vec::new();
     for f in all
         .into_iter()
@@ -69,16 +66,12 @@ fn no_bigquery_dataset_name_is_spelled_outside_the_registry() {
         let text = std::fs::read_to_string(&f).unwrap_or_default();
         for (n, line) in text.lines().enumerate() {
             for c in spelled.captures_iter(line) {
-                let name = &c[1];
-                // The Makefile may default the gate dataset, but only to a disposable name.
-                let allowed = f.ends_with("Makefile") && name.starts_with(tmp);
-                if !allowed {
-                    offenders.push(format!(
-                        "{}:{}: {name}",
-                        f.strip_prefix(root).unwrap().display(),
-                        n + 1
-                    ));
-                }
+                offenders.push(format!(
+                    "{}:{}: {}",
+                    f.strip_prefix(root).unwrap().display(),
+                    n + 1,
+                    &c[1]
+                ));
             }
         }
     }
@@ -86,6 +79,44 @@ fn no_bigquery_dataset_name_is_spelled_outside_the_registry() {
         offenders.is_empty(),
         "BigQuery dataset names belong in dev/stand/registry.yaml (read them via tests/common/registry.rs or \
          dev/pytools/registry.py):\n{}",
+        offenders.join("\n")
+    );
+}
+
+#[test]
+fn no_warehouse_project_or_bucket_is_spelled_outside_the_registry() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut all = Vec::new();
+    for dir in ["tests", "dev", ".github"] {
+        files(&root.join(dir), &[".rs", ".py", ".sh", ".yml"], &mut all);
+    }
+    all.push(root.join("Makefile"));
+    let names = [
+        registry::stand()["bigquery"]["project"].as_str().unwrap(),
+        registry::stand()["gcs"]["bucket"].as_str().unwrap(),
+    ];
+    let offenders: Vec<String> = all
+        .iter()
+        .filter(|f| !f.ends_with("dev/pytools/registry.py"))
+        .flat_map(|f| {
+            let text = std::fs::read_to_string(f).unwrap_or_default();
+            text.lines()
+                .enumerate()
+                .filter(|(_, l)| {
+                    names.iter().any(|n| {
+                        ['"', '\'', '=']
+                            .iter()
+                            .any(|q| l.contains(&format!("{q}{n}")))
+                    })
+                })
+                .map(|(n, _)| format!("{}:{}", f.strip_prefix(root).unwrap().display(), n + 1))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "the warehouse project and bucket belong in dev/stand/registry.yaml (read them via \
+         tests/common/registry.rs `warehouse` or dev/pytools/registry.py `warehouse`):\n{}",
         offenders.join("\n")
     );
 }
