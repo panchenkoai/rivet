@@ -262,6 +262,30 @@ scenarios:
     snowflake:  { test: a_table_rivet_did_not_load_is_not_taken_over }
     clickhouse: { test: a_table_rivet_did_not_load_is_not_taken_over }
 
+  - id: append_onto_a_foreign_view_or_log_refused_every_cycle
+    what: "an incremental or CDC load onto a VIEW at `<table>`, or a `<table>__changes`, that the ledger does not know: refused on every cycle with exit 5 and `RIVET_LOAD_TARGET_NOT_RIVETS`, the object untouched; with both names freed the load lands. Snowflake and ClickHouse cells drive the shared driver over a fake speaking their dialect (no live cell)"
+    bigquery:   { test: bigquery_incremental_onto_a_view_or_a_log_it_did_not_load_is_refused_every_time }
+    snowflake:  { test: an_append_refuses_a_foreign_view_or_log_on_every_cycle_and_writes_nothing }
+    clickhouse: { test: an_append_refuses_a_foreign_view_or_log_on_every_cycle_and_writes_nothing }
+
+  - id: buffer_append_beside_a_foreign_base_refused
+    what: "a base-and-buffer load whose deltas arrive without a whole-table pass does not create or append `<table>__changes` beside a base (or onto a buffer) the ledger does not know"
+    bigquery:   { test: a_buffer_append_onto_a_base_or_buffer_the_ledger_has_no_record_of_is_refused }
+    snowflake:  { na: "`load.layout: base_buffer` is BigQuery-only" }
+    clickhouse: { na: "`load.layout: base_buffer` is BigQuery-only" }
+
+  - id: stop_before_the_write_is_journaled_refused
+    what: "every stop between the ledger read and the first warehouse write (the stale-buffer stop, a staged part that vanished) is journaled `refused`, on every cycle, so it never makes a foreign base rivet's own"
+    bigquery:   { test: a_stale_buffer_refusal_does_not_make_a_foreign_base_rivets_own }
+    snowflake:  { test: a_stop_between_the_ledger_read_and_the_write_is_journaled_as_a_refusal }
+    clickhouse: { test: a_stop_between_the_ledger_read_and_the_write_is_journaled_as_a_refusal }
+
+  - id: ownership_asked_before_the_writing_marker
+    what: "the ownership question precedes the `writing` ledger row: a load killed at the ownership probe, or one whose closing ledger write failed after the refusal, leaves no row that claims the table, and the next load refuses again"
+    bigquery:   { test: a_load_killed_while_asking_about_a_foreign_table_leaves_it_foreign }
+    snowflake:  { test: a_load_killed_while_asking_about_a_foreign_table_leaves_it_foreign }
+    clickhouse: { test: a_failed_closing_write_after_a_foreign_refusal_leaves_the_table_foreign }
+
   - id: rebuild_carries_the_logs_properties
     what: "`--rebuild-changelog` carries description, labels, friendly name, table expiry and the KMS key onto the copy, and refuses a log with column policy tags or row access policies (a copy carries neither)"
     bigquery:   { test: a_rebuild_carries_the_logs_properties_and_refuses_the_policies_it_cannot }

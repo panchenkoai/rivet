@@ -1112,22 +1112,30 @@ fn execute_load<R>(
     // The budget measures what lands in the PARTITIONED target only: a
     // disposable buffer takes no partition, so its files are not its business.
     let budgeted = budgeted_uris(job.plan.layout, &inputs.runs, &inputs.uris);
-    let (rows, report) = match load::before_write(partition_budget_ok(store, job.plan, &budgeted))
-        .and_then(|()| {
-            // The crash marker, written between the LAST pre-write check and the
-            // write itself. Without it a load killed after the warehouse write and
-            // before its closing row left NO row at all, so `has_load_attempt`
-            // answered false and the table rivet had just created read as FOREIGN —
-            // refused for ever, on a remedy ("drop or rename it") that tells the
-            // operator to destroy their own data. It bites the FIRST-ever load into
-            // a table, since after that some row always exists.
-            //
-            // It is replaced, never accumulated: the closing row shares this
-            // `load_id`, so the ledger still holds exactly one audit row per load and
-            // a `writing` row can only survive a process that died.
-            load::before_write(ctx.record_writing())?;
-            run(&**loader, store, &inputs, &mut legs)
-        }) {
+    // Asked before the `writing` marker below, which the next load reads as rivet's claim.
+    let appends = job.mode != load::plan::LoadMode::Full;
+    let (rows, report) = match load::before_write(load::ensure_target_own(
+        &**loader,
+        &job.plan.table,
+        appends,
+        inputs.ownership,
+    ))
+    .and_then(|()| load::before_write(partition_budget_ok(store, job.plan, &budgeted)))
+    .and_then(|()| {
+        // The crash marker, written between the LAST pre-write check and the
+        // write itself. Without it a load killed after the warehouse write and
+        // before its closing row left NO row at all, so `has_load_attempt`
+        // answered false and the table rivet had just created read as FOREIGN —
+        // refused for ever, on a remedy ("drop or rename it") that tells the
+        // operator to destroy their own data. It bites the FIRST-ever load into
+        // a table, since after that some row always exists.
+        //
+        // It is replaced, never accumulated: the closing row shares this
+        // `load_id`, so the ledger still holds exactly one audit row per load and
+        // a `writing` row can only survive a process that died.
+        load::before_write(ctx.record_writing())?;
+        run(&**loader, store, &inputs, &mut legs)
+    }) {
         Ok(v) => v,
         Err(e) => {
             let remaining = remaining_run_ids(&inputs.source_run_ids, &legs.consumed);
@@ -1176,7 +1184,8 @@ fn load_one_cdc_base(
             // Rows this cycle landed, per leg then the buffer; summed for the ledger.
             let mut landed: Vec<u64> = Vec::new();
             let mut report: Option<load::CdcLoadReport> = None;
-            let (baseline, superseded) = load::reconcile::latest_baseline_generation(baseline)?;
+            let (baseline, superseded) =
+                load::before_write(load::reconcile::latest_baseline_generation(baseline))?;
             for id in &superseded {
                 eprintln!(
                     "  note: baseline run {id} is superseded by a newer baseline — recorded as \
@@ -1184,14 +1193,17 @@ fn load_one_cdc_base(
                 );
             }
             if let [_, ..] = baseline.as_slice() {
-                let uris = load::reconcile::select_load_uris(store, &plan.gcs_prefix, &baseline)?;
+                let uris = load::before_write(load::reconcile::select_load_uris(
+                    store,
+                    &plan.gcs_prefix,
+                    &baseline,
+                ))?;
                 let manifests: Vec<_> = baseline.iter().map(|(_, m)| m.clone()).collect();
-                let integrity = load::reconcile::reconcile(&manifests, allow_source_drift)?;
+                let integrity =
+                    load::before_write(load::reconcile::reconcile(&manifests, allow_source_drift))?;
                 // Reached only through `plan.layout.compacts()`, which is the `true`:
                 // the one predicate that owns "does the base carry the flag" is asked.
-                if let Some(why) = load::stale_buffer_refusal(loader, &plan.table, true)? {
-                    anyhow::bail!(why);
-                }
+                load::refuse_stale_buffer(loader, &plan.table, true)?;
                 let mut specs = plan.specs.clone();
                 if load::plan::base_carries_delete_flag(true, plan.deleted_flag) {
                     specs.push(load::cdc::flag_spec(loader.warehouse()));
@@ -1222,13 +1234,19 @@ fn load_one_cdc_base(
             let stream_uris = if stream.is_empty() {
                 Vec::new()
             } else {
-                load::reconcile::select_load_uris(store, &plan.gcs_prefix, &stream)?
+                load::before_write(load::reconcile::select_load_uris(
+                    store,
+                    &plan.gcs_prefix,
+                    &stream,
+                ))?
             };
             // An idle drain writes a Success manifest with no parts: nothing to
             // buffer, and the run is still recorded consumed by the closing record.
             if let Some(uris) = buffer_uris(stream_uris) {
                 let manifests: Vec<_> = stream.iter().map(|(_, m)| m.clone()).collect();
-                let integrity = load::reconcile::reconcile(&manifests, allow_source_drift)?;
+                let integrity =
+                    load::before_write(load::reconcile::reconcile(&manifests, allow_source_drift))?;
+                let ownership = ownership_after_leg(!landed.is_empty(), inputs.ownership);
                 let (cleanup, _prefix_lease) = cleanup_target_leased(
                     plan,
                     store,
@@ -1249,6 +1267,7 @@ fn load_one_cdc_base(
                     pk,
                     Some(integrity.file_rows),
                     cleanup.as_ref().map(|(s, k)| (*s, k.as_slice())),
+                    ownership,
                     "CDC",
                 )?;
                 landed.push(r.rows_appended);
@@ -1265,6 +1284,15 @@ fn load_one_cdc_base(
         },
         |inputs, report| eprintln!("{}", cdc_done_line(&inputs.integrity, report)),
     )
+}
+
+/// Whose the append's names are once this load's own whole-table leg has landed the table.
+fn ownership_after_leg(leg_landed: bool, before: load::Ownership) -> load::Ownership {
+    if leg_landed {
+        load::Ownership::Own
+    } else {
+        before
+    }
 }
 
 /// The one-line `CDC LOAD OK` verdict: what landed where and what the operator
@@ -1873,6 +1901,26 @@ fn load_one_incremental(
     {
         log::warn!("{warning}");
     }
+    load_incremental_job(
+        job,
+        pk,
+        &cursor,
+        allow_source_drift,
+        rebuild_changelog,
+        state,
+    )
+}
+
+/// The incremental load of one job: a whole-table run lands (or joins the log), deltas append.
+fn load_incremental_job(
+    job: LoadJob<'_>,
+    pk: &[String],
+    cursor: &str,
+    allow_source_drift: bool,
+    rebuild_changelog: bool,
+    state: Option<&StateStore>,
+) -> Result<Option<IncrementalReport>> {
+    let plan = job.plan;
     execute_load(
         job,
         |inputs| {
@@ -1924,11 +1972,11 @@ fn load_one_incremental(
             let landed_table = split.first_pass.is_some();
             // Idle deltas (runs with no parts) leave nothing to append; the closing record covers them.
             let delta_uris = match split.has_deltas() {
-                true => buffer_uris(load::reconcile::select_load_uris(
+                true => buffer_uris(load::before_write(load::reconcile::select_load_uris(
                     store,
                     &plan.gcs_prefix,
                     &split.deltas,
-                )?),
+                ))?),
                 false => None,
             };
             let has_deltas = delta_uris.is_some();
@@ -1936,13 +1984,15 @@ fn load_one_incremental(
                 // The runs this leg consumes: the whole-table run and those it supersedes.
                 let mut landed_ids = split.superseded.clone();
                 landed_ids.push(first.1.run_id.clone());
-                let uris = load::reconcile::select_load_uris(
+                let uris = load::before_write(load::reconcile::select_load_uris(
                     store,
                     &plan.gcs_prefix,
                     std::slice::from_ref(&first),
-                )?;
-                let integrity =
-                    load::reconcile::reconcile(std::slice::from_ref(&first.1), allow_source_drift)?;
+                ))?;
+                let integrity = load::before_write(load::reconcile::reconcile(
+                    std::slice::from_ref(&first.1),
+                    allow_source_drift,
+                ))?;
                 eprintln!(
                     "  incremental load {}: run {} holds the whole table (no cursor to resume \
                      from) — landing it as `{}`",
@@ -1969,10 +2019,7 @@ fn load_one_incremental(
                 // The base carries the delete flag as DATA, like a CDC baseline:
                 // the buffer's tombstones flip it, and the column must exist from
                 // the first pass or the MERGE has nothing to set.
-                if let Some(why) = load::stale_buffer_refusal(loader, &plan.table, base_and_buffer)?
-                {
-                    anyhow::bail!(why);
-                }
+                load::refuse_stale_buffer(loader, &plan.table, base_and_buffer)?;
                 let mut base_specs = plan.specs.clone();
                 if load::plan::base_carries_delete_flag(base_and_buffer, plan.deleted_flag) {
                     base_specs.push(load::cdc::flag_spec(loader.warehouse()));
@@ -1992,12 +2039,9 @@ fn load_one_incremental(
             }
             if let Some(uris) = delta_uris {
                 let manifests: Vec<_> = split.deltas.iter().map(|(_, m)| m.clone()).collect();
-                let integrity = load::reconcile::reconcile(&manifests, allow_source_drift)?;
-                let ownership = if landed_table {
-                    load::Ownership::Own
-                } else {
-                    inputs.ownership
-                };
+                let integrity =
+                    load::before_write(load::reconcile::reconcile(&manifests, allow_source_drift))?;
+                let ownership = ownership_after_leg(landed_table, inputs.ownership);
                 let (cleanup, _prefix_lease) = cleanup_target_leased(
                     plan,
                     store,
@@ -2019,6 +2063,7 @@ fn load_one_incremental(
                         pk,
                         Some(integrity.file_rows),
                         cleanup.as_ref().map(|(s, k)| (*s, k.as_slice())),
+                        ownership,
                         "incremental",
                     )?
                 } else {
@@ -2028,7 +2073,7 @@ fn load_one_incremental(
                         &plan.specs,
                         &uris,
                         pk,
-                        &cursor,
+                        cursor,
                         Some(integrity.file_rows),
                         cleanup.as_ref().map(|(s, k)| (*s, k.as_slice())),
                         ownership,
@@ -2039,8 +2084,9 @@ fn load_one_incremental(
                 rows += r.rows_appended;
                 report = Some(IncrementalReport::Changelog(r));
             }
-            let report = report
-                .ok_or_else(|| anyhow::anyhow!("no loadable run among the selected manifests"))?;
+            let report = report.ok_or_else(|| {
+                load::refused("no loadable run among the selected manifests".to_string())
+            })?;
             Ok((rows, report))
         },
         |_, _| {},
@@ -2636,6 +2682,727 @@ mod load_ledger_tests {
         assert!(
             reached.get(),
             "a run with a part must reach the warehouse write: {out:?}"
+        );
+    }
+
+    /// Stage one successful run with one part under the plan's `p/` prefix.
+    fn stage_run(dir: &tempfile::TempDir, run: &str, mode: &str) {
+        let part = format!("part-{run}.parquet");
+        let mut m = super::live_only_decisions::success_manifest(run, &part);
+        m.mode = mode.into();
+        super::live_only_decisions::write_at(
+            dir,
+            &format!("p/manifest-{run}.json"),
+            &serde_json::to_vec(&m).unwrap(),
+        );
+        super::live_only_decisions::write_at(dir, &format!("p/{part}"), b"x");
+    }
+
+    /// The statuses the ledger holds for `target`, newest first.
+    fn statuses(state: &StateStore, target: &str) -> Vec<String> {
+        state
+            .recent_loads(Some(target), 10)
+            .unwrap()
+            .into_iter()
+            .map(|l| l.status)
+            .collect()
+    }
+
+    /// What one load cycle left: its error, the warehouse writes, the ledger rows, the next ownership.
+    #[derive(Debug, PartialEq)]
+    struct Cycle {
+        refusal: Option<String>,
+        typed: bool,
+        exit: Option<(i32, Option<&'static str>)>,
+        writes: Vec<String>,
+        ledger: Vec<String>,
+        next: load::Ownership,
+    }
+
+    impl Cycle {
+        /// Read what a finished load left in the fake warehouse and in the ledger.
+        fn observed(
+            err: Option<anyhow::Error>,
+            writes: &std::cell::RefCell<Vec<String>>,
+            state: &StateStore,
+            target: &str,
+        ) -> Self {
+            Cycle {
+                refusal: err.as_ref().map(|e| format!("{e:#}")),
+                typed: err.as_ref().is_some_and(|e| e.is::<load::Refused>()),
+                exit: err
+                    .as_ref()
+                    .map(|e| (crate::error::classify_exit(e), crate::error::error_code(e))),
+                writes: writes.borrow().clone(),
+                ledger: statuses(state, target),
+                next: ownership_of(Some(state), target, "load"),
+            }
+        }
+
+        /// A stop that wrote nothing, is journaled `refused` only, and says `needle`.
+        fn stopped_saying(&self, needle: &str) -> bool {
+            self.typed
+                && self.writes.is_empty()
+                && self.ledger.iter().all(|s| s == "refused")
+                && self.refusal.as_deref().is_some_and(|m| m.contains(needle))
+        }
+    }
+
+    /// One base-and-buffer CDC cycle through the production closure, over `fake`.
+    fn cdc_base_cycle(
+        dir: &tempfile::TempDir,
+        state: &StateStore,
+        plan: &load::plan::LoadPlan,
+        load_id: &str,
+        fake: load::tests::FakeLoader,
+    ) -> Cycle {
+        let writes = fake.writes();
+        let mut job = cdc_job(dir, state, plan);
+        job.load_id = load_id;
+        job.loader = Box::new(fake);
+        let err = load_one_cdc_base(job, &["id".to_string()], false, Some(state)).err();
+        Cycle::observed(err, &writes, state, &format!("db.{}", plan.table))
+    }
+
+    /// One incremental cycle through the production closure, over `fake`.
+    fn incremental_cycle(
+        dir: &tempfile::TempDir,
+        state: &StateStore,
+        plan: &load::plan::LoadPlan,
+        load_id: &str,
+        fake: load::tests::FakeLoader,
+    ) -> Cycle {
+        let writes = fake.writes();
+        let mut job = cdc_job(dir, state, plan);
+        job.load_id = load_id;
+        job.mode = load::plan::LoadMode::Incremental;
+        job.loader = Box::new(fake);
+        let err =
+            load_incremental_job(job, &["id".to_string()], "id", false, false, Some(state)).err();
+        Cycle::observed(err, &writes, state, &format!("db.{}", plan.table))
+    }
+
+    /// Stage an incremental run: a whole-table pass without `cursor_low`, a delta with one.
+    fn stage_incremental_run(
+        dir: &tempfile::TempDir,
+        run: &str,
+        at: &str,
+        cursor_low: Option<&str>,
+    ) {
+        let part = format!("part-{run}.parquet");
+        let mut m = super::live_only_decisions::success_manifest(run, &part);
+        m.mode = "incremental".into();
+        m.started_at = at.into();
+        m.source.extraction = Some(
+            serde_json::from_value(serde_json::json!({
+                "strategy": "incremental",
+                "cursor_column": "id",
+                "cursor_low": cursor_low,
+                "cursor_high": "9",
+            }))
+            .unwrap(),
+        );
+        super::live_only_decisions::write_at(
+            dir,
+            &format!("p/manifest-{run}.json"),
+            &serde_json::to_vec(&m).unwrap(),
+        );
+        super::live_only_decisions::write_at(dir, &format!("p/{part}"), b"x");
+    }
+
+    /// A plan of `mode` and `layout` for `table`, with one column and nothing staged.
+    fn plan_of(
+        dir: &tempfile::TempDir,
+        table: &str,
+        mode: load::plan::LoadMode,
+        layout: load::plan::CdcLayout,
+    ) -> load::plan::LoadPlan {
+        let mut plan = cdc_plan(dir, table);
+        plan.mode = mode;
+        plan.layout = layout;
+        plan.specs = load::tests::spec_ok();
+        plan.pk = vec!["id".into()];
+        plan.cursor_column = Some("id".into());
+        plan
+    }
+
+    /// Make `target` rivet's own: an earlier load of it is on the ledger.
+    fn loaded_before(state: &StateStore, target: &str) {
+        let mut earlier = ctx(state, "L0");
+        earlier.target_fqtn = target;
+        earlier.record_success(&["r-0".to_string()], 1);
+    }
+
+    /// One cycle of the load the plan's mode asks for, wired as `load_one*` wire it, over `fake`.
+    fn cycle(
+        dir: &tempfile::TempDir,
+        state: &StateStore,
+        plan: &load::plan::LoadPlan,
+        load_id: &str,
+        fake: load::tests::FakeLoader,
+    ) -> Cycle {
+        use load::plan::LoadMode;
+        let writes = fake.writes();
+        let target = format!("db.{}", plan.table);
+        let mut job = cdc_job(dir, state, plan);
+        job.load_id = load_id;
+        job.mode = plan.mode;
+        job.loader = Box::new(fake);
+        let pk = ["id".to_string()];
+        let out = execute_load(
+            job,
+            |_| {},
+            |loader, _, inputs, _| -> Result<(u64, ())> {
+                let (table, specs, uris) = (&plan.table, &plan.specs, &inputs.uris);
+                let rows = match plan.mode {
+                    LoadMode::Full => {
+                        load::run_load(loader, table, specs, uris, None, None, inputs.ownership)?
+                            .rows_loaded
+                    }
+                    LoadMode::Incremental => {
+                        load::run_load_incremental(
+                            loader,
+                            table,
+                            specs,
+                            uris,
+                            &pk,
+                            "id",
+                            None,
+                            None,
+                            inputs.ownership,
+                            false,
+                        )?
+                        .rows_appended
+                    }
+                    LoadMode::Cdc => {
+                        load::run_load_cdc(
+                            loader,
+                            table,
+                            specs,
+                            uris,
+                            &pk,
+                            load::cdc::SourceEngine::MySql,
+                            None,
+                            None,
+                            inputs.ownership,
+                            false,
+                        )?
+                        .rows_appended
+                    }
+                };
+                Ok((rows, ()))
+            },
+            |_, _| {},
+        );
+        Cycle::observed(out.err(), &writes, state, &target)
+    }
+
+    /// A plan of `mode` for `table`, with one column and one staged run.
+    fn staged_plan(
+        dir: &tempfile::TempDir,
+        table: &str,
+        mode: load::plan::LoadMode,
+    ) -> load::plan::LoadPlan {
+        let mut plan = cdc_plan(dir, table);
+        plan.mode = mode;
+        plan.specs = load::tests::spec_ok();
+        plan.pk = vec!["id".into()];
+        plan.cursor_column = Some("id".into());
+        stage_run(dir, "r-1", mode.ledger_str());
+        plan
+    }
+
+    const DIALECTS: [load::cdc::Warehouse; 3] = [
+        load::cdc::Warehouse::BigQuery,
+        load::cdc::Warehouse::Snowflake,
+        load::cdc::Warehouse::ClickHouse,
+    ];
+
+    /// A view at `<table>` or a `<table>__changes` this ledger has no record of is refused
+    /// on every cycle and never written.
+    #[test]
+    fn an_append_refuses_a_foreign_view_or_log_on_every_cycle_and_writes_nothing() {
+        use load::ObjectKind::{Table, View};
+        use load::plan::LoadMode;
+        let mut wrong = Vec::new();
+        for (d, dialect) in DIALECTS.into_iter().enumerate() {
+            for (mode, tag) in [(LoadMode::Incremental, "inc"), (LoadMode::Cdc, "cdc")] {
+                for (case, at_table, at_log) in [
+                    ("view", Some(View), None),
+                    ("view_and_log", Some(View), Some(Table)),
+                    ("log", None, Some(Table)),
+                ] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let state = StateStore::open_in_memory().unwrap();
+                    let table = format!("foreign_{tag}_{case}_{d}");
+                    let log = format!("{table}__changes");
+                    let plan = staged_plan(&dir, &table, mode);
+                    let fake = || {
+                        let mut f = load::tests::fake_loader(1).speaking(dialect);
+                        if let Some(kind) = at_table {
+                            f = f.with_kind(&table, kind);
+                        }
+                        if let Some(kind) = at_log {
+                            f = f.with_kind(&log, kind).with_rows(&log, 7);
+                        }
+                        f
+                    };
+                    let first = cycle(&dir, &state, &plan, "L1", fake());
+                    let second = cycle(&dir, &state, &plan, "L2", fake());
+                    let refused = |c: &Cycle| {
+                        c.stopped_saying("no record of rivet loading it")
+                            && c.next == load::Ownership::Foreign
+                            && c.exit == Some((5, Some("RIVET_LOAD_TARGET_NOT_RIVETS")))
+                    };
+                    // The remedy the refusal prints: with both names free the load lands.
+                    let freed = load::tests::fake_loader(1).speaking(dialect);
+                    let third = cycle(&dir, &state, &plan, "L3", freed);
+                    let landed = [format!("append {table}"), format!("view {table}")];
+                    if !(refused(&first)
+                        && refused(&second)
+                        && first.refusal == second.refusal
+                        && third.refusal.is_none()
+                        && third.writes == landed)
+                    {
+                        wrong.push((dialect, tag, case, first.writes, second.writes));
+                    }
+                }
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "(dialect, mode, what stands at the target, cycle-1 writes, cycle-2 writes): {wrong:?}"
+        );
+    }
+
+    /// The production incremental closure refuses the same foreign names, cycle after cycle.
+    #[test]
+    fn the_incremental_load_refuses_foreign_names_under_both_layouts_on_every_cycle() {
+        use load::ObjectKind::{Table, View};
+        use load::plan::{CdcLayout, LoadMode};
+        let mut wrong = Vec::new();
+        for (layout, tag) in [
+            (CdcLayout::LogAndView, "view"),
+            (CdcLayout::BaseAndBuffer, "base"),
+        ] {
+            for (case, at_table, at_log) in [
+                (
+                    "object",
+                    Some(if tag == "view" { View } else { Table }),
+                    None,
+                ),
+                ("log", None, Some(Table)),
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let state = StateStore::open_in_memory().unwrap();
+                let table = format!("inc_foreign_{tag}_{case}");
+                let log = format!("{table}__changes");
+                let plan = plan_of(&dir, &table, LoadMode::Incremental, layout);
+                stage_incremental_run(&dir, "r-delta", "2026-08-21T00:00:00Z", Some("3"));
+                let fake = || {
+                    let mut f = load::tests::fake_loader(1);
+                    if let Some(kind) = at_table {
+                        f = f.with_kind(&table, kind);
+                    }
+                    if let Some(kind) = at_log {
+                        f = f.with_kind(&log, kind);
+                    }
+                    f
+                };
+                let first = incremental_cycle(&dir, &state, &plan, "L1", fake());
+                let second = incremental_cycle(&dir, &state, &plan, "L2", fake());
+                let refused = |c: &Cycle| {
+                    c.stopped_saying("no record of rivet loading it")
+                        && c.next == load::Ownership::Foreign
+                        && c.exit == Some((5, Some("RIVET_LOAD_TARGET_NOT_RIVETS")))
+                };
+                if !(refused(&first) && refused(&second) && first.refusal == second.refusal) {
+                    wrong.push((tag, case, first, second));
+                }
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "(layout, what stands there, cycles): {wrong:#?}"
+        );
+    }
+
+    /// A whole-table load writes `<table>` only: a log beside a free name is not its business,
+    /// and the foreign table itself is refused in the words `rivet load` has always used.
+    #[test]
+    fn a_whole_table_load_asks_about_the_table_and_never_about_the_log() {
+        use load::ObjectKind::Table;
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateStore::open_in_memory().unwrap();
+        let plan = staged_plan(&dir, "full_beside_log", load::plan::LoadMode::Full);
+        let beside = load::tests::fake_loader(1).with_kind("full_beside_log__changes", Table);
+        let landed = cycle(&dir, &state, &plan, "L1", beside);
+        assert_eq!(
+            (landed.refusal, landed.writes, landed.ledger, landed.next),
+            (
+                None,
+                vec!["materialize full_beside_log".to_string()],
+                vec!["success".to_string()],
+                load::Ownership::Own
+            ),
+            "(refusal, warehouse writes, ledger, next ownership)"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateStore::open_in_memory().unwrap();
+        let plan = staged_plan(&dir, "full_foreign", load::plan::LoadMode::Full);
+        let foreign = cycle(
+            &dir,
+            &state,
+            &plan,
+            "L1",
+            load::tests::fake_loader(1).with_kind("full_foreign", Table),
+        );
+        assert_eq!(
+            (foreign.refusal.as_deref(), foreign.exit, foreign.writes),
+            (
+                Some(
+                    "refusing to overwrite `db.full_foreign`: it exists, and this state DB's \
+                     load ledger has no record of rivet loading it — it may hold someone else's \
+                     data. Drop or rename it, or load into another table"
+                ),
+                Some((5, Some("RIVET_LOAD_TARGET_NOT_RIVETS"))),
+                vec![]
+            ),
+            "(refusal, (exit, code), warehouse writes)"
+        );
+    }
+
+    /// A first load whose whole-table leg and deltas arrive together still lands both: the
+    /// second leg appends to what the first one just made rivet's own.
+    #[test]
+    fn a_first_load_lands_its_table_and_then_its_buffer_in_one_cycle() {
+        use load::plan::{CdcLayout, LoadMode};
+        let landed = |table: &str| {
+            (
+                None,
+                vec![format!("materialize {table}"), format!("append {table}")],
+                load::Ownership::Own,
+            )
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateStore::open_in_memory().unwrap();
+        let plan = plan_of(
+            &dir,
+            "first_cdc_base",
+            LoadMode::Cdc,
+            CdcLayout::BaseAndBuffer,
+        );
+        stage_run(&dir, "r-base", "full");
+        stage_run(&dir, "r-stream", "cdc");
+        let c = cdc_base_cycle(&dir, &state, &plan, "L1", load::tests::fake_loader(1));
+        assert_eq!((c.refusal, c.writes, c.next), landed("first_cdc_base"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateStore::open_in_memory().unwrap();
+        let plan = plan_of(
+            &dir,
+            "first_inc_base",
+            LoadMode::Incremental,
+            CdcLayout::BaseAndBuffer,
+        );
+        stage_incremental_run(&dir, "r-whole", "2026-08-21T00:00:00Z", None);
+        stage_incremental_run(&dir, "r-delta", "2026-08-22T00:00:00Z", Some("3"));
+        let c = incremental_cycle(&dir, &state, &plan, "L1", load::tests::fake_loader(1));
+        assert_eq!((c.refusal, c.writes, c.next), landed("first_inc_base"));
+    }
+
+    /// The whole-table pass of an incremental base-and-buffer load stops on a stale buffer
+    /// as a refusal, on every cycle.
+    #[test]
+    fn an_incremental_pass_over_a_stale_buffer_is_journaled_as_a_refusal_on_every_cycle() {
+        use load::ObjectKind::Table;
+        use load::plan::{CdcLayout, LoadMode};
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateStore::open_in_memory().unwrap();
+        let (table, log) = ("inc_stale", "inc_stale__changes");
+        let plan = plan_of(&dir, table, LoadMode::Incremental, CdcLayout::BaseAndBuffer);
+        stage_incremental_run(&dir, "r-whole", "2026-08-21T00:00:00Z", None);
+        loaded_before(&state, "db.inc_stale");
+        let mut seen = Vec::new();
+        for load_id in ["L1", "L2"] {
+            let fake = load::tests::fake_loader(1)
+                .with_kind(table, Table)
+                .with_kind(log, Table)
+                .with_rows(log, 5);
+            let c = incremental_cycle(&dir, &state, &plan, load_id, fake);
+            seen.push((
+                c.typed,
+                c.writes,
+                c.ledger[0].clone(),
+                c.refusal
+                    .is_some_and(|m| m.contains("refusing to land a whole-table pass")),
+            ));
+        }
+        let stop = (true, Vec::<String>::new(), "refused".to_string(), true);
+        assert_eq!(seen, [stop.clone(), stop]);
+    }
+
+    /// A part that vanishes between the ledger read and the write stops the load as a
+    /// refusal: nothing was written, so the row must not claim the table.
+    #[test]
+    fn a_stop_between_the_ledger_read_and_the_write_is_journaled_as_a_refusal() {
+        use load::plan::{CdcLayout, LoadMode};
+        let vanishing = |dir: &tempfile::TempDir, run: &str| {
+            let part = dir.path().join(format!("p/part-{run}.parquet"));
+            load::tests::fake_loader(1).probing(move |_| {
+                let _ = std::fs::remove_file(&part);
+            })
+        };
+        let mut seen = Vec::new();
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateStore::open_in_memory().unwrap();
+        let plan = plan_of(
+            &dir,
+            "gone_cdc_base",
+            LoadMode::Cdc,
+            CdcLayout::BaseAndBuffer,
+        );
+        stage_run(&dir, "r-base", "full");
+        seen.push(cdc_base_cycle(
+            &dir,
+            &state,
+            &plan,
+            "L1",
+            vanishing(&dir, "r-base"),
+        ));
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateStore::open_in_memory().unwrap();
+        let plan = plan_of(
+            &dir,
+            "gone_cdc_stream",
+            LoadMode::Cdc,
+            CdcLayout::BaseAndBuffer,
+        );
+        stage_run(&dir, "r-stream", "cdc");
+        seen.push(cdc_base_cycle(
+            &dir,
+            &state,
+            &plan,
+            "L1",
+            vanishing(&dir, "r-stream"),
+        ));
+
+        for (table, run, cursor_low) in [
+            ("gone_inc_whole", "r-whole", None),
+            ("gone_inc_delta", "r-delta", Some("3")),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let state = StateStore::open_in_memory().unwrap();
+            let plan = plan_of(&dir, table, LoadMode::Incremental, CdcLayout::BaseAndBuffer);
+            stage_incremental_run(&dir, run, "2026-08-21T00:00:00Z", cursor_low);
+            seen.push(incremental_cycle(
+                &dir,
+                &state,
+                &plan,
+                "L1",
+                vanishing(&dir, run),
+            ));
+        }
+
+        for c in &seen {
+            assert!(
+                c.stopped_saying("part") && c.next == load::Ownership::Foreign,
+                "a stop before the write, journaled as one: {c:#?}"
+            );
+        }
+        assert_eq!(seen.len(), 4);
+    }
+
+    /// The stale-buffer stop over a base this ledger never loaded is journaled as a refusal,
+    /// and the base is still refused after the operator drops the buffer as the text says.
+    #[test]
+    fn a_stale_buffer_refusal_does_not_make_a_foreign_base_rivets_own() {
+        use load::ObjectKind::Table;
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateStore::open_in_memory().unwrap();
+        let (table, log, target) = (
+            "stale_foreign",
+            "stale_foreign__changes",
+            "db.stale_foreign",
+        );
+        let mut plan = staged_plan(&dir, table, load::plan::LoadMode::Cdc);
+        plan.layout = load::plan::CdcLayout::BaseAndBuffer;
+        stage_run(&dir, "r-base", "full");
+        let pk = ["id".to_string()];
+        let run = |load_id: &'static str, fake: load::tests::FakeLoader| {
+            let writes = fake.writes();
+            let mut job = cdc_job(&dir, &state, &plan);
+            job.load_id = load_id;
+            job.loader = Box::new(fake);
+            let err = load_one_cdc_base(job, &pk, false, Some(&state))
+                .map(|_| ())
+                .err();
+            (
+                err.as_ref().map(|e| format!("{e:#}")).unwrap_or_default(),
+                writes.borrow().clone(),
+                statuses(&state, target)[0].clone(),
+                ownership_of(Some(&state), target, "load"),
+            )
+        };
+        let buffered = load::tests::fake_loader(1)
+            .with_kind(table, Table)
+            .with_kind(log, Table)
+            .with_rows(log, 5);
+        let (_, writes, journaled, next) = run("L1", buffered);
+        let dropped = load::tests::fake_loader(1).with_kind(table, Table);
+        let (said, rewrites, _, after) = run("L2", dropped);
+        let second = match said.contains("no record of rivet loading it") {
+            true => "refused as foreign".to_string(),
+            false => format!("not refused as foreign: {said:?}, wrote {rewrites:?}"),
+        };
+        assert_eq!(
+            (journaled.as_str(), next, writes, second.as_str(), after),
+            (
+                "refused",
+                load::Ownership::Foreign,
+                vec![],
+                "refused as foreign",
+                load::Ownership::Foreign
+            ),
+            "(cycle-1 ledger status, ownership after it, cycle-1 writes, cycle-2 outcome, \
+             ownership after cycle 2)"
+        );
+    }
+
+    /// The same stop over rivet's own base is journaled as a refusal too, and repeats.
+    #[test]
+    fn a_stale_buffer_over_rivets_own_base_is_journaled_as_a_refusal_on_every_cycle() {
+        use load::ObjectKind::Table;
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateStore::open_in_memory().unwrap();
+        let (table, log, target) = ("stale_own", "stale_own__changes", "db.stale_own");
+        let mut plan = staged_plan(&dir, table, load::plan::LoadMode::Cdc);
+        plan.layout = load::plan::CdcLayout::BaseAndBuffer;
+        stage_run(&dir, "r-base", "full");
+        let mut earlier = ctx(&state, "L0");
+        earlier.target_fqtn = target;
+        earlier.record_success(&["r-0".to_string()], 1);
+        let pk = ["id".to_string()];
+        let mut seen = Vec::new();
+        for load_id in ["L1", "L2"] {
+            let fake = load::tests::fake_loader(1)
+                .with_kind(table, Table)
+                .with_kind(log, Table)
+                .with_rows(log, 5);
+            let writes = fake.writes();
+            let mut job = cdc_job(&dir, &state, &plan);
+            job.load_id = load_id;
+            job.loader = Box::new(fake);
+            let err = load_one_cdc_base(job, &pk, false, Some(&state))
+                .map(|_| ())
+                .unwrap_err();
+            seen.push((
+                format!("{err:#}").contains("refusing to land a whole-table pass"),
+                err.is::<load::Refused>(),
+                writes.borrow().clone(),
+                statuses(&state, target)[0].clone(),
+            ));
+        }
+        let stop = (true, true, Vec::<String>::new(), "refused".to_string());
+        assert_eq!(
+            seen,
+            [stop.clone(), stop],
+            "per cycle (the stale-buffer text, typed, warehouse writes, newest ledger row)"
+        );
+    }
+
+    /// A load that dies at the probe deciding ownership leaves no row claiming the table,
+    /// so the next load still refuses it.
+    #[test]
+    fn a_load_killed_while_asking_about_a_foreign_table_leaves_it_foreign() {
+        use load::ObjectKind::Table;
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateStore::open_in_memory().unwrap();
+        let (table, target) = ("killed_full", "db.killed_full");
+        let plan = staged_plan(&dir, table, load::plan::LoadMode::Full);
+        let dying = load::tests::fake_loader(1)
+            .with_kind(table, Table)
+            .probing(|_| panic!("KILL: the process dies at the ownership probe"));
+        let killed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cycle(&dir, &state, &plan, "L1", dying)
+        }));
+        let payload = killed.expect_err("the load was killed, it did not return");
+        assert!(
+            payload
+                .downcast_ref::<&str>()
+                .is_some_and(|s| s.starts_with("KILL")),
+            "the kill, not another panic"
+        );
+        let left = (
+            statuses(&state, target),
+            ownership_of(Some(&state), target, "load"),
+        );
+        let second = cycle(
+            &dir,
+            &state,
+            &plan,
+            "L2",
+            load::tests::fake_loader(1).with_kind(table, Table),
+        );
+        let refused_again = second
+            .refusal
+            .is_some_and(|m| m.contains("no record of rivet loading it"));
+        assert_eq!(
+            (left, refused_again, second.writes, second.next),
+            (
+                (vec![], load::Ownership::Foreign),
+                true,
+                vec![],
+                load::Ownership::Foreign
+            ),
+            "((ledger rows the killed load left, ownership the next load reads), cycle 2 \
+             refused as foreign, cycle-2 writes, ownership after cycle 2)"
+        );
+    }
+
+    /// A closing ledger write that fails after a foreign refusal leaves no row claiming the
+    /// table either: both cycles refuse and nothing is written.
+    #[test]
+    fn a_failed_closing_write_after_a_foreign_refusal_leaves_the_table_foreign() {
+        use load::ObjectKind::Table;
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateStore::open_in_memory().unwrap();
+        let table = "unclosed_full";
+        let plan = staged_plan(&dir, table, load::plan::LoadMode::Full);
+        for when in ["INSERT", "UPDATE"] {
+            state.exec_for_test(&format!(
+                "CREATE TRIGGER closing_{when} BEFORE {when} ON load_run \
+                 WHEN NEW.status <> 'writing' \
+                 BEGIN SELECT RAISE(ABORT, 'state backend unavailable'); END"
+            ));
+        }
+        let mut seen = Vec::new();
+        for load_id in ["L1", "L2"] {
+            let c = cycle(
+                &dir,
+                &state,
+                &plan,
+                load_id,
+                load::tests::fake_loader(1).with_kind(table, Table),
+            );
+            let refused = c
+                .refusal
+                .is_some_and(|m| m.contains("no record of rivet loading it"));
+            seen.push((refused, c.writes, c.ledger, c.next));
+        }
+        let stop = (
+            true,
+            Vec::<String>::new(),
+            Vec::<String>::new(),
+            load::Ownership::Foreign,
+        );
+        assert_eq!(
+            seen,
+            [stop.clone(), stop],
+            "per cycle (refused as foreign, warehouse writes, ledger rows, next ownership)"
         );
     }
 
