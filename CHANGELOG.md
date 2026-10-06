@@ -7,9 +7,11 @@
   with `source.mongo.page_size` and `source.mongo.resume: true`, and a `mode: chunked` export
   with `keyset_incremental: true`. `rivet load` treated their runs as whole-table runs and
   overwrote the warehouse table with each run's new keys. Measured on ClickHouse, a collection
-  of 2,500 documents loaded as 500. Both kinds now load like `mode: incremental`: they append
+  of 2,500 documents loaded as 500. MongoDB resume exports now load like `mode: incremental`,
+  as `keyset_incremental` ones do since 0.31.0: they append
   to `<table>__changes` behind a view that keeps one row per key. **Upgrading:** a table that
-  rivet 0.30 or older loaded this way already lacks its earlier rows, and the first load after
+  rivet 0.31 or older loaded this way (0.30 or older for `keyset_incremental`, whose append
+  load shipped in 0.31.0) already lacks its earlier rows, and the first load after
   the upgrade does not bring them back. That load warns ``` `<table>` was last loaded as a
   whole-table overwrite, and export `<export>` now loads by append ``` and names the remedy:
   `rivet state reset -c <config> --export <export>`, then `rivet run` and `rivet load`. The

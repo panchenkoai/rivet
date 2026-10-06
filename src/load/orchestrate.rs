@@ -1815,7 +1815,8 @@ fn overwritten_delta_warning(
         format!(
             "`{fqtn}` was last loaded as a whole-table overwrite, and export `{export}` now \
              loads by append because each run carries only the keys past the last one \
-             (`keyset_incremental` / `source.mongo.resume`). rivet 0.30 and older loaded such \
+             (`keyset_incremental` / `source.mongo.resume`). rivet 0.31 and older \
+             (0.30 and older for `keyset_incremental`) loaded such \
              an export by overwriting the table with each run's new keys, so it may lack rows \
              earlier runs delivered. To restore it: `rivet state reset -c {config} --export \
              {export}`, then `rivet run -c {config}` and `rivet load -c {config}`."
@@ -4376,7 +4377,8 @@ mod overwritten_delta_tests {
             Some(
                 "`db.t` was last loaded as a whole-table overwrite, and export `t` now loads by \
                  append because each run carries only the keys past the last one \
-                 (`keyset_incremental` / `source.mongo.resume`). rivet 0.30 and older loaded such \
+                 (`keyset_incremental` / `source.mongo.resume`). rivet 0.31 and older \
+                 (0.30 and older for `keyset_incremental`) loaded such \
                  an export by overwriting the table with each run's new keys, so it may lack rows \
                  earlier runs delivered. To restore it: `rivet state reset -c rivet.yaml --export \
                  t`, then `rivet run -c rivet.yaml` and `rivet load -c rivet.yaml`."
