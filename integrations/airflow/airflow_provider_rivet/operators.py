@@ -125,7 +125,7 @@ class RivetBaseOperator(BaseOperator):
         for name in undeclared_state_variables(env, os.environ):
             raise PreflightRefusal(
                 "RIVET_AIRFLOW_STATE_ENV_NOT_PASSED",
-                f"the worker's environment sets {name} and this task would not pass it to rivet, which would then "
+                f"the worker's environment sets {name} to a PostgreSQL state and this task would not pass it to rivet, which would then "
                 f"run on an empty SQLite state and treat every export as a first run. Either inherit the worker's "
                 f'value with env_passthrough=["{name}"], or give the task its own with '
                 f'env_from_connections={{"{name}": "<conn_id>"}} (or `env`); unset it on the worker if it is not '

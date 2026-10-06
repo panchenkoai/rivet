@@ -402,7 +402,7 @@ def test_without_a_state_directory_stderr_goes_to_a_private_file_and_never_to_th
     streams = capfd.readouterr()
     assert SECRET not in streams.err + streams.out, "raw stderr must not reach the worker process's own stderr"
     path = Path(payload["stderr_path"])
-    assert path.is_relative_to(own_temp_dir / f"rivet-airflow-{os.getuid()}" / "logs" / "dag" / "task")
+    assert path.is_relative_to(own_temp_dir / f"rivet-airflow-{os.getuid()}" / "logs" / "dag" / invocation.hashed_name("task"))
     assert SECRET in path.read_text() and mode(path) == 0o600
     assert all(mode(d) == 0o700 for d in (path.parent, own_temp_dir / f"rivet-airflow-{os.getuid()}"))
     assert "stderr_temp" in payload["degraded"]
@@ -422,7 +422,7 @@ def test_log_files_are_private_and_only_the_last_tries_of_a_task_are_kept(rig: R
     paths = [Path(rig.run(op, FakeTI(try_number=n))[0]["stderr_path"]) for n in (1, 2, 3)]
     assert [p.exists() for p in paths] == [False, True, True]
     folder = paths[0].parent
-    assert folder == rig.state_dir / "logs" / "dag" / "task"
+    assert folder == rig.state_dir / "logs" / "dag" / invocation.hashed_name("task") and folder.name == "task-9aae63ebb719"
     assert not list(folder.glob("*try1.*")) and len(list(folder.glob("*try3.*"))) >= 3, "a try's files go together"
     assert all(mode(f) == 0o600 for f in folder.iterdir())
     assert all(mode(d) == 0o700 for d in (folder, rig.state_dir / "logs", rig.state_dir / "airflow", rig.state_dir / "airflow" / "dag"))
@@ -585,6 +585,7 @@ def test_a_path_name_is_readable_and_never_shared_by_two_different_names() -> No
     assert name("a:b").startswith("a_b-") and name("a_b") == "a_b"
     assert name("run", "task") != name("run__task") and name("a__b", "c") != name("a", "b__c")
     assert name("load", "1") != name("load-1") and name("orders") == name("orders")
+    assert name("a_", "_b") != name("a__", "b"), "the hash is over the list of parts, not over their concatenation"
 
 
 COLLIDING = [
@@ -622,9 +623,14 @@ def test_two_exports_whose_names_sanitise_to_one_get_their_own_plan_and_are_both
         [{"dag_id": "Sales"}, {"dag_id": "sales"}],
         [{"task_id": "load.\u0437\u0430\u043a\u0430\u0437\u044b"}, {"task_id": "load.\u043a\u043b\u0438\u0435\u043d\u0442\u044b"}],
         [{"task_id": "load", "map_index": 1}, {"task_id": "load-1"}],
+        [{"task_id": "load", "map_index": 1}, {"task_id": "load.1"}],
+        [{"task_id": "load", "map_index": 1}, {"task_id": "load_1"}],
+        [{"task_id": "load", "map_index": 1}, {"task_id": "load", "map_index": 11}],
+        [{"task_id": "apply_a"}, {"task_id": "apply_b"}],
         [{"run_id": "manual__2026-10-06T00:00:00+00:00"}, {"run_id": "manual__2026-10-06T00_00_00_00_00"}],
     ],
-    ids=["dag-non-ascii", "dag-case", "task-non-ascii", "mapped-task", "run-id"],
+    ids=["dag-non-ascii", "dag-case", "task-non-ascii", "mapped-task", "mapped-task-dot", "mapped-task-underscore",
+         "mapped-indexes", "two-tasks", "run-id"],
 )
 def test_two_dags_tasks_or_runs_whose_ids_sanitise_to_one_share_no_artifact_log_or_ledger(rig: Rig, ids: list) -> None:
     def ti(which: int, try_number: int = 1) -> FakeTI:
@@ -639,11 +645,8 @@ def test_two_dags_tasks_or_runs_whose_ids_sanitise_to_one_share_no_artifact_log_
     second, _ = rig.run(op, ti(1))
     retried, _ = rig.run(op, ti(1, try_number=2))
     artifacts = [c["argv"][1] for c in rig.calls() if c["argv"][0] == "apply"]
-    if "task_id" in ids[0]:
-        assert len(set(artifacts)) == 1, "two tasks of one run and one export replay one sealed plan"
-    else:
-        assert [c["argv"][0] for c in rig.calls()].count("plan") == 2, "the second id plans for itself; only its own retry replays"
-        assert artifacts[0].lower() != artifacts[1].lower() and artifacts[1] == artifacts[2]
+    assert [c["argv"][0] for c in rig.calls()].count("plan") == 2, "the second id plans for itself; only its own retry replays"
+    assert artifacts[0].lower() != artifacts[1].lower() and artifacts[1] == artifacts[2]
     logs = [Path(p["stderr_path"]) for p in (first, second, retried)]
     assert str(logs[0]).lower() != str(logs[1]).lower()
     assert logs[0].exists(), "pruning the second id's tries leaves the first id's files alone"
@@ -706,8 +709,233 @@ def test_a_worker_state_url_the_task_does_not_pass_on_is_refused_before_rivet_st
     declared = rig.operator(RivetRunOperator, export="orders", env={"RIVET_PG_URL": SECRET, "RIVET_STATE_URL": "postgresql://other/db"})
     rig.run(declared)
     assert [c["env"]["RIVET_STATE_URL"] for c in rig.calls()] == [STATE_URL, "postgresql://other/db"]
-    monkeypatch.setenv("RIVET_STATE_URL", "")
-    payload, _ = rig.run(rig.operator(RivetRunOperator, export="orders"))
-    assert payload["decision"] == "success", "an empty worker variable selects nothing"
+    monkeypatch.setenv("RIVET_STATE_URL", STATE_URL)
+    opted_out, _ = rig.run(rig.operator(RivetRunOperator, export="orders", env={"RIVET_PG_URL": SECRET, "RIVET_STATE_URL": ""}))
+    assert opted_out["decision"] == "success" and "state_url_sqlite" in opted_out["degraded"], "a declared empty value is a decision"
+    assert rig.calls()[-1]["env"]["RIVET_STATE_URL"] == ""
+    for ignored in ("", " ", "sqlite:///tmp/x.db", "mysql://state-db/x", "Postgres://state-db/x", " postgresql://state-db/x"):
+        monkeypatch.setenv("RIVET_STATE_URL", ignored)
+        payload, _ = rig.run(rig.operator(RivetRunOperator, export="orders"))
+        assert isinstance(payload, dict) and payload["decision"] == "success", f"rivet does not use {ignored!r} as its state: {payload}"
+        assert "state_url_sqlite" in payload["degraded"]
+    for used in ("postgres://state-db/x", "postgresql://state-db/x"):
+        monkeypatch.setenv("RIVET_STATE_URL", used)
+        exc, _ = rig.run(rig.operator(RivetRunOperator, export="orders"))
+        assert isinstance(exc, AirflowFailException) and "RIVET_AIRFLOW_STATE_ENV_NOT_PASSED" in str(exc), used
     readme = (Path(__file__).resolve().parents[1] / "README.md").read_text()
     assert "RIVET_AIRFLOW_STATE_ENV_NOT_PASSED" in readme and "RIVET_AIRFLOW_PLAN_ARTIFACT_FOREIGN" in readme
+
+
+def tenant_tasks(rig: Rig) -> list:
+    """Two apply tasks of one DAG run: two configs of one file name, each with an export called `orders`."""
+    tasks = []
+    for tenant in ("tenant_a", "tenant_b"):
+        (rig.tmp / tenant).mkdir()
+        config = rig.tmp / tenant / "pg.yaml"
+        config.write_text(
+            "source:\n  type: postgres\n  url_env: RIVET_PG_URL\nexports:\n"
+            f"  - {{name: orders, query: SELECT * FROM {tenant}_orders, mode: full}}\n"
+        )
+        tasks.append(rig.operator(RivetApplyOperator, task_id=f"apply_{tenant}", config=str(config), export="orders"))
+    return tasks
+
+
+def files_of(folder: Path) -> dict:
+    """Every file below a directory with its bytes."""
+    return {str(p.relative_to(folder)): p.read_bytes() for p in sorted(folder.rglob("*")) if p.is_file() and "logs" not in p.parts}
+
+
+def refused_twice(rig: Rig, op: object, artifact: Path, *said: str) -> None:
+    """Tries 2 and 3 refuse the artifact for one reason, start no rivet, and leave the state directory as it was."""
+    kept, before, calls = artifact.read_text(), files_of(rig.state_dir), len(rig.calls())
+    outcomes = [rig.run(op, FakeTI(task_id=op.task_id, try_number=n)) for n in (2, 3)]
+    for exc, ti in outcomes:
+        assert isinstance(exc, AirflowFailException), exc
+        assert ti.store[(op.task_id, "return_value")]["preflight_refusal"] == "RIVET_AIRFLOW_PLAN_ARTIFACT_FOREIGN"
+        assert all(text in str(exc) for text in said), exc
+    assert str(outcomes[0][0]) == str(outcomes[1][0]), "the second cycle refuses for the same reason"
+    assert len(rig.calls()) == calls, "neither a plan nor an apply ran"
+    assert artifact.read_text() == kept, "the refusal leaves the artifact as it found it"
+    assert files_of(rig.state_dir) == before, "a refusal records nothing that a later try could read as permission"
+
+
+def test_two_configs_with_one_export_name_in_one_run_each_plan_and_apply_their_own_plan(rig: Rig) -> None:
+    one, two = tenant_tasks(rig)
+    for op in (one, two):
+        payload, _ = rig.run(op)
+        assert payload["decision"] == "success"
+    steps = [c["argv"] for c in rig.calls() if c["argv"][0] in ("plan", "apply")]
+    assert [s[0] for s in steps] == ["plan", "apply", "plan", "apply"], "the second config is planned, not served the first one's plan"
+    configs = [s[s.index("--config") + 1] for s in steps if s[0] == "plan"]
+    artifacts = [Path(s[1]) for s in steps if s[0] == "apply"]
+    assert configs == [str(rig.copy(config=Path(op.config))) for op in (one, two)] and configs[0] != configs[1]
+    assert artifacts[0] != artifacts[1]
+    assert [json.loads(a.read_text())["config_path"] for a in artifacts] == [str(Path(c).resolve()) for c in configs]
+    assert [mode(d) for d in (artifacts[0].parent, artifacts[0].parent.parent)] == [0o700, 0o700], "plans/ and plans/<run>/ are private"
+    rig.run(two, FakeTI(task_id=two.task_id, try_number=2))
+    steps = [c["argv"] for c in rig.calls() if c["argv"][0] in ("plan", "apply")]
+    assert [s[0] for s in steps][4:] == ["apply"] and steps[4][1] == str(artifacts[1]), "a retry replays its own task's plan"
+
+
+def test_a_config_or_query_file_edited_between_two_tries_is_planned_again(rig: Rig) -> None:
+    (rig.config_dir / "orders.sql").write_text("SELECT 1")
+    rig.config.write_text(CONFIG_WITH_QUERY_FILE)
+    op = rig.operator(RivetApplyOperator, export="orders")
+    rig.run(op)
+    rig.run(op, FakeTI(try_number=2))
+    assert [c["argv"][0] for c in rig.calls()].count("plan") == 1, "nothing changed: the retry replays the sealed plan"
+    (rig.config_dir / "orders.sql").write_text("SELECT 2")
+    rig.run(op, FakeTI(try_number=3))
+    rig.config.write_text(CONFIG_WITH_QUERY_FILE + "# edited\n")
+    rig.run(op, FakeTI(try_number=4))
+    artifacts = [c["argv"][1] for c in rig.calls() if c["argv"][0] == "apply"]
+    assert [c["argv"][0] for c in rig.calls()].count("plan") == 3, "the plan of the old query or config is not applied"
+    assert artifacts[0] == artifacts[1] and len(set(artifacts)) == 3
+    for config_tail, sql in (("#S", "ELECT 1"), ("#", "SELECT 1")):
+        rig.config.write_text(CONFIG_WITH_QUERY_FILE + config_tail)
+        (rig.config_dir / "orders.sql").write_text(sql)
+        rig.run(op, FakeTI(try_number=5))
+    assert [c["argv"][0] for c in rig.calls()].count("plan") == 5, "the digest is over each input, not over their concatenation"
+
+
+def test_one_task_id_over_two_config_paths_with_the_same_bytes_shares_no_plan(rig: Rig) -> None:
+    (rig.tmp / "other").mkdir()
+    twin = rig.tmp / "other" / "pg.yaml"
+    twin.write_text(rig.config.read_text())
+    for config in (rig.config, twin):
+        payload, _ = rig.run(rig.operator(RivetApplyOperator, export="orders", config=str(config)))
+        assert payload["decision"] == "success"
+    steps = [c["argv"] for c in rig.calls() if c["argv"][0] in ("plan", "apply")]
+    assert [s[0] for s in steps] == ["plan", "apply", "plan", "apply"] and steps[1][1] != steps[3][1]
+
+
+CONFIG_WITH_QUERY_FILE = """\
+source:
+  type: postgres
+  url_env: RIVET_PG_URL
+exports:
+  - {name: orders, query_file: orders.sql, mode: full}
+  - {name: users, query: SELECT 1, mode: full}
+"""
+EXPIRED = "2000-01-01T00:00:00+00:00"
+
+
+def test_a_sealed_plan_of_another_config_is_refused_and_refused_again_on_the_retry(rig: Rig) -> None:
+    one, two = tenant_tasks(rig)
+    rig.run(one)
+    rig.run(two)
+    theirs, mine = [Path(c["argv"][1]) for c in rig.calls() if c["argv"][0] == "apply"]
+    mine.write_text(theirs.read_text())
+    refused_twice(rig, two, mine, str(rig.copy(config=Path(one.config)).resolve()), str(rig.copy(config=Path(two.config)).resolve()))
+    mine.unlink()
+    payload, _ = rig.run(two, FakeTI(task_id=two.task_id, try_number=4))
+    assert payload["decision"] == "success" and json.loads(mine.read_text())["config_path"] != json.loads(theirs.read_text())["config_path"]
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"export_name": "users"},
+        {"export_name": "Orders"},
+        {"export_name": None},
+        {"export_name": "DROP"},
+        {"config_path": "/elsewhere/pg.yaml"},
+        {"config_path": None},
+        {"config_path": ""},
+        {"config_path": 7},
+        {"config_path": "DROP"},
+        {"export_name": "DROP", "config_path": "DROP"},
+    ],
+    ids=["export-other", "export-case", "export-null", "export-absent", "config-other", "config-null", "config-empty",
+         "config-not-text", "config-absent", "both-absent"],
+)
+@pytest.mark.parametrize("expired", [False, True], ids=["unexpired", "expired"])
+def test_a_sealed_plan_with_an_identity_field_foreign_or_missing_is_refused_twice_expired_or_not(
+    rig: Rig, change: dict, expired: bool
+) -> None:
+    op = rig.operator(RivetApplyOperator, export="orders")
+    rig.run(op)
+    artifact = Path(rig.argv("apply")[1])
+    doc = {**json.loads(artifact.read_text()), **change, **({"expires_at": EXPIRED} if expired else {})}
+    artifact.write_text(json.dumps({k: v for k, v in doc.items() if v != "DROP"}))
+    refused_twice(rig, op, artifact, str(artifact))
+
+
+@pytest.mark.parametrize("text", ["", "{not json", "[1, 2]", '"orders"'], ids=["empty", "garbage", "list", "string"])
+def test_a_file_at_the_artifact_path_that_is_no_plan_object_is_planned_over(rig: Rig, text: str) -> None:
+    op = rig.operator(RivetApplyOperator, export="orders")
+    rig.run(op)
+    artifact = Path(rig.argv("apply")[1])
+    artifact.write_text(text)
+    payload, _ = rig.run(op, FakeTI(try_number=2))
+    assert payload["decision"] == "success" and [c["argv"][0] for c in rig.calls()].count("plan") == 2
+    assert json.loads(artifact.read_text())["export_name"] == "orders"
+
+
+def test_the_scratch_files_of_two_tries_tasks_or_runs_are_separate_files(rig: Rig) -> None:
+    rig.scenario(flags=NEW_FLAGS)
+    tis = [FakeTI(), FakeTI(try_number=2), FakeTI(task_id="other"), FakeTI()]
+    tis[3].run_id = "manual__2026-10-07"
+    for cls in (RivetRunOperator, RivetApplyOperator, RivetLoadOperator):
+        op = rig.operator(cls, export="orders")
+        for ti in tis:
+            rig.run(op, ti)
+    for sub in ("run", "apply", "load"):
+        scratch = [c["argv"][c["argv"].index("--summary-output") + 1] for c in rig.calls() if c["argv"][0] == sub]
+        assert len(scratch) == 4 and len({s.lower() for s in scratch}) == 4, f"{sub}: a zombie try and its retry would share a result file"
+        assert not any(Path(s).exists() for s in scratch)
+
+
+def test_the_plan_scratch_file_is_not_shared_by_two_dags_refreshing_one_layout_file(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    opened, real = [], invocation._open_private
+    monkeypatch.setattr(invocation, "_open_private", lambda path: (opened.append(Path(path)), real(path))[1])
+    campaign = {"waves": [{"wave": 1, "exports": ["orders"]}], "ordered_exports": []}
+    rig.scenario(plan_list=[{"export_name": "orders", "prioritization": {"campaign": campaign}}])
+    target = rig.tmp / "pg.plan.json"
+    op = rig.operator(RivetPlanOperator, plan_file=str(target))
+    tis = [FakeTI(), FakeTI(), FakeTI(try_number=2)]
+    tis[1].dag_id = "other_dag"
+    for ti in tis:
+        payload, _ = rig.run(op, ti)
+        assert payload["decision"] == "success"
+    scratch = [p for p in opened if p.parent == target.parent]
+    assert len(scratch) == 3 and len({str(p).lower() for p in scratch}) == 3 and target not in scratch
+    assert sorted(p.name for p in target.parent.iterdir() if p.is_file()) == ["pg.plan.json"], "no scratch file is left behind"
+
+
+def test_the_lock_of_a_per_table_task_is_named_by_its_exact_export(rig: Rig) -> None:
+    names = ("a:b", "a+b", "Orders", "orders")
+    exports = "".join(f"  - {{name: {json.dumps(n)}, query: SELECT 1, mode: full}}\n" for n in names)
+    rig.config.write_text(f"source:\n  type: postgres\n  url_env: RIVET_PG_URL\nexports:\n{exports}")
+    for n in names:
+        rig.run(rig.operator(RivetLoadOperator, export=n, table="t"))
+    locks = sorted(p.name for p in (rig.state_dir / "airflow" / "locks").iterdir())
+    assert locks == sorted(f"{invocation.path_name(n)}.lock" for n in names) and len({name.lower() for name in locks}) == 4
+    assert "orders.lock" in locks and mode(rig.state_dir / "airflow" / "locks") == 0o700
+
+
+OLD_LAYOUT = ("manual__2026-10-06__try1.run.stderr.log", "scheduled__2026-10-06T00_00_00_00_00__try1.apply.stdout.log")
+
+
+@pytest.mark.parametrize("stderr_dir", [False, True], ids=["state-dir", "stderr-dir"])
+def test_pruning_removes_only_this_tasks_own_files_and_never_an_older_layouts(rig: Rig, stderr_dir: bool) -> None:
+    base = rig.tmp / "mine" if stderr_dir else rig.state_dir / "logs"
+    old = [base / dag / task / name for dag in ("Sales", "sales") for task in ("Task", "task") for name in OLD_LAYOUT]
+    for path in old:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"written for {path.parent}")
+        os.utime(path, (1, 1))
+    op = rig.operator(RivetRunOperator, export="orders", log_keep=1, **({"stderr_dir": str(base)} if stderr_dir else {}))
+    mine = []
+    for dag in ("sales", "Sales"):
+        for n in (1, 2, 3):
+            ti = FakeTI(try_number=n)
+            ti.dag_id = dag
+            mine.append(Path(rig.run(op, ti)[0]["stderr_path"]))
+    assert [p.exists() for p in mine] == [False, False, True] * 2, "retention still counts this task's own tries"
+    assert all(p.exists() and p.read_text().startswith("written for") for p in old), "a file of the older layout is left alone"
+    assert not any(p.parent in {m.parent for m in mine} for p in old), "the new layout's folder is never an older layout's folder"
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text()
+    assert "Upgrading a state directory" in readme

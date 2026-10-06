@@ -250,15 +250,19 @@ PostgreSQL state is `RIVET_STATE_URL=postgresql://...` in the task's environment
 `env_from_connections={"RIVET_STATE_URL": "rivet_state"}`, or set it on the worker and name it in
 `env_passthrough=["RIVET_STATE_URL"]` (a worker variable is not inherited unless it is named).
 
-**A `RIVET_STATE_URL` set on the worker and not passed on is refused.** If the worker's
-environment has a non-empty `RIVET_STATE_URL` and the task's environment would not carry one
+**A PostgreSQL `RIVET_STATE_URL` set on the worker and not passed on is refused.** If the
+worker's `RIVET_STATE_URL` is one rivet would use (it starts with `postgres`, rivet's own rule;
+an empty, blank or `sqlite:` value selects nothing and is not refused) and the task's
+environment has no entry for it
 (not in `env_passthrough`, `env` or `env_from_connections`), the task fails before rivet starts
 with `RIVET_AIRFLOW_STATE_ENV_NOT_PASSED` and is not retried: rivet would otherwise run green on
 an empty SQLite state while the real state sits in the database the worker names. The message
 names the variable and never its value. Fix it one of two ways: inherit the worker's value with
 `env_passthrough=["RIVET_STATE_URL"]`, or give the task its own value with
 `env_from_connections={"RIVET_STATE_URL": "<conn_id>"}` (or `env`). If the worker's variable is
-not meant for this pipeline, unset it on the worker.
+not meant for this pipeline, unset it on the worker, or declare `env={"RIVET_STATE_URL": ""}` on
+the task: a declared value, also an empty one, is the task's own decision and rivet then keeps
+SQLite state in `state_dir`.
 
 ### Local worker setup guide
 
@@ -281,9 +285,10 @@ not meant for this pipeline, unset it on the worker.
    - every relative `query_file` of the config, copied to the same relative path (see 5), and
      `.rivet_airflow_query_files.json`, which records the config directory each one came from.
    - a relative `cdc.checkpoint`, which resolves beside the copied config, that is, here.
-   - `airflow/<dag_id>/`: sealed plan artifacts (`plans/<run_id>/<export>.json`), the crashed
-     ledger, scratch files; `airflow/locks/`.
-   - `logs/<dag_id>/<task_id>/`: rivet's stdout and stderr, one file per step and try.
+   - `airflow/<dag_id>/`: sealed plan artifacts
+     (`plans/<run_id>/<export>__<task_id>__<inputs>-<hash>.json`), the crashed ledger, scratch
+     files; `airflow/locks/<export>.lock`.
+   - `logs/<dag_id>/<task_id>-<hash>/`: rivet's stdout and stderr, one file per step and try.
    - **How a name becomes a path.** A DAG id, task id, run id or export name that is one lower-case
      word of `a-z 0-9 _ . -` (at most 80 characters, not starting with `.` or `-`) is used as it
      is. Any other name (other characters such as `:` `+` or non-ASCII letters, upper case, a
@@ -292,10 +297,25 @@ not meant for this pipeline, unset it on the worker.
      name: run id `scheduled__2026-10-06T00:00:00+00:00` becomes
      `scheduled__2026-10-06T00_00_00_00_00-b07b0ae9e551`. Two different names
      therefore never share a directory, a sealed plan, a log file or a ledger, also on a file
-     system that ignores case.
-   - A sealed plan artifact records the export it was made for. `apply` refuses one that records
-     another export (`RIVET_AIRFLOW_PLAN_ARTIFACT_FOREIGN`) and leaves the file as it is, so the
-     retry is refused for the same reason until a person deletes it.
+     system that ignores case. A task's log folder always carries the hash, also for a plain
+     task id, so it is never a folder an older layout wrote to.
+   - **One sealed plan per task, config and export.** The artifact's name is made from the
+     export, the task id (with the map index) and `<inputs>`: a digest of the config's absolute
+     path, the config's bytes and the export's `query_file`. Two tasks of one DAG run never
+     share a plan, also when they run two configs that both have an export of one name; a
+     retry of the same task replays its own plan; a config or query file edited between two
+     tries is planned again under a new name.
+   - The artifact records the export and the config it was planned from (`export_name`,
+     `config_path`). `apply` refuses a plan object in which either is missing or is not the
+     task's own (`RIVET_AIRFLOW_PLAN_ARTIFACT_FOREIGN`), expired or not, and leaves the file as
+     it is, so the retry is refused for the same reason until a person deletes it. A file at
+     that path that is not a JSON object (empty, cut short) is planned over.
+   - **Upgrading a state directory** written by an earlier build of this package: files of an
+     older layout are left alone. They are never read, never pruned and never deleted, so
+     remove `logs/<dag_id>/<task_id>/` folders without a `-<hash>` suffix and
+     `airflow/<dag_id>/plans/<run_id>/<export>.json` files by hand when you no longer need
+     them. A run in flight during the upgrade plans again, and its crashed budget starts empty
+     (at most one extra crash retry).
    - `.rivet_airflow_marker`: a random id written by the first task that used the directory.
 
    The copies and every file under `airflow/` and `logs/` are created with mode `0600`, in
@@ -366,14 +386,15 @@ not meant for this pipeline, unset it on the worker.
 - **rivet's raw stdout and stderr go to files and never to the task log or to the worker
   process's own stderr** (which Airflow 3, and Airflow 2 with `run_as_user`, copy into the task
   log). The files are
-  `<base>/<dag_id>/<task_id>/<run_id>__try<N>.<step>.stderr.log` (and `.stdout.log`), mode `0600`
+  `<base>/<dag_id>/<task_id>-<hash>/<run_id>__try<N>.<step>.stderr.log` (and `.stdout.log`), mode `0600`
   in `0700` directories; the `rivet.start` record and XCom name the path. `<base>` is
   `stderr_dir` when given, else `<state_dir>/logs`, else, on a worker with no state directory,
   `<temp dir>/rivet-airflow-<uid>/logs` (recorded as `stderr_temp`; a pod loses the files with
   its disk, and what a failure was is still in the error object).
 - **Retention.** When a task ends, the files of its newest `log_keep` tries (default 10, counted
   per task across runs) are kept and the older ones are removed. `log_keep=None` keeps
-  everything. Sealed plan artifacts and crashed ledgers under `airflow/<dag_id>/` are small and
+  everything. Only the task's own folder is looked at; a file of an older layout is never
+  removed (see "Upgrading a state directory"). Sealed plan artifacts and crashed ledgers under `airflow/<dag_id>/` are small and
   are not pruned.
 - `stream_stderr=True` copies stderr into the task log when each step ends. It is the one way
   raw stderr reaches the task log, and it is for debugging: it puts possibly data-bearing text

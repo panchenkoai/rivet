@@ -50,8 +50,19 @@ Changed before the first release, after review (see the README sections named):
   sealed plan, so one export applied the other's plan and was never extracted. `apply` also
   refuses an artifact that records another export (`RIVET_AIRFLOW_PLAN_ARTIFACT_FOREIGN`).
   ("Local worker setup guide")
-- A non-empty `RIVET_STATE_URL` in the worker's environment that the task would not pass to
-  rivet is refused before rivet starts (`RIVET_AIRFLOW_STATE_ENV_NOT_PASSED`).
+- A sealed plan belongs to one task, one config and one export: its name carries the task id
+  and a digest of the config's path, the config's bytes and the export's query file. Two apply
+  tasks of one DAG run with two configs and one export name shared `plans/<run>/<export>.json`,
+  so the second applied the first config's plan and was never extracted. `apply` refuses an
+  artifact whose `export_name` or `config_path` is missing or not the task's own, expired or
+  not. The scratch file of `RivetPlanOperator` is no longer shared by two DAGs that refresh
+  one layout file. ("Local worker setup guide")
+- A task's log folder is `logs/<dag_id>/<task_id>-<hash>/` for every task id. Retention looks
+  only there: files of an older layout are never pruned or deleted (on a file system that
+  ignores case, DAG `sales` removed log files of DAG `Sales`). ("Upgrading a state directory")
+- A `RIVET_STATE_URL` in the worker's environment that rivet would use (it starts with
+  `postgres`) and that the task would not pass to rivet is refused before rivet starts
+  (`RIVET_AIRFLOW_STATE_ENV_NOT_PASSED`). A declared value, also an empty one, is not refused.
 - `build_batch_dag(exports=[])` raises `ValueError`; the watcher carries no failure callback, so
   a callback in `default_args` fires once per failed task.
 - `connection_url`: a password without a login, IPv6 hosts, Oracle `service_name`, an encoded

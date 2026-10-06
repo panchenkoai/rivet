@@ -15,6 +15,7 @@ from .capabilities import MIN_RIVET_VERSION, Capabilities, probe
 MARKER_NAME = ".rivet_airflow_marker"
 STATE_DB_NAME = ".rivet_state.db"
 SETUP_GUIDE = "integrations/airflow/README.md#local-worker-setup-guide"
+STATE_URL_ENV = "RIVET_STATE_URL"
 
 
 class PreflightRefusal(Exception):
@@ -42,6 +43,11 @@ class Preflight:
         """Mode by export name, as the config declares it."""
         exports = self.config.get("exports") or []
         return {e["name"]: str(e.get("mode", "full")) for e in exports if isinstance(e, dict) and "name" in e}
+
+
+def state_kind(env: Mapping[str, str]) -> str:
+    """`postgres` when rivet would open the state `RIVET_STATE_URL` names (its own rule: the value starts with `postgres`), else `sqlite`."""
+    return "postgres" if env.get(STATE_URL_ENV, "").startswith("postgres") else "sqlite"
 
 
 def detect_deployment(env: Mapping[str, str], declared: str = "auto") -> str:
@@ -155,8 +161,8 @@ def run_preflight(
         )
     config = read_config(config_path)
     where = detect_deployment(env, deployment)
-    state_kind = "postgres" if env.get("RIVET_STATE_URL", "").startswith("postgres") else "sqlite"
-    result = Preflight(binary, caps, where, state_kind, None, config)
+    kind = state_kind(env)
+    result = Preflight(binary, caps, where, kind, None, config)
     modes = result.export_modes()
     if export is not None and modes and export not in modes:
         raise PreflightRefusal("RIVET_AIRFLOW_EXPORT_UNKNOWN", f"config {config_path} has no export `{export}`")
@@ -164,7 +170,7 @@ def run_preflight(
     is_cdc = cdc or "cdc" in touched
 
     if where == "pod":
-        if state_kind != "postgres":
+        if kind != "postgres":
             raise PreflightRefusal(
                 "RIVET_AIRFLOW_STATE_SQLITE_ON_POD",
                 "this worker is an ephemeral pod and RIVET_STATE_URL is not a postgres URL; SQLite state would be "
@@ -176,7 +182,7 @@ def run_preflight(
                 "CDC is refused on an ephemeral pod: the stream's checkpoint is a file and would live on the pod's "
                 "disk; this holds until rivet stores the checkpoint in the state database",
             )
-    elif state_kind == "sqlite" or is_cdc or state_dir:
+    elif kind == "sqlite" or is_cdc or state_dir:
         result.state_dir = check_state_dir(state_dir)
         result.marker = ensure_marker(result.state_dir)
         others = sorted({m for m in upstream_markers if m and m != result.marker})
@@ -186,8 +192,8 @@ def run_preflight(
                 f"an upstream task of this DAG run used another state directory than {state_dir} on this worker "
                 f"(marker {others[0][:8]} against {result.marker[:8]}); every task must see the same path; see {SETUP_GUIDE}",
             )
-        check_nothing_left_beside_config(config_path, config, result.state_dir, state_kind == "sqlite", export)
-        if state_kind == "sqlite":
+        check_nothing_left_beside_config(config_path, config, result.state_dir, kind == "sqlite", export)
+        if kind == "sqlite":
             result.warnings.append(
                 ("sqlite_single_host", f"SQLite state in {state_dir}: this setup is single-host; see {SETUP_GUIDE}")
             )

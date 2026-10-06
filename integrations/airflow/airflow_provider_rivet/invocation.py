@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Sequence
 
 from . import _yaml
-from .preflight import Preflight, PreflightRefusal, run_preflight
+from .preflight import STATE_URL_ENV, Preflight, PreflightRefusal, run_preflight, state_kind
 from .result import STATUSES, ErrorObject, UnitResult, error_from_exit, error_from_line, worst
 
 Emit = Callable[[dict[str, Any]], None]
@@ -37,7 +37,6 @@ CLOUD_ENV = {
 STDERR_TAIL = 1 << 20
 QUERY_OWNERS = ".rivet_airflow_query_files.json"
 PLAN_ERRORS = (ValueError, KeyError, IndexError, TypeError, AttributeError)
-STATE_ENV = ("RIVET_STATE_URL",)
 _SAFE = re.compile(r"[^A-Za-z0-9_.-]+")
 _PLAIN = re.compile(r"[a-z0-9_][a-z0-9_.-]{0,79}")
 _HASHED = re.compile(r".*-[0-9a-f]{12}")
@@ -53,24 +52,29 @@ def worker_environment(
     return {k: v for k, v in source.items() if any(fnmatch.fnmatchcase(k, pattern) for pattern in patterns)}
 
 
-def path_name(*parts: Any) -> str:
-    """One path component for user-supplied names, never shared by two different inputs.
-
-    A lone lower-case name of safe characters is kept as it is. Anything else (other characters, upper case,
-    several parts, a leading dot, over 80 characters, or a name shaped like this function's own output) becomes
-    a readable form plus 12 hex digits of the SHA-256 of the exact input.
-    """
+def hashed_name(*parts: Any) -> str:
+    """A readable form of the parts plus 12 hex digits of the SHA-256 of their JSON list; never a plain name."""
     texts = [str(part) for part in parts]
-    if len(texts) == 1 and _PLAIN.fullmatch(texts[0]) and not _HASHED.fullmatch(texts[0]):
-        return texts[0]
     readable = "__".join(_SAFE.sub("_", text) for text in texts)[:80]
     return f"{readable}-{hashlib.sha256(json.dumps(texts).encode()).hexdigest()[:12]}"
 
 
+def path_name(*parts: Any) -> str:
+    """One path component for user-supplied names, never shared by two different inputs.
+
+    A lone lower-case name of safe characters is kept as it is. Anything else (other characters, upper case,
+    several parts, a leading dot, over 80 characters, or a name shaped like `hashed_name`'s output) is hashed.
+    """
+    texts = [str(part) for part in parts]
+    if len(texts) == 1 and _PLAIN.fullmatch(texts[0]) and not _HASHED.fullmatch(texts[0]):
+        return texts[0]
+    return hashed_name(*texts)
+
+
 def undeclared_state_variables(env: Mapping[str, str], environ: Optional[Mapping[str, str]] = None) -> list[str]:
-    """Names of the worker's state-selecting variables that the task's environment would not carry to rivet."""
+    """The state variable, when the worker's value selects PostgreSQL state and the task's environment has no entry for it."""
     source = os.environ if environ is None else environ
-    return [name for name in STATE_ENV if source.get(name) and name not in env]
+    return [STATE_URL_ENV] if state_kind(source) == "postgres" and STATE_URL_ENV not in env else []
 
 
 def plan_layout(plan: Any) -> list[dict[str, Any]]:
@@ -175,10 +179,12 @@ class _Session:
         self.argvs: list[list[str]] = []
         self.stderr_path: Optional[str] = None
         self.tmp: Optional[Path] = None
-        dag, run, task = (path_name(part) for part in request.label[:3])
+        dag, run = (path_name(part) for part in request.label[:2])
+        task = hashed_name(request.label[2])
         attempt = f"try{int(request.label[3])}"
         self.run = run
         self.name = path_name(*request.label[1:3], attempt)
+        self.global_name = path_name(*request.label[:3], attempt)
         self.log_name = f"{run}__{attempt}"
         if pf.state_dir is not None:
             self.work = _private_dir(pf.state_dir, "airflow", dag)
@@ -496,15 +502,35 @@ def _unexpired(artifact: Path) -> bool:
     return expires > datetime.now(timezone.utc)
 
 
-def _refuse_foreign_artifact(artifact: Path, export: str) -> None:
-    """Refuse a sealed plan artifact that records another export than the one being applied; the file is left alone."""
+def _plan_inputs(s: _Session, export: str) -> str:
+    """16 hex digits over what a plan of this export is made from: the config's path, its bytes, the export's query file."""
+    source = Path(s.req.config).resolve()
+    parts = [str(source).encode(), source.read_bytes()]
+    for entry in s.pf.config.get("exports") or []:
+        if isinstance(entry, dict) and entry.get("name") == export and entry.get("query_file"):
+            try:
+                parts.append((source.parent / str(entry["query_file"])).read_bytes())
+            except OSError:
+                parts.append(b"")
+    digest = hashlib.sha256()
+    for part in parts:
+        digest.update(len(part).to_bytes(8, "big") + part)
+    return digest.hexdigest()[:16]
+
+
+def _refuse_foreign_artifact(artifact: Path, export: str, config: str) -> None:
+    """Refuse a plan object that does not record this task's export and config, expired or not; the file is left alone."""
     doc = _read_json(artifact)
-    if isinstance(doc, dict) and doc.get("export_name") != export:
+    if not isinstance(doc, dict):
+        return
+    named, planned = doc.get("export_name"), doc.get("config_path")
+    same_config = isinstance(planned, str) and planned != "" and Path(planned).resolve() == Path(config).resolve()
+    if named != export or not same_config:
         raise PreflightRefusal(
             "RIVET_AIRFLOW_PLAN_ARTIFACT_FOREIGN",
-            f"the sealed plan artifact {artifact} is for export `{doc.get('export_name')}`, not `{export}`: applying "
-            "it would extract the other export under this task's name. It is neither applied nor replaced; delete "
-            "the file once you know what wrote it",
+            f"the sealed plan artifact {artifact} records export `{named}` of config `{planned}`, and this task "
+            f"applies export `{export}` of config `{config}`: applying it would extract something else under this "
+            "task's name. It is neither applied nor replaced; delete the file once you know what wrote it",
         )
 
 
@@ -569,8 +595,8 @@ def _apply(s: _Session) -> Outcome:
     """`rivet plan -e X -o artifact` when no unexpired artifact exists, then `rivet apply artifact`."""
     export = s.req.export or ""
     cfg = s.config_for(None)
-    artifact = _private_dir(s.work, "plans", s.run) / f"{path_name(export)}.json"
-    _refuse_foreign_artifact(artifact, export)
+    artifact = _private_dir(s.work, "plans", s.run) / f"{path_name(export, s.req.label[2], _plan_inputs(s, export))}.json"
+    _refuse_foreign_artifact(artifact, export, cfg)
     if not _unexpired(artifact):
         plan_argv = [s.pf.binary, "plan", "--config", cfg, "--export", export, "--format", "json"]
         plan_argv += ["--output", str(artifact), "--json-errors"]
@@ -578,7 +604,7 @@ def _apply(s: _Session) -> Outcome:
         error = s.classify(planned)
         if error is not None:
             return s.outcome(planned, [UnitResult(export, status="failed", error=error)], error)
-        _refuse_foreign_artifact(artifact, export)
+        _refuse_foreign_artifact(artifact, export, cfg)
     has_summary = s.pf.caps.has_flag("apply", "--summary-output")
     summary = s.work / f"{s.name}.summary.json"
     argv = [s.pf.binary, "apply", str(artifact)]
@@ -615,7 +641,7 @@ def _unit_from_metrics(s: _Session, cfg: str, export: str) -> UnitResult:
 def _plan(s: _Session) -> Outcome:
     """`rivet plan --format json` for the whole config, swapped into `plan_file` only when a builder can read it."""
     target = Path(str(s.req.plan_file))
-    scratch = target.with_name(target.name + ".tmp")
+    scratch = target.with_name(f"{target.name}.{s.global_name}.tmp")
     argv = [s.pf.binary, "plan", "--config", s.config_for(None), "--format", "json", *s.req.extra_args, "--json-errors"]
     step = s.step("plan", argv, stdout_to=scratch)
     error = s.classify(step)
