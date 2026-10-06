@@ -137,3 +137,4 @@
 - [ADR-0025 — CDC paged refill loop inlined per adapter](adr/0025-cdc-paged-refill-loop-inlined-per-adapter.md)
 - [ADR-0026 — First-party extension seam](adr/0026-first-party-extension-seam.md)
 - [ADR-0027 — Structured read relation seam](adr/0027-structured-read-relation-seam.md)
+- [ADR-0039 — The scheduler contract](adr/0039-scheduler-contract.md)

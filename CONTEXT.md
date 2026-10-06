@@ -162,6 +162,30 @@ as three differently-aliased bools (`bound_at_open`, `non_block`,
 (`src/source/cdc/mod.rs`). _Avoid_: bounded flag, non-block mode, until-current
 mode (as a type name — `until_current` remains the user-facing config key).
 
+## Scheduler contract (ADR-0039)
+
+**Error object**:
+The one machine shape of a failure — `code`, `kind`, `class`, `exit_code`,
+`retryable`, `action`, `message` — produced by one function and carried by every
+emitter. A consumer branches on `retryable`, never on text or a table of exit
+codes. _Avoid_: error class (that is the text-derived `error_class` metric
+label), error payload.
+
+**Stop reason**:
+Why a successful CDC drain ended: `caught_up` or `max_events`. Taken from the
+drain's own cap flag, never inferred from counts. _Avoid_: drain status, backlog
+flag.
+
+**State identity**:
+The credential-free source key a state records as its owner. A declared
+`sqlite:` state directory holding another source's state is refused
+(`RIVET_STATE_FOREIGN`). _Avoid_: pipeline id, config hash.
+
+**Run lease**:
+The `run:<export>` lease the process running an export holds for the whole run;
+a second process waits for it up to `--lock-wait`. It lives in the state, so it
+does not fence two hosts with separate state. _Avoid_: run lock, config lock.
+
 ## Pool predictor
 
 The single constructor of a `PoolItem`'s predicted duration

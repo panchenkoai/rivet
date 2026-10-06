@@ -1,0 +1,32 @@
+{
+  "error": "2 export(s) failed: orders_cdc, events",
+  "exit_class": 5,
+  "code": "RIVET_SOURCE_CDC_LOG_GAP",
+  "exit_code": 5,
+  "class": "refusal",
+  "kind": "refusal",
+  "retryable": false,
+  "action": "restore the missing log, or delete the checkpoint so the stream anchors FIRST, then re-snapshot",
+  "failures": [
+    {
+      "export": "orders_cdc",
+      "code": "RIVET_SOURCE_CDC_LOG_GAP",
+      "kind": "refusal",
+      "class": "refusal",
+      "exit_code": 5,
+      "retryable": false,
+      "action": "restore the missing log, or delete the checkpoint so the stream anchors FIRST, then re-snapshot",
+      "message": "export 'orders_cdc': the checkpoint position is no longer in the source log"
+    },
+    {
+      "export": "events",
+      "code": null,
+      "kind": null,
+      "class": "retryable",
+      "exit_code": 2,
+      "retryable": true,
+      "action": null,
+      "message": "export 'events': connection reset by peer"
+    }
+  ]
+}
