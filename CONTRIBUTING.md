@@ -158,5 +158,9 @@ The codebase is organized into focused modules:
 | `notify.rs` | Slack notifications |
 | `resource.rs` | RSS memory monitoring |
 
+`make archfacts` collects deterministic facts for an architecture review — churn and co-change,
+callers, trait implementors, cycles, duplicate bodies — so a reviewer cites them instead of
+re-discovering them: [`dev/pytools/archfacts/README.md`](dev/pytools/archfacts/README.md).
+
 See [docs/architecture.md](docs/architecture.md) for the data-flow diagram,
 the trait surface, and the memory model.

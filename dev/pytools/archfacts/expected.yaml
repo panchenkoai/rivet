@@ -1,0 +1,58 @@
+# Hand-verified facts about rivet, checked by `archfacts selftest --rivet` (scip backend).
+# Each entry: fact -> value -> how it was verified. Verified at 92f2db0a (2026-10-06).
+# When an entry drifts, re-run its command, confirm the new value by reading the code, then edit it here.
+
+- fact: traits[name=source::Source].impls_prod
+  value: 5
+  verified: >-
+    /usr/bin/grep -rnE "^impl (super::)?Source for " src  ->  5 unindented impls:
+    OracleSource, PostgresSource, MysqlSource, MongoSource, MssqlSource
+
+- fact: traits[name=source::Source].impls_test
+  value: 9
+  verified: >-
+    /usr/bin/grep -rnE "^\s+impl (crate::source::)?Source for " src  ->  9 impls, each inside a #[cfg(test)] mod.
+    The two `impl Source for` in tests/live/live_cdc_multi_table_cycle.rs implement that file's own trait and must not count.
+
+- fact: traits[name=tuning::adaptive::PressureSource].hypothetical_seam
+  value: true
+  verified: >-
+    /usr/bin/grep -rnE "impl.*\bPressureSource for" src tests  ->  one production impl (src/tuning/adaptive.rs:341,
+    for Box<dyn Source>) and two test impls (DeadSampler, VecSource)
+
+- fact: items[name=pipeline::commit::write_sink_parts].call_sites
+  value: 6
+  verified: >-
+    /usr/bin/grep -rn "write_sink_parts" src tests  ->  6 calls outside comments and tests: single.rs:373, keyset.rs:167,
+    chunked/exec.rs:130 and :345, chunked/parallel_checkpoint.rs:306, chunked/sequential_checkpoint.rs:103
+
+- fact: items[name=pipeline::commit::write_sink_parts].test_refs
+  value: 1
+  verified: the same grep  ->  one call from test code, src/pipeline/sink/tests.rs:1785
+
+- fact: items[name=plan::build::parse_column_overrides_pub].passthrough_to
+  value: plan::build::parse_column_overrides
+  verified: sed -n 888,893p src/plan/build.rs  ->  the body is `parse_column_overrides(raw, export_name)`
+
+- fact: enum_matches[enum=load::cdc::CompactOrder].match_sites
+  value: 3
+  verified: >-
+    /usr/bin/grep -rn "CompactOrder::" src  ->  arm patterns in exactly three `match` expressions:
+    load/cdc.rs:143, load/clickhouse.rs:430, load/mod.rs:175; every other hit constructs a value or is a `matches!`
+
+- fact: modules[path=src/redact.rs].pub_items
+  value: 6
+  verified: /usr/bin/grep -nE "^\s*pub(\([a-z]+\))? (fn|struct|enum|const|static|type|trait)" src/redact.rs  ->  6 lines
+
+- fact: feature_diff.modules_only_here
+  value: [init::oracle, preflight::oracle, source::oracle, source::oracle::arrow_convert, source::oracle::cdc, source::oracle::kind]
+  verified: >-
+    /usr/bin/grep -rn -A1 'cfg(feature = "oracle")' src | /usr/bin/grep -E "mod \w+;"  ->  init/mod.rs, preflight/mod.rs and
+    source/mod.rs each gate `mod oracle;`; ls src/source/oracle/*.rs  ->  mod, arrow_convert, cdc, kind
+
+- fact: git.cochange[a=src/pipeline/cdc_job.rs,b=src/source/cdc/mod.rs].together
+  rev: 92f2db0a7fa8c626d99c348d0d28d6b307f582c2
+  value: 9
+  verified: >-
+    /usr/bin/git log 92f2db0a -200 --name-only --format=@%H -- . | awk (count commits of at most 30 files naming both
+    src/pipeline/cdc_job.rs and src/source/cdc/mod.rs)  ->  together=9 of 21 and 30 commits; pinned to `rev`, so it never drifts

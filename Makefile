@@ -18,6 +18,13 @@ LIVE_ALL = python3 dev/pytools/live_slot.py --slots $(LIVE_SLOTS) --all --
 pr-ready:  ## Everything a PR must pass before it is opened; paste the summary block into the PR body. ARGS=--fast skips mutants (reported NOT RUN); ARGS='--body FILE' grades the PR body's declarations.
 	python3 dev/pytools/pr_ready.py run $(ARGS)
 
+.PHONY: archfacts archfacts-selftest
+archfacts:  ## Architecture facts for the review agents, both feature sets, then the digest (LENS=hotspots); dev/pytools/archfacts/README.md
+	$(PY) -m dev.pytools.archfacts collect --features both && $(PY) -m dev.pytools.archfacts view architect --lens $(or $(LENS),hotspots)
+
+archfacts-selftest:  ## The fixture crate on both backends plus expected.yaml against rivet (indexes the crate: minutes, ~5 GB)
+	$(PY) -m dev.pytools.archfacts selftest --rivet --require-index
+
 live:  ## Any live command inside a slot: make live CMD="cargo nextest run --run-ignored only -E 'test(x)'"
 	$(LIVE) $(CMD)
 

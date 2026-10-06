@@ -1260,6 +1260,11 @@ jobs:
         run: |
           python3 dev/pytools/fault_catalog.py --self-test
           python3 dev/pytools/nightly.py --self-test
+      # The architecture-facts collector, graded on its fixture crate. `--no-index`
+      # skips the rust-analyzer half with a counted SKIP line: this image has no
+      # rust-analyzer, and indexing is not a PR-CI cost (`make archfacts-selftest`).
+      - name: Architecture facts self-test (approximate backend; index half skipped)
+        run: python3 -m dev.pytools.archfacts selftest --no-index
       # The PRIORITISER's classification, graded over a coverage export copied
       # from a real `cargo llvm-cov --lib --bins --json` run: an executed
       # function, an untaken branch inside one, a function measured at zero, a
