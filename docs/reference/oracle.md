@@ -133,7 +133,7 @@ Parquet); dates before 1582-10-15 are not converted from Oracle's Julian calenda
   (`RIVET_CONFIG_CDC_CONTINUOUS_UNSUPPORTED`), and an Oracle CDC export cannot feed a
   `load:` block. A `TRUNCATE` (table, partition or subpartition) of a captured table
   is refused after the changes before it are delivered and checkpointed, and every
-  re-run stops there until you re-anchor and re-snapshot. It captures NUMBER, FLOAT, BINARY_FLOAT/DOUBLE, DATE, TIMESTAMP
+  re-run stops there until you [re-baseline](cdc-failure-modes.md#the-shape-of-every-recovery) the stream. It captures NUMBER, FLOAT, BINARY_FLOAT/DOUBLE, DATE, TIMESTAMP
   (every zone form), VARCHAR2/NVARCHAR2/CHAR/NCHAR and RAW columns and refuses a table
   with any other type by name.
 - Graded only against Oracle AI Database 23ai/26ai Free. 21c XE (amd64-only) does

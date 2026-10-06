@@ -455,7 +455,7 @@ pub(crate) fn stale_buffer_refusal(
         "refusing to land a whole-table pass of `{base}`: `{buffer}` still holds {rows} change \
          row(s) from BEFORE it, and the next `rivet compact` would merge those older values \
          over the new base. If they belong to the CURRENT base, run `rivet compact` first; if \
-         this pass re-snapshots past them, drop `{buffer}`. Then re-run this `rivet load` — \
+         this pass re-baselines past them, drop `{buffer}`. Then re-run this `rivet load` — \
          nothing was consumed"
     )))
 }

@@ -43,6 +43,22 @@ updates:
       - dependency-name: "jsonwebtoken"
         update-types:
           - version-update:semver-major
+      # arrow, arrow-schema and parquet are one release train and must resolve to
+      # ONE Arrow family: parquet's writer takes arrow-array's RecordBatch, so two
+      # majors side by side do not compile. Dependabot checks each crate alone, and
+      # a lone `arrow` bump is "update_not_possible" for it (cargo keeps arrow at
+      # the locked major while the rest of the family is locked), so its group PR
+      # moved arrow-schema and parquet and left arrow behind (#446). Move the
+      # three together, by hand.
+      - dependency-name: "arrow"
+        update-types:
+          - version-update:semver-major
+      - dependency-name: "arrow-schema"
+        update-types:
+          - version-update:semver-major
+      - dependency-name: "parquet"
+        update-types:
+          - version-update:semver-major
     # One combined PR for the (major-only) churn, so the whole upgrade is
     # reviewed and CI'd together rather than as N racing branches.
     groups:

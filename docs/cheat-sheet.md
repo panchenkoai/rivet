@@ -163,7 +163,7 @@ Rules of thumb:
 - PostgreSQL: an abandoned slot pins WAL and fills the disk. Drop it with
   `SELECT pg_drop_replication_slot('{{SLOT}}');`. Set `max_slot_wal_keep_size` to cap it.
 - SQL Server: change-table retention defaults to about 3 days. A run that falls
-  behind it fails loudly and needs a re-snapshot.
+  behind it fails loudly and needs a re-baseline (Recovery, below).
 - Reading from a replica is verified on every engine: MySQL (`log_replica_updates=ON`;
   rivet refuses a replica without it), PostgreSQL 16+ standbys in continuous mode only
   (`until_current: false`), SQL Server readable secondaries and MongoDB secondaries
@@ -352,8 +352,8 @@ Recovery:
 | Symptom | Action |
 |---|---|
 | Run failed | Re-run. The checkpoint did not advance, so the data is re-read, not lost |
-| PG slot invalidated/dropped, MySQL binlog purged (ERROR 1236), MSSQL below retention | Re-baseline in ONE run (the run anchors first, then re-reads the baseline): delete the checkpoint (MySQL/MSSQL/Mongo) or let the slot be recreated (PG), AND clear the export's `cdc_snapshot` row + `snapshot/_SUCCESS`, AND truncate `<table>__changes` before the next load. Deleting the checkpoint alone is refused (prior-run evidence exists) |
-| MySQL checkpoint used against another server | Refused on purpose. Same order on the new host: fresh checkpoint first, then re-snapshot |
+| PG slot invalidated/dropped, MySQL binlog purged (ERROR 1236), MSSQL below retention, Oracle archived logs gone, a TRUNCATE | Re-baseline in ONE run (the run anchors first, then re-reads every table): delete the checkpoint file if there is one, AND move every file out of the export's destination (old parts still hold removed rows; every `snapshot/_SUCCESS` goes with them), AND delete the export's `cdc_snapshot` rows, AND give the export `cdc.initial: snapshot` if it has none, AND truncate `<table>__changes` before the next load; then re-run. A separate `mode: full` export does not re-baseline the stream (it is refused into the stream's destination) |
+| MySQL checkpoint used against another server | Refused on purpose. Re-baseline on the new host, same steps |
 
 ---
 

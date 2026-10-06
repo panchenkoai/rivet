@@ -672,6 +672,12 @@ exclude_re = [
     # live_cdc::mysql_cdc_refuses_minimal_row_metadata_at_open, RED against the
     # `Ok(())` stub (2026-10-01: "doctor ran no CDC binlog server config check").
     "replace mysql_checks -> Result<\\(\\)> with Ok\\(\\(\\)\\)",
+    # `mongo_checks` (preflight/cdc_health.rs) is doctor's MongoDB glue: its first
+    # statement is `probe_capability(url, tls)?` (a live replica set), so its body stub
+    # is born MISSED offline. Live:
+    # live_cdc_mongo::roast_corrupt_checkpoint_fails_loudly_not_silent_reanchor, RED
+    # against the `Ok(())` stub (2026-10-06: "doctor ran no CDC checkpoint check").
+    "replace mongo_checks -> Result<\\(\\)> with Ok\\(\\(\\)\\)",
     # The base-and-buffer siblings of `load_one_cdc` / `run_loads` (2026-09-17):
     # the same live-only script (state DB, bucket listing, a BigQuery loader), so
     # their body stubs are born MISSED for the documented reason above. Their
