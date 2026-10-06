@@ -231,6 +231,8 @@ mod live_reconcile_repair;
 mod live_resume;
 #[path = "live/live_retry_and_faults.rs"]
 mod live_retry_and_faults;
+#[path = "live/live_rig_seams.rs"]
+mod live_rig_seams;
 #[path = "live/live_schema_drift.rs"]
 mod live_schema_drift;
 #[path = "live/live_shape_drift.rs"]

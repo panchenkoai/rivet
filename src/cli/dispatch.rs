@@ -372,6 +372,7 @@ fn dispatch_cdc(a: CdcArgs) -> Result<()> {
                 // Likewise no `row_hash:` surface — a hash's covered column set is
                 partition: None,
                 partition_guard: None,
+                key: None,
                 // a contract the warehouse table carries, which needs a config file
                 // to declare.
                 row_hash: crate::config::RowHash::All(false),

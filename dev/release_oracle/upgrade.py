@@ -34,6 +34,9 @@ Per SQL engine, on the downloaded previous binary and this one:
              must restore every key; one that appended must draw no warning and stay complete.
   cdc-load   per CDC engine into BigQuery, in UTC and a non-UTC source zone: the previous
              `init --mode cdc` config continued by this binary (upgrade_cdc_load.py).
+  matrix     every family of `load_mode_of` x engine x ClickHouse and BigQuery: the previous
+             release's init, run and load, a change, this binary's run and load, graded by
+             rig_oracle.grade_load (upgrade_matrix.py).
   cdc        per CDC engine: the previous release anchors a stream and captures a batch;
              this binary continues its checkpoint and captures exactly the next batch —
              nothing skipped, nothing of the first batch re-read.
@@ -58,6 +61,7 @@ from .core import Ledger, Proc, isolate_state_db, rivet_bin, run
 from .engines import sql as _sql
 from .regression import _require_prev_binary
 from .upgrade_cdc_load import cdc_load_cells
+from .upgrade_matrix import matrix_cells
 
 __all__ = ["verify_upgrade_continuity"]
 
@@ -634,6 +638,7 @@ def verify_upgrade_continuity(led: Ledger) -> None:
         led.skipped("postgres", "-", SCEN, "load", "upgrade[postgres/load]: no RIVET_ORACLE_POSTGRES_URL", "no url")
     _continued_key_load_cells(led, prev, root)
     cdc_load_cells(led, prev, root)
+    matrix_cells(led, prev, root)
     for engine in CDC_ENGINES:
         cvar = CDC_URL_VARS.get(engine, f"RIVET_CDC_{engine.upper()}_URL")
         curl = os.environ.get(cvar, "")

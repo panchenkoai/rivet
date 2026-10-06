@@ -131,8 +131,8 @@ fn clickhouse_rows_match_source(view: &str, source: Vec<(i64, i64)>, deleted: &s
     );
 }
 
-/// Snapshot, then inserts, updates (one key twice) and a delete: the view must
-/// equal the source row for row, with the deleted key flagged, not missing.
+/// Snapshot, then inserts, updates (one key twice, one key moved) and a delete: the view must
+/// equal the source row for row, with the deleted key and the moved key's old value flagged.
 #[test]
 #[ignore = "live: requires clickhouse + fake-gcs + mysql-cdc"]
 fn a_mysql_cdc_stream_loads_into_clickhouse_and_the_view_matches_the_source() {
@@ -154,12 +154,13 @@ fn a_mysql_cdc_stream_loads_into_clickhouse_and_the_view_matches_the_source() {
              UPDATE {tbl} SET v = 99 WHERE id = 1; \
              UPDATE {tbl} SET v = 30 WHERE id = 3; \
              UPDATE {tbl} SET v = 31 WHERE id = 3; \
+             UPDATE {tbl} SET id = 9 WHERE id = 4; \
              DELETE FROM {tbl} WHERE id = 2"
         ))
         .expect("changes");
     rig.run_ok();
     load(&rig);
-    clickhouse_rows_match_source(&view, source_rows(&tbl), "2");
+    clickhouse_rows_match_source(&view, source_rows(&tbl), "2\n4");
 }
 
 /// A stream with no snapshot leg: the load holds exactly the rows changed after the pin run.
@@ -226,12 +227,13 @@ fn a_postgres_cdc_stream_loads_into_clickhouse_and_the_view_matches_the_source()
          UPDATE {tbl} SET v = 99 WHERE id = 1; \
          UPDATE {tbl} SET v = 30 WHERE id = 3; \
          UPDATE {tbl} SET v = 31 WHERE id = 3; \
+         UPDATE {tbl} SET id = 9 WHERE id = 4; \
          DELETE FROM {tbl} WHERE id = 2"
     ))
     .expect("changes");
     rig.run_ok();
     load(&rig);
-    clickhouse_rows_match_source(&view, source(&mut c), "2");
+    clickhouse_rows_match_source(&view, source(&mut c), "2\n4");
 }
 
 /// The same cycle from SQL Server: the version decodes a 10-byte LSN.
@@ -278,12 +280,13 @@ fn a_sql_server_cdc_stream_loads_into_clickhouse_and_the_view_matches_the_source
          UPDATE dbo.{table} SET v = 99 WHERE id = 1; \
          UPDATE dbo.{table} SET v = 30 WHERE id = 3; \
          UPDATE dbo.{table} SET v = 31 WHERE id = 3; \
+         UPDATE dbo.{table} SET id = 9 WHERE id = 4; \
          DELETE FROM dbo.{table} WHERE id = 2"
     ));
-    wait_for_capture(&ci, 14);
+    wait_for_capture(&ci, 16);
     rig.run_ok();
     load(&rig);
-    clickhouse_rows_match_source(&view, source(), "2");
+    clickhouse_rows_match_source(&view, source(), "2\n4");
 }
 
 /// A primary-key-changing UPDATE on SQL Server reaches ClickHouse as a delete of the old

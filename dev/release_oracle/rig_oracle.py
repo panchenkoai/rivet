@@ -556,6 +556,20 @@ def _proj(col: str, st: str, dt: str, own: str) -> str:
     return f"CAST({_qi(col)} AS VARCHAR)" if temporal or mixed or floats or decimal_vs_float else _qi(col)
 
 
+def key_match(ora, left: str, la: str, right: str, ra: str, key: list[str]) -> str:
+    """`la.k = ra.k` per key column: by value when either side is numeric (an Oracle NUMBER reaches DuckDB as text from the source and as DECIMAL(38,9) from BigQuery), else as text."""
+    lt, rt = dict(_columns(ora, left)), dict(_columns(ora, right))
+
+    def one(k: str) -> str:
+        a, b = f"{la}.{_qi(k)}", f"{ra}.{_qi(k)}"
+        text = f"CAST({a} AS VARCHAR) = CAST({b} AS VARCHAR)"
+        if not (_is_num(lt.get(k, "")) or _is_num(rt.get(k, ""))):
+            return text
+        return f"coalesce(TRY_CAST({a} AS DECIMAL(38,9)) = TRY_CAST({b} AS DECIMAL(38,9)), {text})"
+
+    return " AND ".join(one(k) for k in key)
+
+
 def _numtext(v: object) -> object:
     """A numeric text as an exact Decimal (so `1.50` and `1.5` are one value); anything else unchanged."""
     import decimal
@@ -1385,6 +1399,7 @@ def grade_load(spec: dict) -> dict:
         fq = loaded[0][0]
         leaf = fq.split(".")[-1]
         src, key, native = _source(ora, spec, renders)
+        key = spec.get("key") or key
         ora.db.sql(f"CREATE OR REPLACE TEMP TABLE source_rows AS SELECT * FROM {src}")
         src = "source_rows"
         if target == "clickhouse":
@@ -1472,13 +1487,13 @@ def grade_load(spec: dict) -> dict:
             ora.db.sql(f"CREATE OR REPLACE TEMP TABLE wh AS SELECT {keep} FROM wh_all {live}")
         if spec.get("delta") and not cdc and key:
             # A delta load cannot express a delete: a key the source no longer holds stays in the warehouse by design.
-            on = " AND ".join(f"CAST(s.{_qi(k)} AS VARCHAR) = CAST(w.{_qi(k)} AS VARCHAR)" for k in key)
+            on = key_match(ora, "source_rows", "s", "wh", "w", key)
             stale = ora.scalar(f"SELECT count(*) FROM wh w WHERE NOT EXISTS (SELECT 1 FROM source_rows s WHERE {on})")
             if stale:
                 ora.db.sql(f"DELETE FROM wh w WHERE NOT EXISTS (SELECT 1 FROM source_rows s WHERE {on})")
                 partial.append(f"{stale} warehouse key(s) the source no longer holds are not graded: a delta load cannot express a delete")
         if (cdc or "__pos" in have) and key:
-            on = " AND ".join(f"CAST(s.{_qi(k)} AS VARCHAR) = CAST(w.{_qi(k)} AS VARCHAR)" for k in key)
+            on = key_match(ora, "source_rows", "s", "wh_all", "w", key)
             if not spec.get("snapshot"):
                 # The rows the load must hold: every row changed between the stream's first and latest successful runs, plus the keys it holds.
                 kl = ", ".join(_qi(k) for k in key)
@@ -1491,7 +1506,7 @@ def grade_load(spec: dict) -> dict:
                         held.append(f"SELECT {kl} FROM read_parquet({_lit(spec['anchor_keys'])})")
                 else:
                     partial.append("CDC load without a snapshot leg and no source images of its stream: only the keys the warehouse holds are graded")
-                ek = " AND ".join(f"CAST(s.{_qi(k)} AS VARCHAR) = e.{_qi(k)}" for k in key)
+                ek = key_match(ora, "source_rows", "s", "wh_all", "e", key)
                 src = f"(SELECT s.* FROM {src} s SEMI JOIN ({' UNION '.join(held)}) e ON {ek})"
                 notes.append(f"no snapshot leg: graded the keys the warehouse holds{' and every row the stream owed' if state else ''}")
             if "__is_deleted" in have:
@@ -1725,6 +1740,11 @@ def _compare_self_test() -> None:
     assert diff(flags.format(1, 0, 5), flags.format(1, 7, 1), defects={"b": ["5"]}) != (0, 0), \
         "without a key, a delivered value no sample explains is still a difference"
 
+    ora = _Mem()
+    ora.db.sql("CREATE TABLE s AS SELECT '1' AS \"ID\", '7' AS k")
+    ora.db.sql("CREATE TABLE w AS SELECT 1::DECIMAL(38,9) AS \"ID\", '7' AS k UNION ALL SELECT 2, '7'")
+    held = f"SELECT count(*) FROM w WHERE EXISTS (SELECT 1 FROM s WHERE {key_match(ora, 's', 's', 'w', 'w', ['ID', 'k'])})"
+    assert ora.scalar(held) == 1, "a NUMBER key read from BigQuery as DECIMAL(38,9) is the source's key, by value"
     ora = _Mem()
     ora.db.sql("CREATE TABLE t AS SELECT * FROM (VALUES (1, 'a'), (2, 'b'), (3, 'c')) v(id, v)")
     with tempfile.TemporaryDirectory() as d:

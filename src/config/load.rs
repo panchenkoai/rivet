@@ -435,6 +435,17 @@ pub enum KeyColumns {
     Columns(Vec<String>),
 }
 
+impl KeyColumns {
+    /// The key a load declares: its columns, none for `none`, or `None` for `auto` (the source's).
+    pub fn declared(self) -> Option<Vec<String>> {
+        match self {
+            KeyColumns::Columns(cols) => Some(cols),
+            KeyColumns::None => Some(Vec::new()),
+            KeyColumns::Auto => None,
+        }
+    }
+}
+
 impl<'de> Deserialize<'de> for KeyColumns {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
@@ -790,6 +801,14 @@ mod tests {
         );
         let err = parse(serde_json::json!("id")).unwrap_err().to_string();
         assert!(err.contains("`auto`, `none` or a list"), "{err}");
+        assert_eq!(
+            KeyColumns::Columns(vec!["a".into(), "b".into()]).declared(),
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
+        assert_eq!(
+            (KeyColumns::Auto.declared(), KeyColumns::None.declared()),
+            (None, Some(Vec::new()))
+        );
         let defaults = bigquery(serde_json::json!({}));
         assert_eq!(
             (defaults.pk, defaults.cluster_by, defaults.partition),
