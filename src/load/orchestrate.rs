@@ -1246,7 +1246,7 @@ fn load_one_cdc_base(
                 let manifests: Vec<_> = stream.iter().map(|(_, m)| m.clone()).collect();
                 let integrity =
                     load::before_write(load::reconcile::reconcile(&manifests, allow_source_drift))?;
-                let ownership = ownership_after_leg(!landed.is_empty(), inputs.ownership);
+                let ownership = ownership_after_leg(landed.len(), inputs.ownership);
                 let (cleanup, _prefix_lease) = cleanup_target_leased(
                     plan,
                     store,
@@ -1287,11 +1287,10 @@ fn load_one_cdc_base(
 }
 
 /// Whose the append's names are once this load's own whole-table leg has landed the table.
-fn ownership_after_leg(leg_landed: bool, before: load::Ownership) -> load::Ownership {
-    if leg_landed {
-        load::Ownership::Own
-    } else {
-        before
+fn ownership_after_leg(legs_landed: usize, before: load::Ownership) -> load::Ownership {
+    match legs_landed {
+        0 => before,
+        _ => load::Ownership::Own,
     }
 }
 
@@ -2041,7 +2040,7 @@ fn load_incremental_job(
                 let manifests: Vec<_> = split.deltas.iter().map(|(_, m)| m.clone()).collect();
                 let integrity =
                     load::before_write(load::reconcile::reconcile(&manifests, allow_source_drift))?;
-                let ownership = ownership_after_leg(landed_table, inputs.ownership);
+                let ownership = ownership_after_leg(usize::from(landed_table), inputs.ownership);
                 let (cleanup, _prefix_lease) = cleanup_target_leased(
                     plan,
                     store,
@@ -3071,6 +3070,16 @@ mod load_ledger_tests {
             ),
             "(refusal, (exit, code), warehouse writes)"
         );
+    }
+
+    /// Only a leg that landed in this load makes the names rivet's own for the next leg.
+    #[test]
+    fn a_landed_leg_and_only_that_makes_the_next_leg_rivets_own() {
+        use load::Ownership::{Foreign, Own, Unreadable};
+        assert_eq!(ownership_after_leg(0, Foreign), Foreign);
+        assert_eq!(ownership_after_leg(0, Unreadable), Unreadable);
+        assert_eq!(ownership_after_leg(1, Foreign), Own);
+        assert_eq!(ownership_after_leg(2, Unreadable), Own);
     }
 
     /// A first load whose whole-table leg and deltas arrive together still lands both: the

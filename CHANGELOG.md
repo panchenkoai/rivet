@@ -13,9 +13,12 @@
     (`refusing to overwrite ...`) carries the same code and exits 5; it exited 1.
   - What "no record" means: the state DB this `rivet load` opened has no load of that target.
     Tables, views and logs loaded under the same state DB are unaffected, and so is a load
-    without a state DB. A load pointed at a NEW state DB (a lost one, another host) is now
-    refused where it used to append: restore the state DB, or drop or rename the view and the
-    log and load again.
+    without a state DB. A load pointed at a NEW state DB is now refused where it used to
+    append: a lost state DB, another host, or a container whose state DB does not outlive the
+    run (refused from its second cycle). Keep the state DB between runs (a volume, or a
+    PostgreSQL state), restore it, or drop or rename the view and the log and load again.
+  - A state DB that is configured and cannot be read refuses the same objects, as it already
+    did for a table.
   - A stop before the write exits as what stopped it. `RIVET_LOAD_ADOPTION_COLUMN_MISMATCH`
     now reaches the error line and exits 5 (it exited 1 with no code).
 - **A load that stops before writing never becomes the reason the next load overwrites.** The
