@@ -556,7 +556,7 @@ pub(crate) fn pg_interval_to_iso8601(months: i32, days: i32, microseconds: i64) 
 
 /// Generic wrapper that reads any Postgres binary value as a UTF-8 string.
 /// Used for enum types whose OID is not a standard text OID.
-struct AnyAsString(String);
+pub(super) struct AnyAsString(String);
 
 impl<'a> postgres_types::FromSql<'a> for AnyAsString {
     fn from_sql(

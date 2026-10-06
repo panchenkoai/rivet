@@ -177,3 +177,28 @@ scenarios:
     mssql:    { na: "same shared escape + override (src/plan/build.rs:389-405, PG-RED-proven). MSSQL's row_estimate is RELIABLE (sys.dm_db_partition_stats, mssql/mod.rs:1023-1034), so a small MSSQL table WITHOUT an explicit knob correctly downgrades chunked→Snapshot (the prior 'stays mode=chunked' text was wrong) — an intended downgrade, no loss; the resumability-preserving override is the shared PG-tested `!explicit_chunk_shape` branch." }
     mongo:    { na: "the escape lives in chunked_strategy_from_introspection, unreachable for Mongo (chunked mode bails at build.rs:313); no reltuples-based escape in the Mongo reader" }
     oracle:   { na: "same shared escape + override (src/plan/build.rs, PG-RED-proven). Oracle's estimate is ALL_TABLES.NUM_ROWS (0 until DBMS_STATS), so the escape fires only once stats exist — an intended downgrade; the resumability-preserving override is the shared PG-tested branch" }
+
+  # ── plans that ended in exit 0 and zero rows over a non-empty source ───────
+  - id: range_query_aliases_chunk_column
+    what: "query: aliases another column to the chunk column's name (SELECT legacy_id AS id ...) → the range is read from the query's own output, not the base table's column"
+    postgres: { test: a_query_that_aliases_the_chunk_column_delivers_its_rows_postgres }
+    mysql:    { test: a_query_that_aliases_the_chunk_column_delivers_its_rows_mysql }
+    mssql:    { test: a_query_that_aliases_the_chunk_column_delivers_its_rows_mssql }
+    mongo:    { na: "chunked mode is rejected for MongoDB at config validation; there is no SQL projection" }
+    oracle:   { test: a_query_that_aliases_the_chunk_column_delivers_its_rows_oracle }
+
+  - id: keyset_parallel_incremental_narrow_int_key
+    what: "parallel + keyset_incremental on a 16-bit integer key delivers every row on run 1 and only the new keys on run 2"
+    postgres: { test: parallel_keyset_incremental_on_a_smallint_key_delivers_every_row_postgres }
+    mysql:    { test: parallel_keyset_incremental_on_a_smallint_key_delivers_every_row_mysql }
+    mssql:    { test: parallel_keyset_incremental_on_a_smallint_key_delivers_every_row_mssql }
+    mongo:    { na: "Mongo pages _id; there is no SQL boundary probe and no keyset_incremental" }
+    oracle:   { test: parallel_keyset_incremental_on_a_number5_key_delivers_every_row_oracle }
+
+  - id: guard_probe_value_of_unreadable_type
+    what: "a planner probe (range bound, keyset boundary or ceiling) whose non-NULL value the adapter cannot read is refused naming the type, never taken for an empty table"
+    postgres: { test: a_probe_value_of_an_unreadable_type_is_refused_by_name_postgres }
+    mysql:    { na: "query_scalar reads the text protocol: every non-NULL scalar arrives as bytes whatever its type, so no per-type reader can miss (src/source/mysql/mod.rs)" }
+    mssql:    { na: "scalar_to_string has an arm per ColumnData kind and renders any other kind through Debug; no arm returns None for a value (src/source/mssql/mod.rs)" }
+    mongo:    { na: "query_scalar answers only the reconcile COUNT; Mongo has no SQL probes" }
+    oracle:   { na: "cell_text dispatches on the column kind and propagates decode errors; it has no fall-through that returns None for a value (src/source/oracle/mod.rs)" }

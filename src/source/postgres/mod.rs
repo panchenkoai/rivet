@@ -758,6 +758,12 @@ impl super::Source for PostgresSource {
         if let Ok(Some(v)) = row.try_get::<_, Option<f64>>(0) {
             return Ok(Some(v.to_string()));
         }
+        if let Ok(Some(v)) = row.try_get::<_, Option<i16>>(0) {
+            return Ok(Some(v.to_string()));
+        }
+        if let Ok(Some(v)) = row.try_get::<_, Option<u32>>(0) {
+            return Ok(Some(v.to_string()));
+        }
         // TIMESTAMP / DATE / TIMESTAMPTZ — required for MIN/MAX on time columns (e.g. chunk_by_days)
         if let Ok(Some(v)) = row.try_get::<_, Option<chrono::NaiveDateTime>>(0) {
             return Ok(Some(v.format("%Y-%m-%d %H:%M:%S%.f").to_string()));
@@ -779,7 +785,14 @@ impl super::Source for PostgresSource {
         if let Ok(Some(v)) = row.try_get::<_, Option<String>>(0) {
             return Ok(Some(v));
         }
-        Ok(None)
+        // Only SQL NULL is "no value": a value no arm above reads must not pass for an empty table.
+        if matches!(
+            row.try_get::<_, Option<arrow_convert::AnyAsString>>(0),
+            Ok(None)
+        ) {
+            return Ok(None);
+        }
+        anyhow::bail!(unreadable_probe(row.columns()[0].type_().name(), sql))
     }
 
     fn type_mappings(
@@ -1049,8 +1062,31 @@ fn is_short_fetch(row_count: usize, requested: usize) -> bool {
     row_count < requested
 }
 
+/// The refusal for a non-NULL probe value of a type `query_scalar` has no reader for.
+fn unreadable_probe(pg_type: &str, sql: &str) -> String {
+    format!(
+        "postgres: cannot read a planner probe's `{pg_type}` value. rivet reads a probe as an \
+         integer (int2, int4, int8, oid), float8, a string, a date, a timestamp or a uuid, and \
+         never takes another type for \"no rows\". Chunk, page or partition this export on a \
+         column of one of those types, remove `parallel:` from a keyset export, or use \
+         `mode: full`. Probe: {sql}"
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_unreadable_probe_names_the_type_the_remedy_and_the_probe() {
+        assert_eq!(
+            super::unreadable_probe("numeric", "SELECT max(\"id\") FROM t"),
+            "postgres: cannot read a planner probe's `numeric` value. rivet reads a probe as an \
+             integer (int2, int4, int8, oid), float8, a string, a date, a timestamp or a uuid, \
+             and never takes another type for \"no rows\". Chunk, page or partition this export \
+             on a column of one of those types, remove `parallel:` from a keyset export, or use \
+             `mode: full`. Probe: SELECT max(\"id\") FROM t"
+        );
+    }
+
     #[test]
     fn the_fetch_cap_applies_once_to_a_measurable_batch() {
         use super::wants_fetch_cap;

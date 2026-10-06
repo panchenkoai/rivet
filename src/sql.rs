@@ -104,11 +104,11 @@ pub(crate) fn strip_select_star_from(base_query: &str) -> Option<&str> {
 /// wide row into a temp-file spill (the wrap measured ~3.2 GB of temp_files on
 /// an 8.6 GB table).
 ///
-/// Acceptance stays strict so a filtered / derived / joined / de-duplicated
-/// query is never rewritten to the bare table: the projection must be bare
-/// column references only — any `(` (function / subquery), quote, `DISTINCT`,
-/// or other token → `None`; any trailing clause after the table → `None`. On
-/// `None` the caller wraps exactly as before.
+/// Acceptance stays strict so a filtered / derived / joined / de-duplicated /
+/// renamed query is never rewritten to the bare table: the projection must be
+/// bare column references only — any `(` (function / subquery), quote, alias,
+/// `DISTINCT`, or other token → `None`; any trailing clause after the table →
+/// `None`. On `None` the caller wraps exactly as before.
 pub(crate) fn strip_simple_projection_from(base_query: &str) -> Option<&str> {
     let trimmed = base_query.trim();
     let after_select = strip_prefix_ascii_ci(trimmed, "select").map(str::trim_start)?;
@@ -142,22 +142,14 @@ fn find_from_keyword(s: &str) -> Option<usize> {
     None
 }
 
-/// A non-empty list of bare column references: only ASCII alphanumerics, `_`,
-/// `.`, `,`, `*`, and whitespace — and not a leading `DISTINCT` (which would
-/// change the row count / set, breaking the wrapped row count and the
-/// whole-table equivalence the fast path relies on). Functions (`(`), quoted
-/// idents / string literals, and any other punctuation → `false`.
+/// A comma-separated list whose every item is ONE bare column reference (`col`, `t.col`, `*`); a second token in an item is an alias or a row limiter (`a AS b`, `a b`, `DISTINCT a`, `TOP 5 a`), and the query is then not the table.
 fn is_plain_column_list(s: &str) -> bool {
-    if s.is_empty() {
-        return false;
-    }
-    if let Some(rest) = strip_prefix_ascii_ci(s, "distinct")
-        && rest.starts_with(|c: char| c.is_whitespace())
-    {
-        return false;
-    }
-    s.chars().all(|c| {
-        c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ',' | '*' | ' ' | '\t' | '\n' | '\r')
+    s.split(',').all(|item| {
+        let item = item.trim();
+        !item.is_empty()
+            && item
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '*'))
     })
 }
 
@@ -460,6 +452,34 @@ mod tests {
         assert!(strip_simple_projection_from("SELECT 'from x' FROM t").is_none());
         // Three-part identifier is not `[schema.]table`.
         assert!(strip_simple_projection_from("SELECT id FROM a.b.c").is_none());
+    }
+
+    #[test]
+    fn strip_simple_projection_rejects_a_projection_that_renames_or_limits() {
+        for query in [
+            "SELECT legacy_id AS id, name FROM customers",
+            "SELECT legacy_id id, name FROM customers",
+            "SELECT id, name AS label FROM customers",
+            "SELECT TOP 10 id FROM customers",
+            "SELECT ALL id FROM customers",
+            "SELECT id,, name FROM customers",
+        ] {
+            assert_eq!(strip_simple_projection_from(query), None, "{query}");
+        }
+    }
+
+    #[test]
+    fn a_bound_over_an_aliased_projection_is_read_from_the_query_not_the_table() {
+        let query = "SELECT legacy_id AS id, name FROM customers";
+        assert_eq!(
+            aggregate_sql(SourceType::Postgres, "min", "id", query),
+            "SELECT min(\"id\") AS rivet_agg FROM (SELECT legacy_id AS id, name FROM customers) AS _rivet"
+        );
+        assert_eq!(
+            null_key_probe_sql(SourceType::Postgres, "id", query),
+            "SELECT 1 FROM (SELECT legacy_id AS id, name FROM customers) AS _rivet_nullprobe \
+             WHERE \"id\" IS NULL LIMIT 1"
+        );
     }
 
     #[test]

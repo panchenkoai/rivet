@@ -217,6 +217,8 @@ mod live_pg_state;
 mod live_plan_apply;
 #[path = "live/live_plan_output_ux.rs"]
 mod live_plan_output_ux;
+#[path = "live/live_planner_zero_rows.rs"]
+mod live_planner_zero_rows;
 #[path = "live/live_pool_ledger.rs"]
 mod live_pool_ledger;
 #[path = "live/live_pool_safety.rs"]
