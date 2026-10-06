@@ -327,8 +327,8 @@ pub(crate) fn plan_logs(
         !threads.is_empty(),
         "oracle cdc: no redo log covers SCN {start}..{end} — the archived logs the checkpoint \
          needs are gone. The changes between the checkpoint and the oldest available log are \
-         LOST to this stream. Delete the checkpoint so the next run anchors afresh FIRST, then \
-         re-snapshot the tables."
+         LOST to this stream. {}",
+        crate::source::cdc::checkpoint_identity::RECOVER
     );
     let mut out = Vec::new();
     for (thread, files) in threads {
@@ -337,19 +337,19 @@ pub(crate) fn plan_logs(
             oldest.first <= start,
             "oracle cdc: the oldest redo log still available for thread {thread} starts at SCN \
              {} but the checkpoint needs {start} — the archives in between were deleted and the \
-             changes they held are LOST to this stream. Delete the checkpoint so the next run \
-             anchors afresh FIRST, then re-snapshot the tables.",
-            oldest.first
+             changes they held are LOST to this stream. {}",
+            oldest.first,
+            crate::source::cdc::checkpoint_identity::RECOVER
         );
         for w in files.windows(2) {
             anyhow::ensure!(
                 w[1].sequence == w[0].sequence + 1,
                 "oracle cdc: redo sequence {} of thread {thread} is missing (have {} then {}) — \
-                 the changes it held are LOST to this stream. Restore the archived log, or \
-                 delete the checkpoint (anchor first, then re-snapshot).",
+                 the changes it held are LOST to this stream. Restore the archived log, or: {}",
                 w[0].sequence + 1,
                 w[0].sequence,
-                w[1].sequence
+                w[1].sequence,
+                crate::source::cdc::checkpoint_identity::RECOVER
             );
         }
         out.extend(files);
@@ -402,8 +402,8 @@ impl std::fmt::Display for LogSetFault {
             Self::Hole(lo, hi) => write!(
                 f,
                 "oracle cdc: LogMiner reports a missing log file inside SCN {lo}..{hi} — the \
-                 changes it held are LOST to this stream. Restore the archived log, or delete \
-                 the checkpoint (anchor first, then re-snapshot)."
+                 changes it held are LOST to this stream. Restore the archived log, or: {}",
+                crate::source::cdc::checkpoint_identity::RECOVER
             ),
             Self::Reused { name, sequence } => write!(
                 f,
@@ -501,9 +501,9 @@ pub(crate) fn row_identity(
             crate::error::codes::SOURCE_CDC_UNDECODABLE,
             "oracle cdc: LogMiner gave a change to heap table `{owner}.{table}` no row id ({}). \
              rivet pairs the key moves of one statement by it, so it refuses rather than guess. \
-             Re-snapshot the table (delete the checkpoint first so the stream anchors, then \
-             snapshot).",
-            other.unwrap_or("NULL")
+             {}",
+            other.unwrap_or("NULL"),
+            crate::source::cdc::checkpoint_identity::RECOVER
         ),
     }
 }
@@ -1102,9 +1102,9 @@ impl OracleChangeStream {
             crate::rivet_bail!(
                 crate::error::codes::SOURCE_CDC_LOG_GAP,
                 "oracle cdc: LogMiner reports missing redo ({}) — the changes it held are LOST to \
-                 this stream. Restore the archived log, or delete the checkpoint (anchor first, \
-                 then re-snapshot).",
-                text(7)?.unwrap_or_default()
+                 this stream. Restore the archived log, or: {}",
+                text(7)?.unwrap_or_default(),
+                crate::source::cdc::checkpoint_identity::RECOVER
             );
         }
         let status = text(6)?.unwrap_or_default();
@@ -1113,10 +1113,9 @@ impl OracleChangeStream {
                 crate::error::codes::SOURCE_CDC_UNDECODABLE,
                 "oracle cdc: LogMiner cannot decode a change to `{owner}.{table}` ({op}, status \
                  {status}: {}). A DDL on the table since this redo was written is the usual \
-                 cause: the online dictionary decodes only the table's current shape. \
-                 Re-snapshot the table (delete the checkpoint first so the stream anchors, then \
-                 snapshot).",
-                text(7)?.unwrap_or_default()
+                 cause: the online dictionary decodes only the table's current shape. {}",
+                text(7)?.unwrap_or_default(),
+                crate::source::cdc::checkpoint_identity::RECOVER
             );
         }
         let t = self
@@ -1141,8 +1140,8 @@ impl OracleChangeStream {
                 anyhow::anyhow!(
                     "oracle cdc: a {op:?} of `{owner}.{table}` carries no value for {name} — its \
                      redo was written without ALL COLUMNS supplemental logging (enabled later, \
-                     or dropped since). Writing NULL would be a silent wrong value; re-snapshot \
-                     the table (delete the checkpoint first so the stream anchors, then snapshot)."
+                     or dropped since). Writing NULL would be a silent wrong value. {}",
+                    crate::source::cdc::checkpoint_identity::RECOVER
                 )
             })?;
             let value = |side: Side| -> Result<RivetValue> {
@@ -1389,11 +1388,9 @@ pub(crate) fn truncate_refusal_message(owner: &str, table: &str, stmt: &str) -> 
          destination with no DELETE to retract it — the source empty, the destination not, \
          permanently, because those rows left the source without events and no later capture \
          can reconcile them. Every re-run stops here again: the checkpoint sits at the last \
-         commit before the truncate. Recover in rivet's OWN order: re-anchor FIRST (delete the \
-         checkpoint so the next run pins a fresh one), THEN re-snapshot the table \
-         (`mode: full`). Snapshotting first leaves everything changed between the snapshot and \
-         the new anchor in neither — a silent gap as wide as the snapshot takes.",
-        stmt.trim().trim_end_matches(';')
+         commit before the truncate. {}",
+        stmt.trim().trim_end_matches(';'),
+        crate::source::cdc::checkpoint_identity::RECOVER
     )
 }
 
@@ -2057,7 +2054,10 @@ mod tests {
                 .unwrap_err();
             assert_eq!(crate::error::classify_exit(&e), 5, "{e}");
             let e = e.to_string();
-            assert!(e.contains("anchors afresh FIRST, then re-snapshot"), "{e}");
+            assert!(
+                e.ends_with(crate::source::cdc::checkpoint_identity::RECOVER),
+                "{e}"
+            );
         }
         assert!(matches!(
             identity_verdict(None, &server),

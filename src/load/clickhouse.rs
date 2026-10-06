@@ -693,8 +693,9 @@ fn changelog_conflict(
         .find_map(|p| engine.strip_prefix(p))
         .unwrap_or(engine);
     let restart = format!(
-        "Nothing was written. Drop it and `{view}`, then re-snapshot the export (a CDC stream) \
-         or `rivet state reset` it (an incremental one) so the next load starts the log over"
+        "Nothing was written. Drop it and `{view}`, then start the log over: an incremental \
+         export with `rivet state reset`; a CDC stream with its re-baseline. {}",
+        crate::source::cdc::checkpoint_identity::RECOVER
     );
     if engine != want_engine {
         return Some(format!(

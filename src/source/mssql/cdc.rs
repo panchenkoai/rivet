@@ -267,6 +267,7 @@ fn fill_sql(p: Poll<'_>) -> String {
     } else {
         String::new()
     };
+    let recover = crate::source::cdc::checkpoint_identity::RECOVER.replace('\'', "''");
     format!(
         "DECLARE @from binary(10) = {from_expr}; \
          DECLARE @min binary(10) = sys.fn_cdc_get_min_lsn('{ci}'); \
@@ -274,8 +275,7 @@ fn fill_sql(p: Poll<'_>) -> String {
          {floor} \
          IF @from IS NOT NULL AND @min IS NOT NULL AND @from < @min \
             THROW {RETENTION_GAP_ERROR}, 'rivet cdc: the resume position is older than the SQL Server \
-CDC change-table retention (the cleanup job removed it). Resuming would silently skip changes \
-— restart CDC from a fresh checkpoint FIRST, then re-snapshot the table (mode: full): snapshotting first leaves the changes in between in neither.', 1; \
+CDC change-table retention (the cleanup job removed it). Resuming would silently skip changes. {recover}', 1; \
          DECLARE @to binary(10) = NULL; \
          IF @from IS NOT NULL AND @max IS NOT NULL AND @from <= @max \
             SELECT @to = MAX(s) FROM (SELECT TOP ({batch}) __$start_lsn AS s \

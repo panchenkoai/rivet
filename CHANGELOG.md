@@ -33,6 +33,20 @@
   names the table schema-qualified, with its remedy. The existing key-only-delete warning now
   names what each table's DELETE carries (its primary key, or its replica identity index's
   columns), instead of saying "the primary key" for every non-FULL table.
+- **CDC data-loss messages name a re-baseline you can follow.** The PostgreSQL slot-created
+  warning and the refusals and warnings for a lost or unusable CDC position (dropped slot,
+  purged binlog, change table past retention, deleted archive logs, a foreign or invalid
+  checkpoint, TRUNCATE, DROP, an undecodable change) told the operator to
+  `re-snapshot (mode: full)`. From the state that printed it, that is refused: a `cdc:`
+  block is only valid with `mode: cdc`, and a batch export cannot write into the stream's
+  destination. Every such message, and the matching `rivet doctor` hints, now ends with one
+  text: delete the checkpoint, move every file out of the export's destination (its old parts
+  still hold rows the source no longer has), delete the export's `cdc_snapshot` rows, give it
+  `cdc.initial: snapshot` if it has none, truncate `<table>__changes` before the next load,
+  and re-run; that run anchors first and re-reads every table after. The actions of
+  `RIVET_SOURCE_CDC_FOREIGN_CHECKPOINT`, `_CHECKPOINT_INVALID`, `_LOG_GAP`, `_TRUNCATED`,
+  `_UNDECODABLE` and `_CELL_UNSUPPORTED` say the same; the codes are unchanged. An alert that
+  matches on the old wording (`re-snapshot`, `mode: full`) needs updating.
 
 ## 0.31.0 — 2026-10-04
 
