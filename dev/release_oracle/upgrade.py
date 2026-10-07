@@ -57,11 +57,11 @@ import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 
-from .core import Ledger, Proc, first_error, isolate_state_db, rivet_bin, run
+from .core import Ledger, Proc, first_error, isolate_state_db, rivet_bin, run, run_lanes, server_of
 from .engines import sql as _sql
 from .regression import _require_prev_binary
-from .upgrade_cdc_load import cdc_load_cells
-from .upgrade_matrix import matrix_cells
+from .upgrade_cdc_load import cdc_load_lane_cells
+from .upgrade_matrix import matrix_lane_cells
 
 __all__ = ["verify_upgrade_continuity"]
 
@@ -493,17 +493,26 @@ class _SqlKeys:
 RESUME_LOAD_ENGINES = ("mongo", *ENGINES)
 
 
-def _continued_key_load_cells(led: Ledger, prev: Path, root: Path) -> None:
-    """upgrade[<engine>/resume-load] for every engine with a URL, each recorded PASS, FAIL or a named SKIP."""
+def _continued_key_load_lane_cells(prev: Path, root: Path) -> list[tuple[object, object]]:
+    """upgrade[<engine>/resume-load] for every engine as `(lane, fn)`: a cell on its source server's lane, or a named SKIP."""
     proj, bucket = os.environ.get("BQ_ORACLE_PROJECT", ""), os.environ.get("BQ_ORACLE_BUCKET", "")
+    cells: list[tuple[object, object]] = []
     for engine in RESUME_LOAD_ENGINES:
         var = f"RIVET_ORACLE_{engine.upper()}_URL"
         url = os.environ.get(var, "")
         why = "no BQ_ORACLE_PROJECT / BQ_ORACLE_BUCKET" if not (proj and bucket) else f"no {var}" if not url else ""
         if why:
-            led.skipped(engine, "-", SCEN, "resume-load", f"upgrade[{engine}/resume-load]: {why}", why)
+            cells.append((None, lambda led, e=engine, why=why: led.skipped(
+                e, "-", SCEN, "resume-load", f"upgrade[{e}/resume-load]: {why}", why)))
             continue
-        _continued_key_load_leg(led, prev, root, engine, url, proj, bucket)
+        cells.append((server_of(url), lambda led, e=engine, u=url: _continued_key_load_leg(
+            led, prev, root, e, u, proj, bucket)))
+    return cells
+
+
+def warehouse_lane_cells(prev: Path, root: Path) -> list[tuple[object, object]]:
+    """The resume-load, cdc-load and matrix cells in ledger order, each on the lane of the source server it reads."""
+    return [*_continued_key_load_lane_cells(prev, root), *cdc_load_lane_cells(prev, root), *matrix_lane_cells(prev, root)]
 
 
 def _continued_key_load_leg(led: Ledger, prev: Path, root: Path, engine: str, url: str, proj: str,
@@ -636,9 +645,7 @@ def verify_upgrade_continuity(led: Ledger) -> None:
         _load_leg(led, prev, root, os.environ["RIVET_ORACLE_POSTGRES_URL"])
     else:
         led.skipped("postgres", "-", SCEN, "load", "upgrade[postgres/load]: no RIVET_ORACLE_POSTGRES_URL", "no url")
-    _continued_key_load_cells(led, prev, root)
-    cdc_load_cells(led, prev, root)
-    matrix_cells(led, prev, root)
+    run_lanes(led, warehouse_lane_cells(prev, root))
     for engine in CDC_ENGINES:
         cvar = CDC_URL_VARS.get(engine, f"RIVET_CDC_{engine.upper()}_URL")
         curl = os.environ.get(cvar, "")
@@ -659,6 +666,5 @@ if __name__ == "__main__":
         else:
             _led.skipped("postgres", "-", SCEN, "load", "upgrade[postgres/load]: no RIVET_ORACLE_POSTGRES_URL",
                          "no url")
-        _continued_key_load_cells(_led, _prev, _root)
-        cdc_load_cells(_led, _prev, _root)
+        run_lanes(_led, [*_continued_key_load_lane_cells(_prev, _root), *cdc_load_lane_cells(_prev, _root)])
     raise SystemExit(_led.report())
