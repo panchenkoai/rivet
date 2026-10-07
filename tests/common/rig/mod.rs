@@ -17,6 +17,7 @@ use super::runner::RIVET_BIN;
 /// every backend (two renderers per backend is the drift the rig exists to
 /// prevent).
 mod invoke;
+pub use invoke::Spawned;
 mod materialize;
 mod oracle;
 mod render;

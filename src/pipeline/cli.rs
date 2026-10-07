@@ -248,6 +248,7 @@ pub fn reset_state(config_path: &str, export_name: &str) -> Result<()> {
         );
     }
     let state = StateStore::open(config_path)?;
+    let _held = super::chunked::claim_export_progress(&state, export_name, "reset its state")?;
     state.reset(export_name)?;
     println!("State reset for export '{}'", export_name);
     Ok(())
@@ -421,6 +422,8 @@ pub fn reset_chunk_checkpoint(config_path: &str, export_name: &str) -> Result<()
         );
     }
     let state = StateStore::open(config_path)?;
+    let _held =
+        super::chunked::claim_export_progress(&state, export_name, "remove its chunk checkpoint")?;
     let n = state.reset_chunk_checkpoint(export_name)?;
     // Abandoning the resume also clears the committed/verified boundary, so
     // `rivet state progression` does not report a stale chunk boundary after
@@ -481,6 +484,14 @@ pub fn reset_chunk_checkpoints_stuck(config_path: &str) -> Result<()> {
     );
 
     for name in targets {
+        let Some(_held) = super::chunked::try_run_lease(&state, &name)? else {
+            println!(
+                "Skipping '{}': {} is in progress in a live rivet process, so its checkpoint is not stuck.",
+                name,
+                super::chunked::live_run_label(&state, &name)?
+            );
+            continue;
+        };
         let n = state.reset_chunk_checkpoint(&name)?;
         println!("Removed {} chunk run record(s) for export '{}'.", n, name);
     }
@@ -1473,6 +1484,66 @@ exports:
         let state = StateStore::open(&config_path).unwrap();
         assert!(state.find_in_progress_chunk_run("ghost").unwrap().is_some());
         assert_eq!(state.reset_chunk_checkpoint("ghost").unwrap(), 1);
+    }
+
+    /// While a live run holds the export's run lease every reset is refused under its code and
+    /// removes nothing, twice over; once the lease is released each one goes through.
+    #[test]
+    fn every_reset_is_refused_while_the_exports_run_lease_is_held() {
+        let (dir, config_path) = setup_dir();
+        let run = open_state(&dir);
+        run.create_chunk_run("r_tx", "transactions", "plan", 3)
+            .unwrap();
+        run.update_with_column("transactions", "pg/out", "2026-09-01", "updated_at")
+            .unwrap();
+        let held = crate::pipeline::chunked::try_run_lease(&run, "transactions")
+            .unwrap()
+            .expect("the live run's lease");
+
+        for cycle in 0..2 {
+            for refused in [
+                reset_state(&config_path, "transactions"),
+                reset_chunk_checkpoint(&config_path, "transactions"),
+            ] {
+                let err = refused.expect_err("a reset against a live run");
+                assert_eq!(
+                    crate::error::error_code(&err),
+                    Some("RIVET_STATE_RUN_IN_PROGRESS"),
+                    "cycle {cycle}: {err:#}"
+                );
+            }
+            reset_chunk_checkpoints_stuck(&config_path).unwrap();
+            assert!(
+                run.find_in_progress_chunk_run("transactions")
+                    .unwrap()
+                    .is_some(),
+                "cycle {cycle}: the live run keeps its chunk run"
+            );
+            assert_eq!(
+                run.list_all().unwrap().len(),
+                1,
+                "cycle {cycle}: the live run keeps its cursor row"
+            );
+        }
+
+        drop(held);
+        reset_chunk_checkpoints_stuck(&config_path).unwrap();
+        assert!(
+            run.find_in_progress_chunk_run("transactions")
+                .unwrap()
+                .is_none(),
+            "a chunk run nobody holds is stuck, and is cleared"
+        );
+        reset_state(&config_path, "transactions").unwrap();
+        assert!(run.list_all().unwrap().is_empty());
+        run.create_chunk_run("r_tx2", "transactions", "plan", 3)
+            .unwrap();
+        reset_chunk_checkpoint(&config_path, "transactions").unwrap();
+        assert!(
+            run.find_in_progress_chunk_run("transactions")
+                .unwrap()
+                .is_none()
+        );
     }
 
     // ── show_progression ─────────────────────────────────────────────────────
