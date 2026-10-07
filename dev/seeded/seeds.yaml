@@ -538,3 +538,28 @@ seeds:
       lib:
         patch: position-below-log-start-moved-up/mssql.patch
         cells: ["lib:a_position_below_the_low_watermark_always_reaches_the_refusal"]
+
+  - name: baseline-mark-outlives-capture
+    class: a CDC table's baseline mark outlives the capture it describes, so a table put back into the stream (or another table pointed at its destination) is continued with no baseline
+    history: "2026-10-07 - a table removed from `tables:`, changed, and put back: exit 0, 2 source rows not delivered and 2 delivered rows not in the source, on PostgreSQL, MySQL, MongoDB and Oracle (v0.31.0)"
+    scope: source
+    patch: baseline-mark-outlives-capture/shared.patch
+    engines:
+      postgres:
+        cells:
+          - pg_table_removed_from_tables_and_put_back_is_refused_until_rebaselined
+          - pg_table_switched_to_another_over_its_baseline_is_refused_and_switched_back_continues
+      mysql:
+        cells:
+          - mysql_table_removed_from_tables_and_put_back_is_refused_until_rebaselined
+          - mysql_table_switched_to_another_over_its_baseline_is_refused_and_switched_back_continues
+      mssql:
+        cells: [mssql_cdc_table_switched_to_another_over_its_baseline_is_refused_and_switched_back_continues]
+      mongo:
+        cells:
+          - mongo_cdc_collection_removed_from_tables_and_put_back_is_refused_until_rebaselined
+          - mongo_cdc_collection_switched_to_another_over_its_baseline_is_refused_and_switched_back_continues
+      oracle:
+        cells:
+          - oracle_cdc_table_removed_from_tables_and_put_back_is_refused_until_rebaselined
+          - oracle_cdc_table_switched_to_another_over_its_baseline_is_refused_and_switched_back_continues

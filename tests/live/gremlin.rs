@@ -312,6 +312,10 @@ fn gremlin_row_count_max_fires_on_over_limit_source() {
     let export_name = unique_name("gr_rmax");
 
     let rig = Rig::pg_batch(&export_name)
+        .a_failed_run_may_leave(
+            &[Leftover::OrphanPart, Leftover::FileLog],
+            "the quality gate judges the parts after they are written",
+        )
         .query(&format!(
             r#"SELECT id FROM {table_name}"#,
             table_name = table.name()
@@ -353,6 +357,10 @@ fn gremlin_row_count_min_boundary_is_inclusive() {
     // amend — an amend would thread run 1's state under run 2.
     let boundary_rig = |export: &str, min: u32, dest: std::path::PathBuf| {
         Rig::pg_batch(export)
+            .a_failed_run_may_leave(
+                &[Leftover::OrphanPart, Leftover::FileLog],
+                "the quality gate judges the parts after they are written",
+            )
             .query(&format!("SELECT id FROM {}", table.name()))
             .mode("full")
             .export_line("quality:")
@@ -525,6 +533,10 @@ fn gremlin_multi_export_one_quality_fail_does_not_abort_others() {
     // survival is the assertion. Its destination is the rig's `out_dir_for`.
     let q = format!("SELECT id FROM {}", table.name());
     let rig = Rig::pg_batch(&fail_name)
+        .a_failed_run_may_leave(
+            &[Leftover::OrphanPart, Leftover::FileLog],
+            "the quality gate judges the parts after they are written",
+        )
         .query(&q)
         .mode("full")
         .export_line("quality:")

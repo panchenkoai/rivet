@@ -268,6 +268,10 @@ fn rebaseline_remedy_after_a_truncate_leaves_no_removed_key_live_in_bigquery_pos
     let _cleanup = bq.cleanup(&[&table, &changes]);
     let rig = Rig::pg_cdc(&table, &slot)
         .cdc("initial: snapshot")
+        .a_failed_run_may_leave(
+            &[Leftover::OrphanPart, Leftover::FileLog, Leftover::CdcFlush],
+            "the stream delivers the rows it read before the TRUNCATE it refuses",
+        )
         .dest_gcs_live(&bq.bucket, &bq.prefix)
         .top_line(&bq.load_line(", pk: [id]"));
     rig.run_ok();

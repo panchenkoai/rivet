@@ -1,0 +1,15 @@
+diff --git a/src/pipeline/cdc_job.rs b/src/pipeline/cdc_job.rs
+index 8077f421..ef27f82f 100644
+--- a/src/pipeline/cdc_job.rs
++++ b/src/pipeline/cdc_job.rs
+@@ -438,9 +438,7 @@ pub(super) fn initial_snapshot_pending(
+     }
+     let capture = crate::state::ProgressKey::cdc(&export.name, &config.source.state_key(), &tables);
+     let capture_dest = export.destination.state_key();
+-    let captured = state
+-        .captured_tables(&capture, &capture_dest)?
+-        .unwrap_or_else(|| tables.clone());
++    let captured = tables.clone();
+     if let Some(i) = rejoins_over_a_baseline(&captured, &tables, &done_flags) {
+         let t = &tables[i];
+         let snap = super::finalize::destination_uri_for_manifest(&table_dests[i].2);

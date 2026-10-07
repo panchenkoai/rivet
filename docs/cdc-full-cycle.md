@@ -205,6 +205,17 @@ did not grow); live state still equals the source.
 - **`rivet validate --config cfg.yaml`** certifies both legs — the baseline under
   `snapshot/` and the change parts — and never reports the baseline as stray.
 
+### Putting a table back into `tables:`
+
+A table removed from `tables:` is no longer captured, so what changes in it afterwards is not
+in the destination. Adding it again is refused (`RIVET_STATE_CDC_TABLE_REJOINED`, exit 5,
+nothing read or written) while its old baseline is still recorded, because that baseline
+predates those changes. To put it back: move every file out of the table's directory in the
+destination, delete its `cdc_snapshot` row from the state DB, truncate its `__changes` table
+if a warehouse load consumes the stream, and run again. That run reads the table in full and
+captures it from there. The same refusal answers a `table:` pointed at another table over a
+destination that already holds a completed baseline.
+
 ## Running the automated scenario
 
 ```sh

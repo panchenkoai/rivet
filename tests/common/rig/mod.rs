@@ -90,6 +90,8 @@ pub struct Rig {
     oracle_xfail: Option<(String, String)>,
     /// Whether a graded run of an `oracle_xfail` rig disagreed, as the marker expects.
     oracle_xfailed: std::cell::Cell<bool>,
+    /// What this rig's failed runs may leave behind (see `Rig::a_failed_run_may_leave`).
+    failed_run_leaves: Vec<super::refusal::Leftover>,
     /// Top-level lines rendered after the exports. See [`Rig::top_line`].
     top_lines: Vec<String>,
     /// Caller-owned config copies produced by [`Rig::config_in`] — a
@@ -151,6 +153,7 @@ impl Rig {
             oracle_off: None,
             oracle_xfail: None,
             oracle_xfailed: std::cell::Cell::new(false),
+            failed_run_leaves: Vec::new(),
             top_lines: Vec::new(),
             cloud_dest: None,
             dest_prefix_unslashed: false,
@@ -286,6 +289,14 @@ impl Rig {
     /// Point the same export (name, config dir and state DB kept) at another table or collection.
     pub fn repoint(mut self, table: &str) -> Self {
         self.tables = vec![table.to_string()];
+        self
+    }
+
+    /// Point a SQL Server CDC export at another capture instance.
+    pub fn capture_instance(mut self, ci: &str) -> Self {
+        self.cdc_lines
+            .retain(|l| !l.starts_with("capture_instance:"));
+        self.cdc_lines.push(format!("capture_instance: {ci}"));
         self
     }
 

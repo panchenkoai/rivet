@@ -176,6 +176,10 @@ fn keyset_export_enforces_on_schema_drift_fail() {
     let export_name = unique_name("keyset_drift_exp");
     let out = tempfile::tempdir().unwrap();
     let rig = Rig::pg_batch(&table_name)
+        .a_failed_run_may_leave(
+            &[Leftover::OrphanPart, Leftover::FileLog],
+            "the drift gate fails the run after its parts are written",
+        )
         .export_named(&export_name)
         .mode("chunked")
         .export_line("chunk_by_key: k")
@@ -227,6 +231,10 @@ fn keyset_parallel_export_enforces_on_schema_drift_fail() {
     let export_name = unique_name("keyset_par_drift_exp");
     let out = tempfile::tempdir().unwrap();
     let rig = Rig::pg_batch(&table_name)
+        .a_failed_run_may_leave(
+            &[Leftover::OrphanPart, Leftover::FileLog],
+            "the drift gate fails the run after its parts are written",
+        )
         .export_named(&export_name)
         .mode("chunked")
         .export_line("chunk_by_key: k")
@@ -358,6 +366,10 @@ fn drift_failed_keyset_run_still_records_observed_fingerprint_and_form_b() {
     let export_name = unique_name("keyset_drift_rec_exp");
     let out = tempfile::tempdir().unwrap();
     let rig = Rig::pg_batch(&table_name)
+        .a_failed_run_may_leave(
+            &[Leftover::OrphanPart, Leftover::FileLog],
+            "the drift gate fails the run after its parts are written",
+        )
         .export_named(&export_name)
         .mode("chunked")
         .export_line("chunk_by_key: k")
@@ -440,7 +452,19 @@ fn drift_failed_run_holds_the_cursor(label: &str, mode: &str, strategy: &[&str])
     for line in strategy {
         rig = rig.export_line(line);
     }
-    let mut rig = rig.export_line("on_schema_drift: fail").duckdb_oracle();
+    let mut rig = rig
+        .export_line("on_schema_drift: fail")
+        .a_failed_run_may_leave(
+            &[Leftover::OrphanPart, Leftover::FileLog],
+            "the drift gate fails the run after its parts are written",
+        )
+        .duckdb_oracle();
+    if strategy.contains(&"keyset_incremental: true") {
+        rig = rig.a_failed_run_may_leave(
+            &[Leftover::ResumePoint],
+            "keyset_incremental checkpoints each page: the failed run keeps its page cursor and resume_run_id as the anchor run 3 adopts (the hazard of that anchor is TRIAGE P-06)",
+        );
+    }
 
     assert!(
         rig.run_args(&["--export", &export_name]).status.success(),

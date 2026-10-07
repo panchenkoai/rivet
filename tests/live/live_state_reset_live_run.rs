@@ -349,7 +349,15 @@ fn a_killed_run_does_not_block_the_reset(engine: SqlEngine, key_line: &str, stat
 
 /// A run whose chunk-checkpoint rows are deleted under it fails; it does not publish an empty success.
 fn a_run_whose_checkpoint_rows_vanish_fails_loudly(engine: SqlEngine, state: State) {
-    let s = Scenario::new(engine, RANGE, state);
+    let mut s = Scenario::new(engine, RANGE, state);
+    s.rig = s.rig.a_failed_run_may_leave(
+        &[
+            Leftover::OrphanPart,
+            Leftover::FileLog,
+            Leftover::ChunkCheckpoint,
+        ],
+        "the test deletes the run's checkpoint rows under it: the run fails after writing pages and leaves them beside its released claim",
+    );
     let export = s.rig.export_name().to_string();
     let mut owner = s.spawn_mid_run();
     s.state.exec(

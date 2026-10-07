@@ -8,7 +8,8 @@ was to run and did not.
 
 `--verdicts LOG --lane ci|gate` grades the rig oracle's verdict log (`RIVET-ORACLE-<VERDICT> <test>
 [<export>] — <detail>`, tests/common/verify.rs) instead: a passing test's stderr is hidden, so the
-log is the only proof the oracle ran. Each count of runs the oracle did not fully grade must land
+log is the only proof the oracle ran. A run that did not exit 0 logs REFUSED (graded against its
+pre-run snapshot, tests/common/refusal.rs) or UNGRADED (the test crashed it); both are reported. Each count of runs the oracle did not fully grade must land
 within its noise of the lane's ceiling, both ways: over it is a run the oracle used to grade and no
 longer does; under it is a closed gap, and the ceiling comes down in the same PR.
 
@@ -70,6 +71,9 @@ def verdict_counts(text: str) -> Counter:
 #: The verdicts that grade a deferred run's remainder: the stream's next run compared with the source.
 GRADED = ("PASS", "FAIL", "XFAIL", "PARTIAL")
 
+#: What a known defect of a run that did not exit 0 says (tests/common/refusal.rs): it compares no source, so it pays no deferral.
+REFUSAL_XFAIL = " — [a failed run left: "
+
 
 def unpaid_deferrals(text: str) -> list[str]:
     """Every DEFERRED verdict no later graded verdict of the same test and export follows: a capped run whose remainder nothing graded."""
@@ -81,7 +85,7 @@ def unpaid_deferrals(text: str) -> list[str]:
         verdict, who = m.group(1), (m.group(2), m.group(3))
         if verdict == "DEFERRED":
             owed[who] = l
-        elif verdict in GRADED:
+        elif verdict in GRADED and REFUSAL_XFAIL not in l:
             owed.pop(who, None)
     for (test, export), l in owed.items():
         out.append(f"{test} [{export}]: a capped run deferred its remainder and no later run of the stream was graded")
@@ -92,9 +96,10 @@ def verdict_reasons(text: str) -> Counter:
     """SKIP/PARTIAL/OFF lines per reason, numbers folded to N."""
     out: Counter = Counter()
     for l in text.splitlines():
-        m = re.match(r"RIVET-ORACLE-(SKIP|PARTIAL|OFF) [^—]*— (.*)", l)
+        m = re.match(r"RIVET-ORACLE-(SKIP|PARTIAL|OFF|REFUSED|UNGRADED) [^—]*— (.*)", l)
         if m:
             why = re.sub(r" \{.*$", "", re.sub(r"grade(-load|-stdout)? \d+ ms: ?", "", m.group(2)))
+            why = re.sub(r"`[^`]*`", "`X`", re.sub(r"=\S+;", "=X;", why))
             out[f"{m.group(1)} {re.sub(r'[0-9]+', 'N', why)}"] += 1
     return out
 
@@ -119,7 +124,7 @@ def verdict_errors(text: str, lane: str) -> list[str]:
 def verdict_report(text: str, lane: str) -> list[str]:
     """The counts a lane's census prints: per class, per reason, and each banded counter against its ceiling."""
     n = verdict_counts(text)
-    out = [f"{v} {n[v]}" for v in ("PASS", "PARTIAL", "DEFERRED", "XFAIL", "SKIP", "OFF", "FAIL")]
+    out = [f"{v} {n[v]}" for v in ("PASS", "PARTIAL", "DEFERRED", "XFAIL", "SKIP", "OFF", "REFUSED", "UNGRADED", "FAIL")]
     out += ["per reason (numbers folded to N):"] + [f"{c:7d} {r}" for r, c in verdict_reasons(text).most_common()]
     out += [f"{what}: {n[what]} (ceiling {c} +-{z})" for what, (c, z) in VERDICT_CEILINGS[lane].items()]
     return out
@@ -203,6 +208,14 @@ def _verdict_self_test() -> None:
     assert any("deferred its remainder" in e for e in verdict_errors(unpaid, "ci")), "an unpaid deferral fails the lane"
     assert unpaid_deferrals("RIVET-ORACLE-DEFERRED a [t] — x\nRIVET-ORACLE-PASS a [u] — y\n"), "another export's verdict pays nothing"
     assert not unpaid_deferrals("RIVET-ORACLE-DEFERRED a [t] — x\nRIVET-ORACLE-PARTIAL a [t] — Mongo: only `_id`\n")
+    for unpaying in ("REFUSED a [t] — exit 1: left nothing", "XFAIL a [t] — [a failed run left: observed-schema] known defect: y — z"):
+        assert unpaid_deferrals(f"RIVET-ORACLE-DEFERRED a [t] — x\nRIVET-ORACLE-{unpaying}\n"), f"a failed run pays no deferral: {unpaying}"
+    refused = ("RIVET-ORACLE-REFUSED t [e_1] — exit 3: left only failure-record x2; destination of `e_1` not compared: why\n"
+               "RIVET-ORACLE-UNGRADED t [e] — exit 101: the test injected RIVET_TEST_PANIC_AT=after_part; a crash is graded by the run that resumes it\n")
+    assert verdict_reasons(refused) == Counter({
+        "REFUSED exit N: left only failure-record xN; destination of `X` not compared: why": 1,
+        "UNGRADED exit N: the test injected RIVET_TEST_PANIC_AT=X; a crash is graded by the run that resumes it": 1}), verdict_reasons(refused)
+    assert "REFUSED 1" in verdict_report(at_ceiling("ci") + refused, "ci") and "UNGRADED 1" in verdict_report(at_ceiling("ci") + refused, "ci")
     from .core import Ledger, Status
 
     log = Path(tempfile.mkdtemp(prefix="rivet-verdict-census-")) / "oracle.log"

@@ -214,7 +214,15 @@ fn gremlin_cdc_binlog_cut_mid_drain_fails_loud_then_recovers() {
     let out = d.path().join("out");
     let ckpt = d.path().join("cdc.ckpt");
     std::fs::create_dir_all(&out).unwrap();
-    let rig = cdc_rig(proxied, &tbl, &ckpt, &out);
+    let rig = cdc_rig(proxied, &tbl, &ckpt, &out).a_failed_run_may_leave(
+        &[
+            Leftover::OrphanPart,
+            Leftover::FileLog,
+            Leftover::CdcFlush,
+            Leftover::CdcCheckpoint,
+        ],
+        "the binlog connection is cut mid-drain: the flushes committed before the cut stay, and the checkpoint follows them",
+    );
 
     // Pin through the healthy proxy, then seed ~1.2 MB of binlog.
     let st = rig.run_args(&[]).status;
@@ -266,7 +274,10 @@ fn gremlin_cdc_checkpoint_write_failure_is_loud_and_lossless() {
     let ckpt = ro_dir.join("cdc.ckpt");
     let out = d.path().join("out");
     std::fs::create_dir_all(&out).unwrap();
-    let rig = cdc_rig(MYSQL_CDC_URL, &tbl, &ckpt, &out);
+    let rig = cdc_rig(MYSQL_CDC_URL, &tbl, &ckpt, &out).a_failed_run_may_leave(
+        &[Leftover::OrphanPart, Leftover::FileLog, Leftover::CdcFlush],
+        "the flush is committed before its checkpoint is written, so a checkpoint that cannot be written leaves the flush for the next run to re-read",
+    );
 
     // Pin normally (writable), THEN make the checkpoint dir read-only.
     let st = rig.run_args(&[]).status;
@@ -316,6 +327,8 @@ fn gremlin_cdc_gcs_upload_cut_fails_loud_then_recovers_without_clobber() {
     let _guard_toxi = toxiproxy_guard();
     ensure_toxi_proxy("fake_gcs_gremlin", 14443, "fake-gcs:4443");
     toxi_reset_toxics("fake_gcs_gremlin");
+    // A run of this test that panicked mid-outage left the proxy disabled.
+    toxi_enable("fake_gcs_gremlin");
 
     let d = tempfile::tempdir().unwrap();
     let tbl = unique_name("gremlin_gcs");
@@ -333,6 +346,15 @@ fn gremlin_cdc_gcs_upload_cut_fails_loud_then_recovers_without_clobber() {
         Rig::mysql_cdc(&tbl)
             .checkpoint_path(ckpt.clone())
             .cdc_line("rollover: 200")
+            .a_failed_run_may_leave(
+                &[
+                    Leftover::OrphanPart,
+                    Leftover::FileLog,
+                    Leftover::CdcFlush,
+                    Leftover::CdcCheckpoint,
+                ],
+                "the upload is cut mid-run: what reached the bucket before the cut stays, a part alone or a whole committed flush with the checkpoint behind it",
+            )
             .dest_gcs(bucket, &prefix, endpoint)
     };
 

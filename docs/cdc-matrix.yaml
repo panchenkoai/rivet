@@ -207,6 +207,22 @@ scenarios:
     mongo:    { test: mongo_missing_checkpoint_warning_remedy_recovers_the_document_written_while_it_was_gone }
     oracle:   { test: oracle_cdc_truncate_refusal_remedy_leaves_no_removed_row_live_in_the_prefix }
 
+  - id: cdc_table_put_back_is_refused_until_rebaselined
+    what: "a table taken out of `tables:` and put back is not continued over its old baseline: the stream records the tables each run captures (the `export_state` row of the export and source, per destination), and a table outside the last run's set whose baseline is recorded done is refused (RIVET_STATE_CDC_TABLE_REJOINED, exit 5, nothing read or written) on every run until its files are moved out and its `cdc_snapshot` row deleted; the next run then re-reads it and captures it again. Before, the changes made while it was out were lost with exit 0 (the rig oracle: 2 source rows not delivered, 2 delivered rows not in the source). Each green run is graded against the source by the default rig oracle"
+    postgres: { test: pg_table_removed_from_tables_and_put_back_is_refused_until_rebaselined }
+    mysql:    { test: mysql_table_removed_from_tables_and_put_back_is_refused_until_rebaselined }
+    mssql:    { na: "`tables:` is refused at config load for SQL Server (one capture instance per export); the `table:` twin below covers it" }
+    mongo:    { test: mongo_cdc_collection_removed_from_tables_and_put_back_is_refused_until_rebaselined }
+    oracle:   { test: oracle_cdc_table_removed_from_tables_and_put_back_is_refused_until_rebaselined }
+
+  - id: cdc_table_switched_over_a_baseline_is_refused
+    what: "`table:` pointed at another table while the destination holds the first one's completed baseline is refused the same way, twice, with nothing written (before: exit 0 and the new table's baseline skipped on the first one's snapshot/_SUCCESS marker); pointed back, the stream continues and delivers the row written meanwhile"
+    postgres: { test: pg_table_switched_to_another_over_its_baseline_is_refused_and_switched_back_continues }
+    mysql:    { test: mysql_table_switched_to_another_over_its_baseline_is_refused_and_switched_back_continues }
+    mssql:    { test: mssql_cdc_table_switched_to_another_over_its_baseline_is_refused_and_switched_back_continues }
+    mongo:    { test: mongo_cdc_collection_switched_to_another_over_its_baseline_is_refused_and_switched_back_continues }
+    oracle:   { test: oracle_cdc_table_switched_to_another_over_its_baseline_is_refused_and_switched_back_continues }
+
   # ── Harm / operational-cost contracts (the price CDC charges the source) ──────
   - id: cdc_drain_releases_pinned_wal
     what: "the disk-fill harm: an un-consumed logical slot pins WAL (and holds catalog_xmin, blocking vacuum); a bounded drain must advance confirmed_flush past the drained span so pg_wal_lsn_diff(current, confirmed_flush_lsn) collapses (restart_lsn / catalog_xmin follow at the next checkpoint). Oracle: the server's pg_replication_slots, not rivet's counters"

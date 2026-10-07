@@ -22,6 +22,22 @@
     that already happened. If the capture instance was re-created, or rivet did not run for
     longer than the CDC retention since the baseline, re-baseline the stream.
 
+- **Breaking: a CDC table put back into `tables:` is refused until it is re-baselined.**
+  Applies to `mode: cdc` exports with `cdc.initial: snapshot` or `backfill:`, on every engine.
+  - Before, a table removed from `tables:` and added again later kept its old baseline: the run
+    exited 0 and every insert, update and delete made while the table was out was missing from
+    the destination. The same happened when `table:` was pointed at another table and the
+    destination already held the first table's baseline: the new table got no baseline at all.
+  - Now each run records the tables the stream captures. A table that the last run did not
+    capture, whose baseline is already recorded complete, is refused
+    (`RIVET_STATE_CDC_TABLE_REJOINED`, exit 5, nothing read or written), on every run, until
+    it is re-baselined: move every file out of the table's directory in the destination,
+    delete its `cdc_snapshot` row from the state DB, and truncate its `__changes` table if a
+    warehouse load consumes the stream. The next run reads the table in full and captures it
+    from there. A table that was never captured is still baselined when it is added, as before.
+  - Upgrading: nothing to do and no state migration. The first run on the new version records
+    the current table set without checking it, so a table that was removed and put back
+    under 0.31 or earlier is not detected: re-baseline it as above if that happened.
 - **Breaking: a keyset run that a gate refused is read again, not adopted, by the next run.**
   Applies to `chunk_by_key` with `parallel: N` + `chunk_checkpoint: true`, and to
   `keyset_incremental: true` (sequential or parallel), when a `quality:` content rule

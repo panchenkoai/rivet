@@ -52,6 +52,10 @@ fn a_state_ledger_lost_mid_run_fails_loudly_and_the_next_run_delivers_every_row_
         .mode("chunked")
         .export_line("chunk_by_key: id")
         .export_line("chunk_checkpoint: true")
+        .a_failed_run_may_leave(
+            &[Leftover::OrphanPart],
+            "the state ledger is cut mid-run on purpose: the pages written before the cut stay, and the next run must deliver every row once",
+        )
         .export_line("chunk_size: 500");
     let toxi_url = postgres_state_toxi_url();
     let env = [("RIVET_STATE_URL", toxi_url.as_str())];
