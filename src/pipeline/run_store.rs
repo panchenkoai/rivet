@@ -103,23 +103,8 @@ impl<'a> RunStore<'a> {
     pub fn commit(self) -> Result<()> {
         // ADR-0001 I3 — cursor: fatal on error.
         if let Some(cursor_val) = self.cursor.as_deref() {
-            // A cursor no later run can attribute is the MT6 gap reborn: refuse to
-            // write one rather than store it without its column.
-            let column = self.plan.strategy.cursor_identity().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "export '{}': the run committed cursor `{cursor_val}` but its strategy has \
-                     no cursor identity to record it under — a defect in the strategy, not the \
-                     data; nothing was written",
-                    self.plan.export_name
-                )
-            })?;
-            self.state.update_with_column(
-                &self.plan.export_name,
-                &self.plan.source.state_key(),
-                cursor_val,
-                &column,
-                &self.plan.stream(),
-            )?;
+            self.state
+                .update_with_column(&self.plan.progress_key(), cursor_val)?;
 
             // Test fault-point: cursor advanced, but the outer-pipeline
             // record_metric has NOT been recorded. QA backlog Task 1.1.
@@ -262,6 +247,34 @@ mod tests {
     }
 
     #[test]
+    fn the_progress_key_carries_every_identity_part_of_the_plan() {
+        let mut plan = incremental_plan("orders");
+        plan.base_query = "SELECT id, updated_at FROM \"shop\".\"orders_src\" WHERE id > 0".into();
+        let key = plan.progress_key();
+        assert_eq!(key.export_name, "orders");
+        assert_eq!(key.source, "postgres://127.0.0.1:9999/nonexistent");
+        assert_eq!(key.stream, "shop.orders_src");
+        assert_eq!(key.column.as_deref(), Some("updated_at"));
+        assert!(key.continues_cursor);
+
+        plan.strategy = ExtractionStrategy::Keyset(crate::plan::KeysetPlan {
+            key_column: "id".into(),
+            chunk_size: 1000,
+            checkpoint: true,
+            incremental: false,
+            parallel: 1,
+        });
+        let key = plan.progress_key();
+        assert_eq!(key.column.as_deref(), Some("id"));
+        assert!(!key.continues_cursor, "a crash-recovery keyset");
+
+        plan.strategy = ExtractionStrategy::Snapshot;
+        plan.base_query = "SELECT 1".into();
+        let key = plan.progress_key();
+        assert_eq!((key.stream.as_str(), key.column), ("", None));
+    }
+
+    #[test]
     fn finalize_with_cursor_only_advances_state_cursor() {
         // Incremental cursor with no progression (rare but valid:
         // single.rs's incremental path technically supports this when
@@ -287,17 +300,17 @@ mod tests {
             Some("updated_at"),
             "MT4: every cursor write records its identity"
         );
-        let scope = plan.source.state_key();
+        let elsewhere = crate::state::ProgressKey {
+            stream: "shop.customers".into(),
+            ..plan.progress_key()
+        };
         let said = state
-            .claim_stream("orders", &scope, "shop.customers", true)
-            .expect_err("MT8: the cursor write recorded the relation the plan reads")
+            .claim(elsewhere)
+            .err()
+            .expect("MT8: the cursor write recorded the relation the plan reads")
             .to_string();
         assert!(said.contains("reading `shop.orders_src`"), "{said}");
-        assert!(
-            state
-                .claim_stream("orders", &scope, &plan.stream(), true)
-                .is_ok()
-        );
+        assert!(state.claim(plan.progress_key()).is_ok());
     }
 
     #[test]

@@ -19,6 +19,7 @@ use crate::state::StateStore;
 
 pub(crate) fn run_with_reconnect(
     state: &StateStore,
+    progress: &crate::state::ProgressClaim<'_>,
     plan: &ResolvedRunPlan,
     summary: &mut RunSummary,
     config_path: &str,
@@ -118,6 +119,7 @@ pub(crate) fn run_with_reconnect(
         match run_export(
             &mut *src,
             state,
+            progress,
             plan,
             summary,
             config_path,
@@ -218,6 +220,7 @@ fn decide_export_retry(
 pub(crate) fn run_export(
     src: &mut dyn Source,
     state: &StateStore,
+    progress: &crate::state::ProgressClaim<'_>,
     plan: &ResolvedRunPlan,
     summary: &mut RunSummary,
     config_path: &str,
@@ -238,7 +241,7 @@ pub(crate) fn run_export(
         if plan.source.source_type == crate::config::SourceType::Mongo && kp.parallel.max(1) > 1 {
             return super::mongo_parallel::run_mongo_parallel(plan, summary, state, kp);
         }
-        return super::keyset::run_keyset(src, plan, summary, Some(state));
+        return super::keyset::run_keyset(src, plan, summary, Some(state), progress);
     }
 
     // Chunked strategies own their own execution path.
@@ -259,11 +262,7 @@ pub(crate) fn run_export(
 
     // All non-chunked strategies: ask the strategy for its query and cursor needs.
     let cursor_state = if plan.strategy.needs_cursor_state() {
-        let identity = plan
-            .strategy
-            .cursor_identity()
-            .expect("a strategy that needs cursor state has a cursor identity");
-        Some(state.get_owned(&plan.export_name, &plan.source.state_key(), &identity)?)
+        Some(progress.cursor()?)
     } else {
         None
     };

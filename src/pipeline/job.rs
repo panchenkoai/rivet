@@ -1279,15 +1279,11 @@ fn execute_resolved_plan(
         let summary = synthetic_failed_summary(&plan.export_name, &e);
         return (Err(e), summary);
     }
-    let claim = state
-        .claim_stream(
-            &plan.export_name,
-            &plan.source.state_key(),
-            &plan.stream(),
-            plan.strategy.continues_stored_cursor(),
-        )
-        .and_then(|()| chunked::claim_checkpoint_run(state, plan));
-    let (_run_lease, recovered) = match claim {
+    let claim = state.claim(plan.progress_key()).and_then(|progress| {
+        chunked::claim_checkpoint_run(state, plan)
+            .map(|(lease, recovered)| (progress, lease, recovered))
+    });
+    let (progress, _run_lease, recovered) = match claim {
         Ok(claim) => claim,
         Err(e) => {
             let summary = synthetic_failed_summary(&plan.export_name, &e);
@@ -1361,6 +1357,7 @@ fn execute_resolved_plan(
         }
         Ok(()) => run_with_reconnect(
             state,
+            &progress,
             plan,
             &mut summary,
             tail.runner_config_path,

@@ -242,8 +242,19 @@ pub enum ExtractionStrategy {
 
 impl ResolvedRunPlan {
     /// The stream stored progress belongs to: the relation the query's outermost `FROM` names; empty when it names none.
-    pub fn stream(&self) -> String {
+    fn stream(&self) -> String {
         crate::sql::outer_from_relation(&self.base_query).unwrap_or_default()
+    }
+
+    /// Whose stored progress this plan reads and writes: the one place the identity is computed.
+    pub fn progress_key(&self) -> crate::state::ProgressKey {
+        crate::state::ProgressKey {
+            export_name: self.export_name.clone(),
+            source: self.source.state_key(),
+            stream: self.stream(),
+            column: self.strategy.cursor_identity(),
+            continues_cursor: self.strategy.continues_stored_cursor(),
+        }
     }
 }
 
@@ -305,7 +316,7 @@ impl ExtractionStrategy {
     }
 
     /// Whether a clean run seeks from the stored cursor (incremental, `keyset_incremental`, Mongo `resume`).
-    pub fn continues_stored_cursor(&self) -> bool {
+    fn continues_stored_cursor(&self) -> bool {
         matches!(self, ExtractionStrategy::Incremental(_))
             || matches!(self, ExtractionStrategy::Keyset(kp) if kp.incremental)
     }

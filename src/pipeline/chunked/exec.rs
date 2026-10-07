@@ -536,9 +536,11 @@ mod tests {
         let state = crate::state::StateStore::open_in_memory().expect("in-memory state");
         let mut src = EmptySource;
 
+        let progress = state.claim(plan.progress_key()).expect("claim");
         crate::pipeline::single::run_export(
             &mut src,
             &state,
+            &progress,
             &plan,
             &mut summary,
             "",
