@@ -467,7 +467,14 @@ pub(super) fn initial_snapshot_pending(
     // The anchor — one entry point; `ensure_anchor` picks the engine's
     // mechanism (idempotent: a present anchor is never moved). After the refusal
     // above, so a refused config leaves no slot or checkpoint behind.
-    engine.ensure_anchor(&url, &slot, ckpt_path.as_deref(), tls, prior)?;
+    engine.ensure_anchor(
+        &url,
+        &slot,
+        cdc.capture_instance.as_deref(),
+        ckpt_path.as_deref(),
+        tls,
+        prior,
+    )?;
 
     // The anchor STRING for the snapshot stamp (round-10 STRUCT): rendered by
     // the same `Position.0.to_string()` the drain writes into `__pos`, read

@@ -156,46 +156,13 @@ pub(crate) fn row_image_verdict(rows: &[String]) -> crate::source::cdc::RowImage
 /// termination contract of [`MssqlChangeStream::bound`], pure so the bounded
 /// shape is asserted without a server.
 ///
-/// TWO WAYS a resume position can sit below `fn_cdc_get_min_lsn`, and only one is
-/// data loss. `cdc.change_tables.start_lsn` is where the capture instance BEGAN
-/// and never moves; `fn_cdc_get_min_lsn` is the current low watermark, which the
-/// cleanup job raises. So:
 ///
-///   * `@from < @start` — the position PREDATES the instance. There is no history
-///     before its creation to have lost, so floor to `@min` and over-read, which
-///     is SQL Server's anchor model to begin with.
-///   * `@start <= @from < @min` — the position was inside the instance's lifetime
-///     and the cleanup job removed it. That IS loss, and the THROW is right.
-///
-/// Without the first case the anchor wedged a brand-new export permanently. But
-/// the server's LSNs alone cannot draw that line:
-///
-/// The floor `IF @from < @start SET @from = @min` rescues a brand-new export
-/// whose anchor had been pinned at the DATABASE-wide
-/// `sys.fn_cdc_get_max_lsn()`, a position a freshly-enabled instance's own
-/// `start_lsn` can legally exceed. It rescued that case and destroyed this one.
-/// Measured on a real SQL Server: the cleanup job ADVANCES
-/// `cdc.change_tables.start_lsn` and keeps it equal to `fn_cdc_get_min_lsn`
-/// (before: both `0x…71F80036`, 5 rows; after a forced cleanup: both
-/// `0x…7C980005`, 3 rows). So `@start` and `@min` are one value, `@from < @start`
-/// fires exactly when `@from < @min`, and it always ran FIRST — the interval the
-/// THROW guards (`@start <= @from < @min`) is empty, the THROW is unreachable,
-/// and a position the cleanup job purged past was silently floored to `@min`,
-/// skipping every change in between. That is the thing its own message promises
-/// not to do.
-///
-/// Fresh anchors are still pinned at the database max (`pin_checkpoint_at_max_lsn`),
-/// so the floor is needed for EVERY pin, fresh or legacy — and only for pins. From
-/// LSNs alone "the instance is newer than this position" (floor is right) and "the
-/// cleanup job purged past it" (THROW is right) are indistinguishable once
-/// `start_lsn` moves; rivet tells them apart by the checkpoint's `pinned` flag
-/// (`from_is_pin`, cleared by `advance_cursor` on the first real read). A resume
-/// position, or a legacy checkpoint without the field, takes the THROW.
-/// What one poll needs to know. A parameter object rather than five positional
-/// arguments, because four of them are `&str`/`Option`/`bool` in a row and the
-/// call site said nothing: `fill_sql(ci, expr, 500, None, false)` gives a reader
-/// no way to see that the last value decides whether a purged resume position is
-/// refused or silently skipped.
+/// A position below the instance's `start_lsn` is refused, always: every anchor rivet
+/// writes sits inside its capture instance's lifetime (`pin_checkpoint_at_max_lsn`),
+/// so the only way to be below it is that the cleanup job, or a re-created instance,
+/// moved it past the position. `start_lsn` is what `fn_cdc_get_min_lsn` returns once
+/// the capture job has reached the instance, and is NULL-free before that.
+/// What one poll needs to know.
 struct Poll<'a> {
     /// The capture instance whose change function is read.
     ci: &'a str,
@@ -206,28 +173,6 @@ struct Poll<'a> {
     /// `Some(hex)` pins `@max` at the open-time LSN (a bounded drain); `None`
     /// re-reads `fn_cdc_get_max_lsn()` every poll (the daemon).
     bound: Option<&'a str>,
-    /// True when `from_expr` came from a PIN rather than a flush. Only a pin may
-    /// be floored up to the instance's start.
-    from_is_pin: bool,
-}
-
-/// Move the read cursor to `to` — which CONSUMES the pin.
-///
-/// A pin is a guess written by `ensure_anchor` before anything was read, and
-/// `fill_sql` may floor it to the capture instance's start: nothing was captured,
-/// so nothing can be lost. Once a poll has consumed real changes, `from_lsn` is a
-/// position we REACHED, and flooring that is precisely the silent skip the
-/// retention THROW exists to prevent.
-///
-/// The flag used to be set once in the constructor and never cleared, so from the
-/// SECOND poll onward a mid-run retention purge was floored instead of thrown.
-/// Note the shape of that bug: `fill_sql` was correct on every input it was given
-/// — its own unit test feeds `from_is_pin` by hand and passes either way. The
-/// defect lived in the SUPPLIER. Hence this is a function both production and the
-/// test call, rather than an assignment only a live SQL Server could reach.
-fn advance_cursor(from_lsn: &mut Option<String>, from_is_pin: &mut bool, to: String) {
-    *from_lsn = Some(to);
-    *from_is_pin = false;
 }
 
 /// The user error number `fill_sql` THROWs when the resume position fell below retention.
@@ -244,35 +189,17 @@ fn fill_sql(p: Poll<'_>) -> String {
         from_expr,
         batch,
         bound,
-        from_is_pin,
     } = p;
     let max_expr = match bound {
         Some(hex) => format!("0x{hex}"),
         None => "sys.fn_cdc_get_max_lsn()".to_string(),
     };
-    // The floor exists ONLY for an anchor: a pinned position can legitimately sit
-    // below a capture instance that was enabled after it, and throwing there
-    // wedges a brand-new export with a diagnosis ("the cleanup job removed it")
-    // that is wrong about the cause and unfixable by the remedy it names. A
-    // RESUME position below `@min` is the opposite: changes we had reached are
-    // gone, and flooring silently skips them. Legacy checkpoints carry no marker
-    // and are treated as resume positions — the loud direction, since a false
-    // alarm is recoverable and a silent skip is not.
-    let floor = if from_is_pin {
-        format!(
-            "DECLARE @start binary(10) = (SELECT start_lsn FROM cdc.change_tables \
-                 WHERE capture_instance = '{ci}'); \
-             IF @from IS NOT NULL AND @start IS NOT NULL AND @from < @start SET @from = @min;"
-        )
-    } else {
-        String::new()
-    };
     let recover = crate::source::cdc::checkpoint_identity::RECOVER.replace('\'', "''");
     format!(
         "DECLARE @from binary(10) = {from_expr}; \
-         DECLARE @min binary(10) = sys.fn_cdc_get_min_lsn('{ci}'); \
+         DECLARE @min binary(10) = (SELECT start_lsn FROM cdc.change_tables \
+             WHERE capture_instance = '{ci}'); \
          DECLARE @max binary(10) = {max_expr}; \
-         {floor} \
          IF @from IS NOT NULL AND @min IS NOT NULL AND @from < @min \
             THROW {RETENTION_GAP_ERROR}, 'rivet cdc: the resume position is older than the SQL Server \
 CDC change-table retention (the cleanup job removed it). Resuming would silently skip changes. {recover}', 1; \
@@ -298,8 +225,7 @@ CDC change-table retention (the cleanup job removed it). Resuming would silently
 pub(crate) struct Resume {
     /// Hex LSN to read after, or `None` for "from the change table's min".
     pub from_lsn: Option<String>,
-    /// True when that LSN is an ANCHOR (nothing was captured from it) rather
-    /// than a flushed resume position.
+    /// True for an anchor written by rivet 0.31 or older (`"pinned": true`), which may sit below its instance's start.
     pub from_is_pin: bool,
     /// The database identity the checkpoint recorded, when it recorded one.
     pub identity: Option<DbIdentity>,
@@ -446,9 +372,6 @@ pub(crate) fn resume_from_checkpoint(
         .to_string();
     Ok(Resume {
         from_lsn: Some(from_lsn),
-        // Absent on a checkpoint written before the field existed ⇒ treated as a
-        // resume position, which is the direction that THROWS on retention loss
-        // rather than silently flooring past it.
         from_is_pin: pos
             .0
             .get("pinned")
@@ -473,10 +396,7 @@ pub(crate) struct MssqlCdcConfig {
     /// table's min LSN (first run). This is what makes SQL Server CDC at-least-once
     /// rather than re-reading the whole retained change table every run.
     pub from_lsn: Option<String>,
-    /// True when `from_lsn` came from a PIN (an anchor written before anything
-    /// was captured) rather than from a flush. Only a pin may be floored up to
-    /// the instance's start; a resume position below `@min` is retention loss and
-    /// must THROW. See `fill_sql`.
+    /// See `Resume::from_is_pin`; `open` adopts such an anchor once.
     pub from_is_pin: bool,
     /// The identity the checkpoint recorded; checked against the server at open.
     pub checkpoint_identity: Option<DbIdentity>,
@@ -638,8 +558,6 @@ pub(crate) struct MssqlChangeStream {
     /// checkpoint (advanced only after a durable part), so a crash re-reads from
     /// there (at-least-once) regardless of how far this cursor has moved.
     from_lsn: Option<String>,
-    /// See `MssqlCdcConfig::from_is_pin`.
-    from_is_pin: bool,
     /// The database's identity at open, recorded into every checkpoint.
     identity: Option<DbIdentity>,
     pending: VecDeque<ChangeEvent>,
@@ -705,6 +623,12 @@ impl MssqlChangeStream {
         if cfg.from_lsn.is_some() {
             identity_verdict(cfg.checkpoint_identity.as_ref(), identity.as_ref()).enforce()?;
         }
+        let from_lsn = match &cfg.from_lsn {
+            Some(pin) if cfg.from_is_pin => {
+                Some(rt.block_on(adopt_legacy_pin(&mut client, &cfg.capture_instance, pin))?)
+            }
+            other => other.clone(),
+        };
 
         // Resolve the REAL schema/table from cdc.change_tables metadata. The
         // previous `<schema>_<table>` name heuristic silently mis-tagged every
@@ -817,8 +741,7 @@ impl MssqlChangeStream {
             capture_instance: cfg.capture_instance.clone(),
             schema,
             table,
-            from_lsn: cfg.from_lsn.clone(),
-            from_is_pin: cfg.from_is_pin,
+            from_lsn,
             identity,
             pending: VecDeque::new(),
             // Overridden by `from_url`, which knows the checkpoint's location.
@@ -904,7 +827,6 @@ impl MssqlChangeStream {
             from_expr: &from_expr,
             batch: self.batch_limit,
             bound: self.bound.as_deref(),
-            from_is_pin: self.from_is_pin,
         });
         // The most common SQL Server gotcha — "Invalid object name
         // cdc.fn_cdc_get_all_changes_…" — surfaces here, at the first poll, not at
@@ -1018,9 +940,8 @@ impl MssqlChangeStream {
         self.spooled = spooled;
         match max_lsn {
             // Advance the internal cursor to @to; the next poll reads past it.
-            Some(l) => advance_cursor(&mut self.from_lsn, &mut self.from_is_pin, l),
-            // No rows ⇒ the window is drained up to the current max LSN. The
-            // position did not move, so a pin is still a pin.
+            Some(l) => self.from_lsn = Some(l),
+            // No rows ⇒ the window is drained up to the current max LSN.
             None => self.exhausted = true,
         }
         Ok(())
@@ -1085,7 +1006,6 @@ impl ChangeStream for MssqlChangeStream {
     fn drained_frontier(&self) -> Option<crate::source::cdc::Position> {
         drained_frontier(
             self.exhausted,
-            self.from_is_pin,
             self.bound.as_deref(),
             self.from_lsn.as_deref(),
         )
@@ -1117,14 +1037,9 @@ impl ChangeStream for MssqlChangeStream {
 }
 
 /// The open-time bound a drained bounded run may checkpoint at, when it is past a resumed cursor.
-fn drained_frontier(
-    exhausted: bool,
-    from_is_pin: bool,
-    bound: Option<&str>,
-    from: Option<&str>,
-) -> Option<String> {
+fn drained_frontier(exhausted: bool, bound: Option<&str>, from: Option<&str>) -> Option<String> {
     let (b, f) = (bound?.to_ascii_lowercase(), from?.to_ascii_lowercase());
-    (exhausted && !from_is_pin && b.len() == f.len() && b > f).then_some(b)
+    (exhausted && b.len() == f.len() && b > f).then_some(b)
 }
 
 /// `__$operation` → canonical op. 1=delete, 2=insert, 4=update-after; 3 (update
@@ -1256,57 +1171,108 @@ async fn connect(
     crate::source::mssql::dial(config, &format!("mssql://{}:{}", cfg.host, cfg.port)).await
 }
 
-/// Persist the database's CURRENT max LSN to `ckpt` — the anchor for
-/// `cdc.initial: snapshot`, taken BEFORE the snapshot read so the change
-/// stream overlaps the snapshot instead of gapping it. Fails loudly when CDC
-/// is not enabled on the database (no max LSN exists to anchor at).
+/// The warning a run prints when it adopts an anchor that rivet 0.31 or older wrote below the instance's start.
+const LEGACY_PIN_WARNING: &str = "mssql cdc: this checkpoint is an anchor written by rivet 0.31 or \
+     older, and it is below the capture instance's start. That is normal for an instance enabled \
+     just before the anchor, or cleaned up while the table was quiet; it is also what a cleanup \
+     past unread changes, or a re-created capture instance, looks like, and this checkpoint \
+     cannot tell them apart. Reading from the instance's start. If the capture instance was \
+     re-created, or rivet did not run for longer than the CDC retention since the baseline, \
+     changes may be missing: re-baseline the stream. Later runs refuse such a gap.";
+
+/// A pre-0.32 pinned anchor, moved up to just below its instance's start when it sits under it (with a warning).
+async fn adopt_legacy_pin(
+    client: &mut Client<Compat<TcpStream>>,
+    capture_instance: &str,
+    pin: &str,
+) -> Result<String> {
+    let row = client
+        .query(
+            format!(
+                "SELECT CONVERT(varchar(24), sys.fn_cdc_decrement_lsn(start_lsn), 1) \
+                 FROM cdc.change_tables WHERE capture_instance = @P1 \
+                 AND sys.fn_cdc_increment_lsn(0x{pin}) < start_lsn"
+            ),
+            &[&capture_instance],
+        )
+        .await?
+        .into_row()
+        .await?;
+    Ok(match row.and_then(|r| r.get::<&str, _>(0).map(bare_lsn)) {
+        Some(below_start) => {
+            log::warn!("{LEGACY_PIN_WARNING}");
+            below_start
+        }
+        None => pin.to_string(),
+    })
+}
+
+/// Persist the anchor for `cdc.initial: snapshot` to `ckpt`, BEFORE the snapshot read: the
+/// database's max LSN, or the position just below the capture instance's start when that is
+/// higher (an instance the capture job has not reached yet). Either way the anchor is inside
+/// the instance's lifetime, so a later position below `fn_cdc_get_min_lsn` always means the
+/// log moved. Fails loudly when CDC is not enabled on the database.
 pub(crate) fn pin_checkpoint_at_max_lsn(
     url: &str,
+    capture_instance: &str,
     ckpt: &std::path::Path,
     tls: Option<&TlsConfig>,
 ) -> Result<()> {
     let mut src = crate::source::mssql::MssqlSource::connect_with_tls(url, tls)?;
     let probe = src.cdc_health(None)?;
-    let Some(max) = probe_max_lsn(&probe) else {
+    if probe_max_lsn(&probe).is_none() {
         anyhow::bail!(
             "mssql cdc initial snapshot: sys.fn_cdc_get_max_lsn() is NULL — enable CDC first \
              (EXEC sys.sp_cdc_enable_db) so the anchor exists before the snapshot"
         );
+    }
+    let p = crate::source::mssql::parse_mssql_url(url)?;
+    let cfg = MssqlCdcConfig {
+        host: p.host,
+        port: p.port,
+        database: p.database,
+        user: p.user,
+        password: p.password,
+        capture_instance: capture_instance.to_string(),
+        from_lsn: None,
+        from_is_pin: false,
+        checkpoint_identity: None,
     };
-    // `pinned` marks this as an ANCHOR — a position nothing was ever captured
-    // from — as opposed to a resume position written after a flush. The poll
-    // needs the difference: `@from < @min` means "the instance begins after this
-    // position", and only rivet knows whether that is because the instance is
-    // newer than an anchor (harmless, floor to @min) or because the cleanup job
-    // purged past a position we had actually reached (loss, and the THROW must
-    // fire). From LSNs alone the two are indistinguishable, because the cleanup
-    // job ADVANCES `cdc.change_tables.start_lsn` and keeps it equal to
-    // `fn_cdc_get_min_lsn` — measured on a real server: before a forced cleanup
-    // both read 0x…71F80036 with 5 change rows, after it both read 0x…7C980005
-    // with 3.
-    let identity = {
-        let p = crate::source::mssql::parse_mssql_url(url)?;
-        let cfg = MssqlCdcConfig {
-            host: p.host,
-            port: p.port,
-            database: p.database,
-            user: p.user,
-            password: p.password,
-            capture_instance: String::new(),
-            from_lsn: None,
-            from_is_pin: false,
-            checkpoint_identity: None,
-        };
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-        rt.block_on(async { db_identity(&mut connect(&cfg, tls).await?).await })?
-    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let (identity, anchor) = rt.block_on(async {
+        let mut client = connect(&cfg, tls).await?;
+        let identity = db_identity(&mut client).await?;
+        let anchor = client
+            .query(
+                "DECLARE @max binary(10) = sys.fn_cdc_get_max_lsn(); \
+                 SELECT CONVERT(varchar(24), ISNULL((SELECT sys.fn_cdc_decrement_lsn(start_lsn) \
+                     FROM cdc.change_tables WHERE capture_instance = @P1 AND start_lsn > @max), \
+                     @max), 1)",
+                &[&capture_instance],
+            )
+            .await?
+            .into_row()
+            .await?
+            .and_then(|r| r.get::<&str, _>(0).map(bare_lsn));
+        Ok::<_, anyhow::Error>((identity, anchor))
+    })?;
+    let anchor = anchor.ok_or_else(|| {
+        anyhow::anyhow!("mssql cdc initial snapshot: the server returned no anchor LSN")
+    })?;
     with_identity(
-        &Position::new(serde_json::json!({ "lsn": max, "pinned": true })),
+        &Position::new(serde_json::json!({ "lsn": anchor })),
         identity.as_ref(),
     )
     .save(ckpt)
+}
+
+/// A server-rendered LSN (`0x…`) as the bare lowercase hex a checkpoint stores.
+fn bare_lsn(s: &str) -> String {
+    s.trim_start_matches("0x")
+        .trim_start_matches("0X")
+        .to_ascii_lowercase()
 }
 
 /// The probe's max LSN as the bare hex the checkpoint stores (strip `0x`).
@@ -1314,11 +1280,7 @@ fn probe_max_lsn(probe: &crate::source::mssql::MssqlCdcProbe) -> Option<String> 
     if !probe.cdc_enabled {
         return None;
     }
-    probe.max_lsn_hex.as_deref().map(|s| {
-        s.trim_start_matches("0x")
-            .trim_start_matches("0X")
-            .to_ascii_lowercase()
-    })
+    probe.max_lsn_hex.as_deref().map(bare_lsn)
 }
 
 #[cfg(test)]
@@ -1326,37 +1288,13 @@ mod tests {
     #[test]
     fn only_a_drained_resumed_cursor_below_the_bound_yields_a_frontier() {
         use super::drained_frontier as f;
-        assert_eq!(
-            f(true, false, Some("00FF"), Some("0010")),
-            Some("00ff".into())
-        );
-        assert_eq!(
-            f(false, false, Some("00ff"), Some("0010")),
-            None,
-            "not drained"
-        );
-        assert_eq!(
-            f(true, true, Some("00ff"), Some("0010")),
-            None,
-            "a pin keeps its floor"
-        );
-        assert_eq!(f(true, false, None, Some("0010")), None, "daemon: no bound");
-        assert_eq!(f(true, false, Some("00ff"), None), None, "no cursor");
-        assert_eq!(
-            f(true, false, Some("00ff"), Some("00ff")),
-            None,
-            "already there"
-        );
-        assert_eq!(
-            f(true, false, Some("0010"), Some("00ff")),
-            None,
-            "never backwards"
-        );
-        assert_eq!(
-            f(true, false, Some("0fff"), Some("ff")),
-            None,
-            "unequal widths"
-        );
+        assert_eq!(f(true, Some("00FF"), Some("0010")), Some("00ff".into()));
+        assert_eq!(f(false, Some("00ff"), Some("0010")), None, "not drained");
+        assert_eq!(f(true, None, Some("0010")), None, "daemon: no bound");
+        assert_eq!(f(true, Some("00ff"), None), None, "no cursor");
+        assert_eq!(f(true, Some("00ff"), Some("00ff")), None, "already there");
+        assert_eq!(f(true, Some("0010"), Some("00ff")), None, "never backwards");
+        assert_eq!(f(true, Some("0fff"), Some("ff")), None, "unequal widths");
     }
 
     #[test]
@@ -1716,7 +1654,6 @@ mod tests {
             from_expr: "sys.fn_cdc_get_min_lsn('dbo_orders')",
             batch: 500,
             bound: Some("0000002f000004d80005"),
-            from_is_pin: false,
         });
         assert!(
             bounded.contains("DECLARE @max binary(10) = 0x0000002f000004d80005;"),
@@ -1726,8 +1663,8 @@ mod tests {
             !bounded.contains("fn_cdc_get_max_lsn"),
             "bounded poll must not consult the moving max LSN: {bounded}"
         );
-        // The min-LSN retention guard must survive the pinning.
-        assert!(bounded.contains("sys.fn_cdc_get_min_lsn('dbo_orders')"));
+        // The retention guard must survive the pinning.
+        assert!(bounded.contains("@from < @min THROW 51000"));
         assert!(bounded.contains("TOP (500)"));
 
         let daemon = fill_sql(Poll {
@@ -1735,7 +1672,6 @@ mod tests {
             from_expr: "sys.fn_cdc_increment_lsn(0xabcd)",
             batch: 500,
             bound: None,
-            from_is_pin: false,
         });
         assert!(
             daemon.contains("DECLARE @max binary(10) = sys.fn_cdc_get_max_lsn();"),
@@ -1743,117 +1679,31 @@ mod tests {
         );
     }
 
-    /// The floor is only ever right for an UNCONSUMED pin, and `fill_sql` cannot
-    /// tell — it believes whatever `from_is_pin` it is handed. This pins the
-    /// supplier: the first advance must consume the pin, so poll 2 reaches the
-    /// retention THROW instead of being floored past a purged span.
-    ///
-    /// Deliberately NOT a `fill_sql` test. That function's own matrix hand-sets
-    /// `from_is_pin` and is correct on both values — it stayed green for the whole
-    /// life of the bug, because the wrong value came from the layer above it.
+    /// The poll has no way to move a position up: below the low watermark is always the refusal.
     #[test]
-    fn the_first_advance_consumes_the_pin_so_a_purge_is_thrown_not_floored() {
-        let mut lsn = None;
-        let mut is_pin = true;
-
-        advance_cursor(&mut lsn, &mut is_pin, "0000abcd".to_string());
-        assert_eq!(lsn.as_deref(), Some("0000abcd"), "cursor must move");
-        assert!(
-            !is_pin,
-            "consuming real changes turns the anchor into a REACHED position — \
-             leaving it pinned makes fill_sql floor a mid-run retention purge, \
-             which is the silent skip the THROW exists to prevent"
-        );
-
-        // And the floor really does disappear from the SQL the next poll builds —
-        // the observable the stream hands downstream.
-        let after = fill_sql(Poll {
-            ci: "dbo_orders",
-            from_expr: "sys.fn_cdc_increment_lsn(0x0000abcd)",
-            batch: 500,
-            bound: None,
-            from_is_pin: is_pin,
-        });
-        assert!(
-            !after.contains("SET @from = @min"),
-            "a position we reached must not be floored: {after}"
-        );
-        assert!(
-            after.contains("THROW 51000"),
-            "…it must reach the retention guard instead: {after}"
-        );
-    }
-
-    /// A resume position that PREDATES the capture instance is floored, not
-    /// refused — and the refusal survives for the case that is real loss.
-    ///
-    /// The floor belongs to an ANCHOR and must not exist for a RESUME position.
-    ///
-    /// A shape assertion on generated SQL is a weak instrument, so this asserts
-    /// only what the server's behaviour turns on, and says what it cannot see.
-    /// In particular it hand-sets `from_is_pin` and so cannot see whether the
-    /// STREAM still deserves that flag — the gap
-    /// `the_first_advance_consumes_the_pin_so_a_purge_is_thrown_not_floored`
-    /// exists to close.
-    ///
-    /// The distinction is not cosmetic. `@from < @min` has two causes that no
-    /// LSN comparison can separate, because the cleanup job ADVANCES
-    /// `cdc.change_tables.start_lsn` and keeps it equal to `fn_cdc_get_min_lsn`
-    /// — measured on a real SQL Server: before a forced cleanup both read
-    /// `0x…71F80036` over 5 change rows, after it both read `0x…7C980005` over 3.
-    /// An earlier version of this test asserted the opposite ("the instance's
-    /// creation LSN, which never moves") and, being a shape check, stayed green
-    /// while the floor it demanded made the retention THROW unreachable: with
-    /// `@start == @min` the floor fires exactly when the guard would have, and
-    /// always first, so `@start <= @from < @min` is an empty interval. The live
-    /// test that DOES see the server —
-    /// `mssql_cdc_resume_past_retention_errors_not_a_silent_gap` — went red and
-    /// stayed red.
-    ///
-    /// So the discriminator comes from rivet, not the server: a pinned anchor may
-    /// be floored (the instance is simply newer than it — nothing was captured to
-    /// lose), a resume position may not (changes we had reached are gone, and
-    /// skipping them silently is the harm).
-    #[test]
-    fn only_a_pinned_anchor_is_floored_a_resume_position_must_reach_the_retention_guard() {
-        let pinned = fill_sql(Poll {
-            ci: "dbo_orders",
-            from_expr: "0xabcd",
-            batch: 500,
-            bound: None,
-            from_is_pin: true,
-        });
-        assert!(
-            pinned.contains("SET @from = @min"),
-            "an anchor below a newer instance must be floored, not thrown on — throwing wedges \
-             a brand-new export with a diagnosis that is wrong about the cause: {pinned}"
-        );
-        let floor_at = pinned.find("SET @from = @min").unwrap();
-        let guard_at = pinned
-            .find("THROW 51000")
-            .expect("the retention guard must survive in both forms");
-        assert!(
-            floor_at < guard_at,
-            "the floor must run BEFORE the guard reads @from, or the guard throws on a \
-             position the next statement was about to make valid"
-        );
-
-        let resumed = fill_sql(Poll {
+    fn a_position_below_the_low_watermark_always_reaches_the_refusal() {
+        let sql = fill_sql(Poll {
             ci: "dbo_orders",
             from_expr: "sys.fn_cdc_increment_lsn(0xabcd)",
             batch: 500,
             bound: None,
-            from_is_pin: false,
         });
+        assert!(!sql.contains("SET @from"), "no floor: {sql}");
         assert!(
-            !resumed.contains("SET @from = @min"),
-            "a RESUME position must reach the retention guard — flooring it silently skips every \
-             change the cleanup job purged past, which is what the guard's own message promises \
-             not to do: {resumed}"
+            sql.contains(
+                "DECLARE @min binary(10) = (SELECT start_lsn FROM cdc.change_tables WHERE \
+                 capture_instance = 'dbo_orders');"
+            ),
+            "the guard reads the instance's start, which exists before the capture job reaches it: {sql}"
         );
         assert!(
-            resumed.contains("THROW 51000"),
-            "…and the guard must be there to reach: {resumed}"
+            sql.contains(
+                "IF @from IS NOT NULL AND @min IS NOT NULL AND @from < @min THROW 51000, \
+                 'rivet cdc: the resume position is older than the SQL Server CDC change-table \
+                 retention (the cleanup job removed it). Resuming would silently skip changes. \
+                 Re-baseline the stream in one run:"
+            ),
+            "{sql}"
         );
     }
 

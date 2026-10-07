@@ -2999,3 +2999,199 @@ fn mssql_cdc_refuses_a_captured_value_it_cannot_decode() {
         "a valued xml cell must refuse the run, not land as NULL: {said}"
     );
 }
+
+// ─── the log is gone below a checkpoint that has never advanced ──────────────
+
+/// A snapshot-baselined SQL Server scenario with ids 1..=3 delivered and two updates waiting unread.
+fn baselined_with_two_unread_updates(label: &str) -> CdcScenario {
+    let mut s = CdcScenario::mssql_with(label, "id INT PRIMARY KEY, v INT", |r, _| {
+        r.cdc("initial: snapshot").cdc("until_current: true")
+    });
+    for id in 1..=3 {
+        s.insert(id);
+    }
+    s.settle();
+    s.rig.run_ok();
+    s.update(1);
+    s.update(2);
+    s.settle();
+    s
+}
+
+/// Run once and require the coded log-gap refusal; a run that exits 0 is graded against the source by the rig oracle.
+fn assert_log_gap_refusal(s: &CdcScenario) {
+    let out = s.rig.run();
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(5),
+        "the refusal's exit class:\n{said}"
+    );
+    assert!(
+        said.contains("RIVET_SOURCE_CDC_LOG_GAP")
+            && said.contains("older than the SQL Server CDC change-table retention")
+            && said.contains(REBASELINE_REMEDY),
+        "the refusal carries the code, the cause and the re-baseline remedy:\n{said}"
+    );
+}
+
+/// Follow the refusal's remedy as printed, then compare the new baseline with the source.
+fn assert_remedy_ends_with_destination_equal_to_source(s: &mut CdcScenario) {
+    follow_rebaseline_remedy(&mut s.rig, true);
+    let snap = s.rig.out_dir().join("snapshot");
+    let t = &s.table;
+    assert_eq!(
+        (
+            duckdb_dir_scalar(&snap, "count(*)", None),
+            duckdb_dir_scalar(&snap, "sum(v)", None)
+        ),
+        (
+            mssql_cdc_query_i64(&format!("SELECT COUNT(*) FROM dbo.{t}")),
+            mssql_cdc_query_i64(&format!("SELECT SUM(v) FROM dbo.{t}"))
+        ),
+        "after the remedy the destination holds the source's rows and values"
+    );
+}
+
+/// Disable the capture instance and enable it again under the same name.
+fn recreate_capture_instance(table: &str) {
+    mssql_cdc_exec(&format!(
+        "EXEC sys.sp_cdc_disable_table @source_schema=N'dbo', @source_name=N'{table}', \
+         @capture_instance=N'dbo_{table}'; \
+         EXEC sys.sp_cdc_enable_table @source_schema=N'dbo', @source_name=N'{table}', \
+         @role_name=NULL, @capture_instance=N'dbo_{table}';"
+    ));
+}
+
+/// Retention cleanup past changes no run has read yet, before the first changes run: refused twice, and the remedy recovers.
+#[test]
+#[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC + the rivet-duckdb oracle"]
+fn mssql_cleanup_past_unread_changes_before_the_first_changes_run_is_refused() {
+    let _serial = cross_process_serial("mssql_cdc");
+    let mut s = baselined_with_two_unread_updates("cdc_pingap");
+    mssql_cdc_exec(&format!(
+        "DECLARE @lw binary(10) = (SELECT MAX(__$start_lsn) FROM cdc.dbo_{t}_CT); \
+         EXEC sys.sp_cdc_cleanup_change_table @capture_instance = N'dbo_{t}', \
+         @low_water_mark = @lw, @threshold = 5000;",
+        t = s.table
+    ));
+    assert_log_gap_refusal(&s);
+    assert_log_gap_refusal(&s);
+    assert_remedy_ends_with_destination_equal_to_source(&mut s);
+}
+
+/// The capture instance disabled and re-enabled before the first changes run: refused twice, and the remedy recovers.
+#[test]
+#[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC + the rivet-duckdb oracle"]
+fn mssql_capture_instance_recreated_before_the_first_changes_run_is_refused() {
+    let _serial = cross_process_serial("mssql_cdc");
+    let mut s = baselined_with_two_unread_updates("cdc_pinrecreate");
+    recreate_capture_instance(&s.table);
+    assert_log_gap_refusal(&s);
+    assert_log_gap_refusal(&s);
+    assert_remedy_ends_with_destination_equal_to_source(&mut s);
+}
+
+/// The ADD COLUMN refusal's remedy (re-enable with the full column list, re-run) must not exit 0 over the unread changes.
+#[test]
+#[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC + the rivet-duckdb oracle"]
+fn mssql_add_column_remedy_before_the_first_changes_run_ends_in_the_log_gap_refusal() {
+    let _serial = cross_process_serial("mssql_cdc");
+    let mut s = baselined_with_two_unread_updates("cdc_pinaddcol");
+    mssql_cdc_exec(&format!("ALTER TABLE dbo.{} ADD w INT NULL", s.table));
+    let said = s.rig.run_expect_fail();
+    assert!(
+        said.contains("Re-enable the table with the full column"),
+        "fixture: the ADD COLUMN refusal names the re-enable remedy:\n{said}"
+    );
+    recreate_capture_instance(&s.table);
+    assert_log_gap_refusal(&s);
+    assert_remedy_ends_with_destination_equal_to_source(&mut s);
+}
+
+/// A scenario whose anchor was taken while the database max LSN was still below the instance's start.
+fn anchored_before_the_capture_job_reached_the_instance() -> CdcScenario {
+    (0..5)
+        .find_map(|_| {
+            let s = CdcScenario::mssql_with("cdc_pinfresh", "id INT PRIMARY KEY, v INT", |r, _| {
+                r.cdc("initial: snapshot").cdc("until_current: true")
+            });
+            s.rig.run_ok();
+            let ckpt: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(s.rig.checkpoint()).unwrap())
+                    .unwrap();
+            let below = mssql_cdc_query_i64(&format!(
+                "SELECT COUNT(*) FROM cdc.change_tables WHERE capture_instance = N'dbo_{}' \
+                 AND 0x{} < start_lsn",
+                s.table,
+                ckpt["lsn"].as_str().unwrap()
+            ));
+            (below == 1).then_some(s)
+        })
+        .expect("fixture: five anchors in a row landed after the capture job's scan")
+}
+
+/// An anchor below a just-enabled instance's start loses nothing and refuses nothing.
+#[test]
+#[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC + the rivet-duckdb oracle"]
+fn mssql_an_anchor_below_a_just_enabled_instance_still_delivers_every_later_change() {
+    let _serial = cross_process_serial("mssql_cdc");
+    let mut s = anchored_before_the_capture_job_reached_the_instance();
+    s.insert(1);
+    s.insert(2);
+    s.settle();
+    s.rig.run_ok();
+    assert_eq!(
+        duckdb_dir_scalar(
+            &s.rig.out_dir(),
+            "count(DISTINCT id)",
+            Some("__op = 'insert'")
+        ),
+        s.count(),
+        "every row inserted after the anchor is delivered"
+    );
+    s.rig.run_ok();
+}
+
+/// A table with no change since its baseline: idle runs, then cleanup up to the last idle run's bound, is not a gap.
+#[test]
+#[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC + the rivet-duckdb oracle"]
+fn mssql_a_never_changed_table_is_not_refused_after_cleanup_passes_its_anchor() {
+    let _serial = cross_process_serial("mssql_cdc");
+    let mut quiet = CdcScenario::mssql_with("cdc_pinquiet", "id INT PRIMARY KEY, v INT", |r, _| {
+        r.cdc("initial: snapshot").cdc("until_current: true")
+    });
+    let mut busy = CdcScenario::mssql_with("cdc_pinbusy", "id INT PRIMARY KEY, v INT", |r, _| r);
+    quiet.insert(1);
+    quiet.settle();
+    quiet.rig.run_ok();
+    busy.insert(1);
+    busy.settle();
+    quiet.rig.run_ok();
+    mssql_cdc_exec(&format!(
+        "DECLARE @lw binary(10) = sys.fn_cdc_get_max_lsn(); \
+         EXEC sys.sp_cdc_cleanup_change_table @capture_instance = N'dbo_{}', \
+         @low_water_mark = @lw, @threshold = 5000;",
+        quiet.table
+    ));
+    quiet.rig.run_ok();
+    mssql_cdc_exec(&format!(
+        "UPDATE dbo.{} SET v = 99 WHERE id = 1",
+        quiet.table
+    ));
+    wait_for_capture(&format!("dbo_{}", quiet.table), 2);
+    quiet.rig.run_ok();
+    assert_eq!(
+        duckdb_dir_scalar(
+            &quiet.rig.out_dir(),
+            "count(*)",
+            Some("v = 99 AND __op = 'update'")
+        ),
+        1,
+        "the change made after the cleanup is delivered"
+    );
+}
