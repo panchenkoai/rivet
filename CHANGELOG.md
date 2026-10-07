@@ -44,6 +44,34 @@
   - The scope key no longer changes when the password is rotated. Before, a rotation orphaned
     the cursor and the next incremental run started over.
 
+- **Breaking: a `query:` whose projection renames or limits is read as a query, not as its
+  table.** `query: "SELECT legacy_id AS id, name FROM customers"` with `chunk_column: id` took
+  its range from the table's own `id` and filtered on the alias: exit 0, `_SUCCESS`, 0 of 1000
+  rows, on every SQL engine (present in 0.31.0).
+  - The range, the NULL-key probe and the row count now come from the query itself whenever a
+    projection item is more than one bare column: `a AS b`, `a b`, `DISTINCT a`, `TOP 5 a`.
+  - A plain column list (`SELECT id, name FROM t`, what `rivet init` writes) and `SELECT *`
+    still probe the table directly.
+  - Upgrading: an export of this shape that delivered nothing now delivers the query's rows.
+    An aliased query whose chunk column was not renamed delivers the same rows as before; only
+    its probes are wrapped. Nothing stored in the state database changes.
+- **Breaking: PostgreSQL refuses a planner probe whose value it cannot read, instead of taking
+  it for "no rows".** A range bound, a keyset boundary or the `keyset_incremental` ceiling of a
+  type the adapter had no reader for came back as "no value". With `parallel:` and
+  `keyset_incremental: true` on a `smallint` key that was "no new rows past the anchor": exit 0,
+  `_SUCCESS`, 0 of 3000 rows on every run (present in 0.31.0).
+  - `smallint` and `oid` are now read. `chunk_column:` on a `smallint` column, refused before
+    with "returned no readable value", now exports.
+  - Any other type (`real`, `numeric`, `time`, an enum, ...) stops the run with
+    `postgres: cannot read a planner probe's <type> value`, naming the probe. Only SQL NULL
+    means an empty table.
+  - Upgrading: a parallel `keyset_incremental` export on a `smallint` or `oid` key stored no
+    anchor while it delivered nothing, so its first run after the upgrade delivers the whole
+    table and later runs deliver the new keys.
+  - Upgrading: a parallel keyset export on a key of an unread type ran as a single worker with
+    a warning (and delivered nothing with `keyset_incremental`). It now fails with the message
+    above. Remove `parallel:`: the sequential keyset reads its cursor from the rows.
+  - The refusal for a `numeric` or `real` `chunk_column:` under `query:` has the new text.
 - **Breaking: CDC writes an UPDATE that changes the key as a delete of the old key and an insert
   of the new row** (ADR-0030, accepted), on PostgreSQL, MySQL and Oracle. SQL Server's change
   table already did this, and MongoDB's `_id` cannot change.

@@ -1,0 +1,13 @@
+diff --git a/src/sql.rs b/src/sql.rs
+index 9233d95d..4ecf26d4 100644
+--- a/src/sql.rs
++++ b/src/sql.rs
+@@ -149,7 +149,7 @@ fn is_plain_column_list(s: &str) -> bool {
+         !item.is_empty()
+             && item
+                 .chars()
+-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '*'))
++                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '*' | ' '))
+     })
+ }
+ 

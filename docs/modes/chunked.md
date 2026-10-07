@@ -282,6 +282,14 @@ full-scan + filesort. Add a unique index of a supported type, pick another key,
 use a range `chunk_column:` (integer), or `mode: full`.
 ```
 
+With `parallel:` the planner also reads the key's boundaries (and, with
+`keyset_incremental: true`, its current maximum) through a scalar probe. On
+PostgreSQL the probe reads `smallint`, `integer`, `bigint`, `oid`,
+`double precision`, strings, `date`, `timestamp`, `timestamptz` and `uuid`. A
+key of another type (`real`, `time`, an enum) stops the run with
+`postgres: cannot read a planner probe's <type> value`; remove `parallel:` and
+the sequential keyset pages it from the rows.
+
 **Required privileges:** read-only is sufficient — the introspection probe reads
 `information_schema` index metadata, no elevated grants needed.
 
