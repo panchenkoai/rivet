@@ -396,12 +396,11 @@ fn f5_full_resume_sequence_completes_interrupted_run() {
     // Crash — chunk 1 left in "running", chunk 2 still pending.
 
     // Resume: detect in-progress run.
-    let run_info = state.find_in_progress_chunk_run("logs").unwrap();
-    assert!(
-        run_info.is_some(),
-        "find_in_progress_chunk_run must detect the interrupted run"
-    );
-    let (found_run_id, _plan_hash) = run_info.unwrap();
+    let (found_run_id, _plan_hash, status, _) = state
+        .get_latest_chunk_run("logs")
+        .unwrap()
+        .expect("the interrupted run");
+    assert_eq!(status, "in_progress", "the interrupted run is detected");
     assert_eq!(found_run_id, "run-r2");
 
     // Reset stale running tasks.

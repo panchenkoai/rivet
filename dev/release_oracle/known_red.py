@@ -33,12 +33,6 @@ def _open(cell: str, symptom: str, reason: str) -> KnownRed:
 
 
 KNOWN_RED: tuple[KnownRed, ...] = (
-    _open("live_mode_transition::open_defect_crashed_range_chunk_run_is_not_adopted_by_another_source_postgres",
-          "rig oracle: COUNT(*): source 30, delivered 10",
-          f"P-02: a same-named chunked export of another source resumes a crashed chunk run and publishes its ranges as a success; {_PROGRESS_KEY}"),
-    _open("live_mode_transition::open_defect_crashed_keyset_then_incremental_postgres",
-          "rig oracle: COUNT(*): source 10, delivered 6",
-          f"P-06: an incremental run continues from the high-water of a crashed keyset run whose pages no manifest lists; {_PROGRESS_KEY}"),
     _open("live_mode_transition::open_defect_source_url_without_its_default_port_continues_postgres",
           "P-18: the source URL without its default port lost the cursor: the run delivered ids [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]",
           f"P-18: the source key is the URL as spelled, so dropping `:5432` starts a whole-table pass; {_PROGRESS_KEY}"),
@@ -70,8 +64,8 @@ KNOWN_RED: tuple[KnownRed, ...] = (
           "rig oracle: COUNT(*): source 43, delivered 40",
           "A `double precision` chunk_column under `query:` is sliced by integer BETWEEN windows and drops the fractional keys with exit 0 (a WARN only); found beside P-24/P-25 (#458), no work item yet: refuse it or slice half-open"),
     _open("audit_cli_dispatch::open_defect_apply_pool_writes_only_the_export_on_stdout",
-          "`apply --pool` wrote ",
-          "`rivet apply --pool` prints its pool lines on stdout, into the bytes of a `destination: stdout` export; found beside P-14/P-28 (#463), no work item yet: the lines belong on stderr"),
+          "oracle error: dev/release_oracle/rig_oracle.py grade-stdout exited",
+          "`rivet apply --pool` prints its pool lines on stdout, into the bytes of a `destination: stdout` export; found beside P-14/P-28 (#463), no work item yet: the lines belong on stderr Since #463 the rig oracle grades a stdout export first and its `grade-stdout` raises on the foreign lines instead of giving a verdict, so that is the first line the cell shows"),
     _open("live_partition_by::open_defect_partition_by_exports_a_declared_numeric_column",
           "`partition_by` over a table with a NUMERIC(10,2) column failed under `rivet run`: precision/scale unavailable",
           "`partition_by` reads each partition through a subquery, which loses the catalog's NUMERIC(p,s), so the export is refused although the unpartitioned one runs; found beside P-14 (#463), no work item yet"),

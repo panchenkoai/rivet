@@ -1499,7 +1499,8 @@ exports:
             source: "pg/out".into(),
             stream: String::new(),
             column: Some("updated_at".into()),
-            continues_cursor: true,
+            mode: "keyset",
+            continues_high_water: true,
         };
         run.update_with_column(&key, "2026-09-01").unwrap();
         let held = crate::pipeline::chunked::try_run_lease(&run, "transactions")

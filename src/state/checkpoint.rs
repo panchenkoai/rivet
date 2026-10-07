@@ -44,27 +44,53 @@ impl StateStore {
     /// in place); a never-started unit has none → run it fresh (so `--resume` does
     /// not bail on "no in-progress checkpoint").
     pub fn has_resumable_checkpoint(&self, export_name: &str) -> Result<bool> {
-        if self.find_in_progress_chunk_run(export_name)?.is_some() {
+        let in_progress = self.query_opt(
+            "SELECT 1 FROM chunk_run WHERE export_name = ?1 AND status = 'in_progress' LIMIT 1",
+            &[export_name.into()],
+            |r| r.i64(0),
+        )?;
+        if in_progress.is_some() {
             return Ok(true);
         }
         self.has_resume_run_id_in_any_scope(export_name)
     }
 
-    /// Latest `in_progress` chunk run for this export, if any.
-    pub fn find_in_progress_chunk_run(
+    /// Latest `in_progress` chunk run of `export_name` under `source`, or (`None`) the one that recorded no source.
+    pub(super) fn in_progress_chunk_run(
+        &self,
+        export_name: &str,
+        source: Option<&str>,
+    ) -> Result<Option<(String, String)>> {
+        let by = match source {
+            Some(_) => "source = ?2",
+            None => "source IS NULL AND ?2 = ''",
+        };
+        self.query_opt(
+            &format!(
+                "SELECT run_id, plan_hash FROM chunk_run \
+                 WHERE export_name = ?1 AND status = 'in_progress' AND {by} \
+                 ORDER BY created_at DESC LIMIT 1"
+            ),
+            &[export_name.into(), source.unwrap_or_default().into()],
+            |r| (r.text(0), r.text(1)),
+        )
+    }
+
+    /// Latest `in_progress` chunk run of `export_name` under any source (test inspection).
+    #[cfg(test)]
+    pub(crate) fn find_in_progress_chunk_run(
         &self,
         export_name: &str,
     ) -> Result<Option<(String, String)>> {
         self.query_opt(
-            "SELECT run_id, plan_hash FROM chunk_run
-             WHERE export_name = ?1 AND status = 'in_progress'
-             ORDER BY created_at DESC LIMIT 1",
+            "SELECT run_id, plan_hash FROM chunk_run \
+             WHERE export_name = ?1 AND status = 'in_progress' ORDER BY created_at DESC LIMIT 1",
             &[export_name.into()],
             |r| (r.text(0), r.text(1)),
         )
     }
 
-    /// Open an `in_progress` chunk run with no tasks (tests seed tasks separately).
+    /// Open an `in_progress` chunk run that records no source and no tasks: the row a rivet before v34 left (fixtures).
     pub fn create_chunk_run(
         &self,
         run_id: &str,
@@ -72,33 +98,78 @@ impl StateStore {
         plan_hash: &str,
         max_chunk_attempts: u32,
     ) -> Result<()> {
-        self.open_chunk_run(run_id, export_name, plan_hash, max_chunk_attempts, &[])
+        self.insert_chunk_run(run_id, export_name, None, plan_hash, max_chunk_attempts)
     }
 
-    /// Open an `in_progress` chunk run together with its task list, committed in one transaction.
-    pub fn open_chunk_run(
+    fn insert_chunk_run(
         &self,
         run_id: &str,
         export_name: &str,
+        source: Option<&str>,
+        plan_hash: &str,
+        max_chunk_attempts: u32,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.execute(
+            "INSERT INTO chunk_run (run_id, export_name, source, plan_hash, status, max_chunk_attempts, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 'in_progress', ?5, ?6, ?6)",
+            &[
+                run_id.into(),
+                export_name.into(),
+                source.map(str::to_string).into(),
+                plan_hash.into(),
+                (max_chunk_attempts as i64).into(),
+                now.as_str().into(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Open the `in_progress` chunk run of `key`'s stream with its task list and anchor the stream on it, in one transaction.
+    pub fn open_chunk_run(
+        &self,
+        key: &super::ProgressKey,
+        run_id: &str,
         plan_hash: &str,
         max_chunk_attempts: u32,
         ranges: &[(i64, i64)],
     ) -> Result<()> {
-        let now = chrono::Utc::now().to_rfc3339();
+        self.transaction(|| {
+            self.insert_chunk_run(
+                run_id,
+                &key.export_name,
+                Some(&key.source),
+                plan_hash,
+                max_chunk_attempts,
+            )?;
+            self.insert_chunk_tasks(run_id, ranges)?;
+            self.set_resume_run_id(key, run_id)
+        })
+    }
+
+    /// Record `key`'s stream as the owner of a chunk run that recorded no source, and anchor the stream on it.
+    pub(super) fn adopt_chunk_run(&self, key: &super::ProgressKey, run_id: &str) -> Result<()> {
         self.transaction(|| {
             self.execute(
-                "INSERT INTO chunk_run (run_id, export_name, plan_hash, status, max_chunk_attempts, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, 'in_progress', ?4, ?5, ?5)",
-                &[
-                    run_id.into(),
-                    export_name.into(),
-                    plan_hash.into(),
-                    (max_chunk_attempts as i64).into(),
-                    now.as_str().into(),
-                ],
+                "UPDATE chunk_run SET source = ?1 WHERE run_id = ?2 AND source IS NULL",
+                &[key.source.as_str().into(), run_id.into()],
             )?;
-            self.insert_chunk_tasks(run_id, ranges)
+            self.set_resume_run_id(key, run_id)
         })
+    }
+
+    /// Latest chunk run of `export_name` under `source` in any status; a run that recorded no source counts.
+    pub(super) fn latest_chunk_run_of(
+        &self,
+        export_name: &str,
+        source: &str,
+    ) -> Result<Option<String>> {
+        self.query_opt(
+            "SELECT run_id FROM chunk_run WHERE export_name = ?1
+               AND (source = ?2 OR source IS NULL) ORDER BY updated_at DESC LIMIT 1",
+            &[export_name.into(), source.into()],
+            |r| r.text(0),
+        )
     }
 
     /// Insert `pending` tasks for `ranges`, numbered from 0, all or none.
@@ -319,10 +390,17 @@ impl StateStore {
     /// Mark the chunk run completed; refuses when its row is gone (the checkpoint was removed under the run).
     pub fn finalize_chunk_run_completed(&self, run_id: &str) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
-        let updated = self.execute(
-            "UPDATE chunk_run SET status = 'completed', updated_at = ?1 WHERE run_id = ?2",
-            &[now.into(), run_id.into()],
-        )?;
+        let updated = self.transaction(|| {
+            self.execute(
+                "UPDATE export_state SET resume_run_id = NULL, resume_owner = NULL \
+                 WHERE resume_run_id = ?1",
+                &[run_id.into()],
+            )?;
+            self.execute(
+                "UPDATE chunk_run SET status = 'completed', updated_at = ?1 WHERE run_id = ?2",
+                &[now.as_str().into(), run_id.into()],
+            )
+        })?;
         if updated == 0 {
             crate::rivet_bail!(
                 crate::error::codes::STATE_CHUNK_CHECKPOINT_GONE,
@@ -389,6 +467,11 @@ impl StateStore {
                 &[rid.as_str().into()],
             );
         }
+        self.execute(
+            "UPDATE export_state SET resume_run_id = NULL, resume_owner = NULL \
+             WHERE export_name = ?1 AND resume_owner = 'chunked'",
+            &[export_name.into()],
+        )?;
         self.execute(
             "DELETE FROM chunk_run WHERE export_name = ?1",
             &[export_name.into()],

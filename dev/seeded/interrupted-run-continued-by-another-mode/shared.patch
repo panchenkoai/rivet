@@ -1,0 +1,13 @@
+diff --git a/src/state/cursor.rs b/src/state/cursor.rs
+index db561f17..056bf527 100644
+--- a/src/state/cursor.rs
++++ b/src/state/cursor.rs
+@@ -274,7 +274,7 @@ impl StateStore {
+         let owner = match &row {
+             Some((_, _, Some(run), owner)) => {
+                 let owner = owner.as_deref().unwrap_or(KEYSET);
+-                if owner != key.mode {
++                if owner != key.mode && owner.is_empty() {
+                     crate::rivet_bail!(
+                         crate::error::codes::STATE_INTERRUPTED_RUN_OWNER_MISMATCH,
+                         "export '{export_name}': run {run} of mode `{owner}` is unfinished, but \

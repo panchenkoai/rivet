@@ -255,7 +255,7 @@ mod tests {
         assert_eq!(key.source, "postgres://127.0.0.1:9999/nonexistent");
         assert_eq!(key.stream, "shop.orders_src");
         assert_eq!(key.column.as_deref(), Some("updated_at"));
-        assert!(key.continues_cursor);
+        assert!(key.continues_high_water);
 
         plan.strategy = ExtractionStrategy::Keyset(crate::plan::KeysetPlan {
             key_column: "id".into(),
@@ -266,7 +266,7 @@ mod tests {
         });
         let key = plan.progress_key();
         assert_eq!(key.column.as_deref(), Some("id"));
-        assert!(!key.continues_cursor, "a crash-recovery keyset");
+        assert!(!key.continues_high_water, "a crash-recovery keyset");
 
         plan.strategy = ExtractionStrategy::Snapshot;
         plan.base_query = "SELECT 1".into();

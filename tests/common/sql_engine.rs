@@ -4,8 +4,8 @@
 
 use super::{
     LiveService, MSSQL_URL, MYSQL_URL, MssqlTable, MysqlTable, POSTGRES_URL, PgTable, Rig,
-    mssql_exec, mssql_query_strings, mysql_connect, pg_connect, read_all_parts, require_alive,
-    unique_name,
+    mssql_exec, mssql_query_strings, mysql_connect, mysql_root_connect, pg_connect, read_all_parts,
+    require_alive, unique_name,
 };
 #[cfg(feature = "oracle")]
 use super::{ORACLE_URL, OracleTable, ora_exec, ora_text_rows};
@@ -138,8 +138,8 @@ impl SqlEngine {
         }
     }
 
-    /// A fresh `(id, ext_id, server_time, updated_at, time_spent)` table and its drop guard.
-    pub fn table(self, prefix: &str) -> (String, Box<dyn std::any::Any>) {
+    /// The column definitions of [`SqlEngine::table`].
+    fn standard_columns(self) -> String {
         let ts = match self {
             SqlEngine::Mysql => "DATETIME(6)",
             SqlEngine::Pg => "TIMESTAMP",
@@ -148,13 +148,33 @@ impl SqlEngine {
             SqlEngine::Oracle => "TIMESTAMP(6)",
         };
         let i = self.int64();
-        self.create(
-            prefix,
-            &format!(
-                "id {i} PRIMARY KEY, ext_id {i} NOT NULL UNIQUE, \
-                 server_time {ts} NOT NULL, updated_at {ts} NULL, time_spent INT NULL"
-            ),
+        format!(
+            "id {i} PRIMARY KEY, ext_id {i} NOT NULL UNIQUE, \
+             server_time {ts} NOT NULL, updated_at {ts} NULL, time_spent INT NULL"
         )
+    }
+
+    /// A fresh `(id, ext_id, server_time, updated_at, time_spent)` table and its drop guard.
+    pub fn table(self, prefix: &str) -> (String, Box<dyn std::any::Any>) {
+        self.create(prefix, &self.standard_columns())
+    }
+
+    /// A second database on this engine's stand server (another source key), or `None` where the stand has one (Oracle: one service).
+    pub fn second_database(self, tag: &str) -> Option<SecondDatabase> {
+        #[cfg(feature = "oracle")]
+        if let SqlEngine::Oracle = self {
+            return None;
+        }
+        let name = unique_name(tag);
+        match self {
+            SqlEngine::Mysql => mysql_root_connect()
+                .query_drop(format!(
+                    "CREATE DATABASE {name}; GRANT ALL ON {name}.* TO 'rivet'@'%'"
+                ))
+                .expect("mysql create database as root"),
+            _ => self.exec(&format!("CREATE DATABASE {name}")),
+        }
+        Some(SecondDatabase { engine: self, name })
     }
 
     /// A fresh table with the given column definitions and its drop guard.
@@ -176,6 +196,24 @@ impl SqlEngine {
         (name, guard)
     }
 
+    /// The INSERT of `ids` with `ext_id = id * 10`, `server_time` `minutes_ago` and `time_spent`.
+    fn insert_sql(
+        self,
+        table: &str,
+        ids: std::ops::RangeInclusive<i64>,
+        minutes_ago: i64,
+        spent: Option<i32>,
+    ) -> String {
+        let spent = spent.map_or("NULL".to_string(), |v| v.to_string());
+        let rows: Vec<String> = ids
+            .map(|i| format!("({i}, {}, {}, {spent})", i * 10, self.ago(minutes_ago)))
+            .collect();
+        format!(
+            "INSERT INTO {table} (id, ext_id, server_time, time_spent) VALUES {}",
+            rows.join(", ")
+        )
+    }
+
     /// Insert `ids` with `ext_id = id * 10`, `server_time` `minutes_ago` and `time_spent`.
     pub fn insert(
         self,
@@ -184,14 +222,7 @@ impl SqlEngine {
         minutes_ago: i64,
         spent: Option<i32>,
     ) {
-        let spent = spent.map_or("NULL".to_string(), |v| v.to_string());
-        let rows: Vec<String> = ids
-            .map(|i| format!("({i}, {}, {}, {spent})", i * 10, self.ago(minutes_ago)))
-            .collect();
-        self.exec(&format!(
-            "INSERT INTO {table} (id, ext_id, server_time, time_spent) VALUES {}",
-            rows.join(", ")
-        ));
+        self.exec(&self.insert_sql(table, ids, minutes_ago, spent));
     }
 
     /// A batch rig for this engine.
@@ -202,6 +233,67 @@ impl SqlEngine {
             SqlEngine::Mssql => Rig::mssql_batch(export),
             #[cfg(feature = "oracle")]
             SqlEngine::Oracle => Rig::oracle_batch(export),
+        }
+    }
+}
+
+/// A scratch database beside the stand's own, dropped with this guard.
+pub struct SecondDatabase {
+    engine: SqlEngine,
+    pub name: String,
+}
+
+impl SecondDatabase {
+    /// The source URL of this database: the stand URL with another database path.
+    pub fn url(&self) -> String {
+        let (server, _) = self.engine.url().rsplit_once('/').expect("a database path");
+        format!("{server}/{}", self.name)
+    }
+
+    /// Run setup SQL where `table` resolves inside this database.
+    fn exec(&self, sql: &str) {
+        match self.engine {
+            SqlEngine::Pg => postgres::Client::connect(&self.url(), postgres::NoTls)
+                .expect("connect to the second database")
+                .batch_execute(sql)
+                .expect("pg exec"),
+            _ => self.engine.exec(sql),
+        }
+    }
+
+    /// `table` as setup SQL names it: bare on its own connection (PostgreSQL), qualified elsewhere.
+    fn qualified(&self, table: &str) -> String {
+        match self.engine {
+            SqlEngine::Pg => table.to_string(),
+            SqlEngine::Mssql => format!("{}.dbo.{table}", self.name),
+            _ => format!("{}.{table}", self.name),
+        }
+    }
+
+    /// Create `table` here with the columns of [`SqlEngine::table`] and insert `ids`.
+    pub fn table_with(&self, table: &str, ids: std::ops::RangeInclusive<i64>) {
+        let (e, t) = (self.engine, self.qualified(table));
+        self.exec(&format!("CREATE TABLE {t} ({})", e.standard_columns()));
+        self.exec(&e.insert_sql(&t, ids, 180, Some(10)));
+    }
+}
+
+impl Drop for SecondDatabase {
+    fn drop(&mut self) {
+        let drop = match self.engine {
+            SqlEngine::Pg => format!("DROP DATABASE IF EXISTS {} WITH (FORCE)", self.name),
+            SqlEngine::Mssql => format!(
+                "ALTER DATABASE {0} SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE {0}",
+                self.name
+            ),
+            _ => format!("DROP DATABASE IF EXISTS {}", self.name),
+        };
+        let run = || match self.engine {
+            SqlEngine::Mysql => mysql_root_connect().query_drop(&drop).expect("mysql drop"),
+            _ => self.engine.exec(&drop),
+        };
+        if std::panic::catch_unwind(run).is_err() {
+            eprintln!("could not drop scratch database {}", self.name);
         }
     }
 }

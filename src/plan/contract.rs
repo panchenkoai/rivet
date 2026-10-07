@@ -253,7 +253,8 @@ impl ResolvedRunPlan {
             source: self.source.state_key(),
             stream: self.stream(),
             column: self.strategy.cursor_identity(),
-            continues_cursor: self.strategy.continues_stored_cursor(),
+            mode: self.strategy.mode_label(),
+            continues_high_water: self.strategy.continues_stored_cursor(),
         }
     }
 }
