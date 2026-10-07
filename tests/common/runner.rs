@@ -307,6 +307,166 @@ fn ndjson_key(key: &serde_json::Value) -> Option<i64> {
     key.as_i64().or_else(|| key.as_str()?.parse().ok())
 }
 
+/// One `delivered <head> rows from memory and <tail> from disk` record of a CDC run's stderr.
+#[derive(Debug, Clone, Copy)]
+pub struct SpillSplit {
+    pub from_memory: usize,
+    pub from_disk: usize,
+}
+
+/// What a CDC test knows about the unit IT spilled; the stream is server-wide, so other splits may surround it.
+#[derive(Debug, Clone, Copy)]
+pub enum OwnSpill {
+    /// One transaction of exactly this many rows (PostgreSQL, MySQL: one split per transaction).
+    Transaction(usize),
+    /// A poll batch of the test's own capture instance (SQL Server): rows reached disk.
+    Batch,
+}
+
+const SPLIT_MARK: &str = " rows from memory and ";
+
+/// Every memory/disk split a CDC run reported, in stream order; a split line it cannot read is an error, never a skipped record.
+pub fn spill_splits(stderr: &str) -> Result<Vec<SpillSplit>, String> {
+    let lines = stderr.lines().filter(|l| l.contains(SPLIT_MARK));
+    lines
+        .map(|l| spill_split(l).ok_or_else(|| format!("unreadable spill split line: {l}")))
+        .collect()
+}
+
+/// The split one stderr line reports, `None` when either count does not parse.
+fn spill_split(line: &str) -> Option<SpillSplit> {
+    let (before, after) = line.split_once(SPLIT_MARK)?;
+    let head = before.rsplit_once("delivered ")?.1;
+    let tail = after.split_once(" from disk")?.0;
+    Some(SpillSplit {
+        from_memory: head.trim().parse().ok()?,
+        from_disk: tail.trim().parse().ok()?,
+    })
+}
+
+/// Grade a run's spill evidence: memory stopped at `cap + 1` on EVERY split, and `own` is among them.
+pub fn spill_evidence(stderr: &str, cap: usize, own: OwnSpill) -> Result<(), String> {
+    let splits = spill_splits(stderr)?;
+    if splits.is_empty() {
+        return Err("no spill split was reported: the cap was never crossed".into());
+    }
+    if let Some(s) = splits.iter().find(|s| s.from_memory != cap + 1) {
+        return Err(format!(
+            "memory must stop at the cap: a split held {} rows in memory, not cap + 1 = {} \
+             (the cap is checked after the push). All splits: {splits:?}",
+            s.from_memory,
+            cap + 1
+        ));
+    }
+    let (owned, want) = match own {
+        OwnSpill::Transaction(rows) => (
+            splits.iter().any(|s| s.from_memory + s.from_disk == rows),
+            format!("accounts for the test's own {rows}-row transaction"),
+        ),
+        OwnSpill::Batch => (
+            splits.iter().any(|s| s.from_disk > 0),
+            "put rows of the test's own batch on disk".to_string(),
+        ),
+    };
+    if owned {
+        Ok(())
+    } else {
+        Err(format!("no split {want}. All splits: {splits:?}"))
+    }
+}
+
+/// Panic with the run's stderr unless [`spill_evidence`] holds.
+pub fn assert_spill_evidence(stderr: &str, cap: usize, own: OwnSpill) {
+    if let Err(why) = spill_evidence(stderr, cap, own) {
+        panic!("{why}\nstderr: {stderr}");
+    }
+}
+
+#[cfg(test)]
+mod spill_tests {
+    use super::{OwnSpill, spill_evidence, spill_splits};
+
+    /// The product's split line (`tx_buffer::split_line`) for one MySQL transaction.
+    fn line(pos: u64, head: usize, tail: usize) -> String {
+        format!(
+            "[WARN] mysql cdc: transaction at mysql-bin.000003:{pos} delivered {head} rows \
+             from memory and {tail} from disk (222066 bytes spilled)\n"
+        )
+    }
+
+    /// CI `E2E (3/3)`: five 1000-row transactions of a neighbour's table, then the test's own 400.
+    fn neighbour_then_own(own_tail: usize) -> String {
+        let mut log = String::from(
+            "[WARN] mysql cdc: transaction at mysql-bin.000003:34391 passed the in-memory cap \
+             at 51 rows / 47259 bytes — spilling the rest to /w/.rivet-spill rather than \
+             failing the run.\n",
+        );
+        for pos in [43731, 53071, 62411, 71751, 81091] {
+            log += &line(pos, 51, 949);
+        }
+        log + &line(157709, 51, own_tail)
+    }
+
+    #[test]
+    fn a_neighbours_split_ahead_of_the_tests_own_does_not_decide_the_verdict() {
+        let log = neighbour_then_own(349);
+        assert_eq!(
+            spill_evidence(&log, 50, OwnSpill::Transaction(400)),
+            Ok(()),
+            "the neighbour's 51 + 949 is first on a server-wide binlog; the test's own \
+             51 + 349 is what it is graded on"
+        );
+        let splits = spill_splits(&log).unwrap();
+        let (first, last) = (splits[0], splits[5]);
+        assert_eq!((first.from_memory, first.from_disk), (51, 949));
+        assert_eq!((last.from_memory, last.from_disk), (51, 349));
+        assert_eq!(splits.len(), 6, "every split is read, not only the first");
+    }
+
+    #[test]
+    fn a_run_with_no_split_of_the_tests_own_size_still_fails() {
+        let lost_a_tail_row = neighbour_then_own(348);
+        let why = spill_evidence(&lost_a_tail_row, 50, OwnSpill::Transaction(400)).unwrap_err();
+        assert!(why.contains("own 400-row transaction"), "{why}");
+        let only_the_neighbour = line(43731, 51, 949);
+        assert!(spill_evidence(&only_the_neighbour, 50, OwnSpill::Transaction(400)).is_err());
+    }
+
+    #[test]
+    fn a_head_past_the_cap_fails_on_any_split_not_only_the_first() {
+        let still_buffering = line(43731, 51, 949) + &line(157709, 400, 0);
+        let why = spill_evidence(&still_buffering, 50, OwnSpill::Transaction(400)).unwrap_err();
+        assert!(why.contains("held 400 rows in memory"), "{why}");
+    }
+
+    #[test]
+    fn a_run_that_reported_no_split_fails_as_inert() {
+        let crossed_but_never_closed = "[WARN] mysql cdc: transaction at b:4 passed the cap\n";
+        for own in [OwnSpill::Transaction(400), OwnSpill::Batch] {
+            let why = spill_evidence(crossed_but_never_closed, 50, own).unwrap_err();
+            assert!(why.contains("no spill split was reported"), "{why}");
+        }
+    }
+
+    #[test]
+    fn a_split_line_it_cannot_read_is_an_error_not_a_skipped_record() {
+        let log = line(157709, 51, 349)
+            + "[WARN] mysql cdc: transaction at b:4 delivered many rows from memory and 3 from disk\n";
+        let why = spill_evidence(&log, 50, OwnSpill::Transaction(400)).unwrap_err();
+        assert!(why.contains("unreadable spill split line"), "{why}");
+    }
+
+    #[test]
+    fn a_batch_is_owned_only_when_rows_reached_disk() {
+        assert_eq!(
+            spill_evidence(&line(4, 51, 352), 50, OwnSpill::Batch),
+            Ok(())
+        );
+        let why = spill_evidence(&line(4, 51, 0), 50, OwnSpill::Batch).unwrap_err();
+        assert!(why.contains("own batch on disk"), "{why}");
+    }
+}
+
 #[cfg(test)]
 mod ndjson_tests {
     use super::ndjson_after_ids;
