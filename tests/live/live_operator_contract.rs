@@ -503,6 +503,7 @@ fn second_run_beside(rig: Rig, n: usize) {
 
 /// Mac report C: a TRUNCATE inside the stream is refused as `RIVET_SOURCE_CDC_TRUNCATED` (exit 5), every cycle.
 fn truncate_is_refused_by_code(mut s: CdcScenario) {
+    s.rig.run_ok();
     s.insert(1);
     s.settle();
     s.rig.run_ok();
@@ -760,7 +761,7 @@ fn mysql_binlogs_purged_past_the_checkpoint(after_a_changes_run: bool) {
 }
 
 /// Both reports, E/I: `doctor` is not green for a CDC export whose prerequisite the run then refuses.
-fn doctor_agrees_with_a_refused_cdc_run(rig: Rig) {
+fn doctor_agrees_where_the_stream_is_refused(rig: Rig) {
     let (_, run) = rig.run_after_doctor();
     assert!(
         !run.status.success(),
@@ -788,8 +789,8 @@ fn cdc_stdout_emits_each_change_once(mut s: CdcScenario) {
     );
 }
 
-/// RESULTS 19 and the sweep's general row: the config `rivet init --mode <mode>` writes for `table` runs as written.
-fn init_config_runs(url: &str, table: &str, mode: &str) -> InitConfig {
+/// `rivet init --mode <mode>` over `table`: the config it wrote, of that mode.
+fn init_config(url: &str, table: &str, mode: &str) -> InitConfig {
     let cfg = InitConfig::generate(url, &["--table", table, "--mode", mode]);
     assert!(
         cfg.init.status.success(),
@@ -802,15 +803,24 @@ fn init_config_runs(url: &str, table: &str, mode: &str) -> InitConfig {
         "fixture: `rivet init --mode {mode}` wrote an export of that mode\n{}",
         cfg.yaml()
     );
-    let run = cfg.cli(&["run"]);
+    cfg
+}
+
+/// The generated config runs as written; the default oracle grades what it delivered.
+fn generated_config_runs(cfg: &InitConfig) {
+    let out = cfg.cli(&["run"]);
     assert!(
-        run.status.success(),
-        "the config `rivet init --mode {mode}` wrote does not run (exit {:?})\n{}\n--- config ---\n{}",
-        run.status.code(),
-        text(&run),
+        out.status.success(),
+        "the config `rivet init` wrote does not run (exit {:?})\n{}\n--- config ---\n{}",
+        out.status.code(),
+        text(&out),
         cfg.yaml()
     );
-    cfg
+}
+
+/// RESULTS 19 and the sweep's general row: the config `rivet init --mode <mode>` writes for `table` runs as written.
+fn init_config_runs(url: &str, table: &str, mode: &str) {
+    generated_config_runs(&init_config(url, table, mode));
 }
 
 /// [`init_config_runs`] over the standard table of a batch engine.
@@ -1350,7 +1360,6 @@ fn open_defect_a_corrupt_cdc_checkpoint_is_refused_by_code_postgres() {
 #[ignore = "live+gate-only: docker compose mongo-rs; open defect (uncoded collection-drop refusal), acknowledged in dev/release_oracle/known_red.py"]
 fn open_defect_a_cdc_collection_drop_is_refused_by_code_mongo() {
     let s = CdcScenario::mongo_with("oc_trunc", |r, _| r);
-    s.rig.run_ok();
     truncate_is_refused_by_code(s);
 }
 
@@ -1360,7 +1369,6 @@ fn open_defect_a_cdc_collection_drop_is_refused_by_code_mongo() {
 fn a_cdc_truncate_is_refused_by_code_oracle() {
     let _serial = cross_process_serial("oracle_cdc");
     let s = CdcScenario::oracle_with("oc_trunc", |r, _| r);
-    s.rig.run_ok();
     truncate_is_refused_by_code(s);
 }
 
@@ -1413,7 +1421,7 @@ fn open_defect_doctor_is_not_green_where_the_cdc_run_refuses_a_replica_that_does
         ))
         .unwrap();
     std::thread::sleep(std::time::Duration::from_secs(2));
-    doctor_agrees_with_a_refused_cdc_run(
+    doctor_agrees_where_the_stream_is_refused(
         Rig::mysql_cdc(&table)
             .source_url(REPLICA_NOLOG_RIVET)
             .oracle_known_defect(
@@ -1435,14 +1443,14 @@ fn doctor_is_not_green_where_the_cdc_run_refuses_a_table_with_no_capture_instanc
         table: table.clone(),
         ci: format!("dbo_{table}"),
     };
-    doctor_agrees_with_a_refused_cdc_run(Rig::mssql_cdc(&table, &format!("dbo_{table}")));
+    doctor_agrees_where_the_stream_is_refused(Rig::mssql_cdc(&table, &format!("dbo_{table}")));
 }
 
 #[test]
 #[ignore = "live: requires docker compose mongo-rs"]
 fn doctor_is_not_green_where_the_cdc_run_refuses_a_standalone_mongo() {
     let (url, _m, _guard) = mongo_db("oc_standalone", 3);
-    doctor_agrees_with_a_refused_cdc_run(Rig::mongo_cdc("t").source_url(&url));
+    doctor_agrees_where_the_stream_is_refused(Rig::mongo_cdc("t").source_url(&url));
 }
 
 #[cfg(feature = "oracle")]
@@ -1452,7 +1460,7 @@ fn doctor_is_not_green_where_the_cdc_run_refuses_a_table_without_all_column_logg
     let _serial = cross_process_serial("oracle_cdc");
     let t = OracleTable::create("oc_nolog", "id NUMBER(18) PRIMARY KEY, v NUMBER(18)");
     ora_exec(&format!("GRANT SELECT ON {} TO c##rivetcdc", t.name()));
-    doctor_agrees_with_a_refused_cdc_run(Rig::oracle_cdc(t.name()));
+    doctor_agrees_where_the_stream_is_refused(Rig::oracle_cdc(t.name()));
 }
 
 #[test]
@@ -1587,11 +1595,9 @@ fn the_config_init_writes_runs_full_mongo() {
 fn the_config_init_writes_runs_cdc_postgres() {
     let mut s = CdcScenario::pg_with("oc_initc", "id BIGINT PRIMARY KEY, v BIGINT", |r, _| r);
     s.insert(1);
-    let cfg = InitConfig::generate(POSTGRES_CDC_URL, &["--table", &s.table, "--mode", "cdc"]);
+    let cfg = init_config(POSTGRES_CDC_URL, &s.table, "cdc");
     let _slot = cfg.field("slot").map(Slot::new);
-    drop(cfg);
-    let cfg = init_config_runs(POSTGRES_CDC_URL, &s.table, "cdc");
-    drop(cfg);
+    generated_config_runs(&cfg);
 }
 
 #[test]
@@ -1618,19 +1624,13 @@ fn open_defect_init_cdc_writes_the_capture_instance_the_catalog_holds_mssql() {
     enable_cdc(&table, &ci);
     mssql_cdc_exec(&format!("INSERT INTO dbo.{table} VALUES (1, 1)"));
     wait_for_capture(&ci, 1);
-    let cfg = InitConfig::generate(
-        MSSQL_CDC_URL,
-        &["--table", &format!("dbo.{table}"), "--mode", "cdc"],
-    );
+    let cfg = init_config(MSSQL_CDC_URL, &format!("dbo.{table}"), "cdc");
     assert_eq!(
         cfg.field("capture_instance").as_deref(),
         Some(ci.as_str()),
         "`rivet init --mode cdc` wrote a capture instance cdc.change_tables does not hold for dbo.{table}"
     );
-    assert!(
-        cfg.cli(&["run"]).status.success(),
-        "the generated config runs"
-    );
+    generated_config_runs(&cfg);
 }
 
 #[test]
@@ -1657,15 +1657,9 @@ fn open_defect_the_config_init_writes_runs_cdc_on_a_standby_postgres() {
     .unwrap();
     let _tbl = PgTable::adopt_on(PG_STANDBY_PRIMARY_URL, tbl.clone());
     std::thread::sleep(std::time::Duration::from_secs(2));
-    let cfg = InitConfig::generate(PG_STANDBY_URL, &["--table", &tbl, "--mode", "cdc"]);
+    let cfg = init_config(PG_STANDBY_URL, &tbl, "cdc");
     let _slot = cfg.field("slot").map(|s| Slot::on(PG_STANDBY_URL, s));
-    let run = cfg.cli(&["run"]);
-    assert!(
-        run.status.success(),
-        "the config `rivet init --mode cdc` wrote against a standby does not run (exit {:?})\n{}",
-        run.status.code(),
-        text(&run)
-    );
+    generated_config_runs(&cfg);
 }
 
 #[test]

@@ -424,6 +424,7 @@ fn derived_capture_marker_set_is_pinned() {
         // routed around the invoke seam).
         "apply_env(",
         "cli(",
+        "cli_cdc_ndjson(",
         "cli_env(",
         "cli_in_dir(",
         "drain_and_read(",
