@@ -2,7 +2,6 @@
 
 ## Unreleased
 
-<<<<<<< HEAD
 - **ClickHouse load: a timestamp ClickHouse cannot hold is refused before the load's first
   statement, and that refusal no longer makes the table rivet's own.** The range check ran
   inside the insert of each part, after the `<table>__rivet_swap` table was created, and the
@@ -13,7 +12,6 @@
   of loading. A load with an out-of-range value in a later part no longer inserts the earlier
   parts into the swap table before stopping.
 
-=======
 - **Breaking: a run refuses to continue from progress stored for another table or collection**
   (`RIVET_STATE_CURSOR_STREAM_MISMATCH`, exit 5, nothing read or written). The stored incremental
   cursor, `keyset_incremental` high-water, MongoDB `resume` `_id` and interrupted-run anchor now
@@ -35,7 +33,6 @@
     detected.
   - An export whose `FROM` relation comes from a `--param` that changes between runs is now
     refused when it continues a stored cursor.
->>>>>>> origin/main
 - **Security: a password written in a keyword/value connection string is no longer printed or
   stored.** A PostgreSQL libpq string (`host=… user=… password=… dbname=…`) is accepted in
   `url:`; SQL Server ADO and JDBC-property strings (`…;Password=…;`, `…;PWD=…;`,
