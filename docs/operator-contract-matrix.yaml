@@ -1,0 +1,241 @@
+# Operator-contract matrix. What rivet's exit code, refusal text and advice commands promise an
+# operator, from the 2026-10-07 CLI sweep by hand (RESULTS.md and the two sweep reports). Each
+# cell asserts the correct behaviour (tests/live/live_operator_contract.rs); an `open_defect_*`
+# cell fails today and is acknowledged in dev/release_oracle/known_red.py with the symptom it shows.
+# Patterns: (a) exit 0 over a wrong destination, (b) a failure before the first write, (c) refusal
+# then remedy (Rig::refuses_twice_then), (d) the exit-code contract, (e) advice parity, (f) single rows.
+
+engines: [postgres, mysql, mssql, mongo, oracle]
+
+scenarios:
+  - id: stale_chunk_checkpoint
+    what: "RESULTS 1: a chunk checkpoint older than the last finished run is not resumed"
+    postgres: { test: open_defect_a_stale_chunk_checkpoint_is_not_adopted_after_a_finished_run_postgres }
+    mysql:    { test: open_defect_a_stale_chunk_checkpoint_is_not_adopted_after_a_finished_run_mysql }
+    mssql:    { test: open_defect_a_stale_chunk_checkpoint_is_not_adopted_after_a_finished_run_mssql }
+    mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only; any other mode is refused when the config is read (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no range-chunk checkpoint" }
+    oracle:   { test: open_defect_a_stale_chunk_checkpoint_is_not_adopted_after_a_finished_run_oracle }
+
+  - id: run_validate_exit
+    what: "RESULTS 2: `run --validate` does not exit 0 over `validated: FAIL`"
+    postgres: { test: open_defect_run_validate_does_not_exit_0_over_a_failed_validation_postgres }
+    mysql:    { test: open_defect_run_validate_does_not_exit_0_over_a_failed_validation_mysql }
+    mssql:    { test: open_defect_run_validate_does_not_exit_0_over_a_failed_validation_mssql }
+    mongo:    { test: open_defect_run_validate_does_not_exit_0_over_a_failed_validation_mongo }
+    oracle:   { test: open_defect_run_validate_does_not_exit_0_over_a_failed_validation_oracle }
+
+  - id: read_only_state
+    what: "RESULTS 3: an incremental run that cannot store its cursor does not exit 0"
+    postgres: { test: open_defect_a_run_that_cannot_store_its_cursor_does_not_exit_0_postgres }
+    mysql:    { test: open_defect_a_run_that_cannot_store_its_cursor_does_not_exit_0_mysql }
+    mssql:    { test: open_defect_a_run_that_cannot_store_its_cursor_does_not_exit_0_mssql }
+    mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only; any other mode is refused when the config is read (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no incremental cursor to store" }
+    oracle:   { test: open_defect_a_run_that_cannot_store_its_cursor_does_not_exit_0_oracle }
+
+  - id: concurrent_full_runs
+    what: "RESULTS 4: a second concurrent `full` run is refused, or the prefix holds each key once"
+    postgres: { test: open_defect_a_second_concurrent_full_run_does_not_double_the_prefix_postgres }
+    mysql:    { test: open_defect_a_second_concurrent_full_run_does_not_double_the_prefix_mysql }
+    mssql:    { test: open_defect_a_second_concurrent_full_run_does_not_double_the_prefix_mssql }
+    mongo:    { test: open_defect_a_second_concurrent_full_run_does_not_double_the_prefix_mongo }
+    oracle:   { test: open_defect_a_second_concurrent_full_run_does_not_double_the_prefix_oracle }
+
+  - id: failed_before_first_write
+    what: "RESULTS 8: a run that fails before its first write leaves the previous `_SUCCESS` and manifest alone"
+    postgres: { test: open_defect_a_run_that_never_connected_keeps_the_export_complete_postgres }
+    mysql:    { test: open_defect_a_run_that_never_connected_keeps_the_export_complete_mysql }
+    mssql:    { test: open_defect_a_run_that_never_connected_keeps_the_export_complete_mssql }
+    mongo:    { test: open_defect_a_run_that_never_connected_keeps_the_export_complete_mongo }
+    oracle:   { test: open_defect_a_run_that_never_connected_keeps_the_export_complete_oracle }
+
+  - id: resume_force_remedy
+    what: "RESULTS 12: `--resume --force` runs over a complete prefix, as the refusal says"
+    postgres: { test: open_defect_resume_force_runs_over_a_complete_prefix_postgres }
+    mysql:    { test: open_defect_resume_force_runs_over_a_complete_prefix_mysql }
+    mssql:    { test: open_defect_resume_force_runs_over_a_complete_prefix_mssql }
+    mongo:    { test: resume_force_runs_over_a_complete_prefix_mongo }
+    oracle:   { test: open_defect_resume_force_runs_over_a_complete_prefix_oracle }
+
+  - id: run_in_progress_code
+    what: "RESULTS 11: a second run beside a live checkpointed run is refused as RIVET_STATE_RUN_IN_PROGRESS (exit 5)"
+    postgres: { test: open_defect_a_second_run_beside_a_live_checkpointed_run_is_refused_by_code_postgres }
+    mysql:    { test: open_defect_a_second_run_beside_a_live_checkpointed_run_is_refused_by_code_mysql }
+    mssql:    { test: open_defect_a_second_run_beside_a_live_checkpointed_run_is_refused_by_code_mssql }
+    mongo:    { test: open_defect_a_second_run_beside_a_live_resumable_run_is_refused_by_code_mongo }
+    oracle:   { test: open_defect_a_second_run_beside_a_live_checkpointed_run_is_refused_by_code_oracle }
+
+  - id: plan_unreadable_source
+    what: "RESULTS 10: `plan` over a table that does not exist fails and seals no artifact"
+    postgres: { test: open_defect_plan_fails_over_a_table_that_does_not_exist_postgres }
+    mysql:    { test: open_defect_plan_fails_over_a_table_that_does_not_exist_mysql }
+    mssql:    { test: open_defect_plan_fails_over_a_table_that_does_not_exist_mssql }
+    mongo:    { test: open_defect_plan_fails_over_a_collection_that_does_not_exist_mongo }
+    oracle:   { test: open_defect_plan_fails_over_a_table_that_does_not_exist_oracle }
+
+  - id: unusable_state_url
+    what: "RESULTS 9: a `RIVET_STATE_URL` rivet cannot use is refused"
+    postgres: { test: open_defect_an_unusable_state_url_is_refused_postgres }
+    mysql:    { test: open_defect_an_unusable_state_url_is_refused_mysql }
+    mssql:    { test: open_defect_an_unusable_state_url_is_refused_mssql }
+    mongo:    { test: open_defect_an_unusable_state_url_is_refused_mongo }
+    oracle:   { test: open_defect_an_unusable_state_url_is_refused_oracle }
+
+  - id: corrupt_checkpoint_remedy
+    what: "RESULTS 13: deleting a corrupt CDC checkpoint accepts a new anchor, as the refusal says"
+    postgres: { na: "deleting the checkpoint works on PostgreSQL: the slot is the anchor (Mac sweep F1)" }
+    mysql:    { test: open_defect_deleting_a_corrupt_cdc_checkpoint_accepts_a_new_anchor_mysql }
+    mssql:    { test: open_defect_deleting_a_corrupt_cdc_checkpoint_accepts_a_new_anchor_mssql }
+    mongo:    { test: open_defect_deleting_a_corrupt_cdc_checkpoint_accepts_a_new_anchor_mongo }
+    oracle:   { test: deleting_a_corrupt_cdc_checkpoint_accepts_a_new_anchor_oracle }
+
+  - id: corrupt_checkpoint_code
+    what: "a corrupt CDC checkpoint is refused as RIVET_SOURCE_CDC_CHECKPOINT_INVALID (exit 5)"
+    postgres: { test: open_defect_a_corrupt_cdc_checkpoint_is_refused_by_code_postgres }
+    mysql:    { test: open_defect_a_corrupt_cdc_checkpoint_is_refused_by_code_mysql }
+    mssql:    { test: open_defect_a_corrupt_cdc_checkpoint_is_refused_by_code_mssql }
+    mongo:    { test: open_defect_a_corrupt_cdc_checkpoint_is_refused_by_code_mongo }
+    oracle:   { test: open_defect_a_corrupt_cdc_checkpoint_is_refused_by_code_oracle }
+
+  - id: cdc_truncate_code
+    what: "a TRUNCATE inside the stream is refused as RIVET_SOURCE_CDC_TRUNCATED (exit 5)"
+    postgres: { test: open_defect_a_cdc_truncate_is_refused_by_code_postgres }
+    mysql:    { test: open_defect_a_cdc_truncate_is_refused_by_code_mysql }
+    mssql:    { na: "SQL Server rejects TRUNCATE on a captured table (Msg 4711)" }
+    mongo:    { test: open_defect_a_cdc_collection_drop_is_refused_by_code_mongo }
+    oracle:   { test: a_cdc_truncate_is_refused_by_code_oracle }
+
+  - id: log_gone_before_the_first_changes_run
+    what: "RESULTS 6, 17: retained changes removed past a checkpoint no changes run has advanced are refused as RIVET_SOURCE_CDC_LOG_GAP (exit 5)"
+    postgres: { test: open_defect_a_dropped_slot_is_refused_by_code_postgres }
+    mysql:    { test: open_defect_binlogs_purged_past_the_checkpoint_before_the_first_changes_run_are_refused_by_code_mysql }
+    mssql:    { test: open_defect_a_change_table_cleaned_past_the_checkpoint_before_the_first_changes_run_is_refused_by_code_mssql }
+    mongo:    { gap: "the stand's replica set cannot lose oplog under a resume token without affecting every other change-stream cell: it needs a dedicated replica set started with a minimal `--oplogSize` and filler writes past it" }
+    oracle:   { gap: "the stand cannot lose an Oracle archived log without SYSDBA inside the container (RMAN `delete archivelog` after log switches), which the test user does not hold; the fabricated-low-water twin is live_cdc_oracledb::oracle_cdc_resume_past_log_retention_fails_loudly. Needs: a SYSDBA handle for the harness, run under the oracle_cdc serial group" }
+
+  - id: log_gone_after_a_changes_run
+    what: "RESULTS 17: retained changes removed past a checkpoint a changes run advanced are refused as RIVET_SOURCE_CDC_LOG_GAP (exit 5)"
+    postgres: { test: open_defect_a_dropped_slot_after_a_changes_run_is_refused_by_code_postgres }
+    mysql:    { test: open_defect_binlogs_purged_past_the_checkpoint_after_a_changes_run_are_refused_by_code_mysql }
+    mssql:    { test: a_change_table_cleaned_past_the_checkpoint_after_a_changes_run_is_refused_by_code_mssql }
+    mongo:    { gap: "the stand's replica set cannot lose oplog under a resume token without affecting every other change-stream cell: it needs a dedicated replica set started with a minimal `--oplogSize` and filler writes past it" }
+    oracle:   { gap: "the stand cannot lose an Oracle archived log without SYSDBA inside the container (RMAN `delete archivelog` after log switches), which the test user does not hold; the fabricated-low-water twin is live_cdc_oracledb::oracle_cdc_resume_past_log_retention_fails_loudly. Needs: a SYSDBA handle for the harness, run under the oracle_cdc serial group" }
+
+  - id: refused_cdc_run_leaves_a_slot
+    what: "RESULTS 15: a PostgreSQL CDC run refused for a missing table leaves no replication slot"
+    postgres: { test: open_defect_a_refused_cdc_run_on_a_missing_table_leaves_no_slot_postgres }
+    mysql:    { na: "a replication slot is PostgreSQL's server-side anchor; the MySQL sibling (a checkpoint written by a refused run) is the known defect on roast_mysql_cdc_refuses_a_view_whose_binlog_identity_is_the_base_table" }
+    mssql:    { na: "a replication slot is PostgreSQL's server-side anchor; the MySQL sibling (a checkpoint written by a refused run) is the known defect on roast_mysql_cdc_refuses_a_view_whose_binlog_identity_is_the_base_table" }
+    mongo:    { na: "a replication slot is PostgreSQL's server-side anchor; the MySQL sibling (a checkpoint written by a refused run) is the known defect on roast_mysql_cdc_refuses_a_view_whose_binlog_identity_is_the_base_table" }
+    oracle:   { na: "a replication slot is PostgreSQL's server-side anchor; the MySQL sibling (a checkpoint written by a refused run) is the known defect on roast_mysql_cdc_refuses_a_view_whose_binlog_identity_is_the_base_table" }
+
+  - id: doctor_cdc_prerequisite
+    what: "`doctor` is not green for a CDC export whose prerequisite the run refuses (wal_level, a replica that does not relog, no capture instance, a standalone, no all-column logging)"
+    postgres: { test: open_defect_doctor_is_not_green_where_the_cdc_run_refuses_wal_level_postgres }
+    mysql:    { test: open_defect_doctor_is_not_green_where_the_cdc_run_refuses_a_replica_that_does_not_relog_mysql }
+    mssql:    { test: doctor_is_not_green_where_the_cdc_run_refuses_a_table_with_no_capture_instance_mssql }
+    mongo:    { test: doctor_is_not_green_where_the_cdc_run_refuses_a_standalone_mongo }
+    oracle:   { test: doctor_is_not_green_where_the_cdc_run_refuses_a_table_without_all_column_logging_oracle }
+
+  - id: mongo_page_size_remedy
+    what: "RESULTS 14: removing `page_size` after the heterogeneous-`_id` refusal runs the full scan"
+    postgres: { na: "`page_size` and the heterogeneous-`_id` guard are MongoDB's" }
+    mysql:    { na: "`page_size` and the heterogeneous-`_id` guard are MongoDB's" }
+    mssql:    { na: "`page_size` and the heterogeneous-`_id` guard are MongoDB's" }
+    mongo:    { test: open_defect_removing_page_size_runs_after_the_heterogeneous_id_refusal_mongo }
+    oracle:   { na: "`page_size` and the heterogeneous-`_id` guard are MongoDB's" }
+
+  - id: validate_missing_bucket_s3
+    what: "RESULTS 5: `validate` on a bucket that does not exist fails (s3)"
+    postgres: { test: open_defect_validate_fails_on_a_missing_bucket_s3 }
+    mysql:    { na: "`validate` reads the destination only (MinIO, fake-gcs and Azurite cells under postgres); no source engine is involved" }
+    mssql:    { na: "`validate` reads the destination only (MinIO, fake-gcs and Azurite cells under postgres); no source engine is involved" }
+    mongo:    { na: "`validate` reads the destination only (MinIO, fake-gcs and Azurite cells under postgres); no source engine is involved" }
+    oracle:   { na: "`validate` reads the destination only (MinIO, fake-gcs and Azurite cells under postgres); no source engine is involved" }
+
+  - id: validate_missing_bucket_gcs
+    what: "RESULTS 5: `validate` on a bucket that does not exist fails (gcs)"
+    postgres: { test: open_defect_validate_fails_on_a_missing_bucket_gcs }
+    mysql:    { na: "`validate` reads the destination only (MinIO, fake-gcs and Azurite cells under postgres); no source engine is involved" }
+    mssql:    { na: "`validate` reads the destination only (MinIO, fake-gcs and Azurite cells under postgres); no source engine is involved" }
+    mongo:    { na: "`validate` reads the destination only (MinIO, fake-gcs and Azurite cells under postgres); no source engine is involved" }
+    oracle:   { na: "`validate` reads the destination only (MinIO, fake-gcs and Azurite cells under postgres); no source engine is involved" }
+
+  - id: validate_missing_bucket_azure
+    what: "RESULTS 5: `validate` on a bucket that does not exist fails (azure)"
+    postgres: { test: open_defect_validate_fails_on_a_missing_bucket_azure }
+    mysql:    { na: "`validate` reads the destination only (MinIO, fake-gcs and Azurite cells under postgres); no source engine is involved" }
+    mssql:    { na: "`validate` reads the destination only (MinIO, fake-gcs and Azurite cells under postgres); no source engine is involved" }
+    mongo:    { na: "`validate` reads the destination only (MinIO, fake-gcs and Azurite cells under postgres); no source engine is involved" }
+    oracle:   { na: "`validate` reads the destination only (MinIO, fake-gcs and Azurite cells under postgres); no source engine is involved" }
+
+  - id: cdc_stdout_emits_each_change_once
+    what: "RESULTS 16: three `rivet cdc --checkpoint` drains to stdout emit each change once (PostgreSQL: 3, 3, 3 today)"
+    postgres: { test: open_defect_cdc_to_stdout_emits_each_change_once_postgres }
+    mysql:    { test: cdc_to_stdout_emits_each_change_once_mysql }
+    mssql:    { test: cdc_to_stdout_emits_each_change_once_mssql }
+    mongo:    { test: cdc_to_stdout_emits_each_change_once_mongo }
+    oracle:   { test: cdc_to_stdout_emits_each_change_once_oracle }
+
+  - id: init_config_runs_full
+    what: "the config `rivet init --mode full` writes runs as written"
+    postgres: { test: the_config_init_writes_runs_full_postgres }
+    mysql:    { test: the_config_init_writes_runs_full_mysql }
+    mssql:    { test: the_config_init_writes_runs_full_mssql }
+    mongo:    { test: the_config_init_writes_runs_full_mongo }
+    oracle:   { test: the_config_init_writes_runs_full_oracle }
+
+  - id: init_config_runs_incremental
+    what: "the config `rivet init --mode incremental` writes runs as written"
+    postgres: { test: the_config_init_writes_runs_incremental_postgres }
+    mysql:    { test: the_config_init_writes_runs_incremental_mysql }
+    mssql:    { test: the_config_init_writes_runs_incremental_mssql }
+    mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only; any other mode is refused when the config is read (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED)" }
+    oracle:   { test: the_config_init_writes_runs_incremental_oracle }
+
+  - id: init_config_runs_chunked
+    what: "the config `rivet init --mode chunked` writes runs as written"
+    postgres: { test: the_config_init_writes_runs_chunked_postgres }
+    mysql:    { test: the_config_init_writes_runs_chunked_mysql }
+    mssql:    { test: the_config_init_writes_runs_chunked_mssql }
+    mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only; any other mode is refused when the config is read (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED)" }
+    oracle:   { test: the_config_init_writes_runs_chunked_oracle }
+
+  - id: init_config_runs_cdc
+    what: "RESULTS 19: the config `rivet init --mode cdc` writes runs as written (SQL Server: with the capture instance the catalog holds)"
+    postgres: { test: the_config_init_writes_runs_cdc_postgres }
+    mysql:    { test: the_config_init_writes_runs_cdc_mysql }
+    mssql:    { test: open_defect_init_cdc_writes_the_capture_instance_the_catalog_holds_mssql }
+    mongo:    { test: the_config_init_writes_runs_cdc_mongo }
+    oracle:   { test: a_generated_oracle_cdc_config_has_no_load_block_and_runs_to_parquet }
+
+  - id: init_config_runs_cdc_on_a_standby
+    what: "devbox E2: the config `rivet init --mode cdc` writes against a PostgreSQL standby runs"
+    postgres: { test: open_defect_the_config_init_writes_runs_cdc_on_a_standby_postgres }
+    mysql:    { na: "the standby twin is PostgreSQL's (logical decoding on a hot standby); a MySQL replica is an ordinary binlog source, covered by live_cdc_replica" }
+    mssql:    { na: "the standby twin is PostgreSQL's (logical decoding on a hot standby); a MySQL replica is an ordinary binlog source, covered by live_cdc_replica" }
+    mongo:    { na: "the standby twin is PostgreSQL's (logical decoding on a hot standby); a MySQL replica is an ordinary binlog source, covered by live_cdc_replica" }
+    oracle:   { na: "the standby twin is PostgreSQL's (logical decoding on a hot standby); a MySQL replica is an ordinary binlog source, covered by live_cdc_replica" }
+
+  - id: check_names_the_strategy_run_uses
+    what: "RESULTS 20: `check` names the strategy `run` uses for `mode: chunked` with no chunk column"
+    postgres: { test: open_defect_check_names_the_strategy_run_uses_for_chunked_with_no_column_postgres }
+    mysql:    { test: open_defect_check_names_the_strategy_run_uses_for_chunked_with_no_column_mysql }
+    mssql:    { test: open_defect_check_names_the_strategy_run_uses_for_chunked_with_no_column_mssql }
+    mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only; any other mode is refused when the config is read (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED)" }
+    oracle:   { test: open_defect_check_names_the_strategy_run_uses_for_chunked_with_no_column_oracle }
+
+  - id: standby_refusal_leaves_nothing
+    what: "RESULTS 15 (standby twin): a bounded CDC run refused on a PostgreSQL standby leaves no slot, baseline or cdc_snapshot row, and `point at the primary` then runs"
+    postgres: { test: open_defect_a_bounded_cdc_run_refused_on_a_standby_leaves_nothing_and_its_remedy_runs_postgres }
+    mysql:    { na: "the standby twin is PostgreSQL's (logical decoding on a hot standby); a MySQL replica is an ordinary binlog source, covered by live_cdc_replica" }
+    mssql:    { na: "the standby twin is PostgreSQL's (logical decoding on a hot standby); a MySQL replica is an ordinary binlog source, covered by live_cdc_replica" }
+    mongo:    { na: "the standby twin is PostgreSQL's (logical decoding on a hot standby); a MySQL replica is an ordinary binlog source, covered by live_cdc_replica" }
+    oracle:   { na: "the standby twin is PostgreSQL's (logical decoding on a hot standby); a MySQL replica is an ordinary binlog source, covered by live_cdc_replica" }
+
+  - id: range_chunking_number_19
+    what: "2026-10-06 finding: range chunking takes an Oracle NUMBER(19) integer primary key"
+    postgres: { na: "NUMBER(19) is Oracle's; BIGINT keys range-chunk on the other engines (every range cell of this matrix)" }
+    mysql:    { na: "NUMBER(19) is Oracle's; BIGINT keys range-chunk on the other engines (every range cell of this matrix)" }
+    mssql:    { na: "NUMBER(19) is Oracle's; BIGINT keys range-chunk on the other engines (every range cell of this matrix)" }
+    mongo:    { na: "NUMBER(19) is Oracle's; BIGINT keys range-chunk on the other engines (every range cell of this matrix)" }
+    oracle:   { test: open_defect_range_chunking_takes_a_number_19_key_oracle }

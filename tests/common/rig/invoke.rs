@@ -410,6 +410,48 @@ impl Rig {
         out
     }
 
+    /// argv of `rivet cdc` over this CDC rig's own source, table and stream identity (slot, capture instance, server id).
+    pub(crate) fn cdc_cli_argv(&self, checkpointed: bool) -> Vec<String> {
+        let mut argv: Vec<String> = [
+            "cdc",
+            "--source",
+            &self.source_url,
+            "--table",
+            &self.tables[0],
+        ]
+        .map(String::from)
+        .to_vec();
+        for (key, flag) in [
+            ("slot: ", "--slot"),
+            ("capture_instance: ", "--capture-instance"),
+            ("server_id: ", "--server-id"),
+        ] {
+            if let Some(v) = self.cdc_lines.iter().find_map(|l| l.strip_prefix(key)) {
+                argv.extend([flag.to_string(), v.to_string()]);
+            }
+        }
+        if checkpointed {
+            argv.extend([
+                "--checkpoint".to_string(),
+                self.checkpoint().display().to_string(),
+            ]);
+        }
+        argv
+    }
+
+    /// One bounded `rivet cdc` to stdout over this rig's stream: the NDJSON change lines it printed.
+    pub fn cli_cdc_ndjson(&self, checkpointed: bool) -> Vec<String> {
+        let argv = self.cdc_cli_argv(checkpointed);
+        let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let ceiling = std::time::Duration::from_secs(180);
+        crate::common::runner::run_rivet_args_bounded(&argv, ceiling)
+            .expect("a bounded `rivet cdc` run ends on its own")
+            .lines()
+            .filter(|l| l.trim_start().starts_with('{'))
+            .map(str::to_string)
+            .collect()
+    }
+
     /// `rivet doctor --json`, then the run it predicts: panics when doctor reported all_ok and the run refused; returns (doctor's all_ok, the run).
     pub fn run_after_doctor(&self) -> (bool, std::process::Output) {
         let doctor = self.cli(&["doctor", "--json"]);
