@@ -16,7 +16,7 @@ import os
 import re
 from pathlib import Path
 
-from .core import Ledger, Proc, rivet_bin, run
+from .core import Ledger, Proc, rivet_bin, run, run_lanes, server_of
 
 SCEN = "upgrade_continuity"
 CDC_TABLES = 3
@@ -525,27 +525,23 @@ def cdc_load_leg(led: Ledger, prev: Path, root: Path, engine: str, url: str, tz:
         gcp.gcs_delete_prefix(bucket, f"{pfx}/")
 
 
+def cdc_load_lane_cells(prev: Path, root: Path) -> list[tuple[object, object]]:
+    """Every cdc-load cell as `(lane, fn)`, per engine in UTC, in its non-UTC zone, then on this binary's init;
+    the lane is the source server (MySQL's zone is server-GLOBAL, Oracle's capture shares the batch server)."""
+    skips: list[tuple[object, object]] = []
+    cells: list[tuple[object, object]] = []
+    for e, (_, envs, tz) in CDC_LOAD_ENGINES.items():
+        if not all(os.environ.get(v) for v in envs):
+            skips.append((None, lambda led, e=e, envs=envs: led.skipped(
+                e, "-", SCEN, "cdc-load", f"upgrade[{e}/cdc-load]: no {' / '.join(envs)}", "no url")))
+            continue
+        url = os.environ[envs[0]]
+        for z, init_this in ((None, False), *(((tz, False),) if tz else ()), (None, True)):
+            cells.append((server_of(url), lambda led, e=e, url=url, z=z, i=init_this: cdc_load_leg(
+                led, prev, root, e, url, z, init_this=i)))
+    return skips + cells
+
+
 def cdc_load_cells(led: Ledger, prev: Path, root: Path) -> None:
-    """Every cdc-load cell, per engine in UTC then in its non-UTC zone; the engines run side by side,
-    one engine's cells in turn (MySQL's zone is server-GLOBAL)."""
-    from concurrent.futures import ThreadPoolExecutor
-
-    lanes = []
-    for e, (_, envs, _) in CDC_LOAD_ENGINES.items():
-        if all(os.environ.get(v) for v in envs):
-            lanes.append((e, os.environ[envs[0]]))
-        else:
-            led.skipped(e, "-", SCEN, "cdc-load", f"upgrade[{e}/cdc-load]: no {' / '.join(envs)}", "no url")
-    subs = [led.buffered_child() for _ in lanes]
-
-    def lane(i: int) -> None:
-        engine, url = lanes[i]
-        tz = CDC_LOAD_ENGINES[engine][2]
-        for z in (None, tz) if tz else (None,):
-            cdc_load_leg(subs[i], prev, root, engine, url, z)
-        cdc_load_leg(subs[i], prev, root, engine, url, None, init_this=True)
-
-    with ThreadPoolExecutor(max_workers=max(1, len(lanes))) as ex:
-        list(ex.map(lane, range(len(lanes))))
-    for sub in subs:
-        sub.flush_into(led)
+    """The cdc-load cells alone: one lane per source server."""
+    run_lanes(led, cdc_load_lane_cells(prev, root))

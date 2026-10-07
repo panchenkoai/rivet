@@ -149,6 +149,9 @@ class Ledger:
         # (each `phase()` closes the previous one; `report()` prints the breakdown
         # sorted slowest-first). Answers "what takes so long" every run, cheaply.
         self._phase_times: list[tuple[str, float]] = []
+        #: Phase -> the machine's 1-minute load average when it opened and when it closed.
+        self._phase_load: dict[str, tuple[float, float]] = {}
+        self._load_at_start = 0.0
         self._cur_phase: str | None = None
         self._phase_start: float = time.perf_counter()
         # Buffered mode: a per-ENGINE sub-ledger under parallel `engine_loop`
@@ -178,9 +181,11 @@ class Ledger:
 
     def phase(self, msg: str) -> None:
         # Close the previous phase's wall-clock before opening this one.
-        now = time.perf_counter()
+        now, load = time.perf_counter(), os.getloadavg()[0]
         if self._cur_phase is not None:
             self._phase_times.append((self._cur_phase, now - self._phase_start))
+            self._phase_load[self._cur_phase] = (self._load_at_start, load)
+        self._load_at_start = load
         self._cur_phase = msg
         self._phase_start = now
         self._emit(self._c("1;34", f"▸ {msg}"))
@@ -341,7 +346,8 @@ class Ledger:
             self.phase("Timing (wall-clock, slowest first)")
             for name, dur in sorted(timed, key=lambda p: p[1], reverse=True)[:15]:
                 pct = (dur / total * 100.0) if total > 0 else 0.0
-                print(f"  {dur / 60.0:6.1f} min  {pct:4.0f}%  {name}")
+                lo, hi = self._phase_load.get(name, (0.0, 0.0))
+                print(f"  {dur / 60.0:6.1f} min  {pct:4.0f}%  load {lo:5.1f}->{hi:5.1f}  {name}")
             print(f"  {total / 60.0:6.1f} min  total (sum of phases)")
             print()
         # Inside-the-phase breakdown — the per-engine / per-scenario spans that the
@@ -395,6 +401,7 @@ class Ledger:
                 TIMINGS_HISTORY, timed, self._spans, verdict,
                 sum(c.status is Status.PASS for c in self.cells),
                 sum(c.status is Status.FAIL for c in self.cells),
+                self._phase_load,
             )
         known = [c for c in self.cells if c.status is Status.KNOWN]
         if known:
@@ -427,8 +434,8 @@ TIMINGS_HISTORY = ROOT / "dev" / "release-oracle" / "timings.jsonl"
 
 
 def record_timings(path: Path, phases: list[tuple[str, float]], spans: list[tuple[str, float]],
-                   verdict: str, passed: int, failed: int) -> dict:
-    """Append this run's phase and span timings to `path` and print the phase deltas against the previous run."""
+                   verdict: str, passed: int, failed: int, loads: dict[str, tuple[float, float]] | None = None) -> dict:
+    """Append this run's phase and span timings, and each phase's 1-minute load average at its start and end, to `path`; print the phase deltas against the previous run."""
     import datetime as _dt
     import json as _json
 
@@ -442,6 +449,8 @@ def record_timings(path: Path, phases: list[tuple[str, float]], spans: list[tupl
         "failed": failed,
         "total_min": round(sum(d for _, d in phases) / 60.0, 1),
         "phases_min": {n.split(" — ")[0]: round(d / 60.0, 2) for n, d in phases},
+        "phases_load1": {n.split(" — ")[0]: [round(x, 1) for x in v] for n, v in (loads or {}).items()},
+        "cores": os.cpu_count(),
         "top_spans_min": {n: round(d / 60.0, 2) for n, d in sorted(spans, key=lambda p: p[1], reverse=True)[:40]},
     }
     prev = None
@@ -656,6 +665,41 @@ def cell_gate() -> threading.BoundedSemaphore:
     """The shared limiter. Use as `with cell_gate(): run_cell(...)`. Read via a
     function, not a captured value, so `set_cell_parallel` is honoured after import."""
     return _cell_gate
+
+
+def server_of(url: str) -> str:
+    """`host:port` of a connection URL: two cells with the same value share one server (localhost is 127.0.0.1)."""
+    import urllib.parse
+
+    u = urllib.parse.urlsplit(url)
+    host = (u.hostname or "").lower()
+    return f"{'127.0.0.1' if host == 'localhost' else host}:{u.port}"
+
+
+def run_lanes(led: "Ledger", cells: Sequence[tuple[object, Callable[["Ledger"], None]]], *,
+              workers: int | None = None) -> None:
+    """Run `(lane, fn)` cells: one lane's cells in list order, lanes side by side; every cell's rows are buffered and flushed in list order."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    subs = [led.buffered_child() for _ in cells]
+    lanes: dict[object, list[int]] = {}
+    for i, (lane, _) in enumerate(cells):
+        lanes.setdefault(lane, []).append(i)
+
+    def _lane(idx: list[int]) -> BaseException | None:
+        for i in idx:
+            try:
+                cells[i][1](subs[i])
+            except (Exception, SystemExit) as e:  # noqa: BLE001 — re-raised below, after every row is flushed
+                return e
+        return None
+
+    with ThreadPoolExecutor(max_workers=max(1, min(workers or len(lanes), len(lanes)))) as ex:
+        raised = [e for e in ex.map(_lane, lanes.values()) if e is not None]
+    for sub in subs:
+        sub.flush_into(led)
+    if raised:
+        raise raised[0]
 
 
 def wait_until(check, *, tries: int = 45, delay: float = 2.0) -> bool:

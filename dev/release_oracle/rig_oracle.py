@@ -1391,9 +1391,7 @@ def grade_load(spec: dict) -> dict:
     rows, forms, renders, config = _prep(engine, cdc)
     kw = {"state": spec["state"]} if spec.get("state") else {}
     if target == "bigquery":
-        os.environ["BQ_ORACLE_PROJECT"] = str(load.get("project") or "")
-        os.environ["BQ_ORACLE_DATASET"] = str(load.get("dataset") or "")
-        kw.update(bigquery=True, bq_dataset=str(load.get("dataset")))
+        kw.update(bigquery=True, bq_project=str(load.get("project") or ""), bq_dataset=str(load.get("dataset") or ""))
     notes: list[str] = []
     partial: list[str] = []
     try:
