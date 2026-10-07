@@ -189,11 +189,11 @@ scenarios:
 
   - id: keyset_parallel_incremental_narrow_int_key
     what: "parallel + keyset_incremental on a 16-bit integer key delivers every row on run 1 and only the new keys on run 2"
-    postgres: { test: parallel_keyset_incremental_on_a_smallint_key_delivers_every_row_postgres }
-    mysql:    { test: parallel_keyset_incremental_on_a_smallint_key_delivers_every_row_mysql }
-    mssql:    { test: parallel_keyset_incremental_on_a_smallint_key_delivers_every_row_mssql }
+    postgres: { test: parallel_keyset_incremental_on_a_smallint_key_delivers_the_source_rows_postgres }
+    mysql:    { test: parallel_keyset_incremental_on_a_smallint_key_delivers_the_source_rows_mysql }
+    mssql:    { test: parallel_keyset_incremental_on_a_smallint_key_delivers_the_source_rows_mssql }
     mongo:    { na: "Mongo pages _id; there is no SQL boundary probe and no keyset_incremental" }
-    oracle:   { test: parallel_keyset_incremental_on_a_number5_key_delivers_every_row_oracle }
+    oracle:   { test: parallel_keyset_incremental_on_a_number5_key_delivers_the_source_rows_oracle }
 
   - id: guard_probe_value_of_unreadable_type
     what: "a planner probe (range bound, keyset boundary or ceiling) whose non-NULL value the adapter cannot read is refused naming the type, never taken for an empty table"

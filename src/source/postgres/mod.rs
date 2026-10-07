@@ -792,7 +792,11 @@ impl super::Source for PostgresSource {
         ) {
             return Ok(None);
         }
-        anyhow::bail!(unreadable_probe(row.columns()[0].type_().name(), sql))
+        crate::rivet_bail!(
+            crate::error::codes::SOURCE_PROBE_UNREADABLE,
+            "{}",
+            unreadable_probe(row.columns()[0].type_().name(), sql)
+        )
     }
 
     fn type_mappings(

@@ -495,6 +495,11 @@ pub mod codes {
         "RIVET_SOURCE_VALUE_UNREPRESENTABLE",
         "map the value to a representable one in the export's `query:`, or exclude the column",
     );
+    /// A planner probe (range bound, keyset boundary or ceiling) returned a value of a type the adapter has no reader for.
+    pub const SOURCE_PROBE_UNREADABLE: Code = refusal(
+        "RIVET_SOURCE_PROBE_UNREADABLE",
+        "chunk, page or partition the export on a column of a type the message lists, remove `parallel:` from a keyset export, or use `mode: full`",
+    );
     /// A `columns:` override declares a type the source's wire value cannot be read as.
     pub const SOURCE_OVERRIDE_WIRE_MISMATCH: Code = usage(
         "RIVET_SOURCE_OVERRIDE_WIRE_MISMATCH",
@@ -552,6 +557,7 @@ pub mod codes {
         SOURCE_CDC_CELL_UNSUPPORTED,
         SOURCE_CDC_PREREQUISITE,
         SOURCE_VALUE_UNREPRESENTABLE,
+        SOURCE_PROBE_UNREADABLE,
         SOURCE_OVERRIDE_WIRE_MISMATCH,
         STATE_SCHEMA_NEWER,
         STATE_CURSOR_OWNER_MISMATCH,

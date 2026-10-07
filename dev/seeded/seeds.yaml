@@ -269,7 +269,7 @@ seeds:
       postgres:
         patch: unreadable-probe-read-as-no-rows/postgres.patch
         cells:
-          - parallel_keyset_incremental_on_a_smallint_key_delivers_every_row_postgres
+          - parallel_keyset_incremental_on_a_smallint_key_delivers_the_source_rows_postgres
           - parallel_keyset_incremental_on_a_real_key_is_refused_by_name_postgres
           - a_probe_value_of_an_unreadable_type_is_refused_by_name_postgres
       mysql:
