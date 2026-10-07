@@ -1298,6 +1298,32 @@ jobs:
           uv run --frozen python -m dev.release_oracle.value_diff
           uv run --frozen python -m dev.release_oracle.rig_oracle
 
+  # The Airflow provider package (integrations/airflow): Python only, no Rust
+  # build, no database. It reads the contract fixtures under
+  # tests/fixtures/scheduler/, so a fixture change that the package does not
+  # follow goes red here. Not a required check.
+  airflow-provider:
+    name: Airflow provider (${{ matrix.airflow }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        airflow: ["2.10.5", "3.3.2"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: taiki-e/install-action@v2.87.18
+        with:
+          tool: uv
+      - name: Install Airflow ${{ matrix.airflow }} and the package
+        run: |
+          uv venv --python 3.12 .venv-airflow
+          uv pip install --python .venv-airflow/bin/python "apache-airflow==${{ matrix.airflow }}" pytest \
+            --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-${{ matrix.airflow }}/constraints-3.12.txt"
+          uv pip install --python .venv-airflow/bin/python --no-deps -e integrations/airflow
+      - name: Package tests
+        working-directory: integrations/airflow
+        run: ../../.venv-airflow/bin/python -m pytest -q
+
   test:
     name: Tests
     runs-on: ubuntu-latest

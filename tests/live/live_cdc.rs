@@ -9596,34 +9596,8 @@ fn pg_cdc_a_transaction_past_the_memory_cap_spills_rather_than_failing() {
     // every row arrives from memory, byte-identical output and no memory bound at
     // all). The split itself is the only externally visible measure, so both halves
     // are asserted: the ceiling held, and nothing fell between the two segments.
-    let split = log_a
-        .split("delivered ")
-        .filter_map(|s| s.split_once(" rows from memory and "))
-        .find_map(|(head, rest)| {
-            let tail = rest.split_once(" from disk")?.0;
-            Some((
-                head.trim().parse::<usize>().ok()?,
-                tail.trim().parse::<usize>().ok()?,
-            ))
-        });
-    let (from_memory, from_disk) =
-        split.unwrap_or_else(|| panic!("the run must report the split. stderr: {log_a}"));
-    assert_eq!(
-        from_memory + from_disk,
-        ROWS,
-        "the two segments must account for the WHOLE transaction — a row that \
-         belongs to neither is a row nobody would miss. stderr: {log_a}"
-    );
-    // CAP + 1: the cap is checked AFTER the row is pushed, so the head holds one
-    // row more than the cap before the spill opens. Asserting the exact ceiling
-    // rather than "most of it went to disk" is what makes this a memory bound.
-    assert_eq!(
-        from_memory,
-        CAP + 1,
-        "memory must stop at the cap — that is the whole point of spilling, and a \
-         head larger than the cap means the ceiling is not being enforced. \
-         stderr: {log_a}"
-    );
+    // The slot decodes the whole database, so the split graded is this test's own.
+    assert_spill_evidence(&log_a, CAP, OwnSpill::Transaction(ROWS));
 
     // Leg B — the same transaction under the default cap: no spill.
     let plain_rig = Rig::pg_cdc(&tbl, &slot_plain).dest_path(out_plain.clone());
@@ -9767,32 +9741,8 @@ fn mysql_cdc_a_transaction_past_the_memory_cap_spills_rather_than_failing() {
 
     // The fixture is not inert, and memory really was bounded. Rows alone cannot
     // see this: a spill that quietly keeps buffering delivers identical rows.
-    let split = log
-        .split("delivered ")
-        .filter_map(|s| s.split_once(" rows from memory and "))
-        .find_map(|(head, rest)| {
-            let tail = rest.split_once(" from disk")?.0;
-            Some((
-                head.trim().parse::<usize>().ok()?,
-                tail.trim().parse::<usize>().ok()?,
-            ))
-        });
-    let (from_memory, from_disk) =
-        split.unwrap_or_else(|| panic!("the run must report the split. stderr: {log}"));
-    assert_eq!(
-        from_memory + from_disk,
-        ROWS,
-        "the two segments must account for the WHOLE transaction — a row in \
-         neither is a row nobody would miss. stderr: {log}"
-    );
-    // CAP + 1: the cap is checked after the row is pushed, so the head holds one
-    // row more than the cap before the spill opens.
-    assert_eq!(
-        from_memory,
-        CAP + 1,
-        "memory must stop at the cap — that is the point of spilling, and a head \
-         larger than the cap means the ceiling is not enforced. stderr: {log}"
-    );
+    // The binlog is server-wide, so the split graded is this test's own.
+    assert_spill_evidence(&log, CAP, OwnSpill::Transaction(ROWS));
 
     // THE INDEPENDENT ORACLE. Not rivet's verdict, not rivet's reader.
     let census = rig.row_census();
