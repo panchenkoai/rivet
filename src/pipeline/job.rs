@@ -1275,6 +1275,10 @@ fn execute_resolved_plan(
     tail: TailPolicy<'_>,
     mut meta: MetaConn<'_>,
 ) -> (Result<()>, RunSummary) {
+    if let Some(e) = unexpanded_partition_error(plan) {
+        let summary = synthetic_failed_summary(&plan.export_name, &e);
+        return (Err(e), summary);
+    }
     let (_run_lease, recovered) = match chunked::claim_checkpoint_run(state, plan) {
         Ok(claim) => claim,
         Err(e) => {
@@ -1894,9 +1898,82 @@ pub(crate) fn run_export_job_with_chunk_source(
     )
 }
 
+/// Why `plan` cannot be executed when its destination still holds the `{partition}` token, else `None`.
+fn unexpanded_partition_error(plan: &ResolvedRunPlan) -> Option<anyhow::Error> {
+    let dest = &plan.destination;
+    [dest.path.as_deref(), dest.prefix.as_deref()]
+        .into_iter()
+        .flatten()
+        .any(|s| s.contains("{partition}"))
+        .then(|| {
+            anyhow::anyhow!(
+                "export '{}': the destination still holds the `{{partition}}` token: a \
+                 `partition_by` export is expanded into one export per partition when the config \
+                 runs, and this plan was built without that expansion — a sealed `rivet plan` \
+                 artifact cannot carry it, and a destination that names `{{partition}}` without \
+                 `partition_by:` has nothing to expand. Run the config instead: `rivet apply \
+                 <config.yaml>` or `rivet run --config <config.yaml>`; without `partition_by:`, \
+                 remove the token.",
+                plan.export_name
+            )
+        })
+}
+
 #[cfg(test)]
 mod snapshot_leg_tests {
     use super::*;
+
+    /// A plan with the `{partition}` token left in its path or prefix is refused before any state is written.
+    #[test]
+    fn a_plan_with_an_unexpanded_partition_token_is_refused_before_any_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateStore::open_in_memory().unwrap();
+        let config = dir.path().join("rivet.yaml").to_string_lossy().into_owned();
+        let expanded = crate::pipeline::commit::tests::test_plan();
+        assert!(unexpanded_partition_error(&expanded).is_none());
+        for in_prefix in [false, true] {
+            let mut plan = expanded.clone();
+            let template = format!("{}/{{partition}}", dir.path().display());
+            if in_prefix {
+                plan.destination.prefix = Some(template);
+            } else {
+                plan.destination.path = Some(template);
+            }
+            let (result, summary) = execute_resolved_plan(
+                &plan,
+                &state,
+                TailPolicy {
+                    kind: "apply",
+                    family: "orders",
+                    config_path: &config,
+                    runner_config_path: "",
+                    chunk_source: chunked::ChunkSource::Detect,
+                    apply_context: None,
+                    allow_reconcile: false,
+                    notifications: None,
+                    record_load_spec: false,
+                    plan_warnings: Vec::new(),
+                    strict: false,
+                },
+                MetaConn::open(&plan.source),
+            );
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "export 'orders': the destination still holds the `{partition}` token: a \
+                 `partition_by` export is expanded into one export per partition when the config \
+                 runs, and this plan was built without that expansion — a sealed `rivet plan` \
+                 artifact cannot carry it, and a destination that names `{partition}` without \
+                 `partition_by:` has nothing to expand. Run the config instead: `rivet apply \
+                 <config.yaml>` or `rivet run --config <config.yaml>`; without `partition_by:`, \
+                 remove the token."
+            );
+            assert_eq!(summary.status, "failed");
+            assert!(
+                !dir.path().join("{partition}").exists(),
+                "a refused plan creates nothing at the destination"
+            );
+        }
+    }
 
     /// A run whose source cannot be reached ends FAILED — the post-plan script never reports success it did not earn.
     #[test]

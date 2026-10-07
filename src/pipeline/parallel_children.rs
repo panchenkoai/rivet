@@ -56,6 +56,7 @@ fn adopt_child_event(line: &str) -> serde_json::Result<ChildEvent> {
 /// anything to its captured stderr.
 #[allow(clippy::too_many_arguments)] // forwarding parent's flag set to children
 pub(super) fn run_exports_as_child_processes(
+    _run_set_allows: super::run_set::ChildProcessesOk,
     config_path: &str,
     exports: &[&ExportConfig],
     validate: bool,
