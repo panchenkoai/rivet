@@ -23,7 +23,7 @@ fn identity_matches(owner: &str, expected: &str, legacy: bool) -> bool {
 }
 
 /// Whether two recorded streams provably name different objects: an empty one names none, and a bare name may be the qualified one.
-fn streams_differ(stored: &str, now: &str) -> bool {
+pub(super) fn streams_differ(stored: &str, now: &str) -> bool {
     let qualifies = |long: &str, short: &str| {
         long.strip_suffix(short)
             .is_some_and(|q| q.is_empty() || q.ends_with('.'))
@@ -87,6 +87,20 @@ impl ProgressKey {
             stream: String::new(),
             column: None,
             mode: CHUNKED,
+            continues_high_water: false,
+        }
+    }
+
+    /// The key of a CDC stream: its compared part is the set of tables it captures.
+    pub(crate) fn cdc(export_name: &str, source: &str, tables: &[String]) -> Self {
+        let mut tables = tables.to_vec();
+        tables.sort();
+        Self {
+            export_name: export_name.into(),
+            source: source.into(),
+            stream: serde_json::Value::from(tables).to_string(),
+            column: None,
+            mode: "cdc",
             continues_high_water: false,
         }
     }
@@ -555,7 +569,8 @@ impl StateStore {
     pub fn list_all(&self) -> Result<Vec<CursorState>> {
         self.query(
             "SELECT export_name, last_cursor_value, last_run_at, cursor_column FROM export_state \
-             ORDER BY export_name",
+             WHERE last_cursor_value IS NOT NULL OR resume_run_id IS NOT NULL \
+             OR destination IS NULL ORDER BY export_name",
             &[],
             |r| CursorState {
                 export_name: r.text(0),
@@ -1236,6 +1251,23 @@ mod tests {
             Some("run_2"),
             "resume_run_id must survive"
         );
+    }
+
+    /// A CDC stream's recorded table set is not a cursor: `state show` lists what it listed before.
+    #[test]
+    fn list_all_leaves_out_a_cdc_capture_record() {
+        let s = store();
+        s.update_with_column(&key("orders", "pg/a", "id", "orders"), "7")
+            .unwrap();
+        let cdc = ProgressKey::cdc("stream", "pg/a", &["t".to_string()]);
+        s.record_captured_tables(&cdc, "b/out").unwrap();
+        let listed: Vec<String> = s
+            .list_all()
+            .unwrap()
+            .into_iter()
+            .map(|c| c.export_name)
+            .collect();
+        assert_eq!(listed, ["orders"]);
     }
 
     #[test]
