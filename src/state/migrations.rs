@@ -545,6 +545,8 @@ const MIGRATIONS: &[(i64, &str)] = &[
         CREATE INDEX IF NOT EXISTS idx_file_log_run ON file_log(run_id, file_name);
         CREATE INDEX IF NOT EXISTS idx_export_metrics_export ON export_metrics(export_name, id DESC);",
     ),
+    // v33: the stream (source table / collection) a stored cursor or resume anchor belongs to; NULL = written before v33.
+    (33, "ALTER TABLE export_state ADD COLUMN stream TEXT;"),
 ];
 
 /// PostgreSQL-compatible DDL.  Column types differ from SQLite (BIGSERIAL,
@@ -1012,6 +1014,11 @@ const PG_MIGRATIONS: &[(i64, &str)] = &[
         END $$;
         CREATE INDEX IF NOT EXISTS idx_file_log_run ON file_log(run_id, file_name);
         CREATE INDEX IF NOT EXISTS idx_export_metrics_export ON export_metrics(export_name, id DESC);",
+    ),
+    // v33: see the SQLite ladder.
+    (
+        33,
+        "ALTER TABLE export_state ADD COLUMN IF NOT EXISTS stream TEXT;",
     ),
 ];
 

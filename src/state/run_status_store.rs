@@ -139,6 +139,16 @@ impl StateStore {
             .next())
     }
 
+    /// The newest `running` row of `export_name`: the run a held run lease belongs to.
+    pub fn newest_running_run(&self, export_name: &str) -> Result<Option<String>> {
+        self.query_opt(
+            "SELECT run_id FROM run_status WHERE export_name = ?1 AND status = 'running' \
+             ORDER BY started_at DESC LIMIT 1",
+            &[export_name.into()],
+            |r| r.text(0),
+        )
+    }
+
     /// The run-status rows, newest first — `rivet state runs`. `running_only`
     /// narrows to the rows that can freeze a prefix (gc/cleanup read them).
     pub fn recent_run_status(&self, last: usize, running_only: bool) -> Result<Vec<RunStatusRow>> {
@@ -316,6 +326,27 @@ fn live_on_prefix(alias: &str, param: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The run a refusal names is the export's newest row still `running`: not a finished one, not another export's.
+    #[test]
+    fn the_newest_running_run_of_an_export_is_its_own_latest_unfinished_row() {
+        let s = StateStore::open_in_memory().unwrap();
+        assert_eq!(s.newest_running_run("orders").unwrap(), None);
+        for (run, export, at) in [
+            ("orders_1", "orders", "2026-01-01T00:00:00Z"),
+            ("orders_2", "orders", "2026-01-02T00:00:00Z"),
+            ("orders_3", "orders", "2026-01-03T00:00:00Z"),
+            ("users_9", "users", "2026-01-09T00:00:00Z"),
+        ] {
+            s.begin_run(run, export, "file:///out", at).unwrap();
+        }
+        s.finish_run("orders_3", "success", "2026-01-03T00:01:00Z")
+            .unwrap();
+        assert_eq!(
+            s.newest_running_run("orders").unwrap().as_deref(),
+            Some("orders_2")
+        );
+    }
 
     /// The three queries that decide "is this prefix live?" compose ONE
     /// containment fragment and ONE supersession fragment — a change to either

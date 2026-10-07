@@ -297,6 +297,45 @@ pub(crate) fn live_chunk_run_refusal(export: &str, run_id: Option<&str>) -> Stri
     )
 }
 
+/// The key of an export's run lease: held by a checkpointed run, taken by every command that rewrites the export's stored progress.
+fn run_lease_key(export: &str) -> String {
+    format!("chunk-run:{export}")
+}
+
+/// `export`'s run lease, or `None` while a live process holds it.
+pub(crate) fn try_run_lease<'s>(
+    state: &'s StateStore,
+    export: &str,
+) -> Result<Option<crate::state::LoadLease<'s>>> {
+    state.try_load_lease(&run_lease_key(export))
+}
+
+/// How a refusal names the live run of `export`: by its run-status id, whose last field is the pid.
+pub(crate) fn live_run_label(state: &StateStore, export: &str) -> Result<String> {
+    Ok(match state.newest_running_run(export)? {
+        Some(run_id) => format!("run '{run_id}'"),
+        None => "a run".to_string(),
+    })
+}
+
+/// Take `export`'s run lease to rewrite its stored progress (`what`); refuse while a live run holds it.
+pub(crate) fn claim_export_progress<'s>(
+    state: &'s StateStore,
+    export: &str,
+    what: &str,
+) -> Result<crate::state::LoadLease<'s>> {
+    if let Some(lease) = try_run_lease(state, export)? {
+        return Ok(lease);
+    }
+    crate::rivet_bail!(
+        crate::error::codes::STATE_RUN_IN_PROGRESS,
+        "export '{export}': cannot {what}: {} is in progress in a live rivet process, which \
+         holds the export's run lease. Wait for it to finish, or stop that process (its pid \
+         ends the run id), then repeat this command.",
+        live_run_label(state, export)?
+    )
+}
+
 /// Hold the export's run lease for the whole checkpointed run, refuse while a live process
 /// holds it, and recover a chunk run whose process died (OS-released lease, no clock).
 pub(crate) fn claim_checkpoint_run<'s>(
@@ -307,7 +346,7 @@ pub(crate) fn claim_checkpoint_run<'s>(
         return Ok((None, None));
     }
     let export = &plan.export_name;
-    let Some(lease) = state.try_load_lease(&format!("chunk-run:{export}"))? else {
+    let Some(lease) = try_run_lease(state, export)? else {
         let rid = match state.find_in_progress_chunk_run(export)? {
             Some((rid, _)) => Some(rid),
             None => state.get_resume_run_id(export, &plan.source.state_key())?,
@@ -881,6 +920,61 @@ mod tests {
                 .find_in_progress_chunk_run("orders")
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    /// A command that rewrites an export's progress is refused while a checkpointed run of that
+    /// export holds its lease (naming the run and the way out), another export is unaffected,
+    /// and the same command is admitted once the run lets go.
+    #[test]
+    fn a_progress_rewrite_is_refused_while_a_run_holds_the_exports_lease() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("state.db");
+        let (run, cmd) = (
+            StateStore::open_at_path(&db).unwrap(),
+            StateStore::open_at_path(&db).unwrap(),
+        );
+        let plan = make_plan("orders");
+        let (lease, _) = claim_checkpoint_run(&run, &plan).unwrap();
+        assert!(lease.is_some(), "a checkpointed run takes the run lease");
+
+        let unnamed = claim_export_progress(&cmd, "orders", "reset its state")
+            .err()
+            .expect("refused while the run is alive");
+        assert!(
+            unnamed.to_string().contains(": a run is in progress"),
+            "{unnamed:#}"
+        );
+        run.begin_run(
+            "orders_20260101T000000.000_4242",
+            "orders",
+            "file:///out",
+            "2026-01-01T00:00:00Z",
+        )
+        .unwrap();
+        let err = claim_export_progress(&cmd, "orders", "reset its state")
+            .err()
+            .expect("refused while the run is alive");
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some("RIVET_STATE_RUN_IN_PROGRESS")
+        );
+        assert_eq!(
+            err.to_string(),
+            "export 'orders': cannot reset its state: run 'orders_20260101T000000.000_4242' is \
+             in progress in a live rivet process, which holds the export's run lease. Wait for \
+             it to finish, or stop that process (its pid ends the run id), then repeat this \
+             command."
+        );
+        assert!(
+            claim_export_progress(&cmd, "invoices", "reset its state").is_ok(),
+            "the lease is per export"
+        );
+
+        drop(lease);
+        assert!(
+            claim_export_progress(&cmd, "orders", "reset its state").is_ok(),
+            "admitted once the run has let go"
         );
     }
 

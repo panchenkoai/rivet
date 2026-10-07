@@ -464,6 +464,21 @@ pub mod codes {
         "RIVET_STATE_CURSOR_OWNER_MISMATCH",
         "`rivet state reset -c <config> --export <name>` to start the new cursor with a full pass, or restore the previous cursor column",
     );
+    /// Stored progress (cursor, keyset high-water, resume anchor) belongs to another table or collection.
+    pub const STATE_CURSOR_STREAM_MISMATCH: Code = refusal(
+        "RIVET_STATE_CURSOR_STREAM_MISMATCH",
+        "give each export that shares this state database its own name; if this export was repointed, `rivet state reset -c <config> --export <name>` starts the new table with a full pass (it discards the progress of every export of that name in the state database)",
+    );
+    /// A command that rewrites an export's stored progress met a live run of that export.
+    pub const STATE_RUN_IN_PROGRESS: Code = refusal(
+        "RIVET_STATE_RUN_IN_PROGRESS",
+        "wait for the run to finish, or stop its process, then repeat the command",
+    );
+    /// A checkpointed run found its `chunk_run` row gone when it came to complete it.
+    pub const STATE_CHUNK_CHECKPOINT_GONE: Code = refusal(
+        "RIVET_STATE_CHUNK_CHECKPOINT_GONE",
+        "run the export again: it starts a new chunk run (the parts the lost run wrote stay in the destination, in no manifest)",
+    );
     pub const SOURCE_CURSOR_FINER_THAN_MICROSECOND: Code = refusal(
         "RIVET_SOURCE_CURSOR_FINER_THAN_MICROSECOND",
         "cursor on a column at microsecond precision or coarser, or cast the cursor to TIMESTAMP(6) in a curated query",
@@ -502,6 +517,11 @@ pub mod codes {
     pub const SOURCE_VALUE_UNREPRESENTABLE: Code = refusal(
         "RIVET_SOURCE_VALUE_UNREPRESENTABLE",
         "map the value to a representable one in the export's `query:`, or exclude the column",
+    );
+    /// A planner probe (range bound, keyset boundary or ceiling) returned a value of a type the adapter has no reader for.
+    pub const SOURCE_PROBE_UNREADABLE: Code = refusal(
+        "RIVET_SOURCE_PROBE_UNREADABLE",
+        "chunk, page or partition the export on a column of a type the message lists, remove `parallel:` from a keyset export, or use `mode: full`",
     );
     /// A `columns:` override declares a type the source's wire value cannot be read as.
     pub const SOURCE_OVERRIDE_WIRE_MISMATCH: Code = usage(
@@ -564,10 +584,14 @@ pub mod codes {
         SOURCE_CDC_CELL_UNSUPPORTED,
         SOURCE_CDC_PREREQUISITE,
         SOURCE_VALUE_UNREPRESENTABLE,
+        SOURCE_PROBE_UNREADABLE,
         SOURCE_OVERRIDE_WIRE_MISMATCH,
         STATE_SCHEMA_NEWER,
         STATE_CURSOR_OWNER_MISMATCH,
+        STATE_CURSOR_STREAM_MISMATCH,
         STATE_KEYSET_SEQUENTIAL_ANCHOR_UNFINISHED,
+        STATE_RUN_IN_PROGRESS,
+        STATE_CHUNK_CHECKPOINT_GONE,
         LOAD_VALUE_OUT_OF_TARGET_RANGE,
         LOAD_COUNT_MISMATCH,
         LOAD_ADOPTION_COLUMN_MISMATCH,

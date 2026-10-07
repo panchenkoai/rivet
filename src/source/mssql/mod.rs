@@ -1453,6 +1453,30 @@ mod tests {
         assert_eq!(parsed.database, "rivet");
     }
 
+    /// The JDBC-property and ADO forms are refused as before, and the refusal — which quotes the string — carries no password once redacted.
+    #[test]
+    fn a_keyword_value_string_is_refused_and_its_error_redacts_the_password() {
+        for (conn, said) in [
+            (
+                "sqlserver://127.0.0.1:1433;databaseName=app;user=sa;password=S3cr3tPw",
+                "mssql url missing user@host: sqlserver://127.0.0.1:1433;databaseName=app;user=sa;password=***",
+            ),
+            (
+                "Server=127.0.0.1,1433;Database=d;User Id=u;Password=S3cr3tPw;",
+                "mssql url must start with sqlserver:// — got Server=127.0.0.1,1433;Database=d;User Id=u;Password=***;",
+            ),
+            (
+                "Server=127.0.0.1,1433;Database=d;UID=u;PWD=S3cr3tPw;",
+                "mssql url must start with sqlserver:// — got Server=127.0.0.1,1433;Database=d;UID=u;PWD=***;",
+            ),
+        ] {
+            let Err(err) = parse_mssql_url(conn) else {
+                panic!("not a sqlserver:// URL, must be refused: {conn}")
+            };
+            assert_eq!(crate::redact::redact_error(&err), said, "{conn}");
+        }
+    }
+
     fn parse(q: &str) -> Option<(String, String)> {
         parse_mssql_simple_from_table(q)
     }

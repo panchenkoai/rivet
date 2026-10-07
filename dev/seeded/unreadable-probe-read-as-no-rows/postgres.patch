@@ -1,0 +1,27 @@
+diff --git a/src/source/postgres/mod.rs b/src/source/postgres/mod.rs
+--- a/src/source/postgres/mod.rs
++++ b/src/source/postgres/mod.rs
+@@ -758,9 +758,6 @@
+         if let Ok(Some(v)) = row.try_get::<_, Option<f64>>(0) {
+             return Ok(Some(v.to_string()));
+         }
+-        if let Ok(Some(v)) = row.try_get::<_, Option<i16>>(0) {
+-            return Ok(Some(v.to_string()));
+-        }
+         if let Ok(Some(v)) = row.try_get::<_, Option<u32>>(0) {
+             return Ok(Some(v.to_string()));
+         }
+@@ -792,11 +789,8 @@
+         ) {
+             return Ok(None);
+         }
+-        crate::rivet_bail!(
+-            crate::error::codes::SOURCE_PROBE_UNREADABLE,
+-            "{}",
+-            unreadable_probe(row.columns()[0].type_().name(), sql)
+-        )
++        let _ = unreadable_probe(row.columns()[0].type_().name(), sql);
++        Ok(None)
+     }
+ 
+     fn type_mappings(

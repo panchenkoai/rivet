@@ -1,0 +1,13 @@
+diff --git a/src/state/cursor.rs b/src/state/cursor.rs
+index 0bd0db36..c32611f0 100644
+--- a/src/state/cursor.rs
++++ b/src/state/cursor.rs
+@@ -28,7 +28,7 @@ fn streams_differ(stored: &str, now: &str) -> bool {
+         long.strip_suffix(short)
+             .is_some_and(|q| q.is_empty() || q.ends_with('.'))
+     };
+-    !stored.is_empty() && !now.is_empty() && !qualifies(stored, now) && !qualifies(now, stored)
++    !stored.is_empty() && !now.is_empty() && !qualifies(stored, now) && !qualifies(now, stored) && stored.is_empty()
+ }
+ 
+ /// The progress a run would continue from, worded for a message: an interrupted run's anchor, else the cursor a clean run seeks from.

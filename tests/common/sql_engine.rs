@@ -34,6 +34,15 @@ impl SqlEngine {
         });
     }
 
+    /// Whether the engine's catalog holds unquoted names in upper case (Oracle).
+    pub fn folds_upper(self) -> bool {
+        #[cfg(feature = "oracle")]
+        if let SqlEngine::Oracle = self {
+            return true;
+        }
+        false
+    }
+
     /// The batch stand's source URL.
     pub fn url(self) -> &'static str {
         match self {

@@ -528,6 +528,9 @@ def _attach(spec: dict) -> dict:
 
         # The config's own `options` (a search_path) is kept; the scanner's text settings are appended to it.
         styles = "-c DateStyle=ISO,MDY -c IntervalStyle=postgres -c TimeZone=UTC -c bytea_output=hex"
+        if "://" not in url:
+            # A libpq keyword/value string takes the settings as one more pair.
+            return source_attach(engine, f"{url} options='{styles}'")[0]
         parts = urlsplit(url)
         q = dict(parse_qsl(parts.query))
         q["options"] = f"{q['options']} {styles}" if q.get("options") else styles
@@ -1168,10 +1171,80 @@ def write_keys(keys: list[tuple[str, ...]], cols: list[str], path: str) -> None:
     os.replace(tmp, path)
 
 
+def _value_findings(
+    ora, engine: str, fmt: str, native: dict, rows: dict, src: str, dst: str | None, key: list[str], partial: list[str]
+) -> tuple[dict, dict, frozenset]:
+    """The value leg every graded delivery shares: (`compare`'s findings of `src` against `dst`, the type-ledger row per column, the columns a known defect collapses to BOOLEAN); what it could not cover is appended to `partial`."""
+    from .value_diff import mongo_document_columns
+
+    if engine == "mongo":
+        partial.append("Mongo: only `_id` is graded (the scanner's inferred schema shares nothing else with the document blob)")
+        if dst:
+            dst = mongo_document_columns(ora, src, dst)
+    bits = frozenset(c for c, n in native.items() if n.startswith("BIT")) if engine == "mysql" else frozenset()
+    numbers = frozenset(
+        c for c, n in native.items() if (n.startswith(ORACLE_NUMERIC) if engine == "oracle" else catalog_duck(n))
+    )
+    row_of = {c: rows[n] for c, n in native.items() if n in rows}
+    defects = {c: [x.strip("'") for x in r.get("defect_samples") or []] for c, r in row_of.items() if r.get("known_defect")}
+    # Oracle: its source leg is the client-side `source` render; a DuckDB render (strftime: astronomical years) would grade a different calendar.
+    # A CSV holds text: no DuckDB render applies to it; the source is rendered as the CSV writer documents its text.
+    duck = {} if engine == "oracle" or fmt in ("csv", "ndjson") else {c: _render(r)["duck"] for c, r in row_of.items() if _render(r).get("duck")}
+    canons = {c: _render(r)["canon"] for c, r in row_of.items() if _render(r).get("canon")}
+    verbatim = frozenset(
+        c for c, n in native.items()
+        if (engine == "postgres" and n == "JSON") or (TEXT_NATIVE.match(n) and c not in duck and c not in canons and c not in numbers)
+    )
+    if fmt in ("csv", "ndjson"):
+        src = f"(SELECT {csv_text(_columns(ora, 'source_rows'))} FROM {src})"
+    f = compare(ora, src, dst, bits, numbers, defects, duck, canons, engine != "oracle", verbatim, key)
+    delivered = {d: t for _, _, d, t in f.get("pairs", [])}
+    collapse = frozenset(c for c in defects if defects[c] and delivered.get(c) == "BOOLEAN")
+    return f, row_of, collapse
+
+
+def stdout_ledger(ora, spec: dict, printed: int) -> list[str]:
+    """A stdout run writes no manifest and no part: its whole ledger is the one `export_metrics` success row it recorded since it began, which must count the rows it printed."""
+    if not spec.get("state"):
+        return []
+    got = [r[0] for r in ora.rows(
+        f"SELECT total_rows FROM {_state_table(ora, spec, 'export_metrics')} WHERE export_name = {_lit(spec['export'])} "
+        f"AND status = 'success' AND CAST(run_at AS TIMESTAMPTZ) >= CAST({_lit(spec['since'])} AS TIMESTAMPTZ)"
+    )]
+    return [] if got == [printed] else [
+        f"COUNTER: export_metrics records total_rows {got} in the success row(s) of this run, its stdout holds {printed} row(s)"]
+
+
+def grade_stdout(spec: dict) -> dict:
+    """Grade one `destination: stdout` run: the bytes it printed (kept by the harness at `spec["stdout"]`) against the whole source, and its `export_metrics` row against the rows they hold."""
+    from .duck import Oracle
+
+    partial: list[str] = []
+    engine, fmt, printed = spec["engine"], spec.get("format") or "parquet", spec["stdout"]
+    rows, forms, renders, config = _prep(engine, False)
+    kw = {"state": spec["state"]} if spec.get("state") else {}
+    with Oracle(config=config, **kw, **_attach(spec)) as ora:
+        ora.db.sql("SET TimeZone = 'UTC'")
+        src, key, native = _source(ora, spec, renders)
+        ora.db.sql(f"CREATE OR REPLACE TEMP TABLE source_rows AS SELECT * FROM {src}")
+        key = spec.get("key") or key
+        # No byte at all is a run that printed nothing: graded as an empty delivery, never as an unreadable file.
+        dst = _parts(ora, [printed], fmt) if os.path.getsize(printed) else None
+        n = ora.scalar(f"SELECT count(*) FROM {dst}") if dst else 0
+        f, row_of, collapse = _value_findings(ora, engine, fmt, native, rows, "source_rows", dst, key, partial)
+        extra = _text_form_mismatches([printed], row_of, forms) if dst and fmt == "parquet" else []
+        extra += stdout_ledger(ora, spec, n)
+    failures = grade_findings(f, rows, forms, native, engine != "mongo" and fmt == "parquet", spec.get("overrides") or {}, collapse)
+    facts = {k: v for k, v in f.items() if k not in ("pairs", "dst_cols", "src_stats", "dst_stats")}
+    out = {"failures": failures + extra, "notes": ["stdout: no manifest or part exists to compare"], "facts": facts, "key": key}
+    if partial:
+        out["partial"] = "; ".join(partial)
+    return out
+
+
 def grade(spec: dict) -> dict:
     """Grade one run: `{failures, notes, facts}` (plus `partial`: what a PASS did not cover)."""
     from .duck import Oracle
-    from .value_diff import mongo_document_columns
 
     notes: list[str] = []
     extra: list[str] = []
@@ -1289,27 +1362,7 @@ def grade(spec: dict) -> dict:
             partial.append("a `--resume` run completes a plan made before it: the delivered rows are graded, completeness against that plan is not"
                            if spec.get("resume") else
                            "a sealed plan replays the chunk ranges it was planned with: the delivered rows are graded, completeness against the live source is not")
-        if engine == "mongo":
-            partial.append("Mongo: only `_id` is graded (the scanner's inferred schema shares nothing else with the document blob)")
-            if dst:
-                dst = mongo_document_columns(ora, src, dst)
-        bits = frozenset(c for c, n in native.items() if n.startswith("BIT")) if engine == "mysql" else frozenset()
-        numbers = frozenset(
-            c for c, n in native.items() if (n.startswith(ORACLE_NUMERIC) if engine == "oracle" else catalog_duck(n))
-        )
-        row_of = {c: rows[n] for c, n in native.items() if n in rows}
-        defects = {c: [x.strip("'") for x in r.get("defect_samples") or []] for c, r in row_of.items() if r.get("known_defect")}
-        # Oracle: its source leg is the client-side `source` render; a DuckDB render (strftime: astronomical years) would grade a different calendar.
-        # A CSV holds text: no DuckDB render applies to it; the source is rendered as the CSV writer documents its text.
-        duck = {} if engine == "oracle" or fmt in ("csv", "ndjson") else {c: _render(r)["duck"] for c, r in row_of.items() if _render(r).get("duck")}
-        canons = {c: _render(r)["canon"] for c, r in row_of.items() if _render(r).get("canon")}
-        verbatim = frozenset(
-            c for c, n in native.items()
-            if (engine == "postgres" and n == "JSON") or (TEXT_NATIVE.match(n) and c not in duck and c not in canons and c not in numbers)
-        )
-        if fmt in ("csv", "ndjson"):
-            src = f"(SELECT {csv_text(_columns(ora, 'source_rows'))} FROM {src})"
-        f = compare(ora, src, dst, bits, numbers, defects, duck, canons, engine != "oracle", verbatim, key)
+        f, row_of, collapse = _value_findings(ora, engine, fmt, native, rows, src, dst, key, partial)
         if spec.get("nothing_new") and not cumulative:
             if spec.get("resume"):
                 raise Unreachable("a `--resume` run wrote no new manifest: it skipped an export a prior run completed")
@@ -1321,10 +1374,6 @@ def grade(spec: dict) -> dict:
             extra.append(f"DELTA: the first run in this destination resumed from cursor_low {first['cursor_low']!r}, a cursor no graded run of this stream ended at")
         if cumulative and not cdc:
             save_delta_window(spec, record, graded)
-        delivered = {d: t for _, _, d, t in f.get("pairs", [])}
-        collapse = frozenset(
-            c for c in defects if defects[c] and delivered.get(c) == "BOOLEAN"
-        )
         f["text_form"] = _text_form_mismatches(new_parts, row_of, forms) if fmt == "parquet" else []
         if spec.get("partition_by") and new_parts:
             extra += misfiled(ora, new_parts, spec["partition_by"])
@@ -1741,6 +1790,7 @@ def _self_test() -> None:
     _compare_self_test()
     _layout_self_test()
     _ndjson_self_test()
+    _stdout_self_test()
     print("rig_oracle self-test ok")
 
 
@@ -1759,6 +1809,22 @@ class _Mem:
     def scalar(self, sql: str) -> object:
         """The first cell of `sql`."""
         return self.rows(sql)[0][0]
+
+
+def _stdout_self_test() -> None:
+    """A stdout run's ledger is the success row it recorded since it began: an older row, a failed one, a wrong count or a second row is a finding."""
+    ora = _Mem()
+    ora.db.sql("ATTACH ':memory:' AS st")
+    ora.db.sql("CREATE TABLE st.export_metrics (export_name VARCHAR, run_at VARCHAR, total_rows BIGINT, status VARCHAR)")
+    ora.db.sql("INSERT INTO st.export_metrics VALUES ('e', '2026-10-07T01:00:00.5+00:00', 50, 'success'), "
+               "('e', '2026-10-07T02:00:00.123456+00:00', 7, 'failed'), ('other', '2026-10-07T02:00:00+00:00', 50, 'success')")
+    spec = {"state": "state.db", "export": "e", "since": "2026-10-07T01:00:00Z"}
+    assert stdout_ledger(ora, spec, 50) == [], stdout_ledger(ora, spec, 50)
+    assert stdout_ledger(ora, {**spec, "state": None}, 3) == [], "no state DB is the caller's PARTIAL, not a finding here"
+    assert "total_rows [50]" in stdout_ledger(ora, spec, 49)[0] and "holds 49 row(s)" in stdout_ledger(ora, spec, 49)[0]
+    assert "total_rows []" in stdout_ledger(ora, {**spec, "since": "2026-10-07T01:00:01Z"}, 50)[0], "a row from before this run is not its ledger"
+    ora.db.sql("INSERT INTO st.export_metrics VALUES ('e', '2026-10-07T03:00:00+00:00', 50, 'success')")
+    assert "total_rows [50, 50]" in stdout_ledger(ora, spec, 50)[0], "one run records one success row"
 
 
 def _ndjson_self_test() -> None:
@@ -1942,9 +2008,9 @@ def _ns_self_test() -> None:
 
 
 if __name__ == "__main__":
-    if sys.argv[1:] in (["grade"], ["grade-load"], ["image"]):
+    if sys.argv[1:] in (["grade"], ["grade-load"], ["grade-stdout"], ["image"]):
         spec = json.load(sys.stdin)
-        run = {"grade": grade, "grade-load": grade_load, "image": take_image}[sys.argv[1]]
+        run = {"grade": grade, "grade-load": grade_load, "grade-stdout": grade_stdout, "image": take_image}[sys.argv[1]]
         for attempt in range(3):
             try:
                 verdict = run(spec)
