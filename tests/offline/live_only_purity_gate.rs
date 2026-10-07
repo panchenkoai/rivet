@@ -105,7 +105,7 @@ const BASELINE: &[(&str, usize, usize, usize, usize)] = &[
     ("src/load/bigquery/mod.rs::compact", 0, 0, 0, 1),
     ("src/load/bigquery/mod.rs::rebuild_changelog", 0, 0, 0, 1),
     ("src/source/mysql/cdc.rs::fill", 0, 1, 4, 0),
-    ("src/source/postgres/cdc.rs::fill", 1, 2, 4, 1),
+    ("src/source/postgres/cdc.rs::fill", 1, 1, 3, 1),
     // Excluded 2026-10-01; its transaction-group close moved out to `tx_buffer::close_runs`.
     ("src/source/mssql/cdc.rs::fill", 0, 0, 1, 0),
     // ── the export RUNNERS ───────────────────────────────────────────────
@@ -113,7 +113,7 @@ const BASELINE: &[(&str, usize, usize, usize, usize)] = &[
     // is dense with pagination/plan arithmetic. These are the ceilings most
     // worth spending: the runner-bypass class in the process rules is precisely a
     // per-runner decision that no offline test grades.
-    ("src/pipeline/keyset.rs::run_keyset", 3, 0, 1, 1),
+    ("src/pipeline/keyset.rs::run_keyset", 3, 0, 1, 0),
     ("src/pipeline/keyset.rs::run_keyset_parallel", 3, 0, 1, 2),
     // Excluded 2026-09-27 at their existing decisions (catalog-row parsing, the
     // statement-timeout arm), not grown by the exclusion; shrink as they are extracted.

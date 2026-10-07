@@ -159,9 +159,7 @@ fn execute_repair(
     // Without it we can re-export the data but cannot point the recorded state
     // at the fresh count, so `reconcile → repair → reconcile` could never
     // converge (audit finding #7).
-    let run_id = state
-        .get_latest_chunk_run(&plan.export_name)?
-        .map(|(rid, _, _, _)| rid);
+    let run_id = state.claim(plan.progress_key())?.latest_chunk_run()?;
 
     // One summary across the whole repair (matches the original single
     // `RunSummary::new`): `record_part` appends every freshly-written part to

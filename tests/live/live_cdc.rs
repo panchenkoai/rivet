@@ -9499,6 +9499,107 @@ fn a_bounded_run_reaches_its_bound_across_an_empty_transaction_span() {
     );
 }
 
+/// After a mid-window roll, a failed final part must leave the slot at the last WRITTEN commit, and the next run must deliver the rest.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc postgres-cdc"]
+fn pg_cdc_a_failed_final_part_after_a_mid_window_roll_leaves_the_slot_behind_it() {
+    use std::collections::BTreeSet;
+    let cdc_db = CdcDb::new("cdc_ack_write");
+    let slot = unique_name("rivet_ackw_slot").to_lowercase();
+    let _slot = Slot::new(slot.clone());
+    let ta = unique_name("rivet_cdc_ackw_a").to_lowercase();
+    let tb = unique_name("rivet_cdc_ackw_b").to_lowercase();
+    let mut c = cdc_db.connect();
+    for t in [&ta, &tb] {
+        c.batch_execute(&format!(
+            "CREATE TABLE {t} (id BIGINT PRIMARY KEY, v INT, pad TEXT)"
+        ))
+        .unwrap();
+    }
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    // T1 alone crosses the 1 MiB byte cap, so its part rolls and acks while T2 and
+    // T3 (same peek window: `rollover: 1000`) are already read but not yet written.
+    c.execute(
+        &format!(
+            "INSERT INTO {ta} VALUES (1, 10, repeat('x', 700000)), (2, 20, repeat('y', 700000))"
+        ),
+        &[],
+    )
+    .unwrap();
+    let after_t1: String = c
+        .query_one("SELECT pg_current_wal_lsn()::text", &[])
+        .unwrap()
+        .get(0);
+    c.execute(&format!("INSERT INTO {tb} VALUES (21, 210, 't2')"), &[])
+        .unwrap();
+    c.execute(&format!("INSERT INTO {tb} VALUES (31, 310, 't3')"), &[])
+        .unwrap();
+
+    let d = tempfile::tempdir().unwrap();
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    // The ONE cause of run 1's failure: table B's sub-prefix is a regular file, so
+    // the final part (T2, T3) cannot be written. Table A's part is unaffected.
+    std::fs::write(out.join(&tb), b"in the way").unwrap();
+    let rig = Rig::pg_cdc(&ta, &slot)
+        .source_url(cdc_db.url())
+        .tables(&[&ta, &tb])
+        .export_named("ackw_cdc")
+        .cdc_line("rollover: 1000")
+        .cdc_line("rollover_memory_mb: 1")
+        .dest_path(out.clone());
+    let said = rig.run_expect_fail();
+
+    let ids = |dir: &std::path::Path| -> BTreeSet<i64> {
+        read_cdc_changes(dir).iter().map(|c| c.id).collect()
+    };
+    assert_eq!(
+        ids(&out.join(&ta)),
+        BTreeSet::from([1, 2]),
+        "fixture: run 1 must have rolled and declared T1's part BEFORE it failed — \
+         otherwise there was no mid-window ack and this grades an ordinary failed run:\n{said}"
+    );
+    let held: bool = c
+        .query_one(
+            &format!(
+                "SELECT confirmed_flush_lsn <= '{after_t1}'::pg_lsn \
+                 FROM pg_replication_slots WHERE slot_name = $1"
+            ),
+            &[&slot],
+        )
+        .unwrap()
+        .get(0);
+    let confirmed: String = c
+        .query_one(
+            "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = $1",
+            &[&slot],
+        )
+        .unwrap()
+        .get(0);
+
+    assert!(
+        held,
+        "the failed run acknowledged the slot past what it wrote: confirmed_flush_lsn \
+         {confirmed} is beyond {after_t1}, the WAL position right after T1 — the only \
+         transaction whose part was written"
+    );
+
+    // The remedy an operator would apply: make the destination writable, re-run.
+    std::fs::remove_file(out.join(&tb)).unwrap();
+    rig.run_ok();
+    assert_eq!(
+        ids(&out.join(&tb)),
+        BTreeSet::from([21, 31]),
+        "T2 and T3 were committed before run 1 opened and never written; the re-run \
+         must deliver them. confirmed_flush_lsn after the failed run was {confirmed} \
+         (T1 ended at or before {after_t1}):\n{said}"
+    );
+}
+
 // ─── PostgreSQL: a transaction larger than the in-memory cap ─────────────────
 
 /// A transaction past the memory cap SPILLS to disk and delivers exactly the rows a
@@ -9596,34 +9697,8 @@ fn pg_cdc_a_transaction_past_the_memory_cap_spills_rather_than_failing() {
     // every row arrives from memory, byte-identical output and no memory bound at
     // all). The split itself is the only externally visible measure, so both halves
     // are asserted: the ceiling held, and nothing fell between the two segments.
-    let split = log_a
-        .split("delivered ")
-        .filter_map(|s| s.split_once(" rows from memory and "))
-        .find_map(|(head, rest)| {
-            let tail = rest.split_once(" from disk")?.0;
-            Some((
-                head.trim().parse::<usize>().ok()?,
-                tail.trim().parse::<usize>().ok()?,
-            ))
-        });
-    let (from_memory, from_disk) =
-        split.unwrap_or_else(|| panic!("the run must report the split. stderr: {log_a}"));
-    assert_eq!(
-        from_memory + from_disk,
-        ROWS,
-        "the two segments must account for the WHOLE transaction — a row that \
-         belongs to neither is a row nobody would miss. stderr: {log_a}"
-    );
-    // CAP + 1: the cap is checked AFTER the row is pushed, so the head holds one
-    // row more than the cap before the spill opens. Asserting the exact ceiling
-    // rather than "most of it went to disk" is what makes this a memory bound.
-    assert_eq!(
-        from_memory,
-        CAP + 1,
-        "memory must stop at the cap — that is the whole point of spilling, and a \
-         head larger than the cap means the ceiling is not being enforced. \
-         stderr: {log_a}"
-    );
+    // The slot decodes the whole database, so the split graded is this test's own.
+    assert_spill_evidence(&log_a, CAP, OwnSpill::Transaction(ROWS));
 
     // Leg B — the same transaction under the default cap: no spill.
     let plain_rig = Rig::pg_cdc(&tbl, &slot_plain).dest_path(out_plain.clone());
@@ -9767,32 +9842,8 @@ fn mysql_cdc_a_transaction_past_the_memory_cap_spills_rather_than_failing() {
 
     // The fixture is not inert, and memory really was bounded. Rows alone cannot
     // see this: a spill that quietly keeps buffering delivers identical rows.
-    let split = log
-        .split("delivered ")
-        .filter_map(|s| s.split_once(" rows from memory and "))
-        .find_map(|(head, rest)| {
-            let tail = rest.split_once(" from disk")?.0;
-            Some((
-                head.trim().parse::<usize>().ok()?,
-                tail.trim().parse::<usize>().ok()?,
-            ))
-        });
-    let (from_memory, from_disk) =
-        split.unwrap_or_else(|| panic!("the run must report the split. stderr: {log}"));
-    assert_eq!(
-        from_memory + from_disk,
-        ROWS,
-        "the two segments must account for the WHOLE transaction — a row in \
-         neither is a row nobody would miss. stderr: {log}"
-    );
-    // CAP + 1: the cap is checked after the row is pushed, so the head holds one
-    // row more than the cap before the spill opens.
-    assert_eq!(
-        from_memory,
-        CAP + 1,
-        "memory must stop at the cap — that is the point of spilling, and a head \
-         larger than the cap means the ceiling is not enforced. stderr: {log}"
-    );
+    // The binlog is server-wide, so the split graded is this test's own.
+    assert_spill_evidence(&log, CAP, OwnSpill::Transaction(ROWS));
 
     // THE INDEPENDENT ORACLE. Not rivet's verdict, not rivet's reader.
     let census = rig.row_census();

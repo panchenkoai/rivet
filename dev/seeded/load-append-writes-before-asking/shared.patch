@@ -1,0 +1,49 @@
+diff --git a/src/load/mod.rs b/src/load/mod.rs
+index 58eb0b51..cc742cd1 100644
+--- a/src/load/mod.rs
++++ b/src/load/mod.rs
+@@ -441,7 +441,7 @@ pub(crate) fn refuse_stale_buffer(
+     table: &str,
+     base_and_buffer: bool,
+ ) -> Result<()> {
+-    before_write(stale_buffer_check(loader, table, base_and_buffer))
++    stale_buffer_check(loader, table, base_and_buffer)
+ }
+ 
+ /// The probes and the wording of [`refuse_stale_buffer`].
+@@ -959,7 +959,6 @@ fn adoptable(
+     ownership: Ownership,
+ ) -> Result<bool> {
+     if loader.object_kind(table)? != ObjectKind::Table {
+-        ensure_target_own(loader, table, true, ownership)?;
+         return Ok(false);
+     }
+     let changes = format!("{table}__changes");
+@@ -1046,7 +1045,7 @@ pub fn run_load_buffer(
+     label: &str,
+ ) -> Result<CdcLoadReport> {
+     before_write(append_preflight(loader, table, specs, uris, pk, label))?;
+-    before_write(ensure_target_own(loader, table, true, ownership))?;
++    let _ = ownership;
+     let rows_appended = loader.append_changelog(table, specs, uris, pk)?;
+     if let Some(expected) = expected_delta
+         && rows_appended != expected
+diff --git a/src/load/orchestrate.rs b/src/load/orchestrate.rs
+index a1e4fac1..c5db9e65 100644
+--- a/src/load/orchestrate.rs
++++ b/src/load/orchestrate.rs
+@@ -1114,12 +1114,8 @@ fn execute_load<R>(
+     let budgeted = budgeted_uris(job.plan.layout, &inputs.runs, &inputs.uris);
+     // Asked before the `writing` marker below, which the next load reads as rivet's claim.
+     let appends = job.mode != load::plan::LoadMode::Full;
+-    let (rows, report) = match load::before_write(load::ensure_target_own(
+-        &**loader,
+-        &job.plan.table,
+-        appends,
+-        inputs.ownership,
+-    ))
++    let _ = appends;
++    let (rows, report) = match Ok(())
+     .and_then(|()| load::before_write(partition_budget_ok(store, job.plan, &budgeted)))
+     .and_then(|()| {
+         // The crash marker, written between the LAST pre-write check and the

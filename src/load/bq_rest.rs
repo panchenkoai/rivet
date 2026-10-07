@@ -223,6 +223,15 @@ impl BigQueryApi {
         Ok(self.get_json_if_found(&url, "tables.get")?.filter(is_table))
     }
 
+    /// What `dataset.table` names, from `tables.get`: metadata, no query job.
+    pub(crate) fn object_kind(&self, dataset: &str, table: &str) -> Result<super::ObjectKind> {
+        let url = format!(
+            "{}/bigquery/v2/projects/{}/datasets/{dataset}/tables/{table}",
+            self.endpoint, self.project
+        );
+        kind_of_resource(self.get_json_if_found(&url, "tables.get")?.as_ref())
+    }
+
     /// How many row access policies `dataset.table` has (`rowAccessPolicies.list`); a
     /// rebuilt copy of the table carries none.
     pub(crate) fn row_access_policy_count(&self, dataset: &str, table: &str) -> Result<usize> {
@@ -943,8 +952,47 @@ fn is_table(meta: &Value) -> bool {
     meta.get("type").and_then(Value::as_str) == Some("TABLE")
 }
 
+/// The kind a `tables.get` resource names; a clone is a `TABLE`, and no resource is a free name.
+pub(crate) fn kind_of_resource(meta: Option<&Value>) -> Result<super::ObjectKind> {
+    let Some(meta) = meta else {
+        return Ok(super::ObjectKind::Absent);
+    };
+    let kind = meta
+        .get("type")
+        .and_then(Value::as_str)
+        .context("BigQuery tables.get returned no type")?;
+    Ok(match kind {
+        "TABLE" => super::ObjectKind::Table,
+        "VIEW" => super::ObjectKind::View,
+        _ => super::ObjectKind::Other,
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    /// A clone is a `TABLE` to `tables.get`; a snapshot, an external table and a materialized view are none of rivet's kinds.
+    #[test]
+    fn a_table_resource_names_its_kind_and_no_resource_is_a_free_name() {
+        use crate::load::ObjectKind;
+        let kind = |json: &str| super::kind_of_resource(Some(&serde_json::from_str(json).unwrap()));
+        assert_eq!(super::kind_of_resource(None).unwrap(), ObjectKind::Absent);
+        assert_eq!(kind(r#"{"type":"TABLE"}"#).unwrap(), ObjectKind::Table);
+        assert_eq!(
+            kind(r#"{"type":"TABLE","cloneDefinition":{"cloneTime":"2026-10-07T00:00:00Z"}}"#)
+                .unwrap(),
+            ObjectKind::Table
+        );
+        assert_eq!(kind(r#"{"type":"VIEW"}"#).unwrap(), ObjectKind::View);
+        for other in ["SNAPSHOT", "EXTERNAL", "MATERIALIZED_VIEW"] {
+            assert_eq!(
+                kind(&format!(r#"{{"type":"{other}"}}"#)).unwrap(),
+                ObjectKind::Other
+            );
+        }
+        let err = kind(r#"{"id":"p:d.t"}"#).unwrap_err().to_string();
+        assert!(err.contains("returned no type"), "{err}");
+    }
+
     /// Clients built for different tables share one token source per principal.
     #[test]
     fn clients_for_one_principal_share_one_token_source() {

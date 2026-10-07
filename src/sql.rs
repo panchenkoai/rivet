@@ -104,11 +104,11 @@ pub(crate) fn strip_select_star_from(base_query: &str) -> Option<&str> {
 /// wide row into a temp-file spill (the wrap measured ~3.2 GB of temp_files on
 /// an 8.6 GB table).
 ///
-/// Acceptance stays strict so a filtered / derived / joined / de-duplicated
-/// query is never rewritten to the bare table: the projection must be bare
-/// column references only — any `(` (function / subquery), quote, `DISTINCT`,
-/// or other token → `None`; any trailing clause after the table → `None`. On
-/// `None` the caller wraps exactly as before.
+/// Acceptance stays strict so a filtered / derived / joined / de-duplicated /
+/// renamed query is never rewritten to the bare table: the projection must be
+/// bare column references only — any `(` (function / subquery), quote, alias,
+/// `DISTINCT`, or other token → `None`; any trailing clause after the table →
+/// `None`. On `None` the caller wraps exactly as before.
 pub(crate) fn strip_simple_projection_from(base_query: &str) -> Option<&str> {
     let trimmed = base_query.trim();
     let after_select = strip_prefix_ascii_ci(trimmed, "select").map(str::trim_start)?;
@@ -142,22 +142,14 @@ fn find_from_keyword(s: &str) -> Option<usize> {
     None
 }
 
-/// A non-empty list of bare column references: only ASCII alphanumerics, `_`,
-/// `.`, `,`, `*`, and whitespace — and not a leading `DISTINCT` (which would
-/// change the row count / set, breaking the wrapped row count and the
-/// whole-table equivalence the fast path relies on). Functions (`(`), quoted
-/// idents / string literals, and any other punctuation → `false`.
+/// A comma-separated list whose every item is ONE bare column reference (`col`, `t.col`, `*`); a second token in an item is an alias or a row limiter (`a AS b`, `a b`, `DISTINCT a`, `TOP 5 a`), and the query is then not the table.
 fn is_plain_column_list(s: &str) -> bool {
-    if s.is_empty() {
-        return false;
-    }
-    if let Some(rest) = strip_prefix_ascii_ci(s, "distinct")
-        && rest.starts_with(|c: char| c.is_whitespace())
-    {
-        return false;
-    }
-    s.chars().all(|c| {
-        c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ',' | '*' | ' ' | '\t' | '\n' | '\r')
+    s.split(',').all(|item| {
+        let item = item.trim();
+        !item.is_empty()
+            && item
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '*'))
     })
 }
 
@@ -330,8 +322,122 @@ pub(crate) fn oracle_catalog_preds(qualified: &str) -> (String, String) {
     }
 }
 
+/// The first relation the outermost `FROM` of `query` names, quotes stripped (`schema.table`); `None` for a subquery or no `FROM`.
+pub(crate) fn outer_from_relation(query: &str) -> Option<String> {
+    let b = query.as_bytes();
+    let ident = |c: u8| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'$' | b'#') || c >= 0x80;
+    let closer = |c: u8| match c {
+        b'\'' | b'"' | b'`' => Some(c),
+        b'[' => Some(b']'),
+        _ => None,
+    };
+    let (mut depth, mut quote) = (0i32, None);
+    let after_from = b.iter().enumerate().find_map(|(i, &c)| {
+        if let Some(end) = quote {
+            quote = Some(end).filter(|&e| e != c);
+            return None;
+        }
+        quote = closer(c);
+        match c {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            _ => {}
+        }
+        let keyword = depth == 0
+            && b[i..].len() >= 4
+            && b[i..i + 4].eq_ignore_ascii_case(b"from")
+            && (i == 0 || !ident(b[i - 1]))
+            && b.get(i + 4).is_none_or(|&n| !ident(n));
+        keyword.then_some(i + 4)
+    })?;
+    if quote.is_some() {
+        return None;
+    }
+    let mut rest = query[after_from..].trim_start();
+    let mut parts: Vec<&str> = Vec::new();
+    loop {
+        let first = *rest.as_bytes().first()?;
+        let (part, tail) = match closer(first).filter(|_| first != b'\'') {
+            Some(end) => {
+                let close = rest[1..].find(end as char)? + 1;
+                (&rest[1..close], &rest[close + 1..])
+            }
+            None => {
+                let end = rest.bytes().position(|c| !ident(c)).unwrap_or(rest.len());
+                (&rest[..end], &rest[end..])
+            }
+        };
+        if part.is_empty() {
+            return None;
+        }
+        parts.push(part);
+        match tail.strip_prefix('.') {
+            Some(next) => rest = next,
+            None => return Some(parts.join(".")),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn outer_from_relation_names_the_object_a_query_reads_and_nothing_else() {
+        let rel = |q: &str| outer_from_relation(q);
+        let t = |s: &str| Some(s.to_string());
+        assert_eq!(rel("SELECT * FROM orders"), t("orders"));
+        assert_eq!(
+            rel("SELECT \"id\", \"updated_at\"\nFROM \"orders\"\n"),
+            t("orders")
+        );
+        assert_eq!(
+            rel("select `id` from `shop`.`orders` o where o.id > 1"),
+            t("shop.orders")
+        );
+        assert_eq!(
+            rel("SELECT id FROM [dbo].[order lines] AS l"),
+            t("dbo.order lines")
+        );
+        assert_eq!(rel("SELECT id FROM RIVET.ORDERS"), t("RIVET.ORDERS"));
+        assert_eq!(
+            rel(
+                "SELECT id, extract(year FROM created) y, 'x from y' s FROM orders JOIN users u ON 1=1"
+            ),
+            t("orders")
+        );
+        assert_eq!(
+            rel("WITH recent AS (SELECT * FROM archive) SELECT * FROM recent"),
+            t("recent")
+        );
+        assert_eq!(
+            rel("SELECT id FROM orders"),
+            rel("SELECT id, added_later FROM orders WHERE id > 0"),
+            "a changed projection or filter reads the same object"
+        );
+        assert_ne!(rel("SELECT id FROM orders"), rel("SELECT id FROM orders_b"));
+        assert_ne!(
+            rel("SELECT id FROM a.orders"),
+            rel("SELECT id FROM b.orders")
+        );
+        assert_eq!(rel("SELECT * FROM (SELECT 1) x"), None);
+        assert_eq!(rel("SELECT 1"), None);
+        assert_eq!(rel("FROM t"), t("t"));
+        assert_eq!(rel("SELECT xfrom FROM t"), t("t"));
+        assert_eq!(rel("SELECT fromx FROM t"), t("t"));
+        assert_eq!(rel("SELECT 1 FROM\tt"), t("t"));
+        assert_eq!(rel("SELECT (SELECT max(id) FROM inner_t) m"), None);
+        assert_eq!(rel("SELECT ((1)) FROM t"), t("t"));
+        assert_eq!(rel("SELECT ')' FROM t"), t("t"));
+        assert_eq!(rel("SELECT \"a(\" FROM t"), t("t"));
+        assert_eq!(rel("SELECT [from] FROM t"), t("t"));
+        assert_eq!(rel("SELECT 1 FROM t.\"u v\".w x"), t("t.u v.w"));
+        assert_eq!(rel("SELECT 1 FROM t."), None);
+        assert_eq!(rel("SELECT 1 FROM \"\""), None);
+        assert_eq!(rel("SELECT 1 fro"), None);
+        assert_eq!(rel("SELECT 1 FROM 'literal'"), None);
+        assert_eq!(rel("SELECT fromage FROM"), None);
+        assert_eq!(rel("SELECT 'unterminated FROM t"), None);
+    }
 
     #[test]
     fn oracle_derived_aliases_are_quoted_and_carry_no_as() {
@@ -460,6 +566,34 @@ mod tests {
         assert!(strip_simple_projection_from("SELECT 'from x' FROM t").is_none());
         // Three-part identifier is not `[schema.]table`.
         assert!(strip_simple_projection_from("SELECT id FROM a.b.c").is_none());
+    }
+
+    #[test]
+    fn strip_simple_projection_rejects_a_projection_that_renames_or_limits() {
+        for query in [
+            "SELECT legacy_id AS id, name FROM customers",
+            "SELECT legacy_id id, name FROM customers",
+            "SELECT id, name AS label FROM customers",
+            "SELECT TOP 10 id FROM customers",
+            "SELECT ALL id FROM customers",
+            "SELECT id,, name FROM customers",
+        ] {
+            assert_eq!(strip_simple_projection_from(query), None, "{query}");
+        }
+    }
+
+    #[test]
+    fn a_bound_over_an_aliased_projection_is_read_from_the_query_not_the_table() {
+        let query = "SELECT legacy_id AS id, name FROM customers";
+        assert_eq!(
+            aggregate_sql(SourceType::Postgres, "min", "id", query),
+            "SELECT min(\"id\") AS rivet_agg FROM (SELECT legacy_id AS id, name FROM customers) AS _rivet"
+        );
+        assert_eq!(
+            null_key_probe_sql(SourceType::Postgres, "id", query),
+            "SELECT 1 FROM (SELECT legacy_id AS id, name FROM customers) AS _rivet_nullprobe \
+             WHERE \"id\" IS NULL LIMIT 1"
+        );
     }
 
     #[test]
