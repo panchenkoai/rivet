@@ -74,6 +74,21 @@ def unit_of(sub, argv, doc):
     return export or "", value_of(argv, "--table") or ""
 
 
+def canonical(path):
+    """A path as rivet's `canonicalize()` records it: symlinks resolved, each component as its directory lists it."""
+    out = os.sep
+    for part in Path(os.path.realpath(path)).parts[1:]:
+        try:
+            names = os.listdir(out)
+            if part not in names:
+                inode = os.lstat(os.path.join(out, part)).st_ino
+                part = next((n for n in names if os.lstat(os.path.join(out, n)).st_ino == inode), part)
+        except OSError:
+            pass
+        out = os.path.join(out, part)
+    return out
+
+
 def main():
     """Answer `--version` / `--help`, or replay the scenario for the subcommand."""
     spec = json.loads((HERE / "scenario.json").read_text())
@@ -105,7 +120,7 @@ def main():
         out = value_of(argv, "--output")
         expires = (datetime.now(timezone.utc) + timedelta(hours=spec.get("plan_expires_hours", 24))).isoformat()
         if out:
-            source = str(Path(value_of(argv, "--config")).resolve())
+            source = canonical(value_of(argv, "--config"))
             Path(out).write_text(json.dumps({"export_name": value_of(argv, "--export"), "expires_at": expires, "config_path": source}))
         else:
             print(json.dumps(spec.get("plan_list", [])))

@@ -518,13 +518,21 @@ def _plan_inputs(s: _Session, export: str) -> str:
     return digest.hexdigest()[:16]
 
 
+def _same_file(recorded: str, given: str) -> bool:
+    """True when two spellings name one existing file, whatever their case, Unicode form or symlinks; False when either is gone."""
+    try:
+        return os.path.samefile(recorded, given)
+    except (OSError, ValueError):
+        return False
+
+
 def _refuse_foreign_artifact(artifact: Path, export: str, config: str) -> None:
     """Refuse a plan object that does not record this task's export and config, expired or not; the file is left alone."""
     doc = _read_json(artifact)
     if not isinstance(doc, dict):
         return
     named, planned = doc.get("export_name"), doc.get("config_path")
-    same_config = isinstance(planned, str) and planned != "" and Path(planned).resolve() == Path(config).resolve()
+    same_config = isinstance(planned, str) and planned != "" and _same_file(planned, config)
     if named != export or not same_config:
         raise PreflightRefusal(
             "RIVET_AIRFLOW_PLAN_ARTIFACT_FOREIGN",

@@ -627,10 +627,11 @@ def test_two_exports_whose_names_sanitise_to_one_get_their_own_plan_and_are_both
         [{"task_id": "load", "map_index": 1}, {"task_id": "load_1"}],
         [{"task_id": "load", "map_index": 1}, {"task_id": "load", "map_index": 11}],
         [{"task_id": "apply_a"}, {"task_id": "apply_b"}],
+        [{"task_id": "Task"}, {"task_id": "task"}],
         [{"run_id": "manual__2026-10-06T00:00:00+00:00"}, {"run_id": "manual__2026-10-06T00_00_00_00_00"}],
     ],
     ids=["dag-non-ascii", "dag-case", "task-non-ascii", "mapped-task", "mapped-task-dot", "mapped-task-underscore",
-         "mapped-indexes", "two-tasks", "run-id"],
+         "mapped-indexes", "two-tasks", "task-case", "run-id"],
 )
 def test_two_dags_tasks_or_runs_whose_ids_sanitise_to_one_share_no_artifact_log_or_ledger(rig: Rig, ids: list) -> None:
     def ti(which: int, try_number: int = 1) -> FakeTI:
@@ -830,6 +831,60 @@ def test_a_sealed_plan_of_another_config_is_refused_and_refused_again_on_the_ret
     mine.unlink()
     payload, _ = rig.run(two, FakeTI(task_id=two.task_id, try_number=4))
     assert payload["decision"] == "success" and json.loads(mine.read_text())["config_path"] != json.loads(theirs.read_text())["config_path"]
+
+
+def other_case(rig: Rig) -> Path:
+    """The state directory spelled in upper case; skipped where that is another directory."""
+    spelled = rig.tmp / "STATE"
+    if not spelled.is_dir():
+        pytest.skip("this file system tells `STATE` from `state`")
+    return spelled
+
+
+def other_normal_form(rig: Rig) -> Path:
+    """A state directory stored with a composed accent and spelled decomposed; skipped where that is another name."""
+    (rig.tmp / "st\u00e9").mkdir()
+    spelled = rig.tmp / "ste\u0301"
+    if not spelled.is_dir():
+        pytest.skip("this file system tells the two Unicode forms of one name apart")
+    return spelled
+
+
+def through_a_symlink(rig: Rig) -> Path:
+    """The state directory reached through a symlink."""
+    (rig.tmp / "link").symlink_to(rig.state_dir)
+    return rig.tmp / "link"
+
+
+@pytest.mark.parametrize("spelling", [other_case, other_normal_form, through_a_symlink], ids=["case", "unicode-form", "symlink"])
+def test_a_task_applies_its_own_plan_when_rivet_records_another_spelling_of_the_config(rig: Rig, spelling: object) -> None:
+    op = rig.operator(RivetApplyOperator, export="orders", state_dir=str(spelling(rig)))
+    for attempt in (1, 2):
+        payload, _ = rig.run(op, FakeTI(try_number=attempt))
+        assert isinstance(payload, dict) and payload["decision"] == "success", payload
+    steps = [c["argv"] for c in rig.calls() if c["argv"][0] in ("plan", "apply")]
+    assert [s[0] for s in steps] == ["plan", "apply", "apply"], "the task's own plan is applied and replayed, not refused"
+    given, artifact = steps[0][steps[0].index("--config") + 1], Path(steps[1][1])
+    recorded = json.loads(artifact.read_text())["config_path"]
+    assert recorded != given and os.path.samefile(recorded, given), "the binary records its own spelling of the same file"
+    twin = Path(given).with_name("twin.yaml")
+    twin.write_bytes(Path(given).read_bytes())
+    artifact.write_text(json.dumps({**json.loads(artifact.read_text()), "config_path": str(twin)}))
+    refused_twice(rig, op, artifact, str(twin), given)
+    twin.unlink()
+    refused_twice(rig, op, artifact, str(twin), given)
+
+
+def test_another_exports_query_file_edited_between_two_tries_replays_this_exports_plan(rig: Rig) -> None:
+    (rig.config_dir / "orders.sql").write_text("SELECT 1")
+    (rig.config_dir / "users.sql").write_text("SELECT 1")
+    rig.config.write_text(CONFIG_WITH_QUERY_FILE.replace("query: SELECT 1", "query_file: users.sql"))
+    op = rig.operator(RivetApplyOperator, export="orders")
+    rig.run(op)
+    (rig.config_dir / "users.sql").write_text("SELECT 2")
+    payload, _ = rig.run(op, FakeTI(try_number=2))
+    assert payload["decision"] == "success"
+    assert [c["argv"][0] for c in rig.calls()].count("plan") == 1, "the plan of `orders` is made from its own query file only"
 
 
 @pytest.mark.parametrize(

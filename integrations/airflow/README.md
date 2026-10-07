@@ -305,10 +305,20 @@ SQLite state in `state_dir`.
      share a plan, also when they run two configs that both have an export of one name; a
      retry of the same task replays its own plan; a config or query file edited between two
      tries is planned again under a new name.
+   - A retry replays its own plan only while the resolved config path and the config's bytes
+     are unchanged. A config reached through a symlink that is re-pointed between two tries
+     (a new git-sync revision of the DAG folder) is planned again, also when the bytes are
+     the same, and leaves one more config copy and plan artifact in the state directory.
+   - **The plan digest does not cover the environment.** Changing the source between two
+     tries of one task instance (another URL in `env`, an edited Connection) replays the plan
+     made for the old source against the new one. Clear the task in a new DAG run, or delete
+     its artifact, after such a change.
    - The artifact records the export and the config it was planned from (`export_name`,
      `config_path`). `apply` refuses a plan object in which either is missing or is not the
      task's own (`RIVET_AIRFLOW_PLAN_ARTIFACT_FOREIGN`), expired or not, and leaves the file as
-     it is, so the retry is refused for the same reason until a person deletes it. A file at
+     it is, so the retry is refused for the same reason until a person deletes it. The config
+     is compared as a file, not as text: another case, Unicode form or symlink of the same
+     file is the task's own, and a recorded path that no longer exists is not. A file at
      that path that is not a JSON object (empty, cut short) is planned over.
    - **Upgrading a state directory** written by an earlier build of this package: files of an
      older layout are left alone. They are never read, never pruned and never deleted, so
