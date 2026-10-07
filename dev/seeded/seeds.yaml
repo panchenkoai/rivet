@@ -315,3 +315,35 @@ seeds:
         na: "cell_text dispatches on the column kind and propagates decode errors - it has no fall-through that returns None for a value"
       mongo:
         na: "query_scalar answers only the reconcile COUNT - MongoDB has no SQL probes"
+  - name: reset-under-a-live-run
+    class: a command that rewrites an export's stored progress does not take the export's run lease, so it is accepted while a checkpointed run of that export is alive
+    history: "P-17, 2026-10-06 - `rivet state reset-chunks` during a checkpointed chunked run was accepted; the run exited 0 with `_SUCCESS` and a manifest of 0 parts for a 5000-row table, on main 9f6e0cbd and on v0.31.0"
+    scope: state
+    patch: reset-under-a-live-run/shared.patch
+    engines:
+      sqlite-state:
+        cells:
+          - pg_a_reset_is_refused_while_a_range_run_is_alive_and_works_after_it
+          - pg_a_reset_is_refused_while_a_keyset_run_is_alive_and_works_after_it
+          - pg_a_killed_range_run_does_not_block_the_reset
+      postgres-state:
+        cells:
+          - pg_state_a_reset_is_refused_while_a_range_run_is_alive_and_works_after_it
+          - pg_state_a_killed_range_run_does_not_block_the_reset
+      lib:
+        cells:
+          - "lib:every_reset_is_refused_while_the_exports_run_lease_is_held"
+
+  - name: checkpoint-gone-at-completion
+    class: a checkpointed run completes a chunk run whose row is no longer in the state, and publishes a success over the parts it can no longer list
+    history: "P-17, 2026-10-06 - the run whose `chunk_run` and `chunk_task` rows were removed under it finished exit 0 with `_SUCCESS` and 0 rows, 16 parts left in no manifest"
+    scope: state
+    patch: checkpoint-gone-at-completion/shared.patch
+    engines:
+      sqlite-state:
+        cells: [pg_a_range_run_whose_checkpoint_rows_vanish_fails_loudly]
+      postgres-state:
+        cells: [pg_state_a_range_run_whose_checkpoint_rows_vanish_fails_loudly]
+      lib:
+        cells:
+          - "lib:completing_a_chunk_run_whose_row_is_gone_is_refused"

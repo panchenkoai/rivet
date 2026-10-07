@@ -461,6 +461,16 @@ pub mod codes {
         "RIVET_STATE_CURSOR_STREAM_MISMATCH",
         "give each export that shares this state database its own name; if this export was repointed, `rivet state reset -c <config> --export <name>` starts the new table with a full pass (it discards the progress of every export of that name in the state database)",
     );
+    /// A command that rewrites an export's stored progress met a live run of that export.
+    pub const STATE_RUN_IN_PROGRESS: Code = refusal(
+        "RIVET_STATE_RUN_IN_PROGRESS",
+        "wait for the run to finish, or stop its process, then repeat the command",
+    );
+    /// A checkpointed run found its `chunk_run` row gone when it came to complete it.
+    pub const STATE_CHUNK_CHECKPOINT_GONE: Code = refusal(
+        "RIVET_STATE_CHUNK_CHECKPOINT_GONE",
+        "run the export again: it starts a new chunk run (the parts the lost run wrote stay in the destination, in no manifest)",
+    );
     pub const SOURCE_CURSOR_FINER_THAN_MICROSECOND: Code = refusal(
         "RIVET_SOURCE_CURSOR_FINER_THAN_MICROSECOND",
         "cursor on a column at microsecond precision or coarser, or cast the cursor to TIMESTAMP(6) in a curated query",
@@ -568,6 +578,8 @@ pub mod codes {
         STATE_CURSOR_OWNER_MISMATCH,
         STATE_CURSOR_STREAM_MISMATCH,
         STATE_KEYSET_SEQUENTIAL_ANCHOR_UNFINISHED,
+        STATE_RUN_IN_PROGRESS,
+        STATE_CHUNK_CHECKPOINT_GONE,
         LOAD_VALUE_OUT_OF_TARGET_RANGE,
         LOAD_COUNT_MISMATCH,
         LOAD_ADOPTION_COLUMN_MISMATCH,

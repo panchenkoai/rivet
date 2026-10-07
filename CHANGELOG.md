@@ -72,6 +72,22 @@
     a warning (and delivered nothing with `keyset_incremental`). It now fails with the message
     above. Remove `parallel:`: the sequential keyset reads its cursor from the rows.
   - The refusal for a `numeric` or `real` `chunk_column:` under `query:` has the new text.
+- **Breaking: `rivet state reset` and `rivet state reset-chunks` refuse while a checkpointed run
+  of the export is alive.** Before, both were accepted (exit 0) during the run. A
+  `mode: chunked` export with `chunk_checkpoint: true` then finished with exit 0, `_SUCCESS`
+  and a manifest of 0 parts and 0 rows, with the parts it had written left in the destination
+  in no manifest.
+  - The refusal is `RIVET_STATE_RUN_IN_PROGRESS` (exit 5). It names the run (the last field of
+    a run id is the process id) and removes nothing. Wait for the run, or stop its process, and
+    repeat the command. A run that was killed does not hold the reset back.
+  - `rivet state reset-chunks --stuck-checkpoints` leaves an export whose run is alive in
+    place, prints why, and still exits 0.
+  - Only a run that holds the export's run lease is protected: `chunk_checkpoint: true`, range
+    or keyset. A reset during any other run (`full`, `incremental`, `cdc`) is accepted as before.
+  - A checkpointed run whose `chunk_run` row is gone when it finishes now fails with
+    `RIVET_STATE_CHUNK_CHECKPOINT_GONE` (exit 5) and writes no `_SUCCESS`. Run the export again.
+  - State written by earlier releases needs nothing: no stored row changes shape.
+
 - **Breaking: CDC writes an UPDATE that changes the key as a delete of the old key and an insert
   of the new row** (ADR-0030, accepted), on PostgreSQL, MySQL and Oracle. SQL Server's change
   table already did this, and MongoDB's `_id` cannot change.
