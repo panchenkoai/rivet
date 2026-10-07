@@ -3,7 +3,7 @@ use std::path::Path;
 use crate::config::{Config, ExportConfig};
 use crate::error::Result;
 use crate::plan::{DiagnosticLevel, ExtractionStrategy, ResolvedRunPlan, validate_plan};
-use crate::state::StateStore;
+use crate::state::{ProgressClaim, StateStore};
 
 use super::RunOptions;
 use super::chunked::{self, run_chunked_parallel_checkpoint};
@@ -997,12 +997,48 @@ pub(super) struct RunOutcome<'a> {
     /// `result.is_err()` — the export/quality verdict, computed BEFORE the
     /// manifest is written.
     pub failed: bool,
+    /// The runner returned `Ok`: every row was read before any post-data gate ran.
+    pub data_complete: bool,
     /// `Some(why)` when `finalize_manifest` could not write the manifest.
     pub manifest_gap: &'a Option<String>,
 }
 
-pub(super) fn keyset_anchor_survives(o: RunOutcome<'_>) -> bool {
+/// Did a post-data gate (schema drift, quality) refuse a run whose runner had read every row?
+fn refused_by_a_gate(o: &RunOutcome<'_>) -> bool {
+    o.data_complete && o.failed
+}
+
+/// Whether the keyset resume anchor outlives the run. A run that broke off keeps it; a refused
+/// one releases it, so the next run reads and grades the rows again instead of adopting them,
+/// unless its cursor ran ahead and a re-read would skip them.
+pub(super) fn keyset_anchor_survives(o: &RunOutcome<'_>, cursor_ran_ahead: bool) -> bool {
+    if refused_by_a_gate(o) {
+        return cursor_ran_ahead;
+    }
     o.failed || o.manifest_gap.is_some()
+}
+
+/// Whether the stored cursor sits on one of `run_id`'s own pages: rivet <= 0.31 advanced a
+/// sequential `keyset_incremental` cursor page by page, so releasing that anchor would skip them.
+fn cursor_ran_ahead(progress: &ProgressClaim<'_>, plan: &ResolvedRunPlan, run_id: &str) -> bool {
+    let ExtractionStrategy::Keyset(kp) = &plan.strategy else {
+        return false;
+    };
+    if !kp.incremental {
+        return false;
+    }
+    progress.cursor_is_a_page_of(run_id).unwrap_or(true)
+}
+
+/// What a refused run says when its anchor is kept because the stored cursor already moved.
+fn ran_ahead_warning(export_name: &str, run_id: &str) -> String {
+    format!(
+        "export '{export_name}': refused run {run_id} cannot be read again — the stored cursor \
+         already sits past pages it committed (a run interrupted under rivet 0.31 or earlier, or \
+         one stopped right after its cursor moved), so the next run adopts those pages without \
+         grading them. To have every row read and graded again, run `rivet state reset -c \
+         <config> --export {export_name}` before the next run"
+    )
 }
 
 /// Whether the incremental cursor may advance: only a successful run whose manifest landed.
@@ -1010,18 +1046,25 @@ fn cursor_may_advance(status: &str, manifest_gap: &Option<String>) -> bool {
     status == "success" && manifest_gap.is_none()
 }
 
+/// Release or keep the keyset resume anchor of the run that just ended; returns the warning to log.
 fn finalize_keyset_anchor(
     state: &StateStore,
+    progress: &ProgressClaim<'_>,
     plan: &ResolvedRunPlan,
-    export_name: &str,
-    failed: bool,
-) {
-    if !failed && matches!(plan.strategy, ExtractionStrategy::Keyset(_)) {
-        let _ = state.clear_resume_run_id(export_name, &plan.source.state_key());
+    run_id: &str,
+    o: &RunOutcome<'_>,
+) -> Option<String> {
+    if !matches!(plan.strategy, ExtractionStrategy::Keyset(_)) {
+        return None;
+    }
+    let ran_ahead = refused_by_a_gate(o) && cursor_ran_ahead(progress, plan, run_id);
+    if !keyset_anchor_survives(o, ran_ahead) {
+        let _ = state.clear_resume_run_id(&plan.export_name, &plan.source.state_key());
         // Parallel keyset persists its per-range recovery rows under the same
         // anchor; clear them too (a no-op for sequential keyset, which writes none).
-        let _ = state.clear_keyset_ranges(export_name, &plan.source.state_key());
+        let _ = state.clear_keyset_ranges(&plan.export_name, &plan.source.state_key());
     }
+    ran_ahead.then(|| ran_ahead_warning(&plan.export_name, run_id))
 }
 
 /// Mark a run `running` at its START — in the central run-status ledger AND (for
@@ -1372,6 +1415,7 @@ fn execute_resolved_plan(
     // the records half still applies — the Failed manifest must describe the
     // durable debris with the OBSERVED fingerprint + Form-B, never the stale
     // baseline (seam bughunt 2026-08-21).
+    let data_complete = result.is_ok();
     let result = match result {
         Ok(()) => super::finalize::finalize_export(plan, Some(state), &mut summary),
         Err(e) => {
@@ -1544,15 +1588,15 @@ fn execute_resolved_plan(
     // EVERY entry point must clear it — a wrapper that skips it strands
     // resume_run_id forever (round-3 wrapper-bypass regression), which is exactly
     // why this script now exists once.
-    finalize_keyset_anchor(
-        state,
-        plan,
-        &summary.export_name,
-        keyset_anchor_survives(RunOutcome {
-            failed,
-            manifest_gap: &manifest_gap,
-        }),
-    );
+    let outcome = RunOutcome {
+        failed,
+        data_complete,
+        manifest_gap: &manifest_gap,
+    };
+    if let Some(warning) = finalize_keyset_anchor(state, &progress, plan, &summary.run_id, &outcome)
+    {
+        log::warn!("{warning}");
+    }
     if plan.validate {
         finalize_validate_manifest(plan, &mut summary, tail.kind);
     }
@@ -2140,38 +2184,254 @@ mod tests {
         assert!(!cursor_may_advance("failed", &gap));
     }
 
+    /// A run that broke off mid-data (`data_complete: false`) or passed its gates, with or without its manifest.
+    fn outcome(failed: bool, manifest_gap: &Option<String>) -> RunOutcome<'_> {
+        RunOutcome {
+            failed,
+            data_complete: !failed,
+            manifest_gap,
+        }
+    }
+
     #[test]
     fn a_run_whose_manifest_did_not_land_keeps_its_keyset_resume_anchor() {
         let gap = Some("the manifest write FAILED".to_string());
 
         assert!(
-            keyset_anchor_survives(RunOutcome {
-                failed: false,
-                manifest_gap: &gap
-            }),
+            keyset_anchor_survives(&outcome(false, &gap), false),
             "parts are durable and nothing names them — the anchor is the only way back to them"
         );
         assert!(
-            keyset_anchor_survives(RunOutcome {
-                failed: true,
-                manifest_gap: &None
-            }),
+            keyset_anchor_survives(&outcome(true, &None), false),
             "an export failure keeps its anchor, as it always did"
         );
         assert!(
-            keyset_anchor_survives(RunOutcome {
-                failed: true,
-                manifest_gap: &gap
-            }),
+            keyset_anchor_survives(&outcome(true, &gap), false),
             "both at once is still a run that did not finish"
         );
         assert!(
-            !keyset_anchor_survives(RunOutcome {
-                failed: false,
-                manifest_gap: &None
-            }),
+            !keyset_anchor_survives(&outcome(false, &None), false),
             "a genuinely complete run MUST clear it, or the next run is misread as a resume of \
              this finished one and reuses its frozen run_id"
+        );
+        assert!(
+            !keyset_anchor_survives(&outcome(false, &None), true),
+            "a finished run's cursor sits on its own last page: that is not a refusal"
+        );
+    }
+
+    /// The runner read every row and a gate then refused the result.
+    fn refused(manifest_gap: &Option<String>) -> RunOutcome<'_> {
+        RunOutcome {
+            failed: true,
+            data_complete: true,
+            manifest_gap,
+        }
+    }
+
+    /// A refusal must not become the evidence that lifts it: a kept anchor lets the next run
+    /// adopt the refused pages, read nothing, and pass the gate over nothing.
+    #[test]
+    fn a_refused_run_releases_its_keyset_anchor_so_the_next_run_is_graded_again() {
+        let gap = Some("the manifest write FAILED".to_string());
+        for manifest_gap in [&None, &gap] {
+            assert!(
+                !keyset_anchor_survives(&refused(manifest_gap), false),
+                "a refused run's pages are never adopted, with or without its Failed manifest"
+            );
+            assert!(
+                keyset_anchor_survives(&refused(manifest_gap), true),
+                "a cursor that ran ahead would skip the refused pages on a re-read"
+            );
+        }
+        assert!(refused_by_a_gate(&refused(&None)));
+        assert!(
+            !refused_by_a_gate(&outcome(true, &None)),
+            "a run that broke off mid-data is resumed, not re-read"
+        );
+        assert!(
+            !refused_by_a_gate(&outcome(false, &None)),
+            "a run that passed its gates was not refused"
+        );
+    }
+
+    fn keyset_plan(incremental: bool) -> ResolvedRunPlan {
+        let mut plan = chunked_plan_with_quality(None);
+        plan.strategy = ExtractionStrategy::Keyset(crate::plan::KeysetPlan {
+            key_column: "id".into(),
+            chunk_size: 3,
+            checkpoint: true,
+            incremental,
+            parallel: 1,
+        });
+        plan
+    }
+
+    /// A state store holding run `r1`'s anchor, one range and one committed page ending at key 3.
+    fn anchored_state(plan: &ResolvedRunPlan) -> StateStore {
+        let st = StateStore::open_in_memory().unwrap();
+        let key = plan.progress_key();
+        st.set_resume_run_id(&key, "r1").unwrap();
+        st.persist_keyset_ranges("orders", &key.source, "r1", "id", &[(None, None)])
+            .unwrap();
+        st.record_file(crate::state::FilePart {
+            run_id: "r1",
+            export_name: "orders",
+            file_name: "p0",
+            rows: 3,
+            bytes: 1,
+            format: "parquet",
+            compression: None,
+            cursor_high: Some("3"),
+        })
+        .unwrap();
+        st
+    }
+
+    /// The claim a run of `plan` holds on `st`.
+    fn claimed<'s>(st: &'s StateStore, plan: &ResolvedRunPlan) -> ProgressClaim<'s> {
+        st.claim(plan.progress_key()).unwrap()
+    }
+
+    /// `(anchor, has ranges)` left for `orders`.
+    fn anchor_left(st: &StateStore, plan: &ResolvedRunPlan) -> (Option<String>, bool) {
+        (
+            st.get_resume_run_id("orders", &plan.source.state_key())
+                .unwrap(),
+            st.has_keyset_ranges("orders", "r1", None).unwrap(),
+        )
+    }
+
+    #[test]
+    fn a_refused_or_finished_run_releases_anchor_and_ranges_and_a_broken_off_one_keeps_both() {
+        let plan = keyset_plan(true);
+        let kept = (Some("r1".to_string()), true);
+
+        let st = anchored_state(&plan);
+        assert_eq!(
+            finalize_keyset_anchor(
+                &st,
+                &claimed(&st, &plan),
+                &plan,
+                "r1",
+                &outcome(true, &None)
+            ),
+            None
+        );
+        assert_eq!(anchor_left(&st, &plan), kept, "broke off: resumed next run");
+
+        assert_eq!(
+            finalize_keyset_anchor(&st, &claimed(&st, &plan), &plan, "r1", &refused(&None)),
+            None
+        );
+        assert_eq!(anchor_left(&st, &plan), (None, false), "refused: released");
+
+        let st = anchored_state(&plan);
+        assert_eq!(
+            finalize_keyset_anchor(
+                &st,
+                &claimed(&st, &plan),
+                &plan,
+                "r1",
+                &outcome(false, &None)
+            ),
+            None
+        );
+        assert_eq!(anchor_left(&st, &plan), (None, false), "finished: released");
+
+        let st = anchored_state(&plan);
+        let chunked = chunked_plan_with_quality(None);
+        assert_eq!(
+            finalize_keyset_anchor(&st, &claimed(&st, &plan), &chunked, "r1", &refused(&None)),
+            None
+        );
+        assert_eq!(
+            anchor_left(&st, &plan),
+            kept,
+            "not a keyset export: not its anchor"
+        );
+    }
+
+    #[test]
+    fn a_refused_run_whose_cursor_ran_ahead_keeps_its_anchor_and_says_so() {
+        let plan = keyset_plan(true);
+        let kept = (Some("r1".to_string()), true);
+        let st = anchored_state(&plan);
+        st.update_with_column(&plan.progress_key(), "3").unwrap();
+
+        assert_eq!(
+            finalize_keyset_anchor(&st, &claimed(&st, &plan), &plan, "r1", &refused(&None))
+                .as_deref(),
+            Some(
+                "export 'orders': refused run r1 cannot be read again — the stored cursor already \
+                 sits past pages it committed (a run interrupted under rivet 0.31 or earlier, or \
+                 one stopped right after its cursor moved), so the next run adopts those pages \
+                 without grading them. To have every row read and graded again, run `rivet state \
+                 reset -c <config> --export orders` before the next run"
+            )
+        );
+        assert_eq!(anchor_left(&st, &plan), kept);
+
+        assert_eq!(
+            finalize_keyset_anchor(
+                &st,
+                &claimed(&st, &plan),
+                &plan,
+                "r1",
+                &outcome(true, &None)
+            ),
+            None,
+            "a run that broke off is resumed whatever its cursor: nothing to warn about"
+        );
+        assert_eq!(anchor_left(&st, &plan), kept);
+
+        assert_eq!(
+            finalize_keyset_anchor(
+                &st,
+                &claimed(&st, &plan),
+                &plan,
+                "r1",
+                &outcome(false, &None)
+            ),
+            None,
+            "a finished run's cursor is on its own last page by design"
+        );
+        assert_eq!(anchor_left(&st, &plan), (None, false));
+    }
+
+    #[test]
+    fn only_an_incremental_cursor_on_the_runs_own_page_ran_ahead() {
+        let (inc, full) = (keyset_plan(true), keyset_plan(false));
+        let st = anchored_state(&inc);
+        let key = inc.progress_key();
+        let claim = st.claim(key.clone()).unwrap();
+        assert!(
+            !cursor_ran_ahead(&claim, &inc, "r1"),
+            "no cursor stored yet"
+        );
+
+        st.update_with_column(&key, "3").unwrap();
+        assert!(
+            cursor_ran_ahead(&claim, &inc, "r1"),
+            "the cursor is r1's page"
+        );
+        assert!(
+            !cursor_ran_ahead(&claim, &inc, "r2"),
+            "another run's page: this run began there"
+        );
+        assert!(
+            !cursor_ran_ahead(&claim, &full, "r1"),
+            "a full pass releases its anchor itself and re-reads from the start"
+        );
+        assert!(
+            !cursor_ran_ahead(&claim, &chunked_plan_with_quality(None), "r1"),
+            "not a keyset export"
+        );
+
+        st.update_with_column(&key, "0").unwrap();
+        assert!(
+            !cursor_ran_ahead(&claim, &inc, "r1"),
+            "the cursor is still where r1 began"
         );
     }
 
@@ -3048,15 +3308,23 @@ mod tests {
             .unwrap();
         let anchored = || state.get_resume_run_id(name, &key.source).unwrap();
 
-        super::finalize_keyset_anchor(&state, &plan, name, true);
+        let claim = state.claim(key.clone()).unwrap();
+        let gap = None;
+        let ended = |failed| super::RunOutcome {
+            failed,
+            data_complete: !failed,
+            manifest_gap: &gap,
+        };
+
+        super::finalize_keyset_anchor(&state, &claim, &plan, "run_1", &ended(true));
         assert_eq!(
             anchored().as_deref(),
             Some("run_1"),
-            "a failed run keeps it"
+            "a run that broke off keeps it"
         );
-        super::finalize_keyset_anchor(&state, &chunked, name, false);
+        super::finalize_keyset_anchor(&state, &claim, &chunked, "run_1", &ended(false));
         assert_eq!(anchored().as_deref(), Some("run_1"), "not a keyset finish");
-        super::finalize_keyset_anchor(&state, &plan, name, false);
+        super::finalize_keyset_anchor(&state, &claim, &plan, "run_1", &ended(false));
         assert_eq!(anchored(), None);
         assert!(!state.has_keyset_ranges(name, "run_1", None).unwrap());
         assert!(
