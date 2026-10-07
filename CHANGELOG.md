@@ -36,6 +36,15 @@
   - **Slots a failed run already advanced (0.31.0 and earlier):** the skipped transactions are
     no longer readable from the slot and upgrading does not bring them back. If a PostgreSQL CDC
     run failed while writing a part, compare that table with its source.
+- **ClickHouse load: a timestamp ClickHouse cannot hold is refused before the load's first
+  statement, and that refusal no longer makes the table rivet's own.** The range check ran
+  inside the insert of each part, after the `<table>__rivet_swap` table was created, and the
+  stop was journaled as a failed load. A failed load counts as rivet having written the table,
+  so a table someone else created under that name afterwards was replaced by the next
+  `rivet load`, exit 0. Every part's footer is now checked first; the stop is journaled
+  `refused`, leaves no table behind, and the next load still refuses a table it has no record
+  of loading. A load with an out-of-range value in a later part no longer inserts the earlier
+  parts into the swap table before stopping.
 
 - **Breaking: a run refuses to continue from progress stored for another table or collection**
   (`RIVET_STATE_CURSOR_STREAM_MISMATCH`, exit 5, nothing read or written). The stored incremental
