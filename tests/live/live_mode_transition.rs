@@ -743,6 +743,12 @@ fn open_defect_incremental_query_filter_edited_postgres() {
 }
 
 const STREAM_CODE: &str = "RIVET_STATE_CURSOR_STREAM_MISMATCH";
+const STREAM_REFUSED: Refused = Refused {
+    code: STREAM_CODE,
+    exit: 5,
+};
+/// The stream refusal's remedy for two exports that share a name.
+const OWN_NAMES: &str = "two exports sharing a name in one state database need their own names";
 
 /// Two runs in a row refuse with the stream code (exit 5) naming both streams, and write nothing to `out`.
 fn refused_twice_for_the_stream(
@@ -821,16 +827,28 @@ fn stream_repoint(engine: SqlEngine, stage: Stage) {
     rig.run_ok();
     assert_eq!(ids(first.path()), (101..=110).collect::<Vec<_>>());
 
-    let rig = staged_for(engine, rig.repoint(&b), &stage, second.path());
-    refused_twice_for_the_stream(&rig, second.path(), &a, &b, &ids);
-
-    let reset = rig.cli(&["state", "reset", "--export", &a]);
-    assert!(
-        reset.status.success(),
-        "{}",
-        String::from_utf8_lossy(&reset.stderr)
+    let mut rig = staged_for(engine, rig.repoint(&b), &stage, second.path());
+    let own = unique_name("own");
+    let said = rig.refuses_twice_then(
+        &["run"],
+        &[],
+        STREAM_REFUSED,
+        vec![
+            crate::common::Remedy::new(
+                &format!("`rivet state reset -c <config> --export {a}` starts `"),
+                Then::DeliversTheSource,
+                |r| {
+                    let reset = r.cli(&["state", "reset", "--export", &a]);
+                    let said = String::from_utf8_lossy(&reset.stderr);
+                    assert!(reset.status.success(), "{said}");
+                },
+            ),
+            crate::common::Remedy::new(OWN_NAMES, Then::DeliversTheSource, |r| {
+                r.rebuilt(|r| r.export_named(&own))
+            }),
+        ],
     );
-    rig.run_ok();
+    assert!(said.contains(&a) && said.contains(&b), "{said}");
     assert_eq!(ids(second.path()), (1..=10).collect::<Vec<_>>());
 }
 
@@ -859,16 +877,19 @@ fn stream_shared_name(engine: SqlEngine, stage: Stage) {
     } else {
         one.repoint(&b)
     };
-    let two = staged_for(engine, two, &stage, second.path());
-    refused_twice_for_the_stream(&two, second.path(), &a, &b, &ids);
-
-    let own = staged_for(
-        engine,
-        two.export_named(&unique_name("own")),
-        &stage,
-        second.path(),
+    let mut two = staged_for(engine, two, &stage, second.path());
+    let own = unique_name("own");
+    let said = two.refuses_twice_then(
+        &["run"],
+        &[],
+        STREAM_REFUSED,
+        vec![crate::common::Remedy::new(
+            OWN_NAMES,
+            Then::DeliversTheSource,
+            |r| r.rebuilt(|r| r.export_named(&own)),
+        )],
     );
-    own.run_ok();
+    assert!(said.contains(&a) && said.contains(&b), "{said}");
     assert_eq!(ids(second.path()), (1..=10).collect::<Vec<_>>());
 }
 

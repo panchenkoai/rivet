@@ -20,9 +20,12 @@ mod invoke;
 pub use invoke::Spawned;
 mod materialize;
 mod oracle;
+mod remedy;
+pub use remedy::{Refused, Remedy, Then};
 mod render;
 mod verify;
 
+#[derive(Clone)]
 enum CloudDest {
     S3 {
         bucket: String,
@@ -100,7 +103,7 @@ pub struct Rig {
     /// Every YAML this rig has materialized, so the hand-edit guard can tell
     /// "stale rig render" (fine to overwrite) from "foreign edit" (refused).
     past_renders: std::cell::RefCell<Vec<String>>,
-    dir: tempfile::TempDir,
+    dir: std::sync::Arc<tempfile::TempDir>,
 }
 
 /// A non-primary export in a multi-export config, with its OWN destination.
@@ -159,7 +162,7 @@ impl Rig {
             dest_prefix_unslashed: false,
             materialized_copies: std::cell::RefCell::new(Vec::new()),
             past_renders: std::cell::RefCell::new(Vec::new()),
-            dir: tempfile::tempdir().expect("rig tempdir"),
+            dir: std::sync::Arc::new(tempfile::tempdir().expect("rig tempdir")),
         }
     }
 
