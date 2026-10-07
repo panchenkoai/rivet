@@ -90,14 +90,11 @@ pub(crate) struct PgChangeStream {
     /// committing past it ends the stream; `None` (daemon / anchor-only open)
     /// keeps the pure catch-up exit. The contract lives on [`DrainMode`].
     bound: Option<u64>,
-    /// Any DATA event pushed this run. When still `false` at clean exhaust,
-    /// every frontier-covered transaction was EMPTY (DDL churn decodes as
-    /// row-less BEGIN/COMMIT) — the sink has nothing to flush, so it never
-    /// acks, and the slot would pin WAL behind the noise forever on an idle
-    /// database. A zero-yield run releases the span itself
-    /// ([`Self::release_empty_frontier`]): advancing past a data-free span can
-    /// lose nothing by construction.
-    yielded_data: bool,
+    /// COMMIT LSN of the last DATA-bearing transaction yielded and not yet covered
+    /// by an ack; 0 when nothing is owed downstream. While non-zero the slot moves
+    /// only through [`ChangeStream::ack`]; at 0 the frontier-covered span is
+    /// data-free and [`Self::release_empty_frontier`] may advance past it.
+    owed_through: u64,
     /// Rendered LSN of the last frontier advance — the zero-yield release
     /// target. `take()`n once at exhaust.
     frontier_text: Option<String>,
@@ -708,7 +705,7 @@ impl PgChangeStream {
             exhausted: false,
             pending_truncate_refusal: None,
             bound,
-            yielded_data: false,
+            owed_through: 0,
             frontier_text: None,
             configured_tables: configured_tables.to_vec(),
             barrier_nonce,
@@ -769,7 +766,7 @@ impl PgChangeStream {
                         // event — on disk when it spilled (`TxBuffer::close_transaction`).
                         let (head, tail) = tx.close_transaction(&commit, &lsn)?;
                         if !head.is_empty() || tail.is_some() {
-                            self.yielded_data = true;
+                            self.owed_through = commit_lsn;
                         }
                         self.pending.extend(head);
                         self.frontier = commit_lsn;
@@ -923,7 +920,7 @@ impl PgChangeStream {
     }
 
     /// Zero-yield release: called at clean exhaust. A run whose every
-    /// frontier-covered transaction was EMPTY (see [`Self::yielded_data`])
+    /// frontier-covered transaction was EMPTY (see [`Self::owed_through`])
     /// advances the slot itself — the sink will never ack (it has nothing to
     /// flush), and a data-free span has nothing to lose. A run that yielded
     /// data leaves acking to the sink (the flush→checkpoint→ack durability
@@ -931,7 +928,7 @@ impl PgChangeStream {
     /// and is released then. Failure here only delays WAL release — warn, never
     /// fail an otherwise-clean run.
     fn release_empty_frontier(&mut self) {
-        if self.yielded_data {
+        if self.owed_through != 0 {
             return;
         }
         let Some(lsn) = self.frontier_text.take() else {
@@ -985,6 +982,15 @@ fn tx_disposition(commit_lsn: u64, frontier: u64, bound: Option<u64>) -> TxDispo
         TxDisposition::Yield
     } else {
         TxDisposition::AlreadyYielded
+    }
+}
+
+/// What stays owed downstream after the sink acked `acked`: nothing once the ack covers the last data-bearing commit yielded.
+fn owed_after_ack(owed_through: u64, acked: Option<u64>) -> u64 {
+    if acked.is_some_and(|a| a >= owed_through) {
+        0
+    } else {
+        owed_through
     }
 }
 
@@ -1192,23 +1198,7 @@ impl ChangeStream for PgChangeStream {
             .ok_or_else(|| anyhow::anyhow!("pg cdc ack: position missing 'lsn'"))?
             .to_string();
         self.advance_slot(&lsn)?;
-        // The ack DISCHARGES the latch: everything yielded up to here is durable at
-        // the destination, so a data-free span PAST it has nothing to lose and may be
-        // released by `release_empty_frontier`. Leaving `yielded_data` set for the
-        // whole run made the guard answer "did this run ever yield?" instead of "is
-        // anything still owed downstream", and a bounded run then STOPPED at the first
-        // empty span it met after its first data.
-        //
-        // MEASURED on the pg16 CDC stand, everything committed BEFORE run 1 opened,
-        // `until_current: true`, `rollover: 5`, WAL laid out as
-        // `1 row | 6 empty DDL transactions | 3 rows`: run 1 delivered 1 row, run 2
-        // the other 3, run 3 nothing. Four rows, three `status: success` runs, no
-        // warning — `_SUCCESS` claiming a prefix complete while in-bound committed
-        // data sat unread and the slot stayed pinned behind it. The empty span need
-        // not be exotic: `CREATE TEMP TABLE … DROP` and a bare `ANALYZE` each decode
-        // as a row-less BEGIN/COMMIT, and every wire row counts against the peek
-        // budget, so ~rollover/2 of them fill a window.
-        self.yielded_data = false;
+        self.owed_through = owed_after_ack(self.owed_through, parse_lsn(&lsn));
         Ok(())
     }
 }
@@ -2746,6 +2736,23 @@ mod tests {
         // frontier path, same as the unbounded stream.
         assert_eq!(tx_disposition(0, 0, Some(10)), AlreadyYielded);
         assert_eq!(tx_disposition(0, 0, None), AlreadyYielded);
+    }
+
+    #[test]
+    fn an_ack_discharges_only_what_it_covers() {
+        assert_eq!(
+            owed_after_ack(5, Some(4)),
+            5,
+            "a mid-window ack leaves the rest owed"
+        );
+        assert_eq!(owed_after_ack(5, Some(5)), 0);
+        assert_eq!(owed_after_ack(5, Some(6)), 0);
+        assert_eq!(
+            owed_after_ack(5, None),
+            5,
+            "an unparseable ack discharges nothing"
+        );
+        assert_eq!(owed_after_ack(0, Some(0)), 0);
     }
 
     // The offline mutation guard for the peek-budget contract: the CI mutants

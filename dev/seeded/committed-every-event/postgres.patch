@@ -10,5 +10,5 @@ index d224486d..2915598e 100644
 +                        let (mut head, tail) = tx.close_transaction(&commit, &lsn)?;
 +                        head.iter_mut().for_each(|e| e.committed = true);
                          if !head.is_empty() || tail.is_some() {
-                             self.yielded_data = true;
+                             self.owed_through = commit_lsn;
                          }

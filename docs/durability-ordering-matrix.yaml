@@ -130,3 +130,10 @@ scenarios:
     chunked:     { na: "range chunks are fingerprinted with their column (chunk_plan_fingerprint)" }
     keyset:      { test: persisted_ranges_are_not_reloaded_for_a_different_key_column }
     cdc:         { na: "the CDC leg borrows the recipe's keyset path — same store, same test" }
+
+  - id: cdc_ack_follows_the_write
+    what: "a part that rolls mid-window acknowledges the source only up to its own last commit; transactions already read into the same window but not yet written stay owed, so a failed final part leaves the slot at the last WRITTEN commit and the next run delivers the rest (read MANIFEST-DRIVEN, plus the slot's own confirmed_flush_lsn)."
+    incremental: { na: "no source-side acknowledgement; the cursor is saved once, after the manifest" }
+    chunked:     { na: "no source-side acknowledgement" }
+    keyset:      { na: "no source-side acknowledgement" }
+    cdc:         { test: pg_cdc_a_failed_final_part_after_a_mid_window_roll_leaves_the_slot_behind_it }
