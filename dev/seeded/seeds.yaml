@@ -178,6 +178,41 @@ seeds:
       lib:
         cells: ["lib:a_zero_row_empty_schema_binds_nothing_and_is_not_a_ghost_column"]
 
+  - name: refused-run-adopted
+    class: a keyset run a post-data gate refused keeps its resume anchor, so the next run adopts its pages, reads nothing and passes the gate over nothing
+    history: "night 2026-10-06 P-05 - parallel keyset + chunk_checkpoint and keyset_incremental: run 1 exit 3, run 2 exit 0 with _SUCCESS, on main and on v0.31.0"
+    scope: source
+    patch: refused-run-adopted/shared.patch
+    engines:
+      postgres:
+        cells:
+          - a_refused_parallel_keyset_checkpoint_run_keeps_refusing_a_duplicate_postgres
+          - a_refused_parallel_keyset_checkpoint_run_keeps_refusing_a_null_ratio_postgres
+          - a_refused_parallel_keyset_checkpoint_run_keeps_refusing_schema_drift_postgres
+          - a_refused_keyset_incremental_run_keeps_refusing_a_duplicate_postgres
+          - a_refused_keyset_incremental_run_keeps_refusing_a_null_ratio_postgres
+          - a_refused_keyset_incremental_run_keeps_refusing_schema_drift_postgres
+          - a_refused_parallel_keyset_incremental_run_keeps_refusing_a_duplicate_postgres
+          - a_refused_parallel_keyset_incremental_run_keeps_refusing_schema_drift_postgres
+      mysql:
+        cells:
+          - a_refused_parallel_keyset_checkpoint_run_keeps_refusing_mysql
+          - a_refused_keyset_incremental_run_keeps_refusing_mysql
+      mssql:
+        cells:
+          - a_refused_parallel_keyset_checkpoint_run_keeps_refusing_mssql
+          - a_refused_keyset_incremental_run_keeps_refusing_mssql
+      oracle:
+        cells:
+          - a_refused_parallel_keyset_checkpoint_run_keeps_refusing_oracle
+          - a_refused_keyset_incremental_run_keeps_refusing_oracle
+      mongo:
+        na: "no gate can refuse a Mongo keyset export after its data: the reader's fixed (_id, document) schema never drifts, _id is never duplicated and document is never null, so only row-count rules can fail, and those count adopted rows and refuse again; mongo_parallel persists no anchor at all. By reading (blob_schema() in MongoSource::export, mongo_parallel.rs); no Mongo stand ran on 2026-10-07"
+      lib:
+        cells:
+          - "lib:a_refused_run_releases_its_keyset_anchor_so_the_next_run_is_graded_again"
+          - "lib:a_refused_or_finished_run_releases_anchor_and_ranges_and_a_broken_off_one_keeps_both"
+
   - name: pg-migration-not-idempotent
     class: a PostgreSQL state migration that fails when the ladder replays over tables already in its shape
     history: "#413 - v32 read columns_json from a table that no longer had it; 317 gate cells failed"
