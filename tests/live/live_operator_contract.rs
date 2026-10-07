@@ -407,7 +407,7 @@ fn pg_cdc_missing_table_leaves_no_slot() {
 // (d) the exit-code contract
 
 /// RESULTS 11: a second run beside a live checkpointed run is refused as `RIVET_STATE_RUN_IN_PROGRESS` (exit 5).
-fn second_run_beside_a_live_checkpointed_run(engine: SqlEngine) {
+fn second_run_beside_a_live_checkpointed_one(engine: SqlEngine) {
     let (table, _guard) = id_v_table(engine, "oc_live", 300);
     let rig = slowed(
         engine
@@ -697,19 +697,19 @@ fn open_defect_resume_force_runs_over_a_complete_prefix_mssql() {
 #[test]
 #[ignore = "live+gate-only: docker compose postgres; open defect (uncoded run-in-progress refusal), acknowledged in dev/release_oracle/known_red.py"]
 fn open_defect_a_second_run_beside_a_live_checkpointed_run_is_refused_by_code_postgres() {
-    second_run_beside_a_live_checkpointed_run(SqlEngine::Pg);
+    second_run_beside_a_live_checkpointed_one(SqlEngine::Pg);
 }
 
 #[test]
 #[ignore = "live+gate-only: docker compose mysql; open defect (uncoded run-in-progress refusal), acknowledged in dev/release_oracle/known_red.py"]
 fn open_defect_a_second_run_beside_a_live_checkpointed_run_is_refused_by_code_mysql() {
-    second_run_beside_a_live_checkpointed_run(SqlEngine::Mysql);
+    second_run_beside_a_live_checkpointed_one(SqlEngine::Mysql);
 }
 
 #[test]
 #[ignore = "live+gate-only: docker compose mssql; open defect (uncoded run-in-progress refusal), acknowledged in dev/release_oracle/known_red.py"]
 fn open_defect_a_second_run_beside_a_live_checkpointed_run_is_refused_by_code_mssql() {
-    second_run_beside_a_live_checkpointed_run(SqlEngine::Mssql);
+    second_run_beside_a_live_checkpointed_one(SqlEngine::Mssql);
 }
 
 #[test]
