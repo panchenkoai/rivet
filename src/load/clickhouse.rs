@@ -243,34 +243,38 @@ impl ClickhouseLoader {
     /// The count comes from each part, not from `X-ClickHouse-Summary`: that counts rows
     /// materialized views write too and reads 0 under `async_insert`, while a statement that
     /// returns 200 under `wait_end_of_query` inserted all of its rows (ADR-0035 CH6).
-    fn insert_uris(&self, target: &str, uris: &[String], repeat: Repeat) -> Result<u64> {
+    fn insert_uris(
+        &self,
+        target: &str,
+        uris: &[String],
+        rows: &[u64],
+        repeat: Repeat,
+    ) -> Result<u64> {
         uris.iter()
+            .zip(rows)
             .enumerate()
-            .map(|(i, uri)| {
-                let rows = self.insert_one(target, uri, repeat)?;
+            .map(|(i, (uri, rows))| {
+                let rows = self.insert_one(target, uri, *rows, repeat)?;
                 crate::test_hook::maybe_panic_at_chunk("clickhouse_after_part", i as i64);
                 Ok(rows)
             })
             .sum()
     }
 
-    /// Insert one part into `target`; the rows it holds. Pushed or pulled, the part's footer
-    /// is read first, so a timestamp ClickHouse would clamp refuses before any row lands.
-    fn insert_one(&self, target: &str, uri: &str, repeat: Repeat) -> Result<u64> {
+    /// Insert one part of `rows` rows into `target`; a pushed part's own footer is checked again.
+    fn insert_one(&self, target: &str, uri: &str, rows: u64, repeat: Repeat) -> Result<u64> {
         let (bucket, key) = super::split_object_uri(uri)?;
         let pull = self
             .named_collection
             .as_ref()
             .filter(|_| pullable(bucket, key));
-        let (query, body, meta) = match pull {
+        let (query, body) = match pull {
             Some(nc) => (
                 format!(
                     "INSERT INTO {target} SELECT * FROM {}",
                     pull_source(nc, super::scheme_of(uri), bucket, key)
                 ),
                 bytes::Bytes::new(),
-                super::partition_budget::read_footer(self.store()?, key)
-                    .with_context(|| format!("reading the footer of {uri}"))?,
             ),
             None => {
                 let bytes = self
@@ -278,12 +282,11 @@ impl ClickhouseLoader {
                     .read(key)
                     .with_context(|| format!("reading {uri} for the ClickHouse load"))?;
                 let meta = parquet_footer(&bytes).with_context(|| format!("reading {uri}"))?;
+                refuse_unholdable_timestamps(&meta, uri)?;
                 let insert = format!("INSERT INTO {target} FORMAT Parquet");
-                (insert, bytes::Bytes::from(bytes), meta)
+                (insert, bytes::Bytes::from(bytes))
             }
         };
-        refuse_unholdable_timestamps(&meta, uri)?;
-        let rows = footer_rows(&meta)?;
         let params = [
             ("query", query.as_str()),
             ("input_format_null_as_default", "0"),
@@ -362,6 +365,7 @@ impl TargetLoader for ClickhouseLoader {
                 c.escape_default()
             );
         }
+        let part_rows = super::before_write(checked_part_rows(|| self.store(), uris))?;
         let target = self.quoted(table);
         let swap = self.quoted(&format!("{table}__rivet_swap"));
         self.query(&create_table_sql(
@@ -373,7 +377,7 @@ impl TargetLoader for ClickhouseLoader {
             &order_by(&self.cluster_by),
         ))?;
         crate::test_hook::maybe_panic_at("clickhouse_full_after_swap_created");
-        let rows = self.insert_uris(&swap, uris, Repeat::Undelivered)?;
+        let rows = self.insert_uris(&swap, uris, &part_rows, Repeat::Undelivered)?;
         crate::test_hook::maybe_panic_at("clickhouse_full_before_swap_in");
         for (sql, repeat, hook) in swap_in(self.object_kind(table)?, &swap, &target) {
             self.post(&[], bytes::Bytes::from(sql), repeat)?;
@@ -391,6 +395,7 @@ impl TargetLoader for ClickhouseLoader {
         uris: &[String],
         pk: &[String],
     ) -> Result<u64> {
+        let part_rows = super::before_write(checked_part_rows(|| self.store(), uris))?;
         let full = changelog_specs(specs);
         let changes = self.quoted(&format!("{table}__changes"));
         let shape = changelog_shape(self.cdc, table, pk, self.partition_by.as_deref())?;
@@ -410,7 +415,7 @@ impl TargetLoader for ClickhouseLoader {
             self.query(&alter)
                 .with_context(|| format!("adding new columns to `{table}__changes`"))?;
         }
-        self.insert_uris(&changes, uris, changelog_repeat(self.cdc))
+        self.insert_uris(&changes, uris, &part_rows, changelog_repeat(self.cdc))
     }
 
     fn warehouse(&self) -> Warehouse {
@@ -922,6 +927,41 @@ fn object_kind_of(engine: &str) -> ObjectKind {
 }
 
 /// ClickHouse `DateTime64`'s range in Unix seconds: 1900-01-01 00:00:00 to 2299-12-31 23:59:59.
+/// Parts whose footers are read at once before a load.
+const FOOTER_READERS: usize = 8;
+
+/// The row count of every part in `uris`, in order, each footer checked for a timestamp ClickHouse would clamp; the first part that fails is the one reported. The store is opened only when there is a part to read.
+fn checked_part_rows<'s>(
+    store: impl FnOnce() -> Result<&'s GcsStore>,
+    uris: &[String],
+) -> Result<Vec<u64>> {
+    if uris.is_empty() {
+        return Ok(Vec::new());
+    }
+    let store = store()?;
+    let one = |uri: &String| -> Result<u64> {
+        let (_, key) = super::split_object_uri(uri)?;
+        let meta = super::partition_budget::read_footer(store, key)
+            .with_context(|| format!("reading the footer of {uri}"))?;
+        refuse_unholdable_timestamps(&meta, uri)?;
+        footer_rows(&meta)
+    };
+    let mut rows = Vec::with_capacity(uris.len());
+    for wave in uris.chunks(FOOTER_READERS) {
+        let checked: Vec<Result<u64>> = std::thread::scope(|scope| {
+            let readers: Vec<_> = wave.iter().map(|uri| scope.spawn(|| one(uri))).collect();
+            readers
+                .into_iter()
+                .map(|r| r.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
+                .collect()
+        });
+        for r in checked {
+            rows.push(r?);
+        }
+    }
+    Ok(rows)
+}
+
 const DATETIME64_MIN_SECS: i64 = -2_208_988_800;
 const DATETIME64_MAX_SECS: i64 = 10_413_791_999;
 
@@ -1266,6 +1306,65 @@ mod tests {
         assert_eq!(object_kind_of("ReplacingMergeTree"), ObjectKind::Table);
         assert_eq!(object_kind_of("MergeTree"), ObjectKind::Table);
         assert_eq!(object_kind_of("Dictionary"), ObjectKind::Other);
+    }
+
+    /// The pre-write check returns every part's rows in order, reads more parts than one wave holds, and reports the FIRST out-of-range part.
+    #[test]
+    fn the_pre_write_check_counts_every_part_and_names_the_first_one_out_of_range() {
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, secs: &[i64]| {
+            let micros: Vec<i64> = secs.iter().map(|s| s * 1_000_000).collect();
+            let col = arrow::array::TimestampMicrosecondArray::from(micros).with_timezone("UTC");
+            let batch = arrow::record_batch::RecordBatch::try_from_iter([(
+                "ts",
+                Arc::new(col) as arrow::array::ArrayRef,
+            )])
+            .unwrap();
+            let mut buf = Vec::new();
+            let mut w =
+                parquet::arrow::ArrowWriter::try_new(&mut buf, batch.schema(), None).unwrap();
+            w.write(&batch).unwrap();
+            w.close().unwrap();
+            std::fs::write(dir.path().join(name), buf).unwrap();
+            format!("gs://b/{name}")
+        };
+        let store = GcsStore::open_fs(dir.path().to_str().unwrap()).unwrap();
+        let good: Vec<String> = (0..FOOTER_READERS + 3)
+            .map(|i| write(&format!("p{i:02}.parquet"), &vec![0; i + 1]))
+            .collect();
+        assert_eq!(
+            checked_part_rows(|| Ok(&store), &good).unwrap(),
+            (1..=good.len() as u64).collect::<Vec<_>>(),
+            "one count per part, in the order given"
+        );
+        assert_eq!(
+            checked_part_rows(
+                || Err(anyhow::anyhow!("no store is opened for a load of no parts")),
+                &[]
+            )
+            .unwrap(),
+            Vec::<u64>::new()
+        );
+
+        let mut mixed = good.clone();
+        mixed.insert(1, write("late.parquet", &[DATETIME64_MAX_SECS + 1]));
+        mixed.push(write("early.parquet", &[DATETIME64_MIN_SECS - 1]));
+        let err = format!(
+            "{:#}",
+            checked_part_rows(|| Ok(&store), &mixed).unwrap_err()
+        );
+        assert!(
+            err.contains("gs://b/late.parquet")
+                && err.contains("outside ClickHouse DateTime64's range"),
+            "the first bad part in list order is the one named: {err}"
+        );
+        let gone = vec![good[0].clone(), "gs://b/absent.parquet".to_string()];
+        let err = format!("{:#}", checked_part_rows(|| Ok(&store), &gone).unwrap_err());
+        assert!(
+            err.contains("reading the footer of gs://b/absent.parquet"),
+            "{err}"
+        );
     }
 
     #[test]

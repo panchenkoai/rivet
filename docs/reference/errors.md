@@ -40,13 +40,18 @@ Every failure rivet names carries a stable `RIVET_<FAMILY>_<NAME>` code: in `--j
 | `RIVET_SOURCE_CDC_CELL_UNSUPPORTED` | refusal | 5 | leave the column out of the capture (SQL Server: @captured_column_list), then re-baseline the stream: delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, give it `cdc.initial: snapshot`, then re-run |
 | `RIVET_SOURCE_CDC_PREREQUISITE` | environment | 2 if transient, else 1 | apply the setup statement the message names, then re-run (docs/reference/cdc.md) |
 | `RIVET_SOURCE_VALUE_UNREPRESENTABLE` | refusal | 5 | map the value to a representable one in the export's `query:`, or exclude the column |
+| `RIVET_SOURCE_PROBE_UNREADABLE` | refusal | 5 | chunk, page or partition the export on a column of a type the message lists, remove `parallel:` from a keyset export, or use `mode: full` |
 | `RIVET_SOURCE_OVERRIDE_WIRE_MISMATCH` | usage | 1 | remove or correct the column's `columns:` override (batch: or CAST the column to that type in the export's `query:`; CDC: then re-snapshot the table) |
 | `RIVET_STATE_SCHEMA_NEWER` | refusal | 5 | upgrade rivet, or point this binary at a state DB it created |
 | `RIVET_STATE_CURSOR_OWNER_MISMATCH` | refusal | 5 | `rivet state reset -c <config> --export <name>` to start the new cursor with a full pass, or restore the previous cursor column |
+| `RIVET_STATE_CURSOR_STREAM_MISMATCH` | refusal | 5 | give each export that shares this state database its own name; if this export was repointed, `rivet state reset -c <config> --export <name>` starts the new table with a full pass (it discards the progress of every export of that name in the state database) |
 | `RIVET_STATE_KEYSET_SEQUENTIAL_ANCHOR_UNFINISHED` | refusal | 5 | re-run once with `parallel: 1` to finish the interrupted run, then raise `parallel:` |
+| `RIVET_STATE_RUN_IN_PROGRESS` | refusal | 5 | wait for the run to finish, or stop its process, then repeat the command |
+| `RIVET_STATE_CHUNK_CHECKPOINT_GONE` | refusal | 5 | run the export again: it starts a new chunk run (the parts the lost run wrote stay in the destination, in no manifest) |
 | `RIVET_LOAD_VALUE_OUT_OF_TARGET_RANGE` | refusal | 5 | the warehouse type cannot hold this value; declare a wider type (e.g. String) for the column, or fix the source value |
 | `RIVET_LOAD_COUNT_MISMATCH` | integrity | 3 | compare the warehouse table with the run's manifest before re-running; the source is kept |
 | `RIVET_LOAD_ADOPTION_COLUMN_MISMATCH` | refusal | 5 | add the export's new columns to the table (`ALTER TABLE … ADD COLUMN`) and re-run; do not rename it aside |
+| `RIVET_LOAD_TARGET_NOT_RIVETS` | refusal | 5 | the warehouse object exists and this state DB has no record of rivet loading it: drop or rename it, or load into another table |
 | `RIVET_INTERNAL_VALUE_CONVERTER` | internal | 6 | a value changed between the source and the written part — a bug; report it with the column's type |
 | `RIVET_INTERNAL_SPILL` | internal | 6 | the CDC spill log is inconsistent — a bug or a damaged spill directory; report it and re-run |
 | `RIVET_INTERNAL_TYPE_BUILDER` | internal | 6 | a column builder got a type it cannot build — a bug; report it with the column's type |

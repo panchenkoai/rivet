@@ -698,6 +698,8 @@ Reset the cursor for a specific export (next run will re-export all rows).
 rivet state reset --config <PATH> --export <NAME>
 ```
 
+While a checkpointed run of that export (`chunk_checkpoint: true`) is alive in another rivet process, the reset is refused with `RIVET_STATE_RUN_IN_PROGRESS` (exit 5) and removes nothing: wait for the run, or stop its process, and repeat the command. A run that was killed does not hold the reset back.
+
 ### `rivet state files`
 
 List files produced by exports.
@@ -742,6 +744,8 @@ rivet state reset-chunks --config <PATH> --failed
 ```
 
 Then run `rivet run --config <PATH> --resume` (or a normal run without `--resume`) as needed.
+
+A run that is still alive is not stuck. `--export <NAME>` against one is refused with `RIVET_STATE_RUN_IN_PROGRESS` (exit 5), naming the run; `--stuck-checkpoints` leaves that export alone, prints why, and clears the others. A run that was killed does not hold either form back.
 
 ### `rivet state vacuum`
 

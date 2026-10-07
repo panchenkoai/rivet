@@ -18,7 +18,7 @@ import shutil
 import sys
 from pathlib import Path
 
-from .core import ROOT, Ledger, rivet_bin, run
+from .core import ROOT, Ledger, rivet_bin, run, run_lanes, server_of
 from .engines import sql as _sql
 
 SCEN = "upgrade_continuity"
@@ -243,18 +243,28 @@ def cell(led: Ledger, prev: Path, root: Path, engine: str, url: str, family: tup
         shutil.rmtree(d, ignore_errors=True)
 
 
-def matrix_cells(led: Ledger, prev: Path, root: Path, engines: tuple[str, ...] = ENGINES,
-                 targets: tuple[str, ...] = TARGETS) -> None:
-    """Every family of `load_mode_of` x every engine with a gate URL x every warehouse."""
+def matrix_lane_cells(prev: Path, root: Path, engines: tuple[str, ...] = ENGINES,
+                      targets: tuple[str, ...] = TARGETS) -> list[tuple[object, object]]:
+    """Every family of `load_mode_of` x every engine with a gate URL x every warehouse, as `(lane, fn)`: the lane is the source server."""
+    cells: list[tuple[object, object]] = []
     for family in rows():
         for engine in engines:
             uvar = f"RIVET_ORACLE_{engine.upper()}_URL"
             url = os.environ.get(uvar, "")
             for target in targets:
                 if not url:
-                    led.skipped(engine, "-", SCEN, f"load-{target}", f"upgrade[{engine}/{family[0]}]: no {uvar}", "no url")
+                    cells.append((None, lambda led, e=engine, f=family, t=target, v=uvar: led.skipped(
+                        e, "-", SCEN, f"load-{t}", f"upgrade[{e}/{f[0]}]: no {v}", "no url")))
                     continue
-                cell(led, prev, root, engine, url, family, target)
+                cells.append((server_of(url), lambda led, e=engine, u=url, f=family, t=target: cell(
+                    led, prev, root, e, u, f, t)))
+    return cells
+
+
+def matrix_cells(led: Ledger, prev: Path, root: Path, engines: tuple[str, ...] = ENGINES,
+                 targets: tuple[str, ...] = TARGETS) -> None:
+    """The matrix alone: one lane per source server."""
+    run_lanes(led, matrix_lane_cells(prev, root, engines, targets))
 
 
 def _self_test() -> None:

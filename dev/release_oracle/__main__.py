@@ -34,7 +34,8 @@ PHASE ORDER IS LOAD-BEARING, not cosmetic:
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 
 import argparse
 import os
@@ -44,7 +45,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from .core import Ledger, Status, engine_container, verify_no_invariant_violations, docker, have, record_stage_runs, remove_engine_containers, rivet, rivet_bin, run, sqlcmd, target_dir, verify_nextest_grading, HERE, ROOT
+from .core import Ledger, Status, engine_container, verify_no_invariant_violations, docker, have, record_stage_runs, remove_engine_containers, rivet, rivet_bin, run, run_lanes, sqlcmd, target_dir, verify_nextest_grading, HERE, ROOT
 from . import (
     bigquery,
     blessed_flow,
@@ -295,6 +296,140 @@ def _verdict_scope_self_test() -> None:
         ["refused", "independent", "collides"]
     print("self-test ok: partial runs write no verdict line; an oracle outage is NOT GRADED, not a product failure; "
           "rows keep the first error line; blessed-path cells have distinct export names")
+
+
+def _lanes_self_test() -> None:
+    """Lanes overlap, one lane's cells never do, rows flush in list order, a raise keeps every row; the upgrade
+    cells sharing a source server share a lane; grading a load leaves the process environment alone."""
+    import threading
+
+    both, busy, overlap = threading.Barrier(2, timeout=10), {"a": 0, "b": 0}, []
+
+    def cell(lane: str, n: int, meet: bool = False):
+        def run_cell(sub: Ledger) -> None:
+            busy[lane] += 1
+            overlap.append(busy[lane])
+            if meet:
+                both.wait()  # raises unless the other lane is inside its cell at the same time
+            time.sleep(0.02)
+            busy[lane] -= 1
+            sub.passed("-", "-", "lanes", lane, f"{lane}{n}")
+        return run_cell
+
+    led = Ledger(colour=False)
+    led._buf = []
+    run_lanes(led, [("a", cell("a", 1, True)), ("b", cell("b", 1, True)), ("a", cell("a", 2)), ("b", cell("b", 2)),
+                    ("a", cell("a", 3))])
+    assert [c.detail for c in led.cells] == ["a1", "b1", "a2", "b2", "a3"], led.cells
+    assert set(overlap) == {1}, f"two cells of one lane ran at once: {overlap}"
+
+    def boom(sub: Ledger) -> None:
+        raise RuntimeError("cell blew up")
+
+    led = Ledger(colour=False)
+    led._buf = []
+    try:
+        run_lanes(led, [("a", cell("a", 1)), ("b", boom), ("a", cell("a", 2))])
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("a raising cell must reach the stage, which records it")
+    assert [c.detail for c in led.cells] == ["a1", "a2"], "rows recorded beside a raising cell were dropped"
+
+    # The gate's own URLs (Makefile GATE_ENV): nine servers; Oracle's batch, resume-load and CDC cells share one.
+    from . import upgrade, upgrade_matrix
+    urls = {"RIVET_ORACLE_POSTGRES_URL": "postgresql://rivet:rivet@127.0.0.1:5432/rivet",
+            "RIVET_ORACLE_MYSQL_URL": "mysql://rivet:rivet@127.0.0.1:3306/rivet",
+            "RIVET_ORACLE_MSSQL_URL": "mssql://sa:Rivet_Passw0rd!@127.0.0.1:1433/rivet",
+            "RIVET_ORACLE_MONGO_URL": "mongodb://127.0.0.1:27017/rivet",
+            "RIVET_ORACLE_ORACLE_URL": "oracle://rivet:rivet@localhost:1521/FREEPDB1",
+            "RIVET_UPG_ORACLE_CDC_URL": "oracle://c%23%23rivetcdc:rivet@127.0.0.1:1521/FREEPDB1",
+            "RIVET_CDC_POSTGRES_URL": "postgresql://rivet:rivet@127.0.0.1:5434/rivet",
+            "RIVET_CDC_MYSQL_URL": "mysql://rivet:rivet@127.0.0.1:3307/rivet",
+            "RIVET_CDC_MSSQL_URL": "mssql://sa:Rivet_Passw0rd!@127.0.0.1:1434/rivet",
+            "RIVET_CDC_MONGO_URL": "mongodb://127.0.0.1:27018/rivet?directConnection=true",
+            "BQ_ORACLE_PROJECT": "p", "BQ_ORACLE_BUCKET": "b"}
+    saved = {k: os.environ.get(k) for k in urls}
+    os.environ.update(urls)
+    try:
+        cells = upgrade.warehouse_lane_cells(Path("prev"), Path("root"))
+    finally:
+        for k, v in saved.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+    lanes: dict[object, int] = {}
+    for lane, _ in cells:
+        lanes[lane] = lanes.get(lane, 0) + 1
+    ports = {str(k).rsplit(":", 1)[-1] for k in lanes if k is not None}
+    assert ports == {"5432", "3306", "1433", "27017", "1521", "5434", "3307", "1434", "27018"} and None not in lanes, lanes
+    fam = len(upgrade_matrix.rows()) * len(upgrade_matrix.TARGETS)
+    assert lanes["127.0.0.1:1521"] == fam + 1 + 3, f"Oracle's matrix, resume-load and cdc-load cells are not one lane: {lanes}"
+    assert lanes["127.0.0.1:3307"] == 3 and lanes["127.0.0.1:5432"] == fam + 1, lanes
+
+    # grade_load hands its BigQuery target to the session; the environment every other lane reads stays as it was.
+    import types
+
+    from . import rig_oracle
+    seen: dict = {}
+
+    class _Stop(Exception):
+        pass
+
+    def _oracle(**kw):
+        seen.update(kw)
+        raise _Stop
+
+    fake = types.ModuleType(f"{__package__}.duck")
+    fake.Oracle = _oracle
+    real, before = sys.modules.get(fake.__name__), dict(os.environ)
+    sys.modules[fake.__name__] = fake
+    try:
+        rig_oracle.grade_load({"engine": "postgres", "mode": "batch", "state": "", "url": "postgresql://x/y",
+                               "load": {"target": "bigquery", "project": "proj-of-the-cell", "dataset": "ds_of_the_cell"}})
+    except _Stop:
+        pass
+    finally:
+        sys.modules.pop(fake.__name__, None)
+        if real is not None:
+            sys.modules[fake.__name__] = real
+    assert dict(os.environ) == before, "grade_load wrote the process environment: cells in other lanes read it"
+    assert (seen.get("bq_project"), seen.get("bq_dataset")) == ("proj-of-the-cell", "ds_of_the_cell"), seen
+    print(f"self-test ok: {len(cells)} upgrade cells in {len(lanes)} lanes, one per source server; lanes overlap, "
+          "a lane is serial, rows flush in ledger order; grade_load leaves the environment alone")
+
+
+def _stage_table_self_test() -> None:
+    """A measuring stage shares its wave with nothing; holders and users of one resource never overlap; the table keeps its order and every stage."""
+    def st(name: str, needs: set[str], uses: set[str] = frozenset()) -> Stage:
+        return Stage(name, lambda led: None, frozenset(needs), frozenset(uses))
+
+    cut = [[s.name for s in w] for w in waves([
+        st("a", {"x"}), st("b", {"y"}), st("c", {"x"}), st("m", {ALONE}), st("d", {"z"}), st("u1", {"p"}, {"x"}),
+        st("u2", {"q"}, {"x"}), st("h", {"x"}), st("u3", {"r"}, {"x"})])]
+    assert cut == [["a", "b"], ["c"], ["m"], ["d", "u1", "u2"], ["h"], ["u3"]], cut
+    order: list[str] = []
+    probe = Ledger(colour=False)
+    probe._buf = []
+    run_stages(probe, [Stage(n, lambda led, n=n: (order.append(n), led.passed("-", "-", n, "-", n))[1], frozenset({ALONE}))
+                       for n in ("one", "two")])
+    assert order == ["one", "two"] and [c.scenario for c in probe.cells] == ["one", "two"], (order, probe.cells)
+    for argv in ([], ["--no-cloud"], ["--no-clean"]):
+        ns = parse_args(argv)
+        table = build_stages(ns, {}) + gate_stages(ns)
+        cut = waves(table)
+        assert [s for w in cut for s in w] == table, "the waves must hold every stage once, in table order"
+        measuring = {"release regression", "perf regression", "source harm regression", "previous-release differential",
+                     "field symptom replay", "scale memory"}
+        assert measuring <= {s.name for s in table}, measuring - {s.name for s in table}
+        shared = [[s.name for s in w] for w in cut if len(w) > 1 and measuring & {s.name for s in w}]
+        assert not shared, f"a stage that measures against the previous release shares its wave: {shared}"
+        assert table[-1].name == "live modules" and [s.name for s in cut[-1]] == ["live modules"], \
+            "live modules runs last and alone: it runs what no stage before it ran"
+        first = next(s for s in table if s.name == "release build path")
+        assert not [s for s in table[:table.index(first)] if CARGO in s.needs | s.uses and s.name != "clean tree"], \
+            "the release build path reads the committed lock before any other cargo stage"
+    overlapping = [" + ".join(s.name for s in w) for w in waves(build_stages(parse_args([]), {}) + gate_stages(parse_args([])))
+                   if len(w) > 1]
+    print(f"self-test ok: the stage table keeps every stage in order, measurement stages run alone; overlapping: {overlapping}")
 
 
 def _stages_self_test() -> None:
@@ -631,13 +766,22 @@ def _self_test() -> int:
 
     with _tf.TemporaryDirectory() as d:
         hist = Path(d) / "t.jsonl"
-        record_timings(hist, [("A", 60.0), ("B", 120.0)], [("s", 30.0)], "RELEASE-READY", 3, 0)
+        first = record_timings(hist, [("A", 60.0), ("B", 120.0)], [("s", 30.0)], "RELEASE-READY", 3, 0,
+                               {"A — detail": (1.26, 30.04)})
+        assert first["phases_load1"] == {"A": [1.3, 30.0]} and first["cores"], first
+        timed = Ledger(colour=False)
+        timed._buf = []
+        timed.phase("one")
+        timed.phase("two")
+        lo, hi = timed._phase_load["one"]
+        assert lo > 0 and hi > 0, "a phase must record the load average it opened and closed under"
         second = record_timings(hist, [("A", 180.0), ("B", 120.0)], [], "NOT RELEASABLE", 2, 1)
         lines = hist.read_text().splitlines()
         assert len(lines) == 2, lines
         assert _json.loads(lines[0])["total_min"] == 3.0 and second["total_min"] == 5.0, lines
         assert second["phases_min"] == {"A": 3.0, "B": 2.0} and second["failed"] == 1, second
-    print("self-test ok: gate timings append one history line per run")
+    print("self-test ok: gate timings append one history line per run, with each phase's load average")
+    _stage_table_self_test()
     from . import sentinels
 
     sentinels._self_test()
@@ -650,6 +794,7 @@ def _self_test() -> int:
     from . import upgrade_matrix
 
     upgrade_matrix._self_test()
+    _lanes_self_test()
     skip_census._self_test()
     print("\nregression stage (child harness, stand, banner):")
     return regression._self_test()
@@ -820,105 +965,131 @@ def clean_tree_and_build(led: Ledger, *, fast: bool = False) -> bool:
     return True
 
 
-def preflight(led: Ledger, *, bless_gifs: bool = False) -> None:
-    """Everything that is source-agnostic, in the order the comments above give."""
-    release_path.verify_release_build_path(led)
-    scenarios.verify_state_migrations(led)
-    # The four infra rows the 2026-08-29 harness round wired: each drives
-    # RED-proven live tests through the release binary, probing its own
-    # infrastructure first (skip loudly, never a vacuous pass).
-    scenarios.verify_network_faults(led)
-    scenarios.verify_tls_required(led)
-    tls_downgrade.verify_tls_downgrade_refused(led)
-    scenarios.verify_auth(led)
-    scenarios.verify_cdc_standby(led)
-    scenarios.verify_live_only_coverage(led)
-    scenarios.verify_coverage_matrices(led)
-    # Cheap and container-free: the flag surface is read from `rivet --help`,
-    # so it belongs with the file-level guards rather than after twenty
-    # minutes of bring-up.
-    blessed_flow.verify_flag_surface(led)
-    blessed_flow.verify_run_strict(led)
-    # The instructional GIFs are documentation that can go stale silently — they
-    # are binary assets, so no test reads them and no diff flags them. Placed
-    # among the cheap file-level guards, before anything spends twenty minutes on
-    # containers: a GIF showing a command this binary rejects is worth knowing
-    # early, and it is not fixable by re-rendering (the tape has to change).
-    gifs.verify_gif_currency(led, bless=bless_gifs)
-    scenarios.verify_replica_read(led)
-    scenarios.verify_pool_e2e(led)
-    scenarios.verify_pool_split(led)
-    # Faults that RETURN an error (every hook above panics): the failed-run tail and exact retries.
-    failure.verify_failed_run_tail(led)
-    failure.verify_transient_retry_exact(led)
-    scenarios.verify_batch_resume(led)
-    scenarios.verify_partition_footer(led)
-    scenarios.verify_audit_suspects(led)
-    scenarios.verify_cdc_harm(led)
-    scenarios.verify_session_state(led)
-    cdc.verify_cdc_e2e(led)
-    cdc.verify_cdc_differential(led)
-    regression.verify_release_regression(led)
-    upgrade.verify_upgrade_continuity(led)
-    perf.verify_perf_regression(led)
-    regression.verify_harm_regression(led)
-    # The two prev-release harnesses, next to the stage that shares their
-    # baseline (`RIVET_PREV_RELEASE_BIN`) — and, like it, they FAIL rather than
-    # SKIP when that baseline is absent (see `regression`'s module docstring):
-    # a release is graded against the version users are running, or it is not
-    # graded at all.
-    #   * the DIFFERENTIAL asks whether anything a user can observe changed
-    #     (exit code, DuckDB readback, files, manifest incl. per-part
-    #     fingerprints) across every runner shape — the question the fix rounds
-    #     cannot ask about themselves;
-    #   * the SYMPTOM REPLAY re-measures the field regression's own numbers on a
-    #     workload shaped like the run that found it.
-    regression.verify_previous_release_differential(led)
-    regression.verify_field_symptom_replay(led)
-    regression.verify_scale_memory(led)
-    # Several writers into ONE prefix and ONE state backend. Placed in the
-    # source-agnostic preflight because the property is the WRITERS' — a shared
-    # deployment's exports do not take turns — not any engine's; one source
-    # exercises it. Local first, then the same race over a flat object-store
-    # namespace, where there is no rename to fall back on.
-    # The two state backends are separate implementations of one contract, with
-    # hand-written SQL on both sides. `golden/cdc_state_snapshot.json` checks that
-    # each POPULATES the expected tables; this checks that they AGREE about the
-    # same run — the gap that let shape tracking be absent on Postgres entirely
-    # while every run reported success.
-    state_parity.verify_state_backend_parity(
-        led,
+#: Held by a stage that MEASURES (timings, RSS, server counters against the previous release): nothing else runs beside it.
+ALONE = "the whole machine"
+#: The long-lived stand's source servers, driven by ONE runner at a time: a nextest run's test groups and the
+#: upgrade lanes each serialise their own flock users and server-global settings, and neither sees the other's.
+STAND = "the stand's source servers"
+#: The test-profile build directory and the cores a compile takes.
+CARGO = "cargo"
+SERIAL = frozenset({STAND, CARGO})
+
+
+@dataclass(frozen=True)
+class Stage:
+    """One gate stage: what it runs, what it holds exclusively (`needs`) and what it shares with other users (`uses`)."""
+
+    name: str
+    run: Callable[[Ledger], None]
+    needs: frozenset[str]
+    uses: frozenset[str] = frozenset()
+
+    def conflicts(self, other: "Stage") -> bool:
+        """Whether the two may not overlap: one measures, or one holds what the other holds or uses."""
+        return bool(ALONE in self.needs | other.needs or self.needs & (other.needs | other.uses) or other.needs & self.uses)
+
+
+def waves(stages: Sequence[Stage]) -> list[list[Stage]]:
+    """The table cut into consecutive runs of stages that conflict with none of their wave: order is kept, a wave overlaps."""
+    out: list[list[Stage]] = []
+    for st in stages:
+        if out and not any(st.conflicts(o) for o in out[-1]):
+            out[-1].append(st)
+        else:
+            out.append([st])
+    return out
+
+
+def run_stages(led: Ledger, stages: Sequence[Stage]) -> None:
+    """Run the table: a wave of one prints live, a wave of several runs side by side and prints in table order."""
+    for wave in waves(stages):
+        if len(wave) == 1:
+            wave[0].run(led)
+        else:
+            run_concurrently(led, " + ".join(st.name for st in wave), [(st.name, st.run) for st in wave])
+
+
+def build_stages(ns: argparse.Namespace, built: dict) -> list[Stage]:
+    """The clean build and what only waits beside it."""
+    build = [Stage("clean tree", lambda led: built.update(ok=clean_tree_and_build(led, fast=ns.fast_clean)),
+                   frozenset({CARGO}))] if not ns.no_clean else []
+    return [*build, Stage("object stores", start_stores, frozenset({"the object-store fakes"}))]
+
+
+def gate_stages(ns: argparse.Namespace) -> list[Stage]:
+    """Every stage after the build, in ledger order, with what it holds. Stages are resolved at call time (they are wrapped after import)."""
+    state = dict(
         state_url=os.environ.get("RIVET_CDC_STATE_URL") or os.environ.get("RIVET_CONC_STATE_URL"),
         state_container=os.environ.get("RIVET_SWEEP_STATE_CONTAINER", "rivet-postgres-state-1"),
         src_container=os.environ.get("RIVET_CONC_SRC_CONTAINER", "rivet-postgres-1"),
-        src_url=os.environ.get(
-            "RIVET_CONC_SRC_URL", "postgresql://rivet:rivet@localhost:5432/rivet"
-        ),
+        src_url=os.environ.get("RIVET_CONC_SRC_URL", "postgresql://rivet:rivet@localhost:5432/rivet"),
     )
-    # The BigQuery-bound stages wait on warehouse jobs, not on each other: run together.
-    # Shared state: four SAME-NAMED configs on one Postgres state, blessed and crashed.
-    # Warehouse layout: base + buffer + `compact`, loads batched under the partition cap.
-    # Init delta: the same cycle on configs `rivet init` wrote. Partner shape: init
-    # --mode cdc over three tables through two loads.
-    run_concurrently(led, "BigQuery stages — shared state, warehouse layout, init delta, partner shape", [
-        ("shared state", lambda sub: shared_state.verify_shared_state_same_name(sub)),
-        ("warehouse layout", lambda sub: warehouse_layout.verify_warehouse_layout(sub)),
-        ("init delta", lambda sub: init_delta.verify_init_delta(sub)),
-        ("partner shape", lambda sub: partner_shape.verify_partner_shape(sub)),
-    ])
-    # Sequential: its CDC cells share the cross-process engine locks init delta holds.
-    clickhouse_load.verify_clickhouse_load(led)
-    cdc_schema_drift.verify_cdc_schema_drift(led)
-    concurrency.verify_concurrent_writers_share_a_prefix(
-        led,
-        state_url=os.environ.get("RIVET_CDC_STATE_URL") or os.environ.get("RIVET_CONC_STATE_URL"),
-        state_container=os.environ.get("RIVET_SWEEP_STATE_CONTAINER", "rivet-postgres-state-1"),
-        src_container=os.environ.get("RIVET_CONC_SRC_CONTAINER", "rivet-postgres-1"),
-        src_url=os.environ.get(
-            "RIVET_CONC_SRC_URL", "postgresql://rivet:rivet@localhost:5432/rivet"
-        ),
-        bucket=os.environ.get("BQ_ORACLE_BUCKET", ""),
-    )
+
+    def serial(name: str, run: Callable[[Ledger], None]) -> Stage:
+        return Stage(name, run, SERIAL)
+
+    def measured(name: str, run: Callable[[Ledger], None]) -> Stage:
+        return Stage(name, run, frozenset({ALONE}))
+
+    def warehouse(name: str, run: Callable[[Ledger], None]) -> Stage:
+        # Four nextest runs side by side since 2026-09: each waits on its own BigQuery dataset.
+        return Stage(name, run, frozenset({f"the BigQuery dataset of {name}"}), SERIAL)
+
+    table = [
+        # FIRST: it reads the committed lock, which any later cargo command reconciles.
+        Stage("release build path", lambda led: release_path.verify_release_build_path(led), frozenset({CARGO})),
+        serial("state migrations", lambda led: scenarios.verify_state_migrations(led)),
+        serial("network faults", lambda led: scenarios.verify_network_faults(led)),
+        serial("tls required", lambda led: scenarios.verify_tls_required(led)),
+        serial("tls downgrade", lambda led: tls_downgrade.verify_tls_downgrade_refused(led)),
+        serial("auth", lambda led: scenarios.verify_auth(led)),
+        serial("cdc standby", lambda led: scenarios.verify_cdc_standby(led)),
+        serial("coverage matrices", lambda led: scenarios.verify_coverage_matrices(led)),
+        serial("flag surface", lambda led: blessed_flow.verify_flag_surface(led)),
+        serial("run strict", lambda led: blessed_flow.verify_run_strict(led)),
+        serial("gif currency", lambda led: gifs.verify_gif_currency(led, bless=ns.bless_gifs)),
+        serial("replica read", lambda led: scenarios.verify_replica_read(led)),
+        serial("pool e2e", lambda led: scenarios.verify_pool_e2e(led)),
+        serial("pool split", lambda led: scenarios.verify_pool_split(led)),
+        serial("failed-run tail", lambda led: failure.verify_failed_run_tail(led)),
+        serial("transient retry", lambda led: failure.verify_transient_retry_exact(led)),
+        serial("batch resume", lambda led: scenarios.verify_batch_resume(led)),
+        serial("partition footer", lambda led: scenarios.verify_partition_footer(led)),
+        serial("audit suspects", lambda led: scenarios.verify_audit_suspects(led)),
+        serial("cdc harm", lambda led: scenarios.verify_cdc_harm(led)),
+        serial("session state", lambda led: scenarios.verify_session_state(led)),
+        serial("cdc e2e", lambda led: cdc.verify_cdc_e2e(led)),
+        serial("cdc differential", lambda led: cdc.verify_cdc_differential(led)),
+        measured("release regression", lambda led: regression.verify_release_regression(led)),
+        # The offline battery under llvm-cov compiles and reads no server; the upgrade cells wait on servers and BigQuery.
+        Stage("live-only coverage", lambda led: scenarios.verify_live_only_coverage(led), frozenset({CARGO})),
+        Stage("upgrade continuity", lambda led: upgrade.verify_upgrade_continuity(led), frozenset({STAND})),
+        measured("perf regression", lambda led: perf.verify_perf_regression(led)),
+        measured("source harm regression", lambda led: regression.verify_harm_regression(led)),
+        measured("previous-release differential", lambda led: regression.verify_previous_release_differential(led)),
+        measured("field symptom replay", lambda led: regression.verify_field_symptom_replay(led)),
+        measured("scale memory", lambda led: regression.verify_scale_memory(led)),
+        serial("state backend parity", lambda led: state_parity.verify_state_backend_parity(led, **state)),
+        warehouse("shared state", lambda led: shared_state.verify_shared_state_same_name(led)),
+        warehouse("warehouse layout", lambda led: warehouse_layout.verify_warehouse_layout(led)),
+        warehouse("init delta", lambda led: init_delta.verify_init_delta(led)),
+        warehouse("partner shape", lambda led: partner_shape.verify_partner_shape(led)),
+        # Alone on the stand: its CDC cells would queue on the engine locks init delta holds.
+        serial("clickhouse load", lambda led: clickhouse_load.verify_clickhouse_load(led)),
+        serial("cdc schema drift", lambda led: cdc_schema_drift.verify_cdc_schema_drift(led)),
+        serial("concurrent writers", lambda led: concurrency.verify_concurrent_writers_share_a_prefix(
+            led, **state, bucket=os.environ.get("BQ_ORACLE_BUCKET", ""))),
+        # Its own containers and ports; its CDC cells read the stand's CDC servers (blessed_flow).
+        Stage("engine matrix", lambda led: engine_loop(led, ns), frozenset({"the gate's engine containers"}), SERIAL),
+    ]
+    if not ns.no_cloud:
+        # Its own `bq`-tagged containers; handed this module's bring_up/seed_engine so readiness has one definition.
+        table.append(Stage("bigquery golden", lambda led: bigquery.run_bigquery_golden(
+            led, keep=ns.keep, parallel=ns.engine_parallel, bring_up=bring_up, seed_engine=seed_engine),
+            frozenset({"the BigQuery golden's containers"})))
+    # Last: it runs every live_suite test no stage above already ran.
+    table.append(serial("live modules", lambda led: live_modules.verify_live_modules(led)))
+    return table
 
 
 def _usable_port(port: int) -> int:
@@ -1236,18 +1407,9 @@ def _run_one_engine(led: Ledger, ns: argparse.Namespace, engine: str) -> None:
         f"{engine}: {len(version_lines)} versions, up to {workers} concurrent "
         f"(--version-parallel {cap})"
     )
-    subs = [led.buffered_child() for _ in version_lines]
-    from concurrent.futures import ThreadPoolExecutor
-
-    def _one(pair: tuple[Ledger, str]) -> None:
-        sub, line = pair
-        with sub.span(f"{engine} {line.split()[0]}: version-total"):
-            _run_one_version(sub, ns, engine, line)
-
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        list(ex.map(_one, zip(subs, version_lines)))
-    for sub in subs:
-        sub.flush_into(led)
+    run_lanes(led, [(line, _timed(f"{engine} {line.split()[0]}: version-total",
+                                  lambda sub, line=line: _run_one_version(sub, ns, engine, line)))
+                    for line in version_lines], workers=workers)
 
 
 def _run_one_version(led: Ledger, ns: argparse.Namespace, engine: str, line: str) -> None:
@@ -1284,22 +1446,18 @@ def _run_one_version(led: Ledger, ns: argparse.Namespace, engine: str, line: str
         docker("rm", "-fv", engine_container(engine, tag))
 
 
+def _timed(span: str, fn: Callable[[Ledger], None]) -> Callable[[Ledger], None]:
+    """`fn` with its wall-clock recorded as `span` on the ledger it runs into."""
+    def run_timed(sub: Ledger) -> None:
+        with sub.span(span):
+            fn(sub)
+    return run_timed
+
+
 def run_concurrently(led: Ledger, title: str, stages: list[tuple[str, Callable[[Ledger], None]]]) -> None:
     """Run independent gate stages at once, each into a buffered sub-ledger flushed in list order."""
-    from concurrent.futures import ThreadPoolExecutor
-
     led.phase(title)
-    subs = [led.buffered_child() for _ in stages]
-
-    def _one(i: int) -> None:
-        name, fn = stages[i]
-        with subs[i].span(f"{name}: stage-total"):
-            fn(subs[i])
-
-    with ThreadPoolExecutor(max_workers=len(stages)) as ex:
-        list(ex.map(_one, range(len(stages))))
-    for sub in subs:
-        sub.flush_into(led)
+    run_lanes(led, [(name, _timed(f"{name}: stage-total", fn)) for name, fn in stages])
 
 
 def engine_loop(led: Ledger, ns: argparse.Namespace) -> None:
@@ -1323,19 +1481,8 @@ def engine_loop(led: Ledger, ns: argparse.Namespace) -> None:
         f"Engine matrix — {len(engines)} engines, up to {workers} concurrent "
         f"(wall ≈ slowest engine; scenarios race on the shared state backend)"
     )
-    subs = {e: led.buffered_child() for e in engines}
-    from concurrent.futures import ThreadPoolExecutor
-
-    def _run(e: str) -> None:
-        # The per-engine total wall-clock — the "which engine is the long pole"
-        # number the opaque matrix phase can't give under parallelism.
-        with subs[e].span(f"{e}: engine-total"):
-            _run_one_engine(subs[e], ns, e)
-
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        list(ex.map(_run, engines))
-    for engine in engines:  # deterministic order, not completion order
-        subs[engine].flush_into(led)
+    run_lanes(led, [(e, _timed(f"{e}: engine-total", lambda sub, e=e: _run_one_engine(sub, ns, e)))
+                    for e in engines], workers=workers)
 
 
 def _hold_gate_lock():
@@ -1481,26 +1628,13 @@ def main(argv: list[str] | None = None) -> int:
         for line in banner:
             print(line)
 
-        if not ns.no_clean and not clean_tree_and_build(led, fast=ns.fast_clean):
+        built: dict = {}
+        run_stages(led, build_stages(ns, built))
+        if not ns.no_clean and not built.get("ok"):
             return 1
         version = rivet("--version").stdout.splitlines()
         print(f"  rivet: {rivet_bin()} ({version[0] if version else 'unknown'})")
-        start_stores(led)
-        preflight(led, bless_gifs=ns.bless_gifs)
-        if ns.no_cloud:
-            engine_loop(led, ns)
-        else:
-            # The BigQuery golden brings up its own `bq`-tagged containers on their own
-            # ports, so it runs beside the matrix instead of after it. It is handed THIS
-            # module's bring_up/seed_engine so the readiness hardening has one definition.
-            run_concurrently(led, "Engine matrix + BigQuery golden", [
-                ("engine matrix", lambda sub: engine_loop(sub, ns)),
-                ("bigquery golden", lambda sub: bigquery.run_bigquery_golden(
-                    sub, keep=ns.keep, parallel=ns.engine_parallel,
-                    bring_up=bring_up, seed_engine=seed_engine)),
-            ])
-        # Last: it runs every live_suite test no cell above already ran.
-        live_modules.verify_live_modules(led)
+        run_stages(led, gate_stages(ns))
         skip_census.verify_oracle_verdict_census(led)
         verify_seeded_recall(led, ns.with_seeded_recall)
         verify_no_invariant_violations(led)

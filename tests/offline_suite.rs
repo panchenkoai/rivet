@@ -73,6 +73,8 @@ mod format_fuzz;
 mod harness_env_hygiene_guard;
 #[path = "offline/harness_metrics_guard.rs"]
 mod harness_metrics_guard;
+#[path = "offline/keyword_value_credentials.rs"]
+mod keyword_value_credentials;
 #[path = "offline/mssql_column_data_fixture_guard.rs"]
 mod mssql_column_data_fixture_guard;
 #[path = "offline/mutation_gate_config.rs"]

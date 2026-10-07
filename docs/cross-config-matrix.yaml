@@ -100,3 +100,28 @@ scenarios:
     mssql:    { test: pg_and_mssql_full_exports_agree_on_row_count_and_id_set }
     mongo:    { na: "Mongo's JSON-blob model has no row-for-row SQL parity to compare against" }
     oracle:   { gap: "the Oracle seed is ported table-for-table from MySQL, but no Oracle-vs-MySQL parity test exists" }
+
+  # ── entry points ──────────────────────────────────────────────────────────
+  - id: partition_by_every_entry_point
+    what: "`rivet apply <config>` (waves, `--pool`, `--parallel-export-processes`) delivers the per-partition tree `rivet run` delivers — every in-process entry point takes its exports from pipeline::run_set::RunSet; before, apply wrote the whole table under a directory literally named `{partition}`, exit 0"
+    postgres: { test: apply_config_partitions_like_run_postgres }
+    mysql:    { test: apply_forms_partition_like_run_mysql }
+    mssql:    { test: apply_forms_partition_like_run_mssql }
+    mongo:    { na: "partition_by is refused for a MongoDB source at config load (the bucket probes are SQL)" }
+    oracle:   { test: apply_forms_partition_like_run_oracle }
+
+  - id: sealed_plan_of_partition_by_refused
+    what: "`rivet apply <plan.json>` of a `partition_by` export is refused before any write, naming `rivet apply <config.yaml>` as the remedy, and the remedy delivers the tree; the refusal is in the shared executor, which reads the plan and no engine"
+    postgres: { test: a_sealed_plan_of_a_partitioned_export_is_refused_and_its_remedy_works_postgres }
+    mysql:    { test: a_plan_with_an_unexpanded_partition_token_is_refused_before_any_write }
+    mssql:    { test: a_plan_with_an_unexpanded_partition_token_is_refused_before_any_write }
+    mongo:    { na: "partition_by is refused for a MongoDB source at config load (the bucket probes are SQL)" }
+    oracle:   { test: a_plan_with_an_unexpanded_partition_token_is_refused_before_any_write }
+
+  - id: stdout_under_child_processes
+    what: "`destination: stdout` with `--parallel-export-processes` delivers what the serial run delivers (CSV: its bytes; Parquet: its rows), each run graded against the source from the stdout the rig captured: the run set keeps a stdout export in-process, because a child's stdout is its event channel; before, the parent dropped every data byte, exit 0"
+    postgres: { test: stdout_survives_child_processes_postgres }
+    mysql:    { test: stdout_survives_child_processes_mysql }
+    mssql:    { test: stdout_survives_child_processes_mssql }
+    mongo:    { test: stdout_survives_child_processes_mongo }
+    oracle:   { test: stdout_survives_child_processes_oracle }

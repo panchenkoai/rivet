@@ -339,11 +339,7 @@ impl TargetLoader for BigQueryLoader {
     }
 
     fn object_kind(&self, table: &str) -> Result<super::ObjectKind> {
-        let sql = build_object_kind_sql(&self.project, &self.dataset, table);
-        super::ObjectKind::from_probe(
-            self.api()?
-                .run_query_scalar(&sql, &self.labels("load", table))?,
-        )
+        self.api()?.object_kind(&self.dataset, table)
     }
 
     fn column_overlap(&self, table: &str, names: &[&str]) -> Result<(u64, u64)> {

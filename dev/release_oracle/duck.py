@@ -84,6 +84,7 @@ class Oracle:
         *,
         bigquery: bool = False,
         bq_dataset: str | None = None,
+        bq_project: str | None = None,
         mysql: str | None = None,
         postgres: str | None = None,
         mssql: str | None = None,
@@ -113,15 +114,16 @@ class Oracle:
             self.db.sql(f"ATTACH '{mysql}' AS my (TYPE mysql, READ_ONLY)")
         if postgres:
             self.db.sql("INSTALL postgres; LOAD postgres;")
-            self.db.sql(f"ATTACH '{postgres}' AS pg (TYPE postgres, READ_ONLY)")
+            quoted = postgres.replace("'", "''")
+            self.db.sql(f"ATTACH '{quoted}' AS pg (TYPE postgres, READ_ONLY)")
         if state:
             # rivet's state DB: a Postgres URL, else a SQLite file path.
             kind = "postgres" if state.startswith("postgres") else "sqlite"
             self.db.sql(f"INSTALL {kind}; LOAD {kind};")
             self.db.sql(f"ATTACH '{state}' AS st (TYPE {kind}, READ_ONLY)")
         if bigquery:
-            target = bq_target()
-            if target is None:
+            target = (bq_project, bq_dataset or "") if bq_project is not None else bq_target()
+            if target is None or not target[0]:
                 raise RuntimeError(
                     f"BigQuery oracle needs {BQ_PROJECT_ENV} and {BQ_DATASET_ENV} — "
                     "call `bq_target()` first and SKIP the cell when it returns None, "

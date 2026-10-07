@@ -17,6 +17,7 @@ use super::runner::RIVET_BIN;
 /// every backend (two renderers per backend is the drift the rig exists to
 /// prevent).
 mod invoke;
+pub use invoke::Spawned;
 mod materialize;
 mod oracle;
 mod render;
@@ -282,6 +283,12 @@ impl Rig {
         self
     }
 
+    /// Point the same export (name, config dir and state DB kept) at another table or collection.
+    pub fn repoint(mut self, table: &str) -> Self {
+        self.tables = vec![table.to_string()];
+        self
+    }
+
     /// Query-based export (replaces the `table:` shortcut in the render).
     pub fn query(mut self, sql: &str) -> Self {
         self.query = Some(sql.to_string());
@@ -367,7 +374,7 @@ impl Rig {
 
     /// The fake-gcs sibling of [`Rig::dest_s3`]: anonymous access against the
     /// emulator endpoint, same per-export prefix layout.
-    /// Write to `destination: { type: stdout }` — no directory is created.
+    /// The rig's own export writes to `destination: { type: stdout }`; a second export keeps its local directory, since one stdout carries one export's bytes.
     pub fn dest_stdout(mut self) -> Self {
         self.dest_stdout = true;
         self.dest_precreate = false;

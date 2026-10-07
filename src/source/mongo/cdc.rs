@@ -1257,3 +1257,33 @@ mod tests {
         assert!(!past_time_bound(true, None, t(100)));
     }
 }
+
+#[cfg(test)]
+mod refusal_text_tests {
+    use super::*;
+    use crate::source::cdc::checkpoint_identity::RECOVER;
+
+    /// A removed capture names what was removed and how, says why skipping is wrong, and ends in the recovery steps.
+    #[test]
+    fn a_removed_capture_names_what_was_removed_the_harm_and_the_recovery() {
+        let said = dropped_capture_message(&OperationType::Drop, "shop", Some("orders"));
+        assert!(
+            said.starts_with(
+                "mongodb cdc: captured collection `shop.orders` was removed by `Drop`"
+            ),
+            "{said}"
+        );
+        assert!(
+            said.contains("leave every document it held live in the destination"),
+            "{said}"
+        );
+        assert!(said.ends_with(RECOVER), "{said}");
+        let whole = dropped_capture_message(&OperationType::DropDatabase, "shop", None);
+        assert!(
+            whole
+                .starts_with("mongodb cdc: captured database `shop` was removed by `DropDatabase`"),
+            "{whole}"
+        );
+        assert!(whole.ends_with(RECOVER), "{whole}");
+    }
+}

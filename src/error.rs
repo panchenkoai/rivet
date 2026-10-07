@@ -242,6 +242,7 @@ impl std::error::Error for CodedError {}
 /// [`CodedError`] anywhere in the anyhow context chain. `main` surfaces it as the
 /// JSON `code` field and a `[CODE]` prefix on the text error line.
 pub fn error_code(err: &anyhow::Error) -> Option<&'static str> {
+    let err = stop_cause(err);
     if let Some(c) = err.downcast_ref::<CodedError>() {
         return Some(c.code());
     }
@@ -281,6 +282,7 @@ pub fn error_code(err: &anyhow::Error) -> Option<&'static str> {
 /// `Generic` on purpose — a *visible* signal that a marker was dropped upstream,
 /// rather than being silently rescued by string matching.
 pub fn classify_exit(err: &anyhow::Error) -> i32 {
+    let err = stop_cause(err);
     // Each check downcasts through anyhow's context chain.
     // A child process already classified itself and exited with that code; honor
     // it verbatim (parallel-export path) so the parent surfaces the same class.
@@ -294,6 +296,12 @@ pub fn classify_exit(err: &anyhow::Error) -> i32 {
         return ExitClass::Retryable.code();
     }
     ExitClass::Generic.code()
+}
+
+/// The error under a load's stop-before-write marker, which carries the code and the class.
+fn stop_cause(err: &anyhow::Error) -> &anyhow::Error {
+    err.downcast_ref::<crate::load::Refused>()
+        .map_or(err, crate::load::Refused::cause)
 }
 
 /// The class a typed stop marker in the chain fixes regardless of wording; `None` leaves it to the transient check.
@@ -456,6 +464,21 @@ pub mod codes {
         "RIVET_STATE_CURSOR_OWNER_MISMATCH",
         "`rivet state reset -c <config> --export <name>` to start the new cursor with a full pass, or restore the previous cursor column",
     );
+    /// Stored progress (cursor, keyset high-water, resume anchor) belongs to another table or collection.
+    pub const STATE_CURSOR_STREAM_MISMATCH: Code = refusal(
+        "RIVET_STATE_CURSOR_STREAM_MISMATCH",
+        "give each export that shares this state database its own name; if this export was repointed, `rivet state reset -c <config> --export <name>` starts the new table with a full pass (it discards the progress of every export of that name in the state database)",
+    );
+    /// A command that rewrites an export's stored progress met a live run of that export.
+    pub const STATE_RUN_IN_PROGRESS: Code = refusal(
+        "RIVET_STATE_RUN_IN_PROGRESS",
+        "wait for the run to finish, or stop its process, then repeat the command",
+    );
+    /// A checkpointed run found its `chunk_run` row gone when it came to complete it.
+    pub const STATE_CHUNK_CHECKPOINT_GONE: Code = refusal(
+        "RIVET_STATE_CHUNK_CHECKPOINT_GONE",
+        "run the export again: it starts a new chunk run (the parts the lost run wrote stay in the destination, in no manifest)",
+    );
     pub const SOURCE_CURSOR_FINER_THAN_MICROSECOND: Code = refusal(
         "RIVET_SOURCE_CURSOR_FINER_THAN_MICROSECOND",
         "cursor on a column at microsecond precision or coarser, or cast the cursor to TIMESTAMP(6) in a curated query",
@@ -495,6 +518,11 @@ pub mod codes {
         "RIVET_SOURCE_VALUE_UNREPRESENTABLE",
         "map the value to a representable one in the export's `query:`, or exclude the column",
     );
+    /// A planner probe (range bound, keyset boundary or ceiling) returned a value of a type the adapter has no reader for.
+    pub const SOURCE_PROBE_UNREADABLE: Code = refusal(
+        "RIVET_SOURCE_PROBE_UNREADABLE",
+        "chunk, page or partition the export on a column of a type the message lists, remove `parallel:` from a keyset export, or use `mode: full`",
+    );
     /// A `columns:` override declares a type the source's wire value cannot be read as.
     pub const SOURCE_OVERRIDE_WIRE_MISMATCH: Code = usage(
         "RIVET_SOURCE_OVERRIDE_WIRE_MISMATCH",
@@ -511,6 +539,10 @@ pub mod codes {
     pub const LOAD_ADOPTION_COLUMN_MISMATCH: Code = refusal(
         "RIVET_LOAD_ADOPTION_COLUMN_MISMATCH",
         "add the export's new columns to the table (`ALTER TABLE … ADD COLUMN`) and re-run; do not rename it aside",
+    );
+    pub const LOAD_TARGET_NOT_RIVETS: Code = refusal(
+        "RIVET_LOAD_TARGET_NOT_RIVETS",
+        "the warehouse object exists and this state DB has no record of rivet loading it: drop or rename it, or load into another table",
     );
     pub const INTERNAL_VALUE_CONVERTER: Code = internal(
         "RIVET_INTERNAL_VALUE_CONVERTER",
@@ -552,13 +584,18 @@ pub mod codes {
         SOURCE_CDC_CELL_UNSUPPORTED,
         SOURCE_CDC_PREREQUISITE,
         SOURCE_VALUE_UNREPRESENTABLE,
+        SOURCE_PROBE_UNREADABLE,
         SOURCE_OVERRIDE_WIRE_MISMATCH,
         STATE_SCHEMA_NEWER,
         STATE_CURSOR_OWNER_MISMATCH,
+        STATE_CURSOR_STREAM_MISMATCH,
         STATE_KEYSET_SEQUENTIAL_ANCHOR_UNFINISHED,
+        STATE_RUN_IN_PROGRESS,
+        STATE_CHUNK_CHECKPOINT_GONE,
         LOAD_VALUE_OUT_OF_TARGET_RANGE,
         LOAD_COUNT_MISMATCH,
         LOAD_ADOPTION_COLUMN_MISMATCH,
+        LOAD_TARGET_NOT_RIVETS,
         INTERNAL_VALUE_CONVERTER,
         INTERNAL_SPILL,
         INTERNAL_TYPE_BUILDER,
@@ -862,6 +899,52 @@ mod tests {
             1,
             "a non-transient environment failure"
         );
+    }
+
+    /// A stop before the warehouse write exits as what stopped it, and names its code.
+    #[test]
+    fn a_stop_before_the_write_keeps_the_code_and_the_exit_class_of_its_cause() {
+        type Cause = fn() -> anyhow::Error;
+        let causes: Vec<(Cause, i32, Option<&str>)> = vec![
+            (
+                || anyhow::Error::new(CodedError::new(codes::LOAD_TARGET_NOT_RIVETS, "foreign")),
+                5,
+                Some("RIVET_LOAD_TARGET_NOT_RIVETS"),
+            ),
+            (
+                || {
+                    anyhow::Error::new(CodedError::new(
+                        codes::LOAD_ADOPTION_COLUMN_MISMATCH,
+                        "columns",
+                    ))
+                },
+                5,
+                Some("RIVET_LOAD_ADOPTION_COLUMN_MISMATCH"),
+            ),
+            (
+                || crate::manifest::ManifestInconsistency::DuplicatePartId(1).into(),
+                3,
+                None,
+            ),
+            (|| anyhow::anyhow!("connection reset by peer"), 2, None),
+            (|| anyhow::anyhow!("no partition statistics"), 1, None),
+        ];
+        for (cause, exit, code) in causes {
+            let stop = crate::load::before_write::<()>(Err(cause()))
+                .unwrap_err()
+                .context("loading orders");
+            assert!(stop.is::<crate::load::Refused>());
+            assert_eq!(
+                (classify_exit(&stop), error_code(&stop)),
+                (exit, code),
+                "{stop:#}"
+            );
+            assert_eq!(
+                (classify_exit(&cause()), error_code(&cause())),
+                (exit, code),
+                "the bare cause reads the same"
+            );
+        }
     }
 
     #[test]

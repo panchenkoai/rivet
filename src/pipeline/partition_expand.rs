@@ -1,6 +1,8 @@
 //! Value-based output partitioning expansion (`partition_by`).
 //!
-//! `run` is the only command that materialises partitions. Right after the
+//! Every entry point that runs exports in-process (`run`, `apply <config>`,
+//! `--pool`) goes through `run_set::RunSet::in_process`, the one caller of this
+//! expansion. Right after the
 //! export selection, [`expand_partitioned_exports`] rewrites the borrowed
 //! `&ExportConfig` list into an **owned** list where every export with
 //! `partition_by` set has been replaced by one concrete child export per

@@ -17,6 +17,9 @@
 //!   `scheme://REDACTED@host…`.  This is the only pattern Rivet
 //!   round-trips through driver/error context, so it is the single
 //!   high-value rewrite.  Patches expand here.
+//! - **Keyword/value passwords**: `host=h password=secret dbname=d` (libpq),
+//!   `Server=h;Password=secret;` / `PWD=secret` (ADO) and `;password=secret`
+//!   (JDBC properties) → `password=***`.
 //! - **Known token-shape secrets** (AWS access keys etc.) are *not*
 //!   matched on shape today — they shouldn't be in stringified error
 //!   context unless the operator passed `--source 'aws_access_key_id=AKIA…'`
@@ -153,7 +156,128 @@ fn try_redact_at(bytes: &[u8], i: usize) -> Option<(String, usize)> {
 /// driver/library error (or any operator-untrusted string) into a
 /// persisted or emitted artifact.
 pub fn redact_secrets(s: &str) -> String {
-    redact_query_secrets(&redact_url_passwords(s))
+    redact_query_secrets(&redact_url_passwords(&redact_keyword_passwords(s)))
+}
+
+/// The marker a masked keyword/value password is replaced with.
+const MASK: &str = "***";
+
+/// Mask the value of every `password=` / `pwd=` pair of a keyword/value connection string (libpq DSN, ADO, `;`-separated JDBC properties).
+pub fn redact_keyword_passwords(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut stops = s.match_indices([';', '\n', '\r']).peekable();
+    let mut copied = 0;
+    for (key_start, value_start) in password_pairs(s) {
+        if key_start < copied {
+            continue;
+        }
+        while stops.next_if(|(at, _)| *at < value_start).is_some() {}
+        let stop = stops.peek().map_or(s.len(), |(at, _)| *at);
+        out.push_str(&s[copied..value_start]);
+        out.push_str(MASK);
+        copied = value_start + keyword_value_len(s, key_start, value_start, stop);
+    }
+    out.push_str(&s[copied..]);
+    out
+}
+
+/// Whether `s` holds a keyword/value password pair, masked or not.
+pub(crate) fn has_keyword_password(s: &str) -> bool {
+    password_pairs(s).next().is_some()
+}
+
+/// A byte a keyword may be spelled with (`db.password`, `MYSQL_PWD`, `x-passwd`).
+fn is_keyword_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-')
+}
+
+/// Whether a keyword names a password: it ends in `password`, `passwd` or `pwd`, in any case.
+fn is_password_keyword(key: &str) -> bool {
+    ["password", "passwd", "pwd"].iter().any(|word| {
+        key.len() >= word.len() && key[key.len() - word.len()..].eq_ignore_ascii_case(word)
+    })
+}
+
+/// Every `keyword = value` pair whose keyword names a password, as (keyword start, value start), one per `=` in text order; a URL query pair (`?password=`, `&password=`) is left to [`redact_query_secrets`].
+fn password_pairs(s: &str) -> impl Iterator<Item = (usize, usize)> + '_ {
+    let bytes = s.as_bytes();
+    let is_blank = |b: &&u8| matches!(**b, b' ' | b'\t');
+    s.match_indices('=').filter_map(move |(eq, _)| {
+        let key_end = eq - bytes[..eq].iter().rev().take_while(is_blank).count();
+        let key_start = key_end
+            - bytes[..key_end]
+                .iter()
+                .rev()
+                .take_while(|b| is_keyword_byte(**b))
+                .count();
+        let in_query = key_start > 0 && matches!(bytes[key_start - 1], b'?' | b'&');
+        let value_start = eq + 1 + bytes[eq + 1..].iter().take_while(is_blank).count();
+        (!in_query && is_password_keyword(&s[key_start..key_end]))
+            .then_some((key_start, value_start))
+    })
+}
+
+/// Length of the value starting at `value_start`, given the first `;` or line break at or after it (`stop`): the longer of its quoted and its unquoted reading, so a quote character that is not a quote in the string's grammar leaks nothing.
+fn keyword_value_len(s: &str, key_start: usize, value_start: usize, stop: usize) -> usize {
+    let rest = &s[value_start..];
+    let quoted = match rest.chars().next() {
+        Some('\'') => quoted_value_len(rest, '\''),
+        Some('"') => quoted_value_len(rest, '"'),
+        Some('{') => quoted_value_len(rest, '}'),
+        _ => 0,
+    };
+    let after_semicolon = s[..key_start].trim_end_matches([' ', '\t']).ends_with(';');
+    quoted.max(bare_value_len(rest, stop - value_start, after_semicolon))
+}
+
+/// Length of an unquoted value whose first `;` or line break is at `stop`: up to `stop` in a `;`-separated string, else to whichever of the libpq (whitespace) and ADO (`;`) terminators comes later, so neither grammar leaks a tail.
+fn bare_value_len(rest: &str, stop: usize, after_semicolon: bool) -> usize {
+    let ends_value = |c: char| c == ';' || c.is_whitespace();
+    let masked = rest
+        .strip_prefix(MASK)
+        .is_some_and(|after| after.chars().next().is_none_or(ends_value));
+    if masked {
+        return MASK.len();
+    }
+    if after_semicolon {
+        return stop;
+    }
+    let semicolon = if rest[stop..].starts_with(';') {
+        stop
+    } else {
+        0
+    };
+    unescaped_whitespace(rest).max(semicolon)
+}
+
+/// Length of a quoted value including both quotes, honouring `\x` escapes and a doubled closing quote; the whole text when the quote never closes.
+fn quoted_value_len(rest: &str, close: char) -> usize {
+    let mut chars = rest.char_indices().skip(1).peekable();
+    while let Some((i, c)) = chars.next() {
+        if c == '\\' {
+            chars.next();
+        } else if c == close {
+            if chars.peek().is_some_and(|(_, next)| *next == close) {
+                chars.next();
+            } else {
+                return i + close.len_utf8();
+            }
+        }
+    }
+    rest.len()
+}
+
+/// Offset of the first whitespace not escaped by a backslash, or the length of `text`; a backslash never escapes a line break.
+fn unescaped_whitespace(text: &str) -> usize {
+    let mut chars = text.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if c == '\\' {
+            chars.next_if(|(_, next)| !matches!(next, '\n' | '\r'));
+        } else if c.is_whitespace() {
+            return i;
+        }
+    }
+    text.len()
 }
 
 /// Redact SECRET-BEARING QUERY PARAMETERS: `?token=…`, `&password=…`,
@@ -544,6 +668,344 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    // ── redact_keyword_passwords (docs/url-safety-matrix.yaml) ─────────────
+
+    /// Every keyword/value form and what it becomes, byte for byte.
+    const KEYWORD_FORMS: [(&str, &str); 22] = [
+        (
+            "host=h port=5432 user=u password=S3cr3tPw dbname=d",
+            "host=h port=5432 user=u password=*** dbname=d",
+        ),
+        (
+            "host=h user=u password=S3cr3tPw",
+            "host=h user=u password=***",
+        ),
+        (
+            "host=h password = S3cr3tPw dbname=d",
+            "host=h password = *** dbname=d",
+        ),
+        (
+            r"host=h password='S3cr3tPw it\'s S3cr3tPw' dbname=d",
+            "host=h password=*** dbname=d",
+        ),
+        (
+            r"host=h password=S3cr3tPw\ S3cr3tPw dbname=d",
+            "host=h password=*** dbname=d",
+        ),
+        (
+            "host=h password=a;S3cr3tPw dbname=d",
+            "host=h password=*** dbname=d",
+        ),
+        (
+            "host=h password='S3cr3tPw never closed",
+            "host=h password=***",
+        ),
+        (
+            "Server=h,1433;Database=d;User Id=u;Password=S3cr3tPw;",
+            "Server=h,1433;Database=d;User Id=u;Password=***;",
+        ),
+        (
+            "Server=h;UID=u;PWD=S3cr3tPw;Encrypt=true",
+            "Server=h;UID=u;PWD=***;Encrypt=true",
+        ),
+        (
+            "Server=h;User Id=u;Password=two S3cr3tPw words;Encrypt=true",
+            "Server=h;User Id=u;Password=***;Encrypt=true",
+        ),
+        (
+            "Password=two S3cr3tPw words;Server=h",
+            "Password=***;Server=h",
+        ),
+        (
+            "Server=h;Password=S3cr3tPw trailing S3cr3tPw",
+            "Server=h;Password=***",
+        ),
+        (
+            "Server=h;Password=\"a;S3cr3tPw\"\"S3cr3tPw\";Encrypt=true",
+            "Server=h;Password=***;Encrypt=true",
+        ),
+        (
+            "Driver={x};Server=h;PWD={a;S3cr3tPw}}S3cr3tPw};Encrypt=yes",
+            "Driver={x};Server=h;PWD=***;Encrypt=yes",
+        ),
+        (
+            "sqlserver://h:1433;databaseName=app;user=sa;password=S3cr3tPw",
+            "sqlserver://h:1433;databaseName=app;user=sa;password=***",
+        ),
+        (
+            "sqlserver://h:1433;user=sa;password=p@S3cr3tPw;encrypt=true",
+            "sqlserver://h:1433;user=sa;password=***;encrypt=true",
+        ),
+        ("PGPASSWORD=S3cr3tPw psql", "PGPASSWORD=*** psql"),
+        (
+            "spring.datasource.password=S3cr3tPw",
+            "spring.datasource.password=***",
+        ),
+        (
+            "MYSQL_PWD=S3cr3tPw x-passwd=S3cr3tPw",
+            "MYSQL_PWD=*** x-passwd=***",
+        ),
+        (
+            "host=a password=S3cr3tPw\nhost=b password=S3cr3tPw dbname=d",
+            "host=a password=***\nhost=b password=*** dbname=d",
+        ),
+        (
+            "nothing is listening on host=h port=1 password=S3cr3tPw dbname=d — check the port; then retry",
+            "nothing is listening on host=h port=1 password=***; then retry",
+        ),
+        (
+            "Server=h;Password=;Encrypt=true",
+            "Server=h;Password=***;Encrypt=true",
+        ),
+    ];
+
+    #[test]
+    fn keyword_value_passwords_are_masked_in_every_form() {
+        for (input, want) in KEYWORD_FORMS {
+            assert_eq!(redact_keyword_passwords(input), want, "{input}");
+            let through_all = redact_secrets(input);
+            assert_eq!(through_all, want, "redact_secrets: {input}");
+            assert_eq!(
+                redact_secrets(&through_all),
+                through_all,
+                "a second pass must change nothing: {input}"
+            );
+            assert!(has_keyword_password(input), "{input}");
+        }
+    }
+
+    /// Text main already handled, which the keyword/value pass must leave byte-identical.
+    #[test]
+    fn text_without_a_keyword_password_pair_is_untouched() {
+        for s in [
+            "host=h port=5432 user=u dbname=d sslmode=require",
+            "Server=h;Database=d;Integrated Security=true;",
+            "postgres://h/db?password=hunter2&sslmode=require",
+            "postgresql://u@h/db?keep=1&db_password=x&tail=1",
+            "the password is wrong",
+            "passwords=3 password_env=PGPASS password: x",
+            "mode=keyset chunk_size=1000",
+            "naïve — host=h dbname=d",
+        ] {
+            assert_eq!(redact_keyword_passwords(s), s, "{s}");
+            assert!(!has_keyword_password(s), "{s}");
+        }
+        assert_eq!(
+            redact_secrets("postgres://h/db?password=hunter2&sslmode=require"),
+            "postgres://h/db?password=***&sslmode=require",
+            "a query pair still ends at `&`"
+        );
+        assert_eq!(
+            redact_secrets("postgresql://u:pw@h:5432/db and host=h password=x dbname=d"),
+            "postgresql://REDACTED@h:5432/db and host=h password=*** dbname=d"
+        );
+    }
+
+    /// The secret never survives, whatever it is made of and wherever the string lands.
+    #[test]
+    fn redact_secrets_keyword_value_matrix() {
+        const SECRET: &str = "S3cr3tPw";
+        let bodies = [
+            SECRET.to_string(),
+            format!("{SECRET}@x"),
+            format!("a@{SECRET}"),
+            format!("{SECRET}/x?y#z"),
+            format!("a=b&{SECRET}"),
+            format!("a:{SECRET}:b"),
+            format!("\"{SECRET}"),
+            format!("a'{SECRET}"),
+            format!("a{{{SECRET}"),
+            format!("a,{SECRET})"),
+        ];
+        for body in &bodies {
+            let quoted = body.replace('\'', r"\'");
+            for conn in [
+                format!("host=h port=5432 user=u password={body} dbname=d"),
+                format!("host=h user=u dbname=d password={body}"),
+                format!("host=h user=u password='{quoted} {quoted}' dbname=d"),
+                format!("host=h user=u password={body};{body} dbname=d"),
+                format!("Server=h,1433;Database=d;User Id=u;Password={body};"),
+                format!("Server=h;UID=u;PWD={body} {body};Encrypt=true"),
+                format!("pwd={body} {body};Server=h"),
+                format!("sqlserver://h:1433;databaseName=app;user=sa;password={body}"),
+                format!("sqlserver://h:1433;user=sa;PASSWORD = {body};encrypt=true"),
+            ] {
+                for ctx in [
+                    conn.clone(),
+                    format!("mssql url must start with sqlserver:// — got {conn}"),
+                    format!("[2026-10-07 WARN src] dialing {conn}"),
+                    format!("first line\nconnect to {conn}\nlast line"),
+                ] {
+                    let out = redact_secrets(&ctx);
+                    assert!(
+                        !out.contains(SECRET),
+                        "SECRET leaked\n  body={body}\n  in:  {ctx}\n  out: {out}"
+                    );
+                    assert!(out.contains("***"), "nothing was masked: {out}");
+                    assert_eq!(redact_secrets(&out), out, "second pass: {ctx}");
+                }
+            }
+        }
+    }
+
+    /// Wall-clock ceiling for one hostile megabyte: the scan is one pass and needs milliseconds, a quadratic one needs minutes.
+    const HOSTILE_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// The keyword/value scan of `input`, run on a watchdog thread so an overrun or a panic fails the test instead of hanging it.
+    fn scan_within_budget(label: &str, input: &str) -> Result<String, String> {
+        use std::sync::mpsc::RecvTimeoutError;
+        let (done, result) = std::sync::mpsc::channel();
+        let owned = input.to_string();
+        std::thread::spawn(move || {
+            let has = has_keyword_password(&owned);
+            let _ = done.send((redact_keyword_passwords(&owned), has));
+        });
+        match result.recv_timeout(HOSTILE_BUDGET) {
+            Ok((out, has)) if has || out == input => Ok(out),
+            Ok(_) => Err(format!("{label}: masked a string with no password pair")),
+            Err(RecvTimeoutError::Timeout) => {
+                Err(format!("{label}: no result within {HOSTILE_BUDGET:?}"))
+            }
+            Err(RecvTimeoutError::Disconnected) => Err(format!("{label}: the scan panicked")),
+        }
+    }
+
+    /// Unterminated quotes, a key at the very end, empty values, multi-byte text after `=`: each returns, and returns this.
+    #[test]
+    fn the_keyword_scan_returns_on_every_degenerate_shape() {
+        for (input, want) in [
+            ("password=", "password=***"),
+            ("host=h password", "host=h password"),
+            ("host=h password=", "host=h password=***"),
+            ("host=h password= ", "host=h password= ***"),
+            ("host=h password=\t\t", "host=h password=\t\t***"),
+            ("password='never closed", "password=***"),
+            ("password=\"never closed", "password=***"),
+            ("pwd={never closed", "pwd=***"),
+            ("password='", "password=***"),
+            ("password=\\", "password=***"),
+            ("password='\\", "password=***"),
+            ("password=é", "password=***"),
+            ("password=—x y", "password=*** y"),
+            ("password=😀;x", "password=***"),
+            ("naïve=x password=日本;", "naïve=x password=***"),
+            ("=", "="),
+            ("==", "=="),
+            (" = ", " = "),
+            (";=;", ";=;"),
+            ("password==x", "password=***"),
+            ("password=pwd =y", "password=*** =y"),
+            (
+                "host=h password='a b'pwd=S3cr3tPw",
+                "host=h password=***pwd=***",
+            ),
+            (
+                "host=h password=a;pwd=S3cr3tPw dbname=d",
+                "host=h password=*** dbname=d",
+            ),
+            (
+                "host=h password=S3cr3tPw\\\nnext line",
+                "host=h password=***\nnext line",
+            ),
+            (
+                "host=h password=S3cr3tPw\\\r\nnext line",
+                "host=h password=***\r\nnext line",
+            ),
+            ("password=x\r\npassword=y", "password=***\r\npassword=***"),
+            ("x;password= ;y", "x;password= ***;y"),
+            ("password=***", "password=***"),
+            ("password=***x y", "password=*** y"),
+            (
+                "Server=h;Pwd=S3cr3tPw\\;tail;x=1",
+                "Server=h;Pwd=***;tail;x=1",
+            ),
+            ("a ?password=x", "a ?password=x"),
+            ("a &pwd = x y", "a &pwd = x y"),
+        ] {
+            assert_eq!(
+                scan_within_budget(input, input).as_deref(),
+                Ok(want),
+                "{input:?}"
+            );
+        }
+    }
+
+    /// One megabyte of each hostile shape is scanned in one pass: the exact output, inside the budget.
+    #[test]
+    fn the_keyword_scan_is_linear_on_a_hostile_megabyte() {
+        const MB: usize = 1 << 20;
+        let blanks = " ".repeat(MB);
+        let shapes = [
+            ("`;=` repeated", ";=".repeat(MB / 2), ";=".repeat(MB / 2)),
+            ("`=` alone", "=".repeat(MB), "=".repeat(MB)),
+            (
+                "`pwd=a ` repeated, no `;`",
+                "pwd=a ".repeat(MB / 6),
+                "pwd=*** ".repeat(MB / 6),
+            ),
+            (
+                "`pwd=é ` repeated",
+                "pwd=é ".repeat(MB / 7),
+                "pwd=*** ".repeat(MB / 7),
+            ),
+            (
+                "masked pairs repeated",
+                "pwd=*** ".repeat(MB / 8),
+                "pwd=*** ".repeat(MB / 8),
+            ),
+            (
+                "blanks around every `=`",
+                "pwd \t= \t".repeat(MB / 8),
+                "pwd \t= \t*** \t= \t".repeat(MB / 16),
+            ),
+            (
+                "`pwd=;` repeated",
+                "pwd=;".repeat(MB / 5),
+                "pwd=***".to_string(),
+            ),
+            (
+                "`pwd=` then `;x=y` repeated",
+                format!("a;pwd={}", ";x=y".repeat(MB / 4)),
+                format!("a;pwd=***{}", ";x=y".repeat(MB / 4)),
+            ),
+            (
+                "`password=` repeated",
+                "password=".repeat(MB / 9),
+                "password=***".to_string(),
+            ),
+            (
+                "a quote that never closes",
+                format!("pwd='{}", "a=b;".repeat(MB / 4)),
+                "pwd=***".to_string(),
+            ),
+            (
+                "an opening quote in every pair",
+                "pwd='a".repeat(MB / 6),
+                "pwd=***".to_string(),
+            ),
+            (
+                "a megabyte of blanks before `=`",
+                format!("pwd{blanks}=x"),
+                format!("pwd{blanks}=***"),
+            ),
+            (
+                "a megabyte keyword",
+                format!("{}=x", "a".repeat(MB)),
+                format!("{}=x", "a".repeat(MB)),
+            ),
+        ];
+        for (label, input, want) in &shapes {
+            let out = scan_within_budget(label, input)
+                .unwrap_or_else(|why| panic!("KEYWORD SCAN NOT LINEAR: {why}"));
+            assert!(
+                out == *want,
+                "{label}: {} bytes out, {} wanted",
+                out.len(),
+                want.len()
+            );
         }
     }
 
