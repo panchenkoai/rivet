@@ -25,7 +25,8 @@ that engine). A cell that forgets this looks correct and fails as the PRODUCT:
     changed" and as `src[150000]!=declared[300000]`. Key by the PARENT (which
     carries engine+version), not the leaf.
 
-Preflight callers are exempt BY POSITION, not by luck: `preflight()` runs once,
-serially, before any version container exists. Check which side a new cell is on
+Stages before the engine matrix are exempt BY DECLARATION, not by luck: every stage
+that touches the stand holds it in `__main__.gate_stages`, so no two overlap, and all
+of them finish before any version container exists. Check which side a new cell is on
 before copying either pattern.
 """
