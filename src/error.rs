@@ -242,6 +242,7 @@ impl std::error::Error for CodedError {}
 /// [`CodedError`] anywhere in the anyhow context chain. `main` surfaces it as the
 /// JSON `code` field and a `[CODE]` prefix on the text error line.
 pub fn error_code(err: &anyhow::Error) -> Option<&'static str> {
+    let err = stop_cause(err);
     if let Some(c) = err.downcast_ref::<CodedError>() {
         return Some(c.code());
     }
@@ -281,6 +282,7 @@ pub fn error_code(err: &anyhow::Error) -> Option<&'static str> {
 /// `Generic` on purpose — a *visible* signal that a marker was dropped upstream,
 /// rather than being silently rescued by string matching.
 pub fn classify_exit(err: &anyhow::Error) -> i32 {
+    let err = stop_cause(err);
     // Each check downcasts through anyhow's context chain.
     // A child process already classified itself and exited with that code; honor
     // it verbatim (parallel-export path) so the parent surfaces the same class.
@@ -294,6 +296,12 @@ pub fn classify_exit(err: &anyhow::Error) -> i32 {
         return ExitClass::Retryable.code();
     }
     ExitClass::Generic.code()
+}
+
+/// The error under a load's stop-before-write marker, which carries the code and the class.
+fn stop_cause(err: &anyhow::Error) -> &anyhow::Error {
+    err.downcast_ref::<crate::load::Refused>()
+        .map_or(err, crate::load::Refused::cause)
 }
 
 /// The class a typed stop marker in the chain fixes regardless of wording; `None` leaves it to the transient check.
@@ -542,6 +550,10 @@ pub mod codes {
         "RIVET_LOAD_ADOPTION_COLUMN_MISMATCH",
         "add the export's new columns to the table (`ALTER TABLE … ADD COLUMN`) and re-run; do not rename it aside",
     );
+    pub const LOAD_TARGET_NOT_RIVETS: Code = refusal(
+        "RIVET_LOAD_TARGET_NOT_RIVETS",
+        "the warehouse object exists and this state DB has no record of rivet loading it: drop or rename it, or load into another table",
+    );
     pub const INTERNAL_VALUE_CONVERTER: Code = internal(
         "RIVET_INTERNAL_VALUE_CONVERTER",
         "a value changed between the source and the written part — a bug; report it with the column's type",
@@ -595,6 +607,7 @@ pub mod codes {
         LOAD_VALUE_OUT_OF_TARGET_RANGE,
         LOAD_COUNT_MISMATCH,
         LOAD_ADOPTION_COLUMN_MISMATCH,
+        LOAD_TARGET_NOT_RIVETS,
         INTERNAL_VALUE_CONVERTER,
         INTERNAL_SPILL,
         INTERNAL_TYPE_BUILDER,
@@ -898,6 +911,52 @@ mod tests {
             1,
             "a non-transient environment failure"
         );
+    }
+
+    /// A stop before the warehouse write exits as what stopped it, and names its code.
+    #[test]
+    fn a_stop_before_the_write_keeps_the_code_and_the_exit_class_of_its_cause() {
+        type Cause = fn() -> anyhow::Error;
+        let causes: Vec<(Cause, i32, Option<&str>)> = vec![
+            (
+                || anyhow::Error::new(CodedError::new(codes::LOAD_TARGET_NOT_RIVETS, "foreign")),
+                5,
+                Some("RIVET_LOAD_TARGET_NOT_RIVETS"),
+            ),
+            (
+                || {
+                    anyhow::Error::new(CodedError::new(
+                        codes::LOAD_ADOPTION_COLUMN_MISMATCH,
+                        "columns",
+                    ))
+                },
+                5,
+                Some("RIVET_LOAD_ADOPTION_COLUMN_MISMATCH"),
+            ),
+            (
+                || crate::manifest::ManifestInconsistency::DuplicatePartId(1).into(),
+                3,
+                None,
+            ),
+            (|| anyhow::anyhow!("connection reset by peer"), 2, None),
+            (|| anyhow::anyhow!("no partition statistics"), 1, None),
+        ];
+        for (cause, exit, code) in causes {
+            let stop = crate::load::before_write::<()>(Err(cause()))
+                .unwrap_err()
+                .context("loading orders");
+            assert!(stop.is::<crate::load::Refused>());
+            assert_eq!(
+                (classify_exit(&stop), error_code(&stop)),
+                (exit, code),
+                "{stop:#}"
+            );
+            assert_eq!(
+                (classify_exit(&cause()), error_code(&cause())),
+                (exit, code),
+                "the bare cause reads the same"
+            );
+        }
     }
 
     #[test]
