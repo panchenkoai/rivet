@@ -261,32 +261,6 @@ impl ClickhouseLoader {
             .sum()
     }
 
-    /// The row count of every part in `uris`, each footer checked for a timestamp ClickHouse would clamp; asked before the load's first statement, `FOOTER_READERS` parts at a time.
-    fn checked_part_rows(&self, uris: &[String]) -> Result<Vec<u64>> {
-        let store = self.store()?;
-        let one = |uri: &String| -> Result<u64> {
-            let (_, key) = super::split_object_uri(uri)?;
-            let meta = super::partition_budget::read_footer(store, key)
-                .with_context(|| format!("reading the footer of {uri}"))?;
-            refuse_unholdable_timestamps(&meta, uri)?;
-            footer_rows(&meta)
-        };
-        let mut rows = Vec::with_capacity(uris.len());
-        for wave in uris.chunks(FOOTER_READERS) {
-            let checked: Vec<Result<u64>> = std::thread::scope(|scope| {
-                let readers: Vec<_> = wave.iter().map(|uri| scope.spawn(|| one(uri))).collect();
-                readers
-                    .into_iter()
-                    .map(|r| r.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
-                    .collect()
-            });
-            for r in checked {
-                rows.push(r?);
-            }
-        }
-        Ok(rows)
-    }
-
     /// Insert one part of `rows` rows into `target`; a pushed part's own footer is checked again.
     fn insert_one(&self, target: &str, uri: &str, rows: u64, repeat: Repeat) -> Result<u64> {
         let (bucket, key) = super::split_object_uri(uri)?;
@@ -391,7 +365,7 @@ impl TargetLoader for ClickhouseLoader {
                 c.escape_default()
             );
         }
-        let part_rows = super::before_write(self.checked_part_rows(uris))?;
+        let part_rows = super::before_write(checked_part_rows(self.store()?, uris))?;
         let target = self.quoted(table);
         let swap = self.quoted(&format!("{table}__rivet_swap"));
         self.query(&create_table_sql(
@@ -421,7 +395,7 @@ impl TargetLoader for ClickhouseLoader {
         uris: &[String],
         pk: &[String],
     ) -> Result<u64> {
-        let part_rows = super::before_write(self.checked_part_rows(uris))?;
+        let part_rows = super::before_write(checked_part_rows(self.store()?, uris))?;
         let full = changelog_specs(specs);
         let changes = self.quoted(&format!("{table}__changes"));
         let shape = changelog_shape(self.cdc, table, pk, self.partition_by.as_deref())?;
@@ -956,6 +930,31 @@ fn object_kind_of(engine: &str) -> ObjectKind {
 /// Parts whose footers are read at once before a load.
 const FOOTER_READERS: usize = 8;
 
+/// The row count of every part in `uris`, in order, each footer checked for a timestamp ClickHouse would clamp; the first part that fails is the one reported.
+fn checked_part_rows(store: &GcsStore, uris: &[String]) -> Result<Vec<u64>> {
+    let one = |uri: &String| -> Result<u64> {
+        let (_, key) = super::split_object_uri(uri)?;
+        let meta = super::partition_budget::read_footer(store, key)
+            .with_context(|| format!("reading the footer of {uri}"))?;
+        refuse_unholdable_timestamps(&meta, uri)?;
+        footer_rows(&meta)
+    };
+    let mut rows = Vec::with_capacity(uris.len());
+    for wave in uris.chunks(FOOTER_READERS) {
+        let checked: Vec<Result<u64>> = std::thread::scope(|scope| {
+            let readers: Vec<_> = wave.iter().map(|uri| scope.spawn(|| one(uri))).collect();
+            readers
+                .into_iter()
+                .map(|r| r.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
+                .collect()
+        });
+        for r in checked {
+            rows.push(r?);
+        }
+    }
+    Ok(rows)
+}
+
 const DATETIME64_MIN_SECS: i64 = -2_208_988_800;
 const DATETIME64_MAX_SECS: i64 = 10_413_791_999;
 
@@ -1300,6 +1299,55 @@ mod tests {
         assert_eq!(object_kind_of("ReplacingMergeTree"), ObjectKind::Table);
         assert_eq!(object_kind_of("MergeTree"), ObjectKind::Table);
         assert_eq!(object_kind_of("Dictionary"), ObjectKind::Other);
+    }
+
+    /// The pre-write check returns every part's rows in order, reads more parts than one wave holds, and reports the FIRST out-of-range part.
+    #[test]
+    fn the_pre_write_check_counts_every_part_and_names_the_first_one_out_of_range() {
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, secs: &[i64]| {
+            let micros: Vec<i64> = secs.iter().map(|s| s * 1_000_000).collect();
+            let col = arrow::array::TimestampMicrosecondArray::from(micros).with_timezone("UTC");
+            let batch = arrow::record_batch::RecordBatch::try_from_iter([(
+                "ts",
+                Arc::new(col) as arrow::array::ArrayRef,
+            )])
+            .unwrap();
+            let mut buf = Vec::new();
+            let mut w =
+                parquet::arrow::ArrowWriter::try_new(&mut buf, batch.schema(), None).unwrap();
+            w.write(&batch).unwrap();
+            w.close().unwrap();
+            std::fs::write(dir.path().join(name), buf).unwrap();
+            format!("gs://b/{name}")
+        };
+        let store = GcsStore::open_fs(dir.path().to_str().unwrap()).unwrap();
+        let good: Vec<String> = (0..FOOTER_READERS + 3)
+            .map(|i| write(&format!("p{i:02}.parquet"), &vec![0; i + 1]))
+            .collect();
+        assert_eq!(
+            checked_part_rows(&store, &good).unwrap(),
+            (1..=good.len() as u64).collect::<Vec<_>>(),
+            "one count per part, in the order given"
+        );
+        assert_eq!(checked_part_rows(&store, &[]).unwrap(), Vec::<u64>::new());
+
+        let mut mixed = good.clone();
+        mixed.insert(1, write("late.parquet", &[DATETIME64_MAX_SECS + 1]));
+        mixed.push(write("early.parquet", &[DATETIME64_MIN_SECS - 1]));
+        let err = format!("{:#}", checked_part_rows(&store, &mixed).unwrap_err());
+        assert!(
+            err.contains("gs://b/late.parquet")
+                && err.contains("outside ClickHouse DateTime64's range"),
+            "the first bad part in list order is the one named: {err}"
+        );
+        let gone = vec![good[0].clone(), "gs://b/absent.parquet".to_string()];
+        let err = format!("{:#}", checked_part_rows(&store, &gone).unwrap_err());
+        assert!(
+            err.contains("reading the footer of gs://b/absent.parquet"),
+            "{err}"
+        );
     }
 
     #[test]

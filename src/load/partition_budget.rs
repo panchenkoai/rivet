@@ -189,7 +189,7 @@ fn footer_buckets(meta: &ParquetMetaData, key: &PartitionKey) -> Option<i64> {
 }
 
 /// Bytes of an object's end read in one request; a footer that fits needs no second read.
-const FOOTER_GUESS: u64 = 64 * 1024;
+const FOOTER_GUESS: u64 = 65_536;
 
 /// The footer of the Parquet object at the bucket-relative `key`: its last 8 bytes name
 /// the metadata length, and the metadata sits right before them.
@@ -215,14 +215,18 @@ fn read_footer_guessing(store: &GcsStore, key: &str, guess: u64) -> Result<Parqu
     if size < tail_len + len {
         bail!("{key} declares a {len}-byte footer but is {size} bytes long");
     }
-    if tail_len + len <= guess {
-        let start = (guess - tail_len - len) as usize;
-        return Ok(ParquetMetaDataReader::decode_metadata(
-            &end[start..start + len as usize],
-        )?);
+    if let Some(metadata) = metadata_in(&end, len) {
+        return Ok(ParquetMetaDataReader::decode_metadata(metadata)?);
     }
     let bytes = store.read_range(key, size - tail_len - len, len)?;
     Ok(ParquetMetaDataReader::decode_metadata(&bytes)?)
+}
+
+/// The `len` metadata bytes that sit before the 8-byte tail of `end`, an object's last bytes; `None` when `end` is too short to hold them.
+fn metadata_in(end: &[u8], len: u64) -> Option<&[u8]> {
+    let stop = end.len().checked_sub(FOOTER_SIZE)?;
+    let start = stop.checked_sub(usize::try_from(len).ok()?)?;
+    end.get(start..stop)
 }
 
 /// What one file's footer says about a column's non-NULL values.
@@ -544,6 +548,29 @@ mod tests {
 
     fn write(dir: &std::path::Path, name: &str, field: Field, column: ArrayRef, stats: bool) {
         write_noted(dir, name, field, column, stats, None);
+    }
+
+    /// The metadata is cut from the bytes in hand only when all of it is there.
+    #[test]
+    fn the_metadata_is_taken_from_the_first_read_only_when_it_holds_all_of_it() {
+        let end = b"..METADATAtailtail";
+        assert_eq!(metadata_in(end, 8), Some(&b"METADATA"[..]));
+        assert_eq!(
+            metadata_in(end, 10),
+            Some(&b"..METADATA"[..]),
+            "exactly the whole read"
+        );
+        assert_eq!(
+            metadata_in(end, 11),
+            None,
+            "one byte more than the read holds"
+        );
+        assert_eq!(metadata_in(end, 0), Some(&b""[..]));
+        assert_eq!(
+            metadata_in(b"tail", 0),
+            None,
+            "shorter than the tail itself"
+        );
     }
 
     /// The footer reads the same whether the first read holds all of it, exactly it, or only its tail.
