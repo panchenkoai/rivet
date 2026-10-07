@@ -23,6 +23,26 @@
     detected.
   - An export whose `FROM` relation comes from a `--param` that changes between runs is now
     refused when it continues a stored cursor.
+- **Security: a password written in a keyword/value connection string is no longer printed or
+  stored.** A PostgreSQL libpq string (`host=… user=… password=… dbname=…`) is accepted in
+  `url:`; SQL Server ADO and JDBC-property strings (`…;Password=…;`, `…;PWD=…;`,
+  `sqlserver://host;user=…;password=…`) are refused, and the refusal quoted them. Either way
+  the password reached stderr, `rivet doctor`, `--json-errors`, the state DB (`export_metrics`,
+  `run_journal`, and the `export_state` scope key of a successful run), `plan.json` and the
+  reports under `.rivet/runs`. It is now `password=***` everywhere; URL forms were already
+  redacted. Which strings connect is unchanged.
+  - **Behaviour change, plan/apply:** `rivet plan` from an inline keyword/value `url:` now
+    masks the password in `plan.json`, and `rivet apply` refuses that plan with the same remedy
+    as an inline URL: re-plan from `url_env:` or `url_file:`. Before, the plan held the password
+    and `apply` connected with it.
+  - **State written before the upgrade:** an incremental or keyset cursor stored under the old
+    scope key (which held the password) is moved to the masked key the first time the export
+    runs, plans or reads its cursor: the run continues from the stored cursor and the password
+    leaves `export_state`. `export_metrics` and `run_journal` rows, run reports and `plan.json`
+    files written before the upgrade are not rewritten: rotate that password, and delete the
+    old `plan.json` files.
+  - The scope key no longer changes when the password is rotated. Before, a rotation orphaned
+    the cursor and the next incremental run started over.
 
 - **Breaking: CDC writes an UPDATE that changes the key as a delete of the old key and an insert
   of the new row** (ADR-0030, accepted), on PostgreSQL, MySQL and Oracle. SQL Server's change

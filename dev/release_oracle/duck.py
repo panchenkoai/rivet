@@ -114,7 +114,8 @@ class Oracle:
             self.db.sql(f"ATTACH '{mysql}' AS my (TYPE mysql, READ_ONLY)")
         if postgres:
             self.db.sql("INSTALL postgres; LOAD postgres;")
-            self.db.sql(f"ATTACH '{postgres}' AS pg (TYPE postgres, READ_ONLY)")
+            quoted = postgres.replace("'", "''")
+            self.db.sql(f"ATTACH '{quoted}' AS pg (TYPE postgres, READ_ONLY)")
         if state:
             # rivet's state DB: a Postgres URL, else a SQLite file path.
             kind = "postgres" if state.startswith("postgres") else "sqlite"
