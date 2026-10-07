@@ -291,10 +291,11 @@ const MATRICES: &[(&str, usize)] = &[
     // pinned on PostgreSQL only; their MySQL, SQL Server and Oracle cells are gaps.
     ("docs/mode-transition-matrix.yaml", 26),
     // Operator contract: the 2026-10-07 CLI sweep by hand, one row per finding, each cell
-    // asserting the correct behaviour (open defects acknowledged in known_red.py). The gaps are
-    // cells not written: four findings with no rig entry point yet, the Oracle range-chunk
-    // cells, and the Mongo and CDC twins the sweep saw but this pass did not write.
-    ("docs/operator-contract-matrix.yaml", 46),
+    // asserting the correct behaviour (open defects acknowledged in known_red.py).
+    // Lowered 46 -> 4 (round two): the four that stay are the Oracle and MongoDB cells of the two
+    // "retained changes gone past the checkpoint" rows; the stand cannot lose an archived redo log
+    // or oplog for one cell without a SYSDBA handle or a dedicated replica set.
+    ("docs/operator-contract-matrix.yaml", 4),
     // Pool-split — `apply --pool --split` per (strategy × source engine). Split is a
     // scheduler layer above the runners (each unit runs through chunked/keyset), so its
     // per-engine behaviour (boundary probe, crash-recovery, finding-2 exact-partition

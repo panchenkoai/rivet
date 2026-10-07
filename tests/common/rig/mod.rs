@@ -16,6 +16,8 @@ use super::runner::RIVET_BIN;
 /// stack ships. Kept as an enum so `dest_yaml` stays the single renderer for
 /// every backend (two renderers per backend is the drift the rig exists to
 /// prevent).
+mod init;
+pub use init::InitConfig;
 mod invoke;
 pub use invoke::Spawned;
 mod materialize;
@@ -773,6 +775,9 @@ enum ScnExec {
     },
     /// MongoDB (replica set) through the driver-backed helper — no SQL at all.
     Mongo(super::mongo::MongoTest),
+    /// Oracle (LogMiner) through the shared `ora_exec`, one committed statement per call.
+    #[cfg(feature = "oracle")]
+    Oracle,
 }
 
 /// Drops a SQL Server capture instance + table on teardown (a CDC-tracked
@@ -909,6 +914,23 @@ impl CdcScenario {
         }
     }
 
+    /// Oracle: a `RIVET` `(id, v)` table logged with all columns and readable by the capture user, unpinned and shaped.
+    #[cfg(feature = "oracle")]
+    pub fn oracle_with(label: &str, shape: impl FnOnce(Rig, &str) -> Rig) -> Self {
+        let t = super::OracleTable::create(label, "id NUMBER(18) PRIMARY KEY, v NUMBER(18)");
+        let table = t.name().to_string();
+        super::ora_exec(&format!(
+            "ALTER TABLE {table} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS"
+        ));
+        super::ora_exec(&format!("GRANT SELECT ON {table} TO c##rivetcdc"));
+        Self {
+            rig: shape(Rig::oracle_cdc(&table), &table),
+            table,
+            exec: ScnExec::Oracle,
+            _guards: vec![Box::new(t)],
+        }
+    }
+
     /// SQL Server: table + capture instance (guarded) + pin at max LSN.
     pub fn mssql(label: &str, cols: &str) -> Self {
         let s = Self::mssql_with(label, cols, |r, _| r);
@@ -959,6 +981,19 @@ impl CdcScenario {
                 super::mssql::mssql_cdc_exec(q)
             }
             ScnExec::Mongo(_) => panic!("a MongoDB scenario has no SQL — use insert/update/delete"),
+            #[cfg(feature = "oracle")]
+            ScnExec::Oracle => super::ora_exec(q),
+        }
+    }
+
+    /// Empty the captured relation the way the engine's log records as a truncate (MongoDB: drop the collection).
+    pub fn truncate(&mut self) {
+        match &mut self.exec {
+            ScnExec::Mongo(m) => m.drop_collection(&self.table),
+            _ => {
+                let t = self.qualified();
+                self.sql(&format!("TRUNCATE TABLE {t}"))
+            }
         }
     }
 
@@ -1040,6 +1075,13 @@ impl CdcScenario {
                 super::mssql::mssql_cdc_query_i64(&format!("SELECT COUNT(*) FROM {t}"))
             }
             ScnExec::Mongo(m) => m.count(&self.table) as i64,
+            #[cfg(feature = "oracle")]
+            ScnExec::Oracle => super::ora_text_rows(&format!("SELECT TO_CHAR(COUNT(*)) FROM {t}"))
+                [0][0]
+                .as_deref()
+                .expect("a count")
+                .parse()
+                .expect("an integer count"),
         }
     }
 
@@ -1060,6 +1102,34 @@ impl CdcScenario {
 #[cfg(test)]
 mod rig_render_goldens {
     use super::*;
+
+    /// `rivet cdc` takes each engine's stream identity from the rig, and `--checkpoint` only when asked.
+    #[test]
+    fn cdc_cli_argv_carries_the_rigs_own_stream_identity() {
+        let pg = Rig::pg_cdc("t", "s1").cdc_cli_argv(false);
+        assert_eq!(
+            pg,
+            [
+                "cdc",
+                "--source",
+                crate::common::env::POSTGRES_CDC_URL,
+                "--table",
+                "t",
+                "--slot",
+                "s1"
+            ]
+        );
+        let ms = Rig::mssql_cdc("t", "dbo_t").cdc_cli_argv(false);
+        assert_eq!(ms[5..], ["--capture-instance", "dbo_t"]);
+        let my = Rig::mysql_cdc("t");
+        let sid = server_id_for("t").to_string();
+        let ckpt = my.checkpoint().display().to_string();
+        assert_eq!(
+            my.cdc_cli_argv(true)[5..],
+            ["--server-id", sid.as_str(), "--checkpoint", ckpt.as_str()]
+        );
+        assert_eq!(Rig::mongo_cdc("t").cdc_cli_argv(false).len(), 5);
+    }
 
     /// `url_env:` replaces the inline `url:` in both source-render shapes.
     ///

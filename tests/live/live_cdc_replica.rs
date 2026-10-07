@@ -97,6 +97,7 @@ fn read_cdc_rows(dir: &std::path::Path) -> Vec<(String, i32, Option<i32>)> {
 #[test]
 #[ignore = "live: requires docker compose --profile replica (mysql-primary :3308 → mysql-replica :3309)"]
 fn cdc_reads_changes_from_a_replica() {
+    let _serial = cross_process_serial("mysql_replica");
     ensure_replication();
     let mut p = conn(PRIMARY);
     let table = unique_name("rep_cdc");
@@ -185,6 +186,7 @@ const NOLOG_RIVET: &str = "mysql://rivet:rivet@127.0.0.1:3310/rivet";
 #[test]
 #[ignore = "live: requires docker compose --profile replica (mysql-primary :3308 → mysql-replica-nolog :3310)"]
 fn cdc_from_a_replica_that_does_not_relog_refuses_instead_of_capturing_nothing() {
+    let _serial = cross_process_serial("mysql_replica");
     ensure_replication_on(NOLOG_ROOT);
     let mut p = conn(PRIMARY);
     let mut r = conn(NOLOG_ROOT);
@@ -339,6 +341,7 @@ fn failover(tag: &str) -> Failover {
 #[test]
 #[ignore = "live: requires docker compose --profile replica (mysql-primary :3308 → mysql-replica :3309)"]
 fn a_failover_to_another_cluster_member_is_refused_not_resumed_at_foreign_coordinates() {
+    let _serial = cross_process_serial("mysql_replica");
     let f = failover("rep_failover_safe");
     let ckpt_before = std::fs::read(&f.ckpt).unwrap();
     let said = f.on_primary.run_expect_fail();
@@ -362,6 +365,7 @@ fn a_failover_to_another_cluster_member_is_refused_not_resumed_at_foreign_coordi
 #[ignore = "live: requires docker compose --profile replica (mysql-primary :3308 → mysql-replica :3309)"]
 #[should_panic(expected = "rivet did not follow the failover")]
 fn cdc_follows_a_failover_to_another_cluster_member_by_gtid() {
+    let _serial = cross_process_serial("mysql_replica");
     let f = failover("rep_failover_follow");
     let res = f.on_primary.run_args(&[]);
     let _ = conn(PRIMARY).query_drop(format!("DROP TABLE IF EXISTS {}", f.table));
