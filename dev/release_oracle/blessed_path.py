@@ -376,11 +376,10 @@ def _cell_config(engine: str, scenario: str, table: str, export: str, tls: str, 
     )
 
 
-#: What rivet does TODAY when two configs share one state DB and one export name and read different collections
-#: with `mongo.resume`: `collides` (the second continues from the first one's `_id` and ships short with exit 0),
-#: `refused`, or `independent`. Whether it should refuse is an open product question (see the gate report of
-#: 25e6a47b); when that lands, this is the one value to flip.
-SAME_NAME_RESUME_TODAY = "collides"
+#: What rivet does when two configs share one state DB and one export name and read different collections with
+#: `mongo.resume`: `refused` (stored progress names its stream, so the second export is told to take its own name),
+#: `collides` (the second continues from the first one's `_id` and ships short with exit 0), or `independent`.
+SAME_NAME_RESUME_TODAY = "refused"
 
 
 def same_name_outcome(second_ok: bool, delivered: int, source: int) -> str:
@@ -389,7 +388,7 @@ def same_name_outcome(second_ok: bool, delivered: int, source: int) -> str:
 
 
 def sc_same_name_resume(led: Ledger, engine: str, tag: str, url: str, state_url: str = "") -> None:
-    """DOCUMENTS today's behaviour of two same-named `mongo.resume` exports of different collections on one state."""
+    """Two same-named `mongo.resume` exports of different collections on one state: the second is refused."""
     first, second = GOLDEN_TABLES[0], GOLDEN_TABLES[1]
     work = scenarios.Scope(engine, tag).dir("samename", "pg" if state_url else "sq")
     shutil.rmtree(work, ignore_errors=True)
@@ -417,7 +416,7 @@ def sc_same_name_resume(led: Ledger, engine: str, tag: str, url: str, state_url:
     if seen != SAME_NAME_RESUME_TODAY:
         return led.failed(engine, tag, cell, "local", f"{what}; the gate pins `{SAME_NAME_RESUME_TODAY}` as today's "
                           "behaviour — if the product changed on purpose, flip SAME_NAME_RESUME_TODAY", seen)
-    led.passed(engine, tag, cell, "local", f"DOCUMENTS (open product question, not an endorsement): {what}", seen)
+    led.passed(engine, tag, cell, "local", what, seen)
 
 
 def sc_blessed_path(
