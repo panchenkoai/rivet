@@ -1,0 +1,13 @@
+diff --git a/src/state/checkpoint.rs b/src/state/checkpoint.rs
+index a27d7438..895a2ea3 100644
+--- a/src/state/checkpoint.rs
++++ b/src/state/checkpoint.rs
+@@ -62,7 +62,7 @@ impl StateStore {
+         source: Option<&str>,
+     ) -> Result<Option<(String, String)>> {
+         let by = match source {
+-            Some(_) => "source = ?2",
++            Some(_) => "?2 = ?2",
+             None => "source IS NULL AND ?2 = ''",
+         };
+         self.query_opt(

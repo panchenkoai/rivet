@@ -240,6 +240,48 @@ seeds:
         cells:
           - "lib:the_rebaseline_remedy_names_the_steps_the_product_runs"
 
+  - name: interrupted-run-continued-by-another-mode
+    class: an unfinished checkpoint run's stored progress (page cursor, anchor) is continued by a run of another mode as if it were a committed high-water
+    history: "2026-10-06 - a keyset run crashed after page 0, the export was switched to mode: incremental without a reset: exit 0 with _SUCCESS and a manifest of 1900 of 2000 rows (v0.31.0)"
+    scope: source
+    patch: interrupted-run-continued-by-another-mode/shared.patch
+    engines:
+      postgres:
+        cells:
+          - crashed_keyset_then_incremental_finish_the_run_postgres
+          - crashed_keyset_then_incremental_reset_postgres
+          - crashed_range_chunk_then_incremental_reset_postgres
+      mysql:
+        cells:
+          - crashed_keyset_then_incremental_finish_the_run_mysql
+          - crashed_keyset_then_incremental_reset_mysql
+          - crashed_range_chunk_then_incremental_reset_mysql
+      mssql:
+        cells:
+          - crashed_keyset_then_incremental_finish_the_run_mssql
+          - crashed_keyset_then_incremental_reset_mssql
+          - crashed_range_chunk_then_incremental_reset_mssql
+      oracle:
+        cells:
+          - crashed_keyset_then_incremental_finish_the_run_oracle
+          - crashed_keyset_then_incremental_reset_oracle
+
+  - name: chunk-run-resumed-by-another-source
+    class: an interrupted range-chunk run is looked up by export name alone and resumed by a same-named export of another source
+    history: "2026-10-06 - config A crashed after chunk 0, same-named config B of another database ran: exit 0, 'resuming it', 1000 of 5000 rows (v0.31.0)"
+    scope: source
+    patch: chunk-run-resumed-by-another-source/shared.patch
+    engines:
+      postgres:
+        cells:
+          - range_chunk_shared_name_another_source_postgres
+      mysql:
+        cells:
+          - range_chunk_shared_name_another_source_mysql
+      mssql:
+        cells:
+          - range_chunk_shared_name_another_source_mssql
+
   - name: progress-inherited-by-another-stream
     class: stored progress (incremental cursor, keyset high-water, resume anchor) is continued by an export that reads another table or collection
     history: "2026-10-06 - two same-named exports on one state database, or one export repointed without a reset: exit 0 with _SUCCESS and 0 of 1000 rows (v0.30.0, v0.31.0)"
