@@ -998,3 +998,44 @@ fn incremental_keyset_apply_rotates_run_id_across_repeated_applies() {
         "each apply must rotate the run_id → two distinct manifest-<run_id>.json copies; 1 means the apply wrapper left the resume anchor frozen (the run_id-collision silent-delta-skip class)"
     );
 }
+
+/// P-26: a sealed plan keeps the `{date}` placeholder, so an apply writes under the date it runs on.
+#[test]
+#[ignore = "live+gate-only: postgres; open defect P-26, acknowledged in dev/release_oracle/known_red.py"]
+fn open_defect_a_sealed_plan_keeps_the_date_placeholder() {
+    require_alive(LiveService::Postgres);
+    let table = seed_pg_numeric_table(10);
+    let root = tempfile::tempdir().unwrap();
+    let rig = Rig::pg_batch(table.name())
+        .source_url_env("DATABASE_URL")
+        .dest_path(root.path().join("{date}"));
+    let envs = [("DATABASE_URL", POSTGRES_URL)];
+    let plan = root.path().join("plan.json");
+    let planned = rig.plan_json_env(&plan, &[], &envs);
+    assert!(
+        planned.status.success(),
+        "{}",
+        String::from_utf8_lossy(&planned.stderr)
+    );
+    let applied = rig.apply_env(&plan, &[], &envs);
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    let dated: Vec<std::path::PathBuf> = std::fs::read_dir(root.path())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.is_dir() && !p.ends_with("{date}") && !p.ends_with(".rivet"))
+        .collect();
+    assert_eq!(dated.len(), 1, "one dated directory: {dated:?}");
+    let rows: usize = read_all_parts(&dated[0]).iter().map(|b| b.num_rows()).sum();
+    assert_eq!(rows, 10, "the apply delivers the table");
+
+    let artifact = std::fs::read_to_string(&plan).unwrap();
+    assert!(
+        artifact.contains("{date}"),
+        "P-26: the sealed plan holds no `{{date}}` placeholder: its destination is frozen at the planning date, {:?}",
+        dated[0].file_name().unwrap()
+    );
+}

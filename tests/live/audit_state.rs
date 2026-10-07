@@ -178,3 +178,101 @@ fn audit_state_show_refuses_a_missing_config_path() {
         leaked_db.display()
     );
 }
+
+/// P-19: `state reset --export X` under one config keeps the cursor a same-named export of another source stored.
+#[test]
+#[ignore = "live+gate-only: postgres; open defect P-19, acknowledged in dev/release_oracle/known_red.py"]
+fn open_defect_state_reset_keeps_the_cursor_of_another_source() {
+    let e = SqlEngine::Pg;
+    e.alive();
+    let (table, _guard) = e.table("audit_state");
+    e.insert(&table, 1..=10, 180, Some(10));
+    let other = pg_other_database_url();
+    let _other_guard = pg_same_table_on(&other, &table, 7);
+    let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let on = |rig: Rig, url: &str, out: &std::path::Path| {
+        rig.source_url(url)
+            .restage("incremental", &["cursor_column: id"])
+            .dest_path(out.to_path_buf())
+    };
+
+    let rig = on(e.rig(&table), POSTGRES_URL, a.path());
+    rig.run_ok();
+    let rig = on(rig, &other, b.path());
+    rig.run_ok();
+    assert_eq!(read_ids(b.path()), (1..=7).collect::<Vec<_>>());
+
+    let rig = on(rig, POSTGRES_URL, a.path());
+    let reset = rig.cli(&["state", "reset", "--export", &table]);
+    assert!(
+        reset.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reset.stderr)
+    );
+
+    let rig = on(rig, &other, b.path());
+    rig.run_ok();
+    let on_disk = read_ids(b.path()).len();
+    assert!(
+        on_disk == 7,
+        "P-19: `state reset` under one config deleted the cursor of a same-named export of another source: its next run re-delivered the table ({on_disk} rows on disk for 7 source ids)"
+    );
+}
+
+/// P-23: a `state reset` accepted while an incremental run reads must not leave that run's delta published as a full pass.
+#[test]
+#[ignore = "live+gate-only: postgres; open defect P-23, acknowledged in dev/release_oracle/known_red.py"]
+fn open_defect_state_reset_during_an_incremental_read_keeps_the_manifest_honest() {
+    let e = SqlEngine::Pg;
+    e.alive();
+    let (table, _guard) = e.table("audit_state");
+    e.insert(&table, 1..=10, 180, Some(10));
+    let out = tempfile::tempdir().unwrap();
+    let rig = e
+        .rig(&table)
+        .restage("incremental", &["cursor_column: id"])
+        .dest_path(out.path().to_path_buf());
+    rig.run_ok();
+    e.insert(&table, 11..=13, 170, Some(10));
+
+    let scratch = tempfile::tempdir().unwrap();
+    let paused = scratch.path().join("paused");
+    let mut run = rig.spawn_args_env(
+        &[],
+        &[
+            ("RIVET_TEST_PAUSE_AT", "pg_after_snapshot_open:4000"),
+            ("RIVET_TEST_PAUSE_MARKER", paused.to_str().unwrap()),
+        ],
+    );
+    let waited = std::time::Instant::now();
+    while !paused.exists() {
+        assert!(
+            waited.elapsed().as_secs() < 60,
+            "the run never reached its read"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let reset = rig.cli(&["state", "reset", "--export", &table]);
+    let status = run.wait().unwrap();
+    assert!(
+        status.success(),
+        "the incremental run failed beside a `state reset`"
+    );
+    if !reset.status.success() {
+        return;
+    }
+
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.path().join("manifest.json")).unwrap()).unwrap();
+    let stage = tempfile::tempdir().unwrap();
+    for part in manifest["parts"].as_array().expect("a parts list") {
+        let name = part["path"].as_str().expect("a part path");
+        std::fs::copy(out.path().join(name), stage.path().join(name)).unwrap();
+    }
+    let listed = ids_of(&read_all_parts(stage.path()));
+    assert!(
+        !manifest["source"]["extraction"]["cursor_low"].is_null()
+            || listed == (1..=13).collect::<Vec<_>>(),
+        "P-23: a `state reset` accepted during an incremental read left a manifest with no cursor_low over a delta: its parts hold ids {listed:?} of 1..=13"
+    );
+}

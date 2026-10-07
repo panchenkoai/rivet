@@ -288,3 +288,45 @@ fn destination_parity_row_counts_match_across_local_s3_gcs() {
         "gcs (fake-gcs) downloaded row count must equal the seed"
     );
 }
+
+/// P-27: a relative `destination.path` names one place whatever directory rivet is started from.
+#[test]
+#[ignore = "live+gate-only: postgres; open defect P-27, acknowledged in dev/release_oracle/known_red.py"]
+fn open_defect_a_relative_destination_path_does_not_follow_the_working_directory() {
+    let e = SqlEngine::Pg;
+    e.alive();
+    let (table, _guard) = e.table("dest_relative");
+    e.insert(&table, 1..=10, 180, Some(10));
+    let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let rig = e
+        .rig(&table)
+        .restage("incremental", &["cursor_column: id"])
+        .unwritable_dest_path(std::path::PathBuf::from("./out"));
+    let ran = |dir: &std::path::Path| {
+        let run = rig.run_in_dir(dir);
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+    };
+    ran(a.path());
+    e.insert(&table, 11..=13, 170, Some(10));
+    ran(b.path());
+
+    let beside_config = rig.config_path();
+    let held = |dir: &std::path::Path| {
+        let out = dir.join("out");
+        if out.is_dir() {
+            read_ids(&out)
+        } else {
+            Vec::new()
+        }
+    };
+    let (first, second) = (held(a.path()), held(b.path()));
+    let whole = (1..=13).collect::<Vec<_>>();
+    assert!(
+        [&first, &second, &held(beside_config.parent().unwrap())].contains(&&whole),
+        "P-27: one config with a relative destination.path delivered ids {first:?} under the first working directory and {second:?} under the second: no directory holds the 13 source rows"
+    );
+}

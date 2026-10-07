@@ -284,7 +284,9 @@ const MATRICES: &[(&str, usize)] = &[
     ("docs/runner-coverage-matrix.yaml", 0),
     // Mode transitions (ADR-0033). 3 gaps: MT6, pre-v26 incremental cursors carry no identity.
     // Raised 0 -> 14 (2026-09-26): the Oracle column's honest gaps (batch-only phase 1).
-    ("docs/mode-transition-matrix.yaml", 14),
+    // Raised 14 -> 29 (2026-10-07): five open-defect rows (P-02, P-06, P-18, P-22, an edited query
+    // filter) are pinned on PostgreSQL only; their MySQL, SQL Server and Oracle cells are gaps.
+    ("docs/mode-transition-matrix.yaml", 29),
     // Pool-split — `apply --pool --split` per (strategy × source engine). Split is a
     // scheduler layer above the runners (each unit runs through chunked/keyset), so its
     // per-engine behaviour (boundary probe, crash-recovery, finding-2 exact-partition

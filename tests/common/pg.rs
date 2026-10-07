@@ -59,6 +59,27 @@ impl Drop for PgTable {
     }
 }
 
+/// The stand server's `postgres` database: a second source beside `rivet` for a same-named table.
+pub fn pg_other_database_url() -> String {
+    let (server, _) = POSTGRES_URL.rsplit_once('/').expect("a database path");
+    format!("{server}/postgres")
+}
+
+/// Create `table` in the `SqlEngine::table` shape with ids `1..=rows` in the database at `url`, with its drop guard.
+pub fn pg_same_table_on(url: &str, table: &str, rows: i64) -> PgTable {
+    PgClient::connect(url, NoTls)
+        .expect("connect to the other database")
+        .batch_execute(&format!(
+            "CREATE TABLE {table} (id BIGINT PRIMARY KEY, ext_id BIGINT NOT NULL UNIQUE, \
+             server_time TIMESTAMP NOT NULL, updated_at TIMESTAMP NULL, time_spent INT NULL); \
+             INSERT INTO {table} (id, ext_id, server_time, time_spent) \
+             SELECT g, g * 10, (now() AT TIME ZONE 'UTC') - INTERVAL '180 minutes', 10 \
+             FROM generate_series(1, {rows}) g"
+        ))
+        .expect("create the same-named table");
+    PgTable::adopt_on(url, table.to_string())
+}
+
 /// Create a uniquely-named Postgres table populated with `row_count` rows of
 /// the canonical `(id BIGINT, name TEXT, amount NUMERIC, created_at TIMESTAMPTZ)`
 /// shape used throughout the live-test suite.  Returns a `PgTable` guard

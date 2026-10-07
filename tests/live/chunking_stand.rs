@@ -2842,3 +2842,39 @@ fn stand_pool_split_into_one_cloud_prefix_loses_nothing_postgres() {
 fn stand_pool_split_cloud_crash_then_resume_declares_every_id_postgres() {
     pool_split_cloud(Some(("RIVET_TEST_ERROR_AT", "chunk_export:1")));
 }
+
+/// A `double precision` chunk_column under `query:` is refused or delivers every row: integer windows skip the fractional keys.
+#[test]
+#[ignore = "live+gate-only: postgres; open defect (float chunk_column under query), acknowledged in dev/release_oracle/known_red.py"]
+fn open_defect_a_float_chunk_column_under_query_keeps_its_fractional_keys_postgres() {
+    let e = SqlEngine::Pg;
+    e.alive();
+    let (table, _guard) = e.create(
+        "chunk_float",
+        "k DOUBLE PRECISION PRIMARY KEY, id BIGINT NOT NULL, time_spent INT NULL",
+    );
+    e.exec(&format!(
+        "INSERT INTO {table} SELECT g, g, 0 FROM generate_series(1, 40) g; \
+         INSERT INTO {table} VALUES (10.5, 41, 0), (20.5, 42, 0), (30.5, 43, 0)"
+    ));
+    let out = tempfile::tempdir().unwrap();
+    let rig = e
+        .rig(&table)
+        .query(&format!("SELECT k, id, time_spent FROM {table}"))
+        .restage("chunked", &["chunk_column: k", "chunk_size: 10"])
+        .dest_path(out.path().to_path_buf());
+    let run = rig.run();
+    if !run.status.success() {
+        let said = String::from_utf8_lossy(&run.stderr);
+        assert!(
+            said.contains("chunk_column"),
+            "a refusal must name the chunk_column:\n{said}"
+        );
+        return;
+    }
+    let delivered = read_ids(out.path()).len();
+    assert!(
+        delivered == 43,
+        "a double precision chunk_column under `query:` delivered {delivered} of 43 rows with exit 0"
+    );
+}
