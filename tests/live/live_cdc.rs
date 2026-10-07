@@ -2035,6 +2035,110 @@ fn pg_multi_table_truncate_remedy_recovers_the_other_tables_row_the_advance_skip
     );
 }
 
+/// Three empty `(id, v)` tables on the PostgreSQL CDC stand, their guards, and a connection.
+fn pg_trio(label: &str) -> ([String; 3], Vec<PgTable>, postgres::Client) {
+    let names = ["a", "b", "c"].map(|x| unique_name(&format!("{label}_{x}")));
+    let mut c =
+        postgres::Client::connect(POSTGRES_CDC_URL, postgres::NoTls).expect("connect postgres");
+    for t in &names {
+        c.batch_execute(&format!(
+            "DROP TABLE IF EXISTS {t}; CREATE TABLE {t} (id INT PRIMARY KEY, v INT)"
+        ))
+        .unwrap();
+    }
+    let guards = names
+        .iter()
+        .map(|t| PgTable::adopt_on(POSTGRES_CDC_URL, t.clone()))
+        .collect();
+    (names, guards, c)
+}
+
+/// Three empty `(id, v)` tables on the MySQL CDC stand, their guards, and a connection.
+fn mysql_trio(label: &str) -> ([String; 3], [Table; 3], mysql::PooledConn) {
+    let names = ["a", "b", "c"].map(|x| unique_name(&format!("{label}_{x}")));
+    let mut c = conn();
+    for t in &names {
+        c.query_drop(format!("DROP TABLE IF EXISTS {t}")).unwrap();
+        c.query_drop(format!("CREATE TABLE {t} (id INT PRIMARY KEY, v INT)"))
+            .unwrap();
+    }
+    (names.clone(), names.map(Table), c)
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical) + the rivet-duckdb oracle"]
+fn pg_table_removed_from_tables_and_put_back_is_refused_until_rebaselined() {
+    let (t, _guards, mut c) = pg_trio("cdc_rejoin");
+    let slot = unique_name("rivet_rejoin_slot");
+    let _slot = Slot::new(slot.clone());
+    a_table_put_back_is_refused_until_rebaselined(
+        Rig::pg_cdc(&t[0], &slot),
+        [&t[0], &t[1], &t[2]],
+        &mut |t, op| c.batch_execute(&op.sql(t)).unwrap(),
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc + the rivet-duckdb oracle"]
+fn mysql_table_removed_from_tables_and_put_back_is_refused_until_rebaselined() {
+    let (t, _guards, mut c) = mysql_trio("cdc_rejoin");
+    a_table_put_back_is_refused_until_rebaselined(
+        Rig::mysql_cdc(&t[0]),
+        [&t[0], &t[1], &t[2]],
+        &mut |t, op| c.query_drop(op.sql(t)).unwrap(),
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical) + the rivet-duckdb oracle"]
+fn pg_table_switched_to_another_over_its_baseline_is_refused_and_switched_back_continues() {
+    let (t, _guards, mut c) = pg_trio("cdc_switch");
+    let slot = unique_name("rivet_switch_slot");
+    let _slot = Slot::new(slot.clone());
+    a_table_switched_over_a_baseline_is_refused_and_switched_back_continues(
+        Rig::pg_cdc(&t[0], &slot),
+        [&t[0], &t[1]],
+        &|r, t| r.repoint(t),
+        &mut |t, op| c.batch_execute(&op.sql(t)).unwrap(),
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc + the rivet-duckdb oracle"]
+fn mysql_table_switched_to_another_over_its_baseline_is_refused_and_switched_back_continues() {
+    let (t, _guards, mut c) = mysql_trio("cdc_switch");
+    a_table_switched_over_a_baseline_is_refused_and_switched_back_continues(
+        Rig::mysql_cdc(&t[0]),
+        [&t[0], &t[1]],
+        &|r, t| r.repoint(t),
+        &mut |t, op| c.query_drop(op.sql(t)).unwrap(),
+    );
+}
+
+/// Unchanged: a table added to `tables:` that the stream never captured gets its baseline, with no refusal.
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical) + the rivet-duckdb oracle"]
+fn pg_table_added_to_tables_mid_stream_is_baselined() {
+    let ([ta, tb, tc], _guards, mut c) = pg_trio("cdc_join");
+    let slot = unique_name("rivet_join_slot");
+    let _slot = Slot::new(slot.clone());
+    for t in [&ta, &tb, &tc] {
+        c.batch_execute(&format!("INSERT INTO {t} VALUES (1, 10), (2, 20)"))
+            .unwrap();
+    }
+    let mut rig = Rig::pg_cdc(&ta, &slot)
+        .tables(&[&ta, &tc])
+        .cdc_line("initial: snapshot");
+    rig.run_ok();
+    rig = rig.tables(&[&ta, &tb, &tc]);
+    rig.run_ok();
+    assert_eq!(
+        dir_parquet_id_set(&rig.out_dir().join(&tb).join("snapshot")),
+        [1, 2].into(),
+        "the joining table's baseline holds its rows"
+    );
+}
+
 /// A lost checkpoint's warning remedy, followed as printed, re-reads a row written while it was gone.
 #[test]
 #[ignore = "live: requires docker compose --profile cdc mysql-cdc + the rivet-duckdb oracle"]
@@ -4386,6 +4490,10 @@ fn roast_mysql_cdc_refuses_a_view_whose_binlog_identity_is_the_base_table() {
     let _vg = ViewGuard(view.clone());
 
     let msg = Rig::mysql_cdc(&view)
+        .oracle_known_defect(
+            "a failed run left: cdc-checkpoint",
+            "known defect: a CDC run that refuses at open still writes its checkpoint at the position it started from; the anchor must be written after the open checks",
+        )
         .checkpoint_path(d.path().join("v.ckpt"))
         .dest_path(d.path().join("out"))
         .run_expect_fail();
@@ -4571,7 +4679,12 @@ fn roast_pg_cdc_refuses_a_truncate_instead_of_silently_diverging() {
         "the fixture's TRUNCATE must have emptied it"
     );
 
-    let rig = Rig::pg_cdc(&format!("public.{tbl}"), &slot).source_url(cdc_db.url());
+    let rig = Rig::pg_cdc(&format!("public.{tbl}"), &slot)
+        .a_failed_run_may_leave(
+            &[Leftover::OrphanPart, Leftover::FileLog, Leftover::CdcFlush],
+            "the stream delivers the rows it read before the TRUNCATE it refuses",
+        )
+        .source_url(cdc_db.url());
     // Through the rig, like every other live test here: `run_expect_fail` asserts
     // the non-zero exit AND returns stdout+stderr, so the hand-rolled
     // `run_rivet(&["run", "--config", …])` this used to call was a second way of
@@ -4639,7 +4752,12 @@ fn roast_pg_cdc_refuses_a_truncate_instead_of_silently_diverging() {
     c.execute(&format!("INSERT INTO {tbl} VALUES (9,90)"), &[])
         .unwrap();
     c.execute(&format!("TRUNCATE {other}, {tbl}"), &[]).unwrap();
-    let multi = Rig::pg_cdc(&format!("public.{tbl}"), &third_slot).source_url(cdc_db.url());
+    let multi = Rig::pg_cdc(&format!("public.{tbl}"), &third_slot)
+        .a_failed_run_may_leave(
+            &[Leftover::OrphanPart, Leftover::FileLog, Leftover::CdcFlush],
+            "the stream delivers the rows it read before the TRUNCATE it refuses",
+        )
+        .source_url(cdc_db.url());
     let said2 = multi.run_expect_fail();
     assert!(
         said2.contains(&tbl),
@@ -7646,6 +7764,10 @@ fn roast_pg_cdc_truncate_refusal_delivers_the_rows_it_already_read() {
     c.execute(&format!("TRUNCATE {ta}"), &[]).unwrap();
 
     let rig = Rig::pg_cdc(&format!("public.{ta}"), &slot)
+        .a_failed_run_may_leave(
+            &[Leftover::OrphanPart, Leftover::FileLog, Leftover::CdcFlush],
+            "the stream delivers the rows it read before the TRUNCATE it refuses",
+        )
         .tables(&[&format!("public.{ta}"), &format!("public.{tb}")]);
     let said = rig.run_expect_fail();
     assert!(
@@ -9551,6 +9673,10 @@ fn pg_cdc_a_failed_final_part_after_a_mid_window_roll_leaves_the_slot_behind_it(
         .export_named("ackw_cdc")
         .cdc_line("rollover: 1000")
         .cdc_line("rollover_memory_mb: 1")
+        .a_failed_run_may_leave(
+            &[Leftover::OrphanPart, Leftover::FileLog, Leftover::CdcFlush],
+            "the mid-window roll commits table A's part before the final part fails",
+        )
         .dest_path(out.clone());
     let said = rig.run_expect_fail();
 

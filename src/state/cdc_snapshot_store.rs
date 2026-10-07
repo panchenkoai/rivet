@@ -1,6 +1,13 @@
 use crate::error::Result;
 
-use super::StateStore;
+use super::{ProgressKey, StateStore};
+
+/// Whether `table` is none of the `captured` tables (a bare name may be the qualified one).
+pub(crate) fn joins_capture(captured: &[String], table: &str) -> bool {
+    captured
+        .iter()
+        .all(|c| super::cursor::streams_differ(c, table))
+}
 
 impl StateStore {
     /// Record that `cdc.initial: snapshot`'s backfill for `(export_name,
@@ -51,6 +58,43 @@ impl StateStore {
             .unwrap_or(0)
             > 0)
     }
+
+    /// The tables the CDC stream of `key` captured into `destination` on its last run; `None` when no run recorded them there.
+    pub fn captured_tables(
+        &self,
+        key: &ProgressKey,
+        destination: &str,
+    ) -> Result<Option<Vec<String>>> {
+        let row = self.query_opt(
+            "SELECT stream, destination FROM export_state WHERE export_name = ?1 AND prefix = ?2",
+            &[key.export_name.as_str().into(), key.source.as_str().into()],
+            |r| (r.opt_text(0), r.opt_text(1)),
+        )?;
+        Ok(match row {
+            Some((Some(stream), Some(dest))) if dest == destination => {
+                serde_json::from_str(&stream).ok()
+            }
+            _ => None,
+        })
+    }
+
+    /// Record the tables of `key` as what its CDC stream captures into `destination` from this run on.
+    pub fn record_captured_tables(&self, key: &ProgressKey, destination: &str) -> Result<()> {
+        self.execute(
+            "INSERT INTO export_state (export_name, prefix, stream, destination)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(export_name, prefix) DO UPDATE SET
+                stream = excluded.stream,
+                destination = excluded.destination",
+            &[
+                key.export_name.as_str().into(),
+                key.source.as_str().into(),
+                key.stream.as_str().into(),
+                destination.into(),
+            ],
+        )?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -99,6 +143,54 @@ mod tests {
             s.snapshot_done("users", "users", "b/pb/users/snapshot")
                 .unwrap()
         );
+    }
+
+    fn names(t: &[&str]) -> Vec<String> {
+        t.iter().map(|t| t.to_string()).collect()
+    }
+
+    /// The captured set is what the last run recorded, for its own source and destination only.
+    #[test]
+    fn a_stream_remembers_the_tables_of_its_last_run_per_source_and_destination() {
+        let s = StateStore::open_in_memory().unwrap();
+        let key = |tables: &[&str]| ProgressKey::cdc("e", "pg://h/db", &names(tables));
+        assert_eq!(s.captured_tables(&key(&["a"]), "b/out").unwrap(), None);
+        s.record_captured_tables(&key(&["b", "a,x"]), "b/out")
+            .unwrap();
+        assert_eq!(
+            s.captured_tables(&key(&["a"]), "b/out").unwrap(),
+            Some(names(&["a,x", "b"]))
+        );
+        assert_eq!(s.captured_tables(&key(&["a"]), "b/other").unwrap(), None);
+        let elsewhere = ProgressKey::cdc("e", "pg://h/other", &names(&["a"]));
+        assert_eq!(s.captured_tables(&elsewhere, "b/out").unwrap(), None);
+        s.record_captured_tables(&key(&["b"]), "b/out").unwrap();
+        assert_eq!(
+            s.captured_tables(&key(&["a"]), "b/out").unwrap(),
+            Some(names(&["b"]))
+        );
+    }
+
+    /// A row a batch run of the same name wrote holds a relation, not a table set: nothing is known.
+    #[test]
+    fn a_stream_recorded_by_a_batch_run_is_not_a_captured_set() {
+        let s = StateStore::open_in_memory().unwrap();
+        let key = ProgressKey::cdc("e", "pg://h/db", &names(&["a"]));
+        s.record_captured_tables(&key, "b/out").unwrap();
+        s.execute("UPDATE export_state SET stream = 'public.a'", &[])
+            .unwrap();
+        assert_eq!(s.captured_tables(&key, "b/out").unwrap(), None);
+    }
+
+    #[test]
+    fn a_table_joins_a_capture_that_names_it_in_no_spelling() {
+        let captured = names(&["public.a", "b"]);
+        assert!(!joins_capture(&captured, "a"));
+        assert!(!joins_capture(&captured, "public.b"));
+        assert!(!joins_capture(&captured, "b"));
+        assert!(joins_capture(&captured, "c"));
+        assert!(joins_capture(&captured, "xa"));
+        assert!(joins_capture(&[], "a"));
     }
 
     /// A row recorded before v29 has no prefix: it stays "done" wherever asked,

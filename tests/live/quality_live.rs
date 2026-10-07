@@ -76,7 +76,16 @@ fn unique_column_on_duplicate_data_fails_export() {
         .dest_path(out.path().to_path_buf());
     let (_cfgdir, cfgpath) = cfg(&rig);
 
-    let result = run_rivet_export(&cfgpath, &export_name);
+    let result = run_rivet_env(
+        &[
+            "run",
+            "--config",
+            cfgpath.to_str().unwrap(),
+            "--export",
+            &export_name,
+        ],
+        &[(FAILED_RUN_LEAVES_ENV, "orphan-part,file-log")],
+    );
     assert!(
         !result.status.success(),
         "unique check on duplicate data must fail the export"
@@ -151,7 +160,16 @@ fn row_count_min_gate_fails_when_below_threshold() {
         .dest_path(out.path().to_path_buf());
     let (_cfgdir, cfgpath) = cfg(&rig);
 
-    let result = run_rivet_export(&cfgpath, &export_name);
+    let result = run_rivet_env(
+        &[
+            "run",
+            "--config",
+            cfgpath.to_str().unwrap(),
+            "--export",
+            &export_name,
+        ],
+        &[(FAILED_RUN_LEAVES_ENV, "orphan-part,file-log")],
+    );
     assert!(
         !result.status.success(),
         "row_count_min=100 on 5-row source must fail the export"
@@ -182,7 +200,16 @@ fn row_count_max_gate_fails_when_above_threshold() {
         .dest_path(out.path().to_path_buf());
     let (_cfgdir, cfgpath) = cfg(&rig);
 
-    let result = run_rivet_export(&cfgpath, &export_name);
+    let result = run_rivet_env(
+        &[
+            "run",
+            "--config",
+            cfgpath.to_str().unwrap(),
+            "--export",
+            &export_name,
+        ],
+        &[(FAILED_RUN_LEAVES_ENV, "orphan-part,file-log")],
+    );
     assert!(
         !result.status.success(),
         "row_count_max=10 on 50-row source must fail the export"
@@ -225,7 +252,16 @@ fn null_ratio_max_gate_fails_when_exceeded() {
         .dest_path(out.path().to_path_buf());
     let (_cfgdir, cfgpath) = cfg(&rig);
 
-    let result = run_rivet_export(&cfgpath, &export_name);
+    let result = run_rivet_env(
+        &[
+            "run",
+            "--config",
+            cfgpath.to_str().unwrap(),
+            "--export",
+            &export_name,
+        ],
+        &[(FAILED_RUN_LEAVES_ENV, "orphan-part,file-log")],
+    );
     assert!(
         !result.status.success(),
         "null_ratio_max=0.1 with 80% nulls must fail the export"

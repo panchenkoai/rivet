@@ -618,6 +618,10 @@ fn keyset_over_an_mssql_datetime2_7_key_reads_every_row_once_or_refuses() {
     let rig = Rig::mssql_batch(&table)
         .duckdb_oracle()
         .mode("chunked")
+        .a_failed_run_may_leave(
+            &[Leftover::OrphanPart, Leftover::FileLog],
+            "the keyset run refuses once the seek cannot advance, after two pages are written; they carry no manifest",
+        )
         .export_line("chunk_by_key: ts")
         .export_line("chunk_size: 1");
     let out = rig

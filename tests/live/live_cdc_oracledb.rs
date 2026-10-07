@@ -38,6 +38,46 @@ fn ora_tx(stmts: &[String]) {
     conn.commit().unwrap();
 }
 
+/// Three `(id, v)` capture tables and their config spellings (`RIVET.<name>`).
+fn ora_trio(label: &str) -> (Vec<OracleTable>, [String; 3]) {
+    let tables: Vec<OracleTable> = ["a", "b", "c"]
+        .iter()
+        .map(|x| {
+            cdc_table(
+                &format!("{label}_{x}"),
+                "id NUMBER(18) PRIMARY KEY, v NUMBER(18)",
+            )
+        })
+        .collect();
+    let names = [0, 1, 2].map(|i| format!("RIVET.{}", tables[i].name()));
+    (tables, names)
+}
+
+#[test]
+#[ignore = "live: requires the oracle service with LogMiner prerequisites"]
+fn oracle_cdc_table_removed_from_tables_and_put_back_is_refused_until_rebaselined() {
+    let _serial = cross_process_serial("oracle_cdc");
+    let (tables, t) = ora_trio("ora_rejoin");
+    a_table_put_back_is_refused_until_rebaselined(
+        Rig::oracle_cdc(tables[0].name()),
+        [&t[0], &t[1], &t[2]],
+        &mut |t, op| ora_exec(&op.sql(t)),
+    );
+}
+
+#[test]
+#[ignore = "live: requires the oracle service with LogMiner prerequisites"]
+fn oracle_cdc_table_switched_to_another_over_its_baseline_is_refused_and_switched_back_continues() {
+    let _serial = cross_process_serial("oracle_cdc");
+    let (tables, t) = ora_trio("ora_switch");
+    a_table_switched_over_a_baseline_is_refused_and_switched_back_continues(
+        Rig::oracle_cdc(tables[0].name()),
+        [&t[0], &t[1]],
+        &|r, t| r.repoint(t),
+        &mut |t, op| ora_exec(&op.sql(t)),
+    );
+}
+
 fn ops(v: &[(i64, &str)]) -> Vec<(i64, String)> {
     v.iter().map(|(i, o)| (*i, o.to_string())).collect()
 }
@@ -815,10 +855,21 @@ fn oracle_cdc_truncate_refusal_delivers_the_rows_before_it_once() {
         "INSERT INTO {} VALUES (3, 30, DATE '2024-02-01')",
         t.name()
     ));
+    let refusing = |out: &std::path::Path| {
+        rig(&t, &ckpt, out).a_failed_run_may_leave(
+            &[
+                Leftover::OrphanPart,
+                Leftover::FileLog,
+                Leftover::CdcFlush,
+                Leftover::CdcCheckpoint,
+            ],
+            "the stream delivers the rows it read before the TRUNCATE it refuses, and its checkpoint follows them",
+        )
+    };
     let out1 = d.path().join("out1");
-    expect_truncate_refusal(&rig(&t, &ckpt, &out1), &out1, t.name(), "run 1");
+    expect_truncate_refusal(&refusing(&out1), &out1, t.name(), "run 1");
     let out2 = d.path().join("out2");
-    expect_truncate_refusal(&rig(&t, &ckpt, &out2), &out2, t.name(), "run 2");
+    expect_truncate_refusal(&refusing(&out2), &out2, t.name(), "run 2");
     let mut all = cdc_id_ops(&out1);
     all.extend(cdc_id_ops(&out2));
     assert_eq!(

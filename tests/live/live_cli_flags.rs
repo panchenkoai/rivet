@@ -525,6 +525,8 @@ fn run_reconcile_reports_mismatch_when_source_grows_after_snapshot() {
         &[
             ("RIVET_TEST_PAUSE_AT", "pg_after_snapshot_open:5000"),
             ("RIVET_TEST_PAUSE_MARKER", marker.to_str().unwrap()),
+            // Exit 3 is --reconcile's verdict on a run that delivered everything it read.
+            (FAILED_RUN_LEAVES_ENV, "delivered-run"),
         ],
     );
     writer.join().expect("writer thread");

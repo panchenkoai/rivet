@@ -436,6 +436,33 @@ pub(super) fn initial_snapshot_pending(
         ));
         done_flags.push(done);
     }
+    let capture = crate::state::ProgressKey::cdc(&export.name, &config.source.state_key(), &tables);
+    let capture_dest = export.destination.state_key();
+    let captured = state
+        .captured_tables(&capture, &capture_dest)?
+        .unwrap_or_else(|| tables.clone());
+    if let Some(i) = rejoins_over_a_baseline(&captured, &tables, &done_flags) {
+        let t = &tables[i];
+        let snap = super::finalize::destination_uri_for_manifest(&table_dests[i].2);
+        let snap = snap.trim_end_matches('/');
+        let dir = snap.strip_suffix("/snapshot").unwrap_or(snap);
+        crate::rivet_bail!(
+            crate::error::codes::STATE_CDC_TABLE_REJOINED,
+            "export '{}': table `{t}` is not among the tables this stream captured on its last \
+             run ({}), but a baseline is already recorded complete where its own would go (the \
+             state DB's `cdc_snapshot` row or `{snap}/_SUCCESS`) — its baseline would be \
+             skipped, and no change made to `{t}` while it was out of the capture was read; \
+             nothing was read or written.\n  \
+             Hint: re-baseline `{t}`: move every file out of `{dir}` (the snapshot/_SUCCESS \
+             marker goes with them); delete the `cdc_snapshot` row of export '{}', table `{t}` \
+             from the state DB; and if a warehouse load consumes this stream, truncate that \
+             table's `__changes` table before the next load. The next run reads `{t}` in full \
+             and captures it from there.",
+            export.name,
+            captured.join(", "),
+            export.name,
+        );
+    }
 
     // The pure decision: which tables still need a snapshot, and whether prior
     // evidence forces the fail-loud anchor guard.
@@ -468,6 +495,7 @@ pub(super) fn initial_snapshot_pending(
     // mechanism (idempotent: a present anchor is never moved). After the refusal
     // above, so a refused config leaves no slot or checkpoint behind.
     engine.ensure_anchor(&url, &slot, ckpt_path.as_deref(), tls, prior)?;
+    state.record_captured_tables(&capture, &capture_dest)?;
 
     // The anchor STRING for the snapshot stamp (round-10 STRUCT): rendered by
     // the same `Position.0.to_string()` the drain writes into `__pos`, read
@@ -674,6 +702,11 @@ fn snapshot_plan(
         snapshot: done_flags.iter().any(|&d| d),
     };
     (pending, prior)
+}
+
+/// The first table that joins a stream whose last run did not capture it while its baseline is recorded done.
+fn rejoins_over_a_baseline(captured: &[String], tables: &[String], done: &[bool]) -> Option<usize> {
+    (0..tables.len()).find(|&i| done[i] && crate::state::joins_capture(captured, &tables[i]))
 }
 
 /// A multi-table stream lands each table under its own sub-prefix of the
@@ -1683,6 +1716,21 @@ mod tests {
         checkpoint: false,
         snapshot: true,
     };
+
+    /// Refused: a table the last run did not capture whose baseline is done. Never: a captured table, or a new one.
+    #[test]
+    fn only_a_table_outside_the_last_capture_with_a_done_baseline_rejoins() {
+        let t = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        let (a, ab) = (t(&["a"]), t(&["a", "b"]));
+        assert_eq!(rejoins_over_a_baseline(&a, &ab, &[true, true]), Some(1));
+        assert_eq!(rejoins_over_a_baseline(&a, &ab, &[true, false]), None);
+        assert_eq!(rejoins_over_a_baseline(&ab, &ab, &[true, true]), None);
+        assert_eq!(rejoins_over_a_baseline(&ab, &a, &[true]), None);
+        assert_eq!(
+            rejoins_over_a_baseline(&t(&["b"]), &ab, &[true, true]),
+            Some(0)
+        );
+    }
 
     #[test]
     fn snapshot_plan_first_run_snapshots_all_with_no_resume_evidence() {

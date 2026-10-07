@@ -63,6 +63,7 @@ mod mysql;
 mod oracle;
 mod parquet;
 mod pg;
+mod refusal;
 mod registry;
 mod rig;
 mod runner;
@@ -84,6 +85,7 @@ pub use mysql::*;
 pub use oracle::*;
 pub use parquet::*;
 pub use pg::*;
+pub use refusal::{FAILED_RUN_LEAVES_ENV, Leftover};
 pub use registry::*;
 pub use rig::*;
 pub use runner::*;
@@ -197,6 +199,149 @@ pub fn follow_rebaseline_remedy(rig: &mut Rig, has_baseline: bool) {
         rig.amend_cdc_line("initial: snapshot");
     }
     rig.run_ok();
+}
+
+/// One source write on an `(id, v)` table, engine-neutral.
+#[derive(Clone, Copy)]
+pub enum Churn {
+    Insert(i64),
+    Update(i64),
+    Delete(i64),
+}
+
+impl Churn {
+    /// The statement for a SQL engine.
+    pub fn sql(self, table: &str) -> String {
+        match self {
+            Churn::Insert(id) => format!("INSERT INTO {table} (id, v) VALUES ({id}, {id}0)"),
+            Churn::Update(id) => format!("UPDATE {table} SET v = 99 WHERE id = {id}"),
+            Churn::Delete(id) => format!("DELETE FROM {table} WHERE id = {id}"),
+        }
+    }
+}
+
+/// The text of a run's `RIVET_STATE_CDC_TABLE_REJOINED` refusal, from its code to the end.
+pub fn rejoin_refusal(said: String) -> String {
+    let at = said
+        .find("[RIVET_STATE_CDC_TABLE_REJOINED]")
+        .unwrap_or_else(|| panic!("the run names its refusal:\n{said}"));
+    said[at..].to_string()
+}
+
+/// Every file under `dir`, recursively.
+fn files_under(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    for e in std::fs::read_dir(dir)
+        .expect("read the directory")
+        .flatten()
+    {
+        if e.path().is_dir() {
+            found.extend(files_under(&e.path()));
+        } else {
+            found.push(e.path());
+        }
+    }
+    found.sort();
+    found
+}
+
+/// `tb` leaves `tables:`, changes, and comes back: refused twice with nothing written; the remedy as printed re-reads it and capture resumes (each green run is graded by the rig oracle).
+pub fn a_table_put_back_is_refused_until_rebaselined(
+    mut rig: Rig,
+    [ta, tb, tc]: [&str; 3],
+    exec: &mut dyn FnMut(&str, Churn),
+) {
+    for t in [ta, tb, tc] {
+        exec(t, Churn::Insert(1));
+        exec(t, Churn::Insert(3));
+    }
+    rig = rig.tables(&[ta, tb, tc]).cdc_line("initial: snapshot");
+    rig.run_ok();
+    rig = rig.tables(&[ta, tc]);
+    exec(tb, Churn::Insert(2));
+    exec(tb, Churn::Update(1));
+    exec(tb, Churn::Delete(3));
+    exec(ta, Churn::Insert(2));
+    rig.run_ok();
+    rig = rig.tables(&[ta, tb, tc]);
+    let dir = rig.out_dir().join(tb);
+    let before = files_under(&dir);
+    let first = rejoin_refusal(rig.run_expect_fail());
+    for said in [
+        format!(
+            "table `{tb}` is not among the tables this stream captured on its last run ({ta}, {tc})"
+        ),
+        format!("move every file out of `file://{}`", dir.display()),
+        format!(
+            "delete the `cdc_snapshot` row of export '{}', table `{tb}`",
+            rig.export_name()
+        ),
+    ] {
+        assert!(first.contains(&said), "the refusal says `{said}`:\n{first}");
+    }
+    assert_eq!(
+        rejoin_refusal(rig.run_expect_fail()),
+        first,
+        "the second run refuses for the same reason"
+    );
+    assert_eq!(files_under(&dir), before, "a refused run writes nothing");
+    std::fs::rename(&dir, dir.with_extension("before-rejoin")).expect("move the table's files out");
+    let cleared = clear_cdc_snapshot(
+        &rig.config_path(),
+        rig.export_name(),
+        &dir.to_string_lossy(),
+    );
+    assert_eq!(
+        cleared, 1,
+        "fixture: the one `cdc_snapshot` row of the table put back"
+    );
+    rig.run_ok();
+    assert!(
+        dir.join("snapshot").join("_SUCCESS").exists(),
+        "the remedy's run took the table's baseline again"
+    );
+    exec(tb, Churn::Insert(4));
+    rig.run_ok();
+}
+
+/// `table:` pointed at `tb` over `ta`'s baseline is refused twice; pointed back, the stream continues with the row written meanwhile.
+pub fn a_table_switched_over_a_baseline_is_refused_and_switched_back_continues(
+    mut rig: Rig,
+    [ta, tb]: [&str; 2],
+    repoint: &dyn Fn(Rig, &str) -> Rig,
+    exec: &mut dyn FnMut(&str, Churn),
+) {
+    for t in [ta, tb] {
+        exec(t, Churn::Insert(1));
+    }
+    rig = repoint(rig, ta).cdc_line("initial: snapshot");
+    rig.run_ok();
+    exec(ta, Churn::Insert(2));
+    rig = repoint(rig, tb);
+    let before = files_under(&rig.out_dir());
+    let first = rejoin_refusal(rig.run_expect_fail());
+    assert!(
+        first.contains(&format!(
+            "table `{tb}` is not among the tables this stream captured on its last run ({ta})"
+        )),
+        "the refusal names the table and the last capture:\n{first}"
+    );
+    assert_eq!(
+        rejoin_refusal(rig.run_expect_fail()),
+        first,
+        "the second run refuses for the same reason"
+    );
+    assert_eq!(
+        files_under(&rig.out_dir()),
+        before,
+        "a refused run writes nothing"
+    );
+    rig = repoint(rig, ta);
+    rig.run_ok();
+    assert!(
+        files_under(&rig.out_dir()).len() > before.len(),
+        "pointed back: the row written before the switch arrives as a change part"
+    );
 }
 
 pub fn unique_name(prefix: &str) -> String {

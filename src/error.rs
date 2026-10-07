@@ -474,6 +474,11 @@ pub mod codes {
         "RIVET_STATE_INTERRUPTED_RUN_OWNER_MISMATCH",
         "restore the previous mode's settings and run once to finish the interrupted run, then switch; or abandon it with the command the message names (`rivet state reset` for a keyset run, `rivet state reset-chunks` for a range-chunk run) and the next run starts with a full pass",
     );
+    /// A table joined a CDC stream that did not capture it on its last run, over a baseline already recorded complete.
+    pub const STATE_CDC_TABLE_REJOINED: Code = refusal(
+        "RIVET_STATE_CDC_TABLE_REJOINED",
+        "re-baseline the table the message names: move every file out of its directory in the destination, delete its `cdc_snapshot` row from the state DB, truncate its `__changes` table if a warehouse load consumes the stream, then re-run",
+    );
     /// An in-progress chunk run recorded no source, and its export name holds progress under more than one source.
     pub const STATE_CHUNK_RUN_OWNER_UNKNOWN: Code = refusal(
         "RIVET_STATE_CHUNK_RUN_OWNER_UNKNOWN",
@@ -600,6 +605,7 @@ pub mod codes {
         STATE_CURSOR_OWNER_MISMATCH,
         STATE_CURSOR_STREAM_MISMATCH,
         STATE_INTERRUPTED_RUN_OWNER_MISMATCH,
+        STATE_CDC_TABLE_REJOINED,
         STATE_CHUNK_RUN_OWNER_UNKNOWN,
         STATE_KEYSET_SEQUENTIAL_ANCHOR_UNFINISHED,
         STATE_RUN_IN_PROGRESS,

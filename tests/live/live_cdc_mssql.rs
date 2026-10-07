@@ -2999,3 +2999,34 @@ fn mssql_cdc_refuses_a_captured_value_it_cannot_decode() {
         "a valued xml cell must refuse the run, not land as NULL: {said}"
     );
 }
+
+#[test]
+#[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
+fn mssql_cdc_table_switched_to_another_over_its_baseline_is_refused_and_switched_back_continues() {
+    let _serial = cross_process_serial("mssql_cdc");
+    let mut pair = ["a", "b"].map(|x| {
+        CdcScenario::mssql_with(
+            &format!("cdc_switch_{x}"),
+            "id INT PRIMARY KEY, v INT",
+            |r, _| r,
+        )
+    });
+    let (ta, tb) = (pair[0].table.clone(), pair[1].table.clone());
+    a_table_switched_over_a_baseline_is_refused_and_switched_back_continues(
+        Rig::mssql_cdc(&ta, &format!("dbo_{ta}")),
+        [&ta, &tb],
+        &|r, t| r.repoint(t).capture_instance(&format!("dbo_{t}")),
+        &mut |t, op| {
+            let s = pair
+                .iter_mut()
+                .find(|s| s.table == t)
+                .expect("a table of the pair");
+            match op {
+                Churn::Insert(id) => s.insert(id),
+                Churn::Update(id) => s.update(id),
+                Churn::Delete(id) => s.delete(id),
+            }
+            s.settle();
+        },
+    );
+}

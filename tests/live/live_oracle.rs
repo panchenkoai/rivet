@@ -450,13 +450,14 @@ fn canon_num_normalises_every_rendering_to_one_form() {
 
 /// Every table of the seeded classic + garbage schema (`make seed-oracle`)
 /// exports in full: Parquet row count == the database's own `COUNT(*)`.
+/// Tables named `<name>_<pid>_<n>` are other tests' fixtures, dropped while this one runs.
 #[test]
 #[ignore = "live: requires docker compose oracle + make seed-oracle"]
 fn every_seeded_oracle_table_exports_every_row() {
     require_alive(LiveService::Oracle);
     let tables: Vec<String> = ora_text_rows(
         "SELECT table_name FROM user_tables WHERE table_name NOT LIKE 'ORA\\_%' ESCAPE '\\' \
-         ORDER BY table_name",
+         AND NOT REGEXP_LIKE(table_name, '_[0-9]+_[0-9]+$') ORDER BY table_name",
     )
     .into_iter()
     .filter_map(|r| r[0].clone())

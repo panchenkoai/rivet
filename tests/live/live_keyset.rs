@@ -2460,7 +2460,20 @@ fn keyset_resume_refuses_when_a_committed_page_was_deleted_between_attempts() {
         "fixture: the crash must have left durable parquet"
     );
 
-    let resume = run_rivet_export(&cfg, &export);
+    // The refusal races the other ranges: a worker may finish its unfinished range first.
+    let resume = run_rivet_env(
+        &[
+            "run",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--export",
+            &export,
+        ],
+        &[(
+            FAILED_RUN_LEAVES_ENV,
+            "orphan-part,file-log,chunk-checkpoint",
+        )],
+    );
     assert!(
         !resume.status.success(),
         "resume must REFUSE to declare deleted pages, not finalize Success over a hole"
