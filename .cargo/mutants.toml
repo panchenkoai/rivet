@@ -571,6 +571,14 @@ exclude_re = [
     "delete match arm .* in CdcEngine::ensure_anchor",
     "replace PgChangeStream::fill -> Result",
     "replace MysqlChangeStream::fill -> Result",
+    # The two slot-advancing bodies of the same live-only reader: each runs
+    # `pg_replication_slot_advance` on a real server. Their DECISIONS are graded
+    # offline (`owed_after_yield`, `owed_after_ack`); what is excluded is the stub.
+    # Live oracle proven by hand 2026-10-07 (stub applied, live cell run, restored):
+    # release_empty_frontier -> () ⇒ roast_pg_cdc_empty_transaction_churn_must_not_pin_the_slot FAILS
+    # ack -> Ok(())               ⇒ roast_pg_cdc_crash_between_checkpoint_and_ack_re_reads_and_releases_the_slot FAILS
+    "replace PgChangeStream::release_empty_frontier with \\(\\)$",
+    "replace <impl ChangeStream for PgChangeStream>::ack -> Result<\\(\\)> with Ok\\(\\(\\)\\)$",
     # The match GUARD on the MySQL TRUNCATE arm sits inside that same live-only body.
     # Flipping it to `true`/`false` is the addressed/un-addressed pair that the live
     # test grades directly (`if true` fails the bystander half; disabling fails the

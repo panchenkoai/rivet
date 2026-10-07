@@ -1,13 +1,13 @@
 diff --git a/src/source/postgres/cdc.rs b/src/source/postgres/cdc.rs
-index dff2c36c..bb16b293 100644
+index 31a7734d..5c6dff3f 100644
 --- a/src/source/postgres/cdc.rs
 +++ b/src/source/postgres/cdc.rs
-@@ -987,7 +987,7 @@ fn tx_disposition(commit_lsn: u64, frontier: u64, bound: Option<u64>) -> TxDispo
+@@ -1004,7 +1004,7 @@ fn owed_after_yield(
  
  /// What stays owed downstream after the sink acked `acked`: nothing once the ack covers the last data-bearing commit yielded.
- fn owed_after_ack(owed_through: u64, acked: Option<u64>) -> u64 {
--    if acked.is_some_and(|a| a >= owed_through) {
-+    if acked.is_some_and(|_| true) {
-         0
-     } else {
-         owed_through
+ fn owed_after_ack(owed_through: Option<u64>, acked: Option<u64>) -> Option<u64> {
+-    owed_through.filter(|owed| acked.is_none_or(|a| a < *owed))
++    owed_through.filter(|_| acked.is_none())
+ }
+ 
+ /// Wire budget per peek: the sink's ack cadence (the part rollover), clamped to
