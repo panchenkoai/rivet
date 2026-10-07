@@ -268,13 +268,13 @@ impl StateStore {
     /// Advance the cursor of `key` and record which column/key and which stream it belongs to.
     pub fn update_with_column(&self, key: &ProgressKey, cursor_value: &str) -> Result<()> {
         let (export_name, scope) = (key.export_name.as_str(), key.source.as_str());
-        let Some(cursor_column) = key.column.as_deref() else {
-            anyhow::bail!(
+        let cursor_column = key.column.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
                 "export '{export_name}': the run committed cursor `{cursor_value}` but its strategy has \
                  no cursor identity to record it under — a defect in the strategy, not the \
                  data; nothing was written"
-            );
-        };
+            )
+        })?;
         self.claim_legacy_row(export_name, scope)?;
         let now = chrono::Utc::now().to_rfc3339();
         let sql = "INSERT INTO export_state \

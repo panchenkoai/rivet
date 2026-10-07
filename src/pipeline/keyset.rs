@@ -910,6 +910,11 @@ fn resume_anchor(
     Ok(None)
 }
 
+/// Whether a keyset export with this `parallel:` runs the range-worker runner instead of the single seek loop.
+fn fans_out(parallel: usize) -> bool {
+    parallel > 1
+}
+
 /// Does a sequential keyset run seek from the persisted cursor (crash recovery,
 /// or `keyset_incremental`) rather than from the start of the key space?
 fn seeks_from_persisted_cursor(
@@ -959,7 +964,7 @@ pub(crate) fn run_keyset(
     // concurrently. `chunk_checkpoint` → per-range crash-recovery (iteration 2);
     // `keyset_incremental` → seek past the persisted anchor + advance it at success
     // (iteration 3); neither → a fresh full pass (iteration 1).
-    if kp.parallel > 1 {
+    if fans_out(kp.parallel) {
         return run_keyset_parallel(src, plan, summary, key_plan, kp.parallel, state, progress);
     }
 
@@ -1282,6 +1287,11 @@ mod tests {
             column: Some("id".into()),
             continues_cursor: false,
         }
+    }
+
+    #[test]
+    fn only_parallel_two_or_more_fans_out() {
+        assert_eq!([0, 1, 2, 8].map(fans_out), [false, false, true, true]);
     }
 
     #[test]

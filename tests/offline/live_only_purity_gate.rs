@@ -113,7 +113,7 @@ const BASELINE: &[(&str, usize, usize, usize, usize)] = &[
     // is dense with pagination/plan arithmetic. These are the ceilings most
     // worth spending: the runner-bypass class in the process rules is precisely a
     // per-runner decision that no offline test grades.
-    ("src/pipeline/keyset.rs::run_keyset", 3, 0, 1, 1),
+    ("src/pipeline/keyset.rs::run_keyset", 3, 0, 1, 0),
     ("src/pipeline/keyset.rs::run_keyset_parallel", 3, 0, 1, 2),
     // Excluded 2026-09-27 at their existing decisions (catalog-row parsing, the
     // statement-timeout arm), not grown by the exclusion; shrink as they are extracted.
