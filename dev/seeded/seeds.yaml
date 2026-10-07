@@ -347,3 +347,45 @@ seeds:
       lib:
         cells:
           - "lib:completing_a_chunk_run_whose_row_is_gone_is_refused"
+  - name: apply-skips-partition-expansion
+    class: an entry point builds its own export list instead of taking the run set, and runs a `partition_by` export unexpanded
+    history: "`rivet apply <config>`, `--pool` and a sealed plan wrote the whole table under a directory literally named `{partition}`, exit 0 (v0.31.0)"
+    scope: source
+    patch: apply-skips-partition-expansion/shared.patch
+    engines:
+      postgres:
+        cells:
+          - apply_config_partitions_like_run_postgres
+          - apply_pool_partitions_like_run_postgres
+          - a_sealed_plan_of_a_partitioned_export_is_refused_and_its_remedy_works_postgres
+      mysql:
+        cells: [apply_forms_partition_like_run_mysql]
+      mssql:
+        cells: [apply_forms_partition_like_run_mssql]
+      oracle:
+        cells: [apply_forms_partition_like_run_oracle]
+      mongo:
+        na: "partition_by is refused for a MongoDB source at config load (the bucket probes are SQL), so no entry point can run one unexpanded"
+      lib:
+        cells:
+          - "lib:a_plan_with_an_unexpanded_partition_token_is_refused_before_any_write"
+
+  - name: stdout-swallowed-by-child-processes
+    class: "a `destination: stdout` export is handed to a child process, whose stdout the parent reads as its event stream"
+    history: "`rivet run --parallel-export-processes > out.csv` exited 0 with 0 bytes and a summary of `rows: 120` (v0.31.0)"
+    scope: source
+    patch: stdout-swallowed-by-child-processes/shared.patch
+    engines:
+      postgres:
+        cells: [stdout_survives_child_processes_postgres]
+      mysql:
+        cells: [stdout_survives_child_processes_mysql]
+      mssql:
+        cells: [stdout_survives_child_processes_mssql]
+      oracle:
+        cells: [stdout_survives_child_processes_oracle]
+      mongo:
+        cells: [stdout_survives_child_processes_mongo]
+      lib:
+        cells:
+          - "lib:child_processes_take_the_declared_exports_unless_one_writes_to_stdout"

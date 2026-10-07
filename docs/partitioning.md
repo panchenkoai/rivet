@@ -117,13 +117,19 @@ GROUP BY 1;
   shape is not supported — Rivet rejects the combination up front. A
   `table:` export keeps its table per partition, so a range `chunk_column` is
   type-checked and an unset one auto-resolves to the primary key as usual.
-- **`--parallel-export-processes` is disabled** while partitioning is active
+- **`rivet run --parallel-export-processes` is disabled** while partitioning is active
   (child processes re-load the config and can't see the synthesised partitions);
   the run executes in-process.
+- **`rivet apply <config.yaml>` partitions like `rivet run`**, with and without
+  `--pool N`. Under `rivet apply <config.yaml> --parallel-export-processes` each
+  child process expands its own export.
 - **`plan` / `check` do not expand partitions yet.** They report the *parent*
   export as one un-partitioned job (its `{partition}` token stays literal in the
   shown path, the row estimate is the whole span, strategy is the base mode).
   Treat their output as the per-partition shape, not the campaign.
+- **A sealed plan cannot be applied.** `rivet plan` warns that a `partition_by`
+  export's artifact is a preview, and `rivet apply <plan.json>` refuses it before
+  writing anything. Apply the config instead: `rivet apply <config.yaml>`.
 - **Validating a single partition today:** point `validate` at the concrete
   prefix —
   `rivet validate --config c.yaml --export events --prefix events/created_at=2023-01-01`.

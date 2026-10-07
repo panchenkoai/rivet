@@ -88,6 +88,21 @@
     `RIVET_STATE_CHUNK_CHECKPOINT_GONE` (exit 5) and writes no `_SUCCESS`. Run the export again.
   - State written by earlier releases needs nothing: no stored row changes shape.
 
+- **Breaking: `rivet apply` runs a `partition_by` export as its partitions.** `rivet apply
+  <config.yaml>`, with and without `--pool N`, now writes one `<col>=<value>` directory per
+  partition, as `rivet run` does. Before, it exited 0 with the whole table under a directory
+  literally named `{partition}`.
+  - Output an earlier `apply` wrote under `{partition}` stays where it is; nothing reads or
+    removes it. Delete that directory once the next `apply` has written the partitions.
+  - `rivet apply <plan.json>` refuses a plan whose destination still holds the `{partition}`
+    token, before writing anything. Run `rivet apply <config.yaml>` instead. `rivet plan` warns
+    when it plans a `partition_by` export. A plan sealed by an earlier release is refused the
+    same way.
+  - A destination that names `{partition}` without `partition_by:` is refused when it runs.
+    Before, it wrote into a directory literally named `{partition}`. Remove the token.
+- **`destination: stdout` keeps its data under `--parallel-export-processes`.** `rivet run` and
+  `rivet apply <config.yaml>` now run such a config in-process and warn that they did. Before,
+  the parent dropped every byte its children wrote to stdout and exited 0 with empty output.
 - **Breaking: CDC writes an UPDATE that changes the key as a delete of the old key and an insert
   of the new row** (ADR-0030, accepted), on PostgreSQL, MySQL and Oracle. SQL Server's change
   table already did this, and MongoDB's `_id` cannot change.

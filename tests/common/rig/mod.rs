@@ -374,7 +374,7 @@ impl Rig {
 
     /// The fake-gcs sibling of [`Rig::dest_s3`]: anonymous access against the
     /// emulator endpoint, same per-export prefix layout.
-    /// Write to `destination: { type: stdout }` — no directory is created.
+    /// The rig's own export writes to `destination: { type: stdout }`; a second export keeps its local directory, since one stdout carries one export's bytes.
     pub fn dest_stdout(mut self) -> Self {
         self.dest_stdout = true;
         self.dest_precreate = false;

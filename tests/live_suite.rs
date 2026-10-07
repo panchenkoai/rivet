@@ -126,6 +126,8 @@ mod live_cross_db_parity;
 mod live_density_probe;
 #[path = "live/live_destination_parity.rs"]
 mod live_destination_parity;
+#[path = "live/live_entry_points_run_set.rs"]
+mod live_entry_points_run_set;
 #[path = "live/live_governor.rs"]
 mod live_governor;
 #[path = "live/live_harness_canary.rs"]
