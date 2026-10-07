@@ -93,14 +93,18 @@ Credential redaction is split across two layers (v0.7.2 P0.3):
 
 - **Structural redaction** — `SourceConfig::redact_for_artifact` strips
   plaintext `password` and `user:password@` userinfo from a
-  `SourceConfig` *before* it lands in a `PlanArtifact` (`plan.json`).
+  `SourceConfig` *before* it lands in a `PlanArtifact` (`plan.json`),
+  and masks the password of a keyword/value `url:`
+  (`host=… password=…` → `password=***`).
   Env-var and file references (`url_env`, `password_env`, `url_file`,
   `credentials_file`) are preserved by name — names are not secrets,
   and `apply` needs them to re-resolve credentials.
 - **String redaction** — `crate::redact::redact_secrets` /
   `redact_error` walks a string and rewrites every
   `scheme://user:password@host` URL it finds to
-  `scheme://REDACTED@host`.  Applied as an *invariant* at every
+  `scheme://REDACTED@host`, and every `password=` / `pwd=` pair of a
+  keyword/value connection string (libpq, ADO, JDBC properties) to
+  `password=***`.  Applied as an *invariant* at every
   boundary where an `anyhow::Error` becomes an operator-visible
   artifact:
   - `RunSummary::error_message` (→ `summary.json` / `summary.md` /
@@ -111,6 +115,7 @@ Credential redaction is split across two layers (v0.7.2 P0.3):
     pipeline/job, pipeline/single, chunked/sequential and
     parallel checkpoints, repair_cmd),
   - top-level CLI error output (`main.rs` `eprintln!`),
+  - `rivet doctor` check details (text and `--json`),
   - `rivet validate` hard-failure messages (`could not open destination`
     / `verify_at_destination failed`).
 
@@ -122,6 +127,10 @@ Pinned in tests:
   string-redactor unit + integration suite; pins the URL-rewrite
   rule and proves the redactor is wired into every error → artifact
   path enumerated above.
+- [`tests/offline/keyword_value_credentials.rs`](tests/offline/keyword_value_credentials.rs) —
+  runs the commands with a keyword/value password on every engine and
+  searches every sink for it; the succeeding path is
+  `tests/live/sec_keyword_value_credentials.rs`.
 
 If you observe a plaintext credential in any Rivet-produced output,
 treat it as a security bug (see Reporting below).

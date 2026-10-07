@@ -67,3 +67,40 @@ scenarios:
     mssql:    { test: redact_secrets_url_safety_matrix }
     mongo:    { test: redact_secrets_url_safety_matrix }
     oracle:   { gap: "oracle:// is not in redact_secrets_url_safety_matrix's scheme sweep" }
+
+  # Keyword/value connection strings (2026-10-07). The redactors above know
+  # `scheme://user:pass@` and `?key=` only; a libpq DSN (`host=… password=…`), an ADO
+  # string (`…;Password=…;` / `PWD=`) and JDBC properties (`;password=`) reached every
+  # sink verbatim. Only tokio-postgres ACCEPTS such a string; the other engines refuse
+  # it, and the refusal (or the plan artifact) carried the password.
+  - id: redact_keyword_value_password_general
+    what: "the GENERAL redactor (redact_secrets) masks the password of a keyword/value string in every grammar — whitespace-ended (libpq), `;`-ended (ADO/JDBC), quoted, braced — whatever the password is made of (@ / ? # = & : ; ' \" { ,)."
+    postgres: { test: redact_secrets_keyword_value_matrix }
+    mysql:    { test: redact_secrets_keyword_value_matrix }
+    mssql:    { test: redact_secrets_keyword_value_matrix }
+    mongo:    { test: redact_secrets_keyword_value_matrix }
+    oracle:   { test: redact_secrets_keyword_value_matrix }
+
+  - id: keyword_value_password_reaches_no_sink
+    what: "end to end on a command that fails before a server answers: the password of every keyword/value form is in no sink — stdout, stderr, --json-errors, doctor (text and --json), init, the state DB (export_metrics, run_journal), plan.json, .rivet/runs reports."
+    postgres: { test: a_keyword_value_password_reaches_no_sink_on_any_engine }
+    mysql:    { test: a_keyword_value_password_reaches_no_sink_on_any_engine }
+    mssql:    { test: a_keyword_value_password_reaches_no_sink_on_any_engine }
+    mongo:    { test: a_keyword_value_password_reaches_no_sink_on_any_engine }
+    oracle:   { test: a_keyword_value_password_reaches_no_sink_on_any_engine }
+
+  - id: keyword_value_string_still_connects
+    what: "masking must not change what connects: the form an engine accepts still authenticates and delivers every row (unquoted, and quoted with a space), its succeeding path leaks nothing (plan.json, the export_state scope key), and a form an engine refuses is refused as before."
+    postgres: { test: a_libpq_keyword_value_string_authenticates_and_its_password_reaches_no_sink }
+    mysql:    { na: "mysql Opts::from_url takes a mysql:// URL only (`URL ParseError { relative URL without a base }` on a keyword/value string); nothing connects, and its refusal is graded by keyword_value_password_reaches_no_sink" }
+    mssql:    { test: a_keyword_value_string_is_refused_and_its_error_redacts_the_password }
+    mongo:    { na: "the mongodb driver takes mongodb:// / mongodb+srv:// only; nothing connects, and its refusal is graded by keyword_value_password_reaches_no_sink" }
+    oracle:   { na: "parse_oracle_url takes oracle://USER@HOST:PORT/SERVICE only and its refusal quotes a template, never the string; the plan artifact is graded by keyword_value_password_reaches_no_sink" }
+
+  - id: keyword_value_state_scope_and_plan
+    what: "the state scope key (export_state.prefix) and the plan artifact keep a keyword/value string with its password masked; a cursor stored under the unmasked key by an earlier release is adopted, not orphaned; `apply` refuses the masked plan with the url_env remedy."
+    postgres: { test: a_cursor_stored_with_its_password_unmasked_is_adopted_by_the_masked_scope }
+    mysql:    { na: "no run from a keyword/value string reaches a state write: only tokio-postgres accepts one" }
+    mssql:    { na: "parse_mssql_url refuses the string before any state write" }
+    mongo:    { na: "the mongodb driver refuses the string before any state write" }
+    oracle:   { na: "parse_oracle_url refuses the string before any state write" }

@@ -57,7 +57,10 @@ ADJUDICATED: dict[str, tuple[str, int]] = {  # ratchet-pin: live-only-adjudicate
     # their stubs was CAUGHT, so the exclusions were dead and are gone. That is
     # the standard this list is held to: an adjudication survives only until
     # someone runs the mutant it stands in for.
-    "check": ("cli tests spawn the binary; measured 8% of body (preflight/mod.rs)", 25),
+    # Re-measured 2026-10-07 at 40%: the keyword/value credential tests drive `rivet check`
+    # through the binary past the config arms. Its four mutants were run with the exclusion
+    # lifted and are still MISSED under `--lib --bins`, which spawns no binary.
+    "check": ("cli tests spawn the binary; measured 40% of body (preflight/mod.rs)", 50),
     # `print_up_to_date` (load/orchestrate.rs) — log-only like warn_positional_once: its
     # `()` stub survives the whole offline battery (4198 tests, measured 2026-10-02), and
     # its text is graded through `up_to_date_line`.

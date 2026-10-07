@@ -271,6 +271,8 @@ mod roast_small_table_escape;
 mod roast_validate_exit;
 #[path = "live/sec_exit_codes.rs"]
 mod sec_exit_codes;
+#[path = "live/sec_keyword_value_credentials.rs"]
+mod sec_keyword_value_credentials;
 #[path = "live/sec_mcp_tls.rs"]
 mod sec_mcp_tls;
 #[path = "live/sec_preflight_sqli.rs"]
