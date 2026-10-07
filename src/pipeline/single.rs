@@ -254,6 +254,7 @@ pub(crate) fn run_export(
                 summary,
                 config_path,
                 chunk_source,
+                progress,
             );
         } else {
             return run_chunked_sequential(src, plan, summary, Some(state), chunk_source);

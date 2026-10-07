@@ -620,7 +620,9 @@ fn staged_for(engine: SqlEngine, rig: Rig, stage: &Stage, out: &Path) -> Rig {
         .1
         .iter()
         .map(|l| match l.split_once(": ") {
-            Some((k @ ("chunk_by_key" | "cursor_column"), v)) if engine.folds_upper() => {
+            Some((k @ ("chunk_by_key" | "chunk_column" | "cursor_column"), v))
+                if engine.folds_upper() =>
+            {
                 format!("{k}: {}", v.to_uppercase())
             }
             _ => l.to_string(),
@@ -943,4 +945,272 @@ fn incremental_query_repointed_at_another_table_mssql() {
 #[ignore = "live: requires docker compose oracle"]
 fn incremental_query_repointed_at_another_table_oracle() {
     stream_query_repoint(SqlEngine::Oracle);
+}
+
+const INTERRUPTED_CODE: &str = "RIVET_STATE_INTERRUPTED_RUN_OWNER_MISMATCH";
+
+enum Remedy {
+    FinishTheRun,
+    Reset,
+}
+
+/// P-06: a checkpointed run of `prior` crashes at `crash_at` with part of ids 1..=10 delivered, then the export becomes `mode: incremental` with no reset. `abandon` is the state subcommand the refusal names.
+fn crashed_run_then_incremental(
+    engine: SqlEngine,
+    prior: Stage,
+    crash_at: &str,
+    abandon: &str,
+    remedy: Remedy,
+) {
+    engine.alive();
+    let (table, _guard) = engine.table("crashed_run");
+    engine.insert(&table, 1..=10, 180, Some(10));
+    let (first, second) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let ids = |out: &Path| delivered_ids(engine, out);
+    let source: Vec<i64> = (1..=10).collect();
+    let keeps_a_high_water = prior.1.iter().any(|l| l.starts_with("chunk_by_key"));
+
+    let run = staged_for(engine, engine.rig(&table), &prior, first.path());
+    let crash = run.run_with_env("RIVET_TEST_PANIC_AT", crash_at);
+    assert!(!crash.status.success(), "the first run must crash");
+    assert_eq!(
+        ids(first.path()),
+        vec![1, 2, 3, 4],
+        "ids 1..=4 landed first:
+{}",
+        String::from_utf8_lossy(&crash.stderr)
+    );
+
+    let incremental = staged_for(engine, run, &INCREMENTAL_ID, second.path());
+    for cycle in 1..=2 {
+        let o = incremental.run();
+        let said = String::from_utf8_lossy(&o.stderr).to_string();
+        let got = ids(second.path());
+        assert!(
+            got.is_empty(),
+            "cycle {cycle}: the incremental run delivered {} of {} source ids ({got:?}) past an \
+             unfinished run, exit {:?}",
+            got.len(),
+            source.len(),
+            o.status.code()
+        );
+        assert_eq!(o.status.code(), Some(5), "cycle {cycle}:\n{said}");
+        let command = format!("rivet state {abandon} -c <config> --export {table}");
+        for want in [
+            INTERRUPTED_CODE,
+            "of mode `",
+            "runs as `incremental`",
+            &command,
+        ] {
+            assert!(
+                said.contains(want),
+                "cycle {cycle}: must name {want}:\n{said}"
+            );
+        }
+        assert!(!second.path().join("_SUCCESS").exists(), "cycle {cycle}");
+    }
+
+    match remedy {
+        Remedy::FinishTheRun => {
+            let run = staged_for(engine, incremental, &prior, first.path());
+            run.run_ok();
+            assert_eq!(ids(first.path()), source, "the interrupted run finished");
+            engine.insert(&table, 11..=13, 170, Some(10));
+            let incremental = staged_for(engine, run, &INCREMENTAL_ID, second.path());
+            if keeps_a_high_water {
+                continued(incremental).run_ok();
+                assert_eq!(ids(second.path()), vec![11, 12, 13], "MT2");
+            } else {
+                incremental.run_ok();
+                assert_eq!(ids(second.path()), (1..=13).collect::<Vec<_>>(), "MT1");
+            }
+        }
+        Remedy::Reset => {
+            let reset = incremental.cli(&["state", abandon, "--export", &table]);
+            assert!(
+                reset.status.success(),
+                "{}",
+                String::from_utf8_lossy(&reset.stderr)
+            );
+            incremental.run_ok();
+            assert_eq!(ids(second.path()), source, "a full pass after the reset");
+        }
+    }
+}
+
+fn crashed_keyset_then_incremental(engine: SqlEngine, remedy: Remedy) {
+    crashed_run_then_incremental(
+        engine,
+        KEYSET_CHECKPOINT,
+        "after_keyset_page:0",
+        "reset",
+        remedy,
+    );
+}
+
+fn crashed_range_chunk_then_incremental(engine: SqlEngine, remedy: Remedy) {
+    crashed_run_then_incremental(
+        engine,
+        RANGE_CHUNKED,
+        "after_chunk_complete:0",
+        "reset-chunks",
+        remedy,
+    );
+}
+
+/// P-02: config A crashes after chunk 0; config B (same export name, table name and chunk settings, ANOTHER database) must deliver its own rows, twice; A then resumes its own run.
+fn range_chunk_shared_name_another_source(engine: SqlEngine) {
+    engine.alive();
+    let other = engine
+        .second_database("chunk_other")
+        .expect("a second database on the stand");
+    let (table, _guard) = engine.table("chunk_shared");
+    engine.insert(&table, 1..=10, 180, Some(10));
+    other.table_with(&table, 1..=30);
+    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let ids = |out: &Path| delivered_ids(engine, out);
+
+    let a = staged_for(engine, engine.rig(&table), &RANGE_CHUNKED, dirs[0].path());
+    let crash = a.run_with_env("RIVET_TEST_PANIC_AT", "after_chunk_complete:0");
+    assert!(!crash.status.success(), "config A must crash");
+    let partial = ids(dirs[0].path());
+    assert!(
+        !partial.is_empty() && partial.len() < 10,
+        "A crashed mid-run: {partial:?}"
+    );
+
+    let mut b = a.source_url(&other.url()).no_oracle(
+        "the source is a second database the rig oracle does not attach; the cell re-reads the destination itself",
+    );
+    for (cycle, out) in [(1, dirs[1].path()), (2, dirs[2].path())] {
+        b = staged_for(engine, b, &RANGE_CHUNKED, out);
+        let o = b.run();
+        let got = ids(out);
+        assert_eq!(
+            got,
+            (1..=30).collect::<Vec<_>>(),
+            "cycle {cycle}: B delivered {} of its 30 source ids, exit {:?}:\n{}",
+            got.len(),
+            o.status.code(),
+            String::from_utf8_lossy(&o.stderr)
+        );
+        assert!(o.status.success(), "cycle {cycle}");
+    }
+
+    let a = staged_for(
+        engine,
+        b.source_url(engine.url()),
+        &RANGE_CHUNKED,
+        dirs[0].path(),
+    );
+    let said = a.run_ok_capture();
+    assert!(
+        said.contains("resuming it"),
+        "A resumes its own run:\n{said}"
+    );
+    assert_eq!(ids(dirs[0].path()), (1..=10).collect::<Vec<_>>());
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn crashed_keyset_then_incremental_finish_the_run_postgres() {
+    crashed_keyset_then_incremental(SqlEngine::Pg, Remedy::FinishTheRun);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn crashed_keyset_then_incremental_reset_postgres() {
+    crashed_keyset_then_incremental(SqlEngine::Pg, Remedy::Reset);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn crashed_keyset_then_incremental_finish_the_run_mysql() {
+    crashed_keyset_then_incremental(SqlEngine::Mysql, Remedy::FinishTheRun);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn crashed_keyset_then_incremental_reset_mysql() {
+    crashed_keyset_then_incremental(SqlEngine::Mysql, Remedy::Reset);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn crashed_keyset_then_incremental_finish_the_run_mssql() {
+    crashed_keyset_then_incremental(SqlEngine::Mssql, Remedy::FinishTheRun);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn crashed_keyset_then_incremental_reset_mssql() {
+    crashed_keyset_then_incremental(SqlEngine::Mssql, Remedy::Reset);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn crashed_keyset_then_incremental_finish_the_run_oracle() {
+    crashed_keyset_then_incremental(SqlEngine::Oracle, Remedy::FinishTheRun);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn crashed_keyset_then_incremental_reset_oracle() {
+    crashed_keyset_then_incremental(SqlEngine::Oracle, Remedy::Reset);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn range_chunk_shared_name_another_source_postgres() {
+    range_chunk_shared_name_another_source(SqlEngine::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn range_chunk_shared_name_another_source_mysql() {
+    range_chunk_shared_name_another_source(SqlEngine::Mysql);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn range_chunk_shared_name_another_source_mssql() {
+    range_chunk_shared_name_another_source(SqlEngine::Mssql);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn crashed_range_chunk_then_incremental_finish_the_run_postgres() {
+    crashed_range_chunk_then_incremental(SqlEngine::Pg, Remedy::FinishTheRun);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn crashed_range_chunk_then_incremental_reset_postgres() {
+    crashed_range_chunk_then_incremental(SqlEngine::Pg, Remedy::Reset);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn crashed_range_chunk_then_incremental_finish_the_run_mysql() {
+    crashed_range_chunk_then_incremental(SqlEngine::Mysql, Remedy::FinishTheRun);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn crashed_range_chunk_then_incremental_reset_mysql() {
+    crashed_range_chunk_then_incremental(SqlEngine::Mysql, Remedy::Reset);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn crashed_range_chunk_then_incremental_finish_the_run_mssql() {
+    crashed_range_chunk_then_incremental(SqlEngine::Mssql, Remedy::FinishTheRun);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn crashed_range_chunk_then_incremental_reset_mssql() {
+    crashed_range_chunk_then_incremental(SqlEngine::Mssql, Remedy::Reset);
 }

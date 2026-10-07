@@ -122,6 +122,7 @@ pub(crate) fn run_chunked_sequential_checkpoint(
     summary: &mut RunSummary,
     config_path: &str,
     chunk_source: ChunkSource,
+    progress: &crate::state::ProgressClaim<'_>,
 ) -> Result<()> {
     let cp = chunked_plan(plan);
 
@@ -161,7 +162,8 @@ pub(crate) fn run_chunked_sequential_checkpoint(
         }
     };
 
-    let run_id = ensure_chunk_checkpoint_plan(state, plan, cp, summary, &chunks, config_path)?;
+    let run_id =
+        ensure_chunk_checkpoint_plan(state, plan, cp, summary, &chunks, config_path, progress)?;
 
     // ADR-0012 M8: same manifest-aware preamble as the parallel runner —
     // reconcile destination state with chunk_task table before claiming work.

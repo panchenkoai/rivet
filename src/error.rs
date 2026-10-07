@@ -461,6 +461,16 @@ pub mod codes {
         "RIVET_STATE_CURSOR_STREAM_MISMATCH",
         "give each export that shares this state database its own name; if this export was repointed, `rivet state reset -c <config> --export <name>` starts the new table with a full pass (it discards the progress of every export of that name in the state database)",
     );
+    /// An export met an unfinished checkpointed run that another mode opened on its stream.
+    pub const STATE_INTERRUPTED_RUN_OWNER_MISMATCH: Code = refusal(
+        "RIVET_STATE_INTERRUPTED_RUN_OWNER_MISMATCH",
+        "restore the previous mode's settings and run once to finish the interrupted run, then switch; or abandon it with the command the message names (`rivet state reset` for a keyset run, `rivet state reset-chunks` for a range-chunk run) and the next run starts with a full pass",
+    );
+    /// An in-progress chunk run recorded no source, and its export name holds progress under more than one source.
+    pub const STATE_CHUNK_RUN_OWNER_UNKNOWN: Code = refusal(
+        "RIVET_STATE_CHUNK_RUN_OWNER_UNKNOWN",
+        "`rivet state reset-chunks -c <config> --export <name>` abandons the run; the next run of each config starts a fresh pass",
+    );
     /// A command that rewrites an export's stored progress met a live run of that export.
     pub const STATE_RUN_IN_PROGRESS: Code = refusal(
         "RIVET_STATE_RUN_IN_PROGRESS",
@@ -577,6 +587,8 @@ pub mod codes {
         STATE_SCHEMA_NEWER,
         STATE_CURSOR_OWNER_MISMATCH,
         STATE_CURSOR_STREAM_MISMATCH,
+        STATE_INTERRUPTED_RUN_OWNER_MISMATCH,
+        STATE_CHUNK_RUN_OWNER_UNKNOWN,
         STATE_KEYSET_SEQUENTIAL_ANCHOR_UNFINISHED,
         STATE_RUN_IN_PROGRESS,
         STATE_CHUNK_CHECKPOINT_GONE,

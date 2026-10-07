@@ -1020,7 +1020,7 @@ fn finalize_keyset_anchor(
         let _ = state.clear_resume_run_id(export_name, &plan.source.state_key());
         // Parallel keyset persists its per-range recovery rows under the same
         // anchor; clear them too (a no-op for sequential keyset, which writes none).
-        let _ = state.clear_keyset_ranges(export_name);
+        let _ = state.clear_keyset_ranges(export_name, &plan.source.state_key());
     }
 }
 
@@ -1280,7 +1280,7 @@ fn execute_resolved_plan(
         return (Err(e), summary);
     }
     let claim = state.claim(plan.progress_key()).and_then(|progress| {
-        chunked::claim_checkpoint_run(state, plan)
+        chunked::claim_checkpoint_run(state, plan, &progress)
             .map(|(lease, recovered)| (progress, lease, recovered))
     });
     let (progress, _run_lease, recovered) = match claim {
@@ -1344,6 +1344,7 @@ fn execute_resolved_plan(
                     &mut summary,
                     tail.chunk_source,
                     &mut meta,
+                    &progress,
                 )
             } else {
                 chunked::run_chunked_parallel(

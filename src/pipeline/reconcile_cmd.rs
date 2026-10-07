@@ -132,8 +132,9 @@ fn reconcile_chunked(
 }
 
 fn reconcile_chunked_inner(plan: &ResolvedRunPlan, state: &StateStore) -> Result<ReconcileReport> {
-    let (run_id, _plan_hash, _status, _updated) = state
-        .get_latest_chunk_run(&plan.export_name)?
+    let run_id = state
+        .claim(plan.progress_key())?
+        .latest_chunk_run()?
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "reconcile: no chunk run recorded for export '{}'. \
