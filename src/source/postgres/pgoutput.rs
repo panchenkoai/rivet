@@ -693,7 +693,7 @@ impl Assembler {
     /// Close the open transaction, stamping the commit position on every row and
     /// `committed` on the LAST one only.
     fn close(&mut self, commit_lsn: u64) -> Vec<crate::source::cdc::ChangeEvent> {
-        let position = crate::source::cdc::Position(serde_json::json!({
+        let position = crate::source::cdc::Position::new(serde_json::json!({
             "lsn": format!("{:X}/{:X}", commit_lsn >> 32, commit_lsn & 0xFFFF_FFFF)
         }));
         let rows: Vec<PendingRow> = std::mem::take(&mut self.open);

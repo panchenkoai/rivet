@@ -377,3 +377,74 @@ fn repair_execute_reexports_mismatch_and_preserves_original_file() {
         "repair must add a new chunk0 file alongside the original (collision-proof naming)"
     );
 }
+
+/// P-21: a repair under an edited `chunk_column` is refused, or leaves every source row listed exactly once.
+#[test]
+#[ignore = "live+gate-only: postgres; open defect P-21, acknowledged in dev/release_oracle/known_red.py"]
+fn open_defect_repair_after_a_chunk_column_edit_lists_each_row_once() {
+    let e = SqlEngine::Pg;
+    e.alive();
+    let (table, _guard) = e.create(
+        "repair_plan_edit",
+        "id BIGINT PRIMARY KEY, other_id BIGINT NOT NULL",
+    );
+    e.exec(&format!(
+        "INSERT INTO {table} SELECT g, g / 2 FROM generate_series(1, 40) g"
+    ));
+    let (out, scratch) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let chunked_by = |rig: Rig, column: &str| {
+        rig.query(&format!("SELECT id, other_id FROM {table}"))
+            .restage(
+                "chunked",
+                &[
+                    &format!("chunk_column: {column}"),
+                    "chunk_size: 10",
+                    "chunk_checkpoint: true",
+                ],
+            )
+    };
+    let rig = chunked_by(e.rig(&table), "id").dest_path(out.path().to_path_buf());
+    rig.run_ok();
+
+    let rig = chunked_by(rig, "other_id");
+    let report = scratch.path().join("reconcile.json");
+    let report = report.to_str().unwrap();
+    let reconcile = rig.cli(&[
+        "reconcile",
+        "--export",
+        &table,
+        "--format",
+        "json",
+        "--output",
+        report,
+    ]);
+    let repair = rig.cli(&[
+        "repair",
+        "--export",
+        &table,
+        "--report",
+        report,
+        "--execute",
+    ]);
+    if !repair.status.success() {
+        let said = format!(
+            "{}{}",
+            String::from_utf8_lossy(&reconcile.stderr),
+            String::from_utf8_lossy(&repair.stderr)
+        );
+        assert!(
+            said.contains("chunk_column"),
+            "a refusal must name the changed chunk_column:\n{said}"
+        );
+        return;
+    }
+    let listed = ids_of(&rig.read_declared_parts());
+    let mut distinct = listed.clone();
+    distinct.dedup();
+    assert!(
+        listed == (1..=40).collect::<Vec<_>>(),
+        "P-21: a repair under an edited chunk_column left the manifest listing {} rows over {} distinct ids for 40 source ids",
+        listed.len(),
+        distinct.len()
+    );
+}

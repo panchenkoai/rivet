@@ -241,7 +241,7 @@ jobs:
                  or test(from_a_standby) or test(failover_to_the_standby) or test(bounded_on_a_standby)
                  or test(loads_into_bigquery_or_refuses_by_column) or test(cleanup_source_never_deletes_parts)
                  or test(compact_after_a_source_alter) or test(a_non_unicode_database_round_trips)
-                 or test(a_read_blocked_longer_than_thirty_seconds_still_completes))'
+                 or test(a_read_blocked_longer_than_thirty_seconds_still_completes) or test(open_defect_))'
 
       - name: Dump service logs on failure
         if: failure()

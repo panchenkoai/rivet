@@ -358,6 +358,40 @@ fn every_ci_skip_term_still_names_a_test() {
     );
 }
 
+/// An `open_defect_*` cell fails until its fix lands, so only the gate's known-red ledger may run it; any other name must not borrow the term.
+#[test]
+fn an_open_defect_cell_is_gate_only_and_named_in_the_known_red_ledger() {
+    let ledger = std::fs::read_to_string(root().join("dev/release_oracle/known_red.py")).unwrap();
+    let tests = live_tests_checked();
+    let wrong: Vec<String> = tests
+        .iter()
+        .filter(|t| {
+            let open = t
+                .path
+                .split("::")
+                .last()
+                .unwrap()
+                .starts_with("open_defect_");
+            open != t.path.contains("open_defect_") || (open && !t.gate_only())
+        })
+        .map(|t| format!("{} (reason: {})", t.path, t.reason))
+        .collect();
+    assert!(
+        wrong.is_empty(),
+        "an `open_defect_*` live test must be marked `live+gate-only`, and no other test may carry the term:\n{}",
+        wrong.join("\n")
+    );
+    let unlisted: Vec<&str> = tests
+        .iter()
+        .filter(|t| t.path.contains("open_defect_") && !ledger.contains(&format!("\"{}\"", t.path)))
+        .map(|t| t.path.as_str())
+        .collect();
+    assert!(
+        unlisted.is_empty(),
+        "`open_defect_*` cells with no entry in dev/release_oracle/known_red.py (a fixed defect drops the prefix and the marker with its entry): {unlisted:?}"
+    );
+}
+
 /// The parsers against planted text, so a passing policy is a graded one.
 #[test]
 fn the_filter_parsers_read_what_the_workflows_write() {

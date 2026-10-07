@@ -791,7 +791,7 @@ mod tests {
             table: "t".into(),
             before: None,
             after: Some(vals),
-            position: crate::source::cdc::Position(serde_json::json!({"lsn":"0/1"})),
+            position: crate::source::cdc::Position::new(serde_json::json!({"lsn":"0/1"})),
             committed: true,
             image_names: Some(std::sync::Arc::from(
                 vec!["id".to_string(), "v".to_string()].into_boxed_slice(),
@@ -1415,7 +1415,7 @@ pub(crate) fn encode_event(ev: &ChangeEvent) -> Vec<u8> {
     // `position` and `committed` are re-stamped at the commit boundary by the
     // framer, and carried anyway: a spill that dropped them would be a second place
     // where the transaction's framing is decided.
-    put_str(&mut out, &ev.position.0.to_string());
+    put_str(&mut out, &ev.position.json().to_string());
     out.push(u8::from(ev.committed));
     out.extend_from_slice(&ev.seq.to_be_bytes());
     put_opt_str(&mut out, ev.poison.as_deref());
@@ -1509,7 +1509,7 @@ pub(crate) fn decode_event(rec: &[u8]) -> Result<ChangeEvent> {
     };
     let schema = c.string()?;
     let table = c.string()?;
-    let position = Position(
+    let position = Position::new(
         serde_json::from_str(&c.string()?)
             .map_err(|e| anyhow::anyhow!("cdc spill: the position is not json: {e}"))?,
     );
@@ -1573,7 +1573,7 @@ mod frame_tests {
             table: "orders".into(),
             before: None,
             after: None,
-            position: Position(json!({ "lsn": "0/ABC" })),
+            position: Position::new(json!({ "lsn": "0/ABC" })),
             committed: false,
             image_names: None,
             // NON-ZERO on purpose. With `seq: 0` everywhere, a codec that drops the
@@ -1620,7 +1620,7 @@ mod frame_tests {
         assert_eq!(op.as_str(), e.op.as_str(), "op");
         assert_eq!(schema, &e.schema, "schema");
         assert_eq!(table, &e.table, "table");
-        assert_eq!(position.0, e.position.0, "position");
+        assert_eq!(position.json(), e.position.json(), "position");
         assert_eq!(committed, &e.committed, "committed");
         assert_eq!(seq, &e.seq, "seq");
         assert_eq!(poison, &e.poison, "poison");
@@ -1888,7 +1888,7 @@ mod frame_tests {
             e.committed = true;
             f.push(&encode_event(&e)).expect("push");
         }
-        let commit = Position(json!({ "lsn": "0/FEED" }));
+        let commit = Position::new(json!({ "lsn": "0/FEED" }));
         let mut sp = SpooledTx::new(f.into_reader().expect("seal"), commit.clone());
 
         // `remaining` must COUNT DOWN as the tail drains: the engines' `next_spooled`
@@ -1910,7 +1910,8 @@ mod frame_tests {
                 "remaining must fall by exactly one per drained row"
             );
             assert_eq!(
-                e.position.0, commit.0,
+                e.position.json(),
+                commit.json(),
                 "every row of a spilled tail carries the transaction's COMMIT \
                  position — the resume position depends on it"
             );
@@ -1945,7 +1946,7 @@ mod frame_tests {
         let mut f = SpillFile::create(d.path(), "groups").expect("create");
         for (i, l) in lsns.iter().enumerate() {
             let mut e = ev();
-            e.position = Position(json!({ "lsn": l }));
+            e.position = Position::new(json!({ "lsn": l }));
             e.after = Some(vec![RivetValue::Int(i as i64)]);
             // Poisoned, so the drain has to CLEAR it rather than leave it.
             e.committed = true;
@@ -1970,7 +1971,7 @@ mod frame_tests {
                 lsns.len()
             );
             got.push((
-                e.position.0["lsn"].as_str().expect("lsn").to_string(),
+                e.position.json()["lsn"].as_str().expect("lsn").to_string(),
                 e.committed,
             ));
         }
@@ -1993,8 +1994,8 @@ mod frame_tests {
     /// The group-boundary predicate, at its two ends.
     #[test]
     fn a_row_closes_its_group_when_nothing_of_it_follows() {
-        let a = Position(json!({ "lsn": "0/A" }));
-        let b = Position(json!({ "lsn": "0/B" }));
+        let a = Position::new(json!({ "lsn": "0/A" }));
+        let b = Position::new(json!({ "lsn": "0/B" }));
         assert!(closes_group(&a, None), "the last row always closes");
         assert!(
             closes_group(&a, Some(&b)),
@@ -2059,7 +2060,7 @@ mod spill_cost {
                 RivetValue::Bool(i.is_multiple_of(2)),
                 RivetValue::Bytes(vec![b'x'; 200]),
             ]),
-            position: Position(json!({ "lsn": "0/16B2E00" })),
+            position: Position::new(json!({ "lsn": "0/16B2E00" })),
             committed: false,
             image_names: Some(std::sync::Arc::from(
                 ["id", "name", "at", "amount", "ok", "pad"]
@@ -2287,7 +2288,7 @@ mod event_cost {
         const N: u64 = 1_000_000;
         let names: std::sync::Arc<[String]> =
             std::sync::Arc::from(["id", "v", "pad"].map(String::from).to_vec());
-        let pos = Position(json!({ "lsn": "0/16B2E00" }));
+        let pos = Position::new(json!({ "lsn": "0/16B2E00" }));
 
         println!(
             "size_of::<ChangeEvent>() = {} B (inline only — every String, Vec, Arc \
@@ -2311,12 +2312,12 @@ mod event_cost {
             per / (estimated as f64 / N as f64),
         );
 
-        // Attribute the position: the framer stamps `ev.position = commit.clone()`
-        // on EVERY event, and `Position` wraps a `serde_json::Value` — an object
-        // whose map, key and value are separate allocations, cloned a million times
-        // for one transaction. Sharing it would cost one.
+        // What a position costs when it is NOT shared: `Position` wraps a
+        // `serde_json::Value`, an object whose map, key and value are separate
+        // allocations. The framer shares one across a transaction; this is the price
+        // each event of a single-event transaction still pays.
         let mid = rss_bytes();
-        let shared: Vec<serde_json::Value> = (0..N).map(|_| pos.0.clone()).collect();
+        let shared: Vec<serde_json::Value> = (0..N).map(|_| pos.json().clone()).collect();
         let end = rss_bytes();
         println!(
             "{N} cloned positions alone: RSS +{:.0} MB -> {:.0} B/clone",

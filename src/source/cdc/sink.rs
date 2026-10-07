@@ -474,7 +474,8 @@ pub(crate) fn run_to_files(
         checkpoint,
         state: cfg.state,
     };
-    let (mut total_rows, mut total_bytes, mut emitted) = (0usize, 0usize, 0usize);
+    let (mut total_rows, mut emitted) = (0usize, 0usize);
+    let mut total_bytes = super::ResidentBytes::default();
     // The last commit-boundary position seen, and whether a commit has arrived
     // since the last ack — the only position it is ever valid to advance to.
     let mut last_commit: Option<Position> = None;
@@ -574,15 +575,15 @@ pub(crate) fn run_to_files(
                         // RESIDENT cost for the rollover budget (what the buffer holds); the
                         // bytes-read metric above wants DECODED payload. One `eb` feeding both
                         // silently inflated the metric ~4-13x when the estimate was re-based.
-                        total_bytes += ev.estimated_bytes();
+                        total_bytes.add(&ev);
                         sink.moved.push(&mut sink.buf, ev, &sink.out.key, moved_in);
                         total_rows += 1;
                         emitted += 1;
                     }
-                    if policy.should_roll(total_rows, total_bytes, committed) {
+                    if policy.should_roll(total_rows, total_bytes.bytes(), committed) {
                         roll_all(&mut sinks, stream, &run, &last_commit, &mut unacked_commit)?;
                         total_rows = 0;
-                        total_bytes = 0;
+                        total_bytes.reset();
                     }
                 }
                 // SOFT cap, judged at the COMMIT BOUNDARY — the same treatment
@@ -611,7 +612,7 @@ pub(crate) fn run_to_files(
             if pass_must_roll(unacked_commit, buffered_rows) {
                 roll_all(&mut sinks, stream, &run, &last_commit, &mut unacked_commit)?;
                 total_rows = 0;
-                total_bytes = 0;
+                total_bytes.reset();
             }
             // A pass that yielded nothing has drained to the bound; `max_events`
             // stops the whole run at the cap.
@@ -909,7 +910,7 @@ fn flush(
     let poss: ArrayRef = Arc::new(
         events
             .iter()
-            .map(|e| Some(e.position.0.to_string()))
+            .map(|e| Some(e.position.json().to_string()))
             .collect::<StringArray>(),
     );
     let seqs: ArrayRef = Arc::new(events.iter().map(|e| e.seq as i64).collect::<Int64Array>());
@@ -1482,7 +1483,7 @@ mod tests {
         let (dir, ck_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         let (dest, cols) = (local_dest(&dir), int_col());
         let ck = ck_dir.path().join("ck.json");
-        let frontier = Position(serde_json::json!({ "lsn": "FF" }));
+        let frontier = Position::new(serde_json::json!({ "lsn": "FF" }));
         let run = |events: Vec<ChangeEvent>, max_events: Option<usize>| {
             let mut s = FrontierStream(
                 FakeStream {
@@ -1536,7 +1537,11 @@ mod tests {
         let dest = local_dest(&d);
         let cols = int_col();
         let events: Vec<ChangeEvent> = (1..=6).map(insert).collect();
-        let one = events[0].estimated_bytes();
+        let one = {
+            let mut one = crate::source::cdc::ResidentBytes::default();
+            one.add(&events[0]);
+            one.bytes()
+        };
         assert!(
             one > 0,
             "the fixture is inert: an event must weigh something"
@@ -1937,7 +1942,7 @@ mod tests {
             table: "t".into(),
             before: None,
             after: Some(vec![RivetValue::Int(id)]),
-            position: Position(serde_json::json!({ "lsn": format!("{id:08X}") })),
+            position: Position::new(serde_json::json!({ "lsn": format!("{id:08X}") })),
             committed: true,
             image_names: Some(std::sync::Arc::from(vec!["v".to_string()])),
             seq: 0,
@@ -2992,7 +2997,7 @@ mod tests {
                 RivetValue::Bytes(b"150.05".to_vec()),
                 RivetValue::Bytes(b"7.5".to_vec()),
             ]),
-            position: Position(serde_json::json!({})),
+            position: Position::new(serde_json::json!({})),
             committed: true,
             image_names: None,
             seq: 0,

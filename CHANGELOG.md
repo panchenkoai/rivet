@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+- **Breaking: a keyset run that a gate refused is read again, not adopted, by the next run.**
+  Applies to `chunk_by_key` with `parallel: N` + `chunk_checkpoint: true`, and to
+  `keyset_incremental: true` (sequential or parallel), when a `quality:` content rule
+  (`unique_columns`, `null_ratio_max`) or `on_schema_drift: fail` refuses the run after its rows
+  were written.
+  - Before, the refused run kept its checkpoint. The next run adopted its pages, read nothing,
+    graded nothing, and ended with exit 0, `_SUCCESS` and "quality: pass" over the refused
+    data; the refused run's `run_status` row was rewritten to `success`.
+  - Now every re-run reads the same rows again and is graded again: it keeps exiting 3
+    (quality) or 4 (schema drift) until the source data or the rule is fixed, and the refused
+    runs stay `failed`. Each refused run leaves its parts on the destination under a Failed
+    manifest, as a refused run without a checkpoint always did.
+  - A sequential `keyset_incremental` run no longer moves the stored cursor page by page: the
+    cursor moves once, after the manifest is written, so a refused or interrupted run leaves it
+    where the run began. A run that breaks off mid-way is still resumed from its last
+    committed page.
+  - Upgrading: an export whose last run finished needs nothing. An export whose last run
+    under 0.31 or earlier was refused by such a gate still gets the old behaviour once: the
+    first run on the new version adopts the pages that run left. The same holds for a
+    sequential `keyset_incremental` run interrupted under 0.31 or earlier (its cursor had
+    already moved): if the new version resumes it and a gate refuses it, the run warns that
+    it "cannot be read again", names the command below, and the next run adopts its pages. To
+    have those rows read and graded again, run `rivet state reset -c <config> --export <name>`
+    before the next run.
+    The export then starts from the beginning: a `keyset_incremental` export reads the whole
+    table again.
+
 - **Breaking: a run of another mode refuses to continue past an unfinished checkpoint run**
   (`RIVET_STATE_INTERRUPTED_RUN_OWNER_MISMATCH`, exit 5, nothing read or written). The stored
   record of an export now says whether it is a committed high-water or an interrupted run, and
@@ -29,6 +56,15 @@
     `rivet state reset-chunks -c <config> --export <name>`, and the next run starts a fresh pass.
     Finished cursors and interrupted keyset runs carry over unchanged. Older binaries refuse a
     v34 state (`RIVET_STATE_SCHEMA_NEWER`).
+- **CDC memory: the events of one transaction share its commit position.** Closing a
+  transaction copied its resume position, a JSON object, into every event (about 475 to 730
+  bytes each), which was the largest single item on the heap of a large transaction. The
+  position is now one shared value. Measured on MySQL, one transaction: 500 000 changes
+  940 MB -> 427 MB peak and 1.90 s -> 1.39 s; 20 000 changes 77 MB -> 51 MB. Peak memory still
+  grows with the largest transaction. The transaction-buffer and rollover byte budgets charge a
+  position once per run of events that share it, so they keep tracking real memory. Output,
+  checkpoint files and the NDJSON stream are unchanged.
+
 - **Breaking: an incremental or CDC load refuses a view or a `<table>__changes` it has no record
   of loading**, on BigQuery, Snowflake and ClickHouse. Before, only a foreign TABLE at `<table>`
   was refused: a view there was replaced by rivet's current-state view, a foreign

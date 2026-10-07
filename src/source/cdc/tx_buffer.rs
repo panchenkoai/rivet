@@ -109,7 +109,7 @@ pub(crate) struct TxBuffer {
     spill_dir: Option<PathBuf>,
     caps: (usize, usize),
     head: Vec<ChangeEvent>,
-    bytes: usize,
+    bytes: super::ResidentBytes,
     spill: Option<SpillFile>,
 }
 
@@ -138,7 +138,7 @@ impl TxBuffer {
             spill_dir,
             caps,
             head: Vec::new(),
-            bytes: 0,
+            bytes: super::ResidentBytes::default(),
             spill: None,
         }
     }
@@ -153,9 +153,10 @@ impl TxBuffer {
         if let Some(sp) = self.spill.as_mut() {
             return sp.push(&record(&ev));
         }
-        self.bytes = self.bytes.saturating_add(ev.estimated_bytes());
+        self.bytes.add(&ev);
         self.head.push(ev);
-        let Err(cap) = check_tx_buffer_caps(self.engine, self.head.len(), self.bytes, self.caps)
+        let Err(cap) =
+            check_tx_buffer_caps(self.engine, self.head.len(), self.bytes.bytes(), self.caps)
         else {
             return Ok(());
         };
@@ -167,7 +168,7 @@ impl TxBuffer {
         };
         log::warn!(
             "{}",
-            spill_line(self.engine, at, self.head.len(), self.bytes, dir)
+            spill_line(self.engine, at, self.head.len(), self.bytes.bytes(), dir)
         );
         self.spill = Some(SpillFile::create(dir, terms(self.engine).label)?);
         Ok(())
@@ -176,7 +177,7 @@ impl TxBuffer {
     /// Drop everything buffered and spilled: a transaction that is re-read, deferred or discarded.
     pub(crate) fn clear(&mut self) {
         self.head.clear();
-        self.bytes = 0;
+        self.bytes.reset();
         self.spill = None;
     }
 
@@ -197,7 +198,7 @@ impl TxBuffer {
         at: &dyn Display,
     ) -> Result<(Vec<ChangeEvent>, Option<SpooledTail>)> {
         let mut head = std::mem::take(&mut self.head);
-        self.bytes = 0;
+        self.bytes.reset();
         let Some(sp) = self.spill.take() else {
             TxnFramer::close_group(&mut head, commit);
             return Ok((head, None));
@@ -221,7 +222,7 @@ impl TxBuffer {
         at: &dyn Display,
     ) -> Result<(Vec<ChangeEvent>, Option<SpooledTail>)> {
         let mut head = std::mem::take(&mut self.head);
-        self.bytes = 0;
+        self.bytes.reset();
         // Seal the tail FIRST: its first row says whether the head's last group continues on disk.
         let tail = match self.spill.take() {
             None => None,
@@ -344,7 +345,7 @@ mod tests {
             table: "t".into(),
             before: None,
             after: Some(vec![RivetValue::Int(id)]),
-            position: Position(json!({ "lsn": lsn })),
+            position: Position::new(json!({ "lsn": lsn })),
             // Poisoned: the close has to CLEAR it, not merely leave it.
             committed: true,
             image_names: None,
@@ -376,7 +377,7 @@ mod tests {
             .map(|e| {
                 (
                     id(e),
-                    e.position.0["lsn"].as_str().unwrap().to_string(),
+                    e.position.json()["lsn"].as_str().unwrap().to_string(),
                     e.committed,
                 )
             })
@@ -408,7 +409,7 @@ mod tests {
             "the row that crosses the cap stays in memory"
         );
         assert_eq!(buf.spilled_rows(), Some(2));
-        let commit = Position(json!({ "lsn": "0/C" }));
+        let commit = Position::new(json!({ "lsn": "0/C" }));
         let got = deliver(buf.close_transaction(&commit, &"0/C").expect("close"));
         assert_eq!(
             got,
@@ -428,7 +429,7 @@ mod tests {
     fn an_unspilled_transaction_closes_on_its_last_row_with_no_tail() {
         let mut buf = TxBuffer::with_caps(CdcEngine::Mysql, None, (5, usize::MAX));
         fill(&mut buf, &[(1, "x"), (2, "x")]);
-        let commit = Position(json!({ "lsn": "f:9" }));
+        let commit = Position::new(json!({ "lsn": "f:9" }));
         let (head, tail) = buf.close_transaction(&commit, &"f:9").expect("close");
         assert!(tail.is_none());
         assert_eq!(
@@ -515,7 +516,8 @@ mod tests {
         assert_eq!(buf.spilled_rows(), None);
         assert!(buf.head().is_empty());
         assert_eq!(
-            buf.bytes, 0,
+            buf.bytes.bytes(),
+            0,
             "a stale byte count would trip the next transaction's cap"
         );
     }
@@ -565,8 +567,8 @@ mod tests {
     /// Every arm of the head/tail group-boundary question.
     #[test]
     fn a_head_group_continues_on_disk_only_when_the_tail_starts_in_it() {
-        let a = Position(json!({ "lsn": "0x01" }));
-        let b = Position(json!({ "lsn": "0x02" }));
+        let a = Position::new(json!({ "lsn": "0x01" }));
+        let b = Position::new(json!({ "lsn": "0x02" }));
         assert!(head_group_continues_on_disk(&a, true, Some(&a)));
         assert!(
             !head_group_continues_on_disk(&a, true, Some(&b)),
@@ -591,7 +593,7 @@ mod tests {
                 .enumerate()
                 .map(|(i, l)| row(i as i64, l))
                 .collect();
-            let tail = tail.map(|l| Position(json!({ "lsn": l })));
+            let tail = tail.map(|l| Position::new(json!({ "lsn": l })));
             close_runs(&mut evs, tail.as_ref());
             evs.iter().map(|e| e.committed).collect::<Vec<_>>()
         };
@@ -619,7 +621,7 @@ mod tests {
         );
         fill(&mut buf, &[(1, "x"), (2, "x"), (3, "x"), (4, "x")]);
         let (_, mut tail) = buf
-            .close_transaction(&Position(json!({ "lsn": "c" })), &"c")
+            .close_transaction(&Position::new(json!({ "lsn": "c" })), &"c")
             .expect("close");
         let files = || std::fs::read_dir(d.path()).unwrap().count();
         assert_eq!(files(), 1);
