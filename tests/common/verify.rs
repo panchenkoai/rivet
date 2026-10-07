@@ -592,7 +592,11 @@ impl Case {
         {
             declared.extend(refusal::declared_in_env(raw.1));
         }
-        let (found, others) = refusal::without_other_runs(found, self.pid.filter(|_| !self.forks));
+        let (found, others) = refusal::without_other_runs(
+            found,
+            self.pid.filter(|_| !self.forks),
+            refusal::live_rivet,
+        );
         for (pid, n) in others {
             self.ungraded(&format!(
                 "{exit}: {n} changes carry the run id of another rivet process (pid {pid}), live beside this invocation; they are that run's"

@@ -541,10 +541,19 @@ fn run_pids(text: &str) -> BTreeSet<u32> {
         .collect()
 }
 
-/// Drop what carries only run ids of processes other than `pid`: another live run wrote it while this invocation was refused. Returns those pids with how much each wrote; with no `pid` nothing is dropped.
+/// Whether `pid` is a rivet process running right now.
+pub(crate) fn live_rivet(pid: u32) -> bool {
+    std::process::Command::new("/bin/ps")
+        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("rivet"))
+}
+
+/// Drop what carries only run ids of processes other than `pid` that are `live` now: another run is writing it while this invocation was refused. A run id of a process that has exited (a resumed run's, a load's source run) stays this invocation's. Returns those pids with how much each wrote; with no `pid` nothing is dropped.
 pub(crate) fn without_other_runs(
     found: Vec<Finding>,
     pid: Option<u32>,
+    live: impl Fn(u32) -> bool,
 ) -> (Vec<Finding>, BTreeMap<u32, usize>) {
     let mut others = BTreeMap::new();
     let Some(own) = pid else {
@@ -554,7 +563,7 @@ pub(crate) fn without_other_runs(
         .into_iter()
         .filter(|f| {
             let pids = run_pids(&f.what);
-            let foreign = !pids.is_empty() && !pids.contains(&own);
+            let foreign = !pids.is_empty() && !pids.contains(&own) && pids.iter().all(|p| live(*p));
             for p in pids.iter().filter(|_| foreign) {
                 *others.entry(*p).or_default() += 1;
             }
@@ -1081,9 +1090,15 @@ mod tests {
             f(r#"chunk_run + {"run_id":"e_20261007T145821.409_60001"}"#),
             f(r#"export_schema + {"export_name":"e"}"#),
         ];
-        let (kept, others) = without_other_runs(found.clone(), Some(60001));
+        let (kept, others) = without_other_runs(found.clone(), Some(60001), |_| true);
         assert_eq!(kept, found[2..]);
         assert_eq!(others, BTreeMap::from([(59977, 2)]));
-        assert_eq!(without_other_runs(found.clone(), None).0, found);
+        assert_eq!(without_other_runs(found.clone(), None, |_| true).0, found);
+        // A resumed run writes under the id of the attempt that crashed, and a load names its source run: neither is live.
+        assert_eq!(
+            without_other_runs(found.clone(), Some(60001), |_| false).0,
+            found
+        );
+        assert!(!live_rivet(u32::MAX - 1));
     }
 }
