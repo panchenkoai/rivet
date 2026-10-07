@@ -107,17 +107,33 @@ pub fn run_rivet(args: &[&str]) -> Output {
     run_rivet_env(args, &[])
 }
 
-/// Run `spawn` and hand a `run|load|compact --config` to the default oracle (verify.rs), which grades it by its exit.
+/// `Command::output` that also says which process ran.
+pub(crate) fn output_of(cmd: &mut Command) -> (u32, Output) {
+    use std::process::Stdio;
+    let child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn rivet binary");
+    (
+        child.id(),
+        child.wait_with_output().expect("wait for rivet binary"),
+    )
+}
+
+/// Run `cmd` and hand a `run|load|compact --config` to the default oracle (verify.rs), which grades it by its exit.
 fn graded(
     args: &[&str],
     envs: &[(&str, &str)],
     cwd: Option<&std::path::Path>,
-    spawn: impl FnOnce() -> Output,
+    mut cmd: Command,
 ) -> Output {
     let argv: Vec<String> = args.iter().map(|a| a.to_string()).collect();
     let case = super::verify::begin_raw(&argv, envs, cwd);
-    let out = spawn();
-    if let Some(case) = case {
+    let (pid, out) = output_of(&mut cmd);
+    if let Some(mut case) = case {
+        case.ran_as(pid);
         super::verify::settle(case, out.status, &out.stdout, envs, &Default::default());
     }
     out
@@ -125,10 +141,7 @@ fn graded(
 
 /// `run_rivet` with extra environment variables (fault hooks, log levels).
 pub fn run_rivet_env(args: &[&str], envs: &[(&str, &str)]) -> Output {
-    let mut cmd = rivet_command(args, envs);
-    graded(args, envs, None, || {
-        cmd.output().expect("spawn rivet binary")
-    })
+    graded(args, envs, None, rivet_command(args, envs))
 }
 
 /// `run_rivet_env` with the process working directory set to `dir`.
@@ -142,9 +155,7 @@ pub fn run_rivet_env(args: &[&str], envs: &[(&str, &str)]) -> Output {
 pub fn run_rivet_in_dir(dir: &std::path::Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
     let mut cmd = rivet_command(args, envs);
     cmd.current_dir(dir);
-    graded(args, envs, Some(dir), || {
-        cmd.output().expect("spawn rivet binary")
-    })
+    graded(args, envs, Some(dir), cmd)
 }
 
 /// Spawn `rivet run --config <cfg>` and wait up to `timeout` for it to exit on
@@ -188,11 +199,12 @@ pub fn run_rivet_bounded(
 /// visible in stderr.  Use this when a test needs to assert on warning messages
 /// emitted via the log crate (plan validation warnings, quality warnings, etc.).
 pub fn run_rivet_with_warn_log(args: &[&str]) -> Output {
-    graded(args, &[], None, || {
-        rivet_command(args, &[("RUST_LOG", "warn")])
-            .output()
-            .expect("spawn rivet binary")
-    })
+    graded(
+        args,
+        &[],
+        None,
+        rivet_command(args, &[("RUST_LOG", "warn")]),
+    )
 }
 
 /// Convenience: `rivet run --config <path> --export <name>` and return the

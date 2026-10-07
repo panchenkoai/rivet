@@ -73,6 +73,10 @@ pub enum Leftover {
     OrphanPart,
     /// A CDC checkpoint file added or rewritten.
     CdcCheckpoint,
+    /// A per-run manifest with status success that a `mode: cdc` export added: a flush the stream committed before it stopped.
+    CdcFlush,
+    /// Not a leftover but a declaration: the exit is a verdict on a run that recorded success for the export, whose delivery is then logged ungraded.
+    DeliveredRun,
     /// A `file_log` row: the record of a part the run wrote.
     FileLog,
     /// An `export_schema` row for an export that had none: the schema the run observed.
@@ -97,11 +101,13 @@ pub enum Leftover {
 
 impl Leftover {
     /// Every kind, in report order.
-    pub const ALL: [Leftover; 14] = [
+    pub const ALL: [Leftover; 16] = [
         Leftover::FailureRecord,
         Leftover::FailedManifest,
         Leftover::OrphanPart,
         Leftover::CdcCheckpoint,
+        Leftover::CdcFlush,
+        Leftover::DeliveredRun,
         Leftover::FileLog,
         Leftover::ObservedSchema,
         Leftover::ChunkCheckpoint,
@@ -121,6 +127,8 @@ impl Leftover {
             Leftover::OrphanPart => "orphan-part",
             Leftover::FailedManifest => "failed-manifest",
             Leftover::CdcCheckpoint => "cdc-checkpoint",
+            Leftover::CdcFlush => "cdc-committed-flush",
+            Leftover::DeliveredRun => "delivered-run",
             Leftover::FileLog => "file-log",
             Leftover::ObservedSchema => "observed-schema",
             Leftover::ChunkCheckpoint => "chunk-checkpoint",
@@ -224,6 +232,8 @@ pub(crate) enum StateAt {
 pub(crate) struct Scope {
     /// Per export: its name in the state DB and its destination tree (or why it cannot be read).
     pub exports: Vec<(String, Result<PathBuf, String>)>,
+    /// Per export, whether it is a CDC stream (it commits flush by flush).
+    pub cdc: Vec<bool>,
     /// The CDC checkpoint files the config names.
     pub checkpoints: Vec<PathBuf>,
     /// The state backend, `None` when the invocation keeps none.
@@ -422,7 +432,7 @@ pub(crate) fn diff(
     for (i, (name, _)) in scope.exports.iter().enumerate() {
         match (&before.trees[i], &after.trees[i]) {
             (Ok(b), Ok(a)) => {
-                for (kind, what) in file_changes(b, a, false) {
+                for (kind, what) in file_changes(b, a, false, scope.cdc[i]) {
                     found.push(Finding {
                         kind,
                         export: Some(name.clone()),
@@ -435,7 +445,7 @@ pub(crate) fn diff(
             }
         }
     }
-    for (kind, what) in file_changes(&before.checkpoints, &after.checkpoints, true) {
+    for (kind, what) in file_changes(&before.checkpoints, &after.checkpoints, true, false) {
         found.push(Finding {
             kind,
             export: None,
@@ -460,6 +470,7 @@ fn file_changes(
     before: &BTreeMap<PathBuf, Print>,
     after: &BTreeMap<PathBuf, Print>,
     checkpoint: bool,
+    cdc: bool,
 ) -> Vec<(Leftover, String)> {
     let mut out = Vec::new();
     for (p, now) in after {
@@ -484,6 +495,7 @@ fn file_changes(
             (_, Some(Tag::SuccessManifest), Tag::FailedManifest) if success_kept() => {
                 Leftover::FailedManifest
             }
+            (_, None, Tag::SuccessManifest) if cdc && per_run_manifest(p) => Leftover::CdcFlush,
             (_, _, Tag::SuccessManifest) => Leftover::SuccessManifest,
             (_, None, Tag::Other) => Leftover::OrphanPart,
             (_, Some(_), _) => Leftover::ChangedFile,
@@ -505,6 +517,51 @@ fn file_changes(
         out.push((kind, format!("{} removed", p.display())));
     }
     out
+}
+
+/// Whether `p` is a per-run manifest copy (`manifest-<run id>.json`), not the canonical one.
+fn per_run_manifest(p: &Path) -> bool {
+    p.file_name()
+        .is_some_and(|n| n.to_string_lossy().starts_with("manifest-"))
+}
+
+/// Whether an `export_state` row carries no cursor: only a checkpointed run's claim (state v34: `resume_run_id` + `resume_owner`), set or released.
+fn owner_pointer(table: &str, row: &str) -> bool {
+    table == "export_state"
+        && serde_json::from_str::<serde_json::Value>(row)
+            .is_ok_and(|v| v.get("resume_run_id").is_some() && v["last_cursor_value"].is_null())
+}
+
+/// The pid a rivet run id (`<export>_<yyyymmddThhmmss.mmm>_<pid>`) or a part name built from it ends with, for each one `text` holds.
+fn run_pids(text: &str) -> BTreeSet<u32> {
+    static RE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"\d{8}T\d{6}[._]\d{3}_(\d+)").unwrap());
+    RE.captures_iter(text)
+        .filter_map(|c| c[1].parse().ok())
+        .collect()
+}
+
+/// Drop what carries only run ids of processes other than `pid`: another live run wrote it while this invocation was refused. Returns those pids with how much each wrote; with no `pid` nothing is dropped.
+pub(crate) fn without_other_runs(
+    found: Vec<Finding>,
+    pid: Option<u32>,
+) -> (Vec<Finding>, BTreeMap<u32, usize>) {
+    let mut others = BTreeMap::new();
+    let Some(own) = pid else {
+        return (found, others);
+    };
+    let kept = found
+        .into_iter()
+        .filter(|f| {
+            let pids = run_pids(&f.what);
+            let foreign = !pids.is_empty() && !pids.contains(&own);
+            for p in pids.iter().filter(|_| foreign) {
+                *others.entry(*p).or_default() += 1;
+            }
+            !foreign
+        })
+        .collect();
+    (kept, others)
 }
 
 /// The kind of each state row added, changed or removed between two snapshots.
@@ -536,6 +593,7 @@ fn state_changes(
         let table_kind = |row: &str| match kind_of_table(t) {
             Leftover::ChunkCheckpoint => Leftover::ChunkCheckpoint,
             _ if gone.contains(&field(row, "export_name")) => Leftover::ResumePoint,
+            _ if owner_pointer(t, row) => Leftover::ChunkCheckpoint,
             kind => kind,
         };
         for row in a.difference(b) {
@@ -577,14 +635,14 @@ pub(crate) enum Verdict {
     Fail(Vec<String>),
 }
 
-/// Drop what a sibling export that recorded success left in a multi-export invocation; returns those exports.
+/// Drop what an export that recorded success left when the exit may not be its own (`may`: a sibling failed in a multi-export invocation, or the test declared [`Leftover::DeliveredRun`]); returns those exports.
 pub(crate) fn without_delivering_siblings(
     found: Vec<Finding>,
-    exports: usize,
+    may: bool,
 ) -> (Vec<Finding>, BTreeSet<String>) {
     let delivered: BTreeSet<String> = found
         .iter()
-        .filter(|f| f.kind == Leftover::SuccessRecord && exports > 1)
+        .filter(|f| f.kind == Leftover::SuccessRecord && may)
         .filter_map(|f| f.export.clone())
         .collect();
     let kept = found
@@ -683,6 +741,7 @@ mod tests {
         .unwrap();
         let scope = Scope {
             exports: vec![("e".into(), Ok(out))],
+            cdc: vec![false],
             checkpoints: vec![dir.path().join("cdc.ckpt")],
             state: Some(StateAt::Sqlite(db)),
         };
@@ -902,10 +961,10 @@ mod tests {
             f(Leftover::OrphanPart, "ok"),
             f(Leftover::OrphanPart, "bad"),
         ];
-        let (kept, delivered) = without_delivering_siblings(found.clone(), 2);
+        let (kept, delivered) = without_delivering_siblings(found.clone(), true);
         assert_eq!(kept, vec![f(Leftover::OrphanPart, "bad")]);
         assert_eq!(delivered, ["ok".to_string()].into());
-        let (kept, delivered) = without_delivering_siblings(found.clone(), 1);
+        let (kept, delivered) = without_delivering_siblings(found.clone(), false);
         assert_eq!(
             (kept, delivered.len()),
             (found, 0),
@@ -941,5 +1000,88 @@ mod tests {
     #[should_panic(expected = "unknown leftover kind")]
     fn an_unknown_leftover_kind_is_a_harness_error() {
         declared_in_env("everything");
+    }
+
+    #[test]
+    fn a_flush_a_cdc_stream_committed_is_its_own_kind_and_any_other_success_manifest_is_not() {
+        let kinds = |cdc: bool, file: &str| {
+            let (dir, mut scope) = fixture();
+            scope.cdc = vec![cdc];
+            let before = Snapshot::take(&scope);
+            let body = br#"{"status":"success","run":2}"#;
+            std::fs::write(dir.path().join("out").join(file), body).unwrap();
+            let (found, _) = diff(&scope, &before, &Snapshot::take(&scope));
+            found.iter().map(|f| f.kind).collect::<Vec<_>>()
+        };
+        assert_eq!(kinds(true, "manifest-r2.json"), vec![Leftover::CdcFlush]);
+        assert_eq!(
+            kinds(false, "manifest-r2.json"),
+            vec![Leftover::SuccessManifest]
+        );
+        assert_eq!(
+            kinds(true, "manifest.json"),
+            vec![Leftover::SuccessManifest]
+        );
+        assert_eq!(
+            kinds(true, "manifest-r1.json"),
+            vec![Leftover::SuccessManifest]
+        );
+        let flush = Finding {
+            kind: Leftover::CdcFlush,
+            export: None,
+            what: String::new(),
+        };
+        assert!(matches!(judge(&[flush], &[], None), Verdict::Fail(_)));
+    }
+
+    #[test]
+    fn a_checkpoint_owner_pointer_is_a_chunk_checkpoint_and_a_row_with_a_cursor_is_a_resume_point()
+    {
+        let kind = |row: &str| {
+            let after = BTreeMap::from([(
+                "export_state".to_string(),
+                BTreeSet::from([row.to_string()]),
+            )]);
+            state_changes(&BTreeMap::new(), &after)[0].kind
+        };
+        assert_eq!(
+            kind(
+                r#"{"export_name":"e","last_cursor_value":null,"resume_run_id":"e_20261007T145821.410_7","resume_owner":"chunked"}"#
+            ),
+            Leftover::ChunkCheckpoint
+        );
+        assert_eq!(
+            kind(
+                r#"{"export_name":"e","last_cursor_value":"10","resume_run_id":"e_20261007T145821.410_7"}"#
+            ),
+            Leftover::ResumePoint
+        );
+        assert_eq!(
+            kind(r#"{"export_name":"e","last_cursor_value":null,"resume_run_id":null}"#),
+            Leftover::ChunkCheckpoint
+        );
+        assert_eq!(
+            kind(r#"{"export_name":"e","last_cursor_value":"10","resume_run_id":null}"#),
+            Leftover::ResumePoint
+        );
+    }
+
+    #[test]
+    fn what_another_live_run_wrote_is_not_the_refused_invocations() {
+        let f = |what: &str| Finding {
+            kind: Leftover::ChunkCheckpoint,
+            export: Some("e".into()),
+            what: what.into(),
+        };
+        let found = vec![
+            f(r#"chunk_run + {"run_id":"e_20261007T145821.410_59977"}"#),
+            f("out/e_20261007T145830_981_59977_keyset_start.parquet added (9 bytes)"),
+            f(r#"chunk_run + {"run_id":"e_20261007T145821.409_60001"}"#),
+            f(r#"export_schema + {"export_name":"e"}"#),
+        ];
+        let (kept, others) = without_other_runs(found.clone(), Some(60001));
+        assert_eq!(kept, found[2..]);
+        assert_eq!(others, BTreeMap::from([(59977, 2)]));
+        assert_eq!(without_other_runs(found.clone(), None).0, found);
     }
 }

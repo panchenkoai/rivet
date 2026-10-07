@@ -73,6 +73,10 @@ pub(crate) struct Case {
     events: Vec<usize>,
     /// What the invocation's destinations, checkpoints and state held before it started.
     snapshot: Option<refusal::Snapshot>,
+    /// The rivet process, when its runner said: what carries another process's run id is not this invocation's.
+    pid: Option<u32>,
+    /// Whether the invocation runs its exports in child processes, whose run ids carry their own pids.
+    forks: bool,
     /// When the invocation began: its `export_metrics` rows are the ones recorded since.
     began: String,
     /// The file holding what the run printed for its one `destination: stdout` export.
@@ -402,6 +406,11 @@ fn parse(argv: &[String], envs: &[(&str, &str)], cwd: Option<&Path>) -> Option<C
             }
         })
         .collect();
+    let forks = argv.iter().any(|a| a == "--parallel-export-processes")
+        || cfg
+            .get("parallel_export_processes")
+            .and_then(Value::as_bool)
+            == Some(true);
     Some(Case {
         verb,
         config_dir: cfg_path.parent().map(Path::to_path_buf).unwrap_or_default(),
@@ -415,6 +424,8 @@ fn parse(argv: &[String], envs: &[(&str, &str)], cwd: Option<&Path>) -> Option<C
         cli,
         events: Vec::new(),
         snapshot: None,
+        pid: None,
+        forks,
         began: chrono::Utc::now().to_rfc3339(),
         stdout: None,
     })
@@ -532,9 +543,19 @@ impl Case {
         checkpoints.dedup();
         refusal::Scope {
             exports: self.exports.iter().map(|e| (name(e), root(e))).collect(),
+            cdc: self
+                .exports
+                .iter()
+                .map(|e| self.cli.is_some() || s(e, "mode") == Some("cdc"))
+                .collect(),
             checkpoints,
             state: self.state_at(envs),
         }
+    }
+
+    /// Record the pid the invocation ran as.
+    pub(crate) fn ran_as(&mut self, pid: u32) {
+        self.pid = Some(pid);
     }
 
     /// Log that this invocation ended in a way no grade covers.
@@ -564,23 +585,38 @@ impl Case {
         let scope = self.scope(envs);
         let before = self.snapshot.as_ref().expect("begin took the snapshot");
         let (found, blind) = refusal::diff(&scope, before, &refusal::Snapshot::take(&scope));
-        let states: BTreeSet<&String> = scope.exports.iter().map(|(n, _)| n).collect();
-        let (found, delivered) = refusal::without_delivering_siblings(found, states.len());
-        for e in &delivered {
-            log(
-                "UNGRADED",
-                e,
-                &format!(
-                    "{exit}: this export recorded success beside a sibling that failed; its delivery was not graded"
-                ),
-            );
-        }
         let mut declared = opts.leaves.to_vec();
         if let Some(raw) = envs
             .iter()
             .find(|(k, _)| *k == refusal::FAILED_RUN_LEAVES_ENV)
         {
             declared.extend(refusal::declared_in_env(raw.1));
+        }
+        let (found, others) = refusal::without_other_runs(found, self.pid.filter(|_| !self.forks));
+        for (pid, n) in others {
+            self.ungraded(&format!(
+                "{exit}: {n} changes carry the run id of another rivet process (pid {pid}), live beside this invocation; they are that run's"
+            ));
+        }
+        let states: BTreeSet<&String> = scope.exports.iter().map(|(n, _)| n).collect();
+        let verdict_exit = declared.contains(&Leftover::DeliveredRun);
+        let (found, delivered) =
+            refusal::without_delivering_siblings(found, states.len() > 1 || verdict_exit);
+        assert!(
+            !verdict_exit || !delivered.is_empty(),
+            "a `delivered-run` declaration on a run that recorded no success ({exit}): remove it"
+        );
+        for e in &delivered {
+            let why = if verdict_exit {
+                "declared a verdict on a run that recorded success"
+            } else {
+                "this export recorded success beside a sibling that failed"
+            };
+            log(
+                "UNGRADED",
+                e,
+                &format!("{exit}: {why}; its delivery was not graded"),
+            );
         }
         let marker = opts
             .xfail

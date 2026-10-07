@@ -815,10 +815,21 @@ fn oracle_cdc_truncate_refusal_delivers_the_rows_before_it_once() {
         "INSERT INTO {} VALUES (3, 30, DATE '2024-02-01')",
         t.name()
     ));
+    let refusing = |out: &std::path::Path| {
+        rig(&t, &ckpt, out).a_failed_run_may_leave(
+            &[
+                Leftover::OrphanPart,
+                Leftover::FileLog,
+                Leftover::CdcFlush,
+                Leftover::CdcCheckpoint,
+            ],
+            "the stream delivers the rows it read before the TRUNCATE it refuses, and its checkpoint follows them",
+        )
+    };
     let out1 = d.path().join("out1");
-    expect_truncate_refusal(&rig(&t, &ckpt, &out1), &out1, t.name(), "run 1");
+    expect_truncate_refusal(&refusing(&out1), &out1, t.name(), "run 1");
     let out2 = d.path().join("out2");
-    expect_truncate_refusal(&rig(&t, &ckpt, &out2), &out2, t.name(), "run 2");
+    expect_truncate_refusal(&refusing(&out2), &out2, t.name(), "run 2");
     let mut all = cdc_id_ops(&out1);
     all.extend(cdc_id_ops(&out2));
     assert_eq!(

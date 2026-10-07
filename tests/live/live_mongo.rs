@@ -503,7 +503,9 @@ fn roast_resume_must_not_bypass_heterogeneous_id_guard() {
     m.seed_int_id("t", 100); // uniform int _id — run 1 passes the guard
 
     // SAME rig across runs: the keyset checkpoint persists in export_state.
-    let rig = batch(&db, "t").mongo("page_size: 40, resume: true");
+    let rig = batch(&db, "t")
+        .mongo("page_size: 40, resume: true")
+        .oracle_known_defect("a failed run left: resume-point", "known defect: a resumed keyset run the heterogeneous-_id guard refuses has already written its claim (resume_run_id, resume_owner) on the cursor row; the guard must come before the claim");
     rig.run_ok();
     assert_eq!(
         duckdb_dir_parquet_distinct_strings(&rig.out_dir(), "_id").len(),

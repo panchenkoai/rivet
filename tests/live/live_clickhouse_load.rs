@@ -1361,6 +1361,10 @@ fn a_cdc_insert_whose_every_answer_is_lost_fails_after_five_attempts() {
     let proxy = LossyProxy::start(usize::MAX);
     let rig = Rig::mysql_cdc(&tbl)
         .cdc("initial: snapshot")
+        .a_failed_run_may_leave(
+            &[Leftover::LoadAttempt],
+            "every INSERT reached ClickHouse and only the answers were lost: the load did attempt the write",
+        )
         .dest_gcs(BUCKET, &unique_name("chload"), FAKE_GCS_ENDPOINT)
         .top_line(&load_line(&proxy.url(), &db, ""));
     rig.run_ok();
@@ -1389,6 +1393,10 @@ fn a_full_load_insert_whose_answer_is_lost_is_not_resent() {
     let proxy = LossyProxy::start(0);
     let rig = Rig::pg_batch(&tbl)
         .mode("full")
+        .a_failed_run_may_leave(
+            &[Leftover::LoadAttempt],
+            "the INSERT reached ClickHouse and only its answer was lost: the load did attempt the write",
+        )
         .dest_gcs(BUCKET, &unique_name("chload"), FAKE_GCS_ENDPOINT)
         .top_line(&load_line(&proxy.url(), &db, ""));
     let table = format!("{}.{tbl}", db.0);

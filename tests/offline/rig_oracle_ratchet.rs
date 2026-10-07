@@ -32,7 +32,8 @@ const NO_ORACLE_CEILING: usize = 23; // ratchet-pin: no-oracle-opt-outs
 
 /// Typed declarations in tests/live of what a run that does not exit 0 may leave: `.a_failed_run_may_leave(` and a raw run's `FAILED_RUN_LEAVES_ENV`.
 // 0 -> 19 (2026-10-07): the refusal grade's first pass; every site is a gate that fails a run after its parts are written (quality, schema drift, a manifest that did not land).
-const FAILED_RUN_LEFTOVER_CEILING: usize = 19; // ratchet-pin: failed-run-leftover-declarations
+// 19 -> 34 (2026-10-07): the full-stand sweep; a CDC stream commits the flushes it read before a refusal (6), a run cut mid-way keeps the parts it wrote (3), a ClickHouse load whose answer is lost did attempt the write (2); the whole-suite sweep added four more of the first two classes.
+const FAILED_RUN_LEFTOVER_CEILING: usize = 34; // ratchet-pin: failed-run-leftover-declarations
 
 /// Entries of `KNOWN_PRODUCT_DEFECTS` (tests/common/refusal.rs): product defects every failed run may show.
 const KNOWN_PRODUCT_DEFECT_CEILING: usize = 1; // ratchet-pin: failed-run-known-product-defects
@@ -237,6 +238,21 @@ const KNOWN_DEFECTS: &[(&str, &str, &str)] = &[
         "chunked_checkpoint_refuses_to_clobber_a_cdc_manifest",
         "a failed run left: chunk-checkpoint",
         "known defect: the refusal to overwrite a CDC manifest comes after the chunk plan is stored",
+    ),
+    (
+        "roast_mysql_cdc_refuses_a_view_whose_binlog_identity_is_the_base_table",
+        "a failed run left: cdc-checkpoint",
+        "known defect: a CDC run that refuses at open still writes its checkpoint at the position it started from; the anchor must be written after the open checks",
+    ),
+    (
+        "cdc_from_a_replica_that_does_not_relog_refuses_instead_of_capturing_nothing",
+        "a failed run left: cdc-checkpoint",
+        "known defect: a CDC run that refuses at open still writes its checkpoint at the position it started from; the anchor must be written after the open checks",
+    ),
+    (
+        "roast_resume_must_not_bypass_heterogeneous_id_guard",
+        "a failed run left: resume-point",
+        "known defect: a resumed keyset run the heterogeneous-_id guard refuses has already written its claim (resume_run_id, resume_owner) on the cursor row; the guard must come before the claim",
     ),
 ]; // ratchet-pin: end
 

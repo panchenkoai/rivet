@@ -46,12 +46,15 @@ impl Rig {
         envs: &[(&str, &str)],
         cwd: Option<&std::path::Path>,
     ) -> std::process::Output {
-        let case = self.oracle_begin(argv, envs, cwd);
+        let mut case = self.oracle_begin(argv, envs, cwd);
         let mut cmd = self.invoke_command(argv, envs);
         if let Some(dir) = cwd {
             cmd.current_dir(dir);
         }
-        let out = cmd.output().expect("spawn rivet binary");
+        let (pid, out) = crate::common::runner::output_of(&mut cmd);
+        if let Some(case) = case.as_mut() {
+            case.ran_as(pid);
+        }
         // rivet itself may write into the config (`plan` annotates wave-less
         // configs even without --annotate-waves) — absorb it so the hand-edit
         // guard keeps firing only on edits made OUTSIDE an invocation.
@@ -307,13 +310,16 @@ impl Rig {
     /// The caller reaps it through [`Spawned`]; the reaping grades the run by its exit like any other.
     pub fn spawn_args_env(&self, extra: &[&str], envs: &[(&str, &str)]) -> Spawned<'_> {
         let argv = self.run_argv(extra);
-        let case = self.oracle_begin(&argv, envs, None);
+        let mut case = self.oracle_begin(&argv, envs, None);
         let child = self
             .invoke_command(&argv, envs)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
             .expect("spawn rivet");
+        if let Some(case) = case.as_mut() {
+            case.ran_as(child.id());
+        }
         Spawned {
             rig: self,
             child,
