@@ -761,7 +761,7 @@ impl PgChangeStream {
                 let commit_lsn = parse_lsn(&lsn).unwrap_or(0);
                 match tx_disposition(commit_lsn, self.frontier, self.bound) {
                     TxDisposition::Yield => {
-                        let commit = Position(json!({ "lsn": lsn }));
+                        let commit = Position::new(json!({ "lsn": lsn }));
                         // #158: commit LSN on all, committed on the transaction's LAST
                         // event — on disk when it spilled (`TxBuffer::close_transaction`).
                         let (head, tail) = tx.close_transaction(&commit, &lsn)?;
@@ -1522,7 +1522,7 @@ pub(crate) fn parse_test_decoding(
         before,
         after,
         image_names,
-        position: Position(json!({ "lsn": lsn })),
+        position: Position::new(json!({ "lsn": lsn })),
         // Placeholder — `fill` overrides this, marking only the LAST event of the
         // transaction as the commit boundary (so the sink never rolls mid-tx).
         // Default `false` is the safe value: a stray event that bypassed `fill`
@@ -3653,7 +3653,7 @@ mod spill_tests {
     fn a_split_transaction_closes_on_its_true_last_row() {
         use crate::source::cdc::TxnFramer;
         const N: usize = 5;
-        let commit = Position(json!({ "lsn": "0/DEAD" }));
+        let commit = Position::new(json!({ "lsn": "0/DEAD" }));
         let row = |i: usize| {
             let mut ev = parse_test_decoding(
                 "0/1",

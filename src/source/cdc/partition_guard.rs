@@ -332,7 +332,7 @@ fn partition_moves(
     log::warn!(
         "cdc: `{table}` moved a row from `{col}` = {b} to {a}, another partition (at {pos}); \
          written as a delete of the old row and an insert of the new one",
-        pos = ev.position.0,
+        pos = ev.position.json(),
         b = shown(&before, zoned),
         a = shown(&after, zoned),
     );
@@ -442,7 +442,7 @@ mod tests {
             table: "t".into(),
             before: before.map(|b| vec![RivetValue::Int(1), ts(b)]),
             after: Some(vec![RivetValue::Int(1), ts(after)]),
-            position: super::super::Position(
+            position: super::super::Position::new(
                 serde_json::json!({"file": "binlog.000001", "pos": 4}),
             ),
             committed: true,
@@ -922,7 +922,7 @@ mod tests {
         let (mut moved, mut buf) = (MovedIn::default(), Vec::new());
         let ev = |pos: &str| ChangeEvent {
             op: ChangeOp::Insert,
-            position: super::super::Position(serde_json::json!(pos)),
+            position: super::super::Position::new(serde_json::json!(pos)),
             ..row(&["id", "v"], None, vec![2, 10])
         };
         moved.push(&mut buf, ev("a"), &key, true);

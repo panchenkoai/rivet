@@ -272,7 +272,7 @@ impl Scns {
 
     /// What an event carries as `__pos`: the two SCNs only.
     fn position(self) -> Position {
-        Position(serde_json::json!({
+        Position::new(serde_json::json!({
             "low_water": self.low_water.to_string(),
             "commit_scn": self.commit_scn.to_string(),
         }))
@@ -281,7 +281,7 @@ impl Scns {
 
 /// `position` with the database identity added, as a checkpoint records it.
 fn with_identity(position: &Position, id: &OraIdentity) -> Position {
-    let mut v = position.0.clone();
+    let mut v = position.json().clone();
     if let Some(o) = v.as_object_mut() {
         o.insert("dbid".into(), id.dbid.clone().into());
         o.insert("db_unique_name".into(), id.db_unique_name.clone().into());
@@ -289,7 +289,7 @@ fn with_identity(position: &Position, id: &OraIdentity) -> Position {
         o.insert("con_name".into(), id.con_name.clone().into());
         o.insert("con_dbid".into(), id.con_dbid.clone().into());
     }
-    Position(v)
+    Position::new(v)
 }
 
 /// One redo log file as the catalog lists it.
@@ -1171,7 +1171,7 @@ impl OracleChangeStream {
                 table: t.ev_table.clone(),
                 before: (op != ChangeOp::Insert).then_some(before),
                 after: (op != ChangeOp::Delete).then_some(after),
-                position: Position(serde_json::Value::Null),
+                position: Position::new(serde_json::Value::Null),
                 committed: false,
                 image_names: Some(Arc::clone(&t.names)),
                 seq: 0,
@@ -1201,13 +1201,14 @@ impl OracleChangeStream {
             }
         };
         let commit = first.commit;
-        let mut bytes = first.event.estimated_bytes();
+        let mut bytes = crate::source::cdc::ResidentBytes::default();
+        bytes.add(&first.event);
         let mut group = vec![first];
         loop {
             crate::source::cdc::tx_buffer::check_tx_buffer_caps(
                 crate::source::cdc::CdcEngine::Oracle,
                 group.len(),
-                bytes,
+                bytes.bytes(),
                 (
                     crate::source::cdc::max_tx_rows(),
                     crate::source::cdc::max_tx_bytes(),
@@ -1215,7 +1216,7 @@ impl OracleChangeStream {
             )?;
             match self.next_mined()? {
                 Some(Mine::Change(m)) if joins_commit_group(commit, m.commit) => {
-                    bytes += m.event.estimated_bytes();
+                    bytes.add(&m.event);
                     group.push(m);
                 }
                 Some(m) => {
@@ -2068,7 +2069,7 @@ mod tests {
     /// A 0.30 checkpoint with low-water 0 is refused as such, with the anchor-first remedy, never as LOST.
     #[test]
     fn a_low_water_of_zero_is_refused_as_a_release_defect_not_as_lost_changes() {
-        let pos = Position(serde_json::json!({"low_water": "0", "commit_scn": "9"}));
+        let pos = Position::new(serde_json::json!({"low_water": "0", "commit_scn": "9"}));
         let err = Scns::from_position(&pos, "ck").unwrap_err().to_string();
         assert!(err.contains("records a low-water SCN of 0"), "{err}");
         assert!(err.contains("no change was lost to log retention"), "{err}");
@@ -2077,7 +2078,7 @@ mod tests {
             err.ends_with(crate::source::cdc::checkpoint_identity::RECOVER),
             "{err}"
         );
-        let one = Position(serde_json::json!({"low_water": "1", "commit_scn": "9"}));
+        let one = Position::new(serde_json::json!({"low_water": "1", "commit_scn": "9"}));
         assert_eq!(
             Scns::from_position(&one, "ck").unwrap(),
             Scns {
@@ -2096,7 +2097,7 @@ mod tests {
         let pos = with_identity(&s.position(), &id("1", "10", "7"));
         assert_eq!(Scns::from_position(&pos, "ck").unwrap(), s);
         assert_eq!(OraIdentity::from_position(&pos), Some(id("1", "10", "7")));
-        let hollow = Position(serde_json::json!({"commit_scn": "9"}));
+        let hollow = Position::new(serde_json::json!({"commit_scn": "9"}));
         let err = Scns::from_position(&hollow, "ck").unwrap_err().to_string();
         assert!(
             err.ends_with(&format!(
@@ -2105,7 +2106,7 @@ mod tests {
             )),
             "the remedy must be anchor FIRST, then re-snapshot: {err}"
         );
-        let inverted = Position(serde_json::json!({"low_water": "10", "commit_scn": "9"}));
+        let inverted = Position::new(serde_json::json!({"low_water": "10", "commit_scn": "9"}));
         assert!(Scns::from_position(&inverted, "ck").is_err());
     }
 

@@ -329,7 +329,9 @@ fn encode_resume_token(token: &mongodb::change_stream::event::ResumeToken) -> Re
     // (bug-hunt). Robust to serde_json's preserve_order either way: with it on,
     // insertion order wins (`_data` first); with it off, keys sort (`"_data"` <
     // `"rt"`). See `cdc::validate::parse_pos` which keys on `_data`.
-    Ok(Position(serde_json::json!({ "_data": data, "rt": hex })))
+    Ok(Position::new(
+        serde_json::json!({ "_data": data, "rt": hex }),
+    ))
 }
 
 /// Inverse of [`encode_resume_token`], with a fallback to the pre-lossless

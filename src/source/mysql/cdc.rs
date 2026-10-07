@@ -101,7 +101,7 @@ pub(crate) struct MysqlChangeStream {
 impl MysqlChangeStream {
     /// A checkpoint position at `log_pos` in the current file, carrying the server identity.
     fn position_at(&self, log_pos: u64) -> Position {
-        Position(json!({
+        Position::new(json!({
             "file": self.file,
             "pos": log_pos,
             "server_uuid": self.identity.0,
@@ -755,7 +755,7 @@ impl MysqlChangeStream {
                  foreign server on resume"
             )
         })?;
-        Position(serde_json::json!({
+        Position::new(serde_json::json!({
             "file": file, "pos": pos, "server_uuid": uuid, "gtid_executed": gtid
         }))
         .save(ckpt)
@@ -3036,9 +3036,11 @@ mod identity_recovery_order {
             serde_json::json!({"pos": 4}),
             serde_json::json!({"file": "binlog.000001"}),
         ] {
-            let err =
-                super::MysqlChangeStream::resume_from_checkpoint(Some(&Position(hollow)), "/x")
-                    .unwrap_err();
+            let err = super::MysqlChangeStream::resume_from_checkpoint(
+                Some(&Position::new(hollow)),
+                "/x",
+            )
+            .unwrap_err();
             assert_eq!(crate::error::classify_exit(&err), 5, "{err}");
             assert_eq!(
                 crate::error::error_code(&err),

@@ -111,14 +111,24 @@ impl PriorRun {
 /// LSN, a SQL Server LSN. Persisted verbatim as the checkpoint; each engine
 /// interprets its own shape when resuming. Compared only for equality.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct Position(pub(crate) Json);
+pub(crate) struct Position(pub(crate) std::sync::Arc<Json>);
 
 impl Position {
+    /// A position holding `json`; a clone shares it.
+    pub(crate) fn new(json: Json) -> Self {
+        Self(std::sync::Arc::new(json))
+    }
+
+    /// The engine-shaped value.
+    pub(crate) fn json(&self) -> &Json {
+        &self.0
+    }
+
     /// Load a persisted checkpoint, or `None` on first run (absent).
     pub(crate) fn load(path: &Path) -> Result<Option<Self>> {
         use anyhow::Context as _;
         match std::fs::read_to_string(path) {
-            Ok(s) => Ok(Some(Position(serde_json::from_str(&s).with_context(
+            Ok(s) => Ok(Some(Position::new(serde_json::from_str(&s).with_context(
                 || {
                     format!(
                         "checkpoint '{}' is corrupt or truncated (not valid JSON) — refusing to \
@@ -448,7 +458,6 @@ impl ChangeEvent {
             + before_names
             + img(&self.before)
             + img(&self.after)
-            + json_resident_bytes(&self.position.0)
     }
 
     /// Surface this event's DEFERRED decode error ([`poison`](Self::poison)) if it
@@ -542,6 +551,40 @@ pub(crate) trait ChangeStream {
 }
 
 /// The first declared key column the table does not have, matched as images match names.
+/// The resident bytes of buffered events: each event's own cost, and each position once however many consecutive events share it.
+#[derive(Debug, Default)]
+pub(crate) struct ResidentBytes {
+    bytes: usize,
+    at: Option<Position>,
+}
+
+impl ResidentBytes {
+    /// Charge `ev`; its position is charged only when it is not the one the previous event holds.
+    pub(crate) fn add(&mut self, ev: &ChangeEvent) {
+        let shared = self
+            .at
+            .as_ref()
+            .is_some_and(|p| std::sync::Arc::ptr_eq(&p.0, &ev.position.0));
+        if !shared {
+            self.bytes = self
+                .bytes
+                .saturating_add(json_resident_bytes(ev.position.json()));
+            self.at = Some(ev.position.clone());
+        }
+        self.bytes = self.bytes.saturating_add(ev.estimated_bytes());
+    }
+
+    /// The bytes charged since the last reset.
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Start over: nothing is buffered.
+    pub(crate) fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
 pub(crate) fn undeclared_key_column<'k>(
     key: &'k [String],
     columns: &[crate::types::TypeMapping],
@@ -567,7 +610,7 @@ pub(crate) fn ndjson_line(ev: &ChangeEvent) -> serde_json::Value {
         "table": ev.table,
         "before": to_json(&ev.before),
         "after": to_json(&ev.after),
-        "pos": ev.position.0,
+        "pos": ev.position.json(),
         "seq": ev.seq,
     });
     if let Some(names) = &ev.before_names {
@@ -2145,7 +2188,7 @@ mod mod_decisions {
     /// winner for a key. Silent, and correct-looking at every count.
     #[test]
     fn the_sequence_stamp_writes_the_ordinal_onto_the_event() {
-        let at = |lsn: &str| Position(serde_json::json!({ "lsn": lsn }));
+        let at = |lsn: &str| Position::new(serde_json::json!({ "lsn": lsn }));
         let ev = |lsn: &str| ChangeEvent {
             op: ChangeOp::Insert,
             schema: "s".into(),
@@ -2199,7 +2242,7 @@ mod mod_decisions {
             table: "tab".into(),  // 3
             before,
             after,
-            position: Position(serde_json::json!({})),
+            position: Position::new(serde_json::json!({})),
             committed: false,
             image_names: None,
             seq: 0,
@@ -2228,16 +2271,40 @@ mod mod_decisions {
         poisoned.row_id = Some("z".repeat(13));
         assert_eq!(poisoned.estimated_bytes(), empty + 7 + 11 + 13);
 
-        // The COMMIT POSITION is charged, and it is the dominant term: the framer
-        // clones it onto every event of a transaction, and a one-key JSON object
-        // costs a whole BTreeMap node (measured 475 B). An estimate that ignores it
-        // is wrong by ~60% on every narrow event.
+        // The COMMIT POSITION is charged once per distinct position, not per event: the
+        // framer stamps one shared position on every event of a transaction. A one-key
+        // JSON object costs a whole BTreeMap node (measured 475 B), which a transaction
+        // of single-event commits still pays per event.
         let mut positioned = mk(None, None);
-        positioned.position = Position(serde_json::json!({ "lsn": "0/16B2E00" }));
+        positioned.position = Position::new(serde_json::json!({ "lsn": "0/16B2E00" }));
+        let mut resident = super::ResidentBytes::default();
+        resident.add(&positioned);
         assert!(
-            positioned.estimated_bytes() > empty + 400,
-            "the cloned commit position must be charged — it is 475 of the 772 \
-             bytes a narrow event really costs"
+            resident.bytes() > empty + 400,
+            "a position is charged where it enters the buffer: a one-key JSON object costs a whole BTreeMap node"
+        );
+        let after_one = resident.bytes();
+        let sibling = positioned.clone();
+        resident.add(&sibling);
+        assert_eq!(
+            resident.bytes(),
+            after_one + sibling.estimated_bytes(),
+            "an event sharing the previous event's position adds its own bytes only"
+        );
+        let mut apart = sibling.clone();
+        apart.position = Position::new(serde_json::json!({ "lsn": "0/16B2E00" }));
+        resident.add(&apart);
+        assert!(
+            resident.bytes() > after_one + 2 * sibling.estimated_bytes() + 400,
+            "an equal position held in another allocation is charged again"
+        );
+        resident.reset();
+        assert_eq!(resident.bytes(), 0);
+        resident.add(&sibling);
+        assert_eq!(
+            resident.bytes(),
+            after_one,
+            "after a reset the next position is charged again"
         );
 
         // IMAGE NAMES are charged, amortised by how many events share the Arc.
@@ -2647,7 +2714,7 @@ mod tests {
             table: "t".into(),
             before: None,
             after: Some(vec![crate::source::cdc::value::RivetValue::Int(id)]),
-            position: Position(serde_json::json!({ "lsn": format!("{id:08X}") })),
+            position: Position::new(serde_json::json!({ "lsn": format!("{id:08X}") })),
             committed,
             image_names: None,
             seq: 0,
@@ -2899,7 +2966,7 @@ mod tests {
     fn checkpoint_save_creates_missing_parent_directories() {
         let d = tempfile::tempdir().unwrap();
         let path = d.path().join("cdc").join("nested").join("orders.ckpt");
-        let pos = Position(serde_json::json!({"file": "binlog.000001", "pos": 4}));
+        let pos = Position::new(serde_json::json!({"file": "binlog.000001", "pos": 4}));
         pos.save(&path).expect("save must create parents");
         let loaded = Position::load(&path).unwrap().expect("roundtrip");
         assert_eq!(loaded.0["pos"], 4);
@@ -2979,7 +3046,7 @@ mod tests {
             table: "orders".into(),
             before: None,
             after: Some(vec![RivetValue::Int(id)]),
-            position: Position(serde_json::json!({ "lsn": "stale" })),
+            position: Position::new(serde_json::json!({ "lsn": "stale" })),
             committed: false,
             image_names: None,
             seq: 0,
@@ -2995,7 +3062,7 @@ mod tests {
     /// exact shape that shipped the PG/MSSQL bugs).
     #[test]
     fn txn_framer_close_group_marks_only_the_last_committed() {
-        let commit = Position(serde_json::json!({ "lsn": "COMMIT" }));
+        let commit = Position::new(serde_json::json!({ "lsn": "COMMIT" }));
 
         // N-event group: every event gets the commit position; only the last
         // is committed.
@@ -3014,8 +3081,8 @@ mod tests {
         assert!(one[0].committed && one[0].position == commit);
 
         // Two groups back-to-back: each ends with exactly one committed.
-        let c1 = Position(serde_json::json!({ "lsn": "C1" }));
-        let c2 = Position(serde_json::json!({ "lsn": "C2" }));
+        let c1 = Position::new(serde_json::json!({ "lsn": "C1" }));
+        let c2 = Position::new(serde_json::json!({ "lsn": "C2" }));
         let mut a: Vec<super::ChangeEvent> = (0..2).map(framer_ev).collect();
         let mut b: Vec<super::ChangeEvent> = (0..3).map(framer_ev).collect();
         super::TxnFramer::close_group(&mut a, &c1);
@@ -3047,8 +3114,8 @@ mod tests {
         // position changes — the reliable txn boundary on every engine (PG/MSSQL
         // mark every change `committed`, so `committed` can't be it).
         let mut ts = TxnSeq::default();
-        let pa = Position(serde_json::json!({ "lsn": "A" })); // transaction A
-        let pb = Position(serde_json::json!({ "lsn": "B" })); // transaction B
+        let pa = Position::new(serde_json::json!({ "lsn": "A" })); // transaction A
+        let pb = Position::new(serde_json::json!({ "lsn": "B" })); // transaction B
         // A = 3 changes, B = 2 changes.
         let seqs: Vec<u64> = [&pa, &pa, &pa, &pb, &pb]
             .iter()
@@ -3059,7 +3126,10 @@ mod tests {
         // Same position again after B still counts up within B.
         assert_eq!(ts.next(&pb), 2);
         // A new position resets.
-        assert_eq!(ts.next(&Position(serde_json::json!({ "lsn": "C" }))), 0);
+        assert_eq!(
+            ts.next(&Position::new(serde_json::json!({ "lsn": "C" }))),
+            0
+        );
     }
 
     // ── NDJSON driver honours ChangeEvent.poison (silent-corruption guard) ──
@@ -3081,7 +3151,7 @@ mod tests {
             table: table.into(),
             before: None,
             after: Some(vec![RivetValue::Bytes(b"unchanged-toast-datum".to_vec())]),
-            position: Position(serde_json::json!({ "lsn": "0/ABC" })),
+            position: Position::new(serde_json::json!({ "lsn": "0/ABC" })),
             committed: true,
             image_names: None,
             seq: 0,
@@ -3146,7 +3216,7 @@ mod tests {
             table: "t".into(),
             before: Some(vec![RivetValue::Int(1)]),
             after: Some(vec![RivetValue::Int(2)]),
-            position: Position(serde_json::json!({ "lsn": "0/ABC" })),
+            position: Position::new(serde_json::json!({ "lsn": "0/ABC" })),
             committed: true,
             image_names: None,
             seq: 0,
@@ -3188,7 +3258,7 @@ mod tests {
             table: "t".into(),
             before: Some(vec![RivetValue::Int(1)]),
             after: Some(vec![RivetValue::Bytes(b"a".to_vec()), RivetValue::Int(2)]),
-            position: Position(serde_json::json!({ "lsn": "0/ABC" })),
+            position: Position::new(serde_json::json!({ "lsn": "0/ABC" })),
             committed: true,
             image_names: Some(vec!["v".to_string(), "id".to_string()].into()),
             seq: 0,
@@ -3276,7 +3346,7 @@ mod tests {
             table: "t".into(),
             before: None,
             after: Some(vec![RivetValue::Int(1), RivetValue::Bytes(vec![b'x'; 100])]),
-            position: Position(serde_json::json!({ "lsn": "0/1" })),
+            position: Position::new(serde_json::json!({ "lsn": "0/1" })),
             committed: false,
             image_names: None,
             seq: 0,
@@ -3292,15 +3362,20 @@ mod tests {
             "payload = schema + table + the values' own bytes, nothing else"
         );
         assert!(
-            ev.estimated_bytes() > payload + 400,
-            "resident must exceed payload by at least the position clone — if the \
-             two converge, one of them changed meaning and a metric or a budget is \
-             now lying"
+            ev.estimated_bytes() > payload,
+            "an event's own resident cost is its values plus the struct that holds them"
+        );
+        let mut resident = ResidentBytes::default();
+        resident.add(&ev);
+        assert!(
+            resident.bytes() > payload + 400,
+            "buffered, the event costs its position too — if resident and payload \
+             converge, one of them changed meaning and a metric or a budget is now lying"
         );
         // The position is RESIDENT cost, never payload: re-stamping it must not
         // move the metric's number.
         let before = ev.payload_bytes();
-        ev.position = Position(serde_json::json!({ "lsn": "0/FFFFFFFF", "extra": "x" }));
+        ev.position = Position::new(serde_json::json!({ "lsn": "0/FFFFFFFF", "extra": "x" }));
         assert_eq!(
             ev.payload_bytes(),
             before,

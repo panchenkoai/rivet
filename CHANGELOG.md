@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **CDC memory: the events of one transaction share its commit position.** Closing a
+  transaction copied its resume position, a JSON object, into every event (about 475 to 730
+  bytes each), which was the largest single item on the heap of a large transaction. The
+  position is now one shared value. Measured on MySQL, one transaction: 500 000 changes
+  940 MB -> 427 MB peak and 1.90 s -> 1.39 s; 20 000 changes 77 MB -> 51 MB. Peak memory still
+  grows with the largest transaction. The transaction-buffer and rollover byte budgets charge a
+  position once per run of events that share it, so they keep tracking real memory. Output,
+  checkpoint files and the NDJSON stream are unchanged.
+
 - **Breaking: an incremental or CDC load refuses a view or a `<table>__changes` it has no record
   of loading**, on BigQuery, Snowflake and ClickHouse. Before, only a foreign TABLE at `<table>`
   was refused: a view there was replaced by rivet's current-state view, a foreign

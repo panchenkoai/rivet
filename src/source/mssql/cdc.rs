@@ -384,12 +384,12 @@ fn with_identity(
     position: &crate::source::cdc::Position,
     id: Option<&DbIdentity>,
 ) -> crate::source::cdc::Position {
-    let mut v = position.0.clone();
+    let mut v = position.json().clone();
     if let (Some(id), Some(o)) = (id, v.as_object_mut()) {
         o.insert("family_guid".into(), id.family.clone().into());
         o.insert("recovery_fork_guid".into(), id.fork.clone().into());
     }
-    crate::source::cdc::Position(v)
+    crate::source::cdc::Position::new(v)
 }
 
 /// Read a resume position out of a checkpoint that has already PARSED.
@@ -990,7 +990,7 @@ impl MssqlChangeStream {
                 table: self.table.clone(),
                 before,
                 after,
-                position: Position(json!({ "lsn": lsn })),
+                position: Position::new(json!({ "lsn": lsn })),
                 // Overridden below — the last row of each start-LSN group is
                 // the commit boundary.
                 committed: false,
@@ -1089,7 +1089,7 @@ impl ChangeStream for MssqlChangeStream {
             self.bound.as_deref(),
             self.from_lsn.as_deref(),
         )
-        .map(|lsn| Position(json!({ "lsn": lsn })))
+        .map(|lsn| Position::new(json!({ "lsn": lsn })))
     }
 
     fn next_change(&mut self) -> Option<Result<ChangeEvent>> {
@@ -1303,7 +1303,7 @@ pub(crate) fn pin_checkpoint_at_max_lsn(
         rt.block_on(async { db_identity(&mut connect(&cfg, tls).await?).await })?
     };
     with_identity(
-        &Position(serde_json::json!({ "lsn": max, "pinned": true })),
+        &Position::new(serde_json::json!({ "lsn": max, "pinned": true })),
         identity.as_ref(),
     )
     .save(ckpt)
@@ -1463,7 +1463,7 @@ mod tests {
     }
 
     fn ckpt(j: serde_json::Value) -> crate::source::cdc::Position {
-        crate::source::cdc::Position(j)
+        crate::source::cdc::Position::new(j)
     }
 
     /// The whole point: absence of `lsn` is an ERROR, absence of `pinned` is a
@@ -2041,11 +2041,11 @@ mod identity_tests {
 
     #[test]
     fn a_checkpoint_records_the_identity_and_reads_it_back() {
-        let pos = Position(serde_json::json!({ "lsn": "0a0b", "pinned": true }));
+        let pos = Position::new(serde_json::json!({ "lsn": "0a0b", "pinned": true }));
         let saved = with_identity(&pos, Some(&id("F1", "K1")));
         assert_eq!(
-            saved.0,
-            serde_json::json!({ "lsn": "0a0b", "pinned": true, "family_guid": "F1", "recovery_fork_guid": "K1" })
+            saved.json(),
+            &serde_json::json!({ "lsn": "0a0b", "pinned": true, "family_guid": "F1", "recovery_fork_guid": "K1" })
         );
         assert_eq!(DbIdentity::from_checkpoint(&saved), Some(id("F1", "K1")));
         assert_eq!(
