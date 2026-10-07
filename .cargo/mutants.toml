@@ -883,6 +883,15 @@ exclude_re = [
     #   a_cdc_capture_delivers_sql_variant_and_udt_columns_as_the_source_renders_them
     #   both TIMEOUT at 240s. Its decisions are held by live_only_purity_gate.
     "replace MssqlChangeStream::fill -> Result",
+    # Two more live-only bodies of the same SQL Server reader (2026-10-07), each measured: the stub
+    # applied, the named live cell run, then restored.
+    #   pin_checkpoint_at_max_lsn -> Ok(())  writes no anchor, so the first changes run re-reads the
+    #     change table: mssql_cdc_initial_snapshot_covers_preexisting_rows_then_streams FAILS.
+    #   <impl ChangeStream for MssqlChangeStream>::drained_frontier -> None  leaves an idle checkpoint
+    #     behind the cleanup job: mssql_cdc_quiet_table_checkpoint_advances_so_cleanup_is_not_a_false_gap
+    #     and mssql_a_never_changed_table_is_not_refused_after_cleanup_passes_its_anchor FAIL.
+    "replace pin_checkpoint_at_max_lsn -> Result<\\(\\)> with Ok\\(\\(\\)\\)$",
+    "replace <impl ChangeStream for MssqlChangeStream>::drained_frontier -> Option<crate::source::cdc::Position> with None$",
     # - Oracle interval_iso (each stub, and the IntervalDs arm): edge_oracle_types_export_losslessly
     #   fails on IYM/IDS ("unsupported conversion from interval day to second to
     #   OracleIntervalYM" for the arm). build_column's BinaryFloat (Float64 and Utf8),

@@ -3039,24 +3039,6 @@ fn assert_log_gap_refusal(s: &CdcScenario) {
     );
 }
 
-/// Follow the refusal's remedy as printed, then compare the new baseline with the source.
-fn assert_remedy_ends_with_destination_equal_to_source(s: &mut CdcScenario) {
-    follow_rebaseline_remedy(&mut s.rig, true);
-    let snap = s.rig.out_dir().join("snapshot");
-    let t = &s.table;
-    assert_eq!(
-        (
-            duckdb_dir_scalar(&snap, "count(*)", None),
-            duckdb_dir_scalar(&snap, "sum(v)", None)
-        ),
-        (
-            mssql_cdc_query_i64(&format!("SELECT COUNT(*) FROM dbo.{t}")),
-            mssql_cdc_query_i64(&format!("SELECT SUM(v) FROM dbo.{t}"))
-        ),
-        "after the remedy the destination holds the source's rows and values"
-    );
-}
-
 /// Disable the capture instance and enable it again under the same name.
 fn recreate_capture_instance(table: &str) {
     mssql_cdc_exec(&format!(
@@ -3081,7 +3063,12 @@ fn mssql_cleanup_past_unread_changes_before_the_first_changes_run_is_refused() {
     ));
     assert_log_gap_refusal(&s);
     assert_log_gap_refusal(&s);
-    assert_remedy_ends_with_destination_equal_to_source(&mut s);
+    follow_rebaseline_remedy(&mut s.rig, true);
+    assert_eq!(
+        dir_parquet_id_set(&s.rig.out_dir().join("snapshot")),
+        [1, 2, 3].into(),
+        "the remedy's run is graded against the source by the rig oracle; its baseline holds every key"
+    );
 }
 
 /// The capture instance disabled and re-enabled before the first changes run: refused twice, and the remedy recovers.
@@ -3093,7 +3080,12 @@ fn mssql_capture_instance_recreated_before_the_first_changes_run_is_refused() {
     recreate_capture_instance(&s.table);
     assert_log_gap_refusal(&s);
     assert_log_gap_refusal(&s);
-    assert_remedy_ends_with_destination_equal_to_source(&mut s);
+    follow_rebaseline_remedy(&mut s.rig, true);
+    assert_eq!(
+        dir_parquet_id_set(&s.rig.out_dir().join("snapshot")),
+        [1, 2, 3].into(),
+        "the remedy's run is graded against the source by the rig oracle; its baseline holds every key"
+    );
 }
 
 /// The ADD COLUMN refusal's remedy (re-enable with the full column list, re-run) must not exit 0 over the unread changes.
@@ -3110,7 +3102,12 @@ fn mssql_add_column_remedy_before_the_first_changes_run_ends_in_the_log_gap_refu
     );
     recreate_capture_instance(&s.table);
     assert_log_gap_refusal(&s);
-    assert_remedy_ends_with_destination_equal_to_source(&mut s);
+    follow_rebaseline_remedy(&mut s.rig, true);
+    assert_eq!(
+        dir_parquet_id_set(&s.rig.out_dir().join("snapshot")),
+        [1, 2, 3].into(),
+        "the remedy's run is graded against the source by the rig oracle; its baseline holds every key"
+    );
 }
 
 /// A scenario whose anchor was taken while the database max LSN was still below the instance's start.
@@ -3146,12 +3143,8 @@ fn mssql_an_anchor_below_a_just_enabled_instance_still_delivers_every_later_chan
     s.settle();
     s.rig.run_ok();
     assert_eq!(
-        duckdb_dir_scalar(
-            &s.rig.out_dir(),
-            "count(DISTINCT id)",
-            Some("__op = 'insert'")
-        ),
-        s.count(),
+        cdc_id_ops(&s.rig.out_dir()),
+        vec![(1, "insert".to_string()), (2, "insert".to_string())],
         "every row inserted after the anchor is delivered"
     );
     s.rig.run_ok();
@@ -3185,13 +3178,8 @@ fn mssql_a_never_changed_table_is_not_refused_after_cleanup_passes_its_anchor() 
     ));
     wait_for_capture(&format!("dbo_{}", quiet.table), 2);
     quiet.rig.run_ok();
-    assert_eq!(
-        duckdb_dir_scalar(
-            &quiet.rig.out_dir(),
-            "count(*)",
-            Some("v = 99 AND __op = 'update'")
-        ),
-        1,
+    assert!(
+        cdc_id_ops(&quiet.rig.out_dir()).contains(&(1, "update".to_string())),
         "the change made after the cleanup is delivered"
     );
 }
@@ -3226,12 +3214,8 @@ fn mssql_a_legacy_pinned_anchor_below_the_instance_start_is_adopted_with_a_warni
         "the adoption is said, once:\n{said}"
     );
     assert_eq!(
-        duckdb_dir_scalar(
-            &s.rig.out_dir(),
-            "count(DISTINCT id)",
-            Some("__op = 'insert'")
-        ),
-        s.count(),
+        cdc_id_ops(&s.rig.out_dir()),
+        vec![(1, "insert".to_string())],
         "the row inserted after the legacy anchor is delivered"
     );
     let again = s.rig.run_ok_capture();

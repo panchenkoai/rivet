@@ -623,11 +623,26 @@ impl MssqlChangeStream {
         if cfg.from_lsn.is_some() {
             identity_verdict(cfg.checkpoint_identity.as_ref(), identity.as_ref()).enforce()?;
         }
-        let from_lsn = match &cfg.from_lsn {
-            Some(pin) if cfg.from_is_pin => {
-                Some(rt.block_on(adopt_legacy_pin(&mut client, &cfg.capture_instance, pin))?)
+        let from_lsn = match legacy_pin(cfg) {
+            Some(pin) => {
+                let below_start = rt.block_on(async {
+                    let row = client
+                        .query(
+                            format!(
+                                "SELECT CONVERT(varchar(24), sys.fn_cdc_decrement_lsn(start_lsn), 1) \
+                                 FROM cdc.change_tables WHERE capture_instance = @P1 \
+                                 AND sys.fn_cdc_increment_lsn(0x{pin}) < start_lsn"
+                            ),
+                            &[&cfg.capture_instance.as_str()],
+                        )
+                        .await?
+                        .into_row()
+                        .await?;
+                    Ok::<_, anyhow::Error>(row.and_then(|r| r.get::<&str, _>(0).map(bare_lsn)))
+                })?;
+                Some(adopt_legacy_pin(pin, below_start))
             }
-            other => other.clone(),
+            None => cfg.from_lsn.clone(),
         };
 
         // Resolve the REAL schema/table from cdc.change_tables metadata. The
@@ -1180,31 +1195,24 @@ const LEGACY_PIN_WARNING: &str = "mssql cdc: this checkpoint is an anchor writte
      re-created, or rivet did not run for longer than the CDC retention since the baseline, \
      changes may be missing: re-baseline the stream. Later runs refuse such a gap.";
 
-/// A pre-0.32 pinned anchor, moved up to just below its instance's start when it sits under it (with a warning).
-async fn adopt_legacy_pin(
-    client: &mut Client<Compat<TcpStream>>,
-    capture_instance: &str,
-    pin: &str,
-) -> Result<String> {
-    let row = client
-        .query(
-            format!(
-                "SELECT CONVERT(varchar(24), sys.fn_cdc_decrement_lsn(start_lsn), 1) \
-                 FROM cdc.change_tables WHERE capture_instance = @P1 \
-                 AND sys.fn_cdc_increment_lsn(0x{pin}) < start_lsn"
-            ),
-            &[&capture_instance],
-        )
-        .await?
-        .into_row()
-        .await?;
-    Ok(match row.and_then(|r| r.get::<&str, _>(0).map(bare_lsn)) {
-        Some(below_start) => {
+/// The resume LSN when it is an anchor rivet 0.31 or older wrote (`"pinned": true`).
+fn legacy_pin(cfg: &MssqlCdcConfig) -> Option<&str> {
+    if cfg.from_is_pin {
+        cfg.from_lsn.as_deref()
+    } else {
+        None
+    }
+}
+
+/// Where a legacy pin reads from: just below its instance's start when it sits under it (with the warning), else itself.
+fn adopt_legacy_pin(pin: &str, below_start: Option<String>) -> String {
+    match below_start {
+        Some(lsn) => {
             log::warn!("{LEGACY_PIN_WARNING}");
-            below_start
+            lsn
         }
         None => pin.to_string(),
-    })
+    }
 }
 
 /// Persist the anchor for `cdc.initial: snapshot` to `ckpt`, BEFORE the snapshot read: the
@@ -1677,6 +1685,17 @@ mod tests {
             daemon.contains("DECLARE @max binary(10) = sys.fn_cdc_get_max_lsn();"),
             "daemon poll keeps chasing the head: {daemon}"
         );
+    }
+
+    #[test]
+    fn only_a_pinned_checkpoint_is_a_legacy_pin_and_it_moves_only_when_below_the_start() {
+        let mut c = cfg("dbo_orders");
+        c.from_lsn = Some("0a0b".into());
+        assert_eq!(legacy_pin(&c), None, "a resume position is never adopted");
+        c.from_is_pin = true;
+        assert_eq!(legacy_pin(&c), Some("0a0b"));
+        assert_eq!(adopt_legacy_pin("0a0b", Some("0a0f".into())), "0a0f");
+        assert_eq!(adopt_legacy_pin("0a0b", None), "0a0b");
     }
 
     /// The poll has no way to move a position up: below the low watermark is always the refusal.

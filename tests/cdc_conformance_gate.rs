@@ -937,7 +937,10 @@ const PIN_INDEPENDENT: usize = 113; // ratchet-pin: cdc-census-independent min
 // refusal, which now follows its remedy and reads the baseline with arrow (was presence).
 // 2026-10-03: +2 shared codec - the PostgreSQL and SQL Server capped `rivet cdc --output` cells read the
 // cap's stop point through `read_cdc_changes(`; -1: the SQL Server case-only refusal test moved to presence.
-const PIN_SHARED_CODEC: usize = 106; // ratchet-pin: cdc-census-shared-codec
+// 2026-10-07: +4 shared codec - the SQL Server log-gone-before-the-first-changes-run cells read the remedy's
+// baseline through `dir_parquet_id_set`, and the anchor cells read the stream through `cdc_id_ops`; every run
+// is graded against the source by the default rig oracle, which this census does not see.
+const PIN_SHARED_CODEC: usize = 110; // ratchet-pin: cdc-census-shared-codec
 const PIN_SELF_COUNTER: usize = 6; // ratchet-pin: cdc-census-self-counter
 // 2026-09-28: +1 presence — the SQL Server undecodable-cell refusal, whose oracle is the refusal.
 // 2026-09-29: +2 presence — the PG CDC LMT-timezone and DOMAIN parity cells compare CDC to batch output.

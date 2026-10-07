@@ -536,4 +536,5 @@ seeds:
       oracle:
         na: "the seed is SQL Server's poll statement; this engine has no change-table low watermark to move a position up to"
       lib:
+        patch: position-below-log-start-moved-up/mssql.patch
         cells: ["lib:a_position_below_the_low_watermark_always_reaches_the_refusal"]
