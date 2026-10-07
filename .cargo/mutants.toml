@@ -489,7 +489,6 @@ exclude_re = [
     # prepare_load: exclusion lifted 2026-08-29 to MEASURE (70% of the body runs
     # offline). Restored below if its stub survives.
 
-    "replace execute_load ->",
     "replace load_one ->",
     "replace load_one_cdc ->",
     "replace load_one_incremental ->",
@@ -686,7 +685,6 @@ exclude_re = [
     # `buffer_uris`, `base_done_line`, `latest_baseline_generation` (load/reconcile.rs); `run_compacts` (load/compact.rs) decides through the loader's
     # `compact_*_sql` builders (unit-tested) and `lease_busy_message`. Live:
     # tests/live/live_cdc_compact.rs (both cells) and the `warehouse_layout` gate cell.
-    "replace load_one_cdc_base ->",
     "replace run_compacts ->",
     # (`redact::install_logger` is NOT excluded: the gate's offline coverage shows
     # the CLI tests execute it through the binary — `--lib --bins` grades its stub.)

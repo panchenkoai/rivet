@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+- **Breaking: an incremental or CDC load refuses a view or a `<table>__changes` it has no record
+  of loading**, on BigQuery, Snowflake and ClickHouse. Before, only a foreign TABLE at `<table>`
+  was refused: a view there was replaced by rivet's current-state view, a foreign
+  `<table>__changes` was appended to, and the load exited 0. A base-and-buffer load appended its
+  buffer beside a base it had never loaded, and that success made the base rivet's own for
+  `rivet compact`.
+  - The load now stops before any warehouse write, with exit 5 and
+    `[RIVET_LOAD_TARGET_NOT_RIVETS]`, and names the object. The whole-table refusal
+    (`refusing to overwrite ...`) carries the same code and exits 5; it exited 1.
+  - What "no record" means: the state DB this `rivet load` opened has no load of that target.
+    Tables, views and logs loaded under the same state DB are unaffected, and so is a load
+    without a state DB. A load pointed at a NEW state DB is now refused where it used to
+    append: a lost state DB, another host, or a container whose state DB does not outlive the
+    run (refused from its second cycle). Keep the state DB between runs (a volume, or a
+    PostgreSQL state), restore it, or drop or rename the view and the log and load again.
+  - A state DB that is configured and cannot be read refuses the same objects, as it already
+    did for a table.
+  - A stop before the write exits as what stopped it. `RIVET_LOAD_ADOPTION_COLUMN_MISMATCH`
+    now reaches the error line and exits 5 (it exited 1 with no code).
+- **A load that stops before writing never becomes the reason the next load overwrites.** The
+  stale-buffer stop of a base-and-buffer load, and a staged part that vanished between the
+  ledger read and the write, were recorded `failed`; the next `rivet load` then treated a table
+  it had never loaded as its own and replaced it. They are recorded `refused`. The ownership
+  question is also asked before the `writing` ledger row, so a load killed while refusing, or
+  one whose state DB failed its closing write, leaves no row that claims the table.
+
 - **Breaking: a run refuses to continue from progress stored for another table or collection**
   (`RIVET_STATE_CURSOR_STREAM_MISMATCH`, exit 5, nothing read or written). The stored incremental
   cursor, `keyset_incremental` high-water, MongoDB `resume` `_id` and interrupted-run anchor now
