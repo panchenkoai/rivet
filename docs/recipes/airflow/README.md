@@ -6,6 +6,9 @@ tables run one at a time, a barrier between waves — with per-table retries, lo
 and alerting for free, and a real `rivet` binary doing the work. It builds **one
 DAG per source database** (PostgreSQL, MySQL, SQL Server) from a single factory.
 
+The operator package that replaces this recipe's `BashOperator` (retry by error class,
+load and compact tasks, CDC) is [`integrations/airflow`](../../../integrations/airflow/README.md).
+
 > **MongoDB fits the same pattern.** MongoDB is a first-class Rivet source
 > (full + CDC), so a `mongo.yaml` config yields a `rivet_waves_mongo` DAG
 > analogous to the relational ones — same factory, same plan → waves → graph.
