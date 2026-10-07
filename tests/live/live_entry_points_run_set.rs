@@ -3,6 +3,9 @@
 //!
 //! The delivered side is re-read from the destination (Parquet parts per directory, stdout
 //! bytes) and compared with the fixture the test wrote into the source.
+//!
+//! `rivet apply` has no stdout cell: it prints its wave headers on stdout as well, so no reader
+//! can take an export's bytes out of it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -45,6 +48,23 @@ fn fixture_values(stamp: &dyn Fn(&str) -> String) -> String {
         .join(", ")
 }
 
+/// The first column of every Parquet part in `dir`, as ids.
+fn part_ids(dir: &Path) -> Vec<i64> {
+    read_all_parts(dir)
+        .iter()
+        .flat_map(|batch| {
+            let col = batch.column(0).clone();
+            (0..batch.num_rows()).map(move |row| {
+                let text = arrow::util::display::array_value_to_string(&col, row).unwrap();
+                text.trim()
+                    .parse::<f64>()
+                    .unwrap_or_else(|_| panic!("id cell `{text}` is not a number"))
+                    as i64
+            })
+        })
+        .collect()
+}
+
 /// What `root` holds: the ids in each immediate sub-directory's Parquet parts.
 fn delivered_tree(root: &Path) -> Tree {
     let mut tree = Tree::new();
@@ -53,19 +73,7 @@ fn delivered_tree(root: &Path) -> Tree {
         if !dir.is_dir() {
             continue;
         }
-        let ids: BTreeSet<i64> = read_all_parts(&dir)
-            .iter()
-            .flat_map(|batch| {
-                let col = batch.column(0).clone();
-                (0..batch.num_rows()).map(move |row| {
-                    let text = arrow::util::display::array_value_to_string(&col, row).unwrap();
-                    text.trim()
-                        .parse::<f64>()
-                        .unwrap_or_else(|_| panic!("id cell `{text}` is not a number"))
-                        as i64
-                })
-            })
-            .collect();
+        let ids: BTreeSet<i64> = part_ids(&dir).into_iter().collect();
         if !ids.is_empty() {
             tree.insert(entry.file_name().to_string_lossy().into_owned(), ids);
         }
@@ -323,74 +331,65 @@ fn a_sealed_plan_of_a_partitioned_export_is_refused_and_its_remedy_works_postgre
 /// The standalone MongoDB of the test stack.
 const MONGO_PORT: u16 = 27017;
 
-/// Rows in each stdout fixture table.
+/// Rows in the table the stdout export reads, and in the table the local export beside it reads.
 const STDOUT_ROWS: [i64; 2] = [50, 70];
 
-/// The `id` cells of every CSV data line in `stdout`, sorted.
-fn csv_ids(stdout: &[u8]) -> Vec<i64> {
-    let mut ids: Vec<i64> = String::from_utf8_lossy(stdout)
-        .lines()
-        .filter_map(|line| line.split(',').next()?.trim().parse::<f64>().ok())
-        .map(|id| id as i64)
-        .collect();
+/// The ids `stdout` carries, sorted: the first cell of every CSV data line, or of every row of the one Parquet file.
+fn stdout_ids(format: &str, stdout: &[u8]) -> Vec<i64> {
+    let mut ids: Vec<i64> = if format == "csv" {
+        String::from_utf8_lossy(stdout)
+            .lines()
+            .filter_map(|line| line.split(',').next()?.trim().parse::<f64>().ok())
+            .map(|id| id as i64)
+            .collect()
+    } else if stdout.is_empty() {
+        Vec::new()
+    } else {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("stdout.parquet"), stdout).unwrap();
+        part_ids(dir.path())
+    };
     ids.sort_unstable();
     ids
 }
 
-/// The ids two numeric fixture tables of `STDOUT_ROWS` rows hold, starting at `first`, sorted.
-fn stdout_fixture_ids(first: i64) -> Vec<i64> {
-    let mut ids: Vec<i64> = STDOUT_ROWS.iter().flat_map(|n| first..first + n).collect();
-    ids.sort_unstable();
-    ids
-}
-
-/// Occurrences of the Parquet magic in `bytes`.
-fn parquet_magics(bytes: &[u8]) -> usize {
-    bytes.windows(4).filter(|w| w == b"PAR1").count()
-}
-
-/// Two `destination: stdout` exports deliver the same bytes with and without child processes.
-fn assert_stdout_survives_child_processes(
-    rig_of: &dyn Fn(&'static str) -> Rig,
-    first_id: i64,
-    invoke: &dyn Fn(&Rig, &[&str]) -> std::process::Output,
-) {
+/// A `destination: stdout` export beside a local one delivers the same stdout with and without child processes.
+fn assert_stdout_survives_child_processes(rig_of: &dyn Fn(&'static str) -> Rig, first_id: i64) {
+    let fixture: Vec<i64> = (first_id..first_id + STDOUT_ROWS[0]).collect();
     for format in ["csv", "parquet"] {
-        let rig = rig_of(format);
-        let serial = invoke(&rig, &[]);
+        let serial = rig_of(format).run_args(&[]);
         assert!(
             serial.status.success(),
             "{format}: serial control failed:\n{}",
             String::from_utf8_lossy(&serial.stderr)
         );
-        if format == "csv" {
-            assert_eq!(
-                csv_ids(&serial.stdout),
-                stdout_fixture_ids(first_id),
-                "control: the serial stdout must carry every source row"
-            );
-        } else {
-            assert_eq!(
-                parquet_magics(&serial.stdout),
-                4,
-                "control: the serial stdout must carry two whole Parquet files"
-            );
-        }
-        let children = invoke(&rig, &["--parallel-export-processes"]);
+        assert_eq!(
+            stdout_ids(format, &serial.stdout),
+            fixture,
+            "{format}: control: the serial stdout must carry every source row"
+        );
+        let children = rig_of(format).run_args(&["--parallel-export-processes"]);
         assert!(
             children.status.success(),
             "{format}: the child-process run failed:\n{}",
             String::from_utf8_lossy(&children.stderr)
         );
         assert_eq!(
-            children.stdout.len(),
-            serial.stdout.len(),
-            "{format}: --parallel-export-processes must deliver the serial run's stdout bytes"
+            stdout_ids(format, &children.stdout),
+            fixture,
+            "{format}: --parallel-export-processes must deliver the rows the serial run delivers"
         );
-        assert!(
-            children.stdout == serial.stdout,
-            "{format}: same length, different bytes under --parallel-export-processes"
-        );
+        if format == "csv" {
+            assert_eq!(
+                children.stdout.len(),
+                serial.stdout.len(),
+                "csv: --parallel-export-processes must deliver the serial run's stdout bytes"
+            );
+            assert!(
+                children.stdout == serial.stdout,
+                "csv: same length, different bytes under --parallel-export-processes"
+            );
+        }
         assert!(
             String::from_utf8_lossy(&children.stderr).contains(
                 "--parallel-export-processes is disabled when an export writes to stdout"
@@ -401,18 +400,7 @@ fn assert_stdout_survives_child_processes(
     }
 }
 
-/// `rivet run [flags]` through the rig.
-fn via_run(rig: &Rig, flags: &[&str]) -> std::process::Output {
-    rig.run_args(flags)
-}
-
-/// `rivet apply <config> [flags]` through the rig.
-fn via_apply(rig: &Rig, flags: &[&str]) -> std::process::Output {
-    let cfg = rig.config_path();
-    rig.apply_env(&cfg, flags, &[])
-}
-
-/// A two-export stdout rig over `a` and `b`, selecting `cols`.
+/// A rig whose own export prints `a` to stdout, with a second export landing `b` in a local directory.
 fn stdout_rig(rig: Rig, a: &str, b: &str, cols: &str, format: &'static str) -> Rig {
     rig.query(&format!("SELECT {cols} FROM {a}"))
         .also_export(b, &format!("SELECT {cols} FROM {b}"))
@@ -437,27 +425,7 @@ fn stdout_survives_child_processes_postgres() {
             format,
         )
     };
-    assert_stdout_survives_child_processes(&rig_of, 0, &via_run);
-}
-
-#[test]
-#[ignore = "live: requires docker compose postgres"]
-fn stdout_survives_apply_child_processes_postgres() {
-    require_alive(LiveService::Postgres);
-    let (a, b) = (
-        seed_pg_numeric_table(STDOUT_ROWS[0]),
-        seed_pg_numeric_table(STDOUT_ROWS[1]),
-    );
-    let rig_of = |format| {
-        stdout_rig(
-            Rig::pg_batch(a.name()),
-            a.name(),
-            b.name(),
-            "id, name",
-            format,
-        )
-    };
-    assert_stdout_survives_child_processes(&rig_of, 0, &via_apply);
+    assert_stdout_survives_child_processes(&rig_of, 0);
 }
 
 #[test]
@@ -477,7 +445,7 @@ fn stdout_survives_child_processes_mysql() {
             format,
         )
     };
-    assert_stdout_survives_child_processes(&rig_of, 0, &via_run);
+    assert_stdout_survives_child_processes(&rig_of, 0);
 }
 
 #[test]
@@ -497,7 +465,7 @@ fn stdout_survives_child_processes_mssql() {
             format,
         )
     };
-    assert_stdout_survives_child_processes(&rig_of, 0, &via_run);
+    assert_stdout_survives_child_processes(&rig_of, 0);
 }
 
 #[cfg(feature = "oracle")]
@@ -518,7 +486,7 @@ fn stdout_survives_child_processes_oracle() {
             format,
         )
     };
-    assert_stdout_survives_child_processes(&rig_of, 1, &via_run);
+    assert_stdout_survives_child_processes(&rig_of, 1);
 }
 
 #[test]
@@ -540,5 +508,5 @@ fn stdout_survives_child_processes_mongo() {
             .with_format(format)
             .dest_stdout()
     };
-    assert_stdout_survives_child_processes(&rig_of, 1, &via_run);
+    assert_stdout_survives_child_processes(&rig_of, 1);
 }

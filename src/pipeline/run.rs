@@ -511,7 +511,6 @@ pub fn run(
         .to_path_buf();
 
     let run_set = RunSet::select(&config, export_name)?;
-    let partitioned = run_set.is_partitioned();
     let expanded = run_set.in_process(&config.source, &config_dir, params)?;
     let exports: Vec<&ExportConfig> = expanded.iter().collect();
 
@@ -539,22 +538,12 @@ pub fn run(
         .map(|e| e.name.chars().count())
         .max()
         .unwrap_or(0);
-    let process_mode_requested = parallel_export_processes_cli || config.parallel_export_processes;
-    // Process-mode children re-exec `rivet run --export <name>` and re-load the
-    // config from disk, so they cannot see the synthesised partition child
-    // names. Force in-process execution when partitioning is active.
-    if partitioned && process_mode_requested {
-        log::warn!(
-            "partition_by: --parallel-export-processes is disabled with partitioned exports \
-             (child processes re-load the config and can't see synthesised partitions); \
-             running in-process"
-        );
-    }
-    let children_ok = (process_mode_requested && !partitioned)
-        .then(|| run_set.child_processes())
-        .and_then(|children| children.map_err(|why| log::warn!("{why}")).ok())
-        .map(|(ok, _)| ok)
-        .filter(|_| export_name.is_none() && exports.len() > 1);
+    let children_ok = run_set
+        .run_child_processes(parallel_export_processes_cli)
+        .unwrap_or_else(|why| {
+            log::warn!("{why}");
+            None
+        });
 
     // Stamped here for the paths that open no harm bracket; the bracketed paths
     // below RE-stamp from `RunHarmBracket::open`, which hands back an instant
@@ -865,9 +854,10 @@ pub(crate) fn run_waves(
     // config) opts into within-wave parallelism: each wave's exports run as
     // concurrent child processes (per-child governor keeps each one source-safe),
     // the call blocks until all exit = the wave barrier. Default stays sequential.
-    let children = (parallel_cli || config.parallel_export_processes)
-        .then(|| run_set.child_processes())
-        .and_then(|children| children.map_err(|why| log::warn!("{why}")).ok());
+    let children = run_set.child_processes(parallel_cli).unwrap_or_else(|why| {
+        log::warn!("{why}");
+        None
+    });
     let runnable: Vec<ExportConfig> = match &children {
         Some((_, declared)) => declared.iter().map(|e| (*e).clone()).collect(),
         None => run_set.in_process(&config.source, &config_dir, None)?,

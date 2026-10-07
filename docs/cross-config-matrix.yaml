@@ -119,7 +119,7 @@ scenarios:
     oracle:   { test: a_plan_with_an_unexpanded_partition_token_is_refused_before_any_write }
 
   - id: stdout_under_child_processes
-    what: "`destination: stdout` with `--parallel-export-processes` delivers the serial run's bytes (CSV and Parquet): the run set keeps a stdout export in-process, because a child's stdout is its event channel; before, the parent dropped every data byte, exit 0"
+    what: "`destination: stdout` with `--parallel-export-processes` delivers what the serial run delivers (CSV: its bytes; Parquet: its rows), each run graded against the source from the stdout the rig captured: the run set keeps a stdout export in-process, because a child's stdout is its event channel; before, the parent dropped every data byte, exit 0"
     postgres: { test: stdout_survives_child_processes_postgres }
     mysql:    { test: stdout_survives_child_processes_mysql }
     mssql:    { test: stdout_survives_child_processes_mssql }

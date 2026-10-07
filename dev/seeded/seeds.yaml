@@ -270,9 +270,7 @@ seeds:
     patch: stdout-swallowed-by-child-processes/shared.patch
     engines:
       postgres:
-        cells:
-          - stdout_survives_child_processes_postgres
-          - stdout_survives_apply_child_processes_postgres
+        cells: [stdout_survives_child_processes_postgres]
       mysql:
         cells: [stdout_survives_child_processes_mysql]
       mssql:
