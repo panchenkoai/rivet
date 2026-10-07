@@ -255,6 +255,7 @@ impl ResolvedRunPlan {
             column: self.strategy.cursor_identity(),
             mode: self.strategy.mode_label(),
             continues_high_water: self.strategy.continues_stored_cursor(),
+            resumable: self.strategy.is_resumable(),
         }
     }
 }
