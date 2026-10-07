@@ -271,3 +271,36 @@ fn partition_by_rejects_missing_token() {
         "error should mention the missing {{partition}} token, got: {stderr}"
     );
 }
+
+/// `partition_by` over a table with a NUMERIC(p,s) column delivers every row, as the unpartitioned export does.
+#[test]
+#[ignore = "live+gate-only: postgres; open defect (partition_by with a NUMERIC column), acknowledged in dev/release_oracle/known_red.py"]
+fn open_defect_partition_by_exports_a_declared_numeric_column() {
+    require_alive(LiveService::Postgres);
+    let table = unique_name("part_numeric");
+    pg_connect()
+        .batch_execute(&format!(
+            "CREATE TABLE {table} (id BIGINT PRIMARY KEY, amount NUMERIC(10,2) NOT NULL, created_at TIMESTAMP NOT NULL); \
+             INSERT INTO {table} SELECT g, g * 1.5, TIMESTAMP '2026-03-01' + (g % 3) * INTERVAL '1 day' \
+             FROM generate_series(1, 30) g"
+        ))
+        .unwrap();
+    let _guard = PgCleanup(table.clone());
+    let out_dir = tempfile::tempdir().unwrap();
+    let rig = Rig::pg_batch(&table)
+        .export_line("partition_by: created_at")
+        .dest_path(out_dir.path().join("{partition}"));
+    let run = rig.run();
+    let said = String::from_utf8_lossy(&run.stderr);
+    let cause = "precision/scale unavailable from query metadata and catalog lookup";
+    assert!(
+        run.status.success(),
+        "`partition_by` over a table with a NUMERIC(10,2) column failed under `rivet run`: {}\n{said}",
+        if said.contains(cause) {
+            cause
+        } else {
+            "another error"
+        }
+    );
+    assert_eq!(parquet_rows_recursive(out_dir.path()), 30);
+}

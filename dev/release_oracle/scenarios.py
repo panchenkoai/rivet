@@ -50,7 +50,7 @@ from tempfile import mkdtemp
 
 try:  # importable both as a package module and as a plain sibling file
     from .core import (HERE, RAN_LIVE_MODULES, RAN_LIVE_TESTS, ROOT, SKIP_ALLOWED, self_skipped, Ledger, Proc, Status, container_for_port, docker, docker_exec, have,
-                       nextest_filter, nextest_outcomes, nextest_passed, nextest_started, port_of, release_bin_env,
+                       nextest_filter, nextest_outcomes, nextest_panics, nextest_passed, nextest_started, port_of, release_bin_env,
                        rivet, rivet_bin, run, sqlcmd, test_passed)
     from ..pytools.duckcli import ARGV as DUCKDB
     from . import state_lib
@@ -71,6 +71,7 @@ except ImportError:  # pragma: no cover - depends on how the driver is invoked
         have,
         nextest_filter,
         nextest_outcomes,
+        nextest_panics,
         nextest_started,
         nextest_passed,
         port_of,
@@ -1981,6 +1982,7 @@ def _run_live_modules(led: Ledger, scenario: str, label: str, phase: str,
                 f"{label}: no test ran (see {log_path})", _first_match(p.out, r"error|FAILED"))
         return
     skipped = self_skipped(skip_log)
+    panics = nextest_panics(p.out)
     for name, verdict in sorted(verdicts.items()):
         if verdict in ("PASS", "LEAK") and name in skipped:
             why = SKIP_ALLOWED.get(name)
@@ -1991,9 +1993,11 @@ def _run_live_modules(led: Ledger, scenario: str, label: str, phase: str,
                         f"({skipped[name]}) — counted green by libtest; allow it in "
                         "core.SKIP_ALLOWED with a reason, or bring its infrastructure up", "vacuous skip")
         elif verdict in ("PASS", "LEAK"):
+            led.cell_passed(name)
             _passed(led, scenario, "batch", "-", "-", f"{label} · {name}")
         else:
-            _failed(led, scenario, "batch", "-", "-", f"{label} FAILED · {name} (see {log_path})")
+            why = panics.get(name, "no panic line read")
+            _failed(led, scenario, "batch", "-", "-", f"{label} FAILED · {name} — {why} (see {log_path})")
 
 
 def verify_pool_split(led: Ledger) -> None:

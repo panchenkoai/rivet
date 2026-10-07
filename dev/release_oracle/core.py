@@ -274,6 +274,11 @@ class Ledger:
         self.bad(msg)
         self.add(engine, version, scenario, store, Status.FAIL, detail or msg)
 
+    def cell_passed(self, cell: str) -> None:
+        """A passing live cell: the known-red entry written for its failure (`<cell> — <symptom>`) is fixed, not unexercised."""
+        from . import known_red
+        self.known_passed.update(k.match for k in known_red.KNOWN_RED if k.match.startswith(f"{cell} — "))
+
     def close_known_red(self) -> None:
         """After a FULL run: a known-red entry no failure matched is fixed — it must be removed."""
         from . import known_red
@@ -858,6 +863,17 @@ def nextest_started(out: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
+_NEXTEST_PANIC = re.compile(r"^\s*thread '([^']+)'(?: \(\d+\))? panicked at [^\n]*\n[ \t]*([^\n]*)(?:\n[ \t]+- ([^\n]*))?", re.M)
+
+
+def nextest_panics(out: str) -> dict[str, str]:
+    """Each test's first panic as one line: the message's first line, or the rig oracle's first finding (its header names a per-run export)."""
+    first: dict[str, str] = {}
+    for name, head, finding in _NEXTEST_PANIC.findall(out):
+        first.setdefault(name, (f"rig oracle: {finding}" if head.startswith("rig oracle: ") and finding else head).strip()[:300])
+    return first
+
+
 def nextest_passed(out: str) -> set[str]:
     """The tests nextest reports green: `PASS`, or `LEAK` (passed, left a handle open)."""
     return {n for n, s in nextest_outcomes(out).items() if s in ("PASS", "LEAK")}
@@ -871,6 +887,20 @@ _NEXTEST_SAMPLE = (
     " FAIL + LEAK [   0.476s] (3/4) rivet-cli::live_suite m::leaky_fail\n"
     "        FAIL [   0.200s] (4/4) rivet-cli::live_suite m::plain_fail\n"
     "        FAIL [   0.200s] (   5/1038) rivet-cli::live_suite m::padded_fail\n"
+)
+
+
+# A failed test's stderr as nextest prints it (once when it fails, once in the final list): a plain panic and the rig oracle's.
+_NEXTEST_PANIC_SAMPLE = (
+    "    thread 'm::plain_fail' (9992744) panicked at tests/live/m.rs:190:5:\n"
+    "    P-00: delivered 6 of 10\n"
+    "    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n"
+    "    thread 'm::oracle_fail' panicked at tests/common/verify.rs:1172:13:\n"
+    "    rig oracle: export 't_62083_0' disagrees with its source / rivet's own ledger (rig_oracle.py grade):\n"
+    "      - COUNT(*): source 10, delivered 6\n"
+    "      - COUNT(`id`) (non-null): source 10, delivered 6\n"
+    "    thread 'm::plain_fail' (9992744) panicked at tests/live/m.rs:190:5:\n"
+    "    a later print of the same test\n"
 )
 
 
@@ -899,6 +929,10 @@ def nextest_grading_error() -> str | None:
     want = {"m::slow_then_pass", "m::leaky_pass"}
     if passed != want:
         return f"graded green {sorted(passed)}, want {sorted(want)} (a FAIL + LEAK must stay red)"
+    panics = nextest_panics(_NEXTEST_PANIC_SAMPLE)
+    want_panics = {"m::plain_fail": "P-00: delivered 6 of 10", "m::oracle_fail": "rig oracle: COUNT(*): source 10, delivered 6"}
+    if panics != want_panics:
+        return f"read the panics {panics}, want {want_panics} (a known red is matched by this line)"
     return None
 
 

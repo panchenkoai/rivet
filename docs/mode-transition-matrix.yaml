@@ -119,6 +119,37 @@ scenarios:
     mongo:    { na: "a Mongo export accepts only mode: full or cdc (validate_non_sql_source_modes, src/config/mod.rs:543-554), so there is no incremental / chunked mode to switch from or into; the switch Mongo has (into page_size + resume) is graded by the three *_then_resume_mongo cells" }
     oracle:   { gap: "no Oracle mode-transition live test (the transition logic is shared; the cursor/keyset state Oracle writes is unproven here)" }
 
+  - id: resumed_parallel_keyset_then_incremental
+    what: "P-22 — a parallel keyset run resumed after a crash records the run's highest key: incremental on the key delivers nothing again"
+    postgres: { test: open_defect_resumed_parallel_keyset_then_incremental_postgres }
+    mysql:    { gap: "open defect pinned on PostgreSQL only (dev/release_oracle/known_red.py); the cell for this engine is not written" }
+    mssql:    { gap: "open defect pinned on PostgreSQL only (dev/release_oracle/known_red.py); the cell for this engine is not written" }
+    mongo:    { na: "a Mongo export accepts only mode: full or cdc (validate_non_sql_source_modes, src/config/mod.rs:543-554), so there is no incremental / chunked mode to switch from or into; the switch Mongo has (into page_size + resume) is graded by the three *_then_resume_mongo cells" }
+    oracle:   { gap: "open defect pinned on PostgreSQL only (dev/release_oracle/known_red.py); the cell for this engine is not written" }
+
+  - id: incremental_source_url_respelled
+    what: "P-18 — the same source spelled without its default port keeps its cursor: continues"
+    postgres: { test: open_defect_source_url_without_its_default_port_continues_postgres }
+    mysql:    { gap: "open defect pinned on PostgreSQL only (dev/release_oracle/known_red.py); the cell for this engine is not written" }
+    mssql:    { gap: "open defect pinned on PostgreSQL only (dev/release_oracle/known_red.py); the cell for this engine is not written" }
+    mongo:    { na: "a Mongo export accepts only mode: full or cdc (validate_non_sql_source_modes, src/config/mod.rs:543-554), so there is no incremental / chunked mode to switch from or into; the switch Mongo has (into page_size + resume) is graded by the three *_then_resume_mongo cells" }
+    oracle:   { gap: "open defect pinned on PostgreSQL only (dev/release_oracle/known_red.py); the cell for this engine is not written" }
+
+  - id: incremental_query_filter_edited
+    what: "an edited `query:` filter under the same FROM is another stream: refused, or its own rows in full"
+    postgres: { test: open_defect_incremental_query_filter_edited_postgres }
+    mysql:    { gap: "open defect pinned on PostgreSQL only (dev/release_oracle/known_red.py); the cell for this engine is not written" }
+    mssql:    { gap: "open defect pinned on PostgreSQL only (dev/release_oracle/known_red.py); the cell for this engine is not written" }
+    mongo:    { na: "a Mongo export accepts only mode: full or cdc (validate_non_sql_source_modes, src/config/mod.rs:543-554), so there is no incremental / chunked mode to switch from or into; the switch Mongo has (into page_size + resume) is graded by the three *_then_resume_mongo cells" }
+    oracle:   { gap: "open defect pinned on PostgreSQL only (dev/release_oracle/known_red.py); the cell for this engine is not written" }
+
+  - id: incremental_other_schema_same_table
+    what: "the same table name in another schema (search_path in the URL) is another stream: refused, or its own rows in full"
+    postgres: { test: open_defect_same_table_in_another_schema_is_another_stream_postgres }
+    mysql:    { na: "the schema an unqualified table resolves in is not a source-URL option on this engine (search_path is PostgreSQL's)" }
+    mssql:    { na: "the schema an unqualified table resolves in is not a source-URL option on this engine (search_path is PostgreSQL's)" }
+    mongo:    { na: "a Mongo export accepts only mode: full or cdc (validate_non_sql_source_modes, src/config/mod.rs:543-554), so there is no incremental / chunked mode to switch from or into; the switch Mongo has (into page_size + resume) is graded by the three *_then_resume_mongo cells" }
+    oracle:   { na: "the schema an unqualified table resolves in is not a source-URL option on this engine (search_path is PostgreSQL's)" }
   # Stream identity: the stored progress names the table / collection it was read from. Each cell
   # exports table A, switches the SAME export name and state to table B without a reset, requires the
   # refusal (exit 5, RIVET_STATE_CURSOR_STREAM_MISMATCH, nothing written) TWICE, then re-reads every
