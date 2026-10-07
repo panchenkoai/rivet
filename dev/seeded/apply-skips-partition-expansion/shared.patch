@@ -12,11 +12,11 @@ index ff3912db..0ad7e437 100644
          return (Err(e), summary);
      }
 diff --git a/src/pipeline/run.rs b/src/pipeline/run.rs
-index ce3a004a..52f5172f 100644
+index b82de90d..c9b2890e 100644
 --- a/src/pipeline/run.rs
 +++ b/src/pipeline/run.rs
-@@ -870,7 +870,7 @@ pub(crate) fn run_waves(
-         .and_then(|children| children.map_err(|why| log::warn!("{why}")).ok());
+@@ -860,7 +860,7 @@ pub(crate) fn run_waves(
+     });
      let runnable: Vec<ExportConfig> = match &children {
          Some((_, declared)) => declared.iter().map(|e| (*e).clone()).collect(),
 -        None => run_set.in_process(&config.source, &config_dir, None)?,
@@ -24,7 +24,7 @@ index ce3a004a..52f5172f 100644
      };
      let children_ok = children.map(|(ok, _)| ok);
      let parallel = children_ok.is_some();
-@@ -1712,8 +1712,9 @@ pub(crate) fn run_pool(
+@@ -1702,8 +1702,9 @@ pub(crate) fn run_pool(
      // prefix-level skip applies here unchanged.
      // Same recipe rule as `run`/`run_waves`, and checked BEFORE the `--split`
      // escape: a recipe must not run here whether or not the pool splits it.
