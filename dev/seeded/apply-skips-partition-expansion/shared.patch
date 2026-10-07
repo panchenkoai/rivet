@@ -1,0 +1,38 @@
+diff --git a/src/pipeline/job.rs b/src/pipeline/job.rs
+index ff3912db..0ad7e437 100644
+--- a/src/pipeline/job.rs
++++ b/src/pipeline/job.rs
+@@ -1275,7 +1275,7 @@ fn execute_resolved_plan(
+     tail: TailPolicy<'_>,
+     mut meta: MetaConn<'_>,
+ ) -> (Result<()>, RunSummary) {
+-    if let Some(e) = unexpanded_partition_error(plan) {
++    if let Some(e) = unexpanded_partition_error(plan).filter(|_| false) {
+         let summary = synthetic_failed_summary(&plan.export_name, &e);
+         return (Err(e), summary);
+     }
+diff --git a/src/pipeline/run.rs b/src/pipeline/run.rs
+index ce3a004a..52f5172f 100644
+--- a/src/pipeline/run.rs
++++ b/src/pipeline/run.rs
+@@ -870,7 +870,7 @@ pub(crate) fn run_waves(
+         .and_then(|children| children.map_err(|why| log::warn!("{why}")).ok());
+     let runnable: Vec<ExportConfig> = match &children {
+         Some((_, declared)) => declared.iter().map(|e| (*e).clone()).collect(),
+-        None => run_set.in_process(&config.source, &config_dir, None)?,
++        None => config.exports.clone(),
+     };
+     let children_ok = children.map(|(ok, _)| ok);
+     let parallel = children_ok.is_some();
+@@ -1712,8 +1712,9 @@ pub(crate) fn run_pool(
+     // prefix-level skip applies here unchanged.
+     // Same recipe rule as `run`/`run_waves`, and checked BEFORE the `--split`
+     // escape: a recipe must not run here whether or not the pool splits it.
+-    let mut effective: Vec<ExportConfig> = RunSet::select(&config, None)?
+-        .in_process(&config.source, &config_dir, None)?
++    let mut effective: Vec<ExportConfig> = config
++        .exports
++        .clone()
+         .into_iter()
+         .filter(|e| {
+             if split {
