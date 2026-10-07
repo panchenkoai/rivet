@@ -327,7 +327,16 @@ fn assert_a_refused_run_keeps_refusing(engine: SqlEngine, tag: &str, shape: &[&s
         ),
     };
     let incremental = shape.iter().any(|l| l.starts_with("keyset_incremental"));
-    let mut rig = engine.rig(&table).mode("chunked");
+    let mut rig = engine.rig(&table).mode("chunked").a_failed_run_may_leave(
+        &[
+            Leftover::OrphanPart,
+            Leftover::FileLog,
+            Leftover::ObservedSchema,
+            Leftover::ChunkCheckpoint,
+            Leftover::ResumePoint,
+        ],
+        "a content gate refuses after the parts are written, and the run keeps its anchor so the next run refuses too",
+    );
     for l in shape.iter().chain(lines) {
         rig = rig.export_line(l);
     }
