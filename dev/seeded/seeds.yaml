@@ -265,6 +265,24 @@ seeds:
           - "lib:a_stale_buffer_over_rivets_own_base_is_journaled_as_a_refusal_on_every_cycle"
           - "lib:a_load_killed_while_asking_about_a_foreign_table_leaves_it_foreign"
           - "lib:a_failed_closing_write_after_a_foreign_refusal_leaves_the_table_foreign"
+  - name: ack-past-unwritten
+    class: a CDC source is acknowledged past transactions that were read but not yet written, so a failed later part loses them
+    history: "PostgreSQL: a mid-window roll's ack cleared the yielded-data latch, the zero-yield release then advanced the slot to the last READ commit; a failed final part left confirmed_flush_lsn past it and the next run delivered nothing (0.31.0)"
+    scope: source
+    engines:
+      postgres:
+        patch: ack-past-unwritten/postgres.patch
+        cells:
+          - pg_cdc_a_failed_final_part_after_a_mid_window_roll_leaves_the_slot_behind_it
+          - "lib:an_ack_discharges_only_what_it_covers"
+      mysql:
+        na: "no source-side acknowledgement: the default no-op ChangeStream::ack; the position moves only through the checkpoint the sink saves after a flush (roll_all) or at a fully acked drain"
+      mssql:
+        na: "no source-side acknowledgement: the default no-op ChangeStream::ack; the position moves only through the checkpoint the sink saves after a flush (roll_all) or at a fully acked drain"
+      mongo:
+        na: "no source-side acknowledgement: the default no-op ChangeStream::ack; the position moves only through the checkpoint the sink saves after a flush (roll_all) or at a fully acked drain"
+      oracle:
+        na: "the stream's own frontier save is gated on `outstanding`, set when a commit is handed out and cleared only by an ack of that exact position; there is no latch a partial ack can clear"
   - name: progress-inherited-by-another-stream
     class: stored progress (incremental cursor, keyset high-water, resume anchor) is continued by an export that reads another table or collection
     history: "2026-10-06 - two same-named exports on one state database, or one export repointed without a reset: exit 0 with _SUCCESS and 0 of 1000 rows (v0.30.0, v0.31.0)"

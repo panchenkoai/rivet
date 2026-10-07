@@ -27,6 +27,15 @@
   it had never loaded as its own and replaced it. They are recorded `refused`. The ownership
   question is also asked before the `writing` ledger row, so a load killed while refusing, or
   one whose state DB failed its closing write, leaves no row that claims the table.
+- **PostgreSQL CDC: a failed run no longer acknowledges the slot past what it wrote.** When a
+  part rolled in the middle of a read window (most often through `rollover_memory_mb`) and a
+  later part of the same run then failed to write, the run still advanced the slot's
+  `confirmed_flush_lsn` to the last transaction it had READ. The next run exited 0 and delivered
+  none of the transactions in between. The slot now moves only to the last commit whose part is
+  written; the re-run delivers the rest. Runs that succeed are unchanged.
+  - **Slots a failed run already advanced (0.31.0 and earlier):** the skipped transactions are
+    no longer readable from the slot and upgrading does not bring them back. If a PostgreSQL CDC
+    run failed while writing a part, compare that table with its source.
 
 - **Breaking: a run refuses to continue from progress stored for another table or collection**
   (`RIVET_STATE_CURSOR_STREAM_MISMATCH`, exit 5, nothing read or written). The stored incremental
