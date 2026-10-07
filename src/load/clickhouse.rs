@@ -365,7 +365,7 @@ impl TargetLoader for ClickhouseLoader {
                 c.escape_default()
             );
         }
-        let part_rows = super::before_write(checked_part_rows(self.store()?, uris))?;
+        let part_rows = super::before_write(checked_part_rows(|| self.store(), uris))?;
         let target = self.quoted(table);
         let swap = self.quoted(&format!("{table}__rivet_swap"));
         self.query(&create_table_sql(
@@ -395,7 +395,7 @@ impl TargetLoader for ClickhouseLoader {
         uris: &[String],
         pk: &[String],
     ) -> Result<u64> {
-        let part_rows = super::before_write(checked_part_rows(self.store()?, uris))?;
+        let part_rows = super::before_write(checked_part_rows(|| self.store(), uris))?;
         let full = changelog_specs(specs);
         let changes = self.quoted(&format!("{table}__changes"));
         let shape = changelog_shape(self.cdc, table, pk, self.partition_by.as_deref())?;
@@ -930,8 +930,15 @@ fn object_kind_of(engine: &str) -> ObjectKind {
 /// Parts whose footers are read at once before a load.
 const FOOTER_READERS: usize = 8;
 
-/// The row count of every part in `uris`, in order, each footer checked for a timestamp ClickHouse would clamp; the first part that fails is the one reported.
-fn checked_part_rows(store: &GcsStore, uris: &[String]) -> Result<Vec<u64>> {
+/// The row count of every part in `uris`, in order, each footer checked for a timestamp ClickHouse would clamp; the first part that fails is the one reported. The store is opened only when there is a part to read.
+fn checked_part_rows<'s>(
+    store: impl FnOnce() -> Result<&'s GcsStore>,
+    uris: &[String],
+) -> Result<Vec<u64>> {
+    if uris.is_empty() {
+        return Ok(Vec::new());
+    }
+    let store = store()?;
     let one = |uri: &String| -> Result<u64> {
         let (_, key) = super::split_object_uri(uri)?;
         let meta = super::partition_budget::read_footer(store, key)
@@ -1327,23 +1334,33 @@ mod tests {
             .map(|i| write(&format!("p{i:02}.parquet"), &vec![0; i + 1]))
             .collect();
         assert_eq!(
-            checked_part_rows(&store, &good).unwrap(),
+            checked_part_rows(|| Ok(&store), &good).unwrap(),
             (1..=good.len() as u64).collect::<Vec<_>>(),
             "one count per part, in the order given"
         );
-        assert_eq!(checked_part_rows(&store, &[]).unwrap(), Vec::<u64>::new());
+        assert_eq!(
+            checked_part_rows(
+                || Err(anyhow::anyhow!("no store is opened for a load of no parts")),
+                &[]
+            )
+            .unwrap(),
+            Vec::<u64>::new()
+        );
 
         let mut mixed = good.clone();
         mixed.insert(1, write("late.parquet", &[DATETIME64_MAX_SECS + 1]));
         mixed.push(write("early.parquet", &[DATETIME64_MIN_SECS - 1]));
-        let err = format!("{:#}", checked_part_rows(&store, &mixed).unwrap_err());
+        let err = format!(
+            "{:#}",
+            checked_part_rows(|| Ok(&store), &mixed).unwrap_err()
+        );
         assert!(
             err.contains("gs://b/late.parquet")
                 && err.contains("outside ClickHouse DateTime64's range"),
             "the first bad part in list order is the one named: {err}"
         );
         let gone = vec![good[0].clone(), "gs://b/absent.parquet".to_string()];
-        let err = format!("{:#}", checked_part_rows(&store, &gone).unwrap_err());
+        let err = format!("{:#}", checked_part_rows(|| Ok(&store), &gone).unwrap_err());
         assert!(
             err.contains("reading the footer of gs://b/absent.parquet"),
             "{err}"
