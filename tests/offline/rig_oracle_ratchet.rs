@@ -32,7 +32,7 @@ const NO_ORACLE_CEILING: usize = 23; // ratchet-pin: no-oracle-opt-outs
 
 /// Typed declarations in tests/live of what a run that does not exit 0 may leave: `.a_failed_run_may_leave(` and a raw run's `FAILED_RUN_LEAVES_ENV`.
 // 0 -> 19 (2026-10-07): the refusal grade's first pass; every site is a gate that fails a run after its parts are written (quality, schema drift, a manifest that did not land).
-// 19 -> 34 (2026-10-07): the full-stand sweep; a CDC stream commits the flushes it read before a refusal (6), a run cut mid-way keeps the parts it wrote (3), a ClickHouse load whose answer is lost did attempt the write (2); the whole-suite sweep added four more of the first two classes.
+// 19 -> 34 (2026-10-07): the full-stand sweep: 9 CDC streams that commit what they read before the refusal, 3 runs cut mid-way that keep the parts they wrote, 2 ClickHouse loads whose answer is lost after the write, 1 --reconcile verdict exit.
 const FAILED_RUN_LEFTOVER_CEILING: usize = 34; // ratchet-pin: failed-run-leftover-declarations
 
 /// Entries of `KNOWN_PRODUCT_DEFECTS` (tests/common/refusal.rs): product defects every failed run may show.
