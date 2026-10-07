@@ -204,6 +204,16 @@ impl StateStore {
         Ok(rows.into_iter().next())
     }
 
+    /// Whether `value` is the high-water key of a keyset page `run_id` committed.
+    pub fn is_committed_cursor_high(&self, run_id: &str, value: &str) -> Result<bool> {
+        let rows = self.query(
+            "SELECT 1 FROM file_log WHERE run_id = ?1 AND cursor_high = ?2 LIMIT 1",
+            &[run_id.into(), value.into()],
+            |r| r.i64(0),
+        )?;
+        Ok(!rows.is_empty())
+    }
+
     /// Forget the parts a keyset page logged before it finished — every row after the last
     /// one carrying a `cursor_high` — so a resume re-reads that page whole; returns how many.
     pub fn forget_unfinished_page_parts(&self, run_id: &str) -> Result<usize> {
@@ -324,6 +334,15 @@ mod tests {
         part("r1", "p1a", None);
         part("r1", "p1b", None);
         part("r2", "other", None); // another run is untouched
+        assert!(s.is_committed_cursor_high("r1", "k300").unwrap());
+        assert!(
+            !s.is_committed_cursor_high("r2", "k300").unwrap(),
+            "another run's page"
+        );
+        assert!(
+            !s.is_committed_cursor_high("r1", "k200").unwrap(),
+            "no page of r1 ends there"
+        );
         assert_eq!(s.forget_unfinished_page_parts("r1").expect("forget"), 2);
         let kept: Vec<String> = s
             .list_files_for_run("r1")

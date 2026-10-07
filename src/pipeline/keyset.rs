@@ -934,6 +934,13 @@ fn releases_anchor_at_data_complete(checkpoint: bool, incremental: bool) -> bool
     checkpoint && !incremental
 }
 
+/// Does each committed page move the stored cursor? Only for a crash-recovery-only run: an
+/// incremental cursor is where the next run starts, so it moves once, after the manifest
+/// lands, and a resume continues from the last page `file_log` records instead.
+fn advances_cursor_per_page(checkpoint: bool, incremental: bool) -> bool {
+    checkpoint && !incremental
+}
+
 /// The `(lo, hi)` pairs of a sampled range list, for `persist_keyset_ranges`.
 fn lo_hi_pairs(
     ranges: &[(usize, Option<String>, Option<String>, bool)],
@@ -1189,7 +1196,7 @@ pub(crate) fn run_keyset(
             std::mem::take(&mut page.observed),
             Ok(std::mem::take(&mut page.checksums)),
             |_| {
-                if kp.checkpoint
+                if advances_cursor_per_page(kp.checkpoint, kp.incremental)
                     && let (Some(st), Some(v)) = (state, page.next_cursor.as_ref())
                 {
                     st.update_with_column(
@@ -1252,16 +1259,10 @@ pub(crate) fn run_keyset(
     // skipping rows updated since (the crash-recovery/incremental split's raison
     // d'être).
     //
-    // INCREMENTAL is gated OUT (`!kp.incremental`, mirroring the fresh-run
-    // clear_cursor_value above): its next run continues from the high-water mark
-    // regardless of the anchor, so clearing it yields NO benefit — and clearing it
-    // HERE, before finalize_manifest writes the destination manifest, would strand
-    // this run's committed pages. A crash in the [clear → finalize] window would
-    // then leave a run whose parquet is on the destination + file_log but referenced
-    // by NO manifest: the next incremental run reads only keys past the high-water
-    // mark (0 new rows) and never rehydrates those parts, so the manifest-
-    // authoritative loader silently drops them. The anchor must survive until
-    // finalize for the incremental path (job.rs clears it AFTER the manifest write).
+    // INCREMENTAL is gated OUT (`!kp.incremental`): its anchor survives until
+    // job.rs has graded the run. A crash before the manifest then resumes these
+    // committed pages; a gate refusal releases the anchor there, and the next run
+    // re-reads from the stored cursor, which this run has not moved.
     if releases_anchor_at_data_complete(kp.checkpoint, kp.incremental)
         && let Some(st) = state
     {
@@ -1575,6 +1576,19 @@ mod tests {
         assert!(
             !releases_anchor_at_data_complete(false, false),
             "no checkpoint, no anchor"
+        );
+    }
+
+    #[test]
+    fn only_a_crash_recovery_run_moves_the_stored_cursor_page_by_page() {
+        assert!(advances_cursor_per_page(true, false));
+        assert!(
+            !advances_cursor_per_page(true, true),
+            "an incremental cursor moves once, after the manifest"
+        );
+        assert!(
+            !advances_cursor_per_page(false, false),
+            "no checkpoint, no cursor"
         );
     }
 

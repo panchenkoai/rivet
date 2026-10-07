@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+- **Breaking: a keyset run that a gate refused is read again, not adopted, by the next run.**
+  Applies to `chunk_by_key` with `parallel: N` + `chunk_checkpoint: true`, and to
+  `keyset_incremental: true` (sequential or parallel), when a `quality:` content rule
+  (`unique_columns`, `null_ratio_max`) or `on_schema_drift: fail` refuses the run after its rows
+  were written.
+  - Before, the refused run kept its checkpoint. The next run adopted its pages, read nothing,
+    graded nothing, and ended with exit 0, `_SUCCESS` and "quality: pass" over the refused
+    data; the refused run's `run_status` row was rewritten to `success`.
+  - Now every re-run reads the same rows again and is graded again: it keeps exiting 3
+    (quality) or 4 (schema drift) until the source data or the rule is fixed, and the refused
+    runs stay `failed`. Each refused run leaves its parts on the destination under a Failed
+    manifest, as a refused run without a checkpoint always did.
+  - A sequential `keyset_incremental` run no longer moves the stored cursor page by page: the
+    cursor moves once, after the manifest is written, so a refused or interrupted run leaves it
+    where the run began. A run that breaks off mid-way is still resumed from its last
+    committed page.
+  - Upgrading: an export whose last run finished needs nothing. An export whose last run
+    under 0.31 or earlier was refused by such a gate still gets the old behaviour once: the
+    first run on the new version adopts the pages that run left. The same holds for a
+    sequential `keyset_incremental` run interrupted under 0.31 or earlier (its cursor had
+    already moved): if the new version resumes it and a gate refuses it, the run warns that
+    it "cannot be read again" and the next run adopts its pages. To have those rows read and
+    graded again, run `rivet state reset -c <config> --export <name>` before the next run.
+    The export then starts from the beginning: a `keyset_incremental` export reads the whole
+    table again.
+
 - **Breaking: CDC writes an UPDATE that changes the key as a delete of the old key and an insert
   of the new row** (ADR-0030, accepted), on PostgreSQL, MySQL and Oracle. SQL Server's change
   table already did this, and MongoDB's `_id` cannot change.
