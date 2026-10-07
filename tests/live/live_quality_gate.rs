@@ -244,6 +244,10 @@ struct Cycle {
 
 const ROWS: i64 = 24;
 
+/// The remedy sentence each gate's refusal prints.
+const QUALITY_REMEDY: &str = "Fix the source data";
+const DRIFT_REMEDY: &str = "set `on_schema_drift: warn` to accept";
+
 /// Sorted `(id, v)` of the parts a Success manifest declares.
 fn declared_id_v(rig: &Rig) -> Vec<(i64, i64)> {
     let cell = |b: &arrow::record_batch::RecordBatch, col: &str, i: usize| -> i64 {
@@ -276,8 +280,7 @@ fn observe(rig: &Rig, out: &std::process::Output, detail: &str, incremental: boo
     }
 }
 
-/// Refuse three times running, then apply the gate's own remedy: every refusal must leave what the
-/// first one left, and the remedy run must deliver the source.
+/// Refuse once (ledger, cursor and destination re-read), then twice more and the gate's own remedy through `Rig::refuses_twice_then`.
 fn assert_a_refused_run_keeps_refusing(engine: SqlEngine, tag: &str, shape: &[&str], gate: Gate) {
     engine.alive();
     let (id, v, n) = (engine.col("id"), engine.col("v"), engine.col("n"));
@@ -352,42 +355,60 @@ fn assert_a_refused_run_keeps_refusing(engine: SqlEngine, tag: &str, shape: &[&s
         floor = incremental.then(|| ROWS.to_string());
     }
 
-    let mut seen = Vec::new();
-    let mut expected = Vec::new();
-    for _ in 0..3 {
-        let out = rig.run();
-        seen.push(observe(&rig, &out, detail, incremental));
-        runs.push("failed".to_string());
-        expected.push(Cycle {
-            exit: Some(exit),
-            refusal_named: true,
-            runs: runs.clone(),
-            cursor: floor.clone(),
-            ..seen[0].clone()
-        });
-    }
+    let out = rig.run();
+    let first = observe(&rig, &out, detail, incremental);
+    runs.push("failed".to_string());
     assert_eq!(
-        seen, expected,
-        "{tag} {gate:?}: cycles 1..3 must each refuse and leave what the first refusal left"
+        (first.exit, first.refusal_named, &first.runs, &first.cursor),
+        (Some(exit), true, &runs, &floor),
+        "{tag} {gate:?}: the first run refuses by the gate and leaves the ledger and the cursor where they were"
     );
     if !matches!(gate, Gate::Drift) {
         assert_eq!(
-            (seen[0].success_marker, seen[0].delivered_rows),
+            (first.success_marker, first.delivered_rows),
             (false, 0),
             "{tag} {gate:?}: a refused run delivers nothing"
         );
     }
 
-    // The remedy the refusal names, applied from the refused state.
-    match gate {
+    // Two more refusals, then the remedy the refusal names, applied from the refused state.
+    let (sentence, uncoded) = match gate {
+        Gate::Duplicate => (
+            QUALITY_REMEDY,
+            "a quality-gate refusal (exit 3) has no registry code",
+        ),
+        Gate::Nulls => (
+            QUALITY_REMEDY,
+            "a quality-gate refusal (exit 3) has no registry code",
+        ),
+        Gate::Drift => (
+            DRIFT_REMEDY,
+            "a schema-drift refusal (exit 4) has no registry code",
+        ),
+    };
+    let apply = |r: &mut Rig| match gate {
         Gate::Duplicate => engine.exec(&format!("UPDATE {table} SET {v} = 8 WHERE {id} = 8")),
         Gate::Nulls => engine.exec(&format!("UPDATE {table} SET {n} = 0 WHERE {n} IS NULL")),
         Gate::Drift => {
-            rig.replace_export_line("on_schema_drift", "on_schema_drift: warn");
+            r.replace_export_line("on_schema_drift", "on_schema_drift: warn");
         }
-    }
-    let out = rig.run();
-    let healed = observe(&rig, &out, detail, incremental);
+    };
+    let said = rig.refuses_twice_then(
+        &["run"],
+        &[],
+        Refused::uncoded_known_defect(exit, uncoded),
+        vec![Remedy::new(sentence, Then::DeliversTheSource, apply)],
+    );
+    runs.extend(["failed".to_string(), "failed".to_string()]);
+    let (ledger, cursor) = run_statuses_and_cursor(&rig.config_path(), rig.export_name());
+    let healed = Cycle {
+        exit: Some(0),
+        refusal_named: false,
+        success_marker: rig.out_dir().join("_SUCCESS").is_file(),
+        delivered_rows: 0,
+        runs: ledger,
+        cursor: cursor.filter(|_| incremental),
+    };
     // Declared = the drift baseline's own run (rows 1..=ROWS) plus what the remedy run owes:
     // the rows past the cursor for an incremental export, the whole source for a full pass.
     let source = engine.id_v_pairs(&table);
@@ -405,8 +426,7 @@ fn assert_a_refused_run_keeps_refusing(engine: SqlEngine, tag: &str, shape: &[&s
         (healed.exit, healed.success_marker, healed.runs, delivered),
         (Some(0), true, runs, owed),
         "{tag} {gate:?}: after the remedy the run succeeds, delivers every owed source row once, \
-         and the refused runs stay failed; stderr:\n{}",
-        String::from_utf8_lossy(&out.stderr)
+         and the refused runs stay failed; the remedy run said:\n{said}"
     );
     if incremental {
         let top = source.last().map(|r| r.0.to_string());

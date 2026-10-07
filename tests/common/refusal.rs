@@ -1,8 +1,8 @@
 //! REFUSAL — the default oracle's grade for an invocation that did NOT exit 0 (tests/common/verify.rs
 //! `settle`). The destination trees, the CDC checkpoint files and the state DB are fingerprinted
 //! before the invocation and re-read after it: nothing may have changed except the failure's own
-//! record (a journal row with a non-success status; a manifest with a non-success status and the
-//! `_SUCCESS` marker it withdraws) and what the test declared with a typed [`Leftover`]
+//! record (a journal row with a non-success status; once it wrote a part or a `file_log` row, a
+//! manifest with a non-success status and the `_SUCCESS` marker it withdraws) and what the test declared with a typed [`Leftover`]
 //! (`Rig::a_failed_run_may_leave`, or `RIVET_TEST_FAILED_RUN_LEAVES` on a raw run; both counted by
 //! a shrink-only ceiling). A product defect is excused only as a known defect: one rig's
 //! (`Rig::oracle_known_defect("a failed run left: <kind>", ..)`) or one every failed run shows
@@ -20,10 +20,16 @@ pub const FAILED_RUN_LEAVES_ENV: &str = "RIVET_TEST_FAILED_RUN_LEAVES";
 const FAULT_ENVS: &[&str] = &["RIVET_TEST_PANIC_AT", "RIVET_TEST_ERROR_AT"];
 
 /// Product defects every failed run may show until the product is fixed: the kind and why (pinned by tests/offline/rig_oracle_ratchet.rs; the list only shrinks).
-pub(crate) const KNOWN_PRODUCT_DEFECTS: &[(Leftover, &str)] = &[(
-    Leftover::ObservedSchema,
-    "known defect: a first run that fails stores the drift baseline (src/state/schema.rs `detect_schema_change`) in export_schema, which src/state/migrations.rs v18 documents as success-only",
-)];
+pub(crate) const KNOWN_PRODUCT_DEFECTS: &[(Leftover, &str)] = &[
+    (
+        Leftover::ObservedSchema,
+        "known defect: a first run that fails stores the drift baseline (src/state/schema.rs `detect_schema_change`) in export_schema, which src/state/migrations.rs v18 documents as success-only",
+    ),
+    (
+        Leftover::ManifestBeforeAWrite,
+        "known defect: a run that fails before its first write still rewrites manifest.json to failed and withdraws `_SUCCESS` (owner decision 2026-10-07: it leaves both alone); the cells are live_operator_contract::open_defect_a_run_that_never_connected_keeps_the_export_complete_*",
+    ),
+];
 
 /// The kinds a failed run may leave with no declaration: its own record of the stop.
 const OWN_RECORD: &[Leftover] = &[Leftover::FailureRecord, Leftover::FailedManifest];
@@ -69,6 +75,8 @@ pub enum Leftover {
     FailureRecord,
     /// The destination's record of the stop: a manifest with a non-success status, and the `_SUCCESS` it withdraws (allowed by default).
     FailedManifest,
+    /// A [`Leftover::FailedManifest`] of a run that left no part, flush or `file_log` row: it had not begun writing, so the prefix was not its to re-mark.
+    ManifestBeforeAWrite,
     /// A file added to the destination that is neither a marker nor a manifest.
     OrphanPart,
     /// A CDC checkpoint file added or rewritten.
@@ -101,9 +109,10 @@ pub enum Leftover {
 
 impl Leftover {
     /// Every kind, in report order.
-    pub const ALL: [Leftover; 16] = [
+    pub const ALL: [Leftover; 17] = [
         Leftover::FailureRecord,
         Leftover::FailedManifest,
+        Leftover::ManifestBeforeAWrite,
         Leftover::OrphanPart,
         Leftover::CdcCheckpoint,
         Leftover::CdcFlush,
@@ -126,6 +135,7 @@ impl Leftover {
             Leftover::FailureRecord => "failure-record",
             Leftover::OrphanPart => "orphan-part",
             Leftover::FailedManifest => "failed-manifest",
+            Leftover::ManifestBeforeAWrite => "failed-manifest-before-a-write",
             Leftover::CdcCheckpoint => "cdc-checkpoint",
             Leftover::CdcFlush => "cdc-committed-flush",
             Leftover::DeliveredRun => "delivered-run",
@@ -159,7 +169,8 @@ impl Leftover {
     pub fn declarable(self) -> bool {
         !matches!(
             self,
-            Leftover::SuccessMarker
+            Leftover::ManifestBeforeAWrite
+                | Leftover::SuccessMarker
                 | Leftover::SuccessManifest
                 | Leftover::SuccessRecord
                 | Leftover::UnknownStatus
@@ -664,12 +675,39 @@ pub(crate) fn without_delivering_siblings(
     (kept, delivered)
 }
 
+/// `found` with the failed manifest of each export whose run left no part, flush or `file_log` row re-kinded as [`Leftover::ManifestBeforeAWrite`].
+pub(crate) fn manifests_before_a_write(found: &[Finding]) -> Vec<Finding> {
+    let wrote: BTreeSet<&Option<String>> = found
+        .iter()
+        .filter(|f| {
+            matches!(
+                f.kind,
+                Leftover::OrphanPart | Leftover::CdcFlush | Leftover::FileLog
+            )
+        })
+        .map(|f| &f.export)
+        .collect();
+    found
+        .iter()
+        .cloned()
+        .map(|f| Finding {
+            kind: if f.kind == Leftover::FailedManifest && !wrote.contains(&f.export) {
+                Leftover::ManifestBeforeAWrite
+            } else {
+                f.kind
+            },
+            ..f
+        })
+        .collect()
+}
+
 /// Judge `found` against the failure's own record, what the test `declared`, the caller's `marker` known defect (kind, reason) and [`KNOWN_PRODUCT_DEFECTS`].
 pub(crate) fn judge(
     found: &[Finding],
     declared: &[Leftover],
     marker: Option<(Leftover, &str)>,
 ) -> Verdict {
+    let found = &manifests_before_a_write(found)[..];
     let allowed = |k: Leftover| OWN_RECORD.contains(&k) || declared.contains(&k);
     let excuses: Vec<(Leftover, &str)> = marker
         .into_iter()
@@ -794,23 +832,43 @@ mod tests {
                  INSERT INTO run_journal VALUES ('r', 'e');
                  INSERT INTO load_run VALUES ('l', 'e', 'refused')",
             );
-            std::fs::write(d.join("out/manifest-r2.json"), br#"{"status":"failed"}"#).unwrap();
-            std::fs::write(d.join("out/manifest.json"), br#"{"status":"failed"}"#).unwrap();
-            std::fs::remove_file(d.join("out/_SUCCESS")).unwrap();
         });
+        assert_eq!(kinds, vec![Leftover::FailureRecord; 2]);
+        assert_eq!(verdict, clean("left only failure-record x2"));
+    }
+
+    /// Re-mark the fixture's prefix as failed, after `first` (what the run wrote before that); the verdict with a `file_log` row declared.
+    fn remarked_after(first: &str) -> Verdict {
+        let (dir, scope) = fixture();
+        let before = Snapshot::take(&scope);
+        let d = dir.path();
+        sql(d, first);
+        std::fs::write(d.join("out/manifest-r2.json"), br#"{"status":"failed"}"#).unwrap();
+        std::fs::write(d.join("out/manifest.json"), br#"{"status":"failed"}"#).unwrap();
+        std::fs::remove_file(d.join("out/_SUCCESS")).unwrap();
+        let (found, _) = diff(&scope, &before, &Snapshot::take(&scope));
+        judge(&found, &[Leftover::FileLog], None)
+    }
+
+    #[test]
+    fn a_failed_manifest_is_the_runs_own_record_only_once_it_wrote() {
         assert_eq!(
-            kinds,
-            vec![
-                Leftover::FailedManifest,
-                Leftover::FailedManifest,
-                Leftover::FailedManifest,
-                Leftover::FailureRecord,
-                Leftover::FailureRecord
-            ]
+            remarked_after("INSERT INTO file_log VALUES (1, 'e', 'part-1.parquet')"),
+            clean("left only failed-manifest x3, file-log x1")
         );
-        assert_eq!(
-            verdict,
-            clean("left only failure-record x2, failed-manifest x3")
+        let Verdict::Refused { left, known, .. } = remarked_after("SELECT 1") else {
+            panic!("a known defect, not a failure");
+        };
+        assert_eq!(left, "left only failed-manifest-before-a-write x3");
+        assert_eq!(known.len(), 1, "{known:?}");
+        assert!(
+            known[0].0.starts_with("[a failed run left: failed-manifest-before-a-write] known defect: a run that fails before its first write"),
+            "{known:?}"
+        );
+        let other = remarked_after("INSERT INTO file_log VALUES (1, 'sibling', 'part-1.parquet')");
+        assert!(
+            matches!(other, Verdict::Refused { ref known, .. } if known.len() == 1),
+            "a sibling's write does not make this export's manifest its run's own: {other:?}"
         );
     }
 
