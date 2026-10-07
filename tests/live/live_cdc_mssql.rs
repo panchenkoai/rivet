@@ -3003,9 +3003,9 @@ fn mssql_cdc_refuses_a_captured_value_it_cannot_decode() {
 // ─── the log is gone below a checkpoint that has never advanced ──────────────
 
 /// A snapshot-baselined SQL Server scenario with ids 1..=3 delivered and two updates waiting unread.
-fn baselined_with_two_unread_updates(label: &str) -> CdcScenario {
+fn baselined_with_two_unread_updates(label: &str, shape: fn(Rig) -> Rig) -> CdcScenario {
     let mut s = CdcScenario::mssql_with(label, "id INT PRIMARY KEY, v INT", |r, _| {
-        r.cdc("initial: snapshot").cdc("until_current: true")
+        shape(r.cdc("initial: snapshot").cdc("until_current: true"))
     });
     for id in 1..=3 {
         s.insert(id);
@@ -3054,7 +3054,7 @@ fn recreate_capture_instance(table: &str) {
 #[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC + the rivet-duckdb oracle"]
 fn mssql_cleanup_past_unread_changes_before_the_first_changes_run_is_refused() {
     let _serial = cross_process_serial("mssql_cdc");
-    let mut s = baselined_with_two_unread_updates("cdc_pingap");
+    let mut s = baselined_with_two_unread_updates("cdc_pingap", |r| r);
     mssql_cdc_exec(&format!(
         "DECLARE @lw binary(10) = (SELECT MAX(__$start_lsn) FROM cdc.dbo_{t}_CT); \
          EXEC sys.sp_cdc_cleanup_change_table @capture_instance = N'dbo_{t}', \
@@ -3076,7 +3076,7 @@ fn mssql_cleanup_past_unread_changes_before_the_first_changes_run_is_refused() {
 #[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC + the rivet-duckdb oracle"]
 fn mssql_capture_instance_recreated_before_the_first_changes_run_is_refused() {
     let _serial = cross_process_serial("mssql_cdc");
-    let mut s = baselined_with_two_unread_updates("cdc_pinrecreate");
+    let mut s = baselined_with_two_unread_updates("cdc_pinrecreate", |r| r);
     recreate_capture_instance(&s.table);
     assert_log_gap_refusal(&s);
     assert_log_gap_refusal(&s);
@@ -3093,7 +3093,12 @@ fn mssql_capture_instance_recreated_before_the_first_changes_run_is_refused() {
 #[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC + the rivet-duckdb oracle"]
 fn mssql_add_column_remedy_before_the_first_changes_run_ends_in_the_log_gap_refusal() {
     let _serial = cross_process_serial("mssql_cdc");
-    let mut s = baselined_with_two_unread_updates("cdc_pinaddcol");
+    let mut s = baselined_with_two_unread_updates("cdc_pinaddcol", |r| {
+        r.a_failed_run_may_leave(
+            &[Leftover::ResumePoint],
+            "the refused run after the re-enable has already stored the widened schema (id, v, w) in export_schema",
+        )
+    });
     mssql_cdc_exec(&format!("ALTER TABLE dbo.{} ADD w INT NULL", s.table));
     let said = s.rig.run_expect_fail();
     assert!(
