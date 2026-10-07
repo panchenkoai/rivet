@@ -34,7 +34,8 @@ const NO_ORACLE_CEILING: usize = 23; // ratchet-pin: no-oracle-opt-outs
 // 0 -> 19 (2026-10-07): the refusal grade's first pass; every site is a gate that fails a run after its parts are written (quality, schema drift, a manifest that did not land).
 // 19 -> 34 (2026-10-07): the full-stand sweep: 9 CDC streams that commit what they read before the refusal, 3 runs cut mid-way that keep the parts they wrote, 2 ClickHouse loads whose answer is lost after the write, 1 --reconcile verdict exit.
 // 34 -> 35 (2026-10-07): the refused-run-keeps-refusing cells (one shared rig): parts, their file_log rows, the observed schema and the kept anchor.
-const FAILED_RUN_LEFTOVER_CEILING: usize = 35; // ratchet-pin: failed-run-leftover-declarations
+// 35 -> 36 (2026-10-07): a parallel keyset resume that refuses over a deleted page while another worker finishes its range (seen on CI only).
+const FAILED_RUN_LEFTOVER_CEILING: usize = 36; // ratchet-pin: failed-run-leftover-declarations
 
 /// Entries of `KNOWN_PRODUCT_DEFECTS` (tests/common/refusal.rs): product defects every failed run may show.
 const KNOWN_PRODUCT_DEFECT_CEILING: usize = 1; // ratchet-pin: failed-run-known-product-defects
