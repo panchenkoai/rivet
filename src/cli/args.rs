@@ -597,7 +597,8 @@ pub enum StateAction {
         /// `chunk_run.status = 'in_progress'` (crash, SIGKILL, stale concurrent worker).
         ///
         /// Ignores exports whose latest chunk run already finished (`completed`). Runs listed in the
-        /// database but removed from the YAML are skipped with a printed note.
+        /// database but removed from the YAML are skipped with a printed note, and so is an
+        /// export whose run is still alive in another rivet process: it is not stuck.
         ///
         /// Alias `--failed` refers to "checkpoint state stuck", not HTTP-style failures or metric rows.
         #[arg(long, visible_alias = "failed", group = "reset_chunks_target")]

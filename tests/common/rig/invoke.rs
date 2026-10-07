@@ -45,7 +45,8 @@ impl Rig {
         // configs even without --annotate-waves) — absorb it so the hand-edit
         // guard keeps firing only on edits made OUTSIDE an invocation.
         self.absorb_product_config_writes();
-        if let Some(case) = case.filter(|_| out.status.success()) {
+        if let Some(mut case) = case.filter(|_| out.status.success()) {
+            case.delivered(&out.stdout);
             self.oracle_finish(case, envs);
         }
         out

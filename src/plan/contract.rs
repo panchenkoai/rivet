@@ -240,6 +240,13 @@ pub enum ExtractionStrategy {
     },
 }
 
+impl ResolvedRunPlan {
+    /// The stream stored progress belongs to: the relation the query's outermost `FROM` names; empty when it names none.
+    pub fn stream(&self) -> String {
+        crate::sql::outer_from_relation(&self.base_query).unwrap_or_default()
+    }
+}
+
 impl ExtractionStrategy {
     pub fn mode_label(&self) -> &'static str {
         match self {
@@ -295,6 +302,12 @@ impl ExtractionStrategy {
             ExtractionStrategy::Keyset(k) => Some(k.key_column.clone()),
             _ => None,
         }
+    }
+
+    /// Whether a clean run seeks from the stored cursor (incremental, `keyset_incremental`, Mongo `resume`).
+    pub fn continues_stored_cursor(&self) -> bool {
+        matches!(self, ExtractionStrategy::Incremental(_))
+            || matches!(self, ExtractionStrategy::Keyset(kp) if kp.incremental)
     }
 
     /// Primary cursor column name for incremental exports (`None` for other strategies).
@@ -465,6 +478,32 @@ mod tests {
         assert!(s.cursor_column().is_none());
         let q = s.resolve_query("SELECT 1", SourceType::Postgres).unwrap();
         assert_eq!(q, "SELECT 1");
+    }
+
+    #[test]
+    fn only_strategies_a_clean_run_resumes_continue_the_stored_cursor() {
+        let keyset = |incremental| {
+            ExtractionStrategy::Keyset(KeysetPlan {
+                key_column: "id".into(),
+                chunk_size: 1000,
+                checkpoint: true,
+                incremental,
+                parallel: 1,
+            })
+        };
+        let incremental = ExtractionStrategy::Incremental(IncrementalCursorPlan {
+            primary_column: "updated_at".into(),
+            fallback_column: None,
+            mode: IncrementalCursorMode::SingleColumn,
+            settle: None,
+        });
+        assert!(incremental.continues_stored_cursor());
+        assert!(keyset(true).continues_stored_cursor());
+        assert!(
+            !keyset(false).continues_stored_cursor(),
+            "a crash-recovery keyset clears the stale high-water at a fresh start"
+        );
+        assert!(!ExtractionStrategy::Snapshot.continues_stored_cursor());
     }
 
     #[test]

@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+<<<<<<< HEAD
 - **ClickHouse load: a timestamp ClickHouse cannot hold is refused before the load's first
   statement, and that refusal no longer makes the table rivet's own.** The range check ran
   inside the insert of each part, after the `<table>__rivet_swap` table was created, and the
@@ -12,6 +13,29 @@
   of loading. A load with an out-of-range value in a later part no longer inserts the earlier
   parts into the swap table before stopping.
 
+=======
+- **Breaking: a run refuses to continue from progress stored for another table or collection**
+  (`RIVET_STATE_CURSOR_STREAM_MISMATCH`, exit 5, nothing read or written). The stored incremental
+  cursor, `keyset_incremental` high-water, MongoDB `resume` `_id` and interrupted-run anchor now
+  record the relation they were read from.
+  - Before (0.30.0, 0.31.0 and earlier): an export repointed at another table without
+    `rivet state reset`, or two exports with one name in one state database reading different
+    tables, continued from the other table's value: exit 0, `_SUCCESS`, 0 of 1000 rows.
+  - The relation is the first one the query's outermost `FROM` names (`table:` or `query:`),
+    quotes stripped. Changing the columns, the filter or a join keeps the cursor. `orders` and
+    `public.orders` are the same relation; `a.orders` and `b.orders` are not. A query whose `FROM`
+    is a subquery names none and is not checked.
+  - Remedy: give each export that shares a state database its own name; if you repointed an
+    export, `rivet state reset -c <config> --export <name>` starts the new table with a full pass.
+    The reset discards the progress of every export of that name in the state database.
+  - Upgrade: state schema v33 (one nullable column; releases before this one refuse a migrated
+    state database, as with every schema bump). Progress written by an earlier release names no
+    relation: the first run adopts the relation it reads, logs one `WARN` saying so, and keeps the
+    cursor. It does not reset and does not refuse, so a repoint made BEFORE the upgrade is not
+    detected.
+  - An export whose `FROM` relation comes from a `--param` that changes between runs is now
+    refused when it continues a stored cursor.
+>>>>>>> origin/main
 - **Security: a password written in a keyword/value connection string is no longer printed or
   stored.** A PostgreSQL libpq string (`host=… user=… password=… dbname=…`) is accepted in
   `url:`; SQL Server ADO and JDBC-property strings (`…;Password=…;`, `…;PWD=…;`,
@@ -33,6 +57,65 @@
   - The scope key no longer changes when the password is rotated. Before, a rotation orphaned
     the cursor and the next incremental run started over.
 
+- **Breaking: a `query:` whose projection renames or limits is read as a query, not as its
+  table.** `query: "SELECT legacy_id AS id, name FROM customers"` with `chunk_column: id` took
+  its range from the table's own `id` and filtered on the alias: exit 0, `_SUCCESS`, 0 of 1000
+  rows, on every SQL engine (present in 0.31.0).
+  - The range, the NULL-key probe and the row count now come from the query itself whenever a
+    projection item is more than one bare column: `a AS b`, `a b`, `DISTINCT a`, `TOP 5 a`.
+  - A plain column list (`SELECT id, name FROM t`, what `rivet init` writes) and `SELECT *`
+    still probe the table directly.
+  - Upgrading: an export of this shape that delivered nothing now delivers the query's rows.
+    An aliased query whose chunk column was not renamed delivers the same rows as before; only
+    its probes are wrapped. Nothing stored in the state database changes.
+- **Breaking: PostgreSQL refuses a planner probe whose value it cannot read, instead of taking
+  it for "no rows".** A range bound, a keyset boundary or the `keyset_incremental` ceiling of a
+  type the adapter had no reader for came back as "no value". With `parallel:` and
+  `keyset_incremental: true` on a `smallint` key that was "no new rows past the anchor": exit 0,
+  `_SUCCESS`, 0 of 3000 rows on every run (present in 0.31.0).
+  - `smallint` and `oid` are now read. `chunk_column:` on a `smallint` column, refused before
+    with "returned no readable value", now exports.
+  - Any other type (`real`, `numeric`, `time`, an enum, ...) stops the run with
+    `postgres: cannot read a planner probe's <type> value`, naming the probe. Only SQL NULL
+    means an empty table.
+  - Upgrading: a parallel `keyset_incremental` export on a `smallint` or `oid` key stored no
+    anchor while it delivered nothing, so its first run after the upgrade delivers the whole
+    table and later runs deliver the new keys.
+  - Upgrading: a parallel keyset export on a key of an unread type ran as a single worker with
+    a warning (and delivered nothing with `keyset_incremental`). It now fails with the message
+    above. Remove `parallel:`: the sequential keyset reads its cursor from the rows.
+  - The refusal for a `numeric` or `real` `chunk_column:` under `query:` has the new text.
+- **Breaking: `rivet state reset` and `rivet state reset-chunks` refuse while a checkpointed run
+  of the export is alive.** Before, both were accepted (exit 0) during the run. A
+  `mode: chunked` export with `chunk_checkpoint: true` then finished with exit 0, `_SUCCESS`
+  and a manifest of 0 parts and 0 rows, with the parts it had written left in the destination
+  in no manifest.
+  - The refusal is `RIVET_STATE_RUN_IN_PROGRESS` (exit 5). It names the run (the last field of
+    a run id is the process id) and removes nothing. Wait for the run, or stop its process, and
+    repeat the command. A run that was killed does not hold the reset back.
+  - `rivet state reset-chunks --stuck-checkpoints` leaves an export whose run is alive in
+    place, prints why, and still exits 0.
+  - Only a run that holds the export's run lease is protected: `chunk_checkpoint: true`, range
+    or keyset. A reset during any other run (`full`, `incremental`, `cdc`) is accepted as before.
+  - A checkpointed run whose `chunk_run` row is gone when it finishes now fails with
+    `RIVET_STATE_CHUNK_CHECKPOINT_GONE` (exit 5) and writes no `_SUCCESS`. Run the export again.
+  - State written by earlier releases needs nothing: no stored row changes shape.
+
+- **Breaking: `rivet apply` runs a `partition_by` export as its partitions.** `rivet apply
+  <config.yaml>`, with and without `--pool N`, now writes one `<col>=<value>` directory per
+  partition, as `rivet run` does. Before, it exited 0 with the whole table under a directory
+  literally named `{partition}`.
+  - Output an earlier `apply` wrote under `{partition}` stays where it is; nothing reads or
+    removes it. Delete that directory once the next `apply` has written the partitions.
+  - `rivet apply <plan.json>` refuses a plan whose destination still holds the `{partition}`
+    token, before writing anything. Run `rivet apply <config.yaml>` instead. `rivet plan` warns
+    when it plans a `partition_by` export. A plan sealed by an earlier release is refused the
+    same way.
+  - A destination that names `{partition}` without `partition_by:` is refused when it runs.
+    Before, it wrote into a directory literally named `{partition}`. Remove the token.
+- **`destination: stdout` keeps its data under `--parallel-export-processes`.** `rivet run` and
+  `rivet apply <config.yaml>` now run such a config in-process and warn that they did. Before,
+  the parent dropped every byte its children wrote to stdout and exited 0 with empty output.
 - **Breaking: CDC writes an UPDATE that changes the key as a delete of the old key and an insert
   of the new row** (ADR-0030, accepted), on PostgreSQL, MySQL and Oracle. SQL Server's change
   table already did this, and MongoDB's `_id` cannot change.

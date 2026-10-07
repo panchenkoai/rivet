@@ -94,7 +94,7 @@ def verdict_reasons(text: str) -> Counter:
     for l in text.splitlines():
         m = re.match(r"RIVET-ORACLE-(SKIP|PARTIAL|OFF) [^—]*— (.*)", l)
         if m:
-            why = re.sub(r" \{.*$", "", re.sub(r"grade(-load)? \d+ ms: ?", "", m.group(2)))
+            why = re.sub(r" \{.*$", "", re.sub(r"grade(-load|-stdout)? \d+ ms: ?", "", m.group(2)))
             out[f"{m.group(1)} {re.sub(r'[0-9]+', 'N', why)}"] += 1
     return out
 
@@ -196,6 +196,7 @@ def _verdict_self_test() -> None:
     ci = {k: v[0] for k, v in VERDICT_CEILINGS["ci"].items()}
     assert (n["first-run"], n["skip"], n["partial"]) == (ci["first-run"] + 1, ci["skip"], ci["partial"]), n
     assert verdict_reasons("RIVET-ORACLE-OFF t [e] — grade-load 41 ms: why 7 {x: 1}") == Counter({"OFF why N": 1})
+    assert verdict_reasons("RIVET-ORACLE-PARTIAL t [e] — grade-stdout 9 ms: why") == Counter({"PARTIAL why": 1})
     unpaid = at_ceiling("ci").replace("RIVET-ORACLE-PASS live_x::d0 [t]", "RIVET-ORACLE-SKIP live_x::d0 [t]")
     assert unpaid_deferrals(unpaid) == ["live_x::d0 [t]: a capped run deferred its remainder and no later run of the stream was graded"], \
         unpaid_deferrals(unpaid)
