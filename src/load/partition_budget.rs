@@ -188,22 +188,38 @@ fn footer_buckets(meta: &ParquetMetaData, key: &PartitionKey) -> Option<i64> {
     (c == column && g == granularity.as_str()).then_some(n)
 }
 
+/// Bytes of an object's end read in one request; a footer that fits needs no second read.
+const FOOTER_GUESS: u64 = 64 * 1024;
+
 /// The footer of the Parquet object at the bucket-relative `key`: its last 8 bytes name
 /// the metadata length, and the metadata sits right before them.
 pub(crate) fn read_footer(store: &GcsStore, key: &str) -> Result<ParquetMetaData> {
+    read_footer_guessing(store, key, FOOTER_GUESS)
+}
+
+/// [`read_footer`] with the size of its first read given.
+fn read_footer_guessing(store: &GcsStore, key: &str, guess: u64) -> Result<ParquetMetaData> {
     let size = store.stat_size(key)?;
     let tail_len = FOOTER_SIZE as u64;
     if size < tail_len {
         bail!("{key} is {size} bytes, too short to be a Parquet file");
     }
-    let tail = store.read_range(key, size - tail_len, tail_len)?;
-    let tail: [u8; FOOTER_SIZE] = tail
-        .as_slice()
+    let guess = size.min(guess.max(tail_len));
+    let end = store.read_range(key, size - guess, guess)?;
+    let tail: [u8; FOOTER_SIZE] = end
+        .get(end.len().saturating_sub(FOOTER_SIZE)..)
+        .unwrap_or_default()
         .try_into()
         .context("the Parquet footer tail is not 8 bytes")?;
     let len = FooterTail::try_new(&tail)?.metadata_length() as u64;
     if size < tail_len + len {
         bail!("{key} declares a {len}-byte footer but is {size} bytes long");
+    }
+    if tail_len + len <= guess {
+        let start = (guess - tail_len - len) as usize;
+        return Ok(ParquetMetaDataReader::decode_metadata(
+            &end[start..start + len as usize],
+        )?);
     }
     let bytes = store.read_range(key, size - tail_len - len, len)?;
     Ok(ParquetMetaDataReader::decode_metadata(&bytes)?)
@@ -528,6 +544,33 @@ mod tests {
 
     fn write(dir: &std::path::Path, name: &str, field: Field, column: ArrayRef, stats: bool) {
         write_noted(dir, name, field, column, stats, None);
+    }
+
+    /// The footer reads the same whether the first read holds all of it, exactly it, or only its tail.
+    #[test]
+    fn a_footer_longer_than_the_first_read_takes_a_second_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (field, column) = ts_column(&[at(2024, 1, 1, 0), at(2024, 1, 2, 0)]);
+        write(dir.path(), "p.parquet", field, column, true);
+        let store = GcsStore::open_fs(dir.path().to_str().unwrap()).unwrap();
+        let size = store.stat_size("p.parquet").unwrap();
+        let tail = store.read_range("p.parquet", size - 8, 8).unwrap();
+        let len = u32::from_le_bytes(tail[..4].try_into().unwrap()) as u64;
+        let whole = read_footer(&store, "p.parquet").unwrap();
+        assert_eq!(whole.file_metadata().num_rows(), 2);
+        for guess in [0, 8, len + 7, len + 8, len + 9, size, size + 1] {
+            let got = read_footer_guessing(&store, "p.parquet", guess).unwrap();
+            assert_eq!(
+                (got.file_metadata().num_rows(), got.num_row_groups()),
+                (2, whole.num_row_groups()),
+                "first read of {guess} bytes"
+            );
+            assert_eq!(
+                timestamp_outside(&got, at(2024, 1, 1, 0), at(2024, 1, 1, 12)),
+                timestamp_outside(&whole, at(2024, 1, 1, 0), at(2024, 1, 1, 12)),
+                "first read of {guess} bytes"
+            );
+        }
     }
 
     #[test]

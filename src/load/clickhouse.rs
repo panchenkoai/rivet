@@ -261,17 +261,30 @@ impl ClickhouseLoader {
             .sum()
     }
 
-    /// The row count of every part in `uris`, each footer checked for a timestamp ClickHouse would clamp; asked before the load's first statement.
+    /// The row count of every part in `uris`, each footer checked for a timestamp ClickHouse would clamp; asked before the load's first statement, `FOOTER_READERS` parts at a time.
     fn checked_part_rows(&self, uris: &[String]) -> Result<Vec<u64>> {
-        uris.iter()
-            .map(|uri| {
-                let (_, key) = super::split_object_uri(uri)?;
-                let meta = super::partition_budget::read_footer(self.store()?, key)
-                    .with_context(|| format!("reading the footer of {uri}"))?;
-                refuse_unholdable_timestamps(&meta, uri)?;
-                footer_rows(&meta)
-            })
-            .collect()
+        let store = self.store()?;
+        let one = |uri: &String| -> Result<u64> {
+            let (_, key) = super::split_object_uri(uri)?;
+            let meta = super::partition_budget::read_footer(store, key)
+                .with_context(|| format!("reading the footer of {uri}"))?;
+            refuse_unholdable_timestamps(&meta, uri)?;
+            footer_rows(&meta)
+        };
+        let mut rows = Vec::with_capacity(uris.len());
+        for wave in uris.chunks(FOOTER_READERS) {
+            let checked: Vec<Result<u64>> = std::thread::scope(|scope| {
+                let readers: Vec<_> = wave.iter().map(|uri| scope.spawn(|| one(uri))).collect();
+                readers
+                    .into_iter()
+                    .map(|r| r.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
+                    .collect()
+            });
+            for r in checked {
+                rows.push(r?);
+            }
+        }
+        Ok(rows)
     }
 
     /// Insert one part of `rows` rows into `target`; a pushed part's own footer is checked again.
@@ -940,6 +953,9 @@ fn object_kind_of(engine: &str) -> ObjectKind {
 }
 
 /// ClickHouse `DateTime64`'s range in Unix seconds: 1900-01-01 00:00:00 to 2299-12-31 23:59:59.
+/// Parts whose footers are read at once before a load.
+const FOOTER_READERS: usize = 8;
+
 const DATETIME64_MIN_SECS: i64 = -2_208_988_800;
 const DATETIME64_MAX_SECS: i64 = 10_413_791_999;
 
