@@ -157,7 +157,7 @@ scenarios:
     mongo:    { na: "the parallel _id-range reader records no _id (parallel_keyset_then_resume_mongo), so it has no stored progress to inherit" }
 
   - id: shared_name_another_table
-    what: "two configs, one export name, one Postgres state database, two tables: the second is refused twice until it has its own name (skips without RIVET_GATE_STATE_URL)"
+    what: "two configs, one export name, one state database, two tables: the second is refused twice until it has its own name (separate config files on a Postgres state; on SQLite the second config takes the first one's directory, where its state file lives)"
     postgres: { test: incremental_shared_name_another_table_postgres }
     mysql:    { test: incremental_shared_name_another_table_mysql }
     mssql:    { test: incremental_shared_name_another_table_mssql }

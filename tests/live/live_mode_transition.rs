@@ -675,13 +675,8 @@ fn stream_repoint(engine: SqlEngine, stage: Stage) {
     assert_eq!(ids(second.path()), (1..=10).collect::<Vec<_>>());
 }
 
-/// Two configs, one export name, one Postgres state, two tables: the second is refused until it has its own name.
+/// Two configs, one export name, one state, two tables: the second is refused until it has its own name. A SQLite state sits beside its config, so there the second config takes the first one's directory.
 fn stream_shared_name(engine: SqlEngine, stage: Stage) {
-    if state_url_under_test().is_none() {
-        return skip_live(
-            "RIVET_GATE_STATE_URL unset: two configs share one state only on the Postgres backend",
-        );
-    }
     engine.alive();
     let (a, _ga) = engine.table("stream_a");
     let (b, _gb) = engine.table("stream_b");
@@ -700,12 +695,12 @@ fn stream_shared_name(engine: SqlEngine, stage: Stage) {
     one.run_ok();
     assert_eq!(ids(first.path()), (101..=110).collect::<Vec<_>>());
 
-    let two = staged_for(
-        engine,
-        engine.rig(&b).export_named(&shared),
-        &stage,
-        second.path(),
-    );
+    let two = if state_url_under_test().is_some() {
+        engine.rig(&b).export_named(&shared)
+    } else {
+        one.repoint(&b)
+    };
+    let two = staged_for(engine, two, &stage, second.path());
     refused_twice_for_the_stream(&two, second.path(), &a, &b, &ids);
 
     let own = staged_for(
@@ -763,11 +758,6 @@ fn stream_query_repoint(engine: SqlEngine) {
 
 /// Mongo `resume`: export collection `hi` (`_id` 101..=110), then read `lo` (`_id` 1..=10) under the same export name and state.
 fn mongo_stream(shared_name: bool) {
-    if shared_name && state_url_under_test().is_none() {
-        return skip_live(
-            "RIVET_GATE_STATE_URL unset: two configs share one state only on the Postgres backend",
-        );
-    }
     require_alive(LiveService::Mongo);
     let db = unique_name("mt_stream");
     let m = MongoTest::connect(27017, &db);
@@ -796,7 +786,7 @@ fn mongo_stream(shared_name: bool) {
     rig.run_ok();
     assert_eq!(ids(first.path()), (101..=110).collect::<Vec<_>>());
 
-    let rig = if shared_name {
+    let rig = if shared_name && state_url_under_test().is_some() {
         rig_for("lo", second.path())
     } else {
         rig.repoint("lo").dest_path(second.path().to_path_buf())
