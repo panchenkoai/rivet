@@ -1760,6 +1760,10 @@ jobs:
         # holds on the stand; the cause is open. The release gate runs every one of them
         # (REPLICA_CELLS, verify_cdc_standby, verify_audit_suspects, the derived
         # live-module cell) and FAILS when their stand is down.
+        #
+        # `open_defect_` is the one term for every cell that pins an OPEN product defect:
+        # it asserts the correct behaviour, so it fails until the fix lands, and only the
+        # release gate can read that as an acknowledged red (dev/release_oracle/known_red.py).
         run: >-
           cargo nextest run --archive-file "$RUNNER_TEMP/e2e-nextest.tar.zst"
           --extract-to "$GITHUB_WORKSPACE" --extract-overwrite
@@ -1773,6 +1777,7 @@ jobs:
           --skip cleanup_source_never_deletes_parts --skip compact_after_a_source_alter
           --skip a_non_unicode_database_round_trips
           --skip a_read_blocked_longer_than_thirty_seconds_still_completes
+          --skip open_defect_
 
       - name: Kernel OOM kills (on failure)
         # A process the kernel kills leaves no stderr of its own; the kernel log names it.

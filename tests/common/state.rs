@@ -372,6 +372,47 @@ pub fn clear_cdc_snapshot(cfg: &std::path::Path, export: &str, dest: &str) -> u6
     }
 }
 
+/// `export`'s `run_status` statuses (oldest first) and its stored cursor, from the backend the run used.
+pub fn run_statuses_and_cursor(
+    cfg: &std::path::Path,
+    export: &str,
+) -> (Vec<String>, Option<String>) {
+    const RUNS: &str =
+        "SELECT status FROM run_status WHERE export_name = $1 ORDER BY started_at, run_id";
+    const CURSOR: &str = "SELECT last_cursor_value FROM export_state WHERE export_name = $1";
+    match state_url_under_test() {
+        Some(url) => {
+            let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap_or_else(|e| {
+                panic!("connect to the Postgres state at RIVET_GATE_STATE_URL: {e}")
+            });
+            let runs = client
+                .query(RUNS, &[&export])
+                .expect("query run_status")
+                .iter()
+                .map(|r| r.get::<_, String>(0))
+                .collect();
+            let cursor = client
+                .query_opt(CURSOR, &[&export])
+                .expect("query export_state")
+                .and_then(|r| r.get::<_, Option<String>>(0));
+            (runs, cursor)
+        }
+        None => {
+            let db = StateDb::next_to_config(cfg);
+            let mut stmt = db
+                .conn
+                .prepare(&RUNS.replace("$1", "?1"))
+                .expect("prepare run_status query");
+            let runs = stmt
+                .query_map([export], |r| r.get::<_, String>(0))
+                .expect("query run_status")
+                .map(|r| r.expect("run_status.status"))
+                .collect();
+            (runs, db.cursor_value(export))
+        }
+    }
+}
+
 /// `load_run.status` for `target_table`, oldest first, from the backend the run
 /// USED: Postgres when `RIVET_STATE_URL` names one (the gate's Postgres pass sets
 /// it for every cell), else the SQLite file beside `cfg`. Reading the SQLite file

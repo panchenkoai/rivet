@@ -585,6 +585,163 @@ fn parallel_keyset_then_resume_mongo() {
     mongo_switch_to_resume(Some("page_size: 4"), true, Expect::FullPass);
 }
 
+/// Run after an identity change: true when it refused loudly, naming `state reset`.
+fn refused(rig: &Rig) -> bool {
+    let run = rig.run();
+    if run.status.success() {
+        return false;
+    }
+    let said = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        said.contains("state reset"),
+        "a refusal must name `state reset`:\n{said}"
+    );
+    true
+}
+
+/// P-22: a parallel keyset run resumed after a crash stores the highest key it delivered.
+fn resumed_parallel_keyset_then_incremental(e: SqlEngine) {
+    e.alive();
+    let (table, _guard) = e.table("mode_transition");
+    e.insert(&table, 1..=300, 180, Some(10));
+    e.insert(&table, 400..=400, 180, Some(10));
+    let (first, second) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let parallel = Stage(
+        "chunked",
+        &[
+            "chunk_by_key: id",
+            "chunk_size: 4",
+            "parallel: 4",
+            "chunk_checkpoint: true",
+        ],
+    );
+    let rig = staged(e.rig(&table), &parallel, first.path());
+    let crash = rig.run_with_env("RIVET_TEST_PANIC_AT", "keyset_parallel_range_committed:3");
+    assert!(!crash.status.success(), "the injected crash must stop it");
+    rig.run_ok();
+    assert_eq!(
+        read_ids(first.path()).len(),
+        301,
+        "the resumed run delivers every row"
+    );
+
+    let rig = continued(staged(rig, &INCREMENTAL_ID, second.path()));
+    rig.run_ok();
+    let again = read_ids(second.path());
+    assert!(
+        again.is_empty(),
+        "P-22: a resumed parallel keyset run stored a cursor below its own maximum: incremental on the key re-delivered {} row(s) up to id {}",
+        again.len(),
+        again.last().unwrap_or(&0)
+    );
+}
+
+/// An edited `query:` filter under the same FROM is another stream: refused, or its own rows in full.
+fn incremental_query_filter_edited(e: SqlEngine) {
+    e.alive();
+    let (table, _guard) = e.table("mode_transition");
+    e.insert(&table, 1..=5, 180, Some(0));
+    e.insert(&table, 6..=10, 180, Some(1));
+    let (first, second) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let filtered =
+        |spent: i32| format!("SELECT id, time_spent FROM {table} WHERE time_spent = {spent}");
+
+    let rig = staged(
+        e.rig(&table).query(&filtered(1)),
+        &INCREMENTAL_ID,
+        first.path(),
+    );
+    rig.run_ok();
+    assert_eq!(read_ids(first.path()), (6..=10).collect::<Vec<_>>());
+
+    let rig = staged(rig.query(&filtered(0)), &INCREMENTAL_ID, second.path());
+    if !refused(&rig) {
+        let ids = read_ids(second.path());
+        assert!(
+            ids == (1..=5).collect::<Vec<_>>(),
+            "an edited query filter inherited the old filter's cursor: the run delivered ids {ids:?} of 1..=5 with exit 0"
+        );
+    }
+}
+
+struct PgSchema(String);
+
+impl Drop for PgSchema {
+    fn drop(&mut self) {
+        if let Ok(mut c) = postgres::Client::connect(POSTGRES_URL, postgres::NoTls) {
+            let _ = c.batch_execute(&format!("DROP SCHEMA IF EXISTS {} CASCADE", self.0));
+        }
+    }
+}
+
+#[test]
+#[ignore = "live+gate-only: postgres; open defect P-22, acknowledged in dev/release_oracle/known_red.py"]
+fn open_defect_resumed_parallel_keyset_then_incremental_postgres() {
+    resumed_parallel_keyset_then_incremental(SqlEngine::Pg);
+}
+
+#[test]
+#[ignore = "live+gate-only: postgres; open defect P-18, acknowledged in dev/release_oracle/known_red.py"]
+fn open_defect_source_url_without_its_default_port_continues_postgres() {
+    let e = SqlEngine::Pg;
+    e.alive();
+    let (table, _guard) = e.table("mode_transition");
+    e.insert(&table, 1..=10, 180, Some(10));
+    let (first, second) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let rig = staged(e.rig(&table), &INCREMENTAL_ID, first.path());
+    rig.run_ok();
+    assert_eq!(read_ids(first.path()), (1..=10).collect::<Vec<_>>());
+
+    e.insert(&table, 11..=13, 170, Some(10));
+    let respelled = POSTGRES_URL.replace(":5432", "");
+    assert_ne!(
+        respelled, POSTGRES_URL,
+        "the stand URL names the default port"
+    );
+    let rig = continued(staged(rig, &INCREMENTAL_ID, second.path()).source_url(&respelled));
+    rig.run_ok();
+    let ids = read_ids(second.path());
+    assert!(
+        ids == vec![11, 12, 13],
+        "P-18: the source URL without its default port lost the cursor: the run delivered ids {ids:?}, the delta is [11, 12, 13]"
+    );
+}
+
+#[test]
+#[ignore = "live+gate-only: postgres; open defect (cursor identity, search_path), acknowledged in dev/release_oracle/known_red.py"]
+fn open_defect_same_table_in_another_schema_is_another_stream_postgres() {
+    let e = SqlEngine::Pg;
+    e.alive();
+    let (table, _guard) = e.table("mode_transition");
+    e.insert(&table, 1..=10, 180, Some(10));
+    let schema = PgSchema(unique_name("mt_schema"));
+    e.exec(&format!(
+        "CREATE SCHEMA {s}; CREATE TABLE {s}.{table} (LIKE public.{table} INCLUDING ALL); \
+         INSERT INTO {s}.{table} SELECT * FROM public.{table} WHERE id <= 7",
+        s = schema.0
+    ));
+    let (first, second) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let rig = staged(e.rig(&table), &INCREMENTAL_ID, first.path());
+    rig.run_ok();
+    assert_eq!(read_ids(first.path()), (1..=10).collect::<Vec<_>>());
+
+    let elsewhere = format!("{POSTGRES_URL}?options=-csearch_path%3D{}", schema.0);
+    let rig = staged(rig, &INCREMENTAL_ID, second.path()).source_url(&elsewhere);
+    if !refused(&rig) {
+        let ids = read_ids(second.path());
+        assert!(
+            ids == (1..=7).collect::<Vec<_>>(),
+            "the same table name in another schema inherited the cursor: the run delivered ids {ids:?} of 1..=7 with exit 0"
+        );
+    }
+}
+
+#[test]
+#[ignore = "live+gate-only: postgres; open defect (cursor identity, edited query), acknowledged in dev/release_oracle/known_red.py"]
+fn open_defect_incremental_query_filter_edited_postgres() {
+    incremental_query_filter_edited(SqlEngine::Pg);
+}
+
 const STREAM_CODE: &str = "RIVET_STATE_CURSOR_STREAM_MISMATCH";
 
 /// Two runs in a row refuse with the stream code (exit 5) naming both streams, and write nothing to `out`.

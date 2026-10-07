@@ -248,6 +248,15 @@ scenarios:
     mongo_parallel: { test: quality_gate_fails_a_short_mongo_parallel_export }
     cdc:            { na: "not applied on the drain by design — the gate lives at the finalize_export seam, which CDC returns before; the run warns when `quality:` is set (cdc_ignored_knobs_warning, pinned by cdc_names_every_batch_only_knob_it_ignores_and_only_those and the live a_cdc_export_names_the_batch_knobs_its_drain_ignores)" }
 
+  - id: refused_run_keeps_refusing
+    what: "a run a post-data gate refused (quality content rule, on_schema_drift: fail) refuses again on every re-run until the cause is fixed: the next run must READ the rows again, never adopt the refused run's checkpoint and grade nothing. Three cycles, then the remedy, re-reading the destination and the state store (exit, _SUCCESS, declared rows, run_status, cursor)."
+    single:         { na: "no checkpoint: every run reads the source again, so the gate grades every run" }
+    chunked:        { na: "no checkpoint: every run reads the source again, so the gate grades every run" }
+    chunked_checkpoint: { test: a_refused_chunked_checkpoint_run_keeps_refusing_a_duplicate_postgres, note: "both checkpoint runners close their chunk_run when the last chunk lands, before the gate: the next run plans afresh. Parallel: a_refused_parallel_chunked_checkpoint_run_keeps_refusing_a_duplicate_postgres" }
+    keyset:         { test: a_refused_parallel_keyset_checkpoint_run_keeps_refusing_a_duplicate_postgres, note: "the anchor is released at the dispatcher (job.rs finalize_keyset_anchor) for parallel + checkpoint, sequential keyset_incremental and parallel keyset_incremental; one cell per shape and gate (duplicate, null ratio, schema drift) on PostgreSQL, the two affected shapes on MySQL / SQL Server / Oracle; sequential + checkpoint releases at data-complete (a_refused_keyset_checkpoint_run_keeps_refusing_a_duplicate_postgres)" }
+    mongo_parallel: { na: "no checkpoint: mongo_parallel.rs persists no ranges and no anchor, so every run reads the collection again" }
+    cdc:            { na: "the quality gate is not applied on the drain (see quality_gates), and a schema-drift refusal happens before any change is read" }
+
   - id: shape_drift_warn
     what: "detect_shape_drift — advisory warning when a string/binary column's max byte length grows past the factor. Applied once at the finalize_export seam from the ledger's max-merged shape bytes; every runner feeds its sinks' bytes (Observations via take_observations / take_shape). Each test widens ONE row in a MIDDLE chunk/page/range, so a runner that fed only its first or only its last sink stays RED."
     single:         { test: shape_drift_warns_on_the_single_runner }

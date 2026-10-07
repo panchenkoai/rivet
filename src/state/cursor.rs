@@ -115,6 +115,14 @@ impl ProgressClaim<'_> {
             .get_owned(&self.key.export_name, &self.key.source, column)
     }
 
+    /// Whether the stored cursor is the high-water key of a page `run_id` committed.
+    pub fn cursor_is_a_page_of(&self, run_id: &str) -> Result<bool> {
+        match self.cursor()?.last_cursor_value {
+            Some(v) => self.state.is_committed_cursor_high(run_id, &v),
+            None => Ok(false),
+        }
+    }
+
     /// The interrupted run this stream is anchored on, or `None` when no run is in progress.
     pub fn resume_run_id(&self) -> Result<Option<String>> {
         self.state

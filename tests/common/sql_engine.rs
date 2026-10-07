@@ -326,3 +326,20 @@ pub fn read_id_spent(out: &Path) -> Vec<(i64, Option<i32>)> {
 pub fn read_ids(out: &Path) -> Vec<i64> {
     read_id_spent(out).into_iter().map(|r| r.0).collect()
 }
+
+/// Sorted `id` values of `batches`.
+pub fn ids_of(batches: &[arrow::record_batch::RecordBatch]) -> Vec<i64> {
+    let mut ids: Vec<i64> = batches
+        .iter()
+        .flat_map(|b| {
+            let col = b.column_by_name("id").expect("an id column");
+            let col = col
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("a BIGINT id");
+            col.values().to_vec()
+        })
+        .collect();
+    ids.sort();
+    ids
+}

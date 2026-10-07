@@ -155,3 +155,40 @@ fn run_unknown_export_lists_available_names() {
         "run --export <typo> must enumerate the known export names just like check; got:\n{combined}"
     );
 }
+
+/// `apply --pool` on a stdout export writes the export alone on stdout.
+#[test]
+#[ignore = "live+gate-only: postgres; open defect (apply --pool on a stdout export), acknowledged in dev/release_oracle/known_red.py"]
+fn open_defect_apply_pool_writes_only_the_export_on_stdout() {
+    require_alive(LiveService::Postgres);
+    let table = seed_pg_numeric_table(5);
+    let rig = Rig::pg_batch(table.name())
+        .query(&format!("SELECT id, name FROM {}", table.name()))
+        .with_format("csv")
+        .dest_stdout();
+    let applied = rig.apply_env(&rig.config_path(), &["--pool", "2"], &[]);
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&applied.stdout);
+    let id_of = |line: &str| line.split(',').next().and_then(|c| c.parse::<i64>().ok());
+    let mut delivered: Vec<i64> = stdout.lines().filter_map(id_of).collect();
+    delivered.sort();
+    let source: Vec<i64> = pg_connect()
+        .query(&format!("SELECT id FROM {} ORDER BY id", table.name()), &[])
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_eq!(delivered, source, "the export's rows are on stdout");
+    let foreign = stdout
+        .lines()
+        .filter(|l| *l != "id,name" && id_of(l).is_none())
+        .count();
+    assert!(
+        foreign == 0,
+        "`apply --pool` wrote {foreign} line(s) of its own into a stdout export"
+    );
+}
