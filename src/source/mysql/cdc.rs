@@ -3124,3 +3124,109 @@ impl CheckpointIdentity {
         }
     }
 }
+
+#[cfg(test)]
+mod refusal_text_tests {
+    use super::*;
+    use crate::source::cdc::checkpoint_identity::RECOVER;
+
+    fn target(schema: &str, table: &str) -> Option<(String, String)> {
+        Some((schema.to_string(), table.to_string()))
+    }
+
+    /// A DROP refusal names the table, says why skipping is wrong, and ends in the recovery steps.
+    #[test]
+    fn a_drop_refusal_names_the_table_the_harm_and_the_recovery() {
+        let said = drop_refusal_message(target("shop", "orders").as_ref());
+        assert!(
+            said.starts_with("mysql cdc: captured table `shop.orders` was DROPped"),
+            "{said}"
+        );
+        assert!(
+            said.contains("leave every row it held live in the destination"),
+            "{said}"
+        );
+        assert!(said.ends_with(RECOVER), "{said}");
+        let bare = drop_refusal_message(target("", "orders").as_ref());
+        assert!(
+            bare.contains("captured table `orders` was DROPped"),
+            "{bare}"
+        );
+        let unknown = drop_refusal_message(None);
+        assert!(
+            unknown.contains("a table this reader could not identify"),
+            "{unknown}"
+        );
+        assert!(unknown.ends_with(RECOVER), "{unknown}");
+    }
+
+    /// A statement-logged change names the table, the setting to change, and the recovery steps.
+    #[test]
+    fn a_statement_logged_change_names_the_table_the_setting_and_the_recovery() {
+        let said = statement_dml_refusal_message(target("shop", "orders").as_ref());
+        assert!(
+            said.starts_with(
+                "mysql cdc: a change to `shop.orders` was written to the binlog as a SQL STATEMENT"
+            ),
+            "{said}"
+        );
+        assert!(
+            said.contains("Set binlog_format=ROW for every writer"),
+            "{said}"
+        );
+        assert!(
+            said.contains("drop the change while the checkpoint moves past it"),
+            "{said}"
+        );
+        assert!(said.ends_with(RECOVER), "{said}");
+        let bare = statement_dml_refusal_message(target("", "orders").as_ref());
+        assert!(bare.contains("a change to `orders` was written"), "{bare}");
+        let unknown = statement_dml_refusal_message(None);
+        assert!(
+            unknown.contains("a table this reader could not identify"),
+            "{unknown}"
+        );
+    }
+
+    /// A TRUNCATE refusal names the table, says the destination would keep the rows, and ends in the recovery steps.
+    #[test]
+    fn a_truncate_refusal_names_the_table_the_harm_and_the_recovery() {
+        let said = truncate_refusal_message("shop", "orders");
+        assert!(
+            said.starts_with("mysql cdc: `shop.orders` was TRUNCATEd"),
+            "{said}"
+        );
+        assert!(said.contains("with no DELETE to retract it"), "{said}");
+        assert!(said.ends_with(RECOVER), "{said}");
+        let bare = truncate_refusal_message("", "orders");
+        assert!(
+            bare.starts_with("mysql cdc: `orders` was TRUNCATEd"),
+            "{bare}"
+        );
+    }
+
+    /// An XA PREPARE refusal names the table, says a re-run does not clear it, and gives both ways out.
+    #[test]
+    fn an_xa_prepare_refusal_names_the_table_that_a_rerun_will_not_help_and_the_ways_out() {
+        let said = xa_prepare_refusal_message("shop", "orders");
+        assert!(said.starts_with("mysql cdc: `shop.orders` was written inside an XA transaction that reached `XA PREPARE`"), "{said}");
+        assert!(
+            said.contains("the run stops with the checkpoint unmoved"),
+            "{said}"
+        );
+        assert!(said.contains("This does NOT clear by re-running"), "{said}");
+        assert!(
+            said.contains(&format!("To move past it: {RECOVER} To avoid it")),
+            "{said}"
+        );
+        assert!(
+            said.contains("exported with `mode: full` meanwhile"),
+            "{said}"
+        );
+        let bare = xa_prepare_refusal_message("", "orders");
+        assert!(
+            bare.starts_with("mysql cdc: `orders` was written inside an XA transaction"),
+            "{bare}"
+        );
+    }
+}
