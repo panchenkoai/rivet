@@ -160,7 +160,9 @@ const MATRICES: &[(&str, usize)] = &[
     // Lowered 20 -> 5 (2026-09-29): Oracle CDC shipped (#324); its live tests fill the cells.
     // Raised 5 -> 6 (2026-10-02): the new failover row's Oracle cell is an honest gap (no Data
     // Guard stand), recorded rather than left out of the matrix.
-    ("docs/cdc-matrix.yaml", 6),
+    // Raised 6 -> 7 (2026-10-07): the new log-gone-before-the-first-changes-run row's MongoDB
+    // cell is an honest gap (an oplog rollover cannot be forced on the stand).
+    ("docs/cdc-matrix.yaml", 7),
     // Resilience / crash-recovery (BATCH + cross-cutting). Both Mongo holes closed:
     // batch-clobber filled with a live test; crash-after-source-read is na (that
     // hook is single.rs-only, and Mongo runs the keyset path).

@@ -3195,3 +3195,48 @@ fn mssql_a_never_changed_table_is_not_refused_after_cleanup_passes_its_anchor() 
         "the change made after the cleanup is delivered"
     );
 }
+
+/// An anchor written by rivet 0.31 or older (`"pinned": true`) below the instance's start: adopted once, with the warning.
+#[test]
+#[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC + the rivet-duckdb oracle"]
+fn mssql_a_legacy_pinned_anchor_below_the_instance_start_is_adopted_with_a_warning() {
+    const WARNING: &str = "mssql cdc: this checkpoint is an anchor written by rivet 0.31 or \
+        older, and it is below the capture instance's start. That is normal for an instance enabled \
+        just before the anchor, or cleaned up while the table was quiet; it is also what a cleanup \
+        past unread changes, or a re-created capture instance, looks like, and this checkpoint \
+        cannot tell them apart. Reading from the instance's start. If the capture instance was \
+        re-created, or rivet did not run for longer than the CDC retention since the baseline, \
+        changes may be missing: re-baseline the stream. Later runs refuse such a gap.";
+    let _serial = cross_process_serial("mssql_cdc");
+    let mut s = CdcScenario::mssql_with("cdc_pinlegacy", "id INT PRIMARY KEY, v INT", |r, _| {
+        r.cdc("initial: snapshot").cdc("until_current: true")
+    });
+    s.rig.run_ok();
+    let ckpt = s.rig.checkpoint();
+    let mut j: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&ckpt).unwrap()).unwrap();
+    j["lsn"] = "00000000000000000001".into();
+    j["pinned"] = true.into();
+    std::fs::write(&ckpt, j.to_string()).unwrap();
+    s.insert(1);
+    s.settle();
+    let said = s.rig.run_ok_capture();
+    assert!(
+        said.contains(WARNING),
+        "the adoption is said, once:\n{said}"
+    );
+    assert_eq!(
+        duckdb_dir_scalar(
+            &s.rig.out_dir(),
+            "count(DISTINCT id)",
+            Some("__op = 'insert'")
+        ),
+        s.count(),
+        "the row inserted after the legacy anchor is delivered"
+    );
+    let again = s.rig.run_ok_capture();
+    assert!(
+        !again.contains("anchor written by rivet 0.31 or older"),
+        "the checkpoint the adopting run wrote is an ordinary position:\n{again}"
+    );
+}

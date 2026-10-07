@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- **Breaking: SQL Server CDC refuses a log gap from the first run after the baseline.**
+  Applies to a `mode: cdc` SQL Server export with `cdc.initial: snapshot`.
+  - Before, the checkpoint the baseline wrote (`"pinned": true`) could sit below the capture
+    instance's start, and a run moved such a position up to the start. If the change table lost
+    rows before the first run that read a change (retention cleanup past them, or the capture
+    instance disabled and re-enabled, which is also the remedy the ADD COLUMN refusal names),
+    the next runs ended with exit 0 and those changes were never delivered.
+  - Now the baseline's anchor is always inside the capture instance's lifetime, and any resume
+    position below the instance's `start_lsn` is refused: exit 5 `RIVET_SOURCE_CDC_LOG_GAP`
+    with the re-baseline remedy, on every run until the stream is re-baselined. An idle run now
+    moves a baseline-only checkpoint forward like any other, so a quiet table is not refused
+    when the cleanup job passes its anchor.
+  - Upgrading: a checkpoint that already read a change needs nothing. A baseline-only
+    checkpoint written by 0.31 or earlier that is below the instance's start gets the old
+    behaviour once: the first run on the new version reads from the instance's start, warns
+    ("this checkpoint is an anchor written by rivet 0.31 or older ..."), and writes an ordinary
+    checkpoint; later gaps are refused. That one run cannot tell a harmless anchor from a gap
+    that already happened. If the capture instance was re-created, or rivet did not run for
+    longer than the CDC retention since the baseline, re-baseline the stream.
+
 - **Breaking: a keyset run that a gate refused is read again, not adopted, by the next run.**
   Applies to `chunk_by_key` with `parallel: N` + `chunk_checkpoint: true`, and to
   `keyset_incremental: true` (sequential or parallel), when a `quality:` content rule

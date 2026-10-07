@@ -515,3 +515,25 @@ seeds:
       lib:
         cells:
           - "lib:child_processes_take_the_declared_exports_unless_one_writes_to_stdout"
+
+  - name: position-below-log-start-moved-up
+    class: a resume position below the log's low watermark is moved up to it instead of refused, so the changes in between are skipped under exit 0
+    history: "SQL Server: a `pinned` anchor below fn_cdc_get_min_lsn was floored to the capture instance's start; cleanup past unread changes, or a re-created instance, before the first changes run lost them (v0.31.0)"
+    scope: source
+    engines:
+      postgres:
+        na: "the seed is SQL Server's poll statement; this engine has no change-table low watermark to move a position up to"
+      mysql:
+        na: "the seed is SQL Server's poll statement; this engine has no change-table low watermark to move a position up to"
+      mssql:
+        patch: position-below-log-start-moved-up/mssql.patch
+        cells:
+          - mssql_cleanup_past_unread_changes_before_the_first_changes_run_is_refused
+          - mssql_capture_instance_recreated_before_the_first_changes_run_is_refused
+          - mssql_add_column_remedy_before_the_first_changes_run_ends_in_the_log_gap_refusal
+      mongo:
+        na: "the seed is SQL Server's poll statement; this engine has no change-table low watermark to move a position up to"
+      oracle:
+        na: "the seed is SQL Server's poll statement; this engine has no change-table low watermark to move a position up to"
+      lib:
+        cells: ["lib:a_position_below_the_low_watermark_always_reaches_the_refusal"]

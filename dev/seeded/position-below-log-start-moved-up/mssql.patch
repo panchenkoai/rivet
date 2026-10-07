@@ -1,0 +1,12 @@
+diff --git a/src/source/mssql/cdc.rs b/src/source/mssql/cdc.rs
+index ab3a7640..d5e88145 100644
+--- a/src/source/mssql/cdc.rs
++++ b/src/source/mssql/cdc.rs
+@@ -200,6 +200,7 @@ fn fill_sql(p: Poll<'_>) -> String {
+          DECLARE @min binary(10) = (SELECT start_lsn FROM cdc.change_tables \
+              WHERE capture_instance = '{ci}'); \
+          DECLARE @max binary(10) = {max_expr}; \
++         IF @from IS NOT NULL AND @min IS NOT NULL AND @from < @min SET @from = @min; \
+          IF @from IS NOT NULL AND @min IS NOT NULL AND @from < @min \
+             THROW {RETENTION_GAP_ERROR}, 'rivet cdc: the resume position is older than the SQL Server \
+ CDC change-table retention (the cleanup job removed it). Resuming would silently skip changes. {recover}', 1; \
