@@ -123,8 +123,9 @@ impl StateDb {
 
     /// The `load_run.status` of every load into `target_table`, oldest first — in
     /// the SQLite file this handle opened. Tests call [`ledger_load_statuses`],
-    /// which reads the backend the binary actually wrote.
-    fn load_statuses(&self, target_table: &str) -> Vec<String> {
+    /// which reads the backend the binary actually wrote; only a cell that pins
+    /// `RIVET_STATE_URL` empty on every invocation reads this file directly.
+    pub fn load_statuses(&self, target_table: &str) -> Vec<String> {
         let mut stmt = self
             .conn
             .prepare("SELECT status FROM load_run WHERE target_table = ?1 ORDER BY finished_at")

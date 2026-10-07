@@ -268,6 +268,12 @@ scenarios:
     snowflake:  { test: an_append_refuses_a_foreign_view_or_log_on_every_cycle_and_writes_nothing }
     clickhouse: { test: an_append_refuses_a_foreign_view_or_log_on_every_cycle_and_writes_nothing }
 
+  - id: own_view_and_log_from_another_state_db_refused_every_cycle
+    what: "rivet's OWN view and change log met by the same export from a state DB that never recorded them (a moved config, a lost `.rivet_state.db`): refused on every cycle with exit 5 and `RIVET_LOAD_TARGET_NOT_RIVETS`, both objects untouched, only `refused` journaled; there is no adopt path. The ledger cannot tell this from a foreign object, so BigQuery and Snowflake cite the foreign-object cells; the ClickHouse cell is live and has a CDC sibling, `a_cdc_load_from_another_state_db_refuses_rivets_own_view_and_log_every_cycle`"
+    bigquery:   { test: bigquery_incremental_onto_a_view_or_a_log_it_did_not_load_is_refused_every_time }
+    snowflake:  { test: an_append_refuses_a_foreign_view_or_log_on_every_cycle_and_writes_nothing }
+    clickhouse: { test: an_incremental_load_from_another_state_db_refuses_rivets_own_view_and_log_every_cycle }
+
   - id: buffer_append_beside_a_foreign_base_refused
     what: "a base-and-buffer load whose deltas arrive without a whole-table pass does not create or append `<table>__changes` beside a base (or onto a buffer) the ledger does not know"
     bigquery:   { test: a_buffer_append_onto_a_base_or_buffer_the_ledger_has_no_record_of_is_refused }
