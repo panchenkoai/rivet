@@ -290,6 +290,11 @@ const MATRICES: &[(&str, usize)] = &[
     // Raised 17 -> 26 (2026-10-07): three open-defect rows (P-18, P-22, an edited query filter) are
     // pinned on PostgreSQL only; their MySQL, SQL Server and Oracle cells are gaps.
     ("docs/mode-transition-matrix.yaml", 26),
+    // Operator contract: the 2026-10-07 CLI sweep by hand, one row per finding, each cell
+    // asserting the correct behaviour (open defects acknowledged in known_red.py). The gaps are
+    // cells not written: four findings with no rig entry point yet, the Oracle range-chunk
+    // cells, and the Mongo and CDC twins the sweep saw but this pass did not write.
+    ("docs/operator-contract-matrix.yaml", 46),
     // Pool-split — `apply --pool --split` per (strategy × source engine). Split is a
     // scheduler layer above the runners (each unit runs through chunked/keyset), so its
     // per-engine behaviour (boundary probe, crash-recovery, finding-2 exact-partition

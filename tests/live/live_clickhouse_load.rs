@@ -630,10 +630,7 @@ fn a_load_from_another_state_db_is_refused_every_cycle(
     let said = other.refuses_twice_then(
         &["load"],
         &env,
-        Refused {
-            code: "RIVET_LOAD_TARGET_NOT_RIVETS",
-            exit: 5,
-        },
+        Refused::by_code("RIVET_LOAD_TARGET_NOT_RIVETS", 5),
         vec![],
     );
     assert!(

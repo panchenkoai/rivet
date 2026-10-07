@@ -743,10 +743,7 @@ fn open_defect_incremental_query_filter_edited_postgres() {
 }
 
 const STREAM_CODE: &str = "RIVET_STATE_CURSOR_STREAM_MISMATCH";
-const STREAM_REFUSED: Refused = Refused {
-    code: STREAM_CODE,
-    exit: 5,
-};
+const STREAM_REFUSED: Refused = Refused::by_code(STREAM_CODE, 5);
 /// The stream refusal's remedy for two exports that share a name.
 const OWN_NAMES: &str = "two exports sharing a name in one state database need their own names";
 

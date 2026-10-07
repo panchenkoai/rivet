@@ -38,7 +38,7 @@ const NO_ORACLE_CEILING: usize = 23; // ratchet-pin: no-oracle-opt-outs
 const FAILED_RUN_LEFTOVER_CEILING: usize = 36; // ratchet-pin: failed-run-leftover-declarations
 
 /// Entries of `KNOWN_PRODUCT_DEFECTS` (tests/common/refusal.rs): product defects every failed run may show.
-const KNOWN_PRODUCT_DEFECT_CEILING: usize = 1; // ratchet-pin: failed-run-known-product-defects
+const KNOWN_PRODUCT_DEFECT_CEILING: usize = 2; // ratchet-pin: failed-run-known-product-defects
 
 /// Rust DuckDB-helper call sites across tests/ (see [`duckdb_helper_names`]).
 // 626 -> 630 (2026-10-01): #378 merged first and added 4 calls in its Mongo null-_id tests.
@@ -162,6 +162,23 @@ fn failed_run_leftover_declarations_never_grow() {
     );
 }
 
+/// Refusals the live cells accept with no `RIVET_*` code (`Refused::uncoded_known_defect(`): each is a code the registry owes.
+const UNCODED_REFUSAL_CEILING: usize = 3; // ratchet-pin: uncoded-refusals
+
+#[test]
+fn uncoded_refusals_the_cells_accept_never_grow() {
+    let n: usize = sources()
+        .iter()
+        .filter(|(rel, _)| rel.starts_with("tests/live/"))
+        .map(|(_, t)| t.matches("Refused::uncoded_known_defect(").count())
+        .sum();
+    assert_eq!(
+        n, UNCODED_REFUSAL_CEILING,
+        "refusals accepted with no RIVET_* code (`Refused::uncoded_known_defect(`): {n}, ceiling {UNCODED_REFUSAL_CEILING}. \
+         A refusal is expected by code; a coded one lowers the ceiling here."
+    );
+}
+
 #[test]
 fn known_product_defects_of_a_failed_run_never_grow() {
     let srcs = sources();
@@ -255,6 +272,16 @@ const KNOWN_DEFECTS: &[(&str, &str, &str)] = &[
         "roast_resume_must_not_bypass_heterogeneous_id_guard",
         "a failed run left: resume-point",
         "known defect: a resumed keyset run the heterogeneous-_id guard refuses has already written its claim (resume_run_id, resume_owner) on the cursor row; the guard must come before the claim",
+    ),
+    (
+        "mongo_heterogeneous_resume_remedy",
+        "a failed run left: resume-point",
+        "known defect: a resumed keyset run the heterogeneous-_id guard refuses has already written its claim (resume_run_id, resume_owner) on the cursor row; the guard must come before the claim",
+    ),
+    (
+        "pg_cdc_missing_table_leaves_no_slot",
+        "a failed run left: chunk-checkpoint",
+        "known defect: a PostgreSQL CDC run refused for a table that does not exist has already stored its export_state row and created its slot",
     ),
 ]; // ratchet-pin: end
 

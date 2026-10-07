@@ -21,7 +21,7 @@ pub use invoke::Spawned;
 mod materialize;
 mod oracle;
 mod remedy;
-pub use remedy::{Refused, Remedy, Then};
+pub use remedy::{Refused, Remedy, Then, assert_refused};
 mod render;
 mod verify;
 

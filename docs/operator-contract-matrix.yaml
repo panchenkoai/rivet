@@ -1,0 +1,193 @@
+# Operator-contract matrix. What rivet's exit code, refusal text and advice commands promise an
+# operator, from the 2026-10-07 CLI sweep by hand (RESULTS.md and the two sweep reports). Each
+# cell asserts the correct behaviour (tests/live/live_operator_contract.rs); an `open_defect_*`
+# cell fails today and is acknowledged in dev/release_oracle/known_red.py with the symptom it shows.
+# Patterns: (a) exit 0 over a wrong destination, (b) a failure before the first write, (c) refusal
+# then remedy (Rig::refuses_twice_then), (d) the exit-code contract, (e) advice parity, (f) single rows.
+
+engines: [postgres, mysql, mssql, mongo, oracle]
+
+scenarios:
+  - id: stale_chunk_checkpoint
+    what: "RESULTS 1: a chunk checkpoint older than the last finished run is not resumed"
+    postgres: { test: open_defect_a_stale_chunk_checkpoint_is_not_adopted_after_a_finished_run_postgres }
+    mysql:    { test: open_defect_a_stale_chunk_checkpoint_is_not_adopted_after_a_finished_run_mysql }
+    mssql:    { test: open_defect_a_stale_chunk_checkpoint_is_not_adopted_after_a_finished_run_mssql }
+    mongo:    { gap: "a Mongo export has no chunk checkpoint (mode: full or cdc only)" }
+    oracle:   { gap: "range chunking refuses an Oracle NUMBER(19) key as not integer-family, so this range-checkpoint cell cannot run there; the keyset-checkpoint twin is not written" }
+
+  - id: run_validate_exit
+    what: "RESULTS 2: `run --validate` does not exit 0 over `validated: FAIL`"
+    postgres: { test: open_defect_run_validate_does_not_exit_0_over_a_failed_validation_postgres }
+    mysql:    { test: open_defect_run_validate_does_not_exit_0_over_a_failed_validation_mysql }
+    mssql:    { test: open_defect_run_validate_does_not_exit_0_over_a_failed_validation_mssql }
+    mongo:    { gap: "not run on MongoDB in the sweep; the cell is not written" }
+    oracle:   { test: open_defect_run_validate_does_not_exit_0_over_a_failed_validation_oracle }
+
+  - id: read_only_state
+    what: "RESULTS 3: an incremental run that cannot store its cursor does not exit 0"
+    postgres: { test: open_defect_a_run_that_cannot_store_its_cursor_does_not_exit_0_postgres }
+    mysql:    { test: open_defect_a_run_that_cannot_store_its_cursor_does_not_exit_0_mysql }
+    mssql:    { test: open_defect_a_run_that_cannot_store_its_cursor_does_not_exit_0_mssql }
+    mongo:    { gap: "a Mongo export has no incremental cursor; the keyset-resume twin is not written" }
+    oracle:   { test: open_defect_a_run_that_cannot_store_its_cursor_does_not_exit_0_oracle }
+
+  - id: concurrent_full_runs
+    what: "RESULTS 4: a second concurrent `full` run is refused, or the prefix holds each key once"
+    postgres: { test: open_defect_a_second_concurrent_full_run_does_not_double_the_prefix_postgres }
+    mysql:    { test: open_defect_a_second_concurrent_full_run_does_not_double_the_prefix_mysql }
+    mssql:    { test: open_defect_a_second_concurrent_full_run_does_not_double_the_prefix_mssql }
+    mongo:    { gap: "seen on MongoDB in the Mac sweep (concurrent-full:second[mongo]); the cell needs a slowed Mongo read, not written" }
+    oracle:   { test: open_defect_a_second_concurrent_full_run_does_not_double_the_prefix_oracle }
+
+  - id: failed_before_first_write
+    what: "RESULTS 8: a run that fails before its first write leaves the previous `_SUCCESS` and manifest alone"
+    postgres: { test: open_defect_a_run_that_never_connected_keeps_the_export_complete_postgres }
+    mysql:    { test: open_defect_a_run_that_never_connected_keeps_the_export_complete_mysql }
+    mssql:    { test: open_defect_a_run_that_never_connected_keeps_the_export_complete_mssql }
+    mongo:    { test: open_defect_a_run_that_never_connected_keeps_the_export_complete_mongo }
+    oracle:   { test: open_defect_a_run_that_never_connected_keeps_the_export_complete_oracle }
+
+  - id: resume_force_remedy
+    what: "RESULTS 12: `--resume --force` runs over a complete prefix, as the refusal says"
+    postgres: { test: open_defect_resume_force_runs_over_a_complete_prefix_postgres }
+    mysql:    { test: open_defect_resume_force_runs_over_a_complete_prefix_mysql }
+    mssql:    { test: open_defect_resume_force_runs_over_a_complete_prefix_mssql }
+    mongo:    { gap: "`--resume --force` exits 0 on MongoDB in the sweep (RESULTS 12); the cell that holds it there is not written" }
+    oracle:   { gap: "range chunking refuses an Oracle NUMBER(19) key as not integer-family, so this range-checkpoint cell cannot run there; the keyset-checkpoint twin is not written" }
+
+  - id: run_in_progress_code
+    what: "RESULTS 11: a second run beside a live checkpointed run is refused as RIVET_STATE_RUN_IN_PROGRESS (exit 5)"
+    postgres: { test: open_defect_a_second_run_beside_a_live_checkpointed_run_is_refused_by_code_postgres }
+    mysql:    { test: open_defect_a_second_run_beside_a_live_checkpointed_run_is_refused_by_code_mysql }
+    mssql:    { test: open_defect_a_second_run_beside_a_live_checkpointed_run_is_refused_by_code_mssql }
+    mongo:    { gap: "seen on MongoDB in the sweep (RESULTS 11, five engines); the cell needs a slowed Mongo read, not written" }
+    oracle:   { gap: "range chunking refuses an Oracle NUMBER(19) key as not integer-family, so this range-checkpoint cell cannot run there; the keyset-checkpoint twin is not written" }
+
+  - id: plan_unreadable_source
+    what: "RESULTS 10: `plan` over a table that does not exist fails and seals no artifact"
+    postgres: { test: open_defect_plan_fails_over_a_table_that_does_not_exist_postgres }
+    mysql:    { test: open_defect_plan_fails_over_a_table_that_does_not_exist_mysql }
+    mssql:    { test: open_defect_plan_fails_over_a_table_that_does_not_exist_mssql }
+    mongo:    { gap: "seen on five engines in the sweep (RESULTS 10); the Mongo cell is not written" }
+    oracle:   { test: open_defect_plan_fails_over_a_table_that_does_not_exist_oracle }
+
+  - id: unusable_state_url
+    what: "RESULTS 9: a `RIVET_STATE_URL` rivet cannot use is refused"
+    postgres: { test: open_defect_an_unusable_state_url_is_refused_postgres }
+    mysql:    { test: open_defect_an_unusable_state_url_is_refused_mysql }
+    mssql:    { test: open_defect_an_unusable_state_url_is_refused_mssql }
+    mongo:    { gap: "seen on five engines in the sweep (RESULTS 9); the Mongo cell is not written" }
+    oracle:   { test: open_defect_an_unusable_state_url_is_refused_oracle }
+
+  - id: corrupt_checkpoint_remedy
+    what: "RESULTS 13: deleting a corrupt CDC checkpoint accepts a new anchor, as the refusal says"
+    postgres: { na: "deleting the checkpoint works on PostgreSQL: the slot is the anchor (Mac sweep F1)" }
+    mysql:    { test: open_defect_deleting_a_corrupt_cdc_checkpoint_accepts_a_new_anchor_mysql }
+    mssql:    { test: open_defect_deleting_a_corrupt_cdc_checkpoint_accepts_a_new_anchor_mssql }
+    mongo:    { gap: "seen on MongoDB CDC in the devbox sweep; the replica-set cell is not written" }
+    oracle:   { gap: "seen on Oracle CDC in the devbox sweep (p_oracdc4.py); the Oracle CDC cell is not written" }
+
+  - id: corrupt_checkpoint_code
+    what: "a corrupt CDC checkpoint is refused as RIVET_SOURCE_CDC_CHECKPOINT_INVALID (exit 5)"
+    postgres: { gap: "seen on PostgreSQL CDC with a `cdc.checkpoint` in the Mac sweep (cp-garbage[pgcdc]); the cell is not written" }
+    mysql:    { test: open_defect_a_corrupt_cdc_checkpoint_is_refused_by_code_mysql }
+    mssql:    { test: open_defect_a_corrupt_cdc_checkpoint_is_refused_by_code_mssql }
+    mongo:    { gap: "seen on MongoDB CDC in the devbox sweep; the cell is not written" }
+    oracle:   { gap: "seen on Oracle CDC in the devbox sweep; the cell is not written" }
+
+  - id: cdc_truncate_code
+    what: "a TRUNCATE inside the stream is refused as RIVET_SOURCE_CDC_TRUNCATED (exit 5)"
+    postgres: { test: open_defect_a_cdc_truncate_is_refused_by_code_postgres }
+    mysql:    { test: open_defect_a_cdc_truncate_is_refused_by_code_mysql }
+    mssql:    { na: "SQL Server rejects TRUNCATE on a captured table (Msg 4711)" }
+    mongo:    { gap: "a collection drop exits 1 uncoded in the devbox sweep (row 296); the cell is not written" }
+    oracle:   { gap: "oracle already gives the code in the sweep (rows 209, 211); no cell here holds it" }
+
+  - id: dropped_slot_code
+    what: "RESULTS 17: a dropped PostgreSQL slot is refused as RIVET_SOURCE_CDC_LOG_GAP (exit 5)"
+    postgres: { test: open_defect_a_dropped_slot_is_refused_by_code_postgres }
+    mysql:    { gap: "a replication slot is PostgreSQL's; the MySQL sibling (binlog purged past the checkpoint, raw ERROR 1236) needs a server-wide purge and is not written" }
+    mssql:    { gap: "a replication slot is PostgreSQL's; the MySQL sibling (binlog purged past the checkpoint, raw ERROR 1236) needs a server-wide purge and is not written" }
+    mongo:    { gap: "a replication slot is PostgreSQL's; the MySQL sibling (binlog purged past the checkpoint, raw ERROR 1236) needs a server-wide purge and is not written" }
+    oracle:   { gap: "a replication slot is PostgreSQL's; the MySQL sibling (binlog purged past the checkpoint, raw ERROR 1236) needs a server-wide purge and is not written" }
+
+  - id: refused_cdc_run_leaves_a_slot
+    what: "RESULTS 15: a PostgreSQL CDC run refused for a missing table leaves no replication slot"
+    postgres: { test: open_defect_a_refused_cdc_run_on_a_missing_table_leaves_no_slot_postgres }
+    mysql:    { na: "a replication slot is PostgreSQL's server-side anchor; the MySQL sibling (a checkpoint written by a refused run) is the known defect on roast_mysql_cdc_refuses_a_view_whose_binlog_identity_is_the_base_table" }
+    mssql:    { na: "a replication slot is PostgreSQL's server-side anchor; the MySQL sibling (a checkpoint written by a refused run) is the known defect on roast_mysql_cdc_refuses_a_view_whose_binlog_identity_is_the_base_table" }
+    mongo:    { na: "a replication slot is PostgreSQL's server-side anchor; the MySQL sibling (a checkpoint written by a refused run) is the known defect on roast_mysql_cdc_refuses_a_view_whose_binlog_identity_is_the_base_table" }
+    oracle:   { na: "a replication slot is PostgreSQL's server-side anchor; the MySQL sibling (a checkpoint written by a refused run) is the known defect on roast_mysql_cdc_refuses_a_view_whose_binlog_identity_is_the_base_table" }
+
+  - id: doctor_wal_level
+    what: "`doctor` is not green for a CDC export whose server `wal_level` the run refuses"
+    postgres: { test: open_defect_doctor_is_not_green_where_the_cdc_run_refuses_wal_level_postgres }
+    mysql:    { gap: "`wal_level` is PostgreSQL's prerequisite; the sweep's other doctor rows (MySQL replica without log_replica_updates, a ClickHouse load password) are not written" }
+    mssql:    { gap: "`wal_level` is PostgreSQL's prerequisite; the sweep's other doctor rows (MySQL replica without log_replica_updates, a ClickHouse load password) are not written" }
+    mongo:    { gap: "`wal_level` is PostgreSQL's prerequisite; the sweep's other doctor rows (MySQL replica without log_replica_updates, a ClickHouse load password) are not written" }
+    oracle:   { gap: "`wal_level` is PostgreSQL's prerequisite; the sweep's other doctor rows (MySQL replica without log_replica_updates, a ClickHouse load password) are not written" }
+
+  - id: mongo_page_size_remedy
+    what: "RESULTS 14: removing `page_size` after the heterogeneous-`_id` refusal runs the full scan"
+    postgres: { na: "`page_size` and the heterogeneous-`_id` guard are MongoDB's" }
+    mysql:    { na: "`page_size` and the heterogeneous-`_id` guard are MongoDB's" }
+    mssql:    { na: "`page_size` and the heterogeneous-`_id` guard are MongoDB's" }
+    mongo:    { test: open_defect_removing_page_size_runs_after_the_heterogeneous_id_refusal_mongo }
+    oracle:   { na: "`page_size` and the heterogeneous-`_id` guard are MongoDB's" }
+
+  - id: validate_missing_bucket_s3
+    what: "RESULTS 5: `validate` on a bucket that does not exist fails (s3)"
+    postgres: { test: open_defect_validate_fails_on_a_missing_bucket_s3 }
+    mysql:    { na: "`validate` reads the destination only (MinIO, fake-gcs and Azurite cells under postgres); no source engine is involved" }
+    mssql:    { na: "`validate` reads the destination only (MinIO, fake-gcs and Azurite cells under postgres); no source engine is involved" }
+    mongo:    { na: "`validate` reads the destination only (MinIO, fake-gcs and Azurite cells under postgres); no source engine is involved" }
+    oracle:   { na: "`validate` reads the destination only (MinIO, fake-gcs and Azurite cells under postgres); no source engine is involved" }
+
+  - id: validate_missing_bucket_gcs
+    what: "RESULTS 5: `validate` on a bucket that does not exist fails (gcs)"
+    postgres: { test: open_defect_validate_fails_on_a_missing_bucket_gcs }
+    mysql:    { na: "`validate` reads the destination only (MinIO, fake-gcs and Azurite cells under postgres); no source engine is involved" }
+    mssql:    { na: "`validate` reads the destination only (MinIO, fake-gcs and Azurite cells under postgres); no source engine is involved" }
+    mongo:    { na: "`validate` reads the destination only (MinIO, fake-gcs and Azurite cells under postgres); no source engine is involved" }
+    oracle:   { na: "`validate` reads the destination only (MinIO, fake-gcs and Azurite cells under postgres); no source engine is involved" }
+
+  - id: validate_missing_bucket_azure
+    what: "RESULTS 5: `validate` on a bucket that does not exist fails (azure)"
+    postgres: { test: open_defect_validate_fails_on_a_missing_bucket_azure }
+    mysql:    { na: "`validate` reads the destination only (MinIO, fake-gcs and Azurite cells under postgres); no source engine is involved" }
+    mssql:    { na: "`validate` reads the destination only (MinIO, fake-gcs and Azurite cells under postgres); no source engine is involved" }
+    mongo:    { na: "`validate` reads the destination only (MinIO, fake-gcs and Azurite cells under postgres); no source engine is involved" }
+    oracle:   { na: "`validate` reads the destination only (MinIO, fake-gcs and Azurite cells under postgres); no source engine is involved" }
+
+  - id: cdc_stdout_never_advances_the_slot
+    what: "RESULTS 16: `rivet cdc` to stdout advances the PostgreSQL slot it drained (3, 3, 3 events today)"
+    postgres: { gap: "no rig entry point drives `rivet cdc` NDJSON to stdout three times against one slot; not written" }
+    mysql:    { gap: "no rig entry point drives `rivet cdc` NDJSON to stdout three times against one slot; not written" }
+    mssql:    { gap: "no rig entry point drives `rivet cdc` NDJSON to stdout three times against one slot; not written" }
+    mongo:    { gap: "no rig entry point drives `rivet cdc` NDJSON to stdout three times against one slot; not written" }
+    oracle:   { gap: "no rig entry point drives `rivet cdc` NDJSON to stdout three times against one slot; not written" }
+
+  - id: init_cdc_reads_the_capture_instance
+    what: "RESULTS 19: `rivet init --mode cdc` on SQL Server writes the capture instance the catalog holds"
+    postgres: { gap: "no rig entry point drives `rivet init`; not written" }
+    mysql:    { gap: "no rig entry point drives `rivet init`; not written" }
+    mssql:    { gap: "no rig entry point drives `rivet init`; not written" }
+    mongo:    { gap: "no rig entry point drives `rivet init`; not written" }
+    oracle:   { gap: "no rig entry point drives `rivet init`; not written" }
+
+  - id: check_names_the_strategy_run_uses
+    what: "RESULTS 20: `check` names the strategy `run` uses for `mode: chunked` with no chunk column"
+    postgres: { gap: "not written" }
+    mysql:    { gap: "not written" }
+    mssql:    { gap: "not written" }
+    mongo:    { gap: "not written" }
+    oracle:   { gap: "not written" }
+
+  - id: standby_refusal_leaves_nothing
+    what: "RESULTS 15 (standby twin): a bounded CDC run refused on a PostgreSQL standby leaves no slot, baseline or cdc_snapshot row, and `point at the primary` then runs"
+    postgres: { gap: "needs the cdc-standby stand and its replication wait; not written" }
+    mysql:    { gap: "needs the cdc-standby stand and its replication wait; not written" }
+    mssql:    { gap: "needs the cdc-standby stand and its replication wait; not written" }
+    mongo:    { gap: "needs the cdc-standby stand and its replication wait; not written" }
+    oracle:   { gap: "needs the cdc-standby stand and its replication wait; not written" }

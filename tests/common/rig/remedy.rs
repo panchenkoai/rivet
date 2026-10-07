@@ -9,8 +9,48 @@ use super::*;
 /// A refusal expected by its registry code and the exit class that code's kind decides.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Refused<'a> {
-    pub code: &'a str,
-    pub exit: i32,
+    /// `None` only for [`Refused::uncoded_known_defect`].
+    code: Option<&'a str>,
+    exit: i32,
+}
+
+impl<'a> Refused<'a> {
+    /// The refusal `[code]` with exit class `exit`.
+    pub const fn by_code(code: &'a str, exit: i32) -> Self {
+        Refused {
+            code: Some(code),
+            exit,
+        }
+    }
+
+    /// A refusal that carries no `RIVET_*` code today, which is the known defect `why` names: it must stay uncoded (a code is "now passes"), and each site is counted by an offline ceiling.
+    pub fn uncoded_known_defect(exit: i32, why: &str) -> Refused<'static> {
+        assert!(
+            !why.trim().is_empty(),
+            "an uncoded refusal is a known defect: say which code the registry owes it"
+        );
+        Refused { code: None, exit }
+    }
+
+    /// `[CODE] (exit N)` for a verdict line.
+    fn named(self) -> String {
+        match self.code {
+            Some(c) => format!("[{c}] (exit {})", self.exit),
+            None => format!("an uncoded refusal, a known defect (exit {})", self.exit),
+        }
+    }
+}
+
+/// Panic unless `out` is the one refusal `want`: for a refusal a cell provokes once (beside a live run).
+pub fn assert_refused(out: &std::process::Output, want: Refused) {
+    let s = said(out);
+    if let Some(why) = not_the_refusal(&[&s], want) {
+        panic!(
+            "refusal contract: {}\n{}",
+            why.replace("cycle 1 ", "the invocation "),
+            s.text
+        );
+    }
 }
 
 /// What the invocation must do once a remedy has been applied.
@@ -108,13 +148,18 @@ fn ended(s: &Said) -> String {
 /// Why `cycles` are not one and the same refusal `want`, else `None`.
 pub(crate) fn not_the_refusal(cycles: &[&Said], want: Refused) -> Option<String> {
     for (n, s) in cycles.iter().enumerate() {
-        if s.code.as_deref() != Some(want.code) || s.exit != Some(want.exit) {
+        if let (None, Some(code), true) = (want.code, &s.code, s.exit != Some(0)) {
             return Some(format!(
-                "cycle {} ended with {}, expected [{}] (exit {})",
+                "known defect now passes: cycle {} carries [{code}]; expect the refusal by code",
+                n + 1
+            ));
+        }
+        if s.code.as_deref() != want.code || s.exit != Some(want.exit) {
+            return Some(format!(
+                "cycle {} ended with {}, expected {}",
                 n + 1,
                 ended(s),
-                want.code,
-                want.exit
+                want.named()
             ));
         }
     }
@@ -147,8 +192,8 @@ pub(crate) fn not_the_outcome(refusal: &Said, after: &Said, then: Then) -> Optio
             "exit 0 and the source delivered".to_string(),
         ),
         Then::Refuses(want) => (
-            after.code.as_deref() == Some(want.code) && after.exit == Some(want.exit),
-            format!("[{}] (exit {})", want.code, want.exit),
+            after.code.as_deref() == want.code && after.exit == Some(want.exit),
+            want.named(),
         ),
     };
     (!ok).then(|| format!("ended with {}, expected {expected}", ended(after)))
@@ -271,8 +316,9 @@ impl Rig {
         let sentences: Vec<&str> = remedies.iter().map(|r| r.sentence.as_str()).collect();
         if let Some(gone) = missing_sentence(&first.text, &sentences) {
             panic!(
-                "refuse-then-remedy: the refusal [{}] no longer says `{gone}`: the remedy cell is stale\n--- the refusal:\n{}",
-                want.code, first.text
+                "refuse-then-remedy: the refusal no longer says `{gone}`: the remedy cell is stale ({})\n--- the refusal:\n{}",
+                want.named(),
+                first.text
             );
         }
         let delivers = remedies.iter().any(|r| r.then == Then::DeliversTheSource);
@@ -323,8 +369,8 @@ impl Rig {
             let after = said(&self.cli_env(rerun.as_deref().unwrap_or(argv), envs));
             if let Some(why) = not_the_outcome(&first, &after, then) {
                 panic!(
-                    "refuse-then-remedy: remedy `{sentence}` of [{}] {why}\n{}",
-                    want.code, after.text
+                    "refuse-then-remedy: remedy `{sentence}` {why}\n{}",
+                    after.text
                 );
             }
         }
@@ -356,10 +402,7 @@ fn copy_files(from: &Path, to: &Path) {
 mod tests {
     use super::*;
 
-    const WANT: Refused = Refused {
-        code: "RIVET_STATE_RUN_IN_PROGRESS",
-        exit: 5,
-    };
+    const WANT: Refused = Refused::by_code("RIVET_STATE_RUN_IN_PROGRESS", 5);
 
     fn refusal(exit: i32, stderr: &str) -> Said {
         use std::os::unix::process::ExitStatusExt as _;
@@ -375,7 +418,7 @@ mod tests {
     #[test]
     fn two_identical_coded_refusals_are_the_refusal() {
         let (a, b) = (refusal(5, CODED), refusal(5, CODED));
-        assert_eq!(a.code.as_deref(), Some(WANT.code));
+        assert_eq!(a.code.as_deref(), WANT.code);
         assert_eq!(not_the_refusal(&[&a, &b], WANT), None);
     }
 
@@ -397,6 +440,45 @@ mod tests {
         assert_eq!(
             why,
             "cycle 1 ended with no RIVET_* code (exit 5), expected [RIVET_STATE_RUN_IN_PROGRESS] (exit 5)"
+        );
+    }
+
+    #[test]
+    fn an_uncoded_known_defect_holds_only_while_the_refusal_stays_uncoded() {
+        let uncoded = CODED.replace("[RIVET_STATE_RUN_IN_PROGRESS] ", "");
+        let known =
+            Refused::uncoded_known_defect(1, "the registry owes it RIVET_STATE_RUN_IN_PROGRESS");
+        let (a, b) = (refusal(1, &uncoded), refusal(1, &uncoded));
+        assert_eq!(not_the_refusal(&[&a, &b], known), None);
+        let fixed = refusal(5, CODED);
+        assert_eq!(
+            not_the_refusal(&[&fixed, &fixed], known).as_deref(),
+            Some(
+                "known defect now passes: cycle 1 carries [RIVET_STATE_RUN_IN_PROGRESS]; expect the refusal by code"
+            )
+        );
+        let passed = refusal(0, "");
+        assert_eq!(
+            not_the_refusal(&[&a, &passed], known).as_deref(),
+            Some(
+                "cycle 2 ended with success (exit 0), expected an uncoded refusal, a known defect (exit 1)"
+            )
+        );
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "refusal contract: the invocation ended with no RIVET_* code (exit 1), expected [RIVET_STATE_RUN_IN_PROGRESS] (exit 5)"
+    )]
+    fn one_refusal_is_held_to_its_code_too() {
+        use std::os::unix::process::ExitStatusExt as _;
+        assert_refused(
+            &std::process::Output {
+                status: std::process::ExitStatus::from_raw(1 << 8),
+                stdout: Vec::new(),
+                stderr: b"Error: export 'x' is running\n".to_vec(),
+            },
+            WANT,
         );
     }
 
@@ -450,10 +532,7 @@ mod tests {
     #[test]
     fn a_remedy_is_held_to_the_outcome_it_declared() {
         let before = refusal(5, CODED);
-        let other = Refused {
-            code: "RIVET_STATE_INTERRUPTED_RUN_OWNER_MISMATCH",
-            exit: 5,
-        };
+        let other = Refused::by_code("RIVET_STATE_INTERRUPTED_RUN_OWNER_MISMATCH", 5);
         let blocked = refusal(
             5,
             "Error: [RIVET_STATE_INTERRUPTED_RUN_OWNER_MISMATCH] no\n",
