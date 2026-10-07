@@ -302,8 +302,8 @@ fn spill_files_under(dir: &std::path::Path) -> Vec<String> {
 ///
 /// Without this the whole soak passes on a build where spilling never happens: the
 /// rows are identical either way. It is the fixture-is-not-inert check, per cycle.
-fn assert_cycle_spilled(engine: &str, cycle: usize, stderr: &str) {
-    if engine == "mongo" {
+fn assert_cycle_spilled(engine: &str, cycle: usize, stderr: &str, own: Option<OwnSpill>) {
+    let Some(own) = own else {
         // The CONTROL: nothing to spill, by construction. Asserted rather than
         // skipped — if Mongo ever grows a transaction buffer, this is the line that
         // says the control has stopped being one.
@@ -314,7 +314,7 @@ fn assert_cycle_spilled(engine: &str, cycle: usize, stderr: &str) {
              the memory claim below is no longer about a control"
         );
         return;
-    }
+    };
     if cap() > soak_rows() || tx_rows() <= cap() {
         // Baseline run: no transaction is large enough to cross the cap, so nothing
         // spills by design — either the cap was raised above the fixture, or the
@@ -326,30 +326,9 @@ fn assert_cycle_spilled(engine: &str, cycle: usize, stderr: &str) {
         );
         return;
     }
-    let split = stderr
-        .split("delivered ")
-        .filter_map(|s| s.split_once(" rows from memory and "))
-        .find_map(|(head, rest)| {
-            let tail = rest.split_once(" from disk")?.0;
-            Some((
-                head.trim().parse::<usize>().ok()?,
-                tail.trim().parse::<usize>().ok()?,
-            ))
-        });
-    let (from_memory, from_disk) = split.unwrap_or_else(|| {
-        panic!("{engine} cycle {cycle}: no spill was reported. stderr:\n{stderr}")
-    });
-    assert!(
-        from_disk > 0,
-        "{engine} cycle {cycle}: the cap was noticed but nothing reached disk"
-    );
-    assert_eq!(
-        from_memory,
-        cap() + 1,
-        "{engine} cycle {cycle}: memory must stop at the cap (+1, since the cap is \
-         checked after the row is pushed) — a larger head means the ceiling is not \
-         being enforced"
-    );
+    if let Err(why) = spill_evidence(stderr, cap(), own) {
+        panic!("{engine} cycle {cycle}: {why}\nstderr:\n{stderr}");
+    }
 }
 
 // ─── PostgreSQL ──────────────────────────────────────────────────────────────
@@ -422,7 +401,9 @@ fn soak_spill_postgres() {
             "postgres cycle {cycle} failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
-        assert_cycle_spilled("postgres", cycle, &String::from_utf8_lossy(&out.stderr));
+        let own = OwnSpill::Transaction(rows.min(tx_rows()));
+        let log = String::from_utf8_lossy(&out.stderr);
+        assert_cycle_spilled("postgres", cycle, &log, Some(own));
     }
     assert_soak_is_sound(&rig, "postgres", seeded, rss_before);
 }
@@ -464,7 +445,9 @@ fn soak_spill_mysql() {
             "mysql cycle {cycle} failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
-        assert_cycle_spilled("mysql", cycle, &String::from_utf8_lossy(&out.stderr));
+        let own = OwnSpill::Transaction(rows);
+        let log = String::from_utf8_lossy(&out.stderr);
+        assert_cycle_spilled("mysql", cycle, &log, Some(own));
     }
     assert_soak_is_sound(&rig, "mysql", seeded, rss_before);
 }
@@ -506,7 +489,8 @@ fn soak_spill_mssql() {
             "mssql cycle {cycle} failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
-        assert_cycle_spilled("mssql", cycle, &String::from_utf8_lossy(&out.stderr));
+        let log = String::from_utf8_lossy(&out.stderr);
+        assert_cycle_spilled("mssql", cycle, &log, Some(OwnSpill::Batch));
     }
     assert_soak_is_sound(&rig, "mssql", seeded, rss_before);
 }
@@ -552,7 +536,8 @@ fn soak_spill_mongo() {
             "mongo cycle {cycle} failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
-        assert_cycle_spilled("mongo", cycle, &String::from_utf8_lossy(&out.stderr));
+        let log = String::from_utf8_lossy(&out.stderr);
+        assert_cycle_spilled("mongo", cycle, &log, None);
     }
     assert_soak_is_sound(&rig, "mongo", seeded, rss_before);
 }
