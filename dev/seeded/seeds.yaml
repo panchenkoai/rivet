@@ -258,3 +258,152 @@ seeds:
         na: "no source-side acknowledgement: the default no-op ChangeStream::ack; the position moves only through the checkpoint the sink saves after a flush (roll_all) or at a fully acked drain"
       oracle:
         na: "the stream's own frontier save is gated on `outstanding`, set when a commit is handed out and cleared only by an ack of that exact position; there is no latch a partial ack can clear"
+  - name: progress-inherited-by-another-stream
+    class: stored progress (incremental cursor, keyset high-water, resume anchor) is continued by an export that reads another table or collection
+    history: "2026-10-06 - two same-named exports on one state database, or one export repointed without a reset: exit 0 with _SUCCESS and 0 of 1000 rows (v0.30.0, v0.31.0)"
+    scope: source
+    patch: progress-inherited-by-another-stream/shared.patch
+    engines:
+      postgres:
+        cells:
+          - incremental_repointed_at_another_table_postgres
+          - incremental_query_repointed_at_another_table_postgres
+          - keyset_incremental_repointed_at_another_table_postgres
+          - parallel_keyset_incremental_repointed_at_another_table_postgres
+      mysql:
+        cells:
+          - incremental_repointed_at_another_table_mysql
+          - incremental_query_repointed_at_another_table_mysql
+          - keyset_incremental_repointed_at_another_table_mysql
+          - parallel_keyset_incremental_repointed_at_another_table_mysql
+      mssql:
+        cells:
+          - incremental_repointed_at_another_table_mssql
+          - incremental_query_repointed_at_another_table_mssql
+          - keyset_incremental_repointed_at_another_table_mssql
+          - parallel_keyset_incremental_repointed_at_another_table_mssql
+      oracle:
+        cells:
+          - incremental_repointed_at_another_table_oracle
+          - incremental_query_repointed_at_another_table_oracle
+          - keyset_incremental_repointed_at_another_table_oracle
+          - parallel_keyset_incremental_repointed_at_another_table_oracle
+      mongo:
+        cells: [resume_repointed_at_another_collection_mongo]
+      lib:
+        cells:
+          - "lib:a_stored_cursor_is_refused_for_another_table_every_time_until_a_reset"
+  - name: aliased-projection-read-as-table
+    class: a `query:` whose projection aliases a column to the chunk column's name is probed on the bare table, so the range comes from another column
+    history: "P-24 (2026-10-06): `SELECT legacy_id AS id, name FROM customers` with `chunk_column: id` exported 0 of 1000 rows, exit 0, on main and v0.31.0"
+    scope: source
+    patch: aliased-projection-read-as-table/shared.patch
+    engines:
+      postgres:
+        cells: [a_query_that_aliases_the_chunk_column_delivers_its_rows_postgres]
+      mysql:
+        cells: [a_query_that_aliases_the_chunk_column_delivers_its_rows_mysql]
+      mssql:
+        cells: [a_query_that_aliases_the_chunk_column_delivers_its_rows_mssql]
+      oracle:
+        cells: [a_query_that_aliases_the_chunk_column_delivers_its_rows_oracle]
+      mongo:
+        na: "chunked mode is rejected for MongoDB at config validation - there is no SQL projection to probe"
+      lib:
+        cells:
+          - "lib:strip_simple_projection_rejects_a_projection_that_renames_or_limits"
+          - "lib:a_bound_over_an_aliased_projection_is_read_from_the_query_not_the_table"
+
+  - name: unreadable-probe-read-as-no-rows
+    class: an adapter's scalar probe returns "no value" for a non-NULL value of a type it has no reader for, and the planner reads that as an empty table
+    history: "P-25 (2026-10-06): PostgreSQL parallel keyset_incremental on a smallint key exported 0 of 3000 rows on every run, exit 0, on main and v0.31.0; the numeric range-bound collapse to BETWEEN 0 AND 0 before it"
+    scope: source
+    engines:
+      postgres:
+        patch: unreadable-probe-read-as-no-rows/postgres.patch
+        cells:
+          - parallel_keyset_incremental_on_a_smallint_key_delivers_the_source_rows_postgres
+          - parallel_keyset_incremental_on_a_real_key_is_refused_by_name_postgres
+          - a_probe_value_of_an_unreadable_type_is_refused_by_name_postgres
+      mysql:
+        na: "query_scalar reads the text protocol - every non-NULL scalar arrives as bytes whatever its type, so there is no per-type reader that can miss"
+      mssql:
+        na: "scalar_to_string has an arm per ColumnData kind and renders any other kind through Debug - no arm returns None for a value"
+      oracle:
+        na: "cell_text dispatches on the column kind and propagates decode errors - it has no fall-through that returns None for a value"
+      mongo:
+        na: "query_scalar answers only the reconcile COUNT - MongoDB has no SQL probes"
+  - name: reset-under-a-live-run
+    class: a command that rewrites an export's stored progress does not take the export's run lease, so it is accepted while a checkpointed run of that export is alive
+    history: "P-17, 2026-10-06 - `rivet state reset-chunks` during a checkpointed chunked run was accepted; the run exited 0 with `_SUCCESS` and a manifest of 0 parts for a 5000-row table, on main 9f6e0cbd and on v0.31.0"
+    scope: state
+    patch: reset-under-a-live-run/shared.patch
+    engines:
+      sqlite-state:
+        cells:
+          - pg_a_reset_is_refused_while_a_range_run_is_alive_and_works_after_it
+          - pg_a_reset_is_refused_while_a_keyset_run_is_alive_and_works_after_it
+          - pg_a_killed_range_run_does_not_block_the_reset
+      postgres-state:
+        cells:
+          - pg_state_a_reset_is_refused_while_a_range_run_is_alive_and_works_after_it
+          - pg_state_a_killed_range_run_does_not_block_the_reset
+      lib:
+        cells:
+          - "lib:every_reset_is_refused_while_the_exports_run_lease_is_held"
+
+  - name: checkpoint-gone-at-completion
+    class: a checkpointed run completes a chunk run whose row is no longer in the state, and publishes a success over the parts it can no longer list
+    history: "P-17, 2026-10-06 - the run whose `chunk_run` and `chunk_task` rows were removed under it finished exit 0 with `_SUCCESS` and 0 rows, 16 parts left in no manifest"
+    scope: state
+    patch: checkpoint-gone-at-completion/shared.patch
+    engines:
+      sqlite-state:
+        cells: [pg_a_range_run_whose_checkpoint_rows_vanish_fails_loudly]
+      postgres-state:
+        cells: [pg_state_a_range_run_whose_checkpoint_rows_vanish_fails_loudly]
+      lib:
+        cells:
+          - "lib:completing_a_chunk_run_whose_row_is_gone_is_refused"
+  - name: apply-skips-partition-expansion
+    class: an entry point builds its own export list instead of taking the run set, and runs a `partition_by` export unexpanded
+    history: "`rivet apply <config>`, `--pool` and a sealed plan wrote the whole table under a directory literally named `{partition}`, exit 0 (v0.31.0)"
+    scope: source
+    patch: apply-skips-partition-expansion/shared.patch
+    engines:
+      postgres:
+        cells:
+          - apply_config_partitions_like_run_postgres
+          - apply_pool_partitions_like_run_postgres
+          - a_sealed_plan_of_a_partitioned_export_is_refused_and_its_remedy_works_postgres
+      mysql:
+        cells: [apply_forms_partition_like_run_mysql]
+      mssql:
+        cells: [apply_forms_partition_like_run_mssql]
+      oracle:
+        cells: [apply_forms_partition_like_run_oracle]
+      mongo:
+        na: "partition_by is refused for a MongoDB source at config load (the bucket probes are SQL), so no entry point can run one unexpanded"
+      lib:
+        cells:
+          - "lib:a_plan_with_an_unexpanded_partition_token_is_refused_before_any_write"
+
+  - name: stdout-swallowed-by-child-processes
+    class: "a `destination: stdout` export is handed to a child process, whose stdout the parent reads as its event stream"
+    history: "`rivet run --parallel-export-processes > out.csv` exited 0 with 0 bytes and a summary of `rows: 120` (v0.31.0)"
+    scope: source
+    patch: stdout-swallowed-by-child-processes/shared.patch
+    engines:
+      postgres:
+        cells: [stdout_survives_child_processes_postgres]
+      mysql:
+        cells: [stdout_survives_child_processes_mysql]
+      mssql:
+        cells: [stdout_survives_child_processes_mssql]
+      oracle:
+        cells: [stdout_survives_child_processes_oracle]
+      mongo:
+        cells: [stdout_survives_child_processes_mongo]
+      lib:
+        cells:
+          - "lib:child_processes_take_the_declared_exports_unless_one_writes_to_stdout"

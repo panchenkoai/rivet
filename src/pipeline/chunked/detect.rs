@@ -297,9 +297,8 @@ pub(crate) fn detect_and_generate_chunks(
     //   1. the scalar is NULL — the table really is empty, and one empty window
     //      is the right plan (`integer_range_null_minmax_collapses_to_zero_zero`);
     //   2. the text does not parse as a whole integer — a DECIMAL/NUMERIC/float key;
-    //   3. `query_scalar` cannot render the type at all — PostgreSQL's tries
-    //      i64, i32, f64, timestamp, date, uuid, String and falls through to
-    //      `Ok(None)`, and no arm matches a numeric OID.
+    //   3. `query_scalar` returns `Ok(None)` for a value it cannot render (the
+    //      PostgreSQL adapter did for `numeric`; it now refuses such a value itself).
     //
     // Cases 2 and 3 made min = max = 0, so the plan became the single window
     // `WHERE col BETWEEN 0 AND 0`. PostgreSQL compares numeric to integer
@@ -350,8 +349,7 @@ pub(crate) fn detect_and_generate_chunks(
                 }
                 Err(anyhow::anyhow!(
                     "export '{}': {}({}) returned no readable value although the table has ~{} \
-                     row(s) — the driver cannot render this key's type (PostgreSQL `numeric` is \
-                     the known case). Range chunking would plan the single window `BETWEEN 0 AND \
+                     row(s) — the driver cannot render this key's type. Range chunking would plan the single window `BETWEEN 0 AND \
                      0` and export NOTHING while reporting success. Use `chunk_by_key:` (keyset) \
                      or an integer column.",
                     export_name,

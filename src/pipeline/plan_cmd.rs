@@ -325,6 +325,18 @@ fn per_export_output_path(base: &str, export_name: &str) -> String {
     }
 }
 
+/// What `rivet plan` says about a `partition_by` export: its artifact is a preview that `apply` refuses.
+fn partitioned_preview_note(export: &crate::config::ExportConfig) -> Option<String> {
+    export.partition_by.as_ref().map(|_| {
+        format!(
+            "plan: '{}' is a `partition_by` export: its plan is a preview of the whole table, and \
+             `rivet apply <plan-file>` refuses it — the per-partition exports exist only when the \
+             config runs (`rivet apply <config.yaml>` or `rivet run`)",
+            export.name
+        )
+    })
+}
+
 fn build_plan_artifact(
     config: &Config,
     export: &crate::config::ExportConfig,
@@ -334,6 +346,9 @@ fn build_plan_artifact(
     state: &StateStore,
 ) -> Result<(PlanArtifact, PrioritizationInputs, ExportRecommendation)> {
     let plan = build_plan(config, export, config_dir, false, false, false, params)?;
+    if let Some(note) = partitioned_preview_note(export) {
+        log::warn!("{note}");
+    }
 
     // Collect plan-level compatibility diagnostics and emit Rejected ones as errors.
     let validate_diags = validate_plan(&plan);
@@ -1177,6 +1192,30 @@ mod tests {
         effective_parallel_safe, effective_wave, fields_to_write, history_pack_items,
         plan_write_report, refuse_annotate_scoped_to_export, repack_from_history,
     };
+
+    /// `plan` says a `partition_by` export's artifact is a preview `apply` refuses, and says nothing otherwise.
+    #[test]
+    fn plan_notes_that_a_partitioned_exports_artifact_cannot_be_applied() {
+        let cfg = crate::config::Config::from_yaml(
+            "source: { type: postgres, url: \"postgresql://u:p@127.0.0.1:1/db\" }\n\
+             exports:\n\
+             \x20 - name: events\n    table: events\n    mode: full\n    format: parquet\n\
+             \x20   partition_by: created_at\n\
+             \x20   destination: { type: local, path: \"./out/{partition}\" }\n\
+             \x20 - name: plain\n    table: plain\n    mode: full\n    format: parquet\n\
+             \x20   destination: { type: local, path: ./out/plain }\n",
+        )
+        .expect("the fixture config loads");
+        assert_eq!(
+            super::partitioned_preview_note(&cfg.exports[0]).as_deref(),
+            Some(
+                "plan: 'events' is a `partition_by` export: its plan is a preview of the whole \
+                 table, and `rivet apply <plan-file>` refuses it — the per-partition exports exist \
+                 only when the config runs (`rivet apply <config.yaml>` or `rivet run`)"
+            )
+        );
+        assert_eq!(super::partitioned_preview_note(&cfg.exports[1]), None);
+    }
 
     /// The write-report the operator sees, per outcome. A WRITE always warns;
     /// a read-only run (no flag) with work to schedule prints the persist hint;

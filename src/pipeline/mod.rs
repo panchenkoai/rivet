@@ -48,6 +48,7 @@ pub(crate) mod retry;
 // the type namespace, fns in the value namespace) and unambiguous at
 // every call site (`pipeline::run(...)` is the function).
 pub(crate) mod run;
+mod run_set;
 mod run_store;
 mod schema_drift;
 mod single;

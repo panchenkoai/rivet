@@ -16,8 +16,9 @@ use crate::config::{Config, ExportConfig};
 use crate::error::Result;
 use crate::state::StateStore;
 
+use super::run_set::RunSet;
 use super::summary::RunSummary;
-use super::{aggregate, finalize, ipc, job, parallel_children, parent_ui, partition_expand};
+use super::{aggregate, finalize, ipc, job, parallel_children, parent_ui};
 
 /// Per-run configuration flags passed from the CLI to the pipeline.
 ///
@@ -509,50 +510,9 @@ pub fn run(
         .unwrap_or(Path::new("."))
         .to_path_buf();
 
-    let selected: Vec<&ExportConfig> = if let Some(name) = export_name {
-        let e = config
-            .exports
-            .iter()
-            .find(|e| e.name == name)
-            .ok_or_else(|| anyhow::anyhow!("export '{}' not found in config", name))?;
-        vec![e]
-    } else {
-        config.exports.iter().collect()
-    };
-
-    // Value-based partitioning: rewrite any `partition_by` export into one
-    // concrete child export per bucket *before* the run loop. Non-partitioned
-    // exports pass through. The owned vec must outlive the borrowed `exports`
-    // view rebuilt over it, so it is declared in the enclosing scope.
-    // An export named as some CDC export's `backfill:` is that stream's BASELINE
-    // leg, and the CDC export pulls it (anchor first, then the read). Running it
-    // again from this loop would read the whole table a SECOND time in one
-    // invocation — twice the source pressure, for a prefix nothing consumes.
-    //
-    // Only when the whole config runs: `rivet run -e orders` names it explicitly,
-    // and an operator asking for an export by name gets it. BEFORE the partition
-    // expansion below: a `partition_by` recipe's children are named
-    // `<recipe>__<value>` and would slip past a filter on the recipe's name.
-    let selected: Vec<&ExportConfig> = if export_name.is_none() {
-        let recipes = backfill_recipes_to_skip(&config.exports);
-        crate::config::without_backfill_recipes(selected, &recipes)
-    } else {
-        selected
-    };
-
-    let partitioned = partition_expand::any_partitioned(&selected);
-    let expanded_owned: Vec<ExportConfig>;
-    let exports: Vec<&ExportConfig> = if partitioned {
-        expanded_owned = partition_expand::expand_partitioned_exports(
-            &selected,
-            &config.source,
-            &config_dir,
-            params,
-        )?;
-        expanded_owned.iter().collect()
-    } else {
-        selected
-    };
+    let run_set = RunSet::select(&config, export_name)?;
+    let expanded = run_set.in_process(&config.source, &config_dir, params)?;
+    let exports: Vec<&ExportConfig> = expanded.iter().collect();
 
     let (run_parallel, parallel_snapshots) = run_concurrency(
         parallel_exports_cli,
@@ -578,19 +538,12 @@ pub fn run(
         .map(|e| e.name.chars().count())
         .max()
         .unwrap_or(0);
-    let process_mode_requested = parallel_export_processes_cli || config.parallel_export_processes;
-    // Process-mode children re-exec `rivet run --export <name>` and re-load the
-    // config from disk, so they cannot see the synthesised partition child
-    // names. Force in-process execution when partitioning is active.
-    if partitioned && process_mode_requested {
-        log::warn!(
-            "partition_by: --parallel-export-processes is disabled with partitioned exports \
-             (child processes re-load the config and can't see synthesised partitions); \
-             running in-process"
-        );
-    }
-    let run_parallel_processes =
-        process_mode_requested && export_name.is_none() && exports.len() > 1 && !partitioned;
+    let children_ok = run_set
+        .run_child_processes(parallel_export_processes_cli)
+        .unwrap_or_else(|why| {
+            log::warn!("{why}");
+            None
+        });
 
     // Stamped here for the paths that open no harm bracket; the bracketed paths
     // below RE-stamp from `RunHarmBracket::open`, which hands back an instant
@@ -598,7 +551,7 @@ pub fn run(
     // rivet's own instrumentation (see `snapshot_then_stamp`).
     let mut started_at = chrono::Utc::now();
 
-    if run_parallel_processes {
+    if let Some(children_ok) = children_ok {
         // Run schema migrations once in the parent BEFORE forking children.
         // Otherwise N children race for the exclusive write lock on a
         // brand-new `.rivet_state.db` and `busy_timeout` is not enough to
@@ -621,6 +574,7 @@ pub fn run(
         started_at = window_start;
         let (result, child_failures, stderr_dump) =
             parallel_children::run_exports_as_child_processes(
+                children_ok,
                 config_path,
                 &exports,
                 validate,
@@ -866,8 +820,8 @@ pub fn run(
 /// config **wave by wave** in ascending `wave:` order — exports with no `wave:`
 /// run last — reusing the same per-export job + run aggregate as [`run`]. This
 /// first cut runs each wave's exports SEQUENTIALLY (deterministic); safety-aware
-/// within-wave parallelism is a follow-up, and `partition_by` exports are not
-/// expanded here yet (use `rivet run` for those).
+/// within-wave parallelism is a follow-up. The exports come from the same
+/// [`RunSet`] `run` uses, so a `partition_by` export runs as its partitions.
 pub(crate) fn run_waves(
     config_path: &str,
     force: bool,
@@ -895,24 +849,27 @@ pub(crate) fn run_waves(
     // Same recipe rule as `run`: apply runs the WHOLE config, so a baseline
     // recipe here would be the second full read of a table the CDC export is
     // about to read itself.
-    let recipes = backfill_recipes_to_skip(&config.exports);
-    let runnable: Vec<ExportConfig> =
-        crate::config::without_backfill_recipes(&config.exports, &recipes)
-            .into_iter()
-            .cloned()
-            .collect();
+    let run_set = RunSet::select(&config, None)?;
+    // `--parallel-export-processes` (or `parallel_export_processes: true` in the
+    // config) opts into within-wave parallelism: each wave's exports run as
+    // concurrent child processes (per-child governor keeps each one source-safe),
+    // the call blocks until all exit = the wave barrier. Default stays sequential.
+    let children = run_set.child_processes(parallel_cli).unwrap_or_else(|why| {
+        log::warn!("{why}");
+        None
+    });
+    let runnable: Vec<ExportConfig> = match &children {
+        Some((_, declared)) => declared.iter().map(|e| (*e).clone()).collect(),
+        None => run_set.in_process(&config.source, &config_dir, None)?,
+    };
+    let children_ok = children.map(|(ok, _)| ok);
+    let parallel = children_ok.is_some();
     let by_wave = group_exports_by_wave(&runnable);
     let total: usize = by_wave.iter().map(|(_, v)| v.len()).sum();
     if total == 0 {
         log::warn!("apply: config '{config_path}' defines no exports");
         return Ok(());
     }
-
-    // `--parallel` (or `parallel_export_processes: true` in the config) opts into
-    // within-wave parallelism: each wave's exports run as concurrent child
-    // processes (per-child governor keeps each one source-safe), the call blocks
-    // until all exit = the wave barrier. Default stays sequential.
-    let parallel = parallel_cli || config.parallel_export_processes;
 
     // Compact per-export rendering for the SEQUENTIAL path only. The parallel
     // (subprocess) path renders the parent card stack itself and each child sees
@@ -981,7 +938,7 @@ pub(crate) fn run_waves(
         // The wave barrier is the loop itself: each strategy below fully drains
         // the wave (the sequential loop, or the blocking child-process join)
         // before the next iteration starts the next wave.
-        if parallel {
+        if let Some(children_ok) = children_ok {
             // Cost safety-gate — see [`cost_gate_batches`] for the rule.
             let safe_n = pending.iter().filter(|e| is_parallel_safe(e)).count();
             log::info!(
@@ -1025,6 +982,7 @@ pub(crate) fn run_waves(
                 .unwrap_or(0);
             for batch in &batches {
                 let (result, cf, stderr_dump) = parallel_children::run_exports_as_child_processes(
+                    children_ok,
                     config_path,
                     batch,
                     false,
@@ -1744,20 +1702,15 @@ pub(crate) fn run_pool(
     // prefix-level skip applies here unchanged.
     // Same recipe rule as `run`/`run_waves`, and checked BEFORE the `--split`
     // escape: a recipe must not run here whether or not the pool splits it.
-    let recipes = backfill_recipes_to_skip(&config.exports);
-    let mut effective: Vec<ExportConfig> = config
-        .exports
-        .iter()
+    let mut effective: Vec<ExportConfig> = RunSet::select(&config, None)?
+        .in_process(&config.source, &config_dir, None)?
+        .into_iter()
         .filter(|e| {
-            if recipes.contains(&e.name) {
-                return false;
-            }
             if split {
                 return true; // per-unit skip happens after the split
             }
             finalize::needs_run(e, resume, "apply --pool")
         })
-        .cloned()
         .collect();
     if effective.is_empty() {
         log::warn!("apply --pool: nothing to run (no exports, or all complete)");
@@ -2155,31 +2108,6 @@ pub(crate) fn run_pool(
         failures,
         " in the pool",
     )
-}
-
-/// The exports a WHOLE-CONFIG run must not run itself: each is some `mode: cdc`
-/// export's `backfill:` recipe, which that stream pulls after its anchor.
-///
-/// One definition for all three whole-config entry points ([`run`],
-/// [`run_waves`], [`run_pool`]) — the rule shipped in `run` alone, so
-/// `rivet apply <config.yaml>` read the table twice per invocation, into a
-/// prefix the load deliberately skips. Warns per skipped export, because the
-/// default filter is `warn` and this says an export the operator WROTE did not
-/// run.
-fn backfill_recipes_to_skip(exports: &[ExportConfig]) -> std::collections::HashSet<String> {
-    let recipes = crate::config::backfill_recipe_names(exports);
-    // Info, not warn: this is the partner shape working as designed (every run of
-    // an init'd CDC config would otherwise open with one WARN per table).
-    for e in exports.iter().filter(|e| recipes.contains(&e.name)) {
-        log::info!(
-            "export '{}': skipped — it is the backfill recipe of a `mode: cdc` export, \
-             which runs it after the anchor (run it alone with `-e {}` to export it on \
-             its own)",
-            e.name,
-            e.name
-        );
-    }
-    recipes
 }
 
 /// Group exports by `wave:` in ascending order; an export with no `wave:` runs
