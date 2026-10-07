@@ -462,7 +462,7 @@ fn second_run_beside_a_live_checkpointed_one(engine: SqlEngine) {
             .rig(&table)
             .mode("chunked")
             .export_line("chunk_column: id")
-            .export_line("chunk_size: 20")
+            .export_line("chunk_size: 100")
             .export_line("chunk_checkpoint: true"),
         400,
     );
@@ -796,6 +796,11 @@ fn init_config_runs(url: &str, table: &str, mode: &str) -> InitConfig {
         "`rivet init --mode {mode}` failed (exit {:?})\n{}",
         cfg.init.status.code(),
         text(&cfg.init)
+    );
+    assert!(
+        cfg.yaml().contains(&format!("mode: {mode}")),
+        "fixture: `rivet init --mode {mode}` wrote an export of that mode\n{}",
+        cfg.yaml()
     );
     let run = cfg.cli(&["run"]);
     assert!(
