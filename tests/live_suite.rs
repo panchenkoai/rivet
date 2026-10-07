@@ -126,6 +126,8 @@ mod live_cross_db_parity;
 mod live_density_probe;
 #[path = "live/live_destination_parity.rs"]
 mod live_destination_parity;
+#[path = "live/live_entry_points_run_set.rs"]
+mod live_entry_points_run_set;
 #[path = "live/live_governor.rs"]
 mod live_governor;
 #[path = "live/live_harness_canary.rs"]
@@ -217,6 +219,8 @@ mod live_pg_state;
 mod live_plan_apply;
 #[path = "live/live_plan_output_ux.rs"]
 mod live_plan_output_ux;
+#[path = "live/live_planner_zero_rows.rs"]
+mod live_planner_zero_rows;
 #[path = "live/live_pool_ledger.rs"]
 mod live_pool_ledger;
 #[path = "live/live_pool_safety.rs"]
@@ -302,3 +306,5 @@ mod live_state_backend;
 mod live_state_clock;
 #[path = "live/live_state_pooler.rs"]
 mod live_state_pooler;
+#[path = "live/live_state_reset_live_run.rs"]
+mod live_state_reset_live_run;

@@ -1,0 +1,36 @@
+diff --git a/src/pipeline/cli.rs b/src/pipeline/cli.rs
+index 46fa22d0..4dc61446 100644
+--- a/src/pipeline/cli.rs
++++ b/src/pipeline/cli.rs
+@@ -248,7 +248,6 @@ pub fn reset_state(config_path: &str, export_name: &str) -> Result<()> {
+         );
+     }
+     let state = StateStore::open(config_path)?;
+-    let _held = super::chunked::claim_export_progress(&state, export_name, "reset its state")?;
+     state.reset(export_name)?;
+     println!("State reset for export '{}'", export_name);
+     Ok(())
+@@ -422,8 +421,6 @@ pub fn reset_chunk_checkpoint(config_path: &str, export_name: &str) -> Result<()
+         );
+     }
+     let state = StateStore::open(config_path)?;
+-    let _held =
+-        super::chunked::claim_export_progress(&state, export_name, "remove its chunk checkpoint")?;
+     let n = state.reset_chunk_checkpoint(export_name)?;
+     // Abandoning the resume also clears the committed/verified boundary, so
+     // `rivet state progression` does not report a stale chunk boundary after
+@@ -484,14 +481,6 @@ pub fn reset_chunk_checkpoints_stuck(config_path: &str) -> Result<()> {
+     );
+ 
+     for name in targets {
+-        let Some(_held) = super::chunked::try_run_lease(&state, &name)? else {
+-            println!(
+-                "Skipping '{}': {} is in progress in a live rivet process, so its checkpoint is not stuck.",
+-                name,
+-                super::chunked::live_run_label(&state, &name)?
+-            );
+-            continue;
+-        };
+         let n = state.reset_chunk_checkpoint(&name)?;
+         println!("Removed {} chunk run record(s) for export '{}'.", n, name);
+     }

@@ -107,7 +107,7 @@ impl Rig {
     /// the local tempdir otherwise. ONE renderer for both, so the primary and
     /// secondary exports cannot drift apart (they were two `format!`s before).
     pub(crate) fn dest_yaml(&self, export: &str) -> String {
-        if self.dest_stdout {
+        if self.dest_stdout && export == self.name {
             return "{ type: stdout }".to_string();
         }
         let slash = if self.dest_prefix_unslashed { "" } else { "/" };

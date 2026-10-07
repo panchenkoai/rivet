@@ -316,12 +316,21 @@ impl StateStore {
             .unwrap_or(0))
     }
 
+    /// Mark the chunk run completed; refuses when its row is gone (the checkpoint was removed under the run).
     pub fn finalize_chunk_run_completed(&self, run_id: &str) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
-        self.execute(
+        let updated = self.execute(
             "UPDATE chunk_run SET status = 'completed', updated_at = ?1 WHERE run_id = ?2",
             &[now.into(), run_id.into()],
         )?;
+        if updated == 0 {
+            crate::rivet_bail!(
+                crate::error::codes::STATE_CHUNK_CHECKPOINT_GONE,
+                "chunk checkpoint run '{run_id}' has no `chunk_run` row left to complete: its \
+                 checkpoint rows were removed while it ran, so the parts it wrote are in no \
+                 manifest. Run the export again: it starts a new chunk run."
+            );
+        }
         Ok(())
     }
 
@@ -428,6 +437,31 @@ mod tests {
         std::fs::write(&cfg, "# test").expect("write cfg");
         let s = StateStore::open(cfg.to_str().unwrap()).expect("open store");
         (dir, s)
+    }
+
+    /// Completing a chunk run whose row is gone is a coded refusal; one whose row is there completes.
+    #[test]
+    fn completing_a_chunk_run_whose_row_is_gone_is_refused() {
+        let (_dir, s) = store_on_disk();
+        s.create_chunk_run("run_1", "orders", "h", 1).unwrap();
+        s.finalize_chunk_run_completed("run_1").unwrap();
+        assert!(s.find_in_progress_chunk_run("orders").unwrap().is_none());
+
+        s.create_chunk_run("run_2", "orders", "h", 1).unwrap();
+        assert_eq!(s.reset_chunk_checkpoint("orders").unwrap(), 2);
+        let err = s
+            .finalize_chunk_run_completed("run_2")
+            .expect_err("the row was removed under the run");
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some("RIVET_STATE_CHUNK_CHECKPOINT_GONE")
+        );
+        assert_eq!(
+            err.to_string(),
+            "chunk checkpoint run 'run_2' has no `chunk_run` row left to complete: its \
+             checkpoint rows were removed while it ran, so the parts it wrote are in no \
+             manifest. Run the export again: it starts a new chunk run."
+        );
     }
 
     #[test]
