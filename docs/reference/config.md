@@ -118,7 +118,7 @@ Each entry in the `exports` list defines one export job.
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `name` | string | **yes** | — | Unique identifier for this export |
+| `name` | string | **yes** | — | Unique identifier for this export. State is keyed by it: exports that share one state database need different names, and a run refuses progress stored under its name for another table (`RIVET_STATE_CURSOR_STREAM_MISMATCH`) |
 | `query` | string | one of query/query_file/table/tables | — | Inline SQL SELECT query |
 | `query_file` | string | | — | Path to `.sql` file (relative to config dir) |
 | `table` | string | | — | Whole-table shortcut (`name` or `schema.table`) — enables PK auto-chunking; required for `chunk_by_key` / `chunk_size_memory_mb` |

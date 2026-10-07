@@ -1,0 +1,12 @@
+diff --git a/src/pipeline/run_set.rs b/src/pipeline/run_set.rs
+index cecad73d..303e8e75 100644
+--- a/src/pipeline/run_set.rs
++++ b/src/pipeline/run_set.rs
+@@ -83,6 +83,7 @@ impl RunSet {
+             .declared
+             .iter()
+             .find(|e| e.destination.destination_type == DestinationType::Stdout)
++            .filter(|_| false)
+         {
+             Some(e) => Err(format!(
+                 "destination: stdout: --parallel-export-processes is disabled when an export writes \

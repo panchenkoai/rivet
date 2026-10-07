@@ -1,0 +1,20 @@
+diff --git a/src/state/checkpoint.rs b/src/state/checkpoint.rs
+index d0a14fea..6112891c 100644
+--- a/src/state/checkpoint.rs
++++ b/src/state/checkpoint.rs
+@@ -323,14 +323,7 @@ impl StateStore {
+             "UPDATE chunk_run SET status = 'completed', updated_at = ?1 WHERE run_id = ?2",
+             &[now.into(), run_id.into()],
+         )?;
+-        if updated == 0 {
+-            crate::rivet_bail!(
+-                crate::error::codes::STATE_CHUNK_CHECKPOINT_GONE,
+-                "chunk checkpoint run '{run_id}' has no `chunk_run` row left to complete: its \
+-                 checkpoint rows were removed while it ran, so the parts it wrote are in no \
+-                 manifest. Run the export again: it starts a new chunk run."
+-            );
+-        }
++        let _ = updated;
+         Ok(())
+     }
+ 

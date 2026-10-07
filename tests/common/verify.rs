@@ -15,8 +15,9 @@
 //! checkpoint itself. A stream anchored before any run the oracle saw is
 //! `RIVET-ORACLE-PARTIAL` on its first run, never a plain PASS. Opt out only with `.no_oracle("<reason>")` on
 //! a rig or the `RIVET_TEST_NO_ORACLE=<reason>` env on a raw run (both counted by a
-//! shrink-only ceiling, both logged `RIVET-ORACLE-OFF`); an export the oracle cannot reach
-//! logs `RIVET-ORACLE-SKIP`; an exception inside the oracle FAILs the test as an oracle
+//! shrink-only ceiling, both logged `RIVET-ORACLE-OFF`); a run's one `destination: stdout` export
+//! is graded from the bytes its runner captured (`Case::delivered`); an export the oracle cannot
+//! reach logs `RIVET-ORACLE-SKIP`; an exception inside the oracle FAILs the test as an oracle
 //! error. A `Rig::spawn_args_env` child is graded when its caller reaps it with exit 0;
 //! a hand-built `Command::new(RIVET_BIN)` is not graded (under its own ceiling).
 
@@ -63,6 +64,10 @@ pub(crate) struct Case {
     cli: Option<CdcCli>,
     /// Per export, the NDJSON change lines this `rivet cdc` run printed for its table.
     events: Vec<usize>,
+    /// When the invocation began: its `export_metrics` rows are the ones recorded since.
+    began: String,
+    /// The file holding what the run printed for its one `destination: stdout` export.
+    stdout: Option<PathBuf>,
 }
 
 /// What a `rivet cdc` invocation adds to its equivalent config: its `--max-events` cap, and whether it printed NDJSON (no `--output`).
@@ -171,6 +176,9 @@ pub(crate) fn begin(argv: &[String], envs: &[(&str, &str)], cwd: Option<&Path>) 
             .iter()
             .map(|e| {
                 case.unreachable(e)?;
+                if writes_stdout(e) {
+                    return Ok(ManifestSnapshot::default());
+                }
                 let out = case.local_out(e)?;
                 if case.needs_image(e) {
                     // A run that later fails still delivered what its Success manifests declare.
@@ -379,6 +387,8 @@ fn parse(argv: &[String], envs: &[(&str, &str)], cwd: Option<&Path>) -> Option<C
         replay,
         cli,
         events: Vec::new(),
+        began: chrono::Utc::now().to_rfc3339(),
+        stdout: None,
     })
 }
 
@@ -452,8 +462,16 @@ fn image_exists(base: &Path) -> bool {
 }
 
 impl Case {
-    /// Record what a `rivet cdc` NDJSON run printed: each export's change lines appended to its stream's event log.
+    /// Record what the run printed: the bytes of its one `destination: stdout` export, or a `rivet cdc` NDJSON run's change lines appended per export to its stream's event log.
     pub(crate) fn delivered(&mut self, stdout: &[u8]) {
+        if let [e] = self.stdout_exports()[..] {
+            let path = with_ext(
+                &self.image(e, "stdout"),
+                s(e, "format").unwrap_or("parquet"),
+            );
+            std::fs::write(&path, stdout).expect("keep the run's stdout");
+            self.stdout = Some(path);
+        }
         if !self.cli.is_some_and(|c| c.ndjson) {
             return;
         }
@@ -522,6 +540,16 @@ impl Case {
         opts: &Opts,
     ) -> Result<(serde_json::Value, &'static str), String> {
         let [seen, seen_snap] = before.clone()?;
+        if writes_stdout(e) {
+            let printed = self.stdout.as_ref().ok_or(
+                "stdout destination: this runner did not hand the run's stdout to the oracle",
+            )?;
+            let mut spec = self.facts(e, envs, opts)?;
+            spec["format"] = s(e, "format").unwrap_or("parquet").into();
+            spec["stdout"] = printed.display().to_string().into();
+            spec["since"] = self.began.as_str().into();
+            return Ok((spec, "grade-stdout"));
+        }
         let out = &self.local_out(e)?;
         let snap = &out.join("snapshot");
         let [now, now_snap] = self.manifests_of(e, out);
@@ -717,7 +745,13 @@ impl Case {
         let dest = e.get("destination").ok_or("no destination")?;
         match s(dest, "type") {
             Some("local") | Some("gcs") | Some("azure") => {}
-            Some("stdout") => return Err("stdout destination: nothing durable to read".into()),
+            Some("stdout") if self.stdout_exports().len() == 1 => {}
+            Some("stdout") => {
+                return Err(
+                    "stdout destination: several exports share one stdout, whose bytes name no export"
+                        .into(),
+                );
+            }
             Some("s3") if s(dest, "endpoint").is_some_and(|u| u.contains(":9000")) => {}
             other => {
                 return Err(format!(
@@ -733,6 +767,11 @@ impl Case {
             );
         }
         Ok(())
+    }
+
+    /// The exports of this invocation that write to stdout.
+    fn stdout_exports(&self) -> Vec<&Value> {
+        self.exports.iter().filter(|e| writes_stdout(e)).collect()
     }
 
     /// For one table of a multi-table capture: its table and every table's local destination (the run's ledger counts the whole stream).
@@ -1131,6 +1170,11 @@ fn resolve_vars(text: &str, params: &[(String, String)], envs: &[(&str, &str)]) 
 /// A string field of a YAML mapping.
 fn s<'a>(v: &'a Value, k: &str) -> Option<&'a str> {
     v.get(k).and_then(Value::as_str)
+}
+
+/// Whether an export's destination is the run's own stdout.
+fn writes_stdout(e: &Value) -> bool {
+    e.get("destination").and_then(|d| s(d, "type")) == Some("stdout")
 }
 
 /// A YAML node as text, for substring facts.

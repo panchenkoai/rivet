@@ -273,7 +273,7 @@ Clear persisted chunk checkpoint rows (`chunk_run` / `chunk_task`)
 * `-e`, `--export <EXPORT>` — Export whose chunk checkpoints should be cleared (same as `chunk_checkpoint` runs)
 * `--stuck-checkpoints` [alias: `failed`] — Reset checkpoints for **every export named in this config** that currently has `chunk_run.status = 'in_progress'` (crash, SIGKILL, stale concurrent worker).
 
-   Ignores exports whose latest chunk run already finished (`completed`). Runs listed in the database but removed from the YAML are skipped with a printed note.
+   Ignores exports whose latest chunk run already finished (`completed`). Runs listed in the database but removed from the YAML are skipped with a printed note, and so is an export whose run is still alive in another rivet process: it is not stuck.
 
    Alias `--failed` refers to "checkpoint state stuck", not HTTP-style failures or metric rows.
 
