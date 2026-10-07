@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+- **Breaking: a run of another mode refuses to continue past an unfinished checkpoint run**
+  (`RIVET_STATE_INTERRUPTED_RUN_OWNER_MISMATCH`, exit 5, nothing read or written). The stored
+  record of an export now says whether it is a committed high-water or an interrupted run, and
+  which mode (`keyset`, `chunked`) opened that run.
+  - Before (0.31.0 and earlier): a keyset run with `chunk_checkpoint: true` crashed after its
+    first page, the export was switched to `mode: incremental` without a reset, and the
+    incremental run continued from the crashed run's page cursor: exit 0, `_SUCCESS`, a manifest
+    listing 1900 of 2000 rows.
+  - Now any other mode that meets the interrupted run is refused, including `mode: full` and a
+    switch away from an interrupted range-chunk run (which lost nothing before; it is refused so
+    the interrupted run is finished or abandoned on purpose). Remedy, either one: restore the
+    previous mode's settings and run once to finish the run, then switch; or abandon it with
+    `rivet state reset -c <config> --export <name>` (keyset run) or `rivet state reset-chunks -c
+    <config> --export <name>` (range-chunk run), after which the next run is a full pass.
+  - A switch after a run that FINISHED is unchanged: keyset then incremental on the same key
+    still continues from the high-water.
+- **Fixed: an interrupted range-chunk run is resumed only by the source that opened it.** Two
+  configs with one export name, one state database and different sources: when the first crashed
+  after a chunk, the second resumed the first one's chunk windows over its own table (exit 0,
+  1000 of 5000 rows). Each source now has its own in-progress run; state schema v34 records the
+  source on `chunk_run` and `keyset_range`.
+  - Upgrade: a chunk run left in progress by 0.31.0 recorded no source. It is resumed, with one
+    warning, by the next run of that export name when the name has progress under no other source;
+    when it has, the run is refused (`RIVET_STATE_CHUNK_RUN_OWNER_UNKNOWN`, exit 5) until
+    `rivet state reset-chunks -c <config> --export <name>`, and the next run starts a fresh pass.
+    Finished cursors and interrupted keyset runs carry over unchanged. Older binaries refuse a
+    v34 state (`RIVET_STATE_SCHEMA_NEWER`).
 - **Breaking: an incremental or CDC load refuses a view or a `<table>__changes` it has no record
   of loading**, on BigQuery, Snowflake and ClickHouse. Before, only a foreign TABLE at `<table>`
   was refused: a view there was replaced by rivet's current-state view, a foreign

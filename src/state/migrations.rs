@@ -547,6 +547,37 @@ const MIGRATIONS: &[(i64, &str)] = &[
     ),
     // v33: the stream (source table / collection) a stored cursor or resume anchor belongs to; NULL = written before v33.
     (33, "ALTER TABLE export_state ADD COLUMN stream TEXT;"),
+    // v34: every remaining identity part of stored progress, NULL until a run writes it. `export_state`: the
+    // mode that owns its interrupted run, the resolved schema, the query population, the destination.
+    // `chunk_run` and `keyset_range`: the source key, so one in-progress run and one range set exist per stream.
+    (
+        34,
+        "ALTER TABLE export_state ADD COLUMN resume_owner TEXT;
+        ALTER TABLE export_state ADD COLUMN source_schema TEXT;
+        ALTER TABLE export_state ADD COLUMN population TEXT;
+        ALTER TABLE export_state ADD COLUMN destination TEXT;
+        ALTER TABLE chunk_run ADD COLUMN source TEXT;
+        DROP INDEX IF EXISTS idx_chunk_run_one_inprogress;
+        CREATE UNIQUE INDEX idx_chunk_run_one_inprogress
+            ON chunk_run(export_name, COALESCE(source, '')) WHERE status='in_progress';
+        ALTER TABLE keyset_range RENAME TO keyset_range_v33;
+        CREATE TABLE keyset_range (
+            export_name TEXT NOT NULL,
+            source      TEXT,
+            run_id      TEXT NOT NULL,
+            range_index INTEGER NOT NULL,
+            lo          TEXT,
+            hi          TEXT,
+            done        INTEGER NOT NULL DEFAULT 0,
+            updated_at  TEXT NOT NULL,
+            key_column  TEXT
+        );
+        INSERT INTO keyset_range (export_name, run_id, range_index, lo, hi, done, updated_at, key_column)
+            SELECT export_name, run_id, range_index, lo, hi, done, updated_at, key_column FROM keyset_range_v33;
+        DROP TABLE keyset_range_v33;
+        CREATE UNIQUE INDEX idx_keyset_range_stream
+            ON keyset_range(export_name, COALESCE(source, ''), range_index);",
+    ),
 ];
 
 /// PostgreSQL-compatible DDL.  Column types differ from SQLite (BIGSERIAL,
@@ -1020,6 +1051,22 @@ const PG_MIGRATIONS: &[(i64, &str)] = &[
         33,
         "ALTER TABLE export_state ADD COLUMN IF NOT EXISTS stream TEXT;",
     ),
+    // v34: see the SQLite ladder. Postgres keeps `keyset_range` and swaps its key for the index.
+    (
+        34,
+        "ALTER TABLE export_state ADD COLUMN IF NOT EXISTS resume_owner TEXT;
+        ALTER TABLE export_state ADD COLUMN IF NOT EXISTS source_schema TEXT;
+        ALTER TABLE export_state ADD COLUMN IF NOT EXISTS population TEXT;
+        ALTER TABLE export_state ADD COLUMN IF NOT EXISTS destination TEXT;
+        ALTER TABLE chunk_run ADD COLUMN IF NOT EXISTS source TEXT;
+        DROP INDEX IF EXISTS idx_chunk_run_one_inprogress;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_chunk_run_one_inprogress
+            ON chunk_run(export_name, COALESCE(source, '')) WHERE status='in_progress';
+        ALTER TABLE keyset_range ADD COLUMN IF NOT EXISTS source TEXT;
+        ALTER TABLE keyset_range DROP CONSTRAINT IF EXISTS keyset_range_pkey;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_keyset_range_stream
+            ON keyset_range(export_name, COALESCE(source, ''), range_index);",
+    ),
 ];
 
 // ─── SQLite migration ─────────────────────────────────────────────────────────
@@ -1378,6 +1425,7 @@ mod tests {
             (29, "cdc_snapshot"),
             (30, "export_state"),
             (32, "export_load_spec_run"),
+            (34, "keyset_range"),
         ];
         for &(v, sql) in MIGRATIONS {
             if let Some(pg_tables) = pg.get(&v) {
@@ -1465,6 +1513,76 @@ mod tests {
             }
             StateConn::Postgres(_) => unreachable!(),
         }
+    }
+
+    /// v34 keeps every chunk run and keyset range a v33 state holds, with no source recorded, and admits one run and one range set per source.
+    #[test]
+    fn v34_keeps_in_flight_runs_without_a_source_and_keys_new_ones_by_source() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_schema_version_table(&conn);
+        for &(ver, sql) in MIGRATIONS {
+            if ver <= 33 {
+                conn.execute_batch(&format!(
+                    "BEGIN;\n{sql}\nINSERT INTO schema_version (version) VALUES ({ver});\nCOMMIT;"
+                ))
+                .unwrap();
+            }
+        }
+        conn.execute_batch(
+            "INSERT INTO chunk_run (run_id, export_name, plan_hash, status, max_chunk_attempts, created_at, updated_at) \
+                VALUES ('r1', 'orders', 'h', 'in_progress', 3, 't', 't');
+             INSERT INTO keyset_range (export_name, run_id, range_index, lo, hi, done, updated_at, key_column) \
+                VALUES ('orders', 'k1', 0, NULL, '5', 1, 't', 'id'), ('orders', 'k1', 1, '5', NULL, 0, 't', 'id');
+             INSERT INTO export_state (export_name, prefix, resume_run_id) VALUES ('orders', 'pg/a', 'k1');",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        let text = |sql: &str| -> Vec<String> {
+            let mut q = conn.prepare(sql).unwrap();
+            q.query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(
+            text(
+                "SELECT run_id || ':' || status || ':' || COALESCE(source, 'none') FROM chunk_run"
+            ),
+            vec!["r1:in_progress:none"]
+        );
+        assert_eq!(
+            text(
+                "SELECT range_index || ':' || COALESCE(lo, '-') || ':' || COALESCE(hi, '-') || ':' || done \
+                 || ':' || key_column || ':' || COALESCE(source, 'none') FROM keyset_range ORDER BY range_index"
+            ),
+            vec!["0:-:5:1:id:none", "1:5:-:0:id:none"]
+        );
+        assert_eq!(
+            text(
+                "SELECT COALESCE(resume_owner, 'none') || COALESCE(source_schema, '') || \
+                 COALESCE(population, '') || COALESCE(destination, '') FROM export_state"
+            ),
+            vec!["none"]
+        );
+        let run = |id: &str, source: &str| {
+            conn.execute(
+                "INSERT INTO chunk_run (run_id, export_name, source, plan_hash, status, max_chunk_attempts, created_at, updated_at) \
+                 VALUES (?1, 'orders', ?2, 'h', 'in_progress', 3, 't', 't')",
+                [id, source],
+            )
+        };
+        run("r2", "pg/a").expect("a source's own run beside the unowned one");
+        run("r3", "pg/b").expect("another source's run");
+        run("r4", "pg/b").expect_err("one in-progress run per source");
+        let range = |source: &str| {
+            conn.execute(
+                "INSERT INTO keyset_range (export_name, source, run_id, range_index, done, updated_at) \
+                 VALUES ('orders', ?1, 'k2', 0, 0, 't')",
+                [source],
+            )
+        };
+        range("pg/a").expect("a source's own range 0");
+        range("pg/a").expect_err("one range per index and source");
     }
 
     /// v29 rebuilds `cdc_snapshot` with the prefix in its key: a row written

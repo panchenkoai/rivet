@@ -284,7 +284,10 @@ const MATRICES: &[(&str, usize)] = &[
     ("docs/runner-coverage-matrix.yaml", 0),
     // Mode transitions (ADR-0033). 3 gaps: MT6, pre-v26 incremental cursors carry no identity.
     // Raised 0 -> 14 (2026-09-26): the Oracle column's honest gaps (batch-only phase 1).
-    ("docs/mode-transition-matrix.yaml", 14),
+    // Raised 14 -> 17 (2026-10-07): three Oracle cells of the range-chunk rows. Range chunking refuses
+    // the Rig table's NUMBER(19) key on Oracle, and the shared-name row also needs a second database
+    // (the stand has one Oracle service; another schema is the same source key).
+    ("docs/mode-transition-matrix.yaml", 17),
     // Pool-split — `apply --pool --split` per (strategy × source engine). Split is a
     // scheduler layer above the runners (each unit runs through chunked/keyset), so its
     // per-engine behaviour (boundary probe, crash-recovery, finding-2 exact-partition

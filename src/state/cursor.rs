@@ -35,13 +35,28 @@ fn streams_differ(stored: &str, now: &str) -> bool {
 fn held_progress(
     cursor: Option<&str>,
     anchor: Option<&str>,
-    continues_cursor: bool,
+    continues_high_water: bool,
 ) -> Option<String> {
     match (anchor, cursor) {
         (Some(run), _) => Some(format!("interrupted run {run}")),
-        (None, Some(v)) if continues_cursor => Some(format!("cursor `{v}`")),
+        (None, Some(v)) if continues_high_water => Some(format!("cursor `{v}`")),
         _ => None,
     }
+}
+
+/// The mode a range-chunk run records as the owner of its anchor (`ExtractionStrategy::mode_label`).
+const CHUNKED: &str = "chunked";
+/// The owner of an anchor written before owners were recorded: only a keyset run anchored on this row then.
+const KEYSET: &str = "keyset";
+
+/// The command that abandons an interrupted run owned by `owner`.
+fn abandon_command(owner: &str, export_name: &str) -> String {
+    let verb = if owner == CHUNKED {
+        "reset-chunks"
+    } else {
+        "reset"
+    };
+    format!("rivet state {verb} -c <config> --export {export_name}")
 }
 
 /// The cursor column an incremental run's `key_descriptor_json` names, or `None` for
@@ -57,8 +72,24 @@ pub struct ProgressKey {
     pub(crate) stream: String,
     /// Compared part: the cursor column or keyset key; `None` for a strategy that stores no cursor.
     pub(crate) column: Option<String>,
-    /// Whether a clean run seeks from the stored cursor.
-    pub(crate) continues_cursor: bool,
+    /// The mode that owns a run this plan leaves interrupted (`ExtractionStrategy::mode_label`).
+    pub(crate) mode: &'static str,
+    /// Whether a clean run seeks from a committed high-water.
+    pub(crate) continues_high_water: bool,
+}
+
+impl ProgressKey {
+    /// The key of a range-chunk stream with no compared parts, as a fixture outside the crate names one.
+    pub fn chunked(export_name: &str, source: &str) -> Self {
+        Self {
+            export_name: export_name.into(),
+            source: source.into(),
+            stream: String::new(),
+            column: None,
+            mode: CHUNKED,
+            continues_high_water: false,
+        }
+    }
 }
 
 /// Stored progress as one run may use it; obtained only from [`StateStore::claim`].
@@ -88,6 +119,41 @@ impl ProgressClaim<'_> {
     pub fn resume_run_id(&self) -> Result<Option<String>> {
         self.state
             .get_resume_run_id(&self.key.export_name, &self.key.source)
+    }
+
+    /// The interrupted range-chunk run of this stream and its plan hash; a run left by a rivet that recorded no source is adopted or refused first.
+    pub fn chunk_run(&self) -> Result<Option<(String, String)>> {
+        let (name, source) = (&self.key.export_name, &self.key.source);
+        if let Some(own) = self.state.in_progress_chunk_run(name, Some(source))? {
+            return Ok(Some(own));
+        }
+        let Some((run_id, plan_hash)) = self.state.in_progress_chunk_run(name, None)? else {
+            return Ok(None);
+        };
+        if let Some(other) = self.state.another_source_of(name, source)? {
+            crate::rivet_bail!(
+                crate::error::codes::STATE_CHUNK_RUN_OWNER_UNKNOWN,
+                "export '{name}': chunk checkpoint run '{run_id}' was left in progress by a rivet \
+                 that did not record which source it read, and '{name}' holds progress under \
+                 more than one source in this state database (`{other}` and `{source}`) — \
+                 nothing says whose run it is, so it is not resumed; nothing was read or \
+                 written.\n  \
+                 Hint: `{}` abandons run '{run_id}'; the next run of each config starts a fresh pass.",
+                abandon_command(CHUNKED, name)
+            );
+        }
+        self.state.adopt_chunk_run(&self.key, &run_id)?;
+        log::warn!(
+            "export '{name}': chunk checkpoint run '{run_id}' predates source tracking — \
+             recorded as belonging to `{source}`, which this export reads now"
+        );
+        Ok(Some((run_id, plan_hash)))
+    }
+
+    /// The latest range-chunk run of this stream in any status (one that recorded no source counts), for `reconcile` and `repair`.
+    pub fn latest_chunk_run(&self) -> Result<Option<String>> {
+        self.state
+            .latest_chunk_run_of(&self.key.export_name, &self.key.source)
     }
 }
 
@@ -199,15 +265,41 @@ impl StateStore {
     pub fn claim(&self, key: ProgressKey) -> Result<ProgressClaim<'_>> {
         let (export_name, scope, stream) = (&key.export_name, &key.source, &key.stream);
         let row = self.query_opt(
-            "SELECT stream, last_cursor_value, resume_run_id FROM export_state \
+            "SELECT stream, last_cursor_value, resume_run_id, resume_owner FROM export_state \
              WHERE export_name = ?1 AND (prefix = ?2 OR prefix = '') \
              ORDER BY prefix DESC LIMIT 1",
             &[export_name.as_str().into(), scope.as_str().into()],
-            |r| (r.opt_text(0), r.opt_text(1), r.opt_text(2)),
+            |r| (r.opt_text(0), r.opt_text(1), r.opt_text(2), r.opt_text(3)),
         )?;
-        let held = row.and_then(|(stored, cursor, anchor)| {
-            held_progress(cursor.as_deref(), anchor.as_deref(), key.continues_cursor)
-                .map(|held| (stored, held))
+        let owner = match &row {
+            Some((_, _, Some(run), owner)) => {
+                let owner = owner.as_deref().unwrap_or(KEYSET);
+                if owner != key.mode {
+                    crate::rivet_bail!(
+                        crate::error::codes::STATE_INTERRUPTED_RUN_OWNER_MISMATCH,
+                        "export '{export_name}': run {run} of mode `{owner}` is unfinished, but \
+                         this export now runs as `{}` — the progress it stored is that run's, \
+                         not a point a `{}` run may continue from; nothing was read or written.\n  \
+                         Hint: restore the `{owner}` settings and run once to finish run {run}, \
+                         then switch; or `{}` abandons it and the next run starts with a full pass.",
+                        key.mode,
+                        key.mode,
+                        abandon_command(owner, export_name)
+                    );
+                }
+                self.own_anchor(&key, run)?;
+                Some(owner)
+            }
+            _ => None,
+        };
+        let chunk_anchor = owner == Some(CHUNKED);
+        let held = row.clone().and_then(|(stored, cursor, anchor, _)| {
+            held_progress(
+                cursor.as_deref(),
+                anchor.as_deref().filter(|_| !chunk_anchor),
+                key.continues_high_water,
+            )
+            .map(|held| (stored, held))
         });
         let Some((stored, held)) = held else {
             return Ok(ProgressClaim { state: self, key });
@@ -245,6 +337,38 @@ impl StateStore {
             Some(_) => {}
         }
         Ok(ProgressClaim { state: self, key })
+    }
+
+    /// Record `key` as the owner of the anchored run `run_id` on rows written before owners and sources were recorded.
+    fn own_anchor(&self, key: &ProgressKey, run_id: &str) -> Result<()> {
+        let (name, scope) = (key.export_name.as_str(), key.source.as_str());
+        self.execute(
+            "UPDATE export_state SET resume_owner = ?3 WHERE export_name = ?1 \
+             AND (prefix = ?2 OR prefix = '') AND resume_run_id = ?4 AND resume_owner IS NULL",
+            &[name.into(), scope.into(), key.mode.into(), run_id.into()],
+        )?;
+        self.execute(
+            "UPDATE keyset_range SET source = ?2 WHERE export_name = ?1 AND run_id = ?3 \
+             AND source IS NULL",
+            &[name.into(), scope.into(), run_id.into()],
+        )?;
+        Ok(())
+    }
+
+    /// A source key other than `source` that `export_name` holds progress under, if any.
+    pub(super) fn another_source_of(
+        &self,
+        export_name: &str,
+        source: &str,
+    ) -> Result<Option<String>> {
+        self.query_opt(
+            "SELECT prefix FROM export_state WHERE export_name = ?1 AND prefix NOT IN ('', ?2) \
+             UNION SELECT source FROM chunk_run WHERE export_name = ?1 AND source <> ?2 \
+             UNION SELECT source FROM keyset_range WHERE export_name = ?1 AND source <> ?2 \
+             ORDER BY 1 LIMIT 1",
+            &[export_name.into(), source.into()],
+            |r| r.text(0),
+        )
     }
 
     /// Owner of a pre-v26 row: the key of the latest successful run that wrote this
@@ -321,11 +445,12 @@ impl StateStore {
         let (export_name, scope) = (key.export_name.as_str(), key.source.as_str());
         self.claim_legacy_row(export_name, scope)?;
         let now = chrono::Utc::now().to_rfc3339();
-        let sql =
-            "INSERT INTO export_state (export_name, prefix, resume_run_id, last_run_at, stream)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+        let sql = "INSERT INTO export_state \
+             (export_name, prefix, resume_run_id, last_run_at, stream, resume_owner)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(export_name, prefix) DO UPDATE SET \
-                resume_run_id = excluded.resume_run_id, stream = excluded.stream";
+                resume_run_id = excluded.resume_run_id, stream = excluded.stream, \
+                resume_owner = excluded.resume_owner";
         self.execute(
             sql,
             &[
@@ -334,6 +459,7 @@ impl StateStore {
                 run_id.into(),
                 now.into(),
                 key.stream.as_str().into(),
+                key.mode.into(),
             ],
         )?;
         Ok(())
@@ -354,7 +480,8 @@ impl StateStore {
     pub fn clear_resume_run_id(&self, export_name: &str, scope: &str) -> Result<()> {
         self.claim_legacy_row(export_name, scope)?;
         self.execute(
-            "UPDATE export_state SET resume_run_id = NULL WHERE export_name = ?1 AND prefix = ?2",
+            "UPDATE export_state SET resume_run_id = NULL, resume_owner = NULL \
+             WHERE export_name = ?1 AND prefix = ?2",
             &[export_name.into(), scope.into()],
         )?;
         Ok(())
@@ -363,7 +490,7 @@ impl StateStore {
     /// Clear every in-progress run_id this export name holds, in any scope (a split re-cut its windows).
     pub fn clear_resume_run_id_every_scope(&self, export_name: &str) -> Result<()> {
         self.execute(
-            "UPDATE export_state SET resume_run_id = NULL WHERE export_name = ?1",
+            "UPDATE export_state SET resume_run_id = NULL, resume_owner = NULL WHERE export_name = ?1",
             &[export_name.into()],
         )?;
         Ok(())
@@ -446,7 +573,8 @@ mod tests {
             source: scope.into(),
             stream: stream.into(),
             column: Some(column.into()),
-            continues_cursor: true,
+            mode: "keyset",
+            continues_high_water: true,
         }
     }
 
@@ -467,7 +595,8 @@ mod tests {
 
     fn stream_refusal(s: &StateStore, stream: &str, continues: bool) -> Option<String> {
         s.claim(ProgressKey {
-            continues_cursor: continues,
+            mode: "keyset",
+            continues_high_water: continues,
             ..key("orders", "pg/db", "id", stream)
         })
         .err()
@@ -479,6 +608,231 @@ mod tests {
             assert_eq!(crate::error::classify_exit(&e), 5);
             e.to_string()
         })
+    }
+
+    fn as_mode(mode: &'static str, scope: &str) -> ProgressKey {
+        ProgressKey {
+            mode,
+            continues_high_water: mode == "incremental",
+            ..key("orders", scope, "id", "orders_a")
+        }
+    }
+
+    /// The refusal `claim` or the claimed lookup gives, checked for `code` and exit 5.
+    fn refusal<T>(r: Result<T>, code: &str) -> String {
+        let e = r.err().expect("refused");
+        assert_eq!(crate::error::error_code(&e), Some(code));
+        assert_eq!(crate::error::classify_exit(&e), 5);
+        e.to_string()
+    }
+
+    const OWNER: &str = "RIVET_STATE_INTERRUPTED_RUN_OWNER_MISMATCH";
+    const UNKNOWN: &str = "RIVET_STATE_CHUNK_RUN_OWNER_UNKNOWN";
+
+    #[test]
+    fn an_interrupted_keyset_run_is_refused_for_another_mode_every_time_until_it_is_abandoned() {
+        let s = store();
+        s.set_resume_run_id(&as_mode("keyset", "pg/db"), "run_7")
+            .unwrap();
+        put(&s, "orders", "pg/db", "100", "id", "orders_a").unwrap();
+        for mode in ["incremental", "full", "chunked", "timewindow"] {
+            for cycle in 1..=2 {
+                let said = refusal(s.claim(as_mode(mode, "pg/db")), OWNER);
+                for want in [
+                    "run run_7 of mode `keyset`",
+                    &format!("runs as `{mode}`"),
+                    "restore the `keyset` settings",
+                    "`rivet state reset -c <config> --export orders` abandons it",
+                ] {
+                    assert!(
+                        said.contains(want),
+                        "{mode} cycle {cycle}: {want} in {said}"
+                    );
+                }
+            }
+        }
+        let own = s.claim(as_mode("keyset", "pg/db")).expect("its own mode");
+        assert_eq!(own.resume_run_id().unwrap().as_deref(), Some("run_7"));
+        assert!(
+            s.claim(as_mode("incremental", "my/db")).is_ok(),
+            "another source holds no interrupted run"
+        );
+        s.reset("orders").unwrap();
+        assert!(s.claim(as_mode("incremental", "pg/db")).is_ok());
+    }
+
+    #[test]
+    fn a_finished_keyset_run_leaves_a_high_water_any_mode_may_meet() {
+        let s = store();
+        s.set_resume_run_id(&as_mode("keyset", "pg/db"), "run_7")
+            .unwrap();
+        put(&s, "orders", "pg/db", "100", "id", "orders_a").unwrap();
+        s.clear_resume_run_id("orders", "pg/db").unwrap();
+        let claim = s.claim(as_mode("incremental", "pg/db")).expect("MT2");
+        assert_eq!(
+            claim.cursor().unwrap().last_cursor_value.as_deref(),
+            Some("100")
+        );
+        s.set_resume_run_id(&as_mode("chunked", "pg/db"), "run_8")
+            .unwrap();
+        s.clear_resume_run_id_every_scope("orders").unwrap();
+        assert!(
+            s.claim(as_mode("incremental", "pg/db")).is_ok(),
+            "a cleared anchor leaves no owner behind"
+        );
+    }
+
+    #[test]
+    fn an_anchor_written_before_owners_were_recorded_is_a_keyset_run() {
+        let s = store();
+        s.set_resume_run_id(&as_mode("keyset", "pg/db"), "run_7")
+            .unwrap();
+        s.exec_for_test("UPDATE export_state SET resume_owner = NULL");
+        s.exec_for_test(
+            "INSERT INTO keyset_range (export_name, run_id, range_index, done, updated_at) \
+             VALUES ('orders', 'run_7', 0, 0, 'then'), ('orders', 'run_dead', 1, 0, 'then')",
+        );
+        let said = refusal(s.claim(as_mode("incremental", "pg/db")), OWNER);
+        assert!(said.contains("of mode `keyset`"), "{said}");
+        s.claim(as_mode("keyset", "pg/db")).expect("its own mode");
+        let owned = |sql: &str| s.query(sql, &[], |r| r.opt_text(0)).unwrap();
+        assert_eq!(
+            owned("SELECT resume_owner FROM export_state"),
+            vec![Some("keyset".to_string())]
+        );
+        assert_eq!(
+            owned("SELECT source FROM keyset_range ORDER BY range_index"),
+            vec![Some("pg/db".to_string()), None],
+            "only the anchored run's ranges take the source"
+        );
+    }
+
+    #[test]
+    fn an_interrupted_chunk_run_is_refused_for_another_mode_until_finished_or_abandoned() {
+        let s = store();
+        let chunked = ProgressKey::chunked("orders", "pg/db");
+        s.open_chunk_run(&chunked, "run_c", "h", 3, &[(1, 10)])
+            .unwrap();
+        for cycle in 1..=2 {
+            let said = refusal(s.claim(as_mode("incremental", "pg/db")), OWNER);
+            for want in [
+                "run run_c of mode `chunked`",
+                "`rivet state reset-chunks -c <config> --export orders` abandons it",
+            ] {
+                assert!(said.contains(want), "cycle {cycle}: {want} in {said}");
+            }
+        }
+        let repointed = ProgressKey {
+            stream: "orders_b".into(),
+            ..chunked.clone()
+        };
+        assert!(
+            s.claim(repointed).is_ok(),
+            "a chunk run is compared by its plan hash, not by the stream"
+        );
+        s.reset_chunk_checkpoint("orders").unwrap();
+        assert!(s.claim(as_mode("incremental", "pg/db")).is_ok());
+
+        s.open_chunk_run(&chunked, "run_d", "h", 3, &[(1, 10)])
+            .unwrap();
+        assert!(s.claim(as_mode("incremental", "pg/db")).is_err());
+        s.finalize_chunk_run_completed("run_d").unwrap();
+        assert!(s.claim(as_mode("incremental", "pg/db")).is_ok());
+    }
+
+    #[test]
+    fn a_chunk_run_is_handed_to_its_own_source_only() {
+        let s = store();
+        let (a, b) = (
+            ProgressKey::chunked("orders", "pg/a"),
+            ProgressKey::chunked("orders", "pg/b"),
+        );
+        s.open_chunk_run(&a, "run_a", "h", 3, &[(1, 10)]).unwrap();
+        let other = s.claim(b.clone()).unwrap();
+        assert_eq!(other.chunk_run().unwrap(), None, "P-02");
+        assert_eq!(other.latest_chunk_run().unwrap(), None);
+        s.open_chunk_run(&b, "run_b", "h", 3, &[(1, 10)])
+            .expect("one in-progress run per source");
+        s.open_chunk_run(&b, "run_b2", "h", 3, &[(1, 10)])
+            .expect_err("and no second one");
+        let own = |k: &ProgressKey| s.claim(k.clone()).unwrap().chunk_run().unwrap();
+        assert_eq!(own(&a), Some(("run_a".into(), "h".into())));
+        assert_eq!(own(&b), Some(("run_b".into(), "h".into())));
+        s.finalize_chunk_run_completed("run_a").unwrap();
+        assert_eq!(own(&a), None);
+        assert_eq!(own(&b), Some(("run_b".into(), "h".into())));
+        let latest = |k: &ProgressKey| s.claim(k.clone()).unwrap().latest_chunk_run().unwrap();
+        assert_eq!(latest(&a).as_deref(), Some("run_a"));
+        assert_eq!(latest(&b).as_deref(), Some("run_b"));
+    }
+
+    #[test]
+    fn a_chunk_run_that_recorded_no_source_is_adopted_once_by_the_only_source() {
+        let s = store();
+        s.create_chunk_run("run_l", "orders", "h", 3).unwrap();
+        put(&s, "orders", "pg/a", "5", "id", "orders_a").unwrap();
+        put(&s, "other", "pg/b", "5", "id", "other").unwrap();
+        let a = ProgressKey::chunked("orders", "pg/a");
+        let claim = s.claim(a.clone()).unwrap();
+        assert_eq!(claim.latest_chunk_run().unwrap().as_deref(), Some("run_l"));
+        assert_eq!(
+            claim.chunk_run().unwrap(),
+            Some(("run_l".into(), "h".into()))
+        );
+        assert_eq!(s.in_progress_chunk_run("orders", None).unwrap(), None);
+        assert_eq!(claim.resume_run_id().unwrap().as_deref(), Some("run_l"));
+        assert_eq!(
+            s.claim(ProgressKey::chunked("orders", "pg/b"))
+                .unwrap()
+                .chunk_run()
+                .unwrap(),
+            None,
+            "once adopted it is its owner's"
+        );
+        refusal(s.claim(as_mode("incremental", "pg/a")), OWNER);
+    }
+
+    #[test]
+    fn a_chunk_run_that_recorded_no_source_is_refused_while_the_name_has_two_sources() {
+        for other in ["cursor", "chunk_run", "keyset_range"] {
+            let s = store();
+            s.create_chunk_run("run_l", "orders", "h", 3).unwrap();
+            match other {
+                "cursor" => put(&s, "orders", "pg/b", "5", "id", "orders_b").unwrap(),
+                "chunk_run" => s
+                    .open_chunk_run(
+                        &ProgressKey::chunked("orders", "pg/b"),
+                        "run_b",
+                        "h",
+                        3,
+                        &[],
+                    )
+                    .unwrap(),
+                _ => s
+                    .persist_keyset_ranges("orders", "pg/b", "run_k", "id", &[(None, None)])
+                    .unwrap(),
+            }
+            let a = s.claim(ProgressKey::chunked("orders", "pg/a")).unwrap();
+            for cycle in 1..=2 {
+                let said = refusal(a.chunk_run(), UNKNOWN);
+                for want in [
+                    "'run_l'",
+                    "(`pg/b` and `pg/a`)",
+                    "`rivet state reset-chunks -c <config> --export orders` abandons run 'run_l'",
+                ] {
+                    assert!(
+                        said.contains(want),
+                        "{other} cycle {cycle}: {want} in {said}"
+                    );
+                }
+                assert!(
+                    s.in_progress_chunk_run("orders", None).unwrap().is_some(),
+                    "{other} cycle {cycle}: a refusal changes nothing"
+                );
+            }
+            s.reset_chunk_checkpoint("orders").unwrap();
+            assert_eq!(a.chunk_run().unwrap(), None, "{other}: the remedy lifts it");
+        }
     }
 
     #[test]

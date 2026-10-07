@@ -38,6 +38,7 @@ pub(in crate::pipeline) fn run_chunked_parallel_checkpoint(
     summary: &mut RunSummary,
     chunk_source: ChunkSource,
     meta: &mut crate::pipeline::job::MetaConn<'_>,
+    progress: &crate::state::ProgressClaim<'_>,
 ) -> Result<()> {
     // Subject to the per-runner facade contract (ADR-0018) — dispatched directly
     // from job.rs (bypassing run_export), so it sets the flag itself.
@@ -78,7 +79,8 @@ pub(in crate::pipeline) fn run_chunked_parallel_checkpoint(
         }
     };
 
-    let run_id = ensure_chunk_checkpoint_plan(state, plan, cp, summary, &chunks, config_path)?;
+    let run_id =
+        ensure_chunk_checkpoint_plan(state, plan, cp, summary, &chunks, config_path, progress)?;
 
     // ADR-0012 M8: when resuming a chunked run, reconcile the destination's
     // prior-run manifest with the local chunk_task state.  Parts whose

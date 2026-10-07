@@ -240,6 +240,54 @@ seeds:
         cells:
           - "lib:the_rebaseline_remedy_names_the_steps_the_product_runs"
 
+  - name: interrupted-run-continued-by-another-mode
+    class: an unfinished checkpoint run's stored progress (page cursor, anchor) is continued by a run of another mode as if it were a committed high-water
+    history: "2026-10-06 - a keyset run crashed after page 0, the export was switched to mode: incremental without a reset: exit 0 with _SUCCESS and a manifest of 1900 of 2000 rows (v0.31.0)"
+    scope: source
+    patch: interrupted-run-continued-by-another-mode/shared.patch
+    engines:
+      postgres:
+        cells:
+          - crashed_keyset_then_incremental_finish_the_run_postgres
+          - crashed_keyset_then_incremental_reset_postgres
+          - crashed_range_chunk_then_incremental_reset_postgres
+      mysql:
+        cells:
+          - crashed_keyset_then_incremental_finish_the_run_mysql
+          - crashed_keyset_then_incremental_reset_mysql
+          - crashed_range_chunk_then_incremental_reset_mysql
+      mssql:
+        cells:
+          - crashed_keyset_then_incremental_finish_the_run_mssql
+          - crashed_keyset_then_incremental_reset_mssql
+          - crashed_range_chunk_then_incremental_reset_mssql
+      oracle:
+        cells:
+          - crashed_keyset_then_incremental_finish_the_run_oracle
+          - crashed_keyset_then_incremental_reset_oracle
+      mongo:
+        na: "a Mongo export accepts only mode: full or cdc, so no run of another mode can meet its interrupted keyset run"
+
+  - name: chunk-run-resumed-by-another-source
+    class: an interrupted range-chunk run is looked up by export name alone and resumed by a same-named export of another source
+    history: "2026-10-06 - config A crashed after chunk 0, same-named config B of another database ran: exit 0, 'resuming it', 1000 of 5000 rows (v0.31.0)"
+    scope: source
+    patch: chunk-run-resumed-by-another-source/shared.patch
+    engines:
+      postgres:
+        cells:
+          - range_chunk_shared_name_another_source_postgres
+      mysql:
+        cells:
+          - range_chunk_shared_name_another_source_mysql
+      mssql:
+        cells:
+          - range_chunk_shared_name_another_source_mssql
+      oracle:
+        na: "range chunking refuses the stand's NUMBER key on Oracle and the stand has one Oracle service, so no cell can open two same-named range-chunk runs there (the matrix records the gap)"
+      mongo:
+        na: "a Mongo export has no range chunking"
+
   - name: load-append-writes-before-asking
     class: a load writes a warehouse name before asking whether the ledger has a record of it, or journals a stop before the write in a way the next load reads as ownership
     history: "2026-10-06 triage P-03, P-08, P-10 - an incremental or CDC load replaced a foreign view and appended to a foreign `__changes`, exit 0; the stale-buffer stop was journaled `failed` and the `writing` row preceded the ownership check, so the next load overwrote a table it had refused"

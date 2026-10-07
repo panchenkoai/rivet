@@ -94,14 +94,14 @@ fn pg_keyset_range_round_trips_and_commits() {
     use rivet::state::{KeysetRangePart, StateStore};
     let Some(s) = pg_store() else { return };
     let export = "pg_keyset_range_rt";
-    s.clear_keyset_ranges(export).ok();
+    s.clear_keyset_ranges(export, "src").ok();
 
     let ranges = vec![
         (None, Some("k0500".to_string())),
         (Some("k0500".to_string()), None),
     ];
     // Binds range_index (i64) into the range_index column — WrongType on int4.
-    s.persist_keyset_ranges(export, "run-1", "id", &ranges)
+    s.persist_keyset_ranges(export, "src", "run-1", "id", &ranges)
         .unwrap();
     // Reads range_index/done (i64) back — panics on int4.
     let loaded = s.load_keyset_ranges(export, "run-1", "id").unwrap();
@@ -128,7 +128,7 @@ fn pg_keyset_range_round_trips_and_commits() {
     assert!(!after[0].done, "range 0 untouched");
     assert!(after[1].done, "range 1 committed → done");
 
-    s.clear_keyset_ranges(export).ok();
+    s.clear_keyset_ranges(export, "src").ok();
 }
 
 #[test]
@@ -563,17 +563,20 @@ fn pg_a_chunk_run_whose_task_insert_fails_is_not_left_open() {
              FOR EACH ROW EXECUTE FUNCTION fail_task();",
         )
         .unwrap();
-    s.open_chunk_run("run-1", "orders", "h", 3, &[(1, 10), (11, 20)])
+    let key = rivet::state::ProgressKey::chunked("orders", "src");
+    s.open_chunk_run(&key, "run-1", "h", 3, &[(1, 10), (11, 20)])
         .unwrap_err();
     assert!(
-        s.find_in_progress_chunk_run("orders").unwrap().is_none(),
+        s.list_export_names_with_in_progress_chunk_runs()
+            .unwrap()
+            .is_empty(),
         "the chunk_run row must roll back with its failed task insert"
     );
 
     client
         .batch_execute("DROP TRIGGER fail_task ON chunk_task;")
         .unwrap();
-    s.open_chunk_run("run-2", "orders", "h", 3, &[(1, 10), (11, 20)])
+    s.open_chunk_run(&key, "run-2", "h", 3, &[(1, 10), (11, 20)])
         .unwrap();
     assert_eq!(s.count_chunk_tasks_total("run-2").unwrap(), 2);
 }

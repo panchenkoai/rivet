@@ -515,6 +515,7 @@ fn run_keyset_parallel(
             let fresh = sample_parallel_ranges(src, plan, &key, parallel, floor_r, ceil_r)?;
             st.persist_keyset_ranges(
                 &plan.export_name,
+                &scope,
                 &summary.run_id,
                 &key,
                 &lo_hi_pairs(&fresh),
@@ -1285,7 +1286,8 @@ mod tests {
             source: "p".into(),
             stream: String::new(),
             column: Some("id".into()),
-            continues_cursor: false,
+            mode: "keyset",
+            continues_high_water: false,
         }
     }
 
@@ -1319,7 +1321,8 @@ mod tests {
         let anchored = |rid: &str, ranged_on: Option<&str>| {
             st.set_resume_run_id(&anchor_key(), rid).unwrap();
             if let Some(key) = ranged_on {
-                st.persist_keyset_ranges("e", rid, key, &ranges).unwrap();
+                st.persist_keyset_ranges("e", "p", rid, key, &ranges)
+                    .unwrap();
             }
         };
         anchored("par", Some("id"));

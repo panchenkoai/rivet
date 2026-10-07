@@ -42,21 +42,19 @@ impl StateStore {
     pub fn persist_keyset_ranges(
         &self,
         export_name: &str,
+        source: &str,
         run_id: &str,
         key_column: &str,
         ranges: &[(Option<String>, Option<String>)],
     ) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
         self.transaction(|| {
-            self.execute(
-                "DELETE FROM keyset_range WHERE export_name = ?1",
-                &[export_name.into()],
-            )?;
+            self.clear_keyset_ranges(export_name, source)?;
             for (idx, (lo, hi)) in ranges.iter().enumerate() {
                 self.execute(
                     "INSERT INTO keyset_range \
-                     (export_name, run_id, range_index, lo, hi, done, updated_at, key_column) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7)",
+                     (export_name, source, run_id, range_index, lo, hi, done, updated_at, key_column) \
+                     VALUES (?1, ?8, ?2, ?3, ?4, ?5, 0, ?6, ?7)",
                     &[
                         export_name.into(),
                         run_id.into(),
@@ -65,6 +63,7 @@ impl StateStore {
                         hi.clone().into(),
                         now.as_str().into(),
                         key_column.into(),
+                        source.into(),
                     ],
                 )?;
             }
@@ -118,13 +117,13 @@ impl StateStore {
         Ok(rows > 0)
     }
 
-    /// Clear an export's persisted ranges. Called post-finalize (via
+    /// Clear the persisted ranges of an export's stream under `source`. Called post-finalize (via
     /// `finalize_keyset_anchor`) once the complete manifest is written — a no-op
     /// for any export that never ran parallel keyset.
-    pub fn clear_keyset_ranges(&self, export_name: &str) -> Result<()> {
+    pub fn clear_keyset_ranges(&self, export_name: &str, source: &str) -> Result<()> {
         self.execute(
-            "DELETE FROM keyset_range WHERE export_name = ?1",
-            &[export_name.into()],
+            "DELETE FROM keyset_range WHERE export_name = ?1 AND source = ?2",
+            &[export_name.into(), source.into()],
         )?;
         Ok(())
     }
@@ -198,6 +197,7 @@ mod tests {
         let s = store();
         s.persist_keyset_ranges(
             "exp",
+            "src",
             "run-1",
             "id",
             &[(None, Some("5".into())), (Some("5".into()), None)],
@@ -207,7 +207,7 @@ mod tests {
             "CREATE TRIGGER fail_range BEFORE INSERT ON keyset_range \
              BEGIN SELECT RAISE(ABORT, 'injected'); END;",
         );
-        s.persist_keyset_ranges("exp", "run-2", "id", &[(None, None)])
+        s.persist_keyset_ranges("exp", "src", "run-2", "id", &[(None, None)])
             .unwrap_err();
         assert_eq!(s.load_keyset_ranges("exp", "run-1", "id").unwrap().len(), 2);
     }
@@ -215,7 +215,7 @@ mod tests {
     #[test]
     fn a_range_whose_done_flip_fails_records_no_parts() {
         let s = store();
-        s.persist_keyset_ranges("exp", "run-1", "id", &[(None, None)])
+        s.persist_keyset_ranges("exp", "src", "run-1", "id", &[(None, None)])
             .unwrap();
         s.exec_for_test(
             "CREATE TRIGGER fail_done BEFORE UPDATE ON keyset_range \
@@ -239,7 +239,7 @@ mod tests {
             (Some("k0500".to_string()), Some("k1000".to_string())),
             (Some("k1000".to_string()), None),
         ];
-        s.persist_keyset_ranges("exp", "run-1", "id", &ranges)
+        s.persist_keyset_ranges("exp", "src", "run-1", "id", &ranges)
             .unwrap();
         let loaded = s.load_keyset_ranges("exp", "run-1", "id").unwrap();
         assert_eq!(loaded.len(), 3);
@@ -256,6 +256,7 @@ mod tests {
         let s = store();
         s.persist_keyset_ranges(
             "exp",
+            "src",
             "run-1",
             "id",
             &[(None, Some("500".into())), (Some("500".into()), None)],
@@ -282,7 +283,7 @@ mod tests {
     fn load_with_a_different_run_id_returns_nothing() {
         // A stale set from a superseded run must not leak into a fresh run's load.
         let s = store();
-        s.persist_keyset_ranges("exp", "run-1", "id", &[(None, None)])
+        s.persist_keyset_ranges("exp", "src", "run-1", "id", &[(None, None)])
             .unwrap();
         assert!(
             s.load_keyset_ranges("exp", "run-2", "id")
@@ -301,7 +302,7 @@ mod tests {
             (None, Some("k5".to_string())),
             (Some("k5".to_string()), None),
         ];
-        s.persist_keyset_ranges("exp", "run-1", "id", &ranges)
+        s.persist_keyset_ranges("exp", "src", "run-1", "id", &ranges)
             .unwrap();
 
         let worker = StateStore::open_at_ref(s.state_ref()).unwrap();
@@ -333,13 +334,27 @@ mod tests {
     #[test]
     fn clear_removes_all_ranges_for_the_export() {
         let s = store();
-        s.persist_keyset_ranges("exp", "run-1", "id", &[(None, None)])
+        s.persist_keyset_ranges("exp", "src", "run-1", "id", &[(None, None)])
             .unwrap();
-        s.clear_keyset_ranges("exp").unwrap();
+        s.clear_keyset_ranges("exp", "src").unwrap();
         assert!(
             s.load_keyset_ranges("exp", "run-1", "id")
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn two_sources_of_one_export_name_keep_their_own_ranges() {
+        let s = StateStore::open_in_memory().unwrap();
+        let one = [(None, None)];
+        s.persist_keyset_ranges("exp", "pg/a", "run-a", "id", &one)
+            .unwrap();
+        s.persist_keyset_ranges("exp", "pg/b", "run-b", "id", &one)
+            .expect("the same range index under another source");
+        assert_eq!(s.load_keyset_ranges("exp", "run-a", "id").unwrap().len(), 1);
+        s.clear_keyset_ranges("exp", "pg/b").unwrap();
+        assert_eq!(s.load_keyset_ranges("exp", "run-a", "id").unwrap().len(), 1);
+        assert_eq!(s.load_keyset_ranges("exp", "run-b", "id").unwrap().len(), 0);
     }
 }

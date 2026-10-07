@@ -163,3 +163,53 @@ scenarios:
     mssql:    { test: incremental_shared_name_another_table_mssql }
     oracle:   { test: incremental_shared_name_another_table_oracle }
     mongo:    { test: resume_shared_name_another_collection_mongo }
+
+  # Record kind: a stream's stored record is either a committed high-water (any mode may meet it, MT2)
+  # or an interrupted run owned by the mode that opened it. Each cell crashes a checkpointed run after
+  # its first unit (ids 1..=4 of 10), switches to incremental without a reset, requires the refusal
+  # (exit 5, RIVET_STATE_INTERRUPTED_RUN_OWNER_MISMATCH, nothing written) TWICE, executes one of the
+  # two remedies the message names, and re-reads every source id from the destination.
+
+  - id: crashed_keyset_then_incremental_finish_the_run
+    what: "MT9 — crashed keyset checkpoint run, then incremental: refused twice; the keyset settings restored finish the run, and incremental then continues from its high-water"
+    postgres: { test: crashed_keyset_then_incremental_finish_the_run_postgres }
+    mysql:    { test: crashed_keyset_then_incremental_finish_the_run_mysql }
+    mssql:    { test: crashed_keyset_then_incremental_finish_the_run_mssql }
+    oracle:   { test: crashed_keyset_then_incremental_finish_the_run_oracle }
+    mongo:    { na: "a Mongo export accepts only mode: full or cdc, so there is no incremental mode to switch into" }
+
+  - id: crashed_keyset_then_incremental_reset
+    what: "MT9 — crashed keyset checkpoint run, then incremental: refused twice; `rivet state reset` abandons the run and incremental does a full pass"
+    postgres: { test: crashed_keyset_then_incremental_reset_postgres }
+    mysql:    { test: crashed_keyset_then_incremental_reset_mysql }
+    mssql:    { test: crashed_keyset_then_incremental_reset_mssql }
+    oracle:   { test: crashed_keyset_then_incremental_reset_oracle }
+    mongo:    { na: "a Mongo export accepts only mode: full or cdc, so there is no incremental mode to switch into" }
+
+  - id: crashed_range_chunk_then_incremental_finish_the_run
+    what: "MT9 — crashed range-chunk checkpoint run, then incremental: refused twice; the chunk settings restored finish the run, and incremental then does its MT1 full pass"
+    postgres: { test: crashed_range_chunk_then_incremental_finish_the_run_postgres }
+    mysql:    { test: crashed_range_chunk_then_incremental_finish_the_run_mysql }
+    mssql:    { test: crashed_range_chunk_then_incremental_finish_the_run_mssql }
+    oracle:   { gap: "range chunking refuses the Rig table's Oracle key (NUMBER(19): 'not an integer-family column', observed 2026-10-07), so no range-chunk checkpoint run opens; needs a fixture whose key Oracle range chunking accepts" }
+    mongo:    { na: "a Mongo export accepts only mode: full or cdc, so there is no incremental mode to switch into" }
+
+  - id: crashed_range_chunk_then_incremental_reset
+    what: "MT9 — crashed range-chunk checkpoint run, then incremental: refused twice; `rivet state reset-chunks` abandons the run and incremental does a full pass"
+    postgres: { test: crashed_range_chunk_then_incremental_reset_postgres }
+    mysql:    { test: crashed_range_chunk_then_incremental_reset_mysql }
+    mssql:    { test: crashed_range_chunk_then_incremental_reset_mssql }
+    oracle:   { gap: "range chunking refuses the Rig table's Oracle key (NUMBER(19): 'not an integer-family column', observed 2026-10-07), so no range-chunk checkpoint run opens; needs a fixture whose key Oracle range chunking accepts" }
+    mongo:    { na: "a Mongo export accepts only mode: full or cdc, so there is no incremental mode to switch into" }
+
+  # A range-chunk run belongs to its source: config A crashes after chunk 0; config B (same export name,
+  # table name and chunk settings, ANOTHER database on the same server) delivers all 30 of its own ids,
+  # twice; A then resumes its own run and delivers its 10.
+
+  - id: range_chunk_shared_name_another_source
+    what: "two configs, one export name, one state database, two databases: neither adopts the other's interrupted chunk run"
+    postgres: { test: range_chunk_shared_name_another_source_postgres }
+    mysql:    { test: range_chunk_shared_name_another_source_mysql }
+    mssql:    { test: range_chunk_shared_name_another_source_mssql }
+    oracle:   { gap: "the stand has one Oracle service (FREEPDB1), and another schema of it is the SAME source key, so the cell needs a second PDB; range chunking also refuses the Rig table's NUMBER(19) key" }
+    mongo:    { na: "a Mongo export has no range chunking (mode: full or cdc only)" }
