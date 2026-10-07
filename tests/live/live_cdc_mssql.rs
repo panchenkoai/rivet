@@ -2459,31 +2459,8 @@ fn mssql_cdc_a_batch_past_the_memory_cap_spills_rather_than_failing() {
 
     // The fixture is not inert, and memory really was bounded. Rows alone cannot see
     // this: a spill that quietly keeps buffering delivers identical rows.
-    let split = log
-        .split("delivered ")
-        .filter_map(|s| s.split_once(" rows from memory and "))
-        .find_map(|(head, rest)| {
-            let tail = rest.split_once(" from disk")?.0;
-            Some((
-                head.trim().parse::<usize>().ok()?,
-                tail.trim().parse::<usize>().ok()?,
-            ))
-        });
-    let (from_memory, from_disk) =
-        split.unwrap_or_else(|| panic!("the run must report the split. stderr: {log}"));
-    assert!(
-        from_disk > 0,
-        "rows must actually reach DISK — a cap that was noticed and never acted on \\
-         reads the same in the parquet. stderr: {log}"
-    );
-    // CAP + 1: the cap is checked after the row is pushed, so the head holds one
-    // row more than the cap before the spill opens.
-    assert_eq!(
-        from_memory,
-        CAP + 1,
-        "memory must stop at the cap — that is the point of spilling, and a head \\
-         larger than the cap means the ceiling is not enforced. stderr: {log}"
-    );
+    // A poll reads one capture instance, so every split here is this test's batch.
+    assert_spill_evidence(&log, CAP, OwnSpill::Batch);
 
     // THE INDEPENDENT ORACLE — the SOURCE table, the delivered parquet, and rivet's
     // two ledgers, from one DuckDB session that shares no code with rivet.
