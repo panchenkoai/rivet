@@ -243,34 +243,51 @@ impl ClickhouseLoader {
     /// The count comes from each part, not from `X-ClickHouse-Summary`: that counts rows
     /// materialized views write too and reads 0 under `async_insert`, while a statement that
     /// returns 200 under `wait_end_of_query` inserted all of its rows (ADR-0035 CH6).
-    fn insert_uris(&self, target: &str, uris: &[String], repeat: Repeat) -> Result<u64> {
+    fn insert_uris(
+        &self,
+        target: &str,
+        uris: &[String],
+        rows: &[u64],
+        repeat: Repeat,
+    ) -> Result<u64> {
         uris.iter()
+            .zip(rows)
             .enumerate()
-            .map(|(i, uri)| {
-                let rows = self.insert_one(target, uri, repeat)?;
+            .map(|(i, (uri, rows))| {
+                let rows = self.insert_one(target, uri, *rows, repeat)?;
                 crate::test_hook::maybe_panic_at_chunk("clickhouse_after_part", i as i64);
                 Ok(rows)
             })
             .sum()
     }
 
-    /// Insert one part into `target`; the rows it holds. Pushed or pulled, the part's footer
-    /// is read first, so a timestamp ClickHouse would clamp refuses before any row lands.
-    fn insert_one(&self, target: &str, uri: &str, repeat: Repeat) -> Result<u64> {
+    /// The row count of every part in `uris`, each footer checked for a timestamp ClickHouse would clamp; asked before the load's first statement.
+    fn checked_part_rows(&self, uris: &[String]) -> Result<Vec<u64>> {
+        uris.iter()
+            .map(|uri| {
+                let (_, key) = super::split_object_uri(uri)?;
+                let meta = super::partition_budget::read_footer(self.store()?, key)
+                    .with_context(|| format!("reading the footer of {uri}"))?;
+                refuse_unholdable_timestamps(&meta, uri)?;
+                footer_rows(&meta)
+            })
+            .collect()
+    }
+
+    /// Insert one part of `rows` rows into `target`; a pushed part's own footer is checked again.
+    fn insert_one(&self, target: &str, uri: &str, rows: u64, repeat: Repeat) -> Result<u64> {
         let (bucket, key) = super::split_object_uri(uri)?;
         let pull = self
             .named_collection
             .as_ref()
             .filter(|_| pullable(bucket, key));
-        let (query, body, meta) = match pull {
+        let (query, body) = match pull {
             Some(nc) => (
                 format!(
                     "INSERT INTO {target} SELECT * FROM {}",
                     pull_source(nc, super::scheme_of(uri), bucket, key)
                 ),
                 bytes::Bytes::new(),
-                super::partition_budget::read_footer(self.store()?, key)
-                    .with_context(|| format!("reading the footer of {uri}"))?,
             ),
             None => {
                 let bytes = self
@@ -278,12 +295,11 @@ impl ClickhouseLoader {
                     .read(key)
                     .with_context(|| format!("reading {uri} for the ClickHouse load"))?;
                 let meta = parquet_footer(&bytes).with_context(|| format!("reading {uri}"))?;
+                refuse_unholdable_timestamps(&meta, uri)?;
                 let insert = format!("INSERT INTO {target} FORMAT Parquet");
-                (insert, bytes::Bytes::from(bytes), meta)
+                (insert, bytes::Bytes::from(bytes))
             }
         };
-        refuse_unholdable_timestamps(&meta, uri)?;
-        let rows = footer_rows(&meta)?;
         let params = [
             ("query", query.as_str()),
             ("input_format_null_as_default", "0"),
@@ -362,6 +378,7 @@ impl TargetLoader for ClickhouseLoader {
                 c.escape_default()
             );
         }
+        let part_rows = super::before_write(self.checked_part_rows(uris))?;
         let target = self.quoted(table);
         let swap = self.quoted(&format!("{table}__rivet_swap"));
         self.query(&create_table_sql(
@@ -373,7 +390,7 @@ impl TargetLoader for ClickhouseLoader {
             &order_by(&self.cluster_by),
         ))?;
         crate::test_hook::maybe_panic_at("clickhouse_full_after_swap_created");
-        let rows = self.insert_uris(&swap, uris, Repeat::Undelivered)?;
+        let rows = self.insert_uris(&swap, uris, &part_rows, Repeat::Undelivered)?;
         crate::test_hook::maybe_panic_at("clickhouse_full_before_swap_in");
         for (sql, repeat, hook) in swap_in(self.object_kind(table)?, &swap, &target) {
             self.post(&[], bytes::Bytes::from(sql), repeat)?;
@@ -391,6 +408,7 @@ impl TargetLoader for ClickhouseLoader {
         uris: &[String],
         pk: &[String],
     ) -> Result<u64> {
+        let part_rows = super::before_write(self.checked_part_rows(uris))?;
         let full = changelog_specs(specs);
         let changes = self.quoted(&format!("{table}__changes"));
         let shape = changelog_shape(self.cdc, table, pk, self.partition_by.as_deref())?;
@@ -410,7 +428,7 @@ impl TargetLoader for ClickhouseLoader {
             self.query(&alter)
                 .with_context(|| format!("adding new columns to `{table}__changes`"))?;
         }
-        self.insert_uris(&changes, uris, changelog_repeat(self.cdc))
+        self.insert_uris(&changes, uris, &part_rows, changelog_repeat(self.cdc))
     }
 
     fn warehouse(&self) -> Warehouse {

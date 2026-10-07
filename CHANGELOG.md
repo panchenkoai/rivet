@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **ClickHouse load: a timestamp ClickHouse cannot hold is refused before the load's first
+  statement, and that refusal no longer makes the table rivet's own.** The range check ran
+  inside the insert of each part, after the `<table>__rivet_swap` table was created, and the
+  stop was journaled as a failed load. A failed load counts as rivet having written the table,
+  so a table someone else created under that name afterwards was replaced by the next
+  `rivet load`, exit 0. Every part's footer is now checked first; the stop is journaled
+  `refused`, leaves no table behind, and the next load still refuses a table it has no record
+  of loading. A load with an out-of-range value in a later part no longer inserts the earlier
+  parts into the swap table before stopping.
+
 - **Security: a password written in a keyword/value connection string is no longer printed or
   stored.** A PostgreSQL libpq string (`host=… user=… password=… dbname=…`) is accepted in
   `url:`; SQL Server ADO and JDBC-property strings (`…;Password=…;`, `…;PWD=…;`,

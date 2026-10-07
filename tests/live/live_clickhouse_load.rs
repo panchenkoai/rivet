@@ -1073,13 +1073,13 @@ fn a_timestamp_clickhouse_cannot_hold_is_refused_when_pulled_too() {
         err.contains("column `ts` holds 9999-12-31 00:00, outside ClickHouse DateTime64's range"),
         "{err}"
     );
-    let rows = ch(&format!(
-        "SELECT sum(total_rows) FROM system.tables WHERE database = '{}' FORMAT TSV",
+    let tables = ch(&format!(
+        "SELECT count() FROM system.tables WHERE database = '{}' FORMAT TSV",
         db.0
     ));
     assert_eq!(
-        rows, "0",
-        "no row reached any table, the clamped one least of all"
+        tables, "0",
+        "the refusal comes before the first statement: no table exists, so no row reached one"
     );
 }
 
@@ -1927,4 +1927,69 @@ fn a_mongo_resume_export_into_clickhouse_accumulates_every_run() {
         "the resumed run's 500 new documents join the first 2000, not replace them"
     );
     assert_eq!(clickhouse_ids(&db), m.ids("t"));
+}
+
+/// A range refusal writes nothing and claims nothing: a foreign table created under the target's name afterwards is still refused by the next load, untouched.
+#[test]
+#[ignore = "live: requires clickhouse + fake-gcs + postgres"]
+fn a_range_refusal_claims_nothing_so_a_table_made_after_it_stays_foreign() {
+    require_alive(LiveService::ClickHouse);
+    require_alive(LiveService::FakeGcs);
+    ensure_gcs_bucket(BUCKET);
+    let mut c = pg_connect();
+    let tbl = unique_name("rivet_ch_claim");
+    c.batch_execute(&format!(
+        "CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, ts TIMESTAMP); \
+         INSERT INTO {tbl} VALUES (1, TIMESTAMP '2024-01-01 00:00:00'), \
+                                  (2, TIMESTAMP '9999-12-31 00:00:00')"
+    ))
+    .expect("seed");
+    let _t = PgTable::adopt(tbl.clone());
+    let db = Db::new("rivet_chclaim");
+    let rig = batch_into_clickhouse(Rig::pg_batch(&tbl).mode("full"), &db);
+    rig.run_ok();
+    let out = rig.load_args_env(&[], &[(PASSWORD_ENV, CLICKHOUSE_PASSWORD)]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success() && err.contains("outside ClickHouse DateTime64's range"),
+        "the first load must refuse the range:\n{err}"
+    );
+    let left = ch(&format!(
+        "SELECT name FROM system.tables WHERE database = '{}' FORMAT TSV",
+        db.0
+    ));
+    assert_eq!(
+        left.trim(),
+        "",
+        "a refusal before the first statement leaves no table, the swap table included"
+    );
+
+    ch(&format!(
+        "CREATE TABLE {}.{tbl} (id Int64, note String) ENGINE = MergeTree ORDER BY id",
+        db.0
+    ));
+    ch(&format!(
+        "INSERT INTO {}.{tbl} VALUES (99, 'foreign')",
+        db.0
+    ));
+    c.batch_execute(&format!(
+        "UPDATE {tbl} SET ts = TIMESTAMP '2024-02-02 00:00:00' WHERE id = 2"
+    ))
+    .expect("correct the source");
+    rig.run_ok();
+    let out = rig.load_args_env(&[], &[(PASSWORD_ENV, CLICKHOUSE_PASSWORD)]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success() && err.contains("no record of rivet loading it"),
+        "the second load must refuse a table rivet never loaded:\n{err}"
+    );
+    assert_eq!(
+        ch(&format!(
+            "SELECT id, note FROM {}.{tbl} ORDER BY id FORMAT TSV",
+            db.0
+        ))
+        .trim(),
+        "99\tforeign",
+        "the foreign table keeps its row"
+    );
 }
