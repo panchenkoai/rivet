@@ -437,6 +437,14 @@ fn second_run_beside_a_live_checkpointed_run(engine: SqlEngine) {
         "fixture: the first run is alive when the second answers"
     );
     assert!(first.wait().unwrap().success(), "the live run finishes");
+    let delivered: usize = read_all_parts(&rig.out_dir())
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
+    assert_eq!(
+        delivered, 300,
+        "the live run delivers every row beside the refused one"
+    );
     assert_refused(&second, Refused::by_code("RIVET_STATE_RUN_IN_PROGRESS", 5));
 }
 
