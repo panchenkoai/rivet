@@ -1529,3 +1529,46 @@ fn mongo_cdc_cli_a_capped_run_leaves_its_remainder_to_the_next_run() {
     let rest = ndjson_after_ids(&run(&[]), "docs");
     assert_eq!(rest, [3, 4].into(), "the next run delivers the remainder");
 }
+
+/// Apply one engine-neutral write to a collection.
+fn mongo_churn(m: &MongoTest, coll: &str, op: Churn) {
+    match op {
+        Churn::Insert(id) => m.insert_many(coll, vec![mongodb::bson::doc! { "_id": id, "v": id }]),
+        Churn::Update(id) => m.upsert_set(coll, id, "v", "99"),
+        Churn::Delete(id) => m.delete_one(coll, id),
+    }
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mongo-rs"]
+fn mongo_cdc_collection_removed_from_tables_and_put_back_is_refused_until_rebaselined() {
+    let db = unique_name("cdc_rejoin");
+    let m = MongoTest::connect(PORT, &db);
+    let _g = MongoDbGuard {
+        port: PORT,
+        db: db.clone(),
+    };
+    a_table_put_back_is_refused_until_rebaselined(
+        Rig::mongo_cdc("a").source_url(&MongoTest::url(PORT, &db)),
+        ["a", "b", "c"],
+        &mut |t, op| mongo_churn(&m, t, op),
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mongo-rs"]
+fn mongo_cdc_collection_switched_to_another_over_its_baseline_is_refused_and_switched_back_continues()
+ {
+    let db = unique_name("cdc_switch");
+    let m = MongoTest::connect(PORT, &db);
+    let _g = MongoDbGuard {
+        port: PORT,
+        db: db.clone(),
+    };
+    a_table_switched_over_a_baseline_is_refused_and_switched_back_continues(
+        Rig::mongo_cdc("a").source_url(&MongoTest::url(PORT, &db)),
+        ["a", "b"],
+        &|r, t| r.repoint(t),
+        &mut |t, op| mongo_churn(&m, t, op),
+    );
+}

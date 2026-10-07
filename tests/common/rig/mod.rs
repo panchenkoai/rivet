@@ -292,6 +292,14 @@ impl Rig {
         self
     }
 
+    /// Point a SQL Server CDC export at another capture instance.
+    pub fn capture_instance(mut self, ci: &str) -> Self {
+        self.cdc_lines
+            .retain(|l| !l.starts_with("capture_instance:"));
+        self.cdc_lines.push(format!("capture_instance: {ci}"));
+        self
+    }
+
     /// Query-based export (replaces the `table:` shortcut in the render).
     pub fn query(mut self, sql: &str) -> Self {
         self.query = Some(sql.to_string());
