@@ -165,11 +165,17 @@ const MASK: &str = "***";
 /// Mask the value of every `password=` / `pwd=` pair of a keyword/value connection string (libpq DSN, ADO, `;`-separated JDBC properties).
 pub fn redact_keyword_passwords(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
+    let mut stops = s.match_indices([';', '\n', '\r']).peekable();
     let mut copied = 0;
-    while let Some((key_start, value_start)) = next_password_pair(s, copied) {
+    for (key_start, value_start) in password_pairs(s) {
+        if key_start < copied {
+            continue;
+        }
+        while stops.next_if(|(at, _)| *at < value_start).is_some() {}
+        let stop = stops.peek().map_or(s.len(), |(at, _)| *at);
         out.push_str(&s[copied..value_start]);
         out.push_str(MASK);
-        copied = keyword_value_end(s, key_start, value_start);
+        copied = value_start + keyword_value_len(s, key_start, value_start, stop);
     }
     out.push_str(&s[copied..]);
     out
@@ -177,7 +183,7 @@ pub fn redact_keyword_passwords(s: &str) -> String {
 
 /// Whether `s` holds a keyword/value password pair, masked or not.
 pub(crate) fn has_keyword_password(s: &str) -> bool {
-    next_password_pair(s, 0).is_some()
+    password_pairs(s).next().is_some()
 }
 
 /// A byte a keyword may be spelled with (`db.password`, `MYSQL_PWD`, `x-passwd`).
@@ -192,37 +198,27 @@ fn is_password_keyword(key: &str) -> bool {
     })
 }
 
-/// The next `keyword = value` pair at or after `from` whose keyword names a password, as (keyword start, value start); a URL query pair (`?password=`, `&password=`) is left to [`redact_query_secrets`].
-fn next_password_pair(s: &str, from: usize) -> Option<(usize, usize)> {
+/// Every `keyword = value` pair whose keyword names a password, as (keyword start, value start), one per `=` in text order; a URL query pair (`?password=`, `&password=`) is left to [`redact_query_secrets`].
+fn password_pairs(s: &str) -> impl Iterator<Item = (usize, usize)> + '_ {
     let bytes = s.as_bytes();
-    let blanks = |at: usize| {
-        bytes[at..]
-            .iter()
-            .take_while(|b| matches!(b, b' ' | b'\t'))
-            .count()
-    };
-    let mut i = from;
-    while i < bytes.len() {
-        if !is_keyword_byte(bytes[i]) {
-            i += 1;
-            continue;
-        }
-        let key_end = i + bytes[i..]
-            .iter()
-            .take_while(|b| is_keyword_byte(**b))
-            .count();
-        let eq = key_end + blanks(key_end);
-        let in_query = i > 0 && matches!(bytes[i - 1], b'?' | b'&');
-        if bytes.get(eq) == Some(&b'=') && !in_query && is_password_keyword(&s[i..key_end]) {
-            return Some((i, eq + 1 + blanks(eq + 1)));
-        }
-        i = key_end;
-    }
-    None
+    let is_blank = |b: &&u8| matches!(**b, b' ' | b'\t');
+    s.match_indices('=').filter_map(move |(eq, _)| {
+        let key_end = eq - bytes[..eq].iter().rev().take_while(is_blank).count();
+        let key_start = key_end
+            - bytes[..key_end]
+                .iter()
+                .rev()
+                .take_while(|b| is_keyword_byte(**b))
+                .count();
+        let in_query = key_start > 0 && matches!(bytes[key_start - 1], b'?' | b'&');
+        let value_start = eq + 1 + bytes[eq + 1..].iter().take_while(is_blank).count();
+        (!in_query && is_password_keyword(&s[key_start..key_end]))
+            .then_some((key_start, value_start))
+    })
 }
 
-/// Where the value starting at `value_start` ends: the later of its closing quote and its unquoted end, so a quote character that is not a quote in the string's grammar leaks nothing.
-fn keyword_value_end(s: &str, key_start: usize, value_start: usize) -> usize {
+/// Length of the value starting at `value_start`, given the first `;` or line break at or after it (`stop`): the longer of its quoted and its unquoted reading, so a quote character that is not a quote in the string's grammar leaks nothing.
+fn keyword_value_len(s: &str, key_start: usize, value_start: usize, stop: usize) -> usize {
     let rest = &s[value_start..];
     let quoted = match rest.chars().next() {
         Some('\'') => quoted_value_len(rest, '\''),
@@ -231,24 +227,27 @@ fn keyword_value_end(s: &str, key_start: usize, value_start: usize) -> usize {
         _ => 0,
     };
     let after_semicolon = s[..key_start].trim_end_matches([' ', '\t']).ends_with(';');
-    value_start + quoted.max(bare_value_len(rest, after_semicolon))
+    quoted.max(bare_value_len(rest, stop - value_start, after_semicolon))
 }
 
-/// Length of an unquoted value: up to the next `;` in a `;`-separated string, else to whichever of the libpq (whitespace) and ADO (`;`) terminators comes later, so neither grammar leaks a tail.
-fn bare_value_len(rest: &str, after_semicolon: bool) -> usize {
-    let line = &rest[..rest.find(['\n', '\r']).unwrap_or(rest.len())];
+/// Length of an unquoted value whose first `;` or line break is at `stop`: up to `stop` in a `;`-separated string, else to whichever of the libpq (whitespace) and ADO (`;`) terminators comes later, so neither grammar leaks a tail.
+fn bare_value_len(rest: &str, stop: usize, after_semicolon: bool) -> usize {
     let ends_value = |c: char| c == ';' || c.is_whitespace();
-    let masked = line
+    let masked = rest
         .strip_prefix(MASK)
         .is_some_and(|after| after.chars().next().is_none_or(ends_value));
     if masked {
         return MASK.len();
     }
-    let semicolon = line.find(';');
     if after_semicolon {
-        return semicolon.unwrap_or(line.len());
+        return stop;
     }
-    unescaped_whitespace(line).max(semicolon.unwrap_or(0))
+    let semicolon = if rest[stop..].starts_with(';') {
+        stop
+    } else {
+        0
+    };
+    unescaped_whitespace(rest).max(semicolon)
 }
 
 /// Length of a quoted value including both quotes, honouring `\x` escapes and a doubled closing quote; the whole text when the quote never closes.
@@ -268,17 +267,17 @@ fn quoted_value_len(rest: &str, close: char) -> usize {
     rest.len()
 }
 
-/// Offset of the first whitespace not escaped by a backslash, or the length of `line`.
-fn unescaped_whitespace(line: &str) -> usize {
-    let mut chars = line.char_indices();
+/// Offset of the first whitespace not escaped by a backslash, or the length of `text`; a backslash never escapes a line break.
+fn unescaped_whitespace(text: &str) -> usize {
+    let mut chars = text.char_indices().peekable();
     while let Some((i, c)) = chars.next() {
         if c == '\\' {
-            chars.next();
+            chars.next_if(|(_, next)| !matches!(next, '\n' | '\r'));
         } else if c.is_whitespace() {
             return i;
         }
     }
-    line.len()
+    text.len()
 }
 
 /// Redact SECRET-BEARING QUERY PARAMETERS: `?token=…`, `&password=…`,
@@ -849,6 +848,164 @@ mod tests {
                     assert_eq!(redact_secrets(&out), out, "second pass: {ctx}");
                 }
             }
+        }
+    }
+
+    /// Wall-clock ceiling for one hostile megabyte: the scan is one pass and needs milliseconds, a quadratic one needs minutes.
+    const HOSTILE_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// The keyword/value scan of `input`, run on a watchdog thread so an overrun or a panic fails the test instead of hanging it.
+    fn scan_within_budget(label: &str, input: &str) -> Result<String, String> {
+        use std::sync::mpsc::RecvTimeoutError;
+        let (done, result) = std::sync::mpsc::channel();
+        let owned = input.to_string();
+        std::thread::spawn(move || {
+            let has = has_keyword_password(&owned);
+            let _ = done.send((redact_keyword_passwords(&owned), has));
+        });
+        match result.recv_timeout(HOSTILE_BUDGET) {
+            Ok((out, has)) if has || out == input => Ok(out),
+            Ok(_) => Err(format!("{label}: masked a string with no password pair")),
+            Err(RecvTimeoutError::Timeout) => {
+                Err(format!("{label}: no result within {HOSTILE_BUDGET:?}"))
+            }
+            Err(RecvTimeoutError::Disconnected) => Err(format!("{label}: the scan panicked")),
+        }
+    }
+
+    /// Unterminated quotes, a key at the very end, empty values, multi-byte text after `=`: each returns, and returns this.
+    #[test]
+    fn the_keyword_scan_returns_on_every_degenerate_shape() {
+        for (input, want) in [
+            ("password=", "password=***"),
+            ("host=h password", "host=h password"),
+            ("host=h password=", "host=h password=***"),
+            ("host=h password= ", "host=h password= ***"),
+            ("host=h password=\t\t", "host=h password=\t\t***"),
+            ("password='never closed", "password=***"),
+            ("password=\"never closed", "password=***"),
+            ("pwd={never closed", "pwd=***"),
+            ("password='", "password=***"),
+            ("password=\\", "password=***"),
+            ("password='\\", "password=***"),
+            ("password=é", "password=***"),
+            ("password=—x y", "password=*** y"),
+            ("password=😀;x", "password=***"),
+            ("naïve=x password=日本;", "naïve=x password=***"),
+            ("=", "="),
+            ("==", "=="),
+            (" = ", " = "),
+            (";=;", ";=;"),
+            ("password==x", "password=***"),
+            ("password=pwd =y", "password=*** =y"),
+            (
+                "host=h password='a b'pwd=S3cr3tPw",
+                "host=h password=***pwd=***",
+            ),
+            (
+                "host=h password=a;pwd=S3cr3tPw dbname=d",
+                "host=h password=*** dbname=d",
+            ),
+            (
+                "host=h password=S3cr3tPw\\\nnext line",
+                "host=h password=***\nnext line",
+            ),
+            (
+                "host=h password=S3cr3tPw\\\r\nnext line",
+                "host=h password=***\r\nnext line",
+            ),
+            ("password=x\r\npassword=y", "password=***\r\npassword=***"),
+            ("x;password= ;y", "x;password= ***;y"),
+            ("password=***", "password=***"),
+            ("password=***x y", "password=*** y"),
+            (
+                "Server=h;Pwd=S3cr3tPw\\;tail;x=1",
+                "Server=h;Pwd=***;tail;x=1",
+            ),
+            ("a ?password=x", "a ?password=x"),
+            ("a &pwd = x y", "a &pwd = x y"),
+        ] {
+            assert_eq!(
+                scan_within_budget(input, input).as_deref(),
+                Ok(want),
+                "{input:?}"
+            );
+        }
+    }
+
+    /// One megabyte of each hostile shape is scanned in one pass: the exact output, inside the budget.
+    #[test]
+    fn the_keyword_scan_is_linear_on_a_hostile_megabyte() {
+        const MB: usize = 1 << 20;
+        let blanks = " ".repeat(MB);
+        let shapes = [
+            ("`;=` repeated", ";=".repeat(MB / 2), ";=".repeat(MB / 2)),
+            ("`=` alone", "=".repeat(MB), "=".repeat(MB)),
+            (
+                "`pwd=a ` repeated, no `;`",
+                "pwd=a ".repeat(MB / 6),
+                "pwd=*** ".repeat(MB / 6),
+            ),
+            (
+                "`pwd=é ` repeated",
+                "pwd=é ".repeat(MB / 7),
+                "pwd=*** ".repeat(MB / 7),
+            ),
+            (
+                "masked pairs repeated",
+                "pwd=*** ".repeat(MB / 8),
+                "pwd=*** ".repeat(MB / 8),
+            ),
+            (
+                "blanks around every `=`",
+                "pwd \t= \t".repeat(MB / 8),
+                "pwd \t= \t*** \t= \t".repeat(MB / 16),
+            ),
+            (
+                "`pwd=;` repeated",
+                "pwd=;".repeat(MB / 5),
+                "pwd=***".to_string(),
+            ),
+            (
+                "`pwd=` then `;x=y` repeated",
+                format!("a;pwd={}", ";x=y".repeat(MB / 4)),
+                format!("a;pwd=***{}", ";x=y".repeat(MB / 4)),
+            ),
+            (
+                "`password=` repeated",
+                "password=".repeat(MB / 9),
+                "password=***".to_string(),
+            ),
+            (
+                "a quote that never closes",
+                format!("pwd='{}", "a=b;".repeat(MB / 4)),
+                "pwd=***".to_string(),
+            ),
+            (
+                "an opening quote in every pair",
+                "pwd='a".repeat(MB / 6),
+                "pwd=***".to_string(),
+            ),
+            (
+                "a megabyte of blanks before `=`",
+                format!("pwd{blanks}=x"),
+                format!("pwd{blanks}=***"),
+            ),
+            (
+                "a megabyte keyword",
+                format!("{}=x", "a".repeat(MB)),
+                format!("{}=x", "a".repeat(MB)),
+            ),
+        ];
+        for (label, input, want) in &shapes {
+            let out = scan_within_budget(label, input)
+                .unwrap_or_else(|why| panic!("KEYWORD SCAN NOT LINEAR: {why}"));
+            assert!(
+                out == *want,
+                "{label}: {} bytes out, {} wanted",
+                out.len(),
+                want.len()
+            );
         }
     }
 
