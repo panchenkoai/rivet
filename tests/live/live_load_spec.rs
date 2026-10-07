@@ -1129,6 +1129,89 @@ fn bigquery_incremental_onto_a_table_already_in_the_dataset_is_refused_every_tim
     );
 }
 
+/// What `name` is and holds, read from BigQuery: its type, its view text, its rows.
+fn object_as_it_stands(bq: &BqLive, name: &str) -> (Option<String>, Vec<serde_json::Value>) {
+    let at = format!("`{}.{}`", bq.project, bq.dataset);
+    let mut seen = bq.read_bq_rows(&format!(
+        "SELECT view_definition FROM {at}.INFORMATION_SCHEMA.VIEWS WHERE table_name = '{name}'"
+    ));
+    seen.extend(bq.read_bq_rows(&format!(
+        "SELECT * FROM `{}.{}.{name}` ORDER BY 1",
+        bq.project, bq.dataset
+    )));
+    (bq.read_bq_table_type(name), seen)
+}
+
+/// A VIEW at the export's name, or a `<table>__changes` beside a free name, that the ledger
+/// has no record of: the append refuses on every attempt with exit 5 and its code, and the
+/// object is afterwards exactly what it was. RED on main: the first load replaced the view
+/// (appended to the log) and exited 0.
+#[test]
+#[ignore = "live: requires docker compose up -d postgres + BigQuery creds"]
+fn bigquery_incremental_onto_a_view_or_a_log_it_did_not_load_is_refused_every_time() {
+    let Some(bq) = BqLive::from_env("bq_inc_foreign") else {
+        return;
+    };
+    let e = SqlEngine::Pg;
+    e.alive();
+    for theirs_is_the_log in [false, true] {
+        let (table, _guard) = e.table("bq_inc_foreign");
+        let changes = format!("{table}__changes");
+        let _cleanup = bq.cleanup(&[&table, &changes]);
+        e.insert(&table, 1..=10, 10, Some(1));
+        let (theirs, kind, free) = match theirs_is_the_log {
+            true => (&changes, "TABLE", &table),
+            false => (&table, "VIEW", &changes),
+        };
+        bq.exec(&format!(
+            "CREATE {kind} `{}.{}.{theirs}` AS SELECT 7 AS id",
+            bq.project, bq.dataset
+        ));
+        let before = object_as_it_stands(&bq, theirs);
+
+        let rig = e
+            .rig(&table)
+            .restage("incremental", &["cursor_column: id"])
+            .dest_gcs_live(&bq.bucket, &bq.prefix)
+            .top_line(&bq.load_line(""));
+        rig.run_ok();
+        for attempt in 1..=2 {
+            let out = rig.cli(&["load"]);
+            let said = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(
+                out.status.code(),
+                Some(5),
+                "{kind} attempt {attempt}: a protective refusal exits 5:\n{said}"
+            );
+            assert!(
+                said.contains("[RIVET_LOAD_TARGET_NOT_RIVETS]")
+                    && said.contains(&format!("{theirs}`: it exists"))
+                    && said.contains("no record of rivet loading it"),
+                "{kind} attempt {attempt} names the object and why:\n{said}"
+            );
+            assert_eq!(
+                object_as_it_stands(&bq, theirs),
+                before,
+                "{kind} attempt {attempt}: their object is what it was"
+            );
+            assert_eq!(
+                bq.read_bq_table_type(free),
+                None,
+                "{kind} attempt {attempt}: nothing created beside it"
+            );
+        }
+        let loads = ledger_load_statuses(
+            &rig.config_path(),
+            &format!("{}.{}.{table}", bq.project, bq.dataset),
+        );
+        assert_eq!(loads, ["refused", "refused"], "{kind}: both stops recorded");
+    }
+}
+
 /// A `keyset_incremental` export delivers only the keys past its anchor, so its load
 /// must accumulate: each run's delta joins the earlier rows, and a run with no new key
 /// leaves the table as it was rather than replacing it with nothing.

@@ -504,7 +504,9 @@ fn an_incremental_export_into_clickhouse_adopts_the_table_and_serves_the_latest_
 
 /// A change log keyed on one `load.pk` cannot take a load keyed on another: rows the
 /// old key already collapsed cannot be told apart again, so the load refuses before
-/// writing and the view keeps serving what it served.
+/// writing and the view keeps serving what it served. One config on one state DB, its
+/// `load.pk` edited between two loads; the row inserted in between is what the second
+/// load carries, since a load with nothing new is up to date before it compares a key.
 #[test]
 #[ignore = "live: requires clickhouse + fake-gcs + mysql-cdc"]
 fn a_changed_load_pk_is_refused_before_it_rekeys_the_change_log() {
@@ -521,18 +523,18 @@ fn a_changed_load_pk_is_refused_before_it_rekeys_the_change_log() {
     let _guard = Table(tbl.clone());
     let db = Db::new("rivet_chtest");
     let keyed = |pk: &str| {
-        Rig::mysql_cdc(&tbl)
-            .cdc("initial: snapshot")
-            .dest_gcs(BUCKET, &unique_name("chload"), FAKE_GCS_ENDPOINT)
-            .top_line(&format!(
-                "load: {{ target: clickhouse, url: \"{CLICKHOUSE_HTTP_URL}\", database: {}, \
-                 user: {CLICKHOUSE_USER}, password_env: {PASSWORD_ENV}, pk: [{pk}] }}",
-                db.0
-            ))
+        format!(
+            "load: {{ target: clickhouse, url: \"{CLICKHOUSE_HTTP_URL}\", database: {}, \
+             user: {CLICKHOUSE_USER}, password_env: {PASSWORD_ENV}, pk: [{pk}] }}",
+            db.0
+        )
     };
-    let first = keyed("id, tenant");
-    first.run_ok();
-    load(&first);
+    let mut rig = Rig::mysql_cdc(&tbl)
+        .cdc("initial: snapshot")
+        .dest_gcs(BUCKET, &unique_name("chload"), FAKE_GCS_ENDPOINT)
+        .top_line(&keyed("id, tenant"));
+    rig.run_ok();
+    load(&rig);
     let view = format!("{}.{tbl}", db.0);
     let rows = || {
         ch(&format!(
@@ -545,15 +547,168 @@ fn a_changed_load_pk_is_refused_before_it_rekeys_the_change_log() {
         "the composite key keeps both rows"
     );
 
-    let second = keyed("id");
-    second.run_ok();
-    let out = second.load_args_env(&[], &[(PASSWORD_ENV, CLICKHOUSE_PASSWORD)]);
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (2, 1, 21)"))
+        .expect("change");
+    rig.replace_top_line("load:", &keyed("id"));
+    rig.run_ok();
+    let out = rig.load_args_env(&[], &[(PASSWORD_ENV, CLICKHOUSE_PASSWORD)]);
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
         !out.status.success() && err.contains("collapses versions by (id, tenant)"),
         "a re-keyed load must refuse, naming both keys:\n{err}"
     );
     assert_eq!(rows(), before, "nothing was written: the view is unchanged");
+    assert_eq!(
+        ch(&format!("SELECT count() FROM {view}__changes")),
+        "2",
+        "nothing was written: the change log holds the two snapshot rows"
+    );
+}
+
+/// The SQLite state beside each Rig's config, under a Postgres state pass too: there every
+/// Rig shares one ledger, so a second Rig would not be a state DB that never saw the first.
+const OWN_SQLITE_STATE: (&str, &str) = ("RIVET_STATE_URL", "");
+
+/// What `db.name` is and holds: its engine and DDL from the catalog, and its `(id, v)` rows.
+fn object_as_it_stands(db: &Db, name: &str) -> (String, String) {
+    (
+        ch(&format!(
+            "SELECT engine, create_table_query FROM system.tables WHERE database = '{}' \
+             AND name = '{name}' FORMAT TSVRaw",
+            db.0
+        )),
+        ch(&format!(
+            "SELECT id, v FROM {}.{name} ORDER BY id, v FORMAT TSV",
+            db.0
+        )),
+    )
+}
+
+/// Rivet's own view and change log, met by the same export from a state DB that never
+/// recorded them (a moved config, a lost `.rivet_state.db`): the load refuses on every
+/// cycle with `RIVET_LOAD_TARGET_NOT_RIVETS`, leaves both objects as they were and
+/// journals only `refused`, which never makes them this ledger's own.
+fn a_load_from_another_state_db_is_refused_every_cycle(
+    db: &Db,
+    tbl: &str,
+    build: impl Fn() -> Rig,
+    change: impl FnOnce(),
+) {
+    let env = [(PASSWORD_ENV, CLICKHOUSE_PASSWORD), OWN_SQLITE_STATE];
+    let run = |rig: &Rig| {
+        let out = rig.run_with_envs(&[OWN_SQLITE_STATE]);
+        assert!(
+            out.status.success(),
+            "run:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    let owner = build();
+    run(&owner);
+    owner.load_ok(&[], &env);
+    change();
+    run(&owner);
+    owner.load_ok(&[], &env);
+
+    let view = format!("{}.{tbl}", db.0);
+    let log = format!("{tbl}__changes");
+    ch(&format!("SYSTEM STOP MERGES {view}__changes"));
+    let stand = || [object_as_it_stands(db, tbl), object_as_it_stands(db, &log)];
+    let before = stand();
+    assert!(
+        before[0].0.starts_with("View\t")
+            && before[1]
+                .0
+                .split('\t')
+                .next()
+                .is_some_and(|engine| engine.ends_with("MergeTree")),
+        "fixture: rivet's own view over its own change log:\n{before:?}"
+    );
+
+    let other = build();
+    run(&other);
+    for cycle in 1..=2usize {
+        let out = other.load_args_env(&[], &env);
+        let said = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            out.status.code(),
+            Some(5),
+            "cycle {cycle}: a protective refusal exits 5:\n{said}"
+        );
+        assert!(
+            said.contains("[RIVET_LOAD_TARGET_NOT_RIVETS]")
+                && said.contains(&format!("refusing to replace `{view}`: it exists"))
+                && said.contains("no record of rivet loading it"),
+            "cycle {cycle} names the object and why:\n{said}"
+        );
+        assert_eq!(
+            stand(),
+            before,
+            "cycle {cycle}: the view and the log are what they were"
+        );
+        assert_eq!(
+            StateDb::next_to_config(&other.config_path()).load_statuses(&view),
+            vec!["refused"; cycle],
+            "cycle {cycle}: only refusals are journaled, and a refusal claims nothing"
+        );
+    }
+}
+
+/// An incremental export's view and log, loaded again from a state DB that never saw them.
+#[test]
+#[ignore = "live: requires clickhouse + fake-gcs + postgres"]
+fn an_incremental_load_from_another_state_db_refuses_rivets_own_view_and_log_every_cycle() {
+    require_alive(LiveService::ClickHouse);
+    require_alive(LiveService::FakeGcs);
+    ensure_gcs_bucket(BUCKET);
+    let (tbl, _t, mut c) = pg_batch_seeded("rivet_ch_inc_lost", 5);
+    let db = Db::new("rivet_chtest");
+    a_load_from_another_state_db_is_refused_every_cycle(
+        &db,
+        &tbl,
+        || {
+            batch_into_clickhouse(
+                Rig::pg_batch(&tbl)
+                    .mode("incremental")
+                    .export_line("cursor_column: updated_at"),
+                &db,
+            )
+        },
+        || {
+            c.batch_execute(&format!(
+                "UPDATE {tbl} SET v = 99, updated_at = TIMESTAMP '2026-02-01' WHERE id = 1; \
+                 INSERT INTO {tbl} VALUES (6, 6, TIMESTAMP '2026-02-01')"
+            ))
+            .expect("changes");
+        },
+    );
+}
+
+/// A CDC stream's view and log, loaded again from a state DB and checkpoint that never saw them.
+#[test]
+#[ignore = "live: requires clickhouse + fake-gcs + mysql-cdc"]
+fn a_cdc_load_from_another_state_db_refuses_rivets_own_view_and_log_every_cycle() {
+    require_alive(LiveService::ClickHouse);
+    require_alive(LiveService::FakeGcs);
+    ensure_gcs_bucket(BUCKET);
+    let (tbl, _guard) = seeded("rivet_ch_cdc_lost", 5);
+    let db = Db::new("rivet_chtest");
+    a_load_from_another_state_db_is_refused_every_cycle(
+        &db,
+        &tbl,
+        || into_clickhouse(Rig::mysql_cdc(&tbl), &db),
+        || {
+            conn()
+                .query_drop(format!(
+                    "INSERT INTO {tbl} (id, v) VALUES (6, 6); UPDATE {tbl} SET v = 99 WHERE id = 1"
+                ))
+                .expect("changes");
+        },
+    );
 }
 
 /// A materialized view on the change log writes rows of its own; the load's count
@@ -1073,13 +1228,13 @@ fn a_timestamp_clickhouse_cannot_hold_is_refused_when_pulled_too() {
         err.contains("column `ts` holds 9999-12-31 00:00, outside ClickHouse DateTime64's range"),
         "{err}"
     );
-    let rows = ch(&format!(
-        "SELECT sum(total_rows) FROM system.tables WHERE database = '{}' FORMAT TSV",
+    let tables = ch(&format!(
+        "SELECT count() FROM system.tables WHERE database = '{}' FORMAT TSV",
         db.0
     ));
     assert_eq!(
-        rows, "0",
-        "no row reached any table, the clamped one least of all"
+        tables, "0",
+        "the refusal comes before the first statement: no table exists, so no row reached one"
     );
 }
 
@@ -1478,7 +1633,9 @@ fn a_cdc_log_partitioned_by_a_moving_column_serves_one_latest_row_per_key() {
 }
 
 /// A change log created with one partition refuses a load declaring another, naming both,
-/// and the view keeps serving what it served.
+/// and the view keeps serving what it served. One config on one state DB, its `partition:`
+/// edited between two loads; the row inserted in between is what the second load carries,
+/// since a load with nothing new is up to date before it compares a partition.
 #[test]
 #[ignore = "live: requires clickhouse + fake-gcs + mysql-cdc"]
 fn a_changed_partition_is_refused_before_it_touches_the_change_log() {
@@ -1496,25 +1653,29 @@ fn a_changed_partition_is_refused_before_it_touches_the_change_log() {
     let _guard = Table(tbl.clone());
     let db = Db::new("rivet_chtest");
     let by = |granularity: &str| {
-        Rig::mysql_cdc(&tbl)
-            .cdc("initial: snapshot")
-            .dest_gcs(BUCKET, &unique_name("chload"), FAKE_GCS_ENDPOINT)
-            .top_line(&load_line(
-                CLICKHOUSE_HTTP_URL,
-                &db,
-                &format!(", partition: {{ column: created_at, granularity: {granularity} }}"),
-            ))
+        load_line(
+            CLICKHOUSE_HTTP_URL,
+            &db,
+            &format!(", partition: {{ column: created_at, granularity: {granularity} }}"),
+        )
     };
-    let first = by("month");
-    first.run_ok();
-    load(&first);
+    let mut rig = Rig::mysql_cdc(&tbl)
+        .cdc("initial: snapshot")
+        .dest_gcs(BUCKET, &unique_name("chload"), FAKE_GCS_ENDPOINT)
+        .top_line(&by("month"));
+    rig.run_ok();
+    load(&rig);
     let view = format!("{}.{tbl}", db.0);
     let before = source_rows(&tbl);
     clickhouse_rows_match_source(&view, before.clone(), "");
 
-    let second = by("year");
-    second.run_ok();
-    let out = second.load_args_env(&[], &[(PASSWORD_ENV, CLICKHOUSE_PASSWORD)]);
+    c.query_drop(format!(
+        "INSERT INTO {tbl} VALUES (3, 3, '2026-03-10 00:00:00')"
+    ))
+    .expect("change");
+    rig.replace_top_line("load:", &by("year"));
+    rig.run_ok();
+    let out = rig.load_args_env(&[], &[(PASSWORD_ENV, CLICKHOUSE_PASSWORD)]);
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
         !out.status.success()
@@ -1927,4 +2088,69 @@ fn a_mongo_resume_export_into_clickhouse_accumulates_every_run() {
         "the resumed run's 500 new documents join the first 2000, not replace them"
     );
     assert_eq!(clickhouse_ids(&db), m.ids("t"));
+}
+
+/// A range refusal writes nothing and claims nothing: a foreign table created under the target's name afterwards is still refused by the next load, untouched.
+#[test]
+#[ignore = "live: requires clickhouse + fake-gcs + postgres"]
+fn a_range_refusal_claims_nothing_so_a_table_made_after_it_stays_foreign() {
+    require_alive(LiveService::ClickHouse);
+    require_alive(LiveService::FakeGcs);
+    ensure_gcs_bucket(BUCKET);
+    let mut c = pg_connect();
+    let tbl = unique_name("rivet_ch_claim");
+    c.batch_execute(&format!(
+        "CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, ts TIMESTAMP); \
+         INSERT INTO {tbl} VALUES (1, TIMESTAMP '2024-01-01 00:00:00'), \
+                                  (2, TIMESTAMP '9999-12-31 00:00:00')"
+    ))
+    .expect("seed");
+    let _t = PgTable::adopt(tbl.clone());
+    let db = Db::new("rivet_chclaim");
+    let rig = batch_into_clickhouse(Rig::pg_batch(&tbl).mode("full"), &db);
+    rig.run_ok();
+    let out = rig.load_args_env(&[], &[(PASSWORD_ENV, CLICKHOUSE_PASSWORD)]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success() && err.contains("outside ClickHouse DateTime64's range"),
+        "the first load must refuse the range:\n{err}"
+    );
+    let left = ch(&format!(
+        "SELECT name FROM system.tables WHERE database = '{}' FORMAT TSV",
+        db.0
+    ));
+    assert_eq!(
+        left.trim(),
+        "",
+        "a refusal before the first statement leaves no table, the swap table included"
+    );
+
+    ch(&format!(
+        "CREATE TABLE {}.{tbl} (id Int64, note String) ENGINE = MergeTree ORDER BY id",
+        db.0
+    ));
+    ch(&format!(
+        "INSERT INTO {}.{tbl} VALUES (99, 'foreign')",
+        db.0
+    ));
+    c.batch_execute(&format!(
+        "UPDATE {tbl} SET ts = TIMESTAMP '2024-02-02 00:00:00' WHERE id = 2"
+    ))
+    .expect("correct the source");
+    rig.run_ok();
+    let out = rig.load_args_env(&[], &[(PASSWORD_ENV, CLICKHOUSE_PASSWORD)]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success() && err.contains("no record of rivet loading it"),
+        "the second load must refuse a table rivet never loaded:\n{err}"
+    );
+    assert_eq!(
+        ch(&format!(
+            "SELECT id, note FROM {}.{tbl} ORDER BY id FORMAT TSV",
+            db.0
+        ))
+        .trim(),
+        "99\tforeign",
+        "the foreign table keeps its row"
+    );
 }

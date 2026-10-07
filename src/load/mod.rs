@@ -416,6 +416,13 @@ impl std::error::Error for Refused {
     }
 }
 
+impl Refused {
+    /// The error that stopped the load: its code and exit class are the stop's own.
+    pub(crate) fn cause(&self) -> &anyhow::Error {
+        &self.0
+    }
+}
+
 /// Mark whatever went wrong before any warehouse write as a stop, not a failure.
 pub(crate) fn before_write<T>(r: Result<T>) -> Result<T> {
     r.map_err(|e| {
@@ -427,39 +434,40 @@ pub(crate) fn before_write<T>(r: Result<T>) -> Result<T> {
     })
 }
 
-/// A stop before any warehouse write, with its reason.
-/// A whole-table pass REPLACES the base, but a buffer still holding rows from before
-/// it survives the replacement — and the next `rivet compact` would merge those OLDER
-/// values over the new base (a re-snapshot after a gap restores exactly the pre-gap
-/// rows it existed to fix). Refused by name, nothing consumed; the operator decides
-/// whether the buffer belongs to the current base (compact first) or to the past
-/// (drop it).
-pub(crate) fn stale_buffer_refusal(
+/// Stop a whole-table pass over a base whose buffer still holds rows from before it: the
+/// next `rivet compact` would merge those older values over the new base.
+pub(crate) fn refuse_stale_buffer(
     loader: &dyn TargetLoader,
     table: &str,
     base_and_buffer: bool,
-) -> Result<Option<String>> {
+) -> Result<()> {
+    before_write(stale_buffer_check(loader, table, base_and_buffer))
+}
+
+/// The probes and the wording of [`refuse_stale_buffer`].
+fn stale_buffer_check(loader: &dyn TargetLoader, table: &str, base_and_buffer: bool) -> Result<()> {
     if !base_and_buffer {
-        return Ok(None);
+        return Ok(());
     }
     let changes = format!("{table}__changes");
     if loader.object_kind(&changes)? != ObjectKind::Table {
-        return Ok(None);
+        return Ok(());
     }
     let rows = loader.row_count(&changes)?;
     if rows == 0 {
-        return Ok(None);
+        return Ok(());
     }
     let (base, buffer) = (loader.fqtn(table), loader.fqtn(&changes));
-    Ok(Some(format!(
+    bail!(
         "refusing to land a whole-table pass of `{base}`: `{buffer}` still holds {rows} change \
          row(s) from BEFORE it, and the next `rivet compact` would merge those older values \
          over the new base. If they belong to the CURRENT base, run `rivet compact` first; if \
          this pass re-baselines past them, drop `{buffer}`. Then re-run this `rivet load` — \
          nothing was consumed"
-    )))
+    )
 }
 
+/// A stop before any warehouse write, with its reason.
 pub(crate) fn refused(reason: String) -> anyhow::Error {
     anyhow::Error::new(Refused(anyhow::anyhow!(reason)))
 }
@@ -483,7 +491,8 @@ pub enum Ownership {
 fn ensure_own(fqtn: &str, ownership: Ownership, verb: &str) -> Result<()> {
     match ownership {
         Ownership::Own => Ok(()),
-        Ownership::Foreign => bail!(
+        Ownership::Foreign => crate::rivet_bail!(
+            crate::error::codes::LOAD_TARGET_NOT_RIVETS,
             "refusing to {verb} `{fqtn}`: it exists, and this state DB's load ledger has no \
              record of rivet loading it — it may hold someone else's data. Drop or rename it, \
              or load into another table"
@@ -503,6 +512,31 @@ fn ensure_own(fqtn: &str, ownership: Ownership, verb: &str) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// The question every load asks before its first write: a name it would write that already
+/// holds something must be one this ledger recorded rivet loading. `appends` adds the change log.
+pub(crate) fn ensure_target_own(
+    loader: &dyn TargetLoader,
+    table: &str,
+    appends: bool,
+    ownership: Ownership,
+) -> Result<()> {
+    if matches!(ownership, Ownership::Own | Ownership::Unknown) {
+        return Ok(());
+    }
+    let (at_table, log) = match appends {
+        true => ("replace", Some(format!("{table}__changes"))),
+        false => ("overwrite", None),
+    };
+    let names = std::iter::once((table.to_string(), at_table))
+        .chain(log.into_iter().map(|name| (name, "append to")));
+    for (name, verb) in names {
+        if loader.object_kind(&name)? != ObjectKind::Absent {
+            ensure_own(&loader.fqtn(&name), ownership, verb)?;
+        }
+    }
+    Ok(())
 }
 
 /// Refuse a whole-table load onto a table that is not rivet's own, differs in shape, or is a view.
@@ -925,6 +959,7 @@ fn adoptable(
     ownership: Ownership,
 ) -> Result<bool> {
     if loader.object_kind(table)? != ObjectKind::Table {
+        ensure_target_own(loader, table, true, ownership)?;
         return Ok(false);
     }
     let changes = format!("{table}__changes");
@@ -1007,9 +1042,11 @@ pub fn run_load_buffer(
     pk: &[String],
     expected_delta: Option<u64>,
     cleanup: Option<(&GcsStore, &[String])>,
+    ownership: Ownership,
     label: &str,
 ) -> Result<CdcLoadReport> {
     before_write(append_preflight(loader, table, specs, uris, pk, label))?;
+    before_write(ensure_target_own(loader, table, true, ownership))?;
     let rows_appended = loader.append_changelog(table, specs, uris, pk)?;
     if let Some(expected) = expected_delta
         && rows_appended != expected
@@ -1294,6 +1331,12 @@ pub(crate) mod tests {
     }
     use std::cell::RefCell;
 
+    /// A fake warehouse's record of the calls that changed it, shared with the test.
+    pub(crate) type Journal = std::rc::Rc<RefCell<Vec<String>>>;
+
+    /// What a fake warehouse runs when a name is probed.
+    type ProbeHook = Box<dyn Fn(&str)>;
+
     /// Records every call and returns a canned row count — the seam the driver's
     /// invariants are asserted through, offline.
     #[derive(Default)]
@@ -1317,6 +1360,12 @@ pub(crate) mod tests {
         /// A warehouse without shape control (the Snowflake shape).
         shapeless: bool,
         calls: RefCell<Vec<String>>,
+        /// Every call that changes the warehouse, shared so a test keeps reading it after the loader is boxed.
+        writes: Journal,
+        /// Runs at each `object_kind` probe: what a test observes, or dies at, mid-load.
+        on_probe: Option<ProbeHook>,
+        /// The dialect the fake speaks; BigQuery when unset.
+        dialect: Option<cdc::Warehouse>,
     }
 
     impl FakeLoader {
@@ -1336,6 +1385,33 @@ pub(crate) mod tests {
                 ..Default::default()
             }
         }
+
+        /// Say how many rows `table` holds.
+        pub(crate) fn with_rows(self, table: &str, rows: u64) -> Self {
+            self.counts.borrow_mut().insert(table.into(), rows);
+            self
+        }
+
+        /// Speak `warehouse`'s dialect.
+        pub(crate) fn speaking(mut self, warehouse: cdc::Warehouse) -> Self {
+            self.dialect = Some(warehouse);
+            self
+        }
+
+        /// Run `hook` at every `object_kind` probe.
+        pub(crate) fn probing(mut self, hook: impl Fn(&str) + 'static) -> Self {
+            self.on_probe = Some(Box::new(hook));
+            self
+        }
+
+        /// The shared record of every call that changed the warehouse.
+        pub(crate) fn writes(&self) -> Journal {
+            self.writes.clone()
+        }
+
+        fn wrote(&self, what: String) {
+            self.writes.borrow_mut().push(what);
+        }
     }
 
     impl ShapeControl for FakeLoader {
@@ -1349,11 +1425,13 @@ pub(crate) mod tests {
             Ok(self.drift.borrow().clone())
         }
         fn recluster_changelog(&self, table: &str) -> Result<()> {
+            self.wrote(format!("recluster {table}"));
             self.calls.borrow_mut().push(format!("recluster {table}"));
             *self.drift.borrow_mut() = None;
             Ok(())
         }
         fn rebuild_changelog(&self, table: &str) -> Result<()> {
+            self.wrote(format!("rebuild {table}"));
             self.calls.borrow_mut().push(format!("rebuild {table}"));
             *self.drift.borrow_mut() = None;
             Ok(())
@@ -1376,6 +1454,9 @@ pub(crate) mod tests {
             Ok(self.prior_changes)
         }
         fn object_kind(&self, table: &str) -> Result<ObjectKind> {
+            if let Some(hook) = &self.on_probe {
+                hook(table);
+            }
             if let Some(e) = &self.kind_error {
                 bail!("{e}");
             }
@@ -1394,6 +1475,7 @@ pub(crate) mod tests {
             Ok(self.counts.borrow().get(table).copied().unwrap_or(0))
         }
         fn adopt_as_changelog(&self, table: &str) -> Result<()> {
+            self.wrote(format!("adopt {table}"));
             self.calls.borrow_mut().push(format!("adopt {table}"));
             let rows = self.row_count(table)?;
             let changes = format!("{table}__changes");
@@ -1405,6 +1487,10 @@ pub(crate) mod tests {
             Ok(())
         }
         fn materialize(&self, table: &str, _: &[TargetColumnSpec], _: &[String]) -> Result<u64> {
+            self.wrote(format!("materialize {table}"));
+            self.kinds
+                .borrow_mut()
+                .insert(table.into(), ObjectKind::Table);
             self.materialized.borrow_mut().push(table.into());
             Ok(self.rows)
         }
@@ -1415,14 +1501,16 @@ pub(crate) mod tests {
             _: &[String],
             _: &[String],
         ) -> Result<u64> {
+            self.wrote(format!("append {table}"));
             self.calls.borrow_mut().push(format!("append {table}"));
             self.appended.borrow_mut().push(table.into());
             Ok(self.rows)
         }
         fn warehouse(&self) -> cdc::Warehouse {
-            cdc::Warehouse::BigQuery
+            self.dialect.unwrap_or(cdc::Warehouse::BigQuery)
         }
         fn create_view(&self, table: &str, _view_sql: &str) -> Result<()> {
+            self.wrote(format!("view {table}"));
             self.views.borrow_mut().push(table.into());
             Ok(())
         }
@@ -1953,33 +2041,255 @@ pub(crate) mod tests {
         }
     }
 
+    /// What may stand at an append's two names: `(label, kind of <table>, kind of the log)`.
+    fn append_targets() -> Vec<(&'static str, ObjectKind, ObjectKind)> {
+        use ObjectKind::{Absent, Other, Table, View};
+        vec![
+            ("view", View, Absent),
+            ("view + log", View, Table),
+            ("log only", Absent, Table),
+            ("other object", Other, Absent),
+        ]
+    }
+
+    /// The two append drivers over a fake holding `at_table` and `at_log`, in `dialect`.
+    fn appends_over(
+        dialect: cdc::Warehouse,
+        at_table: ObjectKind,
+        at_log: ObjectKind,
+        ownership: Ownership,
+    ) -> Vec<(&'static str, FakeLoader, Result<CdcLoadReport>)> {
+        let fake = || {
+            FakeLoader {
+                rows: 3,
+                ..Default::default()
+            }
+            .speaking(dialect)
+            .with_kind("t", at_table)
+            .with_kind("t__changes", at_log)
+            .with_rows("t__changes", 7)
+        };
+        let (inc, cdc) = (fake(), fake());
+        let inc_out = load_incremental_as(&inc, ownership);
+        let cdc_out = run_load_cdc(
+            &cdc,
+            "t",
+            &spec(TargetStatus::Ok),
+            &uris(),
+            &["id".to_string()],
+            cdc::SourceEngine::MySql,
+            Some(3),
+            None,
+            ownership,
+            false,
+        );
+        vec![("incremental", inc, inc_out), ("cdc", cdc, cdc_out)]
+    }
+
+    const DIALECTS: [cdc::Warehouse; 3] = [
+        cdc::Warehouse::BigQuery,
+        cdc::Warehouse::Snowflake,
+        cdc::Warehouse::ClickHouse,
+    ];
+
+    /// An append never writes a view, a log or another object this ledger has no record of.
+    #[test]
+    fn an_append_onto_a_name_the_ledger_has_no_record_of_is_refused_untouched() {
+        let mut wrote = Vec::new();
+        for dialect in DIALECTS {
+            for ownership in [Ownership::Foreign, Ownership::Unreadable] {
+                for (label, at_table, at_log) in append_targets() {
+                    for (driver, f, out) in appends_over(dialect, at_table, at_log, ownership) {
+                        let typed = out.as_ref().err().is_some_and(|e| e.is::<Refused>());
+                        let writes = f.writes().borrow().clone();
+                        if !(typed && writes.is_empty()) {
+                            wrote.push((dialect, ownership, driver, label, writes));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            wrote.is_empty(),
+            "(dialect, ownership, driver, what stands at the target, warehouse writes): {wrote:?}"
+        );
+    }
+
+    /// The same targets under a ledger that vouches for them, or under none, load as before;
+    /// so does a ledger with no record when both names are free.
+    #[test]
+    fn an_append_onto_its_own_names_or_free_ones_is_unchanged() {
+        let landed = vec!["append t".to_string(), "view t".to_string()];
+        for dialect in DIALECTS {
+            for ownership in [Ownership::Own, Ownership::Unknown] {
+                for (label, at_table, at_log) in append_targets() {
+                    for (driver, f, out) in appends_over(dialect, at_table, at_log, ownership) {
+                        out.unwrap_or_else(|e| panic!("{driver} {label} {ownership:?}: {e:#}"));
+                        assert_eq!(*f.writes().borrow(), landed, "{driver} {label}");
+                    }
+                }
+            }
+            for ownership in [Ownership::Foreign, Ownership::Unreadable] {
+                for (driver, f, out) in
+                    appends_over(dialect, ObjectKind::Absent, ObjectKind::Absent, ownership)
+                {
+                    out.unwrap_or_else(|e| panic!("{driver} free names {ownership:?}: {e:#}"));
+                    assert_eq!(*f.writes().borrow(), landed, "{driver} free names");
+                }
+            }
+        }
+    }
+
+    /// The question's own answers: who is asked, which names, and the words of each refusal.
+    #[test]
+    fn the_pre_write_question_names_the_object_the_verb_and_the_way_out() {
+        let holding = |names: &[&str]| {
+            names.iter().fold(FakeLoader::default(), |f, name| {
+                f.with_kind(name, ObjectKind::View)
+            })
+        };
+        let said = |names: &[&str], appends, ownership| {
+            ensure_target_own(&holding(names), "t", appends, ownership)
+                .map_err(|e| (crate::error::classify_exit(&e), format!("{e:#}")))
+        };
+        let foreign = |verb: &str, name: &str| {
+            Err((
+                5,
+                format!(
+                    "refusing to {verb} `db.{name}`: it exists, and this state DB's load ledger \
+                     has no record of rivet loading it — it may hold someone else's data. Drop \
+                     or rename it, or load into another table"
+                ),
+            ))
+        };
+        assert_eq!(
+            said(&["t"], true, Ownership::Foreign),
+            foreign("replace", "t")
+        );
+        assert_eq!(
+            said(&["t__changes"], true, Ownership::Foreign),
+            foreign("append to", "t__changes")
+        );
+        assert_eq!(
+            said(&["t"], false, Ownership::Foreign),
+            foreign("overwrite", "t")
+        );
+        assert_eq!(
+            said(&["t__changes"], false, Ownership::Foreign),
+            Ok(()),
+            "a whole-table load does not write the log"
+        );
+        assert_eq!(said(&[], true, Ownership::Foreign), Ok(()), "free names");
+        let (exit, unreadable) = said(&["t__changes"], true, Ownership::Unreadable).unwrap_err();
+        assert_eq!(
+            exit, 1,
+            "an unanswering ledger is the environment's failure"
+        );
+        assert!(
+            unreadable.starts_with(
+                "refusing to append to `db.t__changes`: it exists, and the load ledger could \
+                 not be read to confirm rivet loaded it."
+            ),
+            "{unreadable}"
+        );
+        for vouched in [Ownership::Own, Ownership::Unknown] {
+            ensure_target_own(&FakeLoader::probe_fails("503"), "t", true, vouched)
+                .expect("a ledger that vouches, or none at all, costs no warehouse probe");
+        }
+        assert!(
+            ensure_target_own(
+                &FakeLoader::probe_fails("503"),
+                "t",
+                true,
+                Ownership::Foreign
+            )
+            .is_err(),
+            "a probe that will not answer is not a free name"
+        );
+    }
+
+    /// The buffer append asks the same question: a base or a buffer this ledger has no
+    /// record of is not written, and rivet's own are, as before.
+    #[test]
+    fn a_buffer_append_onto_a_base_or_buffer_the_ledger_has_no_record_of_is_refused() {
+        let buffer = |f: &FakeLoader, ownership| {
+            run_load_buffer(
+                f,
+                "t",
+                &spec(TargetStatus::Ok),
+                &uris(),
+                &["id".into()],
+                Some(3),
+                None,
+                ownership,
+                "CDC",
+            )
+        };
+        let fake = |name: &str| {
+            FakeLoader {
+                rows: 3,
+                ..Default::default()
+            }
+            .with_kind(name, ObjectKind::Table)
+        };
+        for ownership in [Ownership::Foreign, Ownership::Unreadable] {
+            for name in ["t", "t__changes"] {
+                let f = fake(name);
+                let err = buffer(&f, ownership).unwrap_err();
+                assert!(err.is::<Refused>(), "{name} {ownership:?}: {err:#}");
+                assert!(
+                    format!("{err:#}").contains(&format!("`db.{name}`: it exists")),
+                    "{err:#}"
+                );
+                assert!(f.writes().borrow().is_empty(), "{name} {ownership:?}");
+            }
+        }
+        for ownership in [Ownership::Own, Ownership::Unknown] {
+            for name in ["t", "t__changes"] {
+                let f = fake(name);
+                buffer(&f, ownership).unwrap();
+                assert_eq!(*f.writes().borrow(), ["append t"], "{name} {ownership:?}");
+            }
+        }
+        let free = FakeLoader {
+            rows: 3,
+            ..Default::default()
+        };
+        buffer(&free, Ownership::Foreign).unwrap();
+        assert_eq!(*free.writes().borrow(), ["append t"], "free names");
+    }
+
     /// A base replaced while its buffer still holds rows is refused by name; an absent
     /// or empty buffer (the first cycle, or right after a compaction) lets the pass
     /// through. RED against landing the whole-table pass regardless.
     #[test]
     fn a_whole_table_pass_over_a_buffered_base_is_refused_until_the_buffer_is_dealt_with() {
         let first_cycle = FakeLoader::default();
-        assert_eq!(stale_buffer_refusal(&first_cycle, "t", true).unwrap(), None);
+        refuse_stale_buffer(&first_cycle, "t", true).unwrap();
 
         let compacted = FakeLoader {
             kinds: RefCell::new([("t__changes".to_string(), ObjectKind::Table)].into()),
             ..Default::default()
         };
-        assert_eq!(stale_buffer_refusal(&compacted, "t", true).unwrap(), None);
+        refuse_stale_buffer(&compacted, "t", true).unwrap();
 
         let buffered = FakeLoader {
             kinds: RefCell::new([("t__changes".to_string(), ObjectKind::Table)].into()),
             counts: RefCell::new([("t__changes".to_string(), 7)].into()),
             ..Default::default()
         };
-        assert_eq!(
-            stale_buffer_refusal(&buffered, "t", false).unwrap(),
-            None,
-            "a changelog + view layout has no base to replace"
+        refuse_stale_buffer(&buffered, "t", false)
+            .expect("a changelog + view layout has no base to replace");
+        let stop = refuse_stale_buffer(&buffered, "t", true)
+            .expect_err("a buffered base refuses the pass");
+        assert!(stop.is::<Refused>(), "the stop is typed where it is raised");
+        assert!(
+            refuse_stale_buffer(&FakeLoader::probe_fails("503"), "t", true)
+                .unwrap_err()
+                .is::<Refused>(),
+            "a probe that will not answer stops before the write too"
         );
-        let why = stale_buffer_refusal(&buffered, "t", true)
-            .unwrap()
-            .expect("a buffered base refuses the pass");
+        let why = format!("{stop:#}");
         assert!(
             why.contains("`db.t__changes` still holds 7 change row(s) from BEFORE it")
                 && why.contains("run `rivet compact` first")
@@ -2040,6 +2350,11 @@ pub(crate) mod tests {
             prefix_populated(&store, "innocent-neighbour"),
             "an unrelated neighbour export must survive the refused root cleanup"
         );
+    }
+
+    /// The one-column spec, for a driver-level test in a sibling module.
+    pub(crate) fn spec_ok() -> Vec<TargetColumnSpec> {
+        spec(TargetStatus::Ok)
     }
 
     fn spec(status: TargetStatus) -> Vec<TargetColumnSpec> {
@@ -2280,6 +2595,7 @@ pub(crate) mod tests {
             &["id".into()],
             Some(5),
             None,
+            Ownership::Own,
             "incremental",
         )
         .unwrap_err();
@@ -2311,6 +2627,7 @@ pub(crate) mod tests {
             &["id".into()],
             Some(5),
             Some((&store, &[format!("{REL}/x.parquet")][..])),
+            Ownership::Own,
             "CDC",
         )
         .unwrap_err();
@@ -2333,6 +2650,7 @@ pub(crate) mod tests {
             &["id".into()],
             Some(3),
             None,
+            Ownership::Own,
             "CDC",
         )
         .expect("an exact delta passes the gate");
