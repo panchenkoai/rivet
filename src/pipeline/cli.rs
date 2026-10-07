@@ -1494,8 +1494,14 @@ exports:
         let run = open_state(&dir);
         run.create_chunk_run("r_tx", "transactions", "plan", 3)
             .unwrap();
-        run.update_with_column("transactions", "pg/out", "2026-09-01", "updated_at", "")
-            .unwrap();
+        let key = crate::state::ProgressKey {
+            export_name: "transactions".into(),
+            source: "pg/out".into(),
+            stream: String::new(),
+            column: Some("updated_at".into()),
+            continues_cursor: true,
+        };
+        run.update_with_column(&key, "2026-09-01").unwrap();
         let held = crate::pipeline::chunked::try_run_lease(&run, "transactions")
             .unwrap()
             .expect("the live run's lease");

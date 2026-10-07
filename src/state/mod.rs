@@ -12,6 +12,7 @@ mod load_journal_store;
 mod load_lease;
 // Named so a caller can HOLD a lease across a scope it owns — the cleanup delete
 // needs one that outlives the call that took it. Every other holder infers the type.
+pub use cursor::{ProgressClaim, ProgressKey};
 pub use load_lease::LoadLease;
 mod load_spec_store;
 mod metrics;

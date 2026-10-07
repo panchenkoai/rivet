@@ -428,6 +428,7 @@ fn run_keyset_parallel(
     key_plan: IncrementalCursorPlan,
     parallel: usize,
     state: Option<&StateStore>,
+    progress: &crate::state::ProgressClaim<'_>,
 ) -> Result<()> {
     use std::sync::Mutex;
 
@@ -443,9 +444,7 @@ fn run_keyset_parallel(
     // ranges — re-sampling a changed table would move the boundaries and leave a
     // gap. A fresh run samples the ranges, persists them, and sets the anchor.
     let resume_run_id: Option<String> = if checkpoint {
-        state
-            .and_then(|s| s.get_resume_run_id(&plan.export_name, &scope).ok())
-            .flatten()
+        progress.resume_run_id().ok().flatten()
     } else {
         None
     };
@@ -467,13 +466,7 @@ fn run_keyset_parallel(
     let incremental = kp.incremental;
     let (floor, ceil): (Option<String>, Option<String>) = if incremental && resume_run_id.is_none()
     {
-        let anchor = match state {
-            Some(s) => {
-                s.get_owned(&plan.export_name, &scope, &key)?
-                    .last_cursor_value
-            }
-            None => None,
-        };
+        let anchor = progress.cursor()?.last_cursor_value;
         let st = plan.source.source_type;
         let key_q = crate::sql::quote_ident(st, &key);
         // The source answers "is anything past the anchor" in its own collation.
@@ -526,7 +519,7 @@ fn run_keyset_parallel(
                 &key,
                 &lo_hi_pairs(&fresh),
             )?;
-            st.set_resume_run_id(&plan.export_name, &scope, &summary.run_id, &plan.stream())?;
+            st.set_resume_run_id(progress.key(), &summary.run_id)?;
             fresh
         }
         _ => sample_parallel_ranges(src, plan, &key, parallel, floor_r, ceil_r)?,
@@ -949,6 +942,7 @@ pub(crate) fn run_keyset(
     plan: &ResolvedRunPlan,
     summary: &mut RunSummary,
     state: Option<&StateStore>,
+    progress: &crate::state::ProgressClaim<'_>,
 ) -> Result<()> {
     let kp = keyset_plan(plan);
     let scope = plan.source.state_key();
@@ -966,7 +960,7 @@ pub(crate) fn run_keyset(
     // `keyset_incremental` → seek past the persisted anchor + advance it at success
     // (iteration 3); neither → a fresh full pass (iteration 1).
     if kp.parallel > 1 {
-        return run_keyset_parallel(src, plan, summary, key_plan, kp.parallel, state);
+        return run_keyset_parallel(src, plan, summary, key_plan, kp.parallel, state, progress);
     }
 
     log::info!(
@@ -997,7 +991,7 @@ pub(crate) fn run_keyset(
                 Some(st),
                 &plan.export_name,
                 &scope,
-                st.get_resume_run_id(&plan.export_name, &scope)?,
+                progress.resume_run_id()?,
                 false,
                 &kp.key_column,
                 kp.incremental,
@@ -1014,13 +1008,7 @@ pub(crate) fn run_keyset(
 
     let mut last: Option<String> =
         if seeks_from_persisted_cursor(kp.checkpoint, recovering_crash, kp.incremental) {
-            match state {
-                Some(s) => {
-                    s.get_owned(&plan.export_name, &scope, &kp.key_column)?
-                        .last_cursor_value
-                }
-                None => None,
-            }
+            progress.cursor()?.last_cursor_value
         } else {
             None
         };
@@ -1077,7 +1065,7 @@ pub(crate) fn run_keyset(
                 if !kp.incremental {
                     st.clear_cursor_value(&plan.export_name, &scope)?;
                 }
-                st.set_resume_run_id(&plan.export_name, &scope, &summary.run_id, &plan.stream())?;
+                st.set_resume_run_id(progress.key(), &summary.run_id)?;
             }
         }
     }
@@ -1192,13 +1180,7 @@ pub(crate) fn run_keyset(
                 if kp.checkpoint
                     && let (Some(st), Some(v)) = (state, page.next_cursor.as_ref())
                 {
-                    st.update_with_column(
-                        &plan.export_name,
-                        &plan.source.state_key(),
-                        v,
-                        &kp.key_column,
-                        &plan.stream(),
-                    )?;
+                    st.update_with_column(progress.key(), v)?;
                 }
                 Ok(())
             },
@@ -1292,10 +1274,20 @@ pub(crate) fn run_keyset(
 
 #[cfg(test)]
 mod tests {
+    fn anchor_key() -> crate::state::ProgressKey {
+        crate::state::ProgressKey {
+            export_name: "e".into(),
+            source: "p".into(),
+            stream: String::new(),
+            column: Some("id".into()),
+            continues_cursor: false,
+        }
+    }
+
     #[test]
     fn a_parallel_incremental_run_refuses_a_sequential_anchor_whose_cursor_ran_ahead() {
         let st = StateStore::open_in_memory().unwrap();
-        st.set_resume_run_id("e", "p", "seq", "").unwrap();
+        st.set_resume_run_id(&anchor_key(), "seq").unwrap();
         let err =
             resume_anchor(Some(&st), "e", "p", Some("seq".into()), true, "id", true).unwrap_err();
         assert!(
@@ -1315,7 +1307,7 @@ mod tests {
         let st = StateStore::open_in_memory().unwrap();
         let ranges = [(None, Some("5".to_string())), (Some("5".to_string()), None)];
         let anchored = |rid: &str, ranged_on: Option<&str>| {
-            st.set_resume_run_id("e", "p", rid, "").unwrap();
+            st.set_resume_run_id(&anchor_key(), rid).unwrap();
             if let Some(key) = ranged_on {
                 st.persist_keyset_ranges("e", rid, key, &ranges).unwrap();
             }
