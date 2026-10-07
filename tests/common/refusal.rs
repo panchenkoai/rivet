@@ -1009,7 +1009,9 @@ mod tests {
             scope.cdc = vec![cdc];
             let before = Snapshot::take(&scope);
             let body = br#"{"status":"success","run":2}"#;
-            std::fs::write(dir.path().join("out").join(file), body).unwrap();
+            let path = dir.path().join("out").join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
             let (found, _) = diff(&scope, &before, &Snapshot::take(&scope));
             found.iter().map(|f| f.kind).collect::<Vec<_>>()
         };
@@ -1019,7 +1021,7 @@ mod tests {
             vec![Leftover::SuccessManifest]
         );
         assert_eq!(
-            kinds(true, "manifest.json"),
+            kinds(true, "t2/manifest.json"),
             vec![Leftover::SuccessManifest]
         );
         assert_eq!(
