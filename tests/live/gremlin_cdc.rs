@@ -347,8 +347,13 @@ fn gremlin_cdc_gcs_upload_cut_fails_loud_then_recovers_without_clobber() {
             .checkpoint_path(ckpt.clone())
             .cdc_line("rollover: 200")
             .a_failed_run_may_leave(
-                &[Leftover::OrphanPart, Leftover::FileLog],
-                "the upload is cut mid-run: the parts that reached the bucket before the cut stay, with no manifest",
+                &[
+                    Leftover::OrphanPart,
+                    Leftover::FileLog,
+                    Leftover::CdcFlush,
+                    Leftover::CdcCheckpoint,
+                ],
+                "the upload is cut mid-run: what reached the bucket before the cut stays, a part alone or a whole committed flush with the checkpoint behind it",
             )
             .dest_gcs(bucket, &prefix, endpoint)
     };
