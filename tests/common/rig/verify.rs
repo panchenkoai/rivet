@@ -15,7 +15,18 @@ impl Rig {
         self
     }
 
-    /// A known product defect on this rig's own export: only failures of `class` (a name in rig_oracle.KNOWN_DEFECT_CLASSES) are excused, any other FAILs, and a rig that never shows the class fails with "now passes".
+    /// Declare what this rig's runs that do not exit 0 may leave behind besides their own failure record; the reason is required and each site is counted by an offline ceiling.
+    pub fn a_failed_run_may_leave(mut self, what: &[crate::common::Leftover], why: &str) -> Self {
+        assert!(
+            !why.trim().is_empty(),
+            "a_failed_run_may_leave needs a reason — say why the failure legitimately leaves this"
+        );
+        crate::common::refusal::assert_declarable(what);
+        self.failed_run_leaves.extend_from_slice(what);
+        self
+    }
+
+    /// A known product defect on this rig's own export: only failures of `class` (a name in rig_oracle.KNOWN_DEFECT_CLASSES, or `a failed run left: <kind>` for a run that does not exit 0) are excused, any other FAILs, and a rig that never shows the class fails with "now passes".
     pub fn oracle_known_defect(mut self, class: &str, reason: &str) -> Self {
         assert!(
             !reason.trim().is_empty(),
@@ -94,8 +105,15 @@ impl Rig {
         crate::common::verify::begin(argv, envs, cwd)
     }
 
-    /// Grade a successful invocation; records an expected known-defect disagreement.
-    pub(crate) fn oracle_finish(&self, case: crate::common::verify::Case, envs: &[(&str, &str)]) {
+    /// Grade a finished invocation by how it exited; records an expected known-defect disagreement.
+    pub(crate) fn oracle_settle(
+        &self,
+        case: Option<crate::common::verify::Case>,
+        status: std::process::ExitStatus,
+        stdout: &[u8],
+        envs: &[(&str, &str)],
+    ) {
+        let Some(case) = case else { return };
         let opts = crate::common::verify::Opts {
             xfail: self.oracle_xfail.as_ref().map(|(class, reason)| {
                 crate::common::verify::KnownDefect {
@@ -105,8 +123,9 @@ impl Rig {
                 }
             }),
             key: self.census_key.as_deref(),
+            leaves: &self.failed_run_leaves,
         };
-        if crate::common::verify::finish(case, envs, &opts) {
+        if crate::common::verify::settle(case, status, stdout, envs, &opts) {
             self.oracle_xfailed.set(true);
         }
     }
@@ -132,4 +151,60 @@ fn a_known_defect_marker_that_never_fired_fails_the_test_at_drop() {
         "a marker on a rig that never disagreed",
     );
     drop(rig);
+}
+
+/// A rig, its begun `run`, and one file written into its destination while the run was "running"; settle it with `exit`.
+#[cfg(test)]
+fn settle_after_writing(rig: &Rig, file: &str, exit: i32, envs: &[(&str, &str)]) {
+    use std::os::unix::process::ExitStatusExt as _;
+    let argv = ["run", "--config", &rig.config_path().display().to_string()].map(String::from);
+    std::fs::create_dir_all(rig.out_dir()).expect("the rig's destination");
+    let case = rig.oracle_begin(&argv, envs, None);
+    assert!(case.is_some(), "a rig's `run` is graded");
+    std::fs::write(rig.out_dir().join(file), b"written by the failed run")
+        .expect("write the leftover");
+    rig.oracle_settle(
+        case,
+        std::process::ExitStatus::from_raw(exit << 8),
+        &[],
+        envs,
+    );
+}
+
+#[test]
+#[should_panic(expected = "- orphan-part: ")]
+fn a_part_left_by_a_run_that_did_not_exit_0_fails_the_test() {
+    settle_after_writing(&Rig::pg_batch("refused_part"), "part-0.parquet", 1, &[]);
+}
+
+#[test]
+#[should_panic(expected = "- success-marker: ")]
+fn a_success_marker_left_by_a_run_that_did_not_exit_0_fails_the_test() {
+    settle_after_writing(&Rig::pg_batch("refused_marker"), "_SUCCESS", 3, &[]);
+}
+
+#[test]
+fn a_declared_leftover_a_known_defect_and_a_crash_the_test_caused_do_not_fail_the_test() {
+    let declared = Rig::pg_batch("refused_declared")
+        .a_failed_run_may_leave(&[crate::common::Leftover::OrphanPart], "a probe");
+    settle_after_writing(&declared, "part-0.parquet", 1, &[]);
+    let known = Rig::pg_batch("refused_known")
+        .oracle_known_defect("a failed run left: success-marker", "a probe marker");
+    settle_after_writing(&known, "_SUCCESS", 1, &[]);
+    assert!(
+        known.oracle_xfailed.get(),
+        "the marker fired on the refusal"
+    );
+    let crashed = Rig::pg_batch("refused_crashed");
+    let fault = [("RIVET_TEST_PANIC_AT", "after_part_write")];
+    settle_after_writing(&crashed, "part-0.parquet", 101, &fault);
+}
+
+#[test]
+#[should_panic(expected = "- orphan-part: ")]
+fn a_known_defect_of_one_kind_does_not_excuse_a_part() {
+    let rig = Rig::pg_batch("refused_other_kind")
+        .oracle_known_defect("a failed run left: success-marker", "a probe marker");
+    rig.oracle_xfailed.set(true);
+    settle_after_writing(&rig, "part-0.parquet", 1, &[]);
 }

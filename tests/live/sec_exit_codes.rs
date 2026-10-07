@@ -35,6 +35,10 @@ fn quality_gate_failure_exits_data_integrity_3() {
     let export_name = unique_name("xc_quality_3");
 
     let rig = Rig::pg_batch(&export_name)
+        .a_failed_run_may_leave(
+            &[Leftover::OrphanPart, Leftover::FileLog],
+            "the quality gate judges the parts after they are written",
+        )
         .query(&format!("SELECT id FROM {}", table.name()))
         .export_line("quality:")
         .export_line("  row_count_min: 100")
@@ -75,6 +79,10 @@ fn keyset_quality_gate_failure_exits_data_integrity_3() {
     let out = tempfile::tempdir().unwrap();
     let export_name = unique_name("keyset_quality_3_exp");
     let rig = Rig::pg_batch(&table_name)
+        .a_failed_run_may_leave(
+            &[Leftover::OrphanPart, Leftover::FileLog],
+            "the quality gate judges the parts after they are written",
+        )
         .export_named(&export_name)
         .mode("chunked")
         .export_line("chunk_by_key: k")

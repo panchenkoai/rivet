@@ -253,6 +253,10 @@ fn apply_must_not_advance_the_cursor_when_the_manifest_did_not_land() {
     let cfg_dir = tempfile::tempdir().unwrap();
     let export = unique_name("orders_incr");
     let rig = Rig::pg_batch(&export)
+        .a_failed_run_may_leave(
+            &[Leftover::OrphanPart, Leftover::FileLog],
+            "the apply fails at the manifest, after its part is written",
+        )
         .query("SELECT id, updated_at FROM orders")
         .source_url_env("DATABASE_URL")
         .mode("incremental")

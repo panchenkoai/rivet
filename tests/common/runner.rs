@@ -107,7 +107,7 @@ pub fn run_rivet(args: &[&str]) -> Output {
     run_rivet_env(args, &[])
 }
 
-/// Run `spawn` and hand a successful `run|load|compact --config` to the default oracle (verify.rs).
+/// Run `spawn` and hand a `run|load|compact --config` to the default oracle (verify.rs), which grades it by its exit.
 fn graded(
     args: &[&str],
     envs: &[(&str, &str)],
@@ -117,9 +117,8 @@ fn graded(
     let argv: Vec<String> = args.iter().map(|a| a.to_string()).collect();
     let case = super::verify::begin_raw(&argv, envs, cwd);
     let out = spawn();
-    if let Some(mut case) = case.filter(|_| out.status.success()) {
-        case.delivered(&out.stdout);
-        super::verify::finish(case, envs, &Default::default());
+    if let Some(case) = case {
+        super::verify::settle(case, out.status, &out.stdout, envs, &Default::default());
     }
     out
 }
@@ -166,16 +165,19 @@ pub fn run_rivet_bounded(
         .expect("spawn rivet binary");
     loop {
         if let Some(status) = child.try_wait().expect("try_wait rivet") {
-            assert!(status.success(), "bounded rivet run exited non-zero");
             let took = start.elapsed();
             if let Some(case) = case {
-                super::verify::finish(case, &[], &Default::default());
+                super::verify::settle(case, status, &[], &[], &Default::default());
             }
+            assert!(status.success(), "bounded rivet run exited non-zero");
             return Some(took);
         }
         if start.elapsed() >= timeout {
             let _ = child.kill();
             let _ = child.wait();
+            if let Some(case) = &case {
+                case.ungraded("killed at its wall-clock ceiling");
+            }
             return None;
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -269,17 +271,19 @@ pub fn run_rivet_args_bounded_env(
     let mut child = cmd.spawn().expect("spawn rivet binary");
     loop {
         if let Some(status) = child.try_wait().expect("try_wait rivet") {
-            assert!(status.success(), "bounded rivet run exited non-zero");
             let stdout = std::fs::read_to_string(&path).expect("read captured stdout");
-            if let Some(mut case) = case {
-                case.delivered(stdout.as_bytes());
-                super::verify::finish(case, envs, &Default::default());
+            if let Some(case) = case {
+                super::verify::settle(case, status, stdout.as_bytes(), envs, &Default::default());
             }
+            assert!(status.success(), "bounded rivet run exited non-zero");
             return Some(stdout);
         }
         if start.elapsed() >= timeout {
             let _ = child.kill();
             let _ = child.wait();
+            if let Some(case) = &case {
+                case.ungraded("killed at its wall-clock ceiling");
+            }
             return None;
         }
         std::thread::sleep(std::time::Duration::from_millis(50));

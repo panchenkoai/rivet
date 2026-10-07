@@ -3,7 +3,10 @@
 //! its flags are equivalent to; a `--max-events` run that reached its cap defers what it owed past
 //! it to the stream's next run, logged `RIVET-ORACLE-DEFERRED`; the census requires that run's verdict) started through the shared runners
 //! (`run_rivet*` in runner.rs, `run_rivet_ok`, and the `Rig`) in the live suite,
-//! live_type_golden or live_differential that exits 0 is graded: the FACTS come from the
+//! live_type_golden or live_differential is graded by how it exits ([`settle`]). One that exits 0
+//! is graded against its source; one that does not is graded against the snapshot taken before it
+//! (refusal.rs: destination trees, checkpoint files, state rows; `RIVET-ORACLE-REFUSED`, or
+//! `RIVET-ORACLE-UNGRADED` for a run the test crashed itself). For exit 0 the FACTS come from the
 //! config file itself (source type and URL, each export's relation, mode, columns and
 //! destination, the state DB beside the config or `RIVET_STATE_URL`, the Success manifests
 //! the run wrote) and go to `dev/release_oracle/rig_oracle.py`, which owns the one DuckDB
@@ -17,13 +20,15 @@
 //! a rig or the `RIVET_TEST_NO_ORACLE=<reason>` env on a raw run (both counted by a
 //! shrink-only ceiling, both logged `RIVET-ORACLE-OFF`); an export the oracle cannot reach
 //! logs `RIVET-ORACLE-SKIP`; an exception inside the oracle FAILs the test as an oracle
-//! error. A `Rig::spawn_args_env` child is graded when its caller reaps it with exit 0;
+//! error. A `Rig::spawn_args_env` child is graded when its caller reaps it;
 //! a hand-built `Command::new(RIVET_BIN)` is not graded (under its own ceiling).
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use serde_yaml_ng::Value;
+
+use super::refusal::{self, Leftover};
 
 /// The env a raw run sets (to its reason) to opt out of the default oracle.
 pub const NO_ORACLE_ENV: &str = "RIVET_TEST_NO_ORACLE";
@@ -44,6 +49,8 @@ pub(crate) struct KnownDefect<'a> {
 pub(crate) struct Opts<'a> {
     pub xfail: Option<KnownDefect<'a>>,
     pub key: Option<&'a str>,
+    /// What the caller declared a failed run may leave (refusal.rs).
+    pub leaves: &'a [Leftover],
 }
 
 /// One graded invocation: the parsed config and, for `run`, each export's manifests before it.
@@ -63,6 +70,8 @@ pub(crate) struct Case {
     cli: Option<CdcCli>,
     /// Per export, the NDJSON change lines this `rivet cdc` run printed for its table.
     events: Vec<usize>,
+    /// What the invocation's destinations, checkpoints and state held before it started.
+    snapshot: Option<refusal::Snapshot>,
 }
 
 /// What a `rivet cdc` invocation adds to its equivalent config: its `--max-events` cap, and whether it printed NDJSON (no `--output`).
@@ -165,13 +174,15 @@ fn image_dir() -> PathBuf {
 /// Start grading `argv` (run with working directory `cwd`): `None` unless it is `run|load|compact --config <path>`, `apply <config.yaml>` or `cdc` and not opted out.
 pub(crate) fn begin(argv: &[String], envs: &[(&str, &str)], cwd: Option<&Path>) -> Option<Case> {
     let mut case = parse(argv, envs, cwd)?;
+    let scope = case.scope(envs);
     if case.verb == "run" {
         case.before = case
             .exports
             .iter()
-            .map(|e| {
+            .zip(&scope.exports)
+            .map(|(e, (_, root))| {
                 case.unreachable(e)?;
-                let out = case.local_out(e)?;
+                let out = root.clone()?;
                 if case.needs_image(e) {
                     // A run that later fails still delivered what its Success manifests declare.
                     case.stream_dirs(e, &out);
@@ -184,7 +195,23 @@ pub(crate) fn begin(argv: &[String], envs: &[(&str, &str)], cwd: Option<&Path>) 
             case.take_image(e, envs, &case.image(e, "begin"));
         }
     }
+    case.snapshot = Some(refusal::Snapshot::take(&scope));
     Some(case)
+}
+
+/// Grade a finished invocation by how it exited: exit 0 against its source ([`finish`]), anything else against the snapshot taken before it. Returns whether a known defect disagreed as marked.
+pub(crate) fn settle(
+    mut case: Case,
+    status: std::process::ExitStatus,
+    stdout: &[u8],
+    envs: &[(&str, &str)],
+    opts: &Opts,
+) -> bool {
+    if status.success() {
+        case.delivered(stdout);
+        return finish(case, envs, opts);
+    }
+    case.refused(status, envs, opts)
 }
 
 /// Start every CDC stream `cfg` names afresh at the source as it stands now, recording the anchor a run that opened its stream here would; its checkpoint must not exist yet.
@@ -379,6 +406,7 @@ fn parse(argv: &[String], envs: &[(&str, &str)], cwd: Option<&Path>) -> Option<C
         replay,
         cli,
         events: Vec::new(),
+        snapshot: None,
     })
 }
 
@@ -396,7 +424,7 @@ pub(crate) fn begin_raw(
 }
 
 /// Grade a finished invocation that exited 0; panics with every disagreement, returns whether a known defect disagreed as marked.
-pub(crate) fn finish(case: Case, envs: &[(&str, &str)], opts: &Opts) -> bool {
+fn finish(case: Case, envs: &[(&str, &str)], opts: &Opts) -> bool {
     let mut xfailed = false;
     assert!(
         !case.cli.is_some_and(|c| c.ndjson) || case.events.len() == case.exports.len(),
@@ -452,6 +480,132 @@ fn image_exists(base: &Path) -> bool {
 }
 
 impl Case {
+    /// Where this invocation keeps its state: the run's `RIVET_STATE_URL` or the backend under test when Postgres, else SQLite beside the config; `rivet cdc` keeps none (src/cli/dispatch.rs).
+    fn state_at(&self, envs: &[(&str, &str)]) -> Option<refusal::StateAt> {
+        if self.cli.is_some() {
+            return None;
+        }
+        Some(
+            envs.iter()
+                .find(|(n, _)| *n == "RIVET_STATE_URL")
+                .map(|(_, v)| v.to_string())
+                .or_else(super::state::state_url_under_test)
+                .filter(|u| u.starts_with("postgres"))
+                .map_or_else(
+                    || refusal::StateAt::Sqlite(self.config_dir.join(".rivet_state.db")),
+                    refusal::StateAt::Postgres,
+                ),
+        )
+    }
+
+    /// What the refusal grade fingerprints: each export's destination tree (a cloud prefix only around a `run` the oracle can pull), the checkpoint files, the state.
+    fn scope(&self, envs: &[(&str, &str)]) -> refusal::Scope {
+        let root = |e: &Value| -> Result<PathBuf, String> {
+            if e.get("destination").and_then(|d| s(d, "type")) != Some("local") {
+                if self.verb != "run" {
+                    return Err("a cloud prefix is not pulled around a load or a compact".into());
+                }
+                self.unreachable(e)?;
+            }
+            self.local_out(e)
+        };
+        let name = |e: &Value| {
+            let whole = e.get("__stream").unwrap_or(e);
+            s(whole, "name").unwrap_or("?").to_string()
+        };
+        let mut checkpoints: Vec<PathBuf> = self
+            .exports
+            .iter()
+            .filter_map(|e| self.checkpoint(e))
+            .collect();
+        checkpoints.sort();
+        checkpoints.dedup();
+        refusal::Scope {
+            exports: self.exports.iter().map(|e| (name(e), root(e))).collect(),
+            checkpoints,
+            state: self.state_at(envs),
+        }
+    }
+
+    /// Log that this invocation ended in a way no grade covers.
+    pub(crate) fn ungraded(&self, why: &str) {
+        log("UNGRADED", &self.label(), why);
+    }
+
+    /// The verdict line's export: the one export, else `*`.
+    fn label(&self) -> String {
+        match self.exports.as_slice() {
+            [e] => s(e, "name").unwrap_or("?").to_string(),
+            _ => "*".into(),
+        }
+    }
+
+    /// Grade an invocation that did not exit 0 against its pre-run snapshot; panics on anything left behind undeclared, returns whether a known defect showed as marked.
+    fn refused(self, status: std::process::ExitStatus, envs: &[(&str, &str)], opts: &Opts) -> bool {
+        let exit = status
+            .code()
+            .map_or_else(|| "no exit code".to_string(), |c| format!("exit {c}"));
+        if let Some(why) = refusal::crashed_by_the_test(status, envs) {
+            self.ungraded(&format!(
+                "{exit}: {why}; a crash is graded by the run that resumes it"
+            ));
+            return false;
+        }
+        let scope = self.scope(envs);
+        let before = self.snapshot.as_ref().expect("begin took the snapshot");
+        let (found, blind) = refusal::diff(&scope, before, &refusal::Snapshot::take(&scope));
+        let states: BTreeSet<&String> = scope.exports.iter().map(|(n, _)| n).collect();
+        let (found, delivered) = refusal::without_delivering_siblings(found, states.len());
+        for e in &delivered {
+            log(
+                "UNGRADED",
+                e,
+                &format!(
+                    "{exit}: this export recorded success beside a sibling that failed; its delivery was not graded"
+                ),
+            );
+        }
+        let mut declared = opts.leaves.to_vec();
+        if let Some(raw) = envs
+            .iter()
+            .find(|(k, _)| *k == refusal::FAILED_RUN_LEAVES_ENV)
+        {
+            declared.extend(refusal::declared_in_env(raw.1));
+        }
+        let marker = opts
+            .xfail
+            .and_then(|k| Leftover::of_known_defect_class(k.class).map(|kind| (kind, k.reason)));
+        let gaps = if blind.is_empty() {
+            String::new()
+        } else {
+            format!("; {}", blind.join("; "))
+        };
+        let name = self.label();
+        match refusal::judge(&found, &declared, marker) {
+            refusal::Verdict::Refused {
+                left,
+                known,
+                marked,
+            } => {
+                log("REFUSED", &name, &format!("{exit}: {left}{gaps}"));
+                for (why, detail) in known {
+                    log("XFAIL", &name, &format!("{why} — {detail}"));
+                }
+                marked
+            }
+            refusal::Verdict::Fail(lines) => {
+                log("FAIL", &name, &format!("{exit}: {}", lines.join(" | ")));
+                panic!(
+                    "rig oracle: the invocation ended with {exit} and left behind what a failed run may not \
+                     (tests/common/refusal.rs; declare a legitimate leftover with `.a_failed_run_may_leave(..)` or \
+                     {}=<kinds>, a product defect with `Rig::oracle_known_defect(\"a failed run left: <kind>\", ..)`):\n  - {}{gaps}",
+                    refusal::FAILED_RUN_LEAVES_ENV,
+                    lines.join("\n  - ")
+                );
+            }
+        }
+    }
+
     /// Record what a `rivet cdc` NDJSON run printed: each export's change lines appended to its stream's event log.
     pub(crate) fn delivered(&mut self, stdout: &[u8]) {
         if !self.cli.is_some_and(|c| c.ndjson) {
@@ -650,15 +804,11 @@ impl Case {
         };
         let url = source_url(&raw);
         let db = self.config_dir.join(".rivet_state.db");
-        // `rivet cdc` keeps no ledger: its manifests and checkpoint are its whole run record (src/cli/dispatch.rs).
-        let state = envs
-            .iter()
-            .find(|(n, _)| *n == "RIVET_STATE_URL")
-            .map(|(_, v)| v.to_string())
-            .or_else(super::state::state_url_under_test)
-            .filter(|u| u.starts_with("postgres"))
-            .or_else(|| db.is_file().then(|| db.display().to_string()))
-            .filter(|_| self.cli.is_none());
+        let state = match self.state_at(envs) {
+            Some(refusal::StateAt::Postgres(url)) => Some(url),
+            Some(refusal::StateAt::Sqlite(db)) if db.is_file() => Some(db.display().to_string()),
+            _ => None,
+        };
         // A run with no findable state is graded PARTIAL, never a silent PASS of a ledger leg that was not compared.
         let state_missing = (state.is_none() && self.cli.is_none()).then(|| {
             format!(
@@ -1151,7 +1301,9 @@ fn env_of(envs: &[(&str, &str)], k: &str) -> Option<String> {
 fn verdict_of(name: &str, spec: &serde_json::Value, verb: &str, opts: &Opts) -> bool {
     let t0 = std::time::Instant::now();
     // A marker names one export and one failure class; the oracle says whether every failure is of it.
-    let marker = opts.xfail.filter(|k| k.export == name && verb == "grade");
+    let marker = opts.xfail.filter(|k| {
+        k.export == name && verb == "grade" && Leftover::of_known_defect_class(k.class).is_none()
+    });
     let mut spec = spec.clone();
     if let Some(k) = marker {
         spec["known_defect"] = k.class.into();

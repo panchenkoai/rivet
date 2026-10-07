@@ -89,6 +89,8 @@ pub struct Rig {
     oracle_xfail: Option<(String, String)>,
     /// Whether a graded run of an `oracle_xfail` rig disagreed, as the marker expects.
     oracle_xfailed: std::cell::Cell<bool>,
+    /// What this rig's failed runs may leave behind (see `Rig::a_failed_run_may_leave`).
+    failed_run_leaves: Vec<super::refusal::Leftover>,
     /// Top-level lines rendered after the exports. See [`Rig::top_line`].
     top_lines: Vec<String>,
     /// Caller-owned config copies produced by [`Rig::config_in`] — a
@@ -150,6 +152,7 @@ impl Rig {
             oracle_off: None,
             oracle_xfail: None,
             oracle_xfailed: std::cell::Cell::new(false),
+            failed_run_leaves: Vec::new(),
             top_lines: Vec::new(),
             cloud_dest: None,
             dest_prefix_unslashed: false,

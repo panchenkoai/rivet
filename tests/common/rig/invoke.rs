@@ -36,18 +36,27 @@ impl Rig {
 
     /// Run to completion and collect the output.
     fn invoke(&self, argv: &[String], envs: &[(&str, &str)]) -> std::process::Output {
-        let case = self.oracle_begin(argv, envs, None);
-        let out = self
-            .invoke_command(argv, envs)
-            .output()
-            .expect("spawn rivet binary");
+        self.invoke_in(argv, envs, None)
+    }
+
+    /// The one blocking bracket: snapshot, run (in `cwd` when given), absorb config writes, grade by the exit.
+    fn invoke_in(
+        &self,
+        argv: &[String],
+        envs: &[(&str, &str)],
+        cwd: Option<&std::path::Path>,
+    ) -> std::process::Output {
+        let case = self.oracle_begin(argv, envs, cwd);
+        let mut cmd = self.invoke_command(argv, envs);
+        if let Some(dir) = cwd {
+            cmd.current_dir(dir);
+        }
+        let out = cmd.output().expect("spawn rivet binary");
         // rivet itself may write into the config (`plan` annotates wave-less
         // configs even without --annotate-waves) — absorb it so the hand-edit
         // guard keeps firing only on edits made OUTSIDE an invocation.
         self.absorb_product_config_writes();
-        if let Some(case) = case.filter(|_| out.status.success()) {
-            self.oracle_finish(case, envs);
-        }
+        self.oracle_settle(case, out.status, &out.stdout, envs);
         out
     }
 
@@ -206,17 +215,7 @@ impl Rig {
     /// `Command::new(RIVET_BIN)` sites did, and the rig-adoption guard rightly
     /// refused them.
     pub fn run_in_dir(&self, dir: &std::path::Path) -> std::process::Output {
-        let case = self.oracle_begin(&self.run_argv(&[]), &[], Some(dir));
-        let out = self
-            .invoke_command(&self.run_argv(&[]), &[])
-            .current_dir(dir)
-            .output()
-            .expect("spawn rivet binary");
-        self.absorb_product_config_writes();
-        if let Some(case) = case.filter(|_| out.status.success()) {
-            self.oracle_finish(case, &[]);
-        }
-        out
+        self.invoke_in(&self.run_argv(&[]), &[], Some(dir))
     }
 
     /// [`Rig::run_in_dir`] for any OTHER subcommand — `doctor`, `check`, `validate`.
@@ -229,13 +228,7 @@ impl Rig {
     /// the open position"). `run_in_dir` could express the run half of that pair
     /// and nothing could express the diagnostic half.
     pub fn cli_in_dir(&self, args: &[&str], dir: &std::path::Path) -> std::process::Output {
-        let out = self
-            .invoke_command(&self.cli_argv(args), &[])
-            .current_dir(dir)
-            .output()
-            .expect("spawn rivet binary");
-        self.absorb_product_config_writes();
-        out
+        self.invoke_in(&self.cli_argv(args), &[], Some(dir))
     }
 
     /// Run with an extra environment variable (fault injection); returns the
@@ -287,14 +280,15 @@ impl Rig {
                     stdout: std::fs::read(&out_path).unwrap_or_default(),
                     stderr: std::fs::read(&err_path).unwrap_or_default(),
                 };
-                if let Some(case) = case.filter(|_| out.status.success()) {
-                    self.oracle_finish(case, envs);
-                }
+                self.oracle_settle(case, out.status, &out.stdout, envs);
                 return Some(out);
             }
             if start.elapsed() >= timeout {
                 let _ = child.kill();
                 let _ = child.wait();
+                if let Some(case) = &case {
+                    case.ungraded("killed at its wall-clock ceiling");
+                }
                 // Absorb on the KILL path too: a product config write that
                 // landed before the timeout would otherwise false-trip the
                 // hand-edit guard at the next materialization.
@@ -310,7 +304,7 @@ impl Rig {
     /// For tests that must act on a running process — signal it, inspect its
     /// children, watch the staged `.tmp` appear — rather than wait for an exit
     /// status. `run_args_env` blocks until completion and so cannot express them.
-    /// The caller reaps it through [`Spawned`]; a reaping that sees exit 0 grades the run like any other.
+    /// The caller reaps it through [`Spawned`]; the reaping grades the run by its exit like any other.
     pub fn spawn_args_env(&self, extra: &[&str], envs: &[(&str, &str)]) -> Spawned<'_> {
         let argv = self.run_argv(extra);
         let case = self.oracle_begin(&argv, envs, None);
@@ -460,7 +454,7 @@ fn a_doctor_report_without_all_ok_is_an_error_not_agreement() {
     let _ = doctor_agrees_with_run(br#"{"ok": true}"#, false);
 }
 
-/// A live `rivet run` child of [`Rig::spawn_args_env`]: a `Child` (by deref) whose reaping grades the run when it exited 0.
+/// A live `rivet run` child of [`Rig::spawn_args_env`]: a `Child` (by deref) whose reaping grades the run by its exit.
 pub struct Spawned<'a> {
     rig: &'a Rig,
     child: std::process::Child,
@@ -469,14 +463,14 @@ pub struct Spawned<'a> {
 }
 
 impl Spawned<'_> {
-    /// [`std::process::Child::wait`], then grade a successful run.
+    /// [`std::process::Child::wait`], then grade the run.
     pub fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
         let status = self.child.wait()?;
         self.reaped(status);
         Ok(status)
     }
 
-    /// [`std::process::Child::try_wait`], then grade a successful run once it has exited.
+    /// [`std::process::Child::try_wait`], then grade the run once it has exited.
     pub fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
         let status = self.child.try_wait()?;
         if let Some(st) = status {
@@ -495,17 +489,15 @@ impl Spawned<'_> {
         })
     }
 
-    /// Grade the run once, if it exited 0.
+    /// Grade the run once, by its exit.
     fn reaped(&mut self, status: std::process::ExitStatus) {
         self.rig.absorb_product_config_writes();
-        if let Some(case) = self.case.take().filter(|_| status.success()) {
-            let envs: Vec<(&str, &str)> = self
-                .envs
-                .iter()
-                .map(|(k, v)| (k.as_str(), v.as_str()))
-                .collect();
-            self.rig.oracle_finish(case, &envs);
-        }
+        let envs: Vec<(&str, &str)> = self
+            .envs
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        self.rig.oracle_settle(self.case.take(), status, &[], &envs);
     }
 }
 

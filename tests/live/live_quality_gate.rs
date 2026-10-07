@@ -38,9 +38,24 @@ fn pg_duplicate_run(tag: &str, text_key: bool, mode: &str, lines: &[&str]) -> st
         .export_line("quality:")
         .export_line("  unique_columns: [v]")
         .export_line("  unique_max_entries: 1000")
+        .a_failed_run_may_leave(
+            &[Leftover::OrphanPart, Leftover::FileLog],
+            "the quality gate judges the parts after they are written",
+        )
         .dest_path(out.path().to_path_buf());
     for l in lines {
         rig = rig.export_line(l);
+    }
+    if lines.contains(&"chunk_checkpoint: true") {
+        rig = rig
+            .a_failed_run_may_leave(
+                &[Leftover::ChunkCheckpoint],
+                "a checkpointed run records each chunk as it lands",
+            )
+            .oracle_known_defect(
+                "a failed run left: resume-point",
+                "known defect: a checkpointed run its quality gate fails is recorded in export_progression as the committed boundary (TRIAGE P-05 family)",
+            );
     }
     rig.run_args(&["--export", &export])
 }
@@ -145,6 +160,10 @@ fn parallel_keyset_duplicate_run(engine: SqlEngine, tag: &str) -> std::process::
         .export_line("quality:")
         .export_line("  unique_columns: [v]")
         .export_line("  unique_max_entries: 1000")
+        .a_failed_run_may_leave(
+            &[Leftover::OrphanPart, Leftover::FileLog],
+            "the quality gate judges the parts after they are written",
+        )
         .run_args(&["--export", &export])
 }
 
@@ -184,7 +203,11 @@ fn quality_gate_fails_a_short_mongo_parallel_export() {
         .mongo("page_size: 1000")
         .export_line("parallel: 4")
         .export_line("quality:")
-        .export_line("  row_count_min: 5000");
+        .export_line("  row_count_min: 5000")
+        .a_failed_run_may_leave(
+            &[Leftover::OrphanPart, Leftover::FileLog],
+            "the quality gate judges the parts after they are written",
+        );
     let r = rig.run_args(&[]);
     assert_failed_as_single_does(
         "mongo-parallel",
