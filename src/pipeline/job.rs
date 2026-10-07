@@ -3025,6 +3025,47 @@ mod tests {
     // so a field swap surfaces as a wrong-value read, not a passing tie.
 
     #[test]
+    fn a_finished_keyset_run_releases_its_anchor_and_the_ranges_of_its_own_source_only() {
+        use crate::plan::{ExtractionStrategy, KeysetPlan};
+        let chunked = chunked_plan_with_quality(None);
+        let mut plan = chunked.clone();
+        plan.strategy = ExtractionStrategy::Keyset(KeysetPlan {
+            key_column: "id".into(),
+            chunk_size: 10,
+            checkpoint: true,
+            incremental: false,
+            parallel: 2,
+        });
+        let state = crate::state::StateStore::open_in_memory().unwrap();
+        let (key, name) = (plan.progress_key(), plan.export_name.as_str());
+        let one = [(None, None)];
+        state.set_resume_run_id(&key, "run_1").unwrap();
+        state
+            .persist_keyset_ranges(name, &key.source, "run_1", "id", &one)
+            .unwrap();
+        state
+            .persist_keyset_ranges(name, "another/source", "run_2", "id", &one)
+            .unwrap();
+        let anchored = || state.get_resume_run_id(name, &key.source).unwrap();
+
+        super::finalize_keyset_anchor(&state, &plan, name, true);
+        assert_eq!(
+            anchored().as_deref(),
+            Some("run_1"),
+            "a failed run keeps it"
+        );
+        super::finalize_keyset_anchor(&state, &chunked, name, false);
+        assert_eq!(anchored().as_deref(), Some("run_1"), "not a keyset finish");
+        super::finalize_keyset_anchor(&state, &plan, name, false);
+        assert_eq!(anchored(), None);
+        assert!(!state.has_keyset_ranges(name, "run_1", None).unwrap());
+        assert!(
+            state.has_keyset_ranges(name, "run_2", None).unwrap(),
+            "another source keeps its ranges"
+        );
+    }
+
+    #[test]
     fn build_metric_row_maps_every_summary_and_plan_field() {
         let mut summary = RunSummary::stub_for_testing("run-bmr", "orders");
         summary.duration_ms = 1234;

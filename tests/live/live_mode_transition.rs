@@ -1079,9 +1079,7 @@ fn range_chunk_shared_name_another_source(engine: SqlEngine) {
         "A crashed mid-run: {partial:?}"
     );
 
-    let mut b = a.source_url(&other.url()).no_oracle(
-        "the source is a second database the rig oracle does not attach; the cell re-reads the destination itself",
-    );
+    let mut b = a.source_url(&other.url());
     for (cycle, out) in [(1, dirs[1].path()), (2, dirs[2].path())] {
         b = staged_for(engine, b, &RANGE_CHUNKED, out);
         let o = b.run();

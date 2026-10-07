@@ -265,6 +265,8 @@ seeds:
         cells:
           - crashed_keyset_then_incremental_finish_the_run_oracle
           - crashed_keyset_then_incremental_reset_oracle
+      mongo:
+        na: "a Mongo export accepts only mode: full or cdc, so no run of another mode can meet its interrupted keyset run"
 
   - name: chunk-run-resumed-by-another-source
     class: an interrupted range-chunk run is looked up by export name alone and resumed by a same-named export of another source
@@ -281,6 +283,10 @@ seeds:
       mssql:
         cells:
           - range_chunk_shared_name_another_source_mssql
+      oracle:
+        na: "range chunking refuses the stand's NUMBER key on Oracle and the stand has one Oracle service, so no cell can open two same-named range-chunk runs there (the matrix records the gap)"
+      mongo:
+        na: "a Mongo export has no range chunking"
 
   - name: progress-inherited-by-another-stream
     class: stored progress (incremental cursor, keyset high-water, resume anchor) is continued by an export that reads another table or collection
