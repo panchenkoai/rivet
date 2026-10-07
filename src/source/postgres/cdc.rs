@@ -91,10 +91,10 @@ pub(crate) struct PgChangeStream {
     /// keeps the pure catch-up exit. The contract lives on [`DrainMode`].
     bound: Option<u64>,
     /// COMMIT LSN of the last DATA-bearing transaction yielded and not yet covered
-    /// by an ack; 0 when nothing is owed downstream. While non-zero the slot moves
-    /// only through [`ChangeStream::ack`]; at 0 the frontier-covered span is
-    /// data-free and [`Self::release_empty_frontier`] may advance past it.
-    owed_through: u64,
+    /// by an ack; `None` when nothing is owed downstream. While `Some` the slot
+    /// moves only through [`ChangeStream::ack`]; at `None` the frontier-covered span
+    /// is data-free and [`Self::release_empty_frontier`] may advance past it.
+    owed_through: Option<u64>,
     /// Rendered LSN of the last frontier advance — the zero-yield release
     /// target. `take()`n once at exhaust.
     frontier_text: Option<String>,
@@ -705,7 +705,7 @@ impl PgChangeStream {
             exhausted: false,
             pending_truncate_refusal: None,
             bound,
-            owed_through: 0,
+            owed_through: None,
             frontier_text: None,
             configured_tables: configured_tables.to_vec(),
             barrier_nonce,
@@ -765,9 +765,12 @@ impl PgChangeStream {
                         // #158: commit LSN on all, committed on the transaction's LAST
                         // event — on disk when it spilled (`TxBuffer::close_transaction`).
                         let (head, tail) = tx.close_transaction(&commit, &lsn)?;
-                        if !head.is_empty() || tail.is_some() {
-                            self.owed_through = commit_lsn;
-                        }
+                        self.owed_through = owed_after_yield(
+                            self.owed_through,
+                            commit_lsn,
+                            head.len(),
+                            tail.is_some(),
+                        );
                         self.pending.extend(head);
                         self.frontier = commit_lsn;
                         self.frontier_text = Some(lsn.clone());
@@ -928,7 +931,7 @@ impl PgChangeStream {
     /// and is released then. Failure here only delays WAL release — warn, never
     /// fail an otherwise-clean run.
     fn release_empty_frontier(&mut self) {
-        if self.owed_through != 0 {
+        if self.owed_through.is_some() {
             return;
         }
         let Some(lsn) = self.frontier_text.take() else {
@@ -985,13 +988,23 @@ fn tx_disposition(commit_lsn: u64, frontier: u64, bound: Option<u64>) -> TxDispo
     }
 }
 
-/// What stays owed downstream after the sink acked `acked`: nothing once the ack covers the last data-bearing commit yielded.
-fn owed_after_ack(owed_through: u64, acked: Option<u64>) -> u64 {
-    if acked.is_some_and(|a| a >= owed_through) {
-        0
+/// What is owed downstream once a transaction is yielded: its own commit when it carried data, else what was owed before.
+fn owed_after_yield(
+    owed_through: Option<u64>,
+    commit_lsn: u64,
+    buffered_rows: usize,
+    spilled: bool,
+) -> Option<u64> {
+    if buffered_rows > 0 || spilled {
+        Some(commit_lsn)
     } else {
         owed_through
     }
+}
+
+/// What stays owed downstream after the sink acked `acked`: nothing once the ack covers the last data-bearing commit yielded.
+fn owed_after_ack(owed_through: Option<u64>, acked: Option<u64>) -> Option<u64> {
+    owed_through.filter(|owed| acked.is_none_or(|a| a < *owed))
 }
 
 /// Wire budget per peek: the sink's ack cadence (the part rollover), clamped to
@@ -2739,20 +2752,41 @@ mod tests {
     }
 
     #[test]
+    fn a_yielded_transaction_is_owed_only_when_it_carried_data() {
+        assert_eq!(owed_after_yield(None, 7, 1, false), Some(7));
+        assert_eq!(
+            owed_after_yield(None, 7, 0, true),
+            Some(7),
+            "a spilled tail is data"
+        );
+        assert_eq!(owed_after_yield(Some(3), 7, 2, false), Some(7));
+        assert_eq!(
+            owed_after_yield(None, 7, 0, false),
+            None,
+            "an empty transaction owes nothing"
+        );
+        assert_eq!(
+            owed_after_yield(Some(3), 7, 0, false),
+            Some(3),
+            "and keeps what was owed"
+        );
+    }
+
+    #[test]
     fn an_ack_discharges_only_what_it_covers() {
         assert_eq!(
-            owed_after_ack(5, Some(4)),
-            5,
+            owed_after_ack(Some(5), Some(4)),
+            Some(5),
             "a mid-window ack leaves the rest owed"
         );
-        assert_eq!(owed_after_ack(5, Some(5)), 0);
-        assert_eq!(owed_after_ack(5, Some(6)), 0);
+        assert_eq!(owed_after_ack(Some(5), Some(5)), None);
+        assert_eq!(owed_after_ack(Some(5), Some(6)), None);
         assert_eq!(
-            owed_after_ack(5, None),
-            5,
+            owed_after_ack(Some(5), None),
+            Some(5),
             "an unparseable ack discharges nothing"
         );
-        assert_eq!(owed_after_ack(0, Some(0)), 0);
+        assert_eq!(owed_after_ack(None, Some(9)), None);
     }
 
     // The offline mutation guard for the peek-budget contract: the CI mutants
