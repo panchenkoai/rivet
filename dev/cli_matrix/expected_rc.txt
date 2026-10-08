@@ -70,7 +70,7 @@ pg_run_incr 0
 pg_run_json 0
 pg_run_parallel_single 0
 pg_run_reconcile 0
-pg_run_resume_no_chk 1
+pg_run_resume_no_chk 5
 pg_run_summary 0
 pg_run_unknown 1
 pg_run_val_rec 0

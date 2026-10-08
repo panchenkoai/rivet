@@ -41,7 +41,9 @@ three artefacts at the resolved prefix on a clean run:
 not say that the last run succeeded: a run that fails before its first write (the source
 cannot be reached, the password is wrong, the run is refused when it opens) leaves the
 previous `_SUCCESS`, `manifest.json` and every other object exactly as they were, and
-tells its failure through its exit code and the run journal (`rivet metrics`). A run
+tells its failure through its exit code and the run journal (`rivet metrics`). Only on a
+prefix that holds no manifest yet does it leave its own `failed` manifest (0 parts, no
+`_SUCCESS`), so `rivet validate` exits 1 on a prefix whose only run failed. A run
 that put a part at the destination and then failed removes `_SUCCESS` and writes a
 `failed` manifest naming the parts it wrote, because the prefix is no longer the export
 the marker described. `--resume` therefore reads the run journal beside the marker: an

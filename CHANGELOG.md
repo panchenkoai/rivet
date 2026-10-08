@@ -12,15 +12,17 @@
     `_SUCCESS`. After a network failure `rivet validate` exited 1 and a loader or sensor
     keyed on `_SUCCESS` stopped seeing an export that was whole.
   - Now `_SUCCESS` and a `success` manifest mean "this prefix holds a whole export", not
-    "the last run succeeded". Such a run writes nothing to the destination; the failure is
-    told by the exit code and the run journal (`rivet metrics`, `export_metrics`). A run
-    that put a part at the destination and then failed still deletes `_SUCCESS` and
-    writes a `failed` manifest naming those parts.
+    "the last run succeeded". Over a prefix that already holds a manifest such a run writes
+    nothing to the destination; the failure is told by the exit code and the run journal
+    (`rivet metrics`, `export_metrics`). On a prefix with no manifest yet (the export's
+    first run) it records its failure as before: a `failed` manifest with 0 parts and no
+    `_SUCCESS`, so `rivet validate` exits 1 on a prefix whose only run failed. A run that
+    put a part at the destination and then failed still deletes `_SUCCESS` and writes a
+    `failed` manifest naming those parts.
   - What a scheduler or loader that reads the destination sees differently: after a run
     that failed before its first write, `_SUCCESS` is still there, `manifest.json` still
-    says `success` with the previous run's `run_id` and `finished_at`, and a first-ever
-    run that failed leaves no `manifest.json` at all (`rivet validate` then reports
-    `legacy_run`, exit 0, as on any empty prefix). A consumer that used "the marker is
+    says `success` with the previous run's `run_id` and `finished_at`, and no
+    `manifest-<run id>.json` of the failed run is added. A consumer that used "the marker is
     gone" or "the manifest says failed" as its signal that the last run failed must read
     the run's exit code, or compare the manifest's `run_id` with the run it started.
   - `--resume` reads the run journal beside the marker, so its behaviour after such a

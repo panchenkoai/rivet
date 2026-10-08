@@ -259,12 +259,35 @@ pub(super) fn finalize_run_report(config_path: &str, summary: &RunSummary, kind:
 ///
 /// The parts are still durable, which is exactly why this must be loud. Nothing
 /// about the failure is visible in the data; it is visible only here.
-/// Whether a run that did not succeed has no part at the destination (none committed or adopted, none `landed`): the prefix stays as the last run that wrote left it.
-pub(super) fn run_left_the_prefix_alone(summary: &RunSummary, landed: u64) -> bool {
+/// Whether a run that did not succeed has no part at the destination: none committed or adopted, none `landed`.
+pub(super) fn run_put_nothing_at_the_destination(summary: &RunSummary, landed: u64) -> bool {
     summary.status != "success" && summary.manifest_parts.is_empty() && landed == 0
 }
 
+/// What the end of a run did to its prefix: why it is not consumable (`gap`), and whether the run wrote nothing there at all.
+pub(super) struct Finalized {
+    pub gap: Option<String>,
+    pub left_alone: bool,
+}
+
+/// Whether the prefix already holds a canonical manifest, an earlier run's record of what is there; a prefix that cannot be read counts as holding one.
+fn prefix_holds_a_manifest(dest: &dyn crate::destination::Destination) -> bool {
+    !matches!(dest.head(crate::manifest::MANIFEST_FILENAME), Ok(None))
+}
+
 pub(super) fn finalize_manifest(
+    plan: &ResolvedRunPlan,
+    export_family: &str,
+    state: &StateStore,
+    summary: &RunSummary,
+    kind: &str,
+) -> Finalized {
+    let mut left_alone = false;
+    let gap = write_run_manifest(plan, export_family, state, summary, kind, &mut left_alone);
+    Finalized { gap, left_alone }
+}
+
+fn write_run_manifest(
     plan: &ResolvedRunPlan,
     // The export FAMILY (`ExportConfig::family()`), passed at RUNTIME and
     // deliberately NOT a field of `ResolvedRunPlan`: that type is sealed into
@@ -277,6 +300,7 @@ pub(super) fn finalize_manifest(
     state: &StateStore,
     summary: &RunSummary,
     kind: &str,
+    left_alone: &mut bool,
 ) -> Option<String> {
     use crate::manifest::ManifestStatus;
     use crate::pipeline::manifest_writer::{
@@ -334,17 +358,14 @@ pub(super) fn finalize_manifest(
         }
     };
 
-    // `_SUCCESS` and a success manifest say the prefix holds a whole export, not that the
-    // last run succeeded: a run that skipped, or failed before its first write, is told by
-    // its exit code and the journal (`export_metrics`, `run_status`), never by the prefix.
+    // `_SUCCESS` and a manifest describe the prefix, not the last run: a run that put no part
+    // there writes nothing over an earlier run's record. Its failure is told by the exit code
+    // and the journal (`export_metrics`, `run_status`); only on a prefix with no manifest at
+    // all does it leave its own failed manifest, the one record there.
     let landed = plan.parts_landed.load(std::sync::atomic::Ordering::Relaxed);
-    if run_left_the_prefix_alone(summary, landed) {
-        log::info!(
-            "{} '{}': the run ({}) put no part at the destination; its manifest and _SUCCESS stay as they were",
-            kind,
-            summary.export_name,
-            summary.status
-        );
+    let nothing = run_put_nothing_at_the_destination(summary, landed);
+    if nothing && summary.status == "skipped" {
+        *left_alone = true;
         return None;
     }
 
@@ -483,6 +504,17 @@ pub(super) fn finalize_manifest(
             return Some(why);
         }
     };
+
+    if nothing && prefix_holds_a_manifest(&*dest) {
+        *left_alone = true;
+        log::info!(
+            "{} '{}': the run ({}) put no part at the destination; the manifest and _SUCCESS an earlier run left there stay as they were",
+            kind,
+            summary.export_name,
+            summary.status
+        );
+        return None;
+    }
 
     // #167: a `--split` unit shares its destination prefix with its N-1 siblings,
     // so it must NOT write the prefix-level `_SUCCESS` — that would mark the WHOLE
@@ -1632,23 +1664,64 @@ mod tests {
 
         for status in ["skipped", "failed", "interrupted"] {
             assert!(
-                run_left_the_prefix_alone(&bare(status), 0),
+                run_put_nothing_at_the_destination(&bare(status), 0),
                 "a {status} run with no part writes no manifest"
             );
             assert!(
-                !run_left_the_prefix_alone(&with_part(status), 0),
+                !run_put_nothing_at_the_destination(&with_part(status), 0),
                 "a {status} run that committed or adopted parts must still describe them"
             );
             assert!(
-                !run_left_the_prefix_alone(&bare(status), 1),
+                !run_put_nothing_at_the_destination(&bare(status), 1),
                 "a {status} run whose part landed in no manifest withdraws the marker"
             );
         }
         assert!(
-            !run_left_the_prefix_alone(&bare("success"), 0),
+            !run_put_nothing_at_the_destination(&bare("success"), 0),
             "a successful run always writes its manifest, parts or not"
         );
-        assert!(!run_left_the_prefix_alone(&with_part("success"), 1));
+        assert!(!run_put_nothing_at_the_destination(
+            &with_part("success"),
+            1
+        ));
+    }
+
+    #[test]
+    fn the_only_run_of_a_prefix_records_its_failure_and_a_skipped_one_records_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = fin_plan(dir.path());
+        let state = crate::state::StateStore::open_in_memory().unwrap();
+        let bare = |status: &str| {
+            let mut s = fin_summary(&plan, status);
+            s.manifest_parts.clear();
+            s
+        };
+
+        let skipped = finalize_manifest(&plan, "e", &state, &bare("skipped"), "export");
+        assert!(skipped.left_alone && skipped.gap.is_none());
+        assert!(
+            std::fs::read_dir(dir.path()).unwrap().next().is_none(),
+            "a skipped run with no parts writes nothing, manifest or not"
+        );
+
+        let failed = finalize_manifest(&plan, "e", &state, &bare("failed"), "export");
+        assert!(!failed.left_alone && failed.gap.is_none());
+        assert_eq!(
+            read_manifest(dir.path()).status,
+            crate::manifest::ManifestStatus::Failed,
+            "the prefix held no manifest: the failed run's is the one record there"
+        );
+        assert!(!dir.path().join("_SUCCESS").exists());
+
+        let before = std::fs::read(dir.path().join("manifest.json")).unwrap();
+        let mut again = bare("failed");
+        again.run_id = "finrun2".into();
+        assert!(finalize_manifest(&plan, "e", &state, &again, "export").left_alone);
+        assert_eq!(
+            std::fs::read(dir.path().join("manifest.json")).unwrap(),
+            before,
+            "the next failed run leaves the earlier record as it is"
+        );
     }
 
     #[test]
@@ -1663,9 +1736,13 @@ mod tests {
         let mut never_connected = fin_summary(&plan, "failed");
         never_connected.run_id = "finrun2".into();
         never_connected.manifest_parts.clear();
-        let gap = finalize_manifest(&plan, "e", &state, &never_connected, "export");
+        let done = finalize_manifest(&plan, "e", &state, &never_connected, "export");
 
-        assert_eq!(gap, None, "an untouched prefix is not a manifest gap");
+        assert_eq!(
+            (done.gap, done.left_alone),
+            (None, true),
+            "an untouched prefix is not a manifest gap"
+        );
         assert_eq!(before("_SUCCESS"), marker);
         assert_eq!(before("manifest.json"), manifest);
         assert!(
@@ -1744,9 +1821,6 @@ mod tests {
             if !keep_parts {
                 summary.manifest_parts.clear();
                 summary.total_rows = 0;
-                // The part that landed is in no manifest (the transit check refused it).
-                plan.parts_landed
-                    .store(1, std::sync::atomic::Ordering::Relaxed);
             }
             finalize_manifest(&plan, "e", &state, &summary, "export");
             std::fs::read(dir.path().join("manifest.json")).unwrap()

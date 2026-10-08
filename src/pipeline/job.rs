@@ -1588,12 +1588,9 @@ fn execute_resolved_plan(
     // picks up the new status, and the ledger row is re-closed. The manifest
     // itself cannot be re-written to say `failed` — failing to write it is the
     // problem.
-    let prefix_left_alone = super::finalize::run_left_the_prefix_alone(
-        &summary,
-        plan.parts_landed.load(std::sync::atomic::Ordering::Relaxed),
-    );
-    let manifest_gap = finalize_manifest(plan, tail.family, state, &summary, tail.kind);
-    if marker_outlived_its_run(prefix_left_alone, &ledger_run_id, &summary.run_id) {
+    let finalized = finalize_manifest(plan, tail.family, state, &summary, tail.kind);
+    let manifest_gap = finalized.gap;
+    if marker_outlived_its_run(finalized.left_alone, &ledger_run_id, &summary.run_id) {
         super::finalize::retire_running_marker(plan, &ledger_run_id);
     }
     if let Some(why) = &manifest_gap {

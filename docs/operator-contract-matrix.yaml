@@ -49,7 +49,7 @@ scenarios:
     oracle:   { test: open_defect_a_second_concurrent_full_run_does_not_double_the_prefix_oracle }
 
   - id: failed_before_first_write
-    what: "RESULTS 8: a run that never connected leaves the destination byte for byte as it was, twice: empty before the first export, the whole export (`_SUCCESS`, manifest) after it, which `validate` still passes"
+    what: "RESULTS 8: a run that never connected writes nothing over an earlier run's record, twice: before the first export it leaves its failed manifest (the only record there; `validate` exits 1) and the next one leaves that byte for byte; after a complete export it leaves the whole export (`_SUCCESS`, manifest), which `validate` still passes"
     postgres: { test: a_run_that_never_connected_keeps_the_export_complete_postgres }
     mysql:    { test: a_run_that_never_connected_keeps_the_export_complete_mysql }
     mssql:    { test: a_run_that_never_connected_keeps_the_export_complete_mssql }
@@ -89,7 +89,7 @@ scenarios:
     oracle:   { test: a_run_that_failed_after_a_part_withdraws_the_marker_oracle }
 
   - id: resume_failed_before_first_write
-    what: "RESULTS 8 on a resume: a `--resume` that never connected leaves the unfinished run's prefix as it was, and the resume then delivers"
+    what: "RESULTS 8 on a resume: a `--resume` that never connected leaves the prefix of the run that failed after its first chunk byte for byte: its parts and the failed manifest that names them"
     postgres: { test: a_resume_that_never_connected_leaves_the_unfinished_run_as_it_was_postgres }
     mysql:    { test: a_resume_that_never_connected_leaves_the_unfinished_run_as_it_was_mysql }
     mssql:    { test: a_resume_that_never_connected_leaves_the_unfinished_run_as_it_was_mssql }
@@ -105,7 +105,7 @@ scenarios:
     oracle:   { test: a_forced_resume_keeps_the_marker_until_it_writes_oracle }
 
   - id: wave_retry_after_failed_before_first_write
-    what: "RESULTS 8 and `apply --resume`: the wave retry runs again the export whose last run never connected (the marker at its prefix is an earlier run's; the journal says the last run failed), and skips it once that run succeeded"
+    what: "RESULTS 8 and `apply --resume`: the wave retry runs again the export whose last run never connected (the marker at its prefix is an earlier run's; the journal says the last run failed)"
     postgres: { test: a_wave_retry_reruns_the_export_whose_last_run_never_connected_postgres }
     mysql:    { test: a_wave_retry_reruns_the_export_whose_last_run_never_connected_mysql }
     mssql:    { test: a_wave_retry_reruns_the_export_whose_last_run_never_connected_mssql }

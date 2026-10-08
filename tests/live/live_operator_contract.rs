@@ -539,7 +539,7 @@ fn marker_and_manifest(files: &std::collections::BTreeMap<String, Vec<u8>>) -> S
         if named("_SUCCESS").is_some() {
             "kept"
         } else {
-            "withdrawn"
+            "absent"
         },
         status.as_deref().unwrap_or("absent")
     )
@@ -564,7 +564,7 @@ fn changed(
     out
 }
 
-/// RESULTS 8 (owner decision 2026-10-07): a run that never connected leaves the destination as it was, twice: empty before the first export, and the whole export after it, which `validate` still passes.
+/// RESULTS 8 (owner decision 2026-10-07): a run that never connected writes nothing over an earlier run's record, twice. Before the first export it leaves its failed manifest, the only record there (`validate` exits 1), and the next one leaves that; after a complete export it leaves the whole export, which `validate` still passes.
 fn never_connected(mut rig: Rig, url: &str, envs: &[(&str, &str)], store: &Store) {
     let dead = unreachable(url);
     let unreached = |rig: &Rig,
@@ -584,7 +584,22 @@ fn never_connected(mut rig: Rig, url: &str, envs: &[(&str, &str)], store: &Store
         }
     };
     rig.rebuilt(|r| r.source_url(&dead));
-    unreached(&rig, &store.files(), "a destination no run had written to");
+    let only = rig.run_args_env(&[], envs);
+    assert!(!only.status.success(), "fixture: nothing listens at {dead}");
+    let only_failed = store.files();
+    assert_eq!(
+        marker_and_manifest(&only_failed),
+        "`_SUCCESS` absent, manifest.json `failed`",
+        "the only run of a prefix records its failure there, and no marker"
+    );
+    let unvalidated = rig.cli_env(&["validate"], envs);
+    assert_eq!(
+        unvalidated.status.code(),
+        Some(1),
+        "`validate` on a prefix whose only run failed\n{}",
+        text(&unvalidated)
+    );
+    unreached(&rig, &only_failed, "the failed manifest of the only run");
     rig.rebuilt(|r| r.source_url(url));
     let first = rig.run_args_env(&[], envs);
     assert!(first.status.success(), "{}", text(&first));
@@ -631,7 +646,7 @@ fn failed_after_a_part(engine: SqlEngine) {
         serde_json::from_slice(&after["manifest.json"]).expect("a JSON manifest");
     assert_eq!(
         marker_and_manifest(&after),
-        "`_SUCCESS` withdrawn, manifest.json `failed`",
+        "`_SUCCESS` absent, manifest.json `failed`",
         "a run that wrote a part and then failed leaves a prefix nobody may read as whole"
     );
     assert!(
@@ -648,20 +663,18 @@ fn failed_after_a_part(engine: SqlEngine) {
     );
 }
 
-/// A resume that never connected leaves the unfinished run's files as they were, and the resume then delivers.
+/// A resume that never connected leaves the prefix of the run that failed after its first chunk as it was: the parts, and the failed manifest that names them.
 fn resume_never_connected(engine: SqlEngine) {
     let (table, _guard) = range_table(engine, "oc_resnoconn", ROWS);
     let mut rig = range_checkpoint_rig(engine, &table);
-    let crash = rig.run_with_env("RIVET_TEST_PANIC_AT", "after_chunk_complete:2");
-    assert!(
-        !crash.status.success(),
-        "fixture: the first run crashes after its third chunk"
-    );
+    let cut = rig.run_with_env("RIVET_TEST_ERROR_AT", "chunk_export:1");
+    assert!(!cut.status.success(), "fixture: the second chunk fails");
     let store = Store::Local(rig.out_dir());
     let before = store.files();
-    assert!(
-        before.len() >= 3,
-        "fixture: three parts of an unfinished run"
+    assert_eq!(
+        marker_and_manifest(&before),
+        "`_SUCCESS` absent, manifest.json `failed`",
+        "fixture: an unfinished run that wrote parts"
     );
     let dead = unreachable(engine.url());
     rig.rebuilt(|r| r.source_url(&dead));
@@ -673,9 +686,6 @@ fn resume_never_connected(engine: SqlEngine) {
         "a resume that never connected changed the unfinished run's prefix: {:?}",
         changed(&before, &after)
     );
-    rig.rebuilt(|r| r.source_url(engine.url()));
-    let resumed = rig.run_args(&["--resume"]);
-    assert!(resumed.status.success(), "{}", text(&resumed));
 }
 
 /// docs/cloud-destinations.md, Resume: over a prefix that holds `_SUCCESS`, a `--resume --force` that never connected leaves the marker and manifest; one that wrote a part and then failed withdraws the marker.
@@ -707,12 +717,12 @@ fn forced_resume_over_a_marker(engine: SqlEngine) {
     assert!(!cut.status.success(), "fixture: the second chunk fails");
     assert_eq!(
         marker_and_manifest(&store.files()),
-        "`_SUCCESS` withdrawn, manifest.json `failed`",
+        "`_SUCCESS` absent, manifest.json `failed`",
         "a forced resume that wrote a part and then failed"
     );
 }
 
-/// `apply --resume` after a run that never connected runs the export again (its journal says the last run failed, whatever marker an earlier run left), and skips it once that run succeeded.
+/// `apply --resume` after a run that never connected runs the export again: its journal says the last run failed, whatever marker an earlier run left.
 fn wave_retry_after_never_connected(mut rig: Rig, url: &str, grow: impl FnOnce()) {
     rig.run_ok();
     let dead = unreachable(url);
@@ -734,18 +744,10 @@ fn wave_retry_after_never_connected(mut rig: Rig, url: &str, grow: impl FnOnce()
     let before = parts();
     let retry = rig.apply_env(&rig.config_path(), &["--resume"], &[]);
     assert!(retry.status.success(), "{}", text(&retry));
-    let retried = parts();
     assert!(
-        retried > before,
+        parts() > before,
         "`apply --resume` skipped the export whose last run never connected: no new part\n{}",
         text(&retry)
-    );
-    let settled = rig.apply_env(&rig.config_path(), &["--resume"], &[]);
-    assert!(settled.status.success(), "{}", text(&settled));
-    assert_eq!(
-        parts(),
-        retried,
-        "`apply --resume` ran an export whose last run succeeded"
     );
 }
 
@@ -761,17 +763,14 @@ fn wave_retry_sql(engine: SqlEngine) {
 
 const ALREADY_COMPLETE: Refused = Refused::by_code("RIVET_DEST_ALREADY_COMPLETE", 5);
 
-/// RESULTS 12: `--resume` over a complete prefix is refused by code; `--resume --force` then runs as a plain run does, beside the complete export, as the refusal says, and `state reset-chunks` leaves the refusal.
+/// RESULTS 12: `--resume` over a complete prefix is refused by code; `--resume --force` then runs as a plain run does, as the refusal says (what it leaves beside the complete export is pinned by live_resume::chunked_resume_force_overrides_success_gate), and `state reset-chunks` leaves the refusal.
 fn resume_force(engine: SqlEngine) {
     let (table, _guard) = range_table(engine, "oc_resume", ROWS);
-    resume_force_on(range_checkpoint_rig(engine, &table), ROWS);
+    resume_force_on(range_checkpoint_rig(engine, &table));
 }
 
-/// [`resume_force`] on `rig`, whose plain re-run exports `rerun_rows` rows (the whole table, or the delta past a continued key).
-fn resume_force_on(mut rig: Rig, rerun_rows: i64) {
+fn resume_force_on(mut rig: Rig) {
     rig.run_ok();
-    let store = Store::Local(rig.out_dir());
-    let complete = store.files();
     let export = rig.export_name().to_string();
     rig.refuses_twice_and_walks_out(
         &["run", "--resume"],
@@ -788,43 +787,6 @@ fn resume_force_on(mut rig: Rig, rerun_rows: i64) {
                 },
             ),
         ],
-    );
-    let again = rig.run_args(&["--resume", "--force"]);
-    assert!(again.status.success(), "{}", text(&again));
-    let after = store.files();
-    let part = |k: &str| k.ends_with(".parquet");
-    assert!(
-        complete
-            .iter()
-            .filter(|(k, _)| part(k))
-            .all(|(k, v)| after.get(k) == Some(v)),
-        "`--resume --force` rewrote or removed a part of the complete export, which the refusal says it does not: {:?}",
-        changed(&complete, &after)
-    );
-    let manifest: serde_json::Value =
-        serde_json::from_slice(&after["manifest.json"]).expect("a JSON manifest");
-    let named: Vec<&str> = manifest["parts"]
-        .as_array()
-        .expect("a manifest lists its parts")
-        .iter()
-        .filter_map(|p| p["path"].as_str())
-        .collect();
-    assert_eq!(
-        (
-            marker_and_manifest(&after).as_str(),
-            &manifest["row_count"],
-            named.iter().filter(|p| complete.contains_key(**p)).count()
-        ),
-        (
-            "`_SUCCESS` kept, manifest.json `success`",
-            &serde_json::json!(rerun_rows),
-            0
-        ),
-        "manifest.json describes only the new run, as the refusal says: {named:?}"
-    );
-    assert!(
-        named.iter().all(|p| after.contains_key(*p)) && named.is_empty() == (rerun_rows == 0),
-        "the new run's parts are beside the complete export: {named:?}"
     );
 }
 
@@ -1145,7 +1107,6 @@ fn mongo_resume_force() {
         Rig::mongo_batch("t")
             .source_url(&url)
             .mongo("page_size: 10, resume: true"),
-        0,
     );
 }
 

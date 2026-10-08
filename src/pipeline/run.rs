@@ -1809,7 +1809,7 @@ pub(crate) fn run_pool(
     // drop it; the rest re-run (a crashed unit resumes its own checkpoint, a
     // never-started one runs fresh — the per-unit resume flag is set at the call
     // site below). Non-split exports still skip on their own prefix _SUCCESS.
-    if split && resume {
+    if per_unit_skip_applies(split, resume) {
         super::split::skip_completed(realized.as_ref(), &mut effective, &state);
         if effective.is_empty() {
             // Every split unit is complete — but this return sits ABOVE the
@@ -2148,9 +2148,22 @@ fn pool_safe_heavy_split(pending: &[&ExportConfig]) -> (usize, usize) {
     (pending.len() - heavy, heavy)
 }
 
+/// Whether the pool skips completed work per split unit: only a `--split --resume` run has units to skip.
+fn per_unit_skip_applies(split: bool, resume: bool) -> bool {
+    split && resume
+}
+
 #[cfg(test)]
 mod render_guard_tests {
     use super::*;
+
+    #[test]
+    fn the_pool_skips_per_unit_only_under_split_and_resume() {
+        assert!(per_unit_skip_applies(true, true));
+        assert!(!per_unit_skip_applies(true, false));
+        assert!(!per_unit_skip_applies(false, true));
+        assert!(!per_unit_skip_applies(false, false));
+    }
 
     #[test]
     fn only_a_process_rendering_several_exports_itself_uses_compact_cards() {
