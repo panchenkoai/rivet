@@ -118,21 +118,56 @@ pub(crate) fn not_named_by_its_run(manifest: &serde_json::Value) -> Vec<String> 
     odd
 }
 
-/// Paths made read-only until dropped.
-pub struct ReadOnly(Vec<(PathBuf, u32)>);
+/// A local resource made read-only until dropped: the rule that names its paths, and the write bits taken.
+pub struct ReadOnly {
+    what: Local,
+    dir: PathBuf,
+    out: PathBuf,
+    bits: u32,
+}
 
 impl ReadOnly {
     /// Give the resource back now.
     pub fn restore(self) {}
+
+    /// The paths that are this resource now: SQLite creates and removes `-wal`, `-shm` and `-journal` beside the state while it is away.
+    fn paths(&self) -> Vec<PathBuf> {
+        match self.what {
+            Local::Destination => vec![self.out.clone()],
+            Local::StateDirectory => vec![self.dir.clone()],
+            Local::State => state_files(&self.dir),
+        }
+    }
 }
 
 impl Drop for ReadOnly {
     fn drop(&mut self) {
-        use std::os::unix::fs::PermissionsExt as _;
-        for (p, mode) in &self.0 {
-            let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(*mode));
-        }
+        chmod(self.paths(), |mode| mode | self.bits);
     }
+}
+
+/// The SQLite state files in `dir`.
+fn state_files(dir: &Path) -> Vec<PathBuf> {
+    crate::common::runner::files_under(dir)
+        .into_iter()
+        .filter(|p| {
+            p.file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with(".rivet_state.db"))
+        })
+        .collect()
+}
+
+/// Give each of `paths` that is still there the mode `to(its mode)`: the paths changed, and the modes they had.
+fn chmod(paths: Vec<PathBuf>, to: impl Fn(u32) -> u32) -> Vec<(PathBuf, u32)> {
+    use std::os::unix::fs::PermissionsExt as _;
+    paths
+        .into_iter()
+        .filter_map(|p| {
+            let mode = std::fs::metadata(&p).ok()?.permissions().mode();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(to(mode))).ok()?;
+            Some((p, mode))
+        })
+        .collect()
 }
 
 /// Whether a write to `p` (a new file in a directory, an append to a file) still succeeds.
@@ -269,46 +304,31 @@ impl Rig {
 
     /// Make a local resource of this rig read-only until the guard is dropped; panics unless it exists and a write to it is then refused.
     pub fn read_only(&self, what: Local) -> ReadOnly {
-        use std::os::unix::fs::PermissionsExt as _;
         let cfg = self.config_path();
-        let dir = cfg.parent().expect("a config directory");
+        let dir = cfg.parent().expect("a config directory").to_path_buf();
         if let Local::StateDirectory = what {
             // The last connection to close checkpoints and removes `-wal` and `-shm`, as a finished run does.
             rusqlite::Connection::open(dir.join(".rivet_state.db"))
                 .and_then(|c| c.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(())))
                 .expect("checkpoint the state");
+            let state = state_files(&dir);
+            assert_eq!(
+                state.len(),
+                1,
+                "fixture: a state no process has open is one file, with no -wal or -shm: {state:?}"
+            );
         }
-        let state: Vec<PathBuf> = crate::common::runner::files_under(dir)
-            .into_iter()
-            .filter(|p| {
-                p.file_name()
-                    .is_some_and(|n| n.to_string_lossy().starts_with(".rivet_state.db"))
-            })
-            .collect();
-        let paths: Vec<PathBuf> = match what {
-            Local::Destination => vec![self.out_dir()],
-            Local::State => state,
-            Local::StateDirectory => {
-                assert_eq!(
-                    state.len(),
-                    1,
-                    "fixture: a state no process has open is one file, with no -wal or -shm: {state:?}"
-                );
-                vec![dir.to_path_buf()]
-            }
+        let mut guard = ReadOnly {
+            what,
+            dir,
+            out: self.out_dir(),
+            bits: 0,
         };
-        let paths: Vec<PathBuf> = paths.into_iter().filter(|p| p.exists()).collect();
-        let guard = ReadOnly(
-            paths
-                .iter()
-                .map(|p| {
-                    let mode = std::fs::metadata(p).expect("stat").permissions().mode();
-                    std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode & !0o222))
-                        .expect("chmod");
-                    (p.clone(), mode)
-                })
-                .collect(),
-        );
+        let taken = chmod(guard.paths(), |mode| mode & !0o222);
+        guard.bits = taken
+            .iter()
+            .fold(0, |bits, (_, mode)| bits | (mode & 0o222));
+        let paths: Vec<PathBuf> = taken.into_iter().map(|(p, _)| p).collect();
         if let Some(why) = not_taken_away(what, &paths, paths.iter().any(|p| writable(p))) {
             drop(guard);
             panic!("{why}");
@@ -401,6 +421,27 @@ mod tests {
         guard.restore();
         assert!(std::fs::write(out.join("part.parquet"), b"x").is_ok());
         assert!(rig.has_a_part());
+    }
+
+    #[test]
+    fn a_state_file_sqlite_creates_while_the_state_is_away_is_given_back_too() {
+        let rig = Rig::pg_batch("beside_state_sibling");
+        let db = rig.config_path().with_file_name(".rivet_state.db");
+        let open = || rusqlite::Connection::open(&db).expect("open the state");
+        open()
+            .execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE t (x);")
+            .expect("a WAL state, closed: one file");
+        let guard = rig.read_only(Local::State);
+        let write = "INSERT INTO t VALUES (1)";
+        assert!(open().execute(write, []).is_err());
+        assert!(
+            db.with_file_name(".rivet_state.db-shm").is_file(),
+            "fixture: the refused write left a `-shm` beside the state"
+        );
+        guard.restore();
+        open()
+            .execute(write, [])
+            .expect("the state takes a write once it is given back");
     }
 
     #[test]
