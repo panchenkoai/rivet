@@ -163,11 +163,6 @@ impl OracleLogonUser {
             Self::PASSWORD
         )
     }
-
-    /// The login's name, as the catalog holds it.
-    pub fn name(&self) -> &str {
-        &self.0
-    }
 }
 
 impl Drop for OracleLogonUser {

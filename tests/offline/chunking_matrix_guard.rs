@@ -314,12 +314,13 @@ const MATRICES: &[(&str, usize)] = &[
     // refusal codes other cells assert but nobody walks (the CDC, load and legacy-state codes), 9 are
     // the Oracle cells of open-defect rows (no stand that runs `open_defect_` cells had Oracle), 5 the
     // keyset_range row, 2 MongoDB cells.
-    // Raised 78 -> 91 (2026-10-08): the resource-taken-away and two-processes row families and the
+    // Raised 78 -> 93 (2026-10-08): the resource-taken-away and two-processes row families and the
     // `--resume` twins of the wrong-data rows. 9 refusal gaps closed (RUN_IN_PROGRESS and
-    // CHUNK_CHECKPOINT_GONE are walked); 22 new: 10 CDC cells (a stream's session killed, a second
+    // CHUNK_CHECKPOINT_GONE are walked); 24 new: 10 CDC cells (a stream's session killed, a second
     // run beside it: a bounded stream ends before it can be met), 9 Oracle cells of the new
-    // open-defect rows, MongoDB cells of the revoke and validate rows, the load-beside-a-run row.
-    ("docs/sabotage-matrix.yaml", 91),
+    // open-defect rows, the MongoDB and Oracle cells of the revoke row, the MongoDB cell of the
+    // validate row, the load-beside-a-run row, and two runs that name one part in one millisecond.
+    ("docs/sabotage-matrix.yaml", 93),
     // Pool-split — `apply --pool --split` per (strategy × source engine). Split is a
     // scheduler layer above the runners (each unit runs through chunked/keyset), so its
     // per-engine behaviour (boundary probe, crash-recovery, finding-2 exact-partition

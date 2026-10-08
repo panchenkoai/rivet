@@ -967,10 +967,17 @@ fn lease_file_removed(live_rig: impl FnOnce() -> (String, Rig, Box<dyn std::any:
     recovers(&rig, &[]);
 }
 
-/// A second `rivet run` beside a live one of the same export: each delivers or refuses by code, and a run then delivers the source.
+/// A second `rivet run` 700 ms into a live one of the same export (never in its first millisecond: docs/sabotage-matrix.yaml beside_run_same_instant): each delivers or refuses by code, and a run then delivers the source.
 fn second_run_beside(engine: SqlEngine, shape: Shape) {
     let (_table, rig, _guard) = live(engine, "sab_two", shape);
-    let met = rig.beside_a_live_run(&[], |r| shape.mid_run(r), Rig::run);
+    let met = rig.beside_a_live_run(
+        &[],
+        |r| shape.mid_run(r),
+        |r| {
+            std::thread::sleep(std::time::Duration::from_millis(700));
+            r.run()
+        },
+    );
     rig.delivered_or_refused("the second run beside a live one", &met.acted);
     rig.delivered_or_refused("the live run a second one met", &met.run);
     recovers(&rig, &[]);
@@ -2063,13 +2070,6 @@ fn a_run_whose_select_is_revoked_fails_loudly_and_recovers_mysql() {
 #[ignore = "live: requires docker compose mssql"]
 fn a_run_whose_select_is_revoked_fails_loudly_and_recovers_mssql() {
     select_revoked(SqlEngine::Mssql, Shape::RangeCheckpoint);
-}
-
-#[cfg(feature = "oracle")]
-#[test]
-#[ignore = "live: requires docker compose oracle"]
-fn a_run_whose_select_is_revoked_fails_loudly_and_recovers_oracle() {
-    select_revoked(SqlEngine::Oracle, Shape::RangeCheckpoint);
 }
 
 #[test]

@@ -375,7 +375,7 @@ scenarios:
     oracle:   { gap: "not written: needs an unfinished parallel keyset run (the `keyset_parallel_worker` / `mongo_parallel_worker` crash points) and edits of its range rows" }
 
   - id: takeaway_source_session_full
-    what: "the source session of a live run (`mode: full`) killed on the server (pg_terminate_backend, KILL, ALTER SYSTEM KILL SESSION; MongoDB: killCursors on a resumable export): the run delivers or fails loudly, and the next run delivers the source and `validate` passes"
+    what: "every session of the login a live run (`mode: full`) reads as killed on the server (a login the cell creates: pg_terminate_backend, KILL; Oracle: the stand user's sessions whose statement names the table, ALTER SYSTEM KILL SESSION; MongoDB: killCursors and killOp on the collection of a resumable export): the run delivers or fails loudly, and the next run delivers the source and `validate` passes"
     postgres: { test: a_full_run_whose_source_session_is_killed_delivers_or_fails_loudly_postgres }
     mysql:    { test: a_full_run_whose_source_session_is_killed_delivers_or_fails_loudly_mysql }
     mssql:    { test: a_full_run_whose_source_session_is_killed_delivers_or_fails_loudly_mssql }
@@ -383,7 +383,7 @@ scenarios:
     oracle:   { test: a_full_run_whose_source_session_is_killed_delivers_or_fails_loudly_oracle }
 
   - id: takeaway_source_session_incremental
-    what: "the source session of a live run (`mode: incremental`) killed on the server (pg_terminate_backend, KILL, ALTER SYSTEM KILL SESSION; MongoDB: killCursors on a resumable export): the run delivers or fails loudly, and the next run delivers the source and `validate` passes"
+    what: "every session of the login a live run (`mode: incremental`) reads as killed on the server (a login the cell creates: pg_terminate_backend, KILL; Oracle: the stand user's sessions whose statement names the table, ALTER SYSTEM KILL SESSION; MongoDB: killCursors and killOp on the collection of a resumable export): the run delivers or fails loudly, and the next run delivers the source and `validate` passes"
     postgres: { test: a_incremental_run_whose_source_session_is_killed_delivers_or_fails_loudly_postgres }
     mysql:    { test: a_incremental_run_whose_source_session_is_killed_delivers_or_fails_loudly_mysql }
     mssql:    { test: a_incremental_run_whose_source_session_is_killed_delivers_or_fails_loudly_mssql }
@@ -391,7 +391,7 @@ scenarios:
     oracle:   { test: a_incremental_run_whose_source_session_is_killed_delivers_or_fails_loudly_oracle }
 
   - id: takeaway_source_session_range
-    what: "the source session of a live run (range-chunked, no checkpoint) killed on the server (pg_terminate_backend, KILL, ALTER SYSTEM KILL SESSION; MongoDB: killCursors on a resumable export): the run delivers or fails loudly, and the next run delivers the source and `validate` passes"
+    what: "every session of the login a live run (range-chunked, no checkpoint) reads as killed on the server (a login the cell creates: pg_terminate_backend, KILL; Oracle: the stand user's sessions whose statement names the table, ALTER SYSTEM KILL SESSION; MongoDB: killCursors and killOp on the collection of a resumable export): the run delivers or fails loudly, and the next run delivers the source and `validate` passes"
     postgres: { test: a_range_run_whose_source_session_is_killed_delivers_or_fails_loudly_postgres }
     mysql:    { test: a_range_run_whose_source_session_is_killed_delivers_or_fails_loudly_mysql }
     mssql:    { test: a_range_run_whose_source_session_is_killed_delivers_or_fails_loudly_mssql }
@@ -399,7 +399,7 @@ scenarios:
     oracle:   { test: a_range_run_whose_source_session_is_killed_delivers_or_fails_loudly_oracle }
 
   - id: takeaway_source_session_range_checkpoint
-    what: "the source session of a live run (range-chunked, `chunk_checkpoint: true`) killed on the server (pg_terminate_backend, KILL, ALTER SYSTEM KILL SESSION; MongoDB: killCursors on a resumable export): the run delivers or fails loudly, and the next run delivers the source and `validate` passes"
+    what: "every session of the login a live run (range-chunked, `chunk_checkpoint: true`) reads as killed on the server (a login the cell creates: pg_terminate_backend, KILL; Oracle: the stand user's sessions whose statement names the table, ALTER SYSTEM KILL SESSION; MongoDB: killCursors and killOp on the collection of a resumable export): the run delivers or fails loudly, and the next run delivers the source and `validate` passes"
     postgres: { test: a_range_checkpoint_run_whose_source_session_is_killed_delivers_or_fails_loudly_postgres }
     mysql:    { test: a_range_checkpoint_run_whose_source_session_is_killed_delivers_or_fails_loudly_mysql }
     mssql:    { test: a_range_checkpoint_run_whose_source_session_is_killed_delivers_or_fails_loudly_mssql }
@@ -407,7 +407,7 @@ scenarios:
     oracle:   { test: a_range_checkpoint_run_whose_source_session_is_killed_delivers_or_fails_loudly_oracle }
 
   - id: takeaway_source_session_keyset
-    what: "the source session of a live run (keyset (`chunk_by_key`), no checkpoint) killed on the server (pg_terminate_backend, KILL, ALTER SYSTEM KILL SESSION; MongoDB: killCursors on a resumable export): the run delivers or fails loudly, and the next run delivers the source and `validate` passes"
+    what: "every session of the login a live run (keyset (`chunk_by_key`), no checkpoint) reads as killed on the server (a login the cell creates: pg_terminate_backend, KILL; Oracle: the stand user's sessions whose statement names the table, ALTER SYSTEM KILL SESSION; MongoDB: killCursors and killOp on the collection of a resumable export): the run delivers or fails loudly, and the next run delivers the source and `validate` passes"
     postgres: { test: a_keyset_run_whose_source_session_is_killed_delivers_or_fails_loudly_postgres }
     mysql:    { test: a_keyset_run_whose_source_session_is_killed_delivers_or_fails_loudly_mysql }
     mssql:    { test: a_keyset_run_whose_source_session_is_killed_delivers_or_fails_loudly_mssql }
@@ -415,7 +415,7 @@ scenarios:
     oracle:   { test: a_keyset_run_whose_source_session_is_killed_delivers_or_fails_loudly_oracle }
 
   - id: takeaway_source_session_keyset_checkpoint
-    what: "the source session of a live run (keyset (`chunk_by_key`), `chunk_checkpoint: true`) killed on the server (pg_terminate_backend, KILL, ALTER SYSTEM KILL SESSION; MongoDB: killCursors on a resumable export): the run delivers or fails loudly, and the next run delivers the source and `validate` passes"
+    what: "every session of the login a live run (keyset (`chunk_by_key`), `chunk_checkpoint: true`) reads as killed on the server (a login the cell creates: pg_terminate_backend, KILL; Oracle: the stand user's sessions whose statement names the table, ALTER SYSTEM KILL SESSION; MongoDB: killCursors and killOp on the collection of a resumable export): the run delivers or fails loudly, and the next run delivers the source and `validate` passes"
     postgres: { test: a_keyset_checkpoint_run_whose_source_session_is_killed_delivers_or_fails_loudly_postgres }
     mysql:    { test: a_keyset_checkpoint_run_whose_source_session_is_killed_delivers_or_fails_loudly_mysql }
     mssql:    { test: a_keyset_checkpoint_run_whose_source_session_is_killed_delivers_or_fails_loudly_mssql }
@@ -508,7 +508,7 @@ scenarios:
     mysql:    { test: a_run_whose_select_is_revoked_fails_loudly_and_recovers_mysql }
     mssql:    { test: a_run_whose_select_is_revoked_fails_loudly_and_recovers_mssql }
     mongo:    { gap: "needs an auth-enabled MongoDB the cell may create a user on: the standalone on :27017 runs without access control, and the stand's auth instance (:27020) has one fixed read-only user" }
-    oracle:   { test: a_run_whose_select_is_revoked_fails_loudly_and_recovers_oracle }
+    oracle:   { gap: "needs a least-privileged Oracle login under which the export's unqualified table still resolves to RIVET's (a logon trigger that sets CURRENT_SCHEMA); not written: no Oracle within reach of the machine this row was built on to read what the source's catalog probes do under such a login" }
 
   - id: refusal_state_chunk_checkpoint_gone
     what: "RIVET_STATE_CHUNK_CHECKPOINT_GONE: the checkpoint rows of a chunk run removed while it ran (a trigger in the SQLite state removes them when its second task completes); refused twice while the trigger is there, with it dropped `run the export again` delivers, and `state reset-chunks` with it still there leaves the refusal"
@@ -565,6 +565,14 @@ scenarios:
     mssql:    { test: open_defect_a_second_keyset_checkpoint_run_beside_a_live_one_delivers_or_refuses_mssql }
     mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED): its cell of this family is the `mode: full` or the checkpoint row" }
     oracle:   { gap: "an open defect on PostgreSQL, MySQL and SQL Server; the Oracle cell is not written, because no stand that runs `open_defect_` cells has Oracle within reach of the machine this row was built on (CI skips them), so its first failing line could not be read" }
+
+  - id: beside_run_same_instant
+    what: "two runs of one single-runner export (`mode: full` or `incremental`) that name their part in the same millisecond"
+    postgres: { gap: "seen 2 of 10 times on the stand (PostgreSQL once, MySQL once) while the beside_run_incremental cell still started its second run at once: `rig oracle: COUNTER: this run's Success manifests declare 400 rows, their parts hold 200`; the two runs (run ids 8 ms apart) wrote one part name, so one file is declared by both success manifests and counted twice by export_metrics and file_log, while the destination holds each row once; it cannot be forced from outside rivet (it needs a pause before the part is named), so it is not a cell, and that cell now starts its second run 700 ms in" }
+    mysql:    { na: "the part name is the single runner's (src/pipeline/single.rs), whatever the source engine: the postgres column carries the row" }
+    mssql:    { na: "the part name is the single runner's (src/pipeline/single.rs), whatever the source engine: the postgres column carries the row" }
+    mongo:    { na: "the part name is the single runner's (src/pipeline/single.rs), whatever the source engine: the postgres column carries the row" }
+    oracle:   { na: "the part name is the single runner's (src/pipeline/single.rs), whatever the source engine: the postgres column carries the row" }
 
   - id: beside_run_range_checkpoint
     what: "a second `rivet run` beside a live checkpointed one (RESULTS 11 of docs/operator-contract-matrix.yaml, cited here)"

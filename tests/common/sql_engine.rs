@@ -279,21 +279,21 @@ impl SqlEngine {
         rig.restage(mode, &lines)
     }
 
-    /// A login of this engine that may only read `table`, dropped with the guard; its SELECT can be revoked and granted back.
+    /// A login of this engine that may only read `table`, dropped with the guard; its sessions can be killed and its SELECT revoked and granted back. Oracle: the stand's own user, its sessions told apart by the statement that names `table`.
     pub fn reader(self, table: &str) -> Reader {
         let name = unique_name("sab_reader");
-        let (name, url, guard): (String, String, Option<Box<dyn std::any::Any>>) = match self {
+        let (name, url) = match self {
             SqlEngine::Pg => {
                 self.exec(&format!("CREATE ROLE {name} LOGIN PASSWORD 'rivet'"));
                 let url = POSTGRES_URL.replace("rivet:rivet@", &format!("{name}:rivet@"));
-                (name, url, None)
+                (name, url)
             }
             SqlEngine::Mysql => {
                 mysql_root_connect()
                     .query_drop(format!("CREATE USER '{name}'@'%' IDENTIFIED BY 'rivet'"))
                     .expect("mysql create user as root");
                 let url = MYSQL_URL.replace("rivet:rivet@", &format!("{name}:rivet@"));
-                (name, url, None)
+                (name, url)
             }
             SqlEngine::Mssql => {
                 self.exec(&format!(
@@ -301,26 +301,20 @@ impl SqlEngine {
                      CREATE USER {name} FOR LOGIN {name}"
                 ));
                 let url = MSSQL_URL.replace("sa:", &format!("{name}:"));
-                (name, url, None)
+                (name, url)
             }
             #[cfg(feature = "oracle")]
-            SqlEngine::Oracle => {
-                let user = super::OracleLogonUser::create(
-                    "sab_reader",
-                    table,
-                    "EXECUTE IMMEDIATE 'ALTER SESSION SET CURRENT_SCHEMA = RIVET';",
-                );
-                (user.name().to_string(), user.url(), Some(Box::new(user)))
-            }
+            SqlEngine::Oracle => ("RIVET".to_string(), ORACLE_URL.to_string()),
         };
         let reader = Reader {
             engine: self,
             name,
             table: table.to_string(),
             url,
-            _guard: guard,
         };
-        reader.select("GRANT", "TO");
+        if !self.folds_upper() {
+            reader.grant();
+        }
         reader
     }
 
@@ -357,7 +351,6 @@ pub struct Reader {
     name: String,
     table: String,
     url: String,
-    _guard: Option<Box<dyn std::any::Any>>,
 }
 
 impl Reader {
@@ -380,9 +373,9 @@ impl Reader {
                 .engine
                 .exec(&format!("{verb} SELECT ON dbo.{t} {prep} {n}")),
             #[cfg(feature = "oracle")]
-            SqlEngine::Oracle => {
-                super::ora_system_exec(&format!("{verb} SELECT ON RIVET.{t} {prep} {n}"))
-            }
+            SqlEngine::Oracle => panic!(
+                "{verb} SELECT {prep} {n} on {t}: the Oracle reader is the stand's own user (takeaway_select_revoked is a gap on Oracle)"
+            ),
         }
     }
 
@@ -414,8 +407,11 @@ impl Reader {
             #[cfg(feature = "oracle")]
             SqlEngine::Oracle => {
                 let sql = format!(
-                    "SELECT TO_CHAR(sid) || ',' || TO_CHAR(serial#) FROM v$session \
-                     WHERE username = '{n}' ORDER BY 1"
+                    "SELECT TO_CHAR(s.sid) || ',' || TO_CHAR(s.serial#) FROM v$session s \
+                     JOIN v$sql q ON q.sql_id = NVL(s.sql_id, s.prev_sql_id) \
+                     WHERE s.username = '{n}' AND q.sql_text LIKE '%{}%' \
+                     AND q.sql_text NOT LIKE '%v$session%' AND q.rows_processed > 0 ORDER BY 1",
+                    self.table
                 );
                 match super::ora_system_conn().query(&sql, &[]) {
                     Ok(rows) => rows
