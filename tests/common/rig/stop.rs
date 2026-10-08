@@ -53,7 +53,7 @@ pub struct Left {
     pub staged: usize,
     /// Whether `_SUCCESS` is there.
     pub success: bool,
-    /// `run_status` rows of the export still `running`.
+    /// `run_status` rows the stopped process opened that are still `running`.
     pub running: i64,
     /// Rows of the export's run lease (Postgres state; SQLite holds it by `flock`).
     pub leases: i64,
@@ -95,6 +95,16 @@ pub fn graceful_is_worse(graceful: &Stopped, killed: &Stopped) -> Option<String>
             (killed.next == Survived::Delivered && graceful.next != Survived::Delivered)
                 .then(|| "the next run was refused, after the SIGKILL it delivered".to_string())
         })
+}
+
+/// The count of `running` run_status rows of the export that the process `pid` opened (a run id ends in `_<pid>`).
+pub(crate) fn its_running_rows(pid: u32) -> String {
+    let tail = format!("_{pid}");
+    format!(
+        "SELECT COUNT(*) FROM run_status WHERE status = 'running' AND export_name = '{{export}}' \
+         AND substr(run_id, length(run_id) - {} + 1) = '{tail}'",
+        tail.len()
+    )
 }
 
 /// How many files under `dir` (recursively) have a name `is` accepts.
@@ -168,7 +178,8 @@ impl Rig {
             run.try_wait().expect("try_wait").is_none(),
             "stop: the run ended before the signal"
         );
-        let rc = unsafe { libc::kill(run.id() as i32, how.signal()) };
+        let pid = run.id();
+        let rc = unsafe { libc::kill(pid as i32, how.signal()) };
         assert_eq!(rc, 0, "stop: the signal was not delivered");
         assert!(
             seen.elapsed().as_millis() < u128::from(WINDOW_MS / 2),
@@ -183,11 +194,10 @@ impl Rig {
             parts,
             staged,
             success: self.out_dir().join("_SUCCESS").exists(),
-            running: self.state_count(
-                "SELECT COUNT(*) FROM run_status WHERE status = 'running' AND export_name = '{export}'",
+            running: self.state_count(&its_running_rows(pid)),
+            leases: self.state_count(
+                "SELECT COUNT(*) FROM state_lease WHERE lease_key = 'chunk-run:{export}'",
             ),
-            leases: self
-                .state_count("SELECT COUNT(*) FROM state_lease WHERE lease_key = 'chunk-run:{export}'"),
         }
     }
 
@@ -325,6 +335,23 @@ mod tests {
             let parts = usize::from(at == Parked::APartCommitted);
             assert_eq!(not_parked(at, parts, 0), Some("no part is staged"));
         }
+    }
+
+    #[test]
+    fn running_rows_are_counted_for_one_process_of_one_export() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE run_status (run_id TEXT, export_name TEXT, status TEXT);
+             INSERT INTO run_status VALUES
+               ('t_20261008T000000.000_4242', 't', 'running'),
+               ('t_20261008T000000.001_14242', 't', 'running'),
+               ('t_20261008T000000.002_4242', 't', 'failed'),
+               ('u_20261008T000000.003_4242', 'u', 'running');",
+        )
+        .unwrap();
+        let sql = its_running_rows(4242).replace("{export}", "t");
+        let n: i64 = db.query_row(&sql, [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1, "{sql}");
     }
 
     #[test]
