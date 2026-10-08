@@ -1,0 +1,658 @@
+# Guarantee matrix: every guarantee rivet states to its users, tied to the sentence that
+# states it and to the cells that would fail if the sentence were false.
+#
+# Owner's rule (2026-10-08): what is not verified is not claimed, and what is claimed must be
+# verified. An unproven sentence is answered by writing the check, not by softening the sentence.
+#
+# A row:
+#   id:      stable name.
+#   stated:  where the promise is made. `sentence` is VERBATIM (whitespace aside); the guard
+#            fails when the file no longer contains it, so a reworded promise is re-tied here.
+#   held_by: one cell per column the promise covers (an engine, a store, a destination, or
+#            `all` where the promise is engine-independent). A cell is exactly one of
+#              { test: <fn>, asserts: "<text copied from the body of that test>" }
+#              { gate: <stage fn under dev/release_oracle>, asserts: "<text from its module>" }
+#              { gap: "<why no cell holds it here>" }
+#            A `test` counts only when its body would fail if the sentence were false; the
+#            quoted assertion is the evidence, and the guard fails when the body loses it.
+#   contradicted_by: what is known to break the promise today:
+#              known_red:  a substring of an entry in dev/release_oracle/known_red.py
+#              matrix_gap: "<ledger file>#<text in it>"
+#              doc:        "<doc file>#<sentence that says the opposite>"
+#
+# A row is HELD when it has no `gap` cell and no contradiction. The guard
+# (tests/offline/guarantee_matrix_guard.rs) pins the number of rows that are not, and the number
+# of gap cells, shrink-only.
+#
+# `pending:` lists stated guarantees deliberately not tied yet, with the reason.
+
+pending:
+  - id: interrupted_resume_keeps_the_prior_success_marker
+    file: docs/cloud-destinations.md
+    why: "the sentence and the product disagree today (a failed re-run retires the marker); the owner's decision of 2026-10-07 is being implemented by a product PR that rewrites the sentence, the tests and the behaviour together. Tie the new sentence here when it lands."
+
+guarantees:
+  # ── Batch: delivery and crash safety (docs/semantics.md) ─────────────────────────────────
+  - id: no_row_silently_skipped
+    stated:
+      - file: docs/semantics.md
+        sentence: "**No row is silently skipped.** The cursor only advances after the corresponding write succeeds (I3)."
+    held_by:
+      postgres: { test: crash_after_file_write_leaves_file_but_no_manifest_or_cursor, asserts: "recovery must leave every source id (1..=8) at the destination" }
+      mysql: { test: mysql_crash_after_file_write_leaves_file_but_no_manifest_or_cursor, asserts: "recovery must leave every source id (1..=8) — a missing id is row LOSS" }
+      mssql: { test: mssql_crash_after_file_write_leaves_file_but_no_manifest_or_cursor, asserts: "recovery must leave every source id (1..=8) — a missing id is row LOSS" }
+      mongo: { test: mongo_crash_after_file_write_recovers_without_loss, asserts: "recovery after a mid-export crash" }
+      oracle: { gap: "no Oracle batch cell crashes a run between the write and the cursor and reads the destination" }
+    contradicted_by:
+      known_red:
+        - "live_mode_transition::open_defect_source_url_without_its_default_port_continues"
+        - "live_mode_transition::open_defect_incremental_query_filter_edited"
+        - "live_mode_transition::open_defect_same_table_in_another_schema_is_another_stream"
+        - "live_sabotage::open_defect_a_cursor_moved_forward_delivers_or_refuses"
+        - "chunking_stand::open_defect_a_float_chunk_column_under_query_keeps_its_fractional_keys"
+
+  - id: no_incomplete_file_at_the_destination
+    stated:
+      - file: docs/semantics.md
+        sentence: "**No file at the destination is incomplete.** Writers are finalized before destination upload (I1)."
+    held_by:
+      local: { test: crash_after_file_write_leaves_file_but_no_manifest_or_cursor, asserts: "recovery must leave every source id (1..=8) at the destination" }
+      s3: { gap: "no cell cuts an S3 upload mid-part and lists the prefix" }
+      gcs: { test: gremlin_cdc_gcs_upload_cut_fails_loud_then_recovers_without_clobber, asserts: "after healing, the union of GCS parts must hold every row (no gap, no clobber)" }
+      azure: { gap: "no cell cuts an Azure upload mid-part and lists the container" }
+
+  - id: at_least_once_at_the_destination
+    stated:
+      - file: docs/semantics.md
+        sentence: "The trade-off is **at-least-once at the destination**: a crash between write and cursor advancement produces a duplicate file."
+    held_by:
+      postgres: { test: crash_after_file_write_leaves_file_but_no_manifest_or_cursor, asserts: "at-least-once: physical destination rows ({physical}) must be >= source (8)" }
+      mysql: { test: mysql_crash_after_file_write_leaves_file_but_no_manifest_or_cursor, asserts: "at-least-once: physical destination rows must be >= source (8)" }
+      mssql: { test: mssql_crash_after_file_write_leaves_file_but_no_manifest_or_cursor, asserts: "at-least-once: physical destination rows must be >= source (8)" }
+      mongo: { test: mongo_crash_after_file_write_recovers_without_loss, asserts: "duckdb_assert_at_least_once(" }
+      oracle: { gap: "no Oracle batch cell crashes a run between the write and the cursor and reads the destination" }
+    contradicted_by:
+      known_red:
+        - "live_operator_contract::open_defect_a_second_concurrent_full_run_does_not_double_the_prefix"
+
+  - id: uncategorized_errors_are_not_retried
+    stated:
+      - file: docs/semantics.md
+        sentence: "**Uncategorized errors default to `Permanent`** (they are *not* retried)"
+    held_by:
+      all: { test: test_classify_permanent_errors, asserts: "should NOT be transient: {}" }
+
+  - id: cursor_and_manifest_stay_behind_a_crash_after_the_write
+    stated:
+      - file: docs/semantics.md
+        sentence: "| After `dest.write`, before manifest | file present | no entry | not advanced | re-extract → duplicate file at destination |"
+    held_by:
+      postgres: { test: crash_after_file_write_leaves_file_but_no_manifest_or_cursor, asserts: "after_file_write must leave manifest empty" }
+      mysql: { test: mysql_crash_after_file_write_leaves_file_but_no_manifest_or_cursor, asserts: "after_file_write must leave manifest empty" }
+      mssql: { test: mssql_crash_after_file_write_leaves_file_but_no_manifest_or_cursor, asserts: "after_file_write must leave manifest empty" }
+      mongo: { gap: "the Mongo crash cell reads the destination after recovery, not the manifest and cursor between the crash and the recovery" }
+      oracle: { gap: "no Oracle batch cell crashes a run between the write and the cursor" }
+
+  - id: a_plain_run_never_skips_a_finished_run
+    stated:
+      - file: docs/semantics.md
+        sentence: "A **plain** `rivet run` (no `--resume`) never skips the chunks of a run that FINISHED"
+    held_by:
+      mysql: { test: keyset_checkpoint_without_incremental_rereads_on_a_clean_rerun, asserts: "clean re-run must FULLY re-read (2000 rows across both runs)" }
+      postgres: { gap: "no cell re-runs a finished checkpointed export without --resume on this engine and counts the rows of both runs" }
+      mssql: { gap: "no cell re-runs a finished checkpointed export without --resume on this engine and counts the rows of both runs" }
+      oracle: { gap: "no cell re-runs a finished checkpointed export without --resume on this engine and counts the rows of both runs" }
+      mongo: { gap: "no cell re-runs a finished checkpointed export without --resume on this engine and counts the rows of both runs" }
+
+  - id: a_live_run_refuses_a_second_run
+    stated:
+      - file: docs/semantics.md
+        sentence: "**its process is alive** (the lease is held): the run is refused, and so is `--resume`"
+    held_by:
+      sqlite_state: { gap: "the cells that start a second run beside a live one on a SQLite state are open defects (the refusal carries no code); none is green" }
+      postgres_state: { test: two_runs_of_one_export_through_a_transaction_pooler_never_both_proceed, asserts: "one run must proceed and the other be refused by the run lease" }
+    contradicted_by:
+      known_red:
+        - "live_operator_contract::open_defect_a_second_run_beside_a_live_checkpointed_run_is_refused_by_code"
+        - "live_operator_contract::open_defect_a_second_run_beside_a_live_resumable_run_is_refused_by_code"
+        - "audit_state::open_defect_state_reset_during_an_incremental_read_keeps_the_manifest_honest"
+
+  - id: a_completed_chunk_is_never_reclaimed
+    stated:
+      - file: docs/semantics.md
+        sentence: "A `completed` chunk is never re-claimed, even after a crash"
+    held_by:
+      sqlite_state: { test: i5_completed_chunk_task_is_not_reclaimed, asserts: "completed chunk 0 must not be re-claimed" }
+      postgres_state: { gap: "the claim-after-complete invariant test opens the SQLite store only" }
+    contradicted_by:
+      known_red:
+        - "live_sabotage::open_defect_a_resume_over_a_task_marked_completed_delivers_or_refuses"
+        - "live_sabotage::open_defect_a_resume_over_edited_task_bounds_delivers_or_refuses"
+        - "live_sabotage::open_defect_a_resume_over_deleted_tasks_delivers_or_refuses"
+        - "live_sabotage::open_defect_a_resume_over_a_truncated_committed_part_delivers_or_refuses"
+        - "live_sabotage::open_defect_a_resume_over_a_replaced_committed_part_delivers_or_refuses"
+
+  - id: resume_without_a_checkpoint_exits_non_zero
+    stated:
+      - file: docs/reference/cli.md
+        sentence: "Resume an in-progress chunked export. Exits non-zero with an actionable message if no in-progress checkpoint exists"
+    held_by:
+      all: { gap: "the cells that pass --resume to an export with no checkpoint assert the warning text (`resume-no-checkpoint`); none asserts the exit status" }
+  - id: force_overrides_the_success_gate_on_resume
+    stated:
+      - file: docs/reference/cli.md
+        sentence: "with `--resume`, allows starting against a destination prefix whose `_SUCCESS` marker is already present (ADR-0012 M8). Without it, resume against a complete run refuses"
+    held_by:
+      all: { test: rivet_run_resume_refuses_when_success_marker_present_without_force, asserts: "exit code must be non-zero when _SUCCESS gate refuses" }
+    contradicted_by:
+      known_red:
+        - "live_operator_contract::open_defect_resume_force_runs_over_a_complete_prefix"
+
+  - id: a_rerun_never_overwrites_the_previous_parts
+    stated:
+      - file: README.md
+        sentence: "Parts are named per run, so a re-run never overwrites the previous one."
+    held_by:
+      postgres: { test: roast_rapid_incremental_runs_into_same_prefix_must_not_clobber_prior_parts, asserts: "every incremental delta must survive; a clobbered part is silent data loss" }
+      mysql: { test: mysql_roast_rapid_incremental_runs_into_same_prefix_must_not_clobber_prior_parts, asserts: "every incremental delta must survive; a clobbered part is silent data loss" }
+      mssql: { test: mssql_roast_rapid_incremental_runs_into_same_prefix_must_not_clobber_prior_parts, asserts: "every incremental delta must survive; a clobbered part is silent data loss" }
+      mongo: { test: mongo_batch_two_rapid_runs_into_same_prefix_do_not_clobber, asserts: "two rapid full runs must each materialise all 100 rows — no clobber" }
+      oracle: { gap: "no Oracle batch cell runs twice into one prefix and reads the rows of both runs" }
+
+  - id: settle_holds_a_row_until_it_is_old_enough
+    stated:
+      - file: docs/modes/incremental.md
+        sentence: "`settle` holds each row back until it is older than `after` by the source clock:"
+    held_by:
+      postgres: { test: settle_on_another_column_never_skips_an_out_of_order_row_postgres, asserts: "a settled row above a still-settling id must wait for it" }
+      mysql: { test: settle_on_another_column_never_skips_an_out_of_order_row_mysql, asserts: "a settled row above a still-settling id must wait for it" }
+      mssql: { test: settle_on_another_column_never_skips_an_out_of_order_row_mssql, asserts: "a settled row above a still-settling id must wait for it" }
+      oracle: { test: settle_on_another_column_never_skips_an_out_of_order_row_oracle, asserts: "a settled row above a still-settling id must wait for it" }
+
+  - id: a_protective_refusal_keeps_refusing
+    stated:
+      - file: docs/reference/cli.md
+        sentence: "Protective refusal — rivet stopped on purpose so as not to lose, duplicate or overwrite data (a foreign checkpoint, a newer state DB, a cursor-owner mismatch, ...). Retrying unchanged refuses again; a human decides"
+    held_by:
+      postgres: { test: a_changed_cursor_column_is_refused_and_walked_out_postgres, asserts: 'Then::Refuses(Refused::by_code("RIVET_STATE_CURSOR_OWNER_MISMATCH", 5))' }
+      mysql: { test: a_changed_cursor_column_is_refused_and_walked_out_mysql, asserts: 'Then::Refuses(Refused::by_code("RIVET_STATE_CURSOR_OWNER_MISMATCH", 5))' }
+      mssql: { test: a_changed_cursor_column_is_refused_and_walked_out_mssql, asserts: 'Then::Refuses(Refused::by_code("RIVET_STATE_CURSOR_OWNER_MISMATCH", 5))' }
+      oracle: { test: a_changed_cursor_column_is_refused_and_walked_out_oracle, asserts: 'Then::Refuses(Refused::by_code("RIVET_STATE_CURSOR_OWNER_MISMATCH", 5))' }
+      mongo: { test: a_newer_state_schema_is_refused_and_walked_out_mongo, asserts: "refuses_twice_and_walks_out(" }
+    contradicted_by:
+      known_red:
+        - "live_sabotage::open_defect_a_cursor_of_another_type_delivers_or_is_refused_by_code_and_led_out"
+        - "live_sabotage::open_defect_an_edited_plan_fingerprint_delivers_or_is_refused_by_code_and_led_out"
+        - "audit_state::open_defect_state_reset_keeps_the_cursor_of_another_source"
+
+  - id: parallel_keyset_reads_every_row_exactly_once
+    stated:
+      - file: docs/modes/chunked.md
+        sentence: "**every row is read exactly once** (structural parity, proven on all engines)"
+    held_by:
+      postgres: { test: parallel_keyset_parity_postgres, asserts: "the union of all workers' keys must equal 1..=n" }
+      mysql: { test: parallel_keyset_parity_mysql, asserts: "the union of all workers' keys must equal 1..=n" }
+      mssql: { test: parallel_keyset_parity_mssql, asserts: "the union of all workers' keys must equal 1..=n" }
+      oracle: { test: parallel_keyset_reads_every_row_once, asserts: "{ctx}: no row read twice" }
+    contradicted_by:
+      known_red:
+        - "live_mode_transition::open_defect_resumed_parallel_keyset_then_incremental"
+
+  - id: repair_writes_beside_the_originals
+    stated:
+      - file: docs/semantics.md
+        sentence: "**Repair writes new files alongside originals** (RR5). Rivet does **not** delete or overwrite prior destination files."
+    held_by:
+      postgres: { test: repair_execute_reexports_mismatch_and_preserves_original_file, asserts: "RR5: repair must NOT overwrite the original chunk0 file" }
+      mysql: { gap: "the repair cells on this engine cover the nothing-to-repair exit only" }
+      mssql: { gap: "the repair cells on this engine cover the nothing-to-repair exit only" }
+    contradicted_by:
+      known_red:
+        - "live_reconcile_repair::open_defect_repair_after_a_chunk_column_edit_lists_each_row_once"
+
+  - id: reconcile_exits_non_zero_on_a_mismatch
+    stated:
+      - file: docs/semantics.md
+        sentence: "`rivet reconcile` exits **non-zero** when any partition is a `mismatch`"
+    held_by:
+      postgres: { test: reconcile_exits_nonzero_on_mismatch, asserts: "reconcile must exit non-zero on a detected mismatch" }
+      mysql: { gap: "the reconcile cells on this engine cover the all-match exit only" }
+      mssql: { gap: "the reconcile cells on this engine cover the all-match exit only" }
+
+  - id: auto_shrink_keeps_every_row
+    stated:
+      - file: docs/reference/tuning.md
+        sentence: "Transparent to the rest of the pipeline — total row count and output are identical."
+    held_by:
+      all: { test: auto_shrink_parquet_output_is_complete_and_readable, asserts: "auto_shrink must deliver every source row" }
+
+  - id: quality_gate_fails_the_run
+    stated:
+      - file: docs/semantics.md
+        sentence: "A failing gate aborts the run with a non-zero exit code"
+    held_by:
+      single: { test: quality_gate_fails_a_duplicate_on_the_single_runner, asserts: "{runner}: a quality violation must exit 3 (data integrity)" }
+      keyset: { test: quality_gate_fails_a_duplicate_split_across_keyset_pages, asserts: "{runner}: a quality violation must exit 3 (data integrity)" }
+      parallel_keyset: { test: quality_gate_fails_a_duplicate_split_across_parallel_keyset_ranges, asserts: "{runner}: a quality violation must exit 3 (data integrity)" }
+      chunked: { test: quality_gate_fails_a_duplicate_split_across_chunks, asserts: "{runner}: a quality violation must exit 3 (data integrity)" }
+      parallel_chunked: { test: quality_gate_fails_a_duplicate_split_across_parallel_chunks, asserts: "{runner}: a quality violation must exit 3 (data integrity)" }
+
+  - id: schema_drift_surfaces_as_an_error
+    stated:
+      - file: docs/semantics.md
+        sentence: "If the source schema changes between runs, Rivet does not migrate the destination; it surfaces a schema-drift error"
+    held_by:
+      postgres: { test: chunked_range_export_enforces_on_schema_drift_fail, asserts: "a chunked (range) export with `on_schema_drift: fail` must FAIL on a dropped column" }
+      mysql: { gap: "the MySQL drift cells run under the default `warn` policy and assert that the run survives" }
+      mssql: { gap: "no cell runs `on_schema_drift: fail` on this engine" }
+      oracle: { gap: "no cell runs `on_schema_drift: fail` on this engine" }
+      mongo: { gap: "no cell runs `on_schema_drift: fail` on this engine" }
+
+  # ── Destination contract (docs/cloud-destinations.md, docs/reference/cli.md) ─────────────
+  - id: the_success_marker_implies_every_listed_part
+    stated:
+      - file: docs/cloud-destinations.md
+        sentence: "Single line `xxh3:<16-hex>` over the exact bytes of `manifest.json`. Presence implies M5 (every listed part exists at recorded size)."
+      - file: README.md
+        sentence: "Every part is in a manifest with its row count and MD5."
+    held_by:
+      postgres: { test: validate_sees_a_truncated_part_postgres, asserts: "rig.validate_fails(finding);" }
+      mysql: { test: validate_sees_a_truncated_part_mysql, asserts: "rig.validate_fails(finding);" }
+      mssql: { test: validate_sees_a_truncated_part_mssql, asserts: "rig.validate_fails(finding);" }
+      mongo: { test: validate_sees_a_truncated_part_mongo, asserts: "rig.validate_fails(finding);" }
+      oracle: { test: validate_sees_a_truncated_part_oracle, asserts: "rig.validate_fails(finding);" }
+    contradicted_by:
+      matrix_gap:
+        - "docs/attestation-matrix.yaml#a local destination reports no md5, and those parts are size-only"
+
+  - id: validate_fails_on_a_wrong_destination
+    stated:
+      - file: docs/reference/cli.md
+        sentence: "Exits non-zero when the manifest references a part that is missing or whose size does not match"
+    held_by:
+      postgres: { test: validate_sees_a_truncated_part_postgres, asserts: "rig.validate_fails(finding);" }
+      mysql: { test: validate_sees_a_truncated_part_mysql, asserts: "rig.validate_fails(finding);" }
+      mssql: { test: validate_sees_a_truncated_part_mssql, asserts: "rig.validate_fails(finding);" }
+      mongo: { test: validate_sees_a_truncated_part_mongo, asserts: "rig.validate_fails(finding);" }
+      oracle: { test: validate_sees_a_truncated_part_oracle, asserts: "rig.validate_fails(finding);" }
+    contradicted_by:
+      known_red:
+        - "live_sabotage::open_defect_validate_fails_on_a_marker_without_a_manifest"
+
+  - id: validate_never_queries_the_source
+    stated:
+      - file: docs/cloud-destinations.md
+        sentence: "**never queries the source**: only `HEAD` / `GET _SUCCESS` / `GET manifest.json` against the resolved destination."
+    held_by:
+      postgres: { gap: "no cell runs validate against an unreachable source or counts source connections" }
+      mysql: { gap: "no cell runs validate against an unreachable source or counts source connections" }
+      mssql: { gap: "no cell runs validate against an unreachable source or counts source connections" }
+      mongo: { gap: "no cell runs validate against an unreachable source or counts source connections" }
+      oracle: { gap: "no cell runs validate against an unreachable source or counts source connections" }
+
+  - id: run_validate_fails_the_run_as_validate_would
+    stated:
+      - file: docs/reference/cli.md
+        sentence: "A failed verification fails the run's exit as `rivet validate` would on that prefix"
+    held_by:
+      postgres: { test: run_validate_fails_the_run_over_a_failed_validation_postgres, asserts: "gives the same prefix the same exit class" }
+      mysql: { test: run_validate_fails_the_run_over_a_failed_validation_mysql, asserts: "gives the same prefix the same exit class" }
+      mssql: { test: run_validate_fails_the_run_over_a_failed_validation_mssql, asserts: "gives the same prefix the same exit class" }
+      oracle: { test: run_validate_fails_the_run_over_a_failed_validation_oracle, asserts: "gives the same prefix the same exit class" }
+      mongo: { test: run_validate_fails_the_run_over_a_failed_validation_mongo, asserts: "gives the same prefix the same exit class" }
+
+  - id: a_sensor_never_sees_a_half_built_manifest
+    stated:
+      - file: docs/cloud-destinations.md
+        sentence: "`manifest.json` is written before `_SUCCESS`, so an Airflow / CI sensor that polls for `_SUCCESS` never sees a half-built manifest."
+    held_by:
+      all: { gap: "no cell observes the destination between the manifest write and the marker write" }
+
+  - id: resume_quarantines_and_never_deletes
+    stated:
+      - file: docs/cloud-destinations.md
+        sentence: "**M9**: untracked or corrupt parts encountered on resume are moved under `_quarantine/<run_id>/` rather than deleted."
+    held_by:
+      all: { gap: "the resume-plan tests assert the decision (`Quarantine`); no cell asserts the object was moved under _quarantine/ and not deleted" }
+
+  - id: a_missing_bucket_is_not_a_legacy_prefix
+    stated:
+      - file: docs/cloud-destinations.md
+        sentence: "A bucket or container that does not exist is not a legacy prefix: `rivet validate` exits 1 with `RIVET_VERIFY_MANIFEST_READ_ERROR` naming it."
+    held_by:
+      s3: { test: validate_fails_on_a_missing_bucket_s3, asserts: "the verdict names the missing bucket under its verify code" }
+      gcs: { test: validate_fails_on_a_missing_bucket_gcs, asserts: "the verdict names the missing bucket under its verify code" }
+      azure: { test: validate_fails_on_a_missing_bucket_azure, asserts: "the verdict names the missing bucket under its verify code" }
+
+  # ── Plan, errors, secrets, state (docs/reference/cli.md, errors.md, SECURITY.md) ─────────
+  - id: plan_writes_nothing_for_an_unreadable_source
+    stated:
+      - file: docs/reference/cli.md
+        sentence: "`rivet plan` writes a plan only for a source it could read."
+    held_by:
+      postgres: { test: plan_refuses_a_table_that_does_not_exist_postgres, asserts: "`plan` over a table that does not exist exited {} and {} the artifact" }
+      mysql: { test: plan_refuses_a_table_that_does_not_exist_mysql, asserts: "`plan` over a table that does not exist exited {} and {} the artifact" }
+      mssql: { test: plan_refuses_a_table_that_does_not_exist_mssql, asserts: "`plan` over a table that does not exist exited {} and {} the artifact" }
+      oracle: { test: plan_refuses_a_table_that_does_not_exist_oracle, asserts: "`plan` over a table that does not exist exited {} and {} the artifact" }
+      mongo: { test: plan_refuses_a_collection_that_does_not_exist_mongo, asserts: "`plan` over a table that does not exist exited {} and {} the artifact" }
+
+  - id: every_named_failure_has_a_stable_code_and_its_kind_decides_the_exit
+    stated:
+      - file: docs/reference/errors.md
+        sentence: "Every failure rivet names carries a stable `RIVET_<FAMILY>_<NAME>` code: in `--json-errors` output as `code`, and as a `[CODE]` prefix on the text error line. The KIND decides the exit code."
+    held_by:
+      all: { test: a_code_s_kind_decides_its_exit_class, asserts: "assert_eq!(with(ErrorKind::Refusal), 5);" }
+    contradicted_by:
+      known_red:
+        - "live_operator_contract::open_defect_a_corrupt_cdc_checkpoint_is_refused_by_code"
+        - "live_operator_contract::open_defect_a_cdc_truncate_is_refused_by_code"
+        - "live_operator_contract::open_defect_a_dropped_slot_is_refused_by_code"
+        - "live_operator_contract::open_defect_binlogs_purged_past_the_checkpoint_after_a_changes_run_are_refused_by_code"
+        - "live_operator_contract::open_defect_an_oplog_rolled_past_the_checkpoint_after_a_changes_run_is_refused_by_code"
+        - "live_operator_contract::open_defect_a_cdc_collection_drop_is_refused_by_code"
+
+  - id: logs_and_errors_redact_url_passwords
+    stated:
+      - file: SECURITY.md
+        sentence: "**Redaction covers credentials only.** Rivet redacts connection-URL passwords"
+    held_by:
+      all: { test: log_sink_formatter_redacts_embedded_url_password, asserts: "log sink leaked credential: {line}" }
+
+  - id: plan_artifacts_carry_no_plaintext_credentials
+    stated:
+      - file: SECURITY.md
+        sentence: "strips plaintext `password` and `user:password@` userinfo from a `SourceConfig` *before* it lands in a `PlanArtifact` (`plan.json`)"
+    held_by:
+      all: { test: plan_json_redacts_plaintext_url_credentials, asserts: "plan JSON must not contain plaintext credentials 'rivet:rivet'" }
+
+  - id: the_state_url_is_not_embedded_in_plan_artifacts
+    stated:
+      - file: docs/reference/cli.md
+        sentence: "The `RIVET_STATE_URL` value is **not** embedded in plan artifacts or config files. It is resolved from the environment at runtime."
+    held_by:
+      all: { gap: "no cell seals a plan under a RIVET_STATE_URL and reads the artifact for it" }
+
+  - id: an_unusable_state_url_is_refused_never_replaced_by_sqlite
+    stated:
+      - file: docs/reference/cli.md
+        sentence: "it is never replaced by the SQLite file"
+    held_by:
+      postgres: { test: an_unusable_state_url_is_refused_and_each_remedy_runs_postgres, asserts: 'Refused::by_code("RIVET_STATE_URL_SCHEME_UNSUPPORTED", 1)' }
+      mysql: { test: an_unusable_state_url_is_refused_and_each_remedy_runs_mysql, asserts: 'Refused::by_code("RIVET_STATE_URL_SCHEME_UNSUPPORTED", 1)' }
+      mssql: { test: an_unusable_state_url_is_refused_and_each_remedy_runs_mssql, asserts: 'Refused::by_code("RIVET_STATE_URL_SCHEME_UNSUPPORTED", 1)' }
+      oracle: { test: an_unusable_state_url_is_refused_and_each_remedy_runs_oracle, asserts: 'Refused::by_code("RIVET_STATE_URL_SCHEME_UNSUPPORTED", 1)' }
+      mongo: { test: an_unusable_state_url_is_refused_and_each_remedy_runs_mongo, asserts: 'Refused::by_code("RIVET_STATE_URL_SCHEME_UNSUPPORTED", 1)' }
+
+  # ── Source safety and memory (README.md, docs/why/, docs/concepts.md) ────────────────────
+  - id: postgres_session_state_never_leaks_into_a_pool
+    stated:
+      - file: docs/concepts.md
+        sentence: "All Postgres tuning uses `SET LOCAL` inside an RAII-guarded `BEGIN…COMMIT` so session state is never leaked into the pool."
+    held_by:
+      postgres: { test: pg_statement_timeout_not_leaked_after_successful_export, asserts: "statement_timeout leaked to pool after successful export" }
+
+  - id: flat_memory_at_any_table_size
+    stated:
+      - file: docs/why/flat-memory.md
+        sentence: "A 10-thousand-row table and a 500-million-row table run at the same resident set size."
+    held_by:
+      postgres: { gate: verify_scale_memory, asserts: "RSS(large) <= RSS(small) × RIVET_SCALE_RSS_TOL" }
+      mysql: { gate: verify_scale_memory, asserts: "RSS(large) <= RSS(small) × RIVET_SCALE_RSS_TOL" }
+      mssql: { gate: verify_scale_memory, asserts: "RSS(large) <= RSS(small) × RIVET_SCALE_RSS_TOL" }
+      mongo: { gate: verify_scale_memory, asserts: "RSS(large) <= RSS(small) × RIVET_SCALE_RSS_TOL" }
+      oracle: { gap: "the scale_memory stage iterates postgres, mysql, mssql, mongo; Oracle is not measured" }
+    contradicted_by:
+      matrix_gap:
+        - "docs/perf-matrix.yaml#These are NOT a hard CI gate (perf numbers are hardware-noisy)"
+
+  - id: the_longest_source_query_is_one_page
+    stated:
+      - file: docs/why/source-safe-under-load.md
+        sentence: "The longest query Rivet ever holds open on the source is a single page, not a full-table scan."
+    held_by:
+      postgres: { gap: "no cell measures the longest statement a run held on the server" }
+      mysql: { gap: "no cell measures the longest statement a run held on the server" }
+      mssql: { gap: "no cell measures the longest statement a run held on the server" }
+      mongo: { gap: "no cell measures the longest statement a run held on the server" }
+      oracle: { gap: "no cell measures the longest statement a run held on the server" }
+    contradicted_by:
+      doc:
+        - "docs/partitioning.md#server-side cursor, bounded memory, but a single long-running transaction"
+
+  - id: a_sparse_chunk_key_is_named_at_run_start
+    stated:
+      - file: README.md
+        sentence: "warns at run start when a sparse key would split one export into thousands of near-empty queries"
+    held_by:
+      all: { test: no_estimate_egregious_count_warns_never_bails, asserts: "unprovable suspicion must warn, not bail" }
+
+  - id: cdc_memory_is_bounded_by_rollover
+    stated:
+      - file: docs/why/flat-memory.md
+        sentence: "A CDC drain's peak RSS is O(`rollover`) — the part-size at which it flushes and checkpoints — not O(backlog)."
+    held_by:
+      postgres: { gap: "the soak harness that measures it (tests/harness run_soak) runs on demand against GCS and BigQuery; no gate stage or CI cell asserts drain RSS against the backlog" }
+      mysql: { gap: "the soak harness that measures it (tests/harness run_soak) runs on demand against GCS and BigQuery; no gate stage or CI cell asserts drain RSS against the backlog" }
+      mssql: { gap: "the soak harness that measures it (tests/harness run_soak) runs on demand against GCS and BigQuery; no gate stage or CI cell asserts drain RSS against the backlog" }
+      mongo: { gap: "the soak harness that measures it (tests/harness run_soak) runs on demand against GCS and BigQuery; no gate stage or CI cell asserts drain RSS against the backlog" }
+      oracle: { gap: "the soak harness that measures it (tests/harness run_soak) runs on demand against GCS and BigQuery; no gate stage or CI cell asserts drain RSS against the backlog" }
+
+  # ── CDC (README.md, docs/reference/cdc.md) ───────────────────────────────────────────────
+  - id: cdc_never_silently_loses_a_change
+    stated:
+      - file: docs/reference/cdc.md
+        sentence: "the checkpoint/slot is **not advanced**, and the **next run re-reads** from the last good position. Rivet never silently loses a change"
+    held_by:
+      postgres: { test: pg_cdc_crash_after_flush_before_ack_does_not_advance_the_slot, asserts: "the re-read parquet must hold exactly the un-acked changes" }
+      mysql: { test: cdc_crash_after_flush_before_ack_re_reads_on_resume, asserts: "the re-read parquet must hold exactly the un-acked changes" }
+      mssql: { test: mssql_cdc_crash_before_checkpoint_re_reads_on_resume, asserts: "crash before the checkpoint → resume re-reads exactly the 2 un-checkpointed changes" }
+      mongo: { test: mongo_cdc_crash_after_flush_before_ack_re_reads_on_resume, asserts: "id {i} lost across the crash" }
+      oracle: { test: oracle_cdc_crash_after_flush_before_ack, asserts: "a crash before the checkpoint re-reads the un-acked change, and only it" }
+    contradicted_by:
+      known_red:
+        - "live_cdc_cli_surface::open_defect_pg_cdc_cli_rollover_1_delivers_the_pending_changes"
+        - "live_operator_contract::open_defect_cdc_to_stdout_emits_each_change_once"
+
+  - id: a_large_transaction_survives_a_mid_flush_crash_whole
+    stated:
+      - file: README.md
+        sentence: "Checkpoints sit on transaction boundaries, a large transaction survives a mid-flush crash whole"
+    held_by:
+      postgres: { test: roast_pg_cdc_large_transaction_is_atomic_across_a_mid_flush_crash, asserts: "the 12-row transaction must survive the mid-flush crash whole" }
+      mysql: { test: roast_mysql_cdc_large_transaction_is_atomic_across_a_mid_flush_crash, asserts: "the 12-row transaction must survive the mid-flush crash whole" }
+      mssql: { test: roast_mssql_cdc_large_transaction_is_atomic_across_a_mid_flush_crash, asserts: "the 12-row transaction must survive the mid-flush crash whole" }
+      oracle: { test: roast_oracle_cdc_large_transaction_is_atomic_across_a_mid_flush_crash, asserts: "no row of the transaction is lost" }
+      mongo: { gap: "no Mongo cell crashes a multi-document transaction mid-flush and reads it back whole" }
+
+  - id: the_postgres_slot_advances_only_after_the_parts_are_durable
+    stated:
+      - file: README.md
+        sentence: "PostgreSQL's slot advances only after the parts are durable"
+    held_by:
+      postgres: { test: pg_cdc_crash_after_flush_before_ack_does_not_advance_the_slot, asserts: "the re-read parquet must hold exactly the un-acked changes" }
+
+  - id: a_lost_log_position_is_a_loud_stop
+    stated:
+      - file: docs/reference/cdc.md
+        sentence: "**A vanished slot is a loud error, not a silent restart.**"
+      - file: docs/reference/cdc.md
+        sentence: "rivet **fails loudly** (exit 5, `RIVET_SOURCE_CDC_LOG_GAP`), from the first run after the baseline"
+    held_by:
+      postgres: { test: pg_cdc_vanished_slot_with_checkpoint_fails_loudly_not_recreates, asserts: "a vanished slot with an existing checkpoint must fail the run, not silently re-create" }
+      mssql: { test: mssql_add_column_remedy_before_the_first_changes_run_ends_in_the_log_gap_refusal, asserts: "RIVET_SOURCE_CDC_LOG_GAP" }
+    contradicted_by:
+      known_red:
+        - "live_operator_contract::open_defect_a_dropped_slot_after_a_changes_run_is_refused_by_code"
+        - "live_operator_contract::open_defect_binlogs_purged_past_the_checkpoint_before_the_first_changes_run_are_refused_by_code"
+        - "live_operator_contract::open_defect_an_oplog_rolled_past_the_checkpoint_before_the_first_changes_run_is_refused_by_code"
+
+  - id: a_corrupt_checkpoint_fails_loud
+    stated:
+      - file: docs/reference/cdc-failure-modes.md
+        sentence: "**Fails loud** on garbage / truncated / empty checkpoints (invalid JSON — a serde error surfaces; never a silent re-anchor)."
+    held_by:
+      postgres: { test: pg_cdc_corrupt_checkpoint_fails_loud_not_silently_absent, asserts: "a corrupt checkpoint must fail the run, not be read as absent and re-anchor" }
+      mysql: { test: cdc_corrupt_checkpoint_fails_loud_not_silently_absent, asserts: "a corrupt checkpoint must fail the run, not silently re-anchor and skip changes" }
+      mssql: { test: mssql_cdc_corrupt_checkpoint_fails_loud_not_silently_absent, asserts: "a corrupt checkpoint must fail the run, not be read as absent" }
+      mongo: { gap: "no Mongo cell corrupts the stored resume token and runs" }
+      oracle: { test: oracle_cdc_corrupt_checkpoint_fails_loud_not_silently_absent, asserts: "corrupt or truncated" }
+    contradicted_by:
+      known_red:
+        - "live_operator_contract::open_defect_deleting_a_corrupt_cdc_checkpoint_accepts_a_new_anchor"
+
+  - id: cdc_carries_deletes_and_key_changes
+    stated:
+      - file: docs/cdc-bigquery-load.md
+        sentence: "the stream writes an UPDATE that changes the key as a delete of the old key and an insert of the new row"
+    held_by:
+      oracle: { test: oracle_cdc_a_primary_key_update_is_a_delete_then_an_insert, asserts: "3 -> 9 is the old row's delete then the new row's insert at one position" }
+      postgres: { test: pg_cdc_pk_changing_update_captures_and_does_not_brick, asserts: "one position, the insert after the delete" }
+      mysql: { gate: verify_cdc_differential, asserts: '_DIFFERENTIAL_SCENARIOS = ("crud", "wide-txn", "mid-stream-table", "key-update")' }
+      mssql: { gate: verify_cdc_differential, asserts: '_DIFFERENTIAL_SCENARIOS = ("crud", "wide-txn", "mid-stream-table", "key-update")' }
+
+  - id: a_bounded_drain_stops_at_the_log_end_as_of_open
+    stated:
+      - file: docs/reference/cdc.md
+        sentence: "By default `rivet cdc` catches up to the source's log end **as of the moment the run opened**, then **exits** instead of streaming"
+    held_by:
+      postgres: { test: roast_pg_until_current_open_bound_two_runs_lose_nothing, asserts: "run 1 must terminate at the open-time WAL bound under sustained writes" }
+      mysql: { test: roast_mysql_until_current_open_bound_two_runs_lose_nothing, asserts: "run 1 must terminate under sustained writes" }
+      mssql: { test: roast_mssql_until_current_open_bound_two_runs_lose_nothing, asserts: "run 1 must terminate at the open-time max-LSN bound under sustained writes" }
+      mongo: { test: roast_mongo_cdc_until_current_open_bound_two_runs_lose_nothing, asserts: "run 1 must terminate at the open-time cluster-time bound under sustained writes" }
+      oracle: { test: roast_oracle_cdc_until_current_open_bound_two_runs_lose_nothing, asserts: "run 1 must end at the SCN current at open while the writer keeps committing" }
+
+  - id: cdc_and_batch_deliver_every_shared_type_alike
+    stated:
+      - file: docs/reference/cdc.md
+        sentence: "is byte-identical to the batch export."
+    held_by:
+      postgres: { test: postgres_batch_and_cdc_deliver_every_ledger_row_alike, asserts: "{} ledger violations:" }
+      mysql: { test: mysql_batch_and_cdc_deliver_every_ledger_row_alike, asserts: "{} ledger violations:" }
+      mssql: { test: mssql_batch_and_cdc_deliver_every_ledger_row_alike, asserts: "{} ledger violations:" }
+      oracle: { test: oracle_batch_and_cdc_deliver_every_ledger_row_alike, asserts: "{} ledger violations:" }
+
+  - id: the_value_checksum_runs_on_cdc
+    stated:
+      - file: docs/reference/cdc.md
+        sentence: "a mismatch fails the run naming the column, never writes the corrupted part."
+    held_by:
+      all: { gap: "the checksum-mismatch cells corrupt a batch part after the run; no cell makes the two folds of a CDC run disagree" }
+
+  - id: a_failed_cdc_run_leaves_parts_but_no_manifest_or_marker
+    stated:
+      - file: docs/reference/cdc.md
+        sentence: "A failed run leaves its durable parts in the destination but **no `manifest.json` / `_SUCCESS`**"
+    held_by:
+      postgres: { gap: "no live cell fails a CDC run after it wrote a part and reads the destination" }
+      mysql: { gap: "no live cell fails a CDC run after it wrote a part and reads the destination" }
+      mssql: { gap: "no live cell fails a CDC run after it wrote a part and reads the destination" }
+      mongo: { gap: "no live cell fails a CDC run after it wrote a part and reads the destination" }
+      oracle: { gap: "no live cell fails a CDC run after it wrote a part and reads the destination" }
+
+  - id: each_release_is_diffed_against_debezium
+    stated:
+      - file: README.md
+        sentence: "Each release is diffed against Debezium on the same change window."
+    held_by:
+      all: { gate: verify_cdc_differential, asserts: 'engines = ("postgres", "mysql", "mssql", "mongo")' }
+
+  - id: a_redelivered_cdc_event_is_byte_identical
+    stated:
+      - file: docs/reference/cdc.md
+        sentence: "re-delivered event is **byte-identical** — same `__op`, `__pos`, and image —"
+    held_by:
+      postgres: { gap: "no cell compares the event a crashed run delivered with its re-delivery, column by column" }
+      mysql: { gap: "no cell compares the event a crashed run delivered with its re-delivery, column by column" }
+      mssql: { gap: "no cell compares the event a crashed run delivered with its re-delivery, column by column" }
+
+  - id: a_checkpoint_from_another_server_is_refused
+    stated:
+      - file: docs/reference/cdc.md
+        sentence: "rivet refuses one written by a different server (it records `server_uuid`)."
+      - file: docs/reference/cdc.md
+        sentence: "rivet refuses to resume against a database whose `family_guid` differs"
+    held_by:
+      mysql: { test: a_mysql_checkpoint_from_another_server_is_refused, asserts: "the refusal must name BOTH servers" }
+      mssql: { test: mssql_checkpoint_from_another_database_is_refused, asserts: "mssql cdc: this checkpoint was written against a different database" }
+      oracle: { test: oracle_cdc_checkpoint_from_another_database_is_refused, asserts: "written against another database" }
+
+  - id: failover_follows_the_shared_log_and_refuses_elsewhere
+    stated:
+      - file: docs/reference/cdc.md
+        sentence: "**SQL Server — the checkpoint follows a failover, and nothing else.**"
+      - file: docs/reference/cdc.md
+        sentence: "With `cdc.checkpoint:` set, rivet refuses to continue there"
+    held_by:
+      mssql: { test: mssql_checkpoint_follows_a_failover_to_the_secondary, asserts: "a replica shares the primary's log, so its checkpoint must resume there" }
+      postgres: { test: a_pg_failover_to_the_standby_with_a_checkpoint_is_refused_not_resumed_on_a_new_slot, asserts: "is missing but the checkpoint file holds a position" }
+      mysql: { test: a_failover_to_another_cluster_member_is_refused_not_resumed_at_foreign_coordinates, asserts: "RIVET_SOURCE_CDC_FOREIGN_CHECKPOINT" }
+      mongo: { test: mongo_cdc_follows_a_failover_to_another_replica_set_member, asserts: "across the failover every change is captured exactly once, none skipped" }
+
+  - id: mysql_minimal_row_metadata_is_refused
+    stated:
+      - file: docs/reference/cdc.md
+        sentence: "rivet never maps a binlog image by position: a server at `MINIMAL` is refused at open, and an event written under `MINIMAL` is refused when it is read."
+    held_by:
+      mysql_at_open: { test: mysql_cdc_refuses_minimal_row_metadata_at_open, asserts: "MINIMAL must fail the run" }
+      mysql_backlog: { test: mysql_cdc_refuses_a_minimal_backlog_after_the_server_is_switched_to_full, asserts: "the checkpoint must not advance past a refused event" }
+
+  # ── Load (docs/reference/errors.md, README.md) ───────────────────────────────────────────
+  - id: load_never_takes_a_table_it_did_not_load
+    stated:
+      - file: docs/reference/errors.md
+        sentence: "the warehouse object exists and this state DB has no record of rivet loading it: drop or rename it, or load into another table"
+    held_by:
+      bigquery: { test: bigquery_load_refuses_a_table_it_did_not_load_on_every_attempt, asserts: "no record of rivet loading it" }
+      snowflake: { gap: "no Snowflake cell loads over a table this state has no record of" }
+      clickhouse: { test: a_range_refusal_claims_nothing_so_a_table_made_after_it_stays_foreign, asserts: "no record of rivet loading it" }
+
+  - id: compact_merges_the_buffer_and_drops_it
+    stated:
+      - file: README.md
+        sentence: "`rivet compact` merges them in with one `MERGE` per table and drops the buffer"
+    held_by:
+      bigquery: { test: base_and_buffer_cycle_run_load_compact_keeps_deletes_as_flags, asserts: "the buffer is dropped after the merge" }
+
+  # ── Types (docs/type-mapping.md, docs/semantics.md) ──────────────────────────────────────
+  - id: decimals_never_become_floats
+    stated:
+      - file: docs/type-mapping.md
+        sentence: "**DECIMAL / NUMERIC** are never silently converted to float."
+    held_by:
+      contract: { test: contract_decimal_never_maps_to_float, asserts: "{} {} must not become float, got {dt:?}" }
+      postgres: { test: golden_decimal_payments_exact_sums_and_decimal128_types, asserts: "SUM(amount)×10² must equal source golden (decoding must stay exact)" }
+      mysql: { test: mysql_golden_decimal_payments_exact_sums_and_decimal128_types, asserts: "mysql amount column must not downgrade to {:?}" }
+      mssql: { gap: "no golden decimal cell reads the Arrow type and the exact sums on this engine" }
+      oracle: { gap: "no golden decimal cell reads the Arrow type and the exact sums on this engine" }
+
+  - id: a_lossy_or_unmapped_type_fails_loud
+    stated:
+      - file: docs/type-mapping.md
+        sentence: "**Rivet fails loud, not silent** — a lossy or unmapped type is named by `rivet check` and aborts the run, never quietly truncated."
+    held_by:
+      strict: { test: check_strict_and_run_strict_refuse_the_same_config_with_the_same_code, asserts: "run --strict wrote a part" }
+
+      default_policy: { gap: "the refusal cells run under --strict; no cell runs a lossy mapping under the default policy and asserts the run aborts" }
+    contradicted_by:
+      known_red:
+        - "sentinels[rivet_sent_ts9/full]: SUCCEEDED WITH A CHANGED VALUE"
+  - id: uuid_and_json_keep_native_types
+    stated:
+      - file: docs/type-mapping.md
+        sentence: "**UUID and JSON keep native types** — Parquet gets native `LogicalType::Uuid` / `LogicalType::Json`, not opaque strings."
+    held_by:
+      postgres: { test: parquet_schema_pins_postgres_matrix_logical_types, asserts: 'assert_col(&cols, "uid", FIXED_LEN_BYTE_ARRAY, Some(Uuid));' }
+      mysql: { test: parquet_schema_pins_mysql_matrix_logical_types, asserts: 'assert_col(&cols, "extras", BYTE_ARRAY, Some(Json));' }
+  - id: binary_stays_binary
+    stated:
+      - file: docs/type-mapping.md
+        sentence: "stays Arrow `Binary` in Parquet."
+    held_by:
+      postgres: { test: golden_bytea_exact_binary_roundtrip, asserts: "DataType::Binary" }
+
+  - id: identical_rows_produce_byte_identical_parts_across_releases
+    stated:
+      - file: docs/semantics.md
+        sentence: "identical rows produce byte-identical parts (and the same fingerprint) across rivet releases, so a duplicate is safely droppable by fingerprint."
+    held_by:
+      all: { gap: "no cell exports the same rows with the previous release and this build and compares the part bytes" }

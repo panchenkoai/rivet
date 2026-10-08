@@ -77,6 +77,10 @@ use serde::Deserialize;
 /// caught it (audit 2026-08-17).
 const EXEMPT: &[(&str, &str)] = &[
     (
+        "docs/guarantee-matrix.yaml",
+        "tests/offline/guarantee_matrix_guard.rs",
+    ),
+    (
         "docs/attestation-matrix.yaml",
         "tests/offline/attestation_matrix_guard.rs",
     ),
@@ -485,7 +489,7 @@ fn all_fn_names() -> HashSet<String> {
 /// helper — the ledger-grading sibling of "a coverage ledger must grade the CALL SITE,
 /// not the definition". This set is the call-site half: a cell may only name something
 /// the test runner will execute.
-fn all_test_fn_names() -> HashSet<String> {
+pub(super) fn all_test_fn_names() -> HashSet<String> {
     let mut names = HashSet::new();
     for dir in ["src", "tests"] {
         collect_test_fn_names(&repo_root().join(dir), &mut names);
@@ -1630,7 +1634,7 @@ fn items_in(text: &str) -> HashMap<String, String> {
 }
 
 /// The cited test's body plus every same-file `fn`/`const` it reaches by name, transitively.
-fn test_closure(name: &str) -> Option<String> {
+pub(super) fn test_closure(name: &str) -> Option<String> {
     let mut stack = vec![repo_root().join("src"), repo_root().join("tests")];
     while let Some(dir) = stack.pop() {
         for p in std::fs::read_dir(&dir)
