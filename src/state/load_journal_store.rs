@@ -160,6 +160,32 @@ impl StateStore {
             > 0)
     }
 
+    /// The baseline legs loaded into `target_table`, by this state's own run records: `(successful non-stream runs, the most rows one exported)`.
+    pub fn loaded_baseline_legs(&self, target_table: &str) -> Result<(i64, i64)> {
+        Ok(self
+            .query_opt(
+                "SELECT COUNT(DISTINCT m.run_id), COALESCE(MAX(m.total_rows), 0) \
+                 FROM loaded_source_run l JOIN export_metrics m ON m.run_id = l.source_run_id \
+                 WHERE l.target_table = ?1 AND m.status = 'success' AND m.mode <> 'cdc'",
+                &[target_table.into()],
+                |r| (r.i64(0), r.i64(1)),
+            )?
+            .unwrap_or((0, 0)))
+    }
+
+    /// Whether a `rivet compact` ever merged rows into `target_table`.
+    pub fn has_merged_rows(&self, target_table: &str) -> Result<bool> {
+        let sql = format!(
+            "SELECT COUNT(*) FROM load_run WHERE target_table = ?1 AND mode = 'compact' \
+             AND status = '{}' AND rows_loaded > 0",
+            LoadStatus::Success.as_str(),
+        );
+        Ok(self
+            .query_opt(&sql, &[target_table.into()], |r| r.i64(0))?
+            .unwrap_or(0)
+            > 0)
+    }
+
     pub fn loaded_source_run_ids(&self, target_table: &str) -> Result<HashSet<String>> {
         Ok(self
             .query(
@@ -245,6 +271,70 @@ mod tests {
             .unwrap();
         assert!(s.has_load_attempt("p.d.other").unwrap());
         assert!(!s.has_load_attempt("p.d.none").unwrap());
+    }
+
+    /// Only a successful compaction that merged rows counts; a load, a skip, a failure or another table does not.
+    #[test]
+    fn rows_were_merged_only_by_a_successful_compact_that_merged_some() {
+        let s = StateStore::open_in_memory().unwrap();
+        let compact = |id: &str, target: &str, rows, status: &str| {
+            let mut r = rec(id, target, &[], rows, status);
+            r.mode = "compact".into();
+            r
+        };
+        s.store_load(&rec("load", "p.d.t", &["r1"], 9, "success"))
+            .unwrap();
+        s.store_load(&compact("skip", "p.d.t", 0, "success"))
+            .unwrap();
+        s.store_load(&compact("fail", "p.d.t", 4, "failed"))
+            .unwrap();
+        s.store_load(&compact("other", "p.d.other", 4, "success"))
+            .unwrap();
+        assert!(!s.has_merged_rows("p.d.t").unwrap());
+        s.store_load(&compact("ok", "p.d.t", 1, "success")).unwrap();
+        assert!(s.has_merged_rows("p.d.t").unwrap());
+    }
+
+    /// A baseline leg is a loaded run this state recorded as a successful non-stream export.
+    #[test]
+    fn the_loaded_baseline_legs_are_the_successful_non_stream_runs_of_that_table() {
+        let s = StateStore::open_in_memory().unwrap();
+        let metric = |run: &str, mode: &str, status: &str, rows| {
+            s.record_metric_full(&crate::state::MetricRow {
+                export_name: "customers".into(),
+                run_id: run.into(),
+                total_rows: rows,
+                status: status.into(),
+                mode: Some(mode.into()),
+                ..Default::default()
+            })
+            .unwrap();
+        };
+        assert_eq!(s.loaded_baseline_legs("p.d.t").unwrap(), (0, 0));
+        metric("base", "keyset", "success", 0);
+        metric("stream", "cdc", "success", 9);
+        metric("crashed", "keyset", "failed", 4);
+        metric("elsewhere", "keyset", "success", 6);
+        assert_eq!(
+            s.loaded_baseline_legs("p.d.t").unwrap(),
+            (0, 0),
+            "a run nothing loaded into the table is not its leg"
+        );
+        s.store_load(&rec(
+            "L1",
+            "p.d.t",
+            &["base", "stream", "crashed"],
+            0,
+            "success",
+        ))
+        .unwrap();
+        s.store_load(&rec("L2", "p.d.other", &["elsewhere"], 6, "success"))
+            .unwrap();
+        assert_eq!(s.loaded_baseline_legs("p.d.t").unwrap(), (1, 0));
+        metric("rebase", "full", "success", 2);
+        s.store_load(&rec("L3", "p.d.t", &["rebase"], 2, "success"))
+            .unwrap();
+        assert_eq!(s.loaded_baseline_legs("p.d.t").unwrap(), (2, 2));
     }
 
     fn rec(load_id: &str, target: &str, runs: &[&str], rows: i64, status: &str) -> LoadRecord {

@@ -152,6 +152,12 @@ scenarios:
     incremental: { test: a_generated_config_drives_run_load_compact_into_the_warehouse_postgres }
     cdc:         { test: base_and_buffer_cycle_run_load_compact_keeps_deletes_as_flags }
 
+  - id: empty_whole_table_pass_reaches_the_warehouse
+    what: "a whole-table pass that holds no row is not `nothing to load`: it says the table is empty. A full load empties (or creates) the table; under `layout: base_buffer` a CDC baseline leg of a table empty at the source creates the base EMPTY (spec columns, `__is_deleted`, partition, clustering), so the first insert, update and delete are buffered and `rivet compact` merges them, exit 0 (field 2026-10-06: tables empty at baseline got no base and failed `rivet compact` on every cycle from their first change on). A state DB of rivet 0.31 or older (baseline journaled as loaded, no base, changes buffered) is healed by the first load: the base is built when the state's own run record shows exactly one baseline run with 0 rows and no compaction ever merged a row (lib: a_base_an_empty_baseline_never_built_is_built_by_the_next_load, a_missing_base_that_may_have_held_rows_is_never_built_empty; gate: upgrade[mysql/cdc-load/empty-baseline]). The same cycle in a mixed outcome (one base dropped by hand): compact exits 1, names the refused table, merges the other. Sibling cells: a_table_empty_at_baseline_takes_its_first_changes_postgres, a_table_empty_at_baseline_gets_an_empty_base_and_compact_says_the_no_op. Scope: `layout: base_buffer` only (BigQuery, the one warehouse that compacts); under the changelog + view layout an empty snapshot still creates no warehouse object until the first change."
+    full:        { test: an_empty_full_run_reaches_the_warehouse_write }
+    incremental: { na: "an incremental export has no baseline leg; its empty run stays a no-op (lib: a_whole_table_pass_is_a_full_load_or_a_base_and_buffer_baseline_leg)" }
+    cdc:         { test: a_table_empty_at_baseline_takes_its_first_changes_mysql }
+
   - id: compact_merges_the_buffer_and_drops_it
     what: "`rivet compact`: one MERGE per table (per ≤4,000-partition window) upserts the latest change per key into the base, flags a tombstone instead of deleting, un-flags a re-insert, then DROPs the buffer; both MERGE sides are bounded by the same constants so the base prunes; a crash between MERGE and DROP re-merges idempotently. Live: 8 rows / 7 live / 1 flagged with its last values, buffer gone, second compact a no-op, crash-and-retry merges once"
     full:        { na: "nothing to compact" }

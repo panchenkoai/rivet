@@ -364,7 +364,8 @@ def _lanes_self_test() -> None:
     assert ports == {"5432", "3306", "1433", "27017", "1521", "5434", "3307", "1434", "27018"} and None not in lanes, lanes
     fam = len(upgrade_matrix.rows()) * len(upgrade_matrix.TARGETS)
     assert lanes["127.0.0.1:1521"] == fam + 1 + 3, f"Oracle's matrix, resume-load and cdc-load cells are not one lane: {lanes}"
-    assert lanes["127.0.0.1:3307"] == 3 and lanes["127.0.0.1:5432"] == fam + 1, lanes
+    # MySQL's CDC server: UTC, the non-UTC zone, init=this and the empty-baseline cell.
+    assert lanes["127.0.0.1:3307"] == 4 and lanes["127.0.0.1:5432"] == fam + 1, lanes
 
     # grade_load hands its BigQuery target to the session; the environment every other lane reads stays as it was.
     import types

@@ -109,6 +109,15 @@ from its run's spec. Other partition keys (hour, month, year, integer ranges)
 keep a constant `MIN..MAX` range per window in separate jobs — the truncation
 forms did not prune when measured. An empty buffer is just dropped.
 
+**A table that is empty at the baseline.** Its baseline leg writes no Parquet, and
+the load still creates `<table>`: an empty base with the spec's columns,
+`__is_deleted`, and the configured partition and clustering. The first change is
+then buffered and merged like any other. A state DB written by rivet 0.31 or older
+holds such tables with no base at all; the first `rivet load` of a newer version
+creates it (it says so in a `note:`) when that state DB recorded the baseline run
+with 0 rows and no compaction ever merged a row into the table, and the next
+`rivet compact` merges everything buffered since.
+
 **A row that moves to another partition.** The merge reads only the partitions the
 buffer's rows name. On MySQL the stream sees each UPDATE before and after, and
 writes one that moves a row between two partitions as a delete of the old row and
