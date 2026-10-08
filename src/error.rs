@@ -451,6 +451,21 @@ pub mod codes {
         }
     }
 
+    /// `RIVET_STATE_URL` set to something that is not a PostgreSQL URL.
+    pub const STATE_URL_SCHEME_UNSUPPORTED: Code = usage(
+        "RIVET_STATE_URL_SCHEME_UNSUPPORTED",
+        "set `RIVET_STATE_URL` to a `postgres://` or `postgresql://` URL, or unset it to keep the state in the SQLite file beside the config",
+    );
+    /// The state store cannot be written: read-only when it is opened, or it did not take a run's first write.
+    pub const STATE_NOT_WRITABLE: Code = environment(
+        "RIVET_STATE_NOT_WRITABLE",
+        "make the state database writable (the SQLite file and its directory, a read-only filesystem, a read-only role) and run again; the export did not start",
+    );
+    /// A run delivered its rows and manifest, and its incremental cursor write failed.
+    pub const STATE_CURSOR_NOT_STORED: Code = environment(
+        "RIVET_STATE_CURSOR_NOT_STORED",
+        "repair the state database before the next run; the rows are delivered, and the next run delivers them again from the previous cursor",
+    );
     pub const STATE_SCHEMA_NEWER: Code = refusal(
         "RIVET_STATE_SCHEMA_NEWER",
         "upgrade rivet, or point this binary at a state DB it created",
@@ -564,6 +579,16 @@ pub mod codes {
         "RIVET_LOAD_TARGET_NOT_RIVETS",
         "the warehouse object exists and this state DB has no record of rivet loading it: drop or rename it, or load into another table",
     );
+    /// `run --validate` found the destination wrong after the export completed.
+    pub const VALIDATE_FAILED: Code = integrity(
+        "RIVET_VALIDATE_FAILED",
+        "run `rivet validate` on the prefix and settle each failed part before loading it; the export itself completed",
+    );
+    /// `run --validate` could not read the destination back.
+    pub const VALIDATE_UNVERIFIED: Code = environment(
+        "RIVET_VALIDATE_UNVERIFIED",
+        "restore read access to the destination and run `rivet validate`; the export itself completed",
+    );
     pub const INTERNAL_VALUE_CONVERTER: Code = internal(
         "RIVET_INTERNAL_VALUE_CONVERTER",
         "a value changed between the source and the written part — a bug; report it with the column's type",
@@ -606,6 +631,9 @@ pub mod codes {
         SOURCE_VALUE_UNREPRESENTABLE,
         SOURCE_PROBE_UNREADABLE,
         SOURCE_OVERRIDE_WIRE_MISMATCH,
+        STATE_URL_SCHEME_UNSUPPORTED,
+        STATE_NOT_WRITABLE,
+        STATE_CURSOR_NOT_STORED,
         STATE_SCHEMA_NEWER,
         STATE_CURSOR_OWNER_MISMATCH,
         STATE_CURSOR_STREAM_MISMATCH,
@@ -620,6 +648,8 @@ pub mod codes {
         LOAD_COUNT_MISMATCH,
         LOAD_ADOPTION_COLUMN_MISMATCH,
         LOAD_TARGET_NOT_RIVETS,
+        VALIDATE_FAILED,
+        VALIDATE_UNVERIFIED,
         INTERNAL_VALUE_CONVERTER,
         INTERNAL_SPILL,
         INTERNAL_TYPE_BUILDER,

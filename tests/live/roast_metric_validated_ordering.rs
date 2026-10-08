@@ -75,17 +75,16 @@ fn roast_metric_validated_matches_final_summary_verdict() {
     let rig = Rig::pg_batch(&export)
         .query(&format!("SELECT id, name FROM {}", table.name()))
         .export_line("verify: content")
-        .dest_path(out.path().to_path_buf());
+        .dest_path(out.path().to_path_buf())
+        .a_failed_run_may_leave(
+            &[Leftover::DeliveredRun],
+            "`run --validate` is a verdict on an export that completed: its parts, manifest and success row stay",
+        );
     let cfg = rig.config_path();
 
-    // The manifest-verification failure is non-fatal by design (ADR-0001 §I7):
-    // the run itself still exits 0.
+    // The manifest-verification failure fails the run's exit, not the export.
     let run = rig.run_args(&["--export", &export, "--validate"]);
-    assert!(
-        run.status.success(),
-        "run must succeed (manifest verification failures are non-fatal); stderr:\n{}",
-        String::from_utf8_lossy(&run.stderr)
-    );
+    assert_refused(&run, Refused::by_code("RIVET_VALIDATE_FAILED", 3));
 
     let (run_id, metric_validated) = latest_metric_row(&cfg, &export);
 
