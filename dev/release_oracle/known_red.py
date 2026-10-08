@@ -76,7 +76,7 @@ KNOWN_RED: tuple[KnownRed, ...] = (
           "an edited query filter inherited the old filter's cursor: the run delivered ids [] of 1..=5 with exit 0",
           f"Cursor identity, found verifying #456: the stream is the outer FROM relation, so an edited `query:` filter keeps the stored cursor; {_PROGRESS_KEY}"),
     _open("live_mode_transition::open_defect_incremental_query_filter_edited_oracle",
-          "an edited query filter inherited the old filter's cursor: the run delivered ids [] of 1..=5 with exit 0",
+          "rig oracle: COUNT(*): source 4, delivered 0",
           f"Cursor identity, found verifying #456: the stream is the outer FROM relation, so an edited `query:` filter keeps the stored cursor; {_PROGRESS_KEY}"),
     _open("audit_state::open_defect_state_reset_during_an_incremental_read_keeps_the_manifest_honest",
           "P-23: a `state reset` accepted during an incremental read left a manifest with no cursor_low over a delta: its parts hold ids [11, 12, 13] of 1..=13",
