@@ -27,9 +27,6 @@
 # `pending:` lists stated guarantees deliberately not tied yet, with the reason.
 
 pending:
-  - id: interrupted_resume_keeps_the_prior_success_marker
-    file: docs/cloud-destinations.md
-    why: "the sentence and the product disagree today (a failed re-run retires the marker); the owner's decision of 2026-10-07 is being implemented by a product PR that rewrites the sentence, the tests and the behaviour together. Tie the new sentence here when it lands."
 
 guarantees:
   # ── Batch: delivery and crash safety (docs/semantics.md) ─────────────────────────────────
@@ -141,12 +138,79 @@ guarantees:
   - id: force_overrides_the_success_gate_on_resume
     stated:
       - file: docs/reference/cli.md
-        sentence: "with `--resume`, allows starting against a destination prefix whose `_SUCCESS` marker is already present (ADR-0012 M8). Without it, resume against a complete run refuses"
+        sentence: "with `--resume`, goes past the refusal to resume into a destination prefix whose `_SUCCESS` marker is already present (`RIVET_DEST_ALREADY_COMPLETE`, exit 5, ADR-0012 M8): the run continues an interrupted run of the export if one is recorded, else it runs as a plain run does. New parts land beside the old ones, nothing is overwritten, and `manifest.json` then describes only the new run"
     held_by:
-      all: { test: rivet_run_resume_refuses_when_success_marker_present_without_force, asserts: "exit code must be non-zero when _SUCCESS gate refuses" }
-    contradicted_by:
-      known_red:
-        - "live_operator_contract::open_defect_resume_force_runs_over_a_complete_prefix"
+      postgres: { test: a_forced_resume_over_a_complete_prefix_lands_beside_it_postgres, asserts: "manifest.json describes only the new run, as the refusal says" }
+      mysql: { test: a_forced_resume_over_a_complete_prefix_lands_beside_it_mysql, asserts: "manifest.json describes only the new run, as the refusal says" }
+      mssql: { test: a_forced_resume_over_a_complete_prefix_lands_beside_it_mssql, asserts: "manifest.json describes only the new run, as the refusal says" }
+      mongo: { test: a_forced_resume_over_a_complete_prefix_lands_beside_it_mongo, asserts: "manifest.json describes only the new run, as the refusal says" }
+      oracle: { test: a_forced_resume_over_a_complete_prefix_lands_beside_it_oracle, asserts: "manifest.json describes only the new run, as the refusal says" }
+
+  - id: a_run_that_failed_before_its_first_write_leaves_the_prefix
+    stated:
+      - file: docs/cloud-destinations.md
+        sentence: "a run that fails before its first write (the source cannot be reached, the password is wrong, the run is refused when it opens) leaves the previous `_SUCCESS`, `manifest.json` and every other object exactly as they were"
+    held_by:
+      postgres: { test: a_run_that_never_connected_keeps_the_export_complete_postgres, asserts: "a run that never connected left" }
+      mysql: { test: a_run_that_never_connected_keeps_the_export_complete_mysql, asserts: "a run that never connected left" }
+      mssql: { test: a_run_that_never_connected_keeps_the_export_complete_mssql, asserts: "a run that never connected left" }
+      mongo: { test: a_run_that_never_connected_keeps_the_export_complete_mongo, asserts: "a run that never connected left" }
+      oracle: { test: a_run_that_never_connected_keeps_the_export_complete_oracle, asserts: "a run that never connected left" }
+      s3: { test: a_run_that_never_connected_keeps_the_export_complete_s3, asserts: "a run that never connected left" }
+      gcs: { test: a_run_that_never_connected_keeps_the_export_complete_gcs, asserts: "a run that never connected left" }
+      azure: { test: a_run_that_never_connected_keeps_the_export_complete_azure, asserts: "a run that never connected left" }
+
+  - id: the_only_run_of_a_prefix_records_its_failure
+    stated:
+      - file: docs/cloud-destinations.md
+        sentence: "Only on a prefix that holds no manifest yet does it leave its own `failed` manifest (0 parts, no `_SUCCESS`), so `rivet validate` exits 1 on a prefix whose only run failed."
+    held_by:
+      postgres: { test: a_run_that_never_connected_keeps_the_export_complete_postgres, asserts: "`validate` on a prefix whose only run failed" }
+      mysql: { test: a_run_that_never_connected_keeps_the_export_complete_mysql, asserts: "`validate` on a prefix whose only run failed" }
+      mssql: { test: a_run_that_never_connected_keeps_the_export_complete_mssql, asserts: "`validate` on a prefix whose only run failed" }
+      mongo: { test: a_run_that_never_connected_keeps_the_export_complete_mongo, asserts: "`validate` on a prefix whose only run failed" }
+      oracle: { test: a_run_that_never_connected_keeps_the_export_complete_oracle, asserts: "`validate` on a prefix whose only run failed" }
+      s3: { test: a_run_that_never_connected_keeps_the_export_complete_s3, asserts: "`validate` on a prefix whose only run failed" }
+      gcs: { test: a_run_that_never_connected_keeps_the_export_complete_gcs, asserts: "`validate` on a prefix whose only run failed" }
+      azure: { test: a_run_that_never_connected_keeps_the_export_complete_azure, asserts: "`validate` on a prefix whose only run failed" }
+
+  - id: a_run_that_failed_after_a_part_withdraws_the_marker
+    stated:
+      - file: docs/cloud-destinations.md
+        sentence: "A run that put a part at the destination and then failed removes `_SUCCESS` and writes a `failed` manifest naming the parts it wrote"
+    held_by:
+      postgres: { test: a_run_that_failed_after_a_part_withdraws_the_marker_postgres, asserts: "the failed manifest names the parts the run wrote" }
+      mysql: { test: a_run_that_failed_after_a_part_withdraws_the_marker_mysql, asserts: "the failed manifest names the parts the run wrote" }
+      mssql: { test: a_run_that_failed_after_a_part_withdraws_the_marker_mssql, asserts: "the failed manifest names the parts the run wrote" }
+      oracle: { test: a_run_that_failed_after_a_part_withdraws_the_marker_oracle, asserts: "the failed manifest names the parts the run wrote" }
+
+  - id: the_wave_retry_reruns_an_export_whose_last_run_failed
+    stated:
+      - file: docs/cloud-destinations.md
+        sentence: "an export whose last journaled run failed is run again by `rivet apply <config> --resume`"
+    held_by:
+      postgres: { test: a_wave_retry_reruns_the_export_whose_last_run_never_connected_postgres, asserts: "`apply --resume` skipped the export whose last run never connected" }
+      mysql: { test: a_wave_retry_reruns_the_export_whose_last_run_never_connected_mysql, asserts: "`apply --resume` skipped the export whose last run never connected" }
+      mssql: { test: a_wave_retry_reruns_the_export_whose_last_run_never_connected_mssql, asserts: "`apply --resume` skipped the export whose last run never connected" }
+      mongo: { test: a_wave_retry_reruns_the_export_whose_last_run_never_connected_mongo, asserts: "`apply --resume` skipped the export whose last run never connected" }
+      oracle: { test: a_wave_retry_reruns_the_export_whose_last_run_never_connected_oracle, asserts: "`apply --resume` skipped the export whose last run never connected" }
+
+  - id: run_resume_is_not_refused_over_a_marker_a_failed_run_left_alone
+    stated:
+      - file: docs/cloud-destinations.md
+        sentence: "is not refused by `rivet run --resume`, even though an earlier run's `_SUCCESS` is still at its prefix."
+    held_by:
+      all: { test: a_resume_over_a_marker_an_earlier_run_left_redoes_the_run_that_failed, asserts: "the marker is r1's; r2 failed before it wrote and is to be done again" }
+
+  - id: a_resume_keeps_the_prior_success_marker_until_it_writes
+    stated:
+      - file: docs/cloud-destinations.md
+        sentence: "a resume that fails before it puts a part at the destination leaves that marker and its manifest in place, so a sensor polling `_SUCCESS` still sees the last whole dataset; a resume that wrote a part and then failed removes `_SUCCESS` and leaves a `failed` manifest."
+    held_by:
+      postgres: { test: a_forced_resume_keeps_the_marker_until_it_writes_postgres, asserts: "a forced resume that wrote a part and then failed" }
+      mysql: { test: a_forced_resume_keeps_the_marker_until_it_writes_mysql, asserts: "a forced resume that wrote a part and then failed" }
+      mssql: { test: a_forced_resume_keeps_the_marker_until_it_writes_mssql, asserts: "a forced resume that wrote a part and then failed" }
+      oracle: { test: a_forced_resume_keeps_the_marker_until_it_writes_oracle, asserts: "a forced resume that wrote a part and then failed" }
 
   - id: a_rerun_never_overwrites_the_previous_parts
     stated:
