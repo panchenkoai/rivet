@@ -2,6 +2,64 @@
 
 ## Unreleased
 
+- **Breaking: stored progress belongs to one source, one table and one set of rows, and a run
+  that reads another is refused.** Applies to `incremental`, keyset (`chunk_by_key`) and
+  MongoDB `resume` exports on every source engine, and to `rivet state reset`.
+  - **An edited `query:` filter is refused.** Before, an export whose `query:` kept its `FROM`
+    table but changed its filter (a `WHERE`, a join, a CTE) continued from the old filter's
+    cursor: exit 0 and none of the rows the new filter admits below it. Now the run is refused
+    with exit 5 `RIVET_STATE_CURSOR_STREAM_MISMATCH`, naming both queries, on every run.
+    Restore the previous query to continue, or run
+    `rivet state reset -c <config> --export <name>` to deliver the new filter's rows in full,
+    or run `rivet state accept -c <config> --export <name>` to keep the cursor under the new
+    query (see below). A changed column list, letter case or layout is not an edit and
+    continues; any other change of the text after `FROM <table>` is one, a renamed alias or
+    reordered predicates included.
+  - **A `${param}` value that changes between runs is not an edit.** The query is compared
+    as written, before `--param` and environment values are substituted, so
+    `WHERE region = '${region}'` run with another region continues from the stored cursor
+    with no refusal and no warning, as it did before this release. An edit of the text
+    around the placeholder is refused like any other. A `rivet plan` artifact sealed before
+    this release still applies, before or after a run of this release: it carries the
+    substituted query only, and a substituted query that fills the placeholders of the
+    stored one is the same rows.
+  - **New command `rivet state accept --config <PATH> --export <NAME> [--param KEY=VALUE]`.**
+    It answers the refusal above with "the edit is meant, go on from where the export was":
+    the stored progress of that one export is recorded as belonging to what the config reads
+    now, the cursor value is not touched, and the next run continues from it (rows of the
+    new query below the cursor are not delivered; `state reset` delivers them). It is given
+    per export and per edit; no setting accepts later edits. A cursor written for another
+    `cursor_column` is not accepted (`RIVET_STATE_CURSOR_OWNER_MISMATCH`). Each acceptance
+    is listed by `rivet journal` with status `accepted` and a line naming both queries.
+  - **The same table under another PostgreSQL `search_path` is refused.** Before, a source
+    URL that set `options=-c search_path=<schema>` moved an unqualified table to another
+    schema under the cursor of the first: exit 0, zero rows. Now it is the same refusal with
+    the same three remedies. Qualifying the table by hand with the schema it was read through
+    continues.
+  - **`rivet state reset` clears one source.** Before, `state reset --export X` deleted the
+    cursor of every export named `X` in the state database, so a same-named export of another
+    source re-delivered its whole table on its next run. Now it clears the progress `X` holds
+    on the source its config names, and the config's source URL must resolve (a missing
+    `url_env` variable stops the reset with nothing removed).
+  - **A source URL without its default port is the same source.** Before, dropping or adding
+    `:5432` / `:3306` / `:1433` / `:1521` / `:27017` in the URL started a whole-table pass
+    under a second state row. Now both spellings are one source and the run continues.
+  - **A resumed parallel keyset run stores the run's highest key.** Before, a
+    `chunk_by_key` + `parallel` + `chunk_checkpoint` run resumed after a crash stored the
+    highest key of the ranges it re-ran (or none), so a later `incremental` run on the key
+    delivered rows again. Now each committed range records its highest key and the resumed
+    run stores the highest of all.
+  - Upgrading: nothing to do. State written by 0.31 or earlier is read as follows. A cursor
+    row stored under a URL without its default port is moved onto the spelled source on the
+    first run or `state reset` of that export and continues (if both spellings hold a row,
+    the one under the spelled port is kept). A cursor row holds no query and no
+    `search_path` yet: the first run records the ones the export has now, logs one
+    `predates stream tracking` or `predates query tracking` warning, and continues; edits
+    are compared from the second run on, so make the upgrade and a filter edit two separate
+    runs. A parallel keyset run interrupted before the upgrade and resumed after it stores
+    the highest key of the ranges that commit after the upgrade, as 0.31 did. The state
+    schema moves to v35 (`keyset_range.max_key`), so an older rivet no longer opens the
+    state database.
 - **Breaking: a run that fails before its first write leaves the destination as it was.**
   Applies to every batch export (`full`, `incremental`, `chunked`, keyset, the snapshot leg
   of a CDC export) on every source engine and on every destination that keeps objects at

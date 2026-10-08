@@ -328,11 +328,13 @@ const MATRICES: &[(&str, usize)] = &[
     // open-defect rows (a resume after the source grew, an edited destination path or format), and
     // a kill inside `state reset` and inside `repair` (no named point) and a destination moved to
     // another store (the cell's reader of declared ids is local).
-    // Raised 103 -> 116 (2026-10-08): the versions, exhaust, ddl, hostile and clock row families. 13
-    // new: a memory cap (5: no rlimit on macOS, needs a cgroup), a run under a stepped clock (5: no
-    // clock seam, no libfaketime), an Oracle CLOB past 4000 bytes, the warehouse taken away under a
-    // live load, and a signal at `pg_after_snapshot_open` (the signal primitive is not on main).
-    ("docs/sabotage-matrix.yaml", 116),
+    // Raised 103 -> 127 (2026-10-08): the signal rows (a signal at a parked point, then the next run)
+    // arrive with five rows nobody wrote: a CDC stream killed mid-drain (4) and its graceful twin (5),
+    // parallel runners (5), the points that are panic points only (5), an SQLite state copied elsewhere (5).
+    // 127 -> 140 (2026-10-08): the versions, exhaust, ddl, hostile and clock row families add 13 rows nobody
+    // wrote: a memory cap (5), a run under a stepped clock (5), an Oracle CLOB past 4000 bytes, the warehouse
+    // taken away under a live load, and a signal at `pg_after_snapshot_open`.
+    ("docs/sabotage-matrix.yaml", 140),
     // Pool-split — `apply --pool --split` per (strategy × source engine). Split is a
     // scheduler layer above the runners (each unit runs through chunked/keyset), so its
     // per-engine behaviour (boundary probe, crash-recovery, finding-2 exact-partition

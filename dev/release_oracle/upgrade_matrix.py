@@ -155,8 +155,10 @@ def verdict_status(verdict: object) -> tuple[str, str]:
 
 
 def cell(led: Ledger, prev: Path, root: Path, engine: str, url: str, family: tuple[str, str, str],
-         target: str) -> None:
-    """One row: the previous release's init, run and load; a change; this build's run and load; graded."""
+         target: str, scen: str = SCEN, label: str = "upgrade", own_refusal_skips: bool = False) -> None:
+    """One row: the previous release's init, run and load; a change; this build's run and load; graded.
+
+    With `own_refusal_skips`, an old release that refuses the config its own init wrote is a named SKIP."""
     import yaml
 
     from . import gcp
@@ -164,16 +166,16 @@ def cell(led: Ledger, prev: Path, root: Path, engine: str, url: str, family: tup
     from ..pytools.registry import bq_tmp
 
     mode, guard, load_mode = family
-    name = f"upgrade[{engine}/{mode}{'+' + guard if guard else ''}->{load_mode}/{target}]"
+    name = f"{label}[{engine}/{mode}{'+' + guard if guard else ''}->{load_mode}/{target}]"
     store = f"load-{target}"
     if mode in NOT_HERE:
-        return led.skipped(engine, "-", SCEN, store, f"{name}: {NOT_HERE[mode]}", "not here")
+        return led.skipped(engine, "-", scen, store, f"{name}: {NOT_HERE[mode]}", "not here")
     if guard and (mode, guard) not in OPT_IN:
-        return led.failed(engine, "-", SCEN, store, f"{name}: load_mode_of has an arm this matrix cannot "
+        return led.failed(engine, "-", scen, store, f"{name}: load_mode_of has an arm this matrix cannot "
                           "build — add its shape to upgrade_matrix.OPT_IN", "unmapped arm")
     line = OPT_IN.get((mode, guard)) if guard else ""
     if line is None:
-        return led.skipped(engine, "-", SCEN, store, f"{name}: `rivet init` scaffolds no line for this "
+        return led.skipped(engine, "-", scen, store, f"{name}: `rivet init` scaffolds no line for this "
                            "arm's guard, so no generated config reaches it", "no init line")
     proj, bucket, location = _warehouse()
     tag = f"{engine[:2]}{mode[:2].lower()}{'k' if guard else ''}{target[:2]}_{os.getpid()}"
@@ -187,10 +189,10 @@ def cell(led: Ledger, prev: Path, root: Path, engine: str, url: str, family: tup
     db = bq_tmp(f"upgm_{tag}")
     try:
         if not _seed(engine, url, table):
-            return led.failed(engine, "-", SCEN, store, f"{name}: seed failed", "seed")
+            return led.failed(engine, "-", scen, store, f"{name}: seed failed", "seed")
         if target == "clickhouse":
             if _ch(f"CREATE DATABASE IF NOT EXISTS {db}") is None:
-                return led.skipped(engine, "-", SCEN, store, f"{name}: ClickHouse on :8123 is down", "no clickhouse")
+                return led.skipped(engine, "-", scen, store, f"{name}: ClickHouse on :8123 is down", "no clickhouse")
             wh = ["--clickhouse-url", CH_URL, "--clickhouse-database", db, "--clickhouse-user", CH_USER]
         else:
             gcp.bq_ensure_dataset(proj, db, location)
@@ -199,25 +201,28 @@ def cell(led: Ledger, prev: Path, root: Path, engine: str, url: str, family: tup
                     mode.lower(), "--gcs-bucket", bucket, *wh,
                     "-o", "c.yaml"], env=env, cwd=d)
         if not init.ok:
-            return led.skipped(engine, "-", SCEN, store, f"{name}: the previous release's init refuses it: "
+            return led.skipped(engine, "-", scen, store, f"{name}: the previous release's init refuses it: "
                                f"{init.why}", "init refused")
         cfg_path = d / "c.yaml"
         if line:
             text = opt_in(cfg_path.read_text(), line)
             if text is None:
-                return led.skipped(engine, "-", SCEN, store, f"{name}: the previous release's init scaffolds "
+                return led.skipped(engine, "-", scen, store, f"{name}: the previous release's init scaffolds "
                                    f"no `# {line}` here", "no init line")
             cfg_path.write_text(text)
         for binary, step in ((prev, "run"), (prev, "load"), (None, "change"), (rivet_bin(), "run"),
                              (rivet_bin(), "load")):
             if binary is None:
                 if not _change(engine, url, table, append_only=bool(guard)):
-                    return led.failed(engine, "-", SCEN, store, f"{name}: the source change failed", "change")
+                    return led.failed(engine, "-", scen, store, f"{name}: the source change failed", "change")
                 continue
             p = run([str(binary), step, "-c", "c.yaml"], env=env, cwd=d, timeout=None)
+            if not p.ok and binary == prev and own_refusal_skips and "Error: config file" in p.stderr:
+                return led.skipped(engine, "-", scen, store, f"{name}: the old release refuses the config its own init "
+                                   f"wrote: {p.why}", "own config refused")
             if not p.ok:
                 who = "previous" if binary == prev else "this"
-                return led.failed(engine, "-", SCEN, store, f"{name}: {step} by {who} failed: "
+                return led.failed(engine, "-", scen, store, f"{name}: {step} by {who} failed: "
                                   f"{p.why}", step)
         cfg = yaml.safe_load(cfg_path.read_text())
         export = cfg["exports"][0]
@@ -229,10 +234,10 @@ def cell(led: Ledger, prev: Path, root: Path, engine: str, url: str, family: tup
         try:
             status, detail = verdict_status(grade_load(spec))
         except Exception as e:  # noqa: BLE001 — an oracle error is a FAIL, never a pass
-            return led.failed(engine, "-", SCEN, store, f"{name}: oracle error: {type(e).__name__}: {str(e)[:300]}",
+            return led.failed(engine, "-", scen, store, f"{name}: oracle error: {type(e).__name__}: {str(e)[:300]}",
                               "oracle error")
         {"skip": led.skipped, "fail": led.failed, "pass": led.passed}[status](
-            engine, "-", SCEN, store, f"{name}: {detail}", status)
+            engine, "-", scen, store, f"{name}: {detail}", status)
     finally:
         _drop(engine, url, table)
         if target == "clickhouse":
@@ -244,20 +249,22 @@ def cell(led: Ledger, prev: Path, root: Path, engine: str, url: str, family: tup
 
 
 def matrix_lane_cells(prev: Path, root: Path, engines: tuple[str, ...] = ENGINES,
-                      targets: tuple[str, ...] = TARGETS) -> list[tuple[object, object]]:
+                      targets: tuple[str, ...] = TARGETS, families: list[tuple[str, str, str]] | None = None,
+                      scen: str = SCEN, label: str = "upgrade",
+                      own_refusal_skips: bool = False) -> list[tuple[object, object]]:
     """Every family of `load_mode_of` x every engine with a gate URL x every warehouse, as `(lane, fn)`: the lane is the source server."""
     cells: list[tuple[object, object]] = []
-    for family in rows():
+    for family in rows() if families is None else families:
         for engine in engines:
             uvar = f"RIVET_ORACLE_{engine.upper()}_URL"
             url = os.environ.get(uvar, "")
             for target in targets:
                 if not url:
                     cells.append((None, lambda led, e=engine, f=family, t=target, v=uvar: led.skipped(
-                        e, "-", SCEN, f"load-{t}", f"upgrade[{e}/{f[0]}]: no {v}", "no url")))
+                        e, "-", scen, f"load-{t}", f"{label}[{e}/{f[0]}]: no {v}", "no url")))
                     continue
                 cells.append((server_of(url), lambda led, e=engine, u=url, f=family, t=target: cell(
-                    led, prev, root, e, u, f, t)))
+                    led, prev, root, e, u, f, t, scen, label, own_refusal_skips)))
     return cells
 
 

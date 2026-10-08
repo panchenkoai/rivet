@@ -326,6 +326,8 @@ release-oracle-prev-bin:  ## Download the PREVIOUS release binary (the regressio
 	 tar xzf $(PREV_RELEASE_DIR)/carrier/rivet-$(FIELD_REPLAY_CARRIER_TAG)-aarch64-apple-darwin.tar.gz -C $(PREV_RELEASE_DIR)/carrier; \
 	 echo "  field-replay carrier: $$($(FIELD_REPLAY_CARRIER_BIN) --version)"; \
 	fi
+	@# The releases a client still runs (dev/release_oracle/field_state.py FIELD_VERSIONS), beside the baseline.
+	@$(PY) -m dev.release_oracle.field_state --fetch $(PREV_RELEASE_DIR)/field
 
 release-oracle-full: release-oracle-prev-bin  ## Release gate with the WHOLE environment against the local dev stand. This is the one a release is judged by.
 	@# The gate grades `target/release/rivet`. A stale one grades yesterday's

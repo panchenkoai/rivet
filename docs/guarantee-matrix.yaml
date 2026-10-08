@@ -42,9 +42,6 @@ guarantees:
       oracle: { gap: "no Oracle batch cell crashes a run between the write and the cursor and reads the destination" }
     contradicted_by:
       known_red:
-        - "live_mode_transition::open_defect_source_url_without_its_default_port_continues"
-        - "live_mode_transition::open_defect_incremental_query_filter_edited"
-        - "live_mode_transition::open_defect_same_table_in_another_schema_is_another_stream"
         - "live_sabotage::open_defect_a_cursor_moved_forward_delivers_or_refuses"
         - "chunking_stand::open_defect_a_float_chunk_column_under_query_keeps_its_fractional_keys"
 
@@ -247,7 +244,6 @@ guarantees:
       known_red:
         - "live_sabotage::open_defect_a_cursor_of_another_type_delivers_or_is_refused_by_code_and_led_out"
         - "live_sabotage::open_defect_an_edited_plan_fingerprint_delivers_or_is_refused_by_code_and_led_out"
-        - "audit_state::open_defect_state_reset_keeps_the_cursor_of_another_source"
 
   - id: parallel_keyset_reads_every_row_exactly_once
     stated:
@@ -258,9 +254,6 @@ guarantees:
       mysql: { test: parallel_keyset_parity_mysql, asserts: "the union of all workers' keys must equal 1..=n" }
       mssql: { test: parallel_keyset_parity_mssql, asserts: "the union of all workers' keys must equal 1..=n" }
       oracle: { test: parallel_keyset_reads_every_row_once, asserts: "{ctx}: no row read twice" }
-    contradicted_by:
-      known_red:
-        - "live_mode_transition::open_defect_resumed_parallel_keyset_then_incremental"
 
   - id: repair_writes_beside_the_originals
     stated:
@@ -348,11 +341,11 @@ guarantees:
       - file: docs/cloud-destinations.md
         sentence: "**never queries the source**: only `HEAD` / `GET _SUCCESS` / `GET manifest.json` against the resolved destination."
     held_by:
-      postgres: { gap: "no cell runs validate against an unreachable source or counts source connections" }
-      mysql: { gap: "no cell runs validate against an unreachable source or counts source connections" }
-      mssql: { gap: "no cell runs validate against an unreachable source or counts source connections" }
-      mongo: { gap: "no cell runs validate against an unreachable source or counts source connections" }
-      oracle: { gap: "no cell runs validate against an unreachable source or counts source connections" }
+      postgres: { test: validate_never_queries_the_source_postgres, asserts: "validate opened {during_validate} connection(s) to the source" }
+      mysql: { test: validate_never_queries_the_source_mysql, asserts: "validate opened {during_validate} connection(s) to the source" }
+      mssql: { test: validate_never_queries_the_source_mssql, asserts: "validate opened {during_validate} connection(s) to the source" }
+      mongo: { test: validate_never_queries_the_source_mongo, asserts: "validate opened {during_validate} connection(s) to the source" }
+      oracle: { test: validate_never_queries_the_source_oracle, asserts: "validate opened {during_validate} connection(s) to the source" }
 
   - id: run_validate_fails_the_run_as_validate_would
     stated:
@@ -434,7 +427,11 @@ guarantees:
       - file: docs/reference/cli.md
         sentence: "The `RIVET_STATE_URL` value is **not** embedded in plan artifacts or config files. It is resolved from the environment at runtime."
     held_by:
-      all: { gap: "no cell seals a plan under a RIVET_STATE_URL and reads the artifact for it" }
+      postgres: { test: a_sealed_plan_carries_no_state_url_postgres, asserts: "the state URL reached a plan artifact or a config file" }
+      mysql: { test: a_sealed_plan_carries_no_state_url_mysql, asserts: "the state URL reached a plan artifact or a config file" }
+      mssql: { test: a_sealed_plan_carries_no_state_url_mssql, asserts: "the state URL reached a plan artifact or a config file" }
+      mongo: { test: a_sealed_plan_carries_no_state_url_mongo, asserts: "the state URL reached a plan artifact or a config file" }
+      oracle: { test: a_sealed_plan_carries_no_state_url_oracle, asserts: "the state URL reached a plan artifact or a config file" }
 
   - id: an_unusable_state_url_is_refused_never_replaced_by_sqlite
     stated:
@@ -607,11 +604,11 @@ guarantees:
       - file: docs/reference/cdc.md
         sentence: "A failed run leaves its durable parts in the destination but **no `manifest.json` / `_SUCCESS`**"
     held_by:
-      postgres: { gap: "no live cell fails a CDC run after it wrote a part and reads the destination" }
-      mysql: { gap: "no live cell fails a CDC run after it wrote a part and reads the destination" }
-      mssql: { gap: "no live cell fails a CDC run after it wrote a part and reads the destination" }
-      mongo: { gap: "no live cell fails a CDC run after it wrote a part and reads the destination" }
-      oracle: { gap: "no live cell fails a CDC run after it wrote a part and reads the destination" }
+      postgres: { test: a_failed_cdc_run_leaves_parts_without_a_manifest_and_redelivers_them_alike_postgres, asserts: "a failed CDC run leaves no manifest.json and no _SUCCESS" }
+      mysql: { test: a_failed_cdc_run_leaves_parts_without_a_manifest_and_redelivers_them_alike_mysql, asserts: "a failed CDC run leaves no manifest.json and no _SUCCESS" }
+      mssql: { test: a_failed_cdc_run_leaves_parts_without_a_manifest_and_redelivers_them_alike_mssql, asserts: "a failed CDC run leaves no manifest.json and no _SUCCESS" }
+      mongo: { test: a_failed_cdc_run_leaves_parts_without_a_manifest_and_redelivers_them_alike_mongo, asserts: "a failed CDC run leaves no manifest.json and no _SUCCESS" }
+      oracle: { test: a_failed_cdc_run_leaves_parts_without_a_manifest_and_redelivers_them_alike_oracle, asserts: "a failed CDC run leaves no manifest.json and no _SUCCESS" }
 
   - id: each_release_is_diffed_against_debezium
     stated:
@@ -625,9 +622,11 @@ guarantees:
       - file: docs/reference/cdc.md
         sentence: "re-delivered event is **byte-identical** — same `__op`, `__pos`, and image —"
     held_by:
-      postgres: { gap: "no cell compares the event a crashed run delivered with its re-delivery, column by column" }
-      mysql: { gap: "no cell compares the event a crashed run delivered with its re-delivery, column by column" }
-      mssql: { gap: "no cell compares the event a crashed run delivered with its re-delivery, column by column" }
+      postgres: { test: a_failed_cdc_run_leaves_parts_without_a_manifest_and_redelivers_them_alike_postgres, asserts: "the re-delivered events are byte-identical to the ones the failed run wrote" }
+      mysql: { test: a_failed_cdc_run_leaves_parts_without_a_manifest_and_redelivers_them_alike_mysql, asserts: "the re-delivered events are byte-identical to the ones the failed run wrote" }
+      mssql: { test: a_failed_cdc_run_leaves_parts_without_a_manifest_and_redelivers_them_alike_mssql, asserts: "the re-delivered events are byte-identical to the ones the failed run wrote" }
+      mongo: { test: a_failed_cdc_run_leaves_parts_without_a_manifest_and_redelivers_them_alike_mongo, asserts: "the re-delivered events are byte-identical to the ones the failed run wrote" }
+      oracle: { test: a_failed_cdc_run_leaves_parts_without_a_manifest_and_redelivers_them_alike_oracle, asserts: "the re-delivered events are byte-identical to the ones the failed run wrote" }
 
   - id: a_checkpoint_from_another_server_is_refused
     stated:

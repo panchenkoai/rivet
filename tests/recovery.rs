@@ -157,7 +157,7 @@ fn f2_crash_window_is_detectable_via_state_inspection() {
     );
 
     // A recovery procedure can reset cursor state to force a clean re-run.
-    state.reset("events").unwrap();
+    state.reset("events", "").unwrap();
     let after = state.get("events", "").unwrap();
     assert!(
         after.last_cursor_value.is_none(),
