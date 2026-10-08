@@ -43,6 +43,13 @@
 #                   walked out of; every other edit delivers the source, every source id declared
 #                   once where the config now points.
 #
+#   sigkill_<shape>_<point>, graceful_<shape>_<point>
+#                   a run stopped by a signal while parked at a point the test can see
+#                   (`Rig::stopped`: the first part staged, or one part committed and the next
+#                   staged), then the next plain run (tests/live/live_sabotage_ops.rs). A graceful
+#                   stop is held to the SIGKILL of the same point (`graceful_is_worse`).
+#   dead_owner_<how> a run lease whose owner cannot be seen dead: it must expire and let a run through.
+#
 # Elsewhere, and not repeated here (each has an `na:` row that names it): a corrupt CDC checkpoint
 # file is the corrupt-checkpoint rows of docs/operator-contract-matrix.yaml; an edited mode, key or
 # cursor column, table, schema or source URL is docs/mode-transition-matrix.yaml; a crash at a named
@@ -955,3 +962,154 @@ scenarios:
     mssql:    { na: "these edits are the rows of docs/mode-transition-matrix.yaml (full_then_incremental .. crashed_parallel_keyset_then_checkpoint_removed_reset, incremental_cursor_change, incremental_repointed_at_another_table, incremental_other_schema_same_table, incremental_source_url_respelled, incremental_query_filter_edited), every one on every SQL engine: not repeated here" }
     mongo:    { na: "these edits are the rows of docs/mode-transition-matrix.yaml (full_then_incremental .. crashed_parallel_keyset_then_checkpoint_removed_reset, incremental_cursor_change, incremental_repointed_at_another_table, incremental_other_schema_same_table, incremental_source_url_respelled, incremental_query_filter_edited), every one on every SQL engine: not repeated here" }
     oracle:   { na: "these edits are the rows of docs/mode-transition-matrix.yaml (full_then_incremental .. crashed_parallel_keyset_then_checkpoint_removed_reset, incremental_cursor_change, incremental_repointed_at_another_table, incremental_other_schema_same_table, incremental_source_url_respelled, incremental_query_filter_edited), every one on every SQL engine: not repeated here" }
+  - id: sigkill_full_first_part_staged
+    what: "SIGKILL of a `mode: full` run parked with its first part staged and none committed: the stop is not a success and the next plain run delivers the source (a 600 s lease on a Postgres state, so the takeover is the dead owner's)"
+    postgres: { test: a_killed_full_run_with_first_part_staged_is_taken_over_by_the_next_run_postgres }
+    mysql:    { test: a_killed_full_run_with_first_part_staged_is_taken_over_by_the_next_run_mysql }
+    mssql:    { test: a_killed_full_run_with_first_part_staged_is_taken_over_by_the_next_run_mssql }
+    mongo:    { test: a_killed_full_run_with_first_part_staged_is_taken_over_by_the_next_run_mongo }
+    oracle:   { test: a_killed_full_run_with_first_part_staged_is_taken_over_by_the_next_run_oracle }
+
+  - id: sigkill_incremental_first_part_staged
+    what: "SIGKILL of a `mode: incremental` run parked with its first part staged and none committed: the stop is not a success and the next plain run delivers the source (a 600 s lease on a Postgres state, so the takeover is the dead owner's)"
+    postgres: { test: a_killed_incremental_run_with_first_part_staged_is_taken_over_by_the_next_run_postgres }
+    mysql:    { test: a_killed_incremental_run_with_first_part_staged_is_taken_over_by_the_next_run_mysql }
+    mssql:    { test: a_killed_incremental_run_with_first_part_staged_is_taken_over_by_the_next_run_mssql }
+    mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no incremental cursor" }
+    oracle:   { test: a_killed_incremental_run_with_first_part_staged_is_taken_over_by_the_next_run_oracle }
+
+  - id: sigkill_range_first_part_staged
+    what: "SIGKILL of a checkpointed range-chunk run parked with its first part staged and none committed: the stop is not a success and the next plain run delivers the source (a 600 s lease on a Postgres state, so the takeover is the dead owner's)"
+    postgres: { test: a_killed_range_run_with_first_part_staged_is_taken_over_by_the_next_run_postgres }
+    mysql:    { test: a_killed_range_run_with_first_part_staged_is_taken_over_by_the_next_run_mysql }
+    mssql:    { test: a_killed_range_run_with_first_part_staged_is_taken_over_by_the_next_run_mssql }
+    mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no range-chunk checkpoint" }
+    oracle:   { test: a_killed_range_run_with_first_part_staged_is_taken_over_by_the_next_run_oracle }
+
+  - id: sigkill_range_a_part_committed
+    what: "SIGKILL of a checkpointed range-chunk run parked with one part committed and the next staged: the stop is not a success and the next plain run delivers the source (a 600 s lease on a Postgres state, so the takeover is the dead owner's)"
+    postgres: { test: a_killed_range_run_with_a_part_committed_is_taken_over_by_the_next_run_postgres }
+    mysql:    { test: a_killed_range_run_with_a_part_committed_is_taken_over_by_the_next_run_mysql }
+    mssql:    { test: a_killed_range_run_with_a_part_committed_is_taken_over_by_the_next_run_mssql }
+    mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no range-chunk checkpoint" }
+    oracle:   { test: a_killed_range_run_with_a_part_committed_is_taken_over_by_the_next_run_oracle }
+
+  - id: sigkill_keyset_first_part_staged
+    what: "SIGKILL of a checkpointed keyset run parked with its first part staged and none committed: the stop is not a success and the next plain run delivers the source (a 600 s lease on a Postgres state, so the takeover is the dead owner's)"
+    postgres: { test: a_killed_keyset_run_with_first_part_staged_is_taken_over_by_the_next_run_postgres }
+    mysql:    { test: a_killed_keyset_run_with_first_part_staged_is_taken_over_by_the_next_run_mysql }
+    mssql:    { test: a_killed_keyset_run_with_first_part_staged_is_taken_over_by_the_next_run_mssql }
+    mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no keyset checkpoint" }
+    oracle:   { test: a_killed_keyset_run_with_first_part_staged_is_taken_over_by_the_next_run_oracle }
+
+  - id: sigkill_keyset_a_part_committed
+    what: "SIGKILL of a checkpointed keyset run parked with one part committed and the next staged: the stop is not a success and the next plain run delivers the source (a 600 s lease on a Postgres state, so the takeover is the dead owner's)"
+    postgres: { test: a_killed_keyset_run_with_a_part_committed_is_taken_over_by_the_next_run_postgres }
+    mysql:    { test: a_killed_keyset_run_with_a_part_committed_is_taken_over_by_the_next_run_mysql }
+    mssql:    { test: a_killed_keyset_run_with_a_part_committed_is_taken_over_by_the_next_run_mssql }
+    mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no keyset checkpoint" }
+    oracle:   { test: a_killed_keyset_run_with_a_part_committed_is_taken_over_by_the_next_run_oracle }
+
+  - id: graceful_full_first_part_staged
+    what: "SIGTERM and SIGINT of a `mode: full` run parked with its first part staged and none committed: each ends in the signal or an exit of the class table, leaves no `_SUCCESS`, the next run delivers, and nothing is left that the SIGKILL of the same point does not leave"
+    postgres: { test: a_graceful_stop_of_a_full_run_with_first_part_staged_is_no_worse_than_a_kill_postgres }
+    mysql:    { test: a_graceful_stop_of_a_full_run_with_first_part_staged_is_no_worse_than_a_kill_mysql }
+    mssql:    { test: a_graceful_stop_of_a_full_run_with_first_part_staged_is_no_worse_than_a_kill_mssql }
+    mongo:    { test: a_graceful_stop_of_a_full_run_with_first_part_staged_is_no_worse_than_a_kill_mongo }
+    oracle:   { test: a_graceful_stop_of_a_full_run_with_first_part_staged_is_no_worse_than_a_kill_oracle }
+
+  - id: graceful_incremental_first_part_staged
+    what: "SIGTERM and SIGINT of a `mode: incremental` run parked with its first part staged and none committed: each ends in the signal or an exit of the class table, leaves no `_SUCCESS`, the next run delivers, and nothing is left that the SIGKILL of the same point does not leave"
+    postgres: { test: a_graceful_stop_of_a_incremental_run_with_first_part_staged_is_no_worse_than_a_kill_postgres }
+    mysql:    { test: a_graceful_stop_of_a_incremental_run_with_first_part_staged_is_no_worse_than_a_kill_mysql }
+    mssql:    { test: a_graceful_stop_of_a_incremental_run_with_first_part_staged_is_no_worse_than_a_kill_mssql }
+    mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no incremental cursor" }
+    oracle:   { test: a_graceful_stop_of_a_incremental_run_with_first_part_staged_is_no_worse_than_a_kill_oracle }
+
+  - id: graceful_range_first_part_staged
+    what: "SIGTERM and SIGINT of a checkpointed range-chunk run parked with its first part staged and none committed: each ends in the signal or an exit of the class table, leaves no `_SUCCESS`, the next run delivers, and nothing is left that the SIGKILL of the same point does not leave"
+    postgres: { test: a_graceful_stop_of_a_range_run_with_first_part_staged_is_no_worse_than_a_kill_postgres }
+    mysql:    { test: a_graceful_stop_of_a_range_run_with_first_part_staged_is_no_worse_than_a_kill_mysql }
+    mssql:    { test: a_graceful_stop_of_a_range_run_with_first_part_staged_is_no_worse_than_a_kill_mssql }
+    mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no range-chunk checkpoint" }
+    oracle:   { test: a_graceful_stop_of_a_range_run_with_first_part_staged_is_no_worse_than_a_kill_oracle }
+
+  - id: graceful_range_a_part_committed
+    what: "SIGTERM and SIGINT of a checkpointed range-chunk run parked with one part committed and the next staged: each ends in the signal or an exit of the class table, leaves no `_SUCCESS`, the next run delivers, and nothing is left that the SIGKILL of the same point does not leave"
+    postgres: { test: a_graceful_stop_of_a_range_run_with_a_part_committed_is_no_worse_than_a_kill_postgres }
+    mysql:    { test: a_graceful_stop_of_a_range_run_with_a_part_committed_is_no_worse_than_a_kill_mysql }
+    mssql:    { test: a_graceful_stop_of_a_range_run_with_a_part_committed_is_no_worse_than_a_kill_mssql }
+    mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no range-chunk checkpoint" }
+    oracle:   { test: a_graceful_stop_of_a_range_run_with_a_part_committed_is_no_worse_than_a_kill_oracle }
+
+  - id: graceful_keyset_first_part_staged
+    what: "SIGTERM and SIGINT of a checkpointed keyset run parked with its first part staged and none committed: each ends in the signal or an exit of the class table, leaves no `_SUCCESS`, the next run delivers, and nothing is left that the SIGKILL of the same point does not leave"
+    postgres: { test: a_graceful_stop_of_a_keyset_run_with_first_part_staged_is_no_worse_than_a_kill_postgres }
+    mysql:    { test: a_graceful_stop_of_a_keyset_run_with_first_part_staged_is_no_worse_than_a_kill_mysql }
+    mssql:    { test: a_graceful_stop_of_a_keyset_run_with_first_part_staged_is_no_worse_than_a_kill_mssql }
+    mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no keyset checkpoint" }
+    oracle:   { test: a_graceful_stop_of_a_keyset_run_with_first_part_staged_is_no_worse_than_a_kill_oracle }
+
+  - id: graceful_keyset_a_part_committed
+    what: "SIGTERM and SIGINT of a checkpointed keyset run parked with one part committed and the next staged: each ends in the signal or an exit of the class table, leaves no `_SUCCESS`, the next run delivers, and nothing is left that the SIGKILL of the same point does not leave"
+    postgres: { test: a_graceful_stop_of_a_keyset_run_with_a_part_committed_is_no_worse_than_a_kill_postgres }
+    mysql:    { test: a_graceful_stop_of_a_keyset_run_with_a_part_committed_is_no_worse_than_a_kill_mysql }
+    mssql:    { test: a_graceful_stop_of_a_keyset_run_with_a_part_committed_is_no_worse_than_a_kill_mssql }
+    mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no keyset checkpoint" }
+    oracle:   { test: a_graceful_stop_of_a_keyset_run_with_a_part_committed_is_no_worse_than_a_kill_oracle }
+
+  - id: dead_owner_on_another_host
+    what: "the run lease of a killed range run naming an owner on a host that is gone (Postgres state): the run is refused twice, and waiting the lease out delivers the source"
+    postgres: { test: a_lease_of_an_owner_on_a_host_that_is_gone_expires_and_the_run_delivers_postgres }
+    mysql:    { test: a_lease_of_an_owner_on_a_host_that_is_gone_expires_and_the_run_delivers_mysql }
+    mssql:    { test: a_lease_of_an_owner_on_a_host_that_is_gone_expires_and_the_run_delivers_mssql }
+    mongo:    { na: "a MongoDB export takes no run lease: only a checkpointed chunk or keyset run does (ExtractionStrategy::is_resumable)" }
+    oracle:   { test: a_lease_of_an_owner_on_a_host_that_is_gone_expires_and_the_run_delivers_oracle }
+
+  - id: dead_owner_pid_reused
+    what: "the run lease of a killed range run whose owner's pid is alive again as an unrelated process (Postgres state): the run is refused twice, and waiting the lease out delivers the source"
+    postgres: { test: a_lease_of_a_dead_owner_whose_pid_is_alive_again_expires_and_the_run_delivers_postgres }
+    mysql:    { test: a_lease_of_a_dead_owner_whose_pid_is_alive_again_expires_and_the_run_delivers_mysql }
+    mssql:    { test: a_lease_of_a_dead_owner_whose_pid_is_alive_again_expires_and_the_run_delivers_mssql }
+    mongo:    { na: "a MongoDB export takes no run lease: only a checkpointed chunk or keyset run does (ExtractionStrategy::is_resumable)" }
+    oracle:   { test: a_lease_of_a_dead_owner_whose_pid_is_alive_again_expires_and_the_run_delivers_oracle }
+
+  - id: sigkill_cdc_stream
+    what: "SIGKILL of a `mode: cdc` run mid-drain: the next run closes the gap and the slot, capture position or checkpoint has one owner"
+    postgres: { gap: "not written: a CdcScenario cell that parks the stream between a flush and its ack with a real signal (the `cdc_after_flush_before_ack` point is a panic point), on a backlog large enough to be seen mid-drain; MySQL has the one cell" }
+    mysql:    { test: gremlin_cdc_sigkill_mid_drain_recovers_without_gap }
+    mssql:    { gap: "not written: a CdcScenario cell that parks the stream between a flush and its ack with a real signal (the `cdc_after_flush_before_ack` point is a panic point), on a backlog large enough to be seen mid-drain; MySQL has the one cell" }
+    mongo:    { gap: "not written: a CdcScenario cell that parks the stream between a flush and its ack with a real signal (the `cdc_after_flush_before_ack` point is a panic point), on a backlog large enough to be seen mid-drain; MySQL has the one cell" }
+    oracle:   { gap: "not written: a CdcScenario cell that parks the stream between a flush and its ack with a real signal (the `cdc_after_flush_before_ack` point is a panic point), on a backlog large enough to be seen mid-drain; MySQL has the one cell" }
+
+  - id: graceful_cdc_stream
+    what: "SIGTERM and SIGINT of a `mode: cdc` run mid-drain, held to the SIGKILL of the same point"
+    postgres: { gap: "not written: needs the mid-drain park of the sigkill_cdc_stream row on every engine first" }
+    mysql:    { gap: "not written: needs the mid-drain park of the sigkill_cdc_stream row on every engine first" }
+    mssql:    { gap: "not written: needs the mid-drain park of the sigkill_cdc_stream row on every engine first" }
+    mongo:    { gap: "not written: needs the mid-drain park of the sigkill_cdc_stream row on every engine first" }
+    oracle:   { gap: "not written: needs the mid-drain park of the sigkill_cdc_stream row on every engine first" }
+
+  - id: stop_parallel_runner
+    what: "a stop of a `parallel: N` range or keyset run and of MongoDB's parallel scan, by SIGKILL and gracefully"
+    postgres: { gap: "not written: `Rig::stopped` parks a parallel run the same way (every worker blocks at its own rename); the cells need the shapes and their x5 on each engine" }
+    mysql:    { gap: "not written: `Rig::stopped` parks a parallel run the same way (every worker blocks at its own rename); the cells need the shapes and their x5 on each engine" }
+    mssql:    { gap: "not written: `Rig::stopped` parks a parallel run the same way (every worker blocks at its own rename); the cells need the shapes and their x5 on each engine" }
+    mongo:    { gap: "not written: `Rig::stopped` parks a parallel run the same way (every worker blocks at its own rename); the cells need the shapes and their x5 on each engine" }
+    oracle:   { gap: "not written: `Rig::stopped` parks a parallel run the same way (every worker blocks at its own rename); the cells need the shapes and their x5 on each engine" }
+
+  - id: stop_after_the_commit
+    what: "a stop between a committed part and the manifest, between the manifest and the cursor, and after the last chunk's completion (the after_file_write, after_manifest_update, after_cursor_commit, after_chunk_complete and keyset_after_data_complete points)"
+    postgres: { gap: "cannot be written from outside: those are panic points (RIVET_TEST_PANIC_AT), and a signal needs the run parked there; the product parks only at `before_commit_rename` and `after_source_read` (src/test_hook.rs), and no hook is added to the product for a test" }
+    mysql:    { gap: "cannot be written from outside: those are panic points (RIVET_TEST_PANIC_AT), and a signal needs the run parked there; the product parks only at `before_commit_rename` and `after_source_read` (src/test_hook.rs), and no hook is added to the product for a test" }
+    mssql:    { gap: "cannot be written from outside: those are panic points (RIVET_TEST_PANIC_AT), and a signal needs the run parked there; the product parks only at `before_commit_rename` and `after_source_read` (src/test_hook.rs), and no hook is added to the product for a test" }
+    mongo:    { gap: "cannot be written from outside: those are panic points (RIVET_TEST_PANIC_AT), and a signal needs the run parked there; the product parks only at `before_commit_rename` and `after_source_read` (src/test_hook.rs), and no hook is added to the product for a test" }
+    oracle:   { gap: "cannot be written from outside: those are panic points (RIVET_TEST_PANIC_AT), and a signal needs the run parked there; the product parks only at `before_commit_rename` and `after_source_read` (src/test_hook.rs), and no hook is added to the product for a test" }
+
+  - id: dead_owner_state_copied_elsewhere
+    what: "the SQLite state and destination of a killed run copied to another working directory, then run there"
+    postgres: { gap: "not written: needs a rig re-homed onto a copy of its config directory; an SQLite-state lease is an flock on a sidecar file (src/state/load_lease.rs), which a copy does not carry, and no host name is recorded" }
+    mysql:    { gap: "not written: needs a rig re-homed onto a copy of its config directory; an SQLite-state lease is an flock on a sidecar file (src/state/load_lease.rs), which a copy does not carry, and no host name is recorded" }
+    mssql:    { gap: "not written: needs a rig re-homed onto a copy of its config directory; an SQLite-state lease is an flock on a sidecar file (src/state/load_lease.rs), which a copy does not carry, and no host name is recorded" }
+    mongo:    { gap: "not written: needs a rig re-homed onto a copy of its config directory; an SQLite-state lease is an flock on a sidecar file (src/state/load_lease.rs), which a copy does not carry, and no host name is recorded" }
+    oracle:   { gap: "not written: needs a rig re-homed onto a copy of its config directory; an SQLite-state lease is an flock on a sidecar file (src/state/load_lease.rs), which a copy does not carry, and no host name is recorded" }
