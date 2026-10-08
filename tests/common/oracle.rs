@@ -132,3 +132,45 @@ pub fn seed_oracle_numeric_table(rows: i64) -> OracleTable {
     ));
     t
 }
+
+/// A throwaway login with SELECT on `RIVET.<table>` whose every session runs `logon_body` (an AFTER LOGON trigger); trigger and user dropped on scope exit.
+pub struct OracleLogonUser(String);
+
+impl OracleLogonUser {
+    const PASSWORD: &'static str = "Odd_passw0rd1";
+
+    pub fn create(prefix: &str, table: &str, logon_body: &str) -> Self {
+        let name = super::unique_name(prefix).to_uppercase();
+        ora_system_exec(&format!(
+            "CREATE USER {name} IDENTIFIED BY \"{}\"",
+            Self::PASSWORD
+        ));
+        let user = Self(name);
+        ora_system_exec(&format!("GRANT CREATE SESSION TO {}", user.0));
+        ora_system_exec(&format!("GRANT SELECT ON RIVET.{table} TO {}", user.0));
+        ora_system_exec(&format!(
+            "CREATE OR REPLACE TRIGGER SYSTEM.{0}_LOGON AFTER LOGON ON {0}.SCHEMA \
+             BEGIN {logon_body} END;",
+            user.0
+        ));
+        user
+    }
+
+    pub fn url(&self) -> String {
+        format!(
+            "oracle://{}:{}@127.0.0.1:1521/FREEPDB1",
+            self.0,
+            Self::PASSWORD
+        )
+    }
+}
+
+impl Drop for OracleLogonUser {
+    fn drop(&mut self) {
+        let _ = std::panic::catch_unwind(|| {
+            ora_system_exec(&format!("DROP TRIGGER SYSTEM.{}_LOGON", self.0))
+        });
+        let _ =
+            std::panic::catch_unwind(|| ora_system_exec(&format!("DROP USER {} CASCADE", self.0)));
+    }
+}

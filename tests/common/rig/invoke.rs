@@ -439,13 +439,33 @@ impl Rig {
         argv
     }
 
-    /// One bounded `rivet cdc` to stdout over this rig's stream: the NDJSON change lines it printed.
-    pub fn cli_cdc_ndjson(&self, checkpointed: bool) -> Vec<String> {
-        let argv = self.cdc_cli_argv(checkpointed);
+    /// One bounded `rivet cdc` over this rig's stream: `source` replaces the inline `--source <url>` pair, `extra` is appended; its stdout.
+    pub fn cli_cdc(
+        &self,
+        checkpointed: bool,
+        source: Option<&[&str]>,
+        extra: &[&str],
+        envs: &[(&str, &str)],
+    ) -> String {
+        let mut argv = self.cdc_cli_argv(checkpointed);
+        if let Some(form) = source {
+            argv.splice(1..3, form.iter().map(|a| a.to_string()));
+        }
+        argv.extend(extra.iter().map(|a| a.to_string()));
         let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
         let ceiling = std::time::Duration::from_secs(180);
-        crate::common::runner::run_rivet_args_bounded(&argv, ceiling)
+        crate::common::runner::run_rivet_args_bounded_env(&argv, envs, ceiling)
             .expect("a bounded `rivet cdc` run ends on its own")
+    }
+
+    /// The source URL this rig's `rivet cdc` argv carries inline.
+    pub fn cdc_source_url(&self) -> &str {
+        &self.source_url
+    }
+
+    /// One bounded `rivet cdc` to stdout over this rig's stream: the NDJSON change lines it printed.
+    pub fn cli_cdc_ndjson(&self, checkpointed: bool) -> Vec<String> {
+        self.cli_cdc(checkpointed, None, &[], &[])
             .lines()
             .filter(|l| l.trim_start().starts_with('{'))
             .map(str::to_string)

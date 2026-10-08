@@ -124,7 +124,8 @@ const MATRICES: &[(&str, usize)] = &[
     // Lowered 14 -> 12 (2026-09-26): Oracle init keyset scaffold + chunk_by_days proven live.
     // Lowered 12 -> 11 (2026-09-26): the `dense_chunk_dense` row went with `chunk_dense` (its Oracle gap too).
     // Lowered 11 -> 10 (2026-10-08): the Oracle range crash/resume row cites every_chunked_range_runner_hook_loses_nothing_on_oracle.
-    ("docs/chunking-matrix.yaml", 10),
+    // Lowered 10 -> 0 (2026-10-08): the Oracle arm of the chunking stand (Eng::Or) and the Oracle keyset incremental cells.
+    ("docs/chunking-matrix.yaml", 0),
     // Export-STRATEGY flag × engine, verified on GOLDEN fixtures + a distilled
     // GARBAGE profile (anonymized shape of a 200+-table field DB). Two layers:
     // the offline scaffold_strategy oracle (all shapes) + the live chunking_stand
@@ -133,7 +134,8 @@ const MATRICES: &[(&str, usize)] = &[
     // + justified n/a. 0 gaps — every cell is a test or a justified n/a.
     // Raised 0 -> 10 (2026-09-26): the Oracle column's honest gaps (batch-only phase 1).
     // Lowered 10 -> 8 (2026-09-26): Oracle wide-table introspection + time_window proven live.
-    ("docs/cli-flag-matrix.yaml", 8),
+    // Lowered 8 -> 0 (2026-10-08): the Oracle stand cells, the distilled-catalog init cell and the CURRENT_SCHEMA cell.
+    ("docs/cli-flag-matrix.yaml", 0),
     // Destination-backend correctness (local/gcs/s3/azure × scenario): the dogfood
     // cloud findings (prefix normalization B, --validate-is-advisory A) + the
     // emulator round-trip + cross-backend parity.
@@ -145,7 +147,8 @@ const MATRICES: &[(&str, usize)] = &[
     ("docs/destination-matrix.yaml", 0),
     // Raised 0 -> 2 (2026-09-26): the Oracle column's honest gaps (batch-only phase 1).
     // Lowered 2 -> 1 (2026-09-26): Oracle time_window proven live.
-    ("docs/behaviour-matrix.yaml", 1),
+    // Lowered 1 -> 0 (2026-10-08): settle on Oracle through SqlEngine::Oracle.
+    ("docs/behaviour-matrix.yaml", 0),
     // Raised 0 -> 1 (2026-09-26): the Oracle column's honest gaps (batch-only phase 1).
     // Lowered 1 -> 0 (2026-10-08): the Oracle collection column is refused, na.
     ("docs/type-fidelity-matrix.yaml", 0),
@@ -153,7 +156,8 @@ const MATRICES: &[(&str, usize)] = &[
     // parity, csv, tuning profile) — visible + un-growable; fill by writing the test.
     // Raised 0 -> 7 (2026-09-26): the Oracle column's honest gaps (batch-only phase 1).
     // Lowered 7 -> 5 (2026-09-26): Oracle --reconcile + parallel: N proven live.
-    ("docs/cross-config-matrix.yaml", 5),
+    // Lowered 5 -> 0 (2026-10-08): Oracle fake-GCS, MinIO, CSV, codec and Oracle-vs-MySQL parity cells.
+    ("docs/cross-config-matrix.yaml", 0),
     // CDC — the most engine-divergent surface (12 scenarios × 4 engines). Complements
     // tests/cdc_conformance_gate.rs. The 5 holes it surfaced (schema-drift on PG +
     // MSSQL, until_current-terminates-under-load on the three SQL engines) are now
@@ -162,13 +166,15 @@ const MATRICES: &[(&str, usize)] = &[
     // Lowered 20 -> 5 (2026-09-29): Oracle CDC shipped (#324); its live tests fill the cells.
     // Raised 5 -> 6 (2026-10-02): the new failover row's Oracle cell is an honest gap (no Data
     // Guard stand), recorded rather than left out of the matrix.
-    ("docs/cdc-matrix.yaml", 6),
+    // Lowered 6 -> 2 (2026-10-08): Oracle column-add, two-table and open-bound two-run cells; the two Data Guard rows stay (the stand's v$option reports the Data Guard options FALSE).
+    ("docs/cdc-matrix.yaml", 2),
     // Resilience / crash-recovery (BATCH + cross-cutting). Both Mongo holes closed:
     // batch-clobber filled with a live test; crash-after-source-read is na (that
     // hook is single.rs-only, and Mongo runs the keyset path).
     // Raised 0 -> 10 (2026-09-26): the Oracle column's honest gaps (batch-only phase 1).
     // Lowered 10 -> 5 (2026-10-08): five Oracle crash rows cite the every_*_runner_hook_loses_nothing_on_oracle cells that already crash at their hooks.
-    ("docs/resilience-matrix.yaml", 5),
+    // Lowered 5 -> 0 (2026-10-08): Oracle clean-state, rapid-run and keyset two-run cells; assert_no_loss now requires each declared row once.
+    ("docs/resilience-matrix.yaml", 0),
     // Warehouse-load — the resolver + Parquet→warehouse-AUTOLOAD axis, keyed on the 4
     // ExportTarget variants, not source engines. Caught + fixed 3 resolver bugs
     // (SF/DuckDB/CH decimal ceilings). 0 gaps on THAT axis; most cells are offline
@@ -180,7 +186,8 @@ const MATRICES: &[(&str, usize)] = &[
     // Raised 0 -> 5 (2026-09-26): the Oracle column's honest gaps (batch-only phase 1).
     // Lowered 5 -> 4 (2026-09-29): Oracle CDC vanished-anchor proven live.
     // Lowered 4 -> 3 (2026-09-29): Oracle CDC refuses a captured-table TRUNCATE.
-    ("docs/fail-loud-matrix.yaml", 3),
+    // Lowered 3 -> 0 (2026-10-08): Oracle view-under-CDC, sparse-guard and unusable-key cells.
+    ("docs/fail-loud-matrix.yaml", 0),
     // Load-mode write contracts — keyed on the 3 LoadMode variants (full /
     // incremental / cdc), not source engines. Codifies the 4 data bugs found in
     // the load layer (incremental+cleanup loss, full duplicate snapshots, full
@@ -308,7 +315,8 @@ const MATRICES: &[(&str, usize)] = &[
     // resume) is proven on every SQL engine via the Rig stand + a DuckDB manifest oracle;
     // Mongo is `na` (no inline SQL range literal → left whole). 0 gaps.
     // Raised 0 -> 3 (2026-09-26): the Oracle column's honest gaps (batch-only phase 1).
-    ("docs/pool-split-matrix.yaml", 3),
+    // Lowered 3 -> 0 (2026-10-08): the three Oracle split stand cells.
+    ("docs/pool-split-matrix.yaml", 0),
     // CDC per-type value fidelity — the change-stream sibling of type-fidelity, the
     // axis where findings #2 (MSSQL MONEY>2^53), #3 (MySQL ENUM cross-db) and #4
     // (BIT(64) bit 63) lived: batch correct, CDC/edge sibling not. Workhorse cells
@@ -321,7 +329,8 @@ const MATRICES: &[(&str, usize)] = &[
     // Lowered 11 -> 5 (2026-09-30): the Oracle integer/float/decimal/date-time/text/binary
     // cells are graded independently by oracle_batch_and_cdc_deliver_every_ledger_row_alike.
     // Lowered 5 -> 1 (2026-10-08): four Oracle kinds CDC refuses at open are na.
-    ("docs/cdc-type-fidelity-matrix.yaml", 1),
+    // Lowered 1 -> 0 (2026-10-08): the Oracle non-UTC-session cell asserts hard-coded UTC instants.
+    ("docs/cdc-type-fidelity-matrix.yaml", 0),
     // Load spec (ADR-0034) — `load.partition` form × granularity × warehouse target. The
     // BigQuery form cells are live (run + load + tables.get per cell); Snowflake cells are
     // SQL-text proofs (no live Snowflake from this stand); duckdb/clickhouse are `na`. 0 gaps.

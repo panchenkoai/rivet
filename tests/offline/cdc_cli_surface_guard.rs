@@ -251,7 +251,7 @@ fn every_test_cell_cites_a_test_that_exists() {
 /// pre-existing CLI ledgers were not asking. Lower it in the commit that closes one.
 #[test]
 fn cdc_cli_gaps_only_ever_shrink() {
-    const CEILING: usize = 19; // ratchet-pin: cdc-cli-surface-gaps
+    const CEILING: usize = 0; // ratchet-pin: cdc-cli-surface-gaps
     let m = matrix();
     let engines: Vec<String> = m["engines"]
         .as_sequence()
@@ -268,8 +268,8 @@ fn cdc_cli_gaps_only_ever_shrink() {
         }
     }
     let total: usize = gaps.values().map(Vec::len).sum();
-    assert!(
-        total <= CEILING,
+    assert_eq!(
+        total, CEILING,
         "{total} gaps against a ceiling of {CEILING}: {gaps:?}. Adding CLI surface \
          without a test is what this ledger records; raising the ceiling is not an option."
     );

@@ -42,7 +42,7 @@ scenarios:
     mysql:    { test: stand_pool_split_resume_grows_mysql }
     mssql:    { test: stand_pool_split_resume_grows_mssql }
     mongo:    { na: "no inline SQL range literal (inline_literal is unreachable for Mongo) — source_type_supports_split leaves a Mongo giant WHOLE; it fans out via its own keyset/parallel path, never a range split" }
-    oracle:   { gap: "inline_literal / wrap_key_range have Oracle arms, so --split reaches Oracle; no Oracle split stand test" }
+    oracle:   { test: stand_pool_split_resume_grows_oracle }
 
   - id: range_split_junk_gappy_key
     what: "JUNK data (a gappy key: two dense blocks separated by a hole the interior split boundaries fall into, below the sparse floor so the split is not refused). --pool --split, crash, grow, resume — the split survives a gappy key with no gap/dup. Also grows, so it too bites the reconstruct mutant."
@@ -50,7 +50,7 @@ scenarios:
     mysql:    { test: stand_pool_split_gappy_key_mysql }
     mssql:    { test: stand_pool_split_gappy_key_mssql }
     mongo:    { na: "no inline SQL range literal (inline_literal is unreachable for Mongo) — source_type_supports_split leaves a Mongo giant WHOLE; it fans out via its own keyset/parallel path, never a range split" }
-    oracle:   { gap: "no Oracle split-over-gappy-key test" }
+    oracle:   { test: stand_pool_split_gappy_key_oracle }
 
   - id: keyset_split_crash_resume_completes
     what: "chunk_by_key (keyset) IS splittable; the split window is applied at the shared build_plan seam (wrap_key_range) so it composes with the keyset runner. --pool --split, crash a unit (after_keyset_page PANIC — the keyset runner has no chunk_export hook), grow, resume → every original id declared. Proves keyset pool-split works END-TO-END across a crash. Does NOT isolate the finding-2 mutant (single keyset has only panic hooks → no completed survivor to misalign a re-sample); that guarantee is the runner-agnostic reconstruct_* unit tests'."
@@ -58,7 +58,7 @@ scenarios:
     mysql:    { test: stand_pool_split_keyset_recovers_a_crash_mysql }
     mssql:    { test: stand_pool_split_keyset_recovers_a_crash_mssql }
     mongo:    { na: "no inline SQL range literal (inline_literal is unreachable for Mongo) — source_type_supports_split leaves a Mongo giant WHOLE; it fans out via its own keyset/parallel path, never a range split" }
-    oracle:   { gap: "no Oracle keyset split crash/resume test" }
+    oracle:   { test: stand_pool_split_keyset_recovers_a_crash_oracle }
 
   # ── Engine-AGNOSTIC split merge-back / reconstruct guarantees (post-0.24.3 review) ──
   # These operate on the run-unique manifest copies, not per-engine SQL, so every engine cell is

@@ -85,7 +85,7 @@ scenarios:
     mysql:    { test: cdc_non_utc_server_timezone_matches_batch_and_utc_instant, oracle: independent }
     mssql:    { test: mssql_cdc_datetimeoffset_value_is_preserved, oracle: independent, known_defect: ["DATETIMEOFFSET"] }
     mongo:    { na: "BSON dates ride the verbatim document blob" }
-    oracle:   { gap: "no independent Oracle cell: oracle_cdc_non_utc_session_matches_batch (Asia/Tokyo + odd NLS logon trigger) is a DIFFERENTIAL self-oracle (CDC==batch), and the offset-to-UTC unit test stops at decode, before the sink" }
+    oracle:   { test: oracle_cdc_non_utc_session_matches_batch, oracle: independent }
 
   - id: type_text
     what: "varchar/char/text through CDC — value + encoding verbatim"

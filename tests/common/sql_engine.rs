@@ -355,22 +355,22 @@ impl Drop for SecondDatabase {
     }
 }
 
-/// Sorted `(id, time_spent)` of every part under `out`.
+/// Sorted `(id, time_spent)` of every part under `out`; the column names match in either case (Oracle's are upper-case).
 pub fn read_id_spent(out: &Path) -> Vec<(i64, Option<i32>)> {
     let mut rows = Vec::new();
     for b in read_all_parts(out) {
-        let id = b
-            .column_by_name("id")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        let spent = b
-            .column_by_name("time_spent")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
+        let col = |name: &str| {
+            let schema = b.schema();
+            let i = schema
+                .fields()
+                .iter()
+                .position(|f| f.name().eq_ignore_ascii_case(name))
+                .unwrap_or_else(|| panic!("no `{name}` column in {:?}", schema.fields()));
+            b.column(i).clone()
+        };
+        let (id, spent) = (col("id"), col("time_spent"));
+        let id = id.as_any().downcast_ref::<Int64Array>().unwrap();
+        let spent = spent.as_any().downcast_ref::<Int32Array>().unwrap();
         for i in 0..b.num_rows() {
             rows.push((id.value(i), (!spent.is_null(i)).then(|| spent.value(i))));
         }

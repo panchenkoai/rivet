@@ -424,6 +424,7 @@ fn derived_capture_marker_set_is_pinned() {
         // routed around the invoke seam).
         "apply_env(",
         "cli(",
+        "cli_cdc(",
         "cli_cdc_ndjson(",
         "cli_env(",
         "cli_in_dir(",
@@ -940,7 +941,10 @@ const PIN_INDEPENDENT: usize = 113; // ratchet-pin: cdc-census-independent min
 // cap's stop point through `read_cdc_changes(`; -1: the SQL Server case-only refusal test moved to presence.
 // 2026-10-07: +1 shared codec - the PG table-added-mid-stream cell reads the joining table's baseline
 // through `dir_parquet_id_set` (arrow); each run is graded by the default oracle.
-const PIN_SHARED_CODEC: usize = 107; // ratchet-pin: cdc-census-shared-codec
+// 2026-10-08: +6 shared codec - the Oracle column-added, two-table and open-bound two-run cells and the PG `rivet cdc --checkpoint`
+// dropped-slot cell read their parts with arrow against ids the test wrote (the rig oracle grades each run against the source); the Oracle
+// view and pre-ALTER refusals read that nothing was delivered. New `duckdb_*` call sites are closed by the duckdb-helper-sites ratchet.
+const PIN_SHARED_CODEC: usize = 113; // ratchet-pin: cdc-census-shared-codec
 const PIN_SELF_COUNTER: usize = 6; // ratchet-pin: cdc-census-self-counter
 // 2026-09-28: +1 presence — the SQL Server undecodable-cell refusal, whose oracle is the refusal.
 // 2026-09-29: +2 presence — the PG CDC LMT-timezone and DOMAIN parity cells compare CDC to batch output.
