@@ -671,3 +671,50 @@ seeds:
       lib:
         cells:
           - "lib:a_read_only_database_is_refused_as_not_writable_never_as_another_process"
+
+  - name: cdc-refusal-without-a-code
+    class: a CDC stream that cannot continue (unreadable checkpoint, truncated table, log gone past the checkpoint) is refused with exit 1 and no RIVET_* code
+    history: "the 2026-10-07 CLI sweep: 18 known-red cells; a scheduler keyed on the exit class retried a refusal no retry can clear, and MongoDB's error 286 wore the replica-set setup hint"
+    scope: source
+    patch: cdc-refusal-without-a-code/shared.patch
+    engines:
+      postgres:
+        cells:
+          - a_corrupt_cdc_checkpoint_is_refused_by_code_postgres
+          - a_cdc_truncate_is_refused_by_code_postgres
+          - a_dropped_slot_after_a_changes_run_is_refused_by_code_postgres
+      mysql:
+        cells:
+          - a_corrupt_cdc_checkpoint_is_refused_by_code_mysql
+          - a_cdc_truncate_is_refused_by_code_mysql
+      mssql:
+        cells: [a_corrupt_cdc_checkpoint_is_refused_by_code_mssql]
+      mongo:
+        cells:
+          - a_corrupt_cdc_checkpoint_is_refused_by_code_mongo
+          - a_cdc_collection_drop_is_refused_by_code_mongo
+      oracle:
+        cells:
+          - a_corrupt_cdc_checkpoint_is_refused_by_code_oracle
+          - a_cdc_truncate_is_refused_by_code_oracle
+      lib:
+        cells: ["lib:each_failure_class_refuses_with_exit_5_under_its_own_code_and_keeps_its_text"]
+
+  - name: corrupt-checkpoint-remedy-reanchors
+    class: the corrupt-checkpoint refusal prescribes deleting the file, which is refused again under a baseline and skips every change since the checkpoint without one
+    history: "RESULTS 13 of the 2026-10-07 CLI sweep: `delete it to accept a new anchor from a fresh snapshot` on four engines"
+    scope: source
+    patch: corrupt-checkpoint-remedy-reanchors/shared.patch
+    engines:
+      postgres:
+        cells: [a_corrupt_cdc_checkpoint_is_refused_by_code_postgres]
+      mysql:
+        cells: [a_corrupt_cdc_checkpoint_is_refused_by_code_mysql]
+      mssql:
+        cells: [a_corrupt_cdc_checkpoint_is_refused_by_code_mssql]
+      mongo:
+        cells: [a_corrupt_cdc_checkpoint_is_refused_by_code_mongo]
+      oracle:
+        cells: [a_corrupt_cdc_checkpoint_is_refused_by_code_oracle]
+      lib:
+        cells: ["lib:corrupt_checkpoint_fails_loud_not_silently_absent"]

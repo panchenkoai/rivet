@@ -511,7 +511,7 @@ fn resume_force_on(mut rig: Rig) {
 const CHECKPOINT_INVALID: Refused = Refused::by_code("RIVET_SOURCE_CDC_CHECKPOINT_INVALID", 5);
 const TRUNCATED: Refused = Refused::by_code("RIVET_SOURCE_CDC_TRUNCATED", 5);
 
-/// The re-baseline remedy every CDC data-loss refusal ends with, followed as printed.
+/// The re-baseline remedy every CDC data-loss refusal ends with, followed as printed. Last in a walk: it moves the source-side anchor, which no copy of the refused state brings back.
 fn rebaseline<'a>(has_baseline: bool) -> Remedy<'a> {
     Remedy::new(REBASELINE_REMEDY, Then::DeliversTheSource, move |r| {
         apply_rebaseline_remedy(r, has_baseline)
@@ -652,12 +652,8 @@ fn truncate_is_refused_by_code(mut s: CdcScenario, first: impl FnOnce(&mut Rig))
     s.rig.refuses_twice_and_walks_out(
         &["run"],
         &[],
-        TRUNCATED,
+        Refused::by_code("RIVET_SOURCE_CDC_TRUNCATED", 5),
         vec![
-            Remedy::new(REBASELINE_REMEDY, Then::DeliversTheSource, |r| {
-                first(r);
-                apply_rebaseline_remedy(r, false)
-            }),
             Remedy::wrong(
                 "moves the destination's files out and nothing else",
                 Then::Refuses(TRUNCATED),
@@ -667,6 +663,10 @@ fn truncate_is_refused_by_code(mut s: CdcScenario, first: impl FnOnce(&mut Rig))
                     std::fs::create_dir_all(&out).expect("recreate the destination");
                 },
             ),
+            Remedy::new(REBASELINE_REMEDY, Then::DeliversTheSource, |r| {
+                first(r);
+                apply_rebaseline_remedy(r, false)
+            }),
         ],
     )
 }
@@ -677,13 +677,13 @@ fn corrupt_checkpoint_is_refused_by_code(s: CdcScenario, delete_alone: Then) {
     s.rig.refuses_twice_and_walks_out(
         &["run"],
         &[],
-        CHECKPOINT_INVALID,
+        Refused::by_code("RIVET_SOURCE_CDC_CHECKPOINT_INVALID", 5),
         vec![
             Remedy::new("Restore the file", Then::DeliversTheSource, move |r| {
                 std::fs::write(r.checkpoint(), &good).expect("restore the checkpoint")
             }),
-            rebaseline(true),
             deletes_only_the_checkpoint(delete_alone),
+            rebaseline(true),
         ],
     );
 }
@@ -712,10 +712,10 @@ fn pg_dropped_slot_is_refused_by_code(after_a_changes_run: bool) {
     rig.refuses_twice_and_walks_out(
         &["run"],
         &[],
-        Refused::by_code(LOG_GAP, 5),
+        Refused::by_code("RIVET_SOURCE_CDC_LOG_GAP", 5),
         vec![
-            rebaseline(true),
             deletes_only_the_checkpoint(Then::Refuses(Refused::by_code(LOG_GAP, 5))),
+            rebaseline(true),
         ],
     );
 }
@@ -1034,7 +1034,7 @@ fn mongo_oplog_rolled_past_the_checkpoint(after_a_changes_run: bool) {
     );
     follow_rebaseline_remedy(&mut s.rig, true);
     assert_eq!(
-        parquet_rows(&s.rig.out_dir()),
+        parquet_rows(&s.rig.out_dir().join("snapshot")),
         if after_a_changes_run { 3 } else { 2 },
         "the re-baseline run delivered every document the source holds"
     );
@@ -1108,10 +1108,10 @@ fn mysql_binlogs_purged_past_the_checkpoint(after_a_changes_run: bool) {
     rig.refuses_twice_and_walks_out(
         &["run"],
         &[],
-        Refused::by_code(LOG_GAP, 5),
+        Refused::by_code("RIVET_SOURCE_CDC_LOG_GAP", 5),
         vec![
-            rebaseline(true),
             deletes_only_the_checkpoint(Then::Refuses(CHECKPOINT_INVALID)),
+            rebaseline(true),
         ],
     );
 }
