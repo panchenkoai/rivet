@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- **Behaviour change: a table that is empty at its CDC baseline gets an empty warehouse
+  table.** Applies to a `mode: cdc` export with `cdc.backfill:` loaded under
+  `load.layout: base_buffer` (BigQuery), every source engine.
+  - Before, the load consumed the empty baseline as "nothing to load" and created no
+    `<table>`. `rivet compact` passed the table by until its first change was buffered, and
+    from then on refused it on every cycle (`the base table does not exist`; 0.30 and older
+    passed BigQuery's `Not found: Table` through), so the command exited non-zero although
+    every other table was merged. The buffered changes stayed in `<table>__changes`.
+  - Now the load of an empty baseline creates `<table>` empty, with the spec's columns,
+    `__is_deleted`, partition and clustering, and the first change merges into it. A new
+    baseline that holds no row empties an existing base the same way, in every load; before,
+    it did so only when the same load also carried change files.
+  - Upgrading: nothing to do. The first `rivet load` of this version creates the missing
+    table and prints `note: ... does not exist although its baseline was loaded`, and the next
+    `rivet compact` merges every change buffered since the baseline. It does so only when the
+    state DB beside the config recorded exactly one baseline run for the table, with 0 rows,
+    and no compaction ever merged a row into it. A table whose base was dropped by hand after
+    it held rows is still refused by `rivet compact`, as before, and so is one whose state DB
+    does not hold the extract's run records (a load that runs on another host).
+  - `rivet compact` over several tables exits 1 when at least one table failed, names each
+    failed table, and still merges and reports (`COMPACT OK`) the others.
+
 - **Breaking (file names): a single-runner part is named after its run, with the process id
   and a random nonce appended.** Applies to `mode: full`, `mode: incremental` and time-window
   exports that are not chunked, on every source engine, and to MongoDB `parallel` exports.

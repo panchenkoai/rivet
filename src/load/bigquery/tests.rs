@@ -1376,6 +1376,18 @@ fn an_empty_full_load_truncates_an_existing_table_and_creates_a_missing_one() {
 }
 
 #[test]
+fn an_empty_run_says_whether_it_emptied_the_table_or_created_it() {
+    assert_eq!(
+        empty_run_note("p.d.t", true),
+        "  note: the newest run exported 0 rows — `p.d.t` is emptied to match"
+    );
+    assert_eq!(
+        empty_run_note("p.d.t", false),
+        "  note: the newest run exported 0 rows — `p.d.t` is created empty"
+    );
+}
+
+#[test]
 fn a_compaction_with_neither_buffer_nor_leftover_has_nothing_to_merge() {
     assert!(nothing_to_compact(false, false));
     assert!(!nothing_to_compact(true, false), "a live buffer is merged");

@@ -403,7 +403,7 @@ impl TargetLoader for BigQueryLoader {
         let cluster = table_clustering(&self.clustering, existing.as_ref());
         check_cluster_columns(cluster)?;
         if uris.is_empty() {
-            eprintln!("  note: the newest run exported 0 rows — `{target}` is emptied to match");
+            eprintln!("{}", empty_run_note(&target, existing.is_some()));
             let sql = build_empty_table_sql(
                 &target,
                 existing.is_some(),

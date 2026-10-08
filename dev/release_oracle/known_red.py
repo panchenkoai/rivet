@@ -120,13 +120,6 @@ KNOWN_RED: tuple[KnownRed, ...] = (
     KnownRed('upgrade[oracle/cdc-load/tz=Asia/Tokyo]: cycle1/load: prev exit 1: Error: config has no top-level `load:` block',
              "Oracle CDC does not load yet (ADR-0037; the Oracle GA work). The previous release's `rivet init --mode cdc` writes no `load:` block, and this cell still drives the previous release through `load`, which refuses. `upgrade[oracle/cdc-load/init=this]` grades what the scaffold does promise (the baseline Parquet equals the source). The cycle stays unsupported until Oracle CDC loads",
              "2026-10-31"),
-    KnownRed("field[v0.31.0][mysql/empty-at-baseline/bigquery]: empty table — this build's `compact` after the rows arrived: "
-             "exit 1: Error: compact '<table 1>': refusing to compact",
-             "Field defect (the client's deployment): a table EMPTY at baseline gets no base table, the first rows land in "
-             "`<table>__changes`, and `rivet compact` refuses it on every cycle (`the base table does not exist`), failing the "
-             "cycle's exit status. Reproduced from a v0.31.0 state on BigQuery; states of 0.27.0 to 0.30.0 are healed by this "
-             "build's load. The product fix is a separate PR",
-             "2026-10-31"),
     KnownRed('sentinels[rivet_sent_ts9/full]: SUCCEEDED WITH A CHANGED VALUE: `V` differs',
              "Oracle TIMESTAMP(9) is delivered at microseconds today: docs/type-capability-matrix.yaml's oracle TIMESTAMP(9) row is a known_defect (exact native is Timestamp(ns), ADR-0038 CP1, Oracle engine step), so the 1 ns sentinel lands truncated",
              "2026-10-31"),
