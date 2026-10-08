@@ -337,6 +337,17 @@ fn partitioned_preview_note(export: &crate::config::ExportConfig) -> Option<Stri
     })
 }
 
+/// The failure `rivet plan` ends with when its preflight could not read the source: no artifact is sealed.
+fn source_unreadable(export: &str, cause: anyhow::Error) -> anyhow::Error {
+    cause.context(crate::error::CodedError::new(
+        crate::error::codes::PLAN_SOURCE_UNREADABLE,
+        format!(
+            "plan '{export}': the source could not be read, so no plan was written (`rivet apply` \
+             would fail on it)"
+        ),
+    ))
+}
+
 fn build_plan_artifact(
     config: &Config,
     export: &crate::config::ExportConfig,
@@ -364,14 +375,16 @@ fn build_plan_artifact(
         }
     }
 
-    let (computed, plan_diagnostics, hints) = match preflight::get_export_diagnostic(config, export)
-    {
+    let planned = crate::plan::build::export_as_planned(export, &plan.strategy);
+    let (computed, plan_diagnostics, hints) = match preflight::get_export_diagnostic(
+        config, &planned,
+    ) {
         Ok(mut diag) => {
             // #149: measured beats declared — same overlay `check` applies, so
             // the two surfaces quote the same figure with the same label.
             crate::preflight::overlay_measured_rows(
                 &mut diag,
-                export,
+                &planned,
                 config.source.source_type,
                 state,
             );
@@ -419,27 +432,7 @@ fn build_plan_artifact(
             };
             (computed, plan_diagnostics, hints)
         }
-        Err(e) => {
-            log::warn!(
-                "plan '{}': preflight diagnostics failed (continuing without them): {:#}",
-                export.name,
-                e
-            );
-            let computed = compute_plan_data(&plan, None, false, state)?;
-            let mut warnings = vec!["preflight diagnostics unavailable".into()];
-            warnings.extend(validate_warnings);
-            let plan_diagnostics = PlanDiagnostics {
-                verdict: "unknown (preflight failed)".into(),
-                warnings,
-                recommended_profile: "balanced".into(),
-                // No diagnostic to explain from — be honest rather than fabricate
-                // a rationale from config alone (no row estimate / index facts).
-                strategy_rationale: "Strategy rationale unavailable — preflight diagnostics could \
-                     not be collected for this export."
-                    .into(),
-            };
-            (computed, plan_diagnostics, PrioritizationHints::default())
-        }
+        Err(e) => return Err(source_unreadable(&export.name, e)),
     };
 
     let fingerprint = match &plan.strategy {
@@ -2056,5 +2049,26 @@ mod tests {
         // cost until preflight succeeds"), which is the conservative answer;
         // the day count would classify Low.
         assert_eq!(chunked_row_estimate(Some(1095), None, false, true), None);
+    }
+    /// `plan` over a source it cannot read ends with a code, the cause, and the cause's exit class.
+    #[test]
+    fn a_plan_over_an_unreadable_source_fails_by_code_with_the_causes_exit_class() {
+        let missing = super::source_unreadable(
+            "orders",
+            anyhow::anyhow!("preflight: relation \"orders\" does not exist (SQLSTATE 42P01)"),
+        );
+        assert_eq!(
+            format!("{missing:#}"),
+            "plan 'orders': the source could not be read, so no plan was written (`rivet apply` \
+             would fail on it): preflight: relation \"orders\" does not exist (SQLSTATE 42P01)"
+        );
+        assert_eq!(
+            crate::error::error_code(&missing),
+            Some("RIVET_PLAN_SOURCE_UNREADABLE")
+        );
+        assert_eq!(crate::error::classify_exit(&missing), 1);
+        let dropped =
+            super::source_unreadable("orders", anyhow::anyhow!("connection reset by peer"));
+        assert_eq!(crate::error::classify_exit(&dropped), 2);
     }
 }

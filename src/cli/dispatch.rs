@@ -468,6 +468,7 @@ fn dispatch_check(
     if let Some(name) = export.as_deref() {
         check_export_selection(&Config::load_with_params(&config, p.as_ref())?, Some(name))?;
     }
+    let plans = batch_plans(&config, export.as_deref(), p.as_ref())?;
     let type_clean = preflight::check(
         &config,
         export.as_deref(),
@@ -476,6 +477,7 @@ fn dispatch_check(
         strict,
         json,
         tgt,
+        &planned_strategies(&plans),
     )?;
     // Surface plan-validation diagnostics so `check` agrees with `run`/`plan`:
     // a stdout+chunked config is Rejected by all three, not silently passed by
@@ -484,7 +486,7 @@ fn dispatch_check(
     // under `--json` so NDJSON type-report output stays one object per line.
     // This BAILS on a rejection, so the "Looks good" epilogue below only prints
     // when BOTH gates pass — never alongside a "Rejected: …" line (dogfood MED).
-    check_plan_compatibility(&config, export.as_deref(), p.as_ref(), json)?;
+    report_plan_compatibility(plans, json)?;
     if type_clean && !json {
         println!(
             "Looks good. Next: rivet run -c {config} --validate   # export, then verify row counts"
@@ -493,20 +495,15 @@ fn dispatch_check(
     Ok(())
 }
 
-/// Build the resolved plan for each selected export and surface
-/// [`validate_plan`](crate::plan::validate_plan) diagnostics the same way
-/// `rivet plan` does: print every `[rule] message`, and return an error on the
-/// first `Rejected` so `check` exits non-zero on an incompatible combination
-/// (e.g. `[stdout-no-chunked]`). Warnings/Degraded notes print but do not fail.
-fn check_plan_compatibility(
+/// One selected batch export's plan as `rivet run` builds it, or why it did not build.
+type BatchPlan = (String, Result<crate::plan::ResolvedRunPlan>);
+
+/// The plan of every selected export that has a batch plan (a `mode: cdc` export has none), built with the run-only flags off.
+fn batch_plans(
     config_path: &str,
     export_name: Option<&str>,
     params: Option<&std::collections::HashMap<String, String>>,
-    json_output: bool,
-) -> Result<()> {
-    if json_output {
-        return Ok(());
-    }
+) -> Result<Vec<BatchPlan>> {
     let config = Config::load_with_params(config_path, params)?;
     let config_dir = std::path::Path::new(config_path)
         .parent()
@@ -515,32 +512,41 @@ fn check_plan_compatibility(
         Some(name) => config.exports.iter().filter(|e| e.name == name).collect(),
         None => config.exports.iter().collect(),
     };
-    // CDC exports are not plannable — plan/apply is the batch path; CDC runs via
-    // `rivet run`. Skipping them here avoids a misleading "plan did not build"
-    // WARN for a valid `mode: cdc` export (which has `tables:`/`table:`, no query).
-    let selected: Vec<&crate::config::ExportConfig> = selected
+    Ok(selected
         .into_iter()
         .filter(|e| e.mode != crate::config::ExportMode::Cdc)
-        .collect();
+        .map(|e| {
+            let plan = crate::plan::build_plan(&config, e, config_dir, false, false, false, params);
+            (e.name.clone(), plan)
+        })
+        .collect())
+}
+
+/// The strategy of each plan that built, for the preflight to describe.
+fn planned_strategies(plans: &[BatchPlan]) -> preflight::PlannedStrategies {
+    plans
+        .iter()
+        .filter_map(|(name, plan)| Some((name.clone(), plan.as_ref().ok()?.strategy.clone())))
+        .collect()
+}
+
+/// Surface each plan's [`validate_plan`](crate::plan::validate_plan) diagnostics as `rivet plan`
+/// does, and fail on a plan that did not build or on the first `Rejected` (skipped under `--json`).
+fn report_plan_compatibility(plans: Vec<BatchPlan>, json_output: bool) -> Result<()> {
+    if json_output {
+        return Ok(());
+    }
     let mut rejected: Option<String> = None;
-    for export in selected {
-        // `--validate`/`--reconcile`/`--resume` are run-only flags; `check`
-        // builds the plan with them off, matching how `rivet plan` validates.
-        // A plan that does not build cannot run, so it is a blocking finding.
-        let plan =
-            match crate::plan::build_plan(&config, export, config_dir, false, false, false, params)
-            {
-                Ok(plan) => plan,
-                Err(e) => {
-                    let line = format!(
-                        "[plan-build] export '{}': the plan did not build: {e:#}",
-                        export.name
-                    );
-                    println!("Rejected: {line}");
-                    rejected.get_or_insert(line);
-                    continue;
-                }
-            };
+    for (name, plan) in plans {
+        let plan = match plan {
+            Ok(plan) => plan,
+            Err(e) => {
+                let line = format!("[plan-build] export '{name}': the plan did not build: {e:#}");
+                println!("Rejected: {line}");
+                rejected.get_or_insert(line);
+                continue;
+            }
+        };
         for d in crate::plan::validate_plan(&plan) {
             let line = format!("[{}] {}", d.rule, d.message);
             match d.level {
@@ -1046,7 +1052,9 @@ mod check_plan_compatibility_tests {
              \x20   format: parquet\n    destination:\n      type: local\n      path: ./out\n",
         )
         .unwrap();
-        let err = super::check_plan_compatibility(cfg.to_str().unwrap(), None, None, false)
+        let plans = super::batch_plans(cfg.to_str().unwrap(), None, None).unwrap();
+        assert!(super::planned_strategies(&plans).is_empty());
+        let err = super::report_plan_compatibility(plans, false)
             .expect_err("an unbuildable plan must fail `check`");
         let text = format!("{err:#}");
         assert!(
@@ -1162,5 +1170,63 @@ mod subcommand_error_tests {
         assert!(run.is_err(), "run over a missing config succeeded");
         let cdc = dispatch(&["rivet", "cdc", "--source", "nosuch://h/db", "--table", "t"]);
         assert!(cdc.is_err(), "cdc over an unknown scheme succeeded");
+    }
+
+    /// `check` hands the preflight the strategy of every batch plan that built, and none for a CDC stream.
+    #[test]
+    fn check_plans_each_batch_export_once_and_names_its_strategy() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("rivet.yaml");
+        std::fs::write(
+            &cfg,
+            "source:\n  type: postgres\n  url: postgresql://u:p@127.0.0.1:1/db\n\
+             exports:\n\
+             \x20 - name: ranged\n    query: SELECT * FROM t\n    mode: chunked\n    chunk_column: id\n\
+             \x20   format: parquet\n    destination: { type: local, path: ./out/a }\n\
+             \x20 - name: whole\n    query: SELECT * FROM t\n    mode: full\n\
+             \x20   format: parquet\n    destination: { type: local, path: ./out/b }\n\
+             \x20 - name: stream\n    tables: [t]\n    mode: cdc\n\
+             \x20   format: parquet\n    destination: { type: local, path: ./out/c }\n",
+        )
+        .unwrap();
+        let path = cfg.to_str().unwrap();
+        let plans = super::batch_plans(path, None, None).unwrap();
+        let names: Vec<&str> = plans.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["ranged", "whole"]);
+        let strategies = super::planned_strategies(&plans);
+        assert!(matches!(
+            strategies.get("ranged"),
+            Some(crate::plan::ExtractionStrategy::Chunked(c)) if c.column == "id"
+        ));
+        assert!(matches!(
+            strategies.get("whole"),
+            Some(crate::plan::ExtractionStrategy::Snapshot)
+        ));
+        assert!(super::report_plan_compatibility(plans, false).is_ok());
+        let one = super::batch_plans(path, Some("whole"), None).unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].0, "whole");
+    }
+
+    /// `rivet check` ends in an error for a config the planner refuses, before any connection is made.
+    #[test]
+    fn check_fails_on_a_config_the_planner_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("rivet.yaml");
+        std::fs::write(
+            &cfg,
+            "source:\n  type: postgres\n  url: postgresql://u:p@127.0.0.1:1/db\n\
+             exports:\n  - name: orders\n    query: SELECT * FROM orders\n    mode: chunked\n\
+             \x20   chunk_by_key: id\n    format: parquet\n\
+             \x20   destination: { type: local, path: ./out }\n",
+        )
+        .unwrap();
+        let path = cfg.to_str().unwrap().to_string();
+        let err = super::dispatch_check(path, None, vec![], false, false, false, None)
+            .expect_err("a config the planner refuses must fail `check`");
+        assert!(
+            format!("{err:#}").contains("1 export(s) cannot be planned"),
+            "{err:#}"
+        );
     }
 }

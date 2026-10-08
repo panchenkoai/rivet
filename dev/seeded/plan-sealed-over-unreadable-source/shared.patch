@@ -1,0 +1,52 @@
+diff --git a/src/pipeline/plan_cmd.rs b/src/pipeline/plan_cmd.rs
+--- a/src/pipeline/plan_cmd.rs
++++ b/src/pipeline/plan_cmd.rs
+@@ -375,16 +375,14 @@
+         }
+     }
+ 
+-    let planned = crate::plan::build::export_as_planned(export, &plan.strategy);
+-    let (computed, plan_diagnostics, hints) = match preflight::get_export_diagnostic(
+-        config, &planned,
+-    ) {
++    let (computed, plan_diagnostics, hints) = match preflight::get_export_diagnostic(config, export)
++    {
+         Ok(mut diag) => {
+             // #149: measured beats declared — same overlay `check` applies, so
+             // the two surfaces quote the same figure with the same label.
+             crate::preflight::overlay_measured_rows(
+                 &mut diag,
+-                &planned,
++                export,
+                 config.source.source_type,
+                 state,
+             );
+@@ -432,7 +430,27 @@
+             };
+             (computed, plan_diagnostics, hints)
+         }
+-        Err(e) => return Err(source_unreadable(&export.name, e)),
++        Err(e) => {
++            log::warn!(
++                "plan '{}': preflight diagnostics failed (continuing without them): {:#}",
++                export.name,
++                e
++            );
++            let computed = compute_plan_data(&plan, None, false, state)?;
++            let mut warnings = vec!["preflight diagnostics unavailable".into()];
++            warnings.extend(validate_warnings);
++            let plan_diagnostics = PlanDiagnostics {
++                verdict: "unknown (preflight failed)".into(),
++                warnings,
++                recommended_profile: "balanced".into(),
++                // No diagnostic to explain from — be honest rather than fabricate
++                // a rationale from config alone (no row estimate / index facts).
++                strategy_rationale: "Strategy rationale unavailable — preflight diagnostics could \
++                     not be collected for this export."
++                    .into(),
++            };
++            (computed, plan_diagnostics, PrioritizationHints::default())
++        }
+     };
+ 
+     let fingerprint = match &plan.strategy {

@@ -694,3 +694,72 @@ seeds:
       lib:
         cells:
           - "lib:a_read_only_database_is_refused_as_not_writable_never_as_another_process"
+
+  - name: plan-sealed-over-unreadable-source
+    class: a preflight command exits 0 and seals its artifact over a source it could not read
+    history: "`rivet plan` over a missing table or a rejected login printed a WARN, exited 0 and wrote a plan `apply` then failed on (CLI sweep 10, 2026-10-07); on MongoDB the preflight did not ask whether the collection exists"
+    scope: source
+    patch: plan-sealed-over-unreadable-source/shared.patch
+    engines:
+      postgres:
+        cells:
+          - plan_refuses_a_table_that_does_not_exist_postgres
+          - plan_refuses_a_password_the_source_rejects_postgres
+      mysql:
+        cells:
+          - plan_refuses_a_table_that_does_not_exist_mysql
+          - plan_refuses_a_password_the_source_rejects_mysql
+      mssql:
+        cells:
+          - plan_refuses_a_table_that_does_not_exist_mssql
+          - plan_refuses_a_password_the_source_rejects_mssql
+      mongo:
+        patch: plan-sealed-over-unreadable-source/mongo.patch
+        cells:
+          - plan_refuses_a_collection_that_does_not_exist_mongo
+          - check_refuses_a_collection_that_does_not_exist_as_run_does_mongo
+      oracle:
+        cells:
+          - plan_refuses_a_table_that_does_not_exist_oracle
+          - plan_refuses_a_password_the_source_rejects_oracle
+
+  - name: missing-bucket-read-as-no-manifest
+    class: a 404 on an object is read as "the object is absent" when the bucket or container itself does not exist
+    history: "`rivet validate` on a bucket that does not exist reported `legacy_run` and exited 0 on S3, GCS and Azure (CLI sweep 5, 2026-10-07)"
+    scope: source
+    patch: missing-bucket-read-as-no-manifest/shared.patch
+    engines:
+      postgres:
+        cells:
+          - validate_fails_on_a_missing_bucket_s3
+          - validate_fails_on_a_missing_bucket_gcs
+          - validate_fails_on_a_missing_bucket_azure
+      mysql:
+        na: "`validate` reads the destination only: the MinIO, fake-gcs and Azurite cells are listed under postgres, and no source engine is involved"
+      mssql:
+        na: "`validate` reads the destination only: the MinIO, fake-gcs and Azurite cells are listed under postgres, and no source engine is involved"
+      mongo:
+        na: "`validate` reads the destination only: the MinIO, fake-gcs and Azurite cells are listed under postgres, and no source engine is involved"
+      oracle:
+        na: "`validate` reads the destination only: the MinIO, fake-gcs and Azurite cells are listed under postgres, and no source engine is involved"
+      lib:
+        cells: ["lib:head_refuses_a_missing_container_and_reads_a_missing_key_as_absent"]
+
+  - name: check-describes-the-config-not-the-plan
+    class: a preflight command describes a strategy derived from the config instead of the plan the runner builds
+    history: "`rivet check` printed `Strategy: chunked(id, size=100000)` and `column: ?` for a `mode: chunked` export the run executed as one unchunked pass (CLI sweep 20, 2026-10-07)"
+    scope: source
+    patch: check-describes-the-config-not-the-plan/shared.patch
+    engines:
+      postgres:
+        cells: [check_names_the_strategy_run_uses_for_chunked_with_no_column_postgres]
+      mysql:
+        cells: [check_names_the_strategy_run_uses_for_chunked_with_no_column_mysql]
+      mssql:
+        cells: [check_names_the_strategy_run_uses_for_chunked_with_no_column_mssql]
+      mongo:
+        na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes), so the planner resolves nothing a `mode: chunked` description could differ from"
+      oracle:
+        cells: [check_names_the_strategy_run_uses_for_chunked_with_no_column_oracle]
+      lib:
+        cells: ["lib:check_describes_the_export_the_planner_resolved"]

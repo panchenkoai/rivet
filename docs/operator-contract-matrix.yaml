@@ -73,12 +73,28 @@ scenarios:
     oracle:   { test: open_defect_a_second_run_beside_a_live_checkpointed_run_is_refused_by_code_oracle }
 
   - id: plan_unreadable_source
-    what: "RESULTS 10: `plan` over a table that does not exist fails and seals no artifact"
-    postgres: { test: open_defect_plan_fails_over_a_table_that_does_not_exist_postgres }
-    mysql:    { test: open_defect_plan_fails_over_a_table_that_does_not_exist_mysql }
-    mssql:    { test: open_defect_plan_fails_over_a_table_that_does_not_exist_mssql }
-    mongo:    { test: open_defect_plan_fails_over_a_collection_that_does_not_exist_mongo }
-    oracle:   { test: open_defect_plan_fails_over_a_table_that_does_not_exist_oracle }
+    what: "RESULTS 10: `plan` over a table that does not exist fails as RIVET_PLAN_SOURCE_UNREADABLE (exit 1) and seals no artifact"
+    postgres: { test: plan_refuses_a_table_that_does_not_exist_postgres }
+    mysql:    { test: plan_refuses_a_table_that_does_not_exist_mysql }
+    mssql:    { test: plan_refuses_a_table_that_does_not_exist_mssql }
+    mongo:    { test: plan_refuses_a_collection_that_does_not_exist_mongo }
+    oracle:   { test: plan_refuses_a_table_that_does_not_exist_oracle }
+
+  - id: plan_wrong_password
+    what: "RESULTS 10 (hand sweep): `plan` with a password the source rejects fails as RIVET_PLAN_SOURCE_UNREADABLE (exit 1) and seals no artifact"
+    postgres: { test: plan_refuses_a_password_the_source_rejects_postgres }
+    mysql:    { test: plan_refuses_a_password_the_source_rejects_mysql }
+    mssql:    { test: plan_refuses_a_password_the_source_rejects_mssql }
+    mongo:    { na: "the stand's MongoDB runs without access control, so it has no password to reject; the code path is the one plan_refuses_a_collection_that_does_not_exist_mongo takes (the preflight's error)" }
+    oracle:   { test: plan_refuses_a_password_the_source_rejects_oracle }
+
+  - id: check_refuses_what_run_refuses_missing_collection
+    what: "`check` fails as RIVET_SOURCE_COLLECTION_NOT_FOUND (exit 1) over a MongoDB collection that does not exist, which `run` refuses"
+    postgres: { na: "a missing SQL table already failed `check` (the preflight's schema error); the absent-collection guard is MongoDB's" }
+    mysql:    { na: "a missing SQL table already failed `check` (the preflight's schema error); the absent-collection guard is MongoDB's" }
+    mssql:    { na: "a missing SQL table already failed `check` (the preflight's schema error); the absent-collection guard is MongoDB's" }
+    mongo:    { test: check_refuses_a_collection_that_does_not_exist_as_run_does_mongo }
+    oracle:   { na: "a missing SQL table already failed `check` (the preflight's schema error); the absent-collection guard is MongoDB's" }
 
   - id: unusable_state_url
     what: "RESULTS 9: a `RIVET_STATE_URL` rivet cannot use is refused (RIVET_STATE_URL_SCHEME_UNSUPPORTED, exit 1); unsetting it runs on SQLite, and the corrected URL runs on PostgreSQL state (the postgres cell, which has the state server)"
@@ -153,24 +169,48 @@ scenarios:
     oracle:   { na: "`page_size` and the heterogeneous-`_id` guard are MongoDB's" }
 
   - id: validate_missing_bucket_s3
-    what: "RESULTS 5: `validate` on a bucket that does not exist fails (s3)"
-    postgres: { test: open_defect_validate_fails_on_a_missing_bucket_s3 }
+    what: "RESULTS 5: `validate` on a bucket that does not exist cannot verify: exit 1, RIVET_VERIFY_MANIFEST_READ_ERROR naming the bucket (s3)"
+    postgres: { test: validate_fails_on_a_missing_bucket_s3 }
     mysql:    { na: "`validate` reads the destination only (MinIO, fake-gcs and Azurite cells under postgres); no source engine is involved" }
     mssql:    { na: "`validate` reads the destination only (MinIO, fake-gcs and Azurite cells under postgres); no source engine is involved" }
     mongo:    { na: "`validate` reads the destination only (MinIO, fake-gcs and Azurite cells under postgres); no source engine is involved" }
     oracle:   { na: "`validate` reads the destination only (MinIO, fake-gcs and Azurite cells under postgres); no source engine is involved" }
 
   - id: validate_missing_bucket_gcs
-    what: "RESULTS 5: `validate` on a bucket that does not exist fails (gcs)"
-    postgres: { test: open_defect_validate_fails_on_a_missing_bucket_gcs }
+    what: "RESULTS 5: `validate` on a bucket that does not exist cannot verify: exit 1, RIVET_VERIFY_MANIFEST_READ_ERROR naming the bucket (gcs)"
+    postgres: { test: validate_fails_on_a_missing_bucket_gcs }
     mysql:    { na: "`validate` reads the destination only (MinIO, fake-gcs and Azurite cells under postgres); no source engine is involved" }
     mssql:    { na: "`validate` reads the destination only (MinIO, fake-gcs and Azurite cells under postgres); no source engine is involved" }
     mongo:    { na: "`validate` reads the destination only (MinIO, fake-gcs and Azurite cells under postgres); no source engine is involved" }
     oracle:   { na: "`validate` reads the destination only (MinIO, fake-gcs and Azurite cells under postgres); no source engine is involved" }
 
   - id: validate_missing_bucket_azure
-    what: "RESULTS 5: `validate` on a bucket that does not exist fails (azure)"
-    postgres: { test: open_defect_validate_fails_on_a_missing_bucket_azure }
+    what: "RESULTS 5: `validate` on a bucket that does not exist cannot verify: exit 1, RIVET_VERIFY_MANIFEST_READ_ERROR naming the bucket (azure)"
+    postgres: { test: validate_fails_on_a_missing_bucket_azure }
+    mysql:    { na: "`validate` reads the destination only (MinIO, fake-gcs and Azurite cells under postgres); no source engine is involved" }
+    mssql:    { na: "`validate` reads the destination only (MinIO, fake-gcs and Azurite cells under postgres); no source engine is involved" }
+    mongo:    { na: "`validate` reads the destination only (MinIO, fake-gcs and Azurite cells under postgres); no source engine is involved" }
+    oracle:   { na: "`validate` reads the destination only (MinIO, fake-gcs and Azurite cells under postgres); no source engine is involved" }
+
+  - id: validate_empty_prefix_s3
+    what: "the neighbour of RESULTS 5: `validate` on an empty prefix of a bucket that exists is still `legacy_run`, exit 0 (s3)"
+    postgres: { test: validate_reads_an_empty_prefix_of_an_existing_bucket_as_legacy_s3 }
+    mysql:    { na: "`validate` reads the destination only (MinIO, fake-gcs and Azurite cells under postgres); no source engine is involved" }
+    mssql:    { na: "`validate` reads the destination only (MinIO, fake-gcs and Azurite cells under postgres); no source engine is involved" }
+    mongo:    { na: "`validate` reads the destination only (MinIO, fake-gcs and Azurite cells under postgres); no source engine is involved" }
+    oracle:   { na: "`validate` reads the destination only (MinIO, fake-gcs and Azurite cells under postgres); no source engine is involved" }
+
+  - id: validate_empty_prefix_gcs
+    what: "the neighbour of RESULTS 5: `validate` on an empty prefix of a bucket that exists is still `legacy_run`, exit 0 (gcs)"
+    postgres: { test: validate_reads_an_empty_prefix_of_an_existing_bucket_as_legacy_gcs }
+    mysql:    { na: "`validate` reads the destination only (MinIO, fake-gcs and Azurite cells under postgres); no source engine is involved" }
+    mssql:    { na: "`validate` reads the destination only (MinIO, fake-gcs and Azurite cells under postgres); no source engine is involved" }
+    mongo:    { na: "`validate` reads the destination only (MinIO, fake-gcs and Azurite cells under postgres); no source engine is involved" }
+    oracle:   { na: "`validate` reads the destination only (MinIO, fake-gcs and Azurite cells under postgres); no source engine is involved" }
+
+  - id: validate_empty_prefix_azure
+    what: "the neighbour of RESULTS 5: `validate` on an empty prefix of a bucket that exists is still `legacy_run`, exit 0 (azure)"
+    postgres: { test: validate_reads_an_empty_prefix_of_an_existing_bucket_as_legacy_azure }
     mysql:    { na: "`validate` reads the destination only (MinIO, fake-gcs and Azurite cells under postgres); no source engine is involved" }
     mssql:    { na: "`validate` reads the destination only (MinIO, fake-gcs and Azurite cells under postgres); no source engine is involved" }
     mongo:    { na: "`validate` reads the destination only (MinIO, fake-gcs and Azurite cells under postgres); no source engine is involved" }
@@ -226,11 +266,11 @@ scenarios:
 
   - id: check_names_the_strategy_run_uses
     what: "RESULTS 20: `check` names the strategy `run` uses for `mode: chunked` with no chunk column"
-    postgres: { test: open_defect_check_names_the_strategy_run_uses_for_chunked_with_no_column_postgres }
-    mysql:    { test: open_defect_check_names_the_strategy_run_uses_for_chunked_with_no_column_mysql }
-    mssql:    { test: open_defect_check_names_the_strategy_run_uses_for_chunked_with_no_column_mssql }
+    postgres: { test: check_names_the_strategy_run_uses_for_chunked_with_no_column_postgres }
+    mysql:    { test: check_names_the_strategy_run_uses_for_chunked_with_no_column_mysql }
+    mssql:    { test: check_names_the_strategy_run_uses_for_chunked_with_no_column_mssql }
     mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only; any other mode is refused when the config is read (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED)" }
-    oracle:   { test: open_defect_check_names_the_strategy_run_uses_for_chunked_with_no_column_oracle }
+    oracle:   { test: check_names_the_strategy_run_uses_for_chunked_with_no_column_oracle }
 
   - id: standby_refusal_leaves_nothing
     what: "RESULTS 15 (standby twin): a bounded CDC run refused on a PostgreSQL standby leaves no slot, baseline or cdc_snapshot row, and `point at the primary` then runs"

@@ -383,6 +383,13 @@ exclude_re = [
     # audit_preflight_table + the check scenarios (cli/blessed-flow). The overlay
     # DECISIONS are unit-tested in overlay_measured_rows.
     "replace check -> Result<bool> with Ok",
+    # MongoSession::require_collection lists the database's collections: it needs
+    # a live MongoDB, so its whole-fn `Ok(())` stub is unkillable under `--lib
+    # --bins`. Its DECISION is unit-tested (missing_collection_refusal). Stub
+    # proven live-killed 2026-10-08 (stub applied, cells run, source restored):
+    # it fails plan_refuses_a_collection_that_does_not_exist_mongo and
+    # check_refuses_a_collection_that_does_not_exist_as_run_does_mongo.
+    "replace MongoSession::require_collection -> Result<\\(\\)> with Ok\\(\\(\\)\\)",
     # NOTE the `$`: cargo-mutants names a mutant `<path>:<line>:<col>: <what> in
     # <fn>`, so an UNANCHORED `in check` also matches every `check_*` function.
     # Written without it, this entry removed 13 further mutants in six unrelated

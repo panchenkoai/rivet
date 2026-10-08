@@ -1,7 +1,8 @@
 //! A password written in a keyword/value connection string (libpq DSN, ADO, `;`-separated
 //! JDBC properties) reaches no sink: stdout, stderr, `--json-errors`, the state DB,
-//! `plan.json`, the run reports. Every command here fails before a server answers, so
-//! no stand is needed; the succeeding path is `tests/live/sec_keyword_value_credentials.rs`.
+//! the run reports. Every command here fails before a server answers, so no stand is
+//! needed; the succeeding path, `plan.json` included (a plan is written only over a source
+//! that answered), is `tests/live/sec_keyword_value_credentials.rs`.
 
 use std::path::Path;
 
@@ -207,7 +208,7 @@ fn a_keyword_value_password_reaches_no_sink_on_any_engine() {
                 "doctor: stdout",
                 "doctor --json: stdout",
                 "run --json-errors: stderr",
-                "plan.json",
+                "plan: stderr",
                 ".rivet_state.db:export_metrics",
                 ".rivet_state.db:run_journal",
             ] {

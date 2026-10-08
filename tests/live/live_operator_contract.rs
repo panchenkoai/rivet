@@ -113,6 +113,16 @@ fn unreachable(url: &str) -> String {
     format!("{scheme}://{user}127.0.0.1:9/{path}")
 }
 
+/// The MinIO credentials a rig's S3 destination reads.
+const MINIO_ENV: &[(&str, &str)] = &[
+    ("RIVET_TEST_MINIO_AK", MINIO_ACCESS_KEY),
+    ("RIVET_TEST_MINIO_SK", MINIO_SECRET_KEY),
+    ("AWS_EC2_METADATA_DISABLED", "true"),
+];
+
+/// A bucket the empty-prefix cells create and never write to.
+const EMPTY_PREFIX_BUCKET: &str = "oc-emptyprefix";
+
 const RANGE_CHECKPOINT: &[&str] = &[
     "chunk_column: id",
     "chunk_size: 5",
@@ -432,18 +442,39 @@ fn two_full_runs(rig: Rig, N: i64, after_ms: u64) {
     );
 }
 
-/// RESULTS 5: `validate` on a bucket that does not exist does not exit 0.
+/// RESULTS 5: `validate` on a bucket that does not exist cannot verify (exit 1) and names the missing bucket.
 fn validate_on_a_missing_bucket(rig: Rig, envs: &[(&str, &str)]) {
     let out = rig.cli_env(&["validate"], envs);
+    let said = text(&out);
     assert!(
         !out.status.success(),
-        "`validate` on a bucket that does not exist exited 0{}\n{}",
-        if text(&out).contains("legacy_run") {
+        "`validate` on a bucket that does not exist exited 0{}\n{said}",
+        if said.contains("legacy_run") {
             " with `status: legacy_run`"
         } else {
             ""
         },
-        text(&out)
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "could-not-verify is exit 1\n{said}"
+    );
+    assert!(
+        said.contains("[RIVET_VERIFY_MANIFEST_READ_ERROR]")
+            && said.contains("the bucket or container does not exist")
+            && !said.contains("legacy_run"),
+        "the verdict names the missing bucket under its verify code\n{said}"
+    );
+}
+
+/// The neighbour of [`validate_on_a_missing_bucket`]: an empty prefix of a bucket that exists is still a legacy prefix, exit 0.
+fn validate_on_an_empty_prefix(rig: Rig, envs: &[(&str, &str)]) {
+    let out = rig.cli_env(&["validate"], envs);
+    let said = text(&out);
+    assert!(
+        out.status.success() && said.contains("legacy_run"),
+        "`validate` on an empty prefix of an existing bucket is `legacy_run`, exit 0\n{said}"
     );
 }
 
@@ -709,13 +740,31 @@ impl Drop for PgCdcTable {
 
 // (e) advice parity
 
-/// RESULTS 10: `plan` over a table that does not exist fails and seals no artifact.
+const PLAN_UNREADABLE: &str = "RIVET_PLAN_SOURCE_UNREADABLE";
+
+/// RESULTS 10: `plan` over a table that does not exist fails by code and seals no artifact.
 fn plan_on_a_missing_table(engine: SqlEngine) {
     engine.alive();
-    plan_on_a_missing_table_on(engine.rig(&unique_name("oc_absent")));
+    plan_on_an_unreadable_source(engine.rig(&unique_name("oc_absent")), 1);
 }
 
-fn plan_on_a_missing_table_on(rig: Rig) {
+/// RESULTS 10 (hand sweep): `plan` with a password the source refuses fails by code and seals no artifact.
+fn plan_with_a_wrong_password(engine: SqlEngine) {
+    let (table, _guard) = id_v_table(engine, "oc_planpw", 3);
+    let url = with_password(engine.url(), "not_the_password");
+    plan_on_an_unreadable_source(engine.rig(&table).source_url(&url), 1);
+}
+
+/// `url` with its password replaced.
+fn with_password(url: &str, password: &str) -> String {
+    let (scheme, rest) = url.split_once("://").expect("a URL");
+    let (userinfo, host) = rest.rsplit_once('@').expect("a URL with credentials");
+    let user = userinfo.split_once(':').map_or(userinfo, |(u, _)| u);
+    format!("{scheme}://{user}:{password}@{host}")
+}
+
+/// `plan` over a source it cannot read ends as `RIVET_PLAN_SOURCE_UNREADABLE` with exit `exit`, and writes no plan file.
+fn plan_on_an_unreadable_source(rig: Rig, exit: i32) {
     let dir = tempfile::tempdir().unwrap();
     let plan = dir.path().join("plan.json");
     let out = rig.plan_json_env(&plan, &[], &[]);
@@ -732,6 +781,7 @@ fn plan_on_a_missing_table_on(rig: Rig) {
         },
         text(&out)
     );
+    assert_refused(&out, Refused::by_code(PLAN_UNREADABLE, exit));
 }
 
 /// Mac report E: `doctor` is not green for a CDC export on a server whose `wal_level` the run refuses.
@@ -1124,19 +1174,57 @@ fn init_batch_config_runs(engine: SqlEngine, mode: &str) {
 /// RESULTS 20: `check` names the strategy `run` then uses for `mode: chunked` with no chunk column.
 fn check_names_the_strategy_run_uses(engine: SqlEngine) {
     let (table, _guard) = range_table(engine, "oc_nochunk", ROWS);
-    let rig = engine.rig(&table).mode("chunked");
+    // The table fits one default chunk: the planner may run it as one unchunked pass.
+    let (check, chunk_parts) = check_then_run(engine.rig(&table).mode("chunked"));
+    assert_eq!(
+        check.contains("Strategy: chunked("),
+        chunk_parts > 0,
+        "`check` said `Strategy: chunked` and `run` exported {ROWS} rows as one unchunked part, or the reverse ({chunk_parts} chunk part(s))\n{check}"
+    );
+    assert!(
+        !check.contains("column: ?"),
+        "`check` names the column the run ranges on\n{check}"
+    );
+    // Eight chunks of five rows: the planner range-chunks on the primary key it resolved.
+    let (check, chunk_parts) = check_then_run(
+        engine
+            .rig(&table)
+            .mode("chunked")
+            .export_line("chunk_size: 5"),
+    );
+    let key = check
+        .split_once("Strategy: chunked(")
+        .and_then(|(_, rest)| rest.split_once(", size=5)"))
+        .map(|(key, _)| key.to_string())
+        .unwrap_or_default();
+    assert!(
+        key.eq_ignore_ascii_case("id")
+            && check.contains(&format!("Mode: chunked (column: {key}, size: 5)")),
+        "`check` names the range chunking the run uses, on the primary key, in both lines\n{check}"
+    );
+    assert_eq!(chunk_parts, 8, "the run writes one part per chunk of five");
+}
+
+/// What `check` printed for `rig`, then how many range-chunk parts its `run` wrote (0 for one unchunked pass).
+fn check_then_run(rig: Rig) -> (String, usize) {
     let check = text(&rig.cli(&["check"]));
-    let run = rig.run();
-    let ran = text(&run);
-    assert!(run.status.success(), "fixture: the export runs\n{ran}");
-    let chunked_parts = files_below(&rig.out_dir())
+    rig.run_ok();
+    let parts: Vec<String> = files_below(&rig.out_dir())
         .iter()
         .filter(|p| p.extension().is_some_and(|e| e == "parquet"))
-        .count();
-    assert!(
-        !check.contains("Strategy: chunked") || chunked_parts > 1,
-        "`check` said `Strategy: chunked` and `run` exported {ROWS} rows as one unchunked part\n--- check ---\n{check}\n--- run ---\n{ran}"
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        parquet_rows(&rig.out_dir()),
+        ROWS as usize,
+        "fixture: the run delivers the table"
     );
+    let chunk_parts = parts.iter().filter(|n| n.contains("_chunk")).count();
+    assert!(
+        chunk_parts == 0 || chunk_parts == parts.len(),
+        "a run is range-chunked or it is not: {parts:?}"
+    );
+    (check, chunk_parts)
 }
 
 /// RESULTS 15 (standby twin): a bounded CDC run refused on a PostgreSQL standby leaves nothing, and pointing at the primary then runs.
@@ -1376,28 +1464,53 @@ fn open_defect_a_second_run_beside_a_live_checkpointed_run_is_refused_by_code_ms
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose postgres; open defect (plan green over an unreadable source), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_plan_fails_over_a_table_that_does_not_exist_postgres() {
+#[ignore = "live: requires docker compose postgres"]
+fn plan_refuses_a_table_that_does_not_exist_postgres() {
     plan_on_a_missing_table(SqlEngine::Pg);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mysql; open defect (plan green over an unreadable source), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_plan_fails_over_a_table_that_does_not_exist_mysql() {
+#[ignore = "live: requires docker compose postgres"]
+fn plan_refuses_a_password_the_source_rejects_postgres() {
+    plan_with_a_wrong_password(SqlEngine::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn plan_refuses_a_table_that_does_not_exist_mysql() {
     plan_on_a_missing_table(SqlEngine::Mysql);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mssql; open defect (plan green over an unreadable source), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_plan_fails_over_a_table_that_does_not_exist_mssql() {
+#[ignore = "live: requires docker compose mysql"]
+fn plan_refuses_a_password_the_source_rejects_mysql() {
+    plan_with_a_wrong_password(SqlEngine::Mysql);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn plan_refuses_a_table_that_does_not_exist_mssql() {
     plan_on_a_missing_table(SqlEngine::Mssql);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn plan_refuses_a_password_the_source_rejects_mssql() {
+    plan_with_a_wrong_password(SqlEngine::Mssql);
 }
 
 #[cfg(feature = "oracle")]
 #[test]
-#[ignore = "live+gate-only: docker compose oracle; open defect (plan green over an unreadable source), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_plan_fails_over_a_table_that_does_not_exist_oracle() {
+#[ignore = "live: requires docker compose oracle"]
+fn plan_refuses_a_table_that_does_not_exist_oracle() {
     plan_on_a_missing_table(SqlEngine::Oracle);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn plan_refuses_a_password_the_source_rejects_oracle() {
+    plan_with_a_wrong_password(SqlEngine::Oracle);
 }
 
 #[test]
@@ -1526,27 +1639,32 @@ fn open_defect_a_run_that_never_connected_keeps_the_export_complete_mongo() {
 }
 
 #[test]
-#[ignore = "live+gate-only: minio; open defect (validate green on a missing bucket), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_validate_fails_on_a_missing_bucket_s3() {
+#[ignore = "live: requires docker compose minio"]
+fn validate_fails_on_a_missing_bucket_s3() {
     require_alive(LiveService::Minio);
     let rig = Rig::pg_batch("oc_nobucket").dest_s3(
         &unique_name("oc-nobucket").replace('_', "-"),
         "p",
         MINIO_ENDPOINT,
     );
-    validate_on_a_missing_bucket(
-        rig,
-        &[
-            ("RIVET_TEST_MINIO_AK", MINIO_ACCESS_KEY),
-            ("RIVET_TEST_MINIO_SK", MINIO_SECRET_KEY),
-            ("AWS_EC2_METADATA_DISABLED", "true"),
-        ],
-    );
+    validate_on_a_missing_bucket(rig, MINIO_ENV);
 }
 
 #[test]
-#[ignore = "live+gate-only: fake-gcs; open defect (validate green on a missing bucket), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_validate_fails_on_a_missing_bucket_gcs() {
+#[ignore = "live: requires docker compose minio"]
+fn validate_reads_an_empty_prefix_of_an_existing_bucket_as_legacy_s3() {
+    ensure_minio_bucket(EMPTY_PREFIX_BUCKET);
+    let rig = Rig::pg_batch("oc_emptyprefix").dest_s3(
+        EMPTY_PREFIX_BUCKET,
+        &unique_name("p"),
+        MINIO_ENDPOINT,
+    );
+    validate_on_an_empty_prefix(rig, MINIO_ENV);
+}
+
+#[test]
+#[ignore = "live: requires docker compose fake-gcs"]
+fn validate_fails_on_a_missing_bucket_gcs() {
     require_alive(LiveService::FakeGcs);
     validate_on_a_missing_bucket(
         Rig::pg_batch("oc_nobucket").dest_gcs(&unique_name("oc_nobucket"), "p", FAKE_GCS_ENDPOINT),
@@ -1555,12 +1673,32 @@ fn open_defect_validate_fails_on_a_missing_bucket_gcs() {
 }
 
 #[test]
-#[ignore = "live+gate-only: azurite; open defect (validate green on a missing bucket), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_validate_fails_on_a_missing_bucket_azure() {
+#[ignore = "live: requires docker compose fake-gcs"]
+fn validate_reads_an_empty_prefix_of_an_existing_bucket_as_legacy_gcs() {
+    ensure_gcs_bucket(EMPTY_PREFIX_BUCKET);
+    let rig = Rig::pg_batch("oc_emptyprefix").dest_gcs(
+        EMPTY_PREFIX_BUCKET,
+        &unique_name("p"),
+        FAKE_GCS_ENDPOINT,
+    );
+    validate_on_an_empty_prefix(rig, &[]);
+}
+
+#[test]
+#[ignore = "live: requires docker compose azurite"]
+fn validate_fails_on_a_missing_bucket_azure() {
     require_alive(LiveService::Azurite);
     let rig =
         Rig::pg_batch("oc_nobucket").dest_azure(&unique_name("oc-nobucket").replace('_', "-"), "p");
     validate_on_a_missing_bucket(rig, &[("RIVET_TEST_AZURITE_KEY", AZURITE_KEY)]);
+}
+
+#[test]
+#[ignore = "live: requires docker compose azurite"]
+fn validate_reads_an_empty_prefix_of_an_existing_bucket_as_legacy_azure() {
+    ensure_azure_container(EMPTY_PREFIX_BUCKET);
+    let rig = Rig::pg_batch("oc_emptyprefix").dest_azure(EMPTY_PREFIX_BUCKET, &unique_name("p"));
+    validate_on_an_empty_prefix(rig, &[("RIVET_TEST_AZURITE_KEY", AZURITE_KEY)]);
 }
 
 #[cfg(feature = "oracle")]
@@ -1624,10 +1762,38 @@ fn open_defect_a_second_run_beside_a_live_resumable_run_is_refused_by_code_mongo
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose up -d mongo; open defect (plan green over an unreadable source), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_plan_fails_over_a_collection_that_does_not_exist_mongo() {
+#[ignore = "live: requires docker compose up -d mongo"]
+fn plan_refuses_a_collection_that_does_not_exist_mongo() {
     let (url, _m, _guard) = mongo_db("oc_plan", 1);
-    plan_on_a_missing_table_on(Rig::mongo_batch("absent").source_url(&url));
+    plan_on_an_unreadable_source(Rig::mongo_batch("absent").source_url(&url), 1);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mongo"]
+fn check_refuses_a_collection_that_does_not_exist_as_run_does_mongo() {
+    let (url, _m, _guard) = mongo_db("oc_checkabsent", 1);
+    let rig = Rig::mongo_batch("absent").source_url(&url);
+    let (check, run) = (rig.cli(&["check"]), rig.run());
+    let refusal = "does not exist — an export of it would succeed with 0 rows";
+    assert!(
+        !check.status.success() && text(&check).contains(refusal),
+        "`check` is not green over a collection `run` refuses\n{}",
+        text(&check)
+    );
+    assert_refused(
+        &check,
+        Refused::by_code("RIVET_SOURCE_COLLECTION_NOT_FOUND", 1),
+    );
+    assert!(
+        !run.status.success() && text(&run).contains(refusal),
+        "fixture: `run` refuses the absent collection\n{}",
+        text(&run)
+    );
+    let present = Rig::mongo_batch("t").source_url(&url);
+    assert!(
+        present.cli(&["check"]).status.success(),
+        "`check` stays green over a collection that exists"
+    );
 }
 
 #[test]
@@ -1989,27 +2155,27 @@ fn open_defect_the_config_init_writes_runs_cdc_on_a_standby_postgres() {
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose postgres; open defect (check names a strategy run does not use), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_check_names_the_strategy_run_uses_for_chunked_with_no_column_postgres() {
+#[ignore = "live: requires docker compose postgres"]
+fn check_names_the_strategy_run_uses_for_chunked_with_no_column_postgres() {
     check_names_the_strategy_run_uses(SqlEngine::Pg);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mysql; open defect (check names a strategy run does not use), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_check_names_the_strategy_run_uses_for_chunked_with_no_column_mysql() {
+#[ignore = "live: requires docker compose mysql"]
+fn check_names_the_strategy_run_uses_for_chunked_with_no_column_mysql() {
     check_names_the_strategy_run_uses(SqlEngine::Mysql);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mssql; open defect (check names a strategy run does not use), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_check_names_the_strategy_run_uses_for_chunked_with_no_column_mssql() {
+#[ignore = "live: requires docker compose mssql"]
+fn check_names_the_strategy_run_uses_for_chunked_with_no_column_mssql() {
     check_names_the_strategy_run_uses(SqlEngine::Mssql);
 }
 
 #[cfg(feature = "oracle")]
 #[test]
-#[ignore = "live+gate-only: docker compose oracle; open defect (check names a strategy run does not use), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_check_names_the_strategy_run_uses_for_chunked_with_no_column_oracle() {
+#[ignore = "live: requires docker compose oracle"]
+fn check_names_the_strategy_run_uses_for_chunked_with_no_column_oracle() {
     check_names_the_strategy_run_uses(SqlEngine::Oracle);
 }
 

@@ -273,6 +273,34 @@ pub(crate) fn build_plan_on(
     })
 }
 
+/// `export` with the planner's resolutions written in, so a description of it describes what `run` executes.
+pub(crate) fn export_as_planned(
+    export: &ExportConfig,
+    strategy: &ExtractionStrategy,
+) -> ExportConfig {
+    let mut planned = export.clone();
+    if export.mode != ExportMode::Chunked {
+        return planned;
+    }
+    match strategy {
+        ExtractionStrategy::Chunked(range) => {
+            planned.chunk_column = Some(range.column.clone());
+            planned.chunk_size = range.chunk_size;
+        }
+        ExtractionStrategy::Keyset(keyset) => {
+            planned.chunk_column = None;
+            planned.chunk_by_key = Some(keyset.key_column.clone());
+            planned.chunk_size = keyset.chunk_size;
+        }
+        ExtractionStrategy::Snapshot => {
+            planned.mode = ExportMode::Full;
+            planned.chunk_column = None;
+        }
+        ExtractionStrategy::Incremental(_) | ExtractionStrategy::TimeWindow { .. } => {}
+    }
+    planned
+}
+
 /// The key a clean re-run continues past (SQL `keyset_incremental`, Mongo `source.mongo.resume`), or `None` when every run reads the whole range.
 pub(crate) fn continued_key<'a>(config: &'a Config, export: &'a ExportConfig) -> Option<&'a str> {
     match export.mode {
@@ -2013,5 +2041,45 @@ mod tests {
             once.prefix.as_deref(),
             Some(format!("runs/{today}/orders/").as_str())
         );
+    }
+
+    /// The description `check` and `plan` give is of what the planner resolved, never of the config alone.
+    #[test]
+    fn an_export_as_planned_carries_the_planners_resolutions() {
+        let mut chunked = crate::config::sample_export("e");
+        chunked.mode = ExportMode::Chunked;
+        chunked.chunk_size = 100_000;
+        chunked.chunk_column = None;
+
+        let range = chunked_plan(&chunked, "id".into(), 250, 3);
+        let planned = export_as_planned(&chunked, &range);
+        assert_eq!(planned.mode, ExportMode::Chunked);
+        assert_eq!(planned.chunk_column.as_deref(), Some("id"));
+        assert_eq!(planned.chunk_size, 250);
+
+        let mut ranged = chunked.clone();
+        ranged.chunk_column = Some("stale".into());
+        let keyset = ExtractionStrategy::Keyset(KeysetPlan {
+            key_column: "ref".into(),
+            chunk_size: 700,
+            checkpoint: false,
+            incremental: false,
+            parallel: 1,
+        });
+        let planned = export_as_planned(&ranged, &keyset);
+        assert_eq!(planned.chunk_by_key.as_deref(), Some("ref"));
+        assert_eq!(planned.chunk_column, None);
+        assert_eq!(planned.chunk_size, 700);
+
+        let planned = export_as_planned(&ranged, &ExtractionStrategy::Snapshot);
+        assert_eq!(planned.mode, ExportMode::Full);
+        assert_eq!(planned.chunk_column, None);
+
+        let mut full = ranged.clone();
+        full.mode = ExportMode::Full;
+        let planned = export_as_planned(&full, &range);
+        assert_eq!(planned.mode, ExportMode::Full);
+        assert_eq!(planned.chunk_column.as_deref(), Some("stale"));
+        assert_eq!(planned.chunk_size, 100_000);
     }
 }

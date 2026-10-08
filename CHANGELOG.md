@@ -70,6 +70,46 @@
   - Upgrading: a deployment with such a value has been running on SQLite. After correcting
     the URL the PostgreSQL state is empty, so each incremental export starts with a full
     pass; to keep the stored cursors, unset the variable instead and keep the SQLite file.
+- **Breaking: `rivet plan` fails over a source it cannot read, and writes no plan.**
+  Applies to every engine.
+  - Before, when the preflight failed (no connection, a login the source rejects, a table that
+    does not exist), `rivet plan` printed a WARN, exited 0 and wrote a plan whose diagnostics
+    said `unknown (preflight failed)`; `rivet apply` then failed on it. On MongoDB a collection
+    that does not exist was planned with no warning at all.
+  - Now the command ends with `RIVET_PLAN_SOURCE_UNREADABLE` and the source's own error, and
+    writes no plan file for any export of the config: exit 1, or exit 2 when the cause is
+    transient (a refused or dropped connection). A script that relied on exit 0 here now sees
+    a failure; fix the connection, the credentials or the table name and plan again.
+  - Upgrading: nothing to migrate. A plan file written by 0.31 or earlier over an unreadable
+    source is still accepted by `rivet apply`, which fails on it as it did before.
+- **Breaking: `rivet validate` exits 1 on a bucket or container that does not exist.**
+  Applies to `s3`, `gcs` and `azure` destinations.
+  - Before, a destination whose bucket does not exist (a typo, another account) was reported
+    as `status: legacy_run`, exit 0: the same answer as a prefix that was never written.
+  - Now the export's verdict is `NO MANIFEST` with `RIVET_VERIFY_MANIFEST_READ_ERROR` naming
+    the bucket, and the command exits 1 (`could not be verified`). An empty prefix of a bucket
+    that exists is still `legacy_run`, exit 0, and so is a local path that does not exist.
+  - The same question is asked wherever rivet looks for an object and the store answers 404
+    (`run --resume`, `repair`, `reconcile`): a missing bucket is now
+    `RIVET_DEST_CONTAINER_NOT_FOUND` there instead of "the object is absent". It costs one
+    extra listing request (one result) per destination per process.
+- **Breaking: `rivet check` describes the plan `rivet run` builds.**
+  Applies to `mode: chunked` on PostgreSQL, MySQL, SQL Server and Oracle, and to MongoDB.
+  - Before, the `Strategy:` and `Mode:` lines were derived from the config alone. A
+    `mode: chunked` export with no `chunk_column` on a table that fits one chunk printed
+    `Strategy: chunked(id, size=100000)` and `Mode: chunked (column: ?, ...)`, while the run
+    exported it as one unchunked pass.
+  - Now both lines (and `strategy` / `mode` under `--json`) come from the planner `run` uses:
+    `Strategy: full-scan` and `Mode: full (`mode: chunked` runs as one pass: ...)` for that
+    table, the resolved primary key instead of `?` when the run does range-chunk, and the
+    resolved `chunk_size` under `chunk_size_memory_mb`. The verdict, warnings and
+    recommendations are computed for the same resolved plan. `rivet plan` records its
+    diagnostics for the resolved plan as well.
+  - On MongoDB, `rivet check` now fails on a collection that does not exist
+    (`RIVET_SOURCE_COLLECTION_NOT_FOUND`, exit 1), with the refusal `rivet run` gives; before
+    it printed `Looks good` and exited 0.
+  - Exit codes of `rivet check` are otherwise unchanged; a tool that parses the `strategy` or
+    `mode` field sees the new values for the exports above.
 - **Breaking: a CDC table put back into `tables:` is refused until it is re-baselined.**
   Applies to `mode: cdc` exports with `cdc.initial: snapshot` or `backfill:`, on every engine.
   - Before, a table removed from `tables:` and added again later kept its old baseline: the run

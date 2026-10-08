@@ -55,6 +55,9 @@ Every failure rivet names carries a stable `RIVET_<FAMILY>_<NAME>` code: in `--j
 | `RIVET_STATE_KEYSET_SEQUENTIAL_ANCHOR_UNFINISHED` | refusal | 5 | re-run once with `parallel: 1` to finish the interrupted run, then raise `parallel:` |
 | `RIVET_STATE_RUN_IN_PROGRESS` | refusal | 5 | wait for the run to finish, or stop its process, then repeat the command |
 | `RIVET_STATE_CHUNK_CHECKPOINT_GONE` | refusal | 5 | run the export again: it starts a new chunk run (the parts the lost run wrote stay in the destination, in no manifest) |
+| `RIVET_PLAN_SOURCE_UNREADABLE` | environment | 2 if transient, else 1 | fix what the message names (the connection, the credentials, or the table the export reads), then run `rivet plan` again |
+| `RIVET_SOURCE_COLLECTION_NOT_FOUND` | environment | 2 if transient, else 1 | correct the export's `table:` (a dotted collection name is written whole), or create the collection |
+| `RIVET_DEST_CONTAINER_NOT_FOUND` | environment | 2 if transient, else 1 | create the bucket or container, or correct `destination.bucket` |
 | `RIVET_LOAD_VALUE_OUT_OF_TARGET_RANGE` | refusal | 5 | the warehouse type cannot hold this value; declare a wider type (e.g. String) for the column, or fix the source value |
 | `RIVET_LOAD_COUNT_MISMATCH` | integrity | 3 | compare the warehouse table with the run's manifest before re-running; the source is kept |
 | `RIVET_LOAD_ADOPTION_COLUMN_MISMATCH` | refusal | 5 | add the export's new columns to the table (`ALTER TABLE … ADD COLUMN`) and re-run; do not rename it aside |
