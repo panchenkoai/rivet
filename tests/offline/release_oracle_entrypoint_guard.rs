@@ -181,11 +181,19 @@ fn makefile_logical_recipe_lines() -> Vec<(String, String)> {
 /// is satisfied by prose about the flag rather than by the flag being passed.
 /// Splitting on `;` / `&&` and keeping the command that actually launches the
 /// driver is what makes this guard grade a CALL SITE.
-fn command_containing(line: &str, needle: &str) -> Option<String> {
+fn command_containing(line: &str, launches: impl Fn(&str) -> bool) -> Option<String> {
     line.split(';')
         .flat_map(|c| c.split("&&"))
-        .find(|c| c.contains(needle))
+        .find(|c| launches(c))
         .map(|c| c.trim().to_string())
+}
+
+/// Whether `text` launches the gate's driver: `-m dev.release_oracle`, not one of its
+/// sub-modules (`-m dev.release_oracle.field_state --fetch` downloads binaries and grades nothing).
+fn launches_the_gate(text: &str) -> bool {
+    text.split("-m dev.release_oracle")
+        .skip(1)
+        .any(|rest| !rest.starts_with('.'))
 }
 
 /// Every Makefile entry point either CARRIES the baseline or GIVES THE
@@ -201,13 +209,11 @@ fn every_makefile_gate_invocation_carries_a_baseline_or_gives_it_up_by_name() {
     // carrying `python3` found ZERO invocations the day that changed — the count
     // assertion below is what turned that into a failure instead of a guard that
     // passes while grading nothing.
-    const DRIVER: &str = "-m dev.release_oracle";
-
     let invocations: Vec<(String, String)> = makefile_logical_recipe_lines()
         .into_iter()
         // Recipe lines only (a tab-indented rule body): a `#` comment at column 0
         // that MENTIONS the driver is documentation, not an entry point.
-        .filter(|(_, l)| l.starts_with('\t') && l.contains(DRIVER))
+        .filter(|(_, l)| l.starts_with('\t') && launches_the_gate(l))
         .collect();
 
     assert!(
@@ -220,7 +226,7 @@ fn every_makefile_gate_invocation_carries_a_baseline_or_gives_it_up_by_name() {
     let offenders: Vec<String> = invocations
         .iter()
         .map(|(t, l)| {
-            let cmd = command_containing(l, DRIVER).unwrap_or_else(|| {
+            let cmd = command_containing(l, launches_the_gate).unwrap_or_else(|| {
                 panic!("target {t}: the driver invocation is not inside any shell command")
             });
             (t.clone(), cmd)

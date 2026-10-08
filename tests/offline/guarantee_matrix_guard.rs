@@ -13,10 +13,10 @@ const KNOWN_RED: &str = "dev/release_oracle/known_red.py";
 const GATE_DIR: &str = "dev/release_oracle";
 
 /// Rows not fully held: a `gap` cell or a live contradiction. Shrink-only; LOWER it with the row.
-// 34 -> 32 (2026-10-08): CDC refusals carry their code (#497): the lost-log and stable-code rows lost their last contradiction.
-const ROWS_NOT_HELD: usize = 32; // ratchet-pin: guarantee-rows-not-held
+// 30 -> 28 (2026-10-08): CDC refusals carry their code (#497): the lost-log and stable-code rows lost their last contradiction.
+const ROWS_NOT_HELD: usize = 28; // ratchet-pin: guarantee-rows-not-held
 /// `gap` cells over all rows. Shrink-only; LOWER it when a cell is written.
-const GAP_CELLS: usize = 57; // ratchet-pin: guarantee-gap-cells
+const GAP_CELLS: usize = 43; // ratchet-pin: guarantee-gap-cells
 
 fn rows() -> Vec<Value> {
     let doc: Value = serde_yaml_ng::from_str(&subject_text(MATRIX))
