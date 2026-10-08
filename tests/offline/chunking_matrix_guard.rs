@@ -320,7 +320,11 @@ const MATRICES: &[(&str, usize)] = &[
     // run beside it: a bounded stream ends before it can be met), 9 Oracle cells of the new
     // open-defect rows, the MongoDB and Oracle cells of the revoke row, the MongoDB cell of the
     // validate row, the load-beside-a-run row, and two runs that name one part in one millisecond.
-    ("docs/sabotage-matrix.yaml", 93),
+    // Raised 93 -> 103 (2026-10-08): the kill and config-edit row families. 7 Oracle cells of their
+    // open-defect rows (a resume after the source grew, an edited destination path or format), and
+    // a kill inside `state reset` and inside `repair` (no named point) and a destination moved to
+    // another store (the cell's reader of declared ids is local).
+    ("docs/sabotage-matrix.yaml", 103),
     // Pool-split — `apply --pool --split` per (strategy × source engine). Split is a
     // scheduler layer above the runners (each unit runs through chunked/keyset), so its
     // per-engine behaviour (boundary probe, crash-recovery, finding-2 exact-partition
