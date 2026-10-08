@@ -47,7 +47,7 @@ rivet run --config <PATH> [OPTIONS]
 |------|-------|------|-------------|
 | `--config` | `-c` | string | Path to YAML config file **(required)** |
 | `--export` | `-e` | string | Run only a specific export by name |
-| `--validate` | | bool | Validate output file row count after writing |
+| `--validate` | | bool | Validate output file row count after writing, then verify the manifest and every part at the destination. A failed verification fails the run's exit as `rivet validate` would on that prefix: `RIVET_VALIDATE_FAILED` (exit 3) when a check found the destination wrong, `RIVET_VALIDATE_UNVERIFIED` (exit 1) when it could not be read back. The export itself completed: its parts, manifest and `_SUCCESS` stay |
 | `--reconcile` | | bool | Run `COUNT(*)` on source query and compare with exported rows |
 | `--resume` | | bool | Resume an in-progress chunked export. Exits non-zero with an actionable message if no in-progress checkpoint exists — run without `--resume` to start fresh, or `rivet state reset-chunks` to clear a stuck run |
 | `--force` | | bool | Override safety gates that would otherwise refuse the run. Today: with `--resume`, allows starting against a destination prefix whose `_SUCCESS` marker is already present (ADR-0012 M8). Without it, resume against a complete run refuses so an operator cannot accidentally re-export over a verified dataset |
@@ -820,6 +820,10 @@ rivet run --config rivet.yaml
 
 Rivet creates all state tables automatically on first connect, running the full migration ladder up to the current schema version (the same schema-version sequence as SQLite). No manual DDL required.
 
+A `RIVET_STATE_URL` that is set and is not a `postgres://` or `postgresql://` URL (a typo such as `postgre://`, another engine's URL) is refused by every command that opens the state (`RIVET_STATE_URL_SCHEME_UNSUPPORTED`, exit 1): it is never replaced by the SQLite file. An unset or empty variable selects SQLite.
+
+A run starts by recording itself in the state. If the state does not take that write (a read-only file or filesystem, a role without write access), the run is refused before it exports anything (`RIVET_STATE_NOT_WRITABLE`). If the incremental cursor cannot be stored after the rows and the manifest are written, the run exits non-zero (`RIVET_STATE_CURSOR_NOT_STORED`): the rows are delivered, and the next run delivers them again from the previous cursor.
+
 ### Docker Compose (local dev)
 
 `docker-compose.yaml` includes a dedicated `postgres-state` service on port **5433** (separate from the source `postgres` service on port 5432 so data and state never mix):
@@ -849,7 +853,7 @@ export RIVET_STATE_URL="postgresql://rivet:secret@db.internal/rivet_state?sslmod
 |----------|-------------|
 | `RUST_LOG` | Log level: `error`, `warn`, `info`, `debug`, `trace` |
 | `DATABASE_URL` | Commonly used with `url_env: DATABASE_URL` in source config |
-| `RIVET_STATE_URL` | PostgreSQL URL for the state backend. When set (and starts with `postgres`), activates the PG backend instead of the default SQLite file. Example: `postgresql://rivet:rivet@localhost:5433/rivet_state` |
+| `RIVET_STATE_URL` | PostgreSQL URL (`postgres://` or `postgresql://`) for the state backend. When set, activates the PG backend instead of the default SQLite file; any other non-empty value is refused. Example: `postgresql://rivet:rivet@localhost:5433/rivet_state` |
 
 ### Example: verbose logging
 

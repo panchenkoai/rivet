@@ -1,0 +1,15 @@
+diff --git a/src/state/mod.rs b/src/state/mod.rs
+--- a/src/state/mod.rs
++++ b/src/state/mod.rs
+@@ -260,9 +260,9 @@
+     /// `RIVET_STATE_URL` when it is set, else SQLite next to `config_path`.
+     pub fn open(config_path: &str) -> Result<Self> {
+         if let Ok(url) = std::env::var("RIVET_STATE_URL")
+-            && !url.is_empty()
++            && postgres_state_url(&url).is_ok()
+         {
+-            return Self::open_postgres(postgres_state_url(&url)?);
++            return Self::open_postgres(&url);
+         }
+         Self::open_sqlite(config_path)
+     }

@@ -540,3 +540,73 @@ seeds:
         cells:
           - oracle_cdc_table_removed_from_tables_and_put_back_is_refused_until_rebaselined
           - oracle_cdc_table_switched_to_another_over_its_baseline_is_refused_and_switched_back_continues
+
+  - name: failed-validation-exits-zero
+    class: "`run --validate` computes a failed verdict, prints `validated: FAIL` and drops it from the run's exit"
+    history: "2026-10-07 CLI sweep, RESULTS 2 - `run --validate` with `verify: content` on a local destination: `validated: FAIL`, exit 0, on main and on v0.31.0; `rivet validate` on the same prefix exits 3"
+    scope: source
+    patch: failed-validation-exits-zero/shared.patch
+    engines:
+      postgres:
+        cells:
+          - run_validate_fails_the_run_over_a_failed_validation_postgres
+          - roast_metric_validated_matches_final_summary_verdict
+      mysql:
+        cells: [run_validate_fails_the_run_over_a_failed_validation_mysql]
+      mssql:
+        cells: [run_validate_fails_the_run_over_a_failed_validation_mssql]
+      mongo:
+        cells: [run_validate_fails_the_run_over_a_failed_validation_mongo]
+      oracle:
+        cells: [run_validate_fails_the_run_over_a_failed_validation_oracle]
+
+  - name: unwritable-state-run-exports
+    class: a run whose state store does not take its first write (the run-status row) exports anyway
+    history: "2026-10-07 CLI sweep, RESULTS 3 - an incremental run over a read-only `.rivet_state.db`: exit 0 with no metrics row, and every later run delivers the same delta again (16, then 19 rows for 13 source ids), on main and on v0.31.0"
+    scope: source
+    patch: unwritable-state-run-exports/shared.patch
+    engines:
+      postgres:
+        cells: [a_run_over_a_read_only_state_is_refused_and_runs_once_it_is_writable_postgres]
+      mysql:
+        cells: [a_run_over_a_read_only_state_is_refused_and_runs_once_it_is_writable_mysql]
+      mssql:
+        cells: [a_run_over_a_read_only_state_is_refused_and_runs_once_it_is_writable_mssql]
+      mongo:
+        cells: [a_run_over_a_read_only_state_is_refused_and_runs_once_it_is_writable_mongo]
+      oracle:
+        cells: [a_run_over_a_read_only_state_is_refused_and_runs_once_it_is_writable_oracle]
+
+  - name: unstored-cursor-exits-zero
+    class: an incremental cursor write that fails after the manifest is written is logged and the run exits 0
+    history: "2026-10-07 CLI sweep, RESULTS 3 - `cursor advance failed AFTER the manifest was written` at ERROR level and exit 0, on main and on v0.31.0"
+    scope: source
+    patch: unstored-cursor-exits-zero/shared.patch
+    engines:
+      postgres:
+        cells: [a_run_whose_cursor_write_fails_delivers_and_does_not_exit_0_postgres]
+      mysql:
+        cells: [a_run_whose_cursor_write_fails_delivers_and_does_not_exit_0_mysql]
+      mssql:
+        cells: [a_run_whose_cursor_write_fails_delivers_and_does_not_exit_0_mssql]
+      mongo:
+        na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes), so it stores no incremental cursor"
+      oracle:
+        cells: [a_run_whose_cursor_write_fails_delivers_and_does_not_exit_0_oracle]
+
+  - name: state-url-typo-falls-back-to-sqlite
+    class: a `RIVET_STATE_URL` that is not a PostgreSQL URL is ignored and the state is kept in a SQLite file beside the config
+    history: "2026-10-07 CLI sweep, RESULTS 9 - `RIVET_STATE_URL=postgre://...`: exit 0 on a SQLite state beside the config, with no message, on main and on v0.31.0"
+    scope: source
+    patch: state-url-typo-falls-back-to-sqlite/shared.patch
+    engines:
+      postgres:
+        cells: [an_unusable_state_url_is_refused_and_each_remedy_runs_postgres]
+      mysql:
+        cells: [an_unusable_state_url_is_refused_and_each_remedy_runs_mysql]
+      mssql:
+        cells: [an_unusable_state_url_is_refused_and_each_remedy_runs_mssql]
+      mongo:
+        cells: [an_unusable_state_url_is_refused_and_each_remedy_runs_mongo]
+      oracle:
+        cells: [an_unusable_state_url_is_refused_and_each_remedy_runs_oracle]

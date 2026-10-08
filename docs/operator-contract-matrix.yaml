@@ -17,20 +17,28 @@ scenarios:
     oracle:   { test: open_defect_a_stale_chunk_checkpoint_is_not_adopted_after_a_finished_run_oracle }
 
   - id: run_validate_exit
-    what: "RESULTS 2: `run --validate` does not exit 0 over `validated: FAIL`"
-    postgres: { test: open_defect_run_validate_does_not_exit_0_over_a_failed_validation_postgres }
-    mysql:    { test: open_defect_run_validate_does_not_exit_0_over_a_failed_validation_mysql }
-    mssql:    { test: open_defect_run_validate_does_not_exit_0_over_a_failed_validation_mssql }
-    mongo:    { test: open_defect_run_validate_does_not_exit_0_over_a_failed_validation_mongo }
-    oracle:   { test: open_defect_run_validate_does_not_exit_0_over_a_failed_validation_oracle }
+    what: "RESULTS 2: `run --validate` over a failed verification exits 3 (RIVET_VALIDATE_FAILED) on every run, as `rivet validate` does on that prefix"
+    postgres: { test: run_validate_fails_the_run_over_a_failed_validation_postgres }
+    mysql:    { test: run_validate_fails_the_run_over_a_failed_validation_mysql }
+    mssql:    { test: run_validate_fails_the_run_over_a_failed_validation_mssql }
+    mongo:    { test: run_validate_fails_the_run_over_a_failed_validation_mongo }
+    oracle:   { test: run_validate_fails_the_run_over_a_failed_validation_oracle }
 
   - id: read_only_state
-    what: "RESULTS 3: an incremental run that cannot store its cursor does not exit 0"
-    postgres: { test: open_defect_a_run_that_cannot_store_its_cursor_does_not_exit_0_postgres }
-    mysql:    { test: open_defect_a_run_that_cannot_store_its_cursor_does_not_exit_0_mysql }
-    mssql:    { test: open_defect_a_run_that_cannot_store_its_cursor_does_not_exit_0_mssql }
+    what: "RESULTS 3: a run over a state it cannot write is refused before it exports (RIVET_STATE_NOT_WRITABLE, exit 1), and runs once the state is writable"
+    postgres: { test: a_run_over_a_read_only_state_is_refused_and_runs_once_it_is_writable_postgres }
+    mysql:    { test: a_run_over_a_read_only_state_is_refused_and_runs_once_it_is_writable_mysql }
+    mssql:    { test: a_run_over_a_read_only_state_is_refused_and_runs_once_it_is_writable_mssql }
+    mongo:    { test: a_run_over_a_read_only_state_is_refused_and_runs_once_it_is_writable_mongo }
+    oracle:   { test: a_run_over_a_read_only_state_is_refused_and_runs_once_it_is_writable_oracle }
+
+  - id: cursor_write_fails
+    what: "RESULTS 3 (the write after the manifest): a run whose cursor write fails delivers its rows once, keeps the stored cursor and exits 1 (RIVET_STATE_CURSOR_NOT_STORED)"
+    postgres: { test: a_run_whose_cursor_write_fails_delivers_and_does_not_exit_0_postgres }
+    mysql:    { test: a_run_whose_cursor_write_fails_delivers_and_does_not_exit_0_mysql }
+    mssql:    { test: a_run_whose_cursor_write_fails_delivers_and_does_not_exit_0_mssql }
     mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only; any other mode is refused when the config is read (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no incremental cursor to store" }
-    oracle:   { test: open_defect_a_run_that_cannot_store_its_cursor_does_not_exit_0_oracle }
+    oracle:   { test: a_run_whose_cursor_write_fails_delivers_and_does_not_exit_0_oracle }
 
   - id: concurrent_full_runs
     what: "RESULTS 4: a second concurrent `full` run is refused, or the prefix holds each key once"
@@ -73,12 +81,12 @@ scenarios:
     oracle:   { test: open_defect_plan_fails_over_a_table_that_does_not_exist_oracle }
 
   - id: unusable_state_url
-    what: "RESULTS 9: a `RIVET_STATE_URL` rivet cannot use is refused"
-    postgres: { test: open_defect_an_unusable_state_url_is_refused_postgres }
-    mysql:    { test: open_defect_an_unusable_state_url_is_refused_mysql }
-    mssql:    { test: open_defect_an_unusable_state_url_is_refused_mssql }
-    mongo:    { test: open_defect_an_unusable_state_url_is_refused_mongo }
-    oracle:   { test: open_defect_an_unusable_state_url_is_refused_oracle }
+    what: "RESULTS 9: a `RIVET_STATE_URL` rivet cannot use is refused (RIVET_STATE_URL_SCHEME_UNSUPPORTED, exit 1); unsetting it runs on SQLite, and the corrected URL runs on PostgreSQL state (the postgres cell, which has the state server)"
+    postgres: { test: an_unusable_state_url_is_refused_and_each_remedy_runs_postgres }
+    mysql:    { test: an_unusable_state_url_is_refused_and_each_remedy_runs_mysql }
+    mssql:    { test: an_unusable_state_url_is_refused_and_each_remedy_runs_mssql }
+    mongo:    { test: an_unusable_state_url_is_refused_and_each_remedy_runs_mongo }
+    oracle:   { test: an_unusable_state_url_is_refused_and_each_remedy_runs_oracle }
 
   - id: corrupt_checkpoint_remedy
     what: "RESULTS 13: deleting a corrupt CDC checkpoint accepts a new anchor, as the refusal says"

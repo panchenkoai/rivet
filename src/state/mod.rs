@@ -202,6 +202,30 @@ pub(crate) fn open_connection(db_path: &std::path::Path) -> Result<Connection> {
     Ok(conn)
 }
 
+/// `url` when it names the PostgreSQL state backend; any other `RIVET_STATE_URL` is refused, never replaced by SQLite.
+fn postgres_state_url(url: &str) -> Result<&str> {
+    if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+        return Ok(url);
+    }
+    let is_scheme = |s: &str| {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))
+    };
+    let what = match url.split_once("://") {
+        Some((scheme, _)) if is_scheme(scheme) => format!("has the scheme `{scheme}://`"),
+        _ => "is not a URL".to_string(),
+    };
+    crate::rivet_bail!(
+        crate::error::codes::STATE_URL_SCHEME_UNSUPPORTED,
+        "RIVET_STATE_URL {what}; the state backends are PostgreSQL and the SQLite file \
+         beside the config, and a URL rivet cannot use is not replaced by that file. No \
+         state was opened and nothing was read or written. Set RIVET_STATE_URL to a \
+         `postgres://` or `postgresql://` URL, or unset it to keep the state in \
+         `{STATE_DB_NAME}` beside the config."
+    )
+}
+
 // ─── StateStore ───────────────────────────────────────────────────────────────
 
 /// Entry point for all persistent state.  Supports two backends:
@@ -219,8 +243,9 @@ pub(crate) fn open_connection(db_path: &std::path::Path) -> Result<Connection> {
 /// RIVET_STATE_URL=postgresql://user:pass@host:5432/rivet_state
 /// ```
 ///
-/// When the variable is absent or does not start with `postgres`, SQLite is
-/// used and the variable is ignored.
+/// When the variable is absent or empty, SQLite is used. Any other value that is
+/// not a `postgres://` / `postgresql://` URL is refused
+/// (`RIVET_STATE_URL_SCHEME_UNSUPPORTED`), never replaced by SQLite.
 pub struct StateStore {
     pub(super) conn: StateConn,
     /// Serialisable reference for reconnection (parallel chunk workers).
@@ -232,12 +257,12 @@ pub struct StateStore {
 impl StateStore {
     /// Open the appropriate backend.
     ///
-    /// Checks `RIVET_STATE_URL`; falls back to SQLite next to `config_path`.
+    /// `RIVET_STATE_URL` when it is set, else SQLite next to `config_path`.
     pub fn open(config_path: &str) -> Result<Self> {
         if let Ok(url) = std::env::var("RIVET_STATE_URL")
-            && url.starts_with("postgres")
+            && !url.is_empty()
         {
-            return Self::open_postgres(&url);
+            return Self::open_postgres(postgres_state_url(&url)?);
         }
         Self::open_sqlite(config_path)
     }
@@ -439,6 +464,57 @@ mod plaintext_remote_warning {
             is_plaintext_remote("postgres://u:localhost@db.example.com/s"),
             "a password that spells a loopback name is not a loopback host"
         );
+    }
+}
+
+#[cfg(test)]
+mod state_url_guard {
+    use super::*;
+
+    #[test]
+    fn a_postgres_url_in_either_spelling_is_the_postgres_backend() {
+        for url in ["postgres://u:p@h:5432/s", "postgresql://u:p@h/s"] {
+            assert_eq!(postgres_state_url(url).unwrap(), url);
+        }
+    }
+
+    #[test]
+    fn any_other_state_url_is_refused_by_code_with_both_remedies_and_no_secret() {
+        let cases = [
+            (
+                "postgre://u:hunter2@h:5432/s",
+                "has the scheme `postgre://`",
+            ),
+            ("mysql+ssl://u:hunter2@h/s", "has the scheme `mysql+ssl://`"),
+            ("postgres", "is not a URL"),
+            ("postgresql:/u:hunter2@h/s", "is not a URL"),
+            ("u:hunter2@h:5432/s", "is not a URL"),
+            ("hunter2 x://h/s", "is not a URL"),
+            ("://h/s", "is not a URL"),
+            (" ", "is not a URL"),
+        ];
+        for (url, what) in cases {
+            let err = postgres_state_url(url).unwrap_err();
+            assert_eq!(
+                crate::error::error_code(&err),
+                Some("RIVET_STATE_URL_SCHEME_UNSUPPORTED"),
+                "{url}"
+            );
+            assert_eq!(crate::error::classify_exit(&err), 1, "{url}");
+            let said = err.to_string();
+            assert_eq!(
+                said,
+                format!(
+                    "RIVET_STATE_URL {what}; the state backends are PostgreSQL and the SQLite \
+                     file beside the config, and a URL rivet cannot use is not replaced by that \
+                     file. No state was opened and nothing was read or written. Set \
+                     RIVET_STATE_URL to a `postgres://` or `postgresql://` URL, or unset it to \
+                     keep the state in `.rivet_state.db` beside the config."
+                ),
+                "{url}"
+            );
+            assert!(!said.contains("hunter2"), "{said}");
+        }
     }
 }
 

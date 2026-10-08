@@ -722,39 +722,62 @@ pub(super) fn run_diagnosis(
 fn resolve_final_result(
     failed: bool,
     run_result: crate::error::Result<()>,
-    reconcile_gate: crate::error::Result<()>,
     manifest_gap: Option<String>,
+    gates: [crate::error::Result<()>; 3],
 ) -> crate::error::Result<()> {
     if failed {
         return run_result;
     }
-    // NOT gated on `validated` — and that is a DECISION, not an oversight.
-    //
-    // `rivet run --config … --validate` prints `validated: FAIL` and still exits 0,
-    // while the standalone `rivet validate` exits 3 on the same destination state.
-    // That asymmetry hid the round-11 leading-slash bug: a CI gate keyed on the run's
-    // exit code learned nothing while the report said FAIL.
-    //
-    // I made it fatal and reverted, because
-    // `roast_metric_validated_matches_final_summary_verdict` asserts exit 0 verbatim,
-    // citing ADR-0001 §I7. Read strictly, I7 is about manifest WRITE failures ("a
-    // SQLite INSERT failed") and says nothing about a verification VERDICT — so the
-    // citation is a stretch and the contract is arguably unsettled. But it is a
-    // user-visible exit-code contract with a test standing on it, and changing it is
-    // the maintainer's call, not something to slip in beside a bug fix.
-    //
-    // Whoever settles it: the question is whether `--validate` is an observability
-    // aid (I7's spirit — never abort a successful export over a check) or a GATE (the
-    // reason the flag exists on `run` at all). Today it is documented as the first
-    // and used as the second.
-    // The manifest gap outranks the reconcile verdict. Reconcile answers "is the
-    // data right?"; this answers "is the data REACHABLE?" — and an unreachable
-    // prefix makes the first question moot. Ordered before so the exit code names
-    // the condition an operator must act on first.
+    // The manifest gap outranks the gates. They answer "is the data right, and
+    // will the next run continue from it?"; this answers "is the data REACHABLE?"
+    // — and an unreachable prefix makes those questions moot. Ordered before so
+    // the exit code names the condition an operator must act on first.
     if let Some(why) = manifest_gap {
         return Err(anyhow::anyhow!(why));
     }
-    reconcile_gate
+    gates.into_iter().collect()
+}
+
+/// Exit gate for `run --validate`: the class `rivet validate` gives the same prefix (verified-wrong exit 3, could-not-verify exit 1).
+fn validate_run_gate(summary: &RunSummary) -> crate::error::Result<()> {
+    use crate::error::codes::{VALIDATE_FAILED, VALIDATE_UNVERIFIED};
+    if summary.validated != Some(false) {
+        return Ok(());
+    }
+    let verdict = summary.manifest_verification.as_ref();
+    let why = verdict.map_or_else(
+        || "no verdict was recorded".to_string(),
+        |v| {
+            let fatal = v.failures.iter().filter(|f| f.is_fatal());
+            fatal
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; ")
+        },
+    );
+    let code = if verdict.is_none_or(|v| v.has_verified_wrong_failure()) {
+        VALIDATE_FAILED
+    } else {
+        VALIDATE_UNVERIFIED
+    };
+    crate::rivet_bail!(
+        code,
+        "`--validate` did not pass for '{}': {why}. The export completed and its manifest is \
+         written; `rivet validate` re-checks the prefix part by part.",
+        summary.export_name
+    )
+}
+
+/// The failure of a run whose rows and manifest are durable and whose incremental cursor was not stored.
+fn cursor_not_stored(kind: &str, export_name: &str, cause: &anyhow::Error) -> anyhow::Error {
+    anyhow::Error::new(crate::error::CodedError::new(
+        crate::error::codes::STATE_CURSOR_NOT_STORED,
+        format!(
+            "{kind} '{export_name}': the rows are delivered and the manifest is written, but \
+             the incremental cursor could not be stored ({cause:#}), so the next run delivers \
+             the same rows again. Repair the state database before the next run."
+        ),
+    ))
 }
 
 fn reconcile_run_gate(
@@ -1072,18 +1095,35 @@ fn finalize_keyset_anchor(
 /// The ledger is authoritative for a co-located / shared-Postgres load; the bucket
 /// marker lets a cross-boundary reader (Airflow, a foreign-host `rivet load`) see
 /// the live run too. The `prefix` recorded in the ledger is the run's write URI,
-/// which `gc_orphans` matches at-or-under its load prefix. Best-effort: a miss
-/// only makes gc over-defer cleanup, so it warns rather than failing the export.
-fn ledger_begin_run(state: &StateStore, plan: &ResolvedRunPlan, export_family: &str, run_id: &str) {
+/// which `gc_orphans` matches at-or-under its load prefix. The ledger row is the
+/// run's first state write: a state that does not take it refuses the run here,
+/// before a row is exported or anything is written to the destination.
+fn ledger_begin_run(
+    state: &StateStore,
+    plan: &ResolvedRunPlan,
+    export_family: &str,
+    run_id: &str,
+) -> Result<()> {
     let prefix = super::finalize::destination_uri_for_manifest(&plan.destination);
     let started_at = chrono::Utc::now().to_rfc3339();
-    if let Err(e) = state.begin_run(run_id, &plan.export_name, &prefix, &started_at) {
-        log::warn!(
-            "export '{}': run-status begin failed (gc may over-defer orphan cleanup): {e:#}",
-            plan.export_name
-        );
-    }
+    state
+        .begin_run(run_id, &plan.export_name, &prefix, &started_at)
+        .map_err(|e| state_not_writable(&plan.export_name, &e))?;
     super::finalize::write_running_manifest(plan, export_family, run_id, &started_at);
+    Ok(())
+}
+
+/// The refusal of a run whose state store did not take its first write.
+fn state_not_writable(export_name: &str, cause: &anyhow::Error) -> anyhow::Error {
+    anyhow::Error::new(crate::error::CodedError::new(
+        crate::error::codes::STATE_NOT_WRITABLE,
+        format!(
+            "export '{export_name}': the state database did not take this run's first write \
+             ({cause:#}). A run that cannot store its progress delivers the same rows again on \
+             the next run, so the export did not start and nothing was written to the \
+             destination. Make the state database writable and run again."
+        ),
+    ))
 }
 
 /// Transition a run to its terminal status in the run-status ledger at finalize.
@@ -1342,7 +1382,11 @@ fn execute_resolved_plan(
     // Record this run `running` BEFORE any part lands — in the ledger + a bucket
     // marker manifest — the authority `gc_orphans` reads to spare a live extract's
     // committed-but-not-yet-manifested parts. (finish_run transitions it below.)
-    ledger_begin_run(state, plan, tail.family, &summary.run_id);
+    if let Err(e) = ledger_begin_run(state, plan, tail.family, &summary.run_id) {
+        rss_sampler.stop();
+        let summary = synthetic_failed_summary(&plan.export_name, &e);
+        return (Err(e), summary);
+    }
     // The id the LEDGER row was opened under. A chunk-checkpoint RESUME adopts the
     // prior run's id (chunked/mod.rs) — `summary.run_id` changes AFTER this point —
     // and `finish_run` is a bare UPDATE, so closing the run under the adopted id
@@ -1555,13 +1599,15 @@ fn execute_resolved_plan(
         ledger_finish_owned_runs(state, &plan.export_name, &ledger_run_id, &summary);
     }
     // Round-2 audit #12: advance the incremental cursor now that the destination
-    // manifest is durable — never before. A failure here is at-least-once safe (the
-    // data + manifest are durable; the next run re-exports from the prior cursor),
-    // so log loudly rather than fail a run whose write cycle already succeeded.
+    // manifest is durable — never before. A failure here loses nothing (the data +
+    // manifest are durable; the next run re-exports from the prior cursor), but the
+    // next run delivers the window twice, so it fails the run's exit (`cursor_gate`)
+    // without withdrawing the manifest.
     //
     // "now that the manifest is durable" was a PREMISE, not a check: the cursor
     // advanced even when the manifest write had just failed, so the next run
     // started past data nothing described. Guarded now.
+    let mut cursor_gate: crate::error::Result<()> = Ok(());
     if !cursor_may_advance(&summary.status, &manifest_gap) {
         if summary.cursor_high.is_some() {
             log::error!(
@@ -1572,13 +1618,7 @@ fn execute_resolved_plan(
             );
         }
     } else if let Err(e) = commit_incremental_cursor(state, plan, &summary) {
-        log::error!(
-            "{} '{}': cursor advance failed AFTER the manifest was written — the next run \
-             re-exports from the prior cursor (at-least-once, no loss): {:#}",
-            tail.kind,
-            summary.export_name,
-            e
-        );
+        cursor_gate = Err(cursor_not_stored(tail.kind, &summary.export_name, &e));
     }
     // Round-5: a keyset checkpoint run has now finalized its COMPLETE destination
     // manifest — clear the in-progress run_id (persisted for crash rehydration) so a
@@ -1613,9 +1653,11 @@ fn execute_resolved_plan(
     finalize_run_report(tail.config_path, &summary, tail.kind);
     crate::notify::maybe_send(tail.notifications, &summary);
 
-    // An export failure wins, otherwise an unwritten manifest fails the run;
-    // the reconcile leg is `Ok(())` where the policy disables it.
-    let final_result = resolve_final_result(failed, result, reconcile_gate, manifest_gap);
+    // An export failure wins, otherwise an unwritten manifest fails the run, then
+    // the first gate that did: `--validate`, `--reconcile` (`Ok(())` where the
+    // policy disables it), the cursor.
+    let gates = [validate_run_gate(&summary), reconcile_gate, cursor_gate];
+    let final_result = resolve_final_result(failed, result, manifest_gap, gates);
     (final_result, summary)
 }
 
@@ -2753,6 +2795,11 @@ mod tests {
         }
     }
 
+    /// Three green gates.
+    fn green() -> [crate::error::Result<()>; 3] {
+        [Ok(()), Ok(()), Ok(())]
+    }
+
     #[test]
     fn resolve_final_result_surfaces_reconcile_mismatch_when_export_succeeded() {
         use crate::error::DataIntegrityError;
@@ -2762,30 +2809,201 @@ mod tests {
         // `run --reconcile` actually RETURNS the gate rather than Ok. Un-hooking
         // the fold reopens the bug; this test then goes red.
         let gate: crate::error::Result<()> = Err(DataIntegrityError::new("mismatch").into());
-        let out = resolve_final_result(false, Ok(()), gate, None);
+        let out = resolve_final_result(false, Ok(()), None, [Ok(()), gate, Ok(())]);
         assert!(
             out.is_err(),
             "a reconcile mismatch on a successful export must surface as the run result"
         );
         assert_eq!(crate::error::classify_exit(&out.unwrap_err()), 3);
 
-        // An export/quality failure takes precedence over the reconcile gate.
+        // An export/quality failure takes precedence over the gates.
         let qfail: crate::error::Result<()> = Err(DataIntegrityError::new("quality").into());
-        assert!(resolve_final_result(true, qfail, Ok(()), None).is_err());
+        let gate: crate::error::Result<()> = Err(anyhow::anyhow!("a gate"));
+        let out = resolve_final_result(true, qfail, None, [gate, Ok(()), Ok(())]).unwrap_err();
+        assert_eq!(out.to_string(), "quality");
 
-        // Clean run: no export failure, no reconcile mismatch → Ok. (A --validate
-        // verified-wrong verdict is NON-fatal by design — ADR-0001 §I7; a hard gate
-        // is the standalone `rivet validate` command, not `run --validate`.)
-        assert!(resolve_final_result(false, Ok(()), Ok(()), None).is_ok());
+        // Clean run: no export failure and every gate green → Ok.
+        assert!(resolve_final_result(false, Ok(()), None, green()).is_ok());
         // A run whose manifest never landed is not a success, even with the
-        // export and the reconcile both green: the parts are durable and no
+        // export and the gates all green: the parts are durable and no
         // manifest names them, so the loader cannot reach them.
-        let gap = resolve_final_result(false, Ok(()), Ok(()), Some("no manifest".into()));
+        let gap = resolve_final_result(false, Ok(()), Some("no manifest".into()), green());
         assert!(
             gap.is_err(),
             "an unwritten manifest must fail the run — reporting success there is a claim the \
              artifacts do not support"
         );
+    }
+
+    #[test]
+    fn every_gate_fails_the_run_and_the_first_one_names_it() {
+        let gate = |n: usize| -> [crate::error::Result<()>; 3] {
+            let mut gates = green();
+            gates[n] = Err(anyhow::anyhow!("gate {n}"));
+            gates
+        };
+        for n in 0..3 {
+            let err = resolve_final_result(false, Ok(()), None, gate(n)).unwrap_err();
+            assert_eq!(err.to_string(), format!("gate {n}"));
+        }
+        let all = [
+            Err(anyhow::anyhow!("validate")),
+            Err(anyhow::anyhow!("reconcile")),
+            Err(anyhow::anyhow!("cursor")),
+        ];
+        let err = resolve_final_result(false, Ok(()), None, all).unwrap_err();
+        assert_eq!(err.to_string(), "validate");
+        let gap = resolve_final_result(false, Ok(()), Some("no manifest".into()), gate(0));
+        assert_eq!(gap.unwrap_err().to_string(), "no manifest");
+    }
+
+    /// A verdict holding `failures`, as the manifest pass leaves it on the summary.
+    fn verdict(
+        failures: Vec<crate::pipeline::validate_manifest::Failure>,
+    ) -> crate::pipeline::validate_manifest::ManifestVerification {
+        crate::pipeline::validate_manifest::ManifestVerification {
+            passed: false,
+            manifest_found: true,
+            legacy_run: false,
+            parts_verified: 1,
+            parts_md5_verified: 0,
+            parts_failed: 0,
+            success_marker_consistent: true,
+            manifest_self_consistent: true,
+            failures,
+            depth_level: "full".into(),
+        }
+    }
+
+    #[test]
+    fn run_validate_gate_gives_the_exit_rivet_validate_gives() {
+        use crate::pipeline::validate_manifest::Failure;
+        let mut s = RunSummary {
+            export_name: "orders".into(),
+            ..Default::default()
+        };
+        assert!(validate_run_gate(&s).is_ok(), "no `--validate`, no gate");
+        s.validated = Some(true);
+        assert!(validate_run_gate(&s).is_ok(), "a pass is not a failure");
+
+        s.validated = Some(false);
+        s.manifest_verification = Some(verdict(vec![
+            Failure::UntrackedObject {
+                key: "stray.parquet".into(),
+                size_bytes: 1,
+            },
+            Failure::ContentVerificationUnmet {
+                size_only: 1,
+                total: 1,
+            },
+        ]));
+        let err = validate_run_gate(&s).unwrap_err();
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some("RIVET_VALIDATE_FAILED")
+        );
+        assert_eq!(crate::error::classify_exit(&err), 3);
+        assert_eq!(
+            err.to_string(),
+            "`--validate` did not pass for 'orders': verify: content not met — 1 of 1 part(s) only \
+             size-verified (no store checksum); lower max_file_size so parts upload as a single \
+             PUT, or the backend exposes no checksum. The export completed and its manifest is \
+             written; `rivet validate` re-checks the prefix part by part."
+        );
+
+        s.manifest_verification = Some(verdict(vec![Failure::ManifestReadError {
+            detail: "permission denied".into(),
+        }]));
+        let err = validate_run_gate(&s).unwrap_err();
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some("RIVET_VALIDATE_UNVERIFIED")
+        );
+        assert_eq!(crate::error::classify_exit(&err), 1);
+
+        s.manifest_verification = None;
+        let err = validate_run_gate(&s).unwrap_err();
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some("RIVET_VALIDATE_FAILED")
+        );
+        assert!(
+            err.to_string()
+                .contains("'orders': no verdict was recorded. "),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_cursor_that_was_not_stored_is_a_coded_failure_naming_its_cause() {
+        let cause = anyhow::anyhow!("attempt to write a readonly database");
+        let err = cursor_not_stored("export", "orders", &cause);
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some("RIVET_STATE_CURSOR_NOT_STORED")
+        );
+        assert_eq!(crate::error::classify_exit(&err), 1);
+        assert_eq!(
+            err.to_string(),
+            "export 'orders': the rows are delivered and the manifest is written, but the \
+             incremental cursor could not be stored (attempt to write a readonly database), so \
+             the next run delivers the same rows again. Repair the state database before the \
+             next run."
+        );
+    }
+
+    #[test]
+    fn a_state_that_refuses_the_first_write_refuses_the_run_before_the_ledger_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("s.db");
+        let state = crate::state::StateStore::open_at_path(&db).expect("a state DB");
+        let plan = chunked_plan_with_quality(None);
+        let prefix = crate::pipeline::finalize::destination_uri_for_manifest(&plan.destination);
+        ledger_begin_run(&state, &plan, "orders", "run_ok").expect("a writable state");
+        let open_runs = || {
+            let mut ids: Vec<String> = state
+                .active_run_ids_on_prefix(&prefix)
+                .unwrap()
+                .into_iter()
+                .collect();
+            ids.sort();
+            ids
+        };
+        assert_eq!(
+            open_runs(),
+            ["run_ok"],
+            "fixture: the first write is the run-status row"
+        );
+
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER no_runs BEFORE INSERT ON run_status \
+                 BEGIN SELECT RAISE(ABORT, 'the state is not writable'); END;",
+            )
+            .unwrap();
+        let err = ledger_begin_run(&state, &plan, "orders", "run_refused").unwrap_err();
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some("RIVET_STATE_NOT_WRITABLE")
+        );
+        assert_eq!(crate::error::classify_exit(&err), 1);
+        let said = err.to_string();
+        assert!(
+            said.starts_with(
+                "export 'orders': the state database did not take this run's first write (the \
+                 state is not writable"
+            ),
+            "{said}"
+        );
+        assert!(
+            said.ends_with(
+                "so the export did not start and nothing was written to the destination. Make \
+                 the state database writable and run again."
+            ),
+            "{said}"
+        );
+        assert_eq!(open_runs(), ["run_ok"]);
     }
 
     #[test]

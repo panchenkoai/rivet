@@ -1,0 +1,14 @@
+diff --git a/src/pipeline/job.rs b/src/pipeline/job.rs
+--- a/src/pipeline/job.rs
++++ b/src/pipeline/job.rs
+@@ -1383,9 +1383,7 @@
+     // marker manifest — the authority `gc_orphans` reads to spare a live extract's
+     // committed-but-not-yet-manifested parts. (finish_run transitions it below.)
+     if let Err(e) = ledger_begin_run(state, plan, tail.family, &summary.run_id) {
+-        rss_sampler.stop();
+-        let summary = synthetic_failed_summary(&plan.export_name, &e);
+-        return (Err(e), summary);
++        log::warn!("{e:#}");
+     }
+     // The id the LEDGER row was opened under. A chunk-checkpoint RESUME adopts the
+     // prior run's id (chunked/mod.rs) — `summary.run_id` changes AFTER this point —
