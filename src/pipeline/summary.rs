@@ -1255,6 +1255,7 @@ mod tests {
         let plan = ResolvedRunPlan {
             split_window: None,
             bytes_read: Default::default(),
+            parts_landed: Default::default(),
             export_name: "orders".into(),
             partition_rollover: None,
             source_table: None,
@@ -1458,6 +1459,7 @@ mod tests {
         let plan = ResolvedRunPlan {
             split_window: None,
             bytes_read: Default::default(),
+            parts_landed: Default::default(),
             export_name: "events".into(),
             partition_rollover: None,
             source_table: None,
@@ -1536,6 +1538,7 @@ mod tests {
         ResolvedRunPlan {
             split_window: None,
             bytes_read: Default::default(),
+            parts_landed: Default::default(),
             export_name: export_name.into(),
             partition_rollover: None,
             source_table: None,

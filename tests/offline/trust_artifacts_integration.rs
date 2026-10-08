@@ -539,15 +539,11 @@ fn writing_manifest_twice_replaces_the_previous_artifact() {
 
 #[test]
 fn failed_run_after_successful_run_clears_success_marker_decisively() {
-    // The first run succeeds — _SUCCESS is written.  The same prefix is
-    // re-used for a second run that fails partway.  After the second
-    // run, the manifest must reflect status=failed and the _SUCCESS file
-    // must NOT exist (or must be removed).
-    //
-    // Today the writer never deletes _SUCCESS on a failed re-run — it
-    // only refrains from writing one.  That is the behaviour pinned here;
-    // if the contract evolves to require active deletion, this test
-    // becomes the canary.
+    // The first run succeeds: _SUCCESS is written. A second run into the same prefix
+    // wrote a part and then failed, so the pipeline hands the writer a `failed` manifest
+    // (a run that failed before its first write never reaches the writer: see
+    // `finalize::run_left_the_prefix_alone`). The writer removes _SUCCESS before the
+    // non-success canonical manifest lands.
     let dir = tempfile::tempdir().unwrap();
     let dest_proxy = local_dest(dir.path());
 
@@ -558,7 +554,6 @@ fn failed_run_after_successful_run_clears_success_marker_decisively() {
     );
     write_manifest(dest_proxy.as_writer(), &ok).unwrap();
     assert!(dir.path().join(SUCCESS_FILENAME).exists());
-    let stale_marker = std::fs::read_to_string(dir.path().join(SUCCESS_FILENAME)).unwrap();
 
     let fail = build_manifest("r32", ManifestStatus::Failed, Vec::new());
     write_manifest(dest_proxy.as_writer(), &fail).unwrap();
@@ -570,17 +565,14 @@ fn failed_run_after_successful_run_clears_success_marker_decisively() {
     assert_eq!(parsed.status, ManifestStatus::Failed);
     assert_eq!(parsed.run_id, "r32");
 
-    // _SUCCESS is still on disk — it was left over from the prior run.
-    // Document this as the current contract; if it changes, the assertion
-    // here makes the regression explicit.
-    let still_there = dir.path().join(SUCCESS_FILENAME).exists();
-    if still_there {
-        let body = std::fs::read_to_string(dir.path().join(SUCCESS_FILENAME)).unwrap();
-        assert_eq!(
-            body, stale_marker,
-            "stale _SUCCESS body must equal the prior successful run's marker"
-        );
-    }
+    assert!(
+        !dir.path().join(SUCCESS_FILENAME).exists(),
+        "a _SUCCESS beside a failed canonical manifest reads as complete to a sensor"
+    );
+    assert!(
+        dir.path().join("manifest-r31.json").exists(),
+        "the successful run's own manifest copy stays"
+    );
 }
 
 // ─── Section 7: manifest self-consistency (reader-side defence) ──────────────

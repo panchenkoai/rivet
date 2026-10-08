@@ -37,6 +37,18 @@ three artefacts at the resolved prefix on a clean run:
 | `manifest.json` | ADR-0012 trust contract: every committed part is listed with `size_bytes` and `content_fingerprint`. Schema fingerprint and run identity travel here. |
 | `_SUCCESS` | Single line `xxh3:<16-hex>` over the exact bytes of `manifest.json`. Presence implies M5 (every listed part exists at recorded size). |
 
+`_SUCCESS` and a `success` manifest say that the prefix holds a whole export. They do
+not say that the last run succeeded: a run that fails before its first write (the source
+cannot be reached, the password is wrong, the run is refused when it opens) leaves the
+previous `_SUCCESS`, `manifest.json` and every other object exactly as they were, and
+tells its failure through its exit code and the run journal (`rivet metrics`). A run
+that put a part at the destination and then failed removes `_SUCCESS` and writes a
+`failed` manifest naming the parts it wrote, because the prefix is no longer the export
+the marker described. `--resume` therefore reads the run journal beside the marker: an
+export whose last journaled run failed is run again by `rivet apply <config> --resume`
+and is not refused by `rivet run --resume`, even though an earlier run's `_SUCCESS` is
+still at its prefix.
+
 The contract is *atomic at write boundaries*, not at the prefix:
 `manifest.json` is written before `_SUCCESS`, so an Airflow / CI sensor
 that polls for `_SUCCESS` never sees a half-built manifest.  A
@@ -136,9 +148,12 @@ the formal invariants:
   `legacy_run: true`; `rivet validate` returns success without certifying.
   A bucket or container that does not exist is not a legacy prefix: `rivet validate`
   exits 1 with `RIVET_VERIFY_MANIFEST_READ_ERROR` naming it.
-- **M8**: resume against a `_SUCCESS`-marked prefix is refused without
-  `--force`; the verifier wants the operator to opt in to re-exporting
-  over a completed dataset.
+- **M8**: `--resume` against a `_SUCCESS`-marked prefix is refused without
+  `--force` (`RIVET_DEST_ALREADY_COMPLETE`, exit 5). `--resume --force`
+  continues an interrupted run of the export if there is one, else runs as a
+  plain run does (a `full` export is exported again, a delta export continues
+  past its cursor): new parts land beside the old ones, nothing is
+  overwritten, and `manifest.json` then describes only the new run.
 - **M9**: untracked or corrupt parts encountered on resume are moved
   under `_quarantine/<run_id>/` rather than deleted.
 
@@ -155,10 +170,12 @@ the state DB and the prior manifest, and decides per-chunk:
 - **quarantine** — untracked or corrupt object at the chunk's part path;
   move to `_quarantine/<run_id>/` and re-export.
 
-Resume preserves both `manifest.json` and `_SUCCESS` only after the run
-finishes cleanly.  An interrupted resume leaves the prior `_SUCCESS` in
-place so an external sensor polling `_SUCCESS` still sees the most
-recent verified dataset.
+A resume writes `manifest.json` and `_SUCCESS` only when the run finishes
+cleanly.  Over a prefix that already holds `_SUCCESS` (a `--resume --force`),
+a resume that fails before it puts a part at the destination leaves that
+marker and its manifest in place, so a sensor polling `_SUCCESS` still sees
+the last whole dataset; a resume that wrote a part and then failed removes
+`_SUCCESS` and leaves a `failed` manifest.
 
 ---
 

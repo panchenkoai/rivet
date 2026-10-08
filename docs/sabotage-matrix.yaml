@@ -344,6 +344,14 @@ scenarios:
     mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no range-chunk checkpoint" }
     oracle:   { gap: "the refusal ends a live run whose checkpoint rows were removed under it, so it cannot be refused twice from one state; belongs to the resource-taken-away row family (delete the rows beside a slowed run, then `run again` delivers), not written yet" }
 
+  - id: refusal_dest_already_complete
+    what: "RIVET_DEST_ALREADY_COMPLETE: `run --resume` over a prefix that holds a complete export; `--resume --force` runs as a plain run does, beside it; `state reset-chunks` leaves the refusal"
+    postgres: { test: resume_force_runs_over_a_complete_prefix_postgres }
+    mysql:    { test: resume_force_runs_over_a_complete_prefix_mysql }
+    mssql:    { test: resume_force_runs_over_a_complete_prefix_mssql }
+    mongo:    { test: resume_force_runs_over_a_complete_prefix_mongo }
+    oracle:   { test: resume_force_runs_over_a_complete_prefix_oracle }
+
   - id: refusal_load_value_out_of_target_range
     what: "RIVET_LOAD_VALUE_OUT_OF_TARGET_RANGE: a value the warehouse type cannot hold"
     postgres: { gap: "no cell asserts this refusal by code; the walk needs a ClickHouse or BigQuery load cell: refuse twice, a wider declared type, a fixed source value, and one wrong remedy" }

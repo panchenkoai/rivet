@@ -407,7 +407,7 @@ pub enum Commands {
         #[arg(long)]
         parallel_export_processes: bool,
         /// Config-wave mode: skip exports a prior run already completed
-        /// (`_SUCCESS` present) and resume incomplete chunked exports from their
+        /// (`_SUCCESS` present, last journaled run not failed) and resume incomplete chunked exports from their
         /// checkpoints, so a re-run after a partial failure does not redo
         /// finished tables. Independent tables are never re-exported.
         #[arg(long)]
@@ -1213,10 +1213,11 @@ pub struct RunArgs {
     pub resume: bool,
     /// Override safety gates that would otherwise refuse the run.
     ///
-    /// Today: with `--resume`, allows starting against a destination prefix
-    /// whose `_SUCCESS` marker is already present.  Without `--force`,
-    /// resume against an already-complete run refuses, so an operator
-    /// cannot accidentally re-export over a verified dataset.
+    /// Today: with `--resume`, goes past the refusal to resume into a
+    /// destination prefix whose `_SUCCESS` marker is already present
+    /// (`RIVET_DEST_ALREADY_COMPLETE`): the run continues an interrupted run
+    /// of the export if there is one, else it runs as a plain run does. New
+    /// parts land beside the old ones; nothing is overwritten.
     #[arg(long)]
     pub force: bool,
     /// Run the config's exports concurrently, at most 16 at once (needs 2+ exports); a CDC export run alone also takes its pending baseline snapshots at most 16 at once

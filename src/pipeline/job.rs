@@ -254,7 +254,7 @@ fn settle_columns_are_temporal(
 /// (`pg_temp_bytes_delta`, `reconciled`/`source_count`, effective `batch_size`,
 /// config dims, `rivet_version`) are what `record_metric`'s old 15-arg shim
 /// dropped on the floor — they exist on the summary/plan here, so persist them.
-fn build_metric_row(
+pub(super) fn build_metric_row(
     summary: &RunSummary,
     plan: &ResolvedRunPlan,
     tuning_class: &str,
@@ -1198,6 +1198,8 @@ struct TailPolicy<'a> {
     plan_warnings: Vec<(String, String)>,
     /// `--strict`: a lossy or unsupported column refuses the run; apply warns.
     strict: bool,
+    /// The run path's `--force`: a `--resume` with no chunk run to continue runs as a plain run. Apply's `--force` is another gate.
+    force: bool,
 }
 
 /// Does this run's reconcile leg run? Pure, because the three-input condition
@@ -1289,10 +1291,10 @@ fn promotes_to_success(current_status: &str) -> bool {
 }
 
 /// Does the `running` marker written under `opened` survive this run with nothing
-/// replacing it? A skipped run writes no terminal manifest, and a resume that adopted
-/// an earlier id (`finished` ≠ `opened`) writes its terminal manifest under that id.
-fn marker_outlived_its_run(status: &str, opened: &str, finished: &str) -> bool {
-    status == "skipped" || opened != finished
+/// replacing it? A run that left the prefix alone writes no terminal manifest, and a resume
+/// that adopted an earlier id (`finished` ≠ `opened`) writes its terminal manifest under that id.
+fn marker_outlived_its_run(prefix_left_alone: bool, opened: &str, finished: &str) -> bool {
+    prefix_left_alone || opened != finished
 }
 
 /// Terminal status of a run whose runner returned Ok: `skipped` when `skip_empty`
@@ -1363,7 +1365,7 @@ fn execute_resolved_plan(
         return (Err(e), summary);
     }
     let claim = state.claim(plan.progress_key()).and_then(|progress| {
-        chunked::claim_checkpoint_run(state, plan, &progress)
+        chunked::claim_checkpoint_run(state, plan, &progress, tail.force)
             .map(|(lease, recovered)| (progress, lease, recovered))
     });
     let (progress, _run_lease, recovered) = match claim {
@@ -1586,8 +1588,12 @@ fn execute_resolved_plan(
     // picks up the new status, and the ledger row is re-closed. The manifest
     // itself cannot be re-written to say `failed` — failing to write it is the
     // problem.
+    let prefix_left_alone = super::finalize::run_left_the_prefix_alone(
+        &summary,
+        plan.parts_landed.load(std::sync::atomic::Ordering::Relaxed),
+    );
     let manifest_gap = finalize_manifest(plan, tail.family, state, &summary, tail.kind);
-    if marker_outlived_its_run(&summary.status, &ledger_run_id, &summary.run_id) {
+    if marker_outlived_its_run(prefix_left_alone, &ledger_run_id, &summary.run_id) {
         super::finalize::retire_running_marker(plan, &ledger_run_id);
     }
     if let Some(why) = &manifest_gap {
@@ -1851,7 +1857,7 @@ fn run_export_job_inner(
     // dataset is almost never what the operator meant; the gate makes the
     // override an audited decision.
     if resume_success_gate_applies(opts.resume, opts.force)
-        && let Err(e) = check_success_gate_for_resume(&plan)
+        && let Err(e) = check_success_gate_for_resume(&plan, state)
     {
         let summary = synthetic_failed_summary(&export.name, &e);
         return (Err(e), summary);
@@ -1903,6 +1909,7 @@ fn run_export_job_inner(
             record_load_spec: true,
             plan_warnings,
             strict: opts.strict,
+            force: opts.force,
         },
         meta,
     )
@@ -1985,6 +1992,7 @@ pub(crate) fn run_export_job_with_chunk_source(
             record_load_spec,
             plan_warnings: Vec::new(),
             strict: false,
+            force: false,
         },
         MetaConn::open(&plan.source),
     )
@@ -2046,6 +2054,7 @@ mod snapshot_leg_tests {
                     record_load_spec: false,
                     plan_warnings: Vec::new(),
                     strict: false,
+                    force: false,
                 },
                 MetaConn::open(&plan.source),
             );
@@ -2090,6 +2099,7 @@ mod snapshot_leg_tests {
                 record_load_spec: false,
                 plan_warnings: Vec::new(),
                 strict: false,
+                force: false,
             },
             MetaConn::open(&plan.source),
         );
@@ -2679,23 +2689,19 @@ mod tests {
     }
 
     #[test]
-    fn a_marker_outlives_a_skipped_run_or_a_resume_under_another_id() {
+    fn a_marker_outlives_a_run_that_left_the_prefix_alone_or_a_resume_under_another_id() {
         use super::marker_outlived_its_run;
         assert!(
-            marker_outlived_its_run("skipped", "r2", "r2"),
+            marker_outlived_its_run(true, "r2", "r2"),
             "no terminal manifest"
         );
         assert!(
-            marker_outlived_its_run("success", "r2", "r1"),
+            marker_outlived_its_run(false, "r2", "r1"),
             "resume wrote under r1"
         );
         assert!(
-            !marker_outlived_its_run("success", "r2", "r2"),
+            !marker_outlived_its_run(false, "r2", "r2"),
             "terminal replaced it"
-        );
-        assert!(
-            !marker_outlived_its_run("failed", "r2", "r2"),
-            "failed manifest replaced it"
         );
     }
 
@@ -3453,6 +3459,7 @@ mod tests {
         ResolvedRunPlan {
             split_window: None,
             bytes_read: Default::default(),
+            parts_landed: Default::default(),
             export_name: "orders".into(),
             partition_rollover: None,
             source_table: None,

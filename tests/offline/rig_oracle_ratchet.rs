@@ -41,7 +41,8 @@ const NO_ORACLE_CEILING: usize = 24; // ratchet-pin: no-oracle-opt-outs
 const FAILED_RUN_LEFTOVER_CEILING: usize = 40; // ratchet-pin: failed-run-leftover-declarations
 
 /// Entries of `KNOWN_PRODUCT_DEFECTS` (tests/common/refusal.rs): product defects every failed run may show.
-const KNOWN_PRODUCT_DEFECT_CEILING: usize = 2; // ratchet-pin: failed-run-known-product-defects
+// 2 -> 1 (2026-10-08): a run that fails before its first write leaves the prefix alone, so a failed manifest before a write is a failure, no longer an excuse.
+const KNOWN_PRODUCT_DEFECT_CEILING: usize = 1; // ratchet-pin: failed-run-known-product-defects
 
 /// Rust DuckDB-helper call sites across tests/ (see [`duckdb_helper_names`]).
 // 626 -> 630 (2026-10-01): #378 merged first and added 4 calls in its Mongo null-_id tests.
@@ -166,7 +167,8 @@ fn failed_run_leftover_declarations_never_grow() {
 }
 
 /// Refusals the live cells accept with no `RIVET_*` code (`Refused::uncoded_known_defect(`): each is a code the registry owes.
-const UNCODED_REFUSAL_CEILING: usize = 5; // ratchet-pin: uncoded-refusals
+// 5 -> 4 (2026-10-08): `--resume` over a complete prefix is refused as RIVET_DEST_ALREADY_COMPLETE.
+const UNCODED_REFUSAL_CEILING: usize = 4; // ratchet-pin: uncoded-refusals
 
 #[test]
 fn uncoded_refusals_the_cells_accept_never_grow() {

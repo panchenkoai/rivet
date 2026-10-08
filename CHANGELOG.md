@@ -2,6 +2,51 @@
 
 ## Unreleased
 
+- **Breaking: a run that fails before its first write leaves the destination as it was.**
+  Applies to every batch export (`full`, `incremental`, `chunked`, keyset, the snapshot leg
+  of a CDC export) on every source engine and on every destination that keeps objects at
+  rest (local, S3, GCS, Azure).
+  - Before, a run that could not reach the source (exit 2), was given a wrong password, or
+    failed in any other way before it wrote a part, still rewrote `manifest.json` to
+    `status: failed` with 0 rows, added a `manifest-<run id>.json` copy and deleted
+    `_SUCCESS`. After a network failure `rivet validate` exited 1 and a loader or sensor
+    keyed on `_SUCCESS` stopped seeing an export that was whole.
+  - Now `_SUCCESS` and a `success` manifest mean "this prefix holds a whole export", not
+    "the last run succeeded". Such a run writes nothing to the destination; the failure is
+    told by the exit code and the run journal (`rivet metrics`, `export_metrics`). A run
+    that put a part at the destination and then failed still deletes `_SUCCESS` and
+    writes a `failed` manifest naming those parts.
+  - What a scheduler or loader that reads the destination sees differently: after a run
+    that failed before its first write, `_SUCCESS` is still there, `manifest.json` still
+    says `success` with the previous run's `run_id` and `finished_at`, and a first-ever
+    run that failed leaves no `manifest.json` at all (`rivet validate` then reports
+    `legacy_run`, exit 0, as on any empty prefix). A consumer that used "the marker is
+    gone" or "the manifest says failed" as its signal that the last run failed must read
+    the run's exit code, or compare the manifest's `run_id` with the run it started.
+  - `--resume` reads the run journal beside the marker, so its behaviour after such a
+    failure is what it was: `rivet apply <config> --resume` runs again an export whose last
+    journaled run failed, even though an earlier run's `_SUCCESS` is still at its prefix, and
+    `rivet run --resume` is not refused over that marker. Both read `export_metrics` in the
+    state database the config names; with a state database that has no row for the export
+    the marker alone decides, as before.
+  - Upgrading: nothing to migrate. A prefix that 0.31 or earlier already re-marked as
+    failed stays so until the next successful run writes its manifest and marker.
+- **Breaking: `--resume` over a complete prefix is refused by code, and `--resume --force`
+  runs on every strategy.** Applies to `rivet run --resume` on every source engine.
+  - Before, `--resume` into a prefix that holds `_SUCCESS` exited 1 with no code and said
+    "Re-running would overwrite a verified dataset. Pass --force to override". On a
+    `chunk_checkpoint: true` export `--resume --force` then exited 1 with "nothing to
+    continue" and re-marked the complete prefix as failed; on the other strategies it
+    exported again. Nothing was ever overwritten.
+  - Now the refusal is `RIVET_DEST_ALREADY_COMPLETE` (exit 5, was 1) and says what
+    `--force` does: it continues an interrupted run of the export if one is recorded, else
+    the run goes on as a plain run does (a `full` export is exported again, a delta export
+    continues past its cursor); new parts land beside the old ones and `manifest.json` then
+    describes only the new run. `--resume --force` does that on a
+    checkpointed chunked export too. `--resume` without `--force` and with no run to
+    continue is refused as before ("nothing to continue; run without --resume").
+  - A script that matched exit 1 or the old text of this refusal must match exit 5 or the
+    code.
 - **Breaking: SQL Server CDC refuses a log gap from the first run after the baseline.**
   Applies to a `mode: cdc` SQL Server export with `cdc.initial: snapshot`.
   - Before, the checkpoint the baseline wrote (`"pinned": true`) could sit below the capture

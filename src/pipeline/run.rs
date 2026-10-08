@@ -923,7 +923,7 @@ pub(crate) fn run_waves(
         let pending: Vec<&ExportConfig> = exports
             .iter()
             .copied()
-            .filter(|e| finalize::needs_run(e, resume, "apply"))
+            .filter(|e| finalize::needs_run(e, resume, "apply", &state))
             .collect();
         if pending.is_empty() {
             continue;
@@ -1705,7 +1705,7 @@ pub(crate) fn run_pool(
             if split {
                 return true; // per-unit skip happens after the split
             }
-            finalize::needs_run(e, resume, "apply --pool")
+            finalize::needs_run(e, resume, "apply --pool", &state)
         })
         .collect();
     if effective.is_empty() {
@@ -1810,7 +1810,7 @@ pub(crate) fn run_pool(
     // never-started one runs fresh — the per-unit resume flag is set at the call
     // site below). Non-split exports still skip on their own prefix _SUCCESS.
     if split && resume {
-        super::split::skip_completed(realized.as_ref(), &mut effective);
+        super::split::skip_completed(realized.as_ref(), &mut effective, &state);
         if effective.is_empty() {
             // Every split unit is complete — but this return sits ABOVE the
             // pool's prefix-`_SUCCESS` writer, so a crash in the

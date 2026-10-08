@@ -20,16 +20,10 @@ pub const FAILED_RUN_LEAVES_ENV: &str = "RIVET_TEST_FAILED_RUN_LEAVES";
 const FAULT_ENVS: &[&str] = &["RIVET_TEST_PANIC_AT", "RIVET_TEST_ERROR_AT"];
 
 /// Product defects every failed run may show until the product is fixed: the kind and why (pinned by tests/offline/rig_oracle_ratchet.rs; the list only shrinks).
-pub(crate) const KNOWN_PRODUCT_DEFECTS: &[(Leftover, &str)] = &[
-    (
-        Leftover::ObservedSchema,
-        "known defect: a first run that fails stores the drift baseline (src/state/schema.rs `detect_schema_change`) in export_schema, which src/state/migrations.rs v18 documents as success-only",
-    ),
-    (
-        Leftover::ManifestBeforeAWrite,
-        "known defect: a run that fails before its first write still rewrites manifest.json to failed and withdraws `_SUCCESS` (owner decision 2026-10-07: it leaves both alone); the cells are live_operator_contract::open_defect_a_run_that_never_connected_keeps_the_export_complete_*",
-    ),
-];
+pub(crate) const KNOWN_PRODUCT_DEFECTS: &[(Leftover, &str)] = &[(
+    Leftover::ObservedSchema,
+    "known defect: a first run that fails stores the drift baseline (src/state/schema.rs `detect_schema_change`) in export_schema, which src/state/migrations.rs v18 documents as success-only",
+)];
 
 /// The kinds a failed run may leave with no declaration: its own record of the stop.
 const OWN_RECORD: &[Leftover] = &[Leftover::FailureRecord, Leftover::FailedManifest];
@@ -856,19 +850,16 @@ mod tests {
             remarked_after("INSERT INTO file_log VALUES (1, 'e', 'part-1.parquet')"),
             clean("left only failed-manifest x3, file-log x1")
         );
-        let Verdict::Refused { left, known, .. } = remarked_after("SELECT 1") else {
-            panic!("a known defect, not a failure");
-        };
-        assert_eq!(left, "left only failed-manifest-before-a-write x3");
-        assert_eq!(known.len(), 1, "{known:?}");
+        let before_a_write = |v: Verdict| matches!(v, Verdict::Fail(ref l) if l.len() == 3 && l.iter().all(|f| f.starts_with("failed-manifest-before-a-write: ")));
         assert!(
-            known[0].0.starts_with("[a failed run left: failed-manifest-before-a-write] known defect: a run that fails before its first write"),
-            "{known:?}"
+            before_a_write(remarked_after("SELECT 1")),
+            "a run that wrote nothing re-marked the prefix"
         );
-        let other = remarked_after("INSERT INTO file_log VALUES (1, 'sibling', 'part-1.parquet')");
         assert!(
-            matches!(other, Verdict::Refused { ref known, .. } if known.len() == 1),
-            "a sibling's write does not make this export's manifest its run's own: {other:?}"
+            before_a_write(remarked_after(
+                "INSERT INTO file_log VALUES (1, 'sibling', 'part-1.parquet')"
+            )),
+            "a sibling's write does not make this export's manifest its run's own"
         );
     }
 

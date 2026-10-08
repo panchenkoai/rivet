@@ -621,6 +621,49 @@ seeds:
       oracle:
         cells: [run_validate_fails_the_run_over_a_failed_validation_oracle]
 
+  - name: failed-run-remarks-the-prefix-before-a-write
+    class: a run that fails before its first write still rewrites `manifest.json` to failed and deletes `_SUCCESS` over a complete export
+    history: "2026-10-07 CLI sweep, RESULTS 8 - a complete export, then a run that cannot reach the source (exit 2): `_SUCCESS` gone and manifest.json `failed`, 0 rows, so `rivet validate` exits 1 after a network failure; on main and on v0.31.0"
+    scope: source
+    patch: failed-run-remarks-the-prefix-before-a-write/shared.patch
+    engines:
+      lib:
+        cells: ["lib:a_run_that_failed_before_its_first_write_leaves_the_complete_export_as_it_was"]
+      postgres:
+        cells:
+          - a_run_that_never_connected_keeps_the_export_complete_postgres
+          - a_run_that_never_connected_keeps_the_export_complete_s3
+          - a_run_that_never_connected_keeps_the_export_complete_gcs
+          - a_run_that_never_connected_keeps_the_export_complete_azure
+          - a_resume_that_never_connected_leaves_the_unfinished_run_as_it_was_postgres
+      mysql:
+        cells: [a_run_that_never_connected_keeps_the_export_complete_mysql]
+      mssql:
+        cells: [a_run_that_never_connected_keeps_the_export_complete_mssql]
+      mongo:
+        cells: [a_run_that_never_connected_keeps_the_export_complete_mongo]
+      oracle:
+        cells: [a_run_that_never_connected_keeps_the_export_complete_oracle]
+
+  - name: forced-resume-refused-as-nothing-to-continue
+    class: "`--resume --force` over a complete prefix of a checkpointed chunked export is refused as `nothing to continue`, against the refusal that named `--force`"
+    history: "2026-10-07 CLI sweep, RESULTS 12 - `run --resume` over a complete prefix says `Pass --force to override`; `run --resume --force` then exits 1 `nothing to continue` and re-marks the complete prefix as failed; on main and on v0.31.0"
+    scope: source
+    patch: forced-resume-refused-as-nothing-to-continue/shared.patch
+    engines:
+      lib:
+        cells: ["lib:a_forced_resume_with_nothing_to_continue_exports_again"]
+      postgres:
+        cells: [resume_force_runs_over_a_complete_prefix_postgres]
+      mysql:
+        cells: [resume_force_runs_over_a_complete_prefix_mysql]
+      mssql:
+        cells: [resume_force_runs_over_a_complete_prefix_mssql]
+      mongo:
+        na: "the patch removes the chunk runner's run-as-a-plain-run arm (crashed_chunk_run_action); a MongoDB export is never range-chunked, and its `--resume --force` goes past the gate without that arm"
+      oracle:
+        cells: [resume_force_runs_over_a_complete_prefix_oracle]
+
   - name: unwritable-state-run-exports
     class: a run whose state store does not take its first write (the run-status row) exports anyway
     history: "2026-10-07 CLI sweep, RESULTS 3 - an incremental run over a read-only `.rivet_state.db`: exit 0 with no metrics row, and every later run delivers the same delta again (16, then 19 rows for 13 source ids), on main and on v0.31.0"

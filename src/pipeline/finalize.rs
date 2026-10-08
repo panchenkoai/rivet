@@ -259,17 +259,9 @@ pub(super) fn finalize_run_report(config_path: &str, summary: &RunSummary, kind:
 ///
 /// The parts are still durable, which is exactly why this must be loud. Nothing
 /// about the failure is visible in the data; it is visible only here.
-/// A run that SKIPPED and committed no parts has nothing to describe.
-///
-/// Split out of `finalize_manifest` so the decision is reachable without a
-/// `ResolvedRunPlan` and a `StateStore` — the mutation gate found both halves
-/// of this condition unguarded (`==`→`!=` and `&&`→`||` both survived), and
-/// each inversion is a real regression: flipping the equality makes every
-/// SUCCESSFUL run skip its manifest, and widening the `&&` to `||` throws away
-/// the manifest of a skipped run that DID commit parts — the
-/// `[RIVET_VERIFY_SUCCESS_STALE]` shape this guard was added to end.
-pub(super) fn skipped_run_wrote_nothing(summary: &RunSummary) -> bool {
-    summary.status == "skipped" && summary.manifest_parts.is_empty()
+/// Whether a run that did not succeed has no part at the destination (none committed or adopted, none `landed`): the prefix stays as the last run that wrote left it.
+pub(super) fn run_left_the_prefix_alone(summary: &RunSummary, landed: u64) -> bool {
+    summary.status != "success" && summary.manifest_parts.is_empty() && landed == 0
 }
 
 pub(super) fn finalize_manifest(
@@ -342,31 +334,16 @@ pub(super) fn finalize_manifest(
         }
     };
 
-    // A HEALTHY no-op describes nothing, so it must not describe the prefix.
-    //
-    // `"skipped"` is a real production status — `job.rs::ok_status` sets it when a run
-    // reads 0 rows under `skip_empty: true`, the ordinary outcome of an
-    // incremental export with nothing new past the cursor. It used to fall
-    // through the `_` arm below to `Interrupted`, and `write_manifest` then
-    // OVERWROTE the canonical manifest with a zero-part interrupted document
-    // while leaving the previous good run's `_SUCCESS` in place, now stale.
-    //
-    // Measured: run 1 exported 10 rows (manifest success, 1 part, _SUCCESS); run
-    // 2 found nothing new and left `manifest.json` saying `interrupted, 0 parts,
-    // 0 rows` over a prefix still holding the parquet. `rivet validate` then
-    // refused the export — `[RIVET_VERIFY_SUCCESS_STALE]` plus the 10 delivered
-    // rows reported as an `untracked object` — after a run that did nothing
-    // wrong.
-    //
-    // The same early return the no-plan-snapshot case above takes, for the same
-    // reason: there is no committed work to describe. The run itself is recorded
-    // where run history belongs — `export_metrics`, `file_log`, `run_status` —
-    // and the prefix keeps describing the last run that actually delivered.
-    if skipped_run_wrote_nothing(summary) {
-        log::debug!(
-            "{} '{}': skipped run wrote no parts — leaving the prefix's manifest as it stands",
+    // `_SUCCESS` and a success manifest say the prefix holds a whole export, not that the
+    // last run succeeded: a run that skipped, or failed before its first write, is told by
+    // its exit code and the journal (`export_metrics`, `run_status`), never by the prefix.
+    let landed = plan.parts_landed.load(std::sync::atomic::Ordering::Relaxed);
+    if run_left_the_prefix_alone(summary, landed) {
+        log::info!(
+            "{} '{}': the run ({}) put no part at the destination; its manifest and _SUCCESS stay as they were",
             kind,
-            summary.export_name
+            summary.export_name,
+            summary.status
         );
         return None;
     }
@@ -692,7 +669,16 @@ pub(crate) fn write_split_success_marker(
     Ok(())
 }
 
-pub(super) fn check_success_gate_for_resume(plan: &ResolvedRunPlan) -> Result<()> {
+/// Whether the export's newest journaled run failed: a `_SUCCESS` at its prefix is then an earlier run's, left alone by a run that is still to be done again.
+pub(crate) fn last_run_failed(state: &StateStore, export_name: &str) -> Result<bool> {
+    let newest = state.get_metrics(Some(export_name), 1)?;
+    Ok(newest.first().is_some_and(|m| m.status == "failed"))
+}
+
+pub(super) fn check_success_gate_for_resume(
+    plan: &ResolvedRunPlan,
+    state: &StateStore,
+) -> Result<()> {
     use crate::manifest::SUCCESS_FILENAME;
 
     // #167: a `--split` unit shares its prefix with siblings and never writes the
@@ -716,10 +702,16 @@ pub(super) fn check_success_gate_for_resume(plan: &ResolvedRunPlan) -> Result<()
         return Ok(());
     }
     match dest.head(SUCCESS_FILENAME)? {
-        Some(_) => anyhow::bail!(
-            "export '{}': --resume refused — destination prefix already has _SUCCESS \
-             from a prior completed run.  Re-running would overwrite a verified dataset. \
-             Pass --force to override, or use a different destination prefix.",
+        // The marker is an earlier run's: the last run failed before it wrote, and this one redoes it.
+        Some(_) if last_run_failed(state, &plan.export_name)? => Ok(()),
+        Some(_) => crate::rivet_bail!(
+            crate::error::codes::DEST_ALREADY_COMPLETE,
+            "export '{}': --resume refused: the destination prefix already holds a complete \
+             export (_SUCCESS present). Pass --force to go on: the run continues an interrupted \
+             run of this export if there is one, else it runs as a plain run does. What it \
+             exports lands in new parts beside the old ones (nothing is overwritten) and \
+             manifest.json then describes only the new run. Or use a different destination \
+             prefix.",
             plan.export_name
         ),
         None => Ok(()),
@@ -871,8 +863,13 @@ pub(crate) fn repair_missing_split_marker(
     }
 }
 
-/// False when `resume` is set and the export's destination, expanded for today, already holds `_SUCCESS` (logged as a skip by `who`).
-pub(crate) fn needs_run(export: &crate::config::ExportConfig, resume: bool, who: &str) -> bool {
+/// False when `resume` is set, the export's destination, expanded for today, already holds `_SUCCESS`, and the export's last journaled run did not fail (logged as a skip by `who`).
+pub(crate) fn needs_run(
+    export: &crate::config::ExportConfig,
+    resume: bool,
+    who: &str,
+    state: &StateStore,
+) -> bool {
     if !resume {
         return true;
     }
@@ -880,7 +877,8 @@ pub(crate) fn needs_run(export: &crate::config::ExportConfig, resume: bool, who:
     let ctx = crate::destination::placeholder::PlaceholderContext::for_today(&export.name);
     let expanded =
         crate::destination::placeholder::expand_destination(export.destination.clone(), &ctx);
-    if destination_has_success(&expanded) {
+    // An unreadable journal runs the export: the run then meets the same read and fails loudly.
+    if destination_has_success(&expanded) && !last_run_failed(state, &export.name).unwrap_or(true) {
         log::info!(
             "{who}: skipping '{}' — destination already complete (_SUCCESS)",
             export.name
@@ -1565,6 +1563,7 @@ mod tests {
         crate::plan::ResolvedRunPlan {
             split_window: None,
             bytes_read: Default::default(),
+            parts_landed: Default::default(),
             export_name: "public.orders".into(),
             partition_rollover: None,
             source_table: None,
@@ -1608,15 +1607,9 @@ mod tests {
         }
     }
 
-    /// The four corners of "is there anything to describe".
-    ///
-    /// Both halves of the condition were unguarded until the mutation gate said
-    /// so — `==`→`!=` and `&&`→`||` each survived the whole suite. The table
-    /// below fails against either: invert the equality and the SUCCESS row
-    /// stops writing a manifest; widen the `&&` and the skipped-WITH-parts row
-    /// throws away a manifest that describes real committed data.
+    /// Every corner of "did the run put anything at the destination".
     #[test]
-    fn only_a_skipped_run_with_no_parts_has_nothing_to_describe() {
+    fn only_an_unsuccessful_run_with_no_part_at_the_destination_leaves_the_prefix_alone() {
         let with_part = |status: &str| {
             let mut s = RunSummary::stub_for_testing("r", String::from("e"));
             s.status = status.into();
@@ -1637,22 +1630,58 @@ mod tests {
             s
         };
 
+        for status in ["skipped", "failed", "interrupted"] {
+            assert!(
+                run_left_the_prefix_alone(&bare(status), 0),
+                "a {status} run with no part writes no manifest"
+            );
+            assert!(
+                !run_left_the_prefix_alone(&with_part(status), 0),
+                "a {status} run that committed or adopted parts must still describe them"
+            );
+            assert!(
+                !run_left_the_prefix_alone(&bare(status), 1),
+                "a {status} run whose part landed in no manifest withdraws the marker"
+            );
+        }
         assert!(
-            skipped_run_wrote_nothing(&bare("skipped")),
-            "a skipped run with no parts is the one case that writes no manifest"
-        );
-        assert!(
-            !skipped_run_wrote_nothing(&with_part("skipped")),
-            "a skipped run that DID commit parts must still describe them"
-        );
-        assert!(
-            !skipped_run_wrote_nothing(&bare("success")),
+            !run_left_the_prefix_alone(&bare("success"), 0),
             "a successful run always writes its manifest, parts or not"
         );
+        assert!(!run_left_the_prefix_alone(&with_part("success"), 1));
+    }
+
+    #[test]
+    fn a_run_that_failed_before_its_first_write_leaves_the_complete_export_as_it_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = fin_plan(dir.path());
+        let state = crate::state::StateStore::open_in_memory().unwrap();
+        finalize_manifest(&plan, "e", &state, &fin_summary(&plan, "success"), "export");
+        let before = |name: &str| std::fs::read(dir.path().join(name)).unwrap();
+        let (marker, manifest) = (before("_SUCCESS"), before("manifest.json"));
+
+        let mut never_connected = fin_summary(&plan, "failed");
+        never_connected.run_id = "finrun2".into();
+        never_connected.manifest_parts.clear();
+        let gap = finalize_manifest(&plan, "e", &state, &never_connected, "export");
+
+        assert_eq!(gap, None, "an untouched prefix is not a manifest gap");
+        assert_eq!(before("_SUCCESS"), marker);
+        assert_eq!(before("manifest.json"), manifest);
         assert!(
-            !skipped_run_wrote_nothing(&with_part("failed")),
-            "a failed run's committed parts must reach the manifest too"
+            !dir.path().join("manifest-finrun2.json").exists(),
+            "the failed run leaves no per-run manifest either"
         );
+
+        plan.parts_landed
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        finalize_manifest(&plan, "e", &state, &never_connected, "export");
+        assert_eq!(
+            read_manifest(dir.path()).status,
+            crate::manifest::ManifestStatus::Failed,
+            "a part landed: the prefix is no longer the export the marker described"
+        );
+        assert!(!dir.path().join("_SUCCESS").exists());
     }
 
     /// A summary that carries everything finalize_manifest is supposed to
@@ -1715,6 +1744,9 @@ mod tests {
             if !keep_parts {
                 summary.manifest_parts.clear();
                 summary.total_rows = 0;
+                // The part that landed is in no manifest (the transit check refused it).
+                plan.parts_landed
+                    .store(1, std::sync::atomic::Ordering::Relaxed);
             }
             finalize_manifest(&plan, "e", &state, &summary, "export");
             std::fs::read(dir.path().join("manifest.json")).unwrap()
@@ -1815,14 +1847,28 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let plan = fin_plan(dir.path());
         // Empty prefix: resume proceeds.
-        check_success_gate_for_resume(&plan).expect("no _SUCCESS -> gate passes");
+        check_success_gate_for_resume(&plan, &crate::state::StateStore::open_in_memory().unwrap())
+            .expect("no _SUCCESS -> gate passes");
         // Completed prefix: refuse loudly.
         std::fs::write(dir.path().join("_SUCCESS"), b"xxh3:0\n").unwrap();
-        let err = check_success_gate_for_resume(&plan)
-            .expect_err("_SUCCESS present -> resume must be refused");
-        assert!(
-            err.to_string().contains("refused"),
-            "the refusal must be operator-actionable, got: {err:#}"
+        let err = check_success_gate_for_resume(
+            &plan,
+            &crate::state::StateStore::open_in_memory().unwrap(),
+        )
+        .expect_err("_SUCCESS present -> resume must be refused");
+        assert_eq!(
+            err.downcast_ref::<crate::error::CodedError>()
+                .map(|c| c.code()),
+            Some("RIVET_DEST_ALREADY_COMPLETE")
+        );
+        assert_eq!(
+            err.to_string(),
+            "export 'public.orders': --resume refused: the destination prefix already holds a complete \
+             export (_SUCCESS present). Pass --force to go on: the run continues an interrupted \
+             run of this export if there is one, else it runs as a plain run does. What it \
+             exports lands in new parts beside the old ones (nothing is overwritten) and \
+             manifest.json then describes only the new run. Or use a different destination \
+             prefix."
         );
     }
 
@@ -1846,14 +1892,67 @@ mod tests {
             dir.path().display()
         );
         let export: crate::config::ExportConfig = serde_yaml_ng::from_str(&yaml).unwrap();
-        assert!(needs_run(&export, true, "t"), "no marker -> runs");
+        let state = crate::state::StateStore::open_in_memory().unwrap();
+        assert!(needs_run(&export, true, "t", &state), "no marker -> runs");
         std::fs::create_dir_all(dir.path().join("orders")).unwrap();
         std::fs::write(dir.path().join("orders/_SUCCESS"), b"xxh3:0\n").unwrap();
         assert!(
-            !needs_run(&export, true, "t"),
+            !needs_run(&export, true, "t", &state),
             "marker under the expanded path -> skipped"
         );
-        assert!(needs_run(&export, false, "t"), "without --resume -> runs");
+        assert!(
+            needs_run(&export, false, "t", &state),
+            "without --resume -> runs"
+        );
+    }
+
+    /// Journal one run of `orders` with `status`.
+    fn journal_a_run(state: &crate::state::StateStore, run_id: &str, status: &str) {
+        let plan = fin_plan(std::path::Path::new("/unused"));
+        let mut summary = RunSummary::stub_for_testing(run_id, String::from("orders"));
+        summary.status = status.into();
+        state
+            .record_metric_full(&crate::pipeline::job::build_metric_row(
+                &summary, &plan, "balanced",
+            ))
+            .unwrap();
+    }
+
+    #[test]
+    fn a_resume_over_a_marker_an_earlier_run_left_redoes_the_run_that_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = format!(
+            "name: orders\nquery: \"SELECT 1\"\nformat: parquet\ndestination:\n  type: local\n  path: {}\n",
+            dir.path().display()
+        );
+        let export: crate::config::ExportConfig = serde_yaml_ng::from_str(&yaml).unwrap();
+        let mut plan = fin_plan(dir.path());
+        plan.export_name = "orders".into();
+        let state = crate::state::StateStore::open_in_memory().unwrap();
+        std::fs::write(dir.path().join("_SUCCESS"), b"xxh3:0\n").unwrap();
+        let settled = |state: &crate::state::StateStore| {
+            (
+                !needs_run(&export, true, "t", state),
+                check_success_gate_for_resume(&plan, state).is_err(),
+                last_run_failed(state, "orders").unwrap(),
+            )
+        };
+
+        assert_eq!(settled(&state), (true, true, false), "no run journaled");
+        journal_a_run(&state, "r1", "success");
+        assert_eq!(settled(&state), (true, true, false), "the run succeeded");
+        journal_a_run(&state, "r2", "failed");
+        assert_eq!(
+            settled(&state),
+            (false, false, true),
+            "the marker is r1's; r2 failed before it wrote and is to be done again"
+        );
+        journal_a_run(&state, "other", "skipped");
+        assert_eq!(
+            settled(&state),
+            (true, true, false),
+            "a later run settled it"
+        );
     }
 
     /// The crash-in-[last unit → marker] window repair: a complete split prefix

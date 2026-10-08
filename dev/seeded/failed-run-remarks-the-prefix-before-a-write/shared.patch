@@ -1,0 +1,13 @@
+diff --git a/src/pipeline/finalize.rs b/src/pipeline/finalize.rs
+--- a/src/pipeline/finalize.rs
++++ b/src/pipeline/finalize.rs
+@@ -261,7 +261,8 @@
+ /// about the failure is visible in the data; it is visible only here.
+ /// Whether a run that did not succeed has no part at the destination (none committed or adopted, none `landed`): the prefix stays as the last run that wrote left it.
+ pub(super) fn run_left_the_prefix_alone(summary: &RunSummary, landed: u64) -> bool {
+-    summary.status != "success" && summary.manifest_parts.is_empty() && landed == 0
++    let _ = landed;
++    summary.status == "skipped" && summary.manifest_parts.is_empty()
+ }
+ 
+ pub(super) fn finalize_manifest(
