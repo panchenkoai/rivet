@@ -52,6 +52,29 @@
     and continues, so an edit of the destination or format made in the same step as the
     upgrade is not seen; make the upgrade and the edit two separate runs. A run that 0.31
     left unfinished is resumed with the behaviour above.
+
+- **Behaviour change: a table that is empty at its CDC baseline gets an empty warehouse
+  table.** Applies to a `mode: cdc` export with `cdc.backfill:` loaded under
+  `load.layout: base_buffer` (BigQuery), every source engine.
+  - Before, the load consumed the empty baseline as "nothing to load" and created no
+    `<table>`. `rivet compact` passed the table by until its first change was buffered, and
+    from then on refused it on every cycle (`the base table does not exist`; 0.30 and older
+    passed BigQuery's `Not found: Table` through), so the command exited non-zero although
+    every other table was merged. The buffered changes stayed in `<table>__changes`.
+  - Now the load of an empty baseline creates `<table>` empty, with the spec's columns,
+    `__is_deleted`, partition and clustering, and the first change merges into it. A new
+    baseline that holds no row empties an existing base the same way, in every load; before,
+    it did so only when the same load also carried change files.
+  - Upgrading: nothing to do. The first `rivet load` of this version creates the missing
+    table and prints `note: ... does not exist although its baseline was loaded`, and the next
+    `rivet compact` merges every change buffered since the baseline. It does so only when the
+    state DB beside the config recorded exactly one baseline run for the table, with 0 rows,
+    and no compaction ever merged a row into it. A table whose base was dropped by hand after
+    it held rows is still refused by `rivet compact`, as before, and so is one whose state DB
+    does not hold the extract's run records (a load that runs on another host).
+  - `rivet compact` over several tables exits 1 when at least one table failed, names each
+    failed table, and still merges and reports (`COMPACT OK`) the others.
+
 - **Breaking (file names): a single-runner part is named after its run, with the process id
   and a random nonce appended.** Applies to `mode: full`, `mode: incremental` and time-window
   exports that are not chunked, on every source engine, and to MongoDB `parallel` exports.
@@ -133,6 +156,29 @@
     the highest key of the ranges that commit after the upgrade, as 0.31 did. The state
     schema moves to v35 (`keyset_range.max_key`), so an older rivet no longer opens the
     state database.
+- **Breaking: a CDC stream that cannot continue exits 5 with a `RIVET_*` code, where it exited 1
+  with none.** Applies to `mode: cdc` runs and `rivet cdc` on PostgreSQL, MySQL, SQL Server,
+  MongoDB and Oracle.
+  - `RIVET_SOURCE_CDC_CHECKPOINT_INVALID`: a checkpoint file that is not JSON (every engine),
+    and a checkpoint file that is gone while the export has a baseline (MySQL, SQL Server,
+    MongoDB, Oracle).
+  - `RIVET_SOURCE_CDC_TRUNCATED`: a TRUNCATE of a captured table (PostgreSQL, MySQL; Oracle
+    gave it already), a DROP of one (MySQL), a dropped captured collection or database
+    (MongoDB).
+  - `RIVET_SOURCE_CDC_LOG_GAP`: a PostgreSQL slot missing under a checkpoint or a baseline,
+    MySQL binlogs purged past the checkpoint (`ERROR 1236`), a MongoDB oplog rolled past the
+    resume token (error 286). The MongoDB refusal used to end with "change streams require a
+    replica set", which was not the cause; it now names the oplog and the re-baseline.
+  - The corrupt-checkpoint message said "delete it to accept a new anchor from a fresh
+    snapshot". That was wrong on every engine but PostgreSQL: with a baseline the next run
+    refused the missing file, and without one it anchored at the current position and skipped
+    every change since the checkpoint. The message now ends "Restore the file, or:" and the
+    re-baseline steps, the same ones every other CDC data-loss message prints.
+  - What is refused has not changed, and nothing stored changes: a checkpoint and a state
+    database written by 0.31.0 resume as before.
+  - Upgrading: a script or scheduler that matched exit 1 for these cases now sees exit 5
+    (`refusal`: do not retry, follow the remedy in the message). `rivet schema errors` lists
+    the three codes.
 - **Breaking: a run that fails before its first write leaves the destination as it was.**
   Applies to every batch export (`full`, `incremental`, `chunked`, keyset, the snapshot leg
   of a CDC export) on every source engine and on every destination that keeps objects at

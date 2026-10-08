@@ -311,3 +311,187 @@ fn partner_shape_three_tables_one_stream_postgres() {
     );
     cycle(rig, tables, bq, &mut client);
 }
+
+/// Every row of one table's base, flagged or not: `(rows, flagged, NULL flags)`.
+fn base_rows(bq: &BqLive, table: &str) -> (i64, i64, i64) {
+    let row = &bq.read_bq_rows(&format!(
+        "SELECT COUNT(*) AS n, COUNTIF(__is_deleted) AS gone, \
+         COUNTIF(__is_deleted IS NULL) AS unflagged FROM `{}.{}.{table}`",
+        bq.project, bq.dataset
+    ))[0];
+    let g = |k: &str| -> i64 { row[k].as_str().expect(k).parse().expect("a number") };
+    (g("n"), g("gone"), g("unflagged"))
+}
+
+/// One stream over a table that holds rows at the baseline and one that holds NONE:
+/// the empty one's base exists from the first load, and its first insert, update and
+/// delete each reach it through the ordinary `run → load → compact` cycle, exit 0.
+fn empty_at_baseline_cycle(rig: Rig, tables: Vec<String>, bq: BqLive, src: &mut dyn Source) {
+    let changes: Vec<String> = tables.iter().map(|t| format!("{t}__changes")).collect();
+    let all: Vec<&str> = tables
+        .iter()
+        .chain(changes.iter())
+        .map(String::as_str)
+        .collect();
+    let _cleanup = bq.cleanup(&all);
+    let (full, empty) = (&tables[0], &tables[1]);
+    for id in ids(0, 1, 3) {
+        src.exec(&format!("INSERT INTO {full} (id, v) VALUES ({id}, {id})"));
+    }
+
+    rig.run_ok();
+    load_ok(&rig);
+    compact_ok(&rig);
+    assert_eq!(
+        bq.read_bq_table_type(empty).as_deref(),
+        Some("BASE TABLE"),
+        "baseline: a table empty at the source is an EMPTY base, not a missing one"
+    );
+    for t in &tables {
+        assert_table_is_source(&bq, t, src, "baseline");
+    }
+
+    // The first insert into the table that was empty, beside a change in its sibling.
+    let first = ids(1, 1, 2);
+    src.exec(&format!(
+        "INSERT INTO {empty} (id, v) VALUES ({}, 1), ({}, 2)",
+        first[0], first[1]
+    ));
+    src.exec(&format!(
+        "INSERT INTO {full} (id, v) VALUES ({}, 4)",
+        ids(0, 4, 4)[0]
+    ));
+    rig.run_ok();
+    load_ok(&rig);
+    compact_ok(&rig);
+    for t in &tables {
+        assert_table_is_source(&bq, t, src, "first insert");
+    }
+
+    // Its first update and its first delete.
+    src.exec(&format!(
+        "UPDATE {empty} SET v = 100 WHERE id = {}",
+        first[0]
+    ));
+    src.exec(&format!("DELETE FROM {empty} WHERE id = {}", first[1]));
+    rig.run_ok();
+    load_ok(&rig);
+    compact_ok(&rig);
+    for t in &tables {
+        assert_table_is_source(&bq, t, src, "first update and delete");
+    }
+    assert_eq!(
+        base_rows(&bq, empty),
+        (2, 1, 0),
+        "the delete is a flag on a kept row, and no row lacks the flag"
+    );
+    assert_eq!(
+        bq.read_bq_rows(&format!(
+            "SELECT v FROM `{}.{}.{empty}` WHERE id = {}",
+            bq.project, bq.dataset, first[0]
+        ))[0]["v"]
+            .as_str(),
+        Some("100"),
+        "the update reached the base"
+    );
+
+    // A mixed outcome: one base is dropped by hand, the other table's cycle is ordinary.
+    // The command fails, names the table it refused, and still compacts the other.
+    let fqtn = |t: &str| format!("{}.{}.{t}", bq.project, bq.dataset);
+    bq.exec(&format!("DROP TABLE `{}`", fqtn(full)));
+    src.exec(&format!(
+        "INSERT INTO {full} (id, v) VALUES ({}, 5)",
+        ids(0, 5, 5)[0]
+    ));
+    src.exec(&format!(
+        "INSERT INTO {empty} (id, v) VALUES ({}, 3)",
+        ids(1, 3, 3)[0]
+    ));
+    rig.run_ok();
+    load_ok(&rig);
+    let out = rig.cli(&["compact"]);
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        (
+            out.status.code(),
+            said.contains(&format!("COMPACT OK [{empty}]")),
+            said.contains(&format!("COMPACT FAILED [{full}]")),
+            said.contains("the base table does not exist"),
+        ),
+        (Some(1), true, true, true),
+        "(exit code, the healthy table is reported merged, the other is named as failed, \
+         with its cause):\n{said}"
+    );
+    assert_table_is_source(&bq, empty, src, "mixed outcome");
+    let last = |t: &str| {
+        ledger_load_statuses(&rig.config_path(), &fqtn(t))
+            .last()
+            .cloned()
+    };
+    assert_eq!(
+        (last(empty).as_deref(), last(full).as_deref()),
+        (Some("success"), Some("refused")),
+        "the ledger records each table's own outcome"
+    );
+    assert_eq!(
+        buffered(&bq, full),
+        1,
+        "a base that held rows is not rebuilt empty: its buffer waits, whole"
+    );
+}
+
+#[test]
+#[ignore = "live: requires mysql-cdc + BigQuery creds"]
+fn a_table_empty_at_baseline_takes_its_first_changes_mysql() {
+    let Some(bq) = BqLive::from_env("empty_my") else {
+        return;
+    };
+    let mut conn = cdc_conn();
+    let tables: Vec<String> = (0..2)
+        .map(|i| unique_name(&format!("empty_my{i}")))
+        .collect();
+    let mut guards = Vec::new();
+    for t in &tables {
+        conn.exec(&format!("DROP TABLE IF EXISTS {t}"));
+        conn.exec(&format!("CREATE TABLE {t} (id BIGINT PRIMARY KEY, v INT)"));
+        guards.push(MysqlCdcTable(t.clone()));
+    }
+    let rig = shaped(
+        Rig::mysql_cdc(&tables[0]).export_named("stream"),
+        &tables,
+        &bq,
+    );
+    empty_at_baseline_cycle(rig, tables, bq, &mut conn);
+}
+
+#[test]
+#[ignore = "live: requires postgres-cdc (wal_level=logical) + BigQuery creds"]
+fn a_table_empty_at_baseline_takes_its_first_changes_postgres() {
+    let Some(bq) = BqLive::from_env("empty_pg") else {
+        return;
+    };
+    let mut client =
+        postgres::Client::connect(POSTGRES_CDC_URL, postgres::NoTls).expect("connect postgres-cdc");
+    let tables: Vec<String> = (0..2)
+        .map(|i| unique_name(&format!("empty_pg{i}")))
+        .collect();
+    let mut guards: Vec<Box<dyn std::any::Any>> = Vec::new();
+    for t in &tables {
+        client.exec(&format!(
+            "DROP TABLE IF EXISTS {t}; CREATE TABLE {t} (id BIGINT PRIMARY KEY, v INT)"
+        ));
+        guards.push(Box::new(PgTable::adopt_on(POSTGRES_CDC_URL, t.clone())));
+    }
+    let slot = unique_name("empty_pg_slot");
+    guards.push(Box::new(Slot::new(slot.clone())));
+    let rig = shaped(
+        Rig::pg_cdc(&tables[0], &slot).export_named("stream"),
+        &tables,
+        &bq,
+    );
+    empty_at_baseline_cycle(rig, tables, bq, &mut client);
+}
