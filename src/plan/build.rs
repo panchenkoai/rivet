@@ -99,8 +99,8 @@ pub(crate) fn build_plan_on(
             export.name
         );
     }
-    let base_query = {
-        let q = export.resolve_query(config_dir, params)?;
+    let (resolved, written) = export.resolve_query_and_template(config_dir, params)?;
+    let bounded = |q: String| {
         // #167: a `--split` range sub-export restricts the whole export to its key
         // window `(lo, hi]`. Injected HERE (on the base query every runner wraps)
         // so the bound is runner-agnostic by construction — full/chunked/keyset
@@ -123,6 +123,8 @@ pub(crate) fn build_plan_on(
             None => q,
         }
     };
+    let query_template = written.filter(|w| *w != resolved).map(&bounded);
+    let base_query = bounded(resolved);
 
     let merged = merge_tuning_config(config.source.tuning.as_ref(), export.tuning.as_ref());
     // When no `tuning.profile:` is set, fall back to the env-derived default —
@@ -226,6 +228,7 @@ pub(crate) fn build_plan_on(
             .clone()
             .or_else(|| export.table.clone()),
         base_query,
+        query_template,
         is_split_unit: export.split.is_some(),
         // Thread the split window into the plan so finalize records it in the manifest —
         // the durable anchor for exact-partition resume (SplitSynth → manifest::SplitWindow).
@@ -1011,6 +1014,164 @@ mod tests {
             },
             ..crate::config::sample_export("test_export")
         }
+    }
+
+    /// The plan of the one export of a config file whose export body is `export`, built under `params`.
+    fn planned(dir: &Path, export: &str, params: &[(&str, &str)]) -> ResolvedRunPlan {
+        let path = dir.join("rivet.yaml");
+        let yaml = format!(
+            "source:\n  type: postgres\n  url: \"postgresql://localhost/test\"\nexports:\n\
+             \x20 - name: orders\n{export}\n    mode: incremental\n    cursor_column: id\n\
+             \x20   format: parquet\n    destination: {{ type: local, path: ./out }}\n"
+        );
+        std::fs::write(&path, yaml).unwrap();
+        let params: HashMap<String, String> = params
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let params = (!params.is_empty()).then_some(&params);
+        let config = Config::load_with_params(path.to_str().unwrap(), params)
+            .unwrap_or_else(|e| panic!("fixture must load: {e:#}"));
+        build_plan(
+            &config,
+            &config.exports[0],
+            dir,
+            false,
+            false,
+            false,
+            params,
+        )
+        .expect("plan")
+    }
+
+    /// The rows part of the progress identity is the query as written: a placeholder's value is not part of it, the text around it is.
+    #[test]
+    fn a_placeholder_value_is_not_part_of_the_progress_identity_and_the_query_text_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows = |export: &str, params: &[(&str, &str)]| {
+            let plan = planned(dir.path(), export, params);
+            (plan.progress_key().population, plan)
+        };
+        let inline = "    query: \"SELECT id FROM ${t} WHERE region = '${region}'\"";
+        let (eu, eu_plan) = rows(inline, &[("t", "orders"), ("region", "eu")]);
+        let (us, us_plan) = rows(inline, &[("t", "orders"), ("region", "us")]);
+        assert_eq!(eu, "from ?{t} where region = '${region}'");
+        assert_eq!(eu, us, "another value of the placeholder is the same rows");
+        assert_eq!(
+            eu_plan.base_query,
+            "SELECT id FROM orders WHERE region = 'eu'"
+        );
+        assert_eq!(
+            us_plan.base_query,
+            "SELECT id FROM orders WHERE region = 'us'"
+        );
+        assert_eq!(
+            eu_plan.query_template.as_deref(),
+            Some("SELECT id FROM ${t} WHERE region = '${region}'")
+        );
+        assert_eq!(
+            eu_plan.progress_key().stream,
+            "orders",
+            "the stream is the relation read"
+        );
+        let (other_table, _) = rows(inline, &[("t", "archive"), ("region", "eu")]);
+        assert_eq!(other_table, eu, "the relation is the stream's to compare");
+        assert_eq!(
+            planned(dir.path(), inline, &[("t", "archive"), ("region", "eu")])
+                .progress_key()
+                .stream,
+            "archive"
+        );
+
+        let edited = "    query: \"SELECT id FROM ${t} WHERE region = '${region}' AND id > 0\"";
+        let (edited, _) = rows(edited, &[("t", "orders"), ("region", "eu")]);
+        assert_ne!(edited, eu, "an edit of the text around a placeholder");
+
+        let flow = format!("{inline}\n    meta_columns: {{ exported_at: ${{flag}} }}");
+        let params = [("t", "orders"), ("region", "eu"), ("flag", "true")];
+        let (in_flow, _) = rows(&flow, &params);
+        assert_eq!(
+            in_flow, eu,
+            "a placeholder inside a flow collection elsewhere in the file"
+        );
+
+        let plain = "    query: \"SELECT id FROM orders WHERE region = 'eu'\"";
+        let (literal, literal_plan) = rows(plain, &[]);
+        assert_eq!(literal, "from ? where region = 'eu'");
+        assert_eq!(literal_plan.query_template, None);
+        let sealed = serde_json::to_string(&literal_plan).unwrap();
+        assert!(
+            !sealed.contains("query_template"),
+            "a plan with no placeholder serializes as before"
+        );
+
+        let before: ResolvedRunPlan = {
+            let mut sealed = serde_json::to_value(&eu_plan).unwrap();
+            sealed.as_object_mut().unwrap().remove("query_template");
+            serde_json::from_value(sealed).expect("a plan sealed before the field")
+        };
+        assert_eq!(
+            before.progress_key().population,
+            "from ? where region = 'eu'",
+            "a plan sealed before the field compares its substituted query, as it did"
+        );
+
+        std::fs::write(
+            dir.path().join("q.sql"),
+            "SELECT id FROM orders WHERE region = '${region}';\n",
+        )
+        .unwrap();
+        let (file_eu, file_plan) = rows("    query_file: q.sql", &[("region", "eu")]);
+        let (file_us, _) = rows("    query_file: q.sql", &[("region", "us")]);
+        assert_eq!(file_eu, "from ? where region = '${region}'");
+        assert_eq!(file_eu, file_us);
+        assert_eq!(
+            file_plan.base_query,
+            "SELECT id FROM orders WHERE region = 'eu'"
+        );
+
+        let (table, table_plan) = rows("    table: orders", &[]);
+        assert_eq!(table, "from ?");
+        assert_eq!(table_plan.query_template, None);
+    }
+
+    /// A split unit's key window bounds the query as written as it bounds the query that runs.
+    #[test]
+    fn a_split_window_bounds_the_query_as_written_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let inline = "    query: \"SELECT id FROM orders WHERE region = '${region}'\"";
+        let whole = planned(dir.path(), inline, &[("region", "eu")]);
+        let path = dir.path().join("rivet.yaml");
+        let params: HashMap<String, String> = [("region".to_string(), "eu".to_string())].into();
+        let config = Config::load_with_params(path.to_str().unwrap(), Some(&params)).unwrap();
+        let mut unit = config.exports[0].clone();
+        unit.split = Some(crate::config::SplitSynth {
+            parent: "orders".into(),
+            key_column: "id".into(),
+            lo: Some("10".into()),
+            hi: None,
+        });
+        let plan = build_plan(
+            &config,
+            &unit,
+            dir.path(),
+            false,
+            false,
+            false,
+            Some(&params),
+        )
+        .expect("plan");
+        let template = plan.query_template.as_deref().expect("a placeholder");
+        assert!(template.contains("'${region}'"), "{template}");
+        assert_eq!(
+            template.replace("${region}", "eu"),
+            plan.base_query,
+            "the template is the bounded query with its placeholder in place"
+        );
+        assert_ne!(
+            plan.progress_key().population,
+            whole.progress_key().population
+        );
     }
 
     /// A CDC table's change parts are budgeted only when its change log is itself
