@@ -28,6 +28,8 @@ mod cdc_axis_matrix_guard;
 mod ci_gate_steps_guard;
 #[path = "offline/connect_error_hints.rs"]
 mod connect_error_hints;
+#[path = "offline/fix_cells_guard.rs"]
+mod fix_cells_guard;
 #[path = "offline/form_a_checksum_guard.rs"]
 mod form_a_checksum_guard;
 #[path = "offline/memory_throttle_wiring.rs"]
@@ -63,6 +65,8 @@ mod config_parse_errors;
 mod config_secrets;
 #[path = "offline/destructive_delete_gate.rs"]
 mod destructive_delete_gate;
+#[path = "offline/error_sites_guard.rs"]
+mod error_sites_guard;
 #[path = "offline/examples_parse.rs"]
 mod examples_parse;
 #[path = "offline/extension_seam.rs"]
@@ -146,6 +150,8 @@ mod slot_guard_order_guard;
 mod stand_registry_guard;
 #[path = "offline/state_compat.rs"]
 mod state_compat;
+#[path = "offline/test_checks_guard.rs"]
+mod test_checks_guard;
 #[path = "offline/time_window.rs"]
 mod time_window;
 #[path = "offline/trust_artifacts_integration.rs"]

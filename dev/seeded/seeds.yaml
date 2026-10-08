@@ -554,6 +554,29 @@ seeds:
         cells:
           - "lib:child_processes_take_the_declared_exports_unless_one_writes_to_stdout"
 
+  - name: position-below-log-start-moved-up
+    class: a resume position below the log's low watermark is moved up to it instead of refused, so the changes in between are skipped under exit 0
+    history: "SQL Server: a `pinned` anchor below fn_cdc_get_min_lsn was floored to the capture instance's start; cleanup past unread changes, or a re-created instance, before the first changes run lost them (v0.31.0)"
+    scope: source
+    engines:
+      postgres:
+        na: "the seed is SQL Server's poll statement; this engine has no change-table low watermark to move a position up to"
+      mysql:
+        na: "the seed is SQL Server's poll statement; this engine has no change-table low watermark to move a position up to"
+      mssql:
+        patch: position-below-log-start-moved-up/mssql.patch
+        cells:
+          - mssql_cleanup_past_unread_changes_before_the_first_changes_run_is_refused
+          - mssql_capture_instance_recreated_before_the_first_changes_run_is_refused
+          - mssql_add_column_remedy_before_the_first_changes_run_ends_in_the_log_gap_refusal
+      mongo:
+        na: "the seed is SQL Server's poll statement; this engine has no change-table low watermark to move a position up to"
+      oracle:
+        na: "the seed is SQL Server's poll statement; this engine has no change-table low watermark to move a position up to"
+      lib:
+        patch: position-below-log-start-moved-up/mssql.patch
+        cells: ["lib:a_position_below_the_low_watermark_always_reaches_the_refusal"]
+
   - name: baseline-mark-outlives-capture
     class: a CDC table's baseline mark outlives the capture it describes, so a table put back into the stream (or another table pointed at its destination) is continued with no baseline
     history: "2026-10-07 - a table removed from `tables:`, changed, and put back: exit 0, 2 source rows not delivered and 2 delivered rows not in the source, on PostgreSQL, MySQL, MongoDB and Oracle (v0.31.0)"
@@ -713,3 +736,72 @@ seeds:
         cells: [oracle_cdc_corrupt_checkpoint_fails_loud_not_silently_absent]
       lib:
         cells: ["lib:corrupt_checkpoint_fails_loud_not_silently_absent"]
+
+  - name: plan-sealed-over-unreadable-source
+    class: a preflight command exits 0 and seals its artifact over a source it could not read
+    history: "`rivet plan` over a missing table or a rejected login printed a WARN, exited 0 and wrote a plan `apply` then failed on (CLI sweep 10, 2026-10-07); on MongoDB the preflight did not ask whether the collection exists"
+    scope: source
+    patch: plan-sealed-over-unreadable-source/shared.patch
+    engines:
+      postgres:
+        cells:
+          - plan_refuses_a_table_that_does_not_exist_postgres
+          - plan_refuses_a_password_the_source_rejects_postgres
+      mysql:
+        cells:
+          - plan_refuses_a_table_that_does_not_exist_mysql
+          - plan_refuses_a_password_the_source_rejects_mysql
+      mssql:
+        cells:
+          - plan_refuses_a_table_that_does_not_exist_mssql
+          - plan_refuses_a_password_the_source_rejects_mssql
+      mongo:
+        patch: plan-sealed-over-unreadable-source/mongo.patch
+        cells:
+          - plan_refuses_a_collection_that_does_not_exist_mongo
+          - check_refuses_a_collection_that_does_not_exist_as_run_does_mongo
+      oracle:
+        cells:
+          - plan_refuses_a_table_that_does_not_exist_oracle
+          - plan_refuses_a_password_the_source_rejects_oracle
+
+  - name: missing-bucket-read-as-no-manifest
+    class: a 404 on an object is read as "the object is absent" when the bucket or container itself does not exist
+    history: "`rivet validate` on a bucket that does not exist reported `legacy_run` and exited 0 on S3, GCS and Azure (CLI sweep 5, 2026-10-07)"
+    scope: source
+    patch: missing-bucket-read-as-no-manifest/shared.patch
+    engines:
+      postgres:
+        cells:
+          - validate_fails_on_a_missing_bucket_s3
+          - validate_fails_on_a_missing_bucket_gcs
+          - validate_fails_on_a_missing_bucket_azure
+      mysql:
+        na: "`validate` reads the destination only: the MinIO, fake-gcs and Azurite cells are listed under postgres, and no source engine is involved"
+      mssql:
+        na: "`validate` reads the destination only: the MinIO, fake-gcs and Azurite cells are listed under postgres, and no source engine is involved"
+      mongo:
+        na: "`validate` reads the destination only: the MinIO, fake-gcs and Azurite cells are listed under postgres, and no source engine is involved"
+      oracle:
+        na: "`validate` reads the destination only: the MinIO, fake-gcs and Azurite cells are listed under postgres, and no source engine is involved"
+      lib:
+        cells: ["lib:head_refuses_a_missing_container_and_reads_a_missing_key_as_absent"]
+
+  - name: check-describes-the-config-not-the-plan
+    class: a preflight command describes a strategy derived from the config instead of the plan the runner builds
+    history: "`rivet check` printed `Strategy: chunked(id, size=100000)` and `column: ?` for a `mode: chunked` export the run executed as one unchunked pass (CLI sweep 20, 2026-10-07)"
+    scope: source
+    patch: check-describes-the-config-not-the-plan/shared.patch
+    engines:
+      postgres:
+        cells: [check_names_the_strategy_run_uses_for_chunked_with_no_column_postgres]
+      mysql:
+        cells: [check_names_the_strategy_run_uses_for_chunked_with_no_column_mysql]
+      mssql:
+        cells: [check_names_the_strategy_run_uses_for_chunked_with_no_column_mssql]
+      mongo:
+        na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes), so the planner resolves nothing a `mode: chunked` description could differ from"
+      oracle:
+        cells: [check_names_the_strategy_run_uses_for_chunked_with_no_column_oracle]
+      lib:
+        cells: ["lib:check_describes_the_export_the_planner_resolved"]

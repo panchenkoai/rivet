@@ -1,0 +1,11 @@
+diff --git a/src/destination/cloud.rs b/src/destination/cloud.rs
+--- a/src/destination/cloud.rs
++++ b/src/destination/cloud.rs
+@@ -512,7 +512,6 @@
+                 content_md5: meta.content_md5().map(str::to_string),
+             })),
+             Err(e) if e.kind() == opendal::ErrorKind::NotFound => {
+-                self.require_container()?;
+                 Ok(None)
+             }
+             Err(e) => Err(e.into()),

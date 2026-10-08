@@ -32,6 +32,12 @@ impl CloudBackend for S3Backend {
     const LIST_MD5_IS_TRUSTWORTHY: bool = false;
     const SCHEME: &'static str = "s3";
 
+    /// OpenDAL reports S3's `NoSuchBucket` 404 as `ConfigInvalid`; an S3-compatible store without that code answers `NotFound`.
+    const ABSENT_CONTAINER: &'static [opendal::ErrorKind] = &[
+        opendal::ErrorKind::NotFound,
+        opendal::ErrorKind::ConfigInvalid,
+    ];
+
     fn build_operator(config: &DestinationConfig) -> Result<Operator> {
         let bucket = config
             .bucket

@@ -1072,6 +1072,7 @@ impl CdcEngine {
         self,
         url: &str,
         slot: &str,
+        capture_instance: Option<&str>,
         checkpoint: Option<&std::path::Path>,
         tls: Option<&crate::config::TlsConfig>,
         prior: PriorRun,
@@ -1138,9 +1139,12 @@ impl CdcEngine {
                             url, ckpt, tls,
                         )
                     }
-                    Self::Mssql => {
-                        crate::source::mssql::cdc::pin_checkpoint_at_max_lsn(url, ckpt, tls)
-                    }
+                    Self::Mssql => crate::source::mssql::cdc::pin_checkpoint_at_max_lsn(
+                        url,
+                        capture_instance.unwrap_or_default(),
+                        ckpt,
+                        tls,
+                    ),
                     #[cfg(feature = "oracle")]
                     Self::Oracle => {
                         crate::source::oracle::cdc::pin_checkpoint_at_current(url, tls, ckpt)
@@ -3018,6 +3022,7 @@ mod tests {
                 .ensure_anchor(
                     "mysql://u:p@127.0.0.1:1/db",
                     "unused",
+                    None,
                     Some(&missing),
                     None,
                     PriorRun {

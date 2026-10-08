@@ -54,6 +54,7 @@ from . import (
     clickhouse_load,
     concurrency,
     failure,
+    fix_cells,
     gifs,
     init_delta,
     live_modules,
@@ -807,6 +808,7 @@ def _self_test() -> int:
     upgrade_matrix._self_test()
     _lanes_self_test()
     skip_census._self_test()
+    fix_cells._self_test()
     print("\nregression stage (child harness, stand, banner):")
     return regression._self_test()
 
@@ -1098,6 +1100,8 @@ def gate_stages(ns: argparse.Namespace) -> list[Stage]:
         table.append(Stage("bigquery golden", lambda led: bigquery.run_bigquery_golden(
             led, keep=ns.keep, parallel=ns.engine_parallel, bring_up=bring_up, seed_engine=seed_engine),
             frozenset({"the BigQuery golden's containers"})))
+    # The cells a fix added or edited since the baseline, through the baseline: each must fail there.
+    table.append(serial("fix cells", lambda led: fix_cells.verify_fix_cells(led)))
     # Last: it runs every live_suite test no stage above already ran.
     table.append(serial("live modules", lambda led: live_modules.verify_live_modules(led)))
     return table
