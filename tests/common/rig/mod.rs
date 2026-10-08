@@ -135,12 +135,22 @@ struct SecondaryExport {
     lines: Vec<String>,
 }
 
+/// `table` as an export name no other test process shares: a name without this process's id gets it appended.
+fn process_unique(table: &str) -> String {
+    let pid = std::process::id().to_string();
+    if table.contains(&pid) {
+        table.to_string()
+    } else {
+        format!("{table}_{pid}")
+    }
+}
+
 impl Rig {
     fn new(source_type: &'static str, url: &str, table: &str) -> Self {
         Self {
             source_type,
             source_url: url.to_string(),
-            name: table.to_string(),
+            name: process_unique(table),
             tables: vec![table.to_string()],
             query: None,
             source_lines: Vec::new(),
@@ -457,14 +467,7 @@ impl Rig {
         self
     }
 
-    /// Name the EXPORT independently of the table it reads.
-    ///
-    /// `Rig::<engine>_batch(t)` names the export after the table, which is right
-    /// for the common case and wrong whenever a test needs a unique export name
-    /// for isolation while reading a fixed table — `live_keyset.rs` does this in
-    /// 23 places, driving runs with `--export <unique>` against `table: <fixed>`.
-    /// Without this the config declares one name and the CLI asks for another,
-    /// which fails at RUN time, not compile time.
+    /// Name the export exactly `name`, for a test that passes it to `--export`; the default is the table made process-unique, read back with [`Rig::export_name`].
     pub fn export_named(mut self, name: &str) -> Self {
         self.name = name.to_string();
         self
@@ -1109,6 +1112,19 @@ impl CdcScenario {
 mod rig_render_goldens {
     use super::*;
 
+    /// A fixed literal names an export no other test process shares; a minted name stays as minted, and one test's rigs agree.
+    #[test]
+    fn a_default_export_name_is_unique_to_this_process() {
+        let pid = std::process::id();
+        assert_eq!(Rig::mongo_batch("t").export_name(), format!("t_{pid}"));
+        assert_eq!(
+            Rig::mongo_batch("t").export_name(),
+            Rig::mongo_cdc("t").export_name()
+        );
+        let minted = super::super::unique_name("t");
+        assert_eq!(Rig::pg_batch(&minted).export_name(), minted);
+    }
+
     /// `rivet cdc` takes each engine's stream identity from the rig, and `--checkpoint` only when asked.
     #[test]
     fn cdc_cli_argv_carries_the_rigs_own_stream_identity() {
@@ -1232,29 +1248,38 @@ mod rig_render_goldens {
         let cases: [(&str, Rig, &str); 6] = [
             (
                 "mysql_batch",
-                Rig::mysql_batch("t").dest_path("/tmp/o".into()),
+                Rig::mysql_batch("t")
+                    .export_named("t")
+                    .dest_path("/tmp/o".into()),
                 "source: { type: mysql, url: \"mysql://rivet:rivet@127.0.0.1:3306/rivet\" }\nexports:\n  - name: t\n    table: t\n    mode: full\n    format: parquet\n    destination: { type: local, path: \"/tmp/o\" }\n",
             ),
             (
                 "pg_batch",
-                Rig::pg_batch("t").dest_path("/tmp/o".into()),
+                Rig::pg_batch("t")
+                    .export_named("t")
+                    .dest_path("/tmp/o".into()),
                 "source: { type: postgres, url: \"postgresql://rivet:rivet@127.0.0.1:5432/rivet\" }\nexports:\n  - name: t\n    table: t\n    mode: full\n    format: parquet\n    destination: { type: local, path: \"/tmp/o\" }\n",
             ),
             (
                 "mssql_batch",
-                Rig::mssql_batch("t").dest_path("/tmp/o".into()),
+                Rig::mssql_batch("t")
+                    .export_named("t")
+                    .dest_path("/tmp/o".into()),
                 "source:\n  type: mssql\n  url: \"sqlserver://sa:Rivet_Passw0rd!@127.0.0.1:1433/rivet\"\n  tls:\n    accept_invalid_certs: true\nexports:\n  - name: t\n    table: t\n    mode: full\n    format: parquet\n    destination: { type: local, path: \"/tmp/o\" }\n",
             ),
             (
                 "mysql_cdc",
                 Rig::mysql_cdc("t")
+                    .export_named("t")
                     .checkpoint_path("/tmp/ck".into())
                     .dest_path("/tmp/o".into()),
                 "source: { type: mysql, url: \"mysql://rivet:rivet@127.0.0.1:3307/rivet\" }\nexports:\n  - name: t\n    table: t\n    mode: cdc\n    format: parquet\n    cdc: { until_current: true, checkpoint: \"/tmp/ck\", server_id: SID }\n    destination: { type: local, path: \"/tmp/o\" }\n",
             ),
             (
                 "pg_cdc",
-                Rig::pg_cdc("t", "s1").dest_path("/tmp/o".into()),
+                Rig::pg_cdc("t", "s1")
+                    .export_named("t")
+                    .dest_path("/tmp/o".into()),
                 "source: { type: postgres, url: \"postgresql://rivet:rivet@127.0.0.1:5434/rivet\" }\nexports:\n  - name: t\n    table: t\n    mode: cdc\n    format: parquet\n    cdc: { until_current: true, slot: s1 }\n    destination: { type: local, path: \"/tmp/o\" }\n",
             ),
             // relative_checkpoint on a marker-less constructor must SEED the
@@ -1264,6 +1289,7 @@ mod rig_render_goldens {
             (
                 "pg_cdc_relative_checkpoint",
                 Rig::pg_cdc("t", "s1")
+                    .export_named("t")
                     .relative_checkpoint("./b.ckpt")
                     .dest_path("/tmp/o".into()),
                 "source: { type: postgres, url: \"postgresql://rivet:rivet@127.0.0.1:5434/rivet\" }\nexports:\n  - name: t\n    table: t\n    mode: cdc\n    format: parquet\n    cdc: { until_current: true, slot: s1, checkpoint: \"./b.ckpt\" }\n    destination: { type: local, path: \"/tmp/o\" }\n",

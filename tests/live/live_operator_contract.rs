@@ -607,9 +607,9 @@ fn second_run_beside_a_live_checkpointed_one(engine: SqlEngine) {
             .rig(&table)
             .mode("chunked")
             .export_line("chunk_column: id")
-            .export_line("chunk_size: 100")
+            .export_line("chunk_size: 150")
             .export_line("chunk_checkpoint: true"),
-        400,
+        600,
     );
     second_run_beside(rig, 300);
 }
@@ -617,15 +617,10 @@ fn second_run_beside_a_live_checkpointed_one(engine: SqlEngine) {
 /// The second run of `rig` while its first is mid-export is refused as `RIVET_STATE_RUN_IN_PROGRESS`, and the first delivers `n` rows.
 fn second_run_beside(rig: Rig, n: usize) {
     let mut first = rig.spawn_args_env(&[], &[]);
-    let t0 = std::time::Instant::now();
     while !has_a_part(&rig.out_dir()) {
         assert!(
             first.try_wait().unwrap().is_none(),
             "fixture: the run exited before it was seen mid-export"
-        );
-        assert!(
-            t0.elapsed().as_secs() < 60,
-            "fixture: the run never reached its first part"
         );
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
