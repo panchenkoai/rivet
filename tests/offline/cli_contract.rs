@@ -401,6 +401,43 @@ fn state_runs_refuses_a_missing_config_and_last_zero_tells_the_truth() {
     );
 }
 
+/// `rivet state runs --running` on a fresh config with `RIVET_STATE_URL` set to `url`: `(exit, stderr, a SQLite state appeared)`.
+fn state_runs_under_state_url(url: &str) -> (i32, String, bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("r.yaml");
+    std::fs::write(&cfg, "x: 1\n").unwrap();
+    let out = Command::new(RIVET_BIN)
+        .args(["state", "runs", "--running", "-c", cfg.to_str().unwrap()])
+        .env("RIVET_STATE_URL", url)
+        .output()
+        .expect("failed to spawn rivet binary");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        dir.path().join(".rivet_state.db").is_file(),
+    )
+}
+
+/// A `RIVET_STATE_URL` that is not a PostgreSQL URL is refused by code and opens no SQLite
+/// state; an empty one is the SQLite file beside the config, as an unset one is.
+#[test]
+fn a_state_url_rivet_cannot_use_is_refused_and_an_empty_one_is_sqlite() {
+    for typo in ["postgre://u:p@127.0.0.1:1/s", "mysql://u:p@127.0.0.1:1/s"] {
+        let (code, err, sqlite) = state_runs_under_state_url(typo);
+        assert_eq!(code, 1, "{typo}: {err}");
+        assert!(
+            err.lines().any(|l| l.starts_with(
+                "Error: [RIVET_STATE_URL_SCHEME_UNSUPPORTED] RIVET_STATE_URL has the scheme `"
+            )),
+            "{typo}: {err}"
+        );
+        assert!(!sqlite, "{typo}: the refusal opened a SQLite state");
+    }
+    let (code, err, sqlite) = state_runs_under_state_url("");
+    assert_eq!(code, 0, "{err}");
+    assert!(sqlite, "an empty RIVET_STATE_URL is the SQLite state");
+}
+
 /// `--version` names the COMMIT beside the version: a partner's bug report
 /// names "0.27.0" and three pre-release builds carried that number. The shape
 /// is `rivet <semver> (<sha>)`, `unknown` only where no git and no

@@ -21,7 +21,55 @@
     guess. This affects a table that had no captured change since its baseline while the
     cleanup job ran at least once, or whose capture instance was enabled just before the
     baseline. Re-baseline such a stream once, as the refusal says.
-
+- **Breaking: `rivet run --validate` exits non-zero when its validation fails.** Applies to
+  every source engine and every destination that keeps objects at rest.
+  - Before, a run whose end-of-run verification failed printed `validated: FAIL` and exited 0,
+    while `rivet validate` on the same prefix exited 3. A script or scheduler keyed on the
+    run's exit code learned nothing.
+  - Now the run exits as `rivet validate` does on that prefix: `RIVET_VALIDATE_FAILED`
+    (exit 3) when a check found the destination wrong (a missing part, a size or checksum
+    mismatch, `verify: content` not met), `RIVET_VALIDATE_UNVERIFIED` (exit 1) when the
+    destination could not be read back. The error line names each failure. The export itself
+    is not undone: its parts, manifest, `_SUCCESS`, metrics row and cursor are as before.
+  - Upgrading: a job that ran `rivet run --validate && next` now stops before `next` when
+    the verdict is FAIL. The case to look for is `verify: content` on a destination that
+    exposes no content checksum, such as a local path: those runs print `validated: FAIL`
+    today and exit 0. Use `verify: size` there, or drop `--validate`.
+- **Breaking: a run over a state database it cannot write is refused, and a cursor that could
+  not be stored fails the run.** Applies to `rivet run` and `rivet apply`, every batch mode
+  and source engine.
+  - Before, with a read-only `.rivet_state.db` (file permissions, a read-only volume, a
+    read-only role) a run logged warnings, exported, and exited 0. An incremental run could
+    not advance its cursor, so every later run delivered the same rows again; no run left a
+    metrics row.
+  - Now the run is refused before it exports anything (`RIVET_STATE_NOT_WRITABLE`, exit 1),
+    on every run, until the state takes the write. Make the state database writable and run
+    again: the run then delivers from the stored cursor.
+  - A read-only DIRECTORY around a writable state file (a read-only volume mount) gets the
+    same refusal, from every command that opens the state. Before, it failed with exit 2 and
+    `could not acquire the migration lock ... Another rivet process is migrating this state
+    database; wait for it to finish and retry`, although no other process existed.
+  - If the state fails only at the end, when the rows and the manifest are already written,
+    the run exits non-zero with `RIVET_STATE_CURSOR_NOT_STORED` instead of logging an error
+    and exiting 0. The rows are delivered and the next run delivers them again from the
+    previous cursor, as before; the exit code now says so.
+  - Not changed: `mode: cdc` runs, a `chunk_checkpoint` run (it already failed, with
+    `Permission denied`), and commands that only read the state (`state show`, `metrics`).
+  - Upgrading: nothing to do for a writable state. A deployment that ran on a read-only
+    state and relied on exit 0 now sees exit 1.
+- **Breaking: a `RIVET_STATE_URL` that is not a PostgreSQL URL is refused.** Applies to every
+  command that opens the state (`run`, `plan`, `apply`, `load`, `state`, `metrics`, ...).
+  - Before, any value that did not start with `postgres` (a typo such as `postgre://`,
+    another engine's URL) was ignored without a message: the command kept its state in a
+    SQLite file beside the config. In a container that file is lost with the container, so
+    every run started from no cursor.
+  - Now it is refused with `RIVET_STATE_URL_SCHEME_UNSUPPORTED` (exit 1); no SQLite file is
+    created. Set `RIVET_STATE_URL` to a `postgres://` or `postgresql://` URL, or unset it to
+    keep the state in `.rivet_state.db` beside the config. An empty value still selects
+    SQLite, as an unset one does.
+  - Upgrading: a deployment with such a value has been running on SQLite. After correcting
+    the URL the PostgreSQL state is empty, so each incremental export starts with a full
+    pass; to keep the stored cursors, unset the variable instead and keep the SQLite file.
 - **Breaking: a CDC table put back into `tables:` is refused until it is re-baselined.**
   Applies to `mode: cdc` exports with `cdc.initial: snapshot` or `backfill:`, on every engine.
   - Before, a table removed from `tables:` and added again later kept its old baseline: the run

@@ -1,0 +1,377 @@
+# Sabotage matrix. Deliberate failure as gate cells (tests/live/live_sabotage.rs): after every
+# scenario the only acceptable outcomes are (a) exit 0 with the destination equal to the source,
+# graded by the default oracle at the rig's seam, or (b) a refusal that repeats and whose named
+# remedy leads to (a). "Exit 0 over wrong data" and "a refusal nothing leads out of" are findings:
+# an `open_defect_*` cell, acknowledged in dev/release_oracle/known_red.py with its first line.
+#
+# Row families:
+#   refusal_<code>  one row per `refusal` code of the registry (src/error.rs; the guard derives the
+#                   set). A `test:` cell enters through `Rig::refuses_twice_and_walks_out`: refuse,
+#                   refuse again, each remedy the text names, and one WRONG remedy (a plausible
+#                   action the text does not name), which must refuse or deliver, never exit 0 over
+#                   wrong data. A refusal other cells already assert but nobody walks is a `gap:`.
+#   corrupt_<what>  damage to what a run reads about itself: the manifest, marker and parts of a
+#                   complete export (graded by `validate` and the next run), the chunk_run /
+#                   chunk_task rows and committed parts of an unfinished range-chunk run, and the
+#                   stored cursor of an incremental export (`Rig::damage`, `Rig::edit_state`,
+#                   graded by `Rig::delivers_or_refuses`).
+#
+# Elsewhere, and not repeated here: a corrupt CDC checkpoint file is the corrupt-checkpoint rows of
+# docs/operator-contract-matrix.yaml; a config edited between runs is docs/mode-transition-matrix.yaml;
+# a crash at a named point is docs/resilience-matrix.yaml. Row families still to come: a resource
+# taken away mid-run, two processes on one export, a kill at every phase boundary.
+
+engines: [postgres, mysql, mssql, mongo, oracle]
+
+scenarios:
+  - id: refusal_state_cursor_owner_mismatch
+    what: "RIVET_STATE_CURSOR_OWNER_MISMATCH: `cursor_column` changed with no reset; both named remedies deliver, `state reset-chunks` (the sibling command) leaves the refusal"
+    postgres: { test: a_changed_cursor_column_is_refused_and_walked_out_postgres }
+    mysql:    { test: a_changed_cursor_column_is_refused_and_walked_out_mysql }
+    mssql:    { test: a_changed_cursor_column_is_refused_and_walked_out_mssql }
+    mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no incremental cursor" }
+    oracle:   { test: a_changed_cursor_column_is_refused_and_walked_out_oracle }
+
+  - id: refusal_state_cursor_stream_mismatch
+    what: "RIVET_STATE_CURSOR_STREAM_MISMATCH: an incremental export repointed at another table; both named remedies deliver, `state reset-chunks` leaves the refusal"
+    postgres: { test: a_repointed_incremental_export_is_refused_and_walked_out_postgres }
+    mysql:    { test: a_repointed_incremental_export_is_refused_and_walked_out_mysql }
+    mssql:    { test: a_repointed_incremental_export_is_refused_and_walked_out_mssql }
+    mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no incremental cursor" }
+    oracle:   { test: a_repointed_incremental_export_is_refused_and_walked_out_oracle }
+
+  - id: refusal_state_interrupted_run_owner_mismatch
+    what: "RIVET_STATE_INTERRUPTED_RUN_OWNER_MISMATCH: an unfinished range-chunk run and the export now runs as `incremental`; both named remedies deliver, `state reset` and an emptied destination leave the refusal"
+    postgres: { test: an_unfinished_chunk_run_under_another_mode_is_refused_and_walked_out_postgres }
+    mysql:    { test: an_unfinished_chunk_run_under_another_mode_is_refused_and_walked_out_mysql }
+    mssql:    { test: an_unfinished_chunk_run_under_another_mode_is_refused_and_walked_out_mssql }
+    mongo:    { gap: "an unfinished MongoDB `resume: true` run under another shape is the RESULTS 14 cell (live_operator_contract, an uncoded refusal); the coded refusal needs a MongoDB crash point before the walk can be written" }
+    oracle:   { test: an_unfinished_chunk_run_under_another_mode_is_refused_and_walked_out_oracle }
+
+  - id: refusal_state_keyset_sequential_anchor_unfinished
+    what: "RIVET_STATE_KEYSET_SEQUENTIAL_ANCHOR_UNFINISHED: an unfinished sequential keyset-incremental run and the export now runs with `parallel: 2`; `parallel: 1` delivers, `state reset-chunks` leaves the refusal"
+    postgres: { test: an_unfinished_sequential_keyset_run_under_parallel_is_refused_and_walked_out_postgres }
+    mysql:    { test: an_unfinished_sequential_keyset_run_under_parallel_is_refused_and_walked_out_mysql }
+    mssql:    { test: an_unfinished_sequential_keyset_run_under_parallel_is_refused_and_walked_out_mssql }
+    mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no keyset-incremental run" }
+    oracle:   { test: an_unfinished_sequential_keyset_run_under_parallel_is_refused_and_walked_out_oracle }
+
+  - id: refusal_state_schema_newer
+    what: "RIVET_STATE_SCHEMA_NEWER: a state database at a schema newer than the binary; a state database it created delivers, `state reset` on the newer one leaves the refusal"
+    postgres: { test: a_newer_state_schema_is_refused_and_walked_out_postgres }
+    mysql:    { test: a_newer_state_schema_is_refused_and_walked_out_mysql }
+    mssql:    { test: a_newer_state_schema_is_refused_and_walked_out_mssql }
+    mongo:    { test: a_newer_state_schema_is_refused_and_walked_out_mongo }
+    oracle:   { test: a_newer_state_schema_is_refused_and_walked_out_oracle }
+
+  - id: corrupt_manifest_truncated
+    what: "manifest.json cut in half: `validate` fails twice (exit 3) naming RIVET_VERIFY_MANIFEST_INCONSISTENT, the next run delivers and `validate` passes"
+    postgres: { test: validate_sees_a_truncated_manifest_postgres }
+    mysql:    { test: validate_sees_a_truncated_manifest_mysql }
+    mssql:    { test: validate_sees_a_truncated_manifest_mssql }
+    mongo:    { test: validate_sees_a_truncated_manifest_mongo }
+    oracle:   { test: validate_sees_a_truncated_manifest_oracle }
+
+  - id: corrupt_manifest_not_json
+    what: "manifest.json replaced by text that is not JSON: `validate` fails naming RIVET_VERIFY_MANIFEST_INCONSISTENT, the next run delivers"
+    postgres: { test: validate_sees_a_manifest_that_is_not_json_postgres }
+    mysql:    { test: validate_sees_a_manifest_that_is_not_json_mysql }
+    mssql:    { test: validate_sees_a_manifest_that_is_not_json_mssql }
+    mongo:    { test: validate_sees_a_manifest_that_is_not_json_mongo }
+    oracle:   { test: validate_sees_a_manifest_that_is_not_json_oracle }
+
+  - id: corrupt_manifest_drops_a_part
+    what: "manifest.json with its last part removed from the list: `validate` fails naming a RIVET_VERIFY finding, the next run delivers"
+    postgres: { test: validate_sees_a_manifest_that_drops_a_part_postgres }
+    mysql:    { test: validate_sees_a_manifest_that_drops_a_part_mysql }
+    mssql:    { test: validate_sees_a_manifest_that_drops_a_part_mssql }
+    mongo:    { na: "a MongoDB full export writes one part; a part list with one entry less is an empty list, the same sabotage as the removed manifest" }
+    oracle:   { test: validate_sees_a_manifest_that_drops_a_part_oracle }
+
+  - id: corrupt_manifest_names_a_ghost_part
+    what: "manifest.json naming a part that is not in the destination: `validate` fails naming a RIVET_VERIFY finding, the next run delivers"
+    postgres: { test: validate_sees_a_manifest_naming_a_part_that_is_not_there_postgres }
+    mysql:    { test: validate_sees_a_manifest_naming_a_part_that_is_not_there_mysql }
+    mssql:    { test: validate_sees_a_manifest_naming_a_part_that_is_not_there_mssql }
+    mongo:    { test: validate_sees_a_manifest_naming_a_part_that_is_not_there_mongo }
+    oracle:   { test: validate_sees_a_manifest_naming_a_part_that_is_not_there_oracle }
+
+  - id: corrupt_success_without_manifest
+    what: "`_SUCCESS` and the parts present, manifest.json removed: `validate` does not exit 0"
+    postgres: { test: open_defect_validate_fails_on_a_marker_without_a_manifest_postgres }
+    mysql:    { test: open_defect_validate_fails_on_a_marker_without_a_manifest_mysql }
+    mssql:    { test: open_defect_validate_fails_on_a_marker_without_a_manifest_mssql }
+    mongo:    { test: open_defect_validate_fails_on_a_marker_without_a_manifest_mongo }
+    oracle:   { gap: "an open defect on PostgreSQL, MySQL and SQL Server; the Oracle cell is not written, because no stand that runs `open_defect_` cells has Oracle within reach of the machine this row was built on (CI skips them), so its first failing line could not be read" }
+
+  - id: corrupt_manifest_without_success
+    what: "manifest.json present, `_SUCCESS` removed: the next run delivers and writes the marker again"
+    postgres: { test: a_run_restores_a_removed_success_marker_postgres }
+    mysql:    { test: a_run_restores_a_removed_success_marker_mysql }
+    mssql:    { test: a_run_restores_a_removed_success_marker_mssql }
+    mongo:    { gap: "not written for MongoDB: the generator builds a range-chunked SQL export" }
+    oracle:   { test: a_run_restores_a_removed_success_marker_oracle }
+
+  - id: corrupt_part_truncated
+    what: "a part cut in half: `validate` fails naming RIVET_VERIFY_PART_SIZE_MISMATCH, the next run delivers"
+    postgres: { test: validate_sees_a_truncated_part_postgres }
+    mysql:    { test: validate_sees_a_truncated_part_mysql }
+    mssql:    { test: validate_sees_a_truncated_part_mssql }
+    mongo:    { test: validate_sees_a_truncated_part_mongo }
+    oracle:   { test: validate_sees_a_truncated_part_oracle }
+
+  - id: corrupt_part_replaced
+    what: "a part replaced by the bytes of its sibling: `validate` fails naming a RIVET_VERIFY finding, the next run delivers"
+    postgres: { test: validate_sees_a_part_replaced_by_its_sibling_postgres }
+    mysql:    { test: validate_sees_a_part_replaced_by_its_sibling_mysql }
+    mssql:    { test: validate_sees_a_part_replaced_by_its_sibling_mssql }
+    mongo:    { na: "a MongoDB full export writes one part: it has no sibling" }
+    oracle:   { test: validate_sees_a_part_replaced_by_its_sibling_oracle }
+
+  - id: corrupt_part_removed
+    what: "a part deleted: `validate` fails naming a RIVET_VERIFY finding, the next run delivers"
+    postgres: { test: validate_sees_a_removed_part_postgres }
+    mysql:    { test: validate_sees_a_removed_part_mysql }
+    mssql:    { test: validate_sees_a_removed_part_mssql }
+    mongo:    { test: validate_sees_a_removed_part_mongo }
+    oracle:   { test: validate_sees_a_removed_part_oracle }
+
+  - id: corrupt_chunk_task_marked_completed
+    what: "an unfinished range-chunk run whose pending task is marked `completed` in chunk_task: the resume delivers the source or refuses"
+    postgres: { test: open_defect_a_resume_over_a_task_marked_completed_delivers_or_refuses_postgres }
+    mysql:    { test: open_defect_a_resume_over_a_task_marked_completed_delivers_or_refuses_mysql }
+    mssql:    { test: open_defect_a_resume_over_a_task_marked_completed_delivers_or_refuses_mssql }
+    mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no range-chunk checkpoint" }
+    oracle:   { gap: "an open defect on PostgreSQL, MySQL and SQL Server; the Oracle cell is not written, because no stand that runs `open_defect_` cells has Oracle within reach of the machine this row was built on (CI skips them), so its first failing line could not be read" }
+
+  - id: corrupt_chunk_task_bounds
+    what: "an unfinished range-chunk run whose pending task has a lowered upper bound (a hole between two tasks): the resume delivers the source or refuses"
+    postgres: { test: open_defect_a_resume_over_edited_task_bounds_delivers_or_refuses_postgres }
+    mysql:    { test: open_defect_a_resume_over_edited_task_bounds_delivers_or_refuses_mysql }
+    mssql:    { test: open_defect_a_resume_over_edited_task_bounds_delivers_or_refuses_mssql }
+    mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no range-chunk checkpoint" }
+    oracle:   { gap: "an open defect on PostgreSQL, MySQL and SQL Server; the Oracle cell is not written, because no stand that runs `open_defect_` cells has Oracle within reach of the machine this row was built on (CI skips them), so its first failing line could not be read" }
+
+  - id: corrupt_chunk_tasks_deleted
+    what: "an unfinished range-chunk run whose chunk_task rows are deleted, chunk_run kept: the resume delivers the source or refuses"
+    postgres: { test: open_defect_a_resume_over_deleted_tasks_delivers_or_refuses_postgres }
+    mysql:    { test: open_defect_a_resume_over_deleted_tasks_delivers_or_refuses_mysql }
+    mssql:    { test: open_defect_a_resume_over_deleted_tasks_delivers_or_refuses_mssql }
+    mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no range-chunk checkpoint" }
+    oracle:   { gap: "an open defect on PostgreSQL, MySQL and SQL Server; the Oracle cell is not written, because no stand that runs `open_defect_` cells has Oracle within reach of the machine this row was built on (CI skips them), so its first failing line could not be read" }
+
+  - id: corrupt_chunk_run_deleted
+    what: "an unfinished range-chunk run whose chunk_run row is deleted, tasks kept: the next run delivers the source or refuses"
+    postgres: { test: a_resume_over_a_deleted_chunk_run_delivers_or_refuses_postgres }
+    mysql:    { test: a_resume_over_a_deleted_chunk_run_delivers_or_refuses_mysql }
+    mssql:    { test: a_resume_over_a_deleted_chunk_run_delivers_or_refuses_mssql }
+    mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no range-chunk checkpoint" }
+    oracle:   { test: a_resume_over_a_deleted_chunk_run_delivers_or_refuses_oracle }
+
+  - id: corrupt_chunk_run_marked_completed
+    what: "an unfinished range-chunk run whose chunk_run row is marked `completed`: the next run delivers the source or refuses"
+    postgres: { test: a_resume_over_a_chunk_run_marked_completed_delivers_or_refuses_postgres }
+    mysql:    { test: a_resume_over_a_chunk_run_marked_completed_delivers_or_refuses_mysql }
+    mssql:    { test: a_resume_over_a_chunk_run_marked_completed_delivers_or_refuses_mssql }
+    mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no range-chunk checkpoint" }
+    oracle:   { test: a_resume_over_a_chunk_run_marked_completed_delivers_or_refuses_oracle }
+
+  - id: corrupt_chunk_plan_fingerprint
+    what: "an unfinished range-chunk run whose stored plan fingerprint is edited: the resume delivers the source, or is refused by code naming `rivet state reset-chunks`, which then delivers it"
+    postgres: { test: open_defect_an_edited_plan_fingerprint_delivers_or_is_refused_by_code_and_led_out_postgres }
+    mysql:    { test: open_defect_an_edited_plan_fingerprint_delivers_or_is_refused_by_code_and_led_out_mysql }
+    mssql:    { test: open_defect_an_edited_plan_fingerprint_delivers_or_is_refused_by_code_and_led_out_mssql }
+    mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no range-chunk checkpoint" }
+    oracle:   { gap: "an open defect on PostgreSQL, MySQL and SQL Server; the Oracle cell is not written, because no stand that runs `open_defect_` cells has Oracle within reach of the machine this row was built on (CI skips them), so its first failing line could not be read" }
+
+  - id: corrupt_committed_part_truncated
+    what: "a part an unfinished range-chunk run committed, cut in half before the resume: the resume delivers the source or refuses"
+    postgres: { test: open_defect_a_resume_over_a_truncated_committed_part_delivers_or_refuses_postgres }
+    mysql:    { test: open_defect_a_resume_over_a_truncated_committed_part_delivers_or_refuses_mysql }
+    mssql:    { test: open_defect_a_resume_over_a_truncated_committed_part_delivers_or_refuses_mssql }
+    mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no range-chunk checkpoint" }
+    oracle:   { gap: "an open defect on PostgreSQL, MySQL and SQL Server; the Oracle cell is not written, because no stand that runs `open_defect_` cells has Oracle within reach of the machine this row was built on (CI skips them), so its first failing line could not be read" }
+
+  - id: corrupt_committed_part_removed
+    what: "a part an unfinished range-chunk run committed, deleted before the resume: the resume delivers the source or refuses"
+    postgres: { test: a_resume_over_a_removed_committed_part_delivers_or_refuses_postgres }
+    mysql:    { test: a_resume_over_a_removed_committed_part_delivers_or_refuses_mysql }
+    mssql:    { test: a_resume_over_a_removed_committed_part_delivers_or_refuses_mssql }
+    mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no range-chunk checkpoint" }
+    oracle:   { test: a_resume_over_a_removed_committed_part_delivers_or_refuses_oracle }
+
+  - id: corrupt_committed_part_replaced
+    what: "a part an unfinished range-chunk run committed, replaced by its sibling's bytes before the resume: the resume delivers the source or refuses"
+    postgres: { test: open_defect_a_resume_over_a_replaced_committed_part_delivers_or_refuses_postgres }
+    mysql:    { test: open_defect_a_resume_over_a_replaced_committed_part_delivers_or_refuses_mysql }
+    mssql:    { test: open_defect_a_resume_over_a_replaced_committed_part_delivers_or_refuses_mssql }
+    mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no range-chunk checkpoint" }
+    oracle:   { gap: "an open defect on PostgreSQL, MySQL and SQL Server; the Oracle cell is not written, because no stand that runs `open_defect_` cells has Oracle within reach of the machine this row was built on (CI skips them), so its first failing line could not be read" }
+
+  - id: corrupt_cursor_moved_back
+    what: "the stored incremental cursor moved back: the run delivers the source or refuses"
+    postgres: { test: a_cursor_moved_back_delivers_or_refuses_postgres }
+    mysql:    { test: a_cursor_moved_back_delivers_or_refuses_mysql }
+    mssql:    { test: a_cursor_moved_back_delivers_or_refuses_mssql }
+    mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no incremental cursor" }
+    oracle:   { test: a_cursor_moved_back_delivers_or_refuses_oracle }
+
+  - id: corrupt_cursor_moved_forward
+    what: "the stored incremental cursor moved forward past rows the export never delivered: the run delivers the source or refuses"
+    postgres: { test: open_defect_a_cursor_moved_forward_delivers_or_refuses_postgres }
+    mysql:    { test: open_defect_a_cursor_moved_forward_delivers_or_refuses_mysql }
+    mssql:    { test: open_defect_a_cursor_moved_forward_delivers_or_refuses_mssql }
+    mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no incremental cursor" }
+    oracle:   { gap: "an open defect on PostgreSQL, MySQL and SQL Server; the Oracle cell is not written, because no stand that runs `open_defect_` cells has Oracle within reach of the machine this row was built on (CI skips them), so its first failing line could not be read" }
+
+  - id: corrupt_cursor_wrong_type
+    what: "the stored incremental cursor replaced by a value of another type: the run delivers the source, or is refused by code naming `rivet state reset`, which then delivers it"
+    postgres: { test: open_defect_a_cursor_of_another_type_delivers_or_is_refused_by_code_and_led_out_postgres }
+    mysql:    { test: a_cursor_of_another_type_delivers_or_is_refused_by_code_and_led_out_mysql }
+    mssql:    { test: open_defect_a_cursor_of_another_type_delivers_or_is_refused_by_code_and_led_out_mssql }
+    mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no incremental cursor" }
+    oracle:   { gap: "PostgreSQL and SQL Server refuse with the driver's own error (open defect) and MySQL delivers; which of the two Oracle does could not be read: no Oracle within reach of the machine this row was built on, and a cell that may be an open defect cannot be read in CI" }
+
+  - id: refusal_source_cursor_finer_than_microsecond
+    what: "RIVET_SOURCE_CURSOR_FINER_THAN_MICROSECOND: an incremental cursor on a column finer than a microsecond"
+    postgres: { na: "raised only by the Oracle source (src/source/oracle/mod.rs, the one `SOURCE_CURSOR_FINER_THAN_MICROSECOND` site)" }
+    mysql:    { na: "raised only by the Oracle source (src/source/oracle/mod.rs, the one `SOURCE_CURSOR_FINER_THAN_MICROSECOND` site)" }
+    mssql:    { na: "raised only by the Oracle source (src/source/oracle/mod.rs, the one `SOURCE_CURSOR_FINER_THAN_MICROSECOND` site)" }
+    mongo:    { na: "raised only by the Oracle source (src/source/oracle/mod.rs, the one `SOURCE_CURSOR_FINER_THAN_MICROSECOND` site)" }
+    oracle:   { gap: "no cell asserts this refusal by code; the walk needs a TIMESTAMP(9) cursor column on the Oracle stand, which the machine this row was built on does not have" }
+
+  - id: refusal_source_cdc_foreign_checkpoint
+    what: "RIVET_SOURCE_CDC_FOREIGN_CHECKPOINT: a checkpoint written against another server or stream"
+    postgres: { gap: "asserted by its code only in live_cdc_replica (a MySQL failover); the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
+    mysql:    { gap: "asserted by its code only in live_cdc_replica (a MySQL failover); the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
+    mssql:    { gap: "asserted by its code only in live_cdc_replica (a MySQL failover); the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
+    mongo:    { gap: "asserted by its code only in live_cdc_replica (a MySQL failover); the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
+    oracle:   { gap: "asserted by its code only in live_cdc_replica (a MySQL failover); the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
+
+  - id: refusal_source_cdc_checkpoint_invalid
+    what: "RIVET_SOURCE_CDC_CHECKPOINT_INVALID: a checkpoint file that cannot be read"
+    postgres: { gap: "the refusal and its `delete it` remedy are the corrupt-checkpoint rows of docs/operator-contract-matrix.yaml (open defects on most engines); the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
+    mysql:    { gap: "the refusal and its `delete it` remedy are the corrupt-checkpoint rows of docs/operator-contract-matrix.yaml (open defects on most engines); the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
+    mssql:    { gap: "the refusal and its `delete it` remedy are the corrupt-checkpoint rows of docs/operator-contract-matrix.yaml (open defects on most engines); the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
+    mongo:    { gap: "the refusal and its `delete it` remedy are the corrupt-checkpoint rows of docs/operator-contract-matrix.yaml (open defects on most engines); the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
+    oracle:   { gap: "the refusal and its `delete it` remedy are the corrupt-checkpoint rows of docs/operator-contract-matrix.yaml (open defects on most engines); the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
+
+  - id: refusal_source_cdc_log_gap
+    what: "RIVET_SOURCE_CDC_LOG_GAP: the retained log no longer reaches back to the checkpoint"
+    postgres: { gap: "refused by code in the log-gone rows of docs/operator-contract-matrix.yaml; the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
+    mysql:    { gap: "refused by code in the log-gone rows of docs/operator-contract-matrix.yaml; the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
+    mssql:    { gap: "refused by code in the log-gone rows of docs/operator-contract-matrix.yaml; the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
+    mongo:    { gap: "refused by code in the log-gone rows of docs/operator-contract-matrix.yaml; the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
+    oracle:   { gap: "refused by code in the log-gone rows of docs/operator-contract-matrix.yaml; the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
+
+  - id: refusal_source_cdc_truncated
+    what: "RIVET_SOURCE_CDC_TRUNCATED: a TRUNCATE inside the stream"
+    postgres: { gap: "refused by code in the truncate row of docs/operator-contract-matrix.yaml; the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
+    mysql:    { gap: "refused by code in the truncate row of docs/operator-contract-matrix.yaml; the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
+    mssql:    { gap: "refused by code in the truncate row of docs/operator-contract-matrix.yaml; the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
+    mongo:    { gap: "refused by code in the truncate row of docs/operator-contract-matrix.yaml; the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
+    oracle:   { gap: "refused by code in the truncate row of docs/operator-contract-matrix.yaml; the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
+
+  - id: refusal_source_cdc_undecodable
+    what: "RIVET_SOURCE_CDC_UNDECODABLE: a change the stream cannot decode"
+    postgres: { gap: "asserted by its code, once, in live_cdc and live_cdc_oracledb; the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
+    mysql:    { gap: "asserted by its code, once, in live_cdc and live_cdc_oracledb; the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
+    mssql:    { gap: "asserted by its code, once, in live_cdc and live_cdc_oracledb; the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
+    mongo:    { gap: "asserted by its code, once, in live_cdc and live_cdc_oracledb; the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
+    oracle:   { gap: "asserted by its code, once, in live_cdc and live_cdc_oracledb; the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
+
+  - id: refusal_source_cdc_cell_unsupported
+    what: "RIVET_SOURCE_CDC_CELL_UNSUPPORTED: a captured cell of a type the stream cannot carry"
+    postgres: { gap: "asserted by its code, once, in live_cdc; the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
+    mysql:    { gap: "asserted by its code, once, in live_cdc; the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
+    mssql:    { gap: "asserted by its code, once, in live_cdc; the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
+    mongo:    { gap: "asserted by its code, once, in live_cdc; the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
+    oracle:   { gap: "asserted by its code, once, in live_cdc; the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
+
+  - id: refusal_source_value_unrepresentable
+    what: "RIVET_SOURCE_VALUE_UNREPRESENTABLE: a source value the output type cannot hold"
+    postgres: { gap: "asserted by its code, once, in live_cdc; the walk is not written: refuse twice, `map the value in the export's query:` and `exclude the column` each applied, and one wrong remedy" }
+    mysql:    { gap: "asserted by its code, once, in live_cdc; the walk is not written: refuse twice, `map the value in the export's query:` and `exclude the column` each applied, and one wrong remedy" }
+    mssql:    { gap: "asserted by its code, once, in live_cdc; the walk is not written: refuse twice, `map the value in the export's query:` and `exclude the column` each applied, and one wrong remedy" }
+    mongo:    { gap: "asserted by its code, once, in live_cdc; the walk is not written: refuse twice, `map the value in the export's query:` and `exclude the column` each applied, and one wrong remedy" }
+    oracle:   { gap: "asserted by its code, once, in live_cdc; the walk is not written: refuse twice, `map the value in the export's query:` and `exclude the column` each applied, and one wrong remedy" }
+
+  - id: refusal_source_probe_unreadable
+    what: "RIVET_SOURCE_PROBE_UNREADABLE: a chunk, page or partition key of a type the min/max probe cannot read"
+    postgres: { gap: "asserted by its code, once, in live_planner_zero_rows; the walk is not written: refuse twice, each of the three remedies the text names (another key column, no `parallel:`, `mode: full`), and one wrong remedy" }
+    mysql:    { na: "raised only by the PostgreSQL source (src/source/postgres/mod.rs, the one `SOURCE_PROBE_UNREADABLE` site)" }
+    mssql:    { na: "raised only by the PostgreSQL source (src/source/postgres/mod.rs, the one `SOURCE_PROBE_UNREADABLE` site)" }
+    mongo:    { na: "raised only by the PostgreSQL source (src/source/postgres/mod.rs, the one `SOURCE_PROBE_UNREADABLE` site)" }
+    oracle:   { na: "raised only by the PostgreSQL source (src/source/postgres/mod.rs, the one `SOURCE_PROBE_UNREADABLE` site)" }
+
+  - id: refusal_state_cdc_table_rejoined
+    what: "RIVET_STATE_CDC_TABLE_REJOINED: a table removed from `tables:` and put back"
+    postgres: { gap: "asserted by its code in the multi-table CDC cells (the tests/common/mod.rs helper that reads its text); the walk is not written: refuse twice, the per-table re-baseline of the text applied literally, and one wrong remedy, as a multi-table CdcScenario cell" }
+    mysql:    { gap: "asserted by its code in the multi-table CDC cells (the tests/common/mod.rs helper that reads its text); the walk is not written: refuse twice, the per-table re-baseline of the text applied literally, and one wrong remedy, as a multi-table CdcScenario cell" }
+    mssql:    { gap: "asserted by its code in the multi-table CDC cells (the tests/common/mod.rs helper that reads its text); the walk is not written: refuse twice, the per-table re-baseline of the text applied literally, and one wrong remedy, as a multi-table CdcScenario cell" }
+    mongo:    { gap: "asserted by its code in the multi-table CDC cells (the tests/common/mod.rs helper that reads its text); the walk is not written: refuse twice, the per-table re-baseline of the text applied literally, and one wrong remedy, as a multi-table CdcScenario cell" }
+    oracle:   { gap: "asserted by its code in the multi-table CDC cells (the tests/common/mod.rs helper that reads its text); the walk is not written: refuse twice, the per-table re-baseline of the text applied literally, and one wrong remedy, as a multi-table CdcScenario cell" }
+
+  - id: refusal_state_chunk_run_owner_unknown
+    what: "RIVET_STATE_CHUNK_RUN_OWNER_UNKNOWN: an unfinished chunk run a rivet that recorded no source left, under a name two sources share"
+    postgres: { gap: "needs a state database written by rivet 0.31 or earlier (a `chunk_run` row with no source) holding progress of one export name under two sources: the upgrade stand's fixture, not an edited row" }
+    mysql:    { gap: "needs a state database written by rivet 0.31 or earlier (a `chunk_run` row with no source) holding progress of one export name under two sources: the upgrade stand's fixture, not an edited row" }
+    mssql:    { gap: "needs a state database written by rivet 0.31 or earlier (a `chunk_run` row with no source) holding progress of one export name under two sources: the upgrade stand's fixture, not an edited row" }
+    mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no range-chunk checkpoint" }
+    oracle:   { gap: "needs a state database written by rivet 0.31 or earlier (a `chunk_run` row with no source) holding progress of one export name under two sources: the upgrade stand's fixture, not an edited row" }
+
+  - id: refusal_state_chunk_run_superseded
+    what: "RIVET_STATE_CHUNK_RUN_SUPERSEDED: an unfinished chunk run of rivet 0.31 or earlier with a finished run after it"
+    postgres: { gap: "needs a state database written by rivet 0.31 or earlier (an unsourced `chunk_run` row and a run that finished after it): since #482 the current binary refuses the run that would create the second half, so the fixture is the upgrade stand's" }
+    mysql:    { gap: "needs a state database written by rivet 0.31 or earlier (an unsourced `chunk_run` row and a run that finished after it): since #482 the current binary refuses the run that would create the second half, so the fixture is the upgrade stand's" }
+    mssql:    { gap: "needs a state database written by rivet 0.31 or earlier (an unsourced `chunk_run` row and a run that finished after it): since #482 the current binary refuses the run that would create the second half, so the fixture is the upgrade stand's" }
+    mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no range-chunk checkpoint" }
+    oracle:   { gap: "needs a state database written by rivet 0.31 or earlier (an unsourced `chunk_run` row and a run that finished after it): since #482 the current binary refuses the run that would create the second half, so the fixture is the upgrade stand's" }
+
+  - id: refusal_state_run_in_progress
+    what: "RIVET_STATE_RUN_IN_PROGRESS: a command that rewrites an export's progress beside its live run"
+    postgres: { gap: "refused by code in live_state_reset_live_run and (open defects) the run-beside-a-run row of docs/operator-contract-matrix.yaml; the walk (wait and repeat, stop the process and repeat, and a wrong remedy) belongs to the two-processes row family, not written yet" }
+    mysql:    { gap: "refused by code in live_state_reset_live_run and (open defects) the run-beside-a-run row of docs/operator-contract-matrix.yaml; the walk (wait and repeat, stop the process and repeat, and a wrong remedy) belongs to the two-processes row family, not written yet" }
+    mssql:    { gap: "refused by code in live_state_reset_live_run and (open defects) the run-beside-a-run row of docs/operator-contract-matrix.yaml; the walk (wait and repeat, stop the process and repeat, and a wrong remedy) belongs to the two-processes row family, not written yet" }
+    mongo:    { gap: "refused by code in live_state_reset_live_run and (open defects) the run-beside-a-run row of docs/operator-contract-matrix.yaml; the walk (wait and repeat, stop the process and repeat, and a wrong remedy) belongs to the two-processes row family, not written yet" }
+    oracle:   { gap: "refused by code in live_state_reset_live_run and (open defects) the run-beside-a-run row of docs/operator-contract-matrix.yaml; the walk (wait and repeat, stop the process and repeat, and a wrong remedy) belongs to the two-processes row family, not written yet" }
+
+  - id: refusal_state_chunk_checkpoint_gone
+    what: "RIVET_STATE_CHUNK_CHECKPOINT_GONE: the checkpoint rows of a chunk run removed while it ran"
+    postgres: { gap: "the refusal ends a live run whose checkpoint rows were removed under it, so it cannot be refused twice from one state; belongs to the resource-taken-away row family (delete the rows beside a slowed run, then `run again` delivers), not written yet" }
+    mysql:    { gap: "the refusal ends a live run whose checkpoint rows were removed under it, so it cannot be refused twice from one state; belongs to the resource-taken-away row family (delete the rows beside a slowed run, then `run again` delivers), not written yet" }
+    mssql:    { gap: "the refusal ends a live run whose checkpoint rows were removed under it, so it cannot be refused twice from one state; belongs to the resource-taken-away row family (delete the rows beside a slowed run, then `run again` delivers), not written yet" }
+    mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no range-chunk checkpoint" }
+    oracle:   { gap: "the refusal ends a live run whose checkpoint rows were removed under it, so it cannot be refused twice from one state; belongs to the resource-taken-away row family (delete the rows beside a slowed run, then `run again` delivers), not written yet" }
+
+  - id: refusal_load_value_out_of_target_range
+    what: "RIVET_LOAD_VALUE_OUT_OF_TARGET_RANGE: a value the warehouse type cannot hold"
+    postgres: { gap: "no cell asserts this refusal by code; the walk needs a ClickHouse or BigQuery load cell: refuse twice, a wider declared type, a fixed source value, and one wrong remedy" }
+    mysql:    { na: "the refusal is the load target's and does not depend on the source engine: the postgres column carries the row" }
+    mssql:    { na: "the refusal is the load target's and does not depend on the source engine: the postgres column carries the row" }
+    mongo:    { na: "the refusal is the load target's and does not depend on the source engine: the postgres column carries the row" }
+    oracle:   { na: "the refusal is the load target's and does not depend on the source engine: the postgres column carries the row" }
+
+  - id: refusal_load_adoption_column_mismatch
+    what: "RIVET_LOAD_ADOPTION_COLUMN_MISMATCH: an adopted warehouse table missing the export's new columns"
+    postgres: { gap: "no cell asserts this refusal by code; the walk needs a ClickHouse or BigQuery load cell: refuse twice, `ALTER TABLE ... ADD COLUMN`, and one wrong remedy (renaming the table aside, which the text forbids)" }
+    mysql:    { na: "the refusal is the load target's and does not depend on the source engine: the postgres column carries the row" }
+    mssql:    { na: "the refusal is the load target's and does not depend on the source engine: the postgres column carries the row" }
+    mongo:    { na: "the refusal is the load target's and does not depend on the source engine: the postgres column carries the row" }
+    oracle:   { na: "the refusal is the load target's and does not depend on the source engine: the postgres column carries the row" }
+
+  - id: refusal_load_target_not_rivets
+    what: "RIVET_LOAD_TARGET_NOT_RIVETS: a warehouse object this state database has no record of loading"
+    postgres: { gap: "refused twice by code in live_clickhouse_load (no remedy walked) and asserted by its code in live_load_spec; the walk needs a load cell: drop, rename, another table, and one wrong remedy" }
+    mysql:    { na: "the refusal is the load target's and does not depend on the source engine: the postgres column carries the row" }
+    mssql:    { na: "the refusal is the load target's and does not depend on the source engine: the postgres column carries the row" }
+    mongo:    { na: "the refusal is the load target's and does not depend on the source engine: the postgres column carries the row" }
+    oracle:   { na: "the refusal is the load target's and does not depend on the source engine: the postgres column carries the row" }
+
+  - id: corrupt_keyset_range_rows
+    what: "the `keyset_range` rows of an unfinished parallel keyset run edited: the resume delivers the source or refuses"
+    postgres: { gap: "not written: needs an unfinished parallel keyset run (the `keyset_parallel_worker` / `mongo_parallel_worker` crash points) and edits of its range rows" }
+    mysql:    { gap: "not written: needs an unfinished parallel keyset run (the `keyset_parallel_worker` / `mongo_parallel_worker` crash points) and edits of its range rows" }
+    mssql:    { gap: "not written: needs an unfinished parallel keyset run (the `keyset_parallel_worker` / `mongo_parallel_worker` crash points) and edits of its range rows" }
+    mongo:    { gap: "not written: needs an unfinished parallel keyset run (the `keyset_parallel_worker` / `mongo_parallel_worker` crash points) and edits of its range rows" }
+    oracle:   { gap: "not written: needs an unfinished parallel keyset run (the `keyset_parallel_worker` / `mongo_parallel_worker` crash points) and edits of its range rows" }

@@ -90,10 +90,7 @@ pub(super) fn run_exports_as_child_processes(
     // Apply schema migrations once in the parent before spawning children.
     if let Err(e) = StateStore::open(config_path) {
         return (
-            Err(anyhow::anyhow!(
-                "failed to open / migrate state DB before spawning children: {:#}",
-                e
-            )),
+            Err(e.context("failed to open / migrate state DB before spawning children")),
             HashMap::new(),
             String::new(),
         );
