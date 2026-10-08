@@ -1845,6 +1845,33 @@ fn a_refused_changes_only_cdc_run_on_a_missing_table_leaves_no_slot_postgres() {
     pg_cdc_missing_table_leaves_no_slot(false);
 }
 
+/// The MySQL twin of RESULTS 15: a first CDC run refused for a table that does not exist leaves no checkpoint, and creating the table then runs.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn a_refused_cdc_run_on_a_missing_table_leaves_no_checkpoint_mysql() {
+    use mysql::prelude::Queryable as _;
+    let table = unique_name("oc_absent");
+    let _table = MysqlCdcTable(table.clone());
+    let mut rig = Rig::mysql_cdc(&table);
+    rig.refuses_twice_then(
+        &["run"],
+        &[],
+        Refused::by_code(CDC_PREREQUISITE, 1),
+        vec![Remedy::new(
+            "Create the table",
+            Then::DeliversTheSource,
+            |_| {
+                mysql::Conn::new(MYSQL_CDC_URL)
+                    .expect("connect mysql-cdc")
+                    .query_drop(format!(
+                        "CREATE TABLE {table} (id BIGINT PRIMARY KEY, v BIGINT)"
+                    ))
+                    .expect("create the table the refusal named");
+            },
+        )],
+    );
+}
+
 #[test]
 #[ignore = "live: requires docker compose postgres"]
 fn doctor_is_not_green_where_the_cdc_run_refuses_wal_level_postgres() {
@@ -2311,7 +2338,7 @@ fn a_change_table_cleaned_past_the_checkpoint_after_a_changes_run_is_refused_by_
 }
 
 #[test]
-#[ignore = "live: requires docker compose --profile replica (mysql-primary :3308 → mysql-replica-nolog :3310)"]
+#[ignore = "live+gate-only: docker compose --profile replica, with replication wired to mysql-replica-nolog :3310 (the stand does it; CI's E2E job does not)"]
 fn doctor_is_not_green_where_the_cdc_run_refuses_a_replica_that_does_not_relog_mysql() {
     use mysql::prelude::Queryable as _;
     let _serial = cross_process_serial("mysql_replica");

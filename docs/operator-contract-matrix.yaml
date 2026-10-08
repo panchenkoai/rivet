@@ -217,9 +217,9 @@ scenarios:
     oracle:   { na: "a replication slot is PostgreSQL's server-side anchor; this engine's anchor is its checkpoint file, and a refused run that writes one fails the default refusal grade (tests/common/refusal.rs) of every CDC refusal cell, as on doctor_cdc_prerequisite below" }
 
   - id: refused_changes_only_cdc_run_leaves_a_slot
-    what: "RESULTS 15: the changes-only twin of RESULTS 15 (no baseline leg, so the capture open itself is the first writer): refused for a missing table, it leaves no replication slot, and creating the table then runs"
+    what: "the changes-only twin of RESULTS 15 (no baseline leg, so the capture open itself is the first writer): refused for a missing table, it leaves no replication slot (PostgreSQL) and no checkpoint (MySQL), and creating the table then runs"
     postgres: { test: a_refused_changes_only_cdc_run_on_a_missing_table_leaves_no_slot_postgres }
-    mysql:    { na: "a replication slot is PostgreSQL's server-side anchor; this engine's anchor is its checkpoint file, and a refused run that writes one fails the default refusal grade (tests/common/refusal.rs) of every CDC refusal cell, as on doctor_cdc_prerequisite below" }
+    mysql:    { test: a_refused_cdc_run_on_a_missing_table_leaves_no_checkpoint_mysql }
     mssql:    { na: "a replication slot is PostgreSQL's server-side anchor; this engine's anchor is its checkpoint file, and a refused run that writes one fails the default refusal grade (tests/common/refusal.rs) of every CDC refusal cell, as on doctor_cdc_prerequisite below" }
     mongo:    { na: "a replication slot is PostgreSQL's server-side anchor; this engine's anchor is its checkpoint file, and a refused run that writes one fails the default refusal grade (tests/common/refusal.rs) of every CDC refusal cell, as on doctor_cdc_prerequisite below" }
     oracle:   { na: "a replication slot is PostgreSQL's server-side anchor; this engine's anchor is its checkpoint file, and a refused run that writes one fails the default refusal grade (tests/common/refusal.rs) of every CDC refusal cell, as on doctor_cdc_prerequisite below" }

@@ -239,6 +239,7 @@ jobs:
             -E 'not (test(full_content_export_max_pressure) or test(validates) or test(edge_cases) or test(via_duckdb) or test(mongo) or test(warehouse_cell)
                  or test(readable_secondary) or test(mssql_checkpoint_follows_a_failover) or test(mssql_checkpoint_from_another_database)
                  or test(from_a_standby) or test(failover_to_the_standby) or test(bounded_on_a_standby) or test(on_a_standby)
+                 or test(doctor_is_not_green_where_the_cdc_run_refuses_a_replica)
                  or test(loads_into_bigquery_or_refuses_by_column) or test(cleanup_source_never_deletes_parts)
                  or test(compact_after_a_source_alter) or test(a_non_unicode_database_round_trips) or test(range_chunk_shared_name_another_source_oracle)
                  or test(a_read_blocked_longer_than_thirty_seconds_still_completes) or test(open_defect_))'
