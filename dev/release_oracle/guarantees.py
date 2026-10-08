@@ -132,6 +132,7 @@ def _batch_peaks(root: Path, engine: str, url: str) -> dict[str, int | None]:
                 s = _timed(rivet_bin(), d, {"RIVET_PERF_URL": url, **_ENV}, "run", "-c", "c.yaml")
                 got = _declared(d / "output", "SELECT count(*) FROM {parts}")
                 peaks[f"{mode}/{rows}"] = s.rss if s.ok and got and got[0][0] == rows else None
+                shutil.rmtree(d / "output", ignore_errors=True)  # 5 million rows per run: counted, not kept
     finally:
         _drop(engine, url, table)
     return peaks
