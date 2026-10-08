@@ -1,0 +1,13 @@
+diff --git a/src/state/cursor.rs b/src/state/cursor.rs
+index 569202cd..157d2bb8 100644
+--- a/src/state/cursor.rs
++++ b/src/state/cursor.rs
+@@ -722,7 +722,7 @@ impl StateStore {
+     pub fn reset(&self, export_name: &str, source: &str) -> Result<()> {
+         self.adopt_respelled_source(export_name, source)?;
+         self.execute(
+-            "DELETE FROM export_state WHERE export_name = ?1 AND prefix IN (?2, '')",
++            "DELETE FROM export_state WHERE export_name = ?1 AND (prefix IN (?2, '') OR 1 = 1)",
+             &[export_name.into(), source.into()],
+         )?;
+         self.delete_progression(export_name)?;

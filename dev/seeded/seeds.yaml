@@ -763,3 +763,96 @@ seeds:
         cells: [check_names_the_strategy_run_uses_for_chunked_with_no_column_oracle]
       lib:
         cells: ["lib:check_describes_the_export_the_planner_resolved"]
+
+  - name: source-key-as-spelled
+    class: the source part of a progress key is the URL as spelled, so the same server with its default port left out is another source and its stored progress is not found
+    history: "P-18, 2026-10-06 - an incremental export whose URL dropped `:5432` delivered ids 1..13 again instead of the delta 11..13, on main 52f26e45 and on v0.31.0"
+    scope: source
+    patch: source-key-as-spelled/shared.patch
+    engines:
+      postgres:
+        cells: [source_url_without_its_default_port_continues_postgres]
+      mysql:
+        cells: [source_url_without_its_default_port_continues_mysql]
+      mssql:
+        cells: [source_url_without_its_default_port_continues_mssql]
+      mongo:
+        cells: ["lib:a_source_key_names_the_default_port_the_url_left_out"]
+      oracle:
+        cells: [source_url_without_its_default_port_continues_oracle]
+      lib:
+        cells:
+          - "lib:a_source_key_names_the_default_port_the_url_left_out"
+          - "lib:a_cursor_stored_without_the_default_port_continues_under_the_spelled_one"
+
+  - name: resumed-run-cursor-below-its-maximum
+    class: a parallel keyset run resumed after a crash stores the highest key of the ranges it re-ran, not of the run
+    history: "P-22, 2026-10-06 - after a crash and a resume, incremental on the key delivered 75 to 301 of 301 rows again, on main 52f26e45 and on v0.31.0"
+    scope: source
+    patch: resumed-run-cursor-below-its-maximum/shared.patch
+    engines:
+      postgres:
+        cells: [resumed_parallel_keyset_then_incremental_postgres]
+      mysql:
+        cells: [resumed_parallel_keyset_then_incremental_mysql]
+      mssql:
+        cells: [resumed_parallel_keyset_then_incremental_mssql]
+      mongo:
+        na: "the parallel `_id`-range reader stores no key: the first `resume` run after it is a full pass (parallel_keyset_then_resume_mongo), so there is no high-water a resume could under-report"
+      oracle:
+        cells: [resumed_parallel_keyset_then_incremental_oracle]
+      lib:
+        cells: ["lib:a_resumed_run_counts_the_keys_its_committed_ranges_recorded"]
+
+  - name: progress-inherited-by-an-edited-filter
+    class: stored progress is continued by an export whose `query:` keeps its FROM relation and selects other rows of it
+    history: "2026-10-06, found verifying #456 - an incremental export whose filter changed from `time_spent = 1` to `time_spent = 0` exited 0 with none of the five rows the new filter admits, on main 52f26e45 and on v0.31.0"
+    scope: source
+    patch: progress-inherited-by-an-edited-filter/shared.patch
+    engines:
+      postgres:
+        cells: [incremental_query_filter_edited_postgres]
+      mysql:
+        cells: [incremental_query_filter_edited_mysql]
+      mssql:
+        cells: [incremental_query_filter_edited_mssql]
+      mongo:
+        na: "a MongoDB export names a collection and has no `query:`: the rows it reads are the collection's, which the stream part compares (resume_repointed_at_another_collection_mongo)"
+      oracle:
+        cells: [incremental_query_filter_edited_oracle]
+      lib:
+        cells: ["lib:an_edited_filter_or_another_schema_is_refused_until_it_is_restored_or_reset"]
+
+  - name: progress-inherited-by-another-schema
+    class: stored progress is continued by an export that reads the same unqualified table through another `search_path`
+    history: "2026-10-06, found verifying #456 - a source URL with `options=-csearch_path%3D<schema>` moved an incremental export to another schema's table under the stored cursor: exit 0 and none of its seven rows, on main 52f26e45 and on v0.31.0"
+    scope: source
+    patch: progress-inherited-by-another-schema/shared.patch
+    engines:
+      postgres:
+        cells: [same_table_in_another_schema_is_another_stream_postgres]
+      mysql:
+        na: "the schema an unqualified table resolves in is not a source-URL option on this engine (search_path is PostgreSQL's)"
+      mssql:
+        na: "the schema an unqualified table resolves in is not a source-URL option on this engine (search_path is PostgreSQL's)"
+      mongo:
+        na: "a MongoDB export names its database and collection in full; there is no search path"
+      oracle:
+        na: "the schema an unqualified table resolves in is not a source-URL option on this engine (search_path is PostgreSQL's)"
+      lib:
+        cells: ["lib:a_search_path_resolves_the_unqualified_name_it_is_compared_by"]
+
+  - name: reset-clears-another-source
+    class: "`rivet state reset --export X` deletes the progress of every export named X in the state database, whatever source it reads"
+    history: "P-19, 2026-10-06 - a reset under one config deleted the cursor of a same-named export of another source, whose next run delivered its table again (14 rows on disk for 7 source ids), on main 52f26e45 and on v0.31.0"
+    scope: state
+    patch: reset-clears-another-source/shared.patch
+    engines:
+      sqlite-state:
+        cells: [state_reset_keeps_the_cursor_of_another_source]
+      postgres-state:
+        cells: [state_reset_keeps_the_cursor_of_another_source]
+      lib:
+        cells:
+          - "lib:a_reset_clears_its_own_source_and_keeps_another_sources_cursor"
+          - "lib:every_reset_is_refused_while_the_exports_run_lease_is_held"
