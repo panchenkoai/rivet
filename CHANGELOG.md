@@ -23,6 +23,30 @@
     does not hold the extract's run records (a load that runs on another host).
   - `rivet compact` over several tables exits 1 when at least one table failed, names each
     failed table, and still merges and reports (`COMPACT OK`) the others.
+
+- **Breaking (file names): a single-runner part is named after its run, with the process id
+  and a random nonce appended.** Applies to `mode: full`, `mode: incremental` and time-window
+  exports that are not chunked, on every source engine, and to MongoDB `parallel` exports.
+  - Before: `orders_20261008_174122_776.parquet` (the UTC millisecond the read ended). Two
+    `rivet run` of one export that ended their read in the same millisecond wrote the same
+    name; the second file replaced the first, both runs exited 0, and both manifests,
+    `file_log` and `export_metrics` counted the one file (two runs of a 200-row table:
+    400 rows recorded over one 200-row file).
+  - Now: `orders_20261008_174117_653_33972_9f3a1c0b5d7e2a41.parquet`, that is
+    `<export>_<YYYYMMDD>_<HHMMSS>_<mmm>_<pid>_<nonce>[_partN].<format>`: the UTC millisecond
+    the run started and its process id (both from the run's id), then 16 random hex digits,
+    so no two runs write one name, two containers with the same process id included. A
+    MongoDB `parallel` part is
+    `<export>_<YYYYMMDD>_<HHMMSS>_<mmm>_<pid>_<nonce>_w<worker>_keyset<page>.<format>`.
+  - What to change: a consumer that matches part names with a pattern anchored after the
+    millisecond field (`orders_\d{8}_\d{6}_\d{3}\.parquet`) must allow the `_<pid>_<nonce>`
+    fields. `orders_*.parquet` and a date prefix (`orders_20261008_*`) match as before, and
+    names still sort by time across the upgrade. Take part names from `manifest.json` rather
+    than from a pattern.
+  - Nothing else moves: no state or manifest format change. Parts written by earlier
+    releases keep their names and are read, validated and loaded as before, and a prefix may
+    hold both shapes. Chunked, keyset and CDC part names are unchanged.
+
 - **Breaking: stored progress belongs to one source, one table and one set of rows, and a run
   that reads another is refused.** Applies to `incremental`, keyset (`chunk_by_key`) and
   MongoDB `resume` exports on every source engine, and to `rivet state reset`.
@@ -81,6 +105,29 @@
     the highest key of the ranges that commit after the upgrade, as 0.31 did. The state
     schema moves to v35 (`keyset_range.max_key`), so an older rivet no longer opens the
     state database.
+- **Breaking: a CDC stream that cannot continue exits 5 with a `RIVET_*` code, where it exited 1
+  with none.** Applies to `mode: cdc` runs and `rivet cdc` on PostgreSQL, MySQL, SQL Server,
+  MongoDB and Oracle.
+  - `RIVET_SOURCE_CDC_CHECKPOINT_INVALID`: a checkpoint file that is not JSON (every engine),
+    and a checkpoint file that is gone while the export has a baseline (MySQL, SQL Server,
+    MongoDB, Oracle).
+  - `RIVET_SOURCE_CDC_TRUNCATED`: a TRUNCATE of a captured table (PostgreSQL, MySQL; Oracle
+    gave it already), a DROP of one (MySQL), a dropped captured collection or database
+    (MongoDB).
+  - `RIVET_SOURCE_CDC_LOG_GAP`: a PostgreSQL slot missing under a checkpoint or a baseline,
+    MySQL binlogs purged past the checkpoint (`ERROR 1236`), a MongoDB oplog rolled past the
+    resume token (error 286). The MongoDB refusal used to end with "change streams require a
+    replica set", which was not the cause; it now names the oplog and the re-baseline.
+  - The corrupt-checkpoint message said "delete it to accept a new anchor from a fresh
+    snapshot". That was wrong on every engine but PostgreSQL: with a baseline the next run
+    refused the missing file, and without one it anchored at the current position and skipped
+    every change since the checkpoint. The message now ends "Restore the file, or:" and the
+    re-baseline steps, the same ones every other CDC data-loss message prints.
+  - What is refused has not changed, and nothing stored changes: a checkpoint and a state
+    database written by 0.31.0 resume as before.
+  - Upgrading: a script or scheduler that matched exit 1 for these cases now sees exit 5
+    (`refusal`: do not retry, follow the remedy in the message). `rivet schema errors` lists
+    the three codes.
 - **Breaking: a run that fails before its first write leaves the destination as it was.**
   Applies to every batch export (`full`, `incremental`, `chunked`, keyset, the snapshot leg
   of a CDC export) on every source engine and on every destination that keeps objects at

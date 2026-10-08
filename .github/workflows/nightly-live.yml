@@ -320,7 +320,7 @@ jobs:
         # stack does not start (`live+gate-only`; the release gate runs it).
         run: |
           cargo nextest run --release --run-ignored ignored-only --no-fail-fast \
-            -E 'binary(live_suite) and test(mongo) and not (test(the_duckdb_oracle_reaches_sql_server_and_mongodb_too) or test(open_defect_))'
+            -E 'binary(live_suite) and test(mongo) and not (test(the_duckdb_oracle_reaches_sql_server_and_mongodb_too) or test(an_oplog_rolled_past_the_checkpoint) or test(open_defect_))'
 
       - name: Dump Mongo logs on failure
         if: failure()

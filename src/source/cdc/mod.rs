@@ -126,19 +126,18 @@ impl Position {
 
     /// Load a persisted checkpoint, or `None` on first run (absent).
     pub(crate) fn load(path: &Path) -> Result<Option<Self>> {
-        use anyhow::Context as _;
         match std::fs::read_to_string(path) {
-            Ok(s) => Ok(Some(Position::new(serde_json::from_str(&s).with_context(
-                || {
-                    format!(
-                        "checkpoint '{}' is corrupt or truncated (not valid JSON) — refusing to \
+            Ok(s) => match serde_json::from_str(&s) {
+                Ok(json) => Ok(Some(Position::new(json))),
+                Err(e) => Err(checkpoint_identity::checkpoint_invalid(format!(
+                    "checkpoint '{}' is corrupt or truncated (not valid JSON: {e}) — refusing to \
                      silently treat it as absent and re-anchor CDC at 'current', which would \
                      permanently skip every change since the last checkpoint. Restore the file, \
-                     or delete it to accept a new anchor from a fresh snapshot.",
-                        path.display()
-                    )
-                },
-            )?))),
+                     or: {}",
+                    path.display(),
+                    checkpoint_identity::RECOVER
+                ))),
+            },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => {
                 Err(anyhow::Error::new(e)
@@ -1120,7 +1119,7 @@ impl CdcEngine {
                     // MISSING checkpoint: pinning "current" would silently skip
                     // everything since the loss — and on MSSQL would actively
                     // destroy the min-LSN over-read floor. Fail loudly.
-                    anyhow::bail!(
+                    return Err(checkpoint_identity::checkpoint_invalid(format!(
                         // BOTH signals, because they are OR-ed: `snapshot_done` reads
                         // the state DB's `cdc_snapshot` row (authoritative) OR the
                         // destination's `snapshot/_SUCCESS` marker (legacy co-signal).
@@ -1132,7 +1131,7 @@ impl CdcEngine {
                         self.label(),
                         ckpt.display(),
                         checkpoint_identity::RECOVER
-                    );
+                    )));
                 }
                 match self {
                     Self::Mysql => {
@@ -2830,6 +2829,22 @@ mod tests {
             err.to_string().contains("corrupt or truncated"),
             "a corrupt checkpoint must fail loud, not read as absent: {err}"
         );
+        assert_eq!(crate::error::classify_exit(&err), 5, "{err}");
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some("RIVET_SOURCE_CDC_CHECKPOINT_INVALID")
+        );
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "checkpoint '{}' is corrupt or truncated (not valid JSON: key must be a string \
+                 at line 1 column 2) — refusing to silently treat it as absent and re-anchor \
+                 CDC at 'current', which would permanently skip every change since the last \
+                 checkpoint. Restore the file, or: {}",
+                path.display(),
+                checkpoint_identity::RECOVER
+            )
+        );
 
         // An absent checkpoint stays a clean first run (None).
         assert!(
@@ -3020,6 +3035,13 @@ mod tests {
             assert!(
                 msg.contains("prior-run evidence"),
                 "{engine:?}: must explain the evidence: {msg}"
+            );
+            assert!(msg.ends_with(checkpoint_identity::RECOVER), "{msg}");
+            assert_eq!(crate::error::classify_exit(&err), 5, "{engine:?}");
+            assert_eq!(
+                crate::error::error_code(&err),
+                Some("RIVET_SOURCE_CDC_CHECKPOINT_INVALID"),
+                "{engine:?}"
             );
         }
     }

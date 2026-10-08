@@ -461,6 +461,8 @@ fn derived_capture_marker_set_is_pinned() {
         "run_with_env(",
         "run_with_envs(",
         "run_with_envs_bounded(",
+        // `Rig::runs_at_once` — several `rivet run` of one export started together.
+        "runs_at_once(",
         "spawn_args_env(",
         "spawn_mid_run(",
     ];

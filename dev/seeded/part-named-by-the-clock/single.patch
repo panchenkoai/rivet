@@ -1,0 +1,13 @@
+diff --git a/src/pipeline/single.rs b/src/pipeline/single.rs
+index 253ebb8e..398e3ebc 100644
+--- a/src/pipeline/single.rs
++++ b/src/pipeline/single.rs
+@@ -370,7 +370,7 @@ pub(super) fn run_single_export(
+     let (dest, ext) = (frame.dest, frame.ext);
+     let ext = ext.as_str();
+ 
+-    let stamp = super::summary::run_scoped_stamp(&summary.run_id, &plan.export_name);
++    let stamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
+ 
+     let (parts, wrote) = super::commit::write_sink_parts(
+         dest.as_ref(),

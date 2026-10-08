@@ -760,6 +760,48 @@ seeds:
         cells:
           - "lib:a_read_only_database_is_refused_as_not_writable_never_as_another_process"
 
+  - name: cdc-refusal-without-a-code
+    class: a CDC stream that cannot continue (unreadable checkpoint, truncated table, log gone past the checkpoint) is refused with exit 1 and no RIVET_* code
+    history: "the 2026-10-07 CLI sweep: 18 known-red cells; a scheduler keyed on the exit class retried a refusal no retry can clear, and MongoDB's error 286 wore the replica-set setup hint"
+    scope: source
+    patch: cdc-refusal-without-a-code/shared.patch
+    # The walk cells of live_operator_contract catch it too, but under a Postgres state the rig
+    # applies only the first remedy of a walk and records a skip, which recall grades as SKIP.
+    engines:
+      postgres:
+        cells: [pg_cdc_corrupt_checkpoint_fails_loud_not_silently_absent]
+      mysql:
+        cells:
+          - cdc_corrupt_checkpoint_fails_loud_not_silently_absent
+          - mysql_cdc_a_dropped_and_recreated_captured_table_is_refused_not_merged
+      mssql:
+        cells: [mssql_cdc_corrupt_checkpoint_fails_loud_not_silently_absent]
+      mongo:
+        cells: [roast_corrupt_checkpoint_fails_loudly_not_silent_reanchor]
+      oracle:
+        cells: [oracle_cdc_corrupt_checkpoint_fails_loud_not_silently_absent]
+      lib:
+        cells: ["lib:each_failure_class_refuses_with_exit_5_under_its_own_code_and_keeps_its_text"]
+
+  - name: corrupt-checkpoint-remedy-reanchors
+    class: the corrupt-checkpoint refusal prescribes deleting the file, which is refused again under a baseline and skips every change since the checkpoint without one
+    history: "RESULTS 13 of the 2026-10-07 CLI sweep: `delete it to accept a new anchor from a fresh snapshot` on four engines"
+    scope: source
+    patch: corrupt-checkpoint-remedy-reanchors/shared.patch
+    engines:
+      postgres:
+        cells: [pg_cdc_corrupt_checkpoint_fails_loud_not_silently_absent]
+      mysql:
+        cells: [cdc_corrupt_checkpoint_fails_loud_not_silently_absent]
+      mssql:
+        cells: [mssql_cdc_corrupt_checkpoint_fails_loud_not_silently_absent]
+      mongo:
+        cells: [roast_corrupt_checkpoint_fails_loudly_not_silent_reanchor]
+      oracle:
+        cells: [oracle_cdc_corrupt_checkpoint_fails_loud_not_silently_absent]
+      lib:
+        cells: ["lib:corrupt_checkpoint_fails_loud_not_silently_absent"]
+
   - name: plan-sealed-over-unreadable-source
     class: a preflight command exits 0 and seals its artifact over a source it could not read
     history: "`rivet plan` over a missing table or a rejected login printed a WARN, exited 0 and wrote a plan `apply` then failed on (CLI sweep 10, 2026-10-07); on MongoDB the preflight did not ask whether the collection exists"
@@ -959,3 +1001,21 @@ seeds:
         cells: [incremental_query_cosmetic_edit_is_refused_until_accepted_oracle]
       lib:
         cells: ["lib:an_accepted_edit_keeps_the_cursor_under_what_the_export_reads_now"]
+
+  - name: part-named-by-the-clock
+    class: a runner stamps its part name from the wall clock instead of from its run id, so two runs of one export in one millisecond write one file name
+    history: "v0.31.0 - two `rivet run` of one incremental export ended their read in one millisecond: one part, two Success manifests, and file_log and export_metrics counting 400 rows over a 200-row file (#507; the MongoDB parallel reader stamped its worker parts the same way)"
+    scope: source
+    patch: part-named-by-the-clock/single.patch
+    engines:
+      postgres:
+        cells: [incremental_runs_started_together_each_declare_their_own_part_postgres]
+      mysql:
+        cells: [incremental_runs_started_together_each_declare_their_own_part_mysql]
+      mssql:
+        cells: [incremental_runs_started_together_each_declare_their_own_part_mssql]
+      mongo:
+        patch: part-named-by-the-clock/mongo.patch
+        cells: [parallel_parts_are_named_after_their_run_mongo]
+      oracle:
+        cells: [incremental_runs_started_together_each_declare_their_own_part_oracle]
