@@ -79,6 +79,9 @@ pub struct ResolvedRunPlan {
     /// deserialized plan starts a fresh one.
     #[serde(skip, default)]
     pub bytes_read: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Run-wide count of parts this run put at the destination, bumped at the one write seam (`commit::write_part_file`); runtime only, like `bytes_read`.
+    #[serde(skip, default)]
+    pub parts_landed: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// The export's declared source table (`table:`), carried VERBATIM.
     ///
     /// The manifest's source identity is built from this. It used to be derived

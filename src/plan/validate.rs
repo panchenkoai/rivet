@@ -206,6 +206,7 @@ mod tests {
         ResolvedRunPlan {
             split_window: None,
             bytes_read: Default::default(),
+            parts_landed: Default::default(),
             export_name: "test".into(),
             partition_rollover: None,
             source_table: None,

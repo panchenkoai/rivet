@@ -1089,7 +1089,9 @@ fn upload_slices(
             }
             w.finish()?;
             let file_name = format!("cdc-{run_token}-{:06}.{}", seq + k, format.label());
-            let part = write_part_file(dest, tmp.path(), rows.len() as i64, file_name)?;
+            // A stream commits flush by flush under its own manifests: no run-wide count reads this.
+            let landed = std::sync::atomic::AtomicU64::new(0);
+            let part = write_part_file(dest, tmp.path(), rows.len() as i64, file_name, &landed)?;
             Ok((part, slice_column_sums(&data, columns)))
         };
         match one() {

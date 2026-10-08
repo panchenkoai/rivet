@@ -50,7 +50,7 @@ rivet run --config <PATH> [OPTIONS]
 | `--validate` | | bool | Validate output file row count after writing, then verify the manifest and every part at the destination. A failed verification fails the run's exit as `rivet validate` would on that prefix: `RIVET_VALIDATE_FAILED` (exit 3) when a check found the destination wrong, `RIVET_VALIDATE_UNVERIFIED` (exit 1) when it could not be read back. The export itself completed: its parts, manifest and `_SUCCESS` stay |
 | `--reconcile` | | bool | Run `COUNT(*)` on source query and compare with exported rows |
 | `--resume` | | bool | Resume an in-progress chunked export. Exits non-zero with an actionable message if no in-progress checkpoint exists — run without `--resume` to start fresh, or `rivet state reset-chunks` to clear a stuck run |
-| `--force` | | bool | Override safety gates that would otherwise refuse the run. Today: with `--resume`, allows starting against a destination prefix whose `_SUCCESS` marker is already present (ADR-0012 M8). Without it, resume against a complete run refuses so an operator cannot accidentally re-export over a verified dataset |
+| `--force` | | bool | Override safety gates that would otherwise refuse the run. Today: with `--resume`, goes past the refusal to resume into a destination prefix whose `_SUCCESS` marker is already present (`RIVET_DEST_ALREADY_COMPLETE`, exit 5, ADR-0012 M8): the run continues an interrupted run of the export if one is recorded, else it runs as a plain run does. New parts land beside the old ones, nothing is overwritten, and `manifest.json` then describes only the new run |
 | `--parallel-exports` | | bool | Run the config's exports concurrently, at most 16 at once; a CDC export run alone also takes its pending baseline snapshots at most 16 at once |
 | `--parallel-export-processes` | | bool | Run each export as a separate child process |
 | `--summary-output` | | PATH | Write run aggregate to this file as JSON |
@@ -275,7 +275,7 @@ rivet apply <PLAN_FILE | CONFIG> [OPTIONS]
 | Argument/Flag | Type | Description |
 |---|---|---|
 | `PLAN_FILE` / `CONFIG` | string | Path to a plan JSON artifact, or a YAML config for wave-ordered execution **(required)** |
-| `--force` | bool | Overrides whichever safety gate refuses the run (ADR-0013). JSON-artifact mode: bypasses the staleness check (plans > 24 h) **and** the incremental cursor-drift check (both logged and recorded in the run's `apply_context`). YAML config mode: meaningful only with `--resume`, where it overrides the refusal to resume into a destination whose `_SUCCESS` marker is already present; without `--resume` it is a warned no-op |
+| `--force` | bool | Overrides whichever safety gate refuses the run (ADR-0013). JSON-artifact mode: bypasses the staleness check (plans > 24 h) **and** the incremental cursor-drift check (both logged and recorded in the run's `apply_context`). YAML config mode: meaningful only with `--resume`, where it goes past the refusal to resume into a destination whose `_SUCCESS` marker is already present (the export then continues an interrupted run, else runs as a plain run does, beside the complete one); without `--resume` it is a warned no-op |
 
 ### Staleness rules
 
@@ -325,7 +325,7 @@ rivet apply rivet.yaml
 
 A failing export does not stop its wave-mates: failures are collected and the run exits non-zero with the most stop-worthy error (data-integrity > internal > refusal > schema-drift > retryable > generic).
 
-**Resuming after a partial failure.** Re-run with `rivet apply <config>.yaml --resume`: exports a prior run already completed (their destination carries a `_SUCCESS` marker) are **skipped**, and an incomplete chunked export continues from its checkpoint — so recovering a run that failed mid-way does not redo the tables that already succeeded. Without `--resume`, a re-run re-exports everything.
+**Resuming after a partial failure.** Re-run with `rivet apply <config>.yaml --resume`: exports a prior run already completed (their destination carries a `_SUCCESS` marker and their last journaled run did not fail) are **skipped**, and an incomplete chunked export continues from its checkpoint — so recovering a run that failed mid-way does not redo the tables that already succeeded. Without `--resume`, a re-run re-exports everything.
 
 `partition_by` exports are not expanded in this path yet — use `rivet run` for those.
 
@@ -354,7 +354,7 @@ By default `validate` resolves the destination prefix the same way `run` does (`
 | `--run-id` | | string | Substitute `{run_id}` in the destination prefix template (composes with `--date`). No run lookup is performed — if the template has no `{run_id}` placeholder this has no effect; use `--prefix` for an arbitrary path |
 | `--prefix` | | string | Point at an explicit destination prefix |
 
-Exits non-zero when the manifest references a part that is missing or whose size does not match, and when the manifest records its last run as anything but `success` (`RIVET_VERIFY_RUN_NOT_SUCCESSFUL`, exit 1: a failed, interrupted or still-running export is not a completed dataset). A legacy prefix (no manifest) falls back to the M6 reduced-guarantee path and is labelled `legacy_run: true`. A bucket or container that does not exist is not a legacy prefix: the export's verdict carries `RIVET_VERIFY_MANIFEST_READ_ERROR` naming the bucket, and `validate` exits 1.
+Exits non-zero when the manifest references a part that is missing or whose size does not match, and when the manifest records its last run as anything but `success` (`RIVET_VERIFY_RUN_NOT_SUCCESSFUL`, exit 1: a failed, interrupted or still-running export is not a completed dataset). A run that failed before its first write did not touch the prefix, so `validate` still reads the export that was complete before it. A legacy prefix (no manifest) falls back to the M6 reduced-guarantee path and is labelled `legacy_run: true`. A bucket or container that does not exist is not a legacy prefix: the export's verdict carries `RIVET_VERIFY_MANIFEST_READ_ERROR` naming the bucket, and `validate` exits 1.
 
 ### Examples
 

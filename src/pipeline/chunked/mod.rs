@@ -273,17 +273,20 @@ pub(crate) enum CrashedChunkRun {
     Nothing,
     /// Resume the crashed plan, as `--resume` would.
     Resume,
+    /// `--resume --force` with no chunk run to continue: run as a plain run does.
+    ExportAgain,
 }
 
 /// Decide the recovery for a crashed chunk run once this process holds the export's run lease.
 pub(crate) fn crashed_chunk_run_action(
     explicit_resume: bool,
     crashed_run: bool,
+    force: bool,
 ) -> CrashedChunkRun {
-    if explicit_resume || !crashed_run {
-        CrashedChunkRun::Nothing
-    } else {
-        CrashedChunkRun::Resume
+    match (explicit_resume, crashed_run) {
+        (false, true) => CrashedChunkRun::Resume,
+        (true, false) if force => CrashedChunkRun::ExportAgain,
+        _ => CrashedChunkRun::Nothing,
     }
 }
 
@@ -337,11 +340,13 @@ pub(crate) fn claim_export_progress<'s>(
 }
 
 /// Hold the export's run lease for the whole checkpointed run, refuse while a live process
-/// holds it, and recover a chunk run whose process died (OS-released lease, no clock).
+/// holds it, and recover a chunk run whose process died (OS-released lease, no clock);
+/// `force` is the run's `--force`.
 pub(crate) fn claim_checkpoint_run<'s>(
     state: &'s StateStore,
     plan: &ResolvedRunPlan,
     progress: &crate::state::ProgressClaim<'_>,
+    force: bool,
 ) -> Result<(Option<crate::state::LoadLease<'s>>, Option<ResolvedRunPlan>)> {
     if !plan.strategy.is_resumable() {
         return Ok((None, None));
@@ -351,12 +356,12 @@ pub(crate) fn claim_checkpoint_run<'s>(
         let rid = progress.resume_run_id()?;
         anyhow::bail!(live_chunk_run_refusal(export, rid.as_deref()));
     };
-    let crashed = match &plan.strategy {
-        ExtractionStrategy::Chunked(_) => progress.chunk_run()?,
-        _ => None,
+    let ExtractionStrategy::Chunked(_) = &plan.strategy else {
+        return Ok((Some(lease), None));
     };
+    let crashed = progress.chunk_run()?;
     match (
-        crashed_chunk_run_action(plan.resume, crashed.is_some()),
+        crashed_chunk_run_action(plan.resume, crashed.is_some(), force),
         crashed,
     ) {
         (CrashedChunkRun::Resume, Some((rid, _))) => {
@@ -367,6 +372,15 @@ pub(crate) fn claim_checkpoint_run<'s>(
             let mut resumed = plan.clone();
             resumed.resume = true;
             Ok((Some(lease), Some(resumed)))
+        }
+        (CrashedChunkRun::ExportAgain, _) => {
+            log::info!(
+                "export '{export}': --resume --force and no chunk run in progress: nothing to \
+                 continue, running as a plain run"
+            );
+            let mut fresh = plan.clone();
+            fresh.resume = false;
+            Ok((Some(lease), Some(fresh)))
         }
         _ => Ok((Some(lease), None)),
     }
@@ -556,9 +570,34 @@ mod tests {
     #[test]
     fn a_dead_owners_plan_resumes_unless_resume_was_asked_or_nothing_crashed() {
         use super::{CrashedChunkRun::*, crashed_chunk_run_action};
-        assert_eq!(crashed_chunk_run_action(false, true), Resume);
-        assert_eq!(crashed_chunk_run_action(true, true), Nothing);
-        assert_eq!(crashed_chunk_run_action(false, false), Nothing);
+        for force in [false, true] {
+            assert_eq!(crashed_chunk_run_action(false, true, force), Resume);
+            assert_eq!(crashed_chunk_run_action(true, true, force), Nothing);
+            assert_eq!(crashed_chunk_run_action(false, false, force), Nothing);
+        }
+        assert_eq!(crashed_chunk_run_action(true, false, false), Nothing);
+        assert_eq!(crashed_chunk_run_action(true, false, true), ExportAgain);
+    }
+
+    /// `--resume --force` with no chunk run in progress runs as a plain run; without `--force` the plan stays a resume, which the runner refuses.
+    #[test]
+    fn a_forced_resume_with_nothing_to_continue_exports_again() {
+        let state = StateStore::open_in_memory().unwrap();
+        let mut plan = make_plan("orders");
+        plan.resume = true;
+        let claim = |force| {
+            claim_checkpoint_run(
+                &state,
+                &plan,
+                &state.claim(plan.progress_key()).unwrap(),
+                force,
+            )
+            .unwrap()
+            .1
+        };
+        assert!(claim(false).is_none());
+        let fresh = claim(true).expect("the forced resume becomes a fresh run");
+        assert!(!fresh.resume);
     }
 
     #[test]
@@ -656,6 +695,7 @@ mod tests {
         ResolvedRunPlan {
             split_window: None,
             bytes_read: Default::default(),
+            parts_landed: Default::default(),
             export_name: export_name.into(),
             partition_rollover: None,
             source_table: None,
@@ -930,9 +970,13 @@ mod tests {
         .expect_err("the task insert fails");
         state.exec_for_test("DROP TRIGGER fail_task;");
 
-        let (_lease, resumed) =
-            claim_checkpoint_run(&state, &plan, &state.claim(plan.progress_key()).unwrap())
-                .unwrap();
+        let (_lease, resumed) = claim_checkpoint_run(
+            &state,
+            &plan,
+            &state.claim(plan.progress_key()).unwrap(),
+            false,
+        )
+        .unwrap();
         assert!(
             resumed.is_none(),
             "a plain run must start fresh, not resume a chunk run that has no tasks"
@@ -958,7 +1002,8 @@ mod tests {
         );
         let plan = make_plan("orders");
         let (lease, _) =
-            claim_checkpoint_run(&run, &plan, &run.claim(plan.progress_key()).unwrap()).unwrap();
+            claim_checkpoint_run(&run, &plan, &run.claim(plan.progress_key()).unwrap(), false)
+                .unwrap();
         assert!(lease.is_some(), "a checkpointed run takes the run lease");
 
         let unnamed = claim_export_progress(&cmd, "orders", "reset its state")

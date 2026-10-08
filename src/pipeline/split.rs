@@ -789,7 +789,11 @@ pub(crate) fn realize(
 }
 
 /// Drop the split units whose Success manifest copy is already in the shared prefix; other exports skip on their own `_SUCCESS`.
-pub(crate) fn skip_completed(realized: Option<&Realized>, effective: &mut Vec<ExportConfig>) {
+pub(crate) fn skip_completed(
+    realized: Option<&Realized>,
+    effective: &mut Vec<ExportConfig>,
+    state: &crate::state::StateStore,
+) {
     let completed_units = realized
         .map(|r| completed_units_in_prefix(&r.dest, &r.family))
         .unwrap_or_default();
@@ -805,7 +809,7 @@ pub(crate) fn skip_completed(realized: Option<&Realized>, effective: &mut Vec<Ex
             }
             !done
         }
-        None => crate::pipeline::finalize::needs_run(e, true, "apply --pool"),
+        None => crate::pipeline::finalize::needs_run(e, true, "apply --pool", state),
     });
 }
 
@@ -1022,7 +1026,11 @@ mod tests {
             family: "orders".into(),
             seeds: HashMap::new(),
         };
-        skip_completed(Some(&realized), &mut effective);
+        skip_completed(
+            Some(&realized),
+            &mut effective,
+            &crate::state::StateStore::open_in_memory().unwrap(),
+        );
         let left: Vec<_> = effective.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(left, ["orders#1"]);
     }
