@@ -462,6 +462,7 @@ fn derived_capture_marker_set_is_pinned() {
         "run_with_envs(",
         "run_with_envs_bounded(",
         "spawn_args_env(",
+        "spawn_mid_run(",
     ];
     let derived = derived_capture_markers();
     let derived_refs: Vec<&str> = derived.iter().map(|s| s.as_str()).collect();

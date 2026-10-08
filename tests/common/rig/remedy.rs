@@ -72,6 +72,8 @@ pub struct Remedy<'a> {
     then: Then<'a>,
     apply: Box<dyn FnOnce(&mut Rig) + 'a>,
     rerun: Option<Vec<String>>,
+    /// See [`Remedy::in_place`].
+    in_place: bool,
 }
 
 impl<'a> Remedy<'a> {
@@ -87,7 +89,14 @@ impl<'a> Remedy<'a> {
             then,
             apply: Box::new(apply),
             rerun: None,
+            in_place: false,
         }
+    }
+
+    /// Apply this remedy to the state the remedy before it left, not to a copy of the refused state: for a refusal a live process holds, which no copy brings back. The refusal must still stand.
+    pub fn in_place(mut self) -> Self {
+        self.in_place = true;
+        self
     }
 
     /// A plausible action the refusal text does NOT name (`what` the operator did): held to the outcome it declares, and it may leave the refusal exactly as it was.
@@ -183,8 +192,15 @@ pub(crate) fn not_the_refusal(cycles: &[&Said], want: Refused) -> Option<String>
     let first = cycles.first()?;
     cycles
         .iter()
-        .position(|s| s.line != first.line)
+        .position(|s| !same_words(&s.line, &first.line))
         .map(|n| format!("cycle {} refused in other words than cycle 1", n + 1))
+}
+
+/// Whether two error lines say the same thing, the run ids they name (`<export>_<yyyymmddThhmmss.mmm>_<pid>`) apart: each run of an export has its own.
+pub(crate) fn same_words(a: &str, b: &str) -> bool {
+    static RUN_ID: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"_\d{8}T\d{6}\.\d{3}_\d+\b").unwrap());
+    RUN_ID.replace_all(a, "_<run>") == RUN_ID.replace_all(b, "_<run>")
 }
 
 /// Collapse every run of whitespace, so a wrapped message still holds its sentence.
@@ -217,8 +233,8 @@ pub(crate) fn not_the_outcome(
     then: Then,
     named: bool,
 ) -> Option<String> {
-    let unchanged =
-        (after.exit, &after.code, &after.line) == (refusal.exit, &refusal.code, &refusal.line);
+    let unchanged = (after.exit, &after.code) == (refusal.exit, &refusal.code)
+        && same_words(&after.line, &refusal.line);
     if named && unchanged {
         return Some("changed nothing: the invocation refused exactly as before".to_string());
     }
@@ -277,6 +293,11 @@ impl Rig {
             past_renders: self.past_renders.clone(),
             dir: self.dir.clone(),
         }
+    }
+
+    /// A second handle on this rig's export (same config, directory and state), for a live run that outlives a `&mut` walk of the first.
+    pub fn twin(&self) -> Rig {
+        self.builder_copy()
     }
 
     /// Apply a by-value builder edit in place, for a remedy that holds `&mut Rig`.
@@ -378,7 +399,8 @@ impl Rig {
         } else {
             None
         };
-        let state = self.copy_refused_state();
+        let copied = remedies.iter().skip(1).any(|r| !r.in_place);
+        let state = copied.then(|| self.copy_refused_state());
         for (n, remedy) in remedies.into_iter().enumerate() {
             let Remedy {
                 sentence,
@@ -386,6 +408,7 @@ impl Rig {
                 then,
                 apply,
                 rerun,
+                in_place,
             } = remedy;
             let sentence = if named {
                 sentence
@@ -393,13 +416,15 @@ impl Rig {
                 format!("(wrong) {sentence}")
             };
             if n > 0 {
-                if let Some(what) = uncopied {
+                if let (Some(what), false) = (uncopied, in_place) {
                     crate::common::skip_live(&format!(
                         "refuse-then-remedy: remedy `{sentence}` not applied, {what} cannot be copied back to the refused state"
                     ));
                     continue;
                 }
-                self.put_back(&state);
+                if let (Some(state), false) = (&state, in_place) {
+                    self.put_back(state);
+                }
                 let again = said(&self.cli_env(argv, envs));
                 if let Some(why) = not_the_refusal(&[&first, &again], want) {
                     panic!(
