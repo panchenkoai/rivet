@@ -677,26 +677,21 @@ seeds:
     history: "the 2026-10-07 CLI sweep: 18 known-red cells; a scheduler keyed on the exit class retried a refusal no retry can clear, and MongoDB's error 286 wore the replica-set setup hint"
     scope: source
     patch: cdc-refusal-without-a-code/shared.patch
+    # The walk cells of live_operator_contract catch it too, but under a Postgres state the rig
+    # applies only the first remedy of a walk and records a skip, which recall grades as SKIP.
     engines:
       postgres:
-        cells:
-          - a_corrupt_cdc_checkpoint_is_refused_by_code_postgres
-          - a_cdc_truncate_is_refused_by_code_postgres
-          - a_dropped_slot_after_a_changes_run_is_refused_by_code_postgres
+        cells: [pg_cdc_corrupt_checkpoint_fails_loud_not_silently_absent]
       mysql:
         cells:
-          - a_corrupt_cdc_checkpoint_is_refused_by_code_mysql
-          - a_cdc_truncate_is_refused_by_code_mysql
+          - cdc_corrupt_checkpoint_fails_loud_not_silently_absent
+          - mysql_cdc_a_dropped_and_recreated_captured_table_is_refused_not_merged
       mssql:
-        cells: [a_corrupt_cdc_checkpoint_is_refused_by_code_mssql]
+        cells: [mssql_cdc_corrupt_checkpoint_fails_loud_not_silently_absent]
       mongo:
-        cells:
-          - a_corrupt_cdc_checkpoint_is_refused_by_code_mongo
-          - a_cdc_collection_drop_is_refused_by_code_mongo
+        cells: [roast_corrupt_checkpoint_fails_loudly_not_silent_reanchor]
       oracle:
-        cells:
-          - a_corrupt_cdc_checkpoint_is_refused_by_code_oracle
-          - a_cdc_truncate_is_refused_by_code_oracle
+        cells: [oracle_cdc_corrupt_checkpoint_fails_loud_not_silently_absent]
       lib:
         cells: ["lib:each_failure_class_refuses_with_exit_5_under_its_own_code_and_keeps_its_text"]
 
@@ -707,14 +702,14 @@ seeds:
     patch: corrupt-checkpoint-remedy-reanchors/shared.patch
     engines:
       postgres:
-        cells: [a_corrupt_cdc_checkpoint_is_refused_by_code_postgres]
+        cells: [pg_cdc_corrupt_checkpoint_fails_loud_not_silently_absent]
       mysql:
-        cells: [a_corrupt_cdc_checkpoint_is_refused_by_code_mysql]
+        cells: [cdc_corrupt_checkpoint_fails_loud_not_silently_absent]
       mssql:
-        cells: [a_corrupt_cdc_checkpoint_is_refused_by_code_mssql]
+        cells: [mssql_cdc_corrupt_checkpoint_fails_loud_not_silently_absent]
       mongo:
-        cells: [a_corrupt_cdc_checkpoint_is_refused_by_code_mongo]
+        cells: [roast_corrupt_checkpoint_fails_loudly_not_silent_reanchor]
       oracle:
-        cells: [a_corrupt_cdc_checkpoint_is_refused_by_code_oracle]
+        cells: [oracle_cdc_corrupt_checkpoint_fails_loud_not_silently_absent]
       lib:
         cells: ["lib:corrupt_checkpoint_fails_loud_not_silently_absent"]
