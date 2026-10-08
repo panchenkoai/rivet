@@ -28,6 +28,8 @@ mod cdc_axis_matrix_guard;
 mod ci_gate_steps_guard;
 #[path = "offline/connect_error_hints.rs"]
 mod connect_error_hints;
+#[path = "offline/fix_cells_guard.rs"]
+mod fix_cells_guard;
 #[path = "offline/form_a_checksum_guard.rs"]
 mod form_a_checksum_guard;
 #[path = "offline/memory_throttle_wiring.rs"]
