@@ -24,6 +24,8 @@ mod materialize;
 mod oracle;
 mod remedy;
 pub use remedy::{Refused, Remedy, Then, assert_refused};
+mod sabotage;
+pub use sabotage::{Damage, Survived};
 mod render;
 mod verify;
 
