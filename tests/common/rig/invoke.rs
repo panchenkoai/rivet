@@ -447,11 +447,7 @@ impl Rig {
         extra: &[&str],
         envs: &[(&str, &str)],
     ) -> String {
-        let mut argv = self.cdc_cli_argv(checkpointed);
-        if let Some(form) = source {
-            argv.splice(1..3, form.iter().map(|a| a.to_string()));
-        }
-        argv.extend(extra.iter().map(|a| a.to_string()));
+        let argv = with_source_form(self.cdc_cli_argv(checkpointed), source, extra);
         let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
         let ceiling = std::time::Duration::from_secs(180);
         crate::common::runner::run_rivet_args_bounded_env(&argv, envs, ceiling)
@@ -485,6 +481,30 @@ impl Rig {
             ),
         }
     }
+}
+
+/// `argv` of `rivet cdc --source <url> …` with the inline pair replaced by `source` (when given) and `extra` appended.
+fn with_source_form(mut argv: Vec<String>, source: Option<&[&str]>, extra: &[&str]) -> Vec<String> {
+    if let Some(form) = source {
+        assert_eq!(argv[1], "--source", "the inline source pair moved");
+        argv.splice(1..3, form.iter().map(|a| a.to_string()));
+    }
+    argv.extend(extra.iter().map(|a| a.to_string()));
+    argv
+}
+
+#[test]
+fn a_source_form_replaces_the_inline_source_pair() {
+    let inline = || {
+        ["cdc", "--source", "u", "--table", "t"]
+            .map(String::from)
+            .to_vec()
+    };
+    assert_eq!(
+        with_source_form(inline(), Some(&["--source-env", "V"]), &["--output", "d"]),
+        ["cdc", "--source-env", "V", "--table", "t", "--output", "d"]
+    );
+    assert_eq!(with_source_form(inline(), None, &[]), inline());
 }
 
 /// Doctor's all_ok when the run after it agrees, else why not (all_ok, then a refused run); an unreadable report is an error.

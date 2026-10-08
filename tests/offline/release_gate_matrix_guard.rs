@@ -73,7 +73,8 @@ const ENGINES: [&str; 5] = ["postgres", "mysql", "mssql", "mongo", "oracle"];
 // un-gated `grid.oracle` version (the gate does not bring Oracle up yet).
 // Lowered 11 -> 4 (2026-09-26): the gate brings up oracle 23-free; 6 scenario cells flipped to
 // test, blessed_flow + not_inert remain gaps (they ride the CDC stand, which has no Oracle).
-const GAP_RATCHET: usize = 4; // ratchet-pin: release-gate-matrix-gaps
+// Lowered 4 -> 2 (2026-10-08): blessed_flow and not_inert run on Oracle (12 batch cells; the cdc cells are `na` with their reason).
+const GAP_RATCHET: usize = 2; // ratchet-pin: release-gate-matrix-gaps
 
 fn load(path: &str) -> Value {
     let s = super::nonvacuity::subject_text(path);
