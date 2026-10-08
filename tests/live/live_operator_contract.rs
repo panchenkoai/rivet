@@ -135,7 +135,7 @@ fn slowed(rig: Rig, ms: u32) -> Rig {
 
 // (a) exit 0 over a wrong destination
 
-/// RESULTS 1: a checkpoint left by a crashed run is not resumed after a later run finished the export.
+/// RESULTS 1: a run without the checkpoint beside an unfinished checkpointed run is refused, so no finished run can stand beside a checkpoint a later run would resume.
 fn stale_chunk_checkpoint(engine: SqlEngine) {
     let (table, _guard) = range_table(engine, "oc_stale", ROWS);
     let mut rig = range_checkpoint_rig(engine, &table);
@@ -145,41 +145,29 @@ fn stale_chunk_checkpoint(engine: SqlEngine) {
         "fixture: the first run crashes after its third chunk"
     );
     rig.replace_export_line("chunk_checkpoint", "chunk_checkpoint: false");
-    rig.run_ok();
-    let v = engine.col("v");
-    engine.exec(&format!("UPDATE {table} SET {v} = {v} + 1000"));
-    rig.replace_export_line("chunk_checkpoint", "chunk_checkpoint: true");
-    let out = rig.run();
-    if out.status.success() {
-        let stale: Vec<i64> = rig
-            .read_declared_parts()
-            .iter()
-            .flat_map(|b| {
-                ids_of(std::slice::from_ref(b))
-                    .into_iter()
-                    .zip(int_column(b, "v"))
-            })
-            .filter(|(_, v)| *v < 1000)
-            .map(|(id, _)| id)
-            .collect();
-        assert!(
-            stale.is_empty(),
-            "a run resumed a checkpoint older than the last finished run and exited 0: {} of {ROWS} rows carry the value from before the update",
-            stale.len()
-        );
-    }
-}
-
-/// One integer column of a batch, whatever its width.
-fn int_column(b: &arrow::record_batch::RecordBatch, name: &str) -> Vec<i64> {
-    use arrow::array::{Array, Int64Array};
-    let col = b
-        .column_by_name(name)
-        .unwrap_or_else(|| panic!("column {name}"));
-    let col =
-        arrow::compute::cast(col, &arrow::datatypes::DataType::Int64).expect("an integer column");
-    let col = col.as_any().downcast_ref::<Int64Array>().unwrap();
-    (0..col.len()).map(|i| col.value(i)).collect()
+    let export = table.clone();
+    rig.refuses_twice_then(
+        &["run"],
+        &[],
+        Refused::by_code("RIVET_STATE_INTERRUPTED_RUN_OWNER_MISMATCH", 5),
+        vec![
+            Remedy::new(
+                "restore the checkpoint setting",
+                Then::DeliversTheSource,
+                |r| {
+                    r.replace_export_line("chunk_checkpoint", "chunk_checkpoint: true");
+                },
+            ),
+            Remedy::new(
+                "abandons it and the next run starts with a full pass",
+                Then::DeliversTheSource,
+                move |r| {
+                    let reset = r.cli(&["state", "reset-chunks", "--export", &export]);
+                    assert!(reset.status.success(), "{}", text(&reset));
+                },
+            ),
+        ],
+    );
 }
 
 /// RESULTS 2: `run --validate` over a destination that fails verification exits as `rivet validate` does on that prefix.
@@ -1162,20 +1150,20 @@ fn standby_refusal_leaves_nothing_and_its_remedy_runs() {
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose postgres; open defect (stale chunk checkpoint adopted), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_stale_chunk_checkpoint_is_not_adopted_after_a_finished_run_postgres() {
+#[ignore = "live: requires docker compose postgres"]
+fn a_run_without_the_checkpoint_beside_an_unfinished_run_is_refused_postgres() {
     stale_chunk_checkpoint(SqlEngine::Pg);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mysql; open defect (stale chunk checkpoint adopted), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_stale_chunk_checkpoint_is_not_adopted_after_a_finished_run_mysql() {
+#[ignore = "live: requires docker compose mysql"]
+fn a_run_without_the_checkpoint_beside_an_unfinished_run_is_refused_mysql() {
     stale_chunk_checkpoint(SqlEngine::Mysql);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mssql; open defect (stale chunk checkpoint adopted), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_stale_chunk_checkpoint_is_not_adopted_after_a_finished_run_mssql() {
+#[ignore = "live: requires docker compose mssql"]
+fn a_run_without_the_checkpoint_beside_an_unfinished_run_is_refused_mssql() {
     stale_chunk_checkpoint(SqlEngine::Mssql);
 }
 
@@ -1530,8 +1518,8 @@ fn open_defect_validate_fails_on_a_missing_bucket_azure() {
 
 #[cfg(feature = "oracle")]
 #[test]
-#[ignore = "live+gate-only: docker compose oracle; open defect (stale chunk checkpoint adopted), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_stale_chunk_checkpoint_is_not_adopted_after_a_finished_run_oracle() {
+#[ignore = "live: requires docker compose oracle"]
+fn a_run_without_the_checkpoint_beside_an_unfinished_run_is_refused_oracle() {
     stale_chunk_checkpoint(SqlEngine::Oracle);
 }
 

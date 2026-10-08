@@ -31,6 +31,16 @@ const PARALLEL_KEYSET: Stage = Stage(
     "chunked",
     &["chunk_by_key: id", "chunk_size: 4", "parallel: 2"],
 );
+const PARALLEL_KEYSET_CHECKPOINT: Stage = Stage(
+    "chunked",
+    &[
+        "chunk_by_key: id",
+        "chunk_size: 4",
+        "parallel: 2",
+        "chunk_checkpoint: true",
+    ],
+);
+const RANGE_CHUNKED_PLAIN: Stage = Stage("chunked", &["chunk_column: id", "chunk_size: 4"]);
 const KEYSET_INCREMENTAL_ID: Stage = Stage(
     "chunked",
     &[
@@ -1259,6 +1269,263 @@ fn crashed_range_chunk_then_incremental(engine: SqlEngine, remedy: Remedy) {
     );
 }
 
+/// Sorted `(id, time_spent)` of every part under `out`, whatever the engine's integer widths and name case.
+fn delivered_spent(engine: SqlEngine, out: &Path) -> Vec<(i64, i64)> {
+    use arrow::array::{Array, Int64Array};
+    let name = |col: &str| match engine.folds_upper() {
+        true => col.to_uppercase(),
+        false => col.to_string(),
+    };
+    let mut rows = Vec::new();
+    for b in read_all_parts(out) {
+        let ints = |col: &str| -> Vec<i64> {
+            let cast = arrow::compute::cast(
+                b.column_by_name(&name(col)).expect("the column"),
+                &arrow::datatypes::DataType::Int64,
+            )
+            .expect("an integer column");
+            let a = cast.as_any().downcast_ref::<Int64Array>().unwrap();
+            (0..a.len()).map(|i| a.value(i)).collect()
+        };
+        rows.extend(ints("id").into_iter().zip(ints("time_spent")));
+    }
+    rows.sort();
+    rows
+}
+
+/// The standard table with a key range chunking accepts on every engine (Oracle refuses `NUMBER(19)`).
+fn range_chunkable_table(engine: SqlEngine, prefix: &str) -> (String, Box<dyn std::any::Any>) {
+    #[cfg(feature = "oracle")]
+    if let SqlEngine::Oracle = engine {
+        return engine.create(
+            prefix,
+            "id NUMBER(18) PRIMARY KEY, ext_id NUMBER(18) NOT NULL UNIQUE, \
+             server_time TIMESTAMP(6) NOT NULL, updated_at TIMESTAMP(6) NULL, time_spent INT NULL",
+        );
+    }
+    engine.table(prefix)
+}
+
+/// One checkpointed runner shape: its stage, the same stage with the checkpoint removed, where its first run crashes, and the state subcommand that abandons it.
+struct Checkpointed {
+    prior: Stage,
+    plain: Stage,
+    crash_at: &'static str,
+    abandon: &'static str,
+}
+
+const RANGE_CHUNK_RUN: Checkpointed = Checkpointed {
+    prior: RANGE_CHUNKED,
+    plain: RANGE_CHUNKED_PLAIN,
+    crash_at: "after_chunk_complete:0",
+    abandon: "reset-chunks",
+};
+const KEYSET_RUN: Checkpointed = Checkpointed {
+    prior: KEYSET_CHECKPOINT,
+    plain: KEYSET,
+    crash_at: "after_keyset_page:0",
+    abandon: "reset",
+};
+const PARALLEL_KEYSET_RUN: Checkpointed = Checkpointed {
+    prior: PARALLEL_KEYSET_CHECKPOINT,
+    plain: PARALLEL_KEYSET,
+    crash_at: "keyset_parallel_range_committed:0",
+    abandon: "reset",
+};
+
+/// MT10: a checkpointed run crashes with part of ids 1..=10 delivered, then the export drops its checkpoint with no reset: refused twice, nothing written. After `remedy` the uncheckpointed run delivers the source as it is, and the checkpoint put back starts a fresh run over rows changed since.
+fn crashed_run_then_checkpoint_removed(engine: SqlEngine, shape: Checkpointed, remedy: Remedy) {
+    engine.alive();
+    let (table, _guard) = range_chunkable_table(engine, "ckpt_removed");
+    engine.insert(&table, 1..=10, 180, Some(10));
+    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let (crashed, plain_out, fresh) = (dirs[0].path(), dirs[1].path(), dirs[2].path());
+    let ids = |out: &Path| delivered_ids(engine, out);
+    let source: Vec<i64> = (1..=10).collect();
+
+    let run = staged_for(engine, engine.rig(&table), &shape.prior, crashed);
+    let crash = run.run_with_env("RIVET_TEST_PANIC_AT", shape.crash_at);
+    assert!(!crash.status.success(), "the first run must crash");
+    assert!(
+        !ids(crashed).is_empty(),
+        "the crashed run delivered a part first:\n{}",
+        String::from_utf8_lossy(&crash.stderr)
+    );
+
+    let plain = staged_for(engine, run, &shape.plain, plain_out);
+    for cycle in 1..=2 {
+        let o = plain.run();
+        let said = String::from_utf8_lossy(&o.stderr).to_string();
+        let got = ids(plain_out);
+        assert!(
+            got.is_empty(),
+            "cycle {cycle}: the run without the checkpoint delivered {} of {} source ids \
+             ({got:?}) beside an unfinished run, exit {:?}",
+            got.len(),
+            source.len(),
+            o.status.code()
+        );
+        assert_eq!(o.status.code(), Some(5), "cycle {cycle}:\n{said}");
+        let command = format!("rivet state {} -c <config> --export {table}", shape.abandon);
+        for want in [
+            INTERRUPTED_CODE,
+            "of mode `",
+            "runs without the checkpoint that run was opened with",
+            "restore the checkpoint setting (`chunk_checkpoint: true`",
+            &command,
+        ] {
+            assert!(
+                said.contains(want),
+                "cycle {cycle}: must name {want}:\n{said}"
+            );
+        }
+        assert!(!plain_out.join("_SUCCESS").exists(), "cycle {cycle}");
+    }
+
+    let plain = match remedy {
+        Remedy::FinishTheRun => {
+            let run = staged_for(engine, plain, &shape.prior, crashed);
+            run.run_ok();
+            assert_eq!(ids(crashed), source, "the interrupted run finished");
+            staged_for(engine, run, &shape.plain, plain_out)
+        }
+        Remedy::Reset => {
+            let reset = plain.cli(&["state", shape.abandon, "--export", &table]);
+            assert!(
+                reset.status.success(),
+                "{}",
+                String::from_utf8_lossy(&reset.stderr)
+            );
+            plain
+        }
+    };
+    let change = |ids: &str, to: i64| {
+        engine.exec(&format!(
+            "UPDATE {table} SET time_spent = {to} WHERE id IN ({ids})"
+        ))
+    };
+    let expect = |changed: &[(i64, i64)]| -> Vec<(i64, i64)> {
+        let to = |id: i64| changed.iter().find(|c| c.0 == id).map_or(10, |c| c.1);
+        (1..=10).map(|id| (id, to(id))).collect()
+    };
+    change("1, 5, 9", 99);
+    plain.run_ok();
+    assert_eq!(
+        delivered_spent(engine, plain_out),
+        expect(&[(1, 99), (5, 99), (9, 99)]),
+        "the run without the checkpoint, once the unfinished run is settled"
+    );
+
+    change("2, 6, 10", 77);
+    let again = staged_for(engine, plain, &shape.prior, fresh);
+    let said = again.run_ok_capture();
+    assert!(
+        !said.contains("resuming it"),
+        "no run is left to resume:\n{said}"
+    );
+    assert_eq!(
+        delivered_spent(engine, fresh),
+        expect(&[(1, 99), (5, 99), (9, 99), (2, 77), (6, 77), (10, 77)]),
+        "the checkpoint back on reads the source as it is now"
+    );
+}
+
+/// MT10 on MongoDB: a `resume: true` run crashes after its first page, then `resume` is removed.
+fn crashed_resume_then_resume_removed_mongo(remedy: Remedy) {
+    require_alive(LiveService::Mongo);
+    let db = unique_name("mt_resume_off");
+    let m = MongoTest::connect(27017, &db);
+    m.seed_int_id("t", 10);
+    let (crashed, plain_out) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let strings = |dir: &Path, col: &str| dir_parquet_distinct_strings(dir, col);
+    let ids = |dir: &Path| -> Vec<i64> {
+        let mut v: Vec<i64> = strings(dir, "_id")
+            .iter()
+            .map(|s| s.parse().expect("an integer _id"))
+            .collect();
+        v.sort();
+        v
+    };
+    let source: Vec<i64> = (1..=10).collect();
+    let resumable = |rig: Rig| {
+        rig.mongo("page_size: 4, resume: true")
+            .restage("full", &[])
+            .dest_path(crashed.path().to_path_buf())
+    };
+    let unresumable = |rig: Rig| {
+        rig.mongo("page_size: 4")
+            .restage("full", &[])
+            .dest_path(plain_out.path().to_path_buf())
+    };
+
+    let run = resumable(
+        Rig::mongo_batch("t")
+            .source_url(&MongoTest::url(27017, &db))
+            .export_named(&db),
+    );
+    let crash = run.run_with_env("RIVET_TEST_PANIC_AT", "after_keyset_page:0");
+    assert!(!crash.status.success(), "the first run must crash");
+    assert_eq!(ids(crashed.path()), vec![1, 2, 3, 4], "page 0 landed first");
+
+    let plain = unresumable(run);
+    for cycle in 1..=2 {
+        let o = plain.run();
+        let said = String::from_utf8_lossy(&o.stderr).to_string();
+        let got = ids(plain_out.path());
+        assert!(
+            got.is_empty(),
+            "cycle {cycle}: the run without `resume` delivered {} of {} source ids ({got:?}) \
+             beside an unfinished run, exit {:?}",
+            got.len(),
+            source.len(),
+            o.status.code()
+        );
+        assert_eq!(o.status.code(), Some(5), "cycle {cycle}:\n{said}");
+        for want in [
+            INTERRUPTED_CODE,
+            "of mode `keyset`",
+            "MongoDB's `source.mongo.resume: true`",
+            &format!("rivet state reset -c <config> --export {db}"),
+        ] {
+            assert!(
+                said.contains(want),
+                "cycle {cycle}: must name {want}:\n{said}"
+            );
+        }
+    }
+
+    let plain = match remedy {
+        Remedy::FinishTheRun => {
+            let run = resumable(plain);
+            run.run_ok();
+            assert_eq!(ids(crashed.path()), source, "the interrupted run finished");
+            unresumable(run)
+        }
+        Remedy::Reset => {
+            let reset = plain.cli(&["state", "reset", "--export", &db]);
+            assert!(
+                reset.status.success(),
+                "{}",
+                String::from_utf8_lossy(&reset.stderr)
+            );
+            plain
+        }
+    };
+    for id in [1, 5, 9] {
+        m.upsert_set("t", id, "v", "changed");
+    }
+    plain.run_ok();
+    assert_eq!(ids(plain_out.path()), source);
+    let changed = strings(plain_out.path(), "document")
+        .iter()
+        .filter(|d| d.contains("changed"))
+        .count();
+    assert_eq!(
+        changed, 3,
+        "the run without `resume` reads the source as it is now"
+    );
+}
+
 /// P-02: config A crashes after chunk 0; config B (same export name, table name and chunk settings, ANOTHER database) must deliver its own rows, twice; A then resumes its own run.
 fn range_chunk_shared_name_another_source(engine: SqlEngine) {
     engine.alive();
@@ -1410,6 +1677,180 @@ fn crashed_range_chunk_then_incremental_finish_the_run_mssql() {
 #[ignore = "live: requires docker compose mssql"]
 fn crashed_range_chunk_then_incremental_reset_mssql() {
     crashed_range_chunk_then_incremental(SqlEngine::Mssql, Remedy::Reset);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn crashed_range_chunk_then_checkpoint_removed_finish_the_run_postgres() {
+    crashed_run_then_checkpoint_removed(SqlEngine::Pg, RANGE_CHUNK_RUN, Remedy::FinishTheRun);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn crashed_range_chunk_then_checkpoint_removed_finish_the_run_mysql() {
+    crashed_run_then_checkpoint_removed(SqlEngine::Mysql, RANGE_CHUNK_RUN, Remedy::FinishTheRun);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn crashed_range_chunk_then_checkpoint_removed_finish_the_run_mssql() {
+    crashed_run_then_checkpoint_removed(SqlEngine::Mssql, RANGE_CHUNK_RUN, Remedy::FinishTheRun);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn crashed_range_chunk_then_checkpoint_removed_finish_the_run_oracle() {
+    crashed_run_then_checkpoint_removed(SqlEngine::Oracle, RANGE_CHUNK_RUN, Remedy::FinishTheRun);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn crashed_range_chunk_then_checkpoint_removed_reset_postgres() {
+    crashed_run_then_checkpoint_removed(SqlEngine::Pg, RANGE_CHUNK_RUN, Remedy::Reset);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn crashed_range_chunk_then_checkpoint_removed_reset_mysql() {
+    crashed_run_then_checkpoint_removed(SqlEngine::Mysql, RANGE_CHUNK_RUN, Remedy::Reset);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn crashed_range_chunk_then_checkpoint_removed_reset_mssql() {
+    crashed_run_then_checkpoint_removed(SqlEngine::Mssql, RANGE_CHUNK_RUN, Remedy::Reset);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn crashed_range_chunk_then_checkpoint_removed_reset_oracle() {
+    crashed_run_then_checkpoint_removed(SqlEngine::Oracle, RANGE_CHUNK_RUN, Remedy::Reset);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn crashed_keyset_then_checkpoint_removed_finish_the_run_postgres() {
+    crashed_run_then_checkpoint_removed(SqlEngine::Pg, KEYSET_RUN, Remedy::FinishTheRun);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn crashed_keyset_then_checkpoint_removed_finish_the_run_mysql() {
+    crashed_run_then_checkpoint_removed(SqlEngine::Mysql, KEYSET_RUN, Remedy::FinishTheRun);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn crashed_keyset_then_checkpoint_removed_finish_the_run_mssql() {
+    crashed_run_then_checkpoint_removed(SqlEngine::Mssql, KEYSET_RUN, Remedy::FinishTheRun);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn crashed_keyset_then_checkpoint_removed_finish_the_run_oracle() {
+    crashed_run_then_checkpoint_removed(SqlEngine::Oracle, KEYSET_RUN, Remedy::FinishTheRun);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn crashed_keyset_then_checkpoint_removed_reset_postgres() {
+    crashed_run_then_checkpoint_removed(SqlEngine::Pg, KEYSET_RUN, Remedy::Reset);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn crashed_keyset_then_checkpoint_removed_reset_mysql() {
+    crashed_run_then_checkpoint_removed(SqlEngine::Mysql, KEYSET_RUN, Remedy::Reset);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn crashed_keyset_then_checkpoint_removed_reset_mssql() {
+    crashed_run_then_checkpoint_removed(SqlEngine::Mssql, KEYSET_RUN, Remedy::Reset);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn crashed_keyset_then_checkpoint_removed_reset_oracle() {
+    crashed_run_then_checkpoint_removed(SqlEngine::Oracle, KEYSET_RUN, Remedy::Reset);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn crashed_parallel_keyset_then_checkpoint_removed_finish_the_run_postgres() {
+    crashed_run_then_checkpoint_removed(SqlEngine::Pg, PARALLEL_KEYSET_RUN, Remedy::FinishTheRun);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn crashed_parallel_keyset_then_checkpoint_removed_finish_the_run_mysql() {
+    crashed_run_then_checkpoint_removed(
+        SqlEngine::Mysql,
+        PARALLEL_KEYSET_RUN,
+        Remedy::FinishTheRun,
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn crashed_parallel_keyset_then_checkpoint_removed_finish_the_run_mssql() {
+    crashed_run_then_checkpoint_removed(
+        SqlEngine::Mssql,
+        PARALLEL_KEYSET_RUN,
+        Remedy::FinishTheRun,
+    );
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn crashed_parallel_keyset_then_checkpoint_removed_finish_the_run_oracle() {
+    crashed_run_then_checkpoint_removed(
+        SqlEngine::Oracle,
+        PARALLEL_KEYSET_RUN,
+        Remedy::FinishTheRun,
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn crashed_parallel_keyset_then_checkpoint_removed_reset_postgres() {
+    crashed_run_then_checkpoint_removed(SqlEngine::Pg, PARALLEL_KEYSET_RUN, Remedy::Reset);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn crashed_parallel_keyset_then_checkpoint_removed_reset_mysql() {
+    crashed_run_then_checkpoint_removed(SqlEngine::Mysql, PARALLEL_KEYSET_RUN, Remedy::Reset);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn crashed_parallel_keyset_then_checkpoint_removed_reset_mssql() {
+    crashed_run_then_checkpoint_removed(SqlEngine::Mssql, PARALLEL_KEYSET_RUN, Remedy::Reset);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn crashed_parallel_keyset_then_checkpoint_removed_reset_oracle() {
+    crashed_run_then_checkpoint_removed(SqlEngine::Oracle, PARALLEL_KEYSET_RUN, Remedy::Reset);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mongo"]
+fn crashed_resume_then_resume_removed_finish_the_run_mongo() {
+    crashed_resume_then_resume_removed_mongo(Remedy::FinishTheRun);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mongo"]
+fn crashed_resume_then_resume_removed_reset_mongo() {
+    crashed_resume_then_resume_removed_mongo(Remedy::Reset);
 }
 
 #[cfg(feature = "oracle")]

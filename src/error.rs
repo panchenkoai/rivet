@@ -484,10 +484,10 @@ pub mod codes {
         "RIVET_STATE_CURSOR_STREAM_MISMATCH",
         "give each export that shares this state database its own name; if this export was repointed, `rivet state reset -c <config> --export <name>` starts the new table with a full pass (it discards the progress of every export of that name in the state database)",
     );
-    /// An export met an unfinished checkpointed run that another mode opened on its stream.
+    /// An export met an unfinished checkpointed run it does not continue: another mode opened it, or its checkpoint setting is off now.
     pub const STATE_INTERRUPTED_RUN_OWNER_MISMATCH: Code = refusal(
         "RIVET_STATE_INTERRUPTED_RUN_OWNER_MISMATCH",
-        "restore the previous mode's settings and run once to finish the interrupted run, then switch; or abandon it with the command the message names (`rivet state reset` for a keyset run, `rivet state reset-chunks` for a range-chunk run) and the next run starts with a full pass",
+        "restore the settings the interrupted run had (its mode, its checkpoint) and run once to finish it, then change them; or abandon it with the command the message names (`rivet state reset` for a keyset run, `rivet state reset-chunks` for a range-chunk run) and the next run starts with a full pass",
     );
     /// A table joined a CDC stream that did not capture it on its last run, over a baseline already recorded complete.
     pub const STATE_CDC_TABLE_REJOINED: Code = refusal(
@@ -498,6 +498,11 @@ pub mod codes {
     pub const STATE_CHUNK_RUN_OWNER_UNKNOWN: Code = refusal(
         "RIVET_STATE_CHUNK_RUN_OWNER_UNKNOWN",
         "`rivet state reset-chunks -c <config> --export <name>` abandons the run; the next run of each config starts a fresh pass",
+    );
+    /// An in-progress chunk run recorded no source, and a run of its export finished after it was opened.
+    pub const STATE_CHUNK_RUN_SUPERSEDED: Code = refusal(
+        "RIVET_STATE_CHUNK_RUN_SUPERSEDED",
+        "`rivet state reset-chunks -c <config> --export <name>` abandons the run; the next run starts a fresh pass",
     );
     /// A command that rewrites an export's stored progress met a live run of that export.
     pub const STATE_RUN_IN_PROGRESS: Code = refusal(
@@ -635,6 +640,7 @@ pub mod codes {
         STATE_INTERRUPTED_RUN_OWNER_MISMATCH,
         STATE_CDC_TABLE_REJOINED,
         STATE_CHUNK_RUN_OWNER_UNKNOWN,
+        STATE_CHUNK_RUN_SUPERSEDED,
         STATE_KEYSET_SEQUENTIAL_ANCHOR_UNFINISHED,
         STATE_RUN_IN_PROGRESS,
         STATE_CHUNK_CHECKPOINT_GONE,

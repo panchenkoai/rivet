@@ -2335,6 +2335,23 @@ mod tests {
         st.claim(plan.progress_key()).unwrap()
     }
 
+    #[test]
+    fn a_plan_without_its_checkpoint_is_refused_beside_the_run_its_checkpointed_twin_left() {
+        let checkpointed = keyset_plan(false);
+        let mut plain = keyset_plan(false);
+        if let ExtractionStrategy::Keyset(k) = &mut plain.strategy {
+            k.checkpoint = false;
+        }
+        let st = anchored_state(&checkpointed);
+        let refused = st.claim(plain.progress_key()).err().expect("refused");
+        assert_eq!(
+            crate::error::error_code(&refused),
+            Some("RIVET_STATE_INTERRUPTED_RUN_OWNER_MISMATCH"),
+            "{refused:#}"
+        );
+        assert!(st.claim(checkpointed.progress_key()).is_ok());
+    }
+
     /// `(anchor, has ranges)` left for `orders`.
     fn anchor_left(st: &StateStore, plan: &ResolvedRunPlan) -> (Option<String>, bool) {
         (
