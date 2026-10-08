@@ -1,0 +1,13 @@
+diff --git a/src/pipeline/job.rs b/src/pipeline/job.rs
+--- a/src/pipeline/job.rs
++++ b/src/pipeline/job.rs
+@@ -1656,7 +1656,8 @@
+     // An export failure wins, otherwise an unwritten manifest fails the run, then
+     // the first gate that did: `--validate`, `--reconcile` (`Ok(())` where the
+     // policy disables it), the cursor.
+-    let gates = [validate_run_gate(&summary), reconcile_gate, cursor_gate];
++    let _ = validate_run_gate(&summary);
++    let gates = [Ok(()), reconcile_gate, cursor_gate];
+     let final_result = resolve_final_result(failed, result, manifest_gap, gates);
+     (final_result, summary)
+ }

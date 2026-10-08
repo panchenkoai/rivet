@@ -13,6 +13,8 @@ const CEILING: std::time::Duration = std::time::Duration::from_secs(180);
 pub enum Local {
     /// The SQLite state files beside the config.
     State,
+    /// The directory that holds the SQLite state, its one file left writable: a read-only volume mount.
+    StateDirectory,
     /// The local destination directory.
     Destination,
 }
@@ -193,17 +195,32 @@ impl Rig {
     /// Make a local resource of this rig read-only until the guard is dropped; panics unless it exists and a write to it is then refused.
     pub fn read_only(&self, what: Local) -> ReadOnly {
         use std::os::unix::fs::PermissionsExt as _;
-        let paths: Vec<PathBuf> = match what {
-            Local::Destination => vec![self.out_dir()],
-            Local::State => crate::common::runner::files_under(
-                self.config_path().parent().expect("a config directory"),
-            )
+        let cfg = self.config_path();
+        let dir = cfg.parent().expect("a config directory");
+        if let Local::StateDirectory = what {
+            // The last connection to close checkpoints and removes `-wal` and `-shm`, as a finished run does.
+            rusqlite::Connection::open(dir.join(".rivet_state.db"))
+                .and_then(|c| c.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(())))
+                .expect("checkpoint the state");
+        }
+        let state: Vec<PathBuf> = crate::common::runner::files_under(dir)
             .into_iter()
             .filter(|p| {
                 p.file_name()
                     .is_some_and(|n| n.to_string_lossy().starts_with(".rivet_state.db"))
             })
-            .collect(),
+            .collect();
+        let paths: Vec<PathBuf> = match what {
+            Local::Destination => vec![self.out_dir()],
+            Local::State => state,
+            Local::StateDirectory => {
+                assert_eq!(
+                    state.len(),
+                    1,
+                    "fixture: a state no process has open is one file, with no -wal or -shm: {state:?}"
+                );
+                vec![dir.to_path_buf()]
+            }
         };
         let paths: Vec<PathBuf> = paths.into_iter().filter(|p| p.exists()).collect();
         let guard = ReadOnly(
@@ -211,8 +228,7 @@ impl Rig {
                 .iter()
                 .map(|p| {
                     let mode = std::fs::metadata(p).expect("stat").permissions().mode();
-                    let ro = if p.is_dir() { 0o500 } else { 0o400 };
-                    std::fs::set_permissions(p, std::fs::Permissions::from_mode(ro))
+                    std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode & !0o222))
                         .expect("chmod");
                     (p.clone(), mode)
                 })

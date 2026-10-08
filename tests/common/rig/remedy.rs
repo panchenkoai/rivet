@@ -74,6 +74,7 @@ pub struct Remedy<'a> {
     rerun: Option<Vec<String>>,
     /// See [`Remedy::in_place`].
     in_place: bool,
+    rerun_env: Option<Vec<(String, String)>>,
 }
 
 impl<'a> Remedy<'a> {
@@ -90,6 +91,7 @@ impl<'a> Remedy<'a> {
             apply: Box::new(apply),
             rerun: None,
             in_place: false,
+            rerun_env: None,
         }
     }
 
@@ -114,6 +116,13 @@ impl<'a> Remedy<'a> {
     /// Re-run as `argv` instead of the refused invocation, for a remedy that is itself a flag.
     pub fn rerun_as(mut self, argv: &[&str]) -> Self {
         self.rerun = Some(argv.iter().map(|a| a.to_string()).collect());
+        self
+    }
+
+    /// Re-run under `envs` instead of the refused invocation's, for a remedy that is itself an environment variable.
+    pub fn rerun_env(mut self, envs: &[(&str, &str)]) -> Self {
+        let owned = |(k, v): &(&str, &str)| (k.to_string(), v.to_string());
+        self.rerun_env = Some(envs.iter().map(owned).collect());
         self
     }
 }
@@ -409,6 +418,7 @@ impl Rig {
                 apply,
                 rerun,
                 in_place,
+                rerun_env,
             } = remedy;
             let sentence = if named {
                 sentence
@@ -437,7 +447,13 @@ impl Rig {
             let rerun: Option<Vec<&str>> = rerun
                 .as_ref()
                 .map(|a| a.iter().map(String::as_str).collect());
-            let after = said(&self.cli_env(rerun.as_deref().unwrap_or(argv), envs));
+            let rerun_env: Option<Vec<(&str, &str)>> = rerun_env
+                .as_ref()
+                .map(|e| e.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect());
+            let after = said(&self.cli_env(
+                rerun.as_deref().unwrap_or(argv),
+                rerun_env.as_deref().unwrap_or(envs),
+            ));
             if let Some(why) = not_the_outcome(&first, &after, then, named) {
                 panic!(
                     "refuse-then-remedy: remedy `{sentence}` {why}\n{}",

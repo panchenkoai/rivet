@@ -279,97 +279,6 @@ impl SqlEngine {
         rig.restage(mode, &lines)
     }
 
-    /// The kill handles of every other session whose statement holds or names `table`.
-    fn sessions_on(self, table: &str) -> Vec<String> {
-        match self {
-            SqlEngine::Pg => pg_connect()
-                .query(
-                    "SELECT DISTINCT l.pid::text FROM pg_locks l JOIN pg_class c ON c.oid = l.relation \
-                     WHERE c.relname = $1 AND l.pid <> pg_backend_pid() ORDER BY 1",
-                    &[&table],
-                )
-                .expect("pg_locks")
-                .iter()
-                .map(|r| r.get(0))
-                .collect(),
-            SqlEngine::Mysql => mysql_root_connect()
-                .query::<u64, _>(format!(
-                    "SELECT id FROM information_schema.processlist WHERE id <> CONNECTION_ID() \
-                     AND info LIKE '%{table}%' ORDER BY id"
-                ))
-                .expect("processlist")
-                .into_iter()
-                .map(|id| id.to_string())
-                .collect(),
-            SqlEngine::Mssql => mssql_query_strings(&format!(
-                "SELECT CAST(c.session_id AS VARCHAR(12)) FROM sys.dm_exec_connections c \
-                 CROSS APPLY sys.dm_exec_sql_text(c.most_recent_sql_handle) t \
-                 WHERE c.session_id <> @@SPID AND t.text LIKE '%{table}%' ORDER BY 1"
-            )),
-            #[cfg(feature = "oracle")]
-            SqlEngine::Oracle => {
-                let sql = format!(
-                    "SELECT TO_CHAR(s.sid) || ',' || TO_CHAR(s.serial#) FROM v$session s \
-                     JOIN v$sql q ON q.sql_id = NVL(s.sql_id, s.prev_sql_id) \
-                     WHERE s.username = 'RIVET' AND q.sql_text LIKE '%{table}%' \
-                     AND q.sql_text NOT LIKE '%v$session%' AND q.rows_processed > 0 ORDER BY 1"
-                );
-                match super::ora_system_conn().query(&sql, &[]) {
-                    Ok(rows) => rows
-                        .filter_map(|r| r.ok()?.get::<Option<String>>(0).ok()?)
-                        .collect(),
-                    Err(_) => Vec::new(),
-                }
-            }
-        }
-    }
-
-    /// Kill one session on the server by its handle; a session already gone is not an error.
-    fn kill_session(self, handle: &str) {
-        match self {
-            SqlEngine::Pg => {
-                let pid: i32 = handle.parse().expect("a backend pid");
-                let _ = pg_connect().query("SELECT pg_terminate_backend($1)", &[&pid]);
-            }
-            SqlEngine::Mysql => {
-                let _ = mysql_root_connect().query_drop(format!("KILL {handle}"));
-            }
-            SqlEngine::Mssql => {
-                let _ = super::mssql_exec_once(&format!("KILL {handle}"));
-            }
-            #[cfg(feature = "oracle")]
-            SqlEngine::Oracle => {
-                let kill = format!("ALTER SYSTEM KILL SESSION '{handle}' IMMEDIATE");
-                let _ = super::ora_system_conn().execute(&kill, &[]);
-            }
-        }
-    }
-
-    /// Kill on the server the sessions reading `table` once the same ones have been there for 300 ms; panics when none appears in 60 s. Returns how many were killed.
-    pub fn kill_sessions_reading(self, table: &str) -> usize {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        let mut seen: Option<(Vec<String>, std::time::Instant)> = None;
-        let mut killed = 0;
-        while killed == 0 && std::time::Instant::now() < deadline {
-            let now = self.sessions_on(table);
-            match &seen {
-                Some((prev, since)) if !now.is_empty() && *prev == now => {
-                    if since.elapsed() >= std::time::Duration::from_millis(300) {
-                        now.iter().for_each(|s| self.kill_session(s));
-                        killed = now.len();
-                    }
-                }
-                _ if now.is_empty() => seen = None,
-                _ => seen = Some((now, std::time::Instant::now())),
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        if let Some(why) = not_killed(table, killed) {
-            panic!("{why}");
-        }
-        killed
-    }
-
     /// A login of this engine that may only read `table`, dropped with the guard; its SELECT can be revoked and granted back.
     pub fn reader(self, table: &str) -> Reader {
         let name = unique_name("sab_reader");
@@ -427,11 +336,10 @@ impl SqlEngine {
     }
 }
 
-/// Why a kill that hit `killed` sessions is not a source session taken away, else `None`.
-pub(crate) fn not_killed(table: &str, killed: usize) -> Option<String> {
-    (killed == 0).then(|| {
-        format!("sabotage: no session reading {table} appeared to kill: the run was not met")
-    })
+/// Why a kill that hit `killed` sessions of `login` is not a source session taken away, else `None`.
+pub(crate) fn not_killed(login: &str, killed: usize) -> Option<String> {
+    (killed == 0)
+        .then(|| format!("sabotage: no session of {login} appeared to kill: the run was not met"))
 }
 
 #[test]
@@ -439,7 +347,7 @@ fn a_kill_that_hit_no_session_took_nothing_away() {
     assert_eq!(not_killed("t", 1), None);
     assert_eq!(
         not_killed("t", 0).as_deref(),
-        Some("sabotage: no session reading t appeared to kill: the run was not met")
+        Some("sabotage: no session of t appeared to kill: the run was not met")
     );
 }
 
@@ -476,6 +384,93 @@ impl Reader {
                 super::ora_system_exec(&format!("{verb} SELECT ON RIVET.{t} {prep} {n}"))
             }
         }
+    }
+
+    /// The kill handles of this login's sessions.
+    fn sessions(&self) -> Vec<String> {
+        let n = &self.name;
+        match self.engine {
+            SqlEngine::Pg => pg_connect()
+                .query(
+                    "SELECT pid::text FROM pg_stat_activity WHERE usename = $1 ORDER BY 1",
+                    &[n],
+                )
+                .expect("pg_stat_activity")
+                .iter()
+                .map(|r| r.get(0))
+                .collect(),
+            SqlEngine::Mysql => mysql_root_connect()
+                .query::<u64, _>(format!(
+                    "SELECT id FROM information_schema.processlist WHERE user = '{n}' ORDER BY id"
+                ))
+                .expect("processlist")
+                .into_iter()
+                .map(|id| id.to_string())
+                .collect(),
+            SqlEngine::Mssql => mssql_query_strings(&format!(
+                "SELECT CAST(session_id AS VARCHAR(12)) FROM sys.dm_exec_sessions \
+                 WHERE login_name = '{n}' ORDER BY 1"
+            )),
+            #[cfg(feature = "oracle")]
+            SqlEngine::Oracle => {
+                let sql = format!(
+                    "SELECT TO_CHAR(sid) || ',' || TO_CHAR(serial#) FROM v$session \
+                     WHERE username = '{n}' ORDER BY 1"
+                );
+                match super::ora_system_conn().query(&sql, &[]) {
+                    Ok(rows) => rows
+                        .filter_map(|r| r.ok()?.get::<Option<String>>(0).ok()?)
+                        .collect(),
+                    Err(_) => Vec::new(),
+                }
+            }
+        }
+    }
+
+    /// Kill one session on the server by its handle; a session already gone is not an error.
+    fn kill_session(&self, handle: &str) {
+        match self.engine {
+            SqlEngine::Pg => {
+                let pid: i32 = handle.parse().expect("a backend pid");
+                let _ = pg_connect().query("SELECT pg_terminate_backend($1)", &[&pid]);
+            }
+            SqlEngine::Mysql => {
+                let _ = mysql_root_connect().query_drop(format!("KILL {handle}"));
+            }
+            SqlEngine::Mssql => {
+                let _ = super::mssql_exec_once(&format!("KILL {handle}"));
+            }
+            #[cfg(feature = "oracle")]
+            SqlEngine::Oracle => {
+                let kill = format!("ALTER SYSTEM KILL SESSION '{handle}' IMMEDIATE");
+                let _ = super::ora_system_conn().execute(&kill, &[]);
+            }
+        }
+    }
+
+    /// Kill on the server every session of this login once the same ones have been there for 300 ms; panics when none appears in 60 s. Returns how many were killed.
+    pub fn kill_sessions(&self) -> usize {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut seen: Option<(Vec<String>, std::time::Instant)> = None;
+        let mut killed = 0;
+        while killed == 0 && std::time::Instant::now() < deadline {
+            let now = self.sessions();
+            match &seen {
+                Some((prev, since)) if !now.is_empty() && *prev == now => {
+                    if since.elapsed() >= std::time::Duration::from_millis(300) {
+                        now.iter().for_each(|s| self.kill_session(s));
+                        killed = now.len();
+                    }
+                }
+                _ if now.is_empty() => seen = None,
+                _ => seen = Some((now, std::time::Instant::now())),
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        if let Some(why) = not_killed(&self.name, killed) {
+            panic!("{why}");
+        }
+        killed
     }
 
     /// Take this reader's SELECT on its table away.

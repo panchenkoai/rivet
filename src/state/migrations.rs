@@ -1124,32 +1124,121 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
     // (the unprotected ladder hits the errors quoted above and they propagate),
     // but the operator is then handed "no such table: file_manifest" instead of
     // the truth, which names neither the cause nor the remedy.
-    conn.execute_batch("BEGIN IMMEDIATE;").map_err(|e| {
-        // NOTADB is a DIFFERENT disease than BUSY: garbage bytes in the file
-        // are not another process's lock, and telling the operator to "wait
-        // for it to finish" strands them waiting on a phantom (round-5 — the
-        // corrupt-DB probe surfaced this wrong-cause-first headline through
-        // the new `state` CLI).
-        let msg = e.to_string();
-        if msg.contains("file is not a database") || msg.contains("database disk image") {
-            anyhow::anyhow!(
-                "state: {msg} — the state DB file is CORRUPT (or not a SQLite file at \
-                 all), not locked. Move it aside and re-run (rivet rebuilds state; \
-                 incremental cursors and skip-ledgers start fresh), or restore it from \
-                 a backup."
-            )
-        } else {
-            anyhow::anyhow!(
-                "state: could not acquire the migration lock within the busy timeout ({e}). \
-                 Another rivet process is migrating this state database; wait for it to \
-                 finish and retry. Running the migration ladder without the lock is what \
-                 produces 'no such table' / 'duplicate column' failures on a shared backend."
-            )
-        }
-    })?;
+    conn.execute_batch("BEGIN IMMEDIATE;")
+        .map_err(|e| write_lock_not_taken(conn.path(), &e))?;
     let out = migrate_locked(conn);
     let _ = conn.execute_batch(if out.is_ok() { "COMMIT;" } else { "ROLLBACK;" });
     out
+}
+
+/// Why `BEGIN IMMEDIATE` did not take the write lock: a corrupt file, a read-only database, or another process migrating.
+fn write_lock_not_taken(db: Option<&str>, e: &rusqlite::Error) -> anyhow::Error {
+    // NOTADB is a DIFFERENT disease than BUSY: garbage bytes in the file
+    // are not another process's lock, and telling the operator to "wait
+    // for it to finish" strands them waiting on a phantom (round-5 — the
+    // corrupt-DB probe surfaced this wrong-cause-first headline through
+    // the new `state` CLI).
+    let msg = e.to_string();
+    if msg.contains("file is not a database") || msg.contains("database disk image") {
+        return anyhow::anyhow!(
+            "state: {msg} — the state DB file is CORRUPT (or not a SQLite file at \
+             all), not locked. Move it aside and re-run (rivet rebuilds state; \
+             incremental cursors and skip-ledgers start fresh), or restore it from \
+             a backup."
+        );
+    }
+    // READONLY is a third disease: no process holds the database and no wait ends it.
+    if e.sqlite_error_code() == Some(rusqlite::ErrorCode::ReadOnly) {
+        let at = db.map_or(String::new(), |path| format!(" `{path}`"));
+        return anyhow::Error::new(crate::error::CodedError::new(
+            crate::error::codes::STATE_NOT_WRITABLE,
+            format!(
+                "state: the state database{at} is read-only ({e}). SQLite writes the file and, \
+                 beside it, its `-wal` and `-shm` files, so the file and its directory must \
+                 both be writable. The state was not opened and nothing was written. Make the \
+                 state database writable and run again."
+            ),
+        ));
+    }
+    anyhow::anyhow!(
+        "state: could not acquire the migration lock within the busy timeout ({e}). \
+         Another rivet process is migrating this state database; wait for it to \
+         finish and retry. Running the migration ladder without the lock is what \
+         produces 'no such table' / 'duplicate column' failures on a shared backend."
+    )
+}
+
+#[cfg(test)]
+mod write_lock_tests {
+    use super::write_lock_not_taken;
+
+    /// The error SQLite gives for primary or extended result code `code`.
+    fn sqlite(code: std::ffi::c_int, text: &str) -> rusqlite::Error {
+        rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), Some(text.to_string()))
+    }
+
+    #[test]
+    fn a_read_only_database_is_refused_as_not_writable_never_as_another_process() {
+        for code in [
+            rusqlite::ffi::SQLITE_READONLY,
+            rusqlite::ffi::SQLITE_READONLY_DIRECTORY,
+            rusqlite::ffi::SQLITE_READONLY_CANTINIT,
+        ] {
+            let e = sqlite(code, "attempt to write a readonly database");
+            let err = write_lock_not_taken(Some("/data/.rivet_state.db"), &e);
+            assert_eq!(
+                crate::error::error_code(&err),
+                Some("RIVET_STATE_NOT_WRITABLE"),
+                "{code}"
+            );
+            assert_eq!(crate::error::classify_exit(&err), 1, "{code}");
+            assert_eq!(
+                err.to_string(),
+                "state: the state database `/data/.rivet_state.db` is read-only (attempt to write \
+                 a readonly database). SQLite writes the file and, beside it, its `-wal` and \
+                 `-shm` files, so the file and its directory must both be writable. The state \
+                 was not opened and nothing was written. Make the state database writable and \
+                 run again."
+            );
+        }
+        let unnamed = write_lock_not_taken(
+            None,
+            &sqlite(
+                rusqlite::ffi::SQLITE_READONLY,
+                "attempt to write a readonly database",
+            ),
+        );
+        assert!(
+            unnamed
+                .to_string()
+                .starts_with("state: the state database is read-only ("),
+            "{unnamed}"
+        );
+    }
+
+    #[test]
+    fn a_held_lock_and_a_corrupt_file_keep_their_own_causes() {
+        let busy = write_lock_not_taken(
+            Some("s.db"),
+            &sqlite(rusqlite::ffi::SQLITE_BUSY, "database is locked"),
+        );
+        assert_eq!(crate::error::error_code(&busy), None);
+        assert!(
+            busy.to_string()
+                .contains("Another rivet process is migrating this state database"),
+            "{busy}"
+        );
+        let corrupt = write_lock_not_taken(
+            Some("s.db"),
+            &sqlite(rusqlite::ffi::SQLITE_NOTADB, "file is not a database"),
+        );
+        assert_eq!(crate::error::error_code(&corrupt), None);
+        assert!(corrupt.to_string().contains("CORRUPT"), "{corrupt}");
+        assert!(
+            !corrupt.to_string().contains("Another rivet process"),
+            "{corrupt}"
+        );
+    }
 }
 
 fn migrate_locked(conn: &Connection) -> Result<()> {
