@@ -78,6 +78,46 @@ pub(crate) fn not_taken_away(
     })
 }
 
+/// The part paths more than one of `manifests` (parsed manifest documents) declares, sorted.
+pub(crate) fn declared_twice(manifests: &[serde_json::Value]) -> Vec<String> {
+    let mut seen = std::collections::BTreeMap::<&str, usize>::new();
+    for part in manifests
+        .iter()
+        .filter_map(|m| m["parts"].as_array())
+        .flatten()
+    {
+        if let Some(path) = part["path"].as_str() {
+            *seen.entry(path).or_default() += 1;
+        }
+    }
+    seen.into_iter()
+        .filter(|(_, n)| *n > 1)
+        .map(|(p, _)| p.to_string())
+        .collect()
+}
+
+/// The parts of `manifest` whose name does not hold the stamp of the run that declares them (run id `<export>_<yyyymmdd>T<hhmmss>.<mmm>_<pid>`, stamp `<yyyymmdd>_<hhmmss>_<mmm>_<pid>`, a nonce after it), sorted.
+pub(crate) fn not_named_by_its_run(manifest: &serde_json::Value) -> Vec<String> {
+    let (run_id, export) = (
+        manifest["run_id"].as_str().unwrap_or_default(),
+        manifest["export_name"].as_str().unwrap_or_default(),
+    );
+    let stamp = run_id
+        .strip_prefix(export)
+        .unwrap_or(run_id)
+        .replace(['T', '.'], "_");
+    let mut odd: Vec<String> = manifest["parts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|p| p["path"].as_str())
+        .filter(|path| !path.starts_with(&format!("{export}{stamp}_")))
+        .map(str::to_string)
+        .collect();
+    odd.sort();
+    odd
+}
+
 /// A local resource made read-only until dropped: the rule that names its paths, and the write bits taken.
 pub struct ReadOnly {
     what: Local,
@@ -209,6 +249,41 @@ impl Rig {
         }
     }
 
+    /// Start `n` `rivet run` of this rig back to back and reap them once all have ended: what each printed and its exit, each graded like any other run.
+    pub fn runs_at_once(&self, n: usize) -> Vec<std::process::Output> {
+        let mut live: Vec<Spawned<'_>> = (0..n).map(|_| self.spawn_args_env(&[], &[])).collect();
+        for run in &mut live {
+            std::process::Child::wait(run).expect("wait for a run started beside another");
+        }
+        live.into_iter()
+            .map(|run| run.wait_with_output().expect("reap the run"))
+            .collect()
+    }
+
+    /// The part paths more than one run-unique manifest of this rig's local destination declares: one file two runs both claim.
+    pub fn parts_declared_twice(&self) -> Vec<String> {
+        declared_twice(&self.manifests())
+    }
+
+    /// The declared parts of this rig's local destination that are not named after the run that declares them.
+    pub fn parts_not_named_by_their_run(&self) -> Vec<String> {
+        self.manifests()
+            .iter()
+            .flat_map(not_named_by_its_run)
+            .collect()
+    }
+
+    /// Every run-unique manifest of this rig's local destination, parsed.
+    fn manifests(&self) -> Vec<serde_json::Value> {
+        crate::common::parquet::declared_manifests(&self.out_dir())
+            .iter()
+            .map(|m| {
+                serde_json::from_slice(&std::fs::read(m).expect("read a manifest"))
+                    .expect("a JSON manifest")
+            })
+            .collect()
+    }
+
     /// Delete the lease files of this rig's SQLite state (what a live checkpointed run locks); panics when there is none.
     pub fn delete_lease_files(&self) -> usize {
         let cfg = self.config_path();
@@ -298,6 +373,41 @@ mod tests {
         assert!(
             not_taken_away(Local::Destination, &p, true)
                 .is_some_and(|w| w.contains("still writable"))
+        );
+    }
+
+    #[test]
+    fn a_part_two_manifests_declare_is_found_and_one_each_is_not() {
+        let m = |paths: &[&str]| serde_json::json!({ "parts": paths.iter().map(|p| serde_json::json!({ "path": p })).collect::<Vec<_>>() });
+        assert_eq!(
+            declared_twice(&[m(&["a.parquet"]), m(&["b.parquet", "a.parquet"])]),
+            ["a.parquet"]
+        );
+        assert!(declared_twice(&[m(&["a.parquet"]), m(&["b.parquet"]), m(&[])]).is_empty());
+        assert!(declared_twice(&[serde_json::json!({})]).is_empty());
+    }
+
+    #[test]
+    fn a_part_is_named_by_its_run_only_when_it_holds_the_run_stamp() {
+        let m = |paths: &[&str]| {
+            serde_json::json!({
+                "run_id": "orders_20261008T174117.653_33972",
+                "export_name": "orders",
+                "parts": paths.iter().map(|p| serde_json::json!({ "path": p })).collect::<Vec<_>>(),
+            })
+        };
+        let own = [
+            "orders_20261008_174117_653_33972_9f3a1c0b5d7e2a41.parquet",
+            "orders_20261008_174117_653_33972_9f3a1c0b5d7e2a41_part1.parquet",
+        ];
+        assert!(not_named_by_its_run(&m(&own)).is_empty());
+        let other = [
+            "orders_20261008_174117_653_33973_9f3a1c0b5d7e2a41.parquet",
+            "orders_20261008_174122_776.parquet",
+        ];
+        assert_eq!(
+            not_named_by_its_run(&m(&[own[0], other[1], other[0]])),
+            other
         );
     }
 
