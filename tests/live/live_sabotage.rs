@@ -1420,7 +1420,7 @@ impl Ddl {
 }
 
 /// `ddl` on the table of a live range-checkpoint run once it has committed a part, the statement back before the run ends: the run delivers or fails loudly; a dropped table fails every run loudly until it is there again with the rows it held; then a run delivers the source as it is now.
-fn table_changed_under_a_live_run(engine: SqlEngine, ddl: Ddl) {
+fn table_changed_under_it(engine: SqlEngine, ddl: Ddl) {
     let (table, rig, _guard) = live(engine, "sab_ddl", Shape::RangeCheckpoint);
     let (copy, _copy_guard) = engine.range_table("sab_ddl_copy");
     engine.exec(&format!("INSERT INTO {copy} SELECT * FROM {table}"));
@@ -1438,7 +1438,7 @@ fn table_changed_under_a_live_run(engine: SqlEngine, ddl: Ddl) {
 }
 
 /// The collection of a live MongoDB export dropped once it has committed a part, then seeded again with the documents it held: the run delivers or fails loudly, and a run then delivers the source.
-fn collection_dropped_under_a_live_run() {
+fn collection_dropped_under_it() {
     let (rig, m, _guard) = mongo_live("sab_ddl");
     let met = rig.beside_a_live_run(&[], Rig::has_a_part, |_| m.drop_collection("t"));
     let (run, ()) = met.answered_while_alive();
@@ -4098,75 +4098,75 @@ fn a_run_out_of_file_descriptors_fails_loudly_and_the_next_delivers_mongo() {
 #[test]
 #[ignore = "live: requires docker compose postgres"]
 fn a_column_dropped_under_a_live_run_delivers_or_fails_loudly_postgres() {
-    table_changed_under_a_live_run(SqlEngine::Pg, Ddl::DropColumn);
+    table_changed_under_it(SqlEngine::Pg, Ddl::DropColumn);
 }
 
 #[test]
 #[ignore = "live: requires docker compose mysql"]
 fn a_column_dropped_under_a_live_run_delivers_or_fails_loudly_mysql() {
-    table_changed_under_a_live_run(SqlEngine::Mysql, Ddl::DropColumn);
+    table_changed_under_it(SqlEngine::Mysql, Ddl::DropColumn);
 }
 
 #[test]
 #[ignore = "live: requires docker compose mssql"]
 fn a_column_dropped_under_a_live_run_delivers_or_fails_loudly_mssql() {
-    table_changed_under_a_live_run(SqlEngine::Mssql, Ddl::DropColumn);
+    table_changed_under_it(SqlEngine::Mssql, Ddl::DropColumn);
 }
 
 #[cfg(feature = "oracle")]
 #[test]
 #[ignore = "live: requires docker compose oracle"]
 fn a_column_dropped_under_a_live_run_delivers_or_fails_loudly_oracle() {
-    table_changed_under_a_live_run(SqlEngine::Oracle, Ddl::DropColumn);
+    table_changed_under_it(SqlEngine::Oracle, Ddl::DropColumn);
 }
 
 #[test]
 #[ignore = "live: requires docker compose postgres"]
 fn a_column_retyped_under_a_live_run_delivers_or_fails_loudly_postgres() {
-    table_changed_under_a_live_run(SqlEngine::Pg, Ddl::AlterColumnType);
+    table_changed_under_it(SqlEngine::Pg, Ddl::AlterColumnType);
 }
 
 #[test]
 #[ignore = "live: requires docker compose mysql"]
 fn a_column_retyped_under_a_live_run_delivers_or_fails_loudly_mysql() {
-    table_changed_under_a_live_run(SqlEngine::Mysql, Ddl::AlterColumnType);
+    table_changed_under_it(SqlEngine::Mysql, Ddl::AlterColumnType);
 }
 
 #[test]
 #[ignore = "live: requires docker compose mssql"]
 fn a_column_retyped_under_a_live_run_delivers_or_fails_loudly_mssql() {
-    table_changed_under_a_live_run(SqlEngine::Mssql, Ddl::AlterColumnType);
+    table_changed_under_it(SqlEngine::Mssql, Ddl::AlterColumnType);
 }
 
 #[test]
 #[ignore = "live: requires docker compose postgres"]
 fn a_table_dropped_under_a_live_run_delivers_or_fails_loudly_postgres() {
-    table_changed_under_a_live_run(SqlEngine::Pg, Ddl::DropTable);
+    table_changed_under_it(SqlEngine::Pg, Ddl::DropTable);
 }
 
 #[test]
 #[ignore = "live: requires docker compose mysql"]
 fn a_table_dropped_under_a_live_run_delivers_or_fails_loudly_mysql() {
-    table_changed_under_a_live_run(SqlEngine::Mysql, Ddl::DropTable);
+    table_changed_under_it(SqlEngine::Mysql, Ddl::DropTable);
 }
 
 #[test]
 #[ignore = "live: requires docker compose mssql"]
 fn a_table_dropped_under_a_live_run_delivers_or_fails_loudly_mssql() {
-    table_changed_under_a_live_run(SqlEngine::Mssql, Ddl::DropTable);
+    table_changed_under_it(SqlEngine::Mssql, Ddl::DropTable);
 }
 
 #[cfg(feature = "oracle")]
 #[test]
 #[ignore = "live: requires docker compose oracle"]
 fn a_table_dropped_under_a_live_run_delivers_or_fails_loudly_oracle() {
-    table_changed_under_a_live_run(SqlEngine::Oracle, Ddl::DropTable);
+    table_changed_under_it(SqlEngine::Oracle, Ddl::DropTable);
 }
 
 #[test]
 #[ignore = "live: requires docker compose mongo"]
 fn a_table_dropped_under_a_live_run_delivers_or_fails_loudly_mongo() {
-    collection_dropped_under_a_live_run();
+    collection_dropped_under_it();
 }
 
 #[test]
