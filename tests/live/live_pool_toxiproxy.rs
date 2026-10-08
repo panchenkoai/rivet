@@ -264,7 +264,7 @@ fn pool_split_realizes_the_range_split_and_the_union_is_exact() {
         .filter(|p| {
             p.file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(|n| n.contains("pool_split_heavy#"))
+                .is_some_and(|n| n.contains(&format!("{}#", rig.export_name())))
         })
         .collect();
     assert!(
@@ -416,7 +416,7 @@ fn pool_split_prefix_is_manifest_coherent() {
         String::from_utf8_lossy(&v.stderr)
     );
     assert!(
-        !vlog.contains("untracked object: mcoh_giant#"),
+        !vlog.contains(&format!("untracked object: {}#", rig.export_name())),
         "a split unit's own parts must not be flagged untracked (the merge-back \
          claims same-family siblings):\n{vlog}"
     );
@@ -616,7 +616,7 @@ fn pool_split_over_a_nullable_chunk_column_refuses_instead_of_dropping_null_keys
         .filter(|p| {
             p.file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(|n| n.contains("pool_split_nullable_giant#"))
+                .is_some_and(|n| n.contains(&format!("{}#", rig.export_name())))
         })
         .count();
     let delivered = (range_parts > 0).then(|| duckdb_total_parquet_rows(&rig.out_dir()) as i64);
