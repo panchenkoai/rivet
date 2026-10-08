@@ -79,6 +79,16 @@ fn ora(_sql: &str) {
     unreachable!("Eng::Or cells are compiled only with the `oracle` feature");
 }
 
+/// A row source of `n` = 1..=`rows`: two small `CONNECT BY` sets joined, so a 300k-row seed holds no 300k-level hierarchy in PGA (three at once hit ORA-04036 on Oracle Free); with `APPEND` into a `NOLOGGING` table it also writes almost no redo for the LogMiner cells beside it to mine.
+fn ora_series(rows: i64) -> String {
+    format!(
+        "(SELECT (a.l - 1) * 1000 + b.l AS n \
+           FROM (SELECT LEVEL l FROM dual CONNECT BY LEVEL <= {}) a, \
+                (SELECT LEVEL l FROM dual CONNECT BY LEVEL <= 1000) b) WHERE n <= {rows}",
+        (rows + 999) / 1000
+    )
+}
+
 /// Gather optimizer statistics, Oracle's `ANALYZE` (fills `NUM_ROWS` and `AVG_ROW_LEN`).
 fn ora_stats(table: &str) {
     ora(&format!(
@@ -188,10 +198,9 @@ fn insert_dense_range_padded(eng: Eng, table: &str, lo: i64, hi: i64, pad_bytes:
             ));
         }
         Eng::Or => ora(&format!(
-            "INSERT INTO {table} (id, payload, pad) \
-             SELECT {lo} - 1 + LEVEL, {lo} - 1 + LEVEL, RPAD('x', {pad_bytes}, 'x') \
-             FROM dual CONNECT BY LEVEL <= {n}",
-            n = hi - lo + 1
+            "INSERT /*+ APPEND */ INTO {table} (id, payload, pad) \
+             SELECT {lo} - 1 + n, {lo} - 1 + n, RPAD('x', {pad_bytes}, 'x') FROM {}",
+            ora_series(hi - lo + 1)
         )),
     }
 }
@@ -228,9 +237,8 @@ fn insert_dense_range(eng: Eng, table: &str, lo: i64, hi: i64) {
             ));
         }
         Eng::Or => ora(&format!(
-            "INSERT INTO {table} (id, payload) SELECT {lo} - 1 + LEVEL, {lo} - 1 + LEVEL \
-             FROM dual CONNECT BY LEVEL <= {n}",
-            n = hi - lo + 1
+            "INSERT /*+ APPEND */ INTO {table} (id, payload) SELECT {lo} - 1 + n, {lo} - 1 + n FROM {}",
+            ora_series(hi - lo + 1)
         )),
     }
 }
@@ -894,7 +902,7 @@ fn seed_dense_wide(eng: Eng, rows: i64, pad_bytes: usize) -> (String, StandClean
                 format!(", pad VARCHAR2({pad_bytes})")
             };
             ora(&format!(
-                "CREATE TABLE {table} (id NUMBER(18) PRIMARY KEY, payload NUMBER(9) NOT NULL{pad_col})"
+                "CREATE TABLE {table} (id NUMBER(18) PRIMARY KEY, payload NUMBER(9) NOT NULL{pad_col}) NOLOGGING"
             ));
             if pad_bytes == 0 {
                 insert_dense_range(eng, &table, 1, rows);
