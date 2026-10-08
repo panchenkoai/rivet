@@ -2140,6 +2140,26 @@ fn pg_table_added_to_tables_mid_stream_is_baselined() {
     );
 }
 
+/// `rollover: 1` in config mode: an idle bounded run leaves its drain barrier at the head of the slot, which fills the next run's one-row peek; the commits behind it must still arrive.
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical) + the rivet-duckdb oracle"]
+fn pg_cdc_rollover_1_delivers_the_commits_behind_an_idle_runs_barrier() {
+    let mut s = CdcScenario::pg_with("cdc_roll1", "id BIGINT PRIMARY KEY, v BIGINT", |r, _| {
+        r.cdc("rollover: 1")
+    });
+    s.rig.run_ok();
+    s.rig.run_ok();
+    for id in 1..=3 {
+        s.insert(id);
+    }
+    s.rig.run_ok();
+    assert_eq!(
+        dir_parquet_id_set(&s.rig.out_dir()),
+        [1, 2, 3].into(),
+        "three single-row commits behind two idle runs' barriers"
+    );
+}
+
 /// A lost checkpoint's warning remedy, followed as printed, re-reads a row written while it was gone.
 #[test]
 #[ignore = "live: requires docker compose --profile cdc mysql-cdc + the rivet-duckdb oracle"]
@@ -4491,10 +4511,6 @@ fn roast_mysql_cdc_refuses_a_view_whose_binlog_identity_is_the_base_table() {
     let _vg = ViewGuard(view.clone());
 
     let msg = Rig::mysql_cdc(&view)
-        .oracle_known_defect(
-            "a failed run left: cdc-checkpoint",
-            "known defect: a CDC run that refuses at open still writes its checkpoint at the position it started from; the anchor must be written after the open checks",
-        )
         .checkpoint_path(d.path().join("v.ckpt"))
         .dest_path(d.path().join("out"))
         .run_expect_fail();

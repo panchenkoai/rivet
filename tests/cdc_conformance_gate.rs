@@ -948,7 +948,9 @@ const PIN_INDEPENDENT: usize = 113; // ratchet-pin: cdc-census-independent min
 // 2026-10-08: +6 shared codec - the Oracle column-added, two-table and open-bound two-run cells and the PG `rivet cdc --checkpoint`
 // dropped-slot cell read their parts with arrow against ids the test wrote (the rig oracle grades each run against the source); the Oracle
 // view and pre-ALTER refusals read that nothing was delivered. New `duckdb_*` call sites are closed by the duckdb-helper-sites ratchet.
-const PIN_SHARED_CODEC: usize = 117; // ratchet-pin: cdc-census-shared-codec
+// 2026-10-08: +1 shared codec - the PG config-mode `rollover: 1` cell reads the ids behind two idle runs' barriers
+// (pg_cdc_rollover_1_delivers_the_commits_behind_an_idle_runs_barrier); the rig oracle grades the values.
+const PIN_SHARED_CODEC: usize = 118; // ratchet-pin: cdc-census-shared-codec
 const PIN_SELF_COUNTER: usize = 6; // ratchet-pin: cdc-census-self-counter
 // 2026-09-28: +1 presence — the SQL Server undecodable-cell refusal, whose oracle is the refusal.
 // 2026-09-29: +2 presence — the PG CDC LMT-timezone and DOMAIN parity cells compare CDC to batch output.

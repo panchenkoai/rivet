@@ -115,10 +115,43 @@ pub(super) fn collect(config: &Config, config_dir: &std::path::Path) -> Vec<Doct
         #[cfg(not(feature = "oracle"))]
         SourceType::Oracle => Err(crate::source::oracle_feature_missing()),
     };
-    if let Err(e) = result {
-        checks.push(probe_failed(&e));
+    match result {
+        Err(e) => checks.push(probe_failed(&e)),
+        Ok(()) => checks.extend(run_refusals(config, &cdc, &url)),
     }
     checks
+}
+
+/// One failed check per CDC export whose prerequisites the run itself would refuse, asked through the run's own function.
+fn run_refusals(config: &Config, exports: &[&ExportConfig], url: &str) -> Vec<DoctorCheck> {
+    let engine = crate::source::cdc::CdcEngine::from(config.source.source_type);
+    exports
+        .iter()
+        .filter_map(|e| {
+            let cdc = e.cdc.clone().unwrap_or_default();
+            let tables: Vec<String> = e
+                .table
+                .iter()
+                .chain(e.tables.iter().flatten())
+                .cloned()
+                .collect();
+            let drain = crate::source::cdc::DrainMode::from_until_current(cdc.until_current);
+            let refused = engine
+                .refuse_unmet_prerequisites(url, config.source.tls.as_ref(), &tables, drain)
+                .err()?;
+            Some(run_refusal_check(&e.name, &refused))
+        })
+        .collect()
+}
+
+/// The failed check for a prerequisite the run refuses: the refusal's own text, which names its remedy.
+fn run_refusal_check(export: &str, refused: &anyhow::Error) -> DoctorCheck {
+    check(
+        format!("CDC run prerequisites (export '{export}')"),
+        false,
+        Some(super::doctor::trim_probe_error(refused)),
+        None,
+    )
 }
 
 // ─── PostgreSQL ──────────────────────────────────────────────────────────────
@@ -1021,6 +1054,43 @@ mod tests {
         assert!(
             !checks[0].ok && checks[0].name == "CDC health probe",
             "{checks:?}"
+        );
+    }
+
+    /// Doctor fails an export whose prerequisites the run's own function refuses, and adds nothing where it asks nothing.
+    #[test]
+    fn a_prerequisite_the_run_refuses_is_a_failed_check_named_for_its_export() {
+        let cfg = |source: &str| {
+            Config::from_yaml(&format!(
+                "source:\n  {source}\nexports:\n  - name: t\n    table: t\n    mode: cdc\n    \
+                 format: parquet\n    cdc: {{ checkpoint: ./t.ckpt, capture_instance: dbo_t }}\n    \
+                 destination: {{ type: local, path: ./out }}\n"
+            ))
+            .expect("a config")
+        };
+        let run = |c: &Config| {
+            let exports: Vec<&ExportConfig> = c.exports.iter().collect();
+            run_refusals(c, &exports, &c.source.resolve_url().unwrap())
+        };
+        let refused = run(&cfg(
+            "type: postgres\n  url: postgresql://rivet:rivet@127.0.0.1:1/rivet",
+        ));
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert!(!refused[0].ok, "{refused:?}");
+        assert_eq!(refused[0].name, "CDC run prerequisites (export 't')");
+        assert!(
+            refused[0]
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.contains("127.0.0.1:1")),
+            "{refused:?}"
+        );
+        assert!(refused[0].hint.is_none(), "{refused:?}");
+        assert!(
+            run(&cfg(
+                "type: mssql\n  url: sqlserver://sa:x@127.0.0.1:1/rivet"
+            ))
+            .is_empty()
         );
     }
 

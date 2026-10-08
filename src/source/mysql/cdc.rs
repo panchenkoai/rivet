@@ -363,10 +363,18 @@ impl MysqlChangeStream {
         configured_tables: &[String],
     ) -> Result<()> {
         let mut conn = connect_conn(url, tls)?;
-        Self::refuse_nameless_binlog(&mut conn)?;
-        refuse_compressed_binlog(&mut conn)?;
-        refuse_replica_without_relog(&mut conn)?;
-        Self::check_configured_tables_are_routable(&mut conn, configured_tables)
+        Self::refuse_unmet_prerequisites_on(&mut conn, configured_tables)
+    }
+
+    /// Every refusal of the open, asked on `conn` before the anchor is written or the dump starts.
+    fn refuse_unmet_prerequisites_on(
+        conn: &mut mysql::Conn,
+        configured_tables: &[String],
+    ) -> Result<()> {
+        Self::refuse_nameless_binlog(conn)?;
+        refuse_compressed_binlog(conn)?;
+        refuse_replica_without_relog(conn)?;
+        Self::check_configured_tables_are_routable(conn, configured_tables)
     }
 
     /// The binlog row-image verdict, asked on a connection the caller holds.
@@ -573,6 +581,7 @@ impl MysqlChangeStream {
         configured_tables: Vec<String>,
     ) -> Result<Self> {
         let mut conn = connect_conn(url, tls)?;
+        Self::refuse_unmet_prerequisites_on(&mut conn, &configured_tables)?;
         let identity = Self::server_identity(&mut conn)?;
         Self::open_on(
             conn,
@@ -603,17 +612,7 @@ impl MysqlChangeStream {
         } else {
             None
         };
-        // A configured name the binlog can never carry is refused here; its message
-        // carries rivet's `mysql cdc:` prefix, so the caller's grants hint is never
-        // prepended to it.
-        if !configured_tables.is_empty() {
-            Self::check_configured_tables_are_routable(&mut conn, &configured_tables)?;
-        }
         let row_image = Self::row_image_on(&mut conn);
-        // Refuse a compressed binlog rather than read past it in silence.
-        refuse_compressed_binlog(&mut conn)?;
-        // Refuse a replica that does not re-log what it applies: its binlog holds none of it.
-        refuse_replica_without_relog(&mut conn)?;
         // Read the connection's own database BEFORE the binlog stream consumes the
         // connection — it is the meaning of a bare configured name.
         // `Option<String>`, like the two sibling call sites (`mysql/mod.rs`,
@@ -807,8 +806,8 @@ impl MysqlChangeStream {
         };
         // ONE connection for every question asked before the dump; it then dumps.
         let mut conn = connect_conn(url, tls)?;
-        // Before the anchor is written: a refused first run must not pin a MINIMAL span.
-        Self::refuse_nameless_binlog(&mut conn)?;
+        // Before the anchor is written: a refused first run leaves no checkpoint.
+        Self::refuse_unmet_prerequisites_on(&mut conn, &configured_tables)?;
         if let Some(path) = ckpt
             && let Some(pos) = Position::load(path)?
             && let Some((file, p)) =
@@ -1412,7 +1411,8 @@ fn replica_relog_refusal(replicating: bool, relog: Option<&str>) -> Result<()> {
     if !replicating || relogs {
         return Ok(());
     }
-    anyhow::bail!(
+    crate::rivet_bail!(
+        crate::error::codes::SOURCE_CDC_PREREQUISITE,
         "mysql cdc: this server is a replica with log_replica_updates = OFF, so the changes it \
          applies from its source never reach its own binlog — reading it would capture NOTHING of \
          them and report success. Set log_replica_updates = ON (log_slave_updates before 8.0.26; \
@@ -1440,7 +1440,8 @@ fn compression_refusal(raw: Option<&str>) -> Result<()> {
     if !binlog_compression_is_on(raw) {
         return Ok(());
     }
-    anyhow::bail!(
+    crate::rivet_bail!(
+        crate::error::codes::SOURCE_CDC_PREREQUISITE,
         "mysql cdc: the source has binlog_transaction_compression = ON, and this reader cannot \
          expand a Transaction_payload_event — it would capture NOTHING and report success. \
          Turn it off for the replica rivet reads (SET GLOBAL binlog_transaction_compression = OFF; \

@@ -448,10 +448,6 @@ guarantees:
       mssql: { test: mssql_cdc_crash_before_checkpoint_re_reads_on_resume, asserts: "crash before the checkpoint → resume re-reads exactly the 2 un-checkpointed changes" }
       mongo: { test: mongo_cdc_crash_after_flush_before_ack_re_reads_on_resume, asserts: "id {i} lost across the crash" }
       oracle: { test: oracle_cdc_crash_after_flush_before_ack, asserts: "a crash before the checkpoint re-reads the un-acked change, and only it" }
-    contradicted_by:
-      known_red:
-        - "live_cdc_cli_surface::open_defect_pg_cdc_cli_rollover_1_delivers_the_pending_changes"
-        - "live_operator_contract::open_defect_cdc_to_stdout_emits_each_change_once"
 
   - id: a_large_transaction_survives_a_mid_flush_crash_whole
     stated:

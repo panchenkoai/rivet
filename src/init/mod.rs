@@ -768,6 +768,12 @@ pub fn init(
         }
     };
     let yaml_scaffold::Scaffold { text, decisions } = scaffold;
+    let text =
+        if yaml_scaffold::bounds_a_cdc_drain(&text) && pg_source_is_a_standby(source_url, tls) {
+            yaml_scaffold::for_a_standby(&text)
+        } else {
+            text
+        };
 
     if let Some(notice) = cursor_notice(&decisions, mode_override, table.is_none()) {
         eprintln!("{notice}");
@@ -1065,6 +1071,16 @@ fn reject_mongo_schema(schema_flag: Option<&str>) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Whether the source is a PostgreSQL server in recovery (a standby); any other engine or an unanswered probe is not.
+fn pg_source_is_a_standby(source_url: &str, tls: Option<&crate::config::TlsConfig>) -> bool {
+    if !matches!(source_type(source_url), Ok("postgres")) {
+        return false;
+    }
+    crate::source::postgres::connect_client(source_url, tls)
+        .and_then(|mut c| Ok(c.query_one("SELECT pg_is_in_recovery()", &[])?.get(0)))
+        .unwrap_or(false)
 }
 
 #[allow(clippy::too_many_arguments)] // mirrors `init`'s own surface; a params
@@ -1715,6 +1731,19 @@ mod tests {
                 .to_string()
                 + &only_chunk
         );
+    }
+
+    /// Only PostgreSQL has a standby to ask about, and a server that does not answer is not one.
+    #[test]
+    fn only_a_postgres_server_that_answers_in_recovery_is_a_standby() {
+        assert!(!pg_source_is_a_standby(
+            "mysql://rivet:rivet@127.0.0.1:1/rivet",
+            None
+        ));
+        assert!(!pg_source_is_a_standby(
+            "postgresql://rivet:rivet@127.0.0.1:1/rivet",
+            None
+        ));
     }
 
     fn schema_scaffold(infos: &[TableInfo], mode: Option<&str>) -> yaml_scaffold::Scaffold {

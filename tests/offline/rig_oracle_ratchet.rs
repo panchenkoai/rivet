@@ -167,7 +167,7 @@ fn failed_run_leftover_declarations_never_grow() {
 }
 
 /// Refusals the live cells accept with no `RIVET_*` code (`Refused::uncoded_known_defect(`): each is a code the registry owes.
-const UNCODED_REFUSAL_CEILING: usize = 5; // ratchet-pin: uncoded-refusals
+const UNCODED_REFUSAL_CEILING: usize = 4; // ratchet-pin: uncoded-refusals
 
 #[test]
 fn uncoded_refusals_the_cells_accept_never_grow() {
@@ -228,11 +228,6 @@ fn rust_duckdb_helper_call_sites_never_grow() {
 const KNOWN_DEFECTS: &[(&str, &str, &str)] = &[
     // ratchet-pin: oracle-known-defects strings
     (
-        "open_defect_doctor_is_not_green_where_the_cdc_run_refuses_a_replica_that_does_not_relog_mysql",
-        "a failed run left: cdc-checkpoint",
-        "known defect: a CDC run that refuses at open still writes its checkpoint",
-    ),
-    (
         "roast_pg_cdc_refuses_a_bare_table_name_that_matches_two_relations",
         "delivered-only rows",
         "known defect: a bare-name capture delivers the WAL rows",
@@ -268,16 +263,6 @@ const KNOWN_DEFECTS: &[(&str, &str, &str)] = &[
         "known defect: the refusal to overwrite a CDC manifest comes after the chunk plan is stored",
     ),
     (
-        "roast_mysql_cdc_refuses_a_view_whose_binlog_identity_is_the_base_table",
-        "a failed run left: cdc-checkpoint",
-        "known defect: a CDC run that refuses at open still writes its checkpoint at the position it started from; the anchor must be written after the open checks",
-    ),
-    (
-        "cdc_from_a_replica_that_does_not_relog_refuses_instead_of_capturing_nothing",
-        "a failed run left: cdc-checkpoint",
-        "known defect: a CDC run that refuses at open still writes its checkpoint at the position it started from; the anchor must be written after the open checks",
-    ),
-    (
         "roast_resume_must_not_bypass_heterogeneous_id_guard",
         "a failed run left: resume-point",
         "known defect: a resumed keyset run the heterogeneous-_id guard refuses has already written its claim (resume_run_id, resume_owner) on the cursor row; the guard must come before the claim",
@@ -286,11 +271,6 @@ const KNOWN_DEFECTS: &[(&str, &str, &str)] = &[
         "mongo_heterogeneous_resume_remedy",
         "a failed run left: resume-point",
         "known defect: a resumed keyset run the heterogeneous-_id guard refuses has already written its claim (resume_run_id, resume_owner) on the cursor row; the guard must come before the claim",
-    ),
-    (
-        "pg_cdc_missing_table_leaves_no_slot",
-        "a failed run left: chunk-checkpoint",
-        "known defect: a PostgreSQL CDC run refused for a table that does not exist has already stored its export_state row and created its slot",
     ),
 ]; // ratchet-pin: end
 

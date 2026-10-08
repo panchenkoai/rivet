@@ -80,6 +80,23 @@ pub(super) fn generate_schema_config(
     .text)
 }
 
+/// The line every scaffolded CDC export bounds its drain with.
+const BOUNDED_DRAIN_LINE: &str =
+    "      until_current: true  # drain to the current log end and exit (good for a scheduler)";
+
+/// The line a CDC export scaffolded against a PostgreSQL standby carries instead: a bounded drain is refused there.
+const STANDBY_DRAIN_LINE: &str = "      until_current: false  # the source is a standby (in recovery), where a bounded drain is refused; this reads to the end of the replayed log and exits (good for a scheduler)";
+
+/// The scaffold for a source that is a PostgreSQL standby: every CDC export drains unbounded.
+pub(super) fn for_a_standby(text: &str) -> String {
+    wrap_comments(&text.replace(BOUNDED_DRAIN_LINE, STANDBY_DRAIN_LINE))
+}
+
+/// Whether the scaffold holds a CDC export with a bounded drain.
+pub(super) fn bounds_a_cdc_drain(text: &str) -> bool {
+    text.contains(BOUNDED_DRAIN_LINE)
+}
+
 pub(super) fn scaffold_table(
     info: &TableInfo,
     source_url: &str,
@@ -1165,8 +1182,7 @@ fn cdc_export_lines(
 omitting differ per engine — see cdc.md)",
             ident
         ),
-        "      until_current: true  # drain to the current log end and exit (good for a scheduler)"
-            .to_string(),
+        BOUNDED_DRAIN_LINE.to_string(),
     ];
     lines.push(
         if qualified_table.rsplit('.').next() == Some("snapshot") {
@@ -1262,8 +1278,7 @@ fn cdc_multiplex_export_lines(
         "    cdc:".to_string(),
         "      backfill: auto  # baseline through the batch exports above (a table's recipe = the export reading it), after the anchor — no gap"
             .to_string(),
-        "      until_current: true  # drain to the current log end and exit (good for a scheduler)"
-            .to_string(),
+        BOUNDED_DRAIN_LINE.to_string(),
     ];
     match source_type {
         // MySQL has no server-side anchor — the checkpoint IS the resume anchor
@@ -2163,6 +2178,40 @@ mod tests {
             cdc.until_current,
             "an unbounded first run never returns, so there is no second run to be a delta"
         );
+    }
+
+    /// Against a standby the scaffold's CDC drain is unbounded (a bounded one is refused there); a batch scaffold has no drain to change.
+    #[test]
+    fn a_cdc_scaffold_for_a_standby_drains_unbounded_and_still_loads() {
+        let yaml = |mode: &str| {
+            generate_config(
+                &make_table(vec![pk("id", "bigint")]),
+                "postgresql://localhost/db",
+                &crate::init::SourceProvenance::Inline,
+                &Default::default(),
+                Some(mode),
+                None,
+            )
+            .expect("scaffold")
+        };
+        let cdc = yaml("cdc");
+        assert!(bounds_a_cdc_drain(&cdc), "{cdc}");
+        assert!(!bounds_a_cdc_drain(&yaml("full")));
+        let standby = for_a_standby(&cdc);
+        assert!(!bounds_a_cdc_drain(&standby), "{standby}");
+        assert!(
+            standby.contains("      until_current: false  # the source is a standby (in recovery)"),
+            "{standby}"
+        );
+        assert!(
+            standby
+                .lines()
+                .all(|l| l.chars().count() <= COMMENT_WRAP_WIDTH),
+            "{standby}"
+        );
+        let cfg = crate::config::Config::from_yaml(&standby).expect("the standby scaffold loads");
+        assert!(!cfg.exports[0].cdc.as_ref().unwrap().until_current);
+        assert_eq!(for_a_standby(&yaml("full")), yaml("full"));
     }
 
     /// `--bigquery-project/--dataset` is what scaffolds the `load:` block, and a
