@@ -29,6 +29,7 @@ jobs:
           python3 dev/pytools/pr_ready.py --self-test
           python3 dev/pytools/live_slot.py --self-test
       - name: Commits, PR title and body, added lines, raised ratchets, CHANGELOG
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: python3 dev/pytools/pr_ready.py ci --base "$BASE_SHA" --event "$GITHUB_EVENT_PATH"
+        # The checkout is the merge of the PR into the base branch: its first parent is the base tip the PR is
+        # graded against. `pull_request.base.sha` can lag behind it, and then commits already on the base
+        # branch are graded as the PR's own.
+        run: python3 dev/pytools/pr_ready.py ci --base "$(git rev-parse HEAD^1)" --event "$GITHUB_EVENT_PATH"

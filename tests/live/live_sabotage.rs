@@ -11,7 +11,7 @@
 
 use crate::common::*;
 
-const N: i64 = 40;
+pub(crate) const N: i64 = 40;
 const MONGO_PORT: u16 = 27017;
 
 const RANGE_CHECKPOINT: &[&str] = &[
@@ -30,7 +30,7 @@ const KEYSET_INCREMENTAL: &[&str] = &[
 const ITS_TASKS: &str = "run_id IN (SELECT run_id FROM chunk_run WHERE export_name = '{export}')";
 
 /// A fresh standard table holding ids `1..=N`, and its drop guard.
-fn seeded(engine: SqlEngine, tag: &str) -> (String, Box<dyn std::any::Any>) {
+pub(crate) fn seeded(engine: SqlEngine, tag: &str) -> (String, Box<dyn std::any::Any>) {
     engine.alive();
     let (table, guard) = engine.range_table(tag);
     engine.insert(&table, 1..=N, 180, Some(10));
@@ -38,7 +38,7 @@ fn seeded(engine: SqlEngine, tag: &str) -> (String, Box<dyn std::any::Any>) {
 }
 
 /// A full export of `N` documents of a fresh database on the standalone MongoDB, and its drop guard.
-fn mongo_rig(tag: &str) -> (Rig, MongoDbGuard) {
+pub(crate) fn mongo_rig(tag: &str) -> (Rig, MongoDbGuard) {
     require_alive(LiveService::Mongo);
     let db = unique_name(tag);
     let guard = MongoDbGuard {
