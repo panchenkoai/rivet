@@ -9,12 +9,12 @@ engines: [postgres, mysql, mssql, mongo, oracle]
 
 scenarios:
   - id: stale_chunk_checkpoint
-    what: "RESULTS 1: a chunk checkpoint older than the last finished run is not resumed"
-    postgres: { test: open_defect_a_stale_chunk_checkpoint_is_not_adopted_after_a_finished_run_postgres }
-    mysql:    { test: open_defect_a_stale_chunk_checkpoint_is_not_adopted_after_a_finished_run_mysql }
-    mssql:    { test: open_defect_a_stale_chunk_checkpoint_is_not_adopted_after_a_finished_run_mssql }
+    what: "RESULTS 1: a run without the checkpoint beside an unfinished checkpointed run is refused by code, and both named remedies deliver"
+    postgres: { test: a_run_without_the_checkpoint_beside_an_unfinished_run_is_refused_postgres }
+    mysql:    { test: a_run_without_the_checkpoint_beside_an_unfinished_run_is_refused_mysql }
+    mssql:    { test: a_run_without_the_checkpoint_beside_an_unfinished_run_is_refused_mssql }
     mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only; any other mode is refused when the config is read (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no range-chunk checkpoint" }
-    oracle:   { test: open_defect_a_stale_chunk_checkpoint_is_not_adopted_after_a_finished_run_oracle }
+    oracle:   { test: a_run_without_the_checkpoint_beside_an_unfinished_run_is_refused_oracle }
 
   - id: run_validate_exit
     what: "RESULTS 2: `run --validate` does not exit 0 over `validated: FAIL`"

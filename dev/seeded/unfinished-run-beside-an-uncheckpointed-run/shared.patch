@@ -1,12 +1,12 @@
 diff --git a/src/state/cursor.rs b/src/state/cursor.rs
 --- a/src/state/cursor.rs
 +++ b/src/state/cursor.rs
-@@ -387,7 +387,7 @@
-             .into_iter()
-             .chain(chunk_run.map(|run| (run, CHUNKED)));
-         for (run, owner) in unfinished {
--            if owner != key.mode {
-+            if owner != key.mode && owner.is_empty() {
+@@ -400,7 +400,7 @@
+                     abandon_command(owner, export_name)
+                 );
+             }
+-            if !key.resumable {
++            if !key.resumable && owner.is_empty() {
                  crate::rivet_bail!(
                      crate::error::codes::STATE_INTERRUPTED_RUN_OWNER_MISMATCH,
                      "export '{export_name}': run {run} of mode `{owner}` is unfinished, but \

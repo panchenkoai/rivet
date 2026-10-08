@@ -59,6 +59,16 @@ fn abandon_command(owner: &str, export_name: &str) -> String {
     format!("rivet state {verb} -c <config> --export {export_name}")
 }
 
+/// The settings that checkpoint a run of mode `owner`, as a refusal names them.
+fn checkpoint_settings(owner: &str) -> &'static str {
+    if owner == CHUNKED {
+        "`chunk_checkpoint: true`"
+    } else {
+        "`chunk_checkpoint: true`, `keyset_incremental: true` or MongoDB's \
+         `source.mongo.resume: true`, whichever it had"
+    }
+}
+
 /// The cursor column an incremental run's `key_descriptor_json` names, or `None` for
 /// any other strategy's descriptor.
 /// Whose stored progress a run reads and writes: the row it selects and the parts compared before use.
@@ -76,6 +86,8 @@ pub struct ProgressKey {
     pub(crate) mode: &'static str,
     /// Whether a clean run seeks from a committed high-water.
     pub(crate) continues_high_water: bool,
+    /// Whether this plan continues an interrupted run of its own mode (`ExtractionStrategy::is_resumable`).
+    pub(crate) resumable: bool,
 }
 
 impl ProgressKey {
@@ -88,6 +100,7 @@ impl ProgressKey {
             column: None,
             mode: CHUNKED,
             continues_high_water: false,
+            resumable: true,
         }
     }
 
@@ -102,6 +115,7 @@ impl ProgressKey {
             column: None,
             mode: "cdc",
             continues_high_water: false,
+            resumable: false,
         }
     }
 }
@@ -293,27 +307,17 @@ impl StateStore {
             &[export_name.as_str().into(), scope.as_str().into()],
             |r| (r.opt_text(0), r.opt_text(1), r.opt_text(2), r.opt_text(3)),
         )?;
-        let owner = match &row {
+        let anchor = match &row {
             Some((_, _, Some(run), owner)) => {
-                let owner = owner.as_deref().unwrap_or(KEYSET);
-                if owner != key.mode {
-                    crate::rivet_bail!(
-                        crate::error::codes::STATE_INTERRUPTED_RUN_OWNER_MISMATCH,
-                        "export '{export_name}': run {run} of mode `{owner}` is unfinished, but \
-                         this export now runs as `{}` — the progress it stored is that run's, \
-                         not a point a `{}` run may continue from; nothing was read or written.\n  \
-                         Hint: restore the `{owner}` settings and run once to finish run {run}, \
-                         then switch; or `{}` abandons it and the next run starts with a full pass.",
-                        key.mode,
-                        key.mode,
-                        abandon_command(owner, export_name)
-                    );
-                }
-                self.own_anchor(&key, run)?;
-                Some(owner)
+                Some((run.as_str(), owner.as_deref().unwrap_or(KEYSET)))
             }
             _ => None,
         };
+        self.refuse_unfinished_run(&key, anchor)?;
+        if let Some((run, _)) = anchor {
+            self.own_anchor(&key, run)?;
+        }
+        let owner = anchor.map(|(_, owner)| owner);
         let chunk_anchor = owner == Some(CHUNKED);
         let held = row.clone().and_then(|(stored, cursor, anchor, _)| {
             held_progress(
@@ -359,6 +363,60 @@ impl StateStore {
             Some(_) => {}
         }
         Ok(ProgressClaim { state: self, key })
+    }
+
+    /// Refuse `key` while its stream holds an unfinished run this plan does not continue: one of another mode, or of its own mode when the plan keeps no checkpoint.
+    fn refuse_unfinished_run(&self, key: &ProgressKey, anchor: Option<(&str, &str)>) -> Result<()> {
+        let export_name = &key.export_name;
+        let chunk_run = self.unfinished_chunk_run(export_name, &key.source)?;
+        if let Some(run) = &chunk_run
+            && let Some(later) = self.finished_after_unsourced_chunk_run(export_name, run)?
+        {
+            crate::rivet_bail!(
+                crate::error::codes::STATE_CHUNK_RUN_SUPERSEDED,
+                "export '{export_name}': chunk checkpoint run '{run}' was left in progress by \
+                 rivet 0.31 or earlier, and run '{later}' of this export finished after it was \
+                 opened — the parts '{run}' wrote hold the source as it was before that run, so \
+                 it is not resumed; nothing was read or written.\n  \
+                 Hint: `{}` abandons run '{run}'; the next run starts a fresh pass.",
+                abandon_command(CHUNKED, export_name)
+            );
+        }
+        let unfinished = anchor
+            .map(|(run, owner)| (run.to_string(), owner))
+            .into_iter()
+            .chain(chunk_run.map(|run| (run, CHUNKED)));
+        for (run, owner) in unfinished {
+            if owner != key.mode {
+                crate::rivet_bail!(
+                    crate::error::codes::STATE_INTERRUPTED_RUN_OWNER_MISMATCH,
+                    "export '{export_name}': run {run} of mode `{owner}` is unfinished, but \
+                     this export now runs as `{}` — the progress it stored is that run's, \
+                     not a point a `{}` run may continue from; nothing was read or written.\n  \
+                     Hint: restore the `{owner}` settings and run once to finish run {run}, \
+                     then switch; or `{}` abandons it and the next run starts with a full pass.",
+                    key.mode,
+                    key.mode,
+                    abandon_command(owner, export_name)
+                );
+            }
+            if !key.resumable {
+                crate::rivet_bail!(
+                    crate::error::codes::STATE_INTERRUPTED_RUN_OWNER_MISMATCH,
+                    "export '{export_name}': run {run} of mode `{owner}` is unfinished, but \
+                     this export now runs without the checkpoint that run was opened with — a \
+                     run that does not continue it would finish beside it, and a later \
+                     checkpointed run would resume {run} over data older than that finished \
+                     run; nothing was read or written.\n  \
+                     Hint: restore the checkpoint setting ({}) and run once to finish run \
+                     {run}, then remove it; or `{}` abandons it and the next run starts with a \
+                     full pass.",
+                    checkpoint_settings(owner),
+                    abandon_command(owner, export_name)
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Record `key` as the owner of the anchored run `run_id` on rows written before owners and sources were recorded.
@@ -598,6 +656,7 @@ mod tests {
             column: Some(column.into()),
             mode: "keyset",
             continues_high_water: true,
+            resumable: true,
         }
     }
 
@@ -761,6 +820,196 @@ mod tests {
         assert!(s.claim(as_mode("incremental", "pg/db")).is_err());
         s.finalize_chunk_run_completed("run_d").unwrap();
         assert!(s.claim(as_mode("incremental", "pg/db")).is_ok());
+    }
+
+    /// `mode` with its checkpoint off: the plan that continues no interrupted run.
+    fn uncheckpointed(mode: &'static str, scope: &str) -> ProgressKey {
+        ProgressKey {
+            resumable: false,
+            ..as_mode(mode, scope)
+        }
+    }
+
+    #[test]
+    fn an_interrupted_run_is_refused_for_its_own_mode_without_the_checkpoint_until_finished_or_abandoned()
+     {
+        type Abandon = fn(&StateStore);
+        let cases: [(&'static str, &str, &str, Abandon); 2] = [
+            (
+                "chunked",
+                "(`chunk_checkpoint: true`)",
+                "`rivet state reset-chunks -c <config> --export orders` abandons it",
+                |s| {
+                    s.reset_chunk_checkpoint("orders").unwrap();
+                },
+            ),
+            (
+                "keyset",
+                "`keyset_incremental: true` or MongoDB's `source.mongo.resume: true`, whichever it had)",
+                "`rivet state reset -c <config> --export orders` abandons it",
+                |s| s.reset("orders").unwrap(),
+            ),
+        ];
+        for (mode, setting, command, abandon) in cases {
+            let s = store();
+            let open = |run: &str| match mode {
+                "chunked" => s
+                    .open_chunk_run(&as_mode(mode, "pg/db"), run, "h", 3, &[(1, 10)])
+                    .unwrap(),
+                _ => s.set_resume_run_id(&as_mode(mode, "pg/db"), run).unwrap(),
+            };
+            open("run_1");
+            for cycle in 1..=2 {
+                let said = refusal(s.claim(uncheckpointed(mode, "pg/db")), OWNER);
+                for want in [
+                    format!("run run_1 of mode `{mode}` is unfinished"),
+                    "runs without the checkpoint that run was opened with".to_string(),
+                    "nothing was read or written".to_string(),
+                    "restore the checkpoint setting (`chunk_checkpoint: true`".to_string(),
+                    setting.to_string(),
+                    "run once to finish run run_1, then remove it".to_string(),
+                    command.to_string(),
+                ] {
+                    assert!(
+                        said.contains(&want),
+                        "{mode} cycle {cycle}: {want} in {said}"
+                    );
+                }
+            }
+            let own = s.claim(as_mode(mode, "pg/db")).expect("the checkpoint on");
+            assert_eq!(own.resume_run_id().unwrap().as_deref(), Some("run_1"));
+            assert!(
+                s.claim(uncheckpointed(mode, "my/db")).is_ok(),
+                "{mode}: another source holds no interrupted run"
+            );
+            abandon(&s);
+            assert!(
+                s.claim(uncheckpointed(mode, "pg/db")).is_ok(),
+                "{mode}: abandoned"
+            );
+
+            open("run_2");
+            assert!(s.claim(uncheckpointed(mode, "pg/db")).is_err());
+            match mode {
+                "chunked" => s.finalize_chunk_run_completed("run_2").unwrap(),
+                _ => s.clear_resume_run_id("orders", "pg/db").unwrap(),
+            }
+            assert!(
+                s.claim(uncheckpointed(mode, "pg/db")).is_ok(),
+                "{mode}: finished"
+            );
+        }
+    }
+
+    #[test]
+    fn a_chunk_run_with_no_anchor_is_still_an_unfinished_run() {
+        let s = store();
+        let chunked = ProgressKey::chunked("orders", "pg/db");
+        s.open_chunk_run(&chunked, "run_c", "h", 3, &[(1, 10)])
+            .unwrap();
+        s.reset("orders").unwrap();
+        assert_eq!(s.get_resume_run_id("orders", "pg/db").unwrap(), None);
+        for key in [uncheckpointed("chunked", "pg/db"), as_mode("full", "pg/db")] {
+            let said = refusal(s.claim(key), OWNER);
+            assert!(said.contains("run run_c of mode `chunked`"), "{said}");
+        }
+        assert!(s.claim(uncheckpointed("chunked", "pg/other")).is_ok());
+        let own = s.claim(chunked).unwrap().chunk_run().unwrap();
+        assert_eq!(own, Some(("run_c".into(), "h".into())));
+    }
+
+    #[test]
+    fn a_chunk_run_that_recorded_no_source_is_unfinished_for_the_only_source() {
+        let s = store();
+        s.create_chunk_run("run_l", "orders", "h", 3).unwrap();
+        for cycle in 1..=2 {
+            for key in [
+                uncheckpointed("chunked", "pg/a"),
+                as_mode("incremental", "pg/a"),
+            ] {
+                let said = refusal(s.claim(key), OWNER);
+                assert!(
+                    said.contains("run run_l of mode `chunked`")
+                        && said.contains("`rivet state reset-chunks -c <config> --export orders`"),
+                    "cycle {cycle}: {said}"
+                );
+            }
+            assert!(
+                s.in_progress_chunk_run("orders", None).unwrap().is_some(),
+                "cycle {cycle}: a refusal adopts nothing"
+            );
+        }
+        put(&s, "orders", "pg/b", "5", "id", "orders_b").unwrap();
+        for key in [
+            uncheckpointed("chunked", "pg/a"),
+            as_mode("incremental", "pg/a"),
+        ] {
+            assert!(
+                s.claim(key).is_ok(),
+                "with two sources nothing says whose run it is: only resuming it is refused"
+            );
+        }
+        refusal(
+            s.claim(ProgressKey::chunked("orders", "pg/a"))
+                .unwrap()
+                .chunk_run(),
+            UNKNOWN,
+        );
+    }
+
+    #[test]
+    fn a_chunk_run_that_recorded_no_source_is_not_resumed_past_a_run_that_finished_after_it() {
+        let s = store();
+        s.create_chunk_run("run_l", "orders", "h", 3).unwrap();
+        let (later, earlier) = ("9999-01-01T00:00:00+00:00", "2000-01-01T00:00:00+00:00");
+        let metric = |export: &str, run: &str, status: &str, at: &str| {
+            s.exec_for_test(&format!(
+                "INSERT INTO export_metrics (export_name, run_at, duration_ms, total_rows, status, run_id) \
+                 VALUES ('{export}', '{at}', 1, 1, '{status}', '{run}')"
+            ))
+        };
+        metric("orders", "run_l", "success", later);
+        metric("orders", "run_failed", "failed", later);
+        metric("orders", "run_before", "success", earlier);
+        metric("users", "run_other", "success", later);
+        let chunked = ProgressKey::chunked("orders", "pg/a");
+        assert!(
+            s.claim(chunked.clone()).is_ok(),
+            "its own row, a failed run, an earlier run and another export finish nothing after it"
+        );
+
+        metric("orders", "run_n", "success", later);
+        for cycle in 1..=2 {
+            for key in [
+                chunked.clone(),
+                uncheckpointed("chunked", "pg/a"),
+                as_mode("incremental", "pg/a"),
+            ] {
+                let said = refusal(s.claim(key), "RIVET_STATE_CHUNK_RUN_SUPERSEDED");
+                for want in [
+                    "chunk checkpoint run 'run_l' was left in progress by rivet 0.31 or earlier",
+                    "run 'run_n' of this export finished after it was opened",
+                    "nothing was read or written",
+                    "`rivet state reset-chunks -c <config> --export orders` abandons run 'run_l'",
+                ] {
+                    assert!(said.contains(want), "cycle {cycle}: {want} in {said}");
+                }
+            }
+            assert!(
+                s.in_progress_chunk_run("orders", None).unwrap().is_some(),
+                "cycle {cycle}: a refusal changes nothing"
+            );
+        }
+        s.reset_chunk_checkpoint("orders").unwrap();
+        assert!(s.claim(chunked.clone()).is_ok(), "the remedy lifts it");
+
+        s.open_chunk_run(&chunked, "run_s", "h", 3, &[(1, 10)])
+            .unwrap();
+        metric("orders", "run_b", "success", later);
+        assert!(
+            s.claim(chunked).is_ok(),
+            "a run that recorded its source is not judged by a same-named export's runs"
+        );
     }
 
     #[test]

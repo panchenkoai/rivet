@@ -101,6 +101,31 @@
     <config> --export <name>` (range-chunk run), after which the next run is a full pass.
   - A switch after a run that FINISHED is unchanged: keyset then incremental on the same key
     still continues from the high-water.
+- **Breaking: a run without the checkpoint is refused beside an unfinished checkpoint run**
+  (`RIVET_STATE_INTERRUPTED_RUN_OWNER_MISMATCH`, exit 5, nothing read or written), the same way a
+  run of another mode is.
+  - Before (0.31.0 and earlier): a range-chunk run with `chunk_checkpoint: true` was killed after
+    6 of 20 chunks; the export ran once with `chunk_checkpoint` removed and finished (exit 0); 20
+    source rows changed, one per chunk; with `chunk_checkpoint: true` back, the next run resumed
+    the killed run: exit 0, manifest `success`, 120000 rows, and 14 of the 20 changed rows. The
+    other six chunks were the parts written before the kill (PostgreSQL, MySQL, SQL Server).
+  - Now the run without the checkpoint is refused while the interrupted run exists: range chunks,
+    keyset, parallel keyset, and a MongoDB `page_size` export with `resume` removed. Remedy, either
+    one: restore the checkpoint setting and run once to finish the run, then remove it; or abandon
+    it with `rivet state reset-chunks -c <config> --export <name>` (range-chunk run) or `rivet
+    state reset -c <config> --export <name>` (keyset run, MongoDB), after which the next run is a
+    full pass.
+  - Changed for keyset: a keyset run without `chunk_checkpoint` used to read the whole table
+    beside an interrupted checkpointed keyset run and release it on success. It is refused now.
+  - An interrupted range-chunk run counts even when the export's stored row no longer points at
+    it (after `rivet state reset`, or a run left by 0.31.0): another mode and a run without the
+    checkpoint are refused there too. `rivet state reset-chunks` is the command that abandons it.
+  - Upgrade, state written by 0.31.0 and earlier: an interrupted chunk run that nothing finished
+    beside is refused without the checkpoint and resumed with it, as above. One that a later run
+    of the export already finished beside (those versions allowed it) is refused for every config
+    (`RIVET_STATE_CHUNK_RUN_SUPERSEDED`, exit 5) until `rivet state reset-chunks -c <config>
+    --export <name>`; the next run starts a fresh pass. Both paths were run with the 0.31.0 binary
+    first and this version second.
 - **Fixed: an interrupted range-chunk run is resumed only by the source that opened it.** Two
   configs with one export name, one state database and different sources: when the first crashed
   after a chunk, the second resumed the first one's chunk windows over its own table (exit 0,

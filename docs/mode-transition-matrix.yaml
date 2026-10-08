@@ -233,6 +233,60 @@ scenarios:
     oracle:   { test: crashed_range_chunk_then_incremental_reset_oracle }
     mongo:    { na: "a Mongo export accepts only mode: full or cdc, so there is no incremental mode to switch into" }
 
+  # The checkpoint is part of what continues an interrupted run. Each cell crashes a checkpointed run after
+  # its first unit, removes the checkpoint setting (same mode, no reset), requires the refusal (exit 5,
+  # RIVET_STATE_INTERRUPTED_RUN_OWNER_MISMATCH, nothing written) TWICE, executes one of the two remedies the
+  # message names, changes source rows, and re-reads ids and values from the destination: first of the run
+  # without the checkpoint, then of a fresh run with the checkpoint back.
+
+  - id: crashed_range_chunk_then_checkpoint_removed_finish_the_run
+    what: "MT10 — crashed range-chunk checkpoint run, then the same mode without `chunk_checkpoint` (Mongo: without `resume`): refused twice; the checkpoint restored finishes the run; the uncheckpointed run then delivers the source as it is, and the checkpoint back on starts a fresh run"
+    postgres: { test: crashed_range_chunk_then_checkpoint_removed_finish_the_run_postgres }
+    mysql:    { test: crashed_range_chunk_then_checkpoint_removed_finish_the_run_mysql }
+    mssql:    { test: crashed_range_chunk_then_checkpoint_removed_finish_the_run_mssql }
+    oracle:   { test: crashed_range_chunk_then_checkpoint_removed_finish_the_run_oracle }
+    mongo:    { na: "a Mongo export has no range chunking (mode: full or cdc only)" }
+
+  - id: crashed_range_chunk_then_checkpoint_removed_reset
+    what: "MT10 — crashed range-chunk checkpoint run, then the same mode without `chunk_checkpoint` (Mongo: without `resume`): refused twice; `rivet state reset-chunks` abandons the run; the uncheckpointed run then delivers the source as it is, and the checkpoint back on starts a fresh run"
+    postgres: { test: crashed_range_chunk_then_checkpoint_removed_reset_postgres }
+    mysql:    { test: crashed_range_chunk_then_checkpoint_removed_reset_mysql }
+    mssql:    { test: crashed_range_chunk_then_checkpoint_removed_reset_mssql }
+    oracle:   { test: crashed_range_chunk_then_checkpoint_removed_reset_oracle }
+    mongo:    { na: "a Mongo export has no range chunking (mode: full or cdc only)" }
+
+  - id: crashed_keyset_then_checkpoint_removed_finish_the_run
+    what: "MT10 — crashed keyset checkpoint run, then the same mode without `chunk_checkpoint` (Mongo: without `resume`): refused twice; the checkpoint restored finishes the run; the uncheckpointed run then delivers the source as it is, and the checkpoint back on starts a fresh run"
+    postgres: { test: crashed_keyset_then_checkpoint_removed_finish_the_run_postgres }
+    mysql:    { test: crashed_keyset_then_checkpoint_removed_finish_the_run_mysql }
+    mssql:    { test: crashed_keyset_then_checkpoint_removed_finish_the_run_mssql }
+    oracle:   { test: crashed_keyset_then_checkpoint_removed_finish_the_run_oracle }
+    mongo:    { test: crashed_resume_then_resume_removed_finish_the_run_mongo }
+
+  - id: crashed_keyset_then_checkpoint_removed_reset
+    what: "MT10 — crashed keyset checkpoint run, then the same mode without `chunk_checkpoint` (Mongo: without `resume`): refused twice; `rivet state reset` abandons the run; the uncheckpointed run then delivers the source as it is, and the checkpoint back on starts a fresh run"
+    postgres: { test: crashed_keyset_then_checkpoint_removed_reset_postgres }
+    mysql:    { test: crashed_keyset_then_checkpoint_removed_reset_mysql }
+    mssql:    { test: crashed_keyset_then_checkpoint_removed_reset_mssql }
+    oracle:   { test: crashed_keyset_then_checkpoint_removed_reset_oracle }
+    mongo:    { test: crashed_resume_then_resume_removed_reset_mongo }
+
+  - id: crashed_parallel_keyset_then_checkpoint_removed_finish_the_run
+    what: "MT10 — crashed parallel keyset checkpoint run, then the same mode without `chunk_checkpoint` (Mongo: without `resume`): refused twice; the checkpoint restored finishes the run; the uncheckpointed run then delivers the source as it is, and the checkpoint back on starts a fresh run"
+    postgres: { test: crashed_parallel_keyset_then_checkpoint_removed_finish_the_run_postgres }
+    mysql:    { test: crashed_parallel_keyset_then_checkpoint_removed_finish_the_run_mysql }
+    mssql:    { test: crashed_parallel_keyset_then_checkpoint_removed_finish_the_run_mssql }
+    oracle:   { test: crashed_parallel_keyset_then_checkpoint_removed_finish_the_run_oracle }
+    mongo:    { na: "`source.mongo.resume: true` is refused together with `parallel` (src/config/mod.rs), so a parallel Mongo reader keeps no resumable run" }
+
+  - id: crashed_parallel_keyset_then_checkpoint_removed_reset
+    what: "MT10 — crashed parallel keyset checkpoint run, then the same mode without `chunk_checkpoint` (Mongo: without `resume`): refused twice; `rivet state reset` abandons the run; the uncheckpointed run then delivers the source as it is, and the checkpoint back on starts a fresh run"
+    postgres: { test: crashed_parallel_keyset_then_checkpoint_removed_reset_postgres }
+    mysql:    { test: crashed_parallel_keyset_then_checkpoint_removed_reset_mysql }
+    mssql:    { test: crashed_parallel_keyset_then_checkpoint_removed_reset_mssql }
+    oracle:   { test: crashed_parallel_keyset_then_checkpoint_removed_reset_oracle }
+    mongo:    { na: "`source.mongo.resume: true` is refused together with `parallel` (src/config/mod.rs), so a parallel Mongo reader keeps no resumable run" }
+
   # A range-chunk run belongs to its source: config A crashes after chunk 0; config B (same export name,
   # table name and chunk settings, ANOTHER database on the same server) delivers all 30 of its own ids,
   # twice; A then resumes its own run and delivers its 10.
