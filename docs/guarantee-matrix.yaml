@@ -45,9 +45,6 @@ guarantees:
       oracle: { gap: "no Oracle batch cell crashes a run between the write and the cursor and reads the destination" }
     contradicted_by:
       known_red:
-        - "live_mode_transition::open_defect_source_url_without_its_default_port_continues"
-        - "live_mode_transition::open_defect_incremental_query_filter_edited"
-        - "live_mode_transition::open_defect_same_table_in_another_schema_is_another_stream"
         - "live_sabotage::open_defect_a_cursor_moved_forward_delivers_or_refuses"
         - "chunking_stand::open_defect_a_float_chunk_column_under_query_keeps_its_fractional_keys"
 
@@ -183,7 +180,6 @@ guarantees:
       known_red:
         - "live_sabotage::open_defect_a_cursor_of_another_type_delivers_or_is_refused_by_code_and_led_out"
         - "live_sabotage::open_defect_an_edited_plan_fingerprint_delivers_or_is_refused_by_code_and_led_out"
-        - "audit_state::open_defect_state_reset_keeps_the_cursor_of_another_source"
 
   - id: parallel_keyset_reads_every_row_exactly_once
     stated:
@@ -194,9 +190,6 @@ guarantees:
       mysql: { test: parallel_keyset_parity_mysql, asserts: "the union of all workers' keys must equal 1..=n" }
       mssql: { test: parallel_keyset_parity_mssql, asserts: "the union of all workers' keys must equal 1..=n" }
       oracle: { test: parallel_keyset_reads_every_row_once, asserts: "{ctx}: no row read twice" }
-    contradicted_by:
-      known_red:
-        - "live_mode_transition::open_defect_resumed_parallel_keyset_then_incremental"
 
   - id: repair_writes_beside_the_originals
     stated:
