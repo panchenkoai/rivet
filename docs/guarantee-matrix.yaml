@@ -454,34 +454,54 @@ guarantees:
         sentence: "All Postgres tuning uses `SET LOCAL` inside an RAII-guarded `BEGIN…COMMIT` so session state is never leaked into the pool."
     held_by:
       postgres: { test: pg_statement_timeout_not_leaked_after_successful_export, asserts: "statement_timeout leaked to pool after successful export" }
+      postgres_every_batch_shape: { test: every_batch_shape_through_a_transaction_pooler_leaves_its_session_as_it_was_postgres, asserts: "the run changed the session of the pooled connection" }
 
   - id: flat_memory_at_any_table_size
     stated:
       - file: docs/why/flat-memory.md
         sentence: "A 10-thousand-row table and a 500-million-row table run at the same resident set size."
+      - file: docs/why/flat-memory.md
+        sentence: "Rivet's memory is bounded by how much you buffer before a flush"
     held_by:
-      postgres: { gate: verify_scale_memory, asserts: "RSS(large) <= RSS(small) × RIVET_SCALE_RSS_TOL" }
-      mysql: { gate: verify_scale_memory, asserts: "RSS(large) <= RSS(small) × RIVET_SCALE_RSS_TOL" }
-      mssql: { gate: verify_scale_memory, asserts: "RSS(large) <= RSS(small) × RIVET_SCALE_RSS_TOL" }
-      mongo: { gate: verify_scale_memory, asserts: "RSS(large) <= RSS(small) × RIVET_SCALE_RSS_TOL" }
-      oracle: { gap: "the scale_memory stage iterates postgres, mysql, mssql, mongo; Oracle is not measured" }
+      postgres: { gate: verify_flat_rss, asserts: "over_ceiling(peaks, ceiling) + [f for f in flat if f]" }
+      mysql: { gate: verify_flat_rss, asserts: "over_ceiling(peaks, ceiling) + [f for f in flat if f]" }
+      mssql: { gate: verify_flat_rss, asserts: "over_ceiling(peaks, ceiling) + [f for f in flat if f]" }
+      mongo: { gate: verify_flat_rss, asserts: "over_ceiling(peaks, ceiling) + [f for f in flat if f]" }
+      oracle: { gate: verify_flat_rss, asserts: "over_ceiling(peaks, ceiling) + [f for f in flat if f]" }
     contradicted_by:
-      matrix_gap:
-        - "docs/perf-matrix.yaml#These are NOT a hard CI gate (perf numbers are hardware-noisy)"
+      known_red:
+        - "flat-rss[postgres/open_defect_a_small_and_a_large_table_run_at_the_same_rss]"
+        - "flat-rss[mysql/open_defect_a_small_and_a_large_table_run_at_the_same_rss]"
+        - "flat-rss[mssql/open_defect_a_small_and_a_large_table_run_at_the_same_rss]"
+        - "flat-rss[mongo/open_defect_a_small_and_a_large_table_run_at_the_same_rss]"
+        - "flat-rss[oracle/open_defect_a_small_and_a_large_table_run_at_the_same_rss]"
 
   - id: the_longest_source_query_is_one_page
     stated:
       - file: docs/why/source-safe-under-load.md
         sentence: "The longest query Rivet ever holds open on the source is a single page, not a full-table scan."
     held_by:
-      postgres: { gap: "no cell measures the longest statement a run held on the server" }
-      mysql: { gap: "no cell measures the longest statement a run held on the server" }
-      mssql: { gap: "no cell measures the longest statement a run held on the server" }
-      mongo: { gap: "no cell measures the longest statement a run held on the server" }
-      oracle: { gap: "no cell measures the longest statement a run held on the server" }
+      postgres: { test: the_longest_statement_of_a_paged_export_is_one_page_postgres, asserts: "the longest statement held on the source answered {longest} of {total}" }
+      mysql: { test: the_longest_statement_of_a_paged_export_is_one_page_mysql, asserts: "the longest statement held on the source answered {longest} of {total}" }
+      mssql: { test: the_longest_statement_of_a_paged_export_is_one_page_mssql, asserts: "the longest statement held on the source answered {longest} of {total}" }
+      mongo: { test: the_longest_statement_of_a_paged_export_is_one_page_mongo, asserts: "the longest statement held on the source answered {longest} of {total}" }
+      oracle: { test: the_longest_statement_of_a_paged_export_is_one_page_oracle, asserts: "the longest statement held on the source answered {longest} of {total}" }
     contradicted_by:
       doc:
-        - "docs/partitioning.md#server-side cursor, bounded memory, but a single long-running transaction"
+        - "docs/partitioning.md#the cost is the query staying visible (`Sending data`) for the whole drain"
+
+  - id: mode_full_is_one_streaming_select
+    stated:
+      - file: docs/partitioning.md
+        sentence: "**Postgres:** server-side cursor, bounded memory, but a single long-running transaction (watch vacuum / replication lag)."
+      - file: docs/partitioning.md
+        sentence: "the cost is the query staying visible (`Sending data`) for the whole drain."
+    held_by:
+      postgres: { test: mode_full_documents_the_longest_statement_it_holds_postgres, asserts: "mode: full answered {longest} of {total} bytes to its longest statement" }
+      mysql: { test: mode_full_documents_the_longest_statement_it_holds_mysql, asserts: "mode: full answered {longest} of {total} bytes to its longest statement" }
+      mssql: { test: mode_full_documents_the_longest_statement_it_holds_mssql, asserts: "mode: full answered {longest} of {total} bytes to its longest statement" }
+      mongo: { test: mode_full_documents_the_longest_statement_it_holds_mongo, asserts: "mode: full answered {longest} of {total} bytes to its longest statement" }
+      oracle: { test: mode_full_documents_the_longest_statement_it_holds_oracle, asserts: "mode: full answered {longest} of {total} bytes to its longest statement" }
 
   - id: a_sparse_chunk_key_is_named_at_run_start
     stated:
@@ -495,11 +515,11 @@ guarantees:
       - file: docs/why/flat-memory.md
         sentence: "A CDC drain's peak RSS is O(`rollover`) — the part-size at which it flushes and checkpoints — not O(backlog)."
     held_by:
-      postgres: { gap: "the soak harness that measures it (tests/harness run_soak) runs on demand against GCS and BigQuery; no gate stage or CI cell asserts drain RSS against the backlog" }
-      mysql: { gap: "the soak harness that measures it (tests/harness run_soak) runs on demand against GCS and BigQuery; no gate stage or CI cell asserts drain RSS against the backlog" }
-      mssql: { gap: "the soak harness that measures it (tests/harness run_soak) runs on demand against GCS and BigQuery; no gate stage or CI cell asserts drain RSS against the backlog" }
-      mongo: { gap: "the soak harness that measures it (tests/harness run_soak) runs on demand against GCS and BigQuery; no gate stage or CI cell asserts drain RSS against the backlog" }
-      oracle: { gap: "the soak harness that measures it (tests/harness run_soak) runs on demand against GCS and BigQuery; no gate stage or CI cell asserts drain RSS against the backlog" }
+      postgres: { gate: verify_flat_rss, asserts: 'grew(peaks, "backlog", *(n * CDC_CHANGES for n in BACKLOGS))' }
+      mysql: { gate: verify_flat_rss, asserts: 'grew(peaks, "backlog", *(n * CDC_CHANGES for n in BACKLOGS))' }
+      mssql: { gate: verify_flat_rss, asserts: 'grew(peaks, "backlog", *(n * CDC_CHANGES for n in BACKLOGS))' }
+      mongo: { gate: verify_flat_rss, asserts: 'grew(peaks, "backlog", *(n * CDC_CHANGES for n in BACKLOGS))' }
+      oracle: { gate: verify_flat_rss, asserts: 'grew(peaks, "backlog", *(n * CDC_CHANGES for n in BACKLOGS))' }
 
   # ── CDC (README.md, docs/reference/cdc.md) ───────────────────────────────────────────────
   - id: cdc_never_silently_loses_a_change
@@ -719,4 +739,15 @@ guarantees:
       - file: docs/semantics.md
         sentence: "identical rows produce byte-identical parts (and the same fingerprint) across rivet releases, so a duplicate is safely droppable by fingerprint."
     held_by:
-      all: { gap: "no cell exports the same rows with the previous release and this build and compares the part bytes" }
+      postgres: { gate: verify_byte_identical_parts, asserts: "parts_differ(_part_digests(d_prev / \"output\"), cur)" }
+      mysql: { gate: verify_byte_identical_parts, asserts: "parts_differ(_part_digests(d_prev / \"output\"), cur)" }
+      mssql: { gate: verify_byte_identical_parts, asserts: "parts_differ(_part_digests(d_prev / \"output\"), cur)" }
+      mongo: { gate: verify_byte_identical_parts, asserts: "parts_differ(_part_digests(d_prev / \"output\"), cur)" }
+      oracle: { gate: verify_byte_identical_parts, asserts: "parts_differ(_part_digests(d_prev / \"output\"), cur)" }
+    contradicted_by:
+      known_red:
+        - "byte-identical[postgres/open_defect_a_rerun_under_init_defaults_keeps_its_fingerprint]"
+        - "byte-identical[mysql/open_defect_a_rerun_under_init_defaults_keeps_its_fingerprint]"
+        - "byte-identical[mssql/open_defect_a_rerun_under_init_defaults_keeps_its_fingerprint]"
+        - "byte-identical[mongo/open_defect_a_rerun_under_init_defaults_keeps_its_fingerprint]"
+        - "byte-identical[oracle/open_defect_a_rerun_under_init_defaults_keeps_its_fingerprint]"

@@ -330,15 +330,23 @@ def _oracle_cdc_changes(url: str, lo: int) -> None:
         f"DELETE FROM ORC_UPG_PROBE WHERE id BETWEEN {lo} AND {hi} AND MOD(id, 17) = 0;"))
 
 
+def cdc_stream(engine: str, url: str):
+    """The engine's CDC probe context and its change-set writer `(engine, url, lo)`: Oracle has its own table and capture user."""
+    from .cdc import cdc_probe
+    from .perf import _cdc_changes
+
+    if engine == "oracle":
+        return _oracle_cdc_probe(url), lambda _e, _u, lo: _oracle_cdc_changes(_u, lo)
+    return cdc_probe(engine, url), _cdc_changes
+
+
 def _cdc_leg(led: Ledger, prev: Path, engine: str, url: str) -> None:
     """The previous release anchors a CDC stream and captures a batch; this binary continues its checkpoint."""
     import duckdb
 
-    from .cdc import cdc_probe
-    from .perf import CDC_CHANGES, _cdc_changes
+    from .perf import CDC_CHANGES
 
-    probe_cm, changes = ((_oracle_cdc_probe(url), lambda _e, _u, lo: _oracle_cdc_changes(_u, lo))
-                         if engine == "oracle" else (cdc_probe(engine, url), _cdc_changes))
+    probe_cm, changes = cdc_stream(engine, url)
     with probe_cm as probe:
         if probe is None:
             led.failed(engine, "-", SCEN, "local", f"upgrade[{engine}/cdc]: the CDC source setup failed", "setup")
