@@ -4,7 +4,9 @@
 //! migration that forgets to lower the ceiling, so the win stays banked.
 
 /// Uncoded `bail!(` sites under `src/` (429 on 2026-09-27, when the registry landed).
-const CEILING: usize = 414; // ratchet-pin: uncoded-bail-sites
+// 417 -> 416 (2026-10-08): `--resume` over a complete prefix is refused as RIVET_DEST_ALREADY_COMPLETE.
+// 416 -> 413 (2026-10-08): the PostgreSQL and MySQL CDC prerequisite refusals carry RIVET_SOURCE_CDC_PREREQUISITE.
+const CEILING: usize = 413; // ratchet-pin: uncoded-bail-sites
 
 /// Occurrences of a bare `bail!(` (not `rivet_bail!` / `config_bail!`) in `text`.
 fn bare_bails(text: &str) -> usize {

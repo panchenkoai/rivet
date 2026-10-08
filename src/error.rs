@@ -479,10 +479,10 @@ pub mod codes {
         "RIVET_STATE_CURSOR_OWNER_MISMATCH",
         "`rivet state reset -c <config> --export <name>` to start the new cursor with a full pass, or restore the previous cursor column",
     );
-    /// Stored progress (cursor, keyset high-water, resume anchor) belongs to another table or collection.
+    /// Stored progress (cursor, keyset high-water, resume anchor) belongs to another table or collection, another schema, or other rows of it.
     pub const STATE_CURSOR_STREAM_MISMATCH: Code = refusal(
         "RIVET_STATE_CURSOR_STREAM_MISMATCH",
-        "give each export that shares this state database its own name; if this export was repointed, `rivet state reset -c <config> --export <name>` starts the new table with a full pass (it discards the progress of every export of that name in the state database)",
+        "give each export that shares this state database its own name; if this export was edited (another table, another schema, another `query:` filter), restore what it read, or `rivet state reset -c <config> --export <name>` starts what it reads now with a full pass (it discards the progress that name holds on this source), or `rivet state accept -c <config> --export <name>` keeps the stored progress and records it as belonging to what the export reads now (rows of it below that progress are not delivered)",
     );
     /// An export met an unfinished checkpointed run it does not continue: another mode opened it, or its checkpoint setting is off now.
     pub const STATE_INTERRUPTED_RUN_OWNER_MISMATCH: Code = refusal(
@@ -578,6 +578,11 @@ pub mod codes {
         "RIVET_DEST_CONTAINER_NOT_FOUND",
         "create the bucket or container, or correct `destination.bucket`",
     );
+    /// `run --resume` met a destination prefix that already holds a complete export.
+    pub const DEST_ALREADY_COMPLETE: Code = refusal(
+        "RIVET_DEST_ALREADY_COMPLETE",
+        "pass `--force` with `--resume` to continue an interrupted run or, with none, run as a plain run does (new parts beside the complete export); or use another destination prefix",
+    );
     pub const LOAD_VALUE_OUT_OF_TARGET_RANGE: Code = refusal(
         "RIVET_LOAD_VALUE_OUT_OF_TARGET_RANGE",
         "the warehouse type cannot hold this value; declare a wider type (e.g. String) for the column, or fix the source value",
@@ -662,6 +667,7 @@ pub mod codes {
         PLAN_SOURCE_UNREADABLE,
         SOURCE_COLLECTION_NOT_FOUND,
         DEST_CONTAINER_NOT_FOUND,
+        DEST_ALREADY_COMPLETE,
         LOAD_VALUE_OUT_OF_TARGET_RANGE,
         LOAD_COUNT_MISMATCH,
         LOAD_ADOPTION_COLUMN_MISMATCH,

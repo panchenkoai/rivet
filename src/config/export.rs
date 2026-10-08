@@ -138,6 +138,9 @@ pub struct ExportConfig {
     /// planner wraps around the base query, so `table:` survives. Never user-writable.
     #[serde(skip)]
     pub partition_window: Option<PartitionSynth>,
+    /// The inline `query:` as the config file spells it, `${...}` placeholders in place; set by `Config::load_with_params`. Never user-writable.
+    #[serde(skip)]
+    pub query_as_written: Option<String>,
     #[serde(default)]
     pub query: Option<String>,
     pub query_file: Option<String>,
@@ -502,18 +505,29 @@ impl ExportConfig {
         config_dir: &Path,
         params: Option<&std::collections::HashMap<String, String>>,
     ) -> crate::error::Result<String> {
+        Ok(self.resolve_query_and_template(config_dir, params)?.0)
+    }
+
+    /// The export's query with its placeholders substituted, and the same query as written (`${...}` in place) when that spelling is known and resolves to it.
+    pub(crate) fn resolve_query_and_template(
+        &self,
+        config_dir: &Path,
+        params: Option<&std::collections::HashMap<String, String>>,
+    ) -> crate::error::Result<(String, Option<String>)> {
         // table: shortcut takes precedence — already validated by
         // `validate_business_rules` to be mutually exclusive with query/query_file.
         if let Some(tbl) = &self.table {
             validate_table_shortcut_ident(&self.name, tbl)?;
-            return Ok(format!("SELECT * FROM {tbl}"));
+            return Ok((format!("SELECT * FROM {tbl}"), None));
         }
-        let q = match (&self.query, &self.query_file) {
+        let (q, written) = match (&self.query, &self.query_file) {
             (Some(q), None) => {
+                let written = self.query_as_written.clone();
+                let written = written.filter(|w| resolve_vars(w, params).is_ok_and(|r| r == *q));
                 if params.is_some() {
-                    resolve_vars(q, params)
+                    resolve_vars(q, params).map(|q| (q, written))
                 } else {
-                    Ok(q.clone())
+                    Ok((q.clone(), written))
                 }
             }
             (None, Some(file)) => {
@@ -552,7 +566,7 @@ impl ExportConfig {
                     }
                 }
                 let raw = std::fs::read_to_string(&joined)?;
-                resolve_vars(&raw, params)
+                resolve_vars(&raw, params).map(|q| (q, Some(raw)))
             }
             (Some(_), Some(_)) => {
                 anyhow::bail!(
@@ -567,7 +581,8 @@ impl ExportConfig {
                 )
             }
         }?;
-        Ok(crate::sql::wrappable_query(&q))
+        let wrappable = |q: &String| crate::sql::wrappable_query(q);
+        Ok((wrappable(&q), written.as_ref().map(wrappable)))
     }
 }
 
@@ -875,6 +890,7 @@ pub(crate) fn sample_export(name: &str) -> ExportConfig {
         snapshot_label: None,
         split: None,
         partition_window: None,
+        query_as_written: None,
         name: name.into(),
         target: None,
         load: None,
@@ -1065,6 +1081,36 @@ mod tests {
         let p = params(&[("col", "id"), ("table", "orders")]);
         let q = exp.resolve_query(Path::new("/tmp"), Some(&p)).unwrap();
         assert_eq!(q, "SELECT id FROM orders");
+    }
+
+    /// The spelling recorded at load is the template only while it resolves to the export's query.
+    #[test]
+    fn a_recorded_spelling_is_the_template_only_while_it_resolves_to_the_query() {
+        let template = |as_written: Option<&str>, a: &str| {
+            let exp = ExportConfig {
+                query_as_written: as_written.map(str::to_string),
+                ..make_export_direct(Some("SELECT id FROM t WHERE a = 5;"), None)
+            };
+            let p = params(&[("a", a)]);
+            let (q, written) = exp
+                .resolve_query_and_template(Path::new("/tmp"), Some(&p))
+                .unwrap();
+            assert_eq!(q, "SELECT id FROM t WHERE a = 5");
+            written
+        };
+        let spelled = "SELECT id FROM t WHERE a = ${a};";
+        assert_eq!(
+            template(Some(spelled), "5").as_deref(),
+            Some("SELECT id FROM t WHERE a = ${a}"),
+            "the template is made wrappable as the query is"
+        );
+        assert_eq!(
+            template(Some(spelled), "6"),
+            None,
+            "the query was changed since"
+        );
+        assert_eq!(template(Some("SELECT ${RIVET_ACC_UNSET_VAR}"), "5"), None);
+        assert_eq!(template(None, "5"), None);
     }
 
     #[test]

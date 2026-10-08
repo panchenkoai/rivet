@@ -58,7 +58,7 @@ scenarios:
     oracle:   { test: a_changed_cursor_column_is_refused_and_walked_out_oracle }
 
   - id: refusal_state_cursor_stream_mismatch
-    what: "RIVET_STATE_CURSOR_STREAM_MISMATCH: an incremental export repointed at another table; both named remedies deliver, `state reset-chunks` leaves the refusal"
+    what: "RIVET_STATE_CURSOR_STREAM_MISMATCH: an incremental export repointed at another table; own names and `state reset` deliver, `state reset-chunks` leaves the refusal (`state accept`, the third named remedy, is walked by incremental_query_filter_edited and incremental_query_cosmetic_edit_accepted in docs/mode-transition-matrix.yaml)"
     postgres: { test: a_repointed_incremental_export_is_refused_and_walked_out_postgres }
     mysql:    { test: a_repointed_incremental_export_is_refused_and_walked_out_mysql }
     mssql:    { test: a_repointed_incremental_export_is_refused_and_walked_out_mssql }
@@ -352,6 +352,14 @@ scenarios:
     mssql:    { gap: "needs a state database written by rivet 0.31 or earlier (an unsourced `chunk_run` row and a run that finished after it): since #482 the current binary refuses the run that would create the second half, so the fixture is the upgrade stand's" }
     mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no range-chunk checkpoint" }
     oracle:   { gap: "needs a state database written by rivet 0.31 or earlier (an unsourced `chunk_run` row and a run that finished after it): since #482 the current binary refuses the run that would create the second half, so the fixture is the upgrade stand's" }
+
+  - id: refusal_dest_already_complete
+    what: "RIVET_DEST_ALREADY_COMPLETE: `run --resume` over a prefix that holds a complete export; `--resume --force` runs as a plain run does, beside it; `state reset-chunks` leaves the refusal"
+    postgres: { test: resume_force_runs_over_a_complete_prefix_postgres }
+    mysql:    { test: resume_force_runs_over_a_complete_prefix_mysql }
+    mssql:    { test: resume_force_runs_over_a_complete_prefix_mssql }
+    mongo:    { test: resume_force_runs_over_a_complete_prefix_mongo }
+    oracle:   { test: resume_force_runs_over_a_complete_prefix_oracle }
 
   - id: refusal_load_value_out_of_target_range
     what: "RIVET_LOAD_VALUE_OUT_OF_TARGET_RANGE: a value the warehouse type cannot hold"

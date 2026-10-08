@@ -1,0 +1,12 @@
+diff --git a/src/pipeline/finalize.rs b/src/pipeline/finalize.rs
+--- a/src/pipeline/finalize.rs
++++ b/src/pipeline/finalize.rs
+@@ -505,7 +505,7 @@
+         }
+     };
+ 
+-    if nothing && prefix_holds_a_manifest(&*dest) {
++    if nothing && prefix_holds_a_manifest(&*dest) && false {
+         *left_alone = true;
+         log::info!(
+             "{} '{}': the run ({}) put no part at the destination; the manifest and _SUCCESS an earlier run left there stay as they were",

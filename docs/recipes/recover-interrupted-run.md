@@ -42,9 +42,14 @@ What `--resume` does:
   the prior manifest, and decides per-chunk: **skip** (already
   committed), **rewrite** (in-progress / missing part), or **quarantine**
   (untracked or corrupt object — moved under `_quarantine/<run_id>/`).
-- Refused with an actionable error if the prior run already finished
-  cleanly (`_SUCCESS` present + chunks complete).  Use `rivet run`
-  without `--resume` to start a new run.
+- Refused with `RIVET_DEST_ALREADY_COMPLETE` (exit 5) if the prefix
+  already holds a complete export (`_SUCCESS` present).  `--resume --force`
+  goes on: it continues an interrupted run if one is recorded, else it
+  runs as `rivet run` without `--resume` does, beside the complete export.
+
+A run that failed before its first write (the source could not be
+reached) is not this scenario: it left the prefix exactly as it was, with
+the previous `_SUCCESS` and manifest. Fix the cause and run again.
 
 `--resume` is meaningful only for `chunked` mode.  For `full` and
 `incremental`, just re-run — `incremental` picks up from the persisted

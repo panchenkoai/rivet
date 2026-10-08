@@ -490,6 +490,7 @@ fn value_ceiling_ignores_null_cells() {
 fn minimal_sink() -> ExportSink {
     ExportSink {
         bytes_read: Default::default(),
+        parts_landed: Default::default(),
         writer: None,
         format_type: crate::config::FormatType::Csv,
         compression: crate::config::CompressionType::None,

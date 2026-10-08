@@ -1,0 +1,13 @@
+diff --git a/src/state/cursor.rs b/src/state/cursor.rs
+index 569202cd..94deb28a 100644
+--- a/src/state/cursor.rs
++++ b/src/state/cursor.rs
+@@ -58,7 +58,7 @@ impl StoredStream {
+                 return Some((was, now));
+             }
+             let both_unqualified = !stream.contains('.') && !key.stream.contains('.');
+-            if let Some(schema) = schema.filter(|s| both_unqualified && *s != key.schema) {
++            if let Some(schema) = schema.filter(|s| !both_unqualified && *s != key.schema) {
+                 let under = |name: &str, s: &str| {
+                     let name = if name.is_empty() { "its query" } else { name };
+                     match s {

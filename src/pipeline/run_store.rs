@@ -166,10 +166,12 @@ mod tests {
         ResolvedRunPlan {
             split_window: None,
             bytes_read: Default::default(),
+            parts_landed: Default::default(),
             export_name: export_name.into(),
             partition_rollover: None,
             source_table: None,
             base_query: "SELECT 1".into(),
+            query_template: None,
             is_split_unit: false,
             strategy: ExtractionStrategy::Snapshot,
             format: FormatType::Parquet,

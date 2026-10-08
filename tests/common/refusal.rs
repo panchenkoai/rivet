@@ -20,19 +20,17 @@ pub const FAILED_RUN_LEAVES_ENV: &str = "RIVET_TEST_FAILED_RUN_LEAVES";
 const FAULT_ENVS: &[&str] = &["RIVET_TEST_PANIC_AT", "RIVET_TEST_ERROR_AT"];
 
 /// Product defects every failed run may show until the product is fixed: the kind and why (pinned by tests/offline/rig_oracle_ratchet.rs; the list only shrinks).
-pub(crate) const KNOWN_PRODUCT_DEFECTS: &[(Leftover, &str)] = &[
-    (
-        Leftover::ObservedSchema,
-        "known defect: a first run that fails stores the drift baseline (src/state/schema.rs `detect_schema_change`) in export_schema, which src/state/migrations.rs v18 documents as success-only",
-    ),
-    (
-        Leftover::ManifestBeforeAWrite,
-        "known defect: a run that fails before its first write still rewrites manifest.json to failed and withdraws `_SUCCESS` (owner decision 2026-10-07: it leaves both alone); the cells are live_operator_contract::open_defect_a_run_that_never_connected_keeps_the_export_complete_*",
-    ),
-];
+pub(crate) const KNOWN_PRODUCT_DEFECTS: &[(Leftover, &str)] = &[(
+    Leftover::ObservedSchema,
+    "known defect: a first run that fails stores the drift baseline (src/state/schema.rs `detect_schema_change`) in export_schema, which src/state/migrations.rs v18 documents as success-only",
+)];
 
 /// The kinds a failed run may leave with no declaration: its own record of the stop.
-const OWN_RECORD: &[Leftover] = &[Leftover::FailureRecord, Leftover::FailedManifest];
+const OWN_RECORD: &[Leftover] = &[
+    Leftover::FailureRecord,
+    Leftover::FailedManifest,
+    Leftover::FirstFailedManifest,
+];
 
 /// State tables whose rows record an outcome in a `status` column.
 const JOURNAL: &[&str] = &["export_metrics", "run_status", "load_run"];
@@ -77,6 +75,8 @@ pub enum Leftover {
     FailedManifest,
     /// A [`Leftover::FailedManifest`] of a run that left no part, flush or `file_log` row: it had not begun writing, so the prefix was not its to re-mark.
     ManifestBeforeAWrite,
+    /// A non-success manifest added to a directory that held no canonical manifest: the only record there, re-marking nothing (allowed by default).
+    FirstFailedManifest,
     /// A file added to the destination that is neither a marker nor a manifest.
     OrphanPart,
     /// A CDC checkpoint file added or rewritten.
@@ -109,10 +109,11 @@ pub enum Leftover {
 
 impl Leftover {
     /// Every kind, in report order.
-    pub const ALL: [Leftover; 17] = [
+    pub const ALL: [Leftover; 18] = [
         Leftover::FailureRecord,
         Leftover::FailedManifest,
         Leftover::ManifestBeforeAWrite,
+        Leftover::FirstFailedManifest,
         Leftover::OrphanPart,
         Leftover::CdcCheckpoint,
         Leftover::CdcFlush,
@@ -136,6 +137,7 @@ impl Leftover {
             Leftover::OrphanPart => "orphan-part",
             Leftover::FailedManifest => "failed-manifest",
             Leftover::ManifestBeforeAWrite => "failed-manifest-before-a-write",
+            Leftover::FirstFailedManifest => "first-failed-manifest",
             Leftover::CdcCheckpoint => "cdc-checkpoint",
             Leftover::CdcFlush => "cdc-committed-flush",
             Leftover::DeliveredRun => "delivered-run",
@@ -255,6 +257,8 @@ pub(crate) struct Scope {
 pub(crate) struct Snapshot {
     /// Per export, in [`Scope::exports`] order.
     trees: Vec<Result<BTreeMap<PathBuf, Print>, String>>,
+    /// Whether the state is a shared Postgres one, of which only the exports' own rows were read.
+    shared_state: bool,
     checkpoints: BTreeMap<PathBuf, Print>,
     /// Table -> its rows as JSON text; `Err` when the backend could not be read.
     state: Result<BTreeMap<String, BTreeSet<String>>, String>,
@@ -275,6 +279,7 @@ impl Snapshot {
             },
         };
         Snapshot {
+            shared_state: matches!(scope.state, Some(StateAt::Postgres(_))),
             trees: scope
                 .exports
                 .iter()
@@ -289,6 +294,24 @@ impl Snapshot {
             state,
             unscoped,
         }
+    }
+}
+
+impl Snapshot {
+    /// Whether the state held an unfinished checkpointed run when this was taken (a `chunk_run` in progress, a `resume_run_id` claim, a `keyset_range`); a state that could not be read whole counts as holding one.
+    pub(crate) fn holds_an_unfinished_run(&self) -> bool {
+        let Ok(state) = &self.state else {
+            return true;
+        };
+        let any = |table: &str, unfinished: &dyn Fn(&serde_json::Value) -> bool| {
+            state.get(table).into_iter().flatten().any(|row| {
+                serde_json::from_str::<serde_json::Value>(row).map_or(true, |v| unfinished(&v))
+            })
+        };
+        self.shared_state
+            || any("chunk_run", &|v| v["status"] == "in_progress")
+            || any("export_state", &|v| !v["resume_run_id"].is_null())
+            || any("keyset_range", &|_| true)
     }
 }
 
@@ -499,9 +522,16 @@ fn file_changes(
                             .is_some_and(|n| n.to_string_lossy().starts_with("manifest-"))
                 })
         };
+        // A directory with no canonical manifest holds no earlier run's record to re-mark.
+        let first_record = || {
+            !before.keys().any(|q| {
+                q.parent() == p.parent() && q.file_name().is_some_and(|n| n == "manifest.json")
+            })
+        };
         let kind = match (checkpoint, was.map(|w| w.2), now.2) {
             (true, _, _) => Leftover::CdcCheckpoint,
             (_, _, Tag::Marker) => Leftover::SuccessMarker,
+            (_, None, Tag::FailedManifest) if first_record() => Leftover::FirstFailedManifest,
             (_, None | Some(Tag::FailedManifest), Tag::FailedManifest) => Leftover::FailedManifest,
             (_, Some(Tag::SuccessManifest), Tag::FailedManifest) if success_kept() => {
                 Leftover::FailedManifest
@@ -856,20 +886,29 @@ mod tests {
             remarked_after("INSERT INTO file_log VALUES (1, 'e', 'part-1.parquet')"),
             clean("left only failed-manifest x3, file-log x1")
         );
-        let Verdict::Refused { left, known, .. } = remarked_after("SELECT 1") else {
-            panic!("a known defect, not a failure");
-        };
-        assert_eq!(left, "left only failed-manifest-before-a-write x3");
-        assert_eq!(known.len(), 1, "{known:?}");
+        let before_a_write = |v: Verdict| matches!(v, Verdict::Fail(ref l) if l.len() == 3 && l.iter().all(|f| f.starts_with("failed-manifest-before-a-write: ")));
         assert!(
-            known[0].0.starts_with("[a failed run left: failed-manifest-before-a-write] known defect: a run that fails before its first write"),
-            "{known:?}"
+            before_a_write(remarked_after("SELECT 1")),
+            "a run that wrote nothing re-marked the prefix"
         );
-        let other = remarked_after("INSERT INTO file_log VALUES (1, 'sibling', 'part-1.parquet')");
         assert!(
-            matches!(other, Verdict::Refused { ref known, .. } if known.len() == 1),
-            "a sibling's write does not make this export's manifest its run's own: {other:?}"
+            before_a_write(remarked_after(
+                "INSERT INTO file_log VALUES (1, 'sibling', 'part-1.parquet')"
+            )),
+            "a sibling's write does not make this export's manifest its run's own"
         );
+    }
+
+    #[test]
+    fn the_first_failed_manifest_of_a_prefix_is_the_runs_own_record() {
+        let (kinds, verdict) = kinds_after(|d| {
+            std::fs::create_dir_all(d.join("out/fresh")).unwrap();
+            for m in ["manifest.json", "manifest-r9.json"] {
+                std::fs::write(d.join("out/fresh").join(m), br#"{"status":"failed"}"#).unwrap();
+            }
+        });
+        assert_eq!(kinds, vec![Leftover::FirstFailedManifest; 2]);
+        assert_eq!(verdict, clean("left only first-failed-manifest x2"));
     }
 
     #[test]
@@ -1133,6 +1172,35 @@ mod tests {
             kind(r#"{"export_name":"e","last_cursor_value":"10","resume_run_id":null}"#),
             Leftover::ResumePoint
         );
+    }
+
+    #[test]
+    fn a_state_with_a_chunk_run_in_progress_or_a_claim_holds_an_unfinished_run() {
+        let holds = |stmt: &str| {
+            let (dir, scope) = fixture();
+            sql(dir.path(), stmt);
+            Snapshot::take(&scope).holds_an_unfinished_run()
+        };
+        assert!(!holds("SELECT 1"));
+        assert!(!holds(
+            "CREATE TABLE chunk_run (run_id TEXT, export_name TEXT, status TEXT);
+             INSERT INTO chunk_run VALUES ('r', 'e', 'completed')"
+        ));
+        assert!(holds(
+            "CREATE TABLE chunk_run (run_id TEXT, export_name TEXT, status TEXT);
+             INSERT INTO chunk_run VALUES ('r', 'e', 'in_progress')"
+        ));
+        assert!(holds(
+            "ALTER TABLE export_state ADD COLUMN resume_run_id TEXT;
+             UPDATE export_state SET resume_run_id = 'r'"
+        ));
+        assert!(holds(
+            "CREATE TABLE keyset_range (run_id TEXT, export_name TEXT);
+             INSERT INTO keyset_range VALUES ('r', 'e')"
+        ));
+        let (_dir, mut scope) = fixture();
+        scope.state = Some(StateAt::Postgres("postgresql://127.0.0.1:9/none".into()));
+        assert!(Snapshot::take(&scope).holds_an_unfinished_run());
     }
 
     #[test]

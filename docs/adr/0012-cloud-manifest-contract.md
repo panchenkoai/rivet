@@ -45,6 +45,8 @@ Every manifest write also leaves an immutable run-unique copy `manifest-<sanitiz
 
 `_SUCCESS` is a single-line marker carrying the manifest fingerprint (`xxh3:<16-hex>`, `src/manifest.rs::success_marker_body`; see M2). Its only meaning is "the manifest at this prefix represents a fully-committed run". Its existence implies the manifest exists, and every part the manifest references also exists at the recorded byte length.
 
+Amendment (2026-10-08, owner decision 2026-10-07): the marker and a `success` manifest describe the prefix, not the last run. A run that fails before it put a part at the destination writes nothing over a prefix that already holds a manifest (no canonical manifest, no run-unique copy, no marker change; on a cloud prefix its `running` marker is removed), so a network failure does not withdraw a whole export. On a prefix with no manifest it writes its `failed` manifest, the only record there, as before. A run that put a part there and then failed removes `_SUCCESS` before it writes its `failed` manifest, as before. The decision reads two facts: whether this run put a part of its own at the destination (counted at the destination-write seam, `commit::write_part_file`; the parts a resume adopts are not its writes), and whether the prefix already holds a `manifest.json`.
+
 ---
 
 ## Invariants
@@ -136,7 +138,7 @@ Decision matrix per part name:
 | no  | yes | —   | —   | quarantine (M9) — untracked artifact |
 | no  | no  | —   | —   | new — write |
 
-`_SUCCESS` present + no `--force` → refuse to start (operator must opt in to overwrite a successful run).
+`_SUCCESS` present + `--resume` + no `--force` → refuse to start (`RIVET_DEST_ALREADY_COMPLETE`, exit 5). With `--force` the run goes on: it continues an interrupted run of the export if one is recorded, else it runs as a plain run does (a `full` export is exported again, a delta export continues past its cursor). Nothing is overwritten: new parts land beside the old ones and `manifest.json` then describes only the new run.
 
 The "no manifest entry / object present" row does not apply to the run-unique manifest copies (`manifest-*.json`, see Artifacts): both the reconcile and validate untracked-object scans exempt them via `is_run_unique_manifest_name`, so prior runs' sidecar copies are never quarantined as untracked artifacts.
 
