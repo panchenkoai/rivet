@@ -456,10 +456,10 @@ pub mod codes {
         "RIVET_STATE_URL_SCHEME_UNSUPPORTED",
         "set `RIVET_STATE_URL` to a `postgres://` or `postgresql://` URL, or unset it to keep the state in the SQLite file beside the config",
     );
-    /// The state store did not take a run's first write.
+    /// The state store cannot be written: read-only when it is opened, or it did not take a run's first write.
     pub const STATE_NOT_WRITABLE: Code = environment(
         "RIVET_STATE_NOT_WRITABLE",
-        "make the state database writable (file permissions, a read-only filesystem, a read-only role) and run again; the export did not start",
+        "make the state database writable (the SQLite file and its directory, a read-only filesystem, a read-only role) and run again; the export did not start",
     );
     /// A run delivered its rows and manifest, and its incremental cursor write failed.
     pub const STATE_CURSOR_NOT_STORED: Code = environment(

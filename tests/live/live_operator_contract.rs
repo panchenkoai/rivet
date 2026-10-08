@@ -215,13 +215,29 @@ fn run_validate_flag_on(rig: Rig) {
     );
 }
 
-/// Makes the SQLite state files beside a config read-only until dropped.
-struct ReadOnlyState(Vec<std::path::PathBuf>);
+/// What of a SQLite state beside a config is made read-only.
+#[derive(Clone, Copy, Debug)]
+enum ReadOnly {
+    /// The state files themselves.
+    Files,
+    /// The directory that holds them, the files left writable: a read-only volume mount.
+    Directory,
+}
+
+/// Makes the SQLite state beside a config read-only until dropped; holds each path with the mode to put back.
+struct ReadOnlyState(Vec<(std::path::PathBuf, u32)>);
 
 impl ReadOnlyState {
-    fn beside(cfg: &std::path::Path) -> Self {
+    fn beside(cfg: &std::path::Path, shape: ReadOnly) -> Self {
         use std::os::unix::fs::PermissionsExt as _;
-        let files: Vec<_> = files_below(cfg.parent().unwrap())
+        let dir = cfg.parent().unwrap();
+        if let ReadOnly::Directory = shape {
+            // The last connection to close checkpoints and removes `-wal` and `-shm`, as a finished run does.
+            rusqlite::Connection::open(dir.join(".rivet_state.db"))
+                .and_then(|c| c.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(())))
+                .expect("checkpoint the state");
+        }
+        let files: Vec<_> = files_below(dir)
             .into_iter()
             .filter(|p| {
                 p.file_name()
@@ -232,18 +248,35 @@ impl ReadOnlyState {
             !files.is_empty(),
             "fixture: a SQLite state beside the config"
         );
-        for f in &files {
-            std::fs::set_permissions(f, std::fs::Permissions::from_mode(0o400)).unwrap();
-        }
-        ReadOnlyState(files)
+        let paths = match shape {
+            ReadOnly::Files => files,
+            ReadOnly::Directory => {
+                assert_eq!(
+                    files.len(),
+                    1,
+                    "fixture: a state no process has open is one file, with no -wal or -shm: {files:?}"
+                );
+                vec![dir.to_path_buf()]
+            }
+        };
+        let locked = paths
+            .into_iter()
+            .map(|p| {
+                let mode = std::fs::metadata(&p).unwrap().permissions().mode();
+                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode & !0o222))
+                    .unwrap();
+                (p, mode)
+            })
+            .collect();
+        ReadOnlyState(locked)
     }
 }
 
 impl Drop for ReadOnlyState {
     fn drop(&mut self) {
         use std::os::unix::fs::PermissionsExt as _;
-        for f in &self.0 {
-            let _ = std::fs::set_permissions(f, std::fs::Permissions::from_mode(0o600));
+        for (path, mode) in &self.0 {
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(*mode));
         }
     }
 }
@@ -287,19 +320,25 @@ fn mongo_read_only_state() {
     read_only_state_on(rig);
 }
 
-/// `rig` has run once on the SQLite state: lock it, refuse twice, unlock, deliver.
+/// `rig` has run once on the SQLite state: for each read-only shape, lock it, refuse twice, unlock, deliver.
 fn read_only_state_on(mut rig: Rig) {
-    let locked = ReadOnlyState::beside(&rig.config_path());
-    rig.refuses_twice_then(
-        &["run"],
-        SQLITE_STATE,
-        Refused::by_code("RIVET_STATE_NOT_WRITABLE", 1),
-        vec![Remedy::new(
-            "Make the state database writable and run again.",
-            Then::DeliversTheSource,
-            move |_| drop(locked),
-        )],
-    );
+    for shape in [ReadOnly::Files, ReadOnly::Directory] {
+        let locked = ReadOnlyState::beside(&rig.config_path(), shape);
+        let said = rig.refuses_twice_then(
+            &["run"],
+            SQLITE_STATE,
+            Refused::by_code("RIVET_STATE_NOT_WRITABLE", 1),
+            vec![Remedy::new(
+                "Make the state database writable and run again.",
+                Then::DeliversTheSource,
+                move |_| drop(locked),
+            )],
+        );
+        assert!(
+            !said.contains("Another rivet process"),
+            "{shape:?}: a read-only state is not another process's lock\n{said}"
+        );
+    }
 }
 
 /// Sorted `id` values of every part under `out`, whatever the column's integer width (Oracle delivers NUMBER(19) as a decimal).

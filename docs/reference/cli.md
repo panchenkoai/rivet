@@ -822,7 +822,7 @@ Rivet creates all state tables automatically on first connect, running the full 
 
 A `RIVET_STATE_URL` that is set and is not a `postgres://` or `postgresql://` URL (a typo such as `postgre://`, another engine's URL) is refused by every command that opens the state (`RIVET_STATE_URL_SCHEME_UNSUPPORTED`, exit 1): it is never replaced by the SQLite file. An unset or empty variable selects SQLite.
 
-A run starts by recording itself in the state. If the state does not take that write (a read-only file or filesystem, a role without write access), the run is refused before it exports anything (`RIVET_STATE_NOT_WRITABLE`). If the incremental cursor cannot be stored after the rows and the manifest are written, the run exits non-zero (`RIVET_STATE_CURSOR_NOT_STORED`): the rows are delivered, and the next run delivers them again from the previous cursor.
+A run starts by recording itself in the state. If the state does not take that write (a read-only file, directory or filesystem, a role without write access), the run is refused before it exports anything (`RIVET_STATE_NOT_WRITABLE`). SQLite writes `-wal` and `-shm` files beside `.rivet_state.db`, so the directory must be writable as well as the file: on a read-only directory no command can open the state, and each is refused with the same code. If the incremental cursor cannot be stored after the rows and the manifest are written, the run exits non-zero (`RIVET_STATE_CURSOR_NOT_STORED`): the rows are delivered, and the next run delivers them again from the previous cursor.
 
 ### Docker Compose (local dev)
 

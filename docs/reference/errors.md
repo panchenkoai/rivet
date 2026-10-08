@@ -43,7 +43,7 @@ Every failure rivet names carries a stable `RIVET_<FAMILY>_<NAME>` code: in `--j
 | `RIVET_SOURCE_PROBE_UNREADABLE` | refusal | 5 | chunk, page or partition the export on a column of a type the message lists, remove `parallel:` from a keyset export, or use `mode: full` |
 | `RIVET_SOURCE_OVERRIDE_WIRE_MISMATCH` | usage | 1 | remove or correct the column's `columns:` override (batch: or CAST the column to that type in the export's `query:`; CDC: then re-snapshot the table) |
 | `RIVET_STATE_URL_SCHEME_UNSUPPORTED` | usage | 1 | set `RIVET_STATE_URL` to a `postgres://` or `postgresql://` URL, or unset it to keep the state in the SQLite file beside the config |
-| `RIVET_STATE_NOT_WRITABLE` | environment | 2 if transient, else 1 | make the state database writable (file permissions, a read-only filesystem, a read-only role) and run again; the export did not start |
+| `RIVET_STATE_NOT_WRITABLE` | environment | 2 if transient, else 1 | make the state database writable (the SQLite file and its directory, a read-only filesystem, a read-only role) and run again; the export did not start |
 | `RIVET_STATE_CURSOR_NOT_STORED` | environment | 2 if transient, else 1 | repair the state database before the next run; the rows are delivered, and the next run delivers them again from the previous cursor |
 | `RIVET_STATE_SCHEMA_NEWER` | refusal | 5 | upgrade rivet, or point this binary at a state DB it created |
 | `RIVET_STATE_CURSOR_OWNER_MISMATCH` | refusal | 5 | `rivet state reset -c <config> --export <name>` to start the new cursor with a full pass, or restore the previous cursor column |

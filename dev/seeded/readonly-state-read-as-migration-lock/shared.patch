@@ -1,0 +1,24 @@
+diff --git a/src/state/migrations.rs b/src/state/migrations.rs
+--- a/src/state/migrations.rs
++++ b/src/state/migrations.rs
+@@ -1147,19 +1147,7 @@
+              a backup."
+         );
+     }
+-    // READONLY is a third disease: no process holds the database and no wait ends it.
+-    if e.sqlite_error_code() == Some(rusqlite::ErrorCode::ReadOnly) {
+-        let at = db.map_or(String::new(), |path| format!(" `{path}`"));
+-        return anyhow::Error::new(crate::error::CodedError::new(
+-            crate::error::codes::STATE_NOT_WRITABLE,
+-            format!(
+-                "state: the state database{at} is read-only ({e}). SQLite writes the file and, \
+-                 beside it, its `-wal` and `-shm` files, so the file and its directory must \
+-                 both be writable. The state was not opened and nothing was written. Make the \
+-                 state database writable and run again."
+-            ),
+-        ));
+-    }
++    let _ = db;
+     anyhow::anyhow!(
+         "state: could not acquire the migration lock within the busy timeout ({e}). \
+          Another rivet process is migrating this state database; wait for it to \

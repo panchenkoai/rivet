@@ -26,6 +26,10 @@
   - Now the run is refused before it exports anything (`RIVET_STATE_NOT_WRITABLE`, exit 1),
     on every run, until the state takes the write. Make the state database writable and run
     again: the run then delivers from the stored cursor.
+  - A read-only DIRECTORY around a writable state file (a read-only volume mount) gets the
+    same refusal, from every command that opens the state. Before, it failed with exit 2 and
+    `could not acquire the migration lock ... Another rivet process is migrating this state
+    database; wait for it to finish and retry`, although no other process existed.
   - If the state fails only at the end, when the rows and the manifest are already written,
     the run exits non-zero with `RIVET_STATE_CURSOR_NOT_STORED` instead of logging an error
     and exiting 0. The rows are delivered and the next run delivers them again from the

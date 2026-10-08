@@ -651,3 +651,23 @@ seeds:
         cells: [an_unusable_state_url_is_refused_and_each_remedy_runs_mongo]
       oracle:
         cells: [an_unusable_state_url_is_refused_and_each_remedy_runs_oracle]
+
+  - name: readonly-state-read-as-migration-lock
+    class: a read-only SQLite state (its directory, or the file under a pending migration) is reported as another rivet process holding the migration lock
+    history: "2026-10-08 hand probe of #485 - a writable `.rivet_state.db` in a read-only directory: exit 2, no code, `could not acquire the migration lock ... Another rivet process is migrating this state database; wait for it to finish and retry`, on PostgreSQL, MySQL and SQL Server sources"
+    scope: source
+    patch: readonly-state-read-as-migration-lock/shared.patch
+    engines:
+      postgres:
+        cells: [a_run_over_a_read_only_state_is_refused_and_runs_once_it_is_writable_postgres]
+      mysql:
+        cells: [a_run_over_a_read_only_state_is_refused_and_runs_once_it_is_writable_mysql]
+      mssql:
+        cells: [a_run_over_a_read_only_state_is_refused_and_runs_once_it_is_writable_mssql]
+      mongo:
+        cells: [a_run_over_a_read_only_state_is_refused_and_runs_once_it_is_writable_mongo]
+      oracle:
+        cells: [a_run_over_a_read_only_state_is_refused_and_runs_once_it_is_writable_oracle]
+      lib:
+        cells:
+          - "lib:a_read_only_database_is_refused_as_not_writable_never_as_another_process"
