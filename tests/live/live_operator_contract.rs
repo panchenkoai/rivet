@@ -302,6 +302,21 @@ fn read_only_state_on(mut rig: Rig) {
     );
 }
 
+/// Sorted `id` values of every part under `out`, whatever the column's integer width (Oracle delivers NUMBER(19) as a decimal).
+fn delivered_ids(out: &std::path::Path) -> Vec<i64> {
+    use arrow::array::{Array, Int64Array};
+    let mut ids = Vec::new();
+    for b in read_all_parts(out) {
+        let col = b.column_by_name("id").expect("an id column");
+        let col =
+            arrow::compute::cast(col, &arrow::datatypes::DataType::Int64).expect("an integer id");
+        let col = col.as_any().downcast_ref::<Int64Array>().expect("Int64");
+        ids.extend((0..col.len()).map(|i| col.value(i)));
+    }
+    ids.sort_unstable();
+    ids
+}
+
 /// RESULTS 3 (the write after the manifest): a run whose cursor write fails delivers its rows and does not exit 0.
 fn cursor_write_fails(engine: SqlEngine) {
     let (rig, _guard) = incremental_with_a_pending_delta(engine, "oc_nocursor");
@@ -343,10 +358,8 @@ fn cursor_write_fails(engine: SqlEngine) {
         "10",
         "the cursor stays where the last stored run left it"
     );
-    let mut ids = ids_of(&read_all_parts(&rig.out_dir()));
-    ids.sort_unstable();
     assert_eq!(
-        ids,
+        delivered_ids(&rig.out_dir()),
         (1..=13).collect::<Vec<i64>>(),
         "the run that could not store its cursor delivered its rows once"
     );
