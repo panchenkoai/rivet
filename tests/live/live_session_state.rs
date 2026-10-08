@@ -321,55 +321,17 @@ fn mysql_incremental_on_a_timestamp_cursor_reads_each_row_once_under_a_tokyo_ser
 }
 
 #[cfg(feature = "oracle")]
-/// An Oracle login whose every session opens in Asia/Tokyo with day-first NLS masks and a
-/// comma decimal separator (an AFTER LOGON trigger); trigger and user dropped on Drop.
-struct OddOracleUser(String);
-
-#[cfg(feature = "oracle")]
-impl OddOracleUser {
-    const PASSWORD: &'static str = "Odd_passw0rd1";
-
-    fn create(table: &str) -> Self {
-        let name = unique_name("ora_odd").to_uppercase();
-        ora_system_exec(&format!(
-            "CREATE USER {name} IDENTIFIED BY \"{}\"",
-            Self::PASSWORD
-        ));
-        let user = Self(name);
-        ora_system_exec(&format!("GRANT CREATE SESSION TO {}", user.0));
-        ora_system_exec(&format!("GRANT SELECT ON RIVET.{table} TO {}", user.0));
-        ora_system_exec(&format!(
-            "CREATE OR REPLACE TRIGGER SYSTEM.{0}_LOGON AFTER LOGON ON {0}.SCHEMA \
-             BEGIN \
-               EXECUTE IMMEDIATE q'[ALTER SESSION SET NLS_DATE_FORMAT = 'DD-MON-RR']'; \
-               EXECUTE IMMEDIATE q'[ALTER SESSION SET NLS_TIMESTAMP_FORMAT = 'DD-MON-RR HH.MI.SSXFF AM']'; \
-               EXECUTE IMMEDIATE q'[ALTER SESSION SET NLS_TIMESTAMP_TZ_FORMAT = 'DD-MON-RR HH.MI.SSXFF AM TZR']'; \
-               EXECUTE IMMEDIATE q'[ALTER SESSION SET NLS_NUMERIC_CHARACTERS = ',.']'; \
-               EXECUTE IMMEDIATE q'[ALTER SESSION SET TIME_ZONE = 'Asia/Tokyo']'; \
-             END;",
-            user.0
-        ));
-        user
-    }
-
-    fn url(&self) -> String {
-        format!(
-            "oracle://{}:{}@127.0.0.1:1521/FREEPDB1",
-            self.0,
-            Self::PASSWORD
-        )
-    }
-}
-
-#[cfg(feature = "oracle")]
-impl Drop for OddOracleUser {
-    fn drop(&mut self) {
-        let _ = std::panic::catch_unwind(|| {
-            ora_system_exec(&format!("DROP TRIGGER SYSTEM.{}_LOGON", self.0))
-        });
-        let _ =
-            std::panic::catch_unwind(|| ora_system_exec(&format!("DROP USER {} CASCADE", self.0)));
-    }
+/// An Oracle login whose every session opens in Asia/Tokyo with day-first NLS masks and a comma decimal separator.
+fn odd_oracle_user(table: &str) -> OracleLogonUser {
+    OracleLogonUser::create(
+        "ora_odd",
+        table,
+        "EXECUTE IMMEDIATE q'[ALTER SESSION SET NLS_DATE_FORMAT = 'DD-MON-RR']'; \
+         EXECUTE IMMEDIATE q'[ALTER SESSION SET NLS_TIMESTAMP_FORMAT = 'DD-MON-RR HH.MI.SSXFF AM']'; \
+         EXECUTE IMMEDIATE q'[ALTER SESSION SET NLS_TIMESTAMP_TZ_FORMAT = 'DD-MON-RR HH.MI.SSXFF AM TZR']'; \
+         EXECUTE IMMEDIATE q'[ALTER SESSION SET NLS_NUMERIC_CHARACTERS = ',.']'; \
+         EXECUTE IMMEDIATE q'[ALTER SESSION SET TIME_ZONE = 'Asia/Tokyo']';",
+    )
 }
 
 #[cfg(feature = "oracle")]
@@ -395,7 +357,7 @@ fn oracle_incremental_on_a_tstz_cursor_reads_each_row_once_for_a_tokyo_day_first
         "id NUMBER(10) PRIMARY KEY, ts TIMESTAMP(6) WITH TIME ZONE NOT NULL",
     );
     oracle_ts_rows(t.name(), 1, 300);
-    let user = OddOracleUser::create(t.name());
+    let user = odd_oracle_user(t.name());
     assert_eq!(
         ora_text_rows_on(
             &user.url(),

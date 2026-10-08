@@ -41,15 +41,18 @@ FIRST_RUN = {"SKIP": "the stream's first run delivered nothing", "PARTIAL": "the
 #: exclusive ones), so only the first-run counter transfers to it. Measured on #433 (CI run 37108478817):
 #: first-run 61, all MySQL checkpoints a test wrote itself; with Rig::pin_binlog_here recording their anchor: 0.
 #: `deferred`: the capped `rivet cdc` runs a lane runs (each owes its remainder to the stream's next run, graded there).
+#: 2026-10-08 (#484, CI run 37720250883): skip 49 -> 53 and partial 39 -> 47 are the Oracle twins of cells already counted (the
+#: `--pool --split` sibling a `--resume` run skips and its resumed plan, the two `settle:` cells); deferred 6 -> 8 the capped
+#: `rivet cdc` drains on PostgreSQL and SQL Server.
 VERDICT_CEILINGS: dict[str, dict[str, tuple[int, int]]] = {
     "ci": {
         "first-run": (0,  # ratchet-pin: rig-oracle-first-run
                       0),
-        "skip": (49,  # ratchet-pin: rig-oracle-skip
+        "skip": (53,  # ratchet-pin: rig-oracle-skip
                  3),
-        "partial": (39,  # ratchet-pin: rig-oracle-partial
+        "partial": (47,  # ratchet-pin: rig-oracle-partial
                     3),
-        "deferred": (6,  # ratchet-pin: rig-oracle-deferred
+        "deferred": (8,  # ratchet-pin: rig-oracle-deferred
                      0),
     },
     "gate": {"first-run": (0,  # ratchet-pin: rig-oracle-first-run-gate

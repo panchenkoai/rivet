@@ -335,6 +335,13 @@ def json_text(v: object) -> str:
         return json.dumps(str(v))
 
 
+def _bound(c: str, op: str, bound: object, native: object) -> str:
+    """`c <op> bound`; a column registered as exact NUMBER text (Oracle) compares by value, not as text."""
+    if str(native or "").startswith("NUMBER") and re.fullmatch(r"-?\d+(\.\d+)?", str(bound)):
+        return f"TRY_CAST({c} AS DECIMAL(38, 10)) {op} {bound}"
+    return f"{c} {op} {_lit(str(bound))}"
+
+
 def _oracle_register(ora, url: str, sql: str, json_cols: frozenset = frozenset()) -> dict:
     """Rows of an Oracle SELECT (read by python-oracledb) registered as `ora_src`; NUMBER as exact text, INTERVAL YEAR TO MONTH as ISO text, VECTOR as a list, a JSON column as JSON text. Returns `{column: "NUMBER"}` for the NUMBER columns."""
     import array
@@ -387,7 +394,7 @@ def _source(ora, spec: dict, renders: dict) -> tuple[str, list[str], dict]:
     if engine == "oracle":
         from .value_diff import oracle_table_select
 
-        owner = f"owner = {_lit(schema.upper())}" if schema else "owner = USER"
+        owner = f"owner = {_lit(schema.upper())}" if schema else "owner = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')"
         declared = {} if query else {r["COLUMN_NAME"]: norm_native(r["T"]) for r in oracle_rows(
             spec["url"],
             "SELECT column_name, CASE WHEN data_type = 'NUMBER' AND data_precision IS NOT NULL THEN "
@@ -1325,13 +1332,13 @@ def grade(spec: dict) -> dict:
                     ora.db.sql(f"CREATE OR REPLACE TEMP TABLE got AS SELECT *, 0 AS __mseq FROM {src} LIMIT 0")
                     # A row at or below the bound is owed only if delivered anyway: matched by key (a cursor's text differs per reader), else by cursor.
                     ident = f"concat_ws(chr(31), {', '.join(f'CAST({_qi(k)} AS VARCHAR)' for k in key)})" if key else f"CAST({c} AS VARCHAR)"
-                    src = (f"(SELECT * FROM {src} WHERE ({c} IS NOT NULL AND {c} > {_lit(low)}) "
+                    src = (f"(SELECT * FROM {src} WHERE ({c} IS NOT NULL AND {_bound(c, '>', low, native.get(col))}) "
                            f"OR {ident} IN (SELECT {ident} FROM got))")
                 if spec.get("settle") and windows:
                     # `settle:` holds young rows back by rivet's own clock: the upper edge is rivet's cursor_high, a named partial.
                     w = windows[-1]
                     c = spec["cursor_expr"] if w["cursor_column"] == "_rivet_coalesced_cursor" and spec.get("cursor_expr") else _qi(w["cursor_column"])
-                    src = f"(SELECT * FROM {src} WHERE {c} <= {_lit(str(w['cursor_high']))})"
+                    src = f"(SELECT * FROM {src} WHERE {_bound(c, '<=', w['cursor_high'], native.get(w['cursor_column']))})"
                     partial.append("`settle:` holds young rows back by rivet's clock: rows past rivet's cursor_high are not graded")
             legs = [
                 f"SELECT *, {i} AS __mseq FROM {_parts(ora, ps, fmt)}"
@@ -1644,6 +1651,8 @@ def transient(e: BaseException) -> bool:
 
 
 def _self_test() -> None:
+    assert _bound('"ID"', "<=", "10", "NUMBER (by value)") == 'TRY_CAST("ID" AS DECIMAL(38, 10)) <= 10'
+    assert _bound('"K"', ">", "10", "VARCHAR2") == """"K" > '10'""", "a text cursor compares as text"
     bq = {"target": "bigquery", "project": "p", "dataset": "d"}
     assert load_run_filter({"export": "users", "table": "public.users_pg", "load": bq}) == \
         "export_name = 'public_users_pg' AND ends_with(target_table, '.d.public_users_pg')"

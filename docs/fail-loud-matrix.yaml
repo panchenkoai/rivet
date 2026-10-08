@@ -30,7 +30,7 @@ scenarios:
     mssql:    { test: mssql_cdc_capture_instance_name_must_not_decide_the_table }
     mysql:    { test: roast_mysql_cdc_refuses_a_view_whose_binlog_identity_is_the_base_table }
     mongo:    { test: mongo_cdc_warns_when_a_configured_collection_does_not_exist }
-    oracle:   { gap: "no Oracle cell for a relation that EXISTS but can never emit (a VIEW): an absent name bails before the anchor (oracle_cdc_refuses_a_table_it_cannot_resolve_before_the_first_ack), but a view passes the ALL_TAB_COLS probe and is untested live" }
+    oracle:   { test: oracle_cdc_refuses_a_view_before_the_first_ack }
 
   - id: cdc_truncate_loud_not_a_silent_divergence
     what: "a TRUNCATE on a captured table → loud bail naming the re-baseline, never a silent drop that leaves the destination holding rows the source no longer has (no DELETE events carry them, so no later capture can reconcile it)"
@@ -54,7 +54,7 @@ scenarios:
     mysql:    { test: stand_sparse_guard_mysql }
     mssql:    { test: stand_sparse_guard_mssql }
     mongo:    { na: "Mongo pages _id with a keyset seek — no BETWEEN key-span to divide; its guard family is the heterogeneous/NaN _id detector" }
-    oracle:   { gap: "no Oracle live sparse-range guard test" }
+    oracle:   { test: stand_sparse_guard_oracle }
 
   - id: unusable_keyset_key_loud
     what: "keyset requested on a key that isn't single-column NOT NULL UNIQUE/PK (or a heterogeneous BSON _id on Mongo) → bail pointing at the fix; the full scan stays the working remediation"
@@ -62,7 +62,7 @@ scenarios:
     mysql:    { test: stand_keyset_non_usable_bail_mysql }
     mssql:    { na: "the refusal is engine-agnostic plan logic (src/plan/build.rs, is_usable_keyset_key); only the ACCEPT side is engine-specific (mssql_keyset_on_non_pk_unique_index) — pinned once on PG+MySQL" }
     mongo:    { test: mongo_keyset_on_heterogeneous_id_errors_loudly_full_scan_still_works }
-    oracle:   { gap: "the refusal is shared plan logic, but its input (Oracle's all_indexes/all_ind_columns keyset-key probe) is Oracle-specific and untested" }
+    oracle:   { test: stand_keyset_non_usable_bail_oracle }
 
   - id: strict_mode_unsafe_type_gates
     what: "--strict + an unsafe/unsupported source type (or a target-Fail type) → non-zero exit naming the column; without --strict, a printed un-gated note"
