@@ -3189,17 +3189,10 @@ fn mssql_a_never_changed_table_is_not_refused_after_cleanup_passes_its_anchor() 
     );
 }
 
-/// An anchor written by rivet 0.31 or older (`"pinned": true`) below the instance's start: adopted once, with the warning.
+/// An anchor written by rivet 0.31 or older (`"pinned": true`) below the instance's start is refused like any other position there, and the re-baseline remedy recovers.
 #[test]
 #[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC + the rivet-duckdb oracle"]
-fn mssql_a_legacy_pinned_anchor_below_the_instance_start_is_adopted_with_a_warning() {
-    const WARNING: &str = "mssql cdc: this checkpoint is an anchor written by rivet 0.31 or \
-        older, and it is below the capture instance's start. That is normal for an instance enabled \
-        just before the anchor, or cleaned up while the table was quiet; it is also what a cleanup \
-        past unread changes, or a re-created capture instance, looks like, and this checkpoint \
-        cannot tell them apart. Reading from the instance's start. If the capture instance was \
-        re-created, or rivet did not run for longer than the CDC retention since the baseline, \
-        changes may be missing: re-baseline the stream. Later runs refuse such a gap.";
+fn mssql_a_legacy_pinned_anchor_below_the_instance_start_is_refused_until_rebaselined() {
     let _serial = cross_process_serial("mssql_cdc");
     let mut s = CdcScenario::mssql_with("cdc_pinlegacy", "id INT PRIMARY KEY, v INT", |r, _| {
         r.cdc("initial: snapshot").cdc("until_current: true")
@@ -3213,20 +3206,13 @@ fn mssql_a_legacy_pinned_anchor_below_the_instance_start_is_adopted_with_a_warni
     std::fs::write(&ckpt, j.to_string()).unwrap();
     s.insert(1);
     s.settle();
-    let said = s.rig.run_ok_capture();
-    assert!(
-        said.contains(WARNING),
-        "the adoption is said, once:\n{said}"
-    );
+    assert_log_gap_refusal(&s);
+    assert_log_gap_refusal(&s);
+    follow_rebaseline_remedy(&mut s.rig, true);
     assert_eq!(
-        cdc_id_ops(&s.rig.out_dir()),
-        vec![(1, "insert".to_string())],
-        "the row inserted after the legacy anchor is delivered"
-    );
-    let again = s.rig.run_ok_capture();
-    assert!(
-        !again.contains("anchor written by rivet 0.31 or older"),
-        "the checkpoint the adopting run wrote is an ordinary position:\n{again}"
+        dir_parquet_id_set(&s.rig.out_dir().join("snapshot")),
+        [1].into(),
+        "the remedy's baseline holds the row inserted after the legacy anchor"
     );
 }
 

@@ -225,8 +225,6 @@ CDC change-table retention (the cleanup job removed it). Resuming would silently
 pub(crate) struct Resume {
     /// Hex LSN to read after, or `None` for "from the change table's min".
     pub from_lsn: Option<String>,
-    /// True for an anchor written by rivet 0.31 or older (`"pinned": true`), which may sit below its instance's start.
-    pub from_is_pin: bool,
     /// The database identity the checkpoint recorded, when it recorded one.
     pub identity: Option<DbIdentity>,
 }
@@ -334,10 +332,9 @@ fn with_identity(
 /// at-least-once holds; the resume CONTRACT does not, and the comment at the call
 /// site already claimed this case was closed (#99).
 ///
-/// `pinned` is deliberately NOT strict: a checkpoint written before that field
-/// existed is a real and supported input, and its documented default (`false` ⇒
-/// treat the position as a resume) is the loud direction. `lsn` is different in
-/// kind — it IS the position, and a checkpoint without one says nothing at all.
+/// `pinned` (written by rivet 0.31 or older) is ignored: every position is a resume
+/// position, refused when it is below the instance's start. `lsn` IS the position,
+/// and a checkpoint without one says nothing at all.
 ///
 /// A named function rather than an expression at the call site because it DECIDES
 /// something: live-only glue may sequence and wrap, but the branch that separates
@@ -350,7 +347,6 @@ pub(crate) fn resume_from_checkpoint(
     let Some(pos) = pos else {
         return Ok(Resume {
             from_lsn: None,
-            from_is_pin: false,
             identity: None,
         });
     };
@@ -372,11 +368,6 @@ pub(crate) fn resume_from_checkpoint(
         .to_string();
     Ok(Resume {
         from_lsn: Some(from_lsn),
-        from_is_pin: pos
-            .0
-            .get("pinned")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
         identity: DbIdentity::from_checkpoint(pos),
     })
 }
@@ -396,8 +387,6 @@ pub(crate) struct MssqlCdcConfig {
     /// table's min LSN (first run). This is what makes SQL Server CDC at-least-once
     /// rather than re-reading the whole retained change table every run.
     pub from_lsn: Option<String>,
-    /// See `Resume::from_is_pin`; `open` adopts such an anchor once.
-    pub from_is_pin: bool,
     /// The identity the checkpoint recorded; checked against the server at open.
     pub checkpoint_identity: Option<DbIdentity>,
 }
@@ -428,7 +417,6 @@ pub(crate) fn source_object_of_capture_instance(
         password: p.password,
         capture_instance: capture_instance.to_string(),
         from_lsn: None,
-        from_is_pin: false,
         checkpoint_identity: None,
     };
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -623,27 +611,7 @@ impl MssqlChangeStream {
         if cfg.from_lsn.is_some() {
             identity_verdict(cfg.checkpoint_identity.as_ref(), identity.as_ref()).enforce()?;
         }
-        let from_lsn = match legacy_pin(cfg) {
-            Some(pin) => {
-                let below_start = rt.block_on(async {
-                    let row = client
-                        .query(
-                            format!(
-                                "SELECT CONVERT(varchar(24), sys.fn_cdc_decrement_lsn(start_lsn), 1) \
-                                 FROM cdc.change_tables WHERE capture_instance = @P1 \
-                                 AND sys.fn_cdc_increment_lsn(0x{pin}) < start_lsn"
-                            ),
-                            &[&cfg.capture_instance.as_str()],
-                        )
-                        .await?
-                        .into_row()
-                        .await?;
-                    Ok::<_, anyhow::Error>(row.and_then(|r| r.get::<&str, _>(0).map(bare_lsn)))
-                })?;
-                Some(adopt_legacy_pin(pin, below_start))
-            }
-            None => cfg.from_lsn.clone(),
-        };
+        let from_lsn = cfg.from_lsn.clone();
 
         // Resolve the REAL schema/table from cdc.change_tables metadata. The
         // previous `<schema>_<table>` name heuristic silently mis-tagged every
@@ -802,7 +770,6 @@ impl MssqlChangeStream {
                 password: p.password,
                 capture_instance: capture_instance.to_string(),
                 from_lsn: resume.from_lsn,
-                from_is_pin: resume.from_is_pin,
                 checkpoint_identity: resume.identity,
             },
             tls,
@@ -1186,35 +1153,6 @@ async fn connect(
     crate::source::mssql::dial(config, &format!("mssql://{}:{}", cfg.host, cfg.port)).await
 }
 
-/// The warning a run prints when it adopts an anchor that rivet 0.31 or older wrote below the instance's start.
-const LEGACY_PIN_WARNING: &str = "mssql cdc: this checkpoint is an anchor written by rivet 0.31 or \
-     older, and it is below the capture instance's start. That is normal for an instance enabled \
-     just before the anchor, or cleaned up while the table was quiet; it is also what a cleanup \
-     past unread changes, or a re-created capture instance, looks like, and this checkpoint \
-     cannot tell them apart. Reading from the instance's start. If the capture instance was \
-     re-created, or rivet did not run for longer than the CDC retention since the baseline, \
-     changes may be missing: re-baseline the stream. Later runs refuse such a gap.";
-
-/// The resume LSN when it is an anchor rivet 0.31 or older wrote (`"pinned": true`).
-fn legacy_pin(cfg: &MssqlCdcConfig) -> Option<&str> {
-    if cfg.from_is_pin {
-        cfg.from_lsn.as_deref()
-    } else {
-        None
-    }
-}
-
-/// Where a legacy pin reads from: just below its instance's start when it sits under it (with the warning), else itself.
-fn adopt_legacy_pin(pin: &str, below_start: Option<String>) -> String {
-    match below_start {
-        Some(lsn) => {
-            log::warn!("{LEGACY_PIN_WARNING}");
-            lsn
-        }
-        None => pin.to_string(),
-    }
-}
-
 /// Persist the anchor for `cdc.initial: snapshot` to `ckpt`, BEFORE the snapshot read: the
 /// database's max LSN, or the position just below the capture instance's start when that is
 /// higher (an instance the capture job has not reached yet). Either way the anchor is inside
@@ -1243,7 +1181,6 @@ pub(crate) fn pin_checkpoint_at_max_lsn(
         password: p.password,
         capture_instance: capture_instance.to_string(),
         from_lsn: None,
-        from_is_pin: false,
         checkpoint_identity: None,
     };
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -1419,23 +1356,21 @@ mod tests {
         // No file at all — a genuine first run.
         let fresh = resume_from_checkpoint(None, "/x").expect("no checkpoint is not an error");
         assert_eq!(fresh.from_lsn, None);
-        assert!(!fresh.from_is_pin);
 
         // The ordinary resume, and the pin.
         let r = resume_from_checkpoint(Some(&ckpt(serde_json::json!({"lsn": "0a0b"}))), "/x")
             .expect("an lsn without `pinned` is a legacy checkpoint, still valid");
         assert_eq!(r.from_lsn.as_deref(), Some("0a0b"));
-        assert!(
-            !r.from_is_pin,
-            "a checkpoint written before `pinned` existed must default to RESUME — the \
-             direction that throws on retention loss rather than flooring past it"
-        );
-        let pinned = resume_from_checkpoint(
+        let legacy = resume_from_checkpoint(
             Some(&ckpt(serde_json::json!({"lsn": "0a0b", "pinned": true}))),
             "/x",
         )
         .unwrap();
-        assert!(pinned.from_is_pin);
+        assert_eq!(
+            legacy.from_lsn.as_deref(),
+            Some("0a0b"),
+            "an anchor written by rivet 0.31 or older is an ordinary position: below the instance's start it is refused like any other"
+        );
 
         // And the defect this function exists for. Each of these parses as JSON.
         for missing in [
@@ -1687,17 +1622,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn only_a_pinned_checkpoint_is_a_legacy_pin_and_it_moves_only_when_below_the_start() {
-        let mut c = cfg("dbo_orders");
-        c.from_lsn = Some("0a0b".into());
-        assert_eq!(legacy_pin(&c), None, "a resume position is never adopted");
-        c.from_is_pin = true;
-        assert_eq!(legacy_pin(&c), Some("0a0b"));
-        assert_eq!(adopt_legacy_pin("0a0b", Some("0a0f".into())), "0a0f");
-        assert_eq!(adopt_legacy_pin("0a0b", None), "0a0b");
-    }
-
     /// The poll has no way to move a position up: below the low watermark is always the refusal.
     #[test]
     fn a_position_below_the_low_watermark_always_reaches_the_refusal() {
@@ -1728,7 +1652,6 @@ mod tests {
 
     fn cfg(capture_instance: &str) -> MssqlCdcConfig {
         MssqlCdcConfig {
-            from_is_pin: false,
             host: "127.0.0.1".into(),
             // The `mssql-cdc` instance (cdc profile, :1434) — SQL Server Agent on.
             port: 1434,

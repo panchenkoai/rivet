@@ -15,12 +15,12 @@
     moves a baseline-only checkpoint forward like any other, so a quiet table is not refused
     when the cleanup job passes its anchor.
   - Upgrading: a checkpoint that already read a change needs nothing. A baseline-only
-    checkpoint written by 0.31 or earlier that is below the instance's start gets the old
-    behaviour once: the first run on the new version reads from the instance's start, warns
-    ("this checkpoint is an anchor written by rivet 0.31 or older ..."), and writes an ordinary
-    checkpoint; later gaps are refused. That one run cannot tell a harmless anchor from a gap
-    that already happened. If the capture instance was re-created, or rivet did not run for
-    longer than the CDC retention since the baseline, re-baseline the stream.
+    checkpoint written by 0.31 or earlier that is below the instance's start is refused on
+    the first run of the new version, with the same exit 5 `RIVET_SOURCE_CDC_LOG_GAP`: the
+    file cannot tell a harmless anchor from a gap that already happened, so rivet does not
+    guess. This affects a table that had no captured change since its baseline while the
+    cleanup job ran at least once, or whose capture instance was enabled just before the
+    baseline. Re-baseline such a stream once, as the refusal says.
 
 - **Breaking: a CDC table put back into `tables:` is refused until it is re-baselined.**
   Applies to `mode: cdc` exports with `cdc.initial: snapshot` or `backfill:`, on every engine.
