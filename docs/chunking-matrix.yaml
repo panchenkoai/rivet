@@ -102,7 +102,7 @@ scenarios:
     mysql:    { test: mysql_chunked_crash_after_chunk_file_before_commit_resume_reruns_chunk_atleastonce }
     mssql:    { test: mssql_chunked_crash_after_chunk_file_before_commit_resume_reruns_chunk_atleastonce }
     mongo:    { test: mongo_crash_after_file_write_recovers_without_loss }
-    oracle:   { gap: "no Oracle range chunk crash/resume live test" }
+    oracle:   { test: every_chunked_range_runner_hook_loses_nothing_on_oracle }
 
   # ── other strategies ──────────────────────────────────────────────────────
   - id: chunk_count_n

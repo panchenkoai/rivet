@@ -123,7 +123,8 @@ const MATRICES: &[(&str, usize)] = &[
     // Raised 0 -> 14 (2026-09-26): the Oracle column's honest gaps (batch-only phase 1).
     // Lowered 14 -> 12 (2026-09-26): Oracle init keyset scaffold + chunk_by_days proven live.
     // Lowered 12 -> 11 (2026-09-26): the `dense_chunk_dense` row went with `chunk_dense` (its Oracle gap too).
-    ("docs/chunking-matrix.yaml", 11),
+    // Lowered 11 -> 10 (2026-10-08): the Oracle range crash/resume row cites every_chunked_range_runner_hook_loses_nothing_on_oracle.
+    ("docs/chunking-matrix.yaml", 10),
     // Export-STRATEGY flag × engine, verified on GOLDEN fixtures + a distilled
     // GARBAGE profile (anonymized shape of a 200+-table field DB). Two layers:
     // the offline scaffold_strategy oracle (all shapes) + the live chunking_stand
@@ -166,7 +167,8 @@ const MATRICES: &[(&str, usize)] = &[
     // batch-clobber filled with a live test; crash-after-source-read is na (that
     // hook is single.rs-only, and Mongo runs the keyset path).
     // Raised 0 -> 10 (2026-09-26): the Oracle column's honest gaps (batch-only phase 1).
-    ("docs/resilience-matrix.yaml", 10),
+    // Lowered 10 -> 5 (2026-10-08): five Oracle crash rows cite the every_*_runner_hook_loses_nothing_on_oracle cells that already crash at their hooks.
+    ("docs/resilience-matrix.yaml", 5),
     // Warehouse-load — the resolver + Parquet→warehouse-AUTOLOAD axis, keyed on the 4
     // ExportTarget variants, not source engines. Caught + fixed 3 resolver bugs
     // (SF/DuckDB/CH decimal ceilings). 0 gaps on THAT axis; most cells are offline
