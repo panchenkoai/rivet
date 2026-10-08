@@ -96,6 +96,14 @@ scenarios:
     mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only; any other mode is refused when the config is read (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no range-chunk run to fail at its second chunk or to resume" }
     oracle:   { test: a_resume_that_never_connected_leaves_the_unfinished_run_as_it_was_oracle }
 
+  - id: forced_resume_beside
+    what: "RESULTS 12, the refusal's own words: `--resume --force` over a complete prefix runs as a plain run does (the table again, or on MongoDB `resume` the delta past the stored `_id`), the old parts stay byte for byte, and manifest.json names only the new ones"
+    postgres: { test: a_forced_resume_over_a_complete_prefix_lands_beside_it_postgres }
+    mysql:    { test: a_forced_resume_over_a_complete_prefix_lands_beside_it_mysql }
+    mssql:    { test: a_forced_resume_over_a_complete_prefix_lands_beside_it_mssql }
+    mongo:    { test: a_forced_resume_over_a_complete_prefix_lands_beside_it_mongo }
+    oracle:   { test: a_forced_resume_over_a_complete_prefix_lands_beside_it_oracle }
+
   - id: forced_resume_over_a_marker
     what: "docs/cloud-destinations.md, Resume: over a prefix that holds `_SUCCESS`, a `--resume --force` that never connected leaves the marker and manifest byte for byte; one that wrote a part and then failed withdraws the marker and leaves a failed manifest"
     postgres: { test: a_forced_resume_keeps_the_marker_until_it_writes_postgres }

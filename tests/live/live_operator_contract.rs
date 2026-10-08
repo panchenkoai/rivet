@@ -683,7 +683,7 @@ fn wave_retry_sql(engine: SqlEngine) {
 
 const ALREADY_COMPLETE: Refused = Refused::by_code("RIVET_DEST_ALREADY_COMPLETE", 5);
 
-/// RESULTS 12: `--resume` over a complete prefix is refused by code; `--resume --force` then runs as a plain run does, as the refusal says (what it leaves beside the complete export is pinned by live_resume::chunked_resume_force_overrides_success_gate), and `state reset-chunks` leaves the refusal.
+/// RESULTS 12: `--resume` over a complete prefix is refused by code; `--resume --force` then runs as a plain run does, as the refusal says (what it leaves beside the complete export is [`forced_resume_beside`]), and `state reset-chunks` leaves the refusal.
 fn resume_force(engine: SqlEngine) {
     let (table, _guard) = range_table(engine, "oc_resume", ROWS);
     resume_force_on(range_checkpoint_rig(engine, &table));
@@ -708,6 +708,55 @@ fn resume_force_on(mut rig: Rig) {
             ),
         ],
     );
+}
+
+/// What the refusal says of `--resume --force` over a complete prefix: it runs as a plain run does (`rerun_rows` rows: the table again, or the delta past a continued key), the old parts stay byte for byte, and manifest.json names only the new ones.
+fn forced_resume_beside(rig: Rig, rerun_rows: i64) {
+    rig.run_ok();
+    let store = Store::Local(rig.out_dir());
+    let complete = store.files();
+    let forced = rig.run_args(&["--resume", "--force"]);
+    assert!(forced.status.success(), "{}", text(&forced));
+    let after = store.files();
+    let part = |k: &str| k.ends_with(".parquet");
+    assert!(
+        complete
+            .iter()
+            .filter(|(k, _)| part(k))
+            .all(|(k, v)| after.get(k) == Some(v)),
+        "`--resume --force` rewrote or removed a part of the complete export, which the refusal says it does not: {:?}",
+        changed(&complete, &after)
+    );
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&after["manifest.json"]).expect("a JSON manifest");
+    let named: Vec<&str> = manifest["parts"]
+        .as_array()
+        .expect("a manifest lists its parts")
+        .iter()
+        .filter_map(|p| p["path"].as_str())
+        .collect();
+    assert_eq!(
+        (
+            marker_and_manifest(&after).as_str(),
+            &manifest["row_count"],
+            named.iter().filter(|p| complete.contains_key(**p)).count()
+        ),
+        (
+            "`_SUCCESS` kept, manifest.json `success`",
+            &serde_json::json!(rerun_rows),
+            0
+        ),
+        "manifest.json describes only the new run, as the refusal says: {named:?}"
+    );
+    assert!(
+        named.iter().all(|p| after.contains_key(*p)) && named.is_empty() == (rerun_rows == 0),
+        "the new run's parts are beside the complete export: {named:?}"
+    );
+}
+
+fn forced_resume_beside_sql(engine: SqlEngine) {
+    let (table, _guard) = range_table(engine, "oc_beside", ROWS);
+    forced_resume_beside(range_checkpoint_rig(engine, &table), ROWS);
 }
 
 const CHECKPOINT_UNCODED: &str = "a corrupt CDC checkpoint is refused with exit 1 and no code; the registry has RIVET_SOURCE_CDC_CHECKPOINT_INVALID (5), pinned by the *_is_refused_by_code_* cells";
@@ -1862,6 +1911,43 @@ fn a_wave_retry_reruns_the_export_whose_last_run_never_connected_oracle() {
 fn a_wave_retry_reruns_the_export_whose_last_run_never_connected_mongo() {
     let (url, _m, _guard) = mongo_db("oc_retry", 20);
     wave_retry_after_never_connected(Rig::mongo_batch("t").source_url(&url), &url, || {});
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_forced_resume_over_a_complete_prefix_lands_beside_it_postgres() {
+    forced_resume_beside_sql(SqlEngine::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn a_forced_resume_over_a_complete_prefix_lands_beside_it_mysql() {
+    forced_resume_beside_sql(SqlEngine::Mysql);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn a_forced_resume_over_a_complete_prefix_lands_beside_it_mssql() {
+    forced_resume_beside_sql(SqlEngine::Mssql);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn a_forced_resume_over_a_complete_prefix_lands_beside_it_oracle() {
+    forced_resume_beside_sql(SqlEngine::Oracle);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mongo"]
+fn a_forced_resume_over_a_complete_prefix_lands_beside_it_mongo() {
+    let (url, _m, _guard) = mongo_db("oc_beside", ROWS);
+    forced_resume_beside(
+        Rig::mongo_batch("t")
+            .source_url(&url)
+            .mongo("page_size: 10, resume: true"),
+        0,
+    );
 }
 
 #[test]

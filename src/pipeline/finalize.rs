@@ -259,9 +259,9 @@ pub(super) fn finalize_run_report(config_path: &str, summary: &RunSummary, kind:
 ///
 /// The parts are still durable, which is exactly why this must be loud. Nothing
 /// about the failure is visible in the data; it is visible only here.
-/// Whether a run that did not succeed has no part at the destination: none committed or adopted, none `landed`.
+/// Whether a run that did not succeed put no part of its own at the destination (`landed`); the parts it adopted from the run it resumes were that run's writes.
 pub(super) fn run_put_nothing_at_the_destination(summary: &RunSummary, landed: u64) -> bool {
-    summary.status != "success" && summary.manifest_parts.is_empty() && landed == 0
+    summary.status != "success" && landed == 0
 }
 
 /// What the end of a run did to its prefix: why it is not consumable (`gap`), and whether the run wrote nothing there at all.
@@ -1665,15 +1665,15 @@ mod tests {
         for status in ["skipped", "failed", "interrupted"] {
             assert!(
                 run_put_nothing_at_the_destination(&bare(status), 0),
-                "a {status} run with no part writes no manifest"
+                "a {status} run wrote no part"
             );
             assert!(
-                !run_put_nothing_at_the_destination(&with_part(status), 0),
-                "a {status} run that committed or adopted parts must still describe them"
+                run_put_nothing_at_the_destination(&with_part(status), 0),
+                "a {status} run that only adopted the parts of the run it resumes wrote none"
             );
             assert!(
                 !run_put_nothing_at_the_destination(&bare(status), 1),
-                "a {status} run whose part landed in no manifest withdraws the marker"
+                "a {status} run whose part landed, in a manifest or not, wrote"
             );
         }
         assert!(
@@ -1744,6 +1744,13 @@ mod tests {
             "an untouched prefix is not a manifest gap"
         );
         assert_eq!(before("_SUCCESS"), marker);
+        assert_eq!(before("manifest.json"), manifest);
+        let mut resumed = fin_summary(&plan, "failed");
+        resumed.run_id = "finrun3".into();
+        assert!(
+            finalize_manifest(&plan, "e", &state, &resumed, "export").left_alone,
+            "a resume that adopted parts and wrote none of its own leaves the record too"
+        );
         assert_eq!(before("manifest.json"), manifest);
         assert!(
             !dir.path().join("manifest-finrun2.json").exists(),

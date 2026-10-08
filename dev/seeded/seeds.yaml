@@ -654,15 +654,15 @@ seeds:
       lib:
         cells: ["lib:a_forced_resume_with_nothing_to_continue_exports_again"]
       postgres:
-        cells: [resume_force_runs_over_a_complete_prefix_postgres]
+        cells: [a_forced_resume_over_a_complete_prefix_lands_beside_it_postgres]
       mysql:
-        cells: [resume_force_runs_over_a_complete_prefix_mysql]
+        cells: [a_forced_resume_over_a_complete_prefix_lands_beside_it_mysql]
       mssql:
-        cells: [resume_force_runs_over_a_complete_prefix_mssql]
+        cells: [a_forced_resume_over_a_complete_prefix_lands_beside_it_mssql]
       mongo:
         na: "the patch removes the chunk runner's run-as-a-plain-run arm (crashed_chunk_run_action); a MongoDB export is never range-chunked, and its `--resume --force` goes past the gate without that arm"
       oracle:
-        cells: [resume_force_runs_over_a_complete_prefix_oracle]
+        cells: [a_forced_resume_over_a_complete_prefix_lands_beside_it_oracle]
 
   - name: unwritable-state-run-exports
     class: a run whose state store does not take its first write (the run-status row) exports anyway
