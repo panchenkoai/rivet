@@ -76,7 +76,7 @@ fn pg_cursor_round_trip() {
     let got2 = s.get("pg_orders", "").unwrap();
     assert_eq!(got2.last_cursor_value.as_deref(), Some("2024-07-01"));
 
-    s.reset("pg_orders").unwrap();
+    s.reset("pg_orders", "").unwrap();
     let empty = s.get("pg_orders", "").unwrap();
     assert!(empty.last_cursor_value.is_none());
 }
@@ -114,7 +114,7 @@ fn pg_keyset_range_round_trips_and_commits() {
         .commit_keyset_range(
             "run-1",
             export,
-            1,
+            (1, Some("k9")),
             &[KeysetRangePart {
                 file_name: "pk_w1_0.parquet".to_string(),
                 rows: 7,

@@ -1,0 +1,13 @@
+diff --git a/src/pipeline/keyset.rs b/src/pipeline/keyset.rs
+index 40c7b15a..42a82419 100644
+--- a/src/pipeline/keyset.rs
++++ b/src/pipeline/keyset.rs
+@@ -239,7 +239,7 @@ fn seeded_range_max(total: usize, committed: Vec<(usize, Option<String>)>) -> Ve
+     let mut max = vec![None; total];
+     for (idx, key) in committed {
+         if let Some(slot) = max.get_mut(idx) {
+-            *slot = key;
++            *slot = key.filter(|_| false);
+         }
+     }
+     max
