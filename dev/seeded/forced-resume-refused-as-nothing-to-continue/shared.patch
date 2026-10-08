@@ -1,0 +1,12 @@
+diff --git a/src/pipeline/chunked/mod.rs b/src/pipeline/chunked/mod.rs
+--- a/src/pipeline/chunked/mod.rs
++++ b/src/pipeline/chunked/mod.rs
+@@ -285,7 +285,7 @@
+ ) -> CrashedChunkRun {
+     match (explicit_resume, crashed_run) {
+         (false, true) => CrashedChunkRun::Resume,
+-        (true, false) if force => CrashedChunkRun::ExportAgain,
++        (true, false) if force && false => CrashedChunkRun::ExportAgain,
+         _ => CrashedChunkRun::Nothing,
+     }
+ }

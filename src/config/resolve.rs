@@ -21,21 +21,8 @@ pub fn resolve_vars(
     input: &str,
     params: Option<&std::collections::HashMap<String, String>>,
 ) -> crate::error::Result<String> {
-    let mut result = input.to_string();
-    let mut search_from = 0;
-    while let Some(rel_start) = result[search_from..].find("${") {
-        let start = search_from + rel_start;
-        let Some(rel_end) = result[start..].find('}') else {
-            break;
-        };
-        let end = start + rel_end;
-        let var_name = &result[start + 2..end];
-
-        let value = if var_name.is_empty() {
-            // Preserve legacy behavior: `${}` expands to the empty string. No secret
-            // is involved, so there's nothing to protect against.
-            String::new()
-        } else if let Some(v) = params.and_then(|p| p.get(var_name)) {
+    substitute(input, |var_name| {
+        let value = if let Some(v) = params.and_then(|p| p.get(var_name)) {
             v.clone()
         } else {
             match std::env::var(var_name) {
@@ -66,11 +53,53 @@ pub fn resolve_vars(
                  (check the parameter/environment source)"
             );
         }
+        Ok(value)
+    })
+}
 
+/// `input` with every `${name}` replaced by `value_of(name)`, the one scan of the placeholder grammar: `${}` becomes the empty string, an unclosed `${` ends the scan, and a value is never scanned again.
+fn substitute(
+    input: &str,
+    mut value_of: impl FnMut(&str) -> crate::error::Result<String>,
+) -> crate::error::Result<String> {
+    let mut result = input.to_string();
+    let mut search_from = 0;
+    while let Some(rel_start) = result[search_from..].find("${") {
+        let start = search_from + rel_start;
+        let Some(rel_end) = result[start..].find('}') else {
+            break;
+        };
+        let end = start + rel_end;
+        let var_name = &result[start + 2..end];
+        let value = if var_name.is_empty() {
+            String::new()
+        } else {
+            value_of(var_name)?
+        };
         result = format!("{}{}{}", &result[..start], value, &result[end + 1..]);
         search_from = start + value.len();
     }
     Ok(result)
+}
+
+/// The marks that stand for the `${` and the `}` of a placeholder in [`masked`] text.
+const MASK: (char, char) = ('\u{E000}', '\u{E001}');
+
+/// `input` with every `${name}` held between two private-use marks: a brace ends a plain YAML scalar inside a flow collection, so the unresolved document is parsed masked.
+pub(super) fn masked(input: &str) -> String {
+    substitute(input, |name| Ok(format!("{}{name}{}", MASK.0, MASK.1))).unwrap_or_default()
+}
+
+/// A value read from a [`masked`] document, its placeholders spelled `${name}` again.
+pub(super) fn unmasked(value: &str) -> String {
+    value.replace(MASK.0, "${").replace(MASK.1, "}")
+}
+
+/// The text of `template` around its `${name}` placeholders, in order; `None` when it holds none.
+pub(crate) fn literal_parts(template: &str) -> Option<Vec<String>> {
+    let cut = substitute(template, |_| Ok(MASK.0.to_string())).ok()?;
+    let parts = cut.split(MASK.0).map(str::to_string);
+    cut.contains(MASK.0).then(|| parts.collect())
 }
 
 /// Convenience wrapper: resolve `${VAR}` from environment only.
@@ -295,6 +324,33 @@ mod tests {
     fn empty_placeholder_expands_to_empty_string() {
         let result = resolve_vars("pre${}post", None).unwrap();
         assert_eq!(result, "prepost");
+    }
+
+    /// A masked document keeps every placeholder, names it again when unmasked, and holds no brace a flow collection would end a scalar at.
+    #[test]
+    fn a_masked_placeholder_holds_no_brace_and_is_spelled_again_when_unmasked() {
+        let written = "q: [${A}, 'x ${B} y'] ${UNCLOSED";
+        let hidden = masked(written);
+        assert_eq!(
+            hidden,
+            "q: [\u{E000}A\u{E001}, 'x \u{E000}B\u{E001} y'] ${UNCLOSED"
+        );
+        assert_eq!(unmasked(&hidden), written);
+        assert_eq!(masked("pre${}post"), "prepost");
+        assert_eq!(unmasked("plain"), "plain");
+    }
+
+    #[test]
+    fn literal_parts_are_the_text_around_each_placeholder() {
+        let parts = |t: &str| literal_parts(t);
+        let own = |p: &[&str]| Some(p.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(
+            parts("where a = ${x} and b = '${y}'"),
+            own(&["where a = ", " and b = '", "'"])
+        );
+        assert_eq!(parts("${x}"), own(&["", ""]));
+        assert_eq!(parts("where a = 1"), None);
+        assert_eq!(parts("pre${}post ${UNCLOSED"), None);
     }
 
     // ── resolve_vars — unclosed placeholder ─────────────────────────────────

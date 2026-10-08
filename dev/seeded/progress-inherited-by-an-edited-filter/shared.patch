@@ -1,0 +1,12 @@
+diff --git a/src/state/cursor.rs b/src/state/cursor.rs
+--- a/src/state/cursor.rs
++++ b/src/state/cursor.rs
+@@ -96,7 +96,7 @@
+         let rows = |population: &str| format!("{now} ({population})");
+         self.population
+             .as_ref()
+-            .filter(|was| !key.population.is_empty() && !same_rows(was, &key.population))
++            .filter(|was| key.population.is_empty() && !same_rows(was, &key.population))
+             .map(|was| (rows(was), rows(&key.population)))
+     }
+ }

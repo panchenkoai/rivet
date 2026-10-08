@@ -1,0 +1,12 @@
+diff --git a/src/plan/contract.rs b/src/plan/contract.rs
+--- a/src/plan/contract.rs
++++ b/src/plan/contract.rs
+@@ -257,7 +257,7 @@
+             stream: self.stream(),
+             schema: self.source.search_path(),
+             population: crate::sql::row_set(
+-                self.query_template.as_deref().unwrap_or(&self.base_query),
++                &self.base_query,
+             ),
+             column: self.strategy.cursor_identity(),
+             mode: self.strategy.mode_label(),

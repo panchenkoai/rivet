@@ -79,6 +79,9 @@ pub struct ResolvedRunPlan {
     /// deserialized plan starts a fresh one.
     #[serde(skip, default)]
     pub bytes_read: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Run-wide count of parts this run put at the destination, bumped at the one write seam (`commit::write_part_file`); runtime only, like `bytes_read`.
+    #[serde(skip, default)]
+    pub parts_landed: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// The export's declared source table (`table:`), carried VERBATIM.
     ///
     /// The manifest's source identity is built from this. It used to be derived
@@ -94,6 +97,9 @@ pub struct ResolvedRunPlan {
     pub source_table: Option<String>,
     /// Final query string (params substituted, query_file loaded).
     pub base_query: String,
+    /// `base_query` before `${...}` substitution, when the two differ: the rows part of the progress identity is read from it, so a value that changes between runs is not an edit. Absent from a plan with no placeholder and from one sealed before this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_template: Option<String>,
     /// This plan is one range sub-export UNIT of a `--pool --split` (#167). Such
     /// a unit shares its destination prefix with its N-1 siblings, so it must NOT
     /// write the prefix-level `_SUCCESS` itself (that would falsely mark the whole
@@ -252,6 +258,10 @@ impl ResolvedRunPlan {
             export_name: self.export_name.clone(),
             source: self.source.state_key(),
             stream: self.stream(),
+            schema: self.source.search_path(),
+            population: crate::sql::row_set(
+                self.query_template.as_deref().unwrap_or(&self.base_query),
+            ),
             column: self.strategy.cursor_identity(),
             mode: self.strategy.mode_label(),
             continues_high_water: self.strategy.continues_stored_cursor(),

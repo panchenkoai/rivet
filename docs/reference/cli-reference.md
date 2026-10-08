@@ -14,6 +14,7 @@ This document contains the help content for the `rivet` command-line program.
 * [`rivet state`↴](#rivet-state)
 * [`rivet state show`↴](#rivet-state-show)
 * [`rivet state reset`↴](#rivet-state-reset)
+* [`rivet state accept`↴](#rivet-state-accept)
 * [`rivet state files`↴](#rivet-state-files)
 * [`rivet state reset-chunks`↴](#rivet-state-reset-chunks)
 * [`rivet state chunks`↴](#rivet-state-chunks)
@@ -91,7 +92,7 @@ Run export jobs defined in config
 * `--resume` — Resume a chunked export with `chunk_checkpoint: true` (same query/chunk_column/chunk_size)
 * `--force` — Override safety gates that would otherwise refuse the run.
 
-   Today: with `--resume`, allows starting against a destination prefix whose `_SUCCESS` marker is already present.  Without `--force`, resume against an already-complete run refuses, so an operator cannot accidentally re-export over a verified dataset.
+   Today: with `--resume`, goes past the refusal to resume into a destination prefix whose `_SUCCESS` marker is already present (`RIVET_DEST_ALREADY_COMPLETE`): the run continues an interrupted run of the export if there is one, else it runs as a plain run does. New parts land beside the old ones; nothing is overwritten.
 * `--parallel-exports` — Run the config's exports concurrently, at most 16 at once (needs 2+ exports); a CDC export run alone also takes its pending baseline snapshots at most 16 at once
 * `--parallel-export-processes` — Run each export as a separate `rivet` child process (parallel; true per-export peak RSS; more overhead than threads)
 * `--summary-output <PATH>` — Write the run aggregate summary as JSON to this file (in addition to .rivet_state.db)
@@ -207,6 +208,7 @@ Manage export state
 
 * `show` — Show current state for all exports
 * `reset` — Reset state for an export
+* `accept` — Keep the stored progress of an export whose query or source was edited on purpose
 * `files` — Show file manifest (files produced by exports)
 * `reset-chunks` — Clear persisted chunk checkpoint rows (`chunk_run` / `chunk_task`)
 * `chunks` — Show chunk checkpoint status for an export
@@ -241,6 +243,20 @@ Reset state for an export
 
 * `-c`, `--config <CONFIG>`
 * `-e`, `--export <EXPORT>` — Export name to reset
+
+
+
+## `rivet state accept`
+
+Keep the stored progress of an export whose query or source was edited on purpose
+
+**Usage:** `rivet state accept [OPTIONS] --config <CONFIG> --export <EXPORT>`
+
+###### **Options:**
+
+* `-c`, `--config <CONFIG>`
+* `-e`, `--export <EXPORT>` — Export whose stored progress is kept under what it reads now
+* `-p`, `--param <KEY=VALUE>` — Query parameter: key=value (repeatable), as passed to `rivet run`
 
 
 
@@ -463,7 +479,7 @@ Execute a sealed plan artifact, or run a config's exports wave-by-wave
 ###### **Options:**
 
 * `--parallel-export-processes` — Run the cheap (low-cost) exports within each wave concurrently, as separate processes (same as `parallel_export_processes: true` in the config). Config-wave mode only; heavier exports — which already chunk-parallelize internally — still run one at a time
-* `--resume` — Config-wave mode: skip exports a prior run already completed (`_SUCCESS` present) and resume incomplete chunked exports from their checkpoints, so a re-run after a partial failure does not redo finished tables. Independent tables are never re-exported
+* `--resume` — Config-wave mode: skip exports a prior run already completed (`_SUCCESS` present, last journaled run not failed) and resume incomplete chunked exports from their checkpoints, so a re-run after a partial failure does not redo finished tables. Independent tables are never re-exported
 * `--force` — Override whichever safety gate refuses the run: in JSON-artifact mode the plan staleness check (> 24 h) and the incremental cursor-drift check (each bypass is recorded in the run's `apply_context`); in YAML config mode, with `--resume`, the refusal to resume into a prefix whose `_SUCCESS` marker is already present
 * `--pool <N>` — Run the whole config as ONE bounded work-stealing pool of N export slots (config mode only, #166): exports start longest-first (LPT, by each export's last measured duration) and every freeing slot pulls the next — no wave barriers, so the wall approaches `max(longest, total/N)`. Priority `wave:` tiers are NOT honored (makespan mode); exports that are not `parallel_safe` never run concurrently with EACH OTHER (one heavy at a time; cheap exports backfill the remaining slots)
 * `--split` — With `--pool`: when ONE export dominates the pool floor (its predicted duration ≫ the next-longest, #167), split it into N range sub-exports over its key span — separate scheduler units the pool places concurrently, so the giant stops being the makespan floor. The units share one destination prefix and fold to one family, so the load view reads them as a single logical table. Only full/chunked/keyset exports with a `chunk_by_key:`/`chunk_column:` are split (never incremental/CDC). Off by default; ignored without `--pool`
