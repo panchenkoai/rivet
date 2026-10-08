@@ -548,6 +548,11 @@ pub mod codes {
         "RIVET_PLAN_SOURCE_UNREADABLE",
         "fix what the message names (the connection, the credentials, or the table the export reads), then run `rivet plan` again",
     );
+    /// A preflight met a MongoDB collection the database does not list.
+    pub const SOURCE_COLLECTION_NOT_FOUND: Code = environment(
+        "RIVET_SOURCE_COLLECTION_NOT_FOUND",
+        "correct the export's `table:` (a dotted collection name is written whole), or create the collection",
+    );
     /// The bucket or container a cloud destination names does not exist.
     pub const DEST_CONTAINER_NOT_FOUND: Code = environment(
         "RIVET_DEST_CONTAINER_NOT_FOUND",
@@ -621,6 +626,7 @@ pub mod codes {
         STATE_RUN_IN_PROGRESS,
         STATE_CHUNK_CHECKPOINT_GONE,
         PLAN_SOURCE_UNREADABLE,
+        SOURCE_COLLECTION_NOT_FOUND,
         DEST_CONTAINER_NOT_FOUND,
         LOAD_VALUE_OUT_OF_TARGET_RANGE,
         LOAD_COUNT_MISMATCH,

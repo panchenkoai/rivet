@@ -1583,6 +1583,10 @@ fn check_refuses_a_collection_that_does_not_exist_as_run_does_mongo() {
         "`check` is not green over a collection `run` refuses\n{}",
         text(&check)
     );
+    assert_refused(
+        &check,
+        Refused::by_code("RIVET_SOURCE_COLLECTION_NOT_FOUND", 1),
+    );
     assert!(
         !run.status.success() && text(&run).contains(refusal),
         "fixture: `run` refuses the absent collection\n{}",

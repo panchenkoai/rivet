@@ -37,8 +37,9 @@
     resolved `chunk_size` under `chunk_size_memory_mb`. The verdict, warnings and
     recommendations are computed for the same resolved plan. `rivet plan` records its
     diagnostics for the resolved plan as well.
-  - On MongoDB, `rivet check` now fails on a collection that does not exist, with the refusal
-    `rivet run` gives; before it printed `Looks good` and exited 0.
+  - On MongoDB, `rivet check` now fails on a collection that does not exist
+    (`RIVET_SOURCE_COLLECTION_NOT_FOUND`, exit 1), with the refusal `rivet run` gives; before
+    it printed `Looks good` and exited 0.
   - Exit codes of `rivet check` are otherwise unchanged; a tool that parses the `strategy` or
     `mode` field sees the new values for the exports above.
 - **Breaking: a CDC table put back into `tables:` is refused until it is re-baselined.**

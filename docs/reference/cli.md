@@ -476,7 +476,7 @@ rivet repair -c my_export.yaml -e orders --report reconcile.json --execute
 
 Preflight analysis: diagnose source health, estimate row counts, check indexes, recommend tuning. With `--type-report`, also introspects column types and validates them against a target warehouse.
 
-The `Strategy:` and `Mode:` lines (and `strategy` / `mode` under `--json`) describe the plan `rivet run` builds for the export, from the same planner: the chunk column it resolved from the primary key, and `full-scan` for a `mode: chunked` export whose table fits one chunk, which runs as one unchunked pass. On MongoDB, `check` fails on a collection that does not exist, as `run` does.
+The `Strategy:` and `Mode:` lines (and `strategy` / `mode` under `--json`) describe the plan `rivet run` builds for the export, from the same planner: the chunk column it resolved from the primary key, and `full-scan` for a `mode: chunked` export whose table fits one chunk, which runs as one unchunked pass. On MongoDB, `check` fails on a collection that does not exist (`RIVET_SOURCE_COLLECTION_NOT_FOUND`, exit 1), as `run` does.
 
 ```bash
 rivet check --config <PATH> [OPTIONS]

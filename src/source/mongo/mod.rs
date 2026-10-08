@@ -192,7 +192,12 @@ impl MongoSession {
                 .into_future(),
         );
         match missing_collection_refusal(self.db(), collection, listed.ok()) {
-            Some(refusal) => anyhow::bail!("{refusal}"),
+            Some(refusal) => {
+                crate::rivet_bail!(
+                    crate::error::codes::SOURCE_COLLECTION_NOT_FOUND,
+                    "{refusal}"
+                )
+            }
             None => Ok(()),
         }
     }

@@ -81,7 +81,7 @@ scenarios:
     oracle:   { test: plan_refuses_a_password_the_source_rejects_oracle }
 
   - id: check_refuses_what_run_refuses_missing_collection
-    what: "`check` is not green over a MongoDB collection that does not exist, which `run` refuses"
+    what: "`check` fails as RIVET_SOURCE_COLLECTION_NOT_FOUND (exit 1) over a MongoDB collection that does not exist, which `run` refuses"
     postgres: { na: "a missing SQL table already failed `check` (the preflight's schema error); the absent-collection guard is MongoDB's" }
     mysql:    { na: "a missing SQL table already failed `check` (the preflight's schema error); the absent-collection guard is MongoDB's" }
     mssql:    { na: "a missing SQL table already failed `check` (the preflight's schema error); the absent-collection guard is MongoDB's" }
