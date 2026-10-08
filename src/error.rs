@@ -543,6 +543,16 @@ pub mod codes {
         "RIVET_SOURCE_OVERRIDE_WIRE_MISMATCH",
         "remove or correct the column's `columns:` override (batch: or CAST the column to that type in the export's `query:`; CDC: then re-snapshot the table)",
     );
+    /// `rivet plan` could not read the source it plans over (no connection, a refused login, a missing table or collection).
+    pub const PLAN_SOURCE_UNREADABLE: Code = environment(
+        "RIVET_PLAN_SOURCE_UNREADABLE",
+        "fix what the message names (the connection, the credentials, or the table the export reads), then run `rivet plan` again",
+    );
+    /// The bucket or container a cloud destination names does not exist.
+    pub const DEST_CONTAINER_NOT_FOUND: Code = environment(
+        "RIVET_DEST_CONTAINER_NOT_FOUND",
+        "create the bucket or container, or correct `destination.bucket`",
+    );
     pub const LOAD_VALUE_OUT_OF_TARGET_RANGE: Code = refusal(
         "RIVET_LOAD_VALUE_OUT_OF_TARGET_RANGE",
         "the warehouse type cannot hold this value; declare a wider type (e.g. String) for the column, or fix the source value",
@@ -610,6 +620,8 @@ pub mod codes {
         STATE_KEYSET_SEQUENTIAL_ANCHOR_UNFINISHED,
         STATE_RUN_IN_PROGRESS,
         STATE_CHUNK_CHECKPOINT_GONE,
+        PLAN_SOURCE_UNREADABLE,
+        DEST_CONTAINER_NOT_FOUND,
         LOAD_VALUE_OUT_OF_TARGET_RANGE,
         LOAD_COUNT_MISMATCH,
         LOAD_ADOPTION_COLUMN_MISMATCH,

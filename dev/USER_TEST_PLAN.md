@@ -549,13 +549,13 @@ rivet apply /tmp/plan_incr.json
 
 ---
 
-### V7 — `rivet plan` when DB is unreachable (graceful degradation)
+### V7 — `rivet plan` when DB is unreachable (no plan is written)
 
 Stop the database, then run plan.
 
 | ID | Step | Expected | Actual | Pass |
 |----|------|----------|--------|------|
-| V7 | Plan degrades gracefully | Plan artifact still written (or summary printed) with `diagnostics.verdict = "unknown (preflight failed)"` and a warning | | [ ] |
+| V7 | Plan refuses an unreadable source | `Error: [RIVET_PLAN_SOURCE_UNREADABLE] ...` naming the cause, exit 2 (exit 1 for a missing table or a rejected login), and no plan file | | [ ] |
 
 ---
 

@@ -335,6 +335,37 @@ pub(crate) fn unplannable_exports(exports: &[&ExportConfig]) -> Vec<String> {
         .collect()
 }
 
+/// The strategy the planner resolved for each batch export whose plan built, by export name.
+pub type PlannedStrategies = std::collections::HashMap<String, crate::plan::ExtractionStrategy>;
+
+/// Each export as the planner resolved it; one with no built plan (a CDC stream, a refused config) stays as configured.
+fn exports_as_planned(
+    exports: &[&ExportConfig],
+    strategies: &PlannedStrategies,
+) -> Vec<ExportConfig> {
+    exports
+        .iter()
+        .map(|e| match strategies.get(&e.name) {
+            Some(strategy) => crate::plan::build::export_as_planned(e, strategy),
+            None => (*e).clone(),
+        })
+        .collect()
+}
+
+/// The `Mode:` line of a `mode: chunked` export the planner runs as one unchunked pass; `None` for any other.
+fn one_pass_note(
+    export: &ExportConfig,
+    strategy: Option<&crate::plan::ExtractionStrategy>,
+) -> Option<String> {
+    let downgraded = export.mode == crate::config::ExportMode::Chunked
+        && matches!(strategy, Some(crate::plan::ExtractionStrategy::Snapshot));
+    downgraded.then(|| {
+        "full (`mode: chunked` runs as one pass: the table's row estimate fits one chunk)"
+            .to_string()
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn check(
     config_path: &str,
     export_name: Option<&str>,
@@ -343,6 +374,7 @@ pub fn check(
     strict: bool,
     json_output: bool,
     target: Option<ExportTarget>,
+    strategies: &PlannedStrategies,
 ) -> Result<bool> {
     let config = Config::load_with_params(config_path, params)?;
 
@@ -397,24 +429,33 @@ pub fn check(
     // each export's type-report JSON object below (see the `if show_type_report`
     // block). `get_export_diagnostic` already proved the diag is computable
     // without printing; this is the multi-export variant of that path.
+    let planned = exports_as_planned(&exports, strategies);
+    let described: Vec<&ExportConfig> = planned.iter().collect();
     let diagnostics: Vec<ExportDiagnostic> = match config.source.source_type {
-        SourceType::Postgres => postgres::check_postgres(&url, tls, &exports)?,
-        SourceType::Mysql => mysql::check_mysql(&url, tls, &exports)?,
-        SourceType::Mssql => mssql::check_mssql(&url, tls, &exports)?,
+        SourceType::Postgres => postgres::check_postgres(&url, tls, &described)?,
+        SourceType::Mysql => mysql::check_mysql(&url, tls, &described)?,
+        SourceType::Mssql => mssql::check_mssql(&url, tls, &described)?,
         #[cfg(feature = "oracle")]
-        SourceType::Oracle => oracle::check_oracle(&url, tls, &exports)?,
+        SourceType::Oracle => oracle::check_oracle(&url, tls, &described)?,
         #[cfg(not(feature = "oracle"))]
         SourceType::Oracle => return Err(crate::source::oracle_feature_missing()),
-        SourceType::Mongo => mongo::check_mongo(&url, tls, &exports, config.source.mongo.as_ref())?,
+        SourceType::Mongo => {
+            mongo::check_mongo(&url, tls, &described, config.source.mongo.as_ref())?
+        }
     };
     // #149: measured beats declared — overlay the state store's actuals and
     // label every row figure with its source. Best-effort (no state = catalog).
     let mut diagnostics = diagnostics;
     if let Ok(state) = crate::state::StateStore::open(config_path) {
         for d in &mut diagnostics {
-            if let Some(e) = exports.iter().find(|e| e.name == d.export_name) {
+            if let Some(e) = described.iter().find(|e| e.name == d.export_name) {
                 analysis::overlay_measured_rows(d, e, config.source.source_type, &state);
             }
+        }
+    }
+    for (d, raw) in diagnostics.iter_mut().zip(&exports) {
+        if let Some(note) = one_pass_note(raw, strategies.get(&raw.name)) {
+            d.mode = note;
         }
     }
     if !json_output {
@@ -2035,5 +2076,44 @@ mod tests {
         .map(|v| v.message)
         .collect();
         assert_eq!(got, vec!["export 'e': m-a", "export 'e' table 't': m-c"]);
+    }
+
+    /// `check` describes each export as the planner resolved it, and says when `mode: chunked` runs as one pass.
+    #[test]
+    fn check_describes_the_export_the_planner_resolved() {
+        use crate::config::ExportMode;
+        use crate::plan::ExtractionStrategy;
+        let mut chunked = crate::config::sample_export("small");
+        chunked.mode = ExportMode::Chunked;
+        chunked.chunk_column = None;
+        let mut unplanned = crate::config::sample_export("stream");
+        unplanned.mode = ExportMode::Chunked;
+        unplanned.chunk_column = Some("id".into());
+        let strategies: super::PlannedStrategies =
+            [("small".to_string(), ExtractionStrategy::Snapshot)].into();
+
+        let planned = super::exports_as_planned(&[&chunked, &unplanned], &strategies);
+        assert_eq!(planned[0].mode, ExportMode::Full);
+        assert_eq!(planned[1].mode, ExportMode::Chunked);
+        assert_eq!(planned[1].chunk_column.as_deref(), Some("id"));
+
+        assert_eq!(
+            super::one_pass_note(&chunked, strategies.get("small")).as_deref(),
+            Some(
+                "full (`mode: chunked` runs as one pass: the table's row estimate fits one chunk)"
+            )
+        );
+        assert_eq!(super::one_pass_note(&unplanned, None), None);
+        let mut full = chunked.clone();
+        full.mode = ExportMode::Full;
+        assert_eq!(super::one_pass_note(&full, strategies.get("small")), None);
+        let keyset = ExtractionStrategy::Keyset(crate::plan::KeysetPlan {
+            key_column: "id".into(),
+            chunk_size: 10,
+            checkpoint: false,
+            incremental: false,
+            parallel: 1,
+        });
+        assert_eq!(super::one_pass_note(&chunked, Some(&keyset)), None);
     }
 }

@@ -33,12 +33,23 @@ pub(super) fn diagnose_export_mongo(
     diagnose_mongo(url, tls, export, mongo)
 }
 
+/// The collection a batch export reads; `None` for a CDC stream, which may capture a collection before its first write.
+fn batch_collection(export: &ExportConfig) -> Option<&str> {
+    export
+        .table
+        .as_deref()
+        .filter(|_| export.mode != crate::config::ExportMode::Cdc)
+}
+
 fn diagnose_mongo(
     url: &str,
     tls: Option<&TlsConfig>,
     export: &ExportConfig,
     mongo: Option<&crate::config::MongoConfig>,
 ) -> Result<ExportDiagnostic> {
+    if let Some(collection) = batch_collection(export) {
+        crate::source::mongo::require_collection(url, tls, collection)?;
+    }
     // Scan-free row estimate via `estimatedDocumentCount` (collection metadata,
     // never a scan) — the Mongo analogue of PG `reltuples`. Resolved from the
     // `table:` shortcut (the only export shape Mongo supports); `None` when the
@@ -101,4 +112,24 @@ fn diagnose_mongo(
         // parity with pg/mysql/mssql. Mongo is full-only, so the overlay always runs.
         db_max_connections,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::batch_collection;
+    use crate::config::ExportMode;
+
+    /// A batch export's collection must exist before it is diagnosed; a CDC stream's may not exist yet.
+    #[test]
+    fn only_a_batch_export_requires_its_collection() {
+        let mut e = crate::config::sample_export("e");
+        e.table = Some("orders".into());
+        e.mode = ExportMode::Full;
+        assert_eq!(batch_collection(&e), Some("orders"));
+        e.mode = ExportMode::Cdc;
+        assert_eq!(batch_collection(&e), None);
+        e.mode = ExportMode::Full;
+        e.table = None;
+        assert_eq!(batch_collection(&e), None);
+    }
 }

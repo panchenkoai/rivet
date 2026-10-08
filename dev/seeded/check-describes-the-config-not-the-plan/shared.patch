@@ -1,0 +1,12 @@
+diff --git a/src/preflight/mod.rs b/src/preflight/mod.rs
+--- a/src/preflight/mod.rs
++++ b/src/preflight/mod.rs
+@@ -346,7 +346,7 @@
+     exports
+         .iter()
+         .map(|e| match strategies.get(&e.name) {
+-            Some(strategy) => crate::plan::build::export_as_planned(e, strategy),
++            Some(_) => (*e).clone(),
+             None => (*e).clone(),
+         })
+         .collect()

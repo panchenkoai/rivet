@@ -145,6 +145,8 @@ Generate a sealed execution plan artifact — no data is exported.
 
 `rivet plan` runs preflight analysis (row estimate, index check, sparsity), computes chunk boundaries for chunked exports, snapshots the current cursor for incremental exports, and writes everything to a `PlanArtifact` JSON file. The artifact can be reviewed, committed, stored as a CI artifact, or passed to `rivet apply`.
 
+`rivet plan` writes a plan only for a source it could read. When the preflight fails (no connection, a login the source rejects, a table or MongoDB collection that does not exist), the command ends with `RIVET_PLAN_SOURCE_UNREADABLE` and writes no plan file for any export: exit 1, or exit 2 when the cause is transient (a dropped or refused connection).
+
 ```bash
 rivet plan --config <PATH> [OPTIONS]
 ```
@@ -352,7 +354,7 @@ By default `validate` resolves the destination prefix the same way `run` does (`
 | `--run-id` | | string | Substitute `{run_id}` in the destination prefix template (composes with `--date`). No run lookup is performed — if the template has no `{run_id}` placeholder this has no effect; use `--prefix` for an arbitrary path |
 | `--prefix` | | string | Point at an explicit destination prefix |
 
-Exits non-zero when the manifest references a part that is missing or whose size does not match, and when the manifest records its last run as anything but `success` (`RIVET_VERIFY_RUN_NOT_SUCCESSFUL`, exit 1: a failed, interrupted or still-running export is not a completed dataset). A legacy prefix (no manifest) falls back to the M6 reduced-guarantee path and is labelled `legacy_run: true`.
+Exits non-zero when the manifest references a part that is missing or whose size does not match, and when the manifest records its last run as anything but `success` (`RIVET_VERIFY_RUN_NOT_SUCCESSFUL`, exit 1: a failed, interrupted or still-running export is not a completed dataset). A legacy prefix (no manifest) falls back to the M6 reduced-guarantee path and is labelled `legacy_run: true`. A bucket or container that does not exist is not a legacy prefix: the export's verdict carries `RIVET_VERIFY_MANIFEST_READ_ERROR` naming the bucket, and `validate` exits 1.
 
 ### Examples
 
@@ -473,6 +475,8 @@ rivet repair -c my_export.yaml -e orders --report reconcile.json --execute
 ## `rivet check`
 
 Preflight analysis: diagnose source health, estimate row counts, check indexes, recommend tuning. With `--type-report`, also introspects column types and validates them against a target warehouse.
+
+The `Strategy:` and `Mode:` lines (and `strategy` / `mode` under `--json`) describe the plan `rivet run` builds for the export, from the same planner: the chunk column it resolved from the primary key, and `full-scan` for a `mode: chunked` export whose table fits one chunk, which runs as one unchunked pass. On MongoDB, `check` fails on a collection that does not exist, as `run` does.
 
 ```bash
 rivet check --config <PATH> [OPTIONS]

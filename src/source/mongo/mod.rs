@@ -181,6 +181,32 @@ fn missing_collection_refusal(
     })
 }
 
+impl MongoSession {
+    /// Refuse a collection the database does not list: reading it would deliver 0 rows.
+    pub(crate) fn require_collection(&self, collection: &str) -> Result<()> {
+        let listed = self.block_on(
+            self.client()
+                .database(self.db())
+                .list_collection_names()
+                .filter(doc! { "name": collection })
+                .into_future(),
+        );
+        match missing_collection_refusal(self.db(), collection, listed.ok()) {
+            Some(refusal) => anyhow::bail!("{refusal}"),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Connect and refuse `collection` when the database does not list it, as `rivet run` does before it reads.
+pub(crate) fn require_collection(
+    url: &str,
+    tls: Option<&TlsConfig>,
+    collection: &str,
+) -> Result<()> {
+    MongoSession::connect(url, tls)?.require_collection(collection)
+}
+
 /// MongoDB source over a [`MongoSession`], carrying the resolved `source.mongo:`
 /// read options `export` applies.
 pub struct MongoSource {
@@ -634,16 +660,8 @@ impl Source for MongoSource {
                 request.query
             )
         })?;
+        self.session.require_collection(coll_name)?;
         let db = self.session.client().database(self.session.db());
-        let listed = self.session.block_on(
-            db.list_collection_names()
-                .filter(doc! { "name": coll_name })
-                .into_future(),
-        );
-        if let Some(refusal) = missing_collection_refusal(self.session.db(), coll_name, listed.ok())
-        {
-            anyhow::bail!("{refusal}");
-        }
         let schema = blob_schema();
         sink.on_schema(schema.clone())?;
 

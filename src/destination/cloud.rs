@@ -194,6 +194,9 @@ pub(crate) trait CloudBackend {
     /// Round-11 bughunt, read-only (no KMS bucket here) — but the aliasing, the
     /// write-path refusal and the comparison were each read at their sites.
     const LIST_MD5_IS_TRUSTWORTHY: bool = true;
+
+    /// The error kinds a listing ends with when the bucket or container itself is absent.
+    const ABSENT_CONTAINER: &'static [opendal::ErrorKind] = &[opendal::ErrorKind::NotFound];
 }
 
 /// OpenDAL-backed object-store destination, generic over the backend `B`.
@@ -207,6 +210,10 @@ pub(crate) struct CloudDestination<B: CloudBackend> {
     _runtime: Arc<tokio::runtime::Runtime>,
     op: blocking::Operator,
     prefix: String,
+    /// The bucket or container, as the config names it.
+    container: String,
+    /// Set once a listing has answered for the container (see [`CloudDestination::require_container`]).
+    container_answered: std::sync::OnceLock<()>,
     /// The one-shot upload pool this destination draws from (see [`oneshot_pool`]).
     oneshot_budget: &'static AtomicI64,
     _backend: PhantomData<fn() -> B>,
@@ -239,6 +246,21 @@ fn normalize_prefix(p: String) -> String {
     } else {
         format!("{p}/")
     }
+}
+
+/// Whether the error a listing's first page ended with says the container is absent: an absent prefix lists empty, an absent bucket is a 404.
+fn listing_says_container_absent<B: CloudBackend>(
+    first_page_error: Option<opendal::ErrorKind>,
+) -> bool {
+    first_page_error.is_some_and(|kind| B::ABSENT_CONTAINER.contains(&kind))
+}
+
+/// What an operator reads when the configured bucket or container does not exist.
+fn container_absent_message(scheme: &str, container: &str) -> String {
+    format!(
+        "{scheme}://{container}: the bucket or container does not exist (the store answered 404 to a \
+         listing of it). Create it, or correct `destination.bucket`"
+    )
 }
 
 /// The one tokio runtime every object-store operator runs on: opendal sends through a process-global HTTP pool, and a pooled connection dies with the runtime that opened it.
@@ -310,9 +332,40 @@ impl<B: CloudBackend> CloudDestination<B> {
             _runtime: runtime,
             op,
             prefix,
+            container: config.bucket.clone().unwrap_or_default(),
+            container_answered: std::sync::OnceLock::new(),
             oneshot_budget: oneshot_pool(config),
             _backend: PhantomData,
         })
+    }
+
+    /// Fail when the bucket or container itself is absent, which a 404 on a key cannot tell from an absent key.
+    fn require_container(&self) -> Result<()> {
+        if self.container_answered.get().is_some() {
+            return Ok(());
+        }
+        let first_page = self
+            .op
+            .lister_options(
+                &self.prefix,
+                opendal::options::ListOptions {
+                    limit: Some(1),
+                    ..Default::default()
+                },
+            )
+            .and_then(|mut entries| entries.next().transpose());
+        if let Some(e) = first_page.as_ref().err() {
+            log::debug!("{}://{}: container probe: {e}", B::SCHEME, self.container);
+        }
+        if listing_says_container_absent::<B>(first_page.as_ref().err().map(opendal::Error::kind)) {
+            crate::rivet_bail!(
+                crate::error::codes::DEST_CONTAINER_NOT_FOUND,
+                "{}",
+                container_absent_message(B::SCHEME, &self.container)
+            );
+        }
+        let _ = self.container_answered.set(());
+        Ok(())
     }
 
     /// Reserve `size` bytes for a one-shot buffer from this destination's
@@ -458,7 +511,10 @@ impl<B: CloudBackend> super::Destination for CloudDestination<B> {
                 size_bytes: meta.content_length(),
                 content_md5: meta.content_md5().map(str::to_string),
             })),
-            Err(e) if e.kind() == opendal::ErrorKind::NotFound => Ok(None),
+            Err(e) if e.kind() == opendal::ErrorKind::NotFound => {
+                self.require_container()?;
+                Ok(None)
+            }
             Err(e) => Err(e.into()),
         }
     }
@@ -735,5 +791,105 @@ mod tests {
                 "line must still point at the per-attempt detail: {line:?}"
             );
         }
+    }
+
+    /// A store that answers every object stat with 404 and every listing with `list_status`, counting the listings.
+    fn stub_store(list_status: u16) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let listings = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = std::sync::Arc::clone(&listings);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut head = [0u8; 4096];
+                let n = stream.read(&mut head).unwrap_or(0);
+                let request = String::from_utf8_lossy(&head[..n]).into_owned();
+                let target = request.split_whitespace().nth(1).unwrap_or("");
+                let is_listing = target.contains("/o?");
+                let (status, body) = if is_listing {
+                    seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    (list_status, "{}")
+                } else {
+                    (404, "{}")
+                };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        (endpoint, listings)
+    }
+
+    fn stub_destination(endpoint: &str) -> CloudDestination<GcsBackend> {
+        CloudDestination::<GcsBackend>::new_with_retries(
+            &DestinationConfig {
+                destination_type: DestinationType::Gcs,
+                bucket: Some("exports".into()),
+                prefix: Some("p".into()),
+                allow_anonymous: true,
+                endpoint: Some(endpoint.into()),
+                ..Default::default()
+            },
+            0,
+        )
+        .unwrap()
+    }
+
+    /// `head` answers "absent" only for a key: a bucket that does not exist is an error with its own code.
+    #[test]
+    fn head_refuses_a_missing_container_and_reads_a_missing_key_as_absent() {
+        use crate::destination::Destination;
+        let (endpoint, _) = stub_store(404);
+        let err = stub_destination(&endpoint)
+            .head("manifest.json")
+            .expect_err("a 404 listing means the bucket is absent");
+        assert_eq!(
+            err.to_string(),
+            "gs://exports: the bucket or container does not exist (the store answered 404 to a \
+             listing of it). Create it, or correct `destination.bucket`"
+        );
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some("RIVET_DEST_CONTAINER_NOT_FOUND")
+        );
+        assert_eq!(crate::error::classify_exit(&err), 1);
+
+        let (endpoint, listings) = stub_store(200);
+        let dest = stub_destination(&endpoint);
+        assert_eq!(dest.head("manifest.json").unwrap(), None);
+        assert_eq!(dest.head("_SUCCESS").unwrap(), None);
+        assert_eq!(
+            listings.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the container is asked about once per destination"
+        );
+
+        let (endpoint, _) = stub_store(403);
+        assert_eq!(
+            stub_destination(&endpoint).head("manifest.json").unwrap(),
+            None,
+            "a listing the principal may not make says nothing about the bucket"
+        );
+    }
+
+    /// Which listing errors mean an absent container is the backend's to say: S3's `NoSuchBucket` is `ConfigInvalid`.
+    #[test]
+    fn each_backend_names_the_listing_errors_of_an_absent_container() {
+        use super::listing_says_container_absent as absent;
+        use crate::destination::azure::AzureBackend;
+        use crate::destination::s3::S3Backend;
+        use opendal::ErrorKind::{ConfigInvalid, NotFound, PermissionDenied};
+        assert!(absent::<GcsBackend>(Some(NotFound)));
+        assert!(absent::<AzureBackend>(Some(NotFound)));
+        assert!(absent::<S3Backend>(Some(NotFound)));
+        assert!(absent::<S3Backend>(Some(ConfigInvalid)));
+        assert!(!absent::<GcsBackend>(Some(ConfigInvalid)));
+        assert!(!absent::<AzureBackend>(Some(ConfigInvalid)));
+        assert!(!absent::<S3Backend>(Some(PermissionDenied)));
+        assert!(!absent::<S3Backend>(None));
     }
 }

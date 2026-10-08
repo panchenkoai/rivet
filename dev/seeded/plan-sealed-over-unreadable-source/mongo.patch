@@ -1,0 +1,12 @@
+diff --git a/src/preflight/mongo.rs b/src/preflight/mongo.rs
+--- a/src/preflight/mongo.rs
++++ b/src/preflight/mongo.rs
+@@ -38,7 +38,7 @@
+     export
+         .table
+         .as_deref()
+-        .filter(|_| export.mode != crate::config::ExportMode::Cdc)
++        .filter(|_| export.mode != crate::config::ExportMode::Cdc && false)
+ }
+ 
+ fn diagnose_mongo(
