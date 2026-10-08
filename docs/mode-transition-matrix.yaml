@@ -143,6 +143,22 @@ scenarios:
     mongo:    { na: "a Mongo export accepts only mode: full or cdc (validate_non_sql_source_modes, src/config/mod.rs:543-554), so there is no incremental / chunked mode to switch from or into; the switch Mongo has (into page_size + resume) is graded by the three *_then_resume_mongo cells" }
     oracle:   { test: incremental_query_filter_edited_oracle }
 
+  - id: incremental_query_filter_edited_refusal
+    what: "MT8 — the edited-filter refusal alone, twice, nothing written; no remedy is walked, so a Postgres-state run grades it in full"
+    postgres: { test: incremental_query_filter_edited_is_refused_twice_postgres }
+    mysql:    { test: incremental_query_filter_edited_is_refused_twice_mysql }
+    mssql:    { test: incremental_query_filter_edited_is_refused_twice_mssql }
+    mongo:    { na: "a Mongo export accepts only mode: full or cdc (validate_non_sql_source_modes, src/config/mod.rs:543-554), so there is no incremental / chunked mode to switch from or into; the switch Mongo has (into page_size + resume) is graded by the three *_then_resume_mongo cells" }
+    oracle:   { test: incremental_query_filter_edited_is_refused_twice_oracle }
+
+  - id: incremental_other_schema_same_table_refusal
+    what: "MT8 — the other-schema refusal alone, twice, nothing written; no remedy is walked, so a Postgres-state run grades it in full"
+    postgres: { test: same_table_in_another_schema_is_refused_twice_postgres }
+    mysql:    { na: "the schema an unqualified table resolves in is not a source-URL option on this engine (search_path is PostgreSQL's)" }
+    mssql:    { na: "the schema an unqualified table resolves in is not a source-URL option on this engine (search_path is PostgreSQL's)" }
+    mongo:    { na: "a Mongo export accepts only mode: full or cdc (validate_non_sql_source_modes, src/config/mod.rs:543-554), so there is no incremental / chunked mode to switch from or into; the switch Mongo has (into page_size + resume) is graded by the three *_then_resume_mongo cells" }
+    oracle:   { na: "the schema an unqualified table resolves in is not a source-URL option on this engine (search_path is PostgreSQL's)" }
+
   - id: incremental_other_schema_same_table
     what: "MT8 — the same table name in another schema (search_path in the URL) is another stream: refused twice (RIVET_STATE_CURSOR_STREAM_MISMATCH); the source restored continues, `state reset` delivers the other schema's rows in full, another destination is refused again"
     postgres: { test: same_table_in_another_schema_is_another_stream_postgres }

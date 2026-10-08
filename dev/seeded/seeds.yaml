@@ -811,15 +811,15 @@ seeds:
     patch: progress-inherited-by-an-edited-filter/shared.patch
     engines:
       postgres:
-        cells: [incremental_query_filter_edited_postgres]
+        cells: [incremental_query_filter_edited_postgres, incremental_query_filter_edited_is_refused_twice_postgres]
       mysql:
-        cells: [incremental_query_filter_edited_mysql]
+        cells: [incremental_query_filter_edited_mysql, incremental_query_filter_edited_is_refused_twice_mysql]
       mssql:
-        cells: [incremental_query_filter_edited_mssql]
+        cells: [incremental_query_filter_edited_mssql, incremental_query_filter_edited_is_refused_twice_mssql]
       mongo:
         na: "a MongoDB export names a collection and has no `query:`: the rows it reads are the collection's, which the stream part compares (resume_repointed_at_another_collection_mongo)"
       oracle:
-        cells: [incremental_query_filter_edited_oracle]
+        cells: [incremental_query_filter_edited_oracle, incremental_query_filter_edited_is_refused_twice_oracle]
       lib:
         cells: ["lib:an_edited_filter_or_another_schema_is_refused_until_it_is_restored_or_reset"]
 
@@ -830,7 +830,7 @@ seeds:
     patch: progress-inherited-by-another-schema/shared.patch
     engines:
       postgres:
-        cells: [same_table_in_another_schema_is_another_stream_postgres]
+        cells: [same_table_in_another_schema_is_another_stream_postgres, same_table_in_another_schema_is_refused_twice_postgres]
       mysql:
         na: "the schema an unqualified table resolves in is not a source-URL option on this engine (search_path is PostgreSQL's)"
       mssql:

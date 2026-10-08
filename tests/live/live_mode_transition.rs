@@ -657,8 +657,8 @@ fn resumed_parallel_keyset_then_incremental(e: SqlEngine) {
     );
 }
 
-/// An edited `query:` filter under the same FROM is another stream: refused twice by code; the old filter restored continues, a reset delivers the new filter's rows in full, another destination changes nothing.
-fn incremental_query_filter_edited(e: SqlEngine) {
+/// An edited `query:` filter under the same FROM is another stream: refused twice by code; with `walk`, the old filter restored continues, a reset delivers the new filter's rows in full, another destination changes nothing.
+fn incremental_query_filter_edited(e: SqlEngine, walk: bool) {
     e.alive();
     let (table, _guard) = e.table("mode_transition");
     e.insert(&table, 1..=5, 180, Some(0));
@@ -673,6 +673,10 @@ fn incremental_query_filter_edited(e: SqlEngine) {
     assert_eq!(delivered_ids(e, first), (6..=10).collect::<Vec<_>>());
 
     let mut rig = staged_for(e, rig.query(&filtered(0)), &INCREMENTAL_ID, second);
+    if !walk {
+        let (stored, now) = ("where time_spent = 1)", "where time_spent = 0)");
+        return refused_twice_for_the_stream(&rig, second, stored, now, &|o| delivered_ids(e, o));
+    }
     let said = rig.refuses_twice_and_walks_out(
         &["run"],
         &[],
@@ -751,6 +755,44 @@ fn source_url_without_its_default_port_continues_postgres() {
 #[test]
 #[ignore = "live: requires docker compose postgres"]
 fn same_table_in_another_schema_is_another_stream_postgres() {
+    same_table_in_another_schema(true);
+}
+
+/// The refusal alone, no remedy walked: graded in full whatever the state backend.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn same_table_in_another_schema_is_refused_twice_postgres() {
+    same_table_in_another_schema(false);
+}
+
+/// The refusal alone, no remedy walked: graded in full whatever the state backend.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn incremental_query_filter_edited_is_refused_twice_postgres() {
+    incremental_query_filter_edited(SqlEngine::Pg, false);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn incremental_query_filter_edited_is_refused_twice_mysql() {
+    incremental_query_filter_edited(SqlEngine::Mysql, false);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn incremental_query_filter_edited_is_refused_twice_mssql() {
+    incremental_query_filter_edited(SqlEngine::Mssql, false);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn incremental_query_filter_edited_is_refused_twice_oracle() {
+    incremental_query_filter_edited(SqlEngine::Oracle, false);
+}
+
+/// The body of the two other-schema cells; `walk` adds the remedies.
+fn same_table_in_another_schema(walk: bool) {
     let e = SqlEngine::Pg;
     e.alive();
     let (table, _guard) = e.table("mode_transition");
@@ -769,6 +811,11 @@ fn same_table_in_another_schema_is_another_stream_postgres() {
 
     let elsewhere = format!("{POSTGRES_URL}?options=-csearch_path%3D{}", schema.0);
     let mut rig = staged_for(e, rig, &INCREMENTAL_ID, second).source_url(&elsewhere);
+    if !walk {
+        let stored = format!("`{table} under the server's own search_path`");
+        let now = format!("`{table} under search_path {}`", schema.0);
+        return refused_twice_for_the_stream(&rig, second, &stored, &now, &read_ids);
+    }
     let said = rig.refuses_twice_and_walks_out(
         &["run"],
         &[],
@@ -798,7 +845,7 @@ fn same_table_in_another_schema_is_another_stream_postgres() {
 #[test]
 #[ignore = "live: requires docker compose postgres"]
 fn incremental_query_filter_edited_postgres() {
-    incremental_query_filter_edited(SqlEngine::Pg);
+    incremental_query_filter_edited(SqlEngine::Pg, true);
 }
 
 const STREAM_CODE: &str = "RIVET_STATE_CURSOR_STREAM_MISMATCH";
@@ -2028,20 +2075,20 @@ fn source_url_without_its_default_port_continues_oracle() {
 #[test]
 #[ignore = "live: requires docker compose mysql"]
 fn incremental_query_filter_edited_mysql() {
-    incremental_query_filter_edited(SqlEngine::Mysql);
+    incremental_query_filter_edited(SqlEngine::Mysql, true);
 }
 
 #[test]
 #[ignore = "live: requires docker compose mssql"]
 fn incremental_query_filter_edited_mssql() {
-    incremental_query_filter_edited(SqlEngine::Mssql);
+    incremental_query_filter_edited(SqlEngine::Mssql, true);
 }
 
 #[cfg(feature = "oracle")]
 #[test]
 #[ignore = "live: requires docker compose oracle"]
 fn incremental_query_filter_edited_oracle() {
-    incremental_query_filter_edited(SqlEngine::Oracle);
+    incremental_query_filter_edited(SqlEngine::Oracle, true);
 }
 
 #[cfg(feature = "oracle")]
