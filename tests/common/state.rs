@@ -461,6 +461,35 @@ impl ScratchStateDb {
     pub fn client(&self) -> postgres::Client {
         postgres::Client::connect(&self.url(), postgres::NoTls).expect("scratch state DB")
     }
+    /// Close it to new connections and end the sessions it has.
+    pub fn cut_off(&self) {
+        let mut c = postgres::Client::connect(STATE_ADMIN, postgres::NoTls).expect("state server");
+        c.batch_execute(&format!(
+            "ALTER DATABASE {} ALLOW_CONNECTIONS false",
+            self.name
+        ))
+        .expect("close the scratch state DB");
+        let ended = c
+            .query(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1",
+                &[&self.name],
+            )
+            .expect("end its sessions");
+        assert!(
+            !ended.is_empty(),
+            "sabotage: no session on the state database {} to end",
+            self.name
+        );
+    }
+    /// Open it to connections again.
+    pub fn let_in(&self) {
+        let mut c = postgres::Client::connect(STATE_ADMIN, postgres::NoTls).expect("state server");
+        c.batch_execute(&format!(
+            "ALTER DATABASE {} ALLOW_CONNECTIONS true",
+            self.name
+        ))
+        .expect("open the scratch state DB");
+    }
 }
 
 impl Drop for ScratchStateDb {

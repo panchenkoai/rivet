@@ -158,3 +158,31 @@ fn an_initial_snapshot_stream_runs_continuously_from_a_standby() {
         "the second run delivered the change made on the primary"
     );
 }
+
+/// `Remedy::in_place` after an earlier remedy already lifted the refusal is not a walk: the rig panics instead of grading a remedy that changed nothing.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+#[should_panic(expected = "the refused state did not come back before remedy")]
+fn an_in_place_remedy_after_the_refusal_was_lifted_is_not_graded() {
+    require_alive(LiveService::Postgres);
+    let table = seed_pg_numeric_table(5);
+    let sqlite = [("RIVET_STATE_URL", "")];
+    let mut rig = Rig::pg_batch(table.name());
+    assert!(rig.run_with_envs(&sqlite).status.success());
+    let db = rig.config_path().with_file_name(".rivet_state.db");
+    rusqlite::Connection::open(&db)
+        .and_then(|c| c.execute("UPDATE schema_version SET version = version + 100", []))
+        .expect("a newer state schema");
+    let fresh_state = "point this one at a state DB it created";
+    rig.refuses_twice_then(
+        &["run"],
+        &sqlite,
+        Refused::by_code("RIVET_STATE_SCHEMA_NEWER", 5),
+        vec![
+            Remedy::new(fresh_state, Then::DeliversTheSource, |_| {
+                std::fs::remove_file(&db).expect("remove the newer state database");
+            }),
+            Remedy::new(fresh_state, Then::DeliversTheSource, |_| {}).in_place(),
+        ],
+    );
+}
