@@ -484,10 +484,15 @@ pub mod codes {
         "RIVET_STATE_CURSOR_STREAM_MISMATCH",
         "give each export that shares this state database its own name; if this export was edited (another table, another schema, another `query:` filter), restore what it read, or `rivet state reset -c <config> --export <name>` starts what it reads now with a full pass (it discards the progress that name holds on this source), or `rivet state accept -c <config> --export <name>` keeps the stored progress and records it as belonging to what the export reads now (rows of it below that progress are not delivered)",
     );
-    /// An export met an unfinished checkpointed run it does not continue: another mode opened it, or its checkpoint setting is off now.
+    /// A stored cursor was written delivering to another destination, or in another format, than the export delivers to now.
+    pub const STATE_CURSOR_DESTINATION_MISMATCH: Code = refusal(
+        "RIVET_STATE_CURSOR_DESTINATION_MISMATCH",
+        "restore the `destination` and `format` the export had to continue from the stored progress, or `rivet state reset -c <config> --export <name>` starts over with a full pass delivered where the config points now (the parts already delivered stay where they are: empty that location first if the full pass lands in it too)",
+    );
+    /// An export met an unfinished checkpointed run it does not continue: another mode opened it, its checkpoint setting is off now, or its parts are in another format.
     pub const STATE_INTERRUPTED_RUN_OWNER_MISMATCH: Code = refusal(
         "RIVET_STATE_INTERRUPTED_RUN_OWNER_MISMATCH",
-        "restore the settings the interrupted run had (its mode, its checkpoint) and run once to finish it, then change them; or abandon it with the command the message names (`rivet state reset` for a keyset run, `rivet state reset-chunks` for a range-chunk run) and the next run starts with a full pass",
+        "restore the settings the interrupted run had (its mode, its checkpoint, its format) and run once to finish it, then change them; or abandon it with the command the message names (`rivet state reset` for a keyset run, `rivet state reset-chunks` for a range-chunk run) and the next run starts with a full pass",
     );
     /// A table joined a CDC stream that did not capture it on its last run, over a baseline already recorded complete.
     pub const STATE_CDC_TABLE_REJOINED: Code = refusal(
@@ -657,6 +662,7 @@ pub mod codes {
         STATE_SCHEMA_NEWER,
         STATE_CURSOR_OWNER_MISMATCH,
         STATE_CURSOR_STREAM_MISMATCH,
+        STATE_CURSOR_DESTINATION_MISMATCH,
         STATE_INTERRUPTED_RUN_OWNER_MISMATCH,
         STATE_CDC_TABLE_REJOINED,
         STATE_CHUNK_RUN_OWNER_UNKNOWN,

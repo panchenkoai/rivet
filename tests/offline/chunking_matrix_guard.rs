@@ -328,7 +328,10 @@ const MATRICES: &[(&str, usize)] = &[
     // open-defect rows (a resume after the source grew, an edited destination path or format), and
     // a kill inside `state reset` and inside `repair` (no named point) and a destination moved to
     // another store (the cell's reader of declared ids is local).
-    ("docs/sabotage-matrix.yaml", 103),
+    // Lowered 103 -> 93 (2026-10-08): the nine rows a resume after the source grew, an edited
+    // destination path or format and deleted chunk tasks left open are ordinary cells, Oracle
+    // included, and the destination moved to another store has its cell.
+    ("docs/sabotage-matrix.yaml", 93),
     // Pool-split — `apply --pool --split` per (strategy × source engine). Split is a
     // scheduler layer above the runners (each unit runs through chunked/keyset), so its
     // per-engine behaviour (boundary probe, crash-recovery, finding-2 exact-partition

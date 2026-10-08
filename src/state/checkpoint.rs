@@ -206,6 +206,36 @@ impl StateStore {
 
     /// Insert `pending` tasks for `ranges`, numbered from 0, all or none.
     pub fn insert_chunk_tasks(&self, run_id: &str, ranges: &[(i64, i64)]) -> Result<()> {
+        self.insert_chunk_tasks_from(run_id, 0, ranges)
+    }
+
+    /// Plan `ranges` as `pending` tasks after the last task of `run_id`; `replace` drops the tasks it holds first. All or none.
+    pub fn replan_chunk_tasks(
+        &self,
+        run_id: &str,
+        replace: bool,
+        ranges: &[(i64, i64)],
+    ) -> Result<()> {
+        self.transaction(|| {
+            if replace {
+                self.execute("DELETE FROM chunk_task WHERE run_id = ?1", &[run_id.into()])?;
+            }
+            let next = self.query_opt(
+                "SELECT COALESCE(MAX(chunk_index), -1) + 1 FROM chunk_task WHERE run_id = ?1",
+                &[run_id.into()],
+                |r| r.i64(0),
+            )?;
+            self.insert_chunk_tasks_from(run_id, next.unwrap_or(0), ranges)
+        })
+    }
+
+    /// Insert `pending` tasks for `ranges`, numbered from `first`, all or none.
+    fn insert_chunk_tasks_from(
+        &self,
+        run_id: &str,
+        first: i64,
+        ranges: &[(i64, i64)],
+    ) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
         self.transaction(|| {
             for (i, (start, end)) in ranges.iter().enumerate() {
@@ -214,7 +244,7 @@ impl StateStore {
                      VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5)",
                     &[
                         run_id.into(),
-                        (i as i64).into(),
+                        (first + i as i64).into(),
                         start.to_string().into(),
                         end.to_string().into(),
                         now.as_str().into(),
@@ -743,6 +773,41 @@ mod tests {
             s.claim_next_chunk_task("run_t").unwrap().is_some(),
             "a transient failure must still be retried"
         );
+    }
+
+    #[test]
+    fn replanned_tasks_follow_the_stored_ones_or_replace_them() {
+        let (_dir, s) = store_on_disk();
+        s.create_chunk_run("run_a", "orders", "deadbeef", 2)
+            .unwrap();
+        s.create_chunk_run("run_b", "other", "deadbeef", 2).unwrap();
+        s.insert_chunk_tasks("run_a", &[(1, 5), (6, 10)]).unwrap();
+        s.insert_chunk_tasks("run_b", &[(1, 5)]).unwrap();
+        s.complete_chunk_task("run_a", 0, 3, Some("part0.csv"))
+            .unwrap();
+        let plan = |run: &str| -> Vec<(i64, String, String, String)> {
+            s.list_chunk_tasks_for_run(run)
+                .unwrap()
+                .into_iter()
+                .map(|t| (t.chunk_index, t.start_key, t.end_key, t.status))
+                .collect()
+        };
+        let task =
+            |i: i64, lo: &str, hi: &str, status: &str| (i, lo.into(), hi.into(), status.into());
+        s.replan_chunk_tasks("run_a", false, &[(11, 15), (16, 17)])
+            .unwrap();
+        assert_eq!(
+            plan("run_a"),
+            [
+                task(0, "1", "5", "completed"),
+                task(1, "6", "10", "pending"),
+                task(2, "11", "15", "pending"),
+                task(3, "16", "17", "pending"),
+            ]
+        );
+        s.replan_chunk_tasks("run_a", true, &[(1, 20)]).unwrap();
+        assert_eq!(plan("run_a"), [task(0, "1", "20", "pending")]);
+        assert_eq!(plan("run_b"), [task(0, "1", "5", "pending")], "another run");
     }
 
     #[test]

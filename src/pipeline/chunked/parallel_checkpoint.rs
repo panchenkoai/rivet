@@ -57,8 +57,7 @@ pub(in crate::pipeline) fn run_chunked_parallel_checkpoint(
         //    `schema_fingerprint` whose schemas disagree. The identical drop without
         //    `--resume` fails loudly. The gap between a crash and its resume is
         //    exactly where a schema change is most likely.
-        super::check_drift_only(meta.require()?, plan, Some(state), summary)?;
-        vec![]
+        super::resumed_chunk_plan(meta.require()?, plan, state, summary, &chunk_source)?
     } else {
         match chunk_source {
             // Detect: the run's metadata connection computes ranges + runs the

@@ -39,9 +39,11 @@ fn same_rows(a: &str, b: &str) -> bool {
 /// Whether `text` holds no placeholder and is `template` with each of its placeholders replaced by some text.
 fn fills(template: &str, text: &str) -> bool {
     let around = crate::config::literal_parts;
-    let (Some(parts), None) = (around(template), around(text)) else {
-        return false;
-    };
+    matches!((around(template), around(text)), (Some(parts), None) if joins(&parts, text))
+}
+
+/// Whether `text` is `parts` in order with some text between each two.
+fn joins(parts: &[String], text: &str) -> bool {
     let (first, last) = (&parts[0], &parts[parts.len() - 1]);
     let between = text.strip_prefix(first.as_str());
     let Some(between) = between.and_then(|t| t.strip_suffix(last.as_str())) else {
@@ -53,6 +55,47 @@ fn fills(template: &str, text: &str) -> bool {
             rest.find(part.as_str()).map(|at| &rest[at + part.len()..])
         })
         .is_some()
+}
+
+/// Whether two recorded destinations are one: the same text, or one as written and one that fills its `{date}`-style placeholders (what a plan sealed before destinations were recorded carries).
+fn same_place(a: &str, b: &str) -> bool {
+    let around = crate::destination::placeholder::literal_parts;
+    let fills = |template: &str, text: &str| matches!((around(template), around(text)), (Some(parts), None) if joins(&parts, text));
+    a == b || fills(a, b) || fills(b, a)
+}
+
+/// Where the parts of an export land and in what format: the parts of a stored cursor's identity that are not what it reads.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Deserialize)]
+pub struct Landing {
+    /// The destination URI as the config writes it, `{date}`-style placeholders in place; empty when the key names none.
+    pub(crate) destination: String,
+    /// The output format (`FormatType::label`); empty when the key names none.
+    pub(crate) format: String,
+}
+
+impl Landing {
+    /// The landing a progress row stores in `export_state.destination`; `None` for a value this type did not write.
+    fn stored(text: &str) -> Option<Self> {
+        serde_json::from_str(text).ok()
+    }
+
+    /// The text `export_state.destination` holds for this landing.
+    fn to_stored(&self) -> String {
+        serde_json::json!({"destination": self.destination, "format": self.format}).to_string()
+    }
+
+    /// This landing as a message names it.
+    fn worded(&self) -> String {
+        format!("{} as {}", self.destination, self.format)
+    }
+
+    /// Whether a recorded part proves a cursor stored for this landing was not delivered where `now` delivers.
+    fn another_than(&self, now: &Landing) -> bool {
+        let both = |a: &str, b: &str| !a.is_empty() && !b.is_empty();
+        let moved = both(&self.destination, &now.destination)
+            && !same_place(&self.destination, &now.destination);
+        moved || (both(&self.format, &now.format) && self.format != now.format)
+    }
 }
 
 /// `stream` as the source resolves it: an unqualified name under a one-schema `search_path` is that schema's.
@@ -101,11 +144,12 @@ impl StoredStream {
     }
 }
 
-/// What the row of a progress key holds: the run it is anchored on with that run's owner, and the progress a run of the key would continue from (worded) with the stream it was written reading.
+/// What the row of a progress key holds: the run it is anchored on with that run's owner, the progress a run of the key would continue from (worded) with the stream it was written reading, and the cursor a clean run would seek from with the landing it was stored for (`None`: before landings were recorded).
 #[derive(Default)]
 struct StoredProgress {
     anchor: Option<(String, String)>,
     held: Option<(String, StoredStream)>,
+    landed: Option<(String, Option<Landing>)>,
 }
 
 /// What `rivet state accept` found on the row of a progress key.
@@ -178,6 +222,8 @@ pub struct ProgressKey {
     pub(crate) population: String,
     /// Compared part: the cursor column or keyset key; `None` for a strategy that stores no cursor.
     pub(crate) column: Option<String>,
+    /// Compared part: where the parts land and in what format.
+    pub(crate) landing: Landing,
     /// The mode that owns a run this plan leaves interrupted (`ExtractionStrategy::mode_label`).
     pub(crate) mode: &'static str,
     /// Whether a clean run seeks from a committed high-water.
@@ -196,6 +242,7 @@ impl ProgressKey {
             schema: String::new(),
             population: String::new(),
             column: None,
+            landing: Landing::default(),
             mode: CHUNKED,
             continues_high_water: false,
             resumable: true,
@@ -213,6 +260,7 @@ impl ProgressKey {
             schema: String::new(),
             population: String::new(),
             column: None,
+            landing: Landing::default(),
             mode: "cdc",
             continues_high_water: false,
             resumable: false,
@@ -411,7 +459,7 @@ impl StateStore {
     fn stored_progress(&self, key: &ProgressKey) -> Result<StoredProgress> {
         let row = self.query_opt(
             "SELECT stream, last_cursor_value, resume_run_id, resume_owner, source_schema, \
-             population FROM export_state \
+             population, destination FROM export_state \
              WHERE export_name = ?1 AND (prefix = ?2 OR prefix = '') \
              ORDER BY prefix DESC LIMIT 1",
             &[key.export_name.as_str().into(), key.source.as_str().into()],
@@ -419,12 +467,17 @@ impl StateStore {
                 (
                     (r.opt_text(0), r.opt_text(4), r.opt_text(5)),
                     (r.opt_text(1), r.opt_text(2), r.opt_text(3)),
+                    r.opt_text(6),
                 )
             },
         )?;
-        let Some(((stream, schema, population), (cursor, run, owner))) = row else {
+        let Some(((stream, schema, population), (cursor, run, owner), landing)) = row else {
             return Ok(StoredProgress::default());
         };
+        let landed = cursor
+            .as_ref()
+            .filter(|_| key.continues_high_water)
+            .map(|v| (v.clone(), landing.as_deref().and_then(Landing::stored)));
         let anchor = run.map(|run| (run, owner.unwrap_or_else(|| KEYSET.to_string())));
         let resumed = anchor.as_ref().filter(|(_, owner)| owner != CHUNKED);
         let held = held_progress(
@@ -440,14 +493,69 @@ impl StateStore {
         Ok(StoredProgress {
             anchor,
             held: held.map(|held| (held, stored)),
+            landed,
         })
+    }
+
+    /// Refuse a cursor stored for another destination or format than `key` delivers to; record the landing on a row written before landings were.
+    fn claim_landing(
+        &self,
+        key: &ProgressKey,
+        cursor: &str,
+        stored: Option<Landing>,
+    ) -> Result<()> {
+        let (export_name, now) = (key.export_name.as_str(), &key.landing);
+        let Some(was) = stored else {
+            if now.destination.is_empty() && now.format.is_empty() {
+                return Ok(());
+            }
+            self.execute(
+                "UPDATE export_state SET destination = ?3 WHERE export_name = ?1 \
+                 AND (prefix = ?2 OR prefix = '') AND last_cursor_value IS NOT NULL",
+                &[
+                    export_name.into(),
+                    key.source.as_str().into(),
+                    now.to_stored().into(),
+                ],
+            )?;
+            log::warn!(
+                "export '{export_name}': its stored progress (cursor `{cursor}`) predates \
+                 destination tracking — recorded as delivered to `{}`, where this export \
+                 delivers now",
+                now.worded()
+            );
+            return Ok(());
+        };
+        if !was.another_than(now) {
+            return Ok(());
+        }
+        crate::rivet_bail!(
+            crate::error::codes::STATE_CURSOR_DESTINATION_MISMATCH,
+            "export '{export_name}': its stored progress (cursor `{cursor}`) was written \
+             delivering to `{}`, but this export now delivers to `{}` — continuing from it \
+             would deliver only the rows past that cursor there; nothing was read or \
+             written.\n  \
+             Hint: restore the destination and format the export had to continue from the \
+             stored progress, or `rivet state reset -c <config> --export {export_name}` \
+             starts over with a full pass delivered to `{}` — it discards the progress \
+             '{export_name}' holds on this source. The parts already at `{}` are not moved \
+             or removed: empty that location first if the full pass lands in it too.",
+            was.worded(),
+            now.worded(),
+            now.worded(),
+            was.destination
+        )
     }
 
     /// Claim the stored progress of `key`: refuse progress stored for another stream (relation, schema or rows); adopt a row written before a part was recorded, or under another spelling of the source.
     pub fn claim(&self, key: ProgressKey) -> Result<ProgressClaim<'_>> {
         let (export_name, scope, stream) = (&key.export_name, &key.source, &key.stream);
         self.adopt_respelled_source(export_name, scope)?;
-        let StoredProgress { anchor, held } = self.stored_progress(&key)?;
+        let StoredProgress {
+            anchor,
+            held,
+            landed,
+        } = self.stored_progress(&key)?;
         let anchor = anchor
             .as_ref()
             .map(|(run, owner)| (run.as_str(), owner.as_str()));
@@ -473,6 +581,9 @@ impl StateStore {
                  `rivet state accept -c <config> --export {export_name}` keeps it and records \
                  it as belonging to `{now}` — rows of `{now}` below it are not delivered."
             );
+        }
+        if let Some((cursor, landing)) = landed {
+            self.claim_landing(&key, &cursor, landing)?;
         }
         let unrecorded = [
             ("stream", stored.stream.is_none(), stream),
@@ -560,6 +671,20 @@ impl StateStore {
                     abandon_command(owner, export_name)
                 );
             }
+            let now = key.landing.format.as_str();
+            if let Some(was) = self.another_format_of_run(&run, now)? {
+                crate::rivet_bail!(
+                    crate::error::codes::STATE_INTERRUPTED_RUN_OWNER_MISMATCH,
+                    "export '{export_name}': run {run} of mode `{owner}` is unfinished and \
+                     wrote its parts as `{was}`, but this export now writes `{now}` — \
+                     continuing it would finish one run in two formats; nothing was read or \
+                     written.\n  \
+                     Hint: restore `format: {was}` and run once to finish run {run}, then \
+                     change it; or `{}` abandons it and the next run starts with a full pass \
+                     as `{now}`.",
+                    abandon_command(owner, export_name)
+                );
+            }
         }
         Ok(())
     }
@@ -628,15 +753,17 @@ impl StateStore {
         let now = chrono::Utc::now().to_rfc3339();
         let sql = "INSERT INTO export_state \
              (export_name, prefix, last_cursor_value, last_run_at, cursor_column, stream, \
-              source_schema, population)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+              source_schema, population, destination)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(export_name, prefix) DO UPDATE SET
                 last_cursor_value = excluded.last_cursor_value,
                 last_run_at = excluded.last_run_at,
                 cursor_column = excluded.cursor_column,
                 stream = excluded.stream,
                 source_schema = excluded.source_schema,
-                population = excluded.population";
+                population = excluded.population,
+                destination = excluded.destination";
+        let landing = Some(key.landing.to_stored()).filter(|_| key.landing != Landing::default());
         self.execute(
             sql,
             &[
@@ -648,6 +775,7 @@ impl StateStore {
                 key.stream.as_str().into(),
                 key.schema.as_str().into(),
                 key.population.as_str().into(),
+                landing.into(),
             ],
         )?;
         Ok(())
@@ -757,7 +885,8 @@ impl StateStore {
     pub fn clear_cursor_value(&self, export_name: &str, scope: &str) -> Result<()> {
         self.claim_legacy_row(export_name, scope)?;
         self.execute(
-            "UPDATE export_state SET last_cursor_value = NULL WHERE export_name = ?1 AND prefix = ?2",
+            "UPDATE export_state SET last_cursor_value = NULL, destination = NULL \
+             WHERE export_name = ?1 AND prefix = ?2",
             &[export_name.into(), scope.into()],
         )?;
         Ok(())
@@ -840,6 +969,7 @@ mod tests {
             schema: String::new(),
             population: String::new(),
             column: Some(column.into()),
+            landing: Landing::default(),
             mode: "keyset",
             continues_high_water: true,
             resumable: true,
@@ -2497,5 +2627,197 @@ mod tests {
         t.update_legacy("orders", "500").unwrap();
         metric(&t, "incremental", None, "500");
         assert!(t.get_owned("orders", "", "anything").is_ok());
+    }
+
+    const DESTINATION: &str = "RIVET_STATE_CURSOR_DESTINATION_MISMATCH";
+
+    /// A key whose cursor a clean run continues, delivering to `destination` as `format`.
+    fn landing(destination: &str, format: &str) -> ProgressKey {
+        ProgressKey {
+            landing: Landing {
+                destination: destination.into(),
+                format: format.into(),
+            },
+            ..key("orders", "pg/db", "id", "orders")
+        }
+    }
+
+    #[test]
+    fn a_cursor_is_refused_for_another_destination_or_format_until_restored_or_reset() {
+        let s = store();
+        let home = landing("s3://b/orders/", "parquet");
+        s.update_with_column(&home, "40").unwrap();
+        let edits = [
+            (
+                landing("s3://b/moved/", "parquet"),
+                "s3://b/moved/ as parquet",
+            ),
+            (landing("s3://b/orders/", "csv"), "s3://b/orders/ as csv"),
+        ];
+        for (edited, now) in &edits {
+            for cycle in 1..=2 {
+                let said = refusal(s.claim(edited.clone()), DESTINATION);
+                for want in [
+                    "its stored progress (cursor `40`) was written delivering to `s3://b/orders/ as parquet`",
+                    &format!("now delivers to `{now}`"),
+                    "restore the destination and format the export had to continue",
+                    &format!(
+                        "`rivet state reset -c <config> --export orders` starts over with a \
+                         full pass delivered to `{now}`"
+                    ),
+                    "The parts already at `s3://b/orders/` are not moved or removed",
+                ] {
+                    assert!(said.contains(want), "cycle {cycle}: {want} in {said}");
+                }
+            }
+        }
+        assert!(s.claim(home.clone()).is_ok(), "restored");
+        let full = ProgressKey {
+            continues_high_water: false,
+            ..edits[0].0.clone()
+        };
+        assert!(s.claim(full).is_ok(), "a run that seeks from no cursor");
+        s.reset("orders", "pg/db").unwrap();
+        let claim = s.claim(edits[0].0.clone()).expect("reset");
+        assert_eq!(claim.cursor().unwrap().last_cursor_value, None);
+    }
+
+    #[test]
+    fn a_cursor_stored_before_landings_were_recorded_is_adopted_once_then_guarded() {
+        let s = store();
+        put(&s, "orders", "pg/db", "40", "id", "orders").unwrap();
+        let stored = || column(&s, "SELECT destination FROM export_state");
+        assert_eq!(
+            stored(),
+            ["NULL"],
+            "a key that names no landing stores none"
+        );
+        assert!(s.claim(key("orders", "pg/db", "id", "orders")).is_ok());
+        assert_eq!(stored(), ["NULL"], "and adopts none");
+        let home = landing("file:///out", "parquet");
+        assert!(s.claim(home.clone()).is_ok(), "adopted");
+        assert_eq!(stored(), [home.landing.to_stored()]);
+        refusal(s.claim(landing("file:///moved", "parquet")), DESTINATION);
+        assert_eq!(
+            stored(),
+            [home.landing.to_stored()],
+            "a refusal records nothing"
+        );
+        s.exec_for_test("UPDATE export_state SET destination = 'b/out'");
+        let moved = landing("file:///moved", "csv");
+        assert!(
+            s.claim(moved.clone()).is_ok(),
+            "a CDC capture record is no landing"
+        );
+        assert_eq!(stored(), [moved.landing.to_stored()]);
+    }
+
+    #[test]
+    fn a_cursor_write_records_its_landing_and_a_cleared_cursor_holds_none() {
+        let s = store();
+        let home = landing("file:///out", "parquet");
+        s.update_with_column(&home, "40").unwrap();
+        let stored = || column(&s, "SELECT destination FROM export_state");
+        assert_eq!(
+            stored(),
+            [r#"{"destination":"file:///out","format":"parquet"}"#]
+        );
+        s.update_with_column(&landing("file:///moved", "csv"), "41")
+            .unwrap();
+        assert_eq!(
+            stored(),
+            [r#"{"destination":"file:///moved","format":"csv"}"#]
+        );
+        s.clear_cursor_value("orders", "pg/db").unwrap();
+        assert_eq!(stored(), ["NULL"]);
+        assert_eq!(s.list_all().unwrap().len(), 1, "the row is still listed");
+    }
+
+    #[test]
+    fn a_dated_destination_is_one_place_and_a_resolved_one_fills_it() {
+        let dated = "s3://b/{date}/{export}/";
+        assert!(same_place(dated, dated));
+        assert!(same_place(dated, "s3://b/2026-10-08/orders/"));
+        assert!(same_place("s3://b/2026-10-08/orders/", dated));
+        assert!(!same_place(dated, "s3://b/2026-10-08/orders"));
+        assert!(!same_place(dated, "s3://c/2026-10-08/orders/"));
+        assert!(!same_place(dated, "s3://b/{date}/moved/{export}/"));
+        assert!(!same_place(
+            "s3://b/2026-10-08/orders/",
+            "s3://b/2026-10-09/orders/"
+        ));
+        let at = |destination: &str, format: &str| landing(destination, format).landing;
+        let home = at(dated, "parquet");
+        assert!(!home.another_than(&at("s3://b/2026-10-09/orders/", "parquet")));
+        assert!(home.another_than(&at("s3://b/2026-10-09/orders/", "csv")));
+        assert!(home.another_than(&at("s3://b/moved/", "parquet")));
+        assert!(!home.another_than(&at("", "")), "a key that names none");
+        assert!(!at("", "").another_than(&home), "a row that names none");
+        assert_eq!(Landing::stored(&home.to_stored()), Some(home));
+        assert_eq!(Landing::stored("b/out"), None);
+    }
+
+    /// Log `file_name` as a part of `run_id` written as `format`.
+    fn part(s: &StateStore, run_id: &str, file_name: &str, format: &str) {
+        s.record_file(crate::state::FilePart {
+            run_id,
+            export_name: "orders",
+            file_name,
+            rows: 5,
+            bytes: 50,
+            format,
+            compression: None,
+            cursor_high: None,
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn an_unfinished_run_is_refused_for_another_format_than_its_parts_until_it_is_abandoned() {
+        let writes = |mode: &'static str, format: &str| ProgressKey {
+            mode,
+            continues_high_water: false,
+            ..landing("file:///out", format)
+        };
+        let s = store();
+        s.open_chunk_run(&writes("chunked", "parquet"), "run_c", "h", 3, &[(1, 5)])
+            .unwrap();
+        assert!(
+            s.claim(writes("chunked", "csv")).is_ok(),
+            "a run that wrote no part mixes none"
+        );
+        part(&s, "run_c", "orders_chunk0.parquet", "parquet");
+        part(&s, "run_other", "orders_chunk0.csv", "csv");
+        for cycle in 1..=2 {
+            let said = refusal(s.claim(writes("chunked", "csv")), OWNER);
+            for want in [
+                "run run_c of mode `chunked` is unfinished and wrote its parts as `parquet`",
+                "this export now writes `csv`",
+                "restore `format: parquet` and run once to finish run run_c",
+                "`rivet state reset-chunks -c <config> --export orders` abandons it and the \
+                 next run starts with a full pass as `csv`",
+            ] {
+                assert!(said.contains(want), "cycle {cycle}: {want} in {said}");
+            }
+        }
+        assert!(s.claim(writes("chunked", "parquet")).is_ok(), "restored");
+        assert!(
+            s.claim(ProgressKey::chunked("orders", "pg/db")).is_ok(),
+            "a key that names no format"
+        );
+        s.reset("orders", "pg/db").unwrap();
+        refusal(s.claim(writes("chunked", "csv")), OWNER);
+        s.reset_chunk_checkpoint("orders").unwrap();
+        assert!(s.claim(writes("chunked", "csv")).is_ok(), "abandoned");
+
+        let k = store();
+        k.set_resume_run_id(&writes("keyset", "parquet"), "run_k")
+            .unwrap();
+        part(&k, "run_k", "orders_pk_w0_0.parquet", "parquet");
+        let said = refusal(k.claim(writes("keyset", "csv")), OWNER);
+        assert!(
+            said.contains("`rivet state reset -c <config> --export orders` abandons it"),
+            "{said}"
+        );
     }
 }
