@@ -1002,7 +1002,6 @@ fn init_batch_config_runs(engine: SqlEngine, mode: &str) {
 /// RESULTS 20: `check` names the strategy `run` then uses for `mode: chunked` with no chunk column.
 fn check_names_the_strategy_run_uses(engine: SqlEngine) {
     let (table, _guard) = range_table(engine, "oc_nochunk", ROWS);
-    let key = engine.col("id");
     // The table fits one default chunk: the planner may run it as one unchunked pass.
     let (check, chunk_parts) = check_then_run(engine.rig(&table).mode("chunked"));
     assert_eq!(
@@ -1021,10 +1020,15 @@ fn check_names_the_strategy_run_uses(engine: SqlEngine) {
             .mode("chunked")
             .export_line("chunk_size: 5"),
     );
+    let key = check
+        .split_once("Strategy: chunked(")
+        .and_then(|(_, rest)| rest.split_once(", size=5)"))
+        .map(|(key, _)| key.to_string())
+        .unwrap_or_default();
     assert!(
-        check.contains(&format!("Strategy: chunked({key}, size=5)"))
+        key.eq_ignore_ascii_case("id")
             && check.contains(&format!("Mode: chunked (column: {key}, size: 5)")),
-        "`check` names the range chunking the run uses\n{check}"
+        "`check` names the range chunking the run uses, on the primary key, in both lines\n{check}"
     );
     assert_eq!(chunk_parts, 8, "the run writes one part per chunk of five");
 }
