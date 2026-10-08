@@ -247,26 +247,28 @@ impl Scns {
                 .and_then(|s| s.parse::<u64>().ok())
         };
         match (get("low_water"), get("commit_scn")) {
-            (Some(0), Some(_)) => crate::rivet_bail!(
-                crate::error::codes::SOURCE_CDC_CHECKPOINT_INVALID,
-                "oracle cdc: checkpoint '{path}' records a low-water SCN of 0. A rivet release \
+            (Some(0), Some(_)) => Err(crate::source::cdc::checkpoint_identity::checkpoint_invalid(
+                format!(
+                    "oracle cdc: checkpoint '{path}' records a low-water SCN of 0. A rivet release \
                  up to 0.30 wrote that when it read a transaction whose START_SCN was not \
                  assigned yet: it is not a redo position, and no change was lost to log \
                  retention. The true low-water is unknown, so resuming from any other SCN could \
                  skip a long transaction's early changes. {}",
-                crate::source::cdc::checkpoint_identity::RECOVER
-            ),
+                    crate::source::cdc::checkpoint_identity::RECOVER
+                ),
+            )),
             (Some(low_water), Some(commit_scn)) if low_water <= commit_scn => Ok(Self {
                 low_water,
                 commit_scn,
             }),
-            _ => crate::rivet_bail!(
-                crate::error::codes::SOURCE_CDC_CHECKPOINT_INVALID,
-                "oracle cdc: checkpoint '{path}' parses but carries no valid `low_water` / \
+            _ => Err(crate::source::cdc::checkpoint_identity::checkpoint_invalid(
+                format!(
+                    "oracle cdc: checkpoint '{path}' parses but carries no valid `low_water` / \
                  `commit_scn` pair — refusing to treat it as absent, which would re-anchor at \
                  the current SCN and skip everything since. Restore the file, or: {}",
-                crate::source::cdc::checkpoint_identity::RECOVER
-            ),
+                    crate::source::cdc::checkpoint_identity::RECOVER
+                ),
+            )),
         }
     }
 
@@ -1099,13 +1101,12 @@ impl OracleChangeStream {
         let op = text(3)?.unwrap_or_default();
         let (owner, table) = (text(4)?.unwrap_or_default(), text(5)?.unwrap_or_default());
         if op == "MISSING_SCN" {
-            crate::rivet_bail!(
-                crate::error::codes::SOURCE_CDC_LOG_GAP,
+            return Err(crate::source::cdc::checkpoint_identity::log_gap(format!(
                 "oracle cdc: LogMiner reports missing redo ({}) — the changes it held are LOST to \
                  this stream. Restore the archived log, or: {}",
                 text(7)?.unwrap_or_default(),
                 crate::source::cdc::checkpoint_identity::RECOVER
-            );
+            )));
         }
         let status = text(6)?.unwrap_or_default();
         if op == "UNSUPPORTED" || status != "0" {
@@ -1194,7 +1195,9 @@ impl OracleChangeStream {
         };
         let first = match first {
             Mine::Change(m) => m,
-            Mine::Truncate(why) if !self.yielded_since_ack => return Err(truncate_error(why)),
+            Mine::Truncate(why) if !self.yielded_since_ack => {
+                return Err(crate::source::cdc::checkpoint_identity::truncated(why));
+            }
             Mine::Truncate(why) => {
                 self.pending_truncate = Some(why);
                 return Ok(false);
@@ -1373,14 +1376,6 @@ pub(crate) fn ddl_truncates(sql: &str) -> bool {
     }
 }
 
-/// The coded error a captured-table TRUNCATE raises.
-fn truncate_error(why: String) -> anyhow::Error {
-    anyhow::Error::new(crate::error::CodedError::new(
-        crate::error::codes::SOURCE_CDC_TRUNCATED,
-        why,
-    ))
-}
-
 /// Refuse a TRUNCATE of a captured table, naming why re-running cannot fix it and the recovery order.
 pub(crate) fn truncate_refusal_message(owner: &str, table: &str, stmt: &str) -> String {
     format!(
@@ -1429,7 +1424,9 @@ impl ChangeStream for OracleChangeStream {
         if self.queue.is_empty()
             && let Some(why) = &self.pending_truncate
         {
-            return Some(Err(truncate_error(why.clone())));
+            return Some(Err(crate::source::cdc::checkpoint_identity::truncated(
+                why.clone(),
+            )));
         }
         while self.queue.is_empty() && !self.exhausted {
             match self.fill() {
@@ -1866,7 +1863,7 @@ mod tests {
             "{why}"
         );
         assert_eq!(
-            crate::error::error_code(&truncate_error(why)),
+            crate::error::error_code(&crate::source::cdc::checkpoint_identity::truncated(why)),
             Some("RIVET_SOURCE_CDC_TRUNCATED")
         );
     }

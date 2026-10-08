@@ -328,11 +328,12 @@ const MATRICES: &[(&str, usize)] = &[
     // open-defect rows (a resume after the source grew, an edited destination path or format), and
     // a kill inside `state reset` and inside `repair` (no named point) and a destination moved to
     // another store (the cell's reader of declared ids is local).
-    // Raised 103 -> 127 (2026-10-08): the signal rows (a signal at a parked point, then the next run)
+    // 103 -> 127 (2026-10-08): the signal rows (a signal at a parked point, then the next run)
     // arrive with five rows nobody wrote: a CDC stream killed mid-drain (4) and its graceful twin (5),
     // parallel runners (5), the points that are panic points only (5), an SQLite state copied elsewhere (5).
     // Lowered 127 -> 126 (2026-10-08): runs that name one part in one millisecond are a cell on every SQL engine.
-    ("docs/sabotage-matrix.yaml", 126),
+    // 126 -> 115 (2026-10-08): the corrupt-checkpoint, truncate and log-gap walks of the operator contract.
+    ("docs/sabotage-matrix.yaml", 115),
     // Pool-split — `apply --pool --split` per (strategy × source engine). Split is a
     // scheduler layer above the runners (each unit runs through chunked/keyset), so its
     // per-engine behaviour (boundary probe, crash-recovery, finding-2 exact-partition

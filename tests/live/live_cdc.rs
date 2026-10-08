@@ -3037,6 +3037,14 @@ fn cdc_corrupt_checkpoint_fails_loud_not_silently_absent() {
         stderr.contains("corrupt or truncated"),
         "the failure must name the corrupt checkpoint, got:\n{stderr}"
     );
+    assert_refused(
+        &res,
+        Refused::by_code("RIVET_SOURCE_CDC_CHECKPOINT_INVALID", 5),
+    );
+    assert!(
+        stderr.contains(REBASELINE_REMEDY),
+        "the refusal ends with the re-baseline remedy:\n{stderr}"
+    );
     assert!(
         !out2.join("_SUCCESS").exists(),
         "no _SUCCESS may be written for the failed run"
@@ -3174,6 +3182,14 @@ fn pg_cdc_corrupt_checkpoint_fails_loud_not_silently_absent() {
     assert!(
         stderr.contains("corrupt or truncated"),
         "the failure must name the corrupt checkpoint, got:\n{stderr}"
+    );
+    assert_refused(
+        &res,
+        Refused::by_code("RIVET_SOURCE_CDC_CHECKPOINT_INVALID", 5),
+    );
+    assert!(
+        stderr.contains(REBASELINE_REMEDY),
+        "the refusal ends with the re-baseline remedy:\n{stderr}"
     );
 }
 

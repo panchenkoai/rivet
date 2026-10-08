@@ -83,6 +83,29 @@
     the highest key of the ranges that commit after the upgrade, as 0.31 did. The state
     schema moves to v35 (`keyset_range.max_key`), so an older rivet no longer opens the
     state database.
+- **Breaking: a CDC stream that cannot continue exits 5 with a `RIVET_*` code, where it exited 1
+  with none.** Applies to `mode: cdc` runs and `rivet cdc` on PostgreSQL, MySQL, SQL Server,
+  MongoDB and Oracle.
+  - `RIVET_SOURCE_CDC_CHECKPOINT_INVALID`: a checkpoint file that is not JSON (every engine),
+    and a checkpoint file that is gone while the export has a baseline (MySQL, SQL Server,
+    MongoDB, Oracle).
+  - `RIVET_SOURCE_CDC_TRUNCATED`: a TRUNCATE of a captured table (PostgreSQL, MySQL; Oracle
+    gave it already), a DROP of one (MySQL), a dropped captured collection or database
+    (MongoDB).
+  - `RIVET_SOURCE_CDC_LOG_GAP`: a PostgreSQL slot missing under a checkpoint or a baseline,
+    MySQL binlogs purged past the checkpoint (`ERROR 1236`), a MongoDB oplog rolled past the
+    resume token (error 286). The MongoDB refusal used to end with "change streams require a
+    replica set", which was not the cause; it now names the oplog and the re-baseline.
+  - The corrupt-checkpoint message said "delete it to accept a new anchor from a fresh
+    snapshot". That was wrong on every engine but PostgreSQL: with a baseline the next run
+    refused the missing file, and without one it anchored at the current position and skipped
+    every change since the checkpoint. The message now ends "Restore the file, or:" and the
+    re-baseline steps, the same ones every other CDC data-loss message prints.
+  - What is refused has not changed, and nothing stored changes: a checkpoint and a state
+    database written by 0.31.0 resume as before.
+  - Upgrading: a script or scheduler that matched exit 1 for these cases now sees exit 5
+    (`refusal`: do not retry, follow the remedy in the message). `rivet schema errors` lists
+    the three codes.
 - **Breaking: a run that fails before its first write leaves the destination as it was.**
   Applies to every batch export (`full`, `incremental`, `chunked`, keyset, the snapshot leg
   of a CDC export) on every source engine and on every destination that keeps objects at

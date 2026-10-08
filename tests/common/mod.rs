@@ -180,6 +180,12 @@ pub const REBASELINE_REMEDY: &str = "Re-baseline the stream in one run: delete t
 
 /// Follow [`REBASELINE_REMEDY`] on a rig with a local destination, step by step as printed, then run once.
 pub fn follow_rebaseline_remedy(rig: &mut Rig, has_baseline: bool) {
+    apply_rebaseline_remedy(rig, has_baseline);
+    rig.run_ok();
+}
+
+/// The steps of [`REBASELINE_REMEDY`] as printed, up to the run.
+pub fn apply_rebaseline_remedy(rig: &mut Rig, has_baseline: bool) {
     let _ = std::fs::remove_file(rig.checkpoint());
     let out = rig.out_dir();
     std::fs::rename(&out, out.with_extension("pre-rebaseline"))
@@ -198,7 +204,6 @@ pub fn follow_rebaseline_remedy(rig: &mut Rig, has_baseline: bool) {
     if !has_baseline {
         rig.amend_cdc_line("initial: snapshot");
     }
-    rig.run_ok();
 }
 
 /// One source write on an `(id, v)` table, engine-neutral.
