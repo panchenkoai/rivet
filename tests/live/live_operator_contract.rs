@@ -180,33 +180,74 @@ fn stale_chunk_checkpoint(engine: SqlEngine) {
     );
 }
 
-/// RESULTS 2: `run --validate` does not exit 0 when its own validation failed.
+/// RESULTS 2: `run --validate` over a destination that fails verification exits as `rivet validate` does on that prefix.
 fn run_validate_flag(engine: SqlEngine) {
     let (table, _guard) = id_v_table(engine, "oc_validate", ROWS);
     run_validate_flag_on(engine.rig(&table));
 }
 
 fn run_validate_flag_on(rig: Rig) {
-    let rig = rig.export_line("verify: content");
-    let out = rig.run_args(&["--validate"]);
-    let said = text(&out);
+    let passing = rig.run_args(&["--validate"]);
     assert!(
-        said.contains("validated:"),
-        "fixture: `--validate` reports a verdict:\n{said}"
+        passing.status.success() && text(&passing).contains("validated: pass"),
+        "fixture: `run --validate` passes while the destination meets the policy\n{}",
+        text(&passing)
+    );
+    let mut rig = rig.export_line("verify: content").a_failed_run_may_leave(
+        &[Leftover::DeliveredRun],
+        "`run --validate` is a verdict on an export that completed: its parts, manifest and success row stay",
+    );
+    let unchecked = rig.run();
+    assert!(
+        unchecked.status.success(),
+        "fixture: without `--validate` nothing verifies the policy\n{}",
+        text(&unchecked)
+    );
+    let said = rig.refuses_twice_then(
+        &["run", "--validate"],
+        &[],
+        Refused::by_code("RIVET_VALIDATE_FAILED", 3),
+        Vec::new(),
     );
     assert!(
-        !(out.status.success() && said.contains("validated: FAIL")),
-        "`run --validate` exited 0 with `validated: FAIL`\n{said}"
+        said.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .contains("validated: FAIL"),
+        "the summary of a run that failed `--validate` says `validated: FAIL`\n{said}"
+    );
+    let standalone = rig.cli(&["validate"]);
+    assert_eq!(
+        standalone.status.code(),
+        Some(3),
+        "`rivet validate`, which the failure names, gives the same prefix the same exit class\n{}",
+        text(&standalone)
     );
 }
 
-/// Makes the SQLite state files beside a config read-only until dropped.
-struct ReadOnlyState(Vec<std::path::PathBuf>);
+/// What of a SQLite state beside a config is made read-only.
+#[derive(Clone, Copy, Debug)]
+enum ReadOnly {
+    /// The state files themselves.
+    Files,
+    /// The directory that holds them, the files left writable: a read-only volume mount.
+    Directory,
+}
+
+/// Makes the SQLite state beside a config read-only until dropped; holds each path with the mode to put back.
+struct ReadOnlyState(Vec<(std::path::PathBuf, u32)>);
 
 impl ReadOnlyState {
-    fn beside(cfg: &std::path::Path) -> Self {
+    fn beside(cfg: &std::path::Path, shape: ReadOnly) -> Self {
         use std::os::unix::fs::PermissionsExt as _;
-        let files: Vec<_> = files_below(cfg.parent().unwrap())
+        let dir = cfg.parent().unwrap();
+        if let ReadOnly::Directory = shape {
+            // The last connection to close checkpoints and removes `-wal` and `-shm`, as a finished run does.
+            rusqlite::Connection::open(dir.join(".rivet_state.db"))
+                .and_then(|c| c.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(())))
+                .expect("checkpoint the state");
+        }
+        let files: Vec<_> = files_below(dir)
             .into_iter()
             .filter(|p| {
                 p.file_name()
@@ -217,43 +258,159 @@ impl ReadOnlyState {
             !files.is_empty(),
             "fixture: a SQLite state beside the config"
         );
-        for f in &files {
-            std::fs::set_permissions(f, std::fs::Permissions::from_mode(0o400)).unwrap();
-        }
-        ReadOnlyState(files)
+        let paths = match shape {
+            ReadOnly::Files => files,
+            ReadOnly::Directory => {
+                assert_eq!(
+                    files.len(),
+                    1,
+                    "fixture: a state no process has open is one file, with no -wal or -shm: {files:?}"
+                );
+                vec![dir.to_path_buf()]
+            }
+        };
+        let locked = paths
+            .into_iter()
+            .map(|p| {
+                let mode = std::fs::metadata(&p).unwrap().permissions().mode();
+                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode & !0o222))
+                    .unwrap();
+                (p, mode)
+            })
+            .collect();
+        ReadOnlyState(locked)
     }
 }
 
 impl Drop for ReadOnlyState {
     fn drop(&mut self) {
         use std::os::unix::fs::PermissionsExt as _;
-        for f in &self.0 {
-            let _ = std::fs::set_permissions(f, std::fs::Permissions::from_mode(0o600));
+        for (path, mode) in &self.0 {
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(*mode));
         }
     }
 }
 
-/// RESULTS 3: an incremental run that cannot store its cursor does not exit 0.
-fn read_only_state(engine: SqlEngine) {
-    if state_url_under_test().is_some() {
-        return skip_live(
-            "a read-only SQLite state file; this pass grades Postgres state (RIVET_GATE_STATE_URL)",
-        );
-    }
-    let (table, _guard) = id_v_table(engine, "oc_rostate", 10);
+/// The environment that keeps a cell's state in SQLite beside the config, whichever backend the gate grades.
+const SQLITE_STATE: &[(&str, &str)] = &[("RIVET_STATE_URL", "")];
+
+/// Run `rig` once on the SQLite state; panic unless it succeeds.
+fn first_run_on_sqlite(rig: &Rig) {
+    let out = rig.run_with_envs(SQLITE_STATE);
+    assert!(
+        out.status.success(),
+        "fixture: the first run succeeds\n{}",
+        text(&out)
+    );
+}
+
+/// An incremental export of ids `1..=10` that has run once on the SQLite state, then three more source rows.
+fn incremental_with_a_pending_delta(engine: SqlEngine, tag: &str) -> (Rig, Box<dyn std::any::Any>) {
+    let (table, guard) = id_v_table(engine, tag, 10);
     let rig = engine
         .rig(&table)
         .mode("incremental")
         .export_line("cursor_column: id");
-    rig.run_ok();
+    first_run_on_sqlite(&rig);
     insert_ids(engine, &table, 11..=13);
-    let locked = ReadOnlyState::beside(&rig.config_path());
-    let out = rig.run();
-    drop(locked);
+    (rig, guard)
+}
+
+/// RESULTS 3: a run over a state it cannot write is refused before it exports, and runs once the state is writable.
+fn read_only_state(engine: SqlEngine) {
+    let (rig, _guard) = incremental_with_a_pending_delta(engine, "oc_rostate");
+    read_only_state_on(rig);
+}
+
+/// RESULTS 3 on MongoDB: a `full` export that has run once, over a state it can no longer write.
+fn mongo_read_only_state() {
+    let (url, _m, _guard) = mongo_db("oc_rostate", ROWS);
+    let rig = Rig::mongo_batch("t").source_url(&url);
+    first_run_on_sqlite(&rig);
+    read_only_state_on(rig);
+}
+
+/// `rig` has run once on the SQLite state: for each read-only shape, lock it, refuse twice, unlock, deliver.
+fn read_only_state_on(mut rig: Rig) {
+    for shape in [ReadOnly::Files, ReadOnly::Directory] {
+        let locked = ReadOnlyState::beside(&rig.config_path(), shape);
+        let said = rig.refuses_twice_then(
+            &["run"],
+            SQLITE_STATE,
+            Refused::by_code("RIVET_STATE_NOT_WRITABLE", 1),
+            vec![Remedy::new(
+                "Make the state database writable and run again.",
+                Then::DeliversTheSource,
+                move |_| drop(locked),
+            )],
+        );
+        assert!(
+            !said.contains("Another rivet process"),
+            "{shape:?}: a read-only state is not another process's lock\n{said}"
+        );
+    }
+}
+
+/// Sorted `id` values of every part under `out`, whatever the column's integer width (Oracle delivers NUMBER(19) as a decimal).
+fn delivered_ids(out: &std::path::Path) -> Vec<i64> {
+    use arrow::array::{Array, Int64Array};
+    let mut ids = Vec::new();
+    for b in read_all_parts(out) {
+        let col = b.column_by_name("id").expect("an id column");
+        let col =
+            arrow::compute::cast(col, &arrow::datatypes::DataType::Int64).expect("an integer id");
+        let col = col.as_any().downcast_ref::<Int64Array>().expect("Int64");
+        ids.extend((0..col.len()).map(|i| col.value(i)));
+    }
+    ids.sort_unstable();
+    ids
+}
+
+/// RESULTS 3 (the write after the manifest): a run whose cursor write fails delivers its rows and does not exit 0.
+fn cursor_write_fails(engine: SqlEngine) {
+    let (rig, _guard) = incremental_with_a_pending_delta(engine, "oc_nocursor");
+    let rig = rig.a_failed_run_may_leave(
+        &[Leftover::DeliveredRun],
+        "the cursor write fails after the rows and the manifest are durable: the exit is a verdict on a delivered run",
+    );
+    let state = rusqlite::Connection::open(rig.config_path().with_file_name(".rivet_state.db"))
+        .expect("the SQLite state beside the config");
+    let cursor = |state: &rusqlite::Connection| -> String {
+        state
+            .query_row("SELECT last_cursor_value FROM export_state", [], |r| {
+                r.get(0)
+            })
+            .expect("one export_state row")
+    };
+    assert_eq!(
+        cursor(&state),
+        "10",
+        "fixture: the first run stored its cursor"
+    );
+    state
+        .execute_batch(
+            "CREATE TRIGGER oc_frozen_u BEFORE UPDATE ON export_state \
+             BEGIN SELECT RAISE(ABORT, 'export_state is frozen'); END; \
+             CREATE TRIGGER oc_frozen_i BEFORE INSERT ON export_state \
+             BEGIN SELECT RAISE(ABORT, 'export_state is frozen'); END;",
+        )
+        .expect("freeze export_state");
+    let out = rig.run_with_envs(SQLITE_STATE);
+    assert_refused(&out, Refused::by_code("RIVET_STATE_CURSOR_NOT_STORED", 1));
     assert!(
-        !out.status.success(),
-        "an incremental run that could not advance its cursor (read-only state) exited 0\n{}",
+        text(&out).contains("export_state is frozen"),
+        "the failure names its cause\n{}",
         text(&out)
+    );
+    assert_eq!(
+        cursor(&state),
+        "10",
+        "the cursor stays where the last stored run left it"
+    );
+    assert_eq!(
+        delivered_ids(&rig.out_dir()),
+        (1..=13).collect::<Vec<i64>>(),
+        "the run that could not store its cursor delivered its rows once"
     );
 }
 
@@ -651,17 +808,37 @@ fn doctor_agrees_on_a_server_without_logical_wal() {
 /// RESULTS 9: a `RIVET_STATE_URL` rivet cannot use is refused, not replaced by a SQLite file beside the config.
 fn unusable_state_url(engine: SqlEngine) {
     let (table, _guard) = id_v_table(engine, "oc_stateurl", 10);
-    unusable_state_url_on(engine.rig(&table));
+    unusable_state_url_on(engine.rig(&table), None);
 }
 
-fn unusable_state_url_on(rig: Rig) {
-    let out = rig.run_with_env(
-        "RIVET_STATE_URL",
-        "postgre://rivet:rivet@127.0.0.1:5433/rivet_nope",
-    );
-    assert!(
-        !out.status.success(),
-        "`RIVET_STATE_URL=postgre://...` (a scheme rivet does not know) ran with exit 0 on a SQLite state beside the config"
+/// Refuse the typo twice, then each remedy: unset it, and (with a state server) the corrected URL.
+fn unusable_state_url_on(mut rig: Rig, corrected: Option<&str>) {
+    let mut remedies = vec![
+        Remedy::new(
+            "unset it to keep the state in `.rivet_state.db` beside the config",
+            Then::DeliversTheSource,
+            |_| {},
+        )
+        .rerun_env(&[]),
+    ];
+    if let Some(url) = corrected {
+        remedies.push(
+            Remedy::new(
+                "Set RIVET_STATE_URL to a `postgres://` or `postgresql://` URL",
+                Then::DeliversTheSource,
+                |_| {},
+            )
+            .rerun_env(&[("RIVET_STATE_URL", url)]),
+        );
+    }
+    rig.refuses_twice_then(
+        &["run"],
+        &[(
+            "RIVET_STATE_URL",
+            "postgre://rivet:rivet@127.0.0.1:5433/rivet_nope",
+        )],
+        Refused::by_code("RIVET_STATE_URL_SCHEME_UNSUPPORTED", 1),
+        remedies,
     );
 }
 
@@ -1131,53 +1308,78 @@ fn a_run_without_the_checkpoint_beside_an_unfinished_run_is_refused_mssql() {
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose postgres; open defect (run --validate exit), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_run_validate_does_not_exit_0_over_a_failed_validation_postgres() {
+#[ignore = "live: requires docker compose postgres"]
+fn run_validate_fails_the_run_over_a_failed_validation_postgres() {
     run_validate_flag(SqlEngine::Pg);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mysql; open defect (run --validate exit), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_run_validate_does_not_exit_0_over_a_failed_validation_mysql() {
+#[ignore = "live: requires docker compose mysql"]
+fn run_validate_fails_the_run_over_a_failed_validation_mysql() {
     run_validate_flag(SqlEngine::Mysql);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mssql; open defect (run --validate exit), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_run_validate_does_not_exit_0_over_a_failed_validation_mssql() {
+#[ignore = "live: requires docker compose mssql"]
+fn run_validate_fails_the_run_over_a_failed_validation_mssql() {
     run_validate_flag(SqlEngine::Mssql);
 }
 
 #[cfg(feature = "oracle")]
 #[test]
-#[ignore = "live+gate-only: docker compose oracle; open defect (run --validate exit), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_run_validate_does_not_exit_0_over_a_failed_validation_oracle() {
+#[ignore = "live: requires docker compose oracle"]
+fn run_validate_fails_the_run_over_a_failed_validation_oracle() {
     run_validate_flag(SqlEngine::Oracle);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose postgres; open defect (read-only state), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_run_that_cannot_store_its_cursor_does_not_exit_0_postgres() {
+#[ignore = "live: requires docker compose postgres"]
+fn a_run_over_a_read_only_state_is_refused_and_runs_once_it_is_writable_postgres() {
     read_only_state(SqlEngine::Pg);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mysql; open defect (read-only state), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_run_that_cannot_store_its_cursor_does_not_exit_0_mysql() {
+#[ignore = "live: requires docker compose mysql"]
+fn a_run_over_a_read_only_state_is_refused_and_runs_once_it_is_writable_mysql() {
     read_only_state(SqlEngine::Mysql);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mssql; open defect (read-only state), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_run_that_cannot_store_its_cursor_does_not_exit_0_mssql() {
+#[ignore = "live: requires docker compose mssql"]
+fn a_run_over_a_read_only_state_is_refused_and_runs_once_it_is_writable_mssql() {
     read_only_state(SqlEngine::Mssql);
 }
 
 #[cfg(feature = "oracle")]
 #[test]
-#[ignore = "live+gate-only: docker compose oracle; open defect (read-only state), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_run_that_cannot_store_its_cursor_does_not_exit_0_oracle() {
+#[ignore = "live: requires docker compose oracle"]
+fn a_run_over_a_read_only_state_is_refused_and_runs_once_it_is_writable_oracle() {
     read_only_state(SqlEngine::Oracle);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_run_whose_cursor_write_fails_delivers_and_does_not_exit_0_postgres() {
+    cursor_write_fails(SqlEngine::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn a_run_whose_cursor_write_fails_delivers_and_does_not_exit_0_mysql() {
+    cursor_write_fails(SqlEngine::Mysql);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn a_run_whose_cursor_write_fails_delivers_and_does_not_exit_0_mssql() {
+    cursor_write_fails(SqlEngine::Mssql);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn a_run_whose_cursor_write_fails_delivers_and_does_not_exit_0_oracle() {
+    cursor_write_fails(SqlEngine::Oracle);
 }
 
 #[test]
@@ -1317,27 +1519,29 @@ fn plan_refuses_a_password_the_source_rejects_oracle() {
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose postgres; open defect (state URL typo falls back to SQLite), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_an_unusable_state_url_is_refused_postgres() {
-    unusable_state_url(SqlEngine::Pg);
+#[ignore = "live: requires postgres + postgres-state"]
+fn an_unusable_state_url_is_refused_and_each_remedy_runs_postgres() {
+    let (table, _guard) = id_v_table(SqlEngine::Pg, "oc_stateurl", 10);
+    let state = ScratchStateDb::new("oc_stateurl");
+    unusable_state_url_on(SqlEngine::Pg.rig(&table), Some(&state.url()));
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mysql; open defect (state URL typo falls back to SQLite), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_an_unusable_state_url_is_refused_mysql() {
+#[ignore = "live: requires docker compose mysql"]
+fn an_unusable_state_url_is_refused_and_each_remedy_runs_mysql() {
     unusable_state_url(SqlEngine::Mysql);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mssql; open defect (state URL typo falls back to SQLite), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_an_unusable_state_url_is_refused_mssql() {
+#[ignore = "live: requires docker compose mssql"]
+fn an_unusable_state_url_is_refused_and_each_remedy_runs_mssql() {
     unusable_state_url(SqlEngine::Mssql);
 }
 
 #[cfg(feature = "oracle")]
 #[test]
-#[ignore = "live+gate-only: docker compose oracle; open defect (state URL typo falls back to SQLite), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_an_unusable_state_url_is_refused_oracle() {
+#[ignore = "live: requires docker compose oracle"]
+fn an_unusable_state_url_is_refused_and_each_remedy_runs_oracle() {
     unusable_state_url(SqlEngine::Oracle);
 }
 
@@ -1531,8 +1735,14 @@ fn open_defect_range_chunking_takes_a_number_19_key_oracle() {
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose up -d mongo; open defect (run --validate exit), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_run_validate_does_not_exit_0_over_a_failed_validation_mongo() {
+#[ignore = "live: requires docker compose up -d mongo"]
+fn a_run_over_a_read_only_state_is_refused_and_runs_once_it_is_writable_mongo() {
+    mongo_read_only_state();
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mongo"]
+fn run_validate_fails_the_run_over_a_failed_validation_mongo() {
     let (url, _m, _guard) = mongo_db("oc_validate", ROWS);
     run_validate_flag_on(Rig::mongo_batch("t").source_url(&url));
 }
@@ -1592,10 +1802,10 @@ fn check_refuses_a_collection_that_does_not_exist_as_run_does_mongo() {
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose up -d mongo; open defect (state URL typo falls back to SQLite), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_an_unusable_state_url_is_refused_mongo() {
+#[ignore = "live: requires docker compose up -d mongo"]
+fn an_unusable_state_url_is_refused_and_each_remedy_runs_mongo() {
     let (url, _m, _guard) = mongo_db("oc_stateurl", 10);
-    unusable_state_url_on(Rig::mongo_batch("t").source_url(&url));
+    unusable_state_url_on(Rig::mongo_batch("t").source_url(&url), None);
 }
 
 #[test]

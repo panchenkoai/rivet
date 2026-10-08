@@ -560,10 +560,7 @@ pub fn run(
         // version and children's `StateStore::open` calls become idempotent
         // (the `MIGRATIONS` loop is a no-op when `ver <= current`).
         if let Err(e) = StateStore::open(config_path) {
-            return Err(anyhow::anyhow!(
-                "state: failed to initialize state DB before spawning children: {:#}",
-                e
-            ));
+            return Err(e.context("state: failed to initialize state DB before spawning children"));
         }
 
         // Every child sets ENV_CONCURRENT_SIBLINGS, so every child's per-export
@@ -673,10 +670,9 @@ pub fn run(
         // concurrent redraws.  Ensure stderr is also pre-migrated so child
         // threads opening their own `StateStore` don't race on schema DDL.
         if let Err(e) = StateStore::open(config_path) {
-            return Err(anyhow::anyhow!(
-                "state: failed to initialize state DB before spawning export threads: {:#}",
-                e
-            ));
+            return Err(
+                e.context("state: failed to initialize state DB before spawning export threads")
+            );
         }
         let n_cards = exports.len();
         let card_ui = CardUi::start(name_floor, n_cards);

@@ -797,25 +797,9 @@ fn refused_twice_for_the_stream(
 
 /// `stage` on this rig, with key and cursor columns named as the engine's catalog holds them (Oracle folds to upper case).
 fn staged_for(engine: SqlEngine, rig: Rig, stage: &Stage, out: &Path) -> Rig {
-    let lines: Vec<String> = stage
-        .1
-        .iter()
-        .map(|l| match l.split_once(": ") {
-            Some((
-                k @ ("chunk_by_key"
-                | "chunk_column"
-                | "cursor_column"
-                | "time_column"
-                | "cursor_fallback_column"),
-                v,
-            )) if engine.folds_upper() => {
-                format!("{k}: {}", v.to_uppercase())
-            }
-            _ => l.to_string(),
-        })
-        .collect();
-    let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
-    rig.restage(stage.0, &lines).dest_path(out.to_path_buf())
+    engine
+        .staged(rig, stage.0, stage.1)
+        .dest_path(out.to_path_buf())
 }
 
 /// `text` with the fixture's column names spelled as the engine's catalog holds them.

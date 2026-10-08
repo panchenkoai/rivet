@@ -1,0 +1,15 @@
+diff --git a/src/pipeline/job.rs b/src/pipeline/job.rs
+--- a/src/pipeline/job.rs
++++ b/src/pipeline/job.rs
+@@ -1618,7 +1618,10 @@
+             );
+         }
+     } else if let Err(e) = commit_incremental_cursor(state, plan, &summary) {
+-        cursor_gate = Err(cursor_not_stored(tail.kind, &summary.export_name, &e));
++        log::error!(
++            "{:#}",
++            cursor_not_stored(tail.kind, &summary.export_name, &e)
++        );
+     }
+     // Round-5: a keyset checkpoint run has now finalized its COMPLETE destination
+     // manifest — clear the in-progress run_id (persisted for crash rehydration) so a

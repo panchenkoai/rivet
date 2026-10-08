@@ -309,6 +309,12 @@ const MATRICES: &[(&str, usize)] = &[
     // or oplog for one cell without a SYSDBA handle or a dedicated replica set.
     // Lowered 4 -> 2 (2026-10-08): the MongoDB oplog-gone cells on a throwaway replica set; the Oracle pair was attempted and stays.
     ("docs/operator-contract-matrix.yaml", 2),
+    // Sabotage: every `refusal` code of the registry walked out of (refuse, again, each named remedy,
+    // one wrong remedy) and damage to what a run reads about itself. Born at 78 (2026-10-08): 62 are
+    // refusal codes other cells assert but nobody walks (the CDC, load and legacy-state codes), 9 are
+    // the Oracle cells of open-defect rows (no stand that runs `open_defect_` cells had Oracle), 5 the
+    // keyset_range row, 2 MongoDB cells.
+    ("docs/sabotage-matrix.yaml", 78),
     // Pool-split — `apply --pool --split` per (strategy × source engine). Split is a
     // scheduler layer above the runners (each unit runs through chunked/keyset), so its
     // per-engine behaviour (boundary probe, crash-recovery, finding-2 exact-partition
@@ -1693,5 +1699,134 @@ fn runner_matrix_cells_exercise_what_their_row_claims() {
     assert!(
         graded >= 10,
         "graded only {graded} cells — the claim table or the parse is broken"
+    );
+}
+
+const SABOTAGE_MATRIX: &str = "docs/sabotage-matrix.yaml";
+const REFUSAL_ROW: &str = "refusal_";
+/// The one entry point of a `refusal_*` cell: refuse, again, each named remedy, one wrong remedy.
+const REFUSAL_WALK: &str = "refuses_twice_and_walks_out(";
+
+/// The `refusal` codes of the generated registry (docs/reference/errors.md, written by `rivet schema errors`).
+fn registry_refusal_codes() -> std::collections::BTreeSet<String> {
+    let text = std::fs::read_to_string(repo_root().join("docs/reference/errors.md"))
+        .expect("docs/reference/errors.md");
+    text.lines()
+        .filter_map(|l| {
+            let cols: Vec<&str> = l.split('|').map(str::trim).collect();
+            let code = cols.get(1)?.strip_prefix("`RIVET_")?.strip_suffix('`')?;
+            (cols.get(2) == Some(&"refusal")).then(|| format!("RIVET_{code}"))
+        })
+        .collect()
+}
+
+/// The registry code a `refusal_*` row id names.
+fn refusal_row_code(id: &str) -> Option<String> {
+    id.strip_prefix(REFUSAL_ROW)
+        .map(|c| format!("RIVET_{}", c.to_uppercase()))
+}
+
+/// Why the `refusal_*` rows and the registry's refusal codes are not one to one, else empty.
+fn refusal_rows_vs_registry(
+    rows: &std::collections::BTreeSet<String>,
+    codes: &std::collections::BTreeSet<String>,
+) -> Vec<String> {
+    let unwalked = codes
+        .difference(rows)
+        .map(|c| format!("{c} is a refusal of the registry with no `refusal_*` row"));
+    let stale = rows
+        .difference(codes)
+        .map(|c| format!("a `refusal_*` row names {c}, which is not a refusal of the registry"));
+    unwalked.chain(stale).collect()
+}
+
+/// Every refusal the registry can give has a sabotage row, and no row names a code that is gone.
+#[test]
+fn sabotage_matrix_has_one_refusal_row_per_registry_refusal_code() {
+    let codes = registry_refusal_codes();
+    assert!(
+        codes.len() >= 20,
+        "read only {} refusal codes from docs/reference/errors.md — the parse is broken",
+        codes.len()
+    );
+    let rows = load_matrix(SABOTAGE_MATRIX)
+        .scenarios
+        .iter()
+        .filter_map(|s| refusal_row_code(&s.id))
+        .collect();
+    let off = refusal_rows_vs_registry(&rows, &codes);
+    assert!(off.is_empty(), "{SABOTAGE_MATRIX}:\n  {}", off.join("\n  "));
+}
+
+/// Why a `refusal_*` cell's test (its closure `body`) does not walk out of `code`, else `None`.
+fn not_a_refusal_walk(body: &str, code: &str) -> Option<String> {
+    if !body.contains(REFUSAL_WALK) {
+        return Some(format!("never reaches `{REFUSAL_WALK}`"));
+    }
+    (!body.contains(&format!("\"{code}\""))).then(|| format!("never names \"{code}\""))
+}
+
+/// A `refusal_*` cell cites a test that walks out of the row's own code through the one entry point.
+#[test]
+fn sabotage_refusal_cells_walk_out_of_the_code_their_row_names() {
+    let matrix = load_matrix(SABOTAGE_MATRIX);
+    let mut graded = 0;
+    for sc in &matrix.scenarios {
+        let Some(code) = refusal_row_code(&sc.id) else {
+            continue;
+        };
+        for (col, cell) in sc.resolved_cells(&matrix.engines, SABOTAGE_MATRIX) {
+            let Some(test) = &cell.test else { continue };
+            let body = test_closure(test)
+                .unwrap_or_else(|| panic!("{}.{col}: no `fn {test}` under src/ or tests/", sc.id));
+            graded += 1;
+            if let Some(why) = not_a_refusal_walk(&body, &code) {
+                panic!(
+                    "{SABOTAGE_MATRIX} {}.{col} cites `{test}`, which {why}",
+                    sc.id
+                );
+            }
+        }
+    }
+    assert!(
+        graded >= 20,
+        "graded only {graded} refusal cells — the matrix or the parse is broken"
+    );
+}
+
+#[test]
+fn a_refusal_row_set_that_misses_or_invents_a_code_is_reported() {
+    let set = |v: &[&str]| v.iter().map(|s| s.to_string()).collect();
+    let codes = set(&["RIVET_STATE_SCHEMA_NEWER", "RIVET_STATE_RUN_IN_PROGRESS"]);
+    assert!(refusal_rows_vs_registry(&codes, &codes).is_empty());
+    assert_eq!(
+        refusal_rows_vs_registry(&set(&["RIVET_STATE_SCHEMA_NEWER", "RIVET_GONE"]), &codes),
+        vec![
+            "RIVET_STATE_RUN_IN_PROGRESS is a refusal of the registry with no `refusal_*` row",
+            "a `refusal_*` row names RIVET_GONE, which is not a refusal of the registry",
+        ]
+    );
+    assert_eq!(
+        refusal_row_code("refusal_state_schema_newer").as_deref(),
+        Some("RIVET_STATE_SCHEMA_NEWER")
+    );
+    assert_eq!(refusal_row_code("corrupt_part_removed"), None);
+}
+
+#[test]
+fn a_refusal_cell_that_skips_the_walk_or_walks_another_code_is_reported() {
+    let walk = "rig.refuses_twice_and_walks_out(&[\"run\"], Refused::by_code(\"RIVET_STATE_SCHEMA_NEWER\", 5))";
+    assert_eq!(not_a_refusal_walk(walk, "RIVET_STATE_SCHEMA_NEWER"), None);
+    assert_eq!(
+        not_a_refusal_walk(walk, "RIVET_STATE_RUN_IN_PROGRESS").as_deref(),
+        Some("never names \"RIVET_STATE_RUN_IN_PROGRESS\"")
+    );
+    assert_eq!(
+        not_a_refusal_walk(
+            &walk.replace("_and_walks_out", "_then"),
+            "RIVET_STATE_SCHEMA_NEWER"
+        )
+        .as_deref(),
+        Some("never reaches `refuses_twice_and_walks_out(`")
     );
 }
