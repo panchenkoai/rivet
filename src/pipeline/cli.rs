@@ -247,9 +247,16 @@ pub fn reset_state(config_path: &str, export_name: &str) -> Result<()> {
             config_path,
         );
     }
+    let source = config.source.try_state_key().map_err(|e| {
+        anyhow::anyhow!(
+            "export '{export_name}': `state reset` clears the progress this config's source \
+             holds and no other source's, and the source did not resolve — nothing was \
+             reset.\n  {e:#}"
+        )
+    })?;
     let state = StateStore::open(config_path)?;
     let _held = super::chunked::claim_export_progress(&state, export_name, "reset its state")?;
-    state.reset(export_name)?;
+    state.reset(export_name, &source)?;
     println!("State reset for export '{}'", export_name);
     Ok(())
 }
@@ -1494,16 +1501,28 @@ exports:
         let run = open_state(&dir);
         run.create_chunk_run("r_tx", "transactions", "plan", 3)
             .unwrap();
+        let source = crate::config::Config::load(&config_path)
+            .unwrap()
+            .source
+            .state_key();
+        assert!(!source.is_empty(), "the fixture config names a source");
         let key = crate::state::ProgressKey {
             export_name: "transactions".into(),
-            source: "pg/out".into(),
+            source: source.clone(),
             stream: String::new(),
+            schema: String::new(),
+            population: String::new(),
             column: Some("updated_at".into()),
             mode: "keyset",
             continues_high_water: true,
             resumable: true,
         };
         run.update_with_column(&key, "2026-09-01").unwrap();
+        let elsewhere = crate::state::ProgressKey {
+            source: "postgres://another.host:5432/db".into(),
+            ..key.clone()
+        };
+        run.update_with_column(&elsewhere, "2026-08-01").unwrap();
         let held = crate::pipeline::chunked::try_run_lease(&run, "transactions")
             .unwrap()
             .expect("the live run's lease");
@@ -1529,7 +1548,7 @@ exports:
             );
             assert_eq!(
                 run.list_all().unwrap().len(),
-                1,
+                2,
                 "cycle {cycle}: the live run keeps its cursor row"
             );
         }
@@ -1542,8 +1561,17 @@ exports:
                 .is_none(),
             "a chunk run nobody holds is stuck, and is cleared"
         );
-        reset_state(&config_path, "transactions").unwrap();
-        assert!(run.list_all().unwrap().is_empty());
+        for cycle in 0..2 {
+            reset_state(&config_path, "transactions").unwrap();
+            let own = run.get("transactions", &source).unwrap();
+            assert_eq!(own.last_cursor_value, None, "cycle {cycle}: its own cursor");
+            let other = run.get("transactions", &elsewhere.source).unwrap();
+            assert_eq!(
+                other.last_cursor_value.as_deref(),
+                Some("2026-08-01"),
+                "P-19 cycle {cycle}: a same-named export of another source keeps its cursor"
+            );
+        }
         run.create_chunk_run("r_tx2", "transactions", "plan", 3)
             .unwrap();
         reset_chunk_checkpoint(&config_path, "transactions").unwrap();

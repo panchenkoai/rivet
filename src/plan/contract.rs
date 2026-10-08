@@ -252,6 +252,8 @@ impl ResolvedRunPlan {
             export_name: self.export_name.clone(),
             source: self.source.state_key(),
             stream: self.stream(),
+            schema: self.source.search_path(),
+            population: crate::sql::row_set(&self.base_query),
             column: self.strategy.cursor_identity(),
             mode: self.strategy.mode_label(),
             continues_high_water: self.strategy.continues_stored_cursor(),

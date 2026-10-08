@@ -604,18 +604,20 @@ fn parallel_keyset_then_resume_mongo() {
     mongo_switch_to_resume(Some("page_size: 4"), true, Expect::FullPass);
 }
 
-/// Run after an identity change: true when it refused loudly, naming `state reset`.
-fn refused(rig: &Rig) -> bool {
-    let run = rig.run();
-    if run.status.success() {
-        return false;
-    }
-    let said = String::from_utf8_lossy(&run.stderr);
-    assert!(
-        said.contains("state reset"),
-        "a refusal must name `state reset`:\n{said}"
-    );
-    true
+/// The stream refusal's remedy for an export whose query or source was edited.
+const RESTORE: &str = "restore what it read to continue from the stored progress";
+
+/// The stream refusal's reset remedy for `export`, applied through the CLI.
+fn reset_remedy<'a>(export: &'a str) -> crate::common::Remedy<'a> {
+    crate::common::Remedy::new(
+        &format!("`rivet state reset -c <config> --export {export}` starts `"),
+        Then::DeliversTheSource,
+        move |r| {
+            let reset = r.cli(&["state", "reset", "--export", export]);
+            let said = String::from_utf8_lossy(&reset.stderr);
+            assert!(reset.status.success(), "{said}");
+        },
+    )
 }
 
 /// P-22: a parallel keyset run resumed after a crash stores the highest key it delivered.
@@ -655,33 +657,55 @@ fn resumed_parallel_keyset_then_incremental(e: SqlEngine) {
     );
 }
 
-/// An edited `query:` filter under the same FROM is another stream: refused, or its own rows in full.
+/// An edited `query:` filter under the same FROM is another stream: refused twice by code; the old filter restored continues, a reset delivers the new filter's rows in full, another destination changes nothing.
 fn incremental_query_filter_edited(e: SqlEngine) {
     e.alive();
     let (table, _guard) = e.table("mode_transition");
     e.insert(&table, 1..=5, 180, Some(0));
     e.insert(&table, 6..=10, 180, Some(1));
-    let (first, second) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let (first, second, third) = (dirs[0].path(), dirs[1].path(), dirs[2].path());
     let filtered =
         |spent: i32| format!("SELECT id, time_spent FROM {table} WHERE time_spent = {spent}");
 
-    let rig = staged_for(
-        e,
-        e.rig(&table).query(&filtered(1)),
-        &INCREMENTAL_ID,
-        first.path(),
-    );
+    let rig = staged_for(e, e.rig(&table).query(&filtered(1)), &INCREMENTAL_ID, first);
     rig.run_ok();
-    assert_eq!(delivered_ids(e, first.path()), (6..=10).collect::<Vec<_>>());
+    assert_eq!(delivered_ids(e, first), (6..=10).collect::<Vec<_>>());
 
-    let rig = staged_for(e, rig.query(&filtered(0)), &INCREMENTAL_ID, second.path());
-    if !refused(&rig) {
-        let ids = delivered_ids(e, second.path());
-        assert!(
-            ids == (1..=5).collect::<Vec<_>>(),
-            "an edited query filter inherited the old filter's cursor: the run delivered ids {ids:?} of 1..=5 with exit 0"
-        );
+    let mut rig = staged_for(e, rig.query(&filtered(0)), &INCREMENTAL_ID, second);
+    let said = rig.refuses_twice_and_walks_out(
+        &["run"],
+        &[],
+        STREAM_REFUSED,
+        vec![
+            crate::common::Remedy::wrong(
+                "pointed the export at another destination",
+                Then::Refuses(STREAM_REFUSED),
+                |r| r.rebuilt(|r| r.dest_path(third.to_path_buf())),
+            ),
+            crate::common::Remedy::new(RESTORE, Then::DeliversTheSource, |r| {
+                r.rebuilt(|r| staged_for(e, r.query(&filtered(1)), &INCREMENTAL_ID, first))
+            }),
+            reset_remedy(&table),
+        ],
+    );
+    for want in [
+        "where time_spent = 1)",
+        "where time_spent = 0)",
+        "cursor `10`",
+    ] {
+        assert!(said.contains(want), "the refusal names {want}:\n{said}");
     }
+    assert_eq!(
+        delivered_ids(e, second),
+        (1..=5).collect::<Vec<_>>(),
+        "after the reset the edited filter delivers its own rows in full"
+    );
+    assert!(
+        delivered_ids(e, third).is_empty(),
+        "a refused run writes nothing"
+    );
+    assert_eq!(delivered_ids(e, first), (6..=10).collect::<Vec<_>>());
 }
 
 struct PgSchema(String);
@@ -695,8 +719,8 @@ impl Drop for PgSchema {
 }
 
 #[test]
-#[ignore = "live+gate-only: postgres; open defect P-22, acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_resumed_parallel_keyset_then_incremental_postgres() {
+#[ignore = "live: requires docker compose postgres"]
+fn resumed_parallel_keyset_then_incremental_postgres() {
     resumed_parallel_keyset_then_incremental(SqlEngine::Pg);
 }
 
@@ -723,14 +747,15 @@ fn source_url_without_its_default_port_continues(e: SqlEngine) {
 }
 
 #[test]
-#[ignore = "live+gate-only: postgres; open defect P-18, acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_source_url_without_its_default_port_continues_postgres() {
+#[ignore = "live: requires docker compose postgres"]
+fn source_url_without_its_default_port_continues_postgres() {
     source_url_without_its_default_port_continues(SqlEngine::Pg);
 }
 
+/// The same table name read through another `search_path` is another stream: refused twice by code; the old source restored continues, a reset delivers the other schema's rows in full, another destination changes nothing.
 #[test]
-#[ignore = "live+gate-only: postgres; open defect (cursor identity, search_path), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_same_table_in_another_schema_is_another_stream_postgres() {
+#[ignore = "live: requires docker compose postgres"]
+fn same_table_in_another_schema_is_another_stream_postgres() {
     let e = SqlEngine::Pg;
     e.alive();
     let (table, _guard) = e.table("mode_transition");
@@ -741,25 +766,47 @@ fn open_defect_same_table_in_another_schema_is_another_stream_postgres() {
          INSERT INTO {s}.{table} SELECT * FROM public.{table} WHERE id <= 7",
         s = schema.0
     ));
-    let (first, second) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-    let rig = staged_for(e, e.rig(&table), &INCREMENTAL_ID, first.path());
+    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let (first, second, third) = (dirs[0].path(), dirs[1].path(), dirs[2].path());
+    let rig = staged_for(e, e.rig(&table), &INCREMENTAL_ID, first);
     rig.run_ok();
-    assert_eq!(read_ids(first.path()), (1..=10).collect::<Vec<_>>());
+    assert_eq!(read_ids(first), (1..=10).collect::<Vec<_>>());
 
     let elsewhere = format!("{POSTGRES_URL}?options=-csearch_path%3D{}", schema.0);
-    let rig = staged_for(e, rig, &INCREMENTAL_ID, second.path()).source_url(&elsewhere);
-    if !refused(&rig) {
-        let ids = read_ids(second.path());
-        assert!(
-            ids == (1..=7).collect::<Vec<_>>(),
-            "the same table name in another schema inherited the cursor: the run delivered ids {ids:?} of 1..=7 with exit 0"
-        );
+    let mut rig = staged_for(e, rig, &INCREMENTAL_ID, second).source_url(&elsewhere);
+    let said = rig.refuses_twice_and_walks_out(
+        &["run"],
+        &[],
+        STREAM_REFUSED,
+        vec![
+            crate::common::Remedy::wrong(
+                "pointed the export at another destination",
+                Then::Refuses(STREAM_REFUSED),
+                |r| r.rebuilt(|r| r.dest_path(third.to_path_buf())),
+            ),
+            crate::common::Remedy::new(RESTORE, Then::DeliversTheSource, |r| {
+                r.rebuilt(|r| staged_for(e, r, &INCREMENTAL_ID, first).source_url(POSTGRES_URL))
+            }),
+            reset_remedy(&table),
+        ],
+    );
+    for want in [
+        format!("`{table} under the server's own search_path`"),
+        format!("`{table} under search_path {}`", schema.0),
+    ] {
+        assert!(said.contains(&want), "the refusal names {want}:\n{said}");
     }
+    assert_eq!(
+        read_ids(second),
+        (1..=7).collect::<Vec<_>>(),
+        "after the reset the other schema's table is delivered in full"
+    );
+    assert!(read_ids(third).is_empty(), "a refused run writes nothing");
 }
 
 #[test]
-#[ignore = "live+gate-only: postgres; open defect (cursor identity, edited query), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_incremental_query_filter_edited_postgres() {
+#[ignore = "live: requires docker compose postgres"]
+fn incremental_query_filter_edited_postgres() {
     incremental_query_filter_edited(SqlEngine::Pg);
 }
 
@@ -1950,59 +1997,59 @@ fn crashed_range_chunk_then_incremental_reset_oracle() {
 }
 
 #[test]
-#[ignore = "live+gate-only: mysql; open defect P-22, acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_resumed_parallel_keyset_then_incremental_mysql() {
+#[ignore = "live: requires docker compose mysql"]
+fn resumed_parallel_keyset_then_incremental_mysql() {
     resumed_parallel_keyset_then_incremental(SqlEngine::Mysql);
 }
 
 #[test]
-#[ignore = "live+gate-only: mssql; open defect P-22, acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_resumed_parallel_keyset_then_incremental_mssql() {
+#[ignore = "live: requires docker compose mssql"]
+fn resumed_parallel_keyset_then_incremental_mssql() {
     resumed_parallel_keyset_then_incremental(SqlEngine::Mssql);
 }
 
 #[cfg(feature = "oracle")]
 #[test]
-#[ignore = "live+gate-only: oracle; open defect P-22, acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_resumed_parallel_keyset_then_incremental_oracle() {
+#[ignore = "live: requires docker compose oracle"]
+fn resumed_parallel_keyset_then_incremental_oracle() {
     resumed_parallel_keyset_then_incremental(SqlEngine::Oracle);
 }
 
 #[test]
-#[ignore = "live+gate-only: mysql; open defect P-18, acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_source_url_without_its_default_port_continues_mysql() {
+#[ignore = "live: requires docker compose mysql"]
+fn source_url_without_its_default_port_continues_mysql() {
     source_url_without_its_default_port_continues(SqlEngine::Mysql);
 }
 
 #[test]
-#[ignore = "live+gate-only: mssql; open defect P-18, acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_source_url_without_its_default_port_continues_mssql() {
+#[ignore = "live: requires docker compose mssql"]
+fn source_url_without_its_default_port_continues_mssql() {
     source_url_without_its_default_port_continues(SqlEngine::Mssql);
 }
 
 #[cfg(feature = "oracle")]
 #[test]
-#[ignore = "live+gate-only: oracle; open defect P-18, acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_source_url_without_its_default_port_continues_oracle() {
+#[ignore = "live: requires docker compose oracle"]
+fn source_url_without_its_default_port_continues_oracle() {
     source_url_without_its_default_port_continues(SqlEngine::Oracle);
 }
 
 #[test]
-#[ignore = "live+gate-only: mysql; open defect (cursor identity, edited query), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_incremental_query_filter_edited_mysql() {
+#[ignore = "live: requires docker compose mysql"]
+fn incremental_query_filter_edited_mysql() {
     incremental_query_filter_edited(SqlEngine::Mysql);
 }
 
 #[test]
-#[ignore = "live+gate-only: mssql; open defect (cursor identity, edited query), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_incremental_query_filter_edited_mssql() {
+#[ignore = "live: requires docker compose mssql"]
+fn incremental_query_filter_edited_mssql() {
     incremental_query_filter_edited(SqlEngine::Mssql);
 }
 
 #[cfg(feature = "oracle")]
 #[test]
-#[ignore = "live+gate-only: oracle; open defect (cursor identity, edited query), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_incremental_query_filter_edited_oracle() {
+#[ignore = "live: requires docker compose oracle"]
+fn incremental_query_filter_edited_oracle() {
     incremental_query_filter_edited(SqlEngine::Oracle);
 }
 

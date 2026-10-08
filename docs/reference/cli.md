@@ -702,6 +702,8 @@ Reset the cursor for a specific export (next run will re-export all rows).
 rivet state reset --config <PATH> --export <NAME>
 ```
 
+The reset clears the progress the export holds on the source this config names (its cursor and any interrupted keyset run), so the config's source URL must resolve. An export of the same name that reads another source through the same state database keeps its cursor.
+
 While a checkpointed run of that export (`chunk_checkpoint: true`) is alive in another rivet process, the reset is refused with `RIVET_STATE_RUN_IN_PROGRESS` (exit 5) and removes nothing: wait for the run, or stop its process, and repeat the command. A run that was killed does not hold the reset back.
 
 ### `rivet state files`
