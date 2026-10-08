@@ -257,6 +257,28 @@ impl SqlEngine {
         self.exec(&self.insert_sql(table, ids, minutes_ago, spent));
     }
 
+    /// `rig` restaged to `mode` with `lines`, each key column spelled as this engine's catalog holds it (Oracle: upper case).
+    pub fn staged(self, rig: Rig, mode: &str, lines: &[&str]) -> Rig {
+        const KEYS: &[&str] = &[
+            "chunk_by_key",
+            "chunk_column",
+            "cursor_column",
+            "time_column",
+            "cursor_fallback_column",
+        ];
+        let lines: Vec<String> = lines
+            .iter()
+            .map(|l| match l.split_once(": ") {
+                Some((k, v)) if self.folds_upper() && KEYS.contains(&k) => {
+                    format!("{k}: {}", v.to_uppercase())
+                }
+                _ => l.to_string(),
+            })
+            .collect();
+        let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+        rig.restage(mode, &lines)
+    }
+
     /// A batch rig for this engine.
     pub fn rig(self, export: &str) -> Rig {
         match self {
