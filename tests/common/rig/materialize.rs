@@ -45,11 +45,14 @@ impl Rig {
 
     /// Write `rendered` to `path`, refusing to clobber a HAND-EDITED file
     /// (one whose current content matches neither the new render nor any
-    /// prior rig render — i.e. someone else wrote it).
+    /// prior rig render — i.e. someone else wrote it). A file that already
+    /// holds `rendered` is left alone: a rewrite truncates it under a live run
+    /// that is reading it.
     fn write_guarded(&self, path: &std::path::Path, rendered: &str) {
-        if let Ok(existing) = std::fs::read_to_string(path)
+        let existing = std::fs::read_to_string(path).ok();
+        if let Some(existing) = &existing
             && existing != rendered
-            && !self.past_renders.borrow().iter().any(|r| r == &existing)
+            && !self.past_renders.borrow().iter().any(|r| r == existing)
         {
             panic!(
                 "rig config at {} was edited outside the rig; every rig \
@@ -59,7 +62,9 @@ impl Rig {
                 path.display()
             );
         }
-        std::fs::write(path, rendered).unwrap();
+        if existing.as_deref() != Some(rendered) {
+            std::fs::write(path, rendered).unwrap();
+        }
         let mut past = self.past_renders.borrow_mut();
         if !past.iter().any(|r| r == rendered) {
             past.push(rendered.to_string());
