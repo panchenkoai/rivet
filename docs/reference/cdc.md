@@ -864,7 +864,9 @@ unrecoverable — [re-baseline](cdc-failure-modes.md#the-shape-of-every-recovery
 ### SQL Server — the checkpoint fell below retention
 
 If the saved LSN falls **below** `sys.fn_cdc_get_min_lsn()` (the cleanup job — ~3
-days by default — removed the changes after it), rivet **fails loudly** — *"the
+days by default — removed the changes after it, or the capture instance was disabled and
+re-enabled), rivet **fails loudly** (exit 5, `RIVET_SOURCE_CDC_LOG_GAP`), from the first run
+after the baseline — *"the
 resume position is older than the SQL Server CDC change-table retention … Re-baseline the stream"* —
 rather than resume from the new min and **silently skip the gap**. [re-baseline](cdc-failure-modes.md#the-shape-of-every-recovery) the
 stream. Also watch for a **non-advancing `sys.fn_cdc_get_max_lsn()`**:

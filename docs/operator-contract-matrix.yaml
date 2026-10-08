@@ -116,7 +116,7 @@ scenarios:
     what: "RESULTS 6, 17: retained changes removed past a checkpoint no changes run has advanced are refused as RIVET_SOURCE_CDC_LOG_GAP (exit 5)"
     postgres: { test: open_defect_a_dropped_slot_is_refused_by_code_postgres }
     mysql:    { test: open_defect_binlogs_purged_past_the_checkpoint_before_the_first_changes_run_are_refused_by_code_mysql }
-    mssql:    { test: open_defect_a_change_table_cleaned_past_the_checkpoint_before_the_first_changes_run_is_refused_by_code_mssql }
+    mssql:    { test: a_change_table_cleaned_past_the_checkpoint_before_the_first_changes_run_is_refused_by_code_mssql }
     mongo:    { test: open_defect_an_oplog_rolled_past_the_checkpoint_before_the_first_changes_run_is_refused_by_code_mongo }
     oracle:   { gap: "attempted again 2026-10-08 with a throwaway container of the cell's own (the image is on the machine): gvenzl/oracle-free:23-slim-faststart with dev/oracle/init/01-grants.sql and 02-logminer.sh mounted is ready in 26 s, and against it rivet init --mode cdc, the anchor run and one changes run exit 0, a further change is pending, and three log switches leave 4 archived logs, 4 present (V$ARCHIVED_LOG). The last step was not run: the image ships no rman, so the redo can only be lost by deleting the files under /opt/oracle/oradata/archive inside the container, and the agent session's safety check denied that removal (Permission for this command was denied by a built-in Claude Code safety check); it was not routed around. Needs a person to run the removal step once, or an image with rman. The fabricated-low-water twin is live_cdc_oracledb::oracle_cdc_resume_past_log_retention_fails_loudly" }
 

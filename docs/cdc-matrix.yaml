@@ -63,6 +63,14 @@ scenarios:
     mongo:    { test: mongo_cdc_idle_first_run_then_change_is_captured }
     oracle:   { test: oracle_cdc_idle_first_run_then_change_is_captured }
 
+  - id: cdc_log_gone_before_first_changes_run
+    what: "a baseline, then the log loses changes before the first changes run (retention cleanup, a re-created capture instance, a dropped slot): the run refuses, twice, and the printed re-baseline remedy ends with destination = source. The same loss after one changes run is fail-loud-matrix `cdc_vanished_anchor_loud`. MySQL and Oracle forge the position instead of purging the server's log (a real purge is server-global and would break concurrent cells); PostgreSQL and MySQL refuse with exit 1 and no RIVET_ code."
+    postgres: { test: pg_missing_slot_refusal_remedy_recovers_the_row_written_while_the_slot_was_gone }
+    mysql:    { test: cdc_resume_from_missing_binlog_fails_loudly_not_silently }
+    mssql:    { test: mssql_cleanup_past_unread_changes_before_the_first_changes_run_is_refused }
+    mongo:    { test: open_defect_an_oplog_rolled_past_the_checkpoint_before_the_first_changes_run_is_refused_by_code_mongo }
+    oracle:   { test: oracle_cdc_resume_past_log_retention_fails_loudly }
+
   - id: cdc_crash_at_least_once
     what: "crash before checkpoint/ack (cdc_after_flush_before_ack hook) → re-read on resume, never lose"
     postgres: { test: pg_cdc_crash_after_flush_before_ack_does_not_advance_the_slot }

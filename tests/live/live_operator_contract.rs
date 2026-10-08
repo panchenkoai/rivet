@@ -1712,8 +1712,8 @@ fn open_defect_binlogs_purged_past_the_checkpoint_before_the_first_changes_run_a
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mssql (CDC); open defect (pinned-checkpoint loss), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_change_table_cleaned_past_the_checkpoint_before_the_first_changes_run_is_refused_by_code_mssql()
+#[ignore = "live: requires docker compose mssql (CDC)"]
+fn a_change_table_cleaned_past_the_checkpoint_before_the_first_changes_run_is_refused_by_code_mssql()
  {
     let _serial = cross_process_serial("mssql_cdc");
     mssql_cleanup_past_the_checkpoint(false);

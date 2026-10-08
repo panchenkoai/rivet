@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- **Breaking: SQL Server CDC refuses a log gap from the first run after the baseline.**
+  Applies to a `mode: cdc` SQL Server export with `cdc.initial: snapshot`.
+  - Before, the checkpoint the baseline wrote (`"pinned": true`) could sit below the capture
+    instance's start, and a run moved such a position up to the start. If the change table lost
+    rows before the first run that read a change (retention cleanup past them, or the capture
+    instance disabled and re-enabled, which is also the remedy the ADD COLUMN refusal names),
+    the next runs ended with exit 0 and those changes were never delivered.
+  - Now the baseline's anchor is always inside the capture instance's lifetime, and any resume
+    position below the instance's `start_lsn` is refused: exit 5 `RIVET_SOURCE_CDC_LOG_GAP`
+    with the re-baseline remedy, on every run until the stream is re-baselined. An idle run now
+    moves a baseline-only checkpoint forward like any other, so a quiet table is not refused
+    when the cleanup job passes its anchor.
+  - Upgrading: a checkpoint that already read a change needs nothing. A baseline-only
+    checkpoint written by 0.31 or earlier that is below the instance's start is refused on
+    the first run of the new version, with the same exit 5 `RIVET_SOURCE_CDC_LOG_GAP`: the
+    file cannot tell a harmless anchor from a gap that already happened, so rivet does not
+    guess. This affects a table that had no captured change since its baseline while the
+    cleanup job ran at least once, or whose capture instance was enabled just before the
+    baseline. Re-baseline such a stream once, as the refusal says.
 - **Breaking: `rivet run --validate` exits non-zero when its validation fails.** Applies to
   every source engine and every destination that keeps objects at rest.
   - Before, a run whose end-of-run verification failed printed `validated: FAIL` and exited 0,
