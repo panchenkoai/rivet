@@ -684,6 +684,17 @@ def _self_test() -> int:
     assert perf_verdict("postgres", base, Sample(True, 1.05, 0.05, 50 * 1024 * 1024, {})) == []
     assert perf_verdict("postgres", base, Sample(True, 2.0, 0.02, 50 * 1024 * 1024, {}))
     assert perf_verdict("postgres", base, Sample(True, 1.0, 0.02, 200 * 1024 * 1024, {}))
+    # A plan evicted between the two SQL Server readings takes nothing away from the run's
+    # own reads; an unanswered reading is not a measurement; rivet's report yields to it.
+    from .perf import measured_harm
+    assert measured_harm("mssql://h", {"old": 9000, "kept": 100}, {"kept": 130, "new": 20},
+                         {"mssql_logical_reads": 0, "mssql_worktables_created": 1}) == {
+        "mssql_logical_reads": 50, "mssql_worktables_created": 1}
+    assert measured_harm("mssql://h", {}, {"new": 7}, {}) == {"mssql_logical_reads": 7}
+    assert measured_harm("mssql://h", None, {"new": 7}, {"mssql_logical_reads": 7}) is None
+    assert measured_harm("postgresql://h", {"pg_tup_returned": 5}, {"pg_tup_returned": 9}, {}) == {
+        "pg_tup_returned": 4}
+    assert measured_harm("", None, None, {"mongo_docs_scanned": 3}) == {"mongo_docs_scanned": 3}
     # cdc-conns: the ceiling holds even when the previous release was worse, and one
     # connection more than the previous release is a regression under the ceiling too.
     from .perf import conns_verdict

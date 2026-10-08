@@ -55,7 +55,7 @@ fn run_records_the_load_spec_of_a_mongo_collection() {
     rig.run_ok();
 
     let (columns, key) = StateDb::next_to_config(&rig.config_path())
-        .load_spec("c", None)
+        .load_spec(rig.export_name(), None)
         .expect("a successful run records the load spec");
     assert_eq!(columns, ["_id", "document"]);
     assert_eq!(key, Some(vec!["_id".to_string()]));

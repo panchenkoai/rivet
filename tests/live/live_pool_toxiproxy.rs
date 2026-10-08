@@ -256,7 +256,7 @@ fn pool_split_realizes_the_range_split_and_the_union_is_exact() {
     // The split ACTUALLY fired (else the union oracle below is vacuous): the
     // executor said so, AND range-unit parts landed on disk.
     assert!(
-        log.contains("split 'pool_split_heavy' into"),
+        log.contains(&format!("split '{}' into", rig.export_name())),
         "the executor must report realizing the split:\n{log}"
     );
     let giant_range_parts: Vec<_> = files_with_extension(&rig.out_dir(), "parquet")
@@ -374,7 +374,7 @@ fn pool_split_prefix_is_manifest_coherent() {
     );
     assert!(split.status.success(), "split run must succeed:\n{slog}");
     assert!(
-        slog.contains("split 'mcoh_giant' into"),
+        slog.contains(&format!("split '{}' into", rig.export_name())),
         "the split must have fired (else this test is vacuous):\n{slog}"
     );
 
@@ -402,7 +402,7 @@ fn pool_split_prefix_is_manifest_coherent() {
             let m: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
             assert_eq!(
                 m["export_family"].as_str(),
-                Some("mcoh_giant"),
+                Some(rig.export_name()),
                 "every split unit copy must fold to the parent family (load sees one table): {name}"
             );
         }

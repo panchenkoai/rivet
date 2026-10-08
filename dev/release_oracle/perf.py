@@ -113,19 +113,61 @@ def _pg_counters(url: str) -> dict[str, int] | None:
     return dict(zip(("pg_tup_returned", "pg_tup_fetched", "pg_temp_files"), map(int, vals[-3:])))
 
 
-def _timed(binary: Path, cwd: Path, env: dict[str, str], *args: str, probe: str = "") -> Sample:
+def _mssql_reads(url: str, own: str) -> dict[str, int] | None:
+    """Logical reads of each cached statement whose text names `own`, keyed by plan and offset; None when the DMV did not answer."""
+    from .cdc import _sqlcmd
+
+    p = _sqlcmd(url, q=(
+        "SET NOCOUNT ON; SELECT CONCAT('~', CONVERT(varchar(130), qs.plan_handle, 1), '/', "
+        "qs.statement_start_offset, '~', qs.total_logical_reads) FROM sys.dm_exec_query_stats qs "
+        f"CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) t WHERE t.text LIKE '%{own}%' "
+        "AND t.text NOT LIKE '%dm_exec_query_stats%'"))
+    if not p.ok:
+        return None
+    cells = (line.strip().split("~") for line in (p.stdout or "").splitlines())
+    return {c[1]: int(c[2]) for c in cells if len(c) == 3 and c[2].isdigit()}
+
+
+def harness_read(engine: str, url: str) -> str:
+    """`url` when the harness reads this engine's harm counters itself, else "" (rivet's own report grades)."""
+    return url if engine in ("postgres", "mssql") else ""
+
+
+def source_counters(probe: str, own: str) -> dict[str, int] | None:
+    """The source's own harm counters behind `probe`: PostgreSQL's database totals, SQL Server's reads per statement naming `own`."""
+    if probe.startswith("mssql"):
+        return _mssql_reads(probe, own)
+    return _pg_counters(probe) if probe else None
+
+
+def measured_harm(probe: str, before: dict[str, int] | None, after: dict[str, int] | None,
+                  reported: dict[str, int]) -> dict[str, int] | None:
+    """The run's harm from two `source_counters` readings, over rivet's own report; None when a SQL Server reading did not answer.
+
+    A SQL Server plan evicted between the readings takes nothing away: only statements
+    still cached count, each by its own growth.
+    """
+    if probe.startswith("mssql"):
+        if before is None or after is None:
+            return None
+        return reported | {"mssql_logical_reads": sum(v - before.get(k, 0) for k, v in after.items())}
+    return {k: after[k] - before[k] for k in after} if before and after else reported
+
+
+def _timed(binary: Path, cwd: Path, env: dict[str, str], *args: str, probe: str = "",
+           own: str = "") -> Sample:
     """`binary args…` under `/usr/bin/time` in `cwd`: wall, CPU, peak RSS and the run's harm.
 
-    With a PostgreSQL `probe` URL the harm is the source's own counter delta over the run;
-    rivet's self-report changed meaning between releases (#312), so it cannot be compared.
+    With a `probe` URL the harm is the source's own counter delta over the run
+    (`source_counters`); rivet's self-report changed meaning between releases (#312) and its
+    SQL Server reads are a clamped server-wide sum, so neither can be compared.
     """
     flag = "-l" if _is_bsd_time() else "-v"
-    before = _pg_counters(probe) if probe else None
+    before = source_counters(probe, own)
     p = run([str(_TIME_BIN), flag, str(binary), *args], timeout=None, env=env, cwd=cwd)
-    after = _pg_counters(probe) if probe else None
-    harm = ({k: after[k] - before[k] for k in after} if before and after else _last_run_harm(cwd))
-    return Sample(p.returncode == 0, _parse_wall(p.stderr)[1], _cpu(p.stderr),
-                  _parse_rss(p.stderr), harm)
+    harm = measured_harm(probe, before, source_counters(probe, own), _last_run_harm(cwd))
+    return Sample(p.returncode == 0 and harm is not None, _parse_wall(p.stderr)[1], _cpu(p.stderr),
+                  _parse_rss(p.stderr), harm or {})
 
 
 def _best(samples: list[Sample]) -> Sample | None:
@@ -207,8 +249,7 @@ def _batch_path(binary: Path, d: Path, url: str, engine: str, table: str, path: 
             if path == "resume":
                 run([str(binary), "run", "-c", "c.yaml"], cwd=d, timeout=None,
                     env={**env, "RIVET_TEST_PANIC_AT": "after_keyset_page:0"})
-        s = _timed(binary, d, env, "run", "-c", "c.yaml",
-                   probe=url if engine == "postgres" else "")
+        s = _timed(binary, d, env, "run", "-c", "c.yaml", probe=harness_read(engine, url), own=table)
         if i:
             samples.append(s)
     # A fast run that read nothing is not a measurement: the last output holds every row.
@@ -543,7 +584,7 @@ def _snapshot_side(binary: Path, engine: str, url: str) -> Sample | None:
             _cdc_changes(engine, url, 1)
             want = rows(engine, url, "orc_cdc_probe")
             s = _timed(binary, work, {"RIVET_STATE_URL": "", "RIVET_GATE_STATE_URL": ""}, "run", "-c", "c.yaml",
-                       probe=url if engine == "postgres" else "")
+                       probe=harness_read(engine, url), own="orc_cdc_probe")
             got = _declared(work / "output", f"SELECT count(DISTINCT {eng.id_col}) FROM {{parts}}")
             if not s.ok or not want or not got or got[0][0] != want:
                 return None
@@ -689,7 +730,7 @@ def _cdc_side(binary: Path, engine: str, url: str, path: str = "cdc") -> Sample 
                 run([str(binary), "run", "-c", "c.yaml"], cwd=work, timeout=None,
                     env={**env, "RIVET_TEST_PANIC_AT": "cdc_after_flush_before_ack"})
             s = _timed(binary, work, env, "run", "-c", "c.yaml",
-                       probe=url if engine == "postgres" else "")
+                       probe=harness_read(engine, url), own="orc_cdc_probe")
             if i:
                 samples.append(s)
         # A fast drain that captured nothing is not a measurement: every inserted id must have
