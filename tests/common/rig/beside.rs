@@ -413,4 +413,22 @@ mod tests {
         };
         let _ = met.answered_while_alive();
     }
+
+    #[test]
+    fn a_volume_that_still_takes_a_write_was_not_filled() {
+        assert!(not_filled(true).is_some_and(|why| why.contains("nothing was taken away")));
+        assert_eq!(not_filled(false), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_filled_volume_refuses_a_write_until_it_is_freed() {
+        let volume = TinyVolume::mounted(4).expect("macOS mounts one");
+        let file = volume.path().join("part");
+        std::fs::write(&file, [0u8; 8192]).expect("an empty volume takes a write");
+        volume.fill();
+        assert!(std::fs::write(&file, [0u8; 65536]).is_err());
+        volume.free();
+        std::fs::write(&file, [0u8; 65536]).expect("a freed volume takes a write");
+    }
 }
