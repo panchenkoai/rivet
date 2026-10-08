@@ -383,14 +383,7 @@ impl SourceConfig {
                 (None, None) => String::new(),
             });
 
-        let default_port = match self.source_type {
-            SourceType::Postgres => 5432,
-            SourceType::Mysql => 3306,
-            SourceType::Mssql => 1433,
-            SourceType::Oracle => 1521,
-            SourceType::Mongo => 27017,
-        };
-        let port = self.port.unwrap_or(default_port);
+        let port = self.port.unwrap_or(default_port(self.source_type));
 
         let scheme = match self.source_type {
             SourceType::Postgres => "postgresql",
@@ -421,9 +414,23 @@ impl SourceConfig {
     /// The state key of what reads from here (cursor, crash anchor): engine, host, port and
     /// database — no credentials or parameters — so a changed destination keeps its cursor.
     pub fn state_key(&self) -> String {
-        self.resolve_url()
-            .map(|u| source_state_key(self.source_type, &u))
-            .unwrap_or_default()
+        self.try_state_key().unwrap_or_default()
+    }
+
+    /// [`Self::state_key`], or why this config names no source.
+    pub fn try_state_key(&self) -> crate::error::Result<String> {
+        Ok(source_state_key(self.source_type, &self.resolve_url()?))
+    }
+
+    /// The `search_path` this source's URL sets, which decides the schema an unqualified name is read from; empty when it sets none.
+    pub fn search_path(&self) -> String {
+        match self.source_type {
+            SourceType::Postgres => self
+                .resolve_url()
+                .map(|u| url_search_path(&u))
+                .unwrap_or_default(),
+            _ => String::new(),
+        }
     }
 
     pub fn resolve_url(&self) -> crate::error::Result<String> {
@@ -616,7 +623,63 @@ pub(crate) fn source_state_key(source_type: SourceType, url: &str) -> String {
     let rest = find_userinfo(url).map_or(rest, |(at, _)| &url[at + 1..]);
     let at_host = rest.split(['?', '#']).next().unwrap_or(rest);
     let key = format!("{source_type:?}://{}", at_host.trim_end_matches('/')).to_lowercase();
-    crate::redact::redact_keyword_passwords(&key)
+    canonical_source_key(&key)
+}
+
+/// The port an engine listens on when a URL names none.
+fn default_port(source_type: SourceType) -> u16 {
+    match source_type {
+        SourceType::Postgres => 5432,
+        SourceType::Mysql => 3306,
+        SourceType::Mssql => 1433,
+        SourceType::Oracle => 1521,
+        SourceType::Mongo => 27017,
+    }
+}
+
+/// A source key in the one spelling it is stored under: every host names its port (the engine's default where the URL left it out) and a keyword/value password is masked.
+pub(crate) fn canonical_source_key(key: &str) -> String {
+    use SourceType::*;
+    let key = crate::redact::redact_keyword_passwords(key);
+    let Some((engine, rest)) = key.split_once("://") else {
+        return key;
+    };
+    let Some(port) = [Postgres, Mysql, Mssql, Oracle, Mongo]
+        .into_iter()
+        .find(|t| format!("{t:?}").to_lowercase() == engine)
+        .map(default_port)
+    else {
+        return key;
+    };
+    let (hosts, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    if hosts.is_empty() || hosts.contains(['=', ' ', ';']) {
+        return key;
+    }
+    let names_a_port =
+        |h: &str| matches!(h.rsplit_once(':'), Some((_, p)) if !p.is_empty() && !p.contains(']'));
+    let hosts: Vec<String> = hosts
+        .split(',')
+        .map(|h| match names_a_port(h) {
+            true => h.to_string(),
+            false => format!("{}:{port}", h.strip_suffix(':').unwrap_or(h)),
+        })
+        .collect();
+    format!("{engine}://{}{path}", hosts.join(","))
+}
+
+/// The value a URL (or keyword/value string) gives `search_path` through its `options`, lower-cased; empty when it gives none.
+fn url_search_path(url: &str) -> String {
+    let decoded = percent_encoding::percent_decode_str(url).decode_utf8_lossy();
+    let Some((_, rest)) = decoded.split_once("search_path") else {
+        return String::new();
+    };
+    let Some(value) = rest.trim_start().strip_prefix('=') else {
+        return String::new();
+    };
+    let end = value
+        .find(|c: char| c.is_whitespace() || matches!(c, '&' | '#'))
+        .unwrap_or(value.len());
+    value[..end].trim_matches(['\'', '"']).to_lowercase()
 }
 
 #[cfg(test)]
@@ -644,6 +707,90 @@ mod tests {
             k,
             source_state_key(SourceType::Postgres, "postgresql://u@db.host:5432/other")
         );
+    }
+
+    #[test]
+    fn a_source_key_names_the_default_port_the_url_left_out() {
+        use super::{SourceType::*, canonical_source_key, source_state_key};
+        for (engine, scheme, port) in [
+            (Postgres, "postgresql", 5432),
+            (Mysql, "mysql", 3306),
+            (Mssql, "sqlserver", 1433),
+            (Oracle, "oracle", 1521),
+            (Mongo, "mongodb", 27017),
+        ] {
+            let spelled = source_state_key(engine, &format!("{scheme}://u:pw@Db.Host:{port}/app"));
+            let left_out = source_state_key(engine, &format!("{scheme}://u:pw@db.host/app"));
+            assert_eq!(left_out, spelled, "{scheme}");
+            assert!(
+                spelled.ends_with(&format!("://db.host:{port}/app")),
+                "{spelled}"
+            );
+            let stored = spelled.replace(&format!(":{port}"), "");
+            assert_eq!(canonical_source_key(&stored), spelled, "stored without it");
+            assert_eq!(canonical_source_key(&spelled), spelled);
+            assert_ne!(
+                source_state_key(engine, &format!("{scheme}://db.host:{}/app", port + 1)),
+                spelled,
+                "another port is another source"
+            );
+        }
+        let key = |url: &str| source_state_key(Postgres, url);
+        assert_eq!(key("postgresql://db.host"), "postgres://db.host:5432");
+        assert_eq!(key("postgresql://[::1]/app"), "postgres://[::1]:5432/app");
+        assert_eq!(
+            key("postgresql://[::1]:6000/app"),
+            "postgres://[::1]:6000/app"
+        );
+        assert_eq!(
+            key("postgresql://db.host:/app"),
+            "postgres://db.host:5432/app"
+        );
+        assert_eq!(key("postgresql:///app"), "postgres:///app");
+        assert_eq!(
+            source_state_key(Mongo, "mongodb://a,b:27018,c/app"),
+            "mongo://a:27017,b:27018,c:27017/app"
+        );
+        assert_eq!(canonical_source_key("pg/db"), "pg/db");
+        assert_eq!(canonical_source_key("sqlite://h/db"), "sqlite://h/db");
+        assert_eq!(
+            source_state_key(Mssql, "Server=tcp:h,1433;Database=app"),
+            "mssql://server=tcp:h,1433;database=app"
+        );
+    }
+
+    #[test]
+    fn a_search_path_set_through_the_url_is_read_and_nothing_else_is() {
+        use super::{SourceType::*, url_search_path as sp};
+        assert_eq!(
+            sp("postgresql://h/db?options=-csearch_path%3DSales"),
+            "sales"
+        );
+        assert_eq!(
+            sp("postgresql://h/db?options=-c%20search_path%3Da,b&sslmode=require"),
+            "a,b"
+        );
+        assert_eq!(
+            sp("host=h dbname=db options='-c search_path=sales'"),
+            "sales"
+        );
+        assert_eq!(
+            sp("postgresql://h/db?options=--search_path=sales#frag"),
+            "sales"
+        );
+        assert_eq!(sp("postgresql://h/db?options=-csearch_path%3D\"S\""), "s");
+        assert_eq!(sp("postgresql://h/db?sslmode=require"), "");
+        assert_eq!(sp("postgresql://h/search_path"), "");
+        let mut src = make_source(Postgres);
+        src.url = Some("postgresql://u@h/db?options=-csearch_path%3Dsales".into());
+        assert_eq!(src.search_path(), "sales");
+        assert_eq!(src.try_state_key().unwrap(), "postgres://h:5432/db");
+        src.source_type = Mysql;
+        src.url = Some("mysql://u@h/db?options=-csearch_path%3Dsales".into());
+        assert_eq!(src.search_path(), "", "only PostgreSQL has a search_path");
+        src.url = None;
+        assert!(src.try_state_key().is_err());
+        assert_eq!(src.state_key(), "");
     }
 
     #[test]

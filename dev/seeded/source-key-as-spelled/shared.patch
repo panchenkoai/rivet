@@ -1,0 +1,12 @@
+diff --git a/src/config/source.rs b/src/config/source.rs
+index 3c37a8f7..da1438a4 100644
+--- a/src/config/source.rs
++++ b/src/config/source.rs
+@@ -660,6 +660,7 @@ pub(crate) fn canonical_source_key(key: &str) -> String {
+     let hosts: Vec<String> = hosts
+         .split(',')
+         .map(|h| match names_a_port(h) {
++            _ if port > 0 => h.to_string(),
+             true => h.to_string(),
+             false => format!("{}:{port}", h.strip_suffix(':').unwrap_or(h)),
+         })

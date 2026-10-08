@@ -67,8 +67,8 @@ pub(crate) mod validate_manifest;
 
 pub use apply_cmd::run_apply_command;
 pub use cli::{
-    reset_chunk_checkpoint, reset_chunk_checkpoints_stuck, reset_state, show_chunk_checkpoint,
-    show_files, show_journal, show_metrics, show_progression, show_state,
+    accept_state, reset_chunk_checkpoint, reset_chunk_checkpoints_stuck, reset_state,
+    show_chunk_checkpoint, show_files, show_journal, show_metrics, show_progression, show_state,
 };
 pub use plan_cmd::{PlanOutputFormat, run_plan_command};
 pub use reconcile_cmd::{ReconcileOutputFormat, run_reconcile_command};
@@ -285,10 +285,12 @@ mod tests {
         ResolvedRunPlan {
             split_window: None,
             bytes_read: Default::default(),
+            parts_landed: Default::default(),
             export_name: "test_export".into(),
             partition_rollover: None,
             source_table: None,
             base_query: "SELECT 1".into(),
+            query_template: None,
             is_split_unit: false,
             strategy: ExtractionStrategy::Snapshot,
             format: FormatType::Parquet,

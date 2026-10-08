@@ -617,12 +617,10 @@ fn chunked_resume_force_overrides_success_gate() {
         "plain --resume must be refused *by the _SUCCESS gate*; stderr:\n{refused_err}"
     );
 
-    // `--force` overrides that gate. We prove the override by the failure
-    // *reason changing*: with `--force` the run gets PAST the `_SUCCESS` gate
-    // (no `_SUCCESS` refusal) and only then hits the legitimate "nothing
-    // in-progress to resume" state of a cleanly-completed run. (A success
-    // outcome isn't reachable here precisely because a completed run has no
-    // outstanding chunks — that is a different, correct refusal, not the gate.)
+    // `--force` goes past that gate, and with no chunk run to continue the run goes on
+    // as a plain run does: exit 0, the table exported again beside the complete export.
+    let parts = || files_with_extension(out.path(), "parquet").len();
+    let before = parts();
     let forced = run_rivet(&[
         "run",
         "--config",
@@ -634,12 +632,25 @@ fn chunked_resume_force_overrides_success_gate() {
     ]);
     let forced_err = String::from_utf8_lossy(&forced.stderr);
     assert!(
-        !forced_err.contains("_SUCCESS"),
-        "--force must bypass the _SUCCESS gate (no _SUCCESS refusal expected); stderr:\n{forced_err}"
+        forced.status.success(),
+        "--resume --force over a complete prefix must run; stderr:\n{forced_err}"
     );
-    assert!(
-        forced_err.contains("in-progress") || forced_err.contains("reset-chunks"),
-        "--force should reach the real 'nothing to resume' state past the gate; stderr:\n{forced_err}"
+    assert_eq!(
+        parts(),
+        before * 2,
+        "the forced run exports the table again beside the complete export"
+    );
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.path().join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(
+        (
+            out.path().join("_SUCCESS").is_file(),
+            manifest["status"].as_str(),
+            manifest["row_count"].as_i64(),
+            manifest["part_count"].as_u64(),
+        ),
+        (true, Some("success"), Some(20), Some(before as u64)),
+        "manifest.json describes only the new run, as the refusal says"
     );
 }
 

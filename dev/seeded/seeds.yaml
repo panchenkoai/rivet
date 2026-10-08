@@ -643,6 +643,49 @@ seeds:
       oracle:
         cells: [run_validate_fails_the_run_over_a_failed_validation_oracle]
 
+  - name: failed-run-remarks-the-prefix-before-a-write
+    class: a run that fails before its first write still rewrites `manifest.json` to failed and deletes `_SUCCESS` over a complete export
+    history: "2026-10-07 CLI sweep, RESULTS 8 - a complete export, then a run that cannot reach the source (exit 2): `_SUCCESS` gone and manifest.json `failed`, 0 rows, so `rivet validate` exits 1 after a network failure; on main and on v0.31.0"
+    scope: source
+    patch: failed-run-remarks-the-prefix-before-a-write/shared.patch
+    engines:
+      lib:
+        cells: ["lib:a_run_that_failed_before_its_first_write_leaves_the_complete_export_as_it_was"]
+      postgres:
+        cells:
+          - a_run_that_never_connected_keeps_the_export_complete_postgres
+          - a_run_that_never_connected_keeps_the_export_complete_s3
+          - a_run_that_never_connected_keeps_the_export_complete_gcs
+          - a_run_that_never_connected_keeps_the_export_complete_azure
+          - a_resume_that_never_connected_leaves_the_unfinished_run_as_it_was_postgres
+      mysql:
+        cells: [a_run_that_never_connected_keeps_the_export_complete_mysql]
+      mssql:
+        cells: [a_run_that_never_connected_keeps_the_export_complete_mssql]
+      mongo:
+        cells: [a_run_that_never_connected_keeps_the_export_complete_mongo]
+      oracle:
+        cells: [a_run_that_never_connected_keeps_the_export_complete_oracle]
+
+  - name: forced-resume-refused-as-nothing-to-continue
+    class: "`--resume --force` over a complete prefix of a checkpointed chunked export is refused as `nothing to continue`, against the refusal that named `--force`"
+    history: "2026-10-07 CLI sweep, RESULTS 12 - `run --resume` over a complete prefix says `Pass --force to override`; `run --resume --force` then exits 1 `nothing to continue` and re-marks the complete prefix as failed; on main and on v0.31.0"
+    scope: source
+    patch: forced-resume-refused-as-nothing-to-continue/shared.patch
+    engines:
+      lib:
+        cells: ["lib:a_forced_resume_with_nothing_to_continue_exports_again"]
+      postgres:
+        cells: [a_forced_resume_over_a_complete_prefix_lands_beside_it_postgres]
+      mysql:
+        cells: [a_forced_resume_over_a_complete_prefix_lands_beside_it_mysql]
+      mssql:
+        cells: [a_forced_resume_over_a_complete_prefix_lands_beside_it_mssql]
+      mongo:
+        na: "the patch removes the chunk runner's run-as-a-plain-run arm (crashed_chunk_run_action); a MongoDB export is never range-chunked, and its `--resume --force` goes past the gate without that arm"
+      oracle:
+        cells: [a_forced_resume_over_a_complete_prefix_lands_beside_it_oracle]
+
   - name: unwritable-state-run-exports
     class: a run whose state store does not take its first write (the run-status row) exports anyway
     history: "2026-10-07 CLI sweep, RESULTS 3 - an incremental run over a read-only `.rivet_state.db`: exit 0 with no metrics row, and every later run delivers the same delta again (16, then 19 rows for 13 source ids), on main and on v0.31.0"
@@ -785,3 +828,134 @@ seeds:
         cells: [check_names_the_strategy_run_uses_for_chunked_with_no_column_oracle]
       lib:
         cells: ["lib:check_describes_the_export_the_planner_resolved"]
+
+  - name: source-key-as-spelled
+    class: the source part of a progress key is the URL as spelled, so the same server with its default port left out is another source and its stored progress is not found
+    history: "P-18, 2026-10-06 - an incremental export whose URL dropped `:5432` delivered ids 1..13 again instead of the delta 11..13, on main 52f26e45 and on v0.31.0"
+    scope: source
+    patch: source-key-as-spelled/shared.patch
+    engines:
+      postgres:
+        cells: [source_url_without_its_default_port_continues_postgres]
+      mysql:
+        cells: [source_url_without_its_default_port_continues_mysql]
+      mssql:
+        cells: [source_url_without_its_default_port_continues_mssql]
+      mongo:
+        cells: ["lib:a_source_key_names_the_default_port_the_url_left_out"]
+      oracle:
+        cells: [source_url_without_its_default_port_continues_oracle]
+      lib:
+        cells:
+          - "lib:a_source_key_names_the_default_port_the_url_left_out"
+          - "lib:a_cursor_stored_without_the_default_port_continues_under_the_spelled_one"
+
+  - name: resumed-run-cursor-below-its-maximum
+    class: a parallel keyset run resumed after a crash stores the highest key of the ranges it re-ran, not of the run
+    history: "P-22, 2026-10-06 - after a crash and a resume, incremental on the key delivered 75 to 301 of 301 rows again, on main 52f26e45 and on v0.31.0"
+    scope: source
+    patch: resumed-run-cursor-below-its-maximum/shared.patch
+    engines:
+      postgres:
+        cells: [resumed_parallel_keyset_then_incremental_postgres]
+      mysql:
+        cells: [resumed_parallel_keyset_then_incremental_mysql]
+      mssql:
+        cells: [resumed_parallel_keyset_then_incremental_mssql]
+      mongo:
+        na: "the parallel `_id`-range reader stores no key: the first `resume` run after it is a full pass (parallel_keyset_then_resume_mongo), so there is no high-water a resume could under-report"
+      oracle:
+        cells: [resumed_parallel_keyset_then_incremental_oracle]
+      lib:
+        cells: ["lib:a_resumed_run_counts_the_keys_its_committed_ranges_recorded"]
+
+  - name: progress-inherited-by-an-edited-filter
+    class: stored progress is continued by an export whose `query:` keeps its FROM relation and selects other rows of it
+    history: "2026-10-06, found verifying #456 - an incremental export whose filter changed from `time_spent = 1` to `time_spent = 0` exited 0 with none of the five rows the new filter admits, on main 52f26e45 and on v0.31.0"
+    scope: source
+    patch: progress-inherited-by-an-edited-filter/shared.patch
+    engines:
+      postgres:
+        cells: [incremental_query_filter_edited_postgres, incremental_query_filter_edited_is_refused_twice_postgres]
+      mysql:
+        cells: [incremental_query_filter_edited_mysql, incremental_query_filter_edited_is_refused_twice_mysql]
+      mssql:
+        cells: [incremental_query_filter_edited_mssql, incremental_query_filter_edited_is_refused_twice_mssql]
+      mongo:
+        na: "a MongoDB export names a collection and has no `query:`: the rows it reads are the collection's, which the stream part compares (resume_repointed_at_another_collection_mongo)"
+      oracle:
+        cells: [incremental_query_filter_edited_oracle, incremental_query_filter_edited_is_refused_twice_oracle]
+      lib:
+        cells: ["lib:an_edited_filter_or_another_schema_is_refused_until_it_is_restored_or_reset"]
+
+  - name: progress-inherited-by-another-schema
+    class: stored progress is continued by an export that reads the same unqualified table through another `search_path`
+    history: "2026-10-06, found verifying #456 - a source URL with `options=-csearch_path%3D<schema>` moved an incremental export to another schema's table under the stored cursor: exit 0 and none of its seven rows, on main 52f26e45 and on v0.31.0"
+    scope: source
+    patch: progress-inherited-by-another-schema/shared.patch
+    engines:
+      postgres:
+        cells: [same_table_in_another_schema_is_another_stream_postgres, same_table_in_another_schema_is_refused_twice_postgres]
+      mysql:
+        na: "the schema an unqualified table resolves in is not a source-URL option on this engine (search_path is PostgreSQL's)"
+      mssql:
+        na: "the schema an unqualified table resolves in is not a source-URL option on this engine (search_path is PostgreSQL's)"
+      mongo:
+        na: "a MongoDB export names its database and collection in full; there is no search path"
+      oracle:
+        na: "the schema an unqualified table resolves in is not a source-URL option on this engine (search_path is PostgreSQL's)"
+      lib:
+        cells: ["lib:a_search_path_resolves_the_unqualified_name_it_is_compared_by"]
+
+  - name: reset-clears-another-source
+    class: "`rivet state reset --export X` deletes the progress of every export named X in the state database, whatever source it reads"
+    history: "P-19, 2026-10-06 - a reset under one config deleted the cursor of a same-named export of another source, whose next run delivered its table again (14 rows on disk for 7 source ids), on main 52f26e45 and on v0.31.0"
+    scope: state
+    patch: reset-clears-another-source/shared.patch
+    engines:
+      sqlite-state:
+        cells: [state_reset_keeps_the_cursor_of_another_source]
+      postgres-state:
+        cells: [state_reset_keeps_the_cursor_of_another_source]
+      lib:
+        cells:
+          - "lib:a_reset_clears_its_own_source_and_keeps_another_sources_cursor"
+          - "lib:every_reset_is_refused_while_the_exports_run_lease_is_held"
+
+  - name: param-value-read-as-a-filter-edit
+    class: the rows part of a progress key is read from the query after `${param}` substitution, so another value of a placeholder between two runs is refused as an edited filter
+    history: "2026-10-08, owner decision on #493 - an incremental export whose `WHERE time_spent = ${spent}` ran with `--param spent=1` and then `--param spent=0` was refused with exit 5 RIVET_STATE_CURSOR_STREAM_MISMATCH on the PR's head 3dd6ade4; a value is the operator's to change"
+    scope: source
+    patch: param-value-read-as-a-filter-edit/shared.patch
+    engines:
+      postgres:
+        cells: [incremental_query_param_value_changes_between_runs_postgres]
+      mysql:
+        cells: [incremental_query_param_value_changes_between_runs_mysql]
+      mssql:
+        cells: [incremental_query_param_value_changes_between_runs_mssql]
+      mongo:
+        na: "a MongoDB export names a collection and has no `query:`, so no placeholder reaches the rows part of its key"
+      oracle:
+        cells: [incremental_query_param_value_changes_between_runs_oracle]
+      lib:
+        cells: ["lib:a_placeholder_value_is_not_part_of_the_progress_identity_and_the_query_text_is"]
+
+  - name: accepted-edit-not-recorded
+    class: "`rivet state accept` reports an edited query as accepted and leaves the stored progress bound to the query it was written reading, so the next run is refused as before"
+    history: "2026-10-08, owner decision on #493 - a refused edit that is meant had no way out that kept the cursor (`state accept` did not exist on the PR's head 3dd6ade4); seeded so the command cannot answer `Accepted` without re-binding the row"
+    scope: source
+    patch: accepted-edit-not-recorded/shared.patch
+    engines:
+      postgres:
+        cells: [incremental_query_cosmetic_edit_is_refused_until_accepted_postgres]
+      mysql:
+        cells: [incremental_query_cosmetic_edit_is_refused_until_accepted_mysql]
+      mssql:
+        cells: [incremental_query_cosmetic_edit_is_refused_until_accepted_mssql]
+      mongo:
+        na: "a MongoDB export has no `query:` to edit; its stream is its collection, and the accept path it shares is graded by the lib cell"
+      oracle:
+        cells: [incremental_query_cosmetic_edit_is_refused_until_accepted_oracle]
+      lib:
+        cells: ["lib:an_accepted_edit_keeps_the_cursor_under_what_the_export_reads_now"]

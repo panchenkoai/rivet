@@ -314,3 +314,5 @@ mod live_state_clock;
 mod live_state_pooler;
 #[path = "live/live_state_reset_live_run.rs"]
 mod live_state_reset_live_run;
+#[path = "live/live_stated_guarantees.rs"]
+mod live_stated_guarantees;

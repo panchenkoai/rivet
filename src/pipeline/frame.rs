@@ -103,10 +103,12 @@ mod tests {
         ResolvedRunPlan {
             split_window: None,
             bytes_read: Default::default(),
+            parts_landed: Default::default(),
             export_name: "frame_probe".into(),
             partition_rollover: None,
             source_table: None,
             base_query: "SELECT 1".into(),
+            query_template: None,
             is_split_unit: false,
             strategy: crate::plan::ExtractionStrategy::Snapshot,
             format: crate::config::FormatType::Parquet,

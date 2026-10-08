@@ -31,6 +31,98 @@ pub(super) fn streams_differ(stored: &str, now: &str) -> bool {
     !stored.is_empty() && !now.is_empty() && !qualifies(stored, now) && !qualifies(now, stored)
 }
 
+/// Whether two recorded row sets are one: the same text, or a query as written and a substituted query that fills its `${...}` placeholders (what a plan sealed before templates were recorded carries).
+fn same_rows(a: &str, b: &str) -> bool {
+    a == b || fills(a, b) || fills(b, a)
+}
+
+/// Whether `text` holds no placeholder and is `template` with each of its placeholders replaced by some text.
+fn fills(template: &str, text: &str) -> bool {
+    let around = crate::config::literal_parts;
+    let (Some(parts), None) = (around(template), around(text)) else {
+        return false;
+    };
+    let (first, last) = (&parts[0], &parts[parts.len() - 1]);
+    let between = text.strip_prefix(first.as_str());
+    let Some(between) = between.and_then(|t| t.strip_suffix(last.as_str())) else {
+        return false;
+    };
+    let mut inner = parts[1..parts.len() - 1].iter();
+    inner
+        .try_fold(between, |rest, part| {
+            rest.find(part.as_str()).map(|at| &rest[at + part.len()..])
+        })
+        .is_some()
+}
+
+/// `stream` as the source resolves it: an unqualified name under a one-schema `search_path` is that schema's.
+fn resolved(stream: &str, schema: &str) -> String {
+    let unresolved = stream.is_empty() || stream.contains('.');
+    if unresolved || schema.is_empty() || schema.contains(',') {
+        return stream.to_string();
+    }
+    format!("{schema}.{stream}")
+}
+
+/// The stream parts a progress row holds; `None` for a part written before it was recorded.
+struct StoredStream {
+    stream: Option<String>,
+    schema: Option<String>,
+    population: Option<String>,
+}
+
+impl StoredStream {
+    /// What the row was written reading and what `key` reads now, when a recorded part proves them different streams.
+    fn another_than(&self, key: &ProgressKey) -> Option<(String, String)> {
+        let schema = self.schema.as_deref();
+        let now = resolved(&key.stream, &key.schema);
+        if let Some(stream) = &self.stream {
+            let was = resolved(stream, schema.unwrap_or_default());
+            if streams_differ(&was, &now) {
+                return Some((was, now));
+            }
+            let both_unqualified = !stream.contains('.') && !key.stream.contains('.');
+            if let Some(schema) = schema.filter(|s| both_unqualified && *s != key.schema) {
+                let under = |name: &str, s: &str| {
+                    let name = if name.is_empty() { "its query" } else { name };
+                    match s {
+                        "" => format!("{name} under the server's own search_path"),
+                        s => format!("{name} under search_path {s}"),
+                    }
+                };
+                return Some((under(stream, schema), under(&key.stream, &key.schema)));
+            }
+        }
+        let rows = |population: &str| format!("{now} ({population})");
+        self.population
+            .as_ref()
+            .filter(|was| !key.population.is_empty() && !same_rows(was, &key.population))
+            .map(|was| (rows(was), rows(&key.population)))
+    }
+}
+
+/// What the row of a progress key holds: the run it is anchored on with that run's owner, and the progress a run of the key would continue from (worded) with the stream it was written reading.
+#[derive(Default)]
+struct StoredProgress {
+    anchor: Option<(String, String)>,
+    held: Option<(String, StoredStream)>,
+}
+
+/// What `rivet state accept` found on the row of a progress key.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Accepted {
+    /// The row holds no progress a run of the key would continue from.
+    NoProgress,
+    /// The progress already belongs to what the key reads.
+    Unchanged,
+    /// The progress `held` was re-bound from the stream `was` to the stream `now`.
+    Rebound {
+        held: String,
+        was: String,
+        now: String,
+    },
+}
+
 /// The progress a run would continue from, worded for a message: an interrupted run's anchor, else the cursor a clean run seeks from.
 fn held_progress(
     cursor: Option<&str>,
@@ -80,6 +172,10 @@ pub struct ProgressKey {
     pub(crate) source: String,
     /// Compared part: the relation the query's outermost `FROM` names; empty when it names none.
     pub(crate) stream: String,
+    /// Compared part: the `search_path` an unqualified `stream` is resolved in; empty when the source sets none or the name is qualified.
+    pub(crate) schema: String,
+    /// Compared part: the rows the query selects (`sql::row_set`); empty when the key names none.
+    pub(crate) population: String,
     /// Compared part: the cursor column or keyset key; `None` for a strategy that stores no cursor.
     pub(crate) column: Option<String>,
     /// The mode that owns a run this plan leaves interrupted (`ExtractionStrategy::mode_label`).
@@ -97,6 +193,8 @@ impl ProgressKey {
             export_name: export_name.into(),
             source: source.into(),
             stream: String::new(),
+            schema: String::new(),
+            population: String::new(),
             column: None,
             mode: CHUNKED,
             continues_high_water: false,
@@ -112,6 +210,8 @@ impl ProgressKey {
             export_name: export_name.into(),
             source: source.into(),
             stream: serde_json::Value::from(tables).to_string(),
+            schema: String::new(),
+            population: String::new(),
             column: None,
             mode: "cdc",
             continues_high_water: false,
@@ -207,7 +307,7 @@ impl StateStore {
     /// The cursor of `export_name` writing to `scope` (its destination), or the legacy
     /// pre-v30 row no scoped run has claimed yet.
     pub fn get(&self, export_name: &str, scope: &str) -> Result<CursorState> {
-        self.adopt_unmasked_scope(export_name, scope)?;
+        self.adopt_respelled_source(export_name, scope)?;
         Ok(self
             .query_opt(
                 "SELECT last_cursor_value, last_run_at, cursor_column FROM export_state \
@@ -232,7 +332,7 @@ impl StateStore {
     /// Move the legacy (unscoped) row to `scope` if this scope has none yet: the first
     /// scoped writer continues it, and no other config sharing the name can read it after.
     fn claim_legacy_row(&self, export_name: &str, scope: &str) -> Result<()> {
-        self.adopt_unmasked_scope(export_name, scope)?;
+        self.adopt_respelled_source(export_name, scope)?;
         if scope.is_empty() {
             return Ok(());
         }
@@ -244,29 +344,39 @@ impl StateStore {
         Ok(())
     }
 
-    /// Move the newest row whose scope was stored with its password unmasked onto `scope`, and delete every such row left: nothing reads them and they hold the password.
-    fn adopt_unmasked_scope(&self, export_name: &str, scope: &str) -> Result<()> {
-        if !scope.contains("***") {
-            return Ok(());
-        }
+    /// Move progress stored under another spelling of `scope` (its default port left out, its password unmasked) onto `scope`: the newest such cursor row unless `scope` holds one, and its checkpoint rows; the cursor rows left are deleted.
+    pub(super) fn adopt_respelled_source(&self, export_name: &str, scope: &str) -> Result<()> {
         let stored = self.query(
-            "SELECT prefix FROM export_state WHERE export_name = ?1 AND prefix <> ?2 \
-             ORDER BY last_run_at DESC NULLS LAST",
+            "SELECT prefix, last_run_at FROM export_state \
+             WHERE export_name = ?1 AND prefix NOT IN ('', ?2) \
+             UNION SELECT source, NULL FROM chunk_run WHERE export_name = ?1 AND source <> ?2 \
+             UNION SELECT source, NULL FROM keyset_range WHERE export_name = ?1 AND source <> ?2 \
+             ORDER BY 2 DESC NULLS LAST",
             &[export_name.into(), scope.into()],
             |r| r.text(0),
         )?;
-        for unmasked in stored
+        for respelled in stored
             .iter()
-            .filter(|p| crate::redact::redact_keyword_passwords(p) == scope)
+            .filter(|p| crate::config::canonical_source_key(p) == scope)
         {
-            self.execute(
+            for sql in [
                 "UPDATE export_state SET prefix = ?2 WHERE export_name = ?1 AND prefix = ?3 \
                  AND NOT EXISTS (SELECT 1 FROM export_state WHERE export_name = ?1 AND prefix = ?2)",
-                &[export_name.into(), scope.into(), unmasked.as_str().into()],
-            )?;
+                "UPDATE chunk_run SET source = ?2 WHERE export_name = ?1 AND source = ?3 \
+                 AND (status <> 'in_progress' OR NOT EXISTS (SELECT 1 FROM chunk_run c \
+                 WHERE c.export_name = ?1 AND c.source = ?2 AND c.status = 'in_progress'))",
+                "UPDATE keyset_range SET source = ?2 WHERE export_name = ?1 AND source = ?3 \
+                 AND NOT EXISTS (SELECT 1 FROM keyset_range k \
+                 WHERE k.export_name = ?1 AND k.source = ?2)",
+            ] {
+                self.execute(
+                    sql,
+                    &[export_name.into(), scope.into(), respelled.as_str().into()],
+                )?;
+            }
             self.execute(
                 "DELETE FROM export_state WHERE export_name = ?1 AND prefix = ?2",
-                &[export_name.into(), unmasked.as_str().into()],
+                &[export_name.into(), respelled.as_str().into()],
             )?;
         }
         Ok(())
@@ -297,70 +407,105 @@ impl StateStore {
         Ok(state)
     }
 
-    /// Claim the stored progress of `key`: refuse progress stored for another stream (table / collection); adopt a row written before streams were recorded.
-    pub fn claim(&self, key: ProgressKey) -> Result<ProgressClaim<'_>> {
-        let (export_name, scope, stream) = (&key.export_name, &key.source, &key.stream);
+    /// What the row a claim of `key` selects holds.
+    fn stored_progress(&self, key: &ProgressKey) -> Result<StoredProgress> {
         let row = self.query_opt(
-            "SELECT stream, last_cursor_value, resume_run_id, resume_owner FROM export_state \
+            "SELECT stream, last_cursor_value, resume_run_id, resume_owner, source_schema, \
+             population FROM export_state \
              WHERE export_name = ?1 AND (prefix = ?2 OR prefix = '') \
              ORDER BY prefix DESC LIMIT 1",
-            &[export_name.as_str().into(), scope.as_str().into()],
-            |r| (r.opt_text(0), r.opt_text(1), r.opt_text(2), r.opt_text(3)),
+            &[key.export_name.as_str().into(), key.source.as_str().into()],
+            |r| {
+                (
+                    (r.opt_text(0), r.opt_text(4), r.opt_text(5)),
+                    (r.opt_text(1), r.opt_text(2), r.opt_text(3)),
+                )
+            },
         )?;
-        let anchor = match &row {
-            Some((_, _, Some(run), owner)) => {
-                Some((run.as_str(), owner.as_deref().unwrap_or(KEYSET)))
-            }
-            _ => None,
+        let Some(((stream, schema, population), (cursor, run, owner))) = row else {
+            return Ok(StoredProgress::default());
         };
+        let anchor = run.map(|run| (run, owner.unwrap_or_else(|| KEYSET.to_string())));
+        let resumed = anchor.as_ref().filter(|(_, owner)| owner != CHUNKED);
+        let held = held_progress(
+            cursor.as_deref(),
+            resumed.map(|(run, _)| run.as_str()),
+            key.continues_high_water,
+        );
+        let stored = StoredStream {
+            stream,
+            schema,
+            population,
+        };
+        Ok(StoredProgress {
+            anchor,
+            held: held.map(|held| (held, stored)),
+        })
+    }
+
+    /// Claim the stored progress of `key`: refuse progress stored for another stream (relation, schema or rows); adopt a row written before a part was recorded, or under another spelling of the source.
+    pub fn claim(&self, key: ProgressKey) -> Result<ProgressClaim<'_>> {
+        let (export_name, scope, stream) = (&key.export_name, &key.source, &key.stream);
+        self.adopt_respelled_source(export_name, scope)?;
+        let StoredProgress { anchor, held } = self.stored_progress(&key)?;
+        let anchor = anchor
+            .as_ref()
+            .map(|(run, owner)| (run.as_str(), owner.as_str()));
         self.refuse_unfinished_run(&key, anchor)?;
         if let Some((run, _)) = anchor {
             self.own_anchor(&key, run)?;
         }
-        let owner = anchor.map(|(_, owner)| owner);
-        let chunk_anchor = owner == Some(CHUNKED);
-        let held = row.clone().and_then(|(stored, cursor, anchor, _)| {
-            held_progress(
-                cursor.as_deref(),
-                anchor.as_deref().filter(|_| !chunk_anchor),
-                key.continues_high_water,
-            )
-            .map(|held| (stored, held))
-        });
-        let Some((stored, held)) = held else {
+        let Some((held, stored)) = held else {
             return Ok(ProgressClaim { state: self, key });
         };
-        match stored {
-            None if stream.is_empty() => {}
-            None => {
-                self.execute(
-                    "UPDATE export_state SET stream = ?3 WHERE export_name = ?1 \
-                     AND (prefix = ?2 OR prefix = '') AND stream IS NULL",
-                    &[
-                        export_name.as_str().into(),
-                        scope.as_str().into(),
-                        stream.as_str().into(),
-                    ],
-                )?;
-                log::warn!(
-                    "export '{export_name}': its stored progress ({held}) predates stream \
-                     tracking — recorded as belonging to `{stream}`, which this export reads now"
-                );
-            }
-            Some(stored) if streams_differ(&stored, stream) => {
-                crate::rivet_bail!(
-                    crate::error::codes::STATE_CURSOR_STREAM_MISMATCH,
-                    "export '{export_name}': its stored progress ({held}) was written reading \
-                     `{stored}`, but this export reads `{stream}` — continuing from it would \
-                     skip rows of `{stream}`; nothing was read or written.\n  \
-                     Hint: two exports sharing a name in one state database need their own names \
-                     (or their own state). If this export was repointed, \
-                     `rivet state reset -c <config> --export {export_name}` starts `{stream}` over \
-                     with a full pass — it discards the progress of EVERY export named \
-                     '{export_name}' in this state database."
-                );
-            }
-            Some(_) => {}
+        if let Some((was, now)) = stored.another_than(&key) {
+            crate::rivet_bail!(
+                crate::error::codes::STATE_CURSOR_STREAM_MISMATCH,
+                "export '{export_name}': its stored progress ({held}) was written reading \
+                 `{was}`, but this export reads `{now}` — continuing from it would \
+                 skip rows of `{now}`; nothing was read or written.\n  \
+                 Hint: two exports sharing a name in one state database need their own names \
+                 (or their own state). If this export was edited, restore what it read to \
+                 continue from the stored progress, or \
+                 `rivet state reset -c <config> --export {export_name}` starts `{now}` over \
+                 with a full pass — it discards the progress '{export_name}' holds on this \
+                 source. If the edit is meant and the export should go on from that progress, \
+                 `rivet state accept -c <config> --export {export_name}` keeps it and records \
+                 it as belonging to `{now}` — rows of `{now}` below it are not delivered."
+            );
+        }
+        let unrecorded = [
+            ("stream", stored.stream.is_none(), stream),
+            ("source_schema", stored.schema.is_none(), &key.schema),
+            ("population", stored.population.is_none(), &key.population),
+        ];
+        for (column, _, now) in unrecorded
+            .iter()
+            .filter(|(c, legacy, now)| *legacy && (*c == "source_schema" || !now.is_empty()))
+        {
+            self.execute(
+                &format!(
+                    "UPDATE export_state SET {column} = ?3 WHERE export_name = ?1 \
+                     AND (prefix = ?2 OR prefix = '') AND {column} IS NULL"
+                ),
+                &[
+                    export_name.as_str().into(),
+                    scope.as_str().into(),
+                    now.as_str().into(),
+                ],
+            )?;
+        }
+        if stored.stream.is_none() && !stream.is_empty() {
+            log::warn!(
+                "export '{export_name}': its stored progress ({held}) predates stream \
+                 tracking — recorded as belonging to `{stream}`, which this export reads now"
+            );
+        } else if stored.population.is_none() && !key.population.is_empty() {
+            log::warn!(
+                "export '{export_name}': its stored progress ({held}) predates query \
+                 tracking — recorded as belonging to `{}`, which this export reads now",
+                key.population
+            );
         }
         Ok(ProgressClaim { state: self, key })
     }
@@ -482,13 +627,16 @@ impl StateStore {
         self.claim_legacy_row(export_name, scope)?;
         let now = chrono::Utc::now().to_rfc3339();
         let sql = "INSERT INTO export_state \
-             (export_name, prefix, last_cursor_value, last_run_at, cursor_column, stream)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             (export_name, prefix, last_cursor_value, last_run_at, cursor_column, stream, \
+              source_schema, population)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(export_name, prefix) DO UPDATE SET
                 last_cursor_value = excluded.last_cursor_value,
                 last_run_at = excluded.last_run_at,
                 cursor_column = excluded.cursor_column,
-                stream = excluded.stream";
+                stream = excluded.stream,
+                source_schema = excluded.source_schema,
+                population = excluded.population";
         self.execute(
             sql,
             &[
@@ -498,6 +646,8 @@ impl StateStore {
                 now.into(),
                 cursor_column.into(),
                 key.stream.as_str().into(),
+                key.schema.as_str().into(),
+                key.population.as_str().into(),
             ],
         )?;
         Ok(())
@@ -526,11 +676,13 @@ impl StateStore {
         self.claim_legacy_row(export_name, scope)?;
         let now = chrono::Utc::now().to_rfc3339();
         let sql = "INSERT INTO export_state \
-             (export_name, prefix, resume_run_id, last_run_at, stream, resume_owner)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             (export_name, prefix, resume_run_id, last_run_at, stream, resume_owner, \
+              source_schema, population)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(export_name, prefix) DO UPDATE SET \
                 resume_run_id = excluded.resume_run_id, stream = excluded.stream, \
-                resume_owner = excluded.resume_owner";
+                resume_owner = excluded.resume_owner, source_schema = excluded.source_schema, \
+                population = excluded.population";
         self.execute(
             sql,
             &[
@@ -540,6 +692,8 @@ impl StateStore {
                 now.into(),
                 key.stream.as_str().into(),
                 key.mode.into(),
+                key.schema.as_str().into(),
+                key.population.as_str().into(),
             ],
         )?;
         Ok(())
@@ -547,7 +701,7 @@ impl StateStore {
 
     /// The persisted in-progress keyset run_id, or None when no run is in progress.
     pub fn get_resume_run_id(&self, export_name: &str, scope: &str) -> Result<Option<String>> {
-        self.adopt_unmasked_scope(export_name, scope)?;
+        self.adopt_respelled_source(export_name, scope)?;
         let sql = "SELECT resume_run_id FROM export_state \
                    WHERE export_name = ?1 AND (prefix = ?2 OR prefix = '') \
                    ORDER BY prefix DESC LIMIT 1";
@@ -615,13 +769,43 @@ impl StateStore {
     /// verified boundary (`export_progression`). Both must go: a surviving
     /// progression row would make `rivet state progression` report a stale
     /// committed boundary after `state show` is already empty.
-    pub fn reset(&self, export_name: &str) -> Result<()> {
+    ///
+    /// Only the row of `source` (and the row written before sources were recorded) goes: an export of the same name reading another source keeps its cursor.
+    pub fn reset(&self, export_name: &str, source: &str) -> Result<()> {
+        self.adopt_respelled_source(export_name, source)?;
         self.execute(
-            "DELETE FROM export_state WHERE export_name = ?1",
-            &[export_name.into()],
+            "DELETE FROM export_state WHERE export_name = ?1 AND prefix IN (?2, '')",
+            &[export_name.into(), source.into()],
         )?;
         self.delete_progression(export_name)?;
         Ok(())
+    }
+
+    /// Re-bind the stored progress of `key` to the stream, schema and rows it reads now, on the operator's word: the cursor value, its column and any anchor stay. Refused for a cursor written for another column; changes a row only where a run of `key` is refused for its stream.
+    pub fn accept(&self, key: &ProgressKey) -> Result<Accepted> {
+        let (export_name, scope) = (key.export_name.as_str(), key.source.as_str());
+        self.claim_legacy_row(export_name, scope)?;
+        let Some((held, stored)) = self.stored_progress(key)?.held else {
+            return Ok(Accepted::NoProgress);
+        };
+        if let Some(column) = &key.column {
+            self.get_owned(export_name, scope, column)?;
+        }
+        let Some((was, now)) = stored.another_than(key) else {
+            return Ok(Accepted::Unchanged);
+        };
+        self.execute(
+            "UPDATE export_state SET stream = ?3, source_schema = ?4, population = ?5 \
+             WHERE export_name = ?1 AND prefix = ?2",
+            &[
+                export_name.into(),
+                scope.into(),
+                key.stream.as_str().into(),
+                key.schema.as_str().into(),
+                key.population.as_str().into(),
+            ],
+        )?;
+        Ok(Accepted::Rebound { held, was, now })
     }
 
     pub fn list_all(&self) -> Result<Vec<CursorState>> {
@@ -653,6 +837,8 @@ mod tests {
             export_name: export.into(),
             source: scope.into(),
             stream: stream.into(),
+            schema: String::new(),
+            population: String::new(),
             column: Some(column.into()),
             mode: "keyset",
             continues_high_water: true,
@@ -739,7 +925,7 @@ mod tests {
             s.claim(as_mode("incremental", "my/db")).is_ok(),
             "another source holds no interrupted run"
         );
-        s.reset("orders").unwrap();
+        s.reset("orders", "pg/db").unwrap();
         assert!(s.claim(as_mode("incremental", "pg/db")).is_ok());
     }
 
@@ -847,7 +1033,7 @@ mod tests {
                 "keyset",
                 "`keyset_incremental: true` or MongoDB's `source.mongo.resume: true`, whichever it had)",
                 "`rivet state reset -c <config> --export orders` abandons it",
-                |s| s.reset("orders").unwrap(),
+                |s| s.reset("orders", "pg/db").unwrap(),
             ),
         ];
         for (mode, setting, command, abandon) in cases {
@@ -907,7 +1093,7 @@ mod tests {
         let chunked = ProgressKey::chunked("orders", "pg/db");
         s.open_chunk_run(&chunked, "run_c", "h", 3, &[(1, 10)])
             .unwrap();
-        s.reset("orders").unwrap();
+        s.reset("orders", "pg/db").unwrap();
         assert_eq!(s.get_resume_run_id("orders", "pg/db").unwrap(), None);
         for key in [uncheckpointed("chunked", "pg/db"), as_mode("full", "pg/db")] {
             let said = refusal(s.claim(key), OWNER);
@@ -1130,7 +1316,7 @@ mod tests {
             Some("110"),
             "a refusal changes nothing"
         );
-        s.reset("orders").unwrap();
+        s.reset("orders", "pg/db").unwrap();
         assert_eq!(stream_refusal(&s, "orders_b", true), None);
     }
 
@@ -1339,6 +1525,516 @@ mod tests {
         .unwrap()
     }
 
+    const SPELLED: &str = "postgres://db.host:5432/app";
+    const PORTLESS: &str = "postgres://db.host/app";
+    const OTHER_PORT: &str = "postgres://db.host:6000/app";
+
+    fn column(s: &StateStore, sql: &str) -> Vec<String> {
+        s.query(sql, &[], |r| r.opt_text(0).unwrap_or_else(|| "NULL".into()))
+            .unwrap()
+    }
+
+    /// P-18: a cursor stored under a URL that left the default port out is the same source's and continues.
+    #[test]
+    fn a_cursor_stored_without_the_default_port_continues_under_the_spelled_one() {
+        let s = store();
+        put(&s, "orders", PORTLESS, "100", "id", "orders_a").unwrap();
+        put(&s, "orders", OTHER_PORT, "7", "id", "orders_a").unwrap();
+        put(&s, "users", PORTLESS, "55", "id", "users").unwrap();
+        let claim = s.claim(as_mode("incremental", SPELLED)).unwrap();
+        assert_eq!(
+            claim.cursor().unwrap().last_cursor_value.as_deref(),
+            Some("100")
+        );
+        assert_eq!(
+            scopes(&s),
+            [PORTLESS, SPELLED, OTHER_PORT],
+            "this export's row moved; another port and another export are untouched"
+        );
+        let other = s.claim(as_mode("incremental", OTHER_PORT)).unwrap();
+        assert_eq!(
+            other.cursor().unwrap().last_cursor_value.as_deref(),
+            Some("7")
+        );
+
+        let s = store();
+        put(&s, "orders", PORTLESS, "100", "id", "orders_a").unwrap();
+        put(&s, "orders", SPELLED, "300", "id", "orders_a").unwrap();
+        let claim = s.claim(as_mode("incremental", SPELLED)).unwrap();
+        assert_eq!(
+            claim.cursor().unwrap().last_cursor_value.as_deref(),
+            Some("300"),
+            "a row already under the spelled key outranks the other spelling"
+        );
+        assert_eq!(scopes(&s), [SPELLED]);
+    }
+
+    /// P-18 for the checkpoints: an interrupted keyset or range-chunk run opened without the port is resumed, not left beside a fresh pass.
+    #[test]
+    fn an_interrupted_run_stored_without_the_default_port_is_resumed_under_the_spelled_one() {
+        let s = store();
+        anchor(&s, "orders", PORTLESS, "k1", "orders_a").unwrap();
+        s.persist_keyset_ranges("orders", PORTLESS, "k1", "id", &[(None, None)])
+            .unwrap();
+        let claim = s.claim(as_mode("keyset", SPELLED)).unwrap();
+        assert_eq!(claim.resume_run_id().unwrap().as_deref(), Some("k1"));
+        assert_eq!(column(&s, "SELECT source FROM keyset_range"), [SPELLED]);
+
+        let s = store();
+        s.create_chunk_run("c1", "orders", "plan", 3).unwrap();
+        s.create_chunk_run("c0", "users", "plan", 3).unwrap();
+        s.execute("UPDATE chunk_run SET source = ?1", &[PORTLESS.into()])
+            .unwrap();
+        let claim = s.claim(ProgressKey::chunked("orders", SPELLED)).unwrap();
+        assert_eq!(
+            claim.chunk_run().unwrap(),
+            Some(("c1".to_string(), "plan".to_string()))
+        );
+        assert_eq!(
+            column(&s, "SELECT source FROM chunk_run ORDER BY run_id"),
+            [PORTLESS, SPELLED],
+            "another export's run is not this claim's to move"
+        );
+
+        let s = store();
+        s.create_chunk_run("old", "orders", "plan", 3).unwrap();
+        s.execute("UPDATE chunk_run SET source = ?1", &[PORTLESS.into()])
+            .unwrap();
+        s.create_chunk_run("new", "orders", "plan", 3).unwrap();
+        s.execute(
+            "UPDATE chunk_run SET source = ?1 WHERE run_id = 'new'",
+            &[SPELLED.into()],
+        )
+        .unwrap();
+        s.persist_keyset_ranges("orders", PORTLESS, "k1", "id", &[(None, None)])
+            .unwrap();
+        s.persist_keyset_ranges("orders", SPELLED, "k2", "id", &[(None, None)])
+            .unwrap();
+        s.adopt_respelled_source("orders", SPELLED).unwrap();
+        assert_eq!(
+            column(&s, "SELECT source FROM chunk_run ORDER BY run_id"),
+            [SPELLED, PORTLESS],
+            "one unfinished run per source: the spelled one is kept"
+        );
+        assert_eq!(
+            column(&s, "SELECT source FROM keyset_range ORDER BY run_id"),
+            [PORTLESS, SPELLED]
+        );
+    }
+
+    /// P-19: a reset clears the row of its own source, under either spelling, and no other source's.
+    #[test]
+    fn a_reset_clears_its_own_source_and_keeps_another_sources_cursor() {
+        let s = store();
+        put(&s, "orders", PORTLESS, "100", "id", "orders_a").unwrap();
+        put(&s, "orders", OTHER_PORT, "7", "id", "orders_a").unwrap();
+        s.update_legacy("orders", "1").unwrap();
+        for cycle in 1..=2 {
+            s.reset("orders", SPELLED).unwrap();
+            assert_eq!(scopes(&s), [OTHER_PORT], "cycle {cycle}");
+        }
+        let kept = s.get("orders", OTHER_PORT).unwrap();
+        assert_eq!(kept.last_cursor_value.as_deref(), Some("7"));
+    }
+
+    const SPENT_1: &str = "from ? where spent = 1";
+    const SPENT_0: &str = "from ? where spent = 0";
+
+    fn reading(stream: &str, schema: &str, population: &str) -> ProgressKey {
+        ProgressKey {
+            stream: stream.into(),
+            schema: schema.into(),
+            population: population.into(),
+            ..as_mode("incremental", "pg/db")
+        }
+    }
+
+    /// An edited filter or another schema under the same name is another stream: refused twice by code, continued once restored, started over after a reset.
+    #[test]
+    fn an_edited_filter_or_another_schema_is_refused_until_it_is_restored_or_reset() {
+        let s = store();
+        let wrote = reading("orders", "", SPENT_1);
+        s.update_with_column(&wrote, "10").unwrap();
+        assert_eq!(
+            column(
+                &s,
+                "SELECT stream || '|' || source_schema || '|' || population FROM export_state"
+            ),
+            [format!("orders||{SPENT_1}")],
+            "every cursor write records what it read"
+        );
+        let own_search_path = "orders under the server's own search_path";
+        let edits = [
+            (
+                reading("orders", "", SPENT_0),
+                format!("orders ({SPENT_1})"),
+                format!("orders ({SPENT_0})"),
+            ),
+            (
+                reading("orders", "sales", SPENT_1),
+                own_search_path.to_string(),
+                "orders under search_path sales".to_string(),
+            ),
+            (
+                reading("hr.orders", "", SPENT_1),
+                "orders".to_string(),
+                "hr.orders".to_string(),
+            ),
+        ];
+        for (edited, was, now) in &edits[..2] {
+            for cycle in 1..=2 {
+                let said = refusal(
+                    s.claim(edited.clone()),
+                    "RIVET_STATE_CURSOR_STREAM_MISMATCH",
+                );
+                for want in [
+                    "its stored progress (cursor `10`)",
+                    &format!("was written reading `{was}`"),
+                    &format!("this export reads `{now}`"),
+                    "two exports sharing a name in one state database need their own names",
+                    "restore what it read to continue from the stored progress",
+                    &format!("`rivet state reset -c <config> --export orders` starts `{now}` over"),
+                    "it discards the progress 'orders' holds on this source",
+                ] {
+                    assert!(said.contains(want), "cycle {cycle}: {want} in {said}");
+                }
+            }
+        }
+        let (qualified, _, _) = &edits[2];
+        assert!(
+            s.claim(qualified.clone()).is_ok(),
+            "a bare stored name may be the qualified one, as before"
+        );
+        let restored = s.claim(wrote.clone()).expect("what it read, restored");
+        assert_eq!(
+            restored.cursor().unwrap().last_cursor_value.as_deref(),
+            Some("10")
+        );
+        s.reset("orders", "pg/db").unwrap();
+        let fresh = s.claim(edits[0].0.clone()).expect("after the reset");
+        assert_eq!(fresh.cursor().unwrap().last_cursor_value, None);
+    }
+
+    /// A query as written and a substituted query that fills its placeholders are one row set; two templates, or two substituted queries, are one only when equal.
+    #[test]
+    fn a_substituted_query_is_the_rows_of_the_template_it_fills() {
+        let written = "from ? where region = '${region}' and day >= ${from} order by id";
+        let filled = "from ? where region = 'eu' and day >= 20 order by id";
+        for (a, b, same) in [
+            (written, filled, true),
+            (written, written, true),
+            (filled, filled, true),
+            (written, "from ? where region = 'eu' and day >= 20", false),
+            (written, "from ? where region = 'eu' order by id", false),
+            (
+                written,
+                "from ? where day >= 20 and region = 'eu' order by id",
+                false,
+            ),
+            (
+                written,
+                "x from ? where region = 'eu' and day >= 20 order by id",
+                false,
+            ),
+            (
+                filled,
+                "from ? where region = 'us' and day >= 20 order by id",
+                false,
+            ),
+            (
+                "from ? where a = ${x}",
+                "from ? where a = ${x} and id > 0",
+                false,
+            ),
+            ("from ? where a = ${x}", "from ? where a = ${y}", false),
+            ("from ? where ${f}", "from ? where anything at all", true),
+            ("a${x}b${y}b${z}c", "a1b2b3c", true),
+            ("a${x}b${y}b${z}c", "a1b2c", false),
+            ("a${x}a", "a", false),
+            ("a${x}a", "aa", true),
+            ("${x} and ${y}", "1 and 2 and 3", true),
+            ("${x} or ${y}", "1 and 2", false),
+        ] {
+            assert_eq!(same_rows(a, b), same, "{a} / {b}");
+            assert_eq!(same_rows(b, a), same, "{b} / {a}");
+        }
+    }
+
+    /// A plan sealed before templates were recorded carries the substituted query: it continues progress stored under the template, and the template continues progress it stored.
+    #[test]
+    fn a_plan_sealed_with_its_values_substituted_and_a_template_continue_each_other() {
+        let written = "from ? where spent = ${spent}";
+        for (stored, now) in [(written, SPENT_1), (SPENT_1, written), (written, SPENT_0)] {
+            let s = store();
+            s.update_with_column(&reading("orders", "", stored), "10")
+                .unwrap();
+            let claim = s.claim(reading("orders", "", now)).expect("one row set");
+            assert_eq!(
+                claim.cursor().unwrap().last_cursor_value.as_deref(),
+                Some("10")
+            );
+            assert_eq!(
+                s.accept(&reading("orders", "", now)).unwrap(),
+                Accepted::Unchanged
+            );
+        }
+        let s = store();
+        s.update_with_column(&reading("orders", "", written), "10")
+            .unwrap();
+        for edited in [
+            "from ? where spent = ${spent} and id > 0",
+            "from ? where paid = 1",
+        ] {
+            refusal(
+                s.claim(reading("orders", "", edited)),
+                "RIVET_STATE_CURSOR_STREAM_MISMATCH",
+            );
+        }
+    }
+
+    /// The stream parts and the cursor the one `export_state` row holds.
+    fn bound(s: &StateStore) -> Vec<String> {
+        let parts =
+            "stream || '|' || source_schema || '|' || population || '|' || last_cursor_value";
+        column(s, &format!("SELECT {parts} FROM export_state"))
+    }
+
+    /// `state accept` keeps the cursor under the edited stream: refused twice before, continued twice after, and the row it left is refused for the stream it had.
+    #[test]
+    fn an_accepted_edit_keeps_the_cursor_under_what_the_export_reads_now() {
+        for (edited, now) in [
+            (
+                reading("orders", "", SPENT_0),
+                format!("orders ({SPENT_0})"),
+            ),
+            (
+                reading("orders", "sales", SPENT_1),
+                "orders under search_path sales".to_string(),
+            ),
+            (reading("orders_b", "", SPENT_1), "orders_b".to_string()),
+        ] {
+            let s = store();
+            let wrote = reading("orders", "", SPENT_1);
+            s.update_with_column(&wrote, "10").unwrap();
+            for cycle in 1..=2 {
+                let said = refusal(
+                    s.claim(edited.clone()),
+                    "RIVET_STATE_CURSOR_STREAM_MISMATCH",
+                );
+                let accept = format!(
+                    "If the edit is meant and the export should go on from that progress, \
+                     `rivet state accept -c <config> --export orders` keeps it and records it as \
+                     belonging to `{now}` — rows of `{now}` below it are not delivered."
+                );
+                assert!(said.ends_with(&accept), "cycle {cycle}: {said}");
+            }
+            let other_export = ProgressKey {
+                export_name: "customers".into(),
+                ..edited.clone()
+            };
+            assert_eq!(s.accept(&other_export).unwrap(), Accepted::NoProgress);
+            refusal(
+                s.claim(edited.clone()),
+                "RIVET_STATE_CURSOR_STREAM_MISMATCH",
+            );
+
+            let Accepted::Rebound { held, was, now: is } = s.accept(&edited).unwrap() else {
+                panic!("the edit is accepted");
+            };
+            assert_eq!(held, "cursor `10`");
+            assert!(was.starts_with("orders"), "{was}");
+            assert_eq!(is, now);
+            assert_eq!(
+                bound(&s),
+                [format!(
+                    "{}|{}|{}|10",
+                    edited.stream, edited.schema, edited.population
+                )],
+                "the row names what the export reads now and keeps its cursor"
+            );
+            for cycle in 1..=2 {
+                let claim = s.claim(edited.clone());
+                let cursor = claim.expect("accepted").cursor().unwrap();
+                assert_eq!(
+                    cursor.last_cursor_value.as_deref(),
+                    Some("10"),
+                    "cycle {cycle}"
+                );
+                assert_eq!(cursor.cursor_column.as_deref(), Some("id"));
+            }
+            assert_eq!(s.accept(&edited).unwrap(), Accepted::Unchanged);
+            refusal(s.claim(wrote), "RIVET_STATE_CURSOR_STREAM_MISMATCH");
+        }
+    }
+
+    /// `state accept` changes nothing where a run is not refused for its stream, and refuses a cursor written for another column.
+    #[test]
+    fn an_acceptance_rebinds_only_progress_a_run_is_refused_for() {
+        let s = store();
+        let wrote = reading("orders", "", SPENT_1);
+        assert_eq!(s.accept(&wrote).unwrap(), Accepted::NoProgress, "no row");
+        s.update_with_column(&wrote, "10").unwrap();
+        let before = bound(&s);
+        assert_eq!(s.accept(&wrote).unwrap(), Accepted::Unchanged);
+
+        let full = ProgressKey {
+            continues_high_water: false,
+            ..reading("orders", "", SPENT_0)
+        };
+        assert!(
+            s.claim(full.clone()).is_ok(),
+            "a full pass seeks from no cursor"
+        );
+        assert_eq!(s.accept(&full).unwrap(), Accepted::NoProgress);
+
+        let other_column = ProgressKey {
+            column: Some("updated_at".into()),
+            ..reading("orders", "", SPENT_0)
+        };
+        for cycle in 1..=2 {
+            let said = refusal(s.accept(&other_column), "RIVET_STATE_CURSOR_OWNER_MISMATCH");
+            assert!(
+                said.contains("was written for `id`"),
+                "cycle {cycle}: {said}"
+            );
+        }
+        assert_eq!(bound(&s), before, "nothing above changed the row");
+
+        s.execute(
+            "UPDATE export_state SET prefix = '', stream = NULL, source_schema = NULL, population = NULL",
+            &[],
+        )
+        .unwrap();
+        let edited = reading("orders", "", SPENT_0);
+        assert_eq!(
+            s.accept(&edited).unwrap(),
+            Accepted::Unchanged,
+            "a row written before streams were recorded is adopted by the next run, not accepted"
+        );
+        assert_eq!(scopes(&s), ["pg/db"], "the accept claimed the legacy row");
+    }
+
+    /// An acceptance keeps an interrupted run's anchor as it keeps a cursor.
+    #[test]
+    fn an_accepted_edit_keeps_an_interrupted_runs_anchor() {
+        let s = store();
+        let keyset = |population: &str| ProgressKey {
+            population: population.into(),
+            continues_high_water: false,
+            ..key("orders", "pg/db", "id", "orders")
+        };
+        s.set_resume_run_id(&keyset(SPENT_1), "run_7").unwrap();
+        refusal(
+            s.claim(keyset(SPENT_0)),
+            "RIVET_STATE_CURSOR_STREAM_MISMATCH",
+        );
+        let Accepted::Rebound { held, .. } = s.accept(&keyset(SPENT_0)).unwrap() else {
+            panic!("the edit is accepted");
+        };
+        assert_eq!(held, "interrupted run run_7");
+        let claim = s.claim(keyset(SPENT_0)).expect("accepted");
+        assert_eq!(claim.resume_run_id().unwrap().as_deref(), Some("run_7"));
+    }
+
+    /// A name read through a one-schema search_path is that schema's table: qualifying it by hand continues, another schema's is refused.
+    #[test]
+    fn a_search_path_resolves_the_unqualified_name_it_is_compared_by() {
+        let s = store();
+        s.update_with_column(&reading("orders", "sales", "from ?"), "10")
+            .unwrap();
+        assert!(s.claim(reading("sales.orders", "", "from ?")).is_ok());
+        assert!(s.claim(reading("sales.orders", "hr", "from ?")).is_ok());
+        let said = refusal(
+            s.claim(reading("hr.orders", "", "from ?")),
+            "RIVET_STATE_CURSOR_STREAM_MISMATCH",
+        );
+        assert!(said.contains("reading `sales.orders`"), "{said}");
+        assert!(said.contains("reads `hr.orders`"), "{said}");
+        let said = refusal(
+            s.claim(reading("orders", "", "from ?")),
+            "RIVET_STATE_CURSOR_STREAM_MISMATCH",
+        );
+        assert!(
+            said.contains("reading `orders under search_path sales`"),
+            "{said}"
+        );
+        let said = refusal(
+            s.claim(reading("orders", "sales,hr", "from ?")),
+            "RIVET_STATE_CURSOR_STREAM_MISMATCH",
+        );
+        assert!(
+            said.contains("reads `orders under search_path sales,hr`"),
+            "{said}"
+        );
+        assert_eq!(resolved("orders", "a,b"), "orders");
+        assert_eq!(resolved("", "sales"), "");
+
+        let s = store();
+        s.update_with_column(&reading("", "sales", "select 1"), "10")
+            .unwrap();
+        let said = refusal(
+            s.claim(reading("", "", "select 1")),
+            "RIVET_STATE_CURSOR_STREAM_MISMATCH",
+        );
+        assert!(
+            said.contains("reading `its query under search_path sales`"),
+            "{said}"
+        );
+    }
+
+    /// A row written before the schema and the rows were recorded (rivet <= 0.31, or one that recorded the stream only) is adopted once and compared from then on.
+    #[test]
+    fn a_row_written_before_the_query_was_recorded_is_adopted_then_compared() {
+        for stream in [None, Some("orders")] {
+            let s = store();
+            s.execute(
+                "INSERT INTO export_state (export_name, prefix, last_cursor_value, cursor_column, stream) \
+                 VALUES ('orders', 'pg/db', '10', 'id', ?1)",
+                &[stream.into()],
+            )
+            .unwrap();
+            let claim = s.claim(reading("orders", "sales", SPENT_1)).unwrap();
+            assert_eq!(
+                claim.cursor().unwrap().last_cursor_value.as_deref(),
+                Some("10"),
+                "{stream:?}: the legacy row continues"
+            );
+            assert_eq!(
+                column(
+                    &s,
+                    "SELECT stream || '|' || source_schema || '|' || population FROM export_state"
+                ),
+                [format!("orders|sales|{SPENT_1}")],
+                "{stream:?}"
+            );
+            assert!(s.claim(reading("orders", "sales", SPENT_1)).is_ok());
+            refusal(
+                s.claim(reading("orders", "sales", SPENT_0)),
+                "RIVET_STATE_CURSOR_STREAM_MISMATCH",
+            );
+            refusal(
+                s.claim(reading("orders", "", SPENT_1)),
+                "RIVET_STATE_CURSOR_STREAM_MISMATCH",
+            );
+        }
+        let s = store();
+        s.update_legacy("orders", "10").unwrap();
+        s.claim(ProgressKey {
+            continues_high_water: true,
+            ..ProgressKey::chunked("orders", "pg/db")
+        })
+        .unwrap();
+        assert_eq!(
+            column(
+                &s,
+                "SELECT COALESCE(stream, 'NULL') || '|' || source_schema || '|' || \
+                 COALESCE(population, 'NULL') FROM export_state"
+            ),
+            ["NULL||NULL"],
+            "a key that names no stream and no rows records neither"
+        );
+    }
+
     /// A cursor stored under the unmasked scope continues under the masked one, and the password leaves the table.
     #[test]
     fn a_cursor_stored_with_its_password_unmasked_is_adopted_by_the_masked_scope() {
@@ -1477,7 +2173,7 @@ mod tests {
     fn reset_clears_cursor_state() {
         let s = store();
         s.update_legacy("orders", "100").unwrap();
-        s.reset("orders").unwrap();
+        s.reset("orders", "pg/db").unwrap();
         assert!(s.get("orders", "").unwrap().last_cursor_value.is_none());
     }
 
@@ -1598,7 +2294,7 @@ mod tests {
     fn reset_clears_cursor_state_completely() {
         let s = store();
         s.update_legacy("orders", "2024-06-01").unwrap();
-        s.reset("orders").unwrap();
+        s.reset("orders", "pg/db").unwrap();
         let after = s.get("orders", "").unwrap();
         assert!(after.last_cursor_value.is_none());
         assert!(
@@ -1620,7 +2316,7 @@ mod tests {
         s.record_committed_incremental("users", "9", "run-u")
             .unwrap();
 
-        s.reset("orders").unwrap();
+        s.reset("orders", "pg/db").unwrap();
 
         let p = s.get_progression("orders").unwrap();
         assert!(

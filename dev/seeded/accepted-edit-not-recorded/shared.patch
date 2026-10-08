@@ -1,0 +1,12 @@
+diff --git a/src/state/cursor.rs b/src/state/cursor.rs
+--- a/src/state/cursor.rs
++++ b/src/state/cursor.rs
+@@ -796,7 +796,7 @@
+         };
+         self.execute(
+             "UPDATE export_state SET stream = ?3, source_schema = ?4, population = ?5 \
+-             WHERE export_name = ?1 AND prefix = ?2",
++             WHERE export_name = ?1 AND prefix = ?2 AND 1 = 0",
+             &[
+                 export_name.into(),
+                 scope.into(),

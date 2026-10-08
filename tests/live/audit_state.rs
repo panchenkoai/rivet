@@ -181,8 +181,8 @@ fn audit_state_show_refuses_a_missing_config_path() {
 
 /// P-19: `state reset --export X` under one config keeps the cursor a same-named export of another source stored.
 #[test]
-#[ignore = "live+gate-only: postgres; open defect P-19, acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_state_reset_keeps_the_cursor_of_another_source() {
+#[ignore = "live: postgres"]
+fn state_reset_keeps_the_cursor_of_another_source() {
     let e = SqlEngine::Pg;
     e.alive();
     let (table, _guard) = e.table("audit_state");
@@ -216,6 +216,15 @@ fn open_defect_state_reset_keeps_the_cursor_of_another_source() {
     assert!(
         on_disk == 7,
         "P-19: `state reset` under one config deleted the cursor of a same-named export of another source: its next run re-delivered the table ({on_disk} rows on disk for 7 source ids)"
+    );
+
+    let again = tempfile::tempdir().unwrap();
+    let rig = on(rig, POSTGRES_URL, again.path());
+    rig.run_ok();
+    assert_eq!(
+        read_ids(again.path()),
+        (1..=10).collect::<Vec<_>>(),
+        "the reset source starts over with a full pass"
     );
 }
 

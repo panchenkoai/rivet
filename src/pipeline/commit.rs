@@ -431,15 +431,18 @@ pub(crate) enum PartKind {
 /// Seam 1 — ADR-0001 I1 + the destination-write boundary. Writes the
 /// already-finalized temp file to the destination and computes its content
 /// fingerprint (ADR-0012 M3) while the local temp file still exists. Safe to
-/// call from a worker thread (touches no shared run state).
+/// call from a worker thread: the only shared run state it touches is `landed`,
+/// the run's count of parts at the destination, bumped the moment the write returns.
 pub(crate) fn write_part_file(
     dest: &dyn Destination,
     tmp_path: &Path,
     rows: i64,
     file_name: String,
+    landed: &std::sync::atomic::AtomicU64,
 ) -> Result<PartRecord> {
     let bytes = std::fs::metadata(tmp_path).map(|m| m.len()).unwrap_or(0);
     let outcome = dest.write(tmp_path, &file_name)?;
+    landed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // Both body hashes in one read: xxh3 fingerprint (ADR-0012 M3) + base64 MD5
     // (no-download destination verification, GCS md5Hash encoding).  Non-fatal —
     // on failure the fingerprint falls back to the zero placeholder and the md5
@@ -521,6 +524,7 @@ pub(crate) fn write_sink_parts(
                 part.tmp.path(),
                 part.rows as i64,
                 name_for(idx, count),
+                &sink.parts_landed,
             )
         };
         match one() {
@@ -803,10 +807,12 @@ pub(crate) mod tests {
         ResolvedRunPlan {
             split_window: None,
             bytes_read: Default::default(),
+            parts_landed: Default::default(),
             export_name: "orders".into(),
             partition_rollover: None,
             source_table: None,
             base_query: "SELECT 1".into(),
+            query_template: None,
             is_split_unit: false,
             strategy: ExtractionStrategy::Snapshot,
             format: FormatType::Parquet,
@@ -911,8 +917,10 @@ pub(crate) mod tests {
         })
         .unwrap();
 
-        let rec =
-            write_part_file(&dest, &src_path, 7, "out/part.parquet".into()).expect("write ok");
+        let landed = std::sync::atomic::AtomicU64::new(0);
+        let rec = write_part_file(&dest, &src_path, 7, "out/part.parquet".into(), &landed)
+            .expect("write ok");
+        assert_eq!(landed.into_inner(), 1, "the part is at the destination");
 
         assert_eq!(rec.file_name, "out/part.parquet");
         assert_eq!(rec.rows, 7);
@@ -993,13 +1001,34 @@ pub(crate) mod tests {
         let (_d, src) = stage(b"hello rivet");
         // A bogus store checksum (valid base64, wrong digest) must fail the write.
         let dest = ChecksumDest(Some("AAAAAAAAAAAAAAAAAAAAAA==".into()));
-        match write_part_file(&dest, &src, 1, "part.parquet".into()) {
+        let landed = std::sync::atomic::AtomicU64::new(0);
+        match write_part_file(&dest, &src, 1, "part.parquet".into(), &landed) {
             Ok(_) => panic!("mismatched checksum must fail"),
             Err(e) => assert!(
                 e.to_string().contains("transit"),
                 "expected a transit-corruption error, got: {e}"
             ),
         }
+        assert_eq!(
+            landed.into_inner(),
+            1,
+            "the corrupt part is at the destination, in no manifest: the run did write"
+        );
+    }
+
+    #[test]
+    fn a_write_the_destination_refused_put_no_part_there() {
+        let (_d, src) = stage(b"hello rivet");
+        let landed = std::sync::atomic::AtomicU64::new(0);
+        let refused = write_part_file(
+            &NthWriteFails::after(0),
+            &src,
+            1,
+            "p.parquet".into(),
+            &landed,
+        );
+        assert!(refused.is_err(), "the destination refused the write");
+        assert_eq!(landed.into_inner(), 0);
     }
 
     #[test]
@@ -1012,10 +1041,17 @@ pub(crate) mod tests {
         let mut h = Md5::new();
         h.update(payload);
         let real = base64::engine::general_purpose::STANDARD.encode(h.finalize());
-        write_part_file(&ChecksumDest(Some(real)), &src, 1, "p.parquet".into())
-            .expect("matching checksum passes");
+        let landed = Default::default();
+        write_part_file(
+            &ChecksumDest(Some(real)),
+            &src,
+            1,
+            "p.parquet".into(),
+            &landed,
+        )
+        .expect("matching checksum passes");
         // No store checksum (local FS / streamed) → no check, OK.
-        write_part_file(&ChecksumDest(None), &src, 1, "p.parquet".into())
+        write_part_file(&ChecksumDest(None), &src, 1, "p.parquet".into(), &landed)
             .expect("silent store passes");
     }
 
