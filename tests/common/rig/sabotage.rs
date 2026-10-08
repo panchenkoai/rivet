@@ -70,7 +70,9 @@ pub(crate) fn survived(first: &Said, second: Option<&Said>) -> Result<Survived, 
             exit(first)
         )),
         (Some(1..=5), Some(again)) => {
-            if (again.exit, &again.code, &again.line) == (first.exit, &first.code, &first.line) {
+            if (again.exit, &again.code) == (first.exit, &first.code)
+                && super::remedy::same_words(&again.line, &first.line)
+            {
                 Ok(Survived::Refused(first.text.clone()))
             } else {
                 Err(format!(
@@ -85,6 +87,31 @@ pub(crate) fn survived(first: &Said, second: Option<&Said>) -> Result<Survived, 
             "neither a delivery nor a refusal: ended with {}",
             exit(first)
         )),
+    }
+}
+
+/// How an invocation ended once a resource was taken away under it or beside it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Stopped {
+    /// Exit 0, graded by the default oracle against the source.
+    Delivered,
+    /// A loud failure: everything it printed.
+    Failed(String),
+}
+
+/// Why an invocation is neither a delivery nor a loud failure (exit 1 to 5 with an `Error:` line), else how it ended.
+pub(crate) fn stopped(s: &Said) -> Result<Stopped, String> {
+    match s.exit {
+        Some(0) => Ok(Stopped::Delivered),
+        Some(1..=5) if s.line.is_empty() => Err(format!(
+            "failed silently: exit {} with no `Error:` line",
+            s.exit.unwrap_or_default()
+        )),
+        Some(1..=5) => Ok(Stopped::Failed(s.text.clone())),
+        Some(c) => Err(format!(
+            "neither a delivery nor a loud failure: ended with exit {c}"
+        )),
+        None => Err("neither a delivery nor a loud failure: ended by a signal".to_string()),
     }
 }
 
@@ -196,6 +223,28 @@ impl Rig {
         }
     }
 
+    /// Grade a finished invocation a resource was taken from: exit 0 (graded by the default oracle at the seam) or a loud failure; a crash, an internal error or a silent failure panics.
+    pub fn delivered_or_failed_loudly(&self, what: &str, out: &std::process::Output) -> Stopped {
+        let s = said(out);
+        let how = stopped(&s).unwrap_or_else(|why| panic!("{what} {why}\n{}", s.text));
+        eprintln!("sabotage: {what} ended with {:?}: {}", s.exit, s.line);
+        how
+    }
+
+    /// Grade a finished invocation that met another process: exit 0 (graded by the default oracle at the seam) or a refusal by its registry code; anything else panics.
+    pub fn delivered_or_refused(&self, what: &str, out: &std::process::Output) -> Survived {
+        let s = said(out);
+        let how = survived(&s, Some(&s)).unwrap_or_else(|why| panic!("{what} {why}\n{}", s.text));
+        eprintln!("sabotage: {what} ended with {:?}: {}", s.exit, s.line);
+        how
+    }
+
+    /// Run `argv` with the resource still away, then [`Rig::delivered_or_failed_loudly`].
+    pub fn delivers_or_fails_loudly(&self, argv: &[&str], envs: &[(&str, &str)]) -> Stopped {
+        let what = format!("`rivet {}`", argv.join(" "));
+        self.delivered_or_failed_loudly(&what, &self.cli_env(argv, envs))
+    }
+
     /// Run `argv` after a sabotage: exit 0 (graded by the default oracle) or the same coded refusal twice; anything else panics.
     pub fn delivers_or_refuses(&self, argv: &[&str], envs: &[(&str, &str)]) -> Survived {
         let first = said(&self.cli_env(argv, envs));
@@ -260,6 +309,62 @@ mod tests {
         );
         assert!(survived(&no, Some(&ended(5, "Error: other words\n"))).is_err());
         assert!(survived(&no, None).is_err());
+    }
+
+    #[test]
+    fn a_refusal_that_names_another_run_id_is_the_same_refusal() {
+        let gone = |run: &str| {
+            ended(
+                5,
+                &format!(
+                    "Error: [RIVET_STATE_CHUNK_CHECKPOINT_GONE] chunk checkpoint run 't_{run}' has no row\n"
+                ),
+            )
+        };
+        let (a, b) = (
+            gone("20261008T074244.506_29062"),
+            gone("20261008T074244.802_29063"),
+        );
+        assert_eq!(
+            survived(&a, Some(&b)),
+            Ok(Survived::Refused(a.text.clone()))
+        );
+        let other = ended(
+            5,
+            "Error: [RIVET_STATE_CHUNK_CHECKPOINT_GONE] chunk checkpoint run 'u_20261008T074244.802_29063' has no row\n",
+        );
+        assert!(survived(&a, Some(&other)).is_err());
+    }
+
+    #[test]
+    fn a_run_a_resource_was_taken_from_delivers_or_fails_loudly() {
+        assert_eq!(stopped(&ended(0, "")), Ok(Stopped::Delivered));
+        for exit in 1..=5 {
+            let loud = ended(exit, "Error: Permission denied (os error 13)\n");
+            assert_eq!(stopped(&loud), Ok(Stopped::Failed(loud.text.clone())));
+        }
+        assert_eq!(
+            stopped(&ended(1, "warning: could not write\n")),
+            Err("failed silently: exit 1 with no `Error:` line".to_string())
+        );
+        for exit in [6, 101] {
+            assert_eq!(
+                stopped(&ended(exit, "Error: boom\n")),
+                Err(format!(
+                    "neither a delivery nor a loud failure: ended with exit {exit}"
+                ))
+            );
+        }
+        use std::os::unix::process::ExitStatusExt as _;
+        let killed = said(&std::process::Output {
+            status: std::process::ExitStatus::from_raw(9),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        });
+        assert_eq!(
+            stopped(&killed),
+            Err("neither a delivery nor a loud failure: ended by a signal".to_string())
+        );
     }
 
     #[test]

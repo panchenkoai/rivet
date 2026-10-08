@@ -1,4 +1,4 @@
-//! Stops (docs/sabotage-matrix.yaml, the `kill_*`, `graceful_*` and `dead_owner_*` rows): a run
+//! Stops (docs/sabotage-matrix.yaml, the `sigkill_*`, `graceful_*` and `dead_owner_*` rows): a run
 //! stopped by a signal while it is parked at a point the test can see, and the run after it. The
 //! one grade is `Rig::stopped_then_run`: the stop is not a success, and the next plain run delivers
 //! the source (the default oracle at the rig's seam). A graceful stop (SIGTERM, SIGINT) is held to
@@ -40,7 +40,7 @@ fn rig_of(engine: SqlEngine, tag: &str, shape: Shape) -> (Rig, Box<dyn std::any:
 }
 
 /// Stop `rig`'s run with `how` at `at`; the next run must deliver.
-fn stop_and_deliver(rig: &Rig, at: Parked, how: Stop) -> Stopped {
+fn stop_and_deliver(rig: &Rig, at: Parked, how: Stop) -> StoppedRun {
     let stopped = rig.stopped_then_run(at, how, &LONG_LEASE);
     if let Survived::Refused(text) = &stopped.next {
         panic!(

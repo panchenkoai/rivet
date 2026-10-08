@@ -1,4 +1,4 @@
-//! STOP — a run stopped from outside (docs/sabotage-matrix.yaml, the `kill_*`, `graceful_*` and
+//! STOP — a run stopped from outside (docs/sabotage-matrix.yaml, the `sigkill_*`, `graceful_*` and
 //! `dead_owner_*` rows): parked at a point the test can see, sent one signal, reaped, and read for
 //! what it left. A primitive panics unless the run was parked there and alive when the signal went,
 //! so a cell cannot grade a run nobody stopped. [`Rig::stopped_then_run`] is the one grade after it:
@@ -61,7 +61,7 @@ pub struct Left {
 
 /// A stopped run and how the next run ended.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Stopped {
+pub struct StoppedRun {
     pub left: Left,
     pub next: Survived,
 }
@@ -83,7 +83,7 @@ pub(crate) fn not_a_stop(left: &Left, how: Stop) -> Option<String> {
 }
 
 /// Why a graceful stop left a worse state than the SIGKILL of the same point, else `None`.
-pub fn graceful_is_worse(graceful: &Stopped, killed: &Stopped) -> Option<String> {
+pub fn graceful_is_worse(graceful: &StoppedRun, killed: &StoppedRun) -> Option<String> {
     let (g, k) = (&graceful.left, &killed.left);
     let more = |what: &str, g: i64, k: i64| {
         (g > k).then(|| format!("left {g} {what}, the SIGKILL left {k}"))
@@ -107,24 +107,6 @@ pub(crate) fn its_running_rows(pid: u32) -> String {
     )
 }
 
-/// How many files under `dir` (recursively) have a name `is` accepts.
-fn count_files(dir: &Path, is: &dyn Fn(&str) -> bool) -> usize {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return 0;
-    };
-    entries
-        .flatten()
-        .map(|e| {
-            let path = e.path();
-            if path.is_dir() {
-                count_files(&path, is)
-            } else {
-                usize::from(is(&e.file_name().to_string_lossy()))
-            }
-        })
-        .sum()
-}
-
 /// Why a run seen with `parts` committed and `staged` staged files is not parked at `at` yet, else `None`.
 pub(crate) fn not_parked(at: Parked, parts: usize, staged: usize) -> Option<&'static str> {
     match at {
@@ -138,11 +120,14 @@ pub(crate) fn not_parked(at: Parked, parts: usize, staged: usize) -> Option<&'st
 impl Rig {
     /// Committed parts and staged `.tmp` files of this rig's local destination.
     fn parts_and_staged(&self) -> (usize, usize) {
-        let out = self.out_dir();
-        (
-            count_files(&out, &|n| n.ends_with(".parquet")),
-            count_files(&out, &|n| n.ends_with(".tmp")),
-        )
+        let files = crate::common::runner::files_under(&self.out_dir());
+        let ending = |tail: &str| {
+            files
+                .iter()
+                .filter(|f| f.to_string_lossy().ends_with(tail))
+                .count()
+        };
+        (ending(".parquet"), ending(".tmp"))
     }
 
     /// Start `rivet run` with `envs`, park it at `at`, send `how` and reap it; panics unless it was parked there and alive when the signal went.
@@ -156,23 +141,10 @@ impl Rig {
         let mut envs = envs.to_vec();
         envs.push(("RIVET_TEST_BLOCK_AT", "before_commit_rename"));
         envs.push(("RIVET_TEST_BLOCK_MS", &block_ms));
-        let mut run = self.spawn_args_env(&[], &envs);
-        let t0 = std::time::Instant::now();
-        loop {
-            let (parts, staged) = self.parts_and_staged();
-            let Some(why) = not_parked(at, parts, staged) else {
-                break;
-            };
-            assert!(
-                run.try_wait().expect("try_wait").is_none(),
-                "stop: the run ended before it was parked ({why})"
-            );
-            assert!(
-                t0.elapsed().as_secs() < 120,
-                "stop: the run was never parked ({why}; {parts} part(s), {staged} staged)"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        let mut run = self.spawn_mid_run(&envs, |rig| {
+            let (parts, staged) = rig.parts_and_staged();
+            not_parked(at, parts, staged).is_none()
+        });
         let seen = std::time::Instant::now();
         assert!(
             run.try_wait().expect("try_wait").is_none(),
@@ -202,13 +174,13 @@ impl Rig {
     }
 
     /// [`Rig::stopped`], held to [`not_a_stop`], then the next plain run: it delivers the source or gives one coded refusal twice.
-    pub fn stopped_then_run(&self, at: Parked, how: Stop, envs: &[(&str, &str)]) -> Stopped {
+    pub fn stopped_then_run(&self, at: Parked, how: Stop, envs: &[(&str, &str)]) -> StoppedRun {
         let left = self.stopped(at, how, envs);
         if let Some(why) = not_a_stop(&left, how) {
             panic!("a run stopped by {how:?} at {at:?} {why}: {left:?}");
         }
         let next = self.delivers_or_refuses(&["run"], envs);
-        Stopped { left, next }
+        StoppedRun { left, next }
     }
 }
 
@@ -228,8 +200,8 @@ mod tests {
         }
     }
 
-    fn stopped(left: Left, next: Survived) -> Stopped {
-        Stopped { left, next }
+    fn stopped(left: Left, next: Survived) -> StoppedRun {
+        StoppedRun { left, next }
     }
 
     #[test]
@@ -352,22 +324,5 @@ mod tests {
         let sql = its_running_rows(4242).replace("{export}", "t");
         let n: i64 = db.query_row(&sql, [], |r| r.get(0)).unwrap();
         assert_eq!(n, 1, "{sql}");
-    }
-
-    #[test]
-    fn files_are_counted_through_subdirectories_by_name() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir(dir.path().join("d")).unwrap();
-        for f in [
-            "a.parquet",
-            "d/b.parquet",
-            "d/c.parquet.tmp",
-            "manifest.json",
-        ] {
-            std::fs::write(dir.path().join(f), b"x").unwrap();
-        }
-        assert_eq!(count_files(dir.path(), &|n| n.ends_with(".parquet")), 2);
-        assert_eq!(count_files(dir.path(), &|n| n.ends_with(".tmp")), 1);
-        assert_eq!(count_files(&dir.path().join("absent"), &|_| true), 0);
     }
 }
