@@ -386,6 +386,28 @@ seeds:
           - "lib:a_stale_buffer_over_rivets_own_base_is_journaled_as_a_refusal_on_every_cycle"
           - "lib:a_load_killed_while_asking_about_a_foreign_table_leaves_it_foreign"
           - "lib:a_failed_closing_write_after_a_foreign_refusal_leaves_the_table_foreign"
+  - name: empty-baseline-builds-no-base
+    class: a base-and-buffer load consumes an empty baseline leg as "nothing to load" and creates no base, so the table's first change can never be compacted
+    history: "field 2026-10-06 - tables empty at their CDC baseline had no BigQuery table; from their first change on `rivet compact` failed on each of them every cycle and the command exited non-zero (0.27 to 0.31)"
+    scope: source
+    patch: empty-baseline-builds-no-base/shared.patch
+    engines:
+      postgres:
+        cells: [a_table_empty_at_baseline_takes_its_first_changes_postgres]
+      mysql:
+        cells:
+          - a_table_empty_at_baseline_takes_its_first_changes_mysql
+          - a_table_empty_at_baseline_gets_an_empty_base_and_compact_says_the_no_op
+      mssql:
+        na: "the load driver never reads the source engine: one code path, graded by the lib cells and the postgres and mysql cells"
+      mongo:
+        na: "the load driver never reads the source engine: one code path, graded by the lib cells and the postgres and mysql cells"
+      oracle:
+        na: "the load driver never reads the source engine: one code path, graded by the lib cells and the postgres and mysql cells"
+      lib:
+        cells:
+          - "lib:an_empty_baseline_builds_the_base_once"
+          - "lib:a_whole_table_pass_is_a_full_load_or_a_base_and_buffer_baseline_leg"
   - name: ack-past-unwritten
     class: a CDC source is acknowledged past transactions that were read but not yet written, so a failed later part loses them
     history: "PostgreSQL: a mid-window roll's ack cleared the yielded-data latch, the zero-yield release then advanced the slot to the last READ commit; a failed final part left confirmed_flush_lsn past it and the next run delivered nothing (0.31.0)"
