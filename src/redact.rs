@@ -627,7 +627,7 @@ mod tests {
     fn redact_secrets_url_safety_matrix() {
         const SECRET: &str = "S3cr3tPw";
         // Every engine scheme rivet builds/logs.
-        let schemes = ["postgresql", "mysql", "sqlserver", "mongodb"];
+        let schemes = ["postgresql", "mysql", "sqlserver", "mongodb", "oracle"];
         // Password bodies embedding the secret + a URL delimiter that has
         // historically defeated a redactor (a raw '/' is in the base64 alphabet;
         // '@'-before-'/' defeated round-3's fail-safe; ':' defeated the rfind split).

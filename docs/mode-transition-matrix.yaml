@@ -13,7 +13,7 @@ scenarios:
     mysql:    { test: full_then_incremental_mysql }
     mssql:    { test: full_then_incremental_mssql }
     mongo:    { test: full_then_resume_mongo }
-    oracle:   { gap: "no Oracle mode-transition live test (the transition logic is shared; the cursor/keyset state Oracle writes is unproven here)" }
+    oracle:   { test: full_then_incremental_oracle }
 
   - id: time_window_then_incremental
     what: "MT1 — time_window stores no cursor; full pass"
@@ -21,7 +21,7 @@ scenarios:
     mysql:    { test: time_window_then_incremental_mysql }
     mssql:    { test: time_window_then_incremental_mssql }
     mongo:    { na: "a Mongo export accepts only mode: full or cdc (validate_non_sql_source_modes, src/config/mod.rs:543-554), so there is no incremental / chunked mode to switch from or into; the switch Mongo has (into page_size + resume) is graded by the three *_then_resume_mongo cells" }
-    oracle:   { gap: "no Oracle mode-transition live test (the transition logic is shared; the cursor/keyset state Oracle writes is unproven here)" }
+    oracle:   { test: time_window_then_incremental_oracle }
 
   - id: range_chunked_then_incremental
     what: "MT1 — range chunking (chunk_column + chunk_checkpoint) keeps chunk_task state, never a cursor; full pass"
@@ -29,7 +29,7 @@ scenarios:
     mysql:    { test: range_chunked_then_incremental_mysql }
     mssql:    { test: range_chunked_then_incremental_mssql }
     mongo:    { na: "a Mongo export accepts only mode: full or cdc (validate_non_sql_source_modes, src/config/mod.rs:543-554), so there is no incremental / chunked mode to switch from or into; the switch Mongo has (into page_size + resume) is graded by the three *_then_resume_mongo cells" }
-    oracle:   { gap: "no Oracle mode-transition live test (the transition logic is shared; the cursor/keyset state Oracle writes is unproven here)" }
+    oracle:   { test: range_chunked_then_incremental_oracle }
 
   - id: keyset_then_incremental_same_key
     what: "MT2 — keyset without chunk_checkpoint still records its final high-water; incremental on the key continues"
@@ -37,7 +37,7 @@ scenarios:
     mysql:    { test: keyset_then_incremental_same_key_mysql }
     mssql:    { test: keyset_then_incremental_same_key_mssql }
     mongo:    { test: keyset_then_resume_mongo }
-    oracle:   { gap: "no Oracle mode-transition live test (the transition logic is shared; the cursor/keyset state Oracle writes is unproven here)" }
+    oracle:   { test: keyset_then_incremental_same_key_oracle }
 
   - id: keyset_checkpoint_then_incremental_same_key
     what: "MT2 — keyset with chunk_checkpoint (the init default); incremental on the key continues"
@@ -45,7 +45,7 @@ scenarios:
     mysql:    { test: keyset_checkpoint_then_incremental_same_key_mysql }
     mssql:    { test: keyset_checkpoint_then_incremental_same_key_mssql }
     mongo:    { na: "a Mongo export accepts only mode: full or cdc (validate_non_sql_source_modes, src/config/mod.rs:543-554), so there is no incremental / chunked mode to switch from or into; the switch Mongo has (into page_size + resume) is graded by the three *_then_resume_mongo cells" }
-    oracle:   { gap: "no Oracle mode-transition live test (the transition logic is shared; the cursor/keyset state Oracle writes is unproven here)" }
+    oracle:   { test: keyset_checkpoint_then_incremental_same_key_oracle }
 
   - id: parallel_keyset_then_incremental_same_key
     what: "MT2 — parallel keyset records the highest range max; incremental on the key continues"
@@ -53,7 +53,7 @@ scenarios:
     mysql:    { test: parallel_keyset_then_incremental_same_key_mysql }
     mssql:    { test: parallel_keyset_then_incremental_same_key_mssql }
     mongo:    { test: parallel_keyset_then_resume_mongo }
-    oracle:   { gap: "no Oracle mode-transition live test (the transition logic is shared; the cursor/keyset state Oracle writes is unproven here)" }
+    oracle:   { test: parallel_keyset_then_incremental_same_key_oracle }
 
   - id: keyset_then_incremental_other_column
     what: "MT3 — keyset on id, then incremental on server_time: refused, nothing exported; full pass after state reset (the field case)"
@@ -61,7 +61,7 @@ scenarios:
     mysql:    { test: keyset_then_incremental_other_column_mysql }
     mssql:    { test: keyset_then_incremental_other_column_mssql }
     mongo:    { na: "a Mongo export accepts only mode: full or cdc (validate_non_sql_source_modes, src/config/mod.rs:543-554), so there is no incremental / chunked mode to switch from or into; the switch Mongo has (into page_size + resume) is graded by the three *_then_resume_mongo cells" }
-    oracle:   { gap: "no Oracle mode-transition live test (the transition logic is shared; the cursor/keyset state Oracle writes is unproven here)" }
+    oracle:   { test: keyset_then_incremental_other_column_oracle }
 
   - id: keyset_incremental_key_change
     what: "MT3 — keyset_incremental on id, then on another unique key: BOTH keyset runners (sequential, and parallel, which reads the anchor in its own call) refuse their own anchor"
@@ -69,7 +69,7 @@ scenarios:
     mysql:    { test: keyset_incremental_key_change_mysql }
     mssql:    { test: keyset_incremental_key_change_mssql }
     mongo:    { na: "the Mongo keyset key is always _id (full_strategy, src/plan/build.rs) and chunk_by_key is refused outside mode: chunked (src/config/mod.rs:1360-1364), so the key cannot change" }
-    oracle:   { gap: "no Oracle mode-transition live test (the transition logic is shared; the cursor/keyset state Oracle writes is unproven here)" }
+    oracle:   { test: keyset_incremental_key_change_oracle }
 
   - id: incremental_then_keyset_incremental_same_key
     what: "MT2 — incremental on id, then keyset_incremental on id: continues from the incremental cursor"
@@ -77,7 +77,7 @@ scenarios:
     mysql:    { test: incremental_then_keyset_incremental_same_key_mysql }
     mssql:    { test: incremental_then_keyset_incremental_same_key_mssql }
     mongo:    { na: "a Mongo export accepts only mode: full or cdc (validate_non_sql_source_modes, src/config/mod.rs:543-554), so there is no incremental / chunked mode to switch from or into; the switch Mongo has (into page_size + resume) is graded by the three *_then_resume_mongo cells" }
-    oracle:   { gap: "no Oracle mode-transition live test (the transition logic is shared; the cursor/keyset state Oracle writes is unproven here)" }
+    oracle:   { test: incremental_then_keyset_incremental_same_key_oracle }
 
   - id: incremental_cursor_change
     what: "MT3 — cursor_column changed without a reset: refused; full pass after state reset"
@@ -85,7 +85,7 @@ scenarios:
     mysql:    { test: incremental_cursor_change_mysql }
     mssql:    { test: incremental_cursor_change_mssql }
     mongo:    { na: "a Mongo export accepts only mode: full or cdc (validate_non_sql_source_modes, src/config/mod.rs:543-554), so there is no incremental / chunked mode to switch from or into; the switch Mongo has (into page_size + resume) is graded by the three *_then_resume_mongo cells" }
-    oracle:   { gap: "no Oracle mode-transition live test (the transition logic is shared; the cursor/keyset state Oracle writes is unproven here)" }
+    oracle:   { test: incremental_cursor_change_oracle }
 
   - id: incremental_single_to_coalesce
     what: "MT3 — single_column → coalesce on the same primary changes the identity: refused (rows with a NULL primary were never exported)"
@@ -93,7 +93,7 @@ scenarios:
     mysql:    { test: incremental_single_to_coalesce_mysql }
     mssql:    { test: incremental_single_to_coalesce_mssql }
     mongo:    { na: "a Mongo export accepts only mode: full or cdc (validate_non_sql_source_modes, src/config/mod.rs:543-554), so there is no incremental / chunked mode to switch from or into; the switch Mongo has (into page_size + resume) is graded by the three *_then_resume_mongo cells" }
-    oracle:   { gap: "no Oracle mode-transition live test (the transition logic is shared; the cursor/keyset state Oracle writes is unproven here)" }
+    oracle:   { test: incremental_single_to_coalesce_oracle }
 
   - id: incremental_adding_settle
     what: "MT2 — adding settle keeps the identity: continues"
@@ -101,7 +101,7 @@ scenarios:
     mysql:    { test: incremental_adding_settle_mysql }
     mssql:    { test: incremental_adding_settle_mssql }
     mongo:    { na: "a Mongo export accepts only mode: full or cdc (validate_non_sql_source_modes, src/config/mod.rs:543-554), so there is no incremental / chunked mode to switch from or into; the switch Mongo has (into page_size + resume) is graded by the three *_then_resume_mongo cells" }
-    oracle:   { gap: "no Oracle mode-transition live test (the transition logic is shared; the cursor/keyset state Oracle writes is unproven here)" }
+    oracle:   { test: incremental_adding_settle_oracle }
 
   - id: legacy_keyset_state_then_other_column
     what: "MT5 — a pre-v26 keyset cursor (no identity) is attributed to the keyset run that wrote it: refused"
@@ -109,7 +109,7 @@ scenarios:
     mysql:    { test: legacy_keyset_state_then_other_column_mysql }
     mssql:    { test: legacy_keyset_state_then_other_column_mssql }
     mongo:    { na: "a Mongo export accepts only mode: full or cdc (validate_non_sql_source_modes, src/config/mod.rs:543-554), so there is no incremental / chunked mode to switch from or into; the switch Mongo has (into page_size + resume) is graded by the three *_then_resume_mongo cells" }
-    oracle:   { gap: "no Oracle mode-transition live test (the transition logic is shared; the cursor/keyset state Oracle writes is unproven here)" }
+    oracle:   { test: legacy_keyset_state_then_other_column_oracle }
 
   - id: legacy_incremental_state_then_other_column
     what: "MT6 — a pre-v26 incremental cursor is attributed to the column the run's key descriptor (export_metrics.key_descriptor_json, v18+) names: refused; a row older than v18 records no identity anywhere — reset when changing the cursor"
@@ -117,31 +117,31 @@ scenarios:
     mysql:    { test: legacy_incremental_state_then_other_column_mysql }
     mssql:    { test: legacy_incremental_state_then_other_column_mssql }
     mongo:    { na: "a Mongo export accepts only mode: full or cdc (validate_non_sql_source_modes, src/config/mod.rs:543-554), so there is no incremental / chunked mode to switch from or into; the switch Mongo has (into page_size + resume) is graded by the three *_then_resume_mongo cells" }
-    oracle:   { gap: "no Oracle mode-transition live test (the transition logic is shared; the cursor/keyset state Oracle writes is unproven here)" }
+    oracle:   { test: legacy_incremental_state_then_other_column_oracle }
 
   - id: resumed_parallel_keyset_then_incremental
     what: "P-22 — a parallel keyset run resumed after a crash records the run's highest key: incremental on the key delivers nothing again"
     postgres: { test: open_defect_resumed_parallel_keyset_then_incremental_postgres }
-    mysql:    { gap: "open defect pinned on PostgreSQL only (dev/release_oracle/known_red.py); the cell for this engine is not written" }
-    mssql:    { gap: "open defect pinned on PostgreSQL only (dev/release_oracle/known_red.py); the cell for this engine is not written" }
+    mysql:    { test: open_defect_resumed_parallel_keyset_then_incremental_mysql }
+    mssql:    { test: open_defect_resumed_parallel_keyset_then_incremental_mssql }
     mongo:    { na: "a Mongo export accepts only mode: full or cdc (validate_non_sql_source_modes, src/config/mod.rs:543-554), so there is no incremental / chunked mode to switch from or into; the switch Mongo has (into page_size + resume) is graded by the three *_then_resume_mongo cells" }
-    oracle:   { gap: "open defect pinned on PostgreSQL only (dev/release_oracle/known_red.py); the cell for this engine is not written" }
+    oracle:   { test: open_defect_resumed_parallel_keyset_then_incremental_oracle }
 
   - id: incremental_source_url_respelled
     what: "P-18 — the same source spelled without its default port keeps its cursor: continues"
     postgres: { test: open_defect_source_url_without_its_default_port_continues_postgres }
-    mysql:    { gap: "open defect pinned on PostgreSQL only (dev/release_oracle/known_red.py); the cell for this engine is not written" }
-    mssql:    { gap: "open defect pinned on PostgreSQL only (dev/release_oracle/known_red.py); the cell for this engine is not written" }
+    mysql:    { test: open_defect_source_url_without_its_default_port_continues_mysql }
+    mssql:    { test: open_defect_source_url_without_its_default_port_continues_mssql }
     mongo:    { na: "a Mongo export accepts only mode: full or cdc (validate_non_sql_source_modes, src/config/mod.rs:543-554), so there is no incremental / chunked mode to switch from or into; the switch Mongo has (into page_size + resume) is graded by the three *_then_resume_mongo cells" }
-    oracle:   { gap: "open defect pinned on PostgreSQL only (dev/release_oracle/known_red.py); the cell for this engine is not written" }
+    oracle:   { test: open_defect_source_url_without_its_default_port_continues_oracle }
 
   - id: incremental_query_filter_edited
     what: "an edited `query:` filter under the same FROM is another stream: refused, or its own rows in full"
     postgres: { test: open_defect_incremental_query_filter_edited_postgres }
-    mysql:    { gap: "open defect pinned on PostgreSQL only (dev/release_oracle/known_red.py); the cell for this engine is not written" }
-    mssql:    { gap: "open defect pinned on PostgreSQL only (dev/release_oracle/known_red.py); the cell for this engine is not written" }
+    mysql:    { test: open_defect_incremental_query_filter_edited_mysql }
+    mssql:    { test: open_defect_incremental_query_filter_edited_mssql }
     mongo:    { na: "a Mongo export accepts only mode: full or cdc (validate_non_sql_source_modes, src/config/mod.rs:543-554), so there is no incremental / chunked mode to switch from or into; the switch Mongo has (into page_size + resume) is graded by the three *_then_resume_mongo cells" }
-    oracle:   { gap: "open defect pinned on PostgreSQL only (dev/release_oracle/known_red.py); the cell for this engine is not written" }
+    oracle:   { test: open_defect_incremental_query_filter_edited_oracle }
 
   - id: incremental_other_schema_same_table
     what: "the same table name in another schema (search_path in the URL) is another stream: refused, or its own rows in full"
@@ -222,7 +222,7 @@ scenarios:
     postgres: { test: crashed_range_chunk_then_incremental_finish_the_run_postgres }
     mysql:    { test: crashed_range_chunk_then_incremental_finish_the_run_mysql }
     mssql:    { test: crashed_range_chunk_then_incremental_finish_the_run_mssql }
-    oracle:   { gap: "range chunking refuses the Rig table's Oracle key (NUMBER(19): 'not an integer-family column', observed 2026-10-07), so no range-chunk checkpoint run opens; needs a fixture whose key Oracle range chunking accepts" }
+    oracle:   { test: crashed_range_chunk_then_incremental_finish_the_run_oracle }
     mongo:    { na: "a Mongo export accepts only mode: full or cdc, so there is no incremental mode to switch into" }
 
   - id: crashed_range_chunk_then_incremental_reset
@@ -230,7 +230,7 @@ scenarios:
     postgres: { test: crashed_range_chunk_then_incremental_reset_postgres }
     mysql:    { test: crashed_range_chunk_then_incremental_reset_mysql }
     mssql:    { test: crashed_range_chunk_then_incremental_reset_mssql }
-    oracle:   { gap: "range chunking refuses the Rig table's Oracle key (NUMBER(19): 'not an integer-family column', observed 2026-10-07), so no range-chunk checkpoint run opens; needs a fixture whose key Oracle range chunking accepts" }
+    oracle:   { test: crashed_range_chunk_then_incremental_reset_oracle }
     mongo:    { na: "a Mongo export accepts only mode: full or cdc, so there is no incremental mode to switch into" }
 
   # A range-chunk run belongs to its source: config A crashes after chunk 0; config B (same export name,
@@ -242,5 +242,5 @@ scenarios:
     postgres: { test: range_chunk_shared_name_another_source_postgres }
     mysql:    { test: range_chunk_shared_name_another_source_mysql }
     mssql:    { test: range_chunk_shared_name_another_source_mssql }
-    oracle:   { gap: "the stand has one Oracle service (FREEPDB1), and another schema of it is the SAME source key, so the cell needs a second PDB; range chunking also refuses the Rig table's NUMBER(19) key" }
+    oracle:   { test: range_chunk_shared_name_another_source_oracle }
     mongo:    { na: "a Mongo export has no range chunking (mode: full or cdc only)" }

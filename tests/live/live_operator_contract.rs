@@ -692,6 +692,136 @@ fn mssql_cleanup_past_the_checkpoint(after_a_changes_run: bool) {
         .refuses_twice_then(&["run"], &[], Refused::by_code(LOG_GAP, 5), vec![]);
 }
 
+/// A single-node replica set in its own container with the smallest oplog the server accepts (990 MB), removed on drop.
+struct ThrowawayReplicaSet {
+    container: String,
+    port: u16,
+}
+
+impl ThrowawayReplicaSet {
+    fn docker(args: &[&str]) -> std::process::Output {
+        std::process::Command::new("docker")
+            .args(args)
+            .output()
+            .expect("docker on PATH")
+    }
+
+    fn start() -> Self {
+        let container = unique_name("rivet_oc_oplog");
+        let image = format!(
+            "mongo:{}",
+            std::env::var("MONGO_VERSION").unwrap_or_else(|_| "7".into())
+        );
+        let run = Self::docker(&[
+            "run",
+            "-d",
+            "--rm",
+            "--name",
+            &container,
+            "-p",
+            "127.0.0.1::27017",
+            &image,
+            "--replSet",
+            "rs0",
+            "--oplogSize",
+            "990",
+            "--bind_ip_all",
+        ]);
+        assert!(
+            run.status.success(),
+            "fixture: docker run {image}:\n{}",
+            text(&run)
+        );
+        let mut rs = Self { container, port: 0 };
+        let mapped = text(&Self::docker(&["port", &rs.container, "27017/tcp"]));
+        rs.port = mapped
+            .lines()
+            .find_map(|l| l.trim().rsplit_once(':')?.1.parse().ok())
+            .unwrap_or_else(|| panic!("fixture: no mapped port in `{mapped}`"));
+        let t0 = std::time::Instant::now();
+        while !rs
+            .mongosh("try { rs.initiate({_id: 'rs0', members: [{_id: 0, host: '127.0.0.1:27017'}]}) } catch (e) {}; print(db.hello().isWritablePrimary)")
+            .contains("true")
+        {
+            assert!(
+                t0.elapsed().as_secs() < 90,
+                "fixture: the throwaway replica set never elected a primary"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        rs
+    }
+
+    /// Evaluate `js` in the container's `mongosh`; stdout and stderr together.
+    fn mongosh(&self, js: &str) -> String {
+        text(&Self::docker(&[
+            "exec",
+            &self.container,
+            "mongosh",
+            "--quiet",
+            "--eval",
+            js,
+        ]))
+    }
+
+    /// Write more than one oplog of filler and keep writing (the server truncates nothing newer than its last checkpoint, and only as a later write closes a truncate marker) until the oplog no longer holds anything as old as this call.
+    fn roll_the_oplog(&self) {
+        let before: i64 = self
+            .mongosh("print(db.hello().operationTime.t)")
+            .trim()
+            .parse()
+            .expect("fixture: the server's operationTime");
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let said = self.mongosh(
+            "const f = db.getSiblingDB('oc_filler').f; const p = 'x'.repeat(15 * 1024 * 1024); \
+             for (let i = 0; i < 80; i++) { f.insertOne({p}); } db.getSiblingDB('oc_filler').dropDatabase(); print('filled')",
+        );
+        assert!(said.contains("filled"), "fixture: filler writes:\n{said}");
+        let t0 = std::time::Instant::now();
+        loop {
+            let first = self.mongosh(
+                "const f = db.getSiblingDB('oc_filler').f; const p = 'x'.repeat(15 * 1024 * 1024); \
+                 for (let i = 0; i < 5; i++) { f.insertOne({p}); } f.drop(); \
+                 print(db.getSiblingDB('local').oplog.rs.find().sort({$natural: 1}).limit(1).next().ts.t)",
+            );
+            if first.trim().parse::<i64>().is_ok_and(|t| t > before) {
+                return;
+            }
+            assert!(
+                t0.elapsed().as_secs() < 240,
+                "fixture: more than 1.2 GB of writes did not roll a 990 MB oplog: its first entry is at {first}, the checkpoint at {before}"
+            );
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        }
+    }
+}
+
+impl Drop for ThrowawayReplicaSet {
+    fn drop(&mut self) {
+        let _ = Self::docker(&["rm", "-f", "-v", &self.container]);
+    }
+}
+
+/// MongoDB: the oplog rolled past the resume token is refused as a log gap. Server-wide, hence on a replica set of the cell's own.
+fn mongo_oplog_rolled_past_the_checkpoint(after_a_changes_run: bool) {
+    let rs = ThrowawayReplicaSet::start();
+    let mut s = CdcScenario::mongo_on(rs.port, "oc_gap", |r, _| {
+        r.cdc("initial: snapshot")
+            .no_oracle("the rig oracle has no reader for a replica set the cell starts itself")
+    });
+    s.insert(1);
+    s.rig.run_ok();
+    if after_a_changes_run {
+        s.insert(2);
+        s.rig.run_ok();
+    }
+    s.update(1);
+    s.insert(3);
+    rs.roll_the_oplog();
+    s.rig
+        .refuses_twice_then(&["run"], &[], Refused::by_code(LOG_GAP, 5), vec![]);
+}
+
 const REPLICA_PRIMARY: &str = "mysql://root:rivet@127.0.0.1:3308/rivet";
 const REPLICA_ROOT: &str = "mysql://root:rivet@127.0.0.1:3309/rivet";
 const REPLICA_RIVET: &str = "mysql://rivet:rivet@127.0.0.1:3309/rivet";
@@ -1332,10 +1462,12 @@ fn open_defect_a_corrupt_cdc_checkpoint_is_refused_by_code_mongo() {
 
 #[cfg(feature = "oracle")]
 #[test]
-#[ignore = "live: requires docker compose oracle (LogMiner)"]
-fn deleting_a_corrupt_cdc_checkpoint_accepts_a_new_anchor_oracle() {
+#[ignore = "live+gate-only: docker compose oracle (LogMiner); open defect (corrupt checkpoint remedy), acknowledged in dev/release_oracle/known_red.py"]
+fn open_defect_deleting_a_corrupt_cdc_checkpoint_accepts_a_new_anchor_oracle() {
     let _serial = cross_process_serial("oracle_cdc");
-    corrupt_checkpoint_remedy(CdcScenario::oracle_with("oc_ckpt", |r, _| r));
+    corrupt_checkpoint_remedy(CdcScenario::oracle_with("oc_ckpt", |r, _| {
+        r.cdc("initial: snapshot")
+    }));
 }
 
 #[cfg(feature = "oracle")]
@@ -1412,6 +1544,7 @@ fn a_change_table_cleaned_past_the_checkpoint_after_a_changes_run_is_refused_by_
 #[ignore = "live+gate-only: docker compose --profile replica; open defect (doctor green where run refuses), acknowledged in dev/release_oracle/known_red.py"]
 fn open_defect_doctor_is_not_green_where_the_cdc_run_refuses_a_replica_that_does_not_relog_mysql() {
     use mysql::prelude::Queryable as _;
+    let _serial = cross_process_serial("mysql_replica");
     let table = unique_name("oc_nolog");
     let _table = ReplicatedTable(table.clone());
     mysql::Conn::new(REPLICA_PRIMARY)
@@ -1692,4 +1825,17 @@ fn open_defect_check_names_the_strategy_run_uses_for_chunked_with_no_column_orac
 fn open_defect_a_bounded_cdc_run_refused_on_a_standby_leaves_nothing_and_its_remedy_runs_postgres()
 {
     standby_refusal_leaves_nothing_and_its_remedy_runs();
+}
+
+#[test]
+#[ignore = "live+gate-only: docker (a throwaway mongo replica set); open defect (oplog gone), acknowledged in dev/release_oracle/known_red.py"]
+fn open_defect_an_oplog_rolled_past_the_checkpoint_before_the_first_changes_run_is_refused_by_code_mongo()
+ {
+    mongo_oplog_rolled_past_the_checkpoint(false);
+}
+
+#[test]
+#[ignore = "live+gate-only: docker (a throwaway mongo replica set); open defect (oplog gone), acknowledged in dev/release_oracle/known_red.py"]
+fn open_defect_an_oplog_rolled_past_the_checkpoint_after_a_changes_run_is_refused_by_code_mongo() {
+    mongo_oplog_rolled_past_the_checkpoint(true);
 }
