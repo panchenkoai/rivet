@@ -439,13 +439,29 @@ impl Rig {
         argv
     }
 
-    /// One bounded `rivet cdc` to stdout over this rig's stream: the NDJSON change lines it printed.
-    pub fn cli_cdc_ndjson(&self, checkpointed: bool) -> Vec<String> {
-        let argv = self.cdc_cli_argv(checkpointed);
+    /// One bounded `rivet cdc` over this rig's stream: `source` replaces the inline `--source <url>` pair, `extra` is appended; its stdout.
+    pub fn cli_cdc(
+        &self,
+        checkpointed: bool,
+        source: Option<&[&str]>,
+        extra: &[&str],
+        envs: &[(&str, &str)],
+    ) -> String {
+        let argv = with_source_form(self.cdc_cli_argv(checkpointed), source, extra);
         let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
         let ceiling = std::time::Duration::from_secs(180);
-        crate::common::runner::run_rivet_args_bounded(&argv, ceiling)
+        crate::common::runner::run_rivet_args_bounded_env(&argv, envs, ceiling)
             .expect("a bounded `rivet cdc` run ends on its own")
+    }
+
+    /// The source URL this rig's `rivet cdc` argv carries inline.
+    pub fn cdc_source_url(&self) -> &str {
+        &self.source_url
+    }
+
+    /// One bounded `rivet cdc` to stdout over this rig's stream: the NDJSON change lines it printed.
+    pub fn cli_cdc_ndjson(&self, checkpointed: bool) -> Vec<String> {
+        self.cli_cdc(checkpointed, None, &[], &[])
             .lines()
             .filter(|l| l.trim_start().starts_with('{'))
             .map(str::to_string)
@@ -465,6 +481,30 @@ impl Rig {
             ),
         }
     }
+}
+
+/// `argv` of `rivet cdc --source <url> …` with the inline pair replaced by `source` (when given) and `extra` appended.
+fn with_source_form(mut argv: Vec<String>, source: Option<&[&str]>, extra: &[&str]) -> Vec<String> {
+    if let Some(form) = source {
+        assert_eq!(argv[1], "--source", "the inline source pair moved");
+        argv.splice(1..3, form.iter().map(|a| a.to_string()));
+    }
+    argv.extend(extra.iter().map(|a| a.to_string()));
+    argv
+}
+
+#[test]
+fn a_source_form_replaces_the_inline_source_pair() {
+    let inline = || {
+        ["cdc", "--source", "u", "--table", "t"]
+            .map(String::from)
+            .to_vec()
+    };
+    assert_eq!(
+        with_source_form(inline(), Some(&["--source-env", "V"]), &["--output", "d"]),
+        ["cdc", "--source-env", "V", "--table", "t", "--output", "d"]
+    );
+    assert_eq!(with_source_form(inline(), None, &[]), inline());
 }
 
 /// Doctor's all_ok when the run after it agrees, else why not (all_ok, then a refused run); an unreadable report is an error.

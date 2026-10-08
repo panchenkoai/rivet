@@ -25,7 +25,7 @@ scenarios:
     mysql:    { test: stand_dest_gcs_mysql }
     mssql:    { test: stand_dest_gcs_mssql }
     mongo:    { test: stand_dest_gcs_mongo }
-    oracle:   { gap: "no Oracle fake-GCS round-trip" }
+    oracle:   { test: stand_dest_gcs_oracle }
 
   - id: dest_s3
     what: "destination: s3 — MinIO round-trip, all rows"
@@ -33,7 +33,7 @@ scenarios:
     mysql:    { test: stand_dest_s3_mysql }
     mssql:    { test: stand_dest_s3_mssql }
     mongo:    { test: stand_dest_s3_mongo }
-    oracle:   { gap: "no Oracle MinIO round-trip" }
+    oracle:   { test: stand_dest_s3_oracle }
 
   # ── format / compression ──────────────────────────────────────────────────
   - id: format_parquet
@@ -50,7 +50,7 @@ scenarios:
     mysql:    { test: mysql_type_matrix_csv_decimal_text_preserved }
     mssql:    { test: stand_format_csv_mssql }
     mongo:    { test: stand_format_csv_mongo }
-    oracle:   { gap: "no Oracle format: csv test" }
+    oracle:   { test: stand_format_csv_oracle }
 
   - id: compression_codecs
     what: "compression: full codec matrix (zstd/snappy/gzip/none) reads back correctly"
@@ -58,7 +58,7 @@ scenarios:
     mysql:    { test: stand_compression_codecs_mysql }
     mssql:    { test: stand_compression_codecs_mssql }
     mongo:    { test: stand_compression_codecs_mongo }
-    oracle:   { gap: "no Oracle codec-matrix test" }
+    oracle:   { test: stand_compression_codecs_oracle }
 
   # ── enrichment / verification / tuning ────────────────────────────────────
   - id: meta_columns
@@ -99,7 +99,7 @@ scenarios:
     mysql:    { test: pg_and_mysql_chunked_exports_agree_on_row_count_and_id_set }
     mssql:    { test: pg_and_mssql_full_exports_agree_on_row_count_and_id_set }
     mongo:    { na: "Mongo's JSON-blob model has no row-for-row SQL parity to compare against" }
-    oracle:   { gap: "the Oracle seed is ported table-for-table from MySQL, but no Oracle-vs-MySQL parity test exists" }
+    oracle:   { test: oracle_and_mysql_exports_agree_on_every_row }
 
   # ── entry points ──────────────────────────────────────────────────────────
   - id: partition_by_every_entry_point

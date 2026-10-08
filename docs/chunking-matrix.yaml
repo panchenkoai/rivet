@@ -45,7 +45,7 @@ scenarios:
     mysql:    { test: keyset_checkpoint_resume_second_run_captures_only_new_keys }
     mssql:    { test: keyset_checkpoint_resume_mssql_second_run_captures_only_new_keys }
     mongo:    { test: mongo_batch_resume_reads_only_new_since_last_run }
-    oracle:   { gap: "no Oracle keyset + chunk_checkpoint two-run live test" }
+    oracle:   { test: keyset_checkpoint_resume_second_run_captures_only_new_keys_oracle }
 
   - id: keyset_parallel_fanout
     what: "chunk_by_key + parallel: N → N ROW-percentile-range workers seek concurrently (feat/parallel-keyset — a DISTINCT chunking strategy: nth-row percentile range sampling, sparse-key immune). Union reads every row exactly once AND the run fans to ≥2 workers (no silent collapse to a single serial worker)."
@@ -53,7 +53,7 @@ scenarios:
     mysql:    { test: parallel_keyset_parity_mysql }
     mssql:    { test: parallel_keyset_parity_mssql }
     mongo:    { na: "Mongo `parallel: N` is the SEPARATE `_id`-range reader (mongo_parallel), not SQL keyset fan-out — see the mongo_parallel runner, out of this SQL-keyset scenario" }
-    oracle:   { gap: "parallel_keyset_reads_every_row_once proves every row once through the Oracle nth-row boundary probe, but does not assert the run fanned out to ≥2 workers — a collapsed probe still passes it" }
+    oracle:   { test: parallel_keyset_reads_every_row_once }
 
   - id: keyset_parallel_incremental
     what: "chunk_by_key + parallel: N + keyset_incremental: a CLEAN re-run seeks past the persisted anchor + advances it, across N workers (run→unchanged=0→insert→only-new). Discriminator = total row count (1000→1000→1500, never a full re-read)."
@@ -61,7 +61,7 @@ scenarios:
     mysql:    { test: parallel_keyset_incremental_mysql }
     mssql:    { test: parallel_keyset_incremental_mssql }
     mongo:    { na: "Mongo incremental is the `_id`-range reader's `resume`, not SQL keyset_incremental (covered by the mongo resume scenario above)" }
-    oracle:   { gap: "no Oracle parallel keyset_incremental live test" }
+    oracle:   { test: parallel_keyset_incremental_oracle }
 
   - id: keyset_init_generates_for_pk
     what: "rivet init on a single-column-PK table scaffolds chunk_by_key (keyset), not range chunk_column"
@@ -78,7 +78,7 @@ scenarios:
     mysql:    { test: mysql_chunked_auto_resolves_chunk_column_from_pk }
     mssql:    { test: mssql_chunked_auto_resolves_chunk_column_from_pk }
     mongo:    { test: mongo_batch_parallel_integer_id_no_loss_or_dup }
-    oracle:   { gap: "the Oracle introspect_for_chunking resolves a single-int PK, but every Oracle range-chunk live test passes an explicit chunk_column over a `query:` — the table-shortcut auto-resolution is unexercised" }
+    oracle:   { test: stand_range_auto_single_int_pk_oracle }
 
   - id: range_chunk_size_memory_mb
     what: "chunk_size_memory_mb derives the row-count chunk_size from a byte budget"
@@ -86,7 +86,7 @@ scenarios:
     mysql:    { test: mysql_chunk_size_memory_mb_derives_chunk_size }
     mssql:    { test: mssql_chunk_size_memory_mb_derives_chunk_size }
     mongo:    { na: "no byte-budget chunking on Mongo" }
-    oracle:   { gap: "no Oracle chunk_size_memory_mb live test" }
+    oracle:   { test: stand_chunk_size_memory_mb_oracle }
 
   - id: range_sparse_gappy_key
     what: "range chunk over a sparse/gappy integer key: empty middle windows do not lose or false-fail"
@@ -94,7 +94,7 @@ scenarios:
     mysql:    { test: stand_range_gappy_mysql }
     mssql:    { test: stand_range_gappy_mssql }
     mongo:    { na: "Mongo pages _id; no BETWEEN-over-span shape" }
-    oracle:   { gap: "no Oracle range-over-gappy-key live test" }
+    oracle:   { test: stand_range_gappy_oracle }
 
   - id: range_crash_resume_checkpoint
     what: "range chunk + chunk_checkpoint: a crash mid-run resumes and re-runs the interrupted chunk at-least-once"
@@ -102,7 +102,7 @@ scenarios:
     mysql:    { test: mysql_chunked_crash_after_chunk_file_before_commit_resume_reruns_chunk_atleastonce }
     mssql:    { test: mssql_chunked_crash_after_chunk_file_before_commit_resume_reruns_chunk_atleastonce }
     mongo:    { test: mongo_crash_after_file_write_recovers_without_loss }
-    oracle:   { gap: "no Oracle range chunk crash/resume live test" }
+    oracle:   { test: every_chunked_range_runner_hook_loses_nothing_on_oracle }
 
   # ── other strategies ──────────────────────────────────────────────────────
   - id: chunk_count_n
@@ -111,7 +111,7 @@ scenarios:
     mysql:    { test: stand_chunk_count_mysql }
     mssql:    { test: stand_chunk_count_mssql }
     mongo:    { na: "Mongo has no chunk_count knob; the analogue is parallel: N _id-range fan-out, covered by mongo_batch_parallel_integer_id_no_loss_or_dup" }
-    oracle:   { gap: "no Oracle chunk_count live test" }
+    oracle:   { test: stand_chunk_count_oracle }
 
   - id: chunk_by_days
     what: "chunk_by_days: date-window chunking on a date/timestamp key"
@@ -144,7 +144,7 @@ scenarios:
     mysql:    { test: stand_sparse_guard_mysql }
     mssql:    { test: stand_sparse_guard_mssql }
     mongo:    { na: "Mongo pages _id; the BSON hetero/NaN guard is a separate family" }
-    oracle:   { gap: "Oracle's estimate is ALL_TABLES.NUM_ROWS (NULL/0 until DBMS_STATS) — which regime the sparse guard takes on Oracle is untested" }
+    oracle:   { test: stand_sparse_guard_oracle }
 
   - id: guard_null_keyed_range_bail
     what: "range/date chunk over a nullable key with actual NULLs → bail (BETWEEN would silently drop NULL rows)"
@@ -152,7 +152,7 @@ scenarios:
     mysql:    { test: stand_null_keyed_bail_mysql }
     mssql:    { test: stand_null_keyed_bail_mssql }
     mongo:    { na: "no BETWEEN key predicate on Mongo" }
-    oracle:   { gap: "null_key_probe_sql has an Oracle arm (FETCH FIRST 1 ROWS ONLY); no Oracle live bail test" }
+    oracle:   { test: stand_null_keyed_bail_oracle }
 
   - id: guard_keyset_non_usable_key_bail
     what: "chunk_by_key on a non-unique / nullable / heterogeneous key → loud refusal, not a filesort/silent-loss"
@@ -160,7 +160,7 @@ scenarios:
     mysql:    { test: stand_keyset_non_usable_bail_mysql }
     mssql:    { test: roast_mssql_chunk_by_key_on_a_nullable_unique_key_bails_loud }
     mongo:    { test: mongo_keyset_on_heterogeneous_id_errors_loudly_full_scan_still_works }
-    oracle:   { gap: "no Oracle live test of chunk_by_key on a non-unique / nullable key" }
+    oracle:   { test: stand_keyset_non_usable_bail_oracle }
 
   - id: keyset_unsigned_key_completeness
     what: "keyset over an UNSIGNED-integer key (Arrow UInt*) pages through EVERY row, incl. ids past i64::MAX — the strategy × key-TYPE axis the harness never varied (every fixture was signed BIGINT). FIELD BUG (0.21.2 prod): extract_last_cursor_value had no UInt arm, so an unsigned `id` passed the integer-family SELECTION guard (DATA_TYPE unsigned-agnostic) but couldn't advance the cursor — keyset bailed 'could not read the id value … unsupported type' on the first MULTI-PAGE table (~37 exports lost). Unit oracle: cursor_unsigned_integers_field_bug (extraction, up to u64::MAX); live oracle below (end-to-end row-completeness)."

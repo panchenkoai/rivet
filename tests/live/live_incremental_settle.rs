@@ -4,10 +4,28 @@ use crate::common::*;
 use std::path::Path;
 
 fn settled_rig(engine: SqlEngine, table: &str, out: &Path, lines: &[&str]) -> Rig {
+    if !engine.folds_upper() {
+        return engine
+            .rig(table)
+            .query(&format!("SELECT id, server_time, time_spent FROM {table}"))
+            .restage("incremental", lines)
+            .dest_path(out.to_path_buf());
+    }
+    // Oracle: the catalog's upper-case names in the config, and the integer widths `read_id_spent` reads.
+    let lines: Vec<String> = lines
+        .iter()
+        .map(|l| {
+            l.replace("server_time", "SERVER_TIME")
+                .replace("cursor_column: id", "cursor_column: ID")
+        })
+        .collect();
+    let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
     engine
         .rig(table)
-        .query(&format!("SELECT id, server_time, time_spent FROM {table}"))
-        .restage("incremental", lines)
+        .query(&format!(
+            "SELECT CAST(id AS NUMBER(18)) AS id, server_time, CAST(time_spent AS NUMBER(9)) AS time_spent FROM {table}"
+        ))
+        .restage("incremental", &lines)
         .dest_path(out.to_path_buf())
 }
 
@@ -111,4 +129,18 @@ fn settle_on_another_column_never_skips_an_out_of_order_row_postgres() {
 #[ignore = "live: requires docker compose mssql"]
 fn settle_on_another_column_never_skips_an_out_of_order_row_mssql() {
     settle_on_another_column_never_skips_an_out_of_order_row(SqlEngine::Mssql);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn settle_holds_back_young_rows_until_they_age_oracle() {
+    settle_holds_back_young_rows_until_they_age(SqlEngine::Oracle);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn settle_on_another_column_never_skips_an_out_of_order_row_oracle() {
+    settle_on_another_column_never_skips_an_out_of_order_row(SqlEngine::Oracle);
 }

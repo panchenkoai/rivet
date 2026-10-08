@@ -1246,18 +1246,6 @@ def run_scenarios(led: Ledger, engine: str, tag: str, url: str) -> None:
                 err = e
         return child, err
 
-    if engine == "oracle":
-        # blessed_flow and not_inert are keyed on the CDC stand (cdc._ENGINES), which has no Oracle.
-        child, err = _half("blessed_path",
-                           lambda l: blessed_path.verify_blessed_path(l, engine, tag, url, state_url=state_url))
-        child.flush_into(led)
-        for sc in ("blessed_flow", "not_inert"):
-            _skipped(led, engine, tag, sc, "-",
-                     f"{sc}[oracle]: not wired — its cells ride the CDC stand, which has no Oracle "
-                     f"(docs/release-gate-matrix.yaml records the gap)", "gap")
-        if err is not None:
-            raise err
-        return
     with ThreadPoolExecutor(max_workers=2) as ex:
         halves = list(ex.map(lambda a: _half(*a), (
             ("blessed_path",

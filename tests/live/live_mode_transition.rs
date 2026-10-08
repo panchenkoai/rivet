@@ -100,10 +100,6 @@ enum Expect {
     Refused(&'static [&'static str]),
 }
 
-fn staged(rig: Rig, stage: &Stage, out: &Path) -> Rig {
-    rig.restage(stage.0, stage.1).dest_path(out.to_path_buf())
-}
-
 fn transition(engine: SqlEngine, prior: Stage, next: Stage, expect: Expect) {
     transition_with(engine, prior, next, expect, |_| {});
 }
@@ -117,34 +113,44 @@ fn transition_with(
     between: impl Fn(&Path),
 ) {
     engine.alive();
-    let (table, _guard) = engine.table("mode_transition");
+    let (table, _guard) = engine.range_table("mode_transition");
     engine.insert(&table, 1..=10, 180, Some(10));
     let (first, second) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
 
-    let rig = staged(engine.rig(&table), &prior, first.path());
+    let rig = staged_for(engine, engine.rig(&table), &prior, first.path());
     rig.run_ok();
-    assert_eq!(read_ids(first.path()), (1..=10).collect::<Vec<_>>());
+    assert_eq!(
+        delivered_ids(engine, first.path()),
+        (1..=10).collect::<Vec<_>>()
+    );
     between(&rig.config_path().with_file_name(".rivet_state.db"));
 
     engine.insert(&table, 11..=13, 170, Some(10));
-    let rig = staged(rig, &next, second.path());
+    let rig = staged_for(engine, rig, &next, second.path());
     match expect {
         Expect::Continues => {
             let rig = continued(rig);
             rig.run_ok();
-            assert_eq!(read_ids(second.path()), vec![11, 12, 13]);
+            assert_eq!(delivered_ids(engine, second.path()), vec![11, 12, 13]);
         }
         Expect::FullPass => {
             rig.run_ok();
-            assert_eq!(read_ids(second.path()), (1..=13).collect::<Vec<_>>());
+            assert_eq!(
+                delivered_ids(engine, second.path()),
+                (1..=13).collect::<Vec<_>>()
+            );
         }
         Expect::Refused(names) => {
             let said = rig.run_expect_fail();
             for n in names {
-                assert!(said.contains(n), "refusal must name {n}:\n{said}");
+                let n = &catalog_names(engine, n);
+                assert!(said.contains(n.as_str()), "refusal must name {n}:\n{said}");
             }
             assert!(said.contains("state reset"), "{said}");
-            assert!(read_ids(second.path()).is_empty(), "nothing exported");
+            assert!(
+                delivered_ids(engine, second.path()).is_empty(),
+                "nothing exported"
+            );
 
             let reset = rig.cli(&["state", "reset", "--export", &table]);
             assert!(
@@ -153,7 +159,10 @@ fn transition_with(
                 String::from_utf8_lossy(&reset.stderr)
             );
             rig.run_ok();
-            assert_eq!(read_ids(second.path()), (1..=13).collect::<Vec<_>>());
+            assert_eq!(
+                delivered_ids(engine, second.path()),
+                (1..=13).collect::<Vec<_>>()
+            );
         }
     }
 }
@@ -625,19 +634,19 @@ fn resumed_parallel_keyset_then_incremental(e: SqlEngine) {
             "chunk_checkpoint: true",
         ],
     );
-    let rig = staged(e.rig(&table), &parallel, first.path());
+    let rig = staged_for(e, e.rig(&table), &parallel, first.path());
     let crash = rig.run_with_env("RIVET_TEST_PANIC_AT", "keyset_parallel_range_committed:3");
     assert!(!crash.status.success(), "the injected crash must stop it");
     rig.run_ok();
     assert_eq!(
-        read_ids(first.path()).len(),
+        delivered_ids(e, first.path()).len(),
         301,
         "the resumed run delivers every row"
     );
 
-    let rig = continued(staged(rig, &INCREMENTAL_ID, second.path()));
+    let rig = continued(staged_for(e, rig, &INCREMENTAL_ID, second.path()));
     rig.run_ok();
-    let again = read_ids(second.path());
+    let again = delivered_ids(e, second.path());
     assert!(
         again.is_empty(),
         "P-22: a resumed parallel keyset run stored a cursor below its own maximum: incremental on the key re-delivered {} row(s) up to id {}",
@@ -656,17 +665,18 @@ fn incremental_query_filter_edited(e: SqlEngine) {
     let filtered =
         |spent: i32| format!("SELECT id, time_spent FROM {table} WHERE time_spent = {spent}");
 
-    let rig = staged(
+    let rig = staged_for(
+        e,
         e.rig(&table).query(&filtered(1)),
         &INCREMENTAL_ID,
         first.path(),
     );
     rig.run_ok();
-    assert_eq!(read_ids(first.path()), (6..=10).collect::<Vec<_>>());
+    assert_eq!(delivered_ids(e, first.path()), (6..=10).collect::<Vec<_>>());
 
-    let rig = staged(rig.query(&filtered(0)), &INCREMENTAL_ID, second.path());
+    let rig = staged_for(e, rig.query(&filtered(0)), &INCREMENTAL_ID, second.path());
     if !refused(&rig) {
-        let ids = read_ids(second.path());
+        let ids = delivered_ids(e, second.path());
         assert!(
             ids == (1..=5).collect::<Vec<_>>(),
             "an edited query filter inherited the old filter's cursor: the run delivered ids {ids:?} of 1..=5 with exit 0"
@@ -690,31 +700,32 @@ fn open_defect_resumed_parallel_keyset_then_incremental_postgres() {
     resumed_parallel_keyset_then_incremental(SqlEngine::Pg);
 }
 
-#[test]
-#[ignore = "live+gate-only: postgres; open defect P-18, acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_source_url_without_its_default_port_continues_postgres() {
-    let e = SqlEngine::Pg;
+/// P-18: the same source spelled without its default port keeps its cursor.
+fn source_url_without_its_default_port_continues(e: SqlEngine) {
     e.alive();
     let (table, _guard) = e.table("mode_transition");
     e.insert(&table, 1..=10, 180, Some(10));
     let (first, second) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-    let rig = staged(e.rig(&table), &INCREMENTAL_ID, first.path());
+    let rig = staged_for(e, e.rig(&table), &INCREMENTAL_ID, first.path());
     rig.run_ok();
-    assert_eq!(read_ids(first.path()), (1..=10).collect::<Vec<_>>());
+    assert_eq!(delivered_ids(e, first.path()), (1..=10).collect::<Vec<_>>());
 
     e.insert(&table, 11..=13, 170, Some(10));
-    let respelled = POSTGRES_URL.replace(":5432", "");
-    assert_ne!(
-        respelled, POSTGRES_URL,
-        "the stand URL names the default port"
-    );
-    let rig = continued(staged(rig, &INCREMENTAL_ID, second.path()).source_url(&respelled));
+    let respelled = e.url().replace(&format!(":{}/", e.default_port()), "/");
+    assert_ne!(respelled, e.url(), "the stand URL names the default port");
+    let rig = continued(staged_for(e, rig, &INCREMENTAL_ID, second.path()).source_url(&respelled));
     rig.run_ok();
-    let ids = read_ids(second.path());
+    let ids = delivered_ids(e, second.path());
     assert!(
         ids == vec![11, 12, 13],
         "P-18: the source URL without its default port lost the cursor: the run delivered ids {ids:?}, the delta is [11, 12, 13]"
     );
+}
+
+#[test]
+#[ignore = "live+gate-only: postgres; open defect P-18, acknowledged in dev/release_oracle/known_red.py"]
+fn open_defect_source_url_without_its_default_port_continues_postgres() {
+    source_url_without_its_default_port_continues(SqlEngine::Pg);
 }
 
 #[test]
@@ -731,12 +742,12 @@ fn open_defect_same_table_in_another_schema_is_another_stream_postgres() {
         s = schema.0
     ));
     let (first, second) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-    let rig = staged(e.rig(&table), &INCREMENTAL_ID, first.path());
+    let rig = staged_for(e, e.rig(&table), &INCREMENTAL_ID, first.path());
     rig.run_ok();
     assert_eq!(read_ids(first.path()), (1..=10).collect::<Vec<_>>());
 
     let elsewhere = format!("{POSTGRES_URL}?options=-csearch_path%3D{}", schema.0);
-    let rig = staged(rig, &INCREMENTAL_ID, second.path()).source_url(&elsewhere);
+    let rig = staged_for(e, rig, &INCREMENTAL_ID, second.path()).source_url(&elsewhere);
     if !refused(&rig) {
         let ids = read_ids(second.path());
         assert!(
@@ -790,9 +801,14 @@ fn staged_for(engine: SqlEngine, rig: Rig, stage: &Stage, out: &Path) -> Rig {
         .1
         .iter()
         .map(|l| match l.split_once(": ") {
-            Some((k @ ("chunk_by_key" | "chunk_column" | "cursor_column"), v))
-                if engine.folds_upper() =>
-            {
+            Some((
+                k @ ("chunk_by_key"
+                | "chunk_column"
+                | "cursor_column"
+                | "time_column"
+                | "cursor_fallback_column"),
+                v,
+            )) if engine.folds_upper() => {
                 format!("{k}: {}", v.to_uppercase())
             }
             _ => l.to_string(),
@@ -800,6 +816,16 @@ fn staged_for(engine: SqlEngine, rig: Rig, stage: &Stage, out: &Path) -> Rig {
         .collect();
     let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
     rig.restage(stage.0, &lines).dest_path(out.to_path_buf())
+}
+
+/// `text` with the fixture's column names spelled as the engine's catalog holds them.
+fn catalog_names(engine: SqlEngine, text: &str) -> String {
+    if !engine.folds_upper() {
+        return text.to_string();
+    }
+    ["server_time", "updated_at", "ext_id", "`id`"]
+        .iter()
+        .fold(text.to_string(), |t, n| t.replace(n, &n.to_uppercase()))
 }
 
 /// Sorted ids re-read from every part under `out`, whatever case and integer type the engine gives the column.
@@ -1148,7 +1174,7 @@ fn crashed_run_then_incremental(
     remedy: Remedy,
 ) {
     engine.alive();
-    let (table, _guard) = engine.table("crashed_run");
+    let (table, _guard) = engine.range_table("crashed_run");
     engine.insert(&table, 1..=10, 180, Some(10));
     let (first, second) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let ids = |out: &Path| delivered_ids(engine, out);
@@ -1503,10 +1529,8 @@ fn crashed_resume_then_resume_removed_mongo(remedy: Remedy) {
 /// P-02: config A crashes after chunk 0; config B (same export name, table name and chunk settings, ANOTHER database) must deliver its own rows, twice; A then resumes its own run.
 fn range_chunk_shared_name_another_source(engine: SqlEngine) {
     engine.alive();
-    let other = engine
-        .second_database("chunk_other")
-        .expect("a second database on the stand");
-    let (table, _guard) = engine.table("chunk_shared");
+    let other = engine.second_database("chunk_other");
+    let (table, _guard) = engine.range_table("chunk_shared");
     engine.insert(&table, 1..=10, 180, Some(10));
     other.table_with(&table, 1..=30);
     let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
@@ -1827,4 +1851,180 @@ fn crashed_resume_then_resume_removed_finish_the_run_mongo() {
 #[ignore = "live: requires docker compose up -d mongo"]
 fn crashed_resume_then_resume_removed_reset_mongo() {
     crashed_resume_then_resume_removed_mongo(Remedy::Reset);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn full_then_incremental_oracle() {
+    full_then_incremental(SqlEngine::Oracle);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn time_window_then_incremental_oracle() {
+    time_window_then_incremental(SqlEngine::Oracle);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn range_chunked_then_incremental_oracle() {
+    range_chunked_then_incremental(SqlEngine::Oracle);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn keyset_then_incremental_same_key_oracle() {
+    keyset_then_incremental_same_key(SqlEngine::Oracle);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn keyset_checkpoint_then_incremental_same_key_oracle() {
+    keyset_checkpoint_then_incremental_same_key(SqlEngine::Oracle);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn parallel_keyset_then_incremental_same_key_oracle() {
+    parallel_keyset_then_incremental_same_key(SqlEngine::Oracle);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn keyset_then_incremental_other_column_oracle() {
+    keyset_then_incremental_other_column(SqlEngine::Oracle);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn keyset_incremental_key_change_oracle() {
+    keyset_incremental_key_change(SqlEngine::Oracle);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn incremental_then_keyset_incremental_same_key_oracle() {
+    incremental_then_keyset_incremental_same_key(SqlEngine::Oracle);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn incremental_cursor_change_oracle() {
+    incremental_cursor_change(SqlEngine::Oracle);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn incremental_single_to_coalesce_oracle() {
+    incremental_single_to_coalesce(SqlEngine::Oracle);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn incremental_adding_settle_oracle() {
+    incremental_adding_settle(SqlEngine::Oracle);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn legacy_keyset_state_then_other_column_oracle() {
+    legacy_keyset_state_then_other_column(SqlEngine::Oracle);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn legacy_incremental_state_then_other_column_oracle() {
+    legacy_incremental_state_then_other_column(SqlEngine::Oracle);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn crashed_range_chunk_then_incremental_finish_the_run_oracle() {
+    crashed_range_chunk_then_incremental(SqlEngine::Oracle, Remedy::FinishTheRun);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn crashed_range_chunk_then_incremental_reset_oracle() {
+    crashed_range_chunk_then_incremental(SqlEngine::Oracle, Remedy::Reset);
+}
+
+#[test]
+#[ignore = "live+gate-only: mysql; open defect P-22, acknowledged in dev/release_oracle/known_red.py"]
+fn open_defect_resumed_parallel_keyset_then_incremental_mysql() {
+    resumed_parallel_keyset_then_incremental(SqlEngine::Mysql);
+}
+
+#[test]
+#[ignore = "live+gate-only: mssql; open defect P-22, acknowledged in dev/release_oracle/known_red.py"]
+fn open_defect_resumed_parallel_keyset_then_incremental_mssql() {
+    resumed_parallel_keyset_then_incremental(SqlEngine::Mssql);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live+gate-only: oracle; open defect P-22, acknowledged in dev/release_oracle/known_red.py"]
+fn open_defect_resumed_parallel_keyset_then_incremental_oracle() {
+    resumed_parallel_keyset_then_incremental(SqlEngine::Oracle);
+}
+
+#[test]
+#[ignore = "live+gate-only: mysql; open defect P-18, acknowledged in dev/release_oracle/known_red.py"]
+fn open_defect_source_url_without_its_default_port_continues_mysql() {
+    source_url_without_its_default_port_continues(SqlEngine::Mysql);
+}
+
+#[test]
+#[ignore = "live+gate-only: mssql; open defect P-18, acknowledged in dev/release_oracle/known_red.py"]
+fn open_defect_source_url_without_its_default_port_continues_mssql() {
+    source_url_without_its_default_port_continues(SqlEngine::Mssql);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live+gate-only: oracle; open defect P-18, acknowledged in dev/release_oracle/known_red.py"]
+fn open_defect_source_url_without_its_default_port_continues_oracle() {
+    source_url_without_its_default_port_continues(SqlEngine::Oracle);
+}
+
+#[test]
+#[ignore = "live+gate-only: mysql; open defect (cursor identity, edited query), acknowledged in dev/release_oracle/known_red.py"]
+fn open_defect_incremental_query_filter_edited_mysql() {
+    incremental_query_filter_edited(SqlEngine::Mysql);
+}
+
+#[test]
+#[ignore = "live+gate-only: mssql; open defect (cursor identity, edited query), acknowledged in dev/release_oracle/known_red.py"]
+fn open_defect_incremental_query_filter_edited_mssql() {
+    incremental_query_filter_edited(SqlEngine::Mssql);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live+gate-only: oracle; open defect (cursor identity, edited query), acknowledged in dev/release_oracle/known_red.py"]
+fn open_defect_incremental_query_filter_edited_oracle() {
+    incremental_query_filter_edited(SqlEngine::Oracle);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live+gate-only: requires the oracle-latin1 service"]
+fn range_chunk_shared_name_another_source_oracle() {
+    range_chunk_shared_name_another_source(SqlEngine::Oracle);
 }

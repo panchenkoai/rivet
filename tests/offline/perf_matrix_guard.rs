@@ -21,7 +21,7 @@ const ENGINES: [&str; 5] = ["postgres", "mysql", "mssql", "mongo", "oracle"];
 // not after N accumulate (matching the sibling guards' zero-slack convention).
 // Raised 0 -> 7 (2026-09-26): the Oracle column's honest gaps — no Oracle baseline measured yet.
 // Lowered 7 -> 6 (2026-09-29): Oracle keep-up-under-heavy-WAL is `na` (reader-independent retention).
-const GAP_RATCHET: usize = 6; // ratchet-pin: perf-matrix-gaps
+const GAP_RATCHET: usize = 0; // ratchet-pin: perf-matrix-gaps
 
 fn load() -> Value {
     let s = fs::read_to_string(PERF_MATRIX).unwrap_or_else(|e| panic!("read {PERF_MATRIX}: {e}"));

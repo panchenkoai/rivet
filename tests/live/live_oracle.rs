@@ -916,6 +916,173 @@ fn parallel_keyset_reads_every_row_once() {
         .run_args(&[]);
     assert_ok(&run, "parallel keyset");
     assert_every_row_once(out.path(), t.name(), "parallel keyset");
+    let workers = range_workers(out.path());
+    assert!(
+        workers >= 2,
+        "parallel: 4 must fan out to several range workers, got {workers}"
+    );
+}
+
+/// Distinct `_pk_w<range>_` tokens among the part names in `dir`: the range workers that wrote.
+fn range_workers(dir: &Path) -> usize {
+    files_with_extension(dir, "parquet")
+        .iter()
+        .filter_map(|p| {
+            let name = p.file_name()?.to_str()?;
+            Some(name.split("_pk_w").nth(1)?.split('_').next()?.to_string())
+        })
+        .collect::<std::collections::BTreeSet<String>>()
+        .len()
+}
+
+/// `ID NUMBER(18) PRIMARY KEY, PAYLOAD NUMBER(9)` holding ids `1..=rows`.
+fn int_key_table(prefix: &str, rows: i64) -> OracleTable {
+    let t = OracleTable::create(
+        prefix,
+        "id NUMBER(18) PRIMARY KEY, payload NUMBER(9) NOT NULL",
+    );
+    add_int_keys(t.name(), 1, rows);
+    t
+}
+
+/// Append ids `lo..=hi` to an [`int_key_table`].
+fn add_int_keys(table: &str, lo: i64, hi: i64) {
+    ora_exec(&format!(
+        "INSERT INTO {table} SELECT {lo} - 1 + LEVEL, LEVEL FROM dual CONNECT BY LEVEL <= {}",
+        hi - lo + 1
+    ));
+}
+
+/// Three runs of a keyset-incremental export (`extra` lines added): 1000 rows, nothing new, then only the 500 added keys.
+fn keyset_incremental_three_runs(prefix: &str, extra: &[&str]) {
+    require_alive(LiveService::Oracle);
+    let t = int_key_table(prefix, 1_000);
+    let out = tempfile::tempdir().unwrap();
+    let mut rig = Rig::oracle_batch(t.name())
+        .mode("chunked")
+        .export_line("chunk_by_key: ID")
+        .export_line("chunk_checkpoint: true")
+        .export_line("keyset_incremental: true")
+        .export_line("chunk_size: 200")
+        .dest_path(out.path().to_path_buf());
+    for l in extra {
+        rig = rig.export_line(l);
+    }
+    // No pause between runs: part and manifest names must be run-unique within one second.
+    assert_ok(&rig.run_args(&[]), "run 1");
+    assert_every_row_once(out.path(), t.name(), "run 1");
+    assert_ok(&rig.run_args(&[]), "run 2, unchanged source");
+    assert_every_row_once(
+        out.path(),
+        t.name(),
+        "run 2 (a full re-read would double the rows)",
+    );
+    add_int_keys(t.name(), 1_001, 1_500);
+    assert_ok(&rig.run_args(&[]), "run 3, after the insert");
+    assert_every_row_once(out.path(), t.name(), "run 3 (only the 500 new keys)");
+    let source: i64 = ora_text_rows(&format!("SELECT TO_CHAR(COUNT(*)) FROM {}", t.name()))[0][0]
+        .as_deref()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        (source, dir_manifest_copy_total_rows(out.path())),
+        (1_500, 1_500),
+        "the run-unique manifest copies sum run 1 and run 3 to the source's own count"
+    );
+}
+
+/// Keyset with a chunk checkpoint and `keyset_incremental`: a second run reads only keys past the stored one.
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn keyset_checkpoint_resume_second_run_captures_only_new_keys_oracle() {
+    keyset_incremental_three_runs("ora_kinc", &[]);
+}
+
+/// The same three runs through the parallel keyset runner.
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn parallel_keyset_incremental_oracle() {
+    keyset_incremental_three_runs("ora_pkinc", &["parallel: 4"]);
+}
+
+/// Six incremental runs back to back, one new row each, into one prefix: every delta survives.
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn rapid_incremental_runs_into_one_prefix_keep_every_part_oracle() {
+    require_alive(LiveService::Oracle);
+    const N: i64 = 6;
+    let t = OracleTable::create(
+        "ora_rapid",
+        "id NUMBER(10) PRIMARY KEY, updated_at TIMESTAMP(6) NOT NULL",
+    );
+    let out = tempfile::tempdir().unwrap();
+    let rig = Rig::oracle_batch(t.name())
+        .mode("incremental")
+        .export_line("cursor_column: UPDATED_AT")
+        .dest_path(out.path().to_path_buf());
+    for k in 0..N {
+        ora_exec(&format!(
+            "INSERT INTO {} VALUES ({k}, TIMESTAMP '2024-01-01 00:00:00' + NUMTODSINTERVAL({k}, 'SECOND'))",
+            t.name()
+        ));
+        assert_ok(&rig.run_args(&[]), &format!("incremental run {k}"));
+    }
+    assert_every_row_once(out.path(), t.name(), "six rapid runs");
+    assert_eq!(
+        dir_manifest_copy_total_rows(out.path()),
+        N,
+        "the run-unique manifest copies sum every run's row"
+    );
+}
+
+/// A crash after the source read and before any write leaves no part, no manifest, no cursor and no successful run.
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn crash_after_source_read_leaves_state_completely_clean_oracle() {
+    require_alive(LiveService::Oracle);
+    let t = OracleTable::create(
+        "ora_clean",
+        "id NUMBER(10) PRIMARY KEY, updated_at TIMESTAMP(6) NOT NULL",
+    );
+    ora_exec(&format!(
+        "INSERT INTO {} SELECT LEVEL, TIMESTAMP '2024-01-01 00:00:00' + NUMTODSINTERVAL(LEVEL, 'SECOND') \
+         FROM dual CONNECT BY LEVEL <= 10",
+        t.name()
+    ));
+    let export = unique_name("ora_clean_exp");
+    let rig = Rig::oracle_batch(t.name())
+        .export_named(&export)
+        .mode("incremental")
+        .export_line("cursor_column: UPDATED_AT");
+    let crash = rig.run_args_env(&[], &[(PANIC, "after_source_read")]);
+    assert!(
+        String::from_utf8_lossy(&crash.stderr).contains("rivet test-hook: injected"),
+        "the run must die at the hook:\n{}",
+        String::from_utf8_lossy(&crash.stderr)
+    );
+    assert!(
+        files_with_extension(&rig.out_dir(), "parquet").is_empty(),
+        "no part before the first write"
+    );
+    assert!(
+        files_with_extension(&rig.out_dir(), "json").is_empty(),
+        "no manifest before the first write"
+    );
+    let (runs, cursor) = run_statuses_and_cursor(&rig.config_path(), &export);
+    assert_eq!(cursor, None, "the cursor must not advance");
+    assert!(
+        !runs.iter().any(|s| s == "success"),
+        "no run may be recorded successful: {runs:?}"
+    );
+    assert_ok(&rig.run_args(&[]), "recovery");
+    assert_every_row_once(&rig.out_dir(), t.name(), "recovery");
+    assert!(
+        run_statuses_and_cursor(&rig.config_path(), &export)
+            .1
+            .is_some(),
+        "the recovery run stores the cursor"
+    );
 }
 
 /// `run --reconcile` and `rivet reconcile` both count the source through a derived table.
@@ -2245,6 +2412,12 @@ fn assert_no_loss(rig: &Rig, table: &str, ctx: &str) {
             "{ctx}: id {id} is {copies:?}, the source says {}",
             want[id]
         );
+        assert_eq!(
+            copies.len(),
+            1,
+            "{ctx}: id {id} is declared {} times",
+            copies.len()
+        );
     }
 }
 
@@ -2431,4 +2604,248 @@ fn every_parallel_keyset_runner_hook_loses_nothing_on_oracle() {
         ctx,
     );
     assert_no_loss(&rig, t.name(), ctx);
+}
+
+/// The strategy a generated config scaffolds, as the catalog replay labels it.
+fn scaffolded_strategy(cfg: &InitConfig) -> String {
+    let field = |k: &str| cfg.field(k).unwrap_or_else(|| format!("<no {k}>"));
+    match field("mode").as_str() {
+        "chunked" => match cfg.field("chunk_by_key") {
+            Some(k) => format!("keyset({k})"),
+            None => format!("chunked({})", field("chunk_column")),
+        },
+        "incremental" => format!("incremental({})", field("cursor_column")),
+        other => other.to_string(),
+    }
+}
+
+/// Every shape of the distilled field catalog, created empty on Oracle with the fixture's size as its optimizer statistics: `rivet init` reads Oracle's catalog and scaffolds the strategy the fixture expects.
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn init_scaffolds_every_distilled_field_shape_oracle() {
+    require_alive(LiveService::Oracle);
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../../src/init/fixtures/hostile_catalog.json")).unwrap();
+    let shapes = fixture.as_array().expect("fixture rows");
+    assert!(shapes.len() >= 6, "fixture must cover several shapes");
+    let (mut got, mut want) = (Vec::new(), Vec::new());
+    for shape in shapes {
+        let info = &shape["table"];
+        let label = info["table"].as_str().unwrap();
+        let columns: Vec<String> = info["columns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| {
+                let ty = match c["data_type"].as_str().unwrap() {
+                    "bigint" => "NUMBER(18)".to_string(),
+                    "int" => "NUMBER(9)".to_string(),
+                    "decimal" => {
+                        format!("NUMBER({},{})", c["numeric_precision"], c["numeric_scale"])
+                    }
+                    "timestamp" => "TIMESTAMP(6)".to_string(),
+                    "text" | "longtext" => "CLOB".to_string(),
+                    "varchar" | "char" | "uuid" => "VARCHAR2(64)".to_string(),
+                    other => panic!("fixture type `{other}` has no Oracle spelling here"),
+                };
+                let constraint = if c["is_primary_key"] == true {
+                    " PRIMARY KEY"
+                } else if c["is_nullable"] == false {
+                    " NOT NULL"
+                } else {
+                    ""
+                };
+                format!("{} {ty}{constraint}", c["name"].as_str().unwrap())
+            })
+            .collect();
+        let t = OracleTable::create("ora_shape", &columns.join(", "));
+        for c in info["columns"].as_array().unwrap() {
+            if c["is_indexed"] == true && c["is_primary_key"] != true {
+                let col = c["name"].as_str().unwrap();
+                ora_exec(&format!("CREATE INDEX {0}_{col} ON {0} ({col})", t.name()));
+            }
+        }
+        let rows = info["row_estimate"].as_i64().unwrap();
+        let bytes = info["total_bytes"].as_i64().unwrap();
+        ora_exec(&format!(
+            "BEGIN DBMS_STATS.SET_TABLE_STATS(USER, '{}', numrows => {rows}, numblks => {}, \
+             avgrlen => {}); END;",
+            t.name(),
+            (bytes / 8192).max(1),
+            (bytes / rows.max(1)).clamp(1, 30_000)
+        ));
+        let cfg = InitConfig::generate(ORACLE_URL, &["--table", t.name()]);
+        assert!(
+            cfg.init.status.success(),
+            "init on shape {label}:\n{}",
+            String::from_utf8_lossy(&cfg.init.stderr)
+        );
+        got.push((label.to_string(), scaffolded_strategy(&cfg)));
+        want.push((
+            label.to_string(),
+            oracle_expectation(label, shape["expect"].as_str().unwrap()),
+        ));
+    }
+    assert_eq!(got, want, "strategy per distilled shape");
+}
+
+/// The fixture's expected strategy as Oracle spells it: column names upper-case, and a `NUMBER(p,0)` primary key is an integer the keyset cursor reads (the fixture's `decimal(20,0)` keys are `full` elsewhere).
+fn oracle_expectation(label: &str, expect: &str) -> String {
+    if label.starts_with("decimal_pk_") {
+        return "keyset(ID)".to_string();
+    }
+    match expect.split_once('(') {
+        Some((kind, col)) => format!("{kind}({}", col.to_uppercase()),
+        None => expect.to_string(),
+    }
+}
+
+/// An unqualified `table:` another schema owns, reached through the session's CURRENT_SCHEMA, range-chunks completely.
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn chunked_over_an_unqualified_table_resolved_through_current_schema_oracle() {
+    require_alive(LiveService::Oracle);
+    let t = int_key_table("ora_cs", 40);
+    let user = OracleLogonUser::create(
+        "ora_cs",
+        t.name(),
+        "EXECUTE IMMEDIATE 'ALTER SESSION SET CURRENT_SCHEMA = RIVET';",
+    );
+    let out = tempfile::tempdir().unwrap();
+    let run = Rig::oracle_batch(t.name())
+        .source_url(&user.url())
+        .mode("chunked")
+        .export_line("chunk_column: ID")
+        .export_line("chunk_size: 10")
+        .dest_path(out.path().to_path_buf())
+        .run_args(&[]);
+    assert_ok(&run, "chunked through CURRENT_SCHEMA");
+    assert_every_row_once(out.path(), t.name(), "chunked through CURRENT_SCHEMA");
+    assert_eq!(
+        files_with_extension(out.path(), "parquet").len(),
+        4,
+        "40 rows in windows of 10"
+    );
+}
+
+/// `(id, name, amount)` of every row under `dir`, canonical text, by id; the column names match in either case.
+fn id_name_amount(dir: &Path) -> Vec<(i64, Option<String>, Option<String>)> {
+    let mut rows = Vec::new();
+    for b in read_all_parts(dir) {
+        let col = |name: &str| {
+            let schema = b.schema();
+            let i = schema
+                .fields()
+                .iter()
+                .position(|f| f.name().eq_ignore_ascii_case(name))
+                .unwrap_or_else(|| panic!("no `{name}` column in {:?}", schema.fields()));
+            b.column(i).clone()
+        };
+        let (id, name, amount) = (col("id"), col("name"), col("amount"));
+        for i in 0..b.num_rows() {
+            rows.push((
+                render(id.as_ref(), i)
+                    .expect("an id")
+                    .parse()
+                    .expect("an integer id"),
+                render(name.as_ref(), i),
+                render(amount.as_ref(), i),
+            ));
+        }
+    }
+    rows.sort();
+    rows
+}
+
+/// The same 40 rows seeded on Oracle and MySQL export row for row alike, in full and range-chunked mode; an empty table writes no file on either.
+#[test]
+#[ignore = "live: requires docker compose oracle mysql"]
+fn oracle_and_mysql_exports_agree_on_every_row() {
+    require_alive(LiveService::Oracle);
+    require_alive(LiveService::Mysql);
+    const ROWS: i64 = 40;
+    let ora_table = |rows: i64| {
+        let t = OracleTable::create(
+            "ora_parity",
+            "id NUMBER(18) PRIMARY KEY, name VARCHAR2(100) NOT NULL, amount NUMBER(12,2) NOT NULL",
+        );
+        if rows > 0 {
+            ora_exec(&format!(
+                "INSERT INTO {} SELECT LEVEL - 1, 'row_' || (LEVEL - 1), (LEVEL - 1) * 1.5 \
+                 FROM dual CONNECT BY LEVEL <= {rows}",
+                t.name()
+            ));
+        }
+        t
+    };
+    let (ora, my) = (ora_table(ROWS), seed_mysql_numeric_table(ROWS));
+    for (mode, ora_lines, my_lines) in [
+        ("full", &[][..], &[][..]),
+        (
+            "chunked",
+            &["chunk_column: ID", "chunk_size: 7"][..],
+            &["chunk_column: id", "chunk_size: 7"][..],
+        ),
+    ] {
+        let (ora_out, my_out) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let mut ora_rig = Rig::oracle_batch(ora.name())
+            .mode(mode)
+            .dest_path(ora_out.path().to_path_buf());
+        let mut my_rig = Rig::mysql_batch(my.name())
+            .mode(mode)
+            .dest_path(my_out.path().to_path_buf());
+        for l in ora_lines {
+            ora_rig = ora_rig.export_line(l);
+        }
+        for l in my_lines {
+            my_rig = my_rig.export_line(l);
+        }
+        assert_ok(&ora_rig.run_args(&[]), &format!("oracle {mode}"));
+        assert_ok(&my_rig.run_args(&[]), &format!("mysql {mode}"));
+        let (o, m) = (
+            id_name_amount(ora_out.path()),
+            id_name_amount(my_out.path()),
+        );
+        let source: Vec<(i64, Option<String>, Option<String>)> = ora_text_rows(&format!(
+            "SELECT TO_CHAR(id), name, TO_CHAR(amount) FROM {} ORDER BY id",
+            ora.name()
+        ))
+        .into_iter()
+        .map(|r| {
+            (
+                r[0].as_deref().unwrap().parse().unwrap(),
+                r[1].clone(),
+                r[2].as_deref().map(canon_num),
+            )
+        })
+        .collect();
+        assert_eq!(source.len(), ROWS as usize, "fixture: {ROWS} source rows");
+        assert_eq!(
+            o, source,
+            "{mode}: the Oracle export is Oracle's own rendering of the table"
+        );
+        assert_eq!(o, m, "{mode}: Oracle and MySQL deliver the same rows");
+    }
+    let (ora, my) = (ora_table(0), seed_mysql_numeric_table(0));
+    let (ora_out, my_out) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    assert_ok(
+        &Rig::oracle_batch(ora.name())
+            .dest_path(ora_out.path().to_path_buf())
+            .run_args(&[]),
+        "oracle empty",
+    );
+    assert_ok(
+        &Rig::mysql_batch(my.name())
+            .dest_path(my_out.path().to_path_buf())
+            .run_args(&[]),
+        "mysql empty",
+    );
+    assert_eq!(
+        (
+            files_with_extension(ora_out.path(), "parquet").len(),
+            files_with_extension(my_out.path(), "parquet").len()
+        ),
+        (0, 0),
+        "an empty table writes no part on either engine"
+    );
 }

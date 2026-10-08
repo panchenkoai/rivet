@@ -28,7 +28,8 @@ use std::path::{Path, PathBuf};
 // 17 -> 21 (2026-10-02): live_cdc_source_connections counts source connections, which the oracle's own read would add to.
 // 21 -> 22 (2026-10-03): the PG truncate refusal's resumed run keeps the pre-truncate rows the refusal says only a re-snapshot removes.
 // 22 -> 23 (2026-10-03): pg_cdc_a_declared_key_absent_from_the_old_key_does_not_split merges by a declared `load.pk: [code]`; the oracle dedups by the source primary key `id`.
-const NO_ORACLE_CEILING: usize = 23; // ratchet-pin: no-oracle-opt-outs
+// Raised 23 -> 24 (2026-10-08): the MongoDB oplog-gone cells run on a replica set container they start themselves, which the reader inside rivet-duckdb cannot reach.
+const NO_ORACLE_CEILING: usize = 24; // ratchet-pin: no-oracle-opt-outs
 
 /// Typed declarations in tests/live of what a run that does not exit 0 may leave: `.a_failed_run_may_leave(` and a raw run's `FAILED_RUN_LEAVES_ENV`.
 // 0 -> 19 (2026-10-07): the refusal grade's first pass; every site is a gate that fails a run after its parts are written (quality, schema drift, a manifest that did not land).

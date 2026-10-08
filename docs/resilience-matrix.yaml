@@ -27,7 +27,7 @@ scenarios:
     mysql:    { test: mysql_crash_after_source_read_leaves_state_completely_clean }
     mssql:    { test: mssql_crash_after_source_read_leaves_state_completely_clean }
     mongo:    { na: "a Mongo `mode: full` WITHOUT source.mongo.page_size resolves to Snapshot (src/plan/build.rs:168) and DOES fire after_source_read in single.rs — but that boundary is PRE-WRITE (crash → no file, no manifest, no cursor) and the post-read code (single.rs:266→record_part) is byte-identical across source engines, so it is covered by the shared single.rs path the postgres/mysql/mssql cells test, not immune from it. (With page_size it takes the keyset/mongo_parallel path whose boundaries are the after_file_write cells tested below.)" }
-    oracle:   { gap: "no Oracle crash-hook test" }
+    oracle:   { test: crash_after_source_read_leaves_state_completely_clean_oracle }
 
   - id: batch_crash_after_file_write
     what: "crash after the part file, before the manifest → file present, no manifest/cursor, recoverable"
@@ -35,7 +35,7 @@ scenarios:
     mysql:    { test: mysql_crash_after_file_write_leaves_file_but_no_manifest_or_cursor }
     mssql:    { test: mssql_crash_after_file_write_leaves_file_but_no_manifest_or_cursor }
     mongo:    { test: mongo_crash_after_file_write_recovers_without_loss }
-    oracle:   { gap: "no Oracle crash-hook test" }
+    oracle:   { test: every_single_runner_hook_loses_nothing_on_oracle }
 
   - id: batch_crash_after_manifest_update
     what: "crash after the manifest, before the cursor → file+manifest present, no cursor, recoverable"
@@ -43,7 +43,7 @@ scenarios:
     mysql:    { test: mysql_crash_after_manifest_update_leaves_file_and_manifest_but_no_cursor }
     mssql:    { test: mssql_crash_after_manifest_update_leaves_file_and_manifest_but_no_cursor }
     mongo:    { test: mongo_crash_after_manifest_update_recovers_without_loss }
-    oracle:   { gap: "no Oracle crash-hook test" }
+    oracle:   { test: every_single_runner_hook_loses_nothing_on_oracle }
 
   - id: batch_crash_after_cursor_commit
     what: "crash after the cursor commit → fully recoverable with complete state"
@@ -51,7 +51,7 @@ scenarios:
     mysql:    { test: mysql_crash_after_cursor_commit_is_recoverable_with_full_state }
     mssql:    { test: mssql_crash_after_cursor_commit_is_recoverable_with_full_state }
     mongo:    { test: mongo_resume_crash_after_keyset_page_recovers_manifest_driven }
-    oracle:   { gap: "no Oracle crash-hook test" }
+    oracle:   { test: every_incremental_runner_hook_loses_nothing_on_oracle }
 
   # ── chunked (checkpoint) at-least-once ────────────────────────────────────
   - id: chunked_crash_after_chunk_complete
@@ -60,7 +60,7 @@ scenarios:
     mysql:    { test: mysql_chunked_crash_after_first_chunk_complete_resume_finishes_export }
     mssql:    { test: mssql_chunked_crash_after_first_chunk_complete_resume_finishes_export }
     mongo:    { na: "Mongo has no SQL-style chunked path — it uses keyset/parallel (covered by the batch + keyset rows)" }
-    oracle:   { gap: "no Oracle chunked crash/resume test" }
+    oracle:   { test: every_chunked_range_runner_hook_loses_nothing_on_oracle }
 
   - id: chunked_crash_after_chunk_file_atleastonce
     what: "crash after a chunk file, before its commit → resume re-runs the chunk (at-least-once, no loss)"
@@ -68,7 +68,7 @@ scenarios:
     mysql:    { test: mysql_chunked_crash_after_chunk_file_before_commit_resume_reruns_chunk_atleastonce }
     mssql:    { test: mssql_chunked_crash_after_chunk_file_before_commit_resume_reruns_chunk_atleastonce }
     mongo:    { na: "no SQL-style chunked path on Mongo" }
-    oracle:   { gap: "no Oracle chunked crash/resume test" }
+    oracle:   { test: every_chunked_range_runner_hook_loses_nothing_on_oracle }
 
   - id: parallel_chunked_crash_recovery
     what: "crash mid parallel-chunked run → resume finishes with no duplicates"
@@ -76,7 +76,7 @@ scenarios:
     mysql:    { test: mysql_parallel_chunked_crash_after_chunk_complete_resume_finishes_with_no_duplicates }
     mssql:    { test: mssql_parallel_chunked_crash_after_chunk_complete_resume_finishes_with_no_duplicates }
     mongo:    { na: "no SQL-style chunked path on Mongo" }
-    oracle:   { gap: "no Oracle parallel-chunked crash test" }
+    oracle:   { test: every_chunked_range_runner_hook_loses_nothing_on_oracle }
 
   - id: parallel_keyset_crash_recovery
     what: "crash after ONE range of a parallel KEYSET run commits (per-range atomic checkpoint: file_log + keyset_range done=1) → resume rehydrates the done range + re-runs the rest, destination manifest declares every row (no orphan, no dup). A DISTINCT recovery unit from parallel-chunked (per-RANGE, not per-chunk)."
@@ -84,7 +84,7 @@ scenarios:
     mysql:    { test: parallel_keyset_crash_recovery_mysql }
     mssql:    { test: parallel_keyset_crash_recovery_mssql }
     mongo:    { na: "Mongo `parallel: N` is the separate `_id`-range reader (mongo_parallel), covered by live_mongo_crash_recovery.rs — not the SQL keyset per-range path" }
-    oracle:   { gap: "no Oracle parallel-keyset crash test" }
+    oracle:   { test: every_parallel_keyset_runner_hook_loses_nothing_on_oracle }
 
   # ── run-uniqueness: consecutive runs into the same prefix must not clobber ─
   - id: part_name_no_clobber_batch
@@ -93,7 +93,7 @@ scenarios:
     mysql:    { test: mysql_roast_rapid_incremental_runs_into_same_prefix_must_not_clobber_prior_parts }
     mssql:    { test: mssql_roast_rapid_incremental_runs_into_same_prefix_must_not_clobber_prior_parts }
     mongo:    { test: mongo_batch_two_rapid_runs_into_same_prefix_do_not_clobber }
-    oracle:   { gap: "an_incremental_timestamp_cursor_resumes_past_the_last_row reads the two-run union from one prefix, but its runs are not forced sub-second, so it cannot catch a granularity clobber" }
+    oracle:   { test: rapid_incremental_runs_into_one_prefix_keep_every_part_oracle }
 
   - id: part_name_no_clobber_keyset_checkpoint
     what: "keyset/chunk-checkpoint resume: second run captures only new keys, prior parts survive (ms-stamped, run-unique)"
@@ -101,7 +101,7 @@ scenarios:
     mysql:    { test: keyset_checkpoint_resume_second_run_captures_only_new_keys }
     mssql:    { test: keyset_checkpoint_resume_mssql_second_run_captures_only_new_keys }
     mongo:    { test: mongo_batch_resume_reads_only_new_since_last_run }
-    oracle:   { gap: "no Oracle keyset-checkpoint two-run test" }
+    oracle:   { test: keyset_checkpoint_resume_second_run_captures_only_new_keys_oracle }
 
   # ── real-signal faults (not panic hooks) ──────────────────────────────────
   - id: sigkill_commit_window
