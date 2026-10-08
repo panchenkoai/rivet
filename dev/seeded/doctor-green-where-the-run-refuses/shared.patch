@@ -1,0 +1,12 @@
+diff --git a/src/preflight/cdc_health.rs b/src/preflight/cdc_health.rs
+--- a/src/preflight/cdc_health.rs
++++ b/src/preflight/cdc_health.rs
+@@ -117,7 +117,7 @@
+     };
+     match result {
+         Err(e) => checks.push(probe_failed(&e)),
+-        Ok(()) => checks.extend(run_refusals(config, &cdc, &url)),
++        Ok(()) => checks.extend(run_refusals(config, &cdc[..0], &url)),
+     }
+     checks
+ }

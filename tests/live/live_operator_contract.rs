@@ -522,13 +522,22 @@ fn mongo_heterogeneous_resume_remedy() {
     );
 }
 
-/// RESULTS 15: a PostgreSQL CDC run refused for a table that does not exist leaves no replication slot, and creating the table then runs.
-fn pg_cdc_missing_table_leaves_no_slot() {
+/// RESULTS 15: a PostgreSQL CDC run refused for a table that does not exist leaves no replication slot, and creating the table then runs; with a baseline (`initial: snapshot`) or as a changes-only stream.
+fn pg_cdc_missing_table_leaves_no_slot(baseline: bool) {
     let slot = unique_name("oc_noslot");
     let _guard = Slot::new(slot.clone());
     let table = unique_name("oc_absent");
     let _table = PgTable::adopt_on(POSTGRES_CDC_URL, table.clone());
-    let mut rig = Rig::pg_cdc(&table, &slot).cdc("initial: snapshot");
+    let mut rig = Rig::pg_cdc(&table, &slot);
+    if baseline {
+        rig = rig.cdc("initial: snapshot");
+    }
+    // A changes-only stream anchors after the table is created: rows inserted before that are not its to deliver.
+    let seed = if baseline {
+        format!("; INSERT INTO {table} VALUES (1, 1)")
+    } else {
+        String::new()
+    };
     rig.refuses_twice_then(
         &["run"],
         &[],
@@ -551,7 +560,7 @@ fn pg_cdc_missing_table_leaves_no_slot() {
                     "a PostgreSQL CDC run refused for a table that does not exist left its replication slot"
                 );
                 pg.batch_execute(&format!(
-                    "CREATE TABLE {table} (id BIGINT PRIMARY KEY, v BIGINT); INSERT INTO {table} VALUES (1, 1)"
+                    "CREATE TABLE {table} (id BIGINT PRIMARY KEY, v BIGINT){seed}"
                 ))
                 .expect("create the table the refusal named");
             },
@@ -1526,7 +1535,13 @@ fn open_defect_a_dropped_slot_is_refused_by_code_postgres() {
 #[test]
 #[ignore = "live: requires docker compose --profile cdc postgres-cdc"]
 fn a_refused_cdc_run_on_a_missing_table_leaves_no_slot_postgres() {
-    pg_cdc_missing_table_leaves_no_slot();
+    pg_cdc_missing_table_leaves_no_slot(true);
+}
+
+#[test]
+#[ignore = "live: requires docker compose --profile cdc postgres-cdc"]
+fn a_refused_changes_only_cdc_run_on_a_missing_table_leaves_no_slot_postgres() {
+    pg_cdc_missing_table_leaves_no_slot(false);
 }
 
 #[test]

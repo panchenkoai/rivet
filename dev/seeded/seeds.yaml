@@ -763,3 +763,113 @@ seeds:
         cells: [check_names_the_strategy_run_uses_for_chunked_with_no_column_oracle]
       lib:
         cells: ["lib:check_describes_the_export_the_planner_resolved"]
+
+  - name: cdc-anchor-written-before-the-refusal
+    class: a CDC open writes its durable anchor (a replication slot, a first-run checkpoint) before it asks the prerequisites it refuses by
+    history: "known_red sweep 15 and gate run 1 (2026-10-08): a PostgreSQL run refused for a missing table left an inactive slot pinning WAL; a MySQL first run refused for binlog compression left `cdc.ckpt added (112 bytes)`; on main and on v0.31.0"
+    scope: source
+    engines:
+      postgres:
+        patch: cdc-anchor-written-before-the-refusal/postgres.patch
+        cells: [a_refused_changes_only_cdc_run_on_a_missing_table_leaves_no_slot_postgres]
+      mysql:
+        patch: cdc-anchor-written-before-the-refusal/mysql.patch
+        cells:
+          - roast_mysql_cdc_refuses_a_view_whose_binlog_identity_is_the_base_table
+          - cdc_from_a_replica_that_does_not_relog_refuses_instead_of_capturing_nothing
+      oracle:
+        patch: cdc-anchor-written-before-the-refusal/oracle.patch
+        cells: [doctor_is_not_green_where_the_cdc_run_refuses_a_table_without_all_column_logging_oracle]
+      mssql:
+        na: "the SQL Server open writes no anchor: the stream floors at fn_cdc_get_min_lsn and the checkpoint is the sink's, written at the first ack"
+      mongo:
+        na: "the MongoDB anchor is the resume token of the change stream the open has already been given, so there is nothing to write before the server accepted the watch"
+
+  - name: doctor-green-where-the-run-refuses
+    class: doctor grades a CDC export with its own probes and never asks the prerequisites the run refuses by
+    history: "CLI sweep (advice parity) and devbox row 330: `doctor` reported all checks passed for `wal_level=replica` and for a replica with `log_replica_updates = OFF`, which `run` refuses; on main and on v0.31.0"
+    scope: source
+    patch: doctor-green-where-the-run-refuses/shared.patch
+    engines:
+      postgres:
+        cells: [doctor_is_not_green_where_the_cdc_run_refuses_wal_level_postgres]
+      mysql:
+        cells: [doctor_is_not_green_where_the_cdc_run_refuses_a_replica_that_does_not_relog_mysql]
+      mssql:
+        na: "CdcEngine::refuse_unmet_prerequisites asks nothing on SQL Server; doctor's verdict there is mssql_verdicts' own (the capture instance, the Agent, retention)"
+      mongo:
+        na: "CdcEngine::refuse_unmet_prerequisites asks nothing on MongoDB; doctor's verdict there is mongo_capability_verdicts' own (the replica-set requirement)"
+      oracle:
+        na: "oracle_checks already reports the same prerequisites (container, table vetting, supplemental logging) through oracle::cdc::prerequisites, so the cell stays red-proof without this check"
+
+  - name: stdout-drain-never-acks
+    class: the `rivet cdc` stdout driver prints and checkpoints but never acks the source, so a consuming anchor never moves
+    history: "CLI sweep 16: three `rivet cdc` runs to stdout over three changes emitted [3, 3, 3] on PostgreSQL, with or without `--checkpoint`; on main and on v0.31.0"
+    scope: source
+    patch: stdout-drain-never-acks/shared.patch
+    engines:
+      postgres:
+        cells: [cdc_to_stdout_emits_each_change_once_postgres]
+      mysql:
+        na: "the MySQL read position is the checkpoint file the driver saves at each commit; ack is the trait's no-op"
+      mssql:
+        na: "the SQL Server read position is the checkpoint file the driver saves at each commit; ack moves nothing on the server"
+      mongo:
+        na: "the MongoDB read position is the resume token the driver saves at each commit; ack is the trait's no-op"
+      oracle:
+        na: "the Oracle read position is the checkpoint the driver saves at each commit; ack only re-saves the frontier of an exhausted drain"
+      lib:
+        cells: ["lib:the_ndjson_driver_acks_the_last_commit_it_emitted_or_passed"]
+
+  - name: message-only-window-ends-the-drain
+    class: a PostgreSQL peek window that holds only a logical message outside a transaction yields nothing and ends the drain with commits pending behind it
+    history: "gaps round four: every `rivet cdc --output <dir> --rollover 1` run exited 0 with a Success manifest of 0 rows over three pending commits (the previous run's drain barrier filled the one-change window); `rollover: 1` in config mode the same; on main and on v0.31.0"
+    scope: source
+    engines:
+      postgres:
+        patch: message-only-window-ends-the-drain/postgres.patch
+        cells:
+          - pg_cdc_cli_rollover_1_delivers_the_pending_changes
+          - pg_cdc_rollover_1_delivers_the_commits_behind_an_idle_runs_barrier
+      mysql:
+        na: "the peek window over a consuming slot and the drain barrier are PostgreSQL's (pg_logical_slot_peek_changes, pg_logical_emit_message)"
+      mssql:
+        na: "the peek window over a consuming slot and the drain barrier are PostgreSQL's (pg_logical_slot_peek_changes, pg_logical_emit_message)"
+      mongo:
+        na: "the peek window over a consuming slot and the drain barrier are PostgreSQL's (pg_logical_slot_peek_changes, pg_logical_emit_message)"
+      oracle:
+        na: "the peek window over a consuming slot and the drain barrier are PostgreSQL's (pg_logical_slot_peek_changes, pg_logical_emit_message)"
+
+  - name: bounded-standby-refused-after-the-baseline
+    class: the pre-baseline prerequisite check asks without the run's drain mode, so a refusal that depends on it comes after the anchor and the baseline
+    history: "known_red sweep 15 (standby twin): a bounded run on a PostgreSQL standby was refused after its slot, the snapshot baseline with `_SUCCESS` and a `cdc_snapshot` row were written; on main and on v0.31.0"
+    scope: source
+    engines:
+      postgres:
+        patch: bounded-standby-refused-after-the-baseline/postgres.patch
+        cells: [a_bounded_cdc_run_refused_on_a_standby_leaves_nothing_and_its_remedy_runs_postgres]
+      mysql:
+        na: "the refusal that depends on the drain mode is PostgreSQL's (a bounded drain on a hot standby); a MySQL replica is an ordinary binlog source"
+      mssql:
+        na: "the refusal that depends on the drain mode is PostgreSQL's (a bounded drain on a hot standby); a readable secondary takes the bounded drain"
+      mongo:
+        na: "the refusal that depends on the drain mode is PostgreSQL's (a bounded drain on a hot standby); a MongoDB secondary takes the bounded drain"
+      oracle:
+        na: "the refusal that depends on the drain mode is PostgreSQL's (a bounded drain on a hot standby); Oracle refuses the continuous mode when the config is read, before any source is opened"
+
+  - name: init-bounds-a-drain-on-a-standby
+    class: "`rivet init --mode cdc` scaffolds a drain mode the run refuses on the server it introspected"
+    history: "devbox sweep E2: `rivet init --mode cdc` against a PostgreSQL standby wrote `until_current: true`, which the run refuses on a standby; on main and on v0.31.0"
+    scope: source
+    engines:
+      postgres:
+        patch: init-bounds-a-drain-on-a-standby/postgres.patch
+        cells: [the_config_init_writes_runs_cdc_on_a_standby_postgres]
+      mysql:
+        na: "the standby twin is PostgreSQL's (logical decoding on a hot standby); the scaffold's bounded drain runs on a MySQL replica"
+      mssql:
+        na: "the standby twin is PostgreSQL's (logical decoding on a hot standby); the scaffold's bounded drain runs on a readable secondary"
+      mongo:
+        na: "the standby twin is PostgreSQL's (logical decoding on a hot standby); the scaffold's bounded drain runs on a secondary"
+      oracle:
+        na: "the standby twin is PostgreSQL's (logical decoding on a hot standby); Oracle CDC is bounded only"

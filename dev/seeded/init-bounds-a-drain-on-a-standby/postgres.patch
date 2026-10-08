@@ -1,0 +1,14 @@
+diff --git a/src/init/mod.rs b/src/init/mod.rs
+--- a/src/init/mod.rs
++++ b/src/init/mod.rs
+@@ -1079,8 +1079,8 @@
+         return false;
+     }
+     crate::source::postgres::connect_client(source_url, tls)
+-        .and_then(|mut c| Ok(c.query_one("SELECT pg_is_in_recovery()", &[])?.get(0)))
+-        .unwrap_or(false)
++        .and_then(|mut c| Ok(c.query_one("SELECT pg_is_in_recovery()", &[])?.get::<_, bool>(0)))
++        .is_err()
+ }
+ 
+ #[allow(clippy::too_many_arguments)] // mirrors `init`'s own surface; a params

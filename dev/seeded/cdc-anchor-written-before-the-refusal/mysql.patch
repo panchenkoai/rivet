@@ -1,0 +1,20 @@
+diff --git a/src/source/mysql/cdc.rs b/src/source/mysql/cdc.rs
+--- a/src/source/mysql/cdc.rs
++++ b/src/source/mysql/cdc.rs
+@@ -806,8 +806,6 @@
+         };
+         // ONE connection for every question asked before the dump; it then dumps.
+         let mut conn = connect_conn(url, tls)?;
+-        // Before the anchor is written: a refused first run leaves no checkpoint.
+-        Self::refuse_unmet_prerequisites_on(&mut conn, &configured_tables)?;
+         if let Some(path) = ckpt
+             && let Some(pos) = Position::load(path)?
+             && let Some((file, p)) =
+@@ -872,6 +870,7 @@
+             );
+             Self::write_anchor(path, &file, pos, &identity)?;
+         }
++        Self::refuse_unmet_prerequisites_on(&mut conn, &configured_tables)?;
+         Self::open_on(
+             conn,
+             server_id,

@@ -152,6 +152,14 @@ scenarios:
     mongo:    { na: "a replication slot is PostgreSQL's server-side anchor; this engine's anchor is its checkpoint file, and a refused run that writes one fails the default refusal grade (tests/common/refusal.rs) of every CDC refusal cell, as on doctor_cdc_prerequisite below" }
     oracle:   { na: "a replication slot is PostgreSQL's server-side anchor; this engine's anchor is its checkpoint file, and a refused run that writes one fails the default refusal grade (tests/common/refusal.rs) of every CDC refusal cell, as on doctor_cdc_prerequisite below" }
 
+  - id: refused_changes_only_cdc_run_leaves_a_slot
+    what: "RESULTS 15: the changes-only twin of RESULTS 15 (no baseline leg, so the capture open itself is the first writer): refused for a missing table, it leaves no replication slot, and creating the table then runs"
+    postgres: { test: a_refused_changes_only_cdc_run_on_a_missing_table_leaves_no_slot_postgres }
+    mysql:    { na: "a replication slot is PostgreSQL's server-side anchor; this engine's anchor is its checkpoint file, and a refused run that writes one fails the default refusal grade (tests/common/refusal.rs) of every CDC refusal cell, as on doctor_cdc_prerequisite below" }
+    mssql:    { na: "a replication slot is PostgreSQL's server-side anchor; this engine's anchor is its checkpoint file, and a refused run that writes one fails the default refusal grade (tests/common/refusal.rs) of every CDC refusal cell, as on doctor_cdc_prerequisite below" }
+    mongo:    { na: "a replication slot is PostgreSQL's server-side anchor; this engine's anchor is its checkpoint file, and a refused run that writes one fails the default refusal grade (tests/common/refusal.rs) of every CDC refusal cell, as on doctor_cdc_prerequisite below" }
+    oracle:   { na: "a replication slot is PostgreSQL's server-side anchor; this engine's anchor is its checkpoint file, and a refused run that writes one fails the default refusal grade (tests/common/refusal.rs) of every CDC refusal cell, as on doctor_cdc_prerequisite below" }
+
   - id: doctor_cdc_prerequisite
     what: "`doctor` is not green for a CDC export whose prerequisite the run refuses (wal_level, a replica that does not relog, no capture instance, a standalone, no all-column logging)"
     postgres: { test: doctor_is_not_green_where_the_cdc_run_refuses_wal_level_postgres }
