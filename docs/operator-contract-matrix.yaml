@@ -86,7 +86,7 @@ scenarios:
     mysql:    { test: open_defect_deleting_a_corrupt_cdc_checkpoint_accepts_a_new_anchor_mysql }
     mssql:    { test: open_defect_deleting_a_corrupt_cdc_checkpoint_accepts_a_new_anchor_mssql }
     mongo:    { test: open_defect_deleting_a_corrupt_cdc_checkpoint_accepts_a_new_anchor_mongo }
-    oracle:   { test: deleting_a_corrupt_cdc_checkpoint_accepts_a_new_anchor_oracle }
+    oracle:   { test: open_defect_deleting_a_corrupt_cdc_checkpoint_accepts_a_new_anchor_oracle }
 
   - id: corrupt_checkpoint_code
     what: "a corrupt CDC checkpoint is refused as RIVET_SOURCE_CDC_CHECKPOINT_INVALID (exit 5)"
@@ -109,16 +109,16 @@ scenarios:
     postgres: { test: open_defect_a_dropped_slot_is_refused_by_code_postgres }
     mysql:    { test: open_defect_binlogs_purged_past_the_checkpoint_before_the_first_changes_run_are_refused_by_code_mysql }
     mssql:    { test: open_defect_a_change_table_cleaned_past_the_checkpoint_before_the_first_changes_run_is_refused_by_code_mssql }
-    mongo:    { gap: "the stand's replica set cannot lose oplog under a resume token without affecting every other change-stream cell: it needs a dedicated replica set started with a minimal `--oplogSize` and filler writes past it" }
-    oracle:   { gap: "the stand cannot lose an Oracle archived log without SYSDBA inside the container (RMAN `delete archivelog` after log switches), which the test user does not hold; the fabricated-low-water twin is live_cdc_oracledb::oracle_cdc_resume_past_log_retention_fails_loudly. Needs: a SYSDBA handle for the harness, run under the oracle_cdc serial group" }
+    mongo:    { test: open_defect_an_oplog_rolled_past_the_checkpoint_before_the_first_changes_run_is_refused_by_code_mongo }
+    oracle:   { gap: "attempted 2026-10-08, cannot run on this stand: losing archived redo is server-wide, so it needs an Oracle instance no other CDC cell mines. The stand's second instance (oracle-latin1, :1531) cannot be mined: LATIN1PDB refuses the capture user's container switch (ORA-24964) and its FREEPDB1 fails LogMiner with ORA-01305 (a PDB of another character set in the CDB); the image (gvenzl/oracle-free slim) ships no rman. Needs: a third Oracle service with the LogMiner init only. The fabricated-low-water twin is live_cdc_oracledb::oracle_cdc_resume_past_log_retention_fails_loudly" }
 
   - id: log_gone_after_a_changes_run
     what: "RESULTS 17: retained changes removed past a checkpoint a changes run advanced are refused as RIVET_SOURCE_CDC_LOG_GAP (exit 5)"
     postgres: { test: open_defect_a_dropped_slot_after_a_changes_run_is_refused_by_code_postgres }
     mysql:    { test: open_defect_binlogs_purged_past_the_checkpoint_after_a_changes_run_are_refused_by_code_mysql }
     mssql:    { test: a_change_table_cleaned_past_the_checkpoint_after_a_changes_run_is_refused_by_code_mssql }
-    mongo:    { gap: "the stand's replica set cannot lose oplog under a resume token without affecting every other change-stream cell: it needs a dedicated replica set started with a minimal `--oplogSize` and filler writes past it" }
-    oracle:   { gap: "the stand cannot lose an Oracle archived log without SYSDBA inside the container (RMAN `delete archivelog` after log switches), which the test user does not hold; the fabricated-low-water twin is live_cdc_oracledb::oracle_cdc_resume_past_log_retention_fails_loudly. Needs: a SYSDBA handle for the harness, run under the oracle_cdc serial group" }
+    mongo:    { test: open_defect_an_oplog_rolled_past_the_checkpoint_after_a_changes_run_is_refused_by_code_mongo }
+    oracle:   { gap: "attempted 2026-10-08, cannot run on this stand: losing archived redo is server-wide, so it needs an Oracle instance no other CDC cell mines. The stand's second instance (oracle-latin1, :1531) cannot be mined: LATIN1PDB refuses the capture user's container switch (ORA-24964) and its FREEPDB1 fails LogMiner with ORA-01305 (a PDB of another character set in the CDB); the image (gvenzl/oracle-free slim) ships no rman. Needs: a third Oracle service with the LogMiner init only. The fabricated-low-water twin is live_cdc_oracledb::oracle_cdc_resume_past_log_retention_fails_loudly" }
 
   - id: refused_cdc_run_leaves_a_slot
     what: "RESULTS 15: a PostgreSQL CDC run refused for a missing table leaves no replication slot"

@@ -138,8 +138,28 @@ impl SqlEngine {
         }
     }
 
-    /// The column definitions of [`SqlEngine::table`].
-    fn standard_columns(self) -> String {
+    /// The port a source URL of this engine means when it names none.
+    pub fn default_port(self) -> u16 {
+        match self {
+            SqlEngine::Mysql => 3306,
+            SqlEngine::Pg => 5432,
+            SqlEngine::Mssql => 1433,
+            #[cfg(feature = "oracle")]
+            SqlEngine::Oracle => 1521,
+        }
+    }
+
+    /// The widest integer column type range chunking accepts as its key (Oracle: `NUMBER(18)`).
+    fn range_int(self) -> &'static str {
+        match self {
+            #[cfg(feature = "oracle")]
+            SqlEngine::Oracle => "NUMBER(18)",
+            _ => self.int64(),
+        }
+    }
+
+    /// The column definitions of [`SqlEngine::table`], with integer columns of type `i`.
+    fn standard_columns(self, i: &str) -> String {
         let ts = match self {
             SqlEngine::Mysql => "DATETIME(6)",
             SqlEngine::Pg => "TIMESTAMP",
@@ -147,7 +167,6 @@ impl SqlEngine {
             #[cfg(feature = "oracle")]
             SqlEngine::Oracle => "TIMESTAMP(6)",
         };
-        let i = self.int64();
         format!(
             "id {i} PRIMARY KEY, ext_id {i} NOT NULL UNIQUE, \
              server_time {ts} NOT NULL, updated_at {ts} NULL, time_spent INT NULL"
@@ -156,14 +175,23 @@ impl SqlEngine {
 
     /// A fresh `(id, ext_id, server_time, updated_at, time_spent)` table and its drop guard.
     pub fn table(self, prefix: &str) -> (String, Box<dyn std::any::Any>) {
-        self.create(prefix, &self.standard_columns())
+        self.create(prefix, &self.standard_columns(self.int64()))
     }
 
-    /// A second database on this engine's stand server (another source key), or `None` where the stand has one (Oracle: one service).
-    pub fn second_database(self, tag: &str) -> Option<SecondDatabase> {
+    /// [`SqlEngine::table`] with a key range chunking accepts on every engine.
+    pub fn range_table(self, prefix: &str) -> (String, Box<dyn std::any::Any>) {
+        self.create(prefix, &self.standard_columns(self.range_int()))
+    }
+
+    /// A second database of this engine (another source key): a scratch one on the stand server, or the stand's second Oracle instance (`oracle-latin1`).
+    pub fn second_database(self, tag: &str) -> SecondDatabase {
         #[cfg(feature = "oracle")]
         if let SqlEngine::Oracle = self {
-            return None;
+            return SecondDatabase {
+                engine: self,
+                name: String::new(),
+                tables: Default::default(),
+            };
         }
         let name = unique_name(tag);
         match self {
@@ -174,7 +202,11 @@ impl SqlEngine {
                 .expect("mysql create database as root"),
             _ => self.exec(&format!("CREATE DATABASE {name}")),
         }
-        Some(SecondDatabase { engine: self, name })
+        SecondDatabase {
+            engine: self,
+            name,
+            tables: Default::default(),
+        }
     }
 
     /// A fresh table with the given column definitions and its drop guard.
@@ -241,11 +273,17 @@ impl SqlEngine {
 pub struct SecondDatabase {
     engine: SqlEngine,
     pub name: String,
+    /// Tables to drop one by one where the database itself outlives the guard (Oracle).
+    tables: std::cell::RefCell<Vec<String>>,
 }
 
 impl SecondDatabase {
     /// The source URL of this database: the stand URL with another database path.
     pub fn url(&self) -> String {
+        #[cfg(feature = "oracle")]
+        if let SqlEngine::Oracle = self.engine {
+            return super::oracle_latin1_url();
+        }
         let (server, _) = self.engine.url().rsplit_once('/').expect("a database path");
         format!("{server}/{}", self.name)
     }
@@ -257,6 +295,8 @@ impl SecondDatabase {
                 .expect("connect to the second database")
                 .batch_execute(sql)
                 .expect("pg exec"),
+            #[cfg(feature = "oracle")]
+            SqlEngine::Oracle => super::ora_exec_on(&self.url(), sql),
             _ => self.engine.exec(sql),
         }
     }
@@ -265,6 +305,8 @@ impl SecondDatabase {
     fn qualified(&self, table: &str) -> String {
         match self.engine {
             SqlEngine::Pg => table.to_string(),
+            #[cfg(feature = "oracle")]
+            SqlEngine::Oracle => table.to_string(),
             SqlEngine::Mssql => format!("{}.dbo.{table}", self.name),
             _ => format!("{}.{table}", self.name),
         }
@@ -273,13 +315,28 @@ impl SecondDatabase {
     /// Create `table` here with the columns of [`SqlEngine::table`] and insert `ids`.
     pub fn table_with(&self, table: &str, ids: std::ops::RangeInclusive<i64>) {
         let (e, t) = (self.engine, self.qualified(table));
-        self.exec(&format!("CREATE TABLE {t} ({})", e.standard_columns()));
+        self.exec(&format!(
+            "CREATE TABLE {t} ({})",
+            e.standard_columns(e.range_int())
+        ));
+        self.tables.borrow_mut().push(t.clone());
         self.exec(&e.insert_sql(&t, ids, 180, Some(10)));
     }
 }
 
 impl Drop for SecondDatabase {
     fn drop(&mut self) {
+        #[cfg(feature = "oracle")]
+        if let SqlEngine::Oracle = self.engine {
+            for t in self.tables.borrow().iter() {
+                let url = self.url();
+                let drop = format!("DROP TABLE {t} PURGE");
+                if std::panic::catch_unwind(|| super::ora_exec_on(&url, &drop)).is_err() {
+                    eprintln!("could not drop {t} in the second Oracle database");
+                }
+            }
+            return;
+        }
         let drop = match self.engine {
             SqlEngine::Pg => format!("DROP DATABASE IF EXISTS {} WITH (FORCE)", self.name),
             SqlEngine::Mssql => format!(

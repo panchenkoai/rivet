@@ -1776,6 +1776,7 @@ jobs:
           --skip loads_into_bigquery_or_refuses_by_column
           --skip cleanup_source_never_deletes_parts --skip compact_after_a_source_alter
           --skip a_non_unicode_database_round_trips
+          --skip range_chunk_shared_name_another_source_oracle
           --skip a_read_blocked_longer_than_thirty_seconds_still_completes
           --skip open_defect_
 

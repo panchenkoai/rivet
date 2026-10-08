@@ -146,7 +146,8 @@ const MATRICES: &[(&str, usize)] = &[
     // Lowered 2 -> 1 (2026-09-26): Oracle time_window proven live.
     ("docs/behaviour-matrix.yaml", 1),
     // Raised 0 -> 1 (2026-09-26): the Oracle column's honest gaps (batch-only phase 1).
-    ("docs/type-fidelity-matrix.yaml", 1),
+    // Lowered 1 -> 0 (2026-10-08): the Oracle collection column is refused, na.
+    ("docs/type-fidelity-matrix.yaml", 0),
     // Cross config × db: 15 honest holes on the non-PG engines (cloud dests, codec
     // parity, csv, tuning profile) — visible + un-growable; fill by writing the test.
     // Raised 0 -> 7 (2026-09-26): the Oracle column's honest gaps (batch-only phase 1).
@@ -199,7 +200,8 @@ const MATRICES: &[(&str, usize)] = &[
     // round-trip + data-driven redaction sweeps; `na:` cells are driver-owned
     // parses or state-URL seams that don't exist per engine. 0 gaps.
     // Raised 0 -> 3 (2026-09-26): the Oracle column's honest gaps (batch-only phase 1).
-    ("docs/url-safety-matrix.yaml", 3),
+    // Lowered 3 -> 0 (2026-10-08): oracle:// in the redaction sweep and a fields -> URL -> parse round-trip.
+    ("docs/url-safety-matrix.yaml", 0),
     // Durability ordering — the destination manifest is durable BEFORE the delivery
     // position advances, and the manifest/_SUCCESS pair stays consistent. This class
     // regressed twice (round-2 #11/#12) and escaped resilience/cdc because their
@@ -289,13 +291,15 @@ const MATRICES: &[(&str, usize)] = &[
     // (the stand has one Oracle service; another schema is the same source key).
     // Raised 17 -> 26 (2026-10-07): three open-defect rows (P-18, P-22, an edited query filter) are
     // pinned on PostgreSQL only; their MySQL, SQL Server and Oracle cells are gaps.
-    ("docs/mode-transition-matrix.yaml", 26),
+    // Lowered 26 -> 0 (2026-10-08): Oracle cells through the shared generators, the three open-defect rows on every SQL engine, the shared-name range cell on the second Oracle instance.
+    ("docs/mode-transition-matrix.yaml", 0),
     // Operator contract: the 2026-10-07 CLI sweep by hand, one row per finding, each cell
     // asserting the correct behaviour (open defects acknowledged in known_red.py).
     // Lowered 46 -> 4 (round two): the four that stay are the Oracle and MongoDB cells of the two
     // "retained changes gone past the checkpoint" rows; the stand cannot lose an archived redo log
     // or oplog for one cell without a SYSDBA handle or a dedicated replica set.
-    ("docs/operator-contract-matrix.yaml", 4),
+    // Lowered 4 -> 2 (2026-10-08): the MongoDB oplog-gone cells on a throwaway replica set; the Oracle pair was attempted and stays.
+    ("docs/operator-contract-matrix.yaml", 2),
     // Pool-split — `apply --pool --split` per (strategy × source engine). Split is a
     // scheduler layer above the runners (each unit runs through chunked/keyset), so its
     // per-engine behaviour (boundary probe, crash-recovery, finding-2 exact-partition
@@ -314,7 +318,8 @@ const MATRICES: &[(&str, usize)] = &[
     // Raised 0 -> 11 (2026-09-26): the Oracle column's honest gaps (batch-only phase 1).
     // Lowered 11 -> 5 (2026-09-30): the Oracle integer/float/decimal/date-time/text/binary
     // cells are graded independently by oracle_batch_and_cdc_deliver_every_ledger_row_alike.
-    ("docs/cdc-type-fidelity-matrix.yaml", 5),
+    // Lowered 5 -> 1 (2026-10-08): four Oracle kinds CDC refuses at open are na.
+    ("docs/cdc-type-fidelity-matrix.yaml", 1),
     // Load spec (ADR-0034) — `load.partition` form × granularity × warehouse target. The
     // BigQuery form cells are live (run + load + tables.get per cell); Snowflake cells are
     // SQL-text proofs (no live Snowflake from this stand); duckdb/clickhouse are `na`. 0 gaps.

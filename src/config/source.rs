@@ -1092,4 +1092,20 @@ mod tests {
         );
         assert_eq!(parsed.database, "rivet");
     }
+
+    /// A password holding every URL delimiter survives fields -> URL -> `parse_oracle_url`.
+    #[cfg(feature = "oracle")]
+    #[test]
+    fn oracle_url_from_fields_roundtrips_through_parse_oracle_url() {
+        let mut src = make_source(SourceType::Oracle);
+        src.host = Some("db.internal".into());
+        src.user = Some("app@x".into());
+        src.password = Some("p:a/s@s?w#d!%x".into());
+        src.database = Some("FREEPDB1".into());
+        let url = src.resolve_url().expect("oracle url built from fields");
+        let parsed = crate::source::oracle::parse_oracle_url(&url).expect("it parses back");
+        assert_eq!(parsed.user, "app@x");
+        assert_eq!(parsed.password, "p:a/s@s?w#d!%x");
+        assert_eq!(parsed.service, "FREEPDB1");
+    }
 }

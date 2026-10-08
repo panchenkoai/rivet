@@ -896,14 +896,18 @@ impl CdcScenario {
     /// MongoDB (replica set :27018): a fresh database, one collection, unpinned and
     /// shaped — see [`Self::mysql_with`]. The scenario's `_id`s are `i64`.
     pub fn mongo_with(label: &str, shape: impl FnOnce(Rig, &str) -> Rig) -> Self {
-        const PORT: u16 = 27018;
+        Self::mongo_on(27018, label, shape)
+    }
+
+    /// [`Self::mongo_with`] on the replica set member listening on `PORT`.
+    pub fn mongo_on(port: u16, label: &str, shape: impl FnOnce(Rig, &str) -> Rig) -> Self {
         let db = super::unique_name(label);
         let table = "t".to_string();
-        let m = super::mongo::MongoTest::connect(PORT, &db);
+        let m = super::mongo::MongoTest::connect(port, &db);
         m.drop_collection(&table);
-        let rig = Rig::mongo_cdc(&table).source_url(&super::mongo::MongoTest::url(PORT, &db));
+        let rig = Rig::mongo_cdc(&table).source_url(&super::mongo::MongoTest::url(port, &db));
         let guard = super::mongo::MongoDbGuard {
-            port: PORT,
+            port,
             db: db.clone(),
         };
         Self {
