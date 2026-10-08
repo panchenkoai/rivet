@@ -17,7 +17,7 @@ pub use export::*;
 pub use format::*;
 pub use notifications::*;
 #[allow(unused_imports)]
-pub(crate) use resolve::resolve_env_vars;
+pub(crate) use resolve::{literal_parts, resolve_env_vars};
 pub use resolve::{parse_file_size, resolve_vars};
 pub use schema::generate_config_schema_pretty;
 pub use source::*;
@@ -121,7 +121,22 @@ impl Config {
         // error) so a typed `CodedError` raised by validation survives the chain —
         // `error::error_code` downcasts it for the `[CODE]` prefix. `{e:#}` in
         // `main` still renders the full "config file '…': <message>" chain.
-        Self::from_yaml(&resolved).map_err(|e| e.context(format!("config file '{}'", path)))
+        let mut config =
+            Self::from_yaml(&resolved).map_err(|e| e.context(format!("config file '{}'", path)))?;
+        config.record_queries_as_written(&contents);
+        Ok(config)
+    }
+
+    /// Record each export's inline `query:` as the file spells it, placeholders in place, where the unresolved document parses; `ExportConfig::resolve_query_and_template` uses a spelling only if it resolves to the export's query.
+    fn record_queries_as_written(&mut self, unresolved: &str) {
+        let doc = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&resolve::masked(unresolved));
+        let written = doc
+            .ok()
+            .and_then(|d| d.get("exports")?.as_sequence().cloned());
+        for (export, written) in self.exports.iter_mut().zip(written.iter().flatten()) {
+            let query = written.get("query").and_then(|q| q.as_str());
+            export.query_as_written = query.map(resolve::unmasked);
+        }
     }
 
     pub fn from_yaml(yaml: &str) -> crate::error::Result<Self> {

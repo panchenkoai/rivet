@@ -261,6 +261,70 @@ pub fn reset_state(config_path: &str, export_name: &str) -> Result<()> {
     Ok(())
 }
 
+/// The context of the journal event `rivet state accept` records, and the status of its journal.
+const ACCEPTED: &str = "accepted";
+
+/// `rivet state accept`: keep the stored progress of one export under the stream it reads now, and journal that the operator said so.
+pub fn accept_state(
+    config_path: &str,
+    export_name: &str,
+    params: Option<&std::collections::HashMap<String, String>>,
+) -> Result<()> {
+    let config = Config::load_with_params(config_path, params)?;
+    require_known_export(&config, config_path, export_name)?;
+    let export = config.exports.iter().find(|e| e.name == export_name);
+    let export = export.expect("a known export is in the config");
+    if export.mode == crate::config::ExportMode::Cdc {
+        println!(
+            "Export '{export_name}' is a cdc export: it stores a log position, not a cursor, so `state accept` has nothing to keep for it; nothing changed."
+        );
+        return Ok(());
+    }
+    config.source.try_state_key().map_err(|e| {
+        anyhow::anyhow!(
+            "export '{export_name}': `state accept` re-binds the progress this config's source \
+             holds and no other source's, and the source did not resolve — nothing was \
+             changed.\n  {e:#}"
+        )
+    })?;
+    let config_dir = std::path::Path::new(config_path).parent();
+    let config_dir = config_dir.unwrap_or_else(|| std::path::Path::new("."));
+    let plan = crate::plan::build_plan(&config, export, config_dir, false, false, false, params)?;
+    let state = StateStore::open(config_path)?;
+    let _held =
+        super::chunked::claim_export_progress(&state, export_name, "accept its edited query")?;
+    match state.accept(&plan.progress_key())? {
+        crate::state::Accepted::NoProgress => println!(
+            "Export '{export_name}' holds no stored progress on this source that a run would continue from; nothing to accept."
+        ),
+        crate::state::Accepted::Unchanged => println!(
+            "The stored progress of export '{export_name}' already belongs to what it reads now; nothing changed."
+        ),
+        crate::state::Accepted::Rebound { held, was, now } => {
+            let message = format!(
+                "stored progress ({held}) written reading `{was}` is kept for `{now}` by `rivet state accept`"
+            );
+            let at = chrono::Utc::now().format("%Y%m%dT%H%M%S%.3f");
+            let mut journal =
+                crate::journal::RunJournal::new(format!("{export_name}_accept_{at}"), export_name);
+            journal.record(RunEvent::Warning {
+                context: ACCEPTED.into(),
+                message: message.clone(),
+            });
+            journal.record(RunEvent::RunCompleted {
+                status: ACCEPTED.into(),
+                error_message: None,
+                duration_ms: 0,
+            });
+            state.store_journal(&journal)?;
+            println!(
+                "Accepted for export '{export_name}': {message}. The next run continues from it; `rivet journal -c <config> --export {export_name}` shows this acceptance."
+            );
+        }
+    }
+    Ok(())
+}
+
 pub fn show_files(
     config_path: &str,
     export_name: Option<&str>,
@@ -659,6 +723,13 @@ pub fn show_journal(
             dur = duration_str,
         );
         println!("  run_id: {}", journal.run_id);
+        for e in journal.warnings() {
+            if let RunEvent::Warning { context, message } = &e.event
+                && context == ACCEPTED
+            {
+                println!("  accepted: {message}");
+            }
+        }
 
         // ── event summary lines ────────────────────────────────────────────
         let files = journal.files();
@@ -1373,6 +1444,152 @@ exports:
             msg.contains("rivet state show"),
             "must point at a follow-up command: {msg}"
         );
+    }
+
+    // ── accept_state ─────────────────────────────────────────────────────────
+
+    /// A config with one incremental export `orders` whose filter is `filter`, a cdc export and `source`.
+    fn write_accept_config(config_path: &str, source: &str, filter: &str) {
+        let yaml = format!(
+            "source:\n  type: postgres\n  {source}\nexports:\n  - name: orders\n\
+             \x20   query: \"SELECT id FROM orders WHERE {filter}\"\n    mode: incremental\n\
+             \x20   cursor_column: ${{cursor}}\n    format: parquet\n\
+             \x20   destination: {{ type: local, path: ./out }}\n  - name: changes\n\
+             \x20   tables: [orders]\n    mode: cdc\n    format: parquet\n\
+             \x20   cdc: {{ checkpoint: ./c.ckpt }}\n    destination: {{ type: local, path: ./cdc }}\n"
+        );
+        std::fs::write(config_path, yaml).unwrap();
+    }
+
+    /// The journals `rivet state accept` left for `orders`, as (run id, status, message).
+    fn acceptances(state: &StateStore) -> Vec<(String, String, String)> {
+        let journals = state.recent_journals("orders", 10).unwrap();
+        let said = |j: &RunJournal| {
+            let status = match j.final_outcome().map(|e| &e.event) {
+                Some(RunEvent::RunCompleted { status, .. }) => status.clone(),
+                _ => String::new(),
+            };
+            let message = match j.warnings().first().map(|e| &e.event) {
+                Some(RunEvent::Warning { context, message }) if context == ACCEPTED => {
+                    message.clone()
+                }
+                _ => String::new(),
+            };
+            (j.run_id.clone(), status, message)
+        };
+        journals.iter().map(said).collect()
+    }
+
+    /// `state accept` re-binds the row a run is refused for, journals it once, and stops with nothing changed for another column, a cdc export, an unknown export, an unresolved source or a live run.
+    #[test]
+    fn state_accept_keeps_the_cursor_and_journals_the_acceptance() {
+        let (dir, config_path) = setup_dir();
+        let url = "url: postgresql://localhost/testdb";
+        let by = |column: &str| -> std::collections::HashMap<String, String> {
+            [("cursor".to_string(), column.to_string())].into()
+        };
+        let key = |filter: &str, column: &str| {
+            write_accept_config(&config_path, url, filter);
+            let config = Config::load_with_params(&config_path, Some(&by(column))).unwrap();
+            let export = &config.exports[0];
+            let params = by(column);
+            crate::plan::build_plan(
+                &config,
+                export,
+                dir.path(),
+                false,
+                false,
+                false,
+                Some(&params),
+            )
+            .unwrap()
+            .progress_key()
+        };
+        let state = open_state(&dir);
+        let (wrote, edited) = (key("spent = 1", "id"), key("spent = 0", "id"));
+        state.update_with_column(&wrote, "10").unwrap();
+        // (the cursor, whether the first filter may claim it, whether the edited one may)
+        let row = |state: &StateStore| {
+            let cursor = state.get("orders", &wrote.source).unwrap();
+            (
+                cursor.last_cursor_value.unwrap_or_default(),
+                state.claim(wrote.clone()).is_ok(),
+                state.claim(edited.clone()).is_ok(),
+            )
+        };
+        let refused = ("10".to_string(), true, false);
+        for cycle in 1..=2 {
+            let err = state.claim(edited.clone()).err().expect("refused");
+            assert_eq!(
+                crate::error::error_code(&err),
+                Some("RIVET_STATE_CURSOR_STREAM_MISMATCH"),
+                "cycle {cycle}"
+            );
+        }
+
+        let stopped = |r: Result<()>, want: &str| {
+            let said = format!("{:#}", r.expect_err(want));
+            assert!(said.contains(want), "{said}");
+            assert_eq!(row(&state), refused, "{want}");
+            assert_eq!(acceptances(&state), [], "{want}");
+        };
+        stopped(
+            accept_state(&config_path, "orders", None),
+            "'${cursor}' in the config is unresolved",
+        );
+        stopped(
+            accept_state(&config_path, "ghost", Some(&by("id"))),
+            "export 'ghost' is not defined",
+        );
+        accept_state(&config_path, "changes", Some(&by("id"))).expect("a cdc export: no-op");
+        assert_eq!(row(&state), refused, "a cdc export has nothing to accept");
+        assert_eq!(state.recent_journals("changes", 10).unwrap().len(), 0);
+        stopped(
+            accept_state(&config_path, "orders", Some(&by("updated_at"))),
+            "the stored cursor `10` was written for `id`",
+        );
+        write_accept_config(&config_path, "url_env: RIVET_ACC_UNSET_URL", "spent = 0");
+        stopped(
+            accept_state(&config_path, "orders", Some(&by("id"))),
+            "the source did not resolve — nothing was changed",
+        );
+        write_accept_config(&config_path, url, "spent = 0");
+        let held = crate::pipeline::chunked::try_run_lease(&state, "orders")
+            .unwrap()
+            .expect("a live run's lease");
+        for _cycle in 1..=2 {
+            let refused = accept_state(&config_path, "orders", Some(&by("id")));
+            let err = refused.expect_err("an accept against a live run");
+            assert_eq!(
+                crate::error::error_code(&err),
+                Some("RIVET_STATE_RUN_IN_PROGRESS")
+            );
+            stopped(Err(err), "cannot accept its edited query");
+        }
+        drop(held);
+
+        accept_state(&config_path, "orders", Some(&by("id"))).unwrap();
+        assert_eq!(row(&state), ("10".to_string(), false, true));
+        let journaled = acceptances(&state);
+        let [(run_id, status, message)] = journaled.as_slice() else {
+            panic!("one acceptance is journaled: {journaled:?}");
+        };
+        assert!(run_id.starts_with("orders_accept_"), "{run_id}");
+        assert_eq!(status, "accepted");
+        assert_eq!(
+            message,
+            "stored progress (cursor `10`) written reading `orders (from ? where spent = 1)` is \
+             kept for `orders (from ? where spent = 0)` by `rivet state accept`"
+        );
+        accept_state(&config_path, "orders", Some(&by("id"))).unwrap();
+        assert_eq!(
+            acceptances(&state).len(),
+            1,
+            "an accept that changed nothing journals nothing"
+        );
+        let literal = std::fs::read_to_string(&config_path).unwrap();
+        std::fs::write(&config_path, literal.replace("${cursor}", "id")).unwrap();
+        assert!(show_journal(&config_path, "orders", 5, None).is_ok());
     }
 
     // ── reset_chunk_checkpoint ───────────────────────────────────────────────

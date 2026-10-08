@@ -14,6 +14,7 @@ This document contains the help content for the `rivet` command-line program.
 * [`rivet state`↴](#rivet-state)
 * [`rivet state show`↴](#rivet-state-show)
 * [`rivet state reset`↴](#rivet-state-reset)
+* [`rivet state accept`↴](#rivet-state-accept)
 * [`rivet state files`↴](#rivet-state-files)
 * [`rivet state reset-chunks`↴](#rivet-state-reset-chunks)
 * [`rivet state chunks`↴](#rivet-state-chunks)
@@ -207,6 +208,7 @@ Manage export state
 
 * `show` — Show current state for all exports
 * `reset` — Reset state for an export
+* `accept` — Keep the stored progress of an export whose query or source was edited on purpose
 * `files` — Show file manifest (files produced by exports)
 * `reset-chunks` — Clear persisted chunk checkpoint rows (`chunk_run` / `chunk_task`)
 * `chunks` — Show chunk checkpoint status for an export
@@ -241,6 +243,20 @@ Reset state for an export
 
 * `-c`, `--config <CONFIG>`
 * `-e`, `--export <EXPORT>` — Export name to reset
+
+
+
+## `rivet state accept`
+
+Keep the stored progress of an export whose query or source was edited on purpose
+
+**Usage:** `rivet state accept [OPTIONS] --config <CONFIG> --export <EXPORT>`
+
+###### **Options:**
+
+* `-c`, `--config <CONFIG>`
+* `-e`, `--export <EXPORT>` — Export whose stored progress is kept under what it reads now
+* `-p`, `--param <KEY=VALUE>` — Query parameter: key=value (repeatable), as passed to `rivet run`
 
 
 

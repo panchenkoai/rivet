@@ -10,14 +10,31 @@
     cursor: exit 0 and none of the rows the new filter admits below it. Now the run is refused
     with exit 5 `RIVET_STATE_CURSOR_STREAM_MISMATCH`, naming both queries, on every run.
     Restore the previous query to continue, or run
-    `rivet state reset -c <config> --export <name>` to deliver the new filter's rows in full.
-    A changed column list, letter case or layout is not an edit and continues; any other
-    change of the text after `FROM <table>` is one, including a `${param}` or environment
-    value that differs between runs.
+    `rivet state reset -c <config> --export <name>` to deliver the new filter's rows in full,
+    or run `rivet state accept -c <config> --export <name>` to keep the cursor under the new
+    query (see below). A changed column list, letter case or layout is not an edit and
+    continues; any other change of the text after `FROM <table>` is one, a renamed alias or
+    reordered predicates included.
+  - **A `${param}` value that changes between runs is not an edit.** The query is compared
+    as written, before `--param` and environment values are substituted, so
+    `WHERE region = '${region}'` run with another region continues from the stored cursor
+    with no refusal and no warning, as it did before this release. An edit of the text
+    around the placeholder is refused like any other. A `rivet plan` artifact sealed before
+    this release still applies, before or after a run of this release: it carries the
+    substituted query only, and a substituted query that fills the placeholders of the
+    stored one is the same rows.
+  - **New command `rivet state accept --config <PATH> --export <NAME> [--param KEY=VALUE]`.**
+    It answers the refusal above with "the edit is meant, go on from where the export was":
+    the stored progress of that one export is recorded as belonging to what the config reads
+    now, the cursor value is not touched, and the next run continues from it (rows of the
+    new query below the cursor are not delivered; `state reset` delivers them). It is given
+    per export and per edit; no setting accepts later edits. A cursor written for another
+    `cursor_column` is not accepted (`RIVET_STATE_CURSOR_OWNER_MISMATCH`). Each acceptance
+    is listed by `rivet journal` with status `accepted` and a line naming both queries.
   - **The same table under another PostgreSQL `search_path` is refused.** Before, a source
     URL that set `options=-c search_path=<schema>` moved an unqualified table to another
     schema under the cursor of the first: exit 0, zero rows. Now it is the same refusal with
-    the same two remedies. Qualifying the table by hand with the schema it was read through
+    the same three remedies. Qualifying the table by hand with the schema it was read through
     continues.
   - **`rivet state reset` clears one source.** Before, `state reset --export X` deleted the
     cursor of every export named `X` in the state database, so a same-named export of another

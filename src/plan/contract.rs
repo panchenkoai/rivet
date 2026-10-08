@@ -94,6 +94,9 @@ pub struct ResolvedRunPlan {
     pub source_table: Option<String>,
     /// Final query string (params substituted, query_file loaded).
     pub base_query: String,
+    /// `base_query` before `${...}` substitution, when the two differ: the rows part of the progress identity is read from it, so a value that changes between runs is not an edit. Absent from a plan with no placeholder and from one sealed before this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_template: Option<String>,
     /// This plan is one range sub-export UNIT of a `--pool --split` (#167). Such
     /// a unit shares its destination prefix with its N-1 siblings, so it must NOT
     /// write the prefix-level `_SUCCESS` itself (that would falsely mark the whole
@@ -253,7 +256,9 @@ impl ResolvedRunPlan {
             source: self.source.state_key(),
             stream: self.stream(),
             schema: self.source.search_path(),
-            population: crate::sql::row_set(&self.base_query),
+            population: crate::sql::row_set(
+                self.query_template.as_deref().unwrap_or(&self.base_query),
+            ),
             column: self.strategy.cursor_identity(),
             mode: self.strategy.mode_label(),
             continues_high_water: self.strategy.continues_stored_cursor(),

@@ -856,3 +856,41 @@ seeds:
         cells:
           - "lib:a_reset_clears_its_own_source_and_keeps_another_sources_cursor"
           - "lib:every_reset_is_refused_while_the_exports_run_lease_is_held"
+
+  - name: param-value-read-as-a-filter-edit
+    class: the rows part of a progress key is read from the query after `${param}` substitution, so another value of a placeholder between two runs is refused as an edited filter
+    history: "2026-10-08, owner decision on #493 - an incremental export whose `WHERE time_spent = ${spent}` ran with `--param spent=1` and then `--param spent=0` was refused with exit 5 RIVET_STATE_CURSOR_STREAM_MISMATCH on the PR's head 3dd6ade4; a value is the operator's to change"
+    scope: source
+    patch: param-value-read-as-a-filter-edit/shared.patch
+    engines:
+      postgres:
+        cells: [incremental_query_param_value_changes_between_runs_postgres]
+      mysql:
+        cells: [incremental_query_param_value_changes_between_runs_mysql]
+      mssql:
+        cells: [incremental_query_param_value_changes_between_runs_mssql]
+      mongo:
+        na: "a MongoDB export names a collection and has no `query:`, so no placeholder reaches the rows part of its key"
+      oracle:
+        cells: [incremental_query_param_value_changes_between_runs_oracle]
+      lib:
+        cells: ["lib:a_placeholder_value_is_not_part_of_the_progress_identity_and_the_query_text_is"]
+
+  - name: accepted-edit-not-recorded
+    class: "`rivet state accept` reports an edited query as accepted and leaves the stored progress bound to the query it was written reading, so the next run is refused as before"
+    history: "2026-10-08, owner decision on #493 - a refused edit that is meant had no way out that kept the cursor (`state accept` did not exist on the PR's head 3dd6ade4); seeded so the command cannot answer `Accepted` without re-binding the row"
+    scope: source
+    patch: accepted-edit-not-recorded/shared.patch
+    engines:
+      postgres:
+        cells: [incremental_query_cosmetic_edit_is_refused_until_accepted_postgres]
+      mysql:
+        cells: [incremental_query_cosmetic_edit_is_refused_until_accepted_mysql]
+      mssql:
+        cells: [incremental_query_cosmetic_edit_is_refused_until_accepted_mssql]
+      mongo:
+        na: "a MongoDB export has no `query:` to edit; its stream is its collection, and the accept path it shares is graded by the lib cell"
+      oracle:
+        cells: [incremental_query_cosmetic_edit_is_refused_until_accepted_oracle]
+      lib:
+        cells: ["lib:an_accepted_edit_keeps_the_cursor_under_what_the_export_reads_now"]

@@ -564,6 +564,17 @@ pub enum StateAction {
         #[arg(short, long)]
         export: String,
     },
+    /// Keep the stored progress of an export whose query or source was edited on purpose
+    Accept {
+        #[arg(short, long)]
+        config: String,
+        /// Export whose stored progress is kept under what it reads now
+        #[arg(short, long)]
+        export: String,
+        /// Query parameter: key=value (repeatable), as passed to `rivet run`
+        #[arg(short, long = "param", value_name = "KEY=VALUE")]
+        params: Vec<String>,
+    },
     /// Show file manifest (files produced by exports)
     Files {
         #[arg(short, long)]

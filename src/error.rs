@@ -482,7 +482,7 @@ pub mod codes {
     /// Stored progress (cursor, keyset high-water, resume anchor) belongs to another table or collection, another schema, or other rows of it.
     pub const STATE_CURSOR_STREAM_MISMATCH: Code = refusal(
         "RIVET_STATE_CURSOR_STREAM_MISMATCH",
-        "give each export that shares this state database its own name; if this export was edited (another table, another schema, another `query:` filter), restore what it read, or `rivet state reset -c <config> --export <name>` starts what it reads now with a full pass (it discards the progress that name holds on this source)",
+        "give each export that shares this state database its own name; if this export was edited (another table, another schema, another `query:` filter), restore what it read, or `rivet state reset -c <config> --export <name>` starts what it reads now with a full pass (it discards the progress that name holds on this source), or `rivet state accept -c <config> --export <name>` keeps the stored progress and records it as belonging to what the export reads now (rows of it below that progress are not delivered)",
     );
     /// An export met an unfinished checkpointed run it does not continue: another mode opened it, or its checkpoint setting is off now.
     pub const STATE_INTERRUPTED_RUN_OWNER_MISMATCH: Code = refusal(

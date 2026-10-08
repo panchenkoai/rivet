@@ -794,6 +794,14 @@ fn dispatch_state(action: StateAction) -> Result<()> {
     match action {
         StateAction::Show { config, json } => pipeline::show_state(&config, json),
         StateAction::Reset { config, export } => pipeline::reset_state(&config, &export),
+        StateAction::Accept {
+            config,
+            export,
+            params,
+        } => {
+            let p = parse_params(&params)?;
+            pipeline::accept_state(&config, &export, (!p.is_empty()).then_some(&p))
+        }
         StateAction::Files {
             config,
             export,

@@ -31,6 +31,30 @@ pub(super) fn streams_differ(stored: &str, now: &str) -> bool {
     !stored.is_empty() && !now.is_empty() && !qualifies(stored, now) && !qualifies(now, stored)
 }
 
+/// Whether two recorded row sets are one: the same text, or a query as written and a substituted query that fills its `${...}` placeholders (what a plan sealed before templates were recorded carries).
+fn same_rows(a: &str, b: &str) -> bool {
+    a == b || fills(a, b) || fills(b, a)
+}
+
+/// Whether `text` holds no placeholder and is `template` with each of its placeholders replaced by some text.
+fn fills(template: &str, text: &str) -> bool {
+    let around = crate::config::literal_parts;
+    let (Some(parts), None) = (around(template), around(text)) else {
+        return false;
+    };
+    let (first, last) = (&parts[0], &parts[parts.len() - 1]);
+    let between = text.strip_prefix(first.as_str());
+    let Some(between) = between.and_then(|t| t.strip_suffix(last.as_str())) else {
+        return false;
+    };
+    let mut inner = parts[1..parts.len() - 1].iter();
+    inner
+        .try_fold(between, |rest, part| {
+            rest.find(part.as_str()).map(|at| &rest[at + part.len()..])
+        })
+        .is_some()
+}
+
 /// `stream` as the source resolves it: an unqualified name under a one-schema `search_path` is that schema's.
 fn resolved(stream: &str, schema: &str) -> String {
     let unresolved = stream.is_empty() || stream.contains('.');
@@ -72,9 +96,31 @@ impl StoredStream {
         let rows = |population: &str| format!("{now} ({population})");
         self.population
             .as_ref()
-            .filter(|was| !key.population.is_empty() && **was != key.population)
+            .filter(|was| !key.population.is_empty() && !same_rows(was, &key.population))
             .map(|was| (rows(was), rows(&key.population)))
     }
+}
+
+/// What the row of a progress key holds: the run it is anchored on with that run's owner, and the progress a run of the key would continue from (worded) with the stream it was written reading.
+#[derive(Default)]
+struct StoredProgress {
+    anchor: Option<(String, String)>,
+    held: Option<(String, StoredStream)>,
+}
+
+/// What `rivet state accept` found on the row of a progress key.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Accepted {
+    /// The row holds no progress a run of the key would continue from.
+    NoProgress,
+    /// The progress already belongs to what the key reads.
+    Unchanged,
+    /// The progress `held` was re-bound from the stream `was` to the stream `now`.
+    Rebound {
+        held: String,
+        was: String,
+        now: String,
+    },
 }
 
 /// The progress a run would continue from, worded for a message: an interrupted run's anchor, else the cursor a clean run seeks from.
@@ -361,52 +407,56 @@ impl StateStore {
         Ok(state)
     }
 
-    /// Claim the stored progress of `key`: refuse progress stored for another stream (relation, schema or rows); adopt a row written before a part was recorded, or under another spelling of the source.
-    pub fn claim(&self, key: ProgressKey) -> Result<ProgressClaim<'_>> {
-        let (export_name, scope, stream) = (&key.export_name, &key.source, &key.stream);
-        self.adopt_respelled_source(export_name, scope)?;
+    /// What the row a claim of `key` selects holds.
+    fn stored_progress(&self, key: &ProgressKey) -> Result<StoredProgress> {
         let row = self.query_opt(
             "SELECT stream, last_cursor_value, resume_run_id, resume_owner, source_schema, \
              population FROM export_state \
              WHERE export_name = ?1 AND (prefix = ?2 OR prefix = '') \
              ORDER BY prefix DESC LIMIT 1",
-            &[export_name.as_str().into(), scope.as_str().into()],
+            &[key.export_name.as_str().into(), key.source.as_str().into()],
             |r| {
                 (
-                    (r.opt_text(0), r.opt_text(1), r.opt_text(2), r.opt_text(3)),
-                    (r.opt_text(4), r.opt_text(5)),
+                    (r.opt_text(0), r.opt_text(4), r.opt_text(5)),
+                    (r.opt_text(1), r.opt_text(2), r.opt_text(3)),
                 )
             },
         )?;
-        let (row, rest) = row.unzip();
-        let (stored_schema, stored_population) = rest.unwrap_or_default();
-        let anchor = match &row {
-            Some((_, _, Some(run), owner)) => {
-                Some((run.as_str(), owner.as_deref().unwrap_or(KEYSET)))
-            }
-            _ => None,
+        let Some(((stream, schema, population), (cursor, run, owner))) = row else {
+            return Ok(StoredProgress::default());
         };
+        let anchor = run.map(|run| (run, owner.unwrap_or_else(|| KEYSET.to_string())));
+        let resumed = anchor.as_ref().filter(|(_, owner)| owner != CHUNKED);
+        let held = held_progress(
+            cursor.as_deref(),
+            resumed.map(|(run, _)| run.as_str()),
+            key.continues_high_water,
+        );
+        let stored = StoredStream {
+            stream,
+            schema,
+            population,
+        };
+        Ok(StoredProgress {
+            anchor,
+            held: held.map(|held| (held, stored)),
+        })
+    }
+
+    /// Claim the stored progress of `key`: refuse progress stored for another stream (relation, schema or rows); adopt a row written before a part was recorded, or under another spelling of the source.
+    pub fn claim(&self, key: ProgressKey) -> Result<ProgressClaim<'_>> {
+        let (export_name, scope, stream) = (&key.export_name, &key.source, &key.stream);
+        self.adopt_respelled_source(export_name, scope)?;
+        let StoredProgress { anchor, held } = self.stored_progress(&key)?;
+        let anchor = anchor
+            .as_ref()
+            .map(|(run, owner)| (run.as_str(), owner.as_str()));
         self.refuse_unfinished_run(&key, anchor)?;
         if let Some((run, _)) = anchor {
             self.own_anchor(&key, run)?;
         }
-        let owner = anchor.map(|(_, owner)| owner);
-        let chunk_anchor = owner == Some(CHUNKED);
-        let held = row.clone().and_then(|(stored, cursor, anchor, _)| {
-            held_progress(
-                cursor.as_deref(),
-                anchor.as_deref().filter(|_| !chunk_anchor),
-                key.continues_high_water,
-            )
-            .map(|held| (stored, held))
-        });
-        let Some((stored, held)) = held else {
+        let Some((held, stored)) = held else {
             return Ok(ProgressClaim { state: self, key });
-        };
-        let stored = StoredStream {
-            stream: stored,
-            schema: stored_schema,
-            population: stored_population,
         };
         if let Some((was, now)) = stored.another_than(&key) {
             crate::rivet_bail!(
@@ -419,7 +469,9 @@ impl StateStore {
                  continue from the stored progress, or \
                  `rivet state reset -c <config> --export {export_name}` starts `{now}` over \
                  with a full pass — it discards the progress '{export_name}' holds on this \
-                 source."
+                 source. If the edit is meant and the export should go on from that progress, \
+                 `rivet state accept -c <config> --export {export_name}` keeps it and records \
+                 it as belonging to `{now}` — rows of `{now}` below it are not delivered."
             );
         }
         let unrecorded = [
@@ -727,6 +779,33 @@ impl StateStore {
         )?;
         self.delete_progression(export_name)?;
         Ok(())
+    }
+
+    /// Re-bind the stored progress of `key` to the stream, schema and rows it reads now, on the operator's word: the cursor value, its column and any anchor stay. Refused for a cursor written for another column; changes a row only where a run of `key` is refused for its stream.
+    pub fn accept(&self, key: &ProgressKey) -> Result<Accepted> {
+        let (export_name, scope) = (key.export_name.as_str(), key.source.as_str());
+        self.claim_legacy_row(export_name, scope)?;
+        let Some((held, stored)) = self.stored_progress(key)?.held else {
+            return Ok(Accepted::NoProgress);
+        };
+        if let Some(column) = &key.column {
+            self.get_owned(export_name, scope, column)?;
+        }
+        let Some((was, now)) = stored.another_than(key) else {
+            return Ok(Accepted::Unchanged);
+        };
+        self.execute(
+            "UPDATE export_state SET stream = ?3, source_schema = ?4, population = ?5 \
+             WHERE export_name = ?1 AND prefix = ?2",
+            &[
+                export_name.into(),
+                scope.into(),
+                key.stream.as_str().into(),
+                key.schema.as_str().into(),
+                key.population.as_str().into(),
+            ],
+        )?;
+        Ok(Accepted::Rebound { held, was, now })
     }
 
     pub fn list_all(&self) -> Result<Vec<CursorState>> {
@@ -1634,6 +1713,225 @@ mod tests {
         s.reset("orders", "pg/db").unwrap();
         let fresh = s.claim(edits[0].0.clone()).expect("after the reset");
         assert_eq!(fresh.cursor().unwrap().last_cursor_value, None);
+    }
+
+    /// A query as written and a substituted query that fills its placeholders are one row set; two templates, or two substituted queries, are one only when equal.
+    #[test]
+    fn a_substituted_query_is_the_rows_of_the_template_it_fills() {
+        let written = "from ? where region = '${region}' and day >= ${from} order by id";
+        let filled = "from ? where region = 'eu' and day >= 20 order by id";
+        for (a, b, same) in [
+            (written, filled, true),
+            (written, written, true),
+            (filled, filled, true),
+            (written, "from ? where region = 'eu' and day >= 20", false),
+            (written, "from ? where region = 'eu' order by id", false),
+            (
+                written,
+                "from ? where day >= 20 and region = 'eu' order by id",
+                false,
+            ),
+            (
+                written,
+                "x from ? where region = 'eu' and day >= 20 order by id",
+                false,
+            ),
+            (
+                filled,
+                "from ? where region = 'us' and day >= 20 order by id",
+                false,
+            ),
+            (
+                "from ? where a = ${x}",
+                "from ? where a = ${x} and id > 0",
+                false,
+            ),
+            ("from ? where a = ${x}", "from ? where a = ${y}", false),
+            ("from ? where ${f}", "from ? where anything at all", true),
+            ("a${x}a", "a", false),
+            ("a${x}a", "aa", true),
+            ("${x} and ${y}", "1 and 2 and 3", true),
+            ("${x} or ${y}", "1 and 2", false),
+        ] {
+            assert_eq!(same_rows(a, b), same, "{a} / {b}");
+            assert_eq!(same_rows(b, a), same, "{b} / {a}");
+        }
+    }
+
+    /// A plan sealed before templates were recorded carries the substituted query: it continues progress stored under the template, and the template continues progress it stored.
+    #[test]
+    fn a_plan_sealed_with_its_values_substituted_and_a_template_continue_each_other() {
+        let written = "from ? where spent = ${spent}";
+        for (stored, now) in [(written, SPENT_1), (SPENT_1, written), (written, SPENT_0)] {
+            let s = store();
+            s.update_with_column(&reading("orders", "", stored), "10")
+                .unwrap();
+            let claim = s.claim(reading("orders", "", now)).expect("one row set");
+            assert_eq!(
+                claim.cursor().unwrap().last_cursor_value.as_deref(),
+                Some("10")
+            );
+            assert_eq!(
+                s.accept(&reading("orders", "", now)).unwrap(),
+                Accepted::Unchanged
+            );
+        }
+        let s = store();
+        s.update_with_column(&reading("orders", "", written), "10")
+            .unwrap();
+        for edited in [
+            "from ? where spent = ${spent} and id > 0",
+            "from ? where paid = 1",
+        ] {
+            refusal(
+                s.claim(reading("orders", "", edited)),
+                "RIVET_STATE_CURSOR_STREAM_MISMATCH",
+            );
+        }
+    }
+
+    /// The stream parts and the cursor the one `export_state` row holds.
+    fn bound(s: &StateStore) -> Vec<String> {
+        let parts =
+            "stream || '|' || source_schema || '|' || population || '|' || last_cursor_value";
+        column(s, &format!("SELECT {parts} FROM export_state"))
+    }
+
+    /// `state accept` keeps the cursor under the edited stream: refused twice before, continued twice after, and the row it left is refused for the stream it had.
+    #[test]
+    fn an_accepted_edit_keeps_the_cursor_under_what_the_export_reads_now() {
+        for (edited, now) in [
+            (
+                reading("orders", "", SPENT_0),
+                format!("orders ({SPENT_0})"),
+            ),
+            (
+                reading("orders", "sales", SPENT_1),
+                "orders under search_path sales".to_string(),
+            ),
+            (reading("orders_b", "", SPENT_1), "orders_b".to_string()),
+        ] {
+            let s = store();
+            let wrote = reading("orders", "", SPENT_1);
+            s.update_with_column(&wrote, "10").unwrap();
+            for cycle in 1..=2 {
+                let said = refusal(
+                    s.claim(edited.clone()),
+                    "RIVET_STATE_CURSOR_STREAM_MISMATCH",
+                );
+                let accept = format!(
+                    "If the edit is meant and the export should go on from that progress, \
+                     `rivet state accept -c <config> --export orders` keeps it and records it as \
+                     belonging to `{now}` — rows of `{now}` below it are not delivered."
+                );
+                assert!(said.ends_with(&accept), "cycle {cycle}: {said}");
+            }
+            let other_export = ProgressKey {
+                export_name: "customers".into(),
+                ..edited.clone()
+            };
+            assert_eq!(s.accept(&other_export).unwrap(), Accepted::NoProgress);
+            refusal(
+                s.claim(edited.clone()),
+                "RIVET_STATE_CURSOR_STREAM_MISMATCH",
+            );
+
+            let Accepted::Rebound { held, was, now: is } = s.accept(&edited).unwrap() else {
+                panic!("the edit is accepted");
+            };
+            assert_eq!(held, "cursor `10`");
+            assert!(was.starts_with("orders"), "{was}");
+            assert_eq!(is, now);
+            assert_eq!(
+                bound(&s),
+                [format!(
+                    "{}|{}|{}|10",
+                    edited.stream, edited.schema, edited.population
+                )],
+                "the row names what the export reads now and keeps its cursor"
+            );
+            for cycle in 1..=2 {
+                let claim = s.claim(edited.clone());
+                let cursor = claim.expect("accepted").cursor().unwrap();
+                assert_eq!(
+                    cursor.last_cursor_value.as_deref(),
+                    Some("10"),
+                    "cycle {cycle}"
+                );
+                assert_eq!(cursor.cursor_column.as_deref(), Some("id"));
+            }
+            assert_eq!(s.accept(&edited).unwrap(), Accepted::Unchanged);
+            refusal(s.claim(wrote), "RIVET_STATE_CURSOR_STREAM_MISMATCH");
+        }
+    }
+
+    /// `state accept` changes nothing where a run is not refused for its stream, and refuses a cursor written for another column.
+    #[test]
+    fn an_acceptance_rebinds_only_progress_a_run_is_refused_for() {
+        let s = store();
+        let wrote = reading("orders", "", SPENT_1);
+        assert_eq!(s.accept(&wrote).unwrap(), Accepted::NoProgress, "no row");
+        s.update_with_column(&wrote, "10").unwrap();
+        let before = bound(&s);
+        assert_eq!(s.accept(&wrote).unwrap(), Accepted::Unchanged);
+
+        let full = ProgressKey {
+            continues_high_water: false,
+            ..reading("orders", "", SPENT_0)
+        };
+        assert!(
+            s.claim(full.clone()).is_ok(),
+            "a full pass seeks from no cursor"
+        );
+        assert_eq!(s.accept(&full).unwrap(), Accepted::NoProgress);
+
+        let other_column = ProgressKey {
+            column: Some("updated_at".into()),
+            ..reading("orders", "", SPENT_0)
+        };
+        for cycle in 1..=2 {
+            let said = refusal(s.accept(&other_column), "RIVET_STATE_CURSOR_OWNER_MISMATCH");
+            assert!(
+                said.contains("was written for `id`"),
+                "cycle {cycle}: {said}"
+            );
+        }
+        assert_eq!(bound(&s), before, "nothing above changed the row");
+
+        s.execute(
+            "UPDATE export_state SET prefix = '', stream = NULL, source_schema = NULL, population = NULL",
+            &[],
+        )
+        .unwrap();
+        let edited = reading("orders", "", SPENT_0);
+        assert_eq!(
+            s.accept(&edited).unwrap(),
+            Accepted::Unchanged,
+            "a row written before streams were recorded is adopted by the next run, not accepted"
+        );
+        assert_eq!(scopes(&s), ["pg/db"], "the accept claimed the legacy row");
+    }
+
+    /// An acceptance keeps an interrupted run's anchor as it keeps a cursor.
+    #[test]
+    fn an_accepted_edit_keeps_an_interrupted_runs_anchor() {
+        let s = store();
+        let keyset = |population: &str| ProgressKey {
+            population: population.into(),
+            continues_high_water: false,
+            ..key("orders", "pg/db", "id", "orders")
+        };
+        s.set_resume_run_id(&keyset(SPENT_1), "run_7").unwrap();
+        refusal(
+            s.claim(keyset(SPENT_0)),
+            "RIVET_STATE_CURSOR_STREAM_MISMATCH",
+        );
+        let Accepted::Rebound { held, .. } = s.accept(&keyset(SPENT_0)).unwrap() else {
+            panic!("the edit is accepted");
+        };
+        assert_eq!(held, "interrupted run run_7");
+        let claim = s.claim(keyset(SPENT_0)).expect("accepted");
+        assert_eq!(claim.resume_run_id().unwrap().as_deref(), Some("run_7"));
     }
 
     /// A name read through a one-schema search_path is that schema's table: qualifying it by hand continues, another schema's is refused.
