@@ -1035,6 +1035,49 @@ mod tests {
         );
     }
 
+    /// A source whose key spans 1..=230, with no NULL key and no column to drift.
+    struct KeysTo230;
+
+    impl crate::source::Source for KeysTo230 {
+        fn export(
+            &mut self,
+            _request: &crate::source::ExportRequest<'_>,
+            _sink: &mut dyn crate::source::BatchSink,
+        ) -> Result<()> {
+            unreachable!("planning reads no rows")
+        }
+        fn query_scalar(&mut self, sql: &str) -> Result<Option<String>> {
+            let sql = sql.to_lowercase();
+            let bound = [("min(", "1"), ("max(", "230")];
+            let asked = bound.iter().find(|(f, _)| sql.contains(f));
+            Ok(asked
+                .filter(|_| !sql.contains("is null"))
+                .map(|(_, v)| v.to_string()))
+        }
+        fn type_mappings(
+            &mut self,
+            _query: &str,
+            _overrides: &crate::types::ColumnOverrides,
+        ) -> Result<Vec<crate::types::TypeMapping>> {
+            Ok(vec![])
+        }
+    }
+
+    #[test]
+    fn a_resume_detects_the_key_span_again_and_a_sealed_plan_plans_nothing() {
+        let state = StateStore::open_in_memory().unwrap();
+        let plan = make_plan("orders");
+        let mut summary = make_summary(&plan, "run-1");
+        let mut planned = |source: &ChunkSource| {
+            resumed_chunk_plan(&mut KeysTo230, &plan, &state, &mut summary, source).unwrap()
+        };
+        assert_eq!(
+            planned(&ChunkSource::Detect),
+            vec![(1, 100), (101, 200), (201, 230)]
+        );
+        assert_eq!(planned(&ChunkSource::Precomputed(vec![(1, 100)])), vec![]);
+    }
+
     /// A resume hands the keys the source holds past the stored plan to new tasks, and a sealed plan keeps its tasks.
     #[test]
     fn a_resume_extends_the_stored_plan_to_the_ranges_detected_now() {

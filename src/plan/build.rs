@@ -1098,6 +1098,26 @@ mod tests {
         );
     }
 
+    /// A destination spelled through `${VAR}` enters the progress identity by its value: another value is another destination.
+    #[test]
+    fn a_destination_from_a_variable_enters_the_progress_identity_by_its_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rivet.yaml");
+        let yaml = "source:\n  type: postgres\n  url: \"postgresql://localhost/test\"\nexports:\n\
+                    \x20 - name: orders\n    table: orders\n    mode: incremental\n    cursor_column: id\n\
+                    \x20   format: parquet\n    destination: { type: local, path: \"${out}/orders\" }\n";
+        std::fs::write(&path, yaml).unwrap();
+        let delivered_to = |out: &str| {
+            let params = HashMap::from([("out".to_string(), out.to_string())]);
+            let config = Config::load_with_params(path.to_str().unwrap(), Some(&params)).unwrap();
+            let export = &config.exports[0];
+            let plan = build_plan(&config, export, dir.path(), false, false, false, None);
+            plan.expect("plan").progress_key().landing.destination
+        };
+        assert_eq!(delivered_to("/a"), "file:///a/orders");
+        assert_eq!(delivered_to("/b"), "file:///b/orders");
+    }
+
     /// The rows part of the progress identity is the query as written: a placeholder's value is not part of it, the text around it is.
     #[test]
     fn a_placeholder_value_is_not_part_of_the_progress_identity_and_the_query_text_is() {
