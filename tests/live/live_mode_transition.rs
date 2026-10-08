@@ -1015,7 +1015,7 @@ fn stream_query_repoint(engine: SqlEngine) {
 
     engine.insert(&a, 111..=113, 160, Some(10));
     let wider = rig.query(&format!(
-        "SELECT id, ext_id, server_time, time_spent FROM {a} WHERE id > 0"
+        "select id, ext_id, server_time, time_spent   from {a}"
     ));
     let wider = continued(staged_for(engine, wider, &stage, dirs[1].path()));
     wider.run_ok();
