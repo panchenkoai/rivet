@@ -72,7 +72,7 @@ def verdict_counts(text: str) -> Counter:
 
 
 #: Reads repeated in one lane after the reader crashed in native code (tests/common/verify.rs); more means the reader is broken, not unlucky.
-RERUN_CEILING = 3
+RERUN_CEILING = 3  # ratchet-pin: rig-oracle-rerun
 
 #: The verdicts that grade a deferred run's remainder: the stream's next run compared with the source.
 GRADED = ("PASS", "FAIL", "XFAIL", "PARTIAL")
