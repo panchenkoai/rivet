@@ -260,48 +260,51 @@ impl Drop for ReadOnlyState {
     }
 }
 
-/// An incremental export of ids `1..=10` that has run once, then three more source rows.
+/// The environment that keeps a cell's state in SQLite beside the config, whichever backend the gate grades.
+const SQLITE_STATE: &[(&str, &str)] = &[("RIVET_STATE_URL", "")];
+
+/// Run `rig` once on the SQLite state; panic unless it succeeds.
+fn first_run_on_sqlite(rig: &Rig) {
+    let out = rig.run_with_envs(SQLITE_STATE);
+    assert!(
+        out.status.success(),
+        "fixture: the first run succeeds\n{}",
+        text(&out)
+    );
+}
+
+/// An incremental export of ids `1..=10` that has run once on the SQLite state, then three more source rows.
 fn incremental_with_a_pending_delta(engine: SqlEngine, tag: &str) -> (Rig, Box<dyn std::any::Any>) {
     let (table, guard) = id_v_table(engine, tag, 10);
     let rig = engine
         .rig(&table)
         .mode("incremental")
         .export_line("cursor_column: id");
-    rig.run_ok();
+    first_run_on_sqlite(&rig);
     insert_ids(engine, &table, 11..=13);
     (rig, guard)
 }
 
 /// RESULTS 3: a run over a state it cannot write is refused before it exports, and runs once the state is writable.
 fn read_only_state(engine: SqlEngine) {
-    if state_url_under_test().is_some() {
-        return skip_live(
-            "a read-only SQLite state file; this pass grades Postgres state (RIVET_GATE_STATE_URL)",
-        );
-    }
     let (rig, _guard) = incremental_with_a_pending_delta(engine, "oc_rostate");
     read_only_state_on(rig);
 }
 
 /// RESULTS 3 on MongoDB: a `full` export that has run once, over a state it can no longer write.
 fn mongo_read_only_state() {
-    if state_url_under_test().is_some() {
-        return skip_live(
-            "a read-only SQLite state file; this pass grades Postgres state (RIVET_GATE_STATE_URL)",
-        );
-    }
     let (url, _m, _guard) = mongo_db("oc_rostate", ROWS);
     let rig = Rig::mongo_batch("t").source_url(&url);
-    rig.run_ok();
+    first_run_on_sqlite(&rig);
     read_only_state_on(rig);
 }
 
-/// `rig` has run once: lock its state, refuse twice, unlock, deliver.
+/// `rig` has run once on the SQLite state: lock it, refuse twice, unlock, deliver.
 fn read_only_state_on(mut rig: Rig) {
     let locked = ReadOnlyState::beside(&rig.config_path());
     rig.refuses_twice_then(
         &["run"],
-        &[],
+        SQLITE_STATE,
         Refused::by_code("RIVET_STATE_NOT_WRITABLE", 1),
         vec![Remedy::new(
             "Make the state database writable and run again.",
@@ -313,11 +316,6 @@ fn read_only_state_on(mut rig: Rig) {
 
 /// RESULTS 3 (the write after the manifest): a run whose cursor write fails delivers its rows and does not exit 0.
 fn cursor_write_fails(engine: SqlEngine) {
-    if state_url_under_test().is_some() {
-        return skip_live(
-            "a SQLite trigger on export_state; this pass grades Postgres state (RIVET_GATE_STATE_URL)",
-        );
-    }
     let (rig, _guard) = incremental_with_a_pending_delta(engine, "oc_nocursor");
     let rig = rig.a_failed_run_may_leave(
         &[Leftover::DeliveredRun],
@@ -345,7 +343,7 @@ fn cursor_write_fails(engine: SqlEngine) {
              BEGIN SELECT RAISE(ABORT, 'export_state is frozen'); END;",
         )
         .expect("freeze export_state");
-    let out = rig.run();
+    let out = rig.run_with_envs(SQLITE_STATE);
     assert_refused(&out, Refused::by_code("RIVET_STATE_CURSOR_NOT_STORED", 1));
     assert!(
         text(&out).contains("export_state is frozen"),

@@ -576,6 +576,9 @@ seeds:
         cells: [a_run_over_a_read_only_state_is_refused_and_runs_once_it_is_writable_mongo]
       oracle:
         cells: [a_run_over_a_read_only_state_is_refused_and_runs_once_it_is_writable_oracle]
+      lib:
+        cells:
+          - "lib:a_state_that_refuses_the_first_write_refuses_the_run_before_the_ledger_row"
 
   - name: unstored-cursor-exits-zero
     class: an incremental cursor write that fails after the manifest is written is logged and the run exits 0

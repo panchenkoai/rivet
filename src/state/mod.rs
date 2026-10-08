@@ -202,10 +202,13 @@ pub(crate) fn open_connection(db_path: &std::path::Path) -> Result<Connection> {
     Ok(conn)
 }
 
-/// `url` when it names the PostgreSQL state backend; any other `RIVET_STATE_URL` is refused, never replaced by SQLite.
-fn postgres_state_url(url: &str) -> Result<&str> {
+/// The PostgreSQL URL a `RIVET_STATE_URL` value names, `None` for an empty one (SQLite); any other value is refused, never replaced by SQLite.
+fn postgres_state_url(url: &str) -> Result<Option<&str>> {
+    if url.is_empty() {
+        return Ok(None);
+    }
     if url.starts_with("postgres://") || url.starts_with("postgresql://") {
-        return Ok(url);
+        return Ok(Some(url));
     }
     let is_scheme = |s: &str| {
         !s.is_empty()
@@ -260,9 +263,9 @@ impl StateStore {
     /// `RIVET_STATE_URL` when it is set, else SQLite next to `config_path`.
     pub fn open(config_path: &str) -> Result<Self> {
         if let Ok(url) = std::env::var("RIVET_STATE_URL")
-            && !url.is_empty()
+            && let Some(url) = postgres_state_url(&url)?
         {
-            return Self::open_postgres(postgres_state_url(&url)?);
+            return Self::open_postgres(url);
         }
         Self::open_sqlite(config_path)
     }
@@ -472,10 +475,11 @@ mod state_url_guard {
     use super::*;
 
     #[test]
-    fn a_postgres_url_in_either_spelling_is_the_postgres_backend() {
+    fn a_postgres_url_in_either_spelling_is_the_postgres_backend_and_an_empty_one_is_sqlite() {
         for url in ["postgres://u:p@h:5432/s", "postgresql://u:p@h/s"] {
-            assert_eq!(postgres_state_url(url).unwrap(), url);
+            assert_eq!(postgres_state_url(url).unwrap(), Some(url));
         }
+        assert_eq!(postgres_state_url("").unwrap(), None);
     }
 
     #[test]
