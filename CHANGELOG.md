@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- **Breaking (file names): a single-runner part is named after its run, with the process id
+  appended.** Applies to `mode: full`, `mode: incremental` and time-window exports that are
+  not chunked, on every source engine, and to MongoDB `parallel` exports.
+  - Before: `orders_20261008_174122_776.parquet` (the UTC millisecond the read ended). Two
+    `rivet run` of one export that ended their read in the same millisecond wrote the same
+    name; the second file replaced the first, both runs exited 0, and both manifests,
+    `file_log` and `export_metrics` counted the one file (two runs of a 200-row table:
+    400 rows recorded over one 200-row file).
+  - Now: `orders_20261008_174117_653_33972.parquet`, that is
+    `<export>_<YYYYMMDD>_<HHMMSS>_<mmm>_<pid>[_partN].<format>`: the stamp is the run's own id
+    (the UTC millisecond it started and its process id), so no two runs write one name. A
+    MongoDB `parallel` part is `<export>_<YYYYMMDD>_<HHMMSS>_<mmm>_<pid>_w<worker>_keyset<page>.<format>`.
+  - What to change: a consumer that matches part names with a pattern anchored after the
+    millisecond field (`orders_\d{8}_\d{6}_\d{3}\.parquet`) must allow the `_<pid>` field.
+    `orders_*.parquet` and a date prefix (`orders_20261008_*`) match as before, and names
+    still sort by time across the upgrade. Take part names from `manifest.json` rather than
+    from a pattern.
+  - Nothing else moves: no state or manifest format change. Parts written by earlier
+    releases keep their names and are read, validated and loaded as before, and a prefix may
+    hold both shapes. Chunked, keyset and CDC part names are unchanged (they were already
+    unique per run).
+
 - **Breaking: stored progress belongs to one source, one table and one set of rows, and a run
   that reads another is refused.** Applies to `incremental`, keyset (`chunk_by_key`) and
   MongoDB `resume` exports on every source engine, and to `rivet state reset`.

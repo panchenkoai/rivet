@@ -126,8 +126,9 @@ _RUNID_RE = re.compile(rb"[0-9]{8}T[0-9]{6}\.[0-9]+(?:_[0-9]+)?")
 # data-loss fix, so the suffix is here to stay. It must be erased WITH the
 # timestamp, not left dangling: `_064` differs on every run, so a baseline
 # blessed with it would fail on the very next one. Optional, because the
-# chunked/keyset writers stamp differently.
-_TS_RE = re.compile(rb"[0-9]{8}_[0-9]{6}(?:_[0-9]{3})?")
+# chunked/keyset writers stamp differently. The single runner's stamp also ends
+# with the pid of its run id, erased with it for the same reason.
+_TS_RE = re.compile(rb"[0-9]{8}_[0-9]{6}(?:_[0-9]{3}(?:_[0-9]+)?)?")
 # The CHUNK nonce, erased while the chunk NUMBER is kept — the number is the
 # contract `p03` pins, the nonce is `rand::rng().random::<u64>()` formatted
 # `{:016x}` (src/pipeline/chunked/mod.rs::chunk_part_filename), so it differs on

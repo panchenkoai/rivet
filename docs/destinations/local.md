@@ -17,10 +17,10 @@ Rivet creates the directory if it does not exist.
 Files are named automatically:
 
 ```
-{export_name}_{YYYYMMDD}_{HHMMSS}_{mmm}.{format}
+{export_name}_{YYYYMMDD}_{HHMMSS}_{mmm}_{pid}.{format}
 ```
 
-The trailing `_mmm` is milliseconds, added so two runs in the same second never overwrite each other.
+The trailing `_{pid}` is the id of the process that ran the export and `{YYYYMMDD}_{HHMMSS}_{mmm}` the UTC millisecond the run started (both taken from its run id), so two runs never write one file name, even when they start in the same millisecond.
 
 Examples:
 - `users_daily_20260406_120000_123.parquet`
@@ -45,7 +45,7 @@ exports:
       path: ./output
 ```
 
-Parts are named: `big_table_20260406_120000_123_part0.parquet`, `..._part1.parquet`, etc. (unpadded part index; the timestamp includes a millisecond field).
+Parts are named: `big_table_20260406_120000_123_4711_part0.parquet`, `..._part1.parquet`, etc. (unpadded part index; the stamp is the run's start millisecond and process id).
 
 Accepted size suffixes: `KB`, `MB`, `GB` (case-insensitive).
 

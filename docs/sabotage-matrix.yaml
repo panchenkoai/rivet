@@ -593,12 +593,12 @@ scenarios:
     oracle:   { gap: "an open defect on PostgreSQL, MySQL and SQL Server; the Oracle cell is not written, because no stand that runs `open_defect_` cells has Oracle within reach of the machine this row was built on (CI skips them), so its first failing line could not be read" }
 
   - id: beside_run_same_instant
-    what: "two runs of one single-runner export (`mode: full` or `incremental`) that name their part in the same millisecond"
-    postgres: { gap: "seen 2 of 10 times on the stand (PostgreSQL once, MySQL once) while the beside_run_incremental cell still started its second run at once: `rig oracle: COUNTER: this run's Success manifests declare 400 rows, their parts hold 200`; the two runs (run ids 8 ms apart) wrote one part name, so one file is declared by both success manifests and counted twice by export_metrics and file_log, while the destination holds each row once; it cannot be forced from outside rivet (it needs a pause before the part is named), so it is not a cell, and that cell now starts its second run 700 ms in" }
-    mysql:    { na: "the part name is the single runner's (src/pipeline/single.rs), whatever the source engine: the postgres column carries the row" }
-    mssql:    { na: "the part name is the single runner's (src/pipeline/single.rs), whatever the source engine: the postgres column carries the row" }
-    mongo:    { na: "the part name is the single runner's (src/pipeline/single.rs), whatever the source engine: the postgres column carries the row" }
-    oracle:   { na: "the part name is the single runner's (src/pipeline/single.rs), whatever the source engine: the postgres column carries the row" }
+    what: "runs of one unthrottled single-runner export (`mode: incremental`; `full` names its part through the same function) started together, in rounds on a fresh state and destination: each delivers or refuses by code, no part is declared by two runs, every part is named `<export>_<yyyymmdd>_<hhmmss>_<mmm>_<pid>` after the run that declares it, and a run then delivers the source and `validate` passes. Before the part was named after its run, two runs that ended their read in one millisecond wrote one file name (`rig oracle: COUNTER: this run's Success manifests declare 1600 rows, their parts hold 600`)"
+    postgres: { test: incremental_runs_started_together_each_declare_their_own_part_postgres }
+    mysql:    { test: incremental_runs_started_together_each_declare_their_own_part_mysql }
+    mssql:    { test: incremental_runs_started_together_each_declare_their_own_part_mssql }
+    mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED); its parts are stamped by the same `run_scoped_stamp` (src/pipeline/summary.rs) as the SQL columns' cells, which carry the row" }
+    oracle:   { test: incremental_runs_started_together_each_declare_their_own_part_oracle }
 
   - id: beside_run_range_checkpoint
     what: "a second `rivet run` beside a live checkpointed one (RESULTS 11 of docs/operator-contract-matrix.yaml, cited here)"

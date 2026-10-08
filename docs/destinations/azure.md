@@ -175,12 +175,13 @@ access scoped to one container and time window.
 Files are uploaded as:
 
 ```
-az://{container}/{prefix}{export_name}_{YYYYMMDD}_{HHMMSS}_{mmm}.{format}
+az://{container}/{prefix}{export_name}_{YYYYMMDD}_{HHMMSS}_{mmm}_{pid}.{format}
 ```
 
-This is the single (non-chunked, non-keyset) runner's naming: the
-timestamp carries millisecond precision, and its size-split parts append
-`_part{N}`.  Chunked and keyset runs use their own run-unique part names
+This is the single (non-chunked, non-keyset) runner's naming: the stamp
+is the UTC millisecond the run started and the id of its process (both
+from its run id, so two runs never share a name), and its size-split
+parts append `_part{N}`.  Chunked and keyset runs use their own run-unique part names
 — see the per-runner naming table in
 [docs/cloud-destinations.md](../cloud-destinations.md).
 
