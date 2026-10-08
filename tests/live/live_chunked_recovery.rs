@@ -1855,8 +1855,9 @@ fn a_part_write_failing_mid_page_counts_the_earlier_parts_sequential_keyset() {
 
 // ─── A failed run over a completed prefix retires its _SUCCESS ───────────────────
 
-/// Run once to success, then fail a second run into the SAME prefix; return the prefix's
-/// `_SUCCESS` presence and canonical `manifest.json` status after each run.
+/// Run once to success, then fail a second run into the SAME prefix after it wrote (its second of
+/// three chunks fails; the other two land); return the prefix's `_SUCCESS` presence and canonical
+/// `manifest.json` status after each run.
 fn success_marker_after_a_failed_rerun(s3: bool) -> [(bool, String); 2] {
     require_alive(LiveService::Postgres);
     let table = seed_pg_numeric_table(150);
