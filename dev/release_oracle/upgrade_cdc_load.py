@@ -387,6 +387,15 @@ def _oracle_no_load(led: Ledger, name: str, fail, step, body: str, bucket: str, 
                "the source)", "cdc-load")
 
 
+def isolated(body: str, pfx: str, slot: str | None) -> str | None:
+    """init's config under the cell's own prefix and slot (init writes fixed ones, shared by the stand); None when one stayed."""
+    body = re.sub(r"prefix: (exports|cdc)/", rf"prefix: {pfx}/\1/", body)
+    if slot:
+        body = re.sub(r"slot: \S+", f"slot: {slot}", body)
+    stayed = [ln for ln in body.splitlines() if "prefix:" in ln and pfx not in ln]
+    return None if stayed or (slot and f"slot: {slot}" not in body) else body
+
+
 def cdc_load_leg(led: Ledger, prev: Path, root: Path, engine: str, url: str, tz: str | None = None,
                  init_this: bool = False) -> None:
     """One cdc-load cell: the previous release's init config, three cycles by it and two by this binary;
@@ -444,16 +453,11 @@ def cdc_load_leg(led: Ledger, prev: Path, root: Path, engine: str, url: str, tz:
             if not init.ok:
                 return fail("init", f"{'this' if init_this else 'previous'} init: "
                                     f"{init.why}")
-            # Harness isolation only: init writes fixed prefixes and a fixed PG slot name,
-            # shared by every run on the stand.
             cfg = d / "c.yaml"
-            body = re.sub(r"prefix: (exports|cdc)/", rf"prefix: {pfx}/\1/", cfg.read_text())
-            if src.slot:
-                body = re.sub(r"slot: \S+", f"slot: {src.slot}", body)
+            body = isolated(cfg.read_text(), pfx, src.slot)
+            if body is None:
+                return fail("init", "a prefix or slot the harness could not isolate: " + cfg.read_text()[:400])
             cfg.write_text(body)
-            if [ln for ln in body.splitlines() if "prefix:" in ln and pfx not in ln] or (
-                    src.slot and f"slot: {src.slot}" not in body):
-                return fail("init", "a prefix or slot the harness could not isolate: " + body[:400])
             if init_this:
                 chk = step(initer, "check", "-c", "c.yaml")
                 if not chk.ok:

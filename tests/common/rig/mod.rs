@@ -28,6 +28,8 @@ mod remedy;
 pub use remedy::{Refused, Remedy, Then, assert_refused};
 mod sabotage;
 pub use sabotage::{Damage, Stopped, Survived};
+mod stop;
+pub use stop::{Parked, Stop, StoppedRun, graceful_is_worse};
 mod render;
 mod verify;
 

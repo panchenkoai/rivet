@@ -121,31 +121,63 @@ scenarios:
 
   - id: resumed_parallel_keyset_then_incremental
     what: "P-22 — a parallel keyset run resumed after a crash records the run's highest key: incremental on the key delivers nothing again"
-    postgres: { test: open_defect_resumed_parallel_keyset_then_incremental_postgres }
-    mysql:    { test: open_defect_resumed_parallel_keyset_then_incremental_mysql }
-    mssql:    { test: open_defect_resumed_parallel_keyset_then_incremental_mssql }
+    postgres: { test: resumed_parallel_keyset_then_incremental_postgres }
+    mysql:    { test: resumed_parallel_keyset_then_incremental_mysql }
+    mssql:    { test: resumed_parallel_keyset_then_incremental_mssql }
     mongo:    { na: "a Mongo export accepts only mode: full or cdc (validate_non_sql_source_modes, src/config/mod.rs:543-554), so there is no incremental / chunked mode to switch from or into; the switch Mongo has (into page_size + resume) is graded by the three *_then_resume_mongo cells" }
-    oracle:   { test: open_defect_resumed_parallel_keyset_then_incremental_oracle }
+    oracle:   { test: resumed_parallel_keyset_then_incremental_oracle }
 
   - id: incremental_source_url_respelled
-    what: "P-18 — the same source spelled without its default port keeps its cursor: continues"
-    postgres: { test: open_defect_source_url_without_its_default_port_continues_postgres }
-    mysql:    { test: open_defect_source_url_without_its_default_port_continues_mysql }
-    mssql:    { test: open_defect_source_url_without_its_default_port_continues_mssql }
+    what: "P-18 — the same source spelled without its default port keeps its cursor: continues (the stored source key always names the port)"
+    postgres: { test: source_url_without_its_default_port_continues_postgres }
+    mysql:    { test: source_url_without_its_default_port_continues_mysql }
+    mssql:    { test: source_url_without_its_default_port_continues_mssql }
     mongo:    { na: "a Mongo export accepts only mode: full or cdc (validate_non_sql_source_modes, src/config/mod.rs:543-554), so there is no incremental / chunked mode to switch from or into; the switch Mongo has (into page_size + resume) is graded by the three *_then_resume_mongo cells" }
-    oracle:   { test: open_defect_source_url_without_its_default_port_continues_oracle }
+    oracle:   { test: source_url_without_its_default_port_continues_oracle }
 
   - id: incremental_query_filter_edited
-    what: "an edited `query:` filter under the same FROM is another stream: refused, or its own rows in full"
-    postgres: { test: open_defect_incremental_query_filter_edited_postgres }
-    mysql:    { test: open_defect_incremental_query_filter_edited_mysql }
-    mssql:    { test: open_defect_incremental_query_filter_edited_mssql }
+    what: "MT8 — an edited `query:` filter under the same FROM is another stream: refused twice (RIVET_STATE_CURSOR_STREAM_MISMATCH); the filter restored continues, `state reset` delivers the new filter's rows in full, `state accept` keeps the cursor (the new filter's rows above it only, journaled, and the run after it continues), another destination is refused again"
+    postgres: { test: incremental_query_filter_edited_postgres }
+    mysql:    { test: incremental_query_filter_edited_mysql }
+    mssql:    { test: incremental_query_filter_edited_mssql }
     mongo:    { na: "a Mongo export accepts only mode: full or cdc (validate_non_sql_source_modes, src/config/mod.rs:543-554), so there is no incremental / chunked mode to switch from or into; the switch Mongo has (into page_size + resume) is graded by the three *_then_resume_mongo cells" }
-    oracle:   { test: open_defect_incremental_query_filter_edited_oracle }
+    oracle:   { test: incremental_query_filter_edited_oracle }
+
+  - id: incremental_query_filter_edited_refusal
+    what: "MT8 — the edited-filter refusal alone, twice, nothing written; no remedy is walked, so a Postgres-state run grades it in full"
+    postgres: { test: incremental_query_filter_edited_is_refused_twice_postgres }
+    mysql:    { test: incremental_query_filter_edited_is_refused_twice_mysql }
+    mssql:    { test: incremental_query_filter_edited_is_refused_twice_mssql }
+    mongo:    { na: "a Mongo export accepts only mode: full or cdc (validate_non_sql_source_modes, src/config/mod.rs:543-554), so there is no incremental / chunked mode to switch from or into; the switch Mongo has (into page_size + resume) is graded by the three *_then_resume_mongo cells" }
+    oracle:   { test: incremental_query_filter_edited_is_refused_twice_oracle }
+
+  - id: incremental_query_cosmetic_edit_accepted
+    what: "MT8 — a cosmetic edit of the text after FROM (an alias renamed, two predicates swapped) is refused twice like any other edit; `rivet state accept` keeps the cursor, the acceptance is in the journal, and the next two runs continue from it"
+    postgres: { test: incremental_query_cosmetic_edit_is_refused_until_accepted_postgres }
+    mysql:    { test: incremental_query_cosmetic_edit_is_refused_until_accepted_mysql }
+    mssql:    { test: incremental_query_cosmetic_edit_is_refused_until_accepted_mssql }
+    mongo:    { na: "a Mongo export accepts only mode: full or cdc (validate_non_sql_source_modes, src/config/mod.rs:543-554), so there is no incremental / chunked mode to switch from or into; the switch Mongo has (into page_size + resume) is graded by the three *_then_resume_mongo cells" }
+    oracle:   { test: incremental_query_cosmetic_edit_is_refused_until_accepted_oracle }
+
+  - id: incremental_query_param_value_changes
+    what: "MT8 — a `${param}` in the filter whose value changes between runs (by --param, then by the environment) is the same stream: the run continues from the stored cursor with no refusal and no new WARN line; an edit of the query text around the placeholder is refused twice"
+    postgres: { test: incremental_query_param_value_changes_between_runs_postgres }
+    mysql:    { test: incremental_query_param_value_changes_between_runs_mysql }
+    mssql:    { test: incremental_query_param_value_changes_between_runs_mssql }
+    mongo:    { na: "a Mongo export accepts only mode: full or cdc (validate_non_sql_source_modes, src/config/mod.rs:543-554), so there is no incremental / chunked mode to switch from or into; the switch Mongo has (into page_size + resume) is graded by the three *_then_resume_mongo cells" }
+    oracle:   { test: incremental_query_param_value_changes_between_runs_oracle }
+
+  - id: incremental_other_schema_same_table_refusal
+    what: "MT8 — the other-schema refusal alone, twice, nothing written; no remedy is walked, so a Postgres-state run grades it in full"
+    postgres: { test: same_table_in_another_schema_is_refused_twice_postgres }
+    mysql:    { na: "the schema an unqualified table resolves in is not a source-URL option on this engine (search_path is PostgreSQL's)" }
+    mssql:    { na: "the schema an unqualified table resolves in is not a source-URL option on this engine (search_path is PostgreSQL's)" }
+    mongo:    { na: "a Mongo export accepts only mode: full or cdc (validate_non_sql_source_modes, src/config/mod.rs:543-554), so there is no incremental / chunked mode to switch from or into; the switch Mongo has (into page_size + resume) is graded by the three *_then_resume_mongo cells" }
+    oracle:   { na: "the schema an unqualified table resolves in is not a source-URL option on this engine (search_path is PostgreSQL's)" }
 
   - id: incremental_other_schema_same_table
-    what: "the same table name in another schema (search_path in the URL) is another stream: refused, or its own rows in full"
-    postgres: { test: open_defect_same_table_in_another_schema_is_another_stream_postgres }
+    what: "MT8 — the same table name in another schema (search_path in the URL) is another stream: refused twice (RIVET_STATE_CURSOR_STREAM_MISMATCH); the source restored continues, `state reset` delivers the other schema's rows in full, `state accept` keeps the cursor (the other schema's rows above it only), another destination is refused again"
+    postgres: { test: same_table_in_another_schema_is_another_stream_postgres }
     mysql:    { na: "the schema an unqualified table resolves in is not a source-URL option on this engine (search_path is PostgreSQL's)" }
     mssql:    { na: "the schema an unqualified table resolves in is not a source-URL option on this engine (search_path is PostgreSQL's)" }
     mongo:    { na: "a Mongo export accepts only mode: full or cdc (validate_non_sql_source_modes, src/config/mod.rs:543-554), so there is no incremental / chunked mode to switch from or into; the switch Mongo has (into page_size + resume) is graded by the three *_then_resume_mongo cells" }

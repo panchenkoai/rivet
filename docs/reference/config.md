@@ -513,3 +513,7 @@ exports:
 ```bash
 rivet run --config export.yaml --param region=us-east
 ```
+
+A placeholder is filled from `--param` first, then from the environment variable of the same name; one that neither supplies stops the command before anything runs.
+
+For an export that stores a cursor (`incremental`, keyset), the query is compared between runs as written, with the placeholder in place: another value of `${region}` continues from the stored cursor, and which rows that leaves undelivered is yours to decide. An edit of the query text around the placeholder is refused like any other edit (`RIVET_STATE_CURSOR_STREAM_MISMATCH`; see [`rivet state accept`](cli.md#rivet-state-accept)).

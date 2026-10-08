@@ -578,6 +578,8 @@ const MIGRATIONS: &[(i64, &str)] = &[
         CREATE UNIQUE INDEX idx_keyset_range_stream
             ON keyset_range(export_name, COALESCE(source, ''), range_index);",
     ),
+    // v35: the highest key a committed parallel-keyset range delivered; NULL for an empty range or one committed before v35.
+    (35, "ALTER TABLE keyset_range ADD COLUMN max_key TEXT;"),
 ];
 
 /// PostgreSQL-compatible DDL.  Column types differ from SQLite (BIGSERIAL,
@@ -1066,6 +1068,11 @@ const PG_MIGRATIONS: &[(i64, &str)] = &[
         ALTER TABLE keyset_range DROP CONSTRAINT IF EXISTS keyset_range_pkey;
         CREATE UNIQUE INDEX IF NOT EXISTS idx_keyset_range_stream
             ON keyset_range(export_name, COALESCE(source, ''), range_index);",
+    ),
+    // v35: see the SQLite ladder.
+    (
+        35,
+        "ALTER TABLE keyset_range ADD COLUMN IF NOT EXISTS max_key TEXT;",
     ),
 ];
 

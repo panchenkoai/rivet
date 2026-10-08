@@ -54,6 +54,7 @@ from . import (
     clickhouse_load,
     concurrency,
     failure,
+    field_state,
     fix_cells,
     gifs,
     guarantees,
@@ -811,6 +812,7 @@ def _self_test() -> int:
     _lanes_self_test()
     skip_census._self_test()
     fix_cells._self_test()
+    field_state._self_test()
     print("\nregression stage (child harness, stand, banner):")
     return regression._self_test()
 
@@ -1079,6 +1081,7 @@ def gate_stages(ns: argparse.Namespace) -> list[Stage]:
         # The offline battery under llvm-cov compiles and reads no server; the upgrade cells wait on servers and BigQuery.
         Stage("live-only coverage", lambda led: scenarios.verify_live_only_coverage(led), frozenset({CARGO})),
         Stage("upgrade continuity", lambda led: upgrade.verify_upgrade_continuity(led), frozenset({STAND})),
+        Stage("upgrade from a field state", lambda led: field_state.verify_upgrade_from_field_state(led), frozenset({STAND})),
         measured("perf regression", lambda led: perf.verify_perf_regression(led)),
         measured("source harm regression", lambda led: regression.verify_harm_regression(led)),
         measured("previous-release differential", lambda led: regression.verify_previous_release_differential(led)),

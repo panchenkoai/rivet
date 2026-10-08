@@ -702,7 +702,26 @@ Reset the cursor for a specific export (next run will re-export all rows).
 rivet state reset --config <PATH> --export <NAME>
 ```
 
+The reset clears the progress the export holds on the source this config names (its cursor and any interrupted keyset run), so the config's source URL must resolve. An export of the same name that reads another source through the same state database keeps its cursor.
+
 While a checkpointed run of that export (`chunk_checkpoint: true`) is alive in another rivet process, the reset is refused with `RIVET_STATE_RUN_IN_PROGRESS` (exit 5) and removes nothing: wait for the run, or stop its process, and repeat the command. A run that was killed does not hold the reset back.
+
+### `rivet state accept`
+
+Keep the stored progress of an export whose query or source was edited on purpose.
+
+```bash
+rivet state accept --config <PATH> --export <NAME> [--param KEY=VALUE ...]
+```
+
+A run refuses stored progress that was written reading another table, another schema or other rows (`RIVET_STATE_CURSOR_STREAM_MISMATCH`). `state accept` is the answer "the edit is meant, go on from where the export was": it records the stored progress of that one export as belonging to what the config reads now, and leaves the cursor value, its column and an interrupted run's anchor as they are. The next run continues from the cursor under the new query, so rows of the new query below the cursor are not delivered; `rivet state reset` is the command that delivers them.
+
+- It acts on the one export named, on the source this config names, once. A later edit is refused again until it is accepted too; there is no setting that accepts edits in advance.
+- It reads the config as `rivet run` does, so pass the same `--param` values.
+- A cursor written for another `cursor_column` or keyset key is not accepted: the command stops with `RIVET_STATE_CURSOR_OWNER_MISMATCH` (exit 5) and changes nothing.
+- When no run would be refused (no stored progress, or it already belongs to what the export reads) the command says so and changes nothing. The same holds for a `cdc` export, which stores a log position and no cursor.
+- While a run of that export is alive in another rivet process the command is refused with `RIVET_STATE_RUN_IN_PROGRESS` (exit 5).
+- Each acceptance that changed the row is recorded in the run journal: `rivet journal --config <PATH> --export <NAME>` lists it with status `accepted` and a line naming what the progress was written reading and what it is kept for.
 
 ### `rivet state files`
 

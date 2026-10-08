@@ -158,16 +158,36 @@ class _Env:
     """One config dir: the previous `init` wrote its config; runs go through either binary."""
 
     def __init__(self, prev: Path, root: Path, engine: str, url: str, table: str, mode: str,
-                 state_url: str):
+                 state_url: str, *, select: tuple[str, ...] | None = None, extra: tuple[str, ...] = (),
+                 env: dict[str, str] | None = None):
         self.dir = root / f"{engine}_{table}_{'pg' if state_url else 'sq'}"
         self.dir.mkdir(parents=True)
-        self.prev, self.env = prev, {"RIVET_UPG_URL": url, "RIVET_STATE_URL": state_url}
-        self.init = run([str(prev), "init", "--source-env", "RIVET_UPG_URL", "--table", table,
-                         "--mode", mode, "-o", "c.yaml"], env=self.env, cwd=self.dir)
+        self.prev, self.env = prev, {"RIVET_UPG_URL": url, "RIVET_STATE_URL": state_url, **(env or {})}
+        self.init = run([str(prev), "init", "--source-env", "RIVET_UPG_URL", *(select or ("--table", table)),
+                         "--mode", mode, *extra, "-o", "c.yaml"], env=self.env, cwd=self.dir)
 
     def rivet(self, binary: Path, *args: str, extra: dict[str, str] | None = None) -> Proc:
         """`binary args…` in this dir, with the source URL and state backend pinned."""
         return run([str(binary), *args], env={**self.env, **(extra or {})}, cwd=self.dir, timeout=None)
+
+    def rivet_killed(self, binary: Path, *args: str, when, timeout: float = 300.0) -> Proc:
+        """`binary args…` SIGKILLed the moment `when()` holds (or at `timeout`); a run that ended first keeps its own exit status."""
+        import signal
+        import subprocess
+        import time
+
+        log = self.dir / "killed.err"
+        with open(log, "wb") as err:
+            p = subprocess.Popen([str(binary), *args], env={**os.environ, **self.env}, cwd=self.dir,
+                                 stdout=subprocess.DEVNULL, stderr=err)
+            deadline = time.monotonic() + timeout
+            while p.poll() is None:
+                if when() or time.monotonic() > deadline:
+                    p.send_signal(signal.SIGKILL)
+                    break
+                time.sleep(0.002)
+            p.wait()
+        return Proc([str(binary), *args], p.returncode, "", log.read_text(errors="replace"))
 
     def parquet_count(self) -> int:
         return len(glob.glob(str(self.dir / "output" / "**" / "*.parquet"), recursive=True))
