@@ -503,11 +503,7 @@ impl PgChangeStream {
                     format!("pg cdc: reading pg_class to check that `{cfg}` is routable")
                 })?
             else {
-                crate::rivet_bail!(
-                    crate::error::codes::SOURCE_CDC_PREREQUISITE,
-                    "{}",
-                    absent_table_refusal(cfg)
-                );
+                continue; // unresolvable here — the schema probe reports it, loudly
             };
             let relkind: String = row.get(0);
             let relpersistence: String = row.get(1);
@@ -564,7 +560,17 @@ impl PgChangeStream {
         if let Some(why) = server_refusal(&wal_level, mode.is_bounded(), in_recovery) {
             crate::rivet_bail!(crate::error::codes::SOURCE_CDC_PREREQUISITE, "{why}");
         }
-        Self::check_configured_tables_are_routable(client, configured_tables, say_note)
+        Self::check_configured_tables_are_routable(client, configured_tables, say_note)?;
+        // The schema probe's own statement, prepared only: a table it could not read is refused here.
+        for table in configured_tables {
+            crate::source::cdc::validate_table_ident(table)?;
+            client
+                .prepare(&format!("SELECT * FROM {table}"))
+                .map_err(|e| {
+                    table_probe_refusal(table, e.code().map(|c| c.code()), &e.to_string())
+                })?;
+        }
+        Ok(())
     }
 
     /// Connect and ensure a `test_decoding` logical slot named `slot` exists
@@ -979,6 +985,22 @@ pub(crate) fn absent_table_refusal(configured: &str) -> String {
          search_path resolves it), so no change to it could ever be captured; nothing was read \
          or written. Create the table, or fix `table:` in the export, then re-run."
     )
+}
+
+/// Why a configured table the schema probe cannot prepare is refused: absent (SQLSTATE 42P01) by code, anything else in the server's words.
+pub(crate) fn table_probe_refusal(
+    table: &str,
+    sqlstate: Option<&str>,
+    said: &str,
+) -> anyhow::Error {
+    if sqlstate == Some("42P01") {
+        return crate::error::CodedError::new(
+            crate::error::codes::SOURCE_CDC_PREREQUISITE,
+            absent_table_refusal(table),
+        )
+        .into();
+    }
+    anyhow::anyhow!("pg cdc: cannot read `{table}` ({said}); nothing was read or written.")
 }
 
 /// Why this server cannot host the drain: `wal_level` below `logical`, or a bounded drain on a standby.
@@ -2286,6 +2308,30 @@ mod tests {
         assert!(!past_the_bound("0/F", Some(0x10)));
         assert!(!past_the_bound("FF/0", None));
         assert!(!past_the_bound("not an lsn", Some(0x10)));
+    }
+
+    /// An undefined table is the coded absent-table refusal; any other probe failure keeps the server's words.
+    #[test]
+    fn a_table_the_probe_cannot_prepare_is_absent_only_by_its_sqlstate() {
+        let absent = table_probe_refusal(
+            "orders",
+            Some("42P01"),
+            "relation \"orders\" does not exist",
+        );
+        assert_eq!(
+            crate::error::error_code(&absent),
+            Some("RIVET_SOURCE_CDC_PREREQUISITE")
+        );
+        assert_eq!(absent.to_string(), absent_table_refusal("orders"));
+        for other in [Some("42501"), None] {
+            let denied = table_probe_refusal("orders", other, "permission denied for table orders");
+            assert_eq!(crate::error::error_code(&denied), None);
+            assert_eq!(
+                denied.to_string(),
+                "pg cdc: cannot read `orders` (permission denied for table orders); nothing was \
+                 read or written."
+            );
+        }
     }
 
     /// Only a message outside a transaction is a span of its own; a transactional one rides its commit.

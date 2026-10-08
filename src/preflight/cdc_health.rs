@@ -1072,20 +1072,23 @@ mod tests {
             let exports: Vec<&ExportConfig> = c.exports.iter().collect();
             run_refusals(c, &exports, &c.source.resolve_url().unwrap())
         };
-        let refused = run(&cfg(
+        for source in [
             "type: postgres\n  url: postgresql://rivet:rivet@127.0.0.1:1/rivet",
-        ));
-        assert_eq!(refused.len(), 1, "{refused:?}");
-        assert!(!refused[0].ok, "{refused:?}");
-        assert_eq!(refused[0].name, "CDC run prerequisites (export 't')");
-        assert!(
-            refused[0]
-                .detail
-                .as_deref()
-                .is_some_and(|d| d.contains("127.0.0.1:1")),
-            "{refused:?}"
-        );
-        assert!(refused[0].hint.is_none(), "{refused:?}");
+            "type: mysql\n  url: mysql://rivet:rivet@127.0.0.1:1/rivet",
+        ] {
+            let refused = run(&cfg(source));
+            assert_eq!(refused.len(), 1, "{refused:?}");
+            assert!(!refused[0].ok, "{refused:?}");
+            assert_eq!(refused[0].name, "CDC run prerequisites (export 't')");
+            assert!(
+                refused[0]
+                    .detail
+                    .as_deref()
+                    .is_some_and(|d| d.contains("127.0.0.1:1")),
+                "{source}: {refused:?}"
+            );
+            assert!(refused[0].hint.is_none(), "{refused:?}");
+        }
         assert!(
             run(&cfg(
                 "type: mssql\n  url: sqlserver://sa:x@127.0.0.1:1/rivet"

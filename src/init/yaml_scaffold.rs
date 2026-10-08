@@ -87,14 +87,16 @@ const BOUNDED_DRAIN_LINE: &str =
 /// The line a CDC export scaffolded against a PostgreSQL standby carries instead: a bounded drain is refused there.
 const STANDBY_DRAIN_LINE: &str = "      until_current: false  # the source is a standby (in recovery), where a bounded drain is refused; this reads to the end of the replayed log and exits (good for a scheduler)";
 
-/// The scaffold for a source that is a PostgreSQL standby: every CDC export drains unbounded.
-pub(super) fn for_a_standby(text: &str) -> String {
-    wrap_comments(&text.replace(BOUNDED_DRAIN_LINE, STANDBY_DRAIN_LINE))
-}
-
-/// Whether the scaffold holds a CDC export with a bounded drain.
-pub(super) fn bounds_a_cdc_drain(text: &str) -> bool {
-    text.contains(BOUNDED_DRAIN_LINE)
+/// The scaffold as its source runs it: against a PostgreSQL standby every bounded CDC drain becomes unbounded; `in_recovery` is asked only for such a scaffold.
+pub(super) fn for_source(
+    text: String,
+    source_type: &str,
+    in_recovery: impl FnOnce() -> bool,
+) -> String {
+    if source_type == "postgres" && text.contains(BOUNDED_DRAIN_LINE) && in_recovery() {
+        return wrap_comments(&text.replace(BOUNDED_DRAIN_LINE, STANDBY_DRAIN_LINE));
+    }
+    text
 }
 
 pub(super) fn scaffold_table(
@@ -2180,9 +2182,9 @@ mod tests {
         );
     }
 
-    /// Against a standby the scaffold's CDC drain is unbounded (a bounded one is refused there); a batch scaffold has no drain to change.
+    /// Against a PostgreSQL standby the scaffold's CDC drain is unbounded (a bounded one is refused there); nothing else is asked or changed.
     #[test]
-    fn a_cdc_scaffold_for_a_standby_drains_unbounded_and_still_loads() {
+    fn a_cdc_scaffold_for_a_postgres_standby_drains_unbounded_and_still_loads() {
         let yaml = |mode: &str| {
             generate_config(
                 &make_table(vec![pk("id", "bigint")]),
@@ -2194,11 +2196,15 @@ mod tests {
             )
             .expect("scaffold")
         };
-        let cdc = yaml("cdc");
-        assert!(bounds_a_cdc_drain(&cdc), "{cdc}");
-        assert!(!bounds_a_cdc_drain(&yaml("full")));
-        let standby = for_a_standby(&cdc);
-        assert!(!bounds_a_cdc_drain(&standby), "{standby}");
+        let (cdc, full) = (yaml("cdc"), yaml("full"));
+        assert!(cdc.contains(BOUNDED_DRAIN_LINE), "{cdc}");
+        let never =
+            || -> bool { panic!("only a bounded CDC scaffold on PostgreSQL asks the source") };
+        assert_eq!(for_source(cdc.clone(), "postgres", || false), cdc);
+        assert_eq!(for_source(cdc.clone(), "mysql", never), cdc);
+        assert_eq!(for_source(full.clone(), "postgres", never), full);
+        let standby = for_source(cdc.clone(), "postgres", || true);
+        assert!(!standby.contains(BOUNDED_DRAIN_LINE), "{standby}");
         assert!(
             standby.contains("      until_current: false  # the source is a standby (in recovery)"),
             "{standby}"
@@ -2211,7 +2217,6 @@ mod tests {
         );
         let cfg = crate::config::Config::from_yaml(&standby).expect("the standby scaffold loads");
         assert!(!cfg.exports[0].cdc.as_ref().unwrap().until_current);
-        assert_eq!(for_a_standby(&yaml("full")), yaml("full"));
     }
 
     /// `--bigquery-project/--dataset` is what scaffolds the `load:` block, and a
