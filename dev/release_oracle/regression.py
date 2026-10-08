@@ -591,11 +591,17 @@ def _require_prev_binary(
     if prev is not None:
         return prev
     raw = os.environ.get("RIVET_PREV_RELEASE_BIN", "")
-    why = (
-        f"RIVET_PREV_RELEASE_BIN={raw!r} is not an executable file"
-        if raw
-        else "RIVET_PREV_RELEASE_BIN is unset"
+    absent_release_binary(
+        led, engine, version, scenario, store, what,
+        f"RIVET_PREV_RELEASE_BIN={raw!r} is not an executable file" if raw else "RIVET_PREV_RELEASE_BIN is unset",
     )
+    return None
+
+
+def absent_release_binary(
+    led: Ledger, engine: str, version: str, scenario: str, store: str, what: str, why: str
+) -> None:
+    """Record a released binary a stage needs and does not have: FAIL, or SKIP under the named escape."""
     if without_prev_release_comparison():
         led.skipped(
             engine, version, scenario, store,
