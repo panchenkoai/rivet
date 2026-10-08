@@ -1354,23 +1354,59 @@ fn cursor_destination_moved_to_another_store() {
     );
 }
 
-/// A cursor stored before its destination was recorded (the row holds none): a run with the config unchanged continues and records it, and a destination moved after that is refused twice.
-fn cursor_stored_before_destinations_were_recorded(engine: SqlEngine) {
-    let (table, _guard) = seeded(engine, "sab_adopt");
-    let (first, second) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-    let rig = Shape::Incremental
-        .staged(engine, engine.rig(&table))
-        .dest_path(first.path().to_path_buf());
+/// A cursor stored before its destination was recorded (the row holds none): after `grows` adds source rows a run of `rig` with the config unchanged continues and records it, and a destination moved after more rows is refused twice.
+fn continues_then_refuses_a_moved_destination(rig: Rig, grows: impl Fn(i64)) {
+    let second = tempfile::tempdir().unwrap();
     rig.run_ok();
     rig.edit_state(
         "UPDATE export_state SET destination = NULL WHERE export_name = '{export}'",
         1,
     );
-    engine.insert(&table, N + 1..=N + 3, 170, Some(10));
+    grows(N + 1);
     rig.run_ok();
-    engine.insert(&table, N + 4..=N + 6, 170, Some(10));
+    grows(N + 4);
     let mut rig = rig.dest_path(second.path().to_path_buf());
     let refused = Refused::by_code("RIVET_STATE_CURSOR_DESTINATION_MISMATCH", 5);
+    rig.refuses_twice_then(&["run"], &[], refused, vec![]);
+}
+
+/// [`continues_then_refuses_a_moved_destination`] for an incremental export.
+fn cursor_stored_before_destinations_were_recorded(engine: SqlEngine) {
+    let (table, _guard) = seeded(engine, "sab_adopt");
+    let first = tempfile::tempdir().unwrap();
+    let rig = Shape::Incremental
+        .staged(engine, engine.rig(&table))
+        .dest_path(first.path().to_path_buf());
+    continues_then_refuses_a_moved_destination(rig, |from| {
+        engine.insert(&table, from..=from + 2, 170, Some(10))
+    });
+}
+
+/// [`continues_then_refuses_a_moved_destination`] for a MongoDB `resume` export.
+fn cursor_stored_before_destinations_were_recorded_mongo() {
+    require_alive(LiveService::Mongo);
+    let db = unique_name("sab_adopt");
+    let _guard = MongoDbGuard {
+        port: MONGO_PORT,
+        db: db.clone(),
+    };
+    let mongo = MongoTest::connect(MONGO_PORT, &db);
+    mongo.seed_int_id("adopted", N);
+    let first = tempfile::tempdir().unwrap();
+    let rig = Rig::mongo_batch("adopted")
+        .source_url(&MongoTest::url(MONGO_PORT, &db))
+        .mongo("page_size: 4, resume: true")
+        .dest_path(first.path().to_path_buf());
+    continues_then_refuses_a_moved_destination(rig, |from| {
+        (from..=from + 2).for_each(|id| mongo.upsert_set("adopted", id, "v", "new"))
+    });
+}
+
+/// An unfinished range-checkpoint run whose parts are parquet, and the export now writes csv: refused twice, nothing walked (the cell a Postgres state grades whole).
+fn interrupted_run_format_mismatch_is_refused_twice(engine: SqlEngine) {
+    let (_table, rig, _guard) = interrupted(engine, "sab_edit");
+    let mut rig = rig.with_format("csv");
+    let refused = Refused::by_code("RIVET_STATE_INTERRUPTED_RUN_OWNER_MISMATCH", 5);
     rig.refuses_twice_then(&["run"], &[], refused, vec![]);
 }
 
@@ -3845,7 +3881,39 @@ fn a_cursor_stored_before_destinations_were_recorded_continues_then_refuses_a_mo
 }
 
 #[test]
+#[ignore = "live: requires docker compose mongo"]
+fn a_cursor_stored_before_destinations_were_recorded_continues_then_refuses_a_moved_destination_mongo()
+ {
+    cursor_stored_before_destinations_were_recorded_mongo();
+}
+
+#[test]
 #[ignore = "live: requires docker compose postgres + minio"]
 fn an_incremental_export_moved_to_another_store_is_refused_and_walked_out_postgres() {
     cursor_destination_moved_to_another_store();
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn an_unfinished_run_whose_format_is_edited_is_refused_twice_postgres() {
+    interrupted_run_format_mismatch_is_refused_twice(SqlEngine::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn an_unfinished_run_whose_format_is_edited_is_refused_twice_mysql() {
+    interrupted_run_format_mismatch_is_refused_twice(SqlEngine::Mysql);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn an_unfinished_run_whose_format_is_edited_is_refused_twice_mssql() {
+    interrupted_run_format_mismatch_is_refused_twice(SqlEngine::Mssql);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn an_unfinished_run_whose_format_is_edited_is_refused_twice_oracle() {
+    interrupted_run_format_mismatch_is_refused_twice(SqlEngine::Oracle);
 }

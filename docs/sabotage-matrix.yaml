@@ -885,11 +885,11 @@ scenarios:
     oracle:   { test: an_incremental_export_whose_destination_path_is_edited_is_refused_and_walked_out_oracle }
 
   - id: edit_destination_path_cursor_stored_before_destinations_were_recorded
-    what: "an incremental cursor whose row holds no destination (`export_state.destination` NULL, as rivet 0.31 and earlier wrote it): a run with the config unchanged continues and records where it delivers, and a destination moved after that is refused twice (RIVET_STATE_CURSOR_DESTINATION_MISMATCH)"
+    what: "a cursor (incremental; MongoDB `resume`) whose row holds no destination (`export_state.destination` NULL, as rivet 0.31 and earlier wrote it): a run with the config unchanged continues and records where it delivers, and a destination moved after that is refused twice (RIVET_STATE_CURSOR_DESTINATION_MISMATCH)"
     postgres: { test: a_cursor_stored_before_destinations_were_recorded_continues_then_refuses_a_moved_destination_postgres }
     mysql:    { test: a_cursor_stored_before_destinations_were_recorded_continues_then_refuses_a_moved_destination_mysql }
     mssql:    { test: a_cursor_stored_before_destinations_were_recorded_continues_then_refuses_a_moved_destination_mssql }
-    mongo:    { na: "a MongoDB `mode: full` export keeps no progress between runs: every run delivers the whole collection wherever the config points (a `resume: true` export does, and its cell is in the RIVET_STATE_CURSOR_DESTINATION_MISMATCH rows)" }
+    mongo:    { test: a_cursor_stored_before_destinations_were_recorded_continues_then_refuses_a_moved_destination_mongo }
     oracle:   { test: a_cursor_stored_before_destinations_were_recorded_continues_then_refuses_a_moved_destination_oracle }
 
   - id: edit_destination_path_unfinished_checkpoint
@@ -915,6 +915,14 @@ scenarios:
     mssql:    { test: an_unfinished_run_whose_format_is_edited_is_refused_and_walked_out_mssql }
     mongo:    { na: "a MongoDB export has no range-chunk run to leave unfinished (validate_non_sql_source_modes allows no chunked mode); its `resume: true` run has no crash point a cell can place" }
     oracle:   { test: an_unfinished_run_whose_format_is_edited_is_refused_and_walked_out_oracle }
+
+  - id: edit_format_unfinished_checkpoint_refused_twice
+    what: "the same edit under an unfinished range-checkpoint run, refused twice and nothing walked: the cell a Postgres state grades whole (a walk of more than one remedy applies its first only there)"
+    postgres: { test: an_unfinished_run_whose_format_is_edited_is_refused_twice_postgres }
+    mysql:    { test: an_unfinished_run_whose_format_is_edited_is_refused_twice_mysql }
+    mssql:    { test: an_unfinished_run_whose_format_is_edited_is_refused_twice_mssql }
+    mongo:    { na: "a MongoDB export has no range-chunk run to leave unfinished (validate_non_sql_source_modes allows no chunked mode); its `resume: true` run has no crash point a cell can place" }
+    oracle:   { test: an_unfinished_run_whose_format_is_edited_is_refused_twice_oracle }
 
   - id: edit_compression_incremental
     what: "`compression` (the default to gzip) edited between two runs with no reset, an incremental export that ran once and has three new source rows: the run continues, every source id declared once, and `validate` passes"
