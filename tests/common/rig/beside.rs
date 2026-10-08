@@ -148,7 +148,7 @@ impl TinyVolume {
         self.at.path().join("mnt")
     }
 
-    /// Fill the volume; panics unless a write to it is then refused.
+    /// Fill the volume, again while a writer beside the cell frees what it staged; panics unless a write to it is then refused.
     pub fn fill(&self) {
         use std::io::Write as _;
         let mut ballast = std::fs::OpenOptions::new()
@@ -156,23 +156,26 @@ impl TinyVolume {
             .append(true)
             .open(self.path().join(".ballast"))
             .expect("open the ballast");
-        for block in [vec![0u8; 1 << 16], vec![0u8; 512]] {
-            while ballast
+        let mut takes = |bytes: usize| {
+            let block = vec![0u8; bytes];
+            ballast
                 .write_all(&block)
                 .and_then(|()| ballast.sync_data())
                 .is_ok()
-            {}
+        };
+        for _ in 0..20 {
+            for bytes in [1 << 16, 512] {
+                while takes(bytes) {}
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
         }
-        if let Some(why) =
-            not_filled(std::fs::write(self.path().join(".probe"), [0u8; 8192]).is_ok())
-        {
+        if let Some(why) = not_filled(takes(8192)) {
             panic!("{why}");
         }
     }
 
     /// Give the space back.
     pub fn free(&self) {
-        let _ = std::fs::remove_file(self.path().join(".probe"));
         std::fs::remove_file(self.path().join(".ballast")).expect("remove the ballast");
     }
 }
