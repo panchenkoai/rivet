@@ -506,7 +506,7 @@ impl StateStore {
     ) -> Result<()> {
         let (export_name, now) = (key.export_name.as_str(), &key.landing);
         let Some(was) = stored else {
-            if now.destination.is_empty() && now.format.is_empty() {
+            if *now == Landing::default() {
                 return Ok(());
             }
             self.execute(
