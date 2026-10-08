@@ -48,7 +48,7 @@ fn diagnose_mongo(
     mongo: Option<&crate::config::MongoConfig>,
 ) -> Result<ExportDiagnostic> {
     if let Some(collection) = batch_collection(export) {
-        crate::source::mongo::require_collection(url, tls, collection)?;
+        crate::source::mongo::MongoSession::connect(url, tls)?.require_collection(collection)?;
     }
     // Scan-free row estimate via `estimatedDocumentCount` (collection metadata,
     // never a scan) — the Mongo analogue of PG `reltuples`. Resolved from the

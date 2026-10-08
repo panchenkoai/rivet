@@ -1,110 +1,31 @@
 diff --git a/src/pipeline/plan_cmd.rs b/src/pipeline/plan_cmd.rs
 --- a/src/pipeline/plan_cmd.rs
 +++ b/src/pipeline/plan_cmd.rs
-@@ -375,52 +375,82 @@
+@@ -375,16 +375,14 @@
          }
      }
  
 -    let planned = crate::plan::build::export_as_planned(export, &plan.strategy);
--    let mut diag = preflight::get_export_diagnostic(config, &planned)
--        .map_err(|e| source_unreadable(&export.name, e))?;
--    // #149: measured beats declared — same overlay `check` applies, so
--    // the two surfaces quote the same figure with the same label.
--    crate::preflight::overlay_measured_rows(&mut diag, &planned, config.source.source_type, state);
--    // The plan artifact's warnings stay flat strings (severity tags are a
--    // `rivet check` surface); take each warning's message text.
--    let mut warnings: Vec<String> = diag.warnings.iter().map(|w| w.message.clone()).collect();
--    warnings.extend(validate_warnings);
--    // F3 (0.7.5 audit): the JSON artifact's `diagnostics`
--    // exposed a non-Efficient verdict with `warnings: []`, so a
--    // machine consumer could not see *why* the plan was flagged.
--    // If preflight emitted no specific warning, fall back to the
--    // build_suggestion text (the same line shown in `rivet check`)
--    // so the JSON always carries at least one human-readable
--    // reason matching the verdict.
--    if warnings.is_empty() && !matches!(diag.verdict, preflight::HealthVerdict::Efficient) {
--        if let Some(s) = diag.suggestion.clone() {
--            warnings.push(s);
--        } else {
--            warnings.push(format!(
--                "verdict {} but preflight collected no specific warnings — review `rivet check` output for context",
--                diag.verdict
--            ));
+-    let (computed, plan_diagnostics, hints) = match preflight::get_export_diagnostic(
+-        config, &planned,
+-    ) {
 +    let (computed, plan_diagnostics, hints) = match preflight::get_export_diagnostic(config, export)
 +    {
-+        Ok(mut diag) => {
-+            // #149: measured beats declared — same overlay `check` applies, so
-+            // the two surfaces quote the same figure with the same label.
-+            crate::preflight::overlay_measured_rows(
-+                &mut diag,
+         Ok(mut diag) => {
+             // #149: measured beats declared — same overlay `check` applies, so
+             // the two surfaces quote the same figure with the same label.
+             crate::preflight::overlay_measured_rows(
+                 &mut diag,
+-                &planned,
 +                export,
-+                config.source.source_type,
-+                state,
-+            );
-+            // The plan artifact's warnings stay flat strings (severity tags are a
-+            // `rivet check` surface); take each warning's message text.
-+            let mut warnings: Vec<String> =
-+                diag.warnings.iter().map(|w| w.message.clone()).collect();
-+            warnings.extend(validate_warnings);
-+            // F3 (0.7.5 audit): the JSON artifact's `diagnostics`
-+            // exposed a non-Efficient verdict with `warnings: []`, so a
-+            // machine consumer could not see *why* the plan was flagged.
-+            // If preflight emitted no specific warning, fall back to the
-+            // build_suggestion text (the same line shown in `rivet check`)
-+            // so the JSON always carries at least one human-readable
-+            // reason matching the verdict.
-+            if warnings.is_empty() && !matches!(diag.verdict, preflight::HealthVerdict::Efficient) {
-+                if let Some(s) = diag.suggestion.clone() {
-+                    warnings.push(s);
-+                } else {
-+                    warnings.push(format!(
-+                        "verdict {} but preflight collected no specific warnings — review `rivet check` output for context",
-+                        diag.verdict
-+                    ));
-+                }
-+            }
-+            // Explain *why* this strategy was chosen (mode + chunk geometry +
-+            // parallelism) and its risk profile. The mode, column and sizes come
-+            // from `plan.strategy` — the same value the artifact's mode label is
-+            // taken from — so the narrative cannot contradict the plan.
-+            let strategy_rationale = crate::plan::explain_strategy(&diag, &plan.strategy, export);
-+            let plan_diagnostics = PlanDiagnostics {
-+                verdict: diag.verdict.to_string(),
-+                warnings,
-+                recommended_profile: diag.recommended_profile.to_string(),
-+                strategy_rationale,
-+            };
-+            let row_is_measured = diag
-+                .row_source
-+                .as_deref()
-+                .is_some_and(|s| s.starts_with("measured"));
-+            let computed = compute_plan_data(&plan, diag.row_estimate, row_is_measured, state)?;
-+            let hints = PrioritizationHints {
-+                incremental_uses_index: diag.uses_index,
-+                cursor_range_observed: diag.cursor_min.is_some() && diag.cursor_max.is_some(),
-+            };
-+            (computed, plan_diagnostics, hints)
+                 config.source.source_type,
+                 state,
+             );
+@@ -432,7 +430,27 @@
+             };
+             (computed, plan_diagnostics, hints)
          }
--    }
--    // Explain *why* this strategy was chosen (mode + chunk geometry +
--    // parallelism) and its risk profile. The mode, column and sizes come
--    // from `plan.strategy` — the same value the artifact's mode label is
--    // taken from — so the narrative cannot contradict the plan.
--    let strategy_rationale = crate::plan::explain_strategy(&diag, &plan.strategy, export);
--    let plan_diagnostics = PlanDiagnostics {
--        verdict: diag.verdict.to_string(),
--        warnings,
--        recommended_profile: diag.recommended_profile.to_string(),
--        strategy_rationale,
--    };
--    let row_is_measured = diag
--        .row_source
--        .as_deref()
--        .is_some_and(|s| s.starts_with("measured"));
--    let computed = compute_plan_data(&plan, diag.row_estimate, row_is_measured, state)?;
--    let hints = PrioritizationHints {
--        incremental_uses_index: diag.uses_index,
--        cursor_range_observed: diag.cursor_min.is_some() && diag.cursor_max.is_some(),
+-        Err(e) => return Err(source_unreadable(&export.name, e)),
 +        Err(e) => {
 +            log::warn!(
 +                "plan '{}': preflight diagnostics failed (continuing without them): {:#}",

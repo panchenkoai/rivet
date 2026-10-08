@@ -793,12 +793,15 @@ mod tests {
         }
     }
 
-    /// A store that answers every object stat with 404 and every listing with `list_status`, counting the listings.
-    fn stub_store(list_status: u16) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    /// A store that answers every object stat with `stat_status` and every listing with `list_status`, recording each listing's request target.
+    fn stub_store(
+        stat_status: u16,
+        list_status: u16,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let listings = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listings = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = std::sync::Arc::clone(&listings);
         std::thread::spawn(move || {
             for stream in listener.incoming() {
@@ -809,10 +812,10 @@ mod tests {
                 let target = request.split_whitespace().nth(1).unwrap_or("");
                 let is_listing = target.contains("/o?");
                 let (status, body) = if is_listing {
-                    seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    seen.lock().unwrap().push(target.to_string());
                     (list_status, "{}")
                 } else {
-                    (404, "{}")
+                    (stat_status, "{}")
                 };
                 let _ = write!(
                     stream,
@@ -843,7 +846,7 @@ mod tests {
     #[test]
     fn head_refuses_a_missing_container_and_reads_a_missing_key_as_absent() {
         use crate::destination::Destination;
-        let (endpoint, _) = stub_store(404);
+        let (endpoint, _) = stub_store(404, 404);
         let err = stub_destination(&endpoint)
             .head("manifest.json")
             .expect_err("a 404 listing means the bucket is absent");
@@ -858,17 +861,31 @@ mod tests {
         );
         assert_eq!(crate::error::classify_exit(&err), 1);
 
-        let (endpoint, listings) = stub_store(200);
+        let (endpoint, listings) = stub_store(404, 200);
         let dest = stub_destination(&endpoint);
         assert_eq!(dest.head("manifest.json").unwrap(), None);
         assert_eq!(dest.head("_SUCCESS").unwrap(), None);
+        let asked = listings.lock().unwrap().clone();
         assert_eq!(
-            listings.load(std::sync::atomic::Ordering::SeqCst),
+            asked.len(),
             1,
-            "the container is asked about once per destination"
+            "the container is asked about once per destination: {asked:?}"
+        );
+        assert!(
+            asked[0].contains("maxResults=1") && asked[0].contains("prefix=p%2F"),
+            "the probe asks for one result under the prefix: {asked:?}"
         );
 
-        let (endpoint, _) = stub_store(403);
+        let (endpoint, listings) = stub_store(403, 404);
+        stub_destination(&endpoint)
+            .head("manifest.json")
+            .expect_err("a stat the store refuses is an error, never an absent key");
+        assert!(
+            listings.lock().unwrap().is_empty(),
+            "only a 404 on the key asks about the container"
+        );
+
+        let (endpoint, _) = stub_store(404, 403);
         assert_eq!(
             stub_destination(&endpoint).head("manifest.json").unwrap(),
             None,

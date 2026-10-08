@@ -1207,4 +1207,26 @@ mod subcommand_error_tests {
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].0, "whole");
     }
+
+    /// `rivet check` ends in an error for a config the planner refuses, before any connection is made.
+    #[test]
+    fn check_fails_on_a_config_the_planner_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("rivet.yaml");
+        std::fs::write(
+            &cfg,
+            "source:\n  type: postgres\n  url: postgresql://u:p@127.0.0.1:1/db\n\
+             exports:\n  - name: orders\n    query: SELECT * FROM orders\n    mode: chunked\n\
+             \x20   chunk_by_key: id\n    format: parquet\n\
+             \x20   destination: { type: local, path: ./out }\n",
+        )
+        .unwrap();
+        let path = cfg.to_str().unwrap().to_string();
+        let err = super::dispatch_check(path, None, vec![], false, false, false, None)
+            .expect_err("a config the planner refuses must fail `check`");
+        assert!(
+            format!("{err:#}").contains("1 export(s) cannot be planned"),
+            "{err:#}"
+        );
+    }
 }

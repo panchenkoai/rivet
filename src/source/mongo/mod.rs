@@ -198,15 +198,6 @@ impl MongoSession {
     }
 }
 
-/// Connect and refuse `collection` when the database does not list it, as `rivet run` does before it reads.
-pub(crate) fn require_collection(
-    url: &str,
-    tls: Option<&TlsConfig>,
-    collection: &str,
-) -> Result<()> {
-    MongoSession::connect(url, tls)?.require_collection(collection)
-}
-
 /// MongoDB source over a [`MongoSession`], carrying the resolved `source.mongo:`
 /// read options `export` applies.
 pub struct MongoSource {
