@@ -165,7 +165,7 @@ fn failed_run_leftover_declarations_never_grow() {
 }
 
 /// Refusals the live cells accept with no `RIVET_*` code (`Refused::uncoded_known_defect(`): each is a code the registry owes.
-const UNCODED_REFUSAL_CEILING: usize = 5; // ratchet-pin: uncoded-refusals
+const UNCODED_REFUSAL_CEILING: usize = 4; // ratchet-pin: uncoded-refusals
 
 #[test]
 fn uncoded_refusals_the_cells_accept_never_grow() {

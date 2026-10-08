@@ -88,44 +88,36 @@ scenarios:
     mongo:    { test: an_unusable_state_url_is_refused_and_each_remedy_runs_mongo }
     oracle:   { test: an_unusable_state_url_is_refused_and_each_remedy_runs_oracle }
 
-  - id: corrupt_checkpoint_remedy
-    what: "RESULTS 13: deleting a corrupt CDC checkpoint accepts a new anchor, as the refusal says"
-    postgres: { na: "deleting the checkpoint works on PostgreSQL: the slot is the anchor (Mac sweep F1)" }
-    mysql:    { test: open_defect_deleting_a_corrupt_cdc_checkpoint_accepts_a_new_anchor_mysql }
-    mssql:    { test: open_defect_deleting_a_corrupt_cdc_checkpoint_accepts_a_new_anchor_mssql }
-    mongo:    { test: open_defect_deleting_a_corrupt_cdc_checkpoint_accepts_a_new_anchor_mongo }
-    oracle:   { test: open_defect_deleting_a_corrupt_cdc_checkpoint_accepts_a_new_anchor_oracle }
-
   - id: corrupt_checkpoint_code
-    what: "a corrupt CDC checkpoint is refused as RIVET_SOURCE_CDC_CHECKPOINT_INVALID (exit 5)"
-    postgres: { test: open_defect_a_corrupt_cdc_checkpoint_is_refused_by_code_postgres }
-    mysql:    { test: open_defect_a_corrupt_cdc_checkpoint_is_refused_by_code_mysql }
-    mssql:    { test: open_defect_a_corrupt_cdc_checkpoint_is_refused_by_code_mssql }
-    mongo:    { test: open_defect_a_corrupt_cdc_checkpoint_is_refused_by_code_mongo }
-    oracle:   { test: open_defect_a_corrupt_cdc_checkpoint_is_refused_by_code_oracle }
+    what: "RESULTS 13: a corrupt CDC checkpoint is refused as RIVET_SOURCE_CDC_CHECKPOINT_INVALID (exit 5); restoring the file or the re-baseline delivers the source, and deleting the file alone is refused again under the same code (PostgreSQL: it runs, the slot is the anchor)"
+    postgres: { test: a_corrupt_cdc_checkpoint_is_refused_by_code_postgres }
+    mysql:    { test: a_corrupt_cdc_checkpoint_is_refused_by_code_mysql }
+    mssql:    { test: a_corrupt_cdc_checkpoint_is_refused_by_code_mssql }
+    mongo:    { test: a_corrupt_cdc_checkpoint_is_refused_by_code_mongo }
+    oracle:   { test: a_corrupt_cdc_checkpoint_is_refused_by_code_oracle }
 
   - id: cdc_truncate_code
-    what: "a TRUNCATE inside the stream is refused as RIVET_SOURCE_CDC_TRUNCATED (exit 5)"
-    postgres: { test: open_defect_a_cdc_truncate_is_refused_by_code_postgres }
-    mysql:    { test: open_defect_a_cdc_truncate_is_refused_by_code_mysql }
+    what: "a TRUNCATE inside the stream is refused as RIVET_SOURCE_CDC_TRUNCATED (exit 5), and the re-baseline delivers the source"
+    postgres: { test: a_cdc_truncate_is_refused_by_code_postgres }
+    mysql:    { test: a_cdc_truncate_is_refused_by_code_mysql }
     mssql:    { na: "SQL Server rejects TRUNCATE on a captured table (Msg 4711)" }
-    mongo:    { test: open_defect_a_cdc_collection_drop_is_refused_by_code_mongo }
+    mongo:    { test: a_cdc_collection_drop_is_refused_by_code_mongo }
     oracle:   { test: a_cdc_truncate_is_refused_by_code_oracle }
 
   - id: log_gone_before_the_first_changes_run
     what: "RESULTS 6, 17: retained changes removed past a checkpoint no changes run has advanced are refused as RIVET_SOURCE_CDC_LOG_GAP (exit 5)"
-    postgres: { test: open_defect_a_dropped_slot_is_refused_by_code_postgres }
-    mysql:    { test: open_defect_binlogs_purged_past_the_checkpoint_before_the_first_changes_run_are_refused_by_code_mysql }
+    postgres: { test: a_dropped_slot_is_refused_by_code_postgres }
+    mysql:    { test: binlogs_purged_past_the_checkpoint_before_the_first_changes_run_are_refused_by_code_mysql }
     mssql:    { test: open_defect_a_change_table_cleaned_past_the_checkpoint_before_the_first_changes_run_is_refused_by_code_mssql }
-    mongo:    { test: open_defect_an_oplog_rolled_past_the_checkpoint_before_the_first_changes_run_is_refused_by_code_mongo }
+    mongo:    { test: an_oplog_rolled_past_the_checkpoint_before_the_first_changes_run_is_refused_by_code_mongo }
     oracle:   { gap: "attempted again 2026-10-08 with a throwaway container of the cell's own (the image is on the machine): gvenzl/oracle-free:23-slim-faststart with dev/oracle/init/01-grants.sql and 02-logminer.sh mounted is ready in 26 s, and against it rivet init --mode cdc, the anchor run and one changes run exit 0, a further change is pending, and three log switches leave 4 archived logs, 4 present (V$ARCHIVED_LOG). The last step was not run: the image ships no rman, so the redo can only be lost by deleting the files under /opt/oracle/oradata/archive inside the container, and the agent session's safety check denied that removal (Permission for this command was denied by a built-in Claude Code safety check); it was not routed around. Needs a person to run the removal step once, or an image with rman. The fabricated-low-water twin is live_cdc_oracledb::oracle_cdc_resume_past_log_retention_fails_loudly" }
 
   - id: log_gone_after_a_changes_run
     what: "RESULTS 17: retained changes removed past a checkpoint a changes run advanced are refused as RIVET_SOURCE_CDC_LOG_GAP (exit 5)"
-    postgres: { test: open_defect_a_dropped_slot_after_a_changes_run_is_refused_by_code_postgres }
-    mysql:    { test: open_defect_binlogs_purged_past_the_checkpoint_after_a_changes_run_are_refused_by_code_mysql }
+    postgres: { test: a_dropped_slot_after_a_changes_run_is_refused_by_code_postgres }
+    mysql:    { test: binlogs_purged_past_the_checkpoint_after_a_changes_run_are_refused_by_code_mysql }
     mssql:    { test: a_change_table_cleaned_past_the_checkpoint_after_a_changes_run_is_refused_by_code_mssql }
-    mongo:    { test: open_defect_an_oplog_rolled_past_the_checkpoint_after_a_changes_run_is_refused_by_code_mongo }
+    mongo:    { test: an_oplog_rolled_past_the_checkpoint_after_a_changes_run_is_refused_by_code_mongo }
     oracle:   { gap: "attempted again 2026-10-08 with a throwaway container of the cell's own (the image is on the machine): gvenzl/oracle-free:23-slim-faststart with dev/oracle/init/01-grants.sql and 02-logminer.sh mounted is ready in 26 s, and against it rivet init --mode cdc, the anchor run and one changes run exit 0, a further change is pending, and three log switches leave 4 archived logs, 4 present (V$ARCHIVED_LOG). The last step was not run: the image ships no rman, so the redo can only be lost by deleting the files under /opt/oracle/oradata/archive inside the container, and the agent session's safety check denied that removal (Permission for this command was denied by a built-in Claude Code safety check); it was not routed around. Needs a person to run the removal step once, or an image with rman. The fabricated-low-water twin is live_cdc_oracledb::oracle_cdc_resume_past_log_retention_fails_loudly" }
 
   - id: refused_cdc_run_leaves_a_slot
