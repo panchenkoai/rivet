@@ -25,6 +25,8 @@ pub struct KeysetRangeRow {
     /// Inclusive upper bound (`None` = +∞, the last range).
     pub hi: Option<String>,
     pub done: bool,
+    /// The highest key the committed range delivered (`None`: no rows, or committed before it was recorded).
+    pub max_key: Option<String>,
 }
 
 /// A part a worker committed for its range — the `file_log` payload written
@@ -81,7 +83,7 @@ impl StateStore {
         run_id: &str,
         key_column: &str,
     ) -> Result<Vec<KeysetRangeRow>> {
-        let sql = "SELECT range_index, lo, hi, done FROM keyset_range \
+        let sql = "SELECT range_index, lo, hi, done, max_key FROM keyset_range \
                    WHERE export_name = ?1 AND run_id = ?2 \
                      AND (key_column IS NULL OR key_column = ?3) \
                    ORDER BY range_index";
@@ -93,6 +95,7 @@ impl StateStore {
                 lo: r.opt_text(1),
                 hi: r.opt_text(2),
                 done: r.i64(3) != 0,
+                max_key: r.opt_text(4),
             },
         )
     }
@@ -135,12 +138,12 @@ impl StateStore {
     /// boundary — a crash before it commits leaves the range `done=0` with no
     /// `file_log` rows (re-read on resume), after it leaves both durable (skipped +
     /// rehydrated on resume). Only the range's OWN row is touched, so concurrent
-    /// workers never contend.
+    /// workers never contend. The range is named by its index with the highest key it delivered.
     pub fn commit_keyset_range(
         &self,
         run_id: &str,
         export_name: &str,
-        range_index: i64,
+        (range_index, max_key): (i64, Option<&str>),
         parts: &[KeysetRangePart],
         format: &str,
         compression: Option<&str>,
@@ -152,7 +155,7 @@ impl StateStore {
         // Scope the `done` flip by run_id (the table's PK is (export_name,
         // range_index) — run_id is NOT in it), so a run can never flip a row
         // belonging to ANOTHER run's recovery set left behind by a crash (H1).
-        let done_sql = "UPDATE keyset_range SET done = 1, updated_at = ?1 \
+        let done_sql = "UPDATE keyset_range SET done = 1, updated_at = ?1, max_key = ?5 \
              WHERE export_name = ?2 AND range_index = ?3 AND run_id = ?4";
         self.transaction(|| {
             for p in parts {
@@ -177,6 +180,7 @@ impl StateStore {
                     export_name.into(),
                     range_index.into(),
                     run_id.into(),
+                    max_key.into(),
                 ],
             )?;
             Ok(())
@@ -226,7 +230,7 @@ mod tests {
             rows: 3,
             bytes: 30,
         };
-        s.commit_keyset_range("run-1", "exp", 0, &[part], "parquet", None)
+        s.commit_keyset_range("run-1", "exp", (0, None), &[part], "parquet", None)
             .unwrap_err();
         assert!(s.get_files(Some("exp"), 10).unwrap().is_empty());
     }
@@ -310,7 +314,7 @@ mod tests {
             .commit_keyset_range(
                 "run-1",
                 "exp",
-                1,
+                (1, Some("k9")),
                 &[KeysetRangePart {
                     file_name: "exp_run-1_pk_w1_0.parquet".to_string(),
                     rows: 42,
@@ -324,6 +328,15 @@ mod tests {
         let loaded = s.load_keyset_ranges("exp", "run-1", "id").unwrap();
         assert!(!loaded[0].done, "range 0 untouched");
         assert!(loaded[1].done, "range 1 committed → done");
+        assert_eq!(
+            loaded[0].max_key, None,
+            "an open range has delivered nothing"
+        );
+        assert_eq!(
+            loaded[1].max_key.as_deref(),
+            Some("k9"),
+            "the committed range keeps the highest key it delivered"
+        );
         // The part landed in file_log under the run_id (rehydration source).
         let files = s.list_files_for_run("run-1").unwrap();
         assert_eq!(files.len(), 1);

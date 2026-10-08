@@ -58,7 +58,7 @@ scenarios:
     oracle:   { test: a_changed_cursor_column_is_refused_and_walked_out_oracle }
 
   - id: refusal_state_cursor_stream_mismatch
-    what: "RIVET_STATE_CURSOR_STREAM_MISMATCH: an incremental export repointed at another table; both named remedies deliver, `state reset-chunks` leaves the refusal"
+    what: "RIVET_STATE_CURSOR_STREAM_MISMATCH: an incremental export repointed at another table; own names and `state reset` deliver, `state reset-chunks` leaves the refusal (`state accept`, the third named remedy, is walked by incremental_query_filter_edited and incremental_query_cosmetic_edit_accepted in docs/mode-transition-matrix.yaml)"
     postgres: { test: a_repointed_incremental_export_is_refused_and_walked_out_postgres }
     mysql:    { test: a_repointed_incremental_export_is_refused_and_walked_out_mysql }
     mssql:    { test: a_repointed_incremental_export_is_refused_and_walked_out_mssql }

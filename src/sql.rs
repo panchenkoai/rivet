@@ -322,38 +322,85 @@ pub(crate) fn oracle_catalog_preds(qualified: &str) -> (String, String) {
     }
 }
 
-/// The first relation the outermost `FROM` of `query` names, quotes stripped (`schema.table`); `None` for a subquery or no `FROM`.
-pub(crate) fn outer_from_relation(query: &str) -> Option<String> {
-    let b = query.as_bytes();
-    let ident = |c: u8| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'$' | b'#') || c >= 0x80;
-    let closer = |c: u8| match c {
+/// Whether `c` may be part of an unquoted identifier.
+fn ident_byte(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, b'_' | b'$' | b'#') || c >= 0x80
+}
+
+/// The byte that closes the quote `c` opens, if it opens one.
+fn quote_closer(c: u8) -> Option<u8> {
+    match c {
         b'\'' | b'"' | b'`' => Some(c),
         b'[' => Some(b']'),
         _ => None,
-    };
+    }
+}
+
+/// Byte offset of the first `keyword` of `query` outside quotes and parentheses.
+fn outer_keyword(query: &str, keyword: &str) -> Option<usize> {
+    let (b, kw) = (query.as_bytes(), keyword.as_bytes());
     let (mut depth, mut quote) = (0i32, None);
-    let after_from = b.iter().enumerate().find_map(|(i, &c)| {
+    b.iter().enumerate().find_map(|(i, &c)| {
         if let Some(end) = quote {
             quote = Some(end).filter(|&e| e != c);
             return None;
         }
-        quote = closer(c);
+        quote = quote_closer(c);
         match c {
             b'(' => depth += 1,
             b')' => depth -= 1,
             _ => {}
         }
-        let keyword = depth == 0
-            && b[i..].len() >= 4
-            && b[i..i + 4].eq_ignore_ascii_case(b"from")
-            && (i == 0 || !ident(b[i - 1]))
-            && b.get(i + 4).is_none_or(|&n| !ident(n));
-        keyword.then_some(i + 4)
-    })?;
-    if quote.is_some() {
-        return None;
+        let found = depth == 0
+            && b[i..].len() >= kw.len()
+            && b[i..i + kw.len()].eq_ignore_ascii_case(kw)
+            && (i == 0 || !ident_byte(b[i - 1]))
+            && b.get(i + kw.len()).is_none_or(|&n| !ident_byte(n));
+        found.then_some(i)
+    })
+}
+
+/// The rows `query` selects, as text to compare: the query without its outermost projection and with `?` for the relation its outermost `FROM` names (the stream holds the name), lower-cased and with whitespace folded outside quotes; the whole query when it has no outermost `SELECT ... FROM`.
+pub(crate) fn row_set(query: &str) -> String {
+    let q = query.trim_matches(|c: char| c.is_whitespace() || c == ';');
+    let rows = match (outer_keyword(q, "select"), outer_keyword(q, "from")) {
+        (Some(select), Some(from)) if select < from => match outer_relation(q) {
+            Some((_, at)) => format!("{}{}?{}", &q[..select], &q[from..at.start], &q[at.end..]),
+            None => format!("{}{}", &q[..select], &q[from..]),
+        },
+        _ => q.to_string(),
+    };
+    let (mut out, mut quote, mut gap) = (String::with_capacity(rows.len()), None, false);
+    for c in rows.chars() {
+        match quote {
+            Some(end) => {
+                out.push(c);
+                quote = Some(end).filter(|&e| e != c);
+            }
+            None if c.is_whitespace() => gap = true,
+            None => {
+                if std::mem::take(&mut gap) && !out.is_empty() {
+                    out.push(' ');
+                }
+                out.push(c.to_ascii_lowercase());
+                quote = u8::try_from(c).ok().and_then(quote_closer).map(char::from);
+            }
+        }
     }
+    out
+}
+
+/// The first relation the outermost `FROM` of `query` names, quotes stripped (`schema.table`); `None` for a subquery or no `FROM`.
+pub(crate) fn outer_from_relation(query: &str) -> Option<String> {
+    outer_relation(query).map(|(name, _)| name)
+}
+
+/// [`outer_from_relation`] with the bytes of `query` that spell the relation.
+fn outer_relation(query: &str) -> Option<(String, std::ops::Range<usize>)> {
+    let (ident, closer) = (ident_byte, quote_closer);
+    let after_from = outer_keyword(query, "from")? + 4;
     let mut rest = query[after_from..].trim_start();
+    let start = query.len() - rest.len();
     let mut parts: Vec<&str> = Vec::new();
     loop {
         let first = *rest.as_bytes().first()?;
@@ -373,13 +420,66 @@ pub(crate) fn outer_from_relation(query: &str) -> Option<String> {
         parts.push(part);
         match tail.strip_prefix('.') {
             Some(next) => rest = next,
-            None => return Some(parts.join(".")),
+            None => return Some((parts.join("."), start..query.len() - tail.len())),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_row_set_changes_with_the_filter_and_the_source_and_not_with_the_projection_or_layout() {
+        let rows = row_set;
+        assert_eq!(rows("SELECT * FROM orders"), "from ?");
+        assert_eq!(
+            rows("select id, added_later\n  from   \"Sales\".Orders ;\n"),
+            "from ?",
+            "the relation is the stream's to compare"
+        );
+        assert_eq!(
+            rows("SELECT id FROM orders WHERE spent = 1"),
+            "from ? where spent = 1"
+        );
+        assert_ne!(
+            rows("SELECT id FROM orders WHERE spent = 1"),
+            rows("SELECT id FROM orders WHERE spent = 0")
+        );
+        assert_ne!(
+            rows("SELECT id FROM orders o JOIN a ON a.id = o.id"),
+            rows("SELECT id FROM orders o JOIN b ON b.id = o.id")
+        );
+        assert_ne!(
+            rows("SELECT id FROM orders WHERE note = 'a  B'"),
+            rows("SELECT id FROM orders WHERE note = 'a b'"),
+            "text inside quotes is kept as written"
+        );
+        assert_eq!(
+            rows("SELECT id FROM orders WHERE note = 'a  B'"),
+            "from ? where note = 'a  B'"
+        );
+        assert_eq!(
+            rows("SELECT id, extract(year FROM created) y, 'x from y' s FROM [Order Lines] L"),
+            "from ? l"
+        );
+        assert_eq!(
+            rows("WITH recent AS (SELECT * FROM archive WHERE d > 1) SELECT id FROM recent"),
+            "with recent as (select * from archive where d > 1) from ?"
+        );
+        assert_eq!(
+            rows("SELECT a FROM (SELECT 1 a) x WHERE a > 0"),
+            "from (select 1 a) x where a > 0"
+        );
+        assert_ne!(
+            rows("SELECT id FROM a UNION ALL SELECT id FROM b"),
+            rows("SELECT id FROM a UNION ALL SELECT id FROM c")
+        );
+        assert_eq!(rows("SELECT 1"), "select 1");
+        assert_eq!(rows("VALUES (1)"), "values (1)");
+        assert_eq!(rows("FROM t SELECT x"), "from t select x");
+        assert_eq!(rows("selection FROM t"), "selection from t");
+        assert_eq!(rows(""), "");
+    }
 
     #[test]
     fn outer_from_relation_names_the_object_a_query_reads_and_nothing_else() {

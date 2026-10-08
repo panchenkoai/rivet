@@ -234,6 +234,17 @@ fn highest_range_max(range_maxes: Vec<Option<String>>) -> Option<String> {
     range_maxes.into_iter().rev().flatten().next()
 }
 
+/// The per-range high-water keys a run starts from: the key each range committed before a crash recorded, `None` for the rest.
+fn seeded_range_max(total: usize, committed: Vec<(usize, Option<String>)>) -> Vec<Option<String>> {
+    let mut max = vec![None; total];
+    for (idx, key) in committed {
+        if let Some(slot) = max.get_mut(idx) {
+            *slot = key;
+        }
+    }
+    max
+}
+
 /// The page's high-water key rides only on its LAST part (v25): the point the whole page is committed.
 fn page_part_cursor(pi: usize, n_parts: usize, high_water: &Option<String>) -> Option<String> {
     (pi + 1 == n_parts).then(|| high_water.clone()).flatten()
@@ -497,6 +508,7 @@ fn run_keyset_parallel(
     };
     let (floor_r, ceil_r) = (floor.as_deref(), ceil.as_deref());
 
+    let mut committed_max: Vec<(usize, Option<String>)> = Vec::new();
     // ranges: (range_index, lo_exclusive, hi_inclusive, already_done)
     let ranges: Vec<(usize, Option<String>, Option<String>, bool)> = match (&resume_run_id, state) {
         (Some(rid), Some(st)) => {
@@ -504,7 +516,10 @@ fn run_keyset_parallel(
             summary.resumed = true;
             st.load_keyset_ranges(&plan.export_name, rid, &key)?
                 .into_iter()
-                .map(|r| (r.range_index as usize, r.lo, r.hi, r.done))
+                .map(|r| {
+                    committed_max.push((r.range_index as usize, r.max_key));
+                    (r.range_index as usize, r.lo, r.hi, r.done)
+                })
                 .collect()
         }
         (None, Some(st)) if checkpoint => {
@@ -592,12 +607,9 @@ fn run_keyset_parallel(
     // disk, #200-1) and checksums per committed RANGE — both under the range's
     // `UnitId`, so the seam can compute Form-B coverage.
     let fan = super::fan_in::FanIn::default();
-    // Per-range high-water key, indexed by range_index (done ranges stay None —
-    // they are not re-run). cursor_high = the highest populated range's max; on a
-    // RESUME this reflects the RE-RUN ranges only (a range already `done` pre-crash
-    // is skipped), which is acceptable — parallel keyset is a full snapshot, not an
-    // incremental anchor, so its cursor range is descriptive, not a resume floor.
-    let range_max: Mutex<Vec<Option<String>>> = Mutex::new(vec![None; total_ranges]);
+    // Per-range high-water key, indexed by range_index; a range committed before a crash brings the key it recorded.
+    let range_max: Mutex<Vec<Option<String>>> =
+        Mutex::new(seeded_range_max(total_ranges, committed_max));
     let range_first: Mutex<Option<String>> = Mutex::new(None);
 
     // #152: one permit PER PAGE, so shrinking the ceiling sheds workers at page
@@ -713,7 +725,7 @@ fn run_keyset_parallel(
                     st.commit_keyset_range(
                         rid_r,
                         &plan_r.export_name,
-                        ridx as i64,
+                        (ridx as i64, rmax.as_deref()),
                         &range_parts,
                         fmt_r,
                         Some(cmp_r),
@@ -1286,6 +1298,8 @@ mod tests {
             export_name: "e".into(),
             source: "p".into(),
             stream: String::new(),
+            schema: String::new(),
+            population: String::new(),
             column: Some("id".into()),
             mode: "keyset",
             continues_high_water: false,
@@ -1466,6 +1480,18 @@ mod tests {
         assert_eq!(page_part_cursor(2, 3, &hw), hw);
         assert_eq!(page_part_cursor(0, 1, &hw), hw);
         assert_eq!(page_part_cursor(0, 1, &None), None);
+    }
+
+    /// P-22: a resumed run's cursor is the highest key of the whole run, the ranges committed before the crash included.
+    #[test]
+    fn a_resumed_run_counts_the_keys_its_committed_ranges_recorded() {
+        let s = |x: &str| Some(x.to_string());
+        let seeded = seeded_range_max(4, vec![(0, None), (1, None), (3, s("400")), (9, s("x"))]);
+        assert_eq!(seeded, vec![None, None, None, s("400")]);
+        let mut after_the_rerun = seeded;
+        after_the_rerun[1] = s("225");
+        assert_eq!(highest_range_max(after_the_rerun), s("400"));
+        assert_eq!(seeded_range_max(2, Vec::new()), vec![None, None]);
     }
 
     // ── highest_range_max: cursor_high = the top populated range's max ────────

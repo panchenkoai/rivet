@@ -1323,11 +1323,9 @@ fn mysql_binlogs_purged_past_the_checkpoint(after_a_changes_run: bool) {
     let mut r = mysql::Conn::new(REPLICA_ROOT).expect("connect mysql-replica :3309");
     let running: Option<mysql::Row> = r.query_first("SHOW REPLICA STATUS").unwrap();
     let io: Option<String> = running.and_then(|row| row.get("Replica_SQL_Running"));
-    assert_eq!(
-        io.as_deref(),
-        Some("Yes"),
-        "fixture: the replica stand replicates (live_cdc_replica wires it)"
-    );
+    if io.as_deref() != Some("Yes") {
+        crate::live_cdc_replica::ensure_replication();
+    }
     let table = unique_name("oc_purge");
     let _table = ReplicatedTable(table.clone());
     p.query_drop(format!(
