@@ -1479,6 +1479,22 @@ exports:
         journals.iter().map(said).collect()
     }
 
+    /// Only the event `state accept` records is an acceptance: a run's own warning is not one.
+    #[test]
+    fn a_runs_warning_is_not_an_acceptance() {
+        let journal = |context: &str| {
+            let mut j = make_journal("run_1", "orders");
+            j.record(RunEvent::Warning {
+                context: context.into(),
+                message: "kept".into(),
+            });
+            j
+        };
+        assert_eq!(acceptance(&journal("finalize")), None);
+        assert_eq!(acceptance(&journal(ACCEPTED)), Some("kept"));
+        assert_eq!(acceptance(&make_journal("run_2", "orders")), None);
+    }
+
     /// `state accept` re-binds the row a run is refused for, journals it once, and stops with nothing changed for another column, a cdc export, an unknown export, an unresolved source or a live run.
     #[test]
     fn state_accept_keeps_the_cursor_and_journals_the_acceptance() {
