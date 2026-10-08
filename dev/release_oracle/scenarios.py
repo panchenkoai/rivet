@@ -1935,6 +1935,22 @@ def verify_partition_footer(led: Ledger) -> None:
                       ["live_partition_footer"])
 
 
+def nextest_live(log_path: Path, expr: str, env: dict[str, str] | None = None,
+                 threads: int | None = None) -> tuple[dict[str, str], int | None, dict[str, str], dict[str, str]]:
+    """One `cargo nextest` leg over live_suite: (verdicts, tests started, self-skips, first panic lines); the output goes to `log_path`."""
+    skip_log = Path(str(log_path) + ".skips")
+    skip_log.write_text("")
+    p = run(
+        ["cargo", "nextest", "run", "--manifest-path", str(ROOT / "Cargo.toml"),
+         "--test", "live_suite", "--run-ignored", "all", "--no-fail-fast",
+         *(["--test-threads", str(threads)] if threads else []), "-E", expr],
+        env={**release_bin_env(), **(env or {}), "RIVET_SKIP_LOG": str(skip_log)},
+        timeout=NO_TIMEOUT,
+    )
+    log_path.write_text(p.out)
+    return nextest_outcomes(p.out), nextest_started(p.out), self_skipped(skip_log), nextest_panics(p.out)
+
+
 def _run_live_modules(led: Ledger, scenario: str, label: str, phase: str,
                       modules: list[str], env: dict[str, str] | None = None,
                       expr: str | None = None, threads: int | None = None) -> None:
@@ -1945,32 +1961,16 @@ def _run_live_modules(led: Ledger, scenario: str, label: str, phase: str,
         return
     RAN_LIVE_MODULES.update(modules)
     log_path = work_dir() / f"{scenario}_{'_'.join(modules)[:120]}.log"
-    skip_log = Path(str(log_path) + ".skips")
-    skip_log.write_text("")
-    p = run(
-        ["cargo", "nextest", "run", "--manifest-path", str(ROOT / "Cargo.toml"),
-         "--test", "live_suite", "--run-ignored", "all", "--no-fail-fast",
-         *(["--test-threads", str(threads)] if threads else []),
-         "-E", expr or " | ".join(f"test(/^{m}::/)" for m in modules)],
-        env={**release_bin_env(), **(env or {}), "RIVET_SKIP_LOG": str(skip_log)},
-        timeout=NO_TIMEOUT,
-    )
-    log_path.write_text(p.out)
-    # The shared, self-tested parser: a local regex here required an UNPADDED `(n/m)` and
-    # nextest pads it (`(   5/1038)`), so all but the last few verdicts — failures included
-    # — were silently dropped (39 of 1038 graded, measured 2026-09-27).
-    verdicts = nextest_outcomes(p.out)
-    started = nextest_started(p.out)
+    verdicts, started, skipped, panics = nextest_live(
+        log_path, expr or " | ".join(f"test(/^{m}::/)" for m in modules), env, threads)
     if started is not None and len(verdicts) != started:
         _failed(led, scenario, "batch", "-", "-",
                 f"{label}: graded {len(verdicts)} of the {started} tests nextest ran — the rest "
                 f"were not read (see {log_path})", "unread verdicts")
     if not verdicts:
         _failed(led, scenario, "batch", "-", "-",
-                f"{label}: no test ran (see {log_path})", _first_match(p.out, r"error|FAILED"))
+                f"{label}: no test ran (see {log_path})", _first_match(log_path.read_text(), r"error|FAILED"))
         return
-    skipped = self_skipped(skip_log)
-    panics = nextest_panics(p.out)
     for name, verdict in sorted(verdicts.items()):
         if verdict in ("PASS", "LEAK") and name in skipped:
             why = SKIP_ALLOWED.get(name)

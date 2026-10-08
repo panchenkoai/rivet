@@ -621,3 +621,53 @@ pub fn azure_put(container: &str, key: &str, bytes: &[u8]) {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// Remove `bucket` and everything in it from the local MinIO.
+pub fn remove_minio_bucket(bucket: &str) {
+    let out = minio_mc(&format!("mc rb --force local/{bucket}"))
+        .output()
+        .expect("spawn mc rb");
+    assert!(
+        out.status.success(),
+        "`mc rb --force local/{bucket}`: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Remove `bucket` and every object in it from the fake-gcs server.
+pub fn remove_gcs_bucket(bucket: &str) {
+    let http = reqwest::blocking::Client::new();
+    let base = format!("http://127.0.0.1:4443/storage/v1/b/{bucket}");
+    for name in fake_gcs_names(bucket, "") {
+        let _ = http
+            .delete(format!("{base}/o/{}", name.replace('/', "%2F")))
+            .send();
+    }
+    let resp = http.delete(&base).send().expect("fake-gcs bucket delete");
+    assert!(
+        resp.status().is_success(),
+        "fake-gcs delete of bucket {bucket}: {}",
+        resp.status()
+    );
+}
+
+/// Remove `container` and every blob in it from Azurite.
+pub fn remove_azure_container(container: &str) {
+    let out = Command::new("az")
+        .args([
+            "storage",
+            "container",
+            "delete",
+            "--name",
+            container,
+            "--connection-string",
+            AZURITE_CONN_STRING,
+        ])
+        .output()
+        .expect("spawn az storage container delete");
+    assert!(
+        out.status.success(),
+        "az storage container delete {container}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

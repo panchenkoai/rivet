@@ -96,13 +96,6 @@ fn files_below(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
         .collect()
 }
 
-/// Whether `dir` holds a parquet part yet.
-fn has_a_part(dir: &std::path::Path) -> bool {
-    files_below(dir)
-        .iter()
-        .any(|p| p.extension().is_some_and(|e| e == "parquet"))
-}
-
 /// `url` with its host and port replaced by one nothing listens on.
 fn unreachable(url: &str) -> String {
     let (scheme, rest) = url.split_once("://").expect("a URL");
@@ -134,13 +127,6 @@ fn range_checkpoint_rig(engine: SqlEngine, table: &str) -> Rig {
     RANGE_CHECKPOINT
         .iter()
         .fold(engine.rig(table).mode("chunked"), |r, l| r.export_line(l))
-}
-
-/// `rig` reading ten rows every `ms` milliseconds, so a run stays alive long enough to meet another.
-fn slowed(rig: Rig, ms: u32) -> Rig {
-    rig.source_line("tuning:")
-        .source_line("  batch_size: 10")
-        .source_line(&format!("  throttle_ms: {ms}"))
 }
 
 // (a) exit 0 over a wrong destination
@@ -225,72 +211,6 @@ fn run_validate_flag_on(rig: Rig) {
     );
 }
 
-/// What of a SQLite state beside a config is made read-only.
-#[derive(Clone, Copy, Debug)]
-enum ReadOnly {
-    /// The state files themselves.
-    Files,
-    /// The directory that holds them, the files left writable: a read-only volume mount.
-    Directory,
-}
-
-/// Makes the SQLite state beside a config read-only until dropped; holds each path with the mode to put back.
-struct ReadOnlyState(Vec<(std::path::PathBuf, u32)>);
-
-impl ReadOnlyState {
-    fn beside(cfg: &std::path::Path, shape: ReadOnly) -> Self {
-        use std::os::unix::fs::PermissionsExt as _;
-        let dir = cfg.parent().unwrap();
-        if let ReadOnly::Directory = shape {
-            // The last connection to close checkpoints and removes `-wal` and `-shm`, as a finished run does.
-            rusqlite::Connection::open(dir.join(".rivet_state.db"))
-                .and_then(|c| c.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(())))
-                .expect("checkpoint the state");
-        }
-        let files: Vec<_> = files_below(dir)
-            .into_iter()
-            .filter(|p| {
-                p.file_name()
-                    .is_some_and(|n| n.to_string_lossy().starts_with(".rivet_state.db"))
-            })
-            .collect();
-        assert!(
-            !files.is_empty(),
-            "fixture: a SQLite state beside the config"
-        );
-        let paths = match shape {
-            ReadOnly::Files => files,
-            ReadOnly::Directory => {
-                assert_eq!(
-                    files.len(),
-                    1,
-                    "fixture: a state no process has open is one file, with no -wal or -shm: {files:?}"
-                );
-                vec![dir.to_path_buf()]
-            }
-        };
-        let locked = paths
-            .into_iter()
-            .map(|p| {
-                let mode = std::fs::metadata(&p).unwrap().permissions().mode();
-                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode & !0o222))
-                    .unwrap();
-                (p, mode)
-            })
-            .collect();
-        ReadOnlyState(locked)
-    }
-}
-
-impl Drop for ReadOnlyState {
-    fn drop(&mut self) {
-        use std::os::unix::fs::PermissionsExt as _;
-        for (path, mode) in &self.0 {
-            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(*mode));
-        }
-    }
-}
-
 /// The environment that keeps a cell's state in SQLite beside the config, whichever backend the gate grades.
 const SQLITE_STATE: &[(&str, &str)] = &[("RIVET_STATE_URL", "")];
 
@@ -332,8 +252,8 @@ fn mongo_read_only_state() {
 
 /// `rig` has run once on the SQLite state: for each read-only shape, lock it, refuse twice, unlock, deliver.
 fn read_only_state_on(mut rig: Rig) {
-    for shape in [ReadOnly::Files, ReadOnly::Directory] {
-        let locked = ReadOnlyState::beside(&rig.config_path(), shape);
+    for shape in [Local::State, Local::StateDirectory] {
+        let locked = rig.read_only(shape);
         let said = rig.refuses_twice_then(
             &["run"],
             SQLITE_STATE,
@@ -421,7 +341,7 @@ fn concurrent_full_runs(engine: SqlEngine) {
 }
 
 fn concurrent_full_runs_on(rig: Rig) {
-    two_full_runs(slowed(rig, 200), 200, 1500);
+    two_full_runs(rig.slowed(200), 200, 1500);
 }
 
 /// Start `rig`, start it again `after_ms` later while the first is alive: both exiting 0 must not leave more than `N` rows.
@@ -885,34 +805,22 @@ fn pg_cdc_missing_table_leaves_no_slot() {
 /// RESULTS 11: a second run beside a live checkpointed run is refused as `RIVET_STATE_RUN_IN_PROGRESS` (exit 5).
 fn second_run_beside_a_live_checkpointed_one(engine: SqlEngine) {
     let (table, _guard) = range_table(engine, "oc_live", 300);
-    let rig = slowed(
-        engine
-            .rig(&table)
-            .mode("chunked")
-            .export_line("chunk_column: id")
-            .export_line("chunk_size: 150")
-            .export_line("chunk_checkpoint: true"),
-        600,
-    );
+    let rig = engine
+        .rig(&table)
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 150")
+        .export_line("chunk_checkpoint: true")
+        .slowed(600);
     second_run_beside(rig, 300);
 }
 
 /// The second run of `rig` while its first is mid-export is refused as `RIVET_STATE_RUN_IN_PROGRESS`, and the first delivers `n` rows.
 fn second_run_beside(rig: Rig, n: usize) {
-    let mut first = rig.spawn_args_env(&[], &[]);
-    while !has_a_part(&rig.out_dir()) {
-        assert!(
-            first.try_wait().unwrap().is_none(),
-            "fixture: the run exited before it was seen mid-export"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    let second = rig.run();
-    assert!(
-        first.try_wait().unwrap().is_none(),
-        "fixture: the first run is alive when the second answers"
-    );
-    assert!(first.wait().unwrap().success(), "the live run finishes");
+    let (first, second) = rig
+        .beside_a_live_run(&[], Rig::has_a_part, Rig::run)
+        .answered_while_alive();
+    assert!(first.status.success(), "the live run finishes");
     let delivered: usize = read_all_parts(&rig.out_dir())
         .iter()
         .map(|b| b.num_rows())
