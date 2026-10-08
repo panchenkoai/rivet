@@ -346,3 +346,43 @@ impl MongoTest {
         }
     }
 }
+
+impl MongoTest {
+    /// Kill on the server the cursors and operations other clients hold on collection `name`, polling up to 60 s for one; how many were killed.
+    pub fn kill_readers(&self, name: &str) -> usize {
+        let ns = format!("{}.{name}", self.db);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        self.rt.block_on(async {
+            let (admin, db) = (
+                self.client.database("admin"),
+                self.client.database(&self.db),
+            );
+            let mut killed = 0;
+            while killed == 0 && std::time::Instant::now() < deadline {
+                let mut ops = admin
+                    .aggregate([
+                        doc! { "$currentOp": { "allUsers": true, "idleCursors": true } },
+                        doc! { "$match": { "ns": &ns } },
+                    ])
+                    .await
+                    .expect("mongo: $currentOp");
+                while let Some(op) = ops.try_next().await.expect("mongo: $currentOp cursor") {
+                    let kill = match op.get_document("cursor").map(|c| c.get("cursorId")) {
+                        Ok(Some(id)) => {
+                            db.run_command(doc! { "killCursors": name, "cursors": [id.clone()] })
+                        }
+                        _ => match op.get("opid") {
+                            Some(opid) => {
+                                admin.run_command(doc! { "killOp": 1, "op": opid.clone() })
+                            }
+                            None => continue,
+                        },
+                    };
+                    killed += usize::from(kill.await.is_ok());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            killed
+        })
+    }
+}

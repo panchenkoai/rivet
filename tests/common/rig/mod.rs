@@ -16,6 +16,8 @@ use super::runner::RIVET_BIN;
 /// stack ships. Kept as an enum so `dest_yaml` stays the single renderer for
 /// every backend (two renderers per backend is the drift the rig exists to
 /// prevent).
+mod beside;
+pub use beside::{Local, Met, ReadOnly};
 mod init;
 pub use init::InitConfig;
 mod invoke;
@@ -25,7 +27,7 @@ mod oracle;
 mod remedy;
 pub use remedy::{Refused, Remedy, Then, assert_refused};
 mod sabotage;
-pub use sabotage::{Damage, Survived};
+pub use sabotage::{Damage, Stopped, Survived};
 mod render;
 mod verify;
 

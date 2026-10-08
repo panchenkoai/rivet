@@ -302,19 +302,22 @@ impl Rig {
         }
     }
 
-    /// Spawn `rivet run` and hand back the LIVE child, output discarded.
+    /// Spawn `rivet run` and hand back the LIVE child; what it prints is kept for [`Spawned::wait_with_output`].
     ///
     /// For tests that must act on a running process — signal it, inspect its
     /// children, watch the staged `.tmp` appear — rather than wait for an exit
     /// status. `run_args_env` blocks until completion and so cannot express them.
     /// The caller reaps it through [`Spawned`]; the reaping grades the run by its exit like any other.
     pub fn spawn_args_env(&self, extra: &[&str], envs: &[(&str, &str)]) -> Spawned<'_> {
+        static SPAWNED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = SPAWNED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let said = ["stdout", "stderr"].map(|s| self.dir.path().join(format!("spawned-{n}.{s}")));
         let argv = self.run_argv(extra);
         let mut case = self.oracle_begin(&argv, envs, None);
         let child = self
             .invoke_command(&argv, envs)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stdout(std::fs::File::create(&said[0]).expect("spawned stdout file"))
+            .stderr(std::fs::File::create(&said[1]).expect("spawned stderr file"))
             .spawn()
             .expect("spawn rivet");
         if let Some(case) = case.as_mut() {
@@ -324,6 +327,7 @@ impl Rig {
             rig: self,
             child,
             case,
+            said,
             envs: envs
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -547,6 +551,8 @@ pub struct Spawned<'a> {
     rig: &'a Rig,
     child: std::process::Child,
     case: Option<crate::common::verify::Case>,
+    /// The files holding the child's stdout and stderr.
+    said: [PathBuf; 2],
     envs: Vec<(String, String)>,
 }
 
@@ -567,13 +573,13 @@ impl Spawned<'_> {
         Ok(status)
     }
 
-    /// [`Spawned::wait`] with the (discarded, so empty) output.
+    /// [`Spawned::wait`] with everything the child printed.
     pub fn wait_with_output(mut self) -> std::io::Result<std::process::Output> {
         let status = self.wait()?;
         Ok(std::process::Output {
             status,
-            stdout: Vec::new(),
-            stderr: Vec::new(),
+            stdout: std::fs::read(&self.said[0])?,
+            stderr: std::fs::read(&self.said[1])?,
         })
     }
 
