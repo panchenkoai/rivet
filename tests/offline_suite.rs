@@ -146,6 +146,8 @@ mod slot_guard_order_guard;
 mod stand_registry_guard;
 #[path = "offline/state_compat.rs"]
 mod state_compat;
+#[path = "offline/test_checks_guard.rs"]
+mod test_checks_guard;
 #[path = "offline/time_window.rs"]
 mod time_window;
 #[path = "offline/trust_artifacts_integration.rs"]

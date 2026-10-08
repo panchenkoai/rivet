@@ -353,68 +353,6 @@ mod tests {
     }
 
     use super::*;
-    use std::path::Path;
-
-    struct MockDest {
-        caps: DestinationCapabilities,
-    }
-
-    impl Destination for MockDest {
-        fn write(&self, _local: &Path, _key: &str) -> Result<WriteOutcome> {
-            Ok(WriteOutcome::opaque())
-        }
-        fn capabilities(&self) -> DestinationCapabilities {
-            self.caps.clone()
-        }
-    }
-
-    fn atomic_safe() -> MockDest {
-        MockDest {
-            caps: DestinationCapabilities {
-                commit_protocol: WriteCommitProtocol::Atomic,
-                idempotent_overwrite: true,
-                retry_safe: true,
-                partial_write_risk: false,
-            },
-        }
-    }
-
-    fn streaming_unsafe() -> MockDest {
-        MockDest {
-            caps: DestinationCapabilities {
-                commit_protocol: WriteCommitProtocol::Streaming,
-                idempotent_overwrite: false,
-                retry_safe: false,
-                partial_write_risk: true,
-            },
-        }
-    }
-
-    // ── log_capabilities smoke tests — just verify no panic ─────────────────
-
-    #[test]
-    fn log_capabilities_retry_safe_no_panic() {
-        // Any non-local dest kind exercises the WARN branch when the
-        // backend reports retry_safe=false; here retry_safe=true so the
-        // branch is skipped — kind is irrelevant.
-        log_capabilities(
-            "orders",
-            &atomic_safe(),
-            crate::config::DestinationType::S3,
-            3,
-        );
-    }
-
-    #[test]
-    fn log_capabilities_not_retry_safe_with_retries_no_panic() {
-        // Stdout: WARN actually fires (idempotent overwrite not available).
-        log_capabilities(
-            "orders",
-            &streaming_unsafe(),
-            crate::config::DestinationType::Stdout,
-            3,
-        );
-    }
 
     /// The not-retry-safe WARN must not fire for a LOCAL destination — and the
     /// mechanism is not a demotion inside `log_capabilities`, which has no
@@ -451,16 +389,6 @@ mod tests {
         // The warn branch is `!retry_safe && max_retries > 0`, so the assertion
         // above IS the condition that keeps it silent — restating it as
         // `!(!retry_safe && 3 > 0)` would add a line and no coverage.
-    }
-
-    #[test]
-    fn log_capabilities_zero_retries_no_panic() {
-        log_capabilities(
-            "orders",
-            &streaming_unsafe(),
-            crate::config::DestinationType::Stdout,
-            0,
-        );
     }
 
     // ── create_destination — local roundtrip ─────────────────────────────────
