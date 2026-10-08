@@ -1649,13 +1649,14 @@ fn success_manifests(dir: &Path) -> BTreeSet<String> {
         .collect()
 }
 
-/// The source URL the oracle reads through: a toxiproxy front replaced by its upstream (a toxic left active cannot skew the read-back), the LogMiner user by the table owner.
+/// The source URL the oracle reads through: a toxiproxy or pgBouncer front replaced by its upstream (a toxic left active cannot skew the read-back; the pooler refuses the reader's startup options), the LogMiner user by the table owner.
 fn source_url(url: &str) -> String {
     if url == super::env::ORACLE_CDC_URL {
         return super::env::ORACLE_URL.to_string();
     }
     [
         (":15432/", ":5432/"),
+        (":6432/", ":5432/"),
         (":13306/", ":3306/"),
         (":13307/", ":3307/"),
         (":27019/", ":27017/"),
