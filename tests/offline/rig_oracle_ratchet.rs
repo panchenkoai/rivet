@@ -37,8 +37,9 @@ const NO_ORACLE_CEILING: usize = 24; // ratchet-pin: no-oracle-opt-outs
 // 34 -> 35 (2026-10-07): the refused-run-keeps-refusing cells (one shared rig): parts, their file_log rows, the observed schema and the kept anchor.
 // 35 -> 36 (2026-10-07): a parallel keyset resume that refuses over a deleted page while another worker finishes its range (seen on CI only).
 // 36 -> 39 (2026-10-08): `run --validate` over a failed verification now exits 3 and a failed cursor write exits 1, both after the export completed: the two operator-contract generators and roast_metric_validated_matches_final_summary_verdict declare the delivered run.
-// 39 -> 40 (2026-10-08): the sabotage cells that take a resource away from a live run (one shared declaration, `stopped_mid_run`): the parts, file_log rows and checkpoint rows written before the stop stay for the next run.
-const FAILED_RUN_LEFTOVER_CEILING: usize = 40; // ratchet-pin: failed-run-leftover-declarations
+// 39 -> 40 (2026-10-08): the SQL Server ADD COLUMN remedy cell: the log-gap refusal after the re-enable has stored the widened schema.
+// 40 -> 41 (2026-10-08): the sabotage cells that take a resource away from a live run (one shared declaration, `stopped_mid_run`): the parts, file_log rows and checkpoint rows written before the stop stay for the next run.
+const FAILED_RUN_LEFTOVER_CEILING: usize = 41; // ratchet-pin: failed-run-leftover-declarations
 
 /// Entries of `KNOWN_PRODUCT_DEFECTS` (tests/common/refusal.rs): product defects every failed run may show.
 const KNOWN_PRODUCT_DEFECT_CEILING: usize = 2; // ratchet-pin: failed-run-known-product-defects

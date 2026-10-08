@@ -181,6 +181,28 @@ fn missing_collection_refusal(
     })
 }
 
+impl MongoSession {
+    /// Refuse a collection the database does not list, by the rule [`MongoSource::export`] refuses it by.
+    pub(crate) fn require_collection(&self, collection: &str) -> Result<()> {
+        let listed = self.block_on(
+            self.client()
+                .database(self.db())
+                .list_collection_names()
+                .filter(doc! { "name": collection })
+                .into_future(),
+        );
+        match missing_collection_refusal(self.db(), collection, listed.ok()) {
+            Some(refusal) => {
+                crate::rivet_bail!(
+                    crate::error::codes::SOURCE_COLLECTION_NOT_FOUND,
+                    "{refusal}"
+                )
+            }
+            None => Ok(()),
+        }
+    }
+}
+
 /// MongoDB source over a [`MongoSession`], carrying the resolved `source.mongo:`
 /// read options `export` applies.
 pub struct MongoSource {

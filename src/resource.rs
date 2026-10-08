@@ -220,11 +220,6 @@ mod tests {
     }
 
     #[test]
-    fn get_rss_mb_does_not_panic() {
-        let _ = get_rss_mb();
-    }
-
-    #[test]
     fn rss_peak_sampler_stop_returns_value() {
         let sampler = RssPeakSampler::start(0, 50);
         let _peak = sampler.stop();

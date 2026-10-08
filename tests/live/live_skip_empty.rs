@@ -161,7 +161,7 @@ fn skip_empty_skips_on_the_mongo_parallel_runner() {
         "an empty parallel-Mongo export under skip_empty must succeed; stderr:\n{}",
         String::from_utf8_lossy(&r.stderr)
     );
-    assert_eq!(latest_status(&rig, "bench").0, "skipped");
+    assert_eq!(latest_status(&rig, rig.export_name()).0, "skipped");
     m.drop_database();
 }
 

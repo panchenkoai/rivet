@@ -134,6 +134,8 @@ the formal invariants:
   size and content fingerprint.
 - **M6**: legacy prefixes (no `manifest.json`) are surfaced as
   `legacy_run: true`; `rivet validate` returns success without certifying.
+  A bucket or container that does not exist is not a legacy prefix: `rivet validate`
+  exits 1 with `RIVET_VERIFY_MANIFEST_READ_ERROR` naming it.
 - **M8**: resume against a `_SUCCESS`-marked prefix is refused without
   `--force`; the verifier wants the operator to opt in to re-exporting
   over a completed dataset.

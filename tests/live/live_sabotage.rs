@@ -346,7 +346,8 @@ fn validate_sees_mongo(how: Harm, finding: &str) {
 
 fn state_schema_newer_mongo() {
     let (rig, _guard) = mongo_rig("sab_newer");
-    state_schema_newer(rig, "t");
+    let export = rig.export_name().to_string();
+    state_schema_newer(rig, &export);
 }
 
 fn state_schema_newer_sql(engine: SqlEngine) {
@@ -936,7 +937,7 @@ fn run_in_progress(live_rig: impl Fn() -> (String, Rig, Box<dyn std::any::Any>))
 /// A live resumable MongoDB export as [`live`] hands one back: its export name, rig and drop guard.
 fn mongo_live_export(tag: &str) -> (String, Rig, Box<dyn std::any::Any>) {
     let (rig, _m, guard) = mongo_live(tag);
-    ("t".to_string(), rig, Box::new(guard))
+    (rig.export_name().to_string(), rig, Box::new(guard))
 }
 
 fn run_in_progress_sql(engine: SqlEngine) {

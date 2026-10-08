@@ -383,6 +383,13 @@ exclude_re = [
     # audit_preflight_table + the check scenarios (cli/blessed-flow). The overlay
     # DECISIONS are unit-tested in overlay_measured_rows.
     "replace check -> Result<bool> with Ok",
+    # MongoSession::require_collection lists the database's collections: it needs
+    # a live MongoDB, so its whole-fn `Ok(())` stub is unkillable under `--lib
+    # --bins`. Its DECISION is unit-tested (missing_collection_refusal). Stub
+    # proven live-killed 2026-10-08 (stub applied, cells run, source restored):
+    # it fails plan_refuses_a_collection_that_does_not_exist_mongo and
+    # check_refuses_a_collection_that_does_not_exist_as_run_does_mongo.
+    "replace MongoSession::require_collection -> Result<\\(\\)> with Ok\\(\\(\\)\\)",
     # NOTE the `$`: cargo-mutants names a mutant `<path>:<line>:<col>: <what> in
     # <fn>`, so an UNANCHORED `in check` also matches every `check_*` function.
     # Written without it, this entry removed 13 further mutants in six unrelated
@@ -883,6 +890,19 @@ exclude_re = [
     #   a_cdc_capture_delivers_sql_variant_and_udt_columns_as_the_source_renders_them
     #   both TIMEOUT at 240s. Its decisions are held by live_only_purity_gate.
     "replace MssqlChangeStream::fill -> Result",
+    # Two more live-only bodies of the same SQL Server reader (2026-10-07), each measured: the stub
+    # applied, the named live cell run, then restored.
+    #   pin_checkpoint_at_max_lsn -> Ok(())  writes no anchor, so the first changes run re-reads the
+    #     change table: mssql_cdc_initial_snapshot_covers_preexisting_rows_then_streams FAILS.
+    #   <impl ChangeStream for MssqlChangeStream>::drained_frontier -> None  leaves an idle checkpoint
+    #     behind the cleanup job: mssql_cdc_quiet_table_checkpoint_advances_so_cleanup_is_not_a_false_gap
+    #     and mssql_a_never_changed_table_is_not_refused_after_cleanup_passes_its_anchor FAIL.
+    "replace pin_checkpoint_at_max_lsn -> Result<\\(\\)> with Ok\\(\\(\\)\\)$",
+    "replace <impl ChangeStream for MssqlChangeStream>::drained_frontier -> Option<crate::source::cdc::Position> with None$",
+    # source_object_of_capture_instance (live-only: dials SQL Server; in the diff only because its config literal lost a field), each of the five stubs
+    # (Ok(None), and Ok(Some) of empty/"xyzzy" pairs) measured with the stub applied: mssql_cdc_refuses_an_unknown_capture_instance_before_the_snapshot_is_durable
+    # and mssql_cdc_snapshot_leg_reads_the_captured_relation_not_the_default_schema both FAIL.
+    "replace source_object_of_capture_instance -> Result<Option<\\(String, String\\)>> with ",
     # - Oracle interval_iso (each stub, and the IntervalDs arm): edge_oracle_types_export_losslessly
     #   fails on IYM/IDS ("unsupported conversion from interval day to second to
     #   OracleIntervalYM" for the arm). build_column's BinaryFloat (Float64 and Utf8),

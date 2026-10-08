@@ -1817,13 +1817,6 @@ def _harm_seed(engine: str, url: str, drop: bool = False) -> bool:
     return _mongosh(url, script).ok
 
 
-def _pg_counters(url: str) -> dict[str, int] | None:
-    """The source database's own harm counters (see `perf._pg_counters`)."""
-    from .perf import _pg_counters as probe
-
-    return probe(url)
-
-
 def verify_harm_regression(led: Ledger) -> None:
     """What one export costs the SOURCE, cur vs the previous release, per engine: each
     binary exports the same table three times from its own env, and the per-counter MIN
@@ -1847,7 +1840,9 @@ def verify_harm_regression(led: Ledger) -> None:
             led.failed(engine, "-", scen, "local",
                        f"harm[{engine}]: could not seed the harm_probe fixture", "seed")
             continue
-        table = "harm_probe"
+        from .perf import harness_read, measured_harm, source_counters
+
+        table, probe = "harm_probe", harness_read(engine, url)
         mins: dict[str, dict[str, int]] = {}
         for label, binary in (("prev", prev), ("cur", rivet_bin())):
             envdir = work / f"{engine}_{label}"
@@ -1857,15 +1852,13 @@ def verify_harm_regression(led: Ledger) -> None:
             for i in range(4):
                 shutil.rmtree(envdir / "out", ignore_errors=True)
                 (envdir / "out").mkdir(parents=True, exist_ok=True)
-                before = _pg_counters(url) if engine == "postgres" else None
+                before = source_counters(probe, table)
                 run([str(binary), "run", "-c", str(envdir / "c.yaml")], timeout=None,
                     env=_ISOLATED_STATE)
-                after = _pg_counters(url) if engine == "postgres" else None
                 reported = _last_run_harm(envdir)
-                # PostgreSQL: the source's own counters, read here — rivet's report changed
-                # meaning between releases (#312) and cannot be compared across them.
-                measured = ({k: after[k] - before[k] for k in after}
-                            if before and after else reported)
+                measured = measured_harm(probe, before, source_counters(probe, table), reported)
+                if measured is None:
+                    raise RuntimeError(f"harm[{engine}]: the source's own counters did not answer")
                 if not reported or i == 0:
                     measured = {}
                 for m, d in measured.items():

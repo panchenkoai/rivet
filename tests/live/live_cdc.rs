@@ -45,6 +45,7 @@ fn cdc_config(
 #[test]
 fn rig_renders_the_exact_legacy_cdc_template() {
     let yaml = Rig::mysql_cdc("t1")
+        .export_named("t1")
         .checkpoint_path("/tmp/ck".into())
         .dest_path("/tmp/o".into())
         .yaml();

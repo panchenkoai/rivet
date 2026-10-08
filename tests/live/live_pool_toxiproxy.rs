@@ -256,7 +256,7 @@ fn pool_split_realizes_the_range_split_and_the_union_is_exact() {
     // The split ACTUALLY fired (else the union oracle below is vacuous): the
     // executor said so, AND range-unit parts landed on disk.
     assert!(
-        log.contains("split 'pool_split_heavy' into"),
+        log.contains(&format!("split '{}' into", rig.export_name())),
         "the executor must report realizing the split:\n{log}"
     );
     let giant_range_parts: Vec<_> = files_with_extension(&rig.out_dir(), "parquet")
@@ -264,7 +264,7 @@ fn pool_split_realizes_the_range_split_and_the_union_is_exact() {
         .filter(|p| {
             p.file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(|n| n.contains("pool_split_heavy#"))
+                .is_some_and(|n| n.contains(&format!("{}#", rig.export_name())))
         })
         .collect();
     assert!(
@@ -374,7 +374,7 @@ fn pool_split_prefix_is_manifest_coherent() {
     );
     assert!(split.status.success(), "split run must succeed:\n{slog}");
     assert!(
-        slog.contains("split 'mcoh_giant' into"),
+        slog.contains(&format!("split '{}' into", rig.export_name())),
         "the split must have fired (else this test is vacuous):\n{slog}"
     );
 
@@ -402,7 +402,7 @@ fn pool_split_prefix_is_manifest_coherent() {
             let m: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
             assert_eq!(
                 m["export_family"].as_str(),
-                Some("mcoh_giant"),
+                Some(rig.export_name()),
                 "every split unit copy must fold to the parent family (load sees one table): {name}"
             );
         }
@@ -416,7 +416,7 @@ fn pool_split_prefix_is_manifest_coherent() {
         String::from_utf8_lossy(&v.stderr)
     );
     assert!(
-        !vlog.contains("untracked object: mcoh_giant#"),
+        !vlog.contains(&format!("untracked object: {}#", rig.export_name())),
         "a split unit's own parts must not be flagged untracked (the merge-back \
          claims same-family siblings):\n{vlog}"
     );
@@ -616,7 +616,7 @@ fn pool_split_over_a_nullable_chunk_column_refuses_instead_of_dropping_null_keys
         .filter(|p| {
             p.file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(|n| n.contains("pool_split_nullable_giant#"))
+                .is_some_and(|n| n.contains(&format!("{}#", rig.export_name())))
         })
         .count();
     let delivered = (range_parts > 0).then(|| duckdb_total_parquet_rows(&rig.out_dir()) as i64);
