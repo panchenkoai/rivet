@@ -169,6 +169,24 @@ impl Rig {
         }
     }
 
+    /// One count read from the state database this rig's runs use (`{export}` is the export's name).
+    pub fn state_count(&self, sql: &str) -> i64 {
+        let sql = sql.replace("{export}", &self.name);
+        match crate::common::state_url_under_test() {
+            Some(url) => postgres::Client::connect(&url, postgres::NoTls)
+                .expect("connect to the Postgres state (RIVET_GATE_STATE_URL)")
+                .query_one(sql.as_str(), &[])
+                .unwrap_or_else(|e| panic!("state read: `{sql}`: {e}"))
+                .get(0),
+            None => {
+                rusqlite::Connection::open(self.config_path().with_file_name(".rivet_state.db"))
+                    .expect("open the SQLite state")
+                    .query_row(&sql, [], |r| r.get(0))
+                    .unwrap_or_else(|e| panic!("state read: `{sql}`: {e}"))
+            }
+        }
+    }
+
     /// `rivet validate` on this rig's export fails twice with exit 3 and names the `RIVET_VERIFY_*` `finding` in its report.
     pub fn validate_fails(&self, finding: &str) {
         let first = said(&self.cli(&["validate"]));

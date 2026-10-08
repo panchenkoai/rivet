@@ -314,7 +314,10 @@ const MATRICES: &[(&str, usize)] = &[
     // refusal codes other cells assert but nobody walks (the CDC, load and legacy-state codes), 9 are
     // the Oracle cells of open-defect rows (no stand that runs `open_defect_` cells had Oracle), 5 the
     // keyset_range row, 2 MongoDB cells.
-    ("docs/sabotage-matrix.yaml", 78),
+    // Raised 78 -> 102 (2026-10-08): the stop rows (a signal at a parked point, then the next run)
+    // arrive with five rows nobody wrote: a CDC stream mid-drain (9), parallel runners (5), the
+    // points that are panic points only (5), an SQLite state copied elsewhere (5).
+    ("docs/sabotage-matrix.yaml", 102),
     // Pool-split — `apply --pool --split` per (strategy × source engine). Split is a
     // scheduler layer above the runners (each unit runs through chunked/keyset), so its
     // per-engine behaviour (boundary probe, crash-recovery, finding-2 exact-partition

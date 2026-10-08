@@ -26,6 +26,8 @@ mod remedy;
 pub use remedy::{Refused, Remedy, Then, assert_refused};
 mod sabotage;
 pub use sabotage::{Damage, Survived};
+mod stop;
+pub use stop::{Parked, Stop, Stopped, graceful_is_worse};
 mod render;
 mod verify;
 
