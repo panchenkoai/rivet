@@ -363,7 +363,8 @@ impl MysqlChangeStream {
         configured_tables: &[String],
     ) -> Result<()> {
         let mut conn = connect_conn(url, tls)?;
-        Self::refuse_unmet_prerequisites_on(&mut conn, configured_tables)
+        Self::refuse_unmet_prerequisites_on(&mut conn, configured_tables)?;
+        Self::refuse_absent_tables_on(&mut conn, configured_tables)
     }
 
     /// Every refusal of the open, asked on `conn` before the anchor is written or the dump starts.
@@ -374,8 +375,11 @@ impl MysqlChangeStream {
         Self::refuse_nameless_binlog(conn)?;
         refuse_compressed_binlog(conn)?;
         refuse_replica_without_relog(conn)?;
-        Self::check_configured_tables_are_routable(conn, configured_tables)?;
-        // The schema probe's own statement, prepared only: a table it could not read is refused here.
+        Self::check_configured_tables_are_routable(conn, configured_tables)
+    }
+
+    /// Refuse a table the schema probe could not read, by preparing the probe's own statement: asked before a first run's anchor, never on a resume (a table dropped under a stream is the stream's own refusal).
+    fn refuse_absent_tables_on(conn: &mut mysql::Conn, configured_tables: &[String]) -> Result<()> {
         for table in configured_tables {
             use mysql::prelude::Queryable as _;
             crate::source::cdc::validate_table_ident(table)?;
@@ -852,6 +856,7 @@ impl MysqlChangeStream {
         // at a part commit — so an idle bounded run (zero changes drained) would
         // otherwise leave no checkpoint, the next run would re-anchor to a newer
         // "current" position, and every change in between would be silently skipped.
+        Self::refuse_absent_tables_on(&mut conn, &configured_tables)?;
         let (file, pos) = Self::current_coordinates(&mut conn)?;
         let identity = Self::server_identity(&mut conn);
         if let Some(path) = ckpt {

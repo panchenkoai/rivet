@@ -693,6 +693,12 @@ exclude_re = [
     # is_the_base_table, RED against the stub (2026-10-08: "rig run for 'cdc_vbase_..._v'
     # was expected to fail").
     "replace MysqlChangeStream::refuse_unmet_prerequisites_on -> Result<\\(\\)> with Ok\\(\\(\\)\\)",
+    # `MysqlChangeStream::refuse_absent_tables_on` prepares the schema probe's statement for
+    # each table on a live connection before a first run's anchor; the verdict is
+    # `table_probe_refusal` (unit-tested). Its `Ok(())` stub is born MISSED offline. Live:
+    # live_operator_contract::a_refused_cdc_run_on_a_missing_table_leaves_no_checkpoint_mysql,
+    # RED against the stub (2026-10-08: "cdc-checkpoint: .../cdc.ckpt added", the refusal grade).
+    "replace MysqlChangeStream::refuse_absent_tables_on -> Result<\\(\\)> with Ok\\(\\(\\)\\)",
     # `PgChangeStream::refuse_unmet_prerequisites_on` is the same glue on PostgreSQL: it
     # reads `wal_level` and `pg_is_in_recovery()`, runs the routing check and prepares the
     # schema probe's statement; the verdicts are `server_refusal` and `table_probe_refusal`
