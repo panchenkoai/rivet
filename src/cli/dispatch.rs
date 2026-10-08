@@ -800,7 +800,8 @@ fn dispatch_state(action: StateAction) -> Result<()> {
             params,
         } => {
             let p = parse_params(&params)?;
-            pipeline::accept_state(&config, &export, (!p.is_empty()).then_some(&p))
+            let p = if p.is_empty() { None } else { Some(p) };
+            pipeline::accept_state(&config, &export, p.as_ref())
         }
         StateAction::Files {
             config,
@@ -1022,6 +1023,26 @@ fn show_loads(config: &str, target: Option<&str>, last: usize) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod state_accept_dispatch_tests {
+    use super::{StateAction, dispatch_state};
+
+    /// `rivet state accept` reaches its command with its params: a config that is not there and a malformed `--param` are both errors.
+    #[test]
+    fn state_accept_is_dispatched_with_its_params() {
+        let accept = |params: &[&str]| {
+            dispatch_state(StateAction::Accept {
+                config: "/nonexistent/rivet-accept.yaml".into(),
+                export: "orders".into(),
+                params: params.iter().map(|p| p.to_string()).collect(),
+            })
+        };
+        let missing = accept(&["spent=1"]).expect_err("no such config");
+        assert!(format!("{missing:#}").contains("not found"), "{missing:#}");
+        assert!(accept(&["no-equals-sign"]).is_err());
+    }
 }
 
 #[cfg(test)]

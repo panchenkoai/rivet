@@ -264,6 +264,14 @@ pub fn reset_state(config_path: &str, export_name: &str) -> Result<()> {
 /// The context of the journal event `rivet state accept` records, and the status of its journal.
 const ACCEPTED: &str = "accepted";
 
+/// What `journal` says `rivet state accept` kept, when it is the journal of an acceptance.
+fn acceptance(journal: &crate::journal::RunJournal) -> Option<&str> {
+    journal.warnings().into_iter().find_map(|e| match &e.event {
+        RunEvent::Warning { context, message } if context == ACCEPTED => Some(message.as_str()),
+        _ => None,
+    })
+}
+
 /// `rivet state accept`: keep the stored progress of one export under the stream it reads now, and journal that the operator said so.
 pub fn accept_state(
     config_path: &str,
@@ -723,12 +731,8 @@ pub fn show_journal(
             dur = duration_str,
         );
         println!("  run_id: {}", journal.run_id);
-        for e in journal.warnings() {
-            if let RunEvent::Warning { context, message } = &e.event
-                && context == ACCEPTED
-            {
-                println!("  accepted: {message}");
-            }
+        if let Some(message) = acceptance(journal) {
+            println!("  accepted: {message}");
         }
 
         // ── event summary lines ────────────────────────────────────────────
@@ -1469,12 +1473,7 @@ exports:
                 Some(RunEvent::RunCompleted { status, .. }) => status.clone(),
                 _ => String::new(),
             };
-            let message = match j.warnings().first().map(|e| &e.event) {
-                Some(RunEvent::Warning { context, message }) if context == ACCEPTED => {
-                    message.clone()
-                }
-                _ => String::new(),
-            };
+            let message = acceptance(j).unwrap_or_default().to_string();
             (j.run_id.clone(), status, message)
         };
         journals.iter().map(said).collect()

@@ -1748,6 +1748,8 @@ mod tests {
             ),
             ("from ? where a = ${x}", "from ? where a = ${y}", false),
             ("from ? where ${f}", "from ? where anything at all", true),
+            ("a${x}b${y}b${z}c", "a1b2b3c", true),
+            ("a${x}b${y}b${z}c", "a1b2c", false),
             ("a${x}a", "a", false),
             ("a${x}a", "aa", true),
             ("${x} and ${y}", "1 and 2 and 3", true),
