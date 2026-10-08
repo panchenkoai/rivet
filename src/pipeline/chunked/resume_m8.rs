@@ -912,6 +912,7 @@ mod tests {
         crate::plan::ResolvedRunPlan {
             split_window: None,
             bytes_read: Default::default(),
+            parts_landed: Default::default(),
             export_name: "orders".into(),
             partition_rollover: None,
             source_table: None,

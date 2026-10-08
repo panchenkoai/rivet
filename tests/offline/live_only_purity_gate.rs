@@ -143,7 +143,9 @@ const BASELINE: &[(&str, usize, usize, usize, usize)] = &[
     // `delete ! in run_pool` and `replace == with != in run_pool` had to be
     // triaged as separate entries: this ledger is the list of such entries
     // waiting to be written.
-    ("src/pipeline/run.rs::run_pool", 1, 0, 2, 0),
+    // 1→0 `and` (2026-10-08): the per-unit skip condition (`split && resume`) moved out to the pure
+    // `per_unit_skip_applies`, where the in-diff gate grades its `&&`.
+    ("src/pipeline/run.rs::run_pool", 0, 0, 2, 0),
     // The CDC job's baseline pairing (2026-09-17). Its one remaining `||` is
     // `state.snapshot_done(..)? || dest.head("_SUCCESS")?.is_some()` — two I/O
     // reads whose SHORT-CIRCUIT is the point (the object-store HEAD is skipped

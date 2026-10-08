@@ -578,6 +578,11 @@ pub mod codes {
         "RIVET_DEST_CONTAINER_NOT_FOUND",
         "create the bucket or container, or correct `destination.bucket`",
     );
+    /// `run --resume` met a destination prefix that already holds a complete export.
+    pub const DEST_ALREADY_COMPLETE: Code = refusal(
+        "RIVET_DEST_ALREADY_COMPLETE",
+        "pass `--force` with `--resume` to continue an interrupted run or, with none, run as a plain run does (new parts beside the complete export); or use another destination prefix",
+    );
     pub const LOAD_VALUE_OUT_OF_TARGET_RANGE: Code = refusal(
         "RIVET_LOAD_VALUE_OUT_OF_TARGET_RANGE",
         "the warehouse type cannot hold this value; declare a wider type (e.g. String) for the column, or fix the source value",
@@ -662,6 +667,7 @@ pub mod codes {
         PLAN_SOURCE_UNREADABLE,
         SOURCE_COLLECTION_NOT_FOUND,
         DEST_CONTAINER_NOT_FOUND,
+        DEST_ALREADY_COMPLETE,
         LOAD_VALUE_OUT_OF_TARGET_RANGE,
         LOAD_COUNT_MISMATCH,
         LOAD_ADOPTION_COLUMN_MISMATCH,

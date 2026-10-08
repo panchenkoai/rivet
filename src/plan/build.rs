@@ -208,6 +208,7 @@ pub(crate) fn build_plan_on(
     Ok(ResolvedRunPlan {
         export_name: export.name.clone(),
         bytes_read: Default::default(),
+        parts_landed: Default::default(),
         partition_rollover: partition_rollover_of(config, export),
         // The LABEL, where the two differ. `plan.source_table` has exactly one
         // consumer — the manifest's recorded identity in `finalize` — and the two

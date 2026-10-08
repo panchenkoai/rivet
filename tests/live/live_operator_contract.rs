@@ -401,43 +401,290 @@ fn validate_on_an_empty_prefix(rig: Rig, envs: &[(&str, &str)]) {
 
 // (b) a failure before the first write
 
-/// RESULTS 8 (owner decision 2026-10-07): a run that never connected leaves the previous `_SUCCESS` and manifest alone.
-fn never_connected(mut rig: Rig, url: &str) {
-    rig.run_ok();
-    let out_dir = rig.out_dir();
-    assert!(
-        out_dir.join("_SUCCESS").is_file(),
+/// A bucket the before-the-first-write store cells export into, one prefix per cell.
+const NOCONN_BUCKET: &str = "oc-noconn";
+
+/// Where a cell's export lands, read through the store's own API.
+enum Store {
+    Local(std::path::PathBuf),
+    S3(String),
+    Gcs(String),
+    Azure(String),
+}
+
+impl Store {
+    /// Every file at the destination by its path below the prefix, read fresh.
+    fn files(&self) -> std::collections::BTreeMap<String, Vec<u8>> {
+        let hold = tempfile::tempdir().expect("a directory to read the destination into");
+        let root = match self {
+            Store::Local(dir) => dir.clone(),
+            Store::S3(prefix) => {
+                minio_pull_prefix(NOCONN_BUCKET, prefix, hold.path());
+                hold.path().to_path_buf()
+            }
+            Store::Gcs(prefix) => {
+                gcs_pull_prefix(FAKE_GCS_ENDPOINT, NOCONN_BUCKET, prefix, None, hold.path());
+                hold.path().to_path_buf()
+            }
+            Store::Azure(prefix) => {
+                azure_pull_prefix(AZURITE_ENDPOINT, NOCONN_BUCKET, prefix, hold.path());
+                hold.path().to_path_buf()
+            }
+        };
+        files_below(&root)
+            .into_iter()
+            .map(|p| {
+                let key = p.strip_prefix(&root).expect("below the root");
+                (
+                    key.display().to_string(),
+                    std::fs::read(&p).expect("a destination file"),
+                )
+            })
+            .collect()
+    }
+}
+
+/// What `files` say of the export: the marker and the canonical manifest's status.
+fn marker_and_manifest(files: &std::collections::BTreeMap<String, Vec<u8>>) -> String {
+    let named = |name: &str| {
+        files
+            .iter()
+            .find(|(k, _)| k.rsplit('/').next() == Some(name))
+            .map(|(_, v)| v)
+    };
+    let status = named("manifest.json")
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok())
+        .and_then(|m| m["status"].as_str().map(str::to_string));
+    format!(
+        "`_SUCCESS` {}, manifest.json `{}`",
+        if named("_SUCCESS").is_some() {
+            "kept"
+        } else {
+            "absent"
+        },
+        status.as_deref().unwrap_or("absent")
+    )
+}
+
+/// The paths added, rewritten or removed between two readings of a destination.
+fn changed(
+    before: &std::collections::BTreeMap<String, Vec<u8>>,
+    after: &std::collections::BTreeMap<String, Vec<u8>>,
+) -> Vec<String> {
+    let mut out: Vec<String> = after
+        .iter()
+        .filter(|(k, v)| before.get(*k) != Some(*v))
+        .map(|(k, _)| format!("+{k}"))
+        .collect();
+    out.extend(
+        before
+            .keys()
+            .filter(|k| !after.contains_key(*k))
+            .map(|k| format!("-{k}")),
+    );
+    out
+}
+
+/// RESULTS 8 (owner decision 2026-10-07): a run that never connected writes nothing over an earlier run's record, twice. Before the first export it leaves its failed manifest, the only record there (`validate` exits 1), and the next one leaves that; after a complete export it leaves the whole export, which `validate` still passes.
+fn never_connected(mut rig: Rig, url: &str, envs: &[(&str, &str)], store: &Store) {
+    let dead = unreachable(url);
+    let unreached = |rig: &Rig,
+                     before: &std::collections::BTreeMap<String, Vec<u8>>,
+                     over: &str| {
+        for cycle in 1..=2 {
+            let out = rig.run_args_env(&[], envs);
+            assert!(!out.status.success(), "fixture: nothing listens at {dead}");
+            let after = store.files();
+            assert!(
+                &after == before,
+                "a run that never connected left {} over {over} (cycle {cycle}, exit {:?}); changed: {:?}",
+                marker_and_manifest(&after),
+                out.status.code(),
+                changed(before, &after)
+            );
+        }
+    };
+    rig.rebuilt(|r| r.source_url(&dead));
+    let only = rig.run_args_env(&[], envs);
+    assert!(!only.status.success(), "fixture: nothing listens at {dead}");
+    let only_failed = store.files();
+    assert_eq!(
+        marker_and_manifest(&only_failed),
+        "`_SUCCESS` absent, manifest.json `failed`",
+        "the only run of a prefix records its failure there, and no marker"
+    );
+    let unvalidated = rig.cli_env(&["validate"], envs);
+    assert_eq!(
+        unvalidated.status.code(),
+        Some(1),
+        "`validate` on a prefix whose only run failed\n{}",
+        text(&unvalidated)
+    );
+    unreached(&rig, &only_failed, "the failed manifest of the only run");
+    rig.rebuilt(|r| r.source_url(url));
+    let first = rig.run_args_env(&[], envs);
+    assert!(first.status.success(), "{}", text(&first));
+    let complete = store.files();
+    assert_eq!(
+        marker_and_manifest(&complete),
+        "`_SUCCESS` kept, manifest.json `success`",
         "fixture: a complete export"
     );
-    let dead = unreachable(url);
     rig.rebuilt(|r| r.source_url(&dead));
-    let out = rig.run();
-    assert!(!out.status.success(), "fixture: nothing listens at {dead}");
-    let manifest: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(out_dir.join("manifest.json")).expect("manifest.json"),
-    )
-    .expect("a JSON manifest");
-    let marker = if out_dir.join("_SUCCESS").is_file() {
-        "kept"
-    } else {
-        "withdrawn"
-    };
+    unreached(&rig, &complete, "a complete export");
+    let validated = rig.cli_env(&["validate"], envs);
     assert!(
-        marker == "kept" && manifest["status"] == "success",
-        "a run that never connected left `_SUCCESS` {marker} and manifest.json `{}` over a complete export (exit {:?})",
-        manifest["status"].as_str().unwrap_or("?"),
-        out.status.code()
+        validated.status.success(),
+        "`validate` no longer passes the complete export after a run that never connected\n{}",
+        text(&validated)
     );
 }
 
 fn never_connected_sql(engine: SqlEngine) {
     let (table, _guard) = id_v_table(engine, "oc_noconn", ROWS);
-    never_connected(engine.rig(&table), engine.url());
+    let rig = engine.rig(&table);
+    let store = Store::Local(rig.out_dir());
+    never_connected(rig, engine.url(), &[], &store);
+}
+
+/// A fresh PostgreSQL table and a prefix of [`NOCONN_BUCKET`] for one store cell.
+fn noconn_on_a_store() -> (Rig, String, Box<dyn std::any::Any>) {
+    let (table, guard) = id_v_table(SqlEngine::Pg, "oc_noconn", ROWS);
+    (Rig::pg_batch(&table), unique_name("p"), guard)
+}
+
+/// The neighbour of [`never_connected`]: a run that failed after its first part withdraws `_SUCCESS` and leaves a failed manifest naming that part.
+fn failed_after_a_part(engine: SqlEngine) {
+    let (table, _guard) = range_table(engine, "oc_afterpart", ROWS);
+    let rig = range_checkpoint_rig(engine, &table);
+    rig.run_ok();
+    let store = Store::Local(rig.out_dir());
+    let complete = store.files();
+    let out = rig.run_with_env("RIVET_TEST_ERROR_AT", "chunk_export:1");
+    assert!(!out.status.success(), "fixture: the second chunk fails");
+    let after = store.files();
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&after["manifest.json"]).expect("a JSON manifest");
+    assert_eq!(
+        marker_and_manifest(&after),
+        "`_SUCCESS` absent, manifest.json `failed`",
+        "a run that wrote a part and then failed leaves a prefix nobody may read as whole"
+    );
+    assert!(
+        manifest["part_count"].as_u64() >= Some(1),
+        "the failed manifest names the parts the run wrote: {}",
+        manifest["part_count"]
+    );
+    assert!(
+        complete
+            .iter()
+            .all(|(k, v)| { k == "_SUCCESS" || k == "manifest.json" || after.get(k) == Some(v) }),
+        "the failed run rewrote a file of the complete export: {:?}",
+        changed(&complete, &after)
+    );
+}
+
+/// A resume that never connected leaves the prefix of the run that failed after its first chunk as it was: the parts, and the failed manifest that names them.
+fn resume_never_connected(engine: SqlEngine) {
+    let (table, _guard) = range_table(engine, "oc_resnoconn", ROWS);
+    let mut rig = range_checkpoint_rig(engine, &table);
+    let cut = rig.run_with_env("RIVET_TEST_ERROR_AT", "chunk_export:1");
+    assert!(!cut.status.success(), "fixture: the second chunk fails");
+    let store = Store::Local(rig.out_dir());
+    let before = store.files();
+    assert_eq!(
+        marker_and_manifest(&before),
+        "`_SUCCESS` absent, manifest.json `failed`",
+        "fixture: an unfinished run that wrote parts"
+    );
+    let dead = unreachable(engine.url());
+    rig.rebuilt(|r| r.source_url(&dead));
+    let out = rig.run_args(&["--resume"]);
+    assert!(!out.status.success(), "fixture: nothing listens at {dead}");
+    let after = store.files();
+    assert!(
+        after == before,
+        "a resume that never connected changed the unfinished run's prefix: {:?}",
+        changed(&before, &after)
+    );
+}
+
+/// docs/cloud-destinations.md, Resume: over a prefix that holds `_SUCCESS`, a `--resume --force` that never connected leaves the marker and manifest; one that wrote a part and then failed withdraws the marker.
+fn forced_resume_over_a_marker(engine: SqlEngine) {
+    let (table, _guard) = range_table(engine, "oc_forcedres", ROWS);
+    let mut rig = range_checkpoint_rig(engine, &table);
+    rig.run_ok();
+    let store = Store::Local(rig.out_dir());
+    let complete = store.files();
+    let dead = unreachable(engine.url());
+    rig.rebuilt(|r| r.source_url(&dead));
+    let unreached = rig.run_args(&["--resume", "--force"]);
+    assert!(
+        !unreached.status.success(),
+        "fixture: nothing listens at {dead}"
+    );
+    let after = store.files();
+    assert!(
+        after == complete,
+        "a forced resume that never connected left {}; changed: {:?}",
+        marker_and_manifest(&after),
+        changed(&complete, &after)
+    );
+    rig.rebuilt(|r| r.source_url(engine.url()));
+    let cut = rig.run_args_env(
+        &["--resume", "--force"],
+        &[("RIVET_TEST_ERROR_AT", "chunk_export:1")],
+    );
+    assert!(!cut.status.success(), "fixture: the second chunk fails");
+    assert_eq!(
+        marker_and_manifest(&store.files()),
+        "`_SUCCESS` absent, manifest.json `failed`",
+        "a forced resume that wrote a part and then failed"
+    );
+}
+
+/// `apply --resume` after a run that never connected runs the export again: its journal says the last run failed, whatever marker an earlier run left.
+fn wave_retry_after_never_connected(mut rig: Rig, url: &str, grow: impl FnOnce()) {
+    rig.run_ok();
+    let dead = unreachable(url);
+    rig.rebuilt(|r| r.source_url(&dead));
+    assert!(
+        !rig.run().status.success(),
+        "fixture: nothing listens at {dead}"
+    );
+    rig.rebuilt(|r| r.source_url(url));
+    grow();
+    let store = Store::Local(rig.out_dir());
+    let parts = || {
+        store
+            .files()
+            .keys()
+            .filter(|k| k.ends_with(".parquet"))
+            .count()
+    };
+    let before = parts();
+    let retry = rig.apply_env(&rig.config_path(), &["--resume"], &[]);
+    assert!(retry.status.success(), "{}", text(&retry));
+    assert!(
+        parts() > before,
+        "`apply --resume` skipped the export whose last run never connected: no new part\n{}",
+        text(&retry)
+    );
+}
+
+fn wave_retry_sql(engine: SqlEngine) {
+    let (table, _guard) = id_v_table(engine, "oc_retry", ROWS);
+    let grown = table.clone();
+    wave_retry_after_never_connected(engine.rig(&table), engine.url(), move || {
+        insert_ids(engine, &grown, ROWS + 1..=ROWS + 5)
+    });
 }
 
 // (c) refusal -> remedy
 
-/// RESULTS 12: `--resume` over a complete prefix names `--force`; `--resume --force` then runs.
+const ALREADY_COMPLETE: Refused = Refused::by_code("RIVET_DEST_ALREADY_COMPLETE", 5);
+
+/// RESULTS 12: `--resume` over a complete prefix is refused by code; `--resume --force` then runs as a plain run does, as the refusal says (what it leaves beside the complete export is [`forced_resume_beside`]), and `state reset-chunks` leaves the refusal.
 fn resume_force(engine: SqlEngine) {
     let (table, _guard) = range_table(engine, "oc_resume", ROWS);
     resume_force_on(range_checkpoint_rig(engine, &table));
@@ -445,22 +692,76 @@ fn resume_force(engine: SqlEngine) {
 
 fn resume_force_on(mut rig: Rig) {
     rig.run_ok();
-    rig.refuses_twice_then(
+    let export = rig.export_name().to_string();
+    rig.refuses_twice_and_walks_out(
         &["run", "--resume"],
         &[],
-        Refused::uncoded_known_defect(
-            1,
-            "`--resume refused` is a deliberate refusal the registry has no code for",
-        ),
+        ALREADY_COMPLETE,
         vec![
-            Remedy::new("Pass --force to override", Then::DeliversTheSource, |_| {})
+            Remedy::new("Pass --force to go on", Then::DeliversTheSource, |_| {})
                 .rerun_as(&["run", "--resume", "--force"]),
+            Remedy::wrong(
+                "runs `rivet state reset-chunks`, which abandons a run this prefix does not have",
+                Then::Refuses(ALREADY_COMPLETE),
+                move |r| {
+                    r.cli(&["state", "reset-chunks", "--export", &export]);
+                },
+            ),
         ],
     );
 }
 
 const CHECKPOINT_INVALID: Refused = Refused::by_code("RIVET_SOURCE_CDC_CHECKPOINT_INVALID", 5);
 const TRUNCATED: Refused = Refused::by_code("RIVET_SOURCE_CDC_TRUNCATED", 5);
+
+/// What the refusal says of `--resume --force` over a complete prefix: it runs as a plain run does (`rerun_rows` rows: the table again, or the delta past a continued key), the old parts stay byte for byte, and manifest.json names only the new ones.
+fn forced_resume_beside(rig: Rig, rerun_rows: i64) {
+    rig.run_ok();
+    let store = Store::Local(rig.out_dir());
+    let complete = store.files();
+    let forced = rig.run_args(&["--resume", "--force"]);
+    assert!(forced.status.success(), "{}", text(&forced));
+    let after = store.files();
+    let part = |k: &str| k.ends_with(".parquet");
+    assert!(
+        complete
+            .iter()
+            .filter(|(k, _)| part(k))
+            .all(|(k, v)| after.get(k) == Some(v)),
+        "`--resume --force` rewrote or removed a part of the complete export, which the refusal says it does not: {:?}",
+        changed(&complete, &after)
+    );
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&after["manifest.json"]).expect("a JSON manifest");
+    let named: Vec<&str> = manifest["parts"]
+        .as_array()
+        .expect("a manifest lists its parts")
+        .iter()
+        .filter_map(|p| p["path"].as_str())
+        .collect();
+    assert_eq!(
+        (
+            marker_and_manifest(&after).as_str(),
+            &manifest["row_count"],
+            named.iter().filter(|p| complete.contains_key(**p)).count()
+        ),
+        (
+            "`_SUCCESS` kept, manifest.json `success`",
+            &serde_json::json!(rerun_rows),
+            0
+        ),
+        "manifest.json describes only the new run, as the refusal says: {named:?}"
+    );
+    assert!(
+        named.iter().all(|p| after.contains_key(*p)) && named.is_empty() == (rerun_rows == 0),
+        "the new run's parts are beside the complete export: {named:?}"
+    );
+}
+
+fn forced_resume_beside_sql(engine: SqlEngine) {
+    let (table, _guard) = range_table(engine, "oc_beside", ROWS);
+    forced_resume_beside(range_checkpoint_rig(engine, &table), ROWS);
+}
 
 /// The re-baseline remedy every CDC data-loss refusal ends with, followed as printed. Last in a walk: it moves the source-side anchor, which no copy of the refused state brings back.
 fn rebaseline<'a>(has_baseline: bool) -> Remedy<'a> {
@@ -798,7 +1099,7 @@ fn mongo_second_run_beside_a_live_resumable_one() {
     second_run_beside(rig, MONGO_SLOW as usize);
 }
 
-/// RESULTS 12 on MongoDB: `--resume` over a complete resumable export names `--force`, and `--resume --force` runs.
+/// RESULTS 12 on MongoDB: `--resume` over a complete resumable export names `--force`, and `--resume --force` runs as a plain run does: past the stored `_id`, where nothing is new.
 fn mongo_resume_force() {
     let (url, _m, _guard) = mongo_db("oc_resume", ROWS);
     resume_force_on(
@@ -1377,45 +1678,45 @@ fn open_defect_a_second_concurrent_full_run_does_not_double_the_prefix_oracle() 
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose postgres; open defect (failed manifest before a write), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_run_that_never_connected_keeps_the_export_complete_postgres() {
+#[ignore = "live: requires docker compose postgres"]
+fn a_run_that_never_connected_keeps_the_export_complete_postgres() {
     never_connected_sql(SqlEngine::Pg);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mysql; open defect (failed manifest before a write), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_run_that_never_connected_keeps_the_export_complete_mysql() {
+#[ignore = "live: requires docker compose mysql"]
+fn a_run_that_never_connected_keeps_the_export_complete_mysql() {
     never_connected_sql(SqlEngine::Mysql);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mssql; open defect (failed manifest before a write), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_run_that_never_connected_keeps_the_export_complete_mssql() {
+#[ignore = "live: requires docker compose mssql"]
+fn a_run_that_never_connected_keeps_the_export_complete_mssql() {
     never_connected_sql(SqlEngine::Mssql);
 }
 
 #[cfg(feature = "oracle")]
 #[test]
-#[ignore = "live+gate-only: docker compose oracle; open defect (failed manifest before a write), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_run_that_never_connected_keeps_the_export_complete_oracle() {
+#[ignore = "live: requires docker compose oracle"]
+fn a_run_that_never_connected_keeps_the_export_complete_oracle() {
     never_connected_sql(SqlEngine::Oracle);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose postgres; open defect (--resume --force remedy), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_resume_force_runs_over_a_complete_prefix_postgres() {
+#[ignore = "live: requires docker compose postgres"]
+fn resume_force_runs_over_a_complete_prefix_postgres() {
     resume_force(SqlEngine::Pg);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mysql; open defect (--resume --force remedy), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_resume_force_runs_over_a_complete_prefix_mysql() {
+#[ignore = "live: requires docker compose mysql"]
+fn resume_force_runs_over_a_complete_prefix_mysql() {
     resume_force(SqlEngine::Mysql);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mssql; open defect (--resume --force remedy), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_resume_force_runs_over_a_complete_prefix_mssql() {
+#[ignore = "live: requires docker compose mssql"]
+fn resume_force_runs_over_a_complete_prefix_mssql() {
     resume_force(SqlEngine::Mssql);
 }
 
@@ -1584,17 +1885,195 @@ fn open_defect_removing_page_size_runs_after_the_heterogeneous_id_refusal_mongo(
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose up -d mongo; open defect (failed manifest before a write), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_run_that_never_connected_keeps_the_export_complete_mongo() {
-    require_alive(LiveService::Mongo);
-    let db = unique_name("oc_noconn");
-    let _guard = MongoDbGuard {
-        port: MONGO_PORT,
-        db: db.clone(),
-    };
-    MongoTest::connect(MONGO_PORT, &db).seed_int_id("t", 20);
-    let url = MongoTest::url(MONGO_PORT, &db);
-    never_connected(Rig::mongo_batch("t").source_url(&url), &url);
+#[ignore = "live: requires docker compose up -d mongo"]
+fn a_run_that_never_connected_keeps_the_export_complete_mongo() {
+    let (url, _m, _guard) = mongo_db("oc_noconn", 20);
+    let rig = Rig::mongo_batch("t").source_url(&url);
+    let store = Store::Local(rig.out_dir());
+    never_connected(rig, &url, &[], &store);
+}
+
+#[test]
+#[ignore = "live: requires docker compose minio"]
+fn a_run_that_never_connected_keeps_the_export_complete_s3() {
+    ensure_minio_bucket(NOCONN_BUCKET);
+    let (rig, prefix, _guard) = noconn_on_a_store();
+    never_connected(
+        rig.dest_s3(NOCONN_BUCKET, &prefix, MINIO_ENDPOINT),
+        SqlEngine::Pg.url(),
+        MINIO_ENV,
+        &Store::S3(prefix),
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose fake-gcs"]
+fn a_run_that_never_connected_keeps_the_export_complete_gcs() {
+    ensure_gcs_bucket(NOCONN_BUCKET);
+    let (rig, prefix, _guard) = noconn_on_a_store();
+    never_connected(
+        rig.dest_gcs(NOCONN_BUCKET, &prefix, FAKE_GCS_ENDPOINT),
+        SqlEngine::Pg.url(),
+        &[],
+        &Store::Gcs(prefix),
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose azurite"]
+fn a_run_that_never_connected_keeps_the_export_complete_azure() {
+    ensure_azure_container(NOCONN_BUCKET);
+    let (rig, prefix, _guard) = noconn_on_a_store();
+    never_connected(
+        rig.dest_azure(NOCONN_BUCKET, &prefix),
+        SqlEngine::Pg.url(),
+        &[("RIVET_TEST_AZURITE_KEY", AZURITE_KEY)],
+        &Store::Azure(prefix),
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_wave_retry_reruns_the_export_whose_last_run_never_connected_postgres() {
+    wave_retry_sql(SqlEngine::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn a_wave_retry_reruns_the_export_whose_last_run_never_connected_mysql() {
+    wave_retry_sql(SqlEngine::Mysql);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn a_wave_retry_reruns_the_export_whose_last_run_never_connected_mssql() {
+    wave_retry_sql(SqlEngine::Mssql);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn a_wave_retry_reruns_the_export_whose_last_run_never_connected_oracle() {
+    wave_retry_sql(SqlEngine::Oracle);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mongo"]
+fn a_wave_retry_reruns_the_export_whose_last_run_never_connected_mongo() {
+    let (url, _m, _guard) = mongo_db("oc_retry", 20);
+    wave_retry_after_never_connected(Rig::mongo_batch("t").source_url(&url), &url, || {});
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_forced_resume_over_a_complete_prefix_lands_beside_it_postgres() {
+    forced_resume_beside_sql(SqlEngine::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn a_forced_resume_over_a_complete_prefix_lands_beside_it_mysql() {
+    forced_resume_beside_sql(SqlEngine::Mysql);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn a_forced_resume_over_a_complete_prefix_lands_beside_it_mssql() {
+    forced_resume_beside_sql(SqlEngine::Mssql);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn a_forced_resume_over_a_complete_prefix_lands_beside_it_oracle() {
+    forced_resume_beside_sql(SqlEngine::Oracle);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mongo"]
+fn a_forced_resume_over_a_complete_prefix_lands_beside_it_mongo() {
+    let (url, _m, _guard) = mongo_db("oc_beside", ROWS);
+    forced_resume_beside(
+        Rig::mongo_batch("t")
+            .source_url(&url)
+            .mongo("page_size: 10, resume: true"),
+        0,
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_forced_resume_keeps_the_marker_until_it_writes_postgres() {
+    forced_resume_over_a_marker(SqlEngine::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn a_forced_resume_keeps_the_marker_until_it_writes_mysql() {
+    forced_resume_over_a_marker(SqlEngine::Mysql);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn a_forced_resume_keeps_the_marker_until_it_writes_mssql() {
+    forced_resume_over_a_marker(SqlEngine::Mssql);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn a_forced_resume_keeps_the_marker_until_it_writes_oracle() {
+    forced_resume_over_a_marker(SqlEngine::Oracle);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_run_that_failed_after_a_part_withdraws_the_marker_postgres() {
+    failed_after_a_part(SqlEngine::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn a_run_that_failed_after_a_part_withdraws_the_marker_mysql() {
+    failed_after_a_part(SqlEngine::Mysql);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn a_run_that_failed_after_a_part_withdraws_the_marker_mssql() {
+    failed_after_a_part(SqlEngine::Mssql);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn a_run_that_failed_after_a_part_withdraws_the_marker_oracle() {
+    failed_after_a_part(SqlEngine::Oracle);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_resume_that_never_connected_leaves_the_unfinished_run_as_it_was_postgres() {
+    resume_never_connected(SqlEngine::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn a_resume_that_never_connected_leaves_the_unfinished_run_as_it_was_mysql() {
+    resume_never_connected(SqlEngine::Mysql);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn a_resume_that_never_connected_leaves_the_unfinished_run_as_it_was_mssql() {
+    resume_never_connected(SqlEngine::Mssql);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn a_resume_that_never_connected_leaves_the_unfinished_run_as_it_was_oracle() {
+    resume_never_connected(SqlEngine::Oracle);
 }
 
 #[test]
@@ -1669,8 +2148,8 @@ fn a_run_without_the_checkpoint_beside_an_unfinished_run_is_refused_oracle() {
 
 #[cfg(feature = "oracle")]
 #[test]
-#[ignore = "live+gate-only: docker compose oracle; open defect (--resume --force remedy), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_resume_force_runs_over_a_complete_prefix_oracle() {
+#[ignore = "live: requires docker compose oracle"]
+fn resume_force_runs_over_a_complete_prefix_oracle() {
     resume_force(SqlEngine::Oracle);
 }
 

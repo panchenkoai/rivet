@@ -1361,13 +1361,14 @@ def grade(spec: dict) -> dict:
             # A sealed plan owes exactly the source rows inside the chunk ranges it carries (inclusive, as planned).
             within = " OR ".join(f"{_qi(rc)} BETWEEN {int(lo)} AND {int(hi)}" for lo, hi in spec["ranges"])
             src = f"(SELECT * FROM {src} WHERE {within})"
-        elif (spec.get("resume") or spec.get("replay")) and not cumulative and dst and key:
-            # A resume (or a sealed plan's ranges) completes a plan made before this invocation; the source may have moved since.
+        elif (spec.get("resumes_a_run", spec.get("resume")) or spec.get("replay")) and not cumulative and dst and key:
+            # A resume of an unfinished run (or a sealed plan's ranges) completes a plan made before this invocation; the source
+            # may have moved since. A `--resume` that found no run to complete planned afresh and is graded as a plain run.
             kl = ", ".join(_qi(k) for k in key)
             on = " AND ".join(f"CAST(s.{_qi(k)} AS VARCHAR) = CAST(e.{_qi(k)} AS VARCHAR)" for k in key)
             src = f"(SELECT s.* FROM {src} s SEMI JOIN (SELECT DISTINCT {kl} FROM got) e ON {on})"
             partial.append("a `--resume` run completes a plan made before it: the delivered rows are graded, completeness against that plan is not"
-                           if spec.get("resume") else
+                           if spec.get("resumes_a_run", spec.get("resume")) else
                            "a sealed plan replays the chunk ranges it was planned with: the delivered rows are graded, completeness against the live source is not")
         f, row_of, collapse = _value_findings(ora, engine, fmt, native, rows, src, dst, key, partial)
         if spec.get("nothing_new") and not cumulative:
