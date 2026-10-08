@@ -625,37 +625,25 @@ fn a_load_from_another_state_db_is_refused_every_cycle(
         "fixture: rivet's own view over its own change log:\n{before:?}"
     );
 
-    let other = build();
+    let mut other = build();
     run(&other);
-    for cycle in 1..=2usize {
-        let out = other.load_args_env(&[], &env);
-        let said = format!(
-            "{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-        assert_eq!(
-            out.status.code(),
-            Some(5),
-            "cycle {cycle}: a protective refusal exits 5:\n{said}"
-        );
-        assert!(
-            said.contains("[RIVET_LOAD_TARGET_NOT_RIVETS]")
-                && said.contains(&format!("refusing to replace `{view}`: it exists"))
-                && said.contains("no record of rivet loading it"),
-            "cycle {cycle} names the object and why:\n{said}"
-        );
-        assert_eq!(
-            stand(),
-            before,
-            "cycle {cycle}: the view and the log are what they were"
-        );
-        assert_eq!(
-            StateDb::next_to_config(&other.config_path()).load_statuses(&view),
-            vec!["refused"; cycle],
-            "cycle {cycle}: only refusals are journaled, and a refusal claims nothing"
-        );
-    }
+    let said = other.refuses_twice_then(
+        &["load"],
+        &env,
+        Refused::by_code("RIVET_LOAD_TARGET_NOT_RIVETS", 5),
+        vec![],
+    );
+    assert!(
+        said.contains(&format!("refusing to replace `{view}`: it exists"))
+            && said.contains("no record of rivet loading it"),
+        "the refusal names the object and why:\n{said}"
+    );
+    assert_eq!(stand(), before, "the view and the log are what they were");
+    assert_eq!(
+        StateDb::next_to_config(&other.config_path()).load_statuses(&view),
+        vec!["refused"; 2],
+        "only refusals are journaled, and a refusal claims nothing"
+    );
 }
 
 /// An incremental export's view and log, loaded again from a state DB that never saw them.

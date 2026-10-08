@@ -28,7 +28,8 @@ use std::path::{Path, PathBuf};
 // 17 -> 21 (2026-10-02): live_cdc_source_connections counts source connections, which the oracle's own read would add to.
 // 21 -> 22 (2026-10-03): the PG truncate refusal's resumed run keeps the pre-truncate rows the refusal says only a re-snapshot removes.
 // 22 -> 23 (2026-10-03): pg_cdc_a_declared_key_absent_from_the_old_key_does_not_split merges by a declared `load.pk: [code]`; the oracle dedups by the source primary key `id`.
-const NO_ORACLE_CEILING: usize = 23; // ratchet-pin: no-oracle-opt-outs
+// Raised 23 -> 24 (2026-10-08): the MongoDB oplog-gone cells run on a replica set container they start themselves, which the reader inside rivet-duckdb cannot reach.
+const NO_ORACLE_CEILING: usize = 24; // ratchet-pin: no-oracle-opt-outs
 
 /// Typed declarations in tests/live of what a run that does not exit 0 may leave: `.a_failed_run_may_leave(` and a raw run's `FAILED_RUN_LEAVES_ENV`.
 // 0 -> 19 (2026-10-07): the refusal grade's first pass; every site is a gate that fails a run after its parts are written (quality, schema drift, a manifest that did not land).
@@ -39,7 +40,7 @@ const NO_ORACLE_CEILING: usize = 23; // ratchet-pin: no-oracle-opt-outs
 const FAILED_RUN_LEFTOVER_CEILING: usize = 37; // ratchet-pin: failed-run-leftover-declarations
 
 /// Entries of `KNOWN_PRODUCT_DEFECTS` (tests/common/refusal.rs): product defects every failed run may show.
-const KNOWN_PRODUCT_DEFECT_CEILING: usize = 1; // ratchet-pin: failed-run-known-product-defects
+const KNOWN_PRODUCT_DEFECT_CEILING: usize = 2; // ratchet-pin: failed-run-known-product-defects
 
 /// Rust DuckDB-helper call sites across tests/ (see [`duckdb_helper_names`]).
 // 626 -> 630 (2026-10-01): #378 merged first and added 4 calls in its Mongo null-_id tests.
@@ -163,6 +164,23 @@ fn failed_run_leftover_declarations_never_grow() {
     );
 }
 
+/// Refusals the live cells accept with no `RIVET_*` code (`Refused::uncoded_known_defect(`): each is a code the registry owes.
+const UNCODED_REFUSAL_CEILING: usize = 5; // ratchet-pin: uncoded-refusals
+
+#[test]
+fn uncoded_refusals_the_cells_accept_never_grow() {
+    let n: usize = sources()
+        .iter()
+        .filter(|(rel, _)| rel.starts_with("tests/live/"))
+        .map(|(_, t)| t.matches("Refused::uncoded_known_defect(").count())
+        .sum();
+    assert_eq!(
+        n, UNCODED_REFUSAL_CEILING,
+        "refusals accepted with no RIVET_* code (`Refused::uncoded_known_defect(`): {n}, ceiling {UNCODED_REFUSAL_CEILING}. \
+         A refusal is expected by code; a coded one lowers the ceiling here."
+    );
+}
+
 #[test]
 fn known_product_defects_of_a_failed_run_never_grow() {
     let srcs = sources();
@@ -207,6 +225,11 @@ fn rust_duckdb_helper_call_sites_never_grow() {
 /// `(test fn, failure class, reason prefix)` of every `.oracle_known_defect(` site: a product defect the oracle must keep catching, excused only for its class. Removing one is allowed; adding one is a reviewed diff here.
 const KNOWN_DEFECTS: &[(&str, &str, &str)] = &[
     // ratchet-pin: oracle-known-defects strings
+    (
+        "open_defect_doctor_is_not_green_where_the_cdc_run_refuses_a_replica_that_does_not_relog_mysql",
+        "a failed run left: cdc-checkpoint",
+        "known defect: a CDC run that refuses at open still writes its checkpoint",
+    ),
     (
         "roast_pg_cdc_refuses_a_bare_table_name_that_matches_two_relations",
         "delivered-only rows",
@@ -256,6 +279,16 @@ const KNOWN_DEFECTS: &[(&str, &str, &str)] = &[
         "roast_resume_must_not_bypass_heterogeneous_id_guard",
         "a failed run left: resume-point",
         "known defect: a resumed keyset run the heterogeneous-_id guard refuses has already written its claim (resume_run_id, resume_owner) on the cursor row; the guard must come before the claim",
+    ),
+    (
+        "mongo_heterogeneous_resume_remedy",
+        "a failed run left: resume-point",
+        "known defect: a resumed keyset run the heterogeneous-_id guard refuses has already written its claim (resume_run_id, resume_owner) on the cursor row; the guard must come before the claim",
+    ),
+    (
+        "pg_cdc_missing_table_leaves_no_slot",
+        "a failed run left: chunk-checkpoint",
+        "known defect: a PostgreSQL CDC run refused for a table that does not exist has already stored its export_state row and created its slot",
     ),
 ]; // ratchet-pin: end
 

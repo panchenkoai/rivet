@@ -76,6 +76,38 @@ impl StateStore {
         )
     }
 
+    /// The in-progress chunk run of `export_name` under `source`; one that recorded no source counts while the name holds progress under no other source.
+    pub(super) fn unfinished_chunk_run(
+        &self,
+        export_name: &str,
+        source: &str,
+    ) -> Result<Option<String>> {
+        if let Some((own, _)) = self.in_progress_chunk_run(export_name, Some(source))? {
+            return Ok(Some(own));
+        }
+        let Some((unowned, _)) = self.in_progress_chunk_run(export_name, None)? else {
+            return Ok(None);
+        };
+        let ambiguous = self.another_source_of(export_name, source)?.is_some();
+        Ok((!ambiguous).then_some(unowned))
+    }
+
+    /// The latest successful run of `export_name` that ended after chunk run `run_id` was opened, when that chunk run recorded no source.
+    pub(super) fn finished_after_unsourced_chunk_run(
+        &self,
+        export_name: &str,
+        run_id: &str,
+    ) -> Result<Option<String>> {
+        self.query_opt(
+            "SELECT m.run_id FROM export_metrics m JOIN chunk_run c ON c.run_id = ?2 \
+             WHERE m.export_name = ?1 AND m.status = 'success' AND c.source IS NULL \
+               AND m.run_id <> c.run_id AND m.run_at > c.created_at \
+             ORDER BY m.id DESC LIMIT 1",
+            &[export_name.into(), run_id.into()],
+            |r| r.text(0),
+        )
+    }
+
     /// Latest `in_progress` chunk run of `export_name` under any source (test inspection).
     #[cfg(test)]
     pub(crate) fn find_in_progress_chunk_run(

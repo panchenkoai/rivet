@@ -7,6 +7,7 @@ const GROUPS: &[(&str, &str)] = &[
     ("toxiproxy", "toxiproxy_guard()"),
     ("mssql_cdc", "cross_process_serial(\"mssql_cdc\")"),
     ("oracle_cdc", "cross_process_serial(\"oracle_cdc\")"),
+    ("mysql_replica", "cross_process_serial(\"mysql_replica\")"),
 ];
 
 /// `module::test` for every `#[test]` under tests/live whose body holds `call`.

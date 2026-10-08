@@ -45,7 +45,7 @@ scenarios:
     mysql:   { test: mysql_batch_and_cdc_deliver_every_ledger_row_alike, oracle: independent, known_defect: ["BOOLEAN"] }
     mssql:   { test: mssql_batch_and_cdc_deliver_every_ledger_row_alike, oracle: independent }
     mongo:    { na: "boolean rides the verbatim document blob, not a typed column" }
-    oracle:   { gap: "not captured in the preview: a BOOLEAN column is refused by name at open (ColKind::of, column_kinds_cover_the_preview_types_and_refuse_the_rest), while batch exports it" }
+    oracle:   { na: "Oracle CDC captures an allow-list of column kinds (ColKind::of, src/source/oracle/cdc.rs: NUMBER, FLOAT, BINARY_FLOAT/DOUBLE, DATE, the character types, RAW, TIMESTAMP [WITH TIME ZONE]); a BOOLEAN column is refused by name at open, so no value of it reaches the stream (column_kinds_cover_the_preview_types_and_refuse_the_rest)" }
 
   - id: type_integer_families
     what: "int16/32/64 + unsigned 64 (incl. BIGINT UNSIGNED > i64::MAX) survive CDC. MySQL cell is INDEPENDENT (DuckDB re-read vs the source literal), not a batch-differential"
@@ -85,7 +85,7 @@ scenarios:
     mysql:    { test: cdc_non_utc_server_timezone_matches_batch_and_utc_instant, oracle: independent }
     mssql:    { test: mssql_cdc_datetimeoffset_value_is_preserved, oracle: independent, known_defect: ["DATETIMEOFFSET"] }
     mongo:    { na: "BSON dates ride the verbatim document blob" }
-    oracle:   { gap: "no independent Oracle cell: oracle_cdc_non_utc_session_matches_batch (Asia/Tokyo + odd NLS logon trigger) is a DIFFERENTIAL self-oracle (CDC==batch), and the offset-to-UTC unit test stops at decode, before the sink" }
+    oracle:   { test: oracle_cdc_non_utc_session_matches_batch, oracle: independent }
 
   - id: type_text
     what: "varchar/char/text through CDC — value + encoding verbatim"
@@ -109,7 +109,7 @@ scenarios:
     mysql:   { test: mysql_batch_and_cdc_deliver_every_ledger_row_alike, oracle: independent }
     mssql:    { na: "SQL Server has no native JSON type; the CDC matrix fixture omits it by design" }
     mongo:    { test: mongo_cdc_change_stream_renders_tricky_bson_verbatim_like_batch, oracle: independent }
-    oracle:   { gap: "not captured in the preview: a JSON column is refused by name at open (column_kinds_cover_the_preview_types_and_refuse_the_rest), while batch exports it" }
+    oracle:   { na: "Oracle CDC captures an allow-list of column kinds (ColKind::of, src/source/oracle/cdc.rs: NUMBER, FLOAT, BINARY_FLOAT/DOUBLE, DATE, the character types, RAW, TIMESTAMP [WITH TIME ZONE]); a JSON column is refused by name at open, so no value of it reaches the stream (column_kinds_cover_the_preview_types_and_refuse_the_rest)" }
 
   - id: type_uuid
     what: "uuid — PG uuid / MySQL CHAR(36) / MSSQL uniqueidentifier → canonical value through CDC"
@@ -157,7 +157,7 @@ scenarios:
     mysql:    { na: "MySQL has no INTERVAL column type" }
     mssql:    { na: "SQL Server has no INTERVAL type" }
     mongo:    { na: "no interval type" }
-    oracle:   { gap: "not captured in the preview: an INTERVAL column is refused by name at open (column_kinds_cover_the_preview_types_and_refuse_the_rest)" }
+    oracle:   { na: "Oracle CDC captures an allow-list of column kinds (ColKind::of, src/source/oracle/cdc.rs: NUMBER, FLOAT, BINARY_FLOAT/DOUBLE, DATE, the character types, RAW, TIMESTAMP [WITH TIME ZONE]); a INTERVAL column is refused by name at open, so no value of it reaches the stream (column_kinds_cover_the_preview_types_and_refuse_the_rest)" }
 
   - id: type_list
     what: "PostgreSQL 1-D arrays (int[]/text[]/…) as a real Arrow List through CDC; a multi-dimensional array fails loud, never a flat NULL list (finding #6)"
@@ -165,7 +165,7 @@ scenarios:
     mysql:    { na: "MySQL has no array column type" }
     mssql:    { na: "SQL Server has no array column type" }
     mongo:    { na: "arrays ride the verbatim document blob (BSON array → extJSON)" }
-    oracle:   { gap: "not captured in the preview: VARRAY / nested-table (collection) columns are outside the captured kinds and refused at open (ADR-0037 OR7); no Oracle-specific test pins it" }
+    oracle:   { na: "Oracle CDC captures an allow-list of column kinds (ColKind::of, src/source/oracle/cdc.rs: NUMBER, FLOAT, BINARY_FLOAT/DOUBLE, DATE, the character types, RAW, TIMESTAMP [WITH TIME ZONE]); a VARRAY / nested-table column is refused by name at open, so no value of it reaches the stream (column_kinds_cover_the_preview_types_and_refuse_the_rest)" }
 
   - id: type_network
     what: "PostgreSQL inet/cidr through CDC as the server's own address text"

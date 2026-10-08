@@ -97,19 +97,19 @@ scenarios:
     mongo:    test
     oracle:   test
   - id: blessed_flow
-    what: "The WHOLE journey as ONE declared cross-product, not per-defect additions: pipeline{batch,cdc} x lifecycle{clean,repeat,resume} x store{local,s3,gcs} x state{sqlite,postgres} x engine = 144 cells, 76 runnable, 68 `na` each carrying its reason in the ledger. Where blessed_path walks init->apply for one strategy, this adds what that chain cannot reach: the CDC pipeline (plan/apply REFUSE a cdc export, so those cells run `run`), the crash-then-resume lifecycle (a fault hook kills the first apply, and the probe FAILS the cell if the hook did not stop it — a resume whose first run succeeded is a clean re-run wearing a flag), the repeat lifecycle asserted on the MANIFEST COPIES rather than the parquet (the data surviving is what makes a sidecar clobber invisible), and `load` with load_run/loaded_source_run. Values are read ONLY by DuckDB, and only from parts a manifest DECLARES as committed — counting every parquet under the prefix reads a crashed run's orphans as delivered data. State is scoped per-run (watermark on export_metrics, which has no run_id; run ids from the manifests for file_log/run_status): the first draft counted `export_name='flow'` and read 37 rows of unrelated history on a cell that wrote one."
+    what: "The WHOLE journey as ONE declared cross-product, not per-defect additions: pipeline{batch,cdc} x lifecycle{clean,repeat,resume} x store{local,s3,gcs} x state{sqlite,postgres} x engine = 180 cells, 88 runnable, 92 `na` each carrying its reason in the ledger (Oracle: its 12 batch cells run; its 18 cdc cells are `na`, the drain has no load leg and no fixture in the gate's CDC stand). Where blessed_path walks init->apply for one strategy, this adds what that chain cannot reach: the CDC pipeline (plan/apply REFUSE a cdc export, so those cells run `run`), the crash-then-resume lifecycle (a fault hook kills the first apply, and the probe FAILS the cell if the hook did not stop it — a resume whose first run succeeded is a clean re-run wearing a flag), the repeat lifecycle asserted on the MANIFEST COPIES rather than the parquet (the data surviving is what makes a sidecar clobber invisible), and `load` with load_run/loaded_source_run. Values are read ONLY by DuckDB, and only from parts a manifest DECLARES as committed — counting every parquet under the prefix reads a crashed run's orphans as delivered data. State is scoped per-run (watermark on export_metrics, which has no run_id; run ids from the manifests for file_log/run_status): the first draft counted `export_name='flow'` and read 37 rows of unrelated history on a cell that wrote one."
     postgres: test
     mysql:    test
     mssql:    test
     mongo:    test
-    oracle:   { gap: "not wired for Oracle: blessed_flow's cells ride the CDC stand in dev/release_oracle/cdc.py, whose _ENGINES has no Oracle entry (Oracle CDC itself ships as a bounded drain to files, #324, but its `load` leg is refused at config load); the batch chain is graded by blessed_path" }
+    oracle:   test
   - id: not_inert
     what: "The chain's own oracles must be able to go RED. Breaks each artifact class and requires the matching stage to fail: every declared part removed (oracle must stop agreeing with the source), no manifest (must report undelivered, not count the parquet lying next to it), a run id that never ran (state must refuse). Carries a NEGATIVE control too — removing ONE redundant copy of a repeated export must NOT move the oracle; the first draft demanded a failure there and went red against a correct oracle."
     postgres: test
     mysql:    test
     mssql:    test
     mongo:    test
-    oracle:   { gap: "not wired for Oracle: sc_not_inert breaks blessed_flow's artifacts, and blessed_flow does not run on Oracle" }
+    oracle:   test
   - id: verdicts
     what: "init -> the strategy per table matches the golden (keyset/full/range/name-trap), zero phantom heavy-chunk."
     postgres: test

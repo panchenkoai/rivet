@@ -64,6 +64,36 @@ enum Eng {
     Pg,
     My,
     Ms,
+    #[cfg_attr(not(feature = "oracle"), allow(dead_code))]
+    Or,
+}
+
+/// One committed Oracle statement as the stand's `rivet` user.
+#[cfg(feature = "oracle")]
+fn ora(sql: &str) {
+    ora_exec(sql);
+}
+
+#[cfg(not(feature = "oracle"))]
+fn ora(_sql: &str) {
+    unreachable!("Eng::Or cells are compiled only with the `oracle` feature");
+}
+
+/// A row source of `n` = 1..=`rows`: two small `CONNECT BY` sets joined, so a 300k-row seed holds no 300k-level hierarchy in PGA (three at once hit ORA-04036 on Oracle Free); with `APPEND` into a `NOLOGGING` table it also writes almost no redo for the LogMiner cells beside it to mine.
+fn ora_series(rows: i64) -> String {
+    format!(
+        "(SELECT (a.l - 1) * 1000 + b.l AS n \
+           FROM (SELECT LEVEL l FROM dual CONNECT BY LEVEL <= {}) a, \
+                (SELECT LEVEL l FROM dual CONNECT BY LEVEL <= 1000) b) WHERE n <= {rows}",
+        (rows + 999) / 1000
+    )
+}
+
+/// Gather optimizer statistics, Oracle's `ANALYZE` (fills `NUM_ROWS` and `AVG_ROW_LEN`).
+fn ora_stats(table: &str) {
+    ora(&format!(
+        "BEGIN DBMS_STATS.GATHER_TABLE_STATS(USER, '{table}'); END;"
+    ));
 }
 
 impl Eng {
@@ -72,6 +102,24 @@ impl Eng {
             Eng::Pg => require_alive(LiveService::Postgres),
             Eng::My => require_alive(LiveService::Mysql),
             Eng::Ms => require_alive(LiveService::Mssql),
+            Eng::Or => require_alive(LiveService::Oracle),
+        }
+    }
+
+    /// A fresh table name as the engine's catalog stores it (Oracle folds unquoted names to upper case).
+    fn table_name(self, prefix: &str) -> String {
+        let name = unique_name(prefix);
+        match self {
+            Eng::Or => name.to_uppercase(),
+            _ => name,
+        }
+    }
+
+    /// A fixture column as a config key must spell it (the Oracle catalog holds it upper-case).
+    fn col(self, name: &str) -> String {
+        match self {
+            Eng::Or => name.to_uppercase(),
+            _ => name.to_string(),
         }
     }
 
@@ -86,6 +134,7 @@ impl Eng {
         match self {
             Eng::My => "created_at_ts",
             Eng::Pg | Eng::Ms => "created_at_tz",
+            Eng::Or => unreachable!("Oracle's type matrix is live_oracle's own fixture"),
         }
     }
 
@@ -94,6 +143,7 @@ impl Eng {
             Eng::Pg => Rig::pg_batch(&format!("public.{table}")),
             Eng::My => Rig::mysql_batch(table),
             Eng::Ms => Rig::mssql_batch(&format!("dbo.{table}")),
+            Eng::Or => Rig::oracle_batch(table),
         }
     }
 
@@ -102,7 +152,7 @@ impl Eng {
     fn qualified(self, table: &str) -> String {
         match self {
             Eng::Pg => format!("public.{table}"),
-            Eng::My => table.to_string(),
+            Eng::My | Eng::Or => table.to_string(),
             Eng::Ms => format!("dbo.{table}"),
         }
     }
@@ -147,6 +197,11 @@ fn insert_dense_range_padded(eng: Eng, table: &str, lo: i64, hi: i64, pad_bytes:
                  SELECT value, value, {ms} FROM GENERATE_SERIES(CAST({lo} AS BIGINT), CAST({hi} AS BIGINT))"
             ));
         }
+        Eng::Or => ora(&format!(
+            "INSERT /*+ APPEND */ INTO {table} (id, payload, pad) \
+             SELECT {lo} - 1 + n, {lo} - 1 + n, RPAD('x', {pad_bytes}, 'x') FROM {}",
+            ora_series(hi - lo + 1)
+        )),
     }
 }
 
@@ -181,6 +236,10 @@ fn insert_dense_range(eng: Eng, table: &str, lo: i64, hi: i64) {
                  SELECT value, value FROM GENERATE_SERIES(CAST({lo} AS BIGINT), CAST({hi} AS BIGINT))"
             ));
         }
+        Eng::Or => ora(&format!(
+            "INSERT /*+ APPEND */ INTO {table} (id, payload) SELECT {lo} - 1 + n, {lo} - 1 + n FROM {}",
+            ora_series(hi - lo + 1)
+        )),
     }
 }
 
@@ -232,7 +291,7 @@ fn run_pool_split_resume(
         table,
         original_ids,
         grow,
-        "chunk_column: id",
+        &format!("chunk_column: {}", eng.col("id")),
         ("RIVET_TEST_ERROR_AT", "chunk_export:1"),
     );
 }
@@ -434,6 +493,10 @@ impl Drop for StandCleanup {
                 }
             }
             Eng::Ms => mssql_drop_table(&self.1),
+            Eng::Or => {
+                let sql = format!("DROP TABLE {} PURGE", self.1);
+                let _ = std::panic::catch_unwind(|| ora(&sql));
+            }
         }
     }
 }
@@ -444,7 +507,7 @@ impl Drop for StandCleanup {
 /// ABOVE chunk_size so the small-table Snapshot escape does not pre-empt the
 /// range plan. Returns the table name + a cleanup guard.
 fn seed_sparse(eng: Eng, rows: i64, step: i64) -> (String, StandCleanup) {
-    let table = unique_name("stand_sparse");
+    let table = eng.table_name("stand_sparse");
     let guard = StandCleanup(eng, table.clone());
     match eng {
         Eng::Pg => {
@@ -489,6 +552,16 @@ fn seed_sparse(eng: Eng, rows: i64, step: i64) -> (String, StandCleanup) {
             ));
             mssql_exec(&format!("UPDATE STATISTICS {table}"));
         }
+        Eng::Or => {
+            ora(&format!(
+                "CREATE TABLE {table} (id NUMBER(18) PRIMARY KEY, payload NUMBER(9) NOT NULL)"
+            ));
+            ora(&format!(
+                "INSERT INTO {table} (id, payload) SELECT 1 + (LEVEL - 1) * {step}, LEVEL - 1 \
+                 FROM dual CONNECT BY LEVEL <= {rows}"
+            ));
+            ora_stats(&table);
+        }
     }
     (table, guard)
 }
@@ -499,7 +572,7 @@ fn seed_sparse(eng: Eng, rows: i64, step: i64) -> (String, StandCleanup) {
 /// refuse (`bail_if_null_keyed`). `id` is a NOT NULL PK so the table is otherwise
 /// well-formed. Small is fine: the NULL guard fires before chunk generation.
 fn seed_nullable_key(eng: Eng, rows: i64) -> (String, StandCleanup) {
-    let table = unique_name("stand_nullkey");
+    let table = eng.table_name("stand_nullkey");
     let guard = StandCleanup(eng, table.clone());
     match eng {
         Eng::Pg => {
@@ -540,6 +613,16 @@ fn seed_nullable_key(eng: Eng, rows: i64) -> (String, StandCleanup) {
                  FROM GENERATE_SERIES(CAST(1 AS BIGINT), CAST({rows} AS BIGINT))"
             ));
         }
+        Eng::Or => {
+            ora(&format!(
+                "CREATE TABLE {table} (id NUMBER(18) PRIMARY KEY, k NUMBER(9))"
+            ));
+            ora(&format!(
+                "INSERT INTO {table} (id, k) \
+                 SELECT LEVEL, CASE WHEN MOD(LEVEL, 2) = 0 THEN NULL ELSE LEVEL END \
+                 FROM dual CONNECT BY LEVEL <= {rows}"
+            ));
+        }
     }
     (table, guard)
 }
@@ -551,7 +634,7 @@ fn seed_nullable_key(eng: Eng, rows: i64) -> (String, StandCleanup) {
 /// planner must REFUSE it (#103). Small is fine: the integer-family guard fires
 /// at plan time, before any chunk generation.
 fn seed_text_keyed(eng: Eng, rows: i64) -> (String, StandCleanup) {
-    let table = unique_name("stand_textkey");
+    let table = eng.table_name("stand_textkey");
     let guard = StandCleanup(eng, table.clone());
     match eng {
         Eng::Pg => {
@@ -592,6 +675,16 @@ fn seed_text_keyed(eng: Eng, rows: i64) -> (String, StandCleanup) {
             ));
             mssql_exec(&format!("UPDATE STATISTICS {table}"));
         }
+        Eng::Or => {
+            ora(&format!(
+                "CREATE TABLE {table} (id NUMBER(18) PRIMARY KEY, k VARCHAR2(20) NOT NULL)"
+            ));
+            ora(&format!(
+                "INSERT INTO {table} (id, k) SELECT LEVEL, 'v' || LEVEL \
+                 FROM dual CONNECT BY LEVEL <= {rows}"
+            ));
+            ora_stats(&table);
+        }
     }
     (table, guard)
 }
@@ -601,7 +694,7 @@ fn seed_text_keyed(eng: Eng, rows: i64) -> (String, StandCleanup) {
 /// planner must refuse `chunk_by_key` on it at plan time, not fail mid-run after a
 /// partial write (#dogfood).
 fn seed_decimal_pk(eng: Eng, rows: i64) -> (String, StandCleanup) {
-    let table = unique_name("stand_deckey");
+    let table = eng.table_name("stand_deckey");
     let guard = StandCleanup(eng, table.clone());
     match eng {
         Eng::Pg => {
@@ -641,6 +734,17 @@ fn seed_decimal_pk(eng: Eng, rows: i64) -> (String, StandCleanup) {
             ));
             mssql_exec(&format!("UPDATE STATISTICS {table}"));
         }
+        // Scale 2: Oracle's `NUMBER(15,0)` is an integer key the cursor reads.
+        Eng::Or => {
+            ora(&format!(
+                "CREATE TABLE {table} (dkey NUMBER(15,2) PRIMARY KEY, v VARCHAR2(20) NOT NULL)"
+            ));
+            ora(&format!(
+                "INSERT INTO {table} (dkey, v) SELECT LEVEL, 'v' || LEVEL \
+                 FROM dual CONNECT BY LEVEL <= {rows}"
+            ));
+            ora_stats(&table);
+        }
     }
     (table, guard)
 }
@@ -654,7 +758,7 @@ fn run_keyset_decimal_key_bails(eng: Eng) {
     let rig = eng
         .rig(&table)
         .mode("chunked")
-        .export_line("chunk_by_key: dkey")
+        .export_line(&format!("chunk_by_key: {}", eng.col("dkey")))
         .export_line("chunk_size: 100");
     let out = run_rivet_env(
         &["run", "--config", rig.config_path().to_str().unwrap()],
@@ -735,7 +839,7 @@ const SPLIT_PAD_BYTES: usize = 600;
 /// `dense_ids(300_000)`, the grow ranges, or anything else every caller passes,
 /// and the seed stays one bulk INSERT.
 fn seed_dense_wide(eng: Eng, rows: i64, pad_bytes: usize) -> (String, StandCleanup) {
-    let table = unique_name("stand_dense");
+    let table = eng.table_name("stand_dense");
     let guard = StandCleanup(eng, table.clone());
     let (pad_col, pad_val_pg, pad_val_my, pad_val_ms) = if pad_bytes == 0 {
         (String::new(), String::new(), String::new(), String::new())
@@ -791,6 +895,22 @@ fn seed_dense_wide(eng: Eng, rows: i64, pad_bytes: usize) -> (String, StandClean
             ));
             mssql_exec(&format!("UPDATE STATISTICS {table}"));
         }
+        Eng::Or => {
+            let pad_col = if pad_bytes == 0 {
+                String::new()
+            } else {
+                format!(", pad VARCHAR2({pad_bytes})")
+            };
+            ora(&format!(
+                "CREATE TABLE {table} (id NUMBER(18) PRIMARY KEY, payload NUMBER(9) NOT NULL{pad_col}) NOLOGGING"
+            ));
+            if pad_bytes == 0 {
+                insert_dense_range(eng, &table, 1, rows);
+            } else {
+                insert_dense_range_padded(eng, &table, 1, rows, pad_bytes);
+            }
+            ora_stats(&table);
+        }
     }
     (table, guard)
 }
@@ -840,7 +960,7 @@ fn run_chunk_count(eng: Eng, n: usize) {
         .rig(&table)
         .duckdb_oracle()
         .mode("chunked")
-        .export_line("chunk_column: id")
+        .export_line(&format!("chunk_column: {}", eng.col("id")))
         .export_line(&format!("chunk_count: {n}"));
     let cfg = rig.config_path();
     let out = run_rivet_env(
@@ -875,7 +995,7 @@ fn run_chunk_count(eng: Eng, n: usize) {
 /// Seed a table keyed by a DATE column `d` spanning `days` distinct days
 /// (id BIGINT PK, d DATE NOT NULL), for `chunk_by_days` date-window chunking.
 fn seed_dated(eng: Eng, rows: i64, days: i64, recent: bool) -> (String, StandCleanup) {
-    let table = unique_name("stand_dated");
+    let table = eng.table_name("stand_dated");
     let guard = StandCleanup(eng, table.clone());
     // Row `i`'s date, per engine. `recent` → the last `days` days from today
     // (time_window anchors on today, so 2023 dates fall outside its window); else a
@@ -887,6 +1007,8 @@ fn seed_dated(eng: Eng, rows: i64, days: i64, recent: bool) -> (String, StandCle
         (Eng::My, false) => format!("DATE_ADD('2023-01-01', INTERVAL ({i} % {days}) DAY)"),
         (Eng::Ms, true) => format!("DATEADD(day, -({i} % {days}), CAST(GETDATE() AS DATE))"),
         (Eng::Ms, false) => format!("DATEADD(day, {i} % {days}, CAST('2023-01-01' AS DATE))"),
+        (Eng::Or, true) => format!("TRUNC(SYSDATE) - MOD({i}, {days})"),
+        (Eng::Or, false) => format!("DATE '2023-01-01' + MOD({i}, {days})"),
     };
     match eng {
         Eng::Pg => {
@@ -929,6 +1051,16 @@ fn seed_dated(eng: Eng, rows: i64, days: i64, recent: bool) -> (String, StandCle
             ));
             mssql_exec(&format!("UPDATE STATISTICS {table}"));
         }
+        Eng::Or => {
+            ora(&format!(
+                "CREATE TABLE {table} (id NUMBER(18) PRIMARY KEY, d DATE NOT NULL)"
+            ));
+            ora(&format!(
+                "INSERT INTO {table} (id, d) SELECT LEVEL, {} FROM dual CONNECT BY LEVEL <= {rows}",
+                d("LEVEL")
+            ));
+            ora_stats(&table);
+        }
     }
     (table, guard)
 }
@@ -943,7 +1075,7 @@ fn run_chunk_by_days(eng: Eng) {
         .rig(&table)
         .duckdb_oracle()
         .mode("chunked")
-        .export_line("chunk_column: d")
+        .export_line(&format!("chunk_column: {}", eng.col("d")))
         .export_line("chunk_by_days: 7");
     let cfg = rig.config_path();
     let out = run_rivet_env(
@@ -1011,7 +1143,7 @@ fn run_keyset_non_usable_bail(eng: Eng) {
     let rig = eng
         .rig(&table)
         .mode("chunked")
-        .export_line("chunk_by_key: payload");
+        .export_line(&format!("chunk_by_key: {}", eng.col("payload")));
     let cfg = rig.config_path();
     let out = run_rivet_env(
         &["run", "--config", cfg.to_str().unwrap()],
@@ -1034,7 +1166,7 @@ fn run_keyset_non_usable_bail(eng: Eng) {
 /// gap) — below the sparse-guard floor so it runs, exercising the empty-window
 /// path. No row may be lost at an empty window boundary.
 fn seed_gappy(eng: Eng) -> (String, StandCleanup) {
-    let table = unique_name("stand_gappy");
+    let table = eng.table_name("stand_gappy");
     let guard = StandCleanup(eng, table.clone());
     // id = g for g<=50, else 950+g (so 51..100 → 1001..1050).
     match eng {
@@ -1073,6 +1205,17 @@ fn seed_gappy(eng: Eng) -> (String, StandCleanup) {
             ));
             mssql_exec(&format!("UPDATE STATISTICS {table}"));
         }
+        Eng::Or => {
+            ora(&format!(
+                "CREATE TABLE {table} (id NUMBER(18) PRIMARY KEY, payload NUMBER(9) NOT NULL)"
+            ));
+            ora(&format!(
+                "INSERT INTO {table} (id, payload) \
+                 SELECT CASE WHEN LEVEL <= 50 THEN LEVEL ELSE 950 + LEVEL END, LEVEL \
+                 FROM dual CONNECT BY LEVEL <= 100"
+            ));
+            ora_stats(&table);
+        }
     }
     (table, guard)
 }
@@ -1085,7 +1228,7 @@ fn run_range_gappy(eng: Eng) {
     let rig = eng
         .rig(&table)
         .mode("chunked")
-        .export_line("chunk_column: id")
+        .export_line(&format!("chunk_column: {}", eng.col("id")))
         .export_line("chunk_size: 100");
     let cfg = rig.config_path();
     let out = run_rivet_env(
@@ -1112,7 +1255,7 @@ fn run_chunk_size_memory_mb(eng: Eng) {
     let rig = eng
         .rig(&table)
         .mode("chunked")
-        .export_line("chunk_column: id")
+        .export_line(&format!("chunk_column: {}", eng.col("id")))
         .export_line("chunk_size_memory_mb: 1");
     let cfg = rig.config_path();
     let out = run_rivet_env(
@@ -1145,7 +1288,7 @@ fn run_sparse_guard(eng: Eng) {
     let rig = eng
         .rig(&table)
         .mode("chunked")
-        .export_line("chunk_column: id")
+        .export_line(&format!("chunk_column: {}", eng.col("id")))
         .export_line("chunk_size: 1000");
     let cfg = rig.config_path();
     let out = run_rivet_env(
@@ -1156,7 +1299,7 @@ fn run_sparse_guard(eng: Eng) {
 
     match eng {
         // Proven sparse (scan-free estimate) → refuse.
-        Eng::Pg | Eng::Ms => {
+        Eng::Pg | Eng::Ms | Eng::Or => {
             assert!(
                 !out.status.success(),
                 "sparse range must BAIL on this engine; stderr:\n{stderr}"
@@ -1206,7 +1349,7 @@ fn run_null_keyed_bail(eng: Eng) {
     let rig = eng
         .rig(&table)
         .mode("chunked")
-        .export_line("chunk_column: k")
+        .export_line(&format!("chunk_column: {}", eng.col("k")))
         .export_line("chunk_size: 50");
     let cfg = rig.config_path();
     let out = run_rivet_env(
@@ -1256,7 +1399,7 @@ fn run_non_integer_chunk_column_bail(eng: Eng) {
     let rig = eng
         .rig(&table)
         .mode("chunked")
-        .export_line("chunk_column: k")
+        .export_line(&format!("chunk_column: {}", eng.col("k")))
         .export_line("chunk_count: 4");
     let cfg = rig.config_path();
     let out = run_rivet_env(
@@ -2234,6 +2377,7 @@ fn run_unreadable_range_bounds_must_not_export_nothing(eng: Eng) {
             Eng::Pg => "PostgreSQL numeric",
             Eng::My => "MySQL decimal",
             Eng::Ms => "SQL Server decimal",
+            Eng::Or => "Oracle number",
         },
         got,
         String::from_utf8_lossy(&out.stderr)
@@ -2269,7 +2413,7 @@ fn stand_unreadable_range_bounds_must_not_export_nothing_mssql() {
 /// equivalent is a plain NON-unique index, which is the control this matrix
 /// needs: the probe must refuse that key.
 fn seed_partial_unique(eng: Eng, dups: i64, live: i64) -> (String, StandCleanup) {
-    let table = unique_name("stand_partuk");
+    let table = eng.table_name("stand_partuk");
     let guard = StandCleanup(eng, table.clone());
     match eng {
         Eng::Pg => {
@@ -2329,6 +2473,7 @@ fn seed_partial_unique(eng: Eng, dups: i64, live: i64) -> (String, StandCleanup)
             ));
             mssql_exec(&format!("UPDATE STATISTICS {table}"));
         }
+        Eng::Or => unreachable!("Oracle has no partial index over a plain column"),
     }
     (table, guard)
 }
@@ -2877,4 +3022,151 @@ fn open_defect_a_float_chunk_column_under_query_keeps_its_fractional_keys_postgr
         delivered == 43,
         "a double precision chunk_column under `query:` delivered {delivered} of 43 rows with exit 0"
     );
+}
+
+// ─── Oracle arm of the stand (docs/chunking, cli-flag, cross-config, fail-loud, pool-split matrices) ───
+
+#[cfg(feature = "oracle")]
+mod oracle_cells {
+    use super::*;
+
+    #[test]
+    #[ignore = "live: requires docker compose up -d oracle"]
+    fn stand_sparse_guard_oracle() {
+        run_sparse_guard(Eng::Or);
+    }
+
+    #[test]
+    #[ignore = "live: requires docker compose up -d oracle"]
+    fn stand_null_keyed_bail_oracle() {
+        run_null_keyed_bail(Eng::Or);
+    }
+
+    #[test]
+    #[ignore = "live: requires docker compose up -d oracle"]
+    fn stand_non_integer_chunk_column_bail_oracle() {
+        run_non_integer_chunk_column_bail(Eng::Or);
+    }
+
+    #[test]
+    #[ignore = "live: requires docker compose up -d oracle"]
+    fn stand_chunk_count_oracle() {
+        run_chunk_count(Eng::Or, 4);
+    }
+
+    #[test]
+    #[ignore = "live: requires docker compose up -d oracle"]
+    fn stand_chunk_by_days_oracle() {
+        run_chunk_by_days(Eng::Or);
+    }
+
+    #[test]
+    #[ignore = "live: requires docker compose up -d oracle"]
+    fn stand_keyset_non_usable_bail_oracle() {
+        run_keyset_non_usable_bail(Eng::Or);
+    }
+
+    #[test]
+    #[ignore = "live: requires docker compose up -d oracle"]
+    fn stand_keyset_decimal_key_bails_oracle() {
+        run_keyset_decimal_key_bails(Eng::Or);
+    }
+
+    #[test]
+    #[ignore = "live: requires docker compose up -d oracle"]
+    fn stand_range_gappy_oracle() {
+        run_range_gappy(Eng::Or);
+    }
+
+    #[test]
+    #[ignore = "live: requires docker compose up -d oracle"]
+    fn stand_chunk_size_memory_mb_oracle() {
+        run_chunk_size_memory_mb(Eng::Or);
+    }
+
+    /// `mode: chunked` over a `table:` with no `chunk_column` range-chunks on the single integer primary key.
+    #[test]
+    #[ignore = "live: requires docker compose up -d oracle"]
+    fn stand_range_auto_single_int_pk_oracle() {
+        Eng::Or.require();
+        const ROWS: i64 = 2000;
+        let (table, _guard) = seed_dense(Eng::Or, ROWS);
+        let rig = Eng::Or
+            .rig(&table)
+            .mode("chunked")
+            .export_line("chunk_size: 500");
+        let out = rig.run_args_env(&[], &[("RUST_LOG", "warn")]);
+        assert!(
+            out.status.success(),
+            "chunked over a table with no chunk_column must resolve the key from the PK; stderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let files = files_with_extension(&rig.out_dir(), "parquet");
+        assert_eq!(files.len(), 4, "2000 rows / 500 per chunk: {files:?}");
+        assert_eq!(
+            count_parquet_rows(&rig.out_dir()) as i64,
+            ROWS,
+            "the four windows hold every row (the rig oracle grades them against the source)"
+        );
+    }
+
+    #[test]
+    #[ignore = "live: requires docker compose up -d oracle"]
+    fn stand_format_csv_oracle() {
+        run_csv(Eng::Or);
+    }
+
+    #[test]
+    #[ignore = "live: requires docker compose up -d oracle"]
+    fn stand_compression_codecs_oracle() {
+        run_codec_matrix(Eng::Or);
+    }
+
+    #[test]
+    #[ignore = "live: requires docker compose up -d oracle fake-gcs"]
+    fn stand_dest_gcs_oracle() {
+        run_dest_gcs(Eng::Or);
+    }
+
+    #[test]
+    #[ignore = "live: requires docker compose up -d oracle minio"]
+    fn stand_dest_s3_oracle() {
+        run_dest_s3(Eng::Or);
+    }
+
+    #[test]
+    #[ignore = "live: requires docker compose up -d oracle"]
+    fn stand_pool_split_resume_grows_oracle() {
+        Eng::Or.require();
+        let (table, _g) = seed_dense_wide_for_split(Eng::Or, 300_000);
+        run_pool_split_resume(
+            Eng::Or,
+            &table,
+            &dense_ids(300_000),
+            Some((300_001, 450_000)),
+        );
+    }
+
+    #[test]
+    #[ignore = "live: requires docker compose up -d oracle"]
+    fn stand_pool_split_gappy_key_oracle() {
+        Eng::Or.require();
+        let (table, _g, ids) = seed_gappy_split(Eng::Or, 150_000);
+        run_pool_split_resume(Eng::Or, &table, &ids, Some((450_001, 525_000)));
+    }
+
+    #[test]
+    #[ignore = "live: requires docker compose up -d oracle"]
+    fn stand_pool_split_keyset_recovers_a_crash_oracle() {
+        Eng::Or.require();
+        let (table, _g) = seed_dense_wide_for_split(Eng::Or, 300_000);
+        run_pool_split_resume_with(
+            Eng::Or,
+            &table,
+            &dense_ids(300_000),
+            Some((300_001, 450_000)),
+            "chunk_by_key: ID",
+            ("RIVET_TEST_PANIC_AT", "after_keyset_page:1"),
+        );
+    }
 }

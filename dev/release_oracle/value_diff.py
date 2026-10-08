@@ -265,7 +265,7 @@ def oracle_result(url: str, sql: str) -> tuple[list[str], list[tuple]]:
 def oracle_table_select(url: str, table: str, renders: dict | None = None) -> str:
     """`SELECT` of every column of `table` (`OWNER.TABLE` allowed), DATE/TIMESTAMP as ISO text with every fractional digit (python-oracledb would truncate TIMESTAMP(9) to microseconds and refuses BC years), a WITH TIME ZONE column rendered at UTC; `renders` maps a column name to its own `{c}` expression."""
     owner, name = table.split(".", 1) if "." in table else (None, table)
-    where = f"owner = '{owner.upper()}' AND " if owner else "owner = USER AND "
+    where = f"owner = '{owner.upper()}' AND " if owner else "owner = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') AND "
     cols = oracle_rows(
         url,
         "SELECT column_name, data_type FROM all_tab_columns "

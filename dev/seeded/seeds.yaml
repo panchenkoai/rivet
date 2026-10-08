@@ -303,6 +303,44 @@ seeds:
       mongo:
         na: "a Mongo export accepts only mode: full or cdc, so no run of another mode can meet its interrupted keyset run"
 
+  - name: unfinished-run-beside-an-uncheckpointed-run
+    class: a run of the same mode whose plan keeps no checkpoint finishes beside an unfinished checkpoint run, and a later checkpointed run resumes that older run over data read before the finished one
+    history: "2026-10-07 - a range-chunk run with chunk_checkpoint was killed after 6 of 20 chunks, the export ran once without chunk_checkpoint (exit 0), 20 rows changed, and with the checkpoint back the next run resumed the killed one: exit 0, manifest success, 14 of the 20 changed rows (main and v0.31.0; PostgreSQL, MySQL, SQL Server)"
+    scope: source
+    patch: unfinished-run-beside-an-uncheckpointed-run/shared.patch
+    engines:
+      postgres:
+        cells:
+          - crashed_range_chunk_then_checkpoint_removed_finish_the_run_postgres
+          - crashed_range_chunk_then_checkpoint_removed_reset_postgres
+          - crashed_keyset_then_checkpoint_removed_reset_postgres
+          - crashed_parallel_keyset_then_checkpoint_removed_reset_postgres
+      mysql:
+        cells:
+          - crashed_range_chunk_then_checkpoint_removed_finish_the_run_mysql
+          - crashed_range_chunk_then_checkpoint_removed_reset_mysql
+          - crashed_keyset_then_checkpoint_removed_reset_mysql
+          - crashed_parallel_keyset_then_checkpoint_removed_reset_mysql
+      mssql:
+        cells:
+          - crashed_range_chunk_then_checkpoint_removed_finish_the_run_mssql
+          - crashed_range_chunk_then_checkpoint_removed_reset_mssql
+          - crashed_keyset_then_checkpoint_removed_reset_mssql
+          - crashed_parallel_keyset_then_checkpoint_removed_reset_mssql
+      oracle:
+        cells:
+          - crashed_range_chunk_then_checkpoint_removed_finish_the_run_oracle
+          - crashed_range_chunk_then_checkpoint_removed_reset_oracle
+          - crashed_keyset_then_checkpoint_removed_reset_oracle
+          - crashed_parallel_keyset_then_checkpoint_removed_reset_oracle
+      mongo:
+        cells:
+          - crashed_resume_then_resume_removed_finish_the_run_mongo
+          - crashed_resume_then_resume_removed_reset_mongo
+      lib:
+        cells:
+          - "lib:an_interrupted_run_is_refused_for_its_own_mode_without_the_checkpoint_until_finished_or_abandoned"
+
   - name: chunk-run-resumed-by-another-source
     class: an interrupted range-chunk run is looked up by export name alone and resumed by a same-named export of another source
     history: "2026-10-06 - config A crashed after chunk 0, same-named config B of another database ran: exit 0, 'resuming it', 1000 of 5000 rows (v0.31.0)"

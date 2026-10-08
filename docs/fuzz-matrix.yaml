@@ -41,7 +41,7 @@ scenarios:
     mysql:    { na: "binary binlog events are decoded by the mysql_common crate, not Rivet code — there is no Rivet-owned text/byte parser to fuzz" }
     mssql:    { na: "change-table rows arrive as tiberius typed ColumnData (binary protocol, driver-decoded); Rivet only maps the enum in cell_to_rivet" }
     mongo:    { na: "BSON change events are deserialized into typed events by the mongodb driver, not Rivet code" }
-    oracle:   { gap: "a Rivet-owned TEXT parser with no fuzz target yet: Oracle CDC decodes LogMiner's MINE_VALUE text in src/source/oracle/cdc.rs (decode / canonical_number / parse_datetime / decode_hex); unit-tested on literals, never fuzzed" }
+    oracle:   { gap: "attempted 2026-10-08: a must-not-panic target over the LogMiner MINE_VALUE decoder (src/source/oracle/cdc.rs decode) is red on its first inputs, so it lands with the product fix, not before it. Measured with a throwaway unit probe: decode(Number, '1E9223372036854775807') panics `attempt to add with overflow` (cdc.rs:108); decode(TimestampTz, '2024-01-01T00:00:00 +00:9223372036854775807') panics `attempt to multiply with overflow` (cdc.rs:169); decode(TimestampTz, '2024-01-01T00:00:00 +99999999999999:00') panics `TimeDelta::seconds out of bounds` (chrono). The fuzz crate also builds without the `oracle` feature (fuzz/Cargo.toml: default-features = false), so the target needs that feature added" }
 
   - id: fuzz_checkpoint_token_decode
     what: "decoding the persisted resume/checkpoint token from an untrusted, corruptible / hand-editable file"

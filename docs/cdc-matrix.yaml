@@ -68,7 +68,7 @@ scenarios:
     postgres: { test: pg_missing_slot_refusal_remedy_recovers_the_row_written_while_the_slot_was_gone }
     mysql:    { test: cdc_resume_from_missing_binlog_fails_loudly_not_silently }
     mssql:    { test: mssql_cleanup_past_unread_changes_before_the_first_changes_run_is_refused }
-    mongo:    { gap: "no MongoDB cell: an oplog rolled past a first resume token cannot be forced on the stand (the driver's ChangeStreamHistoryLost is not swallowed, read only: src/source/mongo/cdc.rs)" }
+    mongo:    { test: open_defect_an_oplog_rolled_past_the_checkpoint_before_the_first_changes_run_is_refused_by_code_mongo }
     oracle:   { test: oracle_cdc_resume_past_log_retention_fails_loudly }
 
   - id: cdc_crash_at_least_once
@@ -85,7 +85,7 @@ scenarios:
     mysql:    { test: cdc_picks_up_a_column_added_between_runs }
     mssql:    { test: mssql_cdc_column_added_via_new_capture_instance_is_captured }
     mongo:    { na: "schemaless — a new field rides the verbatim document blob; no fixed per-collection schema to drift" }
-    oracle:   { gap: "no Oracle cell yet: columns are resolved from ALL_TAB_COLS at each open and redo older than an ALTER (STATUS 2/3) is refused (ADR-0037 OR4), but neither a column added between runs nor one added mid-window is exercised live" }
+    oracle:   { test: oracle_cdc_picks_up_a_column_added_between_runs }
 
   - id: cdc_whole_db_multiplex
     what: "one stream over many tables/collections, one anchor, resumes"
@@ -93,7 +93,7 @@ scenarios:
     mysql:    { test: cdc_multi_table_stream_one_binlog_connection_and_resumes }
     mssql:    { na: "MSSQL CDC is one capture instance per stream; config validation rejects `tables:` — mixed-txn routing covered by mssql_cdc_mixed_transaction_and_qualified_table_conformance" }
     mongo:    { na: "db.watch() is inherently a single whole-database stream; multi-collection routing is structural (mongo_cdc_mixed_transaction_ending_on_uncaptured_table)" }
-    oracle:   { gap: "no Oracle cell yet: the mining query selects several configured tables in one window, but no live test captures two tables in one run and resumes (the two-table live test only refuses a misspelled one)" }
+    oracle:   { test: oracle_cdc_two_tables_share_one_window_and_resume }
 
   - id: cdc_seq_total_order
     what: "__seq gives a total change order (shared commit position + intra-txn tiebreak) for correct current-state dedup"
@@ -109,7 +109,7 @@ scenarios:
     mysql:    { test: cdc_until_current_terminates_under_sustained_writes }
     mssql:    { test: mssql_cdc_until_current_terminates_under_sustained_writes }
     mongo:    { test: roast_until_current_terminates_under_sustained_writes_and_keeps_backlog }
-    oracle:   { gap: "no Oracle cell yet: the drain passes the SCN current at open as LogMiner's inclusive endScn (ADR-0037 OR8), but termination under a sustained concurrent writer is not measured live" }
+    oracle:   { test: roast_oracle_cdc_until_current_open_bound_two_runs_lose_nothing }
 
   - id: cdc_until_current_open_bound_two_runs
     what: "DEFER-NOT-DROP: a writer commits through run 1, which terminates and captures a prefix; run 2 drains the tail; the distinct-id union re-read from the parquet equals the SOURCE id set. Termination is load-bearing on the open-time bound for PostgreSQL (continuous slot re-peek — the PG variant runs rollover: 5, the RED shape that hung the pre-bound code) AND MongoDB (a tailable change stream that never empty-polls under sustained writes — the cluster-time bound stops it; disabling the pin hangs the sustained-writes test); MySQL (NON_BLOCK EOF) and SQL Server (Agent scan-gap empty poll) terminate natively, so their bound is a precise-stop refinement and their test proves defer-not-drop (each verified fix-invariant for termination by a disable-bound probe)"
@@ -117,7 +117,7 @@ scenarios:
     mysql:    { test: roast_mysql_until_current_open_bound_two_runs_lose_nothing }
     mssql:    { test: roast_mssql_until_current_open_bound_two_runs_lose_nothing }
     mongo:    { test: roast_mongo_cdc_until_current_open_bound_two_runs_lose_nothing }
-    oracle:   { gap: "no Oracle cell yet: defer-not-drop across two runs with a writer committing through run 1 is not exercised live (the transaction-open-across-a-run case is: oracle_cdc_transaction_open_across_a_run_keeps_its_early_rows)" }
+    oracle:   { test: roast_oracle_cdc_until_current_open_bound_two_runs_lose_nothing }
 
   - id: cdc_ndjson_bounded
     what: "the NDJSON driver (rivet cdc without --output) under until_current: terminates at the open-time bound under a live writer and emits the whole pre-open backlog to stdout (no ack by design — stdout is not durable, ADR-0023)"
@@ -181,7 +181,7 @@ scenarios:
     mysql:    { na: "MySQL replicas are not 'in recovery' in this sense — a replica has its own binlog and SHOW MASTER STATUS works; reading CDC from a MySQL replica is a supported topology, not a fail-loud case" }
     mssql:    { na: "SQL Server CDC reads change tables, which exist on the primary; an Always On secondary is read-only but CDC capture is a primary concern — no analogous recovery-mode fail" }
     mongo:    { na: "a MongoDB secondary serves change streams fine (they read the oplog); reading CDC from a secondary is a supported topology, not a fail-loud case" }
-    oracle:   { gap: "not measured: a bounded drain pointed at a Data Guard standby is untested, so whether it fails loud or mines is unknown" }
+    oracle:   { gap: "cannot run on this stand: needs an Oracle Data Guard standby, which is an Enterprise Edition feature the stand's Oracle Database Free image does not include (a licence, not a harness leg; measured 2026-10-08 on the stand: v$option reports `Oracle Data Guard = FALSE` and `Managed Standby = FALSE`). Whether a bounded drain pointed at a standby fails loud or mines is unknown" }
 
   - id: cdc_failover_to_another_member
     what: "a failover: the member rivet reads from fails and the SAME config is pointed at another member of the cluster. Nothing may be lost or duplicated silently: rivet either refuses loudly (no part, checkpoint unmoved) or continues with every change exactly once. A cell that does neither is a strict known defect, so the gate flips the day it is fixed"
@@ -189,7 +189,7 @@ scenarios:
     mysql:    { test: a_failover_to_another_cluster_member_is_refused_not_resumed_at_foreign_coordinates, note: "refused by server identity (server_uuid, then the GTID set); following the failover by GTID is a strict known defect (cdc_follows_a_failover_to_another_cluster_member_by_gtid)" }
     mssql:    { test: mssql_checkpoint_follows_a_failover_to_the_secondary }
     mongo:    { test: mongo_cdc_follows_a_failover_to_another_replica_set_member, note: "the resume token lives in the replica set's shared oplog, so the stream continues on another member; a primary election (stepdown) is not exercised: the stand's second member has priority 0" }
-    oracle:   { gap: "not measured: no Data Guard stand, so what a failover does to an Oracle CDC checkpoint is unknown (another database is refused: oracle_cdc_checkpoint_from_another_database_is_refused)" }
+    oracle:   { gap: "cannot run on this stand: needs an Oracle Data Guard standby, which is an Enterprise Edition feature the stand's Oracle Database Free image does not include (a licence, not a harness leg; measured 2026-10-08 on the stand: v$option reports `Oracle Data Guard = FALSE` and `Managed Standby = FALSE`). What a failover does to an Oracle CDC checkpoint is unknown; another database is refused (oracle_cdc_checkpoint_from_another_database_is_refused)" }
 
   - id: cdc_oversized_transaction_bails_loud
     what: "a transaction is buffered WHOLE (never split across parts), so an oversized one would OOM — each adapter caps its per-transaction buffer (max_tx_rows(), default 5M, and max_tx_bytes(), default 2 GiB of RESIDENT cost — at resident rates the byte cap fires first on any realistic row) and BY DEFAULT bails loudly naming the cap, never a silent OOM or partial capture. With RIVET_CDC_SPILL_DIR set the same threshold spills the tail to disk instead and the run proceeds — the *_past_the_memory_cap_* tests cover that branch; these four cover the refusal, which is why they must run WITHOUT the env var. One shared helper but FOUR call sites — each adapter's own guard is RED-proven, not just the helper"

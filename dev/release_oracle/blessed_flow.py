@@ -119,6 +119,9 @@ class Cell:
         Stated per combination rather than filtered silently: a cross-product
         with invisible holes is the thing this module exists to replace.
         """
+        if self.pipeline == "cdc" and self.engine == "oracle":
+            return ("Oracle CDC is a bounded drain to files whose `load:` leg is refused at config load, and the "
+                    "gate's CDC stand (cdc._ENGINES) has no Oracle fixture; the drain is graded by live_cdc_oracledb")
         if self.pipeline == "cdc" and self.engine == "mongo" and self.store != "local":
             return "mongo CDC to an object store is covered by the cdc_e2e cells; not duplicated here"
         if self.lifecycle == "resume" and self.pipeline == "cdc":
@@ -128,6 +131,11 @@ class Cell:
             # the store axis tests the WRITER, the state axis tests the LEDGER.
             return "store × state is not squared — object stores run on the postgres ledger only"
         return None
+
+
+def golden_table(engine: str) -> str:
+    """The golden seed's table a batch cell exports, as the engine's catalog spells it (Oracle folds unquoted names to upper case)."""
+    return "USERS" if engine == "oracle" else "users"
 
 
 def cross_product(engines: list[str]) -> list[Cell]:
@@ -145,6 +153,7 @@ def cross_product(engines: list[str]) -> list[Cell]:
                                 lifecycle=lifecycle,
                                 store=store,
                                 state=state,
+                                table=golden_table(eng),
                                 flags=_flags_for(len(out), pipeline, lifecycle, store),
                             )
                         )
@@ -1736,7 +1745,7 @@ def sc_not_inert(led: Ledger, engine: str, url: str, state_url: str, tag: str = 
     """Break each artifact class and require the matching stage to go RED."""
     led.phase("blessed flow · inertness probe (each oracle must fail when its subject is broken)")
     cell = Cell(engine=engine, pipeline="batch", lifecycle="clean", store="local",
-                state="sqlite", flags=_flags_for(0, "batch", "clean", "local"))
+                state="sqlite", table=golden_table(engine), flags=_flags_for(0, "batch", "clean", "local"))
     # Per version: --version-parallel runs a family's versions at once, and a shared
     # dir let two baselines write one prefix (duckdb=300000 over a 150000 source).
     work = scenarios.Scope(engine, tag).dir("inert")
@@ -1835,7 +1844,7 @@ def main(argv: list[str] | None = None) -> int:
     import argparse
 
     ap = argparse.ArgumentParser(prog="blessed_flow")
-    ap.add_argument("--engines", default="postgres,mysql,mssql,mongo")
+    ap.add_argument("--engines", default="postgres,mysql,mssql,mongo,oracle")
     ap.add_argument("--rerun-failed", action="store_true",
                     help=f"only the cells marked fail in {VERDICTS}")
     ap.add_argument("--state-url", default=os.environ.get("RIVET_GATE_STATE_URL", ""))

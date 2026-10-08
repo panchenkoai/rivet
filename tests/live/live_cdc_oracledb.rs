@@ -700,6 +700,267 @@ fn oracle_cdc_non_utc_session_matches_batch() {
         (&batch["columns"], &batch["rows"]),
         "an odd capture session decodes every value exactly as the batch export"
     );
+    // Independent of the batch reader: the zoned literals `seed_types` wrote, as UTC microseconds.
+    assert_eq!(
+        (utc_micros(&cdc_out, "TSTZ"), utc_micros(&cdc_out, "TSLTZ")),
+        (
+            [
+                (1, Some(1_709_193_600_500_000)),
+                (2, Some(1_719_820_800_000_000))
+            ]
+            .into(),
+            [(1, Some(1_709_211_600_000_000)), (2, None)].into()
+        ),
+        "10:00:00.5 +02:00 and 10:00 Europe/Berlin (summer); 10:00 -03:00: their UTC instants"
+    );
+}
+
+/// The microsecond-timestamp column `col` of ids 1 and 2 under `dir`, as raw UTC microseconds.
+fn utc_micros(dir: &Path, col: &str) -> std::collections::BTreeMap<i64, Option<i64>> {
+    use arrow::array::{Array, AsArray};
+    use arrow::datatypes::{DataType, Int64Type, TimeUnit};
+    let mut out = std::collections::BTreeMap::new();
+    for b in read_all_parts(dir) {
+        let ts = b
+            .column_by_name(col)
+            .unwrap_or_else(|| panic!("{col} column"));
+        assert!(
+            matches!(
+                ts.data_type(),
+                DataType::Timestamp(TimeUnit::Microsecond, _)
+            ),
+            "{col} is {:?}",
+            ts.data_type()
+        );
+        let ts = arrow::compute::cast(ts, &DataType::Int64).unwrap();
+        let (ts, ids) = (
+            ts.as_primitive::<Int64Type>(),
+            arrow::compute::cast(b.column_by_name("ID").expect("ID"), &DataType::Int64).unwrap(),
+        );
+        let ids = ids.as_primitive::<Int64Type>();
+        for i in 0..b.num_rows() {
+            if ids.value(i) <= 2 {
+                out.insert(ids.value(i), (!ts.is_null(i)).then(|| ts.value(i)));
+            }
+        }
+    }
+    out
+}
+
+/// Drops a view on scope exit.
+struct OraView(String);
+impl Drop for OraView {
+    fn drop(&mut self) {
+        let sql = format!("DROP VIEW {}", self.0);
+        let _ = std::panic::catch_unwind(|| ora_exec(&sql));
+    }
+}
+
+/// A VIEW exists and has columns, but no redo ever names it: configured as a CDC table it is refused before any anchor.
+#[test]
+#[ignore = "live: requires the oracle service with LogMiner prerequisites"]
+fn oracle_cdc_refuses_a_view_before_the_first_ack() {
+    let _serial = cross_process_serial("oracle_cdc");
+    let d = tempfile::tempdir().unwrap();
+    let base = cdc_table("ora_cvb", "id NUMBER(18) PRIMARY KEY, v NUMBER(18)");
+    let view = OraView(format!("{}_V", base.name()));
+    ora_exec(&format!(
+        "CREATE VIEW {} AS SELECT id, v FROM {}",
+        view.0,
+        base.name()
+    ));
+    ora_exec(&format!("GRANT SELECT ON {} TO c##rivetcdc", view.0));
+    ora_exec(&format!("INSERT INTO {} VALUES (1, 10)", base.name()));
+    let (ckpt, out) = (d.path().join("cdc.ckpt"), d.path().join("out"));
+    std::fs::create_dir_all(&out).unwrap();
+    let err = Rig::oracle_cdc(&view.0)
+        .checkpoint_path(ckpt.clone())
+        .dest_path(out.clone())
+        .run_expect_fail();
+    assert!(
+        err.contains(&view.0),
+        "the refusal must name the view: {err}"
+    );
+    assert_eq!(
+        total_parquet_rows(&out),
+        0,
+        "a refused view delivers nothing"
+    );
+    assert_refused_before_any_write(&out, &ckpt);
+}
+
+/// A column added between two runs: the next run reads the table's new shape and delivers the new column's value.
+#[test]
+#[ignore = "live: requires the oracle service with LogMiner prerequisites"]
+fn oracle_cdc_picks_up_a_column_added_between_runs() {
+    let _serial = cross_process_serial("oracle_cdc");
+    let d = tempfile::tempdir().unwrap();
+    let t = cdc_table("ora_cadd", "id NUMBER(18) PRIMARY KEY, v NUMBER(18)");
+    let ckpt = d.path().join("cdc.ckpt");
+    rig(&t, &ckpt, &d.path().join("anchor")).run_ok();
+    ora_exec(&format!("INSERT INTO {} VALUES (1, 10)", t.name()));
+    let out1 = d.path().join("out1");
+    rig(&t, &ckpt, &out1).run_ok();
+    assert_eq!(cdc_id_ops(&out1), ops(&[(1, "insert")]));
+
+    ora_exec(&format!("ALTER TABLE {} ADD (w NUMBER(18))", t.name()));
+    ora_exec(&format!("INSERT INTO {} VALUES (2, 20, 7)", t.name()));
+    let out2 = d.path().join("out2");
+    rig(&t, &ckpt, &out2).run_ok();
+    assert_eq!(
+        cdc_id_ops(&out2),
+        ops(&[(2, "insert")]),
+        "run 2 delivers only the row written after the ALTER"
+    );
+    let added: Vec<String> = read_all_parts(&out2)
+        .iter()
+        .flat_map(|b| {
+            let w = b.column_by_name("W").expect("the added column W").clone();
+            (0..b.num_rows())
+                .map(|i| arrow::util::display::array_value_to_string(&w, i).unwrap())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(added, ["7"], "the added column's value is delivered");
+}
+
+/// A change written before an ALTER and mined after it cannot be decoded by the online dictionary: the run refuses by code and writes nothing.
+#[test]
+#[ignore = "live: requires the oracle service with LogMiner prerequisites"]
+fn oracle_cdc_a_change_older_than_an_alter_is_refused_by_code() {
+    let _serial = cross_process_serial("oracle_cdc");
+    let d = tempfile::tempdir().unwrap();
+    let t = cdc_table("ora_cmid", "id NUMBER(18) PRIMARY KEY, v NUMBER(18)");
+    let ckpt = d.path().join("cdc.ckpt");
+    rig(&t, &ckpt, &d.path().join("anchor")).run_ok();
+    let anchored = std::fs::read(&ckpt).unwrap();
+    ora_exec(&format!("INSERT INTO {} VALUES (1, 10)", t.name()));
+    ora_exec(&format!("ALTER TABLE {} ADD (w NUMBER(18))", t.name()));
+    let out = d.path().join("out");
+    let err = rig(&t, &ckpt, &out).run_expect_fail();
+    assert!(
+        err.contains("[RIVET_SOURCE_CDC_UNDECODABLE]"),
+        "the pre-ALTER change must be refused by code: {err}"
+    );
+    assert_eq!(
+        total_parquet_rows(&out),
+        0,
+        "a refused window delivers nothing"
+    );
+    assert_eq!(
+        std::fs::read(&ckpt).unwrap(),
+        anchored,
+        "the checkpoint must not advance past the refused change"
+    );
+}
+
+/// Two tables in one export share one mining window and one checkpoint, and a second run delivers only what changed since.
+#[test]
+#[ignore = "live: requires the oracle service with LogMiner prerequisites"]
+fn oracle_cdc_two_tables_share_one_window_and_resume() {
+    let _serial = cross_process_serial("oracle_cdc");
+    let d = tempfile::tempdir().unwrap();
+    let (tables, names) = ora_trio("ora_cmux");
+    let ckpt = d.path().join("cdc.ckpt");
+    let both = [names[0].as_str(), names[1].as_str()];
+    let run_into = |dir: &str| {
+        let out = d.path().join(dir);
+        rig(&tables[0], &ckpt, &out).tables(&both).run_ok();
+        out
+    };
+    run_into("anchor");
+    ora_tx(&[
+        format!("INSERT INTO {} VALUES (1, 10)", tables[0].name()),
+        format!("INSERT INTO {} VALUES (2, 20)", tables[1].name()),
+    ]);
+    ora_exec(&format!("INSERT INTO {} VALUES (3, 30)", tables[2].name()));
+    let out1 = run_into("out1");
+    let per_table = |out: &Path, i: usize| {
+        let prefix = std::fs::read_dir(out)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.is_dir() && p.to_string_lossy().contains(tables[i].name()))
+            .unwrap_or_else(|| {
+                panic!(
+                    "no sub-prefix for {} under {}",
+                    tables[i].name(),
+                    out.display()
+                )
+            });
+        cdc_id_ops(&prefix)
+    };
+    assert_eq!(
+        (per_table(&out1, 0), per_table(&out1, 1)),
+        (ops(&[(1, "insert")]), ops(&[(2, "insert")])),
+        "one transaction over two captured tables lands in each table's prefix"
+    );
+    ora_exec(&format!("INSERT INTO {} VALUES (4, 40)", tables[1].name()));
+    let out2 = run_into("out2");
+    assert!(
+        per_table(&out2, 0).is_empty(),
+        "run 2 has nothing new for the first table"
+    );
+    assert_eq!(
+        per_table(&out2, 1),
+        ops(&[(4, "insert")]),
+        "run 2 delivers only the change after run 1's checkpoint"
+    );
+}
+
+/// A writer commits through run 1: the run ends at the SCN current at open with the backlog delivered, and run 2 delivers the tail; the union is the source.
+#[test]
+#[ignore = "live: requires the oracle service with LogMiner prerequisites"]
+fn roast_oracle_cdc_until_current_open_bound_two_runs_lose_nothing() {
+    let _serial = cross_process_serial("oracle_cdc");
+    let d = tempfile::tempdir().unwrap();
+    let t = cdc_table("ora_cob", "id NUMBER(18) PRIMARY KEY, v NUMBER(18)");
+    let (ckpt, out) = (d.path().join("cdc.ckpt"), d.path().join("out"));
+    rig(&t, &ckpt, &d.path().join("anchor")).run_ok();
+    ora_exec(&format!(
+        "INSERT INTO {} SELECT LEVEL - 1, LEVEL - 1 FROM dual CONNECT BY LEVEL <= 30",
+        t.name()
+    ));
+    let table = t.name().to_string();
+    let mut writer = BgWriter::spawn(move |stop| {
+        let conn = ora_conn();
+        let mut i = 10_000i64;
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            conn.execute(&format!("INSERT INTO {table} VALUES ({i}, {i})"), &[])
+                .unwrap();
+            conn.commit().unwrap();
+            i += 1;
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    });
+    let bounded = rig(&t, &ckpt, &out);
+    let run1 = run_rivet_bounded(&bounded.config_path(), std::time::Duration::from_secs(120));
+    writer.stop();
+    assert!(
+        run1.is_some(),
+        "run 1 must end at the SCN current at open while the writer keeps committing"
+    );
+    let after_run1: std::collections::BTreeSet<i64> =
+        cdc_id_ops(&out).into_iter().map(|(id, _)| id).collect();
+    assert!(
+        (0..30).all(|i| after_run1.contains(&i)),
+        "run 1 delivers the backlog committed before it opened, got {} ids",
+        after_run1.len()
+    );
+    let run2 = run_rivet_bounded(&bounded.config_path(), std::time::Duration::from_secs(120));
+    assert!(run2.is_some(), "run 2, with no writer, drains the tail");
+    let got: std::collections::BTreeSet<i64> =
+        cdc_id_ops(&out).into_iter().map(|(id, _)| id).collect();
+    let source: std::collections::BTreeSet<i64> =
+        ora_text_rows(&format!("SELECT TO_CHAR(id) FROM {}", t.name()))
+            .into_iter()
+            .map(|r| r[0].as_deref().unwrap().parse().unwrap())
+            .collect();
+    assert!(
+        source.len() > 30,
+        "fixture: the writer committed during run 1"
+    );
+    assert_eq!(got, source, "the two runs together deliver every source id");
 }
 
 #[test]

@@ -34,7 +34,7 @@ scenarios:
     mysql:    { na: "mysql Opts::from_url percent-decodes the userinfo; rivet owns no userinfo parser" }
     mssql:    { test: mssql_url_from_fields_roundtrips_through_parse_mssql_url }
     mongo:    { na: "mongodb ClientOptions::parse decodes the userinfo per the connection-string spec; rivet owns no userinfo parser" }
-    oracle:   { gap: "rivet owns this parse (parse_oracle_url percent-decodes userinfo); a_full_oracle_url_parses_and_decodes_its_userinfo pins %40/%3A only — no build_url_from_fields -> parse_oracle_url round-trip over / : @ ? # %" }
+    oracle:   { test: oracle_url_from_fields_roundtrips_through_parse_oracle_url }
 
   - id: encode_userinfo_at_construction
     what: "build_url_from_fields percent-encodes userinfo so a raw / @ : ? # cannot make the URL ambiguous (break the driver) or defeat redaction."
@@ -50,7 +50,7 @@ scenarios:
     mysql:    { test: redact_secrets_url_safety_matrix }
     mssql:    { test: redact_secrets_url_safety_matrix }
     mongo:    { test: redact_secrets_url_safety_matrix }
-    oracle:   { gap: "redact_secrets_url_safety_matrix sweeps postgresql/mysql/sqlserver/mongodb only — oracle:// is not in the sweep" }
+    oracle:   { test: redact_secrets_url_safety_matrix }
 
   - id: redact_delimiter_password_state_url
     what: "the PG state-backend redactor (redact_pg_url) masks a RIVET_STATE_URL password with a raw / ? # . Round-3 regressed here."
@@ -66,7 +66,7 @@ scenarios:
     mysql:    { test: redact_secrets_url_safety_matrix }
     mssql:    { test: redact_secrets_url_safety_matrix }
     mongo:    { test: redact_secrets_url_safety_matrix }
-    oracle:   { gap: "oracle:// is not in redact_secrets_url_safety_matrix's scheme sweep" }
+    oracle:   { test: redact_secrets_url_safety_matrix }
 
   # Keyword/value connection strings (2026-10-07). The redactors above know
   # `scheme://user:pass@` and `?key=` only; a libpq DSN (`host=… password=…`), an ADO

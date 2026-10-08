@@ -73,6 +73,8 @@ mod live_catalog_hints;
 mod live_cdc;
 #[path = "live/live_cdc_backfill.rs"]
 mod live_cdc_backfill;
+#[path = "live/live_cdc_cli_surface.rs"]
+mod live_cdc_cli_surface;
 #[path = "live/live_cdc_compact.rs"]
 mod live_cdc_compact;
 #[path = "live/live_cdc_full_cycle.rs"]
@@ -198,6 +200,8 @@ mod live_mysql_retry_and_faults;
 mod live_mysql_schema_drift;
 #[path = "live/live_oltp_load.rs"]
 mod live_oltp_load;
+#[path = "live/live_operator_contract.rs"]
+mod live_operator_contract;
 #[cfg(feature = "oracle")]
 #[path = "live/live_oracle.rs"]
 mod live_oracle;

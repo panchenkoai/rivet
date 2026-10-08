@@ -38,7 +38,7 @@ scenarios:
     mysql:    { test: settle_on_another_column_never_skips_an_out_of_order_row_mysql }
     mssql:    { test: settle_on_another_column_never_skips_an_out_of_order_row_mssql }
     mongo:    { na: "Mongo has no SQL cursor-column incremental" }
-    oracle:   { gap: "settle_threshold has an Oracle arm (SYS_EXTRACT_UTC(SYSTIMESTAMP) - NUMTODSINTERVAL) and the settle subquery an Oracle alias form; no Oracle live test" }
+    oracle:   { test: settle_on_another_column_never_skips_an_out_of_order_row_oracle }
 
   - id: mode_time_window
     what: "mode: time_window — bounded date scan (time_column + days_window), anchored on today"

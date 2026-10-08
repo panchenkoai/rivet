@@ -1289,6 +1289,7 @@ mod tests {
             column: Some("id".into()),
             mode: "keyset",
             continues_high_water: false,
+            resumable: true,
         }
     }
 
