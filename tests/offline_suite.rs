@@ -63,6 +63,8 @@ mod config_parse_errors;
 mod config_secrets;
 #[path = "offline/destructive_delete_gate.rs"]
 mod destructive_delete_gate;
+#[path = "offline/error_sites_guard.rs"]
+mod error_sites_guard;
 #[path = "offline/examples_parse.rs"]
 mod examples_parse;
 #[path = "offline/extension_seam.rs"]
