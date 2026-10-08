@@ -71,6 +71,9 @@ def verdict_counts(text: str) -> Counter:
     return n
 
 
+#: Reads repeated in one lane after the reader crashed in native code (tests/common/verify.rs); more means the reader is broken, not unlucky.
+RERUN_CEILING = 3
+
 #: The verdicts that grade a deferred run's remainder: the stream's next run compared with the source.
 GRADED = ("PASS", "FAIL", "XFAIL", "PARTIAL")
 
@@ -115,6 +118,8 @@ def verdict_errors(text: str, lane: str) -> list[str]:
     if not n["PASS"]:
         return ["the rig oracle logged no PASS verdict"]
     errs = unpaid_deferrals(text)
+    if n["RERUN"] > RERUN_CEILING:
+        errs.append(f"{n['RERUN']} RERUN verdicts, ceiling {RERUN_CEILING}: the oracle's reader crashes too often to call it chance")
     for what, (ceiling, noise) in VERDICT_CEILINGS[lane].items():
         if n[what] > ceiling + noise:
             errs.append(f"{n[what]} {what} verdicts, ceiling {ceiling}: a run the oracle used to grade is no longer graded")
@@ -127,7 +132,7 @@ def verdict_errors(text: str, lane: str) -> list[str]:
 def verdict_report(text: str, lane: str) -> list[str]:
     """The counts a lane's census prints: per class, per reason, and each banded counter against its ceiling."""
     n = verdict_counts(text)
-    out = [f"{v} {n[v]}" for v in ("PASS", "PARTIAL", "DEFERRED", "XFAIL", "SKIP", "OFF", "REFUSED", "UNGRADED", "FAIL")]
+    out = [f"{v} {n[v]}" for v in ("PASS", "PARTIAL", "DEFERRED", "XFAIL", "SKIP", "OFF", "REFUSED", "UNGRADED", "RERUN", "FAIL")]
     out += ["per reason (numbers folded to N):"] + [f"{c:7d} {r}" for r, c in verdict_reasons(text).most_common()]
     out += [f"{what}: {n[what]} (ceiling {c} +-{z})" for what, (c, z) in VERDICT_CEILINGS[lane].items()]
     return out
@@ -200,6 +205,9 @@ def _verdict_self_test() -> None:
         errs = verdict_errors(log + extra * (noise + 1), lane)
         assert len(errs) == 1 and "first-run" in errs[0] and "no longer graded" in errs[0], (lane, errs)
         assert verdict_errors("", lane) and verdict_errors(log.replace("PASS", "OFF"), lane)
+    rerun = "RIVET-ORACLE-RERUN live_x::a [e] — oracle reader crashed (grade): signal: 11 (SIGSEGV) after 1.0s; read once more\n"
+    assert verdict_errors(at_ceiling("ci") + rerun * RERUN_CEILING, "ci") == [], "a rare reader crash is counted, not failed"
+    assert any("RERUN" in e for e in verdict_errors(at_ceiling("ci") + rerun * (RERUN_CEILING + 1), "ci")), "a crashing reader fails the lane"
     n = verdict_counts(at_ceiling("ci") + "RIVET-ORACLE-SKIP t [e] — " + FIRST_RUN["SKIP"] + "\n")
     ci = {k: v[0] for k, v in VERDICT_CEILINGS["ci"].items()}
     assert (n["first-run"], n["skip"], n["partial"]) == (ci["first-run"] + 1, ci["skip"], ci["partial"]), n
