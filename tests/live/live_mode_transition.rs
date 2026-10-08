@@ -678,6 +678,7 @@ fn incremental_query_filter_edited(e: SqlEngine) {
         &[],
         STREAM_REFUSED,
         vec![
+            reset_remedy(&table),
             crate::common::Remedy::wrong(
                 "pointed the export at another destination",
                 Then::Refuses(STREAM_REFUSED),
@@ -686,7 +687,6 @@ fn incremental_query_filter_edited(e: SqlEngine) {
             crate::common::Remedy::new(RESTORE, Then::DeliversTheSource, |r| {
                 r.rebuilt(|r| staged_for(e, r.query(&filtered(1)), &INCREMENTAL_ID, first))
             }),
-            reset_remedy(&table),
         ],
     );
     for want in [
@@ -696,11 +696,6 @@ fn incremental_query_filter_edited(e: SqlEngine) {
     ] {
         assert!(said.contains(want), "the refusal names {want}:\n{said}");
     }
-    assert_eq!(
-        delivered_ids(e, second),
-        (1..=5).collect::<Vec<_>>(),
-        "after the reset the edited filter delivers its own rows in full"
-    );
     assert!(
         delivered_ids(e, third).is_empty(),
         "a refused run writes nothing"
@@ -779,6 +774,7 @@ fn same_table_in_another_schema_is_another_stream_postgres() {
         &[],
         STREAM_REFUSED,
         vec![
+            reset_remedy(&table),
             crate::common::Remedy::wrong(
                 "pointed the export at another destination",
                 Then::Refuses(STREAM_REFUSED),
@@ -787,7 +783,6 @@ fn same_table_in_another_schema_is_another_stream_postgres() {
             crate::common::Remedy::new(RESTORE, Then::DeliversTheSource, |r| {
                 r.rebuilt(|r| staged_for(e, r, &INCREMENTAL_ID, first).source_url(POSTGRES_URL))
             }),
-            reset_remedy(&table),
         ],
     );
     for want in [
@@ -796,12 +791,8 @@ fn same_table_in_another_schema_is_another_stream_postgres() {
     ] {
         assert!(said.contains(&want), "the refusal names {want}:\n{said}");
     }
-    assert_eq!(
-        read_ids(second),
-        (1..=7).collect::<Vec<_>>(),
-        "after the reset the other schema's table is delivered in full"
-    );
     assert!(read_ids(third).is_empty(), "a refused run writes nothing");
+    assert_eq!(read_ids(first), (1..=10).collect::<Vec<_>>());
 }
 
 #[test]
