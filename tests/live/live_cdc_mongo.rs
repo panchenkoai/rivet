@@ -375,7 +375,12 @@ fn roast_corrupt_checkpoint_fails_loudly_not_silent_reanchor() {
     m.upsert_set("t", 1, "v", "a");
 
     // The run must FAIL — never exit 0 having silently re-anchored past the change.
-    let _stderr = rig.run_expect_fail();
+    let stderr = rig.run_expect_fail();
+    assert!(
+        stderr.contains("Error: [RIVET_SOURCE_CDC_CHECKPOINT_INVALID]")
+            && stderr.contains(REBASELINE_REMEDY),
+        "refused by code, ending with the re-baseline remedy:\n{stderr}"
+    );
 
     // `rivet doctor` reads the same file and must FAIL it with the run's remedy:
     // unparseable first, then valid JSON that holds no resume token.

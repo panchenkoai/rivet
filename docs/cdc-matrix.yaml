@@ -68,7 +68,7 @@ scenarios:
     postgres: { test: pg_missing_slot_refusal_remedy_recovers_the_row_written_while_the_slot_was_gone }
     mysql:    { test: cdc_resume_from_missing_binlog_fails_loudly_not_silently }
     mssql:    { test: mssql_cleanup_past_unread_changes_before_the_first_changes_run_is_refused }
-    mongo:    { test: open_defect_an_oplog_rolled_past_the_checkpoint_before_the_first_changes_run_is_refused_by_code_mongo }
+    mongo:    { test: an_oplog_rolled_past_the_checkpoint_before_the_first_changes_run_is_refused_by_code_mongo }
     oracle:   { test: oracle_cdc_resume_past_log_retention_fails_loudly }
 
   - id: cdc_crash_at_least_once

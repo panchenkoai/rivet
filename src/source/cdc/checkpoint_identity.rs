@@ -14,6 +14,26 @@ pub(crate) const RECOVER: &str = "Re-baseline the stream in one run: delete the 
      re-reads every table after, so nothing falls between the two. A separate `mode: full` \
      export does not re-baseline the stream.";
 
+/// A refusal of `code` whose text is `why`.
+fn refusal(code: crate::error::Code, why: String) -> anyhow::Error {
+    anyhow::Error::new(crate::error::CodedError::new(code, why))
+}
+
+/// Refuse a checkpoint that cannot be resumed from (unreadable, of another shape, or gone under a baseline): `SOURCE_CDC_CHECKPOINT_INVALID`, exit 5.
+pub(crate) fn checkpoint_invalid(why: String) -> anyhow::Error {
+    refusal(crate::error::codes::SOURCE_CDC_CHECKPOINT_INVALID, why)
+}
+
+/// Refuse a resume position the source's log no longer reaches (dropped slot, purged binlog, rolled oplog): `SOURCE_CDC_LOG_GAP`, exit 5.
+pub(crate) fn log_gap(why: String) -> anyhow::Error {
+    refusal(crate::error::codes::SOURCE_CDC_LOG_GAP, why)
+}
+
+/// Refuse a captured table whose rows left the source without change events (TRUNCATE, DROP): `SOURCE_CDC_TRUNCATED`, exit 5.
+pub(crate) fn truncated(why: String) -> anyhow::Error {
+    refusal(crate::error::codes::SOURCE_CDC_TRUNCATED, why)
+}
+
 /// What a resume may do given the checkpoint's recorded identity and the server's.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum IdentityVerdict {
@@ -79,5 +99,24 @@ mod tests {
                 .is_ok()
         );
         assert!(IdentityVerdict::Ok.enforce().is_ok());
+    }
+
+    #[test]
+    fn each_failure_class_refuses_with_exit_5_under_its_own_code_and_keeps_its_text() {
+        type Class = fn(String) -> anyhow::Error;
+        let classes: [(Class, &str); 3] = [
+            (checkpoint_invalid, "RIVET_SOURCE_CDC_CHECKPOINT_INVALID"),
+            (log_gap, "RIVET_SOURCE_CDC_LOG_GAP"),
+            (truncated, "RIVET_SOURCE_CDC_TRUNCATED"),
+        ];
+        for (class, code) in classes {
+            let err = class(format!("x cdc: {code} happened. {RECOVER}"));
+            assert_eq!(crate::error::classify_exit(&err), 5, "{code}");
+            assert_eq!(crate::error::error_code(&err), Some(code));
+            assert_eq!(
+                err.to_string(),
+                format!("x cdc: {code} happened. {RECOVER}")
+            );
+        }
     }
 }

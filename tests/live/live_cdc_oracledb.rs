@@ -1190,6 +1190,11 @@ fn oracle_cdc_corrupt_checkpoint_fails_loud_not_silently_absent() {
     std::fs::write(&ckpt, "{\"low_water\": \"12").unwrap();
     let err = rig(&t, &ckpt, &d.path().join("out")).run_expect_fail();
     assert!(err.contains("corrupt or truncated"), "{err}");
+    assert!(
+        err.contains("Error: [RIVET_SOURCE_CDC_CHECKPOINT_INVALID]")
+            && err.contains(REBASELINE_REMEDY),
+        "refused by code, ending with the re-baseline remedy:\n{err}"
+    );
 }
 
 /// The checkpoint with `edit` applied to its JSON.

@@ -283,6 +283,7 @@ fn mysql_cdc_a_dropped_and_recreated_captured_table_is_refused_not_merged() {
          run must refuse at the DROP rather than merge two tables' histories:\n{}",
         said(&out)
     );
+    assert_refused(&out, Refused::by_code("RIVET_SOURCE_CDC_TRUNCATED", 5));
 }
 
 #[test]

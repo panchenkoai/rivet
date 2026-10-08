@@ -56,11 +56,7 @@ pub(crate) fn run_mongo_parallel(
         kp.chunk_size
     );
 
-    // One run-unique stamp shared by every worker; the worker index + page index
-    // make each part name unique WITHIN the run, the stamp unique ACROSS runs
-    // (millisecond precision — two runs into the same prefix must not clobber,
-    // per the run-unique part-name rule).
-    let stamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
+    let stamp = super::summary::run_scoped_stamp(&summary.run_id, &plan.export_name);
 
     let key_plan = IncrementalCursorPlan {
         primary_column: kp.key_column.clone(),

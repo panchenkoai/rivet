@@ -1002,7 +1002,7 @@ fn lease_file_removed(live_rig: impl FnOnce() -> (String, Rig, Box<dyn std::any:
     recovers(&rig, &[]);
 }
 
-/// A second `rivet run` 700 ms into a live one of the same export (never in its first millisecond: docs/sabotage-matrix.yaml beside_run_same_instant): each delivers or refuses by code, and a run then delivers the source.
+/// A second `rivet run` 700 ms into a live one of the same export (runs started together are `runs_at_one_instant`, docs/sabotage-matrix.yaml beside_run_same_instant): each delivers or refuses by code, and a run then delivers the source.
 fn second_run_beside(engine: SqlEngine, shape: Shape) {
     let (_table, rig, _guard) = live(engine, "sab_two", shape);
     let met = rig.beside_a_live_run(
@@ -1016,6 +1016,52 @@ fn second_run_beside(engine: SqlEngine, shape: Shape) {
     rig.delivered_or_refused("the second run beside a live one", &met.acted);
     rig.delivered_or_refused("the live run a second one met", &met.run);
     recovers(&rig, &[]);
+}
+
+/// How many rounds a same-instant cell makes, and how many runs a round starts together.
+const ROUNDS: usize = 3;
+const AT_ONCE: usize = 8;
+
+/// `ROUNDS` rounds of `AT_ONCE` runs of one unthrottled export started together, each round on a fresh state and destination (docs/sabotage-matrix.yaml beside_run_same_instant): each run delivers or refuses by code, no part is declared by two runs, every part is named after its run, and a run then delivers the source.
+fn runs_at_one_instant(engine: SqlEngine, shape: Shape) {
+    let (table, _rig, _guard) = shaped(engine, "sab_inst", shape);
+    for round in 0..ROUNDS {
+        let rig = shape.staged(engine, engine.rig(&table));
+        for out in rig.runs_at_once(AT_ONCE) {
+            rig.delivered_or_refused("a run started beside others", &out);
+        }
+        let (twice, odd) = (
+            rig.parts_declared_twice(),
+            rig.parts_not_named_by_their_run(),
+        );
+        assert!(
+            twice.is_empty(),
+            "round {round}: runs started together declare one part: {twice:?}"
+        );
+        assert!(
+            odd.is_empty(),
+            "round {round}: a part is named `<export>_<yyyymmdd>_<hhmmss>_<mmm>_<pid>_<nonce>` after the run that declares it, these are not: {odd:?}"
+        );
+        if round + 1 == ROUNDS {
+            recovers(&rig, &[]);
+        }
+    }
+}
+
+/// One run of the MongoDB parallel reader, whose worker parts carry the single runner's stamp: every part is named after its run (two `full` runs started together are the beside_run_full row).
+fn parallel_parts_named_by_their_run_mongo() {
+    let (rig, _guard) = mongo_rig("sab_name");
+    let rig = rig.mongo("page_size: 10").export_line("parallel: 2");
+    rig.run_ok();
+    assert!(
+        rig.manifest_parts().len() > 1,
+        "fixture: a parallel run writes several worker parts"
+    );
+    let odd = rig.parts_not_named_by_their_run();
+    assert!(
+        odd.is_empty(),
+        "a part is named `<export>_<yyyymmdd>_<hhmmss>_<mmm>_<pid>_<nonce>` after the run that declares it, these are not: {odd:?}"
+    );
 }
 
 /// `rivet state reset` and `rivet state reset-chunks` beside a live incremental run that continues a stored cursor.
@@ -2831,6 +2877,37 @@ fn a_second_incremental_run_beside_a_live_one_delivers_or_refuses_mssql() {
 #[ignore = "live: requires docker compose oracle"]
 fn a_second_incremental_run_beside_a_live_one_delivers_or_refuses_oracle() {
     second_run_beside(SqlEngine::Oracle, Shape::Incremental);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn incremental_runs_started_together_each_declare_their_own_part_postgres() {
+    runs_at_one_instant(SqlEngine::Pg, Shape::Incremental);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn incremental_runs_started_together_each_declare_their_own_part_mysql() {
+    runs_at_one_instant(SqlEngine::Mysql, Shape::Incremental);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn incremental_runs_started_together_each_declare_their_own_part_mssql() {
+    runs_at_one_instant(SqlEngine::Mssql, Shape::Incremental);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn incremental_runs_started_together_each_declare_their_own_part_oracle() {
+    runs_at_one_instant(SqlEngine::Oracle, Shape::Incremental);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mongo"]
+fn parallel_parts_are_named_after_their_run_mongo() {
+    parallel_parts_named_by_their_run_mongo();
 }
 
 #[test]
