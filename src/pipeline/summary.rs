@@ -300,15 +300,17 @@ pub(crate) fn run_scoped_tag(run_id: &str, export_name: &str) -> String {
     tag.strip_prefix(&prefix).unwrap_or(&tag).to_string()
 }
 
-/// The run-unique stamp of a single-runner or Mongo-parallel part name, `<YYYYMMDD>_<HHMMSS>_<mmm>_<pid>`: [`run_scoped_tag`] with the run id's `T` folded to `_`.
+/// The run-unique stamp of a single-runner or Mongo-parallel part name, `<YYYYMMDD>_<HHMMSS>_<mmm>_<pid>_<nonce>`: [`run_scoped_tag`] with the run id's `T` folded to `_`, then a random nonce for two runs whose ids coincide.
 pub(crate) fn run_scoped_stamp(run_id: &str, export_name: &str) -> String {
+    use rand::RngExt;
     let tag = run_scoped_tag(run_id, export_name);
-    match tag.split_once('T') {
+    let stamp = match tag.split_once('T') {
         Some((date, rest)) if date.len() == 8 && date.bytes().all(|b| b.is_ascii_digit()) => {
             format!("{date}_{rest}")
         }
         _ => tag,
-    }
+    };
+    format!("{stamp}_{:016x}", rand::rng().random::<u64>())
 }
 
 impl RunSummary {
@@ -1239,26 +1241,49 @@ mod tests {
         assert_eq!(sanitize_run_id("ABCabc012"), "ABCabc012");
     }
 
-    #[test]
-    fn a_part_stamp_is_the_run_id_in_the_documented_shape_and_differs_per_process() {
-        assert_eq!(
-            run_scoped_stamp("orders_20261008T174117.653_33972", "orders"),
-            "20261008_174117_653_33972"
+    /// The stamp without its nonce, which must be 16 hex digits.
+    fn sans_nonce(stamp: &str) -> &str {
+        let (head, nonce) = stamp.rsplit_once('_').expect("a nonce field");
+        assert!(
+            nonce.len() == 16 && nonce.bytes().all(|b| b.is_ascii_hexdigit()),
+            "{stamp}"
         );
-        assert_ne!(
-            run_scoped_stamp("orders_20261008T174117.653_33972", "orders"),
-            run_scoped_stamp("orders_20261008T174117.653_33973", "orders"),
-            "two processes in one millisecond name different parts"
+        head
+    }
+
+    #[test]
+    fn a_part_stamp_is_the_run_id_in_the_documented_shape_then_a_nonce() {
+        let id = "orders_20261008T174117.653_33972";
+        assert_eq!(
+            sans_nonce(&run_scoped_stamp(id, "orders")),
+            "20261008_174117_653_33972"
         );
         let fresh = fresh_run_id("orders");
         let stamp = run_scoped_stamp(&fresh, "orders");
         assert!(
-            stamp.ends_with(&format!("_{}", std::process::id())) && !stamp.contains(['T', '.']),
+            sans_nonce(&stamp).ends_with(&format!("_{}", std::process::id()))
+                && !stamp.contains(['T', '.']),
             "{fresh} -> {stamp}"
         );
         for other in ["run-1", "abcdefghT1", "123T4", "Test_run"] {
-            assert_eq!(run_scoped_stamp(other, "orders"), other, "not a run stamp");
+            assert_eq!(
+                sans_nonce(&run_scoped_stamp(other, "orders")),
+                other,
+                "not a run stamp"
+            );
         }
+    }
+
+    #[test]
+    fn two_part_stamps_of_one_millisecond_and_one_pid_differ() {
+        let id = "orders_20261008T174117.653_1";
+        let stamps: std::collections::BTreeSet<String> =
+            (0..64).map(|_| run_scoped_stamp(id, "orders")).collect();
+        assert_eq!(
+            stamps.len(),
+            64,
+            "two containers each run pid 1: the run id is the same, the part name must not be"
+        );
     }
 
     #[test]

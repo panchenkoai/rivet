@@ -593,11 +593,11 @@ scenarios:
     oracle:   { gap: "an open defect on PostgreSQL, MySQL and SQL Server; the Oracle cell is not written, because no stand that runs `open_defect_` cells has Oracle within reach of the machine this row was built on (CI skips them), so its first failing line could not be read" }
 
   - id: beside_run_same_instant
-    what: "runs of one unthrottled single-runner export (`mode: incremental`; `full` names its part through the same function) started together, in rounds on a fresh state and destination: each delivers or refuses by code, no part is declared by two runs, every part is named `<export>_<yyyymmdd>_<hhmmss>_<mmm>_<pid>` after the run that declares it, and a run then delivers the source and `validate` passes. Before the part was named after its run, two runs that ended their read in one millisecond wrote one file name (`rig oracle: COUNTER: this run's Success manifests declare 1600 rows, their parts hold 600`)"
+    what: "runs of one unthrottled single-runner export (`mode: incremental`; `full` names its part through the same function) started together, in rounds on a fresh state and destination: each delivers or refuses by code, no part is declared by two runs, every part is named `<export>_<yyyymmdd>_<hhmmss>_<mmm>_<pid>_<nonce>` after the run that declares it, and a run then delivers the source and `validate` passes. The MongoDB cell is one run of the parallel reader and the name only: a MongoDB export is `mode: full`, and two `full` runs started together are the beside_run_full row. Before the part was named after its run, two runs that ended their read in one millisecond wrote one file name (`rig oracle: COUNTER: this run's Success manifests declare 1600 rows, their parts hold 600`)"
     postgres: { test: incremental_runs_started_together_each_declare_their_own_part_postgres }
     mysql:    { test: incremental_runs_started_together_each_declare_their_own_part_mysql }
     mssql:    { test: incremental_runs_started_together_each_declare_their_own_part_mssql }
-    mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED); its parts are stamped by the same `run_scoped_stamp` (src/pipeline/summary.rs) as the SQL columns' cells, which carry the row" }
+    mongo:    { test: parallel_parts_are_named_after_their_run_mongo }
     oracle:   { test: incremental_runs_started_together_each_declare_their_own_part_oracle }
 
   - id: beside_run_range_checkpoint

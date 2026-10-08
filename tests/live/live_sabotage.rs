@@ -1029,12 +1029,28 @@ fn runs_at_one_instant(engine: SqlEngine, shape: Shape) {
         );
         assert!(
             odd.is_empty(),
-            "round {round}: a part is named `<export>_<yyyymmdd>_<hhmmss>_<mmm>_<pid>` after the run that declares it, these are not: {odd:?}"
+            "round {round}: a part is named `<export>_<yyyymmdd>_<hhmmss>_<mmm>_<pid>_<nonce>` after the run that declares it, these are not: {odd:?}"
         );
         if round + 1 == ROUNDS {
             recovers(&rig, &[]);
         }
     }
+}
+
+/// One run of the MongoDB parallel reader, whose worker parts carry the single runner's stamp: every part is named after its run (two `full` runs started together are the beside_run_full row).
+fn parallel_parts_named_by_their_run_mongo() {
+    let (rig, _guard) = mongo_rig("sab_name");
+    let rig = rig.mongo("page_size: 10").export_line("parallel: 2");
+    rig.run_ok();
+    assert!(
+        rig.manifest_parts().len() > 1,
+        "fixture: a parallel run writes several worker parts"
+    );
+    let odd = rig.parts_not_named_by_their_run();
+    assert!(
+        odd.is_empty(),
+        "a part is named `<export>_<yyyymmdd>_<hhmmss>_<mmm>_<pid>_<nonce>` after the run that declares it, these are not: {odd:?}"
+    );
 }
 
 /// `rivet state reset` and `rivet state reset-chunks` beside a live incremental run that continues a stored cursor.
@@ -2391,6 +2407,12 @@ fn incremental_runs_started_together_each_declare_their_own_part_mssql() {
 #[ignore = "live: requires docker compose oracle"]
 fn incremental_runs_started_together_each_declare_their_own_part_oracle() {
     runs_at_one_instant(SqlEngine::Oracle, Shape::Incremental);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mongo"]
+fn parallel_parts_are_named_after_their_run_mongo() {
+    parallel_parts_named_by_their_run_mongo();
 }
 
 #[test]

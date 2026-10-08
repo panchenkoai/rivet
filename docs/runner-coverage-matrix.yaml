@@ -346,7 +346,7 @@ scenarios:
     cdc:            { test: cdc_drain_row_hash_matches_the_independent_implementation }
 
   - id: run_unique_part_naming
-    what: "two runs into ONE destination prefix must not clobber — part filenames carry a run-unique token (the run id's millisecond stamp and process id, or a random nonce), never a wall-clock stamp two runs can share."
+    what: "two runs into ONE destination prefix must not clobber — part filenames carry a run-unique token (the run id's millisecond stamp and process id, a random nonce, or both), never a wall-clock stamp two runs can share."
     single:         { test: roast_rapid_incremental_runs_into_same_prefix_must_not_clobber_prior_parts }
     chunked:        { test: chunk_part_filename_is_collision_proof_for_same_chunk }
     chunked_checkpoint: { na: "shared naming seam — every chunked variant derives its part base from the same `chunk_part_filename` (called once each by run_chunked_sequential and run_chunked_parallel in exec.rs, and by both checkpoint twins in sequential_checkpoint.rs / parallel_checkpoint.rs); there is no per-runner stamp to forget, so the pure-fn proof in the cell to the left covers this column too" }
@@ -360,7 +360,7 @@ scenarios:
     chunked:        { na: "shared seam `chunk_part_filename` (chunked/mod.rs:64) keys off a fresh `%Y%m%d_%H%M%S` Utc stamp, not the run_id — no double; every chunked variant derives from it" }
     chunked_checkpoint: { na: "same `chunk_part_filename` seam as `chunked` — a fresh stamp, not the run_id" }
     keyset:         { test: keyset_part_names_do_not_double_the_export_name }
-    mongo_parallel: { na: "stamps its parts with `run_scoped_stamp` (src/pipeline/summary.rs), the single runner's function, which strips the `<export>_` prefix through `run_scoped_tag`: the single column carries the row" }
+    mongo_parallel: { test: parallel_parts_are_named_after_their_run_mongo }
     cdc:            { na: "the part name is `cdc-{run_token}-{seq:06}` (src/source/cdc/sink.rs), run_token derived from the run_id — nothing prepends the export name a second time" }
 
   - id: durable_manifest_before_advance

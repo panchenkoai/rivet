@@ -96,7 +96,7 @@ pub(crate) fn declared_twice(manifests: &[serde_json::Value]) -> Vec<String> {
         .collect()
 }
 
-/// The parts of `manifest` whose name does not hold the stamp of the run that declares them (run id `<export>_<yyyymmdd>T<hhmmss>.<mmm>_<pid>`, stamp `<yyyymmdd>_<hhmmss>_<mmm>_<pid>`), sorted.
+/// The parts of `manifest` whose name does not hold the stamp of the run that declares them (run id `<export>_<yyyymmdd>T<hhmmss>.<mmm>_<pid>`, stamp `<yyyymmdd>_<hhmmss>_<mmm>_<pid>`, a nonce after it), sorted.
 pub(crate) fn not_named_by_its_run(manifest: &serde_json::Value) -> Vec<String> {
     let (run_id, export) = (
         manifest["run_id"].as_str().unwrap_or_default(),
@@ -111,7 +111,7 @@ pub(crate) fn not_named_by_its_run(manifest: &serde_json::Value) -> Vec<String> 
         .into_iter()
         .flatten()
         .filter_map(|p| p["path"].as_str())
-        .filter(|path| !path.starts_with(&format!("{export}{stamp}")))
+        .filter(|path| !path.starts_with(&format!("{export}{stamp}_")))
         .map(str::to_string)
         .collect();
     odd.sort();
@@ -377,12 +377,12 @@ mod tests {
             })
         };
         let own = [
-            "orders_20261008_174117_653_33972.parquet",
-            "orders_20261008_174117_653_33972_part1.parquet",
+            "orders_20261008_174117_653_33972_9f3a1c0b5d7e2a41.parquet",
+            "orders_20261008_174117_653_33972_9f3a1c0b5d7e2a41_part1.parquet",
         ];
         assert!(not_named_by_its_run(&m(&own)).is_empty());
         let other = [
-            "orders_20261008_174117_653_33973.parquet",
+            "orders_20261008_174117_653_33973_9f3a1c0b5d7e2a41.parquet",
             "orders_20261008_174122_776.parquet",
         ];
         assert_eq!(
