@@ -1365,6 +1365,16 @@ fn config_path_refuses_a_hand_edited_config() {
     let _ = rig.config_path();
 }
 
+/// A cell polls `config_path()` beside a live run that is reading the file: an unchanged config is never opened for writing.
+#[test]
+fn config_path_does_not_rewrite_an_unchanged_config() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let rig = Rig::pg_batch("t").export_named("e");
+    let cfg = rig.config_path();
+    std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o444)).unwrap();
+    assert_eq!(rig.config_path(), cfg);
+}
+
 /// The sanctioned mutation path: replace_export_line changes the knob in
 /// the BUILDER, so the re-render and the file agree.
 #[test]
