@@ -72,16 +72,16 @@ fn state(rig: &Rig, verb: &str, export: &str) {
 /// RIVET_STATE_CURSOR_OWNER_MISMATCH: an incremental export whose `cursor_column` was changed with no reset.
 fn cursor_owner_mismatch(engine: SqlEngine) {
     let (table, _guard) = seeded(engine, "sab_owner");
-    let (first, second) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-    let on = |rig: Rig, column: &str, out: &std::path::Path| {
+    let out = tempfile::tempdir().unwrap();
+    let on = |rig: Rig, column: &str| {
         engine
             .staged(rig, "incremental", &[&format!("cursor_column: {column}")])
-            .dest_path(out.to_path_buf())
+            .dest_path(out.path().to_path_buf())
     };
-    let rig = on(engine.rig(&table), "id", first.path());
+    let rig = on(engine.rig(&table), "id");
     rig.run_ok();
     engine.insert(&table, N + 1..=N + 3, 170, Some(10));
-    let mut rig = on(rig, "ext_id", second.path());
+    let mut rig = on(rig, "ext_id");
     rig.refuses_twice_and_walks_out(
         &["run"],
         &[],
@@ -95,7 +95,7 @@ fn cursor_owner_mismatch(engine: SqlEngine) {
             Remedy::new(
                 "or restore the previous cursor",
                 Then::DeliversTheSource,
-                |r| r.rebuilt(|r| on(r, "id", first.path())),
+                |r| r.rebuilt(|r| on(r, "id")),
             ),
             Remedy::wrong(
                 "runs `rivet state reset-chunks`, the sibling of the command the text names",

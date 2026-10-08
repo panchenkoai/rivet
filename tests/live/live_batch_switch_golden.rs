@@ -99,30 +99,30 @@ fn batch_full_to_incremental_switch_golden_math() {
     };
     insert(&mut c, 1, 40);
 
-    // Same config DIR (⇒ same state DB / export name) — only mode+dest differ.
-    let stage_cfg = |mode: &'static str, out: &std::path::Path| -> std::path::PathBuf {
+    // Same config DIR (⇒ same state DB / export name) and one destination — only the mode
+    // differs; each stage is read by the parts it added.
+    let dest = Stages::fresh();
+    let stage_cfg = |mode: &'static str| -> std::path::PathBuf {
         let mut rig = Rig::mysql_batch(&tbl)
             .source_url(MYSQL_CDC_URL)
             .mode(mode)
-            .dest_path(out.to_path_buf());
+            .dest_path(dest.path().to_path_buf());
         if mode == "incremental" {
             rig = rig.export_line("cursor_column: id");
         }
         rig.config_in(d.path())
     };
 
-    let out_full = d.path().join("full");
-    run_cfg(&stage_cfg("full", &out_full));
-    let (n, cents, ids) = stage_metrics(&out_full);
+    run_cfg(&stage_cfg("full"));
+    let (n, cents, ids) = stage_metrics(dest.added().path());
     assert_eq!((n, cents), (40, 83_000), "full: 40 rows, Σ = 830.00");
     assert_eq!(ids, (1..=40).collect::<HashSet<i64>>());
 
     // The SWITCH: first incremental re-exports the full set (the cursor was
     // never seeded by `full`) — an overlap with EXACTLY the same sum, and the
     // safe direction: dedupe-by-PK absorbs it; a gap could not.
-    let out_i1 = d.path().join("i1");
-    run_cfg(&stage_cfg("incremental", &out_i1));
-    let (n, cents, ids) = stage_metrics(&out_i1);
+    run_cfg(&stage_cfg("incremental"));
+    let (n, cents, ids) = stage_metrics(dest.added().path());
     assert_eq!(
         (n, cents),
         (40, 83_000),
@@ -132,17 +132,15 @@ fn batch_full_to_incremental_switch_golden_math() {
 
     // New rows → the increment is exactly them.
     insert(&mut c, 41, 50);
-    let out_i2 = d.path().join("i2");
-    run_cfg(&stage_cfg("incremental", &out_i2));
-    let (n, cents, ids) = stage_metrics(&out_i2);
+    run_cfg(&stage_cfg("incremental"));
+    let (n, cents, ids) = stage_metrics(dest.added().path());
     assert_eq!((n, cents), (10, 45_750), "increment: exactly rows 41..=50");
     assert_eq!(ids, (41..=50).collect::<HashSet<i64>>());
 
     // Idle increment is empty (skip_empty=false default still writes a
     // manifest; zero parts ⇒ zero rows through stage_metrics).
-    let out_i3 = d.path().join("i3");
-    run_cfg(&stage_cfg("incremental", &out_i3));
-    let (n, cents, _) = stage_metrics(&out_i3);
+    run_cfg(&stage_cfg("incremental"));
+    let (n, cents, _) = stage_metrics(dest.added().path());
     assert_eq!((n, cents), (0, 0), "idle increment exports nothing");
 }
 
@@ -170,18 +168,16 @@ fn batch_incremental_datetime_cursor_captures_updates_golden_math() {
     c.query_drop(format!("INSERT INTO {tbl} VALUES {}", vals.join(",")))
         .unwrap();
 
-    let stage_cfg = |out: &std::path::Path| -> std::path::PathBuf {
-        let rig = Rig::mysql_batch(&tbl)
-            .source_url(MYSQL_CDC_URL)
-            .mode("incremental")
-            .export_line("cursor_column: updated_at")
-            .dest_path(out.to_path_buf());
-        rig.config_in(d.path())
-    };
+    let dest = Stages::fresh();
+    let cfg = Rig::mysql_batch(&tbl)
+        .source_url(MYSQL_CDC_URL)
+        .mode("incremental")
+        .export_line("cursor_column: updated_at")
+        .dest_path(dest.path().to_path_buf())
+        .config_in(d.path());
 
-    let out1 = d.path().join("r1");
-    run_cfg(&stage_cfg(&out1));
-    let (n, cents, _) = stage_metrics(&out1);
+    run_cfg(&cfg);
+    let (n, cents, _) = stage_metrics(dest.added().path());
     assert_eq!(
         (n, cents),
         (20, 100 * 210 + 25 * 20),
@@ -195,9 +191,8 @@ fn batch_incremental_datetime_cursor_captures_updates_golden_math() {
          updated_at = '2026-01-15 12:00:01' WHERE id <= 5"
     ))
     .unwrap();
-    let out2 = d.path().join("r2");
-    run_cfg(&stage_cfg(&out2));
-    let (n, cents, ids) = stage_metrics(&out2);
+    run_cfg(&cfg);
+    let (n, cents, ids) = stage_metrics(dest.added().path());
     assert_eq!(
         (n, cents),
         (5, 1_625 + 50_000),
@@ -205,8 +200,7 @@ fn batch_incremental_datetime_cursor_captures_updates_golden_math() {
     );
     assert_eq!(ids, (1..=5).collect::<HashSet<i64>>());
 
-    let out3 = d.path().join("r3");
-    run_cfg(&stage_cfg(&out3));
-    let (n, _, _) = stage_metrics(&out3);
+    run_cfg(&cfg);
+    let (n, _, _) = stage_metrics(dest.added().path());
     assert_eq!(n, 0, "idle run exports nothing");
 }

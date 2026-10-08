@@ -104,7 +104,7 @@ fn transition(engine: SqlEngine, prior: Stage, next: Stage, expect: Expect) {
     transition_with(engine, prior, next, expect, |_| {});
 }
 
-/// Run `prior` over ids 1..=10, add ids 11..=13, restage the same rig to `next` and check its export.
+/// Run `prior` over ids 1..=10, add ids 11..=13, restage the same rig to `next` in the same destination and check what its run adds.
 fn transition_with(
     engine: SqlEngine,
     prior: Stage,
@@ -115,30 +115,24 @@ fn transition_with(
     engine.alive();
     let (table, _guard) = engine.range_table("mode_transition");
     engine.insert(&table, 1..=10, 180, Some(10));
-    let (first, second) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let dest = Stages::fresh();
+    let added = || delivered_ids(engine, dest.added().path());
 
-    let rig = staged_for(engine, engine.rig(&table), &prior, first.path());
+    let rig = staged_for(engine, engine.rig(&table), &prior, dest.path());
     rig.run_ok();
-    assert_eq!(
-        delivered_ids(engine, first.path()),
-        (1..=10).collect::<Vec<_>>()
-    );
+    assert_eq!(added(), (1..=10).collect::<Vec<_>>());
     between(&rig.config_path().with_file_name(".rivet_state.db"));
 
     engine.insert(&table, 11..=13, 170, Some(10));
-    let rig = staged_for(engine, rig, &next, second.path());
+    let rig = staged_for(engine, rig, &next, dest.path());
     match expect {
         Expect::Continues => {
-            let rig = continued(rig);
             rig.run_ok();
-            assert_eq!(delivered_ids(engine, second.path()), vec![11, 12, 13]);
+            assert_eq!(added(), vec![11, 12, 13]);
         }
         Expect::FullPass => {
             rig.run_ok();
-            assert_eq!(
-                delivered_ids(engine, second.path()),
-                (1..=13).collect::<Vec<_>>()
-            );
+            assert_eq!(added(), (1..=13).collect::<Vec<_>>());
         }
         Expect::Refused(names) => {
             let said = rig.run_expect_fail();
@@ -147,10 +141,7 @@ fn transition_with(
                 assert!(said.contains(n.as_str()), "refusal must name {n}:\n{said}");
             }
             assert!(said.contains("state reset"), "{said}");
-            assert!(
-                delivered_ids(engine, second.path()).is_empty(),
-                "nothing exported"
-            );
+            assert!(added().is_empty(), "nothing exported");
 
             let reset = rig.cli(&["state", "reset", "--export", &table]);
             assert!(
@@ -159,19 +150,9 @@ fn transition_with(
                 String::from_utf8_lossy(&reset.stderr)
             );
             rig.run_ok();
-            assert_eq!(
-                delivered_ids(engine, second.path()),
-                (1..=13).collect::<Vec<_>>()
-            );
+            assert_eq!(added(), (1..=13).collect::<Vec<_>>());
         }
     }
-}
-
-/// A rig whose next run continues past rows the prior stage delivered to another destination.
-fn continued(rig: Rig) -> Rig {
-    rig.no_oracle(
-        "the continued delta starts past rows the prior stage delivered to another destination",
-    )
 }
 
 /// Export `_id` 1..=10 with `prior`, add 11..=13, switch to `page_size` + `resume`, check the first resumed run.
@@ -180,7 +161,7 @@ fn mongo_switch_to_resume(prior: Option<&str>, parallel: bool, expect: Expect) {
     let db = unique_name("mt_mongo");
     let m = MongoTest::connect(27017, &db);
     m.seed_int_id("t", 10);
-    let (first, second) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let dest = Stages::fresh();
     let mut rig = Rig::mongo_batch("t").source_url(&MongoTest::url(27017, &db));
     if let Some(opts) = prior {
         rig = rig.mongo(opts);
@@ -188,34 +169,30 @@ fn mongo_switch_to_resume(prior: Option<&str>, parallel: bool, expect: Expect) {
     let lines: &[&str] = if parallel { &["parallel: 2"] } else { &[] };
     let rig = rig
         .restage("full", lines)
-        .dest_path(first.path().to_path_buf());
+        .dest_path(dest.path().to_path_buf());
     rig.run_ok();
-    let ids = |dir: &Path| -> Vec<i64> {
-        let mut v: Vec<i64> = dir_parquet_distinct_strings(dir, "_id")
+    let added = || -> Vec<i64> {
+        let mut v: Vec<i64> = dir_parquet_distinct_strings(dest.added().path(), "_id")
             .iter()
             .map(|s| s.parse().expect("an integer _id"))
             .collect();
         v.sort();
         v
     };
-    assert_eq!(ids(first.path()), (1..=10).collect::<Vec<_>>());
+    assert_eq!(added(), (1..=10).collect::<Vec<_>>());
 
     for i in 11..=13 {
         m.upsert_set("t", i, "v", "new");
     }
-    let rig = rig
-        .mongo("page_size: 4, resume: true")
-        .restage("full", &[])
-        .dest_path(second.path().to_path_buf());
+    let rig = rig.mongo("page_size: 4, resume: true").restage("full", &[]);
     match expect {
         Expect::Continues => {
-            let rig = continued(rig);
             rig.run_ok();
-            assert_eq!(ids(second.path()), vec![11, 12, 13]);
+            assert_eq!(added(), vec![11, 12, 13]);
         }
         Expect::FullPass => {
             rig.run_ok();
-            assert_eq!(ids(second.path()), (1..=13).collect::<Vec<_>>());
+            assert_eq!(added(), (1..=13).collect::<Vec<_>>());
         }
         Expect::Refused(_) => unreachable!("no Mongo switch to resume is refused"),
     }
@@ -607,8 +584,8 @@ fn parallel_keyset_then_resume_mongo() {
 /// The stream refusal's remedy for an export whose query or source was edited.
 const RESTORE: &str = "restore what it read to continue from the stored progress";
 
-/// The stream refusal's reset remedy for `export`, applied through the CLI.
-fn reset_remedy<'a>(export: &'a str) -> crate::common::Remedy<'a> {
+/// The stream refusal's reset remedy for `export`, applied through the CLI; with `into`, the full pass then lands in that empty destination, apart from the rows the export delivered before the edit.
+fn reset_remedy<'a>(export: &'a str, into: Option<&'a Path>) -> crate::common::Remedy<'a> {
     crate::common::Remedy::new(
         &format!("`rivet state reset -c <config> --export {export}` starts `"),
         Then::DeliversTheSource,
@@ -616,8 +593,16 @@ fn reset_remedy<'a>(export: &'a str) -> crate::common::Remedy<'a> {
             let reset = r.cli(&["state", "reset", "--export", export]);
             let said = String::from_utf8_lossy(&reset.stderr);
             assert!(reset.status.success(), "{said}");
+            if let Some(out) = into {
+                r.rebuilt(|r| r.dest_path(out.to_path_buf()));
+            }
         },
     )
+}
+
+/// A rig whose runs the default oracle does not grade, for `why`: the cell reads what each run added to the destination itself.
+fn read_by_the_cell(rig: Rig, why: &str) -> Rig {
+    rig.no_oracle(why)
 }
 
 /// The stream refusal's accept remedy for `export`: `before` edits the source, then the CLI keeps the stored progress.
@@ -627,22 +612,27 @@ fn accept_remedy<'a>(export: &'a str, before: impl FnOnce() + 'a) -> crate::comm
         Then::DeliversTheSource,
         move |r| {
             before();
-            let accept = r.cli(&["state", "accept", "--export", export]);
-            let said = String::from_utf8_lossy(&accept.stderr);
-            assert!(accept.status.success(), "{said}");
-            let journal = r.cli(&["journal", "--export", export]);
-            let journal = String::from_utf8_lossy(&journal.stdout).to_string();
-            for want in [
-                "accepted: stored progress (cursor `10`) written reading",
-                "by `rivet state accept`",
-            ] {
-                assert!(
-                    journal.contains(want),
-                    "the journal shows the acceptance ({want}):\n{journal}"
-                );
-            }
+            accept(r, export);
         },
     )
+}
+
+/// `rivet state accept` for `export`, which must succeed and show in the journal.
+fn accept(rig: &Rig, export: &str) {
+    let accept = rig.cli(&["state", "accept", "--export", export]);
+    let said = String::from_utf8_lossy(&accept.stderr);
+    assert!(accept.status.success(), "{said}");
+    let journal = rig.cli(&["journal", "--export", export]);
+    let journal = String::from_utf8_lossy(&journal.stdout).to_string();
+    for want in [
+        "accepted: stored progress (cursor `10`) written reading",
+        "by `rivet state accept`",
+    ] {
+        assert!(
+            journal.contains(want),
+            "the journal shows the acceptance ({want}):\n{journal}"
+        );
+    }
 }
 
 /// Whether a walk applies every remedy: under a Postgres state the rig cannot copy the refused state back and applies the first only.
@@ -672,7 +662,7 @@ fn resumed_parallel_keyset_then_incremental(e: SqlEngine) {
     let (table, _guard) = e.table("mode_transition");
     e.insert(&table, 1..=300, 180, Some(10));
     e.insert(&table, 400..=400, 180, Some(10));
-    let (first, second) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let dest = Stages::fresh();
     let parallel = Stage(
         "chunked",
         &[
@@ -682,19 +672,19 @@ fn resumed_parallel_keyset_then_incremental(e: SqlEngine) {
             "chunk_checkpoint: true",
         ],
     );
-    let rig = staged_for(e, e.rig(&table), &parallel, first.path());
+    let rig = staged_for(e, e.rig(&table), &parallel, dest.path());
     let crash = rig.run_with_env("RIVET_TEST_PANIC_AT", "keyset_parallel_range_committed:3");
     assert!(!crash.status.success(), "the injected crash must stop it");
     rig.run_ok();
     assert_eq!(
-        delivered_ids(e, first.path()).len(),
+        delivered_ids(e, dest.added().path()).len(),
         301,
         "the resumed run delivers every row"
     );
 
-    let rig = continued(staged_for(e, rig, &INCREMENTAL_ID, second.path()));
+    let rig = staged_for(e, rig, &INCREMENTAL_ID, dest.path());
     rig.run_ok();
-    let again = delivered_ids(e, second.path());
+    let again = delivered_ids(e, dest.added().path());
     assert!(
         again.is_empty(),
         "P-22: a resumed parallel keyset run stored a cursor below its own maximum: incremental on the key re-delivered {} row(s) up to id {}",
@@ -703,50 +693,53 @@ fn resumed_parallel_keyset_then_incremental(e: SqlEngine) {
     );
 }
 
-/// An edited `query:` filter under the same FROM is another stream: refused twice by code; with `walk`, the old filter restored continues, a reset delivers the new filter's rows in full, another destination changes nothing.
+/// An edited `query:` filter under the same FROM is another stream: refused twice by code; with `walk`, the old filter restored continues, a reset delivers the new filter's rows in full, another destination changes nothing, and `state accept` keeps the cursor in the same destination.
 fn incremental_query_filter_edited(e: SqlEngine, walk: bool) {
     e.alive();
     let (table, _guard) = e.table("mode_transition");
     e.insert(&table, 1..=5, 180, Some(0));
     e.insert(&table, 6..=10, 180, Some(1));
-    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
-    let (first, second, third) = (dirs[0].path(), dirs[1].path(), dirs[2].path());
+    let dest = Stages::fresh();
+    let (fresh, third) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (first, third) = (dest.path(), third.path());
     let filtered =
         |spent: i32| format!("SELECT id, time_spent FROM {table} WHERE time_spent = {spent}");
 
     let rig = staged_for(e, e.rig(&table).query(&filtered(1)), &INCREMENTAL_ID, first);
     rig.run_ok();
-    assert_eq!(delivered_ids(e, first), (6..=10).collect::<Vec<_>>());
+    assert_eq!(
+        delivered_ids(e, dest.added().path()),
+        (6..=10).collect::<Vec<_>>()
+    );
 
-    let mut rig = staged_for(e, rig.query(&filtered(0)), &INCREMENTAL_ID, second);
     if !walk {
+        let rig = staged_for(e, rig.query(&filtered(0)), &INCREMENTAL_ID, fresh.path());
         let (stored, now) = ("where time_spent = 1)", "where time_spent = 0)");
-        return refused_twice_for_the_stream(&rig, second, stored, now, &|o| delivered_ids(e, o));
+        let ids = |o: &Path| delivered_ids(e, o);
+        return refused_twice_for_the_stream(&rig, fresh.path(), stored, now, &ids);
     }
+    let mut rig = staged_for(e, rig.query(&filtered(0)), &INCREMENTAL_ID, first);
     let said = rig.refuses_twice_and_walks_out(
         &["run"],
         &[],
         STREAM_REFUSED,
         vec![
-            reset_remedy(&table),
+            reset_remedy(&table, Some(fresh.path())),
+            crate::common::Remedy::new(RESTORE, Then::DeliversTheSource, |r| {
+                r.rebuilt(|r| r.query(&filtered(1)))
+            }),
             crate::common::Remedy::wrong(
                 "pointed the export at another destination",
                 Then::Refuses(STREAM_REFUSED),
                 |r| r.rebuilt(|r| r.dest_path(third.to_path_buf())),
             ),
-            crate::common::Remedy::new(RESTORE, Then::DeliversTheSource, |r| {
-                r.rebuilt(|r| staged_for(e, r.query(&filtered(1)), &INCREMENTAL_ID, first))
-            }),
-            accept_remedy(&table, || {
-                e.insert(&table, 11..=12, 170, Some(0));
-                e.insert(&table, 13..=13, 170, Some(1));
-            }),
         ],
     );
     for want in [
         "where time_spent = 1)",
         "where time_spent = 0)",
         "cursor `10`",
+        &format!("`rivet state accept -c <config> --export {table}` keeps it"),
     ] {
         assert!(said.contains(want), "the refusal names {want}:\n{said}");
     }
@@ -754,15 +747,28 @@ fn incremental_query_filter_edited(e: SqlEngine, walk: bool) {
         delivered_ids(e, third).is_empty(),
         "a refused run writes nothing"
     );
-    assert_eq!(delivered_ids(e, first), (6..=10).collect::<Vec<_>>());
-    if walks_every_remedy() {
-        assert_eq!(
-            delivered_ids(e, second),
-            vec![11, 12],
-            "the accepted run keeps the cursor (none of 1..=5) and reads the new filter (not 13)"
+    if !walks_every_remedy() {
+        return assert_eq!(
+            delivered_ids(e, fresh.path()),
+            (1..=5).collect::<Vec<_>>(),
+            "the reset delivers the new filter's rows in full"
         );
-        continues_after_the_acceptance(&rig, &|| delivered_ids(e, second));
     }
+    rig.rebuilt(|r| r.dest_path(first.to_path_buf()));
+    e.insert(&table, 11..=12, 170, Some(0));
+    e.insert(&table, 13..=13, 170, Some(1));
+    accept(&rig, &table);
+    let rig = read_by_the_cell(
+        rig,
+        "an accepted edit keeps the cursor, so the destination holds the old filter's rows below it and none of the new filter's, and the oracle reads all of it against the new filter",
+    );
+    rig.run_ok();
+    assert_eq!(
+        delivered_ids(e, dest.added().path()),
+        vec![11, 12],
+        "the accepted run keeps the cursor (none of 1..=5) and reads the new filter (not 13)"
+    );
+    continues_after_the_acceptance(&rig, &|| delivered_ids(e, first));
 }
 
 /// A cosmetic edit of the text after `FROM <table>` (an alias renamed, two predicates swapped) is refused like any other; `state accept` keeps the cursor and the next runs continue.
@@ -826,22 +832,31 @@ fn incremental_query_param_value_changes_between_runs(e: SqlEngine) {
     let (table, _guard) = e.table("mode_transition");
     e.insert(&table, 1..=5, 180, Some(0));
     e.insert(&table, 6..=10, 180, Some(1));
-    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
-    let (first, second, third) = (dirs[0].path(), dirs[1].path(), dirs[2].path());
+    let dest = Stages::fresh();
+    let added = || delivered_ids(e, dest.added().path());
     let written = format!("SELECT id, time_spent FROM {table} WHERE time_spent = ${{spent}}");
 
-    let rig = staged_for(e, e.rig(&table).query(&written), &INCREMENTAL_ID, first);
+    let rig = staged_for(
+        e,
+        e.rig(&table).query(&written),
+        &INCREMENTAL_ID,
+        dest.path(),
+    );
     let one = rig.run_args(&["--param", "spent=1"]);
     assert!(
         one.status.success(),
         "{}",
         String::from_utf8_lossy(&one.stderr)
     );
-    assert_eq!(delivered_ids(e, first), (6..=10).collect::<Vec<_>>());
+    assert_eq!(added(), (6..=10).collect::<Vec<_>>());
 
     e.insert(&table, 11..=11, 170, Some(0));
     e.insert(&table, 12..=12, 170, Some(1));
-    let rig = staged_for(e, rig, &INCREMENTAL_ID, second);
+    let graded = rig.twin();
+    let rig = read_by_the_cell(
+        rig,
+        "one destination holds the rows of the runs under `spent=1` and under `spent=0`, and the oracle reads all of it against one value's rows",
+    );
     let other = rig.run_args(&["--param", "spent=0"]);
     let said = String::from_utf8_lossy(&other.stderr).to_string();
     assert!(
@@ -849,21 +864,21 @@ fn incremental_query_param_value_changes_between_runs(e: SqlEngine) {
         "another value of the placeholder is not an edit of the query:\n{said}"
     );
     assert_eq!(
-        delivered_ids(e, second),
+        added(),
         vec![11],
         "the run continues from the stored cursor under the new value"
     );
     let new_warnings: Vec<String> = warn_lines(&other)
         .into_iter()
         .filter(|w| !warn_lines(&one).contains(w))
+        .filter(|w| !w.contains("already has parts from a prior run"))
         .collect();
     assert_eq!(
         new_warnings,
         Vec::<String>::new(),
-        "a changed value warns of nothing"
+        "a changed value warns of nothing (the second run into one prefix is told of the first run's parts)"
     );
 
-    let rig = staged_for(e, rig, &INCREMENTAL_ID, first);
     let by_env = rig.run_args_env(&[], &[("spent", "1")]);
     let said = String::from_utf8_lossy(&by_env.stderr).to_string();
     assert!(
@@ -871,13 +886,13 @@ fn incremental_query_param_value_changes_between_runs(e: SqlEngine) {
         "the value from the environment:\n{said}"
     );
     assert_eq!(
-        delivered_ids(e, first),
-        vec![6, 7, 8, 9, 10, 12],
+        added(),
+        vec![12],
         "the environment's value continues from the same cursor"
     );
 
     let edited = format!("{written} AND id > 0");
-    let rig = staged_for(e, rig.query(&edited), &INCREMENTAL_ID, third);
+    let rig = graded.query(&edited);
     for cycle in 1..=2 {
         let o = rig.run_args(&["--param", "spent=1"]);
         let said = String::from_utf8_lossy(&o.stderr).to_string();
@@ -890,7 +905,7 @@ fn incremental_query_param_value_changes_between_runs(e: SqlEngine) {
         ] {
             assert!(said.contains(want), "cycle {cycle}: {want} in:\n{said}");
         }
-        assert!(delivered_ids(e, third).is_empty(), "cycle {cycle}");
+        assert!(added().is_empty(), "cycle {cycle}");
     }
 }
 
@@ -915,17 +930,23 @@ fn source_url_without_its_default_port_continues(e: SqlEngine) {
     e.alive();
     let (table, _guard) = e.table("mode_transition");
     e.insert(&table, 1..=10, 180, Some(10));
-    let (first, second) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-    let rig = staged_for(e, e.rig(&table), &INCREMENTAL_ID, first.path());
+    let dest = Stages::fresh();
+    let rig = staged_for(e, e.rig(&table), &INCREMENTAL_ID, dest.path());
     rig.run_ok();
-    assert_eq!(delivered_ids(e, first.path()), (1..=10).collect::<Vec<_>>());
+    assert_eq!(
+        delivered_ids(e, dest.added().path()),
+        (1..=10).collect::<Vec<_>>()
+    );
 
     e.insert(&table, 11..=13, 170, Some(10));
     let respelled = e.url().replace(&format!(":{}/", e.default_port()), "/");
     assert_ne!(respelled, e.url(), "the stand URL names the default port");
-    let rig = continued(staged_for(e, rig, &INCREMENTAL_ID, second.path()).source_url(&respelled));
+    let rig = read_by_the_cell(
+        rig.source_url(&respelled),
+        "the oracle attaches the source by the config's URL, and DuckDB's MySQL attach takes none without its port",
+    );
     rig.run_ok();
-    let ids = delivered_ids(e, second.path());
+    let ids = delivered_ids(e, dest.added().path());
     assert!(
         ids == vec![11, 12, 13],
         "P-18: the source URL without its default port lost the cursor: the run delivered ids {ids:?}, the delta is [11, 12, 13]"
@@ -990,32 +1011,34 @@ fn same_table_in_another_schema(walk: bool) {
          INSERT INTO {s}.{table} SELECT * FROM public.{table} WHERE id <= 7",
         s = schema.0
     ));
-    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
-    let (first, second, third) = (dirs[0].path(), dirs[1].path(), dirs[2].path());
+    let dest = Stages::fresh();
+    let (fresh, third) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (first, third) = (dest.path(), third.path());
     let rig = staged_for(e, e.rig(&table), &INCREMENTAL_ID, first);
     rig.run_ok();
-    assert_eq!(read_ids(first), (1..=10).collect::<Vec<_>>());
+    assert_eq!(read_ids(dest.added().path()), (1..=10).collect::<Vec<_>>());
 
     let elsewhere = format!("{POSTGRES_URL}?options=-csearch_path%3D{}", schema.0);
-    let mut rig = staged_for(e, rig, &INCREMENTAL_ID, second).source_url(&elsewhere);
     if !walk {
+        let rig = staged_for(e, rig, &INCREMENTAL_ID, fresh.path()).source_url(&elsewhere);
         let stored = format!("`{table} under the server's own search_path`");
         let now = format!("`{table} under search_path {}`", schema.0);
-        return refused_twice_for_the_stream(&rig, second, &stored, &now, &read_ids);
+        return refused_twice_for_the_stream(&rig, fresh.path(), &stored, &now, &read_ids);
     }
+    let mut rig = rig.source_url(&elsewhere);
     let said = rig.refuses_twice_and_walks_out(
         &["run"],
         &[],
         STREAM_REFUSED,
         vec![
-            reset_remedy(&table),
+            reset_remedy(&table, None),
             crate::common::Remedy::wrong(
                 "pointed the export at another destination",
                 Then::Refuses(STREAM_REFUSED),
                 |r| r.rebuilt(|r| r.dest_path(third.to_path_buf())),
             ),
             crate::common::Remedy::new(RESTORE, Then::DeliversTheSource, |r| {
-                r.rebuilt(|r| staged_for(e, r, &INCREMENTAL_ID, first).source_url(POSTGRES_URL))
+                r.rebuilt(|r| r.source_url(POSTGRES_URL))
             }),
             accept_remedy(&table, || {
                 e.insert(&table, 11..=12, 170, Some(10));
@@ -1026,13 +1049,20 @@ fn same_table_in_another_schema(walk: bool) {
             }),
         ],
     );
+    let delta = read_ids(dest.added().path());
     if walks_every_remedy() {
         assert_eq!(
-            read_ids(second),
+            delta,
             vec![11, 12],
             "the accepted run keeps the cursor: none of the other schema's 1..=7"
         );
-        continues_after_the_acceptance(&rig, &|| read_ids(second));
+        continues_after_the_acceptance(&rig, &|| read_ids(first));
+    } else {
+        assert_eq!(
+            delta,
+            (1..=7).collect::<Vec<_>>(),
+            "the reset delivers the other schema's rows in full"
+        );
     }
     for want in [
         format!("`{table} under the server's own search_path`"),
@@ -1041,7 +1071,6 @@ fn same_table_in_another_schema(walk: bool) {
         assert!(said.contains(&want), "the refusal names {want}:\n{said}");
     }
     assert!(read_ids(third).is_empty(), "a refused run writes nothing");
-    assert_eq!(read_ids(first), (1..=10).collect::<Vec<_>>());
 }
 
 #[test]
@@ -1204,32 +1233,35 @@ fn stream_query_repoint(engine: SqlEngine) {
     let (b, _gb) = engine.table("stream_b");
     engine.insert(&a, 101..=110, 170, Some(10));
     engine.insert(&b, 1..=10, 180, Some(10));
-    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let (dest, other_out) = (Stages::fresh(), tempfile::tempdir().unwrap());
     let ids = |out: &Path| delivered_ids(engine, out);
     let stage = INCREMENTAL_ID;
 
     let rig = engine
         .rig(&a)
         .query(&format!("SELECT id, ext_id, server_time FROM {a}"));
-    let rig = staged_for(engine, rig, &stage, dirs[0].path());
+    let rig = staged_for(engine, rig, &stage, dest.path());
     rig.run_ok();
-    assert_eq!(ids(dirs[0].path()), (101..=110).collect::<Vec<_>>());
+    assert_eq!(ids(dest.added().path()), (101..=110).collect::<Vec<_>>());
 
     engine.insert(&a, 111..=113, 160, Some(10));
     let wider = rig.query(&format!(
         "select id, ext_id, server_time, time_spent   from {a}"
     ));
-    let wider = continued(staged_for(engine, wider, &stage, dirs[1].path()));
+    let wider = read_by_the_cell(
+        wider,
+        "the parts delivered before the projection was widened hold no `time_spent`, and the oracle reads the whole destination against the wider query",
+    );
     wider.run_ok();
     assert_eq!(
-        ids(dirs[1].path()),
+        ids(dest.added().path()),
         vec![111, 112, 113],
         "the cursor is kept"
     );
 
     let other = wider.query(&format!("SELECT id, ext_id, server_time FROM {b}"));
-    let other = staged_for(engine, other, &stage, dirs[2].path());
-    refused_twice_for_the_stream(&other, dirs[2].path(), &a, &b, &ids);
+    let other = staged_for(engine, other, &stage, other_out.path());
+    refused_twice_for_the_stream(&other, other_out.path(), &a, &b, &ids);
     let reset = other.cli(&["state", "reset", "--export", &a]);
     assert!(
         reset.status.success(),
@@ -1237,7 +1269,7 @@ fn stream_query_repoint(engine: SqlEngine) {
         String::from_utf8_lossy(&reset.stderr)
     );
     other.run_ok();
-    assert_eq!(ids(dirs[2].path()), (1..=10).collect::<Vec<_>>());
+    assert_eq!(ids(other_out.path()), (1..=10).collect::<Vec<_>>());
 }
 
 /// Mongo `resume`: export collection `hi` (`_id` 101..=110), then read `lo` (`_id` 1..=10) under the same export name and state.
@@ -1447,27 +1479,29 @@ fn crashed_run_then_incremental(
     engine.alive();
     let (table, _guard) = engine.range_table("crashed_run");
     engine.insert(&table, 1..=10, 180, Some(10));
-    let (first, second) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let dest = Stages::fresh();
+    let out = dest.path();
     let ids = |out: &Path| delivered_ids(engine, out);
+    let added = || delivered_ids(engine, dest.added().path());
     let source: Vec<i64> = (1..=10).collect();
     let keeps_a_high_water = prior.1.iter().any(|l| l.starts_with("chunk_by_key"));
 
-    let run = staged_for(engine, engine.rig(&table), &prior, first.path());
+    let run = staged_for(engine, engine.rig(&table), &prior, out);
     let crash = run.run_with_env("RIVET_TEST_PANIC_AT", crash_at);
     assert!(!crash.status.success(), "the first run must crash");
     assert_eq!(
-        ids(first.path()),
+        added(),
         vec![1, 2, 3, 4],
         "ids 1..=4 landed first:
 {}",
         String::from_utf8_lossy(&crash.stderr)
     );
 
-    let incremental = staged_for(engine, run, &INCREMENTAL_ID, second.path());
+    let incremental = staged_for(engine, run, &INCREMENTAL_ID, out);
     for cycle in 1..=2 {
         let o = incremental.run();
         let said = String::from_utf8_lossy(&o.stderr).to_string();
-        let got = ids(second.path());
+        let got = added();
         assert!(
             got.is_empty(),
             "cycle {cycle}: the incremental run delivered {} of {} source ids ({got:?}) past an \
@@ -1489,22 +1523,22 @@ fn crashed_run_then_incremental(
                 "cycle {cycle}: must name {want}:\n{said}"
             );
         }
-        assert!(!second.path().join("_SUCCESS").exists(), "cycle {cycle}");
+        assert!(!out.join("_SUCCESS").exists(), "cycle {cycle}");
     }
 
     match remedy {
         Remedy::FinishTheRun => {
-            let run = staged_for(engine, incremental, &prior, first.path());
+            let run = staged_for(engine, incremental, &prior, out);
             run.run_ok();
-            assert_eq!(ids(first.path()), source, "the interrupted run finished");
+            assert_eq!(ids(out), source, "the interrupted run finished");
+            dest.added();
             engine.insert(&table, 11..=13, 170, Some(10));
-            let incremental = staged_for(engine, run, &INCREMENTAL_ID, second.path());
+            let incremental = staged_for(engine, run, &INCREMENTAL_ID, out);
+            incremental.run_ok();
             if keeps_a_high_water {
-                continued(incremental).run_ok();
-                assert_eq!(ids(second.path()), vec![11, 12, 13], "MT2");
+                assert_eq!(added(), vec![11, 12, 13], "MT2");
             } else {
-                incremental.run_ok();
-                assert_eq!(ids(second.path()), (1..=13).collect::<Vec<_>>(), "MT1");
+                assert_eq!(added(), (1..=13).collect::<Vec<_>>(), "MT1");
             }
         }
         Remedy::Reset => {
@@ -1515,7 +1549,7 @@ fn crashed_run_then_incremental(
                 String::from_utf8_lossy(&reset.stderr)
             );
             incremental.run_ok();
-            assert_eq!(ids(second.path()), source, "a full pass after the reset");
+            assert_eq!(added(), source, "a full pass after the reset");
         }
     }
 }
