@@ -282,12 +282,18 @@ pub(crate) fn run_export(
     )
 }
 
-/// A part's file name: a `_part<N>` suffix whenever the run seals more than one part.
-fn part_file_name(export: &str, ts: &str, part_idx: usize, part_count: usize, ext: &str) -> String {
+/// A part's file name, `<export>_<run stamp>`: a `_part<N>` suffix whenever the run seals more than one part.
+fn part_file_name(
+    export: &str,
+    stamp: &str,
+    part_idx: usize,
+    part_count: usize,
+    ext: &str,
+) -> String {
     if part_count > 1 {
-        format!("{export}_{ts}_part{part_idx}.{ext}")
+        format!("{export}_{stamp}_part{part_idx}.{ext}")
     } else {
-        format!("{export}_{ts}.{ext}")
+        format!("{export}_{stamp}.{ext}")
     }
 }
 
@@ -364,17 +370,13 @@ pub(super) fn run_single_export(
     let (dest, ext) = (frame.dest, frame.ext);
     let ext = ext.as_str();
 
-    // Millisecond precision (matches keyset.rs / mongo_parallel.rs / cdc sink):
-    // two runs into the same prefix within the same SECOND must not produce
-    // identical part names, or the later run silently clobbers the earlier's file
-    // (LocalDestination idempotent_overwrite) — a real incremental-delta loss.
-    let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
+    let stamp = super::summary::run_scoped_stamp(&summary.run_id, &plan.export_name);
 
     let (parts, wrote) = super::commit::write_sink_parts(
         dest.as_ref(),
         &mut sink,
         plan.validate.then_some(plan.format),
-        |idx, count| part_file_name(&plan.export_name, &ts, idx, count, ext),
+        |idx, count| part_file_name(&plan.export_name, &stamp, idx, count, ext),
     );
     // ADR-0029: single's commit unit is the whole invocation — ONE sink accumulated
     // the checksums of every part, so they cover all of them or (on a mid-write

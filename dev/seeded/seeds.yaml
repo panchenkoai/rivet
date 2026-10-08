@@ -1013,3 +1013,21 @@ seeds:
         cells: [an_unfinished_run_whose_format_is_edited_is_refused_and_walked_out_oracle, an_unfinished_run_whose_format_is_edited_is_refused_twice_oracle]
       lib:
         cells: ["lib:an_unfinished_run_is_refused_for_another_format_than_its_parts_until_it_is_abandoned"]
+
+  - name: part-named-by-the-clock
+    class: a runner stamps its part name from the wall clock instead of from its run id, so two runs of one export in one millisecond write one file name
+    history: "v0.31.0 - two `rivet run` of one incremental export ended their read in one millisecond: one part, two Success manifests, and file_log and export_metrics counting 400 rows over a 200-row file (#507; the MongoDB parallel reader stamped its worker parts the same way)"
+    scope: source
+    patch: part-named-by-the-clock/single.patch
+    engines:
+      postgres:
+        cells: [incremental_runs_started_together_each_declare_their_own_part_postgres]
+      mysql:
+        cells: [incremental_runs_started_together_each_declare_their_own_part_mysql]
+      mssql:
+        cells: [incremental_runs_started_together_each_declare_their_own_part_mssql]
+      mongo:
+        patch: part-named-by-the-clock/mongo.patch
+        cells: [parallel_parts_are_named_after_their_run_mongo]
+      oracle:
+        cells: [incremental_runs_started_together_each_declare_their_own_part_oracle]

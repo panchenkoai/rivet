@@ -280,6 +280,39 @@ pub(crate) fn fresh_run_id(export_name: &str) -> String {
     )
 }
 
+/// `s` as one part-name segment: anything outside `[A-Za-z0-9_-]` becomes `_`.
+fn sanitize_run_id(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// The run-unique segment of a keyset part name: the sanitized run id without its redundant `<export>_` prefix.
+pub(crate) fn run_scoped_tag(run_id: &str, export_name: &str) -> String {
+    let tag = sanitize_run_id(run_id);
+    let prefix = format!("{}_", sanitize_run_id(export_name));
+    tag.strip_prefix(&prefix).unwrap_or(&tag).to_string()
+}
+
+/// The run-unique stamp of a single-runner or Mongo-parallel part name, `<YYYYMMDD>_<HHMMSS>_<mmm>_<pid>_<nonce>`: [`run_scoped_tag`] with the run id's `T` folded to `_`, then a random nonce for two runs whose ids coincide.
+pub(crate) fn run_scoped_stamp(run_id: &str, export_name: &str) -> String {
+    use rand::RngExt;
+    let tag = run_scoped_tag(run_id, export_name);
+    let stamp = match tag.split_once('T') {
+        Some((date, rest)) if date.len() == 8 && date.bytes().all(|b| b.is_ascii_digit()) => {
+            format!("{date}_{rest}")
+        }
+        _ => tag,
+    };
+    format!("{stamp}_{:016x}", rand::rng().random::<u64>())
+}
+
 impl RunSummary {
     /// Parts this run committed itself — not the ones a resume adopted.
     pub(super) fn files_committed_here(&self) -> usize {
@@ -1182,6 +1215,76 @@ fn fmt_thousands(n: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_scoped_tag_strips_a_redundant_export_prefix_but_keeps_a_bare_run_id() {
+        assert_eq!(
+            run_scoped_tag(
+                "aa_bonus_conversions_usd_20260820T104554088",
+                "aa_bonus_conversions_usd"
+            ),
+            "20260820T104554088",
+            "the leading <export>_ must be stripped so the part name is not <export>_<export>_<stamp>"
+        );
+        assert_eq!(run_scoped_tag("run-1", "exp"), "run-1");
+        assert_ne!(
+            run_scoped_tag("e_20260820T104554088", "e"),
+            run_scoped_tag("e_20260820T104554090", "e")
+        );
+    }
+
+    #[test]
+    fn sanitize_run_id_keeps_safe_chars_and_replaces_the_rest() {
+        assert_eq!(sanitize_run_id("run-2026_01A9"), "run-2026_01A9");
+        assert_eq!(sanitize_run_id("a/b c:d.e"), "a_b_c_d_e");
+        assert_eq!(sanitize_run_id("../etc"), "___etc");
+        assert_eq!(sanitize_run_id("ABCabc012"), "ABCabc012");
+    }
+
+    /// The stamp without its nonce, which must be 16 hex digits.
+    fn sans_nonce(stamp: &str) -> &str {
+        let (head, nonce) = stamp.rsplit_once('_').expect("a nonce field");
+        assert!(
+            nonce.len() == 16 && nonce.bytes().all(|b| b.is_ascii_hexdigit()),
+            "{stamp}"
+        );
+        head
+    }
+
+    #[test]
+    fn a_part_stamp_is_the_run_id_in_the_documented_shape_then_a_nonce() {
+        let id = "orders_20261008T174117.653_33972";
+        assert_eq!(
+            sans_nonce(&run_scoped_stamp(id, "orders")),
+            "20261008_174117_653_33972"
+        );
+        let fresh = fresh_run_id("orders");
+        let stamp = run_scoped_stamp(&fresh, "orders");
+        assert!(
+            sans_nonce(&stamp).ends_with(&format!("_{}", std::process::id()))
+                && !stamp.contains(['T', '.']),
+            "{fresh} -> {stamp}"
+        );
+        for other in ["run-1", "abcdefghT1", "123T4", "Test_run"] {
+            assert_eq!(
+                sans_nonce(&run_scoped_stamp(other, "orders")),
+                other,
+                "not a run stamp"
+            );
+        }
+    }
+
+    #[test]
+    fn two_part_stamps_of_one_millisecond_and_one_pid_differ() {
+        let id = "orders_20261008T174117.653_1";
+        let stamps: std::collections::BTreeSet<String> =
+            (0..64).map(|_| run_scoped_stamp(id, "orders")).collect();
+        assert_eq!(
+            stamps.len(),
+            64,
+            "two containers each run pid 1: the run id is the same, the part name must not be"
+        );
+    }
 
     #[test]
     fn fmt_thousands_handles_small_and_large() {
