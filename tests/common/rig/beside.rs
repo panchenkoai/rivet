@@ -95,6 +95,105 @@ impl Drop for ReadOnly {
     }
 }
 
+/// A small volume of its own that a cell fills and frees: a disk image mounted for the cell, detached on drop.
+pub struct TinyVolume {
+    at: tempfile::TempDir,
+}
+
+impl TinyVolume {
+    /// Mount a volume of `megabytes`; `None`, with the skip recorded, where the cell cannot mount one.
+    pub fn mounted(megabytes: u32) -> Option<Self> {
+        if !cfg!(target_os = "macos") {
+            crate::common::skip_live(
+                "no volume this cell may fill: it mounts a disk image with macOS `hdiutil` (a Linux tmpfs needs root)",
+            );
+            return None;
+        }
+        let at = tempfile::tempdir().expect("a mount point");
+        let image = at.path().join("volume.dmg");
+        let mount = at.path().join("mnt");
+        std::fs::create_dir(&mount).expect("mkdir the mount point");
+        let hdiutil = |args: &[&str]| {
+            let out = std::process::Command::new("hdiutil")
+                .args(args)
+                .output()
+                .expect("run hdiutil");
+            assert!(
+                out.status.success(),
+                "hdiutil {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let (size, image, mount) = (
+            format!("{megabytes}m"),
+            image.to_string_lossy().to_string(),
+            mount.to_string_lossy().to_string(),
+        );
+        hdiutil(&[
+            "create", "-size", &size, "-fs", "HFS+", "-volname", "rivet", "-quiet", &image,
+        ]);
+        hdiutil(&[
+            "attach",
+            "-nobrowse",
+            "-quiet",
+            "-mountpoint",
+            &mount,
+            &image,
+        ]);
+        Some(Self { at })
+    }
+
+    /// The root of the volume.
+    pub fn path(&self) -> PathBuf {
+        self.at.path().join("mnt")
+    }
+
+    /// Fill the volume; panics unless a write to it is then refused.
+    pub fn fill(&self) {
+        use std::io::Write as _;
+        let mut ballast = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.path().join(".ballast"))
+            .expect("open the ballast");
+        for block in [vec![0u8; 1 << 16], vec![0u8; 512]] {
+            while ballast
+                .write_all(&block)
+                .and_then(|()| ballast.sync_data())
+                .is_ok()
+            {}
+        }
+        if let Some(why) =
+            not_filled(std::fs::write(self.path().join(".probe"), [0u8; 8192]).is_ok())
+        {
+            panic!("{why}");
+        }
+    }
+
+    /// Give the space back.
+    pub fn free(&self) {
+        let _ = std::fs::remove_file(self.path().join(".probe"));
+        std::fs::remove_file(self.path().join(".ballast")).expect("remove the ballast");
+    }
+}
+
+impl Drop for TinyVolume {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("hdiutil")
+            .args(["detach", "-quiet", "-force"])
+            .arg(self.path())
+            .output();
+    }
+}
+
+/// Why a volume a cell filled is not full, else `None`: a further write must be refused.
+pub(crate) fn not_filled(still_writable: bool) -> Option<String> {
+    still_writable.then(|| {
+        "sabotage: the volume still takes a write after it was filled: nothing was taken away"
+            .to_string()
+    })
+}
+
 /// Whether a write to `p` (a new file in a directory, an append to a file) still succeeds.
 fn writable(p: &Path) -> bool {
     if p.is_dir() {
