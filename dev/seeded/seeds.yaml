@@ -937,3 +937,79 @@ seeds:
         cells: [incremental_query_cosmetic_edit_is_refused_until_accepted_oracle]
       lib:
         cells: ["lib:an_accepted_edit_keeps_the_cursor_under_what_the_export_reads_now"]
+
+  - name: resumed-chunk-run-keeps-its-stale-plan
+    class: a run that resumes a crashed range-chunk checkpoint executes the task list the crashed run stored and never looks at the source's key span again
+    history: "2026-10-08, sabotage rows kill_then_source_grows_range_checkpoint and kill_then_source_fills_empty_range_checkpoint - three rows inserted after the crash were in no part (200 of 203), and an empty table killed mid-run and then filled was delivered as 0 of 40, exit 0 on main 95bef44a and on v0.31.0"
+    scope: source
+    patch: resumed-chunk-run-keeps-its-stale-plan/shared.patch
+    engines:
+      postgres:
+        cells: [a_range_checkpoint_run_killed_before_the_source_grows_delivers_the_source_postgres, a_range_checkpoint_parallel_run_killed_before_the_source_grows_delivers_the_source_postgres, a_run_killed_over_an_empty_table_before_it_fills_delivers_the_source_postgres]
+      mysql:
+        cells: [a_range_checkpoint_run_killed_before_the_source_grows_delivers_the_source_mysql, a_range_checkpoint_parallel_run_killed_before_the_source_grows_delivers_the_source_mysql, a_run_killed_over_an_empty_table_before_it_fills_delivers_the_source_mysql]
+      mssql:
+        cells: [a_range_checkpoint_run_killed_before_the_source_grows_delivers_the_source_mssql, a_range_checkpoint_parallel_run_killed_before_the_source_grows_delivers_the_source_mssql, a_run_killed_over_an_empty_table_before_it_fills_delivers_the_source_mssql]
+      mongo:
+        na: "a MongoDB export has no range-chunk checkpoint (validate_non_sql_source_modes allows no chunked mode)"
+      oracle:
+        cells: [a_range_checkpoint_run_killed_before_the_source_grows_delivers_the_source_oracle, a_range_checkpoint_parallel_run_killed_before_the_source_grows_delivers_the_source_oracle, a_run_killed_over_an_empty_table_before_it_fills_delivers_the_source_oracle]
+      lib:
+        cells: ["lib:a_resume_extends_the_stored_plan_to_the_ranges_detected_now"]
+
+  - name: resumed-parallel-keyset-stops-at-its-last-range
+    class: a resumed parallel keyset run skips its committed, open-ended last range and reads no key above the highest one that range delivered
+    history: "2026-10-08, sabotage row kill_then_source_grows_keyset_checkpoint_parallel - killed when its last key range committed, the resume left three rows inserted after the crash in no part (200 of 203), exit 0 on main 95bef44a and on v0.31.0"
+    scope: source
+    patch: resumed-parallel-keyset-stops-at-its-last-range/shared.patch
+    engines:
+      postgres:
+        cells: [a_keyset_checkpoint_parallel_run_killed_before_the_source_grows_delivers_the_source_postgres, a_keyset_checkpoint_parallel_run_with_no_recorded_top_killed_before_the_source_grows_delivers_the_source_postgres]
+      mysql:
+        cells: [a_keyset_checkpoint_parallel_run_killed_before_the_source_grows_delivers_the_source_mysql, a_keyset_checkpoint_parallel_run_with_no_recorded_top_killed_before_the_source_grows_delivers_the_source_mysql]
+      mssql:
+        cells: [a_keyset_checkpoint_parallel_run_killed_before_the_source_grows_delivers_the_source_mssql, a_keyset_checkpoint_parallel_run_with_no_recorded_top_killed_before_the_source_grows_delivers_the_source_mssql]
+      mongo:
+        na: "a MongoDB parallel read keeps no per-range checkpoint (`keyset_range` is written by the SQL keyset runner only)"
+      oracle:
+        cells: [a_keyset_checkpoint_parallel_run_killed_before_the_source_grows_delivers_the_source_oracle, a_keyset_checkpoint_parallel_run_with_no_recorded_top_killed_before_the_source_grows_delivers_the_source_oracle]
+      lib:
+        cells: ["lib:only_a_committed_open_ended_last_range_leaves_a_tail_to_read"]
+
+  - name: cursor-continued-into-another-destination
+    class: an export that continues from a stored cursor keeps it when its destination or its format was edited, so the new location holds only the rows past the cursor
+    history: "2026-10-08, sabotage rows edit_destination_path_incremental and edit_format_incremental - a moved `destination.path` held 3 of 43 rows under a success manifest, and a changed `format` left parquet and csv parts in one prefix, exit 0 on main 95bef44a and on v0.31.0"
+    scope: source
+    patch: cursor-continued-into-another-destination/shared.patch
+    engines:
+      postgres:
+        cells: [an_incremental_export_whose_destination_path_is_edited_is_refused_and_walked_out_postgres, an_incremental_export_whose_format_is_edited_is_refused_and_walked_out_postgres]
+      mysql:
+        cells: [an_incremental_export_whose_destination_path_is_edited_is_refused_and_walked_out_mysql, an_incremental_export_whose_format_is_edited_is_refused_and_walked_out_mysql]
+      mssql:
+        cells: [an_incremental_export_whose_destination_path_is_edited_is_refused_and_walked_out_mssql, an_incremental_export_whose_format_is_edited_is_refused_and_walked_out_mssql]
+      mongo:
+        cells: [a_resume_export_whose_destination_path_is_edited_is_refused_and_walked_out_mongo, a_resume_export_whose_format_is_edited_is_refused_and_walked_out_mongo]
+      oracle:
+        cells: [an_incremental_export_whose_destination_path_is_edited_is_refused_and_walked_out_oracle, an_incremental_export_whose_format_is_edited_is_refused_and_walked_out_oracle]
+      lib:
+        cells: ["lib:a_cursor_is_refused_for_another_destination_or_format_until_restored_or_reset"]
+
+  - name: unfinished-run-finished-in-another-format
+    class: an unfinished checkpointed run is continued in another format than the parts it already wrote, and its success manifest names parts of both
+    history: "2026-10-08, sabotage row edit_format_unfinished_checkpoint - a range-checkpoint run killed after three parquet parts and resumed under `format: csv` finished with a manifest naming parquet and csv parts, exit 0 on main 95bef44a and on v0.31.0"
+    scope: source
+    patch: unfinished-run-finished-in-another-format/shared.patch
+    engines:
+      postgres:
+        cells: [an_unfinished_run_whose_format_is_edited_is_refused_and_walked_out_postgres]
+      mysql:
+        cells: [an_unfinished_run_whose_format_is_edited_is_refused_and_walked_out_mysql]
+      mssql:
+        cells: [an_unfinished_run_whose_format_is_edited_is_refused_and_walked_out_mssql]
+      mongo:
+        na: "a MongoDB `resume: true` run has no crash point a cell can place, so no unfinished MongoDB run is staged; the format check it shares (StateStore::refuse_unfinished_run) is graded by the lib cell"
+      oracle:
+        cells: [an_unfinished_run_whose_format_is_edited_is_refused_and_walked_out_oracle]
+      lib:
+        cells: ["lib:an_unfinished_run_is_refused_for_another_format_than_its_parts_until_it_is_abandoned"]
