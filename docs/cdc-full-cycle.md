@@ -148,6 +148,12 @@ Check:
   keeps every change, and the same `WHERE NOT __is_deleted` reads live state.
 - A second `rivet load` with no new run appends nothing (the load ledger); a
   second `rivet compact` finds no buffer and says so.
+- A table that holds no row at the baseline still gets its base: the load creates
+  `orders` empty, with the source's columns, and its first insert, update or delete
+  is buffered and compacted like any other table's.
+- `rivet compact` works table by table. A table it fails or refuses does not stop
+  the others: each prints its own `COMPACT OK` / `COMPACT FAILED` line and gets its
+  own ledger row, and the command exits 1 when at least one table failed, naming it.
 
 - On **ClickHouse** (preview) there is no compaction either: the change log is a
   `ReplacingMergeTree` that collapses versions per key by itself, and the view reads

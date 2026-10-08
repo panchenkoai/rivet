@@ -290,6 +290,14 @@ pub(super) fn build_empty_table_sql(
     format!("CREATE TABLE `{fqtn}` (\n{schema}\n){clauses};")
 }
 
+/// What a load of a run that exported no rows says it did to `fqtn`.
+pub(super) fn empty_run_note(fqtn: &str, exists: bool) -> String {
+    match exists {
+        true => format!("  note: the newest run exported 0 rows — `{fqtn}` is emptied to match"),
+        false => format!("  note: the newest run exported 0 rows — `{fqtn}` is created empty"),
+    }
+}
+
 /// A free `LOAD DATA` batch-load statement declaring the native `schema`, so
 /// BigQuery coerces the Parquet to native types on load.
 pub(super) fn build_load_data_sql(
