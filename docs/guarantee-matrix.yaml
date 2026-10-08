@@ -342,14 +342,6 @@ guarantees:
         sentence: "Every failure rivet names carries a stable `RIVET_<FAMILY>_<NAME>` code: in `--json-errors` output as `code`, and as a `[CODE]` prefix on the text error line. The KIND decides the exit code."
     held_by:
       all: { test: a_code_s_kind_decides_its_exit_class, asserts: "assert_eq!(with(ErrorKind::Refusal), 5);" }
-    contradicted_by:
-      known_red:
-        - "live_operator_contract::open_defect_a_corrupt_cdc_checkpoint_is_refused_by_code"
-        - "live_operator_contract::open_defect_a_cdc_truncate_is_refused_by_code"
-        - "live_operator_contract::open_defect_a_dropped_slot_is_refused_by_code"
-        - "live_operator_contract::open_defect_binlogs_purged_past_the_checkpoint_after_a_changes_run_are_refused_by_code"
-        - "live_operator_contract::open_defect_an_oplog_rolled_past_the_checkpoint_after_a_changes_run_is_refused_by_code"
-        - "live_operator_contract::open_defect_a_cdc_collection_drop_is_refused_by_code"
 
   - id: logs_and_errors_redact_url_passwords
     stated:
@@ -480,25 +472,17 @@ guarantees:
     held_by:
       postgres: { test: pg_cdc_vanished_slot_with_checkpoint_fails_loudly_not_recreates, asserts: "a vanished slot with an existing checkpoint must fail the run, not silently re-create" }
       mssql: { test: mssql_add_column_remedy_before_the_first_changes_run_ends_in_the_log_gap_refusal, asserts: "RIVET_SOURCE_CDC_LOG_GAP" }
-    contradicted_by:
-      known_red:
-        - "live_operator_contract::open_defect_a_dropped_slot_after_a_changes_run_is_refused_by_code"
-        - "live_operator_contract::open_defect_binlogs_purged_past_the_checkpoint_before_the_first_changes_run_are_refused_by_code"
-        - "live_operator_contract::open_defect_an_oplog_rolled_past_the_checkpoint_before_the_first_changes_run_is_refused_by_code"
 
   - id: a_corrupt_checkpoint_fails_loud
     stated:
       - file: docs/reference/cdc-failure-modes.md
-        sentence: "**Fails loud** on garbage / truncated / empty checkpoints (invalid JSON — a serde error surfaces; never a silent re-anchor)."
+        sentence: "**Fails loud** (`RIVET_SOURCE_CDC_CHECKPOINT_INVALID`, exit 5) on garbage / truncated / empty checkpoints (invalid JSON; never a silent re-anchor)."
     held_by:
       postgres: { test: pg_cdc_corrupt_checkpoint_fails_loud_not_silently_absent, asserts: "a corrupt checkpoint must fail the run, not be read as absent and re-anchor" }
       mysql: { test: cdc_corrupt_checkpoint_fails_loud_not_silently_absent, asserts: "a corrupt checkpoint must fail the run, not silently re-anchor and skip changes" }
       mssql: { test: mssql_cdc_corrupt_checkpoint_fails_loud_not_silently_absent, asserts: "a corrupt checkpoint must fail the run, not be read as absent" }
       mongo: { gap: "no Mongo cell corrupts the stored resume token and runs" }
       oracle: { test: oracle_cdc_corrupt_checkpoint_fails_loud_not_silently_absent, asserts: "corrupt or truncated" }
-    contradicted_by:
-      known_red:
-        - "live_operator_contract::open_defect_deleting_a_corrupt_cdc_checkpoint_accepts_a_new_anchor"
 
   - id: cdc_carries_deletes_and_key_changes
     stated:
