@@ -958,7 +958,7 @@ scenarios:
     oracle:   { test: open_defect_a_run_whose_state_volume_fills_up_delivers_or_fails_loudly_oracle }
 
   - id: exhaust_open_files
-    what: "every run capped at 8 open files (`RLIMIT_NOFILE`, `Rig::open_files`) fails loudly, never by a crash, and a run without the cap then delivers the source and `validate` passes"
+    what: "every run capped at 8 open files (`RLIMIT_NOFILE`, `Rig::open_files`) fails loudly, never by a crash, and a run without the cap then delivers the source and `validate` passes; the cells of the other engines run on the SQLite state, since a Postgres state puts the PostgreSQL client, the open defect of the postgres cell, into every run"
     postgres: { test: open_defect_a_run_out_of_file_descriptors_fails_loudly_and_the_next_delivers_postgres }
     mysql:    { test: a_run_out_of_file_descriptors_fails_loudly_and_the_next_delivers_mysql }
     mssql:    { test: a_run_out_of_file_descriptors_fails_loudly_and_the_next_delivers_mssql }

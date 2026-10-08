@@ -1376,6 +1376,16 @@ fn out_of_file_descriptors(rig: Rig) {
     recovers(&rig, &[]);
 }
 
+/// [`out_of_file_descriptors`] on the SQLite state: on a Postgres state the state client is the PostgreSQL client, whose crash under the cap is the PostgreSQL cell's open defect.
+fn out_of_file_descriptors_on_sqlite_state(rig: Rig) {
+    if not_sqlite_state(
+        "a run out of file descriptors whose only PostgreSQL client would be its state",
+    ) {
+        return;
+    }
+    out_of_file_descriptors(rig);
+}
+
 // ddl_*: the source table changed under a live run
 
 /// One change of the table a live run reads.
@@ -4053,7 +4063,7 @@ fn open_defect_a_run_out_of_file_descriptors_fails_loudly_and_the_next_delivers_
 fn a_run_out_of_file_descriptors_fails_loudly_and_the_next_delivers_mysql() {
     {
         let (_table, rig, _guard) = shaped(SqlEngine::Mysql, "sab_fds", Shape::RangeCheckpoint);
-        out_of_file_descriptors(rig);
+        out_of_file_descriptors_on_sqlite_state(rig);
     }
 }
 
@@ -4062,7 +4072,7 @@ fn a_run_out_of_file_descriptors_fails_loudly_and_the_next_delivers_mysql() {
 fn a_run_out_of_file_descriptors_fails_loudly_and_the_next_delivers_mssql() {
     {
         let (_table, rig, _guard) = shaped(SqlEngine::Mssql, "sab_fds", Shape::RangeCheckpoint);
-        out_of_file_descriptors(rig);
+        out_of_file_descriptors_on_sqlite_state(rig);
     }
 }
 
@@ -4072,7 +4082,7 @@ fn a_run_out_of_file_descriptors_fails_loudly_and_the_next_delivers_mssql() {
 fn a_run_out_of_file_descriptors_fails_loudly_and_the_next_delivers_oracle() {
     {
         let (_table, rig, _guard) = shaped(SqlEngine::Oracle, "sab_fds", Shape::RangeCheckpoint);
-        out_of_file_descriptors(rig);
+        out_of_file_descriptors_on_sqlite_state(rig);
     }
 }
 
@@ -4081,7 +4091,7 @@ fn a_run_out_of_file_descriptors_fails_loudly_and_the_next_delivers_oracle() {
 fn a_run_out_of_file_descriptors_fails_loudly_and_the_next_delivers_mongo() {
     {
         let (rig, _guard) = mongo_rig("sab_fds");
-        out_of_file_descriptors(rig);
+        out_of_file_descriptors_on_sqlite_state(rig);
     }
 }
 
