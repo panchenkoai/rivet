@@ -3,6 +3,8 @@
 //! by a substring; a remedy is named by the sentence of the refusal text it implements and is
 //! applied from a copy of the refused state. Every invocation goes through the rig's one seam, so
 //! each refusal is also graded by tests/common/refusal.rs and each delivery by the default oracle.
+//! A sabotage cell (docs/sabotage-matrix.yaml) enters through [`Rig::refuses_twice_and_walks_out`]:
+//! one named remedy must deliver the source, and one WRONG remedy ([`Remedy::wrong`]) must be walked.
 
 use super::*;
 
@@ -62,9 +64,11 @@ pub enum Then<'a> {
     Refuses(Refused<'a>),
 }
 
-/// One remedy the refusal text names: the sentence, the edit that implements it, and its outcome.
+/// One remedy: the sentence of the refusal text it implements (or, for a wrong one, what the operator did instead), the edit, and its outcome.
 pub struct Remedy<'a> {
     sentence: String,
+    /// `false` for [`Remedy::wrong`]: the text does not name it.
+    named: bool,
     then: Then<'a>,
     apply: Box<dyn FnOnce(&mut Rig) + 'a>,
     rerun: Option<Vec<String>>,
@@ -80,10 +84,23 @@ impl<'a> Remedy<'a> {
         );
         Remedy {
             sentence: sentence.to_string(),
+            named: true,
             then,
             apply: Box::new(apply),
             rerun: None,
             rerun_env: None,
+        }
+    }
+
+    /// A plausible action the refusal text does NOT name (`what` the operator did): held to the outcome it declares, and it may leave the refusal exactly as it was.
+    pub fn wrong(what: &str, then: Then<'a>, apply: impl FnOnce(&mut Rig) + 'a) -> Self {
+        assert!(
+            !what.trim().is_empty(),
+            "a wrong remedy is named by what the operator did"
+        );
+        Remedy {
+            named: false,
+            ..Remedy::new(what, then, apply)
         }
     }
 
@@ -190,9 +207,28 @@ pub(crate) fn missing_sentence<'s>(text: &str, sentences: &[&'s str]) -> Option<
     sentences.iter().copied().find(|s| !text.contains(&flat(s)))
 }
 
-/// Why `after` is not the outcome a remedy declared from `refusal`, else `None`; a remedy that left the refusal as it was changed nothing.
-pub(crate) fn not_the_outcome(refusal: &Said, after: &Said, then: Then) -> Option<String> {
-    if (after.exit, &after.code, &after.line) == (refusal.exit, &refusal.code, &refusal.line) {
+/// Why `remedies` do not walk out of a refusal, else `None`: one named remedy must deliver the source, and one wrong remedy must be tried.
+pub(crate) fn not_a_walk(remedies: &[Remedy]) -> Option<&'static str> {
+    let leads_out = |r: &Remedy| r.named && r.then == Then::DeliversTheSource;
+    if !remedies.iter().any(leads_out) {
+        return Some("a refusal nothing leads out of: no named remedy delivers the source");
+    }
+    if remedies.iter().all(|r| r.named) {
+        return Some("no wrong remedy: walk one plausible action the text does not name");
+    }
+    None
+}
+
+/// Why `after` is not the outcome a remedy declared from `refusal`, else `None`; a named remedy that left the refusal as it was changed nothing.
+pub(crate) fn not_the_outcome(
+    refusal: &Said,
+    after: &Said,
+    then: Then,
+    named: bool,
+) -> Option<String> {
+    let unchanged =
+        (after.exit, &after.code, &after.line) == (refusal.exit, &refusal.code, &refusal.line);
+    if named && unchanged {
         return Some("changed nothing: the invocation refused exactly as before".to_string());
     }
     let (ok, expected) = match then {
@@ -322,7 +358,11 @@ impl Rig {
                 first.text, second.text
             );
         }
-        let sentences: Vec<&str> = remedies.iter().map(|r| r.sentence.as_str()).collect();
+        let sentences: Vec<&str> = remedies
+            .iter()
+            .filter(|r| r.named)
+            .map(|r| r.sentence.as_str())
+            .collect();
         if let Some(gone) = missing_sentence(&first.text, &sentences) {
             panic!(
                 "refuse-then-remedy: the refusal no longer says `{gone}`: the remedy cell is stale ({})\n--- the refusal:\n{}",
@@ -351,11 +391,17 @@ impl Rig {
         for (n, remedy) in remedies.into_iter().enumerate() {
             let Remedy {
                 sentence,
+                named,
                 then,
                 apply,
                 rerun,
                 rerun_env,
             } = remedy;
+            let sentence = if named {
+                sentence
+            } else {
+                format!("(wrong) {sentence}")
+            };
             if n > 0 {
                 if let Some(what) = uncopied {
                     crate::common::skip_live(&format!(
@@ -383,7 +429,7 @@ impl Rig {
                 rerun.as_deref().unwrap_or(argv),
                 rerun_env.as_deref().unwrap_or(envs),
             ));
-            if let Some(why) = not_the_outcome(&first, &after, then) {
+            if let Some(why) = not_the_outcome(&first, &after, then, named) {
                 panic!(
                     "refuse-then-remedy: remedy `{sentence}` {why}\n{}",
                     after.text
@@ -391,6 +437,20 @@ impl Rig {
             }
         }
         first.text
+    }
+
+    /// [`Rig::refuses_twice_then`] for a sabotage cell: a named remedy must deliver the source and a wrong remedy must be walked.
+    pub fn refuses_twice_and_walks_out(
+        &mut self,
+        argv: &[&str],
+        envs: &[(&str, &str)],
+        want: Refused,
+        remedies: Vec<Remedy>,
+    ) -> String {
+        if let Some(why) = not_a_walk(&remedies) {
+            panic!("refusal walk: {why} ({})", want.named());
+        }
+        self.refuses_twice_then(argv, envs, want, remedies)
     }
 }
 
@@ -540,7 +600,8 @@ mod tests {
     fn a_remedy_that_changes_nothing_fails_whatever_outcome_it_declared() {
         let before = refusal(5, CODED);
         for then in [Then::DeliversTheSource, Then::Refuses(WANT)] {
-            let why = not_the_outcome(&before, &refusal(5, CODED), then).expect("a no-op remedy");
+            let why =
+                not_the_outcome(&before, &refusal(5, CODED), then, true).expect("a no-op remedy");
             assert!(why.starts_with("changed nothing"), "{why}");
         }
     }
@@ -554,24 +615,78 @@ mod tests {
             "Error: [RIVET_STATE_INTERRUPTED_RUN_OWNER_MISMATCH] no\n",
         );
         assert_eq!(
-            not_the_outcome(&before, &refusal(0, ""), Then::DeliversTheSource),
+            not_the_outcome(&before, &refusal(0, ""), Then::DeliversTheSource, true),
             None
         );
         assert_eq!(
-            not_the_outcome(&before, &blocked, Then::Refuses(other)),
+            not_the_outcome(&before, &blocked, Then::Refuses(other), true),
             None
         );
         assert_eq!(
-            not_the_outcome(&before, &blocked, Then::DeliversTheSource).as_deref(),
+            not_the_outcome(&before, &blocked, Then::DeliversTheSource, true).as_deref(),
             Some(
                 "ended with [RIVET_STATE_INTERRUPTED_RUN_OWNER_MISMATCH] (exit 5), expected exit 0 and the source delivered"
             )
         );
         assert_eq!(
-            not_the_outcome(&before, &refusal(0, ""), Then::Refuses(other)).as_deref(),
+            not_the_outcome(&before, &refusal(0, ""), Then::Refuses(other), true).as_deref(),
             Some(
                 "ended with success (exit 0), expected [RIVET_STATE_INTERRUPTED_RUN_OWNER_MISMATCH] (exit 5)"
             )
+        );
+    }
+
+    #[test]
+    fn a_wrong_remedy_may_leave_the_refusal_as_it_was_and_is_held_to_its_outcome() {
+        let before = refusal(5, CODED);
+        assert_eq!(
+            not_the_outcome(&before, &refusal(5, CODED), Then::Refuses(WANT), false),
+            None
+        );
+        assert_eq!(
+            not_the_outcome(&before, &refusal(0, ""), Then::DeliversTheSource, false),
+            None
+        );
+        assert_eq!(
+            not_the_outcome(&before, &refusal(0, ""), Then::Refuses(WANT), false).as_deref(),
+            Some("ended with success (exit 0), expected [RIVET_STATE_RUN_IN_PROGRESS] (exit 5)")
+        );
+        assert_eq!(
+            not_the_outcome(&before, &refusal(5, CODED), Then::DeliversTheSource, false).as_deref(),
+            Some(
+                "ended with [RIVET_STATE_RUN_IN_PROGRESS] (exit 5), expected exit 0 and the source delivered"
+            )
+        );
+    }
+
+    #[test]
+    fn a_walk_needs_a_named_remedy_that_delivers_and_a_wrong_one() {
+        let named = |then| Remedy::new("Wait for it", then, |_| {});
+        let wrong = |then| Remedy::wrong("deletes the destination", then, |_| {});
+        assert_eq!(
+            not_a_walk(&[named(Then::DeliversTheSource), wrong(Then::Refuses(WANT))]),
+            None
+        );
+        assert_eq!(
+            not_a_walk(&[named(Then::Refuses(WANT)), wrong(Then::DeliversTheSource)]),
+            Some("a refusal nothing leads out of: no named remedy delivers the source")
+        );
+        assert_eq!(
+            not_a_walk(&[named(Then::DeliversTheSource)]),
+            Some("no wrong remedy: walk one plausible action the text does not name")
+        );
+        assert!(not_a_walk(&[]).is_some());
+    }
+
+    #[test]
+    #[should_panic(expected = "refusal walk: no wrong remedy")]
+    fn a_walk_without_a_wrong_remedy_is_refused_before_anything_runs() {
+        let mut rig = Rig::pg_batch("remedy_walk");
+        rig.refuses_twice_and_walks_out(
+            &["run"],
+            &[],
+            WANT,
+            vec![Remedy::new("Wait for it", Then::DeliversTheSource, |_| {})],
         );
     }
 
