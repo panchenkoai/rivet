@@ -1017,14 +1017,7 @@ impl CdcScenario {
             table: table.clone(),
             ci: ci.clone(),
         };
-        super::mssql::mssql_cdc_exec(
-            "IF NOT EXISTS(SELECT 1 FROM sys.databases WHERE name='rivet' \
-              AND is_cdc_enabled=1) EXEC sys.sp_cdc_enable_db;",
-        );
-        super::mssql::mssql_cdc_exec(&format!(
-            "EXEC sys.sp_cdc_enable_table @source_schema=N'dbo', \
-             @source_name=N'{table}', @role_name=NULL, @capture_instance=N'{ci}';"
-        ));
+        super::mssql::enable_cdc(&table, &ci);
         Self {
             rig: shape(Rig::mssql_cdc(&table, &ci), &table),
             table,

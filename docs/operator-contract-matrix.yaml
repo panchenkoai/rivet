@@ -351,3 +351,19 @@ scenarios:
     mssql:    { na: "NUMBER(19) is Oracle's; BIGINT keys range-chunk on the other engines (every range cell of this matrix)" }
     mongo:    { na: "NUMBER(19) is Oracle's; BIGINT keys range-chunk on the other engines (every range cell of this matrix)" }
     oracle:   { test: open_defect_range_chunking_takes_a_number_19_key_oracle }
+
+  - id: decimal_chunk_column_verdict_follows_the_estimate
+    what: "2026-10-09 finding: a `mode: chunked` config with a DECIMAL `chunk_column` is refused over 10 rows (chunk_size 4) and must be refused over 3; open defect: over 3 rows it runs, because the small-table escape precedes the shape validation"
+    postgres: { test: open_defect_a_decimal_chunk_column_is_refused_whatever_the_row_estimate_postgres }
+    mysql:    { test: open_defect_a_decimal_chunk_column_is_refused_whatever_the_row_estimate_mysql }
+    mssql:    { test: open_defect_a_decimal_chunk_column_is_refused_whatever_the_row_estimate_mssql }
+    mongo:    { na: "a Mongo export has no `mode: chunked`" }
+    oracle:   { test: open_defect_a_decimal_chunk_column_is_refused_whatever_the_row_estimate_oracle }
+
+  - id: keyless_table_verdict_follows_the_estimate
+    what: "2026-10-09 finding: a `mode: chunked` config with no `chunk_column` over a table with no key is refused over 10 rows (chunk_size 4) and must be refused over 3; open defect: over 3 rows it runs, because the small-table escape precedes the shape validation"
+    postgres: { test: open_defect_a_keyless_table_is_refused_whatever_the_row_estimate_postgres }
+    mysql:    { test: open_defect_a_keyless_table_is_refused_whatever_the_row_estimate_mysql }
+    mssql:    { test: open_defect_a_keyless_table_is_refused_whatever_the_row_estimate_mssql }
+    mongo:    { na: "a Mongo export has no `mode: chunked`" }
+    oracle:   { test: open_defect_a_keyless_table_is_refused_whatever_the_row_estimate_oracle }
