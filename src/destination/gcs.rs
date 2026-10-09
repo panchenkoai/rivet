@@ -51,6 +51,21 @@ pub(crate) struct GcsStore {
     async_op: Operator,
 }
 
+/// Storage requests a load may have in flight at once, over every store of the process.
+const LOAD_REQUESTS_IN_FLIGHT: usize = 16;
+
+/// The one budget of storage requests in flight for a load, shared by every store.
+fn load_limit() -> opendal::layers::ConcurrentLimitLayer {
+    static LIMIT: std::sync::OnceLock<opendal::layers::ConcurrentLimitLayer> =
+        std::sync::OnceLock::new();
+    LIMIT
+        .get_or_init(|| {
+            opendal::layers::ConcurrentLimitLayer::new(LOAD_REQUESTS_IN_FLIGHT)
+                .with_http_concurrent_limit(LOAD_REQUESTS_IN_FLIGHT)
+        })
+        .clone()
+}
+
 impl GcsStore {
     /// Build a blocking GCS store for `config`'s bucket. Paths passed to the
     /// methods below are **bucket-relative** (no `gs://bucket/` prefix).
@@ -76,6 +91,7 @@ impl GcsStore {
                 .with_jitter()
                 .with_notify(super::cloud::RivetRetryNotify),
         );
+        let async_op = async_op.layer(load_limit());
         let op = opendal::blocking::Operator::new(async_op.clone())?;
         Ok(Self {
             _runtime: runtime,
