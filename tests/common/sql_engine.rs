@@ -183,6 +183,14 @@ impl SqlEngine {
         self.create(prefix, &self.standard_columns(self.range_int()))
     }
 
+    /// Create `table` again as [`SqlEngine::range_table`] made it, after a cell dropped it (the first guard still drops it).
+    pub fn range_table_again(self, table: &str) {
+        self.exec(&format!(
+            "CREATE TABLE {table} ({})",
+            self.standard_columns(self.range_int())
+        ));
+    }
+
     /// A second database of this engine (another source key): a scratch one on the stand server, or the stand's second Oracle instance (`oracle-latin1`).
     pub fn second_database(self, tag: &str) -> SecondDatabase {
         #[cfg(feature = "oracle")]
