@@ -406,6 +406,20 @@ pub fn cross_process_serial(name: &str) -> QuietWindowGuard {
     QuietWindowGuard { _file: file }
 }
 
+/// The stand's pgBouncer (one server connection) for one cell alone.
+pub fn pgbouncer_alone() -> QuietWindowGuard {
+    require_alive(LiveService::PgBouncer);
+    cross_process_serial("pgbouncer")
+}
+
+/// Make the pooler's one server connection forget every prepared statement, so a cell's first read is the first to describe its statements.
+pub fn forget_pooled_statements() {
+    postgres::Client::connect(PGBOUNCER_URL, postgres::NoTls)
+        .expect("pgbouncer")
+        .batch_execute("DEALLOCATE ALL")
+        .expect("DEALLOCATE ALL through pgbouncer");
+}
+
 /// RAII background-writer: a thread that loops until its stop flag flips, and
 /// on Drop (INCLUDING a panic unwind) sets the flag and JOINS. The sustained-
 /// writes CDC tests spawned a bare JoinHandle then called a panic-capable

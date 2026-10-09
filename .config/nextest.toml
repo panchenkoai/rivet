@@ -69,6 +69,8 @@ oracle = { max-threads = 4 }
 toxiproxy = { max-threads = 1 }
 mssql_cdc = { max-threads = 1 }
 oracle_cdc = { max-threads = 1 }
+# The stand's pgBouncer holds one server connection: the cells that take `pgbouncer_alone()` read through it one at a time.
+pgbouncer = { max-threads = 1 }
 # The replica stand (mysql-primary :3308 -> replicas :3309/:3310): its tests rewire replication and one purges the replica's binlogs.
 mysql_replica = { max-threads = 1 }
 
@@ -113,6 +115,10 @@ test-group = 'oracle_cdc'
 [[profile.default.overrides]]
 filter = 'test(=live_cdc_replica::a_failover_to_another_cluster_member_is_refused_not_resumed_at_foreign_coordinates) or test(=live_cdc_replica::cdc_follows_a_failover_to_another_cluster_member_by_gtid) or test(=live_cdc_replica::cdc_from_a_replica_that_does_not_relog_refuses_instead_of_capturing_nothing) or test(=live_cdc_replica::cdc_reads_changes_from_a_replica) or test(=live_operator_contract::binlogs_purged_past_the_checkpoint_after_a_changes_run_are_refused_by_code_mysql) or test(=live_operator_contract::binlogs_purged_past_the_checkpoint_before_the_first_changes_run_are_refused_by_code_mysql) or test(=live_operator_contract::doctor_is_not_green_where_the_cdc_run_refuses_a_replica_that_does_not_relog_mysql)'
 test-group = 'mysql_replica'
+
+[[profile.default.overrides]]
+filter = 'test(=live_pooled_reads::a_second_table_through_one_transaction_pooler_arrives_as_itself_full_postgres) or test(=live_pooled_reads::a_second_table_through_one_transaction_pooler_arrives_as_itself_keyset_postgres) or test(=live_pooled_reads::a_second_table_through_one_transaction_pooler_arrives_as_itself_range_postgres) or test(=live_pooled_reads::a_second_table_through_one_transaction_pooler_arrives_as_itself_incremental_postgres) or test(=live_pooled_reads::a_wider_second_table_through_one_transaction_pooler_is_delivered_full_postgres) or test(=live_pooled_reads::a_wider_second_table_through_one_transaction_pooler_is_delivered_keyset_postgres) or test(=live_pooled_reads::a_wider_second_table_through_one_transaction_pooler_is_delivered_range_postgres) or test(=live_pooled_reads::a_wider_second_table_through_one_transaction_pooler_is_delivered_incremental_postgres) or test(=live_pooled_reads::a_retyped_column_through_one_transaction_pooler_arrives_as_the_source_holds_it_full_postgres) or test(=live_pooled_reads::a_retyped_column_through_one_transaction_pooler_arrives_as_the_source_holds_it_keyset_postgres) or test(=live_pooled_reads::a_retyped_column_through_one_transaction_pooler_arrives_as_the_source_holds_it_range_postgres) or test(=live_pooled_reads::a_retyped_column_through_one_transaction_pooler_arrives_as_the_source_holds_it_incremental_postgres) or test(=live_pooled_reads::a_gained_column_through_one_transaction_pooler_is_delivered_full_postgres) or test(=live_pooled_reads::a_gained_column_through_one_transaction_pooler_is_delivered_keyset_postgres) or test(=live_pooled_reads::a_gained_column_through_one_transaction_pooler_is_delivered_range_postgres) or test(=live_pooled_reads::a_gained_column_through_one_transaction_pooler_is_delivered_incremental_postgres) or test(=live_pooled_reads::a_widened_key_through_one_transaction_pooler_is_delivered_full_postgres) or test(=live_pooled_reads::a_widened_key_through_one_transaction_pooler_is_delivered_keyset_postgres) or test(=live_pooled_reads::a_widened_key_through_one_transaction_pooler_is_delivered_range_postgres) or test(=live_pooled_reads::a_widened_key_through_one_transaction_pooler_is_delivered_incremental_postgres)'
+test-group = 'pgbouncer'
 
 # Every other Oracle cell (`*_oracle` in any module) shares the listener with `live_oracle`: 32 at once were refused with ORA-12516 (2026-10-08).
 [[profile.default.overrides]]

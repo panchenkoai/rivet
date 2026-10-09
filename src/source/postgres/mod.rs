@@ -95,6 +95,28 @@ impl PostgresSource {
     }
 }
 
+/// Run `sql` as the unnamed statement, parsed and described by this call: a pooler keeps named statements by their text, and one kept from another read would describe these rows.
+pub(crate) fn query_unnamed(
+    client: &mut Client,
+    sql: &str,
+) -> std::result::Result<Vec<postgres::Row>, postgres::Error> {
+    client.query_typed(sql, &[])
+}
+
+/// Prepare `sql` without running it, under a text no earlier call sent, so the description is the one this parse fixes.
+pub(crate) fn prepare_fresh(
+    client: &mut Client,
+    sql: &str,
+) -> std::result::Result<postgres::Statement, postgres::Error> {
+    use rand::RngExt;
+    client.prepare(&fresh_text(sql, rand::rng().random::<u64>()))
+}
+
+/// `sql` followed by a comment carrying `nonce`.
+fn fresh_text(sql: &str, nonce: u64) -> String {
+    format!("{sql} /* rivet {nonce:016x} */")
+}
+
 /// RAII guard for an open `BEGIN ... COMMIT` block.
 ///
 /// `commit()` runs `COMMIT` and marks the txn done; if the guard is dropped
@@ -573,7 +595,7 @@ fn pg_run_export(
     loop {
         let requested = ctl.target();
         let fetch_sql = format!("FETCH {} FROM _rivet", requested);
-        let rows = guard.client_mut().query(&fetch_sql, &[])?;
+        let rows = query_unnamed(guard.client_mut(), &fetch_sql)?;
         if !first_fetch_done {
             first_fetch_done = true;
             // The cursor's snapshot is pinned as of the FIRST FETCH, not the
@@ -744,7 +766,7 @@ impl super::Source for PostgresSource {
     }
 
     fn query_scalar(&mut self, sql: &str) -> Result<Option<String>> {
-        let rows = self.client.query(sql, &[])?;
+        let rows = query_unnamed(&mut self.client, sql)?;
         if rows.is_empty() {
             return Ok(None);
         }
@@ -805,7 +827,7 @@ impl super::Source for PostgresSource {
         column_overrides: &ColumnOverrides,
     ) -> Result<Vec<TypeMapping>> {
         let wrapped = format!("SELECT * FROM ({}) AS _rivet_type_probe LIMIT 0", query);
-        let stmt = self.client.prepare(&wrapped)?;
+        let stmt = prepare_fresh(&mut self.client, &wrapped)?;
         let hints = pg_numeric_catalog_hints_opt(&mut self.client, query);
         let mappings = stmt
             .columns()
@@ -1079,6 +1101,16 @@ fn unreadable_probe(pg_type: &str, sql: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_fresh_text_is_the_statement_and_a_comment_no_other_nonce_gives() {
+        let sql = "SELECT * FROM (SELECT 1) AS _rivet_type_probe LIMIT 0";
+        assert_eq!(
+            super::fresh_text(sql, 0xab),
+            "SELECT * FROM (SELECT 1) AS _rivet_type_probe LIMIT 0 /* rivet 00000000000000ab */"
+        );
+        assert_ne!(super::fresh_text(sql, 1), super::fresh_text(sql, 2));
+    }
+
     #[test]
     fn an_unreadable_probe_names_the_type_the_remedy_and_the_probe() {
         assert_eq!(
