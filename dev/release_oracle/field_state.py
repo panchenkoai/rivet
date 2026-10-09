@@ -36,6 +36,7 @@ longer loads, contract, empty table.
 
 from __future__ import annotations
 
+from contextlib import closing
 import json
 import os
 import re
@@ -442,14 +443,19 @@ class _Watch:
 
             self.duck = Duck(state=state)
 
+    def __enter__(self) -> "_Watch":
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        if self.duck is not None:
+            self.duck.close()
+
     def running(self) -> int:
         q = "SELECT count(*) FROM run_status WHERE status = 'running'"
         try:
             if self.duck is not None:
                 return int(self.duck.db.sql(f"SELECT * FROM postgres_query('st', '{q.replace(chr(39), chr(39) * 2)}')").fetchone()[0])
             import sqlite3
-
-            from contextlib import closing
 
             with closing(sqlite3.connect(f"file:{self.state}?mode=ro", uri=True, timeout=1)) as con:
                 return int(con.execute(q).fetchone()[0])
@@ -709,13 +715,13 @@ def stream_cell(led: Ledger, olds: list[tuple[str, Path]], root: Path, engine: s
                 if how == "cleaned":
                     _forget(pfx)
                     left = {}
-                watch = _Watch(state)
-                held = watch.running()
-                if not change():
-                    return fail("setup", "the source change failed")
-                p = e.rivet_killed(olds[-1][1], "run", "-c", "c.yaml", when=lambda: watch.running() > held)
-                if p.returncode != -9 or watch.running() <= held:
-                    return fail("setup", f"the kill missed: v{olds[-1][0]} ended with exit {p.returncode}: {p.why}")
+                with _Watch(state) as watch:
+                    held = watch.running()
+                    if not change():
+                        return fail("setup", "the source change failed")
+                    p = e.rivet_killed(olds[-1][1], "run", "-c", "c.yaml", when=lambda: watch.running() > held)
+                    if p.returncode != -9 or watch.running() <= held:
+                        return fail("setup", f"the kill missed: v{olds[-1][0]} ended with exit {p.returncode}: {p.why}")
                 owed = _touched(cycle)
             ver0, wrote = state_facts(state)
             ckpt = sorted(str(f.relative_to(e.dir)) for f in e.dir.rglob("*.ckpt"))

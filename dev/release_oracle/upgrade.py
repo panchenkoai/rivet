@@ -47,7 +47,7 @@ it too. Oracles: DuckDB over the parts the manifests declare, the source's own c
 
 from __future__ import annotations
 
-from contextlib import closing
+from contextlib import ExitStack, closing
 import glob
 import json
 import os
@@ -483,8 +483,13 @@ class _MongoKeys:
         return v
 
     def drop(self) -> None:
-        with self.client:
-            self.coll.drop()
+        self.coll.drop()
+
+    def __enter__(self) -> "_MongoKeys":
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self.client.close()
 
 
 class _SqlKeys:
@@ -559,93 +564,94 @@ def _continued_key_load_leg(led: Ledger, prev: Path, root: Path, engine: str, ur
     d = root / f"resume-load-{engine}"
     d.mkdir()
     env = {"RIVET_UPG_URL": url, "RIVET_STATE_URL": "", "RIVET_GATE_STATE_URL": ""}
-    if engine == "mongo":
-        try:
-            src = _MongoKeys(url, name)
-        except ImportError:
-            led.skipped(*row, f"{tag}: pymongo absent", "no pymongo")
-            return
-    else:
-        src = _SqlKeys(engine, url, name)
-
-    def step(binary: Path, *args: str) -> Proc | None:
-        p = run([str(binary), *args, "-c", "c.yaml"], env=env, cwd=d, timeout=None)
-        if not p.ok:
-            led.failed(*row, f"{tag}: {' '.join(args)} by {'prev' if binary == prev else 'this'} failed: "
-                       f"{first_error(p.stderr)[:300]}", args[0])
-        return p if p.ok else None
-
-    def loaded() -> list:
-        # The table the load names, matched in BigQuery's own listing (`bq query` caps at 100 rows unless told).
-        ls = run(["bq", f"--project_id={proj}", "ls", "--format=json", "--max_results=100", dset], timeout=300)
-        names = [t["tableReference"]["tableId"] for t in json.loads(ls.stdout or "[]")] if ls.ok else []
-        table = next((t for t in names if t.lower().endswith(name.lower())), None)
-        if table is None:
-            return []
-        key = "_id" if engine == "mongo" else "id"
-        p = run(["bq", f"--project_id={proj}", "query", "--nouse_legacy_sql", "--format=json", "--max_rows=1000000",
-                 f"SELECT CAST({key} AS STRING) k FROM `{proj}.{dset}.{table}`"], timeout=600)
-        return sorted(src.norm(r["k"]) for r in json.loads(p.stdout or "[]")) if p.ok else []
-
-    try:
-        gcp.bq_ensure_dataset(proj, dset)
-        if not src.add(2000):
-            led.failed(*row, f"{tag}: seed failed", "seed")
-            return
+    with ExitStack() as held:
         if engine == "mongo":
-            (d / "c.yaml").write_text(
-                "source:\n  type: mongo\n  url_env: RIVET_UPG_URL\n  mongo:\n    page_size: 500\n    resume: true\n"
-                f"exports:\n  - name: {name}\n    table: {name}\n    mode: full\n    format: parquet\n"
-                f"    destination: {{ type: gcs, bucket: {bucket}, prefix: \"exports/{name}/\" }}\n"
-                f"load:\n  target: bigquery\n  project: {proj}\n  dataset: {dset}\n  pk: auto\n")
+            try:
+                src = held.enter_context(_MongoKeys(url, name))
+            except ImportError:
+                led.skipped(*row, f"{tag}: pymongo absent", "no pymongo")
+                return
         else:
-            # The previous release's own config, with the opt-in it scaffolds commented out switched on.
-            init = run([str(prev), "init", "--source-env", "RIVET_UPG_URL", "--table", name, "--mode", "chunked",
-                        "--gcs-bucket", bucket, "--bigquery-project", proj, "--bigquery-dataset", dset,
-                        "-o", "c.yaml"], env=env, cwd=d)
-            text = (d / "c.yaml").read_text() if init.ok else ""
-            if "# keyset_incremental: true" not in text:
-                led.failed(*row, f"{tag}: previous init wrote no keyset_incremental opt-in: "
-                           f"{first_error(init.stderr)[:300]}", "init")
+            src = _SqlKeys(engine, url, name)
+
+        def step(binary: Path, *args: str) -> Proc | None:
+            p = run([str(binary), *args, "-c", "c.yaml"], env=env, cwd=d, timeout=None)
+            if not p.ok:
+                led.failed(*row, f"{tag}: {' '.join(args)} by {'prev' if binary == prev else 'this'} failed: "
+                           f"{first_error(p.stderr)[:300]}", args[0])
+            return p if p.ok else None
+
+        def loaded() -> list:
+            # The table the load names, matched in BigQuery's own listing (`bq query` caps at 100 rows unless told).
+            ls = run(["bq", f"--project_id={proj}", "ls", "--format=json", "--max_results=100", dset], timeout=300)
+            names = [t["tableReference"]["tableId"] for t in json.loads(ls.stdout or "[]")] if ls.ok else []
+            table = next((t for t in names if t.lower().endswith(name.lower())), None)
+            if table is None:
+                return []
+            key = "_id" if engine == "mongo" else "id"
+            p = run(["bq", f"--project_id={proj}", "query", "--nouse_legacy_sql", "--format=json", "--max_rows=1000000",
+                     f"SELECT CAST({key} AS STRING) k FROM `{proj}.{dset}.{table}`"], timeout=600)
+            return sorted(src.norm(r["k"]) for r in json.loads(p.stdout or "[]")) if p.ok else []
+
+        try:
+            gcp.bq_ensure_dataset(proj, dset)
+            if not src.add(2000):
+                led.failed(*row, f"{tag}: seed failed", "seed")
                 return
-            (d / "c.yaml").write_text(text.replace("# keyset_incremental: true", "keyset_incremental: true", 1))
-        export = re.search(r"^\s*- name: (\S+)", (d / "c.yaml").read_text(), re.M).group(1)
-        for _ in range(2):
-            if not (step(prev, "run") and step(prev, "load")):
+            if engine == "mongo":
+                (d / "c.yaml").write_text(
+                    "source:\n  type: mongo\n  url_env: RIVET_UPG_URL\n  mongo:\n    page_size: 500\n    resume: true\n"
+                    f"exports:\n  - name: {name}\n    table: {name}\n    mode: full\n    format: parquet\n"
+                    f"    destination: {{ type: gcs, bucket: {bucket}, prefix: \"exports/{name}/\" }}\n"
+                    f"load:\n  target: bigquery\n  project: {proj}\n  dataset: {dset}\n  pk: auto\n")
+            else:
+                # The previous release's own config, with the opt-in it scaffolds commented out switched on.
+                init = run([str(prev), "init", "--source-env", "RIVET_UPG_URL", "--table", name, "--mode", "chunked",
+                            "--gcs-bucket", bucket, "--bigquery-project", proj, "--bigquery-dataset", dset,
+                            "-o", "c.yaml"], env=env, cwd=d)
+                text = (d / "c.yaml").read_text() if init.ok else ""
+                if "# keyset_incremental: true" not in text:
+                    led.failed(*row, f"{tag}: previous init wrote no keyset_incremental opt-in: "
+                               f"{first_error(init.stderr)[:300]}", "init")
+                    return
+                (d / "c.yaml").write_text(text.replace("# keyset_incremental: true", "keyset_incremental: true", 1))
+            export = re.search(r"^\s*- name: (\S+)", (d / "c.yaml").read_text(), re.M).group(1)
+            for _ in range(2):
+                if not (step(prev, "run") and step(prev, "load")):
+                    return
+                if not src.add(500):
+                    led.failed(*row, f"{tag}: insert failed", "seed")
+                    return
+            before, damaged = len(src.keys()) - 500, len(loaded())
+            overwrote = damaged < before
+            if not step(rivet_bin(), "run"):
                 return
-            if not src.add(500):
-                led.failed(*row, f"{tag}: insert failed", "seed")
+            first = step(rivet_bin(), "load")
+            if not first:
                 return
-        before, damaged = len(src.keys()) - 500, len(loaded())
-        overwrote = damaged < before
-        if not step(rivet_bin(), "run"):
-            return
-        first = step(rivet_bin(), "load")
-        if not first:
-            return
-        warned = (f"was last loaded as a whole-table overwrite, and export `{export}` now loads by append"
-                  in first.stderr and f"`rivet state reset -c c.yaml --export {export}`" in first.stderr)
-        if warned != overwrote:
-            led.failed(*row, f"{tag}: the previous release left {damaged} of {before} keys "
-                       f"(overwrote={overwrote}) but this binary's first load warned={warned}", "warning")
-            return
-        if overwrote and not (step(rivet_bin(), "state", "reset", "--export", export)
-                              and step(rivet_bin(), "run") and step(rivet_bin(), "load")):
-            return
-        want, got = src.keys(), loaded()
-        said = (f"the previous release overwrote ({damaged} of {before} keys left); this binary's first load "
-                f"warned with the remedy, and the remedy restored" if overwrote else
-                f"the previous release appended ({damaged} of {before} keys); this binary's load stayed silent and kept")
-        if got == want:
-            led.passed(*row, f"{tag}: {said} all {len(want)}")
-        else:
-            led.failed(*row, f"{tag}: warehouse {len(got)} keys (distinct {len(set(got))}) vs source {len(want)} "
-                       f"after {'the remedy' if overwrote else 'the first load'}", "remedy" if overwrote else "append")
-    finally:
-        src.drop()
-        if not os.environ.get("RIVET_UPG_KEEP"):
-            gcp.bq_delete_dataset(proj, dset)
-        gcp.gcs_delete_prefix(bucket, f"exports/{name}/")
+            warned = (f"was last loaded as a whole-table overwrite, and export `{export}` now loads by append"
+                      in first.stderr and f"`rivet state reset -c c.yaml --export {export}`" in first.stderr)
+            if warned != overwrote:
+                led.failed(*row, f"{tag}: the previous release left {damaged} of {before} keys "
+                           f"(overwrote={overwrote}) but this binary's first load warned={warned}", "warning")
+                return
+            if overwrote and not (step(rivet_bin(), "state", "reset", "--export", export)
+                                  and step(rivet_bin(), "run") and step(rivet_bin(), "load")):
+                return
+            want, got = src.keys(), loaded()
+            said = (f"the previous release overwrote ({damaged} of {before} keys left); this binary's first load "
+                    f"warned with the remedy, and the remedy restored" if overwrote else
+                    f"the previous release appended ({damaged} of {before} keys); this binary's load stayed silent and kept")
+            if got == want:
+                led.passed(*row, f"{tag}: {said} all {len(want)}")
+            else:
+                led.failed(*row, f"{tag}: warehouse {len(got)} keys (distinct {len(set(got))}) vs source {len(want)} "
+                           f"after {'the remedy' if overwrote else 'the first load'}", "remedy" if overwrote else "append")
+        finally:
+            src.drop()
+            if not os.environ.get("RIVET_UPG_KEEP"):
+                gcp.bq_delete_dataset(proj, dset)
+            gcp.gcs_delete_prefix(bucket, f"exports/{name}/")
 
 
 def verify_upgrade_continuity(led: Ledger) -> None:

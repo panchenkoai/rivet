@@ -43,10 +43,8 @@ TAG = f"{os.getpid()}"
 CDC_T, BATCH_T, OLTP_T = f"HARM_CDC_{TAG}", f"HARM_BATCH_{TAG}", f"HARM_OLTP_{TAG}"
 BACKLOGS = tuple(int(n) for n in os.environ.get("HARM_ORA_BACKLOGS", "20000,60000,240000,720000").split(","))
 BATCH_ROWS = tuple(int(n) for n in os.environ.get("HARM_ORA_BATCH_ROWS", "150000,1800000").split(","))
-
-
-def connect(user: str = "rivet", password: str = "rivet") -> oracledb.Connection:
-    return oracledb.connect(user=user, password=password, dsn=DSN)
+APP = {"user": "rivet", "password": "rivet", "dsn": DSN}
+SYSTEM = {"user": "system", "password": "rivet", "dsn": DSN}
 
 
 def sql(con: oracledb.Connection, text: str, *binds: object) -> list[tuple]:
@@ -110,8 +108,7 @@ class Writer(threading.Thread):
         self.table, self.next, self.rows, self.stop = table, base, 0, threading.Event()
 
     def run(self) -> None:
-        con = connect()
-        with con.cursor() as cur:
+        with oracledb.connect(**APP) as con, con.cursor() as cur:
             while not self.stop.is_set():
                 cur.executemany(f"INSERT INTO {self.table} (id, v, pad) VALUES (:1, :2, RPAD('x', 100, 'x'))",
                                 [(i, i) for i in range(self.next, self.next + WRITER_BATCH)])
@@ -121,140 +118,139 @@ class Writer(threading.Thread):
 
 
 def cdc_cells() -> dict:
-    app, system = connect(), connect("system", "rivet")
-    sql(app, f"CREATE TABLE {CDC_T} (id NUMBER(18) PRIMARY KEY, v NUMBER(18), pad VARCHAR2(100))")
-    sql(app, f"ALTER TABLE {CDC_T} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS")
-    sql(app, f"GRANT SELECT ON {CDC_T} TO c##rivetcdc")
-    out: dict = {}
-    try:
-        cwd, env = init(f"RIVET.{CDC_T}", CDC_URL, ["--mode", "cdc"])
-        timed_run(cwd, "rivet.yaml", env)  # anchor
-        next_id, delivered, drains = 1, 0, []
-        for backlog in BACKLOGS:
-            seed(app, CDC_T, next_id, next_id + backlog - 1)
-            next_id += backlog
-            wall, rss = timed_run(cwd, "rivet.yaml", env)
-            got = manifest_rows(cwd) - delivered
-            delivered += got
-            if got != backlog:
-                raise SystemExit(f"drain over {backlog} rows declared {got}")
-            drains.append({"backlog": backlog, "wall_s": round(wall, 2), "rows_per_s": round(backlog / wall),
-                           "peak_rss_mb": round(rss, 1)})
-            print(f"cdc drain: {drains[-1]}", flush=True)
-        out["drains"] = drains
+    with oracledb.connect(**APP) as app, oracledb.connect(**SYSTEM) as system:
+        sql(app, f"CREATE TABLE {CDC_T} (id NUMBER(18) PRIMARY KEY, v NUMBER(18), pad VARCHAR2(100))")
+        sql(app, f"ALTER TABLE {CDC_T} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS")
+        sql(app, f"GRANT SELECT ON {CDC_T} TO c##rivetcdc")
+        out: dict = {}
+        try:
+            cwd, env = init(f"RIVET.{CDC_T}", CDC_URL, ["--mode", "cdc"])
+            timed_run(cwd, "rivet.yaml", env)  # anchor
+            next_id, delivered, drains = 1, 0, []
+            for backlog in BACKLOGS:
+                seed(app, CDC_T, next_id, next_id + backlog - 1)
+                next_id += backlog
+                wall, rss = timed_run(cwd, "rivet.yaml", env)
+                got = manifest_rows(cwd) - delivered
+                delivered += got
+                if got != backlog:
+                    raise SystemExit(f"drain over {backlog} rows declared {got}")
+                drains.append({"backlog": backlog, "wall_s": round(wall, 2), "rows_per_s": round(backlog / wall),
+                               "peak_rss_mb": round(rss, 1)})
+                print(f"cdc drain: {drains[-1]}", flush=True)
+            out["drains"] = drains
 
-        bases = iter(range(10_000_000, 10**9, 10_000_000))
+            bases = iter(range(10_000_000, 10**9, 10_000_000))
 
-        def writer_rate(with_drain: bool) -> float:
-            stop = threading.Event()
+            def writer_rate(with_drain: bool) -> float:
+                stop = threading.Event()
 
-            def loop() -> None:
-                while not stop.is_set():
-                    subprocess.run([RIVET_BIN, "run", "--config", "rivet.yaml"], cwd=cwd,
-                                   env={**os.environ, **env}, capture_output=True, text=True)
+                def loop() -> None:
+                    while not stop.is_set():
+                        subprocess.run([RIVET_BIN, "run", "--config", "rivet.yaml"], cwd=cwd,
+                                       env={**os.environ, **env}, capture_output=True, text=True)
 
-            drain = threading.Thread(target=loop, daemon=True)
-            if with_drain:
-                drain.start()
-            w = Writer(CDC_T, next(bases))
-            w.start()
-            time.sleep(SECS)
-            w.stop.set()
-            w.join()
-            stop.set()
-            if with_drain:
-                drain.join(timeout=300)
-            return w.rows / SECS
+                drain = threading.Thread(target=loop, daemon=True)
+                if with_drain:
+                    drain.start()
+                w = Writer(CDC_T, next(bases))
+                w.start()
+                time.sleep(SECS)
+                w.stop.set()
+                w.join()
+                stop.set()
+                if with_drain:
+                    drain.join(timeout=300)
+                return w.rows / SECS
 
-        # Alternated, so drift in the server's own commit rate lands on both sides.
-        pairs = [(writer_rate(False), writer_rate(True)) for _ in range(ROUNDS)]
-        base, under = (statistics.median(p[i] for p in pairs) for i in (0, 1))
-        out["writer_rows_per_s"] = {"baseline": round(base), "under_drain": round(under),
-                                    "throughput_x": round(under / base, 2),
-                                    "rounds": [[round(b), round(u)] for b, u in pairs]}
-        print(f"cdc co-tenancy: {out['writer_rows_per_s']}", flush=True)
-        timed_run(cwd, "rivet.yaml", env)  # drain what the writers left
-        out["retention"] = {
-            "dba_capture_rows": sql(system, "SELECT COUNT(*) FROM dba_capture")[0][0],
-            "logminer_sessions_left": sql(system, "SELECT COUNT(*) FROM v$logmnr_session")[0][0],
-            "capture_user_sessions_left": sql(
-                system, "SELECT COUNT(*) FROM v$session WHERE username = 'C##RIVETCDC'")[0][0],
-        }
-        print(f"cdc retention: {out['retention']}", flush=True)
-    finally:
-        sql(app, f"DROP TABLE {CDC_T} PURGE")
-    return out
+            # Alternated, so drift in the server's own commit rate lands on both sides.
+            pairs = [(writer_rate(False), writer_rate(True)) for _ in range(ROUNDS)]
+            base, under = (statistics.median(p[i] for p in pairs) for i in (0, 1))
+            out["writer_rows_per_s"] = {"baseline": round(base), "under_drain": round(under),
+                                        "throughput_x": round(under / base, 2),
+                                        "rounds": [[round(b), round(u)] for b, u in pairs]}
+            print(f"cdc co-tenancy: {out['writer_rows_per_s']}", flush=True)
+            timed_run(cwd, "rivet.yaml", env)  # drain what the writers left
+            out["retention"] = {
+                "dba_capture_rows": sql(system, "SELECT COUNT(*) FROM dba_capture")[0][0],
+                "logminer_sessions_left": sql(system, "SELECT COUNT(*) FROM v$logmnr_session")[0][0],
+                "capture_user_sessions_left": sql(
+                    system, "SELECT COUNT(*) FROM v$session WHERE username = 'C##RIVETCDC'")[0][0],
+            }
+            print(f"cdc retention: {out['retention']}", flush=True)
+        finally:
+            sql(app, f"DROP TABLE {CDC_T} PURGE")
+        return out
 
 
 def batch_cells() -> dict:
-    app, system = connect(), connect("system", "rivet")
-    sql(app, f"CREATE TABLE {BATCH_T} (id NUMBER(18) PRIMARY KEY, v NUMBER(18), pad VARCHAR2(100))")
-    sql(app, f"CREATE TABLE {OLTP_T} (id NUMBER(18) PRIMARY KEY, v NUMBER(18))")
-    sql(app, f"INSERT INTO {OLTP_T} SELECT LEVEL, LEVEL FROM dual CONNECT BY LEVEL <= 10000")
-    out: dict = {"exports": []}
-    try:
-        have = 0
-        for rows in BATCH_ROWS:
-            for lo in range(have + 1, rows + 1, 100_000):
-                sql(app, f"INSERT INTO {BATCH_T} SELECT {lo} - 1 + LEVEL, LEVEL, RPAD('x', 100, 'x') "
-                         f"FROM dual CONNECT BY LEVEL <= {min(100_000, rows - lo + 1)}")
-            have = rows
-            sql(app, f"BEGIN DBMS_STATS.GATHER_TABLE_STATS(USER, '{BATCH_T}'); END;")
-            cwd, env = init(BATCH_T, APP_URL, [])
-            mode = re.search(r"^\s*mode:\s*(\S+)", open(os.path.join(cwd, "rivet.yaml")).read(), re.M).group(1)
+    with oracledb.connect(**APP) as app, oracledb.connect(**SYSTEM) as system:
+        sql(app, f"CREATE TABLE {BATCH_T} (id NUMBER(18) PRIMARY KEY, v NUMBER(18), pad VARCHAR2(100))")
+        sql(app, f"CREATE TABLE {OLTP_T} (id NUMBER(18) PRIMARY KEY, v NUMBER(18))")
+        sql(app, f"INSERT INTO {OLTP_T} SELECT LEVEL, LEVEL FROM dual CONNECT BY LEVEL <= 10000")
+        out: dict = {"exports": []}
+        try:
+            have = 0
+            for rows in BATCH_ROWS:
+                for lo in range(have + 1, rows + 1, 100_000):
+                    sql(app, f"INSERT INTO {BATCH_T} SELECT {lo} - 1 + LEVEL, LEVEL, RPAD('x', 100, 'x') "
+                             f"FROM dual CONNECT BY LEVEL <= {min(100_000, rows - lo + 1)}")
+                have = rows
+                sql(app, f"BEGIN DBMS_STATS.GATHER_TABLE_STATS(USER, '{BATCH_T}'); END;")
+                cwd, env = init(BATCH_T, APP_URL, [])
+                mode = re.search(r"^\s*mode:\s*(\S+)", open(os.path.join(cwd, "rivet.yaml")).read(), re.M).group(1)
 
-            lat: list[float] = []
-            probing, longest = threading.Event(), [0.0]
-            mine = {r[0] for r in sql(system, "SELECT sid FROM v$session WHERE audsid = SYS_CONTEXT('USERENV','SESSIONID')")}
+                lat: list[float] = []
+                probing, longest = threading.Event(), [0.0]
+                mine = {r[0] for r in sql(system, "SELECT sid FROM v$session WHERE audsid = SYS_CONTEXT('USERENV','SESSIONID')")}
 
-            def probe(sink: list[float]) -> None:
-                con = connect()
-                with con.cursor() as cur:
-                    while probing.is_set():
-                        t0 = time.perf_counter()
-                        cur.execute(f"SELECT v FROM {OLTP_T} WHERE id = :1", [random.randint(1, 10000)])
-                        cur.fetchall()
-                        sink.append(time.perf_counter() - t0)
+                def probe(sink: list[float]) -> None:
+                    with oracledb.connect(**APP) as con, con.cursor() as cur:
+                        while probing.is_set():
+                            t0 = time.perf_counter()
+                            cur.execute(f"SELECT v FROM {OLTP_T} WHERE id = :1", [random.randint(1, 10000)])
+                            cur.fetchall()
+                            sink.append(time.perf_counter() - t0)
 
-            def watch() -> None:
-                con = connect("system", "rivet")
-                while probing.is_set():
-                    r = sql(con, "SELECT NVL(MAX((SYSDATE - sql_exec_start) * 86400), 0) FROM v$session "
-                                 "WHERE username = 'RIVET' AND status = 'ACTIVE' AND sql_exec_start IS NOT NULL "
-                                 f"AND sql_id IN (SELECT sql_id FROM v$sql WHERE sql_text LIKE '%{BATCH_T}%' "
-                                 "AND sql_text NOT LIKE '%v$sql%')")
-                    longest[0] = max(longest[0], float(r[0][0]))
-                    time.sleep(0.1)
+                def watch() -> None:
+                    with oracledb.connect(**SYSTEM) as con:
+                        while probing.is_set():
+                            r = sql(con, "SELECT NVL(MAX((SYSDATE - sql_exec_start) * 86400), 0) FROM v$session "
+                                         "WHERE username = 'RIVET' AND status = 'ACTIVE' AND sql_exec_start IS NOT NULL "
+                                         f"AND sql_id IN (SELECT sql_id FROM v$sql WHERE sql_text LIKE '%{BATCH_T}%' "
+                                         "AND sql_text NOT LIKE '%v$sql%')")
+                            longest[0] = max(longest[0], float(r[0][0]))
+                            time.sleep(0.1)
 
-            base: list[float] = []
-            probing.set()
-            t = threading.Thread(target=probe, args=(base,), daemon=True)
-            t.start()
-            time.sleep(min(SECS, 5))
-            probing.clear()
-            t.join()
+                base: list[float] = []
+                probing.set()
+                t = threading.Thread(target=probe, args=(base,), daemon=True)
+                t.start()
+                time.sleep(min(SECS, 5))
+                probing.clear()
+                t.join()
 
-            probing.set()
-            threads = [threading.Thread(target=probe, args=(lat,), daemon=True), threading.Thread(target=watch, daemon=True)]
-            for th in threads:
-                th.start()
-            wall, rss = timed_run(cwd, "rivet.yaml", env)
-            probing.clear()
-            for th in threads:
-                th.join()
-            got = manifest_rows(cwd)
-            if got != rows:
-                raise SystemExit(f"export of {rows} rows declared {got}")
-            p99 = lambda xs: statistics.quantiles(xs, n=100)[98] * 1000  # noqa: E731
-            cell = {"rows": rows, "mode": mode, "wall_s": round(wall, 2), "rows_per_s": round(rows / wall),
-                    "peak_rss_mb": round(rss, 1), "oltp_p99_ms": {"baseline": round(p99(base), 2), "under_export": round(p99(lat), 2)},
-                    "oltp_p99_x": round(p99(lat) / p99(base), 2), "longq_s": round(longest[0], 1), "mine": len(mine)}
-            out["exports"].append(cell)
-            print(f"batch export: {cell}", flush=True)
-    finally:
-        sql(app, f"DROP TABLE {BATCH_T} PURGE")
-        sql(app, f"DROP TABLE {OLTP_T} PURGE")
-    return out
+                probing.set()
+                threads = [threading.Thread(target=probe, args=(lat,), daemon=True), threading.Thread(target=watch, daemon=True)]
+                for th in threads:
+                    th.start()
+                wall, rss = timed_run(cwd, "rivet.yaml", env)
+                probing.clear()
+                for th in threads:
+                    th.join()
+                got = manifest_rows(cwd)
+                if got != rows:
+                    raise SystemExit(f"export of {rows} rows declared {got}")
+                p99 = lambda xs: statistics.quantiles(xs, n=100)[98] * 1000  # noqa: E731
+                cell = {"rows": rows, "mode": mode, "wall_s": round(wall, 2), "rows_per_s": round(rows / wall),
+                        "peak_rss_mb": round(rss, 1), "oltp_p99_ms": {"baseline": round(p99(base), 2), "under_export": round(p99(lat), 2)},
+                        "oltp_p99_x": round(p99(lat) / p99(base), 2), "longq_s": round(longest[0], 1), "mine": len(mine)}
+                out["exports"].append(cell)
+                print(f"batch export: {cell}", flush=True)
+        finally:
+            sql(app, f"DROP TABLE {BATCH_T} PURGE")
+            sql(app, f"DROP TABLE {OLTP_T} PURGE")
+        return out
 
 
 def main() -> None:

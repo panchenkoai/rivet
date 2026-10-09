@@ -302,17 +302,17 @@ def _stamped(prev: list[str], cur: list[str]) -> Stamped:
 
     if not prev or not cur:
         return Stamped((len(prev), len(cur)), (None, None), (0, 0), None, None, None)
-    con = duckdb.connect()
-    one = lambda q, *a: con.execute(q, list(a)).fetchone()[0]  # noqa: E731
-    schemas = (_shape(con, prev), _shape(con, cur))
-    rows = (one("SELECT count(*) FROM read_parquet(?)", prev), one("SELECT count(*) FROM read_parquet(?)", cur))
-    if schemas[0] != schemas[1] or STAMP not in [name for name, _ in schemas[1][0]]:
-        return Stamped((len(prev), len(cur)), schemas, rows, None, None, None)
-    rest = f"SELECT * EXCLUDE ({STAMP}) FROM read_parquet(?)"
-    only = (one(f"SELECT count(*) FROM ({rest} EXCEPT ALL {rest})", prev, cur),
-            one(f"SELECT count(*) FROM ({rest} EXCEPT ALL {rest})", cur, prev))
-    return Stamped((len(prev), len(cur)), schemas, rows, only,
-                   one(f"SELECT max({STAMP}) FROM read_parquet(?)", prev), one(f"SELECT min({STAMP}) FROM read_parquet(?)", cur))
+    with duckdb.connect() as con:
+        one = lambda q, *a: con.execute(q, list(a)).fetchone()[0]  # noqa: E731
+        schemas = (_shape(con, prev), _shape(con, cur))
+        rows = (one("SELECT count(*) FROM read_parquet(?)", prev), one("SELECT count(*) FROM read_parquet(?)", cur))
+        if schemas[0] != schemas[1] or STAMP not in [name for name, _ in schemas[1][0]]:
+            return Stamped((len(prev), len(cur)), schemas, rows, None, None, None)
+        rest = f"SELECT * EXCLUDE ({STAMP}) FROM read_parquet(?)"
+        only = (one(f"SELECT count(*) FROM ({rest} EXCEPT ALL {rest})", prev, cur),
+                one(f"SELECT count(*) FROM ({rest} EXCEPT ALL {rest})", cur, prev))
+        return Stamped((len(prev), len(cur)), schemas, rows, only,
+                       one(f"SELECT max({STAMP}) FROM read_parquet(?)", prev), one(f"SELECT min({STAMP}) FROM read_parquet(?)", cur))
 
 
 def _same_parts(prev: Path, root: Path, engine: str, url: str, table: str, mode: str, stamped: bool) -> tuple[str | None, int]:

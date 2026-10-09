@@ -239,8 +239,8 @@ def _http_reachable(url: str, timeout: float = 3.0) -> bool:
     connection / timeout means down, so HTTPError is UP and URLError is DOWN.
     """
     try:
-        urllib.request.urlopen(url, timeout=timeout).close()
-        return True
+        with urllib.request.urlopen(url, timeout=timeout):
+            return True
     except urllib.error.HTTPError:
         return True
     except (urllib.error.URLError, OSError):

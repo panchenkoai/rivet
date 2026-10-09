@@ -58,17 +58,17 @@ def main(argv: list[str]) -> int:
         return 2
     if sql.strip().startswith(".read "):
         sql = Path(sql.strip()[len(".read "):].strip()).read_text()
-    con = duckdb.connect()
-    try:
-        for stmt in duckdb.extract_statements(sql):
-            rel = con.sql(stmt.query)
-            if rel is not None:
-                _render(con, rel, "list" if mode == "box" else mode, header, sys.stdout)
-    except duckdb.Error as e:
-        sys.stdout.flush()
-        print(str(e), file=sys.stderr)
-        return 1
-    return 0
+    with duckdb.connect() as con:
+        try:
+            for stmt in duckdb.extract_statements(sql):
+                rel = con.sql(stmt.query)
+                if rel is not None:
+                    _render(con, rel, "list" if mode == "box" else mode, header, sys.stdout)
+        except duckdb.Error as e:
+            sys.stdout.flush()
+            print(str(e), file=sys.stderr)
+            return 1
+        return 0
 
 
 if __name__ == "__main__":

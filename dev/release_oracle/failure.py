@@ -46,11 +46,13 @@ VER = "stand"
 
 
 # ── small helpers ────────────────────────────────────────────────────────────
+@contextmanager
 def Oracle(**kw):  # noqa: N802
     """The harness DuckDB session, imported lazily so `--self-test` runs on bare python3."""
     from .duck import Oracle as _Oracle
 
-    return _Oracle(**kw)
+    with _Oracle(**kw) as o:
+        yield o
 
 
 def _token() -> str:
@@ -339,28 +341,27 @@ def _mongo_case(led: Ledger, tok: str) -> None:
                     f"failed_run_tail[{key}]: pymongo not importable (run through uv)", "no pymongo")
         return
     db, coll = f"frt_{tok}", "bench"
-    client = pymongo.MongoClient(MONGO_URL, serverSelectionTimeoutMS=5000)
-    work = work_dir() / f"failed_run_tail_{key}_{tok}"
-    work.mkdir(parents=True, exist_ok=True)
-    try:
-        client[db][coll].insert_many([{"_id": i, "v": f"row{i}"} for i in range(1, 4001)])
-        cfg, out = _write_cfg(
-            work, f"frt_mongo_{tok}",
-            f"source:\n  type: mongo\n  url: \"{MONGO_URL}/{db}\"\n  mongo: {{ page_size: 500 }}",
-            f"table: {coll}", ["mode: full", "parallel: 4"])
-        before = _parquet(out)
-        p = _rivet_run(cfg, {"RIVET_TEST_ERROR_AT": "mongo_parallel_worker:1"})
-        g = _grade_failed(p, cfg, out, f"frt_mongo_{tok}", before, "RIVET_TEST_ERROR_AT")
-        g.need(len(_parquet(out) - before) > 0,
-               "fixture inert: the surviving workers wrote no part")
-        src = (client[db][coll].count_documents({}), len(client[db][coll].distinct("_id")))
-        g.problems += _clean_rerun(cfg, out, src, "_id")
-        _finish(led, "mongo", "failed_run_tail", key, g.problems,
-                "mongo_parallel_worker:1 — exit≠0, manifest failed, validate names "
-                "RUN_NOT_SUCCESSFUL, files_committed == disk; clean re-run == source", t0)
-    finally:
-        client.drop_database(db)
-        client.close()
+    with pymongo.MongoClient(MONGO_URL, serverSelectionTimeoutMS=5000) as client:
+        work = work_dir() / f"failed_run_tail_{key}_{tok}"
+        work.mkdir(parents=True, exist_ok=True)
+        try:
+            client[db][coll].insert_many([{"_id": i, "v": f"row{i}"} for i in range(1, 4001)])
+            cfg, out = _write_cfg(
+                work, f"frt_mongo_{tok}",
+                f"source:\n  type: mongo\n  url: \"{MONGO_URL}/{db}\"\n  mongo: {{ page_size: 500 }}",
+                f"table: {coll}", ["mode: full", "parallel: 4"])
+            before = _parquet(out)
+            p = _rivet_run(cfg, {"RIVET_TEST_ERROR_AT": "mongo_parallel_worker:1"})
+            g = _grade_failed(p, cfg, out, f"frt_mongo_{tok}", before, "RIVET_TEST_ERROR_AT")
+            g.need(len(_parquet(out) - before) > 0,
+                   "fixture inert: the surviving workers wrote no part")
+            src = (client[db][coll].count_documents({}), len(client[db][coll].distinct("_id")))
+            g.problems += _clean_rerun(cfg, out, src, "_id")
+            _finish(led, "mongo", "failed_run_tail", key, g.problems,
+                    "mongo_parallel_worker:1 — exit≠0, manifest failed, validate names "
+                    "RUN_NOT_SUCCESSFUL, files_committed == disk; clean re-run == source", t0)
+        finally:
+            client.drop_database(db)
 
 
 def verify_failed_run_tail(led: Ledger) -> None:
