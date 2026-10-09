@@ -94,6 +94,24 @@ class Shape:
 
 
 _RANGE = (r"chunk_by_key: (\w+)", r"chunk_column: \1")
+
+
+@dataclass(frozen=True)
+class Absent:
+    """What every release older than `since` lacks, and what its own binary must answer when asked for it."""
+
+    what: str
+    since: str
+    says: str
+
+
+#: (engine or warehouse, capability) -> the release it arrives in. `lacks` checks the evidence on every row it settles.
+ABSENT: dict[tuple[str, str], Absent] = {
+    ("oracle", "source"): Absent("Oracle source", "0.30.0", r"Unsupported source URL scheme\..*got: oracle://"),
+    ("oracle", "stream"): Absent("Oracle CDC stream a `load:` block may follow", "0.31.0",
+                                 r"\[RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED\].*loading an Oracle CDC stream is not supported yet"),
+    ("clickhouse", "warehouse"): Absent("`init --clickhouse-url`", "0.30.0", r"unexpected argument '--clickhouse-url'"),
+}
 SHAPES = (
     Shape("keyset-incremental", "chunked", ((r"# keyset_incremental: true", "keyset_incremental: true"),), True),
     Shape("incremental", "incremental", (), True),
@@ -189,6 +207,24 @@ def fetch(cache: Path) -> int:
         print(f"  {said} -> {binary_in(cache, v)}")
         rc = rc or (0 if f" {v} " in f"{said} " else 1)
     return rc
+
+
+def lacks(led: Ledger, row: tuple, name: str, ver: str, key: tuple[str, str], p: Proc) -> bool:
+    """True when ABSENT settles the row: release `ver` predates `key` and its step `p` refuses as recorded (SKIP) or does not (FAIL, a stale entry)."""
+    a = ABSENT.get(key)
+    if a is None or _key(ver) >= _key(a.since):
+        return False
+    if not p.ok and re.search(a.says, p.out):
+        led.skipped(*row, f"{name}: v{ver} has no {a.what} (it arrives in v{a.since}): {p.why}", f"absent {key[1]}")
+    else:
+        led.failed(*row, f"{name}: stale exclusion — ABSENT says v{ver} has no {a.what}, and its own answer is not /{a.says}/: "
+                         f"{p.why if not p.ok else 'the step succeeded'}", "stale exclusion")
+    return True
+
+
+def having(releases: list[tuple[str, Path]], *keys: tuple[str, str]) -> list[tuple[str, Path]]:
+    """The releases that predate none of the ABSENT entries among `keys`."""
+    return [r for r in releases if all(_key(r[0]) >= _key(ABSENT[k].since) for k in keys if k in ABSENT)]
 
 
 def old_releases(led: Ledger) -> list[tuple[str, Path]]:
@@ -352,8 +388,8 @@ def _forget(prefix: str) -> None:
 class _Table:
     """A source table of ids 1..n with `v` and a cursor column that grows with the id."""
 
-    def __init__(self, engine: str, url: str, name: str):
-        self.engine, self.url, self.name, self.n = engine, url, name, 0
+    def __init__(self, engine: str, url: str, name: str, int_key: bool = False):
+        self.engine, self.url, self.name, self.n, self.int_key = engine, url, name, 0, int_key
 
     def add(self, n: int) -> bool:
         from .engines import sql
@@ -362,10 +398,10 @@ class _Table:
 
         hi = self.n + n
         if self.n == 0:
-            ok = _seed(self.engine, self.url, self.name, hi, with_cursor=True)
+            ok = _seed(self.engine, self.url, self.name, hi, with_cursor=True, int_key=self.int_key)
         else:
             tmp = f"{self.name}_add"
-            ok = _seed(self.engine, self.url, tmp, hi, with_cursor=True) and sql(
+            ok = _seed(self.engine, self.url, tmp, hi, with_cursor=True, int_key=self.int_key) and sql(
                 self.engine, self.url, f"INSERT INTO {self.name} (id, v, updated_at) SELECT id, v, updated_at "
                                        f"FROM {tmp} WHERE id > {self.n}").ok
             _drop(self.engine, self.url, tmp)
@@ -520,7 +556,7 @@ def batch_cell(led: Ledger, olds: list[tuple[str, Path]], prev: Path | None, roo
         state_url = isolate_state_db(state_url, tag) or ""
         if not state_url:
             return led.failed(*row, f"{name}: could not create a fresh Postgres state DB for the old release", "no state db")
-    src = _Table(engine, url, _case(engine, f"fs_{tag}"))
+    src = _Table(engine, url, _case(engine, f"fs_{tag}"), int_key=_RANGE in shape.edits)
 
     def fail(kind: str, why: str) -> None:
         led.failed(*row, f"{name}: {kind} — {why}", kind)
@@ -530,6 +566,8 @@ def batch_cell(led: Ledger, olds: list[tuple[str, Path]], prev: Path | None, roo
             return fail("setup", "the seed failed")
         e = _Env(olds[0][1], root, engine, url, src.name, shape.mode, state_url)
         cfg, out = e.dir / "c.yaml", e.dir / "output"
+        if lacks(led, row, name, olds[0][0], (engine, "source"), e.init):
+            return
         text = edited(cfg.read_text(), shape.edits) if e.init.ok else None
         if text is None:
             return fail("setup", f"v{olds[0][0]} init wrote no config this shape can be made from: {e.init.why if not e.init.ok else shape.edits}")
@@ -660,6 +698,8 @@ def stream_cell(led: Ledger, olds: list[tuple[str, Path]], root: Path, engine: s
                      extra=(*src.init_args, "--gcs-bucket", BUCKET, "--bigquery-project", "field-state",
                             "--bigquery-dataset", "field_state"), env=src.env)
             cfg = e.dir / "c.yaml"
+            if lacks(led, row, name, olds[0][0], (engine, "source"), e.init):
+                return
             text = isolated(cfg.read_text(), pfx, src.slot) if e.init.ok else None
             text = with_endpoint(text) if text else None
             if text and baseline == "snapshot":
@@ -699,6 +739,8 @@ def stream_cell(led: Ledger, olds: list[tuple[str, Path]], root: Path, engine: s
                 read = None
             else:
                 p = e.rivet(olds[0][1], "run", "-c", "c.yaml")
+                if lacks(led, row, name, olds[0][0], (engine, "stream"), p):
+                    return
                 if not p.ok:
                     return fail("setup", f"v{olds[0][0]} failed its own baseline run: {p.why}")
                 for ver, b in olds:
@@ -874,6 +916,15 @@ class _World:
             _forget(self.pfx)
 
 
+def _unbuilt(led: Ledger, row: tuple, name: str, ver: str, w: _World) -> bool:
+    """True when release `ver` built no world: ABSENT settles the row, or the row fails as setup."""
+    if lacks(led, row, name, ver, (w.target, "warehouse"), w.e.init):
+        return True
+    if w.why:
+        led.failed(*row, f"{name}: setup — v{ver} init wrote no config for this warehouse: {w.why}", "setup")
+    return bool(w.why)
+
+
 def _warehouse_down(target: str) -> str:
     """Why `target` cannot be loaded into here, or ''."""
     from .scenarios import store_up
@@ -915,8 +966,7 @@ def contract_cell(led: Ledger, releases: list[tuple[str, Path]], root: Path, url
                     return led.failed(*row, f"field[contract/mysql/{target}]: setup — could not create and seed {t}", "setup")
             for i, (ver, old) in enumerate(releases):
                 pair = tuple(_World(root, f"{tag}v{i}{side}", 2 * i + j, target, old, src, tables) for j, side in enumerate("wi"))
-                if pair[0].why:
-                    led.skipped(*row, f"field[v{ver}][contract/mysql/{target}]: v{ver} init writes no config for this warehouse: {pair[0].why}", "init refused")
+                if _unbuilt(led, row, f"field[v{ver}][contract/mysql/{target}]", ver, pair[0]):
                     for w in pair:
                         w.close()
                     continue
@@ -1002,8 +1052,7 @@ def empty_table_cell(led: Ledger, releases: list[tuple[str, Path]], root: Path, 
                 return led.failed(*row, f"field[mysql/empty-at-baseline/{target}]: setup — could not create the tables", "setup")
             for i, (ver, old) in enumerate(releases):
                 w = _World(root, f"{tag}v{i}", 100 + i, target, old, src, [kept, empty])
-                if w.why:
-                    led.skipped(*row, f"field[v{ver}][mysql/empty-at-baseline/{target}]: v{ver} init writes no config for this warehouse: {w.why}", "init refused")
+                if _unbuilt(led, row, f"field[v{ver}][mysql/empty-at-baseline/{target}]", ver, w):
                     w.close()
                     continue
                 worlds[ver] = w
@@ -1065,7 +1114,15 @@ def cells(releases: list[tuple[str, Path]], root: Path, states: list[str]) -> li
 
     out: list[tuple[object, str, Callable[[Ledger], None]]] = []
     prev = releases[-1][1] if releases else None
-    sides = [[r] for r in releases] + ([releases] if len(releases) > 1 else [])
+
+    def sides(engine: str, kind: str, *keys: tuple[str, str]) -> list[list[tuple[str, Path]]]:
+        ladder = having(releases, *keys)
+        if len(ladder) < 2 <= len(releases):
+            n = f"field[ladder][{engine}/{kind}]"
+            out.append((None, n, lambda led: led.skipped(engine, "-", SCEN, "-", f"{n}: {len(ladder)} of the {len(releases)} "
+                                                         f"releases can build it (ABSENT) — no ladder to climb", "no ladder")))
+        return [[r] for r in releases] + ([ladder] if len(ladder) > 1 else [])
+
     for engine in ENGINES:
         var = f"RIVET_ORACLE_{engine.upper()}_URL"
         url = os.environ.get(var, "")
@@ -1073,7 +1130,7 @@ def cells(releases: list[tuple[str, Path]], root: Path, states: list[str]) -> li
             out.append((None, f"field[{engine}/batch]", lambda led, e=engine, v=var: led.skipped(
                 e, "-", SCEN, "-", f"field[{e}/batch]: no {v}", "no url")))
             continue
-        for olds in sides:
+        for olds in sides(engine, "batch", (engine, "source")):
             for shape in SHAPES:
                 if len(olds) > 1 and not shape.delta:
                     continue
@@ -1089,7 +1146,7 @@ def cells(releases: list[tuple[str, Path]], root: Path, states: list[str]) -> li
         url = os.environ[envs[0]]
         recipes = [("recipes", "cleaned"), ("recipes", ""), ("recipes", "killed-baseline")] if engine in RECIPE_ENGINES else []
         kinds = [*recipes, ("snapshot", "")]
-        for olds in sides:
+        for olds in sides(engine, "stream", (engine, "source"), (engine, "stream")):
             for baseline, how in kinds:
                 if len(olds) > 1 and (baseline, how) != kinds[0]:
                     continue
@@ -1197,6 +1254,28 @@ def _self_test() -> None:
     line = "a clean cycle · load: exit 1; 1x LOAD FAILED -> exit 0; 1x CDC LOAD OK"
     assert differences(was, was) == [] and differences(was, now) == [(line, line in ACCEPTED_DIFFERENCES)], differences(was, now)
     assert all(why.strip() for why in ACCEPTED_DIFFERENCES.values()), "an accepted difference has no reason"
+    class _Rows:
+        def __init__(self):
+            self.got: list[tuple[str, str]] = []
+
+        def skipped(self, *a):
+            self.got.append(("skip", a[4]))
+
+        def failed(self, *a):
+            self.got.append(("fail", a[4]))
+
+    no_ora = Proc(["rivet", "init"], 1, "", "Error: Unsupported source URL scheme. Expected postgresql://, got: oracle://REDACTED@h/x\n")
+    key, r = ("oracle", "source"), ("oracle", "-", SCEN, "-")
+    for ver, p, want in (("0.29.0", no_ora, "skip"), ("0.29.0", Proc(["rivet"], 0, "", ""), "fail"),
+                         ("0.29.0", Proc(["rivet"], 1, "", "Error: connection refused\n"), "fail"), ("0.30.0", no_ora, None)):
+        rec = _Rows()
+        assert lacks(rec, r, "n", ver, key, p) == (want is not None) and [k for k, _ in rec.got] == [want][:want is not None], (ver, rec.got)
+    assert not lacks(_Rows(), r, "n", "0.1.0", ("postgres", "source"), no_ora)
+    rel = [(v, Path(v)) for v in ("0.29.0", "0.30.0", "0.31.0")]
+    assert [v for v, _ in having(rel, key)] == ["0.30.0", "0.31.0"] and having(rel, ("postgres", "source")) == rel
+    assert [v for v, _ in having(rel, key, ("oracle", "stream"))] == ["0.31.0"]
+    for a in ABSENT.values():
+        assert _key(a.since) > _key(COMPATIBILITY_FLOOR), f"an ABSENT entry no field release predates: {a}"
     assert binary_in(Path("c"), "1.2.3").parts[-2].startswith("rivet-v1.2.3-") and field_cache(Path("c/rivet-v9/rivet")) == Path("c/field")
     names = [n for _, n, _ in cells([("0.1.0", Path("a")), ("0.2.0", Path("b"))], Path(tempfile.gettempdir()), [""])]
     assert len(names) == len([n for n in names if n.startswith("field[")]) > 0
