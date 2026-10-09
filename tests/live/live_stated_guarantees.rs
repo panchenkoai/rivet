@@ -515,6 +515,7 @@ fn is_one_page(longest: u64, total: u64, pages: u64) -> bool {
 #[derive(Clone, Copy)]
 enum Holds {
     OnePage,
+    #[cfg(feature = "oracle")]
     LessThanHalf,
     TheTable,
 }
@@ -587,6 +588,7 @@ fn mode_full_documents_the_longest_statement_it_holds(engine: SqlEngine, holds: 
     let (longest, total) = longest_answer_of_a_run(rig, engine.url(), engine.default_port());
     let held = match holds {
         Holds::OnePage => is_one_page(longest, total, WIRE_PAGES),
+        #[cfg(feature = "oracle")]
         Holds::LessThanHalf => !is_most_of_the_table(longest, total),
         Holds::TheTable => is_most_of_the_table(longest, total),
     };
