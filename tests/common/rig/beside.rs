@@ -78,6 +78,46 @@ pub(crate) fn not_taken_away(
     })
 }
 
+/// The part paths more than one of `manifests` (parsed manifest documents) declares, sorted.
+pub(crate) fn declared_twice(manifests: &[serde_json::Value]) -> Vec<String> {
+    let mut seen = std::collections::BTreeMap::<&str, usize>::new();
+    for part in manifests
+        .iter()
+        .filter_map(|m| m["parts"].as_array())
+        .flatten()
+    {
+        if let Some(path) = part["path"].as_str() {
+            *seen.entry(path).or_default() += 1;
+        }
+    }
+    seen.into_iter()
+        .filter(|(_, n)| *n > 1)
+        .map(|(p, _)| p.to_string())
+        .collect()
+}
+
+/// The parts of `manifest` whose name does not hold the stamp of the run that declares them (run id `<export>_<yyyymmdd>T<hhmmss>.<mmm>_<pid>`, stamp `<yyyymmdd>_<hhmmss>_<mmm>_<pid>`, a nonce after it), sorted.
+pub(crate) fn not_named_by_its_run(manifest: &serde_json::Value) -> Vec<String> {
+    let (run_id, export) = (
+        manifest["run_id"].as_str().unwrap_or_default(),
+        manifest["export_name"].as_str().unwrap_or_default(),
+    );
+    let stamp = run_id
+        .strip_prefix(export)
+        .unwrap_or(run_id)
+        .replace(['T', '.'], "_");
+    let mut odd: Vec<String> = manifest["parts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|p| p["path"].as_str())
+        .filter(|path| !path.starts_with(&format!("{export}{stamp}_")))
+        .map(str::to_string)
+        .collect();
+    odd.sort();
+    odd
+}
+
 /// A local resource made read-only until dropped: the rule that names its paths, and the write bits taken.
 pub struct ReadOnly {
     what: Local,
@@ -104,6 +144,108 @@ impl Drop for ReadOnly {
     fn drop(&mut self) {
         chmod(self.paths(), |mode| mode | self.bits);
     }
+}
+
+/// A small volume of its own that a cell fills and frees: a disk image mounted for the cell, detached on drop.
+pub struct TinyVolume {
+    at: tempfile::TempDir,
+}
+
+impl TinyVolume {
+    /// Mount a volume of `megabytes`; `None`, with the skip recorded, where the cell cannot mount one.
+    pub fn mounted(megabytes: u32) -> Option<Self> {
+        if !cfg!(target_os = "macos") {
+            crate::common::skip_live(
+                "no volume this cell may fill: it mounts a disk image with macOS `hdiutil` (a Linux tmpfs needs root)",
+            );
+            return None;
+        }
+        let at = tempfile::tempdir().expect("a mount point");
+        let image = at.path().join("volume.dmg");
+        let mount = at.path().join("mnt");
+        std::fs::create_dir(&mount).expect("mkdir the mount point");
+        let hdiutil = |args: &[&str]| {
+            let out = std::process::Command::new("hdiutil")
+                .args(args)
+                .output()
+                .expect("run hdiutil");
+            assert!(
+                out.status.success(),
+                "hdiutil {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let (size, image, mount) = (
+            format!("{megabytes}m"),
+            image.to_string_lossy().to_string(),
+            mount.to_string_lossy().to_string(),
+        );
+        hdiutil(&[
+            "create", "-size", &size, "-fs", "HFS+", "-volname", "rivet", "-quiet", &image,
+        ]);
+        hdiutil(&[
+            "attach",
+            "-nobrowse",
+            "-quiet",
+            "-mountpoint",
+            &mount,
+            &image,
+        ]);
+        Some(Self { at })
+    }
+
+    /// The root of the volume.
+    pub fn path(&self) -> PathBuf {
+        self.at.path().join("mnt")
+    }
+
+    /// Fill the volume, again while a writer beside the cell frees what it staged; panics unless a write to it is then refused.
+    pub fn fill(&self) {
+        use std::io::Write as _;
+        let mut ballast = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.path().join(".ballast"))
+            .expect("open the ballast");
+        let mut takes = |bytes: usize| {
+            let block = vec![0u8; bytes];
+            ballast
+                .write_all(&block)
+                .and_then(|()| ballast.sync_data())
+                .is_ok()
+        };
+        for _ in 0..20 {
+            for bytes in [1 << 16, 512] {
+                while takes(bytes) {}
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        if let Some(why) = not_filled(takes(8192)) {
+            panic!("{why}");
+        }
+    }
+
+    /// Give the space back.
+    pub fn free(&self) {
+        std::fs::remove_file(self.path().join(".ballast")).expect("remove the ballast");
+    }
+}
+
+impl Drop for TinyVolume {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("hdiutil")
+            .args(["detach", "-quiet", "-force"])
+            .arg(self.path())
+            .output();
+    }
+}
+
+/// Why a volume a cell filled is not full, else `None`: a further write must be refused.
+pub(crate) fn not_filled(still_writable: bool) -> Option<String> {
+    still_writable.then(|| {
+        "sabotage: the volume still takes a write after it was filled: nothing was taken away"
+            .to_string()
+    })
 }
 
 /// The SQLite state files in `dir`.
@@ -209,6 +351,41 @@ impl Rig {
         }
     }
 
+    /// Start `n` `rivet run` of this rig back to back and reap them once all have ended: what each printed and its exit, each graded like any other run.
+    pub fn runs_at_once(&self, n: usize) -> Vec<std::process::Output> {
+        let mut live: Vec<Spawned<'_>> = (0..n).map(|_| self.spawn_args_env(&[], &[])).collect();
+        for run in &mut live {
+            std::process::Child::wait(run).expect("wait for a run started beside another");
+        }
+        live.into_iter()
+            .map(|run| run.wait_with_output().expect("reap the run"))
+            .collect()
+    }
+
+    /// The part paths more than one run-unique manifest of this rig's local destination declares: one file two runs both claim.
+    pub fn parts_declared_twice(&self) -> Vec<String> {
+        declared_twice(&self.manifests())
+    }
+
+    /// The declared parts of this rig's local destination that are not named after the run that declares them.
+    pub fn parts_not_named_by_their_run(&self) -> Vec<String> {
+        self.manifests()
+            .iter()
+            .flat_map(not_named_by_its_run)
+            .collect()
+    }
+
+    /// Every run-unique manifest of this rig's local destination, parsed.
+    fn manifests(&self) -> Vec<serde_json::Value> {
+        crate::common::parquet::declared_manifests(&self.out_dir())
+            .iter()
+            .map(|m| {
+                serde_json::from_slice(&std::fs::read(m).expect("read a manifest"))
+                    .expect("a JSON manifest")
+            })
+            .collect()
+    }
+
     /// Delete the lease files of this rig's SQLite state (what a live checkpointed run locks); panics when there is none.
     pub fn delete_lease_files(&self) -> usize {
         let cfg = self.config_path();
@@ -302,6 +479,41 @@ mod tests {
     }
 
     #[test]
+    fn a_part_two_manifests_declare_is_found_and_one_each_is_not() {
+        let m = |paths: &[&str]| serde_json::json!({ "parts": paths.iter().map(|p| serde_json::json!({ "path": p })).collect::<Vec<_>>() });
+        assert_eq!(
+            declared_twice(&[m(&["a.parquet"]), m(&["b.parquet", "a.parquet"])]),
+            ["a.parquet"]
+        );
+        assert!(declared_twice(&[m(&["a.parquet"]), m(&["b.parquet"]), m(&[])]).is_empty());
+        assert!(declared_twice(&[serde_json::json!({})]).is_empty());
+    }
+
+    #[test]
+    fn a_part_is_named_by_its_run_only_when_it_holds_the_run_stamp() {
+        let m = |paths: &[&str]| {
+            serde_json::json!({
+                "run_id": "orders_20261008T174117.653_33972",
+                "export_name": "orders",
+                "parts": paths.iter().map(|p| serde_json::json!({ "path": p })).collect::<Vec<_>>(),
+            })
+        };
+        let own = [
+            "orders_20261008_174117_653_33972_9f3a1c0b5d7e2a41.parquet",
+            "orders_20261008_174117_653_33972_9f3a1c0b5d7e2a41_part1.parquet",
+        ];
+        assert!(not_named_by_its_run(&m(&own)).is_empty());
+        let other = [
+            "orders_20261008_174117_653_33973_9f3a1c0b5d7e2a41.parquet",
+            "orders_20261008_174122_776.parquet",
+        ];
+        assert_eq!(
+            not_named_by_its_run(&m(&[own[0], other[1], other[0]])),
+            other
+        );
+    }
+
+    #[test]
     fn a_read_only_destination_refuses_a_write_until_the_guard_goes() {
         let rig = Rig::pg_batch("beside_read_only");
         let out = rig.out_dir();
@@ -354,5 +566,23 @@ mod tests {
             outlived: false,
         };
         let _ = met.answered_while_alive();
+    }
+
+    #[test]
+    fn a_volume_that_still_takes_a_write_was_not_filled() {
+        assert!(not_filled(true).is_some_and(|why| why.contains("nothing was taken away")));
+        assert_eq!(not_filled(false), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_filled_volume_refuses_a_write_until_it_is_freed() {
+        let volume = TinyVolume::mounted(4).expect("macOS mounts one");
+        let file = volume.path().join("part");
+        std::fs::write(&file, [0u8; 8192]).expect("an empty volume takes a write");
+        volume.fill();
+        assert!(std::fs::write(&file, [0u8; 65536]).is_err());
+        volume.free();
+        std::fs::write(&file, [0u8; 65536]).expect("a freed volume takes a write");
     }
 }

@@ -8,6 +8,9 @@ buffer is left. The source epoch is computed by the source engine itself, never 
 session-rendered text. Every SQL engine runs a second time with a non-UTC zone (see `Src.tz_note`).
 Every engine runs once more as `/init=this`: THIS binary's init config, five cycles by this binary, so
 a fix in init is graded before the previous release carries it.
+MySQL and PostgreSQL run once more as `/empty-baseline`: the last table holds no row at the baseline, the
+previous release's compact must refuse it once its first rows are buffered (0.31.0 built no base for it),
+and this binary's first cycle must leave it equal to the source with no manual step.
 """
 
 from __future__ import annotations
@@ -334,6 +337,9 @@ CDC_LOAD_ENGINES: dict[str, tuple[type[Src], tuple[str, ...], str | None]] = {
     "mongo": (Mongo, ("RIVET_CDC_MONGO_URL",), None),
 }
 
+#: The engines whose previous-release init writes a baseline, so a table can be empty AT one.
+EMPTY_BASELINE_ENGINES = ("mysql", "postgres")
+
 
 def _state(o, src: Src, dset: str, t: str) -> tuple[str, str, str, int, bool]:
     """(source `id:v:epoch`, base live `id:v:epoch`, flagged ids, rows minus distinct ids, buffer exists)."""
@@ -387,6 +393,9 @@ def _oracle_no_load(led: Ledger, name: str, fail, step, body: str, bucket: str, 
                "the source)", "cdc-load")
 
 
+NO_BASE = "the base table does not exist"
+
+
 def isolated(body: str, pfx: str, slot: str | None) -> str | None:
     """init's config under the cell's own prefix and slot (init writes fixed ones, shared by the stand); None when one stayed."""
     body = re.sub(r"prefix: (exports|cdc)/", rf"prefix: {pfx}/\1/", body)
@@ -397,23 +406,25 @@ def isolated(body: str, pfx: str, slot: str | None) -> str | None:
 
 
 def cdc_load_leg(led: Ledger, prev: Path, root: Path, engine: str, url: str, tz: str | None = None,
-                 init_this: bool = False) -> None:
+                 init_this: bool = False, empty: bool = False) -> None:
     """One cdc-load cell: the previous release's init config, three cycles by it and two by this binary;
-    with `init_this`, this binary's init config and five cycles by this binary."""
+    with `init_this`, this binary's init config and five cycles by this binary; with `empty`, the last
+    table is empty at the baseline and the previous release's compact must refuse it (`NO_BASE`)."""
     import duckdb
 
     from . import gcp
     from .duck import BQ_DATASET_ENV, BQ_PROJECT_ENV, Oracle as Duck, OracleUnavailable, bq_target, retry
     from ..pytools.registry import bq_tmp
 
-    name = f"upgrade[{engine}/cdc-load{'/init=this' if init_this else ''}{f'/tz={tz}' if tz else ''}]"
+    name = (f"upgrade[{engine}/cdc-load{'/init=this' if init_this else ''}{f'/tz={tz}' if tz else ''}"
+            f"{'/empty-baseline' if empty else ''}]")
     target, bucket = bq_target(), os.environ.get("BQ_ORACLE_BUCKET", "")
     if target is None or not bucket:
         led.skipped(engine, "-", SCEN, "cdc-load", f"{name}: no {BQ_PROJECT_ENV} / {BQ_DATASET_ENV} "
                     "/ BQ_ORACLE_BUCKET", "no bigquery")
         return
     proj = target[0]
-    tag = f"{engine[:2]}{'tz' if tz else ''}{'n' if init_this else ''}_{os.getpid()}"
+    tag = f"{engine[:2]}{'tz' if tz else ''}{'n' if init_this else ''}{'e' if empty else ''}_{os.getpid()}"
     initer = rivet_bin() if init_this else prev
     # 0.30.0's init writes no baseline for a per-table stream; this tree's always does.
     anchor_first = CDC_LOAD_ENGINES[engine][0].anchor_first and not init_this
@@ -425,6 +436,8 @@ def cdc_load_leg(led: Ledger, prev: Path, root: Path, engine: str, url: str, tz:
     d.mkdir()
     seen: dict[str, set[int]] = {t: set() for t in tables}
     part = ""
+    seeded = tables[:-1] if empty else tables
+    refused = 0
 
     def fail(stage: str, why: str) -> None:
         led.failed(engine, "-", SCEN, "cdc-load", f"{name}: {stage}: {why}", stage)
@@ -444,7 +457,7 @@ def cdc_load_leg(led: Ledger, prev: Path, root: Path, engine: str, url: str, tz:
             for t in tables:
                 if not src.create(t):
                     return fail("seed", f"could not create {t}")
-            if not anchor_first and not all(src.apply(t, _ops(k, 0)) for k, t in enumerate(tables)):
+            if not anchor_first and not all(src.apply(t, _ops(k, 0)) for k, t in enumerate(seeded)):
                 return fail("seed", "the seed rows failed")
             gcp.bq_ensure_dataset(proj, dset)
             init = step(initer, "init", "--source-env", "RIVET_UPG_URL", "--mode", "cdc", "--include", *tables,
@@ -487,12 +500,19 @@ def cdc_load_leg(led: Ledger, prev: Path, root: Path, engine: str, url: str, tz:
                         return fail(f"cycle{n}/load", f"{who}'s load left no `__changes` buffer: {buffers()}")
                     extra = [] if s == "run" else ["--run-id", f"upg-{tag}-{n}"]
                     p = step(binary, s, "-c", "c.yaml", *extra)
+                    if empty and who == "prev" and s == "compact" and n > 1 and not p.ok and NO_BASE in p.out:
+                        refused += 1
+                        continue
                     if not p.ok:
                         return fail(f"cycle{n}/{s}", f"{who} {p.why}")
+                if empty and who == "this" and refused != 2:
+                    # The positive control: the state this cell heals must have been produced.
+                    return fail(f"cycle{n}", f"the previous release's compact refused {refused} time(s), "
+                                             f"not twice, with `{NO_BASE}`")
                 def grade() -> tuple[list[str], str]:
                     bad = []
                     with Duck(bigquery=True, bq_dataset=dset, **src.attach) as o:
-                        for t in tables:
+                        for t in (seeded if who == "prev" else tables):
                             want, live, gone, dup, buf = _state(o, src, dset, t)
                             ids = {int(x.split(":")[0]) for x in want.split(",") if x}
                             seen[t] |= ids
@@ -511,6 +531,9 @@ def cdc_load_leg(led: Ledger, prev: Path, root: Path, engine: str, url: str, tz:
                                              + "; ".join(bad)[:600])
             how = ("five cycles by this binary on its own init config" if init_this else
                    "three cycles by the previous release, two by this binary on its init config")
+            if empty:
+                how += (f"; the last table was empty at the baseline, the previous release's compact refused it "
+                        f"{refused} time(s) and this binary's first cycle built its base")
             led.passed(engine, "-", SCEN, "cdc-load", f"{name}: {how}; after every compact each of {CDC_TABLES} bases "
                        f"equals the source instant by value, deletes flagged, no duplicate key, no buffer left "
                        f"(partition column: {part or 'none'}{f'; zone: {src.tz_note}' if tz else ''})", "cdc-load")
@@ -543,6 +566,8 @@ def cdc_load_lane_cells(prev: Path, root: Path) -> list[tuple[object, object]]:
         for z, init_this in ((None, False), *(((tz, False),) if tz else ()), (None, True)):
             cells.append((server_of(url), lambda led, e=e, url=url, z=z, i=init_this: cdc_load_leg(
                 led, prev, root, e, url, z, init_this=i)))
+        if e in EMPTY_BASELINE_ENGINES:
+            cells.append((server_of(url), lambda led, e=e, url=url: cdc_load_leg(led, prev, root, e, url, empty=True)))
     return skips + cells
 
 

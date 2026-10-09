@@ -482,7 +482,12 @@ pub(super) fn initial_snapshot_pending(
     // A source the drain's open would refuse is refused here, before the anchor and the
     // snapshot legs write anything (a MySQL 5.7 run left a part and a checkpoint behind).
     if writes_before_the_drain(&pending_idx) {
-        engine.refuse_unmet_prerequisites(&url, tls, &tables)?;
+        engine.refuse_unmet_prerequisites(
+            &url,
+            tls,
+            &tables,
+            DrainMode::from_until_current(cdc.until_current),
+        )?;
     }
 
     // The pairing, resolved by the same function config load already admitted — so

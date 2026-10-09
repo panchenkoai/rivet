@@ -291,10 +291,7 @@ fn gremlin_mssql_capture_job_stall_loses_nothing() {
     let _serial = cross_process_serial("mssql_cdc");
     // Self-heal first: an earlier aborted run of THIS test may have left the
     // capture job disabled/stopped (the fault it injects is exactly that).
-    mssql_cdc_try_exec(
-        "EXEC msdb.dbo.sp_update_job @job_name = N'cdc.rivet_capture', @enabled = 1",
-    );
-    mssql_cdc_try_exec("EXEC sys.sp_cdc_start_job @job_type = N'capture'");
+    resume_capture_job();
     let d = tempfile::tempdir().unwrap();
     let table = unique_name("rivet_cdc_stall");
     let ci = format!("dbo_{table}");
@@ -315,47 +312,7 @@ fn gremlin_mssql_capture_job_stall_loses_nothing() {
     mssql_cdc_rig(&table, &ci, &ckpt, &out1).run_ok();
     assert_eq!(manifest_rows(&out1), 1);
 
-    // Stall the capture job: DISABLE it (so the scheduler cannot restart it)
-    // and stop it tolerantly — between polls the job is "not running" and a
-    // bare sp_cdc_stop_job refuses.
-    // Re-enable guard armed BEFORE the first manipulation — a panic anywhere
-    // in the stall sequence must never leave the SHARED capture job disabled
-    // (that cascades into every other mssql test's wait_for_capture).
-    struct JobGuard;
-    impl Drop for JobGuard {
-        fn drop(&mut self) {
-            mssql_cdc_try_exec(
-                "EXEC msdb.dbo.sp_update_job @job_name = N'cdc.rivet_capture', @enabled = 1",
-            );
-            mssql_cdc_try_exec("EXEC sys.sp_cdc_start_job @job_type = N'capture'");
-        }
-    }
-    let _job = JobGuard;
-    mssql_cdc_try_exec(
-        "EXEC msdb.dbo.sp_update_job @job_name = N'cdc.rivet_capture', @enabled = 0",
-    );
-    // The continuous job may be BETWEEN polls (stop refused) or mid-poll —
-    // retry the stop until msdb reports no running instance, or the "stall"
-    // never actually happened and the test is meaningless (the earlier flake).
-    let running = || -> i64 {
-        mssql_cdc_query_i64(
-            "SELECT COUNT(*) FROM msdb.dbo.sysjobactivity ja \
-             JOIN msdb.dbo.sysjobs j ON ja.job_id = j.job_id \
-             WHERE j.name = 'cdc.rivet_capture' \
-               AND ja.session_id = (SELECT MAX(session_id) FROM msdb.dbo.syssessions) \
-               AND ja.start_execution_date IS NOT NULL \
-               AND ja.stop_execution_date IS NULL",
-        )
-    };
-    let stop_deadline = std::time::Instant::now() + Duration::from_secs(60);
-    while running() > 0 {
-        mssql_cdc_try_exec("EXEC sys.sp_cdc_stop_job @job_type = N'capture'");
-        assert!(
-            std::time::Instant::now() < stop_deadline,
-            "could not stop the capture job — the stall precondition never held"
-        );
-        std::thread::sleep(Duration::from_secs(1));
-    }
+    let stalled = stall_capture_job();
 
     mssql_cdc_exec(&format!("INSERT INTO dbo.{table} VALUES (2,20),(3,30)"));
 
@@ -367,23 +324,8 @@ fn gremlin_mssql_capture_job_stall_loses_nothing() {
     assert_eq!(manifest_rows(&out2), 0, "stalled job ⇒ nothing new visible");
 
     // Job back: the changes must ALL appear on the next run.
-    mssql_cdc_try_exec(
-        "EXEC msdb.dbo.sp_update_job @job_name = N'cdc.rivet_capture', @enabled = 1",
-    );
-    mssql_cdc_try_exec("EXEC sys.sp_cdc_start_job @job_type = N'capture'");
-    // The continuous capture job takes noticeably longer to come back after a
-    // disable+stop than its steady-state poll cadence — give it up to 120 s.
-    let deadline = std::time::Instant::now() + Duration::from_secs(120);
-    while mssql_cdc_query_i64(&format!("SELECT COUNT(*) FROM cdc.{ci}_CT")) < 3 {
-        // Retry the start each pass — it can race an old instance winding
-        // down ("already running") and be refused transiently.
-        mssql_cdc_try_exec("EXEC sys.sp_cdc_start_job @job_type = N'capture'");
-        assert!(
-            std::time::Instant::now() < deadline,
-            "capture job did not resume within 120s after re-enable"
-        );
-        std::thread::sleep(Duration::from_secs(2));
-    }
+    drop(stalled);
+    wait_for_capture(&ci, 3);
     let out3 = d.path().join("out3");
     std::fs::create_dir_all(&out3).unwrap();
     mssql_cdc_rig(&table, &ci, &ckpt, &out3).run_ok();
@@ -1111,6 +1053,14 @@ fn mssql_cdc_corrupt_checkpoint_fails_loud_not_silently_absent() {
     assert!(
         stderr.contains("corrupt or truncated"),
         "the failure must name the corrupt checkpoint, got:\n{stderr}"
+    );
+    assert_refused(
+        &res,
+        Refused::by_code("RIVET_SOURCE_CDC_CHECKPOINT_INVALID", 5),
+    );
+    assert!(
+        stderr.contains(REBASELINE_REMEDY),
+        "the refusal ends with the re-baseline remedy:\n{stderr}"
     );
 }
 
@@ -3115,26 +3065,26 @@ fn mssql_add_column_remedy_before_the_first_changes_run_ends_in_the_log_gap_refu
     );
 }
 
-/// A scenario whose anchor was taken while the database max LSN was still below the instance's start.
+/// A scenario enabled and anchored while the capture job is stalled, so the database max LSN is below the instance's start.
 fn anchored_before_the_capture_job_reached_the_instance() -> CdcScenario {
-    (0..5)
-        .find_map(|_| {
-            let s = CdcScenario::mssql_with("cdc_pinfresh", "id INT PRIMARY KEY, v INT", |r, _| {
-                r.cdc("initial: snapshot").cdc("until_current: true")
-            });
-            s.rig.run_ok();
-            let ckpt: serde_json::Value =
-                serde_json::from_str(&std::fs::read_to_string(s.rig.checkpoint()).unwrap())
-                    .unwrap();
-            let below = mssql_cdc_query_i64(&format!(
-                "SELECT COUNT(*) FROM cdc.change_tables WHERE capture_instance = N'dbo_{}' \
-                 AND 0x{} < start_lsn",
-                s.table,
-                ckpt["lsn"].as_str().unwrap()
-            ));
-            (below == 1).then_some(s)
-        })
-        .expect("fixture: five anchors in a row landed after the capture job's scan")
+    let _stalled = stall_capture_job();
+    let s = CdcScenario::mssql_with("cdc_pinfresh", "id INT PRIMARY KEY, v INT", |r, _| {
+        r.cdc("initial: snapshot").cdc("until_current: true")
+    });
+    s.rig.run_ok();
+    let ckpt: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(s.rig.checkpoint()).unwrap()).unwrap();
+    assert_eq!(
+        mssql_cdc_query_i64(&format!(
+            "SELECT COUNT(*) FROM cdc.change_tables WHERE capture_instance = N'dbo_{}' \
+             AND sys.fn_cdc_get_max_lsn() < start_lsn AND 0x{} < start_lsn",
+            s.table,
+            ckpt["lsn"].as_str().unwrap()
+        )),
+        1,
+        "fixture: with the capture job stalled, the max LSN and the anchor are below the instance's start"
+    );
+    s
 }
 
 /// An anchor below a just-enabled instance's start loses nothing and refuses nothing.

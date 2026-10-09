@@ -511,6 +511,11 @@ fn is_one_page(longest: u64, total: u64, pages: u64) -> bool {
     longest * pages * 2 <= total * 3
 }
 
+/// Whether the longest answer carried more than half of every byte the source sent: the table in one statement, not a fetch at a time.
+fn is_most_of_the_table(longest: u64, total: u64) -> bool {
+    longest * 2 > total
+}
+
 /// Run `rig` with its source behind a forwarder to `port`: the longest answer the source gave the rivet process and the total, once the run delivered `WIRE_ROWS` rows.
 fn longest_answer_of_a_run(rig: Rig, url: &str, port: u16) -> (u64, u64) {
     let (via, answers) = wire_to(port);
@@ -573,7 +578,7 @@ fn mode_full_documents_the_longest_statement_it_holds(engine: SqlEngine, whole_t
         .export_line(&format!("tuning: {{batch_size: {WIRE_PAGE}}}"));
     let (longest, total) = longest_answer_of_a_run(rig, engine.url(), engine.default_port());
     assert_eq!(
-        !is_one_page(longest, total, WIRE_PAGES),
+        is_most_of_the_table(longest, total),
         whole_table,
         "mode: full answered {longest} of {total} bytes to its longest statement"
     );

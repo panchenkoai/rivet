@@ -247,27 +247,21 @@ impl MysqlChangeStream {
             .get("file")
             .and_then(Json::as_str)
             .ok_or_else(|| {
-                crate::error::CodedError::new(
-                    crate::error::codes::SOURCE_CDC_CHECKPOINT_INVALID,
-                    format!(
-                        "checkpoint '{path}' parses as JSON but carries no 'file' — refusing to \
+                crate::source::cdc::checkpoint_identity::checkpoint_invalid(format!(
+                    "checkpoint '{path}' parses as JSON but carries no 'file' — refusing to \
                          treat it as absent, which would re-anchor at the CURRENT binlog \
                          position and silently skip every change since it was written. Restore \
                          the file, or: {}",
-                        crate::source::cdc::checkpoint_identity::RECOVER
-                    ),
-                )
+                    crate::source::cdc::checkpoint_identity::RECOVER
+                ))
             })?
             .to_string();
         let p = pos.0.get("pos").and_then(Json::as_u64).ok_or_else(|| {
-            crate::error::CodedError::new(
-                crate::error::codes::SOURCE_CDC_CHECKPOINT_INVALID,
-                format!(
-                    "checkpoint '{path}' parses as JSON but carries no 'pos'. Restore the file, \
+            crate::source::cdc::checkpoint_identity::checkpoint_invalid(format!(
+                "checkpoint '{path}' parses as JSON but carries no 'pos'. Restore the file, \
                      or: {}",
-                    crate::source::cdc::checkpoint_identity::RECOVER
-                ),
-            )
+                crate::source::cdc::checkpoint_identity::RECOVER
+            ))
         })?;
         Ok(Some((file, p)))
     }
@@ -363,10 +357,30 @@ impl MysqlChangeStream {
         configured_tables: &[String],
     ) -> Result<()> {
         let mut conn = connect_conn(url, tls)?;
-        Self::refuse_nameless_binlog(&mut conn)?;
-        refuse_compressed_binlog(&mut conn)?;
-        refuse_replica_without_relog(&mut conn)?;
-        Self::check_configured_tables_are_routable(&mut conn, configured_tables)
+        Self::refuse_unmet_prerequisites_on(&mut conn, configured_tables)?;
+        Self::refuse_absent_tables_on(&mut conn, configured_tables)
+    }
+
+    /// Every refusal of the open, asked on `conn` before the anchor is written or the dump starts.
+    fn refuse_unmet_prerequisites_on(
+        conn: &mut mysql::Conn,
+        configured_tables: &[String],
+    ) -> Result<()> {
+        Self::refuse_nameless_binlog(conn)?;
+        refuse_compressed_binlog(conn)?;
+        refuse_replica_without_relog(conn)?;
+        Self::check_configured_tables_are_routable(conn, configured_tables)
+    }
+
+    /// Refuse a table the schema probe could not read, by preparing the probe's own statement: asked before a first run's anchor, never on a resume (a table dropped under a stream is the stream's own refusal).
+    fn refuse_absent_tables_on(conn: &mut mysql::Conn, configured_tables: &[String]) -> Result<()> {
+        for table in configured_tables {
+            use mysql::prelude::Queryable as _;
+            crate::source::cdc::validate_table_ident(table)?;
+            conn.prep(format!("SELECT * FROM {table}"))
+                .map_err(|e| table_probe_refusal(table, server_error_code(&e), &e.to_string()))?;
+        }
+        Ok(())
     }
 
     /// The binlog row-image verdict, asked on a connection the caller holds.
@@ -573,6 +587,7 @@ impl MysqlChangeStream {
         configured_tables: Vec<String>,
     ) -> Result<Self> {
         let mut conn = connect_conn(url, tls)?;
+        Self::refuse_unmet_prerequisites_on(&mut conn, &configured_tables)?;
         let identity = Self::server_identity(&mut conn)?;
         Self::open_on(
             conn,
@@ -603,17 +618,7 @@ impl MysqlChangeStream {
         } else {
             None
         };
-        // A configured name the binlog can never carry is refused here; its message
-        // carries rivet's `mysql cdc:` prefix, so the caller's grants hint is never
-        // prepended to it.
-        if !configured_tables.is_empty() {
-            Self::check_configured_tables_are_routable(&mut conn, &configured_tables)?;
-        }
         let row_image = Self::row_image_on(&mut conn);
-        // Refuse a compressed binlog rather than read past it in silence.
-        refuse_compressed_binlog(&mut conn)?;
-        // Refuse a replica that does not re-log what it applies: its binlog holds none of it.
-        refuse_replica_without_relog(&mut conn)?;
         // Read the connection's own database BEFORE the binlog stream consumes the
         // connection — it is the meaning of a bare configured name.
         // `Option<String>`, like the two sibling call sites (`mysql/mod.rs`,
@@ -642,7 +647,9 @@ impl MysqlChangeStream {
         if mode.is_bounded() {
             req = req.with_flags(BinlogDumpFlags::BINLOG_DUMP_NON_BLOCK);
         }
-        let stream = conn.get_binlog_stream(req)?;
+        let stream = conn
+            .get_binlog_stream(req)
+            .map_err(|e| binlog_read_error(e, &file))?;
         Ok(Self {
             stream,
             configured_tables,
@@ -807,8 +814,8 @@ impl MysqlChangeStream {
         };
         // ONE connection for every question asked before the dump; it then dumps.
         let mut conn = connect_conn(url, tls)?;
-        // Before the anchor is written: a refused first run must not pin a MINIMAL span.
-        Self::refuse_nameless_binlog(&mut conn)?;
+        // Before the anchor is written: a refused first run leaves no checkpoint.
+        Self::refuse_unmet_prerequisites_on(&mut conn, &configured_tables)?;
         if let Some(path) = ckpt
             && let Some(pos) = Position::load(path)?
             && let Some((file, p)) =
@@ -845,6 +852,7 @@ impl MysqlChangeStream {
         // at a part commit — so an idle bounded run (zero changes drained) would
         // otherwise leave no checkpoint, the next run would re-anchor to a newer
         // "current" position, and every change in between would be silently skipped.
+        Self::refuse_absent_tables_on(&mut conn, &configured_tables)?;
         let (file, pos) = Self::current_coordinates(&mut conn)?;
         let identity = Self::server_identity(&mut conn);
         if let Some(path) = ckpt {
@@ -936,7 +944,7 @@ impl MysqlChangeStream {
             return Ok(false); // ended at the open-time ceiling — stay ended
         }
         let ev = match self.stream.next() {
-            Some(ev) => ev?,
+            Some(ev) => ev.map_err(|e| binlog_read_error(e, &self.file))?,
             None => return Ok(false),
         };
         let log_pos = ev.header().log_pos() as u64;
@@ -1136,7 +1144,9 @@ impl MysqlChangeStream {
                 }) =>
             {
                 let (sc, tb) = truncate_target(&qe.query(), &qe.schema()).expect("just matched");
-                anyhow::bail!(truncate_refusal_message(&sc, &tb));
+                return Err(crate::source::cdc::checkpoint_identity::truncated(
+                    truncate_refusal_message(&sc, &tb),
+                ));
             }
             // `XA PREPARE` arrives as a BINARY `XaPrepareLogEvent` on 5.7.7+, never
             // as a QueryEvent — so `is_commit_statement`'s "deliberately not XA
@@ -1197,7 +1207,9 @@ impl MysqlChangeStream {
                         &self.configured_tables,
                     )
                 });
-                anyhow::bail!(drop_refusal_message(ours.and_then(|t| t.as_ref())));
+                return Err(crate::source::cdc::checkpoint_identity::truncated(
+                    drop_refusal_message(ours.and_then(|t| t.as_ref())),
+                ));
             }
             Some(EventData::QueryEvent(qe))
                 if statement_dml_target(&qe.query(), &qe.schema()).is_some_and(|t| {
@@ -1406,13 +1418,38 @@ fn refuse_replica_without_relog(conn: &mut Conn) -> Result<()> {
     replica_relog_refusal(replicating, relog.as_deref())
 }
 
+/// The server's error number of a driver error, when the server sent one.
+fn server_error_code(e: &mysql::Error) -> Option<u16> {
+    match e {
+        mysql::Error::MySqlError(m) => Some(m.code),
+        _ => None,
+    }
+}
+
+/// Why a configured table the schema probe cannot prepare is refused: absent (ER_NO_SUCH_TABLE 1146, ER_BAD_DB_ERROR 1049) by code, anything else in the server's words.
+pub(crate) fn table_probe_refusal(table: &str, code: Option<u16>, said: &str) -> anyhow::Error {
+    if matches!(code, Some(1146 | 1049)) {
+        return crate::error::CodedError::new(
+            crate::error::codes::SOURCE_CDC_PREREQUISITE,
+            format!(
+                "mysql cdc: table `{table}` does not exist on this server (a bare name is read in \
+                 the connection's database), so no change to it could ever be captured; nothing \
+                 was read or written. Create the table, or fix `table:` in the export, then re-run."
+            ),
+        )
+        .into();
+    }
+    anyhow::anyhow!("mysql cdc: cannot read `{table}` ({said}); nothing was read or written.")
+}
+
 /// A replica whose binlog omits replicated changes would capture nothing and report success.
 fn replica_relog_refusal(replicating: bool, relog: Option<&str>) -> Result<()> {
     let relogs = matches!(relog, Some("1") | Some("ON") | Some("on") | None);
     if !replicating || relogs {
         return Ok(());
     }
-    anyhow::bail!(
+    crate::rivet_bail!(
+        crate::error::codes::SOURCE_CDC_PREREQUISITE,
         "mysql cdc: this server is a replica with log_replica_updates = OFF, so the changes it \
          applies from its source never reach its own binlog — reading it would capture NOTHING of \
          them and report success. Set log_replica_updates = ON (log_slave_updates before 8.0.26; \
@@ -1440,7 +1477,8 @@ fn compression_refusal(raw: Option<&str>) -> Result<()> {
     if !binlog_compression_is_on(raw) {
         return Ok(());
     }
-    anyhow::bail!(
+    crate::rivet_bail!(
+        crate::error::codes::SOURCE_CDC_PREREQUISITE,
         "mysql cdc: the source has binlog_transaction_compression = ON, and this reader cannot \
          expand a Transaction_payload_event — it would capture NOTHING and report success. \
          Turn it off for the replica rivet reads (SET GLOBAL binlog_transaction_compression = OFF; \
@@ -1702,6 +1740,36 @@ pub(crate) fn drop_table_targets(
                 truncate_target(&format!("TRUNCATE {n}"), event_db)
             })
             .collect(),
+    )
+}
+
+/// Whether a binlog dump error says the server purged the log the resume position needs (ER_MASTER_FATAL_ERROR_READING_BINLOG with either wording: by file, by GTID).
+pub(crate) fn names_purged_binlog(code: u16, message: &str) -> bool {
+    code == 1236
+        && (message.contains("Could not find first log file name")
+            || message.contains("purged required binary logs"))
+}
+
+/// A binlog dump error as it is shown: a purged log is a `SOURCE_CDC_LOG_GAP` refusal, anything else the driver's own error.
+fn binlog_read_error(e: mysql::Error, file: &str) -> anyhow::Error {
+    match &e {
+        mysql::Error::MySqlError(m) if names_purged_binlog(m.code, &m.message) => {
+            crate::source::cdc::checkpoint_identity::log_gap(purged_binlog_message(
+                file, &m.message,
+            ))
+        }
+        _ => e.into(),
+    }
+}
+
+/// Refuse a resume position whose binlog the server purged.
+pub(crate) fn purged_binlog_message(file: &str, server_said: &str) -> String {
+    format!(
+        "mysql cdc: the server no longer holds binlog `{file}`, where the checkpoint resumes \
+         (ERROR 1236: {server_said}) — it was purged past the checkpoint, and the changes \
+         between the checkpoint and the oldest binlog the server still has are no longer in \
+         the log. {}",
+        crate::source::cdc::checkpoint_identity::RECOVER
     )
 }
 
@@ -3132,6 +3200,41 @@ mod refusal_text_tests {
     use super::*;
     use crate::source::cdc::checkpoint_identity::RECOVER;
 
+    /// An unknown table or database is the coded absent-table refusal; any other probe failure keeps the server's words.
+    #[test]
+    fn a_table_the_probe_cannot_prepare_is_absent_only_by_its_error_number() {
+        for code in [1146, 1049] {
+            let absent = table_probe_refusal("shop.orders", Some(code), "Table doesn't exist");
+            assert_eq!(
+                crate::error::error_code(&absent),
+                Some("RIVET_SOURCE_CDC_PREREQUISITE"),
+                "{code}"
+            );
+            assert_eq!(
+                absent.to_string(),
+                "mysql cdc: table `shop.orders` does not exist on this server (a bare name is read \
+                 in the connection's database), so no change to it could ever be captured; nothing \
+                 was read or written. Create the table, or fix `table:` in the export, then re-run."
+            );
+        }
+        for other in [Some(1142), None] {
+            let denied = table_probe_refusal("orders", other, "SELECT command denied");
+            assert_eq!(crate::error::error_code(&denied), None);
+            assert_eq!(
+                denied.to_string(),
+                "mysql cdc: cannot read `orders` (SELECT command denied); nothing was read or written."
+            );
+        }
+        let server = mysql::Error::MySqlError(mysql::error::MySqlError {
+            state: "42S02".into(),
+            message: "Table 'rivet.t' doesn't exist".into(),
+            code: 1146,
+        });
+        assert_eq!(server_error_code(&server), Some(1146));
+        let io = mysql::Error::IoError(std::io::Error::other("gone"));
+        assert_eq!(server_error_code(&io), None);
+    }
+
     fn target(schema: &str, table: &str) -> Option<(String, String)> {
         Some((schema.to_string(), table.to_string()))
     }
@@ -3160,6 +3263,44 @@ mod refusal_text_tests {
             "{unknown}"
         );
         assert!(unknown.ends_with(RECOVER), "{unknown}");
+    }
+
+    /// ERROR 1236 is a log gap only under the two purge wordings; the same code for another cause stays the driver's error.
+    #[test]
+    fn a_purged_binlog_is_a_log_gap_and_another_1236_is_not() {
+        const BY_FILE: &str = "Could not find first log file name in binary log index file";
+        const BY_GTID: &str = "Cannot replicate because the source purged required binary logs.";
+        const SAME_ID: &str = "A replica with the same server_uuid/server_id as this replica \
+                               has connected to the source";
+        assert!(names_purged_binlog(1236, BY_FILE));
+        assert!(names_purged_binlog(1236, BY_GTID));
+        assert!(!names_purged_binlog(1236, SAME_ID));
+        assert!(!names_purged_binlog(1045, BY_FILE));
+        let server = |code, message: &str| {
+            mysql::Error::MySqlError(mysql::error::MySqlError {
+                state: "HY000".into(),
+                message: message.into(),
+                code,
+            })
+        };
+        let gap = binlog_read_error(server(1236, BY_FILE), "binlog.000007");
+        assert_eq!(crate::error::classify_exit(&gap), 5);
+        assert_eq!(
+            crate::error::error_code(&gap),
+            Some("RIVET_SOURCE_CDC_LOG_GAP")
+        );
+        assert_eq!(
+            gap.to_string(),
+            format!(
+                "mysql cdc: the server no longer holds binlog `binlog.000007`, where the \
+                 checkpoint resumes (ERROR 1236: {BY_FILE}) — it was purged past the checkpoint, \
+                 and the changes between the checkpoint and the oldest binlog the server still \
+                 has are no longer in the log. {RECOVER}"
+            )
+        );
+        let other = binlog_read_error(server(1236, SAME_ID), "binlog.000007");
+        assert_eq!(crate::error::error_code(&other), None);
+        assert!(other.to_string().contains(SAME_ID), "{other}");
     }
 
     /// A statement-logged change names the table, the setting to change, and the recovery steps.

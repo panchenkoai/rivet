@@ -51,7 +51,7 @@ stay scenario-local and don't bleed between runs.
 
 ## Normalization rules
 
-- `YYYYMMDD_HHMMSS` → `<TS>`     (parquet/csv filename timestamp)
+- `YYYYMMDD_HHMMSS[_mmm[_pid_nonce]]` → `<TS>`     (parquet/csv filename stamp)
 - `YYYYMMDDTHHMMSS.NNN` → `<RUNID>` (`.rivet/runs/<export>_<run>`)
 - `_chunkN.parquet` — preserved (chunk numbering IS the contract)
 - Output sorted lexicographically

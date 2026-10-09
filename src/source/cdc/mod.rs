@@ -126,19 +126,18 @@ impl Position {
 
     /// Load a persisted checkpoint, or `None` on first run (absent).
     pub(crate) fn load(path: &Path) -> Result<Option<Self>> {
-        use anyhow::Context as _;
         match std::fs::read_to_string(path) {
-            Ok(s) => Ok(Some(Position::new(serde_json::from_str(&s).with_context(
-                || {
-                    format!(
-                        "checkpoint '{}' is corrupt or truncated (not valid JSON) — refusing to \
+            Ok(s) => match serde_json::from_str(&s) {
+                Ok(json) => Ok(Some(Position::new(json))),
+                Err(e) => Err(checkpoint_identity::checkpoint_invalid(format!(
+                    "checkpoint '{}' is corrupt or truncated (not valid JSON: {e}) — refusing to \
                      silently treat it as absent and re-anchor CDC at 'current', which would \
                      permanently skip every change since the last checkpoint. Restore the file, \
-                     or delete it to accept a new anchor from a fresh snapshot.",
-                        path.display()
-                    )
-                },
-            )?))),
+                     or: {}",
+                    path.display(),
+                    checkpoint_identity::RECOVER
+                ))),
+            },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => {
                 Err(anyhow::Error::new(e)
@@ -632,13 +631,28 @@ pub(crate) fn run(
     tables: Vec<String>,
     max_events: Option<usize>,
 ) -> Result<()> {
-    let mut emitted = 0usize;
     // A cap of 0 means emit nothing — check BEFORE consuming the stream. The
     // post-emit `emitted >= m` check let exactly one event escape at m=0 (it
     // printed, incremented to 1, then 1 >= 0 broke), an off-by-one.
     if max_events == Some(0) {
         return Ok(());
     }
+    let mut last_commit: Option<Position> = None;
+    let drained = emit_ndjson(stream, &checkpoint, &tables, max_events, &mut last_commit);
+    // Every line up to `last_commit` is on stdout: release it at the source (PostgreSQL advances the slot).
+    let acked = last_commit.map_or(Ok(()), |p| stream.ack(&p));
+    drained.and(acked)
+}
+
+/// The emit loop of [`run`]; `last_commit` ends at the last commit boundary whose lines were all printed.
+fn emit_ndjson(
+    stream: &mut dyn ChangeStream,
+    checkpoint: &Option<PathBuf>,
+    tables: &[String],
+    max_events: Option<usize>,
+    last_commit: &mut Option<Position>,
+) -> Result<()> {
+    let mut emitted = 0usize;
     let eng = stream.engine();
     let mut txn_seq = TxnSeq::default();
     while let Some(ev) = stream.next_change() {
@@ -655,8 +669,11 @@ pub(crate) fn run(
                 .iter()
                 .any(|t| sink::table_matches(eng, t, &ev.schema, &ev.table));
         if filtered {
-            if committed && let Some(p) = &checkpoint {
-                stream.checkpoint_of(&ev.position).save(p)?;
+            if committed {
+                if let Some(p) = checkpoint {
+                    stream.checkpoint_of(&ev.position).save(p)?;
+                }
+                *last_commit = Some(ev.position.clone());
             }
             continue;
         }
@@ -675,8 +692,11 @@ pub(crate) fn run(
         // strictly after it and SKIPS the transaction tail (#9 bughunt: an
         // at-least-once break, the save ran before the println). Emit→checkpoint
         // means a crash there re-emits on resume (a duplicate, never a loss).
-        if committed && let Some(p) = &checkpoint {
-            stream.checkpoint_of(&ev.position).save(p)?;
+        if committed {
+            if let Some(p) = checkpoint {
+                stream.checkpoint_of(&ev.position).save(p)?;
+            }
+            *last_commit = Some(ev.position.clone());
         }
         // A SOFT cap, landing on the commit boundary — the same semantics the file
         // sink already had (`max_events_stops_at_a_commit_boundary_never_inside_a_
@@ -1036,6 +1056,7 @@ impl CdcEngine {
         url: &str,
         tls: Option<&crate::config::TlsConfig>,
         tables: &[String],
+        drain: DrainMode,
     ) -> Result<()> {
         match self {
             Self::Mysql => {
@@ -1044,8 +1065,8 @@ impl CdcEngine {
                 )
             }
             Self::Postgres => {
-                crate::source::postgres::cdc::PgChangeStream::refuse_unroutable_tables(
-                    url, tls, tables,
+                crate::source::postgres::cdc::PgChangeStream::refuse_unmet_prerequisites(
+                    url, tls, tables, drain,
                 )
             }
             #[cfg(feature = "oracle")]
@@ -1091,14 +1112,7 @@ impl CdcEngine {
                     tls,
                     PeekBound::Unbounded,
                     DrainMode::Continuous, // anchor-only open — never read, no bound to pin
-                    // No routing cross-check here, deliberately. This open exists
-                    // to CREATE the slot and is dropped without reading or
-                    // acking, so it cannot lose anything; the capture open that
-                    // follows carries the tables and bails there. Refusing before
-                    // the anchor would be actively worse for the operator —
-                    // changes written between a bad config and its fix would have
-                    // no slot holding them, whereas a slot created first keeps
-                    // every one of them until the corrected run drains it.
+                    // The capture open that follows carries the tables.
                     &[],
                     // Nothing is read here, so there is nothing to spill.
                     None,
@@ -1120,7 +1134,7 @@ impl CdcEngine {
                     // MISSING checkpoint: pinning "current" would silently skip
                     // everything since the loss — and on MSSQL would actively
                     // destroy the min-LSN over-read floor. Fail loudly.
-                    anyhow::bail!(
+                    return Err(checkpoint_identity::checkpoint_invalid(format!(
                         // BOTH signals, because they are OR-ed: `snapshot_done` reads
                         // the state DB's `cdc_snapshot` row (authoritative) OR the
                         // destination's `snapshot/_SUCCESS` marker (legacy co-signal).
@@ -1132,7 +1146,7 @@ impl CdcEngine {
                         self.label(),
                         ckpt.display(),
                         checkpoint_identity::RECOVER
-                    );
+                    )));
                 }
                 match self {
                     Self::Mysql => {
@@ -2830,6 +2844,22 @@ mod tests {
             err.to_string().contains("corrupt or truncated"),
             "a corrupt checkpoint must fail loud, not read as absent: {err}"
         );
+        assert_eq!(crate::error::classify_exit(&err), 5, "{err}");
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some("RIVET_SOURCE_CDC_CHECKPOINT_INVALID")
+        );
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "checkpoint '{}' is corrupt or truncated (not valid JSON: key must be a string \
+                 at line 1 column 2) — refusing to silently treat it as absent and re-anchor \
+                 CDC at 'current', which would permanently skip every change since the last \
+                 checkpoint. Restore the file, or: {}",
+                path.display(),
+                checkpoint_identity::RECOVER
+            )
+        );
 
         // An absent checkpoint stays a clean first run (None).
         assert!(
@@ -3021,6 +3051,13 @@ mod tests {
                 msg.contains("prior-run evidence"),
                 "{engine:?}: must explain the evidence: {msg}"
             );
+            assert!(msg.ends_with(checkpoint_identity::RECOVER), "{msg}");
+            assert_eq!(crate::error::classify_exit(&err), 5, "{engine:?}");
+            assert_eq!(
+                crate::error::error_code(&err),
+                Some("RIVET_SOURCE_CDC_CHECKPOINT_INVALID"),
+                "{engine:?}"
+            );
         }
     }
 
@@ -3182,6 +3219,91 @@ mod tests {
             format!("{err:#}").contains("REPLICA IDENTITY FULL"),
             "got: {err:#}"
         );
+    }
+
+    /// A stream of events that records every position it is acked at.
+    struct Acked(std::collections::VecDeque<super::ChangeEvent>, Vec<String>);
+    impl super::ChangeStream for Acked {
+        fn engine(&self) -> super::CdcEngine {
+            super::CdcEngine::Postgres
+        }
+        fn next_change(&mut self) -> Option<Result<super::ChangeEvent>> {
+            self.0.pop_front().map(Ok)
+        }
+        fn ack(&mut self, position: &Position) -> Result<()> {
+            self.1
+                .push(position.json()["lsn"].as_str().unwrap().to_string());
+            Ok(())
+        }
+    }
+
+    /// One clean event on `table` at `lsn`.
+    fn event_at(table: &str, lsn: &str, committed: bool) -> super::ChangeEvent {
+        super::ChangeEvent {
+            position: Position::new(serde_json::json!({ "lsn": lsn })),
+            committed,
+            poison: None,
+            ..poison_event(table)
+        }
+    }
+
+    /// The stdout driver acks once, at the last commit boundary it passed: a printed one, or one on an unlisted table.
+    #[test]
+    fn the_ndjson_driver_acks_the_last_commit_it_emitted_or_passed() {
+        let drain = |events: Vec<super::ChangeEvent>, max: Option<usize>| {
+            let mut s = Acked(events.into(), Vec::new());
+            super::run(&mut s, None, vec!["orders".into()], max).expect("a clean drain");
+            s.1
+        };
+        assert_eq!(
+            drain(
+                vec![
+                    event_at("orders", "0/1", true),
+                    event_at("orders", "0/2", false),
+                    event_at("orders", "0/3", true),
+                ],
+                None
+            ),
+            ["0/3"]
+        );
+        assert_eq!(
+            drain(
+                vec![
+                    event_at("orders", "0/1", true),
+                    event_at("other", "0/2", true)
+                ],
+                None
+            ),
+            ["0/2"],
+            "a commit on an unlisted table is a boundary too"
+        );
+        assert_eq!(
+            drain(
+                vec![
+                    event_at("orders", "0/1", true),
+                    event_at("orders", "0/2", true)
+                ],
+                Some(1)
+            ),
+            ["0/1"],
+            "the cap stops the drain, and the ack, at the first commit"
+        );
+        assert!(
+            drain(vec![event_at("orders", "0/1", false)], None).is_empty(),
+            "an open transaction is never acked"
+        );
+        assert!(drain(vec![event_at("orders", "0/1", true)], Some(0)).is_empty());
+    }
+
+    /// A drain that fails still acks what it printed, and reports the failure.
+    #[test]
+    fn the_ndjson_driver_acks_what_it_printed_before_a_failure() {
+        let mut s = Acked(
+            vec![event_at("orders", "0/1", true), poison_event("orders")].into(),
+            Vec::new(),
+        );
+        super::run(&mut s, None, vec!["orders".into()], None).expect_err("the poison");
+        assert_eq!(s.1, ["0/1"]);
     }
 
     /// A declared key column is found by exact or case-folded name; the first missing one is named.

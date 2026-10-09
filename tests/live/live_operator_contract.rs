@@ -4,7 +4,8 @@
 //! is an `open_defect_*` cell acknowledged in dev/release_oracle/known_red.py.
 //!
 //! Oracles: the exit code and `Error:` line of the real binary, the destination re-read, the
-//! source, and the engine's own catalog. Refusals with a remedy go through `Rig::refuses_twice_then`.
+//! source, and the engine's own catalog. Refusals with a remedy go through `Rig::refuses_twice_then`;
+//! a CDC stream that cannot continue goes through `Rig::refuses_twice_and_walks_out`.
 
 use crate::common::*;
 
@@ -710,6 +711,9 @@ fn resume_force_on(mut rig: Rig) {
     );
 }
 
+const CHECKPOINT_INVALID: Refused = Refused::by_code("RIVET_SOURCE_CDC_CHECKPOINT_INVALID", 5);
+const TRUNCATED: Refused = Refused::by_code("RIVET_SOURCE_CDC_TRUNCATED", 5);
+
 /// What the refusal says of `--resume --force` over a complete prefix: it runs as a plain run does (`rerun_rows` rows: the table again, or the delta past a continued key), the old parts stay byte for byte, and manifest.json names only the new ones.
 fn forced_resume_beside(rig: Rig, rerun_rows: i64) {
     rig.run_ok();
@@ -759,37 +763,32 @@ fn forced_resume_beside_sql(engine: SqlEngine) {
     forced_resume_beside(range_checkpoint_rig(engine, &table), ROWS);
 }
 
-const CHECKPOINT_UNCODED: &str = "a corrupt CDC checkpoint is refused with exit 1 and no code; the registry has RIVET_SOURCE_CDC_CHECKPOINT_INVALID (5), pinned by the *_is_refused_by_code_* cells";
+/// The re-baseline remedy every CDC data-loss refusal ends with, followed as printed. Last in a walk: it moves the source-side anchor, which no copy of the refused state brings back.
+fn rebaseline<'a>(has_baseline: bool) -> Remedy<'a> {
+    Remedy::new(REBASELINE_REMEDY, Then::DeliversTheSource, move |r| {
+        apply_rebaseline_remedy(r, has_baseline)
+    })
+}
 
-/// A stream with a baseline (`initial: snapshot`) and one drained change, and then a checkpoint that is not JSON.
-fn with_a_corrupt_checkpoint(mut s: CdcScenario) -> CdcScenario {
+/// What an operator does first: the checkpoint file goes, and nothing else.
+fn deletes_only_the_checkpoint<'a>(then: Then<'a>) -> Remedy<'a> {
+    Remedy::wrong("deletes the checkpoint file and nothing else", then, |r| {
+        let _ = std::fs::remove_file(r.checkpoint());
+    })
+}
+
+/// A stream with a baseline (`initial: snapshot`) and one drained change, then a checkpoint that is not JSON; returns the bytes it held.
+fn with_a_corrupt_checkpoint(mut s: CdcScenario) -> (CdcScenario, Vec<u8>) {
     s.insert(1);
     s.settle();
     s.rig.run_ok();
     s.insert(2);
     s.settle();
     s.rig.run_ok();
-    assert!(
-        s.rig.checkpoint().is_file(),
-        "fixture: the baseline run wrote a checkpoint"
-    );
+    let good =
+        std::fs::read(s.rig.checkpoint()).expect("fixture: the baseline run wrote a checkpoint");
     std::fs::write(s.rig.checkpoint(), b"{not json").expect("corrupt the checkpoint");
-    s
-}
-
-/// RESULTS 13: the corrupt-checkpoint refusal says "delete it to accept a new anchor"; deleting it then runs.
-fn corrupt_checkpoint_remedy(s: CdcScenario) {
-    let mut s = with_a_corrupt_checkpoint(s);
-    s.rig.refuses_twice_then(
-        &["run"],
-        &[],
-        Refused::uncoded_known_defect(1, CHECKPOINT_UNCODED),
-        vec![Remedy::new(
-            "delete it to accept a new anchor from a fresh snapshot",
-            Then::DeliversTheSource,
-            |r| std::fs::remove_file(r.checkpoint()).expect("delete the checkpoint"),
-        )],
-    );
+    (s, good)
 }
 
 /// RESULTS 14: the heterogeneous-`_id` refusal of a resumed keyset run names "Remove `page_size`"; without it the export runs.
@@ -823,29 +822,49 @@ fn mongo_heterogeneous_resume_remedy() {
     );
 }
 
-/// RESULTS 15: a PostgreSQL CDC run refused for a table that does not exist leaves no replication slot.
-fn pg_cdc_missing_table_leaves_no_slot() {
+/// RESULTS 15: a PostgreSQL CDC run refused for a table that does not exist leaves no replication slot, and creating the table then runs; with a baseline (`initial: snapshot`) or as a changes-only stream.
+fn pg_cdc_missing_table_leaves_no_slot(baseline: bool) {
     let slot = unique_name("oc_noslot");
     let _guard = Slot::new(slot.clone());
-    let rig = Rig::pg_cdc(&unique_name("oc_absent"), &slot)
-        .cdc("initial: snapshot")
-        .oracle_known_defect(
-            "a failed run left: chunk-checkpoint",
-            "known defect: a PostgreSQL CDC run refused for a table that does not exist has already stored its export_state row and created its slot; the refusal must come before both",
-        );
-    let out = rig.run();
-    assert!(!out.status.success(), "fixture: the table does not exist");
-    let left: i64 = postgres::Client::connect(POSTGRES_CDC_URL, postgres::NoTls)
-        .expect("connect postgres-cdc")
-        .query_one(
-            "SELECT COUNT(*) FROM pg_replication_slots WHERE slot_name = $1",
-            &[&slot],
-        )
-        .expect("pg_replication_slots")
-        .get(0);
-    assert_eq!(
-        left, 0,
-        "a PostgreSQL CDC run refused for a table that does not exist left its replication slot"
+    let table = unique_name("oc_absent");
+    let _table = PgTable::adopt_on(POSTGRES_CDC_URL, table.clone());
+    let mut rig = Rig::pg_cdc(&table, &slot);
+    if baseline {
+        rig = rig.cdc("initial: snapshot");
+    }
+    // A changes-only stream anchors after the table is created: rows inserted before that are not its to deliver.
+    let seed = if baseline {
+        format!("; INSERT INTO {table} VALUES (1, 1)")
+    } else {
+        String::new()
+    };
+    rig.refuses_twice_then(
+        &["run"],
+        &[],
+        Refused::by_code(CDC_PREREQUISITE, 1),
+        vec![Remedy::new(
+            "Create the table",
+            Then::DeliversTheSource,
+            |_| {
+                let mut pg = postgres::Client::connect(POSTGRES_CDC_URL, postgres::NoTls)
+                    .expect("connect postgres-cdc");
+                let left: i64 = pg
+                    .query_one(
+                        "SELECT COUNT(*) FROM pg_replication_slots WHERE slot_name = $1",
+                        &[&slot],
+                    )
+                    .expect("pg_replication_slots")
+                    .get(0);
+                assert_eq!(
+                    left, 0,
+                    "a PostgreSQL CDC run refused for a table that does not exist left its replication slot"
+                );
+                pg.batch_execute(&format!(
+                    "CREATE TABLE {table} (id BIGINT PRIMARY KEY, v BIGINT){seed}"
+                ))
+                .expect("create the table the refusal named");
+            },
+        )],
     );
 }
 
@@ -881,33 +900,55 @@ fn second_run_beside(rig: Rig, n: usize) {
     assert_refused(&second, Refused::by_code("RIVET_STATE_RUN_IN_PROGRESS", 5));
 }
 
-/// Mac report C: a TRUNCATE inside the stream is refused as `RIVET_SOURCE_CDC_TRUNCATED` (exit 5), every cycle.
-fn truncate_is_refused_by_code(mut s: CdcScenario) {
+/// Mac report C: a TRUNCATE inside the stream is refused as `RIVET_SOURCE_CDC_TRUNCATED` (exit 5), every cycle; the re-baseline (after `first`, the engine's own step) delivers the source. Returns the refusal text.
+fn truncate_is_refused_by_code(mut s: CdcScenario, first: impl FnOnce(&mut Rig)) -> String {
     s.rig.run_ok();
     s.insert(1);
     s.settle();
     s.rig.run_ok();
     s.truncate();
-    s.rig.refuses_twice_then(
+    s.insert(2);
+    s.settle();
+    s.rig.refuses_twice_and_walks_out(
         &["run"],
         &[],
         Refused::by_code("RIVET_SOURCE_CDC_TRUNCATED", 5),
-        vec![],
-    );
+        vec![
+            Remedy::wrong(
+                "moves the destination's files out and nothing else",
+                Then::Refuses(TRUNCATED),
+                |r| {
+                    let out = r.out_dir();
+                    std::fs::rename(&out, out.with_extension("aside")).expect("move the parts");
+                    std::fs::create_dir_all(&out).expect("recreate the destination");
+                },
+            ),
+            Remedy::new(REBASELINE_REMEDY, Then::DeliversTheSource, |r| {
+                first(r);
+                apply_rebaseline_remedy(r, false)
+            }),
+        ],
+    )
 }
 
-/// Both reports: a corrupt checkpoint is refused as `RIVET_SOURCE_CDC_CHECKPOINT_INVALID` (exit 5), every cycle.
-fn corrupt_checkpoint_is_refused_by_code(s: CdcScenario) {
-    let mut s = with_a_corrupt_checkpoint(s);
-    s.rig.refuses_twice_then(
+/// Both reports, RESULTS 13: a corrupt checkpoint is refused as `RIVET_SOURCE_CDC_CHECKPOINT_INVALID` (exit 5), every cycle; restoring the file or the re-baseline delivers the source, and deleting the file alone ends as `delete_alone`.
+fn corrupt_checkpoint_is_refused_by_code(s: CdcScenario, delete_alone: Then) {
+    let (mut s, good) = with_a_corrupt_checkpoint(s);
+    s.rig.refuses_twice_and_walks_out(
         &["run"],
         &[],
         Refused::by_code("RIVET_SOURCE_CDC_CHECKPOINT_INVALID", 5),
-        vec![],
+        vec![
+            Remedy::new("Restore the file", Then::DeliversTheSource, move |r| {
+                std::fs::write(r.checkpoint(), &good).expect("restore the checkpoint")
+            }),
+            deletes_only_the_checkpoint(delete_alone),
+            rebaseline(true),
+        ],
     );
 }
 
-/// RESULTS 17 (PostgreSQL): a slot dropped under a baselined stream is refused as `RIVET_SOURCE_CDC_LOG_GAP` (exit 5).
+/// RESULTS 17 (PostgreSQL): a slot dropped under a baselined stream is refused as `RIVET_SOURCE_CDC_LOG_GAP` (exit 5); the re-baseline delivers the source.
 fn pg_dropped_slot_is_refused_by_code(after_a_changes_run: bool) {
     let slot = unique_name("oc_slotgone_slot");
     let _slot = Slot::new(slot.clone());
@@ -928,12 +969,33 @@ fn pg_dropped_slot_is_refused_by_code(after_a_changes_run: bool) {
         .unwrap();
     pg.execute("SELECT pg_drop_replication_slot($1)", &[&slot])
         .expect("drop the cell's own slot");
-    rig.refuses_twice_then(
+    rig.refuses_twice_and_walks_out(
         &["run"],
         &[],
         Refused::by_code("RIVET_SOURCE_CDC_LOG_GAP", 5),
-        vec![],
+        vec![
+            deletes_only_the_checkpoint(Then::Refuses(Refused::by_code(LOG_GAP, 5))),
+            rebaseline(true),
+        ],
     );
+}
+
+/// Move the slot named in the rig's config to the server's current WAL position.
+fn advance_the_slot(rig: &mut Rig) {
+    let yaml = std::fs::read_to_string(rig.config_path()).expect("the rendered config");
+    let slot = yaml
+        .split("slot: ")
+        .nth(1)
+        .and_then(|rest| rest.split([',', '}', '\n', ' ']).next())
+        .expect("fixture: the config names its slot")
+        .to_string();
+    postgres::Client::connect(POSTGRES_CDC_URL, postgres::NoTls)
+        .expect("connect postgres-cdc")
+        .execute(
+            "SELECT pg_replication_slot_advance($1, pg_current_wal_lsn())",
+            &[&slot],
+        )
+        .expect("advance the cell's own slot");
 }
 
 /// Drops a table on the postgres-cdc stand.
@@ -1084,6 +1146,7 @@ fn oracle_range_chunking_takes_a_number_19_key() {
 const MONGO_SLOW: i64 = 300_000;
 
 const LOG_GAP: &str = "RIVET_SOURCE_CDC_LOG_GAP";
+const CDC_PREREQUISITE: &str = "RIVET_SOURCE_CDC_PREREQUISITE";
 
 /// SQL Server: the change table cleaned past the checkpoint (what retention does) is refused as a log gap, pinned checkpoint or not.
 fn mssql_cleanup_past_the_checkpoint(after_a_changes_run: bool) {
@@ -1237,8 +1300,24 @@ fn mongo_oplog_rolled_past_the_checkpoint(after_a_changes_run: bool) {
     s.update(1);
     s.insert(3);
     rs.roll_the_oplog();
-    s.rig
-        .refuses_twice_then(&["run"], &[], Refused::by_code(LOG_GAP, 5), vec![]);
+    let said = s.rig.refuses_twice_then(
+        &["run"],
+        &[],
+        Refused::by_code(LOG_GAP, 5),
+        vec![deletes_only_the_checkpoint(Then::Refuses(
+            CHECKPOINT_INVALID,
+        ))],
+    );
+    assert!(
+        said.contains(REBASELINE_REMEDY) && !said.contains("change streams require a replica set"),
+        "the refusal names the re-baseline and not a setup cause:\n{said}"
+    );
+    follow_rebaseline_remedy(&mut s.rig, true);
+    assert_eq!(
+        parquet_rows(&s.rig.out_dir().join("snapshot")),
+        if after_a_changes_run { 3 } else { 2 },
+        "the re-baseline run delivered every document the source holds"
+    );
 }
 
 const REPLICA_PRIMARY: &str = "mysql://root:rivet@127.0.0.1:3308/rivet";
@@ -1265,11 +1344,9 @@ fn mysql_binlogs_purged_past_the_checkpoint(after_a_changes_run: bool) {
     let mut r = mysql::Conn::new(REPLICA_ROOT).expect("connect mysql-replica :3309");
     let running: Option<mysql::Row> = r.query_first("SHOW REPLICA STATUS").unwrap();
     let io: Option<String> = running.and_then(|row| row.get("Replica_SQL_Running"));
-    assert_eq!(
-        io.as_deref(),
-        Some("Yes"),
-        "fixture: the replica stand replicates (live_cdc_replica wires it)"
-    );
+    if io.as_deref() != Some("Yes") {
+        crate::live_cdc_replica::ensure_replication();
+    }
     let table = unique_name("oc_purge");
     let _table = ReplicatedTable(table.clone());
     p.query_drop(format!(
@@ -1306,7 +1383,15 @@ fn mysql_binlogs_purged_past_the_checkpoint(after_a_changes_run: bool) {
     let file: String = last.get(0).unwrap();
     r.query_drop(format!("PURGE BINARY LOGS TO '{file}'"))
         .unwrap();
-    rig.refuses_twice_then(&["run"], &[], Refused::by_code(LOG_GAP, 5), vec![]);
+    rig.refuses_twice_and_walks_out(
+        &["run"],
+        &[],
+        Refused::by_code("RIVET_SOURCE_CDC_LOG_GAP", 5),
+        vec![
+            deletes_only_the_checkpoint(Then::Refuses(CHECKPOINT_INVALID)),
+            rebaseline(true),
+        ],
+    );
 }
 
 /// Both reports, E/I: `doctor` is not green for a CDC export whose prerequisite the run then refuses.
@@ -1475,10 +1560,7 @@ fn standby_refusal_leaves_nothing_and_its_remedy_runs() {
         rig.refuses_twice_then(
             &["run"],
             &[],
-            Refused::uncoded_known_defect(
-                1,
-                "the standby refusal of a bounded CDC run has no registry code",
-            ),
+            Refused::by_code(CDC_PREREQUISITE, 1),
             vec![Remedy::new(
                 "point the source at the primary",
                 Then::DeliversTheSource,
@@ -1750,80 +1832,98 @@ fn an_unusable_state_url_is_refused_and_each_remedy_runs_oracle() {
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose --profile cdc mysql-cdc; open defect (corrupt checkpoint remedy), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_deleting_a_corrupt_cdc_checkpoint_accepts_a_new_anchor_mysql() {
-    corrupt_checkpoint_remedy(CdcScenario::mysql_with(
-        "oc_ckpt",
-        "id BIGINT PRIMARY KEY, v BIGINT",
-        |r, _| r.cdc("initial: snapshot"),
-    ));
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn a_corrupt_cdc_checkpoint_is_refused_by_code_mysql() {
+    corrupt_checkpoint_is_refused_by_code(
+        CdcScenario::mysql_with("oc_ckptc", "id BIGINT PRIMARY KEY, v BIGINT", |r, _| {
+            r.cdc("initial: snapshot")
+        }),
+        Then::Refuses(CHECKPOINT_INVALID),
+    );
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose --profile cdc mysql-cdc; open defect (uncoded corrupt-checkpoint refusal), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_corrupt_cdc_checkpoint_is_refused_by_code_mysql() {
-    corrupt_checkpoint_is_refused_by_code(CdcScenario::mysql_with(
-        "oc_ckptc",
-        "id BIGINT PRIMARY KEY, v BIGINT",
-        |r, _| r.cdc("initial: snapshot"),
-    ));
-}
-
-#[test]
-#[ignore = "live+gate-only: docker compose mssql (CDC); open defect (corrupt checkpoint remedy), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_deleting_a_corrupt_cdc_checkpoint_accepts_a_new_anchor_mssql() {
+#[ignore = "live: requires docker compose mssql (CDC)"]
+fn a_corrupt_cdc_checkpoint_is_refused_by_code_mssql() {
     let _serial = cross_process_serial("mssql_cdc");
-    corrupt_checkpoint_remedy(CdcScenario::mssql_with(
-        "oc_ckpt",
-        "id BIGINT PRIMARY KEY, v BIGINT",
-        |r, _| r.cdc("initial: snapshot"),
-    ));
+    corrupt_checkpoint_is_refused_by_code(
+        CdcScenario::mssql_with("oc_ckptc", "id BIGINT PRIMARY KEY, v BIGINT", |r, _| {
+            r.cdc("initial: snapshot")
+        }),
+        Then::Refuses(CHECKPOINT_INVALID),
+    );
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mssql (CDC); open defect (uncoded corrupt-checkpoint refusal), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_corrupt_cdc_checkpoint_is_refused_by_code_mssql() {
-    let _serial = cross_process_serial("mssql_cdc");
-    corrupt_checkpoint_is_refused_by_code(CdcScenario::mssql_with(
-        "oc_ckptc",
-        "id BIGINT PRIMARY KEY, v BIGINT",
-        |r, _| r.cdc("initial: snapshot"),
-    ));
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn a_cdc_truncate_is_refused_by_code_mysql() {
+    truncate_is_refused_by_code(
+        CdcScenario::mysql("oc_trunc", "id BIGINT PRIMARY KEY, v BIGINT"),
+        |_| {},
+    );
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose --profile cdc mysql-cdc; open defect (uncoded TRUNCATE refusal), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_cdc_truncate_is_refused_by_code_mysql() {
-    truncate_is_refused_by_code(CdcScenario::mysql(
-        "oc_trunc",
-        "id BIGINT PRIMARY KEY, v BIGINT",
-    ));
+#[ignore = "live: requires docker compose --profile cdc postgres-cdc"]
+fn a_cdc_truncate_is_refused_by_code_postgres() {
+    let said = truncate_is_refused_by_code(
+        CdcScenario::pg("oc_trunc", "id BIGINT PRIMARY KEY, v BIGINT"),
+        advance_the_slot,
+    );
+    assert!(
+        said.contains("First get the slot past this commit:"),
+        "the refusal names PostgreSQL's own first step:\n{said}"
+    );
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose --profile cdc postgres-cdc; open defect (uncoded TRUNCATE refusal), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_cdc_truncate_is_refused_by_code_postgres() {
-    truncate_is_refused_by_code(CdcScenario::pg(
-        "oc_trunc",
-        "id BIGINT PRIMARY KEY, v BIGINT",
-    ));
-}
-
-#[test]
-#[ignore = "live+gate-only: docker compose --profile cdc postgres-cdc; open defect (uncoded dropped-slot refusal), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_dropped_slot_is_refused_by_code_postgres() {
+#[ignore = "live: requires docker compose --profile cdc postgres-cdc"]
+fn a_dropped_slot_is_refused_by_code_postgres() {
     pg_dropped_slot_is_refused_by_code(false);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose --profile cdc postgres-cdc; open defect (slot left by a refused run), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_refused_cdc_run_on_a_missing_table_leaves_no_slot_postgres() {
-    pg_cdc_missing_table_leaves_no_slot();
+#[ignore = "live: requires docker compose --profile cdc postgres-cdc"]
+fn a_refused_cdc_run_on_a_missing_table_leaves_no_slot_postgres() {
+    pg_cdc_missing_table_leaves_no_slot(true);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose postgres; open defect (doctor green where run refuses), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_doctor_is_not_green_where_the_cdc_run_refuses_wal_level_postgres() {
+#[ignore = "live: requires docker compose --profile cdc postgres-cdc"]
+fn a_refused_changes_only_cdc_run_on_a_missing_table_leaves_no_slot_postgres() {
+    pg_cdc_missing_table_leaves_no_slot(false);
+}
+
+/// The MySQL twin of RESULTS 15: a first CDC run refused for a table that does not exist leaves no checkpoint, and creating the table then runs.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn a_refused_cdc_run_on_a_missing_table_leaves_no_checkpoint_mysql() {
+    use mysql::prelude::Queryable as _;
+    let table = unique_name("oc_absent");
+    let _table = MysqlCdcTable(table.clone());
+    let mut rig = Rig::mysql_cdc(&table);
+    rig.refuses_twice_then(
+        &["run"],
+        &[],
+        Refused::by_code(CDC_PREREQUISITE, 1),
+        vec![Remedy::new(
+            "Create the table",
+            Then::DeliversTheSource,
+            |_| {
+                mysql::Conn::new(MYSQL_CDC_URL)
+                    .expect("connect mysql-cdc")
+                    .query_drop(format!(
+                        "CREATE TABLE {table} (id BIGINT PRIMARY KEY, v BIGINT)"
+                    ))
+                    .expect("create the table the refusal named");
+            },
+        )],
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn doctor_is_not_green_where_the_cdc_run_refuses_wal_level_postgres() {
     doctor_agrees_on_a_server_without_logical_wal();
 }
 
@@ -2191,54 +2291,41 @@ fn an_unusable_state_url_is_refused_and_each_remedy_runs_mongo() {
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mongo-rs; open defect (corrupt checkpoint remedy), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_deleting_a_corrupt_cdc_checkpoint_accepts_a_new_anchor_mongo() {
-    corrupt_checkpoint_remedy(CdcScenario::mongo_with("oc_ckpt", |r, _| {
-        r.cdc("initial: snapshot")
-    }));
-}
-
-#[test]
-#[ignore = "live+gate-only: docker compose mongo-rs; open defect (uncoded corrupt-checkpoint refusal), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_corrupt_cdc_checkpoint_is_refused_by_code_mongo() {
-    corrupt_checkpoint_is_refused_by_code(CdcScenario::mongo_with("oc_ckptc", |r, _| {
-        r.cdc("initial: snapshot")
-    }));
+#[ignore = "live: requires docker compose mongo-rs"]
+fn a_corrupt_cdc_checkpoint_is_refused_by_code_mongo() {
+    corrupt_checkpoint_is_refused_by_code(
+        CdcScenario::mongo_with("oc_ckptc", |r, _| r.cdc("initial: snapshot")),
+        Then::Refuses(CHECKPOINT_INVALID),
+    );
 }
 
 #[cfg(feature = "oracle")]
 #[test]
-#[ignore = "live+gate-only: docker compose oracle (LogMiner); open defect (corrupt checkpoint remedy), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_deleting_a_corrupt_cdc_checkpoint_accepts_a_new_anchor_oracle() {
+#[ignore = "live: requires docker compose oracle (LogMiner)"]
+fn a_corrupt_cdc_checkpoint_is_refused_by_code_oracle() {
     let _serial = cross_process_serial("oracle_cdc");
-    corrupt_checkpoint_remedy(CdcScenario::oracle_with("oc_ckpt", |r, _| {
-        r.cdc("initial: snapshot")
-    }));
-}
-
-#[cfg(feature = "oracle")]
-#[test]
-#[ignore = "live+gate-only: docker compose oracle (LogMiner); open defect (uncoded corrupt-checkpoint refusal), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_corrupt_cdc_checkpoint_is_refused_by_code_oracle() {
-    let _serial = cross_process_serial("oracle_cdc");
-    corrupt_checkpoint_is_refused_by_code(CdcScenario::oracle_with("oc_ckptc", |r, _| r));
+    corrupt_checkpoint_is_refused_by_code(
+        CdcScenario::oracle_with("oc_ckptc", |r, _| r.cdc("initial: snapshot")),
+        Then::Refuses(CHECKPOINT_INVALID),
+    );
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose --profile cdc postgres-cdc; open defect (uncoded corrupt-checkpoint refusal), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_corrupt_cdc_checkpoint_is_refused_by_code_postgres() {
-    corrupt_checkpoint_is_refused_by_code(CdcScenario::pg_with(
-        "oc_ckptc",
-        "id BIGINT PRIMARY KEY, v BIGINT",
-        |r, _| r.cdc("initial: snapshot").relative_checkpoint("cdc.ckpt"),
-    ));
+#[ignore = "live: requires docker compose --profile cdc postgres-cdc"]
+fn a_corrupt_cdc_checkpoint_is_refused_by_code_postgres() {
+    corrupt_checkpoint_is_refused_by_code(
+        CdcScenario::pg_with("oc_ckptc", "id BIGINT PRIMARY KEY, v BIGINT", |r, _| {
+            r.cdc("initial: snapshot").relative_checkpoint("cdc.ckpt")
+        }),
+        Then::DeliversTheSource,
+    );
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mongo-rs; open defect (uncoded collection-drop refusal), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_cdc_collection_drop_is_refused_by_code_mongo() {
+#[ignore = "live: requires docker compose mongo-rs"]
+fn a_cdc_collection_drop_is_refused_by_code_mongo() {
     let s = CdcScenario::mongo_with("oc_trunc", |r, _| r);
-    truncate_is_refused_by_code(s);
+    truncate_is_refused_by_code(s, |_| {});
 }
 
 #[cfg(feature = "oracle")]
@@ -2247,19 +2334,18 @@ fn open_defect_a_cdc_collection_drop_is_refused_by_code_mongo() {
 fn a_cdc_truncate_is_refused_by_code_oracle() {
     let _serial = cross_process_serial("oracle_cdc");
     let s = CdcScenario::oracle_with("oc_trunc", |r, _| r);
-    truncate_is_refused_by_code(s);
+    truncate_is_refused_by_code(s, |_| {});
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose --profile cdc postgres-cdc; open defect (uncoded dropped-slot refusal), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_dropped_slot_after_a_changes_run_is_refused_by_code_postgres() {
+#[ignore = "live: requires docker compose --profile cdc postgres-cdc"]
+fn a_dropped_slot_after_a_changes_run_is_refused_by_code_postgres() {
     pg_dropped_slot_is_refused_by_code(true);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose --profile replica; open defect (uncoded binlog-gap refusal), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_binlogs_purged_past_the_checkpoint_before_the_first_changes_run_are_refused_by_code_mysql()
- {
+#[ignore = "live: requires docker compose --profile replica"]
+fn binlogs_purged_past_the_checkpoint_before_the_first_changes_run_are_refused_by_code_mysql() {
     let _serial = cross_process_serial("mysql_replica");
     mysql_binlogs_purged_past_the_checkpoint(false);
 }
@@ -2273,8 +2359,8 @@ fn a_change_table_cleaned_past_the_checkpoint_before_the_first_changes_run_is_re
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose --profile replica; open defect (uncoded binlog-gap refusal), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_binlogs_purged_past_the_checkpoint_after_a_changes_run_are_refused_by_code_mysql() {
+#[ignore = "live: requires docker compose --profile replica"]
+fn binlogs_purged_past_the_checkpoint_after_a_changes_run_are_refused_by_code_mysql() {
     let _serial = cross_process_serial("mysql_replica");
     mysql_binlogs_purged_past_the_checkpoint(true);
 }
@@ -2287,8 +2373,8 @@ fn a_change_table_cleaned_past_the_checkpoint_after_a_changes_run_is_refused_by_
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose --profile replica; open defect (doctor green where run refuses), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_doctor_is_not_green_where_the_cdc_run_refuses_a_replica_that_does_not_relog_mysql() {
+#[ignore = "live+gate-only: docker compose --profile replica, with replication wired to mysql-replica-nolog :3310 (the stand does it; CI's E2E job does not)"]
+fn doctor_is_not_green_where_the_cdc_run_refuses_a_replica_that_does_not_relog_mysql() {
     use mysql::prelude::Queryable as _;
     let _serial = cross_process_serial("mysql_replica");
     let table = unique_name("oc_nolog");
@@ -2301,12 +2387,7 @@ fn open_defect_doctor_is_not_green_where_the_cdc_run_refuses_a_replica_that_does
         .unwrap();
     std::thread::sleep(std::time::Duration::from_secs(2));
     doctor_agrees_where_the_stream_is_refused(
-        Rig::mysql_cdc(&table)
-            .source_url(REPLICA_NOLOG_RIVET)
-            .oracle_known_defect(
-                "a failed run left: cdc-checkpoint",
-                "known defect: a CDC run that refuses at open still writes its checkpoint at the position it started from; the anchor must be written after the open checks",
-            ),
+        Rig::mysql_cdc(&table).source_url(REPLICA_NOLOG_RIVET),
     );
 }
 
@@ -2343,8 +2424,8 @@ fn doctor_is_not_green_where_the_cdc_run_refuses_a_table_without_all_column_logg
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose --profile cdc postgres-cdc; open defect (rivet cdc stdout never advances the slot), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_cdc_to_stdout_emits_each_change_once_postgres() {
+#[ignore = "live: requires docker compose --profile cdc postgres-cdc"]
+fn cdc_to_stdout_emits_each_change_once_postgres() {
     cdc_stdout_emits_each_change_once(CdcScenario::pg_with(
         "oc_ndjson",
         "id BIGINT PRIMARY KEY, v BIGINT",
@@ -2525,8 +2606,8 @@ fn the_config_init_writes_runs_cdc_mongo() {
 }
 
 #[test]
-#[ignore = "live+gate-only: the cdc-standby pair (dev/pytools/cdc_stand); open defect (init config refused on a standby), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_the_config_init_writes_runs_cdc_on_a_standby_postgres() {
+#[ignore = "live+gate-only: the cdc-standby pair (dev/pytools/cdc_stand)"]
+fn the_config_init_writes_runs_cdc_on_a_standby_postgres() {
     let tbl = unique_name("oc_inits");
     let mut p = postgres::Client::connect(PG_STANDBY_PRIMARY_URL, postgres::NoTls)
         .expect("connect the cdc-standby primary");
@@ -2567,21 +2648,19 @@ fn check_names_the_strategy_run_uses_for_chunked_with_no_column_oracle() {
 }
 
 #[test]
-#[ignore = "live+gate-only: the cdc-standby pair (dev/pytools/cdc_stand); open defect (standby refusal leaves a baseline), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_bounded_cdc_run_refused_on_a_standby_leaves_nothing_and_its_remedy_runs_postgres()
-{
+#[ignore = "live+gate-only: the cdc-standby pair (dev/pytools/cdc_stand)"]
+fn a_bounded_cdc_run_refused_on_a_standby_leaves_nothing_and_its_remedy_runs_postgres() {
     standby_refusal_leaves_nothing_and_its_remedy_runs();
 }
 
 #[test]
-#[ignore = "live+gate-only: docker (a throwaway mongo replica set); open defect (oplog gone), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_an_oplog_rolled_past_the_checkpoint_before_the_first_changes_run_is_refused_by_code_mongo()
- {
+#[ignore = "live+gate-only: docker (a throwaway mongo replica set, `mongosh` in the image)"]
+fn an_oplog_rolled_past_the_checkpoint_before_the_first_changes_run_is_refused_by_code_mongo() {
     mongo_oplog_rolled_past_the_checkpoint(false);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker (a throwaway mongo replica set); open defect (oplog gone), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_an_oplog_rolled_past_the_checkpoint_after_a_changes_run_is_refused_by_code_mongo() {
+#[ignore = "live+gate-only: docker (a throwaway mongo replica set, `mongosh` in the image)"]
+fn an_oplog_rolled_past_the_checkpoint_after_a_changes_run_is_refused_by_code_mongo() {
     mongo_oplog_rolled_past_the_checkpoint(true);
 }

@@ -28,7 +28,7 @@ INDEPENDENT = re.compile(
     r"duckdb_|pg_count\(|mysql_count|mssql_count|mongo_count|source_count|dir_manifest_copy_id_set|"
     r"read_parquet|count_rows\(|query_i64\(|query_bigints|query_strings|\.query_one\(|\.query\(|"
     r"SELECT count|parquet_ids|parquet_rows|parquet_i64|parquet_id_set|parquet_distinct|"
-    r"read_cdc_changes|read_mongo_cdc_changes|read_ids|read_all_parts|read_declared_parts|"
+    r"read_cdc_changes|cdc_id_ops|read_mongo_cdc_changes|read_ids|read_all_parts|read_declared_parts|"
     r"read_bq_|row_census|census_oracle|count_field_present|ora_text_rows|\.count_documents|"
     # the test's OWN counters: a sink it wrote, the files it lists on disk
     r"CountingSink|files_with_extension"
@@ -37,24 +37,11 @@ INDEPENDENT = re.compile(
 #: `file::test` → why it is allowed today. Shrink-only.
 SELF_ONLY: dict[str, str] = {  # ratchet-pin: self-only-tests strings
     "audit_repair.rs::audit_repair_then_reconcile_converges": "listed 2026-09-27",
-    "live_cdc.rs::cdc_crash_after_flush_before_ack_re_reads_on_resume": "listed 2026-09-27",
-    "live_cdc.rs::cdc_idle_first_run_then_change_is_captured_not_skipped": "listed 2026-09-27",
     "live_cdc.rs::cdc_initial_snapshot_of_an_empty_table_converges_despite_skip_empty": "listed 2026-09-27",
-    "live_cdc.rs::cdc_mixed_transaction_ending_on_uncaptured_table_advances_checkpoint": "listed 2026-09-27",
-    "live_cdc.rs::cdc_multi_table_stream_one_binlog_connection_and_resumes": "listed 2026-09-27",
-    "live_cdc.rs::cdc_resume_captures_only_new_changes": "listed 2026-09-27",
     "live_cdc.rs::mysql_cdc_refuses_a_compressed_binlog_instead_of_capturing_nothing": "listed 2026-09-27",
-    "live_cdc.rs::pg_cdc_crash_after_flush_before_ack_does_not_advance_the_slot": "listed 2026-09-27",
-    "live_cdc.rs::pg_cdc_idle_first_run_then_change_is_captured_not_skipped": "listed 2026-09-27",
-    "live_cdc.rs::pg_cdc_mixed_transaction_ending_on_uncaptured_table_advances_checkpoint": "listed 2026-09-27",
-    "live_cdc.rs::pg_cdc_resume_captures_only_new_changes": "listed 2026-09-27",
     "live_cdc.rs::pg_cdc_vanished_slot_with_checkpoint_fails_loudly_not_recreates": "listed 2026-09-27",
     "live_cdc.rs::pg_initial_snapshot_vanished_slot_fails_loudly_not_recreates": "listed 2026-09-27",
     "live_cdc_golden.rs::cdc_golden_fixture_tables_calculated_metrics": "listed 2026-09-27",
-    "live_cdc_mssql.rs::mssql_cdc_crash_before_checkpoint_re_reads_on_resume": "listed 2026-09-27",
-    "live_cdc_mssql.rs::mssql_cdc_idle_first_run_then_change_is_captured_not_skipped": "listed 2026-09-27",
-    "live_cdc_mssql.rs::mssql_cdc_mixed_transaction_and_qualified_table_conformance": "listed 2026-09-27",
-    "live_cdc_mssql.rs::mssql_cdc_resume_captures_only_new_changes": "listed 2026-09-27",
     "live_keyset_parallel.rs::parallel_keyset_midrange_error_counts_pre_failure_page_parts_postgres": "listed 2026-09-27",
     "live_pg_state.rs::pg_metrics_record_and_query": "listed 2026-09-27",
 }  # ratchet-pin: end

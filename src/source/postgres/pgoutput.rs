@@ -675,13 +675,13 @@ impl Assembler {
                         )
                     })
                     .collect();
-                anyhow::bail!(
+                Err(crate::source::cdc::checkpoint_identity::truncated(format!(
                     "pgoutput: TRUNCATE of {} — this reader cannot represent it as a \
                      change. Every row the truncate removed would sit in the \
                      destination with no DELETE to retract it. {}",
                     named.join(", "),
                     crate::source::cdc::checkpoint_identity::RECOVER
-                )
+                )))
             }
             // A barrier is not a change. It is also not something to swallow: the
             // caller decides whether this is ITS nonce, and a reader that dropped
