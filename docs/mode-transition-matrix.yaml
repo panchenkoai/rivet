@@ -287,6 +287,43 @@ scenarios:
     oracle:   { test: crashed_range_chunk_then_checkpoint_removed_reset_oracle }
     mongo:    { na: "a Mongo export has no range chunking (mode: full or cdc only)" }
 
+  # The same two cells over a 3-row table (chunk_size 4): the planner runs the uncheckpointed stage as one
+  # pass (`export_metrics.mode = full`, asserted), and the refusal must still be the checkpoint one. Open
+  # defect (2026-10-09): that single pass names `full` as the owner of its progress and is told to restore
+  # the `chunked` settings it still has. Acknowledged in dev/release_oracle/known_red.py.
+
+  - id: open_defect_a_one_chunk_range_run_without_its_checkpoint_is_refused_as_its_own_mode_finish_the_run
+    what: "MT10, open defect — crashed range-chunk checkpoint run over a table that fits in one chunk, then the same mode without `chunk_checkpoint` (planned as a single pass): refused twice with the checkpoint wording; the checkpoint restored finishes the run; the single pass then delivers the source as it is, and the checkpoint back on starts a fresh run"
+    postgres: { test: open_defect_a_one_chunk_range_run_without_its_checkpoint_is_refused_as_its_own_mode_finish_the_run_postgres }
+    mysql:    { test: open_defect_a_one_chunk_range_run_without_its_checkpoint_is_refused_as_its_own_mode_finish_the_run_mysql }
+    mssql:    { test: open_defect_a_one_chunk_range_run_without_its_checkpoint_is_refused_as_its_own_mode_finish_the_run_mssql }
+    oracle:   { test: open_defect_a_one_chunk_range_run_without_its_checkpoint_is_refused_as_its_own_mode_finish_the_run_oracle }
+    mongo:    { na: "a Mongo export has no range chunking (mode: full or cdc only)" }
+
+  - id: open_defect_a_one_chunk_range_run_without_its_checkpoint_is_refused_as_its_own_mode_reset
+    what: "MT10, open defect — crashed range-chunk checkpoint run over a table that fits in one chunk, then the same mode without `chunk_checkpoint` (planned as a single pass): refused twice with the checkpoint wording; `rivet state reset-chunks` abandons the run; the single pass then delivers the source as it is, and the checkpoint back on starts a fresh run"
+    postgres: { test: open_defect_a_one_chunk_range_run_without_its_checkpoint_is_refused_as_its_own_mode_reset_postgres }
+    mysql:    { test: open_defect_a_one_chunk_range_run_without_its_checkpoint_is_refused_as_its_own_mode_reset_mysql }
+    mssql:    { test: open_defect_a_one_chunk_range_run_without_its_checkpoint_is_refused_as_its_own_mode_reset_mssql }
+    oracle:   { test: open_defect_a_one_chunk_range_run_without_its_checkpoint_is_refused_as_its_own_mode_reset_oracle }
+    mongo:    { na: "a Mongo export has no range chunking (mode: full or cdc only)" }
+
+  - id: open_defect_a_one_chunk_auto_keyset_run_without_its_checkpoint_is_refused_as_its_own_mode_finish_the_run
+    what: "MT10, open defect — the same over MySQL's auto-selected keyset key (no `chunk_column`, no single-integer primary key): refused twice with the checkpoint wording; the checkpoint restored finishes the run; the single pass then delivers the source as it is"
+    postgres: { na: "the planner pages a unique key by keyset on its own only on MySQL (ADR-0020); elsewhere a table with no single-integer primary key and no `chunk_column` is refused" }
+    mysql:    { test: open_defect_a_one_chunk_auto_keyset_run_without_its_checkpoint_is_refused_as_its_own_mode_finish_the_run_mysql }
+    mssql:    { na: "the planner pages a unique key by keyset on its own only on MySQL (ADR-0020); elsewhere a table with no single-integer primary key and no `chunk_column` is refused" }
+    oracle:   { na: "the planner pages a unique key by keyset on its own only on MySQL (ADR-0020); elsewhere a table with no single-integer primary key and no `chunk_column` is refused" }
+    mongo:    { na: "a Mongo export has no `mode: chunked`" }
+
+  - id: open_defect_a_one_chunk_auto_keyset_run_without_its_checkpoint_is_refused_as_its_own_mode_reset
+    what: "MT10, open defect — the same over MySQL's auto-selected keyset key (no `chunk_column`, no single-integer primary key): refused twice with the checkpoint wording; `rivet state reset` abandons the run; the single pass then delivers the source as it is"
+    postgres: { na: "the planner pages a unique key by keyset on its own only on MySQL (ADR-0020); elsewhere a table with no single-integer primary key and no `chunk_column` is refused" }
+    mysql:    { test: open_defect_a_one_chunk_auto_keyset_run_without_its_checkpoint_is_refused_as_its_own_mode_reset_mysql }
+    mssql:    { na: "the planner pages a unique key by keyset on its own only on MySQL (ADR-0020); elsewhere a table with no single-integer primary key and no `chunk_column` is refused" }
+    oracle:   { na: "the planner pages a unique key by keyset on its own only on MySQL (ADR-0020); elsewhere a table with no single-integer primary key and no `chunk_column` is refused" }
+    mongo:    { na: "a Mongo export has no `mode: chunked`" }
+
   - id: crashed_keyset_then_checkpoint_removed_finish_the_run
     what: "MT10 — crashed keyset checkpoint run, then the same mode without `chunk_checkpoint` (Mongo: without `resume`): refused twice; the checkpoint restored finishes the run; the uncheckpointed run then delivers the source as it is, and the checkpoint back on starts a fresh run"
     postgres: { test: crashed_keyset_then_checkpoint_removed_finish_the_run_postgres }
