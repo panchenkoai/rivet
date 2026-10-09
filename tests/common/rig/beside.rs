@@ -146,6 +146,108 @@ impl Drop for ReadOnly {
     }
 }
 
+/// A small volume of its own that a cell fills and frees: a disk image mounted for the cell, detached on drop.
+pub struct TinyVolume {
+    at: tempfile::TempDir,
+}
+
+impl TinyVolume {
+    /// Mount a volume of `megabytes`; `None`, with the skip recorded, where the cell cannot mount one.
+    pub fn mounted(megabytes: u32) -> Option<Self> {
+        if !cfg!(target_os = "macos") {
+            crate::common::skip_live(
+                "no volume this cell may fill: it mounts a disk image with macOS `hdiutil` (a Linux tmpfs needs root)",
+            );
+            return None;
+        }
+        let at = tempfile::tempdir().expect("a mount point");
+        let image = at.path().join("volume.dmg");
+        let mount = at.path().join("mnt");
+        std::fs::create_dir(&mount).expect("mkdir the mount point");
+        let hdiutil = |args: &[&str]| {
+            let out = std::process::Command::new("hdiutil")
+                .args(args)
+                .output()
+                .expect("run hdiutil");
+            assert!(
+                out.status.success(),
+                "hdiutil {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let (size, image, mount) = (
+            format!("{megabytes}m"),
+            image.to_string_lossy().to_string(),
+            mount.to_string_lossy().to_string(),
+        );
+        hdiutil(&[
+            "create", "-size", &size, "-fs", "HFS+", "-volname", "rivet", "-quiet", &image,
+        ]);
+        hdiutil(&[
+            "attach",
+            "-nobrowse",
+            "-quiet",
+            "-mountpoint",
+            &mount,
+            &image,
+        ]);
+        Some(Self { at })
+    }
+
+    /// The root of the volume.
+    pub fn path(&self) -> PathBuf {
+        self.at.path().join("mnt")
+    }
+
+    /// Fill the volume, again while a writer beside the cell frees what it staged; panics unless a write to it is then refused.
+    pub fn fill(&self) {
+        use std::io::Write as _;
+        let mut ballast = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.path().join(".ballast"))
+            .expect("open the ballast");
+        let mut takes = |bytes: usize| {
+            let block = vec![0u8; bytes];
+            ballast
+                .write_all(&block)
+                .and_then(|()| ballast.sync_data())
+                .is_ok()
+        };
+        for _ in 0..20 {
+            for bytes in [1 << 16, 512] {
+                while takes(bytes) {}
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        if let Some(why) = not_filled(takes(8192)) {
+            panic!("{why}");
+        }
+    }
+
+    /// Give the space back.
+    pub fn free(&self) {
+        std::fs::remove_file(self.path().join(".ballast")).expect("remove the ballast");
+    }
+}
+
+impl Drop for TinyVolume {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("hdiutil")
+            .args(["detach", "-quiet", "-force"])
+            .arg(self.path())
+            .output();
+    }
+}
+
+/// Why a volume a cell filled is not full, else `None`: a further write must be refused.
+pub(crate) fn not_filled(still_writable: bool) -> Option<String> {
+    still_writable.then(|| {
+        "sabotage: the volume still takes a write after it was filled: nothing was taken away"
+            .to_string()
+    })
+}
+
 /// The SQLite state files in `dir`.
 fn state_files(dir: &Path) -> Vec<PathBuf> {
     crate::common::runner::files_under(dir)
@@ -464,5 +566,23 @@ mod tests {
             outlived: false,
         };
         let _ = met.answered_while_alive();
+    }
+
+    #[test]
+    fn a_volume_that_still_takes_a_write_was_not_filled() {
+        assert!(not_filled(true).is_some_and(|why| why.contains("nothing was taken away")));
+        assert_eq!(not_filled(false), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_filled_volume_refuses_a_write_until_it_is_freed() {
+        let volume = TinyVolume::mounted(4).expect("macOS mounts one");
+        let file = volume.path().join("part");
+        std::fs::write(&file, [0u8; 8192]).expect("an empty volume takes a write");
+        volume.fill();
+        assert!(std::fs::write(&file, [0u8; 65536]).is_err());
+        volume.free();
+        std::fs::write(&file, [0u8; 65536]).expect("a freed volume takes a write");
     }
 }
