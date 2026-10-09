@@ -41,12 +41,53 @@ impl Drop for LoadLease<'_> {
     }
 }
 
+#[cfg(test)]
+impl<'a> LoadLease<'a> {
+    /// A held lease on `key` as a Postgres state grants one, kept by a keeper with no thread and no connection.
+    pub(crate) fn kept_for_test(store: &'a StateStore, key: &str) -> Self {
+        let shared = Arc::new(Shared {
+            ttl: 30,
+            alive: AtomicBool::new(true),
+            next_id: AtomicU64::new(0),
+            rows: Mutex::new(HashMap::new()),
+        });
+        let id = shared.keep(key, "h:1:1", Instant::now());
+        let keeper = Arc::new(Keeper {
+            shared,
+            stop: None,
+            thread: None,
+        });
+        Self {
+            store,
+            key: key.to_string(),
+            holder: "h:1:1".to_string(),
+            _file: None,
+            kept: Some((keeper, id)),
+        }
+    }
+
+    /// Lose the lease the way a renewal that found another holder on its row does.
+    pub(crate) fn lose_for_test(&self) {
+        if let Some((keeper, _)) = &self.kept {
+            let shared = &keeper.shared;
+            shared.settle(&shared.asked(), &HashSet::new(), Instant::now());
+        }
+    }
+}
+
 /// One `state_lease` row the keeper renews.
 struct Kept {
     key: String,
     holder: String,
     renewed: Instant,
     lost: bool,
+}
+
+impl Kept {
+    /// Whether the row is still ours `age` after its last renewal: not lost, and less than a whole `ttl` seconds old.
+    fn fresh(&self, age: Duration, ttl: u64) -> bool {
+        !self.lost && age < Duration::from_secs(ttl)
+    }
 }
 
 /// What the keeper's thread and the leases it keeps share.
@@ -82,7 +123,7 @@ impl Shared {
             && self
                 .rows()
                 .get(&id)
-                .is_some_and(|k| !k.lost && k.renewed.elapsed() < Duration::from_secs(self.ttl))
+                .is_some_and(|k| k.fresh(k.renewed.elapsed(), self.ttl))
     }
 
     /// The `(id, key, holder)` of every row to renew.
@@ -448,6 +489,33 @@ mod tests {
         let stale = s.keep("p.d.b", "h:1:2", now - Duration::from_secs(30));
         assert!(s.holds(fresh));
         assert!(!s.holds(stale));
+    }
+
+    /// The TTL boundary is exclusive: a row is ours up to, and not at, one whole TTL after its last renewal.
+    #[test]
+    fn a_lease_exactly_one_ttl_old_is_not_held() {
+        let kept = |lost| Kept {
+            key: "p.d.a".to_string(),
+            holder: "h:1:1".to_string(),
+            renewed: Instant::now(),
+            lost,
+        };
+        let ttl = Duration::from_secs(30);
+        assert!(kept(false).fresh(ttl - Duration::from_nanos(1), 30));
+        assert!(!kept(false).fresh(ttl, 30), "exactly one TTL old");
+        assert!(!kept(true).fresh(Duration::ZERO, 30), "a lost row");
+    }
+
+    /// A lease a keeper keeps answers for its own row: held while the row is ours, not once a renewal lost it.
+    #[test]
+    fn a_kept_lease_is_held_until_its_keeper_loses_its_row() {
+        let store = StateStore::open_in_memory().unwrap();
+        let lease = LoadLease::kept_for_test(&store, "p.d.orders");
+        let other = LoadLease::kept_for_test(&store, "p.d.other");
+        assert!(lease.is_held());
+        lease.lose_for_test();
+        assert!(!lease.is_held(), "a renewal found another holder");
+        assert!(other.is_held(), "another keeper's row is untouched");
     }
 
     /// One renewal answers for every asked row: the rows that came back are fresh, the others are lost for good.

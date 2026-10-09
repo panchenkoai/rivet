@@ -5415,6 +5415,28 @@ mod load_message_tests {
         assert!(holds(&take_table_lease(Some(&state), &key).unwrap()));
     }
 
+    /// A lease its keeper lost is not held, and the load stops on it by code on either side of the write.
+    #[test]
+    fn a_lease_its_keeper_lost_stops_the_load() {
+        let state = crate::state::StateStore::open_in_memory().unwrap();
+        let lease = Some(crate::state::LoadLease::kept_for_test(&state, "p.d.orders"));
+        assert!(holds(&lease));
+        assert!(lease_still_held(holds(&lease), "p.d.orders", false).is_ok());
+        lease.as_ref().unwrap().lose_for_test();
+        assert!(!holds(&lease));
+        let before = lease_still_held(holds(&lease), "p.d.orders", false).unwrap_err();
+        assert!(before.is::<load::Refused>());
+        assert_eq!(
+            crate::error::error_code(&before),
+            Some("RIVET_STATE_LEASE_LOST")
+        );
+        let after = lease_still_held(holds(&lease), "p.d.orders", true).unwrap_err();
+        assert_eq!(
+            crate::error::error_code(&after),
+            Some("RIVET_LOAD_LEASE_LOST_DURING_WRITE")
+        );
+    }
+
     /// A lease lost before the warehouse write is a coded refusal the ledger records as `refused`.
     #[test]
     fn a_lease_lost_before_the_write_is_a_refusal() {
