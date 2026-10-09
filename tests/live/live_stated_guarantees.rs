@@ -711,7 +711,7 @@ fn pooled_session() -> (i32, Vec<(String, String)>) {
 #[test]
 #[ignore = "live: requires docker compose --profile pool up -d pgbouncer (transaction mode, pool_size=1)"]
 fn every_batch_shape_through_a_transaction_pooler_leaves_its_session_as_it_was_postgres() {
-    require_alive(LiveService::PgBouncer);
+    let _alone = pgbouncer_alone();
     let engine = SqlEngine::Pg;
     engine.alive();
     let (table, _guard) = engine.range_table("guar_pool");
@@ -740,6 +740,51 @@ fn every_batch_shape_through_a_transaction_pooler_leaves_its_session_as_it_was_p
             "{mode} {lines:?}: the run changed the session of the pooled connection"
         );
     }
+}
+
+/// docs/why/source-safe-under-load.md names pgBouncer among the fronts rivet is built for. A
+/// transaction-mode pgBouncer reuses a prepared statement by its text across clients, and every
+/// export reads through `FETCH n FROM _rivet`: the second table through one pooled connection is
+/// described as the first was. It must still deliver its own columns and values.
+#[test]
+#[ignore = "live+gate-only: docker compose --profile pool up -d pgbouncer; open defect (a second table through one transaction pooler is read under the first table's columns), acknowledged in dev/release_oracle/known_red.py"]
+fn open_defect_a_second_table_through_one_transaction_pooler_keeps_its_own_columns_postgres() {
+    let _alone = pgbouncer_alone();
+    let engine = SqlEngine::Pg;
+    engine.alive();
+    let (first, _first) = engine.create("guar_poola", "id BIGINT PRIMARY KEY, v BIGINT NOT NULL");
+    let (second, _second) = engine.create(
+        "guar_poolb",
+        "id BIGINT PRIMARY KEY, amount DOUBLE PRECISION NOT NULL",
+    );
+    engine.exec(&format!(
+        "INSERT INTO {first} SELECT g, g FROM generate_series(1, 20) g"
+    ));
+    engine.exec(&format!(
+        "INSERT INTO {second} SELECT g, g + 0.5 FROM generate_series(1, 20) g"
+    ));
+    let delivered = |table: &str| {
+        let rig = engine.rig(table).source_url(PGBOUNCER_URL);
+        let run = rig.run();
+        let (schema, rows) = events(&files_with_extension(&rig.out_dir(), "parquet"));
+        (run.status.success(), schema, rows.first().cloned())
+    };
+    let (ok, schema, _) = delivered(&first);
+    assert!(
+        ok && schema == ["id: Int64", "v: Int64"],
+        "fixture: the first table arrives as itself ({schema:?})"
+    );
+    let (ok, schema, row) = delivered(&second);
+    assert!(
+        !ok || (schema == ["id: Int64", "amount: Float64"]
+            && row == Some(vec!["1".to_string(), "1.5".to_string()])),
+        "the second table through the pooler exited 0 as {schema:?} with first row {row:?}, not as \
+         [id, amount] with (1, 1.5)"
+    );
+    assert!(
+        ok,
+        "the second table through the pooler was refused, not delivered"
+    );
 }
 
 /// The forwarder closes an answer at the next request, and one page is told from two.

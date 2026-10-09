@@ -776,8 +776,8 @@ guarantees:
       - file: docs/recipes/idempotent-warehouse-load.md
         sentence: "Every other column, `_rivet_row_hash` included, is identical."
     held_by:
-      postgres: { gate: verify_byte_identical_parts, asserts: "stamped_differ(was, now, BYTES_ROWS)" }
-      mysql: { gate: verify_byte_identical_parts, asserts: "stamped_differ(was, now, BYTES_ROWS)" }
-      mssql: { gate: verify_byte_identical_parts, asserts: "stamped_differ(was, now, BYTES_ROWS)" }
-      mongo: { gate: verify_byte_identical_parts, asserts: "stamped_differ(was, now, BYTES_ROWS)" }
-      oracle: { gate: verify_byte_identical_parts, asserts: "stamped_differ(was, now, BYTES_ROWS)" }
+      postgres: { gate: verify_byte_identical_parts, asserts: "stamped_differ(_stamped(was, now), BYTES_ROWS)" }
+      mysql: { gate: verify_byte_identical_parts, asserts: "stamped_differ(_stamped(was, now), BYTES_ROWS)" }
+      mssql: { gate: verify_byte_identical_parts, asserts: "stamped_differ(_stamped(was, now), BYTES_ROWS)" }
+      mongo: { gate: verify_byte_identical_parts, asserts: "stamped_differ(_stamped(was, now), BYTES_ROWS)" }
+      oracle: { gate: verify_byte_identical_parts, asserts: "stamped_differ(_stamped(was, now), BYTES_ROWS)" }
