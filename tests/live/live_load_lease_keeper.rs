@@ -347,6 +347,7 @@ fn a_load_whose_lease_is_taken_mid_load_writes_nothing_and_is_recorded_refused()
         !out.status.success(),
         "a load whose lease another holder took exited 0:\n{said}"
     );
+    assert_eq!(out.status.code(), Some(5), "a refusal:\n{said}");
     assert!(said.contains("[RIVET_STATE_LEASE_LOST]"), "{said}");
     assert_eq!(
         existing_tables(&bq, &[&t]),
@@ -389,6 +390,10 @@ fn a_load_whose_lease_is_taken_during_the_write_fails_and_is_recorded_failed() {
         return;
     };
     let (t, rig, _guard) = loadable(&bq, "lk_written");
+    let rig = rig.a_failed_run_may_leave(
+        &[Leftover::LoadAttempt],
+        "the lease is lost after the warehouse write: the load did reach the write",
+    );
     let _cleanup = bq.cleanup(&[&t]);
     let url = state.url();
     let env = [("RIVET_STATE_URL", url.as_str()), SHORT_TTL[0]];
@@ -408,7 +413,11 @@ fn a_load_whose_lease_is_taken_during_the_write_fails_and_is_recorded_failed() {
         !out.status.success(),
         "a load whose lease another holder took during the write exited 0:\n{said}"
     );
-    assert!(said.contains("[RIVET_STATE_LEASE_LOST]"), "{said}");
+    assert_eq!(out.status.code(), Some(3), "an integrity failure:\n{said}");
+    assert!(
+        said.contains("[RIVET_LOAD_LEASE_LOST_DURING_WRITE]"),
+        "{said}"
+    );
     assert!(
         said.contains("This run's warehouse write is done and is recorded as failed"),
         "{said}"

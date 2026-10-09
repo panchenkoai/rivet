@@ -152,7 +152,7 @@ scenarios:
     oracle:   { na: "same source-agnostic load path" }
 
   - id: load_lease_lost_during_the_write_loud
-    what: "a PostgreSQL-state `rivet load` stalled while it writes the warehouse, its lease taken by another holder → RIVET_STATE_LEASE_LOST after the write, the ledger row `failed` (the table stays rivet's own), never a `success`; the next load loads the table"
+    what: "a PostgreSQL-state `rivet load` stalled while it writes the warehouse, its lease taken by another holder → RIVET_LOAD_LEASE_LOST_DURING_WRITE (exit 3) after the write, the ledger row `failed` (the table stays rivet's own), never a `success`; the next load loads the table"
     postgres: { test: a_load_whose_lease_is_taken_during_the_write_fails_and_is_recorded_failed }
     mysql:    { na: "`rivet load` never reads the source: the lease is the state backend's — pinned once" }
     mssql:    { na: "same source-agnostic load path" }

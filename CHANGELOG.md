@@ -28,8 +28,9 @@
       taken by another process) stops before the warehouse write with exit 5
       `RIVET_STATE_LEASE_LOST`, recorded `refused` in the load ledger; the next
       `rivet load` loads the table. When the loss is found only after the write, the
-      command fails with the same code and the ledger row is `failed`, not `success`, so
-      the next `rivet load` loads the same runs again.
+      command fails with exit 3 `RIVET_LOAD_LEASE_LOST_DURING_WRITE` and the ledger row
+      is `failed`, not `success`: another load or compact may have written the table at
+      the same time, and the next `rivet load` loads the same runs again.
     - A checkpointed `rivet run` takes its run lease through the same connection and is
       refused with `RIVET_STATE_LEASE_KEEPER_UNAVAILABLE` when it cannot be opened. A
       PostgreSQL state that cannot be reached for want of file descriptors is an `Error:`

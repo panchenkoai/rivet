@@ -576,7 +576,7 @@ pub mod codes {
     /// A PostgreSQL-state lease stopped being this process's while the work it guards was under way.
     pub const STATE_LEASE_LOST: Code = refusal(
         "RIVET_STATE_LEASE_LOST",
-        "wait for the other `rivet load` or `rivet compact` of that table to end, then run again; if the message says the warehouse was already written, the runs it names are loaded again by that run",
+        "wait for the other `rivet load` or `rivet compact` of that table to end, then run again; nothing was written to the warehouse",
     );
     /// `rivet plan` could not read the source it plans over (no connection, a refused login, a missing table or collection).
     pub const PLAN_SOURCE_UNREADABLE: Code = environment(
@@ -605,6 +605,11 @@ pub mod codes {
     pub const LOAD_COUNT_MISMATCH: Code = integrity(
         "RIVET_LOAD_COUNT_MISMATCH",
         "compare the warehouse table with the run's manifest before re-running; the source is kept",
+    );
+    /// A load or compact found its table lease lost after it had written the warehouse.
+    pub const LOAD_LEASE_LOST_DURING_WRITE: Code = integrity(
+        "RIVET_LOAD_LEASE_LOST_DURING_WRITE",
+        "compare the warehouse table with the source before relying on it: another load or compact may have written it at the same time; the next `rivet load` loads the same runs again",
     );
     pub const LOAD_ADOPTION_COLUMN_MISMATCH: Code = refusal(
         "RIVET_LOAD_ADOPTION_COLUMN_MISMATCH",
@@ -688,6 +693,7 @@ pub mod codes {
         DEST_ALREADY_COMPLETE,
         LOAD_VALUE_OUT_OF_TARGET_RANGE,
         LOAD_COUNT_MISMATCH,
+        LOAD_LEASE_LOST_DURING_WRITE,
         LOAD_ADOPTION_COLUMN_MISMATCH,
         LOAD_TARGET_NOT_RIVETS,
         VALIDATE_FAILED,

@@ -556,18 +556,20 @@ fn lease_lost_message(target_fqtn: &str, written: bool) -> String {
     }
 }
 
-/// Stop once the table's lease is not `held`: a refusal before the warehouse write, a failure once it is `written`.
+/// Stop once the table's lease is not `held`: a refusal before the warehouse write, an integrity failure once it is `written`.
 pub(super) fn lease_still_held(held: bool, target_fqtn: &str, written: bool) -> Result<()> {
     if held {
         return Ok(());
     }
-    let lost = Err(anyhow::Error::new(crate::error::CodedError::new(
-        crate::error::codes::STATE_LEASE_LOST,
-        lease_lost_message(target_fqtn, written),
-    )));
+    let coded = |code| {
+        let message = lease_lost_message(target_fqtn, written);
+        Err(anyhow::Error::new(crate::error::CodedError::new(
+            code, message,
+        )))
+    };
     match written {
-        false => load::before_write(lost),
-        true => lost,
+        false => load::before_write(coded(crate::error::codes::STATE_LEASE_LOST)),
+        true => coded(crate::error::codes::LOAD_LEASE_LOST_DURING_WRITE),
     }
 }
 
@@ -5436,8 +5438,11 @@ mod load_message_tests {
     fn a_lease_lost_during_the_write_is_a_failure() {
         let e = lease_still_held(false, "p.d.orders", true).unwrap_err();
         assert!(!e.is::<load::Refused>());
-        assert_eq!(crate::error::error_code(&e), Some("RIVET_STATE_LEASE_LOST"));
-        assert_eq!(crate::error::classify_exit(&e), 5);
+        assert_eq!(
+            crate::error::error_code(&e),
+            Some("RIVET_LOAD_LEASE_LOST_DURING_WRITE")
+        );
+        assert_eq!(crate::error::classify_exit(&e), 3);
         assert_eq!(ledger_status(&e), "failed");
         assert_eq!(
             e.to_string(),

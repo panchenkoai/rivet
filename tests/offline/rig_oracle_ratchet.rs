@@ -39,7 +39,8 @@ const NO_ORACLE_CEILING: usize = 24; // ratchet-pin: no-oracle-opt-outs
 // 36 -> 39 (2026-10-08): `run --validate` over a failed verification now exits 3 and a failed cursor write exits 1, both after the export completed: the two operator-contract generators and roast_metric_validated_matches_final_summary_verdict declare the delivered run.
 // 39 -> 40 (2026-10-08): the SQL Server ADD COLUMN remedy cell: the log-gap refusal after the re-enable has stored the widened schema.
 // 40 -> 41 (2026-10-08): the sabotage cells that take a resource away from a live run (one shared declaration, `stopped_mid_run`): the parts, file_log rows and checkpoint rows written before the stop stay for the next run.
-const FAILED_RUN_LEFTOVER_CEILING: usize = 41; // ratchet-pin: failed-run-leftover-declarations
+// 41 -> 42 (2026-10-09): a load whose lease is lost after the warehouse write exits 3 and keeps its `failed` ledger row, which is what makes the table rivet's own.
+const FAILED_RUN_LEFTOVER_CEILING: usize = 42; // ratchet-pin: failed-run-leftover-declarations
 
 /// Entries of `KNOWN_PRODUCT_DEFECTS` (tests/common/refusal.rs): product defects every failed run may show.
 // 2 -> 1 (2026-10-08): a run that fails before its first write leaves the prefix alone, so a failed manifest before a write is a failure, no longer an excuse.
