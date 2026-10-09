@@ -768,6 +768,9 @@ pub fn init(
         }
     };
     let yaml_scaffold::Scaffold { text, decisions } = scaffold;
+    let text = yaml_scaffold::for_source(text, source_type(source_url).unwrap_or_default(), || {
+        pg_in_recovery(source_url, tls)
+    });
 
     if let Some(notice) = cursor_notice(&decisions, mode_override, table.is_none()) {
         eprintln!("{notice}");
@@ -1065,6 +1068,13 @@ fn reject_mongo_schema(schema_flag: Option<&str>) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Whether the PostgreSQL server at `source_url` answers that it is in recovery (a standby); an unanswered probe is not one.
+fn pg_in_recovery(source_url: &str, tls: Option<&crate::config::TlsConfig>) -> bool {
+    crate::source::postgres::connect_client(source_url, tls)
+        .and_then(|mut c| Ok(c.query_one("SELECT pg_is_in_recovery()", &[])?.get(0)))
+        .unwrap_or(false)
 }
 
 #[allow(clippy::too_many_arguments)] // mirrors `init`'s own surface; a params
@@ -1715,6 +1725,15 @@ mod tests {
                 .to_string()
                 + &only_chunk
         );
+    }
+
+    /// A server that does not answer is not a standby.
+    #[test]
+    fn a_server_that_does_not_answer_is_not_in_recovery() {
+        assert!(!pg_in_recovery(
+            "postgresql://rivet:rivet@127.0.0.1:1/rivet",
+            None
+        ));
     }
 
     fn schema_scaffold(infos: &[TableInfo], mode: Option<&str>) -> yaml_scaffold::Scaffold {

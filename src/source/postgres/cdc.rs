@@ -537,14 +537,40 @@ impl PgChangeStream {
         Ok(())
     }
 
-    /// The routing refusals, asked before any slot or snapshot part is written.
-    pub(crate) fn refuse_unroutable_tables(
+    /// The open's refusals, asked on a connection of their own before any slot or snapshot part is written.
+    pub(crate) fn refuse_unmet_prerequisites(
         conn_str: &str,
         tls: Option<&TlsConfig>,
         configured_tables: &[String],
+        mode: DrainMode,
     ) -> Result<()> {
         let mut client = super::connect_client_raw(conn_str, tls)?;
-        Self::check_configured_tables_are_routable(&mut client, configured_tables, false)
+        Self::refuse_unmet_prerequisites_on(&mut client, configured_tables, mode, false)
+    }
+
+    /// Every refusal of the open (routing, an absent table, `wal_level`, a bounded drain on a standby), asked on `client`.
+    fn refuse_unmet_prerequisites_on(
+        client: &mut Client,
+        configured_tables: &[String],
+        mode: DrainMode,
+        say_note: bool,
+    ) -> Result<()> {
+        let wal_level: String = client.query_one("SHOW wal_level", &[])?.get(0);
+        let in_recovery: bool = client.query_one("SELECT pg_is_in_recovery()", &[])?.get(0);
+        if let Some(why) = server_refusal(&wal_level, mode.is_bounded(), in_recovery) {
+            crate::rivet_bail!(crate::error::codes::SOURCE_CDC_PREREQUISITE, "{why}");
+        }
+        Self::check_configured_tables_are_routable(client, configured_tables, say_note)?;
+        // The schema probe's own statement, prepared only: a table it could not read is refused here.
+        for table in configured_tables {
+            crate::source::cdc::validate_table_ident(table)?;
+            client
+                .prepare(&format!("SELECT * FROM {table}"))
+                .map_err(|e| {
+                    table_probe_refusal(table, e.code().map(|c| c.code()), &e.to_string())
+                })?;
+        }
+        Ok(())
     }
 
     /// Connect and ensure a `test_decoding` logical slot named `slot` exists
@@ -588,28 +614,10 @@ impl PgChangeStream {
             // session-state-rendering class as datestyle/bytea/intervalstyle).
             READER_SESSION_PIN,
         )?;
-        // The one routing check of a run, on the stream's own connection (the stream is
-        // opened once per run). Its refusals carry rivet's `pg cdc:` prefix, so the
-        // caller's setup hint is never prepended to them.
-        Self::check_configured_tables_are_routable(&mut client, configured_tables, true)?;
+        // The one prerequisite check of a run, on the stream's own connection and before the
+        // slot: its refusals carry rivet's `pg cdc:` prefix, so the setup hint is never prepended.
+        Self::refuse_unmet_prerequisites_on(&mut client, configured_tables, mode, true)?;
         let domains = load_domains(&mut client)?;
-
-        // A bounded run cannot work on a STANDBY: it pins its ceiling with
-        // pg_current_wal_lsn() (unavailable during recovery) and a fresh run
-        // creates the logical slot (also refused in recovery). Detect recovery
-        // up front so the error names the fix, not whichever operation happens
-        // to fail first (slot-create vs wal_lsn).
-        if mode.is_bounded() {
-            let in_recovery: bool = client.query_one("SELECT pg_is_in_recovery()", &[])?.get(0);
-            if in_recovery {
-                anyhow::bail!(
-                    "bounded (until_current) CDC cannot run on a PostgreSQL standby — it is in \
-                     recovery, where pg_current_wal_lsn() is unavailable. Stream continuously \
-                     (until_current: false; PostgreSQL 16+, where a standby can host a logical \
-                     slot) or point the source at the primary."
-                );
-            }
-        }
         let exists: bool = client
             .query_one(
                 "SELECT EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
@@ -820,6 +828,14 @@ impl PgChangeStream {
                 tx.clear();
                 self.exhausted = true;
                 break;
+            } else if is_standalone_message(&data) {
+                // A marker outside any transaction (an earlier run's barrier, another tool's):
+                // a data-free span the zero-yield release may step over, up to the bound.
+                if past_the_bound(&lsn, self.bound) {
+                    self.exhausted = true;
+                    break;
+                }
+                self.frontier_text = Some(lsn);
             } else if data.starts_with("BEGIN") {
                 // Dropping any spill too — a transaction that never reached its
                 // COMMIT in this window is re-read from the slot next time.
@@ -964,6 +980,50 @@ impl PgChangeStream {
     }
 }
 
+/// Why a configured table no relation answers to cannot be captured.
+pub(crate) fn absent_table_refusal(configured: &str) -> String {
+    format!(
+        "pg cdc: table `{configured}` does not exist on this server (as this connection's \
+         search_path resolves it), so no change to it could ever be captured; nothing was read \
+         or written. Create the table, or fix `table:` in the export, then re-run."
+    )
+}
+
+/// Why a configured table the schema probe cannot prepare is refused: absent (SQLSTATE 42P01) by code, anything else in the server's words.
+pub(crate) fn table_probe_refusal(
+    table: &str,
+    sqlstate: Option<&str>,
+    said: &str,
+) -> anyhow::Error {
+    if sqlstate == Some("42P01") {
+        return crate::error::CodedError::new(
+            crate::error::codes::SOURCE_CDC_PREREQUISITE,
+            absent_table_refusal(table),
+        )
+        .into();
+    }
+    anyhow::anyhow!("pg cdc: cannot read `{table}` ({said}); nothing was read or written.")
+}
+
+/// Why this server cannot host the drain: `wal_level` below `logical`, or a bounded drain on a standby.
+pub(crate) fn server_refusal(wal_level: &str, bounded: bool, in_recovery: bool) -> Option<String> {
+    if wal_level != "logical" {
+        return Some(format!(
+            "pg cdc: this server runs wal_level = {wal_level}, and logical decoding needs \
+             wal_level = logical; nothing was read or written. Set wal_level = logical in \
+             postgresql.conf (ALTER SYSTEM SET wal_level = logical), restart the server, then \
+             re-run."
+        ));
+    }
+    (bounded && in_recovery).then(|| {
+        "pg cdc: bounded (until_current) CDC cannot run on a PostgreSQL standby — it is in \
+         recovery, where pg_current_wal_lsn() is unavailable; nothing was read or written. \
+         Stream continuously (until_current: false; PostgreSQL 16+, where a standby can host a \
+         logical slot) or point the source at the primary."
+            .to_string()
+    })
+}
+
 /// Where one decoded transaction goes, given its COMMIT LSN — the pure heart of
 /// the drain's termination contract (see [`PgChangeStream::bound`]).
 #[derive(Debug, PartialEq)]
@@ -1076,6 +1136,16 @@ pub(crate) fn is_barrier_line(line: &str, nonce: &str) -> bool {
         return false;
     };
     head.contains(&format!("prefix: {BARRIER_PREFIX},")) && content.trim_end() == nonce
+}
+
+/// Whether a WAL position lies past a bounded drain's open-time ceiling; an unbounded drain has none.
+fn past_the_bound(lsn: &str, bound: Option<u64>) -> bool {
+    tx_disposition(parse_lsn(lsn).unwrap_or(0), 0, bound) == TxDisposition::PastBound
+}
+
+/// Whether a `test_decoding` line is a logical message emitted outside any transaction.
+pub(crate) fn is_standalone_message(line: &str) -> bool {
+    line.starts_with("message: transactional: 0 ")
 }
 
 /// The prefix rivet stamps on its own logical messages. Shared with the `pgoutput`
@@ -2190,6 +2260,99 @@ mod tests {
     /// spacing, the comma after the prefix and the absent space after `content:`
     /// are all the server's, and a predicate written against a guessed shape
     /// matches nothing while looking right.
+    /// The server verdict: `wal_level` first, then a bounded drain on a standby; anything else runs.
+    #[test]
+    fn the_server_is_refused_for_wal_level_or_a_bounded_drain_in_recovery() {
+        assert_eq!(server_refusal("logical", true, false), None);
+        assert_eq!(server_refusal("logical", false, true), None);
+        assert_eq!(server_refusal("logical", false, false), None);
+        assert_eq!(
+            server_refusal("replica", false, false).as_deref(),
+            Some(
+                "pg cdc: this server runs wal_level = replica, and logical decoding needs \
+                 wal_level = logical; nothing was read or written. Set wal_level = logical in \
+                 postgresql.conf (ALTER SYSTEM SET wal_level = logical), restart the server, then \
+                 re-run."
+            )
+        );
+        assert!(
+            server_refusal("minimal", true, true)
+                .unwrap()
+                .contains("wal_level = minimal")
+        );
+        assert_eq!(
+            server_refusal("logical", true, true).as_deref(),
+            Some(
+                "pg cdc: bounded (until_current) CDC cannot run on a PostgreSQL standby — it is in \
+                 recovery, where pg_current_wal_lsn() is unavailable; nothing was read or written. \
+                 Stream continuously (until_current: false; PostgreSQL 16+, where a standby can \
+                 host a logical slot) or point the source at the primary."
+            )
+        );
+    }
+
+    /// The absent-table refusal names the configured string and both remedies.
+    #[test]
+    fn an_absent_table_is_named_with_its_remedy() {
+        assert_eq!(
+            absent_table_refusal("public.orders"),
+            "pg cdc: table `public.orders` does not exist on this server (as this connection's \
+             search_path resolves it), so no change to it could ever be captured; nothing was \
+             read or written. Create the table, or fix `table:` in the export, then re-run."
+        );
+    }
+
+    /// A position is past the bound only when there is one and it lies strictly beyond it.
+    #[test]
+    fn a_position_is_past_the_bound_only_strictly_beyond_one() {
+        assert!(past_the_bound("0/11", Some(0x10)));
+        assert!(!past_the_bound("0/10", Some(0x10)));
+        assert!(!past_the_bound("0/F", Some(0x10)));
+        assert!(!past_the_bound("FF/0", None));
+        assert!(!past_the_bound("not an lsn", Some(0x10)));
+    }
+
+    /// An undefined table is the coded absent-table refusal; any other probe failure keeps the server's words.
+    #[test]
+    fn a_table_the_probe_cannot_prepare_is_absent_only_by_its_sqlstate() {
+        let absent = table_probe_refusal(
+            "orders",
+            Some("42P01"),
+            "relation \"orders\" does not exist",
+        );
+        assert_eq!(
+            crate::error::error_code(&absent),
+            Some("RIVET_SOURCE_CDC_PREREQUISITE")
+        );
+        assert_eq!(absent.to_string(), absent_table_refusal("orders"));
+        for other in [Some("42501"), None] {
+            let denied = table_probe_refusal("orders", other, "permission denied for table orders");
+            assert_eq!(crate::error::error_code(&denied), None);
+            assert_eq!(
+                denied.to_string(),
+                "pg cdc: cannot read `orders` (permission denied for table orders); nothing was \
+                 read or written."
+            );
+        }
+    }
+
+    /// Only a message outside a transaction is a span of its own; a transactional one rides its commit.
+    #[test]
+    fn only_a_non_transactional_message_stands_alone() {
+        assert!(is_standalone_message(
+            "message: transactional: 0 prefix: rivet, sz: 20 content:rivet-barrier-abc123"
+        ));
+        assert!(is_standalone_message(
+            "message: transactional: 0 prefix: other-tool, sz: 1 content:x"
+        ));
+        assert!(!is_standalone_message(
+            "message: transactional: 1 prefix: rivet, sz: 1 content:x"
+        ));
+        assert!(!is_standalone_message(
+            "table public.t: INSERT: v[text]:'message: transactional: 0 prefix'"
+        ));
+    }
+
     #[test]
     fn only_rivets_own_barrier_with_this_nonce_ends_a_drain() {
         let real = "message: transactional: 0 prefix: rivet, sz: 20 content:rivet-barrier-abc123";

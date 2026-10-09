@@ -686,6 +686,34 @@ exclude_re = [
     # live_cdc::mysql_cdc_refuses_minimal_row_metadata_at_open, RED against the
     # `Ok(())` stub (2026-10-01: "doctor ran no CDC binlog server config check").
     "replace mysql_checks -> Result<\\(\\)> with Ok\\(\\(\\)\\)",
+    # `MysqlChangeStream::refuse_unmet_prerequisites_on` is the open's prerequisite glue:
+    # four questions asked on a live connection (row metadata, compression, replica re-log,
+    # routing), each a named predicate with its own unit test. Its `Ok(())` stub is born
+    # MISSED offline. Live: live_cdc::roast_mysql_cdc_refuses_a_view_whose_binlog_identity_
+    # is_the_base_table, RED against the stub (2026-10-08: "rig run for 'cdc_vbase_..._v'
+    # was expected to fail").
+    "replace MysqlChangeStream::refuse_unmet_prerequisites_on -> Result<\\(\\)> with Ok\\(\\(\\)\\)",
+    # `MysqlChangeStream::refuse_absent_tables_on` prepares the schema probe's statement for
+    # each table on a live connection before a first run's anchor; the verdict is
+    # `table_probe_refusal` (unit-tested). Its `Ok(())` stub is born MISSED offline. Live:
+    # live_operator_contract::a_refused_cdc_run_on_a_missing_table_leaves_no_checkpoint_mysql,
+    # RED against the stub (2026-10-08: "cdc-checkpoint: .../cdc.ckpt added", the refusal grade).
+    "replace MysqlChangeStream::refuse_absent_tables_on -> Result<\\(\\)> with Ok\\(\\(\\)\\)",
+    # `PgChangeStream::refuse_unmet_prerequisites_on` is the same glue on PostgreSQL: it
+    # reads `wal_level` and `pg_is_in_recovery()`, runs the routing check and prepares the
+    # schema probe's statement; the verdicts are `server_refusal` and `table_probe_refusal`
+    # (unit-tested). Its `Ok(())` stub is born MISSED offline. Live:
+    # live_operator_contract::a_refused_changes_only_cdc_run_on_a_missing_table_leaves_no_
+    # slot_postgres, RED against the stub (2026-10-08: "cycle 1 ended with no RIVET_* code
+    # (exit 1), expected [RIVET_SOURCE_CDC_PREREQUISITE]").
+    "replace PgChangeStream::refuse_unmet_prerequisites_on -> Result<\\(\\)> with Ok\\(\\(\\)\\)",
+    # `pg_in_recovery` (init/mod.rs) asks a live PostgreSQL server `pg_is_in_recovery()`;
+    # what the answer changes is `yaml_scaffold::for_source` (unit-tested). `-> true` dies
+    # offline (a server that does not answer is not a standby); `-> false` needs a standby.
+    # Live: live_operator_contract::the_config_init_writes_runs_cdc_on_a_standby_postgres,
+    # RED against the stub (2026-10-08: "the config `rivet init` wrote does not run (exit
+    # Some(1))").
+    "replace pg_in_recovery -> bool with false",
     # `mongo_checks` (preflight/cdc_health.rs) is doctor's MongoDB glue: its first
     # statement is `probe_capability(url, tls)?` (a live replica set), so its body stub
     # is born MISSED offline. Live:
