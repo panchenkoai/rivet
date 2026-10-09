@@ -250,6 +250,16 @@ next resume and the orphan eventually gets moved.
 
 ## Known limitations
 
+- **`rivet load --pool N` opens files in proportion to N** — every table loaded
+  at once holds its own state connection, its own lock file and its own storage
+  and BigQuery connections. Measured on macOS, GCS to BigQuery with a SQLite
+  state: 18 open files at `--pool 1`, 30 at `--pool 4`, 139 at `--pool 16`
+  (62 of them network connections: about three to storage and one to BigQuery
+  per table). The default shell limit on macOS is 256 open files (`ulimit -n`);
+  Linux shells and containers usually start at 1024 or more. Raise the limit
+  or lower `--pool` when a load fails with `Too many open files`. Not done yet:
+  one storage client for every table of the process, and HTTP/2, which would
+  carry the requests of all tables over one connection per host.
 - **Object lifecycle policies** — Rivet does not configure
   retention, lifecycle transitions, encryption-at-rest, or replication
   rules on the destination.  Manage those out-of-band (Terraform, console).
