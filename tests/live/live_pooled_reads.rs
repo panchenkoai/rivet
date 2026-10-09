@@ -72,7 +72,7 @@ fn arrow_type(pg_type: &str) -> &'static str {
         "bigint" => "Int64",
         "integer" => "Int32",
         "double precision" => "Float64",
-        "text" => "Utf8",
+        "text" | "USER-DEFINED" => "Utf8",
         "timestamp without time zone" => "Timestamp(µs)",
         other => panic!("fixture: no Arrow type stated for `{other}`"),
     }
@@ -118,15 +118,20 @@ fn pooled_export_equals_the_source(table: &str, mode: &str, what: &str) {
         !said.contains("could not resolve schema for drift check"),
         "{what}: the {mode} export through the pooler skipped its schema-drift check:\n{said}"
     );
+    destination_equals_the_source(&rig, table, mode, what);
+}
+
+/// The destination of `rig` against `table` as the source holds it: columns, types, every value.
+fn destination_equals_the_source(rig: &Rig, table: &str, mode: &str, what: &str) {
     let (source_columns, source_rows) = source_holds(table);
     let expected: Vec<(String, String)> = source_columns
         .iter()
         .map(|(name, ty)| (name.clone(), arrow_type(ty).to_string()))
         .collect();
-    let (columns, rows) = delivered(&rig);
+    let (columns, rows) = delivered(rig);
     assert_eq!(
         columns, expected,
-        "{what}: the {mode} export through the pooler exited 0 under another read's columns"
+        "{what}: the {mode} export exited 0 under columns the source does not hold"
     );
     assert_eq!(
         rows.len(),
@@ -145,9 +150,14 @@ fn pooled_export_equals_the_source(table: &str, mode: &str, what: &str) {
                     g == w
                 }
             });
+        let short = |cells: &[String]| -> Vec<String> {
+            cells.iter().map(|c| c.chars().take(60).collect()).collect()
+        };
         assert!(
             same,
-            "{what}: {mode} delivered {got:?} where the source holds {want:?}"
+            "{what}: {mode} delivered {:?} where the source holds {:?}",
+            short(got),
+            short(want)
         );
     }
 }
@@ -333,4 +343,193 @@ fn a_widened_key_through_one_transaction_pooler_is_delivered_range_postgres() {
 fn a_widened_key_through_one_transaction_pooler_is_delivered_incremental_postgres() {
     let _alone = pgbouncer_alone();
     an_altered_table_arrives_as_the_source_holds_it("incremental", "INTEGER", KEY_WIDENED);
+}
+
+/// An enum, a domain over INTEGER and a composite type of this cell's own, dropped with the guard.
+struct OwnTypes {
+    stem: String,
+}
+
+impl OwnTypes {
+    fn new() -> Self {
+        let stem = unique_name("pool_ty");
+        ENGINE.exec(&format!(
+            "CREATE TYPE {stem}_e AS ENUM ('new', 'paid', 'void')"
+        ));
+        ENGINE.exec(&format!(
+            "CREATE DOMAIN {stem}_d AS INTEGER CHECK (VALUE > 0)"
+        ));
+        ENGINE.exec(&format!("CREATE TYPE {stem}_c AS (n INTEGER, s TEXT)"));
+        Self { stem }
+    }
+}
+
+impl Drop for OwnTypes {
+    fn drop(&mut self) {
+        let stem = &self.stem;
+        ENGINE.exec(&format!("DROP TYPE IF EXISTS {stem}_c CASCADE"));
+        ENGINE.exec(&format!("DROP DOMAIN IF EXISTS {stem}_d CASCADE"));
+        ENGINE.exec(&format!("DROP TYPE IF EXISTS {stem}_e CASCADE"));
+    }
+}
+
+/// How long a run over a 20-row table may take before it is read as waiting on its own connection.
+const BOUND: std::time::Duration = std::time::Duration::from_secs(60);
+/// A text of 512,000 characters per row: a page of them does not arrive in one socket read.
+const WIDE: &str = "repeat(md5(g::text), 16000)";
+
+/// `rig` run once within `BOUND`; a run that is still going then is killed and fails the cell.
+fn run_within_the_bound(rig: &Rig, mode: &str) -> std::process::Output {
+    rig.run_with_envs_bounded(&[], BOUND).unwrap_or_else(|| {
+        panic!("the {mode} export did not end within {BOUND:?}: it waits on its own connection")
+    })
+}
+
+/// A table of an enum, a domain and wide rows, exported in `mode` over `url`: delivered as the source holds it, within `BOUND`.
+fn an_enum_and_a_domain_are_delivered(mode: &str, url: &str) {
+    if url == PGBOUNCER_URL {
+        forget_pooled_statements();
+    }
+    let types = OwnTypes::new();
+    let stem = &types.stem;
+    let (table, _table) = table_of(
+        "pool_types",
+        &format!(
+            "id BIGINT PRIMARY KEY, status {stem}_e NOT NULL, qty {stem}_d NOT NULL, \
+             wide TEXT NOT NULL, updated_at TIMESTAMP NOT NULL"
+        ),
+        &format!(
+            "g, (ARRAY['new', 'paid', 'void'])[1 + g % 3]::{stem}_e, g::{stem}_d, {WIDE}, \
+             TIMESTAMP '2026-03-03 00:00:00' + g * INTERVAL '1 second'"
+        ),
+    );
+    let rig = staged(ENGINE.rig(&table).source_url(url), mode);
+    let out = run_within_the_bound(&rig, mode);
+    assert!(
+        out.status.success(),
+        "the {mode} export of an enum and a domain failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    destination_equals_the_source(&rig, &table, mode, "an enum and a domain");
+}
+
+/// A column of a type rivet has no mapping for, beside wide rows, over `url`: refused with `needle`, within `BOUND`.
+fn an_unmapped_type_is_refused_within_the_bound(
+    url: &str,
+    suffix: &str,
+    value: &str,
+    needle: &str,
+) {
+    if url == PGBOUNCER_URL {
+        forget_pooled_statements();
+    }
+    let types = OwnTypes::new();
+    let stem = &types.stem;
+    let (table, _table) = table_of(
+        "pool_unmapped",
+        &format!("id BIGINT PRIMARY KEY, x {stem}{suffix} NOT NULL, wide TEXT NOT NULL"),
+        &format!("g, {}, {WIDE}", value.replace("{stem}", stem)),
+    );
+    let rig = ENGINE.rig(&table).source_url(url);
+    let out = run_within_the_bound(&rig, "full");
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success() && said.contains(needle),
+        "a `{stem}{suffix}` column must be refused with `{needle}`:\n{said}"
+    );
+}
+
+const COMPOSITE: (&str, &str, &str) = ("_c", "ROW(g, 'x')::{stem}_c", "no safe Rivet mapping");
+const ENUM_ARRAY: (&str, &str, &str) = (
+    "_e[]",
+    "ARRAY['new', 'paid']::{stem}_e[]",
+    "has no flat mapping",
+);
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn a_table_of_an_enum_and_a_domain_with_wide_rows_is_delivered_full_direct_postgres() {
+    an_enum_and_a_domain_are_delivered("full", POSTGRES_URL);
+}
+
+#[test]
+#[ignore = "live: requires docker compose --profile pool up -d pgbouncer (transaction mode, pool_size=1)"]
+fn a_table_of_an_enum_and_a_domain_with_wide_rows_through_one_transaction_pooler_is_delivered_full_postgres()
+ {
+    let _alone = pgbouncer_alone();
+    an_enum_and_a_domain_are_delivered("full", PGBOUNCER_URL);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn a_table_of_an_enum_and_a_domain_with_wide_rows_is_delivered_keyset_direct_postgres() {
+    an_enum_and_a_domain_are_delivered("keyset", POSTGRES_URL);
+}
+
+#[test]
+#[ignore = "live: requires docker compose --profile pool up -d pgbouncer (transaction mode, pool_size=1)"]
+fn a_table_of_an_enum_and_a_domain_with_wide_rows_through_one_transaction_pooler_is_delivered_keyset_postgres()
+ {
+    let _alone = pgbouncer_alone();
+    an_enum_and_a_domain_are_delivered("keyset", PGBOUNCER_URL);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn a_table_of_an_enum_and_a_domain_with_wide_rows_is_delivered_range_direct_postgres() {
+    an_enum_and_a_domain_are_delivered("range", POSTGRES_URL);
+}
+
+#[test]
+#[ignore = "live: requires docker compose --profile pool up -d pgbouncer (transaction mode, pool_size=1)"]
+fn a_table_of_an_enum_and_a_domain_with_wide_rows_through_one_transaction_pooler_is_delivered_range_postgres()
+ {
+    let _alone = pgbouncer_alone();
+    an_enum_and_a_domain_are_delivered("range", PGBOUNCER_URL);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn a_table_of_an_enum_and_a_domain_with_wide_rows_is_delivered_incremental_direct_postgres() {
+    an_enum_and_a_domain_are_delivered("incremental", POSTGRES_URL);
+}
+
+#[test]
+#[ignore = "live: requires docker compose --profile pool up -d pgbouncer (transaction mode, pool_size=1)"]
+fn a_table_of_an_enum_and_a_domain_with_wide_rows_through_one_transaction_pooler_is_delivered_incremental_postgres()
+ {
+    let _alone = pgbouncer_alone();
+    an_enum_and_a_domain_are_delivered("incremental", PGBOUNCER_URL);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn a_composite_column_with_wide_rows_is_refused_within_the_bound_direct_postgres() {
+    let (suffix, value, needle) = COMPOSITE;
+    an_unmapped_type_is_refused_within_the_bound(POSTGRES_URL, suffix, value, needle);
+}
+
+#[test]
+#[ignore = "live: requires docker compose --profile pool up -d pgbouncer (transaction mode, pool_size=1)"]
+fn a_composite_column_with_wide_rows_through_one_transaction_pooler_is_refused_within_the_bound_postgres()
+ {
+    let _alone = pgbouncer_alone();
+    let (suffix, value, needle) = COMPOSITE;
+    an_unmapped_type_is_refused_within_the_bound(PGBOUNCER_URL, suffix, value, needle);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn an_array_of_an_enum_with_wide_rows_is_refused_within_the_bound_direct_postgres() {
+    let (suffix, value, needle) = ENUM_ARRAY;
+    an_unmapped_type_is_refused_within_the_bound(POSTGRES_URL, suffix, value, needle);
+}
+
+#[test]
+#[ignore = "live: requires docker compose --profile pool up -d pgbouncer (transaction mode, pool_size=1)"]
+fn an_array_of_an_enum_with_wide_rows_through_one_transaction_pooler_is_refused_within_the_bound_postgres()
+ {
+    let _alone = pgbouncer_alone();
+    let (suffix, value, needle) = ENUM_ARRAY;
+    an_unmapped_type_is_refused_within_the_bound(PGBOUNCER_URL, suffix, value, needle);
 }

@@ -24,10 +24,11 @@
     - after a chunk key was widened the run failed with `cached plan must not change result
       type` or `sent a malformed wire payload`, and a chunked run skipped its schema-drift
       check with `could not resolve schema for drift check (skipping)`.
-  - **Now** the statements that return a table's rows or bounds are sent unnamed, so the
-    pooler keeps nothing of them, and the type probe is prepared under a text of its own.
-    The first run of this release through a pooler that still holds statements of an older
-    rivet delivers the table as the source holds it.
+  - **Now** every statement whose columns follow a table (the cursor `FETCH`, the bound and
+    count probes, the type probe) is prepared under a text of its own, so the pooler never
+    answers it with a statement another read left. The first run of this release through a
+    pooler that still holds statements of an older rivet delivers the table as the source
+    holds it.
   - **If you ran 0.31.0 or earlier through such a pooler:** compare each delivered part's
     column names and types with the source table (`DESCRIBE SELECT * FROM
     read_parquet('<part>')` in DuckDB against `\d <table>` in psql). A part whose columns

@@ -220,10 +220,12 @@ its text and answers the same text from any client with the server-side
 statement it already holds, and PostgreSQL keeps the result columns it
 described when that text was first parsed. So the PostgreSQL source sends
 nothing whose columns follow a user table as a reusable named statement:
-the cursor `FETCH` and the scalar probes go as the unnamed statement
-(`query_unnamed` in `src/source/postgres/mod.rs`), and the parse-only type
-probe is prepared under a text unique to the call (`prepare_fresh`). The
-statements left as named ones read the catalog with a fixed column list.
+the cursor `FETCH`, the scalar probes and the type probe are each prepared
+under a text unique to the call (`prepare_fresh` in
+`src/source/postgres/mod.rs`, a trailing comment that carries a random
+number), and a read reuses its own `FETCH` for every page it fetches. The
+statements left under a recurring text read the catalog with a fixed column
+list.
 
 This detection is best-effort and intentionally never fails an export —
 it gives the operator one observable line in the logs. The session
