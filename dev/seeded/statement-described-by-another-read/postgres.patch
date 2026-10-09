@@ -1,0 +1,13 @@
+diff --git a/src/source/postgres/mod.rs b/src/source/postgres/mod.rs
+index d9f9248a..4d259194 100644
+--- a/src/source/postgres/mod.rs
++++ b/src/source/postgres/mod.rs
+@@ -100,7 +100,7 @@ pub(crate) fn query_unnamed(
+     client: &mut Client,
+     sql: &str,
+ ) -> std::result::Result<Vec<postgres::Row>, postgres::Error> {
+-    client.query_typed(sql, &[])
++    client.query(sql, &[])
+ }
+ 
+ /// Prepare `sql` without running it, under a text no earlier call sent, so the description is the one this parse fixes.
