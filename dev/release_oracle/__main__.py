@@ -722,6 +722,8 @@ def _self_test() -> int:
                          {"mssql_logical_reads": 0, "mssql_worktables_created": 1}) == {
         "mssql_logical_reads": 50, "mssql_worktables_created": 1}
     assert measured_harm("mssql://h", {}, {"new": 7}, {}) == {"mssql_logical_reads": 7}
+    assert measured_harm("mssql://h", {"again": 900, "kept": 100}, {"again": 120, "kept": 130}, {}) == {
+        "mssql_logical_reads": 150}, "a statement compiled again between the readings counts by its new total"
     assert measured_harm("mssql://h", None, {"new": 7}, {"mssql_logical_reads": 7}) is None
     assert measured_harm("postgresql://h", {"pg_tup_returned": 5}, {"pg_tup_returned": 9}, {}) == {
         "pg_tup_returned": 4}
