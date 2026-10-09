@@ -1095,3 +1095,14 @@ seeds:
         cells: [parallel_parts_are_named_after_their_run_mongo]
       oracle:
         cells: [incremental_runs_started_together_each_declare_their_own_part_oracle]
+
+  - name: unit-of-work-begins-deferred
+    class: a state unit of work that reads before it writes opens a deferred SQLite transaction, so a writer that commits in between fails its first write with `database is locked` and no wait
+    history: "2026-10-09, #508 - the unit of `apply --pool --split --resume` that extends its plan read the last chunk index, then inserted; its sibling unit committed in between and the run ended exit 1 with `database is locked: Error code 517` (`stand_pool_split_gappy_key_postgres` in CI run 37841398187 and in two local sweeps, `stand_pool_split_resume_grows_mssql` in a third)"
+    scope: state
+    patch: unit-of-work-begins-deferred/shared.patch
+    engines:
+      sqlite-state:
+        cells: ["lib:a_unit_of_work_that_reads_first_writes_beside_another_writer", "lib:a_replan_beside_another_writer_of_the_state_waits_for_it"]
+      postgres-state:
+        na: "a PostgreSQL unit of work runs READ COMMITTED: a statement after a read takes its own snapshot and waits for a row lock, so there is no stale read snapshot to refuse the write"
