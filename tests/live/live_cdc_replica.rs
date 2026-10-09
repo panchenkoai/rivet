@@ -29,7 +29,7 @@ fn conn(url: &str) -> mysql::PooledConn {
 /// Wire up position-based replication from the primary's *current* position, so the
 /// init transactions (both servers ran their own `MYSQL_USER` init) are not
 /// re-applied — full GTID sync would conflict on "CREATE USER rivet already exists".
-fn ensure_replication() {
+pub(crate) fn ensure_replication() {
     ensure_replication_on(REPLICA_ROOT);
 }
 

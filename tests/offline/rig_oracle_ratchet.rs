@@ -169,8 +169,9 @@ fn failed_run_leftover_declarations_never_grow() {
 
 /// Refusals the live cells accept with no `RIVET_*` code (`Refused::uncoded_known_defect(`): each is a code the registry owes.
 // 5 -> 4 (2026-10-08): `--resume` over a complete prefix is refused as RIVET_DEST_ALREADY_COMPLETE.
-// -1 (2026-10-08): the bounded-drain refusal on a PostgreSQL standby carries RIVET_SOURCE_CDC_PREREQUISITE.
-const UNCODED_REFUSAL_CEILING: usize = 4; // ratchet-pin: uncoded-refusals
+// 5 -> 4 (2026-10-08): the corrupt CDC checkpoint is refused by code (#497).
+// 4 -> 3 (2026-10-08): the bounded-drain refusal on a PostgreSQL standby carries RIVET_SOURCE_CDC_PREREQUISITE.
+const UNCODED_REFUSAL_CEILING: usize = 3; // ratchet-pin: uncoded-refusals
 
 #[test]
 fn uncoded_refusals_the_cells_accept_never_grow() {

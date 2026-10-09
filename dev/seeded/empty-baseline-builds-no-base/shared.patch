@@ -1,0 +1,18 @@
+diff --git a/src/load/orchestrate.rs b/src/load/orchestrate.rs
+index 07b994f5..b7555036 100644
+--- a/src/load/orchestrate.rs
++++ b/src/load/orchestrate.rs
+@@ -295,10 +295,10 @@ fn holds_whole_table_pass(
+ ) -> bool {
+     match plan.mode {
+         load::plan::LoadMode::Full => true,
+-        load::plan::LoadMode::Cdc => {
+-            plan.layout.compacts() && runs.iter().any(|(_, m)| is_baseline_leg(m))
++        load::plan::LoadMode::Cdc | load::plan::LoadMode::Incremental => {
++            let _ = runs;
++            false
+         }
+-        load::plan::LoadMode::Incremental => false,
+     }
+ }
+ 

@@ -281,28 +281,28 @@ scenarios:
     oracle:   { gap: "asserted by its code only in live_cdc_replica (a MySQL failover); the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
 
   - id: refusal_source_cdc_checkpoint_invalid
-    what: "RIVET_SOURCE_CDC_CHECKPOINT_INVALID: a checkpoint file that cannot be read"
-    postgres: { gap: "the refusal and its `delete it` remedy are the corrupt-checkpoint rows of docs/operator-contract-matrix.yaml (open defects on most engines); the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
-    mysql:    { gap: "the refusal and its `delete it` remedy are the corrupt-checkpoint rows of docs/operator-contract-matrix.yaml (open defects on most engines); the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
-    mssql:    { gap: "the refusal and its `delete it` remedy are the corrupt-checkpoint rows of docs/operator-contract-matrix.yaml (open defects on most engines); the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
-    mongo:    { gap: "the refusal and its `delete it` remedy are the corrupt-checkpoint rows of docs/operator-contract-matrix.yaml (open defects on most engines); the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
-    oracle:   { gap: "the refusal and its `delete it` remedy are the corrupt-checkpoint rows of docs/operator-contract-matrix.yaml (open defects on most engines); the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
+    what: "RIVET_SOURCE_CDC_CHECKPOINT_INVALID: a checkpoint file that cannot be read (restore it or re-baseline; deleting it alone is the wrong remedy)"
+    postgres: { test: a_corrupt_cdc_checkpoint_is_refused_by_code_postgres }
+    mysql:    { test: a_corrupt_cdc_checkpoint_is_refused_by_code_mysql }
+    mssql:    { test: a_corrupt_cdc_checkpoint_is_refused_by_code_mssql }
+    mongo:    { test: a_corrupt_cdc_checkpoint_is_refused_by_code_mongo }
+    oracle:   { test: a_corrupt_cdc_checkpoint_is_refused_by_code_oracle }
 
   - id: refusal_source_cdc_log_gap
     what: "RIVET_SOURCE_CDC_LOG_GAP: the retained log no longer reaches back to the checkpoint"
-    postgres: { gap: "refused by code in the log-gone rows of docs/operator-contract-matrix.yaml; the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
-    mysql:    { gap: "refused by code in the log-gone rows of docs/operator-contract-matrix.yaml; the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
+    postgres: { test: a_dropped_slot_after_a_changes_run_is_refused_by_code_postgres }
+    mysql:    { test: binlogs_purged_past_the_checkpoint_after_a_changes_run_are_refused_by_code_mysql }
     mssql:    { gap: "refused by code in the log-gone rows of docs/operator-contract-matrix.yaml; the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
     mongo:    { gap: "refused by code in the log-gone rows of docs/operator-contract-matrix.yaml; the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
     oracle:   { gap: "refused by code in the log-gone rows of docs/operator-contract-matrix.yaml; the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
 
   - id: refusal_source_cdc_truncated
     what: "RIVET_SOURCE_CDC_TRUNCATED: a TRUNCATE inside the stream"
-    postgres: { gap: "refused by code in the truncate row of docs/operator-contract-matrix.yaml; the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
-    mysql:    { gap: "refused by code in the truncate row of docs/operator-contract-matrix.yaml; the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
+    postgres: { test: a_cdc_truncate_is_refused_by_code_postgres }
+    mysql:    { test: a_cdc_truncate_is_refused_by_code_mysql }
     mssql:    { gap: "refused by code in the truncate row of docs/operator-contract-matrix.yaml; the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
-    mongo:    { gap: "refused by code in the truncate row of docs/operator-contract-matrix.yaml; the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
-    oracle:   { gap: "refused by code in the truncate row of docs/operator-contract-matrix.yaml; the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
+    mongo:    { test: a_cdc_collection_drop_is_refused_by_code_mongo }
+    oracle:   { test: a_cdc_truncate_is_refused_by_code_oracle }
 
   - id: refusal_source_cdc_undecodable
     what: "RIVET_SOURCE_CDC_UNDECODABLE: a change the stream cannot decode"
@@ -593,12 +593,12 @@ scenarios:
     oracle:   { gap: "an open defect on PostgreSQL, MySQL and SQL Server; the Oracle cell is not written, because no stand that runs `open_defect_` cells has Oracle within reach of the machine this row was built on (CI skips them), so its first failing line could not be read" }
 
   - id: beside_run_same_instant
-    what: "two runs of one single-runner export (`mode: full` or `incremental`) that name their part in the same millisecond"
-    postgres: { gap: "seen 2 of 10 times on the stand (PostgreSQL once, MySQL once) while the beside_run_incremental cell still started its second run at once: `rig oracle: COUNTER: this run's Success manifests declare 400 rows, their parts hold 200`; the two runs (run ids 8 ms apart) wrote one part name, so one file is declared by both success manifests and counted twice by export_metrics and file_log, while the destination holds each row once; it cannot be forced from outside rivet (it needs a pause before the part is named), so it is not a cell, and that cell now starts its second run 700 ms in" }
-    mysql:    { na: "the part name is the single runner's (src/pipeline/single.rs), whatever the source engine: the postgres column carries the row" }
-    mssql:    { na: "the part name is the single runner's (src/pipeline/single.rs), whatever the source engine: the postgres column carries the row" }
-    mongo:    { na: "the part name is the single runner's (src/pipeline/single.rs), whatever the source engine: the postgres column carries the row" }
-    oracle:   { na: "the part name is the single runner's (src/pipeline/single.rs), whatever the source engine: the postgres column carries the row" }
+    what: "runs of one unthrottled single-runner export (`mode: incremental`; `full` names its part through the same function) started together, in rounds on a fresh state and destination: each delivers or refuses by code, no part is declared by two runs, every part is named `<export>_<yyyymmdd>_<hhmmss>_<mmm>_<pid>_<nonce>` after the run that declares it, and a run then delivers the source and `validate` passes. The MongoDB cell is one run of the parallel reader and the name only: a MongoDB export is `mode: full`, and two `full` runs started together are the beside_run_full row. Before the part was named after its run, two runs that ended their read in one millisecond wrote one file name (`rig oracle: COUNTER: this run's Success manifests declare 1600 rows, their parts hold 600`)"
+    postgres: { test: incremental_runs_started_together_each_declare_their_own_part_postgres }
+    mysql:    { test: incremental_runs_started_together_each_declare_their_own_part_mysql }
+    mssql:    { test: incremental_runs_started_together_each_declare_their_own_part_mssql }
+    mongo:    { test: parallel_parts_are_named_after_their_run_mongo }
+    oracle:   { test: incremental_runs_started_together_each_declare_their_own_part_oracle }
 
   - id: beside_run_range_checkpoint
     what: "a second `rivet run` beside a live checkpointed one (RESULTS 11 of docs/operator-contract-matrix.yaml, cited here)"

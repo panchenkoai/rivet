@@ -626,7 +626,9 @@ impl PgChangeStream {
             .get(0);
         match slot_action(slot, exists, prior) {
             SlotAction::Reuse => {}
-            SlotAction::Refuse(why) => anyhow::bail!("{why}"),
+            SlotAction::Refuse(why) => {
+                return Err(crate::source::cdc::checkpoint_identity::log_gap(why));
+            }
             SlotAction::Create => {
                 // Creating the slot anchors capture at the CURRENT WAL position:
                 // everything already written is unreachable from here. That is correct
@@ -738,7 +740,7 @@ impl PgChangeStream {
         // checkpointed and acked everything that preceded the truncate, so the slot
         // sits at the last commit before it and the remedy is lossless for the rest.
         if let Some(why) = self.pending_truncate_refusal.take() {
-            anyhow::bail!(why);
+            return Err(crate::source::cdc::checkpoint_identity::truncated(why));
         }
         let rows = self.client.query(
             "SELECT lsn::text, data FROM pg_logical_slot_peek_changes($1, NULL, $2)",
@@ -889,7 +891,7 @@ impl PgChangeStream {
                 // re-reads. What must be protected is what was already YIELDED —
                 // exactly what `yielded_any` measures.
                 if !yielded_any {
-                    anyhow::bail!(why);
+                    return Err(crate::source::cdc::checkpoint_identity::truncated(why));
                 }
                 self.pending_truncate_refusal = Some(why);
                 self.exhausted = true;

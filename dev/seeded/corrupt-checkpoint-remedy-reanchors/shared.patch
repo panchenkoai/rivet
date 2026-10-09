@@ -1,0 +1,16 @@
+diff --git a/src/source/cdc/mod.rs b/src/source/cdc/mod.rs
+index f1e60e64..dee0d336 100644
+--- a/src/source/cdc/mod.rs
++++ b/src/source/cdc/mod.rs
+@@ -133,9 +133,8 @@ impl Position {
+                     "checkpoint '{}' is corrupt or truncated (not valid JSON: {e}) — refusing to \
+                      silently treat it as absent and re-anchor CDC at 'current', which would \
+                      permanently skip every change since the last checkpoint. Restore the file, \
+-                     or: {}",
+-                    path.display(),
+-                    checkpoint_identity::RECOVER
++                     or delete it to accept a new anchor from a fresh snapshot.",
++                    path.display()
+                 ))),
+             },
+             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
