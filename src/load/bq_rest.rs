@@ -116,14 +116,24 @@ enum Auth {
     GcloudCli,
 }
 
+/// The one BigQuery HTTP client of this process: every table's API holds a clone of it.
+fn shared_http() -> Result<reqwest::blocking::Client> {
+    static HTTP: std::sync::OnceLock<reqwest::blocking::Client> = std::sync::OnceLock::new();
+    if let Some(http) = HTTP.get() {
+        return Ok(http.clone());
+    }
+    let built = reqwest::blocking::Client::builder()
+        .timeout(HTTP_TIMEOUT)
+        .build()
+        .context("building the BigQuery HTTP client")?;
+    Ok(HTTP.get_or_init(|| built).clone())
+}
+
 impl BigQueryApi {
     /// Build a client for `project`, resolving the token source eagerly so a
     /// missing credential is reported before the first job is enqueued.
     pub(crate) fn new(project: &str) -> Result<Self> {
-        let http = reqwest::blocking::Client::builder()
-            .timeout(HTTP_TIMEOUT)
-            .build()
-            .context("building the BigQuery HTTP client")?;
+        let http = shared_http()?;
         Ok(Self {
             project: project.to_string(),
             location: std::env::var("RIVET_BQ_LOCATION")
