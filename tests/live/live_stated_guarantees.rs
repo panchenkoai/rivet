@@ -437,7 +437,7 @@ type Answers = Arc<std::sync::Mutex<Vec<u64>>>;
 /// Every byte the clients sent through a [`wire_to`] forwarder, in the order it read them.
 type Asked = Arc<std::sync::Mutex<Vec<u8>>>;
 
-/// Copy `from` to `to` on a thread, reporting each read to `seen` and the end of the stream as an empty read.
+/// Copy `from` to `to` on a thread, reporting each read to `seen` before it is passed on (a request closes the answer before the source can start the next one) and the end of the stream as an empty read.
 fn pipe(
     mut from: std::net::TcpStream,
     mut to: std::net::TcpStream,
@@ -447,10 +447,13 @@ fn pipe(
     std::thread::spawn(move || {
         let mut buf = [0u8; 65536];
         while let Ok(n) = from.read(&mut buf) {
-            if n == 0 || to.write_all(&buf[..n]).is_err() {
+            if n == 0 {
                 break;
             }
             seen(&buf[..n]);
+            if to.write_all(&buf[..n]).is_err() {
+                break;
+            }
         }
         let _ = to.shutdown(std::net::Shutdown::Both);
         let _ = from.shutdown(std::net::Shutdown::Both);
