@@ -1217,3 +1217,28 @@ seeds:
         cells: ["lib:a_unit_of_work_that_reads_first_writes_beside_another_writer", "lib:a_replan_beside_another_writer_of_the_state_waits_for_it"]
       postgres-state:
         na: "a PostgreSQL unit of work runs READ COMMITTED: a statement after a read takes its own snapshot and waits for a row lock, so there is no stale read snapshot to refuse the write"
+
+  - name: statement-described-by-another-read
+    class: the PostgreSQL source sends a statement whose columns follow a user table as a named prepared statement of a recurring text, so a pooler that keeps prepared statements by text describes it from another read
+    history: "v0.31.0 and main 418fb865 (2026-10-09) - behind a transaction-mode pgBouncer 1.26.0 every export read through `FETCH n FROM _rivet`: a second table of the same width was delivered under the first table's column names and types, exit 0 (1.5 as BIGINT 4609434218613702656); a wider one failed with `DataRow field count does not match the number of columns`; a widened range key failed with `cached plan must not change result type`"
+    scope: source
+    engines:
+      postgres:
+        patch: statement-described-by-another-read/postgres.patch
+        cells:
+          - a_second_table_through_one_transaction_pooler_arrives_as_itself_full_postgres
+          - a_second_table_through_one_transaction_pooler_arrives_as_itself_keyset_postgres
+          - a_second_table_through_one_transaction_pooler_arrives_as_itself_range_postgres
+          - a_second_table_through_one_transaction_pooler_arrives_as_itself_incremental_postgres
+          - a_wider_second_table_through_one_transaction_pooler_is_delivered_full_postgres
+          - a_retyped_column_through_one_transaction_pooler_arrives_as_the_source_holds_it_full_postgres
+          - a_gained_column_through_one_transaction_pooler_is_delivered_keyset_postgres
+          - a_widened_key_through_one_transaction_pooler_is_delivered_range_postgres
+      mysql:
+        na: "the defect is how the PostgreSQL adapter names its statements (rust-postgres prepares a named statement per query, pgBouncer keeps one by its text); this engine's adapter has no such statement; MySQL through ProxySQL delivered every scenario as a direct export does (v0.31.0, 2026-10-09)"
+      mssql:
+        na: "the defect is how the PostgreSQL adapter names its statements (rust-postgres prepares a named statement per query, pgBouncer keeps one by its text); this engine's adapter has no such statement"
+      mongo:
+        na: "the defect is how the PostgreSQL adapter names its statements (rust-postgres prepares a named statement per query, pgBouncer keeps one by its text); this engine's adapter has no such statement"
+      oracle:
+        na: "the defect is how the PostgreSQL adapter names its statements (rust-postgres prepares a named statement per query, pgBouncer keeps one by its text); this engine's adapter has no such statement"

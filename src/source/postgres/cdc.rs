@@ -564,11 +564,9 @@ impl PgChangeStream {
         // The schema probe's own statement, prepared only: a table it could not read is refused here.
         for table in configured_tables {
             crate::source::cdc::validate_table_ident(table)?;
-            client
-                .prepare(&format!("SELECT * FROM {table}"))
-                .map_err(|e| {
-                    table_probe_refusal(table, e.code().map(|c| c.code()), &e.to_string())
-                })?;
+            super::prepare_fresh(client, &format!("SELECT * FROM {table}")).map_err(|e| {
+                table_probe_refusal(table, e.code().map(|c| c.code()), &e.to_string())
+            })?;
         }
         Ok(())
     }

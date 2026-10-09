@@ -406,18 +406,18 @@ pub fn cross_process_serial(name: &str) -> QuietWindowGuard {
     QuietWindowGuard { _file: file }
 }
 
-/// The stand's pgBouncer for one cell alone, its one server connection made to forget every prepared statement.
-///
-/// pgBouncer keeps a prepared statement by its text and reuses it across clients, and rivet reads every table
-/// through `FETCH n FROM _rivet`: a table exported earlier by another cell would describe this cell's cursor.
+/// The stand's pgBouncer (one server connection) for one cell alone.
 pub fn pgbouncer_alone() -> QuietWindowGuard {
     require_alive(LiveService::PgBouncer);
-    let alone = cross_process_serial("pgbouncer");
+    cross_process_serial("pgbouncer")
+}
+
+/// Make the pooler's one server connection forget every prepared statement, so a cell's first read is the first to describe its statements.
+pub fn forget_pooled_statements() {
     postgres::Client::connect(PGBOUNCER_URL, postgres::NoTls)
         .expect("pgbouncer")
         .batch_execute("DEALLOCATE ALL")
         .expect("DEALLOCATE ALL through pgbouncer");
-    alone
 }
 
 /// RAII background-writer: a thread that loops until its stop flag flips, and

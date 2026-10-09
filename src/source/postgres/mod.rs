@@ -95,6 +95,37 @@ impl PostgresSource {
     }
 }
 
+/// Prepare `sql` under a text no earlier call sent, so the description is the one this parse fixes: a pooler keeps named statements by their text, and one kept from another read would describe these rows.
+pub(crate) fn prepare_fresh(
+    client: &mut Client,
+    sql: &str,
+) -> std::result::Result<postgres::Statement, postgres::Error> {
+    use rand::RngExt;
+    client.prepare(&fresh_text(sql, rand::rng().random::<u64>()))
+}
+
+/// `sql` followed by a comment carrying `nonce`.
+fn fresh_text(sql: &str, nonce: u64) -> String {
+    format!("{sql} /* rivet {nonce:016x} */")
+}
+
+/// The read's prepared `FETCH n FROM _rivet`: prepared fresh the first time this read asks for `n` rows, then reused for its later pages.
+fn fetch_statement<'a>(
+    client: &mut Client,
+    prepared: &'a mut Vec<(usize, postgres::Statement)>,
+    n: usize,
+) -> std::result::Result<&'a postgres::Statement, postgres::Error> {
+    let at = match prepared.iter().position(|(size, _)| *size == n) {
+        Some(at) => at,
+        None => {
+            let statement = prepare_fresh(client, &format!("FETCH {n} FROM _rivet"))?;
+            prepared.push((n, statement));
+            prepared.len() - 1
+        }
+    };
+    Ok(&prepared[at].1)
+}
+
 /// RAII guard for an open `BEGIN ... COMMIT` block.
 ///
 /// `commit()` runs `COMMIT` and marks the txn done; if the guard is dropped
@@ -570,10 +601,11 @@ fn pg_run_export(
     let max_value_bytes = tuning.max_value_bytes();
 
     let mut first_fetch_done = false;
+    let mut fetches: Vec<(usize, postgres::Statement)> = Vec::new();
     loop {
         let requested = ctl.target();
-        let fetch_sql = format!("FETCH {} FROM _rivet", requested);
-        let rows = guard.client_mut().query(&fetch_sql, &[])?;
+        let fetch = fetch_statement(guard.client_mut(), &mut fetches, requested)?;
+        let rows = guard.client_mut().query(fetch, &[])?;
         if !first_fetch_done {
             first_fetch_done = true;
             // The cursor's snapshot is pinned as of the FIRST FETCH, not the
@@ -673,6 +705,7 @@ fn pg_run_export(
 
     // Explicit CLOSE is technically redundant — COMMIT releases the cursor —
     // but it documents intent and surfaces any close errors before COMMIT.
+    drop(fetches);
     guard.client_mut().batch_execute("CLOSE _rivet")?;
     guard.commit()?;
     Ok((total_rows, schema.is_some()))
@@ -744,7 +777,8 @@ impl super::Source for PostgresSource {
     }
 
     fn query_scalar(&mut self, sql: &str) -> Result<Option<String>> {
-        let rows = self.client.query(sql, &[])?;
+        let probe = prepare_fresh(&mut self.client, sql)?;
+        let rows = self.client.query(&probe, &[])?;
         if rows.is_empty() {
             return Ok(None);
         }
@@ -805,7 +839,7 @@ impl super::Source for PostgresSource {
         column_overrides: &ColumnOverrides,
     ) -> Result<Vec<TypeMapping>> {
         let wrapped = format!("SELECT * FROM ({}) AS _rivet_type_probe LIMIT 0", query);
-        let stmt = self.client.prepare(&wrapped)?;
+        let stmt = prepare_fresh(&mut self.client, &wrapped)?;
         let hints = pg_numeric_catalog_hints_opt(&mut self.client, query);
         let mappings = stmt
             .columns()
@@ -1079,6 +1113,16 @@ fn unreadable_probe(pg_type: &str, sql: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_fresh_text_is_the_statement_and_a_comment_no_other_nonce_gives() {
+        let sql = "SELECT * FROM (SELECT 1) AS _rivet_type_probe LIMIT 0";
+        assert_eq!(
+            super::fresh_text(sql, 0xab),
+            "SELECT * FROM (SELECT 1) AS _rivet_type_probe LIMIT 0 /* rivet 00000000000000ab */"
+        );
+        assert_ne!(super::fresh_text(sql, 1), super::fresh_text(sql, 2));
+    }
+
     #[test]
     fn an_unreadable_probe_names_the_type_the_remedy_and_the_probe() {
         assert_eq!(
