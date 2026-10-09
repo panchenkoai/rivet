@@ -581,6 +581,50 @@ pub fn enable_cdc(table: &str, ci: &str) {
         "EXEC sys.sp_cdc_enable_table @source_schema=N'dbo', @source_name=N'{table}', \
          @role_name=NULL, @capture_instance=N'{ci}';"
     ));
+    wait_for_a_max_lsn();
+}
+
+const HAS_A_MAX_LSN: &str = "SELECT CASE WHEN sys.fn_cdc_get_max_lsn() IS NULL THEN 0 ELSE 1 END";
+
+/// Block until the database has a max LSN: for some seconds after CDC is first enabled, until the capture job's first scan, it has none and a baseline is refused.
+pub fn wait_for_a_max_lsn() {
+    let asked = std::time::Instant::now();
+    let mut warmed = false;
+    while mssql_cdc_query_i64(HAS_A_MAX_LSN) == 0 {
+        let waited = asked.elapsed();
+        assert!(
+            waited < std::time::Duration::from_secs(120),
+            "fixture: the capture job gave the database no max LSN within 120s"
+        );
+        if waited > std::time::Duration::from_secs(15) {
+            if !warmed {
+                resume_capture_job();
+                mssql_cdc_exec(
+                    "IF OBJECT_ID('dbo.rivet_cdc_warm') IS NULL BEGIN \
+                     CREATE TABLE dbo.rivet_cdc_warm (id INT IDENTITY PRIMARY KEY); \
+                     EXEC sys.sp_cdc_enable_table @source_schema=N'dbo', \
+                     @source_name=N'rivet_cdc_warm', @role_name=NULL, \
+                     @capture_instance=N'dbo_rivet_cdc_warm'; END",
+                );
+                warmed = true;
+            }
+            mssql_cdc_exec("INSERT INTO dbo.rivet_cdc_warm DEFAULT VALUES");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    if warmed {
+        mssql_cdc_exec(
+            "EXEC sys.sp_cdc_disable_table @source_schema=N'dbo', \
+             @source_name=N'rivet_cdc_warm', @capture_instance=N'dbo_rivet_cdc_warm'; \
+             DROP TABLE dbo.rivet_cdc_warm;",
+        );
+    }
+    if asked.elapsed() > std::time::Duration::from_millis(250) {
+        eprintln!(
+            "max LSN: the database had none for {:.1}s",
+            asked.elapsed().as_secs_f64()
+        );
+    }
 }
 
 const CAPTURE_JOB_RUNNING: &str = "SELECT COUNT(*) FROM msdb.dbo.sysjobactivity ja \
@@ -595,6 +639,11 @@ pub struct CaptureJobStalled(std::time::Instant);
 
 /// Stop the capture job and keep the Agent from restarting it; the caller holds `cross_process_serial("mssql_cdc")`.
 pub fn stall_capture_job() -> CaptureJobStalled {
+    mssql_cdc_exec(
+        "IF NOT EXISTS(SELECT 1 FROM sys.databases WHERE name='rivet' AND is_cdc_enabled=1) \
+         EXEC sys.sp_cdc_enable_db;",
+    );
+    wait_for_a_max_lsn();
     let stalled = CaptureJobStalled(std::time::Instant::now());
     mssql_cdc_try_exec(
         "EXEC msdb.dbo.sp_update_job @job_name = N'cdc.rivet_capture', @enabled = 0",

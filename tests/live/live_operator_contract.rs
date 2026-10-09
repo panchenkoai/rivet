@@ -1142,6 +1142,66 @@ fn oracle_range_chunking_takes_a_number_19_key() {
     );
 }
 
+/// A `mode: chunked` config (chunk_size 4) the planner refuses over 10 rows, run over 3 rows first, the row estimate refreshed both times: one config gets one verdict whatever the estimate, so the small table is refused too.
+fn chunked_config_verdict_ignores_the_row_estimate(
+    engine: SqlEngine,
+    key: &str,
+    lines: &[&str],
+    refusal: &str,
+) {
+    engine.alive();
+    let (id, amount, int) = (engine.col("id"), engine.col("amount"), engine.int64());
+    let columns = format!("{id} {int} {key}, {amount} DECIMAL(10,2) NOT NULL");
+    let (table, _guard) = engine.create("oc_estimate", &columns);
+    let grow = |ids: std::ops::RangeInclusive<i64>| {
+        let rows: Vec<String> = ids.map(|g| format!("({g}, {g}.50)")).collect();
+        engine.exec(&format!(
+            "INSERT INTO {table} ({id}, {amount}) VALUES {}",
+            rows.join(", ")
+        ));
+        engine.refresh_row_estimate(&table);
+    };
+    let rig = lines
+        .iter()
+        .fold(engine.rig(&table).mode("chunked"), |r, l| r.export_line(l));
+
+    grow(1..=3);
+    let small = rig.run();
+    let delivered = parquet_rows(&rig.out_dir());
+    grow(4..=10);
+    let large = rig.run();
+    assert!(
+        !large.status.success() && text(&large).contains(refusal),
+        "over 10 rows the config is refused (`{refusal}`):\n{}",
+        text(&large)
+    );
+    assert!(
+        !small.status.success() && text(&small).contains(refusal),
+        "the config refused over 10 rows (`{refusal}`) ran over 3 rows: exit {:?}, {delivered} rows delivered",
+        small.status.code()
+    );
+}
+
+/// [`chunked_config_verdict_ignores_the_row_estimate`] with a DECIMAL `chunk_column`, which range chunking cannot slice.
+fn decimal_chunk_column_verdict(engine: SqlEngine) {
+    chunked_config_verdict_ignores_the_row_estimate(
+        engine,
+        "PRIMARY KEY",
+        &["chunk_column: amount", "chunk_size: 4"],
+        "is not an integer-family column",
+    );
+}
+
+/// [`chunked_config_verdict_ignores_the_row_estimate`] with no `chunk_column` over a table that has no key to page by.
+fn keyless_table_verdict(engine: SqlEngine) {
+    chunked_config_verdict_ignores_the_row_estimate(
+        engine,
+        "NOT NULL",
+        &["chunk_size: 4"],
+        "chunked mode found no safe shape",
+    );
+}
+
 /// Documents enough that a MongoDB read (which `tuning.throttle_ms` does not slow) outlives the start of a second run.
 const MONGO_SLOW: i64 = 300_000;
 
@@ -2214,6 +2274,56 @@ fn open_defect_a_second_run_beside_a_live_checkpointed_run_is_refused_by_code_or
 #[ignore = "live+gate-only: docker compose oracle; open defect (range chunking refuses NUMBER(19)), acknowledged in dev/release_oracle/known_red.py"]
 fn open_defect_range_chunking_takes_a_number_19_key_oracle() {
     oracle_range_chunking_takes_a_number_19_key();
+}
+
+#[test]
+#[ignore = "live+gate-only: docker compose postgres; open defect (a config is validated only past one chunk), acknowledged in dev/release_oracle/known_red.py"]
+fn open_defect_a_decimal_chunk_column_is_refused_whatever_the_row_estimate_postgres() {
+    decimal_chunk_column_verdict(SqlEngine::Pg);
+}
+
+#[test]
+#[ignore = "live+gate-only: docker compose mysql; open defect (a config is validated only past one chunk), acknowledged in dev/release_oracle/known_red.py"]
+fn open_defect_a_decimal_chunk_column_is_refused_whatever_the_row_estimate_mysql() {
+    decimal_chunk_column_verdict(SqlEngine::Mysql);
+}
+
+#[test]
+#[ignore = "live+gate-only: docker compose mssql; open defect (a config is validated only past one chunk), acknowledged in dev/release_oracle/known_red.py"]
+fn open_defect_a_decimal_chunk_column_is_refused_whatever_the_row_estimate_mssql() {
+    decimal_chunk_column_verdict(SqlEngine::Mssql);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live+gate-only: docker compose oracle; open defect (a config is validated only past one chunk), acknowledged in dev/release_oracle/known_red.py"]
+fn open_defect_a_decimal_chunk_column_is_refused_whatever_the_row_estimate_oracle() {
+    decimal_chunk_column_verdict(SqlEngine::Oracle);
+}
+
+#[test]
+#[ignore = "live+gate-only: docker compose postgres; open defect (a config is validated only past one chunk), acknowledged in dev/release_oracle/known_red.py"]
+fn open_defect_a_keyless_table_is_refused_whatever_the_row_estimate_postgres() {
+    keyless_table_verdict(SqlEngine::Pg);
+}
+
+#[test]
+#[ignore = "live+gate-only: docker compose mysql; open defect (a config is validated only past one chunk), acknowledged in dev/release_oracle/known_red.py"]
+fn open_defect_a_keyless_table_is_refused_whatever_the_row_estimate_mysql() {
+    keyless_table_verdict(SqlEngine::Mysql);
+}
+
+#[test]
+#[ignore = "live+gate-only: docker compose mssql; open defect (a config is validated only past one chunk), acknowledged in dev/release_oracle/known_red.py"]
+fn open_defect_a_keyless_table_is_refused_whatever_the_row_estimate_mssql() {
+    keyless_table_verdict(SqlEngine::Mssql);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live+gate-only: docker compose oracle; open defect (a config is validated only past one chunk), acknowledged in dev/release_oracle/known_red.py"]
+fn open_defect_a_keyless_table_is_refused_whatever_the_row_estimate_oracle() {
+    keyless_table_verdict(SqlEngine::Oracle);
 }
 
 #[test]
