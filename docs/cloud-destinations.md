@@ -257,9 +257,10 @@ next resume and the orphan eventually gets moved.
   (62 of them network connections: about three to storage and one to BigQuery
   per table). The default shell limit on macOS is 256 open files (`ulimit -n`);
   Linux shells and containers usually start at 1024 or more. Raise the limit
-  or lower `--pool` when a load fails with `Too many open files`. Not done yet:
-  one storage client for every table of the process, and HTTP/2, which would
-  carry the requests of all tables over one connection per host.
+  or lower `--pool` when a load fails with `Too many open files`. The storage
+  connections are parallel requests of one shared client over HTTP/1.1, one
+  connection per request in flight; HTTP/2, which would carry them over one
+  connection per host, is not enabled.
 - **Object lifecycle policies** — Rivet does not configure
   retention, lifecycle transitions, encryption-at-rest, or replication
   rules on the destination.  Manage those out-of-band (Terraform, console).
