@@ -652,8 +652,28 @@ def _self_test() -> int:
             _sc.verify_live_only_coverage(probe)
             rows = {c.scenario: c.status for c in probe.cells}
             assert rows.get("battery") == want, (skipped, probe.cells)
+        # A self-skip naming the env var the stage can set is run again under it, and only that leg is its verdict.
+        real_live, _legs = _sc.nextest_live, []
+
+        def _two_legs(_log, expr, env=None, _threads=None):
+            _legs.append(expr)
+            if len(_legs) % 2:
+                return ({f"m::{t}": "PASS" for t in "abcde"}, 5, {**{f"m::{t}": "set RIVET_GATE_STATE_URL" for t in "abe"}, "m::d": "X unset"}, {})
+            here = (env or {}).get("RIVET_GATE_STATE_URL", "").startswith("postgres")
+            return {"m::a": "PASS", "m::b": "PASS"}, 2, {"m::b": "still"} if here else {"m::a": "still", "m::b": "still"}, {}
+        _sc.nextest_live = _two_legs
+        try:
+            for again, want in ((("RIVET_GATE_STATE_URL", {"RIVET_GATE_STATE_URL": "postgresql://s"}), "PFPFF"), (None, "FFPFF")):
+                probe = Ledger(colour=False)
+                _sc._run_live_modules(probe, "probe", "probe", "probe", ["m"], again=again)
+                got = "".join("P" if c.status == Status.PASS else "F" for c in probe.cells)
+                assert got == want, (again, probe.cells)
+            assert _legs[1] == "test(=m::a) | test(=m::b) | test(=m::e)" and len(_legs) == 3, _legs
+        finally:
+            _sc.nextest_live = real_live
     finally:
         _sc.run, _sc.have = real_run, real_have
+    print("self-test ok: a live test that self-skips for an env var the stage can set is graded by its second leg")
     from . import state_lib as _sl
     assert _sl.vacuous("running 0 tests\ntest result: ok. 0 passed; 0 failed", {}), "a zero-match filter graded nothing"
     assert _sl.vacuous("test result: ok. 9 passed; 0 failed", {"state::x::t": "RIVET_TEST_STATE_URL unset"})
