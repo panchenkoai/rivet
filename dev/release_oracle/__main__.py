@@ -674,6 +674,11 @@ def _self_test() -> int:
     finally:
         _sc.run, _sc.have = real_run, real_have
     print("self-test ok: a live test that self-skips for an env var the stage can set is graded by its second leg")
+    # Leftovers of killed runs (2087 Mongo databases, 2026-10-09) held the open files the gate's cells needed.
+    import re as _re
+    assert _re.search(r"^release-oracle-full:[^#\n]*\bsweep-test-db\b", (ROOT / "Makefile").read_text(), _re.M), \
+        "`make release-oracle-full` must depend on sweep-test-db: the gate starts on a swept stand"
+    print("self-test ok: the full gate sweeps the stand's leftovers before it starts")
     from . import state_lib as _sl
     assert _sl.vacuous("running 0 tests\ntest result: ok. 0 passed; 0 failed", {}), "a zero-match filter graded nothing"
     assert _sl.vacuous("test result: ok. 9 passed; 0 failed", {"state::x::t": "RIVET_TEST_STATE_URL unset"})

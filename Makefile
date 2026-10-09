@@ -329,7 +329,7 @@ release-oracle-prev-bin:  ## Download the PREVIOUS release binary (the regressio
 	@# The releases a client still runs (dev/release_oracle/field_state.py FIELD_VERSIONS), beside the baseline.
 	@$(PY) -m dev.release_oracle.field_state --fetch $(PREV_RELEASE_DIR)/field
 
-release-oracle-full: release-oracle-prev-bin  ## Release gate with the WHOLE environment against the local dev stand. This is the one a release is judged by.
+release-oracle-full: release-oracle-prev-bin sweep-test-db  ## Release gate with the WHOLE environment against the local dev stand. This is the one a release is judged by.
 	@# The gate grades `target/release/rivet`. A stale one grades yesterday's
 	@# code, and `cargo package` poisons the fingerprints so cargo reports
 	@# `Fresh` on a binary that predates your edits — drop the snapshot first.
