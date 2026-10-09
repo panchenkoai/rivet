@@ -1,13 +1,13 @@
 diff --git a/src/source/postgres/mod.rs b/src/source/postgres/mod.rs
-index d9f9248a..4d259194 100644
+index 1d27fbcd..28870184 100644
 --- a/src/source/postgres/mod.rs
 +++ b/src/source/postgres/mod.rs
-@@ -100,7 +100,7 @@ pub(crate) fn query_unnamed(
-     client: &mut Client,
+@@ -101,7 +101,7 @@ pub(crate) fn prepare_fresh(
      sql: &str,
- ) -> std::result::Result<Vec<postgres::Row>, postgres::Error> {
--    client.query_typed(sql, &[])
-+    client.query(sql, &[])
+ ) -> std::result::Result<postgres::Statement, postgres::Error> {
+     use rand::RngExt;
+-    client.prepare(&fresh_text(sql, rand::rng().random::<u64>()))
++    client.prepare(&fresh_text(sql, rand::rng().random::<u64>() * 0))
  }
  
- /// Prepare `sql` without running it, under a text no earlier call sent, so the description is the one this parse fixes.
+ /// `sql` followed by a comment carrying `nonce`.
