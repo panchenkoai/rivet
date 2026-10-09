@@ -57,6 +57,7 @@ from . import (
     field_state,
     fix_cells,
     gifs,
+    guarantees,
     init_delta,
     live_modules,
     partner_shape,
@@ -507,6 +508,7 @@ def _self_test() -> int:
     from dev.seeded import recall as seeded
 
     seeded.self_test()
+    guarantees.self_test()
     off = Ledger(colour=False)
     off._buf = []
     verify_seeded_recall(off, False)
@@ -1086,6 +1088,8 @@ def gate_stages(ns: argparse.Namespace) -> list[Stage]:
         measured("previous-release differential", lambda led: regression.verify_previous_release_differential(led)),
         measured("field symptom replay", lambda led: regression.verify_field_symptom_replay(led)),
         measured("scale memory", lambda led: regression.verify_scale_memory(led)),
+        measured("flat rss", lambda led: guarantees.verify_flat_rss(led)),
+        serial("byte-identical parts", lambda led: guarantees.verify_byte_identical_parts(led)),
         serial("state backend parity", lambda led: state_parity.verify_state_backend_parity(led, **state)),
         warehouse("shared state", lambda led: shared_state.verify_shared_state_same_name(led)),
         warehouse("warehouse layout", lambda led: warehouse_layout.verify_warehouse_layout(led)),

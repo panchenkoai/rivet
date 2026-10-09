@@ -427,6 +427,431 @@ fn a_sealed_plan_carries_no_state_url_mongo() {
     a_sealed_plan_carries_no_state_url(Rig::mongo_batch("t").source_url(&url));
 }
 
+const WIRE_ROWS: i64 = 4000;
+const WIRE_PAGE: i64 = 200;
+const WIRE_PAGES: u64 = (WIRE_ROWS / WIRE_PAGE) as u64;
+
+/// The bytes of each answer the source gave to one request, over every connection through a [`wire_to`] forwarder.
+type Answers = Arc<std::sync::Mutex<Vec<u64>>>;
+
+/// Every byte the clients sent through a [`wire_to`] forwarder, in the order it read them.
+type Asked = Arc<std::sync::Mutex<Vec<u8>>>;
+
+/// Copy `from` to `to` on a thread, reporting each read to `seen` before it is passed on (a request closes the answer before the source can start the next one) and the end of the stream as an empty read.
+fn pipe(
+    mut from: std::net::TcpStream,
+    mut to: std::net::TcpStream,
+    mut seen: impl FnMut(&[u8]) + Send + 'static,
+) {
+    use std::io::{Read, Write};
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 65536];
+        while let Ok(n) = from.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            seen(&buf[..n]);
+            if to.write_all(&buf[..n]).is_err() {
+                break;
+            }
+        }
+        let _ = to.shutdown(std::net::Shutdown::Both);
+        let _ = from.shutdown(std::net::Shutdown::Both);
+        seen(&[]);
+    });
+}
+
+/// A loopback forwarder to local `port`: its own port, the size of each answer the source gives through it, and what the clients sent.
+fn wire_to(port: u16) -> (u16, Answers, Asked) {
+    // DuckDB's MySQL reader, which the rig's oracle attaches with, refuses a port above 65353.
+    let listener = std::iter::repeat_with(|| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+        .find(|l| l.local_addr().unwrap().port() <= 65353)
+        .unwrap();
+    let via = listener.local_addr().unwrap().port();
+    let (answers, asked) = (Answers::default(), Asked::default());
+    let (all, sent) = (answers.clone(), asked.clone());
+    std::thread::spawn(move || {
+        for down in listener.incoming().flatten() {
+            let Ok(up) = std::net::TcpStream::connect(("127.0.0.1", port)) else {
+                continue;
+            };
+            let open = Arc::new(AtomicUsize::new(0));
+            let close = |all: &Answers, open: &AtomicUsize| {
+                let answer = open.swap(0, Ordering::SeqCst) as u64;
+                if answer > 0 {
+                    all.lock().unwrap().push(answer);
+                }
+            };
+            let (asking, answered) = ((all.clone(), open.clone()), (all.clone(), open));
+            let sent = sent.clone();
+            pipe(
+                down.try_clone().unwrap(),
+                up.try_clone().unwrap(),
+                move |read| {
+                    if !read.is_empty() {
+                        sent.lock().unwrap().extend_from_slice(read);
+                        close(&asking.0, &asking.1);
+                    }
+                },
+            );
+            pipe(up, down, move |read| {
+                if read.is_empty() {
+                    close(&answered.0, &answered.1);
+                } else {
+                    answered.1.fetch_add(read.len(), Ordering::SeqCst);
+                }
+            });
+        }
+    });
+    (via, answers, asked)
+}
+
+/// The FETCH statements a PostgreSQL client sent inside each transaction that declared rivet's cursor, up to its COMMIT.
+fn fetches_per_cursor_transaction(asked: &[u8]) -> Vec<usize> {
+    let find = |hay: &[u8], needle: &[u8]| hay.windows(needle.len()).position(|w| w == needle);
+    let (mut out, mut rest) = (Vec::new(), asked);
+    while let Some(at) = find(rest, b"DECLARE _rivet") {
+        rest = &rest[at + 1..];
+        let end = find(rest, b"COMMIT\0").unwrap_or(rest.len());
+        out.push(rest[..end].windows(6).filter(|w| w == b"FETCH ").count());
+        rest = &rest[end..];
+    }
+    out
+}
+
+/// The longest single answer and the bytes of all of them.
+fn longest_and_total(answers: &[u64]) -> (u64, u64) {
+    (
+        answers.iter().copied().max().unwrap_or(0),
+        answers.iter().sum(),
+    )
+}
+
+/// Whether the longest answer is one page of a `pages`-page read: at most half again over an even share of every byte the source sent.
+fn is_one_page(longest: u64, total: u64, pages: u64) -> bool {
+    longest * pages * 2 <= total * 3
+}
+
+/// What `mode: full` holds on the source in one statement: a `batch_size` page, a fetch array the driver sizes (measured at 4.5% and 7.5% of the table on two servers), or the table.
+#[derive(Clone, Copy)]
+enum Holds {
+    OnePage,
+    #[cfg(feature = "oracle")]
+    LessThanHalf,
+    TheTable,
+}
+
+/// Whether the longest answer carried more than half of every byte the source sent: the table in one statement, not a fetch at a time.
+fn is_most_of_the_table(longest: u64, total: u64) -> bool {
+    longest * 2 > total
+}
+
+/// Run `rig` with its source behind a forwarder to `port`: the size of each answer the source gave the rivet process and every byte the process sent, once the run delivered `WIRE_ROWS` rows.
+fn a_run_on_the_wire(rig: Rig, url: &str, port: u16) -> (Vec<u64>, Vec<u8>) {
+    let (via, answers, asked) = wire_to(port);
+    let rig = rig.source_url(&at_port(url, via));
+    let mut run = rig.spawn_args_env(&[], &[]);
+    // The rig's oracle reads the source through the same URL before and after the process.
+    answers.lock().unwrap().clear();
+    std::process::Child::wait(&mut run).expect("rivet ran");
+    let seen = (
+        answers.lock().unwrap().clone(),
+        asked.lock().unwrap().clone(),
+    );
+    assert!(
+        run.wait().expect("rivet ran").success(),
+        "fixture: the run succeeds"
+    );
+    let rows = events(&files_with_extension(&rig.out_dir(), "parquet"))
+        .1
+        .len();
+    assert_eq!(rows, WIRE_ROWS as usize, "fixture: the run read the table");
+    seen
+}
+
+/// The longest answer the source gave a run of `rig` behind a forwarder to `port`, and the bytes of all of them.
+fn longest_answer_of_a_run(rig: Rig, url: &str, port: u16) -> (u64, u64) {
+    let (longest, total) = longest_and_total(&a_run_on_the_wire(rig, url, port).0);
+    eprintln!("longest answer {longest} of {total} bytes");
+    assert!(
+        total > WIRE_ROWS as u64 * 8,
+        "fixture: the forwarder carried the table ({total} bytes)"
+    );
+    (longest, total)
+}
+
+/// A fresh `WIRE_ROWS`-row table on `engine`, every row the same width on the wire.
+fn wire_table(engine: SqlEngine) -> (String, Box<dyn std::any::Any>) {
+    engine.alive();
+    let (table, guard) = engine.range_table("guar_page");
+    for lo in (1000..1000 + WIRE_ROWS).step_by(500) {
+        engine.insert(&table, lo..=lo + 499, 180, Some(10));
+    }
+    (table, guard)
+}
+
+/// docs/why/source-safe-under-load.md: the longest query rivet holds open on the source is a
+/// single page. Each paged shape reads a 20-page table through a forwarder; no single answer of
+/// the source may be longer than one page's share of the bytes it sent.
+fn the_longest_statement_of_a_paged_export_is_one_page(engine: SqlEngine) {
+    let (table, _guard) = wire_table(engine);
+    let size = format!("chunk_size: {WIRE_PAGE}");
+    for key in ["chunk_by_key: id", "chunk_column: id"] {
+        let rig = engine.staged(engine.rig(&table), "chunked", &[key, &size]);
+        let (longest, total) = longest_answer_of_a_run(rig, engine.url(), engine.default_port());
+        assert!(
+            is_one_page(longest, total, WIRE_PAGES),
+            "{key}: the longest statement held on the source answered {longest} of {total} \
+             bytes, more than one page of {WIRE_PAGES}"
+        );
+    }
+}
+
+/// docs/partitioning.md against the same sentence: what `mode: full` holds on the source. An
+/// engine read through a cursor answers one fetch at a time; the others answer the whole table
+/// to a single statement.
+fn mode_full_documents_the_longest_statement_it_holds(engine: SqlEngine, holds: Holds) {
+    let (table, _guard) = wire_table(engine);
+    let rig = engine
+        .rig(&table)
+        .export_line(&format!("tuning: {{batch_size: {WIRE_PAGE}}}"));
+    let (longest, total) = longest_answer_of_a_run(rig, engine.url(), engine.default_port());
+    let held = match holds {
+        Holds::OnePage => is_one_page(longest, total, WIRE_PAGES),
+        #[cfg(feature = "oracle")]
+        Holds::LessThanHalf => !is_most_of_the_table(longest, total),
+        Holds::TheTable => is_most_of_the_table(longest, total),
+    };
+    assert!(
+        held,
+        "mode: full answered {longest} of {total} bytes to its longest statement"
+    );
+}
+
+/// docs/why/source-safe-under-load.md: on PostgreSQL `mode: full` reads the whole table inside
+/// one transaction, and a chunked export opens one per page. Counted in what the rivet process
+/// sent: the transactions that declare its cursor, and the FETCH statements inside each.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn mode_full_reads_in_one_transaction_and_chunked_in_one_per_page_postgres() {
+    let engine = SqlEngine::Pg;
+    let (table, _guard) = wire_table(engine);
+    let full = engine
+        .rig(&table)
+        .export_line(&format!("tuning: {{batch_size: {WIRE_PAGE}}}"));
+    let asked = a_run_on_the_wire(full, engine.url(), engine.default_port()).1;
+    let per = fetches_per_cursor_transaction(&asked);
+    assert!(
+        per.len() == 1 && per[0] as u64 >= WIRE_PAGES,
+        "mode: full read the table in {} cursor transactions holding {per:?} FETCH statements, \
+         not in one holding all {WIRE_PAGES} pages",
+        per.len()
+    );
+    let size = format!("chunk_size: {WIRE_PAGE}");
+    for key in ["chunk_by_key: id", "chunk_column: id"] {
+        let rig = engine.staged(engine.rig(&table), "chunked", &[key, &size]);
+        let asked = a_run_on_the_wire(rig, engine.url(), engine.default_port()).1;
+        let per = fetches_per_cursor_transaction(&asked);
+        assert!(
+            per.len() as u64 >= WIRE_PAGES,
+            "{key}: {} cursor transactions for {WIRE_PAGES} pages, not one per page ({per:?})",
+            per.len()
+        );
+    }
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn the_longest_statement_of_a_paged_export_is_one_page_postgres() {
+    the_longest_statement_of_a_paged_export_is_one_page(SqlEngine::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn the_longest_statement_of_a_paged_export_is_one_page_mysql() {
+    the_longest_statement_of_a_paged_export_is_one_page(SqlEngine::Mysql);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn the_longest_statement_of_a_paged_export_is_one_page_mssql() {
+    the_longest_statement_of_a_paged_export_is_one_page(SqlEngine::Mssql);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn the_longest_statement_of_a_paged_export_is_one_page_oracle() {
+    the_longest_statement_of_a_paged_export_is_one_page(SqlEngine::Oracle);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn mode_full_documents_the_longest_statement_it_holds_postgres() {
+    mode_full_documents_the_longest_statement_it_holds(SqlEngine::Pg, Holds::OnePage);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn mode_full_documents_the_longest_statement_it_holds_mysql() {
+    mode_full_documents_the_longest_statement_it_holds(SqlEngine::Mysql, Holds::TheTable);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn mode_full_documents_the_longest_statement_it_holds_mssql() {
+    mode_full_documents_the_longest_statement_it_holds(SqlEngine::Mssql, Holds::TheTable);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn mode_full_documents_the_longest_statement_it_holds_oracle() {
+    mode_full_documents_the_longest_statement_it_holds(SqlEngine::Oracle, Holds::LessThanHalf);
+}
+
+/// A fresh database on the standalone MongoDB with `WIRE_ROWS` documents of `pad` bytes in `t`: its URL and drop guard.
+fn wire_collection(pad: usize) -> (String, MongoDbGuard) {
+    require_alive(LiveService::Mongo);
+    let db = unique_name("guar_page");
+    let guard = MongoDbGuard {
+        port: MONGO_PORT,
+        db: db.clone(),
+    };
+    MongoTest::connect(MONGO_PORT, &db).append_padded("t", 1..=WIRE_ROWS as usize, pad);
+    (MongoTest::url(MONGO_PORT, &db), guard)
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mongo"]
+fn the_longest_statement_of_a_paged_export_is_one_page_mongo() {
+    // 2 kB documents: a page outweighs the server's status answers.
+    let (url, _guard) = wire_collection(2000);
+    let rig = Rig::mongo_batch("t").mongo(&format!("page_size: {WIRE_PAGE}"));
+    let (longest, total) = longest_answer_of_a_run(rig, &url, MONGO_PORT);
+    assert!(
+        is_one_page(longest, total, WIRE_PAGES),
+        "page_size: the longest statement held on the source answered {longest} of {total} \
+         bytes, more than one page of {WIRE_PAGES}"
+    );
+}
+
+/// The most a MongoDB server puts in one reply (16 MiB of documents and its envelope).
+const MONGO_REPLY: u64 = 16 * 1024 * 1024 + 64 * 1024;
+
+/// MongoDB sets no cursor batch size: `mode: full` holds one server reply of up to 16 MiB per statement, neither a `batch_size` page nor the collection.
+#[test]
+#[ignore = "live: requires docker compose up -d mongo"]
+fn mode_full_documents_the_longest_statement_it_holds_mongo() {
+    let (url, _guard) = wire_collection(10_000);
+    let rig = Rig::mongo_batch("t").export_line(&format!("tuning: {{batch_size: {WIRE_PAGE}}}"));
+    let (longest, total) = longest_answer_of_a_run(rig, &url, MONGO_PORT);
+    assert!(
+        total > 2 * MONGO_REPLY
+            && longest <= MONGO_REPLY
+            && !is_one_page(longest, total, WIRE_PAGES),
+        "mode: full answered {longest} of {total} bytes to its longest statement"
+    );
+}
+
+/// The backend behind the transaction pooler and every setting of its session.
+fn pooled_session() -> (i32, Vec<(String, String)>) {
+    let mut c = postgres::Client::connect(PGBOUNCER_URL, postgres::NoTls).expect("pgbouncer");
+    let pid = c.query_one("SELECT pg_backend_pid()", &[]).unwrap().get(0);
+    let settings = c
+        .query("SELECT name, setting FROM pg_settings ORDER BY name", &[])
+        .unwrap()
+        .iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect();
+    (pid, settings)
+}
+
+/// docs/concepts.md: Postgres session state is never leaked into the pool. Each batch shape runs
+/// through a transaction-mode pooler with one server connection, delivers the table, and leaves
+/// every setting of that connection as it found it.
+#[test]
+#[ignore = "live: requires docker compose --profile pool up -d pgbouncer (transaction mode, pool_size=1)"]
+fn every_batch_shape_through_a_transaction_pooler_leaves_its_session_as_it_was_postgres() {
+    let _alone = pgbouncer_alone();
+    let engine = SqlEngine::Pg;
+    engine.alive();
+    let (table, _guard) = engine.range_table("guar_pool");
+    engine.insert(&table, 1..=ROWS, 180, Some(10));
+    let before = pooled_session();
+    let shapes: [(&str, &[&str]); 4] = [
+        ("full", &[]),
+        ("chunked", &["chunk_by_key: id", "chunk_size: 5"]),
+        ("chunked", &["chunk_column: id", "chunk_size: 5"]),
+        ("incremental", &["cursor_column: id"]),
+    ];
+    for (mode, lines) in shapes {
+        let rig = engine
+            .staged(engine.rig(&table), mode, lines)
+            .source_url(PGBOUNCER_URL)
+            .export_line("tuning: {statement_timeout_s: 300, lock_timeout_s: 30}");
+        rig.run_ok();
+        assert_eq!(
+            read_ids(&rig.out_dir()),
+            (1..=ROWS).collect::<Vec<_>>(),
+            "{mode} {lines:?}: every row arrives through the pooler"
+        );
+        assert_eq!(
+            pooled_session(),
+            before,
+            "{mode} {lines:?}: the run changed the session of the pooled connection"
+        );
+    }
+}
+
+/// The forwarder closes an answer at the next request, and one page is told from two.
+#[test]
+fn an_answer_ends_at_the_next_request_and_two_pages_are_not_one() {
+    use std::io::{Read, Write};
+    let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = server.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let (mut conn, _) = server.accept().unwrap();
+        let mut ask = [0u8; 1];
+        for answer in [300usize, 7] {
+            conn.read_exact(&mut ask).unwrap();
+            conn.write_all(&vec![0u8; answer]).unwrap();
+        }
+    });
+    let (via, answers, asked) = wire_to(port);
+    let mut client = std::net::TcpStream::connect(("127.0.0.1", via)).unwrap();
+    for answer in [300usize, 7] {
+        client.write_all(b"?").unwrap();
+        client.read_exact(&mut vec![0u8; answer]).unwrap();
+    }
+    client.write_all(b"?").unwrap();
+    drop(client);
+    for _ in 0..200 {
+        if answers.lock().unwrap().len() == 2 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(*answers.lock().unwrap(), vec![300, 7]);
+    assert!(asked.lock().unwrap().starts_with(b"??"));
+    let one =
+        b"Q BEGIN\0 Q DECLARE _rivet .. P FETCH 2 FROM _rivet P FETCH 2 FROM _rivet Q COMMIT\0";
+    assert_eq!(fetches_per_cursor_transaction(one), vec![2]);
+    assert_eq!(
+        fetches_per_cursor_transaction(&[&one[..], b" P FETCH 9 ", &one[..]].concat()),
+        vec![2, 2],
+        "a FETCH outside a cursor transaction is not counted"
+    );
+    assert!(fetches_per_cursor_transaction(b"Q BEGIN\0 Q SELECT 1 Q COMMIT\0").is_empty());
+    assert_eq!(longest_and_total(&[300, 7]), (300, 307));
+    assert!(is_one_page(1000, 20_000, 20) && is_one_page(1500, 20_000, 20));
+    assert!(!is_one_page(2000, 20_000, 20), "two pages are not one");
+    assert!(
+        !is_one_page(20_000, 20_000, 20),
+        "the whole table is not one page"
+    );
+}
+
 /// `at_port` swaps the authority of each URL shape the stand uses and nothing else.
 #[test]
 fn at_port_replaces_only_the_host_and_port() {
