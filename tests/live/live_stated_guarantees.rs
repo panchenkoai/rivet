@@ -511,6 +511,14 @@ fn is_one_page(longest: u64, total: u64, pages: u64) -> bool {
     longest * pages * 2 <= total * 3
 }
 
+/// What `mode: full` holds on the source in one statement: a `batch_size` page, a fetch array the driver sizes (measured at 4.5% and 7.5% of the table on two servers), or the table.
+#[derive(Clone, Copy)]
+enum Holds {
+    OnePage,
+    LessThanHalf,
+    TheTable,
+}
+
 /// Whether the longest answer carried more than half of every byte the source sent: the table in one statement, not a fetch at a time.
 fn is_most_of_the_table(longest: u64, total: u64) -> bool {
     longest * 2 > total
@@ -571,15 +579,19 @@ fn the_longest_statement_of_a_paged_export_is_one_page(engine: SqlEngine) {
 /// docs/partitioning.md against the same sentence: what `mode: full` holds on the source. An
 /// engine read through a cursor answers one fetch at a time; the others answer the whole table
 /// to a single statement.
-fn mode_full_documents_the_longest_statement_it_holds(engine: SqlEngine, whole_table: bool) {
+fn mode_full_documents_the_longest_statement_it_holds(engine: SqlEngine, holds: Holds) {
     let (table, _guard) = wire_table(engine);
     let rig = engine
         .rig(&table)
         .export_line(&format!("tuning: {{batch_size: {WIRE_PAGE}}}"));
     let (longest, total) = longest_answer_of_a_run(rig, engine.url(), engine.default_port());
-    assert_eq!(
-        is_most_of_the_table(longest, total),
-        whole_table,
+    let held = match holds {
+        Holds::OnePage => is_one_page(longest, total, WIRE_PAGES),
+        Holds::LessThanHalf => !is_most_of_the_table(longest, total),
+        Holds::TheTable => is_most_of_the_table(longest, total),
+    };
+    assert!(
+        held,
         "mode: full answered {longest} of {total} bytes to its longest statement"
     );
 }
@@ -612,26 +624,26 @@ fn the_longest_statement_of_a_paged_export_is_one_page_oracle() {
 #[test]
 #[ignore = "live: requires docker compose postgres"]
 fn mode_full_documents_the_longest_statement_it_holds_postgres() {
-    mode_full_documents_the_longest_statement_it_holds(SqlEngine::Pg, false);
+    mode_full_documents_the_longest_statement_it_holds(SqlEngine::Pg, Holds::OnePage);
 }
 
 #[test]
 #[ignore = "live: requires docker compose mysql"]
 fn mode_full_documents_the_longest_statement_it_holds_mysql() {
-    mode_full_documents_the_longest_statement_it_holds(SqlEngine::Mysql, true);
+    mode_full_documents_the_longest_statement_it_holds(SqlEngine::Mysql, Holds::TheTable);
 }
 
 #[test]
 #[ignore = "live: requires docker compose mssql"]
 fn mode_full_documents_the_longest_statement_it_holds_mssql() {
-    mode_full_documents_the_longest_statement_it_holds(SqlEngine::Mssql, true);
+    mode_full_documents_the_longest_statement_it_holds(SqlEngine::Mssql, Holds::TheTable);
 }
 
 #[cfg(feature = "oracle")]
 #[test]
 #[ignore = "live: requires docker compose oracle"]
 fn mode_full_documents_the_longest_statement_it_holds_oracle() {
-    mode_full_documents_the_longest_statement_it_holds(SqlEngine::Oracle, false);
+    mode_full_documents_the_longest_statement_it_holds(SqlEngine::Oracle, Holds::LessThanHalf);
 }
 
 /// A fresh database on the standalone MongoDB with `WIRE_ROWS` documents of `pad` bytes in `t`: its URL and drop guard.
