@@ -68,6 +68,10 @@ ADJUDICATED: dict[str, tuple[str, int]] = {  # ratchet-pin: live-only-adjudicate
     # The binary's entry (`main` → `cli::run_binary`): the same measurement, 26 tests.
     "main": ("cli tests spawn the binary; stub fails 26 offline_suite tests", 100),
     "run_binary": ("cli tests spawn the binary; stub fails 26 offline_suite tests", 100),
+    # `pg_in_recovery` (init/mod.rs) is one expression, so its unit test of a server that does
+    # not answer counts as the whole body. With the exclusion lifted under `--lib --bins` the
+    # `true` mutant is CAUGHT and the `false` one MISSED: only a standby answers `true`.
+    "pg_in_recovery": ("a one-expression fn; offline reaches the unanswered probe, the answer needs a standby", 100),
 }  # ratchet-pin: end
 
 
