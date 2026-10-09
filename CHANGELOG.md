@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+- **Fix: a PostgreSQL export through a transaction-mode pgBouncer that keeps prepared
+  statements is delivered under its own columns.** Applies to every batch mode (`full`,
+  `chunked` by key or by range, `incremental`) when the source URL points at pgBouncer in
+  transaction pooling mode with `max_prepared_statements` above zero (pgBouncer's
+  documented default is 200). Reproduced on pgBouncer 1.26.0 with rivet 0.31.0; a direct
+  connection was never affected, and neither was MySQL through ProxySQL.
+  - **What was wrong in 0.31.0 and earlier.** rivet read every table through a statement
+    of one text, `FETCH n FROM _rivet`. Such a pooler keeps a prepared statement by its text
+    and reuses it for every client, and PostgreSQL keeps the columns it described when that
+    text was first parsed. A table read after another one through the same pooled server
+    connection was decoded as the earlier table:
+    - with the same number of columns the run exited 0 with a success manifest, and the
+      part carried the earlier table's column names and types (a `double precision` 1.5
+      delivered as the `BIGINT` 4609434218613702656);
+    - one table whose column type was altered between two runs was delivered under the old
+      type, exit 0;
+    - with another number of columns, or after `ALTER TABLE .. ADD COLUMN`, the run failed
+      with `DataRow field count does not match the number of columns`, on every run until
+      the pooler dropped its server connection;
+    - after a chunk key was widened the run failed with `cached plan must not change result
+      type` or `sent a malformed wire payload`, and a chunked run skipped its schema-drift
+      check with `could not resolve schema for drift check (skipping)`.
+  - **Now** every statement whose columns follow a table (the cursor `FETCH`, the bound and
+    count probes, the type probe) is prepared under a text of its own, so the pooler never
+    answers it with a statement another read left. The first run of this release through a
+    pooler that still holds statements of an older rivet delivers the table as the source
+    holds it.
+  - **If you ran 0.31.0 or earlier through such a pooler:** compare each delivered part's
+    column names and types with the source table (`DESCRIBE SELECT * FROM
+    read_parquet('<part>')` in DuckDB against `\d <table>` in psql). A part whose columns
+    are the table's own was decoded as that table. A part with another table's columns, or
+    a column under a type the table does not have, holds wrong values: remove it and
+    extract the export again with this release (`rivet state reset -c <config> --export
+    <name>` first for an `incremental` or checkpointed export, so the pass is a full one).
+
 - **Breaking: a destination or format edited under stored progress is refused, and a run
   resumed after a crash delivers the rows that arrived since.** Applies to `incremental`,
   `keyset_incremental`, MongoDB `resume` and `chunk_checkpoint` exports on every source

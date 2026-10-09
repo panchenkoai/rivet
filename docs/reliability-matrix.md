@@ -93,6 +93,7 @@ Per-backend commit contracts: [ADR-0004](adr/0004-destination-write-contracts.md
 | Scenario | PR CI | Nightly | Manual | Notes |
 |---|:---:|:---:|:---:|---|
 | pgBouncer (transaction mode, pool_size=1) | ✅ | ✅ | ✅ | `live_pool_safety` — F1–F6 / G1 DBA-audit fixes |
+| pgBouncer keeping prepared statements: two tables, and one table altered between two runs, through one pooled connection | ✅ | ✅ | ✅ | `live_pooled_reads` — every batch mode; the second destination is compared with the source |
 | ProxySQL (MySQL transaction-persistent pool) | — | ✅ | ✅ | `live_pool_safety::mysql_proxysql_*` — detection + cleanup-through-proxy |
 | MySQL proxy / multiplexer classification (unit) | ✅ | ✅ | — | `source::mysql::tests::proxy_*` — pure classifier over the 4 signals |
 | SQL Server pooler / Azure-gateway classification (unit) | ✅ | ✅ | — | `source::mssql::proxy::tests::*` — pure classifier (@@SPID drift → Multiplexed, EngineEdition 5/8 → AzureGateway) |

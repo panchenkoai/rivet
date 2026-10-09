@@ -324,9 +324,6 @@ KNOWN_RED: tuple[KnownRed, ...] = (
     _open("live_operator_contract::open_defect_a_keyless_table_is_refused_whatever_the_row_estimate_oracle",
           "the config refused over 10 rows (`chunked mode found no safe shape`) ran over 3 rows: exit Some(0), 3 rows delivered",
           "2026-10-09: the planner's small-table escape runs before the shape validation, so a `mode: chunked` config it refuses once the row estimate exceeds chunk_size plans and runs as one pass below it; no work item yet: validate the shape before the escape"),
-    _open("live_stated_guarantees::open_defect_a_second_table_through_one_transaction_pooler_keeps_its_own_columns_postgres",
-          "rig oracle: TYPE: source column `amount` is absent from the delivered parquet",
-          "exit 0 over wrong data: behind a transaction-mode pgBouncer that tracks prepared statements (1.21 and later; the stand runs 1.26.0) a second table read through one pooled server connection is decoded under the first table's column names and types. Every export sends the same statement text `FETCH n FROM _rivet`, pgBouncer reuses a prepared statement by its text across clients, and PostgreSQL keeps the result description it fixed at the first parse. Equal column counts end as exit 0 with the first table's names and reinterpreted values (1.5 delivered as 4609434218613702656); unequal counts fail with `DataRow field count does not match the number of columns`, which is how the session-state cell went red in CI on cf75c140. No work item yet: a cursor name or statement text unique to the export, or FETCH over the simple protocol"),
 )
 
 
