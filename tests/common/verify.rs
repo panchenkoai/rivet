@@ -21,7 +21,8 @@
 //! shrink-only ceiling, both logged `RIVET-ORACLE-OFF`); a run's one `destination: stdout` export
 //! is graded from the bytes its runner captured (`Case::delivered`); an export the oracle cannot
 //! reach logs `RIVET-ORACLE-SKIP`; an exception inside the oracle FAILs the test as an oracle
-//! error. A `Rig::spawn_args_env` child is graded when its caller reaps it;
+//! error; an oracle whose reader died in native code (SIGSEGV, SIGBUS) is read once more, logged
+//! `RIVET-ORACLE-RERUN` and capped per lane by the census. A `Rig::spawn_args_env` child is graded when its caller reaps it;
 //! a hand-built `Command::new(RIVET_BIN)` is not graded (under its own ceiling).
 
 use std::collections::BTreeSet;
@@ -1522,8 +1523,26 @@ fn oracle_python() -> &'static str {
     })
 }
 
-/// Run `dev/release_oracle/rig_oracle.py <verb>` (pinned by uv.lock) over `spec` within `TIMEOUT_SECS`; its JSON verdict.
+/// Whether an oracle that ended with `status` died in native code: a reader's crash, which graded nothing.
+fn reader_crashed(status: &std::process::ExitStatus) -> bool {
+    use std::os::unix::process::ExitStatusExt as _;
+    matches!(status.signal(), Some(libc::SIGSEGV | libc::SIGBUS))
+}
+
+/// Run `dev/release_oracle/rig_oracle.py <verb>` (pinned by uv.lock) over `spec`; its JSON verdict. A reader that crashed is read once more, logged `RIVET-ORACLE-RERUN`.
 fn run_rig_oracle(spec: &serde_json::Value, verb: &str) -> serde_json::Value {
+    run_rig_oracle_once(spec, verb, true).unwrap_or_else(|crash| {
+        log("RERUN", spec["export"].as_str().unwrap_or("*"), &crash);
+        run_rig_oracle_once(spec, verb, false).expect("the last read never asks for another")
+    })
+}
+
+/// One read of the rig oracle within `TIMEOUT_SECS`; `Err` (what crashed) only for a reader's crash while `again` allows another read.
+fn run_rig_oracle_once(
+    spec: &serde_json::Value,
+    verb: &str,
+    again: bool,
+) -> Result<serde_json::Value, String> {
     use std::io::{Read as _, Write as _};
     use std::os::unix::process::CommandExt as _;
     const TIMEOUT_SECS: u64 = 300;
@@ -1570,6 +1589,14 @@ fn run_rig_oracle(spec: &serde_json::Value, verb: &str) -> serde_json::Value {
     };
     let out = stdout.join().unwrap_or_default();
     let err = String::from_utf8_lossy(&stderr.join().unwrap_or_default()).into_owned();
+    if again && !timed_out && reader_crashed(&status) {
+        let frame = err.lines().find(|l| l.trim_start().starts_with("File "));
+        return Err(format!(
+            "oracle reader crashed ({verb}): {status} after {:.1}s in {}; read once more",
+            started.elapsed().as_secs_f64(),
+            frame.map_or("<no Python frame>", str::trim)
+        ));
+    }
     if timed_out || !status.success() {
         let why = if timed_out {
             format!("timed out after {TIMEOUT_SECS}s and was killed")
@@ -1593,12 +1620,12 @@ fn run_rig_oracle(spec: &serde_json::Value, verb: &str) -> serde_json::Value {
             String::from_utf8_lossy(&out)
         );
     }
-    serde_json::from_slice(&out).unwrap_or_else(|e| {
+    Ok(serde_json::from_slice(&out).unwrap_or_else(|e| {
         panic!(
             "rig oracle printed no JSON verdict ({e}):\n{}",
             String::from_utf8_lossy(&out)
         )
-    })
+    }))
 }
 
 /// Append one verdict line (`RIVET-ORACLE-<VERDICT> <test> [<export>] — <detail>`) to stderr and `RIVET_ORACLE_LOG`.
@@ -1656,6 +1683,30 @@ fn source_url(url: &str) -> String {
     ]
     .iter()
     .fold(url.to_string(), |u, (from, to)| u.replace(from, to))
+}
+
+#[test]
+fn only_a_native_crash_of_the_reader_is_read_again() {
+    let ended = |script: &str| {
+        std::process::Command::new("sh")
+            .args(["-c", script])
+            .status()
+            .expect("spawn sh")
+    };
+    assert!(reader_crashed(&ended("kill -SEGV $$")));
+    assert!(reader_crashed(&ended("kill -BUS $$")));
+    for other in [
+        "exit 1",
+        "exit 0",
+        "kill -ABRT $$",
+        "kill -KILL $$",
+        "kill -TERM $$",
+    ] {
+        assert!(
+            !reader_crashed(&ended(other)),
+            "`{other}` is not a reader's crash"
+        );
+    }
 }
 
 #[test]
