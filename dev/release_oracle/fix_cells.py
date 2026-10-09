@@ -41,6 +41,24 @@ TEST = re.compile(r"^#\[test\]\n(?:#\[[^\n]*\n)*(?:pub )?fn (\w+)\(\) \{\n(.*?)^
 UNTRIAGED = ("untriaged: green on v0.31.0 when first measured (2026-10-08); "
              "either a control of the fix or a vacuous fix cell, to be read")
 
+#: Controls: the neighbour of a fix that must stay as it was, so it is green on the release without the fix.
+KEYSET_GROWS = ("control of b6b15004: a keyset resume seeks past its checkpoint key, so it delivered a source that grew "
+                "before the fix; the range and parallel-keyset plans are the cells that are red there")
+COMPRESSION_EDIT = ("control of b6b15004: a `compression` edit under stored progress is not what the new destination "
+                    "guard refuses, and the run continues as it did")
+MOVED_UNFINISHED = ("control of b6b15004: a destination moved under an UNFINISHED range run delivers the source whole "
+                    "where the config points, as it did; the guard refuses a moved cursor and another format")
+ONE_DESTINATION = ("edited by b6b15004, not written for it: its stages now share one destination so the new guard "
+                   "does not refuse them; the golden math it asserts is unchanged")
+AFTER_A_PART = ("control of 3f073dd0: a run that fails AFTER a part still withdraws the marker; the fix is the run "
+                "that fails before its first write")
+MONGO_FORCED = ("control of 3f073dd0: `--resume --force` over a complete continued-key Mongo export is the empty "
+                "delta run it was; the checkpointed SQL shapes are the cells that are red there")
+MSSQL_NO_GAP = ("control of f7086105: no log gap exists here, so the refusal the fix adds from the first run after "
+                "the baseline must not fire, and it did not before")
+EMPTY_PREFIX = ("control of 52f26e45: an empty prefix of an EXISTING bucket still reads `legacy`; the fix fails "
+                "`validate` on a missing bucket")
+
 #: Fix cells allowed to pass on the previous release, each with its reason. Shrink-only.
 GREEN_ON_PREV: dict[str, str] = {  # ratchet-pin: fix-cells-green-on-previous-release strings
     "a_crashed_keyset_incremental_run_is_resumed_not_reread_postgres": UNTRIAGED,
@@ -69,6 +87,34 @@ GREEN_ON_PREV: dict[str, str] = {  # ratchet-pin: fix-cells-green-on-previous-re
     "pg_table_added_to_tables_mid_stream_is_baselined": UNTRIAGED,
     "run_child_processes_flag_keeps_its_partition_fallback_postgres": UNTRIAGED,
     "run_partitions_the_fixture_postgres": UNTRIAGED,
+    "a_keyset_checkpoint_run_killed_before_the_source_grows_delivers_the_source_mssql": KEYSET_GROWS,
+    "a_keyset_checkpoint_run_killed_before_the_source_grows_delivers_the_source_mysql": KEYSET_GROWS,
+    "a_keyset_checkpoint_run_killed_before_the_source_grows_delivers_the_source_oracle": KEYSET_GROWS,
+    "a_keyset_checkpoint_run_killed_before_the_source_grows_delivers_the_source_postgres": KEYSET_GROWS,
+    "an_incremental_export_whose_compression_is_edited_delivers_the_source_mssql": COMPRESSION_EDIT,
+    "an_incremental_export_whose_compression_is_edited_delivers_the_source_mysql": COMPRESSION_EDIT,
+    "an_incremental_export_whose_compression_is_edited_delivers_the_source_oracle": COMPRESSION_EDIT,
+    "an_incremental_export_whose_compression_is_edited_delivers_the_source_postgres": COMPRESSION_EDIT,
+    "an_unfinished_run_whose_compression_is_edited_delivers_the_source_mssql": COMPRESSION_EDIT,
+    "an_unfinished_run_whose_compression_is_edited_delivers_the_source_mysql": COMPRESSION_EDIT,
+    "an_unfinished_run_whose_compression_is_edited_delivers_the_source_oracle": COMPRESSION_EDIT,
+    "an_unfinished_run_whose_compression_is_edited_delivers_the_source_postgres": COMPRESSION_EDIT,
+    "an_unfinished_run_whose_destination_path_is_edited_delivers_the_source_mssql": MOVED_UNFINISHED,
+    "an_unfinished_run_whose_destination_path_is_edited_delivers_the_source_mysql": MOVED_UNFINISHED,
+    "an_unfinished_run_whose_destination_path_is_edited_delivers_the_source_oracle": MOVED_UNFINISHED,
+    "an_unfinished_run_whose_destination_path_is_edited_delivers_the_source_postgres": MOVED_UNFINISHED,
+    "batch_full_to_incremental_switch_golden_math": ONE_DESTINATION,
+    "batch_incremental_datetime_cursor_captures_updates_golden_math": ONE_DESTINATION,
+    "a_run_that_failed_after_a_part_withdraws_the_marker_mssql": AFTER_A_PART,
+    "a_run_that_failed_after_a_part_withdraws_the_marker_mysql": AFTER_A_PART,
+    "a_run_that_failed_after_a_part_withdraws_the_marker_oracle": AFTER_A_PART,
+    "a_run_that_failed_after_a_part_withdraws_the_marker_postgres": AFTER_A_PART,
+    "a_forced_resume_over_a_complete_prefix_lands_beside_it_mongo": MONGO_FORCED,
+    "mssql_a_never_changed_table_is_not_refused_after_cleanup_passes_its_anchor": MSSQL_NO_GAP,
+    "mssql_an_anchor_below_a_just_enabled_instance_still_delivers_every_later_change": MSSQL_NO_GAP,
+    "validate_reads_an_empty_prefix_of_an_existing_bucket_as_legacy_azure": EMPTY_PREFIX,
+    "validate_reads_an_empty_prefix_of_an_existing_bucket_as_legacy_gcs": EMPTY_PREFIX,
+    "validate_reads_an_empty_prefix_of_an_existing_bucket_as_legacy_s3": EMPTY_PREFIX,
 }  # ratchet-pin: end
 
 
