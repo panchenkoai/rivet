@@ -75,6 +75,18 @@ pub fn generate_chunks(min: i64, max: i64, chunk_size: i64) -> Vec<(i64, i64)> {
     chunks
 }
 
+/// The pieces of the inclusive `ranges` that lie outside the inclusive span `lo..=hi`, in order.
+pub(crate) fn ranges_outside(ranges: &[(i64, i64)], (lo, hi): (i64, i64)) -> Vec<(i64, i64)> {
+    ranges
+        .iter()
+        .flat_map(|&(start, end)| {
+            let below = (start < lo).then(|| (start, end.min(lo - 1)));
+            let above = (end > hi).then(|| (start.max(hi + 1), end));
+            below.into_iter().chain(above)
+        })
+        .collect()
+}
+
 pub(crate) fn build_chunk_query_sql(
     base_query: &str,
     order_column: &str,
@@ -516,6 +528,29 @@ mod tests {
         assert!(generate_chunks(10, 5, 10).is_empty());
         assert!(generate_chunks(1, 100, 0).is_empty());
         assert!(generate_chunks(1, 100, -5).is_empty());
+    }
+
+    #[test]
+    fn ranges_outside_a_span_are_its_ranges_cut_at_the_span() {
+        let ranges = [(1, 10), (11, 20), (21, 30)];
+        assert_eq!(ranges_outside(&ranges, (1, 30)), vec![]);
+        assert_eq!(ranges_outside(&ranges, (1, 20)), vec![(21, 30)]);
+        assert_eq!(ranges_outside(&ranges, (11, 30)), vec![(1, 10)]);
+        assert_eq!(ranges_outside(&ranges, (5, 25)), vec![(1, 4), (26, 30)]);
+        assert_eq!(
+            ranges_outside(&ranges, (12, 14)),
+            vec![(1, 10), (11, 11), (15, 20), (21, 30)]
+        );
+        assert_eq!(ranges_outside(&ranges, (40, 50)), ranges.to_vec());
+        assert_eq!(ranges_outside(&ranges, (-9, 0)), ranges.to_vec());
+        assert_eq!(ranges_outside(&[(0, 0)], (0, 0)), vec![]);
+        assert_eq!(ranges_outside(&[], (1, 2)), vec![]);
+        let all = [(i64::MIN, i64::MAX)];
+        assert_eq!(ranges_outside(&all, (i64::MIN, i64::MAX)), vec![]);
+        assert_eq!(
+            ranges_outside(&all, (0, 0)),
+            vec![(i64::MIN, -1), (1, i64::MAX)]
+        );
     }
 
     #[test]

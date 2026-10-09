@@ -1,8 +1,12 @@
 # Mode-transition matrix — ADR-0033. What an export inherits from its PREVIOUS mode when it
 # switches to incremental (or keyset_incremental): a full pass (no cursor was stored), a
 # continuation (same cursor identity), or a loud refusal (different identity). Each cell runs
-# the previous mode over 10 rows, inserts 3 more, restages the same Rig to the new mode and
-# re-reads the destination (tests/live/live_mode_transition.rs).
+# the previous mode over 10 rows, inserts 3 more, restages the same Rig to the new mode in the
+# SAME destination and reads the parts that run added (tests/live/live_mode_transition.rs,
+# `Stages`): an export that keeps a cursor is refused another destination
+# (RIVET_STATE_CURSOR_DESTINATION_MISMATCH, docs/sabotage-matrix.yaml), so a stage is never
+# given its own. A fresh destination appears only where no progress is left to continue: after
+# a `state reset`, or under another export name.
 
 engines: [postgres, mysql, mssql, mongo, oracle]
 

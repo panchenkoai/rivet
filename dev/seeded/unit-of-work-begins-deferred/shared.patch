@@ -1,0 +1,13 @@
+diff --git a/src/state/row.rs b/src/state/row.rs
+index 512c337e..98193878 100644
+--- a/src/state/row.rs
++++ b/src/state/row.rs
+@@ -234,7 +234,7 @@ impl StateStore {
+             return work();
+         }
+         self.batch(match &self.conn {
+-            StateConn::Sqlite(_) => "BEGIN IMMEDIATE",
++            StateConn::Sqlite(_) => "BEGIN",
+             StateConn::Postgres(_) => "BEGIN",
+         })?;
+         self.in_tx.set(true);

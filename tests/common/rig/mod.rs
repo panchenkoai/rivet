@@ -696,6 +696,40 @@ impl Rig {
     }
 }
 
+/// One destination several runs deliver into, read run by run: an export that keeps a cursor is refused another destination, so a cell that reads each run's delta reads the parts that run added.
+pub struct Stages {
+    out: tempfile::TempDir,
+    seen: std::cell::RefCell<std::collections::BTreeSet<PathBuf>>,
+}
+
+impl Stages {
+    /// An empty destination directory.
+    pub fn fresh() -> Self {
+        Stages {
+            out: tempfile::tempdir().expect("a destination directory"),
+            seen: Default::default(),
+        }
+    }
+
+    /// The destination every stage delivers into.
+    pub fn path(&self) -> &Path {
+        self.out.path()
+    }
+
+    /// A directory holding copies of the parquet parts the destination gained since the last call: what the runs in between delivered.
+    pub fn added(&self) -> tempfile::TempDir {
+        let delta = tempfile::tempdir().expect("a directory for one stage's parts");
+        let mut seen = self.seen.borrow_mut();
+        for part in super::runner::files_with_extension(self.path(), "parquet") {
+            if seen.insert(part.clone()) {
+                let name = part.file_name().expect("a part has a file name");
+                std::fs::copy(&part, delta.path().join(name)).expect("copy a part");
+            }
+        }
+        delta
+    }
+}
+
 /// Read every parquet part under `dir` (non-recursive), in filename order.
 pub fn read_all_parts(dir: &Path) -> Vec<arrow::record_batch::RecordBatch> {
     // A MISSING dir is a harness bug (wrong path, dest never created), not

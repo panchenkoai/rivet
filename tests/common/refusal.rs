@@ -257,8 +257,6 @@ pub(crate) struct Scope {
 pub(crate) struct Snapshot {
     /// Per export, in [`Scope::exports`] order.
     trees: Vec<Result<BTreeMap<PathBuf, Print>, String>>,
-    /// Whether the state is a shared Postgres one, of which only the exports' own rows were read.
-    shared_state: bool,
     checkpoints: BTreeMap<PathBuf, Print>,
     /// Table -> its rows as JSON text; `Err` when the backend could not be read.
     state: Result<BTreeMap<String, BTreeSet<String>>, String>,
@@ -279,7 +277,6 @@ impl Snapshot {
             },
         };
         Snapshot {
-            shared_state: matches!(scope.state, Some(StateAt::Postgres(_))),
             trees: scope
                 .exports
                 .iter()
@@ -294,24 +291,6 @@ impl Snapshot {
             state,
             unscoped,
         }
-    }
-}
-
-impl Snapshot {
-    /// Whether the state held an unfinished checkpointed run when this was taken (a `chunk_run` in progress, a `resume_run_id` claim, a `keyset_range`); a state that could not be read whole counts as holding one.
-    pub(crate) fn holds_an_unfinished_run(&self) -> bool {
-        let Ok(state) = &self.state else {
-            return true;
-        };
-        let any = |table: &str, unfinished: &dyn Fn(&serde_json::Value) -> bool| {
-            state.get(table).into_iter().flatten().any(|row| {
-                serde_json::from_str::<serde_json::Value>(row).map_or(true, |v| unfinished(&v))
-            })
-        };
-        self.shared_state
-            || any("chunk_run", &|v| v["status"] == "in_progress")
-            || any("export_state", &|v| !v["resume_run_id"].is_null())
-            || any("keyset_range", &|_| true)
     }
 }
 
@@ -1172,35 +1151,6 @@ mod tests {
             kind(r#"{"export_name":"e","last_cursor_value":"10","resume_run_id":null}"#),
             Leftover::ResumePoint
         );
-    }
-
-    #[test]
-    fn a_state_with_a_chunk_run_in_progress_or_a_claim_holds_an_unfinished_run() {
-        let holds = |stmt: &str| {
-            let (dir, scope) = fixture();
-            sql(dir.path(), stmt);
-            Snapshot::take(&scope).holds_an_unfinished_run()
-        };
-        assert!(!holds("SELECT 1"));
-        assert!(!holds(
-            "CREATE TABLE chunk_run (run_id TEXT, export_name TEXT, status TEXT);
-             INSERT INTO chunk_run VALUES ('r', 'e', 'completed')"
-        ));
-        assert!(holds(
-            "CREATE TABLE chunk_run (run_id TEXT, export_name TEXT, status TEXT);
-             INSERT INTO chunk_run VALUES ('r', 'e', 'in_progress')"
-        ));
-        assert!(holds(
-            "ALTER TABLE export_state ADD COLUMN resume_run_id TEXT;
-             UPDATE export_state SET resume_run_id = 'r'"
-        ));
-        assert!(holds(
-            "CREATE TABLE keyset_range (run_id TEXT, export_name TEXT);
-             INSERT INTO keyset_range VALUES ('r', 'e')"
-        ));
-        let (_dir, mut scope) = fixture();
-        scope.state = Some(StateAt::Postgres("postgresql://127.0.0.1:9/none".into()));
-        assert!(Snapshot::take(&scope).holds_an_unfinished_run());
     }
 
     #[test]
