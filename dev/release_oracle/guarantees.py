@@ -23,6 +23,7 @@ import shutil
 import sys
 import tempfile
 from pathlib import Path
+from typing import NamedTuple
 
 from .core import Ledger, rivet_bin, run
 
@@ -221,6 +222,40 @@ STAMP = "_rivet_exported_at"
 STAMPED = "as_init_writes_it"
 
 
+class Stamped(NamedTuple):
+    """What a reader found in two runs' declared parts, the earlier run first.
+
+    `only` and the two stamps are None when the schemas gave nothing to compare.
+    """
+
+    parts: tuple[int, int]
+    schemas: tuple[object, object]
+    rows: tuple[int, int]
+    only: tuple[int, int] | None
+    last_prev: object
+    first_cur: object
+
+
+def stamped_differ(f: Stamped, rows: int) -> str | None:
+    """Why two runs' parts are not one schema and the same `rows` rows in every column but STAMP, STAMP later on every row of the later run; None when they are."""
+    if not all(f.parts):
+        return f"no declared part (previous {f.parts[0]}, this {f.parts[1]})"
+    was, now = f.schemas
+    if was != now:
+        return f"the schemas differ: previous {was[0]}, this {now[0]}"
+    if STAMP not in [name for name, _ in now[0]]:
+        return f"no {STAMP} column: the config as init wrote it no longer stamps its rows"
+    if not f.rows[0] == f.rows[1] == rows:
+        return f"{f.rows[1]} rows against the previous run's {f.rows[0]}, of {rows} at the source"
+    if f.only is None:
+        return "the reader compared no rows"
+    if any(f.only):
+        return f"outside {STAMP}, {f.only[0]} rows are only in the previous run's parts and {f.only[1]} only in this one's"
+    if f.last_prev is None or f.first_cur is None or not f.last_prev < f.first_cur:
+        return f"{STAMP} is not later on every row of the later run: the previous run's reach {f.last_prev}, this one's start at {f.first_cur}"
+    return None
+
+
 def _shape(con, parts: list[str]) -> tuple[list[tuple], list[tuple]]:
     """The parts' schema as DuckDB reads it: the columns in order, and every Parquet field's physical and logical type."""
     cols = con.execute("DESCRIBE SELECT * FROM read_parquet(?)", [parts]).fetchall()
@@ -229,32 +264,23 @@ def _shape(con, parts: list[str]) -> tuple[list[tuple], list[tuple]]:
     return [c[:2] for c in cols], fields
 
 
-def stamped_differ(prev: list[str], cur: list[str], rows: int) -> str | None:
-    """Why two runs' parts are not one schema and the same `rows` rows in every column but STAMP, STAMP later on every row of `cur`; None when they are."""
+def _stamped(prev: list[str], cur: list[str]) -> Stamped:
+    """Read the facts `stamped_differ` grades from two runs' parts with DuckDB."""
     import duckdb
 
     if not prev or not cur:
-        return f"no declared part (previous {len(prev)}, this {len(cur)})"
+        return Stamped((len(prev), len(cur)), (None, None), (0, 0), None, None, None)
     con = duckdb.connect()
-    was, now = _shape(con, prev), _shape(con, cur)
-    if was != now:
-        return f"the schemas differ: previous {was[0]}, this {now[0]}"
-    if STAMP not in [name for name, _ in now[0]]:
-        return f"no {STAMP} column: the config as init wrote it no longer stamps its rows"
+    one = lambda q, *a: con.execute(q, list(a)).fetchone()[0]  # noqa: E731
+    schemas = (_shape(con, prev), _shape(con, cur))
+    rows = (one("SELECT count(*) FROM read_parquet(?)", prev), one("SELECT count(*) FROM read_parquet(?)", cur))
+    if schemas[0] != schemas[1] or STAMP not in [name for name, _ in schemas[1][0]]:
+        return Stamped((len(prev), len(cur)), schemas, rows, None, None, None)
     rest = f"SELECT * EXCLUDE ({STAMP}) FROM read_parquet(?)"
-    n_prev, n_cur, only_prev, only_cur = (con.execute(q, a).fetchone()[0] for q, a in (
-        ("SELECT count(*) FROM read_parquet(?)", [prev]), ("SELECT count(*) FROM read_parquet(?)", [cur]),
-        (f"SELECT count(*) FROM ({rest} EXCEPT ALL {rest})", [prev, cur]),
-        (f"SELECT count(*) FROM ({rest} EXCEPT ALL {rest})", [cur, prev])))
-    if not n_prev == n_cur == rows:
-        return f"{n_cur} rows against the previous run's {n_prev}, of {rows} at the source"
-    if only_prev or only_cur:
-        return f"outside {STAMP}, {only_prev} rows are only in the previous run's parts and {only_cur} only in this one's"
-    last, first = (con.execute(f"SELECT {f}({STAMP}) FROM read_parquet(?)", [p]).fetchone()[0]
-                   for f, p in (("max", prev), ("min", cur)))
-    if last is None or first is None or not last < first:
-        return f"{STAMP} is not later on every row of the later run: the previous run's reach {last}, this one's start at {first}"
-    return None
+    only = (one(f"SELECT count(*) FROM ({rest} EXCEPT ALL {rest})", prev, cur),
+            one(f"SELECT count(*) FROM ({rest} EXCEPT ALL {rest})", cur, prev))
+    return Stamped((len(prev), len(cur)), schemas, rows, only,
+                   one(f"SELECT max({STAMP}) FROM read_parquet(?)", prev), one(f"SELECT min({STAMP}) FROM read_parquet(?)", cur))
 
 
 def _same_parts(prev: Path, root: Path, engine: str, url: str, table: str, mode: str, stamped: bool) -> tuple[str | None, int]:
@@ -284,7 +310,7 @@ def _same_parts(prev: Path, root: Path, engine: str, url: str, table: str, mode:
         return f"a run failed (previous ok={ran[0]}, this ok={ran[1]})", 0
     if stamped:
         was, now = (_manifest_declared_parts(d / "output") for d in (d_prev, d_cur))
-        return stamped_differ(was, now, BYTES_ROWS), len(now)
+        return stamped_differ(_stamped(was, now), BYTES_ROWS), len(now)
     got = _declared(d_cur / "output", "SELECT count(*) FROM {parts}")
     if not got or got[0][0] != BYTES_ROWS:
         return f"this binary delivered {got[0][0] if got else 0} of {BYTES_ROWS} rows", 0
@@ -325,30 +351,29 @@ def verify_byte_identical_parts(led: Ledger) -> None:
 
 
 def _stamped_self_test() -> None:
-    """`stamped_differ` on hand-written parts: only a later STAMP over equal rows and one schema passes."""
-    import duckdb
+    """`stamped_differ` on hand-written facts: only a later STAMP over equal rows and one schema passes."""
+    def shape(*cols: str) -> tuple[list[tuple], list[tuple]]:
+        return [(c, "BIGINT") for c in cols], [(c, "INT64") for c in sorted(cols)]
 
-    d = Path(tempfile.mkdtemp(prefix="rivet-oracle-stamped-"))
+    plain, both = shape("id", "v"), shape("id", "v", STAMP)
 
-    def part(name: str, day: int, v: str = "i", cols: str = "", n: int = 4) -> list[str]:
-        stamp = f", TIMESTAMPTZ '2026-01-0{day}' AS {STAMP}" if day else ""
-        duckdb.connect().execute(f"COPY (SELECT i::BIGINT AS id, ({v})::BIGINT AS v{cols}{stamp} FROM range({n}) t(i)) "
-                                 f"TO '{d / name}.parquet' (FORMAT parquet)")
-        return [f"{d / name}.parquet"]
+    def facts(**kw) -> Stamped:
+        return Stamped(**{"parts": (1, 1), "schemas": (both, both), "rows": (4, 4), "only": (0, 0), "last_prev": 1, "first_cur": 2, **kw})
 
-    one = part("one", 1)
-    assert stamped_differ(one, part("later", 2), 4) is None
-    assert "1 rows are only in the previous run's parts and 1 only in this one's" in stamped_differ(
-        one, part("value", 2, v="i + (i = 2)::INT"), 4)
-    assert "is not later on every row" in stamped_differ(one, part("same", 1), 4)
-    assert "is not later on every row" in stamped_differ(part("late", 2), one, 4)
-    assert f"no {STAMP} column" in stamped_differ(part("bare_a", 0), part("bare_b", 0), 4)
-    assert "the schemas differ" in stamped_differ(one, part("wider", 2, cols=", 1 AS extra"), 4)
-    assert "the schemas differ" in stamped_differ(one, part("bare", 0), 4)
-    assert "3 rows against the previous run's 4" in stamped_differ(one, part("short", 2, n=3), 4)
-    assert "of 5 at the source" in stamped_differ(one, part("later2", 2), 5)
-    assert stamped_differ([], one, 4) == "no declared part (previous 0, this 1)"
-    shutil.rmtree(d)
+    assert stamped_differ(facts(), 4) is None
+    assert "1 rows are only in the previous run's parts and 1 only in this one's" in stamped_differ(facts(only=(1, 1)), 4)
+    assert "0 rows are only in the previous run's parts and 2 only in this one's" in stamped_differ(facts(only=(0, 2)), 4)
+    assert "is not later on every row" in stamped_differ(facts(first_cur=1), 4)
+    assert "is not later on every row" in stamped_differ(facts(last_prev=2, first_cur=1), 4)
+    assert "is not later on every row" in stamped_differ(facts(first_cur=None), 4)
+    assert f"no {STAMP} column" in stamped_differ(facts(schemas=(plain, plain), only=None), 4)
+    assert "the schemas differ" in stamped_differ(facts(schemas=(both, shape("id", "v", "extra", STAMP)), only=None), 4)
+    assert "the schemas differ" in stamped_differ(facts(schemas=(both, plain), only=None), 4)
+    assert "the schemas differ" in stamped_differ(facts(schemas=(both, ([("id", "BIGINT"), ("v", "INTEGER"), (STAMP, "BIGINT")], both[1]))), 4)
+    assert "3 rows against the previous run's 4" in stamped_differ(facts(rows=(4, 3)), 4)
+    assert "of 5 at the source" in stamped_differ(facts(), 5)
+    assert stamped_differ(facts(only=None), 4) == "the reader compared no rows"
+    assert stamped_differ(facts(parts=(0, 1), schemas=(None, None)), 4) == "no declared part (previous 0, this 1)"
 
 
 def self_test() -> None:
