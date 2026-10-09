@@ -583,28 +583,6 @@ def is_harness_env(name: str) -> bool:
     return name in HARNESS_ENV or bool(HARNESS_ENV_FAMILY.match(name))
 
 
-#: Open files the gate asks for itself: its lanes hold hundreds of pipes, parts and state files at once.
-OPEN_FILES_WANTED = 10240
-
-
-def open_file_limit_to_set(soft: int, hard: int, unlimited: int) -> int | None:
-    """The soft limit to ask for, or None when the current one already covers `OPEN_FILES_WANTED`."""
-    if soft == unlimited or soft >= OPEN_FILES_WANTED:
-        return None
-    return OPEN_FILES_WANTED if hard == unlimited else min(hard, OPEN_FILES_WANTED)
-
-
-def raise_open_file_limit() -> tuple[int, int]:
-    """Raise this process's soft open-file limit (its children inherit it); the limit before and after."""
-    import resource
-
-    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-    want = open_file_limit_to_set(soft, hard, resource.RLIM_INFINITY)
-    if want is not None and want > soft:
-        resource.setrlimit(resource.RLIMIT_NOFILE, (want, hard))
-    return soft, resource.getrlimit(resource.RLIMIT_NOFILE)[0]
-
-
 def scrub_inherited_rivet_env() -> list[str]:
     """Drop every inherited RIVET_* that is not the harness's own; return the dropped names."""
     dropped = sorted(k for k in os.environ if k.startswith("RIVET_") and not is_harness_env(k))

@@ -510,11 +510,6 @@ def _self_test() -> int:
 
     seeded.self_test()
     guarantees.self_test()
-    from .core import OPEN_FILES_WANTED, open_file_limit_to_set
-    inf = -1
-    assert open_file_limit_to_set(256, inf, inf) == OPEN_FILES_WANTED, "a 256-file shell is raised"
-    assert open_file_limit_to_set(256, 4096, inf) == 4096, "never past the hard limit"
-    assert open_file_limit_to_set(OPEN_FILES_WANTED, inf, inf) is None and open_file_limit_to_set(inf, inf, inf) is None
     off = Ledger(colour=False)
     off._buf = []
     verify_seeded_recall(off, False)
@@ -1552,14 +1547,6 @@ def main(argv: list[str] | None = None) -> int:
     dropped = scrub_inherited_rivet_env()
     if dropped:
         print(f"  dropped from the inherited environment (the product's, not the gate's): {' '.join(dropped)}")
-    from .core import OPEN_FILES_WANTED, raise_open_file_limit
-    was, now = raise_open_file_limit()
-    if now != was:
-        print(f"  open files: {was} -> {now} (a launching shell's limit is not the gate's)")
-    if now < OPEN_FILES_WANTED:
-        print(f"the open-file limit is {now} and cannot be raised to {OPEN_FILES_WANTED} (hard limit) — a stage would "
-              "fail with `Too many open files` instead of grading; raise the hard limit and run again", file=sys.stderr)
-        return 2
     lock = _hold_gate_lock()
     if lock is None:
         print(f"another gate run holds {target_dir() / '.gate.lock'} — two runs in one tree clean "
