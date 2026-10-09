@@ -44,6 +44,8 @@ FIRST_RUN = {"SKIP": "the stream's first run delivered nothing", "PARTIAL": "the
 #: 2026-10-08 (#484, CI run 37720250883): skip 49 -> 53 and partial 39 -> 47 are the Oracle twins of cells already counted (the
 #: `--pool --split` sibling a `--resume` run skips and its resumed plan, the two `settle:` cells); deferred 6 -> 8 the capped
 #: `rivet cdc` drains on PostgreSQL and SQL Server.
+#: 2026-10-08 (#504, CI run 37827006036): deferred 8 -> 9, the capped drain of `pg_cdc_cli_rollover_1_delivers_the_pending_changes`,
+#: which CI skipped while it was an `open_defect_` cell; its remainder is graded by the cell's own next drain.
 #: 2026-10-09 (#508, CI run 37857783286 measured 66 = 42 `--resume` + 24 `settle:`): partial 47 -> 24. A `--resume` run is graded
 #: against the source as it is now (it plans the keys the source holds now), so its 42 runs leave the counter: 26 counted on main,
 #: 12 of the new crash-then-grow cells, 4 `run_resume_over_deleted_tasks_*` off `open_defect_`. The 24 left are `settle:` runs:
@@ -56,7 +58,7 @@ VERDICT_CEILINGS: dict[str, dict[str, tuple[int, int]]] = {
                  3),
         "partial": (24,  # ratchet-pin: rig-oracle-partial
                     3),
-        "deferred": (8,  # ratchet-pin: rig-oracle-deferred
+        "deferred": (9,  # ratchet-pin: rig-oracle-deferred
                      0),
     },
     "gate": {"first-run": (0,  # ratchet-pin: rig-oracle-first-run-gate

@@ -127,8 +127,8 @@ fn pg_cdc_cli_writes_csv_parts_and_stops_at_the_cap_on_a_commit() {
 
 /// The same drain at `--rollover 1`: the pending commits must still be delivered.
 #[test]
-#[ignore = "live+gate-only: docker compose --profile cdc postgres-cdc; open defect (rivet cdc --rollover 1 delivers nothing on PostgreSQL), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_pg_cdc_cli_rollover_1_delivers_the_pending_changes() {
+#[ignore = "live: requires docker compose --profile cdc postgres-cdc"]
+fn pg_cdc_cli_rollover_1_delivers_the_pending_changes() {
     capped_csv_drain_defers_the_rest(pg("cli_roll1"), Some("1"));
 }
 

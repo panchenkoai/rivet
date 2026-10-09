@@ -1,0 +1,29 @@
+diff --git a/src/source/mysql/cdc.rs b/src/source/mysql/cdc.rs
+--- a/src/source/mysql/cdc.rs
++++ b/src/source/mysql/cdc.rs
+@@ -818,8 +818,6 @@
+         };
+         // ONE connection for every question asked before the dump; it then dumps.
+         let mut conn = connect_conn(url, tls)?;
+-        // Before the anchor is written: a refused first run leaves no checkpoint.
+-        Self::refuse_unmet_prerequisites_on(&mut conn, &configured_tables)?;
+         if let Some(path) = ckpt
+             && let Some(pos) = Position::load(path)?
+             && let Some((file, p)) =
+@@ -856,7 +854,6 @@
+         // at a part commit — so an idle bounded run (zero changes drained) would
+         // otherwise leave no checkpoint, the next run would re-anchor to a newer
+         // "current" position, and every change in between would be silently skipped.
+-        Self::refuse_absent_tables_on(&mut conn, &configured_tables)?;
+         let (file, pos) = Self::current_coordinates(&mut conn)?;
+         let identity = Self::server_identity(&mut conn);
+         if let Some(path) = ckpt {
+@@ -885,6 +882,8 @@
+             );
+             Self::write_anchor(path, &file, pos, &identity)?;
+         }
++        Self::refuse_unmet_prerequisites_on(&mut conn, &configured_tables)?;
++        Self::refuse_absent_tables_on(&mut conn, &configured_tables)?;
+         Self::open_on(
+             conn,
+             server_id,

@@ -1,0 +1,12 @@
+diff --git a/src/source/postgres/cdc.rs b/src/source/postgres/cdc.rs
+--- a/src/source/postgres/cdc.rs
++++ b/src/source/postgres/cdc.rs
+@@ -833,7 +833,7 @@
+                     self.exhausted = true;
+                     break;
+                 }
+-                self.frontier_text = Some(lsn);
++                drop(lsn);
+             } else if data.starts_with("BEGIN") {
+                 // Dropping any spill too — a transaction that never reached its
+                 // COMMIT in this window is re-read from the slot next time.

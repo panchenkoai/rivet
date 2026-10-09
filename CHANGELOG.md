@@ -229,6 +229,40 @@
     continue is refused as before ("nothing to continue; run without --resume").
   - A script that matched exit 1 or the old text of this refusal must match exit 5 or the
     code.
+- **Behaviour change: a CDC run that refuses a prerequisite leaves nothing behind, and
+  `rivet doctor` agrees with `rivet run`.** Applies to `mode: cdc` and `rivet cdc` on
+  PostgreSQL and MySQL.
+  - Before, on PostgreSQL a run refused for a table that does not exist had already created
+    its replication slot (inactive, pinning WAL); a bounded run on a standby was refused only
+    after the slot, the baseline and `snapshot/_SUCCESS` were written. On MySQL a first run
+    refused for binlog compression, a replica that does not re-log, or an unroutable table had
+    already written its checkpoint. `rivet doctor` reported `All checks passed` for a
+    PostgreSQL server with `wal_level` below `logical` and for a MySQL replica with
+    `log_replica_updates = OFF`.
+  - Now every prerequisite is asked before the first durable write, and these refusals carry
+    `RIVET_SOURCE_CDC_PREREQUISITE` (exit 1, as before): no slot, checkpoint, baseline or state
+    row is left. A PostgreSQL table that does not exist and `wal_level` below `logical` are
+    named by rivet instead of by the server's error. Doctor asks the same function the run
+    refuses by and fails a `CDC run prerequisites` check with the run's own message.
+  - `rivet init --mode cdc` against a PostgreSQL standby writes `until_current: false`, the
+    mode a standby runs; it wrote `until_current: true`, which the run refuses there.
+  - Upgrading: nothing to do for a healthy stream. A slot or checkpoint left by a run 0.31
+    refused is reused as it is once the prerequisite is met; if the export was abandoned
+    instead, drop the slot (`SELECT pg_drop_replication_slot('<slot>')`) or delete the
+    checkpoint file.
+- **Behaviour change: `rivet cdc` to stdout emits each change once on PostgreSQL.** Before,
+  a drain to stdout never advanced the slot, so every run printed every change since the slot
+  was created, with or without `--checkpoint`, and the slot pinned WAL without bound. Now a
+  drain acknowledges the last commit it printed when it ends. Upgrading: the first drain with
+  this version prints the backlog the slot still holds once more, then the slot advances. A
+  consumer that relied on each run re-printing the history must keep its own copy.
+- **Fix: PostgreSQL CDC with `rollover: 1` (`--rollover 1`) delivers the pending changes.**
+  A bounded run leaves its drain barrier (a logical message) in the WAL; at `rollover: 1` the
+  next run's one-change read window held only that message, and the run exited 0 with a
+  Success manifest of 0 rows while commits were pending, on every run. With `rollover: N` the
+  same happened after N idle bounded runs in a row. Messages outside a transaction are now
+  stepped over, up to the run's open-time bound. Upgrading: the first run with this version
+  delivers what such a slot was holding.
 - **Breaking: SQL Server CDC refuses a log gap from the first run after the baseline.**
   Applies to a `mode: cdc` SQL Server export with `cdc.initial: snapshot`.
   - Before, the checkpoint the baseline wrote (`"pinned": true`) could sit below the capture
