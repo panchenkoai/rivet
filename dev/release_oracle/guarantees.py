@@ -4,8 +4,8 @@
 table of 10 thousand, 1 million and 5 million rows, and a CDC drain of 10 and of 30 change sets
 (both past the default `rollover`). Every peak RSS stays under the engine's ceiling, and where the
 smaller size already fills the buffer (keyset pages, a CDC part) the larger one costs no more.
-The sentence "a 10-thousand-row table and a 500-million-row table run at the same resident set
-size" is graded as written by its own cell, red today: see `SAME_RSS`.
+`full` and `incremental` level off once the Parquet row group is full, so the SQL engines run both
+again under the row-group cap the docs name, which a million rows already fill: see `CAPPED`.
 
 `byte_identical_parts` (docs/semantics.md): the previous release and this binary export the same
 rows through the previous release's `init` config. With `exported_at` off the parts are equal byte
@@ -37,8 +37,12 @@ SIZES = (10_000, 1_000_000, 5_000_000)
 BACKLOGS = (10, 30)
 #: A larger input may cost this much more than a smaller one that already fills the buffer.
 FLAT_TOL = 1.25
-#: The cell that grades "the same resident set size" from the smallest table to the largest; red while a table below one batch runs smaller.
-SAME_RSS = "open_defect_a_small_and_a_large_table_run_at_the_same_rss"
+#: `parquet.target_row_group_mb` of the capped runs: the cap docs/why/flat-memory.md names; a million rows of the seeded table fill it.
+GROUP_CAP_MB = 16
+#: The cell that grades `full` and `incremental` under GROUP_CAP_MB as flat from SIZES[1] to SIZES[2]. MongoDB is not claimed: the doc says its `full` grows.
+CAPPED = "full_and_incremental_under_a_row_group_cap"
+#: The modes CAPPED runs; a keyset page is its own part, so `chunked` needs no cap.
+CAPPED_MODES = ("full", "incremental")
 BYTES_ROWS = 250_000
 MIB = 1024 * 1024
 _ENV = {"RIVET_STATE_URL": "", "RIVET_GATE_STATE_URL": ""}
@@ -63,6 +67,12 @@ def grew(peaks: dict[str, int | None], shape: str, small: int, large: int, slack
     if not a or not b or b <= a * FLAT_TOL + slack_mib * MIB:
         return None
     return f"{shape}: {b // MIB} MiB at {large} against {a // MIB} MiB at {small}"
+
+
+def uneven(peaks: dict[str, int | None], shape: str, small: int, large: int) -> list[str]:
+    """What keeps `shape` from being flat from `small` to `large`: a missing measurement, or growth past FLAT_TOL."""
+    pair = {f"{shape}/{n}": peaks.get(f"{shape}/{n}") for n in (small, large)}
+    return over_ceiling(pair, 1 << 30) + [g for g in (grew(peaks, shape, small, large),) if g]
 
 
 def parts_differ(prev: list[str], cur: list[str]) -> str | None:
@@ -115,10 +125,34 @@ def _resized(engine: str, url: str, table: str, rows: int, had: int) -> bool:
                                 f"WHERE id <= 1000000;").ok for lo in range(had, rows, had))
 
 
+def _capped(cfg: Path) -> bool:
+    """Set `parquet.target_row_group_mb: GROUP_CAP_MB` in init's config, which names 128 or no group at all; False when it could not."""
+    cap, lines, out = f"      target_row_group_mb: {GROUP_CAP_MB}", cfg.read_text().splitlines(), []
+    for ln in lines:
+        key = ln.strip().split(":")[0]
+        out += [cap] if key == "target_row_group_mb" else [ln]
+        if key == "format" and "    parquet:" not in lines:
+            out += ["    parquet:", "      row_group_strategy: auto", cap]
+    cfg.write_text("\n".join(out) + "\n")
+    return out.count(cap) == 1
+
+
 def _batch_peaks(root: Path, engine: str, url: str) -> dict[str, int | None]:
-    """Peak RSS of this binary's `init` config per batch mode and table size; None where a run failed or came back short."""
+    """Peak RSS of this binary's `init` config per batch mode and table size, and of CAPPED_MODES under the cap past the smallest size.
+
+    None where a run failed or came back short.
+    """
     from .perf import _init_dir, _timed
     from .upgrade import _declared
+
+    def peak(mode: str, rows: int, cap: bool) -> int | None:
+        d = _init_dir(rivet_bin(), root, f"{table}_{mode}{'_capped' if cap else ''}_{rows}", url, table, mode)
+        if d is None or (cap and not _capped(d / "c.yaml")):
+            return None
+        s = _timed(rivet_bin(), d, {"RIVET_PERF_URL": url, **_ENV}, "run", "-c", "c.yaml")
+        got = _declared(d / "output", "SELECT count(*) FROM {parts}")
+        shutil.rmtree(d / "output", ignore_errors=True)  # 5 million rows per run: counted, not kept
+        return s.rss if s.ok and got and got[0][0] == rows else None
 
     peaks: dict[str, int | None] = {}
     table, had = f"rss_{engine[:2]}_{os.getpid()}", 0
@@ -127,14 +161,9 @@ def _batch_peaks(root: Path, engine: str, url: str) -> dict[str, int | None]:
             sized = _resized(engine, url, table, rows, had)
             had = rows
             for mode in _modes(engine):
-                d = _init_dir(rivet_bin(), root, f"{table}_{mode}_{rows}", url, table, mode) if sized else None
-                if d is None:
-                    peaks[f"{mode}/{rows}"] = None
-                    continue
-                s = _timed(rivet_bin(), d, {"RIVET_PERF_URL": url, **_ENV}, "run", "-c", "c.yaml")
-                got = _declared(d / "output", "SELECT count(*) FROM {parts}")
-                peaks[f"{mode}/{rows}"] = s.rss if s.ok and got and got[0][0] == rows else None
-                shutil.rmtree(d / "output", ignore_errors=True)  # 5 million rows per run: counted, not kept
+                peaks[f"{mode}/{rows}"] = peak(mode, rows, False) if sized else None
+            for mode in CAPPED_MODES if engine != "mongo" and rows > SIZES[0] else ():
+                peaks[f"{mode}_capped/{rows}"] = peak(mode, rows, True) if sized else None
     finally:
         _drop(engine, url, table)
     return peaks
@@ -192,13 +221,16 @@ def verify_flat_rss(led: Ledger) -> None:
         peaks = _batch_peaks(root, engine, os.environ[var])
         # A keyset page is the one batch buffer a million rows already fill; MongoDB's init writes no paged mode.
         _grade_rss(led, engine, "batch", peaks, [grew(peaks, "chunked", SIZES[1], SIZES[2])])
-        same = [g for g in (grew(peaks, m, SIZES[0], SIZES[2], 8) for m in _modes(engine)) if g]
-        if same or over_ceiling(peaks, 1 << 30):
-            led.failed(engine, "-", RSS_SCEN, SAME_RSS, f"flat-rss[{engine}/{SAME_RSS}]: the largest table took "
-                       f"more memory than the smallest: {'; '.join(same) or 'a run gave no measurement'}", "not the same")
+        if engine == "mongo":
+            continue
+        bad = [u for m in CAPPED_MODES for u in uneven(peaks, f"{m}_capped", SIZES[1], SIZES[2])]
+        shown = " ".join(f"{k}={v // MIB if v else '-'}MiB" for k, v in peaks.items() if "_capped/" in k)
+        if bad:
+            led.failed(engine, "-", RSS_SCEN, CAPPED, f"flat-rss[{engine}/{CAPPED}]: target_row_group_mb={GROUP_CAP_MB} "
+                       f"did not level the run off: {'; '.join(bad)} ({shown})", shown)
         else:
-            led.passed(engine, "-", RSS_SCEN, SAME_RSS, f"flat-rss[{engine}/{SAME_RSS}]: every mode within "
-                       f"{FLAT_TOL}x + 8 MiB from {SIZES[0]} to {SIZES[2]} rows", "same")
+            led.passed(engine, "-", RSS_SCEN, CAPPED, f"flat-rss[{engine}/{CAPPED}]: target_row_group_mb={GROUP_CAP_MB}, "
+                       f"within {FLAT_TOL}x from {SIZES[1]} to {SIZES[2]} rows: {shown}", shown)
     for engine in CDC_ENGINES:
         var = CDC_URL_VARS.get(engine, f"RIVET_CDC_{engine.upper()}_URL")
         if not os.environ.get(var):
@@ -386,6 +418,16 @@ def self_test() -> None:
     assert grew(flat, "chunked", 1, 5) is None and grew(flat, "x", 1, 5) is None
     assert grew(flat, "full", 1, 5) == "full: 59 MiB at 5 against 40 MiB at 1"
     assert grew(flat, "full", 1, 5, slack_mib=9) is None
+    assert uneven(flat, "chunked", 1, 5) == []
+    assert uneven(flat, "full", 1, 5) == ["full: 59 MiB at 5 against 40 MiB at 1"]
+    assert uneven(flat, "x", 1, 5) == ["x/1: no measurement"] and uneven({}, "y", 1, 5) == ["y/1: no measurement", "y/5: no measurement"]
+    cfg = Path(tempfile.mkdtemp(prefix="rivet-oracle-capped-")) / "c.yaml"
+    for body in ("    format: parquet\n    parquet:\n      row_group_strategy: auto\n      target_row_group_mb: 128\n", "    format: parquet\n"):
+        cfg.write_text(body)
+        assert _capped(cfg) and cfg.read_text().count(f"target_row_group_mb: {GROUP_CAP_MB}\n") == 1 and "128" not in cfg.read_text()
+    cfg.write_text("    mode: full\n")
+    assert not _capped(cfg), "a config with no place for the cap is not a capped run"
+    shutil.rmtree(cfg.parent)
     assert parts_differ(["a", "b"], ["a", "b"]) is None
     assert parts_differ(["a", "b"], ["a", "c"]) == "1 of 2 parts differ in bytes"
     assert parts_differ(["a"], ["a", "b"]) == "2 parts against the previous release's 1"
@@ -393,7 +435,7 @@ def self_test() -> None:
     _stamped_self_test()
     for path, per_engine in RSS_CEILING_MIB.items():
         assert all(v > 0 for v in per_engine.values()), f"a {path} ceiling of 0 fails every run"
-    print("self-test ok: a peak over its ceiling, a missing measurement or growth past the buffer fails flat-rss; "
+    print("self-test ok: a peak over its ceiling, a missing measurement or growth past the buffer fails flat-rss, capped or not; "
           "parts that differ, differ in number or are absent fail byte-identical, and so do stamped parts that "
           f"differ outside {STAMP}, in schema or in count, or whose {STAMP} did not move")
 

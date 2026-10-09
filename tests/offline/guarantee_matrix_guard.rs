@@ -16,7 +16,8 @@ const GATE_DIR: &str = "dev/release_oracle";
 // 30 -> 27 (2026-10-08): CDC refusals carry their code (#497, -2); a refused CDC run leaves nothing behind (-1).
 // 27 -> 26 (2026-10-09): the guarantee checks left unwritten are written (#506, -1).
 // 26 -> 25 (2026-10-09): the docs name `_rivet_exported_at` as the one column that differs between runs, and a cell holds it (#506, -1).
-const ROWS_NOT_HELD: usize = 25; // ratchet-pin: guarantee-rows-not-held
+// 25 -> 23 (2026-10-09): flat-memory.md states what was measured and a capped-run cell holds it; source-safe-under-load.md scopes the one-page sentence to chunked (#506, -2).
+const ROWS_NOT_HELD: usize = 23; // ratchet-pin: guarantee-rows-not-held
 /// `gap` cells over all rows. Shrink-only; LOWER it when a cell is written.
 const GAP_CELLS: usize = 31; // ratchet-pin: guarantee-gap-cells
 

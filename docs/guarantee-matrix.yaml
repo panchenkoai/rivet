@@ -493,8 +493,6 @@ guarantees:
   - id: flat_memory_at_any_table_size
     stated:
       - file: docs/why/flat-memory.md
-        sentence: "A 10-thousand-row table and a 500-million-row table run at the same resident set size."
-      - file: docs/why/flat-memory.md
         sentence: "Rivet's memory is bounded by how much you buffer before a flush"
     held_by:
       postgres: { gate: verify_flat_rss, asserts: "over_ceiling(peaks, ceiling) + [f for f in flat if f]" }
@@ -502,27 +500,44 @@ guarantees:
       mssql: { gate: verify_flat_rss, asserts: "over_ceiling(peaks, ceiling) + [f for f in flat if f]" }
       mongo: { gate: verify_flat_rss, asserts: "over_ceiling(peaks, ceiling) + [f for f in flat if f]" }
       oracle: { gate: verify_flat_rss, asserts: "over_ceiling(peaks, ceiling) + [f for f in flat if f]" }
-    contradicted_by:
-      known_red:
-        - "flat-rss[postgres/open_defect_a_small_and_a_large_table_run_at_the_same_rss]"
-        - "flat-rss[mysql/open_defect_a_small_and_a_large_table_run_at_the_same_rss]"
-        - "flat-rss[mssql/open_defect_a_small_and_a_large_table_run_at_the_same_rss]"
-        - "flat-rss[mongo/open_defect_a_small_and_a_large_table_run_at_the_same_rss]"
-        - "flat-rss[oracle/open_defect_a_small_and_a_large_table_run_at_the_same_rss]"
+
+  # MongoDB is not a column here: docs/why/flat-memory.md says its `mode: full` grew from 1 million to
+  # 5 million rows under every setting tried (109 -> 141 MiB by default, 102 -> 118 at best, 2026-10-09).
+  - id: peak_rss_does_not_depend_on_table_size_from_a_million_rows
+    stated:
+      - file: docs/why/flat-memory.md
+        sentence: "From a million rows on, peak resident memory does not depend on the table's size in `mode: full` and `mode: incremental` once the Parquet row group is capped"
+      - file: docs/why/flat-memory.md
+        sentence: "in `mode: chunked` it is set by the page (`chunk_size`), not by the table."
+    held_by:
+      postgres: { gate: verify_flat_rss, asserts: 'uneven(peaks, f"{m}_capped", SIZES[1], SIZES[2])' }
+      mysql: { gate: verify_flat_rss, asserts: 'uneven(peaks, f"{m}_capped", SIZES[1], SIZES[2])' }
+      mssql: { gate: verify_flat_rss, asserts: 'uneven(peaks, f"{m}_capped", SIZES[1], SIZES[2])' }
+      oracle: { gate: verify_flat_rss, asserts: 'uneven(peaks, f"{m}_capped", SIZES[1], SIZES[2])' }
+      postgres_chunked: { gate: verify_flat_rss, asserts: 'grew(peaks, "chunked", SIZES[1], SIZES[2])' }
+      mysql_chunked: { gate: verify_flat_rss, asserts: 'grew(peaks, "chunked", SIZES[1], SIZES[2])' }
+      mssql_chunked: { gate: verify_flat_rss, asserts: 'grew(peaks, "chunked", SIZES[1], SIZES[2])' }
+      oracle_chunked: { gate: verify_flat_rss, asserts: 'grew(peaks, "chunked", SIZES[1], SIZES[2])' }
 
   - id: the_longest_source_query_is_one_page
     stated:
       - file: docs/why/source-safe-under-load.md
-        sentence: "The longest query Rivet ever holds open on the source is a single page, not a full-table scan."
+        sentence: "The longest query Rivet holds open on the source in `mode: chunked` is a single page, not a full-table scan."
     held_by:
       postgres: { test: the_longest_statement_of_a_paged_export_is_one_page_postgres, asserts: "the longest statement held on the source answered {longest} of {total}" }
       mysql: { test: the_longest_statement_of_a_paged_export_is_one_page_mysql, asserts: "the longest statement held on the source answered {longest} of {total}" }
       mssql: { test: the_longest_statement_of_a_paged_export_is_one_page_mssql, asserts: "the longest statement held on the source answered {longest} of {total}" }
       mongo: { test: the_longest_statement_of_a_paged_export_is_one_page_mongo, asserts: "the longest statement held on the source answered {longest} of {total}" }
       oracle: { test: the_longest_statement_of_a_paged_export_is_one_page_oracle, asserts: "the longest statement held on the source answered {longest} of {total}" }
-    contradicted_by:
-      doc:
-        - "docs/partitioning.md#the cost is the query staying visible (`Sending data`) for the whole drain"
+
+  - id: postgres_full_is_one_transaction_and_chunked_is_one_per_page
+    stated:
+      - file: docs/why/source-safe-under-load.md
+        sentence: "one transaction, with the cursor's snapshot, stays open until the last row"
+      - file: docs/why/source-safe-under-load.md
+        sentence: "there PostgreSQL opens one transaction per page as well."
+    held_by:
+      postgres: { test: mode_full_reads_in_one_transaction_and_chunked_in_one_per_page_postgres, asserts: "cursor transactions holding {per:?} FETCH statements" }
 
   - id: mode_full_is_one_streaming_select
     stated:

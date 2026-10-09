@@ -434,11 +434,14 @@ const WIRE_PAGES: u64 = (WIRE_ROWS / WIRE_PAGE) as u64;
 /// The bytes of each answer the source gave to one request, over every connection through a [`wire_to`] forwarder.
 type Answers = Arc<std::sync::Mutex<Vec<u64>>>;
 
-/// Copy `from` to `to` on a thread, reporting each read to `seen` and the end of the stream as 0.
+/// Every byte the clients sent through a [`wire_to`] forwarder, in the order it read them.
+type Asked = Arc<std::sync::Mutex<Vec<u8>>>;
+
+/// Copy `from` to `to` on a thread, reporting each read to `seen` and the end of the stream as an empty read.
 fn pipe(
     mut from: std::net::TcpStream,
     mut to: std::net::TcpStream,
-    mut seen: impl FnMut(u64) + Send + 'static,
+    mut seen: impl FnMut(&[u8]) + Send + 'static,
 ) {
     use std::io::{Read, Write};
     std::thread::spawn(move || {
@@ -447,23 +450,23 @@ fn pipe(
             if n == 0 || to.write_all(&buf[..n]).is_err() {
                 break;
             }
-            seen(n as u64);
+            seen(&buf[..n]);
         }
         let _ = to.shutdown(std::net::Shutdown::Both);
         let _ = from.shutdown(std::net::Shutdown::Both);
-        seen(0);
+        seen(&[]);
     });
 }
 
-/// A loopback forwarder to local `port`: its own port, and the size of each answer the source gives through it.
-fn wire_to(port: u16) -> (u16, Answers) {
+/// A loopback forwarder to local `port`: its own port, the size of each answer the source gives through it, and what the clients sent.
+fn wire_to(port: u16) -> (u16, Answers, Asked) {
     // DuckDB's MySQL reader, which the rig's oracle attaches with, refuses a port above 65353.
     let listener = std::iter::repeat_with(|| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
         .find(|l| l.local_addr().unwrap().port() <= 65353)
         .unwrap();
     let via = listener.local_addr().unwrap().port();
-    let answers = Answers::default();
-    let all = answers.clone();
+    let (answers, asked) = (Answers::default(), Asked::default());
+    let (all, sent) = (answers.clone(), asked.clone());
     std::thread::spawn(move || {
         for down in listener.incoming().flatten() {
             let Ok(up) = std::net::TcpStream::connect(("127.0.0.1", port)) else {
@@ -476,26 +479,41 @@ fn wire_to(port: u16) -> (u16, Answers) {
                     all.lock().unwrap().push(answer);
                 }
             };
-            let (asked, answered) = ((all.clone(), open.clone()), (all.clone(), open));
+            let (asking, answered) = ((all.clone(), open.clone()), (all.clone(), open));
+            let sent = sent.clone();
             pipe(
                 down.try_clone().unwrap(),
                 up.try_clone().unwrap(),
-                move |n| {
-                    if n > 0 {
-                        close(&asked.0, &asked.1);
+                move |read| {
+                    if !read.is_empty() {
+                        sent.lock().unwrap().extend_from_slice(read);
+                        close(&asking.0, &asking.1);
                     }
                 },
             );
-            pipe(up, down, move |n| {
-                if n > 0 {
-                    answered.1.fetch_add(n as usize, Ordering::SeqCst);
-                } else {
+            pipe(up, down, move |read| {
+                if read.is_empty() {
                     close(&answered.0, &answered.1);
+                } else {
+                    answered.1.fetch_add(read.len(), Ordering::SeqCst);
                 }
             });
         }
     });
-    (via, answers)
+    (via, answers, asked)
+}
+
+/// The FETCH statements a PostgreSQL client sent inside each transaction that declared rivet's cursor, up to its COMMIT.
+fn fetches_per_cursor_transaction(asked: &[u8]) -> Vec<usize> {
+    let find = |hay: &[u8], needle: &[u8]| hay.windows(needle.len()).position(|w| w == needle);
+    let (mut out, mut rest) = (Vec::new(), asked);
+    while let Some(at) = find(rest, b"DECLARE _rivet") {
+        rest = &rest[at + 1..];
+        let end = find(rest, b"COMMIT\0").unwrap_or(rest.len());
+        out.push(rest[..end].windows(6).filter(|w| w == b"FETCH ").count());
+        rest = &rest[end..];
+    }
+    out
 }
 
 /// The longest single answer and the bytes of all of them.
@@ -525,15 +543,18 @@ fn is_most_of_the_table(longest: u64, total: u64) -> bool {
     longest * 2 > total
 }
 
-/// Run `rig` with its source behind a forwarder to `port`: the longest answer the source gave the rivet process and the total, once the run delivered `WIRE_ROWS` rows.
-fn longest_answer_of_a_run(rig: Rig, url: &str, port: u16) -> (u64, u64) {
-    let (via, answers) = wire_to(port);
+/// Run `rig` with its source behind a forwarder to `port`: the size of each answer the source gave the rivet process and every byte the process sent, once the run delivered `WIRE_ROWS` rows.
+fn a_run_on_the_wire(rig: Rig, url: &str, port: u16) -> (Vec<u64>, Vec<u8>) {
+    let (via, answers, asked) = wire_to(port);
     let rig = rig.source_url(&at_port(url, via));
     let mut run = rig.spawn_args_env(&[], &[]);
     // The rig's oracle reads the source through the same URL before and after the process.
     answers.lock().unwrap().clear();
     std::process::Child::wait(&mut run).expect("rivet ran");
-    let (longest, total) = longest_and_total(&answers.lock().unwrap());
+    let seen = (
+        answers.lock().unwrap().clone(),
+        asked.lock().unwrap().clone(),
+    );
     assert!(
         run.wait().expect("rivet ran").success(),
         "fixture: the run succeeds"
@@ -542,6 +563,12 @@ fn longest_answer_of_a_run(rig: Rig, url: &str, port: u16) -> (u64, u64) {
         .1
         .len();
     assert_eq!(rows, WIRE_ROWS as usize, "fixture: the run read the table");
+    seen
+}
+
+/// The longest answer the source gave a run of `rig` behind a forwarder to `port`, and the bytes of all of them.
+fn longest_answer_of_a_run(rig: Rig, url: &str, port: u16) -> (u64, u64) {
+    let (longest, total) = longest_and_total(&a_run_on_the_wire(rig, url, port).0);
     eprintln!("longest answer {longest} of {total} bytes");
     assert!(
         total > WIRE_ROWS as u64 * 8,
@@ -596,6 +623,38 @@ fn mode_full_documents_the_longest_statement_it_holds(engine: SqlEngine, holds: 
         held,
         "mode: full answered {longest} of {total} bytes to its longest statement"
     );
+}
+
+/// docs/why/source-safe-under-load.md: on PostgreSQL `mode: full` reads the whole table inside
+/// one transaction, and a chunked export opens one per page. Counted in what the rivet process
+/// sent: the transactions that declare its cursor, and the FETCH statements inside each.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn mode_full_reads_in_one_transaction_and_chunked_in_one_per_page_postgres() {
+    let engine = SqlEngine::Pg;
+    let (table, _guard) = wire_table(engine);
+    let full = engine
+        .rig(&table)
+        .export_line(&format!("tuning: {{batch_size: {WIRE_PAGE}}}"));
+    let asked = a_run_on_the_wire(full, engine.url(), engine.default_port()).1;
+    let per = fetches_per_cursor_transaction(&asked);
+    assert!(
+        per.len() == 1 && per[0] as u64 >= WIRE_PAGES,
+        "mode: full read the table in {} cursor transactions holding {per:?} FETCH statements, \
+         not in one holding all {WIRE_PAGES} pages",
+        per.len()
+    );
+    let size = format!("chunk_size: {WIRE_PAGE}");
+    for key in ["chunk_by_key: id", "chunk_column: id"] {
+        let rig = engine.staged(engine.rig(&table), "chunked", &[key, &size]);
+        let asked = a_run_on_the_wire(rig, engine.url(), engine.default_port()).1;
+        let per = fetches_per_cursor_transaction(&asked);
+        assert!(
+            per.len() as u64 >= WIRE_PAGES,
+            "{key}: {} cursor transactions for {WIRE_PAGES} pages, not one per page ({per:?})",
+            per.len()
+        );
+    }
 }
 
 #[test]
@@ -801,7 +860,7 @@ fn an_answer_ends_at_the_next_request_and_two_pages_are_not_one() {
             conn.write_all(&vec![0u8; answer]).unwrap();
         }
     });
-    let (via, answers) = wire_to(port);
+    let (via, answers, asked) = wire_to(port);
     let mut client = std::net::TcpStream::connect(("127.0.0.1", via)).unwrap();
     for answer in [300usize, 7] {
         client.write_all(b"?").unwrap();
@@ -816,6 +875,16 @@ fn an_answer_ends_at_the_next_request_and_two_pages_are_not_one() {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     assert_eq!(*answers.lock().unwrap(), vec![300, 7]);
+    assert!(asked.lock().unwrap().starts_with(b"??"));
+    let one =
+        b"Q BEGIN\0 Q DECLARE _rivet .. P FETCH 2 FROM _rivet P FETCH 2 FROM _rivet Q COMMIT\0";
+    assert_eq!(fetches_per_cursor_transaction(one), vec![2]);
+    assert_eq!(
+        fetches_per_cursor_transaction(&[&one[..], b" P FETCH 9 ", &one[..]].concat()),
+        vec![2, 2],
+        "a FETCH outside a cursor transaction is not counted"
+    );
+    assert!(fetches_per_cursor_transaction(b"Q BEGIN\0 Q SELECT 1 Q COMMIT\0").is_empty());
     assert_eq!(longest_and_total(&[300, 7]), (300, 307));
     assert!(is_one_page(1000, 20_000, 20) && is_one_page(1500, 20_000, 20));
     assert!(!is_one_page(2000, 20_000, 20), "two pages are not one");
