@@ -15,7 +15,8 @@ const GATE_DIR: &str = "dev/release_oracle";
 /// Rows not fully held: a `gap` cell or a live contradiction. Shrink-only; LOWER it with the row.
 // 30 -> 27 (2026-10-08): CDC refusals carry their code (#497, -2); a refused CDC run leaves nothing behind (-1).
 // 27 -> 26 (2026-10-09): the guarantee checks left unwritten are written (#506, -1).
-const ROWS_NOT_HELD: usize = 26; // ratchet-pin: guarantee-rows-not-held
+// 26 -> 25 (2026-10-09): the docs name `_rivet_exported_at` as the one column that differs between runs, and a cell holds it (#506, -1).
+const ROWS_NOT_HELD: usize = 25; // ratchet-pin: guarantee-rows-not-held
 /// `gap` cells over all rows. Shrink-only; LOWER it when a cell is written.
 const GAP_CELLS: usize = 31; // ratchet-pin: guarantee-gap-cells
 

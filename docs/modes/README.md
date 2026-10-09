@@ -30,7 +30,8 @@ Notes worth knowing before you run:
   row is exported, so the first run behaves like `full` — size `batch_size`
   accordingly ([incremental.md](incremental.md#batch-size-and-tuning)).
 - **`chunked` clean re-runs are NOT idempotent.** A crash + `--resume` is
-  at-least-once: a re-run chunk can be written twice (byte-identical), so
+  at-least-once: a re-run chunk can be written twice (byte-identical unless
+  `meta_columns.exported_at` is on), so
   de-duplicate downstream if you re-run ([chunked.md](chunked.md#clean-re-runs-are-not-idempotent)).
 - **Composite cursors** are an `incremental` variant, not a separate mode — see
   [incremental-coalesce.md](incremental-coalesce.md) when one timestamp column

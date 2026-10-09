@@ -303,7 +303,7 @@ preflights:
     backends: [postgres, mysql, mssql, oracle, mongo]
     status: test        # verify_flat_rss (dev/release_oracle/guarantees.py)
   - id: byte_identical_parts
-    what: "identical rows give byte-identical parts across releases (docs/semantics.md), per engine: the DOWNLOADED previous release and this binary run the previous release's `init` config (full and chunked; MongoDB full) over 250,000 seeded rows with `meta_columns.exported_at` off; the sorted sha256 of the parts each manifest declares must be equal, and this binary must have delivered every row. The cell `open_defect_a_rerun_under_init_defaults_keeps_its_fingerprint` runs the config as `init` wrote it and is a known red: the stamp column changes the bytes on every run."
+    what: "identical rows give byte-identical parts across releases (docs/semantics.md), per engine: the DOWNLOADED previous release and this binary run the previous release's `init` config (full and chunked; MongoDB full) over 250,000 seeded rows with `meta_columns.exported_at` off; the sorted sha256 of the parts each manifest declares must be equal, and this binary must have delivered every row. The `<mode>_as_init_writes_it` cells run the config as `init` wrote it (`exported_at` on): DuckDB over the declared parts must read one schema and the same rows in every column but `_rivet_exported_at` (`EXCEPT ALL` both ways, counts), and that column must be later on every row of the later run."
     backends: [postgres, mysql, mssql, oracle, mongo]
     status: test        # verify_byte_identical_parts (dev/release_oracle/guarantees.py)
   - id: state_backend_parity

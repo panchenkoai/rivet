@@ -120,7 +120,7 @@ preflight:
   - id: flat_rss
     what: "peak RSS as a HARD per-engine bound: this binary's own init config per batch mode over 10 thousand / 1 million / 5 million seeded rows, and a CDC drain of 10 and of 30 change sets. Every peak under RSS_CEILING_MIB (largest measured + half); keyset at 5 million within 1.25x of 1 million; the larger CDC backlog within 1.25x of the smaller. dev/release_oracle/guarantees.py."
   - id: byte_identical_parts
-    what: "the downloaded previous release and this binary write byte-identical parts for the same 250,000 rows (previous init config, exported_at off), per engine and mode; the init-default config is a known-red cell. dev/release_oracle/guarantees.py."
+    what: "the downloaded previous release and this binary export the same 250,000 rows through the previous init config, per engine and mode: with exported_at off the parts are byte-identical; as init writes it (exported_at on) DuckDB reads one schema and the same rows in every column but _rivet_exported_at (EXCEPT ALL both ways, counts), and that column is later on every row of the later run. dev/release_oracle/guarantees.py."
   - id: failed_run_tail
     what: "runs failed by a RETURNED error (single, chunked, checkpoint, parallel keyset, schema drift, parallel Mongo): exit/_SUCCESS/manifest/validate/state-cursor/files_committed, then a clean re-run == source. dev/release_oracle/failure.py."
   - id: transient_retry_exact
