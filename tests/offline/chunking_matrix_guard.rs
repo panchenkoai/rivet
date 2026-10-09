@@ -333,7 +333,10 @@ const MATRICES: &[(&str, usize)] = &[
     // parallel runners (5), the points that are panic points only (5), an SQLite state copied elsewhere (5).
     // Lowered 127 -> 126 (2026-10-08): runs that name one part in one millisecond are a cell on every SQL engine.
     // 126 -> 115 (2026-10-08): the corrupt-checkpoint, truncate and log-gap walks of the operator contract.
-    ("docs/sabotage-matrix.yaml", 115),
+    // 115 -> 128 (2026-10-08): the versions, exhaust, ddl, hostile and clock row families add 13 rows nobody
+    // wrote: a memory cap (5), a run under a stepped clock (5), an Oracle CLOB past 4000 bytes, the warehouse
+    // taken away under a live load, and a signal at `pg_after_snapshot_open`.
+    ("docs/sabotage-matrix.yaml", 128),
     // Pool-split — `apply --pool --split` per (strategy × source engine). Split is a
     // scheduler layer above the runners (each unit runs through chunked/keyset), so its
     // per-engine behaviour (boundary probe, crash-recovery, finding-2 exact-partition

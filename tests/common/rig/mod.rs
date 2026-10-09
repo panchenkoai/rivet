@@ -17,7 +17,7 @@ use super::runner::RIVET_BIN;
 /// every backend (two renderers per backend is the drift the rig exists to
 /// prevent).
 mod beside;
-pub use beside::{Local, Met, ReadOnly};
+pub use beside::{Local, Met, ReadOnly, TinyVolume};
 mod init;
 pub use init::InitConfig;
 mod invoke;
@@ -96,6 +96,10 @@ pub struct Rig {
     /// Key column for the census DISTINCT legs (see `Rig::census_key`).
     census_key: Option<String>,
     /// Why this rig opted out of the default oracle (see `Rig::no_oracle`).
+    /// The binary this rig's invocations run instead of this tree's build.
+    bin: Option<PathBuf>,
+    /// The most files an invocation of this rig may hold open (`RLIMIT_NOFILE`).
+    open_files: Option<u64>,
     oracle_off: Option<String>,
     /// A product defect the oracle must keep catching (see `Rig::oracle_known_defect`).
     oracle_xfail: Option<(String, String)>,
@@ -171,6 +175,8 @@ impl Rig {
             ckpt_override: None,
             dest_stdout: false,
             census_key: None,
+            bin: None,
+            open_files: None,
             oracle_off: None,
             oracle_xfail: None,
             oracle_xfailed: std::cell::Cell::new(false),
@@ -444,6 +450,18 @@ impl Rig {
             container: container.to_string(),
             prefix: prefix.to_string(),
         });
+        self
+    }
+
+    /// Cap the files each invocation of this rig may hold open.
+    pub fn open_files(mut self, most: u64) -> Self {
+        self.open_files = Some(most);
+        self
+    }
+
+    /// Keep the config, and so the SQLite state beside it, in `dir` instead of the rig's tempdir.
+    pub fn config_dir(mut self, dir: PathBuf) -> Self {
+        self.config_dir_override = Some(dir);
         self
     }
 
