@@ -47,6 +47,7 @@ it too. Oracles: DuckDB over the parts the manifests declare, the source's own c
 
 from __future__ import annotations
 
+from contextlib import closing
 import glob
 import json
 import os
@@ -133,7 +134,8 @@ def _declared(out: Path, select: str) -> list[tuple]:
     parts = _manifest_declared_parts(out)
     if not parts:
         return []
-    return duckdb.connect().execute(select.format(parts=f"read_parquet({parts})")).fetchall()
+    with duckdb.connect() as con:
+        return con.execute(select.format(parts=f"read_parquet({parts})")).fetchall()
 
 
 def _declared_names(out: Path) -> set[str]:
@@ -242,11 +244,10 @@ def _future_leg(led: Ledger, e: _Env, engine: str) -> None:
     """A state one schema version ahead of this binary is refused before any part lands."""
     db = e.dir / ".rivet_state.db"
     shutil.copy(db, e.dir / "state.bak")
-    con = sqlite3.connect(db)
-    (ver,) = con.execute("SELECT max(version) FROM schema_version").fetchone()
-    con.execute("INSERT INTO schema_version(version) VALUES (?)", (ver + 1,))
-    con.commit()
-    con.close()
+    with closing(sqlite3.connect(db)) as con:
+        (ver,) = con.execute("SELECT max(version) FROM schema_version").fetchone()
+        con.execute("INSERT INTO schema_version(version) VALUES (?)", (ver + 1,))
+        con.commit()
     before = e.parquet_count()
     p = e.rivet(rivet_bin(), "run", "-c", "c.yaml")
     shutil.copy(e.dir / "state.bak", db)
@@ -383,9 +384,10 @@ def _cdc_leg(led: Ledger, prev: Path, engine: str, url: str) -> None:
         mine = sorted(str(p) for p in out.rglob("*.parquet") if p.name in _declared_names(out) - before)
         idc = f"CAST({eng.id_col} AS BIGINT)"  # MongoDB's `_id` lands as text
         every = _declared(out, f"SELECT count(DISTINCT {idc}) FROM {{parts}}")
-        span = (duckdb.connect().execute(
-            f"SELECT min({idc}), count(DISTINCT {idc}) FROM read_parquet({mine})").fetchone()
-            if mine else (None, 0))
+        span = (None, 0)
+        if mine:
+            with duckdb.connect() as con:
+                span = con.execute(f"SELECT min({idc}), count(DISTINCT {idc}) FROM read_parquet({mine})").fetchone()
         ok = (anchored.ok and first.ok and cont.ok
               and every and every[0][0] == 2 * CDC_CHANGES
               and span[0] is not None and span[0] > CDC_CHANGES and span[1] == CDC_CHANGES)
@@ -466,7 +468,8 @@ class _MongoKeys:
     def __init__(self, url: str, name: str):
         import pymongo
 
-        self.coll = pymongo.MongoClient(url, serverSelectionTimeoutMS=5000).get_default_database("rivet")[name]
+        self.client = pymongo.MongoClient(url, serverSelectionTimeoutMS=5000)
+        self.coll = self.client.get_default_database("rivet")[name]
 
     def add(self, n: int) -> bool:
         self.coll.insert_many([{"v": i} for i in range(n)])
@@ -480,7 +483,8 @@ class _MongoKeys:
         return v
 
     def drop(self) -> None:
-        self.coll.drop()
+        with self.client:
+            self.coll.drop()
 
 
 class _SqlKeys:

@@ -156,13 +156,15 @@ def fetch(cache: Path) -> int:
         name = f"rivet-v{v}-{triple()}.tar.gz"
         base = f"https://github.com/{REPO}/releases/download/v{v}"
         try:
-            sums = urllib.request.urlopen(f"{base}/SHA256SUMS.txt", timeout=120).read().decode()
+            with urllib.request.urlopen(f"{base}/SHA256SUMS.txt", timeout=120) as r:
+                sums = r.read().decode()
             want = next((ln.split()[0] for ln in sums.splitlines() if ln.split()[1:] and ln.split()[-1].lstrip("*") == name), None)
             if want is None:
                 absent_note(cache, v).write_text(f"release v{v} publishes no {name}\n")
                 print(f"  v{v}: NO ASSET for this machine ({name} is not in the release's SHA256SUMS.txt)")
                 continue
-            data = urllib.request.urlopen(f"{base}/{name}", timeout=600).read()
+            with urllib.request.urlopen(f"{base}/{name}", timeout=600) as r:
+                data = r.read()
         except urllib.error.HTTPError as e:
             if e.code == 404:
                 absent_note(cache, v).write_text(f"tag v{v} has no published release (HTTP 404)\n")
@@ -326,7 +328,8 @@ def _bucket() -> bool:
     req = urllib.request.Request(f"{GCS}/storage/v1/b?project=field", data=json.dumps({"name": BUCKET}).encode(),
                                  headers={"Content-Type": "application/json"}, method="POST")
     try:
-        urllib.request.urlopen(req, timeout=10).read()
+        with urllib.request.urlopen(req, timeout=10) as r:
+            r.read()
     except urllib.error.HTTPError:
         pass
     except (urllib.error.URLError, OSError):
@@ -339,7 +342,8 @@ def _forget(prefix: str) -> None:
     for name in _objects(prefix):
         req = urllib.request.Request(f"{GCS}/storage/v1/b/{BUCKET}/o/{urllib.parse.quote(name, safe='')}", method="DELETE")
         try:
-            urllib.request.urlopen(req, timeout=10).read()
+            with urllib.request.urlopen(req, timeout=10) as r:
+                r.read()
         except (urllib.error.URLError, OSError):
             pass
 
@@ -403,7 +407,8 @@ def _id_v(parts: list[str]) -> list[tuple[int, int]]:
 
     if not parts:
         return []
-    return sorted((int(i), int(v)) for i, v in duckdb.connect().execute(f"SELECT id, v FROM read_parquet({parts})").fetchall())
+    with duckdb.connect() as con:
+        return sorted((int(i), int(v)) for i, v in con.execute(f"SELECT id, v FROM read_parquet({parts})").fetchall())
 
 
 def state_facts(state: str) -> tuple[int, str]:
@@ -444,11 +449,10 @@ class _Watch:
                 return int(self.duck.db.sql(f"SELECT * FROM postgres_query('st', '{q.replace(chr(39), chr(39) * 2)}')").fetchone()[0])
             import sqlite3
 
-            con = sqlite3.connect(f"file:{self.state}?mode=ro", uri=True, timeout=1)
-            try:
+            from contextlib import closing
+
+            with closing(sqlite3.connect(f"file:{self.state}?mode=ro", uri=True, timeout=1)) as con:
                 return int(con.execute(q).fetchone()[0])
-            finally:
-                con.close()
         except Exception:  # noqa: BLE001 — a state not readable yet holds no run
             return 0
 
