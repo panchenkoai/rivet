@@ -829,8 +829,26 @@ fn names_oversize_event(text: &str) -> bool {
     text.contains("BSONObjectTooLarge") || text.contains("BSONObj size")
 }
 
+/// Whether this driver error text names a resume token the oplog no longer holds (server error 286).
+fn names_history_lost(text: &str) -> bool {
+    text.contains("ChangeStreamHistoryLost")
+}
+
+/// Refuse a resume token the oplog rolled past.
+pub(crate) fn history_lost_message(server_said: &str) -> String {
+    format!(
+        "mongodb cdc: the oplog no longer holds the checkpoint's resume token — it rolled past \
+         the checkpoint, and the changes between the token and the oldest oplog entry are no \
+         longer in the log (server error: {server_said}). {}",
+        crate::source::cdc::checkpoint_identity::RECOVER
+    )
+}
+
 fn diagnose_stream_error(e: mongodb::error::Error) -> anyhow::Error {
     let text = e.to_string();
+    if names_history_lost(&text) {
+        return crate::source::cdc::checkpoint_identity::log_gap(history_lost_message(&text));
+    }
     if names_oversize_event(&text) {
         return anyhow::anyhow!(
             "mongodb cdc: a single change event exceeds MongoDB's 16 MB BSON limit — \
@@ -944,11 +962,9 @@ impl ChangeStream for MongoChangeStream {
                     let coll = cse.ns.as_ref().and_then(|n| n.coll.as_deref());
                     if ddl_removes_a_capture(&cse.operation_type, coll, db_name, configured_tables)
                     {
-                        return Some(Err(anyhow::anyhow!(dropped_capture_message(
-                            &cse.operation_type,
-                            db_name,
-                            coll
-                        ))));
+                        return Some(Err(crate::source::cdc::checkpoint_identity::truncated(
+                            dropped_capture_message(&cse.operation_type, db_name, coll),
+                        )));
                     }
                     continue;
                 }
@@ -1054,6 +1070,28 @@ mod tests {
     /// (which recognises nothing, since one message never carries both spellings),
     /// and `tier` survived being replaced by `""` and by `"xyzzy"` outright — nothing
     /// asserted it said anything at all.
+    /// Error 286 by its code name is a log gap, worded as one and ending in the re-baseline remedy.
+    #[test]
+    fn a_lost_change_stream_history_is_named_and_worded_as_a_log_gap() {
+        const LOST: &str = "Kind: Command failed: Error code 286 (ChangeStreamHistoryLost): \
+                            Resume of change stream was not possible, as the resume point may \
+                            no longer be in the oplog., labels: {}";
+        assert!(super::names_history_lost(LOST));
+        assert!(!super::names_history_lost(
+            "Kind: Command failed: Error code 40573 (Location40573): The $changeStream stage \
+             is only supported on replica sets"
+        ));
+        assert_eq!(
+            super::history_lost_message(LOST),
+            format!(
+                "mongodb cdc: the oplog no longer holds the checkpoint's resume token — it \
+                 rolled past the checkpoint, and the changes between the token and the oldest \
+                 oplog entry are no longer in the log (server error: {LOST}). {}",
+                crate::source::cdc::checkpoint_identity::RECOVER
+            )
+        );
+    }
+
     #[test]
     fn the_oversize_predicate_and_the_capability_string_say_what_they_mean() {
         // MEASURED wire text, both forms.

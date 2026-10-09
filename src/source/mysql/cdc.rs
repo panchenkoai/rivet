@@ -247,27 +247,21 @@ impl MysqlChangeStream {
             .get("file")
             .and_then(Json::as_str)
             .ok_or_else(|| {
-                crate::error::CodedError::new(
-                    crate::error::codes::SOURCE_CDC_CHECKPOINT_INVALID,
-                    format!(
-                        "checkpoint '{path}' parses as JSON but carries no 'file' — refusing to \
+                crate::source::cdc::checkpoint_identity::checkpoint_invalid(format!(
+                    "checkpoint '{path}' parses as JSON but carries no 'file' — refusing to \
                          treat it as absent, which would re-anchor at the CURRENT binlog \
                          position and silently skip every change since it was written. Restore \
                          the file, or: {}",
-                        crate::source::cdc::checkpoint_identity::RECOVER
-                    ),
-                )
+                    crate::source::cdc::checkpoint_identity::RECOVER
+                ))
             })?
             .to_string();
         let p = pos.0.get("pos").and_then(Json::as_u64).ok_or_else(|| {
-            crate::error::CodedError::new(
-                crate::error::codes::SOURCE_CDC_CHECKPOINT_INVALID,
-                format!(
-                    "checkpoint '{path}' parses as JSON but carries no 'pos'. Restore the file, \
+            crate::source::cdc::checkpoint_identity::checkpoint_invalid(format!(
+                "checkpoint '{path}' parses as JSON but carries no 'pos'. Restore the file, \
                      or: {}",
-                    crate::source::cdc::checkpoint_identity::RECOVER
-                ),
-            )
+                crate::source::cdc::checkpoint_identity::RECOVER
+            ))
         })?;
         Ok(Some((file, p)))
     }
@@ -642,7 +636,9 @@ impl MysqlChangeStream {
         if mode.is_bounded() {
             req = req.with_flags(BinlogDumpFlags::BINLOG_DUMP_NON_BLOCK);
         }
-        let stream = conn.get_binlog_stream(req)?;
+        let stream = conn
+            .get_binlog_stream(req)
+            .map_err(|e| binlog_read_error(e, &file))?;
         Ok(Self {
             stream,
             configured_tables,
@@ -936,7 +932,7 @@ impl MysqlChangeStream {
             return Ok(false); // ended at the open-time ceiling — stay ended
         }
         let ev = match self.stream.next() {
-            Some(ev) => ev?,
+            Some(ev) => ev.map_err(|e| binlog_read_error(e, &self.file))?,
             None => return Ok(false),
         };
         let log_pos = ev.header().log_pos() as u64;
@@ -1136,7 +1132,9 @@ impl MysqlChangeStream {
                 }) =>
             {
                 let (sc, tb) = truncate_target(&qe.query(), &qe.schema()).expect("just matched");
-                anyhow::bail!(truncate_refusal_message(&sc, &tb));
+                return Err(crate::source::cdc::checkpoint_identity::truncated(
+                    truncate_refusal_message(&sc, &tb),
+                ));
             }
             // `XA PREPARE` arrives as a BINARY `XaPrepareLogEvent` on 5.7.7+, never
             // as a QueryEvent — so `is_commit_statement`'s "deliberately not XA
@@ -1197,7 +1195,9 @@ impl MysqlChangeStream {
                         &self.configured_tables,
                     )
                 });
-                anyhow::bail!(drop_refusal_message(ours.and_then(|t| t.as_ref())));
+                return Err(crate::source::cdc::checkpoint_identity::truncated(
+                    drop_refusal_message(ours.and_then(|t| t.as_ref())),
+                ));
             }
             Some(EventData::QueryEvent(qe))
                 if statement_dml_target(&qe.query(), &qe.schema()).is_some_and(|t| {
@@ -1702,6 +1702,36 @@ pub(crate) fn drop_table_targets(
                 truncate_target(&format!("TRUNCATE {n}"), event_db)
             })
             .collect(),
+    )
+}
+
+/// Whether a binlog dump error says the server purged the log the resume position needs (ER_MASTER_FATAL_ERROR_READING_BINLOG with either wording: by file, by GTID).
+pub(crate) fn names_purged_binlog(code: u16, message: &str) -> bool {
+    code == 1236
+        && (message.contains("Could not find first log file name")
+            || message.contains("purged required binary logs"))
+}
+
+/// A binlog dump error as it is shown: a purged log is a `SOURCE_CDC_LOG_GAP` refusal, anything else the driver's own error.
+fn binlog_read_error(e: mysql::Error, file: &str) -> anyhow::Error {
+    match &e {
+        mysql::Error::MySqlError(m) if names_purged_binlog(m.code, &m.message) => {
+            crate::source::cdc::checkpoint_identity::log_gap(purged_binlog_message(
+                file, &m.message,
+            ))
+        }
+        _ => e.into(),
+    }
+}
+
+/// Refuse a resume position whose binlog the server purged.
+pub(crate) fn purged_binlog_message(file: &str, server_said: &str) -> String {
+    format!(
+        "mysql cdc: the server no longer holds binlog `{file}`, where the checkpoint resumes \
+         (ERROR 1236: {server_said}) — it was purged past the checkpoint, and the changes \
+         between the checkpoint and the oldest binlog the server still has are no longer in \
+         the log. {}",
+        crate::source::cdc::checkpoint_identity::RECOVER
     )
 }
 
@@ -3160,6 +3190,44 @@ mod refusal_text_tests {
             "{unknown}"
         );
         assert!(unknown.ends_with(RECOVER), "{unknown}");
+    }
+
+    /// ERROR 1236 is a log gap only under the two purge wordings; the same code for another cause stays the driver's error.
+    #[test]
+    fn a_purged_binlog_is_a_log_gap_and_another_1236_is_not() {
+        const BY_FILE: &str = "Could not find first log file name in binary log index file";
+        const BY_GTID: &str = "Cannot replicate because the source purged required binary logs.";
+        const SAME_ID: &str = "A replica with the same server_uuid/server_id as this replica \
+                               has connected to the source";
+        assert!(names_purged_binlog(1236, BY_FILE));
+        assert!(names_purged_binlog(1236, BY_GTID));
+        assert!(!names_purged_binlog(1236, SAME_ID));
+        assert!(!names_purged_binlog(1045, BY_FILE));
+        let server = |code, message: &str| {
+            mysql::Error::MySqlError(mysql::error::MySqlError {
+                state: "HY000".into(),
+                message: message.into(),
+                code,
+            })
+        };
+        let gap = binlog_read_error(server(1236, BY_FILE), "binlog.000007");
+        assert_eq!(crate::error::classify_exit(&gap), 5);
+        assert_eq!(
+            crate::error::error_code(&gap),
+            Some("RIVET_SOURCE_CDC_LOG_GAP")
+        );
+        assert_eq!(
+            gap.to_string(),
+            format!(
+                "mysql cdc: the server no longer holds binlog `binlog.000007`, where the \
+                 checkpoint resumes (ERROR 1236: {BY_FILE}) — it was purged past the checkpoint, \
+                 and the changes between the checkpoint and the oldest binlog the server still \
+                 has are no longer in the log. {RECOVER}"
+            )
+        );
+        let other = binlog_read_error(server(1236, SAME_ID), "binlog.000007");
+        assert_eq!(crate::error::error_code(&other), None);
+        assert!(other.to_string().contains(SAME_ID), "{other}");
     }
 
     /// A statement-logged change names the table, the setting to change, and the recovery steps.

@@ -5,7 +5,8 @@
 
 /// Uncoded `bail!(` sites under `src/` (429 on 2026-09-27, when the registry landed).
 // 417 -> 416 (2026-10-08): `--resume` over a complete prefix is refused as RIVET_DEST_ALREADY_COMPLETE.
-const CEILING: usize = 416; // ratchet-pin: uncoded-bail-sites
+// 416 -> 409 (2026-10-08): CDC refusals carry their code (#497).
+const CEILING: usize = 409; // ratchet-pin: uncoded-bail-sites
 
 /// Occurrences of a bare `bail!(` (not `rivet_bail!` / `config_bail!`) in `text`.
 fn bare_bails(text: &str) -> usize {

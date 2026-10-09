@@ -872,13 +872,13 @@ fn a_missing_base_refuses_the_compaction_and_keeps_the_buffer() {
 }
 
 /// A table the pilot had from day one: EMPTY at the source. Its baseline writes no
-/// file, so no base is ever loaded and no buffer exists — and `compact` must say the
-/// no-op, not ALTER a base that is not there (field, 2026-10-01: five such tables
-/// failed every cycle with BigQuery's `Not found: Table`, and the cycle's exit code
-/// with them).
+/// file, and the load still builds its base — empty, with the source's columns — so
+/// `compact` has a table to merge the first change into; until one arrives it says the
+/// no-op (field, 2026-10-01: five such tables failed every cycle, and the cycle's exit
+/// code with them).
 #[test]
 #[ignore = "live: requires mysql-cdc + BigQuery creds"]
-fn a_table_that_was_never_loaded_is_a_said_no_op_for_compact() {
+fn a_table_empty_at_baseline_gets_an_empty_base_and_compact_says_the_no_op() {
     let Some(bq) = BqLive::from_env("compact_never") else {
         return;
     };
@@ -896,24 +896,27 @@ fn a_table_that_was_never_loaded_is_a_said_no_op_for_compact() {
     scn.rig.run_ok();
     let said = load_ok(&scn.rig);
     assert!(
-        said.contains("produced no files"),
-        "fixture: an empty table loads nothing, so no base exists:\n{said}"
+        said.contains("is created empty"),
+        "an empty baseline says what it did to the base:\n{said}"
     );
-
     assert_eq!(
-        bq.read_bq_table_type(&table),
-        None,
-        "fixture: no base was created"
+        base_profile(&bq, &table),
+        (0, 0, 0, 0, 0),
+        "the base exists and holds no row"
     );
 
     let (ok, said) = compact(&scn.rig, &[]);
-    assert!(ok, "compact on a never-loaded table must exit 0:\n{said}");
+    assert!(ok, "compact with no buffer must exit 0:\n{said}");
     assert!(said.contains("COMPACT SKIP"), "{said}");
-    assert!(!said.contains("Not found: Table"), "{said}");
-    assert_eq!(
-        bq.read_bq_table_type(&table),
-        None,
-        "compact created nothing"
+    assert!(
+        bq.read_bq_table_type(&changes).is_none(),
+        "no buffer was created"
+    );
+
+    let said = load_ok(&scn.rig);
+    assert!(
+        !said.contains("is created empty") && !said.contains("emptied to match"),
+        "a second load writes the base again for nothing:\n{said}"
     );
 }
 

@@ -346,7 +346,7 @@ scenarios:
     cdc:            { test: cdc_drain_row_hash_matches_the_independent_implementation }
 
   - id: run_unique_part_naming
-    what: "two runs into ONE destination prefix must not clobber — part filenames carry a run-unique token (millisecond %3f stamp or a random nonce), never a second-granularity stamp that collides."
+    what: "two runs into ONE destination prefix must not clobber — part filenames carry a run-unique token (the run id's millisecond stamp and process id, a random nonce, or both), never a wall-clock stamp two runs can share."
     single:         { test: roast_rapid_incremental_runs_into_same_prefix_must_not_clobber_prior_parts }
     chunked:        { test: chunk_part_filename_is_collision_proof_for_same_chunk }
     chunked_checkpoint: { na: "shared naming seam — every chunked variant derives its part base from the same `chunk_part_filename` (called once each by run_chunked_sequential and run_chunked_parallel in exec.rs, and by both checkpoint twins in sequential_checkpoint.rs / parallel_checkpoint.rs); there is no per-runner stamp to forget, so the pure-fn proof in the cell to the left covers this column too" }
@@ -355,12 +355,12 @@ scenarios:
     cdc:            { test: roast_second_run_into_same_prefix_must_not_clobber_prior_parts }
 
   - id: part_name_not_export_doubled
-    what: "a part filename carries the export name EXACTLY ONCE. The keyset part-name format prepends `<export>_` AND used the run_id for run-uniqueness — but the production run_id is itself `<export>_<stamp>` (job.rs), so real runs wrote `<export>_<export>_<stamp>_pk_w…` (field-run, 0.24.5). The chunked/mongo/single siblings key their middle segment off a FRESH Utc stamp, not the run_id, so they never doubled; keyset was the odd one out. Fix: `run_scoped_tag` strips a redundant leading `<export>_` from the run tag."
-    single:         { na: "keys off a fresh `%Y%m%d_%H%M%S_%3f` Utc stamp (single.rs), never the run_id — the export name cannot appear twice by construction" }
+    what: "a part filename carries the export name EXACTLY ONCE. The keyset part-name format prepends `<export>_` AND used the run_id for run-uniqueness — but the production run_id is itself `<export>_<stamp>` (job.rs), so real runs wrote `<export>_<export>_<stamp>_pk_w…` (field-run, 0.24.5). The chunked sibling keys its middle segment off a FRESH Utc stamp, not the run_id, so it never doubled. Fix: `run_scoped_tag` strips a redundant leading `<export>_` from the run tag; the single and MongoDB parallel runners stamp their parts through it too (`run_scoped_stamp`)."
+    single:         { test: incremental_runs_started_together_each_declare_their_own_part_postgres }
     chunked:        { na: "shared seam `chunk_part_filename` (chunked/mod.rs:64) keys off a fresh `%Y%m%d_%H%M%S` Utc stamp, not the run_id — no double; every chunked variant derives from it" }
     chunked_checkpoint: { na: "same `chunk_part_filename` seam as `chunked` — a fresh stamp, not the run_id" }
     keyset:         { test: keyset_part_names_do_not_double_the_export_name }
-    mongo_parallel: { na: "keys off a fresh `%Y%m%d_%H%M%S_%3f` stamp (mongo_parallel.rs:63), not the run_id — no double" }
+    mongo_parallel: { test: parallel_parts_are_named_after_their_run_mongo }
     cdc:            { na: "the part name is `cdc-{run_token}-{seq:06}` (src/source/cdc/sink.rs), run_token derived from the run_id — nothing prepends the export name a second time" }
 
   - id: durable_manifest_before_advance

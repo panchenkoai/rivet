@@ -1,0 +1,13 @@
+diff --git a/src/pipeline/mongo_parallel.rs b/src/pipeline/mongo_parallel.rs
+index be1b285c..bb4a6ede 100644
+--- a/src/pipeline/mongo_parallel.rs
++++ b/src/pipeline/mongo_parallel.rs
+@@ -56,7 +56,7 @@ pub(crate) fn run_mongo_parallel(
+         kp.chunk_size
+     );
+ 
+-    let stamp = super::summary::run_scoped_stamp(&summary.run_id, &plan.export_name);
++    let stamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
+ 
+     let key_plan = IncrementalCursorPlan {
+         primary_column: kp.key_column.clone(),

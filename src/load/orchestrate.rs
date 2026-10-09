@@ -283,9 +283,84 @@ fn empty_prefix_note(
     })
 }
 
-/// Whether a load whose runs resolve to no files is a no-op: yes for an append (nothing changed), never for a full load, whose newest run says the table is now empty.
-fn nothing_to_load(mode: load::plan::LoadMode, no_files: bool) -> bool {
-    no_files && mode != load::plan::LoadMode::Full
+/// Whether a load whose runs resolve to no files is a no-op: yes for an append (nothing changed), never for a whole-table pass, whose newest run says the table is now empty.
+fn nothing_to_load(whole_table_pass: bool, no_files: bool) -> bool {
+    no_files && !whole_table_pass
+}
+
+/// Whether `runs` hold a pass over the whole table: any full load, or a baseline leg of a base-and-buffer stream.
+fn holds_whole_table_pass(
+    plan: &load::plan::LoadPlan,
+    runs: &[(String, crate::manifest::RunManifest)],
+) -> bool {
+    match plan.mode {
+        load::plan::LoadMode::Full => true,
+        load::plan::LoadMode::Cdc => {
+            plan.layout.compacts() && runs.iter().any(|(_, m)| is_baseline_leg(m))
+        }
+        load::plan::LoadMode::Incremental => false,
+    }
+}
+
+/// Whether the base of a base-and-buffer stream is missing because its baseline held no rows: the ledger's one loaded baseline leg exported none, no compaction ever merged a row, and the warehouse has no such table.
+fn base_was_never_built(
+    plan: &load::plan::LoadPlan,
+    state: Option<&StateStore>,
+    loader: &dyn load::TargetLoader,
+) -> Result<bool> {
+    let Some(state) = state else {
+        return Ok(false);
+    };
+    if !(plan.mode == load::plan::LoadMode::Cdc && plan.layout.compacts()) {
+        return Ok(false);
+    }
+    let target = loader.fqtn(&plan.table);
+    Ok(state.loaded_baseline_legs(&target)? == (1, 0)
+        && !state.has_merged_rows(&target)?
+        && loader.object_kind(&plan.table)? == load::ObjectKind::Absent)
+}
+
+/// The columns of a base-and-buffer base: the plan's, and the delete flag when the base carries it.
+fn base_specs(
+    plan: &load::plan::LoadPlan,
+    loader: &dyn load::TargetLoader,
+) -> Vec<crate::types::target::TargetColumnSpec> {
+    let mut specs = plan.specs.clone();
+    if load::plan::base_carries_delete_flag(true, plan.deleted_flag) {
+        specs.push(load::cdc::flag_spec(loader.warehouse()));
+    }
+    specs
+}
+
+/// Create the empty base an earlier load of an empty baseline left out, so the buffered changes have a table to merge into.
+fn build_missing_base(
+    plan: &load::plan::LoadPlan,
+    state: Option<&StateStore>,
+    loader: &dyn load::TargetLoader,
+) -> Result<()> {
+    if !load::before_write(base_was_never_built(plan, state, loader))? {
+        return Ok(());
+    }
+    eprintln!("{}", rebuild_note(&loader.fqtn(&plan.table)));
+    load::run_load(
+        loader,
+        &plan.table,
+        &base_specs(plan, loader),
+        &[],
+        Some(0),
+        None,
+        load::Ownership::Own,
+    )?;
+    Ok(())
+}
+
+/// What a load says when it builds the base an earlier load of an empty baseline left out.
+fn rebuild_note(target_fqtn: &str) -> String {
+    format!(
+        "  note: `{target_fqtn}` does not exist although its baseline was loaded: the baseline \
+         held no rows, and rivet 0.31 and older created no table for one. Creating it empty \
+         now; the changes buffered since are merged into it by `rivet compact`"
+    )
 }
 
 /// The refusal when another `rivet load` or `rivet compact` holds the table's lease —
@@ -733,7 +808,7 @@ fn prepare_load(
     let integrity = load::reconcile::reconcile(&manifests, allow_source_drift)?;
     let uris = load::reconcile::select_load_uris(store, &plan.gcs_prefix, &new)?;
     let source_run_ids: Vec<String> = new.iter().map(|(_, m)| m.run_id.clone()).collect();
-    if nothing_to_load(plan.mode, uris.is_empty()) {
+    if nothing_to_load(holds_whole_table_pass(plan, &new), uris.is_empty()) {
         // Unloaded manifests that resolve to NO files: runs that legitimately
         // produced nothing (a CDC cycle with no changes, the anchor cycle of
         // `initial: snapshot`). That is "up to date", not an error. They are
@@ -1066,6 +1141,7 @@ fn execute_load<R>(
     // One load per table at a time: two concurrent loads both read the ledger
     // before either writes it and append the same runs twice.
     let _lease = take_table_lease(job.state, &target_fqtn)?;
+    build_missing_base(job.plan, job.state, &**loader)?;
     let mut ctx = LoadCtx {
         state: job.state,
         load_id: job.load_id,
@@ -1085,7 +1161,9 @@ fn execute_load<R>(
         &target_fqtn,
         job.allow_source_drift,
     )? {
-        Some(i) if nothing_to_load(job.mode, i.uris.is_empty()) => {
+        Some(i)
+            if nothing_to_load(holds_whole_table_pass(job.plan, &i.runs), i.uris.is_empty()) =>
+        {
             ctx.active_at_fetch = i.active_at_fetch.clone();
             ctx.marker_active = i.marker_active.clone();
             print_up_to_date(&job);
@@ -1204,14 +1282,10 @@ fn load_one_cdc_base(
                 // Reached only through `plan.layout.compacts()`, which is the `true`:
                 // the one predicate that owns "does the base carry the flag" is asked.
                 load::refuse_stale_buffer(loader, &plan.table, true)?;
-                let mut specs = plan.specs.clone();
-                if load::plan::base_carries_delete_flag(true, plan.deleted_flag) {
-                    specs.push(load::cdc::flag_spec(loader.warehouse()));
-                }
                 let r = load::run_load(
                     loader,
                     &plan.table,
-                    &specs,
+                    &base_specs(plan, loader),
                     &uris,
                     Some(integrity.file_rows),
                     None,
@@ -2763,6 +2837,215 @@ mod load_ledger_tests {
         Cycle::observed(err, &writes, state, &format!("db.{}", plan.table))
     }
 
+    /// Stage a successful baseline leg that exported no rows and wrote no part.
+    fn stage_empty_baseline(dir: &tempfile::TempDir, run: &str) {
+        let mut m = super::live_only_decisions::success_manifest(run, "unused.parquet");
+        m.mode = "full".into();
+        m.parts.clear();
+        m.part_count = 0;
+        m.row_count = 0;
+        super::live_only_decisions::write_at(
+            dir,
+            &format!("p/manifest-{run}.json"),
+            &serde_json::to_vec(&m).unwrap(),
+        );
+    }
+
+    /// A base-and-buffer CDC plan over `table` with nothing staged.
+    fn base_plan(dir: &tempfile::TempDir, table: &str) -> load::plan::LoadPlan {
+        let mut plan = cdc_plan(dir, table);
+        plan.specs = load::tests::spec_ok();
+        plan.pk = vec!["id".into()];
+        plan.layout = load::plan::CdcLayout::BaseAndBuffer;
+        plan
+    }
+
+    /// What rivet 0.31 left for a table empty at its baseline: the leg `run` journaled as
+    /// loaded into `target`, and the extract's own record that it exported `rows` in `mode`.
+    fn loaded_leg(state: &StateStore, target: &str, run: &str, mode: &str, rows: i64) {
+        let mut earlier = ctx(state, "L0");
+        earlier.target_fqtn = target;
+        earlier.record_empty_runs(&[run.to_string()]);
+        state
+            .record_metric_full(&crate::state::MetricRow {
+                export_name: "orders".into(),
+                run_id: run.into(),
+                total_rows: rows,
+                status: "success".into(),
+                mode: Some(mode.into()),
+                ..Default::default()
+            })
+            .unwrap();
+    }
+
+    /// A table empty at the baseline gets an EMPTY base, in the load that reads the
+    /// baseline, and the next cycle does not write it again.
+    #[test]
+    fn an_empty_baseline_builds_the_base_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateStore::open_in_memory().unwrap();
+        let plan = base_plan(&dir, "empty_base");
+        stage_empty_baseline(&dir, "r-base");
+        let first = cdc_base_cycle(&dir, &state, &plan, "L1", load::tests::fake_loader(0));
+        let again = cdc_base_cycle(
+            &dir,
+            &state,
+            &plan,
+            "L2",
+            load::tests::fake_loader(0).with_kind("empty_base", load::ObjectKind::Table),
+        );
+        assert_eq!(
+            (first.refusal, first.writes, again.refusal, again.writes),
+            (
+                None,
+                vec!["materialize empty_base".to_string()],
+                None,
+                vec![]
+            ),
+            "(cycle-1 error, cycle-1 writes, cycle-2 error, cycle-2 writes)"
+        );
+        assert!(
+            state
+                .loaded_source_run_ids("db.empty_base")
+                .unwrap()
+                .contains("r-base")
+        );
+    }
+
+    /// The state rivet 0.31 and older left: the empty baseline is journaled as loaded and
+    /// its manifest cleaned, no base exists, and the buffer holds the changes made since.
+    /// The next load builds the base, and the cycle after it writes nothing.
+    #[test]
+    fn a_base_an_empty_baseline_never_built_is_built_by_the_next_load() {
+        use load::ObjectKind::Table;
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateStore::open_in_memory().unwrap();
+        let (table, log, target) = ("healed", "healed__changes", "db.healed");
+        let plan = base_plan(&dir, table);
+        loaded_leg(&state, target, "r-base", "keyset", 0);
+        loaded_leg(&state, target, "r-stream", "cdc", 7);
+        let buffered = || {
+            load::tests::fake_loader(0)
+                .with_kind(log, Table)
+                .with_rows(log, 5)
+        };
+        let healed = cdc_base_cycle(&dir, &state, &plan, "L1", buffered());
+        let again = cdc_base_cycle(
+            &dir,
+            &state,
+            &plan,
+            "L2",
+            buffered().with_kind(table, Table),
+        );
+        assert_eq!(
+            (healed.refusal, healed.writes, again.refusal, again.writes),
+            (None, vec!["materialize healed".to_string()], None, vec![]),
+            "(cycle-1 error, cycle-1 writes, cycle-2 error, cycle-2 writes)"
+        );
+    }
+
+    /// A missing base is NOT built empty when it may once have held rows, or when this
+    /// state cannot say: each case leaves the warehouse alone, so `rivet compact` keeps
+    /// refusing by name.
+    #[test]
+    fn a_missing_base_that_may_have_held_rows_is_never_built_empty() {
+        let merged = |state: &StateStore, target: &str| {
+            state
+                .store_load(&LoadRecord {
+                    load_id: "C0".into(),
+                    export_name: "orders".into(),
+                    target_table: target.into(),
+                    warehouse: "bigquery".into(),
+                    mode: "compact".into(),
+                    source_run_ids: Vec::new(),
+                    source_ident: String::new(),
+                    rows_loaded: 3,
+                    status: "success".into(),
+                    finished_at: "2026-08-22T00:00:00Z".into(),
+                })
+                .unwrap();
+        };
+        let cases = [
+            "merged before",
+            "two baselines",
+            "baseline had rows",
+            "no run record",
+            "view layout",
+        ];
+        let mut wrote = Vec::new();
+        for case in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let state = StateStore::open_in_memory().unwrap();
+            let table = format!("kept_{}", case.replace(' ', "_"));
+            let target = format!("db.{table}");
+            let mut plan = base_plan(&dir, &table);
+            match case {
+                "baseline had rows" => loaded_leg(&state, &target, "r-base", "keyset", 3),
+                "no run record" => loaded_leg(&state, &target, "r-base", "cdc", 0),
+                _ => loaded_leg(&state, &target, "r-base", "keyset", 0),
+            }
+            match case {
+                "merged before" => merged(&state, &target),
+                "two baselines" => loaded_leg(&state, &target, "r-base-2", "keyset", 0),
+                "view layout" => plan.layout = load::plan::CdcLayout::LogAndView,
+                _ => {}
+            }
+            let job = cdc_job(&dir, &state, &plan);
+            let writes = load::tests::fake_loader(0);
+            build_missing_base(&plan, job.state, &writes).unwrap();
+            wrote.push((case, writes.writes().borrow().clone()));
+        }
+        assert_eq!(wrote, cases.map(|c| (c, Vec::<String>::new())));
+    }
+
+    /// Only a baseline leg of a base-and-buffer stream, or a full load, is a whole-table pass.
+    #[test]
+    fn a_whole_table_pass_is_a_full_load_or_a_base_and_buffer_baseline_leg() {
+        use load::plan::{CdcLayout, LoadMode};
+        let dir = tempfile::tempdir().unwrap();
+        let run = |mode: &str| {
+            let mut m = super::live_only_decisions::success_manifest("r", "p.parquet");
+            m.mode = mode.into();
+            vec![("k".to_string(), m)]
+        };
+        let plan = |mode, layout| {
+            let mut p = cdc_plan(&dir, "t");
+            p.mode = mode;
+            p.layout = layout;
+            p
+        };
+        let cells = [
+            (LoadMode::Full, CdcLayout::LogAndView, "full", true),
+            (LoadMode::Cdc, CdcLayout::BaseAndBuffer, "full", true),
+            (LoadMode::Cdc, CdcLayout::BaseAndBuffer, "cdc", false),
+            (LoadMode::Cdc, CdcLayout::LogAndView, "full", false),
+            (
+                LoadMode::Incremental,
+                CdcLayout::BaseAndBuffer,
+                "incremental",
+                false,
+            ),
+        ];
+        for (mode, layout, leg, want) in cells {
+            assert_eq!(
+                holds_whole_table_pass(&plan(mode, layout), &run(leg)),
+                want,
+                "{mode:?} {layout:?} leg={leg}"
+            );
+        }
+    }
+
+    /// The note of a rebuilt base names the table, the cause and what merges the buffer.
+    #[test]
+    fn the_rebuild_note_names_the_table_the_cause_and_the_next_step() {
+        assert_eq!(
+            rebuild_note("p.d.t"),
+            "  note: `p.d.t` does not exist although its baseline was loaded: the baseline \
+             held no rows, and rivet 0.31 and older created no table for one. Creating it \
+             empty now; the changes buffered since are merged into it by `rivet compact`"
+        );
+    }
+
     /// One incremental cycle through the production closure, over `fake`.
     fn incremental_cycle(
         dir: &tempfile::TempDir,
@@ -3882,16 +4165,13 @@ mod live_only_decisions {
 
     #[test]
     fn an_empty_newest_run_empties_a_full_load_and_is_a_no_op_for_an_append() {
-        use load::plan::LoadMode;
         assert!(
-            !super::nothing_to_load(LoadMode::Full, true),
+            !super::nothing_to_load(true, true),
             "the table is now empty"
         );
-        assert!(super::nothing_to_load(LoadMode::Incremental, true));
-        assert!(super::nothing_to_load(LoadMode::Cdc, true));
-        assert!(!super::nothing_to_load(LoadMode::Cdc, false));
-        assert!(!super::nothing_to_load(LoadMode::Incremental, false));
-        assert!(!super::nothing_to_load(LoadMode::Full, false));
+        assert!(super::nothing_to_load(false, true));
+        assert!(!super::nothing_to_load(false, false));
+        assert!(!super::nothing_to_load(true, false));
     }
 
     #[test]
