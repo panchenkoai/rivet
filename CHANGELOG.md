@@ -367,6 +367,25 @@
     (`RIVET_STATE_CHUNK_RUN_SUPERSEDED`, exit 5) until `rivet state reset-chunks -c <config>
     --export <name>`; the next run starts a fresh pass. Both paths were run with the 0.31.0 binary
     first and this version second.
+- **Fixed: a `mode: chunked` export whose table fits in one chunk is refused as what it is
+  beside an unfinished checkpoint run.** Applies to PostgreSQL, MySQL, SQL Server and Oracle.
+  A `mode: chunked` export that sets none of `chunk_checkpoint`, `chunk_count`, `chunk_by_days`
+  and `chunk_by_key` runs as one pass while the source's row estimate is at most `chunk_size`.
+  - Before: beside an unfinished checkpoint run of that export, such a run was told `this export
+    now runs as `full`` and `restore the `chunked` settings`, which the config still had; a table
+    near `chunk_size` got that message or the checkpoint one as the estimate moved.
+  - Now it is told what any run of its mode without the checkpoint is told: `this export now
+    runs without the checkpoint that run was opened with`, with the remedies `restore the
+    checkpoint setting (`chunk_checkpoint: true`)` and `rivet state reset-chunks -c <config>
+    --export <name>`. Both were run on PostgreSQL, MySQL and SQL Server.
+  - Unchanged: the code (`RIVET_STATE_INTERRUPTED_RUN_OWNER_MISMATCH`), exit 5, nothing read or
+    written; what such an export runs as (one pass, `mode` `full` in `rivet plan`, the run
+    summary and `export_metrics`); the message a `mode: full` export gets.
+  - Also changed: beside an unfinished run of the other paging mode (a `chunk_by_key` run, then
+    `chunk_column` with no checkpoint on a small table) the message says `now runs as
+    `chunked``, where it said `full`.
+  - `rivet plan --format json` writes `"single_pass_of": "Chunked"` (or `"Keyset"`) in
+    `resolved_plan` for such an export; the field is not part of the plan's checksum.
 - **Fixed: an interrupted range-chunk run is resumed only by the source that opened it.** Two
   configs with one export name, one state database and different sources: when the first crashed
   after a chunk, the second resumed the first one's chunk windows over its own table (exit 0,

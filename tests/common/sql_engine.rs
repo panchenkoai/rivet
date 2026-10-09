@@ -257,6 +257,19 @@ impl SqlEngine {
         self.exec(&self.insert_sql(table, ids, minutes_ago, spent));
     }
 
+    /// Make the catalog's row estimate of `table` its real row count: the engine's statistics command (SQL Server counts rows without one).
+    pub fn refresh_row_estimate(self, table: &str) {
+        match self {
+            SqlEngine::Mysql => self.exec(&format!("ANALYZE TABLE {table}")),
+            SqlEngine::Pg => self.exec(&format!("ANALYZE {table}")),
+            SqlEngine::Mssql => {}
+            #[cfg(feature = "oracle")]
+            SqlEngine::Oracle => self.exec(&format!(
+                "BEGIN DBMS_STATS.GATHER_TABLE_STATS(USER, '{table}'); END;"
+            )),
+        }
+    }
+
     /// `rig` restaged to `mode` with `lines`, each key column spelled as this engine's catalog holds it (Oracle: upper case).
     pub fn staged(self, rig: Rig, mode: &str, lines: &[&str]) -> Rig {
         const KEYS: &[&str] = &[

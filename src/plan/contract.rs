@@ -130,6 +130,9 @@ pub struct ResolvedRunPlan {
     /// older versions still load and their integrity hash is unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partition_rollover: Option<crate::plan::rollover::PartitionRollover>,
+    /// The paging mode a `mode: chunked` export stands for while its table fits in one chunk and `strategy` is one pass; kept out of the artifact seal, so a rivet without the field applies the plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub single_pass_of: Option<PagedMode>,
     pub strategy: ExtractionStrategy,
     pub format: FormatType,
     pub compression: CompressionType,
@@ -232,6 +235,23 @@ impl IncrementalCursorPlan {
     }
 }
 
+/// A mode that pages a table: the two a `mode: chunked` export resolves to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PagedMode {
+    Chunked,
+    Keyset,
+}
+
+impl PagedMode {
+    /// The mode's label, as `ExtractionStrategy::mode_label` gives it.
+    pub fn label(self) -> &'static str {
+        match self {
+            PagedMode::Chunked => "chunked",
+            PagedMode::Keyset => "keyset",
+        }
+    }
+}
+
 /// Extraction strategy and all parameters needed to execute it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ExtractionStrategy {
@@ -263,7 +283,9 @@ impl ResolvedRunPlan {
                 self.query_template.as_deref().unwrap_or(&self.base_query),
             ),
             column: self.strategy.cursor_identity(),
-            mode: self.strategy.mode_label(),
+            mode: self
+                .single_pass_of
+                .map_or(self.strategy.mode_label(), PagedMode::label),
             continues_high_water: self.strategy.continues_stored_cursor(),
             resumable: self.strategy.is_resumable(),
         }
@@ -275,8 +297,8 @@ impl ExtractionStrategy {
         match self {
             ExtractionStrategy::Snapshot => "full",
             ExtractionStrategy::Incremental(_) => "incremental",
-            ExtractionStrategy::Chunked(_) => "chunked",
-            ExtractionStrategy::Keyset(_) => "keyset",
+            ExtractionStrategy::Chunked(_) => PagedMode::Chunked.label(),
+            ExtractionStrategy::Keyset(_) => PagedMode::Keyset.label(),
             ExtractionStrategy::TimeWindow { .. } => "timewindow",
         }
     }

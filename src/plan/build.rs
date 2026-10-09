@@ -8,7 +8,7 @@ use crate::error::Result;
 use crate::tuning::{SourceTuning, TuningProfile, merge_tuning_config};
 
 use super::contract::{
-    ChunkedPlan, ExtractionStrategy, IncrementalCursorPlan, KeysetPlan, ResolvedRunPlan,
+    ChunkedPlan, ExtractionStrategy, IncrementalCursorPlan, KeysetPlan, PagedMode, ResolvedRunPlan,
 };
 
 /// Build a [`ResolvedRunPlan`] from config and CLI flags.
@@ -157,6 +157,7 @@ pub(crate) fn build_plan_on(
         },
     };
 
+    let mut single_pass_of = None;
     let strategy = match export.mode {
         ExportMode::Full => full_strategy(config, export),
         ExportMode::Incremental => {
@@ -182,7 +183,11 @@ pub(crate) fn build_plan_on(
                 settle,
             })
         }
-        ExportMode::Chunked => resolve_chunked_strategy(probe, config, export, &tuning)?,
+        ExportMode::Chunked => {
+            let (strategy, stands_for) = resolve_chunked_strategy(probe, config, export, &tuning)?;
+            single_pass_of = stands_for;
+            strategy
+        }
         ExportMode::TimeWindow => {
             let column = export.time_column.clone().ok_or_else(|| {
                 anyhow::anyhow!(
@@ -211,6 +216,7 @@ pub(crate) fn build_plan_on(
         export_name: export.name.clone(),
         bytes_read: Default::default(),
         parts_landed: Default::default(),
+        single_pass_of,
         partition_rollover: partition_rollover_of(config, export),
         // The LABEL, where the two differ. `plan.source_table` has exactly one
         // consumer — the manifest's recorded identity in `finalize` — and the two
@@ -440,7 +446,7 @@ fn resolve_chunked_strategy(
     config: &Config,
     export: &ExportConfig,
     tuning: &SourceTuning,
-) -> Result<ExtractionStrategy> {
+) -> Result<(ExtractionStrategy, Option<PagedMode>)> {
     // chunk_count / chunk_by_days mutual-exclusion is shared
     // between the introspected and non-introspected paths.
     if let Some(count) = export.chunk_count {
@@ -501,11 +507,14 @@ fn resolve_chunked_strategy(
                 export.chunk_column.as_deref().unwrap_or("")
             );
         }
-        return Ok(chunked_plan(
-            export,
-            export.chunk_column.clone().unwrap(),
-            export.chunk_size,
-            max_attempts,
+        return Ok((
+            chunked_plan(
+                export,
+                export.chunk_column.clone().unwrap(),
+                export.chunk_size,
+                max_attempts,
+            ),
+            None,
         ));
     }
 
@@ -567,11 +576,14 @@ fn resolve_chunked_strategy(
                 export.name,
                 export.chunk_column.as_deref().unwrap_or("")
             );
-            return Ok(chunked_plan(
-                export,
-                export.chunk_column.clone().unwrap(),
-                export.chunk_size,
-                max_attempts,
+            return Ok((
+                chunked_plan(
+                    export,
+                    export.chunk_column.clone().unwrap(),
+                    export.chunk_size,
+                    max_attempts,
+                ),
+                None,
             ));
         }
         Err(e) => {
@@ -684,13 +696,64 @@ fn keyset_key_types(source_type: crate::config::SourceType) -> &'static str {
     }
 }
 
+/// What a `mode: chunked` export with no `chunk_by_key` pages by.
+enum ImplicitKey<'a> {
+    /// The configured `chunk_column`.
+    Column(&'a str),
+    /// The table's single-integer primary key.
+    IntPk(&'a str),
+    /// A single-column unique key, seek-paged: MySQL only (ADR-0020).
+    UniqueKey(&'a str),
+}
+
+impl ImplicitKey<'_> {
+    /// The mode that pages by this key.
+    fn mode(&self) -> PagedMode {
+        match self {
+            ImplicitKey::Column(_) | ImplicitKey::IntPk(_) => PagedMode::Chunked,
+            ImplicitKey::UniqueKey(_) => PagedMode::Keyset,
+        }
+    }
+}
+
+/// The key `export` pages by when it sets no `chunk_by_key`, or `None` when the table offers no safe one.
+fn implicit_key<'a>(
+    source_type: crate::config::SourceType,
+    export: &'a ExportConfig,
+    introspection: &'a crate::source::TableIntrospection,
+) -> Option<ImplicitKey<'a>> {
+    if let Some(column) = export.chunk_column.as_deref() {
+        return Some(ImplicitKey::Column(column));
+    }
+    if let Some(pk) = introspection.single_int_pk.as_deref() {
+        return Some(ImplicitKey::IntPk(pk));
+    }
+    // MySQL has no server-side cursor, so a non-int-PK table has no
+    // safe range-chunk shape. If a single-column unique key exists,
+    // page it with keyset instead of refusing (OPT-4). PG keeps
+    // refusing — its `DECLARE CURSOR` snapshot is already bounded, so
+    // `mode: full` is the safe answer there.
+    //
+    // ADR-0020 (Layer 1, deferred) deliberately keeps this
+    // MySQL-only: flipping the guard is a behaviour-changing default
+    // for every existing PG/MSSQL UUID-PK config, and is to be
+    // promoted "after a real operator request, not on the strength
+    // of 'we technically can'." The escape hatch is explicit
+    // `chunk_by_key:` (which works since Layer 2). Do not flip
+    // without re-opening ADR-0020.
+    (source_type == crate::config::SourceType::Mysql)
+        .then(|| introspection.auto_keyset_key())
+        .flatten()
+        .map(ImplicitKey::UniqueKey)
+}
+
 fn chunked_strategy_from_introspection(
     source_type: crate::config::SourceType,
     export: &ExportConfig,
     tbl: &str,
     max_attempts: u32,
     introspection: &crate::source::TableIntrospection,
-) -> Result<ExtractionStrategy> {
+) -> Result<(ExtractionStrategy, Option<PagedMode>)> {
     // (1) Resolve chunk_size — explicit overrides the budget; otherwise compute
     // from the memory budget and the planner's row-width estimate. Shared by the
     // range-chunked and keyset paths.
@@ -763,7 +826,8 @@ fn chunked_strategy_from_introspection(
             introspection.row_estimate,
             chunk_size,
         );
-        return Ok(ExtractionStrategy::Snapshot);
+        let stands_for = implicit_key(source_type, export, introspection).map(|k| k.mode());
+        return Ok((ExtractionStrategy::Snapshot, stands_for));
     }
 
     // (3) Explicit keyset key (OPT-4): page by a single index-backed unique key.
@@ -794,108 +858,96 @@ fn chunked_strategy_from_introspection(
         );
         refuse_mysql_uuid_keyset_key(source_type, export, key)?;
         let (checkpoint, incremental) = keyset_recovery(export);
-        return Ok(ExtractionStrategy::Keyset(KeysetPlan {
-            key_column: key.to_string(),
-            chunk_size,
-            checkpoint,
-            incremental,
-            // `parallel: N` fans N ROW-percentile-range keyset workers (feat/
-            // parallel-keyset). The runner samples the boundaries at run open and
-            // seeks each disjoint `(lo, hi]` range concurrently; recovery flags come
-            // from `keyset_recovery`, the same as sequential.
-            parallel: export.parallel,
-        }));
+        return Ok((
+            ExtractionStrategy::Keyset(KeysetPlan {
+                key_column: key.to_string(),
+                chunk_size,
+                checkpoint,
+                incremental,
+                // `parallel: N` fans N ROW-percentile-range keyset workers (feat/
+                // parallel-keyset). The runner samples the boundaries at run open and
+                // seeks each disjoint `(lo, hi]` range concurrently; recovery flags come
+                // from `keyset_recovery`, the same as sequential.
+                parallel: export.parallel,
+            }),
+            None,
+        ));
     }
 
     // (4) Resolve chunk_column for range chunking, with an auto-keyset fallback
     // on MySQL when there is no single-integer PK but a usable unique key exists.
-    let column = if let Some(c) = export.chunk_column.clone() {
-        // #103 (variant 1): an explicit chunk_column that is integer-`BETWEEN`-
-        // sliced must be integer-family, or range chunking silently drops rows
-        // between windows. `chunk_by_days` (date half-open) is type-safe and took the
-        // fast path above (never reaches here).
-        let range_sliced = export.chunk_by_days.is_none();
-        if range_sliced && !introspection.is_integer_column(&c) {
-            anyhow::bail!(
-                "export '{}': chunk_column '{}' on {} is not an integer-family column — range \
-                 chunking derives integer min/max boundaries and slices with `BETWEEN`, so a \
-                 numeric/decimal/float/text key silently drops every value between two window \
-                 boundaries. Use `chunk_by_key: {}` (keyset — any orderable indexed key), an \
-                 integer column, or `mode: full`.",
-                export.name,
-                c,
-                tbl,
-                c
-            );
-        }
-        c
-    } else {
-        match introspection.single_int_pk.clone() {
-            Some(col) => {
-                // `info!` was below the default `warn` log level — operators
-                // never saw which column the planner had picked, so a config
-                // that intended `mode: chunked` + `chunk_column: created_at`
-                // but typo'd the column name silently fell back to PK with
-                // no signal. Elevate to `warn!` so the implicit choice is
-                // visible in every run; tell the operator how to silence it.
-                log::warn!(
-                    "export '{}': chunk_column not set — auto-resolved to '{}' \
-                     from the single-integer primary key on {}. \
-                     Set `chunk_column:` explicitly to pin the choice and silence this warning.",
-                    export.name,
-                    col,
-                    tbl
-                );
-                col
-            }
-            None => {
-                // MySQL has no server-side cursor, so a non-int-PK table has no
-                // safe range-chunk shape. If a single-column unique key exists,
-                // page it with keyset instead of refusing (OPT-4). PG keeps
-                // refusing — its `DECLARE CURSOR` snapshot is already bounded, so
-                // `mode: full` is the safe answer there.
-                //
-                // ADR-0020 (Layer 1, deferred) deliberately keeps this
-                // MySQL-only: flipping the guard is a behaviour-changing default
-                // for every existing PG/MSSQL UUID-PK config, and is to be
-                // promoted "after a real operator request, not on the strength
-                // of 'we technically can'." The escape hatch is explicit
-                // `chunk_by_key:` (which works since Layer 2). Do not flip
-                // without re-opening ADR-0020.
-                if source_type == crate::config::SourceType::Mysql
-                    && let Some(key) = introspection.auto_keyset_key()
-                {
-                    log::warn!(
-                        "export '{}': {} has no single-integer PK — auto-selected keyset \
-                         (seek) pagination on unique key '{}'. Set `chunk_by_key:` explicitly \
-                         to pin the choice and silence this warning.",
-                        export.name,
-                        tbl,
-                        key
-                    );
-                    refuse_mysql_uuid_keyset_key(source_type, export, key)?;
-                    let (checkpoint, incremental) = keyset_recovery(export);
-                    return Ok(ExtractionStrategy::Keyset(KeysetPlan {
-                        key_column: key.to_string(),
-                        chunk_size,
-                        checkpoint,
-                        incremental,
-                        parallel: export.parallel,
-                    }));
-                }
+    let column = match implicit_key(source_type, export, introspection) {
+        Some(ImplicitKey::Column(c)) => {
+            // #103 (variant 1): an explicit chunk_column that is integer-`BETWEEN`-
+            // sliced must be integer-family, or range chunking silently drops rows
+            // between windows. `chunk_by_days` (date half-open) is type-safe and took the
+            // fast path above (never reaches here).
+            let range_sliced = export.chunk_by_days.is_none();
+            if range_sliced && !introspection.is_integer_column(c) {
                 anyhow::bail!(
-                    "export '{}': chunked mode found no safe shape on {} — no single-integer PK \
-                     to range-chunk and no single-column UNIQUE/PRIMARY key to keyset-page. \
-                     Set `chunk_column:` (integer) or `chunk_by_key:` (unique key) explicitly, \
-                     add a unique index, or use `mode: full` to accept one long snapshot query.",
+                    "export '{}': chunk_column '{}' on {} is not an integer-family column — range \
+                     chunking derives integer min/max boundaries and slices with `BETWEEN`, so a \
+                     numeric/decimal/float/text key silently drops every value between two window \
+                     boundaries. Use `chunk_by_key: {}` (keyset — any orderable indexed key), an \
+                     integer column, or `mode: full`.",
                     export.name,
-                    tbl
+                    c,
+                    tbl,
+                    c
                 );
             }
+            c.to_string()
         }
+        Some(ImplicitKey::IntPk(col)) => {
+            // `info!` was below the default `warn` log level — operators
+            // never saw which column the planner had picked, so a config
+            // that intended `mode: chunked` + `chunk_column: created_at`
+            // but typo'd the column name silently fell back to PK with
+            // no signal. Elevate to `warn!` so the implicit choice is
+            // visible in every run; tell the operator how to silence it.
+            log::warn!(
+                "export '{}': chunk_column not set — auto-resolved to '{}' \
+                 from the single-integer primary key on {}. \
+                 Set `chunk_column:` explicitly to pin the choice and silence this warning.",
+                export.name,
+                col,
+                tbl
+            );
+            col.to_string()
+        }
+        Some(ImplicitKey::UniqueKey(key)) => {
+            log::warn!(
+                "export '{}': {} has no single-integer PK — auto-selected keyset \
+                 (seek) pagination on unique key '{}'. Set `chunk_by_key:` explicitly \
+                 to pin the choice and silence this warning.",
+                export.name,
+                tbl,
+                key
+            );
+            refuse_mysql_uuid_keyset_key(source_type, export, key)?;
+            let (checkpoint, incremental) = keyset_recovery(export);
+            return Ok((
+                ExtractionStrategy::Keyset(KeysetPlan {
+                    key_column: key.to_string(),
+                    chunk_size,
+                    checkpoint,
+                    incremental,
+                    parallel: export.parallel,
+                }),
+                None,
+            ));
+        }
+        None => anyhow::bail!(
+            "export '{}': chunked mode found no safe shape on {} — no single-integer PK \
+             to range-chunk and no single-column UNIQUE/PRIMARY key to keyset-page. \
+             Set `chunk_column:` (integer) or `chunk_by_key:` (unique key) explicitly, \
+             add a unique index, or use `mode: full` to accept one long snapshot query.",
+            export.name,
+            tbl
+        ),
     };
 
-    Ok(chunked_plan(export, column, chunk_size, max_attempts))
+    Ok((chunked_plan(export, column, chunk_size, max_attempts), None))
 }
 
 /// A range-chunked strategy on `column` carrying the export's own chunk knobs.
@@ -1724,7 +1776,7 @@ mod tests {
         assert!(
             matches!(
                 chunked_strategy_from_introspection(SourceType::Postgres, &good, "public.t", 3, &i),
-                Ok(ExtractionStrategy::Chunked(_))
+                Ok((ExtractionStrategy::Chunked(_), None))
             ),
             "an integer chunk_column must still resolve"
         );
@@ -1898,7 +1950,7 @@ mod tests {
         assert!(
             matches!(
                 chunked_strategy_from_introspection(SourceType::Postgres, &e, "t", 3, &i),
-                Ok(ExtractionStrategy::Keyset(_))
+                Ok((ExtractionStrategy::Keyset(_), None))
             ),
             "PostgreSQL casts the literal to uuid, so its keyset stays"
         );
@@ -1930,6 +1982,7 @@ mod tests {
         let resolve =
             |source_type, export: &ExportConfig, i: &crate::source::TableIntrospection| {
                 chunked_strategy_from_introspection(source_type, export, "public.t", 3, i)
+                    .map(|(strategy, _)| strategy)
             };
         let base = || {
             let mut e = chunked_export();
@@ -2002,6 +2055,117 @@ mod tests {
     }
 
     #[test]
+    fn a_small_table_single_pass_stands_for_the_mode_the_table_would_page_in() {
+        use crate::config::SourceType;
+        let planned =
+            |source_type, export: &ExportConfig, i: &crate::source::TableIntrospection| {
+                chunked_strategy_from_introspection(source_type, export, "public.t", 3, i).unwrap()
+            };
+        let small = |pk: Option<&str>, unique: &[&str]| intro(pk, unique, 3, Some(100), &["id"]);
+        let column = chunked_export();
+        let mut auto = chunked_export();
+        auto.chunk_column = None;
+        for (source_type, export, table, stands_for) in [
+            (
+                SourceType::Postgres,
+                &column,
+                small(None, &[]),
+                Some(PagedMode::Chunked),
+            ),
+            (
+                SourceType::Mysql,
+                &auto,
+                small(Some("id"), &["uid"]),
+                Some(PagedMode::Chunked),
+            ),
+            (
+                SourceType::Mysql,
+                &auto,
+                small(None, &["uid"]),
+                Some(PagedMode::Keyset),
+            ),
+            (SourceType::Postgres, &auto, small(None, &["uid"]), None),
+        ] {
+            let (strategy, got) = planned(source_type, export, &table);
+            assert!(
+                matches!(strategy, ExtractionStrategy::Snapshot),
+                "{strategy:?}"
+            );
+            assert_eq!(got, stands_for, "{source_type:?}");
+        }
+
+        let large = intro(Some("id"), &["id"], 1_000_000, Some(100), &["id"]);
+        assert!(matches!(
+            planned(SourceType::Postgres, &column, &large),
+            (ExtractionStrategy::Chunked(_), None)
+        ));
+        let large_keyed = intro(None, &["uid"], 1_000_000, Some(100), &[]);
+        assert!(matches!(
+            planned(SourceType::Mysql, &auto, &large_keyed),
+            (ExtractionStrategy::Keyset(_), None)
+        ));
+    }
+
+    /// What a run of `plan` is told beside the unfinished range-chunk run `run_c` of its export.
+    fn refused_beside_a_chunk_run(plan: &ResolvedRunPlan) -> String {
+        let state = crate::state::StateStore::open_in_memory().unwrap();
+        let opened_by =
+            crate::state::ProgressKey::chunked(&plan.export_name, &plan.source.state_key());
+        state
+            .open_chunk_run(&opened_by, "run_c", "h", 3, &[(1, 10)])
+            .unwrap();
+        let refused = state.claim(plan.progress_key()).err().expect("refused");
+        assert_eq!(
+            crate::error::error_code(&refused),
+            Some("RIVET_STATE_INTERRUPTED_RUN_OWNER_MISMATCH")
+        );
+        refused.to_string()
+    }
+
+    #[test]
+    fn a_single_pass_of_a_chunked_export_is_refused_as_a_chunked_run_without_its_checkpoint() {
+        let full = build_plan(
+            &minimal_config(),
+            &minimal_export(),
+            Path::new("."),
+            false,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(full.strategy.mode_label(), "full");
+        let said = refused_beside_a_chunk_run(&full);
+        for want in [
+            "this export now runs as `full`",
+            "restore the `chunked` settings",
+        ] {
+            assert!(said.contains(want), "`mode: full`: {want} in {said}");
+        }
+
+        let mut single_pass = full.clone();
+        single_pass.single_pass_of = Some(PagedMode::Chunked);
+        assert_eq!(single_pass.strategy.mode_label(), "full");
+        let said = refused_beside_a_chunk_run(&single_pass);
+        let abandon = format!(
+            "`rivet state reset-chunks -c <config> --export {}` abandons it",
+            full.export_name
+        );
+        for want in [
+            "run run_c of mode `chunked` is unfinished",
+            "runs without the checkpoint that run was opened with",
+            "restore the checkpoint setting (`chunk_checkpoint: true`)",
+            abandon.as_str(),
+        ] {
+            assert!(said.contains(want), "{want} in {said}");
+        }
+
+        single_pass.single_pass_of = Some(PagedMode::Keyset);
+        let said = refused_beside_a_chunk_run(&single_pass);
+        assert!(said.contains("this export now runs as `keyset`"), "{said}");
+    }
+
+    #[test]
     fn keyset_checkpoint_and_incremental_are_independent_plan_flags() {
         // The crash-recovery ⇄ incremental split: `chunk_checkpoint` sets ONLY
         // KeysetPlan.checkpoint (safe crash-recovery); the append-only
@@ -2011,6 +2175,7 @@ mod tests {
         use crate::config::SourceType;
         let resolve = |export: &ExportConfig, i: &crate::source::TableIntrospection| {
             chunked_strategy_from_introspection(SourceType::Postgres, export, "public.t", 3, i)
+                .map(|(strategy, _)| strategy)
         };
         let i = intro(Some("id"), &["uid"], 1_000_000, Some(100), &["id"]);
 

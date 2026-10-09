@@ -1,0 +1,14 @@
+diff --git a/src/plan/contract.rs b/src/plan/contract.rs
+--- a/src/plan/contract.rs
++++ b/src/plan/contract.rs
+@@ -283,9 +283,7 @@
+                 self.query_template.as_deref().unwrap_or(&self.base_query),
+             ),
+             column: self.strategy.cursor_identity(),
+-            mode: self
+-                .single_pass_of
+-                .map_or(self.strategy.mode_label(), PagedMode::label),
++            mode: self.strategy.mode_label(),
+             continues_high_water: self.strategy.continues_stored_cursor(),
+             resumable: self.strategy.is_resumable(),
+         }

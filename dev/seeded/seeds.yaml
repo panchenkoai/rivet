@@ -341,6 +341,34 @@ seeds:
         cells:
           - "lib:an_interrupted_run_is_refused_for_its_own_mode_without_the_checkpoint_until_finished_or_abandoned"
 
+  - name: single-pass-of-a-chunked-export-owned-by-full
+    class: "a chunked-mode export that runs as one pass because its table fits in one chunk names `full` as the mode that owns its progress, so beside an unfinished checkpoint run of its own mode it is refused as another mode and told to restore settings it still has"
+    history: "2026-10-09 - main CI run 37862517574 - MySQL's row estimate of a 10-row table read at most chunk_size 4 once, and the run without `chunk_checkpoint` was told `this export now runs as full ... restore the chunked settings`; 12 of 12 with a 3-row table (PostgreSQL, MySQL, SQL Server)"
+    scope: source
+    patch: single-pass-of-a-chunked-export-owned-by-full/shared.patch
+    engines:
+      postgres:
+        cells:
+          - crashed_one_chunk_range_run_then_checkpoint_removed_finish_the_run_postgres
+          - crashed_one_chunk_range_run_then_checkpoint_removed_reset_postgres
+      mysql:
+        cells:
+          - crashed_one_chunk_range_run_then_checkpoint_removed_finish_the_run_mysql
+          - crashed_one_chunk_range_run_then_checkpoint_removed_reset_mysql
+      mssql:
+        cells:
+          - crashed_one_chunk_range_run_then_checkpoint_removed_finish_the_run_mssql
+          - crashed_one_chunk_range_run_then_checkpoint_removed_reset_mssql
+      oracle:
+        cells:
+          - crashed_one_chunk_range_run_then_checkpoint_removed_finish_the_run_oracle
+          - crashed_one_chunk_range_run_then_checkpoint_removed_reset_oracle
+      mongo:
+        na: "a Mongo export has no `mode: chunked`, so no plan of it is a single pass that stands for a paging mode"
+      lib:
+        cells:
+          - "lib:a_single_pass_of_a_chunked_export_is_refused_as_a_chunked_run_without_its_checkpoint"
+
   - name: chunk-run-resumed-by-another-source
     class: an interrupted range-chunk run is looked up by export name alone and resumed by a same-named export of another source
     history: "2026-10-06 - config A crashed after chunk 0, same-named config B of another database ran: exit 0, 'resuming it', 1000 of 5000 rows (v0.31.0)"

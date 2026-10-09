@@ -696,6 +696,7 @@ mod tests {
             split_window: None,
             bytes_read: Default::default(),
             parts_landed: Default::default(),
+            single_pass_of: None,
             export_name: export_name.into(),
             partition_rollover: None,
             source_table: None,

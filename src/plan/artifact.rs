@@ -552,9 +552,15 @@ impl PlanArtifact {
 /// On the (practically impossible) event that the plan fails to serialize, the
 /// checksum degrades to a sentinel that will never match a real one — apply then
 /// rejects the artifact rather than silently skipping the check.
+///
+/// `single_pass_of` is left out of the digest: a rivet without the field drops it on
+/// read, and the plan it re-serializes must still match the seal.
 fn resolved_plan_integrity(plan: &ResolvedRunPlan) -> String {
     use xxhash_rust::xxh3::xxh3_64;
     let encoded = serde_json::to_value(plan).and_then(|mut v| {
+        if let Some(fields) = v.as_object_mut() {
+            fields.remove("single_pass_of");
+        }
         canonicalize_value(&mut v);
         serde_json::to_vec(&v)
     });
@@ -733,6 +739,7 @@ mod tests {
             split_window: None,
             bytes_read: Default::default(),
             parts_landed: Default::default(),
+            single_pass_of: None,
             export_name: "orders".into(),
             partition_rollover: None,
             source_table: None,
@@ -1060,6 +1067,37 @@ mod tests {
         restored
             .verify_integrity()
             .expect("round-tripped artifact must still verify");
+    }
+
+    #[test]
+    fn a_single_pass_plan_verifies_under_a_rivet_that_drops_the_field() {
+        use crate::plan::contract::PagedMode;
+        let mut plan = minimal_plan();
+        plan.single_pass_of = Some(PagedMode::Chunked);
+        let mut artifact = minimal_artifact();
+        artifact.resolved_plan = plan;
+        artifact.integrity = resolved_plan_integrity(&artifact.resolved_plan);
+        let mut json: serde_json::Value =
+            serde_json::from_str(&artifact.to_json_pretty().unwrap()).unwrap();
+
+        let sealed = PlanArtifact::from_json(&json.to_string()).unwrap();
+        assert_eq!(
+            sealed.resolved_plan.single_pass_of,
+            Some(PagedMode::Chunked),
+            "the plan file carries the field to `rivet apply`"
+        );
+        sealed.verify_integrity().expect("as sealed");
+
+        let dropped = json["resolved_plan"]
+            .as_object_mut()
+            .unwrap()
+            .remove("single_pass_of");
+        assert_eq!(dropped, Some(serde_json::json!("Chunked")));
+        let older = PlanArtifact::from_json(&json.to_string()).unwrap();
+        assert_eq!(older.resolved_plan.single_pass_of, None);
+        older
+            .verify_integrity()
+            .expect("the plan as a rivet without the field re-serializes it");
     }
 
     #[test]

@@ -287,6 +287,26 @@ scenarios:
     oracle:   { test: crashed_range_chunk_then_checkpoint_removed_reset_oracle }
     mongo:    { na: "a Mongo export has no range chunking (mode: full or cdc only)" }
 
+  # The same two cells over a 3-row table with its row estimate refreshed (chunk_size 4): the planner runs
+  # the uncheckpointed stage as one pass (`export_metrics.mode = full`, asserted), and the refusal must still
+  # be the checkpoint one, whatever the estimate says.
+
+  - id: crashed_one_chunk_range_run_then_checkpoint_removed_finish_the_run
+    what: "MT10 — crashed range-chunk checkpoint run over a table that fits in one chunk, then the same mode without `chunk_checkpoint` (planned as a single pass): refused twice with the checkpoint wording; the checkpoint restored finishes the run; the single pass then delivers the source as it is, and the checkpoint back on starts a fresh run"
+    postgres: { test: crashed_one_chunk_range_run_then_checkpoint_removed_finish_the_run_postgres }
+    mysql:    { test: crashed_one_chunk_range_run_then_checkpoint_removed_finish_the_run_mysql }
+    mssql:    { test: crashed_one_chunk_range_run_then_checkpoint_removed_finish_the_run_mssql }
+    oracle:   { test: crashed_one_chunk_range_run_then_checkpoint_removed_finish_the_run_oracle }
+    mongo:    { na: "a Mongo export has no range chunking (mode: full or cdc only)" }
+
+  - id: crashed_one_chunk_range_run_then_checkpoint_removed_reset
+    what: "MT10 — crashed range-chunk checkpoint run over a table that fits in one chunk, then the same mode without `chunk_checkpoint` (planned as a single pass): refused twice with the checkpoint wording; `rivet state reset-chunks` abandons the run; the single pass then delivers the source as it is, and the checkpoint back on starts a fresh run"
+    postgres: { test: crashed_one_chunk_range_run_then_checkpoint_removed_reset_postgres }
+    mysql:    { test: crashed_one_chunk_range_run_then_checkpoint_removed_reset_mysql }
+    mssql:    { test: crashed_one_chunk_range_run_then_checkpoint_removed_reset_mssql }
+    oracle:   { test: crashed_one_chunk_range_run_then_checkpoint_removed_reset_oracle }
+    mongo:    { na: "a Mongo export has no range chunking (mode: full or cdc only)" }
+
   - id: crashed_keyset_then_checkpoint_removed_finish_the_run
     what: "MT10 — crashed keyset checkpoint run, then the same mode without `chunk_checkpoint` (Mongo: without `resume`): refused twice; the checkpoint restored finishes the run; the uncheckpointed run then delivers the source as it is, and the checkpoint back on starts a fresh run"
     postgres: { test: crashed_keyset_then_checkpoint_removed_finish_the_run_postgres }
