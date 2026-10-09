@@ -532,6 +532,45 @@ pub(super) fn take_table_lease<'a>(
     }
 }
 
+/// Whether the table's lease is still this process's; a stateless load holds none to lose.
+pub(super) fn holds(lease: &Option<crate::state::LoadLease<'_>>) -> bool {
+    lease.as_ref().is_none_or(crate::state::LoadLease::is_held)
+}
+
+/// What a load or compact says when its table lease stopped being its own.
+fn lease_lost_message(target_fqtn: &str, written: bool) -> String {
+    let lost = format!(
+        "the lease on `{target_fqtn}` is no longer this process's: it was not renewed within \
+         its TTL (the process stalled, the state database was out of reach, or the lease \
+         keeper stopped), so another `rivet load` or `rivet compact` may be writing the table"
+    );
+    match written {
+        false => format!(
+            "{lost}. This run wrote nothing to the warehouse and recorded nothing as loaded; \
+             wait for the other process, then run again."
+        ),
+        true => format!(
+            "{lost} at the same time as this run did. This run's warehouse write is done and \
+             is recorded as failed, not as a success: check `{target_fqtn}`, then run again."
+        ),
+    }
+}
+
+/// Stop once the table's lease is not `held`: a refusal before the warehouse write, a failure once it is `written`.
+pub(super) fn lease_still_held(held: bool, target_fqtn: &str, written: bool) -> Result<()> {
+    if held {
+        return Ok(());
+    }
+    let lost = Err(anyhow::Error::new(crate::error::CodedError::new(
+        crate::error::codes::STATE_LEASE_LOST,
+        lease_lost_message(target_fqtn, written),
+    )));
+    match written {
+        false => load::before_write(lost),
+        true => lost,
+    }
+}
+
 /// The resolved dedup key for an append mode (`cdc` / `incremental`); bails with a
 /// config-fix hint when neither the config nor the recorded source key gives one.
 pub(super) fn require_pk<'a>(plan: &'a load::plan::LoadPlan, mode: &str) -> Result<&'a [String]> {
@@ -1140,7 +1179,7 @@ fn execute_load<R>(
     let target_fqtn = loader.fqtn(&job.plan.table);
     // One load per table at a time: two concurrent loads both read the ledger
     // before either writes it and append the same runs twice.
-    let _lease = take_table_lease(job.state, &target_fqtn)?;
+    let lease = take_table_lease(job.state, &target_fqtn)?;
     build_missing_base(job.plan, job.state, &**loader)?;
     let mut ctx = LoadCtx {
         state: job.state,
@@ -1211,8 +1250,11 @@ fn execute_load<R>(
         // It is replaced, never accumulated: the closing row shares this
         // `load_id`, so the ledger still holds exactly one audit row per load and
         // a `writing` row can only survive a process that died.
+        lease_still_held(holds(&lease), &target_fqtn, false)?;
         load::before_write(ctx.record_writing())?;
-        run(&**loader, store, &inputs, &mut legs)
+        let landed = run(&**loader, store, &inputs, &mut legs)?;
+        lease_still_held(holds(&lease), &target_fqtn, true)?;
+        Ok(landed)
     }) {
         Ok(v) => v,
         Err(e) => {
@@ -5358,6 +5400,53 @@ mod load_message_tests {
         assert!(m.contains("`p.d.orders`"), "{m}");
         assert!(m.contains("another `rivet load`"), "{m}");
         assert!(m.contains("Wait for it, then retry."), "{m}");
+    }
+
+    /// A held lease lets the load go on, and a stateless load has none to lose.
+    #[test]
+    fn a_held_lease_and_a_stateless_load_go_on() {
+        assert!(lease_still_held(true, "p.d.orders", false).is_ok());
+        assert!(lease_still_held(true, "p.d.orders", true).is_ok());
+        assert!(holds(&None));
+        let state = crate::state::StateStore::open_in_memory().unwrap();
+        let key = format!("p.d.held_{}", std::process::id());
+        assert!(holds(&take_table_lease(Some(&state), &key).unwrap()));
+    }
+
+    /// A lease lost before the warehouse write is a coded refusal the ledger records as `refused`.
+    #[test]
+    fn a_lease_lost_before_the_write_is_a_refusal() {
+        let e = lease_still_held(false, "p.d.orders", false).unwrap_err();
+        assert!(e.is::<load::Refused>());
+        assert_eq!(crate::error::error_code(&e), Some("RIVET_STATE_LEASE_LOST"));
+        assert_eq!(crate::error::classify_exit(&e), 5);
+        assert_eq!(ledger_status(&e), "refused");
+        assert_eq!(
+            e.to_string(),
+            "the lease on `p.d.orders` is no longer this process's: it was not renewed within \
+             its TTL (the process stalled, the state database was out of reach, or the lease \
+             keeper stopped), so another `rivet load` or `rivet compact` may be writing the \
+             table. This run wrote nothing to the warehouse and recorded nothing as loaded; \
+             wait for the other process, then run again."
+        );
+    }
+
+    /// A lease lost during the warehouse write fails the load, and the ledger keeps the write as rivet's own.
+    #[test]
+    fn a_lease_lost_during_the_write_is_a_failure() {
+        let e = lease_still_held(false, "p.d.orders", true).unwrap_err();
+        assert!(!e.is::<load::Refused>());
+        assert_eq!(crate::error::error_code(&e), Some("RIVET_STATE_LEASE_LOST"));
+        assert_eq!(crate::error::classify_exit(&e), 5);
+        assert_eq!(ledger_status(&e), "failed");
+        assert_eq!(
+            e.to_string(),
+            "the lease on `p.d.orders` is no longer this process's: it was not renewed within \
+             its TTL (the process stalled, the state database was out of reach, or the lease \
+             keeper stopped), so another `rivet load` or `rivet compact` may be writing the \
+             table at the same time as this run did. This run's warehouse write is done and \
+             is recorded as failed, not as a success: check `p.d.orders`, then run again."
+        );
     }
 
     /// Both incremental outcomes say what landed where: a whole table names the

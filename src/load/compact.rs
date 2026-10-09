@@ -4,8 +4,8 @@ use crate::error::Result;
 use crate::load;
 use crate::load::ledger::{ledger_load_id, ledger_status, ownership_of};
 use crate::load::orchestrate::{
-    failures_of, hand_off_state, needs_source_engine, no_outcome_error, open_state, reconnect,
-    require_pk, resolve_run_id, take_table_lease,
+    failures_of, hand_off_state, holds, lease_still_held, needs_source_engine, no_outcome_error,
+    open_state, reconnect, require_pk, resolve_run_id, take_table_lease,
 };
 use crate::load::pin::pin_plan_to_its_run;
 use crate::load::{ObjectKind, Ownership};
@@ -265,7 +265,7 @@ pub fn run_compacts(args: CompactArgs) -> Result<()> {
                 let pinned = pin_plan_to_its_run(plan, state.as_ref(), &cfg, "compact")?;
                 let loader = load::build_loader(&pinned, &run_id);
                 let target_fqtn = loader.fqtn(&pinned.table);
-                let _lease = take_table_lease(state.as_ref(), &target_fqtn)?;
+                let lease = take_table_lease(state.as_ref(), &target_fqtn)?;
                 // The export's OWN mode, not a hardcoded label. Compact runs on
                 // `incremental` exports too — `compact_skip_reason` says so in as many
                 // words — and telling the operator of a `mode: incremental` config that
@@ -290,7 +290,9 @@ pub fn run_compacts(args: CompactArgs) -> Result<()> {
                 // the protection.
                 let report = match compact_preflight(loader.as_ref(), &pinned.table, state.as_ref())
                     .and_then(|()| load::before_write(compact_order_of(&pinned, engine)))
-                {
+                    .and_then(|order| {
+                        lease_still_held(holds(&lease), &target_fqtn, false).map(|()| order)
+                    }) {
                     Err(e) => Err(e),
                     // Past the wrap: from here a failure may genuinely have written,
                     // so it must stay a `failed` row — that is what tells the next
@@ -307,7 +309,11 @@ pub fn run_compacts(args: CompactArgs) -> Result<()> {
                         if load::plan::base_carries_delete_flag(true, pinned.deleted_flag) {
                             specs.push(load::cdc::flag_spec(loader.warehouse()));
                         }
-                        loader.compact(&pinned.table, &specs, pk, order)
+                        loader
+                            .compact(&pinned.table, &specs, pk, order)
+                            .and_then(|merged| {
+                                lease_still_held(holds(&lease), &target_fqtn, true).map(|()| merged)
+                            })
                     }
                 };
                 if let Some(s) = state.as_ref() {

@@ -568,6 +568,16 @@ pub mod codes {
         "RIVET_SOURCE_OVERRIDE_WIRE_MISMATCH",
         "remove or correct the column's `columns:` override (batch: or CAST the column to that type in the export's `query:`; CDC: then re-snapshot the table)",
     );
+    /// A PostgreSQL-state lease was not granted: the connection that renews this process's leases could not be opened.
+    pub const STATE_LEASE_KEEPER_UNAVAILABLE: Code = environment(
+        "RIVET_STATE_LEASE_KEEPER_UNAVAILABLE",
+        "free a connection on the state database (rivet holds one per worker plus one for the lease keeper), raise the open-file limit, or lower `--pool`, then run again; nothing ran under the lease",
+    );
+    /// A PostgreSQL-state lease stopped being this process's while the work it guards was under way.
+    pub const STATE_LEASE_LOST: Code = refusal(
+        "RIVET_STATE_LEASE_LOST",
+        "wait for the other `rivet load` or `rivet compact` of that table to end, then run again; if the message says the warehouse was already written, the runs it names are loaded again by that run",
+    );
     /// `rivet plan` could not read the source it plans over (no connection, a refused login, a missing table or collection).
     pub const PLAN_SOURCE_UNREADABLE: Code = environment(
         "RIVET_PLAN_SOURCE_UNREADABLE",
@@ -670,6 +680,8 @@ pub mod codes {
         STATE_KEYSET_SEQUENTIAL_ANCHOR_UNFINISHED,
         STATE_RUN_IN_PROGRESS,
         STATE_CHUNK_CHECKPOINT_GONE,
+        STATE_LEASE_KEEPER_UNAVAILABLE,
+        STATE_LEASE_LOST,
         PLAN_SOURCE_UNREADABLE,
         SOURCE_COLLECTION_NOT_FOUND,
         DEST_CONTAINER_NOT_FOUND,

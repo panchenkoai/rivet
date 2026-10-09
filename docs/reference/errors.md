@@ -56,6 +56,8 @@ Every failure rivet names carries a stable `RIVET_<FAMILY>_<NAME>` code: in `--j
 | `RIVET_STATE_KEYSET_SEQUENTIAL_ANCHOR_UNFINISHED` | refusal | 5 | re-run once with `parallel: 1` to finish the interrupted run, then raise `parallel:` |
 | `RIVET_STATE_RUN_IN_PROGRESS` | refusal | 5 | wait for the run to finish, or stop its process, then repeat the command |
 | `RIVET_STATE_CHUNK_CHECKPOINT_GONE` | refusal | 5 | run the export again: it starts a new chunk run (the parts the lost run wrote stay in the destination, in no manifest) |
+| `RIVET_STATE_LEASE_KEEPER_UNAVAILABLE` | environment | 2 if transient, else 1 | free a connection on the state database (rivet holds one per worker plus one for the lease keeper), raise the open-file limit, or lower `--pool`, then run again; nothing ran under the lease |
+| `RIVET_STATE_LEASE_LOST` | refusal | 5 | wait for the other `rivet load` or `rivet compact` of that table to end, then run again; if the message says the warehouse was already written, the runs it names are loaded again by that run |
 | `RIVET_PLAN_SOURCE_UNREADABLE` | environment | 2 if transient, else 1 | fix what the message names (the connection, the credentials, or the table the export reads), then run `rivet plan` again |
 | `RIVET_SOURCE_COLLECTION_NOT_FOUND` | environment | 2 if transient, else 1 | correct the export's `table:` (a dotted collection name is written whole), or create the collection |
 | `RIVET_DEST_CONTAINER_NOT_FOUND` | environment | 2 if transient, else 1 | create the bucket or container, or correct `destination.bucket` |

@@ -2,6 +2,43 @@
 
 ## Unreleased
 
+- **Fix (behaviour change): on a PostgreSQL state, `rivet load` and `rivet compact` stop
+  instead of writing a table under a lease nothing renews.** Applies only with
+  `RIVET_STATE_URL=postgresql://...`; a SQLite state takes its lease as a file lock and is
+  unchanged. No state table, config key or TTL changed, and 0.31.0 and this release
+  exclude each other on the same lease rows.
+  - **What could happen in 0.31.0 and earlier.** Every lease (one per table being loaded
+    or compacted, one more per table with `cleanup_source`, one per checkpointed export
+    run) was renewed by a thread of its own on a connection of its own, opened after the
+    lease was granted. When that connection could not be opened the load went on, printed
+    `LOAD OK` and exited 0; the lease lapsed after `RIVET_STATE_LEASE_TTL_S` (30 s by
+    default), and a second `rivet load` or `rivet compact` of the same table could then
+    run beside the first. It took three conditions together: a PostgreSQL state; the
+    renewing connection failing to open (the process short of file descriptors, where the
+    PostgreSQL client crashed its thread, or the state server out of connections for the
+    role); and a load of that table still running after the TTL while another one started.
+    A lease another process had taken after a stall was logged and not acted on.
+  - **Now** one connection and one thread per process renew every lease the process
+    holds, and they are started before the first lease is granted.
+    - If that connection cannot be opened, the table is not loaded: the command fails with
+      `RIVET_STATE_LEASE_KEEPER_UNAVAILABLE`, having written nothing to the warehouse and
+      nothing to the load ledger, on every run until a connection is free. Free a
+      connection on the state database, raise the open-file limit, or lower `--pool`.
+    - A load or compact whose lease is no longer its own (not renewed within the TTL, or
+      taken by another process) stops before the warehouse write with exit 5
+      `RIVET_STATE_LEASE_LOST`, recorded `refused` in the load ledger; the next
+      `rivet load` loads the table. When the loss is found only after the write, the
+      command fails with the same code and the ledger row is `failed`, not `success`, so
+      the next `rivet load` loads the same runs again.
+    - A checkpointed `rivet run` takes its run lease through the same connection and is
+      refused with `RIVET_STATE_LEASE_KEEPER_UNAVAILABLE` when it cannot be opened. A
+      PostgreSQL state that cannot be reached for want of file descriptors is an `Error:`
+      line and exit 1, where 0.31.0 crashed with exit 101.
+  - **Connections.** A pooled load or compact holds one state connection per worker plus
+    one, so `--pool 16` is at most 17 connections to the PostgreSQL state where 0.31.0
+    held 32 (48 with `cleanup_source`). Count N + 1 against the role's and the server's
+    connection limits.
+
 - **Fix: a PostgreSQL export through a transaction-mode pgBouncer that keeps prepared
   statements is delivered under its own columns.** Applies to every batch mode (`full`,
   `chunked` by key or by range, `incremental`) when the source URL points at pgBouncer in

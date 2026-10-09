@@ -90,8 +90,19 @@ pub(super) fn pg_sql(sql: &str) -> String {
 /// TLS-aware.
 pub(super) fn connect_pg(url: &str) -> Result<postgres::Client> {
     let tls = crate::source::url_tls(url).1;
-    crate::source::postgres::connect_client(url, tls.as_ref())
+    let connect = || crate::source::postgres::connect_client(url, tls.as_ref());
+    // The client panics where it cannot build its runtime (no file descriptor left).
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(connect))
+        .unwrap_or_else(|panic| Err(anyhow::anyhow!(client_panic_message(&*panic))))
         .map_err(|e| anyhow::anyhow!("state(pg): connect to '{}': {:#}", redact_pg_url(url), e))
+}
+
+/// The connect error a panic of the PostgreSQL client becomes.
+fn client_panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    format!(
+        "the PostgreSQL client could not start: {}",
+        crate::workers::panic_text(payload)
+    )
 }
 
 // ─── Backend connection ────────────────────────────────────────────────────────
@@ -572,6 +583,19 @@ mod empty_state_path_guard {
         assert!(
             StateStore::open(cfg.to_str().unwrap()).is_ok(),
             "a real config path must still open"
+        );
+    }
+}
+
+#[cfg(test)]
+mod client_panic_tests {
+    /// A client panic becomes a connect error that keeps the panic's own words.
+    #[test]
+    fn a_client_panic_reads_as_a_connect_error() {
+        let panic = std::panic::catch_unwind(|| panic!("Too many open files")).unwrap_err();
+        assert_eq!(
+            super::client_panic_message(&*panic),
+            "the PostgreSQL client could not start: Too many open files"
         );
     }
 }
