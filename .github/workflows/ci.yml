@@ -1256,6 +1256,10 @@ jobs:
         run: |
           python3 dev/pytools/self_oracle_lint.py --self-test
           python3 dev/pytools/self_oracle_lint.py
+      - name: Every connection the Python harness opens is held by a `with`
+        run: |
+          python3 dev/pytools/connection_lint.py --self-test
+          python3 dev/pytools/connection_lint.py
       - name: Fault catalog and nightly comparison self-tests
         run: |
           python3 dev/pytools/fault_catalog.py --self-test

@@ -235,7 +235,8 @@ def http_up(url: str, *, timeout: float = 3.0) -> bool:
     import urllib.request
 
     try:
-        urllib.request.urlopen(url, timeout=timeout).read(0)
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            r.read(0)
         return True
     except urllib.error.HTTPError:
         return True

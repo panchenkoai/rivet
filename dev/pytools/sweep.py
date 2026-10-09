@@ -472,8 +472,8 @@ def test_cruft(bigquery: bool = False) -> int:
     """
     print("sweep-test-cruft: dropping objects `<prefix>_<pid>_<n>` whose pid is gone")
     arms = {"postgres": _pg_cruft, "mysql": _my_cruft, "mssql": _ms_cruft}
-    for source, spec in registry.load()["sources"].items():
-        container = spec["container"]
+    for source in registry.load()["sources"]:
+        container = registry.source(source)["container"]
         if not _container_up(container):
             print(f"  {source}: not up — skipped")
             continue

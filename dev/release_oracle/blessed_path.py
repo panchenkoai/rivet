@@ -73,6 +73,7 @@ scored PASS. A stage that could not run is not a stage that succeeded.
 
 from __future__ import annotations
 
+from contextlib import closing
 import json
 import os
 import shutil
@@ -284,15 +285,15 @@ def _state_counts(db: Path) -> dict[str, int]:
             s_path = db.with_name(db.name + side)
             if s_path.is_file():
                 shutil.copy2(s_path, tmp.with_name(tmp.name + side))
-        con = sqlite3.connect(str(tmp))
-        tables = [
-            r[0]
-            for r in con.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' "
-                "AND name NOT LIKE 'sqlite_%'"
-            )
-        ]
-        return {t: con.execute(f"SELECT count(*) FROM {t}").fetchone()[0] for t in tables}
+        with closing(sqlite3.connect(str(tmp))) as con:
+            tables = [
+                r[0]
+                for r in con.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' "
+                    "AND name NOT LIKE 'sqlite_%'"
+                )
+            ]
+            return {t: con.execute(f"SELECT count(*) FROM {t}").fetchone()[0] for t in tables}
     except sqlite3.Error as e:
         # NOT the same as absent, and the difference decides whether the cell is
         # a product finding or a harness one. Signalled distinctly so the report

@@ -131,7 +131,8 @@ def start_stores(led: Ledger) -> None:
         method="POST",
     )
     try:
-        urllib.request.urlopen(req, timeout=5).read()
+        with urllib.request.urlopen(req, timeout=5) as r:
+            r.read()
     except (urllib.error.HTTPError, urllib.error.URLError, OSError):
         pass  # already exists, or the emulator is down — the summary below says which
 

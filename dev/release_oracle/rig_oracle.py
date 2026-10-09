@@ -46,6 +46,7 @@ checkpoint is not graded.
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 import datetime as dt
 import itertools
 import json
@@ -1446,13 +1447,13 @@ def grade_load(spec: dict) -> dict:
         kw.update(bigquery=True, bq_project=str(load.get("project") or ""), bq_dataset=str(load.get("dataset") or ""))
     notes: list[str] = []
     partial: list[str] = []
-    try:
-        ora = Oracle(config=config, **kw, **_attach(spec))
-    except Exception as e:  # noqa: BLE001 — an absent warehouse credential is a named skip, never a pass
-        if target == "bigquery" and any(k in str(e).lower() for k in ("credential", "permission", "unauthenticated", "default credentials")):
-            return {"skip": f"BigQuery unreachable ({str(e)[:160]}): set BIGQUERY_TEST_PROJECT, RIVET_TEST_GCS_BUCKET and gcloud ADC"}
-        raise
-    with ora:
+    with ExitStack() as held:
+        try:
+            ora = held.enter_context(Oracle(config=config, **kw, **_attach(spec)))
+        except Exception as e:  # noqa: BLE001 — an absent warehouse credential is a named skip, never a pass
+            if target == "bigquery" and any(k in str(e).lower() for k in ("credential", "permission", "unauthenticated", "default credentials")):
+                return {"skip": f"BigQuery unreachable ({str(e)[:160]}): set BIGQUERY_TEST_PROJECT, RIVET_TEST_GCS_BUCKET and gcloud ADC"}
+            raise
         ora.db.sql("SET TimeZone = 'UTC'")
         mine = load_run_filter(spec)
         loaded = ora.rows(
@@ -1818,36 +1819,42 @@ class _Mem:
         """The first cell of `sql`."""
         return self.rows(sql)[0][0]
 
+    def __enter__(self) -> "_Mem":
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self.db.close()
+
 
 def _stdout_self_test() -> None:
     """A stdout run's ledger is the success row it recorded since it began: an older row, a failed one, a wrong count or a second row is a finding."""
-    ora = _Mem()
-    ora.db.sql("ATTACH ':memory:' AS st")
-    ora.db.sql("CREATE TABLE st.export_metrics (export_name VARCHAR, run_at VARCHAR, total_rows BIGINT, status VARCHAR)")
-    ora.db.sql("INSERT INTO st.export_metrics VALUES ('e', '2026-10-07T01:00:00.5+00:00', 50, 'success'), "
-               "('e', '2026-10-07T02:00:00.123456+00:00', 7, 'failed'), ('other', '2026-10-07T02:00:00+00:00', 50, 'success')")
-    spec = {"state": "state.db", "export": "e", "since": "2026-10-07T01:00:00Z"}
-    assert stdout_ledger(ora, spec, 50) == [], stdout_ledger(ora, spec, 50)
-    assert stdout_ledger(ora, {**spec, "state": None}, 3) == [], "no state DB is the caller's PARTIAL, not a finding here"
-    assert "total_rows [50]" in stdout_ledger(ora, spec, 49)[0] and "holds 49 row(s)" in stdout_ledger(ora, spec, 49)[0]
-    assert "total_rows []" in stdout_ledger(ora, {**spec, "since": "2026-10-07T01:00:01Z"}, 50)[0], "a row from before this run is not its ledger"
-    ora.db.sql("INSERT INTO st.export_metrics VALUES ('e', '2026-10-07T03:00:00+00:00', 50, 'success')")
-    assert "total_rows [50, 50]" in stdout_ledger(ora, spec, 50)[0], "one run records one success row"
+    with _Mem() as ora:
+        ora.db.sql("ATTACH ':memory:' AS st")
+        ora.db.sql("CREATE TABLE st.export_metrics (export_name VARCHAR, run_at VARCHAR, total_rows BIGINT, status VARCHAR)")
+        ora.db.sql("INSERT INTO st.export_metrics VALUES ('e', '2026-10-07T01:00:00.5+00:00', 50, 'success'), "
+                   "('e', '2026-10-07T02:00:00.123456+00:00', 7, 'failed'), ('other', '2026-10-07T02:00:00+00:00', 50, 'success')")
+        spec = {"state": "state.db", "export": "e", "since": "2026-10-07T01:00:00Z"}
+        assert stdout_ledger(ora, spec, 50) == [], stdout_ledger(ora, spec, 50)
+        assert stdout_ledger(ora, {**spec, "state": None}, 3) == [], "no state DB is the caller's PARTIAL, not a finding here"
+        assert "total_rows [50]" in stdout_ledger(ora, spec, 49)[0] and "holds 49 row(s)" in stdout_ledger(ora, spec, 49)[0]
+        assert "total_rows []" in stdout_ledger(ora, {**spec, "since": "2026-10-07T01:00:01Z"}, 50)[0], "a row from before this run is not its ledger"
+        ora.db.sql("INSERT INTO st.export_metrics VALUES ('e', '2026-10-07T03:00:00+00:00', 50, 'success')")
+        assert "total_rows [50, 50]" in stdout_ledger(ora, spec, 50)[0], "one run records one success row"
 
 
 def _ndjson_self_test() -> None:
     """A `rivet cdc` NDJSON line reads back by the source's column names: a delete's key from its before image, its position as text."""
     import tempfile
 
-    ora = _Mem()
-    ora.db.sql("CREATE TABLE source_rows (id BIGINT, v VARCHAR)")
-    path = os.path.join(tempfile.mkdtemp(prefix="rig-ndjson-"), "e.jsonl")
-    with open(path, "w") as f:
-        f.write('{"op":"insert","table":"t","before":null,"after":[1,"a"],"pos":{"lsn":"0/10"},"seq":0}\n'
-                '{"op":"delete","table":"t","before":[2,null],"after":null,"pos":{"lsn":"0/20"},"seq":1}\n')
-    got = ora.rows(f"SELECT id, v, __op, json_extract_string(__pos, '$.lsn'), __seq FROM {_ndjson(ora, [path], 'postgres')} ORDER BY __seq")
-    assert got == [("1", "a", "insert", "0/10", 0), ("2", None, "delete", "0/20", 1)], got
-    assert [c for c, _ in _columns(ora, _ndjson(ora, [path], "mongo"))][:2] == ["_id", "document"]
+    with _Mem() as ora:
+        ora.db.sql("CREATE TABLE source_rows (id BIGINT, v VARCHAR)")
+        path = os.path.join(tempfile.mkdtemp(prefix="rig-ndjson-"), "e.jsonl")
+        with open(path, "w") as f:
+            f.write('{"op":"insert","table":"t","before":null,"after":[1,"a"],"pos":{"lsn":"0/10"},"seq":0}\n'
+                    '{"op":"delete","table":"t","before":[2,null],"after":null,"pos":{"lsn":"0/20"},"seq":1}\n')
+        got = ora.rows(f"SELECT id, v, __op, json_extract_string(__pos, '$.lsn'), __seq FROM {_ndjson(ora, [path], 'postgres')} ORDER BY __seq")
+        assert got == [("1", "a", "insert", "0/10", 0), ("2", None, "delete", "0/20", 1)], got
+        assert [c for c, _ in _columns(ora, _ndjson(ora, [path], "mongo"))][:2] == ["_id", "document"]
 
 
 def _compare_self_test() -> None:
@@ -1855,11 +1862,11 @@ def _compare_self_test() -> None:
     import tempfile
 
     def diff(src: str, dst: str, **kw) -> tuple[int, int]:
-        ora = _Mem()
-        ora.db.sql(f"CREATE TABLE a AS {src}")
-        ora.db.sql(f"CREATE TABLE b AS {dst}")
-        f = compare(ora, "a", "b", **kw)
-        return f["only_src"], f["only_dst"]
+        with _Mem() as ora:
+            ora.db.sql(f"CREATE TABLE a AS {src}")
+            ora.db.sql(f"CREATE TABLE b AS {dst}")
+            f = compare(ora, "a", "b", **kw)
+            return f["only_src"], f["only_dst"]
 
     j = "SELECT 1 AS id, {!r}::VARCHAR AS j"
     assert diff(j.format('{"x": 3.141592653589793238462}'), j.format('{"x":3.141592653589793}')) == (1, 1), \
@@ -1883,40 +1890,40 @@ def _compare_self_test() -> None:
     assert diff(flags.format(1, 0, 5), flags.format(1, 7, 1), defects={"b": ["5"]}) != (0, 0), \
         "without a key, a delivered value no sample explains is still a difference"
 
-    ora = _Mem()
-    ora.db.sql("CREATE TABLE s AS SELECT '1' AS \"ID\", '7' AS k")
-    ora.db.sql("CREATE TABLE w AS SELECT 1::DECIMAL(38,9) AS \"ID\", '7' AS k UNION ALL SELECT 2, '7'")
-    held = f"SELECT count(*) FROM w WHERE EXISTS (SELECT 1 FROM s WHERE {key_match(ora, 's', 's', 'w', 'w', ['ID', 'k'])})"
-    assert ora.scalar(held) == 1, "a NUMBER key read from BigQuery as DECIMAL(38,9) is the source's key, by value"
-    ora = _Mem()
-    ora.db.sql("CREATE TABLE t AS SELECT * FROM (VALUES (1, 'a'), (2, 'b'), (3, 'c')) v(id, v)")
-    with tempfile.TemporaryDirectory() as d:
-        img = os.path.join(d, "anchor.parquet")
-        write_image(ora, "t", img)
-        assert image_state(img) == "image" and image_state(os.path.join(d, "none.parquet")) is None
-        assert changes_between(ora, None, img, ["id"]) is None, "a first run with no earlier image owes nothing knowable"
-        rec = os.path.join(d, "cursor.json")
-        a, b = os.path.join(d, "a"), os.path.join(d, "b")
-        for out, high in ((a, "40"), (b, "50")):
-            os.makedirs(out)
-            with open(os.path.join(out, "m.json"), "w") as fh:
-                json.dump({"source": {"extraction": {"cursor_column": "id", "cursor_low": "999", "cursor_high": high}}}, fh)
-        spec = {"cursor_record": rec, "out_dir": a}
-        record, low = delta_window(spec, a, ["m.json"])
-        assert low is None, "a stream's first destination owes every row, whatever cursor_low rivet wrote"
-        save_delta_window(spec, record, ["m.json"])
-        assert delta_window({**spec, "out_dir": b}, b, ["m.json"])[1] == "40", "a later destination starts where the stream's last graded run ended"
-        assert delta_window(spec, a, ["m.json"])[1] is None, "a destination keeps the bound it was first graded with"
-        owed = changes_between(ora, None, img, ["id"], first_owes_all=True)
-        assert sorted(r[0] for r in ora.rows(f"SELECT id FROM {owed}")) == ["1", "2", "3"], "an engine anchored server-side owes all"
-        ora.db.sql("UPDATE t SET v = 'B' WHERE id = 2; INSERT INTO t VALUES (4, 'd'); DELETE FROM t WHERE id = 3")
-        got = sorted(r[0] for r in ora.rows(f"SELECT id FROM {changed_keys(ora, img, 't', ['id'])}"))
-        assert got == ["2", "4"], f"rows changed since the anchor are the inserted and updated ones, got {got}"
-        ora.db.sql("ALTER TABLE t ADD COLUMN w INTEGER")
-        got = sorted(r[0] for r in ora.rows(f"SELECT id FROM {changed_keys(ora, img, 't', ['id'])}"))
-        assert got == ["2", "4"], f"an added column alone changes no row, got {got}"
-        assert sorted(r[0] for r in ora.rows(f"SELECT id FROM {changed_keys(ora, None, 't', ['id'])}")) == ["1", "2", "4"], \
-            "with no table at the anchor every row is new"
+    with _Mem() as ora:
+        ora.db.sql("CREATE TABLE s AS SELECT '1' AS \"ID\", '7' AS k")
+        ora.db.sql("CREATE TABLE w AS SELECT 1::DECIMAL(38,9) AS \"ID\", '7' AS k UNION ALL SELECT 2, '7'")
+        held = f"SELECT count(*) FROM w WHERE EXISTS (SELECT 1 FROM s WHERE {key_match(ora, 's', 's', 'w', 'w', ['ID', 'k'])})"
+        assert ora.scalar(held) == 1, "a NUMBER key read from BigQuery as DECIMAL(38,9) is the source's key, by value"
+    with _Mem() as ora:
+        ora.db.sql("CREATE TABLE t AS SELECT * FROM (VALUES (1, 'a'), (2, 'b'), (3, 'c')) v(id, v)")
+        with tempfile.TemporaryDirectory() as d:
+            img = os.path.join(d, "anchor.parquet")
+            write_image(ora, "t", img)
+            assert image_state(img) == "image" and image_state(os.path.join(d, "none.parquet")) is None
+            assert changes_between(ora, None, img, ["id"]) is None, "a first run with no earlier image owes nothing knowable"
+            rec = os.path.join(d, "cursor.json")
+            a, b = os.path.join(d, "a"), os.path.join(d, "b")
+            for out, high in ((a, "40"), (b, "50")):
+                os.makedirs(out)
+                with open(os.path.join(out, "m.json"), "w") as fh:
+                    json.dump({"source": {"extraction": {"cursor_column": "id", "cursor_low": "999", "cursor_high": high}}}, fh)
+            spec = {"cursor_record": rec, "out_dir": a}
+            record, low = delta_window(spec, a, ["m.json"])
+            assert low is None, "a stream's first destination owes every row, whatever cursor_low rivet wrote"
+            save_delta_window(spec, record, ["m.json"])
+            assert delta_window({**spec, "out_dir": b}, b, ["m.json"])[1] == "40", "a later destination starts where the stream's last graded run ended"
+            assert delta_window(spec, a, ["m.json"])[1] is None, "a destination keeps the bound it was first graded with"
+            owed = changes_between(ora, None, img, ["id"], first_owes_all=True)
+            assert sorted(r[0] for r in ora.rows(f"SELECT id FROM {owed}")) == ["1", "2", "3"], "an engine anchored server-side owes all"
+            ora.db.sql("UPDATE t SET v = 'B' WHERE id = 2; INSERT INTO t VALUES (4, 'd'); DELETE FROM t WHERE id = 3")
+            got = sorted(r[0] for r in ora.rows(f"SELECT id FROM {changed_keys(ora, img, 't', ['id'])}"))
+            assert got == ["2", "4"], f"rows changed since the anchor are the inserted and updated ones, got {got}"
+            ora.db.sql("ALTER TABLE t ADD COLUMN w INTEGER")
+            got = sorted(r[0] for r in ora.rows(f"SELECT id FROM {changed_keys(ora, img, 't', ['id'])}"))
+            assert got == ["2", "4"], f"an added column alone changes no row, got {got}"
+            assert sorted(r[0] for r in ora.rows(f"SELECT id FROM {changed_keys(ora, None, 't', ['id'])}")) == ["1", "2", "4"], \
+                "with no table at the anchor every row is new"
 
 
 def _anchor_self_test() -> None:
@@ -1946,7 +1953,8 @@ def _anchor_self_test() -> None:
     with tempfile.TemporaryDirectory() as d:
         p = os.path.join(d, "k.parquet")
         write_keys([("1",), ("2",)], ["id"], p)
-        assert _Mem().rows(f"SELECT id FROM read_parquet({_lit(p)}) ORDER BY id") == [("1",), ("2",)]
+        with _Mem() as ora:
+            assert ora.rows(f"SELECT id FROM read_parquet({_lit(p)}) ORDER BY id") == [("1",), ("2",)]
 
 
 def _layout_self_test() -> None:
@@ -1960,33 +1968,33 @@ def _layout_self_test() -> None:
     assert not absent(Exception('Conversion Error: Could not convert string "NaN" to DECIMAL(18,2)')), "a read error is an oracle error, never absence"
     assert "format(''%s'', \"n\")" in _pg_projection("t", {"n": "NUMERIC(18,2)"}, {}), "a bounded NUMERIC is read as text: NaN has no DECIMAL"
     with tempfile.TemporaryDirectory() as d:
-        ora = _Mem()
-        ora.db.sql("CREATE TABLE src AS SELECT * FROM (VALUES (1, true, '\\x0A\\xFF'::BLOB, '', NULL::VARCHAR, 1.50::DECIMAL(10,2), 'a,\"b'), "
-                   "(2, false, ''::BLOB, 'x', 'y', 2.00, 'z')) v(id, b, bin, e, n, m, q)")
-        csv = os.path.join(d, "p.csv")
-        with open(csv, "w") as fh:
-            fh.write('id,b,bin,e,n,m,q\n1,true,0aff,"",,1.50,"a,""b"\n2,false,"",x,y,2.00,z\n')
-        ora.db.sql(f"CREATE TABLE got AS SELECT * FROM {_parts(ora, [csv], 'csv')}")
-        src = f"(SELECT {csv_text(_columns(ora, 'src'))} FROM src)"
-        f = compare(ora, src, "got", numbers=frozenset({"m"}), verbatim=frozenset({"e", "n", "q"}))
-        assert (f["only_src"], f["only_dst"], f["missing"]) == (0, 0, []), f"rivet's documented CSV text is the source: {f}"
-        with open(csv, "w") as fh:
-            fh.write('id,b,bin,e,n,m\n1,true,0aff,,,1.50\n2,false,"",x,y,2.00\n')
-        ora.db.sql(f"CREATE OR REPLACE TABLE got AS SELECT * FROM {_parts(ora, [csv], 'csv')}")
-        f = compare(ora, src, "got", numbers=frozenset({"m"}), verbatim=frozenset({"e", "n", "q"}))
-        assert f["missing"] == ["q"] and f["only_src"] == 1, f"a dropped column and an empty string written as NULL are differences: {f}"
+        with _Mem() as ora:
+            ora.db.sql("CREATE TABLE src AS SELECT * FROM (VALUES (1, true, '\\x0A\\xFF'::BLOB, '', NULL::VARCHAR, 1.50::DECIMAL(10,2), 'a,\"b'), "
+                       "(2, false, ''::BLOB, 'x', 'y', 2.00, 'z')) v(id, b, bin, e, n, m, q)")
+            csv = os.path.join(d, "p.csv")
+            with open(csv, "w") as fh:
+                fh.write('id,b,bin,e,n,m,q\n1,true,0aff,"",,1.50,"a,""b"\n2,false,"",x,y,2.00,z\n')
+            ora.db.sql(f"CREATE TABLE got AS SELECT * FROM {_parts(ora, [csv], 'csv')}")
+            src = f"(SELECT {csv_text(_columns(ora, 'src'))} FROM src)"
+            f = compare(ora, src, "got", numbers=frozenset({"m"}), verbatim=frozenset({"e", "n", "q"}))
+            assert (f["only_src"], f["only_dst"], f["missing"]) == (0, 0, []), f"rivet's documented CSV text is the source: {f}"
+            with open(csv, "w") as fh:
+                fh.write('id,b,bin,e,n,m\n1,true,0aff,,,1.50\n2,false,"",x,y,2.00\n')
+            ora.db.sql(f"CREATE OR REPLACE TABLE got AS SELECT * FROM {_parts(ora, [csv], 'csv')}")
+            f = compare(ora, src, "got", numbers=frozenset({"m"}), verbatim=frozenset({"e", "n", "q"}))
+            assert f["missing"] == ["q"] and f["only_src"] == 1, f"a dropped column and an empty string written as NULL are differences: {f}"
 
-        for day, v in (("2024-01-01", "2024-01-01 10:00:00"), ("2024-01-02", "2024-01-03 00:00:00"), (HIVE_NULL, None)):
-            os.makedirs(os.path.join(d, f"c={day}", "exp"))
-            pq.write_table(pa.table({"c": pa.array([v], pa.string())}), os.path.join(d, f"c={day}", "exp", "part.parquet"))
-            with open(os.path.join(d, f"c={day}", "exp", "manifest-r.json"), "w") as fh:
-                json.dump({"status": "success", "run_id": "r", "parts": [{"path": "part.parquet"}]}, fh)
-        names = [f"c={day}/exp/manifest-r.json" for day in ("2024-01-01", "2024-01-02", HIVE_NULL)]
-        parts = declared_parts(d, names)
-        assert len(parts) == 3, f"a manifest in a sub-prefix declares parts beside itself: {parts}"
-        assert misfiled(ora, parts, "c") == ["PARTITION: 1 row(s) sit under a `c=` directory whose label does not match their value"], \
-            "a row under the wrong day's directory is a finding; the NULL bucket holding NULL is not"
-        assert stream_parts({"dirs": [os.path.join(d, "c=2024-01-01", "exp")]}, ["r"]) and not stream_parts({"dirs": [d]}, ["r"])
+            for day, v in (("2024-01-01", "2024-01-01 10:00:00"), ("2024-01-02", "2024-01-03 00:00:00"), (HIVE_NULL, None)):
+                os.makedirs(os.path.join(d, f"c={day}", "exp"))
+                pq.write_table(pa.table({"c": pa.array([v], pa.string())}), os.path.join(d, f"c={day}", "exp", "part.parquet"))
+                with open(os.path.join(d, f"c={day}", "exp", "manifest-r.json"), "w") as fh:
+                    json.dump({"status": "success", "run_id": "r", "parts": [{"path": "part.parquet"}]}, fh)
+            names = [f"c={day}/exp/manifest-r.json" for day in ("2024-01-01", "2024-01-02", HIVE_NULL)]
+            parts = declared_parts(d, names)
+            assert len(parts) == 3, f"a manifest in a sub-prefix declares parts beside itself: {parts}"
+            assert misfiled(ora, parts, "c") == ["PARTITION: 1 row(s) sit under a `c=` directory whose label does not match their value"], \
+                "a row under the wrong day's directory is a finding; the NULL bucket holding NULL is not"
+            assert stream_parts({"dirs": [os.path.join(d, "c=2024-01-01", "exp")]}, ["r"]) and not stream_parts({"dirs": [d]}, ["r"])
 
 
 def _ns_self_test() -> None:

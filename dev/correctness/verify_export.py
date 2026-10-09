@@ -78,44 +78,44 @@ def main():
     args = ap.parse_args()
 
     glob = args.parquet if "*" in args.parquet else args.parquet.rstrip("/") + "/*.parquet"
-    con = duckdb.connect()
-    ext = "postgres" if args.source_type == "postgres" else "mysql"
-    try:
-        con.execute(f"INSTALL {ext}; LOAD {ext};")
-        con.execute(f"ATTACH '{args.dsn}' AS src (TYPE {ext}, READ_ONLY);")
-    except Exception as e:  # noqa: BLE001
-        sys.exit(f"verify_export: could not attach source ({ext}): {e}")
+    with duckdb.connect() as con:
+        ext = "postgres" if args.source_type == "postgres" else "mysql"
+        try:
+            con.execute(f"INSTALL {ext}; LOAD {ext};")
+            con.execute(f"ATTACH '{args.dsn}' AS src (TYPE {ext}, READ_ONLY);")
+        except Exception as e:  # noqa: BLE001
+            sys.exit(f"verify_export: could not attach source ({ext}): {e}")
 
-    src_q = args.query.replace("'", "''")
-    scan = f"postgres_query('src', '{src_q}')" if ext == "postgres" else f"mysql_query('src', '{src_q}')"
+        src_q = args.query.replace("'", "''")
+        scan = f"postgres_query('src', '{src_q}')" if ext == "postgres" else f"mysql_query('src', '{src_q}')"
 
-    try:
-        schema = con.execute(f"DESCRIBE SELECT * FROM {scan}").fetchall()
-        schema = [(r[0], r[1]) for r in schema]
-    except Exception as e:  # noqa: BLE001
-        sys.exit(f"verify_export: could not read source query schema: {e}")
+        try:
+            schema = con.execute(f"DESCRIBE SELECT * FROM {scan}").fetchall()
+            schema = [(r[0], r[1]) for r in schema]
+        except Exception as e:  # noqa: BLE001
+            sys.exit(f"verify_export: could not read source query schema: {e}")
 
-    exprs = fingerprint_exprs(schema, args.key)
-    try:
-        src = run_fp(con, exprs, scan)
-        dst = run_fp(con, exprs, f"read_parquet('{glob}')")
-    except Exception as e:  # noqa: BLE001
-        sys.exit(f"verify_export: fingerprint failed: {e}")
+        exprs = fingerprint_exprs(schema, args.key)
+        try:
+            src = run_fp(con, exprs, scan)
+            dst = run_fp(con, exprs, f"read_parquet('{glob}')")
+        except Exception as e:  # noqa: BLE001
+            sys.exit(f"verify_export: fingerprint failed: {e}")
 
-    diffs = [(a, src[a], dst[a]) for a, _ in exprs if src[a] != dst[a]]
-    width = max(len(a) for a, _ in exprs)
-    print(f"{'field'.ljust(width)}  {'source':>20}  {'export':>20}")
-    for a, _ in exprs:
-        mark = "  ✗" if src[a] != dst[a] else ""
-        print(f"{a.ljust(width)}  {str(src[a]):>20}  {str(dst[a]):>20}{mark}")
+        diffs = [(a, src[a], dst[a]) for a, _ in exprs if src[a] != dst[a]]
+        width = max(len(a) for a, _ in exprs)
+        print(f"{'field'.ljust(width)}  {'source':>20}  {'export':>20}")
+        for a, _ in exprs:
+            mark = "  ✗" if src[a] != dst[a] else ""
+            print(f"{a.ljust(width)}  {str(src[a]):>20}  {str(dst[a]):>20}{mark}")
 
-    if diffs:
-        print(f"\nFAIL: {len(diffs)} fingerprint field(s) differ — the export is NOT a faithful "
-              f"copy of the source. rivet lost, duplicated, or corrupted data.", file=sys.stderr)
-        sys.exit(1)
-    print(f"\nPASS: source and export agree on all {len(exprs)} fingerprint fields "
-          f"({src['rows']} rows). The export is complete and uncorrupted.")
-    sys.exit(0)
+        if diffs:
+            print(f"\nFAIL: {len(diffs)} fingerprint field(s) differ — the export is NOT a faithful "
+                  f"copy of the source. rivet lost, duplicated, or corrupted data.", file=sys.stderr)
+            sys.exit(1)
+        print(f"\nPASS: source and export agree on all {len(exprs)} fingerprint fields "
+              f"({src['rows']} rows). The export is complete and uncorrupted.")
+        sys.exit(0)
 
 
 if __name__ == "__main__":

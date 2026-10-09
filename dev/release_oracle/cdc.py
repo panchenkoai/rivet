@@ -655,16 +655,11 @@ def _state_populated(
     # (the caller's `state-not-populated` wording covers it), but the read itself
     # is no longer the thing that silently fails — see `open_state_db`.
     try:
-        con = open_state_db(sdb)
+        with open_state_db(sdb) as con:
+            n, s = con.execute("SELECT count(*), sum(status='success') FROM run_status").fetchone()
+            return bool(n) and n == s
     except (sqlite3.Error, OSError):
         return False
-    try:
-        n, s = con.execute("SELECT count(*), sum(status='success') FROM run_status").fetchone()
-        return bool(n) and n == s
-    except sqlite3.Error:
-        return False
-    finally:
-        con.close()
 
 
 # ── the CDC end-to-end preflight (once, env-driven, SKIP-if-absent) ──────────
@@ -892,15 +887,16 @@ def _lc_drop(eng: str, url: str, t: str) -> None:
         _mongosh(url, f"db.{t}.drop();")
 
 
+@contextlib.contextmanager
 def _lc_oracle():
     """A DuckDB session (dev/release_oracle/duck.py) that reads the MinIO store."""
     try:
         from .duck import Oracle
     except ImportError:
         from duck import Oracle  # type: ignore[no-redef]
-    o = Oracle()
-    o.db.sql(scenarios.S3_HTTPFS_PREAMBLE)
-    return o
+    with Oracle() as o:
+        o.db.sql(scenarios.S3_HTTPFS_PREAMBLE)
+        yield o
 
 
 def _lc_manifests(o, cap: _Capture) -> set[str]:
@@ -1237,8 +1233,9 @@ def _snapshot_diff(want: dict, got: dict) -> str:
     return "[" + ", ".join(f"{k}: {want.get(k)}->{got.get(k)}" for k in keys) + "]"
 
 
-def open_state_db(sdb: Path) -> sqlite3.Connection:
-    """Open a rivet state db for READING, or raise.
+@contextlib.contextmanager
+def open_state_db(sdb: Path):
+    """Open a rivet state db for READING for the length of a `with`, or raise.
 
     Why this is not a one-liner: rivet's SQLite state db is in WAL mode, and a
     `mode=ro` connection cannot create the `-shm` shared-memory index a WAL
@@ -1258,13 +1255,16 @@ def open_state_db(sdb: Path) -> sqlite3.Connection:
     if not sdb.is_file():
         raise FileNotFoundError(sdb)
     last: Exception | None = None
-    for uri, kw in ((f"file:{sdb}?mode=ro", {"uri": True}), (str(sdb), {})):
-        try:
-            con = sqlite3.connect(uri, **kw)  # type: ignore[arg-type]
-            con.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
-            return con
-        except sqlite3.Error as e:  # noqa: PERF203 — two attempts, not a loop over data
-            last = e
+    with contextlib.ExitStack() as held:
+        for uri, kw in ((f"file:{sdb}?mode=ro", {"uri": True}), (str(sdb), {})):
+            try:
+                con = held.enter_context(contextlib.closing(sqlite3.connect(uri, **kw)))  # type: ignore[arg-type]
+                con.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
+            except sqlite3.Error as e:  # noqa: PERF203 — two attempts, not a loop over data
+                last = e
+                continue
+            yield con
+            return
     raise sqlite3.OperationalError(f"cannot read state db {sdb}: {last}")
 
 
@@ -1277,23 +1277,19 @@ def _cdc_state_snapshot_sqlite(sdb: Path) -> dict[str, str]:
     a table absent from the schema genuinely holds nothing.
     """
     snap: dict[str, str] = {}
-    con: sqlite3.Connection | None = open_state_db(sdb)
-    for t in _STATE_TABLES:
-        n = 0
-        if con is not None:
+    with open_state_db(sdb) as con:
+        for t in _STATE_TABLES:
             try:
                 n = con.execute(f"SELECT count(*) FROM {t}").fetchone()[0]
             except sqlite3.Error:
                 n = 0
-        snap[t] = "populated" if n > 0 else "empty"
-    snap["run_status_all_success"] = "no"
-    if con is not None:
+            snap[t] = "populated" if n > 0 else "empty"
+        snap["run_status_all_success"] = "no"
         try:
             n, s = con.execute("SELECT count(*), sum(status='success') FROM run_status").fetchone()
             snap["run_status_all_success"] = "yes" if n and n == s else "no"
         except sqlite3.Error:
             pass
-        con.close()
     return snap
 
 
