@@ -56,6 +56,10 @@ MONGO_FORCED = ("control of 3f073dd0: `--resume --force` over a complete continu
                 "delta run it was; the checkpointed SQL shapes are the cells that are red there")
 MSSQL_NO_GAP = ("control of f7086105: no log gap exists here, so the refusal the fix adds from the first run after "
                 "the baseline must not fire, and it did not before")
+DIRECT_WIDE = ("control of 3132830a: the first version of that fix hung on a non-builtin column type beside "
+               "wide rows; the previous release never sent the unnamed statement, so it reads or refuses as before")
+WIRE_SAMPLE = ("control of 3132830a: a unit sample of the cell's own wire counter (executions, not statement "
+               "texts); it runs no product binary")
 EMPTY_PREFIX = ("control of 52f26e45: an empty prefix of an EXISTING bucket still reads `legacy`; the fix fails "
                 "`validate` on a missing bucket")
 
@@ -115,6 +119,13 @@ GREEN_ON_PREV: dict[str, str] = {  # ratchet-pin: fix-cells-green-on-previous-re
     "validate_reads_an_empty_prefix_of_an_existing_bucket_as_legacy_azure": EMPTY_PREFIX,
     "validate_reads_an_empty_prefix_of_an_existing_bucket_as_legacy_gcs": EMPTY_PREFIX,
     "validate_reads_an_empty_prefix_of_an_existing_bucket_as_legacy_s3": EMPTY_PREFIX,
+    "a_composite_column_with_wide_rows_is_refused_within_the_bound_direct_postgres": DIRECT_WIDE,
+    "a_table_of_an_enum_and_a_domain_with_wide_rows_is_delivered_full_direct_postgres": DIRECT_WIDE,
+    "a_table_of_an_enum_and_a_domain_with_wide_rows_is_delivered_incremental_direct_postgres": DIRECT_WIDE,
+    "a_table_of_an_enum_and_a_domain_with_wide_rows_is_delivered_keyset_direct_postgres": DIRECT_WIDE,
+    "a_table_of_an_enum_and_a_domain_with_wide_rows_is_delivered_range_direct_postgres": DIRECT_WIDE,
+    "an_array_of_an_enum_with_wide_rows_is_refused_within_the_bound_direct_postgres": DIRECT_WIDE,
+    "an_answer_ends_at_the_next_request_and_two_pages_are_not_one": WIRE_SAMPLE,
 }  # ratchet-pin: end
 
 
