@@ -26,7 +26,7 @@ manifests declare, and grades per column
 
 Per mode (values and counts): a snapshot run (full, chunked, keyset) is its own new
 Success manifests against the whole source (no new manifest over a non-empty source is a
-failure; a `--resume` run is graded on the rows it delivered, reported as `partial`); a
+failure; a `--resume` run is graded the same way, against the source as it is now); a
 delta run (incremental, keyset-incremental, Mongo resume) is every Success manifest in the
 destination, latest version per key, against every source row past the cursor where this
 stream's previous graded run ended (the oracle's own record; rivet's `cursor_low` and
@@ -1361,15 +1361,13 @@ def grade(spec: dict) -> dict:
             # A sealed plan owes exactly the source rows inside the chunk ranges it carries (inclusive, as planned).
             within = " OR ".join(f"{_qi(rc)} BETWEEN {int(lo)} AND {int(hi)}" for lo, hi in spec["ranges"])
             src = f"(SELECT * FROM {src} WHERE {within})"
-        elif (spec.get("resumes_a_run", spec.get("resume")) or spec.get("replay")) and not cumulative and dst and key:
-            # A resume of an unfinished run (or a sealed plan's ranges) completes a plan made before this invocation; the source
-            # may have moved since. A `--resume` that found no run to complete planned afresh and is graded as a plain run.
+        elif spec.get("replay") and not cumulative and dst and key:
+            # A sealed plan's ranges were computed when it was planned; the source may have moved since. A `--resume` plans the
+            # keys the source holds now (src/pipeline/chunked `replan_resumed_run`, keyset `plan_unread_tail`): a plain run's grade.
             kl = ", ".join(_qi(k) for k in key)
             on = " AND ".join(f"CAST(s.{_qi(k)} AS VARCHAR) = CAST(e.{_qi(k)} AS VARCHAR)" for k in key)
             src = f"(SELECT s.* FROM {src} s SEMI JOIN (SELECT DISTINCT {kl} FROM got) e ON {on})"
-            partial.append("a `--resume` run completes a plan made before it: the delivered rows are graded, completeness against that plan is not"
-                           if spec.get("resumes_a_run", spec.get("resume")) else
-                           "a sealed plan replays the chunk ranges it was planned with: the delivered rows are graded, completeness against the live source is not")
+            partial.append("a sealed plan replays the chunk ranges it was planned with: the delivered rows are graded, completeness against the live source is not")
         f, row_of, collapse = _value_findings(ora, engine, fmt, native, rows, src, dst, key, partial)
         if spec.get("nothing_new") and not cumulative:
             if spec.get("resume"):

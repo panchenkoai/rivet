@@ -1745,6 +1745,7 @@ exports:
             schema: String::new(),
             population: String::new(),
             column: Some("updated_at".into()),
+            landing: Default::default(),
             mode: "keyset",
             continues_high_water: true,
             resumable: true,

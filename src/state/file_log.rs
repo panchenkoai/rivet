@@ -214,6 +214,31 @@ impl StateStore {
         Ok(!rows.is_empty())
     }
 
+    /// A format other than `format` among the parts `run_id` logged; `None` when every part is `format` or `format` is empty.
+    pub(super) fn another_format_of_run(
+        &self,
+        run_id: &str,
+        format: &str,
+    ) -> Result<Option<String>> {
+        if format.is_empty() {
+            return Ok(None);
+        }
+        self.query_opt(
+            "SELECT format FROM file_log WHERE run_id = ?1 AND format <> ?2 ORDER BY id LIMIT 1",
+            &[run_id.into(), format.into()],
+            |r| r.text(0),
+        )
+    }
+
+    /// Forget the named parts of `run_id`, so a resume that reads their rows again does not declare them too; all or none.
+    pub fn forget_parts(&self, run_id: &str, file_names: &[String]) -> Result<()> {
+        self.transaction(|| {
+            file_names
+                .iter()
+                .try_for_each(|name| self.forget_part(run_id, name))
+        })
+    }
+
     /// Forget the parts a keyset page logged before it finished — every row after the last
     /// one carrying a `cursor_high` — so a resume re-reads that page whole; returns how many.
     pub fn forget_unfinished_page_parts(&self, run_id: &str) -> Result<usize> {
@@ -359,6 +384,43 @@ mod tests {
 
     fn store() -> StateStore {
         StateStore::open_in_memory().expect("in-memory store")
+    }
+
+    #[test]
+    fn a_run_names_another_format_among_its_parts_and_forgets_the_parts_it_is_told_to() {
+        let s = store();
+        let part = |run_id: &str, file_name: &str, format: &str| {
+            s.record_file(FilePart {
+                run_id,
+                export_name: "orders",
+                file_name,
+                rows: 1,
+                bytes: 1,
+                format,
+                compression: None,
+                cursor_high: None,
+            })
+            .unwrap();
+        };
+        part("r1", "a.parquet", "parquet");
+        part("r1", "b.parquet", "parquet");
+        part("r2", "a.parquet", "parquet");
+        part("r2", "c.csv", "csv");
+        let other = |run: &str, format: &str| s.another_format_of_run(run, format).unwrap();
+        assert_eq!(other("r1", "parquet"), None);
+        assert_eq!(other("r1", "csv").as_deref(), Some("parquet"));
+        assert_eq!(other("r1", ""), None, "a caller that names no format");
+        assert_eq!(other("r2", "parquet").as_deref(), Some("csv"));
+        assert_eq!(other("r3", "csv"), None, "a run that logged no part");
+
+        s.forget_parts("r1", &["a.parquet".to_string(), "c.csv".to_string()])
+            .unwrap();
+        let names = |run: &str| -> Vec<String> {
+            let files = s.list_files_for_run(run).unwrap();
+            files.into_iter().map(|f| f.file_name).collect()
+        };
+        assert_eq!(names("r1"), ["b.parquet"]);
+        assert_eq!(names("r2"), ["a.parquet", "c.csv"], "another run's parts");
     }
 
     #[test]

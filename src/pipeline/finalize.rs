@@ -1085,46 +1085,7 @@ pub(super) fn write_running_manifest(
 /// The manifest is a record of where data was written, so the URI must
 /// reflect what an operator would type to find the prefix again.
 pub(crate) fn destination_uri_for_manifest(cfg: &DestinationConfig) -> String {
-    use crate::config::DestinationType;
-    match cfg.destination_type {
-        DestinationType::Local => cfg
-            .path
-            .clone()
-            .or_else(|| cfg.prefix.clone())
-            .map(|p| format!("file://{p}"))
-            .unwrap_or_else(|| "file://.".to_string()),
-        DestinationType::S3 => {
-            let bucket = cfg.bucket.as_deref().unwrap_or("");
-            let prefix = cfg.prefix.as_deref().unwrap_or("");
-            if prefix.is_empty() {
-                format!("s3://{bucket}/")
-            } else {
-                format!("s3://{bucket}/{prefix}")
-            }
-        }
-        DestinationType::Gcs => {
-            let bucket = cfg.bucket.as_deref().unwrap_or("");
-            let prefix = cfg.prefix.as_deref().unwrap_or("");
-            if prefix.is_empty() {
-                format!("gs://{bucket}/")
-            } else {
-                format!("gs://{bucket}/{prefix}")
-            }
-        }
-        DestinationType::Azure => {
-            // `az://<container>/<prefix>` — same Hadoop/HDFS-style scheme that
-            // azcopy and most Azure-native tools recognise.  Manifest URI is
-            // operator-facing, not used for opendal addressing.
-            let container = cfg.bucket.as_deref().unwrap_or("");
-            let prefix = cfg.prefix.as_deref().unwrap_or("");
-            if prefix.is_empty() {
-                format!("az://{container}/")
-            } else {
-                format!("az://{container}/{prefix}")
-            }
-        }
-        DestinationType::Stdout => "stdout".to_string(),
-    }
+    cfg.uri()
 }
 
 #[cfg(test)]
@@ -1601,6 +1562,7 @@ mod tests {
             source_table: None,
             base_query: "SELECT 1".into(),
             query_template: None,
+            destination_written: None,
             is_split_unit: false,
             strategy: crate::plan::ExtractionStrategy::Snapshot,
             format: crate::config::FormatType::Parquet,
