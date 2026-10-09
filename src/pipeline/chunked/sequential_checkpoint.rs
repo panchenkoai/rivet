@@ -147,8 +147,7 @@ pub(crate) fn run_chunked_sequential_checkpoint(
         //    `schema_fingerprint` whose schemas disagree. The identical drop without
         //    `--resume` fails loudly. The gap between a crash and its resume is
         //    exactly where a schema change is most likely.
-        super::check_drift_only(src, plan, Some(state), summary)?;
-        vec![]
+        super::resumed_chunk_plan(src, plan, state, summary, &chunk_source)?
     } else {
         match chunk_source {
             // Detect: compute ranges + run the pre-chunk drift check (ADR-0021).

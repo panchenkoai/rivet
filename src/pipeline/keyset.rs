@@ -368,6 +368,84 @@ fn partition_ranges(
     ranges
 }
 
+/// What a resumed full pass reads past a last, open-ended range the crashed run committed.
+#[derive(Debug, PartialEq, Eq)]
+enum UnreadTail {
+    /// The keys above the highest key that range delivered.
+    Past(String),
+    /// The range again: it recorded no highest key (it was empty, or a rivet that did not record one committed it).
+    Again,
+}
+
+/// The tail a resumed run still owes: `None` unless its last range is open-ended and committed.
+fn unread_tail(ranges: &[crate::state::KeysetRangeRow]) -> Option<UnreadTail> {
+    let last = ranges.last().filter(|r| r.done && r.hi.is_none())?;
+    Some(match &last.max_key {
+        Some(key) => UnreadTail::Past(key.clone()),
+        None => UnreadTail::Again,
+    })
+}
+
+/// The range a parallel-keyset part belongs to, read from the `_pk_w<range>_<page>` its name ends with.
+fn range_of_part(file_name: &str) -> Option<i64> {
+    let stem = file_name.rsplit_once('.').map_or(file_name, |(s, _)| s);
+    let stem = match stem.rsplit_once("_p") {
+        Some((head, n)) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => head,
+        _ => stem,
+    };
+    let (head, page) = stem.rsplit_once('_')?;
+    let (_, range) = head.rsplit_once("_pk_w")?;
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    (digits(page) && digits(range))
+        .then(|| range.parse().ok())
+        .flatten()
+}
+
+/// Plan what a resumed full pass still owes past its committed last range, so rows that arrived above it since the crash are read: one more range past its highest key, or that range again with its logged parts forgotten.
+fn plan_unread_tail(
+    st: &StateStore,
+    export_name: &str,
+    scope: &str,
+    run_id: &str,
+    key: &str,
+    ranges: &mut Vec<crate::state::KeysetRangeRow>,
+) -> Result<()> {
+    let Some(tail) = unread_tail(ranges) else {
+        return Ok(());
+    };
+    let last = ranges.len() - 1;
+    match tail {
+        UnreadTail::Past(top) => {
+            let range_index = ranges.len() as i64;
+            st.append_keyset_range(export_name, scope, run_id, key, range_index, &top)?;
+            ranges.push(crate::state::KeysetRangeRow {
+                range_index,
+                lo: Some(top),
+                hi: None,
+                done: false,
+                max_key: None,
+            });
+        }
+        UnreadTail::Again => {
+            let index = ranges[last].range_index;
+            let parts: Vec<String> = st
+                .list_files_for_run(run_id)?
+                .into_iter()
+                .map(|f| f.file_name)
+                .filter(|name| range_of_part(name) == Some(index))
+                .collect();
+            st.forget_parts(run_id, &parts)?;
+            st.reopen_keyset_range(export_name, run_id, index)?;
+            ranges[last].done = false;
+        }
+    }
+    log::info!(
+        "export '{export_name}': the last key range of interrupted run {run_id} was committed \
+         open-ended — reading the keys the source holds past it now"
+    );
+    Ok(())
+}
+
 /// Parallel keyset (feat/parallel-keyset). N ROW-percentile-range workers seek
 /// concurrently in a `std::thread::scope`; each owns its source connection and
 /// runs the standard bounded seek loop, writing run-unique parts to the SHARED
@@ -485,7 +563,9 @@ fn run_keyset_parallel(
         (Some(rid), Some(st)) => {
             summary.run_id = rid.clone();
             summary.resumed = true;
-            st.load_keyset_ranges(&plan.export_name, rid, &key)?
+            let mut stored = st.load_keyset_ranges(&plan.export_name, rid, &key)?;
+            plan_unread_tail(st, &plan.export_name, &scope, rid, &key, &mut stored)?;
+            stored
                 .into_iter()
                 .map(|r| {
                     committed_max.push((r.range_index as usize, r.max_key));
@@ -1272,6 +1352,7 @@ mod tests {
             schema: String::new(),
             population: String::new(),
             column: Some("id".into()),
+            landing: Default::default(),
             mode: "keyset",
             continues_high_water: false,
             resumable: true,
@@ -1463,6 +1544,142 @@ mod tests {
         after_the_rerun[1] = s("225");
         assert_eq!(highest_range_max(after_the_rerun), s("400"));
         assert_eq!(seeded_range_max(2, Vec::new()), vec![None, None]);
+    }
+
+    /// A stored range `(lo, hi]` of a parallel keyset run.
+    fn stored_range(
+        index: i64,
+        lo: Option<&str>,
+        hi: Option<&str>,
+        done: bool,
+        max_key: Option<&str>,
+    ) -> crate::state::KeysetRangeRow {
+        crate::state::KeysetRangeRow {
+            range_index: index,
+            lo: lo.map(Into::into),
+            hi: hi.map(Into::into),
+            done,
+            max_key: max_key.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn only_a_committed_open_ended_last_range_leaves_a_tail_to_read() {
+        use super::UnreadTail::{Again, Past};
+        let first = stored_range(0, None, Some("100"), true, Some("100"));
+        let tail = |last| super::unread_tail(&[first.clone(), last]);
+        assert_eq!(
+            tail(stored_range(1, Some("100"), None, true, Some("200"))),
+            Some(Past("200".into()))
+        );
+        assert_eq!(
+            tail(stored_range(1, Some("100"), None, true, None)),
+            Some(Again)
+        );
+        assert_eq!(tail(stored_range(1, Some("100"), None, false, None)), None);
+        assert_eq!(
+            tail(stored_range(1, Some("100"), Some("200"), true, Some("200"))),
+            None,
+            "an incremental run stops at the ceiling it pinned"
+        );
+        assert_eq!(super::unread_tail(&[]), None);
+        let open_first = stored_range(0, None, None, true, Some("9"));
+        let bounded_last = stored_range(1, Some("9"), Some("20"), false, None);
+        assert_eq!(super::unread_tail(&[open_first, bounded_last]), None);
+    }
+
+    #[test]
+    fn a_parallel_keyset_part_names_its_range() {
+        let part = |range: usize, page: usize| {
+            format!(
+                "orders_pk_w1_{}_pk_w{range}_{page}.parquet",
+                crate::pipeline::summary::run_scoped_tag("r-1", "orders")
+            )
+        };
+        assert_eq!(super::range_of_part(&part(0, 3)), Some(0));
+        assert_eq!(super::range_of_part(&part(12, 0)), Some(12));
+        let rotated = crate::pipeline::commit::part_indexed_name(&part(7, 2), 1, 3);
+        assert_eq!(super::range_of_part(&rotated), Some(7));
+        assert_eq!(super::range_of_part("orders_pk_w3_0"), Some(3));
+        for not_one in [
+            "orders_20260101T000000_chunk3_0123456789abcdef.parquet",
+            "orders_r-1_pk_wx_0.parquet",
+            "orders_r-1_pk_w3_x.parquet",
+            "orders_r-1_pk_w_0.parquet",
+            "orders.parquet",
+        ] {
+            assert_eq!(super::range_of_part(not_one), None, "{not_one}");
+        }
+    }
+
+    /// A resumed full pass reads past its committed last range: from the key that range recorded, or the range again (its logged parts forgotten) when it recorded none.
+    #[test]
+    fn a_resumed_full_pass_plans_what_its_committed_last_range_left_unread() {
+        use crate::state::KeysetRangePart;
+        let pairs = [
+            (None, Some("100".to_string())),
+            (Some("100".to_string()), None),
+        ];
+        let part = |name: &str| KeysetRangePart {
+            file_name: name.into(),
+            rows: 5,
+            bytes: 50,
+        };
+        let opened = |top: Option<&str>| {
+            let st = StateStore::open_in_memory().unwrap();
+            st.persist_keyset_ranges("e", "p", "run", "id", &pairs)
+                .unwrap();
+            let low = [part("e_run_pk_w0_0.parquet")];
+            st.commit_keyset_range("run", "e", (0, Some("100")), &low, "parquet", None)
+                .unwrap();
+            let high = [part("e_run_pk_w1_0.parquet"), part("e_run_pk_w1_1.parquet")];
+            st.commit_keyset_range("run", "e", (1, top), &high, "parquet", None)
+                .unwrap();
+            st
+        };
+        let plan = |st: &StateStore| {
+            let mut ranges = st.load_keyset_ranges("e", "run", "id").unwrap();
+            super::plan_unread_tail(st, "e", "p", "run", "id", &mut ranges).unwrap();
+            let stored = st.load_keyset_ranges("e", "run", "id").unwrap();
+            let shape = |r: &crate::state::KeysetRangeRow| (r.range_index, r.lo.clone(), r.done);
+            assert_eq!(
+                ranges.iter().map(shape).collect::<Vec<_>>(),
+                stored.iter().map(shape).collect::<Vec<_>>(),
+                "the run reads what the state holds"
+            );
+            let logged = st.list_files_for_run("run").unwrap();
+            let logged: Vec<String> = logged.into_iter().map(|f| f.file_name).collect();
+            (stored.iter().map(shape).collect::<Vec<_>>(), logged)
+        };
+        let own = |v: &str| Some(v.to_string());
+        let all = [
+            "e_run_pk_w0_0.parquet",
+            "e_run_pk_w1_0.parquet",
+            "e_run_pk_w1_1.parquet",
+        ];
+
+        let recorded = opened(Some("180"));
+        let (ranges, logged) = plan(&recorded);
+        assert_eq!(
+            ranges,
+            [
+                (0, None, true),
+                (1, own("100"), true),
+                (2, own("180"), false)
+            ]
+        );
+        assert_eq!(logged, all);
+
+        let unrecorded = opened(None);
+        let (ranges, logged) = plan(&unrecorded);
+        assert_eq!(ranges, [(0, None, true), (1, own("100"), false)]);
+        assert_eq!(
+            logged,
+            all[..1],
+            "the range read again declares no part twice"
+        );
+        let (again, _) = plan(&unrecorded);
+        assert_eq!(again, ranges, "a range left to read is no tail");
     }
 
     // ── highest_range_max: cursor_high = the top populated range's max ────────

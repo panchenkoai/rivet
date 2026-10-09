@@ -121,6 +121,9 @@ What `--resume` does:
 
 - **Incremental exports** resume from `export_state.last_cursor_value`.
 - **Chunked exports** consult the `chunk_task` table: tasks in `completed` are skipped; tasks in `pending` or `running` (the latter reset to `pending` on resume) are re-issued; tasks in `failed` are retried while `attempts < max_chunk_attempts`.
+- **A resumed chunked run reads the source's key span again** (`rivet run`; `rivet apply` replays the ranges its plan sealed). Keys the source holds outside the span the stopped run planned get new tasks, and a run that committed no part before it stopped is planned again whole, so rows that arrived past the old plan are delivered. The windows the stopped run committed are not read again: a row written into one of them since is not in this run's output, as with a window an uninterrupted run has already read.
+- **A resumed parallel keyset run** (`chunk_by_key` with `parallel` and `chunk_checkpoint`) whose last, open-ended key range was committed reads the keys past the highest one that range delivered. A range committed by rivet 0.31 or earlier recorded no such key and is read again whole; none of its parts is declared twice.
+- **An unfinished run is not continued in another format.** If `format` was edited while a checkpointed run was unfinished, the run is refused (`RIVET_STATE_INTERRUPTED_RUN_OWNER_MISMATCH`, exit 5) until the format is restored or the run is abandoned (`rivet state reset-chunks` for a range-chunk run, `rivet state reset` for a keyset run).
 - **Full and time-window** modes do not resume — they restart from the beginning. The previous run's output files remain at the destination unless cleaned manually.
 
 Chunk task transitions are **strictly forward** (`pending → running → {completed | failed}`). A `completed` chunk is never re-claimed, even after a crash — see ADR-0001 I5 (Chunk Task Acyclicity).

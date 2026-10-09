@@ -336,7 +336,10 @@ const MATRICES: &[(&str, usize)] = &[
     // 115 -> 128 (2026-10-08): the versions, exhaust, ddl, hostile and clock row families add 13 rows nobody
     // wrote: a memory cap (5), a run under a stepped clock (5), an Oracle CLOB past 4000 bytes, the warehouse
     // taken away under a live load, and a signal at `pg_after_snapshot_open`.
-    ("docs/sabotage-matrix.yaml", 128),
+    // 128 -> 118 (2026-10-09): the nine rows a resume after the source grew, an edited destination path or
+    // format and deleted chunk tasks left open are ordinary cells, Oracle included, and the destination
+    // moved to another store has its cell.
+    ("docs/sabotage-matrix.yaml", 118),
     // Pool-split — `apply --pool --split` per (strategy × source engine). Split is a
     // scheduler layer above the runners (each unit runs through chunked/keyset), so its
     // per-engine behaviour (boundary probe, crash-recovery, finding-2 exact-partition

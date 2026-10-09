@@ -464,6 +464,8 @@ destination:
 
 With an export named `orders` running on 2026-05-14, this resolves to `exports/2026-05-14/orders/`.
 
+For an export that continues from a stored cursor (`incremental`, `keyset_incremental`, MongoDB `resume`), the destination and the `format` are compared between runs. The destination is compared as written, with the placeholder in place: `exports/{date}/{export}/` is the same destination on every day. Another bucket, `path` or `prefix`, another store or another `format` is refused (`RIVET_STATE_CURSOR_DESTINATION_MISMATCH`, exit 5), because the new location would hold only the rows past the cursor: restore the setting to continue, or run `rivet state reset -c <config> --export <name>` for a full pass delivered where the config points now. A value that comes from `${VAR}` is compared after substitution, so a destination that should change from run to run is spelled with `{date}`.
+
 ---
 
 ## `notifications`

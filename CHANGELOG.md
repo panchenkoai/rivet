@@ -2,6 +2,60 @@
 
 ## Unreleased
 
+- **Breaking: a destination or format edited under stored progress is refused, and a run
+  resumed after a crash delivers the rows that arrived since.** Applies to `incremental`,
+  `keyset_incremental`, MongoDB `resume` and `chunk_checkpoint` exports on every source
+  engine.
+  - **A moved destination or another format under a stored cursor is refused.** Before, an
+    export that continues from a cursor kept it when its `destination` (bucket, `path`,
+    `prefix` or store) or its `format` was edited with no reset: exit 0, and the new
+    location held only the rows past the cursor, or one prefix held parts of two formats.
+    Now the run is refused with exit 5 `RIVET_STATE_CURSOR_DESTINATION_MISMATCH`, naming
+    where the cursor was delivered and where the config points, on every run. Restore the
+    destination and format to continue, or run
+    `rivet state reset -c <config> --export <name>` for a full pass delivered where the
+    config points now. The parts already delivered are not moved or removed: empty that
+    location first if the full pass lands in it too. `rivet state accept` does not lift
+    this refusal. The destination is compared as written, so a `{date}`, `{export}`,
+    `{table}` or `{run_id}` placeholder is one destination on every day, and a `rivet plan`
+    artifact sealed before this release still applies. A destination that comes from
+    `${VAR}` is compared after substitution: a value that moves the path between runs is
+    refused, so spell a per-run prefix with `{date}`.
+  - **An unfinished checkpointed run is not finished in another format.** Before, a
+    `chunk_checkpoint` run interrupted while writing parquet and continued after
+    `format: csv` exited 0 over one success manifest naming parts of both formats. Now the
+    run, and `rivet run --resume`, is refused with exit 5
+    `RIVET_STATE_INTERRUPTED_RUN_OWNER_MISMATCH`, naming both formats. Restore the format
+    and run once to finish it, or abandon it (`rivet state reset-chunks` for a range-chunk
+    run, `rivet state reset` for a keyset run) and the next run starts a full pass in the
+    new format. This holds for a run 0.31 or earlier left unfinished too.
+  - **A resumed chunk-checkpoint run reads the source's key span again.** Before, a plain
+    run or `--resume` that continued a crashed `chunk_column` + `chunk_checkpoint` run
+    finished the plan the crashed run had stored: rows that reached the source past it
+    were in no part, under exit 0 and `_SUCCESS`, and an empty table that filled after the
+    crash was delivered as 0 rows. Now the resumed run detects the key span again, adds
+    tasks for the keys outside the stored plan, and plans a run that committed no part
+    again whole. The windows the crashed run committed are not read again. The units of
+    `rivet apply --pool --split --resume` resume the same way, so rows gained past the top
+    key land in the last unit (before, the resumed split delivered the keys of the crashed
+    plan only). `rivet apply` of a sealed plan artifact replays the ranges its plan
+    sealed, as before. A resume now runs the `min`/`max` and NULL-key probes a fresh run
+    does and fails where a fresh run would (a NULL key, a key span past the sparse-plan
+    limit).
+  - **A resumed parallel keyset run reads past its last range.** Before, a `chunk_by_key` +
+    `parallel` + `chunk_checkpoint` run whose last key range had committed before the crash
+    read no key above it on resume. Now it reads the keys past the highest one that range
+    delivered. A range committed by 0.31 or earlier recorded no such key: it is read again
+    whole, and none of its parts is declared twice.
+  - **A chunk run whose task rows are gone is planned again.** Before, a resume over a
+    `chunk_run` with no `chunk_task` rows wrote a success manifest with 0 rows.
+  - Upgrading: nothing to migrate, and the state schema version does not change. A cursor
+    row written by 0.31 or earlier holds no destination: the first run of this release
+    records where the export delivers, logs one `predates destination tracking` warning
+    and continues, so an edit of the destination or format made in the same step as the
+    upgrade is not seen; make the upgrade and the edit two separate runs. A run that 0.31
+    left unfinished is resumed with the behaviour above.
+
 - **Behaviour change: a table that is empty at its CDC baseline gets an empty warehouse
   table.** Applies to a `mode: cdc` export with `cdc.backfill:` loaded under
   `load.layout: base_buffer` (BigQuery), every source engine.

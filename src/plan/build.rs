@@ -207,6 +207,13 @@ pub(crate) fn build_plan_on(
     };
 
     let (compression, compression_level) = export.effective_compression();
+    // #167: a `--split` sub-export named `daily#0` must resolve `{export}` /
+    // `{table}` to its FAMILY (`daily`), not the unit name — so all N range
+    // units write into ONE shared prefix and the load view recombines them as
+    // one logical table (the merge-back). An ordinary export's family IS its
+    // name, so this is a no-op off the split path.
+    let destination = expand_destination_templates(export.destination.clone(), &export.family());
+    let destination_written = Some(export.destination.uri()).filter(|w| *w != destination.uri());
     Ok(ResolvedRunPlan {
         export_name: export.name.clone(),
         bytes_read: Default::default(),
@@ -229,6 +236,7 @@ pub(crate) fn build_plan_on(
             .or_else(|| export.table.clone()),
         base_query,
         query_template,
+        destination_written,
         is_split_unit: export.split.is_some(),
         // Thread the split window into the plan so finalize records it in the manifest —
         // the durable anchor for exact-partition resume (SplitSynth → manifest::SplitWindow).
@@ -244,12 +252,7 @@ pub(crate) fn build_plan_on(
         max_file_size_bytes: export.max_file_size_bytes(),
         skip_empty: export.skip_empty,
         meta_columns: export.meta_columns.clone(),
-        // #167: a `--split` sub-export named `daily#0` must resolve `{export}` /
-        // `{table}` to its FAMILY (`daily`), not the unit name — so all N range
-        // units write into ONE shared prefix and the load view recombines them as
-        // one logical table (the merge-back). An ordinary export's family IS its
-        // name, so this is a no-op off the split path.
-        destination: expand_destination_templates(export.destination.clone(), &export.family()),
+        destination,
         quality: export.quality.clone(),
         tuning,
         tuning_profile_label,
@@ -1042,6 +1045,77 @@ mod tests {
             params,
         )
         .expect("plan")
+    }
+
+    /// The destination part of the progress identity is the destination as written: a `{date}` prefix is one place on every day, and a plan with no placeholder seals as before.
+    #[test]
+    fn a_dated_destination_enters_the_progress_identity_as_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = planned(dir.path(), "    table: orders", &[]);
+        assert_eq!(plain.destination_written, None);
+        let landing = plain.progress_key().landing;
+        assert_eq!(landing.destination, "file://./out");
+        assert_eq!(landing.format, "parquet");
+        let sealed = serde_json::to_value(&plain).unwrap();
+        assert!(sealed.get("destination_written").is_none(), "{sealed}");
+
+        let path = dir.path().join("rivet.yaml");
+        let mut config = Config::load_with_params(path.to_str().unwrap(), None).unwrap();
+        config.exports[0].destination = DestinationConfig {
+            destination_type: DestinationType::S3,
+            bucket: Some("b".into()),
+            prefix: Some("runs/{date}/{export}/".into()),
+            ..Default::default()
+        };
+        let dated = build_plan(
+            &config,
+            &config.exports[0],
+            dir.path(),
+            false,
+            false,
+            false,
+            None,
+        )
+        .expect("plan");
+        let today = chrono::Utc::now().format("%Y-%m-%d");
+        let resolved = format!("s3://b/runs/{today}/orders/");
+        assert_eq!(dated.destination.uri(), resolved);
+        let written = "s3://b/runs/{date}/{export}/";
+        assert_eq!(dated.destination_written.as_deref(), Some(written));
+        assert_eq!(dated.progress_key().landing.destination, written);
+
+        let mut sealed = serde_json::to_value(&dated).unwrap();
+        let reread: ResolvedRunPlan = serde_json::from_value(sealed.clone()).unwrap();
+        assert_eq!(reread.progress_key().landing.destination, written);
+        sealed
+            .as_object_mut()
+            .unwrap()
+            .remove("destination_written");
+        let before_the_field: ResolvedRunPlan = serde_json::from_value(sealed).unwrap();
+        assert_eq!(
+            before_the_field.progress_key().landing.destination,
+            resolved
+        );
+    }
+
+    /// A destination spelled through `${VAR}` enters the progress identity by its value: another value is another destination.
+    #[test]
+    fn a_destination_from_a_variable_enters_the_progress_identity_by_its_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rivet.yaml");
+        let yaml = "source:\n  type: postgres\n  url: \"postgresql://localhost/test\"\nexports:\n\
+                    \x20 - name: orders\n    table: orders\n    mode: incremental\n    cursor_column: id\n\
+                    \x20   format: parquet\n    destination: { type: local, path: \"${out}/orders\" }\n";
+        std::fs::write(&path, yaml).unwrap();
+        let delivered_to = |out: &str| {
+            let params = HashMap::from([("out".to_string(), out.to_string())]);
+            let config = Config::load_with_params(path.to_str().unwrap(), Some(&params)).unwrap();
+            let export = &config.exports[0];
+            let plan = build_plan(&config, export, dir.path(), false, false, false, None);
+            plan.expect("plan").progress_key().landing.destination
+        };
+        assert_eq!(delivered_to("/a"), "file:///a/orders");
+        assert_eq!(delivered_to("/b"), "file:///b/orders");
     }
 
     /// The rows part of the progress identity is the query as written: a placeholder's value is not part of it, the text around it is.

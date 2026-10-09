@@ -91,6 +91,16 @@ pub fn apply(s: &str, ctx: &PlaceholderContext) -> String {
     out
 }
 
+/// The text of `template` around the placeholders [`apply`] substitutes, in order; `None` when it holds none.
+pub fn literal_parts(template: &str) -> Option<Vec<String>> {
+    const CUT: &str = "\u{0}";
+    let cut = ["{date}", "{export}", "{table}", "{run_id}"]
+        .iter()
+        .fold(template.to_string(), |t, token| t.replace(token, CUT));
+    cut.contains(CUT)
+        .then(|| cut.split(CUT).map(str::to_string).collect())
+}
+
 /// Substitute **only** the `{partition}` token in `destination.path` /
 /// `destination.prefix` with a Hive-style `col=value` segment.
 ///
@@ -131,6 +141,18 @@ mod tests {
             NaiveDate::parse_from_str(date_str, "%Y-%m-%d").unwrap(),
             export,
         )
+    }
+
+    #[test]
+    fn literal_parts_are_the_text_around_each_substituted_placeholder() {
+        let own = |p: &[&str]| Some(p.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(
+            literal_parts("runs/{date}/{export}/x/{table}{run_id}"),
+            own(&["runs/", "/", "/x/", "", ""])
+        );
+        assert_eq!(literal_parts("{date}"), own(&["", ""]));
+        assert_eq!(literal_parts("runs/{partition}/{unknown}/"), None);
+        assert_eq!(literal_parts("runs/plain/"), None);
     }
 
     // ── apply() ────────────────────────────────────────────────────────────

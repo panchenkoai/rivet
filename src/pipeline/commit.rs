@@ -813,6 +813,7 @@ pub(crate) mod tests {
             source_table: None,
             base_query: "SELECT 1".into(),
             query_template: None,
+            destination_written: None,
             is_split_unit: false,
             strategy: ExtractionStrategy::Snapshot,
             format: FormatType::Parquet,

@@ -100,6 +100,9 @@ pub struct ResolvedRunPlan {
     /// `base_query` before `${...}` substitution, when the two differ: the rows part of the progress identity is read from it, so a value that changes between runs is not an edit. Absent from a plan with no placeholder and from one sealed before this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query_template: Option<String>,
+    /// The URI of `destination` before `{date}`-style substitution, when the two differ: the destination part of the progress identity is read from it, so a new day's prefix is not a moved destination. Absent from a plan with no placeholder and from one sealed before this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination_written: Option<String>,
     /// This plan is one range sub-export UNIT of a `--pool --split` (#167). Such
     /// a unit shares its destination prefix with its N-1 siblings, so it must NOT
     /// write the prefix-level `_SUCCESS` itself (that would falsely mark the whole
@@ -263,6 +266,13 @@ impl ResolvedRunPlan {
                 self.query_template.as_deref().unwrap_or(&self.base_query),
             ),
             column: self.strategy.cursor_identity(),
+            landing: crate::state::Landing {
+                destination: self
+                    .destination_written
+                    .clone()
+                    .unwrap_or_else(|| self.destination.uri()),
+                format: self.format.label().into(),
+            },
             mode: self.strategy.mode_label(),
             continues_high_water: self.strategy.continues_stored_cursor(),
             resumable: self.strategy.is_resumable(),

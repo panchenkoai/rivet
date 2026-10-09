@@ -122,9 +122,54 @@ guarantees:
       known_red:
         - "live_sabotage::open_defect_a_resume_over_a_task_marked_completed_delivers_or_refuses"
         - "live_sabotage::open_defect_a_resume_over_edited_task_bounds_delivers_or_refuses"
-        - "live_sabotage::open_defect_a_resume_over_deleted_tasks_delivers_or_refuses"
         - "live_sabotage::open_defect_a_resume_over_a_truncated_committed_part_delivers_or_refuses"
         - "live_sabotage::open_defect_a_resume_over_a_replaced_committed_part_delivers_or_refuses"
+
+  - id: a_resumed_chunk_run_delivers_the_keys_past_its_stored_plan
+    stated:
+      - file: docs/semantics.md
+        sentence: "Keys the source holds outside the span the stopped run planned get new tasks, and a run that committed no part before it stopped is planned again whole, so rows that arrived past the old plan are delivered."
+    held_by:
+      postgres: { test: a_range_checkpoint_run_killed_before_the_source_grows_delivers_the_source_postgres, asserts: "exited 0 over a success manifest declaring {} row(s) for {rows} source ids" }
+      mysql: { test: a_range_checkpoint_run_killed_before_the_source_grows_delivers_the_source_mysql, asserts: "exited 0 over a success manifest declaring {} row(s) for {rows} source ids" }
+      mssql: { test: a_range_checkpoint_run_killed_before_the_source_grows_delivers_the_source_mssql, asserts: "exited 0 over a success manifest declaring {} row(s) for {rows} source ids" }
+      oracle: { test: a_range_checkpoint_run_killed_before_the_source_grows_delivers_the_source_oracle, asserts: "exited 0 over a success manifest declaring {} row(s) for {rows} source ids" }
+      empty_table: { test: a_run_killed_over_an_empty_table_before_it_fills_delivers_the_source_postgres, asserts: "exited 0 over a success manifest declaring {} row(s) for {rows} source ids" }
+
+  - id: a_resumed_parallel_keyset_run_reads_past_its_last_range
+    stated:
+      - file: docs/semantics.md
+        sentence: "whose last, open-ended key range was committed reads the keys past the highest one that range delivered."
+    held_by:
+      postgres: { test: a_keyset_checkpoint_parallel_run_killed_before_the_source_grows_delivers_the_source_postgres, asserts: "exited 0 over a success manifest declaring {} row(s) for {rows} source ids" }
+      mysql: { test: a_keyset_checkpoint_parallel_run_killed_before_the_source_grows_delivers_the_source_mysql, asserts: "exited 0 over a success manifest declaring {} row(s) for {rows} source ids" }
+      mssql: { test: a_keyset_checkpoint_parallel_run_killed_before_the_source_grows_delivers_the_source_mssql, asserts: "exited 0 over a success manifest declaring {} row(s) for {rows} source ids" }
+      oracle: { test: a_keyset_checkpoint_parallel_run_killed_before_the_source_grows_delivers_the_source_oracle, asserts: "exited 0 over a success manifest declaring {} row(s) for {rows} source ids" }
+      a_range_that_recorded_no_key: { test: a_keyset_checkpoint_parallel_run_with_no_recorded_top_killed_before_the_source_grows_delivers_the_source_postgres, asserts: "UPDATE keyset_range SET max_key = NULL WHERE export_name = '{export}'" }
+
+  - id: an_unfinished_run_is_not_continued_in_another_format
+    stated:
+      - file: docs/semantics.md
+        sentence: "If `format` was edited while a checkpointed run was unfinished, the run is refused (`RIVET_STATE_INTERRUPTED_RUN_OWNER_MISMATCH`, exit 5)"
+    held_by:
+      postgres: { test: an_unfinished_run_whose_format_is_edited_is_refused_and_walked_out_postgres, asserts: "Refused::by_code(\"RIVET_STATE_INTERRUPTED_RUN_OWNER_MISMATCH\", 5)" }
+      mysql: { test: an_unfinished_run_whose_format_is_edited_is_refused_and_walked_out_mysql, asserts: "Refused::by_code(\"RIVET_STATE_INTERRUPTED_RUN_OWNER_MISMATCH\", 5)" }
+      mssql: { test: an_unfinished_run_whose_format_is_edited_is_refused_and_walked_out_mssql, asserts: "Refused::by_code(\"RIVET_STATE_INTERRUPTED_RUN_OWNER_MISMATCH\", 5)" }
+      oracle: { test: an_unfinished_run_whose_format_is_edited_is_refused_and_walked_out_oracle, asserts: "Refused::by_code(\"RIVET_STATE_INTERRUPTED_RUN_OWNER_MISMATCH\", 5)" }
+
+  - id: a_cursor_is_not_continued_into_another_destination_or_format
+    stated:
+      - file: docs/reference/config.md
+        sentence: "Another bucket, `path` or `prefix`, another store or another `format` is refused (`RIVET_STATE_CURSOR_DESTINATION_MISMATCH`, exit 5)"
+    held_by:
+      postgres: { test: an_incremental_export_whose_destination_path_is_edited_is_refused_and_walked_out_postgres, asserts: "Refused::by_code(\"RIVET_STATE_CURSOR_DESTINATION_MISMATCH\", 5)" }
+      mysql: { test: an_incremental_export_whose_destination_path_is_edited_is_refused_and_walked_out_mysql, asserts: "Refused::by_code(\"RIVET_STATE_CURSOR_DESTINATION_MISMATCH\", 5)" }
+      mssql: { test: an_incremental_export_whose_destination_path_is_edited_is_refused_and_walked_out_mssql, asserts: "Refused::by_code(\"RIVET_STATE_CURSOR_DESTINATION_MISMATCH\", 5)" }
+      mongo: { test: a_resume_export_whose_destination_path_is_edited_is_refused_and_walked_out_mongo, asserts: "Refused::by_code(\"RIVET_STATE_CURSOR_DESTINATION_MISMATCH\", 5)" }
+      oracle: { test: an_incremental_export_whose_destination_path_is_edited_is_refused_and_walked_out_oracle, asserts: "Refused::by_code(\"RIVET_STATE_CURSOR_DESTINATION_MISMATCH\", 5)" }
+      another_format: { test: an_incremental_export_whose_format_is_edited_is_refused_and_walked_out_postgres, asserts: "Refused::by_code(\"RIVET_STATE_CURSOR_DESTINATION_MISMATCH\", 5)" }
+      another_store: { test: an_incremental_export_moved_to_another_store_is_refused_and_walked_out_postgres, asserts: "Refused::by_code(\"RIVET_STATE_CURSOR_DESTINATION_MISMATCH\", 5)" }
+      a_dated_destination: { test: a_dated_destination_is_one_place_and_a_resolved_one_fills_it, asserts: "assert!(same_place(dated, \"s3://b/2026-10-08/orders/\"));" }
 
   - id: resume_without_a_checkpoint_exits_non_zero
     stated:
