@@ -583,6 +583,65 @@ pub fn enable_cdc(table: &str, ci: &str) {
     ));
 }
 
+const CAPTURE_JOB_RUNNING: &str = "SELECT COUNT(*) FROM msdb.dbo.sysjobactivity ja \
+     JOIN msdb.dbo.sysjobs j ON ja.job_id = j.job_id \
+     WHERE j.name = 'cdc.rivet_capture' \
+       AND ja.session_id = (SELECT MAX(session_id) FROM msdb.dbo.syssessions) \
+       AND ja.start_execution_date IS NOT NULL \
+       AND ja.stop_execution_date IS NULL";
+
+/// The `mssql-cdc` database's one capture job held stopped; dropping it starts the job again.
+pub struct CaptureJobStalled(std::time::Instant);
+
+/// Stop the capture job and keep the Agent from restarting it; the caller holds `cross_process_serial("mssql_cdc")`.
+pub fn stall_capture_job() -> CaptureJobStalled {
+    let stalled = CaptureJobStalled(std::time::Instant::now());
+    mssql_cdc_try_exec(
+        "EXEC msdb.dbo.sp_update_job @job_name = N'cdc.rivet_capture', @enabled = 0",
+    );
+    while mssql_cdc_query_i64(CAPTURE_JOB_RUNNING) > 0 {
+        mssql_cdc_try_exec("EXEC sys.sp_cdc_stop_job @job_type = N'capture'");
+        assert!(
+            stalled.0.elapsed() < std::time::Duration::from_secs(60),
+            "fixture: the capture job did not stop within 60s"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    stalled
+}
+
+/// Enable and start the capture job, tolerating a job that is already running.
+pub fn resume_capture_job() {
+    mssql_cdc_try_exec(
+        "EXEC msdb.dbo.sp_update_job @job_name = N'cdc.rivet_capture', @enabled = 1",
+    );
+    mssql_cdc_try_exec("EXEC sys.sp_cdc_start_job @job_type = N'capture'");
+}
+
+impl Drop for CaptureJobStalled {
+    fn drop(&mut self) {
+        let stalled = self.0.elapsed();
+        resume_capture_job();
+        if std::thread::panicking() {
+            return;
+        }
+        let back = std::time::Instant::now();
+        while mssql_cdc_query_i64(CAPTURE_JOB_RUNNING) == 0 {
+            assert!(
+                back.elapsed() < std::time::Duration::from_secs(60),
+                "fixture: the capture job did not start again within 60s"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            resume_capture_job();
+        }
+        eprintln!(
+            "capture job: stalled {:.1}s, running again after {:.1}s",
+            stalled.as_secs_f64(),
+            back.elapsed().as_secs_f64()
+        );
+    }
+}
+
 /// Block until the capture job has copied at least `want` rows into the change
 /// table — the job runs asynchronously, so the test must wait for it.
 pub fn wait_for_capture(ci: &str, want: i64) {
