@@ -40,6 +40,15 @@
     held 32 (48 with `cleanup_source`). Count N + 1 against the role's and the server's
     connection limits.
 
+- **Fix: `rivet load` into BigQuery opens fewer files per table loaded at once.** Each
+  table of a `--pool N` load built its own HTTP client for the BigQuery API (a thread, an
+  event queue and its connections apiece); one client now serves every table of the
+  process. Measured on macOS, 16 tables from GCS at `--pool 16`: the peak of open files
+  goes from 204 to 139 (event queues 51 to 6), the load takes the same 14 s, and
+  `--pool 1` and `--pool 4` are unchanged at 18 and 30. The rest of the peak is one state
+  connection and the storage connections of each table, which this change does not touch.
+  No config, state or file format change.
+
 - **Fix: a PostgreSQL export through a transaction-mode pgBouncer that keeps prepared
   statements is delivered under its own columns.** Applies to every batch mode (`full`,
   `chunked` by key or by range, `incremental`) when the source URL points at pgBouncer in
