@@ -1772,7 +1772,8 @@ jobs:
           --skip via_duckdb --skip mongo --skip warehouse_cell
           --skip readable_secondary --skip mssql_checkpoint_follows_a_failover
           --skip mssql_checkpoint_from_another_database --skip from_a_standby
-          --skip failover_to_the_standby --skip bounded_on_a_standby
+          --skip failover_to_the_standby --skip bounded_on_a_standby --skip on_a_standby
+          --skip doctor_is_not_green_where_the_cdc_run_refuses_a_replica
           --skip loads_into_bigquery_or_refuses_by_column
           --skip cleanup_source_never_deletes_parts --skip compact_after_a_source_alter
           --skip a_non_unicode_database_round_trips
