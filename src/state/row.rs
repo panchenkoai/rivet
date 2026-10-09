@@ -228,12 +228,15 @@ impl StateStore {
         }
     }
 
-    /// Run `work` as one unit of work: its statements commit together on `Ok` and roll back on `Err` or panic; a nested call joins the open one.
+    /// Run `work` as one unit of work: its statements commit together on `Ok` and roll back on `Err` or panic; a nested call joins the open one. On SQLite it takes the write lock first, so a unit that reads before it writes waits for another writer.
     pub(super) fn transaction<T>(&self, work: impl FnOnce() -> Result<T>) -> Result<T> {
         if self.in_tx.get() {
             return work();
         }
-        self.batch("BEGIN")?;
+        self.batch(match &self.conn {
+            StateConn::Sqlite(_) => "BEGIN IMMEDIATE",
+            StateConn::Postgres(_) => "BEGIN",
+        })?;
         self.in_tx.set(true);
         let open = OpenTx(self);
         let out = work()?;
@@ -267,6 +270,28 @@ impl Drop for OpenTx<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A unit of work that reads before it writes holds the write lock from its start: another writer of the state file waits, and its own write lands.
+    #[test]
+    fn a_unit_of_work_that_reads_first_writes_beside_another_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("rivet.yaml");
+        std::fs::write(&cfg, "# test").unwrap();
+        let s = StateStore::open(cfg.to_str().unwrap()).unwrap();
+        let other = rusqlite::Connection::open(dir.path().join(".rivet_state.db")).unwrap();
+        let row = "INSERT INTO export_state (export_name, last_cursor_value, last_run_at) \
+                   VALUES (?1, '1', 'now')";
+        let done = s.transaction(|| {
+            s.query_opt("SELECT COUNT(*) FROM export_state", &[], |r| r.i64(0))?;
+            let other_is_held = other.execute(row, ["theirs"]).is_err();
+            s.execute(row, &["ours".into()])?;
+            Ok(other_is_held)
+        });
+        assert!(
+            matches!(done, Ok(true)),
+            "a unit of work that read first lost its write to another writer, or let that writer in: {done:?}"
+        );
+    }
 
     #[test]
     fn query_execute_round_trip_over_the_seam() {

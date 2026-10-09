@@ -15,8 +15,8 @@
 #                   chunk_task rows and committed parts of an unfinished range-chunk run, and the
 #                   stored cursor of an incremental export (`Rig::damage`, `Rig::edit_state`,
 #                   graded by `Rig::delivers_or_refuses`). A `*_resume` row continues the same
-#                   damage with `rivet run --resume`, held to the source by the cell (the default
-#                   oracle grades an explicit resume on the rows it delivered).
+#                   damage with `rivet run --resume`, held to the source by the default oracle and
+#                   by the cell's own read of the ids the success manifest declares.
 #   takeaway_<what> a resource taken away while the run is alive (`Rig::beside_a_live_run`): the
 #                   source session killed on the server, the destination or the SQLite state made
 #                   read-only (`Rig::read_only`), a bucket removed, the Postgres state closed, the

@@ -35,10 +35,13 @@
     were in no part, under exit 0 and `_SUCCESS`, and an empty table that filled after the
     crash was delivered as 0 rows. Now the resumed run detects the key span again, adds
     tasks for the keys outside the stored plan, and plans a run that committed no part
-    again whole. The windows the crashed run committed are not read again. `rivet apply`
-    replays the ranges its plan sealed, as before. A resume now runs the `min`/`max` and
-    NULL-key probes a fresh run does and fails where a fresh run would (a NULL key, a key
-    span past the sparse-plan limit).
+    again whole. The windows the crashed run committed are not read again. The units of
+    `rivet apply --pool --split --resume` resume the same way, so rows gained past the top
+    key land in the last unit (before, the resumed split delivered the keys of the crashed
+    plan only). `rivet apply` of a sealed plan artifact replays the ranges its plan
+    sealed, as before. A resume now runs the `min`/`max` and NULL-key probes a fresh run
+    does and fails where a fresh run would (a NULL key, a key span past the sparse-plan
+    limit).
   - **A resumed parallel keyset run reads past its last range.** Before, a `chunk_by_key` +
     `parallel` + `chunk_checkpoint` run whose last key range had committed before the crash
     read no key above it on resume. Now it reads the keys past the highest one that range

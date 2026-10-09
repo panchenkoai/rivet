@@ -65,8 +65,6 @@ pub(crate) struct Case {
     before: Vec<Result<ManifestSnapshot, String>>,
     /// The invocation carries `--resume`.
     resume: bool,
-    /// The `--resume` has a run to complete: the state held an unfinished one before the invocation, whose plan was made then.
-    resumes_a_run: bool,
     /// The chunk ranges a sealed plan replays (computed when it was planned), else `null`.
     replay: serde_json::Value,
     /// A `rivet cdc` invocation's own surface, graded as the `run` of the config it is equivalent to.
@@ -209,9 +207,7 @@ pub(crate) fn begin(argv: &[String], envs: &[(&str, &str)], cwd: Option<&Path>) 
             case.take_image(e, envs, &case.image(e, "begin"));
         }
     }
-    let snapshot = refusal::Snapshot::take(&scope);
-    case.resumes_a_run = case.resume && snapshot.holds_an_unfinished_run();
-    case.snapshot = Some(snapshot);
+    case.snapshot = Some(refusal::Snapshot::take(&scope));
     Some(case)
 }
 
@@ -424,7 +420,6 @@ fn parse(argv: &[String], envs: &[(&str, &str)], cwd: Option<&Path>) -> Option<C
         exports,
         before: Vec::new(),
         resume: argv.iter().any(|a| a == "--resume"),
-        resumes_a_run: argv.iter().any(|a| a == "--resume"),
         replay,
         cli,
         events: Vec::new(),
@@ -786,7 +781,6 @@ impl Case {
                 "new_snapshot_manifests": fresh(&now_snap, &seen_snap),
                 "snapshot": self.declares_snapshot(e),
                 "resume": self.resume,
-                "resumes_a_run": self.resumes_a_run,
                 "replay": self.replay.as_array().is_some_and(|r| !r.is_empty()),
                 "ranges": self.replay,
                 "range_column": e.get("chunk_by_days").is_none().then(|| s(e, "chunk_column")).flatten(),

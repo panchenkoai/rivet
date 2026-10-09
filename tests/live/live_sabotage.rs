@@ -390,7 +390,7 @@ fn continued_after(engine: SqlEngine, argv: &[&str], sabotage: impl FnOnce(&Rig)
     }
 }
 
-/// Sorted ids of the parts the success manifests of `rig`'s destination declare: what an explicit resume is held to, since the default oracle grades it on the rows it delivered.
+/// Sorted ids of the parts the success manifests of `rig`'s destination declare: the cell's own read of what a recovered run delivered, beside the default oracle's.
 fn declared_ids(rig: &Rig) -> Vec<i64> {
     let mut ids: Vec<i64> = rig
         .read_declared_parts()

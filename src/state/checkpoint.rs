@@ -810,6 +810,48 @@ mod tests {
         assert_eq!(plan("run_b"), [task(0, "1", "5", "pending")], "another run");
     }
 
+    /// A resumed unit extends its plan while its sibling writes the same state file: no replan is lost to `database is locked`.
+    #[test]
+    fn a_replan_beside_another_writer_of_the_state_waits_for_it() {
+        let (dir, s) = store_on_disk();
+        s.create_chunk_run("run_a", "orders", "deadbeef", 2)
+            .unwrap();
+        s.create_chunk_run("run_b", "other", "deadbeef", 2).unwrap();
+        s.insert_chunk_tasks("run_a", &[(1, 5)]).unwrap();
+        s.insert_chunk_tasks("run_b", &[(1, 5)]).unwrap();
+        let cfg = dir.path().join("rivet.yaml");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let other = StateStore::open(cfg.to_str().unwrap()).expect("second store");
+                let mut n = 0u64;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    other
+                        .fail_chunk_task("run_b", 0, "x", true)
+                        .expect("the other writer");
+                    n += 1;
+                }
+                n
+            })
+        };
+        let mut failed = Vec::new();
+        for i in 0..1000i64 {
+            if let Err(e) = s.replan_chunk_tasks("run_a", false, &[(10 + i, 10 + i)]) {
+                failed.push(format!("{i}: {e:#}"));
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let writes = writer.join().unwrap();
+        assert!(
+            failed.is_empty(),
+            "{} of 1000 replans failed beside {writes} writes: {}",
+            failed.len(),
+            failed[0]
+        );
+        assert_eq!(s.count_chunk_tasks_total("run_a").unwrap(), 1001);
+    }
+
     #[test]
     fn chunk_claim_complete_and_finalize() {
         let (_dir, s) = store_on_disk();
