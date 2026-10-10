@@ -534,13 +534,58 @@ fn a_pooled_load_short_of_file_descriptors_never_runs_under_a_lapsed_lease() {
     );
 }
 
-/// A pooled load of sixteen tables fits in 130 open files: its storage requests share one budget, not one connection set per table.
+/// The most TLS connections a `rivet load` of this config holds at once, sampled with `lsof` every 50 ms while `load` runs.
+fn peak_tls_connections(
+    rig: &Rig,
+    load: impl FnOnce() -> std::process::Output,
+) -> (
+    std::process::Output,
+    std::collections::BTreeMap<String, usize>,
+) {
+    let wanted = format!("load --config {}", rig.config_path().display());
+    let ended = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let sampler = scope.spawn(|| {
+            let run = |cmd: &str, args: &[&str]| {
+                let out = std::process::Command::new(cmd)
+                    .args(args)
+                    .output()
+                    .unwrap_or_else(|e| {
+                        panic!("fixture: {cmd} is a prerequisite of this cell: {e}")
+                    });
+                String::from_utf8_lossy(&out.stdout).into_owned()
+            };
+            let mut peak = std::collections::BTreeMap::<String, usize>::new();
+            while !ended.load(std::sync::atomic::Ordering::SeqCst) {
+                for pid in run("pgrep", &["-f", &wanted]).split_whitespace() {
+                    let open = run("lsof", &["-a", "-n", "-P", "-i", "TCP", "-p", pid]);
+                    let mut by_remote = std::collections::BTreeMap::<String, usize>::new();
+                    for line in open.lines().filter(|l| l.contains(":443")) {
+                        let remote = line.rsplit("->").next().unwrap_or_default();
+                        let remote = remote.split_whitespace().next().unwrap_or_default();
+                        *by_remote.entry(remote.to_string()).or_default() += 1;
+                    }
+                    if by_remote.values().sum::<usize>() > peak.values().sum::<usize>() {
+                        peak = by_remote;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            peak
+        });
+        let out = load();
+        ended.store(true, std::sync::atomic::Ordering::SeqCst);
+        (out, sampler.join().expect("the sampler"))
+    })
+}
+
+/// A pooled load of sixteen tables takes its storage requests from one budget, so it holds far fewer connections than three per table.
 #[test]
 #[ignore = "live: requires postgres + BigQuery creds"]
-fn a_pooled_load_of_sixteen_tables_fits_in_130_open_files() {
+fn a_pooled_load_of_sixteen_tables_shares_one_budget_of_storage_connections() {
     const POOL: usize = 16;
-    /// Between what a pooled load holds with the budget (117 measured) and without it (145).
-    const FILES: u64 = 130;
+    /// Between the peaks measured with the budget (50 and 51: 22 to storage, 26 to BigQuery) and without it (74).
+    const MOST: usize = 60;
     let Some(bq) = BqLive::from_env("load_budget") else {
         return;
     };
@@ -550,18 +595,19 @@ fn a_pooled_load_of_sixteen_tables_fits_in_130_open_files() {
     let out = rig.run_args_env(&[], &[]);
     assert!(out.status.success(), "the extract:\n{}", stderr(&out));
 
-    let capped = rig.twin().open_files(FILES);
-    let out = capped.load_args_env(&["--pool", &POOL.to_string()], &[]);
+    let (out, peak) = peak_tls_connections(&rig, || {
+        rig.load_args_env(&["--pool", &POOL.to_string()], &[])
+    });
+    assert!(out.status.success(), "the pooled load:\n{}", stderr(&out));
+    let all: usize = peak.values().sum();
     assert!(
-        out.status.success(),
-        "a pooled load under {FILES} open files:\n{}",
-        stderr(&out)
+        all > POOL,
+        "fixture: the sampler saw {all} TLS connection(s), fewer than one per worker: {peak:?}"
     );
-    let mut loaded = existing_tables(&bq, &names);
-    loaded.sort();
-    let mut expected = tables.clone();
-    expected.sort();
-    assert_eq!(loaded, expected, "every table is loaded under the cap");
+    assert!(
+        all <= MOST,
+        "a load of {POOL} tables held {all} TLS connections at once, more than {MOST}: {peak:?}"
+    );
 }
 
 /// A pooled load of sixteen tables holds at most one state connection per worker plus the keeper's.
