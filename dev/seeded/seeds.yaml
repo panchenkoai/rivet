@@ -1242,3 +1242,13 @@ seeds:
         na: "the defect is how the PostgreSQL adapter names its statements (rust-postgres prepares a named statement per query, pgBouncer keeps one by its text); this engine's adapter has no such statement"
       oracle:
         na: "the defect is how the PostgreSQL adapter names its statements (rust-postgres prepares a named statement per query, pgBouncer keeps one by its text); this engine's adapter has no such statement"
+  - name: lease-granted-without-a-keeper
+    class: a PostgreSQL-state lease is granted to a process that has no live connection renewing it, so the work it guards runs under a lease that lapses
+    history: "0.31.0 - `rivet load --pool 16` under `ulimit -n 256`: 12 heartbeat threads died at connect, their tables printed LOAD OK and the load exited 0"
+    scope: state
+    engines:
+      postgres-state:
+        patch: lease-granted-without-a-keeper/postgres-state.patch
+        cells: [a_load_that_cannot_open_its_lease_keeper_refuses_twice_then_loads]
+      sqlite-state:
+        na: the SQLite lease is an flock on a sidecar file, held by its descriptor until the holder ends - nothing renews it and no connection can fail to open

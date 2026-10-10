@@ -558,6 +558,14 @@ scenarios:
     mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no range-chunk checkpoint" }
     oracle:   { test: a_chunk_checkpoint_removed_under_its_run_is_refused_and_walked_out_oracle }
 
+  - id: refusal_state_lease_lost
+    what: "RIVET_STATE_LEASE_LOST: a PostgreSQL-state `rivet load` or `rivet compact` whose table lease stopped being its own (not renewed within the TTL, or taken by another holder) before the warehouse write"
+    postgres: { gap: "refused by its code with the ledger row `refused` and no warehouse table, refused again as busy while the other holder is there, then loaded once that holder ends (the remedy the action names) in live_load_lease_keeper::a_load_whose_lease_is_taken_mid_load_writes_nothing_and_is_recorded_refused; not walked through the rig's refusal walk (one wrong remedy), and `rivet compact` has no cell" }
+    mysql:    { na: "the refusal is the state lease's under a load, which never reads the source: the postgres column carries the row" }
+    mssql:    { na: "the refusal is the state lease's under a load, which never reads the source: the postgres column carries the row" }
+    mongo:    { na: "the refusal is the state lease's under a load, which never reads the source: the postgres column carries the row" }
+    oracle:   { na: "the refusal is the state lease's under a load, which never reads the source: the postgres column carries the row" }
+
   - id: refusal_state_run_in_progress
     what: "RIVET_STATE_RUN_IN_PROGRESS: `state reset` beside a live checkpointed run of the export; refused twice, `state reset-chunks` beside it is refused too and `--stuck-checkpoints` leaves its checkpoint, then `wait for it to finish` and (a second live run) `stop that process` each let the reset through, and a run then delivers the source"
     postgres: { test: a_state_reset_beside_a_live_run_is_refused_and_walked_out_postgres }

@@ -217,7 +217,8 @@ pub enum Commands {
         /// isolates to itself and the rest keep loading, and the per-table lease
         /// is unchanged — `rivet load` and `rivet compact` still refuse a table
         /// the other holds. Each worker opens its own ledger connection, so N is
-        /// also N connections to the state backend; a worker that cannot reopen
+        /// also N connections to the state backend (N + 1 on a PostgreSQL state,
+        /// where one more renews the workers' leases); a worker that cannot reopen
         /// the ledger takes no table, and the other workers load the queue.
         /// Defaults to 16 — the ceiling — capped at the number of tables. Pass
         /// `--pool 1` for the strictly sequential pass.
@@ -240,8 +241,9 @@ pub enum Commands {
         /// another: every freeing worker takes the next table. A failing table
         /// still isolates to itself, and the per-table lease is unchanged — a
         /// table `rivet load` holds is still refused. Each worker opens its own
-        /// ledger connection, so N is also N connections to the state backend; a
-        /// worker that cannot reopen the ledger takes no table, and the other
+        /// ledger connection, so N is also N connections to the state backend
+        /// (N + 1 on a PostgreSQL state, where one more renews the workers'
+        /// leases); a worker that cannot reopen the ledger takes no table, and the other
         /// workers compact the queue. Defaults to 16 — the ceiling — capped
         /// at the number of tables. Pass `--pool 1` for the sequential pass.
         #[arg(long, value_name = "N")]

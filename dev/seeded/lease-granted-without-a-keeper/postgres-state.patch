@@ -1,0 +1,32 @@
+diff --git a/src/state/load_lease.rs b/src/state/load_lease.rs
+index eaf61a6a..b42a1d7b 100644
+--- a/src/state/load_lease.rs
++++ b/src/state/load_lease.rs
+@@ -293,7 +293,7 @@ impl StateStore {
+             StateRef::Postgres(url) => {
+                 let ttl = lease_ttl_s();
+                 let host = host_name();
+-                let keeper = keeper_for(url, ttl).map_err(|e| keeper_unavailable(key, &e))?;
++                let keeper = keeper_for(url, ttl).ok();
+                 let granted = Instant::now();
+                 let holder = format!(
+                     "{host}:{}:{}",
+@@ -339,13 +339,16 @@ impl StateStore {
+                 if got.is_none() {
+                     return Ok(None);
+                 }
+-                let id = keeper.shared.keep(key, &holder, granted);
++                let kept = keeper.map(|k| {
++                    let id = k.shared.keep(key, &holder, granted);
++                    (k, id)
++                });
+                 Ok(Some(LoadLease {
+                     store: self,
+                     key: key.to_string(),
+                     holder,
+                     _file: None,
+-                    kept: Some((keeper, id)),
++                    kept,
+                 }))
+             }
+             StateRef::Sqlite(db) => {
