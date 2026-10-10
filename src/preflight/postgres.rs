@@ -80,7 +80,7 @@ fn diagnose_pg(
             // Direct min/max on the relation when the user used the `table:`
             // shortcut — avoids the subquery wrap that PG would materialise
             // (3.2 GB of temp_files on a 8.6 GB table in our content_items bench).
-            let range_query = match crate::sql::strip_select_star_from(base_query) {
+            let range_query = match crate::pipeline::chunked::strip_select_star_from(base_query) {
                 Some(tbl) => format!("SELECT min({expr})::text, max({expr})::text FROM {tbl}"),
                 None => format!(
                     "SELECT min({expr})::text, max({expr})::text FROM ({base_query}) AS _rivet"
@@ -228,7 +228,7 @@ fn get_cursor_range_pg(
     // a single (nonexistent) identifier instead of injecting SQL into the
     // min()/max() aggregates (CWE-89) — same defense the MSSQL sibling applies.
     let expr = crate::sql::quote_ident(SourceType::Postgres, cursor_col);
-    let range_query = match crate::sql::strip_select_star_from(base_query) {
+    let range_query = match crate::pipeline::chunked::strip_select_star_from(base_query) {
         Some(tbl) => format!("SELECT min({expr})::text, max({expr})::text FROM {tbl}"),
         None => {
             format!("SELECT min({expr})::text, max({expr})::text FROM ({base_query}) AS _rivet")
@@ -776,7 +776,10 @@ mod tests {
         assert_ne!(base, "SELECT 1");
         // …and it must be recognised as a single-table read so the min/max
         // range probe rewrites in place (recovering the dropped Cursor range).
-        assert_eq!(crate::sql::strip_select_star_from(&base), Some("orders"));
+        assert_eq!(
+            crate::pipeline::chunked::strip_select_star_from(&base),
+            Some("orders")
+        );
         assert_eq!(table_from_simple_query(&base).as_deref(), Some("orders"));
     }
 
@@ -790,7 +793,7 @@ mod tests {
             .expect("schema-qualified table shortcut resolves");
         assert_eq!(base, "SELECT * FROM public.orders");
         assert_eq!(
-            crate::sql::strip_select_star_from(&base),
+            crate::pipeline::chunked::strip_select_star_from(&base),
             Some("public.orders")
         );
     }
