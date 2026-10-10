@@ -44,7 +44,7 @@ pub(crate) use crate::workers::{MAX_POOL, effective_pool, run_workers};
 /// It names BOTH bounds on purpose. The warehouse side is the obvious one, but the
 /// STATE backend runs out first and reports an error about a database the operator
 /// was not thinking about: every worker opens its own ledger connection, so N is
-/// also N connections. On Postgres that meets `max_connections` (100 by default,
+/// also N connections (N + 1 on Postgres, where one more renews the leases). On Postgres that meets `max_connections` (100 by default,
 /// minus whatever else is connected and the superuser reserve) and fails with
 /// "sorry, too many clients already" — which rivet classifies as RETRYABLE, so the
 /// run would retry a condition that waiting cannot improve. On SQLite it is not
@@ -88,9 +88,10 @@ pub(crate) fn pool_ceiling_warning(
     }
     Some(format!(
         "--pool {asked} exceeds the ceiling of {MAX_POOL}; running {running} worker(s). \
-         Each worker opens its own ledger connection, so N is also N connections to the \
-         Postgres state backend and counts against its `max_connections` (100 by default, \
-         minus the superuser reserve and whatever else is connected). The warehouse has its \
+         Each worker opens its own ledger connection and one more connection renews their \
+         leases, so N workers are N + 1 connections to the Postgres state backend, counted \
+         against its `max_connections` (100 by default, minus the superuser reserve and \
+         whatever else is connected). The warehouse has its \
          own budget as well: BigQuery allows 100 concurrent interactive queries per PROJECT, \
          shared with everything else running there."
     ))
@@ -165,6 +166,10 @@ mod tests {
         assert!(
             pg.contains(&(MAX_POOL + 1).to_string()),
             "the warning must quote what was asked: {pg}"
+        );
+        assert!(
+            pg.contains("N workers are N + 1 connections to the Postgres state backend"),
+            "the count is the workers plus the lease keeper: {pg}"
         );
         assert!(
             pg.contains("max_connections") && pg.contains("BigQuery"),

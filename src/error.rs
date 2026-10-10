@@ -568,6 +568,16 @@ pub mod codes {
         "RIVET_SOURCE_OVERRIDE_WIRE_MISMATCH",
         "remove or correct the column's `columns:` override (batch: or CAST the column to that type in the export's `query:`; CDC: then re-snapshot the table)",
     );
+    /// A PostgreSQL-state lease was not granted: the connection that renews this process's leases could not be opened.
+    pub const STATE_LEASE_KEEPER_UNAVAILABLE: Code = environment(
+        "RIVET_STATE_LEASE_KEEPER_UNAVAILABLE",
+        "free a connection on the state database (rivet holds one per worker plus one for the lease keeper), raise the open-file limit, or lower `--pool`, then run again; nothing ran under the lease",
+    );
+    /// A PostgreSQL-state lease stopped being this process's while the work it guards was under way.
+    pub const STATE_LEASE_LOST: Code = refusal(
+        "RIVET_STATE_LEASE_LOST",
+        "wait for the other `rivet load` or `rivet compact` of that table to end, then run again; nothing was written to the warehouse",
+    );
     /// `rivet plan` could not read the source it plans over (no connection, a refused login, a missing table or collection).
     pub const PLAN_SOURCE_UNREADABLE: Code = environment(
         "RIVET_PLAN_SOURCE_UNREADABLE",
@@ -595,6 +605,11 @@ pub mod codes {
     pub const LOAD_COUNT_MISMATCH: Code = integrity(
         "RIVET_LOAD_COUNT_MISMATCH",
         "compare the warehouse table with the run's manifest before re-running; the source is kept",
+    );
+    /// A load or compact found its table lease lost after it had written the warehouse.
+    pub const LOAD_LEASE_LOST_DURING_WRITE: Code = integrity(
+        "RIVET_LOAD_LEASE_LOST_DURING_WRITE",
+        "compare the warehouse table with the source before relying on it: another load or compact may have written it at the same time; the next `rivet load` loads the same runs again",
     );
     pub const LOAD_ADOPTION_COLUMN_MISMATCH: Code = refusal(
         "RIVET_LOAD_ADOPTION_COLUMN_MISMATCH",
@@ -670,12 +685,15 @@ pub mod codes {
         STATE_KEYSET_SEQUENTIAL_ANCHOR_UNFINISHED,
         STATE_RUN_IN_PROGRESS,
         STATE_CHUNK_CHECKPOINT_GONE,
+        STATE_LEASE_KEEPER_UNAVAILABLE,
+        STATE_LEASE_LOST,
         PLAN_SOURCE_UNREADABLE,
         SOURCE_COLLECTION_NOT_FOUND,
         DEST_CONTAINER_NOT_FOUND,
         DEST_ALREADY_COMPLETE,
         LOAD_VALUE_OUT_OF_TARGET_RANGE,
         LOAD_COUNT_MISMATCH,
+        LOAD_LEASE_LOST_DURING_WRITE,
         LOAD_ADOPTION_COLUMN_MISMATCH,
         LOAD_TARGET_NOT_RIVETS,
         VALIDATE_FAILED,
