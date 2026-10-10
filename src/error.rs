@@ -1261,3 +1261,49 @@ mod representative_failure_tests {
         assert_eq!(classify_exit(&failures[idx]), ExitClass::Refusal.code());
     }
 }
+
+#[cfg(test)]
+mod stop_marker_tests {
+    use super::{ManifestInconsistency, Refused};
+
+    #[test]
+    fn a_manifest_inconsistency_names_the_two_counts_that_disagree() {
+        let shown = |m: ManifestInconsistency| m.to_string();
+        assert_eq!(
+            shown(ManifestInconsistency::UnsupportedVersion {
+                found: 9,
+                supported: 1
+            }),
+            "manifest_version 9 is not supported by this build (expected 1)"
+        );
+        assert_eq!(
+            shown(ManifestInconsistency::PartCountMismatch {
+                declared: 3,
+                actual: 2
+            }),
+            "part_count declares 3 parts but 2 committed parts found"
+        );
+        assert_eq!(
+            shown(ManifestInconsistency::RowCountMismatch {
+                declared: 10,
+                actual: 7
+            }),
+            "row_count declares 10 rows but committed parts sum to 7"
+        );
+        assert_eq!(
+            shown(ManifestInconsistency::DuplicatePartId(4)),
+            "duplicate part_id 4 in manifest.parts"
+        );
+    }
+
+    #[test]
+    fn a_refused_stop_shows_its_cause_and_keeps_the_cause_chain() {
+        let cause = anyhow::Error::new(std::io::Error::other("disk gone")).context("staging");
+        let stop = Refused(cause);
+        assert_eq!(stop.to_string(), "staging");
+        assert_eq!(
+            std::error::Error::source(&stop).map(ToString::to_string),
+            Some("disk gone".to_string())
+        );
+    }
+}

@@ -461,6 +461,16 @@ mod dest_for_table_tests {
     use super::dest_for_table;
     use crate::config::{DestinationConfig, DestinationType};
 
+    #[test]
+    fn a_stdout_destination_gets_no_per_table_location() {
+        let stdout = DestinationConfig {
+            destination_type: DestinationType::Stdout,
+            ..Default::default()
+        };
+        let d = dest_for_table(&stdout, "orders");
+        assert_eq!((d.path, d.prefix), (None, None));
+    }
+
     // RED test for the finding: cloud prefixes are LITERAL key prefixes —
     // `cloud.rs` concatenates `prefix + key` with NO separator (hence the
     // docs' `prefix: exports/` convention). The multi-table sub-prefix must

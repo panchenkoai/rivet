@@ -611,6 +611,11 @@ pub use crate::error::ManifestInconsistency;
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_manifest_read_cap_is_64_mib() {
+        assert_eq!(MANIFEST_MAX_BYTES, 67_108_864);
+    }
+
     /// One sanitizer for every sidecar name: the manifest copy and the load
     /// lease agree on what a run id / table FQTN becomes on disk.
     #[test]
