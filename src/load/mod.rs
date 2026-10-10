@@ -316,7 +316,7 @@ fn adoption_refusal(
 ) -> String {
     let reads = bytes.map_or_else(
         || "every row".to_string(),
-        |b| format!("every row ({})", crate::pipeline::format_bytes(b)),
+        |b| format!("every row ({})", crate::config::resolve::format_bytes(b)),
     );
     format!(
         "`{table}` (an earlier whole-table load) is partitioned by {existing}, the append declares \
@@ -330,7 +330,7 @@ fn adoption_refusal(
 fn rebuild_refusal(changes: &str, existing: &str, declared: &str, bytes: Option<u64>) -> String {
     let reads = bytes.map_or_else(
         || "every row".to_string(),
-        |b| format!("every row ({})", crate::pipeline::format_bytes(b)),
+        |b| format!("every row ({})", crate::config::resolve::format_bytes(b)),
     );
     format!(
         "`{changes}` is partitioned by {existing}, the load declares {declared}; a table cannot \

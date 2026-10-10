@@ -25,6 +25,7 @@ pub use adaptive::{
     ADAPTIVE_SAMPLE_INTERVAL, BlindSignal, DecisionCause, Governor, next_adaptive_batch_size,
 };
 pub use memory::estimate_row_bytes;
+pub(crate) use profile::retry_backoff_ms;
 pub use profile::{
     BatchMemoryPolicy, SourceTuning, TuningConfig, TuningProfile, merge_tuning_config,
 };

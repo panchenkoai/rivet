@@ -149,17 +149,7 @@ pub use run::{RunOptions, run};
 #[allow(unused_imports)] // `multi_export_concurrent` is wired for future use
 pub(crate) use run::{multi_export_concurrent, multi_export_mode};
 
-pub(crate) fn format_bytes(b: u64) -> String {
-    if b >= 1_073_741_824 {
-        format!("{:.1} GB", b as f64 / 1_073_741_824.0)
-    } else if b >= 1_048_576 {
-        format!("{:.1} MB", b as f64 / 1_048_576.0)
-    } else if b >= 1024 {
-        format!("{:.1} KB", b as f64 / 1024.0)
-    } else {
-        format!("{} B", b)
-    }
-}
+pub(crate) use crate::config::resolve::format_bytes;
 
 /// Strip the trailing recovery-hint portion of a chunked-pipeline error
 /// message produced by `pipeline::chunked`.  Returns the cause prefix and
@@ -215,16 +205,6 @@ mod tests {
     use crate::tuning::SourceTuning;
 
     #[test]
-    fn test_format_bytes() {
-        assert_eq!(format_bytes(500), "500 B");
-        assert_eq!(format_bytes(1024), "1.0 KB");
-        assert_eq!(format_bytes(1536), "1.5 KB");
-        assert_eq!(format_bytes(1_048_576), "1.0 MB");
-        assert_eq!(format_bytes(1_073_741_824), "1.0 GB");
-        assert_eq!(format_bytes(2_684_354_560), "2.5 GB");
-    }
-
-    #[test]
     fn strip_chunked_recovery_hint_strips_use_form() {
         let m = "export 'users': chunk checkpoint run 'users_x' still in progress; \
                  use `rivet run --config foo.yaml --export users --resume` or \
@@ -266,19 +246,6 @@ mod tests {
         let out = clamp_line(&s, 10);
         assert_eq!(out.chars().count(), 10);
         assert!(out.ends_with('…'));
-    }
-
-    #[test]
-    fn format_bytes_boundary_values() {
-        assert_eq!(format_bytes(0), "0 B");
-        assert_eq!(format_bytes(1), "1 B");
-        assert_eq!(format_bytes(1023), "1023 B");
-        assert_eq!(format_bytes(1024), "1.0 KB");
-        assert_eq!(format_bytes(1025), "1.0 KB");
-        assert_eq!(format_bytes(1_048_575), "1024.0 KB");
-        assert_eq!(format_bytes(1_048_576), "1.0 MB");
-        assert_eq!(format_bytes(1_073_741_823), "1024.0 MB");
-        assert_eq!(format_bytes(1_073_741_824), "1.0 GB");
     }
 
     fn minimal_plan() -> ResolvedRunPlan {
