@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- **`rivet load --pool N` keeps at most 16 storage requests in flight for the whole
+  process.** Every table loaded at once used to send its storage requests (list, read,
+  delete) with no shared limit, each request in flight on a connection of its own: a load
+  of 16 tables with `--pool 16` held 46 connections to Cloud Storage and 145 open files,
+  measured on macOS with a release build. It now holds 16 and 117, in the same time
+  (15.0 s before, 14.5 s after, one run each). The budget counts requests, not
+  connections: a connection can outlive its request for a moment, and a debug build
+  sampled every 50 ms held up to 22. A pool larger than the budget waits for a free
+  request instead of opening more connections. The export side (`rivet run` writing to a
+  bucket) is unchanged. No config key: the budget is a constant.
+
 - **Fix (behaviour change): on a PostgreSQL state, `rivet load` and `rivet compact` stop
   instead of writing a table under a lease nothing renews.** Applies only with
   `RIVET_STATE_URL=postgresql://...`; a SQLite state takes its lease as a file lock and is
