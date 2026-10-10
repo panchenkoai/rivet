@@ -164,12 +164,25 @@ mod tests {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
         let server = std::thread::spawn(move || {
-            let (mut peer, _) = listener.accept().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut peer = loop {
+                match listener.accept() {
+                    Ok((peer, _)) => break peer,
+                    Err(_) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(10))
+                    }
+                    Err(_) => return None,
+                }
+            };
+            peer.set_nonblocking(false).unwrap();
+            peer.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .unwrap();
             let mut first = [0u8; 8];
-            peer.read_exact(&mut first).unwrap();
+            peer.read_exact(&mut first).ok()?;
             let _ = peer.write_all(b"N");
-            first
+            Some(first)
         });
         let on = crate::config::TlsConfig {
             mode: crate::config::TlsMode::Require,
@@ -184,7 +197,7 @@ mod tests {
         );
         assert_eq!(
             server.join().unwrap(),
-            [0, 0, 0, 8, 4, 210, 22, 47],
+            Some([0, 0, 0, 8, 4, 210, 22, 47]),
             "the first message is the SSLRequest"
         );
     }
