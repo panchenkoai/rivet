@@ -582,41 +582,7 @@ impl RunManifest {
     }
 }
 
-/// Self-consistency failures detected by [`RunManifest::validate_self_consistency`].
-///
-/// These represent writer bugs, not destination drift; M5 destination-state
-/// checks live in the validate command path.
-#[derive(Debug, PartialEq)]
-pub enum ManifestInconsistency {
-    UnsupportedVersion { found: u32, supported: u32 },
-    PartCountMismatch { declared: u32, actual: usize },
-    RowCountMismatch { declared: i64, actual: i64 },
-    DuplicatePartId(u32),
-}
-
-impl std::fmt::Display for ManifestInconsistency {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::UnsupportedVersion { found, supported } => write!(
-                f,
-                "manifest_version {found} is not supported by this build (expected {supported})"
-            ),
-            Self::PartCountMismatch { declared, actual } => write!(
-                f,
-                "part_count declares {declared} parts but {actual} committed parts found"
-            ),
-            Self::RowCountMismatch { declared, actual } => write!(
-                f,
-                "row_count declares {declared} rows but committed parts sum to {actual}"
-            ),
-            Self::DuplicatePartId(id) => {
-                write!(f, "duplicate part_id {id} in manifest.parts")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ManifestInconsistency {}
+pub use crate::error::ManifestInconsistency;
 
 #[cfg(test)]
 mod tests {

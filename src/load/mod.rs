@@ -399,29 +399,7 @@ impl std::fmt::Display for JobWaitTimeout {
 
 impl std::error::Error for JobWaitTimeout {}
 
-/// A load that stopped before touching the warehouse. The ledger records such a stop as
-/// `refused`, which never makes the target rivet's own — a `failed` row can.
-#[derive(Debug)]
-pub struct Refused(anyhow::Error);
-
-impl std::fmt::Display for Refused {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl std::error::Error for Refused {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.0.source()
-    }
-}
-
-impl Refused {
-    /// The error that stopped the load: its code and exit class are the stop's own.
-    pub(crate) fn cause(&self) -> &anyhow::Error {
-        &self.0
-    }
-}
+pub use crate::error::Refused;
 
 /// Mark whatever went wrong before any warehouse write as a stop, not a failure.
 pub(crate) fn before_write<T>(r: Result<T>) -> Result<T> {

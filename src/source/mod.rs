@@ -20,78 +20,7 @@ use crate::plan::IncrementalCursorPlan;
 use crate::tuning::SourceTuning;
 use crate::types::{ColumnOverrides, CursorState, TypeMapping};
 
-/// A statement-DURATION timeout that **rivet itself** raised — distinct from a
-/// driver-native timeout that carries a structured code (PG 57014, MySQL 3024).
-///
-/// The MSSQL engine has no server-side statement-duration `SET`, so rivet
-/// enforces `tuning.statement_timeout_s` client-side and raises this when the
-/// budget is exceeded (see [`mssql`]). Before this type the retry classifier's
-/// permanence hinged on substring-matching rivet's OWN prose ("statement
-/// timeout after …"); a reworded message would silently flip the error back to
-/// *transient*, and the identical query would be retried until it burned the
-/// budget N times (measured: 3×300 s = 20 min for 0 rows). Carrying a typed
-/// marker means [`crate::pipeline::retry::classify_error`] downcasts the TYPE,
-/// so permanence survives any change to the human-facing wording. The string
-/// branches in the classifier remain a fallback for genuinely driver-native
-/// timeout messages we do not control.
-#[derive(Debug)]
-pub struct StatementDurationTimeout {
-    /// Full actionable message shown to the operator. The classifier keys off
-    /// the TYPE, not this text — it exists only for Display.
-    message: String,
-}
-
-impl StatementDurationTimeout {
-    /// MSSQL client-side statement-duration timeout (no server-side `SET`).
-    pub fn mssql(seconds: u64) -> Self {
-        Self {
-            message: format!(
-                "mssql: statement timeout after {seconds}s (tuning.statement_timeout_s) — \
-                 this query cannot finish within the budget; split it with `mode: chunked` \
-                 (per-chunk statements stay under the limit) or raise \
-                 `tuning.statement_timeout_s`"
-            ),
-        }
-    }
-
-    /// Oracle statement-duration timeout: the driver call timeout plus a check between rows.
-    #[cfg(feature = "oracle")]
-    pub fn oracle(seconds: u64) -> Self {
-        Self {
-            message: format!(
-                "oracle: statement timeout after {seconds}s (tuning.statement_timeout_s) — \
-                 this query cannot finish within the budget; split it with `mode: chunked` \
-                 (per-chunk statements stay under the limit) or raise \
-                 `tuning.statement_timeout_s`"
-            ),
-        }
-    }
-
-    /// MySQL server-side `max_execution_time` timeout (ER_QUERY_TIMEOUT / 3024).
-    /// Wraps the driver's terse "maximum statement execution time exceeded" with
-    /// the actionable fix — including the WIDE-table case (a chunk that still
-    /// times out), which the field's `*_version` tables hit and the raw driver
-    /// error gave no guidance for.
-    pub fn mysql(seconds: u64) -> Self {
-        Self {
-            message: format!(
-                "mysql: statement timeout after {seconds}s (max_execution_time from \
-                 tuning.statement_timeout_s) — this query exceeded its time budget (ERROR 3024). \
-                 Split it with `mode: chunked` / `chunk_by_key` so per-chunk queries stay under \
-                 the limit; if a CHUNK still times out on a WIDE table, lower `chunk_size` or use \
-                 `chunk_size_memory_mb:` (width-aware chunking); or raise `tuning.statement_timeout_s`"
-            ),
-        }
-    }
-}
-
-impl std::fmt::Display for StatementDurationTimeout {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for StatementDurationTimeout {}
+pub use crate::error::StatementDurationTimeout;
 
 /// Summary of a source table relevant to chunked-mode planning. Source-neutral
 /// shape so plan-build can ask either Postgres or MySQL for the same answer.
