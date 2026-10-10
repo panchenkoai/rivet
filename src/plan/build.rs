@@ -29,7 +29,7 @@ pub(crate) fn partition_rollover_of(
     config: &Config,
     export: &ExportConfig,
 ) -> Option<crate::plan::rollover::PartitionRollover> {
-    crate::load::plan::resolved_partition(config, export, export.snapshot_label.as_deref())
+    crate::plan::load_settings::resolved_partition(config, export, export.snapshot_label.as_deref())
         .and_then(rollover_of)
 }
 
@@ -40,16 +40,16 @@ pub(crate) fn cdc_partition_rollover(
     export: &ExportConfig,
     table: &str,
 ) -> Option<crate::plan::rollover::PartitionRollover> {
-    let layout = crate::load::plan::resolved_layout(config, export, Some(table));
+    let layout = crate::plan::load_settings::resolved_layout(config, export, Some(table));
     (!layout.log_is_disposable())
-        .then(|| crate::load::plan::resolved_partition(config, export, Some(table)))
+        .then(|| crate::plan::load_settings::resolved_partition(config, export, Some(table)))
         .flatten()
         .and_then(rollover_of)
 }
 
 /// A COLUMN partition as the writer's budget; other partition forms are not countable.
 fn rollover_of(
-    spec: crate::load::plan::PartitionSpec,
+    spec: crate::config::load::PartitionSpec,
 ) -> Option<crate::plan::rollover::PartitionRollover> {
     match spec.form {
         crate::config::load::PartitionForm::Column {

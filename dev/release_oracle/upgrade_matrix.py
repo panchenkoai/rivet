@@ -1,6 +1,6 @@
 """Upgrade continuity per load-mode family x engine x warehouse, graded by the independent oracle.
 
-One row per arm of `load_mode_of` (src/load/plan.rs), read from the code: the previous release's
+One row per arm of `load_mode_of` (src/plan/load_settings.rs), read from the code: the previous release's
 `init` writes the config, the previous release runs and loads it, the source changes, this build
 runs and loads the same config, and `rig_oracle.grade_load` compares the source with the warehouse
 table in the one DuckDB session. A delta family loaded as an overwrite after the upgrade leaves the
@@ -46,7 +46,7 @@ def load_mode_arms(src: str) -> list[tuple[str, str, str]]:
     """(export mode, guard identifier or "", load mode) for every arm of `load_mode_of` in `src`."""
     m = re.search(r"pub fn load_mode_of\b.*?\bmatch export\.mode \{(.*?)\n    \}\n\}", src, re.S)
     if not m:
-        raise ValueError("load_mode_of's match was not found in src/load/plan.rs")
+        raise ValueError("load_mode_of's match was not found in src/plan/load_settings.rs")
     body = re.sub(r"//[^\n]*", "", m.group(1))
     arms = []
     for pats, guard, load in re.findall(
@@ -62,7 +62,7 @@ def load_mode_arms(src: str) -> list[tuple[str, str, str]]:
 
 def rows() -> list[tuple[str, str, str]]:
     """The families of the tree under test, from its own `load_mode_of`."""
-    return load_mode_arms((ROOT / "src/load/plan.rs").read_text())
+    return load_mode_arms((ROOT / "src/plan/load_settings.rs").read_text())
 
 
 def _warehouse() -> tuple[str, str, str]:
