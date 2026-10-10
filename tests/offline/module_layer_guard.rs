@@ -42,17 +42,13 @@ const LAYERS: &[(&str, &str)] = &[
 const EXCEPTIONS: &[&str] = &[
     // ratchet-pin: module-layer-exceptions strings
     "config -> plan::build::parse_column_overrides_pub",
-    "config -> source::cdc::ORACLE_CONTINUOUS_REFUSAL",
     "config -> sql::wrappable_query",
-    "enrich -> load::cdc::DELETE_FLAG_COLUMN",
     "error -> pipeline::retry::classify_error",
     "notify -> pipeline::RunSummary",
-    "plan -> load::partition_budget::MAX_PARTITIONS_PER_JOB",
     "plan -> load::plan::PartitionSpec",
     "plan -> load::plan::resolved_layout",
     "plan -> load::plan::resolved_partition",
     "plan -> preflight::ExportDiagnostic",
-    "plan -> preflight::SMALL_TABLE_ROW_THRESHOLD",
     "plan -> source::Source",
     "plan -> source::TableIntrospection",
     "plan -> source::connect",
@@ -64,7 +60,6 @@ const EXCEPTIONS: &[&str] = &[
     "preflight -> pipeline::refuse_override_case_miss",
     "preflight -> pipeline::retry::classify_error",
     "redact -> pipeline::ipc::route_log_line",
-    "source -> load::cdc::DELETE_FLAG_COLUMN",
     "source -> pipeline::batch_partition_buckets",
     "source -> pipeline::commit::PartRecord",
     "source -> pipeline::commit::write_part_file",
@@ -78,7 +73,6 @@ const EXCEPTIONS: &[&str] = &[
     "state -> source::url_tls",
     "tuning -> source::Source",
     "tuning -> source::Source::sample_governor_pressure",
-    "tuning -> source::batch_controller::DEFAULT_BATCH_TARGET_MB",
 ]; // ratchet-pin: end
 
 /// Keywords that open an item or a `let`, where a top-level `,` does not end it.

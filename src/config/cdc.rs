@@ -7,6 +7,9 @@ use super::{
     Config, DestinationType, ExportConfig, ExportMode, SourceType, overlapping_table_pair,
 };
 
+/// Why Oracle refuses `until_current: false` / `--stream`: LogMiner here only drains to the open-time SCN.
+pub(crate) const ORACLE_CONTINUOUS_REFUSAL: &str = "Oracle CDC is always a bounded drain to the SCN current at open, so `until_current: false` (`rivet cdc --stream`) would still exit on catch-up — omit it (or set `until_current: true`) and run on a schedule";
+
 /// `until_current` defaults to `true` — the OSS model is the BOUNDED, scheduler-
 /// driven drain ("read to the log end and exit"). `until_current: false` is an
 /// explicit opt-in to the continuous model; making it the default would silently
@@ -910,7 +913,7 @@ impl Config {
                 crate::error::codes::CONFIG_CDC_CONTINUOUS_UNSUPPORTED,
                 "export '{}': {}",
                 export.name,
-                crate::source::cdc::ORACLE_CONTINUOUS_REFUSAL
+                ORACLE_CONTINUOUS_REFUSAL
             );
         }
 

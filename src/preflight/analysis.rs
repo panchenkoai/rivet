@@ -873,11 +873,7 @@ pub(super) fn collect_warnings(
     .collect()
 }
 
-/// Tables at or below this row count are a one-shot full copy, not a workload
-/// worth a "DEGRADED" warning. Mirrors `init::TableInfo::suggest_mode`, which
-/// recommends plain `mode: full` (no index/cursor) up to the same threshold —
-/// so the scaffold init writes must not then be scolded by `check`.
-pub(crate) const SMALL_TABLE_ROW_THRESHOLD: i64 = 100_000;
+pub(crate) use crate::plan::explain::SMALL_TABLE_ROW_THRESHOLD;
 
 /// The verdict for `export`: the table-scan rules of [`compute_verdict`], except a
 /// `mode: cdc` export, which reads the transaction log and scans nothing.

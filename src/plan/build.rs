@@ -55,7 +55,7 @@ fn rollover_of(
         } => Some(crate::plan::rollover::PartitionRollover {
             column,
             granularity,
-            cap: crate::load::partition_budget::MAX_PARTITIONS_PER_JOB as usize,
+            cap: crate::plan::rollover::MAX_PARTITIONS_PER_JOB as usize,
         }),
         _ => None,
     }

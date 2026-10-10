@@ -1268,9 +1268,9 @@ pub(crate) const PG_CDC_HINT: &str = "if this is a permissions/setup error: Post
 pub(crate) const MSSQL_CDC_HINT: &str = "if this is a permissions/setup error: SQL Server CDC must be enabled on the table (sys.sp_cdc_enable_table) with SQL Server Agent running, and the reader needs SELECT on the cdc schema — see the 'SQL Server — CDC change tables' section of docs/reference/cdc.md";
 pub(crate) const ORACLE_CDC_HINT: &str = "if this is a permissions/setup error: Oracle CDC mines redo with LogMiner from CDB$ROOT — the URL names the pluggable database's service, the user is a COMMON user (C##…) granted CREATE SESSION, SET CONTAINER, LOGMINING, EXECUTE_CATALOG_ROLE and SELECT on V_$DATABASE, V_$ARCHIVED_LOG, V_$LOG, V_$LOGFILE, V_$LOGMNR_CONTENTS, V_$LOGMNR_LOGS, V_$TRANSACTION with CONTAINER=ALL, plus SELECT on the captured tables — see the 'Oracle — LogMiner' section of docs/reference/cdc.md";
 pub(crate) const MONGO_CDC_HINT: &str = "if this is a setup error: MongoDB change streams require a replica set (a single-node replica set is fine) — a standalone mongod cannot watch(); the reader needs a role that can run changeStream (readAnyDatabase / read on the db) (connect with directConnection=true to a port-mapped single-node set) — see the 'Prerequisites' section of docs/reference/mongodb.md";
-/// Why Oracle refuses `until_current: false` / `--stream`: LogMiner here only drains to the open-time SCN.
-pub(crate) const ORACLE_CONTINUOUS_REFUSAL: &str = "Oracle CDC is always a bounded drain to the SCN current at open, so `until_current: false` (`rivet cdc --stream`) would still exit on catch-up — omit it (or set `until_current: true`) and run on a schedule";
 
+#[cfg(feature = "oracle")]
+pub(crate) use crate::config::ORACLE_CONTINUOUS_REFUSAL;
 /// Where an oversized transaction spills — `None` unless the operator named a
 /// directory in `RIVET_CDC_SPILL_DIR`.
 ///
@@ -1623,7 +1623,7 @@ impl<'s> CdcSchemaResolver<'s> {
         if let Some(m) = mappings.iter().find(|m| {
             matches!(
                 m.column_name.as_str(),
-                "__op" | "__pos" | "__seq" | crate::load::cdc::DELETE_FLAG_COLUMN
+                "__op" | "__pos" | "__seq" | crate::enrich::DELETE_FLAG_COLUMN
             )
         }) {
             anyhow::bail!(

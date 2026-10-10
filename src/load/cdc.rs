@@ -241,12 +241,7 @@ fn meta_spec(name: &str, ty: TargetType) -> TargetColumnSpec {
     }
 }
 
-/// The soft-delete flag column the view exposes: `true` when the latest change
-/// for a PK was a delete. In rivet's reserved `__` namespace so a plain
-/// `is_deleted` source column cannot collide with it — see
-/// [`is_reserved_column`], which is what makes "reserved" true rather than
-/// merely intended.
-pub const DELETE_FLAG_COLUMN: &str = "__is_deleted";
+pub use crate::enrich::DELETE_FLAG_COLUMN;
 
 /// Every name rivet OWNS in a changelog or base+buffer table.
 ///
