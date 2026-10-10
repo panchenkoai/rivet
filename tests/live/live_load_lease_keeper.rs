@@ -534,6 +534,36 @@ fn a_pooled_load_short_of_file_descriptors_never_runs_under_a_lapsed_lease() {
     );
 }
 
+/// A pooled load of sixteen tables fits in 130 open files: its storage requests share one budget, not one connection set per table.
+#[test]
+#[ignore = "live: requires postgres + BigQuery creds"]
+fn a_pooled_load_of_sixteen_tables_fits_in_130_open_files() {
+    const POOL: usize = 16;
+    /// Between what a pooled load holds with the budget (117 measured) and without it (145).
+    const FILES: u64 = 130;
+    let Some(bq) = BqLive::from_env("load_budget") else {
+        return;
+    };
+    let (tables, rig, _guard) = loadable_pool(&bq, "lk_budget", POOL);
+    let names: Vec<&str> = tables.iter().map(String::as_str).collect();
+    let _cleanup = bq.cleanup(&names);
+    let out = rig.run_args_env(&[], &[]);
+    assert!(out.status.success(), "the extract:\n{}", stderr(&out));
+
+    let capped = rig.twin().open_files(FILES);
+    let out = capped.load_args_env(&["--pool", &POOL.to_string()], &[]);
+    assert!(
+        out.status.success(),
+        "a pooled load under {FILES} open files:\n{}",
+        stderr(&out)
+    );
+    let mut loaded = existing_tables(&bq, &names);
+    loaded.sort();
+    let mut expected = tables.clone();
+    expected.sort();
+    assert_eq!(loaded, expected, "every table is loaded under the cap");
+}
+
 /// A pooled load of sixteen tables holds at most one state connection per worker plus the keeper's.
 #[test]
 #[ignore = "live: requires postgres + a PostgreSQL state server + BigQuery creds"]
