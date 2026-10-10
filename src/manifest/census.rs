@@ -744,7 +744,155 @@ mod tests {
         assert!(census.adopted_by_active_running(&census.runs()[0]));
     }
 
+    /// Only a `{family}#<digits>` name is a split unit: `#eu`, a bare `#` and a
+    /// plain name are ordinary exports of the family, superseded like any other.
+    #[test]
+    fn only_a_digit_suffix_after_the_family_makes_a_run_a_split_unit() {
+        let named = |name: &str| {
+            let keyed = vec![keyed("r1", m("r1", name, "orders"))];
+            let census = ManifestCensus::new(&keyed);
+            let run = &census.runs()[0];
+            (
+                run.unit_index().map(str::to_string),
+                run.is_split_unit(),
+                census.split_units("orders").len(),
+            )
+        };
+        assert_eq!(named("orders#0"), (Some("0".into()), true, 1));
+        assert_eq!(named("orders#12"), (Some("12".into()), true, 1));
+        for plain in ["orders", "orders#", "orders#eu", "orders#1a", "orders_1"] {
+            assert_eq!(named(plain), (None, false, 0), "{plain}");
+        }
+
+        // The consequence: a newer success of `orders#eu` retires the marker of
+        // `orders#us`, because neither is a unit of a split.
+        let mut marker = m("r0", "orders#us", "orders");
+        marker.status = ManifestStatus::Running;
+        let mut done = m("r1", "orders#eu", "orders");
+        done.started_at = "2026-08-21T00:05:00Z".into();
+        let keyed = vec![keyed("r0", marker), keyed("r1", done)];
+        let census = ManifestCensus::new(&keyed);
+        assert!(census.superseded(&census.runs()[0]));
+    }
+
+    /// "Newer" is strict on both liveness relations: a run that started at the
+    /// very instant of another is its contemporary, never its successor.
+    #[test]
+    fn a_run_that_started_at_the_same_instant_neither_supersedes_nor_adopts() {
+        let at = |run: &str, status: ManifestStatus, started: &str| {
+            let mut x = m(run, "orders", "orders");
+            x.status = status;
+            x.started_at = started.into();
+            keyed(run, x)
+        };
+        const T0: &str = "2026-08-21T00:00:00+00:00";
+        const T1: &str = "2026-08-21T00:00:01+00:00";
+
+        // (success started at, is the marker started at T0 superseded)
+        for (success_at, superseded) in [(T1, true), (T0, false)] {
+            let keyed = vec![
+                at("r0", ManifestStatus::Running, T0),
+                at("r1", ManifestStatus::Success, success_at),
+            ];
+            let census = ManifestCensus::new(&keyed);
+            assert_eq!(
+                census.superseded(&census.runs()[0]),
+                superseded,
+                "success started at {success_at}"
+            );
+            assert_eq!(census.active_running(), !superseded, "{success_at}");
+        }
+
+        // (marker started at, is the run that crashed at T0 adopted by it)
+        for (marker_at, adopted) in [(T1, true), (T0, false)] {
+            let keyed = vec![
+                at("r0", ManifestStatus::Interrupted, T0),
+                at("r1", ManifestStatus::Running, marker_at),
+            ];
+            let census = ManifestCensus::new(&keyed);
+            assert_eq!(
+                census.adopted_by_active_running(&census.runs()[0]),
+                adopted,
+                "marker started at {marker_at}"
+            );
+        }
+
+        // A live marker is not its own successor.
+        let keyed = vec![at("r0", ManifestStatus::Running, T0)];
+        let census = ManifestCensus::new(&keyed);
+        assert!(!census.adopted_by_active_running(&census.runs()[0]));
+    }
+
+    /// Two runs of one unit whose finish stamps are the same unreadable text: the
+    /// selection keeps the first listed, it does not flip to whichever came last.
+    #[test]
+    fn an_unreadable_finish_stamp_that_ties_is_not_after_in_either_direction() {
+        assert!(!finished_after("junk", "junk"));
+        assert!(!finished_after("", ""));
+
+        let unreadable = |run: &str| {
+            let mut x = m(run, "orders", "orders");
+            x.finished_at = "not-a-time".into();
+            keyed(run, x)
+        };
+        let keyed = vec![unreadable("r1"), unreadable("r2")];
+        let census = ManifestCensus::new(&keyed);
+        let sel: Vec<&str> = census
+            .latest_generation()
+            .iter()
+            .map(|r| r.manifest.run_id.as_str())
+            .collect();
+        assert_eq!(sel, vec!["r1"]);
+    }
+
     // ── generation selection + coherence ─────────────────────────────────────
+
+    /// A plain snapshot beside a complete split generation is two generations of
+    /// one table, and a second top window is named as such, with the counts.
+    #[test]
+    fn a_plain_snapshot_or_a_second_top_window_is_refused_as_a_second_generation() {
+        let unit = |run: &str, name: &str, lo, hi| {
+            let mut x = m(run, name, "daily");
+            x.split_window = Some(window(lo, hi));
+            keyed(run, x)
+        };
+        let refusal = |keyed: Vec<(String, RunManifest)>| {
+            let census = ManifestCensus::new(&keyed);
+            ensure_single_generation(&census.latest_generation())
+                .expect_err("two generations must not load as one")
+                .to_string()
+        };
+
+        let with_plain = refusal(vec![
+            unit("r1", "daily#0", None, Some("500")),
+            unit("r2", "daily#1", Some("500"), None),
+            keyed("r3", m("r3", "daily", "daily")),
+        ]);
+        assert!(
+            with_plain.contains("MORE THAN ONE split generation"),
+            "{with_plain}"
+        );
+        assert!(
+            with_plain.contains(
+                "(2 split units incl. 1 bottom + 1 top window(s), plus 1 non-split snapshot(s));"
+            ),
+            "{with_plain}"
+        );
+
+        let two_tops = refusal(vec![
+            unit("r1", "daily#0", None, Some("500")),
+            unit("r2", "daily#1", Some("500"), None),
+            unit("r3", "daily#2", Some("300"), None),
+        ]);
+        assert!(
+            two_tops.contains("MORE THAN ONE split generation"),
+            "{two_tops}"
+        );
+        assert!(
+            two_tops.contains("(3 split units incl. 1 bottom + 2 top window(s));"),
+            "{two_tops}"
+        );
+    }
 
     /// The latest run PER UNIT — a split snapshot's N units all belong to the
     /// selection, and their coherence check passes when the windows tile.

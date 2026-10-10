@@ -734,6 +734,28 @@ mod tests {
         assert_eq!(chunk_index_of("orders_20260101_chunkzz_aabb.parquet"), None);
     }
 
+    /// A name is a chunk part only with BOTH halves of the writer's suffix: a digit index and the 16-hex nonce.
+    #[test]
+    fn a_name_is_a_chunk_part_only_with_a_digit_index_and_the_16_hex_nonce() {
+        const NONCE: &str = "00000000deadbeef";
+        let named = |index: &str, nonce: &str| format!("orders_20260101_000000_{index}_{nonce}");
+        for (stem, index) in [
+            (named("chunk7", NONCE), Some("7")),
+            (named("chunk7", "aabb"), None),
+            (named("chunk7", "00000000deadbeef0"), None),
+            (named("chunk7", "zzzzzzzzzzzzzzzz"), None),
+            (named("chunk7", "0000000-deadbeef"), None),
+            (named("chunkzz", NONCE), None),
+            (named("chunk7a", NONCE), None),
+            (named("chunk", NONCE), None),
+            (named("keyset7", NONCE), None),
+        ] {
+            for name in [format!("{stem}.parquet"), format!("{stem}_p3.parquet")] {
+                assert_eq!(chunk_index_of(&name), index, "{name}");
+            }
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -1148,6 +1170,76 @@ mod tests {
         assert!(msg.contains("still in progress"), "got: {msg}");
         assert!(msg.contains("--resume"), "must hint at --resume");
         assert!(msg.contains("reset-chunks"), "must hint at reset-chunks");
+    }
+
+    /// A resume says how many chunk tasks it put back in the queue, and says nothing when it put back none.
+    #[test]
+    fn a_resume_reports_the_chunk_tasks_it_requeued_and_is_silent_when_it_requeued_none() {
+        use crate::pipeline::run::run_tail_tests::{
+            captured_warnings_mentioning, install_warn_capture,
+        };
+        install_warn_capture();
+        const RANGES: [(i64, i64); 4] = [(1, 10), (11, 20), (21, 30), (31, 40)];
+        let resumed = |export: &str, crashed_mid_chunk: bool| {
+            let state = StateStore::open_in_memory().unwrap();
+            let mut plan = make_plan(export);
+            let cp = chunked_plan(&plan).clone();
+            let mut summary = make_summary(&plan, "run-1");
+            let claim = state.claim(plan.progress_key()).unwrap();
+            let mut ensure = |plan: &ResolvedRunPlan| {
+                ensure_chunk_checkpoint_plan(
+                    &state,
+                    plan,
+                    &cp,
+                    &mut summary,
+                    &RANGES,
+                    "c.yaml",
+                    &claim,
+                )
+                .unwrap()
+            };
+            let rid = ensure(&plan);
+            let claim_next = || state.claim_next_chunk_task(&rid).unwrap().unwrap().0;
+            state
+                .complete_chunk_task(&rid, claim_next(), 10, Some("p0.parquet"))
+                .unwrap();
+            if crashed_mid_chunk {
+                state
+                    .fail_chunk_task(&rid, claim_next(), "boom", false)
+                    .unwrap();
+                claim_next();
+                claim_next();
+            }
+            plan.resume = true;
+            assert_eq!(ensure(&plan), rid);
+            let statuses: Vec<String> = state
+                .list_chunk_tasks_for_run(&rid)
+                .unwrap()
+                .into_iter()
+                .map(|t| t.status)
+                .collect();
+            assert_eq!(
+                statuses,
+                ["completed", "pending", "pending", "pending"],
+                "{export}"
+            );
+            let mut said = captured_warnings_mentioning(&format!("export '{export}'"));
+            said.retain(|line| line.contains("chunk task(s)"));
+            said
+        };
+
+        assert_eq!(
+            resumed("requeue_none", false),
+            Vec::<String>::new(),
+            "nothing was requeued, so there is nothing to report"
+        );
+        assert_eq!(
+            resumed("requeue_some", true),
+            [
+                "export 'requeue_some': reset 2 stale 'running' chunk task(s) after resume",
+                "export 'requeue_some': re-queued 1 failed chunk task(s) for retry after resume",
+            ]
+        );
     }
 
     /// A chunk run whose task list failed to land must not be left for a plain run to resume as a zero-chunk success.

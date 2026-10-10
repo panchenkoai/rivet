@@ -660,6 +660,26 @@ mod tests {
         }
     }
 
+    /// A table name starts with a letter or `_` in each of its parts; a leading digit is not a table.
+    #[test]
+    fn a_bare_table_ident_starts_with_a_letter_or_an_underscore_in_every_part() {
+        for (query, table) in [
+            ("SELECT * FROM _staging", Some("_staging")),
+            ("SELECT * FROM _raw._orders", Some("_raw._orders")),
+            ("SELECT * FROM t1", Some("t1")),
+            ("SELECT * FROM 1t", None),
+            ("SELECT * FROM public.1t", None),
+            ("SELECT * FROM 1s.orders", None),
+            ("SELECT * FROM 2024", None),
+            ("SELECT * FROM public.", None),
+            ("SELECT * FROM .orders", None),
+            ("SELECT * FROM", None),
+        ] {
+            assert_eq!(strip_select_star_from(query), table, "{query}");
+            assert_eq!(strip_simple_projection_from(query), table, "{query}");
+        }
+    }
+
     #[test]
     fn a_bound_over_an_aliased_projection_is_read_from_the_query_not_the_table() {
         let query = "SELECT legacy_id AS id, name FROM customers";

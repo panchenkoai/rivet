@@ -686,6 +686,54 @@ mod tests {
         }
     }
 
+    // ── artifact identity ───────────────────────────────────────────────────
+
+    /// Two tables of one engine are two sources: the identity carries every part the manifest recorded.
+    #[test]
+    fn a_source_identity_names_the_engine_and_every_recorded_part_of_the_table() {
+        let source = |schema: Option<&str>, table: Option<&str>| {
+            let mut m = manifest_with_parts(vec![]);
+            m.source.schema = schema.map(str::to_string);
+            m.source.table = table.map(str::to_string);
+            identity_source(&m)
+        };
+        assert_eq!(
+            source(Some("public"), Some("orders")),
+            "postgres:public.orders"
+        );
+        assert_eq!(source(None, Some("orders")), "postgres:orders");
+        assert_eq!(source(None, None), "postgres");
+        assert_eq!(
+            source(Some("public"), None),
+            "postgres",
+            "a schema without a table names no relation"
+        );
+        assert_ne!(
+            source(Some("public"), Some("orders")),
+            source(Some("public"), Some("users")),
+            "two tables of one schema must not read as one source"
+        );
+        assert_ne!(
+            source(Some("public"), Some("orders")),
+            source(Some("audit"), Some("orders")),
+            "the same table name in two schemas must not read as one source"
+        );
+    }
+
+    /// The legacy fold strips the snapshot-leg infix only when a parent is left to fold to.
+    #[test]
+    fn a_snapshot_leg_name_folds_to_its_parent_and_never_to_an_empty_family() {
+        let leg = format!("orders{SNAPSHOT_LEG_INFIX}public.orders");
+        assert_eq!(snapshot_family(&leg), "orders");
+        assert_eq!(snapshot_family("orders"), "orders");
+        let parentless = format!("{SNAPSHOT_LEG_INFIX}orders");
+        assert_eq!(
+            snapshot_family(&parentless),
+            parentless,
+            "an empty family would join every family-less manifest under the prefix"
+        );
+    }
+
     // ── constants ───────────────────────────────────────────────────────────
 
     #[test]

@@ -1879,6 +1879,41 @@ mod tests {
         }
     }
 
+    /// The declared table is the source's identity: split on a real dot for a SQL engine, kept whole for a document store, and never guessed from a document store's export name.
+    #[test]
+    fn a_declared_table_is_split_per_engine_and_a_mongo_name_is_never_split() {
+        use crate::config::SourceType::{Mongo, Postgres};
+        for (engine, declared, schema, table) in [
+            (
+                Postgres,
+                Some("public.orders"),
+                Some("public"),
+                Some("orders"),
+            ),
+            (Postgres, Some("orders"), None, Some("orders")),
+            (Postgres, Some(".orders"), None, Some(".orders")),
+            (Postgres, Some("public."), None, Some("public.")),
+            (Mongo, Some("bh4.orders"), None, Some("bh4.orders")),
+            (Mongo, Some("orders"), None, Some("orders")),
+            (Mongo, None, None, None),
+        ] {
+            let case = format!("{engine:?} table {declared:?}");
+            let dir = tempfile::tempdir().unwrap();
+            let mut plan = fin_plan(dir.path());
+            plan.source.source_type = engine;
+            plan.source_table = declared.map(str::to_string);
+            let state = crate::state::StateStore::open_in_memory().unwrap();
+            let summary = fin_summary(&plan, "success");
+            assert_eq!(summary.export_name, "public.orders");
+
+            finalize_manifest(&plan, "e", &state, &summary, "export");
+
+            let m = read_manifest(dir.path());
+            assert_eq!(m.source.schema.as_deref(), schema, "{case}");
+            assert_eq!(m.source.table.as_deref(), table, "{case}");
+        }
+    }
+
     #[test]
     fn success_gate_refuses_resume_over_a_completed_prefix() {
         let dir = tempfile::tempdir().unwrap();
