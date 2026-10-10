@@ -1953,8 +1953,11 @@ def nextest_live(log_path: Path, expr: str, env: dict[str, str] | None = None,
 
 def _run_live_modules(led: Ledger, scenario: str, label: str, phase: str,
                       modules: list[str], env: dict[str, str] | None = None,
-                      expr: str | None = None, threads: int | None = None) -> None:
-    """Run live_suite `modules` (or the nextest filter `expr`) through the gate binary; one ledger row per test case."""
+                      expr: str | None = None, threads: int | None = None,
+                      again: tuple[str, dict[str, str]] | None = None) -> None:
+    """Run live_suite `modules` (or the nextest filter `expr`) through the gate binary; one ledger row per test case.
+
+    `again` is (an env var, the env that sets it): a test whose self-skip names the var runs a second time under that env, and that leg is its verdict."""
     led.phase(f"{label} · {phase}")
     if not have("cargo"):
         _skipped(led, scenario, "batch", "-", "-", f"{label}: cargo absent", "no cargo")
@@ -1971,6 +1974,16 @@ def _run_live_modules(led: Ledger, scenario: str, label: str, phase: str,
         _failed(led, scenario, "batch", "-", "-",
                 f"{label}: no test ran (see {log_path})", _first_match(log_path.read_text(), r"error|FAILED"))
         return
+    owed = sorted(n for n, v in verdicts.items() if again and v in ("PASS", "LEAK") and again[0] in skipped.get(n, "")
+                  and n not in SKIP_ALLOWED)
+    if owed:
+        log_path = Path(f"{log_path}.{again[0].lower()}")
+        v2, _, s2, p2 = nextest_live(log_path, " | ".join(f"test(={n})" for n in owed), {**(env or {}), **again[1]}, threads)
+        for n in owed:
+            verdicts[n] = v2.get(n, "NOT RUN")
+            skipped.pop(n)
+        skipped.update(s2)
+        panics.update(p2)
     for name, verdict in sorted(verdicts.items()):
         if verdict in ("PASS", "LEAK") and name in skipped:
             why = SKIP_ALLOWED.get(name)
@@ -1982,7 +1995,7 @@ def _run_live_modules(led: Ledger, scenario: str, label: str, phase: str,
                         "core.SKIP_ALLOWED with a reason, or bring its infrastructure up", "vacuous skip")
         elif verdict in ("PASS", "LEAK"):
             led.cell_passed(name)
-            _passed(led, scenario, "batch", "-", "-", f"{label} · {name}")
+            _passed(led, scenario, "batch", "-", "-", f"{label} · {name}{f' (run again with {again[0]})' if name in owed else ''}")
         else:
             why = panics.get(name, "no panic line read")
             _failed(led, scenario, "batch", "-", "-", f"{label} FAILED · {name} — {why} (see {log_path})")

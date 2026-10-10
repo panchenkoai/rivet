@@ -145,12 +145,14 @@ def measured_harm(probe: str, before: dict[str, int] | None, after: dict[str, in
     """The run's harm from two `source_counters` readings, over rivet's own report; None when a SQL Server reading did not answer.
 
     A SQL Server plan evicted between the readings takes nothing away: only statements
-    still cached count, each by its own growth.
+    still cached count, each by its own growth. One whose counter went down was compiled
+    again in between and restarted at zero, so its growth is its total.
     """
     if probe.startswith("mssql"):
         if before is None or after is None:
             return None
-        return reported | {"mssql_logical_reads": sum(v - before.get(k, 0) for k, v in after.items())}
+        grown = (v - before.get(k, 0) if v >= before.get(k, 0) else v for k, v in after.items())
+        return reported | {"mssql_logical_reads": sum(grown)}
     return {k: after[k] - before[k] for k in after} if before and after else reported
 
 

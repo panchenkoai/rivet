@@ -72,12 +72,12 @@ CRASH_ROWS = 250_000
 ENGINES = ("postgres", "mysql", "mssql", "oracle")
 
 
-def _seed(engine: str, url: str, table: str, rows: int, with_cursor: bool) -> bool:
-    """(Re)create `table` holding ids 1..rows (and a cursor column when asked)."""
+def _seed(engine: str, url: str, table: str, rows: int, with_cursor: bool, int_key: bool = False) -> bool:
+    """(Re)create `table` holding ids 1..rows (and a cursor column when asked); `int_key` keeps Oracle's id in the NUMBER(18) range chunking accepts."""
     ts = {"postgres": "TIMESTAMPTZ", "mysql": "DATETIME(6)", "mssql": "DATETIME2", "oracle": "TIMESTAMP"}[engine]
     cols = f"id BIGINT PRIMARY KEY, v BIGINT NOT NULL{f', updated_at {ts} NOT NULL' if with_cursor else ''}"
     if engine == "oracle":
-        cols = cols.replace("BIGINT", "NUMBER(19)")
+        cols = cols.replace("id BIGINT", "id NUMBER(18)" if int_key else "id BIGINT").replace("BIGINT", "NUMBER(19)")
         val = ", TIMESTAMP '2026-01-01 00:00:00' + NUMTODSINTERVAL(level, 'SECOND')" if with_cursor else ""
         body = f"INSERT INTO {table} SELECT level, level{val} FROM dual CONNECT BY level <= {rows};"
     elif engine == "postgres":
