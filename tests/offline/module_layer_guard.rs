@@ -15,6 +15,10 @@ const LAYERS: &[(&str, &str)] = &[
     ("tuning", "source tuning profiles and adaptive sizing"),
     ("types", "the internal type system and delivered text forms"),
     ("config", "the YAML config model and its validation"),
+    (
+        "connect",
+        "the dial every connection shares: TLS gate, connector, PostgreSQL client",
+    ),
     ("format", "Parquet and CSV writers"),
     ("sql", "dialect SQL text sent to a source"),
     ("enrich", "meta columns added to a batch"),
@@ -60,7 +64,6 @@ const EXCEPTIONS: &[&str] = &[
     "source -> pipeline::manifest_writer::write_manifest_without_success_marker",
     "source -> preflight::cdc_health::pg_foreign_slots_warning",
     "source -> preflight::cdc_health::pg_retained_wal_warning",
-    "state -> source::postgres::connect_client",
     "tuning -> source::Source",
     "tuning -> source::Source::sample_governor_pressure",
 ]; // ratchet-pin: end
