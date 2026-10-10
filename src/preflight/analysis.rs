@@ -308,7 +308,7 @@ fn measured_this_source(
     if m.source_type.as_deref() != Some(source.ledger_label().as_str()) {
         return false;
     }
-    let want = crate::pipeline::destination_uri_for_manifest(&export.destination);
+    let want = crate::manifest::destination_uri_for_manifest(&export.destination);
     match m.run_id.as_deref().map(|id| state.run_prefix_of(id)) {
         Some(Ok(Some(prefix))) => prefix == want,
         _ => true,
@@ -1432,7 +1432,7 @@ mod tests {
     #[test]
     fn overlay_uses_the_run_of_the_same_engine_and_destination() {
         let export = cfg("table: rivet_type_matrix\nmode: full\n");
-        let want = crate::pipeline::destination_uri_for_manifest(&export.destination);
+        let want = crate::manifest::destination_uri_for_manifest(&export.destination);
         let mut diag = scope_diag();
         overlay_measured_rows(
             &mut diag,

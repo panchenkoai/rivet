@@ -30,6 +30,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::DestinationConfig;
+
 /// The relational algebra ABOVE these types: which runs live under one prefix
 /// and how they relate (dedupe, family membership, split-unit identity,
 /// supersession, generation coherence, claimed parts). It lives beside the
@@ -580,6 +582,14 @@ impl RunManifest {
         }
         Ok(())
     }
+}
+
+/// Best-effort textual URI for the manifest's `destination.uri` field.
+///
+/// The manifest is a record of where data was written, so the URI must
+/// reflect what an operator would type to find the prefix again.
+pub(crate) fn destination_uri_for_manifest(cfg: &DestinationConfig) -> String {
+    cfg.uri()
 }
 
 /// Upper bound on a destination control artifact (`manifest.json`) the read

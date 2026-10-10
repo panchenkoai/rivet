@@ -21,7 +21,6 @@
 //! There is intentionally no public re-export for these — they are
 //! orchestration glue, not a pipeline API.
 
-use crate::config::DestinationConfig;
 use crate::error::Result;
 use crate::plan::ResolvedRunPlan;
 use crate::state::StateStore;
@@ -1080,13 +1079,7 @@ pub(super) fn write_running_manifest(
     }
 }
 
-/// Best-effort textual URI for the manifest's `destination.uri` field.
-///
-/// The manifest is a record of where data was written, so the URI must
-/// reflect what an operator would type to find the prefix again.
-pub(crate) fn destination_uri_for_manifest(cfg: &DestinationConfig) -> String {
-    cfg.uri()
-}
+pub(crate) use crate::manifest::destination_uri_for_manifest;
 
 #[cfg(test)]
 mod tests {
@@ -1269,7 +1262,7 @@ mod tests {
     }
 
     use super::*;
-    use crate::config::DestinationType;
+    use crate::config::{DestinationConfig, DestinationType};
 
     fn cfg_local(path: Option<&str>, prefix: Option<&str>) -> DestinationConfig {
         DestinationConfig {

@@ -1,4 +1,5 @@
-use std::io::Write;
+use std::io::{BufRead, Write};
+use std::path::Path;
 
 use arrow::array::Time64MicrosecondArray;
 use arrow::array::types::Decimal128Type;
@@ -377,6 +378,45 @@ fn write_csv_value(writer: &mut dyn Write, array: &dyn Array, idx: usize) -> Res
     }
 
     Ok(())
+}
+
+/// Counts RFC-4180 records by streaming the file: a `\n` terminates a record
+/// only outside double quotes, so quoted embedded newlines (which our own CSV
+/// writer emits) stay inside one record. Doubled quotes within a quoted field
+/// self-cancel, so toggling on every `"` tracks quoted state without parsing
+/// fields. CRLF terminators work because the `\n` is the trigger; a final
+/// record without a trailing newline is counted at EOF.
+pub(crate) fn count_csv_records(path: &Path) -> Result<usize> {
+    let file = std::fs::File::open(path)?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut records = 0usize;
+    let mut in_quotes = false;
+    let mut pending = false;
+    loop {
+        let buf = reader.fill_buf()?;
+        if buf.is_empty() {
+            break;
+        }
+        let len = buf.len();
+        for &byte in buf {
+            match byte {
+                b'"' => {
+                    in_quotes = !in_quotes;
+                    pending = true;
+                }
+                b'\n' if !in_quotes => {
+                    records += 1;
+                    pending = false;
+                }
+                _ => pending = true,
+            }
+        }
+        reader.consume(len);
+    }
+    if pending {
+        records += 1;
+    }
+    Ok(records)
 }
 
 #[cfg(test)]
