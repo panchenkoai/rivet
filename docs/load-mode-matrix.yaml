@@ -1,5 +1,5 @@
 # Load-mode behavior matrix — how `rivet load` writes to the warehouse per
-# export mode. Columns are the three load modes (LoadMode in src/load/plan.rs),
+# export mode. Columns are the three load modes (LoadMode in src/plan/load_settings.rs),
 # NOT source engines. Cell = { test } | { na } | { gap }.
 #
 # The bug class this guards: each mode has a DIFFERENT write contract, and mixing

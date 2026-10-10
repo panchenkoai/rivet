@@ -3,6 +3,7 @@ pub mod campaign;
 pub mod explain;
 pub mod history;
 pub mod inputs;
+pub mod load_settings;
 pub mod partition;
 pub mod prioritization;
 pub mod recommend;
