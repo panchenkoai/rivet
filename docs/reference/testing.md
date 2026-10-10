@@ -220,7 +220,7 @@ enters review with its interaction tests or not at all.
 bottom-to-top order (`LAYERS`, one line per module saying what the layer is for). A
 module may reference only the modules below it:
 
-`error < test_hook < scalar < resource < workers < redact < tuning < types < config < format < sql < enrich < quality < journal < destination < manifest < state < plan < source < preflight < init < load < notify < pipeline < cli < mcp < fuzz < lib < main < bin`
+`error < test_hook < scalar < resource < workers < redact < tuning < types < config < connect < format < sql < enrich < quality < journal < destination < manifest < state < plan < source < preflight < init < load < notify < pipeline < cli < mcp < fuzz < lib < main < bin`
 
 A reference is a path written in product code that resolves to another top-level
 module: `crate::m::…` anywhere (a type, a call, an attribute argument, a serde

@@ -217,9 +217,49 @@ pub(crate) fn resolve_captured_table(
     }
 }
 
+/// Does a config `table:` entry match an event's identity? Config may be bare
+/// (`orders` — matches the bare table name in any schema) or schema-qualified
+/// (`public.orders` — matches schema AND table). Adapters always emit schema
+/// and table separately; comparing the config string verbatim against the
+/// bare event table silently routed ZERO events for qualified configs.
+/// Does this configured `table:` name the relation an event came from?
+///
+/// The ENGINE decides how many readings a dotted string has, and passing it is not
+/// ceremony: on a store with schemas, `a.b` may be a qualifier; on one without, it
+/// can only be a name. While Mongo shared SQL's two-reading rule, a collection whose
+/// first segment equalled the DATABASE name matched twice — `table: shopdb.orders`
+/// took both the collection literally named `shopdb.orders` and the sibling
+/// `orders`, interleaving two collections into one destination with every count
+/// intact (round-3B bughunt).
+pub(crate) fn table_matches(
+    engine: super::CdcEngine,
+    cfg: &str,
+    schema: &str,
+    table: &str,
+) -> bool {
+    // Full-name match FIRST: a MongoDB collection name may contain dots
+    // (`my.coll`) and has no schema qualifier, so splitting it into a bogus
+    // `schema.table` dropped every event (bug-hunt: 0-row success forever). This
+    // is safe for SQL — no real table is literally named `schema.table`.
+    if cfg == table {
+        return true;
+    }
+    // A document store has no schema to qualify with, so there is no second
+    // reading — the full-name arm above was the whole answer.
+    if engine == super::CdcEngine::Mongo {
+        return false;
+    }
+    // Otherwise a SQL `schema.table` qualifier.
+    match cfg.split_once('.') {
+        Some((cs, ct)) => cs == schema && ct == table,
+        None => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::source::cdc::CdcEngine;
 
     fn m(schema: &str, table: &str) -> CatalogMatch {
         CatalogMatch {
@@ -459,5 +499,79 @@ mod tests {
             (got.schema.as_str(), got.table.as_str()),
             ("app", "events.v2")
         );
+    }
+
+    // Ultrareview bug_004: a schema-qualified config (`table: public.orders`)
+    // compared verbatim against the adapter's BARE event table matched zero
+    // events — the whole stream silently dropped into a 0-row success.
+    #[test]
+    fn table_matches_handles_bare_and_qualified_configs() {
+        assert!(
+            table_matches(CdcEngine::Postgres, "orders", "public", "orders"),
+            "bare matches any schema"
+        );
+        assert!(
+            table_matches(CdcEngine::Postgres, "public.orders", "public", "orders"),
+            "qualified matches"
+        );
+        assert!(
+            !table_matches(CdcEngine::Postgres, "audit.orders", "public", "orders"),
+            "wrong schema differs"
+        );
+        assert!(
+            !table_matches(CdcEngine::Postgres, "orders", "public", "users"),
+            "different table differs"
+        );
+    }
+
+    /// Mongo has NO schema qualifier, so the `schema.table` split arm must not run
+    /// there — and while it did, one config matched two collections.
+    ///
+    /// Round-3B bughunt. A collection whose first dot-segment equals the DATABASE
+    /// name (db `shopdb`, collections `orders` and `shopdb.orders` — both legal)
+    /// matched `table: shopdb.orders` twice: once by full name, once by the split.
+    /// Two collections' events interleaved into one destination under a green run,
+    /// invisible to any count.
+    ///
+    /// The split arm exists for SQL's `schema.table`; on a store with no schemas it
+    /// is a second reading of a string that has only one.
+    #[test]
+    fn a_mongo_dotted_name_never_splits_into_a_schema_qualifier() {
+        assert!(
+            table_matches(CdcEngine::Mongo, "shopdb.orders", "shopdb", "shopdb.orders"),
+            "the collection LITERALLY named `shopdb.orders` is the only reading"
+        );
+        assert!(
+            !table_matches(CdcEngine::Mongo, "shopdb.orders", "shopdb", "orders"),
+            "the sibling collection `orders` must NOT also match — that is the \
+             interleave: two collections into one destination, counts intact"
+        );
+        // SQL keeps both arms: `schema.table` is a real qualifier there.
+        assert!(table_matches(
+            CdcEngine::Postgres,
+            "public.orders",
+            "public",
+            "orders"
+        ));
+    }
+
+    #[test]
+    fn roast_dotted_collection_name_routes_by_full_name() {
+        // A MongoDB collection literally named `my.data` (dots are legal, no
+        // schema concept) must route by its FULL name — before this it was
+        // mis-split into schema=`my`, table=`data` and routed ZERO events forever.
+        assert!(table_matches(
+            CdcEngine::Mongo,
+            "my.data",
+            "shopdb",
+            "my.data"
+        ));
+        // Still distinguishes a genuinely different collection.
+        assert!(!table_matches(
+            CdcEngine::Mongo,
+            "my.data",
+            "shopdb",
+            "my.other"
+        ));
     }
 }

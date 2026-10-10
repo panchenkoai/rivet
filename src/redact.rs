@@ -374,7 +374,8 @@ pub fn redacted_log_line(timestamp: &str, level: &str, target: &str, message: &s
 /// line through [`redacted_log_line`], and — while an in-process card renderer
 /// owns the screen — routed through its channel so the line lands above the
 /// card block instead of between two frames (which duplicated the block).
-pub fn install_logger() {
+/// `route` is that channel, handed in by the layer that owns it.
+pub fn install_logger(route: LogRoute) {
     use std::io::Write as _;
     let stderr_logger =
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
@@ -391,10 +392,13 @@ pub fn install_logger() {
     log::set_max_level(stderr_logger.filter());
     // A second install (a test process that already has a logger) keeps the
     // first; `main` calls this exactly once.
-    let _ = log::set_boxed_logger(Box::new(UiRoutedLogger(stderr_logger)));
+    let _ = log::set_boxed_logger(Box::new(UiRoutedLogger(stderr_logger, route)));
 }
 
-struct UiRoutedLogger(env_logger::Logger);
+/// Takes a formatted, redacted log line; `false` leaves it to stderr.
+pub type LogRoute = fn(String) -> bool;
+
+struct UiRoutedLogger(env_logger::Logger, LogRoute);
 
 impl log::Log for UiRoutedLogger {
     fn enabled(&self, metadata: &log::Metadata) -> bool {
@@ -411,7 +415,7 @@ impl log::Log for UiRoutedLogger {
             record.target(),
             &record.args().to_string(),
         );
-        if !crate::pipeline::ipc::route_log_line(line) {
+        if !(self.1)(line) {
             self.0.log(record);
         }
     }
@@ -427,7 +431,7 @@ mod logger_tests {
     use log::Log as _;
     use std::sync::{Arc, Mutex};
 
-    /// An `env_logger` at `warn` whose stderr is this buffer.
+    /// An `env_logger` at `warn` whose stderr is this buffer, routed as the binary routes it.
     fn logger(sink: Arc<Mutex<Vec<u8>>>) -> UiRoutedLogger {
         struct Sink(Arc<Mutex<Vec<u8>>>);
         impl std::io::Write for Sink {
@@ -443,7 +447,7 @@ mod logger_tests {
             .filter_level(log::LevelFilter::Warn)
             .target(env_logger::Target::Pipe(Box::new(Sink(sink))))
             .build();
-        UiRoutedLogger(inner)
+        UiRoutedLogger(inner, crate::cli::LOG_ROUTE)
     }
 
     fn record<'a>(level: log::Level, args: std::fmt::Arguments<'a>) -> log::Record<'a> {

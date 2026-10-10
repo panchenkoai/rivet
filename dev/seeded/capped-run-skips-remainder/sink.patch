@@ -1,7 +1,7 @@
-diff --git a/src/source/cdc/sink.rs b/src/source/cdc/sink.rs
+diff --git a/src/pipeline/cdc/sink.rs b/src/pipeline/cdc/sink.rs
 index 64604f50..750b7d2f 100644
---- a/src/source/cdc/sink.rs
-+++ b/src/source/cdc/sink.rs
+--- a/src/pipeline/cdc/sink.rs
++++ b/src/pipeline/cdc/sink.rs
 @@ -592,6 +592,12 @@ pub(crate) fn run_to_files(
                  // block, so a boundary on an uncaptured table still honours it.
                  if committed && cfg.max_events.is_some_and(|m| emitted >= m) {

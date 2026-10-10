@@ -16,10 +16,9 @@ mod adaptive;
 pub(crate) mod memory;
 mod profile;
 
-/// The governor's sampling seam. Production wiring reaches it through the blanket
-/// `impl PressureSource for Box<dyn Source>`, so only tests name the trait — a fake sampler is
+/// The governor's sampling seam. Production wiring reaches it through
+/// `impl PressureSource for Box<dyn Source>`, which lives beside `Source`; a fake sampler is
 /// how the runner-side blind-signal wiring is driven without a live database.
-#[cfg(test)]
 pub use adaptive::PressureSource;
 pub use adaptive::{
     ADAPTIVE_SAMPLE_INTERVAL, BlindSignal, DecisionCause, Governor, next_adaptive_batch_size,

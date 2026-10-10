@@ -134,7 +134,7 @@ pub fn doctor(config_path: &str, json: bool) -> Result<()> {
         }
         Err(e) => {
             all_ok = false;
-            if crate::pipeline::retry::classify_error(&e).is_transient() {
+            if crate::error::retry::classify_error(&e).is_transient() {
                 // Keep the FULL chain (not trim_probe_error) so the transient
                 // keyword survives into the final bail for classify_exit.
                 transient_detail = Some(format!("{e:#}"));
@@ -224,7 +224,7 @@ pub fn doctor(config_path: &str, json: bool) -> Result<()> {
                 // source + transiently-down destination exited Generic (1). Preserve
                 // the first transient detail (source-first) so classify_exit sees it.
                 if transient_detail.is_none()
-                    && crate::pipeline::retry::classify_error(&e).is_transient()
+                    && crate::error::retry::classify_error(&e).is_transient()
                 {
                     transient_detail = Some(format!("{e:#}"));
                 }
@@ -264,8 +264,7 @@ pub fn doctor(config_path: &str, json: bool) -> Result<()> {
             // signal wins (source/destination arms run before this).
             if transient_detail.is_none()
                 && let Some(detail) = &c.detail
-                && crate::pipeline::retry::classify_error(&anyhow::anyhow!("{detail}"))
-                    .is_transient()
+                && crate::error::retry::classify_error(&anyhow::anyhow!("{detail}")).is_transient()
             {
                 transient_detail = Some(detail.clone());
             }
@@ -895,13 +894,13 @@ mod tests {
         // classifiable.
         let transient = doctor_failure_error(Some("connection refused (os error 61)".to_string()));
         assert!(
-            crate::pipeline::retry::classify_error(&transient).is_transient(),
+            crate::error::retry::classify_error(&transient).is_transient(),
             "a transient probe failure must classify Retryable (exit 2): {transient:#}"
         );
         // A non-transient failure stays Generic (exit 1).
         let generic = doctor_failure_error(None);
         assert!(
-            !crate::pipeline::retry::classify_error(&generic).is_transient(),
+            !crate::error::retry::classify_error(&generic).is_transient(),
             "a non-transient failure must stay Generic (exit 1): {generic:#}"
         );
     }
@@ -1477,6 +1476,37 @@ exports:
             msg.contains("doctor: config check failed") && msg.contains("see output above"),
             "returned error must be the one-line pointer (so `main` does not double-print the \
              config error); got {msg:?}"
+        );
+    }
+    /// A destination that fails for good, behind a source that failed for good, is not reported as worth a retry.
+    #[test]
+    fn a_permanent_destination_failure_is_not_reported_as_transient() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("a_file");
+        std::fs::write(&blocker, b"x").unwrap();
+        let yaml = format!(
+            r#"
+source:
+  type: postgres
+  url_env: RIVET_DOCTOR_PERMANENT_DEST_UNSET_URL_ENV
+exports:
+  - name: t
+    query: "SELECT 1"
+    format: csv
+    destination:
+      type: local
+      path: "{}"
+"#,
+            blocker.join("under_a_file").display(),
+        );
+        let config_path = dir.path().join("rivet.yaml");
+        std::fs::write(&config_path, yaml).unwrap();
+
+        let err = doctor(config_path.to_str().unwrap(), true)
+            .expect_err("a directory under a regular file cannot be written");
+        assert_eq!(
+            format!("{err:#}"),
+            "doctor: one or more preflight checks failed (see output above)"
         );
     }
 }

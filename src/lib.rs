@@ -20,6 +20,7 @@ pub use arrow;
 
 // Public — accessed by integration tests in tests/*.rs
 pub mod config;
+pub(crate) mod connect;
 pub mod error;
 pub mod format;
 // Fuzz-only entry points (feature = "fuzzing"); not part of the public API.

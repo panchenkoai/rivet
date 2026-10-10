@@ -1275,7 +1275,7 @@ src/source/mssql/cdc.rs:979:21: replace += with *= in MssqlChangeStream::fill
 src/source/mssql/cdc.rs:979:21: replace += with -= in MssqlChangeStream::fill
 src/source/mssql/cdc.rs:986:21: replace == with != in MssqlChangeStream::fill
 
-# ── 2026-08-28 adjudication: src/source/cdc/sink.rs (full run, 188: 134 caught,
+# ── 2026-08-28 adjudication: src/pipeline/cdc/sink.rs, then src/source/cdc/sink.rs (full run, 188: 134 caught,
 # 46 unviable, 6 timeouts — the timeouts were the drain_is_complete never-stop
 # mutants hanging the FakeStream loop, now a loud fuse panic instead). ONE
 # survivor, LIVE-GUARDED: `yielded_this_pass += → *=` freezes the counter at 0,
@@ -1286,7 +1286,7 @@ src/source/mssql/cdc.rs:986:21: replace == with != in MssqlChangeStream::fill
 # uncaptured_transaction + roast_pg_cdc_empty_transaction_churn_must_not_pin_the_
 # slot (tests/live/live_cdc.rs) — both starve if a zero-yield pass reads as
 # complete while in-bound data remains.
-src/source/cdc/sink.rs:454:35: replace += with *= in run_to_files
+src/pipeline/cdc/sink.rs:491:35: replace += with *= in run_to_files
 
 # ── 2026-08-29: newly VISIBLE survivors after six whole-function exclusions
 # were lifted (execute_resolved_plan, prepare_load, dispatch, run_plan_command,
