@@ -42,7 +42,7 @@ pub(crate) use detect::detect_and_generate_chunks;
 pub(in crate::pipeline) use exec::run_chunked_parallel;
 pub(crate) use exec::run_chunked_sequential;
 pub use math::generate_chunks;
-pub(crate) use math::{build_chunk_query_sql, chunk_plan_fingerprint, strip_select_star_from};
+pub(crate) use math::{build_chunk_query_sql, chunk_plan_fingerprint};
 pub(in crate::pipeline) use parallel_checkpoint::run_chunked_parallel_checkpoint;
 pub(crate) use resume_m8::apply_m8_resume_decisions;
 use resume_m8::prune_superseded_attempts;

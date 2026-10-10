@@ -391,8 +391,7 @@ pub fn refuse_backfill_type_conflict(
     table: &str,
     recipe: &ExportConfig,
 ) -> anyhow::Result<()> {
-    let parsed =
-        |e: &ExportConfig| crate::plan::build::parse_column_overrides_pub(&e.columns, &e.name);
+    let parsed = |e: &ExportConfig| crate::types::parse_column_overrides(&e.columns, &e.name);
     let (recipe_types, cdc_types) = (parsed(recipe)?, parsed(cdc_export)?);
     // BOTH sides narrowed: a qualified recipe key (`orders.price`) against a bare
     // CDC key (`price`) is the same column, and compared raw it was never seen.
@@ -972,7 +971,7 @@ impl Config {
                 {
                     super::export::validate_table_shortcut_ident(&recipe.name, t)?;
                 }
-                crate::plan::build::parse_column_overrides_pub(&recipe.columns, &recipe.name)?;
+                crate::types::parse_column_overrides(&recipe.columns, &recipe.name)?;
                 // One column, one type across the recipe and the stream — decided
                 // here, for every pair, so a conflict added after the baseline
                 // refuses the next run at config load, not after its anchor.
@@ -1323,7 +1322,7 @@ mod tests {
         let all = vec![orders, auto.clone()];
 
         let merged = effective_columns(&auto, &all);
-        let parsed = crate::plan::build::parse_column_overrides_pub(&merged, &auto.name).unwrap();
+        let parsed = crate::types::parse_column_overrides(&merged, &auto.name).unwrap();
         let for_stream = crate::types::overrides_for_unit(&parsed, Some("dbo.orders"));
         assert!(
             for_stream.contains_key("price"),

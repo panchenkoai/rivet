@@ -41,8 +41,6 @@ const LAYERS: &[(&str, &str)] = &[
 /// Upward references measured 2026-10-10 on main 3994d3ca, as `from -> to::item`. Shrink-only.
 const EXCEPTIONS: &[&str] = &[
     // ratchet-pin: module-layer-exceptions strings
-    "config -> plan::build::parse_column_overrides_pub",
-    "config -> sql::wrappable_query",
     "error -> pipeline::retry::classify_error",
     "notify -> pipeline::RunSummary",
     "plan -> load::plan::PartitionSpec",
@@ -55,9 +53,7 @@ const EXCEPTIONS: &[&str] = &[
     "plan -> source::query::wrap_key_range",
     "preflight -> load::plan::RecordedKeys",
     "preflight -> load::plan::RecordedKeys::new",
-    "preflight -> pipeline::chunked::strip_select_star_from",
     "preflight -> pipeline::destination_uri_for_manifest",
-    "preflight -> pipeline::refuse_override_case_miss",
     "preflight -> pipeline::retry::classify_error",
     "redact -> pipeline::ipc::route_log_line",
     "source -> pipeline::batch_partition_buckets",

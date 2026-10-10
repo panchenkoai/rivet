@@ -135,6 +135,52 @@ fn parse_decimal_params(original: &str, inner: &str) -> Result<RivetType> {
     Ok(RivetType::Decimal { precision, scale })
 }
 
+/// Parse the raw `columns:` map from `ExportConfig` into typed [`ColumnOverrides`].
+///
+/// Fails early (at plan-build time) with an actionable error so the user
+/// fixes their `rivet.yaml` before the export runs.
+pub fn parse_column_overrides(
+    raw: &std::collections::HashMap<String, String>,
+    export_name: &str,
+) -> Result<crate::types::ColumnOverrides> {
+    raw.iter()
+        .map(|(col, type_str)| {
+            crate::types::parse_type_str(type_str)
+                .map(|t| (col.clone(), t))
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "export '{}': column override for '{}': {}",
+                        export_name,
+                        col,
+                        e
+                    )
+                })
+        })
+        .collect()
+}
+
+/// Refuse a `columns:` key that names no result column as spelled but one ignoring case; `check` and `run` share it.
+pub(crate) fn refuse_override_case_miss(keys: &[String], names: &[&str]) -> Result<()> {
+    let miss = keys.iter().find_map(|k| {
+        if names.contains(&k.as_str()) {
+            return None;
+        }
+        names
+            .iter()
+            .find(|n| n.eq_ignore_ascii_case(k))
+            .map(|n| (k.as_str(), *n))
+    });
+    if let Some((key, real)) = miss {
+        crate::rivet_bail!(
+            crate::error::codes::CONFIG_COLUMN_OVERRIDE_CASE,
+            "`columns: {{ {key}: ... }}` names no result-set column; the result names it \
+             `{real}`, and override keys match exactly, so the override would be silently \
+             ignored. Spell the key `{real}`."
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

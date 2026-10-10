@@ -164,7 +164,7 @@ fn override_case_fail_oracle(
     }
     let mappings = conn.type_mappings(base_query, &Default::default())?;
     let names: Vec<&str> = mappings.iter().map(|m| m.column_name.as_str()).collect();
-    crate::pipeline::refuse_override_case_miss(&keys, &names)
+    crate::types::refuse_override_case_miss(&keys, &names)
 }
 
 /// The columns the export's strategy pages or tracks by, as written in the config.

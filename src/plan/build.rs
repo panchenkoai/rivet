@@ -11,6 +11,9 @@ use super::contract::{
     ChunkedPlan, ExtractionStrategy, IncrementalCursorPlan, KeysetPlan, ResolvedRunPlan,
 };
 
+pub use crate::types::parse_column_overrides as parse_column_overrides_pub;
+use crate::types::parse_column_overrides;
+
 /// Build a [`ResolvedRunPlan`] from config and CLI flags.
 ///
 /// This is the only place where raw `ExportConfig` fields and CLI flags
@@ -917,38 +920,6 @@ fn chunked_plan(
         checkpoint: export.chunk_checkpoint,
         max_attempts,
     })
-}
-
-/// Public re-export for callers outside `plan` (e.g. `preflight::type_report`).
-pub fn parse_column_overrides_pub(
-    raw: &std::collections::HashMap<String, String>,
-    export_name: &str,
-) -> Result<crate::types::ColumnOverrides> {
-    parse_column_overrides(raw, export_name)
-}
-
-/// Parse the raw `columns:` map from `ExportConfig` into typed [`ColumnOverrides`].
-///
-/// Fails early (at plan-build time) with an actionable error so the user
-/// fixes their `rivet.yaml` before the export runs.
-fn parse_column_overrides(
-    raw: &std::collections::HashMap<String, String>,
-    export_name: &str,
-) -> Result<crate::types::ColumnOverrides> {
-    raw.iter()
-        .map(|(col, type_str)| {
-            crate::types::parse_type_str(type_str)
-                .map(|t| (col.clone(), t))
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "export '{}': column override for '{}': {}",
-                        export_name,
-                        col,
-                        e
-                    )
-                })
-        })
-        .collect()
 }
 
 /// Substitute placeholders in `destination.path` and `destination.prefix`.
