@@ -53,7 +53,6 @@ const EXCEPTIONS: &[&str] = &[
     "preflight -> load::plan::RecordedKeys",
     "preflight -> load::plan::RecordedKeys::new",
     "preflight -> pipeline::chunked::strip_select_star_from",
-    "redact -> pipeline::ipc::route_log_line",
     "source -> pipeline::batch_partition_buckets",
     "source -> pipeline::commit::PartRecord",
     "source -> pipeline::commit::write_part_file",
