@@ -59,8 +59,6 @@ const EXCEPTIONS: &[&str] = &[
     "preflight -> pipeline::chunked::strip_select_star_from",
     "source -> preflight::cdc_health::pg_foreign_slots_warning",
     "source -> preflight::cdc_health::pg_retained_wal_warning",
-    "tuning -> source::Source",
-    "tuning -> source::Source::sample_governor_pressure",
 ]; // ratchet-pin: end
 
 /// Keywords that open an item or a `let`, where a top-level `,` does not end it.

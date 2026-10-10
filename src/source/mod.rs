@@ -381,6 +381,37 @@ pub(crate) fn non_empty_keys(cols: Vec<String>) -> Option<Vec<String>> {
     (!cols.is_empty()).then_some(cols)
 }
 
+/// The production bridge — LIVE-ONLY BY CONSTRUCTION, and deliberately not
+/// unit-tested.
+///
+/// Building the `Box<dyn Source>` it is implemented for needs a real database
+/// handle, so no offline test can call this `sample`; a unit test could only be
+/// written against a fake `Source`, which would grade the fake rather than the
+/// one line that matters (WHICH counter the governor listens to). Its oracle is
+/// the three live shed tests, one per engine with a foreign-pressure counter —
+/// `governor_backs_off_under_concurrent_write_pressure` (PostgreSQL),
+/// `mysql_governor_backs_off_under_real_redo_pressure`,
+/// `mssql_governor_backs_off_under_real_log_flush_pressure`
+/// (`tests/live/live_governor.rs`). Each drives real foreign write pressure and
+/// asserts the run logs a `backed off`, so all three go RED against a stubbed
+/// bridge: `-> None` never sheds (an unreadable signal fails OPEN), and a
+/// constant `Some(0)`/`Some(1)` never RISES, which is the only thing
+/// `GovernorState::observe` reads as pressure. Verified by hand against the
+/// `Some(0)` mutant, 2026-08-14.
+///
+/// The counterpart guard — that this must NOT be wired to the batch loop's own
+/// extraction counters — is `mysql_governor_ignores_the_exports_own_spill_exhaust`.
+impl crate::tuning::PressureSource for Box<dyn Source> {
+    fn sample(&mut self) -> Option<u64> {
+        // The governor's signal is the FOREIGN-pressure counter, not the batch
+        // loop's own-extraction counter: a keyset export's own pages inflate
+        // the spill counters by design, and a governor listening to them sheds
+        // its own workers to the floor and never recovers (field find,
+        // 2026-08-13 — see `Source::sample_governor_pressure`).
+        Source::sample_governor_pressure(self.as_mut())
+    }
+}
+
 pub fn create_source(config: &SourceConfig) -> Result<Box<dyn Source>> {
     let url = config.resolve_url()?;
     warn_if_tls_disabled(config);
