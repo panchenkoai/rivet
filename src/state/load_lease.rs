@@ -518,6 +518,39 @@ mod tests {
         assert!(other.is_held(), "another keeper's row is untouched");
     }
 
+    /// A keeper whose thread needs no connection: told to stop, it lingers for `linger`, then ends and marks the keeper dead as `keep_alive` does.
+    fn keeper_with_thread(linger: Duration) -> Keeper {
+        let shared = Arc::new(shared(30));
+        let (stop, stopped) = mpsc::channel::<()>();
+        let thread = {
+            let shared = shared.clone();
+            std::thread::spawn(move || {
+                let _dead = Dead(&shared.alive);
+                let _ = stopped.recv();
+                std::thread::sleep(linger);
+            })
+        };
+        Keeper {
+            shared,
+            stop: Some(stop),
+            thread: Some(thread),
+        }
+    }
+
+    /// Dropping a keeper tells its thread to stop and returns only once the thread has ended.
+    #[test]
+    fn dropping_a_keeper_stops_its_thread_and_waits_for_it_to_end() {
+        let keeper = keeper_with_thread(Duration::from_millis(300));
+        let shared = keeper.shared.clone();
+        let id = shared.keep("p.d.orders", "h:1:1", Instant::now());
+        assert!(shared.holds(id), "the thread runs while the keeper lives");
+        drop(keeper);
+        assert!(
+            !shared.holds(id),
+            "the thread had ended when the drop returned"
+        );
+    }
+
     /// One renewal answers for every asked row: the rows that came back are fresh, the others are lost for good.
     #[test]
     fn one_renewal_settles_every_kept_row() {
