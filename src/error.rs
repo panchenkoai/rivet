@@ -1324,7 +1324,16 @@ mod representative_failure_tests {
 
 #[cfg(test)]
 mod stop_marker_tests {
-    use super::{ManifestInconsistency, Refused};
+    use super::{JobWaitTimeout, ManifestInconsistency, Refused};
+
+    #[test]
+    fn a_job_wait_timeout_names_the_job_and_how_long_it_waited() {
+        let shown = JobWaitTimeout::bigquery("job_42", 900).to_string();
+        assert_eq!(
+            shown.split(" \u{2014} ").next(),
+            Some("bigquery: stopped waiting for job `job_42` after 900s")
+        );
+    }
 
     #[test]
     fn a_manifest_inconsistency_names_the_two_counts_that_disagree() {

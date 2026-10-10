@@ -139,4 +139,23 @@ mod tests {
         // A malformed URL is a loud parse error, not a silent plaintext fallback.
         assert!(pg_config_ssl_forced("not a url").is_err());
     }
+
+    /// A `mode: disable` block dials without a connector: the failure is the closed port.
+    #[test]
+    fn a_disabled_tls_block_dials_in_plaintext() {
+        let off = crate::config::TlsConfig {
+            mode: crate::config::TlsMode::Disable,
+            ca_file: None,
+            accept_invalid_certs: false,
+            accept_invalid_hostnames: false,
+        };
+        let err = super::connect_client_raw("postgresql://u:p@127.0.0.1:1/db", Some(&off))
+            .err()
+            .expect("nothing listens on port 1");
+        let shown = format!("{err:#}");
+        assert_eq!(
+            shown.split(" \u{2014} ").next(),
+            Some("nothing is listening on 127.0.0.1:1")
+        );
+    }
 }

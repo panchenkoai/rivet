@@ -277,6 +277,14 @@ mod connect_error_tests {
         assert_eq!(hp("sqlserver://sa:p@[::1]:1433/db"), "::1|1433");
         assert_eq!(hp("localhost:5432"), "localhost|5432");
     }
+
+    #[test]
+    fn a_bracketed_ipv6_host_without_a_port_is_not_split_at_its_colons() {
+        assert_eq!(
+            url_host_port("postgresql://u:p@[::1]/db"),
+            ("::1".to_string(), String::new())
+        );
+    }
 }
 
 #[cfg(test)]
