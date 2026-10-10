@@ -533,4 +533,22 @@ load:
             }
         }
     }
+
+    /// A written `base_buffer` is honoured only where `rivet compact` exists.
+    #[test]
+    fn a_written_base_on_a_warehouse_without_compact_keeps_the_changelog_and_its_view() {
+        use crate::config::load::LayoutChoice;
+        let export = serde_yaml_ng::from_str::<crate::config::ExportConfig>(
+            "name: t\ntable: t\nmode: incremental\ncursor_column: u\nformat: parquet\n\
+             destination: { type: local, path: /tmp/t }\n",
+        )
+        .expect("an export");
+        for mode in [LoadMode::Incremental, LoadMode::Cdc] {
+            assert_eq!(
+                cdc_layout(&export, mode, Some(LayoutChoice::BaseBuffer), false),
+                CdcLayout::LogAndView,
+                "{mode:?}: a base nothing merges into would freeze at its first pass"
+            );
+        }
+    }
 }
