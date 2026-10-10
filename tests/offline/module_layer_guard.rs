@@ -41,7 +41,6 @@ const LAYERS: &[(&str, &str)] = &[
 /// Upward references measured 2026-10-10 on main 3994d3ca, as `from -> to::item`. Shrink-only.
 const EXCEPTIONS: &[&str] = &[
     // ratchet-pin: module-layer-exceptions strings
-    "config -> load::is_safe_load_ident",
     "config -> plan::build::parse_column_overrides_pub",
     "config -> source::cdc::ORACLE_CONTINUOUS_REFUSAL",
     "config -> sql::wrappable_query",
@@ -89,8 +88,6 @@ const EXCEPTIONS: &[&str] = &[
     "tuning -> source::Source",
     "tuning -> source::Source::sample_governor_pressure",
     "tuning -> source::batch_controller::DEFAULT_BATCH_TARGET_MB",
-    "types -> load::is_safe_load_ident",
-    "types -> load::latin_fold",
 ]; // ratchet-pin: end
 
 /// Keywords that open an item or a `let`, where a top-level `,` does not end it.

@@ -31,6 +31,7 @@ mod cursor;
 pub mod decimal;
 mod delivery;
 mod fidelity;
+pub(crate) mod ident;
 mod mapping;
 mod override_type;
 pub mod policy;

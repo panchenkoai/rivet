@@ -219,7 +219,7 @@ impl TryFrom<RawLoadSection> for LoadSection {
             },
             LoadTargetKind::Clickhouse => {
                 if let Some(nc) = r.named_collection.as_deref()
-                    && !crate::load::is_safe_load_ident(nc)
+                    && !crate::types::ident::is_safe_load_ident(nc)
                 {
                     return Err(format!(
                         "`load.named_collection` `{}` is not a plain identifier",
