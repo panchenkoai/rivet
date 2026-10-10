@@ -248,7 +248,7 @@ pub(crate) fn classify_routing(rel: &RelationRouting<'_>) -> RoutingVerdict {
     // `to_regclass` accepts it when `db` is the current database, so the probe
     // resolves happily while `table_matches` splits on the FIRST dot and compares
     // `db` against the schema — never matching.
-    if !crate::source::cdc::identity::table_matches(
+    if !crate::source::cdc::sink::table_matches(
         crate::source::cdc::CdcEngine::Postgres,
         cfg,
         rs,
@@ -1464,7 +1464,7 @@ pub(crate) fn truncate_refusal_message(schema: &str, table: &str) -> String {
 pub(crate) fn truncate_is_ours(schema: &str, table: &str, configured: &[String]) -> bool {
     configured.is_empty()
         || configured.iter().any(|c| {
-            crate::source::cdc::identity::table_matches(
+            crate::source::cdc::sink::table_matches(
                 crate::source::cdc::CdcEngine::Postgres,
                 c,
                 schema,

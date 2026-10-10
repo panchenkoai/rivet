@@ -16,6 +16,10 @@
 pub(crate) mod checkpoint_identity;
 pub(crate) mod identity;
 pub(crate) mod partition_guard;
+/// The routing rule under the name the engines call it by; the file sink is `pipeline::cdc::sink`.
+pub(crate) mod sink {
+    pub(crate) use super::identity::table_matches;
+}
 pub(crate) mod spill;
 pub(crate) mod tx_buffer;
 pub(crate) mod validate;
@@ -666,7 +670,7 @@ fn emit_ndjson(
         let filtered = !tables.is_empty()
             && !tables
                 .iter()
-                .any(|t| identity::table_matches(eng, t, &ev.schema, &ev.table));
+                .any(|t| sink::table_matches(eng, t, &ev.schema, &ev.table));
         if filtered {
             if committed {
                 if let Some(p) = checkpoint {

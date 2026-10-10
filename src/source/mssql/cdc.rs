@@ -664,7 +664,7 @@ impl MssqlChangeStream {
         // check that asks a different question is not a check.
         if !configured_tables.is_empty()
             && !configured_tables.iter().any(|c| {
-                crate::source::cdc::identity::table_matches(
+                crate::source::cdc::sink::table_matches(
                     crate::source::cdc::CdcEngine::Mssql,
                     c,
                     &schema,
@@ -969,7 +969,7 @@ impl ChangeStream for MssqlChangeStream {
     /// the same predicate the sink routes by, so an output this stream does not feed
     /// keeps its own configured name.
     fn resolved_identity(&self, configured: &str) -> Option<(String, String)> {
-        crate::source::cdc::identity::table_matches(
+        crate::source::cdc::sink::table_matches(
             crate::source::cdc::CdcEngine::Mssql,
             configured,
             &self.schema,

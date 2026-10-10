@@ -399,8 +399,7 @@ pub(super) fn initial_snapshot_pending(
             // instance backfilled one relation into the other's prefix and only then
             // failed the drain.
             for t in &tables {
-                if crate::source::cdc::identity::table_matches(CdcEngine::Mssql, t, &schema, &table)
-                {
+                if crate::source::cdc::sink::table_matches(CdcEngine::Mssql, t, &schema, &table) {
                     continue;
                 }
                 anyhow::bail!(
