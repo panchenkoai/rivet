@@ -158,4 +158,34 @@ mod tests {
             Some("nothing is listening on 127.0.0.1:1")
         );
     }
+    /// An enforced `tls:` block opens with the TLS request, not with a plaintext startup.
+    #[test]
+    fn an_enforced_tls_block_asks_the_server_for_tls_first() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut peer, _) = listener.accept().unwrap();
+            let mut first = [0u8; 8];
+            peer.read_exact(&mut first).unwrap();
+            let _ = peer.write_all(b"N");
+            first
+        });
+        let on = crate::config::TlsConfig {
+            mode: crate::config::TlsMode::Require,
+            ca_file: None,
+            accept_invalid_certs: false,
+            accept_invalid_hostnames: false,
+        };
+        let url = format!("postgresql://u:p@127.0.0.1:{port}/db");
+        assert!(
+            super::connect_client_raw(&url, Some(&on)).is_err(),
+            "the server declined TLS"
+        );
+        assert_eq!(
+            server.join().unwrap(),
+            [0, 0, 0, 8, 4, 210, 22, 47],
+            "the first message is the SSLRequest"
+        );
+    }
 }

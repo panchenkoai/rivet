@@ -1478,4 +1478,35 @@ exports:
              config error); got {msg:?}"
         );
     }
+    /// A destination that fails for good, behind a source that failed for good, is not reported as worth a retry.
+    #[test]
+    fn a_permanent_destination_failure_is_not_reported_as_transient() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("a_file");
+        std::fs::write(&blocker, b"x").unwrap();
+        let yaml = format!(
+            r#"
+source:
+  type: postgres
+  url_env: RIVET_DOCTOR_PERMANENT_DEST_UNSET_URL_ENV
+exports:
+  - name: t
+    query: "SELECT 1"
+    format: csv
+    destination:
+      type: local
+      path: "{}"
+"#,
+            blocker.join("under_a_file").display(),
+        );
+        let config_path = dir.path().join("rivet.yaml");
+        std::fs::write(&config_path, yaml).unwrap();
+
+        let err = doctor(config_path.to_str().unwrap(), true)
+            .expect_err("a directory under a regular file cannot be written");
+        assert_eq!(
+            format!("{err:#}"),
+            "doctor: one or more preflight checks failed (see output above)"
+        );
+    }
 }
