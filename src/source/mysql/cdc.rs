@@ -1030,7 +1030,7 @@ impl MysqlChangeStream {
                 // evidence that exists.
                 for cfg in &self.configured_tables {
                     if cfg.contains('.')
-                        || !crate::source::cdc::sink::table_matches(
+                        || !crate::source::cdc::identity::table_matches(
                             crate::source::cdc::CdcEngine::Mysql,
                             cfg,
                             &schema,
@@ -1298,7 +1298,7 @@ pub(crate) fn undecodable_event_is_ours(
     match resolved {
         None => true,
         Some((schema, table)) => configured.iter().any(|c| {
-            crate::source::cdc::sink::table_matches(
+            crate::source::cdc::identity::table_matches(
                 crate::source::cdc::CdcEngine::Mysql,
                 c,
                 schema,

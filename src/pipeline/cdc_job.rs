@@ -7,12 +7,13 @@
 //! — `(Result<()>, RunSummary)`, metric recorded internally — so the orchestrator
 //! treats a CDC export like any other.
 
+use super::cdc::{CdcCapture, run_capture};
 use super::finalize::finalize_run_report;
 use super::job::classify_error_message;
 use super::summary::RunSummary;
 use crate::config::{Config, ExportConfig};
 use crate::error::Result;
-use crate::source::cdc::{CdcCapture, CdcConfig, CdcEngine, CdcEngineOpts, DrainMode, run_capture};
+use crate::source::cdc::{CdcConfig, CdcEngine, CdcEngineOpts, DrainMode};
 use crate::state::StateStore;
 
 /// The byte-rollover budget one export runs under — the NAMED supplier of the
@@ -398,7 +399,8 @@ pub(super) fn initial_snapshot_pending(
             // instance backfilled one relation into the other's prefix and only then
             // failed the drain.
             for t in &tables {
-                if crate::source::cdc::sink::table_matches(CdcEngine::Mssql, t, &schema, &table) {
+                if crate::source::cdc::identity::table_matches(CdcEngine::Mssql, t, &schema, &table)
+                {
                     continue;
                 }
                 anyhow::bail!(
@@ -815,7 +817,7 @@ fn run_cdc_inner(
     };
     let outputs = wired
         .iter()
-        .map(|(t, d, u)| crate::source::cdc::CaptureOutput {
+        .map(|(t, d, u)| super::cdc::CaptureOutput {
             table: t.clone(),
             dest: d.as_ref(),
             dest_uri: u.clone(),

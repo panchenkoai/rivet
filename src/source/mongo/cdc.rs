@@ -101,7 +101,7 @@ fn ddl_removes_a_capture(
         (OperationType::Drop | OperationType::Rename, Some(c)) => {
             configured.is_empty()
                 || configured.iter().any(|t| {
-                    crate::source::cdc::sink::table_matches(
+                    crate::source::cdc::identity::table_matches(
                         crate::source::cdc::CdcEngine::Mongo,
                         t,
                         db,
@@ -432,7 +432,7 @@ impl MongoChangeStream {
                     .iter()
                     .filter(|c| {
                         !present.iter().any(|p| {
-                            crate::source::cdc::sink::table_matches(
+                            crate::source::cdc::identity::table_matches(
                                 crate::source::cdc::CdcEngine::Mongo,
                                 c,
                                 &db_name,

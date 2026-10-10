@@ -12,6 +12,7 @@ mod apply_cmd;
 // sub-prefix per captured table) is written HERE and read by everything that has
 // to find those files again — `rivet validate`, and the warehouse load planner.
 // One definition of where a table's parts live, not one per reader.
+pub(crate) mod cdc;
 pub(crate) mod cdc_job;
 pub(crate) mod chunked;
 mod cli;

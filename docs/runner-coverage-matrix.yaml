@@ -130,7 +130,7 @@
 
 #
 # CDC COLUMN, 2026-09-26. `mode: cdc` returns from job.rs before execute_resolved_plan and
-# commits through its own sink (src/source/cdc/sink.rs::roll_all), so the seam wording
+# commits through its own sink (src/pipeline/cdc/sink.rs::roll_all), so the seam wording
 # above ("applied ONCE at finalize_export") does not hold for it: its drift gate and Form
 # B are applied inside the CDC path itself. The column is derived like the others (the
 # guard's CDC_DRAIN). Two of the three gaps it arrived with (open_forensics,
@@ -227,7 +227,7 @@ scenarios:
     chunked_checkpoint: { test: checkpoint_governor_backs_off_under_concurrent_write_pressure, note: "the sequential half is na (no fan-out to govern); this cell grades the PARALLEL half. Was the last `gap:` in this file: the wiring was pinned offline (`the_parallel_checkpoint_runner_arms_spawns_and_drains_the_governor`, a call-site pin over source text) and the pool shed mechanism too (`a_shrunken_permit_ceiling_sheds_pool_workers_without_stranding_a_task`), but neither can catch a run whose SAMPLER never moves under real pressure — the end-to-end shed had only ever been seen in an ad-hoc run (2026-08-14), never committed. Filled to the recipe this cell carried: a checkpoint twin of the `chunked` cells live test (same writer + quiet window, plus `chunk_checkpoint: true`), asserting the RECORDED shed and the full row count. The oracle is the STORED `run_journal.journal_json`, not `rivet journal` — that command renders only files/retries/quality issues and never prints a ParallelismAdjusted, so the first draft read an empty result while stderr showed the shed. RED-proven twice: governor never arming (fails the arm assertion) and `drain_into` dropping its events (fails the RECORD assertion while stderr still says backed off)." }
     keyset:         { test: keyset_governor_backs_off_under_concurrent_write_pressure }
     mongo_parallel: { na: "mongo_parallel spawns one thread per _id range with NO shared permit ceiling — the governor's resize target does not exist there. The reader-level adaptive batch sizing (engine pressure counters) still applies; the concurrency governor is a permit-ceiling mechanism and mongo_parallel has no ceiling to shrink. A future ceiling would take a `test` cell here." }
-    cdc:            { na: "the drain is one change stream per export with no worker permit ceiling to shrink; per-table part uploads fan out once per roll through workers::run_each in roll_all (src/source/cdc/sink.rs), not a governed pool, and CDC reads no `tuning:`" }
+    cdc:            { na: "the drain is one change stream per export with no worker permit ceiling to shrink; per-table part uploads fan out once per roll through workers::run_each in roll_all (src/pipeline/cdc/sink.rs), not a governed pool, and CDC reads no `tuning:`" }
 
   - id: schema_drift_gate
     what: "on_schema_drift enforcement — a drifted schema under `fail` aborts (exit 4). Round-8: keyset + mongo_parallel had SILENTLY dropped it (exit 0 on drift) — each runner re-applied the gate by hand then. Since ADR-0028 the gate runs ONCE at the finalize_export seam from the ledger's drift schema; runners only FEED the schema they resolved (chunked feeds none — its gate is pre-chunk via check_from_type_mappings, ADR-0021). The test cells grade the feed + seam end-to-end."
@@ -361,7 +361,7 @@ scenarios:
     chunked_checkpoint: { na: "same `chunk_part_filename` seam as `chunked` — a fresh stamp, not the run_id" }
     keyset:         { test: keyset_part_names_do_not_double_the_export_name }
     mongo_parallel: { test: parallel_parts_are_named_after_their_run_mongo }
-    cdc:            { na: "the part name is `cdc-{run_token}-{seq:06}` (src/source/cdc/sink.rs), run_token derived from the run_id — nothing prepends the export name a second time" }
+    cdc:            { na: "the part name is `cdc-{run_token}-{seq:06}` (src/pipeline/cdc/sink.rs), run_token derived from the run_id — nothing prepends the export name a second time" }
 
   - id: durable_manifest_before_advance
     what: "the destination manifest covering a run's parts is durable BEFORE the delivery position advances past them (the silent-loss ordering) — cross-references docs/durability-ordering-matrix.yaml."
