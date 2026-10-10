@@ -214,6 +214,36 @@ campaign's worst bugs lived at the intersection of two individually-correct
 knobs (`initial` × vanished-slot, `initial` × `skip_empty`) — a new knob
 enters review with its interaction tests or not at all.
 
+## Module layers (offline guard)
+
+`tests/offline/module_layer_guard.rs` holds the top-level modules of `src/` in one
+bottom-to-top order (`LAYERS`, one line per module saying what the layer is for). A
+module may reference only the modules below it:
+
+`error < test_hook < scalar < resource < workers < redact < tuning < types < config < format < sql < enrich < quality < journal < destination < manifest < state < plan < source < preflight < init < load < notify < pipeline < cli < mcp < fuzz < lib < main < bin`
+
+A reference is a path written in product code that resolves to another top-level
+module: `crate::m::…` anywhere (a type, a call, an attribute argument, a serde
+`"crate::…"` string), every leaf of a `use` tree (grouped and nested trees, `self`,
+`as`, `*`), a `super::` chain that leaves the module, a path through a name that a
+`use` bound to a module (`use crate::m;` then `m::x`), a name re-exported at the crate
+root, and a `#[macro_export]` macro. Code under `#[cfg(test)]` — an item, or the files
+of a `#[cfg(test)] mod x;` — is not product code. A reference belongs to the module
+its path names, so a `pub use` counts where it is written and a glob import is the
+single item `m::*`.
+
+Today's upward references are the `EXCEPTIONS` list in that file (`from -> to::item`,
+no line numbers), under the shrink-only pin `module-layer-exceptions`. The guard
+fails on an upward reference that is not listed, on a listed one that is gone, on a
+top-level module that `LAYERS` does not place, and on a `use` tree or a `cfg` shape it
+cannot read.
+
+To remove an exception, move the item below its user or pass it in from above, then
+delete its line: the stale-entry check makes both one change. A new module goes into
+`LAYERS` above everything it references. `LAYERS` may be reordered only when the
+exception list does not grow; the test prints the reference count of every module
+pair (`--no-capture`) for that.
+
 ## CDC gremlins (real faults)
 
 `tests/live/gremlin_cdc.rs` (+ the capture-job stall in `live_cdc_mssql.rs`)

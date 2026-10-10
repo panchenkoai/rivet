@@ -132,6 +132,8 @@ mod live_service_ports_guard;
 mod live_skip_policy_guard;
 #[path = "offline/load_allow_source_drift.rs"]
 mod load_allow_source_drift;
+#[path = "offline/module_layer_guard.rs"]
+mod module_layer_guard;
 #[path = "offline/nextest_groups_guard.rs"]
 mod nextest_groups_guard;
 #[path = "offline/rig_adoption_guard.rs"]
