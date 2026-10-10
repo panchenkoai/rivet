@@ -24,9 +24,9 @@
 //! the warehouse* is the paid last mile.
 
 use crate::destination::gcs::GcsStore;
+use crate::manifest::MANIFEST_MAX_BYTES;
 use crate::manifest::census::{ManifestCensus, dedupe_by_run_id, ensure_single_generation};
 use crate::manifest::{MANIFEST_FILENAME, ManifestStatus, PartStatus, RunManifest};
-use crate::pipeline::validate_manifest::MANIFEST_MAX_BYTES;
 use anyhow::{Context, Result, bail};
 
 /// The reconciled row-count chain for one export's load, derived from the run

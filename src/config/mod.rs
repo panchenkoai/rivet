@@ -9,6 +9,7 @@ mod notifications;
 pub mod resolve;
 pub mod schema;
 mod source;
+pub(crate) mod url;
 
 pub use cdc::*;
 pub use cursor::IncrementalCursorMode;

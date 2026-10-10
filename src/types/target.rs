@@ -102,10 +102,10 @@ impl ExportTarget {
 
     /// Flags a column name `rivet load` renames (BigQuery look-alikes) or refuses.
     fn grade_column_name(self, spec: &mut TargetColumnSpec) {
-        if self == ExportTarget::DuckDb || crate::load::is_safe_load_ident(&spec.column_name) {
+        if self == ExportTarget::DuckDb || super::ident::is_safe_load_ident(&spec.column_name) {
             return;
         }
-        let (status, note) = match crate::load::latin_fold(&spec.column_name) {
+        let (status, note) = match super::ident::latin_fold(&spec.column_name) {
             Some(latin) if self == ExportTarget::BigQuery => (
                 TargetStatus::Warn,
                 format!("Cyrillic look-alike letters: loads as `{latin}`"),

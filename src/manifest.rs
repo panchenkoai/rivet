@@ -30,6 +30,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::DestinationConfig;
+
 /// The relational algebra ABOVE these types: which runs live under one prefix
 /// and how they relate (dedupe, family membership, split-unit identity,
 /// supersession, generation coherence, claimed parts). It lives beside the
@@ -582,45 +584,37 @@ impl RunManifest {
     }
 }
 
-/// Self-consistency failures detected by [`RunManifest::validate_self_consistency`].
+/// Best-effort textual URI for the manifest's `destination.uri` field.
 ///
-/// These represent writer bugs, not destination drift; M5 destination-state
-/// checks live in the validate command path.
-#[derive(Debug, PartialEq)]
-pub enum ManifestInconsistency {
-    UnsupportedVersion { found: u32, supported: u32 },
-    PartCountMismatch { declared: u32, actual: usize },
-    RowCountMismatch { declared: i64, actual: i64 },
-    DuplicatePartId(u32),
+/// The manifest is a record of where data was written, so the URI must
+/// reflect what an operator would type to find the prefix again.
+pub(crate) fn destination_uri_for_manifest(cfg: &DestinationConfig) -> String {
+    cfg.uri()
 }
 
-impl std::fmt::Display for ManifestInconsistency {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::UnsupportedVersion { found, supported } => write!(
-                f,
-                "manifest_version {found} is not supported by this build (expected {supported})"
-            ),
-            Self::PartCountMismatch { declared, actual } => write!(
-                f,
-                "part_count declares {declared} parts but {actual} committed parts found"
-            ),
-            Self::RowCountMismatch { declared, actual } => write!(
-                f,
-                "row_count declares {declared} rows but committed parts sum to {actual}"
-            ),
-            Self::DuplicatePartId(id) => {
-                write!(f, "duplicate part_id {id} in manifest.parts")
-            }
-        }
-    }
-}
+/// Upper bound on a destination control artifact (`manifest.json`) the read
+/// path will materialise into memory.  A `manifest.json` is metadata — a few
+/// KB to low single-digit MB even for very large datasets — so 64 MiB is far
+/// above any legitimate body while still bounding the blast radius.
+///
+/// Security (V21, CWE-400): the manifest readers `head()` an object then read
+/// its full body into a `Vec<u8>`.  An attacker who can write the destination
+/// prefix (a shared bucket prefix, a world-writable export dir) can plant a
+/// multi-GB `manifest.json`; an unbounded read would OOM the next `--resume`,
+/// `--validate`, or `rivet repair`.  [`crate::pipeline::validate_manifest::read_capped`] consults the size the
+/// `head()` already reports and bails before the read when it exceeds this cap.
+pub(crate) const MANIFEST_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
-impl std::error::Error for ManifestInconsistency {}
+pub use crate::error::ManifestInconsistency;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_manifest_read_cap_is_64_mib() {
+        assert_eq!(MANIFEST_MAX_BYTES, 67_108_864);
+    }
 
     /// One sanitizer for every sidecar name: the manifest copy and the load
     /// lease agree on what a run id / table FQTN becomes on disk.

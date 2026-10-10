@@ -442,7 +442,7 @@ pub(crate) fn aggregate_load_failures(mut failures: Vec<anyhow::Error>) -> Optio
     if failures.is_empty() {
         return None;
     }
-    let primary_idx = crate::pipeline::run::representative_failure_idx(&failures)?;
+    let primary_idx = crate::error::representative_failure_idx(&failures)?;
     let primary = failures.remove(primary_idx);
     if failures.is_empty() {
         return Some(primary);

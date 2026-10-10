@@ -42,18 +42,7 @@ use crate::manifest::{
 };
 use crate::pipeline::manifest_reconcile::{PartPresence, reconcile_manifest_against_listing};
 
-/// Upper bound on a destination control artifact (`manifest.json`) the read
-/// path will materialise into memory.  A `manifest.json` is metadata — a few
-/// KB to low single-digit MB even for very large datasets — so 64 MiB is far
-/// above any legitimate body while still bounding the blast radius.
-///
-/// Security (V21, CWE-400): the manifest readers `head()` an object then read
-/// its full body into a `Vec<u8>`.  An attacker who can write the destination
-/// prefix (a shared bucket prefix, a world-writable export dir) can plant a
-/// multi-GB `manifest.json`; an unbounded read would OOM the next `--resume`,
-/// `--validate`, or `rivet repair`.  [`read_capped`] consults the size the
-/// `head()` already reports and bails before the read when it exceeds this cap.
-pub(crate) const MANIFEST_MAX_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) use crate::manifest::MANIFEST_MAX_BYTES;
 
 /// Same V21/CWE-400 defense for the sibling control artifact `_SUCCESS`, read by
 /// the SAME `verify_at_destination` under the SAME destination-writable threat

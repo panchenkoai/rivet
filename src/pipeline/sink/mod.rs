@@ -26,6 +26,7 @@ use crate::plan::{
 };
 use crate::quality::QualityTracker;
 use crate::source::BatchSink;
+use crate::types::refuse_override_case_miss;
 
 pub(crate) struct CompletedPart {
     pub(in crate::pipeline) tmp: tempfile::NamedTempFile,
@@ -874,28 +875,6 @@ impl ExportSink {
         }
         self.on_batch_inner(dest_batch)
     }
-}
-
-/// Refuse a `columns:` key that names no result column as spelled but one ignoring case; `check` and `run` share it.
-pub(crate) fn refuse_override_case_miss(keys: &[String], names: &[&str]) -> Result<()> {
-    let miss = keys.iter().find_map(|k| {
-        if names.contains(&k.as_str()) {
-            return None;
-        }
-        names
-            .iter()
-            .find(|n| n.eq_ignore_ascii_case(k))
-            .map(|n| (k.as_str(), *n))
-    });
-    if let Some((key, real)) = miss {
-        crate::rivet_bail!(
-            crate::error::codes::CONFIG_COLUMN_OVERRIDE_CASE,
-            "`columns: {{ {key}: ... }}` names no result-set column; the result names it \
-             `{real}`, and override keys match exactly, so the override would be silently \
-             ignored. Spell the key `{real}`."
-        );
-    }
-    Ok(())
 }
 
 impl BatchSink for ExportSink {

@@ -155,6 +155,139 @@ impl std::fmt::Display for PreclassifiedExit {
 
 impl std::error::Error for PreclassifiedExit {}
 
+/// A statement-DURATION timeout that **rivet itself** raised — distinct from a
+/// driver-native timeout that carries a structured code (PG 57014, MySQL 3024).
+///
+/// The MSSQL engine has no server-side statement-duration `SET`, so rivet
+/// enforces `tuning.statement_timeout_s` client-side and raises this when the
+/// budget is exceeded (see [`crate::source::mssql`]). Before this type the retry classifier's
+/// permanence hinged on substring-matching rivet's OWN prose ("statement
+/// timeout after …"); a reworded message would silently flip the error back to
+/// *transient*, and the identical query would be retried until it burned the
+/// budget N times (measured: 3×300 s = 20 min for 0 rows). Carrying a typed
+/// marker means [`crate::pipeline::retry::classify_error`] downcasts the TYPE,
+/// so permanence survives any change to the human-facing wording. The string
+/// branches in the classifier remain a fallback for genuinely driver-native
+/// timeout messages we do not control.
+#[derive(Debug)]
+pub struct StatementDurationTimeout {
+    /// Full actionable message shown to the operator. The classifier keys off
+    /// the TYPE, not this text — it exists only for Display.
+    message: String,
+}
+
+impl StatementDurationTimeout {
+    /// MSSQL client-side statement-duration timeout (no server-side `SET`).
+    pub fn mssql(seconds: u64) -> Self {
+        Self {
+            message: format!(
+                "mssql: statement timeout after {seconds}s (tuning.statement_timeout_s) — \
+                 this query cannot finish within the budget; split it with `mode: chunked` \
+                 (per-chunk statements stay under the limit) or raise \
+                 `tuning.statement_timeout_s`"
+            ),
+        }
+    }
+
+    /// Oracle statement-duration timeout: the driver call timeout plus a check between rows.
+    #[cfg(feature = "oracle")]
+    pub fn oracle(seconds: u64) -> Self {
+        Self {
+            message: format!(
+                "oracle: statement timeout after {seconds}s (tuning.statement_timeout_s) — \
+                 this query cannot finish within the budget; split it with `mode: chunked` \
+                 (per-chunk statements stay under the limit) or raise \
+                 `tuning.statement_timeout_s`"
+            ),
+        }
+    }
+
+    /// MySQL server-side `max_execution_time` timeout (ER_QUERY_TIMEOUT / 3024).
+    /// Wraps the driver's terse "maximum statement execution time exceeded" with
+    /// the actionable fix — including the WIDE-table case (a chunk that still
+    /// times out), which the field's `*_version` tables hit and the raw driver
+    /// error gave no guidance for.
+    pub fn mysql(seconds: u64) -> Self {
+        Self {
+            message: format!(
+                "mysql: statement timeout after {seconds}s (max_execution_time from \
+                 tuning.statement_timeout_s) — this query exceeded its time budget (ERROR 3024). \
+                 Split it with `mode: chunked` / `chunk_by_key` so per-chunk queries stay under \
+                 the limit; if a CHUNK still times out on a WIDE table, lower `chunk_size` or use \
+                 `chunk_size_memory_mb:` (width-aware chunking); or raise `tuning.statement_timeout_s`"
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for StatementDurationTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for StatementDurationTimeout {}
+
+/// Self-consistency failures detected by [`RunManifest::validate_self_consistency`].
+///
+/// These represent writer bugs, not destination drift; M5 destination-state
+/// checks live in the validate command path.
+#[derive(Debug, PartialEq)]
+pub enum ManifestInconsistency {
+    UnsupportedVersion { found: u32, supported: u32 },
+    PartCountMismatch { declared: u32, actual: usize },
+    RowCountMismatch { declared: i64, actual: i64 },
+    DuplicatePartId(u32),
+}
+
+impl std::fmt::Display for ManifestInconsistency {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedVersion { found, supported } => write!(
+                f,
+                "manifest_version {found} is not supported by this build (expected {supported})"
+            ),
+            Self::PartCountMismatch { declared, actual } => write!(
+                f,
+                "part_count declares {declared} parts but {actual} committed parts found"
+            ),
+            Self::RowCountMismatch { declared, actual } => write!(
+                f,
+                "row_count declares {declared} rows but committed parts sum to {actual}"
+            ),
+            Self::DuplicatePartId(id) => {
+                write!(f, "duplicate part_id {id} in manifest.parts")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ManifestInconsistency {}
+
+/// A load that stopped before touching the warehouse. The ledger records such a stop as
+/// `refused`, which never makes the target rivet's own — a `failed` row can.
+#[derive(Debug)]
+pub struct Refused(pub(crate) anyhow::Error);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for Refused {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.0.source()
+    }
+}
+
+impl Refused {
+    /// The error that stopped the load: its code and exit class are the stop's own.
+    pub(crate) fn cause(&self) -> &anyhow::Error {
+        &self.0
+    }
+}
+
 /// What KIND of failure a coded error is — the dimension an operator (and the release gate)
 /// branches on: fix the input, fix the environment, decide, stop and investigate, report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -249,10 +382,7 @@ pub fn error_code(err: &anyhow::Error) -> Option<&'static str> {
     // The existing source-side statement-timeout marker also gets a stable code,
     // so the long-query failure an operator's `statement_timeout` tooling watches
     // for is greppable without re-tagging its construction site.
-    if err
-        .downcast_ref::<crate::source::StatementDurationTimeout>()
-        .is_some()
-    {
+    if err.downcast_ref::<StatementDurationTimeout>().is_some() {
         return Some(codes::SOURCE_STATEMENT_TIMEOUT.id);
     }
     None
@@ -300,8 +430,7 @@ pub fn classify_exit(err: &anyhow::Error) -> i32 {
 
 /// The error under a load's stop-before-write marker, which carries the code and the class.
 fn stop_cause(err: &anyhow::Error) -> &anyhow::Error {
-    err.downcast_ref::<crate::load::Refused>()
-        .map_or(err, crate::load::Refused::cause)
+    err.downcast_ref::<Refused>().map_or(err, Refused::cause)
 }
 
 /// The class a typed stop marker in the chain fixes regardless of wording; `None` leaves it to the transient check.
@@ -310,9 +439,7 @@ pub(crate) fn stop_class(err: &anyhow::Error) -> Option<ExitClass> {
         return Some(ExitClass::SchemaDrift);
     }
     if err.downcast_ref::<DataIntegrityError>().is_some()
-        || err
-            .downcast_ref::<crate::manifest::ManifestInconsistency>()
-            .is_some()
+        || err.downcast_ref::<ManifestInconsistency>().is_some()
     {
         return Some(ExitClass::DataIntegrity);
     }
@@ -325,6 +452,17 @@ pub(crate) fn stop_class(err: &anyhow::Error) -> Option<ExitClass> {
         ErrorKind::Usage => Some(ExitClass::Generic),
         ErrorKind::Environment => None,
     }
+}
+
+/// Index of the most "stop-worthy" failure in a batch, ranked by
+/// [`crate::error::ExitClass::stop_rank`]. The chosen error's typed marker then rides up so `classify_exit`
+/// exits the process on the scariest reason rather than whichever export happened
+/// to fail first. Returns `None` for an empty slice.
+pub(crate) fn representative_failure_idx(failures: &[anyhow::Error]) -> Option<usize> {
+    (0..failures.len()).max_by_key(|&i| {
+        crate::error::ExitClass::from_code(crate::error::classify_exit(&failures[i]))
+            .map_or(0, crate::error::ExitClass::stop_rank)
+    })
 }
 
 /// Stable, greppable error codes carried by [`CodedError`]. A scheduler / CI step
@@ -1063,5 +1201,109 @@ mod tests {
         assert_eq!(error_code(&e), Some(codes::CONFIG_NO_EXPORTS.id));
         assert_eq!(classify_exit(&e), ExitClass::Generic.code());
         assert!(format!("{e:#}").contains("at least one export must be defined"));
+    }
+}
+
+#[cfg(test)]
+mod representative_failure_tests {
+    use super::representative_failure_idx;
+    use crate::error::{DataIntegrityError, ExitClass, SchemaDriftError, classify_exit};
+
+    #[test]
+    fn empty_batch_has_no_representative() {
+        assert_eq!(representative_failure_idx(&[]), None);
+    }
+
+    #[test]
+    fn data_integrity_outranks_everything_regardless_of_position() {
+        // Data-integrity sits LAST so a naive "first failure" or a flipped
+        // min/max selector would pick the generic error instead.
+        let failures = vec![
+            anyhow::anyhow!("generic boom"),
+            SchemaDriftError::new("shape changed").into(),
+            anyhow::anyhow!("another generic"),
+            DataIntegrityError::new("reconcile mismatch").into(),
+        ];
+        let idx = representative_failure_idx(&failures).unwrap();
+        assert_eq!(
+            classify_exit(&failures[idx]),
+            ExitClass::DataIntegrity.code(),
+            "a mixed batch must surface the data-integrity (exit 3) failure"
+        );
+    }
+
+    #[test]
+    fn schema_drift_outranks_retryable_and_generic() {
+        // No data-integrity present → schema-drift (exit 4) is the scariest.
+        let failures = vec![
+            anyhow::anyhow!("generic"),
+            SchemaDriftError::new("drift").into(),
+        ];
+        let idx = representative_failure_idx(&failures).unwrap();
+        assert_eq!(classify_exit(&failures[idx]), ExitClass::SchemaDrift.code());
+    }
+
+    #[test]
+    fn a_refusal_outranks_a_retryable_and_a_generic_failure() {
+        let refused = || -> anyhow::Error {
+            crate::error::CodedError::new(
+                crate::error::codes::STATE_CURSOR_OWNER_MISMATCH,
+                "cursor owned elsewhere",
+            )
+            .into()
+        };
+        let failures = vec![refused(), anyhow::anyhow!("connection reset by peer")];
+        assert_eq!(classify_exit(&failures[1]), ExitClass::Retryable.code());
+        let idx = representative_failure_idx(&failures).unwrap();
+        assert_eq!(classify_exit(&failures[idx]), ExitClass::Refusal.code());
+        let failures = vec![refused(), anyhow::anyhow!("generic")];
+        let idx = representative_failure_idx(&failures).unwrap();
+        assert_eq!(classify_exit(&failures[idx]), ExitClass::Refusal.code());
+    }
+}
+
+#[cfg(test)]
+mod stop_marker_tests {
+    use super::{ManifestInconsistency, Refused};
+
+    #[test]
+    fn a_manifest_inconsistency_names_the_two_counts_that_disagree() {
+        let shown = |m: ManifestInconsistency| m.to_string();
+        assert_eq!(
+            shown(ManifestInconsistency::UnsupportedVersion {
+                found: 9,
+                supported: 1
+            }),
+            "manifest_version 9 is not supported by this build (expected 1)"
+        );
+        assert_eq!(
+            shown(ManifestInconsistency::PartCountMismatch {
+                declared: 3,
+                actual: 2
+            }),
+            "part_count declares 3 parts but 2 committed parts found"
+        );
+        assert_eq!(
+            shown(ManifestInconsistency::RowCountMismatch {
+                declared: 10,
+                actual: 7
+            }),
+            "row_count declares 10 rows but committed parts sum to 7"
+        );
+        assert_eq!(
+            shown(ManifestInconsistency::DuplicatePartId(4)),
+            "duplicate part_id 4 in manifest.parts"
+        );
+    }
+
+    #[test]
+    fn a_refused_stop_shows_its_cause_and_keeps_the_cause_chain() {
+        let cause = anyhow::Error::new(std::io::Error::other("disk gone")).context("staging");
+        let stop = Refused(cause);
+        assert_eq!(stop.to_string(), "staging");
+        assert_eq!(
+            std::error::Error::source(&stop).map(ToString::to_string),
+            Some("disk gone".to_string())
+        );
     }
 }

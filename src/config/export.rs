@@ -581,7 +581,7 @@ impl ExportConfig {
                 )
             }
         }?;
-        let wrappable = |q: &String| crate::sql::wrappable_query(q);
+        let wrappable = |q: &String| wrappable_query(q);
         Ok((wrappable(&q), written.as_ref().map(wrappable)))
     }
 }
@@ -875,6 +875,16 @@ pub enum PartitionGranularity {
     Month,
     /// One bucket per calendar year (`col=2023/`).
     Year,
+}
+
+/// A user query made safe to wrap as `FROM (<query>)`: trailing whitespace and `;`
+/// trimmed, and a newline appended when the last line holds a `--` comment.
+pub(crate) fn wrappable_query(query: &str) -> String {
+    let q = query.trim_end_matches(|c: char| c.is_whitespace() || c == ';');
+    match q.lines().last() {
+        Some(last) if last.contains("--") => format!("{q}\n"),
+        _ => q.to_string(),
+    }
 }
 
 /// Canonical fully-populated [`ExportConfig`] for tests across the crate.
@@ -1303,5 +1313,22 @@ mod tests {
         let exp = make_export_direct(None, Some("queries/orders.sql"));
         let q = exp.resolve_query(dir.path(), None).unwrap();
         assert_eq!(q, "SELECT * FROM orders");
+    }
+}
+
+#[cfg(test)]
+mod wrappable_query_tests {
+    use super::wrappable_query;
+
+    #[test]
+    fn wrappable_query_drops_the_semicolon_and_ends_a_trailing_comment() {
+        assert_eq!(wrappable_query("SELECT 1 ;\n  "), "SELECT 1");
+        assert_eq!(wrappable_query("SELECT 1;;"), "SELECT 1");
+        assert_eq!(
+            wrappable_query("SELECT 1\n-- the tail\n"),
+            "SELECT 1\n-- the tail\n"
+        );
+        assert_eq!(wrappable_query("SELECT 1 -- c"), "SELECT 1 -- c\n");
+        assert_eq!(wrappable_query("SELECT 1"), "SELECT 1");
     }
 }

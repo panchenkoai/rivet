@@ -295,6 +295,39 @@ pub fn create_destination_for_probe(config: &DestinationConfig) -> Result<Box<dy
     }
 }
 
+/// A multi-table stream lands each table under its own sub-prefix of the
+/// export's destination (`<base>/<table>/`), so every table's prefix is
+/// self-describing (its own parts + `manifest.json` + `_SUCCESS`), exactly like
+/// N single-table exports — minus the N−1 extra slots/connections.
+pub(crate) fn dest_for_table(
+    base: &crate::config::DestinationConfig,
+    table: &str,
+) -> crate::config::DestinationConfig {
+    let mut d = base.clone();
+    match d.destination_type {
+        crate::config::DestinationType::Local => {
+            let p = d.path.take().unwrap_or_else(|| ".".into());
+            d.path = Some(format!("{}/{}", p.trim_end_matches('/'), table));
+        }
+        crate::config::DestinationType::Stdout => {}
+        // Cloud destinations: extend the key prefix. Cloud prefixes are
+        // LITERAL key prefixes — the destination concatenates `prefix + key`
+        // with no separator (the docs' `prefix: exports/` convention) — so the
+        // sub-prefix must supply both its slashes itself, or every object
+        // lands as a mangled flat key (`<prefix>/<table>cdc-….parquet`).
+        _ => {
+            let pfx = d.prefix.take().unwrap_or_default();
+            let base = pfx.trim_end_matches('/');
+            d.prefix = Some(if base.is_empty() {
+                format!("{table}/")
+            } else {
+                format!("{base}/{table}/")
+            });
+        }
+    }
+    d
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -420,5 +453,76 @@ mod tests {
         let dest = create_destination(&config).unwrap();
         let caps = dest.capabilities();
         assert_eq!(caps.commit_protocol, WriteCommitProtocol::Streaming);
+    }
+}
+
+#[cfg(test)]
+mod dest_for_table_tests {
+    use super::dest_for_table;
+    use crate::config::{DestinationConfig, DestinationType};
+
+    #[test]
+    fn a_stdout_destination_gets_no_per_table_location() {
+        let stdout = DestinationConfig {
+            destination_type: DestinationType::Stdout,
+            ..Default::default()
+        };
+        let d = dest_for_table(&stdout, "orders");
+        assert_eq!((d.path, d.prefix), (None, None));
+    }
+
+    // RED test for the finding: cloud prefixes are LITERAL key prefixes —
+    // `cloud.rs` concatenates `prefix + key` with NO separator (hence the
+    // docs' `prefix: exports/` convention). The multi-table sub-prefix must
+    // therefore supply both slashes itself; without the trailing one, every
+    // object of a `tables:` export lands as `<prefix>/<table>cdc-….parquet`
+    // (mangled flat keys) — observed live on a real GCS bucket.
+    #[test]
+    fn cloud_table_sub_prefix_carries_its_own_trailing_slash() {
+        let gcs = DestinationConfig {
+            destination_type: DestinationType::Gcs,
+            bucket: Some("b".into()),
+            prefix: Some("exports".into()),
+            ..Default::default()
+        };
+        let d = dest_for_table(&gcs, "orders");
+        let prefix = d.prefix.unwrap();
+        // The exact join the cloud destination performs:
+        let key = format!("{prefix}{}", "cdc-r-000000.parquet");
+        assert_eq!(
+            key, "exports/orders/cdc-r-000000.parquet",
+            "cloud keys are prefix ++ name — the sub-prefix must end with '/'"
+        );
+
+        // A trailing slash on the configured prefix must not double up.
+        let gcs2 = DestinationConfig {
+            prefix: Some("exports/".into()),
+            ..gcs.clone()
+        };
+        assert_eq!(
+            dest_for_table(&gcs2, "orders").prefix.unwrap(),
+            "exports/orders/"
+        );
+
+        // No configured prefix: the table becomes the whole prefix.
+        let gcs3 = DestinationConfig {
+            prefix: None,
+            ..gcs
+        };
+        assert_eq!(dest_for_table(&gcs3, "orders").prefix.unwrap(), "orders/");
+    }
+
+    #[test]
+    fn local_table_sub_path_is_a_plain_directory_join() {
+        let local = DestinationConfig {
+            destination_type: DestinationType::Local,
+            path: Some("/data/cdc/".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            dest_for_table(&local, "orders").path.unwrap(),
+            "/data/cdc/orders",
+            "local paths go through the filesystem join — no trailing slash needed"
+        );
     }
 }

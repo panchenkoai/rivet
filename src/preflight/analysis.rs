@@ -308,7 +308,7 @@ fn measured_this_source(
     if m.source_type.as_deref() != Some(source.ledger_label().as_str()) {
         return false;
     }
-    let want = crate::pipeline::destination_uri_for_manifest(&export.destination);
+    let want = crate::manifest::destination_uri_for_manifest(&export.destination);
     match m.run_id.as_deref().map(|id| state.run_prefix_of(id)) {
         Some(Ok(Some(prefix))) => prefix == want,
         _ => true,
@@ -873,11 +873,7 @@ pub(super) fn collect_warnings(
     .collect()
 }
 
-/// Tables at or below this row count are a one-shot full copy, not a workload
-/// worth a "DEGRADED" warning. Mirrors `init::TableInfo::suggest_mode`, which
-/// recommends plain `mode: full` (no index/cursor) up to the same threshold —
-/// so the scaffold init writes must not then be scolded by `check`.
-pub(crate) const SMALL_TABLE_ROW_THRESHOLD: i64 = 100_000;
+pub(crate) use crate::plan::explain::SMALL_TABLE_ROW_THRESHOLD;
 
 /// The verdict for `export`: the table-scan rules of [`compute_verdict`], except a
 /// `mode: cdc` export, which reads the transaction log and scans nothing.
@@ -1436,7 +1432,7 @@ mod tests {
     #[test]
     fn overlay_uses_the_run_of_the_same_engine_and_destination() {
         let export = cfg("table: rivet_type_matrix\nmode: full\n");
-        let want = crate::pipeline::destination_uri_for_manifest(&export.destination);
+        let want = crate::manifest::destination_uri_for_manifest(&export.destination);
         let mut diag = scope_diag();
         overlay_measured_rows(
             &mut diag,

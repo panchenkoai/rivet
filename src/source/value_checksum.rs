@@ -660,7 +660,7 @@ fn part_row_count_mismatch(
         .filter(|p| p.status == crate::manifest::PartStatus::Committed);
     for (part, path) in committed.zip(paths) {
         if manifest.format == crate::config::FormatType::Csv.label() {
-            let records = crate::pipeline::validate::count_csv_records(path)
+            let records = crate::format::csv::count_csv_records(path)
                 .map_err(|e| anyhow::anyhow!("part row count: read {}: {e}", part.path))?;
             let actual = records.saturating_sub(1) as i64;
             if actual != part.rows {

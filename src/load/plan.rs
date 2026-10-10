@@ -390,7 +390,7 @@ fn resolve_load_prefix(
 /// export wrote, and the table segment can never land below a stripped token.
 fn table_load_prefix(base_uri: &str, table: &str) -> Result<String> {
     let (bucket, base) = crate::load::split_object_uri(base_uri)?;
-    let sub = crate::pipeline::cdc_job::dest_for_table(
+    let sub = crate::destination::dest_for_table(
         &crate::config::DestinationConfig {
             destination_type: crate::config::DestinationType::Gcs,
             prefix: Some(base.to_string()),
