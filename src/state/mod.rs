@@ -78,7 +78,7 @@ pub(super) fn pg_sql(sql: &str) -> String {
 /// — there is no YAML `tls:` block — so the transport-security policy is derived
 /// from the URL's `sslmode` query parameter ([`crate::config::url::url_tls`]), exactly as `rivet init` does for
 /// source connections. The connection itself goes through the shared
-/// [`crate::source::postgres::connect_client`] path so the state backend and
+/// [`crate::connect::postgres::connect_client`] path so the state backend and
 /// source connections apply identical TLS rules.
 ///
 /// - missing / `disable` / `prefer` / `allow` / unrecognized → `NoTls`
@@ -90,7 +90,7 @@ pub(super) fn pg_sql(sql: &str) -> String {
 /// TLS-aware.
 pub(super) fn connect_pg(url: &str) -> Result<postgres::Client> {
     let tls = crate::config::url::url_tls(url).1;
-    let connect = || crate::source::postgres::connect_client(url, tls.as_ref());
+    let connect = || crate::connect::postgres::connect_client(url, tls.as_ref());
     // The client panics where it cannot build its runtime (no file descriptor left).
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(connect))
         .unwrap_or_else(|panic| Err(anyhow::anyhow!(client_panic_message(&*panic))))

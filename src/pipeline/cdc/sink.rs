@@ -7,7 +7,7 @@
 //! (upsert shape). A `DELETE` carries its key columns from the before-image.
 //! Downstream MERGEs by PK + `__op` — the latest full image per key wins.
 //!
-//! Column typing flows through [`super::value`] (`RivetValue` → Arrow), so
+//! Column typing flows through [`crate::source::cdc::value`] (`RivetValue` → Arrow), so
 //! temporals/decimals land as real `Timestamp`/`Date32`/`Decimal128` columns.
 //! Each part is uploaded through [`crate::pipeline::commit::write_part_file`] —
 //! the same destination + content-MD5 + transit-integrity path the batch export
@@ -35,8 +35,11 @@ use crate::manifest::{
 };
 use crate::pipeline::commit::{PartRecord, write_part_file};
 use crate::pipeline::manifest_writer::{write_manifest, write_manifest_without_success_marker};
+use crate::source::cdc::identity::table_matches;
 use crate::source::cdc::value::{self, RivetValue};
-use crate::source::cdc::{ChangeEvent, ChangeStream, Position, TxnSeq};
+use crate::source::cdc::{
+    CdcEngine, ChangeEvent, ChangeStream, Position, ResidentBytes, TxnSeq, partition_guard,
+};
 use crate::types::{TypeMapping, build_arrow_field};
 
 /// One table's wiring in a (possibly multi-table) CDC run: where its parts go
@@ -59,7 +62,7 @@ pub(crate) struct TableOutput<'a> {
     /// footer; `None` when the change log is not partitioned.
     pub partition: Option<crate::plan::rollover::PartitionRollover>,
     /// The partition key a change must not move (base-and-buffer layout only).
-    pub partition_guard: Option<super::partition_guard::PartitionGuard>,
+    pub partition_guard: Option<partition_guard::PartitionGuard>,
     /// The key the load merges by; an UPDATE that changes it is written as a delete and an insert.
     pub key: Vec<String>,
     /// Columns this table's `columns:` overrides name; a refused cell of one is an override mismatch.
@@ -78,7 +81,7 @@ pub(crate) struct SinkConfig<'a> {
     /// different exports whenever `name:` differed from `table:`.
     pub export_name: String,
     pub outputs: Vec<TableOutput<'a>>,
-    pub engine: super::CdcEngine,
+    pub engine: CdcEngine,
     pub format: FormatType,
     pub checkpoint: Option<PathBuf>,
     pub max_events: Option<usize>,
@@ -135,12 +138,12 @@ struct TableSink<'a> {
     /// How many of `parts` the last per-roll manifest already declared.
     manifested_parts: usize,
     /// The open transaction's moved-in keys, which order a statement's key moves.
-    moved: super::partition_guard::MovedIn,
+    moved: partition_guard::MovedIn,
 }
 
 /// The facts one sink run shares across every table and every roll: who it is, how it writes, where it records.
 struct SinkRun<'a> {
-    engine: super::CdcEngine,
+    engine: CdcEngine,
     format: FormatType,
     export_name: &'a str,
     run_token: &'a str,
@@ -183,7 +186,7 @@ impl TableSink<'_> {
     /// Encode + upload this table's buffered changes as one part per partition-budget slice.
     fn encode_and_upload(
         &self,
-        engine: super::CdcEngine,
+        engine: CdcEngine,
         format: FormatType,
         run_token: &str,
     ) -> FlushedParts {
@@ -278,45 +281,6 @@ impl TableSink<'_> {
         self.seq += 1;
         self.buf.clear();
         self.moved.reset();
-    }
-}
-
-/// Does a config `table:` entry match an event's identity? Config may be bare
-/// (`orders` — matches the bare table name in any schema) or schema-qualified
-/// (`public.orders` — matches schema AND table). Adapters always emit schema
-/// and table separately; comparing the config string verbatim against the
-/// bare event table silently routed ZERO events for qualified configs.
-/// Does this configured `table:` name the relation an event came from?
-///
-/// The ENGINE decides how many readings a dotted string has, and passing it is not
-/// ceremony: on a store with schemas, `a.b` may be a qualifier; on one without, it
-/// can only be a name. While Mongo shared SQL's two-reading rule, a collection whose
-/// first segment equalled the DATABASE name matched twice — `table: shopdb.orders`
-/// took both the collection literally named `shopdb.orders` and the sibling
-/// `orders`, interleaving two collections into one destination with every count
-/// intact (round-3B bughunt).
-pub(crate) fn table_matches(
-    engine: super::CdcEngine,
-    cfg: &str,
-    schema: &str,
-    table: &str,
-) -> bool {
-    // Full-name match FIRST: a MongoDB collection name may contain dots
-    // (`my.coll`) and has no schema qualifier, so splitting it into a bogus
-    // `schema.table` dropped every event (bug-hunt: 0-row success forever). This
-    // is safe for SQL — no real table is literally named `schema.table`.
-    if cfg == table {
-        return true;
-    }
-    // A document store has no schema to qualify with, so there is no second
-    // reading — the full-name arm above was the whole answer.
-    if engine == super::CdcEngine::Mongo {
-        return false;
-    }
-    // Otherwise a SQL `schema.table` qualifier.
-    match cfg.split_once('.') {
-        Some((cs, ct)) => cs == schema && ct == table,
-        None => false,
     }
 }
 
@@ -475,7 +439,7 @@ pub(crate) fn run_to_files(
         state: cfg.state,
     };
     let (mut total_rows, mut emitted) = (0usize, 0usize);
-    let mut total_bytes = super::ResidentBytes::default();
+    let mut total_bytes = ResidentBytes::default();
     // The last commit-boundary position seen, and whether a commit has arrived
     // since the last ack — the only position it is ever valid to advance to.
     let mut last_commit: Option<Position> = None;
@@ -557,7 +521,7 @@ pub(crate) fn run_to_files(
                         ev.payload_bytes() as u64,
                         std::sync::atomic::Ordering::Relaxed,
                     );
-                    let split = super::partition_guard::split_move(
+                    let split = partition_guard::split_move(
                         &ev,
                         &sink.out.key,
                         sink.out.partition_guard.as_ref(),
@@ -896,7 +860,7 @@ fn flush(
     events: &[ChangeEvent],
     schema: &SchemaRef,
     columns: &[TypeMapping],
-    engine: super::CdcEngine,
+    engine: CdcEngine,
     row_hash: &crate::config::RowHash,
     partition: Option<&crate::plan::rollover::PartitionRollover>,
     overridden: &std::collections::HashSet<String>,
@@ -1203,7 +1167,7 @@ pub(crate) fn part_compression(format: FormatType) -> CompressionType {
 /// plan coupling; `record_part` is the plan-bound path the batch export uses).
 #[allow(clippy::too_many_arguments)] // the export identity joined an existing 7-arg builder
 fn build_manifest(
-    engine: super::CdcEngine,
+    engine: CdcEngine,
     column_sums: &std::collections::BTreeMap<String, u64>,
     out: &TableOutput<'_>,
     export_name: &str,
@@ -1435,8 +1399,8 @@ mod tests {
     }
 
     impl ChangeStream for FakeStream {
-        fn engine(&self) -> super::super::CdcEngine {
-            super::super::CdcEngine::Postgres
+        fn engine(&self) -> CdcEngine {
+            CdcEngine::Postgres
         }
 
         fn next_change(&mut self) -> Option<Result<ChangeEvent>> {
@@ -1466,8 +1430,8 @@ mod tests {
     struct FrontierStream(FakeStream, Position);
 
     impl ChangeStream for FrontierStream {
-        fn engine(&self) -> super::super::CdcEngine {
-            super::super::CdcEngine::Mssql
+        fn engine(&self) -> CdcEngine {
+            CdcEngine::Mssql
         }
         fn next_change(&mut self) -> Option<Result<ChangeEvent>> {
             self.0.next_change()
@@ -1674,80 +1638,6 @@ mod tests {
         );
     }
 
-    // Ultrareview bug_004: a schema-qualified config (`table: public.orders`)
-    // compared verbatim against the adapter's BARE event table matched zero
-    // events — the whole stream silently dropped into a 0-row success.
-    #[test]
-    fn table_matches_handles_bare_and_qualified_configs() {
-        assert!(
-            table_matches(CdcEngine::Postgres, "orders", "public", "orders"),
-            "bare matches any schema"
-        );
-        assert!(
-            table_matches(CdcEngine::Postgres, "public.orders", "public", "orders"),
-            "qualified matches"
-        );
-        assert!(
-            !table_matches(CdcEngine::Postgres, "audit.orders", "public", "orders"),
-            "wrong schema differs"
-        );
-        assert!(
-            !table_matches(CdcEngine::Postgres, "orders", "public", "users"),
-            "different table differs"
-        );
-    }
-
-    /// Mongo has NO schema qualifier, so the `schema.table` split arm must not run
-    /// there — and while it did, one config matched two collections.
-    ///
-    /// Round-3B bughunt. A collection whose first dot-segment equals the DATABASE
-    /// name (db `shopdb`, collections `orders` and `shopdb.orders` — both legal)
-    /// matched `table: shopdb.orders` twice: once by full name, once by the split.
-    /// Two collections' events interleaved into one destination under a green run,
-    /// invisible to any count.
-    ///
-    /// The split arm exists for SQL's `schema.table`; on a store with no schemas it
-    /// is a second reading of a string that has only one.
-    #[test]
-    fn a_mongo_dotted_name_never_splits_into_a_schema_qualifier() {
-        assert!(
-            table_matches(CdcEngine::Mongo, "shopdb.orders", "shopdb", "shopdb.orders"),
-            "the collection LITERALLY named `shopdb.orders` is the only reading"
-        );
-        assert!(
-            !table_matches(CdcEngine::Mongo, "shopdb.orders", "shopdb", "orders"),
-            "the sibling collection `orders` must NOT also match — that is the \
-             interleave: two collections into one destination, counts intact"
-        );
-        // SQL keeps both arms: `schema.table` is a real qualifier there.
-        assert!(table_matches(
-            CdcEngine::Postgres,
-            "public.orders",
-            "public",
-            "orders"
-        ));
-    }
-
-    #[test]
-    fn roast_dotted_collection_name_routes_by_full_name() {
-        // A MongoDB collection literally named `my.data` (dots are legal, no
-        // schema concept) must route by its FULL name — before this it was
-        // mis-split into schema=`my`, table=`data` and routed ZERO events forever.
-        assert!(table_matches(
-            CdcEngine::Mongo,
-            "my.data",
-            "shopdb",
-            "my.data"
-        ));
-        // Still distinguishes a genuinely different collection.
-        assert!(!table_matches(
-            CdcEngine::Mongo,
-            "my.data",
-            "shopdb",
-            "my.other"
-        ));
-    }
-
     /// A nameless image is refused even at matching arity: rivet never maps by position.
     #[test]
     fn a_nameless_image_fails_the_flush_and_writes_no_part() {
@@ -1795,8 +1685,8 @@ mod tests {
         ack_count: usize,
     }
     impl ChangeStream for ManifestBeforeAckStream {
-        fn engine(&self) -> super::super::CdcEngine {
-            super::super::CdcEngine::Postgres
+        fn engine(&self) -> CdcEngine {
+            CdcEngine::Postgres
         }
 
         fn next_change(&mut self) -> Option<Result<ChangeEvent>> {
@@ -1886,8 +1776,8 @@ mod tests {
             acked: Vec<Position>,
         }
         impl ChangeStream for FailAfter {
-            fn engine(&self) -> super::super::CdcEngine {
-                super::super::CdcEngine::Postgres
+            fn engine(&self) -> CdcEngine {
+                CdcEngine::Postgres
             }
 
             fn next_change(&mut self) -> Option<Result<ChangeEvent>> {
@@ -3018,12 +2908,14 @@ mod tests {
     }
 
     fn local_dest(dir: &tempfile::TempDir) -> Box<dyn crate::destination::Destination> {
-        crate::destination::create_destination(&crate::config::DestinationConfig {
-            destination_type: crate::config::DestinationType::Local,
-            path: Some(dir.path().to_string_lossy().into_owned()),
-            ..Default::default()
-        })
-        .unwrap()
+        Box::new(
+            crate::destination::local::LocalDestination::new(&crate::config::DestinationConfig {
+                destination_type: crate::config::DestinationType::Local,
+                path: Some(dir.path().to_string_lossy().into_owned()),
+                ..Default::default()
+            })
+            .unwrap(),
+        )
     }
 
     fn cfg<'a>(
@@ -4264,9 +4156,9 @@ mod tests {
         };
         let dest = local_dest(&out);
         let mut c = cfg(dest.as_ref(), &cols, FormatType::Parquet, 10);
-        c.outputs[0].partition_guard = Some(super::super::partition_guard::PartitionGuard {
+        c.outputs[0].partition_guard = Some(super::partition_guard::PartitionGuard {
             column: "v".into(),
-            unit: super::super::partition_guard::GuardUnit::Range {
+            unit: super::partition_guard::GuardUnit::Range {
                 start: 0,
                 end: 100,
                 interval: 10,

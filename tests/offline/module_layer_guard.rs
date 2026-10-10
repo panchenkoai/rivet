@@ -15,6 +15,10 @@ const LAYERS: &[(&str, &str)] = &[
     ("tuning", "source tuning profiles and adaptive sizing"),
     ("types", "the internal type system and delivered text forms"),
     ("config", "the YAML config model and its validation"),
+    (
+        "connect",
+        "the dial every connection shares: TLS gate, connector, PostgreSQL client",
+    ),
     ("format", "Parquet and CSV writers"),
     ("sql", "dialect SQL text sent to a source"),
     ("enrich", "meta columns added to a batch"),
@@ -41,7 +45,6 @@ const LAYERS: &[(&str, &str)] = &[
 /// Upward references measured 2026-10-10 on main 3994d3ca, as `from -> to::item`. Shrink-only.
 const EXCEPTIONS: &[&str] = &[
     // ratchet-pin: module-layer-exceptions strings
-    "error -> pipeline::retry::classify_error",
     "notify -> pipeline::RunSummary",
     "plan -> load::plan::PartitionSpec",
     "plan -> load::plan::resolved_layout",
@@ -54,18 +57,8 @@ const EXCEPTIONS: &[&str] = &[
     "preflight -> load::plan::RecordedKeys",
     "preflight -> load::plan::RecordedKeys::new",
     "preflight -> pipeline::chunked::strip_select_star_from",
-    "preflight -> pipeline::retry::classify_error",
-    "redact -> pipeline::ipc::route_log_line",
-    "source -> pipeline::batch_partition_buckets",
-    "source -> pipeline::commit::PartRecord",
-    "source -> pipeline::commit::write_part_file",
-    "source -> pipeline::manifest_writer::write_manifest",
-    "source -> pipeline::manifest_writer::write_manifest_without_success_marker",
     "source -> preflight::cdc_health::pg_foreign_slots_warning",
     "source -> preflight::cdc_health::pg_retained_wal_warning",
-    "state -> source::postgres::connect_client",
-    "tuning -> source::Source",
-    "tuning -> source::Source::sample_governor_pressure",
 ]; // ratchet-pin: end
 
 /// Keywords that open an item or a `let`, where a top-level `,` does not end it.

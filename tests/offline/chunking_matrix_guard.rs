@@ -1213,7 +1213,7 @@ const INLINE_DRAIN: &str = "fan_in::commit_unit(";
 /// The CDC drain's commit call: `mode: cdc` returns from job.rs before the batch
 /// tail and commits through its own per-table sinks under `src/source/cdc`.
 const CDC_DRAIN: &str = "].record_part(";
-const CDC_ROOT: &str = "src/source/cdc";
+const CDC_ROOT: &str = "src/pipeline/cdc";
 
 /// Every COMMIT LOOP the product has → the runner-coverage COLUMN it collapses
 /// into. This table is the collapse the ledger's header describes, written where
@@ -1417,8 +1417,8 @@ fn runner_matrix_columns_are_derived_from_the_commit_loops() {
     loops.extend(top_level_callers_of(FAN_IN_DRAIN));
     loops.extend(top_level_callers_of(INLINE_DRAIN));
     super::nonvacuity::require_needle(
-        &super::nonvacuity::subject_text("src/source/cdc/sink.rs"),
-        "src/source/cdc/sink.rs",
+        &super::nonvacuity::subject_text("src/pipeline/cdc/sink.rs"),
+        "src/pipeline/cdc/sink.rs",
         CDC_DRAIN,
         1,
         "If the CDC sink's commit call moved, re-point CDC_DRAIN — the cdc column is derived \

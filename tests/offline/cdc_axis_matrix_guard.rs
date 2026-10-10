@@ -26,7 +26,8 @@ use serde_yaml_ng::Value;
 
 const MATRIX: &str = "docs/cdc-axis-matrix.yaml";
 const CONFIG: &str = "src/config/cdc.rs";
-const SINK: &str = "src/source/cdc/sink.rs";
+const SINK: &str = "src/pipeline/cdc/sink.rs";
+const CAPTURE: &str = "src/pipeline/cdc/mod.rs";
 const CDC_MOD: &str = "src/source/cdc/mod.rs";
 const SWEEP: &str = "dev/pytools/cdc_sweep.py";
 
@@ -125,7 +126,7 @@ fn cdc_config_fields() -> BTreeSet<String> {
 /// Every `maybe_panic_at("cdc_…")` fault point in the CDC path.
 fn cdc_crash_hooks() -> BTreeSet<String> {
     let mut out = BTreeSet::new();
-    for path in [SINK, CDC_MOD] {
+    for path in [SINK, CAPTURE, CDC_MOD] {
         let src = fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
         for (i, _) in src.match_indices("maybe_panic_at(\"cdc_") {
             let tail = &src[i + "maybe_panic_at(\"".len()..];
@@ -136,7 +137,7 @@ fn cdc_crash_hooks() -> BTreeSet<String> {
     }
     assert!(
         out.len() >= 4,
-        "found only {} cdc crash hook(s) ({out:?}) across {SINK} and {CDC_MOD} — the scan found \
+        "found only {} cdc crash hook(s) ({out:?}) across {SINK}, {CAPTURE} and {CDC_MOD} — the scan found \
          nothing rather than the hooks having gone away.",
         out.len()
     );

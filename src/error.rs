@@ -5,6 +5,8 @@
 //! *class* instead of grepping stderr. Before this, `main` exited `1` for every
 //! error, forcing operators to regex the error text to decide retry-vs-stop.
 
+pub mod retry;
+
 /// Machine-actionable exit-code taxonomy.
 ///
 /// A scheduler keys its retry / alert policy off the numeric exit code:
@@ -165,7 +167,7 @@ impl std::error::Error for PreclassifiedExit {}
 /// timeout after …"); a reworded message would silently flip the error back to
 /// *transient*, and the identical query would be retried until it burned the
 /// budget N times (measured: 3×300 s = 20 min for 0 rows). Carrying a typed
-/// marker means [`crate::pipeline::retry::classify_error`] downcasts the TYPE,
+/// marker means [`retry::classify_error`] downcasts the TYPE,
 /// so permanence survives any change to the human-facing wording. The string
 /// branches in the classifier remain a fallback for genuinely driver-native
 /// timeout messages we do not control.
@@ -227,6 +229,64 @@ impl std::fmt::Display for StatementDurationTimeout {
 }
 
 impl std::error::Error for StatementDurationTimeout {}
+
+/// A connect that failed in the TLS handshake — a configuration fault no retry fixes (the classifier keys on the TYPE).
+#[derive(Debug)]
+pub struct TlsHandshakeFailed(String);
+
+impl std::fmt::Display for TlsHandshakeFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl TlsHandshakeFailed {
+    /// Put the TLS verdict (and its fix) in front of a driver error; `at` names the endpoint when known.
+    pub(crate) fn wrap(err: anyhow::Error, at: Option<&str>) -> anyhow::Error {
+        let with = at.map(|a| format!(" with {a}")).unwrap_or_default();
+        err.context(Self(format!(
+            "TLS handshake{with} failed — the server does not speak TLS or its certificate \
+             is not trusted: set `tls.ca_file` for a private CA, or `tls.mode: disable` if the \
+             server has no TLS (trusted networks only); retrying will not help"
+        )))
+    }
+}
+
+/// A warehouse job rivet stopped WAITING for, having waited out its budget.
+///
+/// Deliberately NOT a [`Refused`]: that one means "stopped before touching the
+/// warehouse", and this is the opposite — the statement was submitted and may well
+/// still be running server-side. The type is what the retry classifier keys off
+/// ([`retry::classify_error`]), so the permanence of a deterministic
+/// timeout cannot be undone by rewording its message; retrying a wait that already
+/// expired only doubles the wait.
+#[derive(Debug)]
+pub struct JobWaitTimeout {
+    message: String,
+}
+
+impl JobWaitTimeout {
+    /// The BigQuery poll loop gave up on `job_id` after `seconds`.
+    pub fn bigquery(job_id: &str, seconds: u64) -> Self {
+        Self {
+            message: format!(
+                "bigquery: stopped waiting for job `{job_id}` after {seconds}s — the job may \
+                 still be RUNNING in BigQuery, so check it there before re-running: \
+                 SELECT state, error_result FROM `region-<your dataset's region>`.\
+                 INFORMATION_SCHEMA.JOBS WHERE job_id = '{job_id}'. An append mode that \
+                 re-consumes the same runs would double them"
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for JobWaitTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for JobWaitTimeout {}
 
 /// Self-consistency failures detected by [`RunManifest::validate_self_consistency`].
 ///
@@ -395,7 +455,7 @@ pub fn error_code(err: &anyhow::Error) -> Option<&'static str> {
 /// 2. `stop_class`: [`SchemaDriftError`] → `4`; [`DataIntegrityError`] /
 ///    [`crate::manifest::ManifestInconsistency`] → `3`; a [`CodedError`] by kind
 ///    (refusal `5`, internal `6`, integrity `3`, usage `1`).
-/// 3. otherwise, if [`crate::pipeline::retry::classify_error`] says the error is
+/// 3. otherwise, if [`retry::classify_error`] says the error is
 ///    transient → `2`.
 /// 4. otherwise → `1` (generic).
 ///
@@ -422,7 +482,7 @@ pub fn classify_exit(err: &anyhow::Error) -> i32 {
     if let Some(c) = stop_class(err) {
         return c.code();
     }
-    if crate::pipeline::retry::classify_error(err).is_transient() {
+    if retry::classify_error(err).is_transient() {
         return ExitClass::Retryable.code();
     }
     ExitClass::Generic.code()
@@ -1264,7 +1324,16 @@ mod representative_failure_tests {
 
 #[cfg(test)]
 mod stop_marker_tests {
-    use super::{ManifestInconsistency, Refused};
+    use super::{JobWaitTimeout, ManifestInconsistency, Refused};
+
+    #[test]
+    fn a_job_wait_timeout_names_the_job_and_how_long_it_waited() {
+        let shown = JobWaitTimeout::bigquery("job_42", 900).to_string();
+        assert_eq!(
+            shown.split(" \u{2014} ").next(),
+            Some("bigquery: stopped waiting for job `job_42` after 900s")
+        );
+    }
 
     #[test]
     fn a_manifest_inconsistency_names_the_two_counts_that_disagree() {

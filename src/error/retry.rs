@@ -1,10 +1,6 @@
-//! **Layer: Execution**
-//!
 //! Error classification for retry logic.  `classify_error` maps raw error strings
 //! to retry categories (transient vs permanent, reconnect-needed, extra delay).
 //! No plan data is read here — this is pure error-signal processing.
-
-pub(crate) use crate::tuning::retry_backoff_ms;
 
 /// Outcome of `classify_error`.
 ///
@@ -115,7 +111,7 @@ pub fn classify_error(err: &anyhow::Error) -> RetryClass {
     // --- Typed marker: rivet-raised statement-duration timeout (deterministic) ---
     // Downcast the TYPE so permanence does not depend on the Display wording.
     if err
-        .downcast_ref::<crate::source::StatementDurationTimeout>()
+        .downcast_ref::<super::StatementDurationTimeout>()
         .is_some()
     {
         return PERMANENT;
@@ -125,15 +121,12 @@ pub fn classify_error(err: &anyhow::Error) -> RetryClass {
     // Same reasoning, opposite end of the pipeline: the wait already expired, so
     // repeating it only spends the budget again. Keyed on the TYPE for the same
     // reason — a reworded message must not be able to make it retryable.
-    if err.downcast_ref::<crate::load::JobWaitTimeout>().is_some() {
+    if err.downcast_ref::<super::JobWaitTimeout>().is_some() {
         return PERMANENT;
     }
 
     // --- Typed marker: the connect failed in the TLS handshake (config, not network) ---
-    if err
-        .downcast_ref::<crate::source::TlsHandshakeFailed>()
-        .is_some()
-    {
+    if err.downcast_ref::<super::TlsHandshakeFailed>().is_some() {
         return PERMANENT;
     }
 
