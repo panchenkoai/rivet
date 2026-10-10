@@ -76,7 +76,7 @@ pub(super) fn pg_sql(sql: &str) -> String {
 ///
 /// The state backend connects to its store using only a URL (`RIVET_STATE_URL`)
 /// — there is no YAML `tls:` block — so the transport-security policy is derived
-/// from the URL's `sslmode` query parameter ([`crate::source::url_tls`]), exactly as `rivet init` does for
+/// from the URL's `sslmode` query parameter ([`crate::config::url::url_tls`]), exactly as `rivet init` does for
 /// source connections. The connection itself goes through the shared
 /// [`crate::source::postgres::connect_client`] path so the state backend and
 /// source connections apply identical TLS rules.
@@ -89,7 +89,7 @@ pub(super) fn pg_sql(sql: &str) -> String {
 /// reconnection paths in `checkpoint.rs`, so every PG state connection is
 /// TLS-aware.
 pub(super) fn connect_pg(url: &str) -> Result<postgres::Client> {
-    let tls = crate::source::url_tls(url).1;
+    let tls = crate::config::url::url_tls(url).1;
     let connect = || crate::source::postgres::connect_client(url, tls.as_ref());
     // The client panics where it cannot build its runtime (no file descriptor left).
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(connect))
@@ -430,7 +430,7 @@ impl StateStore {
 
 /// A state URL that reaches a non-loopback host without an `sslmode` asking for TLS.
 fn is_plaintext_remote(url: &str) -> bool {
-    !crate::source::host_is_loopback(url) && crate::source::url_tls(url).1.is_none()
+    !crate::config::url::host_is_loopback(url) && crate::config::url::url_tls(url).1.is_none()
 }
 
 // ─── Migration tests ──────────────────────────────────────────────────────────

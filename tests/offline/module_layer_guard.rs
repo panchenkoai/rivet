@@ -62,9 +62,7 @@ const EXCEPTIONS: &[&str] = &[
     "source -> pipeline::manifest_writer::write_manifest_without_success_marker",
     "source -> preflight::cdc_health::pg_foreign_slots_warning",
     "source -> preflight::cdc_health::pg_retained_wal_warning",
-    "state -> source::host_is_loopback",
     "state -> source::postgres::connect_client",
-    "state -> source::url_tls",
     "tuning -> source::Source",
     "tuning -> source::Source::sample_governor_pressure",
 ]; // ratchet-pin: end
