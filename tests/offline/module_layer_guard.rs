@@ -41,7 +41,6 @@ const LAYERS: &[(&str, &str)] = &[
 /// Upward references measured 2026-10-10 on main 3994d3ca, as `from -> to::item`. Shrink-only.
 const EXCEPTIONS: &[&str] = &[
     // ratchet-pin: module-layer-exceptions strings
-    "error -> pipeline::retry::classify_error",
     "notify -> pipeline::RunSummary",
     "plan -> load::plan::PartitionSpec",
     "plan -> load::plan::resolved_layout",
@@ -54,7 +53,6 @@ const EXCEPTIONS: &[&str] = &[
     "preflight -> load::plan::RecordedKeys",
     "preflight -> load::plan::RecordedKeys::new",
     "preflight -> pipeline::chunked::strip_select_star_from",
-    "preflight -> pipeline::retry::classify_error",
     "redact -> pipeline::ipc::route_log_line",
     "source -> pipeline::batch_partition_buckets",
     "source -> pipeline::commit::PartRecord",

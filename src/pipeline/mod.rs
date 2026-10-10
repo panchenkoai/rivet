@@ -38,9 +38,12 @@ mod reconcile_cmd;
 mod repair_cmd;
 pub(crate) mod report;
 mod resume_decisions;
-// `pub(crate)` so `error::classify_exit` can reach `retry::classify_error`
-// (transient → exit-code 2) without routing through the test-only re-export.
-pub(crate) mod retry;
+/// The runners' names for the retry classifier in `error` and the backoff in `tuning`.
+pub(crate) mod retry {
+    pub(crate) use crate::error::retry::is_transient;
+    pub use crate::error::retry::{Attempt, RetryClass, classify_error, should_retry};
+    pub(crate) use crate::tuning::retry_backoff_ms;
+}
 // The `rivet run` orchestrator (~290 LOC) lives next door so this facade
 // stays a thin re-export layer.  Module name shadows `pub fn run` below;
 // the duplicate is resolved by Rust's namespace rules (modules live in

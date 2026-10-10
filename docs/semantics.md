@@ -58,7 +58,7 @@ The exact state-write ordering is defined by **[ADR-0001 — State Update Invari
 
 ## Retry semantics
 
-Retries are classified by error type in [src/pipeline/retry.rs](https://github.com/panchenkoai/rivet/blob/main/src/pipeline/retry.rs):
+Retries are classified by error type in [src/error/retry.rs](https://github.com/panchenkoai/rivet/blob/main/src/error/retry.rs):
 
 The classifier (`RetryClass`) has two outcomes — `Transient` (retry) and `Permanent` (propagate):
 

@@ -20,7 +20,7 @@ use crate::plan::IncrementalCursorPlan;
 use crate::tuning::SourceTuning;
 use crate::types::{ColumnOverrides, CursorState, TypeMapping};
 
-pub use crate::error::StatementDurationTimeout;
+pub use crate::error::{StatementDurationTimeout, TlsHandshakeFailed};
 
 /// Summary of a source table relevant to chunked-mode planning. Source-neutral
 /// shape so plan-build can ask either Postgres or MySQL for the same answer.
@@ -376,28 +376,6 @@ pub(crate) fn oracle_feature_missing() -> anyhow::Error {
 /// A key column list, or `None` when the table has no key.
 pub(crate) fn non_empty_keys(cols: Vec<String>) -> Option<Vec<String>> {
     (!cols.is_empty()).then_some(cols)
-}
-
-/// A connect that failed in the TLS handshake — a configuration fault no retry fixes (the classifier keys on the TYPE).
-#[derive(Debug)]
-pub struct TlsHandshakeFailed(String);
-
-impl std::fmt::Display for TlsHandshakeFailed {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl TlsHandshakeFailed {
-    /// Put the TLS verdict (and its fix) in front of a driver error; `at` names the endpoint when known.
-    pub(crate) fn wrap(err: anyhow::Error, at: Option<&str>) -> anyhow::Error {
-        let with = at.map(|a| format!(" with {a}")).unwrap_or_default();
-        err.context(Self(format!(
-            "TLS handshake{with} failed — the server does not speak TLS or its certificate \
-             is not trusted: set `tls.ca_file` for a private CA, or `tls.mode: disable` if the \
-             server has no TLS (trusted networks only); retrying will not help"
-        )))
-    }
 }
 
 /// True when a rendered driver error names a failed TLS handshake or an untrusted certificate.
