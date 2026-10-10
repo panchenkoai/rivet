@@ -1914,6 +1914,86 @@ mod tests {
         }
     }
 
+    /// The cursor range is the run's incremental evidence: it is recorded when the run knows the cursor column OR a high bound, not only when it knows both.
+    #[test]
+    fn a_cursor_range_is_recorded_when_the_run_knows_the_column_or_the_high_bound() {
+        for (column, high) in [
+            (Some("updated_at"), None),
+            (None, Some("2026-02-01")),
+            (None, None),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let plan = fin_plan(dir.path());
+            let state = crate::state::StateStore::open_in_memory().unwrap();
+            let mut summary = fin_summary(&plan, "success");
+            summary.cursor_column = column.map(str::to_string);
+            summary.cursor_high = high.map(str::to_string);
+
+            finalize_manifest(&plan, "e", &state, &summary, "export");
+
+            let m = read_manifest(dir.path());
+            let ex = m.source.extraction.as_ref().expect("extraction section");
+            let case = format!("column {column:?} high {high:?}");
+            assert_eq!(ex.cursor_column.as_deref(), column, "{case}");
+            assert_eq!(ex.cursor_high.as_deref(), high, "{case}");
+            let low = (column.is_some() || high.is_some()).then_some("2026-01-01");
+            assert_eq!(ex.cursor_low.as_deref(), low, "{case}");
+        }
+    }
+
+    /// The end-of-run manifest pass reads the destination: a declared part that is not there costs the run its `validated`.
+    #[test]
+    fn the_manifest_pass_withdraws_validated_when_a_declared_part_is_not_at_the_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = fin_plan(dir.path());
+        let state = crate::state::StateStore::open_in_memory().unwrap();
+        let mut summary = fin_summary(&plan, "success");
+        summary.validated = Some(true);
+
+        finalize_validate_manifest(&plan, &mut summary, "export");
+        assert_eq!(
+            summary.validated,
+            Some(true),
+            "a prefix with no manifest keeps the file-row verdict"
+        );
+
+        finalize_manifest(&plan, "e", &state, &summary, "export");
+        assert!(dir.path().join("manifest.json").is_file());
+        assert!(!dir.path().join("part-000001.parquet").exists());
+        finalize_validate_manifest(&plan, &mut summary, "export");
+        assert_eq!(
+            summary.validated,
+            Some(false),
+            "the manifest declares a part the destination does not hold"
+        );
+    }
+
+    /// A run into a prefix that already holds a completed run is warned before it writes; an empty prefix is silent.
+    #[test]
+    fn a_run_into_a_prefix_holding_a_completed_run_is_warned_and_an_empty_prefix_is_not() {
+        use crate::pipeline::run::run_tail_tests::{
+            captured_warnings_mentioning, install_warn_capture,
+        };
+        install_warn_capture();
+        let warned = |export: &str, marker: Option<&str>| {
+            let dir = tempfile::tempdir().unwrap();
+            if let Some(marker) = marker {
+                std::fs::write(dir.path().join(marker), b"").unwrap();
+            }
+            let mut plan = fin_plan(dir.path());
+            plan.export_name = export.into();
+            warn_if_prefix_has_completed_run(&plan);
+            captured_warnings_mentioning(&format!("export '{export}'"))
+        };
+        assert_eq!(warned("rerun_guard_empty", None), Vec::<String>::new());
+        let said = warned("rerun_guard_done", Some(crate::manifest::SUCCESS_FILENAME));
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(
+            said[0].contains("already has parts from a prior run (_SUCCESS present)"),
+            "{said:?}"
+        );
+    }
+
     #[test]
     fn success_gate_refuses_resume_over_a_completed_prefix() {
         let dir = tempfile::tempdir().unwrap();
