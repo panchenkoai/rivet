@@ -641,6 +641,49 @@ mod tests {
         assert_eq!(pg_sql("?10 AND ?11"), "$10 AND $11");
     }
 
+    /// Only `?` followed by a digit is a placeholder; a bare `?` stays, at the end of the text too.
+    #[test]
+    fn a_question_mark_without_a_digit_is_not_a_placeholder() {
+        assert_eq!(pg_sql("WHERE a ? b"), "WHERE a ? b");
+        assert_eq!(pg_sql("WHERE a = ?1 OR b ?"), "WHERE a = $1 OR b ?");
+        assert_eq!(pg_sql("?"), "?");
+        assert_eq!(pg_sql(""), "");
+    }
+
+    /// The SQLite state file sits in the config's own directory, whatever the config is called.
+    #[test]
+    fn the_sqlite_state_file_lives_beside_the_config() {
+        use std::path::Path;
+        assert_eq!(
+            StateStore::state_db_path("/etc/rivet/prod.yaml"),
+            Path::new("/etc/rivet/.rivet_state.db")
+        );
+        assert_eq!(
+            StateStore::state_db_path("configs/nightly.yaml"),
+            Path::new("configs/.rivet_state.db")
+        );
+        assert_eq!(
+            StateStore::state_db_path("rivet.yaml"),
+            Path::new(".rivet_state.db")
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("r.yaml");
+        let named = StateStore::state_db_path(cfg.to_str().unwrap());
+        assert!(!named.exists());
+        let store = StateStore::open_sqlite(cfg.to_str().unwrap()).unwrap();
+        assert!(
+            named.is_file(),
+            "the path the CLI names must be the file the store created: {}",
+            named.display()
+        );
+        assert!(
+            matches!(store.state_ref(), StateRef::Sqlite(opened) if *opened == named),
+            "the store must be the SQLite file at {}",
+            named.display()
+        );
+    }
+
     #[test]
     fn pg_detail_appends_the_cause_the_error_itself_does_not_print() {
         #[derive(Debug)]

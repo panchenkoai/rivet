@@ -458,3 +458,78 @@ fn version_names_the_commit_beside_the_semver() {
     );
     assert_ne!(sha, "", "{out}");
 }
+
+/// `rivet apply <config>` over `exports`, each failing on a closed port: `(the summaries its "report:" lines name, the summaries on disk)`.
+fn run_reports_named_and_written(
+    exports: &[&str],
+) -> (Vec<std::path::PathBuf>, Vec<std::path::PathBuf>) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut yaml = String::from(
+        "source:\n  type: postgres\n  url: \"postgresql://u@127.0.0.1:1/db\"\nexports:\n",
+    );
+    for name in exports {
+        yaml.push_str(&format!(
+            "  - name: {name}\n    query: \"SELECT 1 AS id\"\n    mode: full\n    format: parquet\n    \
+             destination:\n      type: local\n      path: \"{}\"\n",
+            dir.path().join(name).display()
+        ));
+    }
+    std::fs::write(dir.path().join("rivet.yaml"), yaml).unwrap();
+    let stderr_path = dir.path().join("stderr.txt");
+    let mut cmd = Command::new(RIVET_BIN);
+    for (var, _) in std::env::vars_os() {
+        if var.to_string_lossy().starts_with("RIVET_") {
+            cmd.env_remove(var);
+        }
+    }
+    let mut child = cmd
+        .args(["apply", "rivet.yaml"])
+        .current_dir(dir.path())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::fs::File::create(&stderr_path).unwrap())
+        .spawn()
+        .expect("failed to spawn rivet binary");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("`rivet apply` against a closed port did not finish in 60 s");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let stderr = std::fs::read_to_string(&stderr_path).unwrap();
+    assert_eq!(status.code(), Some(2), "{stderr}");
+    let named = stderr
+        .lines()
+        .filter_map(|l| l.strip_prefix("report:"))
+        .map(|p| dir.path().join(p.trim()))
+        .collect();
+    let mut written: Vec<std::path::PathBuf> = std::fs::read_dir(dir.path().join(".rivet/runs"))
+        .unwrap_or_else(|e| panic!("no run report directory: {e}\n{stderr}"))
+        .map(|run| run.unwrap().path().join("summary.md"))
+        .filter(|summary| summary.is_file())
+        .collect();
+    written.sort();
+    (named, written)
+}
+
+/// A lone export's run ends by pointing at its report, the one place to look; a
+/// multi-export run writes every report and leaves the pointing to its aggregate.
+#[test]
+fn a_lone_export_is_pointed_at_its_run_report_and_a_multi_export_run_is_not() {
+    let (named, written) = run_reports_named_and_written(&["orders"]);
+    assert_eq!(written.len(), 1, "{written:?}");
+    assert_eq!(named, written, "the pointer names the report that exists");
+
+    let (named, written) = run_reports_named_and_written(&["orders", "users"]);
+    assert_eq!(written.len(), 2, "every export still gets its report");
+    assert_eq!(
+        named,
+        Vec::<std::path::PathBuf>::new(),
+        "one line per export would double the output"
+    );
+}

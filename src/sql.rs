@@ -659,6 +659,79 @@ mod tests {
         }
     }
 
+    /// A table name starts with a letter or `_` in each of its parts; a leading digit is not a table.
+    #[test]
+    fn a_bare_table_ident_starts_with_a_letter_or_an_underscore_in_every_part() {
+        for (query, table) in [
+            ("SELECT * FROM _staging", Some("_staging")),
+            ("SELECT * FROM _raw._orders", Some("_raw._orders")),
+            ("SELECT * FROM t1", Some("t1")),
+            ("SELECT * FROM 1t", None),
+            ("SELECT * FROM public.1t", None),
+            ("SELECT * FROM 1s.orders", None),
+            ("SELECT * FROM 2024", None),
+            ("SELECT * FROM public.", None),
+            ("SELECT * FROM .orders", None),
+            ("SELECT * FROM", None),
+        ] {
+            assert_eq!(strip_select_star_from(query), table, "{query}");
+            assert_eq!(strip_simple_projection_from(query), table, "{query}");
+        }
+    }
+
+    /// `FROM` is the keyword only as a whole word: a column that merely contains it does not end the projection.
+    #[test]
+    fn the_from_keyword_is_a_whole_word_wherever_it_stands() {
+        for (text, at) in [
+            ("id from t", Some(3)),
+            ("id, valid_from from prices", Some(15)),
+            ("id, from_date from prices", Some(14)),
+            ("from t", Some(0)),
+            ("id from", Some(3)),
+            ("id fromage", None),
+            ("valid_from", None),
+            ("fro", None),
+            ("", None),
+        ] {
+            assert_eq!(find_from_keyword(text), at, "{text:?}");
+        }
+        for (query, table) in [
+            ("SELECT id, valid_from FROM prices", Some("prices")),
+            ("SELECT id, from_date FROM prices", Some("prices")),
+            (
+                "SELECT valid_from, from_date, id FROM prices",
+                Some("prices"),
+            ),
+            ("SELECT id FROM", None),
+            ("SELECT FROM prices", None),
+        ] {
+            assert_eq!(strip_simple_projection_from(query), table, "{query}");
+        }
+    }
+
+    /// Only a statement that starts with SELECT, and reaches FROM right after its `*`, is the table shortcut.
+    #[test]
+    fn only_a_statement_that_opens_with_select_is_the_table_shortcut() {
+        assert_eq!(strip_prefix_ascii_ci("SeLeCt 1", "select"), Some(" 1"));
+        assert_eq!(strip_prefix_ascii_ci("select", "select"), Some(""));
+        assert_eq!(strip_prefix_ascii_ci("selec", "select"), None);
+        assert_eq!(strip_prefix_ascii_ci("", "select"), None);
+        assert_eq!(strip_prefix_ascii_ci("delete 1", "select"), None);
+        for query in [
+            "DELETE * FROM orders",
+            "TABLE  * FROM orders",
+            "SELECT * JOIN orders",
+            "SELECT * frm",
+            "SEL",
+            "",
+        ] {
+            assert_eq!(strip_select_star_from(query), None, "{query:?}");
+        }
+        for query in ["DELETE id FROM orders", "UPDATE id FROM orders", "SEL"] {
+            assert_eq!(strip_simple_projection_from(query), None, "{query:?}");
+        }
+    }
+
     #[test]
     fn a_bound_over_an_aliased_projection_is_read_from_the_query_not_the_table() {
         let query = "SELECT legacy_id AS id, name FROM customers";
