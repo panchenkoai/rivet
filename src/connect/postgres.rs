@@ -169,9 +169,75 @@ pub(crate) fn connect_client(url: &str, tls: Option<&TlsConfig>) -> Result<Clien
 /// An in-process PostgreSQL server that records what one client sends.
 #[cfg(test)]
 pub(crate) mod wire_recorder {
+    use std::io::{Read, Write};
+
+    /// What the server answers to every prepared statement.
+    pub(crate) enum Answer {
+        /// This many text columns and these rows of them; `None` is NULL.
+        Rows(usize, Vec<Vec<Option<&'static str>>>),
+        /// An error with this SQLSTATE and the message `refused`.
+        Error(&'static str),
+    }
+
     /// A PostgreSQL server for one client: every simple query is answered (with an error when it says `fail`); a prepared statement is recorded and the connection closed. The statements are handed over when the client leaves.
     pub(crate) fn recording_server() -> (String, std::sync::mpsc::Receiver<Vec<String>>) {
-        use std::io::{Read, Write};
+        serve(None)
+    }
+
+    /// [`recording_server`], but every prepared statement is recorded and answered with `answer`.
+    pub(crate) fn answering_server(
+        answer: Answer,
+    ) -> (String, std::sync::mpsc::Receiver<Vec<String>>) {
+        serve(Some(answer))
+    }
+
+    /// One backend message: its tag, its length and `body`.
+    fn message(tag: u8, body: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        out.extend(((body.len() + 4) as u32).to_be_bytes());
+        out.extend(body);
+        out
+    }
+
+    /// An ErrorResponse with `sqlstate` and the message `refused`.
+    fn error(sqlstate: &str) -> Vec<u8> {
+        message(
+            b'E',
+            format!("SERROR\0C{sqlstate}\0Mrefused\0\0").as_bytes(),
+        )
+    }
+
+    /// The RowDescription of `columns` text columns.
+    fn text_columns(columns: usize) -> Vec<u8> {
+        let mut body = (columns as u16).to_be_bytes().to_vec();
+        for i in 0..columns {
+            body.extend(format!("c{i}\0").as_bytes());
+            body.extend([0u8; 6]);
+            body.extend(25u32.to_be_bytes());
+            body.extend((-1i16).to_be_bytes());
+            body.extend((-1i32).to_be_bytes());
+            body.extend(0u16.to_be_bytes());
+        }
+        message(b'T', &body)
+    }
+
+    /// One DataRow of text cells.
+    fn data_row(cells: &[Option<&str>]) -> Vec<u8> {
+        let mut body = (cells.len() as u16).to_be_bytes().to_vec();
+        for cell in cells {
+            match cell {
+                Some(text) => {
+                    body.extend((text.len() as i32).to_be_bytes());
+                    body.extend(text.as_bytes());
+                }
+                None => body.extend((-1i32).to_be_bytes()),
+            }
+        }
+        message(b'D', &body)
+    }
+
+    /// Accept one client and answer it until it leaves, a read times out, or a prepared statement arrives with no `answer` to give.
+    fn serve(answer: Option<Answer>) -> (String, std::sync::mpsc::Receiver<Vec<String>>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!(
             "postgresql://u@127.0.0.1:{}/db",
@@ -195,25 +261,59 @@ pub(crate) mod wire_recorder {
             conn.write_all(ready).unwrap();
             let mut seen = Vec::new();
             let mut tag = [0u8; 1];
-            while conn.read_exact(&mut tag).is_ok() && matches!(tag[0], b'Q' | b'P') {
+            // After an error the rest of the extended exchange is skipped up to its Sync.
+            let mut skipping = false;
+            while conn.read_exact(&mut tag).is_ok() {
                 let Some(body) = read_body(&mut conn) else {
                     break;
                 };
-                if tag[0] == b'P' {
-                    // Parse: the statement name, then the statement text.
-                    let text = body.split(|b| *b == 0).nth(1).unwrap_or_default();
-                    seen.push(String::from_utf8_lossy(text).to_string());
+                let reply: Vec<u8> = match (tag[0], &answer) {
+                    (b'Q', _) => {
+                        let sql = String::from_utf8_lossy(&body[..body.len() - 1]).to_string();
+                        let mut reply = if sql.contains("fail") {
+                            error("XX000")
+                        } else {
+                            message(b'C', b"SET\0")
+                        };
+                        seen.push(sql);
+                        reply.extend(ready);
+                        reply
+                    }
+                    (b'P', answer) => {
+                        // Parse: the statement name, then the statement text.
+                        let text = body.split(|b| *b == 0).nth(1).unwrap_or_default();
+                        seen.push(String::from_utf8_lossy(text).to_string());
+                        match answer {
+                            None => break,
+                            Some(Answer::Error(sqlstate)) => {
+                                skipping = true;
+                                error(sqlstate)
+                            }
+                            Some(Answer::Rows(..)) => message(b'1', b""),
+                        }
+                    }
+                    (b'S', Some(_)) => {
+                        skipping = false;
+                        ready.to_vec()
+                    }
+                    (_, Some(_)) if skipping => Vec::new(),
+                    (b'D', Some(Answer::Rows(columns, _))) => {
+                        let mut reply = message(b't', &[0, 0]);
+                        reply.extend(text_columns(*columns));
+                        reply
+                    }
+                    (b'B', Some(_)) => message(b'2', b""),
+                    (b'E', Some(Answer::Rows(_, rows))) => {
+                        let mut reply: Vec<u8> = rows.iter().flat_map(|r| data_row(r)).collect();
+                        reply.extend(message(b'C', format!("SELECT {}\0", rows.len()).as_bytes()));
+                        reply
+                    }
+                    (b'C', Some(_)) => message(b'3', b""),
+                    _ => break,
+                };
+                if conn.write_all(&reply).is_err() {
                     break;
                 }
-                let sql = String::from_utf8_lossy(&body[..body.len() - 1]).to_string();
-                let answer: &[u8] = if sql.contains("fail") {
-                    b"E\0\0\0\x1cSERROR\0CXX000\0Mrefused\0\0"
-                } else {
-                    b"C\0\0\0\x08SET\0"
-                };
-                seen.push(sql);
-                conn.write_all(answer).unwrap();
-                conn.write_all(ready).unwrap();
             }
             let _ = queries_out.send(seen);
         });

@@ -1030,7 +1030,7 @@ fn pg_cdc_non_iso_datestyle_and_escape_bytea_match_batch() {
     // `datestyle` ('German, DMY') nulled every timestamp (rivet's ISO parser
     // failed on DMY text) and a non-hex `bytea_output` ('escape') corrupted every
     // bytea — both silent, found by the source-parity sweep under a flipped
-    // session. The CDC reader now pins datestyle/bytea_output on connect, so CDC
+    // session. The CDC reader now sets datestyle/bytea_output for each read of the slot, so CDC
     // matches a batch export (binary protocol, format-immune) regardless.
     let d = tempfile::tempdir().unwrap();
     // Isolated DB (see CdcDb): ALTERing the DATABASE-level datestyle/bytea_output
@@ -1080,7 +1080,7 @@ fn pg_cdc_non_iso_datestyle_and_escape_bytea_match_batch() {
 #[ignore = "live: requires docker compose postgres (wal_level=logical)"]
 fn pg_cdc_lmt_timestamptz_under_a_named_zone_matches_batch() {
     // A named zone renders a pre-1893 Berlin instant with a SECONDS offset (+00:53:28)
-    // the text parser cannot read; the reader pins TimeZone = 'UTC' so it renders +00.
+    // the text parser cannot read; the reader reads the slot under TimeZone = 'UTC' so it renders +00.
     let d = tempfile::tempdir().unwrap();
     let cdc_db = CdcDb::new("cdc_lmt");
     let tbl = unique_name("cdc_lmt_pg");
