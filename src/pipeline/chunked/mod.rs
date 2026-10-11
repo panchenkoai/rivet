@@ -754,6 +754,15 @@ mod tests {
                 assert_eq!(chunk_index_of(&name), index, "{name}");
             }
         }
+
+        // Only `_p<digits>` at the very end is the rotation suffix: an export
+        // whose NAME holds `_p` still has its parts classified.
+        for export in ["user_profiles", "orders_p", "metrics_p95"] {
+            let name = chunk_part_filename(export, 7, "parquet");
+            assert_eq!(chunk_index_of(&name), Some("7"), "{name}");
+            let rotated = crate::pipeline::commit::part_indexed_name(&name, 1, 2);
+            assert_eq!(chunk_index_of(&rotated), Some("7"), "{rotated}");
+        }
     }
 
     use super::*;
