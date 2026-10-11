@@ -1,0 +1,27 @@
+diff --git a/src/connect/postgres.rs b/src/connect/postgres.rs
+index 8af640bd..2f59b839 100644
+--- a/src/connect/postgres.rs
++++ b/src/connect/postgres.rs
+@@ -122,7 +122,7 @@ pub(crate) fn read_pinned<T>(
+ pub(crate) fn connect_client(url: &str, tls: Option<&TlsConfig>) -> Result<Client> {
+     // Refuse remote plaintext (no `tls:` block) before any dial (CWE-319).
+     super::require_tls_or_loopback(url, tls)?;
+-    match tls {
++    let mut client = match tls {
+         Some(cfg) if cfg.mode.is_enforced() => {
+             let connector = build_native_tls(cfg)?;
+             let make_tls = postgres_native_tls::MakeTlsConnector::new(connector);
+@@ -134,7 +134,12 @@ pub(crate) fn connect_client(url: &str, tls: Option<&TlsConfig>) -> Result<Clien
+                 .map_err(|e| super::describe_connect_error(url, e.into()))
+         }
+         _ => Client::connect(url, NoTls).map_err(|e| super::describe_connect_error(url, e.into())),
+-    }
++    }?;
++    client.batch_execute(
++        "SET TimeZone = 'UTC'; SET DateStyle = 'ISO, MDY'; \
++         SET IntervalStyle = 'postgres'; SET bytea_output = 'hex'",
++    )?;
++    Ok(client)
+ }
+ 
+ #[cfg(test)]

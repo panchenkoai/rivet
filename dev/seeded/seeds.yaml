@@ -1290,3 +1290,22 @@ seeds:
       lib:
         cells:
           - "lib:the_from_keyword_is_found_at_the_same_offset_around_multi_byte_text"
+
+  - name: session-set-on-a-pooled-connection
+    class: "a PostgreSQL batch connection sends a session-level `SET`, which stays on the server connection a transaction-mode pooler hands to its other clients"
+    history: "v0.30.0 and v0.31.0 - behind an idle pgBouncer in transaction mode (pool sizes 1 and 5) the pid-flip detection saw a direct connection, so every run left TimeZone, DateStyle, IntervalStyle and bytea_output set on the pooled session; on a database whose default is `escape` another client then read `bytea::text` in hex"
+    scope: source
+    patch: session-set-on-a-pooled-connection/postgres.patch
+    engines:
+      postgres:
+        cells: [every_batch_shape_through_a_transaction_pooler_leaves_its_session_as_it_was_postgres]
+      mysql:
+        na: "the patched code is the PostgreSQL dial; the MySQL export puts its session variables back under MysqlSessionGuard (src/source/mysql/mod.rs), held through ProxySQL by mysql_proxysql_session_vars_clean_after_successful_export"
+      mssql:
+        na: "the patched code is the PostgreSQL dial; SQL Server puts LOCK_TIMEOUT and the isolation level back when the source drops (impl Drop for MssqlSource), and the stand has no SQL Server pooler to read a shared session through"
+      mongo:
+        na: "MongoDB has no session-level setting and no external pooler: the driver pools its own connections"
+      oracle:
+        na: "the patched code is the PostgreSQL dial; the stand has no Oracle connection pooler (DRCP, CMAN) to read a shared session through"
+      lib:
+        cells: ["lib:the_dial_sends_no_statement"]
