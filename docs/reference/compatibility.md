@@ -246,9 +246,9 @@ every supported PostgreSQL version (12+).
 
 Every PostgreSQL read whose text depends on them runs under `TimeZone = 'UTC'`,
 `DateStyle = 'ISO, MDY'`, `IntervalStyle = 'postgres'` and `bytea_output = 'hex'`, whatever the
-server, database or role defaults are: the export, the bound and count probes of a run, and the
-range and plan probes of `check` and `plan`. Stored values are unaffected: a `timestamptz` is an
-instant, and a `timestamp` has no zone. What changes is calendar arithmetic inside your own
+server, database or role defaults are. That is the export, the bound and count probes of a run,
+and the range and plan probes of `check` and `plan`. Stored values are unaffected: a
+`timestamptz` is an instant, and a `timestamp` has no zone. What changes is calendar arithmetic inside your own
 `query:`. For example, `current_date` and `ts::date` on a `timestamptz` column count days in UTC.
 For the server's local day, say so explicitly: `(ts AT TIME ZONE 'Europe/Kyiv')::date`.
 

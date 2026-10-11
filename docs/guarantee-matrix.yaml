@@ -495,7 +495,7 @@ guarantees:
   - id: postgres_sessions_print_utc_iso_and_hex
     stated:
       - file: docs/reference/compatibility.md
-        sentence: "Every PostgreSQL connection rivet opens sets `TimeZone = 'UTC'`, `DateStyle = 'ISO, MDY'`, `IntervalStyle = 'postgres'` and `bytea_output = 'hex'`, whatever the server, database or role defaults are."
+        sentence: "Every PostgreSQL read whose text depends on them runs under `TimeZone = 'UTC'`, `DateStyle = 'ISO, MDY'`, `IntervalStyle = 'postgres'` and `bytea_output = 'hex'`, whatever the server, database or role defaults are."
     held_by:
       postgres_export: { test: the_text_a_query_casts_is_utc_iso_and_hex_whatever_the_role_defaults_postgres, asserts: "the text the query casts follows the role's defaults, not UTC, ISO, postgres and hex" }
       postgres_cdc_reader_formats: { test: pg_cdc_non_iso_datestyle_and_escape_bytea_match_batch, asserts: "assert_cdc_matches_batch(&out, &batch_out)" }
