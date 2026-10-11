@@ -1309,3 +1309,22 @@ seeds:
         na: "the patched code is the PostgreSQL dial; the stand has no Oracle connection pooler (DRCP, CMAN) to read a shared session through"
       lib:
         cells: ["lib:the_dial_sends_no_statement"]
+
+  - name: session-set-on-a-pooled-cdc-connection
+    class: "the PostgreSQL CDC reader sends a session-level `SET` when it opens, which stays on the server connection a transaction-mode pooler hands to its other clients"
+    history: "v0.19.1 through v0.31.0 - the test_decoding reader set DateStyle, bytea_output, IntervalStyle, extra_float_digits and TimeZone with session SETs at every open (no pooler detection); through pgBouncer in transaction mode a refused run and a run that read changes alike left all five with pg_settings.source = session on the pooled backend"
+    scope: source
+    patch: session-set-on-a-pooled-cdc-connection/postgres.patch
+    engines:
+      postgres:
+        cells: [a_cdc_run_refused_through_a_transaction_pooler_leaves_its_session_as_it_was_postgres]
+      mysql:
+        na: "the patched code is the PostgreSQL test_decoding reader (src/source/postgres/cdc.rs); MySQL CDC is a binlog dump, which no query proxy carries (docs/reference/cdc.md)"
+      mssql:
+        na: "the patched code is the PostgreSQL test_decoding reader (src/source/postgres/cdc.rs), which no other engine runs; the stand has no SQL Server pooler to read a shared session through"
+      mongo:
+        na: "MongoDB has no session-level setting and no external pooler: the driver pools its own connections"
+      oracle:
+        na: "the patched code is the PostgreSQL test_decoding reader (src/source/postgres/cdc.rs), which no other engine runs; the stand has no Oracle connection pooler (DRCP, CMAN) to read a shared session through"
+      lib:
+        cells: ["lib:the_open_sends_no_statement_before_its_first_read"]

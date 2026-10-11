@@ -205,9 +205,10 @@
   class: "PG batch reads no longer pin TimeZone/DateStyle/IntervalStyle/bytea_output -> text renderings follow the session"
   file: src/connect/postgres.rs
   old: |2-
-            txn.client.batch_execute(&format!("BEGIN; {TXN_FORMATS}"))?;
+            txn.client
+                .batch_execute(&format!("BEGIN; {TXN_FORMATS}{more}"))?;
   new: |2-
-            txn.client.batch_execute("BEGIN")?;
+            txn.client.batch_execute(&format!("BEGIN{more}"))?;
   detectors:
     - test: a_pinned_read_sets_the_four_formats_for_its_own_transaction_and_commits
       suite: lib
