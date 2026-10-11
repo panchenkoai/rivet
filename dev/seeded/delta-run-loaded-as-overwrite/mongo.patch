@@ -1,8 +1,8 @@
-diff --git a/src/load/plan.rs b/src/load/plan.rs
-index c73a27bd..3a493227 100644
---- a/src/load/plan.rs
-+++ b/src/load/plan.rs
-@@ -448,7 +448,7 @@ pub fn load_mode_of(
+diff --git a/src/plan/load_settings.rs b/src/plan/load_settings.rs
+index 2026379a..021573c5 100644
+--- a/src/plan/load_settings.rs
++++ b/src/plan/load_settings.rs
+@@ -75,7 +75,7 @@ pub fn load_mode_of(
          ExportMode::Cdc => LoadMode::Cdc,
          ExportMode::Incremental => LoadMode::Incremental,
          // only the keys past the last run's: a delta, never the whole table

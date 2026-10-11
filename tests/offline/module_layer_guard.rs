@@ -46,16 +46,11 @@ const LAYERS: &[(&str, &str)] = &[
 const EXCEPTIONS: &[&str] = &[
     // ratchet-pin: module-layer-exceptions strings
     "notify -> pipeline::RunSummary",
-    "plan -> load::plan::PartitionSpec",
-    "plan -> load::plan::resolved_layout",
-    "plan -> load::plan::resolved_partition",
     "plan -> preflight::ExportDiagnostic",
     "plan -> source::Source",
     "plan -> source::TableIntrospection",
     "plan -> source::connect",
     "plan -> source::query::wrap_key_range",
-    "preflight -> load::plan::RecordedKeys",
-    "preflight -> load::plan::RecordedKeys::new",
     "preflight -> pipeline::chunked::strip_select_star_from",
     "source -> preflight::cdc_health::pg_foreign_slots_warning",
     "source -> preflight::cdc_health::pg_retained_wal_warning",
