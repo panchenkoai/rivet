@@ -2,8 +2,7 @@
 //!
 //! Module layout:
 //!
-//! - `mod.rs` (this file) — `PostgresSource` struct + connect/TLS path, the
-//!   transaction-pooler detector, `PgTxnGuard`, sampling helpers
+//! - `mod.rs` (this file) — `PostgresSource` struct + connect/TLS path, sampling helpers
 //!   (`pg_sample_checkpoints_req`, `pg_fetch_work_mem_bytes`),
 //!   `introspect_pg_on` (chunk-planner catalog probe), the cursor + FETCH export loop
 //!   (`pg_run_export`), the `Source` trait impl, and the catalog-hint
@@ -34,8 +33,8 @@ use postgres::Client;
 use postgres::types::Type;
 
 use crate::config::{SourceType, TlsConfig};
-use crate::connect::postgres::pin_session_formats;
-pub(crate) use crate::connect::postgres::{connect_client, connect_client_raw};
+pub(crate) use crate::connect::postgres::connect_client;
+use crate::connect::postgres::{PgTxnGuard, detect_pg_transaction_pooler, read_pinned};
 use crate::error::Result;
 use crate::source::batch_controller::AdaptiveBatchController;
 use crate::source::query::build_export_query;
@@ -61,8 +60,8 @@ impl PostgresSource {
 
     /// Connect honoring the user's [`TlsConfig`] through the shared dial, warning on a transaction pooler.
     pub fn connect_with_tls(url: &str, tls: Option<&TlsConfig>) -> Result<Self> {
-        let mut client = connect_client_raw(url, tls)?;
-        let transaction_pooler = pin_session_formats(&mut client)?;
+        let mut client = connect_client(url, tls)?;
+        let transaction_pooler = detect_pg_transaction_pooler(&mut client);
         if transaction_pooler {
             log::warn!(
                 "transaction-mode connection pooler detected (pgBouncer/Odyssey) — \
@@ -106,50 +105,6 @@ fn fetch_statement<'a>(
         }
     };
     Ok(&prepared[at].1)
-}
-
-/// RAII guard for an open `BEGIN ... COMMIT` block.
-///
-/// `commit()` runs `COMMIT` and marks the txn done; if the guard is dropped
-/// before `commit()` (early return, `?`-bubbled error, or panic-driven unwind),
-/// `Drop` issues a best-effort `ROLLBACK`. Postgres releases any open cursors
-/// as part of ROLLBACK, so the cursor declared inside the txn is also cleaned
-/// up. Closes the **G1** gap from the DBA audit (cursor leak on panic).
-struct PgTxnGuard<'a> {
-    client: &'a mut Client,
-    committed: bool,
-}
-
-impl<'a> PgTxnGuard<'a> {
-    fn begin(client: &'a mut Client) -> Result<Self> {
-        client.batch_execute("BEGIN")?;
-        Ok(Self {
-            client,
-            committed: false,
-        })
-    }
-
-    fn client_mut(&mut self) -> &mut Client {
-        self.client
-    }
-
-    fn commit(mut self) -> Result<()> {
-        self.client.batch_execute("COMMIT")?;
-        self.committed = true;
-        Ok(())
-    }
-}
-
-impl Drop for PgTxnGuard<'_> {
-    fn drop(&mut self) {
-        if !self.committed
-            && let Err(e) = self.client.batch_execute("ROLLBACK")
-        {
-            // Drop must not panic. Worst case the connection is poisoned and
-            // the pool recycles it; log so operators see it.
-            log::warn!("PgTxnGuard: ROLLBACK during drop failed: {e:#}");
-        }
-    }
 }
 
 /// Probe `SHOW work_mem` and return the value in bytes.
@@ -426,8 +381,8 @@ fn introspect_pg_on(
 /// Run the full export transaction against an open Postgres client.
 ///
 /// All session-mutating SET commands use SET LOCAL so they are scoped to
-/// the transaction and reset automatically on COMMIT or ROLLBACK. The caller
-/// is responsible for issuing ROLLBACK if this function returns Err.
+/// the transaction and reset automatically on COMMIT or ROLLBACK; the guard
+/// rolls back when this function returns Err.
 ///
 /// Returns (total_rows, had_schema). had_schema is false only when the query
 /// returned zero rows; the caller must emit an empty schema in that case.
@@ -439,24 +394,9 @@ fn pg_run_export(
     sink: &mut dyn super::BatchSink,
     numeric_hints: Option<&HashMap<String, (u8, i8)>>,
 ) -> Result<(usize, bool)> {
-    // Open the txn under guard *first* — if SET LOCAL or DECLARE fails below,
-    // Drop will roll back. Without the guard, a failure between BEGIN and the
-    // explicit ROLLBACK in the caller would leak a half-set-up txn into the pool.
+    // The read runs under UTC: a naive cursor bound re-injected into `WHERE col > '<literal>'` is
+    // coerced in the transaction's zone, and text the query casts prints in its formats.
     let mut guard = PgTxnGuard::begin(client)?;
-    // Pin the read txn's TimeZone to UTC. The row READ is UTC-absolute (the binary
-    // protocol yields instants regardless of session zone), but the incremental /
-    // keyset cursor boundary is re-injected as an OFFSET-LESS naive-UTC literal
-    // into `WHERE col > '<literal>'`; PostgreSQL coerces a naive literal to
-    // `timestamptz` using the SESSION TimeZone, so on any non-UTC session (a common
-    // production default via postgresql.conf or `ALTER ROLE/DATABASE ... SET
-    // timezone`) the boundary shifts by the zone offset and every incremental run
-    // silently SKIPS (west of UTC) or DUPLICATES (east) the offset-wide gap window —
-    // a count-passing data loss invisible under a UTC test session. The MySQL path
-    // pins the equivalent (`SET time_zone='+00:00'`). SET LOCAL is txn-scoped, so it
-    // auto-resets on commit/rollback and never leaks into the pooled connection.
-    guard
-        .client_mut()
-        .batch_execute("SET LOCAL TimeZone = 'UTC'")?;
     if tuning.statement_timeout_s > 0 {
         guard.client_mut().batch_execute(&format!(
             "SET LOCAL statement_timeout = '{}s'",
@@ -648,8 +588,8 @@ impl super::Source for PostgresSource {
         let hint_query = request.catalog_hint_query.unwrap_or(request.query);
         let numeric_hints = pg_numeric_catalog_hints_opt(&mut self.client, hint_query);
 
-        // PgTxnGuard inside pg_run_export rolls the txn back automatically on
-        // any error or panic, so no explicit ROLLBACK is needed here.
+        // The transaction guard inside pg_run_export rolls back on any error
+        // or panic, so no explicit ROLLBACK is needed here.
         let (total_rows, had_schema) = pg_run_export(
             &mut self.client,
             &built.sql,
@@ -680,8 +620,10 @@ impl super::Source for PostgresSource {
     }
 
     fn query_scalar(&mut self, sql: &str) -> Result<Option<String>> {
-        let probe = prepare_fresh(&mut self.client, sql)?;
-        let rows = self.client.query(&probe, &[])?;
+        let rows = read_pinned(&mut self.client, |client| {
+            let probe = prepare_fresh(client, sql)?;
+            client.query(&probe, &[])
+        })?;
         if rows.is_empty() {
             return Ok(None);
         }

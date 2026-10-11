@@ -486,14 +486,21 @@ guarantees:
     stated:
       - file: docs/concepts.md
         sentence: "All Postgres tuning uses `SET LOCAL` inside an RAII-guarded `BEGIN…COMMIT` so session state is never leaked into the pool."
+      - file: docs/reference/compatibility.md
+        sentence: "Behind a transaction-mode pooler (pgBouncer, Odyssey) the server connection goes back to the pool with every setting as rivet found it."
+      - file: docs/reference/compatibility.md
+        sentence: "Its `test_decoding` reader parses the server's text of every value, so each read of the slot runs in a transaction of its own that sets the four formats and `extra_float_digits = 3` with `SET LOCAL`."
     held_by:
       postgres: { test: pg_statement_timeout_not_leaked_after_successful_export, asserts: "statement_timeout leaked to pool after successful export" }
       postgres_every_batch_shape: { test: every_batch_shape_through_a_transaction_pooler_leaves_its_session_as_it_was_postgres, asserts: "the run changed the session of the pooled connection" }
+      postgres_cdc_refused: { test: a_cdc_run_refused_through_a_transaction_pooler_leaves_its_session_as_it_was_postgres, asserts: "the refused CDC run changed the session of the pooled connection" }
+      postgres_cdc_open: { test: the_open_sends_no_statement_before_its_first_read, asserts: 'assert_eq!(sent(queries), ["SHOW wal_level"]);' }
+      postgres_cdc_read: { test: a_peek_sets_the_five_formats_for_its_own_transaction, asserts: "BEGIN_PINNED_TEXT," }
 
   - id: postgres_sessions_print_utc_iso_and_hex
     stated:
       - file: docs/reference/compatibility.md
-        sentence: "Every PostgreSQL connection rivet opens sets `TimeZone = 'UTC'`, `DateStyle = 'ISO, MDY'`, `IntervalStyle = 'postgres'` and `bytea_output = 'hex'`, whatever the server, database or role defaults are."
+        sentence: "Every PostgreSQL read whose text depends on them runs under `TimeZone = 'UTC'`, `DateStyle = 'ISO, MDY'`, `IntervalStyle = 'postgres'` and `bytea_output = 'hex'`, whatever the server, database or role defaults are."
     held_by:
       postgres_export: { test: the_text_a_query_casts_is_utc_iso_and_hex_whatever_the_role_defaults_postgres, asserts: "the text the query casts follows the role's defaults, not UTC, ISO, postgres and hex" }
       postgres_cdc_reader_formats: { test: pg_cdc_non_iso_datestyle_and_escape_bytea_match_batch, asserts: "assert_cdc_matches_batch(&out, &batch_out)" }

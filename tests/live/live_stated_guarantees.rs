@@ -779,22 +779,9 @@ fn mode_full_documents_the_longest_statement_it_holds_mongo() {
     );
 }
 
-/// The backend behind the transaction pooler and every setting of its session.
-fn pooled_session() -> (i32, Vec<(String, String)>) {
-    let mut c = postgres::Client::connect(PGBOUNCER_URL, postgres::NoTls).expect("pgbouncer");
-    let pid = c.query_one("SELECT pg_backend_pid()", &[]).unwrap().get(0);
-    let settings = c
-        .query("SELECT name, setting FROM pg_settings ORDER BY name", &[])
-        .unwrap()
-        .iter()
-        .map(|r| (r.get(0), r.get(1)))
-        .collect();
-    (pid, settings)
-}
-
-/// docs/concepts.md: Postgres session state is never leaked into the pool. Each batch shape runs
-/// through a transaction-mode pooler with one server connection, delivers the table, and leaves
-/// every setting of that connection as it found it.
+/// docs/concepts.md: Postgres session state is never leaked into the pool. Each batch shape, `check` and
+/// `doctor` run twice through a transaction-mode pooler with one server connection, and leave every
+/// setting of that connection, and where it was set, as they found it.
 #[test]
 #[ignore = "live: requires docker compose --profile pool up -d pgbouncer (transaction mode, pool_size=1)"]
 fn every_batch_shape_through_a_transaction_pooler_leaves_its_session_as_it_was_postgres() {
@@ -803,7 +790,7 @@ fn every_batch_shape_through_a_transaction_pooler_leaves_its_session_as_it_was_p
     engine.alive();
     let (table, _guard) = engine.range_table("guar_pool");
     engine.insert(&table, 1..=ROWS, 180, Some(10));
-    let before = pooled_session();
+    let before = pooled_session_without_set_formats();
     let shapes: [(&str, &[&str]); 4] = [
         ("full", &[]),
         ("chunked", &["chunk_by_key: id", "chunk_size: 5"]),
@@ -811,21 +798,36 @@ fn every_batch_shape_through_a_transaction_pooler_leaves_its_session_as_it_was_p
         ("incremental", &["cursor_column: id"]),
     ];
     for (mode, lines) in shapes {
-        let rig = engine
-            .staged(engine.rig(&table), mode, lines)
-            .source_url(PGBOUNCER_URL)
-            .export_line("tuning: {statement_timeout_s: 300, lock_timeout_s: 30}");
-        rig.run_ok();
-        assert_eq!(
-            read_ids(&rig.out_dir()),
-            (1..=ROWS).collect::<Vec<_>>(),
-            "{mode} {lines:?}: every row arrives through the pooler"
-        );
-        assert_eq!(
-            pooled_session(),
-            before,
-            "{mode} {lines:?}: the run changed the session of the pooled connection"
-        );
+        for cycle in 1..=2 {
+            let rig = engine
+                .staged(engine.rig(&table), mode, lines)
+                .source_url(PGBOUNCER_URL)
+                .export_line("tuning: {statement_timeout_s: 300, lock_timeout_s: 30}");
+            rig.run_ok();
+            assert_eq!(
+                read_ids(&rig.out_dir()),
+                (1..=ROWS).collect::<Vec<_>>(),
+                "{mode} {lines:?}: every row arrives through the pooler"
+            );
+            assert_eq!(
+                pooled_session(),
+                before,
+                "{mode} {lines:?}, run {cycle}: the run changed the session of the pooled connection"
+            );
+            for command in ["check", "doctor"] {
+                let out = rig.cli(&[command]);
+                assert!(
+                    out.status.success(),
+                    "{command}: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                assert_eq!(
+                    pooled_session(),
+                    before,
+                    "{mode} {lines:?}, run {cycle}: `{command}` changed the session of the pooled connection"
+                );
+            }
+        }
     }
 }
 

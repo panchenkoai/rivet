@@ -3,6 +3,7 @@ use super::analysis::*;
 use super::cursor_expr::incremental_key_expr;
 use super::schema_error::PreflightSchemaError;
 use crate::config::{ExportConfig, ExportMode, SourceType, TlsConfig};
+use crate::connect::postgres::read_pinned;
 use crate::error::Result;
 
 /// Connect once and build one [`ExportDiagnostic`] per export. Rendering
@@ -86,7 +87,7 @@ fn diagnose_pg(
                     "SELECT min({expr})::text, max({expr})::text FROM ({base_query}) AS _rivet"
                 ),
             };
-            match client.query(&range_query, &[]) {
+            match read_pinned(client, |c| c.query(&range_query, &[])) {
                 Ok(rows) if !rows.is_empty() => {
                     let min_val: Option<String> = rows[0].get(0);
                     let max_val: Option<String> = rows[0].get(1);
@@ -146,7 +147,7 @@ fn estimate_rows_pg(
     query: &str,
 ) -> Result<(Option<i64>, Option<i64>)> {
     let explain = format!("EXPLAIN {}", query);
-    let rows = match client.query(&explain, &[]) {
+    let rows = match read_pinned(client, |c| c.query(&explain, &[])) {
         Ok(r) => r,
         Err(e) => {
             // A SQLSTATE *class 42* failure (undefined table/column, no
@@ -234,7 +235,7 @@ fn get_cursor_range_pg(
             format!("SELECT min({expr})::text, max({expr})::text FROM ({base_query}) AS _rivet")
         }
     };
-    match client.query(&range_query, &[]) {
+    match read_pinned(client, |c| c.query(&range_query, &[])) {
         Ok(rows) if !rows.is_empty() => {
             let min_val: Option<String> = rows[0].get(0);
             let max_val: Option<String> = rows[0].get(1);
@@ -480,7 +481,7 @@ pub(crate) fn single_int_pk_pg(
 
 fn analyze_plan_pg(client: &mut postgres::Client, query: &str) -> (Option<String>, bool) {
     let explain = format!("EXPLAIN {}", query);
-    match client.query(&explain, &[]) {
+    match read_pinned(client, |c| c.query(&explain, &[])) {
         Ok(rows) => {
             let lines: Vec<String> = rows.iter().map(|r| r.get::<_, String>(0)).collect();
             let plan_text = lines.join("\n");
@@ -857,5 +858,97 @@ mod tests {
         );
         assert_eq!(t("SELECT * FROM []"), None);
         assert_eq!(t("SELECT * FROM [dbo].[a] JOIN [dbo].[b] ON 1 = 1"), None);
+    }
+
+    // ── the probes against a canned server answer ────────────────────────────
+
+    use crate::connect::postgres::wire_recorder::{Answer, BEGIN_PINNED, answering_server, sent};
+
+    const INDEX_PLAN: &str =
+        "Index Scan using orders_pkey on orders  (cost=0.29..8.30 rows=5000 width=120)";
+    const SEQ_PLAN: &str = "Seq Scan on orders  (cost=0.00..1250.00 rows=70 width=9)";
+
+    /// What `probe` returns from a server that answers every prepared statement with `answer`, and the statements that server saw.
+    fn probed<T>(
+        answer: Answer,
+        probe: impl FnOnce(&mut postgres::Client) -> T,
+    ) -> (T, Vec<String>) {
+        let (url, queries) = answering_server(answer);
+        let mut client = crate::connect::postgres::connect_client(&url, None).unwrap();
+        let out = probe(&mut client);
+        drop(client);
+        (out, sent(queries))
+    }
+
+    #[test]
+    fn the_row_estimate_and_the_width_are_read_from_the_plan_the_server_returns() {
+        let (got, saw) = probed(Answer::Rows(1, vec![vec![Some(INDEX_PLAN)]]), |c| {
+            estimate_rows_pg(c, "SELECT * FROM orders")
+        });
+        assert_eq!(got.unwrap(), (Some(5000), Some(120)));
+        assert_eq!(
+            saw,
+            [BEGIN_PINNED, "EXPLAIN SELECT * FROM orders", "COMMIT"]
+        );
+        let two_lines = vec![vec![Some("Sort  (cost=1.00..2.00)")], vec![Some(SEQ_PLAN)]];
+        let (got, _) = probed(Answer::Rows(1, two_lines), |c| {
+            estimate_rows_pg(c, "SELECT * FROM orders ORDER BY id")
+        });
+        assert_eq!(got.unwrap(), (Some(70), Some(9)));
+    }
+
+    #[test]
+    fn a_refused_estimate_fails_the_preflight_only_for_a_schema_error() {
+        let (got, saw) = probed(Answer::Error("42P01"), |c| {
+            estimate_rows_pg(c, "SELECT * FROM gone")
+        });
+        let why = format!("{:#}", got.unwrap_err());
+        assert!(
+            why.contains("refused") && why.contains("SQLSTATE 42P01"),
+            "{why}"
+        );
+        assert_eq!(
+            saw,
+            [BEGIN_PINNED, "EXPLAIN SELECT * FROM gone", "ROLLBACK"]
+        );
+        let (got, _) = probed(Answer::Error("57014"), |c| estimate_rows_pg(c, "SELECT 1"));
+        assert_eq!(got.unwrap(), (None, None), "a cancelled probe is not fatal");
+    }
+
+    #[test]
+    fn the_cursor_range_is_the_min_and_max_the_server_returns() {
+        let range = |answer| {
+            probed(answer, |c| {
+                get_cursor_range_pg(c, "SELECT * FROM orders", "id")
+            })
+        };
+        let (got, saw) = range(Answer::Rows(2, vec![vec![Some("10"), Some("250")]]));
+        assert_eq!(got, (Some("10".to_string()), Some("250".to_string())));
+        assert_eq!(
+            saw,
+            [
+                BEGIN_PINNED,
+                "SELECT min(\"id\")::text, max(\"id\")::text FROM orders",
+                "COMMIT"
+            ]
+        );
+        let (got, _) = range(Answer::Rows(2, vec![vec![None, Some("250")]]));
+        assert_eq!(got, (None, Some("250".to_string())));
+        assert_eq!(range(Answer::Rows(2, Vec::new())).0, (None, None));
+        assert_eq!(range(Answer::Error("42703")).0, (None, None));
+    }
+
+    #[test]
+    fn the_plan_analysis_names_the_scan_and_says_whether_it_uses_an_index() {
+        let plan = |answer| probed(answer, |c| analyze_plan_pg(c, "SELECT * FROM orders"));
+        let (got, saw) = plan(Answer::Rows(1, vec![vec![Some(INDEX_PLAN)]]));
+        assert_eq!(got, (Some(INDEX_PLAN.to_string()), true));
+        assert_eq!(
+            saw,
+            [BEGIN_PINNED, "EXPLAIN SELECT * FROM orders", "COMMIT"]
+        );
+        let (got, _) = plan(Answer::Rows(1, vec![vec![Some(SEQ_PLAN)]]));
+        assert_eq!(got, (Some(SEQ_PLAN.to_string()), false));
+        assert_eq!(plan(Answer::Error("57014")).0, (None, false));
     }
 }

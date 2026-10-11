@@ -26,6 +26,7 @@ use postgres::Client;
 use serde_json::json;
 
 use crate::config::TlsConfig;
+use crate::connect::postgres::read_pinned_text;
 use crate::error::Result;
 use crate::source::cdc::tx_buffer::{SpooledTail, TxBuffer, replay};
 use crate::source::cdc::value::RivetValue;
@@ -544,7 +545,7 @@ impl PgChangeStream {
         configured_tables: &[String],
         mode: DrainMode,
     ) -> Result<()> {
-        let mut client = super::connect_client_raw(conn_str, tls)?;
+        let mut client = super::connect_client(conn_str, tls)?;
         Self::refuse_unmet_prerequisites_on(&mut client, configured_tables, mode, false)
     }
 
@@ -597,21 +598,7 @@ impl PgChangeStream {
         spill_dir: Option<&std::path::Path>,
     ) -> Result<Self> {
         // The batch dial: the plaintext gate, the forced-ssl connector, and a host:port-naming error.
-        let mut client = super::connect_client_raw(conn_str, tls)?;
-        // test_decoding renders values as TEXT in the polling SESSION's format, so
-        // pin the formats this reader's parser assumes — otherwise a non-default
-        // database `datestyle` (e.g. 'German, DMY') nulls every timestamp and a
-        // non-hex `bytea_output` corrupts every bytea, silently (verified via the
-        // source-parity sweep under a flipped session). Immune to the DB default.
-        client.batch_execute(
-            // extra_float_digits=3 pins SHORTEST-EXACT float text rendering. On a
-            // session where it is <= 0 (pre-PG12 default, or set for dump compat)
-            // float8out/float4out ROUND to ~15/~6 sig digits, so the text reader
-            // parses a lossy value while the batch binary path stays exact — a
-            // silent CDC-vs-batch float divergence (bug hunt 2026-08-09, same
-            // session-state-rendering class as datestyle/bytea/intervalstyle).
-            READER_SESSION_PIN,
-        )?;
+        let mut client = super::connect_client(conn_str, tls)?;
         // The one prerequisite check of a run, on the stream's own connection and before the
         // slot: its refusals carry rivet's `pg cdc:` prefix, so the setup hint is never prepended.
         Self::refuse_unmet_prerequisites_on(&mut client, configured_tables, mode, true)?;
@@ -740,10 +727,13 @@ impl PgChangeStream {
         if let Some(why) = self.pending_truncate_refusal.take() {
             return Err(crate::source::cdc::checkpoint_identity::truncated(why));
         }
-        let rows = self.client.query(
-            "SELECT lsn::text, data FROM pg_logical_slot_peek_changes($1, NULL, $2)",
-            &[&self.slot, &self.batch_limit],
-        )?;
+        // test_decoding renders each value as text in the formats of the transaction that peeks.
+        let rows = read_pinned_text(&mut self.client, |c| {
+            c.query(
+                "SELECT lsn::text, data FROM pg_logical_slot_peek_changes($1, NULL, $2)",
+                &[&self.slot, &self.batch_limit],
+            )
+        })?;
         let n_rows = rows.len();
         // Frame transactions (BEGIN … changes … COMMIT) and stamp every change with
         // its transaction's COMMIT LSN — the only valid slot-advance boundary and
@@ -2221,11 +2211,6 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
-/// Session formats the text reader parses, pinned on its own connection (TimeZone too:
-/// an LMT-era timestamptz in a named zone renders a seconds offset nothing parses).
-const READER_SESSION_PIN: &str = "SET datestyle = 'ISO, MDY'; SET bytea_output = 'hex'; \
-     SET intervalstyle = 'postgres'; SET extra_float_digits = 3; SET TimeZone = 'UTC';";
-
 /// Parse a PostgreSQL timestamp rendering (`YYYY-MM-DD HH:MM:SS[.ffffff][±TZ]`).
 /// For `timestamptz` the trailing offset is DATA, not decoration: test_decoding
 /// renders the instant in the polling session's zone, so at any non-UTC
@@ -3238,11 +3223,60 @@ mod tests {
         assert_eq!(d.value(0), 19_782, "2024-02-29 is day 19782 of the epoch");
     }
 
+    /// A stream over `client` on a slot it never opened.
+    fn stream_on(client: Client) -> PgChangeStream {
+        PgChangeStream {
+            client,
+            domains: Domains::new(),
+            slot: "s".into(),
+            pending: VecDeque::new(),
+            spill_dir: None,
+            spooled: None,
+            batch_limit: 10,
+            frontier: 0,
+            exhausted: false,
+            pending_truncate_refusal: None,
+            bound: None,
+            owed_through: None,
+            frontier_text: None,
+            configured_tables: Vec::new(),
+            barrier_nonce: None,
+        }
+    }
+
     #[test]
-    fn the_reader_session_pins_timezone_to_utc() {
+    fn the_open_sends_no_statement_before_its_first_read() {
+        use crate::connect::postgres::wire_recorder::{recording_server, sent};
+        let (url, queries) = recording_server();
+        let open = PgChangeStream::open(
+            &url,
+            "s",
+            PriorRun::default(),
+            None,
+            crate::source::cdc::PeekBound::Sized(10),
+            DrainMode::Continuous,
+            &[],
+            None,
+        );
+        assert!(open.is_err(), "the recorder answers no prepared statement");
+        assert_eq!(sent(queries), ["SHOW wal_level"]);
+    }
+
+    #[test]
+    fn a_peek_sets_the_five_formats_for_its_own_transaction() {
+        use crate::connect::postgres::wire_recorder::{BEGIN_PINNED_TEXT, recording_server, sent};
+        let (url, queries) = recording_server();
+        let mut stream = stream_on(crate::connect::postgres::connect_client(&url, None).unwrap());
         assert!(
-            READER_SESSION_PIN.contains("SET TimeZone = 'UTC';"),
-            "{READER_SESSION_PIN}"
+            stream.fill().is_err(),
+            "the recorder answers no prepared statement"
+        );
+        assert_eq!(
+            sent(queries),
+            [
+                BEGIN_PINNED_TEXT,
+                "SELECT lsn::text, data FROM pg_logical_slot_peek_changes($1, NULL, $2)"
+            ]
         );
     }
 

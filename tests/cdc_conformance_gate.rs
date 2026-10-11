@@ -924,7 +924,9 @@ fn oracle_class_census_is_pinned() {
 // 2026-10-03: +3 independent - the BigQuery truncate re-baseline cell (read through `bq`), and the PG
 // single- and multi-table truncate re-baseline cells, classed by the `query_one(` that reads the slot's
 // truncate LSN; their row oracle is arrow plus the default oracle.
-const PIN_INDEPENDENT: usize = 113; // ratchet-pin: cdc-census-independent min
+// 2026-10-11: +1 independent - the PG capture refused twice through the transaction pooler, classed by the
+// `query_one(` that counts its slot; its oracle is `pg_settings` read by a second client of the pooler.
+const PIN_INDEPENDENT: usize = 114; // ratchet-pin: cdc-census-independent min
 // 2026-09-28, source connection ceilings: +3 shared codec — the run's captured row is the
 // fixture check; the oracle is the server's own connection counter.
 // 2026-09-29: +2 shared codec — the Oracle TRUNCATE refusal on re-run and the uncaptured-truncate cell.
