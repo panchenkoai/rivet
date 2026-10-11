@@ -486,6 +486,8 @@ guarantees:
     stated:
       - file: docs/concepts.md
         sentence: "All Postgres tuning uses `SET LOCAL` inside an RAII-guarded `BEGIN…COMMIT` so session state is never leaked into the pool."
+      - file: docs/reference/compatibility.md
+        sentence: "Behind a transaction-mode pooler (pgBouncer, Odyssey) the server connection goes back to the pool with every setting as rivet found it."
     held_by:
       postgres: { test: pg_statement_timeout_not_leaked_after_successful_export, asserts: "statement_timeout leaked to pool after successful export" }
       postgres_every_batch_shape: { test: every_batch_shape_through_a_transaction_pooler_leaves_its_session_as_it_was_postgres, asserts: "the run changed the session of the pooled connection" }

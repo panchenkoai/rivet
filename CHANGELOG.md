@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+- **Fix: a PostgreSQL run through a transaction-mode pooler no longer leaves session settings
+  on the pooled server connection.** PostgreSQL batch connections only. Reproduced on rivet
+  0.31.0 behind pgBouncer 1.26.0 in transaction mode, with pool sizes 1 and 5.
+  - **What was wrong in 0.30.0 and 0.31.0.** Each connection rivet opened for `run`, `check`,
+    `plan`, `doctor`, `init`, a PostgreSQL state database and `rivet-mcp` sent
+    `SET TimeZone = 'UTC'; SET DateStyle = 'ISO, MDY'; SET IntervalStyle = 'postgres';
+    SET bytea_output = 'hex'` as session settings, unless it detected a transaction pooler.
+    The detection compares the backend pid of two statements, and an idle pooler answers both
+    from one server connection, so the settings were sent and stayed on the connection the
+    pooler then gave to its other clients.
+    - Who was affected: other clients of the same pooler, not rivet. pgBouncer puts back the
+      parameters it tracks for each client (`TimeZone`, `DateStyle` and `IntervalStyle` in
+      1.26), so the setting another client read differently is `bytea_output`. Measured on a
+      database whose default is `escape`: after one `rivet run`, another client's
+      `bytea::text` came back in `hex`. A pooler that tracks fewer parameters hands on more
+      of the four.
+    - rivet's own output was correct.
+  - **Now** a batch connection sends no session-level `SET`. The export, the bound and count
+    probes of a run, the range and plan probes of `check` and `plan`, and the table
+    statistics of `rivet-mcp` set the four formats with `SET LOCAL` inside the transaction
+    that reads, on a direct connection and behind a pooler alike, and nothing outlives the
+    transaction. On a direct connection the delivered files and the `check` output are the
+    same as in 0.31.0 (compared under a role whose defaults are Asia/Tokyo, `German, DMY`,
+    `sql_standard` and `escape`).
+    - Behind a pooler busy enough for 0.31.0 to detect it, the probes and `check` ran in the
+      role's zone and formats while the export ran in UTC. They now read in UTC as well.
+    - `mode: cdc` is not covered: its `test_decoding` reader still sets its formats on its
+      own session. Connect a PostgreSQL CDC export to the server directly.
+    - A setting an earlier release left behind stays on the pooled server connection until
+      the pooler closes it (pgBouncer: `server_lifetime`, one hour by default) or is restarted.
 - **Fix: a `query:` holding a non-ASCII character no longer ends the run in a panic.**
   Applies to every source engine. Reproduced on rivet 0.31.0 with PostgreSQL, MySQL,
   SQL Server and MongoDB.

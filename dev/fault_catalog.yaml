@@ -200,19 +200,22 @@
       suite: live_suite
       needs: postgres, mysql, postgres-state
 
-# Not documented RED against this exact mutant; the incremental cursor is still covered by SET LOCAL (see pg-incremental-cursor-tz).
+# The read transaction opens without its four formats; the offline cell pins the statement, the live ones the text.
 - id: pg-session-formats-unpinned
-  class: "PG batch connection no longer pins TimeZone/DateStyle/IntervalStyle/bytea_output -> text renderings follow the session"
-  file: src/source/postgres/mod.rs
+  class: "PG batch reads no longer pin TimeZone/DateStyle/IntervalStyle/bytea_output -> text renderings follow the session"
+  file: src/connect/postgres.rs
   old: |2-
-        if !transaction_pooler {
+            txn.client.batch_execute(&format!("BEGIN; {TXN_FORMATS}"))?;
   new: |2-
-        if false && !transaction_pooler {
+            txn.client.batch_execute("BEGIN")?;
   detectors:
+    - test: a_pinned_read_sets_the_four_formats_for_its_own_transaction_and_commits
+      suite: lib
+      needs: none
     - test: pg_check_reports_a_timestamptz_cursor_range_in_iso_utc_for_any_session
       suite: live_suite
       needs: postgres
-    - test: pg_date_window_chunks_read_each_row_once_in_an_odd_session
+    - test: pg_incremental_on_a_timestamptz_cursor_reads_each_row_once_across_runs_in_an_odd_session
       suite: live_suite
       needs: postgres
 
@@ -230,15 +233,14 @@
       suite: lib
       needs: none
 
-# DEFAULT, not deletion: deleting the line is masked by pin_session_formats' session-level SET TimeZone.
-# DEFAULT resets to the role/db/startup-options zone, un-pinning both layers for the read txn.
+# DEFAULT resets to the role/db/startup-options zone for the read transaction; the other three formats stay pinned.
 - id: pg-incremental-cursor-tz
   class: "PG incremental cursor boundary parsed in the session zone -> non-UTC session skips/duplicates the offset window"
-  file: src/source/postgres/mod.rs
+  file: src/connect/postgres.rs
   old: |2-
-            .batch_execute("SET LOCAL TimeZone = 'UTC'")?;
+    const TXN_FORMATS: &str = "SET LOCAL TimeZone = 'UTC'; SET LOCAL DateStyle = 'ISO, MDY'; \
   new: |2-
-            .batch_execute("SET LOCAL TimeZone = DEFAULT")?;
+    const TXN_FORMATS: &str = "SET LOCAL TimeZone = DEFAULT; SET LOCAL DateStyle = 'ISO, MDY'; \
   detectors:
     - test: pg_incremental_cursor_survives_a_non_utc_session_timezone
       suite: live_suite

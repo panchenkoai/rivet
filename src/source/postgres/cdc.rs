@@ -544,7 +544,7 @@ impl PgChangeStream {
         configured_tables: &[String],
         mode: DrainMode,
     ) -> Result<()> {
-        let mut client = super::connect_client_raw(conn_str, tls)?;
+        let mut client = super::connect_client(conn_str, tls)?;
         Self::refuse_unmet_prerequisites_on(&mut client, configured_tables, mode, false)
     }
 
@@ -597,7 +597,7 @@ impl PgChangeStream {
         spill_dir: Option<&std::path::Path>,
     ) -> Result<Self> {
         // The batch dial: the plaintext gate, the forced-ssl connector, and a host:port-naming error.
-        let mut client = super::connect_client_raw(conn_str, tls)?;
+        let mut client = super::connect_client(conn_str, tls)?;
         // test_decoding renders values as TEXT in the polling SESSION's format, so
         // pin the formats this reader's parser assumes — otherwise a non-default
         // database `datestyle` (e.g. 'German, DMY') nulls every timestamp and a

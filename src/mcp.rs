@@ -7,6 +7,7 @@
 //! The server speaks JSON-RPC 2.0 over stdin/stdout (one object per line).
 //! All tools are read-only — no writes, no DDL.
 
+use crate::connect::postgres::read_pinned;
 use serde_json::{Value, json};
 use std::io::{BufRead, Write};
 
@@ -346,8 +347,8 @@ fn pg_table_stats(url: &str, schema: Option<&str>) -> anyhow::Result<String> {
     let mut client = pg_connect(url)?;
     let sql = pg_table_stats_sql(schema);
     let rows = match schema {
-        Some(s) => client.query(sql, &[&s])?,
-        None => client.query(sql, &[])?,
+        Some(s) => read_pinned(&mut client, |c| c.query(sql, &[&s]))?,
+        None => read_pinned(&mut client, |c| c.query(sql, &[]))?,
     };
     Ok(format!(
         "Table stats (top 20)\n\n{}",

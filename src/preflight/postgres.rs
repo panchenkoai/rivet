@@ -3,6 +3,7 @@ use super::analysis::*;
 use super::cursor_expr::incremental_key_expr;
 use super::schema_error::PreflightSchemaError;
 use crate::config::{ExportConfig, ExportMode, SourceType, TlsConfig};
+use crate::connect::postgres::read_pinned;
 use crate::error::Result;
 
 /// Connect once and build one [`ExportDiagnostic`] per export. Rendering
@@ -86,7 +87,7 @@ fn diagnose_pg(
                     "SELECT min({expr})::text, max({expr})::text FROM ({base_query}) AS _rivet"
                 ),
             };
-            match client.query(&range_query, &[]) {
+            match read_pinned(client, |c| c.query(&range_query, &[])) {
                 Ok(rows) if !rows.is_empty() => {
                     let min_val: Option<String> = rows[0].get(0);
                     let max_val: Option<String> = rows[0].get(1);
@@ -146,7 +147,7 @@ fn estimate_rows_pg(
     query: &str,
 ) -> Result<(Option<i64>, Option<i64>)> {
     let explain = format!("EXPLAIN {}", query);
-    let rows = match client.query(&explain, &[]) {
+    let rows = match read_pinned(client, |c| c.query(&explain, &[])) {
         Ok(r) => r,
         Err(e) => {
             // A SQLSTATE *class 42* failure (undefined table/column, no
@@ -234,7 +235,7 @@ fn get_cursor_range_pg(
             format!("SELECT min({expr})::text, max({expr})::text FROM ({base_query}) AS _rivet")
         }
     };
-    match client.query(&range_query, &[]) {
+    match read_pinned(client, |c| c.query(&range_query, &[])) {
         Ok(rows) if !rows.is_empty() => {
             let min_val: Option<String> = rows[0].get(0);
             let max_val: Option<String> = rows[0].get(1);
@@ -480,7 +481,7 @@ pub(crate) fn single_int_pk_pg(
 
 fn analyze_plan_pg(client: &mut postgres::Client, query: &str) -> (Option<String>, bool) {
     let explain = format!("EXPLAIN {}", query);
-    match client.query(&explain, &[]) {
+    match read_pinned(client, |c| c.query(&explain, &[])) {
         Ok(rows) => {
             let lines: Vec<String> = rows.iter().map(|r| r.get::<_, String>(0)).collect();
             let plan_text = lines.join("\n");

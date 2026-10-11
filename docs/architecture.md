@@ -179,11 +179,13 @@ proxy / gateway, rather than letting the operator find out later through
 an inexplicably long-running query or session-state leak:
 
 - **Postgres** — `detect_pg_transaction_pooler` in
-  `src/source/postgres/mod.rs` compares `pg_backend_pid()` across two
+  `src/connect/postgres.rs` compares `pg_backend_pid()` across two
   consecutive queries. Different PIDs imply transaction-mode pooling
   (pgBouncer, Odyssey). The warning explicitly names what does not
   work: `SET LOCAL` is transaction-scoped, advisory locks / `LISTEN`
-  are unavailable.
+  are unavailable. An idle pooler answers both queries from one server
+  connection and is not detected, so nothing but the warning depends on
+  it: a batch connection sends no session-level `SET` at all.
 
 - **MySQL** — `classify_mysql_proxy` in `src/source/mysql/proxy.rs` is a pure
   classifier over four signals, in this precedence order:
