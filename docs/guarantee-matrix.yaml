@@ -492,6 +492,15 @@ guarantees:
       postgres: { test: pg_statement_timeout_not_leaked_after_successful_export, asserts: "statement_timeout leaked to pool after successful export" }
       postgres_every_batch_shape: { test: every_batch_shape_through_a_transaction_pooler_leaves_its_session_as_it_was_postgres, asserts: "the run changed the session of the pooled connection" }
 
+  - id: postgres_sessions_print_utc_iso_and_hex
+    stated:
+      - file: docs/reference/compatibility.md
+        sentence: "Every PostgreSQL connection rivet opens sets `TimeZone = 'UTC'`, `DateStyle = 'ISO, MDY'`, `IntervalStyle = 'postgres'` and `bytea_output = 'hex'`, whatever the server, database or role defaults are."
+    held_by:
+      postgres_export: { test: the_text_a_query_casts_is_utc_iso_and_hex_whatever_the_role_defaults_postgres, asserts: "the text the query casts follows the role's defaults, not UTC, ISO, postgres and hex" }
+      postgres_cdc_reader_formats: { test: pg_cdc_non_iso_datestyle_and_escape_bytea_match_batch, asserts: "assert_cdc_matches_batch(&out, &batch_out)" }
+      postgres_cdc_reader_zone: { test: pg_cdc_lmt_timestamptz_under_a_named_zone_matches_batch, asserts: "assert_cdc_matches_batch(&out, &batch_out)" }
+
   - id: flat_memory_at_any_table_size
     stated:
       - file: docs/why/flat-memory.md
