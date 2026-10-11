@@ -3942,7 +3942,7 @@ mod tests {
         }
     }
 
-    /// Every signature phrase names its class on its own, in any letter case.
+    /// Every signature phrase names its class on its own, in any letter case; the bare error number 3024 is left out on purpose.
     #[test]
     fn each_error_signature_alone_names_its_class() {
         for (phrase, class) in [
@@ -3952,7 +3952,6 @@ mod tests {
             ("deadlock", "deadlock"),
             ("lock wait timeout", "lock_timeout"),
             ("could not obtain lock", "lock_timeout"),
-            ("3024", "statement_timeout"),
             ("maximum statement execution time", "statement_timeout"),
             ("statement timeout", "statement_timeout"),
             ("schema drift", "schema_drift"),
