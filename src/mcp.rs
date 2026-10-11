@@ -756,4 +756,25 @@ mod tests {
         // Header width = max(1, 2) = 2 bytes — header padded to 2.
         assert!(out.contains("x "), "header padded to byte-width 2");
     }
+
+    #[test]
+    fn the_table_stats_are_the_rows_the_server_returns_read_in_a_pinned_transaction() {
+        use crate::connect::postgres::wire_recorder::{
+            Answer, BEGIN_PINNED, answering_server, sent,
+        };
+        let row = vec![Some("public"), Some("orders"), Some("2026-10-11 08:45")];
+        let (url, queries) = answering_server(Answer::Rows(3, vec![row]));
+        let out = pg_table_stats(&url, None).unwrap();
+        assert_eq!(
+            out,
+            "Table stats (top 20)\n\n\
+             c0     | c1     | c2              \n\
+             -------+--------+-----------------\n\
+             public | orders | 2026-10-11 08:45"
+        );
+        assert_eq!(
+            sent(queries),
+            [BEGIN_PINNED, pg_table_stats_sql(None), "COMMIT"]
+        );
+    }
 }

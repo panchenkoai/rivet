@@ -420,6 +420,49 @@ pub fn forget_pooled_statements() {
         .expect("DEALLOCATE ALL through pgbouncer");
 }
 
+/// The backend behind the transaction pooler and every setting of its session with where it was set.
+pub fn pooled_session() -> (i32, Vec<(String, String, String)>) {
+    let mut c = postgres::Client::connect(PGBOUNCER_URL, postgres::NoTls).expect("pgbouncer");
+    let pid = c.query_one("SELECT pg_backend_pid()", &[]).unwrap().get(0);
+    let settings = c
+        .query(
+            "SELECT name, setting, source FROM pg_settings ORDER BY name",
+            &[],
+        )
+        .unwrap()
+        .iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .collect();
+    (pid, settings)
+}
+
+/// The pooled session after the pooler's one server connection gave back the text formats an earlier client set on it.
+pub fn pooled_session_without_set_formats() -> (i32, Vec<(String, String, String)>) {
+    postgres::Client::connect(PGBOUNCER_URL, postgres::NoTls)
+        .expect("pgbouncer")
+        .batch_execute(
+            "RESET TimeZone; RESET DateStyle; RESET IntervalStyle; RESET bytea_output; \
+             RESET extra_float_digits",
+        )
+        .expect("RESET through pgbouncer");
+    let session = pooled_session();
+    let formats = [
+        "TimeZone",
+        "DateStyle",
+        "IntervalStyle",
+        "bytea_output",
+        "extra_float_digits",
+    ];
+    let set: Vec<_> = (session.1.iter())
+        .filter(|(name, _, source)| formats.contains(&name.as_str()) && source == "session")
+        .collect();
+    assert!(
+        set.is_empty(),
+        "fixture: the pooled connection still carries a session SET: {set:?}"
+    );
+    session
+}
+
 /// RAII background-writer: a thread that loops until its stop flag flips, and
 /// on Drop (INCLUDING a panic unwind) sets the flag and JOINS. The sustained-
 /// writes CDC tests spawned a bare JoinHandle then called a panic-capable

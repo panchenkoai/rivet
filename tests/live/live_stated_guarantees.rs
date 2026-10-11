@@ -779,49 +779,6 @@ fn mode_full_documents_the_longest_statement_it_holds_mongo() {
     );
 }
 
-/// The backend behind the transaction pooler and every setting of its session with where it was set.
-fn pooled_session() -> (i32, Vec<(String, String, String)>) {
-    let mut c = postgres::Client::connect(PGBOUNCER_URL, postgres::NoTls).expect("pgbouncer");
-    let pid = c.query_one("SELECT pg_backend_pid()", &[]).unwrap().get(0);
-    let settings = c
-        .query(
-            "SELECT name, setting, source FROM pg_settings ORDER BY name",
-            &[],
-        )
-        .unwrap()
-        .iter()
-        .map(|r| (r.get(0), r.get(1), r.get(2)))
-        .collect();
-    (pid, settings)
-}
-
-/// The pooled session after the pooler's one server connection gave back the text formats an earlier client set on it.
-fn pooled_session_without_set_formats() -> (i32, Vec<(String, String, String)>) {
-    postgres::Client::connect(PGBOUNCER_URL, postgres::NoTls)
-        .expect("pgbouncer")
-        .batch_execute(
-            "RESET TimeZone; RESET DateStyle; RESET IntervalStyle; RESET bytea_output; \
-             RESET extra_float_digits",
-        )
-        .expect("RESET through pgbouncer");
-    let session = pooled_session();
-    let formats = [
-        "TimeZone",
-        "DateStyle",
-        "IntervalStyle",
-        "bytea_output",
-        "extra_float_digits",
-    ];
-    let set: Vec<_> = (session.1.iter())
-        .filter(|(name, _, source)| formats.contains(&name.as_str()) && source == "session")
-        .collect();
-    assert!(
-        set.is_empty(),
-        "fixture: the pooled connection still carries a session SET: {set:?}"
-    );
-    session
-}
-
 /// docs/concepts.md: Postgres session state is never leaked into the pool. Each batch shape, `check` and
 /// `doctor` run twice through a transaction-mode pooler with one server connection, and leave every
 /// setting of that connection, and where it was set, as they found it.
@@ -872,41 +829,6 @@ fn every_batch_shape_through_a_transaction_pooler_leaves_its_session_as_it_was_p
             }
         }
     }
-}
-
-/// docs/reference/compatibility.md: a `mode: cdc` run sends no session-level `SET` either. Through the
-/// transaction-mode pooler the capture is refused (the server behind it runs `wal_level = replica`), twice,
-/// and each refused run leaves every setting of the pooled connection, and where it was set, as it found it.
-#[test]
-#[ignore = "live: requires docker compose --profile pool up -d pgbouncer (transaction mode, pool_size=1)"]
-fn a_cdc_run_refused_through_a_transaction_pooler_leaves_its_session_as_it_was_postgres() {
-    let _alone = pgbouncer_alone();
-    let engine = SqlEngine::Pg;
-    engine.alive();
-    let (table, _guard) = engine.range_table("guar_pool_cdc");
-    let slot = unique_name("guar_pool_slot");
-    let _slot = Slot::on(POSTGRES_URL, slot.clone());
-    let before = pooled_session_without_set_formats();
-    let rig = Rig::pg_cdc(&table, &slot).source_url(PGBOUNCER_URL);
-    for cycle in 1..=2 {
-        assert_refused(
-            &rig.run(),
-            Refused::by_code("RIVET_SOURCE_CDC_PREREQUISITE", 1),
-        );
-        assert_eq!(
-            pooled_session(),
-            before,
-            "cycle {cycle}: the refused CDC run changed the session of the pooled connection"
-        );
-    }
-    let slots: i64 = pg_connect()
-        .query_one(
-            "SELECT count(*) FROM pg_replication_slots WHERE slot_name = $1",
-            &[&slot],
-        )
-        .unwrap()
-        .get(0);
-    assert_eq!(slots, 0, "a refused capture creates no slot");
 }
 
 /// Drops its PostgreSQL role on the main stand when the cell ends.
