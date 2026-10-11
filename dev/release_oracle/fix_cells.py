@@ -62,6 +62,8 @@ WIRE_SAMPLE = ("control of 3132830a: a unit sample of the cell's own wire counte
                "texts); it runs no product binary")
 EMPTY_PREFIX = ("control of 52f26e45: an empty prefix of an EXISTING bucket still reads `legacy`; the fix fails "
                 "`validate` on a missing bucket")
+SQLITE_AS_BEFORE = ("edited by 17747ef2, not written for it: the commit lifted the cell's restriction to the SQLite "
+                    "state; this stage runs the SQLite state only, where the cell is the test it was before the fix")
 
 #: Fix cells allowed to pass on the previous release, each with its reason. Shrink-only.
 GREEN_ON_PREV: dict[str, str] = {  # ratchet-pin: fix-cells-green-on-previous-release strings
@@ -126,6 +128,10 @@ GREEN_ON_PREV: dict[str, str] = {  # ratchet-pin: fix-cells-green-on-previous-re
     "a_table_of_an_enum_and_a_domain_with_wide_rows_is_delivered_range_direct_postgres": DIRECT_WIDE,
     "an_array_of_an_enum_with_wide_rows_is_refused_within_the_bound_direct_postgres": DIRECT_WIDE,
     "an_answer_ends_at_the_next_request_and_two_pages_are_not_one": WIRE_SAMPLE,
+    "a_run_out_of_file_descriptors_fails_loudly_and_the_next_delivers_mongo": SQLITE_AS_BEFORE,
+    "a_run_out_of_file_descriptors_fails_loudly_and_the_next_delivers_mssql": SQLITE_AS_BEFORE,
+    "a_run_out_of_file_descriptors_fails_loudly_and_the_next_delivers_mysql": SQLITE_AS_BEFORE,
+    "a_run_out_of_file_descriptors_fails_loudly_and_the_next_delivers_oracle": SQLITE_AS_BEFORE,
 }  # ratchet-pin: end
 
 

@@ -7,8 +7,13 @@ ship through every correctness check.
 
 Per path, each binary runs from its own directory and state: one warm-up, then three
 measured runs; the MINIMUM of each metric is compared (other activity only ever adds).
+A batch path whose warm-up took under a second gets nine: its wall has two modes about
+0.1 s apart on either binary, the slow one in 6 to 9 runs of 10 (measured, v0.31.0
+against itself), so one side's minimum can be the slow mode beside the other's fast one.
+That is also why the wall has a second bound: a best run no slower than the previous
+release's MEDIAN run did not reach its floor, and is not a regression.
 
-  wall   seconds                  ≤ prev × RIVET_PERF_WALL_TOL (1.5) + 0.1 s
+  wall   seconds                  ≤ prev × RIVET_PERF_WALL_TOL (1.5) + 0.1 s, or ≤ prev's median run
   cpu    user + sys seconds       ≤ prev × RIVET_PERF_CPU_TOL (1.3) + 0.05 s
   rss    peak resident bytes      ≤ prev × RIVET_PERF_RSS_TOL (1.3) + 16 MiB
   harm   the engine's graded      ≤ prev × RIVET_HARM_TOL (1.25) + RIVET_HARM_SLACK (200)
@@ -43,6 +48,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import statistics
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -69,6 +75,8 @@ DELTA = 20_000
 CDC_CHANGES = 20_000
 BIG_ROWS = 2_000_000
 REPS = 3
+SHORT_WALL = 1.0
+SHORT_REPS = 9
 MIB = 1024 * 1024
 # What a bounded CDC run needs: one metadata connection plus the change stream. A MongoDB
 # driver client adds its own monitoring connections (3 per client, measured).
@@ -79,13 +87,14 @@ CONN_CEILING = {  # ratchet-pin: cdc-connection-ceiling sum
 
 @dataclass(frozen=True)
 class Sample:
-    """One measured run."""
+    """One measured run, or the per-metric minimum of several with their median wall as `typical`."""
 
     ok: bool
     wall: float
     cpu: float
     rss: int
     harm: dict[str, int]
+    typical: float = 0.0
 
 
 def _cpu(text: str) -> float:
@@ -172,13 +181,19 @@ def _timed(binary: Path, cwd: Path, env: dict[str, str], *args: str, probe: str 
                   _parse_rss(p.stderr), harm or {})
 
 
+def measured_reps(warm_up_wall: float) -> int:
+    """How many measured runs follow a warm-up of this wall: SHORT_REPS under SHORT_WALL, else REPS."""
+    return SHORT_REPS if warm_up_wall < SHORT_WALL else REPS
+
+
 def _best(samples: list[Sample]) -> Sample | None:
     """The per-metric minimum over successful samples, or None when any run failed."""
     if not samples or not all(s.ok for s in samples):
         return None
     keys = set.intersection(*(set(s.harm) for s in samples)) if samples else set()
     return Sample(True, min(s.wall for s in samples), min(s.cpu for s in samples),
-                  min(s.rss for s in samples), {k: min(s.harm[k] for s in samples) for k in keys})
+                  min(s.rss for s in samples), {k: min(s.harm[k] for s in samples) for k in keys},
+                  statistics.median(s.wall for s in samples))
 
 
 def perf_verdict(engine: str, prev: Sample, cur: Sample) -> list[str]:
@@ -190,8 +205,8 @@ def perf_verdict(engine: str, prev: Sample, cur: Sample) -> list[str]:
     hs = int(os.environ.get("RIVET_HARM_SLACK") or "200")
     worse = []
     # Absolute slack under the ratio: a 0.02 s CPU reading moves by a scheduler tick.
-    if cur.wall > prev.wall * wt + 0.1:
-        worse.append(f"wall {cur.wall:.2f}s > {prev.wall:.2f}s×{wt}")
+    if cur.wall > max(prev.wall * wt + 0.1, prev.typical):
+        worse.append(f"wall {cur.wall:.2f}s > {prev.wall:.2f}s×{wt} and its median {prev.typical:.2f}s")
     if cur.cpu > prev.cpu * ct + 0.05:
         worse.append(f"cpu {cur.cpu:.2f}s > {prev.cpu:.2f}s×{ct}")
     if cur.rss > prev.rss * rt + 16 * MIB:
@@ -236,10 +251,11 @@ def _fresh(d: Path) -> None:
 
 def _batch_path(binary: Path, d: Path, url: str, engine: str, table: str, path: str,
                 rows: int = ROWS, idc: str = "id") -> Sample | None:
-    """Warm up, then the minimum of REPS measured runs of one batch path."""
+    """Warm up, then the minimum of `measured_reps` measured runs of one batch path."""
     env = {"RIVET_PERF_URL": url, "RIVET_STATE_URL": "", "RIVET_GATE_STATE_URL": ""}
     samples: list[Sample] = []
-    for i in range(REPS + 1):
+    reps, i = REPS, -1
+    while (i := i + 1) <= reps:
         if path == "incremental":
             if i == 0:
                 _fresh(d)
@@ -254,9 +270,11 @@ def _batch_path(binary: Path, d: Path, url: str, engine: str, table: str, path: 
         s = _timed(binary, d, env, "run", "-c", "c.yaml", probe=harness_read(engine, url), own=table)
         if i:
             samples.append(s)
+        else:
+            reps = measured_reps(s.wall)
     # A fast run that read nothing is not a measurement: the last output holds every row.
     got = _declared(d / "output", f"SELECT count(DISTINCT {idc}) FROM {{parts}}")
-    want = rows + (REPS + 1) * DELTA if path == "incremental" else rows
+    want = rows + (reps + 1) * DELTA if path == "incremental" else rows
     if not got or got[0][0] != want:
         return None
     return _best(samples)
