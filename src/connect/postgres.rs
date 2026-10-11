@@ -177,6 +177,8 @@ pub(crate) mod wire_recorder {
         Rows(usize, Vec<Vec<Option<&'static str>>>),
         /// An error with this SQLSTATE and the message `refused`.
         Error(&'static str),
+        /// One row of these `bigint` cells.
+        Int8(Vec<i64>),
     }
 
     /// A PostgreSQL server for one client: every simple query is answered (with an error when it says `fail`); a prepared statement is recorded and the connection closed. The statements are handed over when the client leaves.
@@ -236,6 +238,30 @@ pub(crate) mod wire_recorder {
         message(b'D', &body)
     }
 
+    /// The RowDescription of `columns` bigint columns.
+    fn int8_columns(columns: usize) -> Vec<u8> {
+        let mut body = (columns as u16).to_be_bytes().to_vec();
+        for i in 0..columns {
+            body.extend(format!("c{i}\0").as_bytes());
+            body.extend([0u8; 6]);
+            body.extend(20u32.to_be_bytes());
+            body.extend(8i16.to_be_bytes());
+            body.extend((-1i32).to_be_bytes());
+            body.extend(1u16.to_be_bytes());
+        }
+        message(b'T', &body)
+    }
+
+    /// One DataRow of bigint cells in the binary format.
+    fn int8_row(cells: &[i64]) -> Vec<u8> {
+        let mut body = (cells.len() as u16).to_be_bytes().to_vec();
+        for cell in cells {
+            body.extend(8i32.to_be_bytes());
+            body.extend(cell.to_be_bytes());
+        }
+        message(b'D', &body)
+    }
+
     /// Accept one client and answer it until it leaves, a read times out, or a prepared statement arrives with no `answer` to give.
     fn serve(answer: Option<Answer>) -> (String, std::sync::mpsc::Receiver<Vec<String>>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -290,6 +316,7 @@ pub(crate) mod wire_recorder {
                                 error(sqlstate)
                             }
                             Some(Answer::Rows(..)) => message(b'1', b""),
+                            Some(Answer::Int8(..)) => message(b'1', b""),
                         }
                     }
                     (b'S', Some(_)) => {
@@ -302,10 +329,20 @@ pub(crate) mod wire_recorder {
                         reply.extend(text_columns(*columns));
                         reply
                     }
+                    (b'D', Some(Answer::Int8(cells))) => {
+                        let mut reply = message(b't', &[0, 0]);
+                        reply.extend(int8_columns(cells.len()));
+                        reply
+                    }
                     (b'B', Some(_)) => message(b'2', b""),
                     (b'E', Some(Answer::Rows(_, rows))) => {
                         let mut reply: Vec<u8> = rows.iter().flat_map(|r| data_row(r)).collect();
                         reply.extend(message(b'C', format!("SELECT {}\0", rows.len()).as_bytes()));
+                        reply
+                    }
+                    (b'E', Some(Answer::Int8(cells))) => {
+                        let mut reply = int8_row(cells);
+                        reply.extend(message(b'C', b"SELECT 1\0"));
                         reply
                     }
                     (b'C', Some(_)) => message(b'3', b""),

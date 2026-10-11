@@ -1399,4 +1399,23 @@ mod tests {
             "no completed tasks → no committed boundary"
         );
     }
+
+    /// A connection given back is the one the next chunk takes, so no new one is dialled; with none idle the take dials.
+    #[test]
+    fn a_connection_given_back_is_taken_again_without_a_new_dial() {
+        let mut cfg = make_plan("orders").source;
+        cfg.url = Some("postgresql://nobody@127.0.0.1:1/x".into());
+        let idle = IdleSources::default();
+        assert!(idle.take(&cfg).is_err(), "nothing idle: the take must dial");
+        idle.give(Box::new(KeysTo230));
+        let mut reused = idle.take(&cfg).expect("the idle connection, not a dial");
+        assert_eq!(
+            reused.query_scalar("SELECT max(id) FROM orders").unwrap(),
+            Some("230".to_string())
+        );
+        assert!(
+            idle.take(&cfg).is_err(),
+            "a taken connection is no longer idle"
+        );
+    }
 }

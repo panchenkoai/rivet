@@ -2071,4 +2071,170 @@ mod tests {
             super::source_unreadable("orders", anyhow::anyhow!("connection reset by peer"));
         assert_eq!(crate::error::classify_exit(&dropped), 2);
     }
+
+    // ── guards a live mutation sweep left unpinned ──────────────────────────
+
+    /// A dash and an underscore are kept as written, so two exports that differ only there keep two files; a bare file name stays bare.
+    #[test]
+    fn per_export_path_keeps_a_dash_and_an_underscore_as_written() {
+        assert_eq!(
+            per_export_output_path("/tmp/plan.json", "daily-orders_v2"),
+            "/tmp/plan.daily-orders_v2.json"
+        );
+        assert_ne!(
+            per_export_output_path("plan.json", "a-b"),
+            per_export_output_path("plan.json", "a_b")
+        );
+        assert_eq!(
+            per_export_output_path("plan.json", "orders"),
+            "plan.orders.json"
+        );
+    }
+
+    /// A config of three exports whose `wave`/`parallel_safe` differ from each other and from `recs`.
+    fn three_exports() -> (crate::config::Config, Vec<(String, u32, bool)>) {
+        let mut cfg = crate::config::Config::from_yaml(
+            "source: { type: postgres, url: \"postgresql://u:p@127.0.0.1:1/db\" }\n\
+             exports:\n\
+             \x20 - name: first\n    table: first\n    mode: full\n    format: parquet\n\
+             \x20   destination: { type: local, path: ./out/first }\n\
+             \x20 - name: second\n    table: second\n    mode: full\n    format: parquet\n\
+             \x20   destination: { type: local, path: ./out/second }\n\
+             \x20 - name: third\n    table: third\n    mode: full\n    format: parquet\n\
+             \x20   destination: { type: local, path: ./out/third }\n",
+        )
+        .expect("the fixture config loads");
+        (cfg.exports[0].wave, cfg.exports[0].parallel_safe) = (Some(1), Some(true));
+        (cfg.exports[1].wave, cfg.exports[1].parallel_safe) = (Some(9), Some(false));
+        let recs = vec![
+            ("first".to_string(), 4, false),
+            ("second".to_string(), 5, true),
+            ("third".to_string(), 6, true),
+        ];
+        (cfg, recs)
+    }
+
+    /// With nothing written each export reads its own config value, not a neighbour's and not the recommendation.
+    #[test]
+    fn an_unwritten_export_reads_its_own_config_value() {
+        let (cfg, recs) = three_exports();
+        let (fields, written) = (ExportFields::new(), std::collections::HashSet::new());
+        let safe = effective_parallel_safe(&recs, &cfg, &fields, &written);
+        assert_eq!(
+            (safe["first"], safe["second"], safe["third"]),
+            (true, false, false)
+        );
+        let wave = effective_wave(&recs, &cfg, &fields, &written);
+        assert_eq!(
+            (wave["first"], wave["second"], wave["third"]),
+            (Some(1), Some(9), None)
+        );
+    }
+
+    /// Only the field a write carried is on disk afterwards: a `wave` write leaves `parallel_safe` as the config had it, and the reverse.
+    #[test]
+    fn a_write_puts_on_disk_only_the_field_it_carried() {
+        let (cfg, recs) = three_exports();
+        let written: std::collections::HashSet<String> =
+            ["third".to_string()].into_iter().collect();
+        let only = |field: &'static str, value: &str| -> ExportFields {
+            [("third".to_string(), vec![(field, value.to_string())])]
+                .into_iter()
+                .collect()
+        };
+        let wave_only = only("wave", "6");
+        assert!(!effective_parallel_safe(&recs, &cfg, &wave_only, &written)["third"]);
+        assert_eq!(
+            effective_wave(&recs, &cfg, &wave_only, &written)["third"],
+            Some(6)
+        );
+        let safe_only = only("parallel_safe", "true");
+        assert!(effective_parallel_safe(&recs, &cfg, &safe_only, &written)["third"]);
+        assert_eq!(
+            effective_wave(&recs, &cfg, &safe_only, &written)["third"],
+            None
+        );
+    }
+
+    /// The annotations land in the config file itself, and the names returned are the ones that matched a `- name:` line.
+    #[test]
+    fn the_annotations_are_written_into_the_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rivet.yaml");
+        std::fs::write(&path, "exports:\n  - name: orders\n    mode: full\n").unwrap();
+        let config = path.to_str().unwrap();
+        let written =
+            super::write_plan_fields_to_config(config, &wave_fields(&[("orders", 3), ("gone", 1)]))
+                .unwrap();
+        assert_eq!(
+            written.into_iter().collect::<Vec<_>>(),
+            ["orders".to_string()]
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "exports:\n  - name: orders\n    wave: 3\n    mode: full\n"
+        );
+        let missing = dir.path().join("absent.yaml");
+        let err = super::write_plan_fields_to_config(
+            missing.to_str().unwrap(),
+            &wave_fields(&[("orders", 3)]),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().starts_with("cannot read config '"),
+            "{err:#}"
+        );
+    }
+
+    /// The field lands two columns past the dash at any list indent.
+    #[test]
+    fn wave_annotations_follow_the_indent_of_the_list() {
+        let annotated =
+            |yaml: &str| apply_field_annotations(yaml, &wave_fields(&[("orders", 2)])).0;
+        assert_eq!(
+            annotated("exports:\n- name: orders\n  wave: 9\n  mode: full\n"),
+            "exports:\n- name: orders\n  wave: 2\n  mode: full\n"
+        );
+        assert_eq!(
+            annotated("exports:\n      - name: orders\n        wave: 9\n        mode: full\n"),
+            "exports:\n      - name: orders\n        wave: 2\n        mode: full\n"
+        );
+    }
+
+    /// A blank line or a comment at any indent does not end the export, so a stale field after it is still replaced; the next top-level key does end it.
+    #[test]
+    fn a_blank_line_or_a_comment_does_not_end_the_export_block() {
+        let yaml = "exports:\n  - name: orders\n\n# tuned by hand\n    wave: 9\n    mode: full\n\
+                    other:\n    wave: 5\n";
+        let (out, written) = apply_field_annotations(yaml, &wave_fields(&[("orders", 2)]));
+        assert_eq!(written.len(), 1);
+        assert_eq!(
+            out,
+            "exports:\n  - name: orders\n    wave: 2\n\n# tuned by hand\n    mode: full\n\
+             other:\n    wave: 5\n"
+        );
+    }
+
+    /// A quoted export name is read as its bare name, in either quote style and before a trailing comment; other lines are not names.
+    #[test]
+    fn a_quoted_export_name_is_read_as_its_bare_name() {
+        let parsed = |line: &str| super::parse_export_name(line);
+        assert_eq!(
+            parsed("  - name: \"orders\""),
+            Some((2, "orders".to_string()))
+        );
+        assert_eq!(
+            parsed("- name: 'daily orders'  # nightly"),
+            Some((0, "daily orders".to_string()))
+        );
+        assert_eq!(parsed("  - name: \"\""), None);
+        assert_eq!(parsed("    name: orders"), None);
+        let yaml = "exports:\n  - name: \"orders\"\n    mode: full\n";
+        let (out, written) = apply_field_annotations(yaml, &wave_fields(&[("orders", 2)]));
+        assert_eq!(written.len(), 1);
+        assert_eq!(
+            out,
+            "exports:\n  - name: \"orders\"\n    wave: 2\n    mode: full\n"
+        );
+    }
 }
