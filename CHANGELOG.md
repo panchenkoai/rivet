@@ -3,8 +3,8 @@
 ## Unreleased
 
 - **Fix: a PostgreSQL run through a transaction-mode pooler no longer leaves session settings
-  on the pooled server connection.** PostgreSQL batch connections only. Reproduced on rivet
-  0.31.0 behind pgBouncer 1.26.0 in transaction mode, with pool sizes 1 and 5.
+  on the pooled server connection.** PostgreSQL batch connections and `mode: cdc`. Reproduced
+  on rivet 0.31.0 behind pgBouncer 1.26.0 in transaction mode, with pool sizes 1 and 5.
   - **What was wrong in 0.30.0 and 0.31.0.** Each connection rivet opened for `run`, `check`,
     `plan`, `doctor`, `init`, a PostgreSQL state database and `rivet-mcp` sent
     `SET TimeZone = 'UTC'; SET DateStyle = 'ISO, MDY'; SET IntervalStyle = 'postgres';
@@ -18,6 +18,12 @@
       database whose default is `escape`: after one `rivet run`, another client's
       `bytea::text` came back in `hex`. A pooler that tracks fewer parameters hands on more
       of the four.
+    - `mode: cdc` had no pooler detection at all: every connection its `test_decoding` reader
+      opened sent the same four and `SET extra_float_digits = 3`, a refused run included (the
+      reader has set session formats since 0.19.1, by `git log`; measured on 0.31.0). Through
+      pgBouncer on a database whose defaults are `escape` and `extra_float_digits = 0`, one CDC
+      run left `bytea_output = hex` and `extra_float_digits = 3` on the pooled connection for
+      the pooler's other clients.
     - rivet's own output was correct.
   - **Now** a batch connection sends no session-level `SET`. The export, the bound and count
     probes of a run, the range and plan probes of `check` and `plan`, and the table
@@ -28,8 +34,19 @@
     `sql_standard` and `escape`).
     - Behind a pooler busy enough for 0.31.0 to detect it, the probes and `check` ran in the
       role's zone and formats while the export ran in UTC. They now read in UTC as well.
-    - `mode: cdc` is not covered: its `test_decoding` reader still sets its formats on its
-      own session. Connect a PostgreSQL CDC export to the server directly.
+    - `mode: cdc` sends no session-level `SET` either. Each read of the slot runs in a
+      transaction of its own that sets the four formats and `extra_float_digits = 3` with
+      `SET LOCAL` (two round trips more per read of the slot, which holds up to one part's
+      changes). On a direct connection the delivered changes are the same as in 0.31.0
+      (one window of inserts, updates and deletes over `float8`, `float4`, `timestamptz`,
+      `timestamp`, `date`, `bytea`, `interval` and `numeric`, read under a role whose defaults
+      are Asia/Tokyo, `German, DMY`, `sql_standard`, `escape` and `extra_float_digits = 0`).
+      - Checked by hand through pgBouncer 1.26.0 in transaction mode with one server
+        connection, in front of a `wal_level = logical` server: a refused run, a run that
+        read changes and a run that found none each left the five settings and their
+        `pg_settings.source` as they were, on the same backend. The test suite covers a
+        refused capture through the pooler and, offline, the statements the reader sends;
+        it has no pooler in front of a logical server.
     - A setting an earlier release left behind stays on the pooled server connection until
       the pooler closes it (pgBouncer: `server_lifetime`, one hour by default) or is restarted.
 - **Fix: a `query:` holding a non-ASCII character no longer ends the run in a panic.**
