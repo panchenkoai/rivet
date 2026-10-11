@@ -200,6 +200,8 @@ mod live_mysql_resume;
 mod live_mysql_retry_and_faults;
 #[path = "live/live_mysql_schema_drift.rs"]
 mod live_mysql_schema_drift;
+#[path = "live/live_non_ascii_query.rs"]
+mod live_non_ascii_query;
 #[path = "live/live_oltp_load.rs"]
 mod live_oltp_load;
 #[path = "live/live_operator_contract.rs"]
