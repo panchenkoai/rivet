@@ -44,3 +44,10 @@ path = "fuzz_targets/spill_frame_decode.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "sql_query_text"
+path = "fuzz_targets/sql_query_text.rs"
+test = false
+doc = false
+bench = false

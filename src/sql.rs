@@ -116,12 +116,13 @@ pub(crate) fn strip_simple_projection_from(base_query: &str) -> Option<&str> {
 
 /// Byte offset of the first whitespace/boundary-delimited `from` keyword
 /// (ASCII case-insensitive), or `None`. Only meaningful once the preceding text
-/// is known paren/quote-free (see [`strip_simple_projection_from`]).
+/// is known paren/quote-free (see [`strip_simple_projection_from`]). The keyword
+/// is matched on bytes, so the offset and the byte after the keyword are char boundaries.
 fn find_from_keyword(s: &str) -> Option<usize> {
     let bytes = s.as_bytes();
     let mut i = 0;
     while i + 4 <= bytes.len() {
-        if s[i..i + 4].eq_ignore_ascii_case("from")
+        if bytes[i..i + 4].eq_ignore_ascii_case(b"from")
             && (i == 0 || bytes[i - 1].is_ascii_whitespace())
             && (i + 4 == bytes.len() || bytes[i + 4].is_ascii_whitespace())
         {
@@ -174,12 +175,10 @@ fn parse_bare_table_ident(after_from: &str) -> Option<&str> {
     Some(ident)
 }
 
+/// `s` without its leading `prefix` (ASCII case-insensitive); `None` when `s` does not start with it.
 fn strip_prefix_ascii_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-    if s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
-        Some(&s[prefix.len()..])
-    } else {
-        None
-    }
+    let (head, rest) = s.split_at_checked(prefix.len())?;
+    head.eq_ignore_ascii_case(prefix).then_some(rest)
 }
 
 /// `SELECT <agg>(<col>) FROM …` for `agg` in {`min`, `max`, `count`, …}, with
@@ -749,5 +748,200 @@ mod tests {
         // skipped (None), never a misleading density figure.
         assert!(row_estimate_sql(SourceType::Mysql, "warranty").is_none());
         assert!(row_estimate_sql(SourceType::Mysql, "shop.warranty").is_none());
+    }
+
+    /// [`find_from_keyword`] as 0.31.0 spelled it: defined for ASCII text only.
+    fn find_from_keyword_before(s: &str) -> Option<usize> {
+        let bytes = s.as_bytes();
+        (0..bytes.len().saturating_sub(3)).find(|&i| {
+            s[i..i + 4].eq_ignore_ascii_case("from")
+                && (i == 0 || bytes[i - 1].is_ascii_whitespace())
+                && (i + 4 == bytes.len() || bytes[i + 4].is_ascii_whitespace())
+        })
+    }
+
+    /// [`strip_prefix_ascii_ci`] as 0.31.0 spelled it: defined for ASCII text only.
+    fn strip_prefix_ascii_ci_before<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+        if s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
+            Some(&s[prefix.len()..])
+        } else {
+            None
+        }
+    }
+
+    /// Query-shaped text: SQL words and punctuation in any order, with multi-byte characters among them when `non_ascii`.
+    fn query_text(non_ascii: bool) -> impl proptest::strategy::Strategy<Value = String> {
+        use proptest::strategy::Strategy as _;
+        let mut pieces = vec![
+            "select", "SELECT", "from", "FROM", "From", "with", "as", "where", " ", "  ", "\t",
+            "\n", "*", ",", ".", ";", "(", ")", "'", "\"", "`", "[", "]", "/*", "*/", "--", "t",
+            "id", "a.b", "_x", "1", "$", "#", "fro", "sel",
+        ];
+        if non_ascii {
+            pieces.extend([
+                "\u{e9}",
+                "\u{446}",
+                "\u{2014}",
+                "\u{1f600}",
+                "\u{a0}",
+                "\u{3000}",
+            ]);
+        }
+        proptest::collection::vec(proptest::sample::select(pieces), 0..14).prop_map(|p| p.concat())
+    }
+
+    const SQL_ENGINES: [SourceType; 4] = [
+        SourceType::Postgres,
+        SourceType::Mysql,
+        SourceType::Mssql,
+        SourceType::Oracle,
+    ];
+
+    /// Every recogniser and SQL builder of this module over `query`; a panic is the failure.
+    fn recognise_everything(query: &str) {
+        let _ = strip_select_star_from(query);
+        let _ = strip_simple_projection_from(query);
+        let _ = row_set(query);
+        let _ = outer_from_relation(query);
+        for engine in SQL_ENGINES {
+            let _ = aggregate_sql(engine, "min", "id", query);
+            let _ = null_key_probe_sql(engine, "id", query);
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig {
+            cases: 2048, ..Default::default()
+        })]
+
+        #[test]
+        fn no_recogniser_panics_on_any_query_text(
+            query in proptest::prop_oneof![
+                query_text(true),
+                proptest::prelude::any::<String>(),
+            ],
+        ) {
+            recognise_everything(&query);
+            if let Some(at) = find_from_keyword(&query) {
+                proptest::prop_assert!(
+                    query.is_char_boundary(at) && query.is_char_boundary(at + 4),
+                    "{query:?}: {at}"
+                );
+            }
+        }
+
+        #[test]
+        fn ascii_query_text_is_recognised_as_before(
+            query in proptest::prop_oneof![query_text(false), "[ -~\\t\\n]{0,40}"],
+        ) {
+            proptest::prop_assert_eq!(
+                find_from_keyword(&query),
+                find_from_keyword_before(&query),
+                "{:?}", query
+            );
+            for prefix in ["select", "from"] {
+                proptest::prop_assert_eq!(
+                    strip_prefix_ascii_ci(&query, prefix),
+                    strip_prefix_ascii_ci_before(&query, prefix),
+                    "{:?} / {}", query, prefix
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_from_keyword_is_found_at_the_same_offset_around_multi_byte_text() {
+        for (text, at) in [
+            ("a from t", Some(2)),
+            ("from t", Some(0)),
+            ("a FROM", Some(2)),
+            ("a\tFrOm\nt", Some(2)),
+            ("afrom t", None),
+            ("a fromt", None),
+            ("fro", None),
+            ("", None),
+            ("caf\u{e9} from t", Some(6)),
+            ("'\u{43a}\u{43e}\u{444}\u{435}' AS x FROM t", Some(16)),
+            ("\u{1f600} from\tt", Some(5)),
+            ("\u{e9}", None),
+            ("\u{e9}from t", None),
+            ("a from\u{e9}", None),
+            ("a\u{a0}from t", None),
+            ("a from\u{a0}t", None),
+            ("\u{2014}\u{2014}\u{2014}", None),
+        ] {
+            assert_eq!(find_from_keyword(text), at, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn a_keyword_prefix_is_stripped_only_from_text_that_starts_with_it() {
+        for (text, prefix, rest) in [
+            ("select x", "select", Some(" x")),
+            ("SeLeCt", "select", Some("")),
+            ("FROM\u{e9}", "from", Some("\u{e9}")),
+            ("selec", "select", None),
+            ("", "select", None),
+            ("selec\u{e9}", "select", None),
+            ("\u{e9}select", "select", None),
+            ("WITH \u{e9} AS", "select", None),
+            ("/* \u{446}\u{435}\u{43d}\u{430} */", "select", None),
+            (", '\u{e9}t\u{e9}'", "from", None),
+            ("fro\u{2014}", "from", None),
+        ] {
+            assert_eq!(
+                strip_prefix_ascii_ci(text, prefix),
+                rest,
+                "{text:?} / {prefix}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_query_holding_multi_byte_text_is_never_read_as_the_bare_table() {
+        for query in [
+            "SELECT g AS id, 'caf\u{e9}' AS label FROM generate_series(1, 100) AS g",
+            "WITH \u{e9} AS (SELECT 1 AS id) SELECT id FROM \u{e9}",
+            "/* \u{446}\u{435}\u{43d}\u{430} */ SELECT 1 AS id",
+            "/* ab\u{e9} */ SELECT * FROM orders",
+            "SELECT *, '\u{e9}t\u{e9}' AS label FROM orders",
+            "SELECT id, '\u{e9}t\u{e9}' AS label FROM orders",
+            "SELECT id, /* \u{446}\u{435}\u{43d}\u{430} */ name FROM orders",
+            "SELECT id, caf\u{e9} FROM orders",
+            "SELECT * FROM caf\u{e9}",
+            "SELECT id FROM caf\u{e9}",
+            "SELECT * FROM orders -- \u{2014}",
+        ] {
+            assert_eq!(strip_select_star_from(query), None, "{query}");
+            assert_eq!(strip_simple_projection_from(query), None, "{query}");
+            assert_eq!(
+                aggregate_sql(SourceType::Postgres, "min", "id", query),
+                format!("SELECT min(\"id\") AS rivet_agg FROM ({query}) AS _rivet"),
+            );
+            assert_eq!(
+                null_key_probe_sql(SourceType::Mysql, "id", query),
+                format!("SELECT 1 FROM ({query}) AS _rivet_nullprobe WHERE `id` IS NULL LIMIT 1"),
+            );
+        }
+    }
+
+    #[test]
+    fn multi_byte_text_after_the_table_form_leaves_the_ascii_decision_alone() {
+        assert_eq!(
+            strip_select_star_from("SELECT * FROM orders\u{3000}"),
+            strip_select_star_from("SELECT * FROM orders ")
+        );
+        assert_eq!(
+            strip_simple_projection_from("SELECT id FROM orders WHERE note = '\u{e9}'"),
+            strip_simple_projection_from("SELECT id FROM orders WHERE note = 'e'")
+        );
+        assert_eq!(
+            outer_from_relation("SELECT '\u{e9}' x FROM caf\u{e9}.\"t \u{2014}\" o"),
+            Some("caf\u{e9}.t \u{2014}".to_string())
+        );
+        assert_eq!(
+            row_set("SELECT '\u{e9}' FROM \u{446} WHERE a = '\u{2014}  B'"),
+            "from ? where a = '\u{2014}  B'"
+        );
     }
 }

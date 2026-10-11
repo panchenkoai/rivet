@@ -1252,3 +1252,41 @@ seeds:
         cells: [a_load_that_cannot_open_its_lease_keeper_refuses_twice_then_loads]
       sqlite-state:
         na: the SQLite lease is an flock on a sidecar file, held by its descriptor until the holder ends - nothing renews it and no connection can fail to open
+  - name: query-prefix-cut-mid-character
+    class: a query recogniser slices the query text at a keyword's byte length, inside a multi-byte character, and the run ends in a panic instead of reading the query
+    history: "2026-10-11: `/* <Cyrillic> */ SELECT 1 AS id` and `WITH <e-acute> AS (...) SELECT ...` in `mode: full` ended with exit 101 and 0 files on main and v0.31.0 (`byte index 6 is not a char boundary`); every request tries the query for `SELECT * FROM t`"
+    scope: source
+    patch: query-prefix-cut-mid-character/shared.patch
+    engines:
+      postgres:
+        cells: [a_query_opening_with_non_ascii_text_delivers_its_rows_postgres]
+      mysql:
+        cells: [a_query_opening_with_non_ascii_text_delivers_its_rows_mysql]
+      mssql:
+        cells: [a_query_opening_with_non_ascii_text_delivers_its_rows_mssql]
+      oracle:
+        cells: [a_query_opening_with_non_ascii_text_delivers_its_rows_oracle]
+      mongo:
+        cells: [a_query_opening_with_non_ascii_text_is_refused_like_its_ascii_spelling_mongo]
+      lib:
+        cells:
+          - "lib:a_keyword_prefix_is_stripped_only_from_text_that_starts_with_it"
+  - name: projection-scan-cut-mid-character
+    class: the chunked planner scans a query's projection for `FROM` by slicing four bytes at every offset, inside a multi-byte character, and the run ends in a panic instead of planning
+    history: "2026-10-11: `SELECT g AS id, 'caf<e-acute>' AS label FROM generate_series(1, 100) AS g` with `chunk_column: id` ended with exit 101 and 0 files on main and v0.31.0 (`byte index 14 is not a char boundary`); the ASCII spelling delivered 100 rows"
+    scope: source
+    patch: projection-scan-cut-mid-character/shared.patch
+    engines:
+      postgres:
+        cells: [a_chunked_query_holding_non_ascii_text_delivers_its_rows_postgres]
+      mysql:
+        cells: [a_chunked_query_holding_non_ascii_text_delivers_its_rows_mysql]
+      mssql:
+        cells: [a_chunked_query_holding_non_ascii_text_delivers_its_rows_mssql]
+      oracle:
+        cells: [a_chunked_query_holding_non_ascii_text_delivers_its_rows_oracle]
+      mongo:
+        na: "chunked mode is rejected for MongoDB at config validation - there is no SQL projection to scan"
+      lib:
+        cells:
+          - "lib:the_from_keyword_is_found_at_the_same_offset_around_multi_byte_text"

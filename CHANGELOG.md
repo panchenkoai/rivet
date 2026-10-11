@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+- **Fix: a `query:` holding a non-ASCII character no longer ends the run in a panic.**
+  Applies to every source engine. Reproduced on rivet 0.31.0 with PostgreSQL, MySQL,
+  SQL Server and MongoDB.
+  - **What was wrong in 0.31.0 and earlier.** Two readers of the query text cut it at a
+    byte offset, and a cut inside a multi-byte character stopped the process: exit 101,
+    `byte index N is not a char boundary`, on every run.
+    - Every export, in every mode: a multi-byte character across byte 6 of the query (a
+      comment or a CTE name that opens it: `/* <non-ASCII comment> */ SELECT ...`,
+      `WITH é AS (...) SELECT ...`), or across byte 4 of what follows `SELECT *`
+      (`SELECT *, 'été' AS label FROM t`). On MongoDB the same text crashed in place of the
+      refusal a hand-written `query:` gets there.
+    - Range-chunked exports (`chunk_column`), and the value-partition and split planners
+      that probe a query's bounds the same way: any non-ASCII character before the
+      query's first `FROM` (`SELECT id, 'café' AS label FROM t`).
+    - A non-ASCII character anywhere else (a `WHERE` literal, a table name after `FROM`)
+      was read correctly.
+    - Nothing was written to the destination: no part, no manifest, no `_SUCCESS`, no run
+      summary. The state database kept one `run_status` row in `running` for each crashed
+      run and the export's schema baseline.
+    - The cut at the query's start dates from 0.6.0 and every export's query has gone
+      through it since 0.18.0; the scan for `FROM` dates from 0.16.0.
+  - **Now** both readers compare bytes and never cut the text inside a character. Such a
+    query runs and delivers what its ASCII spelling delivers; on MongoDB it is refused by
+    name like any `query:`. An export that crashed needs nothing but the upgrade: run after
+    two crashes of 0.31.0 on the same state, this build exited 0 and delivered every row.
+    The `running` rows the crashes left stay in `run_status`, behind the newer run.
+  - **Unchanged:** what is recognised in an ASCII query. The `SELECT * FROM t` and plain
+    column-list shortcuts, the position of the outer `FROM` and every SQL text rivet builds
+    from a query are byte-identical for 575,270 query texts that did not crash before
+    (568,212 of them ASCII), compared between the previous code and this one. A query with a
+    non-ASCII identifier (`SELECT id, café FROM t`) is not taken for the bare-table
+    shortcut: its bounds are read from the query, wrapped as `FROM (<query>) AS _rivet`.
+
 - **`rivet load --pool N` keeps at most 16 storage requests in flight for the whole
   process.** Every table loaded at once used to send its storage requests (list, read,
   delete) with no shared limit, each request in flight on a connection of its own: a load

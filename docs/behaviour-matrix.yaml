@@ -72,3 +72,11 @@ scenarios:
     mssql:    { na: "engine-agnostic — see the postgres cell" }
     mongo:    { na: "engine-agnostic — see the postgres cell" }
     oracle:   { na: "engine-agnostic — see the postgres cell" }
+
+  - id: query_text_non_ascii
+    what: "query: opens with non-ASCII text (a comment, a CTE name, a literal right after `SELECT *`) — every request reads the query's first bytes for its table form; mode: full delivers the rows and the literal of the same query spelled in ASCII"
+    postgres: { test: a_query_opening_with_non_ascii_text_delivers_its_rows_postgres }
+    mysql:    { test: a_query_opening_with_non_ascii_text_delivers_its_rows_mysql }
+    mssql:    { test: a_query_opening_with_non_ascii_text_delivers_its_rows_mssql }
+    mongo:    { test: a_query_opening_with_non_ascii_text_is_refused_like_its_ascii_spelling_mongo }
+    oracle:   { test: a_query_opening_with_non_ascii_text_delivers_its_rows_oracle }

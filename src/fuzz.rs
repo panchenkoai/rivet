@@ -8,7 +8,7 @@
 //! Scope note: Rivet's genuinely untrusted *text/binary parse* surface is
 //! narrow. MySQL and SQL Server CDC decode the **binary** wire protocol inside
 //! their driver crates (not Rivet code); the Parquet path only *writes* from
-//! already-typed Arrow (it never parses untrusted Parquet). The three parsers
+//! already-typed Arrow (it never parses untrusted Parquet). The parsers
 //! below are the real Rivet-owned surface.
 
 /// Config YAML parser. The operator-authored config is only semi-trusted, but a
@@ -48,4 +48,20 @@ pub fn mongo_resume_token(data: &[u8]) {
 /// holds the whole frame surface to "Err, never panic".
 pub fn spill_frame_decode(data: &[u8]) {
     let _ = crate::source::cdc::spill::decode_event(data);
+}
+
+/// Query-text recognisers — the operator-authored `query:` every export is read through: the table-form and plain-projection shortcuts, the outer `FROM` relation, the row-set text and the preflight relation scan. Any UTF-8 text is recognised or declined, never a panic.
+pub fn sql_query_text(data: &[u8]) {
+    use crate::config::SourceType::{Mssql, Mysql, Oracle, Postgres};
+    let Ok(query) = std::str::from_utf8(data) else {
+        return;
+    };
+    let _ = crate::sql::strip_select_star_from(query);
+    let _ = crate::sql::row_set(query);
+    let _ = crate::sql::outer_from_relation(query);
+    let _ = crate::preflight::table_from_simple_query(query);
+    for engine in [Postgres, Mysql, Mssql, Oracle] {
+        let _ = crate::sql::aggregate_sql(engine, "min", "id", query);
+        let _ = crate::sql::null_key_probe_sql(engine, "id", query);
+    }
 }
