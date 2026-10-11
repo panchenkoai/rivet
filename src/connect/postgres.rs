@@ -69,6 +69,9 @@ fn pg_config_ssl_forced(url: &str) -> Result<postgres::Config> {
 const TXN_FORMATS: &str = "SET LOCAL TimeZone = 'UTC'; SET LOCAL DateStyle = 'ISO, MDY'; \
      SET LOCAL IntervalStyle = 'postgres'; SET LOCAL bytea_output = 'hex'";
 
+/// The fifth format, for a reader of the server's own text of a value: a float in its shortest exact form.
+const EXACT_FLOAT_TEXT: &str = "; SET LOCAL extra_float_digits = 3";
+
 /// An open transaction that reads under [`TXN_FORMATS`]; dropped uncommitted, it rolls back.
 pub(crate) struct PgTxnGuard<'a> {
     client: &'a mut Client,
@@ -78,11 +81,20 @@ pub(crate) struct PgTxnGuard<'a> {
 impl<'a> PgTxnGuard<'a> {
     /// `BEGIN` and the formats in one round trip.
     pub(crate) fn begin(client: &'a mut Client) -> std::result::Result<Self, postgres::Error> {
+        Self::begin_with(client, "")
+    }
+
+    /// `BEGIN`, the formats and `more` (a further `SET LOCAL`, led by `; `) in one round trip.
+    fn begin_with(
+        client: &'a mut Client,
+        more: &str,
+    ) -> std::result::Result<Self, postgres::Error> {
         let txn = Self {
             client,
             committed: false,
         };
-        txn.client.batch_execute(&format!("BEGIN; {TXN_FORMATS}"))?;
+        txn.client
+            .batch_execute(&format!("BEGIN; {TXN_FORMATS}{more}"))?;
         Ok(txn)
     }
 
@@ -112,7 +124,24 @@ pub(crate) fn read_pinned<T>(
     client: &mut Client,
     read: impl FnOnce(&mut Client) -> std::result::Result<T, postgres::Error>,
 ) -> std::result::Result<T, postgres::Error> {
-    let mut txn = PgTxnGuard::begin(client)?;
+    read_under(client, "", read)
+}
+
+/// [`read_pinned`] with floats in their shortest exact text too, for a read whose values arrive as the server's text (`test_decoding`).
+pub(crate) fn read_pinned_text<T>(
+    client: &mut Client,
+    read: impl FnOnce(&mut Client) -> std::result::Result<T, postgres::Error>,
+) -> std::result::Result<T, postgres::Error> {
+    read_under(client, EXACT_FLOAT_TEXT, read)
+}
+
+/// Run `read` between `BEGIN` with the formats and `more`, and `COMMIT`; a failed read rolls back.
+fn read_under<T>(
+    client: &mut Client,
+    more: &str,
+    read: impl FnOnce(&mut Client) -> std::result::Result<T, postgres::Error>,
+) -> std::result::Result<T, postgres::Error> {
+    let mut txn = PgTxnGuard::begin_with(client, more)?;
     let out = read(txn.client_mut())?;
     txn.commit()?;
     Ok(out)
@@ -137,12 +166,11 @@ pub(crate) fn connect_client(url: &str, tls: Option<&TlsConfig>) -> Result<Clien
     }
 }
 
+/// An in-process PostgreSQL server that records what one client sends.
 #[cfg(test)]
-mod tests {
-    use super::pg_config_ssl_forced;
-
-    /// A PostgreSQL server for one client: every simple query is answered (with an error when it says `fail`), and the queries are handed over when the client leaves.
-    fn recording_server() -> (String, std::sync::mpsc::Receiver<Vec<String>>) {
+pub(crate) mod wire_recorder {
+    /// A PostgreSQL server for one client: every simple query is answered (with an error when it says `fail`); a prepared statement is recorded and the connection closed. The statements are handed over when the client leaves.
+    pub(crate) fn recording_server() -> (String, std::sync::mpsc::Receiver<Vec<String>>) {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!(
@@ -167,10 +195,16 @@ mod tests {
             conn.write_all(ready).unwrap();
             let mut seen = Vec::new();
             let mut tag = [0u8; 1];
-            while conn.read_exact(&mut tag).is_ok() && tag[0] == b'Q' {
+            while conn.read_exact(&mut tag).is_ok() && matches!(tag[0], b'Q' | b'P') {
                 let Some(body) = read_body(&mut conn) else {
                     break;
                 };
+                if tag[0] == b'P' {
+                    // Parse: the statement name, then the statement text.
+                    let text = body.split(|b| *b == 0).nth(1).unwrap_or_default();
+                    seen.push(String::from_utf8_lossy(text).to_string());
+                    break;
+                }
                 let sql = String::from_utf8_lossy(&body[..body.len() - 1]).to_string();
                 let answer: &[u8] = if sql.contains("fail") {
                     b"E\0\0\0\x1cSERROR\0CXX000\0Mrefused\0\0"
@@ -187,14 +221,26 @@ mod tests {
     }
 
     /// The queries the server was sent, once the client has left.
-    fn sent(queries: std::sync::mpsc::Receiver<Vec<String>>) -> Vec<String> {
+    pub(crate) fn sent(queries: std::sync::mpsc::Receiver<Vec<String>>) -> Vec<String> {
         queries
             .recv_timeout(std::time::Duration::from_secs(15))
             .expect("the server reports its queries")
     }
 
-    const BEGIN_PINNED: &str = "BEGIN; SET LOCAL TimeZone = 'UTC'; SET LOCAL DateStyle = 'ISO, MDY'; \
+    /// What opens a pinned read.
+    pub(crate) const BEGIN_PINNED: &str = "BEGIN; SET LOCAL TimeZone = 'UTC'; SET LOCAL DateStyle = 'ISO, MDY'; \
          SET LOCAL IntervalStyle = 'postgres'; SET LOCAL bytea_output = 'hex'";
+
+    /// What opens a pinned read of the server's text of a value.
+    pub(crate) const BEGIN_PINNED_TEXT: &str = "BEGIN; SET LOCAL TimeZone = 'UTC'; SET LOCAL DateStyle = 'ISO, MDY'; \
+         SET LOCAL IntervalStyle = 'postgres'; SET LOCAL bytea_output = 'hex'; \
+         SET LOCAL extra_float_digits = 3";
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pg_config_ssl_forced;
+    use super::wire_recorder::{BEGIN_PINNED, BEGIN_PINNED_TEXT, recording_server, sent};
 
     #[test]
     fn the_dial_sends_no_statement() {
@@ -211,6 +257,25 @@ mod tests {
         assert_eq!(read.unwrap(), 7);
         drop(client);
         assert_eq!(sent(queries), [BEGIN_PINNED, "SELECT 1", "COMMIT"]);
+    }
+
+    #[test]
+    fn a_pinned_text_read_sets_exact_floats_as_the_fifth_format_and_commits() {
+        let (url, queries) = recording_server();
+        let mut client = super::connect_client(&url, None).unwrap();
+        let read =
+            super::read_pinned_text(&mut client, |c| c.batch_execute("SELECT 1").map(|()| 7));
+        assert_eq!(read.unwrap(), 7);
+        drop(client);
+        assert_eq!(sent(queries), [BEGIN_PINNED_TEXT, "SELECT 1", "COMMIT"]);
+    }
+
+    #[test]
+    fn a_prepared_statement_is_recorded_and_left_unanswered() {
+        let (url, queries) = recording_server();
+        let mut client = super::connect_client(&url, None).unwrap();
+        assert!(client.query("SELECT $1::int", &[&1i32]).is_err());
+        assert_eq!(sent(queries), ["SELECT $1::int"]);
     }
 
     #[test]

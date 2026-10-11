@@ -253,14 +253,13 @@ and the range and plan probes of `check` and `plan`. Stored values are unaffecte
 For the server's local day, say so explicitly: `(ts AT TIME ZONE 'Europe/Kyiv')::date`.
 
 rivet sets the four with `SET LOCAL` inside the transaction that reads, on a direct connection
-and behind a pooler alike, and sends no session-level `SET` on a batch connection. Behind a
-transaction-mode pooler (pgBouncer, Odyssey) the server connection goes back to the pool with
+and behind a pooler alike, and sends no session-level `SET`, in a batch run or in `mode: cdc`.
+Behind a transaction-mode pooler (pgBouncer, Odyssey) the server connection goes back to the pool with
 every setting as rivet found it.
 
-The exception is `mode: cdc`. Its `test_decoding` reader sets the formats it parses
-(`DateStyle`, `bytea_output`, `IntervalStyle`, `extra_float_digits`, `TimeZone`) on its own
-session, and behind a transaction-mode pooler they stay on the server connection. Connect a
-PostgreSQL CDC export to the server directly.
+`mode: cdc` reads the slot the same way. Its `test_decoding` reader parses the server's text of
+every value, so each read of the slot runs in a transaction of its own that sets the four formats
+and `extra_float_digits = 3` with `SET LOCAL`.
 
 ## What "passes" means per target
 
