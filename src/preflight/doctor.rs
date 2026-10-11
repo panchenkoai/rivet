@@ -1509,4 +1509,42 @@ exports:
             "doctor: one or more preflight checks failed (see output above)"
         );
     }
+
+    /// A CDC health check that fails for good, behind a source that failed for good and a destination that answers, is not reported as worth a retry.
+    #[test]
+    fn a_permanent_cdc_health_failure_is_not_reported_as_transient() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = format!(
+            r#"
+source:
+  type: postgres
+  url_env: RIVET_DOCTOR_PERMANENT_CDC_UNSET_URL_ENV
+exports:
+  - name: t
+    table: t
+    mode: cdc
+    format: parquet
+    cdc: {{ checkpoint: ./t.ckpt }}
+    destination:
+      type: local
+      path: "{}"
+"#,
+            dir.path().join("out").display(),
+        );
+        let config_path = dir.path().join("rivet.yaml");
+        std::fs::write(&config_path, yaml).unwrap();
+        let config = Config::load(config_path.to_str().unwrap()).expect("the config loads");
+        let cdc = crate::preflight::cdc_health::collect(&config, dir.path());
+        assert!(
+            cdc.iter().any(|c| !c.ok && c.detail.is_some()),
+            "fixture: a failed CDC health check with a detail: {cdc:?}"
+        );
+
+        let err =
+            doctor(config_path.to_str().unwrap(), true).expect_err("the source URL is not set");
+        assert_eq!(
+            format!("{err:#}"),
+            "doctor: one or more preflight checks failed (see output above)"
+        );
+    }
 }

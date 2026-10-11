@@ -715,6 +715,18 @@ def _self_test() -> int:
     assert perf_verdict("postgres", base, Sample(True, 1.05, 0.05, 50 * 1024 * 1024, {})) == []
     assert perf_verdict("postgres", base, Sample(True, 2.0, 0.02, 50 * 1024 * 1024, {}))
     assert perf_verdict("postgres", base, Sample(True, 1.0, 0.02, 200 * 1024 * 1024, {}))
+    # A path under a second is measured more often: three runs of a two-mode wall can all be the slow mode.
+    from .perf import REPS, SHORT_REPS, SHORT_WALL, measured_reps
+    assert (measured_reps(SHORT_WALL - 0.01), measured_reps(SHORT_WALL)) == (SHORT_REPS, REPS) and SHORT_REPS >= 3 * REPS
+    # A best run no slower than the previous release's median run is the slow mode of the same wall, not a regression.
+    from .perf import _best
+    runs = [Sample(True, w, 0.02, 50 * 1024 * 1024, {}) for w in (0.14, 0.44, 0.38, 0.40, 0.14)]
+    two_modes = _best(runs)
+    assert (two_modes.wall, two_modes.typical) == (0.14, 0.38), two_modes
+    assert perf_verdict("postgres", two_modes, Sample(True, 0.38, 0.02, 50 * 1024 * 1024, {})) == []
+    assert perf_verdict("postgres", two_modes, Sample(True, 0.42, 0.02, 50 * 1024 * 1024, {})) == [
+        "wall 0.42s > 0.14s×1.5 and its median 0.38s"]
+    assert perf_verdict("postgres", _best(runs[:1] + runs[-1:] + runs[1:2]), Sample(True, 0.38, 0.02, 50 * 1024 * 1024, {}))
     # A plan evicted between the two SQL Server readings takes nothing away from the run's
     # own reads; an unanswered reading is not a measurement; rivet's report yields to it.
     from .perf import measured_harm

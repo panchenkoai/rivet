@@ -51,7 +51,11 @@ const DEFAULT_ENDPOINT: &str = "https://bigquery.googleapis.com";
 /// Per-request ceiling. Generous: a `LOAD DATA` insert only ENQUEUES the job
 /// (the wait happens in the poll loop), but a large statement body plus a slow
 /// link should not trip a short timeout.
+#[cfg(not(test))]
 const HTTP_TIMEOUT: Duration = Duration::from_secs(120);
+/// One second in the unit tests, where a request is watched reaching the ceiling.
+#[cfg(test)]
+const HTTP_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Poll backoff bounds. Starts tight so a metadata `COUNT(*)` (sub-second)
 /// returns promptly, and widens so a multi-minute load costs a handful of
@@ -980,6 +984,32 @@ pub(crate) fn kind_of_resource(meta: Option<&Value>) -> Result<super::ObjectKind
 
 #[cfg(test)]
 mod tests {
+    /// A request through the shared client ends at `HTTP_TIMEOUT`: a server that accepts and never answers is not waited on past it, nor given up on before it.
+    #[test]
+    fn the_shared_client_gives_up_on_a_silent_server_at_the_http_timeout() {
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a silent port");
+        let url = format!("http://{}/", silent.local_addr().unwrap());
+        let http = super::shared_http().expect("the shared client");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let asked = std::time::Instant::now();
+        std::thread::spawn(move || {
+            tx.send(http.get(url).send().map(drop).map_err(|e| e.is_timeout()))
+        });
+        let answer = rx
+            .recv_timeout(super::HTTP_TIMEOUT * 10)
+            .expect("the request is still waiting at ten times HTTP_TIMEOUT");
+        assert_eq!(
+            answer,
+            Err(true),
+            "a silent server ends the request by its timeout"
+        );
+        assert!(
+            asked.elapsed() >= super::HTTP_TIMEOUT,
+            "the request ended {:?} after it was sent, before HTTP_TIMEOUT",
+            asked.elapsed()
+        );
+    }
+
     /// A clone is a `TABLE` to `tables.get`; a snapshot, an external table and a materialized view are none of rivet's kinds.
     #[test]
     fn a_table_resource_names_its_kind_and_no_resource_is_a_free_name() {

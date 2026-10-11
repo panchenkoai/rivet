@@ -829,6 +829,73 @@ fn every_batch_shape_through_a_transaction_pooler_leaves_its_session_as_it_was_p
     }
 }
 
+/// Drops its PostgreSQL role on the main stand when the cell ends.
+struct ScratchRole(String);
+
+impl Drop for ScratchRole {
+    fn drop(&mut self) {
+        let _ = pg_connect().batch_execute(&format!("DROP ROLE IF EXISTS {}", self.0));
+    }
+}
+
+/// docs/reference/compatibility.md: rivet's connection prints UTC, ISO dates, postgres intervals and hex bytea,
+/// whatever the role defaults are. A role whose own session prints none of the four exports the text its query casts.
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn the_text_a_query_casts_is_utc_iso_and_hex_whatever_the_role_defaults_postgres() {
+    require_alive(LiveService::Postgres);
+    let table = unique_name("guar_fmt");
+    let role = unique_name("rivet_fmt");
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "CREATE ROLE {role} LOGIN PASSWORD 'rivet';
+         ALTER ROLE {role} SET TimeZone = 'Asia/Tokyo';
+         ALTER ROLE {role} SET DateStyle = 'German, DMY';
+         ALTER ROLE {role} SET IntervalStyle = 'sql_standard';
+         ALTER ROLE {role} SET bytea_output = 'escape';"
+    ))
+    .unwrap();
+    let _role = ScratchRole(role.clone());
+    c.batch_execute(&format!(
+        "CREATE TABLE {table} (id INT PRIMARY KEY, ts TIMESTAMPTZ, d DATE, iv INTERVAL, b BYTEA);
+         INSERT INTO {table} VALUES (1, '2026-01-02 03:04:05+00', '2026-01-02', '1 day 02:03:04', '\\x0001ff');
+         GRANT SELECT ON {table} TO {role};"
+    ))
+    .unwrap();
+    let _tbl = PgTable::adopt(table.clone());
+    let url = format!("postgresql://{role}:rivet@127.0.0.1:5432/rivet");
+    let casts = "ts::text AS ts_text, d::text AS d_text, iv::text AS iv_text, b::text AS b_text";
+    let own: String = postgres::Client::connect(&url, postgres::NoTls)
+        .expect("connect as the role")
+        .query_one(
+            &format!("SELECT concat_ws('|', ts::text, d::text, iv::text, b::text) FROM {table}"),
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        own, "02.01.2026 12:04:05 JST|02.01.2026|1 2:03:04|\\000\\001\\377",
+        "fixture: the role's own session prints none of the pinned formats"
+    );
+
+    let rig = Rig::pg_batch(&format!("public.{table}"))
+        .source_url(&url)
+        .query(&format!("SELECT id, {casts} FROM {table}"));
+    rig.run_ok();
+    let (_, rows) = events(&files_with_extension(&rig.out_dir(), "parquet"));
+    assert_eq!(
+        rows,
+        vec![vec![
+            "1",
+            "2026-01-02 03:04:05+00",
+            "2026-01-02",
+            "1 day 02:03:04",
+            "\\x0001ff"
+        ]],
+        "the text the query casts follows the role's defaults, not UTC, ISO, postgres and hex"
+    );
+}
+
 /// The forwarder closes an answer at the next request, and one page is told from two.
 #[test]
 fn an_answer_ends_at_the_next_request_and_two_pages_are_not_one() {
