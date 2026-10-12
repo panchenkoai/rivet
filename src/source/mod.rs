@@ -478,6 +478,41 @@ pub(crate) fn value_within_ceiling(
     Ok(())
 }
 
+/// The keyset keys among a table's single-column unique-index columns, given as (column, is the primary key): the primary key's column first, each column once.
+pub(crate) fn keyset_keys_primary_first(columns: &[(String, bool)]) -> Vec<String> {
+    let mut keys: Vec<String> = Vec::new();
+    for primary in [true, false] {
+        for (col, is_primary) in columns {
+            if *is_primary == primary && !keys.contains(col) {
+                keys.push(col.clone());
+            }
+        }
+    }
+    keys
+}
+
+#[cfg(test)]
+mod keyset_key_order_tests {
+    use super::keyset_keys_primary_first;
+
+    #[test]
+    fn the_primary_key_comes_first_and_a_column_is_listed_once() {
+        let cols = |list: &[(&str, bool)]| -> Vec<(String, bool)> {
+            list.iter().map(|(c, p)| (c.to_string(), *p)).collect()
+        };
+        let keys = |list: &[(&str, bool)]| keyset_keys_primary_first(&cols(list));
+        assert_eq!(keys(&[("email", false), ("id", true)]), ["id", "email"]);
+        assert_eq!(keys(&[("id", true), ("email", false)]), ["id", "email"]);
+        assert_eq!(keys(&[("a", false), ("b", false)]), ["a", "b"]);
+        assert_eq!(
+            keys(&[("id", false), ("id", true), ("id", false)]),
+            ["id"],
+            "a column under two unique indexes is one key"
+        );
+        assert!(keys(&[]).is_empty());
+    }
+}
+
 #[cfg(test)]
 mod key_list_tests {
     use super::split_key_list;

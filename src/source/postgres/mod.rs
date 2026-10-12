@@ -252,6 +252,11 @@ fn pg_sample_checkpoints_req(client: &mut Client) -> Option<i64> {
 /// or bare `<table>` (resolved under `public`). It is split internally with
 /// the same strict rules as the `table:` YAML shortcut — anything more
 /// elaborate must use the explicit-column path.
+/// The heap bytes one row takes, from the planner's row estimate; none while the table has no estimate.
+fn avg_row_bytes(row_estimate: i64, rel_size_bytes: i64) -> Option<i64> {
+    (row_estimate > 0).then(|| rel_size_bytes / row_estimate)
+}
+
 fn introspect_pg_on(
     client: &mut Client,
     qualified_table: &str,
@@ -275,11 +280,7 @@ fn introspect_pg_on(
         }
         None => (0, 0),
     };
-    let avg_row_bytes = if row_estimate > 0 {
-        Some(rel_size_bytes / row_estimate)
-    } else {
-        None
-    };
+    let avg_row_bytes = avg_row_bytes(row_estimate, rel_size_bytes);
 
     // ── single int PK probe ─────────────────────────────────────────────
     let pk_rows = client.query(
@@ -342,16 +343,11 @@ fn introspect_pg_on(
            AND t.typname <> 'numeric'",
         &[&schema, &table],
     )?;
-    let mut keyset_keys: Vec<String> = Vec::new();
-    for primary in [true, false] {
-        for row in &keyset_rows {
-            let col: String = row.get(0);
-            let is_primary: bool = row.get(1);
-            if is_primary == primary && !keyset_keys.contains(&col) {
-                keyset_keys.push(col);
-            }
-        }
-    }
+    let keyset_columns: Vec<(String, bool)> = keyset_rows
+        .iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    let keyset_keys = super::keyset_keys_primary_first(&keyset_columns);
 
     // Integer-family columns — the safety set for an explicit `chunk_column`
     // (range chunking slices with integer `BETWEEN`; a non-integer key silently
@@ -958,6 +954,33 @@ fn unreadable_probe(pg_type: &str, sql: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_row_takes_the_heap_size_over_the_row_estimate() {
+        use super::avg_row_bytes;
+        assert_eq!(avg_row_bytes(100, 8_192), Some(81));
+        assert_eq!(avg_row_bytes(1, 8_192), Some(8_192));
+        assert_eq!(avg_row_bytes(3, 2), Some(0));
+        assert_eq!(avg_row_bytes(0, 8_192), None);
+    }
+
+    /// `information_schema` spells a decimal column `numeric`; a parameterised or padded spelling is one too, and no other type is.
+    #[test]
+    fn only_numeric_and_decimal_are_numeric_information_types() {
+        use super::is_pg_numeric_information_type;
+        for dt in [
+            "numeric",
+            "decimal",
+            " NUMERIC ",
+            "numeric(10,2)",
+            "Decimal(5)",
+        ] {
+            assert!(is_pg_numeric_information_type(dt), "{dt}");
+        }
+        for dt in ["integer", "double precision", "numericx", "text", ""] {
+            assert!(!is_pg_numeric_information_type(dt), "{dt}");
+        }
+    }
+
     #[test]
     fn a_fresh_text_is_the_statement_and_a_comment_no_other_nonce_gives() {
         let sql = "SELECT * FROM (SELECT 1) AS _rivet_type_probe LIMIT 0";

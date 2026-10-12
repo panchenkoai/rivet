@@ -257,14 +257,6 @@ fn introspect_mysql_on(
     )?;
     let (row_estimate, avg_row_bytes) = match row_stats {
         Some((rows, avg, data_len)) => {
-            let row_count = rows.max(0);
-            let raw_per_row = if avg > 0 {
-                Some(avg)
-            } else if row_count > 0 {
-                Some(data_len / row_count)
-            } else {
-                None
-            };
             // InnoDB stores TEXT/BLOB > ~768 B off-page in 16 KB BLOB pages,
             // and `AVG_ROW_LENGTH` counts the allocated page bytes — not the
             // actual content. On wide-text workloads (CMS bodies, JSON logs,
@@ -279,8 +271,7 @@ fn introspect_mysql_on(
             //
             // Pilots who want exact control can set `chunk_size:` explicitly
             // (it always wins over the budget-derived size).
-            let per_row = raw_per_row.map(correct_innodb_avg_row_length);
-            (row_count, per_row.filter(|b| *b > 0))
+            mysql_row_stats(rows, avg, data_len)
         }
         None => (0, None),
     };
@@ -314,14 +305,7 @@ fn introspect_mysql_on(
                 (&schema, &table, &col),
             )?;
             match type_row.map(|(t,)| t.to_ascii_lowercase()) {
-                Some(t)
-                    if matches!(
-                        t.as_str(),
-                        "tinyint" | "smallint" | "mediumint" | "int" | "bigint"
-                    ) =>
-                {
-                    Some(col)
-                }
+                Some(t) if is_mysql_integer_type(&t) => Some(col),
                 Some(t) => {
                     log::debug!(
                         "introspect_mysql_table: PK '{col}' on {schema}.{table} has non-int type '{t}' — skipping auto-resolve"
@@ -356,19 +340,8 @@ fn introspect_mysql_on(
                AND s2.INDEX_NAME = s.INDEX_NAME AND s2.SEQ_IN_INDEX = 2)",
         (&schema, &table),
     )?;
-    let mut keyset_keys: Vec<String> = Vec::new();
     // PRIMARY first (most efficient — clustered), then other unique indexes.
-    for primary in [true, false] {
-        for (col, index_name, is_nullable) in &keyset_rows {
-            let is_primary = index_name == "PRIMARY";
-            if is_primary == primary
-                && is_nullable.eq_ignore_ascii_case("NO")
-                && !keyset_keys.contains(col)
-            {
-                keyset_keys.push(col.clone());
-            }
-        }
-    }
+    let keyset_keys = super::keyset_keys_primary_first(&mysql_keyset_columns(keyset_rows));
 
     // Integer-family columns — the safety set for an explicit `chunk_column`
     // (see TableIntrospection::int_columns). `DATA_TYPE` is unsigned-agnostic
@@ -391,6 +364,41 @@ fn introspect_mysql_on(
         avg_row_bytes,
         int_columns,
     })
+}
+
+/// The row count and the bytes one row takes, from a table's `information_schema.TABLES` row: the reported average row length, else the data length spread over the rows, corrected for InnoDB's off-page pages; a figure that is not positive is no estimate.
+fn mysql_row_stats(rows: i64, avg: i64, data_len: i64) -> (i64, Option<i64>) {
+    let row_count = rows.max(0);
+    let raw_per_row = if avg > 0 {
+        Some(avg)
+    } else if row_count > 0 {
+        Some(data_len / row_count)
+    } else {
+        None
+    };
+    let per_row = raw_per_row.map(correct_innodb_avg_row_length);
+    (row_count, per_row.filter(|b| *b > 0))
+}
+
+/// Whether a lower-cased MySQL `DATA_TYPE` is of the integer family, the only one a range chunk may slice.
+fn is_mysql_integer_type(data_type: &str) -> bool {
+    matches!(
+        data_type,
+        "tinyint" | "smallint" | "mediumint" | "int" | "bigint"
+    )
+}
+
+/// The NOT NULL columns among (column, index name, IS_NULLABLE) rows, each with whether its index is the primary key.
+fn mysql_keyset_columns(rows: Vec<(String, String, String)>) -> Vec<(String, bool)> {
+    rows.into_iter()
+        .filter(|(_, _, is_nullable)| is_nullable.eq_ignore_ascii_case("NO"))
+        .map(|(col, index_name, _)| (col, index_name == "PRIMARY"))
+        .collect()
+}
+
+/// `max_execution_time` in milliseconds for a statement timeout in seconds; none when the timeout is off.
+fn max_execution_ms(statement_timeout_s: u64) -> Option<u64> {
+    (statement_timeout_s > 0).then(|| statement_timeout_s * 1000)
 }
 
 fn build_mysql_ssl_opts(cfg: &TlsConfig) -> SslOpts {
@@ -684,8 +692,7 @@ impl super::Source for MysqlSource {
         // even on a panic or an early return. `time_zone` normalises TIMESTAMP to
         // UTC (Parquet `isAdjustedToUTC=true`); `max_execution_time` bounds the
         // statement when a timeout is configured.
-        let max_exec_ms = (request.tuning.statement_timeout_s > 0)
-            .then(|| request.tuning.statement_timeout_s * 1000);
+        let max_exec_ms = max_execution_ms(request.tuning.statement_timeout_s);
         let mut guard = MysqlSessionGuard::apply(&mut conn, max_exec_ms)?;
 
         let sample_pool = if request.tuning.adaptive {
@@ -889,6 +896,151 @@ impl super::Source for MysqlSource {
 #[cfg(test)]
 mod tests {
     use super::{bit_bytes_to_u64, correct_innodb_avg_row_length};
+
+    /// The row size is the reported average, else the data length over the rows, and nothing when neither is positive.
+    #[test]
+    fn row_stats_prefer_the_reported_average_and_fall_back_to_data_over_rows() {
+        use super::mysql_row_stats;
+        assert_eq!(mysql_row_stats(100, 50, 9_000), (100, Some(50)));
+        assert_eq!(mysql_row_stats(100, 0, 9_000), (100, Some(90)));
+        assert_eq!(mysql_row_stats(1, 0, 7), (1, Some(7)));
+        assert_eq!(mysql_row_stats(0, 0, 9_000), (0, None));
+        assert_eq!(mysql_row_stats(-5, 0, 9_000), (0, None));
+        assert_eq!(
+            mysql_row_stats(100, 0, 0),
+            (100, None),
+            "zero bytes is no estimate"
+        );
+        assert_eq!(
+            mysql_row_stats(100, 0, 50),
+            (100, None),
+            "under a byte a row is no estimate"
+        );
+        assert_eq!(mysql_row_stats(0, 12, 0), (0, Some(12)));
+        assert_eq!(
+            mysql_row_stats(10, 41_000, 0),
+            (10, Some(correct_innodb_avg_row_length(41_000))),
+            "an off-page row length is corrected"
+        );
+    }
+
+    #[test]
+    fn only_the_integer_family_is_an_integer_type() {
+        use super::is_mysql_integer_type;
+        for t in ["tinyint", "smallint", "mediumint", "int", "bigint"] {
+            assert!(is_mysql_integer_type(t), "{t}");
+        }
+        for t in ["decimal", "varchar", "bit", "double", "integer", ""] {
+            assert!(!is_mysql_integer_type(t), "{t}");
+        }
+    }
+
+    /// A nullable column is no keyset key, and only the index named PRIMARY is the primary key.
+    #[test]
+    fn keyset_columns_are_the_not_null_ones_marked_by_the_primary_index() {
+        use super::mysql_keyset_columns;
+        let row = |c: &str, i: &str, n: &str| (c.to_string(), i.to_string(), n.to_string());
+        assert_eq!(
+            mysql_keyset_columns(vec![
+                row("email", "uq_email", "NO"),
+                row("nick", "uq_nick", "YES"),
+                row("id", "PRIMARY", "no"),
+                row("code", "primary_like", "NO"),
+            ]),
+            [
+                ("email".to_string(), false),
+                ("id".to_string(), true),
+                ("code".to_string(), false)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_statement_timeout_becomes_milliseconds_and_zero_is_no_timeout() {
+        use super::max_execution_ms;
+        assert_eq!(max_execution_ms(0), None);
+        assert_eq!(max_execution_ms(1), Some(1_000));
+        assert_eq!(max_execution_ms(300), Some(300_000));
+    }
+
+    /// The server's statement timeout is known by either error code or by any one of its three message spellings.
+    #[test]
+    fn a_statement_timeout_is_known_by_its_code_or_by_its_message() {
+        use super::is_statement_timeout;
+        let server = |code: u16, message: &str| {
+            mysql::Error::MySqlError(mysql::MySqlError {
+                state: "HY000".into(),
+                message: message.into(),
+                code,
+            })
+        };
+        assert!(is_statement_timeout(&server(3024, "interrupted")));
+        assert!(is_statement_timeout(&server(1969, "interrupted")));
+        for message in [
+            "Query execution was interrupted, max_execution_time exceeded",
+            "max_statement_time exceeded",
+            "Query execution was interrupted, maximum statement execution time exceeded",
+        ] {
+            assert!(is_statement_timeout(&server(1, message)), "{message}");
+        }
+        assert!(!is_statement_timeout(&server(
+            1205,
+            "Lock wait timeout exceeded"
+        )));
+        assert!(!is_statement_timeout(&server(
+            1064,
+            "You have an error in your SQL syntax"
+        )));
+    }
+
+    #[test]
+    fn the_pool_opens_one_connection_until_more_are_asked_for() {
+        let constraints = super::lean_pool_opts().constraints();
+        assert_eq!((constraints.min(), constraints.max()), (1, 100));
+    }
+
+    /// Each TLS mode and each override sets exactly the driver options it names.
+    #[test]
+    fn tls_options_follow_the_mode_the_ca_file_and_each_override() {
+        use crate::config::{TlsConfig, TlsMode};
+        let opts = |cfg: TlsConfig| {
+            let ssl = super::build_mysql_ssl_opts(&cfg);
+            (
+                ssl.accept_invalid_certs(),
+                ssl.skip_domain_validation(),
+                ssl.root_cert_path()
+                    .map(|p| p.to_string_lossy().into_owned()),
+            )
+        };
+        let mode = |mode| TlsConfig {
+            mode,
+            ..Default::default()
+        };
+        assert_eq!(opts(mode(TlsMode::Require)), (true, true, None));
+        assert_eq!(opts(mode(TlsMode::VerifyCa)), (false, true, None));
+        assert_eq!(opts(mode(TlsMode::VerifyFull)), (false, false, None));
+        assert_eq!(
+            opts(TlsConfig {
+                ca_file: Some("/etc/ca.pem".into()),
+                ..mode(TlsMode::VerifyFull)
+            }),
+            (false, false, Some("/etc/ca.pem".to_string()))
+        );
+        assert_eq!(
+            opts(TlsConfig {
+                accept_invalid_certs: true,
+                ..mode(TlsMode::VerifyFull)
+            }),
+            (true, false, None)
+        );
+        assert_eq!(
+            opts(TlsConfig {
+                accept_invalid_hostnames: true,
+                ..mode(TlsMode::VerifyFull)
+            }),
+            (false, true, None)
+        );
+    }
 
     #[test]
     fn only_an_enforced_tls_mode_turns_on_the_driver_ssl_options() {
