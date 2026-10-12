@@ -128,6 +128,18 @@ pub(crate) fn wire_to_big_decimal(wire: &[u8]) -> Option<BigDecimal> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_wire_reader_takes_numeric_and_no_other_type() {
+        assert!(<PgNumericWire as FromSql>::accepts(&Type::NUMERIC));
+        assert!(!<PgNumericWire as FromSql>::accepts(&Type::INT8));
+        let raw = [0u8, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(
+            PgNumericWire::from_sql(&Type::NUMERIC, &raw).unwrap().0,
+            raw
+        );
+        assert!(PgNumericWire::from_sql(&Type::TEXT, &raw).is_err());
+    }
+
     /// Build a raw PG numeric wire payload from its constituent fields.
     ///
     /// Layout (all big-endian):

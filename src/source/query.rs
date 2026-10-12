@@ -583,6 +583,64 @@ mod tests {
     }
 
     #[test]
+    fn a_mysql_literal_escapes_the_quote_and_the_backslash() {
+        assert_eq!(escape_mysql_literal("250001"), "'250001'");
+        assert_eq!(escape_mysql_literal("O'Brien"), r"'O\'Brien'");
+        assert_eq!(escape_mysql_literal(r"C:\tmp"), r"'C:\\tmp'");
+        assert_eq!(escape_mysql_literal("'; DROP --"), r"'\'; DROP --'");
+    }
+
+    /// A page limit with a key plan builds a keyset page, bounded above for a parallel worker; without the limit the same plan builds the incremental query.
+    #[test]
+    fn a_page_limit_with_a_key_plan_builds_a_keyset_page() {
+        use crate::config::IncrementalCursorMode;
+        let plan = crate::plan::IncrementalCursorPlan {
+            primary_column: "id".into(),
+            fallback_column: None,
+            mode: IncrementalCursorMode::SingleColumn,
+            settle: None,
+        };
+        let tuning = crate::tuning::SourceTuning::from_config(None);
+        let overrides = Default::default();
+        let request = |page_limit, upper_bound| crate::source::ExportRequest {
+            query: "SELECT * FROM t",
+            catalog_hint_query: None,
+            incremental: Some(&plan),
+            cursor: None,
+            tuning: &tuning,
+            column_overrides: &overrides,
+            page_limit,
+            base_relation: None,
+            upper_bound,
+        };
+        let page = build_export_query(&request(Some(100), None), SourceType::Postgres);
+        assert_eq!(
+            page.sql,
+            build_keyset_query("SELECT * FROM t", "id", None, 100, SourceType::Postgres).sql
+        );
+        let bounded = build_export_query(&request(Some(100), Some("500")), SourceType::Postgres);
+        assert_eq!(
+            bounded.sql,
+            build_keyset_query_bounded(
+                "SELECT * FROM t",
+                "id",
+                None,
+                Some("500"),
+                100,
+                SourceType::Postgres
+            )
+            .sql
+        );
+        assert_ne!(page.sql, bounded.sql);
+        let whole = build_export_query(&request(None, None), SourceType::Postgres);
+        assert_eq!(
+            whole.sql,
+            build_incremental_query("SELECT * FROM t", Some(&plan), None, SourceType::Postgres).sql
+        );
+        assert_ne!(whole.sql, page.sql);
+    }
+
+    #[test]
     fn escape_pg_literal_basic() {
         assert_eq!(escape_pg_literal("hello"), r"E'hello'");
         assert_eq!(escape_pg_literal("O'Brien"), r"E'O\'Brien'");
