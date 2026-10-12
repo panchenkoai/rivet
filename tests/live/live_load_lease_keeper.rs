@@ -84,6 +84,18 @@ impl ScratchState {
             .get(0)
     }
 
+    /// The scratch role's sessions once the server has let go of one a client just closed: a backend outlives its socket by a moment, so the count is read until it is down to `settled` or 5 s have passed.
+    fn connections_once_closed(&self, admin: &mut postgres::Client, settled: i64) -> i64 {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let now = self.connections(admin);
+            if now <= settled || std::time::Instant::now() >= until {
+                return now;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
     /// The holder of `table`'s lease, when a row for it exists.
     fn lease_holder(&self, inside: &mut postgres::Client, table: &str) -> Option<String> {
         inside
@@ -783,7 +795,7 @@ fn one_keeper_renews_every_lease_and_reports_the_one_that_is_gone() {
 
     drop(leases);
     assert_eq!(
-        state.connections(&mut admin),
+        state.connections_once_closed(&mut admin, 1),
         1,
         "the keeper's connection ends with its last lease"
     );
