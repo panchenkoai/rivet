@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+- **Fix: masking a URL password in a log line or an error text takes one pass over the
+  text.** Applies to every command and every engine: each emitted log line and each error
+  text goes through this scan.
+  - **What was wrong in 0.31.0 and earlier.** The scan for `scheme://user:password@` started
+    a new read at every byte: from each letter to the end of the run of letters, digits and
+    `+ . -` it stands in, and from each `://` to the next whitespace. The time grew with the
+    square of the longest such run. Measured on that function compiled alone with
+    optimisations: a run of 16 KiB took 0.1 s, 64 KiB 1.1 s, 256 KiB 18.6 s. The text
+    came out correct; only the time was wrong. Whether a real driver message holds a run
+    that long (a hex or base64 value quoted in an error) was not observed in the field: the
+    defect was found by reading the code under mutants that hung its tests.
+  - **Now** the same 256 KiB take 0.7 ms and 16 MiB take 34 ms. What is masked is
+    unchanged: the new scan and the previous one give byte-identical output on 400,000
+    generated texts of URL punctuation, whitespace and multi-byte characters, and that
+    comparison stays in the test suite.
+  - **Also fixed: a secret query parameter with a name longer than 64 characters was not
+    masked** (`?<65+ characters>_token=...`, since 0.25.0). The length limit is removed;
+    a name of any length ending in a secret word is masked.
+  - **Removed, no behaviour change:** two config checks that no config could reach, because
+    an earlier check refuses the same input first — the `..` check of a local destination
+    `path`/`prefix` (every destination's `..` segment is refused before it), and "cdc mode
+    reads the transaction log, not a query" (a `query:` beside `table:` is refused as two
+    sources, and a `query:` alone as a missing `table:`). The messages an operator sees are
+    the ones they saw before.
+
 - **Fix: a PostgreSQL run through a transaction-mode pooler no longer leaves session settings
   on the pooled server connection.** PostgreSQL batch connections and `mode: cdc`. Reproduced
   on rivet 0.31.0 behind pgBouncer 1.26.0 in transaction mode, with pool sizes 1 and 5.

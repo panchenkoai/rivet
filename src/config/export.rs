@@ -960,6 +960,45 @@ pub(crate) fn sample_export(name: &str) -> ExportConfig {
 mod tests {
     use super::*;
 
+    /// A settle age is a whole number with one of four units, positive and at most `i32::MAX` seconds.
+    #[test]
+    fn a_settle_age_is_whole_seconds_minutes_hours_or_days() {
+        for (raw, seconds) in [
+            ("90s", 90),
+            ("30m", 1_800),
+            ("1h", 3_600),
+            ("2d", 172_800),
+            (" 5m ", 300),
+            ("2147483647s", i32::MAX as u64),
+        ] {
+            assert_eq!(parse_settle_after(raw).ok(), Some(seconds), "{raw:?}");
+        }
+        for raw in [
+            "",
+            "m",
+            "5",
+            "5x",
+            "+5m",
+            "-5m",
+            "1.5h",
+            "5 m",
+            "0s",
+            "0d",
+            "2147483648s",
+            "99999999999999999999s",
+            "24856d",
+        ] {
+            assert!(parse_settle_after(raw).is_err(), "{raw:?} must be refused");
+        }
+    }
+
+    /// Only `verify: content` asks for every part's content to be checked.
+    #[test]
+    fn only_content_verification_requires_content() {
+        assert!(VerifyMode::Content.requires_content());
+        assert!(!VerifyMode::Size.requires_content());
+    }
+
     /// #167: a `--split` sub-export named `daily#0` must fold to family `daily`
     /// so the load view recombines the N range units as one logical table. RED
     /// against a `family()` that ignores `split` (returns the unit name `daily#0`,

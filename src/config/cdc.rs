@@ -847,13 +847,6 @@ impl Config {
             // `table:` + `tables:` is refused earlier, by `validate_export_source`.
             (Some(_), _) => {}
         }
-        if export.query.is_some() || export.query_file.is_some() {
-            anyhow::bail!(
-                "export '{}': cdc mode reads the transaction log, not a query — \
-                 remove query/query_file and use `table:`",
-                export.name
-            );
-        }
         Ok(())
     }
 

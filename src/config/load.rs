@@ -943,13 +943,38 @@ mod tests {
             .is_some(),
             "exactly the cap is allowed"
         );
+        let buckets = |start: i64, end: i64, interval: i64| {
+            partition_of(serde_json::json!({
+                "range": { "column": "n", "start": start, "end": end, "interval": interval }
+            }))
+            .map(|spec| spec.is_some())
+        };
+        assert_eq!(
+            buckets(5, 10_005, 1),
+            Ok(true),
+            "the span is end minus start"
+        );
+        assert_eq!(buckets(0, 70_000, 7), Ok(true), "10000 whole buckets");
+        assert!(
+            buckets(0, 70_001, 7)
+                .unwrap_err()
+                .contains("makes 10001 partitions"),
+            "a partial last bucket counts"
+        );
     }
 
     #[test]
     fn granularities_round_trip_and_coarsen() {
         assert_eq!(Granularity::Hour.coarser(), Some(Granularity::Day));
         assert_eq!(Granularity::Year.coarser(), None);
-        assert_eq!(Granularity::parse_sql("MONTH"), Some(Granularity::Month));
+        for g in [
+            Granularity::Hour,
+            Granularity::Day,
+            Granularity::Month,
+            Granularity::Year,
+        ] {
+            assert_eq!(Granularity::parse_sql(g.as_sql()), Some(g));
+        }
         assert_eq!(Granularity::parse_sql("WEEK"), None);
         assert_eq!(Granularity::Day.as_sql(), "DAY");
         assert_eq!(Granularity::Day.as_str(), "day");
