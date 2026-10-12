@@ -220,6 +220,17 @@ exports:
         err.to_string().contains("needs a chunking strategy"),
         "a strategy-less chunked config must still get the pick-one guidance: {err}"
     );
+
+    for strategy in ["chunk_column: id", "chunk_count: 4", "chunk_by_days: 7"] {
+        let outcome = Config::from_yaml(
+            &no_strategy.replace("mode: chunked", &format!("mode: chunked\n    {strategy}")),
+        );
+        let said = outcome.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            !said.contains("needs a chunking strategy"),
+            "`{strategy}` is a strategy, so the pick-one guidance must not fire: {said}"
+        );
+    }
 }
 
 #[test]

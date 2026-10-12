@@ -51,3 +51,10 @@ path = "fuzz_targets/sql_query_text.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "redact_text"
+path = "fuzz_targets/redact_text.rs"
+test = false
+doc = false
+bench = false

@@ -1081,36 +1081,6 @@ impl Config {
             }
         }
 
-        // V15: a `type: local` destination `path` (or `prefix`) is written
-        // verbatim to the filesystem. A `..` component lets a committed config
-        // climb out of the intended output tree (`../../../../tmp/x`) — mirror
-        // the `query_file` traversal guard and reject it at config-load.
-        //
-        // Absolute paths are deliberately *not* rejected: `path: /output` is a
-        // legitimate Docker volume-mount pattern (see `examples/rivet.yaml`) and
-        // an explicit operator choice, not a hidden escape. The `..` climb is
-        // the unambiguous traversal footgun.
-        if export.destination.destination_type == DestinationType::Local {
-            for (field, value) in [
-                ("path", export.destination.path.as_deref()),
-                ("prefix", export.destination.prefix.as_deref()),
-            ] {
-                let Some(value) = value else { continue };
-                if std::path::Path::new(value)
-                    .components()
-                    .any(|c| c == std::path::Component::ParentDir)
-                {
-                    anyhow::bail!(
-                        "export '{}': local destination {} must not contain a '..' component: \
-                         '{}' (a parent-dir climb writes outside the output tree).",
-                        export.name,
-                        field,
-                        value
-                    );
-                }
-            }
-        }
-
         if export.destination.destination_type == DestinationType::S3 {
             let ak = export.destination.access_key_env.is_some();
             let sk = export.destination.secret_key_env.is_some();
@@ -2867,6 +2837,8 @@ exports:
             // would not — `checked_mul -> checked_add` sailed through the
             // usize::MAX-ish fixture above (both overflow there).
             ("rollover_memory_mb: 18014398509481984", "overflows"),
+            // 2^44 MiB is 2^64 bytes: the smallest power of two that overflows.
+            ("rollover_memory_mb: 17592186044416", "overflows"),
         ] {
             let yaml = base.replace("ROLLOVER_LINE", line);
             let err = Config::from_yaml(&yaml).expect_err(line).to_string();

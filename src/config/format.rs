@@ -256,6 +256,21 @@ mod tests {
         assert_eq!(CompressionType::None.label(), "none");
     }
 
+    /// Every codec is read back from the label it prints, and nothing else is a codec.
+    #[test]
+    fn a_compression_label_reads_back_as_its_codec() {
+        for codec in [
+            CompressionType::Zstd,
+            CompressionType::Snappy,
+            CompressionType::Gzip,
+            CompressionType::Lz4,
+            CompressionType::None,
+        ] {
+            assert_eq!(CompressionType::from_label(codec.label()), Some(codec));
+        }
+        assert_eq!(CompressionType::from_label("brotli"), None);
+    }
+
     // ── L24: compression_profile override warning ───────────────────────────
 
     #[test]
@@ -467,5 +482,39 @@ mod tests {
             rows >= 1_000,
             "must not go below minimum 1 000 rows; got {rows}"
         );
+    }
+
+    /// Under `max_row_group_mb` a group is the most rows that fit the cap: one more row would pass it. The cap never raises a smaller target and never goes under 1 000 rows.
+    #[test]
+    fn max_row_group_mb_caps_a_group_at_the_rows_that_fit() {
+        let capped = |schema: &arrow::datatypes::SchemaRef, target_mb, max_mb| {
+            ParquetConfig {
+                row_group_strategy: Some(RowGroupStrategy::Auto),
+                target_row_group_mb: target_mb,
+                max_row_group_mb: max_mb,
+                ..Default::default()
+            }
+            .effective_row_group_rows(schema)
+            .unwrap()
+        };
+        for (schema, max_mb) in [(narrow_schema(), 8), (wide_schema(), 64)] {
+            let row_bytes = crate::tuning::estimate_row_bytes(&schema);
+            let rows = capped(&schema, None, Some(max_mb));
+            let cap_bytes = max_mb * 1024 * 1024;
+            assert!(
+                rows * row_bytes <= cap_bytes && (rows + 1) * row_bytes > cap_bytes,
+                "{rows} rows of {row_bytes} bytes under a {max_mb} MiB cap"
+            );
+            assert!(
+                rows < capped(&schema, None, None),
+                "the cap lowers the group"
+            );
+        }
+        assert_eq!(
+            capped(&narrow_schema(), Some(8), Some(64)),
+            capped(&narrow_schema(), Some(8), None),
+            "a cap above the target changes nothing"
+        );
+        assert_eq!(capped(&wide_schema(), None, Some(1)), 1_000);
     }
 }

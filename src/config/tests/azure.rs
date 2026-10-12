@@ -86,3 +86,22 @@ fn azure_allow_anonymous_with_sas_rejected() {
         "error must mention allow_anonymous: {err}"
     );
 }
+
+/// Anonymous access is refused beside any one credential field, each on its own.
+#[test]
+fn azure_allow_anonymous_with_any_one_credential_field_rejected() {
+    for field in [
+        "account_name: acct",
+        "account_key_env: K",
+        "sas_token_env: S",
+    ] {
+        let yaml = format!(
+            "{AZURE_BASE}      endpoint: http://127.0.0.1:10000/devstoreaccount1\n      allow_anonymous: true\n      {field}\n"
+        );
+        let err = Config::from_yaml(&yaml).expect_err(field).to_string();
+        assert!(
+            err.contains("allow_anonymous cannot be combined"),
+            "{field}: {err}"
+        );
+    }
+}
