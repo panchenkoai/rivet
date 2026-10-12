@@ -3892,4 +3892,366 @@ mod tests {
             "{err:#}"
         );
     }
+
+    // ── guards a live mutation sweep left unpinned ──────────────────────────
+
+    /// A source that answers the run's metadata probes from a script.
+    struct ScriptedSource {
+        count: std::result::Result<Option<String>, String>,
+        mappings: Vec<crate::types::TypeMapping>,
+    }
+
+    impl crate::source::Source for ScriptedSource {
+        fn export(
+            &mut self,
+            _request: &crate::source::ExportRequest<'_>,
+            _sink: &mut dyn crate::source::BatchSink,
+        ) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn query_scalar(&mut self, _sql: &str) -> crate::error::Result<Option<String>> {
+            self.count.clone().map_err(|e| anyhow::anyhow!(e))
+        }
+        fn type_mappings(
+            &mut self,
+            _query: &str,
+            _overrides: &crate::types::ColumnOverrides,
+        ) -> crate::error::Result<Vec<crate::types::TypeMapping>> {
+            Ok(self.mappings.clone())
+        }
+        fn server_context(&mut self) -> Option<String> {
+            Some(r#"{"engine":"scripted"}"#.into())
+        }
+        fn primary_key(&mut self, table: &str) -> crate::error::Result<Option<Vec<String>>> {
+            Ok(Some(vec![format!("pk_of_{table}")]))
+        }
+    }
+
+    /// A source config whose port refuses every connection.
+    fn unreachable_source() -> SourceConfig {
+        let mut source = chunked_plan_with_quality(None).source;
+        source.url = Some("postgresql://nobody@127.0.0.1:1/x".into());
+        source
+    }
+
+    /// The run's metadata connection, already holding `src`.
+    fn meta_holding(cfg: &SourceConfig, src: ScriptedSource) -> MetaConn<'_> {
+        MetaConn {
+            cfg,
+            src: Some(Box::new(src)),
+        }
+    }
+
+    /// Every signature phrase names its class on its own, in any letter case; the bare error number 3024 is left out on purpose.
+    #[test]
+    fn each_error_signature_alone_names_its_class() {
+        for (phrase, class) in [
+            ("keyset could not read", "keyset_unreadable_key"),
+            ("could not read the key value", "keyset_unreadable_key"),
+            ("parallel checkpoint worker", "parallel_checkpoint"),
+            ("deadlock", "deadlock"),
+            ("lock wait timeout", "lock_timeout"),
+            ("could not obtain lock", "lock_timeout"),
+            ("maximum statement execution time", "statement_timeout"),
+            ("statement timeout", "statement_timeout"),
+            ("schema drift", "schema_drift"),
+            ("schema changed", "schema_drift"),
+            ("on_schema_drift", "schema_drift"),
+            ("doesn't exist", "relation_not_found"),
+            ("does not exist", "relation_not_found"),
+            ("no such table", "relation_not_found"),
+            ("invalid object name", "relation_not_found"),
+            ("unknown table", "relation_not_found"),
+            ("permission denied", "privilege"),
+            ("command denied", "privilege"),
+            ("privilege", "privilege"),
+            ("view server state", "privilege"),
+            ("access denied", "source_auth"),
+            ("authentication failed", "source_auth"),
+            ("password authentication", "source_auth"),
+            ("connection reset", "connection"),
+            ("connection refused", "connection"),
+            ("connection closed", "connection"),
+            ("broken pipe", "connection"),
+            ("server has gone away", "connection"),
+            ("connection timed out", "connection"),
+            ("certificate", "tls"),
+            ("tls handshake", "tls"),
+            ("ssl error", "tls"),
+            ("no space left", "disk_full"),
+            ("disk full", "disk_full"),
+            ("quota exceeded", "disk_full"),
+            ("out of memory", "out_of_memory"),
+            ("cannot allocate memory", "out_of_memory"),
+        ] {
+            let message = format!("export 'e': {} (page 7)", phrase.to_uppercase());
+            assert_eq!(classify_error_message(&message), Some(class), "{phrase}");
+        }
+    }
+
+    /// Each keyed strategy is named with the column it pages by; a strategy without a key has no descriptor.
+    #[test]
+    fn the_key_descriptor_names_the_column_each_strategy_pages_by() {
+        use crate::config::IncrementalCursorMode;
+        use crate::plan::IncrementalCursorPlan;
+        let mut plan = chunked_plan_with_quality(None);
+        assert_eq!(strategy_key_column(&plan), Some(("chunked", "id")));
+        plan.strategy = ExtractionStrategy::Keyset(crate::plan::KeysetPlan {
+            key_column: "order_no".into(),
+            chunk_size: 10,
+            checkpoint: false,
+            incremental: false,
+            parallel: 1,
+        });
+        assert_eq!(strategy_key_column(&plan), Some(("keyset", "order_no")));
+        plan.strategy = ExtractionStrategy::Incremental(IncrementalCursorPlan {
+            primary_column: "updated_at".into(),
+            fallback_column: None,
+            mode: IncrementalCursorMode::SingleColumn,
+            settle: None,
+        });
+        assert_eq!(
+            strategy_key_column(&plan),
+            Some(("incremental", "updated_at"))
+        );
+        let described: serde_json::Value =
+            serde_json::from_str(&key_descriptor_json(&plan, None).unwrap()).unwrap();
+        assert_eq!(
+            described,
+            serde_json::json!({ "strategy": "incremental", "key": "updated_at" })
+        );
+        plan.strategy = ExtractionStrategy::Snapshot;
+        assert_eq!(strategy_key_column(&plan), None);
+        assert_eq!(key_descriptor_json(&plan, Some("bigint")), None);
+    }
+
+    /// A keyset run's metric row carries its page size and its fan-out, which is never below one worker.
+    #[test]
+    fn a_keyset_runs_metric_row_carries_its_page_size_and_its_fan_out() {
+        let keyset = |parallel| {
+            let mut plan = chunked_plan_with_quality(None);
+            plan.strategy = ExtractionStrategy::Keyset(crate::plan::KeysetPlan {
+                key_column: "order_no".into(),
+                chunk_size: 250,
+                checkpoint: false,
+                incremental: false,
+                parallel,
+            });
+            build_metric_row(
+                &RunSummary::stub_for_testing("run-keyset", "orders"),
+                &plan,
+                "balanced",
+            )
+        };
+        let row = keyset(4);
+        assert_eq!((row.chunk_size, row.parallel), (Some(250), Some(4)));
+        assert_eq!(row.chunk_key.as_deref(), Some("order_no"));
+        assert_eq!(keyset(0).parallel, Some(1), "one reader is one worker");
+    }
+
+    /// Deltas that carry both engines' spill counters are summed and named for both.
+    #[test]
+    fn a_mixed_spill_is_summed_and_named_for_both_counters() {
+        let both = [
+            ("mysql_created_tmp_disk_tables".to_string(), 40_i64),
+            ("pg_temp_files".to_string(), 2_i64),
+        ];
+        let spill = spill_total(&both);
+        assert_eq!(spill.total, 42);
+        assert_eq!(spill.unit, "disk spills (tmp-disk tables + temp files)");
+    }
+
+    /// Closing the bracket credits the temp spill to the summary and records every other counter's growth; with a snapshot missing it records nothing.
+    #[test]
+    fn closing_the_harm_bracket_records_the_windows_growth_and_credits_the_temp_spill() {
+        let snapshot = |files: i64, returned: i64, temp_bytes: i64| {
+            vec![
+                ("pg_temp_files".to_string(), files),
+                ("pg_tup_returned".to_string(), returned),
+                (crate::source::PG_TEMP_BYTES_KEY.to_string(), temp_bytes),
+            ]
+        };
+        let state = StateStore::open_in_memory().unwrap();
+        let mut summary = RunSummary::stub_for_testing("run-harm", "orders");
+        let bracket = HarmBracket {
+            harm: Some(snapshot(3, 100, 1000)),
+        };
+        let deltas = bracket.close_with(Some(snapshot(5, 150, 4000)), &state, &mut summary);
+        let grew = vec![
+            ("pg_temp_files".to_string(), 2),
+            ("pg_tup_returned".to_string(), 50),
+        ];
+        assert_eq!(deltas, grew);
+        assert_eq!(summary.pg_temp_bytes_delta, Some(3000));
+        assert_eq!(state.harm_rows_for_test("run-harm"), grew);
+
+        for (before, after) in [
+            (None, Some(snapshot(5, 150, 4000))),
+            (Some(snapshot(3, 100, 1000)), None),
+        ] {
+            let mut summary = RunSummary::stub_for_testing("run-half", "orders");
+            let deltas = HarmBracket { harm: before }.close_with(after, &state, &mut summary);
+            assert_eq!(deltas, Vec::new());
+            assert_eq!(summary.pg_temp_bytes_delta, None);
+            assert_eq!(state.harm_rows_for_test("run-half"), Vec::new());
+        }
+    }
+
+    /// The run-level snapshot is the engine's counters under their own names, and nothing when the source refuses the connection.
+    #[test]
+    fn the_harm_snapshot_is_the_sources_named_counters_and_nothing_when_it_cannot_connect() {
+        use crate::connect::postgres::wire_recorder::{Answer, answering_server};
+        let (url, _queries) = answering_server(Answer::Int8(vec![11, 12, 13, 14, 15, 16, 17]));
+        let mut source = unreachable_source();
+        assert_eq!(harm_snapshot(&source), None);
+        source.url = Some(url);
+        let counters: Vec<(String, i64)> = [
+            ("pg_blks_read", 11),
+            ("pg_blks_hit", 12),
+            ("pg_tup_returned", 13),
+            ("pg_tup_fetched", 14),
+            ("pg_temp_files", 15),
+            ("pg_deadlocks", 16),
+            (crate::source::PG_TEMP_BYTES_KEY, 17),
+            ("pg_slot_spill_txns", 11),
+            ("pg_slot_spill_bytes", 12),
+            ("pg_slot_decoded_bytes", 13),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.to_string(), value))
+        .collect();
+        assert_eq!(harm_snapshot(&source), Some(counters));
+    }
+
+    /// The open probe records the key column's own native type, the server context, the mappings, the schema and, only when asked, the primary key.
+    #[test]
+    fn the_open_probe_records_the_key_columns_own_native_type() {
+        use crate::types::{RivetType, SourceColumn, TypeMapping};
+        let mapping = |name: &str, native: &str, rivet_type: RivetType| {
+            TypeMapping::from_source(&SourceColumn::simple(name, native, false), rivet_type)
+        };
+        let probed = |want_key: bool| {
+            let mut plan = chunked_plan_with_quality(None);
+            plan.source = unreachable_source();
+            plan.source_table = Some("public.orders".into());
+            let scripted = ScriptedSource {
+                count: Ok(None),
+                mappings: vec![
+                    mapping("payload", "text", RivetType::String),
+                    mapping("id", "bigint unsigned", RivetType::Int64),
+                ],
+            };
+            let state = StateStore::open_in_memory().unwrap();
+            let mut summary = RunSummary::stub_for_testing("run-open", "orders");
+            let mut meta = meta_holding(&plan.source, scripted);
+            capture_open_forensics(&plan, &state, &mut summary, want_key, &mut meta);
+            let stored: Vec<String> = state
+                .get_stored_schema("orders")
+                .unwrap()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|c| c.name)
+                .collect();
+            (summary, stored)
+        };
+        let (summary, stored) = probed(true);
+        assert_eq!(summary.key_native_type.as_deref(), Some("bigint unsigned"));
+        assert_eq!(
+            summary.server_context_json.as_deref(),
+            Some(r#"{"engine":"scripted"}"#)
+        );
+        assert_eq!(summary.open_mappings.as_ref().map(Vec::len), Some(2));
+        assert_eq!(
+            summary.open_primary_key,
+            Some(vec!["pk_of_public.orders".to_string()])
+        );
+        assert_eq!(stored, ["payload", "id"]);
+        assert_eq!(probed(false).0.open_primary_key, None);
+    }
+
+    /// The count is read on the held connection and compared with the committed parts' rows, or with the run's rows when no part is recorded; a count that cannot be read is a reason, never a verdict.
+    #[test]
+    fn the_reconcile_count_is_read_on_the_held_connection_and_compared_with_what_was_committed() {
+        use crate::pipeline::run::run_tail_tests::{
+            captured_warnings_mentioning, install_warn_capture,
+        };
+        install_warn_capture();
+        let source = unreachable_source();
+        let reconciled = |export: &str,
+                          count: std::result::Result<Option<&str>, &str>,
+                          part_rows: &[i64],
+                          total_rows: i64| {
+            let mut plan = chunked_plan_with_quality(None);
+            plan.export_name = export.into();
+            let mut summary = RunSummary::stub_for_testing("run-reconcile", export);
+            summary.total_rows = total_rows;
+            for (i, rows) in part_rows.iter().enumerate() {
+                summary.manifest_parts.push(crate::manifest::ManifestPart {
+                    part_id: i as u32,
+                    path: format!("part-{i}.parquet"),
+                    rows: *rows,
+                    size_bytes: 1,
+                    content_fingerprint: String::new(),
+                    content_md5: String::new(),
+                    status: crate::manifest::PartStatus::Committed,
+                });
+            }
+            let scripted = ScriptedSource {
+                count: count.map(|v| v.map(str::to_string)).map_err(str::to_string),
+                mappings: Vec::new(),
+            };
+            let mut meta = meta_holding(&source, scripted);
+            let why = reconcile_source_count(&plan, &mut summary, &mut meta);
+            (why, summary.source_count, summary.reconciled)
+        };
+        let mismatch_warnings = |export: &str| {
+            captured_warnings_mentioning(&format!("reconcile MISMATCH for '{export}'"))
+        };
+
+        assert_eq!(
+            reconciled("rec_resumed", Ok(Some("2500")), &[2000, 500], 500),
+            (None, Some(2500), Some(true)),
+            "a resumed run is compared by every committed part, not by the rows it re-ran"
+        );
+        assert_eq!(mismatch_warnings("rec_resumed"), Vec::<String>::new());
+        assert_eq!(
+            reconciled("rec_no_parts", Ok(Some("7")), &[], 7),
+            (None, Some(7), Some(true)),
+            "with no part recorded the run's own row count is what is compared"
+        );
+        assert_eq!(
+            reconciled("rec_short", Ok(Some("2499")), &[2000, 500], 500),
+            (None, Some(2499), Some(false))
+        );
+        let said = mismatch_warnings("rec_short");
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(
+            said[0].ends_with("committed 2500 rows, source has 2499"),
+            "{said:?}"
+        );
+
+        assert_eq!(
+            reconciled("rec_null", Ok(None), &[5], 5),
+            (
+                Some("source reconcile COUNT(*) returned NULL".to_string()),
+                None,
+                None
+            )
+        );
+        assert_eq!(
+            reconciled("rec_text", Ok(Some("n/a")), &[5], 5),
+            (
+                Some("source reconcile count 'n/a' is not an integer".to_string()),
+                None,
+                None
+            )
+        );
+        let (why, counted, verdict) = reconciled("rec_dropped", Err("connection reset"), &[5], 5);
+        assert!(
+            why.as_deref()
+                .is_some_and(|w| w.starts_with("could not connect to the source to reconcile: ")),
+            "a count that failed on the held connection is asked again on a fresh one: {why:?}"
+        );
+        assert_eq!((counted, verdict), (None, None));
+    }
 }
