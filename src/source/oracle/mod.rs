@@ -525,11 +525,19 @@ impl OracleSource {
             }
             None => stmt.query(&[]).ora().map_err(timed_out)?,
         };
-        let (row_index, metas) = result_columns(
+        let Some((row_index, metas)) = result_columns(
             cursor.columns(),
             projection.native.len(),
             &projection.empty_flags,
-        );
+        ) else {
+            crate::rivet_bail!(
+                crate::error::codes::SOURCE_COLUMNS_CHANGED_UNDER_READ,
+                "oracle: the query returned {} column(s) where its type probe, a moment earlier, \
+                 described {}: a column left the table between the two. This read wrote nothing.",
+                cursor.columns().len(),
+                projection.native.len()
+            );
+        };
         let mut native = projection.native.clone();
         native.extend(metas[projection.native.len()..].iter().map(native_type));
         let cursor_cols: Vec<(&str, bool, &str)> = metas
@@ -639,16 +647,20 @@ fn sub_micro_cursor_refusal(
 
 /// The result columns the schema carries, and where each sits in a row: the query's own
 /// columns, then whatever an outer wrapper added after the LOB empty-value flags (the
-/// coalesce cursor), skipping the flags themselves.
+/// coalesce cursor), skipping the flags themselves. None when the result holds fewer
+/// columns than the probe described.
 fn result_columns<M: Clone>(
     all: &[M],
     native: usize,
     empty_flags: &[Option<usize>],
-) -> (Vec<usize>, Vec<M>) {
+) -> Option<(Vec<usize>, Vec<M>)> {
     let tail = native + empty_flags.iter().flatten().count();
     let row_index: Vec<usize> = (0..native).chain(tail..all.len()).collect();
-    let metas = row_index.iter().map(|&i| all[i].clone()).collect();
-    (row_index, metas)
+    let metas = row_index
+        .iter()
+        .map(|&i| all.get(i).cloned())
+        .collect::<Option<Vec<M>>>()?;
+    (all.len() >= tail).then_some((row_index, metas))
 }
 
 impl Source for OracleSource {
@@ -902,13 +914,28 @@ mod tests {
     #[test]
     fn result_columns_keep_the_coalesce_cursor_and_skip_the_lob_flags() {
         let all = ["A", "B", "C", "FLAG_B", "_rivet_coalesced_cursor"];
-        let (idx, metas) = super::result_columns(&all, 3, &[None, Some(3), None]);
+        let (idx, metas) = super::result_columns(&all, 3, &[None, Some(3), None]).unwrap();
         assert_eq!(idx, vec![0, 1, 2, 4]);
         assert_eq!(metas, vec!["A", "B", "C", "_rivet_coalesced_cursor"]);
-        let (idx, metas) = super::result_columns(&["A", "FLAG_A"], 1, &[Some(1)]);
+        let (idx, metas) = super::result_columns(&["A", "FLAG_A"], 1, &[Some(1)]).unwrap();
         assert_eq!((idx, metas), (vec![0], vec!["A"]));
-        let (idx, _) = super::result_columns(&["A", "B"], 2, &[None, None]);
+        let (idx, _) = super::result_columns(&["A", "B"], 2, &[None, None]).unwrap();
         assert_eq!(idx, vec![0, 1]);
+    }
+
+    /// A result with fewer columns than the probe described is told apart, not indexed past its end.
+    #[test]
+    fn a_result_narrower_than_its_probe_has_no_column_layout() {
+        assert_eq!(
+            super::result_columns(&["A", "B"], 3, &[None, None, None]),
+            None
+        );
+        assert_eq!(
+            super::result_columns(&["A", "B"], 2, &[None, Some(2)]),
+            None
+        );
+        assert_eq!(super::result_columns::<&str>(&[], 1, &[None]), None);
+        assert!(super::result_columns(&["A", "B", "C"], 2, &[None, None]).is_some());
     }
     use super::*;
 

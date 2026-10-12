@@ -761,6 +761,11 @@ pub mod codes {
         "RIVET_SOURCE_PROBE_UNREADABLE",
         "chunk, page or partition the export on a column of a type the message lists, remove `parallel:` from a keyset export, or use `mode: full`",
     );
+    /// A read returned fewer columns than its type probe described a moment earlier: the table changed between the two.
+    pub const SOURCE_COLUMNS_CHANGED_UNDER_READ: Code = environment(
+        "RIVET_SOURCE_COLUMNS_CHANGED_UNDER_READ",
+        "run the export again: the next run probes and reads the table as it is now",
+    );
     /// A `columns:` override declares a type the source's wire value cannot be read as.
     pub const SOURCE_OVERRIDE_WIRE_MISMATCH: Code = usage(
         "RIVET_SOURCE_OVERRIDE_WIRE_MISMATCH",
@@ -868,6 +873,7 @@ pub mod codes {
         SOURCE_CDC_PREREQUISITE,
         SOURCE_VALUE_UNREPRESENTABLE,
         SOURCE_PROBE_UNREADABLE,
+        SOURCE_COLUMNS_CHANGED_UNDER_READ,
         SOURCE_OVERRIDE_WIRE_MISMATCH,
         STATE_URL_SCHEME_UNSUPPORTED,
         STATE_NOT_WRITABLE,

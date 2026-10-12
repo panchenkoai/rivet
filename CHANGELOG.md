@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- **Fix: an Oracle export whose table loses a column while it is being read stops with an
+  error instead of a panic.** Oracle only; every batch mode. Seen once in CI on main
+  (`07e3e9b7`..`97d3f57b`) as exit 101 of a range-chunked run; not reported from the field.
+  - **What was wrong in 0.30.0 and 0.31.0.** Each Oracle read describes its query's columns,
+    then runs the query. When the query needs no column rewritten (no LOB, no type read
+    through a conversion) it is sent as written, so a column dropped between the two
+    statements came back as a narrower result, and the reader indexed that result by the
+    wider description: `index out of bounds`, exit 101 (an abort in a release build). The run
+    ended without recording its failure: its `run_status` and `export_metrics` rows stayed
+    `running`.
+  - **Now** that read stops with `RIVET_SOURCE_COLUMNS_CHANGED_UNDER_READ` (kind:
+    environment), the run is recorded as failed, and the next run reads the table as it is.
+  - **Proof and its limit.** A unit test pins the column layout on a result narrower than
+    its probe; it panicked before the change. The window between the two statements is a
+    few milliseconds, so no live cell hits it on demand: the existing cell
+    `a_column_dropped_under_a_live_run_delivers_or_fails_loudly_oracle` reaches it by chance.
+  - **Unchanged:** a query whose columns are rewritten names each column, and Oracle itself
+    refuses a dropped one (`ORA-00904`). A column ADDED between the two statements is still
+    delivered as an extra column of that read.
+
 - **Fix: masking a URL password in a log line or an error text takes one pass over the
   text.** Applies to every command and every engine: each emitted log line and each error
   text goes through this scan.

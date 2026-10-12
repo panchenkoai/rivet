@@ -41,6 +41,7 @@ Every failure rivet names carries a stable `RIVET_<FAMILY>_<NAME>` code: in `--j
 | `RIVET_SOURCE_CDC_PREREQUISITE` | environment | 2 if transient, else 1 | apply the setup statement the message names, then re-run (docs/reference/cdc.md) |
 | `RIVET_SOURCE_VALUE_UNREPRESENTABLE` | refusal | 5 | map the value to a representable one in the export's `query:`, or exclude the column |
 | `RIVET_SOURCE_PROBE_UNREADABLE` | refusal | 5 | chunk, page or partition the export on a column of a type the message lists, remove `parallel:` from a keyset export, or use `mode: full` |
+| `RIVET_SOURCE_COLUMNS_CHANGED_UNDER_READ` | environment | 2 if transient, else 1 | run the export again: the next run probes and reads the table as it is now |
 | `RIVET_SOURCE_OVERRIDE_WIRE_MISMATCH` | usage | 1 | remove or correct the column's `columns:` override (batch: or CAST the column to that type in the export's `query:`; CDC: then re-snapshot the table) |
 | `RIVET_STATE_URL_SCHEME_UNSUPPORTED` | usage | 1 | set `RIVET_STATE_URL` to a `postgres://` or `postgresql://` URL, or unset it to keep the state in the SQLite file beside the config |
 | `RIVET_STATE_NOT_WRITABLE` | environment | 2 if transient, else 1 | make the state database writable (the SQLite file and its directory, a read-only filesystem, a read-only role) and run again; the export did not start |
