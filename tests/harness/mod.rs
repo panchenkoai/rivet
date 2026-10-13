@@ -76,6 +76,8 @@ pub enum Mode {
 
 #[path = "../common/registry.rs"]
 mod registry;
+#[path = "../common/sf_reader.rs"]
+mod sf_reader;
 use registry::{stand_bench_db, stand_bq_e2e, stand_container, stand_host_port};
 
 static PG_CLIENT: LazyLock<[&str; 6]> =
@@ -1057,7 +1059,7 @@ impl Verification {
     fn cdc_run_peak_rss(&self, cdc_cfg: &Path) -> Result<f64> {
         let out = Command::new("/usr/bin/time")
             .arg("-l")
-            .arg("rivet")
+            .arg(rivet().get_program())
             .args(["run", "-c"])
             .arg(cdc_cfg)
             .output()
@@ -1816,32 +1818,39 @@ fn snow_json(conn: &str, sql: &str) -> Result<serde_json::Value> {
     serde_json::from_str(&out[start..]).with_context(|| format!("parse snow json from: {out}"))
 }
 
-/// `snow sql` returning a single scalar (the first column of the first row).
+/// Rows of `sql`, read through DuckDB's `snowflake` extension: the loader drives `snow`, so a read through `snow` would grade the tool with itself.
+fn sf_read(conn: &str, sql: &str) -> Result<Vec<Vec<serde_json::Value>>> {
+    let var = |k: &str| std::env::var(k).with_context(|| format!("{k} unset"));
+    sf_reader::snowflake_rows(
+        conn,
+        &var("RIVET_SF_DATABASE")?,
+        &var("RIVET_SF_WAREHOUSE")?,
+        sql,
+    )
+    .map_err(anyhow::Error::msg)
+}
+
+/// The first column of the first row, as an integer.
 fn sf_scalar(conn: &str, sql: &str) -> Result<i64> {
-    let v = snow_json(conn, sql)?;
-    let val = v
-        .get(0)
-        .and_then(|row| row.as_object())
-        .and_then(|o| o.values().next())
-        .context("snow: empty result")?;
+    let rows = sf_read(conn, sql)?;
+    let val = rows
+        .first()
+        .and_then(|r| r.first())
+        .context("snowflake: empty result")?;
     match val {
-        serde_json::Value::Number(n) => n.as_i64().context("snow: scalar not an i64"),
-        serde_json::Value::String(s) => s.trim().parse().context("snow: parse scalar string"),
-        other => bail!("snow: unexpected scalar {other}"),
+        serde_json::Value::Number(n) => n.as_i64().context("snowflake: scalar not an i64"),
+        serde_json::Value::String(s) => s.trim().parse().context("snowflake: parse scalar string"),
+        other => bail!("snowflake: unexpected scalar {other}"),
     }
 }
 
-/// `snow sql` returning `(col0, col1)` rows. serde_json orders a row's keys
-/// (BTreeMap default, or SELECT order under `preserve_order`) so for a
-/// `SELECT column_name, data_type` both give `(name, type)`.
+/// `(col0, col1)` of every row, in SELECT order.
 fn sf_rows(conn: &str, sql: &str) -> Result<Vec<(String, String)>> {
-    let v = snow_json(conn, sql)?;
     let mut out = Vec::new();
-    for row in v.as_array().context("snow: result not an array")? {
-        let obj = row.as_object().context("snow: row not an object")?;
-        let mut vals = obj.values();
-        let a = vals.next().context("snow: row missing col0")?;
-        let b = vals.next().context("snow: row missing col1")?;
+    for row in sf_read(conn, sql)? {
+        let [a, b, ..] = row.as_slice() else {
+            bail!("snowflake: a row of fewer than two columns: {row:?}")
+        };
         out.push((json_str(a), json_str(b)));
     }
     Ok(out)

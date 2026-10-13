@@ -67,6 +67,7 @@ mod refusal;
 mod registry;
 mod rig;
 mod runner;
+mod sf_reader;
 mod snowflake;
 mod sql_engine;
 mod state;

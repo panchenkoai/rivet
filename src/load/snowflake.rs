@@ -91,6 +91,8 @@ impl SnowflakeLoader {
                 let path = format!("$1:{}", s.column_name);
                 if needs_parse_json(s) {
                     format!("PARSE_JSON({path})")
+                } else if s.target_type == TargetType::Snowflake(SfType::Binary) {
+                    format!("{path}::BINARY")
                 } else {
                     path
                 }
@@ -326,19 +328,18 @@ impl SnowflakeLoader {
              ALTER SESSION SET TIMEZONE = 'UTC';\n\
              USE WAREHOUSE {wh};\n\
              USE SCHEMA {db}.{sc};\n\
-             CREATE FILE FORMAT IF NOT EXISTS rivet_pq TYPE=PARQUET BINARY_AS_TEXT=FALSE;\n\
-             CREATE OR REPLACE STAGE {stage} URL='{url}' STORAGE_INTEGRATION={si} FILE_FORMAT=rivet_pq;\n\
+             CREATE OR REPLACE STAGE {stage} URL='{url}' STORAGE_INTEGRATION={si} FILE_FORMAT={PARQUET_FORMAT};\n\
              CREATE OR REPLACE TABLE {fqtn} (\n{ddl}\n){cluster};\n\
              COPY INTO {fqtn} ({columns})\n\
              \x20 FROM (SELECT {select} FROM @{stage})\n\
-             \x20 FILE_FORMAT=(FORMAT_NAME=rivet_pq) {files};\n\
+             \x20 FILE_FORMAT={PARQUET_FORMAT} {files};\n\
              SELECT COUNT(*) AS ROWS_ FROM {fqtn};",
             tag = self.query_tag(table),
             wh = self.warehouse,
             db = self.database,
             sc = self.schema,
             si = self.storage_integration,
-            url = self.gcs_url,
+            url = stage_url(&self.gcs_url),
         );
 
         Ok(sql)
@@ -461,21 +462,20 @@ impl SnowflakeLoader {
              ALTER SESSION SET TIMEZONE = 'UTC';\n\
              USE WAREHOUSE {wh};\n\
              USE SCHEMA {db}.{sc};\n\
-             CREATE FILE FORMAT IF NOT EXISTS rivet_pq TYPE=PARQUET BINARY_AS_TEXT=FALSE;\n\
-             CREATE OR REPLACE STAGE {stage} URL='{url}' STORAGE_INTEGRATION={si} FILE_FORMAT=rivet_pq;\n\
+             CREATE OR REPLACE STAGE {stage} URL='{url}' STORAGE_INTEGRATION={si} FILE_FORMAT={PARQUET_FORMAT};\n\
              CREATE TABLE IF NOT EXISTS {changes_fqtn} (\n{ddl}\n){cluster};\n\
              {alter}\
              SELECT COUNT(*) AS BEFORE_ FROM {changes_fqtn};\n\
              COPY INTO {changes_fqtn} ({columns})\n\
              \x20 FROM (SELECT {select} FROM @{stage})\n\
-             \x20 FILE_FORMAT=(FORMAT_NAME=rivet_pq) FORCE=TRUE {files};\n\
+             \x20 FILE_FORMAT={PARQUET_FORMAT} FORCE=TRUE {files};\n\
              SELECT COUNT(*) AS AFTER_ FROM {changes_fqtn};",
             tag = self.query_tag(&changes),
             wh = self.warehouse,
             db = self.database,
             sc = self.schema,
             si = self.storage_integration,
-            url = self.gcs_url,
+            url = stage_url(&self.gcs_url),
             alter = build_alter_add_columns_sql(&changes_fqtn, &full),
         );
         Ok(sql)
@@ -565,6 +565,14 @@ fn build_alter_add_columns_sql(fqtn: &str, specs: &[TargetColumnSpec]) -> String
         .join(",\n  ");
     format!("ALTER TABLE {fqtn} ADD COLUMN\n  {adds};\n")
 }
+
+/// The stage URL: the export prefix closed with one `/`. Snowflake joins a stage URL and a `FILES` entry as text, so a prefix written without the slash named `…/orderspart-0.parquet`.
+fn stage_url(gcs_url: &str) -> String {
+    format!("{}/", gcs_url.trim_end_matches('/'))
+}
+
+/// How every stage and `COPY` reads a part, spelled inline: a named format made by `CREATE … IF NOT EXISTS` is whatever object already has that name. Logical types on, so a Parquet timestamp or time is read as one and not as its raw integer; binary kept as bytes.
+const PARQUET_FORMAT: &str = "(TYPE=PARQUET BINARY_AS_TEXT=FALSE USE_LOGICAL_TYPE=TRUE)";
 
 /// A column is loaded through `PARSE_JSON` iff its native type is `VARIANT`
 /// (Rivet's Snowflake resolver maps JSON → `VARIANT`); a plain `COPY` would
@@ -896,6 +904,38 @@ mod tests {
         assert_eq!(extract_named(&v, "BEFORE_"), Some(10));
         assert_eq!(extract_named(&v, "AFTER_"), Some(35));
         assert_eq!(extract_named(&v, "MISSING_"), None);
+    }
+
+    /// Both load scripts read a part through the inline format (never a named object another statement could have made), under a stage URL closed with one slash, and cast a binary column.
+    #[test]
+    fn both_scripts_read_parts_by_an_inline_format_under_a_closed_stage_url() {
+        let format = "FILE_FORMAT=(TYPE=PARQUET BINARY_AS_TEXT=FALSE USE_LOGICAL_TYPE=TRUE)";
+        let specs = [
+            col("id", SfType::NumberPs(38, 0)),
+            col("raw", SfType::Binary),
+        ];
+        let uris = ["gs://bkt/exports/orders/part-0.parquet".to_string()];
+        for url in ["gcs://bkt/exports/orders", "gcs://bkt/exports/orders/"] {
+            let mut l = adoption_loader();
+            l.gcs_url = url.into();
+            l.storage_integration = "RIVET_GCS".into();
+            let scripts = [
+                l.build_materialize_sql("orders", &specs, &uris).unwrap(),
+                l.build_append_changelog_sql("orders", &specs, &uris)
+                    .unwrap(),
+            ];
+            for sql in scripts {
+                assert_eq!(sql.matches(format).count(), 2, "stage and COPY: {sql}");
+                assert!(
+                    !sql.contains("rivet_pq") && !sql.contains("CREATE FILE FORMAT"),
+                    "{sql}"
+                );
+                assert!(sql.contains("URL='gcs://bkt/exports/orders/' "), "{sql}");
+                assert!(sql.contains("FILES=('part-0.parquet')"), "{sql}");
+                assert!(sql.contains("$1:raw::BINARY"), "{sql}");
+                assert!(sql.contains("$1:id,") || sql.contains("$1:id "), "{sql}");
+            }
+        }
     }
 
     fn adoption_loader() -> SnowflakeLoader {

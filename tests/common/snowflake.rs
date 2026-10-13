@@ -55,6 +55,55 @@ impl SfLive {
         )
     }
 
+    /// Every row of `sql`, read through the DuckDB reader (never through `snow`, the loader's own tool).
+    pub fn read(&self, sql: &str) -> Vec<Vec<serde_json::Value>> {
+        super::sf_reader::snowflake_rows(&self.connection, &self.database, &self.warehouse, sql)
+            .unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// `BASE TABLE` / `VIEW` for `table`, or `None` when nothing has that name.
+    pub fn kind(&self, table: &str) -> Option<String> {
+        self.read(&format!(
+            "SELECT table_type FROM {}.INFORMATION_SCHEMA.TABLES WHERE table_schema = '{}' AND table_name = '{}'",
+            self.database,
+            self.schema.to_uppercase(),
+            table.to_uppercase()
+        ))
+        .first()
+        .map(|r| r[0].as_str().expect("table_type").to_string())
+    }
+
+    /// `(COUNT(*), COUNT(DISTINCT key))` of `table`.
+    pub fn counts(&self, table: &str, key: &str) -> (i64, i64) {
+        let rows = self.read(&format!(
+            "SELECT COUNT(*), COUNT(DISTINCT {key}) FROM {}.{}.{table}",
+            self.database, self.schema
+        ));
+        let n = |v: &serde_json::Value| match v {
+            serde_json::Value::String(s) => s.parse().expect("a count"),
+            other => other.as_i64().expect("a count"),
+        };
+        (n(&rows[0][0]), n(&rows[0][1]))
+    }
+
+    /// Run one statement as the stand's own setup (through `snow`); panics with what Snowflake said.
+    pub fn exec(&self, sql: &str) {
+        let out = std::process::Command::new("snow")
+            .args(["sql", "-c", &self.connection, "-q", sql])
+            .output()
+            .expect("spawn snow");
+        assert!(
+            out.status.success(),
+            "snow `{sql}`: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// `<database>.<schema>.<table>`.
+    pub fn fq(&self, table: &str) -> String {
+        format!("{}.{}.{table}", self.database, self.schema)
+    }
+
     /// A guard that drops `tables` (each with its `__changes` log) and the cell's GCS prefix.
     pub fn cleanup(&self, tables: &[&str]) -> SfCleanup {
         SfCleanup {
@@ -75,6 +124,8 @@ impl Drop for SfCleanup {
                 ("VIEW", t.clone()),
                 ("TABLE", t.clone()),
                 ("TABLE", format!("{t}__changes")),
+                ("STAGE", format!("rivet_stage_{t}")),
+                ("STAGE", format!("rivet_stage_{t}__changes")),
             ] {
                 let sql = format!("DROP {kind} IF EXISTS {}.{name}", self.schema);
                 let _ = std::process::Command::new("snow")
