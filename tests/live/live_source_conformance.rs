@@ -14,7 +14,14 @@ use rivet::tuning::SourceTuning;
 
 const ROWS: i64 = 40;
 const MONGO_PORT: u16 = 27017;
-const COLUMNS: [&str; 5] = ["id", "ext_id", "server_time", "updated_at", "time_spent"];
+const COLUMNS: [&str; 6] = [
+    "id",
+    "ext_id",
+    "server_time",
+    "updated_at",
+    "time_spent",
+    "label",
+];
 
 /// What one export handed its sink: each schema's column names, and the first column of every row.
 #[derive(Default)]
@@ -32,6 +39,7 @@ impl BatchSink for Collected {
     }
     fn on_batch(&mut self, batch: &RecordBatch) -> Result<()> {
         self.rows += batch.num_rows();
+        labels_are_the_ids_own(batch);
         if let Some(ids) = batch.column(0).as_any().downcast_ref::<Int64Array>() {
             self.first_column.extend(ids.iter().flatten());
         }
@@ -242,6 +250,7 @@ fn conforms(engine: SqlEngine) {
         types[2].arrow_type,
         Some(DataType::Timestamp(TimeUnit::Microsecond, None))
     );
+    assert_eq!(types[5].arrow_type, Some(DataType::Utf8));
 
     // native_column_types: full types where the wire lacks them, nothing elsewhere.
     let native = s.native_column_types(&table).expect("native_column_types");

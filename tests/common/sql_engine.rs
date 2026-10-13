@@ -167,13 +167,48 @@ impl SqlEngine {
             #[cfg(feature = "oracle")]
             SqlEngine::Oracle => "TIMESTAMP(6)",
         };
+        let text = match self {
+            SqlEngine::Mysql => "VARCHAR(64) CHARACTER SET utf8mb4",
+            SqlEngine::Pg => "TEXT",
+            SqlEngine::Mssql => "NVARCHAR(64)",
+            #[cfg(feature = "oracle")]
+            SqlEngine::Oracle => "NVARCHAR2(64)",
+        };
         format!(
             "id {i} PRIMARY KEY, ext_id {i} NOT NULL UNIQUE, \
-             server_time {ts} NOT NULL, updated_at {ts} NULL, time_spent INT NULL"
+             server_time {ts} NOT NULL, updated_at {ts} NULL, time_spent INT NULL, label {text} NULL"
         )
     }
 
-    /// A fresh `(id, ext_id, server_time, updated_at, time_spent)` table and its drop guard.
+    /// `text` as a string literal of this engine (`NULL` for none).
+    fn text_literal(self, text: Option<&str>) -> String {
+        let Some(text) = text else {
+            return "NULL".to_string();
+        };
+        let quoted = text.replace('\'', "''");
+        match self {
+            SqlEngine::Mysql => format!("'{}'", quoted.replace('\\', "\\\\")),
+            SqlEngine::Pg => format!("'{quoted}'"),
+            SqlEngine::Mssql => format!("N'{quoted}'"),
+            #[cfg(feature = "oracle")]
+            SqlEngine::Oracle => {
+                let mut units = String::new();
+                for c in quoted.chars() {
+                    match c {
+                        ' '..='~' if c != '\\' => units.push(c),
+                        _ => {
+                            for u in c.encode_utf16(&mut [0; 2]) {
+                                units.push_str(&format!("\\{u:04X}"));
+                            }
+                        }
+                    }
+                }
+                format!("UNISTR('{units}')")
+            }
+        }
+    }
+
+    /// A fresh `(id, ext_id, server_time, updated_at, time_spent, label)` table and its drop guard.
     pub fn table(self, prefix: &str) -> (String, Box<dyn std::any::Any>) {
         self.create(prefix, &self.standard_columns(self.int64()))
     }
@@ -236,7 +271,7 @@ impl SqlEngine {
         (name, guard)
     }
 
-    /// The INSERT of `ids` with `ext_id = id * 10`, `server_time` `minutes_ago` and `time_spent`.
+    /// The INSERT of `ids` with `ext_id = id * 10`, `server_time` `minutes_ago`, `time_spent` and the [`label_of`] each id.
     fn insert_sql(
         self,
         table: &str,
@@ -246,10 +281,17 @@ impl SqlEngine {
     ) -> String {
         let spent = spent.map_or("NULL".to_string(), |v| v.to_string());
         let rows: Vec<String> = ids
-            .map(|i| format!("({i}, {}, {}, {spent})", i * 10, self.ago(minutes_ago)))
+            .map(|i| {
+                let label = self.text_literal(label_of(i));
+                format!(
+                    "({i}, {}, {}, {spent}, {label})",
+                    i * 10,
+                    self.ago(minutes_ago)
+                )
+            })
             .collect();
         format!(
-            "INSERT INTO {table} (id, ext_id, server_time, time_spent) VALUES {}",
+            "INSERT INTO {table} (id, ext_id, server_time, time_spent, label) VALUES {}",
             rows.join(", ")
         )
     }
@@ -615,10 +657,57 @@ impl Drop for SecondDatabase {
     }
 }
 
+/// The text the shared table stores beside `id`: one shape a reader of text may mishandle per residue of the id.
+pub fn label_of(id: i64) -> Option<&'static str> {
+    match id % 8 {
+        0 => Some("caf\u{e9}"),
+        1 => Some("\u{65e5}\u{672c}\u{8a9e}"),
+        2 => Some("\u{1f600}"),
+        3 => Some("it's \"x\""),
+        4 => None,
+        5 => Some("\u{3b1}\u{3b2}\u{3b3}  "),
+        6 => Some("a\\b%_"),
+        _ => Some("tab\there"),
+    }
+}
+
+/// Panics unless every `label` of `batch` is the [`label_of`] its row's id; a batch without the two columns holds nothing to compare.
+pub fn labels_are_the_ids_own(batch: &arrow::record_batch::RecordBatch) {
+    let schema = batch.schema();
+    let at = |name: &str| {
+        schema
+            .fields()
+            .iter()
+            .position(|f| f.name().eq_ignore_ascii_case(name))
+    };
+    let (Some(id), Some(label)) = (at("id"), at("label")) else {
+        return;
+    };
+    let Some(id) = batch.column(id).as_any().downcast_ref::<Int64Array>() else {
+        return;
+    };
+    let label = arrow::compute::cast(batch.column(label), &arrow::datatypes::DataType::Utf8)
+        .expect("a label column reads as text");
+    let label = label
+        .as_any()
+        .downcast_ref::<arrow::array::StringArray>()
+        .expect("text");
+    for row in 0..batch.num_rows() {
+        let got = (!label.is_null(row)).then(|| label.value(row));
+        assert_eq!(
+            got,
+            label_of(id.value(row)),
+            "the label of id {} is not the text the source holds",
+            id.value(row)
+        );
+    }
+}
+
 /// Sorted `(id, time_spent)` of every part under `out`; the column names match in either case (Oracle's are upper-case).
 pub fn read_id_spent(out: &Path) -> Vec<(i64, Option<i32>)> {
     let mut rows = Vec::new();
     for b in read_all_parts(out) {
+        labels_are_the_ids_own(&b);
         let col = |name: &str| {
             let schema = b.schema();
             let i = schema
@@ -649,6 +738,7 @@ pub fn ids_of(batches: &[arrow::record_batch::RecordBatch]) -> Vec<i64> {
     let mut ids: Vec<i64> = batches
         .iter()
         .flat_map(|b| {
+            labels_are_the_ids_own(b);
             let col = b.column_by_name("id").expect("an id column");
             let col = col
                 .as_any()
@@ -659,4 +749,70 @@ pub fn ids_of(batches: &[arrow::record_batch::RecordBatch]) -> Vec<i64> {
         .collect();
     ids.sort();
     ids
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{ArrayRef, StringArray};
+    use arrow::record_batch::RecordBatch;
+    use std::sync::Arc;
+
+    /// A batch of `ids` under an `id` column, with `labels` under `name`.
+    fn batch(ids: &[i64], name: &str, labels: Vec<Option<&str>>) -> RecordBatch {
+        let id: ArrayRef = Arc::new(Int64Array::from(ids.to_vec()));
+        let label: ArrayRef = Arc::new(StringArray::from(labels));
+        RecordBatch::try_from_iter([("id", id), (name, label)]).expect("a batch")
+    }
+
+    /// The comparison passes the text each id owns, in either case of the column name, and panics on one changed character, a lost NULL and a NULL in place of text.
+    #[test]
+    fn the_label_comparison_fails_on_any_text_that_is_not_the_ids_own() {
+        let ids: Vec<i64> = (0..16).collect();
+        let own = || ids.iter().map(|i| label_of(*i)).collect::<Vec<_>>();
+        labels_are_the_ids_own(&batch(&ids, "label", own()));
+        labels_are_the_ids_own(&batch(&ids, "LABEL", own()));
+        labels_are_the_ids_own(&batch(&ids, "other", vec![Some("x"); 16]));
+        let spoiled = |at: usize, with: Option<&'static str>| {
+            let mut labels = own();
+            labels[at] = with;
+            let batch = batch(&ids, "label", labels);
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                labels_are_the_ids_own(&batch)
+            }))
+            .is_err()
+        };
+        assert!(spoiled(0, Some("cafe")), "an accent lost");
+        assert!(spoiled(2, Some("\u{fffd}")), "a character replaced");
+        assert!(spoiled(4, Some("")), "a NULL read as empty text");
+        assert!(
+            spoiled(5, Some("\u{3b1}\u{3b2}\u{3b3}")),
+            "trailing spaces cut"
+        );
+        assert!(spoiled(7, None), "text read as NULL");
+    }
+
+    /// Every residue has its own shape, and each engine spells the quote, the backslash and the text outside ASCII its own way.
+    #[test]
+    fn a_label_is_written_as_the_engines_own_literal() {
+        let shapes: std::collections::BTreeSet<_> = (0..8).map(label_of).collect();
+        assert_eq!(shapes.len(), 8);
+        assert_eq!(
+            label_of(-3),
+            label_of(7),
+            "a negative id takes the last shape"
+        );
+        let lit = |e: SqlEngine, id: i64| e.text_literal(label_of(id));
+        assert_eq!(lit(SqlEngine::Pg, 3), r#"'it''s "x"'"#);
+        assert_eq!(lit(SqlEngine::Pg, 6), r"'a\b%_'");
+        assert_eq!(lit(SqlEngine::Mysql, 6), r"'a\\b%_'");
+        assert_eq!(lit(SqlEngine::Mssql, 0), "N'caf\u{e9}'");
+        assert_eq!(lit(SqlEngine::Mysql, 4), "NULL");
+        #[cfg(feature = "oracle")]
+        {
+            assert_eq!(lit(SqlEngine::Oracle, 2), r"UNISTR('\D83D\DE00')");
+            assert_eq!(lit(SqlEngine::Oracle, 6), r"UNISTR('a\005Cb%_')");
+            assert_eq!(lit(SqlEngine::Oracle, 3), r#"UNISTR('it''s "x"')"#);
+        }
+    }
 }

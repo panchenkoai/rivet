@@ -1598,19 +1598,6 @@ fn delivered_spent(engine: SqlEngine, out: &Path) -> Vec<(i64, i64)> {
     rows
 }
 
-/// The standard table with a key range chunking accepts on every engine (Oracle refuses `NUMBER(19)`).
-fn range_chunkable_table(engine: SqlEngine, prefix: &str) -> (String, Box<dyn std::any::Any>) {
-    #[cfg(feature = "oracle")]
-    if let SqlEngine::Oracle = engine {
-        return engine.create(
-            prefix,
-            "id NUMBER(18) PRIMARY KEY, ext_id NUMBER(18) NOT NULL UNIQUE, \
-             server_time TIMESTAMP(6) NOT NULL, updated_at TIMESTAMP(6) NULL, time_spent INT NULL",
-        );
-    }
-    engine.table(prefix)
-}
-
 /// One checkpointed runner shape: its stage, the same stage with the checkpoint removed, where its first run crashes, the state subcommand that abandons it, how many rows the source holds, and the table's columns when not the standard ones.
 struct Checkpointed {
     prior: Stage,
@@ -1672,7 +1659,7 @@ fn crashed_run_then_checkpoint_removed(engine: SqlEngine, shape: Checkpointed, r
     engine.alive();
     let (table, _guard) = match shape.columns {
         Some(columns) => engine.create("ckpt_removed", columns),
-        None => range_chunkable_table(engine, "ckpt_removed"),
+        None => engine.range_table("ckpt_removed"),
     };
     engine.insert(&table, 1..=shape.rows, 180, Some(10));
     engine.refresh_row_estimate(&table);
