@@ -42,11 +42,11 @@ scenarios:
 
   - id: concurrent_full_runs
     what: "RESULTS 4: a second concurrent `full` run is refused, or the prefix holds each key once"
-    postgres: { test: open_defect_a_second_concurrent_full_run_does_not_double_the_prefix_postgres }
-    mysql:    { test: open_defect_a_second_concurrent_full_run_does_not_double_the_prefix_mysql }
-    mssql:    { test: open_defect_a_second_concurrent_full_run_does_not_double_the_prefix_mssql }
-    mongo:    { test: open_defect_a_second_concurrent_full_run_does_not_double_the_prefix_mongo }
-    oracle:   { test: open_defect_a_second_concurrent_full_run_does_not_double_the_prefix_oracle }
+    postgres: { test: a_second_concurrent_full_run_does_not_double_the_prefix_postgres }
+    mysql:    { test: a_second_concurrent_full_run_does_not_double_the_prefix_mysql }
+    mssql:    { test: a_second_concurrent_full_run_does_not_double_the_prefix_mssql }
+    mongo:    { test: a_second_concurrent_full_run_does_not_double_the_prefix_mongo }
+    oracle:   { test: a_second_concurrent_full_run_does_not_double_the_prefix_oracle }
 
   - id: failed_before_first_write
     what: "RESULTS 8: a run that never connected writes nothing over an earlier run's record, twice: before the first export it leaves its failed manifest (the only record there; `validate` exits 1) and the next one leaves that byte for byte; after a complete export it leaves the whole export (`_SUCCESS`, manifest), which `validate` still passes"
@@ -130,11 +130,11 @@ scenarios:
 
   - id: run_in_progress_code
     what: "RESULTS 11: a second run beside a live checkpointed run is refused as RIVET_STATE_RUN_IN_PROGRESS (exit 5)"
-    postgres: { test: open_defect_a_second_run_beside_a_live_checkpointed_run_is_refused_by_code_postgres }
-    mysql:    { test: open_defect_a_second_run_beside_a_live_checkpointed_run_is_refused_by_code_mysql }
-    mssql:    { test: open_defect_a_second_run_beside_a_live_checkpointed_run_is_refused_by_code_mssql }
-    mongo:    { test: open_defect_a_second_run_beside_a_live_resumable_run_is_refused_by_code_mongo }
-    oracle:   { test: open_defect_a_second_run_beside_a_live_checkpointed_run_is_refused_by_code_oracle }
+    postgres: { test: a_second_run_beside_a_live_checkpointed_run_is_refused_by_code_postgres }
+    mysql:    { test: a_second_run_beside_a_live_checkpointed_run_is_refused_by_code_mysql }
+    mssql:    { test: a_second_run_beside_a_live_checkpointed_run_is_refused_by_code_mssql }
+    mongo:    { test: a_second_run_beside_a_live_resumable_run_is_refused_by_code_mongo }
+    oracle:   { test: a_second_run_beside_a_live_checkpointed_run_is_refused_by_code_oracle }
 
   - id: plan_unreadable_source
     what: "RESULTS 10: `plan` over a table that does not exist fails as RIVET_PLAN_SOURCE_UNREADABLE (exit 1) and seals no artifact"

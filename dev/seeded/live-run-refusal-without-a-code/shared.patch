@@ -1,0 +1,14 @@
+diff --git a/src/pipeline/chunked/mod.rs b/src/pipeline/chunked/mod.rs
+index 469571d1..223b38c8 100644
+--- a/src/pipeline/chunked/mod.rs
++++ b/src/pipeline/chunked/mod.rs
+@@ -420,8 +420,7 @@ pub(crate) fn claim_run<'s>(
+     if let Some(lease) = try_run_lease(state, export)? {
+         return Ok(lease);
+     }
+-    crate::rivet_bail!(
+-        crate::error::codes::STATE_RUN_IN_PROGRESS,
++    anyhow::bail!(
+         "{}",
+         live_run_refusal(
+             export,

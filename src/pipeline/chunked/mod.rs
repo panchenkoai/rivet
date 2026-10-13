@@ -356,17 +356,23 @@ pub(crate) fn crashed_chunk_run_action(
     }
 }
 
-/// The refusal a checkpointed run gives when a LIVE process holds the export's run lease.
-pub(crate) fn live_chunk_run_refusal(export: &str, run_id: Option<&str>) -> String {
-    let run = run_id.map(|r| format!(" '{r}'")).unwrap_or_default();
+/// The refusal a run gives when a LIVE process holds the export's run lease: `run_id` names the live run when the state records one, and a checkpointed plan says what the next run does with what it left.
+pub(crate) fn live_run_refusal(export: &str, run_id: Option<&str>, resumable: bool) -> String {
+    let (kind, then) = match resumable {
+        true => ("chunk checkpoint run", "the next run resumes it"),
+        false => ("run", "the next run starts over"),
+    };
+    let run = match run_id {
+        Some(id) => format!("{kind} '{id}'"),
+        None => format!("a {kind}"),
+    };
     format!(
-        "export '{export}': chunk checkpoint run{run} still in progress in another live rivet \
-         process (it holds the export's run lease); wait for it to finish — if it is stopped \
-         instead, the next run resumes it"
+        "export '{export}': {run} still in progress in another live rivet process (it holds \
+         the export's run lease); wait for it to finish — if it is stopped instead, {then}"
     )
 }
 
-/// The key of an export's run lease: held by a checkpointed run, taken by every command that rewrites the export's stored progress.
+/// The key of an export's run lease: held by every run of the export, taken by every command that rewrites its stored progress or its destination.
 fn run_lease_key(export: &str) -> String {
     format!("chunk-run:{export}")
 }
@@ -405,26 +411,39 @@ pub(crate) fn claim_export_progress<'s>(
     )
 }
 
-/// Hold the export's run lease for the whole checkpointed run, refuse while a live process
-/// holds it, and recover a chunk run whose process died (OS-released lease, no clock);
-/// `force` is the run's `--force`.
-pub(crate) fn claim_checkpoint_run<'s>(
+/// Hold the export's run lease for the whole run, whatever its mode: refused by code while a live process holds it (released by the OS or the keeper when that process dies, no clock).
+pub(crate) fn claim_run<'s>(
     state: &'s StateStore,
+    plan: &ResolvedRunPlan,
+) -> Result<crate::state::LoadLease<'s>> {
+    let export = &plan.export_name;
+    if let Some(lease) = try_run_lease(state, export)? {
+        return Ok(lease);
+    }
+    crate::rivet_bail!(
+        crate::error::codes::STATE_RUN_IN_PROGRESS,
+        "{}",
+        live_run_refusal(
+            export,
+            state.newest_running_run(export)?.as_deref(),
+            plan.strategy.is_resumable()
+        )
+    )
+}
+
+/// Under the run lease, recover a chunk run whose process died: the plan to run in its place, if any; `force` is the run's `--force`.
+pub(crate) fn recover_checkpoint_run(
     plan: &ResolvedRunPlan,
     progress: &crate::state::ProgressClaim<'_>,
     force: bool,
-) -> Result<(Option<crate::state::LoadLease<'s>>, Option<ResolvedRunPlan>)> {
-    if !plan.strategy.is_resumable() {
-        return Ok((None, None));
-    }
+) -> Result<Option<ResolvedRunPlan>> {
     let export = &plan.export_name;
-    let Some(lease) = try_run_lease(state, export)? else {
-        let rid = progress.resume_run_id()?;
-        anyhow::bail!(live_chunk_run_refusal(export, rid.as_deref()));
-    };
     let ExtractionStrategy::Chunked(_) = &plan.strategy else {
-        return Ok((Some(lease), None));
+        return Ok(None);
     };
+    if !plan.strategy.is_resumable() {
+        return Ok(None);
+    }
     let crashed = progress.chunk_run()?;
     match (
         crashed_chunk_run_action(plan.resume, crashed.is_some(), force),
@@ -437,7 +456,7 @@ pub(crate) fn claim_checkpoint_run<'s>(
             );
             let mut resumed = plan.clone();
             resumed.resume = true;
-            Ok((Some(lease), Some(resumed)))
+            Ok(Some(resumed))
         }
         (CrashedChunkRun::ExportAgain, _) => {
             log::info!(
@@ -446,9 +465,9 @@ pub(crate) fn claim_checkpoint_run<'s>(
             );
             let mut fresh = plan.clone();
             fresh.resume = false;
-            Ok((Some(lease), Some(fresh)))
+            Ok(Some(fresh))
         }
-        _ => Ok((Some(lease), None)),
+        _ => Ok(None),
     }
 }
 
@@ -653,14 +672,8 @@ mod tests {
         let mut plan = make_plan("orders");
         plan.resume = true;
         let claim = |force| {
-            claim_checkpoint_run(
-                &state,
-                &plan,
-                &state.claim(plan.progress_key()).unwrap(),
-                force,
-            )
-            .unwrap()
-            .1
+            recover_checkpoint_run(&plan, &state.claim(plan.progress_key()).unwrap(), force)
+                .unwrap()
         };
         assert!(claim(false).is_none());
         let fresh = claim(true).expect("the forced resume becomes a fresh run");
@@ -670,14 +683,53 @@ mod tests {
     #[test]
     fn a_live_owner_is_refused_without_a_remedy_that_touches_it() {
         assert_eq!(
-            super::live_chunk_run_refusal("t", Some("r1")),
+            super::live_run_refusal("t", Some("r1"), true),
             "export 't': chunk checkpoint run 'r1' still in progress in another live rivet \
              process (it holds the export's run lease); wait for it to finish — if it is \
              stopped instead, the next run resumes it"
         );
-        assert!(super::live_chunk_run_refusal("t", None).starts_with(
-            "export 't': chunk checkpoint run still in progress in another live rivet process"
-        ));
+        assert_eq!(
+            super::live_run_refusal("t", None, false),
+            "export 't': a run still in progress in another live rivet process (it holds the \
+             export's run lease); wait for it to finish — if it is stopped instead, the next \
+             run starts over"
+        );
+    }
+
+    /// Every run takes its export's lease, whatever its mode: a second run of the export is refused by code while the first is alive, another export is not, and the lease is free once the run ends.
+    #[test]
+    fn a_run_of_any_mode_holds_its_exports_lease_until_it_ends() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("state.db");
+        let (first, second) = (
+            StateStore::open_at_path(&db).unwrap(),
+            StateStore::open_at_path(&db).unwrap(),
+        );
+        let checkpointed = make_plan("orders");
+        let mut full = make_plan("orders");
+        full.strategy = ExtractionStrategy::Snapshot;
+        assert!(checkpointed.strategy.is_resumable() && !full.strategy.is_resumable());
+        for (live, late) in [
+            (&full, &full),
+            (&full, &checkpointed),
+            (&checkpointed, &full),
+        ] {
+            let held = claim_run(&first, live).expect("the first run takes the lease");
+            let err = claim_run(&second, late).err().expect("refused beside it");
+            assert_eq!(
+                crate::error::error_code(&err),
+                Some("RIVET_STATE_RUN_IN_PROGRESS")
+            );
+            assert!(
+                err.to_string()
+                    .contains("still in progress in another live rivet process"),
+                "{err:#}"
+            );
+            let other = make_plan("customers");
+            drop(claim_run(&second, &other).expect("another export is free"));
+            drop(held);
+            drop(claim_run(&second, late).expect("free once the first run ended"));
+        }
     }
 
     /// An export whose NAME contains `_chunk<digits>_` must not fool the index
@@ -1252,6 +1304,48 @@ mod tests {
         );
     }
 
+    /// A plain run that finds a chunk run left in progress (its process gone) runs as its resume; a run that already is a resume, and a plan of another mode, are left as they are.
+    #[test]
+    fn a_plain_run_over_a_chunk_run_left_in_progress_becomes_its_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateStore::open_at_path(&dir.path().join("state.db")).unwrap();
+        let plan = make_plan("orders");
+        let cp = chunked_plan(&plan).clone();
+        let mut summary = make_summary(&plan, "run-1");
+        let progress = state.claim(plan.progress_key()).unwrap();
+        ensure_chunk_checkpoint_plan(
+            &state,
+            &plan,
+            &cp,
+            &mut summary,
+            &[(1, 100), (101, 200)],
+            "rivet.yaml",
+            &progress,
+        )
+        .expect("the chunk run is opened");
+        assert!(!plan.resume);
+        let resumed = recover_checkpoint_run(&plan, &progress, false)
+            .unwrap()
+            .expect("the plain run takes the crashed run over");
+        assert!(resumed.resume);
+        assert_eq!(resumed.export_name, plan.export_name);
+
+        let mut already = plan.clone();
+        already.resume = true;
+        assert!(
+            recover_checkpoint_run(&already, &progress, false)
+                .unwrap()
+                .is_none()
+        );
+        let mut full = plan.clone();
+        full.strategy = ExtractionStrategy::Snapshot;
+        assert!(
+            recover_checkpoint_run(&full, &progress, false)
+                .unwrap()
+                .is_none()
+        );
+    }
+
     /// A chunk run whose task list failed to land must not be left for a plain run to resume as a zero-chunk success.
     #[test]
     fn a_failed_task_insert_leaves_no_chunk_run_to_resume_as_an_empty_success() {
@@ -1276,13 +1370,9 @@ mod tests {
         .expect_err("the task insert fails");
         state.exec_for_test("DROP TRIGGER fail_task;");
 
-        let (_lease, resumed) = claim_checkpoint_run(
-            &state,
-            &plan,
-            &state.claim(plan.progress_key()).unwrap(),
-            false,
-        )
-        .unwrap();
+        let resumed =
+            recover_checkpoint_run(&plan, &state.claim(plan.progress_key()).unwrap(), false)
+                .unwrap();
         assert!(
             resumed.is_none(),
             "a plain run must start fresh, not resume a chunk run that has no tasks"
@@ -1307,10 +1397,7 @@ mod tests {
             StateStore::open_at_path(&db).unwrap(),
         );
         let plan = make_plan("orders");
-        let (lease, _) =
-            claim_checkpoint_run(&run, &plan, &run.claim(plan.progress_key()).unwrap(), false)
-                .unwrap();
-        assert!(lease.is_some(), "a checkpointed run takes the run lease");
+        let lease = claim_run(&run, &plan).expect("a run takes the run lease");
 
         let unnamed = claim_export_progress(&cmd, "orders", "reset its state")
             .err()

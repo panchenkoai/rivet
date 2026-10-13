@@ -421,6 +421,88 @@ seeds:
         cells:
           - "lib:a_success_marker_without_a_manifest_is_not_a_legacy_run"
 
+  - name: run-lease-held-only-by-checkpointed-runs
+    class: "a mutual exclusion taken by one kind of run only: the export's run lease was held by checkpointed runs, so two concurrent runs of any other mode both exited 0 and the destination held every key twice"
+    history: "2026-10-07 - operator-contract Sweep 4 - two concurrent `full` runs of one export, 200 source rows, 400 delivered, exit 0 twice; the same on the range and keyset runners (sabotage matrix, 2026-10-09)"
+    scope: source
+    patch: run-lease-held-only-by-checkpointed-runs/shared.patch
+    engines:
+      postgres:
+        cells:
+          - a_second_concurrent_full_run_does_not_double_the_prefix_postgres
+          - a_second_range_run_beside_a_live_one_delivers_or_refuses_postgres
+          - a_second_keyset_run_beside_a_live_one_delivers_or_refuses_postgres
+      mysql:
+        cells:
+          - a_second_concurrent_full_run_does_not_double_the_prefix_mysql
+          - a_second_range_run_beside_a_live_one_delivers_or_refuses_mysql
+          - a_second_keyset_run_beside_a_live_one_delivers_or_refuses_mysql
+      mssql:
+        cells:
+          - a_second_concurrent_full_run_does_not_double_the_prefix_mssql
+          - a_second_range_run_beside_a_live_one_delivers_or_refuses_mssql
+          - a_second_keyset_run_beside_a_live_one_delivers_or_refuses_mssql
+      oracle:
+        cells:
+          - a_second_concurrent_full_run_does_not_double_the_prefix_oracle
+      mongo:
+        cells:
+          - a_second_concurrent_full_run_does_not_double_the_prefix_mongo
+      lib:
+        cells:
+          - "lib:a_run_of_any_mode_holds_its_exports_lease_until_it_ends"
+
+  - name: live-run-refusal-without-a-code
+    class: "a refusal that one command gives by code and another gives as plain text: a second run beside a live checkpointed run exited 1 with no `RIVET_*` code, while `state reset` in the same situation gave RIVET_STATE_RUN_IN_PROGRESS (5)"
+    history: "2026-10-07 - operator-contract Sweep 11 - exit 1, no code, on PostgreSQL, MySQL, SQL Server, Oracle and MongoDB"
+    scope: source
+    patch: live-run-refusal-without-a-code/shared.patch
+    engines:
+      postgres:
+        cells:
+          - a_second_run_beside_a_live_checkpointed_run_is_refused_by_code_postgres
+          - a_second_keyset_checkpoint_run_beside_a_live_one_delivers_or_refuses_postgres
+      mysql:
+        cells:
+          - a_second_run_beside_a_live_checkpointed_run_is_refused_by_code_mysql
+          - a_second_keyset_checkpoint_run_beside_a_live_one_delivers_or_refuses_mysql
+      mssql:
+        cells:
+          - a_second_run_beside_a_live_checkpointed_run_is_refused_by_code_mssql
+          - a_second_keyset_checkpoint_run_beside_a_live_one_delivers_or_refuses_mssql
+      oracle:
+        cells:
+          - a_second_run_beside_a_live_checkpointed_run_is_refused_by_code_oracle
+      mongo:
+        cells:
+          - a_second_run_beside_a_live_resumable_run_is_refused_by_code_mongo
+      lib:
+        cells:
+          - "lib:a_run_of_any_mode_holds_its_exports_lease_until_it_ends"
+
+  - name: repair-rewrites-chunks-beside-a-live-run
+    class: "a command that rewrites what a run is writing without taking the run's lease: `rivet repair --execute` beside a live checkpointed run read its pending chunks as mismatched and exported them again while the run exported them too"
+    history: "2026-10-09 - sabotage matrix - both processes exit 0 and the destination declares keys twice"
+    scope: source
+    patch: repair-rewrites-chunks-beside-a-live-run/shared.patch
+    engines:
+      postgres:
+        cells:
+          - repair_beside_a_live_run_delivers_or_fails_loudly_postgres
+      mysql:
+        cells:
+          - repair_beside_a_live_run_delivers_or_fails_loudly_mysql
+      mssql:
+        cells:
+          - repair_beside_a_live_run_delivers_or_fails_loudly_mssql
+      oracle:
+        na: "the repair-beside-a-live-run cell is not written for Oracle"
+      mongo:
+        na: "a MongoDB export has no range-chunk checkpoint to repair"
+      lib:
+        cells:
+          - "lib:a_repair_beside_a_live_run_is_refused_before_it_touches_anything"
+
   - name: chunk-run-resumed-by-another-source
     class: an interrupted range-chunk run is looked up by export name alone and resumed by a same-named export of another source
     history: "2026-10-06 - config A crashed after chunk 0, same-named config B of another database ran: exit 0, 'resuming it', 1000 of 5000 rows (v0.31.0)"

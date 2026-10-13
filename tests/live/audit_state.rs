@@ -230,8 +230,8 @@ fn state_reset_keeps_the_cursor_of_another_source() {
 
 /// P-23: a `state reset` accepted while an incremental run reads must not leave that run's delta published as a full pass.
 #[test]
-#[ignore = "live+gate-only: postgres; open defect P-23, acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_state_reset_during_an_incremental_read_keeps_the_manifest_honest() {
+#[ignore = "live: requires docker compose postgres"]
+fn state_reset_during_an_incremental_read_keeps_the_manifest_honest() {
     let e = SqlEngine::Pg;
     e.alive();
     let (table, _guard) = e.table("audit_state");

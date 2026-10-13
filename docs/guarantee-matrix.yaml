@@ -65,9 +65,6 @@ guarantees:
       mssql: { test: mssql_crash_after_file_write_leaves_file_but_no_manifest_or_cursor, asserts: "at-least-once: physical destination rows must be >= source (8)" }
       mongo: { test: mongo_crash_after_file_write_recovers_without_loss, asserts: "duckdb_assert_at_least_once(" }
       oracle: { gap: "no Oracle batch cell crashes a run between the write and the cursor and reads the destination" }
-    contradicted_by:
-      known_red:
-        - "live_operator_contract::open_defect_a_second_concurrent_full_run_does_not_double_the_prefix"
 
   - id: uncategorized_errors_are_not_retried
     stated:
@@ -103,13 +100,8 @@ guarantees:
       - file: docs/semantics.md
         sentence: "**its process is alive** (the lease is held): the run is refused, and so is `--resume`"
     held_by:
-      sqlite_state: { gap: "the cells that start a second run beside a live one on a SQLite state are open defects (the refusal carries no code); none is green" }
+      sqlite_state: { test: a_second_run_beside_a_live_checkpointed_run_is_refused_by_code_postgres, asserts: "assert_refused(&second, Refused::by_code(\"RIVET_STATE_RUN_IN_PROGRESS\", 5));" }
       postgres_state: { test: two_runs_of_one_export_through_a_transaction_pooler_never_both_proceed, asserts: "one run must proceed and the other be refused by the run lease" }
-    contradicted_by:
-      known_red:
-        - "live_operator_contract::open_defect_a_second_run_beside_a_live_checkpointed_run_is_refused_by_code"
-        - "live_operator_contract::open_defect_a_second_run_beside_a_live_resumable_run_is_refused_by_code"
-        - "audit_state::open_defect_state_reset_during_an_incremental_read_keeps_the_manifest_honest"
 
   - id: a_completed_chunk_is_never_reclaimed
     stated:

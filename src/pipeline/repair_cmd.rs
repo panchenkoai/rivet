@@ -159,6 +159,8 @@ fn execute_repair(
     // Without it we can re-export the data but cannot point the recorded state
     // at the fresh count, so `reconcile → repair → reconcile` could never
     // converge (audit finding #7).
+    let _run_lease =
+        super::chunked::claim_export_progress(state, &plan.export_name, "repair its chunks")?;
     let run_id = state.claim(plan.progress_key())?.latest_chunk_run()?;
 
     // One summary across the whole repair (matches the original single
@@ -646,6 +648,47 @@ fn print_report_pretty(report: &RepairReport) {
 mod tests {
     use super::*;
     use crate::plan::{PartitionKind, PartitionResult, ReconcileReport};
+
+    /// A repair is refused by code while a live run holds the export's lease, before it opens a source or reads the state; with the lease free it goes on (and fails on the source this plan does not have).
+    #[test]
+    fn a_repair_beside_a_live_run_is_refused_before_it_touches_anything() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("state.db");
+        let (run, repair) = (
+            StateStore::open_at_path(&db).unwrap(),
+            StateStore::open_at_path(&db).unwrap(),
+        );
+        let mut plan = crate::pipeline::commit::tests::test_plan();
+        let export = plan.export_name.clone();
+        let actions = || RepairPlan {
+            rivet_version: String::new(),
+            export_name: export.clone(),
+            reconcile_run_id: String::new(),
+            strategy: "chunked".into(),
+            actions: Vec::new(),
+            skipped: Vec::new(),
+        };
+        let held = super::super::chunked::try_run_lease(&run, &export)
+            .unwrap()
+            .expect("the live run's lease");
+        let err =
+            execute_repair(&mut plan, &repair, actions()).expect_err("refused beside the live run");
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some("RIVET_STATE_RUN_IN_PROGRESS")
+        );
+        assert!(
+            err.to_string().contains("cannot repair its chunks"),
+            "{err:#}"
+        );
+        drop(held);
+        let after = execute_repair(&mut plan, &repair, actions());
+        assert_ne!(
+            after.err().as_ref().and_then(crate::error::error_code),
+            Some("RIVET_STATE_RUN_IN_PROGRESS"),
+            "the lease is free once the run ended"
+        );
+    }
 
     #[test]
     fn plan_from_auto_would_derive_actions_from_reconcile() {
