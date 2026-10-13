@@ -12,8 +12,10 @@
     `rivet repair --execute` beside a live checkpointed run exported that run's pending chunks
     a second time. `rivet state reset` was accepted while an incremental run was reading, and
     that run's manifest then described its delta as a first pass.
-  - **Now** every run takes the lease. The second run exits 5 with
-    `RIVET_STATE_RUN_IN_PROGRESS` and writes nothing; the first delivers. `rivet repair
+  - **Now** every run takes the lease. One of the two runs exits 5 with
+    `RIVET_STATE_RUN_IN_PROGRESS` and writes nothing; the other delivers (200 rows in the
+    measurement above). It is the later one, except that a first run still creating its
+    state database may reach the lease no earlier than a run started beside it. `rivet repair
     --execute` and `rivet state reset` get the same refusal beside a live run.
   - **Also changed:** the refusal a second run got beside a live checkpointed run was exit 1
     with no code; it is exit 5 with `RIVET_STATE_RUN_IN_PROGRESS`. The text still starts

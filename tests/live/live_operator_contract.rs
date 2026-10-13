@@ -345,7 +345,7 @@ fn concurrent_full_runs_on(rig: Rig) {
     two_full_runs(rig.slowed(200), 200, 1500);
 }
 
-/// Start `rig`, start it again `after_ms` later while the first is alive: both exiting 0 must not leave more than `N` rows.
+/// Start `rig`, start it again `after_ms` later while the first is alive: both exiting 0 must not leave more than `N` rows, and at least one delivers. Each run is reaped, and so graded, as it ends: a refused run is graded while the other is still alive, so the other one's writes are not taken for its own. Which of the two is refused is not fixed: a first run that is still creating its state database takes the lease no earlier than the second.
 #[allow(non_snake_case)]
 fn two_full_runs(rig: Rig, N: i64, after_ms: u64) {
     let mut first = rig.spawn_args_env(&[], &[]);
@@ -354,11 +354,25 @@ fn two_full_runs(rig: Rig, N: i64, after_ms: u64) {
         first.try_wait().unwrap().is_none(),
         "fixture: the first run is alive when the second starts"
     );
-    let second = rig.run();
-    let first = first.wait().unwrap();
+    let mut second = rig.spawn_args_env(&[], &[]);
+    let (mut a, mut b) = (None, None);
+    while a.is_none() || b.is_none() {
+        if a.is_none() {
+            a = first.try_wait().unwrap();
+        }
+        if b.is_none() {
+            b = second.try_wait().unwrap();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let (first, second) = (a.unwrap(), b.unwrap());
     let rows = parquet_rows(&rig.out_dir());
     assert!(
-        !(first.success() && second.status.success()) || rows as i64 == N,
+        first.success() || second.success(),
+        "neither of two concurrent full runs delivered: {first:?}, {second:?}"
+    );
+    assert!(
+        !(first.success() && second.success()) || rows as i64 == N,
         "two concurrent full runs both exited 0 and the prefix holds {rows} rows for {N} keys"
     );
 }
