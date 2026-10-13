@@ -1,5 +1,5 @@
 diff --git a/src/pipeline/repair_cmd.rs b/src/pipeline/repair_cmd.rs
-index d716af0f..8584a4e7 100644
+index c74eefb6..9158eb34 100644
 --- a/src/pipeline/repair_cmd.rs
 +++ b/src/pipeline/repair_cmd.rs
 @@ -159,8 +159,6 @@ fn execute_repair(

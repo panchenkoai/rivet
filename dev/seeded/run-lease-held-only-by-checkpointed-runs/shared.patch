@@ -1,5 +1,5 @@
 diff --git a/src/pipeline/chunked/mod.rs b/src/pipeline/chunked/mod.rs
-index a1677237..d25c44eb 100644
+index 469571d1..a7253f52 100644
 --- a/src/pipeline/chunked/mod.rs
 +++ b/src/pipeline/chunked/mod.rs
 @@ -417,6 +417,12 @@ pub(crate) fn claim_run<'s>(

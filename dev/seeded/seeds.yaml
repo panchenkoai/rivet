@@ -500,7 +500,8 @@ seeds:
       mongo:
         na: "a MongoDB export has no range-chunk checkpoint to repair"
       lib:
-        na: "`execute_repair` opens a source before anything else; no unit test reaches its claim"
+        cells:
+          - "lib:a_repair_beside_a_live_run_is_refused_before_it_touches_anything"
 
   - name: chunk-run-resumed-by-another-source
     class: an interrupted range-chunk run is looked up by export name alone and resumed by a same-named export of another source
