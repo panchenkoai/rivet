@@ -6,7 +6,7 @@ requires-python = ">=3.12"
 # Pinned, not floated: the oracle's job is to disagree with rivet when rivet is
 # wrong, so the reader itself must not move under us between two runs of the
 # same gate. `duckdb` carries the postgres/mysql/sqlite scanners and — with
-# `INSTALL bigquery FROM community` — the BigQuery reader (see
+# `INSTALL bigquery FROM community` / `INSTALL snowflake FROM community` — the warehouse readers (see
 # dev/release_oracle/duck.py).
 dependencies = [
     "duckdb==1.5.5",
@@ -23,6 +23,9 @@ dependencies = [
     # 2026-09-20 gate. Exact-pinned like duckdb: a hash that moves between two
     # runs of the same gate is not an oracle.
     "xxhash==4.0.1",
+    # The Snowflake ADBC driver the DuckDB `snowflake` community extension reads through
+    # (dev/release_oracle/duck.py); rivet's loader shells out to `snow`, so the two share no code.
+    "adbc-driver-snowflake==1.11.0",
 ]
 
 [tool.uv]
