@@ -2277,52 +2277,52 @@ fn open_defect_range_chunking_takes_a_number_19_key_oracle() {
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose postgres; open defect (a config is validated only past one chunk), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_decimal_chunk_column_is_refused_whatever_the_row_estimate_postgres() {
+#[ignore = "live: requires docker compose postgres"]
+fn a_decimal_chunk_column_is_refused_whatever_the_row_estimate_postgres() {
     decimal_chunk_column_verdict(SqlEngine::Pg);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mysql; open defect (a config is validated only past one chunk), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_decimal_chunk_column_is_refused_whatever_the_row_estimate_mysql() {
+#[ignore = "live: requires docker compose mysql"]
+fn a_decimal_chunk_column_is_refused_whatever_the_row_estimate_mysql() {
     decimal_chunk_column_verdict(SqlEngine::Mysql);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mssql; open defect (a config is validated only past one chunk), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_decimal_chunk_column_is_refused_whatever_the_row_estimate_mssql() {
+#[ignore = "live: requires docker compose mssql"]
+fn a_decimal_chunk_column_is_refused_whatever_the_row_estimate_mssql() {
     decimal_chunk_column_verdict(SqlEngine::Mssql);
 }
 
 #[cfg(feature = "oracle")]
 #[test]
-#[ignore = "live+gate-only: docker compose oracle; open defect (a config is validated only past one chunk), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_decimal_chunk_column_is_refused_whatever_the_row_estimate_oracle() {
+#[ignore = "live: requires docker compose oracle"]
+fn a_decimal_chunk_column_is_refused_whatever_the_row_estimate_oracle() {
     decimal_chunk_column_verdict(SqlEngine::Oracle);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose postgres; open defect (a config is validated only past one chunk), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_keyless_table_is_refused_whatever_the_row_estimate_postgres() {
+#[ignore = "live: requires docker compose postgres"]
+fn a_keyless_table_is_refused_whatever_the_row_estimate_postgres() {
     keyless_table_verdict(SqlEngine::Pg);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mysql; open defect (a config is validated only past one chunk), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_keyless_table_is_refused_whatever_the_row_estimate_mysql() {
+#[ignore = "live: requires docker compose mysql"]
+fn a_keyless_table_is_refused_whatever_the_row_estimate_mysql() {
     keyless_table_verdict(SqlEngine::Mysql);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mssql; open defect (a config is validated only past one chunk), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_keyless_table_is_refused_whatever_the_row_estimate_mssql() {
+#[ignore = "live: requires docker compose mssql"]
+fn a_keyless_table_is_refused_whatever_the_row_estimate_mssql() {
     keyless_table_verdict(SqlEngine::Mssql);
 }
 
 #[cfg(feature = "oracle")]
 #[test]
-#[ignore = "live+gate-only: docker compose oracle; open defect (a config is validated only past one chunk), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_keyless_table_is_refused_whatever_the_row_estimate_oracle() {
+#[ignore = "live: requires docker compose oracle"]
+fn a_keyless_table_is_refused_whatever_the_row_estimate_oracle() {
     keyless_table_verdict(SqlEngine::Oracle);
 }
 

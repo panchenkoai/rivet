@@ -2,6 +2,42 @@
 
 ## Unreleased
 
+- **Fixed: a `mode: chunked` config the planner refuses on a large table is refused on a small
+  one too.** PostgreSQL, MySQL, SQL Server and Oracle; exports with the `table:` shortcut.
+  Reproduced on rivet 0.31.0 with PostgreSQL.
+  - **What was wrong in 0.31.0 and earlier.** While the source's row estimate was at most
+    `chunk_size`, the planner returned a single pass before it checked the shape. So a config
+    with a `DECIMAL` `chunk_column`, or with no `chunk_column` over a table that has no key to
+    page by, ran with exit 0 on a small table and was refused once the table outgrew one chunk.
+    Measured on a 3-row table with `chunk_column: amount` (`DECIMAL(10,2)`), `chunk_size: 4`:
+    0.31.0 exits 0 and writes one file.
+  - **Now** the shape is checked first: the same run exits 1 with `chunk_column 'amount' ... is
+    not an integer-family column`, twice in a row, and writes nothing. A keyless table gets
+    `chunked mode found no safe shape`. On MySQL an auto-selected unique key under a `uuid`
+    override is refused on a small table as on a large one
+    (`RIVET_CONFIG_KEYSET_KEY_UUID_OVERRIDE`).
+  - **What to do if a run now refuses:** follow the message: name an integer `chunk_column`,
+    set `chunk_by_key:`, or use `mode: full`.
+  - Unchanged: a config whose shape is valid still runs as one pass on a small table.
+- **Fixed: a `mode: chunked` export whose table fits in one chunk is refused as what it is
+  beside an unfinished checkpoint run.** Applies to PostgreSQL, MySQL, SQL Server and Oracle.
+  A `mode: chunked` export that sets none of `chunk_checkpoint`, `chunk_count`, `chunk_by_days`
+  and `chunk_by_key` runs as one pass while the source's row estimate is at most `chunk_size`.
+  - Before: beside an unfinished checkpoint run of that export, such a run was told `this export
+    now runs as `full`` and `restore the `chunked` settings`, which the config still had; a table
+    near `chunk_size` got that message or the checkpoint one as the estimate moved.
+  - Now it is told what any run of its mode without the checkpoint is told: `this export now
+    runs without the checkpoint that run was opened with`, with the remedies `restore the
+    checkpoint setting (`chunk_checkpoint: true`)` and `rivet state reset-chunks -c <config>
+    --export <name>`. Both were run on PostgreSQL, MySQL and SQL Server.
+  - Unchanged: the code (`RIVET_STATE_INTERRUPTED_RUN_OWNER_MISMATCH`), exit 5, nothing read or
+    written; what such an export runs as (one pass, `mode` `full` in `rivet plan`, the run
+    summary and `export_metrics`); the message a `mode: full` export gets.
+  - Also changed: beside an unfinished run of the other paging mode (a `chunk_by_key` run, then
+    `chunk_column` with no checkpoint on a small table) the message says `now runs as
+    `chunked``, where it said `full`.
+  - `rivet plan --format json` writes `"single_pass_of": "Chunked"` (or `"Keyset"`) in
+    `resolved_plan` for such an export; the field is not part of the plan's checksum.
 - **Fixed: `rivet validate` no longer passes a prefix whose manifest is gone while `_SUCCESS`
   is there.** Every source and destination. Reproduced on rivet 0.31.0 with PostgreSQL and a
   local destination.

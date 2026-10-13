@@ -218,6 +218,15 @@ impl SqlEngine {
         self.create(prefix, &self.standard_columns(self.range_int()))
     }
 
+    /// [`SqlEngine::table`] whose `id` is unique and not null, but not a primary key.
+    pub fn table_without_a_primary_key(self, prefix: &str) -> (String, Box<dyn std::any::Any>) {
+        let columns = self.standard_columns(self.int64());
+        self.create(
+            prefix,
+            &columns.replacen("PRIMARY KEY", "NOT NULL UNIQUE", 1),
+        )
+    }
+
     /// Create `table` again as [`SqlEngine::range_table`] made it, after a cell dropped it (the first guard still drops it).
     pub fn range_table_again(self, table: &str) {
         self.exec(&format!(
