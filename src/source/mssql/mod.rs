@@ -509,165 +509,17 @@ fn catalog_decimal_to_params(precision: u8, scale: u8) -> Option<(u8, i8)> {
 /// is unqualified. Handles `[bracketed]` and bare identifiers; pure `&str`
 /// work, so it is unit-testable without a live server.
 fn parse_mssql_simple_from_table(query: &str) -> Option<(String, String)> {
-    let from_idx = mssql_find_outer_from_keyword(query)?;
-    let tail = trim_sql_ws(query.get(from_idx + 4..)?);
-    let (first, after1) = parse_mssql_ident_piece(tail)?;
-    let after1 = trim_sql_ws(after1);
-    // `schema.table` (optionally `db.schema.table` → take the last two parts).
-    let (schema, table, after) = if after1.starts_with('.') {
-        let (second, after2) = parse_mssql_ident_piece(trim_sql_ws(after1.get(1..)?))?;
-        let after2 = trim_sql_ws(after2);
-        if after2.starts_with('.') {
-            // db.schema.table — `first` is the database, drop it.
-            let (third, after3) = parse_mssql_ident_piece(trim_sql_ws(after2.get(1..)?))?;
-            (second, third, trim_sql_ws(after3))
-        } else {
-            (first, second, after2)
-        }
-    } else {
-        ("dbo".to_string(), first, after1)
-    };
-    // Reject joins / comma-lists / a trailing dotted continuation we didn't
-    // consume; only a clause boundary (WHERE/ORDER/…/end) or an alias may follow.
-    let after = skip_mssql_optional_alias(after)?;
-    if mssql_joins_or_comma(after) {
-        return None;
+    let mut names: Vec<String> = crate::sql::single_relation(query, false)?
+        .into_iter()
+        .map(|part| part.name)
+        .collect();
+    let table = names.pop()?;
+    match names.len() {
+        0 => Some(("dbo".to_string(), table)),
+        // `schema.table`, or `db.schema.table` with the database dropped.
+        1 | 2 => Some((names.pop()?, table)),
+        _ => None,
     }
-    Some((schema, table))
-}
-
-fn trim_sql_ws(s: &str) -> &str {
-    s.trim_matches(|c: char| matches!(c, ' ' | '\t' | '\n' | '\r'))
-}
-
-fn is_sql_ident_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_'
-}
-
-/// Case-insensitive keyword match at byte `idx` with identifier-boundary checks
-/// on both sides (so `from_x` does not match `from`).
-fn sql_keyword_at(haystack: &[u8], idx: usize, kw_lower: &[u8]) -> bool {
-    let n = kw_lower.len();
-    if idx + n > haystack.len() || !haystack[idx..idx + n].eq_ignore_ascii_case(kw_lower) {
-        return false;
-    }
-    let before_ok = idx == 0 || !is_sql_ident_byte(haystack[idx - 1]);
-    let after_ok = idx + n >= haystack.len() || !is_sql_ident_byte(haystack[idx + n]);
-    before_ok && after_ok
-}
-
-/// Byte offset of the top-level `FROM`, skipping nested parentheses
-/// (subqueries) and `'…'` string literals (with `''` escapes).
-fn mssql_find_outer_from_keyword(sql: &str) -> Option<usize> {
-    let b = sql.as_bytes();
-    let mut i = 0usize;
-    let mut depth = 0usize;
-    let mut in_quote = false;
-    while i < b.len() {
-        if in_quote {
-            if b[i] == b'\'' {
-                if i + 1 < b.len() && b[i + 1] == b'\'' {
-                    i += 2;
-                } else {
-                    in_quote = false;
-                    i += 1;
-                }
-                continue;
-            }
-            i += 1;
-            continue;
-        }
-        match b[i] {
-            b'\'' => in_quote = true,
-            b'(' => depth += 1,
-            b')' => depth = depth.saturating_sub(1),
-            _ if depth == 0 && sql_keyword_at(b, i, b"from") => return Some(i),
-            _ => {}
-        }
-        i += 1;
-    }
-    None
-}
-
-/// Parse one T-SQL identifier piece: `[bracketed name]` (with `]]` escapes) or
-/// a bare `ident`. Returns the unquoted name and the remaining tail.
-fn parse_mssql_ident_piece(rest: &str) -> Option<(String, &str)> {
-    let rest = trim_sql_ws(rest);
-    if let Some(after_open) = rest.strip_prefix('[') {
-        let mut out = String::new();
-        let mut chars = after_open.chars();
-        while let Some(ch) = chars.next() {
-            if ch == ']' {
-                if chars.as_str().starts_with(']') {
-                    chars.next();
-                    out.push(']');
-                    continue;
-                }
-                return Some((out, chars.as_str()));
-            }
-            out.push(ch);
-        }
-        return None; // unterminated bracket
-    }
-    let bytes = rest.as_bytes();
-    if bytes.is_empty() || (!bytes[0].is_ascii_alphabetic() && bytes[0] != b'_') {
-        return None;
-    }
-    let mut i = 1usize;
-    while i < bytes.len() && is_sql_ident_byte(bytes[i]) {
-        i += 1;
-    }
-    Some((rest.get(0..i)?.to_string(), rest.get(i..)?))
-}
-
-/// `true` when a join / comma-list follows the relation — the parser rejects
-/// these (catalog hints only resolve for a single base table).
-fn mssql_joins_or_comma(rest: &str) -> bool {
-    let r = trim_sql_ws(rest);
-    if r.starts_with(',') || r.starts_with('.') {
-        return true;
-    }
-    let b = r.as_bytes();
-    ["inner", "left", "right", "full", "cross", "join"]
-        .iter()
-        .any(|kw| sql_keyword_at(b, 0, kw.as_bytes()))
-}
-
-/// Consume an optional table alias (`[AS] alias`) after the relation, stopping
-/// at a clause boundary. Returns the tail after the alias, or `None` if what
-/// follows is a join/comma (so the caller rejects the query).
-fn skip_mssql_optional_alias(rest: &str) -> Option<&str> {
-    let rest = trim_sql_ws(rest);
-    if rest.is_empty() || mssql_starts_clause_boundary(rest) || mssql_joins_or_comma(rest) {
-        return Some(rest);
-    }
-    let mut rest = rest;
-    if sql_keyword_at(rest.as_bytes(), 0, b"as") {
-        rest = trim_sql_ws(rest.get(2..)?);
-    }
-    let (_, tail) = parse_mssql_ident_piece(rest)?;
-    Some(trim_sql_ws(tail))
-}
-
-fn mssql_starts_clause_boundary(rest: &str) -> bool {
-    let r = trim_sql_ws(rest);
-    if r.is_empty() {
-        return true;
-    }
-    const KWS: &[&[u8]] = &[
-        b"where",
-        b"group",
-        b"having",
-        b"order",
-        b"union",
-        b"except",
-        b"intersect",
-        b"for",
-        b"option",
-        b"offset",
-    ];
-    let b = r.as_bytes();
-    KWS.iter().any(|kw| sql_keyword_at(b, 0, kw))
 }
 
 impl Source for MssqlSource {
@@ -1424,10 +1276,7 @@ mod tls_posture_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        catalog_decimal_to_params, mssql_find_outer_from_keyword, parse_mssql_simple_from_table,
-        parse_mssql_url, sql_keyword_at,
-    };
+    use super::{catalog_decimal_to_params, parse_mssql_simple_from_table, parse_mssql_url};
 
     // Regression (round-2 audit #1): the shared `build_url_from_fields` percent-
     // ENCODES userinfo for every engine, but this hand-rolled parser must
@@ -1481,47 +1330,6 @@ mod tests {
         parse_mssql_simple_from_table(q)
     }
 
-    // ── mutation-W4 gap closure ──────────────────────────────────────────────
-    // 18 mutants survived in the FROM-finder (quote escapes, paren depth,
-    // identifier boundaries) — no direct test existed. A mis-found FROM feeds
-    // the table extraction for catalog lookups; golden byte OFFSETS pin the
-    // arithmetic, tricky shapes pin the state machine.
-    #[test]
-    fn outer_from_finder_golden_offsets() {
-        let f = mssql_find_outer_from_keyword;
-        // Exact offset (kills index arithmetic): "SELECT a " = 9 bytes.
-        assert_eq!(f("SELECT a FROM t"), Some(9));
-        // Case-insensitive.
-        assert_eq!(f("select a frOm t"), Some(9));
-        // Subquery FROM is nested — only the outer one counts.
-        let q = "SELECT (SELECT x FROM i) FROM t";
-        assert_eq!(f(q), Some(q.rfind("FROM").unwrap()));
-        // 'from' inside a string literal is skipped…
-        let q = "SELECT 'from' FROM t";
-        assert_eq!(f(q), Some(q.rfind("FROM").unwrap()));
-        // …including with a doubled-quote escape swallowing a fake closer.
-        let q = "SELECT 'it''s from x' FROM t";
-        assert_eq!(f(q), Some(q.rfind("FROM").unwrap()));
-        // Escape-skip arithmetic: with a long prefix the escape index i has
-        // 2*i PAST the string end, so an `i += 2` -> `i *= 2` mutant runs off
-        // the buffer and returns None (short fixtures let 2*i coincidentally
-        // land back on the closing quote — the fixture must break the
-        // coincidence, not rely on it).
-        let q = "SELECT aaaaaaaaaaaaaaaaaaaaaaaaaaaa, 'it''s' FROM t";
-        assert!(2 * q.find("''").unwrap() > q.len(), "fixture invariant");
-        assert_eq!(f(q), Some(q.rfind("FROM").unwrap()));
-        // Identifier boundaries: neither `a_from` nor `fromage` match.
-        let q = "SELECT a_from, fromage FROM t";
-        assert_eq!(f(q), Some(q.rfind("FROM").unwrap()));
-        // Unbalanced-close before FROM must not underflow depth below zero and
-        // hide the keyword.
-        assert_eq!(f(") FROM t"), Some(2));
-        // No FROM at all.
-        assert_eq!(f("SELECT 1"), None);
-        // FROM stuck inside parens only -> nested, not outer.
-        assert_eq!(f("SELECT (x FROM t)"), None);
-    }
-
     #[test]
     fn numeric_display_inserts_the_point_exactly() {
         // W4: the split/pad arithmetic (digits.len() - scale, width scale+1)
@@ -1537,15 +1345,31 @@ mod tests {
         assert_eq!(n(10, 1), "1.0");
     }
 
+    /// A name in any quoting, a database prefix, a trailing `;` and a comment that mentions FROM all read as the one table.
     #[test]
-    fn keyword_at_checks_both_identifier_boundaries() {
-        let k = |h: &str, i: usize| sql_keyword_at(h.as_bytes(), i, b"from");
-        assert!(k("from t", 0), "start of string is a boundary");
-        assert!(k("x from", 2), "end of string is a boundary");
-        assert!(!k("xfrom t", 1), "preceded by an identifier byte");
-        assert!(!k("from_x", 0), "followed by an identifier byte");
-        assert!(!k("fro", 0), "keyword longer than the remaining haystack");
-        assert!(k("x FROM y", 2), "case-insensitive");
+    fn the_table_is_read_past_quotes_comments_and_a_database_prefix() {
+        let t = |s: &str, t: &str| Some((s.to_string(), t.to_string()));
+        for (q, want) in [
+            (
+                "SELECT a FROM [Sales].[Order Details] WITH (NOLOCK)",
+                t("Sales", "Order Details"),
+            ),
+            ("SELECT a FROM \"s\".\"t\"", t("s", "t")),
+            ("SELECT a FROM db.s.t;", t("s", "t")),
+            ("SELECT a FROM srv.db.s.t", None),
+            (
+                "SELECT amount -- rows from the last week\nFROM t",
+                t("dbo", "t"),
+            ),
+            ("SELECT amount\n-- taken from legacy\nFROM s.t", t("s", "t")),
+            (
+                "SELECT amount /* from b */ FROM t /* from c */ WHERE a = 1",
+                t("dbo", "t"),
+            ),
+            ("SELECT a FROM t x JOIN u ON 1 = 1", None),
+        ] {
+            assert_eq!(parse(q), want, "{q:?}");
+        }
     }
 
     #[test]
