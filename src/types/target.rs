@@ -1921,6 +1921,38 @@ mod tests {
         );
     }
 
+    /// Scale 0 is an ordinary decimal on DuckDB and Snowflake too: the negative-scale warning starts below zero.
+    #[test]
+    fn a_decimal_of_scale_zero_is_not_a_negative_scale() {
+        let zero = RivetType::Decimal {
+            precision: 10,
+            scale: 0,
+        };
+        for spec in [duck(&zero), sf(&zero)] {
+            assert_eq!(spec.status, TargetStatus::Ok, "{:?}", spec.target_type);
+            assert_eq!(spec.note, None);
+        }
+        assert_eq!(duck(&zero).target_type.to_string(), "DECIMAL(10,0)");
+        assert_eq!(sf(&zero).target_type.to_string(), "NUMBER(10,0)");
+    }
+
+    /// A column rivet cannot map fails on every target with the source's own reason, not a blank or a stock phrase.
+    #[test]
+    fn an_unsupported_column_fails_with_the_sources_reason() {
+        let odd = RivetType::Unsupported {
+            native_type: "geometry".into(),
+            reason: "PostGIS geometry has no interchange form".into(),
+        };
+        for spec in [bq(&odd), duck(&odd), sf(&odd), ch(&odd)] {
+            assert_eq!(spec.status, TargetStatus::Fail);
+            assert_eq!(
+                spec.note.as_deref(),
+                Some("PostGIS geometry has no interchange form")
+            );
+        }
+        assert_eq!(unsupported_reason(&RivetType::Bool), "no target mapping");
+    }
+
     // ── L5 recovery SQL (the post-load transform for BigQuery autoload) ───────
 
     #[test]

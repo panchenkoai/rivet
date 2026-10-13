@@ -303,6 +303,48 @@ mod tests {
         );
     }
 
+    /// Every spelling of each primitive names its own type, and a spelling of one is not another.
+    #[test]
+    fn every_primitive_spelling_names_its_own_type() {
+        for (names, want) in [
+            (&["int2", "smallint", "int16"][..], RivetType::Int16),
+            (&["int4", "int", "integer", "int32"][..], RivetType::Int32),
+            (&["int8", "bigint", "int64"][..], RivetType::Int64),
+            (&["float4", "real", "float32"][..], RivetType::Float32),
+            (
+                &["float8", "double", "double precision", "float64"][..],
+                RivetType::Float64,
+            ),
+            (&["date"][..], RivetType::Date),
+            (&["bool", "boolean"][..], RivetType::Bool),
+            (
+                &["binary", "bytea", "blob", "varbinary"][..],
+                RivetType::Binary,
+            ),
+            (
+                &["text", "varchar", "string", "char", "bpchar", "name"][..],
+                RivetType::String,
+            ),
+            (&["json", "jsonb"][..], RivetType::Json),
+        ] {
+            for name in names {
+                assert_eq!(parse_type_str(name).unwrap(), want, "{name}");
+            }
+        }
+    }
+
+    /// The decimal bounds are inclusive: precision 76 and a scale equal to the precision are types; one past either is refused.
+    #[test]
+    fn the_decimal_bounds_are_inclusive() {
+        let decimal = |precision, scale| RivetType::Decimal { precision, scale };
+        assert_eq!(parse_type_str("decimal(76,0)").unwrap(), decimal(76, 0));
+        assert_eq!(parse_type_str("decimal(5,5)").unwrap(), decimal(5, 5));
+        assert_eq!(parse_type_str("decimal(1,1)").unwrap(), decimal(1, 1));
+        let past = |s: &str| parse_type_str(s).unwrap_err().to_string();
+        assert!(past("decimal(77,0)").contains("out of range (1..=76)"));
+        assert!(past("decimal(5,6)").contains("scale 6 exceeds precision 5"));
+    }
+
     #[test]
     fn primitive_types() {
         assert_eq!(parse_type_str("bool").unwrap(), RivetType::Bool);

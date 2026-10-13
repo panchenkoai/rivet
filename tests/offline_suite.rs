@@ -97,6 +97,8 @@ mod oneshot_budget;
 // a moved subject fails LOUDLY instead of grading the empty set.
 #[path = "offline/nonvacuity.rs"]
 mod nonvacuity;
+#[path = "offline/open_defects_guard.rs"]
+mod open_defects_guard;
 #[path = "offline/oracle_read_scope_guard.rs"]
 mod oracle_read_scope_guard;
 #[path = "offline/perf_matrix_guard.rs"]
