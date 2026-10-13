@@ -1,0 +1,99 @@
+# Source conformance matrix — every method of the `Source` trait (src/source/mod.rs),
+# per engine, called DIRECTLY on a live source.
+#
+# Why it exists: a unit mutation sweep of src/source (2026-10-12/13, 4268 mutants)
+# left 101 survivors that replace the whole body of a `Source` method with a
+# constant (`harm_counters` 38, `primary_key` 18, `query_scalar` 18,
+# `server_context` 17, `sample_governor_pressure` 13, ...), in all five engines
+# alike. No live test called these methods; they were reached only through the
+# CLI, where a constant answer often changes nothing an assertion reads.
+#
+# The cells of one row share ONE test body (tests/live/live_source_conformance.rs,
+# `conforms`): what an engine answers its own way is a field of `Ways` there, so a
+# new engine or a new method cannot be covered on one engine and forgotten on
+# another. MongoDB reads documents, not SQL, and has its own body.
+#
+# A cell is EXACTLY one of:
+#   test: <fn>  — the live test that calls the method on this engine.
+#   na:   <why> — the method has no meaning on this engine.
+#   gap:  <why> — it should be tested here and is not.
+#
+# Differences this ledger made visible and pins as they are (not judged here):
+#   * a result with no row hands the sink the query's columns on SQL Server and
+#     Oracle, no column on PostgreSQL, and both in turn on MySQL;
+#   * the catalog gives a row size (`avg_row_bytes`) on PostgreSQL and MySQL only.
+
+engines: [postgres, mysql, mssql, mongo, oracle]
+
+scenarios:
+  - id: source_query_scalar
+    what: "query_scalar returns a number as text and a NULL as none (MongoDB: the reconcile count, and none for any other scalar)"
+    postgres: { test: a_source_answers_every_method_postgres }
+    mysql:    { test: a_source_answers_every_method_mysql }
+    mssql:    { test: a_source_answers_every_method_mssql }
+    mongo:    { test: a_source_answers_every_method_mongo }
+    oracle:   { test: a_source_answers_every_method_oracle }
+
+  - id: source_primary_key
+    what: "primary_key returns the key columns in KEY order (a two-column key declared `(b, a)`), and none for a table without a key (MongoDB: always `_id`)"
+    postgres: { test: a_source_answers_every_method_postgres }
+    mysql:    { test: a_source_answers_every_method_mysql }
+    mssql:    { test: a_source_answers_every_method_mssql }
+    mongo:    { test: a_source_answers_every_method_mongo }
+    oracle:   { test: a_source_answers_every_method_oracle }
+
+  - id: source_introspect_for_chunking
+    what: "introspect_for_chunking names the single integer key, the keyset keys with the primary key first, the integer columns and the row count; a keyless table has none of the keys"
+    postgres: { test: a_source_answers_every_method_postgres }
+    mysql:    { test: a_source_answers_every_method_mysql }
+    mssql:    { test: a_source_answers_every_method_mssql }
+    mongo:    { test: a_source_answers_every_method_mongo }
+    oracle:   { test: a_source_answers_every_method_oracle }
+
+  - id: source_type_mappings
+    what: "type_mappings lists every column of the query in order with a native type and an Arrow type"
+    postgres: { test: a_source_answers_every_method_postgres }
+    mysql:    { test: a_source_answers_every_method_mysql }
+    mssql:    { test: a_source_answers_every_method_mssql }
+    mongo:    { test: a_source_answers_every_method_mongo }
+    oracle:   { test: a_source_answers_every_method_oracle }
+
+  - id: source_native_column_types
+    what: "native_column_types adds the full type where the wire metadata lacks it (MySQL `datetime(6)`), and nothing elsewhere"
+    postgres: { test: a_source_answers_every_method_postgres }
+    mysql:    { test: a_source_answers_every_method_mysql }
+    mssql:    { test: a_source_answers_every_method_mssql }
+    mongo:    { test: a_source_answers_every_method_mongo }
+    oracle:   { test: a_source_answers_every_method_oracle }
+
+  - id: source_server_context
+    what: "server_context is a JSON object naming the engine and a version"
+    postgres: { test: a_source_answers_every_method_postgres }
+    mysql:    { test: a_source_answers_every_method_mysql }
+    mssql:    { test: a_source_answers_every_method_mssql }
+    mongo:    { test: a_source_answers_every_method_mongo }
+    oracle:   { test: a_source_answers_every_method_oracle }
+
+  - id: source_harm_counters
+    what: "harm_counters are named after their engine, each once, and none is negative"
+    postgres: { test: a_source_answers_every_method_postgres }
+    mysql:    { test: a_source_answers_every_method_mysql }
+    mssql:    { test: a_source_answers_every_method_mssql }
+    mongo:    { test: a_source_answers_every_method_mongo }
+    oracle:   { test: a_source_answers_every_method_oracle }
+
+  - id: source_sample_governor_pressure
+    what: "sample_governor_pressure is a counter that does not go down between two samples (MongoDB: none, it has no foreign-pressure counter)"
+    postgres: { test: a_source_answers_every_method_postgres }
+    mysql:    { test: a_source_answers_every_method_mysql }
+    mssql:    { test: a_source_answers_every_method_mssql }
+    mongo:    { test: a_source_answers_every_method_mongo }
+    oracle:   { test: a_source_answers_every_method_oracle }
+
+  - id: source_export
+    what: "export hands the sink every row once under the query's columns, and no row for an empty result"
+    postgres: { test: a_source_answers_every_method_postgres }
+    mysql:    { test: a_source_answers_every_method_mysql }
+    mssql:    { test: a_source_answers_every_method_mssql }
+    mongo:    { test: a_source_answers_every_method_mongo }
+    oracle:   { test: a_source_answers_every_method_oracle }
